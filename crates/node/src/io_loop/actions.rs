@@ -3,7 +3,6 @@
 use super::IoLoop;
 use super::TimerOp;
 use super::block_commit::{AccumulateDecision, PendingCommit};
-use crate::action_handler::{self, DispatchPool};
 use crate::protocol::fetch::FetchInput;
 use crate::protocol::fetch_instances;
 use crate::protocol::sync::SyncInput;
@@ -11,7 +10,7 @@ use hyperscale_core::{
     Action, ActionContext, CommitSource, FetchRequest, NodeInput, PreparedBlock, ProtocolEvent,
     StateMachine,
 };
-use hyperscale_dispatch::Dispatch;
+use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_engine::Engine;
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
@@ -85,7 +84,7 @@ where
                 let topology = Arc::clone(&self.topology);
                 let validator_id = self.validator_id;
 
-                self.dispatch.spawn_consensus_crypto(move || {
+                self.dispatch.spawn(DispatchPool::ConsensusCrypto, move || {
                     let block_hash = header.hash();
                     let msg = hyperscale_types::block_header_message(
                         header.shard_group_id,
@@ -120,7 +119,7 @@ where
                 let local_shard = self.local_shard;
                 let validator_id = self.validator_id;
 
-                self.dispatch.spawn_consensus_crypto(move || {
+                self.dispatch.spawn(DispatchPool::ConsensusCrypto, move || {
                     let vote = hyperscale_types::BlockVote::new(
                         block_hash,
                         local_shard,
@@ -148,7 +147,7 @@ where
                 let network = Arc::clone(&self.network);
                 let validator_id = self.validator_id;
 
-                self.dispatch.spawn_consensus_crypto(move || {
+                self.dispatch.spawn(DispatchPool::ConsensusCrypto, move || {
                     let msg = hyperscale_types::committed_block_header_message(
                         committed_header.header.shard_group_id,
                         committed_header.header.height,
@@ -185,7 +184,7 @@ where
                 let local_shard = self.local_shard;
                 let validator_id = self.validator_id;
 
-                self.dispatch.spawn_crypto(move || {
+                self.dispatch.spawn(DispatchPool::Crypto, move || {
                     let tx_count = u32::try_from(tx_outcomes.len()).unwrap_or(u32::MAX);
                     let msg = hyperscale_types::exec_vote_message(
                         vote_anchor_ts,
@@ -241,7 +240,7 @@ where
                 let network = Arc::clone(&self.network);
                 let validator_id = self.validator_id;
 
-                self.dispatch.spawn_crypto(move || {
+                self.dispatch.spawn(DispatchPool::Crypto, move || {
                     let cert = std::sync::Arc::unwrap_or_clone(certificate);
                     let msg = hyperscale_types::exec_cert_batch_message(
                         cert.shard_group_id(),
@@ -679,7 +678,8 @@ where
     /// With `SyncDispatch` (simulation), `spawn_*` runs inline so events
     /// enter the channel immediately and are drained by the harness.
     fn dispatch_delegated_action(&self, action: Action) {
-        let pool = action_handler::dispatch_pool_for(&action)
+        let pool = action
+            .dispatch_pool()
             .expect("dispatch_delegated_action called for delegated actions only");
 
         // Clone cheap shared state for the 'static spawn closure.
@@ -689,7 +689,7 @@ where
         let pending_chain = Arc::clone(&self.pending_chain);
         let event_tx = self.event_sender.clone();
 
-        let spawn_fn = move || {
+        self.dispatch.spawn(pool, move || {
             let notify = move |event: NodeInput| {
                 let _ = event_tx.send(event);
             };
@@ -724,14 +724,36 @@ where
                 notify: &notify,
                 commit_prepared: &commit_prepared,
             };
-            action_handler::handle_delegated_action(action, &ctx);
-        };
+            // Route to the coordinator crate that owns this Action variant.
+            match &action {
+                Action::VerifyAndBuildQuorumCertificate { .. }
+                | Action::VerifyQcSignature { .. }
+                | Action::VerifyRemoteHeaderQc { .. }
+                | Action::VerifyTransactionRoot { .. }
+                | Action::VerifyProvisionTxRoots { .. }
+                | Action::VerifyProvisionRoot { .. }
+                | Action::VerifyCertificateRoot { .. }
+                | Action::VerifyLocalReceiptRoot { .. }
+                | Action::VerifyStateRoot { .. }
+                | Action::BuildProposal { .. } => {
+                    hyperscale_bft::action_handlers::handle_action(action, &ctx);
+                }
 
-        match pool {
-            DispatchPool::ConsensusCrypto => self.dispatch.spawn_consensus_crypto(spawn_fn),
-            DispatchPool::Crypto => self.dispatch.spawn_crypto(spawn_fn),
-            DispatchPool::Execution => self.dispatch.spawn_execution(spawn_fn),
-        }
+                Action::AggregateExecutionCertificate { .. }
+                | Action::VerifyAndAggregateExecutionVotes { .. }
+                | Action::VerifyExecutionCertificateSignature { .. }
+                | Action::ExecuteTransactions { .. }
+                | Action::ExecuteCrossShardTransactions { .. } => {
+                    hyperscale_execution::action_handlers::handle_action(action, &ctx);
+                }
+
+                Action::VerifyProvisions { .. } | Action::FetchAndBroadcastProvisions { .. } => {
+                    hyperscale_provisions::action_handlers::handle_action(action, &ctx);
+                }
+
+                _ => {}
+            }
+        });
     }
 
     /// Local shard committee excluding self, for use as the `peers` argument

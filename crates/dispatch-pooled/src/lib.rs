@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use thiserror::Error;
 use tracing::instrument;
 
-use hyperscale_dispatch::Dispatch;
+use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_metrics as metrics;
 
 /// Errors from thread pool configuration.
@@ -464,84 +464,45 @@ impl PooledDispatch {
     }
 }
 
-impl Dispatch for PooledDispatch {
-    #[instrument(level = "debug", skip_all)]
-    fn spawn_consensus_crypto(&self, f: impl FnOnce() + Send + 'static) {
-        self.consensus_crypto_pending
-            .fetch_add(1, Ordering::Relaxed);
-        let pending = self.consensus_crypto_pending.clone();
-        let pool = Arc::clone(&self.consensus_crypto_pool);
-        self.consensus_crypto_pool.spawn_fifo(move || {
-            let start = std::time::Instant::now();
-            pool.install(f);
-            pending.fetch_sub(1, Ordering::Relaxed);
-            metrics::record_pool_task_completed("consensus_crypto", start.elapsed().as_secs_f64());
-        });
-    }
-
-    fn spawn_crypto(&self, f: impl FnOnce() + Send + 'static) {
-        self.crypto_pending.fetch_add(1, Ordering::Relaxed);
-        let pending = self.crypto_pending.clone();
-        let pool = Arc::clone(&self.crypto_pool);
-        self.crypto_pool.spawn_fifo(move || {
-            let start = std::time::Instant::now();
-            pool.install(f);
-            pending.fetch_sub(1, Ordering::Relaxed);
-            metrics::record_pool_task_completed("crypto", start.elapsed().as_secs_f64());
-        });
-    }
-
-    fn try_spawn_crypto(&self, f: impl FnOnce() + Send + 'static) -> bool {
-        const BACKPRESSURE_THRESHOLD: usize = 100;
-
-        let depth = self.crypto_pending.load(Ordering::Relaxed);
-        if depth > BACKPRESSURE_THRESHOLD {
-            return false;
+impl PooledDispatch {
+    const fn pool_state(
+        &self,
+        pool: DispatchPool,
+    ) -> (&Arc<rayon::ThreadPool>, &Arc<AtomicUsize>, &'static str) {
+        match pool {
+            DispatchPool::ConsensusCrypto => (
+                &self.consensus_crypto_pool,
+                &self.consensus_crypto_pending,
+                "consensus_crypto",
+            ),
+            DispatchPool::Crypto => (&self.crypto_pool, &self.crypto_pending, "crypto"),
+            DispatchPool::TxValidation => (
+                &self.tx_validation_pool,
+                &self.tx_validation_pending,
+                "tx_validation",
+            ),
+            DispatchPool::Execution => (&self.execution_pool, &self.execution_pending, "execution"),
         }
-
-        self.spawn_crypto(f);
-        true
     }
+}
 
-    fn spawn_tx_validation(&self, f: impl FnOnce() + Send + 'static) {
-        self.tx_validation_pending.fetch_add(1, Ordering::Relaxed);
-        let pending = self.tx_validation_pending.clone();
-        let pool = Arc::clone(&self.tx_validation_pool);
-        self.tx_validation_pool.spawn_fifo(move || {
+impl Dispatch for PooledDispatch {
+    #[instrument(level = "debug", skip_all, fields(?pool))]
+    fn spawn(&self, pool: DispatchPool, f: impl FnOnce() + Send + 'static) {
+        let (rayon_pool, pending, label) = self.pool_state(pool);
+        pending.fetch_add(1, Ordering::Relaxed);
+        let pending = pending.clone();
+        let rayon_pool_owned = Arc::clone(rayon_pool);
+        rayon_pool.spawn_fifo(move || {
             let start = std::time::Instant::now();
-            pool.install(f);
+            rayon_pool_owned.install(f);
             pending.fetch_sub(1, Ordering::Relaxed);
-            metrics::record_pool_task_completed("tx_validation", start.elapsed().as_secs_f64());
+            metrics::record_pool_task_completed(label, start.elapsed().as_secs_f64());
         });
     }
 
-    #[instrument(level = "debug", skip_all)]
-    fn spawn_execution(&self, f: impl FnOnce() + Send + 'static) {
-        self.execution_pending.fetch_add(1, Ordering::Relaxed);
-        let pending = self.execution_pending.clone();
-        let pool = Arc::clone(&self.execution_pool);
-        self.execution_pool.spawn_fifo(move || {
-            let start = std::time::Instant::now();
-            pool.install(f);
-            pending.fetch_sub(1, Ordering::Relaxed);
-            metrics::record_pool_task_completed("execution", start.elapsed().as_secs_f64());
-        });
-    }
-
-    fn consensus_crypto_queue_depth(&self) -> usize {
-        self.consensus_crypto_pending.load(Ordering::Relaxed)
-    }
-
-    fn crypto_queue_depth(&self) -> usize {
-        self.crypto_pending.load(Ordering::Relaxed)
-    }
-
-    fn tx_validation_queue_depth(&self) -> usize {
-        self.tx_validation_pending.load(Ordering::Relaxed)
-    }
-
-    fn execution_queue_depth(&self) -> usize {
-        self.execution_pending.load(Ordering::Relaxed)
+    fn queue_depth(&self, pool: DispatchPool) -> usize {
+        self.pool_state(pool).1.load(Ordering::Relaxed)
     }
 }
 
@@ -646,22 +607,22 @@ mod tests {
         let exec_counter = Arc::new(AtomicUsize::new(0));
 
         let counter = consensus_crypto_counter.clone();
-        dispatch.spawn_consensus_crypto(move || {
+        dispatch.spawn(DispatchPool::ConsensusCrypto, move || {
             counter.fetch_add(1, Ordering::SeqCst);
         });
 
         let counter = crypto_counter.clone();
-        dispatch.spawn_crypto(move || {
+        dispatch.spawn(DispatchPool::Crypto, move || {
             counter.fetch_add(1, Ordering::SeqCst);
         });
 
         let counter = tx_validation_counter.clone();
-        dispatch.spawn_tx_validation(move || {
+        dispatch.spawn(DispatchPool::TxValidation, move || {
             counter.fetch_add(1, Ordering::SeqCst);
         });
 
         let counter = exec_counter.clone();
-        dispatch.spawn_execution(move || {
+        dispatch.spawn(DispatchPool::Execution, move || {
             counter.fetch_add(1, Ordering::SeqCst);
         });
 

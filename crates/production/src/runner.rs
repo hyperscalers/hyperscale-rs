@@ -44,7 +44,7 @@ use crate::event_loop::{PinnedLoopConfig, ProdIoLoop, spawn_pinned_loop};
 use crate::rpc::{MempoolSnapshot, NodeStatusState};
 use arc_swap::ArcSwap;
 use hyperscale_bft::BftConfig;
-use hyperscale_dispatch::Dispatch;
+use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_dispatch_pooled::PooledDispatch;
 use hyperscale_engine::{NetworkDefinition, RadixExecutor};
 use hyperscale_mempool::MempoolConfig;
@@ -786,10 +786,10 @@ impl ProductionRunner {
     fn collect_metrics(&self) {
         // ── Thread pool queue depths ─────────────────────────────────────
         metrics::set_pool_queue_depths(
-            self.dispatch.consensus_crypto_queue_depth(),
-            self.dispatch.crypto_queue_depth(),
-            self.dispatch.tx_validation_queue_depth(),
-            self.dispatch.execution_queue_depth(),
+            self.dispatch.queue_depth(DispatchPool::ConsensusCrypto),
+            self.dispatch.queue_depth(DispatchPool::Crypto),
+            self.dispatch.queue_depth(DispatchPool::TxValidation),
+            self.dispatch.queue_depth(DispatchPool::Execution),
         );
 
         // ── Peer count ───────────────────────────────────────────────────

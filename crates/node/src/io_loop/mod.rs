@@ -40,7 +40,7 @@ use crate::protocol::fetch_instances::{
 use crate::protocol::sync::{SyncInput, SyncProtocol, SyncStatus};
 use arc_swap::ArcSwap;
 use hyperscale_core::{Action, NodeInput, ProtocolEvent, StateMachine, TimerId};
-use hyperscale_dispatch::Dispatch;
+use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_engine::{Engine, GenesisConfig, RadixExecutor, TransactionValidation};
 use hyperscale_messages::TransactionGossip;
 use hyperscale_metrics as metrics;
@@ -950,7 +950,7 @@ where
         let network = Arc::clone(&self.network);
         let validator_id = self.validator_id;
 
-        self.dispatch.spawn_crypto(move || {
+        self.dispatch.spawn(DispatchPool::Crypto, move || {
             for (provisions, recipients) in batches {
                 if provisions.transactions.is_empty() {
                     continue;

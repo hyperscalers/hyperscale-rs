@@ -773,4 +773,39 @@ impl Action {
     pub fn type_name(&self) -> &'static str {
         self.into()
     }
+
+    /// Which thread pool this action should run on, or `None` if it's not
+    /// delegated (timers, network broadcasts, persist — handled inline by
+    /// the runner).
+    #[must_use]
+    pub const fn dispatch_pool(&self) -> Option<hyperscale_dispatch::DispatchPool> {
+        use hyperscale_dispatch::DispatchPool;
+        match self {
+            // Consensus-critical crypto + state root computation.
+            Self::VerifyAndBuildQuorumCertificate { .. }
+            | Self::VerifyQcSignature { .. }
+            | Self::VerifyRemoteHeaderQc { .. }
+            | Self::VerifyTransactionRoot { .. }
+            | Self::VerifyProvisionRoot { .. }
+            | Self::VerifyCertificateRoot { .. }
+            | Self::VerifyLocalReceiptRoot { .. }
+            | Self::VerifyProvisionTxRoots { .. }
+            | Self::VerifyStateRoot { .. }
+            | Self::BuildProposal { .. } => Some(DispatchPool::ConsensusCrypto),
+
+            // General crypto (cert aggregation, provision proofs).
+            Self::AggregateExecutionCertificate { .. }
+            | Self::VerifyAndAggregateExecutionVotes { .. }
+            | Self::VerifyExecutionCertificateSignature { .. }
+            | Self::VerifyProvisions { .. }
+            | Self::FetchAndBroadcastProvisions { .. } => Some(DispatchPool::Crypto),
+
+            // Transaction execution.
+            Self::ExecuteTransactions { .. } | Self::ExecuteCrossShardTransactions { .. } => {
+                Some(DispatchPool::Execution)
+            }
+
+            _ => None,
+        }
+    }
 }

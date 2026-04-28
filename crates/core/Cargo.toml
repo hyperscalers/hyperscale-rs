@@ -5,10 +5,11 @@ edition.workspace = true
 description = "Core types for Hyperscale consensus: Event, Action, and StateMachine trait"
 
 [dependencies]
-hyperscale-types.workspace = true
+hyperscale-dispatch.workspace = true
+hyperscale-engine.workspace = true
 hyperscale-messages.workspace = true
 hyperscale-storage.workspace = true
-hyperscale-engine.workspace = true
+hyperscale-types.workspace = true
 strum.workspace = true
 
 [lints]
