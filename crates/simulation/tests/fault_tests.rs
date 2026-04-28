@@ -226,11 +226,21 @@ fn run_cross_shard_fault_scenario<F>(install_faults: F, fetch_kinds: &[&'static 
 where
     F: FnOnce(&mut SimulationRunner) -> Vec<RuleHandle>,
 {
+    run_cross_shard_fault_scenario_with_seed(install_faults, fetch_kinds, 42);
+}
+
+fn run_cross_shard_fault_scenario_with_seed<F>(
+    install_faults: F,
+    fetch_kinds: &[&'static str],
+    seed: u64,
+) where
+    F: FnOnce(&mut SimulationRunner) -> Vec<RuleHandle>,
+{
     let (_guard, recorder) = test_setup();
 
     let config = multi_shard_config();
     let num_shards = u64::from(config.num_shards);
-    let mut runner = SimulationRunner::new(&config, 42);
+    let mut runner = SimulationRunner::new(&config, seed);
 
     let ((kp_a, acc_a), (_kp_b, acc_b)) = find_accounts_on_each_shard(num_shards);
     let initial_balance = Decimal::from(10_000);
@@ -379,6 +389,38 @@ fn cross_shard_compound_provisions_and_exec_cert_fetch_fallback() {
         },
         &["provision", "exec_cert"],
     );
+}
+
+/// Cross-shard provisions fetch under unreliable RPC: `provisions.broadcast`
+/// is dropped 100% (forcing fetch as the only recovery path) AND
+/// `provision.request` is dropped 50% (so each fetch attempt has a
+/// coin-flip chance of timing out and being retried).
+///
+/// Exercises [`Fetch::handle_failed`] and the retry path that wasn't
+/// covered by the all-or-nothing tests above. Runs across three seeds
+/// to confirm the seeded-RNG retry path is deterministic — every seed
+/// must independently reach successful execution within the 30s budget.
+#[test]
+fn cross_shard_provisions_fetch_with_50pct_request_loss() {
+    for seed in [42u64, 1337, 2026] {
+        run_cross_shard_fault_scenario_with_seed(
+            |runner| {
+                let broadcast_rule = runner
+                    .network_mut()
+                    .fault()
+                    .drop_type("provisions.broadcast")
+                    .install();
+                let request_rule = runner
+                    .network_mut()
+                    .fault()
+                    .drop_type_with_probability("provision.request", 0.5)
+                    .install();
+                vec![broadcast_rule, request_rule]
+            },
+            &["provision"],
+            seed,
+        );
+    }
 }
 
 /// Cross-shard remote-header fetch fallback. Source-shard validators
