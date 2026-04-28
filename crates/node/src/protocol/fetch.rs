@@ -16,6 +16,7 @@
 //! machinery handles that as a special case of a one-element batch.
 
 use hyperscale_core::FetchPeers;
+use hyperscale_metrics as metrics;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
 use std::sync::Arc;
@@ -94,16 +95,21 @@ struct Entry {
 /// Id-keyed fetch state machine.
 pub struct Fetch<Id: Eq + Hash + Ord + Clone> {
     config: FetchConfig,
+    /// Routed into the global metrics recorder as the `kind` label.
+    kind: &'static str,
     /// `BTreeMap` for deterministic iteration order during chunk assembly.
     pending: BTreeMap<Id, Entry>,
 }
 
 impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
     /// Create a new protocol instance with the given config.
+    ///
+    /// `kind` labels metrics emitted by this instance.
     #[must_use]
-    pub const fn new(config: FetchConfig) -> Self {
+    pub const fn new(kind: &'static str, config: FetchConfig) -> Self {
         Self {
             config,
+            kind,
             pending: BTreeMap::new(),
         }
     }
@@ -163,6 +169,9 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
             });
         }
         if added > 0 {
+            for _ in 0..added {
+                metrics::record_fetch_started(self.kind);
+            }
             debug!(count = added, "Started id fetch");
         }
         vec![]
@@ -179,6 +188,9 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
             }
         }
         if released > 0 {
+            for _ in 0..released {
+                metrics::record_fetch_failed(self.kind);
+            }
             trace!(count = released, "Id fetch chunk failed");
         }
         vec![]
@@ -186,7 +198,9 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
 
     fn handle_drop(&mut self, ids: &[Id]) -> Vec<FetchOutput<Id>> {
         for id in ids {
-            self.pending.remove(id);
+            if self.pending.remove(id).is_some() {
+                metrics::record_fetch_completed(self.kind);
+            }
         }
         vec![]
     }
@@ -274,7 +288,7 @@ mod tests {
 
     #[test]
     fn request_then_tick_emits_chunked_sends() {
-        let mut p = Fetch::<TxHash>::new(config());
+        let mut p = Fetch::<TxHash>::new("test", config());
         p.handle(FetchInput::Request {
             ids: vec![tx(1), tx(2), tx(3), tx(4), tx(5)],
             peers: pinned(vid(1)),
@@ -291,7 +305,7 @@ mod tests {
 
     #[test]
     fn failed_releases_chunk_for_retry() {
-        let mut p = Fetch::<TxHash>::new(config());
+        let mut p = Fetch::<TxHash>::new("test", config());
         p.handle(FetchInput::Request {
             ids: vec![tx(1), tx(2)],
             peers: pinned(vid(1)),
@@ -310,7 +324,7 @@ mod tests {
 
     #[test]
     fn admitted_drops_ids() {
-        let mut p = Fetch::<TxHash>::new(config());
+        let mut p = Fetch::<TxHash>::new("test", config());
         p.handle(FetchInput::Request {
             ids: vec![tx(1), tx(2)],
             peers: pinned(vid(1)),
@@ -325,14 +339,14 @@ mod tests {
 
     #[test]
     fn admitted_unknown_id_is_silent_noop() {
-        let mut p = Fetch::<TxHash>::new(config());
+        let mut p = Fetch::<TxHash>::new("test", config());
         let out = p.handle(FetchInput::Admitted { ids: vec![tx(99)] });
         assert!(out.is_empty());
     }
 
     #[test]
     fn duplicate_request_keeps_existing_peers() {
-        let mut p = Fetch::<TxHash>::new(config());
+        let mut p = Fetch::<TxHash>::new("test", config());
         p.handle(FetchInput::Request {
             ids: vec![tx(1)],
             peers: pinned(vid(1)),
@@ -355,11 +369,14 @@ mod tests {
 
     #[test]
     fn siblings_share_peer_pool_via_arc_grouping() {
-        let mut p = Fetch::<TxHash>::new(FetchConfig {
-            max_in_flight: 100,
-            max_ids_per_request: 50,
-            parallel_chunks_per_tick: 8,
-        });
+        let mut p = Fetch::<TxHash>::new(
+            "test",
+            FetchConfig {
+                max_in_flight: 100,
+                max_ids_per_request: 50,
+                parallel_chunks_per_tick: 8,
+            },
+        );
         p.handle(FetchInput::Request {
             ids: (0..30).map(tx).collect(),
             peers: pinned(vid(1)),
@@ -372,11 +389,14 @@ mod tests {
 
     #[test]
     fn global_in_flight_cap_bounds_emissions() {
-        let mut p = Fetch::<TxHash>::new(FetchConfig {
-            max_in_flight: 3,
-            max_ids_per_request: 10,
-            parallel_chunks_per_tick: 4,
-        });
+        let mut p = Fetch::<TxHash>::new(
+            "test",
+            FetchConfig {
+                max_in_flight: 3,
+                max_ids_per_request: 10,
+                parallel_chunks_per_tick: 4,
+            },
+        );
         p.handle(FetchInput::Request {
             ids: (0..10).map(tx).collect(),
             peers: pinned(vid(1)),

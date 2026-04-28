@@ -108,6 +108,10 @@ where
                     outbound_cache.get_outbound(req.block_height, req.target_shard);
                 if let Some(provisions) = cached_outbound.first() {
                     use hyperscale_messages::response::GetProvisionResponse;
+                    hyperscale_metrics::record_fetch_response_sent(
+                        "provision",
+                        provisions.transactions.len().max(1),
+                    );
                     return GetProvisionResponse {
                         provisions: Some((**provisions).clone()),
                     };
@@ -117,6 +121,12 @@ where
                 {
                     let guard = dedup.lock().unwrap();
                     if let Some(cached) = guard.cache.get(&cache_key) {
+                        if let Some(p) = &cached.provisions {
+                            hyperscale_metrics::record_fetch_response_sent(
+                                "provision",
+                                p.transactions.len().max(1),
+                            );
+                        }
                         return cached.clone();
                     }
                     // Check if another thread is already computing this
@@ -148,6 +158,12 @@ where
                 let topo = topology.load();
                 let response =
                     serve_provision_request(&*storage, topo.local_shard(), topo.num_shards(), &req);
+                if let Some(p) = &response.provisions {
+                    hyperscale_metrics::record_fetch_response_sent(
+                        "provision",
+                        p.transactions.len(),
+                    );
+                }
 
                 // Store in cache, notify waiters, remove in-flight
                 {

@@ -325,25 +325,35 @@ where
         let initial_persisted_height = state.bft().committed_height();
         let b = &config.batch;
         let sync_protocol = SyncProtocol::new(config.sync.clone());
-        let transaction_fetch = TransactionFetch::new(config.transaction_fetch.clone());
-        let local_provision_fetch = LocalProvisionFetch::new(FetchConfig {
-            max_in_flight: 64,
-            max_ids_per_request: 16,
-            parallel_chunks_per_tick: 2,
-        });
-        let finalized_wave_fetch = FinalizedWaveFetch::new(FetchConfig {
-            max_in_flight: 8,
-            max_ids_per_request: 4,
-            parallel_chunks_per_tick: 1,
-        });
-        let provision_fetch = ProvisionFetch::new(config.provision_fetch.clone());
-        let exec_cert_fetch = ExecCertFetch::new(config.exec_cert_fetch.clone());
+        let transaction_fetch =
+            TransactionFetch::new("transaction", config.transaction_fetch.clone());
+        let local_provision_fetch = LocalProvisionFetch::new(
+            "local_provision",
+            FetchConfig {
+                max_in_flight: 64,
+                max_ids_per_request: 16,
+                parallel_chunks_per_tick: 2,
+            },
+        );
+        let finalized_wave_fetch = FinalizedWaveFetch::new(
+            "finalized_wave",
+            FetchConfig {
+                max_in_flight: 8,
+                max_ids_per_request: 4,
+                parallel_chunks_per_tick: 1,
+            },
+        );
+        let provision_fetch = ProvisionFetch::new("provision", config.provision_fetch.clone());
+        let exec_cert_fetch = ExecCertFetch::new("exec_cert", config.exec_cert_fetch.clone());
         // Header fetches are scope-id (one per height); single-id chunks suffice.
-        let header_fetch = HeaderFetch::new(FetchConfig {
-            max_in_flight: 16,
-            max_ids_per_request: 1,
-            parallel_chunks_per_tick: 4,
-        });
+        let header_fetch = HeaderFetch::new(
+            "header",
+            FetchConfig {
+                max_in_flight: 16,
+                max_ids_per_request: 1,
+                parallel_chunks_per_tick: 4,
+            },
+        );
         let storage = Arc::new(storage);
         let pending_chain = Arc::new(hyperscale_storage::PendingChain::new(Arc::clone(&storage)));
         let caches = SharedCaches::new(Arc::clone(state.provisions().store()));
