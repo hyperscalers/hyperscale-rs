@@ -1,5 +1,8 @@
 //! Node state machine.
 
+mod proposal;
+mod timers;
+
 use hyperscale_bft::{BftConfig, BftCoordinator, RecoveredState};
 use hyperscale_core::{Action, ProtocolEvent, StateMachine, TimerId};
 use hyperscale_execution::ExecutionCoordinator;
@@ -8,9 +11,8 @@ use hyperscale_provisions::{OutboundProvisionTracker, ProvisionConfig, Provision
 use hyperscale_remote_headers::RemoteHeaderCoordinator;
 use hyperscale_topology::TopologyCoordinator;
 use hyperscale_types::{
-    Block, BlockHash, BlockHeader, BlockManifest, CertifiedBlock, FinalizedWave, LocalTimestamp,
-    Provisions, QuorumCertificate, RoutableTransaction, ShardGroupId, StateRoot, TopologySnapshot,
-    TxHash,
+    Block, BlockHash, BlockHeader, BlockManifest, CertifiedBlock, LocalTimestamp,
+    QuorumCertificate, RoutableTransaction, ShardGroupId, StateRoot, TopologySnapshot, TxHash,
 };
 use std::sync::Arc;
 use tracing::instrument;
@@ -67,16 +69,6 @@ impl std::fmt::Debug for NodeStateMachine {
             .field("now", &self.now)
             .finish_non_exhaustive()
     }
-}
-
-/// Inputs gathered for building a block proposal.
-///
-/// Used by both `ContentAvailable` and `QuorumCertificateFormed` handlers
-/// to avoid duplicating the ready-transaction gathering logic.
-struct ProposalInputs {
-    ready_txs: Vec<Arc<RoutableTransaction>>,
-    finalized_waves: Vec<Arc<FinalizedWave>>,
-    provisions: Vec<Arc<Provisions>>,
 }
 
 impl NodeStateMachine {
@@ -183,99 +175,7 @@ impl NodeStateMachine {
         // implicitly via the proposal timer (HotStuff-2 style)
     }
 
-    // ─── Shared Helpers ─────────────────────────────────────────────────
-
-    /// Gather all inputs needed for a block proposal.
-    ///
-    /// Used by both `on_proposal_timer` and `on_qc_formed` to avoid duplicating
-    /// the ready-transaction + abort intents + certificates gathering logic.
-    fn gather_proposal_inputs(&self, pending_txs: usize, pending_certs: usize) -> ProposalInputs {
-        // Request extra transactions from the mempool to compensate for QC-chain
-        // duplicates that will be filtered by BFT during proposal building.
-        let max_txs = self.bft.config().max_transactions_per_block + self.bft.dedup_overhead();
-        let ready_txs =
-            self.mempool
-                .ready_transactions(max_txs, pending_txs, pending_certs, self.now);
-        let finalized_waves = self.execution.get_finalized_waves();
-        let provisions = self.provisions.queued_provisions(self.now);
-
-        ProposalInputs {
-            ready_txs,
-            finalized_waves,
-            provisions,
-        }
-    }
-
     // ─── Event Handlers ─────────────────────────────────────────────────
-
-    /// Handle cleanup timer.
-    #[instrument(skip(self))]
-    fn on_cleanup_timer(&mut self) -> Vec<Action> {
-        // Reschedule the cleanup timer
-        let mut actions = vec![Action::SetTimer {
-            id: TimerId::Cleanup,
-            duration: self.bft.config().cleanup_interval,
-        }];
-
-        // Check pending blocks that need fetch requests.
-        // We delay fetching to give gossip and local certificate creation
-        // time to fill in missing data first.
-        actions.extend(
-            self.bft
-                .check_pending_block_fetches(self.topology.snapshot(), false),
-        );
-
-        // Check if we're behind and need to catch up via sync.
-        // This handles the case where we have a higher latest_qc than committed_height,
-        // meaning the network has progressed but we're stuck.
-        actions.extend(self.bft.check_sync_health(self.topology.snapshot()));
-
-        // Drop tombstones whose `end_timestamp_exclusive` has passed —
-        // past expiry, validator-side validity check rejects re-submission
-        // anyway, so the tombstone is no longer correctness-bearing.
-        self.mempool.cleanup_expired_tombstones();
-
-        // Drop pending pool entries past their `end_timestamp_exclusive`.
-        // The proposer filter already skips them at selection time; this
-        // sweep keeps the pool from accumulating dead entries when expiry
-        // outpaces selection (transient cross-shard stalls, etc.).
-        self.mempool.cleanup_expired_pending();
-
-        actions
-    }
-
-    /// Handle view change timer — check if the leader has timed out.
-    fn on_view_change_timer(&mut self) -> Vec<Action> {
-        if let Some(actions) = self.bft.check_round_timeout(self.topology.snapshot()) {
-            actions
-        } else {
-            // Conditions not met yet. Reschedule for the remaining time
-            // until the actual timeout fires (relative to last_leader_activity).
-            let remaining = self.bft.remaining_view_change_timeout();
-            vec![Action::SetTimer {
-                id: TimerId::ViewChange,
-                duration: remaining,
-            }]
-        }
-    }
-
-    /// Handle content available — try to propose if we're the proposer.
-    fn on_content_available(&mut self) -> Vec<Action> {
-        self.try_event_driven_proposal()
-    }
-
-    /// Shared proposal logic for `ContentAvailable` and QC-formed paths.
-    fn try_event_driven_proposal(&mut self) -> Vec<Action> {
-        let (pending_txs, pending_certs) = self.bft.pending_block_counts();
-        let inputs = self.gather_proposal_inputs(pending_txs, pending_certs);
-
-        self.bft.try_propose(
-            self.topology.snapshot(),
-            &inputs.ready_txs,
-            inputs.finalized_waves,
-            inputs.provisions,
-        )
-    }
 
     /// Handle a received block header — validate in-flight limits.
     fn on_block_header_received(
@@ -498,7 +398,7 @@ impl StateMachine for NodeStateMachine {
             // ── Timers ───────────────────────────────────────────────────
             ProtocolEvent::CleanupTimer => self.on_cleanup_timer(),
             ProtocolEvent::ViewChangeTimer => self.on_view_change_timer(),
-            ProtocolEvent::ContentAvailable => self.on_content_available(),
+            ProtocolEvent::ContentAvailable => self.try_event_driven_proposal(),
 
             // ── BFT Consensus ────────────────────────────────────────────
             ProtocolEvent::BlockHeaderReceived { header, manifest } => {
