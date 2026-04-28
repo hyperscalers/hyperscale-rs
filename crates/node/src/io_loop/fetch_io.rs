@@ -22,7 +22,7 @@ where
     /// Dispatch outputs from any [`FetchBinding`]'s state machine: emit one
     /// network request per chunk (or per id, for `PER_ID` bindings) and
     /// route the response through the binding's callback.
-    pub(super) fn process_fetch_outputs<B: FetchBinding>(
+    pub(in crate::io_loop) fn process_fetch_outputs<B: FetchBinding>(
         &self,
         outputs: Vec<crate::io_loop::protocol::fetch::FetchOutput<B::Id>>,
     ) {
@@ -54,7 +54,7 @@ where
     /// Drive a single fetch binding: feed a `Request`, drain the resulting
     /// `Tick` outputs through `process_fetch_outputs`. Used by both the
     /// `Action::Fetch` arms and the `*FetchFailed` step arms.
-    pub(super) fn drive_fetch<B: FetchBinding>(
+    pub(in crate::io_loop) fn drive_fetch<B: FetchBinding>(
         &mut self,
         input: crate::io_loop::protocol::fetch::FetchInput<B::Id>,
     ) {
@@ -75,7 +75,7 @@ where
         self.process_fetch_outputs::<B>(outputs);
     }
 
-    pub(super) fn update_fetch_tick_timer(&mut self) {
+    pub(in crate::io_loop) fn update_fetch_tick_timer(&mut self) {
         let op = if self.protocols.has_any_pending() {
             TimerOp::Set {
                 id: TimerId::FetchTick,

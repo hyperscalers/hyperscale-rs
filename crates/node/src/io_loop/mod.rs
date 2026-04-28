@@ -21,10 +21,10 @@
 mod actions;
 mod block_commit;
 mod caches;
+mod fetch_io;
 mod network_handlers;
 mod phase_times;
 pub mod protocol;
-mod protocols;
 mod step;
 mod verify;
 
