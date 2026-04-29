@@ -487,34 +487,17 @@ seeded_tests! {
     cross_shard_provisions_fetch_with_50pct_request_loss_seed_2026 => 2026,
 }
 
-/// Cross-shard remote-header fetch fallback. Source-shard validators
-/// normally broadcast `block.committed` gossip on every commit, which
-/// the target shard's `RemoteHeaderCoordinator` consumes to gate
-/// downstream provision/EC expectations. Suppressing that gossip forces
-/// the target shard to fetch missing headers via
-/// `GetCommittedBlockHeaderRequest`.
+/// Cross-shard remote-header sync. Source-shard validators normally
+/// broadcast `block.committed` gossip on every commit, which the target
+/// shard's `RemoteHeaderCoordinator` consumes to gate downstream
+/// provision/EC expectations. Suppressing that gossip forces the target
+/// shard's `RemoteHeaderSyncProtocol` (sliding-window range catch-up) to
+/// pull headers directly from source-shard committee members.
 ///
 /// This is the *first link* in the cross-shard recovery chain — without
 /// the remote header, neither the provision-fetch nor the EC-fetch
 /// trigger has anything to register against.
-///
-/// **Known failing**: header fetch fallback fires (Layers 1+2 pass —
-/// `block.committed` rule fires ~15k times across the run, header fetch
-/// engages, served headers come back), but the cross-shard tx still
-/// aborts on every node (`transactions_aborted = 6`). With the gossip
-/// channel dropped per commit, the target shard's
-/// `RemoteHeaderCoordinator.last_verified_height` lags hundreds of
-/// blocks behind head. By the time the catch-up chain reaches the
-/// specific source block referenced by the cross-shard tx, that wave
-/// has already hit `WAVE_TIMEOUT` (24s of weighted-timestamp) and
-/// committed an all-abort wave cert. Documents a real architectural
-/// finding: continuous remote-header gossip loss puts cross-shard
-/// liveness at the mercy of catch-up rate vs. wave timeout, even
-/// though every individual fetch step succeeds.
-/// Remove `#[ignore]` if/when remote-header catch-up parallelises or
-/// the wave timeout is extended for cross-shard waves.
 #[test]
-#[ignore = "cumulative recovery timeouts exceed WAVE_TIMEOUT — see body comment"]
 fn cross_shard_header_fetch_fallback_when_committed_gossip_dropped() {
     run_cross_shard_fault_scenario(
         |runner| {
@@ -526,6 +509,6 @@ fn cross_shard_header_fetch_fallback_when_committed_gossip_dropped() {
                     .install(),
             ]
         },
-        &["header"],
+        &["remote_header"],
     );
 }
