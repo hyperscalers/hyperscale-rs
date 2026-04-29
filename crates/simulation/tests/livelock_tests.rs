@@ -32,8 +32,8 @@ fn two_shard_config() -> NetworkConfig {
     NetworkConfig {
         num_shards: 2,
         validators_per_shard: 3,
-        intra_shard_latency: Duration::from_millis(10),
-        cross_shard_latency: Duration::from_millis(50),
+        intra_shard_latency: Duration::from_millis(100),
+        cross_shard_latency: Duration::from_millis(100),
         jitter_fraction: 0.1,
         ..Default::default()
     }

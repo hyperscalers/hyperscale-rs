@@ -1142,7 +1142,8 @@ impl ExecutionCoordinator {
             .flat_map(|(wid, _)| wid.remote_shards.iter().copied())
             .filter(|s| *s != local_shard)
             .collect();
-        self.expected_certs.retain_if_shard_needed(&shards_needed);
+        self.expected_certs
+            .retain_if_shard_needed(&shards_needed, now_ts);
         self.expected_certs.prune_fulfilled(now_ts);
 
         actions

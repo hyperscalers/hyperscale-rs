@@ -49,6 +49,16 @@ const EXEC_CERT_RETRY_INTERVAL: Duration = Duration::from_secs(10);
 /// duplicate still in flight from that path finds its tombstone here.
 const FULFILLED_EXEC_CERT_RETENTION: Duration = Duration::from_secs(WAVE_TIMEOUT.as_secs() * 2);
 
+/// Grace window during which a freshly-registered expectation is retained
+/// even when no local wave references its source shard yet. Remote
+/// committed-block headers can arrive ahead of the local block that
+/// creates the dependent wave; without this window, the registration is
+/// silently pruned by `retain_if_shard_needed` and the EC never gets
+/// fetched. Sized to comfortably exceed the worst-case lag between
+/// receiving the remote header and committing the local block referencing
+/// the same cross-shard tx.
+const EXPECTED_RETENTION_GRACE: Duration = WAVE_TIMEOUT;
+
 type ExpectedCertKey = (ShardGroupId, BlockHeight, WaveId);
 
 /// Per-expectation bookkeeping.
@@ -138,9 +148,21 @@ impl ExpectedCertTracker {
     /// Drop expectations whose source shard is no longer referenced by any
     /// outstanding local wave. The coordinator computes the set from
     /// `WaveRegistry` and passes it in — the tracker has no view of waves.
-    pub fn retain_if_shard_needed(&mut self, shards_needed: &HashSet<ShardGroupId>) {
-        self.expected
-            .retain(|(source_shard, _, _), _| shards_needed.contains(source_shard));
+    pub fn retain_if_shard_needed(
+        &mut self,
+        shards_needed: &HashSet<ShardGroupId>,
+        now_ts: WeightedTimestamp,
+    ) {
+        // Retain expectations whose source shard is still referenced by a
+        // local wave OR whose registration is recent enough that the
+        // matching local wave may not have been committed yet. Without the
+        // grace window, a remote header arriving slightly ahead of the
+        // local block that creates the dependent wave is silently pruned
+        // and the EC never gets fetched.
+        self.expected.retain(|(source_shard, _, _), entry| {
+            shards_needed.contains(source_shard)
+                || now_ts.elapsed_since(entry.discovered_at) < EXPECTED_RETENTION_GRACE
+        });
     }
 
     /// Drop fulfilled tombstones older than the retention window. Pruning
@@ -298,10 +320,29 @@ mod tests {
         t.register(ShardGroupId(2), BlockHeight(6), w2.clone(), ms(0));
 
         let needed: HashSet<ShardGroupId> = std::iter::once(ShardGroupId(1)).collect();
-        t.retain_if_shard_needed(&needed);
+        // Advance past the grace window so the unneeded entry is actually pruned.
+        let now = ms(u64::try_from(EXPECTED_RETENTION_GRACE.as_millis()).unwrap() + 1);
+        t.retain_if_shard_needed(&needed, now);
 
         assert!(t.is_expected(ShardGroupId(1), BlockHeight(5), &w1));
         assert!(!t.is_expected(ShardGroupId(2), BlockHeight(6), &w2));
+    }
+
+    #[test]
+    fn retain_if_shard_needed_keeps_recent_unneeded_expectation() {
+        // A remote header can register an expectation before the local block
+        // creating the dependent wave commits — the grace window protects
+        // that race.
+        let mut t = ExpectedCertTracker::new();
+        let w = wave(5);
+        t.register(ShardGroupId(1), BlockHeight(5), w.clone(), ms(0));
+
+        // Within grace window, no local wave references shard 1 yet —
+        // expectation must still be retained.
+        let needed: HashSet<ShardGroupId> = HashSet::new();
+        t.retain_if_shard_needed(&needed, ms(1_000));
+
+        assert!(t.is_expected(ShardGroupId(1), BlockHeight(5), &w));
     }
 
     #[test]
