@@ -1,16 +1,16 @@
 //! Centralized remote header coordination.
 //!
 //! This module is the single source of truth for remote committed block headers.
-//! It receives raw headers from gossip (or fallback fetch), dispatches QC
+//! It receives raw headers from gossip (or sync-driven fetch), dispatches QC
 //! verification, stores verified headers, and emits `RemoteHeaderAdmitted`
 //! continuations for downstream consumers (BFT, Provision, Execution).
 //!
 //! It also tracks per-shard liveness and emits
-//! `Action::Fetch(FetchRequest::RemoteHeader)` when a remote shard hasn't
-//! sent headers within the timeout window — enabling proposer-only gossip
-//! with fallback recovery.
+//! `Action::StartRemoteHeaderSync` when a remote shard hasn't sent headers
+//! within the staleness threshold — the I/O loop's
+//! `RemoteHeaderSyncProtocol` then runs sliding-window catch-up.
 
-use hyperscale_core::{Action, FetchPeers, FetchRequest, ProtocolEvent};
+use hyperscale_core::{Action, ProtocolEvent};
 use hyperscale_types::{
     BlockHeight, Bls12381G1PublicKey, CommittedBlockHeader, REMOTE_HEADER_RETENTION, ShardGroupId,
     TopologySnapshot, ValidatorId, WeightedTimestamp,
@@ -20,14 +20,21 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, trace, warn};
 
-/// How long to wait before requesting missing headers from a remote shard.
-/// Measured against the BFT-authenticated `weighted_timestamp_ms` of our
-/// local committed blocks, so the timeout is independent of local block
-/// production rate.
+/// How long to wait before raising the per-shard sync target for a remote
+/// shard. Measured against the BFT-authenticated `weighted_timestamp_ms`
+/// of our local committed blocks, so the threshold is independent of
+/// local block production rate.
 ///
 /// Sized to give the remote proposer's gossip time to arrive across typical
-/// committee latency before we initiate a fallback fetch.
+/// committee latency before we ask the I/O loop's `RemoteHeaderSyncProtocol`
+/// to probe.
 const HEADER_LIVENESS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Probe lookahead added to `last_verified_height` when raising the sync
+/// target. Sized to fit one full range fetch at the I/O loop's maximum
+/// batch size, so a single round-trip can close a long gap without
+/// requiring repeated target bumps.
+const DEFAULT_PROBE_LOOKAHEAD: u64 = 64;
 
 /// Remote header coordinator memory statistics for monitoring collection sizes.
 #[allow(missing_docs)] // flat counters; field names are the documentation
@@ -41,7 +48,10 @@ pub struct RemoteHeaderMemoryStats {
 /// Tracks an expected header from a remote shard that hasn't arrived yet.
 ///
 /// Created from topology knowledge: if we know a shard exists, we expect
-/// headers from it. If none arrive within the timeout, we request via fallback.
+/// headers from it. If none arrive within the staleness threshold, we
+/// raise the per-shard target on the I/O loop's
+/// `RemoteHeaderSyncProtocol`, which manages range fetching and per-fetch
+/// backoff itself.
 #[derive(Debug, Clone)]
 struct ExpectedHeader {
     /// Local weighted timestamp when we first expected a header from
@@ -55,12 +65,6 @@ struct ExpectedHeader {
     /// remote shard, rather than comparing heights across independent
     /// counters. `None` until the first header is verified.
     last_verified_at: Option<WeightedTimestamp>,
-    /// Whether we've already emitted a fallback request for the current gap.
-    requested: bool,
-    /// Local weighted timestamp when we last emitted a fallback request.
-    /// Used as a cooldown to prevent re-requesting every block when the
-    /// gap remains open after a fetch completes or is dropped.
-    requested_at: WeightedTimestamp,
 }
 
 /// Centralized remote block header coordination.
@@ -104,13 +108,11 @@ pub struct RemoteHeaderCoordinator {
     tips: HashMap<ShardGroupId, (BlockHeight, WeightedTimestamp)>,
 
     // ═══════════════════════════════════════════════════════════════════
-    // Liveness Tracking (for fallback requests)
+    // Liveness Tracking (drives header-sync staleness detection)
     // ═══════════════════════════════════════════════════════════════════
-    /// Per-shard liveness tracking for fallback header requests.
-    ///
-    /// Populated when topology tells us remote shards exist.
-    /// Emits `Action::Fetch(FetchRequest::RemoteHeader)` when a shard hasn't
-    /// sent headers within the timeout.
+    /// Per-shard liveness tracking. Populated when topology tells us
+    /// remote shards exist. Drives `Action::StartRemoteHeaderSync` when a
+    /// shard hasn't sent headers within `HEADER_LIVENESS_TIMEOUT`.
     expected: HashMap<ShardGroupId, ExpectedHeader>,
 
     /// Current local committed height (updated on each block commit).
@@ -286,17 +288,15 @@ impl RemoteHeaderCoordinator {
         let mut actions = Vec::new();
 
         // Update liveness tracking: advance the remote tip and record the
-        // local height at which we received it. Reset the request flag so
-        // future gaps can trigger new requests. Any in-flight fallback fetch
-        // for this gap self-cancels via the `RemoteHeaderAdmitted`
-        // continuation, which the io_loop translates into an admission
-        // signal on the header fetch protocol.
+        // local height at which we received it. The I/O loop's
+        // `RemoteHeaderSyncProtocol` observes the same `RemoteHeaderAdmitted`
+        // continuation and advances its per-shard `committed` counter,
+        // ending an in-flight catch-up cycle once it reaches target.
         if let Some(expected) = self.expected.get_mut(&shard)
             && height > expected.last_verified_height
         {
             expected.last_verified_height = height;
             expected.last_verified_at = Some(self.local_committed_ts);
-            expected.requested = false;
         }
 
         // Emit continuation so downstream consumers receive the verified header.
@@ -354,8 +354,6 @@ impl RemoteHeaderCoordinator {
                     discovered_at: self.local_committed_ts,
                     last_verified_height: BlockHeight(0),
                     last_verified_at: None,
-                    requested: false,
-                    requested_at: WeightedTimestamp::ZERO,
                 });
         }
 
@@ -363,7 +361,7 @@ impl RemoteHeaderCoordinator {
         let mut actions = vec![];
         let now = self.local_committed_ts;
 
-        for (&shard, expected) in &mut self.expected {
+        for (&shard, expected) in &self.expected {
             // Liveness baseline: when we last verified a header from this
             // shard, or the seeding time if we haven't seen one yet. Both
             // anchors are local weighted timestamps, so age is measured in
@@ -374,75 +372,57 @@ impl RemoteHeaderCoordinator {
                 continue;
             }
 
-            // If we already have a request in flight, only re-request after
-            // a full cooldown period. This prevents flooding when the gap
-            // remains open (e.g. fetch failed or returned a partial result
-            // that didn't close the gap).
-            if expected.requested
-                && now.elapsed_since(expected.requested_at) < HEADER_LIVENESS_TIMEOUT
-            {
+            if topology.committee_for_shard(shard).is_empty() {
                 continue;
             }
 
-            // Request missing header from any validator in the source shard.
-            let from_height = BlockHeight(expected.last_verified_height.0 + 1);
-            let peers = topology.committee_for_shard(shard).to_vec();
-            if peers.is_empty() {
-                continue;
-            }
+            // Probe the source shard's tip via the I/O loop's
+            // `RemoteHeaderSyncProtocol`. The action is idempotent — the
+            // FSM short-circuits if its target is already at or past
+            // `target`, and applies its own per-fetch backoff on failures.
+            let target = BlockHeight(expected.last_verified_height.0 + DEFAULT_PROBE_LOOKAHEAD);
 
             info!(
                 source_shard = shard.0,
-                from_height = from_height.0,
+                target = target.0,
                 age_ms = u64::try_from(now.elapsed_since(baseline).as_millis()).unwrap_or(u64::MAX),
-                "Remote header liveness timeout — requesting missing headers via fallback"
+                "Remote header liveness timeout — raising sync target"
             );
 
-            expected.requested = true;
-            expected.requested_at = now;
-            actions.push(Action::Fetch(FetchRequest::RemoteHeader {
+            actions.push(Action::StartRemoteHeaderSync {
                 source_shard: shard,
-                from_height,
-                peers: FetchPeers::rotation(peers),
-            }));
+                target,
+            });
         }
 
         actions
     }
 
-    /// Immediately request missing headers for all remote shards that are
-    /// behind, bypassing the normal liveness timeout.
+    /// Immediately raise the sync target for all remote shards that are
+    /// behind, bypassing the normal liveness threshold.
     ///
     /// Called on sync-complete so the validator quickly discovers provision
     /// needs for blocks committed during the sync window.
     pub fn flush_expected_headers(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
         let mut actions = vec![];
-        let now = self.local_committed_ts;
 
-        for (&shard, expected) in &mut self.expected {
-            if expected.requested {
+        for (&shard, expected) in &self.expected {
+            if topology.committee_for_shard(shard).is_empty() {
                 continue;
             }
 
-            let from_height = BlockHeight(expected.last_verified_height.0 + 1);
-            let peers = topology.committee_for_shard(shard).to_vec();
-            if peers.is_empty() {
-                continue;
-            }
+            let target = BlockHeight(expected.last_verified_height.0 + DEFAULT_PROBE_LOOKAHEAD);
 
             info!(
                 source_shard = shard.0,
-                from_height = from_height.0,
-                "Sync catchup — immediately requesting remote headers"
+                target = target.0,
+                "Sync catchup — raising remote-header sync target"
             );
 
-            expected.requested = true;
-            expected.requested_at = now;
-            actions.push(Action::Fetch(FetchRequest::RemoteHeader {
+            actions.push(Action::StartRemoteHeaderSync {
                 source_shard: shard,
-                from_height,
-                peers: FetchPeers::rotation(peers),
-            }));
+                target,
+            });
         }
         actions
     }

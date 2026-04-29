@@ -23,8 +23,9 @@
 //!
 //! With proposer-only gossip, headers may not arrive (proposer is byzantine/slow).
 //! The coordinator tracks per-shard liveness and emits
-//! `Action::Fetch(FetchRequest::RemoteHeader)` after a timeout, triggering a
-//! point-to-point fetch from any validator in the source shard.
+//! `Action::StartRemoteHeaderSync` after a staleness threshold, raising the
+//! per-shard target on the I/O loop's sliding-window
+//! `RemoteHeaderSyncProtocol`.
 
 mod coordinator;
 
