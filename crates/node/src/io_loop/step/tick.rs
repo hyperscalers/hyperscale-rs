@@ -8,7 +8,7 @@
 
 use crate::io_loop::IoLoop;
 use crate::io_loop::protocol::binding::{
-    ExecCertBinding, FinalizedWaveBinding, HeaderBinding, LocalProvisionBinding, ProvisionBinding,
+    ExecCertBinding, FinalizedWaveBinding, LocalProvisionBinding, ProvisionBinding,
     TransactionBinding,
 };
 use crate::io_loop::protocol::fetch::FetchInput;
@@ -45,7 +45,6 @@ where
         self.drive_fetch::<ProvisionBinding>(FetchInput::Tick);
 
         self.drive_fetch::<ExecCertBinding>(FetchInput::Tick);
-        self.drive_fetch::<HeaderBinding>(FetchInput::Tick);
 
         self.update_fetch_tick_timer();
     }

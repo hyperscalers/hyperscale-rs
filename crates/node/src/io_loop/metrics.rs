@@ -39,7 +39,7 @@ pub struct MetricsSnapshot {
     pub fetch_provision: usize,
     pub fetch_local_provision: usize,
     pub fetch_exec_cert: usize,
-    pub fetch_header: usize,
+    pub fetch_remote_header: usize,
     pub fetch_finalized_wave: usize,
     pub memory: metrics::MemoryMetrics,
 }
@@ -62,7 +62,7 @@ pub fn record_metrics<S: ChainWriter>(snapshot: MetricsSnapshot, storage: &S) {
     metrics::set_fetch_in_flight("provision", snapshot.fetch_provision);
     metrics::set_fetch_in_flight("local_provision", snapshot.fetch_local_provision);
     metrics::set_fetch_in_flight("exec_cert", snapshot.fetch_exec_cert);
-    metrics::set_fetch_in_flight("header", snapshot.fetch_header);
+    metrics::set_fetch_in_flight("remote_header", snapshot.fetch_remote_header);
     metrics::set_fetch_in_flight("finalized_wave", snapshot.fetch_finalized_wave);
 
     // RocksDB property queries — potentially slow under compaction pressure.
@@ -118,7 +118,7 @@ where
             fetch_provision: proto.provision_in_flight,
             fetch_local_provision: proto.local_provision_in_flight,
             fetch_exec_cert: proto.exec_cert_in_flight,
-            fetch_header: proto.header_in_flight,
+            fetch_remote_header: self.protocols.remote_header_sync.in_flight_ranges(),
             fetch_finalized_wave: proto.finalized_wave_in_flight,
             memory: metrics::MemoryMetrics {
                 // BFT
@@ -194,7 +194,10 @@ where
                 node_finalized_wave_fetch_pending: proto.finalized_wave_pending,
                 node_provision_fetch_pending: proto.provision_pending,
                 node_exec_cert_fetch_pending: proto.exec_cert_pending,
-                node_header_fetch_pending: proto.header_pending,
+                node_remote_header_fetch_pending: self
+                    .protocols
+                    .remote_header_sync
+                    .in_flight_ranges(),
                 // Storage — filled in by record_metrics off-thread.
                 rocksdb_block_cache_usage_bytes: 0,
                 rocksdb_memtable_usage_bytes: 0,

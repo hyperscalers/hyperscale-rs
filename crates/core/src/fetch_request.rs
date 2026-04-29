@@ -99,15 +99,4 @@ pub enum FetchRequest {
         /// health-weighted selection works equally well empirically.
         peers: FetchPeers,
     },
-    /// Cross-shard committed-block-header fetch (`ScopeFetch` keyed by
-    /// `(ShardGroupId, BlockHeight)`).
-    RemoteHeader {
-        /// Source shard whose headers are missing.
-        source_shard: ShardGroupId,
-        /// First missing height (fetch starts from here).
-        from_height: BlockHeight,
-        /// Source-shard peer pool. No canonical preferred — any peer can
-        /// serve.
-        peers: FetchPeers,
-    },
 }

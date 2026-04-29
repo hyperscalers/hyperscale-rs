@@ -7,8 +7,8 @@
 
 use super::binding::{
     ExecCertBinding, ExecCertFetch, FetchBinding, FinalizedWaveBinding, FinalizedWaveFetch,
-    HeaderBinding, HeaderFetch, LocalProvisionBinding, LocalProvisionFetch, ProvisionBinding,
-    ProvisionFetch, TransactionBinding, TransactionFetch,
+    LocalProvisionBinding, LocalProvisionFetch, ProvisionBinding, ProvisionFetch,
+    TransactionBinding, TransactionFetch,
 };
 use super::fetch::FetchConfig;
 use super::remote_header_sync::{
@@ -44,9 +44,6 @@ pub struct ProtocolHost {
 
     /// Cross-shard execution-cert fetch (rotates through source committee).
     pub exec_cert: ExecCertFetch,
-
-    /// Cross-shard committed-block-header fetch (rotates through source committee).
-    pub header: HeaderFetch,
 }
 
 impl ProtocolHost {
@@ -75,15 +72,6 @@ impl ProtocolHost {
             ),
             provision: ProvisionFetch::new("provision", config.provision_fetch.clone()),
             exec_cert: ExecCertFetch::new("exec_cert", config.exec_cert_fetch.clone()),
-            // Header fetches are scope-id (one per height); single-id chunks suffice.
-            header: HeaderFetch::new(
-                "header",
-                FetchConfig {
-                    max_in_flight: 16,
-                    max_ids_per_request: 1,
-                    parallel_chunks_per_tick: 4,
-                },
-            ),
         }
     }
 
@@ -96,7 +84,6 @@ impl ProtocolHost {
             || self.finalized_wave.has_pending()
             || self.provision.has_pending()
             || self.exec_cert.has_pending()
-            || self.header.has_pending()
             || self.sync.has_deferred()
             || self.remote_header_sync.has_deferred()
             || self.remote_header_sync.is_syncing()
@@ -111,7 +98,6 @@ impl ProtocolHost {
         FinalizedWaveBinding::apply_admission(&mut self.finalized_wave, event);
         ProvisionBinding::apply_admission(&mut self.provision, event);
         ExecCertBinding::apply_admission(&mut self.exec_cert, event);
-        HeaderBinding::apply_admission(&mut self.header, event);
     }
 
     /// Drive the sync protocol's periodic tick. Returns the outputs the
@@ -156,8 +142,6 @@ impl ProtocolHost {
             provision_pending: self.provision.pending_count(),
             exec_cert_in_flight: self.exec_cert.in_flight_count(),
             exec_cert_pending: self.exec_cert.pending_count(),
-            header_in_flight: self.header.in_flight_count(),
-            header_pending: self.header.pending_count(),
             sync_status: self.sync.status(),
         }
     }
@@ -179,7 +163,5 @@ pub struct ProtocolMetrics {
     pub provision_pending: usize,
     pub exec_cert_in_flight: usize,
     pub exec_cert_pending: usize,
-    pub header_in_flight: usize,
-    pub header_pending: usize,
     pub sync_status: SyncStatus,
 }

@@ -1386,8 +1386,8 @@ impl MetricsRecorder for PrometheusRecorder {
             .set(m.node_exec_cert_fetch_pending as f64);
         self.metrics
             .memory_node
-            .with_label_values(&["header_fetch_pending"])
-            .set(m.node_header_fetch_pending as f64);
+            .with_label_values(&["remote_header_fetch_pending"])
+            .set(m.node_remote_header_fetch_pending as f64);
 
         // Storage
         self.metrics

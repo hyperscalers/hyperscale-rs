@@ -3,7 +3,6 @@
 //! These messages are sent directly to a specific peer and expect a response.
 
 mod block;
-mod committed_header;
 mod execution_cert;
 mod finalized_wave;
 mod local_provision;
@@ -13,7 +12,6 @@ mod sync;
 mod transaction;
 
 pub use block::{GetBlockRequest, Inventory};
-pub use committed_header::GetCommittedBlockHeaderRequest;
 pub use execution_cert::GetExecutionCertsRequest;
 pub use finalized_wave::GetFinalizedWavesRequest;
 pub use local_provision::GetLocalProvisionsRequest;

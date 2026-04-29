@@ -3,7 +3,6 @@
 //! These messages are sent in reply to request messages.
 
 mod block;
-mod committed_header;
 mod execution_cert;
 mod finalized_wave;
 mod local_provision;
@@ -12,7 +11,6 @@ mod remote_header;
 mod transaction;
 
 pub use block::{ElidedCertifiedBlock, GetBlockResponse, RehydrationMiss};
-pub use committed_header::GetCommittedBlockHeaderResponse;
 pub use execution_cert::GetExecutionCertsResponse;
 pub use finalized_wave::GetFinalizedWavesResponse;
 pub use local_provision::GetLocalProvisionsResponse;

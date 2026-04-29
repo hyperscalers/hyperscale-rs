@@ -11,7 +11,6 @@ use hyperscale_messages::{
 };
 use hyperscale_network::Network;
 use hyperscale_storage::Storage;
-use hyperscale_types::BlockHeight;
 use tracing::warn;
 
 impl<S, N, D, E> IoLoop<S, N, D, E>
@@ -260,34 +259,6 @@ where
                         GetExecutionCertsResponse {
                             certificates: Some(certs),
                         }
-                    }
-                },
-            );
-
-        // ── committed_header.request → serve from local storage ────────
-
-        let storage = Arc::clone(&self.storage);
-        self.network
-            .register_request_handler::<hyperscale_messages::request::GetCommittedBlockHeaderRequest>(
-                move |req: hyperscale_messages::request::GetCommittedBlockHeaderRequest| {
-                    use hyperscale_messages::response::GetCommittedBlockHeaderResponse;
-
-                    // Look up the committed block at the requested height.
-                    let certified = storage
-                        .get_block(BlockHeight(req.height.0));
-
-                    match certified {
-                        Some(certified) => {
-                            let committed = hyperscale_types::CommittedBlockHeader::new(
-                                certified.block.header().clone(),
-                                certified.qc,
-                            );
-                            hyperscale_metrics::record_fetch_response_sent("header", 1);
-                            GetCommittedBlockHeaderResponse {
-                                header: Some(committed),
-                            }
-                        }
-                        None => GetCommittedBlockHeaderResponse { header: None },
                     }
                 },
             );

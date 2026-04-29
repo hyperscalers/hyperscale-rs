@@ -4,7 +4,7 @@ use super::IoLoop;
 use super::TimerOp;
 use super::block_commit::{AccumulateDecision, PendingCommit};
 use crate::io_loop::protocol::binding::{
-    ExecCertBinding, FinalizedWaveBinding, HeaderBinding, LocalProvisionBinding, ProvisionBinding,
+    ExecCertBinding, FinalizedWaveBinding, LocalProvisionBinding, ProvisionBinding,
     TransactionBinding,
 };
 use crate::io_loop::protocol::fetch::FetchInput;
@@ -460,14 +460,6 @@ where
                     peers,
                 });
             }
-            FetchRequest::RemoteHeader {
-                source_shard,
-                from_height,
-                peers,
-            } => self.drive_fetch::<HeaderBinding>(FetchInput::Request {
-                ids: vec![(source_shard, from_height)],
-                peers,
-            }),
         }
 
         self.update_fetch_tick_timer();

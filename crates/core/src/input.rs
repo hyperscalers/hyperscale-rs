@@ -213,14 +213,6 @@ pub enum NodeInput {
         /// Wave ids that weren't returned.
         hashes: Vec<WaveId>,
     },
-
-    /// A committed block header fetch request failed.
-    HeaderFetchFailed {
-        /// Source shard the fetch targeted.
-        source_shard: ShardGroupId,
-        /// Starting height that failed to return.
-        from_height: BlockHeight,
-    },
 }
 
 impl NodeInput {
@@ -268,7 +260,6 @@ impl NodeInput {
             Self::ProvisionsFetchFailed { .. } => EventPriority::Internal,
             Self::ExecutionCertsReceived { .. } => EventPriority::Internal,
             Self::ExecCertFetchFailed { .. } => EventPriority::Internal,
-            Self::HeaderFetchFailed { .. } => EventPriority::Internal,
             Self::LocalProvisionReceived { .. } => EventPriority::Internal,
             Self::LocalProvisionsFetchFailed { .. } => EventPriority::Internal,
             Self::FinalizedWaveReceived { .. } => EventPriority::Internal,

@@ -6,7 +6,7 @@
 
 use crate::io_loop::IoLoop;
 use crate::io_loop::protocol::binding::{
-    ExecCertBinding, FinalizedWaveBinding, HeaderBinding, LocalProvisionBinding, ProvisionBinding,
+    ExecCertBinding, FinalizedWaveBinding, LocalProvisionBinding, ProvisionBinding,
     TransactionBinding,
 };
 use crate::io_loop::protocol::fetch::FetchInput;
@@ -56,17 +56,6 @@ where
 
     pub(in crate::io_loop) fn handle_exec_cert_fetch_failed(&mut self, hashes: Vec<WaveId>) {
         self.drive_fetch::<ExecCertBinding>(FetchInput::Failed { ids: hashes });
-        self.update_fetch_tick_timer();
-    }
-
-    pub(in crate::io_loop) fn handle_header_fetch_failed(
-        &mut self,
-        source_shard: ShardGroupId,
-        from_height: BlockHeight,
-    ) {
-        self.drive_fetch::<HeaderBinding>(FetchInput::Failed {
-            ids: vec![(source_shard, from_height)],
-        });
         self.update_fetch_tick_timer();
     }
 }

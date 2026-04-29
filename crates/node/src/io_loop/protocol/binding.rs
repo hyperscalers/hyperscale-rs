@@ -19,13 +19,11 @@ use super::host::ProtocolHost;
 use crossbeam::channel::Sender;
 use hyperscale_core::{FetchPeers, NodeInput, ProtocolEvent};
 use hyperscale_messages::request::{
-    GetCommittedBlockHeaderRequest, GetExecutionCertsRequest, GetFinalizedWavesRequest,
-    GetLocalProvisionsRequest, GetProvisionsRequest, GetTransactionsRequest,
+    GetExecutionCertsRequest, GetFinalizedWavesRequest, GetLocalProvisionsRequest,
+    GetProvisionsRequest, GetTransactionsRequest,
 };
 use hyperscale_network::{Network, ResponseVerdict};
-use hyperscale_types::{
-    BlockHeight, ProvisionHash, ShardGroupId, TxHash, ValidatorId, WaveId, WaveIdHash,
-};
+use hyperscale_types::{BlockHeight, ProvisionHash, ShardGroupId, TxHash, WaveId, WaveIdHash};
 use std::hash::Hash;
 use std::sync::Arc;
 
@@ -41,8 +39,6 @@ pub type FinalizedWaveFetch = Fetch<WaveIdHash>;
 pub type ExecCertFetch = Fetch<WaveId>;
 /// Cross-shard provision fetch keyed by `(source_shard, block_height)`.
 pub type ProvisionFetch = Fetch<(ShardGroupId, BlockHeight)>;
-/// Cross-shard committed-block-header fetch keyed by `(source_shard, height)`.
-pub type HeaderFetch = Fetch<(ShardGroupId, BlockHeight)>;
 
 // ─── Trait ─────────────────────────────────────────────────────────────
 
@@ -397,72 +393,4 @@ pub fn provisions_is_abandoned(
 ) -> bool {
     let (shard, height) = *id;
     !state.provisions().is_expected(shard, height)
-}
-
-/// Marker type for the cross-shard committed-block-header fetch.
-pub struct HeaderBinding;
-
-impl FetchBinding for HeaderBinding {
-    type Id = (ShardGroupId, BlockHeight);
-
-    const NAME: &'static str = "header";
-
-    /// Each request targets exactly one `(shard, height)`.
-    const PER_ID: bool = true;
-
-    fn fetch_mut(host: &mut ProtocolHost) -> &mut Fetch<Self::Id> {
-        &mut host.header
-    }
-
-    fn dispatch_chunk<N: Network>(
-        ids: Vec<(ShardGroupId, BlockHeight)>,
-        peers: &FetchPeers,
-        _local_shard: ShardGroupId,
-        network: &N,
-        sender: &Sender<NodeInput>,
-    ) {
-        debug_assert_eq!(ids.len(), 1);
-        let (source_shard, from_height) = ids[0];
-        let request = GetCommittedBlockHeaderRequest {
-            shard: source_shard,
-            height: from_height,
-        };
-        let es = sender.clone();
-        network.request(
-            &peers.peers,
-            peers.preferred,
-            request,
-            Box::new(move |result| {
-                let Ok(response) = result else {
-                    let _ = es.send(NodeInput::HeaderFetchFailed {
-                        source_shard,
-                        from_height,
-                    });
-                    return ResponseVerdict::Accept;
-                };
-                let Some(header) = response.header else {
-                    let _ = es.send(NodeInput::HeaderFetchFailed {
-                        source_shard,
-                        from_height,
-                    });
-                    return ResponseVerdict::Reject;
-                };
-                let _ = es.send(NodeInput::Protocol(Box::new(
-                    ProtocolEvent::RemoteHeaderReceived {
-                        committed_header: header,
-                        sender: ValidatorId(0),
-                    },
-                )));
-                ResponseVerdict::Accept
-            }),
-        );
-    }
-
-    fn apply_admission(fetch: &mut Fetch<Self::Id>, event: &ProtocolEvent) {
-        if let ProtocolEvent::RemoteHeaderAdmitted { committed_header } = event {
-            fetch.handle(FetchInput::Admitted {
-                ids: vec![(committed_header.shard_group_id(), committed_header.height())],
-            });
-        }
-    }
 }

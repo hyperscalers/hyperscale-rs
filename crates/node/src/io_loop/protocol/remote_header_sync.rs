@@ -257,6 +257,12 @@ impl RemoteHeaderSyncProtocol {
         self.shards.values().any(|s| s.committed < s.target)
     }
 
+    /// Total in-flight range fetches across all shards. Used for metrics.
+    #[must_use]
+    pub fn in_flight_ranges(&self) -> usize {
+        self.shards.values().map(|s| s.in_flight_ranges).sum()
+    }
+
     /// Process an input and return outputs.
     pub fn handle(&mut self, input: SyncInput) -> Vec<SyncOutput> {
         match input {

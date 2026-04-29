@@ -200,8 +200,8 @@ pub struct MemoryMetrics {
     pub node_provision_fetch_pending: usize,
     /// (shard, height) keys with pending cross-shard execution-cert fetches.
     pub node_exec_cert_fetch_pending: usize,
-    /// (shard, `from_height`) keys with pending cross-shard header fetches.
-    pub node_header_fetch_pending: usize,
+    /// In-flight cross-shard remote-header range fetches across all shards.
+    pub node_remote_header_fetch_pending: usize,
 
     // ── Storage (byte-level where available) ──
     /// `RocksDB` block cache usage in bytes.
