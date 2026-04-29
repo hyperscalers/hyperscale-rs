@@ -221,10 +221,12 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::ExecutionCertificateAggregated { .. }
             | ProtocolEvent::ExecutionCertificatesReceived { .. }
             | ProtocolEvent::ExecutionCertificateSignatureVerified { .. }
-            | ProtocolEvent::ExecutionCertificateAdmitted { .. }) => self.handle_execution(evt),
+            | ProtocolEvent::ExecutionCertificateAdmitted { .. }
+            | ProtocolEvent::FinalizedWavesReceived { .. }) => self.handle_execution(evt),
 
             // ── Transactions ─────────────────────────────────────────────
             evt @ (ProtocolEvent::TransactionGossipReceived { .. }
+            | ProtocolEvent::TransactionsReceived { .. }
             | ProtocolEvent::TransactionsAdmitted { .. }) => self.handle_transaction(evt),
 
             // ── Sync ─────────────────────────────────────────────────────

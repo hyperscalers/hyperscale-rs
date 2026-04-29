@@ -372,13 +372,6 @@ where
             }
 
             // ── Fetch protocol ─────────────────────────────────────────
-            NodeInput::TransactionReceived {
-                transactions,
-                missing_hashes,
-            } => {
-                self.handle_transactions_received(transactions, missing_hashes);
-            }
-
             NodeInput::FetchTransactionsFailed { hashes } => {
                 self.handle_fetch_transactions_failed(hashes);
             }
@@ -393,10 +386,6 @@ where
             NodeInput::ExecCertFetchFailed { hashes } => self.handle_exec_cert_fetch_failed(hashes),
 
             // ── Committed header (gossip → BLS verify → state machine) ──
-            NodeInput::CommittedHeaderValidated {
-                committed_header,
-                sender,
-            } => self.handle_committed_header_validated(committed_header, sender),
             NodeInput::CommittedBlockGossipReceived {
                 committed_header,
                 sender,
@@ -409,20 +398,8 @@ where
                 sender_signature,
             ),
 
-            NodeInput::LocalProvisionReceived {
-                batches,
-                missing_hashes,
-            } => self.handle_local_provision_received(batches, missing_hashes),
-
             NodeInput::LocalProvisionsFetchFailed { hashes } => {
                 self.handle_local_provisions_fetch_failed(hashes);
-            }
-
-            NodeInput::FinalizedWaveReceived {
-                waves,
-                missing_hashes,
-            } => {
-                self.handle_finalized_wave_received(waves, missing_hashes);
             }
 
             NodeInput::FinalizedWaveFetchFailed { hashes } => {

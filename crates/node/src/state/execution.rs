@@ -57,6 +57,13 @@ impl NodeStateMachine {
                 }
                 actions
             }
+            ProtocolEvent::FinalizedWavesReceived { waves } => {
+                let mut actions = Vec::new();
+                for wave in waves {
+                    actions.extend(self.execution.admit_finalized_wave(wave));
+                }
+                actions
+            }
             ProtocolEvent::ExecutionCertificateSignatureVerified { certificate, valid } => self
                 .execution
                 .on_certificate_verified(self.topology.snapshot(), certificate, valid),

@@ -375,6 +375,28 @@ pub enum ProtocolEvent {
         certificate: Arc<ExecutionCertificate>,
     },
 
+    /// Transactions delivered from a fetch request (raw, before mempool admission).
+    ///
+    /// Routed to `NodeStateMachine::on_transactions_fetched`, which funnels
+    /// them through mempool admission. The fetch protocol drain hooks this
+    /// event directly to drop every delivered hash from `in_flight`,
+    /// including duplicates / tombstoned / validity-expired txs that won't
+    /// surface via `TransactionsAdmitted`.
+    TransactionsReceived {
+        /// Transactions returned by the peer.
+        transactions: Vec<Arc<RoutableTransaction>>,
+    },
+
+    /// Finalized waves delivered from a peer in response to a fetch request.
+    ///
+    /// Routed to `ExecutionCoordinator::admit_finalized_wave` per wave.
+    /// The fetch protocol drain hooks the subsequent `FinalizedWavesAdmitted`
+    /// continuation, not this event.
+    FinalizedWavesReceived {
+        /// Finalized waves returned by the peer.
+        waves: Vec<Arc<FinalizedWave>>,
+    },
+
     /// Finalized waves were just admitted to the canonical execution store.
     ///
     /// Emitted by `ExecutionCoordinator` (wrapped in `Action::Continuation`)

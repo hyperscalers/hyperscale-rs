@@ -6,7 +6,6 @@
 //! variant payloads and forwards to the appropriate `handle_*` method.
 
 mod block_sync;
-mod fetch_delivery;
 mod fetch_failure;
 mod gossip;
 mod protocol;

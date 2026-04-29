@@ -9,10 +9,9 @@
 //!    BLS verification.
 //! 2. `flush_committed_header_verifications` — fires when the batch fills
 //!    or its window expires. Spawns one closure on the crypto pool that
-//!    verifies each sender's BLS signature. Valid headers are sent back as
-//!    `CommittedHeaderValidated`.
-//! 3. `CommittedHeaderValidated` — the verified header is fed into the
-//!    state machine as `RemoteHeaderReceived`.
+//!    verifies each sender's BLS signature. Valid headers are emitted
+//!    directly as `ProtocolEvent::RemoteHeaderReceived` for the state
+//!    machine to dispatch QC verification.
 
 use crate::io_loop::IoLoop;
 use crate::io_loop::verify::verify_bls_with_metrics;
@@ -40,19 +39,6 @@ where
     D: Dispatch,
     E: Engine,
 {
-    /// Sender signature already verified — feed the header into the state
-    /// machine for QC-verification dispatch.
-    pub(in crate::io_loop) fn handle_committed_header_validated(
-        &mut self,
-        committed_header: CommittedBlockHeader,
-        sender: ValidatorId,
-    ) {
-        self.feed_event(ProtocolEvent::RemoteHeaderReceived {
-            committed_header,
-            sender,
-        });
-    }
-
     /// Inbound handler closure already verified sender's committee
     /// membership and resolved the public key. Queue for batched BLS
     /// verification; fires `flush_committed_header_verifications` when full.
@@ -73,7 +59,8 @@ where
     /// Flush accumulated committed-header sender-signature verifications.
     ///
     /// Spawns one closure on the crypto pool that verifies each sender's
-    /// BLS signature. Valid headers are sent back as `CommittedHeaderValidated`.
+    /// BLS signature. Valid headers are emitted directly as
+    /// `ProtocolEvent::RemoteHeaderReceived` for state-machine ingestion.
     pub(in crate::io_loop) fn flush_committed_header_verifications(&mut self) {
         let items = self.committed_header_batch.take();
         if items.is_empty() {
@@ -95,10 +82,12 @@ where
                     "committed_header",
                 );
                 if valid {
-                    let _ = event_tx.send(NodeInput::CommittedHeaderValidated {
-                        committed_header,
-                        sender,
-                    });
+                    let _ = event_tx.send(NodeInput::Protocol(Box::new(
+                        ProtocolEvent::RemoteHeaderReceived {
+                            committed_header,
+                            sender,
+                        },
+                    )));
                 } else {
                     tracing::warn!(
                         sender = sender.0,

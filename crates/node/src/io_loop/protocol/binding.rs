@@ -112,10 +112,14 @@ impl FetchBinding for TransactionBinding {
                         txs.iter().map(|tx| tx.hash()).collect();
                     let missing_hashes: Vec<TxHash> =
                         hs.into_iter().filter(|h| !delivered.contains(h)).collect();
-                    let _ = es.send(NodeInput::TransactionReceived {
-                        transactions: txs,
-                        missing_hashes,
-                    });
+                    let _ = es.send(NodeInput::Protocol(Box::new(
+                        ProtocolEvent::TransactionsReceived { transactions: txs },
+                    )));
+                    if !missing_hashes.is_empty() {
+                        let _ = es.send(NodeInput::FetchTransactionsFailed {
+                            hashes: missing_hashes,
+                        });
+                    }
                     if returned < requested {
                         ResponseVerdict::Reject
                     } else {
@@ -130,8 +134,19 @@ impl FetchBinding for TransactionBinding {
     }
 
     fn apply_admission(fetch: &mut Fetch<TxHash>, event: &ProtocolEvent) {
-        if let ProtocolEvent::TransactionsAdmitted { txs } = event {
-            let ids: Vec<TxHash> = txs.iter().map(|tx| tx.hash()).collect();
+        // Drain on TransactionsReceived to catch every delivered hash —
+        // duplicates / tombstoned / validity-expired txs don't surface via
+        // TransactionsAdmitted, so without this they'd pin the in-flight
+        // set forever. Also drain on TransactionsAdmitted so the broadcast
+        // path (no Received event precursor) still drains.
+        let ids: Vec<TxHash> = match event {
+            ProtocolEvent::TransactionsReceived { transactions } => {
+                transactions.iter().map(|tx| tx.hash()).collect()
+            }
+            ProtocolEvent::TransactionsAdmitted { txs } => txs.iter().map(|tx| tx.hash()).collect(),
+            _ => return,
+        };
+        if !ids.is_empty() {
             fetch.handle(FetchInput::Admitted { ids });
         }
     }
@@ -169,12 +184,15 @@ impl FetchBinding for LocalProvisionBinding {
                     let missing_hashes: Vec<ProvisionHash> =
                         hs.into_iter().filter(|h| !delivered.contains(h)).collect();
                     let had_misses = !missing_hashes.is_empty();
-                    let batches = resp.provisions.into_iter().map(Arc::new).collect();
-                    let _ = es.send(NodeInput::LocalProvisionReceived {
-                        batches,
-                        missing_hashes,
-                    });
+                    for provisions in resp.provisions {
+                        let _ = es.send(NodeInput::Protocol(Box::new(
+                            ProtocolEvent::ProvisionsReceived { provisions },
+                        )));
+                    }
                     if had_misses {
+                        let _ = es.send(NodeInput::LocalProvisionsFetchFailed {
+                            hashes: missing_hashes,
+                        });
                         ResponseVerdict::Reject
                     } else {
                         ResponseVerdict::Accept
@@ -230,10 +248,14 @@ impl FetchBinding for FinalizedWaveBinding {
                     let missing_hashes: Vec<WaveIdHash> =
                         hs.into_iter().filter(|h| !delivered.contains(h)).collect();
                     let waves = resp.waves.into_iter().map(Arc::new).collect();
-                    let _ = es.send(NodeInput::FinalizedWaveReceived {
-                        waves,
-                        missing_hashes,
-                    });
+                    let _ = es.send(NodeInput::Protocol(Box::new(
+                        ProtocolEvent::FinalizedWavesReceived { waves },
+                    )));
+                    if !missing_hashes.is_empty() {
+                        let _ = es.send(NodeInput::FinalizedWaveFetchFailed {
+                            hashes: missing_hashes,
+                        });
+                    }
                     if returned < requested {
                         ResponseVerdict::Reject
                     } else {

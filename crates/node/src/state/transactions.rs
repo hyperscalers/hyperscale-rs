@@ -1,7 +1,8 @@
 //! Transaction-flow dispatch arms.
 //!
-//! Two `ProtocolEvent` variants drive the transaction pipeline:
+//! Three `ProtocolEvent` variants drive the transaction pipeline:
 //! - `TransactionGossipReceived` — gossip-delivered tx → mempool admission;
+//! - `TransactionsReceived` — fetch-delivered batch → mempool admission;
 //! - `TransactionsAdmitted` — mempool emits this after admission; BFT's
 //!   pending-block subscriber consumes it and we latch a proposal-retry.
 
@@ -18,6 +19,9 @@ impl NodeStateMachine {
                 tx,
                 submitted_locally,
             } => self.on_transaction_gossip_received(tx, submitted_locally),
+            ProtocolEvent::TransactionsReceived { transactions } => {
+                self.on_transactions_fetched(transactions)
+            }
             ProtocolEvent::TransactionsAdmitted { txs } => {
                 let actions = self
                     .bft
@@ -49,12 +53,11 @@ impl NodeStateMachine {
         )
     }
 
-    /// Admit a batch of fetch-delivered transactions through mempool. Called
-    /// directly from `io_loop` when a fetch response arrives — bypasses the
-    /// gossip-side validation pipeline (the txs came from a peer we asked).
-    /// Mempool emits `Continuation(TransactionsAdmitted)` for the admitted
-    /// subset; the admission arm latches the proposal-retry.
-    pub fn on_transactions_fetched(&mut self, txs: Vec<Arc<RoutableTransaction>>) -> Vec<Action> {
+    /// Admit a batch of fetch-delivered transactions through mempool. Bypasses
+    /// the gossip-side validation pipeline (the txs came from a peer we
+    /// asked). Mempool emits `Continuation(TransactionsAdmitted)` for the
+    /// admitted subset; the admission arm latches the proposal-retry.
+    fn on_transactions_fetched(&mut self, txs: Vec<Arc<RoutableTransaction>>) -> Vec<Action> {
         if txs.is_empty() {
             return vec![];
         }

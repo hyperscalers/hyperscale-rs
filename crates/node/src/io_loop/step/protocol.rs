@@ -32,9 +32,11 @@ where
         self.feed_event(ProtocolEvent::BlockPersisted { height });
     }
 
-    /// Default `Protocol(_)` passthrough — feed the variant into the state
-    /// machine without IoLoop-side side effects.
+    /// Default `Protocol(_)` passthrough — fan the event across fetch-binding
+    /// drain hooks (so e.g. `TransactionsReceived` clears in-flight tracking)
+    /// and feed the variant into the state machine.
     pub(in crate::io_loop) fn handle_protocol_passthrough(&mut self, event: ProtocolEvent) {
+        self.protocols.apply_admission(&event);
         self.feed_event(event);
     }
 }

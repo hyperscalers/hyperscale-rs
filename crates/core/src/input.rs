@@ -2,9 +2,8 @@
 
 use crate::ProtocolEvent;
 use hyperscale_types::{
-    BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, CommittedBlockHeader, FinalizedWave,
-    ProvisionHash, Provisions, RoutableTransaction, ShardGroupId, TxHash, ValidatorId, WaveId,
-    WaveIdHash,
+    BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, CommittedBlockHeader, ProvisionHash,
+    RoutableTransaction, ShardGroupId, TxHash, ValidatorId, WaveId, WaveIdHash,
 };
 use std::sync::Arc;
 
@@ -41,6 +40,7 @@ pub enum EventPriority {
 ///   (sync, fetch, validation pipeline) before potentially converting them
 ///   into `ProtocolEvent`s.
 #[derive(Debug, Clone, strum::IntoStaticStr)]
+#[allow(clippy::large_enum_variant)] // TODO: fix this. temporary until box.
 pub enum NodeInput {
     /// Pass-through to state machine. `IoLoop` extracts the `ProtocolEvent` and
     /// passes it to `state.handle()` directly. Boxed because `ProtocolEvent`
@@ -103,60 +103,10 @@ pub enum NodeInput {
         hashes: Vec<TxHash>,
     },
 
-    /// Received transactions from a fetch request (raw, before protocol processing).
-    ///
-    /// Routed to `NodeStateMachine::on_transactions_fetched`, which funnels
-    /// them through mempool admission. The block-hash association is reported
-    /// at admission time via the `Continuation(TransactionsAdmitted)` event;
-    /// `io_loop`'s drain doesn't need it here.
-    ///
-    /// `missing_hashes` lists requested hashes the peer did not return
-    /// (computed client-side as `requested - delivered`). The fetch FSM
-    /// feeds them as `Failed` so `in_flight` is cleared and the next tick
-    /// retries them; without this, partial responses would pin entries
-    /// in the in-flight set forever.
-    TransactionReceived {
-        /// Transactions returned by the peer.
-        transactions: Vec<Arc<RoutableTransaction>>,
-        /// Requested hashes the peer did not return.
-        missing_hashes: Vec<TxHash>,
-    },
-
-    /// Local provisions received from a fetch request.
-    ///
-    /// `missing_hashes` lists requested hashes the peer did not have
-    /// (evicted or never seen). Together with `batches` it fully partitions
-    /// the request, so the fetch protocol can reclaim missing hashes for
-    /// retry without relying on a per-peer heuristic.
-    LocalProvisionReceived {
-        /// Provision batches the peer returned.
-        batches: Vec<Arc<Provisions>>,
-        /// Hashes the peer didn't have — caller retries these elsewhere.
-        missing_hashes: Vec<ProvisionHash>,
-    },
-
     /// Local provision fetch failed.
     LocalProvisionsFetchFailed {
         /// Provision hashes that failed to fetch.
         hashes: Vec<ProvisionHash>,
-    },
-
-    /// Finalized waves received from a peer in response to a fetch request.
-    ///
-    /// Routed to `ExecutionCoordinator::admit_finalized_wave`. `io_loop`'s
-    /// `Continuation(FinalizedWavesAdmitted)` interception drains the matching
-    /// fetch protocol — the block-hash association and serving peer aren't
-    /// needed at `io_loop`'s level once the cert is in the wave's EC.
-    ///
-    /// `missing_hashes` lists requested wave-id hashes the peer did not
-    /// return (computed client-side as `requested - delivered`); the fetch
-    /// FSM feeds them as `Failed` so partial responses don't pin entries
-    /// in the in-flight set.
-    FinalizedWaveReceived {
-        /// Finalized waves returned by the peer.
-        waves: Vec<Arc<FinalizedWave>>,
-        /// Requested wave-id hashes the peer did not return.
-        missing_hashes: Vec<WaveIdHash>,
     },
 
     /// A finalized wave fetch request failed.
@@ -178,15 +128,6 @@ pub enum NodeInput {
     TransactionValidationsFailed {
         /// Hashes of transactions that failed validation.
         hashes: Vec<TxHash>,
-    },
-
-    /// A committed block header from a remote shard whose sender signature
-    /// has been verified by the `IoLoop` gossip gate.
-    CommittedHeaderValidated {
-        /// Verified committed block header from a remote shard.
-        committed_header: CommittedBlockHeader,
-        /// Validator that signed the gossip envelope.
-        sender: ValidatorId,
     },
 
     /// A committed block header gossip that has passed pre-filtering
@@ -242,11 +183,13 @@ impl NodeInput {
                 | ProtocolEvent::GlobalBlockReceived { .. }
                 | ProtocolEvent::GlobalBlockVoteReceived { .. }
                 | ProtocolEvent::ProvisionsReceived { .. }
-                | ProtocolEvent::ExecutionCertificatesReceived { .. } => EventPriority::Network,
+                | ProtocolEvent::ExecutionCertificatesReceived { .. }
+                | ProtocolEvent::FinalizedWavesReceived { .. }
+                | ProtocolEvent::TransactionsReceived { .. } => EventPriority::Network,
 
                 // Fetch delivery events are processed callbacks from the fetch
-                // protocol, not raw network messages (analogous to
-                // CommittedHeaderValidated). They fall through to Internal.
+                // protocol, not raw network messages. They fall through to
+                // Internal.
                 _ => EventPriority::Internal,
             },
             Self::SubmitTransaction { .. } => EventPriority::Client,
@@ -256,16 +199,12 @@ impl NodeInput {
             Self::RemoteHeadersFetchFailed { .. } => EventPriority::Internal,
             Self::FetchTick => EventPriority::Timer,
             Self::FetchTransactionsFailed { .. } => EventPriority::Internal,
-            Self::TransactionReceived { .. } => EventPriority::Network,
             Self::TransactionValidated { .. } => EventPriority::Internal,
             Self::TransactionValidationsFailed { .. } => EventPriority::Internal,
-            Self::CommittedHeaderValidated { .. } => EventPriority::Internal,
             Self::CommittedBlockGossipReceived { .. } => EventPriority::Network,
             Self::ProvisionsFetchFailed { .. } => EventPriority::Internal,
             Self::ExecCertFetchFailed { .. } => EventPriority::Internal,
-            Self::LocalProvisionReceived { .. } => EventPriority::Internal,
             Self::LocalProvisionsFetchFailed { .. } => EventPriority::Internal,
-            Self::FinalizedWaveReceived { .. } => EventPriority::Internal,
             Self::FinalizedWaveFetchFailed { .. } => EventPriority::Internal,
         }
     }
