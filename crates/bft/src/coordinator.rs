@@ -362,7 +362,9 @@ impl BftCoordinator {
         self.set_block_syncing(topology, true);
         self.block_sync.set_sync_target(target_height);
 
-        vec![Action::StartBlockSync { target_height }]
+        vec![Action::StartBlockSync {
+            target: target_height,
+        }]
     }
 
     /// Handle a synced block ready to apply (from runner via

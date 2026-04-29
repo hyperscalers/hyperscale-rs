@@ -35,6 +35,19 @@ where
     D: Dispatch,
     E: Engine,
 {
+    // ─── Action dispatch ────────────────────────────────────────────────
+
+    /// Handle `Action::StartBlockSync`: feed the FSM and dispatch any
+    /// fetches it emits.
+    pub(in crate::io_loop) fn process_start_block_sync(&mut self, target: BlockHeight) {
+        let outputs = self
+            .protocols
+            .block_sync
+            .handle(BlockSyncInput::StartSync { scope: (), target });
+        self.process_block_sync_outputs(outputs);
+        self.update_fetch_tick_timer();
+    }
+
     // ─── step() handlers ────────────────────────────────────────────────
 
     /// Handle a sync block response: rehydrate the elided block against

@@ -736,7 +736,7 @@ pub enum Action {
     /// `ProtocolEvent::BlockSyncReadyToApply`.
     StartBlockSync {
         /// The height we need to sync to.
-        target_height: BlockHeight,
+        target: BlockHeight,
     },
 
     /// Request the runner to start (or raise the target of) remote-header

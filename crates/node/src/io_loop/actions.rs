@@ -68,13 +68,14 @@ where
             }
 
             // ─── Sync / fetch protocol drive ───────────────────────────────
-            Action::StartBlockSync { .. } | Action::Fetch(_) => {
-                self.process_sync_fetch_action(action);
+            Action::StartBlockSync { target } => {
+                self.process_start_block_sync(target);
             }
             Action::StartRemoteHeaderSync {
                 source_shard,
                 target,
             } => self.process_start_remote_header_sync(source_shard, target),
+            Action::Fetch(req) => self.process_fetch_request(req),
 
             // ─── io_loop-internal effects ──────────────────────────────────
             Action::SetTimer { id, duration } => {
@@ -412,21 +413,6 @@ where
     pub(super) fn flush_block_commits(&mut self) {
         self.block_commit
             .flush(&self.storage, &self.event_sender, &self.dispatch);
-    }
-
-    /// Process sync and unified-fetch actions.
-    fn process_sync_fetch_action(&mut self, action: Action) {
-        match action {
-            Action::StartBlockSync { target_height } => {
-                let outputs = self.protocols.block_sync.handle(BlockSyncInput::StartSync {
-                    scope: (),
-                    target: target_height,
-                });
-                self.process_block_sync_outputs(outputs);
-            }
-            Action::Fetch(req) => self.process_fetch_request(req),
-            _ => unreachable!(),
-        }
     }
 
     /// Dispatch a typed fetch request to the corresponding binding.
