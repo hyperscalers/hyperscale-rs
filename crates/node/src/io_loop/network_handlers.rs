@@ -29,9 +29,10 @@ where
     pub(super) fn register_request_handler(&self) {
         use crate::io_loop::protocol::block_serve::serve_block_request;
         use crate::io_loop::protocol::provision_serve::serve_provision_request;
+        use crate::io_loop::protocol::remote_header_serve::serve_remote_headers_request;
         use crate::io_loop::protocol::transaction_serve::serve_transaction_request;
         use hyperscale_messages::request::{
-            GetBlockRequest, GetProvisionsRequest, GetTransactionsRequest,
+            GetBlockRequest, GetProvisionsRequest, GetRemoteHeadersRequest, GetTransactionsRequest,
         };
         use std::collections::HashMap;
         use std::sync::Arc;
@@ -290,6 +291,14 @@ where
                     }
                 },
             );
+
+        // ── remote_header.request → range header sync ───────────────────
+
+        let storage = Arc::clone(&self.storage);
+        self.network
+            .register_request_handler::<GetRemoteHeadersRequest>(move |req| {
+                serve_remote_headers_request(&*storage, &req)
+            });
     }
 
     /// Register gossip handlers for broadcast message types (transactions
