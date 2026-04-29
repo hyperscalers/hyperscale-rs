@@ -440,9 +440,20 @@ impl<B: SyncBinding> Sync<B> {
     }
 
     fn handle_admitted(&mut self, scope: &B::Scope, height: BlockHeight) -> Vec<SyncOutput<B>> {
-        let Some(state) = self.scopes.get_mut(scope) else {
-            return vec![];
-        };
+        // Always track the latest committed height for this scope, even if
+        // sync hasn't been started yet. Otherwise a future `StartSync`
+        // would re-fetch heights the consumer has already admitted.
+        let state = self
+            .scopes
+            .entry(scope.clone())
+            .or_insert_with(|| ScopeState::new(BlockHeight::GENESIS));
+
+        // `Complete` should only fire on the transition from "syncing" to
+        // "caught up" — i.e. the consumer admitted the height that closes
+        // the last gap. Capture whether we were below target *before*
+        // advancing committed so a steady-stream of admissions outside an
+        // active sync (target == committed) doesn't re-fire Complete.
+        let was_syncing = state.committed < state.target;
 
         if height > state.committed {
             state.committed = height;
@@ -451,7 +462,7 @@ impl<B: SyncBinding> Sync<B> {
         // Drop tracking state for heights at or below the new committed
         // level.
         let committed = state.committed;
-        let reached_target = committed >= state.target;
+        let reached_target = was_syncing && committed >= state.target;
         state.heights_queued.retain(|&h| h > committed);
         state.in_flight.retain(|&h| h > committed);
         state.deferred.retain(|&h, _| h > committed);
@@ -816,5 +827,82 @@ mod tests {
         });
         let st = s.scopes.get(&1).unwrap();
         assert_eq!(st.target, BlockHeight(7));
+    }
+
+    #[test]
+    fn admissions_before_first_start_sync_advance_committed() {
+        // Consumer admits heights before any sync has been requested.
+        // A subsequent `StartSync` must start from the current committed
+        // height, not from genesis.
+        let mut s: Sync<UnitBinding> = Sync::new(cfg_per_id());
+        for h in 1..=5 {
+            let outputs = s.handle(SyncInput::Admitted {
+                scope: (),
+                height: BlockHeight(h),
+            });
+            // Pre-sync admissions must not emit Complete (no sync was active).
+            assert!(
+                !outputs
+                    .iter()
+                    .any(|o| matches!(o, SyncOutput::Complete { .. }))
+            );
+        }
+
+        // Now request sync to height 8. Should only fetch heights 6, 7, 8.
+        let outputs = s.handle(SyncInput::StartSync {
+            scope: (),
+            target: BlockHeight(8),
+        });
+        let fetched_heights: Vec<u64> = outputs
+            .iter()
+            .filter_map(|o| match o {
+                SyncOutput::Fetch { from, .. } => Some(from.0),
+                SyncOutput::Complete { .. } => None,
+            })
+            .collect();
+        assert_eq!(fetched_heights, vec![6, 7, 8]);
+    }
+
+    #[test]
+    fn admissions_outside_sync_do_not_fire_complete() {
+        // Steady-state admission stream after sync caught up shouldn't
+        // re-fire Complete.
+        let mut s: Sync<UnitBinding> = Sync::new(SyncConfig {
+            max_per_request: 1,
+            window_size: 32,
+            max_concurrent_per_scope: 1,
+        });
+        let _ = s.handle(SyncInput::StartSync {
+            scope: (),
+            target: BlockHeight(2),
+        });
+        let _ = s.handle(SyncInput::Admitted {
+            scope: (),
+            height: BlockHeight(1),
+        });
+        let outputs = s.handle(SyncInput::Admitted {
+            scope: (),
+            height: BlockHeight(2),
+        });
+        // First catch-up: Complete fires.
+        assert_eq!(
+            outputs
+                .iter()
+                .filter(|o| matches!(o, SyncOutput::Complete { .. }))
+                .count(),
+            1
+        );
+        // Subsequent admissions while idle: no Complete.
+        for h in 3..=10 {
+            let outputs = s.handle(SyncInput::Admitted {
+                scope: (),
+                height: BlockHeight(h),
+            });
+            assert!(
+                !outputs
+                    .iter()
+                    .any(|o| matches!(o, SyncOutput::Complete { .. }))
+            );
+        }
     }
 }
