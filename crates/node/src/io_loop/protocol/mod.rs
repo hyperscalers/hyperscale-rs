@@ -2,11 +2,12 @@
 //!
 //! - [`fetch`] generic per-id fetch state machine, with per-payload bindings
 //!   in [`binding`] and the I/O-loop-owned bundle in [`host`].
-//! - [`sync`] block sync state machine + inbound block-request server handlers.
-//! - [`provision_serve`] / [`transaction_serve`] inbound request handlers
-//!   that serve cached state to peers.
+//! - [`sync`] block sync state machine.
+//! - [`block_serve`] / [`provision_serve`] / [`transaction_serve`] inbound
+//!   request handlers that serve cached state to peers.
 
 pub mod binding;
+pub mod block_serve;
 pub mod fetch;
 pub mod host;
 pub mod provision_serve;
