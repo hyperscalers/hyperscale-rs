@@ -196,8 +196,20 @@ impl ScopeState {
         None
     }
 
-    fn peek_next_height(&self) -> Option<BlockHeight> {
-        self.heights_to_fetch.peek().map(|Reverse(h)| *h)
+    /// Peek the lowest valid queued height, lazily discarding stale heap
+    /// tops left behind by `handle_admitted`'s prune of `heights_queued` /
+    /// `in_flight` (`BinaryHeap` has no `retain`). Keeps `peek` and `pop`
+    /// applying the same validity filter — without this, `peek` can return
+    /// a stale entry that `pop_next_height` then skips, breaking callers
+    /// that assume a successful peek implies a successful pop.
+    fn peek_next_height(&mut self) -> Option<BlockHeight> {
+        while let Some(&Reverse(top)) = self.heights_to_fetch.peek() {
+            if self.heights_queued.contains(&top) && !self.in_flight.contains(&top) {
+                return Some(top);
+            }
+            self.heights_to_fetch.pop();
+        }
+        None
     }
 }
 
@@ -904,5 +916,51 @@ mod tests {
                     .any(|o| matches!(o, SyncOutput::Complete { .. }))
             );
         }
+    }
+
+    #[test]
+    fn admit_past_queued_window_does_not_panic_on_stale_heap_top() {
+        // Regression: `peek_next_height` and `pop_next_height` previously
+        // applied different validity filters. After consensus advanced
+        // `committed` past every queued height (e.g. fast catch-up via gossip
+        // while sync was still draining its window), `handle_admitted` would
+        // prune `heights_queued` / `in_flight` but leave stale entries on the
+        // BinaryHeap. The next `emit_fetches` would peek a stale top, then
+        // `pop_next_height` would skip past it and return None → panic on
+        // `expect("peek matched")`. Reproduces the cluster-halt panic seen
+        // at sync.rs:547 (shard-1 validators 5/6).
+        let mut s: Sync<UnitBinding> = Sync::new(SyncConfig {
+            max_per_request: 1,
+            window_size: 64,
+            max_concurrent_per_scope: 4,
+        });
+
+        // StartSync queues 1..=10 and dispatches the first 4 (heap retains
+        // 5..=10).
+        let _ = s.handle(SyncInput::StartSync {
+            scope: (),
+            target: BlockHeight(10),
+        });
+
+        // Consensus admits past the entire queued window. This prunes
+        // `heights_queued` and `in_flight` but leaves 5..=10 on the heap.
+        for h in 1..=10 {
+            let _ = s.handle(SyncInput::Admitted {
+                scope: (),
+                height: BlockHeight(h),
+            });
+        }
+
+        // FetchSucceeded decrements `in_flight_ranges`, freeing a slot —
+        // this forces `emit_fetches` to re-enter its inner loop with a
+        // heap full of stale tops. Pre-fix this panics; post-fix peek
+        // self-prunes and returns None cleanly.
+        let _ = s.handle(SyncInput::FetchSucceeded {
+            scope: (),
+            from: BlockHeight(1),
+            count: 1,
+            delivered_heights: vec![BlockHeight(1)],
+            now: std::time::Instant::now(),
+        });
     }
 }
