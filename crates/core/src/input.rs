@@ -40,7 +40,6 @@ pub enum EventPriority {
 ///   (sync, fetch, validation pipeline) before potentially converting them
 ///   into `ProtocolEvent`s.
 #[derive(Debug, Clone, strum::IntoStaticStr)]
-#[allow(clippy::large_enum_variant)] // TODO: fix this. temporary until box.
 pub enum NodeInput {
     /// Pass-through to state machine. `IoLoop` extracts the `ProtocolEvent` and
     /// passes it to `state.handle()` directly. Boxed because `ProtocolEvent`
@@ -134,8 +133,11 @@ pub enum NodeInput {
     /// (sender committee check + public key resolution) but still needs
     /// batched BLS signature verification.
     CommittedBlockGossipReceived {
-        /// Header carried in the gossip envelope.
-        committed_header: CommittedBlockHeader,
+        /// Header carried in the gossip envelope. Boxed so the variant
+        /// stays small — `CommittedBlockHeader` is the bulky field; the
+        /// BLS pubkey/sig stay inline since boxing them adds an
+        /// allocation per gossip without crossing a meaningful threshold.
+        committed_header: Box<CommittedBlockHeader>,
         /// Sender validator id.
         sender: ValidatorId,
         /// Sender's public key, resolved from topology.

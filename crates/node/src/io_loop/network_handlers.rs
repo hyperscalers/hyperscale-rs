@@ -316,7 +316,7 @@ where
                     };
 
                     let _ = tx.send(NodeInput::CommittedBlockGossipReceived {
-                        committed_header: gossip.committed_header,
+                        committed_header: Box::new(gossip.committed_header),
                         sender,
                         public_key,
                         sender_signature: gossip.sender_signature,

@@ -406,7 +406,7 @@ where
                 public_key,
                 sender_signature,
             } => self.handle_committed_block_gossip_received(
-                committed_header,
+                *committed_header,
                 sender,
                 public_key,
                 sender_signature,
