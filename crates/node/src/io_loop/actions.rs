@@ -53,7 +53,6 @@ where
             | Action::VerifyTransactionRoot { .. }
             | Action::VerifyProvisionRoot { .. }
             | Action::VerifyCertificateRoot { .. }
-            | Action::VerifyLocalReceiptRoot { .. }
             | Action::VerifyProvisionTxRoots { .. }
             | Action::VerifyProvisions { .. }
             | Action::ExecuteTransactions { .. }
@@ -507,7 +506,6 @@ where
                 | Action::VerifyProvisionTxRoots { .. }
                 | Action::VerifyProvisionRoot { .. }
                 | Action::VerifyCertificateRoot { .. }
-                | Action::VerifyLocalReceiptRoot { .. }
                 | Action::VerifyStateRoot { .. }
                 | Action::BuildProposal { .. }
                 | Action::BroadcastBlockHeader { .. }

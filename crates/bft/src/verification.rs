@@ -11,8 +11,8 @@
 #[cfg(test)]
 use hyperscale_types::Hash;
 use hyperscale_types::{
-    Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, FinalizedWave, ProvisionsRoot,
-    ReceiptBundle, StateRoot, TopologySnapshot,
+    Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, FinalizedWave, LocalReceiptRoot,
+    ProvisionsRoot, StateRoot, TopologySnapshot,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -41,9 +41,15 @@ pub struct PendingQcVerification {
 /// captured at `initiate_state_root_verification` time — capturing at initiate
 /// time produced a stale-snapshot race where an entry deferred before its
 /// parent committed would dispatch with the wrong `parent_state_root`.
+///
+/// Carries `expected_local_receipt_root` so the verifier runs receipt-root
+/// validation as a pre-flight before the JMT computation: if the receipts
+/// don't reproduce the QC'd `local_receipt_root`, the JMT recomputation
+/// can't match `state_root` either (receipts ARE the JMT input), so the
+/// handler short-circuits and emits both root events with `valid=false`.
 #[derive(Debug)]
 pub struct ReadyStateRootVerification {
-    /// Block whose state root is being verified.
+    /// Block whose state and receipt roots are being verified.
     pub block_hash: BlockHash,
     /// Parent block hash; the JMT computation chains on top of this parent's snapshot.
     pub parent_block_hash: BlockHash,
@@ -53,6 +59,8 @@ pub struct ReadyStateRootVerification {
     pub parent_block_height: BlockHeight,
     /// State root the proposer claimed; the verifier rejects on mismatch.
     pub expected_root: StateRoot,
+    /// Local-receipt root from the block header (pre-flight check).
+    pub expected_local_receipt_root: LocalReceiptRoot,
     /// Finalized waves from the `PendingBlock` — these carry the proposer's receipts,
     /// ensuring all validators verify against the same execution outputs.
     pub finalized_waves: Vec<Arc<FinalizedWave>>,
@@ -80,6 +88,7 @@ pub struct PendingStateRootVerification {
     pub parent_block_hash: BlockHash,
     pub parent_block_height: BlockHeight,
     pub expected_root: StateRoot,
+    pub expected_local_receipt_root: LocalReceiptRoot,
     pub block_height: BlockHeight,
 }
 
@@ -444,6 +453,18 @@ impl VerificationPipeline {
         true
     }
 
+    /// Push a `PendingStateRootVerification` onto the ready queue and mark
+    /// both state-root and receipt-root as in-flight. The receipt-root
+    /// in-flight marker tracks the same dispatch lifecycle as state-root —
+    /// the unified `VerifyStateRoot` handler emits both events.
+    fn enqueue_ready_state_root(&mut self, ready: PendingStateRootVerification) {
+        self.state_root_verifications_in_flight
+            .insert(ready.block_hash);
+        self.in_flight_roots
+            .insert((ready.block_hash, VerificationKind::LocalReceiptRoot));
+        self.ready_state_root_verifications.push(ready);
+    }
+
     /// Initiate state root verification for a block.
     ///
     /// If JMT is ready, pushes to the ready queue for immediate dispatch.
@@ -464,6 +485,7 @@ impl VerificationPipeline {
             parent_block_hash,
             parent_block_height,
             expected_root: block.header().state_root,
+            expected_local_receipt_root: block.header().local_receipt_root,
             block_height: block.height(),
         };
 
@@ -475,8 +497,7 @@ impl VerificationPipeline {
             || self.verified_state_roots.contains(&parent_block_hash);
 
         if parent_tree_available {
-            self.state_root_verifications_in_flight.insert(block_hash);
-            self.ready_state_root_verifications.push(ready);
+            self.enqueue_ready_state_root(ready);
         } else {
             debug!(
                 block_hash = ?block_hash,
@@ -509,9 +530,7 @@ impl VerificationPipeline {
                         parent = ?block_hash,
                         "Unblocking deferred state root verification"
                     );
-                    self.state_root_verifications_in_flight
-                        .insert(ready.block_hash);
-                    self.ready_state_root_verifications.push(ready);
+                    self.enqueue_ready_state_root(ready);
                 }
             }
 
@@ -551,9 +570,7 @@ impl VerificationPipeline {
                     parent = ?block_hash,
                     "Unblocking deferred state root verification (proposer verified)"
                 );
-                self.state_root_verifications_in_flight
-                    .insert(ready.block_hash);
-                self.ready_state_root_verifications.push(ready);
+                self.enqueue_ready_state_root(ready);
             }
         }
 
@@ -631,27 +648,6 @@ impl VerificationPipeline {
             block_hash,
             expected_root: block.header().certificate_root,
             certificates: block.certificates().to_vec(),
-        }]
-    }
-
-    /// Initiate local receipt root verification for a block.
-    pub fn initiate_local_receipt_root_verification(
-        &mut self,
-        block_hash: BlockHash,
-        block: &Block,
-        receipts: Vec<ReceiptBundle>,
-    ) -> Vec<Action> {
-        debug!(
-            ?block_hash,
-            receipt_count = receipts.len(),
-            expected_root = ?block.header().local_receipt_root,
-            "Initiating local receipt root verification"
-        );
-        self.mark_root_in_flight(block_hash, VerificationKind::LocalReceiptRoot);
-        vec![Action::VerifyLocalReceiptRoot {
-            block_hash,
-            expected_root: block.header().local_receipt_root,
-            receipts,
         }]
     }
 
@@ -748,20 +744,6 @@ impl VerificationPipeline {
             !block.certificates().is_empty(),
         ) {
             actions.extend(self.initiate_certificate_root_verification(block_hash, block));
-        }
-
-        if self.needs_root(
-            block_hash,
-            VerificationKind::LocalReceiptRoot,
-            !block.certificates().is_empty(),
-        ) {
-            let receipts: Vec<_> = block
-                .certificates()
-                .iter()
-                .flat_map(|fw| fw.receipts.iter().cloned())
-                .collect();
-            actions
-                .extend(self.initiate_local_receipt_root_verification(block_hash, block, receipts));
         }
 
         if self.needs_root(
@@ -896,6 +878,7 @@ impl VerificationPipeline {
                     parent_state_root,
                     parent_block_height: pending.parent_block_height,
                     expected_root: pending.expected_root,
+                    expected_local_receipt_root: pending.expected_local_receipt_root,
                     finalized_waves,
                     block_height: pending.block_height,
                 }
@@ -989,9 +972,7 @@ impl VerificationPipeline {
             {
                 for ready in entries {
                     if ready.parent_block_height <= block_height {
-                        self.state_root_verifications_in_flight
-                            .insert(ready.block_hash);
-                        self.ready_state_root_verifications.push(ready);
+                        self.enqueue_ready_state_root(ready);
                     } else {
                         self.deferred_state_root_verifications
                             .entry(parent_block_hash)
@@ -1033,9 +1014,7 @@ impl VerificationPipeline {
                     parent = ?block_hash,
                     "Unblocking deferred state root verification (parent committed)"
                 );
-                self.state_root_verifications_in_flight
-                    .insert(ready.block_hash);
-                self.ready_state_root_verifications.push(ready);
+                self.enqueue_ready_state_root(ready);
             }
         }
 

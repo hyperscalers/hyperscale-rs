@@ -5,9 +5,9 @@ use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PublicKey,
     CertificateRoot, CommittedBlockHeader, ExecutionCertificate, ExecutionVote, FinalizedWave,
     GlobalReceiptRoot, LocalReceiptRoot, NodeId, ProposerTimestamp, ProvisionHash, ProvisionTxRoot,
-    Provisions, ProvisionsRoot, QuorumCertificate, ReceiptBundle, Round, RoutableTransaction,
-    ShardGroupId, StateProvision, StateRoot, TopologySnapshot, TransactionRoot, TransactionStatus,
-    TxHash, TxOutcome, ValidatorId, WaveId, WeightedTimestamp,
+    Provisions, ProvisionsRoot, QuorumCertificate, Round, RoutableTransaction, ShardGroupId,
+    StateProvision, StateRoot, TopologySnapshot, TransactionRoot, TransactionStatus, TxHash,
+    TxOutcome, ValidatorId, WaveId, WeightedTimestamp,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -317,18 +317,28 @@ pub enum Action {
         height: BlockHeight,
     },
 
-    /// Verify a block's state root against the JMT.
+    /// Verify a block's local-receipt root and state root against the JMT.
     ///
-    /// Applies the block's shard-local state changes to the JMT and compares the
-    /// resulting root against the header's `state_root`.
-    /// Returns `ProtocolEvent::BlockRootVerified`.
+    /// Runs the receipt-root check as a pre-flight: hashes the receipts in
+    /// `finalized_waves` and compares to `expected_local_receipt_root`. If
+    /// receipts diverge, the JMT recomputation cannot match `expected_root`
+    /// either (receipts ARE the JMT input), so the handler short-circuits
+    /// without touching the JMT. On receipt-root pass, applies the block's
+    /// shard-local state changes to the JMT and compares the resulting
+    /// root against the header's `state_root`.
+    ///
+    /// Emits two `ProtocolEvent::BlockRootVerified` events — one for
+    /// `VerificationKind::LocalReceiptRoot`, one for
+    /// `VerificationKind::StateRoot`. On receipt-root mismatch, the
+    /// state-root event reports `valid=false` so the coordinator's
+    /// per-kind tracking still completes.
     ///
     /// The action handler walks the snapshot chain from `parent_block_hash`
     /// to build an overlay of uncommitted tree nodes, then calls
     /// `prepare_block_commit` which computes the JMT root and caches a
     /// `PreparedCommit` for efficient commit later.
     VerifyStateRoot {
-        /// Block whose state root is being verified.
+        /// Block whose state and receipt roots are being verified.
         block_hash: BlockHash,
         /// Parent block hash — used to walk the snapshot chain for the overlay.
         parent_block_hash: BlockHash,
@@ -338,8 +348,11 @@ pub enum Action {
         parent_block_height: BlockHeight,
         /// Expected state root after applying writes.
         expected_root: StateRoot,
-        /// Finalized waves whose receipts contribute to the state root.
-        /// The thread pool merges `DatabaseUpdates` from these.
+        /// Expected local-receipt root (pre-flight check before JMT).
+        expected_local_receipt_root: LocalReceiptRoot,
+        /// Finalized waves whose receipts contribute to both the receipt
+        /// root and the state root. The thread pool merges `DatabaseUpdates`
+        /// from these.
         finalized_waves: Vec<Arc<FinalizedWave>>,
         /// Block height being verified.
         block_height: BlockHeight,
@@ -398,22 +411,6 @@ pub enum Action {
         expected_root: CertificateRoot,
         /// Finalized waves whose underlying cert `receipt_hash` values form the merkle leaves.
         certificates: Vec<Arc<FinalizedWave>>,
-    },
-
-    /// Verify a block's local receipt root.
-    ///
-    /// Computes the merkle root from each receipt's `receipt_hash()` and
-    /// compares against the block header's claimed `local_receipt_root`.
-    /// Returns `ProtocolEvent::LocalReceiptRootVerified`.
-    ///
-    /// Pure CPU operation — verified in parallel with other root verifications.
-    VerifyLocalReceiptRoot {
-        /// Block whose local receipt root is being verified.
-        block_hash: BlockHash,
-        /// Expected local receipt root from block header.
-        expected_root: LocalReceiptRoot,
-        /// Receipt bundles from finalized waves on the pending block.
-        receipts: Vec<ReceiptBundle>,
     },
 
     /// Verify a block's per-target-shard provisions commitments.
@@ -674,7 +671,6 @@ impl Action {
             | Self::VerifyTransactionRoot { .. }
             | Self::VerifyProvisionRoot { .. }
             | Self::VerifyCertificateRoot { .. }
-            | Self::VerifyLocalReceiptRoot { .. }
             | Self::VerifyProvisionTxRoots { .. }
             | Self::VerifyStateRoot { .. }
             | Self::BuildProposal { .. }

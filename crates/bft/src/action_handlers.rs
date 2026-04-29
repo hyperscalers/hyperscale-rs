@@ -716,35 +716,53 @@ pub fn handle_action<S, E, N>(
             )));
         }
 
-        Action::VerifyLocalReceiptRoot {
-            block_hash,
-            expected_root,
-            receipts,
-        } => {
-            let start = std::time::Instant::now();
-            let valid = verify_local_receipt_root(expected_root, &receipts);
-            metrics::record_signature_verification_latency(
-                "local_receipt_root",
-                start.elapsed().as_secs_f64(),
-            );
-            (ctx.notify)(NodeInput::Protocol(Box::new(
-                ProtocolEvent::BlockRootVerified {
-                    kind: VerificationKind::LocalReceiptRoot,
-                    block_hash,
-                    valid,
-                },
-            )));
-        }
-
         Action::VerifyStateRoot {
             block_hash,
             parent_block_hash,
             parent_state_root,
             parent_block_height,
             expected_root,
+            expected_local_receipt_root,
             finalized_waves,
             block_height,
         } => {
+            // Pre-flight: hash the receipts and compare to the QC'd
+            // `local_receipt_root`. If they diverge, JMT recomputation
+            // can't match `state_root` either (receipts ARE the JMT input),
+            // so short-circuit and report both roots as invalid. The
+            // coordinator's per-kind tracking still completes because both
+            // events are emitted.
+            let receipt_bundles: Vec<ReceiptBundle> = finalized_waves
+                .iter()
+                .flat_map(|fw| fw.receipts.iter().cloned())
+                .collect();
+
+            let receipt_start = std::time::Instant::now();
+            let receipt_root_valid =
+                verify_local_receipt_root(expected_local_receipt_root, &receipt_bundles);
+            metrics::record_signature_verification_latency(
+                "local_receipt_root",
+                receipt_start.elapsed().as_secs_f64(),
+            );
+            (ctx.notify)(NodeInput::Protocol(Box::new(
+                ProtocolEvent::BlockRootVerified {
+                    kind: VerificationKind::LocalReceiptRoot,
+                    block_hash,
+                    valid: receipt_root_valid,
+                },
+            )));
+
+            if !receipt_root_valid {
+                (ctx.notify)(NodeInput::Protocol(Box::new(
+                    ProtocolEvent::BlockRootVerified {
+                        kind: VerificationKind::StateRoot,
+                        block_hash,
+                        valid: false,
+                    },
+                )));
+                return;
+            }
+
             let start = std::time::Instant::now();
             let view = ctx.pending_chain.view_at(parent_block_hash);
             let pending_snapshots = view.pending_snapshots().to_vec();
