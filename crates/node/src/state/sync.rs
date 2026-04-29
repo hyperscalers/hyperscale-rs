@@ -26,9 +26,9 @@ impl NodeStateMachine {
                 actions.extend(self.provisions.flush_expected_provisions(topo));
                 actions
             }
-            ProtocolEvent::ChainMetadataFetched { height, hash, qc } => self
+            ProtocolEvent::CommittedStateRestored { height, hash, qc } => self
                 .bft
-                .on_chain_metadata_fetched(self.topology.snapshot(), height, hash, qc),
+                .on_committed_state_restored(self.topology.snapshot(), height, hash, qc),
             _ => unreachable!("non-sync event routed to handle_sync"),
         }
     }

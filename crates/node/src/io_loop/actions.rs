@@ -83,7 +83,7 @@ where
             Action::TrackExecutionCertificate { certificate } => {
                 self.handle_track_execution_certificate(&certificate);
             }
-            Action::FetchChainMetadata => self.handle_fetch_chain_metadata(),
+            Action::RestoreCommittedState => self.handle_restore_committed_state(),
             Action::CommitBlock { block, qc, source } => {
                 self.accept_block_commit(PendingCommit {
                     block: Arc::new(block),
@@ -185,12 +185,12 @@ where
         }
     }
 
-    fn handle_fetch_chain_metadata(&self) {
+    fn handle_restore_committed_state(&self) {
         let height = self.storage.committed_height();
         let hash = self.storage.committed_hash();
         let qc = self.storage.latest_qc();
         let _ = self.event_sender.send(NodeInput::Protocol(Box::new(
-            ProtocolEvent::ChainMetadataFetched { height, hash, qc },
+            ProtocolEvent::CommittedStateRestored { height, hash, qc },
         )));
     }
 
@@ -402,14 +402,11 @@ where
     /// Process sync and unified-fetch actions.
     fn process_sync_fetch_action(&mut self, action: Action) {
         match action {
-            Action::StartSync {
-                target_height,
-                target_hash,
-            } => {
-                let outputs = self.protocols.sync.handle(SyncInput::StartSync {
-                    target_height,
-                    target_hash,
-                });
+            Action::StartSync { target_height } => {
+                let outputs = self
+                    .protocols
+                    .sync
+                    .handle(SyncInput::StartSync { target_height });
                 self.process_sync_outputs(outputs);
             }
             Action::Fetch(req) => self.process_fetch_request(req),

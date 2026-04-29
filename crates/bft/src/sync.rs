@@ -467,10 +467,7 @@ pub enum SyncHealthDecision {
     /// No action needed — already synced, already syncing, or making progress.
     Idle,
     /// Trigger catch-up sync to the named target.
-    TriggerSync {
-        target_height: BlockHeight,
-        target_hash: BlockHash,
-    },
+    TriggerSync { target_height: BlockHeight },
 }
 
 impl SyncManager {
@@ -501,7 +498,6 @@ impl SyncManager {
         };
 
         let qc_height = latest_qc.height;
-        let qc_hash = latest_qc.block_hash;
 
         if committed_height >= qc_height {
             return SyncHealthDecision::Idle;
@@ -545,7 +541,6 @@ impl SyncManager {
                     );
                     return SyncHealthDecision::TriggerSync {
                         target_height: qc_height,
-                        target_hash: qc_hash,
                     };
                 }
                 return SyncHealthDecision::Idle;
@@ -562,7 +557,6 @@ impl SyncManager {
                 );
                 return SyncHealthDecision::TriggerSync {
                     target_height: qc_height,
-                    target_hash: qc_hash,
                 };
             }
             return SyncHealthDecision::Idle;
@@ -578,7 +572,6 @@ impl SyncManager {
 
         SyncHealthDecision::TriggerSync {
             target_height: qc_height,
-            target_hash: qc_hash,
         }
     }
 }
@@ -755,12 +748,8 @@ mod tests {
         let qc = qc_at(BlockHeight(10));
         let decision = sm.health_check(&topology(), BlockHeight(5), Some(&qc), false, &commits, 0);
         match decision {
-            SyncHealthDecision::TriggerSync {
-                target_height,
-                target_hash,
-            } => {
+            SyncHealthDecision::TriggerSync { target_height } => {
                 assert_eq!(target_height, BlockHeight(10));
-                assert_eq!(target_hash, qc.block_hash);
             }
             SyncHealthDecision::Idle => {
                 panic!("expected TriggerSync for missing-next-block gap")

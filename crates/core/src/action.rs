@@ -716,10 +716,12 @@ pub enum Action {
     // ═══════════════════════════════════════════════════════════════════════
     // Storage: Read Requests (returns callback ProtocolEvent)
     // ═══════════════════════════════════════════════════════════════════════
-    /// Fetch chain metadata (latest height, hash, QC).
+    /// Restore committed state (height, hash, QC) from local storage.
     ///
-    /// Returns `ProtocolEvent::ChainMetadataFetched { height, hash, qc }`.
-    FetchChainMetadata,
+    /// Issued at startup as a recovery bootstrap — the runner reads chain
+    /// metadata from `RocksDB` and replies with
+    /// `ProtocolEvent::CommittedStateRestored { height, hash, qc }`.
+    RestoreCommittedState,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Runner I/O Requests (network fetches handled by the runner)
@@ -735,8 +737,6 @@ pub enum Action {
     StartSync {
         /// The height we need to sync to.
         target_height: BlockHeight,
-        /// The hash of the target block (for verification).
-        target_hash: BlockHash,
     },
 
     /// Issue a network fetch via one of the unified fetch protocols.

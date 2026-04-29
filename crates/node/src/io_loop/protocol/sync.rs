@@ -18,7 +18,7 @@ use hyperscale_messages::response::{ElidedCertifiedBlock, GetBlockResponse};
 use hyperscale_metrics as metrics;
 use hyperscale_provisions::ProvisionStore;
 use hyperscale_storage::ChainReader;
-use hyperscale_types::{BlockHash, BlockHeight, CertifiedBlock, Provisions, WAVE_TIMEOUT};
+use hyperscale_types::{BlockHeight, CertifiedBlock, Provisions, WAVE_TIMEOUT};
 use serde::Serialize;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -138,10 +138,7 @@ impl Default for SyncStatus {
 #[allow(missing_docs)] // variant payloads are self-describing (height, now, block)
 pub enum SyncInput {
     /// Start or update sync target.
-    StartSync {
-        target_height: BlockHeight,
-        target_hash: BlockHash,
-    },
+    StartSync { target_height: BlockHeight },
     /// A block response was received.
     /// `None` means the peer did not have the block.
     BlockResponseReceived {
@@ -186,7 +183,7 @@ pub enum SyncOutput {
 /// executing the returned outputs.
 pub struct SyncProtocol {
     config: SyncConfig,
-    sync_target: Option<(BlockHeight, BlockHash)>,
+    sync_target: Option<BlockHeight>,
     committed_height: BlockHeight,
     heights_to_fetch: BinaryHeap<Reverse<BlockHeight>>,
     heights_queued: HashSet<BlockHeight>,
@@ -234,10 +231,7 @@ impl SyncProtocol {
     /// Process an input and return outputs.
     pub fn handle(&mut self, input: SyncInput) -> Vec<SyncOutput> {
         match input {
-            SyncInput::StartSync {
-                target_height,
-                target_hash,
-            } => self.handle_start_sync(target_height, target_hash),
+            SyncInput::StartSync { target_height } => self.handle_start_sync(target_height),
             SyncInput::BlockResponseReceived { height, block, now } => {
                 self.handle_block_response(height, block.map(|b| *b), now)
             }
@@ -259,7 +253,7 @@ impl SyncProtocol {
     #[must_use]
     pub fn blocks_behind(&self) -> u64 {
         self.sync_target
-            .map_or(0, |(t, _)| t.0.saturating_sub(self.committed_height.0))
+            .map_or(0, |t| t.0.saturating_sub(self.committed_height.0))
     }
 
     /// Get current sync status.
@@ -272,10 +266,10 @@ impl SyncProtocol {
                 SyncStateKind::Idle
             },
             current_height: self.committed_height.0,
-            target_height: self.sync_target.map(|(h, _)| h.0),
+            target_height: self.sync_target.map(|h| h.0),
             blocks_behind: self
                 .sync_target
-                .map_or(0, |(t, _)| t.0.saturating_sub(self.committed_height.0)),
+                .map_or(0, |t| t.0.saturating_sub(self.committed_height.0)),
             pending_fetches: self.in_flight.len(),
             queued_heights: self.heights_queued.len() + self.deferred.len(),
         }
@@ -285,23 +279,18 @@ impl SyncProtocol {
     // Input Handlers
     // ═══════════════════════════════════════════════════════════════════════
 
-    fn handle_start_sync(
-        &mut self,
-        target_height: BlockHeight,
-        target_hash: BlockHash,
-    ) -> Vec<SyncOutput> {
-        if self.sync_target.is_some_and(|(t, _)| t >= target_height) {
+    fn handle_start_sync(&mut self, target_height: BlockHeight) -> Vec<SyncOutput> {
+        if self.sync_target.is_some_and(|t| t >= target_height) {
             return vec![];
         }
 
         info!(
             target_height = target_height.0,
-            ?target_hash,
             committed = self.committed_height.0,
             "Starting sync"
         );
 
-        self.sync_target = Some((target_height, target_hash));
+        self.sync_target = Some(target_height);
         self.queue_heights_in_window();
         self.emit_fetch_outputs()
     }
@@ -401,7 +390,7 @@ impl SyncProtocol {
         self.committed_height = height;
         self.remove_heights_at_or_below(height);
 
-        if let Some((target, _)) = self.sync_target {
+        if let Some(target) = self.sync_target {
             metrics::record_sync_block_applied();
             if height >= target {
                 info!(height = height.0, target = target.0, "Sync complete");
@@ -454,7 +443,7 @@ impl SyncProtocol {
     }
 
     fn queue_heights_in_window(&mut self) {
-        let Some((target_height, _)) = self.sync_target else {
+        let Some(target_height) = self.sync_target else {
             return;
         };
 
@@ -478,7 +467,7 @@ impl SyncProtocol {
     /// after `handle_start_sync`, so a missing target means nothing to
     /// fetch.
     fn emit_fetch_outputs(&mut self) -> Vec<SyncOutput> {
-        let Some((target_height, _)) = self.sync_target else {
+        let Some(target_height) = self.sync_target else {
             return Vec::new();
         };
         let mut outputs = Vec::new();
@@ -608,7 +597,6 @@ mod tests {
 
         let outputs = protocol.handle(SyncInput::StartSync {
             target_height: BlockHeight(5),
-            target_hash: BlockHash::ZERO,
         });
 
         assert!(protocol.is_syncing());
@@ -629,7 +617,6 @@ mod tests {
 
         protocol.handle(SyncInput::StartSync {
             target_height: BlockHeight(2),
-            target_hash: BlockHash::ZERO,
         });
 
         assert!(protocol.is_syncing());
@@ -656,7 +643,6 @@ mod tests {
 
         protocol.handle(SyncInput::StartSync {
             target_height: BlockHeight(1),
-            target_hash: BlockHash::ZERO,
         });
 
         let t0 = Instant::now();
@@ -702,7 +688,6 @@ mod tests {
         });
         protocol.handle(SyncInput::StartSync {
             target_height: BlockHeight(1),
-            target_hash: BlockHash::ZERO,
         });
 
         let t0 = Instant::now();
@@ -755,7 +740,6 @@ mod tests {
 
         let outputs = protocol.handle(SyncInput::StartSync {
             target_height: BlockHeight(3),
-            target_hash: BlockHash::ZERO,
         });
 
         // Initial fetches: nothing flagged.
@@ -799,7 +783,6 @@ mod tests {
         });
         let _ = protocol.handle(SyncInput::StartSync {
             target_height: BlockHeight(3),
-            target_hash: BlockHash::ZERO,
         });
         protocol.mark_force_full_refetch(BlockHeight(1));
         // Commit past the marked height — drain.

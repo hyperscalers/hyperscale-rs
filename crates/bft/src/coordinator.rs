@@ -339,7 +339,6 @@ impl BftCoordinator {
         &mut self,
         topology: &TopologySnapshot,
         target_height: BlockHeight,
-        target_hash: BlockHash,
     ) -> Vec<Action> {
         // Don't raise the target while already syncing. The io_loop's
         // SyncProtocol manages its own target internally. Once the current
@@ -352,7 +351,6 @@ impl BftCoordinator {
         info!(
             validator = ?topology.local_validator_id(),
             target_height = target_height.0,
-            target_hash = ?target_hash,
             committed_height = self.committed_height.0,
             "Starting sync - setting syncing flag and requesting blocks"
         );
@@ -364,10 +362,7 @@ impl BftCoordinator {
         self.set_syncing(topology, true);
         self.sync.set_sync_target(target_height);
 
-        vec![Action::StartSync {
-            target_height,
-            target_hash,
-        }]
+        vec![Action::StartSync { target_height }]
     }
 
     /// Handle a synced block ready to apply (from runner via
@@ -556,20 +551,20 @@ impl BftCoordinator {
     /// Request recovery from storage.
     ///
     /// Call this on startup to restore state from persistent storage.
-    /// The runner will respond with `Event::ChainMetadataFetched`.
+    /// The runner will respond with `Event::CommittedStateRestored`.
     pub fn request_recovery(&self, topology: &TopologySnapshot) -> Vec<Action> {
         info!(
             validator = ?topology.local_validator_id(),
-            "Requesting chain metadata for recovery"
+            "Requesting committed-state restoration"
         );
-        vec![Action::FetchChainMetadata]
+        vec![Action::RestoreCommittedState]
     }
 
-    /// Handle chain metadata fetched from storage (recovery).
+    /// Handle committed state restored from storage (recovery).
     ///
-    /// Called when the runner completes `Action::FetchChainMetadata`.
+    /// Called when the runner completes `Action::RestoreCommittedState`.
     #[instrument(skip(self, qc), fields(height = height.0, has_hash = hash.is_some(), has_qc = qc.is_some()))]
-    pub fn on_chain_metadata_fetched(
+    pub fn on_committed_state_restored(
         &mut self,
         topology: &TopologySnapshot,
         height: BlockHeight,
@@ -1016,7 +1011,6 @@ impl BftCoordinator {
         }
 
         let parent_height = header.parent_qc.height;
-        let parent_block_hash = header.parent_qc.block_hash;
 
         // Check for a COMPLETE parent block; an incomplete pending block still
         // requires sync for the full data.
@@ -1030,7 +1024,7 @@ impl BftCoordinator {
                 target_height = parent_height.0,
                 "Missing parent block, triggering sync (continuing to process header)"
             );
-            actions = self.start_sync(topology, parent_height, parent_block_hash);
+            actions = self.start_sync(topology, parent_height);
         }
 
         // Only adopt the QC if we have the parent it certifies — otherwise we
@@ -2940,10 +2934,9 @@ impl BftCoordinator {
             self.pending_blocks.len(),
         ) {
             crate::sync::SyncHealthDecision::Idle => vec![],
-            crate::sync::SyncHealthDecision::TriggerSync {
-                target_height,
-                target_hash,
-            } => self.start_sync(topology, target_height, target_hash),
+            crate::sync::SyncHealthDecision::TriggerSync { target_height } => {
+                self.start_sync(topology, target_height)
+            }
         }
     }
 

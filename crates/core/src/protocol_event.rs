@@ -403,7 +403,7 @@ pub enum ProtocolEvent {
     // Storage Callbacks
     // ═══════════════════════════════════════════════════════════════════════
     /// Chain metadata fetched from storage.
-    ChainMetadataFetched {
+    CommittedStateRestored {
         /// Highest committed height found in storage (`0` for fresh start).
         height: BlockHeight,
         /// Hash of the highest committed block, if present.
