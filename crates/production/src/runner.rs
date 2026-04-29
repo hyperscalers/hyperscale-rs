@@ -482,7 +482,7 @@ pub struct ProductionRunner {
 
     /// Libp2p network adapter (shared with `InboundRouter`, `RequestManager`).
     network: Arc<Libp2pAdapter>,
-    /// Network topology snapshot (lock-free `ArcSwap`, updated on epoch transitions).
+    /// Network topology snapshot (lock-free `ArcSwap`, updated on topology changes).
     topology_snapshot: SharedTopologySnapshot,
     /// `RocksDB` storage (for `InboundRouter` and genesis).
     #[allow(dead_code)]

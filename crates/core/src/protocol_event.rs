@@ -7,9 +7,9 @@
 
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote, CertifiedBlock,
-    CommittedBlockHeader, EpochConfig, EpochId, ExecutionCertificate, ExecutionVote, FinalizedWave,
-    Provisions, QuorumCertificate, Round, RoutableTransaction, ShardGroupId, TxOutcome,
-    ValidatorId, WaveId, WeightedTimestamp,
+    CommittedBlockHeader, ExecutionCertificate, ExecutionVote, FinalizedWave, Provisions,
+    QuorumCertificate, Round, RoutableTransaction, ShardGroupId, TxOutcome, ValidatorId, WaveId,
+    WeightedTimestamp,
 };
 use std::sync::Arc;
 
@@ -82,9 +82,6 @@ pub enum ProtocolEvent {
 
     /// Periodic cleanup of stale state.
     CleanupTimer,
-
-    /// Timer for global consensus operations.
-    GlobalConsensusTimer,
 
     // ═══════════════════════════════════════════════════════════════════════
     // BFT Consensus
@@ -472,115 +469,6 @@ pub enum ProtocolEvent {
         source_shard: ShardGroupId,
         /// Height the sync caught up to.
         height: BlockHeight,
-    },
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // Global Consensus / Epoch
-    // ═══════════════════════════════════════════════════════════════════════
-    /// Received a global block proposal from another validator.
-    GlobalBlockReceived {
-        /// Current epoch.
-        epoch: EpochId,
-        /// Height within the global chain.
-        height: BlockHeight,
-        /// Validator that proposed the block.
-        proposer: ValidatorId,
-        /// Hash of the proposed global block.
-        block_hash: BlockHash,
-        /// Next epoch configuration carried by this block, if it finalizes the epoch.
-        next_epoch_config: Option<Box<EpochConfig>>,
-    },
-
-    /// Received a vote on a global block.
-    GlobalBlockVoteReceived {
-        /// Block being voted on.
-        block_hash: BlockHash,
-        /// Shard the vote came from.
-        shard: ShardGroupId,
-        /// Aggregated BLS signature from the shard's local quorum.
-        shard_signature: hyperscale_types::Bls12381G2Signature,
-        /// Bitfield of validators in the shard who signed.
-        signers: hyperscale_types::SignerBitfield,
-        /// Total voting power covered by the shard signature.
-        voting_power: hyperscale_types::VotePower,
-    },
-
-    /// Global quorum certificate formed.
-    GlobalQcFormed {
-        /// Block the global QC certifies.
-        block_hash: BlockHash,
-        /// Epoch in which the QC was formed.
-        epoch: EpochId,
-    },
-
-    /// Epoch transition is imminent.
-    EpochEndApproaching {
-        /// Epoch that's about to end.
-        current_epoch: EpochId,
-        /// Height at which the current epoch ends.
-        end_height: BlockHeight,
-    },
-
-    /// Ready to transition to next epoch.
-    EpochTransitionReady {
-        /// Epoch we're transitioning from.
-        from_epoch: EpochId,
-        /// Epoch we're transitioning to.
-        to_epoch: EpochId,
-        /// Finalized configuration for the new epoch.
-        next_config: Box<EpochConfig>,
-    },
-
-    /// Epoch transition completed.
-    EpochTransitionComplete {
-        /// The new epoch.
-        new_epoch: EpochId,
-        /// This validator's shard in the new epoch.
-        new_shard: ShardGroupId,
-        /// `true` if this validator is still syncing to the new shard before resuming consensus.
-        is_waiting: bool,
-    },
-
-    /// Validator finished syncing to new shard after shuffle.
-    ValidatorSyncComplete {
-        /// Epoch this validator finished syncing for.
-        epoch: EpochId,
-        /// Shard this validator now serves.
-        shard: ShardGroupId,
-    },
-
-    /// Shard split initiated.
-    ShardSplitInitiated {
-        /// Shard being split.
-        source_shard: ShardGroupId,
-        /// New shard ID being created from the split.
-        new_shard: ShardGroupId,
-        /// Hash range split point — accounts above go to `new_shard`.
-        split_point: u64,
-    },
-
-    /// Shard split completed.
-    ShardSplitComplete {
-        /// Original shard whose split is complete.
-        source_shard: ShardGroupId,
-        /// Newly created shard now serving its range.
-        new_shard: ShardGroupId,
-    },
-
-    /// Shard merge initiated.
-    ShardMergeInitiated {
-        /// First shard being merged.
-        shard_a: ShardGroupId,
-        /// Second shard being merged.
-        shard_b: ShardGroupId,
-        /// Resulting shard ID after merge.
-        merged_shard: ShardGroupId,
-    },
-
-    /// Shard merge completed.
-    ShardMergeComplete {
-        /// The merged shard now serving the combined range.
-        merged_shard: ShardGroupId,
     },
 }
 

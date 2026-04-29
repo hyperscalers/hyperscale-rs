@@ -52,7 +52,7 @@ pub struct Libp2pAdapter {
     stream_control: stream::Control,
 
     /// Validator BLS public keys for identity verification.
-    /// Shared with the validator-bind service; updated on epoch transitions.
+    /// Shared with the validator-bind service; updated on topology changes.
     validator_keys: Arc<ArcSwap<ValidatorKeyMap>>,
 }
 
@@ -217,7 +217,7 @@ impl Libp2pAdapter {
 
         let cached_peer_count = Arc::new(AtomicUsize::new(0));
 
-        // Wrap validator keys in ArcSwap for lock-free updates on epoch transitions.
+        // Wrap validator keys in ArcSwap for lock-free updates on topology changes.
         let shared_keys = Arc::new(ArcSwap::from(validator_keys));
 
         // Spawn the validator-bind service. This handles cryptographic
@@ -296,7 +296,7 @@ impl Libp2pAdapter {
 
     /// Update the validator key map for bind verification.
     ///
-    /// Called by `Libp2pNetwork::update_validator_keys` on epoch transitions.
+    /// Called by `Libp2pNetwork::update_validator_keys` on topology changes.
     pub fn update_validator_keys(&self, keys: Arc<ValidatorKeyMap>) {
         self.validator_keys.store(keys);
     }

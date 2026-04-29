@@ -33,7 +33,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-/// Shared validator key map, updated atomically on epoch transitions.
+/// Shared validator key map, updated atomically on topology changes.
 type SharedValidatorKeys = Arc<ArcSwap<ValidatorKeyMap>>;
 
 /// Stream protocol identifier for the validator-bind handshake.

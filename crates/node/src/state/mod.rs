@@ -184,7 +184,6 @@ impl StateMachine for NodeStateMachine {
         event = %event.type_name(),
         height = self.bft.committed_height().0,
     ))]
-    #[allow(clippy::too_many_lines)] // single dispatch over the ProtocolEvent enum; one arm per variant
     fn handle(&mut self, event: ProtocolEvent) -> Vec<Action> {
         let mut actions = match event {
             // ── Timers ───────────────────────────────────────────────────
@@ -234,27 +233,6 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::BlockSyncComplete { .. }
             | ProtocolEvent::RemoteHeaderSyncProtocolComplete { .. }
             | ProtocolEvent::CommittedStateRestored { .. }) => self.handle_sync(evt),
-
-            // ── Global Consensus / Epoch (not yet implemented) ───────────
-            // When implemented, route to GlobalConsensusState.
-            // The #[instrument] span already logs the specific event name.
-            //
-            // TODO(epoch): After transition_to_next_epoch() / mark_shard_splitting() /
-            // clear_shard_splitting() mutates self.topology, emit
-            // Action::TopologyChanged { topology_snapshot: Arc::clone(self.topology.snapshot()) }
-            // so the io_loop updates its shared topology snapshot.
-            ProtocolEvent::GlobalConsensusTimer
-            | ProtocolEvent::GlobalBlockReceived { .. }
-            | ProtocolEvent::GlobalBlockVoteReceived { .. }
-            | ProtocolEvent::GlobalQcFormed { .. }
-            | ProtocolEvent::EpochEndApproaching { .. }
-            | ProtocolEvent::EpochTransitionReady { .. }
-            | ProtocolEvent::EpochTransitionComplete { .. }
-            | ProtocolEvent::ValidatorSyncComplete { .. }
-            | ProtocolEvent::ShardSplitInitiated { .. }
-            | ProtocolEvent::ShardSplitComplete { .. }
-            | ProtocolEvent::ShardMergeInitiated { .. }
-            | ProtocolEvent::ShardMergeComplete { .. } => vec![],
         };
 
         // Drain any state root verifications that became ready during this event.

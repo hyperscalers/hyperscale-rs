@@ -31,6 +31,16 @@ mod wave;
 
 pub use primitives::bloom::{BloomFilter, DEFAULT_FPR, MAX_BITS};
 
+pub use block::Block;
+pub use block::certified::{CertifiedBlock, CertifiedBlockHashMismatch};
+pub use block::committed_header::CommittedBlockHeader;
+pub use block::header::BlockHeader;
+pub use block::manifest::{BlockManifest, BlockMetadata};
+pub use block::roots::{
+    compute_certificate_root, compute_local_receipt_root, compute_provision_root,
+    compute_transaction_root,
+};
+pub use block::vote::BlockVote;
 pub use crypto::batch_verify::{
     batch_verify_bls_different_messages, batch_verify_bls_different_messages_all_or_nothing,
     batch_verify_bls_same_message, batch_verify_ed25519,
@@ -57,10 +67,17 @@ pub use primitives::merkle::{
     compute_merkle_root, compute_merkle_root_with_proof, compute_padded_merkle_root,
     verify_merkle_inclusion,
 };
+pub use primitives::signer_bitfield::SignerBitfield;
 pub use provisioning::batch::Provisions;
 pub use provisioning::proof::MerkleInclusionProof;
 pub use provisioning::state_entry::{StateEntry, StateProvision};
 pub use provisioning::tx_entries::TxEntries;
+pub use quorum_certificate::QuorumCertificate;
+pub use receipt::bundle::ReceiptBundle;
+pub use receipt::global::GlobalReceipt;
+pub use receipt::local::{LocalExecutionEntry, LocalReceipt};
+pub use receipt::metadata::{ApplicationEvent, ExecutionMetadata, FeeSummary, LogLevel};
+pub use receipt::outcome::TransactionOutcome;
 pub use signing::{
     DOMAIN_BLOCK_HEADER, DOMAIN_BLOCK_VOTE, DOMAIN_COMMITTED_BLOCK_HEADER, DOMAIN_EXEC_CERT_BATCH,
     DOMAIN_EXEC_VOTE, DOMAIN_EXEC_VOTE_BATCH, DOMAIN_STATE_PROVISION_BATCH, DOMAIN_VALIDATOR_BIND,
@@ -68,34 +85,10 @@ pub use signing::{
     exec_cert_batch_message, exec_vote_batch_message, exec_vote_message, state_provisions_message,
     validator_bind_message,
 };
-pub use topology::consensus_config::{
-    GlobalConsensusConfig, GlobalValidatorInfo, ShardCommitteeConfig, ValidatorRating,
-};
-pub use topology::epoch::{DEFAULT_EPOCH_LENGTH, EpochConfig, EpochId, ValidatorShardState};
-
-pub use block::Block;
-pub use block::certified::{CertifiedBlock, CertifiedBlockHashMismatch};
-pub use block::committed_header::CommittedBlockHeader;
-pub use block::header::BlockHeader;
-pub use block::manifest::{BlockManifest, BlockMetadata};
-pub use block::roots::{
-    compute_certificate_root, compute_local_receipt_root, compute_provision_root,
-    compute_transaction_root,
-};
-pub use block::vote::BlockVote;
-pub use primitives::signer_bitfield::SignerBitfield;
-pub use quorum_certificate::QuorumCertificate;
-pub use receipt::bundle::ReceiptBundle;
-pub use receipt::global::GlobalReceipt;
-pub use receipt::local::{LocalExecutionEntry, LocalReceipt};
-pub use receipt::metadata::{ApplicationEvent, ExecutionMetadata, FeeSummary, LogLevel};
-pub use receipt::outcome::TransactionOutcome;
 pub use time::range::{MAX_VALIDITY_RANGE, TimestampRange};
 pub use time::timeouts::{REMOTE_HEADER_RETENTION, RETENTION_HORIZON, WAVE_TIMEOUT};
 pub use time::timestamp::{LocalTimestamp, ProposerTimestamp, WeightedTimestamp};
-pub use topology::snapshot::{
-    TopologySnapshot, TopologySnapshotError, node_id_hash_u64, shard_for_node,
-};
+pub use topology::snapshot::{TopologySnapshot, node_id_hash_u64, shard_for_node};
 pub use topology::validator::{ValidatorInfo, ValidatorSet};
 pub use transaction::constructors::{
     routable_from_notarized_v1, routable_from_notarized_v2, routable_from_user_transaction,

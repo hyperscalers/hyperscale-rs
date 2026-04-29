@@ -201,15 +201,13 @@ impl NodeInput {
             // Timers and network-received messages are classified explicitly;
             // everything else (callbacks, continuations, completions) defaults to Internal.
             Self::Protocol(pe) => match pe.as_ref() {
-                ProtocolEvent::ViewChangeTimer
-                | ProtocolEvent::CleanupTimer
-                | ProtocolEvent::GlobalConsensusTimer => EventPriority::Timer,
+                ProtocolEvent::ViewChangeTimer | ProtocolEvent::CleanupTimer => {
+                    EventPriority::Timer
+                }
 
                 ProtocolEvent::BlockHeaderReceived { .. }
                 | ProtocolEvent::RemoteHeaderReceived { .. }
                 | ProtocolEvent::BlockVoteReceived { .. }
-                | ProtocolEvent::GlobalBlockReceived { .. }
-                | ProtocolEvent::GlobalBlockVoteReceived { .. }
                 | ProtocolEvent::ProvisionsReceived { .. }
                 | ProtocolEvent::ExecutionCertificatesReceived { .. }
                 | ProtocolEvent::FinalizedWavesReceived { .. }

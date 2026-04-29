@@ -16,8 +16,6 @@ pub enum TimerId {
     ViewChange,
     /// Periodic cleanup timer
     Cleanup,
-    /// Global consensus timer (epoch management)
-    GlobalConsensus,
     /// Periodic tick for the fetch protocol (retry pending fetches)
     FetchTick,
 }
@@ -29,9 +27,6 @@ impl TimerId {
         match self {
             Self::ViewChange => NodeInput::Protocol(Box::new(ProtocolEvent::ViewChangeTimer)),
             Self::Cleanup => NodeInput::Protocol(Box::new(ProtocolEvent::CleanupTimer)),
-            Self::GlobalConsensus => {
-                NodeInput::Protocol(Box::new(ProtocolEvent::GlobalConsensusTimer))
-            }
             Self::FetchTick => NodeInput::FetchTick,
         }
     }
