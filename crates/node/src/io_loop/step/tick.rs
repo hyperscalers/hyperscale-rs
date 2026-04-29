@@ -32,6 +32,9 @@ where
         let outputs = self.protocols.sync_tick(now);
         self.process_sync_outputs(outputs);
 
+        let outputs = self.protocols.remote_header_sync_tick(now);
+        self.process_remote_header_sync_outputs(outputs);
+
         self.drive_fetch::<TransactionBinding>(FetchInput::Tick);
         self.drive_fetch::<LocalProvisionBinding>(FetchInput::Tick);
         self.drive_fetch::<FinalizedWaveBinding>(FetchInput::Tick);

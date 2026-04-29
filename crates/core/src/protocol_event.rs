@@ -429,6 +429,17 @@ pub enum ProtocolEvent {
         height: BlockHeight,
     },
 
+    /// The `io_loop`'s `RemoteHeaderSyncProtocol` caught `source_shard`'s
+    /// committed-header chain up to `height`. `RemoteHeaderCoordinator`
+    /// uses this to clear any "syncing" flag for that shard and resume
+    /// normal per-gap behaviour.
+    RemoteHeaderSyncProtocolComplete {
+        /// Source shard whose chain caught up.
+        source_shard: ShardGroupId,
+        /// Height the sync caught up to.
+        height: BlockHeight,
+    },
+
     // ═══════════════════════════════════════════════════════════════════════
     // Global Consensus / Epoch
     // ═══════════════════════════════════════════════════════════════════════

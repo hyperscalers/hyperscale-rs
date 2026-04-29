@@ -229,6 +229,7 @@ impl StateMachine for NodeStateMachine {
             // ── Sync ─────────────────────────────────────────────────────
             evt @ (ProtocolEvent::SyncBlockReadyToApply { .. }
             | ProtocolEvent::SyncProtocolComplete { .. }
+            | ProtocolEvent::RemoteHeaderSyncProtocolComplete { .. }
             | ProtocolEvent::CommittedStateRestored { .. }) => self.handle_sync(evt),
 
             // ── Global Consensus / Epoch (not yet implemented) ───────────

@@ -71,6 +71,10 @@ where
             Action::StartSync { .. } | Action::Fetch(_) => {
                 self.process_sync_fetch_action(action);
             }
+            Action::StartRemoteHeaderSync {
+                source_shard,
+                target,
+            } => self.process_start_remote_header_sync(source_shard, target),
 
             // ─── io_loop-internal effects ──────────────────────────────────
             Action::SetTimer { id, duration } => {
@@ -159,6 +163,17 @@ where
                     .finalized_wave
                     .insert(wave.wave_id_hash(), Arc::clone(wave));
             }
+        }
+
+        // Tell the remote-header-sync FSM about admitted headers so it can
+        // advance per-shard `committed` and emit `SyncComplete` once the
+        // chain catches up. Drives any newly-emitted range fetches inline.
+        if let ProtocolEvent::RemoteHeaderAdmitted { committed_header } = &pe {
+            let outputs = self.protocols.on_remote_header_admitted(
+                committed_header.shard_group_id(),
+                committed_header.header.height,
+            );
+            self.process_remote_header_sync_outputs(outputs);
         }
 
         let _ = self.event_sender.send(NodeInput::Protocol(Box::new(pe)));

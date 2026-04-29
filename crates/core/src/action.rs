@@ -739,6 +739,17 @@ pub enum Action {
         target_height: BlockHeight,
     },
 
+    /// Request the runner to start (or raise the target of) remote-header
+    /// sync for `source_shard`. The runner's `RemoteHeaderSyncProtocol`
+    /// emits range fetches and feeds verified headers back to
+    /// [`crate::ProtocolEvent::RemoteHeaderReceived`].
+    StartRemoteHeaderSync {
+        /// Remote shard whose committed-header chain we're catching up to.
+        source_shard: ShardGroupId,
+        /// Highest known target height for that shard's chain.
+        target: BlockHeight,
+    },
+
     /// Issue a network fetch via one of the unified fetch protocols.
     ///
     /// Replaces the family of flat `Fetch*` / `RequestMissing*` variants —

@@ -9,6 +9,7 @@ mod fetch_delivery;
 mod fetch_failure;
 mod gossip;
 mod protocol;
+mod remote_header_sync;
 mod sync;
 mod tick;
 mod tx_validation;

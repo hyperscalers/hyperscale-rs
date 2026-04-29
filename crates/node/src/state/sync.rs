@@ -29,6 +29,10 @@ impl NodeStateMachine {
             ProtocolEvent::CommittedStateRestored { height, hash, qc } => self
                 .bft
                 .on_committed_state_restored(self.topology.snapshot(), height, hash, qc),
+            // Acknowledged but unused for now. Commit 4 wires
+            // `RemoteHeaderCoordinator` to clear its per-shard "syncing"
+            // flag here.
+            ProtocolEvent::RemoteHeaderSyncProtocolComplete { .. } => vec![],
             _ => unreachable!("non-sync event routed to handle_sync"),
         }
     }

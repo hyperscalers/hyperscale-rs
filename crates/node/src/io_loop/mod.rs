@@ -347,6 +347,26 @@ where
             NodeInput::SyncBlockFetchFailed { height } => {
                 self.handle_sync_block_fetch_failed(height);
             }
+            NodeInput::RemoteHeadersResponseReceived {
+                source_shard,
+                from_height,
+                count,
+                headers,
+            } => {
+                self.handle_remote_headers_response_received(
+                    source_shard,
+                    from_height,
+                    count,
+                    headers,
+                );
+            }
+            NodeInput::RemoteHeadersFetchFailed {
+                source_shard,
+                from_height,
+                count,
+            } => {
+                self.handle_remote_headers_fetch_failed(source_shard, from_height, count);
+            }
 
             // ── Fetch protocol ─────────────────────────────────────────
             NodeInput::TransactionReceived { transactions } => {
