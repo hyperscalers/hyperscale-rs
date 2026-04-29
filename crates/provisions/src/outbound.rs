@@ -288,8 +288,8 @@ mod tests {
         assert_eq!(tracker.memory_stats().tracked_provisions, 1);
         assert_eq!(tracker.memory_stats().tracked_tx_entries, 2);
         assert!(store.get(&provision_hash).is_some());
-        let hits = store.get_outbound(BlockHeight(10), ShardGroupId(1));
-        assert_eq!(hits.len(), 1);
+        let hit = store.get_outbound(BlockHeight(10), ShardGroupId(1));
+        assert!(hit.is_some());
     }
 
     #[test]

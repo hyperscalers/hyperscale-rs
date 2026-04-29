@@ -95,16 +95,16 @@ where
                 // generated for this (source_block_height, target_shard),
                 // rebuild the response from memory — no RocksDB regeneration,
                 // no merkle-proof recomputation.
-                let cached_outbound =
-                    outbound_cache.get_outbound(req.block_height, req.target_shard);
-                if let Some(provisions) = cached_outbound.first() {
+                if let Some(provisions) =
+                    outbound_cache.get_outbound(req.block_height, req.target_shard)
+                {
                     use hyperscale_messages::response::GetProvisionResponse;
                     hyperscale_metrics::record_fetch_response_sent(
                         "provision",
                         provisions.transactions.len().max(1),
                     );
                     return GetProvisionResponse {
-                        provisions: Some((**provisions).clone()),
+                        provisions: Some((*provisions).clone()),
                     };
                 }
 

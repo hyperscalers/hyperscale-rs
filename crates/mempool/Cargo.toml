@@ -8,7 +8,7 @@ description = "Mempool state machine"
 hyperscale-core.workspace = true
 hyperscale-metrics.workspace = true
 hyperscale-types.workspace = true
-parking_lot.workspace = true
+papaya.workspace = true
 tracing.workspace = true
 serde.workspace = true
 

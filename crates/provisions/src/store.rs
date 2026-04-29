@@ -15,17 +15,29 @@
 //!   which also populates a `(source_block_height, target_shard)` index
 //!   used by the cross-shard `provision.request` fast path. Eviction is
 //!   gated on terminal execution certificates from the target shard.
+//!
+//! Both maps are backed by [`papaya::HashMap`] — lock-free concurrent
+//! maps so the network worker thread can read provisions wait-free in
+//! the common case without contending with the single state-machine
+//! writer.
+//!
+//! The outbound index is single-slot per `(source_block_height,
+//! target_shard)`: the protocol guarantees exactly one [`Provisions`]
+//! batch per such key (the proposer commits to one set at the source
+//! block, attested in the source block header). Repeated inserts for
+//! the same key are idempotent.
 
 use hyperscale_types::{
     BlockHeight, BloomFilter, DEFAULT_FPR, ProvisionHash, Provisions, ShardGroupId,
 };
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use papaya::HashMap;
+use std::collections::HashSet;
+use std::sync::Arc;
 
 /// Shared content-addressed store of `Provisions` bodies.
 pub struct ProvisionStore {
-    inner: Mutex<HashMap<ProvisionHash, Arc<Provisions>>>,
-    outbound_index: Mutex<HashMap<(BlockHeight, ShardGroupId), HashSet<ProvisionHash>>>,
+    inner: HashMap<ProvisionHash, Arc<Provisions>>,
+    outbound_index: HashMap<(BlockHeight, ShardGroupId), Arc<Provisions>>,
 }
 
 impl ProvisionStore {
@@ -33,8 +45,8 @@ impl ProvisionStore {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(HashMap::new()),
-            outbound_index: Mutex::new(HashMap::new()),
+            inner: HashMap::new(),
+            outbound_index: HashMap::new(),
         }
     }
 
@@ -42,126 +54,87 @@ impl ProvisionStore {
     ///
     /// Inbound callers use this; the secondary outbound index is not
     /// touched.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned by a previously panicking writer.
     pub fn insert(&self, provisions: Arc<Provisions>) {
         let hash = provisions.hash();
-        let mut g = self.inner.lock().unwrap();
-        g.entry(hash).or_insert(provisions);
+        self.inner.pin().get_or_insert_with(hash, || provisions);
     }
 
     /// Insert provisions our proposer generated for `target_shard`.
-    /// Populates the `(source_block_height, target_shard)` index so
+    /// Populates the `(source_block_height, target_shard)` slot so
     /// cross-shard `provision.request` handlers can serve from the cache
-    /// before regenerating from `RocksDB`. Idempotent.
-    ///
-    /// # Panics
-    ///
-    /// Panics if either internal mutex is poisoned.
+    /// before regenerating from `RocksDB`. Idempotent on the
+    /// `(height, shard)` slot — first writer wins, repeated inserts of
+    /// the same content are no-ops.
     pub fn insert_outbound(&self, provisions: Arc<Provisions>, target_shard: ShardGroupId) {
         let hash = provisions.hash();
         let block_height = provisions.block_height;
-        {
-            let mut g = self.inner.lock().unwrap();
-            g.entry(hash).or_insert(provisions);
-        }
-        let mut idx = self.outbound_index.lock().unwrap();
-        idx.entry((block_height, target_shard))
-            .or_default()
-            .insert(hash);
+        self.inner
+            .pin()
+            .get_or_insert_with(hash, || Arc::clone(&provisions));
+        self.outbound_index
+            .pin()
+            .get_or_insert_with((block_height, target_shard), || provisions);
     }
 
     /// Look up provisions by content hash.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn get(&self, hash: &ProvisionHash) -> Option<Arc<Provisions>> {
-        self.inner.lock().unwrap().get(hash).cloned()
+        self.inner.pin().get(hash).cloned()
     }
 
-    /// Fetch every outbound provisions entry registered for
-    /// `(block_height, target_shard)`. Returns an empty vec if nothing is
-    /// cached — the caller should fall through to `RocksDB` regeneration.
-    ///
-    /// # Panics
-    ///
-    /// Panics if either internal mutex is poisoned.
+    /// Fetch the outbound provisions registered for
+    /// `(block_height, target_shard)`, if any. Returns `None` if nothing
+    /// is cached — the caller should fall through to `RocksDB`
+    /// regeneration.
     pub fn get_outbound(
         &self,
         block_height: BlockHeight,
         target_shard: ShardGroupId,
-    ) -> Vec<Arc<Provisions>> {
-        let idx = self.outbound_index.lock().unwrap();
-        let Some(hashes) = idx.get(&(block_height, target_shard)) else {
-            return Vec::new();
-        };
-        let hashes: Vec<ProvisionHash> = hashes.iter().copied().collect();
-        drop(idx);
-        let inner = self.inner.lock().unwrap();
-        hashes
-            .iter()
-            .filter_map(|h| inner.get(h).cloned())
-            .collect()
+    ) -> Option<Arc<Provisions>> {
+        self.outbound_index
+            .pin()
+            .get(&(block_height, target_shard))
+            .cloned()
     }
 
     /// Evict provisions whose retention window has elapsed. Returns the
     /// number of entries actually removed from the primary map. Also
     /// scrubs the outbound secondary index for the evicted hashes.
-    ///
-    /// # Panics
-    ///
-    /// Panics if either internal mutex is poisoned.
     pub fn evict(&self, hashes: impl IntoIterator<Item = ProvisionHash>) -> usize {
-        let hashes: Vec<ProvisionHash> = hashes.into_iter().collect();
-        let removed = {
-            let mut g = self.inner.lock().unwrap();
-            hashes.iter().filter(|h| g.remove(h).is_some()).count()
-        };
-        if !hashes.is_empty() {
-            let mut idx = self.outbound_index.lock().unwrap();
-            idx.retain(|_, set| {
-                for h in &hashes {
-                    set.remove(h);
-                }
-                !set.is_empty()
-            });
+        let hashes: HashSet<ProvisionHash> = hashes.into_iter().collect();
+        if hashes.is_empty() {
+            return 0;
         }
+        let removed = {
+            let g = self.inner.pin();
+            hashes.iter().filter(|h| g.remove(*h).is_some()).count()
+        };
+        let idx = self.outbound_index.pin();
+        idx.retain(|_, provisions| !hashes.contains(&provisions.hash()));
         removed
     }
 
     /// Number of provisions currently held in the primary map.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn len(&self) -> usize {
-        self.inner.lock().unwrap().len()
+        self.inner.len()
     }
 
     /// True when the primary map holds no provisions.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn is_empty(&self) -> bool {
-        self.inner.lock().unwrap().is_empty()
+        self.inner.is_empty()
     }
 
     /// Build a bloom filter over every cached provision hash. Sync
     /// inventory attaches this to `GetBlockRequest` so the responder can
     /// elide provisions the requester already holds.
     ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
-    #[allow(clippy::significant_drop_tightening)] // need the lock to iterate keys
+    /// Iteration is concurrent-safe: keys inserted or removed during the
+    /// snapshot may or may not appear. Bloom filters are an inclusion hint,
+    /// not a manifest — false positives waste a fetch attempt, false
+    /// negatives just mean the responder sends extras.
     pub fn provision_bloom_snapshot(&self) -> Option<BloomFilter<ProvisionHash>> {
-        let inner = self.inner.lock().unwrap();
-        let mut bf = BloomFilter::with_capacity(inner.len(), DEFAULT_FPR)?;
-        for hash in inner.keys() {
+        let g = self.inner.pin();
+        let mut bf = BloomFilter::with_capacity(g.len(), DEFAULT_FPR)?;
+        for (hash, _) in &g {
             bf.insert(hash);
         }
         Some(bf)

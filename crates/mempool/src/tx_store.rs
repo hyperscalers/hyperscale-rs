@@ -20,20 +20,22 @@
 //!
 //! The mempool's [`PoolEntry`](crate::coordinator) holds metadata only;
 //! body lookups go through this store.
+//!
+//! Backed by [`papaya::HashMap`] — a lock-free concurrent map. Reads from
+//! the network worker thread are wait-free in the common case and never
+//! contend with the single state-machine writer.
 
 use hyperscale_types::{BloomFilter, DEFAULT_FPR, RoutableTransaction, TxHash};
-use parking_lot::RwLock;
-use std::collections::HashMap;
+use papaya::HashMap;
 use std::sync::Arc;
 
 /// Shared content-addressed store of [`RoutableTransaction`] bodies.
 ///
 /// Read-heavy: every mempool iteration and every inbound fetch serve
 /// reads bodies; writes (insert on validation, evict on retention sweep)
-/// are infrequent. Uses [`parking_lot::RwLock`] so concurrent reads from
-/// the io-loop thread and network workers don't serialize on each other.
+/// are infrequent and single-threaded (state machine).
 pub struct TxStore {
-    inner: RwLock<HashMap<TxHash, Arc<RoutableTransaction>>>,
+    inner: HashMap<TxHash, Arc<RoutableTransaction>>,
 }
 
 impl TxStore {
@@ -41,7 +43,7 @@ impl TxStore {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            inner: RwLock::new(HashMap::new()),
+            inner: HashMap::new(),
         }
     }
 
@@ -50,51 +52,49 @@ impl TxStore {
     /// keep pointing at the same allocation).
     pub fn insert(&self, tx: Arc<RoutableTransaction>) {
         let hash = tx.hash();
-        let mut g = self.inner.write();
-        g.entry(hash).or_insert(tx);
+        self.inner.pin().get_or_insert_with(hash, || tx);
     }
 
     /// Look up a transaction body by hash.
     #[must_use]
     pub fn get(&self, hash: &TxHash) -> Option<Arc<RoutableTransaction>> {
-        self.inner.read().get(hash).cloned()
+        self.inner.pin().get(hash).cloned()
     }
 
-    /// Bulk lookup — single lock acquire across the whole batch. Returns
-    /// `(hash, body)` pairs for those found; missing hashes are skipped
-    /// (caller decides fallback policy).
+    /// Bulk lookup. Returns `(hash, body)` pairs for those found; missing
+    /// hashes are skipped (caller decides fallback policy).
     #[must_use]
     pub fn get_batch(&self, hashes: &[TxHash]) -> Vec<(TxHash, Arc<RoutableTransaction>)> {
-        let inner = self.inner.read();
+        let g = self.inner.pin();
         hashes
             .iter()
-            .filter_map(|h| inner.get(h).map(|tx| (*h, Arc::clone(tx))))
+            .filter_map(|h| g.get(h).map(|tx| (*h, Arc::clone(tx))))
             .collect()
     }
 
     /// True if the store currently holds a body for `hash`.
     #[must_use]
     pub fn contains(&self, hash: &TxHash) -> bool {
-        self.inner.read().contains_key(hash)
+        self.inner.pin().contains_key(hash)
     }
 
     /// Drop bodies for the given hashes. Returns the number actually
     /// removed.
     pub fn evict(&self, hashes: impl IntoIterator<Item = TxHash>) -> usize {
-        let mut g = self.inner.write();
+        let g = self.inner.pin();
         hashes.into_iter().filter(|h| g.remove(h).is_some()).count()
     }
 
     /// Number of bodies currently held.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.inner.read().len()
+        self.inner.len()
     }
 
     /// True when the store holds no bodies.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.inner.read().is_empty()
+        self.inner.is_empty()
     }
 
     /// Build a bloom filter over every cached transaction hash. Sync
@@ -104,12 +104,16 @@ impl TxStore {
     /// Returns `None` if the set is too large to size a filter within the
     /// [`MAX_BITS`](hyperscale_types::MAX_BITS) cap; callers treat this as
     /// "send no inventory, accept the full response."
+    ///
+    /// Iteration is concurrent-safe: keys inserted or removed during the
+    /// snapshot may or may not appear. Bloom filters are an inclusion hint,
+    /// not a manifest — false positives waste a fetch attempt, false
+    /// negatives just mean the responder sends extras. Both are fine.
     #[must_use]
-    #[allow(clippy::significant_drop_tightening)] // need the read lock to iterate keys
     pub fn tx_bloom_snapshot(&self) -> Option<BloomFilter<TxHash>> {
-        let inner = self.inner.read();
-        let mut bf = BloomFilter::with_capacity(inner.len(), DEFAULT_FPR)?;
-        for hash in inner.keys() {
+        let g = self.inner.pin();
+        let mut bf = BloomFilter::with_capacity(g.len(), DEFAULT_FPR)?;
+        for (hash, _) in &g {
             bf.insert(hash);
         }
         Some(bf)

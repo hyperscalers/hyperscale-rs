@@ -120,6 +120,7 @@ opentelemetry = "0.31.0"
 opentelemetry_sdk = "0.31.0"
 opentelemetry-otlp = { version = "0.31.1", features = ["grpc-tonic", "reqwest-rustls"] }
 opentelemetry-semantic-conventions = "0.31.0"
+papaya = "0.2.4"
 parking_lot = "0.12"
 proptest = "1"
 quick_cache = "0.6.21"
