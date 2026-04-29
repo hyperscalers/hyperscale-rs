@@ -1,10 +1,14 @@
 //! Transaction-flow dispatch arms.
 //!
 //! Three `ProtocolEvent` variants drive the transaction pipeline:
-//! - `TransactionGossipReceived` — gossip-delivered tx → mempool admission;
+//! - `TransactionValidated` — gossip-delivered tx that passed async validation
+//!   → mempool admission;
 //! - `TransactionsReceived` — fetch-delivered batch → mempool admission;
 //! - `TransactionsAdmitted` — mempool emits this after admission; BFT's
 //!   pending-block subscriber consumes it and we latch a proposal-retry.
+//!
+//! `TransactionGossipReceived` is the raw gossip arrival; `IoLoop` intercepts
+//! it before reaching the state machine and queues for async validation.
 
 use super::NodeStateMachine;
 use hyperscale_core::{Action, ProtocolEvent};
@@ -15,10 +19,16 @@ impl NodeStateMachine {
     /// Dispatch a transaction-category `ProtocolEvent`.
     pub(super) fn handle_transaction(&mut self, event: ProtocolEvent) -> Vec<Action> {
         match event {
-            ProtocolEvent::TransactionGossipReceived {
+            ProtocolEvent::TransactionValidated {
                 tx,
                 submitted_locally,
-            } => self.on_transaction_gossip_received(tx, submitted_locally),
+            } => self.on_transaction_validated(tx, submitted_locally),
+            ProtocolEvent::TransactionGossipReceived { .. } => {
+                unreachable!(
+                    "TransactionGossipReceived is intercepted by IoLoop for async validation; \
+                     state machine sees only TransactionValidated"
+                )
+            }
             ProtocolEvent::TransactionsReceived { transactions } => {
                 self.on_transactions_fetched(transactions)
             }
@@ -33,10 +43,11 @@ impl NodeStateMachine {
         }
     }
 
-    /// Hand a gossiped transaction to the canonical mempool. Mempool emits
-    /// `Continuation(TransactionsAdmitted)` for whatever it admits; that
-    /// arm latches the proposal-retry — no need to do it optimistically here.
-    fn on_transaction_gossip_received(
+    /// Hand a validated gossip transaction to the canonical mempool. Mempool
+    /// emits `Continuation(TransactionsAdmitted)` for whatever it admits;
+    /// that arm latches the proposal-retry — no need to do it optimistically
+    /// here.
+    fn on_transaction_validated(
         &mut self,
         tx: Arc<RoutableTransaction>,
         submitted_locally: bool,

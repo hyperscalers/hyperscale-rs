@@ -49,7 +49,7 @@ where
         self.pending_validation.remove(&tx_hash);
         let is_local = submitted_locally || self.locally_submitted.remove(&tx_hash);
         self.actions_generated = 0;
-        self.feed_event(ProtocolEvent::TransactionGossipReceived {
+        self.feed_event(ProtocolEvent::TransactionValidated {
             tx,
             submitted_locally: is_local,
         });
