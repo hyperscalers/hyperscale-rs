@@ -2939,6 +2939,7 @@ impl BftCoordinator {
             has_next_block,
             &self.commits,
             self.pending_blocks.len(),
+            self.view_change.view_changes,
         ) {
             crate::block_sync::BlockSyncHealthDecision::Idle => vec![],
             crate::block_sync::BlockSyncHealthDecision::TriggerSync { target_height } => {
