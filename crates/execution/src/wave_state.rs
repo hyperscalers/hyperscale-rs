@@ -98,8 +98,26 @@ pub struct WaveState {
     explicit_aborts: HashSet<TxHash>,
     /// Whether the local vote has been emitted (`build_vote_data` called once).
     voted: bool,
-    /// Whether the local EC has been added to `execution_certificates`. Gates
-    /// wave completion: `is_complete` requires the local EC to be present.
+    /// `global_receipt_root` carried on this validator's own emitted vote.
+    /// Set by `build_vote_data`. Reconciled against `admitted_local_ec_root`
+    /// to detect divergence (see `reconcile_local_ec_decision`).
+    local_vote_global_receipt_root: Option<GlobalReceiptRoot>,
+    /// `global_receipt_root` from the admitted local EC. Set by
+    /// `add_execution_certificate` for the `is_local` arm. May arrive
+    /// before the local vote (cross-shard race where peers aggregate the
+    /// EC before this validator finishes executing).
+    admitted_local_ec_root: Option<GlobalReceiptRoot>,
+    /// Set when the admitted local EC's `global_receipt_root` disagreed
+    /// with `local_vote_global_receipt_root`. Permanently bars the wave
+    /// from finalizing locally so divergent receipts cannot enter the
+    /// `finalized` store, propagate via `cert_bloom`, or be re-served on
+    /// sync. The wave is recovered later via the canonical `FinalizedWave`
+    /// admitted through block-sync.
+    locally_divergent: bool,
+    /// Whether the local EC has been added to `execution_certificates`.
+    /// Gates wave completion: `is_complete` requires the local EC to be
+    /// present. Independent of the canonical-root reconciliation —
+    /// `locally_divergent` carries the divergence verdict separately.
     local_ec_emitted: bool,
     /// Latches `log_if_overdue`: fires once per wave after crossing the
     /// `WAVE_OVERDUE_WARN` threshold. Under ts-based ages we can't rely on
@@ -178,6 +196,9 @@ impl WaveState {
             execution_receipts: HashMap::new(),
             explicit_aborts: HashSet::new(),
             voted: false,
+            local_vote_global_receipt_root: None,
+            admitted_local_ec_root: None,
+            locally_divergent: false,
             local_ec_emitted: false,
             overdue_warned: false,
             covered_shards,
@@ -476,14 +497,21 @@ impl WaveState {
 
         let root = compute_global_receipt_root(&outcomes);
         self.voted = true;
+        self.local_vote_global_receipt_root = Some(root);
+        self.reconcile_local_ec_root();
         Some((target, root, outcomes))
     }
 
     // ── Cross-shard EC collection ───────────────────────────────────────
 
     /// Feed an EC into the wave. Handles dedup (by canonical hash), updates
-    /// per-tx coverage, and tracks aborts/failures. If the EC is our own local
-    /// EC (`ec.wave_id == self.wave_id`), flips `local_ec_emitted` true.
+    /// per-tx coverage, and tracks aborts/failures. For our own local EC
+    /// (`ec.wave_id == self.wave_id`), records the admitted root and runs
+    /// `reconcile_local_ec_decision` — which compares against the local
+    /// vote when both are known. The local EC may arrive before the local
+    /// vote in cross-shard waves where peers aggregate the EC before this
+    /// validator finishes executing; the reconciliation runs again from
+    /// `build_vote_data` once the local vote lands.
     ///
     /// Returns `true` if the wave is now complete (ready for `finalize_wave`).
     pub fn add_execution_certificate(&mut self, ec: Arc<ExecutionCertificate>) -> bool {
@@ -510,12 +538,58 @@ impl WaveState {
             }
         }
 
-        self.execution_certificates.push(ec);
         if is_local {
+            self.admitted_local_ec_root = Some(ec.global_receipt_root);
             self.local_ec_emitted = true;
+            self.reconcile_local_ec_root();
         }
 
+        self.execution_certificates.push(ec);
+
         self.is_complete()
+    }
+
+    /// Compare `local_vote_global_receipt_root` against
+    /// `admitted_local_ec_root` once both are known. Run from both sites
+    /// that can supply the second half of the pair: `build_vote_data`
+    /// (when the EC arrived first) and `add_execution_certificate`
+    /// (when the vote arrived first).
+    ///
+    /// `global_receipt_root` commits to each tx's
+    /// `LocalReceipt::receipt_hash` (which folds in `database_updates`),
+    /// so a root mismatch is direct proof that local execution produced
+    /// different writes than the quorum. Latches `locally_divergent` to
+    /// keep the wave out of the `finalized` store; the canonical
+    /// `FinalizedWave` is recovered later via block-sync.
+    fn reconcile_local_ec_root(&mut self) {
+        if self.locally_divergent {
+            return;
+        }
+        let (Some(local_root), Some(ec_root)) = (
+            self.local_vote_global_receipt_root,
+            self.admitted_local_ec_root,
+        ) else {
+            return;
+        };
+        if local_root != ec_root {
+            self.locally_divergent = true;
+            tracing::warn!(
+                wave = %self.wave_id,
+                block_hash = ?self.block_hash,
+                local_root = ?local_root,
+                ec_root = ?ec_root,
+                "Local execution diverged from quorum — wave will not finalize locally"
+            );
+        }
+    }
+
+    /// Whether this wave was excluded from local finalization because the
+    /// admitted local EC's `global_receipt_root` disagreed with the
+    /// validator's own vote. Callers (e.g. wave pruning) use this to skip
+    /// recovery paths that assume local receipts are canonical.
+    #[must_use]
+    pub const fn is_locally_divergent(&self) -> bool {
+        self.locally_divergent
     }
 
     /// Whether the wave is complete: local EC present, every non-aborted
@@ -530,6 +604,9 @@ impl WaveState {
     #[must_use]
     pub fn is_complete(&self) -> bool {
         if !self.local_ec_emitted {
+            return false;
+        }
+        if self.locally_divergent {
             return false;
         }
         if !self.has_local_receipts_for_non_aborted() {
@@ -1032,6 +1109,110 @@ mod tests {
             !w.is_complete(),
             "must not finalize when local abort disagrees with quorum's EC"
         );
+    }
+
+    #[test]
+    fn locally_divergent_when_vote_root_disagrees_with_admitted_ec() {
+        // Local vote computed root R1 (from this validator's database_updates).
+        // Quorum aggregated EC with root R2 (other validators' agreed root).
+        // R1 != R2 ⇒ this validator's `LocalReceipt.database_updates`
+        // differs from canonical. Wave must not finalize locally; the
+        // canonical `FinalizedWave` is recovered later via block-sync.
+        let mut w = make_single_shard_wave(2);
+        let h0 = w.tx_hashes()[0];
+        let h1 = w.tx_hashes()[1];
+
+        record_executed(&mut w, h0, true);
+        record_executed(&mut w, h1, true);
+
+        // Emit local vote — captures local_vote_global_receipt_root.
+        let (_, local_root, _) = w.build_vote_data(ts_for(WAVE_START + 2)).unwrap();
+
+        // Build a local EC with a DIFFERENT global_receipt_root.
+        let outcomes: Vec<TxOutcome> = w
+            .tx_hashes()
+            .iter()
+            .map(|h| TxOutcome {
+                tx_hash: *h,
+                outcome: executed(true),
+            })
+            .collect();
+        let divergent_root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"divergent"));
+        assert_ne!(local_root, divergent_root);
+        let ec_local = Arc::new(ExecutionCertificate::new(
+            w.wave_id().clone(),
+            WeightedTimestamp(WAVE_START.0 + 1),
+            divergent_root,
+            outcomes,
+            Bls12381G2Signature([0u8; 96]),
+            SignerBitfield::new(4),
+        ));
+
+        w.add_execution_certificate(ec_local);
+
+        assert!(w.is_locally_divergent());
+        assert!(!w.is_complete());
+    }
+
+    #[test]
+    fn not_locally_divergent_when_vote_root_matches_admitted_ec() {
+        // Happy path: local execution agrees with quorum. Vote and EC
+        // carry the same root, wave finalizes normally.
+        let mut w = make_single_shard_wave(1);
+        let h0 = w.tx_hashes()[0];
+
+        record_executed(&mut w, h0, true);
+        let (_, local_root, outcomes) = w.build_vote_data(ts_for(WAVE_START + 2)).unwrap();
+
+        let ec_local = Arc::new(ExecutionCertificate::new(
+            w.wave_id().clone(),
+            WeightedTimestamp(WAVE_START.0 + 1),
+            local_root,
+            outcomes,
+            Bls12381G2Signature([0u8; 96]),
+            SignerBitfield::new(4),
+        ));
+        w.add_execution_certificate(ec_local);
+
+        assert!(!w.is_locally_divergent());
+        assert!(w.is_complete());
+    }
+
+    #[test]
+    fn divergence_caught_when_ec_arrives_before_vote() {
+        // Cross-shard race: local EC aggregated and admitted before this
+        // validator emits its vote. Reconciliation runs again from
+        // `build_vote_data` and catches the mismatch then.
+        let mut w = make_single_shard_wave(1);
+        let h0 = w.tx_hashes()[0];
+
+        record_executed(&mut w, h0, true);
+
+        // EC arrives first with a root we will NOT match locally.
+        let ec_root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"ec"));
+        let ec_local = Arc::new(ExecutionCertificate::new(
+            w.wave_id().clone(),
+            WeightedTimestamp(WAVE_START.0 + 1),
+            ec_root,
+            vec![TxOutcome {
+                tx_hash: h0,
+                outcome: executed(true),
+            }],
+            Bls12381G2Signature([0u8; 96]),
+            SignerBitfield::new(4),
+        ));
+        w.add_execution_certificate(ec_local);
+        // Vote not yet emitted — divergence undetectable, wave still
+        // appears completable.
+        assert!(!w.is_locally_divergent());
+
+        // Local vote produces a different root.
+        let (_, local_root, _) = w.build_vote_data(ts_for(WAVE_START + 2)).unwrap();
+        assert_ne!(local_root, ec_root);
+
+        // Reconciliation now flags divergence.
+        assert!(w.is_locally_divergent());
+        assert!(!w.is_complete());
     }
 
     #[test]

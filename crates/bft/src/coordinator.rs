@@ -2384,25 +2384,6 @@ impl BftCoordinator {
             "Applying synced block"
         );
 
-        // The sync peer can serve a block whose `FinalizedWave.receipts`
-        // don't agree with their own EC (different shard-local execution,
-        // bug, or byzantine serving). Applying such a block would feed the
-        // peer's divergent `LocalReceipt.database_updates` into our
-        // `pending_chain` overlay and substate DB, corrupting subsequent
-        // reads. Reject at ingress; `BlockSyncProtocol` re-attempts the height.
-        for fw in block.certificates() {
-            if let Err(err) = fw.validate_receipts_against_ec() {
-                warn!(
-                    ?block_hash,
-                    height = height.0,
-                    wave_id_hash = ?fw.wave_id_hash(),
-                    ?err,
-                    "Rejecting synced block: FinalizedWave receipts inconsistent with its EC"
-                );
-                return vec![];
-            }
-        }
-
         // Capture parent state BEFORE record_block_committed advances heights.
         let parent_state_root = self
             .chain_view()
@@ -3222,10 +3203,9 @@ impl BftCoordinator {
 mod tests {
     use super::*;
     use hyperscale_types::{
-        Bls12381G1PrivateKey, Bls12381G2Signature, CertificateRoot, GlobalReceiptHash,
-        GlobalReceiptRoot, LocalReceiptRoot, ProvisionsRoot, ShardGroupId, SignerBitfield,
-        TopologySnapshot, TransactionRoot, ValidatorId, ValidatorInfo, ValidatorSet,
-        WeightedTimestamp, generate_bls_keypair, zero_bls_signature,
+        Bls12381G1PrivateKey, CertificateRoot, LocalReceiptRoot, ProvisionsRoot, ShardGroupId,
+        SignerBitfield, TopologySnapshot, TransactionRoot, ValidatorId, ValidatorInfo,
+        ValidatorSet, WeightedTimestamp, generate_bls_keypair, zero_bls_signature,
     };
     use std::collections::BTreeMap;
 
@@ -4509,83 +4489,6 @@ mod tests {
                 )
             }
             .is_ok()
-        );
-    }
-
-    #[test]
-    fn test_apply_synced_block_rejects_inconsistent_wave_receipts() {
-        use hyperscale_types::{
-            ExecutionCertificate, ExecutionOutcome, FinalizedWave, LocalReceipt, ReceiptBundle,
-            TransactionOutcome, TxOutcome, WaveCertificate, WaveId,
-        };
-
-        let (mut state, topology) = make_test_state();
-        state.set_time(LocalTimestamp::from_millis(100_000));
-        let committed_before = state.committed_height;
-
-        // Build a FinalizedWave whose EC attests "success" but whose receipt
-        // reports "failure" — the divergent-peer signature we want to reject.
-        let tx_hash = TxHash::from_raw(Hash::from_bytes(b"tx_divergent"));
-        let wave_id = WaveId::new(
-            ShardGroupId(0),
-            BlockHeight(1),
-            std::collections::BTreeSet::new(),
-        );
-        let ec = ExecutionCertificate::new(
-            wave_id.clone(),
-            WeightedTimestamp(1),
-            GlobalReceiptRoot::ZERO,
-            vec![TxOutcome {
-                tx_hash,
-                outcome: ExecutionOutcome::Executed {
-                    receipt_hash: GlobalReceiptHash::ZERO,
-                    success: true,
-                },
-            }],
-            Bls12381G2Signature([0u8; 96]),
-            SignerBitfield::new(4),
-        );
-        let bad_wave = Arc::new(FinalizedWave {
-            certificate: Arc::new(WaveCertificate {
-                wave_id,
-                execution_certificates: vec![Arc::new(ec)],
-            }),
-            receipts: vec![ReceiptBundle {
-                tx_hash,
-                local_receipt: Arc::new(LocalReceipt {
-                    outcome: TransactionOutcome::Failure, // EC said Success
-                    #[allow(clippy::default_trait_access)]
-                    database_updates: Default::default(),
-                    application_events: vec![],
-                }),
-                execution_output: None,
-            }],
-        });
-
-        let block = Block::Live {
-            header: BlockHeader {
-                parent_block_hash: BlockHash::ZERO,
-                ..make_header_at_height(BlockHeight(1), 1000)
-            },
-            transactions: vec![],
-            certificates: vec![bad_wave],
-            provisions: vec![],
-        };
-        let qc = QuorumCertificate {
-            weighted_timestamp: WeightedTimestamp(1000),
-            ..make_test_qc(block.hash(), BlockHeight(1))
-        };
-
-        let certified = CertifiedBlock::new_unchecked(block, qc);
-        let actions = state.apply_synced_block(&topology, certified);
-
-        assert!(
-            actions.is_empty(),
-            "apply_synced_block should reject a block whose wave receipts disagree with its EC"
-        );
-        assert_eq!(
-            state.committed_height, committed_before,
-            "rejected block must not advance committed_height"
         );
     }
 }
