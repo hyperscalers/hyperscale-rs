@@ -429,11 +429,6 @@ pub enum ProtocolEvent {
         height: BlockHeight,
     },
 
-    /// Sync recovery complete — validator has caught up and is resuming consensus.
-    /// Triggers immediate provision and remote header fetching so the validator
-    /// can participate in execution for recent blocks within the timeout window.
-    SyncResumed,
-
     // ═══════════════════════════════════════════════════════════════════════
     // Global Consensus / Epoch
     // ═══════════════════════════════════════════════════════════════════════

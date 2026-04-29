@@ -393,6 +393,10 @@ impl BftCoordinator {
     /// Re-enables normal block proposals and view changes.
     /// Also triggers fetch requests for any pending blocks that still need data,
     /// since fetching was suppressed during sync.
+    ///
+    /// `NodeStateMachine` flushes expected remote headers and provisions in
+    /// the same `SyncProtocolComplete` arm, so this returns only BFT-local
+    /// resume actions.
     pub fn on_sync_complete(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
         info!(
             validator = ?topology.local_validator_id(),
@@ -406,14 +410,7 @@ impl BftCoordinator {
         // is done, we need to fetch any missing transactions/certificates.
         // Use force_immediate=true to bypass the age timeout — blocks received
         // during sync shouldn't wait another timeout period to be fetched.
-        let mut actions = self.check_pending_block_fetches(topology, true);
-
-        // Notify NodeStateMachine to flush expected provisions and remote
-        // headers immediately so we can participate in execution for recent
-        // blocks within the WAVE_TIMEOUT window.
-        actions.push(Action::Continuation(ProtocolEvent::SyncResumed));
-
-        actions
+        self.check_pending_block_fetches(topology, true)
     }
 
     /// Record leader activity (resets the view change timeout).
@@ -4164,14 +4161,12 @@ mod tests {
         state.set_syncing(&topology, true);
         assert!(state.is_syncing());
 
-        // Fresh state has no pending blocks, so SyncResumed is the only action.
+        // Fresh state has no pending blocks, so on_sync_complete returns
+        // no actions — the remote-header / provision flushes happen in
+        // NodeStateMachine's SyncProtocolComplete arm.
         let actions = state.on_sync_complete(&topology);
         assert!(!state.is_syncing());
-        assert_eq!(actions.len(), 1);
-        assert!(matches!(
-            &actions[0],
-            Action::Continuation(ProtocolEvent::SyncResumed)
-        ));
+        assert!(actions.is_empty());
     }
 
     #[test]

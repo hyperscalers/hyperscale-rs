@@ -1,9 +1,10 @@
 //! Sync-flow dispatch arms.
 //!
-//! Sync recovery fans out across multiple coordinators when it completes —
-//! BFT exits sync mode, while remote-headers and provisions flush their
-//! expected sets so we can immediately participate in execution for blocks
-//! within the `WAVE_TIMEOUT` window.
+//! When `SyncProtocolComplete` fires we fan out across all three
+//! coordinators in one pass: BFT exits sync mode and re-issues any
+//! pending block fetches it had suppressed; remote-headers and
+//! provisions flush their expected sets so we can immediately
+//! participate in execution for blocks within the `WAVE_TIMEOUT` window.
 
 use super::NodeStateMachine;
 use hyperscale_core::{Action, ProtocolEvent};
@@ -15,17 +16,13 @@ impl NodeStateMachine {
             ProtocolEvent::SyncBlockReadyToApply { certified } => self
                 .bft
                 .on_sync_block_ready_to_apply(self.topology.snapshot(), certified),
-            // SyncProtocol finished fetching — tell BFT to exit sync mode so
-            // it can re-enter sync if still behind, or resume normal consensus.
+            // SyncProtocol finished fetching: exit BFT sync mode + flush
+            // expected provisions + flush expected headers, all in one
+            // pass.
             ProtocolEvent::SyncProtocolComplete { .. } => {
-                self.bft.on_sync_complete(self.topology.snapshot())
-            }
-            // Sync recovery complete — flush expected provisions and remote
-            // headers immediately so we can participate in execution for recent
-            // blocks within the WAVE_TIMEOUT window.
-            ProtocolEvent::SyncResumed => {
                 let topo = self.topology.snapshot();
-                let mut actions = self.remote_headers.flush_expected_headers(topo);
+                let mut actions = self.bft.on_sync_complete(topo);
+                actions.extend(self.remote_headers.flush_expected_headers(topo));
                 actions.extend(self.provisions.flush_expected_provisions(topo));
                 actions
             }
