@@ -147,9 +147,16 @@ pub enum NodeInput {
     /// `Continuation(FinalizedWavesAdmitted)` interception drains the matching
     /// fetch protocol — the block-hash association and serving peer aren't
     /// needed at `io_loop`'s level once the cert is in the wave's EC.
+    ///
+    /// `missing_hashes` lists requested wave-id hashes the peer did not
+    /// return (computed client-side as `requested - delivered`); the fetch
+    /// FSM feeds them as `Failed` so partial responses don't pin entries
+    /// in the in-flight set.
     FinalizedWaveReceived {
         /// Finalized waves returned by the peer.
         waves: Vec<Arc<FinalizedWave>>,
+        /// Requested wave-id hashes the peer did not return.
+        missing_hashes: Vec<WaveIdHash>,
     },
 
     /// A finalized wave fetch request failed.

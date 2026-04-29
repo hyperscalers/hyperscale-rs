@@ -17,6 +17,7 @@ use hyperscale_network::Network;
 use hyperscale_storage::Storage;
 use hyperscale_types::{
     ExecutionCertificate, FinalizedWave, ProvisionHash, Provisions, RoutableTransaction, TxHash,
+    WaveIdHash,
 };
 use std::sync::Arc;
 
@@ -98,10 +99,18 @@ where
     /// `ExecutionCoordinator::admit_finalized_wave`, which emits
     /// `Continuation(FinalizedWavesAdmitted)`. `io_loop`'s interception arm
     /// drains the fetch protocol; state.rs forwards to the BFT subscriber.
+    /// `missing_hashes` (requested but not returned by the peer) are fed
+    /// to the fetch FSM as `Failed` so the next tick redispatches them.
     pub(in crate::io_loop) fn handle_finalized_wave_received(
         &mut self,
         waves: Vec<Arc<FinalizedWave>>,
+        missing_hashes: Vec<WaveIdHash>,
     ) {
+        if !missing_hashes.is_empty() {
+            self.protocols.finalized_wave.handle(FetchInput::Failed {
+                ids: missing_hashes,
+            });
+        }
         for wave in waves {
             let actions = self.state.execution().admit_finalized_wave(wave);
             self.process_actions(actions);

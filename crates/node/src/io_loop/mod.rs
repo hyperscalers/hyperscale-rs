@@ -422,8 +422,11 @@ where
                 self.handle_local_provisions_fetch_failed(hashes);
             }
 
-            NodeInput::FinalizedWaveReceived { waves } => {
-                self.handle_finalized_wave_received(waves);
+            NodeInput::FinalizedWaveReceived {
+                waves,
+                missing_hashes,
+            } => {
+                self.handle_finalized_wave_received(waves, missing_hashes);
             }
 
             NodeInput::FinalizedWaveFetchFailed { hashes } => {

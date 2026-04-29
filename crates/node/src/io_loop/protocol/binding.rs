@@ -24,7 +24,7 @@ use hyperscale_messages::request::{
 };
 use hyperscale_network::{Network, ResponseVerdict};
 use hyperscale_types::{
-    BlockHeight, ProvisionHash, Provisions, ShardGroupId, TxHash, WaveId, WaveIdHash,
+    BlockHeight, FinalizedWave, ProvisionHash, Provisions, ShardGroupId, TxHash, WaveId, WaveIdHash,
 };
 use std::hash::Hash;
 use std::sync::Arc;
@@ -225,8 +225,15 @@ impl FetchBinding for FinalizedWaveBinding {
                 if let Ok(resp) = result {
                     let returned = resp.waves.len();
                     let requested = hs.len();
+                    let delivered: std::collections::HashSet<WaveIdHash> =
+                        resp.waves.iter().map(FinalizedWave::wave_id_hash).collect();
+                    let missing_hashes: Vec<WaveIdHash> =
+                        hs.into_iter().filter(|h| !delivered.contains(h)).collect();
                     let waves = resp.waves.into_iter().map(Arc::new).collect();
-                    let _ = es.send(NodeInput::FinalizedWaveReceived { waves });
+                    let _ = es.send(NodeInput::FinalizedWaveReceived {
+                        waves,
+                        missing_hashes,
+                    });
                     if returned < requested {
                         ResponseVerdict::Reject
                     } else {
@@ -277,10 +284,22 @@ impl FetchBinding for ExecCertBinding {
                 if let Ok(response) = result {
                     match response.certificates {
                         Some(certs) if !certs.is_empty() => {
+                            let delivered: std::collections::HashSet<WaveId> =
+                                certs.iter().map(|c| c.wave_id.clone()).collect();
+                            let missing: Vec<WaveId> = failed_ids
+                                .into_iter()
+                                .filter(|id| !delivered.contains(id))
+                                .collect();
+                            let had_misses = !missing.is_empty();
                             let _ = es.send(NodeInput::ExecutionCertsReceived {
                                 certificates: certs,
                             });
-                            ResponseVerdict::Accept
+                            if had_misses {
+                                let _ = es.send(NodeInput::ExecCertFetchFailed { hashes: missing });
+                                ResponseVerdict::Reject
+                            } else {
+                                ResponseVerdict::Accept
+                            }
                         }
                         _ => {
                             let _ = es.send(NodeInput::ExecCertFetchFailed { hashes: failed_ids });
@@ -375,6 +394,14 @@ impl FetchBinding for ProvisionBinding {
                     return ResponseVerdict::Reject;
                 }
                 if provisions.transactions.is_empty() {
+                    // Empty-but-scope-matched response is still a miss for
+                    // the requester: the FSM has nothing to admit, so
+                    // without an explicit `Failed` the id stays in_flight
+                    // forever.
+                    let _ = es.send(NodeInput::ProvisionsFetchFailed {
+                        source_shard,
+                        block_height,
+                    });
                     return ResponseVerdict::Reject;
                 }
                 let _ = es.send(NodeInput::Protocol(Box::new(
