@@ -1,21 +1,23 @@
-//! Sync-protocol step handlers.
+//! Block-sync I/O glue.
 //!
-//! The block-sync protocol's I/O glue: rehydrate elided block responses
-//! against local caches; on a rehydration miss mark the height for a
-//! full refetch (next request omits the inventory bloom so the responder
-//! cannot elide bodies again).
+//! Bridges `Sync<BlockSyncBinding>`'s scheduling decisions to the network
+//! and BFT. This is where payload-specific concerns live:
 //!
-//! Two `step()` arms route here:
-//! - `BlockSyncResponseReceived` — rehydrate the elided block, deliver
-//!   on success or mark for full refetch on miss;
-//! - `BlockSyncFetchFailed` — signal failure to the sync FSM.
+//! - building `GetBlockRequest`s with the right inventory bloom + force-full
+//!   override
+//! - rehydrating elided responses against local caches
+//! - validating block / QC shape (height match, QC hash match, QC height
+//!   match, certificate-root match)
+//! - delivering valid blocks to BFT via `ProtocolEvent::BlockSyncReadyToApply`
+//! - feeding scheduling events back to the FSM
 //!
-//! The sync FSM (`super::super::protocol::block_sync::BlockSyncProtocol`) is owned by
-//! `ProtocolHost`. This module bridges its outputs to the network and
-//! threads `NodeInput::SyncBlock*` callbacks back through the event sender.
+//! The FSM itself owns nothing about a `CertifiedBlock`'s shape — it just
+//! tracks heights and emits `Fetch { from, count }` for the binding to
+//! turn into a network round-trip.
 
 use crate::io_loop::IoLoop;
 use crate::io_loop::protocol::block_sync::{BlockSyncInput, BlockSyncOutput};
+use crate::io_loop::protocol::sync::SyncOutput;
 use hyperscale_core::{NodeInput, ProtocolEvent};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::Engine;
@@ -37,132 +39,109 @@ where
 
     /// Handle a sync block response: rehydrate the elided block against
     /// local caches; on a miss, mark the height for a full refetch and
-    /// signal the sync FSM to re-queue.
+    /// signal the FSM to re-queue.
     pub(in crate::io_loop) fn handle_block_sync_response_received(
         &mut self,
         height: BlockHeight,
         block: Option<Box<ElidedCertifiedBlock>>,
     ) {
         let Some(elided) = block else {
-            // Peer didn't have the block — pass `None` through to the sync
-            // state machine, which re-queues the height.
-            self.deliver_sync_block(height, None);
+            // Peer didn't have the block — re-queue via fetch-failed.
+            self.feed_block_sync_fetch_failed(height);
             return;
         };
-        match self.rehydrate_elided_block(&elided) {
-            Ok(cert) => self.deliver_sync_block(height, Some(Box::new(cert))),
+        let cert = match self.rehydrate_elided_block(&elided) {
+            Ok(c) => c,
             Err(_miss) => {
                 // Inventory bloom said we had bodies we couldn't resolve.
-                // Mark the height so the next fetch sends an empty
-                // inventory — the responder cannot elide bodies, so
-                // rehydration will succeed on the retry. Signal the FSM
-                // to re-queue this height.
+                // Mark for full refetch and re-queue.
                 metrics::record_sync_response_error("rehydration_miss");
                 self.protocols.block_sync.mark_force_full_refetch(height);
-                self.deliver_sync_block(height, None);
+                self.feed_block_sync_fetch_failed(height);
+                return;
             }
-        }
+        };
+        self.deliver_sync_block(height, cert);
     }
 
-    /// Handle a sync block fetch failure: signal the sync state machine.
+    /// Handle a sync block fetch failure (network error / not-found).
     pub(in crate::io_loop) fn handle_block_sync_fetch_failed(&mut self, height: BlockHeight) {
-        let outputs = self
-            .protocols
-            .block_sync
-            .handle(BlockSyncInput::BlockFetchFailed {
-                height,
-                now: std::time::Instant::now(),
-            });
-        self.process_block_sync_outputs(outputs);
-        self.update_fetch_tick_timer();
+        metrics::record_sync_response_error("fetch_failed");
+        self.feed_block_sync_fetch_failed(height);
     }
 
     // ─── Sync output processing + helpers ───────────────────────────────
 
-    /// Process `BlockSyncProtocol` outputs internally.
-    ///
-    /// `DeliverBlock` and `SyncComplete` are fed directly to the state
-    /// machine (no round-trip through the runner). `FetchBlock` uses the
-    /// `Network` trait.
+    /// Process FSM outputs: `Fetch` → network request, `Complete` →
+    /// fed into the state machine as `BlockSyncComplete`.
     pub(in crate::io_loop) fn process_block_sync_outputs(&mut self, outputs: Vec<BlockSyncOutput>) {
-        // Snapshot the sync inventory once per batch so every FetchBlock in
+        // Snapshot the sync inventory once per batch so every Fetch in
         // this tick shares a consistent view of mempool / cert-cache /
-        // provision-store membership. Built lazily: skipped entirely if
-        // the batch contains no FetchBlock outputs.
+        // provision-store membership. Built lazily.
         let mut inventory_cache: Option<Inventory> = None;
         for output in outputs {
             match output {
-                BlockSyncOutput::FetchBlock {
-                    height,
-                    target_height,
-                    force_full,
-                } => {
-                    use hyperscale_messages::request::GetBlockRequest;
-                    // Heights flagged `force_full` were rehydration misses
-                    // last time — request with empty inventory so the
-                    // responder cannot elide bodies again.
-                    let inventory = if force_full {
-                        Inventory::empty()
-                    } else {
-                        inventory_cache
-                            .get_or_insert_with(|| self.build_sync_inventory())
-                            .clone()
-                    };
-                    let es = self.event_sender.clone();
-                    let peers = self.local_peers();
-                    self.network.request(
-                        &peers,
-                        None,
-                        GetBlockRequest::new(height, target_height).with_inventory(inventory),
-                        Box::new(move |result| {
-                            match result {
-                                Ok(resp) => {
-                                    let block = resp.into_elided().map(Box::new);
-                                    let _ = es.send(NodeInput::BlockSyncResponseReceived {
-                                        height,
-                                        block,
-                                    });
-                                }
-                                Err(_) => {
-                                    let _ = es.send(NodeInput::BlockSyncFetchFailed { height });
-                                }
-                            }
-                            // Sync's "peer doesn't have this height" is
-                            // ambiguous (peer may simply be behind us) —
-                            // never Reject.
-                            ResponseVerdict::Accept
-                        }),
-                    );
+                SyncOutput::Fetch { from: height, .. } => {
+                    self.dispatch_block_sync_fetch(height, &mut inventory_cache);
                 }
-                BlockSyncOutput::DeliverBlock { certified } => {
-                    metrics::record_sync_block_received_by_bft();
-                    metrics::record_sync_block_submitted_for_verification();
-                    self.feed_event(ProtocolEvent::BlockSyncReadyToApply {
-                        certified: *certified,
-                    });
-                }
-                BlockSyncOutput::SyncComplete { height } => {
+                SyncOutput::Complete { height, .. } => {
                     tracing::info!(
                         height = height.0,
                         "Sync protocol complete, resuming consensus"
                     );
-                    // Tell BftCoordinator to exit sync mode. The previous
-                    // BlockPersisted → on_block_persisted path was unreliable
-                    // because BlockPersisted requires PreparedCommit which
-                    // may not be available yet for synced blocks.
                     self.feed_event(ProtocolEvent::BlockSyncComplete { height });
                 }
             }
         }
     }
 
+    /// Dispatch a single-height block fetch. Reads the current sync
+    /// target and `force_full` flag from the FSM at dispatch time.
+    fn dispatch_block_sync_fetch(
+        &self,
+        height: BlockHeight,
+        inventory_cache: &mut Option<Inventory>,
+    ) {
+        use hyperscale_messages::request::GetBlockRequest;
+
+        let target_height = self.protocols.block_sync.target(&()).unwrap_or(height);
+        let force_full = self.protocols.block_sync.force_full(height);
+
+        // Heights flagged `force_full` were rehydration misses last time —
+        // request with empty inventory so the responder cannot elide bodies.
+        let inventory = if force_full {
+            Inventory::empty()
+        } else {
+            inventory_cache
+                .get_or_insert_with(|| self.build_sync_inventory())
+                .clone()
+        };
+        let es = self.event_sender.clone();
+        let peers = self.local_peers();
+        self.network.request(
+            &peers,
+            None,
+            GetBlockRequest::new(height, target_height).with_inventory(inventory),
+            Box::new(move |result| {
+                match result {
+                    Ok(resp) => {
+                        let block = resp.into_elided().map(Box::new);
+                        let _ = es.send(NodeInput::BlockSyncResponseReceived { height, block });
+                    }
+                    Err(_) => {
+                        let _ = es.send(NodeInput::BlockSyncFetchFailed { height });
+                    }
+                }
+                // "Peer doesn't have this height" is ambiguous (peer may
+                // simply be behind us) — never Reject.
+                ResponseVerdict::Accept
+            }),
+        );
+    }
+
     /// Snapshot local mempool / finalized-wave cache / provision store
-    /// into an [`Inventory`] so sync requests can tell the responder which
-    /// bodies to elide.
-    ///
-    /// Each category degrades independently to `None` when the cached set
-    /// exceeds the filter size cap — the responder treats absence as
-    /// "send everything for this category."
+    /// into an [`Inventory`] so the responder can elide bodies the
+    /// requester already has.
     fn build_sync_inventory(&self) -> Inventory {
         Inventory {
             tx_have: self.state.mempool().tx_bloom_snapshot(),
@@ -171,10 +150,7 @@ where
         }
     }
 
-    /// Rehydrate an elided sync response into a full `CertifiedBlock` by
-    /// resolving any omitted body against local caches. On miss returns
-    /// the list of hashes the lookups couldn't resolve — the caller marks
-    /// the height for a full refetch.
+    /// Rehydrate an elided sync response into a full `CertifiedBlock`.
     fn rehydrate_elided_block(
         &self,
         elided: &ElidedCertifiedBlock,
@@ -189,42 +165,82 @@ where
         )
     }
 
-    /// Run the post-rehydration sync pipeline: certificate-root check,
-    /// then feed the block into the sync state machine (or pass through
-    /// `None` for not-found / rehydration-miss).
-    fn deliver_sync_block(&mut self, height: BlockHeight, block: Option<Box<CertifiedBlock>>) {
-        let certificate_root_valid = match block.as_deref() {
-            Some(fetched) if !fetched.block.certificates().is_empty() => {
-                let computed =
-                    hyperscale_types::compute_certificate_root(fetched.block.certificates());
-                let matches = computed == fetched.block.header().certificate_root;
-                if !matches {
-                    tracing::warn!(
-                        height = height.0,
-                        ?computed,
-                        expected = ?fetched.block.header().certificate_root,
-                        "Sync: certificate_root mismatch — rejecting response"
-                    );
-                }
-                matches
-            }
-            _ => true, // Empty block or no block — no root to check
-        };
-
-        if certificate_root_valid {
-            let outputs = self
-                .protocols
-                .block_sync
-                .handle(BlockSyncInput::BlockResponseReceived {
-                    height,
-                    block,
-                    now: std::time::Instant::now(),
-                });
-            self.process_block_sync_outputs(outputs);
-        } else {
-            let _ = self
-                .event_sender
-                .send(NodeInput::BlockSyncFetchFailed { height });
+    /// Validate a rehydrated block and either deliver it to BFT or
+    /// re-queue via fetch-failed.
+    fn deliver_sync_block(&mut self, height: BlockHeight, certified: CertifiedBlock) {
+        // ── Shape validation that used to live in the FSM ──
+        if certified.block.height() != height {
+            tracing::warn!(
+                expected = height.0,
+                got = certified.block.height().0,
+                "Height mismatch in sync response"
+            );
+            metrics::record_sync_block_filtered("height_mismatch");
+            self.feed_block_sync_fetch_failed(height);
+            return;
         }
+        let block_hash = certified.block.hash();
+        if certified.qc.block_hash != block_hash {
+            tracing::warn!(height = height.0, "QC block hash mismatch in sync response");
+            metrics::record_sync_block_filtered("qc_hash_mismatch");
+            self.feed_block_sync_fetch_failed(height);
+            return;
+        }
+        if certified.qc.height != height {
+            tracing::warn!(height = height.0, "QC height mismatch in sync response");
+            metrics::record_sync_block_filtered("qc_height_mismatch");
+            self.feed_block_sync_fetch_failed(height);
+            return;
+        }
+        // Certificate-root match (only needed when block carries certs).
+        if !certified.block.certificates().is_empty() {
+            let computed =
+                hyperscale_types::compute_certificate_root(certified.block.certificates());
+            if computed != certified.block.header().certificate_root {
+                tracing::warn!(
+                    height = height.0,
+                    ?computed,
+                    expected = ?certified.block.header().certificate_root,
+                    "Sync: certificate_root mismatch — rejecting response"
+                );
+                self.feed_block_sync_fetch_failed(height);
+                return;
+            }
+        }
+
+        metrics::record_sync_block_downloaded();
+        metrics::record_sync_block_verified();
+        metrics::record_sync_block_received_by_bft();
+        metrics::record_sync_block_submitted_for_verification();
+
+        // Hand the block off to BFT; tell the FSM the height was delivered.
+        self.feed_event(ProtocolEvent::BlockSyncReadyToApply { certified });
+        let outputs = self
+            .protocols
+            .block_sync
+            .handle(BlockSyncInput::FetchSucceeded {
+                scope: (),
+                from: height,
+                count: 1,
+                delivered_heights: vec![height],
+                now: std::time::Instant::now(),
+            });
+        self.process_block_sync_outputs(outputs);
+        self.update_fetch_tick_timer();
+    }
+
+    /// Common back-edge: re-queue a height via `FetchFailed`.
+    fn feed_block_sync_fetch_failed(&mut self, height: BlockHeight) {
+        let outputs = self
+            .protocols
+            .block_sync
+            .handle(BlockSyncInput::FetchFailed {
+                scope: (),
+                from: height,
+                count: 1,
+                now: std::time::Instant::now(),
+            });
+        self.process_block_sync_outputs(outputs);
+        self.update_fetch_tick_timer();
     }
 }

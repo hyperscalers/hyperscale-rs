@@ -69,7 +69,7 @@ where
             committed_height: self.state.bft().committed_height(),
             view: self.state.bft().view().0,
             state_root,
-            block_sync: self.protocols.block_sync.status(),
+            block_sync: self.protocols.block_sync.block_sync_status(),
             mempool_pending: pending,
             mempool_in_flight: in_flight,
             mempool_total: mempool.len(),

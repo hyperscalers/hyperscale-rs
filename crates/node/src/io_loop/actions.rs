@@ -396,7 +396,7 @@ where
                 let outputs = self
                     .protocols
                     .block_sync
-                    .handle(BlockSyncInput::BlockCommitted { height });
+                    .handle(BlockSyncInput::Admitted { scope: (), height });
                 self.process_block_sync_outputs(outputs);
                 if let Some((block, qc)) = notify_now {
                     let certified = hyperscale_types::CertifiedBlock::new_unchecked(
@@ -418,10 +418,10 @@ where
     fn process_sync_fetch_action(&mut self, action: Action) {
         match action {
             Action::StartBlockSync { target_height } => {
-                let outputs = self
-                    .protocols
-                    .block_sync
-                    .handle(BlockSyncInput::StartSync { target_height });
+                let outputs = self.protocols.block_sync.handle(BlockSyncInput::StartSync {
+                    scope: (),
+                    target: target_height,
+                });
                 self.process_block_sync_outputs(outputs);
             }
             Action::Fetch(req) => self.process_fetch_request(req),

@@ -130,6 +130,17 @@ pub trait SyncBinding: 'static {
 
     /// Stable identifier for tracing / metrics.
     const NAME: &'static str;
+
+    /// Hook fired when a height is admitted. Bindings with per-id
+    /// auxiliary state (e.g. block-sync's `force_full_refetch`) clean up
+    /// entries at or below `committed` here. Default no-op.
+    #[allow(unused_variables)]
+    fn on_admitted(state: &mut Self::State, scope: &Self::Scope, committed: BlockHeight) {}
+
+    /// Hook fired when a scope reaches its target and emits `Complete`.
+    /// Binding can clear all per-id state at this point. Default no-op.
+    #[allow(unused_variables)]
+    fn on_complete(state: &mut Self::State, scope: &Self::Scope, height: BlockHeight) {}
 }
 
 /// Per-scope sliding-window state.
@@ -295,6 +306,12 @@ impl<B: SyncBinding> Sync<B> {
         self.scopes.values().map(|s| s.in_flight_ranges).sum()
     }
 
+    /// Per-scope target. `None` if the scope has no entry yet.
+    #[must_use]
+    pub fn target(&self, scope: &B::Scope) -> Option<BlockHeight> {
+        self.scopes.get(scope).map(|s| s.target)
+    }
+
     /// Per-scope status snapshot.
     #[must_use]
     pub fn status(&self, scope: &B::Scope) -> ScopeStatus {
@@ -433,21 +450,27 @@ impl<B: SyncBinding> Sync<B> {
 
         // Drop tracking state for heights at or below the new committed
         // level.
-        state.heights_queued.retain(|&h| h > state.committed);
-        state.in_flight.retain(|&h| h > state.committed);
-        state.deferred.retain(|&h, _| h > state.committed);
+        let committed = state.committed;
+        let reached_target = committed >= state.target;
+        state.heights_queued.retain(|&h| h > committed);
+        state.in_flight.retain(|&h| h > committed);
+        state.deferred.retain(|&h, _| h > committed);
+
+        // Binding hook: clean up per-id auxiliary state.
+        B::on_admitted(&mut self.binding_state, scope, committed);
 
         let mut outputs = Vec::new();
-        if state.committed >= state.target {
+        if reached_target {
             info!(
                 binding = B::NAME,
                 ?scope,
-                height = state.committed.0,
+                height = committed.0,
                 "sync: caught up"
             );
+            B::on_complete(&mut self.binding_state, scope, committed);
             outputs.push(SyncOutput::Complete {
                 scope: scope.clone(),
-                height: state.committed,
+                height: committed,
             });
             return outputs;
         }

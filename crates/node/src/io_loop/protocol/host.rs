@@ -140,7 +140,7 @@ impl ProtocolHost {
             provision_pending: self.provision.pending_count(),
             exec_cert_in_flight: self.exec_cert.in_flight_count(),
             exec_cert_pending: self.exec_cert.pending_count(),
-            block_sync_status: self.block_sync.status(),
+            block_sync_status: self.block_sync.block_sync_status(),
         }
     }
 }
