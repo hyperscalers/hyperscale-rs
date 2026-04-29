@@ -74,7 +74,10 @@ impl ProtocolHost {
     }
 
     /// True if any fetch protocol has work outstanding (in-flight or
-    /// queued), or if sync has heights parked behind a backoff.
+    /// queued), or if sync has heights parked behind a backoff. Keeps the
+    /// `FetchTick` timer alive so deferred heights eventually retry and
+    /// active sync scopes keep emitting fetches even if their consumer is
+    /// slow to admit.
     #[must_use]
     pub fn has_any_pending(&self) -> bool {
         self.transaction.has_pending()
@@ -83,6 +86,7 @@ impl ProtocolHost {
             || self.provision.has_pending()
             || self.exec_cert.has_pending()
             || self.block_sync.has_deferred()
+            || self.block_sync.is_syncing()
             || self.remote_header_sync.has_deferred()
             || self.remote_header_sync.is_syncing()
     }

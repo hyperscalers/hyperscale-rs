@@ -513,9 +513,12 @@ impl<B: SyncBinding> Sync<B> {
                 .collect();
             for h in ready {
                 state.deferred.remove(&h);
-                if h > state.committed && h <= state.target && !state.in_flight.contains(&h) {
-                    state.heights_queued.insert(h);
-                    state.heights_to_fetch.push(Reverse(h));
+                if h > state.committed && h <= state.target {
+                    // Defer to `queue_height` so dedup against
+                    // `heights_queued` / `in_flight` / `deferred` stays in
+                    // one place — and we don't double-push if the height is
+                    // somehow already tracked.
+                    state.queue_height(h);
                 }
             }
         }
