@@ -312,6 +312,17 @@ impl<B: SyncBinding> Sync<B> {
         self.scopes.values().any(|s| s.committed < s.target)
     }
 
+    /// Total blocks behind across all scopes — sum of each scope's
+    /// `target - committed`. Use for an aggregate gauge across a
+    /// multi-scope binding.
+    #[must_use]
+    pub fn total_blocks_behind(&self) -> u64 {
+        self.scopes
+            .values()
+            .map(|s| s.target.0.saturating_sub(s.committed.0))
+            .sum()
+    }
+
     /// Total in-flight fetch ranges across all scopes.
     #[must_use]
     pub fn in_flight_ranges(&self) -> usize {

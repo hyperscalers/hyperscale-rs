@@ -285,9 +285,22 @@ fn run_cross_shard_fault_scenario_with_seed<F>(
         }
 
         // Layer 2: each fetch protocol engaged client-side and server-side.
+        // `block` and `remote_header` are sync FSMs (range round-trips); the
+        // rest are per-id Fetch bindings. Pick the right counter family per
+        // kind — both record `items_sent` on the serve side under the same
+        // `fetch_items_sent` label, since the responder doesn't distinguish.
         for kind in fetch_kinds {
-            let started = recorder.counter("fetch_started", Some(kind));
-            let completed = recorder.counter("fetch_completed", Some(kind));
+            let (started, completed) = if matches!(*kind, "block" | "remote_header") {
+                (
+                    recorder.counter("sync_round_started", Some(kind)),
+                    recorder.counter("sync_round_completed", Some(kind)),
+                )
+            } else {
+                (
+                    recorder.counter("fetch_started", Some(kind)),
+                    recorder.counter("fetch_completed", Some(kind)),
+                )
+            };
             let items_sent = recorder.counter("fetch_items_sent", Some(kind));
             assert!(
                 started >= 1 && completed >= 1 && items_sent >= 1,

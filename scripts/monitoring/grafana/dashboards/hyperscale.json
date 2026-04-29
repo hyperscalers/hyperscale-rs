@@ -2354,8 +2354,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "max by (shard) (hyperscale_sync_blocks_behind)",
-          "legendFormat": "Shard {{shard}}",
+          "expr": "max by (shard, kind) (hyperscale_sync_blocks_behind)",
+          "legendFormat": "{{kind}} – Shard {{shard}}",
           "refId": "A"
         }
       ],
@@ -2367,7 +2367,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Total fetch operations completed across the cluster",
+      "description": "Per-id fetch completions (ids/sec) and sync range round-trips (rounds/sec) — different units, plotted together for at-a-glance liveness.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2445,11 +2445,20 @@
             "uid": "${datasource}"
           },
           "expr": "sum by (kind) (rate(hyperscale_fetch_completed_total[1m]))",
-          "legendFormat": "{{kind}}",
+          "legendFormat": "fetch / {{kind}}",
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (kind) (rate(hyperscale_sync_round_completed_total[1m]))",
+          "legendFormat": "sync round / {{kind}}",
+          "refId": "B"
         }
       ],
-      "title": "Fetch Completed Rate",
+      "title": "Fetch & Sync-Round Completed Rate",
       "type": "timeseries"
     },
     {
@@ -2457,7 +2466,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Total fetch requests in flight across all validators",
+      "description": "Per-id fetches in flight (ids) and sync range fetches in flight (ranges) — different units; plotted together for at-a-glance liveness.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2536,11 +2545,20 @@
             "uid": "${datasource}"
           },
           "expr": "sum by (kind) (hyperscale_fetch_in_flight)",
-          "legendFormat": "{{kind}}",
+          "legendFormat": "fetch / {{kind}}",
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (kind) (hyperscale_sync_round_in_flight)",
+          "legendFormat": "sync round / {{kind}}",
+          "refId": "B"
         }
       ],
-      "title": "Fetch In Flight",
+      "title": "Fetch & Sync-Round In Flight",
       "type": "timeseries"
     },
     {
@@ -2548,7 +2566,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Pending response channels in the network layer. Should be low and stable. Growing values indicate a memory leak.",
+      "description": "Sync responses received but rejected at the data-validity layer. height_mismatch / qc_hash_mismatch / qc_height_mismatch indicate peer misbehavior or out-of-sync state.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2578,7 +2596,7 @@
             "spanNulls": false,
             "stacking": {
               "group": "A",
-              "mode": "none"
+              "mode": "normal"
             },
             "thresholdsStyle": {
               "mode": "off"
@@ -2594,7 +2612,7 @@
               }
             ]
           },
-          "unit": "short"
+          "unit": "ops"
         },
         "overrides": []
       },
@@ -2608,8 +2626,7 @@
       "options": {
         "legend": {
           "calcs": [
-            "mean",
-            "max"
+            "sum"
           ],
           "displayMode": "table",
           "placement": "bottom",
@@ -2626,21 +2643,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(hyperscale_libp2p_pending_response_channels)",
-          "legendFormat": "Pending Channels (cluster)",
+          "expr": "sum by (kind, reason) (rate(hyperscale_sync_blocks_filtered_total[5m]))",
+          "legendFormat": "{{kind}} – {{reason}}",
           "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "max(hyperscale_libp2p_pending_response_channels)",
-          "legendFormat": "Max (single validator)",
-          "refId": "B"
         }
       ],
-      "title": "Pending Response Channels",
+      "title": "Sync Filtered by Reason",
       "type": "timeseries"
     },
     {
@@ -2648,23 +2656,40 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "CRITICAL: Network event loop panics. Any value > 0 means the validator's networking is DOWN and requires restart.",
+      "description": "Per-shard sync activity. Each row = (kind, shard); colored bar = sync currently in progress (catching up). Empty rows = up to date.",
       "fieldConfig": {
         "defaults": {
           "color": {
             "mode": "thresholds"
           },
-          "mappings": [],
+          "custom": {
+            "fillOpacity": 70,
+            "lineWidth": 0,
+            "spanNulls": false
+          },
+          "mappings": [
+            {
+              "options": {
+                "0": {
+                  "color": "green",
+                  "index": 0,
+                  "text": "idle"
+                },
+                "1": {
+                  "color": "orange",
+                  "index": 1,
+                  "text": "syncing"
+                }
+              },
+              "type": "value"
+            }
+          ],
           "thresholds": {
             "mode": "absolute",
             "steps": [
               {
                 "color": "green",
                 "value": null
-              },
-              {
-                "color": "red",
-                "value": 1
               }
             ]
           },
@@ -2680,39 +2705,40 @@
       },
       "id": 57,
       "options": {
-        "colorMode": "background",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
+        "alignValue": "left",
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
         },
-        "textMode": "auto"
+        "mergeValues": true,
+        "rowHeight": 0.9,
+        "showValue": "never",
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
       },
-      "pluginVersion": "10.1.0",
       "targets": [
         {
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(hyperscale_libp2p_event_loop_panics_total)",
+          "expr": "max by (kind, shard) (hyperscale_sync_in_progress)",
+          "legendFormat": "{{kind}} – Shard {{shard}}",
           "refId": "A"
         }
       ],
-      "title": "Network Event Loop Panics (CRITICAL)",
-      "type": "stat"
+      "title": "Sync Active by Shard / Kind",
+      "type": "state-timeline"
     },
     {
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Sync response errors by type. 'timeout' and 'backfill_timeout' are liveness-related. Others may indicate malicious peers.",
+      "description": "Sync responses rejected at transport/decode layer. error_type ∈ {rehydration_miss, fetch_failed, provision_cache_miss}. Combine with 'Sync Filtered by Reason' for full reject visibility.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2789,8 +2815,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (error_type) (rate(hyperscale_sync_response_errors_total[5m]))",
-          "legendFormat": "{{error_type}}",
+          "expr": "sum by (kind, error_type) (rate(hyperscale_sync_response_errors_total[5m]))",
+          "legendFormat": "{{kind}} – {{error_type}}",
           "refId": "A"
         }
       ],
@@ -3657,9 +3683,18 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(rate(hyperscale_sync_peers_banned_total[1m]))",
-          "legendFormat": "Peers Banned (cluster)",
+          "expr": "sum by (kind) (rate(hyperscale_fetch_retried_total[1m]))",
+          "legendFormat": "Fetch retries – {{kind}} (cluster)",
           "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (kind) (rate(hyperscale_sync_round_retried_total[1m]))",
+          "legendFormat": "Sync-round retries – {{kind}} (cluster)",
+          "refId": "D"
         }
       ],
       "title": "Error Rates",

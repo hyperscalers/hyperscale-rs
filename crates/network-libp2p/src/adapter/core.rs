@@ -287,9 +287,6 @@ impl Libp2pAdapter {
                         panic = %panic_msg,
                         "CRITICAL: Network event loop panicked! Networking is down. Node restart required."
                     );
-
-                    // Record metric for alerting
-                    metrics::record_network_event_loop_panic();
                 }
             }
         });

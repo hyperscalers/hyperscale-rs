@@ -190,7 +190,7 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
         }
         if released > 0 {
             for _ in 0..released {
-                metrics::record_fetch_failed(self.kind);
+                metrics::record_fetch_retried(self.kind);
             }
             trace!(count = released, "Id fetch chunk failed");
         }

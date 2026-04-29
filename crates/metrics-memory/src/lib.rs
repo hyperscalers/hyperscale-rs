@@ -237,12 +237,45 @@ impl MetricsRecorder for MemoryRecorder {
 
     // ── Sync ─────────────────────────────────────────────────────────
 
-    fn record_sync_block_downloaded(&self) {
-        self.inc("sync_blocks_downloaded", None, 1);
+    fn set_sync_blocks_behind(&self, kind: &str, blocks_behind: u64) {
+        self.set("sync_blocks_behind", Some(kind), blocks_behind as f64);
     }
 
-    fn record_sync_block_applied(&self) {
-        self.inc("sync_blocks_applied", None, 1);
+    fn set_sync_in_progress(&self, kind: &str, in_progress: bool) {
+        self.set(
+            "sync_in_progress",
+            Some(kind),
+            if in_progress { 1.0 } else { 0.0 },
+        );
+    }
+
+    fn record_sync_block_filtered(&self, kind: &str, reason: &str) {
+        // Memory backend stores a single string label; concatenate.
+        self.inc("sync_blocks_filtered", Some(&format!("{kind}:{reason}")), 1);
+    }
+
+    fn record_sync_response_error(&self, kind: &str, error_type: &str) {
+        self.inc(
+            "sync_response_errors",
+            Some(&format!("{kind}:{error_type}")),
+            1,
+        );
+    }
+
+    fn record_sync_round_started(&self, kind: &str) {
+        self.inc("sync_round_started", Some(kind), 1);
+    }
+
+    fn record_sync_round_completed(&self, kind: &str) {
+        self.inc("sync_round_completed", Some(kind), 1);
+    }
+
+    fn record_sync_round_retried(&self, kind: &str) {
+        self.inc("sync_round_retried", Some(kind), 1);
+    }
+
+    fn set_sync_round_in_flight(&self, kind: &str, count: usize) {
+        self.set("sync_round_in_flight", Some(kind), count as f64);
     }
 
     // ── Fetch ────────────────────────────────────────────────────────
@@ -255,8 +288,8 @@ impl MetricsRecorder for MemoryRecorder {
         self.inc("fetch_completed", Some(kind), 1);
     }
 
-    fn record_fetch_failed(&self, kind: &str) {
-        self.inc("fetch_failed", Some(kind), 1);
+    fn record_fetch_retried(&self, kind: &str) {
+        self.inc("fetch_retried", Some(kind), 1);
     }
 
     fn record_fetch_items_received(&self, kind: &str, count: usize) {

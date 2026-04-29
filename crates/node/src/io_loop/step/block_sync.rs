@@ -68,7 +68,7 @@ where
             Err(_miss) => {
                 // Inventory bloom said we had bodies we couldn't resolve.
                 // Mark for full refetch and re-queue.
-                metrics::record_sync_response_error("rehydration_miss");
+                metrics::record_sync_response_error("block", "rehydration_miss");
                 self.protocols.block_sync.mark_force_full_refetch(height);
                 self.feed_block_sync_fetch_failed(height);
                 return;
@@ -79,7 +79,7 @@ where
 
     /// Handle a sync block fetch failure (network error / not-found).
     pub(in crate::io_loop) fn handle_block_sync_fetch_failed(&mut self, height: BlockHeight) {
-        metrics::record_sync_response_error("fetch_failed");
+        metrics::record_sync_response_error("block", "fetch_failed");
         self.feed_block_sync_fetch_failed(height);
     }
 
@@ -131,6 +131,7 @@ where
         };
         let es = self.event_sender.clone();
         let peers = self.local_peers();
+        metrics::record_sync_round_started("block");
         self.network.request(
             &peers,
             None,
@@ -188,20 +189,20 @@ where
                 got = certified.block.height().0,
                 "Height mismatch in sync response"
             );
-            metrics::record_sync_block_filtered("height_mismatch");
+            metrics::record_sync_block_filtered("block", "height_mismatch");
             self.feed_block_sync_fetch_failed(height);
             return;
         }
         let block_hash = certified.block.hash();
         if certified.qc.block_hash != block_hash {
             tracing::warn!(height = height.0, "QC block hash mismatch in sync response");
-            metrics::record_sync_block_filtered("qc_hash_mismatch");
+            metrics::record_sync_block_filtered("block", "qc_hash_mismatch");
             self.feed_block_sync_fetch_failed(height);
             return;
         }
         if certified.qc.height != height {
             tracing::warn!(height = height.0, "QC height mismatch in sync response");
-            metrics::record_sync_block_filtered("qc_height_mismatch");
+            metrics::record_sync_block_filtered("block", "qc_height_mismatch");
             self.feed_block_sync_fetch_failed(height);
             return;
         }
@@ -221,10 +222,7 @@ where
             }
         }
 
-        metrics::record_sync_block_downloaded();
-        metrics::record_sync_block_verified();
-        metrics::record_sync_block_received_by_bft();
-        metrics::record_sync_block_submitted_for_verification();
+        metrics::record_sync_round_completed("block");
 
         // Hand the block off to BFT; tell the FSM the height was delivered.
         self.feed_event(ProtocolEvent::BlockSyncReadyToApply { certified });
@@ -244,6 +242,7 @@ where
 
     /// Common back-edge: re-queue a height via `FetchFailed`.
     fn feed_block_sync_fetch_failed(&mut self, height: BlockHeight) {
+        metrics::record_sync_round_retried("block");
         let outputs = self
             .protocols
             .block_sync

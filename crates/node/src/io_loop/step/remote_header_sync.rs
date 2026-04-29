@@ -143,18 +143,14 @@ where
                         from_height,
                         count,
                     };
-                    metrics::record_fetch_started("remote_header");
+                    metrics::record_sync_round_started("remote_header");
                     self.network.request(
                         &peers,
                         None,
                         request,
                         Box::new(move |result| {
                             if let Ok(resp) = result {
-                                metrics::record_fetch_completed("remote_header");
-                                metrics::record_fetch_items_received(
-                                    "remote_header",
-                                    resp.headers.len(),
-                                );
+                                metrics::record_sync_round_completed("remote_header");
                                 let _ = es.send(NodeInput::RemoteHeadersResponseReceived {
                                     source_shard,
                                     from_height,
@@ -162,7 +158,7 @@ where
                                     headers: resp.headers,
                                 });
                             } else {
-                                metrics::record_fetch_failed("remote_header");
+                                metrics::record_sync_round_retried("remote_header");
                                 let _ = es.send(NodeInput::RemoteHeadersFetchFailed {
                                     source_shard,
                                     from_height,

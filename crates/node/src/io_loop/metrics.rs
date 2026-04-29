@@ -35,11 +35,18 @@ pub struct MetricsSnapshot {
     pub backpressure_active: bool,
     pub blocks_behind: u64,
     pub is_syncing: bool,
+    /// In-flight range fetches for block-sync.
+    pub block_sync_round_in_flight: usize,
+    /// Sum of `blocks_behind` across every remote-header sync scope.
+    pub remote_header_blocks_behind: u64,
+    /// Any remote-header sync scope is below target.
+    pub remote_header_is_syncing: bool,
+    /// In-flight range fetches across all remote-header sync scopes.
+    pub remote_header_round_in_flight: usize,
     pub fetch_transaction: usize,
     pub fetch_provision: usize,
     pub fetch_local_provision: usize,
     pub fetch_exec_cert: usize,
-    pub fetch_remote_header: usize,
     pub fetch_finalized_wave: usize,
     pub memory: metrics::MemoryMetrics,
 }
@@ -57,12 +64,16 @@ pub fn record_metrics<S: ChainWriter>(snapshot: MetricsSnapshot, storage: &S) {
     metrics::set_lock_contention(snapshot.contention_ratio);
     metrics::set_in_flight(snapshot.in_flight);
     metrics::set_backpressure_active(snapshot.backpressure_active);
-    metrics::set_block_sync_status(snapshot.blocks_behind, snapshot.is_syncing);
+    metrics::set_sync_blocks_behind("block", snapshot.blocks_behind);
+    metrics::set_sync_in_progress("block", snapshot.is_syncing);
+    metrics::set_sync_round_in_flight("block", snapshot.block_sync_round_in_flight);
+    metrics::set_sync_blocks_behind("remote_header", snapshot.remote_header_blocks_behind);
+    metrics::set_sync_in_progress("remote_header", snapshot.remote_header_is_syncing);
+    metrics::set_sync_round_in_flight("remote_header", snapshot.remote_header_round_in_flight);
     metrics::set_fetch_in_flight("transaction", snapshot.fetch_transaction);
     metrics::set_fetch_in_flight("provision", snapshot.fetch_provision);
     metrics::set_fetch_in_flight("local_provision", snapshot.fetch_local_provision);
     metrics::set_fetch_in_flight("exec_cert", snapshot.fetch_exec_cert);
-    metrics::set_fetch_in_flight("remote_header", snapshot.fetch_remote_header);
     metrics::set_fetch_in_flight("finalized_wave", snapshot.fetch_finalized_wave);
 
     // RocksDB property queries — potentially slow under compaction pressure.
@@ -114,11 +125,14 @@ where
             backpressure_active: mempool.at_in_flight_limit(),
             blocks_behind: self.protocols.block_sync.blocks_behind(),
             is_syncing: self.protocols.block_sync.is_syncing(),
+            block_sync_round_in_flight: self.protocols.block_sync.in_flight_ranges(),
+            remote_header_blocks_behind: self.protocols.remote_header_sync.total_blocks_behind(),
+            remote_header_is_syncing: self.protocols.remote_header_sync.is_syncing(),
+            remote_header_round_in_flight: self.protocols.remote_header_sync.in_flight_ranges(),
             fetch_transaction: proto.transaction_in_flight,
             fetch_provision: proto.provision_in_flight,
             fetch_local_provision: proto.local_provision_in_flight,
             fetch_exec_cert: proto.exec_cert_in_flight,
-            fetch_remote_header: self.protocols.remote_header_sync.in_flight_ranges(),
             fetch_finalized_wave: proto.finalized_wave_in_flight,
             memory: metrics::MemoryMetrics {
                 // BFT

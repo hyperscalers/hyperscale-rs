@@ -88,7 +88,7 @@ pub fn serve_block_request(
             height = req.height.0,
             "Cache miss for provisions inside live window — serving sealed"
         );
-        metrics::record_sync_response_error("provision_cache_miss");
+        metrics::record_sync_response_error("block", "provision_cache_miss");
         GetBlockResponse::found(ElidedCertifiedBlock::elide(&block, qc, &req.inventory))
     }
 }

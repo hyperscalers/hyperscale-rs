@@ -319,12 +319,6 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// Record libp2p bandwidth.
     fn record_libp2p_bandwidth(&self, bytes_in: u64, bytes_out: u64) {}
 
-    /// Record pending response channels count.
-    fn record_pending_response_channels(&self, count: usize) {}
-
-    /// Record a network event loop panic.
-    fn record_network_event_loop_panic(&self) {}
-
     /// Record a gossipsub publish failure.
     fn record_gossipsub_publish_failure(&self, topic: &str) {}
 
@@ -353,38 +347,45 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     fn record_early_arrival_eviction(&self) {}
 
     // ── Sync ─────────────────────────────────────────────────────────
+    //
+    // Two scopes share these metrics: `kind="block"` for block-sync and
+    // `kind="remote_header"` for remote-header sync. Both run as
+    // `Sync<Binding>` FSMs that fetch *ranges* of contiguous heights, not
+    // individual ids — keep their counters separate from the per-id Fetch
+    // family below so dashboards aren't comparing range-rate to id-rate
+    // under one chart.
 
-    /// Set sync status gauges.
-    fn set_block_sync_status(&self, blocks_behind: u64, in_progress: bool) {}
+    /// Set the per-scope `blocks_behind` gauge.
+    fn set_sync_blocks_behind(&self, kind: &str, blocks_behind: u64) {}
 
-    /// Record a sync block downloaded.
-    fn record_sync_block_downloaded(&self) {}
+    /// Set the per-scope `in_progress` gauge (0/1).
+    fn set_sync_in_progress(&self, kind: &str, in_progress: bool) {}
 
-    /// Record a sync block received by BFT.
-    fn record_sync_block_received_by_bft(&self) {}
+    /// Record a sync response that was filtered out before delivery
+    /// (height mismatch, QC mismatch, certificate-root mismatch, etc.).
+    fn record_sync_block_filtered(&self, kind: &str, reason: &str) {}
 
-    /// Record a sync block submitted for verification.
-    fn record_sync_block_submitted_for_verification(&self) {}
+    /// Record a sync response error (rehydration miss, `fetch_failed`, etc.).
+    fn record_sync_response_error(&self, kind: &str, error_type: &str) {}
 
-    /// Record a sync block buffered.
-    fn record_sync_block_buffered(&self) {}
+    /// Record a sync range round-trip started (network request emitted).
+    fn record_sync_round_started(&self, kind: &str) {}
 
-    /// Record a sync block filtered out.
-    fn record_sync_block_filtered(&self, reason: &str) {}
+    /// Record a sync range round-trip that completed successfully.
+    fn record_sync_round_completed(&self, kind: &str) {}
 
-    /// Record a sync block verified.
-    fn record_sync_block_verified(&self) {}
+    /// Record a sync range round-trip released for retry. Increments per
+    /// release-for-retry, not per unrecoverable failure.
+    fn record_sync_round_retried(&self, kind: &str) {}
 
-    /// Record a sync block applied.
-    fn record_sync_block_applied(&self) {}
-
-    /// Record a sync response error.
-    fn record_sync_response_error(&self, error_type: &str) {}
-
-    /// Record a sync peer banned.
-    fn record_sync_peer_banned(&self) {}
+    /// Set the per-scope in-flight range gauge.
+    fn set_sync_round_in_flight(&self, kind: &str, count: usize) {}
 
     // ── Fetch ────────────────────────────────────────────────────────
+    //
+    // Per-`kind` counters and gauge for outbound per-id fetches. Always
+    // counted in *ids*. Range round-trips driven by sync FSMs use the
+    // `sync_round_*` family above, not these.
 
     /// Record a fetch operation started.
     fn record_fetch_started(&self, kind: &str) {}
@@ -392,8 +393,10 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// Record a fetch operation completed.
     fn record_fetch_completed(&self, kind: &str) {}
 
-    /// Record a fetch operation failed.
-    fn record_fetch_failed(&self, kind: &str) {}
+    /// Record a fetch operation released for retry. Increments per release-
+    /// for-retry, not per unrecoverable failure — the retry budget is owned
+    /// by the network layer, so this is genuinely a retry counter.
+    fn record_fetch_retried(&self, kind: &str) {}
 
     /// Record items received via fetch.
     fn record_fetch_items_received(&self, kind: &str, count: usize) {}
@@ -696,18 +699,6 @@ pub fn record_libp2p_bandwidth(bytes_in: u64, bytes_out: u64) {
     recorder().record_libp2p_bandwidth(bytes_in, bytes_out);
 }
 
-/// Record pending response channels count.
-#[inline]
-pub fn record_pending_response_channels(count: usize) {
-    recorder().record_pending_response_channels(count);
-}
-
-/// Record a network event loop panic.
-#[inline]
-pub fn record_network_event_loop_panic() {
-    recorder().record_network_event_loop_panic();
-}
-
 /// Record a gossipsub publish failure.
 #[inline]
 pub fn record_gossipsub_publish_failure(topic: &str) {
@@ -764,64 +755,52 @@ pub fn record_early_arrival_eviction() {
 
 // ── Sync ─────────────────────────────────────────────────────────────
 
-/// Set sync status gauges.
+/// Set the per-scope `blocks_behind` gauge.
 #[inline]
-pub fn set_block_sync_status(blocks_behind: u64, in_progress: bool) {
-    recorder().set_block_sync_status(blocks_behind, in_progress);
+pub fn set_sync_blocks_behind(kind: &str, blocks_behind: u64) {
+    recorder().set_sync_blocks_behind(kind, blocks_behind);
 }
 
-/// Record a sync block downloaded.
+/// Set the per-scope `in_progress` gauge (0/1).
 #[inline]
-pub fn record_sync_block_downloaded() {
-    recorder().record_sync_block_downloaded();
+pub fn set_sync_in_progress(kind: &str, in_progress: bool) {
+    recorder().set_sync_in_progress(kind, in_progress);
 }
 
-/// Record a sync block received by BFT.
+/// Record a sync response filtered out before delivery.
 #[inline]
-pub fn record_sync_block_received_by_bft() {
-    recorder().record_sync_block_received_by_bft();
-}
-
-/// Record a sync block submitted for verification.
-#[inline]
-pub fn record_sync_block_submitted_for_verification() {
-    recorder().record_sync_block_submitted_for_verification();
-}
-
-/// Record a sync block buffered.
-#[inline]
-pub fn record_sync_block_buffered() {
-    recorder().record_sync_block_buffered();
-}
-
-/// Record a sync block filtered out.
-#[inline]
-pub fn record_sync_block_filtered(reason: &str) {
-    recorder().record_sync_block_filtered(reason);
-}
-
-/// Record a sync block verified.
-#[inline]
-pub fn record_sync_block_verified() {
-    recorder().record_sync_block_verified();
-}
-
-/// Record a sync block applied.
-#[inline]
-pub fn record_sync_block_applied() {
-    recorder().record_sync_block_applied();
+pub fn record_sync_block_filtered(kind: &str, reason: &str) {
+    recorder().record_sync_block_filtered(kind, reason);
 }
 
 /// Record a sync response error.
 #[inline]
-pub fn record_sync_response_error(error_type: &str) {
-    recorder().record_sync_response_error(error_type);
+pub fn record_sync_response_error(kind: &str, error_type: &str) {
+    recorder().record_sync_response_error(kind, error_type);
 }
 
-/// Record a sync peer banned.
+/// Record a sync range round-trip started.
 #[inline]
-pub fn record_sync_peer_banned() {
-    recorder().record_sync_peer_banned();
+pub fn record_sync_round_started(kind: &str) {
+    recorder().record_sync_round_started(kind);
+}
+
+/// Record a sync range round-trip completed successfully.
+#[inline]
+pub fn record_sync_round_completed(kind: &str) {
+    recorder().record_sync_round_completed(kind);
+}
+
+/// Record a sync range round-trip released for retry.
+#[inline]
+pub fn record_sync_round_retried(kind: &str) {
+    recorder().record_sync_round_retried(kind);
+}
+
+/// Set the per-scope in-flight range gauge.
+#[inline]
+pub fn set_sync_round_in_flight(kind: &str, count: usize) {
+    recorder().set_sync_round_in_flight(kind, count);
 }
 
 // ── Fetch ────────────────────────────────────────────────────────────
@@ -838,10 +817,10 @@ pub fn record_fetch_completed(kind: &str) {
     recorder().record_fetch_completed(kind);
 }
 
-/// Record a fetch operation failed.
+/// Record a fetch operation released for retry.
 #[inline]
-pub fn record_fetch_failed(kind: &str) {
-    recorder().record_fetch_failed(kind);
+pub fn record_fetch_retried(kind: &str) {
+    recorder().record_fetch_retried(kind);
 }
 
 /// Record items received via fetch.

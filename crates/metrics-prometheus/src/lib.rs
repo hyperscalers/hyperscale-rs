@@ -82,26 +82,25 @@ pub struct Metrics {
     pub libp2p_peers_connected: Gauge,
     pub libp2p_bandwidth_in_bytes: Counter,
     pub libp2p_bandwidth_out_bytes: Counter,
-    pub libp2p_pending_response_channels: Gauge,
-    pub libp2p_event_loop_panics: Counter,
 
     // === Sync ===
-    pub sync_blocks_behind: Gauge,
-    pub sync_blocks_downloaded: Counter,
-    pub sync_blocks_received_by_bft: Counter,
-    pub sync_blocks_submitted_for_verification: Counter,
-    pub sync_blocks_buffered: Counter,
+    //
+    // Per-scope status keyed by `kind` (`block` or `remote_header`).
+    // Filtering / response-error dimensions remain because they don't
+    // collapse into the per-`kind` fetch counters below.
+    pub sync_blocks_behind: GaugeVec,
+    pub sync_in_progress: GaugeVec,
     pub sync_blocks_filtered: CounterVec,
-    pub sync_blocks_verified: Counter,
-    pub sync_blocks_applied: Counter,
-    pub sync_in_progress: Gauge,
     pub sync_response_errors: CounterVec,
-    pub sync_peers_banned: Counter,
+    pub sync_round_started: CounterVec,
+    pub sync_round_completed: CounterVec,
+    pub sync_round_retried: CounterVec,
+    pub sync_round_in_flight: GaugeVec,
 
     // === Fetch ===
     pub fetch_started: CounterVec,
     pub fetch_completed: CounterVec,
-    pub fetch_failed: CounterVec,
+    pub fetch_retried: CounterVec,
     pub fetch_items_received: CounterVec,
     pub fetch_items_sent: CounterVec,
     pub fetch_latency: HistogramVec,
@@ -432,91 +431,68 @@ impl Metrics {
             )
             .unwrap(),
 
-            libp2p_pending_response_channels: register_gauge!(
-                "hyperscale_libp2p_pending_response_channels",
-                "Number of pending response channels (potential memory leak if growing)"
-            )
-            .unwrap(),
-
-            libp2p_event_loop_panics: register_counter!(
-                "hyperscale_libp2p_event_loop_panics_total",
-                "Network event loop panics (critical - requires node restart)"
-            )
-            .unwrap(),
-
-            // Sync
-            sync_blocks_behind: register_gauge!(
+            // Sync — per-scope status (`kind` = "block" or "remote_header").
+            sync_blocks_behind: register_gauge_vec!(
                 "hyperscale_sync_blocks_behind",
-                "Number of blocks behind the network head"
+                "Per-scope blocks behind the latest known target",
+                &["kind"]
             )
             .unwrap(),
 
-            sync_blocks_downloaded: register_counter!(
-                "hyperscale_sync_blocks_downloaded_total",
-                "Total blocks downloaded during sync"
-            )
-            .unwrap(),
-
-            sync_blocks_received_by_bft: register_counter!(
-                "hyperscale_sync_blocks_received_by_bft_total",
-                "Total sync blocks received by BFT state machine"
-            )
-            .unwrap(),
-
-            sync_blocks_submitted_for_verification: register_counter!(
-                "hyperscale_sync_blocks_submitted_for_verification_total",
-                "Total sync blocks submitted for QC verification"
-            )
-            .unwrap(),
-
-            sync_blocks_buffered: register_counter!(
-                "hyperscale_sync_blocks_buffered_total",
-                "Total sync blocks buffered (out of order)"
+            sync_in_progress: register_gauge_vec!(
+                "hyperscale_sync_in_progress",
+                "Per-scope sync activity (0 or 1)",
+                &["kind"]
             )
             .unwrap(),
 
             sync_blocks_filtered: register_counter_vec!(
                 "hyperscale_sync_blocks_filtered_total",
-                "Total sync blocks filtered out by reason",
-                &["reason"]
-            )
-            .unwrap(),
-
-            sync_blocks_verified: register_counter!(
-                "hyperscale_sync_blocks_verified_total",
-                "Total sync blocks with verified QC signatures"
-            )
-            .unwrap(),
-
-            sync_blocks_applied: register_counter!(
-                "hyperscale_sync_blocks_applied_total",
-                "Total sync blocks applied (committed)"
-            )
-            .unwrap(),
-
-            sync_in_progress: register_gauge!(
-                "hyperscale_sync_in_progress",
-                "Whether sync is currently active (0 or 1)"
+                "Sync responses filtered out before delivery, by scope and reason",
+                &["kind", "reason"]
             )
             .unwrap(),
 
             sync_response_errors: register_counter_vec!(
                 "hyperscale_sync_response_errors_total",
-                "Total sync response errors by type",
-                &["error_type"]
+                "Sync response errors by scope and type",
+                &["kind", "error_type"]
             )
             .unwrap(),
 
-            sync_peers_banned: register_counter!(
-                "hyperscale_sync_peers_banned_total",
-                "Total peers banned for malicious sync responses"
+            sync_round_started: register_counter_vec!(
+                "hyperscale_sync_round_started_total",
+                "Sync range round-trips started (one per network request emitted by a sync FSM)",
+                &["kind"]
             )
             .unwrap(),
 
-            // Fetch
+            sync_round_completed: register_counter_vec!(
+                "hyperscale_sync_round_completed_total",
+                "Sync range round-trips completed successfully",
+                &["kind"]
+            )
+            .unwrap(),
+
+            sync_round_retried: register_counter_vec!(
+                "hyperscale_sync_round_retried_total",
+                "Sync range round-trips released for retry — increments per release-for-retry, not per unrecoverable failure",
+                &["kind"]
+            )
+            .unwrap(),
+
+            sync_round_in_flight: register_gauge_vec!(
+                "hyperscale_sync_round_in_flight",
+                "Per-scope in-flight sync range fetches",
+                &["kind"]
+            )
+            .unwrap(),
+
+            // Fetch — per-`kind` counters. Per-id bindings count in *ids*;
+            // range bindings (`block`, `remote_header`) count in *ranges*.
             fetch_started: register_counter_vec!(
                 "hyperscale_fetch_started_total",
-                "Total fetch operations started",
+                "Total fetch operations started (ids for per-id bindings, ranges for sync)",
                 &["kind"]
             )
             .unwrap(),
@@ -528,9 +504,9 @@ impl Metrics {
             )
             .unwrap(),
 
-            fetch_failed: register_counter_vec!(
-                "hyperscale_fetch_failed_total",
-                "Total fetch operations failed",
+            fetch_retried: register_counter_vec!(
+                "hyperscale_fetch_retried_total",
+                "Total fetch operations released for retry — increments per release-for-retry, not per unrecoverable failure",
                 &["kind"]
             )
             .unwrap(),
@@ -909,16 +885,6 @@ impl MetricsRecorder for PrometheusRecorder {
             .inc_by(bytes_out as f64);
     }
 
-    fn record_pending_response_channels(&self, count: usize) {
-        self.metrics
-            .libp2p_pending_response_channels
-            .set(count as f64);
-    }
-
-    fn record_network_event_loop_panic(&self) {
-        self.metrics.libp2p_event_loop_panics.inc();
-    }
-
     fn record_gossipsub_publish_failure(&self, topic: &str) {
         let topic_type = topic.rsplit('/').next().unwrap_or("unknown");
         self.metrics
@@ -970,53 +936,60 @@ impl MetricsRecorder for PrometheusRecorder {
 
     // ── Sync ─────────────────────────────────────────────────────────
 
-    fn set_block_sync_status(&self, blocks_behind: u64, in_progress: bool) {
-        self.metrics.sync_blocks_behind.set(blocks_behind as f64);
+    fn set_sync_blocks_behind(&self, kind: &str, blocks_behind: u64) {
+        self.metrics
+            .sync_blocks_behind
+            .with_label_values(&[kind])
+            .set(blocks_behind as f64);
+    }
+
+    fn set_sync_in_progress(&self, kind: &str, in_progress: bool) {
         self.metrics
             .sync_in_progress
+            .with_label_values(&[kind])
             .set(if in_progress { 1.0 } else { 0.0 });
     }
 
-    fn record_sync_block_downloaded(&self) {
-        self.metrics.sync_blocks_downloaded.inc();
-    }
-
-    fn record_sync_block_received_by_bft(&self) {
-        self.metrics.sync_blocks_received_by_bft.inc();
-    }
-
-    fn record_sync_block_submitted_for_verification(&self) {
-        self.metrics.sync_blocks_submitted_for_verification.inc();
-    }
-
-    fn record_sync_block_buffered(&self) {
-        self.metrics.sync_blocks_buffered.inc();
-    }
-
-    fn record_sync_block_filtered(&self, reason: &str) {
+    fn record_sync_block_filtered(&self, kind: &str, reason: &str) {
         self.metrics
             .sync_blocks_filtered
-            .with_label_values(&[reason])
+            .with_label_values(&[kind, reason])
             .inc();
     }
 
-    fn record_sync_block_verified(&self) {
-        self.metrics.sync_blocks_verified.inc();
-    }
-
-    fn record_sync_block_applied(&self) {
-        self.metrics.sync_blocks_applied.inc();
-    }
-
-    fn record_sync_response_error(&self, error_type: &str) {
+    fn record_sync_response_error(&self, kind: &str, error_type: &str) {
         self.metrics
             .sync_response_errors
-            .with_label_values(&[error_type])
+            .with_label_values(&[kind, error_type])
             .inc();
     }
 
-    fn record_sync_peer_banned(&self) {
-        self.metrics.sync_peers_banned.inc();
+    fn record_sync_round_started(&self, kind: &str) {
+        self.metrics
+            .sync_round_started
+            .with_label_values(&[kind])
+            .inc();
+    }
+
+    fn record_sync_round_completed(&self, kind: &str) {
+        self.metrics
+            .sync_round_completed
+            .with_label_values(&[kind])
+            .inc();
+    }
+
+    fn record_sync_round_retried(&self, kind: &str) {
+        self.metrics
+            .sync_round_retried
+            .with_label_values(&[kind])
+            .inc();
+    }
+
+    fn set_sync_round_in_flight(&self, kind: &str, count: usize) {
+        self.metrics
+            .sync_round_in_flight
+            .with_label_values(&[kind])
+            .set(count as f64);
     }
 
     // ── Fetch ────────────────────────────────────────────────────────
@@ -1032,8 +1005,8 @@ impl MetricsRecorder for PrometheusRecorder {
             .inc();
     }
 
-    fn record_fetch_failed(&self, kind: &str) {
-        self.metrics.fetch_failed.with_label_values(&[kind]).inc();
+    fn record_fetch_retried(&self, kind: &str) {
+        self.metrics.fetch_retried.with_label_values(&[kind]).inc();
     }
 
     fn record_fetch_items_received(&self, kind: &str, count: usize) {
