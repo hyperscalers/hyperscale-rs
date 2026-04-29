@@ -134,10 +134,13 @@ pub struct MempoolMemoryStats {
     pub ready_txs_by_node: usize,
 }
 
-/// Entry in the transaction pool. Holds admission metadata only — bodies
-/// live in the shared [`TxStore`] keyed by tx hash.
+/// Entry in the transaction pool. Carries the body alongside admission
+/// metadata. The same `Arc` is also held by the shared [`TxStore`] so
+/// the network worker can serve fetches without touching the mempool;
+/// in-mempool reads go through this field directly.
 #[derive(Debug)]
 struct PoolEntry {
+    tx: Arc<RoutableTransaction>,
     status: TransactionStatus,
     /// Whether this is a cross-shard transaction (cached at insertion time).
     cross_shard: bool,
@@ -172,11 +175,12 @@ pub struct MempoolCoordinator {
     /// Transaction pool sorted by hash (`BTreeMap` for ordered iteration).
     pool: BTreeMap<TxHash, PoolEntry>,
 
-    /// Shared content-addressed body store. Bodies enter on admission and
-    /// leave when their tombstone retention window elapses. Held behind
-    /// `Arc` so the network worker thread (serving inbound `transaction.
-    /// request`s) can read bodies concurrently with the mempool state
-    /// machine, without contending on a mempool mutex.
+    /// Shared content-addressed body store mirroring the bodies held by
+    /// live pool entries plus those still inside the tombstone retention
+    /// window. The mempool itself reads bodies via [`PoolEntry::tx`]; the
+    /// store exists so the network worker thread (serving inbound
+    /// `transaction.request`s) can read bodies concurrently without
+    /// touching the state machine.
     tx_store: Arc<TxStore>,
 
     /// Terminal-state dedup. Tombstones stop gossip from re-adding
@@ -310,6 +314,7 @@ impl MempoolCoordinator {
         self.pool.insert(
             hash,
             PoolEntry {
+                tx: Arc::clone(tx),
                 status: TransactionStatus::Pending,
                 cross_shard,
                 submitted_locally,
@@ -447,43 +452,24 @@ impl MempoolCoordinator {
     /// - Completed (certificate committed)
     /// - Aborted (explicitly aborted)
     fn evict_terminal(&mut self, topology: &TopologySnapshot, tx_hash: TxHash) {
-        // Remove locked nodes and update counters if this transaction was holding locks
-        let info_to_unlock = self.pool.get(&tx_hash).and_then(|entry| {
-            if entry.status.holds_state_lock() {
-                self.tx_store
-                    .get(&tx_hash)
-                    .map(|tx| (tx, entry.status.clone()))
-            } else {
-                None
-            }
-        });
-        if let Some((tx, status)) = info_to_unlock {
-            self.remove_locked_nodes(topology, &tx);
-            if matches!(status, TransactionStatus::Committed(_)) {
+        let Some(entry) = self.pool.remove(&tx_hash) else {
+            return;
+        };
+
+        if entry.status.holds_state_lock() {
+            self.remove_locked_nodes(topology, &entry.tx);
+            if matches!(entry.status, TransactionStatus::Committed(_)) {
                 self.locks.dec_in_flight();
             }
         }
 
-        // Remove from ready tracking
         self.remove_from_ready_tracking(&tx_hash);
 
-        // Drop the pool entry and tombstone the hash. Body stays in
+        // Tombstone the hash so it can't be re-admitted. Body stays in
         // `tx_store` so peers can still fetch by hash; both expire on the
         // same `end_timestamp_exclusive` via `prune_tombstones`.
-        if let Some(_entry) = self.pool.remove(&tx_hash) {
-            let end = self.tx_store.get(&tx_hash).map_or(self.current_ts, |tx| {
-                tx.validity_range.end_timestamp_exclusive
-            });
-            self.tombstones.tombstone(tx_hash, end);
-        } else {
-            // No body — tombstone with whatever expiry we can reconstruct.
-            // In practice this branch is unreachable today (callers always
-            // tombstone via `evict_terminal` after a successful pool lookup),
-            // but the safety net stays so a future caller can't accidentally
-            // tombstone a hash with no expiry. Use `current_ts` so the entry
-            // is dropped on the very next prune sweep.
-            self.tombstones.tombstone(tx_hash, self.current_ts);
-        }
+        self.tombstones
+            .tombstone(tx_hash, entry.tx.validity_range.end_timestamp_exclusive);
     }
 
     /// Check if a transaction hash is tombstoned (reached terminal state).
@@ -529,6 +515,7 @@ impl MempoolCoordinator {
                 );
                 self.tx_store.insert(Arc::clone(tx));
                 PoolEntry {
+                    tx: Arc::clone(tx),
                     status: TransactionStatus::Pending, // Will be updated by execution
                     cross_shard: tx.is_cross_shard(num_shards),
                     submitted_locally: false, // Fetched for block processing
@@ -748,9 +735,8 @@ impl MempoolCoordinator {
         for tx_hash in promotable {
             if let Some(entry) = self.pool.get(&tx_hash)
                 && entry.status == TransactionStatus::Pending
-                && let Some(tx) = self.tx_store.get(&tx_hash)
             {
-                to_readd.push((tx_hash, tx, entry.admitted_at));
+                to_readd.push((tx_hash, Arc::clone(&entry.tx), entry.admitted_at));
             }
         }
         for (hash, tx, added_at) in to_readd {
@@ -911,10 +897,9 @@ impl MempoolCoordinator {
         self.pool.contains_key(hash)
     }
 
-    /// Get a transaction body by hash. Thin wrapper around
-    /// [`TxStore::get`] kept for callers that already hold a mempool
-    /// reference; new code should query [`Self::tx_store`] directly to
-    /// avoid coupling.
+    /// Get a transaction body by hash. Delegates to [`TxStore`] so the
+    /// answer covers both live pool entries and tombstone-window bodies
+    /// (terminal-state txs whose body we still hold for slow peers).
     #[must_use]
     pub fn get_transaction(&self, hash: &TxHash) -> Option<Arc<RoutableTransaction>> {
         self.tx_store.get(hash)
@@ -962,11 +947,7 @@ impl MempoolCoordinator {
         self.pool
             .iter()
             .filter(|(_, entry)| !matches!(entry.status, TransactionStatus::Completed(_)))
-            .filter_map(|(hash, entry)| {
-                self.tx_store
-                    .get(hash)
-                    .map(|tx| (*hash, entry.status.clone(), tx))
-            })
+            .map(|(hash, entry)| (*hash, entry.status.clone(), Arc::clone(&entry.tx)))
             .collect()
     }
 
@@ -1007,11 +988,8 @@ impl MempoolCoordinator {
             .pool
             .iter()
             .filter(|(_, entry)| matches!(entry.status, TransactionStatus::Pending))
-            .filter_map(|(hash, _)| {
-                self.tx_store.get(hash).and_then(|tx| {
-                    (tx.validity_range.end_timestamp_exclusive <= now).then_some(*hash)
-                })
-            })
+            .filter(|(_, entry)| entry.tx.validity_range.end_timestamp_exclusive <= now)
+            .map(|(hash, _)| *hash)
             .collect();
         for hash in &expired {
             self.pool.remove(hash);
