@@ -1,40 +1,30 @@
 //! Local provisions fetch response (intra-shard DA).
 
-use hyperscale_types::{MessagePriority, NetworkMessage, ProvisionHash, Provisions};
+use hyperscale_types::{MessagePriority, NetworkMessage, Provisions};
 use sbor::prelude::BasicSbor;
 
 /// Response to a local provisions fetch request.
 ///
-/// `batches` holds the batches the responder has. `missing_hashes` lists the
-/// requested hashes the responder does not have (either never seen or evicted
-/// from the in-memory store). The union of batch hashes and `missing_hashes`
-/// equals the requested hash set, so the caller can distinguish "peer has no
-/// copy" from a transport-level empty response.
+/// `batches` holds the batches the responder has. The requester knows the
+/// hashes it asked for, so missing hashes are computed client-side as
+/// `requested - returned`; the wire format does not duplicate that diff.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct GetLocalProvisionsResponse {
     /// Provision batches the responder had locally.
     pub batches: Vec<Provisions>,
-    /// Requested hashes the responder did not have (never seen or evicted).
-    pub missing_hashes: Vec<ProvisionHash>,
 }
 
 impl GetLocalProvisionsResponse {
-    /// Build a response carrying `batches` and a list of `missing_hashes`.
+    /// Build a response carrying `batches`.
     #[must_use]
-    pub const fn new(batches: Vec<Provisions>, missing_hashes: Vec<ProvisionHash>) -> Self {
-        Self {
-            batches,
-            missing_hashes,
-        }
+    pub const fn new(batches: Vec<Provisions>) -> Self {
+        Self { batches }
     }
 
     /// Build an empty response (responder had none of the requested batches).
     #[must_use]
     pub const fn empty() -> Self {
-        Self {
-            batches: vec![],
-            missing_hashes: vec![],
-        }
+        Self { batches: vec![] }
     }
 }
 

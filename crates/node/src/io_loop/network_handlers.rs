@@ -187,15 +187,13 @@ where
                     use hyperscale_messages::response::GetLocalProvisionsResponse;
 
                     let mut batches = Vec::with_capacity(req.batch_hashes.len());
-                    let mut missing = Vec::new();
                     for h in &req.batch_hashes {
-                        match provision_store.get(h) {
-                            Some(b) => batches.push((*b).clone()),
-                            None => missing.push(*h),
+                        if let Some(b) = provision_store.get(h) {
+                            batches.push((*b).clone());
                         }
                     }
 
-                    GetLocalProvisionsResponse::new(batches, missing)
+                    GetLocalProvisionsResponse::new(batches)
                 },
             );
 

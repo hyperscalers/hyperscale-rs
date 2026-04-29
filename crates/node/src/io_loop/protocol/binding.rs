@@ -23,7 +23,9 @@ use hyperscale_messages::request::{
     GetProvisionsRequest, GetTransactionsRequest,
 };
 use hyperscale_network::{Network, ResponseVerdict};
-use hyperscale_types::{BlockHeight, ProvisionHash, ShardGroupId, TxHash, WaveId, WaveIdHash};
+use hyperscale_types::{
+    BlockHeight, ProvisionHash, Provisions, ShardGroupId, TxHash, WaveId, WaveIdHash,
+};
 use std::hash::Hash;
 use std::sync::Arc;
 
@@ -162,11 +164,15 @@ impl FetchBinding for LocalProvisionBinding {
             GetLocalProvisionsRequest::new(ids),
             Box::new(move |result| {
                 if let Ok(resp) = result {
-                    let had_misses = !resp.missing_hashes.is_empty();
+                    let delivered: std::collections::HashSet<ProvisionHash> =
+                        resp.batches.iter().map(Provisions::hash).collect();
+                    let missing_hashes: Vec<ProvisionHash> =
+                        hs.into_iter().filter(|h| !delivered.contains(h)).collect();
+                    let had_misses = !missing_hashes.is_empty();
                     let batches = resp.batches.into_iter().map(Arc::new).collect();
                     let _ = es.send(NodeInput::LocalProvisionReceived {
                         batches,
-                        missing_hashes: resp.missing_hashes,
+                        missing_hashes,
                     });
                     if had_misses {
                         ResponseVerdict::Reject
