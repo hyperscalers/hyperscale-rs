@@ -33,10 +33,10 @@ pub struct ProvisionsRequest {
     /// Transaction hash (for correlation).
     pub tx_hash: TxHash,
     /// Nodes owned by our shard whose state we need to provision.
-    pub nodes: Vec<NodeId>,
-    /// Target shards and the nodes this tx needs from each.
+    pub local_nodes: Vec<NodeId>,
+    /// Per-target-shard nodes this tx reads from each remote shard.
     /// Used to populate `TxEntries::target_nodes` for conflict detection.
-    pub targets: Vec<(ShardGroupId, Vec<NodeId>)>,
+    pub target_nodes: Vec<(ShardGroupId, Vec<NodeId>)>,
 }
 
 /// Actions the state machine wants to perform.

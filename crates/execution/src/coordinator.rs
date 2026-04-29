@@ -1763,7 +1763,7 @@ impl ExecutionCoordinator {
 
             if !owned_nodes.is_empty() {
                 // Build per-target-shard node needs for conflict detection.
-                let mut targets: Vec<(ShardGroupId, Vec<NodeId>)> = Vec::new();
+                let mut target_nodes: Vec<(ShardGroupId, Vec<NodeId>)> = Vec::new();
                 let all_nodes: Vec<&NodeId> = tx
                     .declared_reads
                     .iter()
@@ -1781,14 +1781,14 @@ impl ExecutionCoordinator {
                         .copied()
                         .copied()
                         .collect();
-                    targets.push((target_shard, needed));
+                    target_nodes.push((target_shard, needed));
                 }
 
-                if !targets.is_empty() {
+                if !target_nodes.is_empty() {
                     provision_requests.push(ProvisionsRequest {
                         tx_hash: tx.hash(),
-                        nodes: owned_nodes,
-                        targets,
+                        local_nodes: owned_nodes,
+                        target_nodes,
                     });
                 }
             }
@@ -1800,7 +1800,7 @@ impl ExecutionCoordinator {
 
         let mut shard_recipients = HashMap::new();
         for req in &provision_requests {
-            for &(target_shard, _) in &req.targets {
+            for &(target_shard, _) in &req.target_nodes {
                 shard_recipients.entry(target_shard).or_insert_with(|| {
                     topology
                         .committee_for_shard(target_shard)

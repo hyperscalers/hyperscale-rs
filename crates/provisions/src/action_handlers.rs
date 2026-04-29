@@ -79,7 +79,7 @@ where
         // Must use historical reads — current state may have new vaults that don't
         // exist at block_height, causing the merkle proof to fail on the remote shard.
         let Some(expanded_nodes) =
-            expand_nodes_with_owned_at_height(view, &req.nodes, block_height)
+            expand_nodes_with_owned_at_height(view, &req.local_nodes, block_height)
         else {
             warn!(
                 source_shard = source_shard.0,
@@ -100,7 +100,7 @@ where
             );
             continue;
         };
-        per_tx.push((req.tx_hash, req.targets.clone(), Arc::new(entries)));
+        per_tx.push((req.tx_hash, req.target_nodes.clone(), Arc::new(entries)));
     }
     per_tx
 }
