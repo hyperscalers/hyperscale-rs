@@ -13,10 +13,8 @@
 //! Production: `SyncManager` wraps this, maps outputs to tokio tasks.
 //! Simulation: feeds inputs/outputs synchronously via event queue.
 
-use hyperscale_messages::request::{GetBlockRequest, GetBlockTopUpRequest};
-use hyperscale_messages::response::{
-    ElidedCertifiedBlock, GetBlockResponse, GetBlockTopUpResponse,
-};
+use hyperscale_messages::request::GetBlockRequest;
+use hyperscale_messages::response::{ElidedCertifiedBlock, GetBlockResponse};
 use hyperscale_metrics as metrics;
 use hyperscale_provisions::ProvisionStore;
 use hyperscale_storage::ChainReader;
@@ -166,10 +164,14 @@ pub enum SyncInput {
 pub enum SyncOutput {
     /// Request the runner to fetch a block at this height. `target_height`
     /// is the sync target, passed through to the serving peer so it can
-    /// choose between `Block::Live` and `Block::Sealed`.
+    /// choose between `Block::Live` and `Block::Sealed`. `force_full` is
+    /// set after a rehydration miss on this height — the next request
+    /// must omit the inventory bloom so the responder cannot elide bodies
+    /// the requester couldn't resolve last time.
     FetchBlock {
         height: BlockHeight,
         target_height: BlockHeight,
+        force_full: bool,
     },
     /// A validated block is ready to deliver to BFT.
     DeliverBlock { certified: Box<CertifiedBlock> },
@@ -192,6 +194,11 @@ pub struct SyncProtocol {
     /// Heights whose last fetch failed; held out of `heights_to_fetch`
     /// until their backoff deadline elapses.
     deferred: HashMap<BlockHeight, DeferralBackoff>,
+    /// Heights whose previous response failed rehydration. The next fetch
+    /// for these heights must omit the inventory bloom so the responder
+    /// cannot elide bodies the requester couldn't resolve last time.
+    /// Drained when the height is committed or sync completes.
+    force_full_refetch: HashSet<BlockHeight>,
 }
 
 impl SyncProtocol {
@@ -206,7 +213,15 @@ impl SyncProtocol {
             heights_queued: HashSet::new(),
             in_flight: HashSet::new(),
             deferred: HashMap::new(),
+            force_full_refetch: HashSet::new(),
         }
+    }
+
+    /// Mark `height` so its next fetch omits the inventory bloom. Called
+    /// after a rehydration miss: the responder elided bodies the requester
+    /// couldn't resolve, so the next request must allow no elision.
+    pub fn mark_force_full_refetch(&mut self, height: BlockHeight) {
+        self.force_full_refetch.insert(height);
     }
 
     /// True if any heights are parked awaiting backoff. Lets the runner
@@ -428,12 +443,14 @@ impl SyncProtocol {
         self.heights_to_fetch.clear();
         self.heights_queued.clear();
         self.deferred.clear();
+        self.force_full_refetch.clear();
     }
 
     fn remove_heights_at_or_below(&mut self, threshold: BlockHeight) {
         self.heights_queued.retain(|&h| h > threshold);
         self.in_flight.retain(|&h| h > threshold);
         self.deferred.retain(|&h, _| h > threshold);
+        self.force_full_refetch.retain(|&h| h > threshold);
     }
 
     fn queue_heights_in_window(&mut self) {
@@ -471,6 +488,7 @@ impl SyncProtocol {
                 outputs.push(SyncOutput::FetchBlock {
                     height,
                     target_height,
+                    force_full: self.force_full_refetch.contains(&height),
                 });
             } else {
                 break;
@@ -560,60 +578,6 @@ pub fn serve_block_request(
         metrics::record_sync_response_error("provision_cache_miss");
         GetBlockResponse::found(ElidedCertifiedBlock::elide(&block, qc, &req.inventory))
     }
-}
-
-/// Serve a top-up request — the requester's rehydration of an earlier
-/// elided response missed some bodies (bloom false-positives or local
-/// evictions), so it's asking for just those hashes.
-///
-/// Reads the block from storage and returns only the bodies whose hashes
-/// are listed in the request. Hashes we don't have (block evicted, or
-/// caller's hash is unknown) are silently omitted — the requester then
-/// falls back to a full refetch.
-pub fn serve_block_topup_request(
-    storage: &impl ChainReader,
-    provision_store: &ProvisionStore,
-    req: &GetBlockTopUpRequest,
-) -> GetBlockTopUpResponse {
-    let Some(hyperscale_storage::BlockForSync { block, .. }) =
-        storage.get_block_for_sync(req.height)
-    else {
-        return GetBlockTopUpResponse::empty();
-    };
-
-    let transactions = req
-        .missing_tx
-        .iter()
-        .filter_map(|want| {
-            block
-                .transactions()
-                .iter()
-                .find(|tx| tx.hash() == *want)
-                .map(|tx| (*want, Arc::clone(tx)))
-        })
-        .collect();
-
-    let certificates = req
-        .missing_cert
-        .iter()
-        .filter_map(|want| {
-            block
-                .certificates()
-                .iter()
-                .find(|fw| fw.wave_id_hash() == *want)
-                .map(|fw| (*want, Arc::clone(fw)))
-        })
-        .collect();
-
-    // Provisions never live in the persisted block — they're held only in
-    // the in-memory cache, so resolve top-up hits against `provision_store`.
-    let provisions = req
-        .missing_provision
-        .iter()
-        .filter_map(|want| provision_store.get(want).map(|p| (*want, p)))
-        .collect();
-
-    GetBlockTopUpResponse::new(transactions, certificates, provisions)
 }
 
 #[cfg(test)]
@@ -779,6 +743,72 @@ mod tests {
             outputs
                 .iter()
                 .any(|o| matches!(o, SyncOutput::FetchBlock { height, .. } if height.0 == 1))
+        );
+    }
+
+    #[test]
+    fn force_full_refetch_propagates_to_next_fetch_output() {
+        let mut protocol = SyncProtocol::new(SyncConfig {
+            max_concurrent_fetches: 4,
+            sync_window_size: 10,
+        });
+
+        let outputs = protocol.handle(SyncInput::StartSync {
+            target_height: BlockHeight(3),
+            target_hash: BlockHash::ZERO,
+        });
+
+        // Initial fetches: nothing flagged.
+        assert!(outputs.iter().all(|o| matches!(
+            o,
+            SyncOutput::FetchBlock {
+                force_full: false,
+                ..
+            }
+        )));
+
+        // Mark height 2; next fetch wave for that height must carry the flag.
+        protocol.mark_force_full_refetch(BlockHeight(2));
+        let outputs = protocol.handle(SyncInput::BlockFetchFailed {
+            height: BlockHeight(2),
+            now: Instant::now() + Duration::from_secs(2),
+        });
+        // Failure parks; tick to promote and re-emit.
+        let _ = outputs;
+        let outputs = protocol.handle(SyncInput::Tick {
+            now: Instant::now() + Duration::from_secs(10),
+        });
+        let height_2 = outputs.iter().find_map(|o| match o {
+            SyncOutput::FetchBlock {
+                height, force_full, ..
+            } if height.0 == 2 => Some(*force_full),
+            _ => None,
+        });
+        assert_eq!(
+            height_2,
+            Some(true),
+            "force_full must propagate to the re-emitted FetchBlock for height 2"
+        );
+    }
+
+    #[test]
+    fn force_full_refetch_drains_on_commit() {
+        let mut protocol = SyncProtocol::new(SyncConfig {
+            max_concurrent_fetches: 4,
+            sync_window_size: 10,
+        });
+        let _ = protocol.handle(SyncInput::StartSync {
+            target_height: BlockHeight(3),
+            target_hash: BlockHash::ZERO,
+        });
+        protocol.mark_force_full_refetch(BlockHeight(1));
+        // Commit past the marked height — drain.
+        let _ = protocol.handle(SyncInput::BlockCommitted {
+            height: BlockHeight(1),
+        });
+        assert!(
+            !protocol.force_full_refetch.contains(&BlockHeight(1)),
+            "commit at height must drop the marker"
         );
     }
 }

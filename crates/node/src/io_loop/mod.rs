@@ -347,12 +347,6 @@ where
             NodeInput::SyncBlockFetchFailed { height } => {
                 self.handle_sync_block_fetch_failed(height);
             }
-            NodeInput::SyncBlockTopUpReceived { height, response } => {
-                self.handle_sync_block_topup_received(height, response);
-            }
-            NodeInput::SyncBlockTopUpFailed { height } => {
-                self.handle_sync_block_topup_failed(height);
-            }
 
             // ── Fetch protocol ─────────────────────────────────────────
             NodeInput::TransactionReceived { transactions } => {

@@ -70,23 +70,6 @@ pub enum NodeInput {
         height: BlockHeight,
     },
 
-    /// Top-up response received from network callback after a rehydration
-    /// miss. `response = None` signals the peer couldn't serve any of the
-    /// requested bodies (empty-response short-circuit on the wire).
-    SyncBlockTopUpReceived {
-        /// Height the top-up belongs to.
-        height: BlockHeight,
-        /// Body bodies the peer returned, or `None` for empty-response short-circuit.
-        response: Option<Box<hyperscale_messages::response::GetBlockTopUpResponse>>,
-    },
-
-    /// Top-up request failed (timeout / transport error). The `IoLoop`
-    /// drops the buffered elided block and refetches the whole thing.
-    SyncBlockTopUpFailed {
-        /// Height whose top-up request failed.
-        height: BlockHeight,
-    },
-
     /// Periodic tick for the fetch protocol to retry pending operations.
     FetchTick,
 
@@ -249,8 +232,6 @@ impl NodeInput {
             Self::SubmitTransaction { .. } => EventPriority::Client,
             Self::SyncBlockResponseReceived { .. } => EventPriority::Internal,
             Self::SyncBlockFetchFailed { .. } => EventPriority::Internal,
-            Self::SyncBlockTopUpReceived { .. } => EventPriority::Internal,
-            Self::SyncBlockTopUpFailed { .. } => EventPriority::Internal,
             Self::FetchTick => EventPriority::Timer,
             Self::FetchTransactionsFailed { .. } => EventPriority::Internal,
             Self::TransactionReceived { .. } => EventPriority::Network,

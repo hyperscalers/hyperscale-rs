@@ -28,10 +28,10 @@ where
     #[allow(clippy::too_many_lines)] // single registration table; one closure per request type
     pub(super) fn register_request_handler(&self) {
         use crate::io_loop::protocol::provision_serve::serve_provision_request;
-        use crate::io_loop::protocol::sync::{serve_block_request, serve_block_topup_request};
+        use crate::io_loop::protocol::sync::serve_block_request;
         use crate::io_loop::protocol::transaction_serve::serve_transaction_request;
         use hyperscale_messages::request::{
-            GetBlockRequest, GetBlockTopUpRequest, GetProvisionsRequest, GetTransactionsRequest,
+            GetBlockRequest, GetProvisionsRequest, GetTransactionsRequest,
         };
         use std::collections::HashMap;
         use std::sync::Arc;
@@ -54,15 +54,6 @@ where
         self.network
             .register_request_handler::<GetBlockRequest>(move |req| {
                 serve_block_request(&*storage, &provision_store, &req)
-            });
-
-        // ── block_topup.request → sync protocol ──────────────────────
-
-        let storage = Arc::clone(&self.storage);
-        let provision_store = Arc::clone(&self.caches.provision_store);
-        self.network
-            .register_request_handler::<GetBlockTopUpRequest>(move |req| {
-                serve_block_topup_request(&*storage, &provision_store, &req)
             });
 
         // ── transaction.request → fetch protocol ─────────────────────

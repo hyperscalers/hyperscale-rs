@@ -14,20 +14,12 @@ use super::fetch::FetchConfig;
 use super::sync::{SyncInput, SyncOutput, SyncProtocol, SyncStatus};
 use crate::config::NodeConfig;
 use hyperscale_core::ProtocolEvent;
-use hyperscale_messages::response::ElidedCertifiedBlock;
-use hyperscale_types::BlockHeight;
-use std::collections::HashMap;
 use std::time::Instant;
 
 /// Sync + per-payload fetch protocols owned by the I/O loop.
 pub struct ProtocolHost {
     /// Block-sync state machine.
     pub sync: SyncProtocol,
-
-    /// Elided sync responses awaiting a top-up. Keyed by block height.
-    /// Populated when rehydration misses; drained on topup response or
-    /// topup failure.
-    pub pending_block_topups: HashMap<BlockHeight, Box<ElidedCertifiedBlock>>,
 
     /// Per-block transaction fetch (intra-shard, pinned to proposer).
     pub transaction: TransactionFetch,
@@ -54,7 +46,6 @@ impl ProtocolHost {
     pub fn new(config: &NodeConfig) -> Self {
         Self {
             sync: SyncProtocol::new(config.sync.clone()),
-            pending_block_topups: HashMap::new(),
             transaction: TransactionFetch::new("transaction", config.transaction_fetch.clone()),
             local_provision: LocalProvisionFetch::new(
                 "local_provision",
