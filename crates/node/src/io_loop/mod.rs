@@ -330,17 +330,14 @@ where
 
         match event {
             // ── Transaction validation pipeline ────────────────────────
-            NodeInput::TransactionValidated {
-                tx,
-                submitted_locally,
-            } => self.handle_transaction_validated(tx, submitted_locally),
+            NodeInput::TransactionGossipReceived { tx } => {
+                self.handle_gossip_received_tx_for_validation(tx);
+            }
+            NodeInput::TransactionValidated { tx } => self.handle_transaction_validated(tx),
             NodeInput::TransactionValidationsFailed { hashes } => {
                 self.handle_transaction_validations_failed(&hashes);
             }
             NodeInput::Protocol(pe) => match *pe {
-                ProtocolEvent::TransactionGossipReceived { tx, .. } => {
-                    self.handle_gossip_received_tx_for_validation(tx);
-                }
                 ProtocolEvent::BlockPersisted { height } => {
                     self.handle_block_persisted(height);
                 }

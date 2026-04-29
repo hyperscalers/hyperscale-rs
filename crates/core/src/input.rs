@@ -52,6 +52,14 @@ pub enum NodeInput {
         tx: Arc<RoutableTransaction>,
     },
 
+    /// Raw gossip-delivered transaction. `IoLoop` queues it for async
+    /// validation; the validated form is surfaced as
+    /// `ProtocolEvent::TransactionValidated`.
+    TransactionGossipReceived {
+        /// The transaction.
+        tx: Arc<RoutableTransaction>,
+    },
+
     /// Sync block response received from network callback. Carries the
     /// elided wire shape; the `IoLoop` rehydrates to a full `CertifiedBlock`
     /// by looking up omitted bodies in the local mempool / cert cache /
@@ -114,12 +122,12 @@ pub enum NodeInput {
         hashes: Vec<WaveIdHash>,
     },
 
-    /// Transaction validated by the validation pipeline.
+    /// Transaction validated by the validation pipeline. The `IoLoop`
+    /// resolves `submitted_locally` from its `locally_submitted` set
+    /// before forwarding as `ProtocolEvent::TransactionValidated`.
     TransactionValidated {
         /// Validated transaction ready for the mempool.
         tx: Arc<RoutableTransaction>,
-        /// `true` if this validator submitted the tx (don't gossip back to client).
-        submitted_locally: bool,
     },
 
     /// Transactions that failed validation — sent back so the `IoLoop` can
@@ -181,7 +189,6 @@ impl NodeInput {
                 ProtocolEvent::BlockHeaderReceived { .. }
                 | ProtocolEvent::RemoteHeaderReceived { .. }
                 | ProtocolEvent::BlockVoteReceived { .. }
-                | ProtocolEvent::TransactionGossipReceived { .. }
                 | ProtocolEvent::GlobalBlockReceived { .. }
                 | ProtocolEvent::GlobalBlockVoteReceived { .. }
                 | ProtocolEvent::ProvisionsReceived { .. }
@@ -195,6 +202,7 @@ impl NodeInput {
                 _ => EventPriority::Internal,
             },
             Self::SubmitTransaction { .. } => EventPriority::Client,
+            Self::TransactionGossipReceived { .. } => EventPriority::Network,
             Self::BlockSyncResponseReceived { .. } => EventPriority::Internal,
             Self::BlockSyncFetchFailed { .. } => EventPriority::Internal,
             Self::RemoteHeadersResponseReceived { .. } => EventPriority::Internal,

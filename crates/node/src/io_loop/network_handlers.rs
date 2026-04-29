@@ -275,19 +275,17 @@ where
     pub(super) fn register_gossip_handlers(&self) {
         use hyperscale_network::{GossipVerdict, TopicScope};
 
-        // ── transaction.gossip → ProtocolEvent::TransactionGossipReceived ─
-        // The existing step() intercept handles dedup + validation queueing.
+        // ── transaction.gossip → NodeInput::TransactionGossipReceived ─
+        // The step() handler dedups against tx_store / tombstones and
+        // enqueues for batched async validation.
 
         let tx = self.event_sender.clone();
         self.network.register_gossip_handler::<TransactionGossip>(
             TopicScope::Shard,
             move |gossip: TransactionGossip| -> GossipVerdict {
-                let _ = tx.send(NodeInput::Protocol(Box::new(
-                    ProtocolEvent::TransactionGossipReceived {
-                        tx: gossip.transaction,
-                        submitted_locally: false,
-                    },
-                )));
+                let _ = tx.send(NodeInput::TransactionGossipReceived {
+                    tx: gossip.transaction,
+                });
                 GossipVerdict::Accept
             },
         );

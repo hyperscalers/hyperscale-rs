@@ -225,8 +225,7 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::FinalizedWavesReceived { .. }) => self.handle_execution(evt),
 
             // ── Transactions ─────────────────────────────────────────────
-            evt @ (ProtocolEvent::TransactionGossipReceived { .. }
-            | ProtocolEvent::TransactionValidated { .. }
+            evt @ (ProtocolEvent::TransactionValidated { .. }
             | ProtocolEvent::TransactionsReceived { .. }
             | ProtocolEvent::TransactionsAdmitted { .. }) => self.handle_transaction(evt),
 

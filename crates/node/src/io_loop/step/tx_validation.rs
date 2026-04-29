@@ -2,12 +2,14 @@
 //!
 //! Four `NodeInput` variants drive the pipeline:
 //!
-//! - `TransactionGossipReceived` (intercepted before reaching the state
-//!   machine) — queue for batched validation if not already cached/tombstoned;
+//! - `TransactionGossipReceived` — raw gossip arrival; queue for batched
+//!   validation if not already cached/tombstoned. Never reaches the state
+//!   machine.
 //! - `SubmitTransaction` — locally-submitted tx: gossip to relevant shards,
 //!   then queue for validation if needed;
-//! - `TransactionValidated` — async-validation success: cache, mark
-//!   locally-submitted if applicable, feed into state-machine admission;
+//! - `TransactionValidated` — async-validation success: resolve
+//!   locally-submitted from the tracking set, feed
+//!   `ProtocolEvent::TransactionValidated` to state-machine admission;
 //! - `TransactionValidationsFailed` — async-validation failure: clean up
 //!   tracking sets so the tx can be re-validated later.
 //!
@@ -43,15 +45,14 @@ where
     pub(in crate::io_loop) fn handle_transaction_validated(
         &mut self,
         tx: Arc<RoutableTransaction>,
-        submitted_locally: bool,
     ) {
         let tx_hash = tx.hash();
         self.pending_validation.remove(&tx_hash);
-        let is_local = submitted_locally || self.locally_submitted.remove(&tx_hash);
+        let submitted_locally = self.locally_submitted.remove(&tx_hash);
         self.actions_generated = 0;
         self.feed_event(ProtocolEvent::TransactionValidated {
             tx,
-            submitted_locally: is_local,
+            submitted_locally,
         });
     }
 
@@ -137,10 +138,7 @@ where
             let mut failed_hashes = Vec::new();
             for (tx, valid) in batch.into_iter().zip(results) {
                 if valid {
-                    let _ = event_tx.send(NodeInput::TransactionValidated {
-                        tx,
-                        submitted_locally: false, // IoLoop sets from locally_submitted
-                    });
+                    let _ = event_tx.send(NodeInput::TransactionValidated { tx });
                 } else {
                     failed_hashes.push(tx.hash());
                 }

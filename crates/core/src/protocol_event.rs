@@ -357,16 +357,6 @@ pub enum ProtocolEvent {
     // ═══════════════════════════════════════════════════════════════════════
     // Mempool / Transactions
     // ═══════════════════════════════════════════════════════════════════════
-    /// Raw transaction gossip arrival. Intercepted by `IoLoop` and queued for
-    /// async validation; never reaches the state machine via this variant.
-    /// The post-validation result is surfaced as `TransactionValidated`.
-    TransactionGossipReceived {
-        /// The transaction.
-        tx: Arc<RoutableTransaction>,
-        /// `true` if this validator submitted the tx (don't gossip back to client).
-        submitted_locally: bool,
-    },
-
     /// Transaction passed async validation. Routed to the state machine for
     /// mempool admission. Mempool emits `Continuation(TransactionsAdmitted)`
     /// for whatever it admits.

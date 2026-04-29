@@ -7,8 +7,8 @@
 //! - `TransactionsAdmitted` — mempool emits this after admission; BFT's
 //!   pending-block subscriber consumes it and we latch a proposal-retry.
 //!
-//! `TransactionGossipReceived` is the raw gossip arrival; `IoLoop` intercepts
-//! it before reaching the state machine and queues for async validation.
+//! Raw gossip arrivals enter `IoLoop` as `NodeInput::TransactionGossipReceived`
+//! and never reach the state machine; the validated form does.
 
 use super::NodeStateMachine;
 use hyperscale_core::{Action, ProtocolEvent};
@@ -23,12 +23,6 @@ impl NodeStateMachine {
                 tx,
                 submitted_locally,
             } => self.on_transaction_validated(tx, submitted_locally),
-            ProtocolEvent::TransactionGossipReceived { .. } => {
-                unreachable!(
-                    "TransactionGossipReceived is intercepted by IoLoop for async validation; \
-                     state machine sees only TransactionValidated"
-                )
-            }
             ProtocolEvent::TransactionsReceived { transactions } => {
                 self.on_transactions_fetched(transactions)
             }
