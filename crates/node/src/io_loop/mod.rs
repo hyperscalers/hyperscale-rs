@@ -372,8 +372,11 @@ where
             }
 
             // ── Fetch protocol ─────────────────────────────────────────
-            NodeInput::TransactionReceived { transactions } => {
-                self.handle_transactions_received(transactions);
+            NodeInput::TransactionReceived {
+                transactions,
+                missing_hashes,
+            } => {
+                self.handle_transactions_received(transactions, missing_hashes);
             }
 
             NodeInput::FetchTransactionsFailed { hashes } => {

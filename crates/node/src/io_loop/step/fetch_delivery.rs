@@ -28,15 +28,20 @@ where
     E: Engine,
 {
     /// Route delivered txs through mempool admission, then drain every
-    /// delivered hash from the fetch protocol. Mempool's
-    /// `TransactionsAdmitted` event covers only newly-admitted txs — txs
-    /// rejected as duplicates / tombstoned / validity-expired don't
-    /// surface there, so we drop them from the fetch FSM directly. Without
-    /// this, redundant fetch responses pin entries in the pending set
-    /// forever and `fetch_in_flight{kind=transaction}` ratchets up.
+    /// delivered hash from the fetch protocol and signal `Failed` for
+    /// hashes the peer didn't return. Mempool's `TransactionsAdmitted`
+    /// event covers only newly-admitted txs — txs rejected as duplicates
+    /// / tombstoned / validity-expired don't surface there, so we drop
+    /// them from the fetch FSM directly. Without the explicit
+    /// `Admitted` drain, redundant fetch responses pin entries in the
+    /// pending set forever; without the `Failed` signal for missing
+    /// hashes, partial responses leak `in_flight=true` entries that the
+    /// next tick can't redispatch — both leaks ratchet
+    /// `fetch_in_flight{kind=transaction}` upward.
     pub(in crate::io_loop) fn handle_transactions_received(
         &mut self,
         transactions: Vec<Arc<RoutableTransaction>>,
+        missing_hashes: Vec<TxHash>,
     ) {
         let delivered_hashes: Vec<TxHash> = transactions.iter().map(|tx| tx.hash()).collect();
         let actions = self.state.on_transactions_fetched(transactions);
@@ -44,6 +49,11 @@ where
         if !delivered_hashes.is_empty() {
             self.drive_fetch::<TransactionBinding>(FetchInput::Admitted {
                 ids: delivered_hashes,
+            });
+        }
+        if !missing_hashes.is_empty() {
+            self.drive_fetch::<TransactionBinding>(FetchInput::Failed {
+                ids: missing_hashes,
             });
         }
     }

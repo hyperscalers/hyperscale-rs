@@ -106,7 +106,14 @@ impl FetchBinding for TransactionBinding {
                     let txs = resp.into_transactions();
                     let returned = txs.len();
                     let requested = hs.len();
-                    let _ = es.send(NodeInput::TransactionReceived { transactions: txs });
+                    let delivered: std::collections::HashSet<TxHash> =
+                        txs.iter().map(|tx| tx.hash()).collect();
+                    let missing_hashes: Vec<TxHash> =
+                        hs.into_iter().filter(|h| !delivered.contains(h)).collect();
+                    let _ = es.send(NodeInput::TransactionReceived {
+                        transactions: txs,
+                        missing_hashes,
+                    });
                     if returned < requested {
                         ResponseVerdict::Reject
                     } else {

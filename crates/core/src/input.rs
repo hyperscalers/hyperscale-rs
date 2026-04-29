@@ -109,9 +109,17 @@ pub enum NodeInput {
     /// them through mempool admission. The block-hash association is reported
     /// at admission time via the `Continuation(TransactionsAdmitted)` event;
     /// `io_loop`'s drain doesn't need it here.
+    ///
+    /// `missing_hashes` lists requested hashes the peer did not return
+    /// (computed client-side as `requested - delivered`). The fetch FSM
+    /// feeds them as `Failed` so `in_flight` is cleared and the next tick
+    /// retries them; without this, partial responses would pin entries
+    /// in the in-flight set forever.
     TransactionReceived {
         /// Transactions returned by the peer.
         transactions: Vec<Arc<RoutableTransaction>>,
+        /// Requested hashes the peer did not return.
+        missing_hashes: Vec<TxHash>,
     },
 
     /// Local provisions received from a fetch request.
