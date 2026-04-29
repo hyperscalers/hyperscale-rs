@@ -1,7 +1,7 @@
 //! Consolidated configuration for `IoLoop`.
 
+use crate::io_loop::protocol::block_sync::BlockSyncConfig;
 use crate::io_loop::protocol::fetch::FetchConfig;
-use crate::io_loop::protocol::sync::SyncConfig;
 use std::time::Duration;
 
 /// Configuration for [`IoLoop`](crate::io_loop::IoLoop).
@@ -9,8 +9,8 @@ use std::time::Duration;
 /// Bundles all sub-component configs so runners can pass a single value.
 #[derive(Debug, Default, Clone)]
 pub struct NodeConfig {
-    /// Sync (catch-up + rehydration) configuration.
-    pub sync: SyncConfig,
+    /// Block-sync (catch-up + rehydration) configuration.
+    pub block_sync: BlockSyncConfig,
     /// Inbound transaction fetch configuration.
     pub transaction_fetch: FetchConfig,
     /// Cross-shard provision fetch configuration.

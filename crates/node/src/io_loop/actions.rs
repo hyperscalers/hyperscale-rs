@@ -7,8 +7,8 @@ use crate::io_loop::protocol::binding::{
     ExecCertBinding, FinalizedWaveBinding, LocalProvisionBinding, ProvisionBinding,
     TransactionBinding,
 };
+use crate::io_loop::protocol::block_sync::BlockSyncInput;
 use crate::io_loop::protocol::fetch::FetchInput;
-use crate::io_loop::protocol::sync::SyncInput;
 use hyperscale_core::{
     Action, ActionContext, CommitSource, FetchRequest, NodeInput, PreparedBlock, ProtocolEvent,
     StateMachine,
@@ -68,7 +68,7 @@ where
             }
 
             // ─── Sync / fetch protocol drive ───────────────────────────────
-            Action::StartSync { .. } | Action::Fetch(_) => {
+            Action::StartBlockSync { .. } | Action::Fetch(_) => {
                 self.process_sync_fetch_action(action);
             }
             Action::StartRemoteHeaderSync {
@@ -395,9 +395,9 @@ where
                 debug!(height = height.0, "Block committed");
                 let outputs = self
                     .protocols
-                    .sync
-                    .handle(SyncInput::BlockCommitted { height });
-                self.process_sync_outputs(outputs);
+                    .block_sync
+                    .handle(BlockSyncInput::BlockCommitted { height });
+                self.process_block_sync_outputs(outputs);
                 if let Some((block, qc)) = notify_now {
                     let certified = hyperscale_types::CertifiedBlock::new_unchecked(
                         Arc::unwrap_or_clone(block),
@@ -417,12 +417,12 @@ where
     /// Process sync and unified-fetch actions.
     fn process_sync_fetch_action(&mut self, action: Action) {
         match action {
-            Action::StartSync { target_height } => {
+            Action::StartBlockSync { target_height } => {
                 let outputs = self
                     .protocols
-                    .sync
-                    .handle(SyncInput::StartSync { target_height });
-                self.process_sync_outputs(outputs);
+                    .block_sync
+                    .handle(BlockSyncInput::StartSync { target_height });
+                self.process_block_sync_outputs(outputs);
             }
             Action::Fetch(req) => self.process_fetch_request(req),
             _ => unreachable!(),

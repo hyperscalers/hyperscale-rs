@@ -57,7 +57,7 @@ pub fn record_metrics<S: ChainWriter>(snapshot: MetricsSnapshot, storage: &S) {
     metrics::set_lock_contention(snapshot.contention_ratio);
     metrics::set_in_flight(snapshot.in_flight);
     metrics::set_backpressure_active(snapshot.backpressure_active);
-    metrics::set_sync_status(snapshot.blocks_behind, snapshot.is_syncing);
+    metrics::set_block_sync_status(snapshot.blocks_behind, snapshot.is_syncing);
     metrics::set_fetch_in_flight("transaction", snapshot.fetch_transaction);
     metrics::set_fetch_in_flight("provision", snapshot.fetch_provision);
     metrics::set_fetch_in_flight("local_provision", snapshot.fetch_local_provision);
@@ -96,7 +96,7 @@ where
         let mempool = self.state.mempool();
         let contention = mempool.lock_contention_stats();
         let proto = self.protocols.metrics();
-        let sync_status = &proto.sync_status;
+        let block_sync_status = &proto.block_sync_status;
 
         let bft_mem = self.state.bft().memory_stats();
         let exec_mem = self.state.execution().memory_stats();
@@ -112,8 +112,8 @@ where
             contention_ratio: contention.contention_ratio(),
             in_flight: mempool.in_flight(),
             backpressure_active: mempool.at_in_flight_limit(),
-            blocks_behind: self.protocols.sync.blocks_behind(),
-            is_syncing: self.protocols.sync.is_syncing(),
+            blocks_behind: self.protocols.block_sync.blocks_behind(),
+            is_syncing: self.protocols.block_sync.is_syncing(),
             fetch_transaction: proto.transaction_in_flight,
             fetch_provision: proto.provision_in_flight,
             fetch_local_provision: proto.local_provision_in_flight,
@@ -187,8 +187,8 @@ where
                 node_pending_block_commits: self.block_commit.pending_len(),
                 node_validation_batch: self.validation_batch.len(),
                 node_committed_header_batch: self.committed_header_batch.len(),
-                node_sync_queued_heights: sync_status.queued_heights,
-                node_sync_in_flight_fetches: sync_status.pending_fetches,
+                node_block_sync_queued_heights: block_sync_status.queued_heights,
+                node_block_sync_in_flight_fetches: block_sync_status.pending_fetches,
                 node_tx_fetch_blocks: proto.transaction_pending,
                 node_local_provision_fetch_pending: proto.local_provision_pending,
                 node_finalized_wave_fetch_pending: proto.finalized_wave_pending,

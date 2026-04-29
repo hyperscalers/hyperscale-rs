@@ -29,8 +29,8 @@ where
         // `apply_admission` on canonical admission events; cross-shard
         // provisions also evict abandoned scopes via a predicate.
         let now = std::time::Instant::now();
-        let outputs = self.protocols.sync_tick(now);
-        self.process_sync_outputs(outputs);
+        let outputs = self.protocols.block_sync_tick(now);
+        self.process_block_sync_outputs(outputs);
 
         let outputs = self.protocols.remote_header_sync_tick(now);
         self.process_remote_header_sync_outputs(outputs);

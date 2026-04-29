@@ -25,7 +25,7 @@ fn fresh_coordinator_reports_genesis_chain_state() {
     assert_eq!(coordinator.committed_height(), BlockHeight::GENESIS);
     assert!(coordinator.latest_qc().is_none());
     assert_eq!(coordinator.view(), Round::INITIAL);
-    assert!(!coordinator.is_syncing());
+    assert!(!coordinator.is_block_syncing());
 }
 
 #[test]
@@ -155,7 +155,7 @@ fn on_block_persisted_returns_no_actions_when_not_syncing() {
 
     let actions = coordinator.on_block_persisted(&topology, BlockHeight(1));
     assert!(actions.is_empty());
-    assert!(!coordinator.is_syncing());
+    assert!(!coordinator.is_block_syncing());
 }
 
 #[test]

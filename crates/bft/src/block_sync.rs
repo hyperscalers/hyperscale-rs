@@ -31,7 +31,7 @@ pub struct PendingSyncedBlockVerification {
 /// `BftCoordinator` owns this as a field and delegates sync-specific bookkeeping
 /// to it. Core protocol state changes (`committed_height`, `latest_qc`) remain
 /// on `BftCoordinator`.
-pub struct SyncManager {
+pub struct BlockSyncManager {
     /// Whether we are currently syncing (catching up to the network).
     syncing: bool,
 
@@ -54,8 +54,8 @@ pub struct SyncManager {
     pending_synced_block_verifications: HashMap<BlockHash, PendingSyncedBlockVerification>,
 }
 
-impl SyncManager {
-    /// Create a new `SyncManager`.
+impl BlockSyncManager {
+    /// Create a new `BlockSyncManager`.
     pub fn new() -> Self {
         Self {
             syncing: false,
@@ -265,7 +265,7 @@ impl SyncManager {
         &mut self,
         block_hash: BlockHash,
         valid: bool,
-    ) -> Option<SyncVerificationResult> {
+    ) -> Option<BlockSyncVerificationResult> {
         let mut pending = self
             .pending_synced_block_verifications
             .remove(&block_hash)?;
@@ -280,7 +280,7 @@ impl SyncManager {
             // verifications are kept — a single bad peer shouldn't cascade
             // into losing all in-flight sync work. Blocks above this height
             // will be blocked by the gap until a re-sync fills it.
-            return Some(SyncVerificationResult::Failed);
+            return Some(BlockSyncVerificationResult::Failed);
         }
 
         info!(
@@ -294,7 +294,7 @@ impl SyncManager {
         self.pending_synced_block_verifications
             .insert(block_hash, pending);
 
-        Some(SyncVerificationResult::Verified)
+        Some(BlockSyncVerificationResult::Verified)
     }
 
     /// Number of pending synced block verifications (for logging).
@@ -436,7 +436,7 @@ impl SyncManager {
 }
 
 /// Classification of an incoming synced block. Returned by
-/// [`SyncManager::ingest`] so the coordinator doesn't have to replicate the
+/// [`BlockSyncManager::ingest`] so the coordinator doesn't have to replicate the
 /// stale/duplicate/ordering branching.
 pub enum IngestOutcome {
     /// Stale (already committed), duplicate of an in-flight verification,
@@ -453,7 +453,7 @@ pub enum IngestOutcome {
 }
 
 /// Result of a synced block QC verification.
-pub enum SyncVerificationResult {
+pub enum BlockSyncVerificationResult {
     /// QC verified successfully — ready to apply consecutive blocks.
     Verified,
     /// QC verification failed — the bad block is removed, other pending
@@ -462,15 +462,15 @@ pub enum SyncVerificationResult {
     Failed,
 }
 
-/// Decision returned by [`SyncManager::health_check`].
-pub enum SyncHealthDecision {
+/// Decision returned by [`BlockSyncManager::health_check`].
+pub enum BlockSyncHealthDecision {
     /// No action needed — already synced, already syncing, or making progress.
     Idle,
     /// Trigger catch-up sync to the named target.
     TriggerSync { target_height: BlockHeight },
 }
 
-impl SyncManager {
+impl BlockSyncManager {
     /// Decide whether we're stuck behind the latest QC and should fall back
     /// to catch-up sync. Called periodically by the cleanup timer.
     ///
@@ -492,19 +492,19 @@ impl SyncManager {
         has_next_block: bool,
         commits: &CommitPipeline,
         pending_blocks_len: usize,
-    ) -> SyncHealthDecision {
+    ) -> BlockSyncHealthDecision {
         let Some(latest_qc) = latest_qc else {
-            return SyncHealthDecision::Idle;
+            return BlockSyncHealthDecision::Idle;
         };
 
         let qc_height = latest_qc.height;
 
         if committed_height >= qc_height {
-            return SyncHealthDecision::Idle;
+            return BlockSyncHealthDecision::Idle;
         }
 
         if self.is_syncing() {
-            return SyncHealthDecision::Idle;
+            return BlockSyncHealthDecision::Idle;
         }
 
         let next_needed_height = committed_height.next();
@@ -539,11 +539,11 @@ impl SyncManager {
                         gap = gap,
                         "Have complete block and pending commit but significantly behind - triggering sync to recover"
                     );
-                    return SyncHealthDecision::TriggerSync {
+                    return BlockSyncHealthDecision::TriggerSync {
                         target_height: qc_height,
                     };
                 }
-                return SyncHealthDecision::Idle;
+                return BlockSyncHealthDecision::Idle;
             }
 
             if gap > 3 {
@@ -555,11 +555,11 @@ impl SyncManager {
                     gap = gap,
                     "Have complete block but no pending commit (missing QC) - triggering sync to recover"
                 );
-                return SyncHealthDecision::TriggerSync {
+                return BlockSyncHealthDecision::TriggerSync {
                     target_height: qc_height,
                 };
             }
-            return SyncHealthDecision::Idle;
+            return BlockSyncHealthDecision::Idle;
         }
 
         info!(
@@ -570,7 +570,7 @@ impl SyncManager {
             "Sync health check: can't make progress, triggering catch-up sync"
         );
 
-        SyncHealthDecision::TriggerSync {
+        BlockSyncHealthDecision::TriggerSync {
             target_height: qc_height,
         }
     }
@@ -637,14 +637,14 @@ mod tests {
 
     #[test]
     fn ingest_drops_stale_block_at_or_below_committed() {
-        let mut sm = SyncManager::new();
+        let mut sm = BlockSyncManager::new();
         let out = sm.ingest(certified(BlockHeight(3), b"s"), BlockHeight(5));
         assert!(matches!(out, IngestOutcome::Drop));
     }
 
     #[test]
     fn ingest_drops_block_already_pending_verification() {
-        let mut sm = SyncManager::new();
+        let mut sm = BlockSyncManager::new();
         let cb = certified(BlockHeight(6), b"p");
         sm.track_pending_verification_for_test(cb.clone());
         let out = sm.ingest(cb, BlockHeight(5));
@@ -653,7 +653,7 @@ mod tests {
 
     #[test]
     fn ingest_drops_block_already_buffered() {
-        let mut sm = SyncManager::new();
+        let mut sm = BlockSyncManager::new();
         let cb = certified(BlockHeight(7), b"b");
         sm.buffer_block(BlockHeight(7), cb.clone());
         let out = sm.ingest(cb, BlockHeight(5));
@@ -662,7 +662,7 @@ mod tests {
 
     #[test]
     fn ingest_submits_when_block_is_next_needed_height() {
-        let mut sm = SyncManager::new();
+        let mut sm = BlockSyncManager::new();
         let cb = certified(BlockHeight(6), b"next");
         let out = sm.ingest(cb, BlockHeight(5));
         assert!(matches!(out, IngestOutcome::Submit(_)));
@@ -670,7 +670,7 @@ mod tests {
 
     #[test]
     fn ingest_buffers_future_block_and_stores_it() {
-        let mut sm = SyncManager::new();
+        let mut sm = BlockSyncManager::new();
         let cb = certified(BlockHeight(8), b"future");
         let out = sm.ingest(cb, BlockHeight(5));
         assert!(matches!(out, IngestOutcome::Buffered));
@@ -681,7 +681,7 @@ mod tests {
 
     #[test]
     fn next_submitable_is_empty_when_pending_saturates_parallelism() {
-        let mut sm = SyncManager::new();
+        let mut sm = BlockSyncManager::new();
         sm.track_pending_verification_for_test(certified(BlockHeight(6), b"a"));
         sm.track_pending_verification_for_test(certified(BlockHeight(7), b"b"));
         let out = sm.next_submitable(BlockHeight(5), 2);
@@ -690,7 +690,7 @@ mod tests {
 
     #[test]
     fn next_submitable_drains_slots_from_buffer_starting_above_pending() {
-        let mut sm = SyncManager::new();
+        let mut sm = BlockSyncManager::new();
         sm.track_pending_verification_for_test(certified(BlockHeight(6), b"pending"));
         sm.buffer_block(BlockHeight(7), certified(BlockHeight(7), b"buf1"));
         sm.buffer_block(BlockHeight(8), certified(BlockHeight(8), b"buf2"));
@@ -703,7 +703,7 @@ mod tests {
 
     #[test]
     fn next_submitable_skips_non_contiguous_buffered_entries() {
-        let mut sm = SyncManager::new();
+        let mut sm = BlockSyncManager::new();
         sm.buffer_block(BlockHeight(8), certified(BlockHeight(8), b"later"));
         let out = sm.next_submitable(BlockHeight(5), 4);
         assert!(
@@ -716,42 +716,42 @@ mod tests {
 
     #[test]
     fn health_check_idle_without_latest_qc() {
-        let sm = SyncManager::new();
+        let sm = BlockSyncManager::new();
         let commits = CommitPipeline::new();
         let decision = sm.health_check(&topology(), BlockHeight(0), None, false, &commits, 0);
-        assert!(matches!(decision, SyncHealthDecision::Idle));
+        assert!(matches!(decision, BlockSyncHealthDecision::Idle));
     }
 
     #[test]
     fn health_check_idle_when_already_at_qc_height() {
-        let sm = SyncManager::new();
+        let sm = BlockSyncManager::new();
         let commits = CommitPipeline::new();
         let qc = qc_at(BlockHeight(10));
         let decision = sm.health_check(&topology(), BlockHeight(10), Some(&qc), true, &commits, 0);
-        assert!(matches!(decision, SyncHealthDecision::Idle));
+        assert!(matches!(decision, BlockSyncHealthDecision::Idle));
     }
 
     #[test]
     fn health_check_idle_when_already_syncing() {
-        let mut sm = SyncManager::new();
+        let mut sm = BlockSyncManager::new();
         sm.set_syncing(true);
         let commits = CommitPipeline::new();
         let qc = qc_at(BlockHeight(10));
         let decision = sm.health_check(&topology(), BlockHeight(5), Some(&qc), false, &commits, 0);
-        assert!(matches!(decision, SyncHealthDecision::Idle));
+        assert!(matches!(decision, BlockSyncHealthDecision::Idle));
     }
 
     #[test]
     fn health_check_triggers_sync_when_next_block_missing() {
-        let sm = SyncManager::new();
+        let sm = BlockSyncManager::new();
         let commits = CommitPipeline::new();
         let qc = qc_at(BlockHeight(10));
         let decision = sm.health_check(&topology(), BlockHeight(5), Some(&qc), false, &commits, 0);
         match decision {
-            SyncHealthDecision::TriggerSync { target_height } => {
+            BlockSyncHealthDecision::TriggerSync { target_height } => {
                 assert_eq!(target_height, BlockHeight(10));
             }
-            SyncHealthDecision::Idle => {
+            BlockSyncHealthDecision::Idle => {
                 panic!("expected TriggerSync for missing-next-block gap")
             }
         }
@@ -761,21 +761,24 @@ mod tests {
     fn health_check_triggers_sync_when_block_present_but_qc_stalled() {
         // has_next_block=true but no pending commit → missing-QC escalation
         // fires when gap > 3.
-        let sm = SyncManager::new();
+        let sm = BlockSyncManager::new();
         let commits = CommitPipeline::new();
         let qc = qc_at(BlockHeight(10));
         let decision = sm.health_check(&topology(), BlockHeight(5), Some(&qc), true, &commits, 0);
-        assert!(matches!(decision, SyncHealthDecision::TriggerSync { .. }));
+        assert!(matches!(
+            decision,
+            BlockSyncHealthDecision::TriggerSync { .. }
+        ));
     }
 
     #[test]
     fn health_check_idle_when_gap_is_small_and_block_present() {
-        let sm = SyncManager::new();
+        let sm = BlockSyncManager::new();
         let commits = CommitPipeline::new();
         let qc = qc_at(BlockHeight(7));
         // gap = 2, <= 3, so we wait for normal consensus.
         let decision = sm.health_check(&topology(), BlockHeight(5), Some(&qc), true, &commits, 0);
-        assert!(matches!(decision, SyncHealthDecision::Idle));
+        assert!(matches!(decision, BlockSyncHealthDecision::Idle));
     }
 
     fn qc_at(height: BlockHeight) -> QuorumCertificate {
@@ -787,7 +790,7 @@ mod tests {
 
     // Test-only shim avoiding the `pub fn` gate on the tracked insertion,
     // which is otherwise reached only via `register_for_verification`.
-    impl SyncManager {
+    impl BlockSyncManager {
         fn track_pending_verification_for_test(&mut self, certified: CertifiedBlock) {
             let block_hash = certified.block.hash();
             self.pending_synced_block_verifications.insert(

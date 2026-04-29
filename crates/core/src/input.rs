@@ -57,7 +57,7 @@ pub enum NodeInput {
     /// elided wire shape; the `IoLoop` rehydrates to a full `CertifiedBlock`
     /// by looking up omitted bodies in the local mempool / cert cache /
     /// provision store before handing off to the sync state machine.
-    SyncBlockResponseReceived {
+    BlockSyncResponseReceived {
         /// Height of the block being synced.
         height: BlockHeight,
         /// Elided block payload, or `None` if the peer couldn't serve this height.
@@ -65,7 +65,7 @@ pub enum NodeInput {
     },
 
     /// Sync block fetch failed from network callback.
-    SyncBlockFetchFailed {
+    BlockSyncFetchFailed {
         /// Height that failed to fetch.
         height: BlockHeight,
     },
@@ -246,8 +246,8 @@ impl NodeInput {
                 _ => EventPriority::Internal,
             },
             Self::SubmitTransaction { .. } => EventPriority::Client,
-            Self::SyncBlockResponseReceived { .. } => EventPriority::Internal,
-            Self::SyncBlockFetchFailed { .. } => EventPriority::Internal,
+            Self::BlockSyncResponseReceived { .. } => EventPriority::Internal,
+            Self::BlockSyncFetchFailed { .. } => EventPriority::Internal,
             Self::RemoteHeadersResponseReceived { .. } => EventPriority::Internal,
             Self::RemoteHeadersFetchFailed { .. } => EventPriority::Internal,
             Self::FetchTick => EventPriority::Timer,

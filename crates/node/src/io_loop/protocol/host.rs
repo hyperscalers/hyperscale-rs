@@ -1,21 +1,19 @@
 //! Bundle of fetch + sync protocols owned by the I/O loop.
 //!
-//! `ProtocolHost` holds the seven payload-specific fetch state machines plus
-//! the sync protocol and its rehydration scratch state. Lifting these out of
-//! `IoLoop` collapses 8 fields into one and makes "what the I/O loop is
-//! orchestrating" explicit.
+//! `ProtocolHost` holds the per-payload fetch state machines plus the
+//! block-sync and remote-header-sync state machines. Lifting these out of
+//! `IoLoop` makes "what the I/O loop is orchestrating" explicit.
 
 use super::binding::{
     ExecCertBinding, ExecCertFetch, FetchBinding, FinalizedWaveBinding, FinalizedWaveFetch,
     LocalProvisionBinding, LocalProvisionFetch, ProvisionBinding, ProvisionFetch,
     TransactionBinding, TransactionFetch,
 };
+use super::block_sync::{BlockSyncInput, BlockSyncOutput, BlockSyncProtocol, BlockSyncStatus};
 use super::fetch::FetchConfig;
 use super::remote_header_sync::{
-    RemoteHeaderSyncConfig, RemoteHeaderSyncProtocol, SyncInput as RemoteHeaderSyncInput,
-    SyncOutput as RemoteHeaderSyncOutput,
+    RemoteHeaderSyncConfig, RemoteHeaderSyncInput, RemoteHeaderSyncOutput, RemoteHeaderSyncProtocol,
 };
-use super::sync::{SyncInput, SyncOutput, SyncProtocol, SyncStatus};
 use crate::config::NodeConfig;
 use hyperscale_core::ProtocolEvent;
 use std::time::Instant;
@@ -23,7 +21,7 @@ use std::time::Instant;
 /// Sync + per-payload fetch protocols owned by the I/O loop.
 pub struct ProtocolHost {
     /// Block-sync state machine.
-    pub sync: SyncProtocol,
+    pub block_sync: BlockSyncProtocol,
 
     /// Multi-shard remote-header sync state machine. Catches up missing
     /// committed-header chains by batching contiguous heights into range
@@ -51,7 +49,7 @@ impl ProtocolHost {
     #[must_use]
     pub fn new(config: &NodeConfig) -> Self {
         Self {
-            sync: SyncProtocol::new(config.sync.clone()),
+            block_sync: BlockSyncProtocol::new(config.block_sync.clone()),
             remote_header_sync: RemoteHeaderSyncProtocol::new(RemoteHeaderSyncConfig::default()),
             transaction: TransactionFetch::new("transaction", config.transaction_fetch.clone()),
             local_provision: LocalProvisionFetch::new(
@@ -84,7 +82,7 @@ impl ProtocolHost {
             || self.finalized_wave.has_pending()
             || self.provision.has_pending()
             || self.exec_cert.has_pending()
-            || self.sync.has_deferred()
+            || self.block_sync.has_deferred()
             || self.remote_header_sync.has_deferred()
             || self.remote_header_sync.is_syncing()
     }
@@ -100,10 +98,10 @@ impl ProtocolHost {
         ExecCertBinding::apply_admission(&mut self.exec_cert, event);
     }
 
-    /// Drive the sync protocol's periodic tick. Returns the outputs the
+    /// Drive the block-sync protocol's periodic tick. Returns the outputs the
     /// I/O loop should dispatch (block fetches, deliveries, sync-complete).
-    pub fn sync_tick(&mut self, now: Instant) -> Vec<SyncOutput> {
-        self.sync.handle(SyncInput::Tick { now })
+    pub fn block_sync_tick(&mut self, now: Instant) -> Vec<BlockSyncOutput> {
+        self.block_sync.handle(BlockSyncInput::Tick { now })
     }
 
     /// Drive the remote-header-sync periodic tick. Returns range fetches
@@ -142,7 +140,7 @@ impl ProtocolHost {
             provision_pending: self.provision.pending_count(),
             exec_cert_in_flight: self.exec_cert.in_flight_count(),
             exec_cert_pending: self.exec_cert.pending_count(),
-            sync_status: self.sync.status(),
+            block_sync_status: self.block_sync.status(),
         }
     }
 }
@@ -163,5 +161,5 @@ pub struct ProtocolMetrics {
     pub provision_pending: usize,
     pub exec_cert_in_flight: usize,
     pub exec_cert_pending: usize,
-    pub sync_status: SyncStatus,
+    pub block_sync_status: BlockSyncStatus,
 }

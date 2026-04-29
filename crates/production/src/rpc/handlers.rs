@@ -660,7 +660,7 @@ mod tests {
 
         // Create state with node that is 20 blocks behind (threshold is 10)
         let sync_status = crate::status::SyncStatus {
-            state: hyperscale_node::SyncStateKind::Syncing,
+            state: hyperscale_node::BlockSyncStateKind::Syncing,
             current_height: 80,
             target_height: Some(100),
             blocks_behind: 20,
@@ -723,7 +723,7 @@ mod tests {
 
         // Create state with node that is only 5 blocks behind (under threshold of 10)
         let sync_status = crate::status::SyncStatus {
-            state: hyperscale_node::SyncStateKind::Syncing,
+            state: hyperscale_node::BlockSyncStateKind::Syncing,
             current_height: 95,
             target_height: Some(100),
             blocks_behind: 5,

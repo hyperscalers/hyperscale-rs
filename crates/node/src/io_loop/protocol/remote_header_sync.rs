@@ -19,7 +19,7 @@
 //! per received header, and `RemoteHeaderCoordinator`'s existing
 //! `on_committed_header_received` path runs QC verification and admission
 //! in the usual way. Each header's `RemoteHeaderAdmitted` continuation
-//! feeds back into `SyncInput::HeaderAdmitted`, advancing the per-shard
+//! feeds back into `RemoteHeaderSyncInput::HeaderAdmitted`, advancing the per-shard
 //! `committed` counter.
 
 use hyperscale_types::{BlockHeight, CommittedBlockHeader, ShardGroupId};
@@ -105,7 +105,7 @@ impl Default for RemoteHeaderSyncConfig {
 /// Inputs to the remote-header sync state machine.
 #[derive(Debug)]
 #[allow(missing_docs)] // payloads are self-describing
-pub enum SyncInput {
+pub enum RemoteHeaderSyncInput {
     /// Set or raise the sync target for `source_shard`. Idempotent if the
     /// target hasn't moved forward.
     StartSync {
@@ -144,7 +144,7 @@ pub enum SyncInput {
 /// Outputs from the remote-header sync state machine.
 #[derive(Debug)]
 #[allow(missing_docs)] // payloads are self-describing
-pub enum SyncOutput {
+pub enum RemoteHeaderSyncOutput {
     /// Issue a range fetch covering `[from_height, from_height + count)`
     /// from any peer in `source_shard`'s committee.
     FetchHeaders {
@@ -264,30 +264,30 @@ impl RemoteHeaderSyncProtocol {
     }
 
     /// Process an input and return outputs.
-    pub fn handle(&mut self, input: SyncInput) -> Vec<SyncOutput> {
+    pub fn handle(&mut self, input: RemoteHeaderSyncInput) -> Vec<RemoteHeaderSyncOutput> {
         match input {
-            SyncInput::StartSync {
+            RemoteHeaderSyncInput::StartSync {
                 source_shard,
                 target,
             } => self.handle_start_sync(source_shard, target),
-            SyncInput::HeadersResponseReceived {
+            RemoteHeaderSyncInput::HeadersResponseReceived {
                 source_shard,
                 from_height,
                 count,
                 headers,
                 now,
             } => self.handle_response(source_shard, from_height, count, headers, now),
-            SyncInput::HeadersFetchFailed {
+            RemoteHeaderSyncInput::HeadersFetchFailed {
                 source_shard,
                 from_height,
                 count,
                 now,
             } => self.handle_fetch_failed(source_shard, from_height, count, now),
-            SyncInput::HeaderAdmitted {
+            RemoteHeaderSyncInput::HeaderAdmitted {
                 source_shard,
                 height,
             } => self.handle_header_admitted(source_shard, height),
-            SyncInput::Tick { now } => self.handle_tick(now),
+            RemoteHeaderSyncInput::Tick { now } => self.handle_tick(now),
         }
     }
 
@@ -299,7 +299,7 @@ impl RemoteHeaderSyncProtocol {
         &mut self,
         source_shard: ShardGroupId,
         target: BlockHeight,
-    ) -> Vec<SyncOutput> {
+    ) -> Vec<RemoteHeaderSyncOutput> {
         // Distinguish "first sync for this shard" from "raise an existing
         // target": a freshly created entry has `target == BlockHeight::GENESIS`,
         // so we always proceed into the window-queue path on its first call.
@@ -332,8 +332,8 @@ impl RemoteHeaderSyncProtocol {
         count: u64,
         headers: Vec<CommittedBlockHeader>,
         now: Instant,
-    ) -> Vec<SyncOutput> {
-        let mut outputs: Vec<SyncOutput> = Vec::with_capacity(headers.len());
+    ) -> Vec<RemoteHeaderSyncOutput> {
+        let mut outputs: Vec<RemoteHeaderSyncOutput> = Vec::with_capacity(headers.len());
         let Some(state) = self.shards.get_mut(&source_shard) else {
             // No shard state — input arrived after sync was reset.
             return outputs;
@@ -358,7 +358,7 @@ impl RemoteHeaderSyncProtocol {
                 continue;
             }
             delivered.insert(h);
-            outputs.push(SyncOutput::DeliverHeader {
+            outputs.push(RemoteHeaderSyncOutput::DeliverHeader {
                 source_shard,
                 header: Box::new(header),
             });
@@ -395,7 +395,7 @@ impl RemoteHeaderSyncProtocol {
         from_height: BlockHeight,
         count: u64,
         now: Instant,
-    ) -> Vec<SyncOutput> {
+    ) -> Vec<RemoteHeaderSyncOutput> {
         let Some(state) = self.shards.get_mut(&source_shard) else {
             return vec![];
         };
@@ -415,7 +415,7 @@ impl RemoteHeaderSyncProtocol {
         &mut self,
         source_shard: ShardGroupId,
         height: BlockHeight,
-    ) -> Vec<SyncOutput> {
+    ) -> Vec<RemoteHeaderSyncOutput> {
         let Some(state) = self.shards.get_mut(&source_shard) else {
             return vec![];
         };
@@ -437,7 +437,7 @@ impl RemoteHeaderSyncProtocol {
                 height = state.committed.0,
                 "remote-header sync: caught up"
             );
-            outputs.push(SyncOutput::SyncComplete {
+            outputs.push(RemoteHeaderSyncOutput::SyncComplete {
                 source_shard,
                 height: state.committed,
             });
@@ -451,7 +451,7 @@ impl RemoteHeaderSyncProtocol {
         outputs
     }
 
-    fn handle_tick(&mut self, now: Instant) -> Vec<SyncOutput> {
+    fn handle_tick(&mut self, now: Instant) -> Vec<RemoteHeaderSyncOutput> {
         for state in self.shards.values_mut() {
             // Promote ready deferred heights back into the heap.
             let ready: Vec<BlockHeight> = state
@@ -495,7 +495,7 @@ impl RemoteHeaderSyncProtocol {
     /// Pack contiguous heights from `heights_to_fetch` into `FetchHeaders`
     /// outputs, respecting `max_concurrent_fetches_per_shard` and
     /// `max_headers_per_fetch`.
-    fn emit_fetch_outputs(&mut self) -> Vec<SyncOutput> {
+    fn emit_fetch_outputs(&mut self) -> Vec<RemoteHeaderSyncOutput> {
         let mut outputs = Vec::new();
         let max_per = self.config.max_headers_per_fetch;
         let max_concurrent = self.config.max_concurrent_fetches_per_shard;
@@ -533,7 +533,7 @@ impl RemoteHeaderSyncProtocol {
                     count,
                     "remote-header sync: emitting range fetch"
                 );
-                outputs.push(SyncOutput::FetchHeaders {
+                outputs.push(RemoteHeaderSyncOutput::FetchHeaders {
                     source_shard: shard_id,
                     from_height: range_start,
                     count,
@@ -571,7 +571,7 @@ mod tests {
     #[test]
     fn start_sync_queues_window_and_emits_first_range() {
         let mut p = RemoteHeaderSyncProtocol::new(cfg());
-        let outputs = p.handle(SyncInput::StartSync {
+        let outputs = p.handle(RemoteHeaderSyncInput::StartSync {
             source_shard: shard(1),
             target: BlockHeight(20),
         });
@@ -580,7 +580,7 @@ mod tests {
         let fetches: Vec<_> = outputs
             .iter()
             .filter_map(|o| match o {
-                SyncOutput::FetchHeaders {
+                RemoteHeaderSyncOutput::FetchHeaders {
                     source_shard,
                     from_height,
                     count,
@@ -596,7 +596,7 @@ mod tests {
     #[test]
     fn response_delivers_headers_and_admit_advances_committed() {
         let mut p = RemoteHeaderSyncProtocol::new(cfg());
-        let _ = p.handle(SyncInput::StartSync {
+        let _ = p.handle(RemoteHeaderSyncInput::StartSync {
             source_shard: shard(1),
             target: BlockHeight(20),
         });
@@ -605,7 +605,7 @@ mod tests {
         let headers = (1..=8)
             .map(|h| header_at(shard(1), BlockHeight(h)))
             .collect();
-        let outputs = p.handle(SyncInput::HeadersResponseReceived {
+        let outputs = p.handle(RemoteHeaderSyncInput::HeadersResponseReceived {
             source_shard: shard(1),
             from_height: BlockHeight(1),
             count: 8,
@@ -615,13 +615,13 @@ mod tests {
 
         let delivered = outputs
             .iter()
-            .filter(|o| matches!(o, SyncOutput::DeliverHeader { .. }))
+            .filter(|o| matches!(o, RemoteHeaderSyncOutput::DeliverHeader { .. }))
             .count();
         assert_eq!(delivered, 8);
 
         // Admit each one and verify completion fires when target reached.
         for h in 1..=8 {
-            let _ = p.handle(SyncInput::HeaderAdmitted {
+            let _ = p.handle(RemoteHeaderSyncInput::HeaderAdmitted {
                 source_shard: shard(1),
                 height: BlockHeight(h),
             });
@@ -633,13 +633,13 @@ mod tests {
     #[test]
     fn fetch_failed_defers_failed_heights_until_backoff() {
         let mut p = RemoteHeaderSyncProtocol::new(cfg());
-        let _ = p.handle(SyncInput::StartSync {
+        let _ = p.handle(RemoteHeaderSyncInput::StartSync {
             source_shard: shard(1),
             target: BlockHeight(8),
         });
         let now = Instant::now();
         // Both initial ranges go in-flight. Fail the first one.
-        let _ = p.handle(SyncInput::HeadersFetchFailed {
+        let _ = p.handle(RemoteHeaderSyncInput::HeadersFetchFailed {
             source_shard: shard(1),
             from_height: BlockHeight(1),
             count: 8,
@@ -648,25 +648,25 @@ mod tests {
         assert!(p.has_deferred());
 
         // Tick before backoff: failed heights stay parked.
-        let outputs = p.handle(SyncInput::Tick {
+        let outputs = p.handle(RemoteHeaderSyncInput::Tick {
             now: now + Duration::from_millis(500),
         });
         let refires_low = outputs.iter().any(|o| {
             matches!(
                 o,
-                SyncOutput::FetchHeaders { from_height, .. } if from_height.0 <= 8
+                RemoteHeaderSyncOutput::FetchHeaders { from_height, .. } if from_height.0 <= 8
             )
         });
         assert!(!refires_low, "deferred heights must wait out backoff");
 
         // Tick past first-round backoff (1s): heights re-emerge.
-        let outputs = p.handle(SyncInput::Tick {
+        let outputs = p.handle(RemoteHeaderSyncInput::Tick {
             now: now + Duration::from_secs(2),
         });
         let refires_low = outputs.iter().any(|o| {
             matches!(
                 o,
-                SyncOutput::FetchHeaders { from_height, .. } if from_height.0 == 1
+                RemoteHeaderSyncOutput::FetchHeaders { from_height, .. } if from_height.0 == 1
             )
         });
         assert!(refires_low, "expected re-emission after backoff");
@@ -675,7 +675,7 @@ mod tests {
     #[test]
     fn partial_response_defers_short_capped_heights() {
         let mut p = RemoteHeaderSyncProtocol::new(cfg());
-        let _ = p.handle(SyncInput::StartSync {
+        let _ = p.handle(RemoteHeaderSyncInput::StartSync {
             source_shard: shard(1),
             target: BlockHeight(20),
         });
@@ -684,7 +684,7 @@ mod tests {
         let headers = (1..=5)
             .map(|h| header_at(shard(1), BlockHeight(h)))
             .collect();
-        let _ = p.handle(SyncInput::HeadersResponseReceived {
+        let _ = p.handle(RemoteHeaderSyncInput::HeadersResponseReceived {
             source_shard: shard(1),
             from_height: BlockHeight(1),
             count: 8,
@@ -702,17 +702,17 @@ mod tests {
             sync_window_size: 32,
             max_concurrent_fetches_per_shard: 1,
         });
-        let _ = p.handle(SyncInput::StartSync {
+        let _ = p.handle(RemoteHeaderSyncInput::StartSync {
             source_shard: shard(1),
             target: BlockHeight(2),
         });
         for h in 1..=2 {
-            let _ = p.handle(SyncInput::HeaderAdmitted {
+            let _ = p.handle(RemoteHeaderSyncInput::HeaderAdmitted {
                 source_shard: shard(1),
                 height: BlockHeight(h),
             });
         }
-        let outputs = p.handle(SyncInput::HeaderAdmitted {
+        let outputs = p.handle(RemoteHeaderSyncInput::HeaderAdmitted {
             source_shard: shard(1),
             height: BlockHeight(2),
         });
@@ -725,17 +725,17 @@ mod tests {
     #[test]
     fn shards_progress_independently() {
         let mut p = RemoteHeaderSyncProtocol::new(cfg());
-        let _ = p.handle(SyncInput::StartSync {
+        let _ = p.handle(RemoteHeaderSyncInput::StartSync {
             source_shard: shard(1),
             target: BlockHeight(10),
         });
-        let _ = p.handle(SyncInput::StartSync {
+        let _ = p.handle(RemoteHeaderSyncInput::StartSync {
             source_shard: shard(2),
             target: BlockHeight(20),
         });
         // Admit shard 1 fully; shard 2 still needs work.
         for h in 1..=10 {
-            let _ = p.handle(SyncInput::HeaderAdmitted {
+            let _ = p.handle(RemoteHeaderSyncInput::HeaderAdmitted {
                 source_shard: shard(1),
                 height: BlockHeight(h),
             });

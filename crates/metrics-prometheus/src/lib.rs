@@ -970,7 +970,7 @@ impl MetricsRecorder for PrometheusRecorder {
 
     // ── Sync ─────────────────────────────────────────────────────────
 
-    fn set_sync_status(&self, blocks_behind: u64, in_progress: bool) {
+    fn set_block_sync_status(&self, blocks_behind: u64, in_progress: bool) {
         self.metrics.sync_blocks_behind.set(blocks_behind as f64);
         self.metrics
             .sync_in_progress
@@ -1359,11 +1359,11 @@ impl MetricsRecorder for PrometheusRecorder {
         self.metrics
             .memory_node
             .with_label_values(&["sync_queued_heights"])
-            .set(m.node_sync_queued_heights as f64);
+            .set(m.node_block_sync_queued_heights as f64);
         self.metrics
             .memory_node
             .with_label_values(&["sync_in_flight_fetches"])
-            .set(m.node_sync_in_flight_fetches as f64);
+            .set(m.node_block_sync_in_flight_fetches as f64);
         self.metrics
             .memory_node
             .with_label_values(&["tx_fetch_blocks"])

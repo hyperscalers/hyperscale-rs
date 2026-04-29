@@ -187,9 +187,9 @@ pub struct MemoryMetrics {
     /// Committed headers queued in the verification batch.
     pub node_committed_header_batch: usize,
     /// Block heights queued for sync fetch.
-    pub node_sync_queued_heights: usize,
+    pub node_block_sync_queued_heights: usize,
     /// In-flight sync fetches.
-    pub node_sync_in_flight_fetches: usize,
+    pub node_block_sync_in_flight_fetches: usize,
     /// Blocks with pending transaction fetches.
     pub node_tx_fetch_blocks: usize,
     /// Blocks with pending local provision fetches.
@@ -355,7 +355,7 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     // ── Sync ─────────────────────────────────────────────────────────
 
     /// Set sync status gauges.
-    fn set_sync_status(&self, blocks_behind: u64, in_progress: bool) {}
+    fn set_block_sync_status(&self, blocks_behind: u64, in_progress: bool) {}
 
     /// Record a sync block downloaded.
     fn record_sync_block_downloaded(&self) {}
@@ -766,8 +766,8 @@ pub fn record_early_arrival_eviction() {
 
 /// Set sync status gauges.
 #[inline]
-pub fn set_sync_status(blocks_behind: u64, in_progress: bool) {
-    recorder().set_sync_status(blocks_behind, in_progress);
+pub fn set_block_sync_status(blocks_behind: u64, in_progress: bool) {
+    recorder().set_block_sync_status(blocks_behind, in_progress);
 }
 
 /// Record a sync block downloaded.

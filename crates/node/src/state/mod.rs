@@ -30,8 +30,8 @@ pub type NodeIndex = u32;
 /// in `BftCoordinator` (HotStuff-2 style).
 ///
 /// The block-sync protocol itself lives on `IoLoop` (in
-/// `io_loop::protocol::sync`); when a synced block is ready to apply,
-/// `IoLoop` fires a `SyncBlockReadyToApply` event into this state machine,
+/// `io_loop::protocol::block_sync`); when a synced block is ready to apply,
+/// `IoLoop` fires a `BlockSyncReadyToApply` event into this state machine,
 /// which routes it to BFT.
 pub struct NodeStateMachine {
     /// This node's index (simulation-only, for routing).
@@ -227,8 +227,8 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::TransactionsAdmitted { .. }) => self.handle_transaction(evt),
 
             // ── Sync ─────────────────────────────────────────────────────
-            evt @ (ProtocolEvent::SyncBlockReadyToApply { .. }
-            | ProtocolEvent::SyncProtocolComplete { .. }
+            evt @ (ProtocolEvent::BlockSyncReadyToApply { .. }
+            | ProtocolEvent::BlockSyncComplete { .. }
             | ProtocolEvent::RemoteHeaderSyncProtocolComplete { .. }
             | ProtocolEvent::CommittedStateRestored { .. }) => self.handle_sync(evt),
 

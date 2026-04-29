@@ -84,12 +84,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, instrument, trace, warn};
 
+use crate::block_sync::{BlockSyncManager, BlockSyncVerificationResult};
 use crate::chain_view::ChainView;
 use crate::commit_pipeline::CommitPipeline;
 use crate::config::BftConfig;
 use crate::pending::PendingBlock;
 use crate::proposal::{ProposalKind, ProposalTracker, TakeResult};
-use crate::sync::{SyncManager, SyncVerificationResult};
 use crate::tx_cache::CommittedTxCache;
 use crate::verification::{InFlightCheck, VerificationPipeline};
 use crate::view_change::ViewChangeController;
@@ -187,7 +187,7 @@ pub struct BftCoordinator {
     verification: VerificationPipeline,
 
     /// Sync coordination (block buffering, verification tracking, sync flag).
-    sync: SyncManager,
+    block_sync: BlockSyncManager,
 
     /// In-flight proposal awaiting `Event::ProposalBuilt` callback.
     proposal: ProposalTracker,
@@ -251,7 +251,7 @@ impl BftCoordinator {
             votes: VoteKeeper::new(),
             commits: CommitPipeline::new(),
             verification: VerificationPipeline::new(recovered.committed_height),
-            sync: SyncManager::new(),
+            block_sync: BlockSyncManager::new(),
             proposal: ProposalTracker::new(),
             tx_cache: CommittedTxCache::new(),
             config,
@@ -299,13 +299,13 @@ impl BftCoordinator {
     /// When syncing:
     /// - Proposer will create empty "sync blocks" instead of skipping their turn
     /// - View changes are suppressed (we're intentionally behind)
-    fn set_syncing(&mut self, topology: &TopologySnapshot, syncing: bool) {
-        if syncing && !self.sync.is_syncing() {
+    fn set_block_syncing(&mut self, topology: &TopologySnapshot, syncing: bool) {
+        if syncing && !self.block_sync.is_syncing() {
             info!(
                 validator = ?topology.local_validator_id(),
                 "Entering sync mode - will propose empty blocks if selected"
             );
-        } else if !syncing && self.sync.is_syncing() {
+        } else if !syncing && self.block_sync.is_syncing() {
             info!(
                 validator = ?topology.local_validator_id(),
                 "Exiting sync mode - resuming normal block production"
@@ -313,20 +313,20 @@ impl BftCoordinator {
             // Reset leader activity timeout since we've caught up
             self.view_change.last_leader_activity = Some(self.now);
         }
-        self.sync.set_syncing(syncing);
+        self.block_sync.set_syncing(syncing);
     }
 
     /// Check if this validator is currently syncing.
     #[must_use]
-    pub const fn is_syncing(&self) -> bool {
-        self.sync.is_syncing()
+    pub const fn is_block_syncing(&self) -> bool {
+        self.block_sync.is_syncing()
     }
 
     /// Start syncing to catch up to the network.
     ///
     /// This is the single entry point for initiating sync. It:
     /// 1. Sets the syncing flag immediately (enables sync block proposals, suppresses fetches)
-    /// 2. Returns the `StartSync` action for the runner to begin fetching blocks
+    /// 2. Returns the `StartBlockSync` action for the runner to begin fetching blocks
     ///
     /// Setting the syncing flag immediately (rather than waiting for the first synced block)
     /// ensures that:
@@ -335,16 +335,16 @@ impl BftCoordinator {
     /// - The state machine accurately reflects that we're waiting for sync data
     ///
     /// The syncing flag will be cleared when `Event::SyncComplete` arrives.
-    fn start_sync(
+    fn start_block_sync(
         &mut self,
         topology: &TopologySnapshot,
         target_height: BlockHeight,
     ) -> Vec<Action> {
         // Don't raise the target while already syncing. The io_loop's
-        // SyncProtocol manages its own target internally. Once the current
+        // BlockSyncProtocol manages its own target internally. Once the current
         // sync completes and we resume consensus, a new start_sync will
         // fire naturally if we're still behind.
-        if self.sync.is_syncing() {
+        if self.block_sync.is_syncing() {
             return vec![];
         }
 
@@ -359,27 +359,29 @@ impl BftCoordinator {
         // - Enables sync block proposals if we're the proposer
         // - Suppresses fetch requests (check_pending_block_fetches returns empty)
         // - Signals to other code that we're catching up
-        self.set_syncing(topology, true);
-        self.sync.set_sync_target(target_height);
+        self.set_block_syncing(topology, true);
+        self.block_sync.set_sync_target(target_height);
 
-        vec![Action::StartSync { target_height }]
+        vec![Action::StartBlockSync { target_height }]
     }
 
     /// Handle a synced block ready to apply (from runner via
-    /// `Event::SyncBlockReadyToApply`). Delegates the dedup/routing
-    /// decision to [`SyncManager::ingest`] and translates the outcome into
+    /// `Event::BlockSyncReadyToApply`). Delegates the dedup/routing
+    /// decision to [`BlockSyncManager::ingest`] and translates the outcome into
     /// a submit dispatch or a buffer drain.
     pub fn on_sync_block_ready_to_apply(
         &mut self,
         topology: &TopologySnapshot,
         certified: CertifiedBlock,
     ) -> Vec<Action> {
-        match self.sync.ingest(certified, self.committed_height) {
-            crate::sync::IngestOutcome::Drop => vec![],
-            crate::sync::IngestOutcome::Submit(certified) => {
+        match self.block_sync.ingest(certified, self.committed_height) {
+            crate::block_sync::IngestOutcome::Drop => vec![],
+            crate::block_sync::IngestOutcome::Submit(certified) => {
                 self.submit_synced_block_for_verification(topology, *certified)
             }
-            crate::sync::IngestOutcome::Buffered => self.try_drain_buffered_synced_blocks(topology),
+            crate::block_sync::IngestOutcome::Buffered => {
+                self.try_drain_buffered_synced_blocks(topology)
+            }
         }
     }
 
@@ -390,14 +392,14 @@ impl BftCoordinator {
     /// since fetching was suppressed during sync.
     ///
     /// `NodeStateMachine` flushes expected remote headers and provisions in
-    /// the same `SyncProtocolComplete` arm, so this returns only BFT-local
+    /// the same `BlockSyncComplete` arm, so this returns only BFT-local
     /// resume actions.
-    pub fn on_sync_complete(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
+    pub fn on_block_sync_complete(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
         info!(
             validator = ?topology.local_validator_id(),
             "Sync complete, resuming normal consensus"
         );
-        self.set_syncing(topology, false);
+        self.set_block_syncing(topology, false);
 
         // Resume fetching for any pending blocks that still need data.
         // During sync, check_pending_block_fetches() returns empty because we
@@ -470,7 +472,7 @@ impl BftCoordinator {
             .any(|pb| pb.header().height.0 == next_height && !pb.is_complete());
         if self.verification.has_verification_in_flight()
             || has_incomplete_block_at_tip
-            || self.sync.has_unverified_in_flight()
+            || self.block_sync.has_unverified_in_flight()
         {
             return false;
         }
@@ -663,7 +665,7 @@ impl BftCoordinator {
 
         // Syncing validators propose an empty sync block to keep the chain
         // advancing while catching up on execution state.
-        if self.sync.is_syncing() {
+        if self.block_sync.is_syncing() {
             return self.build_and_dispatch_proposal(
                 topology,
                 next_height,
@@ -1024,7 +1026,7 @@ impl BftCoordinator {
                 target_height = parent_height.0,
                 "Missing parent block, triggering sync (continuing to process header)"
             );
-            actions = self.start_sync(topology, parent_height);
+            actions = self.start_block_sync(topology, parent_height);
         }
 
         // Only adopt the QC if we have the parent it certifies — otherwise we
@@ -1582,16 +1584,16 @@ impl BftCoordinator {
         info!(
             block_hash = ?block_hash,
             valid,
-            pending_sync_count = self.sync.pending_verification_count(),
+            pending_sync_count = self.block_sync.pending_verification_count(),
             pending_consensus_count = self.verification.pending_qc_count(),
             "on_qc_signature_verified: received callback"
         );
-        if let Some(result) = self.sync.on_qc_verified(block_hash, valid) {
+        if let Some(result) = self.block_sync.on_qc_verified(block_hash, valid) {
             return match result {
                 // Even on failure, try applying verified blocks below the gap.
                 // The failed block creates a gap that blocks further progress,
                 // but blocks already verified at lower heights can still apply.
-                SyncVerificationResult::Failed | SyncVerificationResult::Verified => {
+                BlockSyncVerificationResult::Failed | BlockSyncVerificationResult::Verified => {
                     self.try_apply_verified_synced_blocks(topology)
                 }
             };
@@ -1810,11 +1812,11 @@ impl BftCoordinator {
         // Auto-resume from sync the moment persistence catches up to the
         // sync target: a single event carries the signal, so there's no
         // room for ordering races between sync completion and persistence.
-        if self.sync.is_syncing()
-            && let Some(target) = self.sync.sync_target_height()
+        if self.block_sync.is_syncing()
+            && let Some(target) = self.block_sync.sync_target_height()
             && block_height >= target
         {
-            return self.on_sync_complete(topology);
+            return self.on_block_sync_complete(topology);
         }
         vec![]
     }
@@ -2333,15 +2335,18 @@ impl BftCoordinator {
             return vec![];
         };
 
-        vec![self.sync.register_for_verification(certified, public_keys)]
+        vec![
+            self.block_sync
+                .register_for_verification(certified, public_keys),
+        ]
     }
 
     /// Try to drain buffered synced blocks in sequential order. Asks
-    /// [`SyncManager::next_submitable`] which blocks are eligible — the
+    /// [`BlockSyncManager::next_submitable`] which blocks are eligible — the
     /// coordinator just dispatches each for QC verification.
     fn try_drain_buffered_synced_blocks(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
         let mut actions = Vec::new();
-        let blocks = self.sync.next_submitable(
+        let blocks = self.block_sync.next_submitable(
             self.committed_height,
             self.config.max_parallel_sync_verifications,
         );
@@ -2382,7 +2387,7 @@ impl BftCoordinator {
         // bug, or byzantine serving). Applying such a block would feed the
         // peer's divergent `LocalReceipt.database_updates` into our
         // `pending_chain` overlay and substate DB, corrupting subsequent
-        // reads. Reject at ingress; `SyncProtocol` re-attempts the height.
+        // reads. Reject at ingress; `BlockSyncProtocol` re-attempts the height.
         for fw in block.certificates() {
             if let Err(err) = fw.validate_receipts_against_ec() {
                 warn!(
@@ -2409,7 +2414,7 @@ impl BftCoordinator {
         self.record_block_committed(&block, block_hash, qc.weighted_timestamp);
 
         // Track sync progress for the loop iterator.
-        self.sync.set_sync_applied_height(height);
+        self.block_sync.set_sync_applied_height(height);
 
         // Update latest QC if this one is newer.
         if self
@@ -2461,7 +2466,7 @@ impl BftCoordinator {
     /// double-apply blocks already handed off.
     fn try_apply_verified_synced_blocks(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
         let mut actions = Vec::new();
-        while let Some(certified) = self.sync.take_next_verified(self.committed_height) {
+        while let Some(certified) = self.block_sync.take_next_verified(self.committed_height) {
             actions.extend(self.apply_synced_block(topology, certified));
         }
         actions.extend(self.try_drain_buffered_synced_blocks(topology));
@@ -2888,7 +2893,7 @@ impl BftCoordinator {
         // Remote headers are pruned per-shard-tip at insertion time, not by
         // local committed height (remote shards have independent heights).
 
-        self.sync.cleanup(committed_height);
+        self.block_sync.cleanup(committed_height);
         self.verification
             .cleanup(&self.pending_blocks, committed_height);
     }
@@ -2896,7 +2901,7 @@ impl BftCoordinator {
     /// Check pending blocks and emit fetch requests for those that have been
     /// waiting longer than the configured timeout.
     ///
-    /// Suppressed while syncing so `SyncProtocol`'s block deliveries aren't
+    /// Suppressed while syncing so `BlockSyncProtocol`'s block deliveries aren't
     /// starved by gossip-fetch requests competing for the same slots.
     #[must_use]
     pub fn check_pending_block_fetches(
@@ -2904,7 +2909,7 @@ impl BftCoordinator {
         topology: &TopologySnapshot,
         force_immediate: bool,
     ) -> Vec<Action> {
-        if self.sync.is_syncing() {
+        if self.block_sync.is_syncing() {
             return vec![];
         }
 
@@ -2919,13 +2924,13 @@ impl BftCoordinator {
 
     /// Check if we're behind and need to catch up via sync. Called
     /// periodically by the cleanup timer. Delegates the decision to
-    /// [`SyncManager::health_check`] and translates a trigger into a
+    /// [`BlockSyncManager::health_check`] and translates a trigger into a
     /// `start_sync`.
     pub fn check_sync_health(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
         let next_needed_height = self.committed_height.next();
         let has_next_block = self.has_complete_block_at_height(next_needed_height);
 
-        match self.sync.health_check(
+        match self.block_sync.health_check(
             topology,
             self.committed_height,
             self.latest_qc.as_ref(),
@@ -2933,9 +2938,9 @@ impl BftCoordinator {
             &self.commits,
             self.pending_blocks.len(),
         ) {
-            crate::sync::SyncHealthDecision::Idle => vec![],
-            crate::sync::SyncHealthDecision::TriggerSync { target_height } => {
-                self.start_sync(topology, target_height)
+            crate::block_sync::BlockSyncHealthDecision::Idle => vec![],
+            crate::block_sync::BlockSyncHealthDecision::TriggerSync { target_height } => {
+                self.start_block_sync(topology, target_height)
             }
         }
     }
@@ -3073,8 +3078,8 @@ impl BftCoordinator {
             pending_state_root_verifications: self
                 .verification
                 .pending_state_root_verifications_len(),
-            buffered_synced_blocks: self.sync.buffered_synced_blocks_len(),
-            pending_synced_block_verifications: self.sync.pending_verification_count(),
+            buffered_synced_blocks: self.block_sync.buffered_synced_blocks_len(),
+            pending_synced_block_verifications: self.block_sync.pending_verification_count(),
         }
     }
 
@@ -3178,12 +3183,12 @@ impl BftCoordinator {
         }
 
         // In pending synced block verifications (synced blocks are always complete)
-        if self.sync.has_pending_at_height(height) {
+        if self.block_sync.has_pending_at_height(height) {
             return true;
         }
 
         // In buffered synced blocks (synced blocks are always complete)
-        if self.sync.has_buffered_height(height) {
+        if self.block_sync.has_buffered_height(height) {
             return true;
         }
 
@@ -4091,8 +4096,8 @@ mod tests {
             )
         });
 
-        state.set_syncing(&topology, true);
-        assert!(state.is_syncing());
+        state.set_block_syncing(&topology, true);
+        assert!(state.is_block_syncing());
 
         // Ready txs must be dropped — sync blocks are always empty.
         let ready_txs = vec![Arc::new(hyperscale_types::test_utils::test_transaction(1))];
@@ -4135,7 +4140,7 @@ mod tests {
                 BlockHeight(3),
             )
         });
-        state.set_syncing(&topology, true);
+        state.set_block_syncing(&topology, true);
 
         let actions = state.try_propose(&topology, &[], vec![], vec![]);
         let Some(Action::BuildProposal { timestamp, .. }) = actions
@@ -4151,14 +4156,14 @@ mod tests {
     #[test]
     fn test_sync_complete_exits_sync_mode() {
         let (mut state, topology) = make_test_state();
-        state.set_syncing(&topology, true);
-        assert!(state.is_syncing());
+        state.set_block_syncing(&topology, true);
+        assert!(state.is_block_syncing());
 
         // Fresh state has no pending blocks, so on_sync_complete returns
         // no actions — the remote-header / provision flushes happen in
-        // NodeStateMachine's SyncProtocolComplete arm.
-        let actions = state.on_sync_complete(&topology);
-        assert!(!state.is_syncing());
+        // NodeStateMachine's BlockSyncComplete arm.
+        let actions = state.on_block_sync_complete(&topology);
+        assert!(!state.is_block_syncing());
         assert!(actions.is_empty());
     }
 
@@ -4168,7 +4173,7 @@ mod tests {
         // blocks once verification completes.
         let (mut state, topology) = make_multi_validator_state();
         state.set_time(LocalTimestamp::from_millis(100_000));
-        state.set_syncing(&topology, true);
+        state.set_block_syncing(&topology, true);
 
         let block_hash = BlockHash::from_raw(Hash::from_bytes(b"other_proposer_block"));
         let height = BlockHeight(1);
@@ -4192,7 +4197,7 @@ mod tests {
         state.view_change.last_leader_activity = Some(LocalTimestamp::ZERO);
 
         assert!(state.should_advance_round());
-        state.set_syncing(&topology, true);
+        state.set_block_syncing(&topology, true);
         assert!(state.should_advance_round());
         assert!(state.check_round_timeout(&topology).is_some());
     }
@@ -4205,8 +4210,8 @@ mod tests {
         state.set_time(LocalTimestamp::from_millis(100_000));
         state.view_change.last_leader_activity = Some(LocalTimestamp::ZERO);
 
-        state.set_syncing(&topology, true);
-        state.on_sync_complete(&topology);
+        state.set_block_syncing(&topology, true);
+        state.on_block_sync_complete(&topology);
 
         assert_eq!(
             state.view_change.last_leader_activity,
@@ -4219,7 +4224,7 @@ mod tests {
         // Vote locking applies during sync just as in normal operation.
         let (mut state, topology) = make_multi_validator_state();
         state.set_time(LocalTimestamp::from_millis(100_000));
-        state.set_syncing(&topology, true);
+        state.set_block_syncing(&topology, true);
 
         let height = BlockHeight(1);
         let block_a = BlockHash::from_raw(Hash::from_bytes(b"block_a"));
@@ -4246,11 +4251,11 @@ mod tests {
 
     #[test]
     fn test_start_sync_sets_syncing_flag() {
-        // check_sync_health triggers StartSync when the gap to latest_qc is
+        // check_sync_health triggers StartBlockSync when the gap to latest_qc is
         // large (>3) without a pending commit.
         let (mut state, topology) = make_test_state();
         state.set_time(LocalTimestamp::from_millis(100_000));
-        assert!(!state.is_syncing());
+        assert!(!state.is_block_syncing());
 
         state.latest_qc = Some(QuorumCertificate {
             parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"block_4")),
@@ -4262,11 +4267,11 @@ mod tests {
         });
         let actions = state.check_sync_health(&topology);
 
-        assert!(state.is_syncing());
+        assert!(state.is_block_syncing());
         assert!(
             actions
                 .iter()
-                .any(|a| matches!(a, Action::StartSync { .. }))
+                .any(|a| matches!(a, Action::StartBlockSync { .. }))
         );
     }
 
@@ -4296,7 +4301,7 @@ mod tests {
 
         let actions = state.on_sync_block_ready_to_apply(&topology, certified);
         assert!(actions.is_empty());
-        assert!(!state.is_syncing());
+        assert!(!state.is_block_syncing());
     }
 
     #[test]
@@ -4314,7 +4319,7 @@ mod tests {
                 BlockHeight(3),
             )
         });
-        state.set_syncing(&topology, true);
+        state.set_block_syncing(&topology, true);
         let _ = state.try_propose(&topology, &[], vec![], vec![]);
 
         assert_eq!(
@@ -4342,14 +4347,14 @@ mod tests {
             )
         });
 
-        state.set_syncing(&topology, true);
+        state.set_block_syncing(&topology, true);
         let sync_actions = state.build_and_dispatch_proposal(
             &topology,
             BlockHeight(4),
             Round(0),
             ProposalKind::Sync,
         );
-        state.set_syncing(&topology, false);
+        state.set_block_syncing(&topology, false);
 
         state.pending_blocks.clear();
         state.commits.certified_blocks.clear();
@@ -4396,7 +4401,7 @@ mod tests {
                 BlockHeight(3),
             )
         });
-        state.set_syncing(&topology, true);
+        state.set_block_syncing(&topology, true);
 
         let actions = state.try_propose(&topology, &[], vec![], vec![]);
         assert!(

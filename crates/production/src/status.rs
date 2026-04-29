@@ -1,6 +1,6 @@
 //! Production-specific sync status types.
 
-use hyperscale_node::SyncStateKind;
+use hyperscale_node::BlockSyncStateKind;
 use serde::Serialize;
 
 /// Sync status for external APIs.
@@ -10,7 +10,7 @@ use serde::Serialize;
 #[derive(Debug, Clone, Serialize)]
 pub struct SyncStatus {
     /// Current sync state ("idle" or "syncing").
-    pub state: SyncStateKind,
+    pub state: BlockSyncStateKind,
     /// Current committed height.
     pub current_height: u64,
     /// Target height (if syncing).
@@ -28,7 +28,7 @@ pub struct SyncStatus {
 impl Default for SyncStatus {
     fn default() -> Self {
         Self {
-            state: SyncStateKind::Idle,
+            state: BlockSyncStateKind::Idle,
             current_height: 0,
             target_height: None,
             blocks_behind: 0,

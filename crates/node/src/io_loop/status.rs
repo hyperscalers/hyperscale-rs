@@ -5,7 +5,7 @@
 //! — pure reads from the state machine.
 
 use crate::io_loop::IoLoop;
-use crate::io_loop::protocol::sync::SyncStatus;
+use crate::io_loop::protocol::block_sync::BlockSyncStatus;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::Engine;
 use hyperscale_network::Network;
@@ -23,7 +23,7 @@ pub struct NodeStatusSnapshot {
     pub committed_height: BlockHeight,
     pub view: u64,
     pub state_root: StateRoot,
-    pub sync: SyncStatus,
+    pub block_sync: BlockSyncStatus,
     pub mempool_pending: usize,
     /// Block committed, holding state locks until the wave certificate
     /// commits in a later block.
@@ -69,7 +69,7 @@ where
             committed_height: self.state.bft().committed_height(),
             view: self.state.bft().view().0,
             state_root,
-            sync: self.protocols.sync.status(),
+            block_sync: self.protocols.block_sync.status(),
             mempool_pending: pending,
             mempool_in_flight: in_flight,
             mempool_total: mempool.len(),

@@ -58,6 +58,7 @@
 
 pub mod action_handlers;
 
+mod block_sync;
 mod chain_view;
 mod commit_pipeline;
 mod config;
@@ -65,7 +66,6 @@ mod coordinator;
 mod lookups;
 mod pending;
 mod proposal;
-mod sync;
 mod tx_cache;
 mod validation;
 mod verification;

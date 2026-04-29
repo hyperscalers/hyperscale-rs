@@ -6,16 +6,16 @@
 //! cannot elide bodies again).
 //!
 //! Two `step()` arms route here:
-//! - `SyncBlockResponseReceived` — rehydrate the elided block, deliver
+//! - `BlockSyncResponseReceived` — rehydrate the elided block, deliver
 //!   on success or mark for full refetch on miss;
-//! - `SyncBlockFetchFailed` — signal failure to the sync FSM.
+//! - `BlockSyncFetchFailed` — signal failure to the sync FSM.
 //!
-//! The sync FSM (`super::super::protocol::sync::SyncProtocol`) is owned by
+//! The sync FSM (`super::super::protocol::block_sync::BlockSyncProtocol`) is owned by
 //! `ProtocolHost`. This module bridges its outputs to the network and
 //! threads `NodeInput::SyncBlock*` callbacks back through the event sender.
 
 use crate::io_loop::IoLoop;
-use crate::io_loop::protocol::sync::{SyncInput, SyncOutput};
+use crate::io_loop::protocol::block_sync::{BlockSyncInput, BlockSyncOutput};
 use hyperscale_core::{NodeInput, ProtocolEvent};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::Engine;
@@ -38,7 +38,7 @@ where
     /// Handle a sync block response: rehydrate the elided block against
     /// local caches; on a miss, mark the height for a full refetch and
     /// signal the sync FSM to re-queue.
-    pub(in crate::io_loop) fn handle_sync_block_response_received(
+    pub(in crate::io_loop) fn handle_block_sync_response_received(
         &mut self,
         height: BlockHeight,
         block: Option<Box<ElidedCertifiedBlock>>,
@@ -58,30 +58,33 @@ where
                 // rehydration will succeed on the retry. Signal the FSM
                 // to re-queue this height.
                 metrics::record_sync_response_error("rehydration_miss");
-                self.protocols.sync.mark_force_full_refetch(height);
+                self.protocols.block_sync.mark_force_full_refetch(height);
                 self.deliver_sync_block(height, None);
             }
         }
     }
 
     /// Handle a sync block fetch failure: signal the sync state machine.
-    pub(in crate::io_loop) fn handle_sync_block_fetch_failed(&mut self, height: BlockHeight) {
-        let outputs = self.protocols.sync.handle(SyncInput::BlockFetchFailed {
-            height,
-            now: std::time::Instant::now(),
-        });
-        self.process_sync_outputs(outputs);
+    pub(in crate::io_loop) fn handle_block_sync_fetch_failed(&mut self, height: BlockHeight) {
+        let outputs = self
+            .protocols
+            .block_sync
+            .handle(BlockSyncInput::BlockFetchFailed {
+                height,
+                now: std::time::Instant::now(),
+            });
+        self.process_block_sync_outputs(outputs);
         self.update_fetch_tick_timer();
     }
 
     // ─── Sync output processing + helpers ───────────────────────────────
 
-    /// Process `SyncProtocol` outputs internally.
+    /// Process `BlockSyncProtocol` outputs internally.
     ///
     /// `DeliverBlock` and `SyncComplete` are fed directly to the state
     /// machine (no round-trip through the runner). `FetchBlock` uses the
     /// `Network` trait.
-    pub(in crate::io_loop) fn process_sync_outputs(&mut self, outputs: Vec<SyncOutput>) {
+    pub(in crate::io_loop) fn process_block_sync_outputs(&mut self, outputs: Vec<BlockSyncOutput>) {
         // Snapshot the sync inventory once per batch so every FetchBlock in
         // this tick shares a consistent view of mempool / cert-cache /
         // provision-store membership. Built lazily: skipped entirely if
@@ -89,7 +92,7 @@ where
         let mut inventory_cache: Option<Inventory> = None;
         for output in outputs {
             match output {
-                SyncOutput::FetchBlock {
+                BlockSyncOutput::FetchBlock {
                     height,
                     target_height,
                     force_full,
@@ -115,13 +118,13 @@ where
                             match result {
                                 Ok(resp) => {
                                     let block = resp.into_elided().map(Box::new);
-                                    let _ = es.send(NodeInput::SyncBlockResponseReceived {
+                                    let _ = es.send(NodeInput::BlockSyncResponseReceived {
                                         height,
                                         block,
                                     });
                                 }
                                 Err(_) => {
-                                    let _ = es.send(NodeInput::SyncBlockFetchFailed { height });
+                                    let _ = es.send(NodeInput::BlockSyncFetchFailed { height });
                                 }
                             }
                             // Sync's "peer doesn't have this height" is
@@ -131,14 +134,14 @@ where
                         }),
                     );
                 }
-                SyncOutput::DeliverBlock { certified } => {
+                BlockSyncOutput::DeliverBlock { certified } => {
                     metrics::record_sync_block_received_by_bft();
                     metrics::record_sync_block_submitted_for_verification();
-                    self.feed_event(ProtocolEvent::SyncBlockReadyToApply {
+                    self.feed_event(ProtocolEvent::BlockSyncReadyToApply {
                         certified: *certified,
                     });
                 }
-                SyncOutput::SyncComplete { height } => {
+                BlockSyncOutput::SyncComplete { height } => {
                     tracing::info!(
                         height = height.0,
                         "Sync protocol complete, resuming consensus"
@@ -147,7 +150,7 @@ where
                     // BlockPersisted → on_block_persisted path was unreliable
                     // because BlockPersisted requires PreparedCommit which
                     // may not be available yet for synced blocks.
-                    self.feed_event(ProtocolEvent::SyncProtocolComplete { height });
+                    self.feed_event(ProtocolEvent::BlockSyncComplete { height });
                 }
             }
         }
@@ -211,17 +214,17 @@ where
         if certificate_root_valid {
             let outputs = self
                 .protocols
-                .sync
-                .handle(SyncInput::BlockResponseReceived {
+                .block_sync
+                .handle(BlockSyncInput::BlockResponseReceived {
                     height,
                     block,
                     now: std::time::Instant::now(),
                 });
-            self.process_sync_outputs(outputs);
+            self.process_block_sync_outputs(outputs);
         } else {
             let _ = self
                 .event_sender
-                .send(NodeInput::SyncBlockFetchFailed { height });
+                .send(NodeInput::BlockSyncFetchFailed { height });
         }
     }
 }

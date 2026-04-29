@@ -416,15 +416,15 @@ pub enum ProtocolEvent {
     // Sync Delivery (from IoLoop after sync protocol processing)
     // ═══════════════════════════════════════════════════════════════════════
     /// A synced block is ready to be applied to local state.
-    SyncBlockReadyToApply {
+    BlockSyncReadyToApply {
         /// The synced block + its certifying QC, ready to apply.
         certified: CertifiedBlock,
     },
 
-    /// The `io_loop`'s `SyncProtocol` has finished fetching all blocks up to
+    /// The `io_loop`'s `BlockSyncProtocol` has finished fetching all blocks up to
     /// the sync target. `BftCoordinator` should exit sync mode so it can re-enter
     /// if still behind, or resume normal consensus.
-    SyncProtocolComplete {
+    BlockSyncComplete {
         /// Height the sync protocol caught up to.
         height: BlockHeight,
     },

@@ -7,10 +7,10 @@
 //! # Usage
 //!
 //! ```text
-//! Runner ──► SyncProtocol::handle(SyncInput) ──► Vec<SyncOutput>
+//! Runner ──► BlockSyncProtocol::handle(BlockSyncInput) ──► Vec<BlockSyncOutput>
 //! ```
 //!
-//! Production: `SyncManager` wraps this, maps outputs to tokio tasks.
+//! Production: `BlockSyncManager` wraps this, maps outputs to tokio tasks.
 //! Simulation: feeds inputs/outputs synchronously via event queue.
 
 use hyperscale_metrics as metrics;
@@ -59,7 +59,7 @@ impl DeferralBackoff {
 
 /// Configuration for the sync protocol.
 #[derive(Debug, Clone)]
-pub struct SyncConfig {
+pub struct BlockSyncConfig {
     /// Maximum number of concurrent fetch requests.
     pub max_concurrent_fetches: usize,
 
@@ -68,7 +68,7 @@ pub struct SyncConfig {
     pub sync_window_size: u64,
 }
 
-impl Default for SyncConfig {
+impl Default for BlockSyncConfig {
     fn default() -> Self {
         Self {
             max_concurrent_fetches: 32,
@@ -80,14 +80,14 @@ impl Default for SyncConfig {
 /// Current sync state for external APIs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum SyncStateKind {
+pub enum BlockSyncStateKind {
     /// Not syncing, node is up to date.
     Idle,
     /// Actively fetching and applying blocks.
     Syncing,
 }
 
-impl SyncStateKind {
+impl BlockSyncStateKind {
     /// Returns a string representation for metrics/logging.
     #[must_use]
     pub const fn as_str(&self) -> &'static str {
@@ -100,9 +100,9 @@ impl SyncStateKind {
 
 /// Sync status snapshot for external APIs.
 #[derive(Debug, Clone, Serialize)]
-pub struct SyncStatus {
+pub struct BlockSyncStatus {
     /// Current sync state.
-    pub state: SyncStateKind,
+    pub state: BlockSyncStateKind,
     /// Current committed height.
     pub current_height: u64,
     /// Target height (if syncing).
@@ -115,10 +115,10 @@ pub struct SyncStatus {
     pub queued_heights: usize,
 }
 
-impl Default for SyncStatus {
+impl Default for BlockSyncStatus {
     fn default() -> Self {
         Self {
-            state: SyncStateKind::Idle,
+            state: BlockSyncStateKind::Idle,
             current_height: 0,
             target_height: None,
             blocks_behind: 0,
@@ -131,7 +131,7 @@ impl Default for SyncStatus {
 /// Inputs to the sync protocol state machine.
 #[derive(Debug)]
 #[allow(missing_docs)] // variant payloads are self-describing (height, now, block)
-pub enum SyncInput {
+pub enum BlockSyncInput {
     /// Start or update sync target.
     StartSync { target_height: BlockHeight },
     /// A block response was received.
@@ -153,7 +153,7 @@ pub enum SyncInput {
 /// Outputs from the sync protocol state machine.
 #[derive(Debug)]
 #[allow(missing_docs)] // variant payloads are self-describing (height, certified)
-pub enum SyncOutput {
+pub enum BlockSyncOutput {
     /// Request the runner to fetch a block at this height. `target_height`
     /// is the sync target, passed through to the serving peer so it can
     /// choose between `Block::Live` and `Block::Sealed`. `force_full` is
@@ -176,8 +176,8 @@ pub enum SyncOutput {
 /// Tracks which heights need fetching and validates responses.
 /// The runner drives this by calling `handle()` with inputs and
 /// executing the returned outputs.
-pub struct SyncProtocol {
-    config: SyncConfig,
+pub struct BlockSyncProtocol {
+    config: BlockSyncConfig,
     sync_target: Option<BlockHeight>,
     committed_height: BlockHeight,
     heights_to_fetch: BinaryHeap<Reverse<BlockHeight>>,
@@ -193,10 +193,10 @@ pub struct SyncProtocol {
     force_full_refetch: HashSet<BlockHeight>,
 }
 
-impl SyncProtocol {
+impl BlockSyncProtocol {
     /// Create a new sync protocol state machine.
     #[must_use]
-    pub fn new(config: SyncConfig) -> Self {
+    pub fn new(config: BlockSyncConfig) -> Self {
         Self {
             config,
             sync_target: None,
@@ -224,17 +224,17 @@ impl SyncProtocol {
     }
 
     /// Process an input and return outputs.
-    pub fn handle(&mut self, input: SyncInput) -> Vec<SyncOutput> {
+    pub fn handle(&mut self, input: BlockSyncInput) -> Vec<BlockSyncOutput> {
         match input {
-            SyncInput::StartSync { target_height } => self.handle_start_sync(target_height),
-            SyncInput::BlockResponseReceived { height, block, now } => {
+            BlockSyncInput::StartSync { target_height } => self.handle_start_sync(target_height),
+            BlockSyncInput::BlockResponseReceived { height, block, now } => {
                 self.handle_block_response(height, block.map(|b| *b), now)
             }
-            SyncInput::BlockFetchFailed { height, now } => {
+            BlockSyncInput::BlockFetchFailed { height, now } => {
                 self.handle_block_fetch_failed(height, now)
             }
-            SyncInput::BlockCommitted { height } => self.handle_block_committed(height),
-            SyncInput::Tick { now } => self.handle_tick(now),
+            BlockSyncInput::BlockCommitted { height } => self.handle_block_committed(height),
+            BlockSyncInput::Tick { now } => self.handle_tick(now),
         }
     }
 
@@ -253,12 +253,12 @@ impl SyncProtocol {
 
     /// Get current sync status.
     #[must_use]
-    pub fn status(&self) -> SyncStatus {
-        SyncStatus {
+    pub fn status(&self) -> BlockSyncStatus {
+        BlockSyncStatus {
             state: if self.sync_target.is_some() {
-                SyncStateKind::Syncing
+                BlockSyncStateKind::Syncing
             } else {
-                SyncStateKind::Idle
+                BlockSyncStateKind::Idle
             },
             current_height: self.committed_height.0,
             target_height: self.sync_target.map(|h| h.0),
@@ -274,7 +274,7 @@ impl SyncProtocol {
     // Input Handlers
     // ═══════════════════════════════════════════════════════════════════════
 
-    fn handle_start_sync(&mut self, target_height: BlockHeight) -> Vec<SyncOutput> {
+    fn handle_start_sync(&mut self, target_height: BlockHeight) -> Vec<BlockSyncOutput> {
         if self.sync_target.is_some_and(|t| t >= target_height) {
             return vec![];
         }
@@ -295,7 +295,7 @@ impl SyncProtocol {
         height: BlockHeight,
         response: Option<CertifiedBlock>,
         now: Instant,
-    ) -> Vec<SyncOutput> {
+    ) -> Vec<BlockSyncOutput> {
         self.in_flight.remove(&height);
 
         if let Some(CertifiedBlock { block, qc }) = response {
@@ -332,7 +332,7 @@ impl SyncProtocol {
             // Block validated end-to-end — drop any prior backoff for this height.
             self.deferred.remove(&height);
             let certified = CertifiedBlock::new_unchecked(block, qc);
-            let mut outputs = vec![SyncOutput::DeliverBlock {
+            let mut outputs = vec![BlockSyncOutput::DeliverBlock {
                 certified: Box::new(certified),
             }];
             outputs.extend(self.emit_fetch_outputs());
@@ -344,7 +344,11 @@ impl SyncProtocol {
         }
     }
 
-    fn handle_block_fetch_failed(&mut self, height: BlockHeight, now: Instant) -> Vec<SyncOutput> {
+    fn handle_block_fetch_failed(
+        &mut self,
+        height: BlockHeight,
+        now: Instant,
+    ) -> Vec<BlockSyncOutput> {
         self.in_flight.remove(&height);
         metrics::record_sync_response_error("fetch_failed");
         self.defer_height(height, now);
@@ -363,7 +367,7 @@ impl SyncProtocol {
         );
     }
 
-    fn handle_tick(&mut self, now: Instant) -> Vec<SyncOutput> {
+    fn handle_tick(&mut self, now: Instant) -> Vec<BlockSyncOutput> {
         // Promote ready heights into the fetch queue, but keep the clock
         // entry — consecutive failures must accumulate rounds, only a
         // successful response clears the entry.
@@ -381,7 +385,7 @@ impl SyncProtocol {
         self.emit_fetch_outputs()
     }
 
-    fn handle_block_committed(&mut self, height: BlockHeight) -> Vec<SyncOutput> {
+    fn handle_block_committed(&mut self, height: BlockHeight) -> Vec<BlockSyncOutput> {
         self.committed_height = height;
         self.remove_heights_at_or_below(height);
 
@@ -391,7 +395,7 @@ impl SyncProtocol {
                 info!(height = height.0, target = target.0, "Sync complete");
                 self.sync_target = None;
                 self.clear_height_queue();
-                return vec![SyncOutput::SyncComplete { height: target }];
+                return vec![BlockSyncOutput::SyncComplete { height: target }];
             }
 
             // Extend sliding window
@@ -461,7 +465,7 @@ impl SyncProtocol {
     /// Short-circuits when no sync target is set — heights are only queued
     /// after `handle_start_sync`, so a missing target means nothing to
     /// fetch.
-    fn emit_fetch_outputs(&mut self) -> Vec<SyncOutput> {
+    fn emit_fetch_outputs(&mut self) -> Vec<BlockSyncOutput> {
         let Some(target_height) = self.sync_target else {
             return Vec::new();
         };
@@ -469,7 +473,7 @@ impl SyncProtocol {
         while self.in_flight.len() < self.config.max_concurrent_fetches {
             if let Some(height) = self.pop_next_height() {
                 self.in_flight.insert(height);
-                outputs.push(SyncOutput::FetchBlock {
+                outputs.push(BlockSyncOutput::FetchBlock {
                     height,
                     target_height,
                     force_full: self.force_full_refetch.contains(&height),
@@ -488,27 +492,27 @@ mod tests {
 
     #[test]
     fn test_sync_config_defaults() {
-        let config = SyncConfig::default();
+        let config = BlockSyncConfig::default();
         assert_eq!(config.max_concurrent_fetches, 32);
         assert_eq!(config.sync_window_size, 64);
     }
 
     #[test]
     fn test_sync_status_default() {
-        let status = SyncStatus::default();
-        assert_eq!(status.state, SyncStateKind::Idle);
+        let status = BlockSyncStatus::default();
+        assert_eq!(status.state, BlockSyncStateKind::Idle);
         assert_eq!(status.current_height, 0);
         assert!(status.target_height.is_none());
     }
 
     #[test]
     fn test_start_sync_emits_fetches() {
-        let mut protocol = SyncProtocol::new(SyncConfig {
+        let mut protocol = BlockSyncProtocol::new(BlockSyncConfig {
             max_concurrent_fetches: 4,
             sync_window_size: 10,
         });
 
-        let outputs = protocol.handle(SyncInput::StartSync {
+        let outputs = protocol.handle(BlockSyncInput::StartSync {
             target_height: BlockHeight(5),
         });
 
@@ -516,26 +520,26 @@ mod tests {
         // Should emit FetchBlock for heights 1..=5
         let fetch_count = outputs
             .iter()
-            .filter(|o| matches!(o, SyncOutput::FetchBlock { .. }))
+            .filter(|o| matches!(o, BlockSyncOutput::FetchBlock { .. }))
             .count();
         assert_eq!(fetch_count, 4); // limited by max_concurrent_fetches
     }
 
     #[test]
     fn test_sync_complete() {
-        let mut protocol = SyncProtocol::new(SyncConfig {
+        let mut protocol = BlockSyncProtocol::new(BlockSyncConfig {
             max_concurrent_fetches: 32,
             sync_window_size: 64,
         });
 
-        protocol.handle(SyncInput::StartSync {
+        protocol.handle(BlockSyncInput::StartSync {
             target_height: BlockHeight(2),
         });
 
         assert!(protocol.is_syncing());
 
         // Commit up to target
-        let outputs = protocol.handle(SyncInput::BlockCommitted {
+        let outputs = protocol.handle(BlockSyncInput::BlockCommitted {
             height: BlockHeight(2),
         });
 
@@ -543,50 +547,50 @@ mod tests {
         assert!(
             outputs
                 .iter()
-                .any(|o| matches!(o, SyncOutput::SyncComplete { height } if height.0 == 2))
+                .any(|o| matches!(o, BlockSyncOutput::SyncComplete { height } if height.0 == 2))
         );
     }
 
     #[test]
     fn test_failed_fetch_defers_then_requeues_on_tick() {
-        let mut protocol = SyncProtocol::new(SyncConfig {
+        let mut protocol = BlockSyncProtocol::new(BlockSyncConfig {
             max_concurrent_fetches: 1,
             sync_window_size: 10,
         });
 
-        protocol.handle(SyncInput::StartSync {
+        protocol.handle(BlockSyncInput::StartSync {
             target_height: BlockHeight(1),
         });
 
         let t0 = Instant::now();
 
         // Failure parks the height — no fetch should be re-emitted yet.
-        let outputs = protocol.handle(SyncInput::BlockFetchFailed {
+        let outputs = protocol.handle(BlockSyncInput::BlockFetchFailed {
             height: BlockHeight(1),
             now: t0,
         });
         assert!(
             outputs
                 .iter()
-                .all(|o| !matches!(o, SyncOutput::FetchBlock { height, .. } if height.0 == 1)),
+                .all(|o| !matches!(o, BlockSyncOutput::FetchBlock { height, .. } if height.0 == 1)),
             "deferred height must not be re-fetched immediately"
         );
         assert!(protocol.has_deferred());
 
         // Tick before the deadline — still parked.
-        let outputs = protocol.handle(SyncInput::Tick {
+        let outputs = protocol.handle(BlockSyncInput::Tick {
             now: t0 + Duration::from_millis(100),
         });
         assert!(outputs.is_empty());
 
         // Tick past the first-round backoff (1s) — height promoted and fetched.
-        let outputs = protocol.handle(SyncInput::Tick {
+        let outputs = protocol.handle(BlockSyncInput::Tick {
             now: t0 + Duration::from_secs(2),
         });
         assert!(
             outputs
                 .iter()
-                .any(|o| matches!(o, SyncOutput::FetchBlock { height, .. } if height.0 == 1))
+                .any(|o| matches!(o, BlockSyncOutput::FetchBlock { height, .. } if height.0 == 1))
         );
         // Clock entry persists across promotion — only a successful response
         // (or commit/clear) drops it, so consecutive failures keep advancing.
@@ -595,70 +599,70 @@ mod tests {
 
     #[test]
     fn test_repeated_failures_extend_backoff() {
-        let mut protocol = SyncProtocol::new(SyncConfig {
+        let mut protocol = BlockSyncProtocol::new(BlockSyncConfig {
             max_concurrent_fetches: 1,
             sync_window_size: 10,
         });
-        protocol.handle(SyncInput::StartSync {
+        protocol.handle(BlockSyncInput::StartSync {
             target_height: BlockHeight(1),
         });
 
         let t0 = Instant::now();
-        protocol.handle(SyncInput::BlockFetchFailed {
+        protocol.handle(BlockSyncInput::BlockFetchFailed {
             height: BlockHeight(1),
             now: t0,
         });
         // Promote at t0+1s.
-        let outputs = protocol.handle(SyncInput::Tick {
+        let outputs = protocol.handle(BlockSyncInput::Tick {
             now: t0 + Duration::from_secs(1),
         });
         assert!(
             outputs
                 .iter()
-                .any(|o| matches!(o, SyncOutput::FetchBlock { height, .. } if height.0 == 1))
+                .any(|o| matches!(o, BlockSyncOutput::FetchBlock { height, .. } if height.0 == 1))
         );
 
         // Fail again — second round backoff is 2s.
         let t1 = t0 + Duration::from_secs(1);
-        protocol.handle(SyncInput::BlockFetchFailed {
+        protocol.handle(BlockSyncInput::BlockFetchFailed {
             height: BlockHeight(1),
             now: t1,
         });
         // 1s after second failure: still parked.
-        let outputs = protocol.handle(SyncInput::Tick {
+        let outputs = protocol.handle(BlockSyncInput::Tick {
             now: t1 + Duration::from_millis(1500),
         });
         assert!(
             outputs
                 .iter()
-                .all(|o| !matches!(o, SyncOutput::FetchBlock { height, .. } if height.0 == 1))
+                .all(|o| !matches!(o, BlockSyncOutput::FetchBlock { height, .. } if height.0 == 1))
         );
         // 2s after second failure: ready.
-        let outputs = protocol.handle(SyncInput::Tick {
+        let outputs = protocol.handle(BlockSyncInput::Tick {
             now: t1 + Duration::from_secs(3),
         });
         assert!(
             outputs
                 .iter()
-                .any(|o| matches!(o, SyncOutput::FetchBlock { height, .. } if height.0 == 1))
+                .any(|o| matches!(o, BlockSyncOutput::FetchBlock { height, .. } if height.0 == 1))
         );
     }
 
     #[test]
     fn force_full_refetch_propagates_to_next_fetch_output() {
-        let mut protocol = SyncProtocol::new(SyncConfig {
+        let mut protocol = BlockSyncProtocol::new(BlockSyncConfig {
             max_concurrent_fetches: 4,
             sync_window_size: 10,
         });
 
-        let outputs = protocol.handle(SyncInput::StartSync {
+        let outputs = protocol.handle(BlockSyncInput::StartSync {
             target_height: BlockHeight(3),
         });
 
         // Initial fetches: nothing flagged.
         assert!(outputs.iter().all(|o| matches!(
             o,
-            SyncOutput::FetchBlock {
+            BlockSyncOutput::FetchBlock {
                 force_full: false,
                 ..
             }
@@ -666,17 +670,17 @@ mod tests {
 
         // Mark height 2; next fetch wave for that height must carry the flag.
         protocol.mark_force_full_refetch(BlockHeight(2));
-        let outputs = protocol.handle(SyncInput::BlockFetchFailed {
+        let outputs = protocol.handle(BlockSyncInput::BlockFetchFailed {
             height: BlockHeight(2),
             now: Instant::now() + Duration::from_secs(2),
         });
         // Failure parks; tick to promote and re-emit.
         let _ = outputs;
-        let outputs = protocol.handle(SyncInput::Tick {
+        let outputs = protocol.handle(BlockSyncInput::Tick {
             now: Instant::now() + Duration::from_secs(10),
         });
         let height_2 = outputs.iter().find_map(|o| match o {
-            SyncOutput::FetchBlock {
+            BlockSyncOutput::FetchBlock {
                 height, force_full, ..
             } if height.0 == 2 => Some(*force_full),
             _ => None,
@@ -690,16 +694,16 @@ mod tests {
 
     #[test]
     fn force_full_refetch_drains_on_commit() {
-        let mut protocol = SyncProtocol::new(SyncConfig {
+        let mut protocol = BlockSyncProtocol::new(BlockSyncConfig {
             max_concurrent_fetches: 4,
             sync_window_size: 10,
         });
-        let _ = protocol.handle(SyncInput::StartSync {
+        let _ = protocol.handle(BlockSyncInput::StartSync {
             target_height: BlockHeight(3),
         });
         protocol.mark_force_full_refetch(BlockHeight(1));
         // Commit past the marked height — drain.
-        let _ = protocol.handle(SyncInput::BlockCommitted {
+        let _ = protocol.handle(BlockSyncInput::BlockCommitted {
             height: BlockHeight(1),
         });
         assert!(

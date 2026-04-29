@@ -726,15 +726,15 @@ pub enum Action {
     // ═══════════════════════════════════════════════════════════════════════
     // Runner I/O Requests (network fetches handled by the runner)
     // These request the runner to perform network I/O and deliver results
-    // back as NodeInputs (TransactionReceived, SyncBlockResponseReceived)
+    // back as NodeInputs (TransactionReceived, BlockSyncResponseReceived)
     // ═══════════════════════════════════════════════════════════════════════
     /// Request the runner to start syncing to a target height.
     ///
     /// Emitted when the state machine detects it's behind (e.g., receives a
     /// block header or QC ahead of committed height). The runner handles
     /// peer selection, fetching, validation, and delivers blocks via
-    /// `ProtocolEvent::SyncBlockReadyToApply`.
-    StartSync {
+    /// `ProtocolEvent::BlockSyncReadyToApply`.
+    StartBlockSync {
         /// The height we need to sync to.
         target_height: BlockHeight,
     },

@@ -341,11 +341,11 @@ where
             NodeInput::SubmitTransaction { tx } => self.handle_submit_transaction(tx),
 
             // ── Sync protocol ──────────────────────────────────────────
-            NodeInput::SyncBlockResponseReceived { height, block } => {
-                self.handle_sync_block_response_received(height, block);
+            NodeInput::BlockSyncResponseReceived { height, block } => {
+                self.handle_block_sync_response_received(height, block);
             }
-            NodeInput::SyncBlockFetchFailed { height } => {
-                self.handle_sync_block_fetch_failed(height);
+            NodeInput::BlockSyncFetchFailed { height } => {
+                self.handle_block_sync_fetch_failed(height);
             }
             NodeInput::RemoteHeadersResponseReceived {
                 source_shard,

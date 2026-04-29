@@ -568,10 +568,10 @@ mod tests {
     #[tokio::test]
     async fn test_sync_status_endpoint() {
         use crate::status::SyncStatus;
-        use hyperscale_node::SyncStateKind;
+        use hyperscale_node::BlockSyncStateKind;
 
         let sync_status = Arc::new(ArcSwap::new(Arc::new(SyncStatus {
-            state: SyncStateKind::Syncing,
+            state: BlockSyncStateKind::Syncing,
             current_height: 100,
             target_height: Some(200),
             blocks_behind: 100,

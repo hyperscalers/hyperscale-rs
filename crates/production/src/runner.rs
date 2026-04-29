@@ -1050,14 +1050,14 @@ fn update_rpc_state(config: &PinnedLoopConfig, snapshot: &NodeStatusSnapshot) {
     if let Some(ref sync_status) = config.sync_status {
         let current = sync_status.load();
         sync_status.store(Arc::new(SyncStatus {
-            state: snapshot.sync.state.clone(),
-            current_height: snapshot.sync.current_height,
-            target_height: snapshot.sync.target_height,
-            blocks_behind: snapshot.sync.blocks_behind,
+            state: snapshot.block_sync.state.clone(),
+            current_height: snapshot.block_sync.current_height,
+            target_height: snapshot.block_sync.target_height,
+            blocks_behind: snapshot.block_sync.blocks_behind,
             // Preserve sync_peers set by runner's collect_metrics
             sync_peers: current.sync_peers,
-            pending_fetches: snapshot.sync.pending_fetches,
-            queued_heights: snapshot.sync.queued_heights,
+            pending_fetches: snapshot.block_sync.pending_fetches,
+            queued_heights: snapshot.block_sync.queued_heights,
         }));
     }
 

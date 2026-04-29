@@ -14,9 +14,7 @@
 //! `handle_continuation`.
 
 use crate::io_loop::IoLoop;
-use crate::io_loop::protocol::remote_header_sync::{
-    SyncInput as RemoteHeaderSyncInput, SyncOutput as RemoteHeaderSyncOutput,
-};
+use crate::io_loop::protocol::remote_header_sync::{RemoteHeaderSyncInput, RemoteHeaderSyncOutput};
 use hyperscale_core::{NodeInput, ProtocolEvent};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::Engine;

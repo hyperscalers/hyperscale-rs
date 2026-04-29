@@ -1,6 +1,6 @@
 //! Sync-flow dispatch arms.
 //!
-//! When `SyncProtocolComplete` fires we fan out across all three
+//! When `BlockSyncComplete` fires we fan out across all three
 //! coordinators in one pass: BFT exits sync mode and re-issues any
 //! pending block fetches it had suppressed; remote-headers and
 //! provisions flush their expected sets so we can immediately
@@ -13,15 +13,15 @@ impl NodeStateMachine {
     /// Dispatch a sync-category `ProtocolEvent`.
     pub(super) fn handle_sync(&mut self, event: ProtocolEvent) -> Vec<Action> {
         match event {
-            ProtocolEvent::SyncBlockReadyToApply { certified } => self
+            ProtocolEvent::BlockSyncReadyToApply { certified } => self
                 .bft
                 .on_sync_block_ready_to_apply(self.topology.snapshot(), certified),
-            // SyncProtocol finished fetching: exit BFT sync mode + flush
+            // BlockSyncProtocol finished fetching: exit BFT sync mode + flush
             // expected provisions + flush expected headers, all in one
             // pass.
-            ProtocolEvent::SyncProtocolComplete { .. } => {
+            ProtocolEvent::BlockSyncComplete { .. } => {
                 let topo = self.topology.snapshot();
-                let mut actions = self.bft.on_sync_complete(topo);
+                let mut actions = self.bft.on_block_sync_complete(topo);
                 actions.extend(self.remote_headers.flush_expected_headers(topo));
                 actions.extend(self.provisions.flush_expected_provisions(topo));
                 actions
