@@ -8,6 +8,7 @@
 //! missing hashes so the in-flight set retries.
 
 use crate::io_loop::IoLoop;
+use crate::io_loop::protocol::binding::TransactionBinding;
 use crate::io_loop::protocol::fetch::FetchInput;
 use hyperscale_core::ProtocolEvent;
 use hyperscale_dispatch::Dispatch;
@@ -15,7 +16,7 @@ use hyperscale_engine::Engine;
 use hyperscale_network::Network;
 use hyperscale_storage::Storage;
 use hyperscale_types::{
-    ExecutionCertificate, FinalizedWave, ProvisionHash, Provisions, RoutableTransaction,
+    ExecutionCertificate, FinalizedWave, ProvisionHash, Provisions, RoutableTransaction, TxHash,
 };
 use std::sync::Arc;
 
@@ -26,15 +27,25 @@ where
     D: Dispatch,
     E: Engine,
 {
-    /// Route delivered txs through mempool admission. Fetch-protocol drain
-    /// happens via the resulting `Continuation(TransactionsAdmitted)`
-    /// interception.
+    /// Route delivered txs through mempool admission, then drain every
+    /// delivered hash from the fetch protocol. Mempool's
+    /// `TransactionsAdmitted` event covers only newly-admitted txs — txs
+    /// rejected as duplicates / tombstoned / validity-expired don't
+    /// surface there, so we drop them from the fetch FSM directly. Without
+    /// this, redundant fetch responses pin entries in the pending set
+    /// forever and `fetch_in_flight{kind=transaction}` ratchets up.
     pub(in crate::io_loop) fn handle_transactions_received(
         &mut self,
         transactions: Vec<Arc<RoutableTransaction>>,
     ) {
+        let delivered_hashes: Vec<TxHash> = transactions.iter().map(|tx| tx.hash()).collect();
         let actions = self.state.on_transactions_fetched(transactions);
         self.process_actions(actions);
+        if !delivered_hashes.is_empty() {
+            self.drive_fetch::<TransactionBinding>(FetchInput::Admitted {
+                ids: delivered_hashes,
+            });
+        }
     }
 
     /// Each delivered cert flows through `on_wave_certificate`, which emits
