@@ -219,6 +219,7 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::ExecutionVoteReceived { .. }
             | ProtocolEvent::ExecutionVotesVerifiedAndAggregated { .. }
             | ProtocolEvent::ExecutionCertificateAggregated { .. }
+            | ProtocolEvent::ExecutionCertificatesReceived { .. }
             | ProtocolEvent::ExecutionCertificateSignatureVerified { .. }
             | ProtocolEvent::ExecutionCertificateAdmitted { .. }) => self.handle_execution(evt),
 

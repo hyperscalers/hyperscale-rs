@@ -291,9 +291,11 @@ impl FetchBinding for ExecCertBinding {
                                 .filter(|id| !delivered.contains(id))
                                 .collect();
                             let had_misses = !missing.is_empty();
-                            let _ = es.send(NodeInput::ExecutionCertsReceived {
-                                certificates: certs,
-                            });
+                            let _ = es.send(NodeInput::Protocol(Box::new(
+                                ProtocolEvent::ExecutionCertificatesReceived {
+                                    certificates: certs,
+                                },
+                            )));
                             if had_misses {
                                 let _ = es.send(NodeInput::ExecCertFetchFailed { hashes: missing });
                                 ResponseVerdict::Reject
@@ -315,9 +317,9 @@ impl FetchBinding for ExecCertBinding {
     }
 
     fn apply_admission(fetch: &mut Fetch<WaveId>, event: &ProtocolEvent) {
-        if let ProtocolEvent::ExecutionCertificateAdmitted { wave_id } = event {
+        if let ProtocolEvent::ExecutionCertificateAdmitted { certificate } = event {
             fetch.handle(FetchInput::Admitted {
-                ids: vec![wave_id.clone()],
+                ids: vec![certificate.wave_id.clone()],
             });
         }
     }

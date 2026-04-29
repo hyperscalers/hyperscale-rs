@@ -16,8 +16,7 @@ use hyperscale_engine::Engine;
 use hyperscale_network::Network;
 use hyperscale_storage::Storage;
 use hyperscale_types::{
-    ExecutionCertificate, FinalizedWave, ProvisionHash, Provisions, RoutableTransaction, TxHash,
-    WaveIdHash,
+    FinalizedWave, ProvisionHash, Provisions, RoutableTransaction, TxHash, WaveIdHash,
 };
 use std::sync::Arc;
 
@@ -57,18 +56,6 @@ where
                 ids: missing_hashes,
             });
         }
-    }
-
-    /// Each delivered cert flows through `on_wave_certificate`, which emits
-    /// `Continuation(ExecutionCertificateAdmitted)`. `io_loop`'s
-    /// interception arm drains the exec-cert fetch protocol per wave.
-    pub(in crate::io_loop) fn handle_execution_certs_received(
-        &mut self,
-        certificates: Vec<ExecutionCertificate>,
-    ) {
-        let actions = self.state.on_execution_certs_received(certificates);
-        self.process_actions(actions);
-        self.update_fetch_tick_timer();
     }
 
     /// Fetched batches enter the verification pipeline. Successful

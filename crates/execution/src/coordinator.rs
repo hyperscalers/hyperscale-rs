@@ -998,16 +998,6 @@ impl ExecutionCoordinator {
             self.committed_ts,
         );
 
-        // Canonical admission: drains the exec-cert fetch protocol via the
-        // matching `Continuation` arm in io_loop, regardless of whether the
-        // cert arrived by broadcast or fetch. Verification gates downstream
-        // effects, but the fetch-protocol drain happens at admission.
-        let mut actions = vec![Action::Continuation(
-            ProtocolEvent::ExecutionCertificateAdmitted {
-                wave_id: cert.wave_id.clone(),
-            },
-        )];
-
         if cleared {
             tracing::debug!(
                 source_shard = shard.0,
@@ -1023,14 +1013,13 @@ impl ExecutionCoordinator {
                 shard = shard.0,
                 "Could not resolve all public keys for execution cert verification"
             );
-            return actions;
+            return vec![];
         };
 
-        actions.push(Action::VerifyExecutionCertificateSignature {
+        vec![Action::VerifyExecutionCertificateSignature {
             certificate: cert,
             public_keys,
-        });
-        actions
+        }]
     }
 
     /// Handle execution certificate signature verification result.
@@ -1055,7 +1044,11 @@ impl ExecutionCoordinator {
 
         let shard = certificate.shard_group_id();
         let ec_arc = Arc::new(certificate);
-        let mut actions = Vec::new();
+        let mut actions = vec![Action::Continuation(
+            ProtocolEvent::ExecutionCertificateAdmitted {
+                certificate: Arc::clone(&ec_arc),
+            },
+        )];
 
         // If this is a local shard EC, mark the wave as having an EC to skip
         // it in scan_complete_waves, and persist it for fallback serving to

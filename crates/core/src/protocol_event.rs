@@ -343,6 +343,17 @@ pub enum ProtocolEvent {
         valid: bool,
     },
 
+    /// Execution certificates delivered from any source — fetch response or
+    /// peer broadcast (post sender-sig check). Each cert carries its own
+    /// `(shard_group_id, block_height, wave_id)`. The state machine iterates
+    /// the batch and routes each cert to `ExecutionCoordinator::on_wave_certificate`,
+    /// which dispatches signature verification. The fetch protocol drain
+    /// hooks this event by `wave_id`.
+    ExecutionCertificatesReceived {
+        /// Execution certificates to admit.
+        certificates: Vec<ExecutionCertificate>,
+    },
+
     // ═══════════════════════════════════════════════════════════════════════
     // Mempool / Transactions
     // ═══════════════════════════════════════════════════════════════════════
@@ -356,13 +367,12 @@ pub enum ProtocolEvent {
 
     /// An execution certificate was just admitted to the canonical EC store.
     ///
-    /// Emitted by `ExecutionCoordinator::on_wave_certificate` for both
-    /// broadcast-delivered and fetch-delivered certs. `io_loop` intercepts
-    /// the matching `Continuation` arm and drains the exec-cert fetch
-    /// protocol's in-flight tracking by `wave_id`.
+    /// Emitted by `ExecutionCoordinator::on_certificate_verified` only when
+    /// the aggregated BLS signature passes verification. Drives state-machine
+    /// fan-out (cross-shard ACK observation, vote-action re-scan).
     ExecutionCertificateAdmitted {
-        /// Wave the certificate covers.
-        wave_id: WaveId,
+        /// The verified certificate.
+        certificate: Arc<ExecutionCertificate>,
     },
 
     /// Finalized waves were just admitted to the canonical execution store.

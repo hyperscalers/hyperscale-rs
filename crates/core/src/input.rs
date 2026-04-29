@@ -2,9 +2,9 @@
 
 use crate::ProtocolEvent;
 use hyperscale_types::{
-    BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, CommittedBlockHeader,
-    ExecutionCertificate, FinalizedWave, ProvisionHash, Provisions, RoutableTransaction,
-    ShardGroupId, TxHash, ValidatorId, WaveId, WaveIdHash,
+    BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, CommittedBlockHeader, FinalizedWave,
+    ProvisionHash, Provisions, RoutableTransaction, ShardGroupId, TxHash, ValidatorId, WaveId,
+    WaveIdHash,
 };
 use std::sync::Arc;
 
@@ -211,18 +211,6 @@ pub enum NodeInput {
         block_height: BlockHeight,
     },
 
-    /// Execution certificates delivered from any source — fetch response or
-    /// peer broadcast (post sender-sig check). Routed to
-    /// `NodeStateMachine::on_execution_certs_received`, which delegates each
-    /// cert to `ExecutionCoordinator::on_wave_certificate`. Each cert
-    /// carries its own `(shard_group_id, block_height, wave_id)`; `io_loop`'s
-    /// `Continuation(ExecutionCertificateAdmitted)` interception drains the
-    /// matching fetch protocol per wave.
-    ExecutionCertsReceived {
-        /// Execution certificates to admit.
-        certificates: Vec<ExecutionCertificate>,
-    },
-
     /// An execution certificate fetch request failed.
     ExecCertFetchFailed {
         /// Wave ids that weren't returned.
@@ -253,7 +241,8 @@ impl NodeInput {
                 | ProtocolEvent::TransactionGossipReceived { .. }
                 | ProtocolEvent::GlobalBlockReceived { .. }
                 | ProtocolEvent::GlobalBlockVoteReceived { .. }
-                | ProtocolEvent::ProvisionsReceived { .. } => EventPriority::Network,
+                | ProtocolEvent::ProvisionsReceived { .. }
+                | ProtocolEvent::ExecutionCertificatesReceived { .. } => EventPriority::Network,
 
                 // Fetch delivery events are processed callbacks from the fetch
                 // protocol, not raw network messages (analogous to
@@ -273,7 +262,6 @@ impl NodeInput {
             Self::CommittedHeaderValidated { .. } => EventPriority::Internal,
             Self::CommittedBlockGossipReceived { .. } => EventPriority::Network,
             Self::ProvisionsFetchFailed { .. } => EventPriority::Internal,
-            Self::ExecutionCertsReceived { .. } => EventPriority::Internal,
             Self::ExecCertFetchFailed { .. } => EventPriority::Internal,
             Self::LocalProvisionReceived { .. } => EventPriority::Internal,
             Self::LocalProvisionsFetchFailed { .. } => EventPriority::Internal,

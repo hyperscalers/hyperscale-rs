@@ -390,10 +390,6 @@ where
                 block_height,
             } => self.handle_provisions_fetch_failed(source_shard, block_height),
 
-            NodeInput::ExecutionCertsReceived { certificates } => {
-                self.handle_execution_certs_received(certificates);
-            }
-
             NodeInput::ExecCertFetchFailed { hashes } => self.handle_exec_cert_fetch_failed(hashes),
 
             // ── Committed header (gossip → BLS verify → state machine) ──
