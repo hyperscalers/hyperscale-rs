@@ -12,7 +12,7 @@ use super::binding::{
 use super::block_sync::{BlockSyncInput, BlockSyncOutput, BlockSyncProtocol, BlockSyncStatus};
 use super::fetch::FetchConfig;
 use super::remote_header_sync::{
-    RemoteHeaderSyncConfig, RemoteHeaderSyncInput, RemoteHeaderSyncOutput, RemoteHeaderSyncProtocol,
+    self, RemoteHeaderSyncInput, RemoteHeaderSyncOutput, RemoteHeaderSyncProtocol,
 };
 use crate::config::NodeConfig;
 use hyperscale_core::ProtocolEvent;
@@ -50,7 +50,7 @@ impl ProtocolHost {
     pub fn new(config: &NodeConfig) -> Self {
         Self {
             block_sync: BlockSyncProtocol::new(config.block_sync.clone()),
-            remote_header_sync: RemoteHeaderSyncProtocol::new(RemoteHeaderSyncConfig::default()),
+            remote_header_sync: RemoteHeaderSyncProtocol::new(remote_header_sync::default_config()),
             transaction: TransactionFetch::new("transaction", config.transaction_fetch.clone()),
             local_provision: LocalProvisionFetch::new(
                 "local_provision",
@@ -119,8 +119,8 @@ impl ProtocolHost {
         height: hyperscale_types::BlockHeight,
     ) -> Vec<RemoteHeaderSyncOutput> {
         self.remote_header_sync
-            .handle(RemoteHeaderSyncInput::HeaderAdmitted {
-                source_shard,
+            .handle(RemoteHeaderSyncInput::Admitted {
+                scope: source_shard,
                 height,
             })
     }

@@ -1,20 +1,14 @@
-//! Remote-header sync step handlers.
+//! Remote-header sync I/O glue.
 //!
-//! I/O glue between `RemoteHeaderSyncProtocol` and the runner. Drives:
-//! - `Action::StartRemoteHeaderSync` → kicks off / raises target on the FSM
-//! - Network callbacks (`NodeInput::RemoteHeaders*`) → fed back into the FSM
-//! - FSM outputs (`FetchHeaders`, `DeliverHeader`, `SyncComplete`) → routed
-//!   to the network layer, the protocol-event stream, or
-//!   `NodeStateMachine` respectively.
-//!
-//! Per-header validation goes through the existing
-//! `ProtocolEvent::RemoteHeaderReceived` path so QC verification is
-//! unchanged from the gossip-driven path. The FSM observes admission via
-//! the `RemoteHeaderAdmitted` continuation interception in
-//! `handle_continuation`.
+//! Bridges `Sync<RemoteHeaderSyncBinding>`'s scheduling to the network
+//! and to the existing `RemoteHeaderReceived` ingestion path. The FSM
+//! tracks heights only; the step layer owns wire shape (range fetches),
+//! response decoding, and feeding delivered headers into per-header QC
+//! verification.
 
 use crate::io_loop::IoLoop;
 use crate::io_loop::protocol::remote_header_sync::{RemoteHeaderSyncInput, RemoteHeaderSyncOutput};
+use crate::io_loop::protocol::sync::SyncOutput;
 use hyperscale_core::{NodeInput, ProtocolEvent};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::Engine;
@@ -44,7 +38,7 @@ where
             .protocols
             .remote_header_sync
             .handle(RemoteHeaderSyncInput::StartSync {
-                source_shard,
+                scope: source_shard,
                 target,
             });
         self.process_remote_header_sync_outputs(outputs);
@@ -53,7 +47,11 @@ where
 
     // ─── step() handlers ────────────────────────────────────────────────
 
-    /// Network callback: a range response arrived (possibly empty).
+    /// Network callback: a range response arrived (possibly empty). Each
+    /// returned header is funneled through the same `RemoteHeaderReceived`
+    /// path gossip-arrived headers take, so QC verification + admission
+    /// stay unchanged. The FSM is told which heights actually arrived so
+    /// it can defer the short-capped tail.
     pub(in crate::io_loop) fn handle_remote_headers_response_received(
         &mut self,
         source_shard: ShardGroupId,
@@ -61,15 +59,40 @@ where
         count: u64,
         headers: Vec<CommittedBlockHeader>,
     ) {
-        let outputs = self.protocols.remote_header_sync.handle(
-            RemoteHeaderSyncInput::HeadersResponseReceived {
-                source_shard,
-                from_height,
-                count,
-                headers,
-                now: std::time::Instant::now(),
-            },
-        );
+        // Filter to in-range deliveries, deliver each to the existing
+        // verification path, and collect the heights for the FSM.
+        let mut delivered_heights = Vec::with_capacity(headers.len());
+        for header in headers {
+            let h = header.header.height;
+            if h < from_height || h.0 >= from_height.0 + count {
+                tracing::warn!(
+                    source_shard = source_shard.0,
+                    requested_from = from_height.0,
+                    requested_count = count,
+                    height = h.0,
+                    "remote-header sync: response contained out-of-range height — discarding"
+                );
+                continue;
+            }
+            delivered_heights.push(h);
+            // The `sender` field carries no meaning for fetched headers —
+            // a sentinel value avoids confusion with real validator ids.
+            self.feed_event(ProtocolEvent::RemoteHeaderReceived {
+                committed_header: header,
+                sender: ValidatorId(u64::MAX),
+            });
+        }
+
+        let outputs =
+            self.protocols
+                .remote_header_sync
+                .handle(RemoteHeaderSyncInput::FetchSucceeded {
+                    scope: source_shard,
+                    from: from_height,
+                    count,
+                    delivered_heights,
+                    now: std::time::Instant::now(),
+                });
         self.process_remote_header_sync_outputs(outputs);
         self.update_fetch_tick_timer();
     }
@@ -84,9 +107,9 @@ where
         let outputs =
             self.protocols
                 .remote_header_sync
-                .handle(RemoteHeaderSyncInput::HeadersFetchFailed {
-                    source_shard,
-                    from_height,
+                .handle(RemoteHeaderSyncInput::FetchFailed {
+                    scope: source_shard,
+                    from: from_height,
                     count,
                     now: std::time::Instant::now(),
                 });
@@ -96,18 +119,17 @@ where
 
     // ─── Output processing ──────────────────────────────────────────────
 
-    /// Route FSM outputs: `FetchHeaders` → network request,
-    /// `DeliverHeader` → `RemoteHeaderReceived` event,
-    /// `SyncComplete` → `RemoteHeaderSyncProtocolComplete` event.
+    /// Route FSM outputs: `Fetch` → network request, `Complete` →
+    /// `RemoteHeaderSyncProtocolComplete` event.
     pub(in crate::io_loop) fn process_remote_header_sync_outputs(
         &mut self,
         outputs: Vec<RemoteHeaderSyncOutput>,
     ) {
         for output in outputs {
             match output {
-                RemoteHeaderSyncOutput::FetchHeaders {
-                    source_shard,
-                    from_height,
+                SyncOutput::Fetch {
+                    scope: source_shard,
+                    from: from_height,
                     count,
                 } => {
                     let es = self.event_sender.clone();
@@ -151,22 +173,8 @@ where
                         }),
                     );
                 }
-                RemoteHeaderSyncOutput::DeliverHeader {
-                    source_shard: _,
-                    header,
-                } => {
-                    // Funnel through the same path gossip-arrived headers
-                    // take; QC verification + admission run unchanged. The
-                    // `sender` field carries no meaning for fetched headers
-                    // — set to a sentinel that won't be confused with a
-                    // real validator.
-                    self.feed_event(ProtocolEvent::RemoteHeaderReceived {
-                        committed_header: *header,
-                        sender: ValidatorId(u64::MAX),
-                    });
-                }
-                RemoteHeaderSyncOutput::SyncComplete {
-                    source_shard,
+                SyncOutput::Complete {
+                    scope: source_shard,
                     height,
                 } => {
                     tracing::info!(
