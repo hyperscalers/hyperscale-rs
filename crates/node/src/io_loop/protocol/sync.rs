@@ -49,6 +49,15 @@ const DEFERRAL_MULTIPLIER: f64 = 2.0;
 /// Backoff cap; subsequent rounds plateau here rather than growing unbounded.
 const DEFERRAL_MAX_MS: u64 = 30_000;
 
+/// How long a delivered-but-unadmitted height stays parked before we
+/// give up waiting for the consumer's admission and demote it back to
+/// `deferred` for re-fetch. Covers the async gap between
+/// [`SyncInput::FetchSucceeded`] and [`SyncInput::Admitted`] — chiefly
+/// QC verification on the consensus-crypto pool — while still bounding
+/// the wait when admission never lands (e.g. QC verification rejects the
+/// delivered header and the binding has no further candidates).
+const PENDING_ADMISSION_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Per-height deferral state: how many rounds we've backed off and when the
 /// next retry is permitted.
 #[derive(Debug, Default)]
@@ -160,6 +169,15 @@ struct ScopeState {
     /// Heights whose last fetch failed; held out of `heights_to_fetch`
     /// until their backoff deadline elapses.
     deferred: HashMap<BlockHeight, DeferralBackoff>,
+    /// Heights delivered by the network but not yet admitted by the
+    /// consumer (admission is async — e.g. cross-shard QC verification
+    /// on a thread pool). Held out of `heights_to_fetch` until either
+    /// admission lands (drop on `handle_admitted`) or the deadline
+    /// elapses (demoted to `deferred` on `handle_tick`). Without this,
+    /// `queue_window` would re-queue every just-delivered range and
+    /// `emit_fetches` would dispatch a duplicate fetch for the bytes
+    /// we just received.
+    pending_admission: HashMap<BlockHeight, Instant>,
     /// Number of in-flight fetch ranges for this scope. Bounded by
     /// `max_concurrent_per_scope`.
     in_flight_ranges: usize,
@@ -174,12 +192,16 @@ impl ScopeState {
             heights_queued: HashSet::new(),
             in_flight: HashSet::new(),
             deferred: HashMap::new(),
+            pending_admission: HashMap::new(),
             in_flight_ranges: 0,
         }
     }
 
     fn queue_height(&mut self, height: BlockHeight) {
-        if self.in_flight.contains(&height) || self.deferred.contains_key(&height) {
+        if self.in_flight.contains(&height)
+            || self.deferred.contains_key(&height)
+            || self.pending_admission.contains_key(&height)
+        {
             return;
         }
         if self.heights_queued.insert(height) {
@@ -345,7 +367,9 @@ impl<B: SyncBinding> Sync<B> {
                 current_height: s.committed.0,
                 blocks_behind: s.target.0.saturating_sub(s.committed.0),
                 pending_fetches: s.in_flight_ranges,
-                queued_heights: s.heights_queued.len() + s.deferred.len(),
+                queued_heights: s.heights_queued.len()
+                    + s.deferred.len()
+                    + s.pending_admission.len(),
             })
             .unwrap_or_default()
     }
@@ -418,11 +442,20 @@ impl<B: SyncBinding> Sync<B> {
         state.in_flight_ranges = state.in_flight_ranges.saturating_sub(1);
 
         let delivered: HashSet<BlockHeight> = delivered_heights.iter().copied().collect();
+        let pending_deadline = now + PENDING_ADMISSION_TIMEOUT;
 
         for offset in 0..count {
             let h = BlockHeight(from.0 + offset);
             state.in_flight.remove(&h);
-            if !delivered.contains(&h) && h <= state.target && h > state.committed {
+            if delivered.contains(&h) {
+                if h > state.committed {
+                    // Park until the consumer admits this height (async —
+                    // e.g. QC verification on the consensus-crypto pool).
+                    // `handle_tick` demotes back to `deferred` if admission
+                    // never arrives within `PENDING_ADMISSION_TIMEOUT`.
+                    state.pending_admission.insert(h, pending_deadline);
+                }
+            } else if h <= state.target && h > state.committed {
                 state.deferred.entry(h).or_default().advance_round(now);
             }
         }
@@ -489,6 +522,7 @@ impl<B: SyncBinding> Sync<B> {
         state.heights_queued.retain(|&h| h > committed);
         state.in_flight.retain(|&h| h > committed);
         state.deferred.retain(|&h, _| h > committed);
+        state.pending_admission.retain(|&h, _| h > committed);
 
         // Binding hook: clean up per-id auxiliary state.
         B::on_admitted(&mut self.binding_state, scope, committed);
@@ -516,6 +550,23 @@ impl<B: SyncBinding> Sync<B> {
 
     fn handle_tick(&mut self, now: Instant) -> Vec<SyncOutput<B>> {
         for state in self.scopes.values_mut() {
+            // Demote pending-admission heights whose deadline elapsed
+            // back to `deferred` (with one round of backoff). Covers the
+            // case where admission never lands — e.g. the consumer
+            // rejected the delivered header and the binding has no
+            // further candidates.
+            let stale: Vec<BlockHeight> = state
+                .pending_admission
+                .iter()
+                .filter_map(|(h, deadline)| (now >= *deadline).then_some(*h))
+                .collect();
+            for h in stale {
+                state.pending_admission.remove(&h);
+                if h > state.committed && h <= state.target {
+                    state.deferred.entry(h).or_default().advance_round(now);
+                }
+            }
+
             // Promote ready deferred heights back into the heap.
             let ready: Vec<BlockHeight> = state
                 .deferred
@@ -526,9 +577,10 @@ impl<B: SyncBinding> Sync<B> {
                 state.deferred.remove(&h);
                 if h > state.committed && h <= state.target {
                     // Defer to `queue_height` so dedup against
-                    // `heights_queued` / `in_flight` / `deferred` stays in
-                    // one place — and we don't double-push if the height is
-                    // somehow already tracked.
+                    // `heights_queued` / `in_flight` / `deferred` /
+                    // `pending_admission` stays in one place — and we
+                    // don't double-push if the height is somehow already
+                    // tracked.
                     state.queue_height(h);
                 }
             }
@@ -930,6 +982,115 @@ mod tests {
                     .any(|o| matches!(o, SyncOutput::Complete { .. }))
             );
         }
+    }
+
+    #[test]
+    fn fetch_succeeded_does_not_redispatch_delivered_unadmitted_heights() {
+        // Regression: admission is async (e.g. cross-shard QC verification
+        // on a thread pool), so between FetchSucceeded and the matching
+        // Admitted there's a window during which delivered heights had
+        // been "tracked nowhere" — `queue_window` would re-queue them and
+        // `emit_fetches` would dispatch a duplicate range fetch for the
+        // exact bytes we just received. Pending-admission tracking closes
+        // that gap.
+        let mut s: Sync<ShardBinding> = Sync::new(SyncConfig {
+            max_per_request: 8,
+            window_size: 32,
+            max_concurrent_per_scope: 2,
+        });
+        let _ = s.handle(SyncInput::StartSync {
+            scope: 1,
+            target: BlockHeight(20),
+        });
+        let now = Instant::now();
+        let outputs = s.handle(SyncInput::FetchSucceeded {
+            scope: 1,
+            from: BlockHeight(1),
+            count: 8,
+            delivered_heights: (1..=8).map(BlockHeight).collect(),
+            now,
+        });
+        let new_fetches: Vec<(BlockHeight, u64)> = outputs
+            .iter()
+            .filter_map(|o| match o {
+                SyncOutput::Fetch { from, count, .. } => Some((*from, *count)),
+                SyncOutput::Complete { .. } => None,
+            })
+            .collect();
+        assert!(
+            !new_fetches.iter().any(|(from, _)| *from == BlockHeight(1)),
+            "should not re-dispatch a fetch starting at height 1 — we just got 1..=8 \
+             back from the network. Got: {new_fetches:?}"
+        );
+    }
+
+    #[test]
+    fn pending_admission_heights_demote_to_deferred_after_timeout() {
+        // If admission never lands (e.g. consumer rejected the delivered
+        // header and the binding has no further candidates), the
+        // pending-admission slot must not be permanent — Tick demotes it
+        // back to `deferred` so the height eventually re-fetches.
+        let mut s: Sync<ShardBinding> = Sync::new(SyncConfig {
+            max_per_request: 8,
+            window_size: 32,
+            max_concurrent_per_scope: 2,
+        });
+        let _ = s.handle(SyncInput::StartSync {
+            scope: 1,
+            target: BlockHeight(8),
+        });
+        let now = Instant::now();
+        let _ = s.handle(SyncInput::FetchSucceeded {
+            scope: 1,
+            from: BlockHeight(1),
+            count: 8,
+            delivered_heights: (1..=8).map(BlockHeight).collect(),
+            now,
+        });
+        // Tick before timeout: still pending, no re-fetch.
+        let _ = s.handle(SyncInput::Tick {
+            now: now + Duration::from_secs(1),
+        });
+        assert!(!s.has_deferred());
+
+        // Tick past PENDING_ADMISSION_TIMEOUT (5s): heights demote to
+        // deferred. They wait one round of deferral backoff before
+        // re-emerging.
+        let _ = s.handle(SyncInput::Tick {
+            now: now + Duration::from_secs(6),
+        });
+        assert!(s.has_deferred(), "stale pending heights should demote");
+    }
+
+    #[test]
+    fn admit_clears_pending_admission_below_committed() {
+        let mut s: Sync<ShardBinding> = Sync::new(SyncConfig {
+            max_per_request: 8,
+            window_size: 32,
+            max_concurrent_per_scope: 2,
+        });
+        let _ = s.handle(SyncInput::StartSync {
+            scope: 1,
+            target: BlockHeight(8),
+        });
+        let now = Instant::now();
+        let _ = s.handle(SyncInput::FetchSucceeded {
+            scope: 1,
+            from: BlockHeight(1),
+            count: 8,
+            delivered_heights: (1..=8).map(BlockHeight).collect(),
+            now,
+        });
+        // Admit half the range; pending entries ≤ committed should drop.
+        for h in 1..=4 {
+            let _ = s.handle(SyncInput::Admitted {
+                scope: 1,
+                height: BlockHeight(h),
+            });
+        }
+        let st = s.scopes.get(&1).unwrap();
+        assert!(st.pending_admission.keys().all(|&h| h > BlockHeight(4)));
+        assert_eq!(st.pending_admission.len(), 4);
     }
 
     #[test]
