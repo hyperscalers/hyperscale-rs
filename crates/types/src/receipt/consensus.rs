@@ -12,7 +12,7 @@
 //! failed transactions.
 
 use crate::{
-    ApplicationEvent, DatabaseUpdates, EventRoot, GlobalReceipt, GlobalReceiptHash,
+    ApplicationEvent, DatabaseUpdates, EventRoot, GlobalReceipt, GlobalReceiptHash, Hash,
     TransactionOutcome, WritesRoot,
 };
 use std::sync::LazyLock;
@@ -72,6 +72,16 @@ impl ConsensusReceipt {
     #[must_use]
     pub const fn is_success(&self) -> bool {
         matches!(self, Self::Succeeded { .. })
+    }
+
+    /// Per-shard receipt hash used as a leaf in `local_receipt_root`.
+    ///
+    /// Includes outcome + `event_root` + `database_updates_hash`. Equivalent
+    /// to [`LocalReceipt::receipt_hash`](crate::LocalReceipt::receipt_hash)
+    /// applied to the projection of `self`.
+    #[must_use]
+    pub fn local_receipt_hash(&self) -> Hash {
+        self.to_local_receipt().receipt_hash()
     }
 
     /// Project to the legacy [`LocalReceipt`](crate::LocalReceipt) shape.

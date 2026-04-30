@@ -1,86 +1,48 @@
-//! Storage / network bundle pairing a `LocalReceipt` with optional engine output.
+//! Persisted receipt — consensus portion plus optional local metadata.
 
-use std::sync::Arc;
+use crate::{ConsensusReceipt, ExecutionMetadata, LocalExecutionEntry, TransactionOutcome, TxHash};
 
-use crate::{ExecutionMetadata, LocalReceipt, TxHash};
-
-/// A receipt bundle for storage — local receipt + optional execution output.
+/// A persisted receipt: consensus-bound portion paired with optional
+/// local-only metadata.
 ///
-/// `execution_output` is `None` when the receipt was fetched from a peer (sync/catch-up).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReceiptBundle {
-    /// Hash of the executed transaction this bundle belongs to.
+/// `metadata` is `None` when this receipt was received from a peer (sync
+/// or catch-up) — peers don't ship their local logs/fees/errors. When
+/// the local node executed the transaction, `metadata` is `Some`.
+#[derive(Debug, Clone, PartialEq, Eq, sbor::prelude::BasicSbor)]
+pub struct StoredReceipt {
+    /// Hash of the executed transaction this receipt belongs to.
     pub tx_hash: TxHash,
-    /// Per-shard receipt produced by execution.
-    pub local_receipt: Arc<LocalReceipt>,
-    /// Only populated when this node executed the transaction locally.
-    pub execution_output: Option<ExecutionMetadata>,
+    /// Consensus-bound portion (transferable across peers, hash-stable).
+    pub consensus: ConsensusReceipt,
+    /// Local-only execution metadata (fees, logs, errors). Only
+    /// populated for transactions this node executed locally.
+    pub metadata: Option<ExecutionMetadata>,
 }
 
-// Manual SBOR implementation (Arc doesn't derive BasicSbor)
-impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValueKind, E>
-    for ReceiptBundle
-{
-    fn encode_value_kind(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
-        encoder.write_value_kind(sbor::ValueKind::Tuple)
-    }
-
-    fn encode_body(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
-        encoder.write_size(3)?;
-        encoder.encode(&self.tx_hash)?;
-        encoder.encode(self.local_receipt.as_ref())?;
-        encoder.encode(&self.execution_output)?;
-        Ok(())
-    }
-}
-
-impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValueKind, D>
-    for ReceiptBundle
-{
-    fn decode_body_with_value_kind(
-        decoder: &mut D,
-        value_kind: sbor::ValueKind<sbor::NoCustomValueKind>,
-    ) -> Result<Self, sbor::DecodeError> {
-        decoder.check_preloaded_value_kind(value_kind, sbor::ValueKind::Tuple)?;
-        let length = decoder.read_size()?;
-
-        if length != 3 {
-            return Err(sbor::DecodeError::UnexpectedSize {
-                expected: 3,
-                actual: length,
-            });
+impl From<LocalExecutionEntry> for StoredReceipt {
+    /// Bridge from the legacy engine-output shape during the
+    /// `unify-receipt-types` migration. Removed in the legacy-cleanup commit.
+    fn from(entry: LocalExecutionEntry) -> Self {
+        let consensus = match entry.local_receipt.outcome {
+            TransactionOutcome::Success => ConsensusReceipt::Succeeded {
+                receipt_hash: entry.receipt_hash,
+                database_updates: entry.local_receipt.database_updates,
+                application_events: entry.local_receipt.application_events,
+            },
+            TransactionOutcome::Failure => ConsensusReceipt::Failed,
+        };
+        Self {
+            tx_hash: entry.tx_hash,
+            consensus,
+            metadata: Some(entry.execution_output),
         }
-
-        let tx_hash: TxHash = decoder.decode()?;
-        let local_receipt: LocalReceipt = decoder.decode()?;
-        let execution_output: Option<ExecutionMetadata> = decoder.decode()?;
-
-        Ok(Self {
-            tx_hash,
-            local_receipt: Arc::new(local_receipt),
-            execution_output,
-        })
-    }
-}
-
-impl sbor::Categorize<sbor::NoCustomValueKind> for ReceiptBundle {
-    fn value_kind() -> sbor::ValueKind<sbor::NoCustomValueKind> {
-        sbor::ValueKind::Tuple
-    }
-}
-
-impl sbor::Describe<sbor::NoCustomTypeKind> for ReceiptBundle {
-    const TYPE_ID: sbor::RustTypeId = sbor::RustTypeId::novel_with_code("ReceiptBundle", &[], &[]);
-
-    fn type_data() -> sbor::TypeData<sbor::NoCustomTypeKind, sbor::RustTypeId> {
-        sbor::TypeData::unnamed(sbor::TypeKind::Any)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ApplicationEvent, Hash, TransactionOutcome};
+    use crate::{ApplicationEvent, DatabaseUpdates, GlobalReceiptHash, Hash};
 
     fn make_event(seed: u8) -> ApplicationEvent {
         ApplicationEvent {
@@ -89,32 +51,28 @@ mod tests {
         }
     }
 
-    fn make_receipt(events: Vec<ApplicationEvent>) -> LocalReceipt {
-        LocalReceipt {
-            outcome: TransactionOutcome::Success,
-            database_updates: crate::DatabaseUpdates::default(),
-            application_events: events,
-        }
+    #[test]
+    fn synced_receipt_has_no_metadata() {
+        let synced = StoredReceipt {
+            tx_hash: TxHash::from_raw(Hash::from_bytes(b"synced_tx")),
+            consensus: ConsensusReceipt::Succeeded {
+                receipt_hash: GlobalReceiptHash::ZERO,
+                database_updates: DatabaseUpdates::default(),
+                application_events: vec![make_event(1)],
+            },
+            metadata: None,
+        };
+        assert!(synced.metadata.is_none());
     }
 
     #[test]
-    fn test_receipt_bundle_optional_execution_output() {
-        let receipt = Arc::new(make_receipt(vec![make_event(1)]));
-
-        // Bundle without execution output (synced from peer)
-        let synced = ReceiptBundle {
-            tx_hash: TxHash::from_raw(Hash::from_bytes(b"synced_tx")),
-            local_receipt: Arc::clone(&receipt),
-            execution_output: None,
-        };
-        assert!(synced.execution_output.is_none());
-
-        // Bundle with execution output (executed locally)
-        let local = ReceiptBundle {
+    fn locally_executed_receipt_carries_metadata() {
+        let local = StoredReceipt {
             tx_hash: TxHash::from_raw(Hash::from_bytes(b"local_tx")),
-            local_receipt: receipt,
-            execution_output: Some(ExecutionMetadata::failure(Some("test error".to_string()))),
+            consensus: ConsensusReceipt::Failed,
+            metadata: Some(ExecutionMetadata::failure(Some("test error".to_string()))),
         };
-        assert!(local.execution_output.is_some());
+        assert!(local.metadata.is_some());
+        assert!(!local.consensus.is_success());
     }
 }

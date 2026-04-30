@@ -2,7 +2,7 @@
 //! reconstruction, validation, and `Vec<Arc<FinalizedWave>>` SBOR helpers.
 
 use crate::{
-    ExecutionCertificate, ExecutionOutcome, LocalReceipt, ReceiptBundle, TransactionDecision,
+    ConsensusReceipt, ExecutionCertificate, ExecutionOutcome, StoredReceipt, TransactionDecision,
     TransactionOutcome, TxHash, WaveCertificate, WaveId, WaveIdHash,
 };
 use sbor::prelude::*;
@@ -34,7 +34,7 @@ pub struct FinalizedWave {
     /// Receipt bundles for txs that executed. Aborted txs are absent —
     /// `receipts.len() <= tx_count()`. Preserves canonical block order.
     /// Held in-memory until block commit, then written atomically with block metadata.
-    pub receipts: Vec<ReceiptBundle>,
+    pub receipts: Vec<StoredReceipt>,
 }
 
 /// Reason a `FinalizedWave`'s receipts don't agree with its own EC.
@@ -148,20 +148,20 @@ impl FinalizedWave {
     ///   has incomplete state — syncing peer should try a different source).
     pub fn reconstruct<F>(certificate: Arc<WaveCertificate>, mut lookup: F) -> Option<Self>
     where
-        F: FnMut(&TxHash) -> Option<Arc<LocalReceipt>>,
+        F: FnMut(&TxHash) -> Option<Arc<ConsensusReceipt>>,
     {
         let local_ec = certificate
             .execution_certificates
             .iter()
             .find(|ec| ec.wave_id == certificate.wave_id)?;
 
-        let mut receipts: Vec<ReceiptBundle> = Vec::with_capacity(local_ec.tx_outcomes.len());
+        let mut receipts: Vec<StoredReceipt> = Vec::with_capacity(local_ec.tx_outcomes.len());
         for outcome in &local_ec.tx_outcomes {
             match lookup(&outcome.tx_hash) {
-                Some(receipt) => receipts.push(ReceiptBundle {
+                Some(receipt) => receipts.push(StoredReceipt {
                     tx_hash: outcome.tx_hash,
-                    local_receipt: receipt,
-                    execution_output: None,
+                    consensus: (*receipt).clone(),
+                    metadata: None,
                 }),
                 None if outcome.is_aborted() => {}
                 None => return None,
@@ -221,11 +221,16 @@ impl FinalizedWave {
                     } else {
                         TransactionOutcome::Failure
                     };
-                    if receipt.local_receipt.outcome != expected {
+                    let actual = if receipt.consensus.is_success() {
+                        TransactionOutcome::Success
+                    } else {
+                        TransactionOutcome::Failure
+                    };
+                    if actual != expected {
                         return Err(ReceiptValidationError::OutcomeMismatch {
                             tx_hash: outcome.tx_hash,
                             expected,
-                            actual: receipt.local_receipt.outcome,
+                            actual,
                         });
                     }
                 }
@@ -308,7 +313,7 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
             });
         }
         let certificate: WaveCertificate = decoder.decode()?;
-        let receipts: Vec<ReceiptBundle> = decoder.decode()?;
+        let receipts: Vec<StoredReceipt> = decoder.decode()?;
         Ok(Self {
             certificate: Arc::new(certificate),
             receipts,

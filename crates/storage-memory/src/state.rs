@@ -9,9 +9,9 @@ use hyperscale_storage::{
     DatabaseUpdate, DatabaseUpdates, DbPartitionKey, JmtSnapshot, PartitionDatabaseUpdates, keys,
 };
 use hyperscale_types::{
-    BlockHash, BlockHeight, CertifiedBlock, ExecutionCertificate, ExecutionCertificateHash,
-    ExecutionMetadata, LocalReceipt, QuorumCertificate, RoutableTransaction, ShardGroupId,
-    StateRoot, TxHash, WaveCertificate, WaveIdHash,
+    BlockHash, BlockHeight, CertifiedBlock, ConsensusReceipt, ExecutionCertificate,
+    ExecutionCertificateHash, ExecutionMetadata, QuorumCertificate, RoutableTransaction,
+    ShardGroupId, StateRoot, TxHash, WaveCertificate, WaveIdHash,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -107,8 +107,8 @@ pub struct ConsensusState {
     pub transactions: HashMap<TxHash, RoutableTransaction>,
     /// Wave certificates indexed by identity hash.
     pub certificates: HashMap<WaveIdHash, WaveCertificate>,
-    /// Local receipts keyed by transaction hash.
-    pub local_receipts: HashMap<TxHash, Arc<LocalReceipt>>,
+    /// Consensus receipts keyed by transaction hash.
+    pub consensus_receipts: HashMap<TxHash, Arc<ConsensusReceipt>>,
     /// Execution output details keyed by transaction hash.
     pub execution_outputs: HashMap<TxHash, ExecutionMetadata>,
     /// Insertion height for each receipt, enabling height-based pruning.
@@ -137,7 +137,7 @@ impl ConsensusState {
             committed_qc: None,
             transactions: HashMap::new(),
             certificates: HashMap::new(),
-            local_receipts: HashMap::new(),
+            consensus_receipts: HashMap::new(),
             execution_outputs: HashMap::new(),
             receipt_heights: HashMap::new(),
             execution_certs: HashMap::new(),
@@ -156,7 +156,7 @@ impl ConsensusState {
         }
         self.receipt_heights.retain(|tx_hash, height| {
             if *height <= cutoff {
-                self.local_receipts.remove(tx_hash);
+                self.consensus_receipts.remove(tx_hash);
                 self.execution_outputs.remove(tx_hash);
                 false
             } else {

@@ -43,8 +43,11 @@ impl hyperscale_storage::ChainReader for RocksDbStorage {
         Self::get_certificates_batch(self, hashes)
     }
 
-    fn get_local_receipt(&self, tx_hash: &TxHash) -> Option<Arc<hyperscale_types::LocalReceipt>> {
-        Self::get_local_receipt(self, tx_hash)
+    fn get_consensus_receipt(
+        &self,
+        tx_hash: &TxHash,
+    ) -> Option<Arc<hyperscale_types::ConsensusReceipt>> {
+        Self::get_consensus_receipt(self, tx_hash)
     }
 
     fn get_execution_certificates_by_height(

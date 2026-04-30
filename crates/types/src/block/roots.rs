@@ -1,8 +1,8 @@
 //! Merkle root computation helpers for the per-block fields in [`BlockHeader`].
 
 use crate::{
-    CertificateRoot, FinalizedWave, Hash, LocalReceiptRoot, ProvisionsRoot, ReceiptBundle,
-    RoutableTransaction, TransactionRoot, compute_merkle_root, compute_padded_merkle_root,
+    CertificateRoot, FinalizedWave, Hash, LocalReceiptRoot, ProvisionsRoot, RoutableTransaction,
+    StoredReceipt, TransactionRoot, compute_merkle_root, compute_padded_merkle_root,
 };
 use std::sync::Arc;
 
@@ -30,7 +30,7 @@ pub fn compute_certificate_root(certificates: &[Arc<FinalizedWave>]) -> Certific
 /// to ensure determinism regardless of collection order (e.g. `HashMap` iteration).
 /// Returns `Hash::ZERO` if there are no receipts.
 #[must_use]
-pub fn compute_local_receipt_root(receipts: &[ReceiptBundle]) -> LocalReceiptRoot {
+pub fn compute_local_receipt_root(receipts: &[StoredReceipt]) -> LocalReceiptRoot {
     if receipts.is_empty() {
         return LocalReceiptRoot::ZERO;
     }
@@ -38,7 +38,7 @@ pub fn compute_local_receipt_root(receipts: &[ReceiptBundle]) -> LocalReceiptRoo
     // Sort by tx_hash for deterministic ordering across validators.
     let mut sorted: Vec<_> = receipts
         .iter()
-        .map(|b| (b.tx_hash, b.local_receipt.receipt_hash()))
+        .map(|b| (b.tx_hash, b.consensus.local_receipt_hash()))
         .collect();
     sorted.sort_by_key(|(tx_hash, _)| *tx_hash);
 

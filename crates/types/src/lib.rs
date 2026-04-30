@@ -73,7 +73,7 @@ pub use provisioning::proof::MerkleInclusionProof;
 pub use provisioning::state_entry::{StateEntry, StateProvision};
 pub use provisioning::tx_entries::TxEntries;
 pub use quorum_certificate::QuorumCertificate;
-pub use receipt::bundle::ReceiptBundle;
+pub use receipt::bundle::StoredReceipt;
 pub use receipt::consensus::{ConsensusReceipt, FAILED_RECEIPT_HASH};
 pub use receipt::global::GlobalReceipt;
 pub use receipt::local::{LocalExecutionEntry, LocalReceipt};

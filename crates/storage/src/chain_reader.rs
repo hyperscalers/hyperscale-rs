@@ -4,9 +4,9 @@
 //! All methods take `&self` — implementations use interior mutability.
 
 use hyperscale_types::{
-    Block, BlockHash, BlockHeight, CertifiedBlock, ExecutionCertificate, ExecutionCertificateHash,
-    LocalReceipt, ProvisionHash, QuorumCertificate, RoutableTransaction, ShardGroupId, TxHash,
-    WaveCertificate, WaveIdHash,
+    Block, BlockHash, BlockHeight, CertifiedBlock, ConsensusReceipt, ExecutionCertificate,
+    ExecutionCertificateHash, ProvisionHash, QuorumCertificate, RoutableTransaction, ShardGroupId,
+    TxHash, WaveCertificate, WaveIdHash,
 };
 use std::sync::Arc;
 
@@ -67,8 +67,8 @@ pub trait ChainReader: Send + Sync + 'static {
 
     // ─── Receipt Storage ──────────────────────────────────────────────────
 
-    /// Retrieve the local receipt for a transaction.
-    fn get_local_receipt(&self, tx_hash: &TxHash) -> Option<Arc<LocalReceipt>>;
+    /// Retrieve the consensus-bound receipt portion for a transaction.
+    fn get_consensus_receipt(&self, tx_hash: &TxHash) -> Option<Arc<ConsensusReceipt>>;
 
     // ─── Execution Certificate Reads ────────────────────────────────────
 

@@ -23,14 +23,14 @@ fn commit_with(
     let block = if updates.node_updates.is_empty() {
         block
     } else {
-        let receipt = hyperscale_types::ReceiptBundle {
+        let receipt = hyperscale_types::StoredReceipt {
             tx_hash: TxHash::ZERO,
-            local_receipt: Arc::new(hyperscale_types::LocalReceipt {
-                outcome: hyperscale_types::TransactionOutcome::Success,
+            consensus: hyperscale_types::ConsensusReceipt::Succeeded {
+                receipt_hash: hyperscale_types::GlobalReceiptHash::ZERO,
                 database_updates: updates.clone(),
                 application_events: vec![],
-            }),
-            execution_output: None,
+            },
+            metadata: None,
         };
         let new_fw = Arc::new(hyperscale_types::FinalizedWave {
             certificate: Arc::new(hyperscale_types::WaveCertificate {

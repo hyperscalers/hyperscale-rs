@@ -40,8 +40,8 @@
 use hyperscale_core::{Action, FetchPeers, FetchRequest, ProtocolEvent, ProvisionsRequest};
 use hyperscale_types::{
     Attempt, Block, BlockHash, BlockHeight, BloomFilter, ExecutionCertificate, ExecutionVote,
-    GlobalReceiptRoot, LocalExecutionEntry, NodeId, Provisions, ReceiptBundle, RoutableTransaction,
-    ShardGroupId, TopologySnapshot, TxHash, TxOutcome, ValidatorId, WAVE_TIMEOUT, WaveCertificate,
+    GlobalReceiptRoot, LocalExecutionEntry, NodeId, Provisions, RoutableTransaction, ShardGroupId,
+    StoredReceipt, TopologySnapshot, TxHash, TxOutcome, ValidatorId, WAVE_TIMEOUT, WaveCertificate,
     WaveId, WaveIdHash, WeightedTimestamp,
 };
 #[cfg(test)]
@@ -486,11 +486,7 @@ impl ExecutionCoordinator {
             return Vec::new();
         };
         for result in results {
-            wave.record_receipt(ReceiptBundle {
-                tx_hash: result.tx_hash,
-                local_receipt: Arc::new(result.local_receipt),
-                execution_output: Some(result.execution_output),
-            });
+            wave.record_receipt(StoredReceipt::from(result));
         }
         for wr in tx_outcomes {
             wave.record_execution_result(wr.tx_hash, wr.outcome);
@@ -1516,7 +1512,7 @@ impl ExecutionCoordinator {
             .iter()
             .find(|ec| ec.wave_id == wc.wave_id)
             .expect("WaveCertificate invariant: local EC must be present");
-        let mut receipts: Vec<ReceiptBundle> = Vec::with_capacity(local_ec.tx_outcomes.len());
+        let mut receipts: Vec<StoredReceipt> = Vec::with_capacity(local_ec.tx_outcomes.len());
         for outcome in &local_ec.tx_outcomes {
             if outcome.is_aborted() {
                 continue;
@@ -2423,15 +2419,15 @@ mod tests {
                     success: true,
                 },
             );
-            wave.record_receipt(hyperscale_types::ReceiptBundle {
+            wave.record_receipt(hyperscale_types::StoredReceipt {
                 tx_hash: *h,
-                local_receipt: Arc::new(hyperscale_types::LocalReceipt {
-                    outcome: hyperscale_types::TransactionOutcome::Success,
+                consensus: hyperscale_types::ConsensusReceipt::Succeeded {
+                    receipt_hash: GlobalReceiptHash::ZERO,
                     #[allow(clippy::default_trait_access)]
                     database_updates: Default::default(),
                     application_events: vec![],
-                }),
-                execution_output: None,
+                },
+                metadata: None,
             });
         }
 

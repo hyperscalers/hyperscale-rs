@@ -1,6 +1,6 @@
 //! Receipt storage for `RocksDB`.
 
-use crate::column_families::{ExecutionOutputsCf, LocalReceiptsCf};
+use crate::column_families::{ConsensusReceiptsCf, ExecutionOutputsCf};
 use crate::core::RocksDbStorage;
 use crate::typed_cf::{self, TypedCf};
 
@@ -9,12 +9,12 @@ use rocksdb::WriteBatch;
 use std::sync::Arc;
 
 impl RocksDbStorage {
-    /// Store a receipt bundle (local receipt + optional execution output).
+    /// Store a stored receipt (consensus portion + optional metadata).
     ///
     /// # Panics
     ///
     /// Panics if the underlying `RocksDB` write fails.
-    pub fn store_receipt_bundle(&self, bundle: &hyperscale_types::ReceiptBundle) {
+    pub fn store_receipt_bundle(&self, bundle: &hyperscale_types::StoredReceipt) {
         let mut batch = WriteBatch::default();
         self.add_receipt_bundle_to_batch(&mut batch, bundle);
         self.db
@@ -22,12 +22,12 @@ impl RocksDbStorage {
             .expect("failed to persist receipt bundle");
     }
 
-    /// Store multiple receipt bundles in a single atomic `WriteBatch`.
+    /// Store multiple stored receipts in a single atomic `WriteBatch`.
     ///
     /// # Panics
     ///
     /// Panics if the underlying `RocksDB` write fails.
-    pub fn store_receipt_bundles(&self, bundles: &[hyperscale_types::ReceiptBundle]) {
+    pub fn store_receipt_bundles(&self, bundles: &[hyperscale_types::StoredReceipt]) {
         if bundles.is_empty() {
             return;
         }
@@ -38,48 +38,48 @@ impl RocksDbStorage {
         tracing::debug!(
             count = bundles.len(),
             tx_hashes = ?bundles.iter().map(|b| b.tx_hash).collect::<Vec<_>>(),
-            "Persisting receipt bundles to RocksDB"
+            "Persisting stored receipts to RocksDB"
         );
         self.db
             .write(batch)
-            .expect("failed to persist receipt bundles");
+            .expect("failed to persist stored receipts");
     }
 
-    /// Add a single receipt bundle's writes to an existing `WriteBatch`.
+    /// Add a single stored receipt's writes to an existing `WriteBatch`.
     pub(crate) fn add_receipt_bundle_to_batch(
         &self,
         batch: &mut WriteBatch,
-        bundle: &hyperscale_types::ReceiptBundle,
+        bundle: &hyperscale_types::StoredReceipt,
     ) {
         let cf = self.cf();
 
-        typed_cf::batch_put::<LocalReceiptsCf>(
+        typed_cf::batch_put::<ConsensusReceiptsCf>(
             batch,
-            LocalReceiptsCf::handle(&cf),
+            ConsensusReceiptsCf::handle(&cf),
             bundle.tx_hash.as_raw(),
-            bundle.local_receipt.as_ref(),
+            &bundle.consensus,
         );
 
-        if let Some(ref local) = bundle.execution_output {
+        if let Some(ref metadata) = bundle.metadata {
             typed_cf::batch_put::<ExecutionOutputsCf>(
                 batch,
                 ExecutionOutputsCf::handle(&cf),
                 bundle.tx_hash.as_raw(),
-                local,
+                metadata,
             );
         }
     }
 
-    /// Retrieve the local receipt for a transaction.
-    pub fn get_local_receipt(
+    /// Retrieve the consensus-bound receipt portion for a transaction.
+    pub fn get_consensus_receipt(
         &self,
         tx_hash: &TxHash,
-    ) -> Option<Arc<hyperscale_types::LocalReceipt>> {
-        self.cf_get::<LocalReceiptsCf>(tx_hash.as_raw())
+    ) -> Option<Arc<hyperscale_types::ConsensusReceipt>> {
+        self.cf_get::<ConsensusReceiptsCf>(tx_hash.as_raw())
             .map(Arc::new)
     }
 
-    /// Retrieve execution output details for a transaction.
+    /// Retrieve execution metadata for a transaction.
     pub fn get_execution_output(
         &self,
         tx_hash: &TxHash,

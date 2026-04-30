@@ -15,7 +15,7 @@ use hyperscale_types::Hash;
 #[cfg(test)]
 use hyperscale_types::TxHash;
 use hyperscale_types::{
-    BlockHash, BlockHeight, LocalReceipt, MerkleInclusionProof, NodeId, StateRoot,
+    BlockHash, BlockHeight, ConsensusReceipt, MerkleInclusionProof, NodeId, StateRoot,
 };
 use radix_common::prelude::DatabaseUpdate;
 use radix_substate_store_interface::interface::SubstateDatabase;
@@ -39,7 +39,7 @@ pub struct ChainEntry {
     /// Block height. Used for pruning and version-aware reads.
     pub height: BlockHeight,
     /// Per-tx receipts produced by this block.
-    pub receipts: Vec<Arc<LocalReceipt>>,
+    pub receipts: Vec<Arc<ConsensusReceipt>>,
     /// JMT snapshot from this block's speculative state-root computation.
     pub jmt_snapshot: Arc<JmtSnapshot>,
 }
@@ -206,7 +206,7 @@ pub struct SubstateView<S> {
     /// Per-receipt references for versioned queries
     /// ([`SubstateStore::list_substates_for_node_at_height`]).
     /// Sorted by height ascending.
-    versioned_receipts: Vec<(BlockHeight, Arc<LocalReceipt>)>,
+    versioned_receipts: Vec<(BlockHeight, Arc<ConsensusReceipt>)>,
     /// Lazy cache of base-storage reads observed through this view.
     /// Populated on every overlay-miss `get_raw_substate_by_db_key` call.
     /// Consumed at commit time by `take_base_reads` so `capture_history`
@@ -238,11 +238,16 @@ impl<S> SubstateView<S> {
         let mut overlay: OverlayEntries = HashMap::new();
         let mut jmt_snapshots: Vec<Arc<JmtSnapshot>> = Vec::with_capacity(chain.len());
         let mut jmt_nodes: JmtNodeIndex = HashMap::new();
-        let mut versioned_receipts: Vec<(BlockHeight, Arc<LocalReceipt>)> = Vec::new();
+        let mut versioned_receipts: Vec<(BlockHeight, Arc<ConsensusReceipt>)> = Vec::new();
 
         for entry in chain {
             for receipt in &entry.receipts {
-                apply_database_updates(&mut overlay, &receipt.database_updates);
+                if let ConsensusReceipt::Succeeded {
+                    database_updates, ..
+                } = receipt.as_ref()
+                {
+                    apply_database_updates(&mut overlay, database_updates);
+                }
                 versioned_receipts.push((entry.height, Arc::clone(receipt)));
             }
             for (key, node) in &entry.jmt_snapshot.nodes {
@@ -521,7 +526,13 @@ impl<S: SubstateStore + crate::VersionedStore> SubstateStore for SubstateView<S>
             if *h > block_height {
                 break;
             }
-            let updates = &receipt.database_updates;
+            let ConsensusReceipt::Succeeded {
+                database_updates: updates,
+                ..
+            } = receipt.as_ref()
+            else {
+                continue;
+            };
             if let Some(node_updates) = updates.node_updates.get(&entity_key) {
                 for (&partition_num, partition_updates) in &node_updates.partition_updates {
                     match partition_updates {
@@ -788,7 +799,10 @@ mod tests {
         ) -> Vec<hyperscale_types::WaveCertificate> {
             Vec::new()
         }
-        fn get_local_receipt(&self, _tx_hash: &TxHash) -> Option<Arc<LocalReceipt>> {
+        fn get_consensus_receipt(
+            &self,
+            _tx_hash: &TxHash,
+        ) -> Option<Arc<hyperscale_types::ConsensusReceipt>> {
             None
         }
         fn get_execution_certificates_by_height(
@@ -835,10 +849,9 @@ mod tests {
         updates
     }
 
-    fn make_receipt(updates: DatabaseUpdates) -> Arc<LocalReceipt> {
-        use hyperscale_types::{LocalReceipt, TransactionOutcome};
-        Arc::new(LocalReceipt {
-            outcome: TransactionOutcome::Success,
+    fn make_receipt(updates: DatabaseUpdates) -> Arc<ConsensusReceipt> {
+        Arc::new(ConsensusReceipt::Succeeded {
+            receipt_hash: hyperscale_types::GlobalReceiptHash::ZERO,
             database_updates: updates,
             application_events: vec![],
         })

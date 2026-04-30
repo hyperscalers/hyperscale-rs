@@ -227,8 +227,11 @@ impl hyperscale_storage::ChainReader for SharedStorage {
         self.0.get_certificates_batch(hashes)
     }
 
-    fn get_local_receipt(&self, tx_hash: &TxHash) -> Option<Arc<hyperscale_types::LocalReceipt>> {
-        self.0.get_local_receipt(tx_hash)
+    fn get_consensus_receipt(
+        &self,
+        tx_hash: &TxHash,
+    ) -> Option<Arc<hyperscale_types::ConsensusReceipt>> {
+        self.0.get_consensus_receipt(tx_hash)
     }
 
     fn get_execution_certificates_by_height(

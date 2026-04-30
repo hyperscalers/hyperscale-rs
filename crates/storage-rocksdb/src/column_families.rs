@@ -7,8 +7,8 @@ use crate::typed_cf::{BeU64Codec, DbCodec, HashCodec, JmtKeyCodec, RawCodec, Sbo
 
 use crate::jmt_stored::{StoredNodeKey, VersionedStoredNode};
 use hyperscale_types::{
-    BlockMetadata, ExecutionCertificate, ExecutionMetadata, Hash, LocalReceipt,
-    RoutableTransaction, WaveCertificate,
+    BlockMetadata, ExecutionCertificate, ExecutionMetadata, Hash, RoutableTransaction,
+    WaveCertificate,
 };
 
 // ─── CF name constants ───────────────────────────────────────────────────────
@@ -295,13 +295,13 @@ impl TypedCf for StateHistoryCf {
 
 // Receipts
 
-pub struct LocalReceiptsCf;
-impl TypedCf for LocalReceiptsCf {
+pub struct ConsensusReceiptsCf;
+impl TypedCf for ConsensusReceiptsCf {
     const NAME: &'static str = LOCAL_RECEIPTS_CF;
     type Key = Hash;
-    type Value = LocalReceipt;
+    type Value = hyperscale_types::ConsensusReceipt;
     type KeyCodec = HashCodec;
-    type ValueCodec = SborCodec<LocalReceipt>;
+    type ValueCodec = SborCodec<hyperscale_types::ConsensusReceipt>;
     fn handle<'a>(cf: &CfHandles<'a>) -> &'a rocksdb::ColumnFamily {
         cf.local_receipts
     }

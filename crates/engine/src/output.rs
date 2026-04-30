@@ -6,7 +6,7 @@
 //! [`ExecutedTx`] is the canonical engine-side record. It carries the
 //! consensus-bound portion ([`ConsensusReceipt`]) and the local-only
 //! metadata ([`ExecutionMetadata`]) — same separation the rest of the
-//! system uses (see [`ReceiptBundle`](hyperscale_types::ReceiptBundle)).
+//! system uses (see [`StoredReceipt`](hyperscale_types::StoredReceipt)).
 
 use hyperscale_types::{
     ConsensusReceipt, ExecutionMetadata, ExecutionOutcome, LocalExecutionEntry, TxHash, TxOutcome,

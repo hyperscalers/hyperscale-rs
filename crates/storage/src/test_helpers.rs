@@ -11,10 +11,10 @@ use crate::{
 use hyperscale_types::{
     ApplicationEvent, Block, BlockHash, BlockHeader, BlockHeight, Bls12381G2Signature,
     CertificateRoot, ExecutionCertificate, ExecutionMetadata, ExecutionOutcome, FeeSummary,
-    FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalReceipt, LocalReceiptRoot,
-    LogLevel, NodeId, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, ReceiptBundle, Round,
-    ShardGroupId, SignerBitfield, StateRoot, TransactionOutcome, TransactionRoot, TxHash,
-    TxOutcome, ValidatorId, WaveCertificate, WaveId, WeightedTimestamp, zero_bls_signature,
+    FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalReceiptRoot, LogLevel, NodeId,
+    ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, SignerBitfield,
+    StateRoot, StoredReceipt, TransactionRoot, TxHash, TxOutcome, ValidatorId, WaveCertificate,
+    WaveId, WeightedTimestamp, zero_bls_signature,
 };
 use radix_common::prelude::DatabaseUpdate;
 use radix_substate_store_interface::db_key_mapper::{DatabaseKeyMapper, SpreadPrefixKeyMapper};
@@ -138,19 +138,19 @@ pub fn make_test_qc(block: &Block) -> QuorumCertificate {
     }
 }
 
-/// Build a `ReceiptBundle` with both local receipt and execution output.
+/// Build a `StoredReceipt` with both consensus portion and metadata.
 #[must_use]
-pub fn make_test_receipt_bundle(seed: u8) -> ReceiptBundle {
+pub fn make_test_receipt_bundle(seed: u8) -> StoredReceipt {
     let tx_hash = TxHash::from_raw(Hash::from_bytes(&[seed; 32]));
-    let local_receipt = Arc::new(LocalReceipt {
-        outcome: TransactionOutcome::Success,
+    let consensus = hyperscale_types::ConsensusReceipt::Succeeded {
+        receipt_hash: hyperscale_types::GlobalReceiptHash::ZERO,
         database_updates: DatabaseUpdates::default(),
         application_events: vec![ApplicationEvent {
             type_id: vec![seed],
             data: vec![seed, seed + 1],
         }],
-    });
-    let execution_output = Some(ExecutionMetadata {
+    };
+    let metadata = Some(ExecutionMetadata {
         fee_summary: FeeSummary {
             total_execution_cost: vec![seed],
             total_royalty_cost: vec![],
@@ -160,10 +160,10 @@ pub fn make_test_receipt_bundle(seed: u8) -> ReceiptBundle {
         log_messages: vec![(LogLevel::Info, format!("tx {seed}"))],
         error_message: None,
     });
-    ReceiptBundle {
+    StoredReceipt {
         tx_hash,
-        local_receipt,
-        execution_output,
+        consensus,
+        metadata,
     }
 }
 
