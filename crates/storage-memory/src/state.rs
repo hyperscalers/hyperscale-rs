@@ -148,6 +148,18 @@ impl ConsensusState {
         }
     }
 
+    /// Insert a slice of stored receipts into the consensus + metadata maps.
+    pub(crate) fn insert_receipts(&mut self, receipts: &[hyperscale_types::StoredReceipt]) {
+        for receipt in receipts {
+            self.consensus_receipts
+                .insert(receipt.tx_hash, Arc::clone(&receipt.consensus));
+            if let Some(ref metadata) = receipt.metadata {
+                self.execution_metadata
+                    .insert(receipt.tx_hash, metadata.clone());
+            }
+        }
+    }
+
     /// Prune receipts older than the retention window.
     pub(crate) fn prune_receipts(&mut self, committed_height: BlockHeight) {
         let cutoff = committed_height.saturating_sub(SIM_RECEIPT_RETENTION_BLOCKS);

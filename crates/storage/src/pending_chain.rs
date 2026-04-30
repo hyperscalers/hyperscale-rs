@@ -242,10 +242,7 @@ impl<S> SubstateView<S> {
 
         for entry in chain {
             for receipt in &entry.receipts {
-                if let ConsensusReceipt::Succeeded {
-                    database_updates, ..
-                } = receipt.as_ref()
-                {
+                if let Some(database_updates) = receipt.database_updates() {
                     apply_database_updates(&mut overlay, database_updates);
                 }
                 versioned_receipts.push((entry.height, Arc::clone(receipt)));
@@ -526,11 +523,7 @@ impl<S: SubstateStore + crate::VersionedStore> SubstateStore for SubstateView<S>
             if *h > block_height {
                 break;
             }
-            let ConsensusReceipt::Succeeded {
-                database_updates: updates,
-                ..
-            } = receipt.as_ref()
-            else {
+            let Some(updates) = receipt.database_updates() else {
                 continue;
             };
             if let Some(node_updates) = updates.node_updates.get(&entity_key) {

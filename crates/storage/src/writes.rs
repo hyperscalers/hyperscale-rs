@@ -1,6 +1,6 @@
 //! Utilities for merging, filtering, and reconstructing `DatabaseUpdates`.
 
-use hyperscale_types::{ConsensusReceipt, StoredReceipt};
+use hyperscale_types::StoredReceipt;
 use radix_common::prelude::DatabaseUpdate;
 use radix_substate_store_interface::interface::{
     DatabaseUpdates, NodeDatabaseUpdates, PartitionDatabaseUpdates,
@@ -16,10 +16,7 @@ use std::sync::Arc;
 pub fn merge_updates_from_receipts(receipts: &[StoredReceipt]) -> DatabaseUpdates {
     let mut merged = DatabaseUpdates::default();
     for receipt in receipts {
-        if let ConsensusReceipt::Succeeded {
-            database_updates, ..
-        } = receipt.consensus.as_ref()
-        {
+        if let Some(database_updates) = receipt.consensus.database_updates() {
             merge_into(&mut merged, database_updates);
         }
     }

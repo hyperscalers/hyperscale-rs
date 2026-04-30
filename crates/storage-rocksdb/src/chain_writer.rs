@@ -73,15 +73,9 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
         // Collect per-receipt DatabaseUpdates references — no merge needed.
         // State locking guarantees no key conflicts between receipts, so
         // put_at_version can flatten them directly into JMT work items.
-        // Failed receipts contribute no writes.
         let per_receipt_updates: Vec<&DatabaseUpdates> = receipts
             .iter()
-            .filter_map(|b| match b.consensus.as_ref() {
-                hyperscale_types::ConsensusReceipt::Succeeded {
-                    database_updates, ..
-                } => Some(database_updates),
-                hyperscale_types::ConsensusReceipt::Failed => None,
-            })
+            .filter_map(|r| r.consensus.database_updates())
             .collect();
 
         let (computed_root, collected) = if pending_snapshots.is_empty() {
@@ -115,15 +109,9 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
         );
 
         // Merge updates for the substate WriteBatch (off the state_root critical path).
-        // Failed receipts contribute no writes.
         let updates: Vec<DatabaseUpdates> = receipts
             .iter()
-            .filter_map(|b| match b.consensus.as_ref() {
-                hyperscale_types::ConsensusReceipt::Succeeded {
-                    database_updates, ..
-                } => Some(database_updates.clone()),
-                hyperscale_types::ConsensusReceipt::Failed => None,
-            })
+            .filter_map(|r| r.consensus.database_updates().cloned())
             .collect();
         let merged_updates = hyperscale_storage::merge_database_updates(&updates);
 

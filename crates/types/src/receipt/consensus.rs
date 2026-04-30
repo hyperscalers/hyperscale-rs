@@ -74,6 +74,18 @@ impl ConsensusReceipt {
         matches!(self, Self::Succeeded { .. })
     }
 
+    /// The shard-filtered database updates, or `None` for `Failed`
+    /// (failed transactions produce no writes).
+    #[must_use]
+    pub const fn database_updates(&self) -> Option<&DatabaseUpdates> {
+        match self {
+            Self::Succeeded {
+                database_updates, ..
+            } => Some(database_updates),
+            Self::Failed => None,
+        }
+    }
+
     /// Per-shard receipt hash used as a leaf in `local_receipt_root`.
     ///
     /// Hashes `outcome_byte || event_root || database_updates_hash`.

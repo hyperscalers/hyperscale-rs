@@ -69,15 +69,9 @@ impl ChainWriter for SimStorage {
                 .map(|h| h.0);
 
         // Collect per-receipt DatabaseUpdates references — no merge needed.
-        // Failed receipts contribute no writes.
         let per_receipt_updates: Vec<&hyperscale_storage::DatabaseUpdates> = receipts
             .iter()
-            .filter_map(|b| match b.consensus.as_ref() {
-                hyperscale_types::ConsensusReceipt::Succeeded {
-                    database_updates, ..
-                } => Some(database_updates),
-                hyperscale_types::ConsensusReceipt::Failed => None,
-            })
+            .filter_map(|r| r.consensus.database_updates())
             .collect();
 
         let (result_root, collected) = if pending_snapshots.is_empty() {
@@ -167,14 +161,7 @@ impl ChainWriter for SimStorage {
                         .or_default()
                         .push(wave_id_hash);
                 }
-                for receipt in &prepared.receipts {
-                    c.consensus_receipts
-                        .insert(receipt.tx_hash, Arc::clone(&receipt.consensus));
-                    if let Some(ref metadata) = receipt.metadata {
-                        c.execution_metadata
-                            .insert(receipt.tx_hash, metadata.clone());
-                    }
-                }
+                c.insert_receipts(&prepared.receipts);
                 for fw in block.certificates() {
                     for ec in &fw.certificate.execution_certificates {
                         let canonical_hash = ec.canonical_hash();
@@ -285,14 +272,7 @@ impl SimStorage {
                     .push(wave_id_hash);
             }
             // Store receipts atomically with block commit.
-            for receipt in receipts {
-                c.consensus_receipts
-                    .insert(receipt.tx_hash, Arc::clone(&receipt.consensus));
-                if let Some(ref metadata) = receipt.metadata {
-                    c.execution_metadata
-                        .insert(receipt.tx_hash, metadata.clone());
-                }
-            }
+            c.insert_receipts(receipts);
             // Store execution certificates (extracted from wave certs) atomically.
             for fw in block.certificates() {
                 for ec in &fw.certificate.execution_certificates {
