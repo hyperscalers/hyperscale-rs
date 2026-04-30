@@ -10,7 +10,7 @@ mod provision;
 mod remote_header;
 mod transaction;
 
-pub use block::{ElidedCertifiedBlock, GetBlockResponse, RehydrationMiss};
+pub use block::{ElidedCertifiedBlock, GetBlockResponse, RehydrateError, RehydrationMiss};
 pub use execution_cert::GetExecutionCertsResponse;
 pub use finalized_wave::GetFinalizedWavesResponse;
 pub use local_provision::GetLocalProvisionsResponse;

@@ -23,7 +23,7 @@ use hyperscale_core::{NodeInput, ProtocolEvent};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_engine::Engine;
 use hyperscale_messages::request::Inventory;
-use hyperscale_messages::response::{ElidedCertifiedBlock, RehydrationMiss};
+use hyperscale_messages::response::{ElidedCertifiedBlock, RehydrateError};
 use hyperscale_metrics as metrics;
 use hyperscale_network::{Network, ResponseVerdict};
 use hyperscale_storage::Storage;
@@ -70,10 +70,12 @@ where
         };
         let cert = match self.rehydrate_elided_block(&elided) {
             Ok(c) => c,
-            Err(_miss) => {
-                // Inventory bloom said we had bodies we couldn't resolve.
-                // Mark for full refetch and re-queue.
-                metrics::record_sync_response_error("block", "rehydration_miss");
+            Err(err) => {
+                let reason = match err {
+                    RehydrateError::Missing(_) => "rehydration_miss",
+                    RehydrateError::QcMismatch { .. } => "qc_hash_mismatch",
+                };
+                metrics::record_sync_response_error("block", reason);
                 self.protocols.block_sync.mark_force_full_refetch(height);
                 self.feed_block_sync_fetch_failed(height);
                 return;
@@ -210,7 +212,7 @@ where
     fn rehydrate_elided_block(
         &self,
         elided: &ElidedCertifiedBlock,
-    ) -> Result<CertifiedBlock, RehydrationMiss> {
+    ) -> Result<CertifiedBlock, RehydrateError> {
         let mempool = self.state.mempool();
         let execution = self.state.execution();
         let provision_store = &self.caches.provision_store;
@@ -470,7 +472,8 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_qc_hash_mismatch() {
+    #[should_panic(expected = "CertifiedBlock pairing invariant")]
+    fn certified_block_rejects_qc_hash_mismatch() {
         let block = Block::Live {
             header: header(),
             transactions: vec![],
@@ -479,11 +482,7 @@ mod tests {
         };
         let mut qc = qc_for(&block);
         qc.block_hash = BlockHash::from_raw(Hash::from_bytes(b"wrong"));
-        let certified = CertifiedBlock::new_unchecked(block, qc);
-        assert_eq!(
-            validate_synced_block(HEIGHT, &certified).unwrap_err(),
-            "qc_hash_mismatch"
-        );
+        let _ = CertifiedBlock::new_unchecked(block, qc);
     }
 
     #[test]

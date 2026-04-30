@@ -56,12 +56,21 @@ impl CertifiedBlock {
         Ok(Self { block, qc })
     }
 
-    /// Construct without running the pairing check. Prefer `new_checked`
-    /// outside of tests and internal callers where the invariant is
-    /// guaranteed by construction.
+    /// Pair a block with its QC, panicking if `qc.block_hash` doesn't
+    /// match `block.hash()`. For call sites where the pair is built
+    /// together (genesis, freshly produced blocks, test fixtures) and
+    /// a mismatch indicates a programming error. Use [`new_checked`]
+    /// for any path that consumes externally-sourced QC/block pairs
+    /// (wire decode, storage load).
+    ///
+    /// [`new_checked`]: Self::new_checked
+    ///
+    /// # Panics
+    ///
+    /// Panics if `qc.block_hash != block.hash()`.
     #[must_use]
     pub fn new_unchecked(block: Block, qc: QuorumCertificate) -> Self {
-        debug_assert_eq!(
+        assert_eq!(
             qc.block_hash,
             block.hash(),
             "CertifiedBlock pairing invariant"

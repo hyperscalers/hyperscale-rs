@@ -190,7 +190,18 @@ impl RocksDbStorage {
         metrics::record_storage_read(elapsed);
         metrics::record_storage_operation("get_block_denormalized", elapsed);
 
-        Some(CertifiedBlock::new_unchecked(block, metadata.qc))
+        match CertifiedBlock::new_checked(block, metadata.qc) {
+            Ok(certified) => Some(certified),
+            Err(err) => {
+                tracing::error!(
+                    height = height.0,
+                    block_hash = ?err.block_hash,
+                    qc_block_hash = ?err.qc_block_hash,
+                    "Stored block and QC have mismatched hashes — possible corruption"
+                );
+                None
+            }
+        }
     }
 
     /// Get block metadata only (without fetching transactions/certificates).

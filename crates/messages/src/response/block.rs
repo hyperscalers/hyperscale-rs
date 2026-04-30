@@ -2,10 +2,11 @@
 
 use crate::request::Inventory;
 use hyperscale_types::{
-    Block, BlockHeader, CertifiedBlock, FinalizedWave, MessagePriority, NetworkMessage,
+    Block, BlockHash, BlockHeader, CertifiedBlock, FinalizedWave, MessagePriority, NetworkMessage,
     ProvisionHash, Provisions, QuorumCertificate, RoutableTransaction, TxHash, WaveIdHash,
 };
 use sbor::prelude::BasicSbor;
+use std::fmt;
 use std::sync::Arc;
 
 /// A block in elided wire form.
@@ -115,19 +116,31 @@ impl ElidedCertifiedBlock {
     ///
     /// # Errors
     ///
-    /// Returns [`RehydrationMiss`] when one or more elided bodies could
-    /// not be resolved by the supplied lookup closures.
+    /// Returns [`RehydrateError::Missing`] when one or more elided bodies
+    /// could not be resolved by the supplied lookup closures, or
+    /// [`RehydrateError::QcMismatch`] when the inline QC's `block_hash`
+    /// does not match the inline header's hash.
     pub fn try_rehydrate<FTx, FCert, FProv>(
         &self,
         mut tx_lookup: FTx,
         mut cert_lookup: FCert,
         mut provision_lookup: FProv,
-    ) -> Result<CertifiedBlock, RehydrationMiss>
+    ) -> Result<CertifiedBlock, RehydrateError>
     where
         FTx: FnMut(&TxHash) -> Option<Arc<RoutableTransaction>>,
         FCert: FnMut(&WaveIdHash) -> Option<Arc<FinalizedWave>>,
         FProv: FnMut(&ProvisionHash) -> Option<Arc<Provisions>>,
     {
+        // Header + QC are always inline, so the pairing can be checked
+        // before resolving any bodies. A peer that sends a mismatched
+        // (header, qc) pair fails fast without us doing lookup work.
+        let header_hash = self.header.hash();
+        if self.qc.block_hash != header_hash {
+            return Err(RehydrateError::QcMismatch {
+                header_hash,
+                qc_block_hash: self.qc.block_hash,
+            });
+        }
         let mut miss = RehydrationMiss::default();
         let mut txs = Vec::with_capacity(self.transactions.len());
         for (hash, body) in &self.transactions {
@@ -169,7 +182,7 @@ impl ElidedCertifiedBlock {
         });
 
         if !miss.is_empty() {
-            return Err(miss);
+            return Err(RehydrateError::Missing(miss));
         }
 
         let txs: Vec<Arc<RoutableTransaction>> = txs.into_iter().map(Option::unwrap).collect();
@@ -225,6 +238,40 @@ impl RehydrationMiss {
         self.missing_tx.len() + self.missing_cert.len() + self.missing_provision.len()
     }
 }
+
+/// Why [`ElidedCertifiedBlock::try_rehydrate`] failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RehydrateError {
+    /// One or more elided body hashes could not be resolved by the
+    /// supplied lookup closures. The caller should issue a top-up.
+    Missing(RehydrationMiss),
+    /// The inline QC's `block_hash` does not match the inline header's
+    /// hash. A peer sent an invalid pairing; the response is unusable
+    /// regardless of body availability.
+    QcMismatch {
+        /// Hash of the inline header.
+        header_hash: BlockHash,
+        /// `block_hash` field from the inline QC.
+        qc_block_hash: BlockHash,
+    },
+}
+
+impl fmt::Display for RehydrateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Missing(miss) => write!(f, "{} missing bodies", miss.total()),
+            Self::QcMismatch {
+                header_hash,
+                qc_block_hash,
+            } => write!(
+                f,
+                "qc.block_hash {qc_block_hash:?} does not match header hash {header_hash:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RehydrateError {}
 
 fn matches_filter<T>(filter: Option<&hyperscale_types::BloomFilter<T>>, hash: &T) -> bool
 where
@@ -412,9 +459,12 @@ mod tests {
             provision_have: None,
         };
         let elided = ElidedCertifiedBlock::elide(&block, qc, &inv);
-        let miss = elided
+        let err = elided
             .try_rehydrate(|_| None, |_| None, |_| None)
             .expect_err("rehydration should fail when elided body has no local source");
+        let RehydrateError::Missing(miss) = err else {
+            panic!("expected Missing, got {err:?}");
+        };
         assert_eq!(miss.total(), 1);
         assert_eq!(miss.missing_tx, vec![tx_hash]);
     }
@@ -437,9 +487,12 @@ mod tests {
         };
         let elided = ElidedCertifiedBlock::elide(&block, qc, &inv);
 
-        let miss = elided
+        let err = elided
             .try_rehydrate(|_| None, |_| None, |_| None)
             .expect_err("first pass should miss");
+        let RehydrateError::Missing(miss) = err else {
+            panic!("expected Missing, got {err:?}");
+        };
         assert_eq!(miss.missing_tx, vec![tx_hash]);
 
         let topup_tx = Arc::clone(&tx_arc);
