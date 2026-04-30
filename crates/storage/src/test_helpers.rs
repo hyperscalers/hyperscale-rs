@@ -138,7 +138,9 @@ pub fn make_test_qc(block: &Block) -> QuorumCertificate {
     }
 }
 
-/// Build a `StoredReceipt` with both consensus portion and metadata.
+/// Build a deterministic locally-executed `StoredReceipt` from `seed`
+/// — succeeded, with a single application event and a non-empty fee
+/// summary so equality checks across seeds distinguish entries.
 #[must_use]
 pub fn make_test_receipt(seed: u8) -> StoredReceipt {
     let tx_hash = TxHash::from_raw(Hash::from_bytes(&[seed; 32]));

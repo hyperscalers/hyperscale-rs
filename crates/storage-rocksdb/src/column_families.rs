@@ -65,10 +65,13 @@ pub const STALE_JMT_NODES_CF: &str = "stale_jmt_nodes";
 /// entry itself. Mirrors the `stale_jmt_nodes` pattern.
 pub const STALE_STATE_HISTORY_CF: &str = "stale_state_history";
 
-/// Column family name for local receipts keyed by tx hash.
+/// Column family for the consensus portion of stored receipts, keyed by
+/// tx hash. Companion to [`EXECUTION_METADATA_CF`] (same key, separate CF
+/// so metadata can be pruned on its own cycle).
 pub const CONSENSUS_RECEIPTS_CF: &str = "consensus_receipts";
 
-/// Column family name for execution output details keyed by tx hash.
+/// Column family for the local-only [`ExecutionMetadata`] (fees, logs,
+/// error), keyed by tx hash. Absent when the tx was synced from a peer.
 pub const EXECUTION_METADATA_CF: &str = "execution_metadata";
 
 /// Column family for execution certificates keyed by canonical hash.

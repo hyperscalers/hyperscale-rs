@@ -1523,7 +1523,7 @@ impl ExecutionCoordinator {
                 tracing::error!(
                     wave = %wave_id,
                     tx_hash = ?outcome.tx_hash,
-                    "finalize_wave: non-aborted tx is missing its local receipt \
+                    "finalize_wave: non-aborted tx is missing its stored receipt \
                      (is_complete gate bypassed)"
                 );
             }

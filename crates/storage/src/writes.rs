@@ -9,9 +9,9 @@ use std::sync::Arc;
 
 /// Extract and merge `DatabaseUpdates` from stored receipts.
 ///
-/// This is the canonical way to derive state updates from receipts for
-/// JMT computation and substate writes. Used internally by `ChainWriter`
-/// implementations. Failed transactions contribute no writes.
+/// Canonical projection from receipts to JMT/substate-write input.
+/// Failed receipts contribute nothing (`ConsensusReceipt::database_updates`
+/// returns `None`).
 #[must_use]
 pub fn merge_updates_from_receipts(receipts: &[StoredReceipt]) -> DatabaseUpdates {
     let mut merged = DatabaseUpdates::default();

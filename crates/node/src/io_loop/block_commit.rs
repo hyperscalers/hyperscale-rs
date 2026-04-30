@@ -232,7 +232,7 @@ where
     /// until the task clears it. If a previous task is still running, all
     /// pending commits remain queued for a future flush.
     ///
-    /// Receipt bundles are not drained here — they're already embedded in
+    /// Stored receipts are not drained here — they're already embedded in
     /// each `PreparedCommit`. Writing them in a single task guarantees
     /// ordering: the I/O pool does not guarantee FIFO across separate
     /// `spawn()` calls.

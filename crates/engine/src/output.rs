@@ -15,59 +15,57 @@ use hyperscale_types::{
 /// Output from executing a batch of transactions.
 #[derive(Debug, Clone, Default)]
 pub struct ExecutionOutput {
-    /// Results for each transaction, in the same order as input.
+    /// One [`ExecutedTx`] per input transaction, preserving input order so
+    /// callers can zip results back against their request batch.
     pub results: Vec<ExecutedTx>,
 }
 
+#[allow(missing_docs)] // thin Vec wrapper; methods mirror Vec semantics
 impl ExecutionOutput {
-    /// Create a new execution output.
     #[must_use]
     pub const fn new(results: Vec<ExecutedTx>) -> Self {
         Self { results }
     }
 
-    /// Create an empty output (no transactions).
     #[must_use]
     pub const fn empty() -> Self {
         Self { results: vec![] }
     }
 
-    /// Get the number of results.
     #[must_use]
     pub const fn len(&self) -> usize {
         self.results.len()
     }
 
-    /// Check if the output is empty.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.results.is_empty()
     }
 
-    /// Iterate over results.
     pub fn iter(&self) -> impl Iterator<Item = &ExecutedTx> {
         self.results.iter()
     }
 }
 
-/// Engine output for one transaction.
-///
-/// Holds the canonical fields produced by execution: the consensus
-/// portion (variant-tagged outcome plus, on success, the precomputed
-/// receipt hash and shard-filtered writes/events) and the local-only
-/// metadata (logs, error, fees).
+/// Engine output for one transaction — a [`ConsensusReceipt`] paired with
+/// its [`ExecutionMetadata`]. Convertible to [`StoredReceipt`] via [`From`].
 #[derive(Debug, Clone)]
 pub struct ExecutedTx {
-    /// Hash of the executed transaction.
+    /// Identity of the executed transaction; primary key in downstream
+    /// receipt stores and the join key against `WaveCertificate` outcomes.
     pub tx_hash: TxHash,
-    /// Consensus-bound receipt portion (transferable across peers).
+    /// Hash-stable, peer-transferable portion. Signed over (indirectly,
+    /// via `local_receipt_root`) and shipped on sync.
     pub consensus: ConsensusReceipt,
-    /// Local-only execution metadata (logs, error, fees).
+    /// Node-local diagnostics (fees, logs, error). Never crosses the wire;
+    /// dropped when this record is forwarded to a peer.
     pub metadata: ExecutionMetadata,
 }
 
 impl ExecutedTx {
-    /// Build a record for an executed transaction.
+    /// Build a record from already-projected pieces. Most callers want
+    /// [`crate::receipt::build_executed_tx`] (which projects from a Radix
+    /// `TransactionReceipt`) or [`Self::failure`] / [`Self::failure_with_log`].
     #[must_use]
     pub const fn new(
         tx_hash: TxHash,
@@ -81,11 +79,10 @@ impl ExecutedTx {
         }
     }
 
-    /// Build a canonical failure record for `tx_hash`.
-    ///
-    /// Pure constructor — does not log. Production callers that want
-    /// the failure surfaced should call this through
-    /// [`Self::failure_with_log`].
+    /// Canonical synthetic-failure record. Pure constructor; does not log.
+    /// Use [`Self::failure_with_log`] when the failure has a diagnostic
+    /// string that should hit the logs at the construction site (it does
+    /// not flow downstream).
     #[must_use]
     pub const fn failure(tx_hash: TxHash) -> Self {
         Self {
@@ -95,10 +92,9 @@ impl ExecutedTx {
         }
     }
 
-    /// Convenience: log the error and return a failure record. The
-    /// `error` string does not flow downstream — neither vote
-    /// aggregation nor receipt persistence carry it — so logging at
-    /// the construction site is the only place it surfaces.
+    /// As [`Self::failure`], but emits a `warn!` carrying `error` first.
+    /// The string is dropped after logging — neither the consensus
+    /// receipt nor the metadata carry it downstream.
     #[must_use]
     pub fn failure_with_log(tx_hash: TxHash, error: impl AsRef<str>) -> Self {
         tracing::warn!(
@@ -109,13 +105,14 @@ impl ExecutedTx {
         Self::failure(tx_hash)
     }
 
-    /// Whether the transaction succeeded.
+    /// `true` iff `consensus` is [`ConsensusReceipt::Succeeded`].
     #[must_use]
     pub const fn is_success(&self) -> bool {
         self.consensus.is_success()
     }
 
-    /// Project the wave-vote view ([`TxOutcome`]; small, copyable).
+    /// Project the small, copyable [`TxOutcome`] used in execution votes
+    /// — drops `database_updates`, `application_events`, and metadata.
     #[must_use]
     pub const fn outcome(&self) -> TxOutcome {
         let outcome = match &self.consensus {
@@ -132,7 +129,8 @@ impl ExecutedTx {
 }
 
 impl From<ExecutedTx> for StoredReceipt {
-    /// Engine-produced receipts always carry metadata; wrapped in `Some`.
+    /// `metadata: Some(_)` because engine-produced ⇒ locally executed.
+    /// Sync-ingress sites use [`StoredReceipt::synced`] for the `None` case.
     fn from(tx: ExecutedTx) -> Self {
         Self {
             tx_hash: tx.tx_hash,

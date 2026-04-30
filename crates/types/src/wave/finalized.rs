@@ -11,7 +11,7 @@ use std::sync::Arc;
 /// A finalized wave — all participating shards have reported, `WaveCertificate` created.
 ///
 /// Holds the wave certificate (which contains the execution certificates) plus the
-/// receipt bundles produced by local execution. Receipts are written atomically
+/// stored receipts produced by local execution. Receipts are written atomically
 /// with the block at commit time (not fire-and-forget).
 ///
 /// # Derived views
@@ -31,14 +31,13 @@ use std::sync::Arc;
 pub struct FinalizedWave {
     /// The wave certificate carrying per-shard ECs and tx outcomes.
     pub certificate: Arc<WaveCertificate>,
-    /// Receipt bundles for txs that executed. Aborted txs are absent —
+    /// Stored receipts for txs that executed. Aborted txs are absent —
     /// `receipts.len() <= tx_count()`. Preserves canonical block order.
     /// Held in-memory until block commit, then written atomically with block metadata.
     pub receipts: Vec<StoredReceipt>,
 }
 
 /// Reason a `FinalizedWave`'s receipts don't agree with its own EC.
-/// Returned by [`FinalizedWave::validate_receipts_against_ec`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReceiptValidationError {
     /// The `WaveCertificate` has no EC whose `wave_id == wc.wave_id`.
@@ -198,7 +197,7 @@ impl FinalizedWave {
     /// This does **not** verify `database_updates` or `writes_root` —
     /// `ConsensusReceipt::Succeeded` carries only shard-filtered writes, so the global
     /// `writes_root` the EC commits to can't be reconstructed from a
-    /// local receipt alone. Use to catch gross drift (wrong tx, wrong
+    /// stored receipt alone. Use to catch gross drift (wrong tx, wrong
     /// success/fail, missing or surplus receipts) at peer-wave ingress.
     ///
     /// # Errors
@@ -215,7 +214,7 @@ impl FinalizedWave {
 
         let mut receipt_iter = self.receipts.iter();
         for outcome in &local_ec.tx_outcomes {
-            // Aborted outcomes carry no local receipt; skip.
+            // Aborted outcomes carry no stored receipt; skip.
             let ec_kind = match &outcome.outcome {
                 ExecutionOutcome::Aborted => continue,
                 ExecutionOutcome::Succeeded { receipt_hash } => Some(*receipt_hash),

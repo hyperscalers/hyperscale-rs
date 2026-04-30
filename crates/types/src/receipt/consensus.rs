@@ -40,20 +40,24 @@ pub static FAILED_RECEIPT_HASH: LazyLock<GlobalReceiptHash> = LazyLock::new(|| {
 /// failure is consensus-equivalent.
 #[derive(Debug, Clone, PartialEq, Eq, sbor::prelude::BasicSbor)]
 pub enum ConsensusReceipt {
-    /// Engine committed the transaction; state changes applied.
+    /// Engine committed the tx; carries the precomputed receipt hash and
+    /// the writes/events the local shard needs.
     Succeeded {
-        /// Precomputed hash of the corresponding [`GlobalReceipt`].
-        ///
-        /// Cannot be recomputed from this variant alone — depends on
-        /// `writes_root`, which is derived from globally-filtered
-        /// (non-shard-filtered) updates not carried here.
+        /// Precomputed [`GlobalReceiptHash`] — cannot be recomputed from
+        /// this variant alone, since it folds in `writes_root` derived
+        /// from globally-filtered (not shard-filtered) updates that
+        /// aren't carried here.
         receipt_hash: GlobalReceiptHash,
-        /// Shard-filtered substate writes produced by the transaction.
+        /// Substate writes filtered to the local shard. The global
+        /// `writes_root` on `receipt_hash` covers writes for all shards;
+        /// this field is only what the local shard needs to apply.
         database_updates: DatabaseUpdates,
-        /// Application events emitted during execution.
+        /// Identical across shards for the same tx — events come from
+        /// user logic, which sees the same merged state on every shard.
         application_events: Vec<ApplicationEvent>,
     },
-    /// Engine rejected the transaction; no state changes applied.
+    /// All failures collapse to one variant — the canonical
+    /// [`FAILED_RECEIPT_HASH`] is derived at hash time, no payload needed.
     Failed,
 }
 

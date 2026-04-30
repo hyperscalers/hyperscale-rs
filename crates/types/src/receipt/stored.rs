@@ -11,12 +11,17 @@ use std::sync::Arc;
 /// the local node executed the transaction, `metadata` is `Some`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredReceipt {
-    /// Hash of the executed transaction this receipt belongs to.
+    /// Primary key in the per-tx receipt store and the join key against
+    /// `WaveCertificate` outcomes during validation.
     pub tx_hash: TxHash,
-    /// Consensus-bound portion (transferable across peers, hash-stable).
+    /// Shared via `Arc` so flowing a receipt through `PendingChain`,
+    /// validation, and persistence is `Arc::clone`-cheap rather than
+    /// deep-cloning the substate writes.
     pub consensus: Arc<ConsensusReceipt>,
-    /// Local-only execution metadata (fees, logs, errors). Only
-    /// populated for transactions this node executed locally.
+    /// `Some` ⇔ this node executed the tx locally. Synced-from-peer and
+    /// reconstructed receipts are `None` (peers don't ship metadata),
+    /// and metadata may also be pruned earlier than the consensus
+    /// portion since it's not consensus-critical.
     pub metadata: Option<ExecutionMetadata>,
 }
 

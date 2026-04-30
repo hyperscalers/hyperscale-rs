@@ -9,7 +9,7 @@ use rocksdb::WriteBatch;
 use std::sync::Arc;
 
 impl RocksDbStorage {
-    /// Store a stored receipt (consensus portion + optional metadata).
+    /// One-shot variant of [`Self::store_receipts`] for a single receipt.
     ///
     /// # Panics
     ///
@@ -20,7 +20,9 @@ impl RocksDbStorage {
         self.db.write(batch).expect("failed to persist receipt");
     }
 
-    /// Store multiple stored receipts in a single atomic `WriteBatch`.
+    /// Atomic batch persist — consensus and metadata land together so a
+    /// crash mid-batch can't leave metadata referencing a missing receipt
+    /// (or vice versa).
     ///
     /// # Panics
     ///
@@ -41,7 +43,9 @@ impl RocksDbStorage {
         self.db.write(batch).expect("failed to persist receipts");
     }
 
-    /// Add a single stored receipt's writes to an existing `WriteBatch`.
+    /// Append the receipt's writes to a caller-owned `WriteBatch` so it
+    /// can land atomically with the rest of the block commit (header,
+    /// substate, JMT). Used by `commit_block` / `prepare_block_commit`.
     pub(crate) fn add_receipt_to_batch(
         &self,
         batch: &mut WriteBatch,
@@ -66,7 +70,8 @@ impl RocksDbStorage {
         }
     }
 
-    /// Retrieve the consensus-bound receipt portion for a transaction.
+    /// Read the consensus portion. Present for any tx that committed
+    /// (success or failure); absent for aborted txs and unknown hashes.
     pub fn get_consensus_receipt(
         &self,
         tx_hash: &TxHash,
@@ -75,7 +80,9 @@ impl RocksDbStorage {
             .map(Arc::new)
     }
 
-    /// Retrieve execution metadata for a transaction.
+    /// Read the local-only metadata. `None` when the tx was synced from
+    /// a peer (peers don't ship their metadata) or pruned earlier than
+    /// the consensus portion.
     pub fn get_execution_metadata(
         &self,
         tx_hash: &TxHash,

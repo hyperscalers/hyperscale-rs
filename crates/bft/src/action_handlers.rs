@@ -335,9 +335,9 @@ pub fn verify_certificate_root(
     valid
 }
 
-/// Verify a block's local receipt root against its receipt bundles.
+/// Verify a block's local receipt root against its stored receipts.
 ///
-/// Pure computation over the receipts' `receipt_hash()` values.
+/// Pure computation over the receipts' `local_receipt_hash()` values.
 pub fn verify_local_receipt_root(
     expected_root: LocalReceiptRoot,
     receipts: &[StoredReceipt],
