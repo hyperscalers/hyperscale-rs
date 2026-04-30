@@ -2,8 +2,8 @@
 //! reconstruction, validation, and `Vec<Arc<FinalizedWave>>` SBOR helpers.
 
 use crate::{
-    ConsensusReceipt, ExecutionCertificate, ExecutionOutcome, StoredReceipt, TransactionDecision,
-    TransactionOutcome, TxHash, WaveCertificate, WaveId, WaveIdHash,
+    ConsensusReceipt, ExecutionCertificate, ExecutionOutcome, GlobalReceiptHash, StoredReceipt,
+    TransactionDecision, TxHash, WaveCertificate, WaveId, WaveIdHash,
 };
 use sbor::prelude::*;
 use std::sync::Arc;
@@ -59,15 +59,26 @@ pub enum ReceiptValidationError {
         /// `tx_hash` the receipt actually carried.
         actual: TxHash,
     },
-    /// A receipt's outcome (Success/Failure) disagrees with the EC's
-    /// attested outcome for that tx.
-    OutcomeMismatch {
-        /// Hash of the tx whose outcomes disagree.
+    /// EC attested the tx as `Succeeded` but the stored receipt is `Failed`.
+    UnexpectedFailure {
+        /// Hash of the tx.
         tx_hash: TxHash,
-        /// Outcome attested by the EC.
-        expected: TransactionOutcome,
-        /// Outcome carried by the receipt.
-        actual: TransactionOutcome,
+    },
+    /// EC attested the tx as `Failed` but the stored receipt is `Succeeded`.
+    UnexpectedSuccess {
+        /// Hash of the tx.
+        tx_hash: TxHash,
+    },
+    /// EC's `receipt_hash` for a `Succeeded` tx disagrees with the stored
+    /// receipt's `receipt_hash`. Catches divergent state for the same tx
+    /// across validators that both succeeded but produced different writes.
+    ReceiptHashMismatch {
+        /// Hash of the tx.
+        tx_hash: TxHash,
+        /// `receipt_hash` attested by the EC.
+        expected: GlobalReceiptHash,
+        /// `receipt_hash` carried by the stored receipt.
+        actual: GlobalReceiptHash,
     },
     /// More receipts than non-aborted outcomes.
     ExtraReceipt {
@@ -199,42 +210,52 @@ impl FinalizedWave {
 
         let mut receipt_iter = self.receipts.iter();
         for outcome in &local_ec.tx_outcomes {
-            match outcome.outcome {
-                ExecutionOutcome::Aborted => {
-                    // Aborted outcomes carry no local receipt; skip.
-                }
-                ExecutionOutcome::Succeeded { .. } | ExecutionOutcome::Failed => {
-                    let success = outcome.outcome.is_success();
-                    let receipt =
-                        receipt_iter
-                            .next()
-                            .ok_or(ReceiptValidationError::MissingReceipt {
-                                tx_hash: outcome.tx_hash,
-                            })?;
-                    if receipt.tx_hash != outcome.tx_hash {
-                        return Err(ReceiptValidationError::TxHashMismatch {
-                            expected: outcome.tx_hash,
-                            actual: receipt.tx_hash,
-                        });
-                    }
-                    let expected = if success {
-                        TransactionOutcome::Success
-                    } else {
-                        TransactionOutcome::Failure
-                    };
-                    let actual = if receipt.consensus.is_success() {
-                        TransactionOutcome::Success
-                    } else {
-                        TransactionOutcome::Failure
-                    };
-                    if actual != expected {
-                        return Err(ReceiptValidationError::OutcomeMismatch {
+            // Aborted outcomes carry no local receipt; skip.
+            let ec_kind = match &outcome.outcome {
+                ExecutionOutcome::Aborted => continue,
+                ExecutionOutcome::Succeeded { receipt_hash } => Some(*receipt_hash),
+                ExecutionOutcome::Failed => None,
+            };
+
+            let receipt = receipt_iter
+                .next()
+                .ok_or(ReceiptValidationError::MissingReceipt {
+                    tx_hash: outcome.tx_hash,
+                })?;
+            if receipt.tx_hash != outcome.tx_hash {
+                return Err(ReceiptValidationError::TxHashMismatch {
+                    expected: outcome.tx_hash,
+                    actual: receipt.tx_hash,
+                });
+            }
+
+            match (ec_kind, &receipt.consensus) {
+                (
+                    Some(expected_hash),
+                    ConsensusReceipt::Succeeded {
+                        receipt_hash: actual_hash,
+                        ..
+                    },
+                ) => {
+                    if *actual_hash != expected_hash {
+                        return Err(ReceiptValidationError::ReceiptHashMismatch {
                             tx_hash: outcome.tx_hash,
-                            expected,
-                            actual,
+                            expected: expected_hash,
+                            actual: *actual_hash,
                         });
                     }
                 }
+                (Some(_), ConsensusReceipt::Failed) => {
+                    return Err(ReceiptValidationError::UnexpectedFailure {
+                        tx_hash: outcome.tx_hash,
+                    });
+                }
+                (None, ConsensusReceipt::Succeeded { .. }) => {
+                    return Err(ReceiptValidationError::UnexpectedSuccess {
+                        tx_hash: outcome.tx_hash,
+                    });
+                }
+                (None, ConsensusReceipt::Failed) => { /* match — both Failed */ }
             }
         }
         if let Some(extra) = receipt_iter.next() {

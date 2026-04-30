@@ -637,7 +637,8 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_outcome_flip() {
+    fn validate_rejects_unexpected_failure() {
+        // EC says Succeeded, receipt says Failed.
         let wave_id = make_wave_id(0, BlockHeight(42), &[1]);
         let tx_a = TxHash::from_raw(Hash::from_bytes(b"tx_a"));
         let outcomes = vec![TxOutcome {
@@ -659,7 +660,72 @@ mod tests {
         };
         assert!(matches!(
             fw.validate_receipts_against_ec(),
-            Err(ReceiptValidationError::OutcomeMismatch { .. })
+            Err(ReceiptValidationError::UnexpectedFailure { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_unexpected_success() {
+        // EC says Failed, receipt says Succeeded.
+        let wave_id = make_wave_id(0, BlockHeight(42), &[1]);
+        let tx_a = TxHash::from_raw(Hash::from_bytes(b"tx_a"));
+        let outcomes = vec![TxOutcome {
+            tx_hash: tx_a,
+            outcome: ExecutionOutcome::Failed,
+        }];
+        let fw = FinalizedWave {
+            certificate: Arc::new(WaveCertificate {
+                wave_id: wave_id.clone(),
+                execution_certificates: vec![make_local_ec(&wave_id, outcomes)],
+            }),
+            receipts: vec![StoredReceipt {
+                tx_hash: tx_a,
+                consensus: crate::ConsensusReceipt::Succeeded {
+                    receipt_hash: GlobalReceiptHash::ZERO,
+                    database_updates: DatabaseUpdates::default(),
+                    application_events: vec![],
+                },
+                metadata: None,
+            }],
+        };
+        assert!(matches!(
+            fw.validate_receipts_against_ec(),
+            Err(ReceiptValidationError::UnexpectedSuccess { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_receipt_hash_mismatch() {
+        // Both Succeeded but receipt_hashes disagree — divergent state for the same tx.
+        let wave_id = make_wave_id(0, BlockHeight(42), &[1]);
+        let tx_a = TxHash::from_raw(Hash::from_bytes(b"tx_a"));
+        let ec_hash = GlobalReceiptHash::from_raw(Hash::from_bytes(b"ec"));
+        let receipt_hash = GlobalReceiptHash::from_raw(Hash::from_bytes(b"receipt"));
+        let outcomes = vec![TxOutcome {
+            tx_hash: tx_a,
+            outcome: ExecutionOutcome::Succeeded {
+                receipt_hash: ec_hash,
+            },
+        }];
+        let fw = FinalizedWave {
+            certificate: Arc::new(WaveCertificate {
+                wave_id: wave_id.clone(),
+                execution_certificates: vec![make_local_ec(&wave_id, outcomes)],
+            }),
+            receipts: vec![StoredReceipt {
+                tx_hash: tx_a,
+                consensus: crate::ConsensusReceipt::Succeeded {
+                    receipt_hash,
+                    database_updates: DatabaseUpdates::default(),
+                    application_events: vec![],
+                },
+                metadata: None,
+            }],
+        };
+        assert!(matches!(
+            fw.validate_receipts_against_ec(),
+            Err(ReceiptValidationError::ReceiptHashMismatch { expected, actual, .. })
+                if expected == ec_hash && actual == receipt_hash
         ));
     }
 
