@@ -53,7 +53,7 @@ impl SimulationEngine {
                 .results
                 .into_iter()
                 .next()
-                .unwrap_or_else(|| ExecutedTx::failure(tx_hash, "No result returned"))
+                .unwrap_or_else(|| ExecutedTx::failure_with_log(tx_hash, "No result returned"))
         })
         .clone()
     }

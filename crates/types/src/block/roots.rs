@@ -25,26 +25,22 @@ pub fn compute_certificate_root(certificates: &[Arc<FinalizedWave>]) -> Certific
 
 /// Compute the local receipt merkle root for a block's receipts.
 ///
-/// Each receipt's `receipt_hash()` (includes outcome + events + `database_updates`)
-/// becomes a leaf. Receipts are sorted by `tx_hash` before computing the root
-/// to ensure determinism regardless of collection order (e.g. `HashMap` iteration).
+/// Each receipt's [`ConsensusReceipt::local_receipt_hash`](crate::ConsensusReceipt::local_receipt_hash)
+/// (outcome tag + `event_root` + `database_updates_hash`) becomes a leaf,
+/// in canonical block order — the same order
+/// [`FinalizedWave::validate_receipts_against_ec`](crate::FinalizedWave::validate_receipts_against_ec)
+/// walks them, and the order every construction site (`finalize_wave`,
+/// `FinalizedWave::reconstruct`) builds them.
+///
 /// Returns `Hash::ZERO` if there are no receipts.
 #[must_use]
 pub fn compute_local_receipt_root(receipts: &[StoredReceipt]) -> LocalReceiptRoot {
     if receipts.is_empty() {
         return LocalReceiptRoot::ZERO;
     }
-
-    // Sort by tx_hash for deterministic ordering across validators.
-    let mut sorted: Vec<_> = receipts
+    let leaves: Vec<Hash> = receipts
         .iter()
-        .map(|b| (b.tx_hash, b.consensus.local_receipt_hash()))
-        .collect();
-    sorted.sort_by_key(|(tx_hash, _)| *tx_hash);
-
-    let leaves: Vec<Hash> = sorted
-        .into_iter()
-        .map(|(_, receipt_hash)| receipt_hash)
+        .map(|r| r.consensus.local_receipt_hash())
         .collect();
     LocalReceiptRoot::from_raw(compute_merkle_root(&leaves))
 }

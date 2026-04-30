@@ -349,7 +349,10 @@ where
                         num_shards,
                     );
                     let tx = output.results.pop().unwrap_or_else(|| {
-                        ExecutedTx::failure(req.tx_hash, "No cross-shard execution result returned")
+                        ExecutedTx::failure_with_log(
+                            req.tx_hash,
+                            "No cross-shard execution result returned",
+                        )
                     });
                     (tx.outcome(), StoredReceipt::from(tx))
                 })

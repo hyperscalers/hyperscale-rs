@@ -169,11 +169,9 @@ impl FinalizedWave {
         let mut receipts: Vec<StoredReceipt> = Vec::with_capacity(local_ec.tx_outcomes.len());
         for outcome in &local_ec.tx_outcomes {
             match lookup(&outcome.tx_hash) {
-                Some(receipt) => receipts.push(StoredReceipt {
-                    tx_hash: outcome.tx_hash,
-                    consensus: (*receipt).clone(),
-                    metadata: None,
-                }),
+                Some(receipt) => {
+                    receipts.push(StoredReceipt::synced(outcome.tx_hash, (*receipt).clone()));
+                }
                 None if outcome.is_aborted() => {}
                 None => return None,
             }

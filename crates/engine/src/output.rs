@@ -83,18 +83,30 @@ impl ExecutedTx {
 
     /// Build a canonical failure record for `tx_hash`.
     ///
-    /// `error` is logged at the construction site (it does not flow
-    /// downstream — neither vote aggregation nor receipt persistence
-    /// carry the message).
+    /// Pure constructor — does not log. Production callers that want
+    /// the failure surfaced should call this through
+    /// [`Self::failure_with_log`].
     #[must_use]
-    pub fn failure(tx_hash: TxHash, error: impl Into<String>) -> Self {
-        let error = error.into();
-        tracing::warn!(?tx_hash, %error, "transaction execution failed");
+    pub const fn failure(tx_hash: TxHash) -> Self {
         Self {
             tx_hash,
             consensus: ConsensusReceipt::Failed,
-            metadata: ExecutionMetadata::failure(None),
+            metadata: ExecutionMetadata::failure(),
         }
+    }
+
+    /// Convenience: log the error and return a failure record. The
+    /// `error` string does not flow downstream — neither vote
+    /// aggregation nor receipt persistence carry it — so logging at
+    /// the construction site is the only place it surfaces.
+    #[must_use]
+    pub fn failure_with_log(tx_hash: TxHash, error: impl AsRef<str>) -> Self {
+        tracing::warn!(
+            ?tx_hash,
+            error = error.as_ref(),
+            "transaction execution failed"
+        );
+        Self::failure(tx_hash)
     }
 
     /// Whether the transaction succeeded.
@@ -150,9 +162,9 @@ mod tests {
 
     #[test]
     fn execution_output_preserves_input_order() {
-        let a = ExecutedTx::failure(tx_hash(1), "err-a");
-        let b = ExecutedTx::failure(tx_hash(2), "err-b");
-        let c = ExecutedTx::failure(tx_hash(3), "err-c");
+        let a = ExecutedTx::failure(tx_hash(1));
+        let b = ExecutedTx::failure(tx_hash(2));
+        let c = ExecutedTx::failure(tx_hash(3));
         let out = ExecutionOutput::new(vec![a, b, c]);
 
         let hashes: Vec<TxHash> = out.iter().map(|e| e.tx_hash).collect();
@@ -164,7 +176,7 @@ mod tests {
     #[test]
     fn failure_marks_consensus_as_failed_and_carries_tx_hash() {
         let h = tx_hash(7);
-        let exec = ExecutedTx::failure(h, "boom");
+        let exec = ExecutedTx::failure(h);
 
         assert_eq!(exec.tx_hash, h);
         assert!(!exec.is_success());
@@ -175,8 +187,8 @@ mod tests {
     fn failure_receipt_hash_is_canonical_across_failures() {
         // All failures share the canonical FAILED_RECEIPT_HASH; downstream
         // vote aggregation matches by tx_hash, not by receipt_hash.
-        let a = ExecutedTx::failure(tx_hash(1), "err");
-        let b = ExecutedTx::failure(tx_hash(2), "different");
+        let a = ExecutedTx::failure(tx_hash(1));
+        let b = ExecutedTx::failure(tx_hash(2));
         assert_eq!(a.consensus.receipt_hash(), b.consensus.receipt_hash());
         assert_ne!(a.tx_hash, b.tx_hash);
     }

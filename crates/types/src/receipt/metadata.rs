@@ -65,9 +65,16 @@ pub struct ExecutionMetadata {
 }
 
 impl ExecutionMetadata {
-    /// Create a failure execution output.
+    /// Create a failure metadata record with no error message.
+    ///
+    /// Used by the engine's synthetic-failure path
+    /// ([`ExecutedTx::failure`](../../../../engine/src/output.rs))
+    /// where no Radix-produced diagnostic exists. Real failed receipts
+    /// from `build_execution_metadata` populate `error_message` directly
+    /// from Radix's [`RuntimeError`](radix_engine::errors)/[`RejectionReason`](radix_engine::errors)/[`AbortReason`](radix_engine::transaction::AbortReason)
+    /// rather than going through a constructor.
     #[must_use]
-    pub const fn failure(error: Option<String>) -> Self {
+    pub const fn failure() -> Self {
         Self {
             fee_summary: FeeSummary {
                 total_execution_cost: vec![],
@@ -76,7 +83,7 @@ impl ExecutionMetadata {
                 total_tipping_cost: vec![],
             },
             log_messages: vec![],
-            error_message: error,
+            error_message: None,
         }
     }
 }

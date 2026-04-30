@@ -19,6 +19,20 @@ pub struct StoredReceipt {
     pub metadata: Option<ExecutionMetadata>,
 }
 
+impl StoredReceipt {
+    /// Construct a synced receipt — consensus only, no local metadata.
+    /// Use at sync-ingress sites where peer-shipped receipts arrive
+    /// without their originator's logs/fees/errors.
+    #[must_use]
+    pub const fn synced(tx_hash: TxHash, consensus: ConsensusReceipt) -> Self {
+        Self {
+            tx_hash,
+            consensus,
+            metadata: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -50,7 +64,10 @@ mod tests {
         let local = StoredReceipt {
             tx_hash: TxHash::from_raw(Hash::from_bytes(b"local_tx")),
             consensus: ConsensusReceipt::Failed,
-            metadata: Some(ExecutionMetadata::failure(Some("test error".to_string()))),
+            metadata: Some(ExecutionMetadata {
+                error_message: Some("test error".into()),
+                ..ExecutionMetadata::failure()
+            }),
         };
         assert!(local.metadata.is_some());
         assert!(!local.consensus.is_success());

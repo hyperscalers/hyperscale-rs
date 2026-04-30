@@ -66,7 +66,7 @@ pub const STALE_JMT_NODES_CF: &str = "stale_jmt_nodes";
 pub const STALE_STATE_HISTORY_CF: &str = "stale_state_history";
 
 /// Column family name for local receipts keyed by tx hash.
-pub const LOCAL_RECEIPTS_CF: &str = "local_receipts";
+pub const CONSENSUS_RECEIPTS_CF: &str = "consensus_receipts";
 
 /// Column family name for execution output details keyed by tx hash.
 pub const EXECUTION_METADATA_CF: &str = "execution_metadata";
@@ -96,7 +96,7 @@ pub const ALL_COLUMN_FAMILIES: &[&str] = &[
     CERTIFICATES_CF,
     JMT_NODES_CF,
     STALE_JMT_NODES_CF,
-    LOCAL_RECEIPTS_CF,
+    CONSENSUS_RECEIPTS_CF,
     EXECUTION_METADATA_CF,
     EXECUTION_CERTS_CF,
     EXECUTION_CERTS_BY_HEIGHT_CF,
@@ -119,7 +119,7 @@ pub struct CfHandles<'a> {
     certificates: &'a rocksdb::ColumnFamily,
     jmt_nodes: &'a rocksdb::ColumnFamily,
     stale_jmt_nodes: &'a rocksdb::ColumnFamily,
-    local_receipts: &'a rocksdb::ColumnFamily,
+    consensus_receipts: &'a rocksdb::ColumnFamily,
     execution_metadata: &'a rocksdb::ColumnFamily,
     execution_certs: &'a rocksdb::ColumnFamily,
     execution_certs_by_height: &'a rocksdb::ColumnFamily,
@@ -144,7 +144,7 @@ impl<'a> CfHandles<'a> {
             certificates: resolve(CERTIFICATES_CF),
             jmt_nodes: resolve(JMT_NODES_CF),
             stale_jmt_nodes: resolve(STALE_JMT_NODES_CF),
-            local_receipts: resolve(LOCAL_RECEIPTS_CF),
+            consensus_receipts: resolve(CONSENSUS_RECEIPTS_CF),
             execution_metadata: resolve(EXECUTION_METADATA_CF),
             execution_certs: resolve(EXECUTION_CERTS_CF),
             execution_certs_by_height: resolve(EXECUTION_CERTS_BY_HEIGHT_CF),
@@ -297,13 +297,13 @@ impl TypedCf for StateHistoryCf {
 
 pub struct ConsensusReceiptsCf;
 impl TypedCf for ConsensusReceiptsCf {
-    const NAME: &'static str = LOCAL_RECEIPTS_CF;
+    const NAME: &'static str = CONSENSUS_RECEIPTS_CF;
     type Key = Hash;
     type Value = hyperscale_types::ConsensusReceipt;
     type KeyCodec = HashCodec;
     type ValueCodec = SborCodec<hyperscale_types::ConsensusReceipt>;
     fn handle<'a>(cf: &CfHandles<'a>) -> &'a rocksdb::ColumnFamily {
-        cf.local_receipts
+        cf.consensus_receipts
     }
 }
 

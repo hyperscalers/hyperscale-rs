@@ -147,7 +147,7 @@ impl RadixExecutor {
         // Get-or-validate is cached on RoutableTransaction; avoids
         // re-checking signatures already checked at RPC ingress.
         let Some(validated) = tx.get_or_validate(&self.caches.validator) else {
-            return ExecutedTx::failure(tx.hash(), "Validation failed");
+            return ExecutedTx::failure_with_log(tx.hash(), "Validation failed");
         };
         let executable = validated.clone().create_executable();
 
@@ -239,7 +239,7 @@ impl Engine for RadixExecutor {
 
         for tx in transactions {
             let Some(validated) = tx.get_or_validate(&self.caches.validator) else {
-                results.push(ExecutedTx::failure(tx.hash(), "Validation failed"));
+                results.push(ExecutedTx::failure_with_log(tx.hash(), "Validation failed"));
                 continue;
             };
             let executable = validated.clone().create_executable();

@@ -55,7 +55,7 @@ pub fn build_executed_tx<S: SubstateDatabase>(
 
     let TransactionResult::Commit(commit) = &receipt.result else {
         let error = format!("{:?}", receipt.result);
-        return ExecutedTx::failure(tx.hash(), error);
+        return ExecutedTx::failure_with_log(tx.hash(), &error);
     };
 
     let success = matches!(
