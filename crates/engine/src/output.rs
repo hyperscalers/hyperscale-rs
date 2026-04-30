@@ -9,7 +9,7 @@
 //! system uses (see [`StoredReceipt`](hyperscale_types::StoredReceipt)).
 
 use hyperscale_types::{
-    ConsensusReceipt, ExecutionMetadata, ExecutionOutcome, LocalExecutionEntry, TxHash, TxOutcome,
+    ConsensusReceipt, ExecutionMetadata, ExecutionOutcome, StoredReceipt, TxHash, TxOutcome,
 };
 
 /// Output from executing a batch of transactions.
@@ -109,9 +109,7 @@ impl ExecutedTx {
         self.consensus.is_success()
     }
 
-    /// Project the wave-vote view (legacy [`TxOutcome`] shape; small,
-    /// copyable). Used at the engine→state-machine boundary during
-    /// the `unify-receipt-types` migration.
+    /// Project the wave-vote view ([`TxOutcome`]; small, copyable).
     #[must_use]
     pub const fn outcome(&self) -> TxOutcome {
         let outcome = match &self.consensus {
@@ -125,17 +123,16 @@ impl ExecutedTx {
             outcome,
         }
     }
+}
 
-    /// Project the persistence view (legacy [`LocalExecutionEntry`]
-    /// shape). Used at the engine→state-machine boundary during the
-    /// `unify-receipt-types` migration.
-    #[must_use]
-    pub fn into_entry(self) -> LocalExecutionEntry {
-        LocalExecutionEntry {
-            tx_hash: self.tx_hash,
-            receipt_hash: self.consensus.receipt_hash(),
-            local_receipt: self.consensus.to_local_receipt(),
-            execution_output: self.metadata,
+impl From<ExecutedTx> for StoredReceipt {
+    /// Bridge from engine output to storage shape: metadata is always
+    /// present (the engine always produces it), so wrapped in `Some`.
+    fn from(tx: ExecutedTx) -> Self {
+        Self {
+            tx_hash: tx.tx_hash,
+            consensus: tx.consensus,
+            metadata: Some(tx.metadata),
         }
     }
 }

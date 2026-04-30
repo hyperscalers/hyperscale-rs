@@ -303,7 +303,7 @@ pub enum ProtocolEvent {
         /// The wave whose execution produced these results.
         wave_id: WaveId,
         /// Per-tx local execution entries (database updates + receipt).
-        results: Vec<hyperscale_types::LocalExecutionEntry>,
+        results: Vec<hyperscale_types::StoredReceipt>,
         /// Per-tx outcomes extracted on the handler thread for vote signing.
         tx_outcomes: Vec<TxOutcome>,
     },

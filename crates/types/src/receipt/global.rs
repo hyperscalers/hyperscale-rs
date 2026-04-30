@@ -1,6 +1,6 @@
 //! Cross-shard agreement receipt (Tier 1).
 
-use crate::{EventRoot, GlobalReceiptHash, Hash, TransactionOutcome, WritesRoot};
+use crate::{EventRoot, GlobalReceiptHash, Hash, WritesRoot};
 
 /// Cross-shard agreement receipt — ensures validators on different shards
 /// executing the same transaction reach the same outcome.
@@ -13,8 +13,8 @@ use crate::{EventRoot, GlobalReceiptHash, Hash, TransactionOutcome, WritesRoot};
 /// Ephemeral — never written to storage, only lives for EC aggregation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, sbor::prelude::BasicSbor)]
 pub struct GlobalReceipt {
-    /// Whether the engine committed or rejected the transaction.
-    pub outcome: TransactionOutcome,
+    /// Whether the engine committed (`true`) or rejected (`false`) the transaction.
+    pub success: bool,
     /// Merkle root of application event hashes.
     pub event_root: EventRoot,
     /// Merkle root of declared-only, system-filtered global database writes.
@@ -30,17 +30,9 @@ impl GlobalReceipt {
     /// Compute the global receipt hash.
     ///
     /// This is the value signed over in execution votes and stored on certificates.
-    ///
-    /// # Panics
-    ///
-    /// Cannot panic: outcome maps to a fixed-size byte and roots are
-    /// fixed-size hashes.
     #[must_use]
     pub fn receipt_hash(&self) -> GlobalReceiptHash {
-        let outcome_byte = match self.outcome {
-            TransactionOutcome::Success => [1u8],
-            TransactionOutcome::Failure => [0u8],
-        };
+        let outcome_byte = if self.success { [1u8] } else { [0u8] };
         GlobalReceiptHash::from_raw(Hash::from_parts(&[
             &outcome_byte,
             self.event_root.as_raw().as_bytes(),

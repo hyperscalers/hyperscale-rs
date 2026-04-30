@@ -191,7 +191,7 @@ impl FinalizedWave {
     /// success/failure outcome.
     ///
     /// This does **not** verify `database_updates` or `writes_root` —
-    /// `LocalReceipt` carries only shard-filtered writes, so the global
+    /// `ConsensusReceipt::Succeeded` carries only shard-filtered writes, so the global
     /// `writes_root` the EC commits to can't be reconstructed from a
     /// local receipt alone. Use to catch gross drift (wrong tx, wrong
     /// success/fail, missing or surplus receipts) at peer-wave ingress.

@@ -1,6 +1,6 @@
 //! Persisted receipt — consensus portion plus optional local metadata.
 
-use crate::{ConsensusReceipt, ExecutionMetadata, LocalExecutionEntry, TransactionOutcome, TxHash};
+use crate::{ConsensusReceipt, ExecutionMetadata, TxHash};
 
 /// A persisted receipt: consensus-bound portion paired with optional
 /// local-only metadata.
@@ -17,26 +17,6 @@ pub struct StoredReceipt {
     /// Local-only execution metadata (fees, logs, errors). Only
     /// populated for transactions this node executed locally.
     pub metadata: Option<ExecutionMetadata>,
-}
-
-impl From<LocalExecutionEntry> for StoredReceipt {
-    /// Bridge from the legacy engine-output shape during the
-    /// `unify-receipt-types` migration. Removed in the legacy-cleanup commit.
-    fn from(entry: LocalExecutionEntry) -> Self {
-        let consensus = match entry.local_receipt.outcome {
-            TransactionOutcome::Success => ConsensusReceipt::Succeeded {
-                receipt_hash: entry.receipt_hash,
-                database_updates: entry.local_receipt.database_updates,
-                application_events: entry.local_receipt.application_events,
-            },
-            TransactionOutcome::Failure => ConsensusReceipt::Failed,
-        };
-        Self {
-            tx_hash: entry.tx_hash,
-            consensus,
-            metadata: Some(entry.execution_output),
-        }
-    }
 }
 
 #[cfg(test)]

@@ -3,9 +3,9 @@
 use hyperscale_core::{Action, CrossShardExecutionRequest};
 use hyperscale_types::{
     BlockHash, Bls12381G1PublicKey, Bls12381G2Signature, ExecutionCertificate, ExecutionVote,
-    GlobalReceiptRoot, RoutableTransaction, SignerBitfield, StateProvision, StateRoot, TxHash,
-    ValidatorId, WaveId, WeightedTimestamp, batch_verify_bls_same_message, exec_vote_message,
-    verify_bls12381_v1, zero_bls_signature,
+    GlobalReceiptRoot, RoutableTransaction, SignerBitfield, StateProvision, StateRoot,
+    StoredReceipt, TxHash, ValidatorId, WaveId, WeightedTimestamp, batch_verify_bls_same_message,
+    exec_vote_message, verify_bls12381_v1, zero_bls_signature,
 };
 #[cfg(test)]
 use hyperscale_types::{GlobalReceiptHash, Hash};
@@ -316,7 +316,7 @@ where
             let (tx_outcomes, results): (Vec<_>, Vec<_>) = output
                 .results
                 .into_iter()
-                .map(|tx| (tx.outcome(), tx.into_entry()))
+                .map(|tx| (tx.outcome(), StoredReceipt::from(tx)))
                 .unzip();
             metrics::record_execution_latency(start.elapsed().as_secs_f64());
             (ctx.notify)(NodeInput::Protocol(Box::new(
@@ -351,7 +351,7 @@ where
                     let tx = output.results.pop().unwrap_or_else(|| {
                         ExecutedTx::failure(req.tx_hash, "No cross-shard execution result returned")
                     });
-                    (tx.outcome(), tx.into_entry())
+                    (tx.outcome(), StoredReceipt::from(tx))
                 })
                 .unzip();
             metrics::record_execution_latency(start.elapsed().as_secs_f64());

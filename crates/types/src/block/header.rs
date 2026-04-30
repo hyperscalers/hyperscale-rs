@@ -68,8 +68,9 @@ pub struct BlockHeader {
     /// For empty blocks (genesis, fallback, no certificates), this is `CertificateRoot::ZERO`.
     pub certificate_root: CertificateRoot,
 
-    /// Merkle root of per-tx `LocalReceipt` hashes for all transactions
-    /// covered by this block's wave certificates.
+    /// Merkle root of per-tx consensus-receipt hashes
+    /// ([`ConsensusReceipt::local_receipt_hash`](crate::ConsensusReceipt::local_receipt_hash))
+    /// for all transactions covered by this block's wave certificates.
     ///
     /// Commits to the specific per-tx state deltas (shard-filtered `DatabaseUpdates`)
     /// that were applied to produce `state_root`. Enables per-tx delta attribution

@@ -13,18 +13,18 @@
 
 use crate::{
     ApplicationEvent, DatabaseUpdates, EventRoot, GlobalReceipt, GlobalReceiptHash, Hash,
-    TransactionOutcome, WritesRoot,
+    WritesRoot, compute_merkle_root,
 };
 use std::sync::LazyLock;
 
 /// Canonical receipt hash for any failed transaction.
 ///
 /// All failed transactions hash to the same value — derived from the
-/// fixed `(Failure, EventRoot::ZERO, WritesRoot::ZERO)` triple. Cached
-/// to avoid recomputing per failure.
+/// fixed `(success=false, EventRoot::ZERO, WritesRoot::ZERO)` triple.
+/// Cached to avoid recomputing per failure.
 pub static FAILED_RECEIPT_HASH: LazyLock<GlobalReceiptHash> = LazyLock::new(|| {
     GlobalReceipt {
-        outcome: TransactionOutcome::Failure,
+        success: false,
         event_root: EventRoot::ZERO,
         writes_root: WritesRoot::ZERO,
     }
@@ -76,32 +76,37 @@ impl ConsensusReceipt {
 
     /// Per-shard receipt hash used as a leaf in `local_receipt_root`.
     ///
-    /// Includes outcome + `event_root` + `database_updates_hash`. Equivalent
-    /// to [`LocalReceipt::receipt_hash`](crate::LocalReceipt::receipt_hash)
-    /// applied to the projection of `self`.
+    /// Hashes `outcome_byte || event_root || database_updates_hash`.
+    /// `Failed` produces the same hash as a no-write/no-event failure.
+    ///
+    /// # Panics
+    ///
+    /// Panics if SBOR encoding of `database_updates` fails — `DatabaseUpdates`
+    /// is a closed SBOR type and encoding is infallible in practice.
     #[must_use]
     pub fn local_receipt_hash(&self) -> Hash {
-        self.to_local_receipt().receipt_hash()
-    }
-
-    /// Project to the legacy [`LocalReceipt`](crate::LocalReceipt) shape.
-    ///
-    /// Used at the engine→state-machine boundary during the
-    /// `unify-receipt-types` migration. Will be removed once all
-    /// consumers consume `ConsensusReceipt` directly.
-    #[must_use]
-    pub fn to_local_receipt(&self) -> crate::LocalReceipt {
-        match self {
+        let (outcome_byte, event_root, database_updates) = match self {
             Self::Succeeded {
                 database_updates,
                 application_events,
                 ..
-            } => crate::LocalReceipt {
-                outcome: TransactionOutcome::Success,
-                database_updates: database_updates.clone(),
-                application_events: application_events.clone(),
-            },
-            Self::Failed => crate::LocalReceipt::failure(),
-        }
+            } => {
+                let event_hashes: Vec<Hash> = application_events
+                    .iter()
+                    .map(ApplicationEvent::hash)
+                    .collect();
+                let event_root = compute_merkle_root(&event_hashes);
+                ([1u8], event_root, database_updates.clone())
+            }
+            Self::Failed => ([0u8], Hash::ZERO, DatabaseUpdates::default()),
+        };
+        let updates_bytes =
+            sbor::prelude::basic_encode(&database_updates).expect("encode should not fail");
+        let updates_hash = Hash::from_bytes(&updates_bytes);
+        Hash::from_parts(&[
+            &outcome_byte,
+            event_root.as_bytes(),
+            updates_hash.as_bytes(),
+        ])
     }
 }
