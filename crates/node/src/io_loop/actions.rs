@@ -358,10 +358,9 @@ where
             // Insert JMT snapshot into PendingChain so child blocks'
             // VerifyStateRoot can find this block's tree nodes via the overlay.
             let jmt_snapshot = Arc::new(S::jmt_snapshot(&prepared).clone());
-            let receipts: Vec<Arc<hyperscale_types::LocalReceipt>> = finalized_waves
+            let receipts: Vec<Arc<hyperscale_types::ConsensusReceipt>> = finalized_waves
                 .iter()
-                .flat_map(|fw| fw.receipts.iter())
-                .map(|b| Arc::clone(&b.local_receipt))
+                .flat_map(|fw| fw.consensus_receipts())
                 .collect();
             self.pending_chain.insert(
                 block_hash,

@@ -7,8 +7,8 @@ use crate::typed_cf::{BeU64Codec, DbCodec, HashCodec, JmtKeyCodec, RawCodec, Sbo
 
 use crate::jmt_stored::{StoredNodeKey, VersionedStoredNode};
 use hyperscale_types::{
-    BlockMetadata, ExecutionCertificate, ExecutionMetadata, Hash, LocalReceipt,
-    RoutableTransaction, WaveCertificate,
+    BlockMetadata, ExecutionCertificate, ExecutionMetadata, Hash, RoutableTransaction,
+    WaveCertificate,
 };
 
 // ─── CF name constants ───────────────────────────────────────────────────────
@@ -65,11 +65,14 @@ pub const STALE_JMT_NODES_CF: &str = "stale_jmt_nodes";
 /// entry itself. Mirrors the `stale_jmt_nodes` pattern.
 pub const STALE_STATE_HISTORY_CF: &str = "stale_state_history";
 
-/// Column family name for local receipts keyed by tx hash.
-pub const LOCAL_RECEIPTS_CF: &str = "local_receipts";
+/// Column family for the consensus portion of stored receipts, keyed by
+/// tx hash. Companion to [`EXECUTION_METADATA_CF`] (same key, separate CF
+/// so metadata can be pruned on its own cycle).
+pub const CONSENSUS_RECEIPTS_CF: &str = "consensus_receipts";
 
-/// Column family name for execution output details keyed by tx hash.
-pub const EXECUTION_OUTPUTS_CF: &str = "execution_outputs";
+/// Column family for the local-only [`ExecutionMetadata`] (fees, logs,
+/// error), keyed by tx hash. Absent when the tx was synced from a peer.
+pub const EXECUTION_METADATA_CF: &str = "execution_metadata";
 
 /// Column family for execution certificates keyed by canonical hash.
 pub const EXECUTION_CERTS_CF: &str = "execution_certs";
@@ -96,8 +99,8 @@ pub const ALL_COLUMN_FAMILIES: &[&str] = &[
     CERTIFICATES_CF,
     JMT_NODES_CF,
     STALE_JMT_NODES_CF,
-    LOCAL_RECEIPTS_CF,
-    EXECUTION_OUTPUTS_CF,
+    CONSENSUS_RECEIPTS_CF,
+    EXECUTION_METADATA_CF,
     EXECUTION_CERTS_CF,
     EXECUTION_CERTS_BY_HEIGHT_CF,
 ];
@@ -119,8 +122,8 @@ pub struct CfHandles<'a> {
     certificates: &'a rocksdb::ColumnFamily,
     jmt_nodes: &'a rocksdb::ColumnFamily,
     stale_jmt_nodes: &'a rocksdb::ColumnFamily,
-    local_receipts: &'a rocksdb::ColumnFamily,
-    execution_outputs: &'a rocksdb::ColumnFamily,
+    consensus_receipts: &'a rocksdb::ColumnFamily,
+    execution_metadata: &'a rocksdb::ColumnFamily,
     execution_certs: &'a rocksdb::ColumnFamily,
     execution_certs_by_height: &'a rocksdb::ColumnFamily,
 }
@@ -144,8 +147,8 @@ impl<'a> CfHandles<'a> {
             certificates: resolve(CERTIFICATES_CF),
             jmt_nodes: resolve(JMT_NODES_CF),
             stale_jmt_nodes: resolve(STALE_JMT_NODES_CF),
-            local_receipts: resolve(LOCAL_RECEIPTS_CF),
-            execution_outputs: resolve(EXECUTION_OUTPUTS_CF),
+            consensus_receipts: resolve(CONSENSUS_RECEIPTS_CF),
+            execution_metadata: resolve(EXECUTION_METADATA_CF),
             execution_certs: resolve(EXECUTION_CERTS_CF),
             execution_certs_by_height: resolve(EXECUTION_CERTS_BY_HEIGHT_CF),
         }
@@ -295,27 +298,27 @@ impl TypedCf for StateHistoryCf {
 
 // Receipts
 
-pub struct LocalReceiptsCf;
-impl TypedCf for LocalReceiptsCf {
-    const NAME: &'static str = LOCAL_RECEIPTS_CF;
+pub struct ConsensusReceiptsCf;
+impl TypedCf for ConsensusReceiptsCf {
+    const NAME: &'static str = CONSENSUS_RECEIPTS_CF;
     type Key = Hash;
-    type Value = LocalReceipt;
+    type Value = hyperscale_types::ConsensusReceipt;
     type KeyCodec = HashCodec;
-    type ValueCodec = SborCodec<LocalReceipt>;
+    type ValueCodec = SborCodec<hyperscale_types::ConsensusReceipt>;
     fn handle<'a>(cf: &CfHandles<'a>) -> &'a rocksdb::ColumnFamily {
-        cf.local_receipts
+        cf.consensus_receipts
     }
 }
 
-pub struct ExecutionOutputsCf;
-impl TypedCf for ExecutionOutputsCf {
-    const NAME: &'static str = EXECUTION_OUTPUTS_CF;
+pub struct ExecutionMetadataCf;
+impl TypedCf for ExecutionMetadataCf {
+    const NAME: &'static str = EXECUTION_METADATA_CF;
     type Key = Hash;
     type Value = ExecutionMetadata;
     type KeyCodec = HashCodec;
     type ValueCodec = SborCodec<ExecutionMetadata>;
     fn handle<'a>(cf: &CfHandles<'a>) -> &'a rocksdb::ColumnFamily {
-        cf.execution_outputs
+        cf.execution_metadata
     }
 }
 

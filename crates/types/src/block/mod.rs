@@ -117,11 +117,10 @@ mod tests {
                 GlobalReceiptRoot::from_raw(Hash::from_bytes(&[seed + 100; 4])),
                 vec![TxOutcome {
                     tx_hash: TxHash::from_raw(Hash::from_bytes(&[seed; 4])),
-                    outcome: ExecutionOutcome::Executed {
+                    outcome: ExecutionOutcome::Succeeded {
                         receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(
                             &[seed + 50; 4],
                         )),
-                        success: true,
                     },
                 }],
                 Bls12381G2Signature([0u8; 96]),
@@ -155,9 +154,8 @@ mod tests {
             GlobalReceiptRoot::from_raw(Hash::from_bytes(b"receipt")),
             vec![TxOutcome {
                 tx_hash: TxHash::from_raw(Hash::from_bytes(b"tx1")),
-                outcome: ExecutionOutcome::Executed {
+                outcome: ExecutionOutcome::Succeeded {
                     receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(b"rh")),
-                    success: true,
                 },
             }],
             Bls12381G2Signature([0u8; 96]),

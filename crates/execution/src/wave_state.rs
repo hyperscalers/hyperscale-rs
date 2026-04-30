@@ -26,7 +26,7 @@
 
 use hyperscale_types::{
     BlockHash, BlockHeight, ExecutionCertificate, ExecutionCertificateHash, ExecutionOutcome,
-    GlobalReceiptRoot, ReceiptBundle, RoutableTransaction, ShardGroupId, TransactionDecision,
+    GlobalReceiptRoot, RoutableTransaction, ShardGroupId, StoredReceipt, TransactionDecision,
     TxHash, TxOutcome, WAVE_TIMEOUT, WaveCertificate, WaveId, WeightedTimestamp,
     compute_global_receipt_root,
 };
@@ -92,7 +92,7 @@ pub struct WaveState {
     /// the wave (rather than a process-wide cache) prevents a receipt from a
     /// locally-executed tx from leaking into a `FinalizedWave` whose EC later
     /// attests that tx as `Aborted` — the `ExtraReceipt` race.
-    execution_receipts: HashMap<TxHash, ReceiptBundle>,
+    execution_receipts: HashMap<TxHash, StoredReceipt>,
     /// Explicit aborts from `ConflictDetector`. Distinct from remote-reported
     /// aborts in `tracker_aborted` — these are local pre-vote decisions.
     explicit_aborts: HashSet<TxHash>,
@@ -322,13 +322,13 @@ impl WaveState {
     /// Paired with `record_execution_result`: both flow from the same
     /// `ExecutionBatchCompleted` event and are scoped to this wave. Receipts
     /// for txs not in the wave are silently dropped.
-    pub fn record_receipt(&mut self, bundle: ReceiptBundle) {
-        if !self.tx_hash_set.contains(&bundle.tx_hash) {
+    pub fn record_receipt(&mut self, receipt: StoredReceipt) {
+        if !self.tx_hash_set.contains(&receipt.tx_hash) {
             return;
         }
         self.execution_receipts
-            .entry(bundle.tx_hash)
-            .or_insert(bundle);
+            .entry(receipt.tx_hash)
+            .or_insert(receipt);
     }
 
     /// Number of receipts currently held by this wave. Exposed for memory
@@ -346,7 +346,7 @@ impl WaveState {
     /// is expected; for a non-aborted outcome it indicates the
     /// `has_local_receipts_for_non_aborted` gate was bypassed, which would
     /// be a bug.
-    pub fn take_receipt(&mut self, tx_hash: &TxHash) -> Option<ReceiptBundle> {
+    pub fn take_receipt(&mut self, tx_hash: &TxHash) -> Option<StoredReceipt> {
         self.execution_receipts.remove(tx_hash)
     }
 
@@ -529,10 +529,7 @@ impl WaveState {
                 if outcome.is_aborted() {
                     self.tracker_aborted.insert(outcome.tx_hash);
                 }
-                if !matches!(
-                    outcome.outcome,
-                    ExecutionOutcome::Executed { success: true, .. }
-                ) {
+                if !matches!(outcome.outcome, ExecutionOutcome::Succeeded { .. }) {
                     self.tx_has_failure.insert(outcome.tx_hash);
                 }
             }
@@ -556,7 +553,8 @@ impl WaveState {
     /// (when the vote arrived first).
     ///
     /// `global_receipt_root` commits to each tx's
-    /// `LocalReceipt::receipt_hash` (which folds in `database_updates`),
+    /// [`ConsensusReceipt::receipt_hash`](hyperscale_types::ConsensusReceipt::receipt_hash)
+    /// (which folds in `writes_root` derived from `database_updates`),
     /// so a root mismatch is direct proof that local execution produced
     /// different writes than the quorum. Latches `locally_divergent` to
     /// keep the wave out of the `finalized` store; the canonical
@@ -772,8 +770,7 @@ impl WaveState {
 mod tests {
     use super::*;
     use hyperscale_types::{
-        Bls12381G2Signature, GlobalReceiptHash, Hash, LocalReceipt, SignerBitfield,
-        TransactionOutcome,
+        Bls12381G2Signature, GlobalReceiptHash, Hash, SignerBitfield,
         test_utils::{test_node, test_transaction_with_nodes},
     };
 
@@ -832,9 +829,12 @@ mod tests {
     }
 
     fn executed(success: bool) -> ExecutionOutcome {
-        ExecutionOutcome::Executed {
-            receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(b"r")),
-            success,
+        if success {
+            ExecutionOutcome::Succeeded {
+                receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(b"r")),
+            }
+        } else {
+            ExecutionOutcome::Failed
         }
     }
 
@@ -844,19 +844,19 @@ mod tests {
     /// alone — the `is_complete` gate keys off `execution_receipts`.
     fn record_executed(w: &mut WaveState, tx_hash: TxHash, success: bool) {
         w.record_execution_result(tx_hash, executed(success));
-        w.record_receipt(ReceiptBundle {
+        w.record_receipt(StoredReceipt {
             tx_hash,
-            local_receipt: Arc::new(LocalReceipt {
-                outcome: if success {
-                    TransactionOutcome::Success
-                } else {
-                    TransactionOutcome::Failure
-                },
-                #[allow(clippy::default_trait_access)]
-                database_updates: Default::default(),
-                application_events: vec![],
+            consensus: Arc::new(if success {
+                hyperscale_types::ConsensusReceipt::Succeeded {
+                    receipt_hash: hyperscale_types::GlobalReceiptHash::ZERO,
+                    #[allow(clippy::default_trait_access)]
+                    database_updates: Default::default(),
+                    application_events: vec![],
+                }
+            } else {
+                hyperscale_types::ConsensusReceipt::Failed
             }),
-            execution_output: None,
+            metadata: None,
         });
     }
 
@@ -985,7 +985,7 @@ mod tests {
         let (_, _, outcomes) = w.build_vote_data(ts_for(WAVE_START + 3)).unwrap();
         assert!(matches!(
             outcomes[0].outcome,
-            ExecutionOutcome::Executed { .. }
+            ExecutionOutcome::Succeeded { .. } | ExecutionOutcome::Failed
         ));
         assert!(matches!(outcomes[1].outcome, ExecutionOutcome::Aborted));
     }
@@ -1115,7 +1115,7 @@ mod tests {
     fn locally_divergent_when_vote_root_disagrees_with_admitted_ec() {
         // Local vote computed root R1 (from this validator's database_updates).
         // Quorum aggregated EC with root R2 (other validators' agreed root).
-        // R1 != R2 ⇒ this validator's `LocalReceipt.database_updates`
+        // R1 != R2 ⇒ this validator's `ConsensusReceipt::Succeeded.database_updates`
         // differs from canonical. Wave must not finalize locally; the
         // canonical `FinalizedWave` is recovered later via block-sync.
         let mut w = make_single_shard_wave(2);
@@ -1253,7 +1253,7 @@ mod tests {
         let (_, _, outcomes) = w.build_vote_data(ts_for(WAVE_START + 2)).unwrap();
         assert!(matches!(
             outcomes[0].outcome,
-            ExecutionOutcome::Executed { success: true, .. }
+            ExecutionOutcome::Succeeded { .. }
         ));
     }
 

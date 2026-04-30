@@ -2,8 +2,8 @@
 //! reconstruction, validation, and `Vec<Arc<FinalizedWave>>` SBOR helpers.
 
 use crate::{
-    ExecutionCertificate, ExecutionOutcome, LocalReceipt, ReceiptBundle, TransactionDecision,
-    TransactionOutcome, TxHash, WaveCertificate, WaveId, WaveIdHash,
+    ConsensusReceipt, ExecutionCertificate, ExecutionOutcome, GlobalReceiptHash, StoredReceipt,
+    TransactionDecision, TxHash, WaveCertificate, WaveId, WaveIdHash,
 };
 use sbor::prelude::*;
 use std::sync::Arc;
@@ -11,7 +11,7 @@ use std::sync::Arc;
 /// A finalized wave — all participating shards have reported, `WaveCertificate` created.
 ///
 /// Holds the wave certificate (which contains the execution certificates) plus the
-/// receipt bundles produced by local execution. Receipts are written atomically
+/// stored receipts produced by local execution. Receipts are written atomically
 /// with the block at commit time (not fire-and-forget).
 ///
 /// # Derived views
@@ -31,14 +31,13 @@ use std::sync::Arc;
 pub struct FinalizedWave {
     /// The wave certificate carrying per-shard ECs and tx outcomes.
     pub certificate: Arc<WaveCertificate>,
-    /// Receipt bundles for txs that executed. Aborted txs are absent —
+    /// Stored receipts for txs that executed. Aborted txs are absent —
     /// `receipts.len() <= tx_count()`. Preserves canonical block order.
     /// Held in-memory until block commit, then written atomically with block metadata.
-    pub receipts: Vec<ReceiptBundle>,
+    pub receipts: Vec<StoredReceipt>,
 }
 
 /// Reason a `FinalizedWave`'s receipts don't agree with its own EC.
-/// Returned by [`FinalizedWave::validate_receipts_against_ec`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReceiptValidationError {
     /// The `WaveCertificate` has no EC whose `wave_id == wc.wave_id`.
@@ -59,15 +58,26 @@ pub enum ReceiptValidationError {
         /// `tx_hash` the receipt actually carried.
         actual: TxHash,
     },
-    /// A receipt's outcome (Success/Failure) disagrees with the EC's
-    /// attested outcome for that tx.
-    OutcomeMismatch {
-        /// Hash of the tx whose outcomes disagree.
+    /// EC attested the tx as `Succeeded` but the stored receipt is `Failed`.
+    UnexpectedFailure {
+        /// Hash of the tx.
         tx_hash: TxHash,
-        /// Outcome attested by the EC.
-        expected: TransactionOutcome,
-        /// Outcome carried by the receipt.
-        actual: TransactionOutcome,
+    },
+    /// EC attested the tx as `Failed` but the stored receipt is `Succeeded`.
+    UnexpectedSuccess {
+        /// Hash of the tx.
+        tx_hash: TxHash,
+    },
+    /// EC's `receipt_hash` for a `Succeeded` tx disagrees with the stored
+    /// receipt's `receipt_hash`. Catches divergent state for the same tx
+    /// across validators that both succeeded but produced different writes.
+    ReceiptHashMismatch {
+        /// Hash of the tx.
+        tx_hash: TxHash,
+        /// `receipt_hash` attested by the EC.
+        expected: GlobalReceiptHash,
+        /// `receipt_hash` carried by the stored receipt.
+        actual: GlobalReceiptHash,
     },
     /// More receipts than non-aborted outcomes.
     ExtraReceipt {
@@ -120,6 +130,13 @@ impl FinalizedWave {
         self.local_ec().tx_outcomes.len()
     }
 
+    /// Iterator over each receipt's consensus payload, in canonical
+    /// block order. Used by pending-chain insertion and local-receipt
+    /// root verification.
+    pub fn consensus_receipts(&self) -> impl Iterator<Item = Arc<crate::ConsensusReceipt>> + '_ {
+        self.receipts.iter().map(|r| Arc::clone(&r.consensus))
+    }
+
     /// Iterator over the wave's tx hashes in canonical block order.
     pub fn tx_hashes(&self) -> impl Iterator<Item = TxHash> + '_ {
         self.local_ec().tx_outcomes.iter().map(|o| o.tx_hash)
@@ -148,21 +165,19 @@ impl FinalizedWave {
     ///   has incomplete state — syncing peer should try a different source).
     pub fn reconstruct<F>(certificate: Arc<WaveCertificate>, mut lookup: F) -> Option<Self>
     where
-        F: FnMut(&TxHash) -> Option<Arc<LocalReceipt>>,
+        F: FnMut(&TxHash) -> Option<Arc<ConsensusReceipt>>,
     {
         let local_ec = certificate
             .execution_certificates
             .iter()
             .find(|ec| ec.wave_id == certificate.wave_id)?;
 
-        let mut receipts: Vec<ReceiptBundle> = Vec::with_capacity(local_ec.tx_outcomes.len());
+        let mut receipts: Vec<StoredReceipt> = Vec::with_capacity(local_ec.tx_outcomes.len());
         for outcome in &local_ec.tx_outcomes {
             match lookup(&outcome.tx_hash) {
-                Some(receipt) => receipts.push(ReceiptBundle {
-                    tx_hash: outcome.tx_hash,
-                    local_receipt: receipt,
-                    execution_output: None,
-                }),
+                Some(receipt) => {
+                    receipts.push(StoredReceipt::synced(outcome.tx_hash, receipt));
+                }
                 None if outcome.is_aborted() => {}
                 None => return None,
             }
@@ -180,9 +195,9 @@ impl FinalizedWave {
     /// success/failure outcome.
     ///
     /// This does **not** verify `database_updates` or `writes_root` —
-    /// `LocalReceipt` carries only shard-filtered writes, so the global
+    /// `ConsensusReceipt::Succeeded` carries only shard-filtered writes, so the global
     /// `writes_root` the EC commits to can't be reconstructed from a
-    /// local receipt alone. Use to catch gross drift (wrong tx, wrong
+    /// stored receipt alone. Use to catch gross drift (wrong tx, wrong
     /// success/fail, missing or surplus receipts) at peer-wave ingress.
     ///
     /// # Errors
@@ -199,36 +214,52 @@ impl FinalizedWave {
 
         let mut receipt_iter = self.receipts.iter();
         for outcome in &local_ec.tx_outcomes {
-            match outcome.outcome {
-                ExecutionOutcome::Aborted => {
-                    // Aborted outcomes carry no local receipt; skip.
-                }
-                ExecutionOutcome::Executed { success, .. } => {
-                    let receipt =
-                        receipt_iter
-                            .next()
-                            .ok_or(ReceiptValidationError::MissingReceipt {
-                                tx_hash: outcome.tx_hash,
-                            })?;
-                    if receipt.tx_hash != outcome.tx_hash {
-                        return Err(ReceiptValidationError::TxHashMismatch {
-                            expected: outcome.tx_hash,
-                            actual: receipt.tx_hash,
-                        });
-                    }
-                    let expected = if success {
-                        TransactionOutcome::Success
-                    } else {
-                        TransactionOutcome::Failure
-                    };
-                    if receipt.local_receipt.outcome != expected {
-                        return Err(ReceiptValidationError::OutcomeMismatch {
+            // Aborted outcomes carry no stored receipt; skip.
+            let ec_kind = match &outcome.outcome {
+                ExecutionOutcome::Aborted => continue,
+                ExecutionOutcome::Succeeded { receipt_hash } => Some(*receipt_hash),
+                ExecutionOutcome::Failed => None,
+            };
+
+            let receipt = receipt_iter
+                .next()
+                .ok_or(ReceiptValidationError::MissingReceipt {
+                    tx_hash: outcome.tx_hash,
+                })?;
+            if receipt.tx_hash != outcome.tx_hash {
+                return Err(ReceiptValidationError::TxHashMismatch {
+                    expected: outcome.tx_hash,
+                    actual: receipt.tx_hash,
+                });
+            }
+
+            match (ec_kind, receipt.consensus.as_ref()) {
+                (
+                    Some(expected_hash),
+                    ConsensusReceipt::Succeeded {
+                        receipt_hash: actual_hash,
+                        ..
+                    },
+                ) => {
+                    if *actual_hash != expected_hash {
+                        return Err(ReceiptValidationError::ReceiptHashMismatch {
                             tx_hash: outcome.tx_hash,
-                            expected,
-                            actual: receipt.local_receipt.outcome,
+                            expected: expected_hash,
+                            actual: *actual_hash,
                         });
                     }
                 }
+                (Some(_), ConsensusReceipt::Failed) => {
+                    return Err(ReceiptValidationError::UnexpectedFailure {
+                        tx_hash: outcome.tx_hash,
+                    });
+                }
+                (None, ConsensusReceipt::Succeeded { .. }) => {
+                    return Err(ReceiptValidationError::UnexpectedSuccess {
+                        tx_hash: outcome.tx_hash,
+                    });
+                }
+                (None, ConsensusReceipt::Failed) => { /* match — both Failed */ }
             }
         }
         if let Some(extra) = receipt_iter.next() {
@@ -251,10 +282,7 @@ impl FinalizedWave {
                 if outcome.is_aborted() {
                     aborted.insert(outcome.tx_hash);
                 }
-                if !matches!(
-                    outcome.outcome,
-                    ExecutionOutcome::Executed { success: true, .. }
-                ) {
+                if !matches!(outcome.outcome, ExecutionOutcome::Succeeded { .. }) {
                     failure.insert(outcome.tx_hash);
                 }
             }
@@ -308,7 +336,7 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
             });
         }
         let certificate: WaveCertificate = decoder.decode()?;
-        let receipts: Vec<ReceiptBundle> = decoder.decode()?;
+        let receipts: Vec<StoredReceipt> = decoder.decode()?;
         Ok(Self {
             certificate: Arc::new(certificate),
             receipts,

@@ -5,7 +5,7 @@ use crate::core::RocksDbStorage;
 use crate::jmt_snapshot_store::SnapshotTreeStore;
 
 use hyperscale_storage::JmtSnapshot;
-use hyperscale_types::{BlockHeight, ReceiptBundle};
+use hyperscale_types::{BlockHeight, StoredReceipt};
 use radix_substate_store_interface::interface::DatabaseUpdates;
 use rocksdb::WriteBatch;
 use std::sync::Arc;
@@ -40,7 +40,7 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
         pending_snapshots: &[std::sync::Arc<hyperscale_storage::JmtSnapshot>],
         base_reads: Option<&hyperscale_storage::BaseReadCache>,
     ) -> (hyperscale_types::StateRoot, Self::PreparedCommit) {
-        let receipts: Vec<&ReceiptBundle> = finalized_waves
+        let receipts: Vec<&StoredReceipt> = finalized_waves
             .iter()
             .flat_map(|fw| fw.receipts.iter())
             .collect();
@@ -75,7 +75,7 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
         // put_at_version can flatten them directly into JMT work items.
         let per_receipt_updates: Vec<&DatabaseUpdates> = receipts
             .iter()
-            .map(|b| &b.local_receipt.database_updates)
+            .filter_map(|r| r.consensus.database_updates())
             .collect();
 
         let (computed_root, collected) = if pending_snapshots.is_empty() {
@@ -111,7 +111,7 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
         // Merge updates for the substate WriteBatch (off the state_root critical path).
         let updates: Vec<DatabaseUpdates> = receipts
             .iter()
-            .map(|b| b.local_receipt.database_updates.clone())
+            .filter_map(|r| r.consensus.database_updates().cloned())
             .collect();
         let merged_updates = hyperscale_storage::merge_database_updates(&updates);
 
@@ -123,8 +123,8 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
             base_reads,
         );
 
-        for bundle in &receipts {
-            self.add_receipt_bundle_to_batch(&mut write_batch, bundle);
+        for receipt in &receipts {
+            self.add_receipt_to_batch(&mut write_batch, receipt);
         }
 
         let prepared = RocksDbPreparedCommit {
@@ -206,7 +206,7 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
         block: &Arc<hyperscale_types::Block>,
         qc: &Arc<hyperscale_types::QuorumCertificate>,
     ) -> hyperscale_types::StateRoot {
-        let receipts: Vec<ReceiptBundle> = block
+        let receipts: Vec<StoredReceipt> = block
             .certificates()
             .iter()
             .flat_map(|fw| fw.receipts.iter().cloned())
@@ -249,7 +249,7 @@ impl RocksDbStorage {
         merged_updates: &DatabaseUpdates,
         block: &Arc<hyperscale_types::Block>,
         qc: &Arc<hyperscale_types::QuorumCertificate>,
-        receipts: &[ReceiptBundle],
+        receipts: &[StoredReceipt],
     ) -> hyperscale_types::StateRoot {
         let block_height = block.height().0;
         let _commit_guard = self.commit_lock.lock().unwrap();
@@ -277,8 +277,8 @@ impl RocksDbStorage {
         crate::execution_certs::append_block_certs_to_batch(self, &mut batch, block);
 
         // Add receipts to the batch atomically.
-        for bundle in receipts {
-            self.add_receipt_bundle_to_batch(&mut batch, bundle);
+        for receipt in receipts {
+            self.add_receipt_to_batch(&mut batch, receipt);
         }
 
         // Compute JMT update.

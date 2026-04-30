@@ -4,7 +4,7 @@ use crate::core::SimStorage;
 use crate::state::apply_updates;
 
 use hyperscale_storage::{ChainWriter, DatabaseUpdates, JmtSnapshot};
-use hyperscale_types::{BlockHeight, CertifiedBlock, ReceiptBundle, StateRoot};
+use hyperscale_types::{BlockHeight, CertifiedBlock, StateRoot, StoredReceipt};
 use std::sync::Arc;
 
 /// Precomputed commit work for a `SimStorage` block commit.
@@ -14,7 +14,7 @@ use std::sync::Arc;
 pub struct SimPreparedCommit {
     snapshot: JmtSnapshot,
     merged_updates: DatabaseUpdates,
-    receipts: Vec<ReceiptBundle>,
+    receipts: Vec<StoredReceipt>,
 }
 
 impl ChainWriter for SimStorage {
@@ -35,7 +35,7 @@ impl ChainWriter for SimStorage {
         // hint is irrelevant to its perf and is ignored.
         _base_reads: Option<&hyperscale_storage::BaseReadCache>,
     ) -> (StateRoot, Self::PreparedCommit) {
-        let receipts: Vec<ReceiptBundle> = finalized_waves
+        let receipts: Vec<StoredReceipt> = finalized_waves
             .iter()
             .flat_map(|fw| fw.receipts.iter().cloned())
             .collect();
@@ -71,7 +71,7 @@ impl ChainWriter for SimStorage {
         // Collect per-receipt DatabaseUpdates references — no merge needed.
         let per_receipt_updates: Vec<&hyperscale_storage::DatabaseUpdates> = receipts
             .iter()
-            .map(|b| &b.local_receipt.database_updates)
+            .filter_map(|r| r.consensus.database_updates())
             .collect();
 
         let (result_root, collected) = if pending_snapshots.is_empty() {
@@ -161,14 +161,7 @@ impl ChainWriter for SimStorage {
                         .or_default()
                         .push(wave_id_hash);
                 }
-                for bundle in &prepared.receipts {
-                    c.local_receipts
-                        .insert(bundle.tx_hash, bundle.local_receipt.clone());
-                    if let Some(ref exec_output) = bundle.execution_output {
-                        c.execution_outputs
-                            .insert(bundle.tx_hash, exec_output.clone());
-                    }
-                }
+                c.insert_receipts(&prepared.receipts);
                 for fw in block.certificates() {
                     for ec in &fw.certificate.execution_certificates {
                         let canonical_hash = ec.canonical_hash();
@@ -194,7 +187,7 @@ impl ChainWriter for SimStorage {
         block: &Arc<hyperscale_types::Block>,
         qc: &Arc<hyperscale_types::QuorumCertificate>,
     ) -> StateRoot {
-        let receipts: Vec<ReceiptBundle> = block
+        let receipts: Vec<StoredReceipt> = block
             .certificates()
             .iter()
             .flat_map(|fw| fw.receipts.iter().cloned())
@@ -211,7 +204,7 @@ impl SimStorage {
         merged_updates: &DatabaseUpdates,
         block: &Arc<hyperscale_types::Block>,
         qc: &Arc<hyperscale_types::QuorumCertificate>,
-        receipts: &[ReceiptBundle],
+        receipts: &[StoredReceipt],
     ) -> StateRoot {
         let block_height = block.height();
         let mut s = self.state.write().unwrap();
@@ -279,14 +272,7 @@ impl SimStorage {
                     .push(wave_id_hash);
             }
             // Store receipts atomically with block commit.
-            for bundle in receipts {
-                c.local_receipts
-                    .insert(bundle.tx_hash, bundle.local_receipt.clone());
-                if let Some(ref exec_output) = bundle.execution_output {
-                    c.execution_outputs
-                        .insert(bundle.tx_hash, exec_output.clone());
-                }
-            }
+            c.insert_receipts(receipts);
             // Store execution certificates (extracted from wave certs) atomically.
             for fw in block.certificates() {
                 for ec in &fw.certificate.execution_certificates {

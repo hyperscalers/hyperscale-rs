@@ -40,9 +40,9 @@
 use hyperscale_core::{Action, FetchPeers, FetchRequest, ProtocolEvent, ProvisionsRequest};
 use hyperscale_types::{
     Attempt, Block, BlockHash, BlockHeight, BloomFilter, ExecutionCertificate, ExecutionVote,
-    GlobalReceiptRoot, LocalExecutionEntry, NodeId, Provisions, ReceiptBundle, RoutableTransaction,
-    ShardGroupId, TopologySnapshot, TxHash, TxOutcome, ValidatorId, WAVE_TIMEOUT, WaveCertificate,
-    WaveId, WaveIdHash, WeightedTimestamp,
+    GlobalReceiptRoot, NodeId, Provisions, RoutableTransaction, ShardGroupId, StoredReceipt,
+    TopologySnapshot, TxHash, TxOutcome, ValidatorId, WAVE_TIMEOUT, WaveCertificate, WaveId,
+    WaveIdHash, WeightedTimestamp,
 };
 #[cfg(test)]
 use hyperscale_types::{ExecutionOutcome, Hash};
@@ -467,7 +467,7 @@ impl ExecutionCoordinator {
     pub fn on_execution_batch_completed(
         &mut self,
         wave_id: &WaveId,
-        results: Vec<LocalExecutionEntry>,
+        results: Vec<StoredReceipt>,
         tx_outcomes: Vec<TxOutcome>,
     ) -> Vec<Action> {
         if results.is_empty() && tx_outcomes.is_empty() {
@@ -486,11 +486,7 @@ impl ExecutionCoordinator {
             return Vec::new();
         };
         for result in results {
-            wave.record_receipt(ReceiptBundle {
-                tx_hash: result.tx_hash,
-                local_receipt: Arc::new(result.local_receipt),
-                execution_output: Some(result.execution_output),
-            });
+            wave.record_receipt(result);
         }
         for wr in tx_outcomes {
             wave.record_execution_result(wr.tx_hash, wr.outcome);
@@ -1516,18 +1512,18 @@ impl ExecutionCoordinator {
             .iter()
             .find(|ec| ec.wave_id == wc.wave_id)
             .expect("WaveCertificate invariant: local EC must be present");
-        let mut receipts: Vec<ReceiptBundle> = Vec::with_capacity(local_ec.tx_outcomes.len());
+        let mut receipts: Vec<StoredReceipt> = Vec::with_capacity(local_ec.tx_outcomes.len());
         for outcome in &local_ec.tx_outcomes {
             if outcome.is_aborted() {
                 continue;
             }
-            if let Some(bundle) = wave.take_receipt(&outcome.tx_hash) {
-                receipts.push(bundle);
+            if let Some(receipt) = wave.take_receipt(&outcome.tx_hash) {
+                receipts.push(receipt);
             } else {
                 tracing::error!(
                     wave = %wave_id,
                     tx_hash = ?outcome.tx_hash,
-                    "finalize_wave: non-aborted tx is missing its local receipt \
+                    "finalize_wave: non-aborted tx is missing its stored receipt \
                      (is_complete gate bypassed)"
                 );
             }
@@ -2409,29 +2405,27 @@ mod tests {
             .iter()
             .map(|h| hyperscale_types::TxOutcome {
                 tx_hash: *h,
-                outcome: ExecutionOutcome::Executed {
+                outcome: ExecutionOutcome::Succeeded {
                     receipt_hash: GlobalReceiptHash::ZERO,
-                    success: true,
                 },
             })
             .collect();
         for h in &tx_hashes {
             wave.record_execution_result(
                 *h,
-                ExecutionOutcome::Executed {
+                ExecutionOutcome::Succeeded {
                     receipt_hash: GlobalReceiptHash::ZERO,
-                    success: true,
                 },
             );
-            wave.record_receipt(hyperscale_types::ReceiptBundle {
+            wave.record_receipt(hyperscale_types::StoredReceipt {
                 tx_hash: *h,
-                local_receipt: Arc::new(hyperscale_types::LocalReceipt {
-                    outcome: hyperscale_types::TransactionOutcome::Success,
+                consensus: Arc::new(hyperscale_types::ConsensusReceipt::Succeeded {
+                    receipt_hash: GlobalReceiptHash::ZERO,
                     #[allow(clippy::default_trait_access)]
                     database_updates: Default::default(),
                     application_events: vec![],
                 }),
-                execution_output: None,
+                metadata: None,
             });
         }
 

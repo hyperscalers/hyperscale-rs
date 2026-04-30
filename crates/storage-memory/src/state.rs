@@ -9,9 +9,9 @@ use hyperscale_storage::{
     DatabaseUpdate, DatabaseUpdates, DbPartitionKey, JmtSnapshot, PartitionDatabaseUpdates, keys,
 };
 use hyperscale_types::{
-    BlockHash, BlockHeight, CertifiedBlock, ExecutionCertificate, ExecutionCertificateHash,
-    ExecutionMetadata, LocalReceipt, QuorumCertificate, RoutableTransaction, ShardGroupId,
-    StateRoot, TxHash, WaveCertificate, WaveIdHash,
+    BlockHash, BlockHeight, CertifiedBlock, ConsensusReceipt, ExecutionCertificate,
+    ExecutionCertificateHash, ExecutionMetadata, QuorumCertificate, RoutableTransaction,
+    ShardGroupId, StateRoot, TxHash, WaveCertificate, WaveIdHash,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -107,10 +107,10 @@ pub struct ConsensusState {
     pub transactions: HashMap<TxHash, RoutableTransaction>,
     /// Wave certificates indexed by identity hash.
     pub certificates: HashMap<WaveIdHash, WaveCertificate>,
-    /// Local receipts keyed by transaction hash.
-    pub local_receipts: HashMap<TxHash, Arc<LocalReceipt>>,
+    /// Consensus receipts keyed by transaction hash.
+    pub consensus_receipts: HashMap<TxHash, Arc<ConsensusReceipt>>,
     /// Execution output details keyed by transaction hash.
-    pub execution_outputs: HashMap<TxHash, ExecutionMetadata>,
+    pub execution_metadata: HashMap<TxHash, ExecutionMetadata>,
     /// Insertion height for each receipt, enabling height-based pruning.
     pub receipt_heights: HashMap<TxHash, BlockHeight>,
     /// Execution certificates keyed by canonical hash.
@@ -137,14 +137,26 @@ impl ConsensusState {
             committed_qc: None,
             transactions: HashMap::new(),
             certificates: HashMap::new(),
-            local_receipts: HashMap::new(),
-            execution_outputs: HashMap::new(),
+            consensus_receipts: HashMap::new(),
+            execution_metadata: HashMap::new(),
             receipt_heights: HashMap::new(),
             execution_certs: HashMap::new(),
             execution_certs_by_height: HashMap::new(),
             wave_certs_by_height: HashMap::new(),
             tx_to_wave: HashMap::new(),
             tx_to_ec: HashMap::new(),
+        }
+    }
+
+    /// Insert a slice of stored receipts into the consensus + metadata maps.
+    pub(crate) fn insert_receipts(&mut self, receipts: &[hyperscale_types::StoredReceipt]) {
+        for receipt in receipts {
+            self.consensus_receipts
+                .insert(receipt.tx_hash, Arc::clone(&receipt.consensus));
+            if let Some(ref metadata) = receipt.metadata {
+                self.execution_metadata
+                    .insert(receipt.tx_hash, metadata.clone());
+            }
         }
     }
 
@@ -156,8 +168,8 @@ impl ConsensusState {
         }
         self.receipt_heights.retain(|tx_hash, height| {
             if *height <= cutoff {
-                self.local_receipts.remove(tx_hash);
-                self.execution_outputs.remove(tx_hash);
+                self.consensus_receipts.remove(tx_hash);
+                self.execution_metadata.remove(tx_hash);
                 false
             } else {
                 true

@@ -25,40 +25,29 @@ impl TxOutcome {
 }
 
 /// The outcome of executing a transaction on a single shard.
+///
+/// The variant tag IS the outcome — there is no separate `success: bool`
+/// flag. Failed transactions carry no `receipt_hash` on the wire (the
+/// canonical [`FAILED_RECEIPT_HASH`](crate::FAILED_RECEIPT_HASH) is
+/// derivable at hash time).
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub enum ExecutionOutcome {
-    /// Transaction executed. `receipt_hash` is the hash of the execution receipt.
-    /// `success=true` means the transaction's logic succeeded (writes applied).
-    /// `success=false` means the transaction's logic failed (no writes).
-    Executed {
+    /// Engine committed the transaction; state changes applied.
+    Succeeded {
         /// Hash of the global receipt produced by this execution.
         receipt_hash: GlobalReceiptHash,
-        /// Whether the engine committed (`true`) or rejected (`false`) the tx.
-        success: bool,
     },
+    /// Engine rejected the transaction; no state changes applied.
+    /// Carries no payload — every failure is consensus-equivalent.
+    Failed,
     /// Transaction aborted before execution could complete.
     Aborted,
 }
 
 impl ExecutionOutcome {
-    /// Whether execution succeeded (executed with success=true).
-    #[must_use]
-    pub const fn is_success(&self) -> bool {
-        matches!(self, Self::Executed { success: true, .. })
-    }
-
     /// Whether the transaction was aborted.
     #[must_use]
     pub const fn is_aborted(&self) -> bool {
         matches!(self, Self::Aborted)
-    }
-
-    /// Get the receipt hash, or `GlobalReceiptHash::ZERO` for aborted outcomes.
-    #[must_use]
-    pub const fn receipt_hash_or_zero(&self) -> GlobalReceiptHash {
-        match self {
-            Self::Executed { receipt_hash, .. } => *receipt_hash,
-            Self::Aborted => GlobalReceiptHash::ZERO,
-        }
     }
 }

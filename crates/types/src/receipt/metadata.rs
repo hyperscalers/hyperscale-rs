@@ -53,7 +53,7 @@ pub enum LogLevel {
 /// transaction locally (not available for synced receipts).
 ///
 /// Written atomically with block commit but on a separate pruning cycle
-/// (can be pruned earlier than `LocalReceipts` since not needed for state verification).
+/// (can be pruned earlier than the consensus receipt since not needed for state verification).
 #[derive(Debug, Clone, PartialEq, Eq, sbor::prelude::BasicSbor)]
 pub struct ExecutionMetadata {
     /// Fee breakdown reported by the engine.
@@ -65,9 +65,17 @@ pub struct ExecutionMetadata {
 }
 
 impl ExecutionMetadata {
-    /// Create a failure execution output.
+    /// All-zero metadata: empty fees, no logs, no error.
+    ///
+    /// Used by the engine's synthetic-failure path (`ExecutedTx::failure`
+    /// in the `hyperscale_engine` crate) when no Radix-produced
+    /// diagnostic exists — the executor never reached the VM and has
+    /// nothing meaningful to populate. Real failed receipts come from
+    /// `build_execution_metadata` and populate `error_message`,
+    /// `log_messages`, and `fee_summary` directly from the Radix
+    /// transaction receipt.
     #[must_use]
-    pub const fn failure(error: Option<String>) -> Self {
+    pub const fn empty() -> Self {
         Self {
             fee_summary: FeeSummary {
                 total_execution_cost: vec![],
@@ -76,7 +84,7 @@ impl ExecutionMetadata {
                 total_tipping_cost: vec![],
             },
             log_messages: vec![],
-            error_message: error,
+            error_message: None,
         }
     }
 }

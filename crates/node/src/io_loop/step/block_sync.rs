@@ -312,7 +312,7 @@ fn validate_synced_block(
             }
         }
 
-        let receipts: Vec<hyperscale_types::ReceiptBundle> = certified
+        let receipts: Vec<hyperscale_types::StoredReceipt> = certified
             .block
             .certificates()
             .iter()
@@ -343,12 +343,12 @@ mod tests {
     use super::*;
     use hyperscale_types::{
         Block, BlockHash, BlockHeader, Bls12381G2Signature, CertificateRoot, ExecutionCertificate,
-        ExecutionOutcome, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalReceipt,
-        LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, ReceiptBundle,
-        Round, ShardGroupId, SignerBitfield, StateRoot, TransactionOutcome, TransactionRoot,
-        TxHash, TxOutcome, ValidatorId, WaveCertificate, WaveId, WeightedTimestamp,
-        compute_certificate_root, compute_local_receipt_root, compute_transaction_root,
-        test_utils::test_transaction, zero_bls_signature,
+        ExecutionOutcome, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash,
+        LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round,
+        ShardGroupId, SignerBitfield, StateRoot, StoredReceipt, TransactionRoot, TxHash, TxOutcome,
+        ValidatorId, WaveCertificate, WaveId, WeightedTimestamp, compute_certificate_root,
+        compute_local_receipt_root, compute_transaction_root, test_utils::test_transaction,
+        zero_bls_signature,
     };
     use std::collections::BTreeMap;
     use std::sync::Arc;
@@ -398,9 +398,12 @@ mod tests {
         let wave_id = WaveId::new(ShardGroupId(0), HEIGHT, std::collections::BTreeSet::new());
         let outcome = TxOutcome {
             tx_hash,
-            outcome: ExecutionOutcome::Executed {
-                receipt_hash: GlobalReceiptHash::ZERO,
-                success,
+            outcome: if success {
+                ExecutionOutcome::Succeeded {
+                    receipt_hash: GlobalReceiptHash::ZERO,
+                }
+            } else {
+                ExecutionOutcome::Failed
             },
         };
         let ec = ExecutionCertificate::new(
@@ -411,19 +414,19 @@ mod tests {
             Bls12381G2Signature([0u8; 96]),
             SignerBitfield::new(4),
         );
-        let receipt = ReceiptBundle {
+        let receipt = StoredReceipt {
             tx_hash,
-            local_receipt: Arc::new(LocalReceipt {
-                outcome: if success {
-                    TransactionOutcome::Success
-                } else {
-                    TransactionOutcome::Failure
-                },
-                #[allow(clippy::default_trait_access)]
-                database_updates: Default::default(),
-                application_events: vec![],
+            consensus: Arc::new(if success {
+                hyperscale_types::ConsensusReceipt::Succeeded {
+                    receipt_hash: hyperscale_types::GlobalReceiptHash::ZERO,
+                    #[allow(clippy::default_trait_access)]
+                    database_updates: Default::default(),
+                    application_events: vec![],
+                }
+            } else {
+                hyperscale_types::ConsensusReceipt::Failed
             }),
-            execution_output: None,
+            metadata: None,
         };
         let fw = Arc::new(FinalizedWave {
             certificate: Arc::new(WaveCertificate {
@@ -569,23 +572,18 @@ mod tests {
             GlobalReceiptRoot::ZERO,
             vec![TxOutcome {
                 tx_hash,
-                outcome: ExecutionOutcome::Executed {
+                outcome: ExecutionOutcome::Succeeded {
                     receipt_hash: GlobalReceiptHash::ZERO,
-                    success: true,
                 },
             }],
             Bls12381G2Signature([0u8; 96]),
             SignerBitfield::new(4),
         );
-        let receipt = ReceiptBundle {
+        let receipt = StoredReceipt {
             tx_hash,
-            local_receipt: Arc::new(LocalReceipt {
-                outcome: TransactionOutcome::Failure, // EC said Success
-                #[allow(clippy::default_trait_access)]
-                database_updates: Default::default(),
-                application_events: vec![],
-            }),
-            execution_output: None,
+            // ConsensusReceipt::Failed but EC said Succeeded — mismatch test.
+            consensus: std::sync::Arc::new(hyperscale_types::ConsensusReceipt::Failed),
+            metadata: None,
         };
         let fw = Arc::new(FinalizedWave {
             certificate: Arc::new(WaveCertificate {

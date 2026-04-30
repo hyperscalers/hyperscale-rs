@@ -9,25 +9,25 @@ use hyperscale_storage::{
     NodeDatabaseUpdates, PartitionDatabaseUpdates, SubstateDatabase, SubstateStore,
 };
 use hyperscale_types::{
-    BlockHash, BlockHeight, Hash, QuorumCertificate, ReceiptBundle, Round, ShardGroupId, StateRoot,
+    BlockHash, BlockHeight, Hash, QuorumCertificate, Round, ShardGroupId, StateRoot, StoredReceipt,
     TxHash, WaveIdHash, WeightedTimestamp,
 };
 use std::sync::Arc;
 use tempfile::TempDir;
 
-/// Helper: wrap `DatabaseUpdates` into a single `ReceiptBundle` for test commit calls.
-fn updates_to_receipts(updates: &DatabaseUpdates) -> Vec<ReceiptBundle> {
+/// Helper: wrap `DatabaseUpdates` into a single `StoredReceipt` for test commit calls.
+fn updates_to_receipts(updates: &DatabaseUpdates) -> Vec<StoredReceipt> {
     if updates.node_updates.is_empty() {
         return vec![];
     }
-    vec![ReceiptBundle {
+    vec![StoredReceipt {
         tx_hash: TxHash::ZERO,
-        local_receipt: Arc::new(hyperscale_types::LocalReceipt {
-            outcome: hyperscale_types::TransactionOutcome::Success,
+        consensus: Arc::new(hyperscale_types::ConsensusReceipt::Succeeded {
+            receipt_hash: hyperscale_types::GlobalReceiptHash::ZERO,
             database_updates: updates.clone(),
             application_events: vec![],
         }),
-        execution_output: None,
+        metadata: None,
     }]
 }
 
@@ -377,7 +377,7 @@ fn push_wave(block: &mut hyperscale_types::Block, fw: Arc<hyperscale_types::Fina
 /// Wrap receipts into a single `FinalizedWave` attached to `block.certificates`,
 /// so the new `commit_block` (which derives receipts from `block.certificates`)
 /// can apply them.
-fn attach_receipts(block: &mut hyperscale_types::Block, receipts: Vec<ReceiptBundle>) {
+fn attach_receipts(block: &mut hyperscale_types::Block, receipts: Vec<StoredReceipt>) {
     let new_fw = Arc::new(hyperscale_types::FinalizedWave {
         certificate: Arc::new(hyperscale_types::WaveCertificate {
             wave_id: hyperscale_types::WaveId::new(
@@ -773,21 +773,21 @@ fn test_blocks_survive_reopen() {
 #[test]
 fn test_receipt_survives_reopen() {
     let temp_dir = TempDir::new().unwrap();
-    let bundle = hyperscale_storage::test_helpers::make_test_receipt_bundle(55);
-    let tx_hash = bundle.tx_hash;
+    let receipt = hyperscale_storage::test_helpers::make_test_receipt(55);
+    let tx_hash = receipt.tx_hash;
 
     {
         let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
-        storage.store_receipt_bundle(&bundle);
+        storage.store_receipt(&receipt);
     }
 
     {
         let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
-        assert!(storage.get_local_receipt(&tx_hash).is_some());
-        let retrieved = storage.get_local_receipt(&tx_hash).unwrap();
-        assert_eq!(*retrieved, *bundle.local_receipt);
-        let local = storage.get_execution_output(&tx_hash).unwrap();
-        assert_eq!(local, bundle.execution_output.unwrap());
+        assert!(storage.get_consensus_receipt(&tx_hash).is_some());
+        let retrieved = storage.get_consensus_receipt(&tx_hash).unwrap();
+        assert_eq!(retrieved, receipt.consensus);
+        let local = storage.get_execution_metadata(&tx_hash).unwrap();
+        assert_eq!(local, receipt.metadata.unwrap());
     }
 }
 
@@ -900,14 +900,14 @@ fn rocks_commit_with(
 ) {
     let mut block = block.clone();
     if !updates.node_updates.is_empty() {
-        let receipt = hyperscale_types::ReceiptBundle {
+        let receipt = hyperscale_types::StoredReceipt {
             tx_hash: TxHash::ZERO,
-            local_receipt: Arc::new(hyperscale_types::LocalReceipt {
-                outcome: hyperscale_types::TransactionOutcome::Success,
+            consensus: Arc::new(hyperscale_types::ConsensusReceipt::Succeeded {
+                receipt_hash: hyperscale_types::GlobalReceiptHash::ZERO,
                 database_updates: updates.clone(),
                 application_events: vec![],
             }),
-            execution_output: None,
+            metadata: None,
         };
         let wave = Arc::new(hyperscale_types::FinalizedWave {
             certificate: Arc::new(hyperscale_types::WaveCertificate {

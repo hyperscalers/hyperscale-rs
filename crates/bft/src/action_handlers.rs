@@ -8,9 +8,9 @@ use hyperscale_storage::{ChainWriter, SubstateStore};
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, BlockVote, Bls12381G1PublicKey,
     Bls12381G2Signature, CertificateRoot, FinalizedWave, Hash, LocalReceiptRoot, ProposerTimestamp,
-    ProvisionHash, ProvisionTxRoot, ProvisionsRoot, QuorumCertificate, ReceiptBundle, Round,
-    RoutableTransaction, ShardGroupId, SignerBitfield, StateRoot, TopologySnapshot,
-    TransactionRoot, ValidatorId, VotePower, WeightedTimestamp, batch_verify_bls_same_message,
+    ProvisionHash, ProvisionTxRoot, ProvisionsRoot, QuorumCertificate, Round, RoutableTransaction,
+    ShardGroupId, SignerBitfield, StateRoot, StoredReceipt, TopologySnapshot, TransactionRoot,
+    ValidatorId, VotePower, WeightedTimestamp, batch_verify_bls_same_message,
     compute_certificate_root, compute_local_receipt_root, compute_provision_root,
     compute_provision_tx_roots, compute_transaction_root, compute_waves, verify_bls12381_v1,
 };
@@ -335,12 +335,12 @@ pub fn verify_certificate_root(
     valid
 }
 
-/// Verify a block's local receipt root against its receipt bundles.
+/// Verify a block's local receipt root against its stored receipts.
 ///
-/// Pure computation over the receipts' `receipt_hash()` values.
+/// Pure computation over the receipts' `local_receipt_hash()` values.
 pub fn verify_local_receipt_root(
     expected_root: LocalReceiptRoot,
-    receipts: &[ReceiptBundle],
+    receipts: &[StoredReceipt],
 ) -> bool {
     let computed_root = compute_local_receipt_root(receipts);
     let valid = computed_root == expected_root;
@@ -466,7 +466,7 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
         None,
     );
 
-    let receipts: Vec<ReceiptBundle> = certificates
+    let receipts: Vec<StoredReceipt> = certificates
         .iter()
         .flat_map(|fw| fw.receipts.iter().cloned())
         .collect();
@@ -526,11 +526,10 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
 
 fn collect_finalized_receipts(
     waves: &[Arc<FinalizedWave>],
-) -> Vec<Arc<hyperscale_types::LocalReceipt>> {
+) -> Vec<Arc<hyperscale_types::ConsensusReceipt>> {
     waves
         .iter()
-        .flat_map(|fw| fw.receipts.iter())
-        .map(|b| Arc::clone(&b.local_receipt))
+        .flat_map(|fw| fw.consensus_receipts())
         .collect()
 }
 
@@ -732,14 +731,14 @@ pub fn handle_action<S, E, N>(
             // so short-circuit and report both roots as invalid. The
             // coordinator's per-kind tracking still completes because both
             // events are emitted.
-            let receipt_bundles: Vec<ReceiptBundle> = finalized_waves
+            let stored_receipts: Vec<StoredReceipt> = finalized_waves
                 .iter()
                 .flat_map(|fw| fw.receipts.iter().cloned())
                 .collect();
 
             let receipt_start = std::time::Instant::now();
             let receipt_root_valid =
-                verify_local_receipt_root(expected_local_receipt_root, &receipt_bundles);
+                verify_local_receipt_root(expected_local_receipt_root, &stored_receipts);
             metrics::record_signature_verification_latency(
                 "local_receipt_root",
                 receipt_start.elapsed().as_secs_f64(),
@@ -926,7 +925,7 @@ pub fn handle_action<S, E, N>(
 mod tests {
     use super::*;
     use hyperscale_types::{
-        Bls12381G1PrivateKey, ProposerTimestamp, ReceiptBundle, compute_certificate_root,
+        Bls12381G1PrivateKey, ProposerTimestamp, StoredReceipt, compute_certificate_root,
         compute_local_receipt_root, compute_provision_root, compute_transaction_root,
         generate_bls_keypair,
     };
@@ -1343,7 +1342,7 @@ mod tests {
 
     #[test]
     fn verify_local_receipt_root_matches_compute_local_receipt_root() {
-        let receipts: Vec<ReceiptBundle> = Vec::new();
+        let receipts: Vec<StoredReceipt> = Vec::new();
         let root = compute_local_receipt_root(&receipts);
         assert!(verify_local_receipt_root(root, &receipts));
         assert!(!verify_local_receipt_root(

@@ -136,9 +136,8 @@ mod tests {
             .iter()
             .map(|h| TxOutcome {
                 tx_hash: *h,
-                outcome: ExecutionOutcome::Executed {
+                outcome: ExecutionOutcome::Succeeded {
                     receipt_hash: GlobalReceiptHash::ZERO,
-                    success: true,
                 },
             })
             .collect();

@@ -302,8 +302,9 @@ pub enum ProtocolEvent {
     ExecutionBatchCompleted {
         /// The wave whose execution produced these results.
         wave_id: WaveId,
-        /// Per-tx local execution entries (database updates + receipt).
-        results: Vec<hyperscale_types::LocalExecutionEntry>,
+        /// Per-tx stored receipts (consensus portion + metadata) ready
+        /// to be persisted alongside the wave's commit.
+        results: Vec<hyperscale_types::StoredReceipt>,
         /// Per-tx outcomes extracted on the handler thread for vote signing.
         tx_outcomes: Vec<TxOutcome>,
     },

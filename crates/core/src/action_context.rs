@@ -10,7 +10,7 @@ use hyperscale_engine::Engine;
 use hyperscale_network::Network;
 use hyperscale_storage::{PendingChain, Storage};
 use hyperscale_types::{
-    BlockHash, BlockHeight, Bls12381G1PrivateKey, LocalReceipt, TopologySnapshot,
+    BlockHash, BlockHeight, Bls12381G1PrivateKey, ConsensusReceipt, TopologySnapshot,
 };
 use std::sync::Arc;
 
@@ -51,5 +51,5 @@ pub struct PreparedBlock<P: Send> {
     pub parent_block_hash: BlockHash,
     pub block_height: BlockHeight,
     pub prepared: P,
-    pub receipts: Vec<Arc<LocalReceipt>>,
+    pub receipts: Vec<Arc<ConsensusReceipt>>,
 }

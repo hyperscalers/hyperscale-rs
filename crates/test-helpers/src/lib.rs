@@ -274,14 +274,10 @@ pub fn make_finalized_wave(
     decision: TransactionDecision,
 ) -> FinalizedWave {
     let outcome = match decision {
-        TransactionDecision::Accept => ExecutionOutcome::Executed {
+        TransactionDecision::Accept => ExecutionOutcome::Succeeded {
             receipt_hash: GlobalReceiptHash::ZERO,
-            success: true,
         },
-        TransactionDecision::Reject => ExecutionOutcome::Executed {
-            receipt_hash: GlobalReceiptHash::ZERO,
-            success: false,
-        },
+        TransactionDecision::Reject => ExecutionOutcome::Failed,
         TransactionDecision::Aborted => ExecutionOutcome::Aborted,
     };
     let wave_id = WaveId::new(ShardGroupId(0), block_height, BTreeSet::new());

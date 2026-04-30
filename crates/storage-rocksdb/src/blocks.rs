@@ -165,7 +165,7 @@ impl RocksDbStorage {
         let certificates: Option<Vec<Arc<FinalizedWave>>> = certs
             .into_iter()
             .map(|cert| {
-                FinalizedWave::reconstruct(cert, |h| self.get_local_receipt(h)).map(Arc::new)
+                FinalizedWave::reconstruct(cert, |h| self.get_consensus_receipt(h)).map(Arc::new)
             })
             .collect();
         let Some(certificates) = certificates else {
@@ -268,7 +268,7 @@ impl RocksDbStorage {
         let certificates: Option<Vec<Arc<FinalizedWave>>> = certs
             .into_iter()
             .map(|cert| {
-                FinalizedWave::reconstruct(cert, |h| self.get_local_receipt(h)).map(Arc::new)
+                FinalizedWave::reconstruct(cert, |h| self.get_consensus_receipt(h)).map(Arc::new)
             })
             .collect();
         let Some(certificates) = certificates else {

@@ -1,6 +1,6 @@
 //! Receipt storage for `RocksDB`.
 
-use crate::column_families::{ExecutionOutputsCf, LocalReceiptsCf};
+use crate::column_families::{ConsensusReceiptsCf, ExecutionMetadataCf};
 use crate::core::RocksDbStorage;
 use crate::typed_cf::{self, TypedCf};
 
@@ -9,81 +9,84 @@ use rocksdb::WriteBatch;
 use std::sync::Arc;
 
 impl RocksDbStorage {
-    /// Store a receipt bundle (local receipt + optional execution output).
+    /// One-shot variant of [`Self::store_receipts`] for a single receipt.
     ///
     /// # Panics
     ///
     /// Panics if the underlying `RocksDB` write fails.
-    pub fn store_receipt_bundle(&self, bundle: &hyperscale_types::ReceiptBundle) {
+    pub fn store_receipt(&self, receipt: &hyperscale_types::StoredReceipt) {
         let mut batch = WriteBatch::default();
-        self.add_receipt_bundle_to_batch(&mut batch, bundle);
-        self.db
-            .write(batch)
-            .expect("failed to persist receipt bundle");
+        self.add_receipt_to_batch(&mut batch, receipt);
+        self.db.write(batch).expect("failed to persist receipt");
     }
 
-    /// Store multiple receipt bundles in a single atomic `WriteBatch`.
+    /// Atomic batch persist — consensus and metadata land together so a
+    /// crash mid-batch can't leave metadata referencing a missing receipt
+    /// (or vice versa).
     ///
     /// # Panics
     ///
     /// Panics if the underlying `RocksDB` write fails.
-    pub fn store_receipt_bundles(&self, bundles: &[hyperscale_types::ReceiptBundle]) {
-        if bundles.is_empty() {
+    pub fn store_receipts(&self, receipts: &[hyperscale_types::StoredReceipt]) {
+        if receipts.is_empty() {
             return;
         }
         let mut batch = WriteBatch::default();
-        for bundle in bundles {
-            self.add_receipt_bundle_to_batch(&mut batch, bundle);
+        for receipt in receipts {
+            self.add_receipt_to_batch(&mut batch, receipt);
         }
         tracing::debug!(
-            count = bundles.len(),
-            tx_hashes = ?bundles.iter().map(|b| b.tx_hash).collect::<Vec<_>>(),
-            "Persisting receipt bundles to RocksDB"
+            count = receipts.len(),
+            tx_hashes = ?receipts.iter().map(|r| r.tx_hash).collect::<Vec<_>>(),
+            "Persisting receipts to RocksDB"
         );
-        self.db
-            .write(batch)
-            .expect("failed to persist receipt bundles");
+        self.db.write(batch).expect("failed to persist receipts");
     }
 
-    /// Add a single receipt bundle's writes to an existing `WriteBatch`.
-    pub(crate) fn add_receipt_bundle_to_batch(
+    /// Append the receipt's writes to a caller-owned `WriteBatch` so it
+    /// can land atomically with the rest of the block commit (header,
+    /// substate, JMT). Used by `commit_block` / `prepare_block_commit`.
+    pub(crate) fn add_receipt_to_batch(
         &self,
         batch: &mut WriteBatch,
-        bundle: &hyperscale_types::ReceiptBundle,
+        receipt: &hyperscale_types::StoredReceipt,
     ) {
         let cf = self.cf();
 
-        typed_cf::batch_put::<LocalReceiptsCf>(
+        typed_cf::batch_put::<ConsensusReceiptsCf>(
             batch,
-            LocalReceiptsCf::handle(&cf),
-            bundle.tx_hash.as_raw(),
-            bundle.local_receipt.as_ref(),
+            ConsensusReceiptsCf::handle(&cf),
+            receipt.tx_hash.as_raw(),
+            &receipt.consensus,
         );
 
-        if let Some(ref local) = bundle.execution_output {
-            typed_cf::batch_put::<ExecutionOutputsCf>(
+        if let Some(ref metadata) = receipt.metadata {
+            typed_cf::batch_put::<ExecutionMetadataCf>(
                 batch,
-                ExecutionOutputsCf::handle(&cf),
-                bundle.tx_hash.as_raw(),
-                local,
+                ExecutionMetadataCf::handle(&cf),
+                receipt.tx_hash.as_raw(),
+                metadata,
             );
         }
     }
 
-    /// Retrieve the local receipt for a transaction.
-    pub fn get_local_receipt(
+    /// Read the consensus portion. Present for any tx that committed
+    /// (success or failure); absent for aborted txs and unknown hashes.
+    pub fn get_consensus_receipt(
         &self,
         tx_hash: &TxHash,
-    ) -> Option<Arc<hyperscale_types::LocalReceipt>> {
-        self.cf_get::<LocalReceiptsCf>(tx_hash.as_raw())
+    ) -> Option<Arc<hyperscale_types::ConsensusReceipt>> {
+        self.cf_get::<ConsensusReceiptsCf>(tx_hash.as_raw())
             .map(Arc::new)
     }
 
-    /// Retrieve execution output details for a transaction.
-    pub fn get_execution_output(
+    /// Read the local-only metadata. `None` when the tx was synced from
+    /// a peer (peers don't ship their metadata) or pruned earlier than
+    /// the consensus portion.
+    pub fn get_execution_metadata(
         &self,
         tx_hash: &TxHash,
     ) -> Option<hyperscale_types::ExecutionMetadata> {
-        self.cf_get::<ExecutionOutputsCf>(tx_hash.as_raw())
+        self.cf_get::<ExecutionMetadataCf>(tx_hash.as_raw())
     }
 }

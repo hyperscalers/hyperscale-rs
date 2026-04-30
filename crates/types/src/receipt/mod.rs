@@ -1,26 +1,26 @@
-//! Three-tier receipt model for transaction execution results.
+//! Receipt model for transaction execution results.
 //!
 //! | Tier | Type | Contents | Cross-shard identical? |
 //! |------|------|----------|------------------------|
-//! | **Global** | [`GlobalReceipt`](global::GlobalReceipt) | outcome + `event_root` + `writes_root` | Yes |
-//! | **Local**  | [`LocalReceipt`](local::LocalReceipt)   | outcome + shard-filtered state changes + events | No |
-//! | **Output** | [`ExecutionMetadata`](metadata::ExecutionMetadata) | fees, logs, errors | No |
+//! | **Global**    | [`GlobalReceipt`](global::GlobalReceipt)         | success bit + `event_root` + `writes_root` | Yes |
+//! | **Consensus** | [`ConsensusReceipt`](consensus::ConsensusReceipt) | variant tag + (Succeeded:) shard-filtered writes + events + precomputed `receipt_hash` | No |
+//! | **Metadata**  | [`ExecutionMetadata`](metadata::ExecutionMetadata) | fees, logs, errors | No (local-only) |
+//! | **Stored**    | [`StoredReceipt`](stored::StoredReceipt)         | `tx_hash` + consensus + optional metadata | n/a (storage shape) |
 //!
-//! The global receipt hash is signed over in execution votes/certificates.
+//! `GlobalReceipt::receipt_hash()` is signed over in execution votes/certificates.
 //! Per-shard state correctness is enforced by `state_root` in the block header,
-//! with per-tx attribution via `local_receipt_root`.
+//! with per-tx attribution via `local_receipt_root` (`ConsensusReceipt::local_receipt_hash`).
 
-pub mod bundle;
+pub mod consensus;
 pub mod global;
-pub mod local;
 pub mod metadata;
-pub mod outcome;
+pub mod stored;
 
 #[cfg(test)]
 mod tests {
     use crate::{
-        ApplicationEvent, DatabaseUpdates, EventRoot, GlobalReceipt, Hash, LocalReceipt,
-        TransactionOutcome, WritesRoot, compute_merkle_root,
+        ApplicationEvent, ConsensusReceipt, DatabaseUpdates, EventRoot, GlobalReceipt,
+        GlobalReceiptHash, Hash, WritesRoot,
     };
 
     fn make_event(seed: u8) -> ApplicationEvent {
@@ -30,43 +30,23 @@ mod tests {
         }
     }
 
-    fn make_receipt(events: Vec<ApplicationEvent>) -> LocalReceipt {
-        LocalReceipt {
-            outcome: TransactionOutcome::Success,
+    fn make_succeeded(events: Vec<ApplicationEvent>) -> ConsensusReceipt {
+        ConsensusReceipt::Succeeded {
+            receipt_hash: GlobalReceiptHash::ZERO,
             database_updates: DatabaseUpdates::default(),
             application_events: events,
         }
     }
 
     #[test]
-    fn test_empty_receipt_has_zero_event_root() {
-        let receipt = make_receipt(vec![]);
-        let global = receipt.global_receipt(WritesRoot::ZERO);
-        assert_eq!(global.event_root, EventRoot::ZERO);
-    }
-
-    #[test]
-    fn test_global_receipt_derivation() {
-        let events = vec![make_event(1), make_event(2)];
-        let receipt = make_receipt(events.clone());
-
-        let global = receipt.global_receipt(WritesRoot::ZERO);
-        assert_eq!(global.outcome, TransactionOutcome::Success);
-
-        let event_hashes: Vec<Hash> = events.iter().map(ApplicationEvent::hash).collect();
-        let expected_root = EventRoot::from_raw(compute_merkle_root(&event_hashes));
-        assert_eq!(global.event_root, expected_root);
-    }
-
-    #[test]
-    fn test_receipt_hash_changes_with_outcome() {
+    fn test_global_receipt_hash_changes_with_outcome() {
         let success = GlobalReceipt {
-            outcome: TransactionOutcome::Success,
+            success: true,
             event_root: EventRoot::ZERO,
             writes_root: WritesRoot::ZERO,
         };
         let failure = GlobalReceipt {
-            outcome: TransactionOutcome::Failure,
+            success: false,
             event_root: EventRoot::ZERO,
             writes_root: WritesRoot::ZERO,
         };
@@ -74,24 +54,14 @@ mod tests {
     }
 
     #[test]
-    fn test_receipt_hash_changes_with_events() {
-        let receipt_a = make_receipt(vec![make_event(1)]);
-        let receipt_b = make_receipt(vec![make_event(1), make_event(2)]);
-        assert_ne!(
-            receipt_a.global_receipt(WritesRoot::ZERO).receipt_hash(),
-            receipt_b.global_receipt(WritesRoot::ZERO).receipt_hash()
-        );
-    }
-
-    #[test]
-    fn test_receipt_hash_changes_with_writes_root() {
+    fn test_global_receipt_hash_changes_with_writes_root() {
         let a = GlobalReceipt {
-            outcome: TransactionOutcome::Success,
+            success: true,
             event_root: EventRoot::ZERO,
             writes_root: WritesRoot::ZERO,
         };
         let b = GlobalReceipt {
-            outcome: TransactionOutcome::Success,
+            success: true,
             event_root: EventRoot::ZERO,
             writes_root: WritesRoot::from_raw(Hash::from_bytes(b"different")),
         };
@@ -112,22 +82,24 @@ mod tests {
 
     #[test]
     fn test_local_receipt_hash_deterministic() {
-        let receipt = make_receipt(vec![make_event(1)]);
-        assert_eq!(receipt.receipt_hash(), receipt.receipt_hash());
+        let receipt = make_succeeded(vec![make_event(1)]);
+        assert_eq!(receipt.local_receipt_hash(), receipt.local_receipt_hash());
     }
 
     #[test]
-    fn test_local_receipt_hash_changes_with_updates() {
-        let a = LocalReceipt {
-            outcome: TransactionOutcome::Success,
-            database_updates: DatabaseUpdates::default(),
-            application_events: vec![],
-        };
-        let b = LocalReceipt {
-            outcome: TransactionOutcome::Failure,
-            database_updates: DatabaseUpdates::default(),
-            application_events: vec![],
-        };
-        assert_ne!(a.receipt_hash(), b.receipt_hash());
+    fn test_local_receipt_hash_changes_with_outcome() {
+        let succeeded = make_succeeded(vec![]);
+        let failed = ConsensusReceipt::Failed;
+        assert_ne!(succeeded.local_receipt_hash(), failed.local_receipt_hash());
+    }
+
+    #[test]
+    fn test_local_receipt_hash_changes_with_events() {
+        let receipt_a = make_succeeded(vec![make_event(1)]);
+        let receipt_b = make_succeeded(vec![make_event(1), make_event(2)]);
+        assert_ne!(
+            receipt_a.local_receipt_hash(),
+            receipt_b.local_receipt_hash()
+        );
     }
 }

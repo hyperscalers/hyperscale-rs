@@ -260,9 +260,8 @@ mod tests {
     fn executed(tx_hash: TxHash) -> TxOutcome {
         TxOutcome {
             tx_hash,
-            outcome: ExecutionOutcome::Executed {
+            outcome: ExecutionOutcome::Succeeded {
                 receipt_hash: GlobalReceiptHash::from_raw(Hash::ZERO),
-                success: true,
             },
         }
     }
