@@ -74,9 +74,8 @@ mod tests {
     fn make_outcome(seed: u8) -> TxOutcome {
         TxOutcome {
             tx_hash: TxHash::from_raw(Hash::from_bytes(&[seed; 4])),
-            outcome: ExecutionOutcome::Executed {
+            outcome: ExecutionOutcome::Succeeded {
                 receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(&[seed + 100; 4])),
-                success: true,
             },
         }
     }
@@ -241,17 +240,13 @@ mod tests {
     fn test_tx_outcome_leaf_success_matters() {
         let success = TxOutcome {
             tx_hash: TxHash::from_raw(Hash::from_bytes(b"tx")),
-            outcome: ExecutionOutcome::Executed {
+            outcome: ExecutionOutcome::Succeeded {
                 receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(b"receipt")),
-                success: true,
             },
         };
         let failure = TxOutcome {
             tx_hash: TxHash::from_raw(Hash::from_bytes(b"tx")),
-            outcome: ExecutionOutcome::Executed {
-                receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(b"receipt")),
-                success: false,
-            },
+            outcome: ExecutionOutcome::Failed,
         };
         assert_ne!(tx_outcome_leaf(&success), tx_outcome_leaf(&failure));
     }
@@ -260,9 +255,8 @@ mod tests {
     fn test_tx_outcome_leaf_aborted_differs_from_executed() {
         let executed = TxOutcome {
             tx_hash: TxHash::from_raw(Hash::from_bytes(b"tx")),
-            outcome: ExecutionOutcome::Executed {
+            outcome: ExecutionOutcome::Succeeded {
                 receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(b"receipt")),
-                success: true,
             },
         };
         let aborted = TxOutcome {
@@ -487,16 +481,14 @@ mod tests {
         let outcomes = vec![
             TxOutcome {
                 tx_hash: tx_a,
-                outcome: ExecutionOutcome::Executed {
+                outcome: ExecutionOutcome::Succeeded {
                     receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(b"r_a")),
-                    success: true,
                 },
             },
             TxOutcome {
                 tx_hash: tx_b,
-                outcome: ExecutionOutcome::Executed {
+                outcome: ExecutionOutcome::Succeeded {
                     receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(b"r_b")),
-                    success: true,
                 },
             },
         ];
@@ -524,9 +516,8 @@ mod tests {
         let outcomes = vec![
             TxOutcome {
                 tx_hash: tx_a,
-                outcome: ExecutionOutcome::Executed {
+                outcome: ExecutionOutcome::Succeeded {
                     receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(b"r_a")),
-                    success: true,
                 },
             },
             TxOutcome {
@@ -561,9 +552,8 @@ mod tests {
 
         let outcomes = vec![TxOutcome {
             tx_hash: tx_a,
-            outcome: ExecutionOutcome::Executed {
+            outcome: ExecutionOutcome::Succeeded {
                 receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(b"r_a")),
-                success: true,
             },
         }];
         let wc = Arc::new(WaveCertificate {
@@ -608,9 +598,8 @@ mod tests {
         let outcomes = vec![
             TxOutcome {
                 tx_hash: tx_a,
-                outcome: ExecutionOutcome::Executed {
+                outcome: ExecutionOutcome::Succeeded {
                     receipt_hash: GlobalReceiptHash::ZERO,
-                    success: true,
                 },
             },
             TxOutcome {
@@ -619,10 +608,7 @@ mod tests {
             },
             TxOutcome {
                 tx_hash: tx_c,
-                outcome: ExecutionOutcome::Executed {
-                    receipt_hash: GlobalReceiptHash::ZERO,
-                    success: false,
-                },
+                outcome: ExecutionOutcome::Failed,
             },
         ];
         let fw = FinalizedWave {
@@ -656,9 +642,8 @@ mod tests {
         let tx_a = TxHash::from_raw(Hash::from_bytes(b"tx_a"));
         let outcomes = vec![TxOutcome {
             tx_hash: tx_a,
-            outcome: ExecutionOutcome::Executed {
+            outcome: ExecutionOutcome::Succeeded {
                 receipt_hash: GlobalReceiptHash::ZERO,
-                success: true,
             },
         }];
         let fw = FinalizedWave {
@@ -684,9 +669,8 @@ mod tests {
         let tx_a = TxHash::from_raw(Hash::from_bytes(b"tx_a"));
         let outcomes = vec![TxOutcome {
             tx_hash: tx_a,
-            outcome: ExecutionOutcome::Executed {
+            outcome: ExecutionOutcome::Succeeded {
                 receipt_hash: GlobalReceiptHash::ZERO,
-                success: true,
             },
         }];
         let fw = FinalizedWave {
@@ -738,9 +722,8 @@ mod tests {
         let tx_b = TxHash::from_raw(Hash::from_bytes(b"tx_b"));
         let outcomes = vec![TxOutcome {
             tx_hash: tx_a,
-            outcome: ExecutionOutcome::Executed {
+            outcome: ExecutionOutcome::Succeeded {
                 receipt_hash: GlobalReceiptHash::ZERO,
-                success: true,
             },
         }];
         let fw = FinalizedWave {

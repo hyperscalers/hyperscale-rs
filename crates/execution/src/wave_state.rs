@@ -529,10 +529,7 @@ impl WaveState {
                 if outcome.is_aborted() {
                     self.tracker_aborted.insert(outcome.tx_hash);
                 }
-                if !matches!(
-                    outcome.outcome,
-                    ExecutionOutcome::Executed { success: true, .. }
-                ) {
+                if !matches!(outcome.outcome, ExecutionOutcome::Succeeded { .. }) {
                     self.tx_has_failure.insert(outcome.tx_hash);
                 }
             }
@@ -831,9 +828,12 @@ mod tests {
     }
 
     fn executed(success: bool) -> ExecutionOutcome {
-        ExecutionOutcome::Executed {
-            receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(b"r")),
-            success,
+        if success {
+            ExecutionOutcome::Succeeded {
+                receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(b"r")),
+            }
+        } else {
+            ExecutionOutcome::Failed
         }
     }
 
@@ -984,7 +984,7 @@ mod tests {
         let (_, _, outcomes) = w.build_vote_data(ts_for(WAVE_START + 3)).unwrap();
         assert!(matches!(
             outcomes[0].outcome,
-            ExecutionOutcome::Executed { .. }
+            ExecutionOutcome::Succeeded { .. } | ExecutionOutcome::Failed
         ));
         assert!(matches!(outcomes[1].outcome, ExecutionOutcome::Aborted));
     }
@@ -1252,7 +1252,7 @@ mod tests {
         let (_, _, outcomes) = w.build_vote_data(ts_for(WAVE_START + 2)).unwrap();
         assert!(matches!(
             outcomes[0].outcome,
-            ExecutionOutcome::Executed { success: true, .. }
+            ExecutionOutcome::Succeeded { .. }
         ));
     }
 

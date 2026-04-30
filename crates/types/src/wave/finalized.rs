@@ -203,7 +203,8 @@ impl FinalizedWave {
                 ExecutionOutcome::Aborted => {
                     // Aborted outcomes carry no local receipt; skip.
                 }
-                ExecutionOutcome::Executed { success, .. } => {
+                ExecutionOutcome::Succeeded { .. } | ExecutionOutcome::Failed => {
+                    let success = outcome.outcome.is_success();
                     let receipt =
                         receipt_iter
                             .next()
@@ -256,10 +257,7 @@ impl FinalizedWave {
                 if outcome.is_aborted() {
                     aborted.insert(outcome.tx_hash);
                 }
-                if !matches!(
-                    outcome.outcome,
-                    ExecutionOutcome::Executed { success: true, .. }
-                ) {
+                if !matches!(outcome.outcome, ExecutionOutcome::Succeeded { .. }) {
                     failure.insert(outcome.tx_hash);
                 }
             }

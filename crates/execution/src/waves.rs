@@ -431,9 +431,8 @@ mod tests {
     fn make_outcome(tx_hash: TxHash) -> TxOutcome {
         TxOutcome {
             tx_hash,
-            outcome: ExecutionOutcome::Executed {
+            outcome: ExecutionOutcome::Succeeded {
                 receipt_hash: GlobalReceiptHash::ZERO,
-                success: true,
             },
         }
     }

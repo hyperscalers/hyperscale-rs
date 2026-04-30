@@ -4,23 +4,18 @@ use crate::{ExecutionOutcome, GlobalReceiptRoot, Hash, TxOutcome, compute_padded
 
 /// Compute the leaf hash for a transaction outcome in the receipt tree.
 ///
-/// For executed outcomes: Leaf = `H(tx_hash` || `receipt_hash` || `success_byte`)
-/// For aborted outcomes: Leaf = `H(tx_hash` || "ABORTED:" || `sbor_encode(reason)`)
+/// - `Succeeded`: `H(tx_hash || receipt_hash)`
+/// - `Failed`:    `H(tx_hash || b"FAILED:")` (domain-tagged; canonical hash is implicit)
+/// - `Aborted`:   `H(tx_hash || b"ABORTED:")`
 ///
-/// The domain tag `b"ABORTED:"` ensures abort leaves can never collide with
-/// executed leaves.
+/// The domain tags ensure the three variants can never collide.
 #[must_use]
 pub fn tx_outcome_leaf(outcome: &TxOutcome) -> Hash {
     match &outcome.outcome {
-        ExecutionOutcome::Executed {
-            receipt_hash,
-            success,
-            ..
-        } => Hash::from_parts(&[
-            outcome.tx_hash.as_bytes(),
-            receipt_hash.as_bytes(),
-            &[u8::from(*success)],
-        ]),
+        ExecutionOutcome::Succeeded { receipt_hash } => {
+            Hash::from_parts(&[outcome.tx_hash.as_bytes(), receipt_hash.as_bytes()])
+        }
+        ExecutionOutcome::Failed => Hash::from_parts(&[outcome.tx_hash.as_bytes(), b"FAILED:"]),
         ExecutionOutcome::Aborted => Hash::from_parts(&[outcome.tx_hash.as_bytes(), b"ABORTED:"]),
     }
 }

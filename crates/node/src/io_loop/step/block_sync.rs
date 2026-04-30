@@ -398,9 +398,12 @@ mod tests {
         let wave_id = WaveId::new(ShardGroupId(0), HEIGHT, std::collections::BTreeSet::new());
         let outcome = TxOutcome {
             tx_hash,
-            outcome: ExecutionOutcome::Executed {
-                receipt_hash: GlobalReceiptHash::ZERO,
-                success,
+            outcome: if success {
+                ExecutionOutcome::Succeeded {
+                    receipt_hash: GlobalReceiptHash::ZERO,
+                }
+            } else {
+                ExecutionOutcome::Failed
             },
         };
         let ec = ExecutionCertificate::new(
@@ -569,9 +572,8 @@ mod tests {
             GlobalReceiptRoot::ZERO,
             vec![TxOutcome {
                 tx_hash,
-                outcome: ExecutionOutcome::Executed {
+                outcome: ExecutionOutcome::Succeeded {
                     receipt_hash: GlobalReceiptHash::ZERO,
-                    success: true,
                 },
             }],
             Bls12381G2Signature([0u8; 96]),

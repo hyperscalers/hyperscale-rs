@@ -184,9 +184,8 @@ pub fn make_test_execution_certificate(
         GlobalReceiptRoot::from_raw(Hash::from_bytes(&[seed + 50; 32])),
         vec![TxOutcome {
             tx_hash: TxHash::from_raw(Hash::from_bytes(&[seed + 100; 32])),
-            outcome: ExecutionOutcome::Executed {
+            outcome: ExecutionOutcome::Succeeded {
                 receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(&[seed + 150; 32])),
-                success: true,
             },
         }],
         Bls12381G2Signature([0u8; 96]),

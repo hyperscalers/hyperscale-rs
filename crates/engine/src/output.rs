@@ -113,13 +113,16 @@ impl ExecutedTx {
     /// copyable). Used at the engine→state-machine boundary during
     /// the `unify-receipt-types` migration.
     #[must_use]
-    pub fn outcome(&self) -> TxOutcome {
+    pub const fn outcome(&self) -> TxOutcome {
+        let outcome = match &self.consensus {
+            ConsensusReceipt::Succeeded { receipt_hash, .. } => ExecutionOutcome::Succeeded {
+                receipt_hash: *receipt_hash,
+            },
+            ConsensusReceipt::Failed => ExecutionOutcome::Failed,
+        };
         TxOutcome {
             tx_hash: self.tx_hash,
-            outcome: ExecutionOutcome::Executed {
-                receipt_hash: self.consensus.receipt_hash(),
-                success: self.consensus.is_success(),
-            },
+            outcome,
         }
     }
 

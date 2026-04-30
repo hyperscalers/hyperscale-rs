@@ -2405,18 +2405,16 @@ mod tests {
             .iter()
             .map(|h| hyperscale_types::TxOutcome {
                 tx_hash: *h,
-                outcome: ExecutionOutcome::Executed {
+                outcome: ExecutionOutcome::Succeeded {
                     receipt_hash: GlobalReceiptHash::ZERO,
-                    success: true,
                 },
             })
             .collect();
         for h in &tx_hashes {
             wave.record_execution_result(
                 *h,
-                ExecutionOutcome::Executed {
+                ExecutionOutcome::Succeeded {
                     receipt_hash: GlobalReceiptHash::ZERO,
-                    success: true,
                 },
             );
             wave.record_receipt(hyperscale_types::StoredReceipt {
