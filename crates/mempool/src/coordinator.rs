@@ -5,7 +5,7 @@ use crate::lock_tracker::LockTracker;
 use crate::ready_set::ReadySet;
 use crate::tombstones::TombstoneStore;
 use crate::tx_store::TxStore;
-use hyperscale_core::{Action, FetchPeers, FetchRequest, ProtocolEvent};
+use hyperscale_core::{Action, FetchAbandon, FetchPeers, FetchRequest, ProtocolEvent};
 use hyperscale_types::{
     BlockHeight, CertifiedBlock, LocalTimestamp, NodeId, RETENTION_HORIZON, RoutableTransaction,
     ShardGroupId, TopologySnapshot, TransactionDecision, TransactionStatus, TxHash,
@@ -209,8 +209,10 @@ pub struct MempoolCoordinator {
 
     /// Cross-shard txs the mempool has been told to expect via verified
     /// provisions bundles, but has not yet seen on the wire (gossip / submit
-    /// / block inclusion). Cleared on admission; consulted for fetch fallback
-    /// and horizon-bounded eviction.
+    /// / block inclusion). Cleared on admission, on block-include race, or
+    /// on retention-horizon orphan sweep — the latter two emit
+    /// `Action::AbandonFetch` so any in-flight fetch is cancelled. Also
+    /// consulted to drive grace-window fetch fallback.
     expected_txs: ExpectedTxs,
 
     /// Configuration for mempool behavior.
@@ -488,6 +490,7 @@ impl MempoolCoordinator {
         height = certified.block.height().0,
         tx_count = certified.block.transaction_count()
     ))]
+    #[allow(clippy::too_many_lines)] // sequential orchestration: block-include, expected-tx sweep, certificate processing
     pub fn on_block_committed(
         &mut self,
         topology: &TopologySnapshot,
@@ -504,6 +507,7 @@ impl MempoolCoordinator {
         // This handles the case where we fetched transactions to vote on a block
         // but didn't receive them via gossip. We need them in the mempool for
         // status tracking (execution status updates).
+        let mut abandoned_tx_fetches: Vec<TxHash> = Vec::new();
         for tx in block.transactions() {
             let hash = tx.hash();
             let num_shards = topology.num_shards();
@@ -526,8 +530,17 @@ impl MempoolCoordinator {
                 }
             });
             // Block inclusion is the strongest possible signal that the tx
-            // exists; any cross-shard expectation is satisfied.
-            self.expected_txs.forget(&hash);
+            // exists; any cross-shard expectation is satisfied. If a fetch
+            // was racing the commit, cancel it explicitly — `forget` returns
+            // `true` exactly when an expected entry was actively cleared.
+            if self.expected_txs.forget(&hash) {
+                abandoned_tx_fetches.push(hash);
+            }
+        }
+        if !abandoned_tx_fetches.is_empty() {
+            actions.push(Action::AbandonFetch(FetchAbandon::Transactions {
+                ids: abandoned_tx_fetches,
+            }));
         }
 
         // Update transaction status to Committed and add locks.
@@ -574,8 +587,10 @@ impl MempoolCoordinator {
 
         // Fire fetches for entries whose grace window has elapsed. Re-emitted
         // every block past grace; the fetch protocol dedupes in-flight ids
-        // and handles peer rotation. Cleared on admission via the normal
-        // gossip / submit / block-include cleanup paths.
+        // and handles peer rotation. In-flights drain on admission
+        // (gossip / submit `Continuation(TransactionsAdmitted)`) and on the
+        // explicit `Action::AbandonFetch` emitted from the block-include
+        // race and retention-horizon paths below.
         for (source_shard, ids) in self
             .expected_txs
             .due_for_fetch(self.current_ts, EXPECTED_TX_GRACE)
@@ -605,17 +620,27 @@ impl MempoolCoordinator {
         // fetch retry past `RETENTION_HORIZON` is provably moot — every wave
         // that needed it has long since timed out via WAVE_TIMEOUT. Drop with
         // warn + metric; non-zero rate here means cross-shard DA failed.
-        for (tx_hash, source_shard) in self
+        // Each dropped hash is also handed to `AbandonFetch` so the io_loop's
+        // `TransactionBinding` clears any in-flight retry — without this the
+        // fetch protocol keeps requesting forever.
+        let dropped = self
             .expected_txs
-            .drop_past_horizon(self.current_ts, RETENTION_HORIZON)
-        {
-            tracing::warn!(
-                ?tx_hash,
-                ?source_shard,
-                height = height.0,
-                "Expected cross-shard tx dropped past RETENTION_HORIZON without DA"
-            );
-            hyperscale_metrics::record_expected_tx_dropped();
+            .drop_past_horizon(self.current_ts, RETENTION_HORIZON);
+        if !dropped.is_empty() {
+            let mut abandoned: Vec<TxHash> = Vec::with_capacity(dropped.len());
+            for (tx_hash, source_shard) in dropped {
+                tracing::warn!(
+                    ?tx_hash,
+                    ?source_shard,
+                    height = height.0,
+                    "Expected cross-shard tx dropped past RETENTION_HORIZON without DA"
+                );
+                hyperscale_metrics::record_expected_tx_dropped();
+                abandoned.push(tx_hash);
+            }
+            actions.push(Action::AbandonFetch(FetchAbandon::Transactions {
+                ids: abandoned,
+            }));
         }
 
         // Per-tx terminal state from committed wave certificates. Decisions are
@@ -1367,6 +1392,76 @@ mod tests {
             &certified_block_with_provisions(BlockHeight(100), ShardGroupId(0), &[]),
         );
         assert_eq!(mempool.pending_expected_count(), 1);
+    }
+
+    #[test]
+    fn drop_past_horizon_emits_abandon_fetch() {
+        // Same setup as `entry_dropped_past_retention_horizon_emits_metric`,
+        // but assert the explicit AbandonFetch action so any in-flight fetch
+        // is cancelled rather than retried forever.
+        let topology = make_test_topology();
+        let mut mempool = MempoolCoordinator::new();
+
+        let unseen_hash = test_transaction(1).hash();
+
+        mempool.on_block_committed(
+            &topology,
+            &certified_block_with_provisions(BlockHeight(1), ShardGroupId(0), &[unseen_hash]),
+        );
+        let actions = mempool.on_block_committed(
+            &topology,
+            &certified_block_with_provisions(BlockHeight(700), ShardGroupId(0), &[]),
+        );
+
+        let abandoned: Vec<TxHash> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::AbandonFetch(FetchAbandon::Transactions { ids }) => Some(ids.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(
+            abandoned,
+            vec![unseen_hash],
+            "Expected AbandonFetch for retention-horizon-orphaned tx, got actions: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn block_include_emits_abandon_fetch_for_expected_tx() {
+        // Race: a tx is recorded as expected via provisions on H=1, then
+        // arrives via block inclusion on H=2 *without* having gone through
+        // gossip/submit admission. The block-include forget site clears the
+        // expected entry; the in-flight fetch (if any) must be cancelled
+        // explicitly because no `TransactionsAdmitted` continuation fires
+        // on this path.
+        let topology = make_test_topology();
+        let mut mempool = MempoolCoordinator::new();
+
+        let tx = test_transaction(1);
+        let tx_hash = tx.hash();
+
+        mempool.on_block_committed(
+            &topology,
+            &certified_block_with_provisions(BlockHeight(1), ShardGroupId(1), &[tx_hash]),
+        );
+        assert_eq!(mempool.pending_expected_count(), 1);
+
+        let certified = certified_commit_block(
+            BlockHeight(2),
+            tx,
+            make_finalized_wave(BlockHeight(2), tx_hash, TransactionDecision::Accept),
+        );
+        let actions = mempool.on_block_committed(&topology, &certified);
+
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::AbandonFetch(FetchAbandon::Transactions { ids }) if ids == &[tx_hash]
+            )),
+            "Expected AbandonFetch for block-included expected tx, got: {actions:?}"
+        );
     }
 
     #[test]

@@ -2,7 +2,10 @@
 //!
 //! When a committed block carries verified provisions referencing a tx that
 //! is not yet in our pool, we record `(tx_hash, source_shard, first_seen_ts)`
-//! here. The happy path is gossip arrival, which calls `forget`. On miss,
+//! here. The happy path is gossip arrival, which calls `forget`. Block-
+//! include race and retention-horizon orphan sweep also remove entries; the
+//! coordinator turns those drops into `Action::AbandonFetch` so any in-flight
+//! transaction fetch is cancelled rather than retried indefinitely. On miss
 //! callers consult the index to drive fetch fallback and horizon-bounded
 //! eviction.
 //!
@@ -58,9 +61,11 @@ impl ExpectedTxs {
     }
 
     /// Drop the expectation for `tx_hash`. Called from admission paths once
-    /// the tx is in pool.
-    pub fn forget(&mut self, tx_hash: &TxHash) {
-        self.entries.remove(tx_hash);
+    /// the tx is in pool. Returns `true` if an entry was removed — the
+    /// caller uses that to emit `Action::AbandonFetch` so any in-flight
+    /// fetch is cancelled.
+    pub fn forget(&mut self, tx_hash: &TxHash) -> bool {
+        self.entries.remove(tx_hash).is_some()
     }
 
     /// Number of distinct tx hashes currently expected.

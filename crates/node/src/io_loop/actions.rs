@@ -475,6 +475,9 @@ where
     #[allow(clippy::needless_pass_by_value)] // mirrors process_fetch_request; future variants carry Vec ids
     fn process_fetch_abandon(&mut self, req: FetchAbandon) {
         match req {
+            FetchAbandon::Transactions { ids } => {
+                self.drive_fetch::<TransactionBinding>(FetchInput::Drop { ids });
+            }
             FetchAbandon::RemoteProvisions {
                 source_shard,
                 block_height,

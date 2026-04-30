@@ -10,12 +10,21 @@
 //! `io_loop`'s dispatcher matches the inner enum and feeds the ids through
 //! `FetchInput::Drop` on the corresponding binding.
 
-use hyperscale_types::{BlockHeight, ShardGroupId};
+use hyperscale_types::{BlockHeight, ShardGroupId, TxHash};
 
 /// Fetch-cancel family — one variant per payload type. Variants are added
 /// when each binding migrates to push-cancel.
 #[derive(Debug, Clone)]
 pub enum FetchAbandon {
+    /// Per-tx fetch keyed by [`TxHash`]. Emitted by the mempool when an
+    /// expected cross-shard tx is dropped from `ExpectedTxs` without ever
+    /// being admitted — block-include race (tx landed via committed block
+    /// while the fetch was still in flight) or retention-horizon orphan
+    /// cleanup (cross-shard DA failed entirely).
+    Transactions {
+        /// Tx hashes whose in-flight fetch should be cancelled.
+        ids: Vec<TxHash>,
+    },
     /// Cross-shard provisions fetch keyed by `(source_shard, block_height)`.
     /// Emitted when [`provisions::ProvisionCoordinator`]'s expected-set drops
     /// the key — verification succeeded, the entry orphaned past retention,
