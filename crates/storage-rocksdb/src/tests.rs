@@ -773,21 +773,21 @@ fn test_blocks_survive_reopen() {
 #[test]
 fn test_receipt_survives_reopen() {
     let temp_dir = TempDir::new().unwrap();
-    let bundle = hyperscale_storage::test_helpers::make_test_receipt(55);
-    let tx_hash = bundle.tx_hash;
+    let receipt = hyperscale_storage::test_helpers::make_test_receipt(55);
+    let tx_hash = receipt.tx_hash;
 
     {
         let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
-        storage.store_receipt(&bundle);
+        storage.store_receipt(&receipt);
     }
 
     {
         let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
         assert!(storage.get_consensus_receipt(&tx_hash).is_some());
         let retrieved = storage.get_consensus_receipt(&tx_hash).unwrap();
-        assert_eq!(*retrieved, bundle.consensus);
+        assert_eq!(*retrieved, receipt.consensus);
         let local = storage.get_execution_metadata(&tx_hash).unwrap();
-        assert_eq!(local, bundle.metadata.unwrap());
+        assert_eq!(local, receipt.metadata.unwrap());
     }
 }
 

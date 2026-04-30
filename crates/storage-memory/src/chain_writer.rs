@@ -167,14 +167,14 @@ impl ChainWriter for SimStorage {
                         .or_default()
                         .push(wave_id_hash);
                 }
-                for bundle in &prepared.receipts {
+                for receipt in &prepared.receipts {
                     c.consensus_receipts.insert(
-                        bundle.tx_hash,
-                        std::sync::Arc::new(bundle.consensus.clone()),
+                        receipt.tx_hash,
+                        std::sync::Arc::new(receipt.consensus.clone()),
                     );
-                    if let Some(ref metadata) = bundle.metadata {
+                    if let Some(ref metadata) = receipt.metadata {
                         c.execution_metadata
-                            .insert(bundle.tx_hash, metadata.clone());
+                            .insert(receipt.tx_hash, metadata.clone());
                     }
                 }
                 for fw in block.certificates() {
@@ -287,14 +287,14 @@ impl SimStorage {
                     .push(wave_id_hash);
             }
             // Store receipts atomically with block commit.
-            for bundle in receipts {
+            for receipt in receipts {
                 c.consensus_receipts.insert(
-                    bundle.tx_hash,
-                    std::sync::Arc::new(bundle.consensus.clone()),
+                    receipt.tx_hash,
+                    std::sync::Arc::new(receipt.consensus.clone()),
                 );
-                if let Some(ref metadata) = bundle.metadata {
+                if let Some(ref metadata) = receipt.metadata {
                     c.execution_metadata
-                        .insert(bundle.tx_hash, metadata.clone());
+                        .insert(receipt.tx_hash, metadata.clone());
                 }
             }
             // Store execution certificates (extracted from wave certs) atomically.

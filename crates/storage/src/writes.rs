@@ -15,10 +15,10 @@ use std::sync::Arc;
 #[must_use]
 pub fn merge_updates_from_receipts(receipts: &[StoredReceipt]) -> DatabaseUpdates {
     let mut merged = DatabaseUpdates::default();
-    for bundle in receipts {
+    for receipt in receipts {
         if let ConsensusReceipt::Succeeded {
             database_updates, ..
-        } = &bundle.consensus
+        } = &receipt.consensus
         {
             merge_into(&mut merged, database_updates);
         }

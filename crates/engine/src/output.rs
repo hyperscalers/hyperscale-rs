@@ -91,7 +91,7 @@ impl ExecutedTx {
         Self {
             tx_hash,
             consensus: ConsensusReceipt::Failed,
-            metadata: ExecutionMetadata::failure(),
+            metadata: ExecutionMetadata::empty(),
         }
     }
 

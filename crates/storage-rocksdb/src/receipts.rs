@@ -14,12 +14,10 @@ impl RocksDbStorage {
     /// # Panics
     ///
     /// Panics if the underlying `RocksDB` write fails.
-    pub fn store_receipt(&self, bundle: &hyperscale_types::StoredReceipt) {
+    pub fn store_receipt(&self, receipt: &hyperscale_types::StoredReceipt) {
         let mut batch = WriteBatch::default();
-        self.add_receipt_to_batch(&mut batch, bundle);
-        self.db
-            .write(batch)
-            .expect("failed to persist receipt bundle");
+        self.add_receipt_to_batch(&mut batch, receipt);
+        self.db.write(batch).expect("failed to persist receipt");
     }
 
     /// Store multiple stored receipts in a single atomic `WriteBatch`.
@@ -27,44 +25,42 @@ impl RocksDbStorage {
     /// # Panics
     ///
     /// Panics if the underlying `RocksDB` write fails.
-    pub fn store_receipts(&self, bundles: &[hyperscale_types::StoredReceipt]) {
-        if bundles.is_empty() {
+    pub fn store_receipts(&self, receipts: &[hyperscale_types::StoredReceipt]) {
+        if receipts.is_empty() {
             return;
         }
         let mut batch = WriteBatch::default();
-        for bundle in bundles {
-            self.add_receipt_to_batch(&mut batch, bundle);
+        for receipt in receipts {
+            self.add_receipt_to_batch(&mut batch, receipt);
         }
         tracing::debug!(
-            count = bundles.len(),
-            tx_hashes = ?bundles.iter().map(|b| b.tx_hash).collect::<Vec<_>>(),
-            "Persisting stored receipts to RocksDB"
+            count = receipts.len(),
+            tx_hashes = ?receipts.iter().map(|r| r.tx_hash).collect::<Vec<_>>(),
+            "Persisting receipts to RocksDB"
         );
-        self.db
-            .write(batch)
-            .expect("failed to persist stored receipts");
+        self.db.write(batch).expect("failed to persist receipts");
     }
 
     /// Add a single stored receipt's writes to an existing `WriteBatch`.
     pub(crate) fn add_receipt_to_batch(
         &self,
         batch: &mut WriteBatch,
-        bundle: &hyperscale_types::StoredReceipt,
+        receipt: &hyperscale_types::StoredReceipt,
     ) {
         let cf = self.cf();
 
         typed_cf::batch_put::<ConsensusReceiptsCf>(
             batch,
             ConsensusReceiptsCf::handle(&cf),
-            bundle.tx_hash.as_raw(),
-            &bundle.consensus,
+            receipt.tx_hash.as_raw(),
+            &receipt.consensus,
         );
 
-        if let Some(ref metadata) = bundle.metadata {
+        if let Some(ref metadata) = receipt.metadata {
             typed_cf::batch_put::<ExecutionMetadataCf>(
                 batch,
                 ExecutionMetadataCf::handle(&cf),
-                bundle.tx_hash.as_raw(),
+                receipt.tx_hash.as_raw(),
                 metadata,
             );
         }

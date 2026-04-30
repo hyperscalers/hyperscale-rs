@@ -36,7 +36,7 @@ impl StoredReceipt {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ApplicationEvent, DatabaseUpdates, GlobalReceiptHash, Hash};
+    use crate::{ApplicationEvent, DatabaseUpdates, FeeSummary, GlobalReceiptHash, Hash};
 
     fn make_event(seed: u8) -> ApplicationEvent {
         ApplicationEvent {
@@ -65,8 +65,14 @@ mod tests {
             tx_hash: TxHash::from_raw(Hash::from_bytes(b"local_tx")),
             consensus: ConsensusReceipt::Failed,
             metadata: Some(ExecutionMetadata {
+                fee_summary: FeeSummary {
+                    total_execution_cost: vec![],
+                    total_royalty_cost: vec![],
+                    total_storage_cost: vec![],
+                    total_tipping_cost: vec![],
+                },
+                log_messages: vec![],
                 error_message: Some("test error".into()),
-                ..ExecutionMetadata::failure()
             }),
         };
         assert!(local.metadata.is_some());

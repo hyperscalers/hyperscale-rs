@@ -1517,8 +1517,8 @@ impl ExecutionCoordinator {
             if outcome.is_aborted() {
                 continue;
             }
-            if let Some(bundle) = wave.take_receipt(&outcome.tx_hash) {
-                receipts.push(bundle);
+            if let Some(receipt) = wave.take_receipt(&outcome.tx_hash) {
+                receipts.push(receipt);
             } else {
                 tracing::error!(
                     wave = %wave_id,

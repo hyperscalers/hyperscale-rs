@@ -65,16 +65,17 @@ pub struct ExecutionMetadata {
 }
 
 impl ExecutionMetadata {
-    /// Create a failure metadata record with no error message.
+    /// All-zero metadata: empty fees, no logs, no error.
     ///
-    /// Used by the engine's synthetic-failure path
-    /// ([`ExecutedTx::failure`](../../../../engine/src/output.rs))
-    /// where no Radix-produced diagnostic exists. Real failed receipts
-    /// from `build_execution_metadata` populate `error_message` directly
-    /// from Radix's [`RuntimeError`](radix_engine::errors)/[`RejectionReason`](radix_engine::errors)/[`AbortReason`](radix_engine::transaction::AbortReason)
-    /// rather than going through a constructor.
+    /// Used by the engine's synthetic-failure path (`ExecutedTx::failure`
+    /// in the `hyperscale_engine` crate) when no Radix-produced
+    /// diagnostic exists — the executor never reached the VM and has
+    /// nothing meaningful to populate. Real failed receipts come from
+    /// `build_execution_metadata` and populate `error_message`,
+    /// `log_messages`, and `fee_summary` directly from the Radix
+    /// transaction receipt.
     #[must_use]
-    pub const fn failure() -> Self {
+    pub const fn empty() -> Self {
         Self {
             fee_summary: FeeSummary {
                 total_execution_cost: vec![],

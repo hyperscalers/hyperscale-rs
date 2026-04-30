@@ -322,13 +322,13 @@ impl WaveState {
     /// Paired with `record_execution_result`: both flow from the same
     /// `ExecutionBatchCompleted` event and are scoped to this wave. Receipts
     /// for txs not in the wave are silently dropped.
-    pub fn record_receipt(&mut self, bundle: StoredReceipt) {
-        if !self.tx_hash_set.contains(&bundle.tx_hash) {
+    pub fn record_receipt(&mut self, receipt: StoredReceipt) {
+        if !self.tx_hash_set.contains(&receipt.tx_hash) {
             return;
         }
         self.execution_receipts
-            .entry(bundle.tx_hash)
-            .or_insert(bundle);
+            .entry(receipt.tx_hash)
+            .or_insert(receipt);
     }
 
     /// Number of receipts currently held by this wave. Exposed for memory

@@ -17,19 +17,14 @@ use radix_substate_store_interface::interface::{
     CreateDatabaseUpdates, DatabaseUpdates, SubstateDatabase,
 };
 
-/// Extract state updates from a committed transaction receipt.
-pub fn extract_state_updates(receipt: &TransactionReceipt) -> Option<DatabaseUpdates> {
-    match &receipt.result {
-        TransactionResult::Commit(commit) => Some(commit.state_updates.create_database_updates()),
-        TransactionResult::Reject(_) | TransactionResult::Abort(_) => None,
-    }
-}
-
 /// Extract `DatabaseUpdates` from a transaction receipt.
 ///
 /// Returns `DatabaseUpdates::default()` for rejected/aborted transactions.
 pub fn extract_database_updates(receipt: &TransactionReceipt) -> DatabaseUpdates {
-    extract_state_updates(receipt).unwrap_or_default()
+    match &receipt.result {
+        TransactionResult::Commit(commit) => commit.state_updates.create_database_updates(),
+        TransactionResult::Reject(_) | TransactionResult::Abort(_) => DatabaseUpdates::default(),
+    }
 }
 
 /// Build an [`ExecutedTx`] from a Radix Engine receipt.
@@ -70,25 +65,25 @@ pub fn build_executed_tx<S: SubstateDatabase>(
         .copied()
         .collect();
 
-    let application_events = extract_application_events(commit);
-    let mut database_updates = extract_database_updates(receipt);
-    database_updates = crate::sharding::filter_updates_for_shard(
-        &database_updates,
-        local_shard,
-        num_shards,
-        storage,
-        &declared_nodes,
-    );
-
     if !success {
         // Failed receipts carry no consensus payload; metadata still flows.
         return ExecutedTx::new(tx.hash(), ConsensusReceipt::Failed, metadata);
     }
 
-    // writes_root for GlobalReceipt: declared-only, system-filtered,
-    // NOT shard-filtered. Must match the per-shard agreement on the
-    // global view of writes.
+    let application_events = extract_application_events(commit);
+
+    // Walk the commit once. Two views of the same updates feed the
+    // success path: shard-filtered for the local consensus payload,
+    // declared-only/system-filtered for the global `writes_root` the
+    // EC commits to.
     let raw_updates = extract_database_updates(receipt);
+    let database_updates = crate::sharding::filter_updates_for_shard(
+        &raw_updates,
+        local_shard,
+        num_shards,
+        storage,
+        &declared_nodes,
+    );
     let global_updates =
         crate::sharding::filter_updates_for_global_receipt(&raw_updates, storage, &declared_nodes);
     let writes_root = crate::sharding::compute_writes_root(&global_updates);
