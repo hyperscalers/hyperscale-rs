@@ -316,7 +316,7 @@ where
             let (tx_outcomes, results): (Vec<_>, Vec<_>) = output
                 .results
                 .into_iter()
-                .map(|tx| (tx.outcome, tx.entry))
+                .map(|tx| (tx.outcome(), tx.into_entry()))
                 .unzip();
             metrics::record_execution_latency(start.elapsed().as_secs_f64());
             (ctx.notify)(NodeInput::Protocol(Box::new(
@@ -351,7 +351,7 @@ where
                     let tx = output.results.pop().unwrap_or_else(|| {
                         ExecutedTx::failure(req.tx_hash, "No cross-shard execution result returned")
                     });
-                    (tx.outcome, tx.entry)
+                    (tx.outcome(), tx.into_entry())
                 })
                 .unzip();
             metrics::record_execution_latency(start.elapsed().as_secs_f64());

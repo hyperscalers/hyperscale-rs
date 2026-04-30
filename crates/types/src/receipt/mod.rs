@@ -11,6 +11,7 @@
 //! with per-tx attribution via `local_receipt_root`.
 
 pub mod bundle;
+pub mod consensus;
 pub mod global;
 pub mod local;
 pub mod metadata;

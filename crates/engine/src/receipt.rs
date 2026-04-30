@@ -9,8 +9,8 @@
 
 use crate::output::ExecutedTx;
 use hyperscale_types::{
-    ApplicationEvent, ExecutionMetadata, FeeSummary, LocalReceipt, LogLevel, NodeId,
-    RoutableTransaction, ShardGroupId, TransactionOutcome,
+    ApplicationEvent, ConsensusReceipt, ExecutionMetadata, FeeSummary, LocalReceipt, LogLevel,
+    NodeId, RoutableTransaction, ShardGroupId, TransactionOutcome,
 };
 use radix_engine::transaction::{TransactionReceipt, TransactionResult};
 use radix_substate_store_interface::interface::{
@@ -111,7 +111,7 @@ pub fn build_executed_tx<S: SubstateDatabase>(
             .collect();
         let local_receipt =
             build_local_receipt(receipt, storage, &declared_nodes, local_shard, num_shards);
-        let execution_output = build_execution_metadata(receipt);
+        let metadata = build_execution_metadata(receipt);
 
         // writes_root for GlobalReceipt: declared-only, system-filtered,
         // NOT shard-filtered. Must match the per-shard agreement on the
@@ -125,7 +125,12 @@ pub fn build_executed_tx<S: SubstateDatabase>(
         let writes_root = crate::sharding::compute_writes_root(&global_updates);
         let receipt_hash = local_receipt.global_receipt(writes_root).receipt_hash();
 
-        ExecutedTx::success(tx.hash(), receipt_hash, local_receipt, execution_output)
+        let consensus = ConsensusReceipt::Succeeded {
+            receipt_hash,
+            database_updates: local_receipt.database_updates,
+            application_events: local_receipt.application_events,
+        };
+        ExecutedTx::new(tx.hash(), consensus, metadata)
     } else {
         let error = format!("{:?}", receipt.result);
         ExecutedTx::failure(tx.hash(), error)

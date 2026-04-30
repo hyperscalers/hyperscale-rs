@@ -3,24 +3,17 @@
 //! [`ExecutionOutput`] is the value returned by every [`Engine`](crate::Engine)
 //! call — one [`ExecutedTx`] per input transaction, in input order.
 //!
-//! [`ExecutedTx`] carries two consumer-shaped projections of one tx's result:
-//!
-//! - `outcome` — lightweight summary that flows into wave vote aggregation
-//!   (`ExecutionVote::tx_outcomes` → `ExecutionCertificate`).
-//! - `entry` — full local receipt + execution metadata that flows into
-//!   chain-state persistence when the wave's certificate commits.
-//!
-//! These types are I/O-shaped (no `Arc`s, no lifetimes) so they can be
-//! moved across thread-pool boundaries between the executor (which
-//! produces them) and the state machine (which consumes them).
+//! [`ExecutedTx`] is the canonical engine-side record. It carries the
+//! consensus-bound portion ([`ConsensusReceipt`]) and the local-only
+//! metadata ([`ExecutionMetadata`]) — same separation the rest of the
+//! system uses (see [`ReceiptBundle`](hyperscale_types::ReceiptBundle)).
 
 use hyperscale_types::{
-    ExecutionMetadata, ExecutionOutcome, GlobalReceiptHash, LocalExecutionEntry, LocalReceipt,
-    TxHash, TxOutcome, WritesRoot,
+    ConsensusReceipt, ExecutionMetadata, ExecutionOutcome, LocalExecutionEntry, TxHash, TxOutcome,
 };
 
 /// Output from executing a batch of transactions.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ExecutionOutput {
     /// Results for each transaction, in the same order as input.
     pub results: Vec<ExecutedTx>,
@@ -63,72 +56,83 @@ impl ExecutionOutput {
     }
 }
 
-/// One executed transaction's consumer-shaped output.
+/// Engine output for one transaction.
 ///
-/// `outcome` flows into wave vote aggregation (`ExecutionVote::tx_outcomes` →
-/// `ExecutionCertificate`). `entry` flows into chain-state persistence
-/// (receipts written when the wave's certificate is committed).
+/// Holds the canonical fields produced by execution: the consensus
+/// portion (variant-tagged outcome plus, on success, the precomputed
+/// receipt hash and shard-filtered writes/events) and the local-only
+/// metadata (logs, error, fees).
 #[derive(Debug, Clone)]
 pub struct ExecutedTx {
-    /// Lightweight summary for vote aggregation.
-    pub outcome: TxOutcome,
-    /// Full local receipt + execution metadata for persistence.
-    pub entry: LocalExecutionEntry,
+    /// Hash of the executed transaction.
+    pub tx_hash: TxHash,
+    /// Consensus-bound receipt portion (transferable across peers).
+    pub consensus: ConsensusReceipt,
+    /// Local-only execution metadata (logs, error, fees).
+    pub metadata: ExecutionMetadata,
 }
 
 impl ExecutedTx {
-    /// Create a successful executed-tx record.
+    /// Build a record for an executed transaction.
     #[must_use]
-    pub const fn success(
+    pub const fn new(
         tx_hash: TxHash,
-        receipt_hash: GlobalReceiptHash,
-        local_receipt: LocalReceipt,
-        execution_output: ExecutionMetadata,
+        consensus: ConsensusReceipt,
+        metadata: ExecutionMetadata,
     ) -> Self {
         Self {
-            outcome: TxOutcome {
-                tx_hash,
-                outcome: ExecutionOutcome::Executed {
-                    receipt_hash,
-                    success: true,
-                },
-            },
-            entry: LocalExecutionEntry {
-                tx_hash,
-                receipt_hash,
-                local_receipt,
-                execution_output,
-            },
+            tx_hash,
+            consensus,
+            metadata,
         }
     }
 
-    /// Create a failed executed-tx record.
+    /// Build a canonical failure record for `tx_hash`.
     ///
-    /// `error` is logged at the construction site (it does not flow downstream
-    /// — neither vote aggregation nor receipt persistence carry the message).
+    /// `error` is logged at the construction site (it does not flow
+    /// downstream — neither vote aggregation nor receipt persistence
+    /// carry the message).
     #[must_use]
     pub fn failure(tx_hash: TxHash, error: impl Into<String>) -> Self {
         let error = error.into();
         tracing::warn!(?tx_hash, %error, "transaction execution failed");
-        let local_receipt = LocalReceipt::failure();
-        // Failures have no writes, so writes_root is ZERO.
-        let receipt_hash = local_receipt
-            .global_receipt(WritesRoot::ZERO)
-            .receipt_hash();
         Self {
-            outcome: TxOutcome {
-                tx_hash,
-                outcome: ExecutionOutcome::Executed {
-                    receipt_hash,
-                    success: false,
-                },
+            tx_hash,
+            consensus: ConsensusReceipt::Failed,
+            metadata: ExecutionMetadata::failure(None),
+        }
+    }
+
+    /// Whether the transaction succeeded.
+    #[must_use]
+    pub const fn is_success(&self) -> bool {
+        self.consensus.is_success()
+    }
+
+    /// Project the wave-vote view (legacy [`TxOutcome`] shape; small,
+    /// copyable). Used at the engine→state-machine boundary during
+    /// the `unify-receipt-types` migration.
+    #[must_use]
+    pub fn outcome(&self) -> TxOutcome {
+        TxOutcome {
+            tx_hash: self.tx_hash,
+            outcome: ExecutionOutcome::Executed {
+                receipt_hash: self.consensus.receipt_hash(),
+                success: self.consensus.is_success(),
             },
-            entry: LocalExecutionEntry {
-                tx_hash,
-                receipt_hash,
-                local_receipt,
-                execution_output: ExecutionMetadata::failure(None),
-            },
+        }
+    }
+
+    /// Project the persistence view (legacy [`LocalExecutionEntry`]
+    /// shape). Used at the engine→state-machine boundary during the
+    /// `unify-receipt-types` migration.
+    #[must_use]
+    pub fn into_entry(self) -> LocalExecutionEntry {
+        LocalExecutionEntry {
+            tx_hash: self.tx_hash,
+            receipt_hash: self.consensus.receipt_hash(),
+            local_receipt: self.consensus.to_local_receipt(),
+            execution_output: self.metadata,
         }
     }
 }
@@ -157,38 +161,29 @@ mod tests {
         let c = ExecutedTx::failure(tx_hash(3), "err-c");
         let out = ExecutionOutput::new(vec![a, b, c]);
 
-        let hashes: Vec<TxHash> = out.iter().map(|e| e.outcome.tx_hash).collect();
+        let hashes: Vec<TxHash> = out.iter().map(|e| e.tx_hash).collect();
         assert_eq!(hashes, vec![tx_hash(1), tx_hash(2), tx_hash(3)]);
         assert_eq!(out.len(), 3);
         assert!(!out.is_empty());
     }
 
     #[test]
-    fn failure_marks_outcome_unsuccessful_and_carries_tx_hash() {
+    fn failure_marks_consensus_as_failed_and_carries_tx_hash() {
         let h = tx_hash(7);
         let exec = ExecutedTx::failure(h, "boom");
 
-        assert_eq!(exec.outcome.tx_hash, h);
-        assert_eq!(exec.entry.tx_hash, h);
-        // tx_hash and receipt_hash on `outcome` and `entry` must agree —
-        // downstream vote aggregation matches them by hash.
-        assert_eq!(exec.outcome.tx_hash, exec.entry.tx_hash);
-        assert!(matches!(
-            exec.outcome.outcome,
-            ExecutionOutcome::Executed { success: false, .. }
-        ));
+        assert_eq!(exec.tx_hash, h);
+        assert!(!exec.is_success());
+        assert!(matches!(exec.consensus, ConsensusReceipt::Failed));
     }
 
     #[test]
     fn failure_receipt_hash_is_canonical_across_failures() {
-        // All failures share `LocalReceipt::failure()` + `WritesRoot::ZERO`,
-        // so they share one receipt_hash. Validators in the same shard
-        // can vote on the same (tx_hash, canonical_failure_hash) pair
-        // regardless of why each saw the tx fail.
+        // All failures share the canonical FAILED_RECEIPT_HASH; downstream
+        // vote aggregation matches by tx_hash, not by receipt_hash.
         let a = ExecutedTx::failure(tx_hash(1), "err");
         let b = ExecutedTx::failure(tx_hash(2), "different");
-        assert_eq!(a.entry.receipt_hash, b.entry.receipt_hash);
-        // Outcome on the wave-vote side is still keyed by tx_hash.
-        assert_ne!(a.outcome.tx_hash, b.outcome.tx_hash);
+        assert_eq!(a.consensus.receipt_hash(), b.consensus.receipt_hash());
+        assert_ne!(a.tx_hash, b.tx_hash);
     }
 }
