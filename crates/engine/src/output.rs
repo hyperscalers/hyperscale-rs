@@ -48,12 +48,6 @@ impl ExecutionOutput {
     pub fn iter(&self) -> impl Iterator<Item = &ExecutedTx> {
         self.results.iter()
     }
-
-    /// Get a reference to the results.
-    #[must_use]
-    pub fn results(&self) -> &[ExecutedTx] {
-        &self.results
-    }
 }
 
 /// Engine output for one transaction.

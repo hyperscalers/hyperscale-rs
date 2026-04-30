@@ -53,7 +53,7 @@ pub enum LogLevel {
 /// transaction locally (not available for synced receipts).
 ///
 /// Written atomically with block commit but on a separate pruning cycle
-/// (can be pruned earlier than `LocalReceipts` since not needed for state verification).
+/// (can be pruned earlier than the consensus receipt since not needed for state verification).
 #[derive(Debug, Clone, PartialEq, Eq, sbor::prelude::BasicSbor)]
 pub struct ExecutionMetadata {
     /// Fee breakdown reported by the engine.

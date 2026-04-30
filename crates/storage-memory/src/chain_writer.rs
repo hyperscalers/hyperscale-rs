@@ -173,7 +173,8 @@ impl ChainWriter for SimStorage {
                         std::sync::Arc::new(bundle.consensus.clone()),
                     );
                     if let Some(ref metadata) = bundle.metadata {
-                        c.execution_outputs.insert(bundle.tx_hash, metadata.clone());
+                        c.execution_metadata
+                            .insert(bundle.tx_hash, metadata.clone());
                     }
                 }
                 for fw in block.certificates() {
@@ -292,7 +293,8 @@ impl SimStorage {
                     std::sync::Arc::new(bundle.consensus.clone()),
                 );
                 if let Some(ref metadata) = bundle.metadata {
-                    c.execution_outputs.insert(bundle.tx_hash, metadata.clone());
+                    c.execution_metadata
+                        .insert(bundle.tx_hash, metadata.clone());
                 }
             }
             // Store execution certificates (extracted from wave certs) atomically.

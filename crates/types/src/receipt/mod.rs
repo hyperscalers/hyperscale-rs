@@ -5,16 +5,16 @@
 //! | **Global**    | [`GlobalReceipt`](global::GlobalReceipt)         | success bit + `event_root` + `writes_root` | Yes |
 //! | **Consensus** | [`ConsensusReceipt`](consensus::ConsensusReceipt) | variant tag + (Succeeded:) shard-filtered writes + events + precomputed `receipt_hash` | No |
 //! | **Metadata**  | [`ExecutionMetadata`](metadata::ExecutionMetadata) | fees, logs, errors | No (local-only) |
-//! | **Stored**    | [`StoredReceipt`](bundle::StoredReceipt)         | `tx_hash` + consensus + optional metadata | n/a (storage shape) |
+//! | **Stored**    | [`StoredReceipt`](stored::StoredReceipt)         | `tx_hash` + consensus + optional metadata | n/a (storage shape) |
 //!
 //! `GlobalReceipt::receipt_hash()` is signed over in execution votes/certificates.
 //! Per-shard state correctness is enforced by `state_root` in the block header,
 //! with per-tx attribution via `local_receipt_root` (`ConsensusReceipt::local_receipt_hash`).
 
-pub mod bundle;
 pub mod consensus;
 pub mod global;
 pub mod metadata;
+pub mod stored;
 
 #[cfg(test)]
 mod tests {

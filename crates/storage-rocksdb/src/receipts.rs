@@ -1,6 +1,6 @@
 //! Receipt storage for `RocksDB`.
 
-use crate::column_families::{ConsensusReceiptsCf, ExecutionOutputsCf};
+use crate::column_families::{ConsensusReceiptsCf, ExecutionMetadataCf};
 use crate::core::RocksDbStorage;
 use crate::typed_cf::{self, TypedCf};
 
@@ -14,9 +14,9 @@ impl RocksDbStorage {
     /// # Panics
     ///
     /// Panics if the underlying `RocksDB` write fails.
-    pub fn store_receipt_bundle(&self, bundle: &hyperscale_types::StoredReceipt) {
+    pub fn store_receipt(&self, bundle: &hyperscale_types::StoredReceipt) {
         let mut batch = WriteBatch::default();
-        self.add_receipt_bundle_to_batch(&mut batch, bundle);
+        self.add_receipt_to_batch(&mut batch, bundle);
         self.db
             .write(batch)
             .expect("failed to persist receipt bundle");
@@ -27,13 +27,13 @@ impl RocksDbStorage {
     /// # Panics
     ///
     /// Panics if the underlying `RocksDB` write fails.
-    pub fn store_receipt_bundles(&self, bundles: &[hyperscale_types::StoredReceipt]) {
+    pub fn store_receipts(&self, bundles: &[hyperscale_types::StoredReceipt]) {
         if bundles.is_empty() {
             return;
         }
         let mut batch = WriteBatch::default();
         for bundle in bundles {
-            self.add_receipt_bundle_to_batch(&mut batch, bundle);
+            self.add_receipt_to_batch(&mut batch, bundle);
         }
         tracing::debug!(
             count = bundles.len(),
@@ -46,7 +46,7 @@ impl RocksDbStorage {
     }
 
     /// Add a single stored receipt's writes to an existing `WriteBatch`.
-    pub(crate) fn add_receipt_bundle_to_batch(
+    pub(crate) fn add_receipt_to_batch(
         &self,
         batch: &mut WriteBatch,
         bundle: &hyperscale_types::StoredReceipt,
@@ -61,9 +61,9 @@ impl RocksDbStorage {
         );
 
         if let Some(ref metadata) = bundle.metadata {
-            typed_cf::batch_put::<ExecutionOutputsCf>(
+            typed_cf::batch_put::<ExecutionMetadataCf>(
                 batch,
-                ExecutionOutputsCf::handle(&cf),
+                ExecutionMetadataCf::handle(&cf),
                 bundle.tx_hash.as_raw(),
                 metadata,
             );
@@ -80,10 +80,10 @@ impl RocksDbStorage {
     }
 
     /// Retrieve execution metadata for a transaction.
-    pub fn get_execution_output(
+    pub fn get_execution_metadata(
         &self,
         tx_hash: &TxHash,
     ) -> Option<hyperscale_types::ExecutionMetadata> {
-        self.cf_get::<ExecutionOutputsCf>(tx_hash.as_raw())
+        self.cf_get::<ExecutionMetadataCf>(tx_hash.as_raw())
     }
 }

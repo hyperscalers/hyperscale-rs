@@ -45,29 +45,9 @@ pub enum ExecutionOutcome {
 }
 
 impl ExecutionOutcome {
-    /// Whether execution succeeded.
-    #[must_use]
-    pub const fn is_success(&self) -> bool {
-        matches!(self, Self::Succeeded { .. })
-    }
-
     /// Whether the transaction was aborted.
     #[must_use]
     pub const fn is_aborted(&self) -> bool {
         matches!(self, Self::Aborted)
-    }
-
-    /// Get the receipt hash, or `GlobalReceiptHash::ZERO` for non-success outcomes.
-    ///
-    /// Failed transactions hash to the canonical
-    /// [`FAILED_RECEIPT_HASH`](crate::FAILED_RECEIPT_HASH) when needed,
-    /// but this method returns ZERO to preserve legacy
-    /// `receipt_hash_or_zero` semantics for callers that key by it.
-    #[must_use]
-    pub const fn receipt_hash_or_zero(&self) -> GlobalReceiptHash {
-        match self {
-            Self::Succeeded { receipt_hash } => *receipt_hash,
-            Self::Failed | Self::Aborted => GlobalReceiptHash::ZERO,
-        }
     }
 }

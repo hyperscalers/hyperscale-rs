@@ -553,7 +553,8 @@ impl WaveState {
     /// (when the vote arrived first).
     ///
     /// `global_receipt_root` commits to each tx's
-    /// `LocalReceipt::receipt_hash` (which folds in `database_updates`),
+    /// [`ConsensusReceipt::receipt_hash`](hyperscale_types::ConsensusReceipt::receipt_hash)
+    /// (which folds in `writes_root` derived from `database_updates`),
     /// so a root mismatch is direct proof that local execution produced
     /// different writes than the quorum. Latches `locally_divergent` to
     /// keep the wave out of the `finalized` store; the canonical
@@ -1114,7 +1115,7 @@ mod tests {
     fn locally_divergent_when_vote_root_disagrees_with_admitted_ec() {
         // Local vote computed root R1 (from this validator's database_updates).
         // Quorum aggregated EC with root R2 (other validators' agreed root).
-        // R1 != R2 ⇒ this validator's `LocalReceipt.database_updates`
+        // R1 != R2 ⇒ this validator's `ConsensusReceipt::Succeeded.database_updates`
         // differs from canonical. Wave must not finalize locally; the
         // canonical `FinalizedWave` is recovered later via block-sync.
         let mut w = make_single_shard_wave(2);

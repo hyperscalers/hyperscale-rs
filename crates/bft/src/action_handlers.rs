@@ -732,14 +732,14 @@ pub fn handle_action<S, E, N>(
             // so short-circuit and report both roots as invalid. The
             // coordinator's per-kind tracking still completes because both
             // events are emitted.
-            let receipt_bundles: Vec<StoredReceipt> = finalized_waves
+            let stored_receipts: Vec<StoredReceipt> = finalized_waves
                 .iter()
                 .flat_map(|fw| fw.receipts.iter().cloned())
                 .collect();
 
             let receipt_start = std::time::Instant::now();
             let receipt_root_valid =
-                verify_local_receipt_root(expected_local_receipt_root, &receipt_bundles);
+                verify_local_receipt_root(expected_local_receipt_root, &stored_receipts);
             metrics::record_signature_verification_latency(
                 "local_receipt_root",
                 receipt_start.elapsed().as_secs_f64(),

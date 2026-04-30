@@ -110,7 +110,7 @@ pub struct ConsensusState {
     /// Consensus receipts keyed by transaction hash.
     pub consensus_receipts: HashMap<TxHash, Arc<ConsensusReceipt>>,
     /// Execution output details keyed by transaction hash.
-    pub execution_outputs: HashMap<TxHash, ExecutionMetadata>,
+    pub execution_metadata: HashMap<TxHash, ExecutionMetadata>,
     /// Insertion height for each receipt, enabling height-based pruning.
     pub receipt_heights: HashMap<TxHash, BlockHeight>,
     /// Execution certificates keyed by canonical hash.
@@ -138,7 +138,7 @@ impl ConsensusState {
             transactions: HashMap::new(),
             certificates: HashMap::new(),
             consensus_receipts: HashMap::new(),
-            execution_outputs: HashMap::new(),
+            execution_metadata: HashMap::new(),
             receipt_heights: HashMap::new(),
             execution_certs: HashMap::new(),
             execution_certs_by_height: HashMap::new(),
@@ -157,7 +157,7 @@ impl ConsensusState {
         self.receipt_heights.retain(|tx_hash, height| {
             if *height <= cutoff {
                 self.consensus_receipts.remove(tx_hash);
-                self.execution_outputs.remove(tx_hash);
+                self.execution_metadata.remove(tx_hash);
                 false
             } else {
                 true

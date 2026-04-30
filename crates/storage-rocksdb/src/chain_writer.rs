@@ -136,7 +136,7 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
         );
 
         for bundle in &receipts {
-            self.add_receipt_bundle_to_batch(&mut write_batch, bundle);
+            self.add_receipt_to_batch(&mut write_batch, bundle);
         }
 
         let prepared = RocksDbPreparedCommit {
@@ -290,7 +290,7 @@ impl RocksDbStorage {
 
         // Add receipts to the batch atomically.
         for bundle in receipts {
-            self.add_receipt_bundle_to_batch(&mut batch, bundle);
+            self.add_receipt_to_batch(&mut batch, bundle);
         }
 
         // Compute JMT update.
