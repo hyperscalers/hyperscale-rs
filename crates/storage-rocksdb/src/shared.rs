@@ -203,6 +203,13 @@ impl hyperscale_storage::ChainReader for SharedStorage {
         self.0.get_block(height)
     }
 
+    fn get_committed_header(
+        &self,
+        height: BlockHeight,
+    ) -> Option<hyperscale_types::CommittedBlockHeader> {
+        hyperscale_storage::ChainReader::get_committed_header(&*self.0, height)
+    }
+
     fn committed_height(&self) -> BlockHeight {
         self.0.committed_height()
     }

@@ -4,15 +4,26 @@ use crate::core::SimStorage;
 
 use hyperscale_storage::{BlockForSync, ChainReader};
 use hyperscale_types::{
-    BlockHash, BlockHeight, CertifiedBlock, ConsensusReceipt, ExecutionCertificate,
-    ExecutionCertificateHash, QuorumCertificate, RoutableTransaction, ShardGroupId, TxHash,
-    WaveCertificate, WaveIdHash,
+    BlockHash, BlockHeight, CertifiedBlock, CommittedBlockHeader, ConsensusReceipt,
+    ExecutionCertificate, ExecutionCertificateHash, QuorumCertificate, RoutableTransaction,
+    ShardGroupId, TxHash, WaveCertificate, WaveIdHash,
 };
 use std::sync::Arc;
 
 impl ChainReader for SimStorage {
     fn get_block(&self, height: BlockHeight) -> Option<CertifiedBlock> {
         self.consensus.read().unwrap().blocks.get(&height).cloned()
+    }
+
+    fn get_committed_header(&self, height: BlockHeight) -> Option<CommittedBlockHeader> {
+        self.consensus
+            .read()
+            .unwrap()
+            .blocks
+            .get(&height)
+            .map(|certified| {
+                CommittedBlockHeader::new(certified.block.header().clone(), certified.qc.clone())
+            })
     }
 
     fn committed_height(&self) -> BlockHeight {

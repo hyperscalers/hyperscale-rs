@@ -768,6 +768,12 @@ mod tests {
         fn get_block(&self, _height: BlockHeight) -> Option<hyperscale_types::CertifiedBlock> {
             None
         }
+        fn get_committed_header(
+            &self,
+            _height: BlockHeight,
+        ) -> Option<hyperscale_types::CommittedBlockHeader> {
+            None
+        }
         fn committed_height(&self) -> BlockHeight {
             BlockHeight(0)
         }

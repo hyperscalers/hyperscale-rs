@@ -4,9 +4,9 @@
 //! All methods take `&self` — implementations use interior mutability.
 
 use hyperscale_types::{
-    Block, BlockHash, BlockHeight, CertifiedBlock, ConsensusReceipt, ExecutionCertificate,
-    ExecutionCertificateHash, ProvisionHash, QuorumCertificate, RoutableTransaction, ShardGroupId,
-    TxHash, WaveCertificate, WaveIdHash,
+    Block, BlockHash, BlockHeight, CertifiedBlock, CommittedBlockHeader, ConsensusReceipt,
+    ExecutionCertificate, ExecutionCertificateHash, ProvisionHash, QuorumCertificate,
+    RoutableTransaction, ShardGroupId, TxHash, WaveCertificate, WaveIdHash,
 };
 use std::sync::Arc;
 
@@ -38,6 +38,13 @@ pub struct BlockForSync {
 pub trait ChainReader: Send + Sync + 'static {
     /// Get a committed block by height.
     fn get_block(&self, height: BlockHeight) -> Option<CertifiedBlock>;
+
+    /// Get a committed block header (header + committing QC) by height.
+    ///
+    /// Lighter than [`Self::get_block`]: skips the per-tx and per-cert
+    /// fan-out reads needed to rehydrate a full block. Used by the
+    /// remote-header fallback serve path, which never needs the body.
+    fn get_committed_header(&self, height: BlockHeight) -> Option<CommittedBlockHeader>;
 
     /// Get the highest committed block height.
     fn committed_height(&self) -> BlockHeight;

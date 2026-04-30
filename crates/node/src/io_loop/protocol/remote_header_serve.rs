@@ -9,7 +9,7 @@
 use hyperscale_messages::request::{GetRemoteHeadersRequest, MAX_REMOTE_HEADERS_PER_REQUEST};
 use hyperscale_messages::response::GetRemoteHeadersResponse;
 use hyperscale_storage::ChainReader;
-use hyperscale_types::{BlockHeight, CommittedBlockHeader};
+use hyperscale_types::BlockHeight;
 
 /// Serve an inbound remote-header range request.
 ///
@@ -27,13 +27,10 @@ pub fn serve_remote_headers_request(
 
     for offset in 0..bounded_count {
         let height = BlockHeight(req.from_height.0.saturating_add(offset));
-        let Some(certified) = storage.get_block(height) else {
+        let Some(header) = storage.get_committed_header(height) else {
             break;
         };
-        headers.push(CommittedBlockHeader::new(
-            certified.block.header().clone(),
-            certified.qc,
-        ));
+        headers.push(header);
     }
 
     if !headers.is_empty() {
