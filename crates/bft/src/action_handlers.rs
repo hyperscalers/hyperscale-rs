@@ -529,8 +529,7 @@ fn collect_finalized_receipts(
 ) -> Vec<Arc<hyperscale_types::ConsensusReceipt>> {
     waves
         .iter()
-        .flat_map(|fw| fw.receipts.iter())
-        .map(|b| Arc::new(b.consensus.clone()))
+        .flat_map(|fw| fw.consensus_receipts())
         .collect()
 }
 

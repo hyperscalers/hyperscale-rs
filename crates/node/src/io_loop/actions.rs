@@ -360,8 +360,7 @@ where
             let jmt_snapshot = Arc::new(S::jmt_snapshot(&prepared).clone());
             let receipts: Vec<Arc<hyperscale_types::ConsensusReceipt>> = finalized_waves
                 .iter()
-                .flat_map(|fw| fw.receipts.iter())
-                .map(|b| Arc::new(b.consensus.clone()))
+                .flat_map(|fw| fw.consensus_receipts())
                 .collect();
             self.pending_chain.insert(
                 block_hash,

@@ -25,11 +25,11 @@ fn commit_with(
     } else {
         let receipt = hyperscale_types::StoredReceipt {
             tx_hash: TxHash::ZERO,
-            consensus: hyperscale_types::ConsensusReceipt::Succeeded {
+            consensus: Arc::new(hyperscale_types::ConsensusReceipt::Succeeded {
                 receipt_hash: hyperscale_types::GlobalReceiptHash::ZERO,
                 database_updates: updates.clone(),
                 application_events: vec![],
-            },
+            }),
             metadata: None,
         };
         let new_fw = Arc::new(hyperscale_types::FinalizedWave {

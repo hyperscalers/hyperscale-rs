@@ -132,12 +132,11 @@ impl ExecutedTx {
 }
 
 impl From<ExecutedTx> for StoredReceipt {
-    /// Bridge from engine output to storage shape: metadata is always
-    /// present (the engine always produces it), so wrapped in `Some`.
+    /// Engine-produced receipts always carry metadata; wrapped in `Some`.
     fn from(tx: ExecutedTx) -> Self {
         Self {
             tx_hash: tx.tx_hash,
-            consensus: tx.consensus,
+            consensus: std::sync::Arc::new(tx.consensus),
             metadata: Some(tx.metadata),
         }
     }

@@ -22,11 +22,11 @@ fn updates_to_receipts(updates: &DatabaseUpdates) -> Vec<StoredReceipt> {
     }
     vec![StoredReceipt {
         tx_hash: TxHash::ZERO,
-        consensus: hyperscale_types::ConsensusReceipt::Succeeded {
+        consensus: Arc::new(hyperscale_types::ConsensusReceipt::Succeeded {
             receipt_hash: hyperscale_types::GlobalReceiptHash::ZERO,
             database_updates: updates.clone(),
             application_events: vec![],
-        },
+        }),
         metadata: None,
     }]
 }
@@ -785,7 +785,7 @@ fn test_receipt_survives_reopen() {
         let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
         assert!(storage.get_consensus_receipt(&tx_hash).is_some());
         let retrieved = storage.get_consensus_receipt(&tx_hash).unwrap();
-        assert_eq!(*retrieved, receipt.consensus);
+        assert_eq!(retrieved, receipt.consensus);
         let local = storage.get_execution_metadata(&tx_hash).unwrap();
         assert_eq!(local, receipt.metadata.unwrap());
     }
@@ -902,11 +902,11 @@ fn rocks_commit_with(
     if !updates.node_updates.is_empty() {
         let receipt = hyperscale_types::StoredReceipt {
             tx_hash: TxHash::ZERO,
-            consensus: hyperscale_types::ConsensusReceipt::Succeeded {
+            consensus: Arc::new(hyperscale_types::ConsensusReceipt::Succeeded {
                 receipt_hash: hyperscale_types::GlobalReceiptHash::ZERO,
                 database_updates: updates.clone(),
                 application_events: vec![],
-            },
+            }),
             metadata: None,
         };
         let wave = Arc::new(hyperscale_types::FinalizedWave {

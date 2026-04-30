@@ -72,7 +72,7 @@ impl ChainWriter for SimStorage {
         // Failed receipts contribute no writes.
         let per_receipt_updates: Vec<&hyperscale_storage::DatabaseUpdates> = receipts
             .iter()
-            .filter_map(|b| match &b.consensus {
+            .filter_map(|b| match b.consensus.as_ref() {
                 hyperscale_types::ConsensusReceipt::Succeeded {
                     database_updates, ..
                 } => Some(database_updates),
@@ -168,10 +168,8 @@ impl ChainWriter for SimStorage {
                         .push(wave_id_hash);
                 }
                 for receipt in &prepared.receipts {
-                    c.consensus_receipts.insert(
-                        receipt.tx_hash,
-                        std::sync::Arc::new(receipt.consensus.clone()),
-                    );
+                    c.consensus_receipts
+                        .insert(receipt.tx_hash, Arc::clone(&receipt.consensus));
                     if let Some(ref metadata) = receipt.metadata {
                         c.execution_metadata
                             .insert(receipt.tx_hash, metadata.clone());
@@ -288,10 +286,8 @@ impl SimStorage {
             }
             // Store receipts atomically with block commit.
             for receipt in receipts {
-                c.consensus_receipts.insert(
-                    receipt.tx_hash,
-                    std::sync::Arc::new(receipt.consensus.clone()),
-                );
+                c.consensus_receipts
+                    .insert(receipt.tx_hash, Arc::clone(&receipt.consensus));
                 if let Some(ref metadata) = receipt.metadata {
                     c.execution_metadata
                         .insert(receipt.tx_hash, metadata.clone());

@@ -131,6 +131,13 @@ impl FinalizedWave {
         self.local_ec().tx_outcomes.len()
     }
 
+    /// Iterator over each receipt's consensus payload, in canonical
+    /// block order. Used by pending-chain insertion and local-receipt
+    /// root verification.
+    pub fn consensus_receipts(&self) -> impl Iterator<Item = Arc<crate::ConsensusReceipt>> + '_ {
+        self.receipts.iter().map(|r| Arc::clone(&r.consensus))
+    }
+
     /// Iterator over the wave's tx hashes in canonical block order.
     pub fn tx_hashes(&self) -> impl Iterator<Item = TxHash> + '_ {
         self.local_ec().tx_outcomes.iter().map(|o| o.tx_hash)
@@ -170,7 +177,7 @@ impl FinalizedWave {
         for outcome in &local_ec.tx_outcomes {
             match lookup(&outcome.tx_hash) {
                 Some(receipt) => {
-                    receipts.push(StoredReceipt::synced(outcome.tx_hash, (*receipt).clone()));
+                    receipts.push(StoredReceipt::synced(outcome.tx_hash, receipt));
                 }
                 None if outcome.is_aborted() => {}
                 None => return None,
@@ -227,7 +234,7 @@ impl FinalizedWave {
                 });
             }
 
-            match (ec_kind, &receipt.consensus) {
+            match (ec_kind, receipt.consensus.as_ref()) {
                 (
                     Some(expected_hash),
                     ConsensusReceipt::Succeeded {

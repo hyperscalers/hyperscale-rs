@@ -162,7 +162,7 @@ pub fn make_test_receipt(seed: u8) -> StoredReceipt {
     });
     StoredReceipt {
         tx_hash,
-        consensus,
+        consensus: Arc::new(consensus),
         metadata,
     }
 }

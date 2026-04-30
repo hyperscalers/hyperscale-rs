@@ -416,7 +416,7 @@ mod tests {
         );
         let receipt = StoredReceipt {
             tx_hash,
-            consensus: if success {
+            consensus: Arc::new(if success {
                 hyperscale_types::ConsensusReceipt::Succeeded {
                     receipt_hash: hyperscale_types::GlobalReceiptHash::ZERO,
                     #[allow(clippy::default_trait_access)]
@@ -425,7 +425,7 @@ mod tests {
                 }
             } else {
                 hyperscale_types::ConsensusReceipt::Failed
-            },
+            }),
             metadata: None,
         };
         let fw = Arc::new(FinalizedWave {
@@ -582,7 +582,7 @@ mod tests {
         let receipt = StoredReceipt {
             tx_hash,
             // ConsensusReceipt::Failed but EC said Succeeded — mismatch test.
-            consensus: hyperscale_types::ConsensusReceipt::Failed,
+            consensus: std::sync::Arc::new(hyperscale_types::ConsensusReceipt::Failed),
             metadata: None,
         };
         let fw = Arc::new(FinalizedWave {

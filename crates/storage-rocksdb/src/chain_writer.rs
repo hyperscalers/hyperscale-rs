@@ -76,7 +76,7 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
         // Failed receipts contribute no writes.
         let per_receipt_updates: Vec<&DatabaseUpdates> = receipts
             .iter()
-            .filter_map(|b| match &b.consensus {
+            .filter_map(|b| match b.consensus.as_ref() {
                 hyperscale_types::ConsensusReceipt::Succeeded {
                     database_updates, ..
                 } => Some(database_updates),
@@ -118,7 +118,7 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
         // Failed receipts contribute no writes.
         let updates: Vec<DatabaseUpdates> = receipts
             .iter()
-            .filter_map(|b| match &b.consensus {
+            .filter_map(|b| match b.consensus.as_ref() {
                 hyperscale_types::ConsensusReceipt::Succeeded {
                     database_updates, ..
                 } => Some(database_updates.clone()),

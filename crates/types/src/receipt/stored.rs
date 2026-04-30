@@ -1,6 +1,7 @@
 //! Persisted receipt — consensus portion plus optional local metadata.
 
 use crate::{ConsensusReceipt, ExecutionMetadata, TxHash};
+use std::sync::Arc;
 
 /// A persisted receipt: consensus-bound portion paired with optional
 /// local-only metadata.
@@ -8,12 +9,12 @@ use crate::{ConsensusReceipt, ExecutionMetadata, TxHash};
 /// `metadata` is `None` when this receipt was received from a peer (sync
 /// or catch-up) — peers don't ship their local logs/fees/errors. When
 /// the local node executed the transaction, `metadata` is `Some`.
-#[derive(Debug, Clone, PartialEq, Eq, sbor::prelude::BasicSbor)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredReceipt {
     /// Hash of the executed transaction this receipt belongs to.
     pub tx_hash: TxHash,
     /// Consensus-bound portion (transferable across peers, hash-stable).
-    pub consensus: ConsensusReceipt,
+    pub consensus: Arc<ConsensusReceipt>,
     /// Local-only execution metadata (fees, logs, errors). Only
     /// populated for transactions this node executed locally.
     pub metadata: Option<ExecutionMetadata>,
@@ -24,12 +25,68 @@ impl StoredReceipt {
     /// Use at sync-ingress sites where peer-shipped receipts arrive
     /// without their originator's logs/fees/errors.
     #[must_use]
-    pub const fn synced(tx_hash: TxHash, consensus: ConsensusReceipt) -> Self {
+    pub const fn synced(tx_hash: TxHash, consensus: Arc<ConsensusReceipt>) -> Self {
         Self {
             tx_hash,
             consensus,
             metadata: None,
         }
+    }
+}
+
+impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValueKind, E>
+    for StoredReceipt
+{
+    fn encode_value_kind(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
+        encoder.write_value_kind(sbor::ValueKind::Tuple)
+    }
+
+    fn encode_body(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
+        encoder.write_size(3)?;
+        encoder.encode(&self.tx_hash)?;
+        encoder.encode(self.consensus.as_ref())?;
+        encoder.encode(&self.metadata)?;
+        Ok(())
+    }
+}
+
+impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValueKind, D>
+    for StoredReceipt
+{
+    fn decode_body_with_value_kind(
+        decoder: &mut D,
+        value_kind: sbor::ValueKind<sbor::NoCustomValueKind>,
+    ) -> Result<Self, sbor::DecodeError> {
+        decoder.check_preloaded_value_kind(value_kind, sbor::ValueKind::Tuple)?;
+        let length = decoder.read_size()?;
+        if length != 3 {
+            return Err(sbor::DecodeError::UnexpectedSize {
+                expected: 3,
+                actual: length,
+            });
+        }
+        let tx_hash: TxHash = decoder.decode()?;
+        let consensus: ConsensusReceipt = decoder.decode()?;
+        let metadata: Option<ExecutionMetadata> = decoder.decode()?;
+        Ok(Self {
+            tx_hash,
+            consensus: Arc::new(consensus),
+            metadata,
+        })
+    }
+}
+
+impl sbor::Categorize<sbor::NoCustomValueKind> for StoredReceipt {
+    fn value_kind() -> sbor::ValueKind<sbor::NoCustomValueKind> {
+        sbor::ValueKind::Tuple
+    }
+}
+
+impl sbor::Describe<sbor::NoCustomTypeKind> for StoredReceipt {
+    const TYPE_ID: sbor::RustTypeId = sbor::RustTypeId::novel_with_code("StoredReceipt", &[], &[]);
+
+    fn type_data() -> sbor::TypeData<sbor::NoCustomTypeKind, sbor::RustTypeId> {
+        sbor::TypeData::unnamed(sbor::TypeKind::Any)
     }
 }
 
@@ -47,15 +104,14 @@ mod tests {
 
     #[test]
     fn synced_receipt_has_no_metadata() {
-        let synced = StoredReceipt {
-            tx_hash: TxHash::from_raw(Hash::from_bytes(b"synced_tx")),
-            consensus: ConsensusReceipt::Succeeded {
+        let synced = StoredReceipt::synced(
+            TxHash::from_raw(Hash::from_bytes(b"synced_tx")),
+            Arc::new(ConsensusReceipt::Succeeded {
                 receipt_hash: GlobalReceiptHash::ZERO,
                 database_updates: DatabaseUpdates::default(),
                 application_events: vec![make_event(1)],
-            },
-            metadata: None,
-        };
+            }),
+        );
         assert!(synced.metadata.is_none());
     }
 
@@ -63,7 +119,7 @@ mod tests {
     fn locally_executed_receipt_carries_metadata() {
         let local = StoredReceipt {
             tx_hash: TxHash::from_raw(Hash::from_bytes(b"local_tx")),
-            consensus: ConsensusReceipt::Failed,
+            consensus: Arc::new(ConsensusReceipt::Failed),
             metadata: Some(ExecutionMetadata {
                 fee_summary: FeeSummary {
                     total_execution_cost: vec![],

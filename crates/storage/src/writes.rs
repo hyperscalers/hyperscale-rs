@@ -18,7 +18,7 @@ pub fn merge_updates_from_receipts(receipts: &[StoredReceipt]) -> DatabaseUpdate
     for receipt in receipts {
         if let ConsensusReceipt::Succeeded {
             database_updates, ..
-        } = &receipt.consensus
+        } = receipt.consensus.as_ref()
         {
             merge_into(&mut merged, database_updates);
         }

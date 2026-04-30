@@ -2419,12 +2419,12 @@ mod tests {
             );
             wave.record_receipt(hyperscale_types::StoredReceipt {
                 tx_hash: *h,
-                consensus: hyperscale_types::ConsensusReceipt::Succeeded {
+                consensus: Arc::new(hyperscale_types::ConsensusReceipt::Succeeded {
                     receipt_hash: GlobalReceiptHash::ZERO,
                     #[allow(clippy::default_trait_access)]
                     database_updates: Default::default(),
                     application_events: vec![],
-                },
+                }),
                 metadata: None,
             });
         }

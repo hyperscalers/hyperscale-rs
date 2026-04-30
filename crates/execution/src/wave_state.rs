@@ -846,7 +846,7 @@ mod tests {
         w.record_execution_result(tx_hash, executed(success));
         w.record_receipt(StoredReceipt {
             tx_hash,
-            consensus: if success {
+            consensus: Arc::new(if success {
                 hyperscale_types::ConsensusReceipt::Succeeded {
                     receipt_hash: hyperscale_types::GlobalReceiptHash::ZERO,
                     #[allow(clippy::default_trait_access)]
@@ -855,7 +855,7 @@ mod tests {
                 }
             } else {
                 hyperscale_types::ConsensusReceipt::Failed
-            },
+            }),
             metadata: None,
         });
     }

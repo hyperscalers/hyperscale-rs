@@ -619,16 +619,16 @@ mod tests {
             receipts: vec![
                 StoredReceipt {
                     tx_hash: tx_a,
-                    consensus: crate::ConsensusReceipt::Succeeded {
+                    consensus: Arc::new(crate::ConsensusReceipt::Succeeded {
                         receipt_hash: GlobalReceiptHash::ZERO,
                         database_updates: DatabaseUpdates::default(),
                         application_events: vec![],
-                    },
+                    }),
                     metadata: None,
                 },
                 StoredReceipt {
                     tx_hash: tx_c,
-                    consensus: crate::ConsensusReceipt::Failed,
+                    consensus: std::sync::Arc::new(crate::ConsensusReceipt::Failed),
                     metadata: None,
                 },
             ],
@@ -654,7 +654,7 @@ mod tests {
             }),
             receipts: vec![StoredReceipt {
                 tx_hash: tx_a,
-                consensus: crate::ConsensusReceipt::Failed,
+                consensus: std::sync::Arc::new(crate::ConsensusReceipt::Failed),
                 metadata: None,
             }],
         };
@@ -680,11 +680,11 @@ mod tests {
             }),
             receipts: vec![StoredReceipt {
                 tx_hash: tx_a,
-                consensus: crate::ConsensusReceipt::Succeeded {
+                consensus: Arc::new(crate::ConsensusReceipt::Succeeded {
                     receipt_hash: GlobalReceiptHash::ZERO,
                     database_updates: DatabaseUpdates::default(),
                     application_events: vec![],
-                },
+                }),
                 metadata: None,
             }],
         };
@@ -714,11 +714,11 @@ mod tests {
             }),
             receipts: vec![StoredReceipt {
                 tx_hash: tx_a,
-                consensus: crate::ConsensusReceipt::Succeeded {
+                consensus: Arc::new(crate::ConsensusReceipt::Succeeded {
                     receipt_hash,
                     database_updates: DatabaseUpdates::default(),
                     application_events: vec![],
-                },
+                }),
                 metadata: None,
             }],
         };
@@ -767,11 +767,11 @@ mod tests {
             }),
             receipts: vec![StoredReceipt {
                 tx_hash: tx_a,
-                consensus: crate::ConsensusReceipt::Succeeded {
+                consensus: Arc::new(crate::ConsensusReceipt::Succeeded {
                     receipt_hash: GlobalReceiptHash::ZERO,
                     database_updates: DatabaseUpdates::default(),
                     application_events: vec![],
-                },
+                }),
                 metadata: None,
             }],
         };
@@ -799,11 +799,11 @@ mod tests {
             }),
             receipts: vec![StoredReceipt {
                 tx_hash: tx_b,
-                consensus: crate::ConsensusReceipt::Succeeded {
+                consensus: Arc::new(crate::ConsensusReceipt::Succeeded {
                     receipt_hash: GlobalReceiptHash::ZERO,
                     database_updates: DatabaseUpdates::default(),
                     application_events: vec![],
-                },
+                }),
                 metadata: None,
             }],
         };
