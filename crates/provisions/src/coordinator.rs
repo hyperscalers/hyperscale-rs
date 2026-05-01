@@ -385,7 +385,10 @@ impl ProvisionCoordinator {
             self.expected.register(shard, height, proposer);
         }
 
-        // Join with buffered provisions waiting for this header.
+        // Join with buffered provisions waiting for this header. Drop any
+        // entries whose deadline has already passed — without this gate a
+        // late header arrival can reanimate provisions the local commit
+        // sweep already evicted and re-enqueue them for inclusion.
         let mut actions = vec![];
         let drained = self.pipeline.drain_pending_for_key(key);
         if !drained.is_empty() {
@@ -395,7 +398,17 @@ impl ProvisionCoordinator {
                 pending_count = drained.len(),
                 "Found buffered provisions for verified header"
             );
+            let local_ts = self.expected.local_ts();
+            let source_block_ts = committed_header.qc.weighted_timestamp;
             for provisions in drained {
+                if provisions.deadline(source_block_ts) <= local_ts {
+                    debug!(
+                        shard = shard.0,
+                        height = height.0,
+                        "Dropping drained provisions past deadline"
+                    );
+                    continue;
+                }
                 actions.extend(Self::emit_provision_verification(
                     topology,
                     provisions,
@@ -650,7 +663,7 @@ impl ProvisionCoordinator {
     /// until pruned on block commit.
     #[must_use]
     pub fn queued_provisions(&self, now: LocalTimestamp) -> Vec<Arc<Provisions>> {
-        self.queue.queued(now)
+        self.queue.queued(now, self.expected.local_ts())
     }
 
     /// Look up verified provisions by their content hash.

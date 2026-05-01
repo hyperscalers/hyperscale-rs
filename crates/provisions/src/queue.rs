@@ -96,11 +96,19 @@ impl QueuedProvisionBuffer {
 
     /// Provisions eligible for block inclusion at `now`. Skips entries
     /// that haven't satisfied the configured dwell window yet — they stay
-    /// in the queue for a later call.
-    pub(crate) fn queued(&self, now: LocalTimestamp) -> Vec<Arc<Provisions>> {
+    /// in the queue for a later call. Also filters past-deadline entries
+    /// so a proposer that hasn't committed since the deadline crossed
+    /// (e.g. mid-round-timeout) cannot pull stale provisions into a
+    /// proposal that peers will reject as missing.
+    pub(crate) fn queued(
+        &self,
+        now: LocalTimestamp,
+        weighted_now: WeightedTimestamp,
+    ) -> Vec<Arc<Provisions>> {
         self.queue
             .iter()
             .filter(|q| now.saturating_sub(q.added_at) >= self.min_dwell_time)
+            .filter(|q| q.provisions.deadline(q.source_block_ts) > weighted_now)
             .map(|q| Arc::clone(&q.provisions))
             .collect()
     }
@@ -152,7 +160,7 @@ mod tests {
         let buf = QueuedProvisionBuffer::new(Duration::ZERO);
         assert_eq!(buf.queue_len(), 0);
         assert_eq!(buf.tombstone_len(), 0);
-        assert!(buf.queued(local(0)).is_empty());
+        assert!(buf.queued(local(0), ts(0)).is_empty());
     }
 
     #[test]
@@ -160,7 +168,7 @@ mod tests {
         let mut buf = QueuedProvisionBuffer::new(Duration::ZERO);
         let provisions = make_provisions(1, ShardGroupId(1), BlockHeight(10));
         buf.enqueue(Arc::clone(&provisions), ts(1_000), local(100));
-        assert_eq!(buf.queued(local(100)).len(), 1);
+        assert_eq!(buf.queued(local(100), ts(1_000)).len(), 1);
     }
 
     #[test]
@@ -168,8 +176,27 @@ mod tests {
         let mut buf = QueuedProvisionBuffer::new(Duration::from_millis(500));
         let provisions = make_provisions(1, ShardGroupId(1), BlockHeight(10));
         buf.enqueue(Arc::clone(&provisions), ts(1_000), local(0));
-        assert!(buf.queued(local(100)).is_empty());
-        assert_eq!(buf.queued(local(500)).len(), 1);
+        assert!(buf.queued(local(100), ts(1_000)).is_empty());
+        assert_eq!(buf.queued(local(500), ts(1_000)).len(), 1);
+    }
+
+    #[test]
+    fn deadline_filter_skips_past_deadline_provisions() {
+        let mut buf = QueuedProvisionBuffer::new(Duration::ZERO);
+        let provisions = make_provisions(1, ShardGroupId(1), BlockHeight(10));
+        let source_ts = ts(1_000);
+        buf.enqueue(Arc::clone(&provisions), source_ts, local(0));
+        let live = provisions.deadline(source_ts);
+        assert_eq!(
+            buf.queued(local(0), live.minus(Duration::from_millis(1)))
+                .len(),
+            1,
+            "before deadline: included"
+        );
+        assert!(
+            buf.queued(local(0), live).is_empty(),
+            "at deadline: excluded"
+        );
     }
 
     #[test]
