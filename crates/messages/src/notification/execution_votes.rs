@@ -1,7 +1,7 @@
 //! `ExecutionVotesNotification` message.
 
 use hyperscale_types::{
-    Bls12381G2Signature, ExecutionVote, MessagePriority, NetworkMessage, ShardGroupId, ValidatorId,
+    Bls12381G2Signature, ExecutionVote, MessageClass, NetworkMessage, ShardGroupId, ValidatorId,
 };
 use sbor::prelude::BasicSbor;
 
@@ -70,7 +70,7 @@ impl NetworkMessage for ExecutionVotesNotification {
         "execution.vote.batch"
     }
 
-    fn priority() -> MessagePriority {
-        MessagePriority::Coordination
+    fn class() -> MessageClass {
+        MessageClass::CrossShardProgress
     }
 }

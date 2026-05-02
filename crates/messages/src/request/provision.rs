@@ -1,7 +1,7 @@
 //! Provision fetch request for fallback recovery.
 
 use crate::response::GetProvisionResponse;
-use hyperscale_types::{BlockHeight, MessagePriority, NetworkMessage, Request, ShardGroupId};
+use hyperscale_types::{BlockHeight, MessageClass, NetworkMessage, Request, ShardGroupId};
 use sbor::prelude::BasicSbor;
 
 /// Request to fetch missing provisions from a source shard.
@@ -24,8 +24,8 @@ impl NetworkMessage for GetProvisionsRequest {
         "provision.request"
     }
 
-    fn priority() -> MessagePriority {
-        MessagePriority::Coordination
+    fn class() -> MessageClass {
+        MessageClass::CrossShardProgress
     }
 }
 

@@ -1,7 +1,7 @@
 //! `BlockHeader` notification message.
 
 use hyperscale_types::{
-    BlockHeader, BlockManifest, Bls12381G2Signature, MessagePriority, NetworkMessage,
+    BlockHeader, BlockManifest, Bls12381G2Signature, MessageClass, NetworkMessage,
     block_header_message,
 };
 use sbor::prelude::BasicSbor;
@@ -63,8 +63,8 @@ impl NetworkMessage for BlockHeaderNotification {
         "block.header"
     }
 
-    fn priority() -> MessagePriority {
-        MessagePriority::Critical
+    fn class() -> MessageClass {
+        MessageClass::Consensus
     }
 }
 

@@ -1,6 +1,6 @@
 //! Provision fetch response for fallback recovery.
 
-use hyperscale_types::{MessagePriority, NetworkMessage, Provisions};
+use hyperscale_types::{MessageClass, NetworkMessage, Provisions};
 use sbor::prelude::BasicSbor;
 
 /// Response to a provision fetch request containing the provisions bundle.
@@ -26,8 +26,8 @@ impl NetworkMessage for GetProvisionResponse {
         "provision.response"
     }
 
-    fn priority() -> MessagePriority {
-        MessagePriority::Coordination
+    fn class() -> MessageClass {
+        MessageClass::CrossShardProgress
     }
 }
 

@@ -3,8 +3,9 @@
 //! Delegates to the shared [`RequestStreamPool`], which multiplexes
 //! request/response pairs over a persistent stream per peer.
 
-use super::{RequestManager, RequestPriority};
+use super::RequestManager;
 use crate::adapter::NetworkError;
+use hyperscale_types::MessageClass;
 use libp2p::PeerId;
 
 impl RequestManager {
@@ -17,7 +18,7 @@ impl RequestManager {
         peer: &PeerId,
         type_id: &'static str,
         data: &[u8],
-        _priority: RequestPriority,
+        _class: MessageClass,
     ) -> Result<Vec<u8>, NetworkError> {
         let timeout = self.compute_stream_timeout(peer);
         self.pool.send(*peer, type_id, data.to_vec(), timeout).await

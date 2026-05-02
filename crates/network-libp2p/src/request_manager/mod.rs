@@ -23,7 +23,7 @@
 //! let manager = RequestManager::new(adapter.clone(), RequestManagerConfig::default());
 //!
 //! // Send a request with automatic retry
-//! match manager.request(&peers, None, "block.request".into(), "block.request", sbor_bytes, RequestPriority::Background).await {
+//! match manager.request(&peers, None, "block.request".into(), "block.request", sbor_bytes, MessageClass::Recovery).await {
 //!     Ok((peer, response)) => { /* success */ }
 //!     Err(RequestError::Exhausted { attempts }) => { /* all retries failed */ }
 //!     Err(RequestError::NoPeers) => { /* no peers available */ }
@@ -90,78 +90,47 @@ pub enum RequestError {
     Shutdown,
 }
 
-/// Priority levels for requests.
+/// Whether a class should use the relaxed retry/backoff regime.
 ///
-/// Priority affects timeout tolerance and retry aggressiveness.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RequestPriority {
-    /// Critical requests (pending block completion).
-    /// Tighter timeouts, more aggressive retries.
-    Critical,
-
-    /// Normal requests.
-    Normal,
-
-    /// Background requests (sync).
-    /// Higher timeout tolerance, less aggressive.
-    Background,
-}
-
-/// Map a wire-level [`hyperscale_types::MessagePriority`] onto the binary
-/// [`RequestPriority`] used by the request manager. Only `Background` falls
-/// through to the relaxed retry/backoff regime; every other tier is treated as
-/// `Critical` for timeout tolerance.
+/// `Recovery` and `Bulk` are the sheddable classes; all others get tight
+/// retries with shorter backoff to absorb packet loss without falling
+/// behind on the BFT or cross-shard hot paths.
 #[must_use]
-pub const fn request_priority_for(priority: hyperscale_types::MessagePriority) -> RequestPriority {
-    match priority {
-        hyperscale_types::MessagePriority::Background => RequestPriority::Background,
-        _ => RequestPriority::Critical,
-    }
+pub const fn uses_relaxed_retry(class: hyperscale_types::MessageClass) -> bool {
+    matches!(
+        class,
+        hyperscale_types::MessageClass::Recovery | hyperscale_types::MessageClass::Bulk
+    )
 }
 
 #[cfg(test)]
-mod priority_mapping_tests {
-    use super::{RequestPriority, request_priority_for};
-    use hyperscale_types::MessagePriority;
+mod retry_regime_tests {
+    use super::uses_relaxed_retry;
+    use hyperscale_types::MessageClass;
 
     #[test]
-    fn critical_maps_to_critical() {
-        assert_eq!(
-            request_priority_for(MessagePriority::Critical),
-            RequestPriority::Critical
-        );
+    fn consensus_uses_tight_retry() {
+        assert!(!uses_relaxed_retry(MessageClass::Consensus));
     }
 
     #[test]
-    fn coordination_maps_to_critical() {
-        assert_eq!(
-            request_priority_for(MessagePriority::Coordination),
-            RequestPriority::Critical
-        );
+    fn block_completion_uses_tight_retry() {
+        assert!(!uses_relaxed_retry(MessageClass::BlockCompletion));
     }
 
     #[test]
-    fn finalization_maps_to_critical() {
-        assert_eq!(
-            request_priority_for(MessagePriority::Finalization),
-            RequestPriority::Critical
-        );
+    fn cross_shard_progress_uses_tight_retry() {
+        assert!(!uses_relaxed_retry(MessageClass::CrossShardProgress));
     }
 
     #[test]
-    fn propagation_maps_to_critical() {
-        assert_eq!(
-            request_priority_for(MessagePriority::Propagation),
-            RequestPriority::Critical
-        );
+    fn recovery_uses_relaxed_retry() {
+        assert!(uses_relaxed_retry(MessageClass::Recovery));
     }
 
     #[test]
-    fn background_maps_to_background() {
-        assert_eq!(
-            request_priority_for(MessagePriority::Background),
-            RequestPriority::Background
-        );
+    fn bulk_uses_relaxed_retry() {
+        assert!(uses_relaxed_retry(MessageClass::Bulk));
     }
 }
 
@@ -262,7 +231,7 @@ impl RequestManager {
     /// * `request_desc` - Description for logging (e.g., "block.request")
     /// * `type_id` - Message type identifier for the typed frame header
     /// * `sbor_data` - SBOR-encoded request payload (compressed by transport)
-    /// * `priority` - Request priority (affects timeout and retry aggressiveness)
+    /// * `class` - Message class (drives timeout and retry aggressiveness)
     ///
     /// # Returns
     ///
@@ -279,9 +248,8 @@ impl RequestManager {
         request_desc: String,
         type_id: &'static str,
         sbor_data: Vec<u8>,
-        priority: RequestPriority,
+        class: hyperscale_types::MessageClass,
     ) -> Result<(PeerId, Bytes), RequestError> {
-        // Acquire concurrency slot
         self.acquire_slot().await?;
 
         let result = self
@@ -291,7 +259,7 @@ impl RequestManager {
                 &request_desc,
                 type_id,
                 &sbor_data,
-                priority,
+                class,
             )
             .await;
 

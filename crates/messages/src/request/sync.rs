@@ -1,7 +1,7 @@
 //! Sync-related request messages.
 
 use hyperscale_types::{
-    BlockHeight, Bls12381G2Signature, MessagePriority, NetworkMessage, ShardMessage, ValidatorId,
+    BlockHeight, Bls12381G2Signature, MessageClass, NetworkMessage, ShardMessage, ValidatorId,
 };
 use sbor::prelude::BasicSbor;
 
@@ -40,8 +40,8 @@ impl NetworkMessage for SyncCompleteAnnouncement {
         "sync.complete"
     }
 
-    fn priority() -> MessagePriority {
-        MessagePriority::Background
+    fn class() -> MessageClass {
+        MessageClass::Recovery
     }
 }
 

@@ -2,7 +2,7 @@
 
 use crate::trace_context::TraceContext;
 use hyperscale_types::{
-    Bls12381G2Signature, MessagePriority, NetworkMessage, Provisions, ValidatorId,
+    Bls12381G2Signature, MessageClass, NetworkMessage, Provisions, ValidatorId,
 };
 use sbor::prelude::BasicSbor;
 
@@ -57,7 +57,7 @@ impl NetworkMessage for ProvisionsNotification {
         "provisions.broadcast"
     }
 
-    fn priority() -> MessagePriority {
-        MessagePriority::Coordination
+    fn class() -> MessageClass {
+        MessageClass::CrossShardProgress
     }
 }

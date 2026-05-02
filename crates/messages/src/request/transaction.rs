@@ -1,7 +1,7 @@
 //! Transaction fetch request.
 
 use crate::response::GetTransactionsResponse;
-use hyperscale_types::{MessagePriority, NetworkMessage, Request, TxHash};
+use hyperscale_types::{MessageClass, NetworkMessage, Request, TxHash};
 use sbor::prelude::BasicSbor;
 
 /// Request to fetch transactions by hash.
@@ -35,8 +35,8 @@ impl NetworkMessage for GetTransactionsRequest {
         "transaction.request"
     }
 
-    fn priority() -> MessagePriority {
-        MessagePriority::Critical
+    fn class() -> MessageClass {
+        MessageClass::BlockCompletion
     }
 }
 

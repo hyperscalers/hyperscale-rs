@@ -2,8 +2,9 @@
 
 use super::{
     MAX_STREAM_TIMEOUT, MIN_STREAM_TIMEOUT_COLD, MIN_STREAM_TIMEOUT_WARM, RequestManager,
-    RequestPriority, STREAM_TIMEOUT_RTT_MULTIPLIER,
+    STREAM_TIMEOUT_RTT_MULTIPLIER, uses_relaxed_retry,
 };
+use hyperscale_types::MessageClass;
 use libp2p::PeerId;
 use std::time::Duration;
 
@@ -21,26 +22,25 @@ fn stream_timeout_from_rtt(rtt_ema_secs: Option<f64>) -> Duration {
     })
 }
 
-/// Compute initial backoff from optional RTT EMA and priority.
+/// Compute initial backoff from optional RTT EMA and class.
 ///
-/// Base backoff is `rtt * 0.5` clamped to `[50ms, 1s]`, then adjusted by priority:
-/// - Critical: 0.7x (shorter backoff)
-/// - Normal: 1.0x
-/// - Background: 1.5x (longer backoff)
+/// Base backoff is `rtt * 0.5` clamped to `[50ms, 1s]`, then adjusted by class:
+/// - Tight regime (`Consensus` / `BlockCompletion` / `CrossShardProgress`): 0.7×
+/// - Relaxed regime (`Recovery` / `Bulk`): 1.5×
 fn initial_backoff_from_rtt(
     rtt_ema_secs: Option<f64>,
     default_backoff: Duration,
-    priority: RequestPriority,
+    class: MessageClass,
 ) -> Duration {
     let base_backoff = rtt_ema_secs.map_or(default_backoff, |rtt| {
         let rtt_based = Duration::from_secs_f64(rtt * 0.5);
         rtt_based.clamp(Duration::from_millis(50), Duration::from_secs(1))
     });
 
-    match priority {
-        RequestPriority::Critical => base_backoff.mul_f32(0.7),
-        RequestPriority::Normal => base_backoff,
-        RequestPriority::Background => base_backoff.mul_f32(1.5),
+    if uses_relaxed_retry(class) {
+        base_backoff.mul_f32(1.5)
+    } else {
+        base_backoff.mul_f32(0.7)
     }
 }
 
@@ -53,19 +53,16 @@ impl RequestManager {
         stream_timeout_from_rtt(self.health.rtt_ema_secs(peer))
     }
 
-    /// Compute initial backoff based on peer RTT and priority.
+    /// Compute initial backoff based on peer RTT and class.
     ///
     /// For peers with known RTT, use a fraction of their RTT as initial backoff.
-    /// Priority adjusts this: Critical requests use shorter backoff, Background longer.
-    pub(super) fn compute_initial_backoff(
-        &self,
-        peer: &PeerId,
-        priority: RequestPriority,
-    ) -> Duration {
+    /// Class adjusts this: tight-regime classes get a shorter backoff, relaxed
+    /// (Recovery, Bulk) get a longer one.
+    pub(super) fn compute_initial_backoff(&self, peer: &PeerId, class: MessageClass) -> Duration {
         initial_backoff_from_rtt(
             self.health.rtt_ema_secs(peer),
             self.config.initial_backoff,
-            priority,
+            class,
         )
     }
 }
@@ -96,56 +93,71 @@ mod tests {
         assert_eq!(timeout, MIN_STREAM_TIMEOUT_COLD);
     }
 
+    /// Allow ±1ms slop to absorb f32 rounding in the multiplier.
+    #[allow(clippy::cast_precision_loss)] // ms values are well under f64 mantissa
+    fn assert_near_ms(actual: Duration, expected_ms: u64) {
+        let actual_ms = actual.as_secs_f64() * 1000.0;
+        let diff = (actual_ms - expected_ms as f64).abs();
+        assert!(
+            diff < 1.0,
+            "expected ≈{expected_ms}ms, got {actual_ms}ms (diff {diff})"
+        );
+    }
+
     #[test]
     fn test_initial_backoff_known_rtt() {
         let default = Duration::from_millis(100);
 
-        // 200ms RTT * 0.5 = 100ms
-        let normal = initial_backoff_from_rtt(Some(0.2), default, RequestPriority::Normal);
-        assert_eq!(normal, Duration::from_millis(100));
+        // 200ms RTT * 0.5 = 100ms; CrossShardProgress is tight regime → ≈70ms
+        let tight = initial_backoff_from_rtt(Some(0.2), default, MessageClass::CrossShardProgress);
+        assert_near_ms(tight, 70);
 
-        // Critical should be shorter
-        let critical = initial_backoff_from_rtt(Some(0.2), default, RequestPriority::Critical);
-        assert!(critical < normal);
+        // Recovery is relaxed regime → ≈150ms
+        let relaxed = initial_backoff_from_rtt(Some(0.2), default, MessageClass::Recovery);
+        assert_near_ms(relaxed, 150);
 
-        // Background should be longer
-        let background = initial_backoff_from_rtt(Some(0.2), default, RequestPriority::Background);
-        assert!(background > normal);
+        assert!(tight < relaxed);
     }
 
     #[test]
     fn test_initial_backoff_unknown_rtt() {
+        // Cold peer uses the configured default before applying the class
+        // multiplier — tight regime returns ≈ default × 0.7.
         let default = Duration::from_millis(100);
-        let backoff = initial_backoff_from_rtt(None, default, RequestPriority::Normal);
-        assert_eq!(backoff, default);
+        let backoff = initial_backoff_from_rtt(None, default, MessageClass::Consensus);
+        assert_near_ms(backoff, 70);
     }
 
     #[test]
     fn test_initial_backoff_clamps_to_range() {
         let default = Duration::from_millis(100);
 
-        // Very low RTT: 1ms * 0.5 = 0.5ms -> clamped to 50ms
-        let backoff = initial_backoff_from_rtt(Some(0.001), default, RequestPriority::Normal);
-        assert_eq!(backoff, Duration::from_millis(50));
+        // Very low RTT: 1ms * 0.5 = 0.5ms -> clamped to 50ms (then × 0.7 ≈ 35ms)
+        let backoff = initial_backoff_from_rtt(Some(0.001), default, MessageClass::Consensus);
+        assert_near_ms(backoff, 35);
 
-        // Very high RTT: 10s * 0.5 = 5s -> clamped to 1s
-        let backoff = initial_backoff_from_rtt(Some(10.0), default, RequestPriority::Normal);
-        assert_eq!(backoff, Duration::from_secs(1));
+        // Very high RTT: 10s * 0.5 = 5s -> clamped to 1s (then × 0.7 ≈ 700ms)
+        let backoff = initial_backoff_from_rtt(Some(10.0), default, MessageClass::Consensus);
+        assert_near_ms(backoff, 700);
     }
 
     #[test]
-    fn test_priority_ordering() {
+    fn test_class_ordering() {
         let default = Duration::from_millis(100);
         let rtt = Some(0.2);
 
-        let critical = initial_backoff_from_rtt(rtt, default, RequestPriority::Critical);
-        let normal = initial_backoff_from_rtt(rtt, default, RequestPriority::Normal);
-        let background = initial_backoff_from_rtt(rtt, default, RequestPriority::Background);
+        let consensus = initial_backoff_from_rtt(rtt, default, MessageClass::Consensus);
+        let block_completion =
+            initial_backoff_from_rtt(rtt, default, MessageClass::BlockCompletion);
+        let cross_shard = initial_backoff_from_rtt(rtt, default, MessageClass::CrossShardProgress);
+        let recovery = initial_backoff_from_rtt(rtt, default, MessageClass::Recovery);
+        let bulk = initial_backoff_from_rtt(rtt, default, MessageClass::Bulk);
 
-        assert!(critical < normal, "Critical should be shorter than Normal");
-        assert!(
-            normal < background,
-            "Normal should be shorter than Background"
-        );
+        // Tight regime — all equal, shorter than relaxed.
+        assert_eq!(consensus, block_completion);
+        assert_eq!(block_completion, cross_shard);
+        // Relaxed regime — equal to each other, longer than tight.
+        assert_eq!(recovery, bulk);
+        assert!(consensus < recovery);
     }
 }

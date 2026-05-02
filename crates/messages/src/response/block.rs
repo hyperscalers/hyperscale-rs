@@ -2,7 +2,7 @@
 
 use crate::request::Inventory;
 use hyperscale_types::{
-    Block, BlockHash, BlockHeader, CertifiedBlock, FinalizedWave, MessagePriority, NetworkMessage,
+    Block, BlockHash, BlockHeader, CertifiedBlock, FinalizedWave, MessageClass, NetworkMessage,
     ProvisionHash, Provisions, QuorumCertificate, RoutableTransaction, TxHash, WaveIdHash,
 };
 use sbor::prelude::BasicSbor;
@@ -326,8 +326,8 @@ impl NetworkMessage for GetBlockResponse {
         "block.response"
     }
 
-    fn priority() -> MessagePriority {
-        MessagePriority::Background
+    fn class() -> MessageClass {
+        MessageClass::Recovery
     }
 }
 

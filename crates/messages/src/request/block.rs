@@ -2,7 +2,7 @@
 
 use crate::response::GetBlockResponse;
 use hyperscale_types::{
-    BlockHeight, BloomFilter, MessagePriority, NetworkMessage, ProvisionHash, Request, TxHash,
+    BlockHeight, BloomFilter, MessageClass, NetworkMessage, ProvisionHash, Request, TxHash,
     WaveIdHash,
 };
 use sbor::prelude::BasicSbor;
@@ -107,8 +107,8 @@ impl NetworkMessage for GetBlockRequest {
         "block.request"
     }
 
-    fn priority() -> MessagePriority {
-        MessagePriority::Background
+    fn class() -> MessageClass {
+        MessageClass::Recovery
     }
 }
 

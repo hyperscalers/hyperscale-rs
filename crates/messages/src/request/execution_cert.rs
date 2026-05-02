@@ -1,7 +1,7 @@
 //! Execution certificate fetch request for fallback recovery.
 
 use crate::response::GetExecutionCertsResponse;
-use hyperscale_types::{MessagePriority, NetworkMessage, Request, WaveId};
+use hyperscale_types::{MessageClass, NetworkMessage, Request, WaveId};
 use sbor::prelude::BasicSbor;
 
 /// Request to fetch missing execution certificates from a source shard.
@@ -23,8 +23,8 @@ impl NetworkMessage for GetExecutionCertsRequest {
         "execution_cert.request"
     }
 
-    fn priority() -> MessagePriority {
-        MessagePriority::Coordination
+    fn class() -> MessageClass {
+        MessageClass::CrossShardProgress
     }
 }
 

@@ -1,6 +1,6 @@
 //! Transaction fetch response.
 
-use hyperscale_types::{MessagePriority, NetworkMessage, RoutableTransaction};
+use hyperscale_types::{MessageClass, NetworkMessage, RoutableTransaction};
 use std::sync::Arc;
 
 /// Response to a transaction fetch request.
@@ -148,8 +148,8 @@ impl NetworkMessage for GetTransactionsResponse {
         "transaction.response"
     }
 
-    fn priority() -> MessagePriority {
-        MessagePriority::Critical
+    fn class() -> MessageClass {
+        MessageClass::BlockCompletion
     }
 }
 

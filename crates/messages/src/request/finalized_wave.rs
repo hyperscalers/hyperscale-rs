@@ -3,7 +3,7 @@
 use crate::response::GetFinalizedWavesResponse;
 #[cfg(test)]
 use hyperscale_types::Hash;
-use hyperscale_types::{MessagePriority, NetworkMessage, Request, WaveIdHash};
+use hyperscale_types::{MessageClass, NetworkMessage, Request, WaveIdHash};
 use sbor::prelude::BasicSbor;
 
 /// Request to fetch finalized waves by id-hash.
@@ -30,8 +30,8 @@ impl NetworkMessage for GetFinalizedWavesRequest {
         "finalized_wave.request"
     }
 
-    fn priority() -> MessagePriority {
-        MessagePriority::Coordination
+    fn class() -> MessageClass {
+        MessageClass::BlockCompletion
     }
 }
 

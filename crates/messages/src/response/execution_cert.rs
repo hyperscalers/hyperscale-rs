@@ -1,6 +1,6 @@
 //! Execution certificate fetch response for fallback recovery.
 
-use hyperscale_types::{ExecutionCertificate, MessagePriority, NetworkMessage};
+use hyperscale_types::{ExecutionCertificate, MessageClass, NetworkMessage};
 use sbor::prelude::BasicSbor;
 
 /// Response to an execution certificate fetch request.
@@ -23,8 +23,8 @@ impl NetworkMessage for GetExecutionCertsResponse {
         "execution_cert.response"
     }
 
-    fn priority() -> MessagePriority {
-        MessagePriority::Coordination
+    fn class() -> MessageClass {
+        MessageClass::CrossShardProgress
     }
 }
 

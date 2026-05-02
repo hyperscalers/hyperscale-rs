@@ -1,6 +1,6 @@
 //! Range response for remote committed block headers.
 
-use hyperscale_types::{CommittedBlockHeader, MessagePriority, NetworkMessage};
+use hyperscale_types::{CommittedBlockHeader, MessageClass, NetworkMessage};
 use sbor::prelude::BasicSbor;
 
 /// Response to a [`crate::request::GetRemoteHeadersRequest`].
@@ -22,8 +22,8 @@ impl NetworkMessage for GetRemoteHeadersResponse {
         "remote_header.response"
     }
 
-    fn priority() -> MessagePriority {
-        MessagePriority::Coordination
+    fn class() -> MessageClass {
+        MessageClass::Recovery
     }
 }
 

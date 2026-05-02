@@ -1,32 +1,31 @@
-//! Command types and priority-based command channels.
+//! Command types and class-based command channels.
 
-use hyperscale_types::MessagePriority;
+use hyperscale_types::MessageClass;
 use libp2p::{Multiaddr, PeerId as Libp2pPeerId};
 use tokio::sync::mpsc;
 
 /// Maximum number of commands to drain per event loop iteration.
 /// Prevents tight loops from monopolizing the event loop when channels are flooded.
-/// High-priority response commands and normal commands each have this limit.
 pub(super) const MAX_COMMANDS_PER_DRAIN: usize = 100;
 
 /// Commands sent to the swarm task.
 ///
-/// Commands are processed in priority order when using priority channels.
+/// Commands are processed in class order when using class channels.
 /// Non-broadcast commands (Subscribe, Dial, etc.) are always processed
-/// with high priority since they're control operations.
+/// at the most-urgent class since they're control operations.
 #[derive(Debug)]
 pub(super) enum SwarmCommand {
     /// Subscribe to a gossipsub topic.
     Subscribe { topic: String },
 
-    /// Broadcast a message to a topic with priority.
+    /// Broadcast a message to a topic with the given class.
     ///
-    /// Priority determines processing order in the event loop.
-    /// Higher priority messages are processed before lower priority ones.
+    /// Class determines processing order in the event loop. More-urgent
+    /// classes are processed before less-urgent ones.
     Broadcast {
         topic: String,
         data: Vec<u8>,
-        priority: MessagePriority,
+        class: MessageClass,
     },
 
     /// Dial a peer.
@@ -43,8 +42,8 @@ pub(super) enum SwarmCommand {
     },
 }
 
-/// Receiver type for priority command channels.
-pub(super) type PriorityReceivers = (
+/// Receiver type for class-tiered command channels.
+pub(super) type ClassReceivers = (
     mpsc::UnboundedReceiver<SwarmCommand>,
     mpsc::UnboundedReceiver<SwarmCommand>,
     mpsc::UnboundedReceiver<SwarmCommand>,
@@ -52,84 +51,80 @@ pub(super) type PriorityReceivers = (
     mpsc::UnboundedReceiver<SwarmCommand>,
 );
 
-/// Priority-based command channels for the swarm task.
+/// Class-tiered command channels for the swarm task.
 ///
-/// Commands are sent to the appropriate channel based on message priority.
-/// The event loop processes channels in priority order (Critical first, Background last).
+/// Commands are sent to the appropriate channel based on message class.
+/// The event loop processes channels in class order (Consensus first, Bulk last).
 #[derive(Clone, Debug)]
-pub(super) struct PriorityCommandChannels {
-    /// Critical priority - BFT consensus messages, pending block requests.
+pub(super) struct ClassCommandChannels {
+    /// Consensus class — BFT round-blocking traffic.
     /// Never dropped, processed immediately.
-    critical: mpsc::UnboundedSender<SwarmCommand>,
+    consensus: mpsc::UnboundedSender<SwarmCommand>,
 
-    /// Coordination priority - Cross-shard execution messages.
-    /// High priority, may be batched.
-    coordination: mpsc::UnboundedSender<SwarmCommand>,
+    /// `BlockCompletion` class — DA gap-closure for the current proposal.
+    block_completion: mpsc::UnboundedSender<SwarmCommand>,
 
-    /// Finalization priority - Wave certificate gossip.
-    /// Important but not liveness-critical.
-    finalization: mpsc::UnboundedSender<SwarmCommand>,
+    /// `CrossShardProgress` class — execution and finalization coordination.
+    cross_shard_progress: mpsc::UnboundedSender<SwarmCommand>,
 
-    /// Propagation priority - Transaction gossip (mempool).
-    /// Best-effort, can be shed under load.
-    propagation: mpsc::UnboundedSender<SwarmCommand>,
+    /// Recovery class — catch-up traffic. Sheddable.
+    recovery: mpsc::UnboundedSender<SwarmCommand>,
 
-    /// Background priority - Sync operations.
-    /// Lowest priority, fully deferrable.
-    background: mpsc::UnboundedSender<SwarmCommand>,
+    /// Bulk class — high-volume best-effort with fetch fallback.
+    bulk: mpsc::UnboundedSender<SwarmCommand>,
 }
 
-impl PriorityCommandChannels {
-    /// Create new priority channels, returning (senders, receivers).
-    pub(super) fn new() -> (Self, PriorityReceivers) {
-        let (critical_tx, critical_rx) = mpsc::unbounded_channel();
-        let (coordination_tx, coordination_rx) = mpsc::unbounded_channel();
-        let (finalization_tx, finalization_rx) = mpsc::unbounded_channel();
-        let (propagation_tx, propagation_rx) = mpsc::unbounded_channel();
-        let (background_tx, background_rx) = mpsc::unbounded_channel();
+impl ClassCommandChannels {
+    /// Create new class channels, returning (senders, receivers).
+    pub(super) fn new() -> (Self, ClassReceivers) {
+        let (consensus_tx, consensus_rx) = mpsc::unbounded_channel();
+        let (block_completion_tx, block_completion_rx) = mpsc::unbounded_channel();
+        let (cross_shard_progress_tx, cross_shard_progress_rx) = mpsc::unbounded_channel();
+        let (recovery_tx, recovery_rx) = mpsc::unbounded_channel();
+        let (bulk_tx, bulk_rx) = mpsc::unbounded_channel();
 
         (
             Self {
-                critical: critical_tx,
-                coordination: coordination_tx,
-                finalization: finalization_tx,
-                propagation: propagation_tx,
-                background: background_tx,
+                consensus: consensus_tx,
+                block_completion: block_completion_tx,
+                cross_shard_progress: cross_shard_progress_tx,
+                recovery: recovery_tx,
+                bulk: bulk_tx,
             },
             (
-                critical_rx,
-                coordination_rx,
-                finalization_rx,
-                propagation_rx,
-                background_rx,
+                consensus_rx,
+                block_completion_rx,
+                cross_shard_progress_rx,
+                recovery_rx,
+                bulk_rx,
             ),
         )
     }
 
-    /// Send a command to the appropriate priority channel.
+    /// Send a command to the appropriate class channel.
     ///
-    /// For Broadcast commands, uses the embedded priority.
-    /// For control commands (Subscribe, Dial, etc.), uses Critical priority.
+    /// For Broadcast commands, uses the embedded class.
+    /// For control commands (Subscribe, Dial, etc.), uses Consensus class.
     #[allow(clippy::result_large_err)]
     pub(super) fn send(
         &self,
         cmd: SwarmCommand,
     ) -> Result<(), mpsc::error::SendError<SwarmCommand>> {
-        let priority = match &cmd {
-            SwarmCommand::Broadcast { priority, .. } => *priority,
-            // Control commands always get critical priority
+        let class = match &cmd {
+            SwarmCommand::Broadcast { class, .. } => *class,
+            // Control commands always get Consensus class.
             SwarmCommand::Subscribe { .. }
             | SwarmCommand::Dial { .. }
             | SwarmCommand::GetListenAddresses { .. }
-            | SwarmCommand::GetConnectedPeers { .. } => MessagePriority::Critical,
+            | SwarmCommand::GetConnectedPeers { .. } => MessageClass::Consensus,
         };
 
-        match priority {
-            MessagePriority::Critical => self.critical.send(cmd),
-            MessagePriority::Coordination => self.coordination.send(cmd),
-            MessagePriority::Finalization => self.finalization.send(cmd),
-            MessagePriority::Propagation => self.propagation.send(cmd),
-            MessagePriority::Background => self.background.send(cmd),
+        match class {
+            MessageClass::Consensus => self.consensus.send(cmd),
+            MessageClass::BlockCompletion => self.block_completion.send(cmd),
+            MessageClass::CrossShardProgress => self.cross_shard_progress.send(cmd),
+            MessageClass::Recovery => self.recovery.send(cmd),
+            MessageClass::Bulk => self.bulk.send(cmd),
         }
     }
 }
@@ -139,79 +134,77 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_priority_channels_creation() {
-        let (_channels, (mut crit, mut coord, mut final_, mut prop, mut bg)) =
-            PriorityCommandChannels::new();
+    fn test_class_channels_creation() {
+        let (_channels, (mut con, mut bc, mut csp, mut rec, mut bulk)) =
+            ClassCommandChannels::new();
 
-        // All receivers should be empty initially
-        assert!(crit.try_recv().is_err());
-        assert!(coord.try_recv().is_err());
-        assert!(final_.try_recv().is_err());
-        assert!(prop.try_recv().is_err());
-        assert!(bg.try_recv().is_err());
+        assert!(con.try_recv().is_err());
+        assert!(bc.try_recv().is_err());
+        assert!(csp.try_recv().is_err());
+        assert!(rec.try_recv().is_err());
+        assert!(bulk.try_recv().is_err());
     }
 
     #[test]
-    fn test_broadcast_routes_by_priority() {
-        let (channels, (mut crit, mut coord, mut final_, mut prop, mut bg)) =
-            PriorityCommandChannels::new();
+    fn test_broadcast_routes_by_class() {
+        let (channels, (mut con, mut bc, mut csp, mut rec, mut bulk)) = ClassCommandChannels::new();
 
         channels
             .send(SwarmCommand::Broadcast {
                 topic: "t".into(),
                 data: vec![1],
-                priority: MessagePriority::Critical,
+                class: MessageClass::Consensus,
             })
             .unwrap();
         channels
             .send(SwarmCommand::Broadcast {
                 topic: "t".into(),
                 data: vec![2],
-                priority: MessagePriority::Coordination,
+                class: MessageClass::BlockCompletion,
             })
             .unwrap();
         channels
             .send(SwarmCommand::Broadcast {
                 topic: "t".into(),
                 data: vec![3],
-                priority: MessagePriority::Finalization,
+                class: MessageClass::CrossShardProgress,
             })
             .unwrap();
         channels
             .send(SwarmCommand::Broadcast {
                 topic: "t".into(),
                 data: vec![4],
-                priority: MessagePriority::Propagation,
+                class: MessageClass::Recovery,
             })
             .unwrap();
         channels
             .send(SwarmCommand::Broadcast {
                 topic: "t".into(),
                 data: vec![5],
-                priority: MessagePriority::Background,
+                class: MessageClass::Bulk,
             })
             .unwrap();
 
         assert!(
-            matches!(crit.try_recv().unwrap(), SwarmCommand::Broadcast { data, .. } if data == vec![1])
+            matches!(con.try_recv().unwrap(), SwarmCommand::Broadcast { data, .. } if data == vec![1])
         );
         assert!(
-            matches!(coord.try_recv().unwrap(), SwarmCommand::Broadcast { data, .. } if data == vec![2])
+            matches!(bc.try_recv().unwrap(), SwarmCommand::Broadcast { data, .. } if data == vec![2])
         );
         assert!(
-            matches!(final_.try_recv().unwrap(), SwarmCommand::Broadcast { data, .. } if data == vec![3])
+            matches!(csp.try_recv().unwrap(), SwarmCommand::Broadcast { data, .. } if data == vec![3])
         );
         assert!(
-            matches!(prop.try_recv().unwrap(), SwarmCommand::Broadcast { data, .. } if data == vec![4])
+            matches!(rec.try_recv().unwrap(), SwarmCommand::Broadcast { data, .. } if data == vec![4])
         );
         assert!(
-            matches!(bg.try_recv().unwrap(), SwarmCommand::Broadcast { data, .. } if data == vec![5])
+            matches!(bulk.try_recv().unwrap(), SwarmCommand::Broadcast { data, .. } if data == vec![5])
         );
     }
 
     #[test]
-    fn test_control_commands_use_critical_channel() {
-        let (channels, (mut crit, _, _, _, _)) = PriorityCommandChannels::new();
+    fn test_control_commands_use_consensus_channel() {
+        let (channels, (mut con, _, _, _, _)) = ClassCommandChannels::new();
 
         channels
             .send(SwarmCommand::Subscribe {
@@ -219,7 +212,7 @@ mod tests {
             })
             .unwrap();
         assert!(matches!(
-            crit.try_recv().unwrap(),
+            con.try_recv().unwrap(),
             SwarmCommand::Subscribe { .. }
         ));
 
@@ -228,15 +221,12 @@ mod tests {
                 address: "/ip4/127.0.0.1/tcp/1234".parse().unwrap(),
             })
             .unwrap();
-        assert!(matches!(
-            crit.try_recv().unwrap(),
-            SwarmCommand::Dial { .. }
-        ));
+        assert!(matches!(con.try_recv().unwrap(), SwarmCommand::Dial { .. }));
     }
 
     #[test]
     fn test_send_fails_on_closed_channel() {
-        let (channels, receivers) = PriorityCommandChannels::new();
+        let (channels, receivers) = ClassCommandChannels::new();
         drop(receivers);
 
         let result = channels.send(SwarmCommand::Subscribe {
@@ -247,22 +237,22 @@ mod tests {
 
     #[test]
     fn test_multiple_messages_preserve_order() {
-        let (channels, (mut crit, _, _, _, _)) = PriorityCommandChannels::new();
+        let (channels, (mut con, _, _, _, _)) = ClassCommandChannels::new();
 
         for i in 0..5u8 {
             channels
                 .send(SwarmCommand::Broadcast {
                     topic: format!("topic-{i}"),
                     data: vec![i],
-                    priority: MessagePriority::Critical,
+                    class: MessageClass::Consensus,
                 })
                 .unwrap();
         }
 
         for i in 0..5u8 {
-            let msg = crit.try_recv().unwrap();
+            let msg = con.try_recv().unwrap();
             assert!(matches!(msg, SwarmCommand::Broadcast { data, .. } if data == vec![i]));
         }
-        assert!(crit.try_recv().is_err());
+        assert!(con.try_recv().is_err());
     }
 }

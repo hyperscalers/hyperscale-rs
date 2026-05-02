@@ -5,7 +5,7 @@
 //! Any validator in the source shard can serve this from local storage.
 
 use crate::response::GetRemoteHeadersResponse;
-use hyperscale_types::{BlockHeight, MessagePriority, NetworkMessage, Request, ShardGroupId};
+use hyperscale_types::{BlockHeight, MessageClass, NetworkMessage, Request, ShardGroupId};
 use sbor::prelude::BasicSbor;
 
 /// Server-enforced upper bound on `count`. Sized to match the block-sync
@@ -34,8 +34,8 @@ impl NetworkMessage for GetRemoteHeadersRequest {
         "remote_header.request"
     }
 
-    fn priority() -> MessagePriority {
-        MessagePriority::Coordination
+    fn class() -> MessageClass {
+        MessageClass::Recovery
     }
 }
 

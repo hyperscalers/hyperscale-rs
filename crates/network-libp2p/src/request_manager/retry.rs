@@ -3,10 +3,11 @@
 //! Implements request-centric retry: retries the same peer first (packet loss
 //! is probabilistic), only rotating after a threshold of failures.
 
-use super::{RequestError, RequestManager, RequestPriority};
+use super::{RequestError, RequestManager};
 use crate::adapter::NetworkError;
 use bytes::Bytes;
 use hyperscale_metrics as metrics;
+use hyperscale_types::MessageClass;
 use libp2p::PeerId;
 use std::time::{Duration, Instant};
 use tracing::{debug, trace, warn};
@@ -20,7 +21,7 @@ impl RequestManager {
         request_desc: &str,
         type_id: &'static str,
         data: &[u8],
-        priority: RequestPriority,
+        class: MessageClass,
     ) -> Result<(PeerId, Bytes), RequestError> {
         let mut attempts: u32 = 0;
         let mut current_peer_attempts: u32 = 0;
@@ -36,8 +37,7 @@ impl RequestManager {
                 .ok_or(RequestError::NoPeers)?,
         };
 
-        // Compute initial backoff based on peer RTT (if known) and priority
-        let mut backoff = self.compute_initial_backoff(&current_peer, priority);
+        let mut backoff = self.compute_initial_backoff(&current_peer, class);
 
         loop {
             // Record request start
@@ -51,9 +51,7 @@ impl RequestManager {
             );
 
             let start = Instant::now();
-            let result = self
-                .send_request(&current_peer, type_id, data, priority)
-                .await;
+            let result = self.send_request(&current_peer, type_id, data, class).await;
             let elapsed = start.elapsed();
 
             debug!(

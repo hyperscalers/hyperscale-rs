@@ -1,6 +1,6 @@
 //! Local provisions fetch response (intra-shard DA).
 
-use hyperscale_types::{MessagePriority, NetworkMessage, Provisions};
+use hyperscale_types::{MessageClass, NetworkMessage, Provisions};
 use sbor::prelude::BasicSbor;
 
 /// Response to a local provisions fetch request.
@@ -33,8 +33,8 @@ impl NetworkMessage for GetLocalProvisionsResponse {
         "local_provision.response"
     }
 
-    fn priority() -> MessagePriority {
-        MessagePriority::Coordination
+    fn class() -> MessageClass {
+        MessageClass::BlockCompletion
     }
 }
 

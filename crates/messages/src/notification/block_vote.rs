@@ -1,6 +1,6 @@
 //! `BlockVote` notification message.
 
-use hyperscale_types::{BlockVote, MessagePriority, NetworkMessage};
+use hyperscale_types::{BlockVote, MessageClass, NetworkMessage};
 use sbor::prelude::BasicSbor;
 
 /// Vote on a block proposal. 2f+1 matching votes create a `QuorumCertificate`.
@@ -39,8 +39,8 @@ impl NetworkMessage for BlockVoteNotification {
         "block.vote"
     }
 
-    fn priority() -> MessagePriority {
-        MessagePriority::Critical
+    fn class() -> MessageClass {
+        MessageClass::Consensus
     }
 }
 

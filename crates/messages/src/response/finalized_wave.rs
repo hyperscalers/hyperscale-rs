@@ -1,6 +1,6 @@
 //! Finalized wave fetch response (intra-shard DA).
 
-use hyperscale_types::{FinalizedWave, MessagePriority, NetworkMessage};
+use hyperscale_types::{FinalizedWave, MessageClass, NetworkMessage};
 
 /// Response to a finalized wave fetch request.
 ///
@@ -34,8 +34,8 @@ impl NetworkMessage for GetFinalizedWavesResponse {
         "finalized_wave.response"
     }
 
-    fn priority() -> MessagePriority {
-        MessagePriority::Coordination
+    fn class() -> MessageClass {
+        MessageClass::BlockCompletion
     }
 }
 

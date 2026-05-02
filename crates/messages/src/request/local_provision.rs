@@ -3,7 +3,7 @@
 use crate::response::GetLocalProvisionsResponse;
 #[cfg(test)]
 use hyperscale_types::Hash;
-use hyperscale_types::{MessagePriority, NetworkMessage, ProvisionHash, Request};
+use hyperscale_types::{MessageClass, NetworkMessage, ProvisionHash, Request};
 use sbor::prelude::BasicSbor;
 
 /// Request to fetch provision batches by hash.
@@ -30,8 +30,8 @@ impl NetworkMessage for GetLocalProvisionsRequest {
         "local_provision.request"
     }
 
-    fn priority() -> MessagePriority {
-        MessagePriority::Coordination
+    fn class() -> MessageClass {
+        MessageClass::BlockCompletion
     }
 }
 

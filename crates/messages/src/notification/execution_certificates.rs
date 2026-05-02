@@ -1,7 +1,7 @@
 //! `ExecutionCertificatesNotification` message.
 
 use hyperscale_types::{
-    Bls12381G2Signature, ExecutionCertificate, MessagePriority, NetworkMessage, ShardGroupId,
+    Bls12381G2Signature, ExecutionCertificate, MessageClass, NetworkMessage, ShardGroupId,
     ValidatorId,
 };
 use sbor::prelude::BasicSbor;
@@ -72,7 +72,7 @@ impl NetworkMessage for ExecutionCertificatesNotification {
         "execution.cert.batch"
     }
 
-    fn priority() -> MessagePriority {
-        MessagePriority::Coordination
+    fn class() -> MessageClass {
+        MessageClass::CrossShardProgress
     }
 }

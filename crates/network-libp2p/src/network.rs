@@ -6,7 +6,7 @@
 use crate::adapter::Libp2pAdapter;
 use crate::inbound_router::{InboundRouterHandle, spawn_inbound_router};
 use crate::notify_pool::NotifyStreamPool;
-use crate::request_manager::{RequestManager, request_priority_for};
+use crate::request_manager::RequestManager;
 use hyperscale_network::{
     GossipHandler, HandlerRegistry, Network, NotificationHandler, RequestError, RequestHandler,
     ResponseVerdict, Topic, TopicScope, ValidatorKeyMap, compression,
@@ -92,7 +92,7 @@ impl Network for Libp2pNetwork {
     fn broadcast_to_shard<M: ShardMessage>(&self, shard: ShardGroupId, message: &M) {
         let topic = Topic::shard(M::message_type_id(), shard);
         let data = compression::compress(&sbor::basic_encode(message).expect("SBOR encode failed"));
-        if let Err(e) = self.adapter.publish(&topic, data, M::priority()) {
+        if let Err(e) = self.adapter.publish(&topic, data, M::class()) {
             warn!(error = ?e, "Libp2pNetwork: broadcast_to_shard failed");
         }
     }
@@ -100,7 +100,7 @@ impl Network for Libp2pNetwork {
     fn broadcast_global<M: NetworkMessage>(&self, message: &M) {
         let topic = Topic::global(M::message_type_id());
         let data = compression::compress(&sbor::basic_encode(message).expect("SBOR encode failed"));
-        if let Err(e) = self.adapter.publish(&topic, data, M::priority()) {
+        if let Err(e) = self.adapter.publish(&topic, data, M::class()) {
             warn!(error = ?e, "Libp2pNetwork: broadcast_global failed");
         }
     }
@@ -195,7 +195,7 @@ impl Network for Libp2pNetwork {
         }
 
         let preferred_libp2p = preferred_peer.and_then(|v| self.validator_peer_id(v));
-        let priority = request_priority_for(R::priority());
+        let class = R::class();
 
         // SBOR-encode the request
         let request_bytes = match sbor::basic_encode(&request) {
@@ -220,7 +220,7 @@ impl Network for Libp2pNetwork {
                     description,
                     type_id,
                     request_bytes,
-                    priority,
+                    class,
                 )
                 .await
             {

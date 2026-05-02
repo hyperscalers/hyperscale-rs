@@ -1,11 +1,11 @@
-//! Async event loop processing swarm events and priority-ordered commands.
+//! Async event loop processing swarm events and class-ordered commands.
 //!
-//! Commands are processed in priority order:
-//! 1. Critical priority (BFT consensus)
-//! 2. Coordination priority (cross-shard execution)
-//! 3. Finalization priority (certificate gossip)
-//! 4. Propagation priority (transaction gossip)
-//! 5. Background priority (sync operations)
+//! Commands are processed in class order, most-urgent first:
+//! 1. Consensus (BFT round-blocking)
+//! 2. `BlockCompletion` (current-proposal DA gap closure)
+//! 3. `CrossShardProgress` (execution & finalization coordination)
+//! 4. Recovery (catch-up traffic)
+//! 5. Bulk (transaction gossip, fetch-fallback-backed)
 
 use super::behaviour::{Behaviour, BehaviourEvent};
 use super::command::{MAX_COMMANDS_PER_DRAIN, SwarmCommand};
@@ -47,11 +47,11 @@ fn parse_hyperscale_version(agent_version: &str) -> Option<&str> {
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // single hot loop; splitting would scatter shared swarm state
 pub(super) async fn run(
     mut swarm: Swarm<Behaviour>,
-    mut critical_rx: mpsc::UnboundedReceiver<SwarmCommand>,
-    mut coordination_rx: mpsc::UnboundedReceiver<SwarmCommand>,
-    mut finalization_rx: mpsc::UnboundedReceiver<SwarmCommand>,
-    mut propagation_rx: mpsc::UnboundedReceiver<SwarmCommand>,
-    mut background_rx: mpsc::UnboundedReceiver<SwarmCommand>,
+    mut consensus_rx: mpsc::UnboundedReceiver<SwarmCommand>,
+    mut block_completion_rx: mpsc::UnboundedReceiver<SwarmCommand>,
+    mut cross_shard_progress_rx: mpsc::UnboundedReceiver<SwarmCommand>,
+    mut recovery_rx: mpsc::UnboundedReceiver<SwarmCommand>,
+    mut bulk_rx: mpsc::UnboundedReceiver<SwarmCommand>,
     mut shutdown_rx: mpsc::Receiver<()>,
     cached_peer_count: Arc<AtomicUsize>,
     local_shard: ShardGroupId,
@@ -165,57 +165,58 @@ pub(super) async fn run(
                 }
             }
 
-            // Priority-ordered command processing.
-            // Each priority level is checked in order, with higher priorities processed first.
-            // Within each branch, we also drain higher-priority channels to maintain ordering.
+            // Class-ordered command processing.
+            // Each class is checked in order; before handling a less-urgent
+            // command we drain every more-urgent channel to maintain strict
+            // priority.
 
-            // Critical priority - BFT consensus messages (highest command priority)
-            Some(cmd) = critical_rx.recv() => {
+            // Consensus — BFT round-blocking traffic.
+            Some(cmd) = consensus_rx.recv() => {
                 handle_command(&mut swarm, cmd);
-                drain_channel(&mut swarm, &mut critical_rx);
+                drain_channel(&mut swarm, &mut consensus_rx);
             }
 
-            // Coordination priority - Cross-shard execution messages
-            Some(cmd) = coordination_rx.recv() => {
-                drain_channel(&mut swarm, &mut critical_rx);
+            // BlockCompletion — current-proposal DA gap closure.
+            Some(cmd) = block_completion_rx.recv() => {
+                drain_channel(&mut swarm, &mut consensus_rx);
                 handle_command(&mut swarm, cmd);
-                drain_channel(&mut swarm, &mut coordination_rx);
+                drain_channel(&mut swarm, &mut block_completion_rx);
             }
 
-            // Finalization priority - Certificate gossip
-            Some(cmd) = finalization_rx.recv() => {
+            // CrossShardProgress — execution & finalization coordination.
+            Some(cmd) = cross_shard_progress_rx.recv() => {
                 drain_higher_priority_commands(
                     &mut swarm,
-                    &mut critical_rx,
-                    &mut coordination_rx,
+                    &mut consensus_rx,
+                    &mut block_completion_rx,
                 );
                 handle_command(&mut swarm, cmd);
-                drain_channel(&mut swarm, &mut finalization_rx);
+                drain_channel(&mut swarm, &mut cross_shard_progress_rx);
             }
 
-            // Propagation priority - Transaction gossip (mempool)
-            Some(cmd) = propagation_rx.recv() => {
+            // Recovery — catch-up traffic.
+            Some(cmd) = recovery_rx.recv() => {
                 drain_all_higher_priority_commands(
                     &mut swarm,
-                    &mut critical_rx,
-                    &mut coordination_rx,
-                    &mut finalization_rx,
+                    &mut consensus_rx,
+                    &mut block_completion_rx,
+                    &mut cross_shard_progress_rx,
                 );
                 handle_command(&mut swarm, cmd);
-                drain_channel(&mut swarm, &mut propagation_rx);
+                drain_channel(&mut swarm, &mut recovery_rx);
             }
 
-            // Background priority - Sync operations (lowest priority)
-            Some(cmd) = background_rx.recv() => {
+            // Bulk — transaction gossip; fetch-fallback-backed and sheddable.
+            Some(cmd) = bulk_rx.recv() => {
                 drain_all_higher_priority_commands(
                     &mut swarm,
-                    &mut critical_rx,
-                    &mut coordination_rx,
-                    &mut finalization_rx,
+                    &mut consensus_rx,
+                    &mut block_completion_rx,
+                    &mut cross_shard_progress_rx,
                 );
-                drain_channel(&mut swarm, &mut propagation_rx);
+                drain_channel(&mut swarm, &mut recovery_rx);
                 handle_command(&mut swarm, cmd);
-                drain_channel(&mut swarm, &mut background_rx);
+                drain_channel(&mut swarm, &mut bulk_rx);
             }
 
             // Drain gossipsub validation results and report to swarm.
@@ -460,28 +461,28 @@ fn drain_channel(swarm: &mut Swarm<Behaviour>, rx: &mut mpsc::UnboundedReceiver<
     }
 }
 
-/// Drain critical and coordination priority commands.
-/// Used before processing finalization-level commands.
+/// Drain `Consensus` and `BlockCompletion` commands.
+/// Called before processing a `CrossShardProgress`-class command.
 fn drain_higher_priority_commands(
     swarm: &mut Swarm<Behaviour>,
-    critical_rx: &mut mpsc::UnboundedReceiver<SwarmCommand>,
-    coordination_rx: &mut mpsc::UnboundedReceiver<SwarmCommand>,
+    consensus_rx: &mut mpsc::UnboundedReceiver<SwarmCommand>,
+    block_completion_rx: &mut mpsc::UnboundedReceiver<SwarmCommand>,
 ) {
-    drain_channel(swarm, critical_rx);
-    drain_channel(swarm, coordination_rx);
+    drain_channel(swarm, consensus_rx);
+    drain_channel(swarm, block_completion_rx);
 }
 
-/// Drain all higher priority commands (critical, coordination, finalization).
-/// Used before processing propagation and background level commands.
+/// Drain all classes more urgent than `Recovery`.
+/// Called before processing a `Recovery` or `Bulk` class command.
 fn drain_all_higher_priority_commands(
     swarm: &mut Swarm<Behaviour>,
-    critical_rx: &mut mpsc::UnboundedReceiver<SwarmCommand>,
-    coordination_rx: &mut mpsc::UnboundedReceiver<SwarmCommand>,
-    finalization_rx: &mut mpsc::UnboundedReceiver<SwarmCommand>,
+    consensus_rx: &mut mpsc::UnboundedReceiver<SwarmCommand>,
+    block_completion_rx: &mut mpsc::UnboundedReceiver<SwarmCommand>,
+    cross_shard_progress_rx: &mut mpsc::UnboundedReceiver<SwarmCommand>,
 ) {
-    drain_channel(swarm, critical_rx);
-    drain_channel(swarm, coordination_rx);
-    drain_channel(swarm, finalization_rx);
+    drain_channel(swarm, consensus_rx);
+    drain_channel(swarm, block_completion_rx);
+    drain_channel(swarm, cross_shard_progress_rx);
 }
 
 #[cfg(test)]

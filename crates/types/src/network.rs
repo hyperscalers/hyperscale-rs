@@ -1,111 +1,123 @@
-//! Network message traits and priority classification.
+//! Network message traits and class classification.
 //!
 //! These traits mark types as network messages for serialization and routing.
 //!
-//! # Priority Levels
+//! # Class Levels
 //!
-//! Messages are classified into five priority tiers, from highest to lowest:
+//! Messages are classified by what stalls if delivery is delayed, into five
+//! tiers from most to least urgent:
 //!
-//! 1. **Critical** - BFT consensus messages (`BlockHeader`, `BlockVote`) and
-//!    requests that unblock pending blocks. Never dropped.
+//! 1. **Consensus** — BFT round-blocking messages whose loss can only be
+//!    recovered by a view-change timeout (`BlockHeader`, `BlockVote`).
 //!
-//! 2. **Coordination** - Cross-shard execution messages (`StateProvision`, `ExecutionVote`,
-//!    `ExecutionCertificate`). High priority, may be batched for efficiency.
+//! 2. **`BlockCompletion`** — DA gap-closure for the *current* proposal. Delay
+//!    extends the voting window but the round still completes
+//!    (`GetTransactions`, `GetLocalProvisions`, `GetFinalizedWaves` on the
+//!    pending-block path).
 //!
-//! 3. **Finalization** - Wave certificate gossip. Important for progress
-//!    but not liveness-critical.
+//! 3. **`CrossShardProgress`** — Execution and finalization across shards.
+//!    Delay stalls cross-shard execution but local consensus continues
+//!    (`StateProvision`, `ExecutionVotes`, `ExecutionCertificates`,
+//!    `CommittedBlockHeader` gossip).
 //!
-//! 4. **Propagation** - Transaction gossip for mempool dissemination.
-//!    Best-effort, can be shed under load.
+//! 4. **Recovery** — Catch-up traffic. Steady-state volume is zero
+//!    (`GetBlock`, `GetSync`, `GetRemoteHeader`).
 //!
-//! 5. **Background** - Sync operations like block fetching. Fully deferrable.
+//! 5. **Bulk** — High-volume best-effort with fetch fallback
+//!    (`TransactionGossip`).
 
 use sbor::prelude::{BasicDecode, BasicEncode, BasicSbor};
 
-/// Network message priority levels.
+/// Network message class.
 ///
-/// Lower numeric values = higher priority.
-/// Messages at the same priority level are processed FIFO.
+/// Lower numeric values = more urgent.
+/// Messages within a class are processed FIFO.
 ///
-/// Priority determines:
+/// Class determines:
 /// - Processing order in the network adaptor event loop
 /// - Network queue ordering for broadcasts
 /// - Backpressure behavior under load
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, BasicSbor)]
 #[repr(u8)]
-pub enum MessagePriority {
-    /// Liveness-critical consensus messages.
+pub enum MessageClass {
+    /// BFT round-blocking; loss only recovered by view-change timeout.
     ///
     /// Includes:
-    /// - `BlockHeaderNotification` - block proposals
-    /// - `BlockVoteNotification` - votes on proposals
-    /// - `GetTransactionsRequest/Response` - unblock pending blocks
+    /// - `BlockHeaderNotification` — proposer → committee
+    /// - `BlockVoteNotification` — voter → next proposer
     ///
-    /// Never dropped, processed immediately.
-    Critical = 0,
+    /// Never dropped, processed immediately, must preempt all other traffic.
+    Consensus = 0,
 
-    /// Cross-shard coordination messages.
+    /// DA gap-closure for the current proposal.
     ///
-    /// Includes:
-    /// - `StateProvisionNotification` - cross-shard state delivery with merkle proofs
-    /// - `ExecutionVotesNotification` - execution votes
-    /// - `ExecutionCertificatesNotification` - execution certificates
+    /// Includes (on the hot pending-block path):
+    /// - `GetTransactionsRequest/Response`
+    /// - `GetLocalProvisionsRequest/Response`
+    /// - `GetFinalizedWavesRequest/Response`
     ///
-    /// High priority but may be batched for efficiency.
-    Coordination = 1,
+    /// Delay extends the voting window but the round still completes.
+    BlockCompletion = 1,
 
-    /// Finalization messages.
+    /// Execution and finalization coordination across shards.
     ///
     /// Includes:
-    /// - `WaveCertificateNotification` - wave certificates for committed waves
+    /// - `CommittedBlockHeader` gossip — proposer broadcast on commit
+    /// - `StateProvisionNotification` — cross-shard state delivery
+    /// - `ExecutionVotesNotification` — execution votes
+    /// - `ExecutionCertificatesNotification` — execution certificates
+    /// - `GetProvisionsRequest/Response` — cross-shard fallback
+    /// - `GetExecutionCertRequest/Response` — EC fallback
     ///
-    /// Important for progress but not liveness-critical.
-    Finalization = 2,
+    /// Delay stalls cross-shard progress but not local consensus.
+    CrossShardProgress = 2,
 
-    /// Mempool propagation.
+    /// Catch-up traffic. Zero volume in steady state.
     ///
     /// Includes:
-    /// - `TransactionGossip` - new transaction dissemination
+    /// - `GetBlockRequest/Response` — bulk block sync
+    /// - `GetSyncRequest` — sync session bootstrap
+    /// - `GetRemoteHeaderRequest/Response` — remote shard catch-up
     ///
-    /// Best-effort, can be shed under load.
-    Propagation = 3,
+    /// Sheddable; must always yield to higher classes.
+    Recovery = 3,
 
-    /// Background/sync operations.
+    /// High-volume best-effort with fetch fallback.
     ///
     /// Includes:
-    /// - `GetBlockRequest/Response` - block sync catch-up
+    /// - `TransactionGossip` — mempool dissemination
     ///
-    /// Lowest priority, fully deferrable.
-    Background = 4,
+    /// Largest class by volume; sheddable on the wire.
+    Bulk = 4,
 }
 
-impl MessagePriority {
-    /// Whether this priority level can be dropped under backpressure.
+impl MessageClass {
+    /// Whether this class can be dropped under backpressure.
     ///
-    /// Only `Propagation` and `Background` messages are droppable.
-    /// Higher priority messages must be delivered.
+    /// Only `Recovery` and `Bulk` are droppable. Higher classes must be
+    /// delivered.
     #[inline]
     #[must_use]
     pub const fn is_droppable(&self) -> bool {
-        matches!(self, Self::Propagation | Self::Background)
+        matches!(self, Self::Recovery | Self::Bulk)
     }
 }
 
 /// Marker trait for network messages.
 ///
 /// All messages sent over the network must implement this trait.
-/// Each message type declares its priority for network `QoS`.
+/// Each message type declares its class for network `QoS`.
 pub trait NetworkMessage: Send + Sync + Sized + BasicEncode + BasicDecode {
     /// Unique message type identifier for routing.
     fn message_type_id() -> &'static str;
 
-    /// The priority level for this message type.
+    /// The class for this message type.
     ///
     /// Used by the network adaptor for queue ordering and backpressure.
-    /// Defaults to `Background` - override for higher priority messages.
+    /// Defaults to `Recovery` — override for higher-urgency messages.
     #[must_use]
-    fn priority() -> MessagePriority {
-        MessagePriority::Background
+    fn class() -> MessageClass {
+        MessageClass::Recovery
     }
 
     /// Get the gossipsub topic for this message type.

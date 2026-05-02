@@ -1,7 +1,7 @@
 //! Core `Libp2pAdapter`: construction, public API, and shutdown.
 
 use super::behaviour::{Behaviour, NOTIFY_PROTOCOL, REQUEST_PROTOCOL};
-use super::command::{PriorityCommandChannels, SwarmCommand};
+use super::command::{ClassCommandChannels, SwarmCommand};
 use super::error::NetworkError;
 use crate::config::Libp2pConfig;
 use arc_swap::ArcSwap;
@@ -10,7 +10,7 @@ use futures::FutureExt;
 use hyperscale_metrics as metrics;
 use hyperscale_network::HandlerRegistry;
 use hyperscale_network::ValidatorKeyMap;
-use hyperscale_types::{Bls12381G2Signature, MessagePriority, ShardGroupId, ValidatorId};
+use hyperscale_types::{Bls12381G2Signature, MessageClass, ShardGroupId, ValidatorId};
 use libp2p::{Multiaddr, PeerId as Libp2pPeerId, Stream, gossipsub, identify, identity, kad};
 use libp2p_stream as stream;
 use std::sync::Arc;
@@ -21,7 +21,7 @@ use tracing::{info, trace};
 /// libp2p-based network adapter for production use.
 ///
 /// Uses gossipsub for efficient broadcast and Kademlia DHT for peer discovery.
-/// Commands are processed in priority order via [`PriorityCommandChannels`].
+/// Commands are processed in priority order via [`ClassCommandChannels`].
 ///
 /// Request/response uses raw streams via `libp2p_stream`. The adapter is a "dumb pipe" -
 /// all timeout logic is owned by `RequestManager`.
@@ -34,7 +34,7 @@ pub struct Libp2pAdapter {
 
     /// Priority-based command channels to swarm task.
     /// Commands are routed to the appropriate channel based on message priority.
-    priority_channels: PriorityCommandChannels,
+    priority_channels: ClassCommandChannels,
 
     /// Known validators (`ValidatorId` -> `PeerId`).
     /// Used by request-response to resolve peer addresses.
@@ -208,12 +208,12 @@ impl Libp2pAdapter {
         let (validation_tx, validation_rx) =
             mpsc::unbounded_channel::<super::gossipsub::ValidationReport>();
 
-        // Priority-based command channels - commands are routed by message priority.
-        // Critical messages (BFT consensus) are processed before Background (sync).
+        // Class-tiered command channels — commands are routed by message class.
+        // Consensus (BFT round-blocking) is drained before Recovery (sync) and Bulk.
         let (
             priority_channels,
-            (critical_rx, coordination_rx, finalization_rx, propagation_rx, background_rx),
-        ) = PriorityCommandChannels::new();
+            (consensus_rx, block_completion_rx, cross_shard_progress_rx, recovery_rx, bulk_rx),
+        ) = ClassCommandChannels::new();
 
         let cached_peer_count = Arc::new(AtomicUsize::new(0));
 
@@ -252,11 +252,11 @@ impl Libp2pAdapter {
 
             let result = std::panic::AssertUnwindSafe(super::event_loop::run(
                 swarm,
-                critical_rx,
-                coordination_rx,
-                finalization_rx,
-                propagation_rx,
-                background_rx,
+                consensus_rx,
+                block_completion_rx,
+                cross_shard_progress_rx,
+                recovery_rx,
+                bulk_rx,
                 shutdown_rx,
                 cached_peer_count,
                 shard,
@@ -315,11 +315,11 @@ impl Libp2pAdapter {
             .map_err(|_| NetworkError::NetworkShutdown)
     }
 
-    /// Publish pre-encoded data to a topic with a given priority.
+    /// Publish pre-encoded data to a topic with a given class.
     ///
-    /// Messages are routed to the appropriate priority channel based on the
-    /// provided [`MessagePriority`]. Critical messages (BFT consensus) are
-    /// processed before Background messages (sync).
+    /// Messages are routed to the appropriate class channel based on the
+    /// provided [`MessageClass`]. Consensus messages (BFT round-blocking) are
+    /// processed before Recovery messages (sync) and Bulk (tx gossip).
     ///
     /// Callers are responsible for SBOR-encoding and compressing the message
     /// before calling this method (use `sbor::basic_encode` + `compression::compress`).
@@ -331,7 +331,7 @@ impl Libp2pAdapter {
         &self,
         topic: &hyperscale_network::Topic,
         data: Vec<u8>,
-        priority: MessagePriority,
+        class: MessageClass,
     ) -> Result<(), NetworkError> {
         let data_len = data.len();
 
@@ -339,17 +339,16 @@ impl Libp2pAdapter {
             .send(SwarmCommand::Broadcast {
                 topic: topic.to_string(),
                 data,
-                priority,
+                class,
             })
             .map_err(|_| NetworkError::NetworkShutdown)?;
 
-        // Record metrics
         metrics::record_network_message_sent();
         metrics::record_libp2p_bandwidth(0, data_len as u64);
 
         trace!(
             topic = %topic,
-            priority = ?priority,
+            class = ?class,
             data_len,
             "Published message"
         );

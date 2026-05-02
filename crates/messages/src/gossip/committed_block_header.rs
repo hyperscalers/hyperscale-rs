@@ -1,7 +1,7 @@
 //! `CommittedBlockHeader` gossip message for cross-shard header broadcast.
 
 use hyperscale_types::{
-    Bls12381G2Signature, CommittedBlockHeader, MessagePriority, NetworkMessage, ValidatorId,
+    Bls12381G2Signature, CommittedBlockHeader, MessageClass, NetworkMessage, ValidatorId,
     committed_block_header_message,
 };
 use sbor::prelude::BasicSbor;
@@ -42,8 +42,8 @@ impl NetworkMessage for CommittedBlockHeaderGossip {
         "block.committed"
     }
 
-    fn priority() -> MessagePriority {
-        MessagePriority::Coordination
+    fn class() -> MessageClass {
+        MessageClass::CrossShardProgress
     }
 }
 
