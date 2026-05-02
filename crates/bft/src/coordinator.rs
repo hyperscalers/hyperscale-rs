@@ -941,7 +941,7 @@ impl BftCoordinator {
             original_round = original_round.0,
             block_hash = ?block_hash,
             tx_count = manifest.transaction_count(),
-            cert_count = manifest.cert_hashes.len(),
+            cert_count = manifest.cert_ids.len(),
             "Re-proposing vote-locked block after view change (keeping original round)"
         );
 
@@ -1165,8 +1165,8 @@ impl BftCoordinator {
                 pending.add_transaction_arc(tx);
             }
         }
-        for wave_hash in pending.manifest().cert_hashes.clone() {
-            if let Some(fw) = lookup_finalized_wave(&wave_hash) {
+        for wave_id in pending.manifest().cert_ids.clone() {
+            if let Some(fw) = lookup_finalized_wave(&wave_id.hash()) {
                 pending.add_finalized_wave(fw);
             }
         }

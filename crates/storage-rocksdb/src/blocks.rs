@@ -6,7 +6,7 @@ use crate::core::RocksDbStorage;
 use hyperscale_metrics as metrics;
 use hyperscale_types::{
     Block, BlockHeight, BlockMetadata, CertifiedBlock, FinalizedWave, Hash, ProvisionHash,
-    QuorumCertificate, RoutableTransaction, TxHash, WaveCertificate, WaveIdHash,
+    QuorumCertificate, RoutableTransaction, TxHash, WaveCertificate, WaveId, WaveIdHash,
 };
 use rocksdb::{WriteBatch, WriteOptions};
 use std::sync::Arc;
@@ -148,13 +148,19 @@ impl RocksDbStorage {
         }
 
         // 3. Batch-fetch certificates (preserving order)
-        let certs = self.get_certificates_batch_ordered(&metadata.manifest.cert_hashes);
+        let cert_hashes: Vec<WaveIdHash> = metadata
+            .manifest
+            .cert_ids
+            .iter()
+            .map(WaveId::hash)
+            .collect();
+        let certs = self.get_certificates_batch_ordered(&cert_hashes);
 
         // Verify we got ALL certificates - return None if any are missing
-        if certs.len() != metadata.manifest.cert_hashes.len() {
+        if certs.len() != cert_hashes.len() {
             tracing::warn!(
                 height = height.0,
-                expected = metadata.manifest.cert_hashes.len(),
+                expected = cert_hashes.len(),
                 found = certs.len(),
                 "Block has missing certificates - cannot serve sync request"
             );
@@ -258,13 +264,19 @@ impl RocksDbStorage {
         }
 
         // 3. Try to batch-fetch certificates (preserving order)
-        let certs = self.get_certificates_batch_ordered(&metadata.manifest.cert_hashes);
+        let cert_hashes: Vec<WaveIdHash> = metadata
+            .manifest
+            .cert_ids
+            .iter()
+            .map(WaveId::hash)
+            .collect();
+        let certs = self.get_certificates_batch_ordered(&cert_hashes);
 
         // Check if all certificates are present - if not, return None
-        if certs.len() != metadata.manifest.cert_hashes.len() {
+        if certs.len() != cert_hashes.len() {
             tracing::debug!(
                 height = height.0,
-                expected = metadata.manifest.cert_hashes.len(),
+                expected = cert_hashes.len(),
                 found = certs.len(),
                 "Block has missing certificates - cannot serve sync request"
             );

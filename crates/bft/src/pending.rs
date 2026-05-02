@@ -7,7 +7,7 @@ use hyperscale_core::{Action, FetchOrigin, FetchPeers, FetchRequest};
 use hyperscale_types::Hash;
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockManifest, FinalizedWave, LocalTimestamp, ProvisionHash,
-    Provisions, RoutableTransaction, TopologySnapshot, TxHash, WaveIdHash,
+    Provisions, RoutableTransaction, TopologySnapshot, TxHash, WaveId, WaveIdHash,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -74,7 +74,7 @@ impl PendingBlock {
         let missing_transaction_hashes: HashSet<TxHash> =
             manifest.tx_hashes.iter().copied().collect();
         let missing_wave_hashes: HashSet<WaveIdHash> =
-            manifest.cert_hashes.iter().copied().collect();
+            manifest.cert_ids.iter().map(WaveId::hash).collect();
         let missing_provision_hashes: HashSet<ProvisionHash> =
             manifest.provision_hashes.iter().copied().collect();
 
@@ -262,9 +262,9 @@ impl PendingBlock {
         // Pass finalized waves into the block in manifest order.
         let certificates: Vec<Arc<FinalizedWave>> = self
             .manifest
-            .cert_hashes
+            .cert_ids
             .iter()
-            .filter_map(|hash| self.received_waves.get(hash).cloned())
+            .filter_map(|id| self.received_waves.get(&id.hash()).cloned())
             .collect();
 
         // Attach provisions in manifest order. `received_provisions` is
@@ -315,7 +315,7 @@ impl PendingBlock {
 
     /// Get certificate count.
     pub const fn certificate_count(&self) -> usize {
-        self.manifest.cert_hashes.len()
+        self.manifest.cert_ids.len()
     }
 }
 
@@ -472,15 +472,15 @@ mod tests {
     #[test]
     fn test_pending_block_with_waves() {
         let tx1 = TxHash::from_raw(Hash::from_bytes(b"tx1"));
-        let wave1 = WaveIdHash::from_raw(Hash::from_bytes(b"wave1"));
-        let wave2 = WaveIdHash::from_raw(Hash::from_bytes(b"wave2"));
+        let wave1 = WaveId::new(ShardGroupId(0), BlockHeight(1), BTreeSet::new());
+        let wave2 = WaveId::new(ShardGroupId(0), BlockHeight(2), BTreeSet::new());
         let header = make_header(BlockHeight(1));
 
         let pb = PendingBlock::from_manifest(
             header,
             BlockManifest {
                 tx_hashes: vec![tx1],
-                cert_hashes: vec![wave1, wave2],
+                cert_ids: vec![wave1.clone(), wave2.clone()],
                 ..Default::default()
             },
             LocalTimestamp::ZERO,
@@ -488,8 +488,8 @@ mod tests {
 
         assert_eq!(pb.missing_transaction_count(), 1);
         assert_eq!(pb.missing_wave_count(), 2);
-        assert!(pb.needs_wave(&wave1));
-        assert!(pb.needs_wave(&wave2));
+        assert!(pb.needs_wave(&wave1.hash()));
+        assert!(pb.needs_wave(&wave2.hash()));
         assert!(!pb.is_complete());
     }
 
@@ -498,13 +498,12 @@ mod tests {
         use hyperscale_types::{BlockHeight, WaveCertificate, WaveId};
 
         let wave_id = WaveId::new(ShardGroupId(0), BlockHeight(1), BTreeSet::new());
-        let wave_hash = wave_id.hash();
         let header = make_header(BlockHeight(1));
 
         let mut pb = PendingBlock::from_manifest(
             header,
             BlockManifest {
-                cert_hashes: vec![wave_hash],
+                cert_ids: vec![wave_id.clone()],
                 ..Default::default()
             },
             LocalTimestamp::ZERO,
@@ -536,14 +535,13 @@ mod tests {
         let tx = Arc::new(test_transaction(1));
         let tx_hash = tx.hash();
         let wave_id = WaveId::new(ShardGroupId(0), BlockHeight(1), BTreeSet::new());
-        let wave_hash = wave_id.hash();
         let header = make_header(BlockHeight(1));
 
         let mut pb = PendingBlock::from_manifest(
             header,
             BlockManifest {
                 tx_hashes: vec![tx_hash],
-                cert_hashes: vec![wave_hash],
+                cert_ids: vec![wave_id.clone()],
                 ..Default::default()
             },
             LocalTimestamp::ZERO,
