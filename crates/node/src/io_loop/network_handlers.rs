@@ -208,7 +208,7 @@ where
                     let waves: Vec<hyperscale_types::FinalizedWave> = req
                         .wave_ids
                         .iter()
-                        .filter_map(|id| fw_cache.get(&id.hash()).map(|fw| (*fw).clone()))
+                        .filter_map(|id| fw_cache.get(id).map(|fw| (*fw).clone()))
                         .collect();
 
                     GetFinalizedWavesResponse::new(waves)
@@ -228,8 +228,7 @@ where
 
                     let mut certs = Vec::new();
                     for wave_id in &req.wave_ids {
-                        let key = (wave_id.hash(), wave_id.clone());
-                        if let Some(cert) = guard.get(&key) {
+                        if let Some(cert) = guard.get(wave_id) {
                             certs.push(cert.as_ref().clone());
                         }
                     }

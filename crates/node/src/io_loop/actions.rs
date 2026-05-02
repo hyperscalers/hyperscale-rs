@@ -152,7 +152,7 @@ where
             for wave in waves {
                 self.caches
                     .finalized_wave
-                    .insert(wave.wave_id_hash(), Arc::clone(wave));
+                    .insert(wave.wave_id().clone(), Arc::clone(wave));
             }
         }
 
@@ -176,9 +176,8 @@ where
     ) {
         // Cache for serving EC fetch requests from remote shards.
         // Persistence is handled via wave certificates in block.certificates.
-        let key = (certificate.wave_id.hash(), certificate.wave_id.clone());
         if let Ok(mut cache) = self.caches.exec_cert.lock() {
-            cache.insert(key, Arc::clone(certificate));
+            cache.insert(certificate.wave_id.clone(), Arc::clone(certificate));
             if cache.len() > 2000 {
                 let cutoff = cache
                     .values()
