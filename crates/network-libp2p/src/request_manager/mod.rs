@@ -107,6 +107,64 @@ pub enum RequestPriority {
     Background,
 }
 
+/// Map a wire-level [`hyperscale_types::MessagePriority`] onto the binary
+/// [`RequestPriority`] used by the request manager. Only `Background` falls
+/// through to the relaxed retry/backoff regime; every other tier is treated as
+/// `Critical` for timeout tolerance.
+#[must_use]
+pub const fn request_priority_for(priority: hyperscale_types::MessagePriority) -> RequestPriority {
+    match priority {
+        hyperscale_types::MessagePriority::Background => RequestPriority::Background,
+        _ => RequestPriority::Critical,
+    }
+}
+
+#[cfg(test)]
+mod priority_mapping_tests {
+    use super::{RequestPriority, request_priority_for};
+    use hyperscale_types::MessagePriority;
+
+    #[test]
+    fn critical_maps_to_critical() {
+        assert_eq!(
+            request_priority_for(MessagePriority::Critical),
+            RequestPriority::Critical
+        );
+    }
+
+    #[test]
+    fn coordination_maps_to_critical() {
+        assert_eq!(
+            request_priority_for(MessagePriority::Coordination),
+            RequestPriority::Critical
+        );
+    }
+
+    #[test]
+    fn finalization_maps_to_critical() {
+        assert_eq!(
+            request_priority_for(MessagePriority::Finalization),
+            RequestPriority::Critical
+        );
+    }
+
+    #[test]
+    fn propagation_maps_to_critical() {
+        assert_eq!(
+            request_priority_for(MessagePriority::Propagation),
+            RequestPriority::Critical
+        );
+    }
+
+    #[test]
+    fn background_maps_to_background() {
+        assert_eq!(
+            request_priority_for(MessagePriority::Background),
+            RequestPriority::Background
+        );
+    }
+}
+
 /// Configuration for the request manager.
 #[derive(Debug, Clone)]
 pub struct RequestManagerConfig {

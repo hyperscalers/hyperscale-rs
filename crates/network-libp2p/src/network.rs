@@ -6,7 +6,7 @@
 use crate::adapter::Libp2pAdapter;
 use crate::inbound_router::{InboundRouterHandle, spawn_inbound_router};
 use crate::notify_pool::NotifyStreamPool;
-use crate::request_manager::{RequestManager, RequestPriority};
+use crate::request_manager::{RequestManager, request_priority_for};
 use hyperscale_network::{
     GossipHandler, HandlerRegistry, Network, NotificationHandler, RequestError, RequestHandler,
     ResponseVerdict, Topic, TopicScope, ValidatorKeyMap, compression,
@@ -195,11 +195,7 @@ impl Network for Libp2pNetwork {
         }
 
         let preferred_libp2p = preferred_peer.and_then(|v| self.validator_peer_id(v));
-        let priority = if R::priority() == hyperscale_types::MessagePriority::Background {
-            RequestPriority::Background
-        } else {
-            RequestPriority::Critical
-        };
+        let priority = request_priority_for(R::priority());
 
         // SBOR-encode the request
         let request_bytes = match sbor::basic_encode(&request) {
