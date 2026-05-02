@@ -166,6 +166,15 @@ pub struct RequestManagerConfig {
 
     /// Minimum concurrency (won't reduce below this even under poor conditions).
     pub min_concurrent: usize,
+
+    /// Cap on concurrent in-flight requests in the *sheddable* classes
+    /// (`Recovery` + `Bulk`). Counted as a subset of `max_concurrent` —
+    /// prevents a flood of catchup / DA-backfill fetches from filling the
+    /// global pool and starving hot-path classes (`Consensus`,
+    /// `BlockCompletion`, `CrossShardProgress`). Sized so the hot path
+    /// always has at least `max_concurrent - sheddable_max_concurrent`
+    /// slots available regardless of sheddable load.
+    pub sheddable_max_concurrent: usize,
 }
 
 impl Default for RequestManagerConfig {
@@ -180,6 +189,10 @@ impl Default for RequestManagerConfig {
             backoff_multiplier: 1.5,
             target_success_rate: 0.5,
             min_concurrent: 4,
+            // 16/64 leaves 48 slots for hot-path classes under any
+            // sheddable load — sized to absorb catchup / DA bursts without
+            // blocking pending-block or cross-shard fetches.
+            sheddable_max_concurrent: 16,
         }
     }
 }
@@ -201,6 +214,10 @@ pub struct RequestManager {
     health: PeerHealthTracker,
     /// Current in-flight request count.
     in_flight: AtomicUsize,
+    /// Subset of `in_flight` whose class is `Recovery` or `Bulk`. Capped
+    /// independently by `config.sheddable_max_concurrent` so catchup /
+    /// DA-backfill bursts can't starve the hot-path classes.
+    sheddable_in_flight: AtomicUsize,
     /// Current effective concurrency limit (may be reduced adaptively).
     effective_concurrent: AtomicUsize,
 }
@@ -217,6 +234,7 @@ impl RequestManager {
                 ..Default::default()
             }),
             in_flight: AtomicUsize::new(0),
+            sheddable_in_flight: AtomicUsize::new(0),
             effective_concurrent: AtomicUsize::new(effective),
             config,
         }
@@ -250,7 +268,7 @@ impl RequestManager {
         sbor_data: Vec<u8>,
         class: hyperscale_types::MessageClass,
     ) -> Result<(PeerId, Bytes), RequestError> {
-        self.acquire_slot().await?;
+        self.acquire_slot(class).await?;
 
         let result = self
             .request_inner(
@@ -263,8 +281,10 @@ impl RequestManager {
             )
             .await;
 
-        // Release slot
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        if uses_relaxed_retry(class) {
+            self.sheddable_in_flight.fetch_sub(1, Ordering::SeqCst);
+        }
 
         result
     }

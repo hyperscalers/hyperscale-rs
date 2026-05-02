@@ -1,9 +1,32 @@
 //! Adaptive concurrency control for request management.
 
-use super::{RequestError, RequestManager};
+use super::{RequestError, RequestManager, uses_relaxed_retry};
+use hyperscale_types::MessageClass;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tracing::{info, trace, warn};
+
+/// Pure admission decision: would a request of `class` be admitted right now?
+///
+/// Returns `true` when the global pool has room AND, if the class is
+/// sheddable (`Recovery` / `Bulk`), the sheddable subset is below its own
+/// cap. Used both by the live CAS loop in `acquire_slot` and by the unit
+/// tests below.
+const fn would_admit(
+    in_flight: usize,
+    limit: usize,
+    sheddable_in_flight: usize,
+    sheddable_cap: usize,
+    class: MessageClass,
+) -> bool {
+    if in_flight >= limit {
+        return false;
+    }
+    if uses_relaxed_retry(class) && sheddable_in_flight >= sheddable_cap {
+        return false;
+    }
+    true
+}
 
 /// Compute the reduced concurrency value (halve, but don't go below min).
 fn compute_reduced_concurrency(current: usize, min: usize) -> usize {
@@ -43,33 +66,46 @@ fn compute_increased_concurrency(
 
 impl RequestManager {
     /// Wait for a concurrency slot to become available.
-    pub(super) async fn acquire_slot(&self) -> Result<(), RequestError> {
+    ///
+    /// Hot-path classes acquire freely against `effective_concurrent`.
+    /// Sheddable classes (`Recovery` / `Bulk`) additionally observe
+    /// `config.sheddable_max_concurrent` so a catchup / DA-backfill burst
+    /// can never fill the global pool and starve the hot path.
+    pub(super) async fn acquire_slot(&self, class: MessageClass) -> Result<(), RequestError> {
         let start = Instant::now();
         let max_wait = Duration::from_secs(30);
+        let sheddable = uses_relaxed_retry(class);
+        let sheddable_cap = self.config.sheddable_max_concurrent;
 
         loop {
             let current = self.in_flight.load(Ordering::Relaxed);
             let limit = self.effective_concurrent.load(Ordering::Relaxed);
+            let sheddable_now = self.sheddable_in_flight.load(Ordering::Relaxed);
 
-            if current < limit {
-                // Try to acquire slot with CAS
-                if self
+            if would_admit(current, limit, sheddable_now, sheddable_cap, class)
+                && self
                     .in_flight
                     .compare_exchange(current, current + 1, Ordering::SeqCst, Ordering::Relaxed)
                     .is_ok()
-                {
-                    return Ok(());
+            {
+                if sheddable {
+                    self.sheddable_in_flight.fetch_add(1, Ordering::SeqCst);
                 }
-                // CAS failed, another thread got it, loop and retry
+                return Ok(());
             }
 
-            // Check for timeout
             if start.elapsed() > max_wait {
-                warn!(current, limit, "Timed out waiting for concurrency slot");
+                warn!(
+                    current,
+                    limit,
+                    sheddable_now,
+                    sheddable_cap,
+                    ?class,
+                    "Timed out waiting for concurrency slot"
+                );
                 return Err(RequestError::Exhausted { attempts: 0 });
             }
 
-            // Wait a bit before retrying
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
@@ -201,5 +237,78 @@ mod tests {
         // Should get increment=1
         let result = compute_increased_concurrency(48, 64, 0.9, 0.5);
         assert_eq!(result, Some(49));
+    }
+
+    // ── Per-class admission ───────────────────────────────────────────
+
+    #[test]
+    fn admit_hot_below_global_limit() {
+        // Hot classes are admitted as long as the global pool has room.
+        for class in [
+            MessageClass::Consensus,
+            MessageClass::BlockCompletion,
+            MessageClass::CrossShardProgress,
+        ] {
+            assert!(would_admit(0, 64, 0, 16, class));
+            assert!(would_admit(63, 64, 16, 16, class));
+            assert!(!would_admit(64, 64, 0, 16, class));
+        }
+    }
+
+    #[test]
+    fn admit_sheddable_below_subset_cap() {
+        // Sheddable classes admit only while sheddable_in_flight < cap.
+        for class in [MessageClass::Recovery, MessageClass::Bulk] {
+            assert!(would_admit(0, 64, 0, 16, class));
+            assert!(would_admit(20, 64, 15, 16, class));
+            assert!(!would_admit(20, 64, 16, 16, class));
+        }
+    }
+
+    #[test]
+    fn sheddable_flood_does_not_starve_hot() {
+        // The motivating regression: 16 sheddable in-flight (subset cap)
+        // out of 64 global. Hot classes still see 48 slots of headroom.
+        let in_flight = 16;
+        let sheddable_in_flight = 16;
+
+        // Sheddable is now blocked.
+        assert!(!would_admit(
+            in_flight,
+            64,
+            sheddable_in_flight,
+            16,
+            MessageClass::Recovery
+        ));
+        assert!(!would_admit(
+            in_flight,
+            64,
+            sheddable_in_flight,
+            16,
+            MessageClass::Bulk
+        ));
+
+        // Hot path still admitted.
+        for class in [
+            MessageClass::Consensus,
+            MessageClass::BlockCompletion,
+            MessageClass::CrossShardProgress,
+        ] {
+            assert!(would_admit(in_flight, 64, sheddable_in_flight, 16, class));
+        }
+    }
+
+    #[test]
+    fn global_limit_blocks_every_class() {
+        // When the global pool is full, no class is admitted.
+        for class in [
+            MessageClass::Consensus,
+            MessageClass::BlockCompletion,
+            MessageClass::CrossShardProgress,
+            MessageClass::Recovery,
+            MessageClass::Bulk,
+        ] {
+            assert!(!would_admit(64, 64, 0, 16, class));
+        }
     }
 }
