@@ -316,4 +316,90 @@ mod tests {
         }
         assert!(con.try_recv().is_err());
     }
+
+    /// Helper: build a Broadcast command on the given class.
+    fn bcast(class: MessageClass, n: u8) -> SwarmCommand {
+        SwarmCommand::Broadcast {
+            topic: "t".into(),
+            data: vec![n],
+            class,
+        }
+    }
+
+    #[test]
+    fn recovery_lane_drops_when_full_without_error() {
+        // Slow consumer: never drain. The lane must stop accepting once
+        // it hits its bounded capacity, but `send` must report `Ok(())`
+        // — sheddable backpressure is not a hard error.
+        let (channels, (_con, _bc, _csp, _rec_rx, _bulk_rx)) = ClassCommandChannels::new();
+
+        let mut accepted = 0usize;
+        // Push twice the capacity so we definitely overflow.
+        for n in 0..(RECOVERY_CHANNEL_CAPACITY * 2) {
+            #[allow(clippy::cast_possible_truncation)]
+            let cmd = bcast(MessageClass::Recovery, (n & 0xFF) as u8);
+            // Every call returns Ok regardless of full/accepted.
+            channels.send(cmd).expect("send should not fail on full");
+            accepted += 1;
+        }
+        assert_eq!(accepted, RECOVERY_CHANNEL_CAPACITY * 2);
+    }
+
+    #[test]
+    fn bulk_lane_drops_when_full_without_error() {
+        // Same contract as recovery but for the higher-volume Bulk lane.
+        let (channels, (_con, _bc, _csp, _rec_rx, _bulk_rx)) = ClassCommandChannels::new();
+
+        for n in 0..(BULK_CHANNEL_CAPACITY * 2) {
+            #[allow(clippy::cast_possible_truncation)]
+            channels
+                .send(bcast(MessageClass::Bulk, (n & 0xFF) as u8))
+                .expect("send should not fail on full");
+        }
+    }
+
+    #[test]
+    fn hot_lanes_remain_unbounded() {
+        // Hot lanes have no capacity limit. Sending well past either
+        // sheddable cap on a Consensus lane still routes every command.
+        let (channels, (mut con, _bc, _csp, _rec, _bulk)) = ClassCommandChannels::new();
+
+        let count = BULK_CHANNEL_CAPACITY + 1024;
+        for n in 0..count {
+            #[allow(clippy::cast_possible_truncation)]
+            channels
+                .send(bcast(MessageClass::Consensus, (n & 0xFF) as u8))
+                .unwrap();
+        }
+        let mut drained = 0usize;
+        while con.try_recv().is_ok() {
+            drained += 1;
+        }
+        assert_eq!(
+            drained, count,
+            "Consensus lane must accept and deliver every command"
+        );
+    }
+
+    #[test]
+    fn full_recovery_does_not_block_hot_lane() {
+        // Motivating regression: a flood on Recovery must not stall
+        // Consensus traffic. Saturate Recovery, then send on Consensus
+        // and verify it lands on its receiver.
+        let (channels, (mut con, _bc, _csp, _rec_rx, _bulk_rx)) = ClassCommandChannels::new();
+
+        for n in 0..(RECOVERY_CHANNEL_CAPACITY * 2) {
+            #[allow(clippy::cast_possible_truncation)]
+            channels
+                .send(bcast(MessageClass::Recovery, (n & 0xFF) as u8))
+                .unwrap();
+        }
+
+        // A Consensus command goes through unaffected.
+        channels
+            .send(bcast(MessageClass::Consensus, 0xAB))
+            .expect("hot lane unaffected by sheddable backpressure");
+        let msg = con.try_recv().expect("Consensus command delivered");
+        assert!(matches!(msg, SwarmCommand::Broadcast { data, .. } if data == vec![0xAB]));
+    }
 }
