@@ -23,7 +23,7 @@ use hyperscale_core::{NodeInput, ProtocolEvent};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_engine::Engine;
 use hyperscale_messages::request::Inventory;
-use hyperscale_messages::response::{ElidedCertifiedBlock, RehydrateError};
+use hyperscale_messages::response::{ElidedCertifiedBlock, GetBlockResponse, RehydrateError};
 use hyperscale_metrics as metrics;
 use hyperscale_network::{Network, ResponseVerdict};
 use hyperscale_storage::Storage;
@@ -180,7 +180,8 @@ where
             &peers,
             None,
             GetBlockRequest::new(height, target_height).with_inventory(inventory),
-            Box::new(move |result| {
+            None,
+            Box::new(move |result: Result<GetBlockResponse, _>| {
                 match result {
                     Ok(resp) => {
                         let block = resp.into_elided().map(Box::new);

@@ -13,6 +13,7 @@ use hyperscale_core::{NodeInput, ProtocolEvent};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::Engine;
 use hyperscale_messages::request::GetRemoteHeadersRequest;
+use hyperscale_messages::response::GetRemoteHeadersResponse;
 use hyperscale_metrics as metrics;
 use hyperscale_network::{Network, ResponseVerdict};
 use hyperscale_storage::Storage;
@@ -148,7 +149,8 @@ where
                         &peers,
                         None,
                         request,
-                        Box::new(move |result| {
+                        None,
+                        Box::new(move |result: Result<GetRemoteHeadersResponse, _>| {
                             if let Ok(resp) = result {
                                 metrics::record_sync_round_completed("remote_header");
                                 let _ = es.send(NodeInput::RemoteHeadersResponseReceived {

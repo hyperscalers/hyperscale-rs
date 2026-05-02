@@ -5,7 +5,7 @@ use crate::lock_tracker::LockTracker;
 use crate::ready_set::ReadySet;
 use crate::tombstones::TombstoneStore;
 use crate::tx_store::TxStore;
-use hyperscale_core::{Action, FetchAbandon, FetchPeers, FetchRequest, ProtocolEvent};
+use hyperscale_core::{Action, FetchAbandon, FetchOrigin, FetchPeers, FetchRequest, ProtocolEvent};
 use hyperscale_types::{
     BlockHeight, CertifiedBlock, LocalTimestamp, NodeId, RETENTION_HORIZON, RoutableTransaction,
     ShardGroupId, TopologySnapshot, TransactionDecision, TransactionStatus, TxHash,
@@ -627,6 +627,7 @@ impl MempoolCoordinator {
             actions.push(Action::Fetch(FetchRequest::Transactions {
                 ids,
                 peers: FetchPeers::rotation(peers),
+                origin: FetchOrigin::Mempool,
             }));
         }
 
@@ -1311,7 +1312,7 @@ mod tests {
         let fetch = actions
             .iter()
             .find_map(|a| match a {
-                Action::Fetch(FetchRequest::Transactions { ids, peers }) => Some((ids, peers)),
+                Action::Fetch(FetchRequest::Transactions { ids, peers, .. }) => Some((ids, peers)),
                 _ => None,
             })
             .expect("fetch action emitted past grace");
@@ -1346,7 +1347,7 @@ mod tests {
         let fetches: Vec<_> = actions
             .iter()
             .filter_map(|a| match a {
-                Action::Fetch(FetchRequest::Transactions { ids, peers }) => Some((ids, peers)),
+                Action::Fetch(FetchRequest::Transactions { ids, peers, .. }) => Some((ids, peers)),
                 _ => None,
             })
             .collect();

@@ -8,7 +8,8 @@
 //! The `HandlerRegistry` owns SBOR serialization — `Network` impls just forward.
 
 use hyperscale_types::{
-    Bls12381G1PublicKey, NetworkMessage, Request, ShardGroupId, ShardMessage, ValidatorId,
+    Bls12381G1PublicKey, MessageClass, NetworkMessage, Request, ShardGroupId, ShardMessage,
+    ValidatorId,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -221,11 +222,18 @@ pub trait Network: Send + Sync + 'static {
     /// tracker that timeouts use, deprioritizing the serving peer for future
     /// selection. Verdict is ignored on the `Err` path (the network already
     /// recorded the failure).
+    ///
+    /// `class_override` lets the caller demote (or, in principle, promote)
+    /// the message class on a per-call basis. `None` uses the wire type's
+    /// static [`NetworkMessage::class()`]. Bimodal types like
+    /// `GetTransactionsRequest` use this to differentiate hot-path
+    /// pending-block fetches from sync / DA-backfill fetches.
     fn request<R: Request + 'static>(
         &self,
         peers: &[ValidatorId],
         preferred_peer: Option<ValidatorId>,
         request: R,
+        class_override: Option<MessageClass>,
         on_response: Box<dyn FnOnce(Result<R::Response, RequestError>) -> ResponseVerdict + Send>,
     );
 }

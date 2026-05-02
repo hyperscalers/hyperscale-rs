@@ -217,6 +217,7 @@ impl Network for SimNetworkAdapter {
         peers: &[ValidatorId],
         preferred_peer: Option<ValidatorId>,
         request: R,
+        _class_override: Option<hyperscale_types::MessageClass>,
         on_response: Box<dyn FnOnce(Result<R::Response, RequestError>) -> ResponseVerdict + Send>,
     ) {
         let request_bytes =
@@ -350,6 +351,7 @@ mod tests {
             peers,
             preferred,
             GetBlockRequest::new(BlockHeight(42), BlockHeight(42)),
+            None,
             Box::new(|_| ResponseVerdict::Accept),
         );
 
@@ -379,6 +381,7 @@ mod tests {
             &[ValidatorId(1)],
             None,
             GetBlockRequest::new(BlockHeight(1), BlockHeight(1)),
+            None,
             Box::new(move |r| {
                 *result_clone.lock().unwrap() = Some(r);
                 ResponseVerdict::Accept
@@ -412,6 +415,7 @@ mod tests {
             &[ValidatorId(1)],
             None,
             GetBlockRequest::new(BlockHeight(1), BlockHeight(1)),
+            None,
             Box::new(move |r| {
                 *result_clone.lock().unwrap() = Some(r);
                 ResponseVerdict::Accept

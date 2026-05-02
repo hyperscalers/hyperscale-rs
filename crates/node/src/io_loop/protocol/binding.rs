@@ -17,7 +17,7 @@
 use super::fetch::{Fetch, FetchInput};
 use super::host::ProtocolHost;
 use crossbeam::channel::Sender;
-use hyperscale_core::{FetchPeers, NodeInput, ProtocolEvent};
+use hyperscale_core::{FetchOrigin, FetchPeers, NodeInput, ProtocolEvent};
 use hyperscale_messages::request::{
     GetExecutionCertsRequest, GetFinalizedWavesRequest, GetLocalProvisionsRequest,
     GetProvisionsRequest, GetTransactionsRequest,
@@ -61,11 +61,13 @@ pub trait FetchBinding: 'static {
     fn fetch_mut(host: &mut ProtocolHost) -> &mut Fetch<Self::Id>;
 
     /// Send one request covering `ids` and route the response back through
-    /// the event sender. For [`PER_ID`](Self::PER_ID) bindings the dispatcher
-    /// pre-splits into single-element chunks before calling this.
+    /// the event sender. `origin` flows down to `Network::request` as the
+    /// per-call class override. For [`PER_ID`](Self::PER_ID) bindings the
+    /// dispatcher pre-splits into single-element chunks before calling this.
     fn dispatch_chunk<N: Network>(
         ids: Vec<Self::Id>,
         peers: &FetchPeers,
+        origin: FetchOrigin,
         local_shard: ShardGroupId,
         network: &N,
         sender: &Sender<NodeInput>,
@@ -93,6 +95,7 @@ impl FetchBinding for TransactionBinding {
     fn dispatch_chunk<N: Network>(
         ids: Vec<TxHash>,
         peers: &FetchPeers,
+        origin: FetchOrigin,
         _local_shard: ShardGroupId,
         network: &N,
         sender: &Sender<NodeInput>,
@@ -103,6 +106,7 @@ impl FetchBinding for TransactionBinding {
             &peers.peers,
             peers.preferred,
             GetTransactionsRequest::new(ids),
+            origin.class_override(),
             Box::new(move |result| {
                 if let Ok(resp) = result {
                     let txs = resp.into_transactions();
@@ -167,6 +171,7 @@ impl FetchBinding for LocalProvisionBinding {
     fn dispatch_chunk<N: Network>(
         ids: Vec<ProvisionHash>,
         peers: &FetchPeers,
+        origin: FetchOrigin,
         _local_shard: ShardGroupId,
         network: &N,
         sender: &Sender<NodeInput>,
@@ -177,6 +182,7 @@ impl FetchBinding for LocalProvisionBinding {
             &peers.peers,
             peers.preferred,
             GetLocalProvisionsRequest::new(ids),
+            origin.class_override(),
             Box::new(move |result| {
                 if let Ok(resp) = result {
                     let delivered: std::collections::HashSet<ProvisionHash> =
@@ -229,6 +235,7 @@ impl FetchBinding for FinalizedWaveBinding {
     fn dispatch_chunk<N: Network>(
         ids: Vec<WaveIdHash>,
         peers: &FetchPeers,
+        origin: FetchOrigin,
         _local_shard: ShardGroupId,
         network: &N,
         sender: &Sender<NodeInput>,
@@ -239,6 +246,7 @@ impl FetchBinding for FinalizedWaveBinding {
             &peers.peers,
             peers.preferred,
             GetFinalizedWavesRequest::new(ids),
+            origin.class_override(),
             Box::new(move |result| {
                 if let Ok(resp) = result {
                     let returned = resp.waves.len();
@@ -292,6 +300,7 @@ impl FetchBinding for ExecCertBinding {
     fn dispatch_chunk<N: Network>(
         ids: Vec<WaveId>,
         peers: &FetchPeers,
+        origin: FetchOrigin,
         _local_shard: ShardGroupId,
         network: &N,
         sender: &Sender<NodeInput>,
@@ -302,6 +311,7 @@ impl FetchBinding for ExecCertBinding {
             &peers.peers,
             peers.preferred,
             GetExecutionCertsRequest { wave_ids: ids },
+            origin.class_override(),
             Box::new(move |result| {
                 if let Ok(response) = result {
                     match response.certificates {
@@ -366,6 +376,7 @@ impl FetchBinding for ProvisionBinding {
     fn dispatch_chunk<N: Network>(
         ids: Vec<(ShardGroupId, BlockHeight)>,
         peers: &FetchPeers,
+        origin: FetchOrigin,
         local_shard: ShardGroupId,
         network: &N,
         sender: &Sender<NodeInput>,
@@ -383,6 +394,7 @@ impl FetchBinding for ProvisionBinding {
             &peers.peers,
             peers.preferred,
             request,
+            origin.class_override(),
             Box::new(move |result| {
                 let Ok(response) = result else {
                     let _ = es.send(NodeInput::ProvisionsFetchFailed {

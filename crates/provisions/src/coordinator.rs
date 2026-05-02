@@ -16,7 +16,7 @@ use crate::pipeline::ProvisionPipeline;
 use crate::queue::QueuedProvisionBuffer;
 use crate::store::ProvisionStore;
 use crate::verified_headers::VerifiedHeaderBuffer;
-use hyperscale_core::{Action, FetchAbandon, FetchPeers, FetchRequest, ProtocolEvent};
+use hyperscale_core::{Action, FetchAbandon, FetchOrigin, FetchPeers, FetchRequest, ProtocolEvent};
 use hyperscale_types::{
     BlockHeight, CommittedBlockHeader, Hash, LocalTimestamp, ProvisionHash, ProvisionTxRoot,
     Provisions, RETENTION_HORIZON, ShardGroupId, TopologySnapshot, compute_padded_merkle_root,
@@ -264,6 +264,7 @@ impl ProvisionCoordinator {
                                 .filter(|p| *p != effect.proposer)
                                 .collect(),
                         ),
+                        origin: FetchOrigin::CrossShard,
                     })
                 }),
         );
@@ -334,6 +335,7 @@ impl ProvisionCoordinator {
                             .filter(|p| *p != effect.proposer)
                             .collect(),
                     ),
+                    origin: FetchOrigin::CrossShard,
                 })
             })
             .collect()
@@ -1444,6 +1446,7 @@ mod tests {
                 source_shard,
                 block_height,
                 peers,
+                ..
             }) if *source_shard == ShardGroupId(1)
                 && *block_height == BlockHeight(10)
                 && peers.preferred == Some(ValidatorId(0))

@@ -2,7 +2,7 @@
 //!
 //! Tracks blocks being assembled from headers + gossiped transactions + finalized waves.
 
-use hyperscale_core::{Action, FetchPeers, FetchRequest};
+use hyperscale_core::{Action, FetchOrigin, FetchPeers, FetchRequest};
 #[cfg(test)]
 use hyperscale_types::Hash;
 use hyperscale_types::{
@@ -368,6 +368,7 @@ pub fn check_fetches(
             actions.push(Action::Fetch(FetchRequest::Transactions {
                 ids: missing_txs,
                 peers: FetchPeers::with_preferred(proposer, local_committee.clone()),
+                origin: FetchOrigin::PendingBlock,
             }));
         }
 
@@ -383,6 +384,7 @@ pub fn check_fetches(
             actions.push(Action::Fetch(FetchRequest::LocalProvisions {
                 ids: missing_provisions,
                 peers: FetchPeers::with_preferred(proposer, local_committee.clone()),
+                origin: FetchOrigin::PendingBlock,
             }));
         }
 
@@ -398,6 +400,7 @@ pub fn check_fetches(
             actions.push(Action::Fetch(FetchRequest::FinalizedWaves {
                 ids: missing_waves,
                 peers: FetchPeers::with_preferred(proposer, local_committee),
+                origin: FetchOrigin::PendingBlock,
             }));
         }
     }

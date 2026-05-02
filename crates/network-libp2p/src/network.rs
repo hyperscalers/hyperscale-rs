@@ -162,6 +162,7 @@ impl Network for Libp2pNetwork {
         peers: &[ValidatorId],
         preferred_peer: Option<ValidatorId>,
         request: R,
+        class_override: Option<hyperscale_types::MessageClass>,
         on_response: Box<dyn FnOnce(Result<R::Response, RequestError>) -> ResponseVerdict + Send>,
     ) {
         // Resolve ValidatorIds → PeerIds via the adapter's global registry
@@ -195,7 +196,7 @@ impl Network for Libp2pNetwork {
         }
 
         let preferred_libp2p = preferred_peer.and_then(|v| self.validator_peer_id(v));
-        let class = R::class();
+        let class = class_override.unwrap_or_else(R::class);
 
         // SBOR-encode the request
         let request_bytes = match sbor::basic_encode(&request) {

@@ -437,27 +437,42 @@ where
     /// `drive_fetch::<B>`. The tick timer is refreshed once at the end.
     fn process_fetch_request(&mut self, req: FetchRequest) {
         match req {
-            FetchRequest::Transactions { ids, peers } => {
-                self.drive_fetch::<TransactionBinding>(FetchInput::Request { ids, peers });
+            FetchRequest::Transactions { ids, peers, origin } => {
+                self.drive_fetch::<TransactionBinding>(FetchInput::Request { ids, peers, origin });
             }
-            FetchRequest::LocalProvisions { ids, peers } => {
-                self.drive_fetch::<LocalProvisionBinding>(FetchInput::Request { ids, peers });
+            FetchRequest::LocalProvisions { ids, peers, origin } => {
+                self.drive_fetch::<LocalProvisionBinding>(FetchInput::Request {
+                    ids,
+                    peers,
+                    origin,
+                });
             }
-            FetchRequest::FinalizedWaves { ids, peers } => {
-                self.drive_fetch::<FinalizedWaveBinding>(FetchInput::Request { ids, peers });
+            FetchRequest::FinalizedWaves { ids, peers, origin } => {
+                self.drive_fetch::<FinalizedWaveBinding>(FetchInput::Request {
+                    ids,
+                    peers,
+                    origin,
+                });
             }
             FetchRequest::RemoteProvisions {
                 source_shard,
                 block_height,
                 peers,
+                origin,
             } => self.drive_fetch::<ProvisionBinding>(FetchInput::Request {
                 ids: vec![(source_shard, block_height)],
                 peers,
+                origin,
             }),
-            FetchRequest::ExecutionCerts { wave_id, peers } => {
+            FetchRequest::ExecutionCerts {
+                wave_id,
+                peers,
+                origin,
+            } => {
                 self.drive_fetch::<ExecCertBinding>(FetchInput::Request {
                     ids: vec![wave_id],
                     peers,
+                    origin,
                 });
             }
         }

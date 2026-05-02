@@ -11,8 +11,48 @@
 //! key (no id-set to enumerate).
 
 use hyperscale_types::{
-    BlockHeight, ProvisionHash, ShardGroupId, TxHash, ValidatorId, WaveId, WaveIdHash,
+    BlockHeight, MessageClass, ProvisionHash, ShardGroupId, TxHash, ValidatorId, WaveId, WaveIdHash,
 };
+
+/// Why a fetch was issued.
+///
+/// Maps to a [`MessageClass`] override at the network layer so the same
+/// wire type (e.g. `GetTransactionsRequest`) can be issued with different
+/// urgency depending on the caller's context.
+///
+/// Most call sites match the wire type's static `NetworkMessage::class()`,
+/// so the override is `None`. The override fires when the caller is *less
+/// urgent* than the static default — e.g. the mempool DA-backfill path
+/// issues `GetTransactionsRequest` (statically `BlockCompletion`) but
+/// should be treated as `Recovery`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum FetchOrigin {
+    /// Pending-block voting path (BFT pending state machine). Hot path —
+    /// loss extends the current voting window.
+    PendingBlock,
+    /// Cross-shard execution dependency (provisions / EC fallback). Stalls
+    /// cross-shard execution but local consensus continues.
+    CrossShard,
+    /// Mempool DA-backfill — best-effort propagation of txs the mempool
+    /// missed via gossip. No live BFT round depends on this.
+    Mempool,
+    /// Sync / catch-up — node behind, recovering toward live state.
+    Sync,
+}
+
+impl FetchOrigin {
+    /// Class override for [`Network::request`](hyperscale_network::Network).
+    ///
+    /// `None` keeps the wire type's static `NetworkMessage::class()`; `Some`
+    /// demotes to a less-urgent class for catch-up / best-effort traffic.
+    #[must_use]
+    pub const fn class_override(self) -> Option<MessageClass> {
+        match self {
+            Self::PendingBlock | Self::CrossShard => None,
+            Self::Mempool | Self::Sync => Some(MessageClass::Recovery),
+        }
+    }
+}
 
 /// Peer pool plus an optional canonical-source hint.
 ///
@@ -64,6 +104,8 @@ pub enum FetchRequest {
         /// Peer pool. BFT-path emitters set `preferred = Some(proposer)`;
         /// the mempool DA path uses `None`.
         peers: FetchPeers,
+        /// Why this fetch was issued; drives the network class override.
+        origin: FetchOrigin,
     },
     /// Local-provision fetch by id.
     LocalProvisions {
@@ -71,6 +113,8 @@ pub enum FetchRequest {
         ids: Vec<ProvisionHash>,
         /// Peer pool. BFT-path emitters set `preferred = Some(proposer)`.
         peers: FetchPeers,
+        /// Why this fetch was issued; drives the network class override.
+        origin: FetchOrigin,
     },
     /// Finalized-wave fetch by id.
     FinalizedWaves {
@@ -78,6 +122,8 @@ pub enum FetchRequest {
         ids: Vec<WaveIdHash>,
         /// Peer pool. BFT-path emitters set `preferred = Some(proposer)`.
         peers: FetchPeers,
+        /// Why this fetch was issued; drives the network class override.
+        origin: FetchOrigin,
     },
     /// Cross-shard provisions fetch (`ScopeFetch` keyed by
     /// `(ShardGroupId, BlockHeight)`).
@@ -89,6 +135,8 @@ pub enum FetchRequest {
         /// Source-shard peer pool. `preferred = Some(source-block proposer)`
         /// — they originated the provisions.
         peers: FetchPeers,
+        /// Why this fetch was issued; drives the network class override.
+        origin: FetchOrigin,
     },
     /// Cross-shard execution-cert fetch by `WaveId`.
     ExecutionCerts {
@@ -98,5 +146,7 @@ pub enum FetchRequest {
         /// designated broadcaster role is computable but the network's
         /// health-weighted selection works equally well empirically.
         peers: FetchPeers,
+        /// Why this fetch was issued; drives the network class override.
+        origin: FetchOrigin,
     },
 }

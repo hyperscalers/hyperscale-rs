@@ -19,7 +19,7 @@
 //! request; the chunking machinery handles that as a special case of a
 //! one-element batch.
 
-use hyperscale_core::FetchPeers;
+use hyperscale_core::{FetchOrigin, FetchPeers};
 use hyperscale_metrics as metrics;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
@@ -51,12 +51,16 @@ impl Default for FetchConfig {
 #[derive(Debug)]
 pub enum FetchInput<Id> {
     /// Request `ids` using `peers`. Idempotent: ids already pending keep
-    /// their existing peer pool; new ids are added with the supplied one.
+    /// their existing peer pool / origin; new ids are added with the supplied
+    /// pair.
     Request {
         /// Ids to fetch.
         ids: Vec<Id>,
         /// Peer pool / canonical-source hint for these ids' network requests.
         peers: FetchPeers,
+        /// Why the fetch is being issued. Drives the message-class override
+        /// when the binding ultimately calls `Network::request`.
+        origin: FetchOrigin,
     },
     /// A network attempt for `ids` failed (or returned an unusable response);
     /// reclaim them for retry on the next tick.
@@ -88,18 +92,23 @@ pub enum FetchInput<Id> {
 pub enum FetchOutput<Id> {
     /// Issue a network request for `ids` against `peers`. The output handler
     /// translates this into `Network::request(&peers.peers, peers.preferred,
-    /// ..)`. The network's health-weighted selector picks the actual target.
+    /// .., origin.class_override(), ..)`. The network's health-weighted
+    /// selector picks the actual target.
     Send {
         /// Ids in this chunk.
         ids: Vec<Id>,
         /// Peer pool for the request.
         peers: FetchPeers,
+        /// Origin shared by every id in this chunk; chunks are grouped by
+        /// `(peers, origin)` so this is well-defined.
+        origin: FetchOrigin,
     },
 }
 
 #[derive(Debug)]
 struct Entry {
     peers: Arc<FetchPeers>,
+    origin: FetchOrigin,
     in_flight: bool,
 }
 
@@ -110,6 +119,15 @@ enum DropKind {
     Admitted,
     Abandoned,
 }
+
+/// Group key for ready ids during chunk assembly: same peer pool *and*
+/// same origin coalesce; different origins emit separate `Send`s so they
+/// can carry distinct `MessageClass` overrides downstream.
+type GroupKey = (FetchPeers, FetchOrigin);
+
+/// Group value: shared peer pool, the origin all ids in the group share,
+/// and the ids themselves.
+type GroupValue<Id> = (Arc<FetchPeers>, FetchOrigin, Vec<Id>);
 
 /// Id-keyed fetch state machine.
 pub struct Fetch<Id: Eq + Hash + Ord + Clone> {
@@ -136,7 +154,7 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
     /// Process an input and return outputs.
     pub fn handle(&mut self, input: FetchInput<Id>) -> Vec<FetchOutput<Id>> {
         match input {
-            FetchInput::Request { ids, peers } => self.handle_request(ids, peers),
+            FetchInput::Request { ids, peers, origin } => self.handle_request(ids, peers, origin),
             FetchInput::Failed { ids } => self.handle_failed(&ids),
             FetchInput::Admitted { ids } => self.handle_drop(&ids, DropKind::Admitted),
             FetchInput::Abandoned { ids } => self.handle_drop(&ids, DropKind::Abandoned),
@@ -162,7 +180,12 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
         self.pending.len()
     }
 
-    fn handle_request(&mut self, ids: Vec<Id>, peers: FetchPeers) -> Vec<FetchOutput<Id>> {
+    fn handle_request(
+        &mut self,
+        ids: Vec<Id>,
+        peers: FetchPeers,
+        origin: FetchOrigin,
+    ) -> Vec<FetchOutput<Id>> {
         if ids.is_empty() {
             return vec![];
         }
@@ -173,6 +196,7 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
                 added += 1;
                 Entry {
                     peers: Arc::clone(&shared),
+                    origin,
                     in_flight: false,
                 }
             });
@@ -224,12 +248,14 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
             return vec![];
         }
 
-        // Group ready ids by peer-pool *content*. Two `Request` calls that
-        // carry identical `FetchPeers` end up with distinct `Arc`s but should
-        // still coalesce into one `Send` — keying by Arc identity defeats
-        // batching for callers that emit single-id Actions (e.g. exec-cert,
-        // remote-provision).
-        let mut groups: HashMap<FetchPeers, (Arc<FetchPeers>, Vec<Id>)> = HashMap::new();
+        // Group ready ids by `(peer-pool content, origin)`. Two `Request`
+        // calls that carry identical `FetchPeers` end up with distinct `Arc`s
+        // but should still coalesce into one `Send` — keying by Arc identity
+        // defeats batching for callers that emit single-id Actions
+        // (e.g. exec-cert, remote-provision). Origins differ in network
+        // class, so two ids requested with the same peers but different
+        // origins issue as separate `Send`s.
+        let mut groups: HashMap<GroupKey, GroupValue<Id>> = HashMap::new();
         let mut taken = 0usize;
         for (id, entry) in &self.pending {
             if taken >= global_room {
@@ -239,26 +265,27 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
                 continue;
             }
             groups
-                .entry((*entry.peers).clone())
-                .or_insert_with(|| (Arc::clone(&entry.peers), Vec::new()))
-                .1
+                .entry(((*entry.peers).clone(), entry.origin))
+                .or_insert_with(|| (Arc::clone(&entry.peers), entry.origin, Vec::new()))
+                .2
                 .push(id.clone());
             taken += 1;
         }
 
         // Iterate groups in sorted order for deterministic test output.
-        let mut group_order: Vec<FetchPeers> = groups.keys().cloned().collect();
+        let mut group_order: Vec<GroupKey> = groups.keys().cloned().collect();
         group_order.sort_unstable_by(|a, b| {
-            a.preferred
+            a.0.preferred
                 .map(|v| v.0)
-                .cmp(&b.preferred.map(|v| v.0))
-                .then_with(|| a.peers.cmp(&b.peers))
+                .cmp(&b.0.preferred.map(|v| v.0))
+                .then_with(|| a.0.peers.cmp(&b.0.peers))
+                .then_with(|| a.1.cmp(&b.1))
         });
 
         let mut outputs = Vec::new();
         let mut chunks_emitted = 0usize;
         'outer: for key in group_order {
-            let (peers, ids) = groups.remove(&key).expect("key just collected");
+            let (peers, origin, ids) = groups.remove(&key).expect("key just collected");
             for chunk in ids.chunks(self.config.max_ids_per_request) {
                 if chunks_emitted >= self.config.parallel_chunks_per_tick {
                     break 'outer;
@@ -271,6 +298,7 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
                 outputs.push(FetchOutput::Send {
                     ids: chunk.to_vec(),
                     peers: (*peers).clone(),
+                    origin,
                 });
                 chunks_emitted += 1;
             }
@@ -310,6 +338,7 @@ mod tests {
         p.handle(FetchInput::Request {
             ids: vec![tx(1), tx(2), tx(3), tx(4), tx(5)],
             peers: pinned(vid(1)),
+            origin: FetchOrigin::PendingBlock,
         });
 
         let out = p.handle(FetchInput::Tick);
@@ -327,6 +356,7 @@ mod tests {
         p.handle(FetchInput::Request {
             ids: vec![tx(1), tx(2)],
             peers: pinned(vid(1)),
+            origin: FetchOrigin::PendingBlock,
         });
         let out = p.handle(FetchInput::Tick);
         assert_eq!(out.len(), 1);
@@ -346,6 +376,7 @@ mod tests {
         p.handle(FetchInput::Request {
             ids: vec![tx(1), tx(2)],
             peers: pinned(vid(1)),
+            origin: FetchOrigin::PendingBlock,
         });
         p.handle(FetchInput::Tick);
 
@@ -368,6 +399,7 @@ mod tests {
         p.handle(FetchInput::Request {
             ids: vec![tx(1), tx(2)],
             peers: pinned(vid(1)),
+            origin: FetchOrigin::PendingBlock,
         });
         p.handle(FetchInput::Tick);
 
@@ -383,10 +415,12 @@ mod tests {
         p.handle(FetchInput::Request {
             ids: vec![tx(1)],
             peers: pinned(vid(1)),
+            origin: FetchOrigin::PendingBlock,
         });
         p.handle(FetchInput::Request {
             ids: vec![tx(1), tx(2)],
             peers: pinned(vid(2)),
+            origin: FetchOrigin::PendingBlock,
         });
         let out = p.handle(FetchInput::Tick);
         assert_eq!(out.len(), 2);
@@ -423,6 +457,7 @@ mod tests {
             p.handle(FetchInput::Request {
                 ids: vec![tx(n)],
                 peers: pinned(vid(1)),
+                origin: FetchOrigin::PendingBlock,
             });
         }
         let out = p.handle(FetchInput::Tick);
@@ -444,6 +479,7 @@ mod tests {
         p.handle(FetchInput::Request {
             ids: (0..30).map(tx).collect(),
             peers: pinned(vid(1)),
+            origin: FetchOrigin::PendingBlock,
         });
         let out = p.handle(FetchInput::Tick);
         assert_eq!(out.len(), 1);
@@ -464,6 +500,7 @@ mod tests {
         p.handle(FetchInput::Request {
             ids: (0..10).map(tx).collect(),
             peers: pinned(vid(1)),
+            origin: FetchOrigin::PendingBlock,
         });
         p.handle(FetchInput::Tick);
         assert_eq!(p.in_flight_count(), 3, "global cap honoured");

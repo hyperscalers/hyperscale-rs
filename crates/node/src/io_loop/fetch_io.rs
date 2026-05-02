@@ -29,19 +29,27 @@ where
         use crate::io_loop::protocol::fetch::FetchOutput;
 
         let local_shard = self.topology_snapshot.load().local_shard();
-        for FetchOutput::Send { ids, peers } in outputs {
+        for FetchOutput::Send { ids, peers, origin } in outputs {
             if B::PER_ID {
                 for id in ids {
                     B::dispatch_chunk(
                         vec![id],
                         &peers,
+                        origin,
                         local_shard,
                         &*self.network,
                         &self.event_sender,
                     );
                 }
             } else {
-                B::dispatch_chunk(ids, &peers, local_shard, &*self.network, &self.event_sender);
+                B::dispatch_chunk(
+                    ids,
+                    &peers,
+                    origin,
+                    local_shard,
+                    &*self.network,
+                    &self.event_sender,
+                );
             }
         }
     }
@@ -54,11 +62,12 @@ where
         input: crate::io_loop::protocol::fetch::FetchInput<B::Id>,
     ) {
         use crate::io_loop::protocol::fetch::FetchInput;
-        if let FetchInput::Request { ids, peers } = &input {
+        if let FetchInput::Request { ids, peers, origin } = &input {
             tracing::trace!(
                 binding = B::NAME,
                 ids = ids.len(),
                 peer_count = peers.peers.len() + usize::from(peers.preferred.is_some()),
+                origin = ?origin,
                 "Dispatching fetch request"
             );
         }
