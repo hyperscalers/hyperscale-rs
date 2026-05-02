@@ -2,14 +2,15 @@
 //!
 //! The filter exists so a sync requester can tell the responder which
 //! transactions / certificates / provisions it already has locally, letting
-//! the responder elide those bodies from the response. All items inserted
-//! are already 32-byte cryptographic hashes ([`TypedHash`]), so no hashing
-//! is performed here — probes are derived directly from the item bytes via
+//! the responder elide those bodies from the response. Each item produces a
+//! 16-byte seed via the [`BloomKey`] trait — for [`TypedHash`] items the
+//! seed is the first 16 bytes of the hash (free); for structured ids like
+//! `WaveId` the seed is derived from the id's identity hash. Probes use
 //! Kirsch-Mitzenmacher double-hashing (same FPR as independent hashes; see
 //! Kirsch & Mitzenmacher, "Less Hashing, Same Performance", 2006).
 //!
 //! The phantom [`T`] tags the filter with the item kind so
-//! `BloomFilter<TxHash>` can't be confused with `BloomFilter<WaveIdHash>`
+//! `BloomFilter<TxHash>` can't be confused with `BloomFilter<WaveId>`
 //! at a call site. The wire format is identical regardless of `T`.
 //!
 //! Sizing: callers construct via [`BloomFilter::with_capacity`] supplying
@@ -29,6 +30,27 @@
 use std::marker::PhantomData;
 
 use crate::TypedHash;
+
+/// Seed source for [`BloomFilter`] entries. Produces the 16-byte seed that
+/// double-hashing splits into the two `u64`s used to derive bit probes.
+///
+/// For [`TypedHash`] items the seed is the first 16 bytes of the underlying
+/// 32-byte hash — free, since the bytes are already a cryptographic hash.
+/// For structured identifiers (e.g. [`WaveId`](crate::WaveId)) the impl
+/// derives the seed from the id's own identity hash.
+pub trait BloomKey {
+    /// Return the 16-byte seed used to derive the filter's bit probes.
+    fn bloom_seed(&self) -> [u8; 16];
+}
+
+impl<T: TypedHash> BloomKey for T {
+    fn bloom_seed(&self) -> [u8; 16] {
+        let bytes = self.as_raw().as_bytes();
+        let mut out = [0u8; 16];
+        out.copy_from_slice(&bytes[0..16]);
+        out
+    }
+}
 
 /// Default target false-positive rate (1%).
 pub const DEFAULT_FPR: f64 = 0.01;
@@ -101,11 +123,11 @@ impl<T> BloomFilter<T> {
     }
 }
 
-impl<T: TypedHash> BloomFilter<T> {
-    /// Insert an item. Items are already cryptographic hashes; probes come
-    /// straight from the item bytes with no rehashing.
+impl<T: BloomKey> BloomFilter<T> {
+    /// Insert an item. The item's [`BloomKey::bloom_seed`] supplies the
+    /// 16-byte material the probes are derived from.
     pub fn insert(&mut self, item: &T) {
-        let (h1, h2) = split_hash(item);
+        let (h1, h2) = split_seed(&item.bloom_seed());
         let m = self.bit_len() as u64;
         for i in 0..u64::from(self.k) {
             let bit = probe(h1, h2, i, m);
@@ -119,7 +141,7 @@ impl<T: TypedHash> BloomFilter<T> {
     /// actually inserted into *this* instance; false positives occur at the
     /// configured FPR when populated to capacity.
     pub fn contains(&self, item: &T) -> bool {
-        let (h1, h2) = split_hash(item);
+        let (h1, h2) = split_seed(&item.bloom_seed());
         let m = self.bit_len() as u64;
         for i in 0..u64::from(self.k) {
             let bit = probe(h1, h2, i, m);
@@ -157,14 +179,12 @@ fn size_for(n: usize, fpr: f64) -> Option<(usize, u8)> {
     Some((m_bits, k))
 }
 
-/// Split a 32-byte typed hash into two `u64` halves. The low 16 bytes are
-/// used; the upper 16 are unused but available for future variants.
+/// Split a 16-byte seed into two `u64` halves used by double-hashing.
 /// Bit 0 of `h2` is forced set so `i * h2` steps through every residue
 /// class of `m` (avoids short probe cycles when `m` is a power of two).
-fn split_hash<T: TypedHash>(item: &T) -> (u64, u64) {
-    let bytes = item.as_raw().as_bytes();
-    let h1 = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-    let h2 = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) | 1;
+fn split_seed(seed: &[u8; 16]) -> (u64, u64) {
+    let h1 = u64::from_le_bytes(seed[0..8].try_into().unwrap());
+    let h2 = u64::from_le_bytes(seed[8..16].try_into().unwrap()) | 1;
     (h1, h2)
 }
 
@@ -261,7 +281,7 @@ impl<T> sbor::Describe<sbor::NoCustomTypeKind> for BloomFilter<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Hash, TxHash, WaveIdHash};
+    use crate::{Hash, ProvisionHash, TxHash};
     use sbor::{basic_decode, basic_encode};
 
     fn tx(n: u64) -> TxHash {
@@ -343,8 +363,8 @@ mod tests {
         // Same wire bytes regardless of tag; the tag is a source-level label.
         let bf_tx: BloomFilter<TxHash> = BloomFilter::empty();
         let bytes_tx = basic_encode(&bf_tx).unwrap();
-        let bf_wave: BloomFilter<WaveIdHash> = BloomFilter::empty();
-        let bytes_wave = basic_encode(&bf_wave).unwrap();
-        assert_eq!(bytes_tx, bytes_wave);
+        let bf_prov: BloomFilter<ProvisionHash> = BloomFilter::empty();
+        let bytes_prov = basic_encode(&bf_prov).unwrap();
+        assert_eq!(bytes_tx, bytes_prov);
     }
 }

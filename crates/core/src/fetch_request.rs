@@ -11,7 +11,7 @@
 //! key (no id-set to enumerate).
 
 use hyperscale_types::{
-    BlockHeight, MessageClass, ProvisionHash, ShardGroupId, TxHash, ValidatorId, WaveId, WaveIdHash,
+    BlockHeight, MessageClass, ProvisionHash, ShardGroupId, TxHash, ValidatorId, WaveId,
 };
 
 /// Why a fetch was issued.
@@ -118,8 +118,8 @@ pub enum FetchRequest {
     },
     /// Finalized-wave fetch by id.
     FinalizedWaves {
-        /// Wave-id hashes to fetch.
-        ids: Vec<WaveIdHash>,
+        /// Wave ids to fetch.
+        ids: Vec<WaveId>,
         /// Peer pool. BFT-path emitters set `preferred = Some(proposer)`.
         peers: FetchPeers,
         /// Why this fetch was issued; drives the network class override.

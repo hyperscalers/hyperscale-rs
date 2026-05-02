@@ -6,7 +6,7 @@ use crate::core::RocksDbStorage;
 use hyperscale_metrics as metrics;
 use hyperscale_types::{
     Block, BlockHeight, BlockMetadata, CertifiedBlock, FinalizedWave, Hash, ProvisionHash,
-    QuorumCertificate, RoutableTransaction, TxHash, WaveCertificate, WaveIdHash,
+    QuorumCertificate, RoutableTransaction, TxHash, WaveCertificate, WaveId,
 };
 use rocksdb::{WriteBatch, WriteOptions};
 use std::sync::Arc;
@@ -110,11 +110,7 @@ impl RocksDbStorage {
             );
         }
         for fw in block.certificates() {
-            self.cf_put::<CertificatesCf>(
-                batch,
-                fw.wave_id().hash().as_raw(),
-                fw.certificate.as_ref(),
-            );
+            self.cf_put::<CertificatesCf>(batch, fw.wave_id(), fw.certificate.as_ref());
         }
     }
 
@@ -148,13 +144,13 @@ impl RocksDbStorage {
         }
 
         // 3. Batch-fetch certificates (preserving order)
-        let certs = self.get_certificates_batch_ordered(&metadata.manifest.cert_hashes);
+        let certs = self.get_certificates_batch_ordered(&metadata.manifest.cert_ids);
 
         // Verify we got ALL certificates - return None if any are missing
-        if certs.len() != metadata.manifest.cert_hashes.len() {
+        if certs.len() != metadata.manifest.cert_ids.len() {
             tracing::warn!(
                 height = height.0,
-                expected = metadata.manifest.cert_hashes.len(),
+                expected = metadata.manifest.cert_ids.len(),
                 found = certs.len(),
                 "Block has missing certificates - cannot serve sync request"
             );
@@ -258,13 +254,13 @@ impl RocksDbStorage {
         }
 
         // 3. Try to batch-fetch certificates (preserving order)
-        let certs = self.get_certificates_batch_ordered(&metadata.manifest.cert_hashes);
+        let certs = self.get_certificates_batch_ordered(&metadata.manifest.cert_ids);
 
         // Check if all certificates are present - if not, return None
-        if certs.len() != metadata.manifest.cert_hashes.len() {
+        if certs.len() != metadata.manifest.cert_ids.len() {
             tracing::debug!(
                 height = height.0,
-                expected = metadata.manifest.cert_hashes.len(),
+                expected = metadata.manifest.cert_ids.len(),
                 found = certs.len(),
                 "Block has missing certificates - cannot serve sync request"
             );
@@ -336,26 +332,25 @@ impl RocksDbStorage {
             .collect()
     }
 
-    /// Get multiple certificates by hash, preserving order.
+    /// Get multiple certificates by `WaveId`, preserving order.
     ///
     /// Unlike `get_certificates_batch`, this returns results in the same order
-    /// as the input hashes, with missing entries causing the result to be shorter.
+    /// as the input ids, with missing entries causing the result to be shorter.
     /// Callers should check that the result length matches the input length.
-    fn get_certificates_batch_ordered(&self, hashes: &[WaveIdHash]) -> Vec<Arc<WaveCertificate>> {
-        if hashes.is_empty() {
+    fn get_certificates_batch_ordered(&self, ids: &[WaveId]) -> Vec<Arc<WaveCertificate>> {
+        if ids.is_empty() {
             return vec![];
         }
 
-        let raw: Vec<Hash> = hashes.iter().map(|h| h.into_raw()).collect();
-        let results = self.cf_multi_get::<CertificatesCf>(&raw);
+        let results = self.cf_multi_get::<CertificatesCf>(ids);
 
         results
             .into_iter()
-            .zip(hashes.iter())
-            .filter_map(|(result, hash)| {
+            .zip(ids.iter())
+            .filter_map(|(result, id)| {
                 result.map_or_else(
                     || {
-                        tracing::trace!(?hash, "Certificate not found in storage");
+                        tracing::trace!(?id, "Certificate not found in storage");
                         None
                     },
                     |cert| Some(Arc::new(cert)),
@@ -434,27 +429,26 @@ impl RocksDbStorage {
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Store a wave certificate.
-    pub fn put_certificate(&self, hash: &WaveIdHash, cert: &WaveCertificate) {
-        self.cf_put_sync::<CertificatesCf>(hash.as_raw(), cert);
+    pub fn put_certificate(&self, id: &WaveId, cert: &WaveCertificate) {
+        self.cf_put_sync::<CertificatesCf>(id, cert);
     }
 
-    /// Get a wave certificate by `wave_id` hash.
-    pub fn get_certificate(&self, hash: &WaveIdHash) -> Option<WaveCertificate> {
-        self.cf_get::<CertificatesCf>(hash.as_raw())
+    /// Get a wave certificate by `WaveId`.
+    pub fn get_certificate(&self, id: &WaveId) -> Option<WaveCertificate> {
+        self.cf_get::<CertificatesCf>(id)
     }
 
-    /// Get multiple certificates by hash (batch read).
+    /// Get multiple certificates by `WaveId` (batch read).
     ///
     /// Uses `RocksDB`'s `multi_get_cf` for efficient batch retrieval.
-    /// Returns only certificates that were found (missing hashes are skipped).
-    pub fn get_certificates_batch(&self, hashes: &[WaveIdHash]) -> Vec<WaveCertificate> {
-        if hashes.is_empty() {
+    /// Returns only certificates that were found (missing ids are skipped).
+    pub fn get_certificates_batch(&self, ids: &[WaveId]) -> Vec<WaveCertificate> {
+        if ids.is_empty() {
             return vec![];
         }
 
         let start = Instant::now();
-        let raw: Vec<Hash> = hashes.iter().map(|h| h.into_raw()).collect();
-        let results = self.cf_multi_get::<CertificatesCf>(&raw);
+        let results = self.cf_multi_get::<CertificatesCf>(ids);
         let certs: Vec<_> = results.into_iter().flatten().collect();
 
         let elapsed = start.elapsed().as_secs_f64();
@@ -478,7 +472,7 @@ impl RocksDbStorage {
     /// certificate and state writes, the node's state will diverge from the network.
     #[cfg(test)]
     #[instrument(level = Level::DEBUG, skip_all, fields(
-        wave_hash = %certificate.wave_id.hash(),
+        wave_id = ?certificate.wave_id,
         latency_us = tracing::field::Empty,
         otel.kind = "INTERNAL",
     ))]
@@ -492,7 +486,7 @@ impl RocksDbStorage {
         let mut write_count = 0usize;
 
         // 1. Serialize and add certificate to batch
-        self.cf_put::<CertificatesCf>(&mut batch, certificate.wave_id.hash().as_raw(), certificate);
+        self.cf_put::<CertificatesCf>(&mut batch, &certificate.wave_id, certificate);
         write_count += 1;
 
         // 2. Append substate writes to the cert batch at the current
@@ -523,7 +517,7 @@ impl RocksDbStorage {
         );
 
         tracing::debug!(
-            wave_hash = %certificate.wave_id.hash(),
+            wave_id = ?certificate.wave_id,
             write_count,
             "Certificate state writes committed (JMT deferred to block commit)"
         );

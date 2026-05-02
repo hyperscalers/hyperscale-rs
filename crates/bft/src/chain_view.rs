@@ -14,7 +14,7 @@
 use hyperscale_types::Hash;
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, ProvisionHash, QuorumCertificate, StateRoot,
-    TxHash, WaveIdHash,
+    TxHash, WaveId,
 };
 use std::collections::{HashMap, HashSet};
 use tracing::warn;
@@ -120,13 +120,13 @@ impl ChainView<'_> {
         &self,
         parent_block_hash: BlockHash,
         tx_cache: &CommittedTxCache,
-    ) -> (HashSet<WaveIdHash>, HashSet<TxHash>, HashSet<ProvisionHash>) {
-        let mut cert_hashes: HashSet<WaveIdHash> = HashSet::new();
+    ) -> (HashSet<WaveId>, HashSet<TxHash>, HashSet<ProvisionHash>) {
+        let mut cert_ids: HashSet<WaveId> = HashSet::new();
         let mut tx_hashes: HashSet<TxHash> = HashSet::new();
         let mut provision_hashes: HashSet<ProvisionHash> = HashSet::new();
 
         tx_hashes.extend(tx_cache.recent_tx_hashes());
-        cert_hashes.extend(tx_cache.recent_cert_hashes());
+        cert_ids.extend(tx_cache.recent_cert_ids());
 
         let mut current_hash = parent_block_hash;
         while let Some(block) = self.get_block(current_hash) {
@@ -134,7 +134,7 @@ impl ChainView<'_> {
                 break;
             }
             for cert in block.certificates() {
-                cert_hashes.insert(cert.wave_id().hash());
+                cert_ids.insert(cert.wave_id().clone());
             }
             for tx in block.transactions() {
                 tx_hashes.insert(tx.hash());
@@ -160,7 +160,7 @@ impl ChainView<'_> {
             current_hash = pending.header().parent_block_hash;
         }
 
-        (cert_hashes, tx_hashes, provision_hashes)
+        (cert_ids, tx_hashes, provision_hashes)
     }
 }
 

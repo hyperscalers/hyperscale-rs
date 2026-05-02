@@ -6,7 +6,7 @@ use hyperscale_storage::{BlockForSync, ChainReader};
 use hyperscale_types::{
     BlockHash, BlockHeight, CertifiedBlock, CommittedBlockHeader, ConsensusReceipt,
     ExecutionCertificate, ExecutionCertificateHash, QuorumCertificate, RoutableTransaction,
-    ShardGroupId, TxHash, WaveCertificate, WaveIdHash,
+    ShardGroupId, TxHash, WaveCertificate, WaveId,
 };
 use std::sync::Arc;
 
@@ -64,11 +64,10 @@ impl ChainReader for SimStorage {
             .collect()
     }
 
-    fn get_certificates_batch(&self, hashes: &[WaveIdHash]) -> Vec<WaveCertificate> {
+    fn get_certificates_batch(&self, ids: &[WaveId]) -> Vec<WaveCertificate> {
         let c = self.consensus.read().unwrap();
-        hashes
-            .iter()
-            .filter_map(|h| c.certificates.get(h).cloned())
+        ids.iter()
+            .filter_map(|id| c.certificates.get(id).cloned())
             .collect()
     }
 
@@ -99,8 +98,8 @@ impl ChainReader for SimStorage {
 
     fn get_wave_certificate_for_tx(&self, tx_hash: &TxHash) -> Option<WaveCertificate> {
         let c = self.consensus.read().unwrap();
-        let wave_id_hash = c.tx_to_wave.get(tx_hash)?;
-        c.certificates.get(wave_id_hash).cloned()
+        let wave_id = c.tx_to_wave.get(tx_hash)?;
+        c.certificates.get(wave_id).cloned()
     }
 
     fn get_ec_hashes_for_tx(

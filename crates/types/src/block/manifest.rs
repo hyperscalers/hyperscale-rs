@@ -2,8 +2,7 @@
 //! (`BlockMetadata`).
 
 use crate::{
-    Block, BlockHash, BlockHeader, BlockHeight, ProvisionHash, QuorumCertificate, TxHash,
-    WaveIdHash,
+    Block, BlockHash, BlockHeader, BlockHeight, ProvisionHash, QuorumCertificate, TxHash, WaveId,
 };
 use sbor::prelude::*;
 
@@ -17,9 +16,9 @@ pub struct BlockManifest {
     /// Transaction hashes in block order.
     pub tx_hashes: Vec<TxHash>,
 
-    /// Certificate hashes (`wave_id` hashes) in block order.
+    /// Wave identifiers in block order.
     /// Validators use these to match against their locally finalized waves.
-    pub cert_hashes: Vec<WaveIdHash>,
+    pub cert_ids: Vec<WaveId>,
 
     /// Hashes of provisions included in this block.
     /// Used for provision data availability — validators fetch missing batches by hash.
@@ -34,16 +33,14 @@ impl BlockManifest {
     }
 
     /// Build a manifest from a full block (extracting hashes).
-    ///
-    /// `cert_hashes` uses `wave_id` identity hashes (computable without EC knowledge).
     #[must_use]
     pub fn from_block(block: &Block) -> Self {
         Self {
             tx_hashes: block.transactions().iter().map(|tx| tx.hash()).collect(),
-            cert_hashes: block
+            cert_ids: block
                 .certificates()
                 .iter()
-                .map(|c| c.wave_id().hash())
+                .map(|c| c.wave_id().clone())
                 .collect(),
             provision_hashes: vec![],
         }

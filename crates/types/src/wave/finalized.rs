@@ -3,7 +3,7 @@
 
 use crate::{
     ConsensusReceipt, ExecutionCertificate, ExecutionOutcome, GlobalReceiptHash, StoredReceipt,
-    TransactionDecision, TxHash, WaveCertificate, WaveId, WaveIdHash,
+    TransactionDecision, TxHash, WaveCertificate, WaveId,
 };
 use sbor::prelude::*;
 use std::sync::Arc;
@@ -91,12 +91,6 @@ impl FinalizedWave {
     #[must_use]
     pub fn wave_id(&self) -> &WaveId {
         &self.certificate.wave_id
-    }
-
-    /// Get the wave ID hash (used as key in pending block tracking).
-    #[must_use]
-    pub fn wave_id_hash(&self) -> WaveIdHash {
-        self.certificate.wave_id.hash()
     }
 
     /// Get the execution certificates (from the wave certificate).

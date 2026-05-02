@@ -14,7 +14,7 @@
 
 use hyperscale_core::{Action, CommitSource, ProtocolEvent, TimerId};
 use hyperscale_types::{
-    BlockHash, LocalTimestamp, ProposerTimestamp, ProvisionHash, WaveIdHash, WeightedTimestamp,
+    BlockHash, LocalTimestamp, ProposerTimestamp, ProvisionHash, WaveId, WeightedTimestamp,
 };
 
 /// BFT statistics for monitoring.
@@ -941,7 +941,7 @@ impl BftCoordinator {
             original_round = original_round.0,
             block_hash = ?block_hash,
             tx_count = manifest.transaction_count(),
-            cert_count = manifest.cert_hashes.len(),
+            cert_count = manifest.cert_ids.len(),
             "Re-proposing vote-locked block after view change (keeping original round)"
         );
 
@@ -983,7 +983,7 @@ impl BftCoordinator {
         header: &BlockHeader,
         manifest: BlockManifest,
         lookup_tx: impl Fn(&TxHash) -> Option<Arc<RoutableTransaction>>,
-        lookup_finalized_wave: impl Fn(&WaveIdHash) -> Option<Arc<FinalizedWave>>,
+        lookup_finalized_wave: impl Fn(&WaveId) -> Option<Arc<FinalizedWave>>,
         lookup_provision: impl Fn(&ProvisionHash) -> Option<Arc<Provisions>>,
     ) -> Vec<Action> {
         let block_hash = header.hash();
@@ -1154,7 +1154,7 @@ impl BftCoordinator {
         header: BlockHeader,
         manifest: BlockManifest,
         lookup_tx: impl Fn(&TxHash) -> Option<Arc<RoutableTransaction>>,
-        lookup_finalized_wave: impl Fn(&WaveIdHash) -> Option<Arc<FinalizedWave>>,
+        lookup_finalized_wave: impl Fn(&WaveId) -> Option<Arc<FinalizedWave>>,
         lookup_provision: impl Fn(&ProvisionHash) -> Option<Arc<Provisions>>,
     ) {
         let block_hash = header.hash();
@@ -1165,8 +1165,8 @@ impl BftCoordinator {
                 pending.add_transaction_arc(tx);
             }
         }
-        for wave_hash in pending.manifest().cert_hashes.clone() {
-            if let Some(fw) = lookup_finalized_wave(&wave_hash) {
+        for wave_id in pending.manifest().cert_ids.clone() {
+            if let Some(fw) = lookup_finalized_wave(&wave_id) {
                 pending.add_finalized_wave(fw);
             }
         }
@@ -2221,7 +2221,7 @@ impl BftCoordinator {
             block
                 .certificates()
                 .iter()
-                .map(|cert| cert.wave_id().hash()),
+                .map(|cert| cert.wave_id().clone()),
         );
 
         // Reset backoff tracking — new height means fresh round counting.
@@ -2763,10 +2763,10 @@ impl BftCoordinator {
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         for fw in waves {
-            let wave_id_hash = fw.wave_id_hash();
+            let wave_id = fw.wave_id().clone();
             if let Err(err) = fw.validate_receipts_against_ec() {
                 warn!(
-                    ?wave_id_hash,
+                    ?wave_id,
                     ?err,
                     "Rejecting FinalizedWave: receipts inconsistent with its EC"
                 );
@@ -2775,7 +2775,7 @@ impl BftCoordinator {
             actions.extend(self.check_pending_blocks_for_arrival(
                 topology,
                 "finalized wave",
-                |pending| pending.needs_wave(&wave_id_hash),
+                |pending| pending.needs_wave(&wave_id),
                 |pending| {
                     pending.add_finalized_wave(Arc::clone(fw));
                 },
@@ -3146,7 +3146,7 @@ impl BftCoordinator {
         &self,
         parent_block_hash: BlockHash,
     ) -> (
-        std::collections::HashSet<WaveIdHash>,
+        std::collections::HashSet<WaveId>,
         std::collections::HashSet<TxHash>,
         std::collections::HashSet<ProvisionHash>,
     ) {

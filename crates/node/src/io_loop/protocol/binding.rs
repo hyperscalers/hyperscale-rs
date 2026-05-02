@@ -23,9 +23,7 @@ use hyperscale_messages::request::{
     GetProvisionsRequest, GetTransactionsRequest,
 };
 use hyperscale_network::{Network, ResponseVerdict};
-use hyperscale_types::{
-    BlockHeight, FinalizedWave, ProvisionHash, Provisions, ShardGroupId, TxHash, WaveId, WaveIdHash,
-};
+use hyperscale_types::{BlockHeight, ProvisionHash, Provisions, ShardGroupId, TxHash, WaveId};
 use std::hash::Hash;
 use std::sync::Arc;
 
@@ -35,8 +33,8 @@ use std::sync::Arc;
 pub type TransactionFetch = Fetch<TxHash>;
 /// Local-provision fetch keyed by [`ProvisionHash`].
 pub type LocalProvisionFetch = Fetch<ProvisionHash>;
-/// Finalized-wave fetch keyed by [`WaveIdHash`].
-pub type FinalizedWaveFetch = Fetch<WaveIdHash>;
+/// Finalized-wave fetch keyed by [`WaveId`].
+pub type FinalizedWaveFetch = Fetch<WaveId>;
 /// Cross-shard execution-cert fetch keyed by [`WaveId`].
 pub type ExecCertFetch = Fetch<WaveId>;
 /// Cross-shard provision fetch keyed by `(source_shard, block_height)`.
@@ -224,16 +222,16 @@ impl FetchBinding for LocalProvisionBinding {
 pub struct FinalizedWaveBinding;
 
 impl FetchBinding for FinalizedWaveBinding {
-    type Id = WaveIdHash;
+    type Id = WaveId;
 
     const NAME: &'static str = "finalized_wave";
 
-    fn fetch_mut(host: &mut ProtocolHost) -> &mut Fetch<WaveIdHash> {
+    fn fetch_mut(host: &mut ProtocolHost) -> &mut Fetch<WaveId> {
         &mut host.finalized_wave
     }
 
     fn dispatch_chunk<N: Network>(
-        ids: Vec<WaveIdHash>,
+        ids: Vec<WaveId>,
         peers: &FetchPeers,
         origin: FetchOrigin,
         _local_shard: ShardGroupId,
@@ -241,7 +239,7 @@ impl FetchBinding for FinalizedWaveBinding {
         sender: &Sender<NodeInput>,
     ) {
         let es = sender.clone();
-        let hs = ids.clone();
+        let requested_ids = ids.clone();
         network.request(
             &peers.peers,
             peers.preferred,
@@ -250,19 +248,19 @@ impl FetchBinding for FinalizedWaveBinding {
             Box::new(move |result| {
                 if let Ok(resp) = result {
                     let returned = resp.waves.len();
-                    let requested = hs.len();
-                    let delivered: std::collections::HashSet<WaveIdHash> =
-                        resp.waves.iter().map(FinalizedWave::wave_id_hash).collect();
-                    let missing_hashes: Vec<WaveIdHash> =
-                        hs.into_iter().filter(|h| !delivered.contains(h)).collect();
+                    let requested = requested_ids.len();
+                    let delivered: std::collections::HashSet<WaveId> =
+                        resp.waves.iter().map(|w| w.wave_id().clone()).collect();
+                    let missing_ids: Vec<WaveId> = requested_ids
+                        .into_iter()
+                        .filter(|id| !delivered.contains(id))
+                        .collect();
                     let waves = resp.waves.into_iter().map(Arc::new).collect();
                     let _ = es.send(NodeInput::Protocol(Box::new(
                         ProtocolEvent::FinalizedWavesReceived { waves },
                     )));
-                    if !missing_hashes.is_empty() {
-                        let _ = es.send(NodeInput::FinalizedWavesFetchFailed {
-                            hashes: missing_hashes,
-                        });
+                    if !missing_ids.is_empty() {
+                        let _ = es.send(NodeInput::FinalizedWavesFetchFailed { ids: missing_ids });
                     }
                     if returned < requested {
                         ResponseVerdict::Reject
@@ -270,16 +268,16 @@ impl FetchBinding for FinalizedWaveBinding {
                         ResponseVerdict::Accept
                     }
                 } else {
-                    let _ = es.send(NodeInput::FinalizedWavesFetchFailed { hashes: hs });
+                    let _ = es.send(NodeInput::FinalizedWavesFetchFailed { ids: requested_ids });
                     ResponseVerdict::Accept
                 }
             }),
         );
     }
 
-    fn apply_admission(fetch: &mut Fetch<WaveIdHash>, event: &ProtocolEvent) {
+    fn apply_admission(fetch: &mut Fetch<WaveId>, event: &ProtocolEvent) {
         if let ProtocolEvent::FinalizedWavesAdmitted { waves } = event {
-            let ids: Vec<WaveIdHash> = waves.iter().map(|w| w.wave_id_hash()).collect();
+            let ids: Vec<WaveId> = waves.iter().map(|w| w.wave_id().clone()).collect();
             fetch.handle(FetchInput::Admitted { ids });
         }
     }

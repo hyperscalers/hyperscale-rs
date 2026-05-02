@@ -202,7 +202,7 @@ impl NodeStateMachine {
         if is_next_block
             && self
                 .mempool
-                .would_exceed_in_flight(total_tx_count, manifest.cert_hashes.len())
+                .would_exceed_in_flight(total_tx_count, manifest.cert_ids.len())
         {
             tracing::warn!(
                 block_hash = ?header.hash(),
@@ -217,7 +217,7 @@ impl NodeStateMachine {
             header,
             manifest,
             |h| self.mempool.get_transaction(h),
-            |h| self.execution.get_finalized_wave_by_hash(h),
+            |id| self.execution.get_finalized_wave(id),
             |h| self.provisions.get_provisions_by_hash(h),
         )
     }

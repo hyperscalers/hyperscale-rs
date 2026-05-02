@@ -10,7 +10,7 @@ use hyperscale_storage::{
 };
 use hyperscale_types::{
     BlockHash, BlockHeight, Hash, QuorumCertificate, Round, ShardGroupId, StateRoot, StoredReceipt,
-    TxHash, WaveIdHash, WeightedTimestamp,
+    TxHash, WeightedTimestamp,
 };
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -155,13 +155,13 @@ fn test_commit_certificate_with_writes_persists_both() {
 
     let updates = make_mapped_database_update(1, 0, vec![10, 20], vec![99, 88, 77]);
     let cert = make_test_wave_certificate(BlockHeight(42), ShardGroupId(0));
-    let wave_hash = cert.wave_id.hash();
+    let wave_id = cert.wave_id.clone();
 
     storage.commit_certificate_with_writes(&cert, &updates);
 
-    let stored_cert = storage.get_certificate(&wave_hash);
+    let stored_cert = storage.get_certificate(&wave_id);
     assert!(stored_cert.is_some());
-    assert_eq!(stored_cert.unwrap().wave_id.hash(), wave_hash);
+    assert_eq!(stored_cert.unwrap().wave_id, wave_id);
 
     // Verify the substate was written to the state CF via direct key lookup.
     // make_mapped_database_update uses SpreadPrefixKeyMapper, so extract the
@@ -265,14 +265,14 @@ fn test_certificate_idempotency() {
 
     let updates = make_mapped_database_update(1, 0, vec![10, 20], vec![99, 88, 77]);
     let cert = make_test_wave_certificate(BlockHeight(42), ShardGroupId(0));
-    let wave_hash = cert.wave_id.hash();
+    let wave_id = cert.wave_id.clone();
 
     storage.commit_certificate_with_writes(&cert, &updates);
     storage.commit_certificate_with_writes(&cert, &updates);
 
-    let stored = storage.get_certificate(&wave_hash);
+    let stored = storage.get_certificate(&wave_id);
     assert!(stored.is_some());
-    assert_eq!(stored.unwrap().wave_id.hash(), wave_hash);
+    assert_eq!(stored.unwrap().wave_id, wave_id);
 }
 
 #[test]
@@ -508,7 +508,7 @@ fn test_commit_block_stores_certificates() {
 
     let shard = ShardGroupId(0);
     let cert = Arc::new(make_test_wave_certificate(BlockHeight(1), shard));
-    let wave_hash = cert.wave_id.hash();
+    let wave_id = cert.wave_id.clone();
 
     // Create a block that includes this certificate
     let block = make_test_block(BlockHeight(1));
@@ -544,7 +544,7 @@ fn test_commit_block_stores_certificates() {
 
     let _ = storage.commit_block(&Arc::new(block), &Arc::new(qc));
 
-    assert!(storage.get_certificate(&wave_hash).is_some());
+    assert!(storage.get_certificate(&wave_id).is_some());
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -567,19 +567,23 @@ fn test_certificates_batch() {
 
     let cert1 = make_test_wave_certificate(BlockHeight(1), ShardGroupId(0));
     let cert2 = make_test_wave_certificate(BlockHeight(2), ShardGroupId(0));
-    let hash1 = cert1.wave_id.hash();
-    let hash2 = cert2.wave_id.hash();
+    let id1 = cert1.wave_id.clone();
+    let id2 = cert2.wave_id.clone();
 
-    storage.put_certificate(&hash1, &cert1);
-    storage.put_certificate(&hash2, &cert2);
+    storage.put_certificate(&id1, &cert1);
+    storage.put_certificate(&id2, &cert2);
 
-    let result = storage.get_certificates_batch(&[hash1, hash2]);
+    let result = storage.get_certificates_batch(&[id1.clone(), id2]);
     assert_eq!(result.len(), 2);
 
-    let missing = WaveIdHash::from_raw(Hash::from_bytes(&[99; 32]));
-    let partial = storage.get_certificates_batch(&[hash1, missing]);
+    let missing = hyperscale_types::WaveId::new(
+        ShardGroupId(99),
+        BlockHeight(99),
+        std::collections::BTreeSet::new(),
+    );
+    let partial = storage.get_certificates_batch(&[id1.clone(), missing]);
     assert_eq!(partial.len(), 1);
-    assert_eq!(partial[0].wave_id.hash(), hash1);
+    assert_eq!(partial[0].wave_id, id1);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -637,23 +641,24 @@ fn test_certificate_store_and_retrieve() {
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
     let cert = make_test_wave_certificate(BlockHeight(1), ShardGroupId(0));
-    let wave_hash = cert.wave_id.hash();
+    let wave_id = cert.wave_id.clone();
 
-    storage.put_certificate(&wave_hash, &cert);
+    storage.put_certificate(&wave_id, &cert);
 
-    let stored = storage.get_certificate(&wave_hash).unwrap();
-    assert_eq!(stored.wave_id.hash(), wave_hash);
+    let stored = storage.get_certificate(&wave_id).unwrap();
+    assert_eq!(stored.wave_id, wave_id);
 }
 
 #[test]
 fn test_certificate_get_missing() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
-    assert!(
-        storage
-            .get_certificate(&WaveIdHash::from_raw(Hash::from_bytes(&[99; 32])))
-            .is_none()
+    let missing = hyperscale_types::WaveId::new(
+        ShardGroupId(99),
+        BlockHeight(99),
+        std::collections::BTreeSet::new(),
     );
+    assert!(storage.get_certificate(&missing).is_none());
 }
 
 #[test]
@@ -684,7 +689,7 @@ fn test_commit_certificate_via_commit_store() {
 
     assert_eq!(storage.jmt_height(), BlockHeight(0));
     assert_eq!(storage.state_root(), StateRoot::ZERO);
-    assert!(storage.get_certificate(&cert.wave_id.hash()).is_some());
+    assert!(storage.get_certificate(&cert.wave_id).is_some());
 }
 
 #[test]
@@ -707,12 +712,12 @@ fn test_substates_survive_reopen() {
 
     let root_after_write;
     let version_after_write;
-    let cert_hash;
+    let cert_id;
     {
         let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
         let updates = make_mapped_database_update(1, 0, vec![10], vec![42]);
         let cert = make_test_wave_certificate(BlockHeight(1), ShardGroupId(0));
-        cert_hash = cert.wave_id.hash();
+        cert_id = cert.wave_id.clone();
         storage.commit_certificate_with_writes(&cert, &updates);
         root_after_write = storage.state_root();
         version_after_write = storage.jmt_height();
@@ -724,9 +729,9 @@ fn test_substates_survive_reopen() {
         assert_eq!(storage.jmt_height(), version_after_write);
         assert_eq!(storage.state_root(), root_after_write);
 
-        let cert = storage.get_certificate(&cert_hash);
+        let cert = storage.get_certificate(&cert_id);
         assert!(cert.is_some(), "certificate should survive reopen");
-        assert_eq!(cert.unwrap().wave_id.hash(), cert_hash);
+        assert_eq!(cert.unwrap().wave_id, cert_id);
 
         // Verify the substate was written via direct key lookup.
         // make_mapped_database_update uses SpreadPrefixKeyMapper, so use the

@@ -2,8 +2,7 @@
 
 use crate::response::GetBlockResponse;
 use hyperscale_types::{
-    BlockHeight, BloomFilter, MessageClass, NetworkMessage, ProvisionHash, Request, TxHash,
-    WaveIdHash,
+    BlockHeight, BloomFilter, MessageClass, NetworkMessage, ProvisionHash, Request, TxHash, WaveId,
 };
 use sbor::prelude::BasicSbor;
 
@@ -23,7 +22,7 @@ pub struct Inventory {
     pub tx_have: Option<BloomFilter<TxHash>>,
     /// Finalized wave certificates the requester already has cached.
     /// Responder may omit matching `FinalizedWave` bodies.
-    pub cert_have: Option<BloomFilter<WaveIdHash>>,
+    pub cert_have: Option<BloomFilter<WaveId>>,
     /// Provisions the requester already has in its provision store.
     /// Independent of the responder's own `Live → Sealed` downgrade.
     pub provision_have: Option<BloomFilter<ProvisionHash>>,

@@ -16,9 +16,7 @@
 //! building, which iterates the store to include finalized waves in block
 //! order.
 
-use hyperscale_types::{
-    BloomFilter, DEFAULT_FPR, FinalizedWave, TxHash, WaveCertificate, WaveId, WaveIdHash,
-};
+use hyperscale_types::{BloomFilter, DEFAULT_FPR, FinalizedWave, TxHash, WaveCertificate, WaveId};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
@@ -50,14 +48,10 @@ impl FinalizedWaveStore {
         self.waves.values().map(|fw| Arc::new(fw.clone())).collect()
     }
 
-    /// Lookup by the hash of a wave's `WaveId`. Peers reference waves by
-    /// `wave_id.hash()` in fetch requests, so this is the primary ingress
-    /// lookup for serving finalized-wave data.
-    pub fn get_by_wave_id_hash(&self, wave_id_hash: &WaveIdHash) -> Option<Arc<FinalizedWave>> {
-        self.waves
-            .values()
-            .find(|fw| fw.certificate.wave_id.hash() == *wave_id_hash)
-            .map(|fw| Arc::new(fw.clone()))
+    /// Lookup by `WaveId`. Peers reference waves by id in fetch requests,
+    /// so this is the primary ingress lookup for serving finalized-wave data.
+    pub fn get(&self, wave_id: &WaveId) -> Option<Arc<FinalizedWave>> {
+        self.waves.get(wave_id).map(|fw| Arc::new(fw.clone()))
     }
 
     /// Certificate containing `tx_hash`, if any. Used to answer
@@ -100,13 +94,13 @@ impl FinalizedWaveStore {
         self.waves.is_empty()
     }
 
-    /// Build a bloom filter over every tracked `WaveIdHash`. Sync
+    /// Build a bloom filter over every tracked `WaveId`. Sync
     /// inventory attaches this to `GetBlockRequest` so the responder can
     /// elide finalized-wave certificates the requester already has.
-    pub fn cert_bloom_snapshot(&self) -> Option<BloomFilter<WaveIdHash>> {
+    pub fn cert_bloom_snapshot(&self) -> Option<BloomFilter<WaveId>> {
         let mut bf = BloomFilter::with_capacity(self.waves.len(), DEFAULT_FPR)?;
         for wave_id in self.waves.keys() {
-            bf.insert(&wave_id.hash());
+            bf.insert(wave_id);
         }
         Some(bf)
     }
@@ -188,25 +182,18 @@ mod tests {
     }
 
     #[test]
-    fn lookup_by_wave_id_hash_matches_inserted_wave() {
+    fn lookup_by_wave_id_matches_inserted_wave() {
         let mut store = FinalizedWaveStore::new();
         let tx = TxHash::from_raw(Hash::from_bytes(b"tx1"));
         let (wid, fw) = make_finalized_wave(1, &[tx]);
-        let expected_hash = wid.hash();
 
         store.insert(wid.clone(), fw);
 
-        let looked_up = store
-            .get_by_wave_id_hash(&expected_hash)
-            .expect("wave present by hash");
+        let looked_up = store.get(&wid).expect("wave present by id");
         assert_eq!(looked_up.certificate.wave_id, wid);
 
-        // Unknown hash returns None.
-        assert!(
-            store
-                .get_by_wave_id_hash(&WaveIdHash::from_raw(Hash::from_bytes(b"unknown")))
-                .is_none()
-        );
+        // Unknown id returns None.
+        assert!(store.get(&make_wave_id(99)).is_none());
     }
 
     #[test]
@@ -259,10 +246,10 @@ mod tests {
         store.insert(wid2.clone(), fw2);
 
         let bf = store.cert_bloom_snapshot().expect("sizing ok");
-        assert!(bf.contains(&wid1.hash()));
-        assert!(bf.contains(&wid2.hash()));
-        // Untracked wave-id hash: exercises the filter's zero region.
-        let absent = make_wave_id(99).hash();
+        assert!(bf.contains(&wid1));
+        assert!(bf.contains(&wid2));
+        // Untracked wave id: exercises the filter's zero region.
+        let absent = make_wave_id(99);
         assert!(!bf.contains(&absent));
     }
 

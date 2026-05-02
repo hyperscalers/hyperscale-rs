@@ -14,9 +14,7 @@
 
 use hyperscale_mempool::TxStore;
 use hyperscale_provisions::ProvisionStore;
-use hyperscale_types::{
-    ExecutionCertificate, FinalizedWave, TransactionStatus, TxHash, WaveId, WaveIdHash,
-};
+use hyperscale_types::{ExecutionCertificate, FinalizedWave, TransactionStatus, TxHash, WaveId};
 use quick_cache::sync::Cache as QuickCache;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -28,7 +26,7 @@ pub(super) const DEFAULT_TX_STATUS_CACHE_SIZE: usize = 100_000;
 
 /// Execution certificate cache shared between the `io_loop` (which inserts
 /// on `TrackExecutionCertificate`) and the inbound EC fetch handler.
-pub type ExecCertCache = Arc<Mutex<HashMap<(WaveIdHash, WaveId), Arc<ExecutionCertificate>>>>;
+pub type ExecCertCache = Arc<Mutex<HashMap<WaveId, Arc<ExecutionCertificate>>>>;
 
 /// Inbound request-serving caches plus the cross-thread transaction-status
 /// view exposed to external RPC consumers.
@@ -43,10 +41,10 @@ pub struct SharedCaches {
     /// Latest emitted status per transaction. Survives mempool eviction so
     /// RPC `tx_status` lookups can answer for finalized/expired txs.
     pub tx_status: Arc<QuickCache<TxHash, TransactionStatus>>,
-    /// Finalized waves, keyed by wave-id hash. Populated by `io_loop`'s
+    /// Finalized waves, keyed by `WaveId`. Populated by `io_loop`'s
     /// `Continuation(FinalizedWavesAdmitted)` interception; queried by the
     /// inbound finalized-wave handler.
-    pub finalized_wave: Arc<QuickCache<WaveIdHash, Arc<FinalizedWave>>>,
+    pub finalized_wave: Arc<QuickCache<WaveId, Arc<FinalizedWave>>>,
     /// Outbound + local provision store, owned by the
     /// [`ProvisionCoordinator`]. Cloned here so handlers (block, block-topup,
     /// local-provision, cross-shard provision) can read it without going

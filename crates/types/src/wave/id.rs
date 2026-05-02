@@ -1,6 +1,7 @@
 //! [`WaveId`] — self-contained globally unique wave identifier.
 
-use crate::{BlockHeight, Hash, ShardGroupId, WaveIdHash};
+use crate::primitives::bloom::BloomKey;
+use crate::{BlockHeight, Hash, ShardGroupId};
 use sbor::prelude::*;
 use std::collections::BTreeSet;
 
@@ -51,20 +52,16 @@ impl WaveId {
     pub fn dependency_count(&self) -> usize {
         self.remote_shards.len()
     }
+}
 
-    /// Compute a deterministic identity hash for this wave.
-    ///
-    /// Used for: `BlockManifest` `cert_hashes`, `PendingBlock` matching, storage keys,
-    /// wave cert fetch requests. Computable without knowing EC content.
-    ///
-    /// # Panics
-    ///
-    /// Panics if SBOR encoding fails — `WaveId` is a closed SBOR type
-    /// and encoding is infallible in practice.
-    #[must_use]
-    pub fn hash(&self) -> WaveIdHash {
+impl BloomKey for WaveId {
+    fn bloom_seed(&self) -> [u8; 16] {
         let bytes = basic_encode(self).expect("WaveId serialization should never fail");
-        WaveIdHash::from_raw(Hash::from_bytes(&bytes))
+        let h = Hash::from_bytes(&bytes);
+        let raw = h.as_bytes();
+        let mut out = [0u8; 16];
+        out.copy_from_slice(&raw[0..16]);
+        out
     }
 }
 

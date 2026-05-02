@@ -3,7 +3,7 @@
 use crate::ProtocolEvent;
 use hyperscale_types::{
     BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, CertifiedBlock, CommittedBlockHeader,
-    ProvisionHash, RoutableTransaction, ShardGroupId, TxHash, ValidatorId, WaveId, WaveIdHash,
+    ProvisionHash, RoutableTransaction, ShardGroupId, TxHash, ValidatorId, WaveId,
 };
 use std::sync::Arc;
 
@@ -137,8 +137,8 @@ pub enum NodeInput {
 
     /// A finalized-wave fetch request failed.
     FinalizedWavesFetchFailed {
-        /// Wave-id hashes that weren't returned.
-        hashes: Vec<WaveIdHash>,
+        /// Wave ids that weren't returned.
+        ids: Vec<WaveId>,
     },
 
     /// Transaction validated by the validation pipeline. The `IoLoop`

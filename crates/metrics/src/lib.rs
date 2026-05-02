@@ -171,7 +171,7 @@ pub struct MemoryMetrics {
     pub node_finalized_wave_cache: usize,
     /// Time-bounded cache of provision bodies for cross-shard fetch service.
     pub node_provision_cache: usize,
-    /// Fallback execution certificate cache keyed by (`wave_id_hash`, `wave_id`).
+    /// Fallback execution certificate cache keyed by `wave_id`.
     pub node_exec_cert_cache: usize,
     /// Blocks with prepared JMT state awaiting flush.
     pub node_prepared_commits: usize,

@@ -16,7 +16,7 @@
 //!    bounded by `MAX_VALIDITY_RANGE` because admission requires
 //!    `end_timestamp_exclusive <= anchor + MAX_VALIDITY_RANGE`.
 
-use hyperscale_types::{RoutableTransaction, TxHash, WaveIdHash, WeightedTimestamp};
+use hyperscale_types::{RoutableTransaction, TxHash, WaveId, WeightedTimestamp};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -25,7 +25,7 @@ pub struct CommittedTxCache {
     /// `end_timestamp_exclusive <= current_committed_ts`.
     tx_lookup: HashMap<TxHash, WeightedTimestamp>,
     recently_committed_txs: HashSet<TxHash>,
-    recently_committed_certs: HashSet<WaveIdHash>,
+    recently_committed_certs: HashSet<WaveId>,
 }
 
 impl CommittedTxCache {
@@ -37,17 +37,17 @@ impl CommittedTxCache {
         }
     }
 
-    /// Buffer tx and cert hashes from a freshly committed block. Called
+    /// Buffer tx hashes and cert ids from a freshly committed block. Called
     /// synchronously at BFT commit time; entries are cleared by
     /// `register_committed` (txs) or `remove` (certs) once the mempool
     /// catches up.
     pub fn buffer_commit(
         &mut self,
         tx_hashes: impl IntoIterator<Item = TxHash>,
-        cert_hashes: impl IntoIterator<Item = WaveIdHash>,
+        cert_ids: impl IntoIterator<Item = WaveId>,
     ) {
         self.recently_committed_txs.extend(tx_hashes);
-        self.recently_committed_certs.extend(cert_hashes);
+        self.recently_committed_certs.extend(cert_ids);
     }
 
     /// Promote a block's transactions from the bridge buffer into the
@@ -87,8 +87,8 @@ impl CommittedTxCache {
         self.recently_committed_txs.iter().copied()
     }
 
-    pub fn recent_cert_hashes(&self) -> impl Iterator<Item = WaveIdHash> + '_ {
-        self.recently_committed_certs.iter().copied()
+    pub fn recent_cert_ids(&self) -> impl Iterator<Item = WaveId> + '_ {
+        self.recently_committed_certs.iter().cloned()
     }
 
     pub fn tx_lookup_len(&self) -> usize {
@@ -108,10 +108,13 @@ impl CommittedTxCache {
 mod tests {
     use super::*;
     use hyperscale_types::test_utils::test_notarized_transaction_v1;
-    use hyperscale_types::{Hash, TimestampRange, routable_from_notarized_v1};
+    use hyperscale_types::{
+        BlockHeight, Hash, ShardGroupId, TimestampRange, routable_from_notarized_v1,
+    };
+    use std::collections::BTreeSet;
 
-    fn h(b: &[u8]) -> WaveIdHash {
-        WaveIdHash::from_raw(Hash::from_bytes(b))
+    fn wid(height: u64) -> WaveId {
+        WaveId::new(ShardGroupId(0), BlockHeight(height), BTreeSet::new())
     }
 
     fn th(b: &[u8]) -> TxHash {
@@ -128,12 +131,13 @@ mod tests {
     #[test]
     fn buffered_hashes_surface_in_recent_iterators() {
         let mut cache = CommittedTxCache::new();
-        cache.buffer_commit([th(b"tx1"), th(b"tx2")], [h(b"c1")]);
+        let c1 = wid(1);
+        cache.buffer_commit([th(b"tx1"), th(b"tx2")], [c1.clone()]);
 
         let txs: HashSet<TxHash> = cache.recent_tx_hashes().collect();
-        let certs: HashSet<WaveIdHash> = cache.recent_cert_hashes().collect();
+        let certs: HashSet<WaveId> = cache.recent_cert_ids().collect();
         assert_eq!(txs, HashSet::from([th(b"tx1"), th(b"tx2")]));
-        assert_eq!(certs, HashSet::from([h(b"c1")]));
+        assert_eq!(certs, HashSet::from([c1]));
     }
 
     #[test]

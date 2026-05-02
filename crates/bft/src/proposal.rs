@@ -17,8 +17,7 @@
 use hyperscale_core::Action;
 use hyperscale_types::{
     BlockHash, BlockHeight, FinalizedWave, LocalTimestamp, ProposerTimestamp, ProvisionHash,
-    Provisions, Round, RoutableTransaction, TopologySnapshot, TxHash, WaveIdHash,
-    WeightedTimestamp,
+    Provisions, Round, RoutableTransaction, TopologySnapshot, TxHash, WaveId, WeightedTimestamp,
 };
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -206,14 +205,14 @@ pub fn select_transactions(
 /// so the proposer must produce a deterministic order.
 pub fn select_finalized_waves(
     finalized_waves: Vec<Arc<FinalizedWave>>,
-    qc_chain_cert_hashes: &HashSet<WaveIdHash>,
+    qc_chain_cert_ids: &HashSet<WaveId>,
     max_finalized_txs: usize,
 ) -> (Vec<Arc<FinalizedWave>>, usize) {
     let mut candidate_waves: Vec<_> = finalized_waves
         .into_iter()
-        .filter(|fw| !qc_chain_cert_hashes.contains(&fw.wave_id_hash()))
+        .filter(|fw| !qc_chain_cert_ids.contains(fw.wave_id()))
         .collect();
-    candidate_waves.sort_by_key(|fw| (fw.wave_id().block_height, fw.wave_id_hash()));
+    candidate_waves.sort_by_key(|fw| (fw.wave_id().block_height, fw.wave_id().clone()));
 
     let mut finalized_tx_count = 0usize;
     let waves_to_propose: Vec<_> = candidate_waves

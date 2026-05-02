@@ -137,17 +137,6 @@ hash_newtype!(
     "WaveReceiptHash"
 );
 
-hash_newtype!(
-    /// Identity hash of a [`WaveId`](crate::WaveId).
-    ///
-    /// Computed from the SBOR-encoded `(shard_group_id, block_height, remote_shards)`
-    /// tuple — uniquely identifies a wave without requiring knowledge of its
-    /// execution certificates. Used as the key for wave-cert storage,
-    /// `BlockManifest::cert_hashes`, fetch requests, and the `tx_to_wave` index.
-    pub WaveIdHash,
-    "WaveIdHash"
-);
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -44,7 +44,7 @@ use hyperscale_types::{
     Attempt, Block, BlockHash, BlockHeight, BloomFilter, ExecutionCertificate, ExecutionVote,
     GlobalReceiptRoot, NodeId, Provisions, RoutableTransaction, ShardGroupId, StoredReceipt,
     TopologySnapshot, TxHash, TxOutcome, ValidatorId, WAVE_TIMEOUT, WaveCertificate, WaveId,
-    WaveIdHash, WeightedTimestamp,
+    WeightedTimestamp,
 };
 #[cfg(test)]
 use hyperscale_types::{ExecutionOutcome, Hash};
@@ -130,7 +130,7 @@ pub struct ExecutionMemoryStats {
 /// Handles transaction execution after blocks are committed.
 pub struct ExecutionCoordinator {
     /// Finalized wave certificates ready for block inclusion, keyed by
-    /// `WaveId`. Terminal-state lookup surface for wave-id-hash fetches,
+    /// `WaveId`. Terminal-state lookup surface for wave-id fetches,
     /// tx-membership queries, and proposal building.
     finalized: FinalizedWaveStore,
 
@@ -1581,13 +1581,10 @@ impl ExecutionCoordinator {
         self.finalized.all_waves()
     }
 
-    /// Get a finalized wave by its `wave_id` hash (returns `Arc` for sharing).
+    /// Get a finalized wave by its `WaveId` (returns `Arc` for sharing).
     #[must_use]
-    pub fn get_finalized_wave_by_hash(
-        &self,
-        wave_id_hash: &WaveIdHash,
-    ) -> Option<Arc<FinalizedWave>> {
-        self.finalized.get_by_wave_id_hash(wave_id_hash)
+    pub fn get_finalized_wave(&self, wave_id: &WaveId) -> Option<Arc<FinalizedWave>> {
+        self.finalized.get(wave_id)
     }
 
     /// Bloom filter over every tracked finalized-wave id hash. Attached to
@@ -1595,7 +1592,7 @@ impl ExecutionCoordinator {
     /// certificates the requester already has. Returns `None` when the
     /// cached set is too large to size a filter within the configured cap.
     #[must_use]
-    pub fn cert_bloom_snapshot(&self) -> Option<BloomFilter<WaveIdHash>> {
+    pub fn cert_bloom_snapshot(&self) -> Option<BloomFilter<WaveId>> {
         self.finalized.cert_bloom_snapshot()
     }
 
@@ -2512,7 +2509,7 @@ mod tests {
         let _ = state.finalize_wave(&wave_id);
         let finalized = state
             .finalized
-            .get_by_wave_id_hash(&wave_id.hash())
+            .get(&wave_id)
             .expect("wave must be in the finalized store after finalize_wave");
 
         // Sanity: state is populated across sub-machines.
