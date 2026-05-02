@@ -66,8 +66,7 @@ impl ElidedCertifiedBlock {
             .iter()
             .map(|fw| {
                 let id = fw.wave_id().clone();
-                // `cert_have` bloom is keyed by WaveIdHash; hash at the boundary.
-                let body = if matches_filter(inventory.cert_have.as_ref(), &id.hash()) {
+                let body = if matches_filter(inventory.cert_have.as_ref(), &id) {
                     None
                 } else {
                     Some((**fw).clone())
@@ -274,11 +273,11 @@ impl fmt::Display for RehydrateError {
 
 impl std::error::Error for RehydrateError {}
 
-fn matches_filter<T>(filter: Option<&hyperscale_types::BloomFilter<T>>, hash: &T) -> bool
+fn matches_filter<T>(filter: Option<&hyperscale_types::BloomFilter<T>>, item: &T) -> bool
 where
-    T: hyperscale_types::TypedHash,
+    T: hyperscale_types::BloomKey,
 {
-    filter.is_some_and(|bf| bf.contains(hash))
+    filter.is_some_and(|bf| bf.contains(item))
 }
 
 /// Response to a block fetch request.

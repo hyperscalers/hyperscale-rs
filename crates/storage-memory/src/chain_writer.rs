@@ -154,12 +154,12 @@ impl ChainWriter for SimStorage {
                 );
                 for fw in block.certificates() {
                     let cert = &fw.certificate;
-                    let wave_id_hash = cert.wave_id.hash();
-                    c.certificates.insert(wave_id_hash, (**cert).clone());
+                    let wave_id = cert.wave_id.clone();
+                    c.certificates.insert(wave_id.clone(), (**cert).clone());
                     c.wave_certs_by_height
-                        .entry(cert.wave_id.block_height)
+                        .entry(wave_id.block_height)
                         .or_default()
-                        .push(wave_id_hash);
+                        .push(wave_id);
                 }
                 c.insert_receipts(&prepared.receipts);
                 for fw in block.certificates() {
@@ -264,12 +264,12 @@ impl SimStorage {
             );
             for fw in block.certificates() {
                 let cert = &fw.certificate;
-                let wave_id_hash = cert.wave_id.hash();
-                c.certificates.insert(wave_id_hash, (**cert).clone());
+                let wave_id = cert.wave_id.clone();
+                c.certificates.insert(wave_id.clone(), (**cert).clone());
                 c.wave_certs_by_height
-                    .entry(cert.wave_id.block_height)
+                    .entry(wave_id.block_height)
                     .or_default()
-                    .push(wave_id_hash);
+                    .push(wave_id);
             }
             // Store receipts atomically with block commit.
             c.insert_receipts(receipts);

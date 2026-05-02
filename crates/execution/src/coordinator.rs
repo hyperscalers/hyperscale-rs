@@ -44,7 +44,7 @@ use hyperscale_types::{
     Attempt, Block, BlockHash, BlockHeight, BloomFilter, ExecutionCertificate, ExecutionVote,
     GlobalReceiptRoot, NodeId, Provisions, RoutableTransaction, ShardGroupId, StoredReceipt,
     TopologySnapshot, TxHash, TxOutcome, ValidatorId, WAVE_TIMEOUT, WaveCertificate, WaveId,
-    WaveIdHash, WeightedTimestamp,
+    WeightedTimestamp,
 };
 #[cfg(test)]
 use hyperscale_types::{ExecutionOutcome, Hash};
@@ -130,7 +130,7 @@ pub struct ExecutionMemoryStats {
 /// Handles transaction execution after blocks are committed.
 pub struct ExecutionCoordinator {
     /// Finalized wave certificates ready for block inclusion, keyed by
-    /// `WaveId`. Terminal-state lookup surface for wave-id-hash fetches,
+    /// `WaveId`. Terminal-state lookup surface for wave-id fetches,
     /// tx-membership queries, and proposal building.
     finalized: FinalizedWaveStore,
 
@@ -1592,7 +1592,7 @@ impl ExecutionCoordinator {
     /// certificates the requester already has. Returns `None` when the
     /// cached set is too large to size a filter within the configured cap.
     #[must_use]
-    pub fn cert_bloom_snapshot(&self) -> Option<BloomFilter<WaveIdHash>> {
+    pub fn cert_bloom_snapshot(&self) -> Option<BloomFilter<WaveId>> {
         self.finalized.cert_bloom_snapshot()
     }
 

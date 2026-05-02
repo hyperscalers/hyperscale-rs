@@ -29,7 +29,7 @@ mod topology;
 mod transaction;
 mod wave;
 
-pub use primitives::bloom::{BloomFilter, DEFAULT_FPR, MAX_BITS};
+pub use primitives::bloom::{BloomFilter, BloomKey, DEFAULT_FPR, MAX_BITS};
 
 pub use block::Block;
 pub use block::certified::{CertifiedBlock, CertifiedBlockHashMismatch};
@@ -58,7 +58,7 @@ pub use primitives::hash::{Hash, TypedHash};
 pub use primitives::hash_kinds::{
     BlockHash, CertificateRoot, EventRoot, ExecutionCertificateHash, GlobalReceiptHash,
     GlobalReceiptRoot, LocalReceiptRoot, ProvisionHash, ProvisionTxRoot, ProvisionsRoot, StateRoot,
-    TransactionRoot, TxHash, WaveIdHash, WaveReceiptHash, WritesRoot,
+    TransactionRoot, TxHash, WaveReceiptHash, WritesRoot,
 };
 pub use primitives::identifiers::{
     Attempt, BlockHeight, NodeId, PartitionNumber, Round, ShardGroupId, ValidatorId, VotePower,

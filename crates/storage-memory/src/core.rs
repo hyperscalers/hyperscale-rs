@@ -139,7 +139,7 @@ impl SimStorage {
             .write()
             .unwrap()
             .certificates
-            .insert(certificate.wave_id.hash(), certificate.clone());
+            .insert(certificate.wave_id.clone(), certificate.clone());
     }
 
     /// Test helper: commits database updates with auto-incrementing JMT version.

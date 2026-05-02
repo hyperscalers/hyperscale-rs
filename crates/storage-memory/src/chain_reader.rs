@@ -67,7 +67,7 @@ impl ChainReader for SimStorage {
     fn get_certificates_batch(&self, ids: &[WaveId]) -> Vec<WaveCertificate> {
         let c = self.consensus.read().unwrap();
         ids.iter()
-            .filter_map(|id| c.certificates.get(&id.hash()).cloned())
+            .filter_map(|id| c.certificates.get(id).cloned())
             .collect()
     }
 
@@ -98,8 +98,8 @@ impl ChainReader for SimStorage {
 
     fn get_wave_certificate_for_tx(&self, tx_hash: &TxHash) -> Option<WaveCertificate> {
         let c = self.consensus.read().unwrap();
-        let wave_id_hash = c.tx_to_wave.get(tx_hash)?;
-        c.certificates.get(wave_id_hash).cloned()
+        let wave_id = c.tx_to_wave.get(tx_hash)?;
+        c.certificates.get(wave_id).cloned()
     }
 
     fn get_ec_hashes_for_tx(

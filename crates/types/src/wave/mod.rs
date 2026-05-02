@@ -38,8 +38,8 @@ mod tests {
         ExecutionCertificateHash, ExecutionOutcome, FinalizedWave, GlobalReceiptHash,
         GlobalReceiptRoot, Hash, NodeId, ProvisionTxRoot, ReceiptValidationError, ShardGroupId,
         SignerBitfield, StoredReceipt, TopologySnapshot, TxHash, TxOutcome, ValidatorId,
-        ValidatorInfo, ValidatorSet, WaveCertificate, WaveId, WaveIdHash, WaveReceiptHash,
-        WeightedTimestamp, compute_global_receipt_root, compute_global_receipt_root_with_proof,
+        ValidatorInfo, ValidatorSet, WaveCertificate, WaveId, WaveReceiptHash, WeightedTimestamp,
+        compute_global_receipt_root, compute_global_receipt_root_with_proof,
         compute_padded_merkle_root, compute_provision_tx_roots, decode_wave_cert_vec,
         encode_wave_cert_vec, generate_bls_keypair, test_utils::test_transaction_with_nodes,
         tx_outcome_leaf, wave_leader, wave_leader_at,
@@ -110,18 +110,17 @@ mod tests {
     }
 
     #[test]
-    fn test_wave_id_hash_deterministic() {
+    fn test_wave_id_deterministic() {
         let w1 = make_wave_id(0, BlockHeight(42), &[1]);
         let w2 = make_wave_id(0, BlockHeight(42), &[1]);
-        assert_eq!(w1.hash(), w2.hash());
-        assert_ne!(w1.hash(), WaveIdHash::ZERO);
+        assert_eq!(w1, w2);
     }
 
     #[test]
-    fn test_wave_id_hash_differs_by_height() {
+    fn test_wave_id_differs_by_height() {
         let w1 = make_wave_id(0, BlockHeight(42), &[1]);
         let w2 = make_wave_id(0, BlockHeight(43), &[1]);
-        assert_ne!(w1.hash(), w2.hash());
+        assert_ne!(w1, w2);
     }
 
     #[test]

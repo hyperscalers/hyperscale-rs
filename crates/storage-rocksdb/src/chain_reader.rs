@@ -7,7 +7,7 @@ use hyperscale_storage::BlockForSync;
 use hyperscale_types::{
     BlockHash, BlockHeight, CertifiedBlock, CommittedBlockHeader, ExecutionCertificate,
     ExecutionCertificateHash, QuorumCertificate, RoutableTransaction, ShardGroupId, TxHash,
-    WaveCertificate, WaveId, WaveIdHash,
+    WaveCertificate, WaveId,
 };
 use std::sync::Arc;
 
@@ -46,8 +46,7 @@ impl hyperscale_storage::ChainReader for RocksDbStorage {
     }
 
     fn get_certificates_batch(&self, ids: &[WaveId]) -> Vec<WaveCertificate> {
-        let hashes: Vec<WaveIdHash> = ids.iter().map(WaveId::hash).collect();
-        Self::get_certificates_batch(self, &hashes)
+        Self::get_certificates_batch(self, ids)
     }
 
     fn get_consensus_receipt(
