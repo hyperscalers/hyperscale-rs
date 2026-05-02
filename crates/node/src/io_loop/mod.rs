@@ -508,8 +508,8 @@ where
                 self.update_fetch_tick_timer();
             }
 
-            NodeInput::FinalizedWavesFetchFailed { hashes } => {
-                self.drive_fetch::<FinalizedWaveBinding>(FetchInput::Failed { ids: hashes });
+            NodeInput::FinalizedWavesFetchFailed { ids } => {
+                self.drive_fetch::<FinalizedWaveBinding>(FetchInput::Failed { ids });
                 self.update_fetch_tick_timer();
             }
         }

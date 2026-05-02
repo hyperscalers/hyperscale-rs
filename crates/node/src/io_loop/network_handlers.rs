@@ -206,9 +206,9 @@ where
                     use hyperscale_messages::response::GetFinalizedWavesResponse;
 
                     let waves: Vec<hyperscale_types::FinalizedWave> = req
-                        .wave_id_hashes
+                        .wave_ids
                         .iter()
-                        .filter_map(|h| fw_cache.get(h).map(|fw| (*fw).clone()))
+                        .filter_map(|id| fw_cache.get(&id.hash()).map(|fw| (*fw).clone()))
                         .collect();
 
                     GetFinalizedWavesResponse::new(waves)

@@ -7,7 +7,7 @@ use hyperscale_core::{Action, FetchOrigin, FetchPeers, FetchRequest};
 use hyperscale_types::Hash;
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockManifest, FinalizedWave, LocalTimestamp, ProvisionHash,
-    Provisions, RoutableTransaction, TopologySnapshot, TxHash, WaveId, WaveIdHash,
+    Provisions, RoutableTransaction, TopologySnapshot, TxHash, WaveId,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -39,14 +39,14 @@ pub struct PendingBlock {
     /// Set of transaction hashes we're still waiting for (`HashSet` for O(1) lookup).
     missing_transaction_hashes: HashSet<TxHash>,
 
-    /// Map of `wave_id` hash -> `Arc<FinalizedWave>` (carries cert + receipts + ECs).
+    /// Map of `WaveId` -> `Arc<FinalizedWave>` (carries cert + receipts + ECs).
     ///
     /// A block is complete once
     /// all its waves have been independently finalized by this validator.
-    received_waves: BTreeMap<WaveIdHash, Arc<FinalizedWave>>,
+    received_waves: BTreeMap<WaveId, Arc<FinalizedWave>>,
 
-    /// Set of `wave_id` hashes we're still waiting for.
-    missing_wave_hashes: HashSet<WaveIdHash>,
+    /// Set of `WaveId`s we're still waiting for.
+    missing_wave_ids: HashSet<WaveId>,
 
     /// Received provisions keyed by provisions hash. `BTreeMap` so
     /// `provisions()` iteration is deterministic across validators.
@@ -73,8 +73,7 @@ impl PendingBlock {
         let total_tx_count = manifest.transaction_count();
         let missing_transaction_hashes: HashSet<TxHash> =
             manifest.tx_hashes.iter().copied().collect();
-        let missing_wave_hashes: HashSet<WaveIdHash> =
-            manifest.cert_ids.iter().map(WaveId::hash).collect();
+        let missing_wave_ids: HashSet<WaveId> = manifest.cert_ids.iter().cloned().collect();
         let missing_provision_hashes: HashSet<ProvisionHash> =
             manifest.provision_hashes.iter().copied().collect();
 
@@ -83,7 +82,7 @@ impl PendingBlock {
             received_transactions: HashMap::with_capacity(total_tx_count),
             missing_transaction_hashes,
             received_waves: BTreeMap::new(),
-            missing_wave_hashes,
+            missing_wave_ids,
             received_provisions: BTreeMap::new(),
             missing_provision_hashes,
             manifest,
@@ -118,7 +117,7 @@ impl PendingBlock {
             received_transactions: HashMap::new(),
             missing_transaction_hashes: HashSet::new(),
             received_waves: BTreeMap::new(),
-            missing_wave_hashes: HashSet::new(),
+            missing_wave_ids: HashSet::new(),
             received_provisions,
             missing_provision_hashes: HashSet::new(),
             manifest,
@@ -133,7 +132,7 @@ impl PendingBlock {
         }
         // Fill in all finalized waves
         for fw in finalized_waves {
-            pending.received_waves.insert(fw.wave_id_hash(), fw);
+            pending.received_waves.insert(fw.wave_id().clone(), fw);
         }
         pending
     }
@@ -155,9 +154,9 @@ impl PendingBlock {
     ///
     /// Returns true if this wave was needed, false if duplicate or not in this block.
     pub fn add_finalized_wave(&mut self, fw: Arc<FinalizedWave>) -> bool {
-        let wave_hash = fw.wave_id_hash();
-        if self.missing_wave_hashes.remove(&wave_hash) {
-            self.received_waves.insert(wave_hash, fw);
+        let wave_id = fw.wave_id().clone();
+        if self.missing_wave_ids.remove(&wave_id) {
+            self.received_waves.insert(wave_id, fw);
             true
         } else {
             false
@@ -167,7 +166,7 @@ impl PendingBlock {
     /// Check if all transactions, finalized waves, and provisions have been received.
     pub fn is_complete(&self) -> bool {
         self.missing_transaction_hashes.is_empty()
-            && self.missing_wave_hashes.is_empty()
+            && self.missing_wave_ids.is_empty()
             && self.missing_provision_hashes.is_empty()
     }
 
@@ -192,14 +191,14 @@ impl PendingBlock {
         self.missing_transaction_hashes.contains(tx_hash)
     }
 
-    /// Get the number of missing wave hashes.
+    /// Get the number of missing waves.
     pub fn missing_wave_count(&self) -> usize {
-        self.missing_wave_hashes.len()
+        self.missing_wave_ids.len()
     }
 
     /// Check if this pending block needs a specific finalized wave.
-    pub fn needs_wave(&self, wave_id_hash: &WaveIdHash) -> bool {
-        self.missing_wave_hashes.contains(wave_id_hash)
+    pub fn needs_wave(&self, wave_id: &WaveId) -> bool {
+        self.missing_wave_ids.contains(wave_id)
     }
 
     /// Add a received provisions.
@@ -225,9 +224,9 @@ impl PendingBlock {
         self.missing_provision_hashes.contains(batch_hash)
     }
 
-    /// Get the missing wave ID hashes as a Vec.
-    pub fn missing_waves(&self) -> Vec<WaveIdHash> {
-        self.missing_wave_hashes.iter().copied().collect()
+    /// Get the missing wave ids as a Vec.
+    pub fn missing_waves(&self) -> Vec<WaveId> {
+        self.missing_wave_ids.iter().cloned().collect()
     }
 
     /// Get all received finalized waves.
@@ -243,7 +242,7 @@ impl PendingBlock {
             return Err(format!(
                 "Cannot construct block: {} transactions, {} waves still missing",
                 self.missing_transaction_hashes.len(),
-                self.missing_wave_hashes.len()
+                self.missing_wave_ids.len()
             ));
         }
 
@@ -264,7 +263,7 @@ impl PendingBlock {
             .manifest
             .cert_ids
             .iter()
-            .filter_map(|id| self.received_waves.get(&id.hash()).cloned())
+            .filter_map(|id| self.received_waves.get(id).cloned())
             .collect();
 
         // Attach provisions in manifest order. `received_provisions` is
@@ -488,8 +487,8 @@ mod tests {
 
         assert_eq!(pb.missing_transaction_count(), 1);
         assert_eq!(pb.missing_wave_count(), 2);
-        assert!(pb.needs_wave(&wave1.hash()));
-        assert!(pb.needs_wave(&wave2.hash()));
+        assert!(pb.needs_wave(&wave1));
+        assert!(pb.needs_wave(&wave2));
         assert!(!pb.is_complete());
     }
 

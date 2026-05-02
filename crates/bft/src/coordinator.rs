@@ -2763,10 +2763,10 @@ impl BftCoordinator {
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         for fw in waves {
-            let wave_id_hash = fw.wave_id_hash();
+            let wave_id = fw.wave_id().clone();
             if let Err(err) = fw.validate_receipts_against_ec() {
                 warn!(
-                    ?wave_id_hash,
+                    ?wave_id,
                     ?err,
                     "Rejecting FinalizedWave: receipts inconsistent with its EC"
                 );
@@ -2775,7 +2775,7 @@ impl BftCoordinator {
             actions.extend(self.check_pending_blocks_for_arrival(
                 topology,
                 "finalized wave",
-                |pending| pending.needs_wave(&wave_id_hash),
+                |pending| pending.needs_wave(&wave_id),
                 |pending| {
                     pending.add_finalized_wave(Arc::clone(fw));
                 },

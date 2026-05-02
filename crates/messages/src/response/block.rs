@@ -3,7 +3,7 @@
 use crate::request::Inventory;
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, CertifiedBlock, FinalizedWave, MessageClass, NetworkMessage,
-    ProvisionHash, Provisions, QuorumCertificate, RoutableTransaction, TxHash, WaveIdHash,
+    ProvisionHash, Provisions, QuorumCertificate, RoutableTransaction, TxHash, WaveId,
 };
 use sbor::prelude::BasicSbor;
 use std::fmt;
@@ -30,8 +30,8 @@ pub struct ElidedCertifiedBlock {
     pub qc: QuorumCertificate,
     /// Per-transaction `(hash, optional body)` pairs; body is `None` when elided.
     pub transactions: Vec<(TxHash, Option<RoutableTransaction>)>,
-    /// Per-certificate `(wave-id hash, optional body)` pairs; body is `None` when elided.
-    pub certificates: Vec<(WaveIdHash, Option<FinalizedWave>)>,
+    /// Per-certificate `(wave id, optional body)` pairs; body is `None` when elided.
+    pub certificates: Vec<(WaveId, Option<FinalizedWave>)>,
     /// Per-provision `(hash, optional body)` pairs. `None` overall preserves the
     /// `Block::Sealed` shape; `Some(_)` preserves `Block::Live`.
     pub provisions: Option<Vec<(ProvisionHash, Option<Provisions>)>>,
@@ -65,13 +65,14 @@ impl ElidedCertifiedBlock {
             .certificates()
             .iter()
             .map(|fw| {
-                let hash = fw.wave_id_hash();
-                let body = if matches_filter(inventory.cert_have.as_ref(), &hash) {
+                let id = fw.wave_id().clone();
+                // `cert_have` bloom is keyed by WaveIdHash; hash at the boundary.
+                let body = if matches_filter(inventory.cert_have.as_ref(), &id.hash()) {
                     None
                 } else {
                     Some((**fw).clone())
                 };
-                (hash, body)
+                (id, body)
             })
             .collect();
 
@@ -128,7 +129,7 @@ impl ElidedCertifiedBlock {
     ) -> Result<CertifiedBlock, RehydrateError>
     where
         FTx: FnMut(&TxHash) -> Option<Arc<RoutableTransaction>>,
-        FCert: FnMut(&WaveIdHash) -> Option<Arc<FinalizedWave>>,
+        FCert: FnMut(&WaveId) -> Option<Arc<FinalizedWave>>,
         FProv: FnMut(&ProvisionHash) -> Option<Arc<Provisions>>,
     {
         // Header + QC are always inline, so the pairing can be checked
@@ -155,14 +156,14 @@ impl ElidedCertifiedBlock {
         }
 
         let mut certs = Vec::with_capacity(self.certificates.len());
-        for (hash, body) in &self.certificates {
+        for (id, body) in &self.certificates {
             if let Some(fw) = body {
                 certs.push(Some(Arc::new(fw.clone())));
-            } else if let Some(resolved) = cert_lookup(hash) {
+            } else if let Some(resolved) = cert_lookup(id) {
                 certs.push(Some(resolved));
             } else {
                 certs.push(None);
-                miss.missing_cert.push(*hash);
+                miss.missing_cert.push(id.clone());
             }
         }
 
@@ -217,8 +218,8 @@ impl ElidedCertifiedBlock {
 pub struct RehydrationMiss {
     /// Transaction hashes whose bodies could not be resolved.
     pub missing_tx: Vec<TxHash>,
-    /// Wave-id hashes whose finalized-wave bodies could not be resolved.
-    pub missing_cert: Vec<WaveIdHash>,
+    /// Wave ids whose finalized-wave bodies could not be resolved.
+    pub missing_cert: Vec<WaveId>,
     /// Provision hashes whose bodies could not be resolved.
     pub missing_provision: Vec<ProvisionHash>,
 }
