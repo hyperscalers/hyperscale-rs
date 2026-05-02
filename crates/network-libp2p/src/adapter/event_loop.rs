@@ -50,8 +50,8 @@ pub(super) async fn run(
     mut consensus_rx: mpsc::UnboundedReceiver<SwarmCommand>,
     mut block_completion_rx: mpsc::UnboundedReceiver<SwarmCommand>,
     mut cross_shard_progress_rx: mpsc::UnboundedReceiver<SwarmCommand>,
-    mut recovery_rx: mpsc::UnboundedReceiver<SwarmCommand>,
-    mut bulk_rx: mpsc::UnboundedReceiver<SwarmCommand>,
+    mut recovery_rx: mpsc::Receiver<SwarmCommand>,
+    mut bulk_rx: mpsc::Receiver<SwarmCommand>,
     mut shutdown_rx: mpsc::Receiver<()>,
     cached_peer_count: Arc<AtomicUsize>,
     local_shard: ShardGroupId,
@@ -451,8 +451,27 @@ fn handle_command(swarm: &mut Swarm<Behaviour>, cmd: SwarmCommand) {
     }
 }
 
+/// `try_recv` shim so [`drain_channel`] can drive both `UnboundedReceiver`
+/// (hot lanes) and `Receiver` (sheddable bounded lanes) without a second
+/// helper.
+trait TryRecvCmd {
+    fn try_recv(&mut self) -> Result<SwarmCommand, mpsc::error::TryRecvError>;
+}
+
+impl TryRecvCmd for mpsc::UnboundedReceiver<SwarmCommand> {
+    fn try_recv(&mut self) -> Result<SwarmCommand, mpsc::error::TryRecvError> {
+        Self::try_recv(self)
+    }
+}
+
+impl TryRecvCmd for mpsc::Receiver<SwarmCommand> {
+    fn try_recv(&mut self) -> Result<SwarmCommand, mpsc::error::TryRecvError> {
+        Self::try_recv(self)
+    }
+}
+
 /// Drain up to [`MAX_COMMANDS_PER_DRAIN`] pending commands from a single channel.
-fn drain_channel(swarm: &mut Swarm<Behaviour>, rx: &mut mpsc::UnboundedReceiver<SwarmCommand>) {
+fn drain_channel<R: TryRecvCmd>(swarm: &mut Swarm<Behaviour>, rx: &mut R) {
     for _ in 0..MAX_COMMANDS_PER_DRAIN {
         match rx.try_recv() {
             Ok(cmd) => handle_command(swarm, cmd),
