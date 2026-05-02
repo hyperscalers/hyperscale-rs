@@ -14,8 +14,7 @@
 
 use hyperscale_core::{Action, CommitSource, ProtocolEvent, TimerId};
 use hyperscale_types::{
-    BlockHash, LocalTimestamp, ProposerTimestamp, ProvisionHash, WaveId, WaveIdHash,
-    WeightedTimestamp,
+    BlockHash, LocalTimestamp, ProposerTimestamp, ProvisionHash, WaveId, WeightedTimestamp,
 };
 
 /// BFT statistics for monitoring.
@@ -984,7 +983,7 @@ impl BftCoordinator {
         header: &BlockHeader,
         manifest: BlockManifest,
         lookup_tx: impl Fn(&TxHash) -> Option<Arc<RoutableTransaction>>,
-        lookup_finalized_wave: impl Fn(&WaveIdHash) -> Option<Arc<FinalizedWave>>,
+        lookup_finalized_wave: impl Fn(&WaveId) -> Option<Arc<FinalizedWave>>,
         lookup_provision: impl Fn(&ProvisionHash) -> Option<Arc<Provisions>>,
     ) -> Vec<Action> {
         let block_hash = header.hash();
@@ -1155,7 +1154,7 @@ impl BftCoordinator {
         header: BlockHeader,
         manifest: BlockManifest,
         lookup_tx: impl Fn(&TxHash) -> Option<Arc<RoutableTransaction>>,
-        lookup_finalized_wave: impl Fn(&WaveIdHash) -> Option<Arc<FinalizedWave>>,
+        lookup_finalized_wave: impl Fn(&WaveId) -> Option<Arc<FinalizedWave>>,
         lookup_provision: impl Fn(&ProvisionHash) -> Option<Arc<Provisions>>,
     ) {
         let block_hash = header.hash();
@@ -1167,7 +1166,7 @@ impl BftCoordinator {
             }
         }
         for wave_id in pending.manifest().cert_ids.clone() {
-            if let Some(fw) = lookup_finalized_wave(&wave_id.hash()) {
+            if let Some(fw) = lookup_finalized_wave(&wave_id) {
                 pending.add_finalized_wave(fw);
             }
         }

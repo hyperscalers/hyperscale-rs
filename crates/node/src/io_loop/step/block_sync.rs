@@ -219,7 +219,7 @@ where
         let provision_store = &self.caches.provision_store;
         elided.try_rehydrate(
             |h| mempool.get_transaction(h),
-            |id| execution.get_finalized_wave_by_hash(&id.hash()),
+            |id| execution.get_finalized_wave(id),
             |h| provision_store.get(h),
         )
     }

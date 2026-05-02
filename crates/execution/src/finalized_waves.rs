@@ -50,14 +50,10 @@ impl FinalizedWaveStore {
         self.waves.values().map(|fw| Arc::new(fw.clone())).collect()
     }
 
-    /// Lookup by the hash of a wave's `WaveId`. Peers reference waves by
-    /// `wave_id.hash()` in fetch requests, so this is the primary ingress
-    /// lookup for serving finalized-wave data.
-    pub fn get_by_wave_id_hash(&self, wave_id_hash: &WaveIdHash) -> Option<Arc<FinalizedWave>> {
-        self.waves
-            .values()
-            .find(|fw| fw.certificate.wave_id.hash() == *wave_id_hash)
-            .map(|fw| Arc::new(fw.clone()))
+    /// Lookup by `WaveId`. Peers reference waves by id in fetch requests,
+    /// so this is the primary ingress lookup for serving finalized-wave data.
+    pub fn get(&self, wave_id: &WaveId) -> Option<Arc<FinalizedWave>> {
+        self.waves.get(wave_id).map(|fw| Arc::new(fw.clone()))
     }
 
     /// Certificate containing `tx_hash`, if any. Used to answer
@@ -188,25 +184,18 @@ mod tests {
     }
 
     #[test]
-    fn lookup_by_wave_id_hash_matches_inserted_wave() {
+    fn lookup_by_wave_id_matches_inserted_wave() {
         let mut store = FinalizedWaveStore::new();
         let tx = TxHash::from_raw(Hash::from_bytes(b"tx1"));
         let (wid, fw) = make_finalized_wave(1, &[tx]);
-        let expected_hash = wid.hash();
 
         store.insert(wid.clone(), fw);
 
-        let looked_up = store
-            .get_by_wave_id_hash(&expected_hash)
-            .expect("wave present by hash");
+        let looked_up = store.get(&wid).expect("wave present by id");
         assert_eq!(looked_up.certificate.wave_id, wid);
 
-        // Unknown hash returns None.
-        assert!(
-            store
-                .get_by_wave_id_hash(&WaveIdHash::from_raw(Hash::from_bytes(b"unknown")))
-                .is_none()
-        );
+        // Unknown id returns None.
+        assert!(store.get(&make_wave_id(99)).is_none());
     }
 
     #[test]

@@ -1581,13 +1581,10 @@ impl ExecutionCoordinator {
         self.finalized.all_waves()
     }
 
-    /// Get a finalized wave by its `wave_id` hash (returns `Arc` for sharing).
+    /// Get a finalized wave by its `WaveId` (returns `Arc` for sharing).
     #[must_use]
-    pub fn get_finalized_wave_by_hash(
-        &self,
-        wave_id_hash: &WaveIdHash,
-    ) -> Option<Arc<FinalizedWave>> {
-        self.finalized.get_by_wave_id_hash(wave_id_hash)
+    pub fn get_finalized_wave(&self, wave_id: &WaveId) -> Option<Arc<FinalizedWave>> {
+        self.finalized.get(wave_id)
     }
 
     /// Bloom filter over every tracked finalized-wave id hash. Attached to
@@ -2512,7 +2509,7 @@ mod tests {
         let _ = state.finalize_wave(&wave_id);
         let finalized = state
             .finalized
-            .get_by_wave_id_hash(&wave_id.hash())
+            .get(&wave_id)
             .expect("wave must be in the finalized store after finalize_wave");
 
         // Sanity: state is populated across sub-machines.
