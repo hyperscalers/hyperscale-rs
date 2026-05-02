@@ -218,6 +218,10 @@ pub struct RequestManager {
     /// independently by `config.sheddable_max_concurrent` so catchup /
     /// DA-backfill bursts can't starve the hot-path classes.
     sheddable_in_flight: AtomicUsize,
+    /// Per-class in-flight counters used to drive the
+    /// `request_slots_in_flight{class}` gauge. Indexed by class
+    /// discriminant (0..=4). Sum equals `in_flight`.
+    per_class_in_flight: [AtomicUsize; 5],
     /// Current effective concurrency limit (may be reduced adaptively).
     effective_concurrent: AtomicUsize,
 }
@@ -235,8 +239,28 @@ impl RequestManager {
             }),
             in_flight: AtomicUsize::new(0),
             sheddable_in_flight: AtomicUsize::new(0),
+            per_class_in_flight: [
+                AtomicUsize::new(0),
+                AtomicUsize::new(0),
+                AtomicUsize::new(0),
+                AtomicUsize::new(0),
+                AtomicUsize::new(0),
+            ],
             effective_concurrent: AtomicUsize::new(effective),
             config,
+        }
+    }
+
+    /// Map a `MessageClass` onto the index used by `per_class_in_flight`.
+    /// Mirrors the enum discriminant order in `crates/types/src/network.rs`.
+    #[inline]
+    pub(super) const fn class_index(class: hyperscale_types::MessageClass) -> usize {
+        match class {
+            hyperscale_types::MessageClass::Consensus => 0,
+            hyperscale_types::MessageClass::BlockCompletion => 1,
+            hyperscale_types::MessageClass::CrossShardProgress => 2,
+            hyperscale_types::MessageClass::Recovery => 3,
+            hyperscale_types::MessageClass::Bulk => 4,
         }
     }
 
@@ -281,10 +305,7 @@ impl RequestManager {
             )
             .await;
 
-        self.in_flight.fetch_sub(1, Ordering::SeqCst);
-        if uses_relaxed_retry(class) {
-            self.sheddable_in_flight.fetch_sub(1, Ordering::SeqCst);
-        }
+        self.release_slot(class);
 
         result
     }

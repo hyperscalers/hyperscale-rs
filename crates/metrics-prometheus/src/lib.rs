@@ -138,6 +138,16 @@ pub struct Metrics {
     pub network_request_retries: CounterVec,
     pub early_arrival_evictions: Counter,
     pub backpressure_events: CounterVec,
+
+    // === Network class accounting ===
+    /// Per-class in-flight request slot count.
+    pub request_slots_in_flight: GaugeVec,
+    /// `acquire_slot` wait time histogram, per class.
+    pub request_slot_wait: HistogramVec,
+    /// Gossipsub validation outcomes (accept / reject / ignore).
+    pub gossipsub_validations: CounterVec,
+    /// Inbound serving stream count, per protocol.
+    pub inbound_streams_in_use: GaugeVec,
 }
 
 impl Metrics {
@@ -698,6 +708,38 @@ impl Metrics {
                 &["source"]
             )
             .unwrap(),
+
+            request_slots_in_flight: register_gauge_vec!(
+                "hyperscale_request_slots_in_flight",
+                "In-flight request slots, broken down by message class",
+                &["class"]
+            )
+            .unwrap(),
+
+            request_slot_wait: register_histogram_vec!(
+                "hyperscale_request_slot_wait_seconds",
+                "Time spent inside acquire_slot before admission",
+                &["class"],
+                vec![
+                    0.000_1, 0.000_5, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
+                    5.0, 10.0,
+                ]
+            )
+            .unwrap(),
+
+            gossipsub_validations: register_counter_vec!(
+                "hyperscale_gossipsub_validations_total",
+                "Gossipsub validation outcomes (accept / reject / ignore)",
+                &["outcome"]
+            )
+            .unwrap(),
+
+            inbound_streams_in_use: register_gauge_vec!(
+                "hyperscale_inbound_streams_in_use",
+                "Inbound serving streams in flight, per protocol",
+                &["protocol"]
+            )
+            .unwrap(),
         }
     }
 }
@@ -940,6 +982,38 @@ impl MetricsRecorder for PrometheusRecorder {
 
     fn record_early_arrival_eviction(&self) {
         self.metrics.early_arrival_evictions.inc();
+    }
+
+    fn set_request_slots_in_flight(&self, class: &str, count: usize) {
+        #[allow(clippy::cast_precision_loss)]
+        // count is bounded by RequestManagerConfig::max_concurrent (≤ 64)
+        self.metrics
+            .request_slots_in_flight
+            .with_label_values(&[class])
+            .set(count as f64);
+    }
+
+    fn record_request_slot_wait(&self, class: &str, wait_secs: f64) {
+        self.metrics
+            .request_slot_wait
+            .with_label_values(&[class])
+            .observe(wait_secs);
+    }
+
+    fn record_gossipsub_validation(&self, outcome: &str) {
+        self.metrics
+            .gossipsub_validations
+            .with_label_values(&[outcome])
+            .inc();
+    }
+
+    fn set_inbound_streams_in_use(&self, protocol: &str, count: usize) {
+        #[allow(clippy::cast_precision_loss)]
+        // count is bounded by MAX_INBOUND_CONCURRENT (= 128)
+        self.metrics
+            .inbound_streams_in_use
+            .with_label_values(&[protocol])
+            .set(count as f64);
     }
 
     // ── Sync ─────────────────────────────────────────────────────────

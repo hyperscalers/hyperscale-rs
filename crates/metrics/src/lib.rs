@@ -345,6 +345,29 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// Record an early arrival eviction.
     fn record_early_arrival_eviction(&self) {}
 
+    /// Set the in-flight request slot count for a `MessageClass`.
+    ///
+    /// Sampled by the request manager whenever a slot is acquired or
+    /// released. The total across classes equals the global `in_flight`.
+    fn set_request_slots_in_flight(&self, class: &str, count: usize) {}
+
+    /// Record how long a request waited inside the `acquire_slot` CAS loop
+    /// before admission. P99 spikes on a sheddable class mean the subset
+    /// cap is biting; spikes on hot classes mean the global pool is
+    /// saturated.
+    fn record_request_slot_wait(&self, class: &str, wait_secs: f64) {}
+
+    /// Record a gossipsub validation outcome (`accept` / `reject` /
+    /// `ignore`). Reject spikes mean peers are sending invalid data;
+    /// `ignore` spikes typically mean handler panics or unregistered
+    /// topics.
+    fn record_gossipsub_validation(&self, outcome: &str) {}
+
+    /// Set the inbound serving stream count for a protocol
+    /// (`request` / `notify`). Approaching `MAX_INBOUND_CONCURRENT`
+    /// means new inbound streams are about to be rejected.
+    fn set_inbound_streams_in_use(&self, protocol: &str, count: usize) {}
+
     // ── Sync ─────────────────────────────────────────────────────────
     //
     // Two scopes share these metrics: `kind="block"` for block-sync and
@@ -757,6 +780,30 @@ pub fn record_backpressure_event(source: &str) {
 #[inline]
 pub fn record_early_arrival_eviction() {
     recorder().record_early_arrival_eviction();
+}
+
+/// Set the in-flight request slot count for a class.
+#[inline]
+pub fn set_request_slots_in_flight(class: &str, count: usize) {
+    recorder().set_request_slots_in_flight(class, count);
+}
+
+/// Record `acquire_slot` wait time.
+#[inline]
+pub fn record_request_slot_wait(class: &str, wait_secs: f64) {
+    recorder().record_request_slot_wait(class, wait_secs);
+}
+
+/// Record a gossipsub validation outcome.
+#[inline]
+pub fn record_gossipsub_validation(outcome: &str) {
+    recorder().record_gossipsub_validation(outcome);
+}
+
+/// Set the inbound serving stream count for a protocol.
+#[inline]
+pub fn set_inbound_streams_in_use(protocol: &str, count: usize) {
+    recorder().set_inbound_streams_in_use(protocol, count);
 }
 
 // ── Sync ─────────────────────────────────────────────────────────────

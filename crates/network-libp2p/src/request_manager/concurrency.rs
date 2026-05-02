@@ -1,6 +1,7 @@
 //! Adaptive concurrency control for request management.
 
 use super::{RequestError, RequestManager, uses_relaxed_retry};
+use hyperscale_metrics as metrics;
 use hyperscale_types::MessageClass;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -91,6 +92,10 @@ impl RequestManager {
                 if sheddable {
                     self.sheddable_in_flight.fetch_add(1, Ordering::SeqCst);
                 }
+                let idx = Self::class_index(class);
+                let class_now = self.per_class_in_flight[idx].fetch_add(1, Ordering::SeqCst) + 1;
+                metrics::set_request_slots_in_flight(class.as_str(), class_now);
+                metrics::record_request_slot_wait(class.as_str(), start.elapsed().as_secs_f64());
                 return Ok(());
             }
 
@@ -103,11 +108,24 @@ impl RequestManager {
                     ?class,
                     "Timed out waiting for concurrency slot"
                 );
+                metrics::record_request_slot_wait(class.as_str(), start.elapsed().as_secs_f64());
                 return Err(RequestError::Exhausted { attempts: 0 });
             }
 
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    /// Release a slot held by `class`. Decrements the global, per-class,
+    /// and (if applicable) sheddable counters and re-emits the gauge.
+    pub(super) fn release_slot(&self, class: MessageClass) {
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        if uses_relaxed_retry(class) {
+            self.sheddable_in_flight.fetch_sub(1, Ordering::SeqCst);
+        }
+        let idx = Self::class_index(class);
+        let class_now = self.per_class_in_flight[idx].fetch_sub(1, Ordering::SeqCst) - 1;
+        metrics::set_request_slots_in_flight(class.as_str(), class_now);
     }
 
     /// Reduce effective concurrency due to poor network conditions.

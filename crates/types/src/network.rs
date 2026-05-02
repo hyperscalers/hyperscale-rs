@@ -101,6 +101,19 @@ impl MessageClass {
     pub const fn is_droppable(&self) -> bool {
         matches!(self, Self::Recovery | Self::Bulk)
     }
+
+    /// Stable string name used as a metric label.
+    #[inline]
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Consensus => "consensus",
+            Self::BlockCompletion => "block_completion",
+            Self::CrossShardProgress => "cross_shard_progress",
+            Self::Recovery => "recovery",
+            Self::Bulk => "bulk",
+        }
+    }
 }
 
 /// Marker trait for network messages.

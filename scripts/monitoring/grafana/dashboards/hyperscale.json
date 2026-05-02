@@ -2012,12 +2012,267 @@
       "type": "timeseries"
     },
     {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "In-flight request slots broken down by message class. Sheddable classes (Recovery, Bulk) are capped at sheddable_max_concurrent (default 16/64) so a catchup or DA-backfill flood cannot starve hot-path traffic. A blue stack growing while orange flatlines is the symptom this cap was added to prevent.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "axisCenteredZero": false,
+            "drawStyle": "line",
+            "fillOpacity": 30,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {"group": "A", "mode": "normal"}
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 60},
+      "id": 130,
+      "options": {
+        "legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "none"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${datasource}"},
+          "expr": "avg by (class) (hyperscale_request_slots_in_flight)",
+          "legendFormat": "{{class}}",
+          "refId": "A"
+        }
+      ],
+      "title": "In-flight Request Slots by Class",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Drop rate on the bounded sheddable command channels (Recovery, Bulk). Steady state is zero. Any non-zero rate means the channel cap is biting — operator should look at whether the matching class is overproducing or whether the swarm event loop is draining too slowly.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "axisCenteredZero": false,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {"group": "A", "mode": "none"}
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 60},
+      "id": 131,
+      "options": {
+        "legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "none"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${datasource}"},
+          "expr": "sum by (source) (rate(hyperscale_backpressure_events_total{source=~\"recovery_channel|bulk_channel\"}[1m]))",
+          "legendFormat": "{{source}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Sheddable Channel Drops",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "P99 acquire_slot wait time per class. P99 ≪ 10ms in steady state. A spike on a sheddable class (Recovery/Bulk) means the subset cap is biting; a spike on hot classes (Consensus/BlockCompletion/CrossShardProgress) means the global pool is saturated and the adaptive throttle should be kicking in.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "axisCenteredZero": false,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {"group": "A", "mode": "none"}
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 60},
+      "id": 132,
+      "options": {
+        "legend": {"calcs": ["max"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "none"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${datasource}"},
+          "expr": "histogram_quantile(0.99, sum by (class, le) (rate(hyperscale_request_slot_wait_seconds_bucket[1m])))",
+          "legendFormat": "P99 {{class}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Request Slot Wait P99 by Class",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Gossipsub message validation outcomes. Accept dominates in healthy state. Reject spikes indicate peers are sending invalid data (or our verification is wrong). Ignore spikes mean handler panics (caught by VerdictGuard) or unregistered topics.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "axisCenteredZero": false,
+            "drawStyle": "line",
+            "fillOpacity": 30,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {"group": "A", "mode": "normal"}
+          },
+          "unit": "ops"
+        },
+        "overrides": [
+          {
+            "matcher": {"id": "byName", "options": "accept"},
+            "properties": [{"id": "color", "value": {"fixedColor": "green", "mode": "fixed"}}]
+          },
+          {
+            "matcher": {"id": "byName", "options": "reject"},
+            "properties": [{"id": "color", "value": {"fixedColor": "red", "mode": "fixed"}}]
+          },
+          {
+            "matcher": {"id": "byName", "options": "ignore"},
+            "properties": [{"id": "color", "value": {"fixedColor": "yellow", "mode": "fixed"}}]
+          }
+        ]
+      },
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 68},
+      "id": 133,
+      "options": {
+        "legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "none"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${datasource}"},
+          "expr": "sum by (outcome) (rate(hyperscale_gossipsub_validations_total[1m]))",
+          "legendFormat": "{{outcome}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Gossipsub Validation Outcomes",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Inbound serving streams in flight against MAX_INBOUND_CONCURRENT (= 128). Approaching the cap means peers are about to be rejected at accept(). A flat ceiling here pairs with a peer-visible 'inbound stream dropped' warning in the logs.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "axisCenteredZero": false,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {"group": "A", "mode": "none"},
+            "thresholdsStyle": {"mode": "line"}
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "red", "value": 128}
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 68},
+      "id": 134,
+      "options": {
+        "legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "none"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${datasource}"},
+          "expr": "avg(hyperscale_inbound_streams_in_use)",
+          "legendFormat": "Inbound (avg/validator)",
+          "refId": "A"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${datasource}"},
+          "expr": "max(hyperscale_inbound_streams_in_use)",
+          "legendFormat": "Inbound (max/validator)",
+          "refId": "B"
+        }
+      ],
+      "title": "Inbound Streams In Use",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Network request retry rate by request_type. Sustained non-zero rates point to packet loss or unhealthy peers; the request manager rotates peer after retries_before_rotation attempts.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "axisCenteredZero": false,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {"group": "A", "mode": "none"}
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 68},
+      "id": 135,
+      "options": {
+        "legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "none"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${datasource}"},
+          "expr": "sum by (request_type) (rate(hyperscale_network_request_retries_total[1m]))",
+          "legendFormat": "{{request_type}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Network Request Retries by Type",
+      "type": "timeseries"
+    },
+    {
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 52
+        "y": 76
       },
       "id": 104,
       "panels": [],
@@ -2082,7 +2337,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 53
+        "y": 77
       },
       "id": 40,
       "options": {
@@ -2200,7 +2455,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 53
+        "y": 77
       },
       "id": 41,
       "options": {
@@ -2264,7 +2519,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 61
+        "y": 85
       },
       "id": 105,
       "panels": [],
@@ -2330,7 +2585,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 78
+        "y": 102
       },
       "id": 50,
       "options": {
@@ -2421,7 +2676,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 62
+        "y": 86
       },
       "id": 51,
       "options": {
@@ -2520,7 +2775,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 62
+        "y": 86
       },
       "id": 52,
       "options": {
@@ -2620,7 +2875,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 78
+        "y": 102
       },
       "id": 56,
       "options": {
@@ -2710,7 +2965,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 62
+        "y": 86
       },
       "id": 57,
       "options": {
@@ -2809,7 +3064,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 78
+        "y": 102
       },
       "id": 58,
       "options": {
@@ -2846,7 +3101,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 94
+        "y": 118
       },
       "id": 110,
       "panels": [],
@@ -2905,7 +3160,7 @@
         "h": 4,
         "w": 4,
         "x": 0,
-        "y": 95
+        "y": 119
       },
       "id": 111,
       "options": {
@@ -2978,7 +3233,7 @@
         "h": 4,
         "w": 4,
         "x": 4,
-        "y": 95
+        "y": 119
       },
       "id": 112,
       "options": {
@@ -3038,7 +3293,7 @@
         "h": 4,
         "w": 4,
         "x": 8,
-        "y": 95
+        "y": 119
       },
       "id": 113,
       "options": {
@@ -3158,7 +3413,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 103
+        "y": 127
       },
       "id": 114,
       "options": {
@@ -3258,7 +3513,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 99
+        "y": 123
       },
       "id": 115,
       "options": {
@@ -3365,7 +3620,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 103
+        "y": 127
       },
       "id": 116,
       "options": {
@@ -3411,7 +3666,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 111
+        "y": 135
       },
       "id": 106,
       "panels": [],
@@ -3477,7 +3732,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 112
+        "y": 136
       },
       "id": 60,
       "options": {
@@ -3568,7 +3823,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 112
+        "y": 136
       },
       "id": 61,
       "options": {
@@ -3659,7 +3914,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 112
+        "y": 136
       },
       "id": 62,
       "options": {
@@ -3723,7 +3978,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 120
+        "y": 144
       },
       "id": 200,
       "panels": [],
@@ -3809,7 +4064,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 121
+        "y": 145
       },
       "id": 201,
       "options": {
@@ -3926,7 +4181,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 121
+        "y": 145
       },
       "id": 202,
       "options": {
@@ -4026,7 +4281,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 121
+        "y": 145
       },
       "id": 203,
       "options": {
@@ -4063,7 +4318,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 130
+        "y": 154
       },
       "id": 107,
       "panels": [],
@@ -4129,7 +4384,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 131
+        "y": 155
       },
       "id": 70,
       "options": {
@@ -4219,7 +4474,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 139
+        "y": 163
       },
       "id": 71,
       "options": {
@@ -4498,7 +4753,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 139
+        "y": 163
       },
       "id": 120,
       "options": {
@@ -4598,7 +4853,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 139
+        "y": 163
       },
       "id": 80,
       "options": {
@@ -4707,7 +4962,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 147
+        "y": 171
       },
       "id": 81,
       "options": {
@@ -4781,7 +5036,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 165
+        "y": 189
       },
       "id": 300,
       "panels": [],
@@ -4847,7 +5102,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 166
+        "y": 190
       },
       "id": 301,
       "options": {
@@ -4938,7 +5193,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 166
+        "y": 190
       },
       "id": 302,
       "options": {
@@ -5029,7 +5284,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 166
+        "y": 190
       },
       "id": 303,
       "options": {
@@ -5120,7 +5375,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 174
+        "y": 198
       },
       "id": 304,
       "options": {
@@ -5211,7 +5466,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 174
+        "y": 198
       },
       "id": 306,
       "options": {
@@ -5302,7 +5557,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 174
+        "y": 198
       },
       "id": 307,
       "options": {
@@ -5393,7 +5648,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 182
+        "y": 206
       },
       "id": 308,
       "options": {
@@ -5431,7 +5686,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 190
+        "y": 214
       },
       "id": 310,
       "panels": [],
@@ -5497,7 +5752,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 191
+        "y": 215
       },
       "id": 311,
       "options": {
@@ -5588,7 +5843,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 191
+        "y": 215
       },
       "id": 312,
       "options": {
@@ -5689,7 +5944,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 199
+        "y": 223
       },
       "id": 313,
       "options": {

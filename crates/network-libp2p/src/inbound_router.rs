@@ -261,6 +261,7 @@ impl InboundRouter {
             );
             return None;
         };
+        self.update_inbound_gauge();
         Some(permit)
     }
 
@@ -269,6 +270,16 @@ impl InboundRouter {
         if let Some(counter) = self.per_peer.get(peer_id) {
             counter.fetch_sub(1, Ordering::Relaxed);
         }
+        self.update_inbound_gauge();
+    }
+
+    /// Update the global inbound-streams-in-use gauge from the semaphore.
+    /// Cheap (atomic read) and the only place we centrally know the
+    /// occupancy without threading a counter through every spawn site.
+    fn update_inbound_gauge(&self) {
+        let in_use =
+            MAX_INBOUND_CONCURRENT.saturating_sub(self.global_semaphore.available_permits());
+        metrics::set_inbound_streams_in_use("all", in_use);
     }
 
     /// Record a stream failure for a peer. If failures exceed the threshold
