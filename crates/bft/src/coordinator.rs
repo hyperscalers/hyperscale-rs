@@ -14,7 +14,8 @@
 
 use hyperscale_core::{Action, CommitSource, ProtocolEvent, TimerId};
 use hyperscale_types::{
-    BlockHash, LocalTimestamp, ProposerTimestamp, ProvisionHash, WaveIdHash, WeightedTimestamp,
+    BlockHash, LocalTimestamp, ProposerTimestamp, ProvisionHash, WaveId, WaveIdHash,
+    WeightedTimestamp,
 };
 
 /// BFT statistics for monitoring.
@@ -2221,7 +2222,7 @@ impl BftCoordinator {
             block
                 .certificates()
                 .iter()
-                .map(|cert| cert.wave_id().hash()),
+                .map(|cert| cert.wave_id().clone()),
         );
 
         // Reset backoff tracking — new height means fresh round counting.
@@ -3146,7 +3147,7 @@ impl BftCoordinator {
         &self,
         parent_block_hash: BlockHash,
     ) -> (
-        std::collections::HashSet<WaveIdHash>,
+        std::collections::HashSet<WaveId>,
         std::collections::HashSet<TxHash>,
         std::collections::HashSet<ProvisionHash>,
     ) {
