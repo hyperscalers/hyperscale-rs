@@ -18,7 +18,7 @@ use hyperscale_storage::{
 };
 use hyperscale_types::{
     BlockHash, BlockHeight, CertifiedBlock, ExecutionCertificateHash, NodeId, QuorumCertificate,
-    RoutableTransaction, ShardGroupId, StateRoot, TxHash, WaveCertificate, WaveIdHash,
+    RoutableTransaction, ShardGroupId, StateRoot, TxHash, WaveCertificate, WaveId, WaveIdHash,
 };
 use std::sync::Arc;
 
@@ -230,8 +230,9 @@ impl hyperscale_storage::ChainReader for SharedStorage {
         self.0.get_transactions_batch(hashes)
     }
 
-    fn get_certificates_batch(&self, hashes: &[WaveIdHash]) -> Vec<WaveCertificate> {
-        self.0.get_certificates_batch(hashes)
+    fn get_certificates_batch(&self, ids: &[WaveId]) -> Vec<WaveCertificate> {
+        let hashes: Vec<WaveIdHash> = ids.iter().map(WaveId::hash).collect();
+        self.0.get_certificates_batch(&hashes)
     }
 
     fn get_consensus_receipt(

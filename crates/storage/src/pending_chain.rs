@@ -794,7 +794,7 @@ mod tests {
         }
         fn get_certificates_batch(
             &self,
-            _hashes: &[hyperscale_types::WaveIdHash],
+            _ids: &[hyperscale_types::WaveId],
         ) -> Vec<hyperscale_types::WaveCertificate> {
             Vec::new()
         }

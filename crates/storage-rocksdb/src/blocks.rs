@@ -148,19 +148,13 @@ impl RocksDbStorage {
         }
 
         // 3. Batch-fetch certificates (preserving order)
-        let cert_hashes: Vec<WaveIdHash> = metadata
-            .manifest
-            .cert_ids
-            .iter()
-            .map(WaveId::hash)
-            .collect();
-        let certs = self.get_certificates_batch_ordered(&cert_hashes);
+        let certs = self.get_certificates_batch_ordered(&metadata.manifest.cert_ids);
 
         // Verify we got ALL certificates - return None if any are missing
-        if certs.len() != cert_hashes.len() {
+        if certs.len() != metadata.manifest.cert_ids.len() {
             tracing::warn!(
                 height = height.0,
-                expected = cert_hashes.len(),
+                expected = metadata.manifest.cert_ids.len(),
                 found = certs.len(),
                 "Block has missing certificates - cannot serve sync request"
             );
@@ -264,19 +258,13 @@ impl RocksDbStorage {
         }
 
         // 3. Try to batch-fetch certificates (preserving order)
-        let cert_hashes: Vec<WaveIdHash> = metadata
-            .manifest
-            .cert_ids
-            .iter()
-            .map(WaveId::hash)
-            .collect();
-        let certs = self.get_certificates_batch_ordered(&cert_hashes);
+        let certs = self.get_certificates_batch_ordered(&metadata.manifest.cert_ids);
 
         // Check if all certificates are present - if not, return None
-        if certs.len() != cert_hashes.len() {
+        if certs.len() != metadata.manifest.cert_ids.len() {
             tracing::debug!(
                 height = height.0,
-                expected = cert_hashes.len(),
+                expected = metadata.manifest.cert_ids.len(),
                 found = certs.len(),
                 "Block has missing certificates - cannot serve sync request"
             );
@@ -348,26 +336,26 @@ impl RocksDbStorage {
             .collect()
     }
 
-    /// Get multiple certificates by hash, preserving order.
+    /// Get multiple certificates by `WaveId`, preserving order.
     ///
     /// Unlike `get_certificates_batch`, this returns results in the same order
-    /// as the input hashes, with missing entries causing the result to be shorter.
+    /// as the input ids, with missing entries causing the result to be shorter.
     /// Callers should check that the result length matches the input length.
-    fn get_certificates_batch_ordered(&self, hashes: &[WaveIdHash]) -> Vec<Arc<WaveCertificate>> {
-        if hashes.is_empty() {
+    fn get_certificates_batch_ordered(&self, ids: &[WaveId]) -> Vec<Arc<WaveCertificate>> {
+        if ids.is_empty() {
             return vec![];
         }
 
-        let raw: Vec<Hash> = hashes.iter().map(|h| h.into_raw()).collect();
+        let raw: Vec<Hash> = ids.iter().map(|id| id.hash().into_raw()).collect();
         let results = self.cf_multi_get::<CertificatesCf>(&raw);
 
         results
             .into_iter()
-            .zip(hashes.iter())
-            .filter_map(|(result, hash)| {
+            .zip(ids.iter())
+            .filter_map(|(result, id)| {
                 result.map_or_else(
                     || {
-                        tracing::trace!(?hash, "Certificate not found in storage");
+                        tracing::trace!(?id, "Certificate not found in storage");
                         None
                     },
                     |cert| Some(Arc::new(cert)),

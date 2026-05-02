@@ -6,7 +6,7 @@
 use hyperscale_types::{
     Block, BlockHash, BlockHeight, CertifiedBlock, CommittedBlockHeader, ConsensusReceipt,
     ExecutionCertificate, ExecutionCertificateHash, ProvisionHash, QuorumCertificate,
-    RoutableTransaction, ShardGroupId, TxHash, WaveCertificate, WaveIdHash,
+    RoutableTransaction, ShardGroupId, TxHash, WaveCertificate, WaveId,
 };
 use std::sync::Arc;
 
@@ -67,10 +67,10 @@ pub trait ChainReader: Send + Sync + 'static {
     /// Returns only transactions that were found (missing hashes are skipped).
     fn get_transactions_batch(&self, hashes: &[TxHash]) -> Vec<RoutableTransaction>;
 
-    /// Get multiple certificates by hash (batch read).
+    /// Get multiple certificates by `WaveId` (batch read).
     ///
-    /// Returns only certificates that were found (missing hashes are skipped).
-    fn get_certificates_batch(&self, hashes: &[WaveIdHash]) -> Vec<WaveCertificate>;
+    /// Returns only certificates that were found (missing ids are skipped).
+    fn get_certificates_batch(&self, ids: &[WaveId]) -> Vec<WaveCertificate>;
 
     // ─── Receipt Storage ──────────────────────────────────────────────────
 
