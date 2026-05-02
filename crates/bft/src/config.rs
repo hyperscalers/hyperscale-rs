@@ -29,6 +29,15 @@ pub struct BftConfig {
     /// Default: 30 seconds (reasonable upper bound for most networks).
     pub view_change_timeout_max: Option<Duration>,
 
+    /// Absolute ceiling on view-change suppression while a block is in
+    /// progress at the proposal tip — fetching content, awaiting our QC,
+    /// or waiting for vote propagation. Bounds how long a Byzantine
+    /// proposer can stall the round timer purely by keeping a header
+    /// alive without ever advancing the chain. Once this elapses since
+    /// the last leader-activity reset, the timer fires regardless of
+    /// pending work.
+    pub max_progress_wait: Duration,
+
     /// Maximum transactions per block.
     pub max_transactions_per_block: usize,
 
@@ -77,6 +86,7 @@ impl Default for BftConfig {
             view_change_timeout: Duration::from_secs(3),
             view_change_timeout_increment: Duration::from_secs(1),
             view_change_timeout_max: Some(Duration::from_secs(30)),
+            max_progress_wait: Duration::from_secs(9),
             max_transactions_per_block: 4096,
             max_finalized_transactions_per_block: 8192,
             max_provision_transactions_per_block: 4096,
@@ -117,6 +127,14 @@ impl BftConfig {
     #[must_use]
     pub const fn with_view_change_timeout_max(mut self, max: Option<Duration>) -> Self {
         self.view_change_timeout_max = max;
+        self
+    }
+
+    /// Set the absolute ceiling on view-change suppression while a block
+    /// is in progress at the proposal tip.
+    #[must_use]
+    pub const fn with_max_progress_wait(mut self, wait: Duration) -> Self {
+        self.max_progress_wait = wait;
         self
     }
 

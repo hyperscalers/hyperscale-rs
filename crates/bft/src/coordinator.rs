@@ -457,26 +457,43 @@ impl BftCoordinator {
     /// the view if the leader fails. When a syncing node becomes the proposer
     /// after a view change, they propose an empty sync block.
     fn should_advance_round(&self) -> bool {
-        // Don't view-change while we're actively processing the leader's
-        // block — either assembling it (pending) or verifying it. The
-        // timeout should detect leader failure, not slow processing.
+        // Don't view-change while we're actively processing or waiting on
+        // the leader's block. The timeout should detect leader *failure*,
+        // not slow vote/QC propagation around a healthy proposal.
         //
-        // Only suppress for blocks at the current proposal height — pending
-        // blocks at future heights (received early) are irrelevant to
-        // whether the current leader proposed.
+        // Three suppression sources, all bounded by `max_progress_wait`
+        // measured from the last leader-activity reset so a Byzantine
+        // proposer who only sends a header (and never advances the chain)
+        // can't pin us at a stale round forever:
+        //
+        // 1. Verification in flight — block roots being checked.
+        // 2. A pending block exists at the proposal tip — covers both
+        //    followers fetching content and proposers awaiting their own
+        //    QC after broadcasting. The earlier `!is_complete()` filter
+        //    only caught the follower case; proposers' pending blocks are
+        //    fully assembled at emission time, so without dropping the
+        //    filter the timer fires while the proposer waits for vote
+        //    propagation.
+        // 3. Block sync has unverified work in flight.
         let next_height = self
             .latest_qc
             .as_ref()
             .map_or(self.committed_height.0 + 1, |qc| qc.height.0 + 1);
-        let has_incomplete_block_at_tip = self
+        let has_pending_at_tip = self
             .pending_blocks
             .values()
-            .any(|pb| pb.header().height.0 == next_height && !pb.is_complete());
-        if self.verification.has_verification_in_flight()
-            || has_incomplete_block_at_tip
-            || self.block_sync.has_unverified_in_flight()
-        {
-            return false;
+            .any(|pb| pb.header().height.0 == next_height);
+        let suppressed = self.verification.has_verification_in_flight()
+            || has_pending_at_tip
+            || self.block_sync.has_unverified_in_flight();
+        if suppressed {
+            let within_progress_window = self
+                .view_change
+                .last_leader_activity
+                .is_some_and(|t| self.now.saturating_sub(t) < self.config.max_progress_wait);
+            if within_progress_window {
+                return false;
+            }
         }
 
         self.view_change.timeout_elapsed(&self.config, self.now)
