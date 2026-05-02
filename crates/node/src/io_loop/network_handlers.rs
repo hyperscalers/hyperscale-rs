@@ -197,19 +197,42 @@ where
                 },
             );
 
-        // ── finalized_wave.request → finalized wave cache lookup ─────
+        // ── finalized_wave.request → cache lookup + storage fallback ─────
 
         let fw_cache = Arc::clone(&self.caches.finalized_wave);
+        let fw_storage = Arc::clone(&self.storage);
         self.network
             .register_request_handler::<hyperscale_messages::request::GetFinalizedWavesRequest>(
                 move |req: hyperscale_messages::request::GetFinalizedWavesRequest| {
                     use hyperscale_messages::response::GetFinalizedWavesResponse;
 
-                    let waves: Vec<hyperscale_types::FinalizedWave> = req
-                        .wave_ids
-                        .iter()
-                        .filter_map(|id| fw_cache.get(id).map(|fw| (*fw).clone()))
-                        .collect();
+                    let mut waves: Vec<hyperscale_types::FinalizedWave> = Vec::new();
+                    let mut missing: Vec<hyperscale_types::WaveId> = Vec::new();
+                    for id in &req.wave_ids {
+                        if let Some(fw) = fw_cache.get(id) {
+                            waves.push((*fw).clone());
+                        } else {
+                            missing.push(id.clone());
+                        }
+                    }
+
+                    // Storage fallback: rebuild any missing FinalizedWave
+                    // from the persisted WaveCertificate plus per-tx
+                    // consensus receipts. The cache is bounded (LRU); peers
+                    // requesting waves past the window must still get a
+                    // complete answer from durable storage.
+                    if !missing.is_empty() {
+                        let certs = fw_storage.get_certificates_batch(&missing);
+                        for cert in certs {
+                            if let Some(fw) =
+                                hyperscale_types::FinalizedWave::reconstruct(Arc::new(cert), |h| {
+                                    fw_storage.get_consensus_receipt(h)
+                                })
+                            {
+                                waves.push(fw);
+                            }
+                        }
+                    }
 
                     GetFinalizedWavesResponse::new(waves)
                 },
