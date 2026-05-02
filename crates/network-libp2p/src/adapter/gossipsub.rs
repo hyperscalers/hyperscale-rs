@@ -22,6 +22,61 @@ pub(super) struct ValidationReport {
     pub acceptance: gossipsub::MessageAcceptance,
 }
 
+/// Guards a single message's verdict so gossipsub never leaks peer-scoring
+/// state when a handler task panics or is cancelled.
+///
+/// Every gossipsub message handed up by the swarm must produce exactly one
+/// `report_message_validation_result` call downstream — otherwise the
+/// behaviour holds onto the message id forever and peer scoring drifts.
+/// Construct one of these on entry to the spawned handler task; call
+/// [`Self::report`] on the success / Reject paths; the `Drop` impl falls
+/// back to `Ignore` if neither fired (panic / future cancel / early
+/// return). `Ignore` is the right fallback — it does not penalise the
+/// sender or propagate the message.
+struct VerdictGuard {
+    pending: Option<(gossipsub::MessageId, Libp2pPeerId)>,
+    tx: mpsc::UnboundedSender<ValidationReport>,
+}
+
+impl VerdictGuard {
+    const fn new(
+        message_id: gossipsub::MessageId,
+        propagation_source: Libp2pPeerId,
+        tx: mpsc::UnboundedSender<ValidationReport>,
+    ) -> Self {
+        Self {
+            pending: Some((message_id, propagation_source)),
+            tx,
+        }
+    }
+
+    fn report(&mut self, acceptance: gossipsub::MessageAcceptance) {
+        if let Some((message_id, propagation_source)) = self.pending.take() {
+            let _ = self.tx.send(ValidationReport {
+                message_id,
+                propagation_source,
+                acceptance,
+            });
+        }
+    }
+}
+
+impl Drop for VerdictGuard {
+    fn drop(&mut self) {
+        if let Some((message_id, propagation_source)) = self.pending.take() {
+            warn!(
+                peer = %propagation_source,
+                "Gossip handler task ended without reporting a verdict; sending Ignore"
+            );
+            let _ = self.tx.send(ValidationReport {
+                message_id,
+                propagation_source,
+                acceptance: gossipsub::MessageAcceptance::Ignore,
+            });
+        }
+    }
+}
+
 /// Handle a single swarm event — gossipsub messages only.
 ///
 /// Connection lifecycle, identify, and kademlia events are handled in `event_loop.rs`.
@@ -107,8 +162,11 @@ pub(super) fn handle_gossipsub_event(
             // Spawn decompress + handler off the event loop.
             // LZ4 decompression is fast (~4GB/s) but the handler includes
             // SBOR decode which we don't want to stall the swarm poll on.
+            // `VerdictGuard` ensures gossipsub gets exactly one verdict per
+            // message even if `handler` panics or the task is cancelled.
             let vtx = validation_tx.clone();
             tokio::spawn(async move {
+                let mut guard = VerdictGuard::new(message_id, propagation_source, vtx);
                 match hyperscale_network::compression::decompress(&message.data) {
                     Ok(payload) => {
                         let verdict = handler(payload);
@@ -122,11 +180,7 @@ pub(super) fn handle_gossipsub_event(
                                 gossipsub::MessageAcceptance::Reject
                             }
                         };
-                        let _ = vtx.send(ValidationReport {
-                            message_id,
-                            propagation_source,
-                            acceptance,
-                        });
+                        guard.report(acceptance);
                     }
                     Err(e) => {
                         warn!(
@@ -135,11 +189,7 @@ pub(super) fn handle_gossipsub_event(
                             "Failed to decompress gossip message"
                         );
                         metrics::record_invalid_message();
-                        let _ = vtx.send(ValidationReport {
-                            message_id,
-                            propagation_source,
-                            acceptance: gossipsub::MessageAcceptance::Reject,
-                        });
+                        guard.report(gossipsub::MessageAcceptance::Reject);
                     }
                 }
             });
