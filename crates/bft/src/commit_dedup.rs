@@ -15,13 +15,14 @@
 //!
 //! 2. **Retention lookup** (`*_retention`): per-artifact deadline maps
 //!    surviving the bridge drain. Each entry is bounded by an artifact-
-//!    specific horizon — for txs, the tx's own `end_timestamp_exclusive`
-//!    (capped by `MAX_VALIDITY_RANGE` at admission); pruned when
-//!    `committed_ts >= deadline`. Past expiry, validity-window checks
-//!    independently reject re-submission, so the entry is no longer
-//!    correctness-bearing.
+//!    specific BFT-attested horizon — for txs, the tx's own
+//!    `end_timestamp_exclusive` (capped by `MAX_VALIDITY_RANGE` at
+//!    admission); for certs, `vote_anchor_ts + RETENTION_HORIZON` from the
+//!    wave's local EC. Pruned when `committed_ts >= deadline`. Past expiry,
+//!    independent validity-window / cross-shard-wave-timeout rules reject
+//!    re-inclusion, so the entry is no longer correctness-bearing.
 
-use hyperscale_types::{RoutableTransaction, TxHash, WaveId, WeightedTimestamp};
+use hyperscale_types::{FinalizedWave, RoutableTransaction, TxHash, WaveId, WeightedTimestamp};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -29,6 +30,11 @@ pub struct CommitDedupIndex {
     /// `tx_hash → end_timestamp_exclusive`. Pruned when
     /// `end_timestamp_exclusive <= current_committed_ts`.
     tx_retention: HashMap<TxHash, WeightedTimestamp>,
+    /// `wave_id → vote_anchor_ts + RETENTION_HORIZON`. Pruned when
+    /// `deadline <= current_committed_ts`. Past the horizon, every tx the
+    /// wave covered has terminated everywhere, so no future block can
+    /// legitimately reference the same `wave_id`.
+    cert_retention: HashMap<WaveId, WeightedTimestamp>,
     recent_txs: HashSet<TxHash>,
     recent_certs: HashSet<WaveId>,
 }
@@ -37,6 +43,7 @@ impl CommitDedupIndex {
     pub fn new() -> Self {
         Self {
             tx_retention: HashMap::new(),
+            cert_retention: HashMap::new(),
             recent_txs: HashSet::new(),
             recent_certs: HashSet::new(),
         }
@@ -44,8 +51,8 @@ impl CommitDedupIndex {
 
     /// Buffer tx hashes and cert ids from a freshly committed block. Called
     /// synchronously at BFT commit time; entries are cleared by
-    /// `register_committed_txs` (txs) or `remove_tx` (certs) once the
-    /// mempool catches up.
+    /// `register_committed_txs` / `register_committed_certs` once the post-
+    /// commit registration path runs.
     pub fn buffer_commit(
         &mut self,
         tx_hashes: impl IntoIterator<Item = TxHash>,
@@ -69,6 +76,22 @@ impl CommitDedupIndex {
         }
     }
 
+    /// Promote a block's finalized waves from the bridge buffer into the
+    /// retention lookup. Each entry's deadline is the wave's local EC
+    /// `vote_anchor_ts + RETENTION_HORIZON` — past that horizon, every tx
+    /// the wave covered has terminated everywhere and no future block can
+    /// legitimately reference the same `wave_id`.
+    pub fn register_committed_certs(&mut self, finalized_waves: &[Arc<FinalizedWave>]) {
+        for fw in finalized_waves {
+            let wave_id = fw.wave_id().clone();
+            let deadline = fw.local_ec().deadline();
+            self.cert_retention
+                .entry(wave_id.clone())
+                .or_insert(deadline);
+            self.recent_certs.remove(&wave_id);
+        }
+    }
+
     /// Remove a finalized transaction from the retention lookup. Called when
     /// a TC is committed, so the tx is no longer relevant for timeout
     /// validation.
@@ -76,16 +99,21 @@ impl CommitDedupIndex {
         self.tx_retention.remove(tx_hash);
     }
 
-    /// Drop retention-lookup entries whose `end_timestamp_exclusive <= now`.
-    /// `now` is the `weighted_timestamp` of the latest committed block.
-    /// Past expiry, the validator-side validity check rejects any
-    /// re-submission, so the entry is no longer correctness-bearing.
+    /// Drop retention-lookup entries past their deadline. `now` is the
+    /// `weighted_timestamp` of the latest committed block. Past expiry,
+    /// independent rules (tx validity check; wave-timeout) reject any
+    /// re-inclusion, so the entry is no longer correctness-bearing.
     pub fn prune(&mut self, now: WeightedTimestamp) {
         self.tx_retention.retain(|_, end| *end > now);
+        self.cert_retention.retain(|_, deadline| *deadline > now);
     }
 
     pub fn contains_tx(&self, tx_hash: &TxHash) -> bool {
         self.tx_retention.contains_key(tx_hash)
+    }
+
+    pub fn contains_cert(&self, wave_id: &WaveId) -> bool {
+        self.cert_retention.contains_key(wave_id)
     }
 
     pub fn recent_tx_hashes(&self) -> impl Iterator<Item = TxHash> + '_ {
@@ -98,6 +126,10 @@ impl CommitDedupIndex {
 
     pub fn tx_retention_len(&self) -> usize {
         self.tx_retention.len()
+    }
+
+    pub fn cert_retention_len(&self) -> usize {
+        self.cert_retention.len()
     }
 
     pub fn recent_txs_len(&self) -> usize {
@@ -188,5 +220,55 @@ mod tests {
         cache.remove_tx(&tx_hash);
 
         assert!(!cache.contains_tx(&tx_hash));
+    }
+
+    // ─── Certs ──────────────────────────────────────────────────────────
+
+    fn make_fw(height: u64) -> Arc<FinalizedWave> {
+        Arc::new(hyperscale_test_helpers::make_finalized_wave(
+            BlockHeight(height),
+            TxHash::from_raw(Hash::from_bytes(
+                &[u8::try_from(height).unwrap_or(u8::MAX); 32],
+            )),
+            hyperscale_types::TransactionDecision::Accept,
+        ))
+    }
+
+    #[test]
+    fn register_certs_promotes_to_lookup_and_clears_bridge() {
+        let mut cache = CommitDedupIndex::new();
+        let fw1 = make_fw(1);
+        let fw2_id = wid(2);
+        // fw1 is registered after being buffered; wid(2) stays in the bridge.
+        cache.buffer_commit([], [fw1.wave_id().clone(), fw2_id.clone()]);
+        cache.register_committed_certs(std::slice::from_ref(&fw1));
+
+        assert!(cache.contains_cert(fw1.wave_id()));
+        assert!(!cache.contains_cert(&fw2_id));
+
+        let remaining: HashSet<WaveId> = cache.recent_cert_ids().collect();
+        assert_eq!(remaining, HashSet::from([fw2_id]));
+    }
+
+    #[test]
+    fn prune_drops_certs_past_their_deadline() {
+        // make_finalized_wave sets vote_anchor_ts = block_height + 1.
+        // Deadline = vote_anchor_ts + RETENTION_HORIZON.
+        let mut cache = CommitDedupIndex::new();
+        let fw = make_fw(1);
+        cache.register_committed_certs(&[Arc::clone(&fw)]);
+        assert!(cache.contains_cert(fw.wave_id()));
+
+        // At now=ZERO the deadline (ts(2) + horizon) is far in the future.
+        cache.prune(WeightedTimestamp::ZERO);
+        assert!(cache.contains_cert(fw.wave_id()));
+
+        // Past the deadline: entry evicts.
+        let past = fw
+            .local_ec()
+            .deadline()
+            .plus(std::time::Duration::from_millis(1));
+        cache.prune(past);
+        assert!(!cache.contains_cert(fw.wave_id()));
     }
 }

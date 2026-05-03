@@ -17,7 +17,7 @@ use crate::commit_dedup::CommitDedupIndex;
 use crate::config::BftConfig;
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, LocalTimestamp, RoutableTransaction, TopologySnapshot, TxHash,
-    VotePower,
+    VotePower, WaveId,
 };
 #[cfg(test)]
 use hyperscale_types::{
@@ -188,18 +188,53 @@ pub fn validate_no_duplicate_transactions(
     Ok(())
 }
 
+/// Validate that no finalized wave in the block has already been committed
+/// or appears in an ancestor block above committed height. Mirrors
+/// [`validate_no_duplicate_transactions`] but for `wave_id`.
+///
+/// Both proposer and validator hit `record_block_committed` synchronously
+/// during their respective commit handlers, so their `dedup_index` reflects
+/// the same just-committed waves at the same logical moment. Validation
+/// against this shared state is therefore safe under the on-qc-formed race.
+pub fn validate_no_duplicate_certificates(
+    block: &Block,
+    qc_chain_cert_ids: &HashSet<WaveId>,
+    dedup_index: &CommitDedupIndex,
+) -> Result<(), String> {
+    if block.certificates().is_empty() {
+        return Ok(());
+    }
+
+    for fw in block.certificates() {
+        let wave_id = fw.wave_id();
+        if qc_chain_cert_ids.contains(wave_id) {
+            return Err(format!(
+                "wave certificate {wave_id:?} already in QC chain ancestor"
+            ));
+        }
+        if dedup_index.contains_cert(wave_id) {
+            return Err(format!(
+                "wave certificate {wave_id:?} already committed within its retention window"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Run all pre-vote block-contents checks: transaction ordering, `waves`
-/// recomputation, and cross-ancestor transaction uniqueness. Returns a
-/// single diagnostic on the first failure so the caller can log once.
+/// recomputation, and cross-ancestor uniqueness for txs and certs. Returns
+/// a single diagnostic on the first failure so the caller can log once.
 pub fn validate_block_for_vote(
     topology: &TopologySnapshot,
     block: &Block,
     qc_chain_tx_hashes: &HashSet<TxHash>,
+    qc_chain_cert_ids: &HashSet<WaveId>,
     dedup_index: &CommitDedupIndex,
 ) -> Result<(), String> {
     validate_transaction_ordering(block)?;
     validate_waves(topology, block)?;
     validate_no_duplicate_transactions(block, qc_chain_tx_hashes, dedup_index)?;
+    validate_no_duplicate_certificates(block, qc_chain_cert_ids, dedup_index)?;
     Ok(())
 }
 
@@ -489,6 +524,70 @@ mod tests {
         let mut dedup_index = CommitDedupIndex::new();
         dedup_index.register_committed_txs(&[dup_tx]);
         let err = validate_no_duplicate_transactions(&block, &qc_chain, &dedup_index).unwrap_err();
+        assert!(err.contains("already committed"));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // validate_no_duplicate_certificates
+    // ═══════════════════════════════════════════════════════════════════════
+
+    fn block_with_certificates(
+        height: BlockHeight,
+        certificates: Vec<Arc<hyperscale_types::FinalizedWave>>,
+    ) -> Block {
+        Block::Live {
+            header: header_at_height(height, 100_000),
+            transactions: Vec::new(),
+            certificates,
+            provisions: Vec::new(),
+        }
+    }
+
+    fn finalized_wave_at(height: u64) -> Arc<hyperscale_types::FinalizedWave> {
+        Arc::new(hyperscale_test_helpers::make_finalized_wave(
+            BlockHeight(height),
+            TxHash::from_raw(Hash::from_bytes(
+                &[u8::try_from(height).unwrap_or(u8::MAX); 32],
+            )),
+            hyperscale_types::TransactionDecision::Accept,
+        ))
+    }
+
+    #[test]
+    fn validate_no_duplicate_certificates_accepts_empty_block() {
+        let block = block_with_certificates(BlockHeight(5), vec![]);
+        let qc_chain = HashSet::new();
+        let dedup_index = CommitDedupIndex::new();
+        assert!(validate_no_duplicate_certificates(&block, &qc_chain, &dedup_index).is_ok());
+    }
+
+    #[test]
+    fn validate_no_duplicate_certificates_accepts_unique() {
+        let block = block_with_certificates(BlockHeight(5), vec![finalized_wave_at(1)]);
+        let qc_chain = HashSet::new();
+        let dedup_index = CommitDedupIndex::new();
+        assert!(validate_no_duplicate_certificates(&block, &qc_chain, &dedup_index).is_ok());
+    }
+
+    #[test]
+    fn validate_no_duplicate_certificates_rejects_qc_chain_dup() {
+        let fw = finalized_wave_at(1);
+        let dup_id = fw.wave_id().clone();
+        let block = block_with_certificates(BlockHeight(6), vec![fw]);
+        let qc_chain: HashSet<_> = std::iter::once(dup_id).collect();
+        let dedup_index = CommitDedupIndex::new();
+        let err = validate_no_duplicate_certificates(&block, &qc_chain, &dedup_index).unwrap_err();
+        assert!(err.contains("already in QC chain ancestor"));
+    }
+
+    #[test]
+    fn validate_no_duplicate_certificates_rejects_retention_dup() {
+        let fw = finalized_wave_at(1);
+        let block = block_with_certificates(BlockHeight(6), vec![Arc::clone(&fw)]);
+        let qc_chain = HashSet::new();
+        let mut dedup_index = CommitDedupIndex::new();
+        dedup_index.register_committed_certs(&[fw]);
+        let err = validate_no_duplicate_certificates(&block, &qc_chain, &dedup_index).unwrap_err();
         assert!(err.contains("already committed"));
     }
 }

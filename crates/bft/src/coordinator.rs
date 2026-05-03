@@ -54,6 +54,9 @@ pub struct BftMemoryStats {
     pub received_votes_by_height: usize,
     /// Recently-committed tx-hash → height entries used for fast dedup lookup.
     pub committed_tx_lookup: usize,
+    /// Recently-committed wave-id → deadline entries for proposal/validation
+    /// dedup. Keyed by `vote_anchor_ts + RETENTION_HORIZON`.
+    pub committed_cert_lookup: usize,
     /// Recently-committed transaction hashes retained for proposal dedup.
     pub recently_committed_txs: usize,
     /// Recently-committed wave certificate hashes retained for proposal dedup.
@@ -1451,12 +1454,13 @@ impl BftCoordinator {
         block_hash: BlockHash,
         block: &Block,
     ) -> bool {
-        let (_, qc_chain_tx_hashes, _) =
+        let (qc_chain_cert_ids, qc_chain_tx_hashes, _) =
             self.collect_qc_chain_hashes(block.header().parent_block_hash);
         if let Err(e) = crate::validation::validate_block_for_vote(
             topology,
             block,
             &qc_chain_tx_hashes,
+            &qc_chain_cert_ids,
             &self.dedup_index,
         ) {
             warn!(
@@ -3028,6 +3032,19 @@ impl BftCoordinator {
         self.dedup_index.register_committed_txs(transactions);
     }
 
+    /// Register committed finalized waves for proposal/validation dedup.
+    ///
+    /// Called by the node state layer after the post-commit lifecycle has
+    /// run. Each entry's lifetime is bounded by `vote_anchor_ts +
+    /// RETENTION_HORIZON` from the wave's local EC; past that horizon,
+    /// every tx the wave covered has terminated everywhere.
+    pub fn register_committed_finalized_waves(
+        &mut self,
+        finalized_waves: &[Arc<hyperscale_types::FinalizedWave>],
+    ) {
+        self.dedup_index.register_committed_certs(finalized_waves);
+    }
+
     /// Remove a finalized transaction from the committed lookup.
     ///
     /// Called when a TC is committed, so the tx is no longer relevant for
@@ -3092,6 +3109,7 @@ impl BftCoordinator {
             voted_heights: self.votes.voted_heights_len(),
             received_votes_by_height: self.votes.received_votes_len(),
             committed_tx_lookup: self.dedup_index.tx_retention_len(),
+            committed_cert_lookup: self.dedup_index.cert_retention_len(),
             recently_committed_txs: self.dedup_index.recent_txs_len(),
             recently_committed_certs: self.dedup_index.recent_certs_len(),
             pending_qc_verifications: self.verification.pending_qc_verifications_len(),

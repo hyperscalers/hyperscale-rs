@@ -247,11 +247,14 @@ impl NodeStateMachine {
         let mut actions = Vec::new();
         let block_hash = certified.block.hash();
 
-        // Register committed transactions with BFT for proposal dedup. The
-        // tx_cache reads each tx's `validity_range.end_timestamp_exclusive`
-        // to bound its own retention.
+        // Register committed transactions and finalized waves with BFT for
+        // proposal/validation dedup. The dedup index uses each tx's
+        // `validity_range.end_timestamp_exclusive` and each wave's
+        // `vote_anchor_ts + RETENTION_HORIZON` to bound retention.
         self.bft
             .register_committed_transactions(certified.block.transactions());
+        self.bft
+            .register_committed_finalized_waves(certified.block.certificates());
 
         // Mark this block as a usable parent for child state-root
         // verifications. By the time `BlockCommitted` fires, the block's JMT
