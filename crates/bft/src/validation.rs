@@ -13,8 +13,8 @@
 //!
 //! Errors are returned as human-readable strings so the caller can log a
 //! single diagnostic line at the rejection site.
+use crate::commit_dedup::CommitDedupIndex;
 use crate::config::BftConfig;
-use crate::tx_cache::CommittedTxCache;
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, LocalTimestamp, RoutableTransaction, TopologySnapshot, TxHash,
     VotePower,
@@ -166,7 +166,7 @@ pub fn validate_waves(topology: &TopologySnapshot, block: &Block) -> Result<(), 
 pub fn validate_no_duplicate_transactions(
     block: &Block,
     qc_chain_tx_hashes: &HashSet<TxHash>,
-    tx_cache: &CommittedTxCache,
+    dedup_index: &CommitDedupIndex,
 ) -> Result<(), String> {
     if block.transactions().is_empty() {
         return Ok(());
@@ -179,7 +179,7 @@ pub fn validate_no_duplicate_transactions(
                 "transaction {tx_hash} already in QC chain ancestor"
             ));
         }
-        if tx_cache.contains_tx(&tx_hash) {
+        if dedup_index.contains_tx(&tx_hash) {
             return Err(format!(
                 "transaction {tx_hash} already committed within its validity window"
             ));
@@ -195,11 +195,11 @@ pub fn validate_block_for_vote(
     topology: &TopologySnapshot,
     block: &Block,
     qc_chain_tx_hashes: &HashSet<TxHash>,
-    tx_cache: &CommittedTxCache,
+    dedup_index: &CommitDedupIndex,
 ) -> Result<(), String> {
     validate_transaction_ordering(block)?;
     validate_waves(topology, block)?;
-    validate_no_duplicate_transactions(block, qc_chain_tx_hashes, tx_cache)?;
+    validate_no_duplicate_transactions(block, qc_chain_tx_hashes, dedup_index)?;
     Ok(())
 }
 
@@ -457,16 +457,16 @@ mod tests {
     fn validate_no_duplicate_transactions_accepts_empty_block() {
         let block = block_with_transactions(BlockHeight(5), vec![]);
         let qc_chain = HashSet::new();
-        let tx_cache = CommittedTxCache::new();
-        assert!(validate_no_duplicate_transactions(&block, &qc_chain, &tx_cache).is_ok());
+        let dedup_index = CommitDedupIndex::new();
+        assert!(validate_no_duplicate_transactions(&block, &qc_chain, &dedup_index).is_ok());
     }
 
     #[test]
     fn validate_no_duplicate_transactions_accepts_unique() {
         let block = block_with_transactions(BlockHeight(5), sorted_txs(&[10, 20]));
         let qc_chain = HashSet::new();
-        let tx_cache = CommittedTxCache::new();
-        assert!(validate_no_duplicate_transactions(&block, &qc_chain, &tx_cache).is_ok());
+        let dedup_index = CommitDedupIndex::new();
+        assert!(validate_no_duplicate_transactions(&block, &qc_chain, &dedup_index).is_ok());
     }
 
     #[test]
@@ -475,20 +475,20 @@ mod tests {
         let dup_hash = txs[0].hash();
         let block = block_with_transactions(BlockHeight(6), txs);
         let qc_chain: HashSet<_> = std::iter::once(dup_hash).collect();
-        let tx_cache = CommittedTxCache::new();
-        let err = validate_no_duplicate_transactions(&block, &qc_chain, &tx_cache).unwrap_err();
+        let dedup_index = CommitDedupIndex::new();
+        let err = validate_no_duplicate_transactions(&block, &qc_chain, &dedup_index).unwrap_err();
         assert!(err.contains("already in QC chain ancestor"));
     }
 
     #[test]
-    fn validate_no_duplicate_transactions_rejects_tx_cache_dup() {
+    fn validate_no_duplicate_transactions_rejects_retention_dup() {
         let txs = sorted_txs(&[10, 20]);
         let dup_tx = Arc::clone(&txs[0]);
         let block = block_with_transactions(BlockHeight(6), txs);
         let qc_chain = HashSet::new();
-        let mut tx_cache = CommittedTxCache::new();
-        tx_cache.register_committed(&[dup_tx]);
-        let err = validate_no_duplicate_transactions(&block, &qc_chain, &tx_cache).unwrap_err();
+        let mut dedup_index = CommitDedupIndex::new();
+        dedup_index.register_committed_txs(&[dup_tx]);
+        let err = validate_no_duplicate_transactions(&block, &qc_chain, &dedup_index).unwrap_err();
         assert!(err.contains("already committed"));
     }
 }

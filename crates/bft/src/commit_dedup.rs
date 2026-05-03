@@ -1,53 +1,58 @@
-//! Deduplication cache for committed transaction and certificate hashes.
+//! Deduplication index for committed artifacts referenced by block contents.
 //!
-//! Serves two purposes:
+//! The BFT layer enforces a single contract: every committed artifact (tx,
+//! cert, provision) appears in the chain exactly once. This index is the
+//! mechanism — proposers consult it to filter candidates, validators consult
+//! it to reject duplicate inclusions.
 //!
-//! 1. **Bridge buffer** (`recently_committed_*`): hashes from blocks just
-//!    committed by BFT, held synchronously until the mempool processes the
-//!    async `BlockCommitted` event and purges them. Lets proposal dedup and
-//!    QC-chain walks see the latest commit even while the event is in flight.
+//! Two complementary tiers share the index:
 //!
-//! 2. **Retention lookup** (`tx_lookup`): tx hash → `end_timestamp_exclusive`
-//!    from the tx's `validity_range`, for historical dedup over a bounded
-//!    window. Survives mempool processing; pruned at the entry's own
-//!    `end_timestamp_exclusive`. Past expiry, the validator-side validity
-//!    check rejects re-submission anyway, so the entry is no longer
-//!    correctness-bearing — it becomes a perf optimisation. Maximum age is
-//!    bounded by `MAX_VALIDITY_RANGE` because admission requires
-//!    `end_timestamp_exclusive <= anchor + MAX_VALIDITY_RANGE`.
+//! 1. **Bridge buffer** (`recent_*`): hashes from blocks just committed by
+//!    BFT, held synchronously until the post-commit registration path runs.
+//!    Covers the gap where the just-committed block has been evicted from
+//!    `pending_blocks` but the QC-chain walk doesn't yet see it via durable
+//!    storage. Drained by `register_committed_*`.
+//!
+//! 2. **Retention lookup** (`*_retention`): per-artifact deadline maps
+//!    surviving the bridge drain. Each entry is bounded by an artifact-
+//!    specific horizon — for txs, the tx's own `end_timestamp_exclusive`
+//!    (capped by `MAX_VALIDITY_RANGE` at admission); pruned when
+//!    `committed_ts >= deadline`. Past expiry, validity-window checks
+//!    independently reject re-submission, so the entry is no longer
+//!    correctness-bearing.
 
 use hyperscale_types::{RoutableTransaction, TxHash, WaveId, WeightedTimestamp};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-pub struct CommittedTxCache {
+pub struct CommitDedupIndex {
     /// `tx_hash → end_timestamp_exclusive`. Pruned when
     /// `end_timestamp_exclusive <= current_committed_ts`.
-    tx_lookup: HashMap<TxHash, WeightedTimestamp>,
-    recently_committed_txs: HashSet<TxHash>,
-    recently_committed_certs: HashSet<WaveId>,
+    tx_retention: HashMap<TxHash, WeightedTimestamp>,
+    recent_txs: HashSet<TxHash>,
+    recent_certs: HashSet<WaveId>,
 }
 
-impl CommittedTxCache {
+impl CommitDedupIndex {
     pub fn new() -> Self {
         Self {
-            tx_lookup: HashMap::new(),
-            recently_committed_txs: HashSet::new(),
-            recently_committed_certs: HashSet::new(),
+            tx_retention: HashMap::new(),
+            recent_txs: HashSet::new(),
+            recent_certs: HashSet::new(),
         }
     }
 
     /// Buffer tx hashes and cert ids from a freshly committed block. Called
     /// synchronously at BFT commit time; entries are cleared by
-    /// `register_committed` (txs) or `remove` (certs) once the mempool
-    /// catches up.
+    /// `register_committed_txs` (txs) or `remove_tx` (certs) once the
+    /// mempool catches up.
     pub fn buffer_commit(
         &mut self,
         tx_hashes: impl IntoIterator<Item = TxHash>,
         cert_ids: impl IntoIterator<Item = WaveId>,
     ) {
-        self.recently_committed_txs.extend(tx_hashes);
-        self.recently_committed_certs.extend(cert_ids);
+        self.recent_txs.extend(tx_hashes);
+        self.recent_certs.extend(cert_ids);
     }
 
     /// Promote a block's transactions from the bridge buffer into the
@@ -55,20 +60,20 @@ impl CommittedTxCache {
     /// `validity_range.end_timestamp_exclusive`, which bounds the entry's
     /// lifetime. Called by the node state layer after the mempool
     /// processes a committed block.
-    pub fn register_committed(&mut self, transactions: &[Arc<RoutableTransaction>]) {
+    pub fn register_committed_txs(&mut self, transactions: &[Arc<RoutableTransaction>]) {
         for tx in transactions {
             let tx_hash = tx.hash();
             let end = tx.validity_range.end_timestamp_exclusive;
-            self.tx_lookup.entry(tx_hash).or_insert(end);
-            self.recently_committed_txs.remove(&tx_hash);
+            self.tx_retention.entry(tx_hash).or_insert(end);
+            self.recent_txs.remove(&tx_hash);
         }
     }
 
     /// Remove a finalized transaction from the retention lookup. Called when
     /// a TC is committed, so the tx is no longer relevant for timeout
     /// validation.
-    pub fn remove(&mut self, tx_hash: &TxHash) {
-        self.tx_lookup.remove(tx_hash);
+    pub fn remove_tx(&mut self, tx_hash: &TxHash) {
+        self.tx_retention.remove(tx_hash);
     }
 
     /// Drop retention-lookup entries whose `end_timestamp_exclusive <= now`.
@@ -76,31 +81,31 @@ impl CommittedTxCache {
     /// Past expiry, the validator-side validity check rejects any
     /// re-submission, so the entry is no longer correctness-bearing.
     pub fn prune(&mut self, now: WeightedTimestamp) {
-        self.tx_lookup.retain(|_, end| *end > now);
+        self.tx_retention.retain(|_, end| *end > now);
     }
 
     pub fn contains_tx(&self, tx_hash: &TxHash) -> bool {
-        self.tx_lookup.contains_key(tx_hash)
+        self.tx_retention.contains_key(tx_hash)
     }
 
     pub fn recent_tx_hashes(&self) -> impl Iterator<Item = TxHash> + '_ {
-        self.recently_committed_txs.iter().copied()
+        self.recent_txs.iter().copied()
     }
 
     pub fn recent_cert_ids(&self) -> impl Iterator<Item = WaveId> + '_ {
-        self.recently_committed_certs.iter().cloned()
+        self.recent_certs.iter().cloned()
     }
 
-    pub fn tx_lookup_len(&self) -> usize {
-        self.tx_lookup.len()
+    pub fn tx_retention_len(&self) -> usize {
+        self.tx_retention.len()
     }
 
     pub fn recent_txs_len(&self) -> usize {
-        self.recently_committed_txs.len()
+        self.recent_txs.len()
     }
 
     pub fn recent_certs_len(&self) -> usize {
-        self.recently_committed_certs.len()
+        self.recent_certs.len()
     }
 }
 
@@ -130,7 +135,7 @@ mod tests {
 
     #[test]
     fn buffered_hashes_surface_in_recent_iterators() {
-        let mut cache = CommittedTxCache::new();
+        let mut cache = CommitDedupIndex::new();
         let c1 = wid(1);
         cache.buffer_commit([th(b"tx1"), th(b"tx2")], [c1.clone()]);
 
@@ -142,13 +147,13 @@ mod tests {
 
     #[test]
     fn register_promotes_to_lookup_and_clears_bridge() {
-        let mut cache = CommittedTxCache::new();
+        let mut cache = CommitDedupIndex::new();
         let tx1 = tx_with_end(1, 60_000);
         let tx1_hash = tx1.hash();
         // tx2 is in the bridge but not registered — it should stay buffered.
         let tx2_hash = th(b"tx2");
         cache.buffer_commit([tx1_hash, tx2_hash], []);
-        cache.register_committed(std::slice::from_ref(&tx1));
+        cache.register_committed_txs(std::slice::from_ref(&tx1));
 
         assert!(cache.contains_tx(&tx1_hash));
         assert!(!cache.contains_tx(&tx2_hash));
@@ -159,12 +164,12 @@ mod tests {
 
     #[test]
     fn prune_drops_entries_past_their_end_exclusive() {
-        let mut cache = CommittedTxCache::new();
+        let mut cache = CommitDedupIndex::new();
         let early = tx_with_end(1, 100);
         let later = tx_with_end(2, 900);
         let early_hash = early.hash();
         let later_hash = later.hash();
-        cache.register_committed(&[early, later]);
+        cache.register_committed_txs(&[early, later]);
 
         // At now=500: early (end=100) is past expiry, later (end=900) survives.
         cache.prune(WeightedTimestamp(500));
@@ -175,12 +180,12 @@ mod tests {
 
     #[test]
     fn remove_clears_lookup() {
-        let mut cache = CommittedTxCache::new();
+        let mut cache = CommitDedupIndex::new();
         let tx = tx_with_end(1, 60_000);
         let tx_hash = tx.hash();
-        cache.register_committed(&[tx]);
+        cache.register_committed_txs(&[tx]);
 
-        cache.remove(&tx_hash);
+        cache.remove_tx(&tx_hash);
 
         assert!(!cache.contains_tx(&tx_hash));
     }

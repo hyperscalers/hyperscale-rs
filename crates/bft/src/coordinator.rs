@@ -86,11 +86,11 @@ use tracing::{debug, info, instrument, trace, warn};
 
 use crate::block_sync::{BlockSyncManager, BlockSyncVerificationResult};
 use crate::chain_view::ChainView;
+use crate::commit_dedup::CommitDedupIndex;
 use crate::commit_pipeline::CommitPipeline;
 use crate::config::BftConfig;
 use crate::pending::PendingBlock;
 use crate::proposal::{ProposalKind, ProposalTracker, TakeResult};
-use crate::tx_cache::CommittedTxCache;
 use crate::verification::{InFlightCheck, VerificationPipeline};
 use crate::view_change::ViewChangeController;
 use crate::vote_keeper::{LockDecision, VoteKeeper};
@@ -195,7 +195,7 @@ pub struct BftCoordinator {
     /// Dedup cache for committed transaction and certificate hashes.
     /// Bridges synchronous BFT commits to async mempool processing, and
     /// provides a bounded retention window for historical dedup.
-    tx_cache: CommittedTxCache,
+    dedup_index: CommitDedupIndex,
 
     // ═══════════════════════════════════════════════════════════════════════════
     // Configuration
@@ -253,7 +253,7 @@ impl BftCoordinator {
             verification: VerificationPipeline::new(recovered.committed_height),
             block_sync: BlockSyncManager::new(),
             proposal: ProposalTracker::new(),
-            tx_cache: CommittedTxCache::new(),
+            dedup_index: CommitDedupIndex::new(),
             config,
             now: LocalTimestamp::ZERO,
         }
@@ -741,7 +741,7 @@ impl BftCoordinator {
         let transactions = crate::proposal::select_transactions(
             ready_txs,
             &qc_chain_tx_hashes,
-            &self.tx_cache,
+            &self.dedup_index,
             validity_anchor,
         );
         let (finalized_waves, finalized_tx_count) = crate::proposal::select_finalized_waves(
@@ -1457,7 +1457,7 @@ impl BftCoordinator {
             topology,
             block,
             &qc_chain_tx_hashes,
-            &self.tx_cache,
+            &self.dedup_index,
         ) {
             warn!(
                 validator = ?topology.local_validator_id(),
@@ -2216,7 +2216,7 @@ impl BftCoordinator {
 
         // Buffer committed hashes so collect_qc_chain_hashes can
         // exclude them even after cleanup_old_state removes the block.
-        self.tx_cache.buffer_commit(
+        self.dedup_index.buffer_commit(
             block.transactions().iter().map(|tx| tx.hash()),
             block
                 .certificates()
@@ -2914,7 +2914,7 @@ impl BftCoordinator {
         // for proposal dedup — transactions committed far in the past will
         // have been evicted from mempool already, so stale entries just waste
         // memory.
-        self.tx_cache.prune(self.committed_ts);
+        self.dedup_index.prune(self.committed_ts);
 
         // Remote headers are pruned per-shard-tip at insertion time, not by
         // local committed height (remote shards have independent heights).
@@ -3025,7 +3025,7 @@ impl BftCoordinator {
     /// `validity_range`. Each entry's lifetime is bounded by its own
     /// `end_timestamp_exclusive`.
     pub fn register_committed_transactions(&mut self, transactions: &[Arc<RoutableTransaction>]) {
-        self.tx_cache.register_committed(transactions);
+        self.dedup_index.register_committed_txs(transactions);
     }
 
     /// Remove a finalized transaction from the committed lookup.
@@ -3033,7 +3033,7 @@ impl BftCoordinator {
     /// Called when a TC is committed, so the tx is no longer relevant for
     /// timeout validation.
     pub fn remove_committed_transaction(&mut self, tx_hash: &TxHash) {
-        self.tx_cache.remove(tx_hash);
+        self.dedup_index.remove_tx(tx_hash);
     }
 
     /// Get the current committed height.
@@ -3091,9 +3091,9 @@ impl BftCoordinator {
             pending_commits_awaiting_data: self.commits.awaiting_data_len(),
             voted_heights: self.votes.voted_heights_len(),
             received_votes_by_height: self.votes.received_votes_len(),
-            committed_tx_lookup: self.tx_cache.tx_lookup_len(),
-            recently_committed_txs: self.tx_cache.recent_txs_len(),
-            recently_committed_certs: self.tx_cache.recent_certs_len(),
+            committed_tx_lookup: self.dedup_index.tx_retention_len(),
+            recently_committed_txs: self.dedup_index.recent_txs_len(),
+            recently_committed_certs: self.dedup_index.recent_certs_len(),
             pending_qc_verifications: self.verification.pending_qc_verifications_len(),
             verified_qcs: self.verification.verified_qcs_len(),
             pending_state_root_verifications: self
@@ -3140,7 +3140,7 @@ impl BftCoordinator {
     /// Walk the QC chain from `parent_block_hash` back to committed height,
     /// collecting certificate, transaction, and provision hashes from
     /// ancestor blocks. Thin wrapper over [`ChainView::collect_ancestor_hashes`]
-    /// that supplies the coordinator's `tx_cache`.
+    /// that supplies the coordinator's `dedup_index`.
     #[must_use]
     pub fn collect_qc_chain_hashes(
         &self,
@@ -3151,7 +3151,7 @@ impl BftCoordinator {
         std::collections::HashSet<ProvisionHash>,
     ) {
         self.chain_view()
-            .collect_ancestor_hashes(parent_block_hash, &self.tx_cache)
+            .collect_ancestor_hashes(parent_block_hash, &self.dedup_index)
     }
 
     /// Get the BFT configuration.
@@ -4472,7 +4472,7 @@ mod tests {
             crate::validation::validate_no_duplicate_transactions(
                 &block,
                 &qc_chain,
-                &state.tx_cache,
+                &state.dedup_index,
             )
         };
         assert!(result.is_err());
@@ -4522,7 +4522,7 @@ mod tests {
                 crate::validation::validate_no_duplicate_transactions(
                     &block,
                     &qc_chain,
-                    &state.tx_cache,
+                    &state.dedup_index,
                 )
             }
             .is_ok()
