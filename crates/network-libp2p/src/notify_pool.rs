@@ -40,6 +40,7 @@ const PEER_CHANNEL_CAPACITY: usize = 256;
 ///
 /// Carries pre-compressed data so that compression happens once per message
 /// (in [`Libp2pNetwork::notify`]) rather than once per peer.
+#[cfg_attr(test, derive(Debug))]
 struct PendingFrame {
     type_id: &'static str,
     compressed_data: Vec<u8>,
@@ -97,27 +98,10 @@ impl NotifyStreamPool {
             compressed_data,
         };
 
-        // Fast path: try to send on existing actor's channel.
-        if let Some(actor) = self.peers.get(&peer_id) {
-            match actor.frame_tx.try_send(frame) {
-                Ok(()) => return,
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    warn!(peer = %peer_id, "Notification channel full, dropping frame");
-                    return;
-                }
-                Err(mpsc::error::TrySendError::Closed(frame_back)) => {
-                    // Actor task is dead. Drop the DashMap ref before removing.
-                    drop(actor);
-                    self.peers.remove(&peer_id);
-                    // Fall through to spawn a new actor with the recovered frame.
-                    self.spawn_actor(peer_id, frame_back);
-                    return;
-                }
-            }
+        if let Err(frame_back) = try_enqueue_existing(&self.peers, &peer_id, frame) {
+            // No live actor — spawn one (subject to backoff).
+            self.spawn_actor(peer_id, frame_back);
         }
-
-        // No actor exists — spawn one (subject to backoff).
-        self.spawn_actor(peer_id, frame);
     }
 
     /// Spawn a new stream actor for a peer, subject to backoff.
@@ -213,5 +197,161 @@ impl NotifyStreamPool {
                 current_backoff,
             },
         );
+    }
+}
+
+/// Try to enqueue `frame` onto the existing actor for `peer_id`.
+///
+/// Returns `Ok(())` when the frame was either sent or deliberately dropped
+/// (channel full — bounded-channel backpressure protects memory at the cost
+/// of frame loss, which is acceptable for notifications). Returns
+/// `Err(frame)` when there is no live actor, handing the frame back so the
+/// caller can spawn one. Removes the dead actor's entry as a side effect.
+fn try_enqueue_existing(
+    peers: &DashMap<PeerId, PeerStreamActor>,
+    peer_id: &PeerId,
+    frame: PendingFrame,
+) -> Result<(), PendingFrame> {
+    let Some(actor) = peers.get(peer_id) else {
+        return Err(frame);
+    };
+    match actor.frame_tx.try_send(frame) {
+        Ok(()) => Ok(()),
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            warn!(peer = %peer_id, "Notification channel full, dropping frame");
+            Ok(())
+        }
+        Err(mpsc::error::TrySendError::Closed(frame_back)) => {
+            drop(actor);
+            peers.remove(peer_id);
+            Err(frame_back)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_frame(tag: u8) -> PendingFrame {
+        PendingFrame {
+            type_id: "test.notify",
+            compressed_data: vec![tag],
+        }
+    }
+
+    fn install_actor(
+        peers: &DashMap<PeerId, PeerStreamActor>,
+        peer: PeerId,
+        capacity: usize,
+    ) -> mpsc::Receiver<PendingFrame> {
+        let (tx, rx) = mpsc::channel(capacity);
+        peers.insert(peer, PeerStreamActor { frame_tx: tx });
+        rx
+    }
+
+    #[tokio::test]
+    async fn try_enqueue_delivers_to_live_actor() {
+        let peers = DashMap::new();
+        let peer = PeerId::random();
+        let mut rx = install_actor(&peers, peer, 4);
+
+        let result = try_enqueue_existing(&peers, &peer, make_frame(1));
+        assert!(result.is_ok());
+
+        let received = rx.try_recv().expect("frame delivered to actor channel");
+        assert_eq!(received.compressed_data, vec![1]);
+        assert!(peers.contains_key(&peer), "live actor entry preserved");
+    }
+
+    #[tokio::test]
+    async fn try_enqueue_drops_frame_when_channel_full() {
+        // Capacity 1, pre-fill, then attempt to send — frame must be dropped
+        // (no panic, no respawn) since notifications prefer loss to unbounded
+        // memory growth.
+        let peers = DashMap::new();
+        let peer = PeerId::random();
+        let mut rx = install_actor(&peers, peer, 1);
+        let actor_tx = peers.get(&peer).unwrap().frame_tx.clone();
+        actor_tx.try_send(make_frame(0xAA)).expect("prime channel");
+
+        let result = try_enqueue_existing(&peers, &peer, make_frame(0xBB));
+        assert!(
+            result.is_ok(),
+            "full channel must be reported as handled, not as a respawn signal"
+        );
+        assert!(
+            peers.contains_key(&peer),
+            "actor entry must survive a dropped frame"
+        );
+
+        // Only the priming frame is in the channel — the new one was dropped.
+        let first = rx.try_recv().expect("priming frame still queued");
+        assert_eq!(first.compressed_data, vec![0xAA]);
+        assert!(rx.try_recv().is_err(), "dropped frame must not be queued");
+    }
+
+    #[tokio::test]
+    async fn try_enqueue_returns_frame_and_evicts_when_actor_dead() {
+        // Closing the receiver makes the sender's try_send return Closed.
+        let peers = DashMap::new();
+        let peer = PeerId::random();
+        let rx = install_actor(&peers, peer, 4);
+        drop(rx);
+
+        let result = try_enqueue_existing(&peers, &peer, make_frame(0xCC));
+        match result {
+            Err(returned) => assert_eq!(
+                returned.compressed_data,
+                vec![0xCC],
+                "exact frame must be handed back so the spawn path can re-queue it"
+            ),
+            Ok(()) => panic!("dead actor must signal respawn via Err"),
+        }
+        assert!(
+            !peers.contains_key(&peer),
+            "dead actor entry must be evicted so the next send spawns fresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_enqueue_returns_frame_when_no_actor_exists() {
+        let peers = DashMap::new();
+        let peer = PeerId::random();
+
+        let result = try_enqueue_existing(&peers, &peer, make_frame(0xDD));
+        match result {
+            Err(returned) => assert_eq!(returned.compressed_data, vec![0xDD]),
+            Ok(()) => panic!("absent actor must signal spawn via Err"),
+        }
+        assert!(!peers.contains_key(&peer), "no actor entry was created");
+    }
+
+    #[tokio::test]
+    async fn backoff_doubles_then_caps_at_max() {
+        let map = DashMap::new();
+        let peer = PeerId::random();
+
+        let mut expected = INITIAL_BACKOFF;
+        let mut steps = 0;
+        loop {
+            NotifyStreamPool::apply_backoff(&map, &peer);
+            steps += 1;
+            assert_eq!(
+                map.get(&peer).unwrap().current_backoff,
+                expected,
+                "step {steps}: expected {expected:?}"
+            );
+            if expected == MAX_BACKOFF {
+                break;
+            }
+            expected = (expected * BACKOFF_MULTIPLIER).min(MAX_BACKOFF);
+            assert!(steps < 32, "backoff failed to saturate within 32 steps");
+        }
+
+        for _ in 0..3 {
+            NotifyStreamPool::apply_backoff(&map, &peer);
+            assert_eq!(map.get(&peer).unwrap().current_backoff, MAX_BACKOFF);
+        }
     }
 }
