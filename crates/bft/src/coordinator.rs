@@ -57,10 +57,16 @@ pub struct BftMemoryStats {
     /// Recently-committed wave-id → deadline entries for proposal/validation
     /// dedup. Keyed by `vote_anchor_ts + RETENTION_HORIZON`.
     pub committed_cert_lookup: usize,
+    /// Recently-committed provision-hash → deadline entries for
+    /// proposal/validation dedup. Keyed by `local_committed_ts +
+    /// RETENTION_HORIZON`.
+    pub committed_provision_lookup: usize,
     /// Recently-committed transaction hashes retained for proposal dedup.
     pub recently_committed_txs: usize,
     /// Recently-committed wave certificate hashes retained for proposal dedup.
     pub recently_committed_certs: usize,
+    /// Recently-committed provision hashes retained for proposal dedup.
+    pub recently_committed_provisions: usize,
     /// Block headers whose parent QC signature is still being verified.
     pub pending_qc_verifications: usize,
     /// QC-signature verification cache (block hash → height).
@@ -1454,13 +1460,14 @@ impl BftCoordinator {
         block_hash: BlockHash,
         block: &Block,
     ) -> bool {
-        let (qc_chain_cert_ids, qc_chain_tx_hashes, _) =
+        let (qc_chain_cert_ids, qc_chain_tx_hashes, qc_chain_provision_hashes) =
             self.collect_qc_chain_hashes(block.header().parent_block_hash);
         if let Err(e) = crate::validation::validate_block_for_vote(
             topology,
             block,
             &qc_chain_tx_hashes,
             &qc_chain_cert_ids,
+            &qc_chain_provision_hashes,
             &self.dedup_index,
         ) {
             warn!(
@@ -2226,6 +2233,7 @@ impl BftCoordinator {
                 .certificates()
                 .iter()
                 .map(|cert| cert.wave_id().clone()),
+            block.provisions().iter().map(|p| p.hash()),
         );
 
         // Reset backoff tracking — new height means fresh round counting.
@@ -3045,6 +3053,21 @@ impl BftCoordinator {
         self.dedup_index.register_committed_certs(finalized_waves);
     }
 
+    /// Register committed provision batches for proposal/validation dedup.
+    ///
+    /// Called by the node state layer after the post-commit lifecycle has
+    /// run. Each entry's lifetime is bounded by `local_committed_ts +
+    /// RETENTION_HORIZON` (a conservative surrogate for the source-shard QC
+    /// timestamp).
+    pub fn register_committed_provisions(
+        &mut self,
+        provisions: &[Arc<hyperscale_types::Provisions>],
+        local_committed_ts: WeightedTimestamp,
+    ) {
+        self.dedup_index
+            .register_committed_provisions(provisions, local_committed_ts);
+    }
+
     /// Remove a finalized transaction from the committed lookup.
     ///
     /// Called when a TC is committed, so the tx is no longer relevant for
@@ -3110,8 +3133,10 @@ impl BftCoordinator {
             received_votes_by_height: self.votes.received_votes_len(),
             committed_tx_lookup: self.dedup_index.tx_retention_len(),
             committed_cert_lookup: self.dedup_index.cert_retention_len(),
+            committed_provision_lookup: self.dedup_index.provision_retention_len(),
             recently_committed_txs: self.dedup_index.recent_txs_len(),
             recently_committed_certs: self.dedup_index.recent_certs_len(),
+            recently_committed_provisions: self.dedup_index.recent_provisions_len(),
             pending_qc_verifications: self.verification.pending_qc_verifications_len(),
             verified_qcs: self.verification.verified_qcs_len(),
             pending_state_root_verifications: self

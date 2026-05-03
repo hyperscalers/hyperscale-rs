@@ -16,8 +16,8 @@
 use crate::commit_dedup::CommitDedupIndex;
 use crate::config::BftConfig;
 use hyperscale_types::{
-    Block, BlockHeader, BlockHeight, LocalTimestamp, RoutableTransaction, TopologySnapshot, TxHash,
-    VotePower, WaveId,
+    Block, BlockHeader, BlockHeight, LocalTimestamp, ProvisionHash, RoutableTransaction,
+    TopologySnapshot, TxHash, VotePower, WaveId,
 };
 #[cfg(test)]
 use hyperscale_types::{
@@ -221,20 +221,57 @@ pub fn validate_no_duplicate_certificates(
     Ok(())
 }
 
+/// Validate that no provisions batch in the block has already been committed
+/// or appears in an ancestor block above committed height. Mirrors
+/// [`validate_no_duplicate_transactions`] but for `ProvisionHash`.
+///
+/// Without this check, the on-qc-formed race could cause a proposer to
+/// re-include a just-committed batch — the duplicate is technically
+/// idempotent (admission no-ops via `pipeline.has_verified`), but the
+/// re-inclusion wastes block bytes and re-runs verification. Validators
+/// reject it outright.
+pub fn validate_no_duplicate_provisions(
+    block: &Block,
+    qc_chain_provision_hashes: &HashSet<ProvisionHash>,
+    dedup_index: &CommitDedupIndex,
+) -> Result<(), String> {
+    if block.provisions().is_empty() {
+        return Ok(());
+    }
+
+    for batch in block.provisions() {
+        let provision_hash = batch.hash();
+        if qc_chain_provision_hashes.contains(&provision_hash) {
+            return Err(format!(
+                "provisions batch {provision_hash:?} already in QC chain ancestor"
+            ));
+        }
+        if dedup_index.contains_provision(&provision_hash) {
+            return Err(format!(
+                "provisions batch {provision_hash:?} already committed within its retention window"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Run all pre-vote block-contents checks: transaction ordering, `waves`
-/// recomputation, and cross-ancestor uniqueness for txs and certs. Returns
-/// a single diagnostic on the first failure so the caller can log once.
+/// recomputation, and cross-ancestor uniqueness for txs, certs, and
+/// provisions. Returns a single diagnostic on the first failure so the
+/// caller can log once.
 pub fn validate_block_for_vote(
     topology: &TopologySnapshot,
     block: &Block,
     qc_chain_tx_hashes: &HashSet<TxHash>,
     qc_chain_cert_ids: &HashSet<WaveId>,
+    qc_chain_provision_hashes: &HashSet<ProvisionHash>,
     dedup_index: &CommitDedupIndex,
 ) -> Result<(), String> {
     validate_transaction_ordering(block)?;
     validate_waves(topology, block)?;
     validate_no_duplicate_transactions(block, qc_chain_tx_hashes, dedup_index)?;
     validate_no_duplicate_certificates(block, qc_chain_cert_ids, dedup_index)?;
+    validate_no_duplicate_provisions(block, qc_chain_provision_hashes, dedup_index)?;
     Ok(())
 }
 
@@ -588,6 +625,76 @@ mod tests {
         let mut dedup_index = CommitDedupIndex::new();
         dedup_index.register_committed_certs(&[fw]);
         let err = validate_no_duplicate_certificates(&block, &qc_chain, &dedup_index).unwrap_err();
+        assert!(err.contains("already committed"));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // validate_no_duplicate_provisions
+    // ═══════════════════════════════════════════════════════════════════════
+
+    fn block_with_provisions(
+        height: BlockHeight,
+        provisions: Vec<Arc<hyperscale_types::Provisions>>,
+    ) -> Block {
+        Block::Live {
+            header: header_at_height(height, 100_000),
+            transactions: Vec::new(),
+            certificates: Vec::new(),
+            provisions,
+        }
+    }
+
+    fn provisions_with_seed(seed: u8) -> Arc<hyperscale_types::Provisions> {
+        use hyperscale_types::{MerkleInclusionProof, Provisions, ShardGroupId, TxEntries};
+        let tx_hash = TxHash::from_raw(Hash::from_bytes(&[seed; 32]));
+        Arc::new(Provisions::new(
+            ShardGroupId(0),
+            ShardGroupId(1),
+            BlockHeight(u64::from(seed)),
+            MerkleInclusionProof::dummy(),
+            vec![TxEntries {
+                tx_hash,
+                entries: vec![],
+                target_nodes: vec![],
+            }],
+        ))
+    }
+
+    #[test]
+    fn validate_no_duplicate_provisions_accepts_empty_block() {
+        let block = block_with_provisions(BlockHeight(5), vec![]);
+        let qc_chain = HashSet::new();
+        let dedup_index = CommitDedupIndex::new();
+        assert!(validate_no_duplicate_provisions(&block, &qc_chain, &dedup_index).is_ok());
+    }
+
+    #[test]
+    fn validate_no_duplicate_provisions_accepts_unique() {
+        let block = block_with_provisions(BlockHeight(5), vec![provisions_with_seed(1)]);
+        let qc_chain = HashSet::new();
+        let dedup_index = CommitDedupIndex::new();
+        assert!(validate_no_duplicate_provisions(&block, &qc_chain, &dedup_index).is_ok());
+    }
+
+    #[test]
+    fn validate_no_duplicate_provisions_rejects_qc_chain_dup() {
+        let p = provisions_with_seed(1);
+        let dup_hash = p.hash();
+        let block = block_with_provisions(BlockHeight(6), vec![p]);
+        let qc_chain: HashSet<_> = std::iter::once(dup_hash).collect();
+        let dedup_index = CommitDedupIndex::new();
+        let err = validate_no_duplicate_provisions(&block, &qc_chain, &dedup_index).unwrap_err();
+        assert!(err.contains("already in QC chain ancestor"));
+    }
+
+    #[test]
+    fn validate_no_duplicate_provisions_rejects_retention_dup() {
+        let p = provisions_with_seed(1);
+        let block = block_with_provisions(BlockHeight(6), vec![Arc::clone(&p)]);
+        let qc_chain = HashSet::new();
+        let mut dedup_index = CommitDedupIndex::new();
+        dedup_index.register_committed_provisions(&[p], hyperscale_types::WeightedTimestamp(1_000));
+        let err = validate_no_duplicate_provisions(&block, &qc_chain, &dedup_index).unwrap_err();
         assert!(err.contains("already committed"));
     }
 }

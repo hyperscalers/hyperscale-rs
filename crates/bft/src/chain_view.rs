@@ -127,6 +127,7 @@ impl ChainView<'_> {
 
         tx_hashes.extend(dedup_index.recent_tx_hashes());
         cert_ids.extend(dedup_index.recent_cert_ids());
+        provision_hashes.extend(dedup_index.recent_provision_hashes());
 
         let mut current_hash = parent_block_hash;
         while let Some(block) = self.get_block(current_hash) {
