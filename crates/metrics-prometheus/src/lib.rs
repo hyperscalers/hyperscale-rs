@@ -1202,12 +1202,12 @@ impl MetricsRecorder for PrometheusRecorder {
             .set(m.bft_committed_tx_lookup as f64);
         self.metrics
             .memory_bft
-            .with_label_values(&["recently_committed_txs"])
-            .set(m.bft_recently_committed_txs as f64);
+            .with_label_values(&["committed_cert_lookup"])
+            .set(m.bft_committed_cert_lookup as f64);
         self.metrics
             .memory_bft
-            .with_label_values(&["recently_committed_certs"])
-            .set(m.bft_recently_committed_certs as f64);
+            .with_label_values(&["committed_provision_lookup"])
+            .set(m.bft_committed_provision_lookup as f64);
         self.metrics
             .memory_bft
             .with_label_values(&["pending_qc_verifications"])

@@ -20,7 +20,6 @@ use std::collections::{HashMap, HashSet};
 use tracing::warn;
 
 use crate::pending::PendingBlock;
-use crate::tx_cache::CommittedTxCache;
 
 pub struct ChainView<'a> {
     pub committed_height: BlockHeight,
@@ -113,20 +112,18 @@ impl ChainView<'_> {
     ///
     /// Two walks are fused: full blocks via `get_block` (certified +
     /// assembled pending), then a manifest-only fallback for ancestors not
-    /// yet assembled. Recently-committed hashes from `tx_cache` are folded
-    /// in so proposal dedup sees the latest commit even before the async
-    /// `BlockCommitted` event clears the mempool.
+    /// yet assembled. The just-committed block (at or below
+    /// `committed_height`) is covered separately by
+    /// [`CommitDedupIndex`](crate::commit_dedup::CommitDedupIndex)'s
+    /// `contains_*` queries, populated synchronously inside
+    /// [`crate::coordinator::BftCoordinator::record_block_committed`].
     pub fn collect_ancestor_hashes(
         &self,
         parent_block_hash: BlockHash,
-        tx_cache: &CommittedTxCache,
     ) -> (HashSet<WaveId>, HashSet<TxHash>, HashSet<ProvisionHash>) {
         let mut cert_ids: HashSet<WaveId> = HashSet::new();
         let mut tx_hashes: HashSet<TxHash> = HashSet::new();
         let mut provision_hashes: HashSet<ProvisionHash> = HashSet::new();
-
-        tx_hashes.extend(tx_cache.recent_tx_hashes());
-        cert_ids.extend(tx_cache.recent_cert_ids());
 
         let mut current_hash = parent_block_hash;
         while let Some(block) = self.get_block(current_hash) {

@@ -24,7 +24,7 @@ use std::sync::Arc;
 use tracing::debug;
 
 use crate::chain_view::ChainView;
-use crate::tx_cache::CommittedTxCache;
+use crate::commit_dedup::CommitDedupIndex;
 use crate::verification::VerificationPipeline;
 
 /// Variant-specific content for a proposal build.
@@ -159,7 +159,7 @@ impl ProposalTracker {
 pub fn select_transactions(
     ready_txs: &[Arc<RoutableTransaction>],
     qc_chain_tx_hashes: &HashSet<TxHash>,
-    tx_cache: &CommittedTxCache,
+    dedup_index: &CommitDedupIndex,
     validity_anchor: WeightedTimestamp,
 ) -> Vec<Arc<RoutableTransaction>> {
     let before = ready_txs.len();
@@ -169,7 +169,7 @@ pub fn select_transactions(
         .iter()
         .filter(|tx| {
             let h = tx.hash();
-            if qc_chain_tx_hashes.contains(&h) || tx_cache.contains_tx(&h) {
+            if qc_chain_tx_hashes.contains(&h) || dedup_index.contains_tx(&h) {
                 deduped += 1;
                 return false;
             }
@@ -511,8 +511,8 @@ mod tests {
         Arc::new(routable_from_notarized_v1(notarized, range).expect("valid notarized"))
     }
 
-    fn empty_tx_cache() -> CommittedTxCache {
-        CommittedTxCache::new()
+    fn empty_dedup_index() -> CommitDedupIndex {
+        CommitDedupIndex::new()
     }
 
     #[test]
@@ -527,7 +527,7 @@ mod tests {
             tx_with_range(2, valid_range),
         ];
 
-        let selected = select_transactions(&txs, &HashSet::new(), &empty_tx_cache(), anchor);
+        let selected = select_transactions(&txs, &HashSet::new(), &empty_dedup_index(), anchor);
 
         assert_eq!(selected.len(), 1, "only the in-range tx should survive");
         assert_eq!(selected[0].hash(), txs[1].hash());
@@ -540,7 +540,7 @@ mod tests {
         let future_range = TimestampRange::new(ts(1_000), ts(60_000));
         let txs = vec![tx_with_range(3, future_range)];
 
-        let selected = select_transactions(&txs, &HashSet::new(), &empty_tx_cache(), anchor);
+        let selected = select_transactions(&txs, &HashSet::new(), &empty_dedup_index(), anchor);
 
         assert!(
             selected.is_empty(),
@@ -555,7 +555,7 @@ mod tests {
         let too_wide = TimestampRange::new(ts(0), anchor.plus(Duration::from_mins(10)));
         let txs = vec![tx_with_range(4, too_wide)];
 
-        let selected = select_transactions(&txs, &HashSet::new(), &empty_tx_cache(), anchor);
+        let selected = select_transactions(&txs, &HashSet::new(), &empty_dedup_index(), anchor);
 
         assert!(selected.is_empty(), "malformed range should be filtered");
     }
@@ -567,7 +567,7 @@ mod tests {
         let range = TimestampRange::new(ts(500), anchor); // [500, 1000)
         let txs = vec![tx_with_range(5, range)];
 
-        let selected = select_transactions(&txs, &HashSet::new(), &empty_tx_cache(), anchor);
+        let selected = select_transactions(&txs, &HashSet::new(), &empty_dedup_index(), anchor);
 
         assert!(
             selected.is_empty(),
@@ -582,7 +582,7 @@ mod tests {
         let range = TimestampRange::new(anchor, anchor.plus(Duration::from_mins(1)));
         let txs = vec![tx_with_range(6, range)];
 
-        let selected = select_transactions(&txs, &HashSet::new(), &empty_tx_cache(), anchor);
+        let selected = select_transactions(&txs, &HashSet::new(), &empty_dedup_index(), anchor);
 
         assert_eq!(selected.len(), 1, "anchor == start_inclusive must be kept");
     }
@@ -597,7 +597,7 @@ mod tests {
         let mut chain = HashSet::new();
         chain.insert(tx.hash());
 
-        let selected = select_transactions(&[tx], &chain, &empty_tx_cache(), anchor);
+        let selected = select_transactions(&[tx], &chain, &empty_dedup_index(), anchor);
         assert!(selected.is_empty());
     }
 }

@@ -18,33 +18,37 @@
 //! silently break invariants the downstream coordinators rely on; the edges
 //! are not enforced by the type system.
 //!
+//! Dedup-index registration is owned by
+//! [`crate::coordinator::BftCoordinator::record_block_committed`] (in the
+//! `bft` crate) and runs synchronously when BFT internally commits the
+//! block — earlier than this fanout. So mempool's tombstone-retention pass
+//! in step 2 already sees the up-to-date `tx_retention` map.
+//!
 //! The order is, with the dependency edge that motivates each step:
 //!
-//! 1. `bft.register_committed_transactions` — populates the dedup
-//!    `tx_cache` that mempool's tombstone-retention pass reads in step 3.
-//!    Must precede mempool's commit transition.
-//! 2. `bft.on_block_committed_verification` — marks the block's JMT
+//! 1. `bft.on_block_committed_verification` — marks the block's JMT
 //!    snapshot as a usable parent in `PendingChain`. Child state-root
 //!    verifications in subsequent dispatches need this; if any are pending
 //!    against this block as their parent, they unblock here. Must precede
 //!    any path that may emit child verifications.
-//! 3. `mempool.on_block_committed` — Pending → Committed → Completed
+//! 2. `mempool.on_block_committed` — Pending → Committed → Completed
 //!    transitions for `block.transactions` and `block.certificates`.
-//!    Reads BFT's `tx_cache` (set in step 1) for tombstone retention bounds.
-//! 4. `remote_headers.on_block_committed` — liveness updates and
+//!    Reads BFT's `dedup_index.tx_retention` (populated synchronously in
+//!    `record_block_committed`) for tombstone retention bounds.
+//! 3. `remote_headers.on_block_committed` — liveness updates and
 //!    cross-shard timeout scheduling. Independent of the local coordinators
 //!    above; ordered here so all "cross-shard" work runs before execution.
-//! 5. `provisions.on_block_committed` — pruning + fallback timeouts. Reads
+//! 4. `provisions.on_block_committed` — pruning + fallback timeouts. Reads
 //!    provision hashes directly off the block (`Block::Live` carries them
 //!    inline; `Block::Sealed` has none). Independent of mempool and
 //!    remote-headers; sequenced before execution because execution may
 //!    consume provisions queued here on the next proposal attempt.
-//! 6. `outbound_provisions.on_block_committed(qc.weighted_timestamp)` —
+//! 5. `outbound_provisions.on_block_committed(qc.weighted_timestamp)` —
 //!    deterministic eviction sweep. Uses the BFT-authenticated weighted
 //!    timestamp from the QC so every validator evicts identically. Must
-//!    follow steps 1-5 because eviction reads the now-up-to-date provisions
-//!    state.
-//! 7. `apply_block_to_execution` — per-wave cleanup, wave dispatch (Live)
+//!    follow earlier steps because eviction reads the now-up-to-date
+//!    provisions state.
+//! 6. `apply_block_to_execution` — per-wave cleanup, wave dispatch (Live)
 //!    or wave-assignment recording (Sealed), and vote emission. Last
 //!    because (a) execution's wave-cleanup reads `block.certificates` after
 //!    mempool has finished its terminal-state transitions, and (b) vote
@@ -246,12 +250,6 @@ impl NodeStateMachine {
     fn on_block_committed(&mut self, certified: &CertifiedBlock) -> Vec<Action> {
         let mut actions = Vec::new();
         let block_hash = certified.block.hash();
-
-        // Register committed transactions with BFT for proposal dedup. The
-        // tx_cache reads each tx's `validity_range.end_timestamp_exclusive`
-        // to bound its own retention.
-        self.bft
-            .register_committed_transactions(certified.block.transactions());
 
         // Mark this block as a usable parent for child state-root
         // verifications. By the time `BlockCommitted` fires, the block's JMT

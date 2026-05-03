@@ -72,10 +72,10 @@ pub struct MemoryMetrics {
     pub bft_received_votes_by_height: usize,
     /// Committed transaction hash lookup.
     pub bft_committed_tx_lookup: usize,
-    /// Recently committed transaction hashes (dedup window).
-    pub bft_recently_committed_txs: usize,
-    /// Recently committed certificate hashes (dedup window).
-    pub bft_recently_committed_certs: usize,
+    /// Committed wave certificate lookup.
+    pub bft_committed_cert_lookup: usize,
+    /// Committed provision batch lookup.
+    pub bft_committed_provision_lookup: usize,
     /// Block headers pending QC verification.
     pub bft_pending_qc_verifications: usize,
     /// Cache of verified QC signatures.
