@@ -70,3 +70,83 @@ impl NodeStateMachine {
             .on_fetched_transactions(self.topology.snapshot(), txs, self.now)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_support::TestNode;
+    use hyperscale_core::{ProtocolEvent, StateMachine};
+    use hyperscale_types::test_utils::{test_transaction, test_transaction_with_nodes};
+    use std::sync::Arc;
+
+    /// Validated gossip transactions are gated by the local-shard filter
+    /// before reaching mempool. A tx with empty reads/writes never
+    /// involves any shard, so the local-shard predicate rejects it and
+    /// the mempool stays empty.
+    #[test]
+    fn transaction_validated_drops_tx_with_no_local_shard_involvement() {
+        let TestNode { mut node, .. } = TestNode::new();
+
+        let tx = Arc::new(test_transaction_with_nodes(
+            b"empty-shards-xyz",
+            /* read_nodes */ vec![],
+            /* write_nodes */ vec![],
+        ));
+
+        let actions = node.handle(ProtocolEvent::TransactionValidated {
+            tx,
+            submitted_locally: false,
+        });
+
+        assert!(actions.is_empty());
+        assert_eq!(
+            node.mempool.len(),
+            0,
+            "non-local tx must not enter the mempool",
+        );
+    }
+
+    /// Counterpart to the rejection test: a tx that touches a local node
+    /// must reach the mempool (with `num_shards = 1` every node maps to
+    /// `ShardGroupId(0)`).
+    #[test]
+    fn transaction_validated_routes_local_shard_tx_to_mempool() {
+        let TestNode { mut node, .. } = TestNode::new();
+        let tx = Arc::new(test_transaction(/* seed */ 1));
+
+        let _ = node.handle(ProtocolEvent::TransactionValidated {
+            tx,
+            submitted_locally: true,
+        });
+
+        assert_eq!(
+            node.mempool.len(),
+            1,
+            "local-shard tx must be admitted to the mempool",
+        );
+    }
+
+    /// `TransactionsReceived` is the fetch-delivery counterpart to
+    /// `TransactionValidated` — txs arrive from a peer we asked, so the
+    /// gossip-side validation pipeline is skipped and the orchestrator
+    /// hands the batch directly to mempool's `on_fetched_transactions`.
+    /// Distinct mempool method, distinct admission flags (gossip path
+    /// passes `submitted_locally`; this path always treats them as
+    /// remote). Bug surface: dropping the call entirely, or routing
+    /// fetch txs through the gossip path and inheriting its validation.
+    #[test]
+    fn transactions_received_admits_fetched_batch_to_mempool() {
+        let TestNode { mut node, .. } = TestNode::new();
+        let txs = vec![
+            Arc::new(test_transaction(/* seed */ 1)),
+            Arc::new(test_transaction(/* seed */ 2)),
+        ];
+
+        let _ = node.handle(ProtocolEvent::TransactionsReceived { transactions: txs });
+
+        assert_eq!(
+            node.mempool.len(),
+            2,
+            "fetched txs must be admitted via the fetch path",
+        );
+    }
+}

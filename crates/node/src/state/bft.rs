@@ -325,3 +325,367 @@ impl NodeStateMachine {
         actions
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_support::TestNode;
+    use hyperscale_core::{Action, ProtocolEvent, StateMachine};
+    use hyperscale_mempool::MempoolConfig;
+    use hyperscale_test_helpers::{certify, make_live_block};
+    use hyperscale_types::{
+        BlockHeight, BlockManifest, CommittedBlockHeader, Hash, LocalTimestamp,
+        MerkleInclusionProof, Provisions, QuorumCertificate, RETENTION_HORIZON, ShardGroupId,
+        TransactionStatus, TxEntries, TxHash, ValidatorId, WaveId, test_utils::test_transaction,
+    };
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    /// `RemoteHeaderAdmitted` must fan out to **both** execution and
+    /// provisions: execution registers expected ECs from the header's
+    /// wave list (only for waves whose `remote_shards` includes local);
+    /// provisions records the verified header for cross-shard provision
+    /// flows. Dropping either side leaves the shard blind to one half of
+    /// cross-shard work.
+    #[test]
+    fn remote_header_admitted_fans_to_execution_and_provisions() {
+        let TestNode { mut node, .. } = TestNode::builder().num_shards(2).build();
+
+        // Wave on remote shard 1 listing local shard 0 as a dependency.
+        let mut remote_shards = BTreeSet::new();
+        remote_shards.insert(ShardGroupId(0));
+        let wave = WaveId::new(ShardGroupId(1), BlockHeight(5), remote_shards);
+
+        let mut block = make_live_block(
+            ShardGroupId(1),
+            BlockHeight(5),
+            /* timestamp_ms */ 1_000,
+            ValidatorId(0),
+            vec![],
+            vec![],
+        );
+        if let hyperscale_types::Block::Live { ref mut header, .. } = block {
+            header.waves = vec![wave];
+        }
+        let committed_header = Arc::new(CommittedBlockHeader::new(
+            block.header().clone(),
+            QuorumCertificate::genesis(),
+        ));
+
+        let pre_exec = node.execution.memory_stats().expected_exec_certs;
+        let pre_prov = node.provisions.verified_remote_header_count();
+
+        let _ = node.handle(ProtocolEvent::RemoteHeaderAdmitted { committed_header });
+
+        assert_eq!(
+            node.execution.memory_stats().expected_exec_certs,
+            pre_exec + 1,
+            "execution must register the wave from the verified header as an expected EC",
+        );
+        assert_eq!(
+            node.provisions.verified_remote_header_count(),
+            pre_prov + 1,
+            "provisions must record the verified remote header",
+        );
+    }
+
+    /// `TransactionsAdmitted` latches a proposal-retry via
+    /// `bft.queue_ready_proposal()`; the post-dispatch hook in
+    /// `mod.rs::handle` calls `try_event_driven_proposal()` when the
+    /// latch fires. End-to-end: when the local validator is the
+    /// round-0 proposer for height 1, this chain must surface a
+    /// `BuildProposal` action. Without the latch (or without the
+    /// post-dispatch hook), no proposal would emerge — and that
+    /// regression is silent until liveness breaks.
+    #[test]
+    fn transactions_admitted_drives_proposal_through_post_dispatch_hook() {
+        // proposer_for(h=1, r=0) = committee[(1+0) % 4] = committee[1]
+        // = ValidatorId(1). Pick local_idx=1 to be the leader.
+        let TestNode { mut node, .. } = TestNode::builder().local_idx(1).build();
+        assert!(
+            node.topology()
+                .should_propose(BlockHeight(1), hyperscale_types::Round::INITIAL),
+            "local must be the round-0 height-1 proposer for this test",
+        );
+
+        let actions = node.handle(ProtocolEvent::TransactionsAdmitted { txs: vec![] });
+
+        let saw_proposal = actions
+            .iter()
+            .any(|a| matches!(a, Action::BuildProposal { .. }));
+        assert!(
+            saw_proposal,
+            "expected BuildProposal after TransactionsAdmitted on a leader; got {actions:?}",
+        );
+    }
+
+    /// Counterpart: a non-leader still latches the retry, but the
+    /// post-dispatch `try_propose` returns empty (the leader check
+    /// short-circuits inside BFT). The latch fires regardless — the
+    /// guard is at the proposer level, not the latch level.
+    #[test]
+    fn transactions_admitted_does_not_emit_proposal_on_non_leader() {
+        // local_idx=0 → ValidatorId(0); committee[1] = ValidatorId(1)
+        // is the proposer, so we are not.
+        let TestNode { mut node, .. } = TestNode::new();
+        assert!(
+            !node
+                .topology()
+                .should_propose(BlockHeight(1), hyperscale_types::Round::INITIAL),
+            "local must NOT be the round-0 height-1 proposer for this test",
+        );
+
+        let actions = node.handle(ProtocolEvent::TransactionsAdmitted { txs: vec![] });
+
+        let saw_proposal = actions
+            .iter()
+            .any(|a| matches!(a, Action::BuildProposal { .. }));
+        assert!(
+            !saw_proposal,
+            "non-leader must not emit BuildProposal; got {actions:?}",
+        );
+    }
+
+    /// `BlockPersisted` only re-arms the cleanup timer when BFT signals
+    /// it just exited sync mode (non-empty action list). On a steady-
+    /// state node, the post-persist call is a no-op and no `SetTimer`
+    /// must be appended.
+    #[test]
+    fn block_persisted_does_not_reschedule_cleanup_timer_in_steady_state() {
+        let TestNode { mut node, .. } = TestNode::new();
+
+        let actions = node.handle(ProtocolEvent::BlockPersisted {
+            height: BlockHeight(10),
+        });
+
+        let cleanup_timer_set = actions.iter().any(|a| {
+            matches!(
+                a,
+                Action::SetTimer {
+                    id: hyperscale_core::TimerId::Cleanup,
+                    ..
+                }
+            )
+        });
+        assert!(
+            !cleanup_timer_set,
+            "steady-state BlockPersisted must not duplicate the cleanup timer; got {actions:?}",
+        );
+    }
+
+    /// The orchestrator's outbound-provisions sweep on `BlockCommitted` must
+    /// run on `qc.weighted_timestamp` — never on local clock. Every
+    /// validator sees the same QC, so they evict in lockstep; if local
+    /// clock leaks in, validators with skew evict at different commits
+    /// and the outbound tracker forks across the network.
+    ///
+    /// Test pumps local clock far past the entry's deadline and commits a
+    /// block whose `qc.weighted_timestamp` is BELOW that deadline. The
+    /// entry must survive — proves the sweep ignored the local clock. A
+    /// second commit with `weighted_timestamp` past the deadline then
+    /// confirms the eviction path itself works.
+    #[test]
+    fn block_committed_evicts_outbound_provisions_on_qc_weighted_timestamp_not_local_clock() {
+        let TestNode { mut node, .. } = TestNode::builder().num_shards(2).build();
+
+        // Register an outbound batch (local shard 0 → remote shard 1).
+        // Deadline = self.now (ZERO) + RETENTION_HORIZON ≈ 5m24s.
+        let provisions = Arc::new(Provisions::new(
+            ShardGroupId(0),
+            ShardGroupId(1),
+            BlockHeight(1),
+            MerkleInclusionProof::dummy(),
+            vec![TxEntries {
+                tx_hash: TxHash::from_raw(Hash::from_bytes(b"outbound-tx")),
+                entries: vec![],
+                target_nodes: vec![],
+            }],
+        ));
+        let _ = node.handle(ProtocolEvent::OutboundProvisionBroadcast {
+            provisions,
+            target_shard: ShardGroupId(1),
+        });
+        assert_eq!(
+            node.outbound_provisions().memory_stats().tracked_provisions,
+            1,
+            "broadcast must register the outbound entry",
+        );
+
+        // Pump local clock WAY past the deadline. If the orchestrator
+        // were using `self.now`, the next commit would evict.
+        let retention_ms =
+            u64::try_from(RETENTION_HORIZON.as_millis()).expect("RETENTION_HORIZON fits u64");
+        let past_deadline_ms = retention_ms * 10;
+        node.set_time(LocalTimestamp::from_millis(past_deadline_ms));
+
+        // Commit a block whose qc.weighted_timestamp is BELOW the entry
+        // deadline. The orchestrator passes this into the outbound sweep.
+        let block = make_live_block(
+            ShardGroupId(0),
+            BlockHeight(1),
+            /* timestamp_ms */ 1_000,
+            ValidatorId(0),
+            vec![],
+            vec![],
+        );
+        let certified = certify(block, /* weighted_timestamp_ms */ 1_000);
+        let _ = node.handle(ProtocolEvent::BlockCommitted { certified });
+        assert_eq!(
+            node.outbound_provisions().memory_stats().tracked_provisions,
+            1,
+            "outbound entry must survive — qc.weighted_timestamp is below the deadline, \
+             local clock past it must not leak in",
+        );
+
+        // Commit a second block whose qc.weighted_timestamp IS past the
+        // deadline. Now the eviction path proper must fire.
+        let block = make_live_block(
+            ShardGroupId(0),
+            BlockHeight(2),
+            /* timestamp_ms */ 1_000,
+            ValidatorId(0),
+            vec![],
+            vec![],
+        );
+        let certified = certify(block, past_deadline_ms);
+        let _ = node.handle(ProtocolEvent::BlockCommitted { certified });
+        assert_eq!(
+            node.outbound_provisions().memory_stats().tracked_provisions,
+            0,
+            "outbound entry must be evicted — qc.weighted_timestamp now exceeds the deadline",
+        );
+    }
+
+    /// `on_block_header_received` gates BFT ingest on `would_exceed_in_flight`
+    /// for blocks at exactly `committed_height + 1`. The gate is documented
+    /// as next-block-only because validators at different pending heights
+    /// see different in-flight counts — a wider check would split votes.
+    /// When the gate fires the orchestrator returns immediately without
+    /// consulting BFT; observable as zero pending blocks afterwards.
+    #[test]
+    fn block_header_received_drops_next_block_when_would_exceed_in_flight() {
+        // Tiny in-flight cap so a small manifest trips the projection.
+        let mempool_config = MempoolConfig {
+            max_in_flight: 1,
+            ..MempoolConfig::default()
+        };
+        let TestNode { mut node, .. } = TestNode::builder().mempool_config(mempool_config).build();
+
+        // Manifest claiming 4 new txs; with `max_in_flight = 1` and current
+        // in-flight = 0, projected = 4 > 1 → would_exceed = true.
+        let manifest = BlockManifest {
+            tx_hashes: vec![TxHash::ZERO, TxHash::ZERO, TxHash::ZERO, TxHash::ZERO],
+            cert_ids: vec![],
+            provision_hashes: vec![],
+        };
+
+        // Header at committed_height + 1 = 1 (fresh node committed at GENESIS).
+        let header = make_live_block(
+            ShardGroupId(0),
+            BlockHeight(1),
+            /* timestamp_ms */ 1_000,
+            ValidatorId(0),
+            vec![],
+            vec![],
+        )
+        .header()
+        .clone();
+
+        let actions = node.handle(ProtocolEvent::BlockHeaderReceived { header, manifest });
+
+        assert!(
+            actions.is_empty(),
+            "gated header must produce no actions; got {actions:?}",
+        );
+        assert_eq!(
+            node.bft().pending_block_counts(),
+            (0, 0),
+            "gated header must not reach BFT — pending_blocks should be untouched",
+        );
+    }
+
+    /// Counterpart to the gate-fires test: when the manifest fits inside
+    /// the in-flight cap, the orchestrator must let BFT ingest the header
+    /// and the pending-block count must reflect it. Catches the
+    /// regression where the gate over-fires (e.g. flipped predicate,
+    /// off-by-one bound) — symptom would be the same as the network
+    /// silently dropping all incoming headers.
+    #[test]
+    fn block_header_received_admits_next_block_within_in_flight_cap() {
+        // Default mempool cap is well above 1 tx; pair with a
+        // single-tx manifest so the projection cleanly fits.
+        let TestNode { mut node, .. } = TestNode::new();
+
+        let manifest = BlockManifest {
+            tx_hashes: vec![TxHash::ZERO],
+            cert_ids: vec![],
+            provision_hashes: vec![],
+        };
+
+        // proposer_for(h=1, r=0) = committee[(1+0) % 4] = ValidatorId(1).
+        // BFT's header validation rejects on proposer mismatch, so the
+        // header must name the actual round-0 height-1 leader to reach
+        // the pending-blocks insert.
+        let header = make_live_block(
+            ShardGroupId(0),
+            BlockHeight(1),
+            /* timestamp_ms */ 1_000,
+            ValidatorId(1),
+            vec![],
+            vec![],
+        )
+        .header()
+        .clone();
+
+        let _ = node.handle(ProtocolEvent::BlockHeaderReceived { header, manifest });
+
+        let (pending_blocks, _) = node.bft().pending_block_counts();
+        assert_eq!(
+            pending_blocks, 1,
+            "header within cap must reach BFT exactly once — pending_blocks should be 1",
+        );
+    }
+
+    /// Step 2 of the `on_block_committed` orchestration ordering
+    /// ([bft.rs module head]) hands the certified block to
+    /// `mempool.on_block_committed`, which flips every entry in
+    /// `block.transactions()` from `Pending` to `Committed(height)`.
+    /// The edges of that ordering are not enforced by the type system —
+    /// reordering or dropping the mempool fanout silently breaks status
+    /// reporting and leaves locks untaken. This test pins the visible
+    /// transition: admit a tx via gossip, commit a block carrying it,
+    /// and assert the mempool entry is now `Committed(h)`.
+    #[test]
+    fn block_committed_flips_admitted_tx_to_committed_in_mempool() {
+        let TestNode { mut node, .. } = TestNode::new();
+
+        let tx = Arc::new(test_transaction(/* seed */ 1));
+        let tx_hash = tx.hash();
+
+        let _ = node.handle(ProtocolEvent::TransactionValidated {
+            tx: Arc::clone(&tx),
+            submitted_locally: true,
+        });
+        assert_eq!(
+            node.mempool().status(&tx_hash),
+            Some(TransactionStatus::Pending),
+            "tx must be admitted as Pending before commit",
+        );
+
+        let block = make_live_block(
+            ShardGroupId(0),
+            BlockHeight(1),
+            /* timestamp_ms */ 1_000,
+            ValidatorId(0),
+            vec![tx],
+            vec![],
+        );
+        let certified = certify(block, /* weighted_timestamp_ms */ 1_000);
+        let _ = node.handle(ProtocolEvent::BlockCommitted { certified });
+
+        assert_eq!(
+            node.mempool().status(&tx_hash),
+            Some(TransactionStatus::Committed(BlockHeight(1))),
+            "on_block_committed must flip the included tx from Pending to Committed(1)",
+        );
+    }
+}

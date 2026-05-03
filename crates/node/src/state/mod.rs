@@ -8,6 +8,9 @@ mod sync;
 mod timers;
 mod transactions;
 
+#[cfg(test)]
+mod test_support;
+
 use hyperscale_bft::{BftConfig, BftCoordinator, RecoveredState};
 use hyperscale_core::{Action, ProtocolEvent, StateMachine};
 use hyperscale_execution::ExecutionCoordinator;
@@ -154,6 +157,12 @@ impl NodeStateMachine {
     #[must_use]
     pub const fn provisions(&self) -> &ProvisionCoordinator {
         &self.provisions
+    }
+
+    /// Get a reference to the outbound provision tracker.
+    #[must_use]
+    pub const fn outbound_provisions(&self) -> &OutboundProvisionTracker {
+        &self.outbound_provisions
     }
 
     /// Get a reference to the remote header coordinator.

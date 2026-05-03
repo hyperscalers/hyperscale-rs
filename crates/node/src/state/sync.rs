@@ -37,3 +37,94 @@ impl NodeStateMachine {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_support::TestNode;
+    use crate::assert_emits;
+    use hyperscale_core::{Action, FetchRequest, ProtocolEvent, StateMachine};
+    use hyperscale_test_helpers::make_live_block;
+    use hyperscale_types::{
+        BlockHash, BlockHeight, CommittedBlockHeader, QuorumCertificate, ShardGroupId, ValidatorId,
+        WaveId,
+    };
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    /// `BlockSyncComplete` fans out to BFT, remote-headers, and
+    /// provisions in one pass. The provisions flush is the most
+    /// directly observable: when a verified remote header has seeded
+    /// `expected_provisions`, the flush surfaces an
+    /// `Action::Fetch(FetchRequest::RemoteProvisions { .. })`. This
+    /// test catches a regression where the provisions flush is
+    /// dropped from the sync-complete arm.
+    #[test]
+    fn block_sync_complete_flushes_expected_provisions() {
+        let TestNode { mut node, .. } = TestNode::builder().num_shards(2).build();
+
+        // Seed provisions.expected via a verified remote header whose
+        // wave depends on local.
+        let mut remote_shards = BTreeSet::new();
+        remote_shards.insert(ShardGroupId(0));
+        let wave = WaveId::new(ShardGroupId(1), BlockHeight(5), remote_shards);
+        let mut block = make_live_block(
+            ShardGroupId(1),
+            BlockHeight(5),
+            /* timestamp_ms */ 1_000,
+            ValidatorId(0),
+            vec![],
+            vec![],
+        );
+        if let hyperscale_types::Block::Live { ref mut header, .. } = block {
+            header.waves = vec![wave];
+        }
+        let committed_header = Arc::new(CommittedBlockHeader::new(
+            block.header().clone(),
+            QuorumCertificate::genesis(),
+        ));
+        let _ = node.handle(ProtocolEvent::RemoteHeaderAdmitted { committed_header });
+
+        // Now trigger sync-complete. The provisions flush must surface
+        // a fetch request for the seeded expected entry.
+        let actions = node.handle(ProtocolEvent::BlockSyncComplete {
+            height: BlockHeight(5),
+        });
+
+        assert_emits!(
+            actions,
+            Action::Fetch(FetchRequest::RemoteProvisions { source_shard, .. })
+                if *source_shard == ShardGroupId(1)
+        );
+    }
+
+    /// `CommittedStateRestored` is the boot-time hand-off from `RocksDB`
+    /// to the in-memory BFT state. The orchestrator routes it to
+    /// `bft.on_committed_state_restored`, which restores
+    /// `committed_height` so subsequent header validation and pending-
+    /// block routing accept blocks at the correct tip. A regression
+    /// that drops the routing leaves a freshly-booted node convinced
+    /// it's still at genesis — silent until the first real header
+    /// arrives and gets rejected as "below committed height".
+    #[test]
+    fn committed_state_restored_advances_bft_committed_height() {
+        let TestNode { mut node, .. } = TestNode::new();
+        assert_eq!(
+            node.bft().committed_height(),
+            BlockHeight(0),
+            "fresh node must start at genesis",
+        );
+
+        let restored_height = BlockHeight(42);
+        let _ = node.handle(ProtocolEvent::CommittedStateRestored {
+            height: restored_height,
+            hash: Some(BlockHash::ZERO),
+            qc: None,
+        });
+
+        assert_eq!(
+            node.bft().committed_height(),
+            restored_height,
+            "committed height must reflect the restored value",
+        );
+    }
+}

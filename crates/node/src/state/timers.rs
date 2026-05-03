@@ -55,3 +55,56 @@ impl NodeStateMachine {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_support::TestNode;
+    use crate::assert_emits;
+    use hyperscale_core::{Action, ProtocolEvent, StateMachine, TimerId};
+
+    /// `CleanupTimer` is the only thing keeping its own loop alive — it
+    /// must reschedule itself before doing anything else, so a missed
+    /// reschedule silently halts mempool / BFT housekeeping.
+    #[test]
+    fn cleanup_timer_reschedules_itself() {
+        let TestNode { mut node, .. } = TestNode::new();
+
+        let actions = node.handle(ProtocolEvent::CleanupTimer);
+
+        assert!(
+            matches!(
+                actions.first(),
+                Some(Action::SetTimer {
+                    id: TimerId::Cleanup,
+                    ..
+                })
+            ),
+            "CleanupTimer must lead with its own reschedule; got {actions:?}",
+        );
+    }
+
+    /// `ViewChangeTimer` reschedules itself with the BFT coordinator's
+    /// reported remaining timeout when no view change is needed yet.
+    /// On a freshly-built node, `check_round_timeout` returns `None`, so
+    /// we exercise the reschedule branch.
+    #[test]
+    fn view_change_timer_reschedules_with_remaining_timeout() {
+        let TestNode { mut node, .. } = TestNode::new();
+        let expected = node.bft.remaining_view_change_timeout();
+
+        let actions = node.handle(ProtocolEvent::ViewChangeTimer);
+
+        assert_eq!(
+            actions.len(),
+            1,
+            "expected single reschedule; got {actions:?}"
+        );
+        assert_emits!(
+            actions,
+            Action::SetTimer {
+                id: TimerId::ViewChange,
+                duration,
+            } if *duration == expected
+        );
+    }
+}
