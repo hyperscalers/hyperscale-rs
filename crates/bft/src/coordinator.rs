@@ -52,21 +52,15 @@ pub struct BftMemoryStats {
     pub voted_heights: usize,
     /// Equivocation-detection records keyed by `(height, validator)`.
     pub received_votes_by_height: usize,
-    /// Recently-committed tx-hash → height entries used for fast dedup lookup.
+    /// Committed tx-hash → `end_timestamp_exclusive` entries used for fast
+    /// dedup lookup.
     pub committed_tx_lookup: usize,
-    /// Recently-committed wave-id → deadline entries for proposal/validation
-    /// dedup. Keyed by `vote_anchor_ts + RETENTION_HORIZON`.
+    /// Committed wave-id → deadline entries for proposal/validation dedup.
+    /// Keyed by `vote_anchor_ts + RETENTION_HORIZON`.
     pub committed_cert_lookup: usize,
-    /// Recently-committed provision-hash → deadline entries for
-    /// proposal/validation dedup. Keyed by `local_committed_ts +
-    /// RETENTION_HORIZON`.
+    /// Committed provision-hash → deadline entries for proposal/validation
+    /// dedup. Keyed by `local_committed_ts + RETENTION_HORIZON`.
     pub committed_provision_lookup: usize,
-    /// Recently-committed transaction hashes retained for proposal dedup.
-    pub recently_committed_txs: usize,
-    /// Recently-committed wave certificate hashes retained for proposal dedup.
-    pub recently_committed_certs: usize,
-    /// Recently-committed provision hashes retained for proposal dedup.
-    pub recently_committed_provisions: usize,
     /// Block headers whose parent QC signature is still being verified.
     pub pending_qc_verifications: usize,
     /// QC-signature verification cache (block hash → height).
@@ -2209,9 +2203,9 @@ impl BftCoordinator {
     }
 
     /// Common bookkeeping for committing a block (shared between consensus and
-    /// sync paths). Updates `committed_height`/`hash`, buffers recently
-    /// committed hashes for dedup, resets backoff tracking, and cleans up old
-    /// state.
+    /// sync paths). Updates `committed_height`/`hash`, registers committed
+    /// artifacts in the dedup index, resets backoff tracking, and cleans up
+    /// old state.
     fn record_block_committed(
         &mut self,
         block: &Block,
@@ -2225,16 +2219,17 @@ impl BftCoordinator {
         self.committed_ts = commit_ts;
         self.committed_state_root = block.header().state_root;
 
-        // Buffer committed hashes so collect_qc_chain_hashes can
-        // exclude them even after cleanup_old_state removes the block.
-        self.dedup_index.buffer_commit(
-            block.transactions().iter().map(|tx| tx.hash()),
-            block
-                .certificates()
-                .iter()
-                .map(|cert| cert.wave_id().clone()),
-            block.provisions().iter().map(|p| p.hash()),
-        );
+        // Register committed artifacts synchronously. The retention maps
+        // are populated here so the just-committed block's contents are
+        // visible to dedup before any subsequent `try_propose` runs in the
+        // same `on_qc_formed` tick — even though `cleanup_old_state` below
+        // evicts the block from `pending_blocks`.
+        self.dedup_index
+            .register_committed_txs(block.transactions());
+        self.dedup_index
+            .register_committed_certs(block.certificates());
+        self.dedup_index
+            .register_committed_provisions(block.provisions(), commit_ts);
 
         // Reset backoff tracking — new height means fresh round counting.
         self.view_change.reset_for_height_advance();
@@ -3029,53 +3024,6 @@ impl BftCoordinator {
         ready
     }
 
-    /// Register committed transactions for execution timeout validation.
-    ///
-    /// Called by the node state layer after mempool processes a committed block.
-    /// Validators use this for proposal-side dedup so a tx hash already
-    /// committed to the chain cannot be re-included while still in its
-    /// `validity_range`. Each entry's lifetime is bounded by its own
-    /// `end_timestamp_exclusive`.
-    pub fn register_committed_transactions(&mut self, transactions: &[Arc<RoutableTransaction>]) {
-        self.dedup_index.register_committed_txs(transactions);
-    }
-
-    /// Register committed finalized waves for proposal/validation dedup.
-    ///
-    /// Called by the node state layer after the post-commit lifecycle has
-    /// run. Each entry's lifetime is bounded by `vote_anchor_ts +
-    /// RETENTION_HORIZON` from the wave's local EC; past that horizon,
-    /// every tx the wave covered has terminated everywhere.
-    pub fn register_committed_finalized_waves(
-        &mut self,
-        finalized_waves: &[Arc<hyperscale_types::FinalizedWave>],
-    ) {
-        self.dedup_index.register_committed_certs(finalized_waves);
-    }
-
-    /// Register committed provision batches for proposal/validation dedup.
-    ///
-    /// Called by the node state layer after the post-commit lifecycle has
-    /// run. Each entry's lifetime is bounded by `local_committed_ts +
-    /// RETENTION_HORIZON` (a conservative surrogate for the source-shard QC
-    /// timestamp).
-    pub fn register_committed_provisions(
-        &mut self,
-        provisions: &[Arc<hyperscale_types::Provisions>],
-        local_committed_ts: WeightedTimestamp,
-    ) {
-        self.dedup_index
-            .register_committed_provisions(provisions, local_committed_ts);
-    }
-
-    /// Remove a finalized transaction from the committed lookup.
-    ///
-    /// Called when a TC is committed, so the tx is no longer relevant for
-    /// timeout validation.
-    pub fn remove_committed_transaction(&mut self, tx_hash: &TxHash) {
-        self.dedup_index.remove_tx(tx_hash);
-    }
-
     /// Get the current committed height.
     #[must_use]
     pub const fn committed_height(&self) -> BlockHeight {
@@ -3134,9 +3082,6 @@ impl BftCoordinator {
             committed_tx_lookup: self.dedup_index.tx_retention_len(),
             committed_cert_lookup: self.dedup_index.cert_retention_len(),
             committed_provision_lookup: self.dedup_index.provision_retention_len(),
-            recently_committed_txs: self.dedup_index.recent_txs_len(),
-            recently_committed_certs: self.dedup_index.recent_certs_len(),
-            recently_committed_provisions: self.dedup_index.recent_provisions_len(),
             pending_qc_verifications: self.verification.pending_qc_verifications_len(),
             verified_qcs: self.verification.verified_qcs_len(),
             pending_state_root_verifications: self
@@ -3193,8 +3138,7 @@ impl BftCoordinator {
         std::collections::HashSet<TxHash>,
         std::collections::HashSet<ProvisionHash>,
     ) {
-        self.chain_view()
-            .collect_ancestor_hashes(parent_block_hash, &self.dedup_index)
+        self.chain_view().collect_ancestor_hashes(parent_block_hash)
     }
 
     /// Get the BFT configuration.

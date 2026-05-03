@@ -55,9 +55,6 @@ fn memory_stats_reports_all_zeros_for_fresh_coordinator() {
         committed_tx_lookup,
         committed_cert_lookup,
         committed_provision_lookup,
-        recently_committed_txs,
-        recently_committed_certs,
-        recently_committed_provisions,
         pending_qc_verifications,
         verified_qcs,
         pending_state_root_verifications,
@@ -75,9 +72,6 @@ fn memory_stats_reports_all_zeros_for_fresh_coordinator() {
     assert_eq!(committed_tx_lookup, 0);
     assert_eq!(committed_cert_lookup, 0);
     assert_eq!(committed_provision_lookup, 0);
-    assert_eq!(recently_committed_txs, 0);
-    assert_eq!(recently_committed_certs, 0);
-    assert_eq!(recently_committed_provisions, 0);
     assert_eq!(pending_qc_verifications, 0);
     assert_eq!(verified_qcs, 0);
     assert_eq!(pending_state_root_verifications, 0);
