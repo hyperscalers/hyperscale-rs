@@ -30,10 +30,10 @@
 use crate::adapter::{Libp2pAdapter, NetworkError};
 use crate::stream_framing::{self, MAX_FRAME_SIZE};
 use dashmap::DashMap;
-use futures::AsyncReadExt;
+use futures::{AsyncRead, AsyncReadExt, AsyncWrite};
 use hyperscale_metrics as metrics;
 use hyperscale_network::compression;
-use libp2p::{PeerId, Stream};
+use libp2p::PeerId;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
@@ -306,6 +306,7 @@ impl RequestStreamPool {
 /// peer, so retrying on a fresh stream is safe. `ResponseFailed` means the
 /// request was already on the wire — the peer may have processed it, so
 /// retry could double-apply.
+#[cfg_attr(test, derive(Debug))]
 enum IoOutcome {
     Ok(Vec<u8>),
     WriteFailed(NetworkError),
@@ -313,7 +314,11 @@ enum IoOutcome {
 }
 
 /// Write a typed request frame and read the length-prefixed response.
-async fn do_request_response(stream: &mut Stream, type_id: &str, data: &[u8]) -> IoOutcome {
+async fn do_request_response<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    type_id: &str,
+    data: &[u8],
+) -> IoOutcome {
     let wire_bytes = match stream_framing::write_typed_frame(stream, type_id, data).await {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -355,5 +360,338 @@ fn drain_with_error(
 ) {
     while let Ok(req) = req_rx.try_recv() {
         let _ = req.resp_tx.send(Err(err_fn()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stream_framing::read_typed_frame;
+    use std::io;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
+
+    /// In-memory bidirectional stream. Writes accumulate in `written`; reads
+    /// drain from `to_read`. Optionally fails every write with a stub error.
+    struct MockStream {
+        written: Vec<u8>,
+        to_read: futures::io::Cursor<Vec<u8>>,
+        write_err: Option<io::ErrorKind>,
+    }
+
+    impl MockStream {
+        fn new(read_data: Vec<u8>) -> Self {
+            Self {
+                written: Vec::new(),
+                to_read: futures::io::Cursor::new(read_data),
+                write_err: None,
+            }
+        }
+
+        fn failing_writes(kind: io::ErrorKind) -> Self {
+            Self {
+                written: Vec::new(),
+                to_read: futures::io::Cursor::new(Vec::new()),
+                write_err: Some(kind),
+            }
+        }
+    }
+
+    impl AsyncRead for MockStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.to_read).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for MockStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if let Some(kind) = self.write_err {
+                return Poll::Ready(Err(io::Error::new(kind, "mock write failure")));
+            }
+            self.written.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Build a wire-format response frame: 4-byte BE length prefix + LZ4-compressed payload.
+    fn build_response(payload: &[u8]) -> Vec<u8> {
+        let compressed = compression::compress(payload);
+        let len = u32::try_from(compressed.len()).unwrap();
+        let mut buf = Vec::with_capacity(4 + compressed.len());
+        buf.extend_from_slice(&len.to_be_bytes());
+        buf.extend_from_slice(&compressed);
+        buf
+    }
+
+    fn make_pending() -> (
+        PendingRequest,
+        oneshot::Receiver<Result<Vec<u8>, NetworkError>>,
+    ) {
+        let (tx, rx) = oneshot::channel();
+        let req = PendingRequest {
+            type_id: "test.req",
+            data: vec![1, 2, 3],
+            timeout: Duration::from_secs(1),
+            resp_tx: tx,
+        };
+        (req, rx)
+    }
+
+    #[tokio::test]
+    async fn request_response_round_trips_request_and_response() {
+        let response_payload = b"hello response";
+        let request_payload = b"request body bytes";
+        let request_type_id = "test.req";
+
+        let mut stream = MockStream::new(build_response(response_payload));
+        let outcome = do_request_response(&mut stream, request_type_id, request_payload).await;
+
+        match outcome {
+            IoOutcome::Ok(bytes) => assert_eq!(bytes, response_payload),
+            other => panic!("expected Ok with decoded response, got {other:?}"),
+        }
+
+        // The request must have hit the wire as a well-formed typed frame
+        // matching what an inbound router would parse.
+        let mut written = futures::io::Cursor::new(stream.written);
+        let (parsed_type_id, parsed_payload, _) = read_typed_frame(&mut written, MAX_FRAME_SIZE)
+            .await
+            .expect("written request must round-trip through read_typed_frame");
+        assert_eq!(parsed_type_id, request_type_id);
+        assert_eq!(parsed_payload, request_payload);
+    }
+
+    #[tokio::test]
+    async fn request_response_write_failure_yields_write_failed() {
+        let mut stream = MockStream::failing_writes(io::ErrorKind::BrokenPipe);
+        let outcome = do_request_response(&mut stream, "test.req", b"body").await;
+        assert!(
+            matches!(outcome, IoOutcome::WriteFailed(NetworkError::StreamIo(_))),
+            "expected WriteFailed(StreamIo), got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_response_truncated_length_prefix_yields_response_failed() {
+        // Writes succeed but the read side has only 2 bytes — read_frame_len needs 4.
+        let mut stream = MockStream::new(vec![0, 0]);
+        let outcome = do_request_response(&mut stream, "test.req", b"body").await;
+        assert!(
+            matches!(
+                outcome,
+                IoOutcome::ResponseFailed(NetworkError::StreamIo(_))
+            ),
+            "expected ResponseFailed(StreamIo) for truncated length prefix, got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_response_truncated_body_yields_response_failed() {
+        // Length prefix says 1000 bytes, body has only 10 — read_exact fails.
+        let mut response = 1000u32.to_be_bytes().to_vec();
+        response.extend_from_slice(&[0u8; 10]);
+        let mut stream = MockStream::new(response);
+        let outcome = do_request_response(&mut stream, "test.req", b"body").await;
+        assert!(
+            matches!(
+                outcome,
+                IoOutcome::ResponseFailed(NetworkError::StreamIo(_))
+            ),
+            "expected ResponseFailed(StreamIo) for truncated body, got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_response_invalid_compressed_payload_yields_response_failed() {
+        // Valid length prefix, but body bytes don't form a valid LZ4 frame.
+        let garbage = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let mut response = u32::try_from(garbage.len()).unwrap().to_be_bytes().to_vec();
+        response.extend_from_slice(&garbage);
+        let mut stream = MockStream::new(response);
+        let outcome = do_request_response(&mut stream, "test.req", b"body").await;
+        match outcome {
+            IoOutcome::ResponseFailed(NetworkError::StreamIo(ref msg)) => {
+                assert!(
+                    msg.contains("decompression"),
+                    "expected decompression error message, got {msg}"
+                );
+            }
+            other => panic!("expected ResponseFailed(StreamIo) for invalid payload, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn request_response_oversize_response_yields_response_failed() {
+        // Length prefix > MAX_FRAME_SIZE causes read_frame_len to bail before reading body.
+        let too_large = u32::try_from(MAX_FRAME_SIZE + 1).unwrap();
+        let response = too_large.to_be_bytes().to_vec();
+        let mut stream = MockStream::new(response);
+        let outcome = do_request_response(&mut stream, "test.req", b"body").await;
+        match outcome {
+            IoOutcome::ResponseFailed(NetworkError::StreamIo(ref msg)) => {
+                assert!(
+                    msg.contains("read length failed"),
+                    "expected length-validation error, got {msg}"
+                );
+            }
+            other => panic!("expected ResponseFailed for oversize response, got {other:?}"),
+        }
+    }
+
+    /// Snapshot the backoff entry's `(current_backoff, scheduled_delay)` where
+    /// `scheduled_delay = next_attempt - sample_instant`. `sample_instant` is
+    /// captured before reading the entry so the delay reflects the value
+    /// `apply_backoff` set, not whatever has elapsed since.
+    fn snapshot(map: &DashMap<PeerId, BackoffState>, peer: &PeerId) -> (Duration, Duration) {
+        let sampled_at = Instant::now();
+        let entry = map.get(peer).expect("backoff state inserted");
+        let scheduled = entry.next_attempt.saturating_duration_since(sampled_at);
+        (entry.current_backoff, scheduled)
+    }
+
+    #[tokio::test]
+    async fn backoff_first_failure_schedules_initial_delay() {
+        let map = DashMap::new();
+        let peer = PeerId::random();
+        let before = Instant::now();
+        RequestStreamPool::apply_backoff(&map, &peer);
+        let (current, scheduled) = snapshot(&map, &peer);
+
+        // current_backoff is exactly INITIAL_BACKOFF on the first failure.
+        assert_eq!(current, INITIAL_BACKOFF);
+
+        // next_attempt should be (apply-time + INITIAL_BACKOFF). Apply-time
+        // sits between `before` and `now()`, so scheduled lands within
+        // [INITIAL_BACKOFF - elapsed, INITIAL_BACKOFF]. The lower bound
+        // catches a regression like `next_attempt = Instant::now()` (no
+        // backoff at all).
+        let max_elapsed = before.elapsed();
+        assert!(
+            scheduled <= INITIAL_BACKOFF,
+            "scheduled {scheduled:?} exceeds INITIAL_BACKOFF {INITIAL_BACKOFF:?}"
+        );
+        assert!(
+            scheduled + max_elapsed >= INITIAL_BACKOFF,
+            "scheduled {scheduled:?} + elapsed {max_elapsed:?} < INITIAL_BACKOFF {INITIAL_BACKOFF:?} \
+             — looks like backoff wasn't applied"
+        );
+    }
+
+    #[tokio::test]
+    async fn backoff_doubles_then_caps_at_max() {
+        let map = DashMap::new();
+        let peer = PeerId::random();
+
+        // Walk the geometric series and assert each step matches the formula
+        // exactly until it saturates. This catches off-by-one (cap reached
+        // one step early/late) and stuck-at-initial regressions.
+        let mut expected = INITIAL_BACKOFF;
+        let mut steps = 0;
+        loop {
+            RequestStreamPool::apply_backoff(&map, &peer);
+            steps += 1;
+            assert_eq!(
+                map.get(&peer).unwrap().current_backoff,
+                expected,
+                "step {steps}: expected {expected:?}"
+            );
+            if expected == MAX_BACKOFF {
+                break;
+            }
+            expected = (expected * BACKOFF_MULTIPLIER).min(MAX_BACKOFF);
+            assert!(steps < 32, "backoff failed to saturate within 32 steps");
+        }
+
+        // Further failures stay pinned at MAX_BACKOFF, not above.
+        for _ in 0..3 {
+            RequestStreamPool::apply_backoff(&map, &peer);
+            assert_eq!(map.get(&peer).unwrap().current_backoff, MAX_BACKOFF);
+        }
+    }
+
+    #[tokio::test]
+    async fn backoff_isolates_per_peer() {
+        let map = DashMap::new();
+        let a = PeerId::random();
+        let b = PeerId::random();
+
+        RequestStreamPool::apply_backoff(&map, &a);
+        RequestStreamPool::apply_backoff(&map, &a);
+        RequestStreamPool::apply_backoff(&map, &b);
+
+        assert_eq!(
+            map.get(&a).unwrap().current_backoff,
+            INITIAL_BACKOFF * BACKOFF_MULTIPLIER
+        );
+        assert_eq!(map.get(&b).unwrap().current_backoff, INITIAL_BACKOFF);
+    }
+
+    #[tokio::test]
+    async fn drain_fails_every_pending_request() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut receivers = Vec::new();
+        for _ in 0..3 {
+            let (req, rcv) = make_pending();
+            tx.send(req).await.unwrap();
+            receivers.push(rcv);
+        }
+
+        drain_with_error(&mut rx, || NetworkError::StreamIo("torn down".into()));
+
+        for rcv in receivers {
+            let result = rcv.await.expect("response channel still open");
+            assert!(matches!(result, Err(NetworkError::StreamIo(ref s)) if s == "torn down"));
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_on_empty_channel_is_noop() {
+        let (_tx, mut rx) = mpsc::channel::<PendingRequest>(8);
+        // No panic, no requests touched — try_recv finds nothing and returns.
+        drain_with_error(&mut rx, || NetworkError::StreamIo("unused".into()));
+    }
+
+    #[tokio::test]
+    async fn drain_invokes_err_fn_once_per_request() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let (req1, rcv1) = make_pending();
+        let (req2, rcv2) = make_pending();
+        tx.send(req1).await.unwrap();
+        tx.send(req2).await.unwrap();
+
+        let count = AtomicUsize::new(0);
+        drain_with_error(&mut rx, || {
+            count.fetch_add(1, Ordering::Relaxed);
+            NetworkError::StreamIo("torn down".into())
+        });
+
+        // Both receivers see an error, and the closure ran exactly once per
+        // drained request (not once total, not once per receiver poll).
+        assert!(matches!(
+            rcv1.await.unwrap(),
+            Err(NetworkError::StreamIo(_))
+        ));
+        assert!(matches!(
+            rcv2.await.unwrap(),
+            Err(NetworkError::StreamIo(_))
+        ));
+        assert_eq!(count.load(Ordering::Relaxed), 2);
     }
 }
