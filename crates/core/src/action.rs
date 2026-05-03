@@ -115,18 +115,6 @@ pub enum Action {
         recipients: Vec<ValidatorId>,
     },
 
-    /// Cache an aggregated execution certificate for serving fetch requests.
-    ///
-    /// Emitted by the wave leader after aggregation and by non-leaders after
-    /// receiving and verifying the EC broadcast. The `io_loop` stores these in
-    /// the in-memory cache so remote shards can fetch ECs via fallback.
-    /// Persistence is handled via wave certificates in `block.certificates`
-    /// at commit time.
-    TrackExecutionCertificate {
-        /// Execution certificate to cache for serving fetch requests.
-        certificate: Arc<ExecutionCertificate>,
-    },
-
     /// Fetch state entries and broadcast provisions for all cross-shard txs in a block.
     ///
     /// Only the block proposer emits this (once per block). Delegated to the

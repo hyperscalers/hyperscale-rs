@@ -193,7 +193,7 @@ where
                 node_tx_status_cache: self.caches.tx_status.len(),
                 node_finalized_wave_cache: self.caches.finalized_wave.len(),
                 node_provision_cache: self.caches.provision_store.len(),
-                node_exec_cert_cache: self.caches.exec_cert.lock().unwrap().len(),
+                node_exec_cert_cache: self.caches.exec_cert_store.len(),
                 node_prepared_commits: self.block_commit.prepared_len(),
                 node_pending_validation: self.pending_validation.len(),
                 node_locally_submitted: self.locally_submitted.len(),

@@ -85,9 +85,6 @@ where
                 self.pending_timer_ops.push(TimerOp::Cancel { id });
             }
             Action::Continuation(pe) => self.handle_continuation(pe),
-            Action::TrackExecutionCertificate { certificate } => {
-                self.handle_track_execution_certificate(&certificate);
-            }
             Action::RestoreCommittedState => self.handle_restore_committed_state(),
             Action::CommitBlock { block, qc, source } => {
                 self.accept_block_commit(PendingCommit {
@@ -168,26 +165,6 @@ where
         }
 
         let _ = self.event_sender.send(NodeInput::Protocol(Box::new(pe)));
-    }
-
-    fn handle_track_execution_certificate(
-        &self,
-        certificate: &Arc<hyperscale_types::ExecutionCertificate>,
-    ) {
-        // Cache for serving EC fetch requests from remote shards.
-        // Persistence is handled via wave certificates in block.certificates.
-        if let Ok(mut cache) = self.caches.exec_cert.lock() {
-            cache.insert(certificate.wave_id.clone(), Arc::clone(certificate));
-            if cache.len() > 2000 {
-                let cutoff = cache
-                    .values()
-                    .map(|c| c.block_height())
-                    .max()
-                    .unwrap_or(BlockHeight::GENESIS)
-                    .saturating_sub(500);
-                cache.retain(|_, c| c.block_height() > cutoff);
-            }
-        }
     }
 
     fn handle_restore_committed_state(&self) {

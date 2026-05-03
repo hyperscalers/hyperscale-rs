@@ -8,25 +8,21 @@
 //! genesis) and into RPC state.
 //!
 //! The caches are independent of the consensus state machine; the `io_loop`
-//! mutates them in response to outbound events (`TrackExecutionCertificate`,
-//! `Continuation(FinalizedWavesAdmitted)`, validated transactions, terminal
+//! mutates them in response to outbound events
+//! (`Continuation(FinalizedWavesAdmitted)`, validated transactions, terminal
 //! status), and handlers read them on remote-peer requests.
 
+use hyperscale_execution::ExecCertStore;
 use hyperscale_mempool::TxStore;
 use hyperscale_provisions::ProvisionStore;
-use hyperscale_types::{ExecutionCertificate, FinalizedWave, TransactionStatus, TxHash, WaveId};
+use hyperscale_types::{FinalizedWave, TransactionStatus, TxHash, WaveId};
 use quick_cache::sync::Cache as QuickCache;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// Default certificate cache capacity.
 pub(super) const DEFAULT_CERT_CACHE_SIZE: usize = 10_000;
 /// Default transaction status cache capacity.
 pub(super) const DEFAULT_TX_STATUS_CACHE_SIZE: usize = 100_000;
-
-/// Execution certificate cache shared between the `io_loop` (which inserts
-/// on `TrackExecutionCertificate`) and the inbound EC fetch handler.
-pub type ExecCertCache = Arc<Mutex<HashMap<WaveId, Arc<ExecutionCertificate>>>>;
 
 /// Inbound request-serving caches plus the cross-thread transaction-status
 /// view exposed to external RPC consumers.
@@ -52,23 +48,32 @@ pub struct SharedCaches {
     ///
     /// [`ProvisionCoordinator`]: hyperscale_provisions::ProvisionCoordinator
     pub provision_store: Arc<ProvisionStore>,
-    /// Execution certificates seen recently, for fallback serving when a
-    /// remote shard fetches an EC we already aggregated. Pruned tier-wise
-    /// in the `TrackExecutionCertificate` action handler.
-    pub exec_cert: ExecCertCache,
+    /// Aggregated local-shard execution certificates awaiting block commit,
+    /// owned by the [`ExecutionCoordinator`]. Cloned here so the inbound EC
+    /// fetch handler can serve cross-shard fallback requests without taking
+    /// a coordinator lock; on cache miss the handler falls through to
+    /// storage.
+    ///
+    /// [`ExecutionCoordinator`]: hyperscale_execution::ExecutionCoordinator
+    pub exec_cert_store: Arc<ExecCertStore>,
 }
 
 impl SharedCaches {
-    /// Construct caches at `io_loop` startup. The `ProvisionStore` and
-    /// `TxStore` are owned by their respective state machines; clones are
-    /// passed in so the same `Arc`s flow into network handler closures.
-    pub fn new(provision_store: Arc<ProvisionStore>, tx_store: Arc<TxStore>) -> Self {
+    /// Construct caches at `io_loop` startup. The `ProvisionStore`,
+    /// `TxStore`, and `ExecCertStore` are owned by their respective state
+    /// machines; clones are passed in so the same `Arc`s flow into network
+    /// handler closures.
+    pub fn new(
+        provision_store: Arc<ProvisionStore>,
+        tx_store: Arc<TxStore>,
+        exec_cert_store: Arc<ExecCertStore>,
+    ) -> Self {
         Self {
             tx_store,
             tx_status: Arc::new(QuickCache::new(DEFAULT_TX_STATUS_CACHE_SIZE)),
             finalized_wave: Arc::new(QuickCache::new(DEFAULT_CERT_CACHE_SIZE)),
             provision_store,
-            exec_cert: Arc::new(Mutex::new(HashMap::new())),
+            exec_cert_store,
         }
     }
 }

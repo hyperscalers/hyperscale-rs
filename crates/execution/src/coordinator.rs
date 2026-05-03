@@ -55,6 +55,7 @@ use tracing::instrument;
 use crate::action_handlers::build_dispatch_action;
 use crate::conflict::DetectedConflict;
 use crate::early_arrivals::{EARLY_VOTE_RETENTION, EarlyArrivalBuffer};
+use crate::exec_cert_store::ExecCertStore;
 use crate::expected_certs::ExpectedCertTracker;
 use crate::finalized_waves::FinalizedWaveStore;
 use crate::lookups::{committee_public_keys_for_shard, peers_excluding_self};
@@ -185,6 +186,14 @@ pub struct ExecutionCoordinator {
     /// (positive ACK signal) or the safety horizon elapses. Symmetric to
     /// `OutboundProvisionTracker` on the source side.
     outbound_certs: OutboundExecutionCertificateTracker,
+
+    /// Aggregated local-shard execution certificates awaiting block commit.
+    /// Held behind an `Arc` and shared with the `io_loop` so the inbound EC
+    /// fetch handler can serve cross-shard fallback requests without taking
+    /// a coordinator lock. Populated on local aggregation and on verifying
+    /// a local-shard EC received via broadcast; evicted in
+    /// `remove_finalized_wave` once the containing block commits.
+    exec_certs: Arc<ExecCertStore>,
 }
 
 impl Default for ExecutionCoordinator {
@@ -231,7 +240,17 @@ impl ExecutionCoordinator {
             provisioning: ProvisioningTracker::new(),
             expected_certs: ExpectedCertTracker::new(),
             outbound_certs: OutboundExecutionCertificateTracker::new(),
+            exec_certs: Arc::new(ExecCertStore::new()),
         }
+    }
+
+    /// Reference to the shared execution-certificate store. The `io_loop`
+    /// clones this `Arc` into its `SharedCaches` so the inbound EC fetch
+    /// handler can read aggregated local-shard certificates without
+    /// acquiring a coordinator lock.
+    #[must_use]
+    pub const fn exec_cert_store(&self) -> &Arc<ExecCertStore> {
+        &self.exec_certs
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -925,10 +944,9 @@ impl ExecutionCoordinator {
         // aggregated, especially with many shards where provision flow is slower).
         let remote_shards: Vec<ShardGroupId> = wave_id.remote_shards.iter().copied().collect();
 
-        // Cache the cert in io_loop for fallback serving.
-        actions.push(Action::TrackExecutionCertificate {
-            certificate: Arc::clone(certificate),
-        });
+        // Make the cert available to the io_loop's inbound EC fetch handler
+        // for fallback serving until the containing block commits.
+        self.exec_certs.insert(Arc::clone(certificate));
 
         // Broadcast EC to all local peers (they don't aggregate — they need it).
         let local_peers = peers_excluding_self(topology, topology.local_shard());
@@ -1053,9 +1071,9 @@ impl ExecutionCoordinator {
             self.waves.mark_ec_dispatched(ec_arc.wave_id.clone());
             // EC received from wave leader — cancel any pending vote retry.
             self.waves.clear_vote_retry(&ec_arc.wave_id);
-            actions.push(Action::TrackExecutionCertificate {
-                certificate: Arc::clone(&ec_arc),
-            });
+            // Make the verified cert available to the io_loop's inbound EC
+            // fetch handler for fallback serving until block commit.
+            self.exec_certs.insert(Arc::clone(&ec_arc));
         }
 
         actions.extend(self.handle_wave_attestation(topology, &ec_arc));
@@ -1615,6 +1633,10 @@ impl ExecutionCoordinator {
     pub fn remove_finalized_wave(&mut self, fw: &hyperscale_types::FinalizedWave) {
         let wave_id = fw.wave_id();
         self.finalized.remove(wave_id);
+        // The local-shard EC is now durable in storage via the committed
+        // wave certificate; drop the in-memory copy so peers fetching after
+        // this point fall through to storage.
+        self.exec_certs.evict(wave_id);
         // The wave may already have been removed by `finalize_wave` (local
         // aggregation path) or be absent entirely (sync path: the block was
         // received as committed without local tracking). Either case is fine.
@@ -2198,7 +2220,7 @@ mod tests {
 
         let actions = state.on_certificate_aggregated(&topo, &wave_id, &Arc::new(cert));
 
-        // Should have: TrackExecutionCertificate + BroadcastEC(local) + BroadcastEC(remote shard 1)
+        // Should have: BroadcastEC(local) + BroadcastEC(remote shard 1)
         let broadcast_actions: Vec<_> = actions
             .iter()
             .filter(|a| matches!(a, Action::BroadcastExecutionCertificate { .. }))

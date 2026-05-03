@@ -14,6 +14,7 @@ pub mod wave_state;
 
 mod coordinator;
 mod early_arrivals;
+mod exec_cert_store;
 mod expected_certs;
 mod finalized_waves;
 mod lookups;
@@ -23,5 +24,6 @@ mod vote_tracker;
 mod waves;
 
 pub use coordinator::{CompletionData, ExecutionCoordinator, ExecutionMemoryStats};
+pub use exec_cert_store::ExecCertStore;
 pub use vote_tracker::VoteTracker;
 pub use wave_state::WaveState;

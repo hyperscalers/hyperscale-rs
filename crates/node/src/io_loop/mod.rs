@@ -308,6 +308,7 @@ where
         let caches = SharedCaches::new(
             Arc::clone(state.provisions().store()),
             Arc::clone(state.mempool().tx_store()),
+            Arc::clone(state.execution().exec_cert_store()),
         );
         Self {
             state,
