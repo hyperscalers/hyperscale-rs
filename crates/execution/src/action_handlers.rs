@@ -240,6 +240,12 @@ pub(crate) fn build_dispatch_action(
 ///
 /// Outcomes flow through `ctx.notify`. Variants owned by other coordinator
 /// crates hit `unreachable!()` — node's dispatcher routes by variant prefix.
+///
+/// # Panics
+///
+/// Panics if the dispatcher routes a variant owned by another crate, or if
+/// the [`Engine`](hyperscale_engine::Engine) breaks its "one result per input
+/// transaction" contract.
 #[allow(clippy::too_many_lines)] // single dispatch over execution-owned Action variants
 pub fn handle_action<S, E, N>(action: Action, ctx: &hyperscale_core::ActionContext<'_, S, E, N>)
 where
@@ -248,7 +254,6 @@ where
     N: hyperscale_network::Network,
 {
     use hyperscale_core::{NodeInput, ProtocolEvent};
-    use hyperscale_engine::ExecutedTx;
     use hyperscale_metrics as metrics;
     use hyperscale_storage::SubstateStore;
 
@@ -348,12 +353,11 @@ where
                         local_shard,
                         num_shards,
                     );
-                    let tx = output.results.pop().unwrap_or_else(|| {
-                        ExecutedTx::failure_with_log(
-                            req.tx_hash,
-                            "No cross-shard execution result returned",
-                        )
-                    });
+                    // Engine contract: one result per input tx; we pass one in.
+                    let tx = output
+                        .results
+                        .pop()
+                        .expect("execute_cross_shard returned no result for single-tx input");
                     (tx.outcome(), StoredReceipt::from(tx))
                 })
                 .unzip();

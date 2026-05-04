@@ -49,11 +49,12 @@ impl SimulationEngine {
             .clone();
 
         lock.get_or_init(|| {
+            // Engine contract: one result per input tx; we pass one in.
             compute()
                 .results
                 .into_iter()
                 .next()
-                .unwrap_or_else(|| ExecutedTx::failure_with_log(tx_hash, "No result returned"))
+                .expect("inner Engine returned no result for single-tx input")
         })
         .clone()
     }
