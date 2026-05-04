@@ -15,19 +15,21 @@ use radix_common::types::NodeId as RadixNodeId;
 use radix_substate_store_interface::db_key_mapper::{DatabaseKeyMapper, SpreadPrefixKeyMapper};
 use radix_substate_store_interface::interface::{DbPartitionKey, DbSortKey};
 
-use crate::typed_cf::DbCodec;
+use crate::typed_cf::{DbCodec, DbEncode};
 
 /// Codec for composite substate keys: `node_key ++ partition_num ++ sort_key`.
 #[derive(Default)]
 pub struct SubstateKeyCodec;
 
-impl DbCodec<(DbPartitionKey, DbSortKey)> for SubstateKeyCodec {
+impl DbEncode<(DbPartitionKey, DbSortKey)> for SubstateKeyCodec {
     fn encode_to(&self, value: &(DbPartitionKey, DbSortKey), buf: &mut Vec<u8>) {
         buf.extend_from_slice(&value.0.node_key);
         buf.push(value.0.partition_num);
         buf.extend_from_slice(&value.1.0);
     }
+}
 
+impl DbCodec<(DbPartitionKey, DbSortKey)> for SubstateKeyCodec {
     fn decode(&self, bytes: &[u8]) -> (DbPartitionKey, DbSortKey) {
         let (entity_key, partition_num, sort_key) =
             decompose_storage_key(bytes).expect("invalid storage key");

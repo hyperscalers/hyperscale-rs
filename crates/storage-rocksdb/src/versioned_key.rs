@@ -10,7 +10,7 @@
 use radix_substate_store_interface::interface::{DbPartitionKey, DbSortKey};
 
 use crate::substate_key::SubstateKeyCodec;
-use crate::typed_cf::DbCodec;
+use crate::typed_cf::{DbCodec, DbEncode};
 
 const VERSION_LEN: usize = 8;
 
@@ -26,13 +26,15 @@ type VersionedKey = ((DbPartitionKey, DbSortKey), u64);
 #[derive(Default)]
 pub struct VersionedSubstateKeyCodec;
 
-impl DbCodec<VersionedKey> for VersionedSubstateKeyCodec {
+impl DbEncode<VersionedKey> for VersionedSubstateKeyCodec {
     fn encode_to(&self, value: &VersionedKey, buf: &mut Vec<u8>) {
         let ((pk, sk), version) = value;
         SubstateKeyCodec.encode_to(&(pk.clone(), sk.clone()), buf);
         buf.extend_from_slice(&version.to_be_bytes());
     }
+}
 
+impl DbCodec<VersionedKey> for VersionedSubstateKeyCodec {
     fn decode(&self, bytes: &[u8]) -> VersionedKey {
         assert!(
             bytes.len() >= VERSION_LEN,

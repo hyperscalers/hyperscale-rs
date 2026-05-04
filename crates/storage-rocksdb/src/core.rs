@@ -50,7 +50,7 @@ use crate::metadata::{
 };
 use crate::substate_key::partition_prefix;
 use crate::typed_cf::{
-    DbCodec, TypedCf, batch_delete, batch_put, batch_put_raw, get, multi_get, prefix_iter,
+    DbEncode, TypedCf, batch_delete, batch_put, batch_put_raw, get, multi_get, prefix_iter,
 };
 use crate::versioned_key::VersionedSubstateKeyCodec;
 

@@ -1,8 +1,10 @@
 //! Typed column family API — compile-time key/value type safety for `RocksDB` operations.
 //!
 //! Each column family is a zero-sized struct implementing [`TypedCf`], which declares
-//! the key type, value type, and their encodings. The [`DbCodec`] trait abstracts
-//! encode/decode so the same type can use different encodings in different CFs.
+//! the key type, value type, and their encodings. Codecs come in two layers:
+//! [`DbEncode`] (write paths) and [`DbCodec`] (adds decode, required for read and
+//! iteration paths). A CF whose key codec is encode-only therefore cannot be
+//! iterated — misuse is a compile-time error rather than a runtime panic.
 
 use std::marker::PhantomData;
 
@@ -14,12 +16,17 @@ use sbor::{basic_decode, basic_encode};
 use crate::column_families::CfHandles;
 use crate::jmt_stored::{StoredNodeKey, encode_key};
 
-// ─── Codec trait ──────────────────────────────────────────────────────────────
+// ─── Codec traits ─────────────────────────────────────────────────────────────
 
-/// Codec for encoding/decoding typed values to/from `RocksDB` byte representations.
-pub trait DbCodec<T> {
+/// Encode-only codec: serializes typed values into `RocksDB` byte representations.
+///
+/// Codecs that can also deserialize (the common case) additionally implement
+/// [`DbCodec`]. Write-only codecs (e.g. [`JmtKeyCodec`], whose key format has
+/// no inverse in this codebase) implement only `DbEncode`. Iterator helpers
+/// require `DbCodec` on the key codec, so attempting to iterate a CF with a
+/// write-only key codec is a compile-time error.
+pub trait DbEncode<T> {
     fn encode_to(&self, value: &T, buf: &mut Vec<u8>);
-    fn decode(&self, bytes: &[u8]) -> T;
 
     /// Convenience wrapper that allocates a new Vec.
     fn encode(&self, value: &T) -> Vec<u8> {
@@ -27,6 +34,11 @@ pub trait DbCodec<T> {
         self.encode_to(value, &mut buf);
         buf
     }
+}
+
+/// Full codec: encode + decode. Read paths and iterator helpers require this.
+pub trait DbCodec<T>: DbEncode<T> {
+    fn decode(&self, bytes: &[u8]) -> T;
 }
 
 // ─── Codec implementations ───────────────────────────────────────────────────
@@ -40,16 +52,14 @@ impl<T> Default for SborCodec<T> {
     }
 }
 
-impl<T> DbCodec<T> for SborCodec<T>
-where
-    T: BasicEncode + BasicDecode,
-{
+impl<T: BasicEncode> DbEncode<T> for SborCodec<T> {
     fn encode_to(&self, value: &T, buf: &mut Vec<u8>) {
-        // basic_encode returns a Vec; append it to buf.
         let encoded = basic_encode(value).expect("SBOR encoding must succeed");
         buf.extend_from_slice(&encoded);
     }
+}
 
+impl<T: BasicEncode + BasicDecode> DbCodec<T> for SborCodec<T> {
     fn decode(&self, bytes: &[u8]) -> T {
         basic_decode(bytes).expect("SBOR decoding must succeed")
     }
@@ -60,11 +70,13 @@ where
 #[derive(Default)]
 pub struct BeU64Codec;
 
-impl DbCodec<u64> for BeU64Codec {
+impl DbEncode<u64> for BeU64Codec {
     fn encode_to(&self, value: &u64, buf: &mut Vec<u8>) {
         buf.extend_from_slice(&value.to_be_bytes());
     }
+}
 
+impl DbCodec<u64> for BeU64Codec {
     fn decode(&self, bytes: &[u8]) -> u64 {
         u64::from_be_bytes(bytes.try_into().expect("u64 key must be 8 bytes"))
     }
@@ -74,11 +86,13 @@ impl DbCodec<u64> for BeU64Codec {
 #[derive(Default)]
 pub struct HashCodec;
 
-impl DbCodec<Hash> for HashCodec {
+impl DbEncode<Hash> for HashCodec {
     fn encode_to(&self, value: &Hash, buf: &mut Vec<u8>) {
         buf.extend_from_slice(value.as_bytes());
     }
+}
 
+impl DbCodec<Hash> for HashCodec {
     fn decode(&self, bytes: &[u8]) -> Hash {
         Hash::from_hash_bytes(bytes)
     }
@@ -88,30 +102,32 @@ impl DbCodec<Hash> for HashCodec {
 #[derive(Default)]
 pub struct RawCodec;
 
-impl DbCodec<Vec<u8>> for RawCodec {
+impl DbEncode<Vec<u8>> for RawCodec {
     fn encode_to(&self, value: &Vec<u8>, buf: &mut Vec<u8>) {
         buf.extend_from_slice(value);
     }
+}
 
+impl DbCodec<Vec<u8>> for RawCodec {
     fn decode(&self, bytes: &[u8]) -> Vec<u8> {
         bytes.to_vec()
     }
 }
 
 /// JMT node key codec — wraps the existing `encode_key` function.
+///
+/// Write-only: JMT keys are encoded for writes and point lookups but the
+/// format has no decoder in this codebase. Implementing only [`DbEncode`]
+/// (and not [`DbCodec`]) ensures any attempt to iterate the JMT-nodes CF
+/// or otherwise decode a key is a compile-time error rather than a runtime
+/// panic.
 #[derive(Default)]
 pub struct JmtKeyCodec;
 
-impl DbCodec<StoredNodeKey> for JmtKeyCodec {
+impl DbEncode<StoredNodeKey> for JmtKeyCodec {
     fn encode_to(&self, value: &StoredNodeKey, buf: &mut Vec<u8>) {
         let encoded = encode_key(value);
         buf.extend_from_slice(&encoded);
-    }
-
-    fn decode(&self, _bytes: &[u8]) -> StoredNodeKey {
-        // JMT keys are only encoded for writes/lookups, never decoded from raw bytes
-        // in our codebase (the decode path goes through SBOR for the node values).
-        unimplemented!("JMT key decoding not needed — keys are write-only in RocksDB")
     }
 }
 
@@ -134,8 +150,10 @@ pub trait TypedCf {
     /// Value type stored in this CF.
     type Value;
 
-    /// Codec for encoding/decoding keys.
-    type KeyCodec: DbCodec<Self::Key> + Default + 'static;
+    /// Codec for encoding keys. Iteration also requires the codec to
+    /// implement [`DbCodec`] (i.e. support decoding); CFs whose key codec
+    /// is encode-only (e.g. JMT nodes) cannot be iterated, by design.
+    type KeyCodec: DbEncode<Self::Key> + Default + 'static;
     /// Codec for encoding/decoding values.
     type ValueCodec: DbCodec<Self::Value> + Default + 'static;
 
@@ -278,7 +296,10 @@ pub fn batch_delete<CF: TypedCf>(batch: &mut WriteBatch, cf: &ColumnFamily, key:
 pub fn iter_all<'a, CF: TypedCf>(
     db: &'a DB,
     cf: &ColumnFamily,
-) -> impl Iterator<Item = (CF::Key, CF::Value)> + 'a {
+) -> impl Iterator<Item = (CF::Key, CF::Value)> + 'a
+where
+    CF::KeyCodec: DbCodec<CF::Key>,
+{
     let mut iter = db.raw_iterator_cf(cf);
     iter.seek_to_first();
     raw_iter_to_typed::<CF>(iter)
@@ -293,7 +314,10 @@ pub fn prefix_iter<'a, CF: TypedCf>(
     db: &'a DB,
     cf: &ColumnFamily,
     prefix: &[u8],
-) -> impl Iterator<Item = (CF::Key, CF::Value)> + 'a {
+) -> impl Iterator<Item = (CF::Key, CF::Value)> + 'a
+where
+    CF::KeyCodec: DbCodec<CF::Key>,
+{
     prefix_iter_from::<CF>(db, cf, prefix, prefix)
 }
 
@@ -306,7 +330,10 @@ pub fn prefix_iter_from<'a, CF: TypedCf>(
     cf: &ColumnFamily,
     prefix: &[u8],
     start: &[u8],
-) -> impl Iterator<Item = (CF::Key, CF::Value)> + 'a {
+) -> impl Iterator<Item = (CF::Key, CF::Value)> + 'a
+where
+    CF::KeyCodec: DbCodec<CF::Key>,
+{
     let mut iter = db.raw_iterator_cf(cf);
     iter.seek(start);
     let end = next_prefix(prefix);
@@ -320,7 +347,10 @@ pub fn prefix_iter_snap<'a, CF: TypedCf>(
     snapshot: &'a Snapshot<'_>,
     cf: &ColumnFamily,
     prefix: &[u8],
-) -> impl Iterator<Item = (CF::Key, CF::Value)> + 'a {
+) -> impl Iterator<Item = (CF::Key, CF::Value)> + 'a
+where
+    CF::KeyCodec: DbCodec<CF::Key>,
+{
     prefix_iter_from_snap::<CF>(snapshot, cf, prefix, prefix)
 }
 
@@ -330,7 +360,10 @@ pub fn prefix_iter_from_snap<'a, CF: TypedCf>(
     cf: &ColumnFamily,
     prefix: &[u8],
     start: &[u8],
-) -> impl Iterator<Item = (CF::Key, CF::Value)> + 'a {
+) -> impl Iterator<Item = (CF::Key, CF::Value)> + 'a
+where
+    CF::KeyCodec: DbCodec<CF::Key>,
+{
     let mut iter = snapshot.raw_iterator_cf(cf);
     iter.seek(start);
     let end = next_prefix(prefix);
@@ -341,7 +374,10 @@ pub fn prefix_iter_from_snap<'a, CF: TypedCf>(
 /// all remaining entries.
 fn raw_iter_to_typed<CF: TypedCf>(
     mut iter: DBRawIteratorWithThreadMode<'_, DB>,
-) -> impl Iterator<Item = (CF::Key, CF::Value)> + '_ {
+) -> impl Iterator<Item = (CF::Key, CF::Value)> + '_
+where
+    CF::KeyCodec: DbCodec<CF::Key>,
+{
     let key_codec = CF::KeyCodec::default();
     let value_codec = CF::ValueCodec::default();
     let mut done = false;
@@ -370,7 +406,10 @@ fn raw_iter_to_typed<CF: TypedCf>(
 fn bounded_iter_to_typed<CF: TypedCf>(
     mut iter: DBRawIteratorWithThreadMode<'_, DB>,
     end: Option<Vec<u8>>,
-) -> impl Iterator<Item = (CF::Key, CF::Value)> + '_ {
+) -> impl Iterator<Item = (CF::Key, CF::Value)> + '_
+where
+    CF::KeyCodec: DbCodec<CF::Key>,
+{
     let key_codec = CF::KeyCodec::default();
     let value_codec = CF::ValueCodec::default();
     let mut done = false;
@@ -456,11 +495,13 @@ pub fn meta_write<E: MetadataEntry>(batch: &mut WriteBatch, value: &E::Value) {
 #[derive(Default)]
 pub struct BlockHeightCodec;
 
-impl DbCodec<BlockHeight> for BlockHeightCodec {
+impl DbEncode<BlockHeight> for BlockHeightCodec {
     fn encode_to(&self, value: &BlockHeight, buf: &mut Vec<u8>) {
         buf.extend_from_slice(&value.0.to_be_bytes());
     }
+}
 
+impl DbCodec<BlockHeight> for BlockHeightCodec {
     fn decode(&self, bytes: &[u8]) -> BlockHeight {
         let arr: [u8; 8] = bytes.try_into().unwrap_or([0; 8]);
         BlockHeight(u64::from_be_bytes(arr))
@@ -471,12 +512,14 @@ impl DbCodec<BlockHeight> for BlockHeightCodec {
 #[derive(Default)]
 pub struct JmtMetadataCodec;
 
-impl DbCodec<(u64, StateRoot)> for JmtMetadataCodec {
+impl DbEncode<(u64, StateRoot)> for JmtMetadataCodec {
     fn encode_to(&self, value: &(u64, StateRoot), buf: &mut Vec<u8>) {
         buf.extend_from_slice(&value.0.to_be_bytes());
         buf.extend_from_slice(&value.1.as_raw().to_bytes());
     }
+}
 
+impl DbCodec<(u64, StateRoot)> for JmtMetadataCodec {
     fn decode(&self, bytes: &[u8]) -> (u64, StateRoot) {
         assert!(bytes.len() == 40, "jmt:metadata must be 40 bytes");
         let version = u64::from_be_bytes(bytes[..8].try_into().unwrap());

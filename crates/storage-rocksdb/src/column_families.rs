@@ -12,7 +12,9 @@ use rocksdb::{ColumnFamily, DB};
 
 use crate::jmt_stored::{StaleTreePart, StoredNodeKey, VersionedStoredNode};
 use crate::substate_key::SubstateKeyCodec;
-use crate::typed_cf::{BeU64Codec, DbCodec, HashCodec, JmtKeyCodec, RawCodec, SborCodec, TypedCf};
+use crate::typed_cf::{
+    BeU64Codec, DbCodec, DbEncode, HashCodec, JmtKeyCodec, RawCodec, SborCodec, TypedCf,
+};
 use crate::versioned_key::VersionedSubstateKeyCodec;
 
 // ─── CF name constants ───────────────────────────────────────────────────────
@@ -350,12 +352,14 @@ impl TypedCf for ExecutionCertsByHeightCf {
 #[derive(Default)]
 pub struct HeightHashCodec;
 
-impl DbCodec<(u64, Hash)> for HeightHashCodec {
+impl DbEncode<(u64, Hash)> for HeightHashCodec {
     fn encode_to(&self, value: &(u64, Hash), buf: &mut Vec<u8>) {
         buf.extend_from_slice(&value.0.to_be_bytes());
         buf.extend_from_slice(value.1.as_bytes());
     }
+}
 
+impl DbCodec<(u64, Hash)> for HeightHashCodec {
     fn decode(&self, bytes: &[u8]) -> (u64, Hash) {
         assert!(bytes.len() == 40, "HeightHash key must be 40 bytes");
         let height = u64::from_be_bytes(bytes[..8].try_into().unwrap());
@@ -368,7 +372,10 @@ impl DbCodec<(u64, Hash)> for HeightHashCodec {
 #[derive(Default)]
 pub struct UnitCodec;
 
-impl DbCodec<()> for UnitCodec {
+impl DbEncode<()> for UnitCodec {
     fn encode_to(&self, _value: &(), _buf: &mut Vec<u8>) {}
+}
+
+impl DbCodec<()> for UnitCodec {
     fn decode(&self, _bytes: &[u8]) {}
 }
