@@ -9,7 +9,6 @@
 //! ```ignore
 //! hyperscale_metrics_prometheus::install();
 //! ```
-#![allow(dead_code)]
 // Metrics values are display readouts; precision loss on usize/u64 → f64 is irrelevant.
 #![allow(clippy::cast_precision_loss)]
 
