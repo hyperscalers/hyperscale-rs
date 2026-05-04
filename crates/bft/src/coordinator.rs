@@ -1163,20 +1163,36 @@ impl BftCoordinator {
         let block_hash = header.hash();
         let mut pending = PendingBlock::from_manifest(header, manifest, self.now);
 
-        for tx_hash in pending.manifest().tx_hashes.clone() {
-            if let Some(tx) = lookup_tx(&tx_hash) {
-                pending.add_transaction_arc(tx);
-            }
+        // Borrow the manifest only long enough to collect locally-available
+        // Arcs, releasing it before the mutable `add_*` calls below.
+        let txs: Vec<Arc<RoutableTransaction>> = pending
+            .manifest()
+            .tx_hashes
+            .iter()
+            .filter_map(&lookup_tx)
+            .collect();
+        for tx in txs {
+            pending.add_transaction_arc(tx);
         }
-        for wave_id in pending.manifest().cert_ids.clone() {
-            if let Some(fw) = lookup_finalized_wave(&wave_id) {
-                pending.add_finalized_wave(fw);
-            }
+
+        let waves: Vec<Arc<FinalizedWave>> = pending
+            .manifest()
+            .cert_ids
+            .iter()
+            .filter_map(&lookup_finalized_wave)
+            .collect();
+        for fw in waves {
+            pending.add_finalized_wave(fw);
         }
-        for provision_hash in pending.manifest().provision_hashes.clone() {
-            if let Some(p) = lookup_provision(&provision_hash) {
-                pending.add_provision(p);
-            }
+
+        let provisions: Vec<Arc<Provisions>> = pending
+            .manifest()
+            .provision_hashes
+            .iter()
+            .filter_map(&lookup_provision)
+            .collect();
+        for p in provisions {
+            pending.add_provision(p);
         }
 
         self.pending_blocks.insert(block_hash, pending);
