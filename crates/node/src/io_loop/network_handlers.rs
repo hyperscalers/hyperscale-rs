@@ -47,6 +47,31 @@ where
             in_flight: HashMap<(u64, u64), ProvisionWaiter>,
         }
 
+        // Single-flight guard: clears the `in_flight` slot and wakes waiters
+        // when the producer's stack unwinds — including on panic, where the
+        // explicit cleanup below would be skipped. Waiters treat a still-`None`
+        // slot after wake as a failure response.
+        struct InFlightGuard {
+            dedup: Arc<std::sync::Mutex<ProvisionsRequestDedup>>,
+            waiter: ProvisionWaiter,
+            cache_key: (u64, u64),
+        }
+        impl Drop for InFlightGuard {
+            fn drop(&mut self) {
+                if let Ok(mut g) = self.dedup.lock() {
+                    g.in_flight.remove(&self.cache_key);
+                }
+                self.waiter.1.notify_all();
+            }
+        }
+
+        // Cap how long a waiter blocks on a producer. Request handlers run on
+        // tokio blocking-pool threads; without a bound, a stalled producer can
+        // pin every waiter thread and eventually starve the pool. The guard
+        // above already wakes waiters on producer panic — this bound covers
+        // the rest (deadlock, deep stalls, runaway work).
+        const PRODUCER_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
         // ── block.request → sync protocol ────────────────────────────
 
         let storage = Arc::clone(&self.storage);
@@ -89,6 +114,8 @@ where
 
         self.network
             .register_request_handler::<GetProvisionsRequest>(move |req: GetProvisionsRequest| {
+                use hyperscale_messages::response::GetProvisionResponse;
+
                 let cache_key = (req.block_height.0, req.target_shard.0);
 
                 // Outbound fast path: if we still hold the exact batch we
@@ -98,7 +125,6 @@ where
                 if let Some(provisions) =
                     outbound_cache.get_outbound(req.block_height, req.target_shard)
                 {
-                    use hyperscale_messages::response::GetProvisionResponse;
                     hyperscale_metrics::record_fetch_response_sent(
                         "provision",
                         provisions.transactions.len().max(1),
@@ -108,8 +134,8 @@ where
                     };
                 }
 
-                // Fast path: check cache
-                {
+                // Fast path: check cache or join an existing in-flight computation.
+                let waiter_to_join = {
                     let guard = dedup.lock().unwrap();
                     if let Some(cached) = guard.cache.get(&cache_key) {
                         if let Some(p) = &cached.provisions {
@@ -120,23 +146,29 @@ where
                         }
                         return cached.clone();
                     }
-                    // Check if another thread is already computing this
-                    if let Some(waiter) = guard.in_flight.get(&cache_key).cloned() {
-                        drop(guard); // release lock while waiting
-                        let (lock, cvar) = &*waiter;
-                        let mut result = lock.lock().unwrap();
-                        while result.is_none() {
-                            result = cvar.wait(result).unwrap();
-                        }
-                        return result.clone().unwrap();
+                    guard.in_flight.get(&cache_key).cloned()
+                };
+
+                if let Some(waiter) = waiter_to_join {
+                    let (lock, cvar) = &*waiter;
+                    let (result, wait_outcome) = cvar
+                        .wait_timeout_while(lock.lock().unwrap(), PRODUCER_WAIT_BUDGET, |r| {
+                            r.is_none()
+                        })
+                        .unwrap();
+                    if wait_outcome.timed_out() {
+                        return GetProvisionResponse { provisions: None };
                     }
+                    return result
+                        .clone()
+                        .unwrap_or(GetProvisionResponse { provisions: None });
                 }
 
-                // We're the first — register as in-flight
-                let waiter = Arc::new((
-                    std::sync::Mutex::new(
-                        None::<hyperscale_messages::response::GetProvisionResponse>,
-                    ),
+                // We're the producer — register the in-flight slot and let
+                // the guard handle cleanup + waiter wake-up on every exit
+                // path, including panic.
+                let waiter: ProvisionWaiter = Arc::new((
+                    std::sync::Mutex::new(None::<GetProvisionResponse>),
                     std::sync::Condvar::new(),
                 ));
                 dedup
@@ -145,7 +177,12 @@ where
                     .in_flight
                     .insert(cache_key, Arc::clone(&waiter));
 
-                // Compute
+                let _guard = InFlightGuard {
+                    dedup: Arc::clone(&dedup),
+                    waiter: Arc::clone(&waiter),
+                    cache_key,
+                };
+
                 let topo = topology.load();
                 let response =
                     serve_provision_request(&*storage, topo.local_shard(), topo.num_shards(), &req);
@@ -156,24 +193,18 @@ where
                     );
                 }
 
-                // Store in cache, notify waiters, remove in-flight
-                {
-                    let mut guard = dedup.lock().unwrap();
-                    if response.provisions.is_some() {
-                        guard.cache.insert(cache_key, response.clone());
-                        // Evict oldest entry (keep last 256)
-                        if guard.cache.len() > 256 {
-                            let min_key = *guard.cache.first_key_value().unwrap().0;
-                            guard.cache.remove(&min_key);
-                        }
+                if response.provisions.is_some() {
+                    let mut g = dedup.lock().unwrap();
+                    g.cache.insert(cache_key, response.clone());
+                    // Evict oldest entry (keep last 256)
+                    if g.cache.len() > 256 {
+                        let min_key = *g.cache.first_key_value().unwrap().0;
+                        g.cache.remove(&min_key);
                     }
-                    guard.in_flight.remove(&cache_key);
                 }
 
-                // Wake all waiters
-                let (lock, cvar) = &*waiter;
-                *lock.lock().unwrap() = Some(response.clone());
-                cvar.notify_all();
+                // Publish the result before the guard's notify_all fires.
+                *waiter.0.lock().unwrap() = Some(response.clone());
 
                 response
             });
