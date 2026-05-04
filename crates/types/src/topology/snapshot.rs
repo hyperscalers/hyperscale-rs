@@ -274,9 +274,13 @@ impl TopologySnapshot {
     }
 
     /// Get the minimum voting power required for quorum in a shard.
+    ///
+    /// Equivalent to `total * 2 / 3 + 1` but divides first so the multiply
+    /// cannot overflow when total is near `u64::MAX`.
     #[must_use]
     pub fn quorum_threshold_for_shard(&self, shard: ShardGroupId) -> u64 {
-        (self.voting_power_for_shard(shard) * 2 / 3) + 1
+        let total = self.voting_power_for_shard(shard);
+        total / 3 * 2 + (total % 3) * 2 / 3 + 1
     }
 
     // ── Local shard shortcuts ────────────────────────────────────────────

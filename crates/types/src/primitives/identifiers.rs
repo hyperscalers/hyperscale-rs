@@ -238,7 +238,7 @@ impl VotePower {
     /// Calculate if we have 2f+1 quorum (>2/3 of total).
     #[must_use]
     pub const fn has_quorum(voted: u64, total: u64) -> bool {
-        voted * 3 > total * 2
+        (voted as u128) * 3 > (total as u128) * 2
     }
 }
 
