@@ -13,24 +13,16 @@
 //! period elapses.
 
 use crate::adapter::Libp2pAdapter;
+use crate::peer_backoff::{self, BackoffState};
 use crate::stream_framing;
 use dashmap::DashMap;
 use futures::AsyncWriteExt;
 use hyperscale_metrics as metrics;
 use libp2p::PeerId;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::warn;
-
-/// Initial reconnection backoff after a stream failure.
-const INITIAL_BACKOFF: Duration = Duration::from_millis(100);
-
-/// Maximum reconnection backoff.
-const MAX_BACKOFF: Duration = Duration::from_secs(5);
-
-/// Backoff multiplier for exponential backoff.
-const BACKOFF_MULTIPLIER: u32 = 2;
 
 /// Channel capacity per peer. Bounds memory usage and provides backpressure.
 /// At ~1KB per notification, 256 frames ≈ 256KB buffer per peer.
@@ -44,12 +36,6 @@ const PEER_CHANNEL_CAPACITY: usize = 256;
 struct PendingFrame {
     type_id: &'static str,
     compressed_data: Vec<u8>,
-}
-
-/// Exponential backoff state for a peer after stream failure.
-struct BackoffState {
-    next_attempt: Instant,
-    current_backoff: Duration,
 }
 
 /// Handle to a per-peer stream actor. Dropping the sender closes the channel,
@@ -145,7 +131,7 @@ impl NotifyStreamPool {
             Ok(s) => s,
             Err(e) => {
                 warn!(peer = %peer_id, error = ?e, "Failed to open persistent notify stream");
-                Self::apply_backoff(&backoff_map, &peer_id);
+                peer_backoff::apply_backoff(&backoff_map, &peer_id);
                 peers.remove(&peer_id);
                 return;
             }
@@ -172,7 +158,7 @@ impl NotifyStreamPool {
                         error = ?e,
                         "Persistent notify stream write failed"
                     );
-                    Self::apply_backoff(&backoff_map, &peer_id);
+                    peer_backoff::apply_backoff(&backoff_map, &peer_id);
                     peers.remove(&peer_id);
                     return;
                 }
@@ -182,21 +168,6 @@ impl NotifyStreamPool {
         // Channel closed (Libp2pNetwork dropped or pool shutdown). Graceful close.
         let _ = stream.close().await;
         peers.remove(&peer_id);
-    }
-
-    /// Apply exponential backoff for a peer after a stream failure.
-    fn apply_backoff(backoff_map: &DashMap<PeerId, BackoffState>, peer_id: &PeerId) {
-        let current_backoff = backoff_map.get(peer_id).map_or(INITIAL_BACKOFF, |state| {
-            (state.current_backoff * BACKOFF_MULTIPLIER).min(MAX_BACKOFF)
-        });
-
-        backoff_map.insert(
-            *peer_id,
-            BackoffState {
-                next_attempt: Instant::now() + current_backoff,
-                current_backoff,
-            },
-        );
     }
 }
 
@@ -325,33 +296,5 @@ mod tests {
             Ok(()) => panic!("absent actor must signal spawn via Err"),
         }
         assert!(!peers.contains_key(&peer), "no actor entry was created");
-    }
-
-    #[tokio::test]
-    async fn backoff_doubles_then_caps_at_max() {
-        let map = DashMap::new();
-        let peer = PeerId::random();
-
-        let mut expected = INITIAL_BACKOFF;
-        let mut steps = 0;
-        loop {
-            NotifyStreamPool::apply_backoff(&map, &peer);
-            steps += 1;
-            assert_eq!(
-                map.get(&peer).unwrap().current_backoff,
-                expected,
-                "step {steps}: expected {expected:?}"
-            );
-            if expected == MAX_BACKOFF {
-                break;
-            }
-            expected = (expected * BACKOFF_MULTIPLIER).min(MAX_BACKOFF);
-            assert!(steps < 32, "backoff failed to saturate within 32 steps");
-        }
-
-        for _ in 0..3 {
-            NotifyStreamPool::apply_backoff(&map, &peer);
-            assert_eq!(map.get(&peer).unwrap().current_backoff, MAX_BACKOFF);
-        }
     }
 }

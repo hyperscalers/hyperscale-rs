@@ -11,6 +11,7 @@ mod config;
 mod inbound_router;
 mod network;
 mod notify_pool;
+mod peer_backoff;
 mod request_manager;
 mod request_pool;
 mod stream_framing;

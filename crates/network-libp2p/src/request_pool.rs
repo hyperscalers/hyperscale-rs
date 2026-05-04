@@ -28,6 +28,7 @@
 //! crossed the wire so retry is not safe — the actor tears down and exits.
 
 use crate::adapter::{Libp2pAdapter, NetworkError};
+use crate::peer_backoff::{self, BackoffState};
 use crate::stream_framing::{self, MAX_FRAME_SIZE};
 use dashmap::DashMap;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite};
@@ -38,15 +39,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
-
-/// Initial reconnection backoff after a stream failure.
-const INITIAL_BACKOFF: Duration = Duration::from_millis(100);
-
-/// Maximum reconnection backoff.
-const MAX_BACKOFF: Duration = Duration::from_secs(5);
-
-/// Backoff multiplier for exponential backoff.
-const BACKOFF_MULTIPLIER: u32 = 2;
 
 /// Channel capacity per peer. Bounds memory and provides caller backpressure.
 const PEER_CHANNEL_CAPACITY: usize = 64;
@@ -66,12 +58,6 @@ struct PendingRequest {
     /// On timeout the actor tears down the stream (state unknowable).
     timeout: Duration,
     resp_tx: oneshot::Sender<Result<Vec<u8>, NetworkError>>,
-}
-
-/// Exponential backoff state for a peer after stream failure.
-struct BackoffState {
-    next_attempt: Instant,
-    current_backoff: Duration,
 }
 
 /// Handle to a per-peer request actor. Dropping the sender closes the channel,
@@ -199,7 +185,7 @@ impl RequestStreamPool {
                 drain_with_error(&mut req_rx, || {
                     NetworkError::StreamOpenFailed(format!("{e:?}"))
                 });
-                Self::apply_backoff(&backoff_map, &peer);
+                peer_backoff::apply_backoff(&backoff_map, &peer);
                 peers.remove(&peer);
                 return;
             }
@@ -263,7 +249,7 @@ impl RequestStreamPool {
                     drain_with_error(&mut req_rx, || {
                         NetworkError::StreamIo("peer stream reset after prior failure".into())
                     });
-                    Self::apply_backoff(&backoff_map, &peer);
+                    peer_backoff::apply_backoff(&backoff_map, &peer);
                     peers.remove(&peer);
                     return;
                 }
@@ -274,7 +260,7 @@ impl RequestStreamPool {
                     drain_with_error(&mut req_rx, || {
                         NetworkError::StreamIo("peer stream reset after request timeout".into())
                     });
-                    Self::apply_backoff(&backoff_map, &peer);
+                    peer_backoff::apply_backoff(&backoff_map, &peer);
                     peers.remove(&peer);
                     return;
                 }
@@ -282,20 +268,6 @@ impl RequestStreamPool {
         }
 
         peers.remove(&peer);
-    }
-
-    fn apply_backoff(backoff_map: &DashMap<PeerId, BackoffState>, peer: &PeerId) {
-        let current_backoff = backoff_map.get(peer).map_or(INITIAL_BACKOFF, |state| {
-            (state.current_backoff * BACKOFF_MULTIPLIER).min(MAX_BACKOFF)
-        });
-
-        backoff_map.insert(
-            *peer,
-            BackoffState {
-                next_attempt: Instant::now() + current_backoff,
-                current_backoff,
-            },
-        );
     }
 }
 
@@ -553,94 +525,6 @@ mod tests {
             }
             other => panic!("expected ResponseFailed for oversize response, got {other:?}"),
         }
-    }
-
-    /// Snapshot the backoff entry's `(current_backoff, scheduled_delay)` where
-    /// `scheduled_delay = next_attempt - sample_instant`. `sample_instant` is
-    /// captured before reading the entry so the delay reflects the value
-    /// `apply_backoff` set, not whatever has elapsed since.
-    fn snapshot(map: &DashMap<PeerId, BackoffState>, peer: &PeerId) -> (Duration, Duration) {
-        let sampled_at = Instant::now();
-        let entry = map.get(peer).expect("backoff state inserted");
-        let scheduled = entry.next_attempt.saturating_duration_since(sampled_at);
-        (entry.current_backoff, scheduled)
-    }
-
-    #[tokio::test]
-    async fn backoff_first_failure_schedules_initial_delay() {
-        let map = DashMap::new();
-        let peer = PeerId::random();
-        let before = Instant::now();
-        RequestStreamPool::apply_backoff(&map, &peer);
-        let (current, scheduled) = snapshot(&map, &peer);
-
-        // current_backoff is exactly INITIAL_BACKOFF on the first failure.
-        assert_eq!(current, INITIAL_BACKOFF);
-
-        // next_attempt should be (apply-time + INITIAL_BACKOFF). Apply-time
-        // sits between `before` and `now()`, so scheduled lands within
-        // [INITIAL_BACKOFF - elapsed, INITIAL_BACKOFF]. The lower bound
-        // catches a regression like `next_attempt = Instant::now()` (no
-        // backoff at all).
-        let max_elapsed = before.elapsed();
-        assert!(
-            scheduled <= INITIAL_BACKOFF,
-            "scheduled {scheduled:?} exceeds INITIAL_BACKOFF {INITIAL_BACKOFF:?}"
-        );
-        assert!(
-            scheduled + max_elapsed >= INITIAL_BACKOFF,
-            "scheduled {scheduled:?} + elapsed {max_elapsed:?} < INITIAL_BACKOFF {INITIAL_BACKOFF:?} \
-             — looks like backoff wasn't applied"
-        );
-    }
-
-    #[tokio::test]
-    async fn backoff_doubles_then_caps_at_max() {
-        let map = DashMap::new();
-        let peer = PeerId::random();
-
-        // Walk the geometric series and assert each step matches the formula
-        // exactly until it saturates. This catches off-by-one (cap reached
-        // one step early/late) and stuck-at-initial regressions.
-        let mut expected = INITIAL_BACKOFF;
-        let mut steps = 0;
-        loop {
-            RequestStreamPool::apply_backoff(&map, &peer);
-            steps += 1;
-            assert_eq!(
-                map.get(&peer).unwrap().current_backoff,
-                expected,
-                "step {steps}: expected {expected:?}"
-            );
-            if expected == MAX_BACKOFF {
-                break;
-            }
-            expected = (expected * BACKOFF_MULTIPLIER).min(MAX_BACKOFF);
-            assert!(steps < 32, "backoff failed to saturate within 32 steps");
-        }
-
-        // Further failures stay pinned at MAX_BACKOFF, not above.
-        for _ in 0..3 {
-            RequestStreamPool::apply_backoff(&map, &peer);
-            assert_eq!(map.get(&peer).unwrap().current_backoff, MAX_BACKOFF);
-        }
-    }
-
-    #[tokio::test]
-    async fn backoff_isolates_per_peer() {
-        let map = DashMap::new();
-        let a = PeerId::random();
-        let b = PeerId::random();
-
-        RequestStreamPool::apply_backoff(&map, &a);
-        RequestStreamPool::apply_backoff(&map, &a);
-        RequestStreamPool::apply_backoff(&map, &b);
-
-        assert_eq!(
-            map.get(&a).unwrap().current_backoff,
-            INITIAL_BACKOFF * BACKOFF_MULTIPLIER
-        );
-        assert_eq!(map.get(&b).unwrap().current_backoff, INITIAL_BACKOFF);
     }
 
     #[tokio::test]
