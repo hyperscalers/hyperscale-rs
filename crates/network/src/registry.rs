@@ -61,10 +61,6 @@ impl HandlerRegistry {
     ///
     /// Wraps the handler in a closure that SBOR-decodes the payload before
     /// calling the handler. Decode errors are logged and the message is dropped.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the registry's internal `RwLock` is poisoned.
     pub fn register_gossip<M: NetworkMessage>(&self, handler: impl GossipHandler<M>) {
         let raw: Arc<RawGossipHandler> =
             Arc::new(move |payload: Vec<u8>| match basic_decode::<M>(&payload) {
@@ -80,7 +76,7 @@ impl HandlerRegistry {
             });
         self.gossip
             .write()
-            .unwrap()
+            .unwrap_or_else(PoisonError::into_inner)
             .insert(M::message_type_id(), raw);
     }
 
@@ -88,10 +84,6 @@ impl HandlerRegistry {
     ///
     /// Wraps the handler in a closure that SBOR-decodes the request,
     /// calls the handler, and SBOR-encodes the response.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the registry's internal `RwLock` is poisoned.
     pub fn register_request<R: Request>(&self, handler: impl RequestHandler<R>) {
         let raw: Arc<RawRequestHandler> = Arc::new(move |payload: &[u8]| -> Vec<u8> {
             let req = match basic_decode::<R>(payload) {
@@ -121,7 +113,7 @@ impl HandlerRegistry {
 
         self.request
             .write()
-            .unwrap()
+            .unwrap_or_else(PoisonError::into_inner)
             .insert(R::message_type_id(), raw);
     }
 
@@ -129,10 +121,6 @@ impl HandlerRegistry {
     ///
     /// SBOR-decodes the payload before calling the handler. Stored in a separate
     /// map so a message type can be registered as both gossip and notification.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the registry's internal `RwLock` is poisoned.
     pub fn register_notification<M: NetworkMessage>(&self, handler: impl NotificationHandler<M>) {
         let raw: Arc<RawNotificationHandler> =
             Arc::new(move |payload: Vec<u8>| match basic_decode::<M>(&payload) {
@@ -147,7 +135,7 @@ impl HandlerRegistry {
             });
         self.notification
             .write()
-            .unwrap()
+            .unwrap_or_else(PoisonError::into_inner)
             .insert(M::message_type_id(), raw);
     }
 
@@ -157,40 +145,37 @@ impl HandlerRegistry {
     ///
     /// Prefer [`register_gossip`](Self::register_gossip) for production code.
     /// This is useful for infrastructure tests that work with raw bytes.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the registry's internal `RwLock` is poisoned.
     pub fn register_raw_gossip(&self, type_id: &'static str, handler: Arc<RawGossipHandler>) {
-        self.gossip.write().unwrap().insert(type_id, handler);
+        self.gossip
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(type_id, handler);
     }
 
     /// Register a raw request handler by `type_id` string.
     ///
     /// Prefer [`register_request`](Self::register_request) for production code.
     /// This is useful for infrastructure tests that work with raw bytes.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the registry's internal `RwLock` is poisoned.
     pub fn register_raw_request(&self, type_id: &'static str, handler: Arc<RawRequestHandler>) {
-        self.request.write().unwrap().insert(type_id, handler);
+        self.request
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(type_id, handler);
     }
 
     /// Register a raw notification handler by `type_id` string.
     ///
     /// Prefer [`register_notification`](Self::register_notification) for production code.
     /// This is useful for infrastructure tests that work with raw bytes.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the registry's internal `RwLock` is poisoned.
     pub fn register_raw_notification(
         &self,
         type_id: &'static str,
         handler: Arc<RawNotificationHandler>,
     ) {
-        self.notification.write().unwrap().insert(type_id, handler);
+        self.notification
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(type_id, handler);
     }
 
     // ── Transport-layer dispatch (used by inbound router / sim harness) ──
