@@ -13,11 +13,11 @@ use hyperscale_network::Network;
 use hyperscale_storage::Storage;
 
 use crate::io_loop::IoLoop;
-use crate::io_loop::protocol::binding::{
+use crate::io_loop::fetch::FetchInput;
+use crate::io_loop::fetch::binding::{
     ExecCertBinding, FinalizedWaveBinding, LocalProvisionBinding, ProvisionBinding,
     TransactionBinding,
 };
-use crate::io_loop::protocol::fetch::FetchInput;
 
 impl<S, N, D, E> IoLoop<S, N, D, E>
 where
@@ -28,10 +28,10 @@ where
 {
     pub(in crate::io_loop) fn handle_fetch_tick(&mut self) {
         let now = std::time::Instant::now();
-        let outputs = self.protocols.block_sync_tick(now);
+        let outputs = self.syncs.block_tick(now);
         self.process_block_sync_outputs(outputs);
 
-        let outputs = self.protocols.remote_header_sync_tick(now);
+        let outputs = self.syncs.remote_header_tick(now);
         self.process_remote_header_sync_outputs(outputs);
 
         self.drive_fetch::<TransactionBinding>(FetchInput::Tick);

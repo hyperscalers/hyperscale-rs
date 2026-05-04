@@ -9,8 +9,8 @@ use hyperscale_network::Network;
 use hyperscale_storage::Storage;
 
 use super::{IoLoop, TimerOp};
-use crate::io_loop::protocol::binding::FetchBinding;
-use crate::io_loop::protocol::fetch::{FetchInput, FetchOutput};
+use crate::io_loop::fetch::binding::FetchBinding;
+use crate::io_loop::fetch::{FetchInput, FetchOutput};
 
 impl<S, N, D, E> IoLoop<S, N, D, E>
 where
@@ -69,7 +69,7 @@ where
             );
         }
         let outputs = {
-            let fetch = B::fetch_mut(&mut self.protocols);
+            let fetch = B::fetch_mut(&mut self.fetches);
             fetch.handle(input);
             fetch.handle(FetchInput::Tick)
         };
@@ -77,7 +77,7 @@ where
     }
 
     pub(in crate::io_loop) fn update_fetch_tick_timer(&mut self) {
-        let op = if self.protocols.has_any_pending() {
+        let op = if self.fetches.has_any_pending() || self.syncs.has_any_pending() {
             TimerOp::Set {
                 id: TimerId::FetchTick,
                 duration: Self::FETCH_TICK_INTERVAL,

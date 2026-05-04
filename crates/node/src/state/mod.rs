@@ -35,8 +35,8 @@ pub type NodeIndex = u32;
 /// machine. View changes are handled implicitly via local round advancement
 /// in `BftCoordinator` (HotStuff-2 style).
 ///
-/// The block-sync protocol itself lives on `IoLoop` (in
-/// `io_loop::protocol::block_sync`); when a synced block is ready to apply,
+/// The block-sync state machine itself lives on `IoLoop` (in
+/// `io_loop::sync::block`); when a synced block is ready to apply,
 /// `IoLoop` fires a `BlockSyncReadyToApply` event into this state machine,
 /// which routes it to BFT.
 pub struct NodeStateMachine {
@@ -243,7 +243,7 @@ impl StateMachine for NodeStateMachine {
             // ── Sync ─────────────────────────────────────────────────────
             evt @ (ProtocolEvent::BlockSyncReadyToApply { .. }
             | ProtocolEvent::BlockSyncComplete { .. }
-            | ProtocolEvent::RemoteHeaderSyncProtocolComplete { .. }
+            | ProtocolEvent::RemoteHeaderSyncComplete { .. }
             | ProtocolEvent::CommittedStateRestored { .. }) => self.handle_sync(evt),
         };
 

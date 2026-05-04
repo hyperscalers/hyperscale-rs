@@ -21,14 +21,15 @@
 mod actions;
 mod block_commit;
 mod caches;
+pub mod fetch;
 mod fetch_io;
 mod init;
 mod metrics;
 mod network_handlers;
 mod phase_times;
-pub mod protocol;
 mod status;
 mod step;
+pub mod sync;
 mod verify;
 
 use std::collections::HashSet;
@@ -55,13 +56,13 @@ use crate::batch_accumulator::BatchAccumulator;
 use crate::config::NodeConfig;
 use crate::io_loop::block_commit::BlockCommitCoordinator;
 use crate::io_loop::caches::SharedCaches;
-use crate::io_loop::protocol::binding::{
+use crate::io_loop::fetch::binding::{
     ExecCertBinding, FinalizedWaveBinding, LocalProvisionBinding, ProvisionBinding,
     TransactionBinding,
 };
-use crate::io_loop::protocol::fetch::FetchInput;
-use crate::io_loop::protocol::host::ProtocolHost;
+use crate::io_loop::fetch::{FetchHost, FetchInput};
 use crate::io_loop::step::CommittedHeaderVerificationItem;
+use crate::io_loop::sync::SyncHost;
 
 /// Lock-free shared topology snapshot for handler closures and dispatch.
 ///
@@ -203,8 +204,11 @@ where
     /// shared with external RPC consumers.
     caches: SharedCaches,
 
-    /// Sync + per-payload fetch protocols.
-    protocols: ProtocolHost,
+    /// Per-payload fetch state machines.
+    fetches: FetchHost,
+
+    /// Sync state machines (block-sync, remote-header sync).
+    syncs: SyncHost,
 
     /// Stateless transaction validator (signature + format + EC checks).
     /// `Arc` so it can be cloned into the `tx_validation` pool closure
@@ -305,7 +309,8 @@ where
     ) -> Self {
         let initial_persisted_height = state.bft().committed_height();
         let b = &config.batch;
-        let protocols = ProtocolHost::new(&config);
+        let fetches = FetchHost::new(&config);
+        let syncs = SyncHost::new(&config);
         let storage = Arc::new(storage);
         let pending_chain = Arc::new(PendingChain::new(Arc::clone(&storage)));
         let caches = SharedCaches::new(
@@ -329,7 +334,8 @@ where
             tx_validator,
             pending_validation: HashSet::new(),
             locally_submitted: HashSet::new(),
-            protocols,
+            fetches,
+            syncs,
             validation_batch: BatchAccumulator::new(b.tx_validation_max, b.tx_validation_window),
             committed_header_batch: BatchAccumulator::new(
                 b.committed_header_max,

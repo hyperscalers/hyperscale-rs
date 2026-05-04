@@ -627,7 +627,7 @@ pub enum Action {
     },
 
     /// Request the runner to start (or raise the target of) remote-header
-    /// sync for `source_shard`. The runner's `RemoteHeaderSyncProtocol`
+    /// sync for `source_shard`. The runner's `RemoteHeaderSync`
     /// emits range fetches and feeds verified headers back to
     /// [`crate::ProtocolEvent::RemoteHeaderReceived`].
     StartRemoteHeaderSync {

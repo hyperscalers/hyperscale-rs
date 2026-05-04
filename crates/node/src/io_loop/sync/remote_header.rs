@@ -10,7 +10,7 @@
 
 use hyperscale_types::ShardGroupId;
 
-use super::sync::{Sync, SyncBinding, SyncConfig, SyncInput, SyncOutput};
+use super::{Sync, SyncBinding, SyncConfig, SyncInput, SyncOutput};
 
 /// Default upper bound on heights packed into a single range fetch.
 /// Matches `MAX_REMOTE_HEADERS_PER_REQUEST` so the responder never has to
@@ -28,7 +28,7 @@ pub const DEFAULT_SYNC_WINDOW_SIZE: u64 = 256;
 pub const DEFAULT_MAX_CONCURRENT_FETCHES_PER_SHARD: usize = 4;
 
 /// Type alias: remote-header sync is `Sync<RemoteHeaderSyncBinding>`.
-pub type RemoteHeaderSyncProtocol = Sync<RemoteHeaderSyncBinding>;
+pub type RemoteHeaderSync = Sync<RemoteHeaderSyncBinding>;
 
 /// Type alias for remote-header sync inputs.
 pub type RemoteHeaderSyncInput = SyncInput<RemoteHeaderSyncBinding>;

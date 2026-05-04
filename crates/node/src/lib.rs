@@ -10,6 +10,6 @@ pub mod io_loop;
 mod state;
 
 pub use config::NodeConfig;
-pub use io_loop::protocol::block_sync::BlockSyncStateKind;
+pub use io_loop::sync::block::BlockSyncStateKind;
 pub use io_loop::{NodeStatusSnapshot, SharedTopologySnapshot, TimerOp};
 pub use state::NodeStateMachine;

@@ -111,8 +111,9 @@ where
         let bft_stats = self.state.bft().stats();
         let mempool = self.state.mempool();
         let contention = mempool.lock_contention_stats();
-        let proto = self.protocols.metrics();
-        let block_sync_status = &proto.block_sync_status;
+        let fetches = self.fetches.metrics();
+        let syncs = self.syncs.metrics();
+        let block_sync_status = &syncs.block_sync_status;
 
         let bft_mem = self.state.bft().memory_stats();
         let exec_mem = self.state.execution().memory_stats();
@@ -128,17 +129,17 @@ where
             contention_ratio: contention.contention_ratio(),
             in_flight: mempool.in_flight(),
             backpressure_active: mempool.at_in_flight_limit(),
-            blocks_behind: self.protocols.block_sync.blocks_behind(),
-            is_syncing: self.protocols.block_sync.is_syncing(),
-            block_sync_round_in_flight: self.protocols.block_sync.in_flight_ranges(),
-            remote_header_blocks_behind: self.protocols.remote_header_sync.total_blocks_behind(),
-            remote_header_is_syncing: self.protocols.remote_header_sync.is_syncing(),
-            remote_header_round_in_flight: self.protocols.remote_header_sync.in_flight_ranges(),
-            fetch_transaction: proto.transaction_in_flight,
-            fetch_provision: proto.provision_in_flight,
-            fetch_local_provision: proto.local_provision_in_flight,
-            fetch_exec_cert: proto.exec_cert_in_flight,
-            fetch_finalized_wave: proto.finalized_wave_in_flight,
+            blocks_behind: self.syncs.block.blocks_behind(),
+            is_syncing: self.syncs.block.is_syncing(),
+            block_sync_round_in_flight: self.syncs.block.in_flight_ranges(),
+            remote_header_blocks_behind: self.syncs.remote_header.total_blocks_behind(),
+            remote_header_is_syncing: self.syncs.remote_header.is_syncing(),
+            remote_header_round_in_flight: self.syncs.remote_header.in_flight_ranges(),
+            fetch_transaction: fetches.transaction_in_flight,
+            fetch_provision: fetches.provision_in_flight,
+            fetch_local_provision: fetches.local_provision_in_flight,
+            fetch_exec_cert: fetches.exec_cert_in_flight,
+            fetch_finalized_wave: fetches.finalized_wave_in_flight,
             memory: MemoryMetrics {
                 // BFT
                 bft_pending_blocks: bft_mem.pending_blocks,
@@ -206,15 +207,12 @@ where
                 node_committed_header_batch: self.committed_header_batch.len(),
                 node_block_sync_queued_heights: block_sync_status.queued_heights,
                 node_block_sync_in_flight_fetches: block_sync_status.pending_fetches,
-                node_tx_fetch_blocks: proto.transaction_pending,
-                node_local_provision_fetch_pending: proto.local_provision_pending,
-                node_finalized_wave_fetch_pending: proto.finalized_wave_pending,
-                node_provision_fetch_pending: proto.provision_pending,
-                node_exec_cert_fetch_pending: proto.exec_cert_pending,
-                node_remote_header_fetch_pending: self
-                    .protocols
-                    .remote_header_sync
-                    .in_flight_ranges(),
+                node_tx_fetch_blocks: fetches.transaction_pending,
+                node_local_provision_fetch_pending: fetches.local_provision_pending,
+                node_finalized_wave_fetch_pending: fetches.finalized_wave_pending,
+                node_provision_fetch_pending: fetches.provision_pending,
+                node_exec_cert_fetch_pending: fetches.exec_cert_pending,
+                node_remote_header_fetch_pending: self.syncs.remote_header.in_flight_ranges(),
                 // Storage — filled in by record_metrics off-thread.
                 rocksdb_block_cache_usage_bytes: 0,
                 rocksdb_memtable_usage_bytes: 0,

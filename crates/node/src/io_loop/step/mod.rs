@@ -7,7 +7,7 @@
 
 mod block_sync;
 mod gossip;
-mod protocol;
+mod protocol_event;
 mod remote_header_sync;
 mod tick;
 mod tx_validation;

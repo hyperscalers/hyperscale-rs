@@ -24,8 +24,8 @@
 //! With proposer-only gossip, headers may not arrive (proposer is byzantine/slow).
 //! The coordinator tracks per-shard liveness and emits
 //! `Action::StartRemoteHeaderSync` after a staleness threshold, raising the
-//! per-shard target on the I/O loop's sliding-window
-//! `RemoteHeaderSyncProtocol`.
+//! per-shard target on the I/O loop's sliding-window `RemoteHeaderSync`
+//! state machine.
 
 mod coordinator;
 

@@ -167,7 +167,7 @@ fn transaction_fetch_fallback_when_gossip_dropped() {
         // recorded by the serve handler when it answers a fetch request, so a
         // non-zero value proves at least one fetch round-trip completed
         // successfully. (`fetch_started`/`fetch_completed` are not yet wired
-        // client-side; see `crates/node/src/protocol/fetch.rs`.)
+        // client-side; see `crates/node/src/io_loop/fetch/`.)
         let fetch_items_sent = recorder.counter("fetch_items_sent", Some("transaction"));
         assert!(
             fetch_items_sent >= 1,
@@ -501,7 +501,7 @@ seeded_tests! {
 /// broadcast `block.committed` gossip on every commit, which the target
 /// shard's `RemoteHeaderCoordinator` consumes to gate downstream
 /// provision/EC expectations. Suppressing that gossip forces the target
-/// shard's `RemoteHeaderSyncProtocol` (sliding-window range catch-up) to
+/// shard's `RemoteHeaderSync` (sliding-window range catch-up) to
 /// pull headers directly from source-shard committee members.
 ///
 /// This is the *first link* in the cross-shard recovery chain — without

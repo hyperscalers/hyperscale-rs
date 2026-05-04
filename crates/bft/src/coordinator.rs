@@ -353,7 +353,7 @@ impl BftCoordinator {
         target_height: BlockHeight,
     ) -> Vec<Action> {
         // Don't raise the target while already syncing. The io_loop's
-        // BlockSyncProtocol manages its own target internally. Once the current
+        // BlockSync manages its own target internally. Once the current
         // sync completes and we resume consensus, a new start_sync will
         // fire naturally if we're still behind.
         if self.block_sync.is_syncing() {
@@ -2948,7 +2948,7 @@ impl BftCoordinator {
     /// Check pending blocks and emit fetch requests for those that have been
     /// waiting longer than the configured timeout.
     ///
-    /// Suppressed while syncing so `BlockSyncProtocol`'s block deliveries aren't
+    /// Suppressed while syncing so `BlockSync`'s block deliveries aren't
     /// starved by gossip-fetch requests competing for the same slots.
     #[must_use]
     pub fn check_pending_block_fetches(

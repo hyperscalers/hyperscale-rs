@@ -22,12 +22,12 @@ use tracing::{debug, error, trace, warn};
 
 use super::block_commit::{AccumulateDecision, PendingCommit};
 use super::{IoLoop, TimerOp};
-use crate::io_loop::protocol::binding::{
+use crate::io_loop::fetch::FetchInput;
+use crate::io_loop::fetch::binding::{
     ExecCertBinding, FinalizedWaveBinding, LocalProvisionBinding, ProvisionBinding,
     TransactionBinding,
 };
-use crate::io_loop::protocol::block_sync::BlockSyncInput;
-use crate::io_loop::protocol::fetch::FetchInput;
+use crate::io_loop::sync::block::BlockSyncInput;
 impl<S, N, D, E> IoLoop<S, N, D, E>
 where
     S: Storage,
@@ -148,7 +148,7 @@ where
     // arm, with no architectural payoff.
 
     fn handle_continuation(&mut self, pe: ProtocolEvent) {
-        self.protocols.apply_admission(&pe);
+        self.fetches.apply_admission(&pe);
 
         // Serving-cache insertion is io_loop's own state, not an
         // instance concern — keep it here.
@@ -164,7 +164,7 @@ where
         // advance per-shard `committed` and emit `SyncComplete` once the
         // chain catches up. Drives any newly-emitted range fetches inline.
         if let ProtocolEvent::RemoteHeaderAdmitted { committed_header } = &pe {
-            let outputs = self.protocols.on_remote_header_admitted(
+            let outputs = self.syncs.on_remote_header_admitted(
                 committed_header.shard_group_id(),
                 committed_header.header.height,
             );
@@ -391,8 +391,8 @@ where
             AccumulateDecision::Accepted { height, notify_now } => {
                 debug!(height = height.0, "Block committed");
                 let outputs = self
-                    .protocols
-                    .block_sync
+                    .syncs
+                    .block
                     .handle(BlockSyncInput::Admitted { scope: (), height });
                 self.process_block_sync_outputs(outputs);
                 if let Some((block, qc)) = notify_now {

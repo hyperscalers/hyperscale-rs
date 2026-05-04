@@ -454,19 +454,23 @@ pub enum ProtocolEvent {
         certified: CertifiedBlock,
     },
 
-    /// The `io_loop`'s `BlockSyncProtocol` has finished fetching all blocks up to
-    /// the sync target. `BftCoordinator` should exit sync mode so it can re-enter
-    /// if still behind, or resume normal consensus.
+    /// The `io_loop`'s [`BlockSync`] state machine has finished fetching all
+    /// blocks up to the sync target. `BftCoordinator` should exit sync mode
+    /// so it can re-enter if still behind, or resume normal consensus.
+    ///
+    /// [`BlockSync`]: ../../node/io_loop/sync/block/type.BlockSync.html
     BlockSyncComplete {
-        /// Height the sync protocol caught up to.
+        /// Height the sync caught up to.
         height: BlockHeight,
     },
 
-    /// The `io_loop`'s `RemoteHeaderSyncProtocol` caught `source_shard`'s
-    /// committed-header chain up to `height`. `RemoteHeaderCoordinator`
-    /// uses this to clear any "syncing" flag for that shard and resume
-    /// normal per-gap behaviour.
-    RemoteHeaderSyncProtocolComplete {
+    /// The `io_loop`'s [`RemoteHeaderSync`] state machine caught
+    /// `source_shard`'s committed-header chain up to `height`.
+    /// `RemoteHeaderCoordinator` uses this to clear any "syncing" flag for
+    /// that shard and resume normal per-gap behaviour.
+    ///
+    /// [`RemoteHeaderSync`]: ../../node/io_loop/sync/remote_header/type.RemoteHeaderSync.html
+    RemoteHeaderSyncComplete {
         /// Source shard whose chain caught up.
         source_shard: ShardGroupId,
         /// Height the sync caught up to.

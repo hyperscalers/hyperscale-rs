@@ -13,7 +13,7 @@ use hyperscale_storage::Storage;
 use hyperscale_types::{BlockHeight, ShardGroupId, StateRoot};
 
 use crate::io_loop::IoLoop;
-use crate::io_loop::protocol::block_sync::BlockSyncStatus;
+use crate::io_loop::sync::block::BlockSyncStatus;
 
 /// Snapshot of node state for external status APIs.
 ///
@@ -71,7 +71,7 @@ where
             committed_height: self.state.bft().committed_height(),
             view: self.state.bft().view().0,
             state_root,
-            block_sync: self.protocols.block_sync.block_sync_status(),
+            block_sync: self.syncs.block.block_sync_status(),
             mempool_pending: pending,
             mempool_in_flight: in_flight,
             mempool_total: mempool.len(),

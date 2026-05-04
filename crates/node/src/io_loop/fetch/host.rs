@@ -1,36 +1,22 @@
-//! Bundle of fetch + sync protocols owned by the I/O loop.
+//! Bundle of per-payload fetch state machines owned by the I/O loop.
 //!
-//! `ProtocolHost` holds the per-payload fetch state machines plus the
-//! block-sync and remote-header-sync state machines. Lifting these out of
-//! `IoLoop` makes "what the I/O loop is orchestrating" explicit.
-
-use std::time::Instant;
+//! [`FetchHost`] holds one [`Fetch<Id>`] per payload binding, plus the
+//! cross-binding fanout (`apply_admission`) and metric readouts. Lifting
+//! these out of `IoLoop` makes "what fetches the I/O loop is orchestrating"
+//! explicit and isolates per-payload state from sync state.
 
 use hyperscale_core::ProtocolEvent;
-use hyperscale_types::{BlockHeight, ShardGroupId};
 
+use super::FetchConfig;
 use super::binding::{
     ExecCertBinding, ExecCertFetch, FetchBinding, FinalizedWaveBinding, FinalizedWaveFetch,
     LocalProvisionBinding, LocalProvisionFetch, ProvisionBinding, ProvisionFetch,
     TransactionBinding, TransactionFetch,
 };
-use super::block_sync::{BlockSyncInput, BlockSyncOutput, BlockSyncProtocol, BlockSyncStatus};
-use super::fetch::FetchConfig;
-use super::remote_header_sync::{
-    self, RemoteHeaderSyncInput, RemoteHeaderSyncOutput, RemoteHeaderSyncProtocol,
-};
 use crate::config::NodeConfig;
 
-/// Sync + per-payload fetch protocols owned by the I/O loop.
-pub struct ProtocolHost {
-    /// Block-sync state machine.
-    pub block_sync: BlockSyncProtocol,
-
-    /// Multi-shard remote-header sync state machine. Catches up missing
-    /// committed-header chains by batching contiguous heights into range
-    /// fetches.
-    pub remote_header_sync: RemoteHeaderSyncProtocol,
-
+/// Per-payload fetch state machines owned by the I/O loop.
+pub struct FetchHost {
     /// Per-block transaction fetch (intra-shard, pinned to proposer).
     pub transaction: TransactionFetch,
 
@@ -47,13 +33,11 @@ pub struct ProtocolHost {
     pub exec_cert: ExecCertFetch,
 }
 
-impl ProtocolHost {
-    /// Build the protocol host from a node config.
+impl FetchHost {
+    /// Build the fetch host from a node config.
     #[must_use]
     pub fn new(config: &NodeConfig) -> Self {
         Self {
-            block_sync: BlockSyncProtocol::new(config.block_sync.clone()),
-            remote_header_sync: RemoteHeaderSyncProtocol::new(remote_header_sync::default_config()),
             transaction: TransactionFetch::new("transaction", config.transaction_fetch.clone()),
             local_provision: LocalProvisionFetch::new(
                 "local_provision",
@@ -76,11 +60,9 @@ impl ProtocolHost {
         }
     }
 
-    /// True if any fetch protocol has work outstanding (in-flight or
-    /// queued), or if sync has heights parked behind a backoff. Keeps the
-    /// `FetchTick` timer alive so deferred heights eventually retry and
-    /// active sync scopes keep emitting fetches even if their consumer is
-    /// slow to admit.
+    /// True if any per-payload fetch has work outstanding (in-flight or
+    /// queued). Keeps the `FetchTick` timer alive so deferred ids
+    /// eventually retry.
     #[must_use]
     pub fn has_any_pending(&self) -> bool {
         self.transaction.has_pending()
@@ -88,10 +70,6 @@ impl ProtocolHost {
             || self.finalized_wave.has_pending()
             || self.provision.has_pending()
             || self.exec_cert.has_pending()
-            || self.block_sync.has_deferred()
-            || self.block_sync.is_syncing()
-            || self.remote_header_sync.has_deferred()
-            || self.remote_header_sync.is_syncing()
     }
 
     /// Fan an admission `ProtocolEvent` across every binding. Each
@@ -105,38 +83,11 @@ impl ProtocolHost {
         ExecCertBinding::apply_admission(&mut self.exec_cert, event);
     }
 
-    /// Drive the block-sync protocol's periodic tick. Returns the outputs the
-    /// I/O loop should dispatch (block fetches, deliveries, sync-complete).
-    pub fn block_sync_tick(&mut self, now: Instant) -> Vec<BlockSyncOutput> {
-        self.block_sync.handle(BlockSyncInput::Tick { now })
-    }
-
-    /// Drive the remote-header-sync periodic tick. Returns range fetches
-    /// and any newly-emitted `SyncComplete` for shards that just caught up.
-    pub fn remote_header_sync_tick(&mut self, now: Instant) -> Vec<RemoteHeaderSyncOutput> {
-        self.remote_header_sync
-            .handle(RemoteHeaderSyncInput::Tick { now })
-    }
-
-    /// Notify the remote-header-sync FSM that `RemoteHeaderCoordinator`
-    /// admitted a header at `height` for `source_shard`.
-    pub fn on_remote_header_admitted(
-        &mut self,
-        source_shard: ShardGroupId,
-        height: BlockHeight,
-    ) -> Vec<RemoteHeaderSyncOutput> {
-        self.remote_header_sync
-            .handle(RemoteHeaderSyncInput::Admitted {
-                scope: source_shard,
-                height,
-            })
-    }
-
-    /// Snapshot per-binding fetch counts plus sync status. The I/O loop
-    /// flattens this into the larger `MetricsSnapshot`.
+    /// Snapshot per-binding fetch counts. The I/O loop flattens this into
+    /// the larger `MetricsSnapshot`.
     #[must_use]
-    pub fn metrics(&self) -> ProtocolMetrics {
-        ProtocolMetrics {
+    pub fn metrics(&self) -> FetchMetrics {
+        FetchMetrics {
             transaction_in_flight: self.transaction.in_flight_count(),
             transaction_pending: self.transaction.pending_count(),
             local_provision_in_flight: self.local_provision.in_flight_count(),
@@ -147,17 +98,16 @@ impl ProtocolHost {
             provision_pending: self.provision.pending_count(),
             exec_cert_in_flight: self.exec_cert.in_flight_count(),
             exec_cert_pending: self.exec_cert.pending_count(),
-            block_sync_status: self.block_sync.block_sync_status(),
         }
     }
 }
 
-/// Cheap aggregate of per-binding fetch counts plus sync status.
+/// Cheap aggregate of per-binding fetch counts.
 ///
-/// Returned by [`ProtocolHost::metrics`]; flattened into the broader
+/// Returned by [`FetchHost::metrics`]; flattened into the broader
 /// `MetricsSnapshot` by the I/O loop.
 #[allow(missing_docs)] // flat readouts; field names are the documentation
-pub struct ProtocolMetrics {
+pub struct FetchMetrics {
     pub transaction_in_flight: usize,
     pub transaction_pending: usize,
     pub local_provision_in_flight: usize,
@@ -168,5 +118,4 @@ pub struct ProtocolMetrics {
     pub provision_pending: usize,
     pub exec_cert_in_flight: usize,
     pub exec_cert_pending: usize,
-    pub block_sync_status: BlockSyncStatus,
 }

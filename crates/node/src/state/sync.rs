@@ -17,7 +17,7 @@ impl NodeStateMachine {
             ProtocolEvent::BlockSyncReadyToApply { certified } => self
                 .bft
                 .on_sync_block_ready_to_apply(self.topology.snapshot(), certified),
-            // BlockSyncProtocol finished fetching: exit BFT sync mode + flush
+            // BlockSync finished fetching: exit BFT sync mode + flush
             // expected provisions + flush expected headers, all in one
             // pass.
             ProtocolEvent::BlockSyncComplete { .. } => {
@@ -33,7 +33,7 @@ impl NodeStateMachine {
             // Acknowledged but unused for now. Commit 4 wires
             // `RemoteHeaderCoordinator` to clear its per-shard "syncing"
             // flag here.
-            ProtocolEvent::RemoteHeaderSyncProtocolComplete { .. } => vec![],
+            ProtocolEvent::RemoteHeaderSyncComplete { .. } => vec![],
             _ => unreachable!("non-sync event routed to handle_sync"),
         }
     }

@@ -4,7 +4,7 @@
 //! [`FetchBinding`] impl that owns:
 //!
 //! - the `Id` type the fetch is keyed by;
-//! - which `Fetch<Id>` instance on [`ProtocolHost`] backs it;
+//! - which `Fetch<Id>` instance on [`FetchHost`] backs it;
 //! - the request/response shape and the per-binding rules for translating
 //!   responses back into [`NodeInput`] events;
 //! - which `ProtocolEvent` admits ids out of the in-flight set.
@@ -26,8 +26,8 @@ use hyperscale_messages::request::{
 use hyperscale_network::{Network, ResponseVerdict};
 use hyperscale_types::{BlockHeight, ProvisionHash, ShardGroupId, TxHash, WaveId};
 
-use super::fetch::{Fetch, FetchInput};
-use super::host::ProtocolHost;
+use super::host::FetchHost;
+use super::{Fetch, FetchInput};
 
 // ─── Type aliases used across the module tree ──────────────────────────
 
@@ -58,7 +58,7 @@ pub trait FetchBinding: 'static {
     const PER_ID: bool = false;
 
     /// Locate the `Fetch<Id>` instance for this binding inside the host.
-    fn fetch_mut(host: &mut ProtocolHost) -> &mut Fetch<Self::Id>;
+    fn fetch_mut(host: &mut FetchHost) -> &mut Fetch<Self::Id>;
 
     /// Send one request covering `ids` and route the response back through
     /// the event sender. `origin` flows down to `Network::request` as the
@@ -88,7 +88,7 @@ impl FetchBinding for TransactionBinding {
 
     const NAME: &'static str = "transaction";
 
-    fn fetch_mut(host: &mut ProtocolHost) -> &mut Fetch<TxHash> {
+    fn fetch_mut(host: &mut FetchHost) -> &mut Fetch<TxHash> {
         &mut host.transaction
     }
 
@@ -164,7 +164,7 @@ impl FetchBinding for LocalProvisionBinding {
 
     const NAME: &'static str = "local_provision";
 
-    fn fetch_mut(host: &mut ProtocolHost) -> &mut Fetch<ProvisionHash> {
+    fn fetch_mut(host: &mut FetchHost) -> &mut Fetch<ProvisionHash> {
         &mut host.local_provision
     }
 
@@ -230,7 +230,7 @@ impl FetchBinding for FinalizedWaveBinding {
 
     const NAME: &'static str = "finalized_wave";
 
-    fn fetch_mut(host: &mut ProtocolHost) -> &mut Fetch<WaveId> {
+    fn fetch_mut(host: &mut FetchHost) -> &mut Fetch<WaveId> {
         &mut host.finalized_wave
     }
 
@@ -294,7 +294,7 @@ impl FetchBinding for ExecCertBinding {
 
     const NAME: &'static str = "exec_cert";
 
-    fn fetch_mut(host: &mut ProtocolHost) -> &mut Fetch<WaveId> {
+    fn fetch_mut(host: &mut FetchHost) -> &mut Fetch<WaveId> {
         &mut host.exec_cert
     }
 
@@ -371,7 +371,7 @@ impl FetchBinding for ProvisionBinding {
     /// each request targets exactly one scope.
     const PER_ID: bool = true;
 
-    fn fetch_mut(host: &mut ProtocolHost) -> &mut Fetch<Self::Id> {
+    fn fetch_mut(host: &mut FetchHost) -> &mut Fetch<Self::Id> {
         &mut host.provision
     }
 

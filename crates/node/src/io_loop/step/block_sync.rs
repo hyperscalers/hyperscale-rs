@@ -33,8 +33,8 @@ use hyperscale_types::{
 };
 
 use crate::io_loop::IoLoop;
-use crate::io_loop::protocol::block_sync::{BlockSyncInput, BlockSyncOutput};
-use crate::io_loop::protocol::sync::SyncOutput;
+use crate::io_loop::sync::SyncOutput;
+use crate::io_loop::sync::block::{BlockSyncInput, BlockSyncOutput};
 
 impl<S, N, D, E> IoLoop<S, N, D, E>
 where
@@ -49,8 +49,8 @@ where
     /// fetches it emits.
     pub(in crate::io_loop) fn process_start_block_sync(&mut self, target: BlockHeight) {
         let outputs = self
-            .protocols
-            .block_sync
+            .syncs
+            .block
             .handle(BlockSyncInput::StartSync { scope: (), target });
         self.process_block_sync_outputs(outputs);
         self.update_fetch_tick_timer();
@@ -83,7 +83,7 @@ where
                     RehydrateError::QcMismatch { .. } => "qc_hash_mismatch",
                 };
                 record_sync_response_error("block", reason);
-                self.protocols.block_sync.mark_force_full_refetch(height);
+                self.syncs.block.mark_force_full_refetch(height);
                 self.feed_block_sync_fetch_failed(height);
                 return;
             }
@@ -168,8 +168,8 @@ where
     ) {
         use hyperscale_messages::request::GetBlockRequest;
 
-        let target_height = self.protocols.block_sync.target(&()).unwrap_or(height);
-        let force_full = self.protocols.block_sync.force_full(height);
+        let target_height = self.syncs.block.target(&()).unwrap_or(height);
+        let force_full = self.syncs.block.force_full(height);
 
         // Heights flagged `force_full` were rehydration misses last time —
         // request with empty inventory so the responder cannot elide bodies.
@@ -239,16 +239,13 @@ where
 
         // Hand the block off to BFT; tell the FSM the height was delivered.
         self.feed_event(ProtocolEvent::BlockSyncReadyToApply { certified });
-        let outputs = self
-            .protocols
-            .block_sync
-            .handle(BlockSyncInput::FetchSucceeded {
-                scope: (),
-                from: height,
-                count: 1,
-                delivered_heights: vec![height],
-                now: std::time::Instant::now(),
-            });
+        let outputs = self.syncs.block.handle(BlockSyncInput::FetchSucceeded {
+            scope: (),
+            from: height,
+            count: 1,
+            delivered_heights: vec![height],
+            now: std::time::Instant::now(),
+        });
         self.process_block_sync_outputs(outputs);
         self.update_fetch_tick_timer();
     }
@@ -256,15 +253,12 @@ where
     /// Common back-edge: re-queue a height via `FetchFailed`.
     fn feed_block_sync_fetch_failed(&mut self, height: BlockHeight) {
         record_sync_round_retried("block");
-        let outputs = self
-            .protocols
-            .block_sync
-            .handle(BlockSyncInput::FetchFailed {
-                scope: (),
-                from: height,
-                count: 1,
-                now: std::time::Instant::now(),
-            });
+        let outputs = self.syncs.block.handle(BlockSyncInput::FetchFailed {
+            scope: (),
+            from: height,
+            count: 1,
+            now: std::time::Instant::now(),
+        });
         self.process_block_sync_outputs(outputs);
         self.update_fetch_tick_timer();
     }

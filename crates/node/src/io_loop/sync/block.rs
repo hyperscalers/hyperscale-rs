@@ -13,7 +13,7 @@
 //! Public API:
 //! - [`BlockSyncBinding`] — marker type implementing [`SyncBinding`]
 //! - [`BlockSyncState`] — binding-private state owned by `Sync<BlockSyncBinding>`
-//! - [`BlockSyncProtocol`] — type alias for `Sync<BlockSyncBinding>`
+//! - [`BlockSync`] — type alias for `Sync<BlockSyncBinding>`
 //! - [`BlockSyncInput`] / [`BlockSyncOutput`] — type aliases for
 //!   `SyncInput<BlockSyncBinding>` / `SyncOutput<BlockSyncBinding>`
 //! - [`BlockSyncStateKind`] — high-level Idle/Syncing tag for status APIs
@@ -24,13 +24,13 @@ use std::collections::HashSet;
 use hyperscale_types::BlockHeight;
 use serde::Serialize;
 
-use super::sync::{ScopeStatus, Sync, SyncBinding, SyncConfig, SyncInput, SyncOutput};
+use super::{ScopeStatus, Sync, SyncBinding, SyncConfig, SyncInput, SyncOutput};
 
 /// Configuration alias for block-sync.
 pub type BlockSyncConfig = SyncConfig;
 
 /// Type alias: block-sync is `Sync<BlockSyncBinding>`.
-pub type BlockSyncProtocol = Sync<BlockSyncBinding>;
+pub type BlockSync = Sync<BlockSyncBinding>;
 
 /// Type alias for block-sync inputs.
 pub type BlockSyncInput = SyncInput<BlockSyncBinding>;
@@ -61,7 +61,7 @@ impl SyncBinding for BlockSyncBinding {
         state.force_full_refetch.retain(|&h| h > committed);
     }
 
-    /// Clear all force-full markers when the protocol catches up.
+    /// Clear all force-full markers when sync catches up.
     fn on_complete(state: &mut Self::State, _scope: &Self::Scope, _height: BlockHeight) {
         state.force_full_refetch.clear();
     }

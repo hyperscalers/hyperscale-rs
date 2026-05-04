@@ -1,8 +1,8 @@
-//! Generic sliding-window sync protocol.
+//! Sliding-window sync state machines plus inbound serve handlers.
 //!
-//! Pure synchronous state machine that schedules sliding-window catch-up
-//! against one or more "scopes" (e.g. a single chain for block-sync; one
-//! per remote shard for remote-header-sync). Per-scope it tracks:
+//! The generic [`Sync`] state machine owns scheduling for one or more
+//! "scopes" (e.g. a single chain for block-sync; one per remote shard for
+//! remote-header-sync). Per-scope it tracks:
 //!
 //! - `target` — the highest known height to chase
 //! - `committed` — the highest height admitted via [`SyncInput::Admitted`]
@@ -11,9 +11,19 @@
 //! - which heights are deferred behind an exponential backoff after a
 //!   failed fetch
 //!
-//! The generic owns scheduling only. Per-payload concerns — wire shape,
-//! response decoding, rehydration, payload-private state — live on the
-//! binding via [`SyncBinding`] and its associated `State` type.
+//! Per-payload concerns — wire shape, response decoding, rehydration,
+//! payload-private state — live on the binding via [`SyncBinding`] and
+//! its associated `State` type.
+//!
+//! # Module map
+//!
+//! - [`block`] — block-sync binding (`Sync<BlockSyncBinding>`).
+//! - [`remote_header`] — remote-header sync binding
+//!   (`Sync<RemoteHeaderSyncBinding>`), one scope per remote shard.
+//! - [`block_serve`] / [`remote_header_serve`] — inbound responders for
+//!   the range requests the binding-side step layer dispatches.
+//! - [`host`] bundles the two sync state machines and exposes
+//!   IoLoop-side glue (tick, admission notification, metrics).
 //!
 //! # Usage
 //!
@@ -42,6 +52,14 @@ use std::time::{Duration, Instant};
 use hyperscale_types::BlockHeight;
 use serde::Serialize;
 use tracing::{info, trace};
+
+pub mod block;
+pub mod block_serve;
+pub mod host;
+pub mod remote_header;
+pub mod remote_header_serve;
+
+pub use host::{SyncHost, SyncMetrics};
 
 /// Initial backoff for a deferred height after its first fetch failure.
 const DEFERRAL_BASE_MS: u64 = 1_000;
@@ -1192,7 +1210,7 @@ mod tests {
         // BinaryHeap. The next `emit_fetches` would peek a stale top, then
         // `pop_next_height` would skip past it and return None → panic on
         // `expect("peek matched")`. Reproduces the cluster-halt panic seen
-        // at sync.rs:547 (shard-1 validators 5/6).
+        // in the V7 cluster (shard-1 validators 5/6).
         let mut s: Sync<UnitBinding> = Sync::new(SyncConfig {
             max_per_request: 1,
             window_size: 64,

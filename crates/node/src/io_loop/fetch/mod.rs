@@ -1,23 +1,15 @@
-//! Id-keyed fetch state machine with admission-driven completion.
+//! Id-keyed fetch state machine plus per-payload bindings and inbound
+//! request responders.
 //!
-//! Tracks a set of pending ids. Each `Request` carries the peer pool the
-//! ids should be fetched from; the protocol stores it as `Arc<FetchPeers>`
-//! so siblings share state. Each `Tick` collects ids that aren't in flight,
-//! groups them by their peer-pool *value* (so callers that emit one
-//! `Request` per id still batch when their peer pools are equal), and
-//! emits chunked `Send`s up to per-tick and global concurrency caps. The
-//! protocol does NO peer selection — it hands the full pool
-//! through to the output handler, which calls `Network::request` and lets
-//! the network's health-weighted selector pick.
-//!
-//! Entries self-evict on `Admitted` (payload landed via fetch / gossip /
-//! local production) or `Abandoned` (consumer dropped its expectation via
-//! `Action::AbandonFetch`). Both paths converge on the same internal
-//! removal logic; they're surfaced as distinct inputs so the two
-//! populations are observable as separate metrics. Cross-shard payloads
-//! instantiate this with `Id = (ShardGroupId, BlockHeight)` — one id per
-//! request; the chunking machinery handles that as a special case of a
-//! one-element batch.
+//! - The generic [`Fetch`] state machine in this file owns scheduling
+//!   only — pending sets, chunking, in-flight caps.
+//! - [`binding`] provides per-payload glue: which `Fetch<Id>` instance on
+//!   [`FetchHost`] backs each payload, the wire shape of each request,
+//!   and which `ProtocolEvent` admits ids out of the in-flight set.
+//! - [`host`] bundles the per-payload `Fetch<Id>` instances owned by the
+//!   I/O loop, plus the `apply_admission` fan-out and metrics readouts.
+//! - [`transaction_serve`] / [`provision_serve`] answer inbound requests
+//!   for the fetch payloads that have a dedicated wire request type.
 
 use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
@@ -28,6 +20,13 @@ use hyperscale_metrics::{
     record_fetch_abandoned, record_fetch_completed, record_fetch_retried, record_fetch_started,
 };
 use tracing::{debug, trace};
+
+pub mod binding;
+pub mod host;
+pub mod provision_serve;
+pub mod transaction_serve;
+
+pub use host::{FetchHost, FetchMetrics};
 
 /// Tunables for a [`Fetch`] instance.
 #[derive(Debug, Clone)]

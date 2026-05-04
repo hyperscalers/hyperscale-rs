@@ -8,7 +8,7 @@
 //! It also tracks per-shard liveness and emits
 //! `Action::StartRemoteHeaderSync` when a remote shard hasn't sent headers
 //! within the staleness threshold — the I/O loop's
-//! `RemoteHeaderSyncProtocol` then runs sliding-window catch-up.
+//! `RemoteHeaderSync` then runs sliding-window catch-up.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -27,7 +27,7 @@ use tracing::{debug, info, trace, warn};
 /// local block production rate.
 ///
 /// Sized to give the remote proposer's gossip time to arrive across typical
-/// committee latency before we ask the I/O loop's `RemoteHeaderSyncProtocol`
+/// committee latency before we ask the I/O loop's `RemoteHeaderSync`
 /// to probe.
 const HEADER_LIVENESS_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -51,7 +51,7 @@ pub struct RemoteHeaderMemoryStats {
 /// Created from topology knowledge: if we know a shard exists, we expect
 /// headers from it. If none arrive within the staleness threshold, we
 /// raise the per-shard target on the I/O loop's
-/// `RemoteHeaderSyncProtocol`, which manages range fetching and per-fetch
+/// `RemoteHeaderSync`, which manages range fetching and per-fetch
 /// backoff itself.
 #[derive(Debug, Clone)]
 struct ExpectedHeader {
@@ -290,7 +290,7 @@ impl RemoteHeaderCoordinator {
 
         // Update liveness tracking: advance the remote tip and record the
         // local height at which we received it. The I/O loop's
-        // `RemoteHeaderSyncProtocol` observes the same `RemoteHeaderAdmitted`
+        // `RemoteHeaderSync` observes the same `RemoteHeaderAdmitted`
         // continuation and advances its per-shard `committed` counter,
         // ending an in-flight catch-up cycle once it reaches target.
         if let Some(expected) = self.expected.get_mut(&shard)
@@ -378,7 +378,7 @@ impl RemoteHeaderCoordinator {
             }
 
             // Probe the source shard's tip via the I/O loop's
-            // `RemoteHeaderSyncProtocol`. The action is idempotent — the
+            // `RemoteHeaderSync`. The action is idempotent — the
             // FSM short-circuits if its target is already at or past
             // `target`, and applies its own per-fetch backoff on failures.
             let target = BlockHeight(expected.last_verified_height.0 + DEFAULT_PROBE_LOOKAHEAD);

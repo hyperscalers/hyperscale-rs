@@ -19,8 +19,8 @@ use hyperscale_storage::Storage;
 use hyperscale_types::{BlockHeight, CommittedBlockHeader, ShardGroupId, ValidatorId};
 
 use crate::io_loop::IoLoop;
-use crate::io_loop::protocol::remote_header_sync::{RemoteHeaderSyncInput, RemoteHeaderSyncOutput};
-use crate::io_loop::protocol::sync::SyncOutput;
+use crate::io_loop::sync::SyncOutput;
+use crate::io_loop::sync::remote_header::{RemoteHeaderSyncInput, RemoteHeaderSyncOutput};
 
 impl<S, N, D, E> IoLoop<S, N, D, E>
 where
@@ -39,8 +39,8 @@ where
         target: BlockHeight,
     ) {
         let outputs = self
-            .protocols
-            .remote_header_sync
+            .syncs
+            .remote_header
             .handle(RemoteHeaderSyncInput::StartSync {
                 scope: source_shard,
                 target,
@@ -87,16 +87,16 @@ where
             });
         }
 
-        let outputs =
-            self.protocols
-                .remote_header_sync
-                .handle(RemoteHeaderSyncInput::FetchSucceeded {
-                    scope: source_shard,
-                    from: from_height,
-                    count,
-                    delivered_heights,
-                    now: std::time::Instant::now(),
-                });
+        let outputs = self
+            .syncs
+            .remote_header
+            .handle(RemoteHeaderSyncInput::FetchSucceeded {
+                scope: source_shard,
+                from: from_height,
+                count,
+                delivered_heights,
+                now: std::time::Instant::now(),
+            });
         self.process_remote_header_sync_outputs(outputs);
         self.update_fetch_tick_timer();
     }
@@ -108,15 +108,15 @@ where
         from_height: BlockHeight,
         count: u64,
     ) {
-        let outputs =
-            self.protocols
-                .remote_header_sync
-                .handle(RemoteHeaderSyncInput::FetchFailed {
-                    scope: source_shard,
-                    from: from_height,
-                    count,
-                    now: std::time::Instant::now(),
-                });
+        let outputs = self
+            .syncs
+            .remote_header
+            .handle(RemoteHeaderSyncInput::FetchFailed {
+                scope: source_shard,
+                from: from_height,
+                count,
+                now: std::time::Instant::now(),
+            });
         self.process_remote_header_sync_outputs(outputs);
         self.update_fetch_tick_timer();
     }
@@ -124,7 +124,7 @@ where
     // ─── Output processing ──────────────────────────────────────────────
 
     /// Route FSM outputs: `Fetch` → network request, `Complete` →
-    /// `RemoteHeaderSyncProtocolComplete` event.
+    /// `RemoteHeaderSyncComplete` event.
     pub(in crate::io_loop) fn process_remote_header_sync_outputs(
         &mut self,
         outputs: Vec<RemoteHeaderSyncOutput>,
@@ -183,7 +183,7 @@ where
                         height = height.0,
                         "remote-header sync caught up"
                     );
-                    self.feed_event(ProtocolEvent::RemoteHeaderSyncProtocolComplete {
+                    self.feed_event(ProtocolEvent::RemoteHeaderSyncComplete {
                         source_shard,
                         height,
                     });
