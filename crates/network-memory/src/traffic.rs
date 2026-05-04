@@ -113,13 +113,17 @@ impl NetworkTrafficAnalyzer {
         self.total_wire_bytes
             .fetch_add(wire_size as u64, Ordering::Relaxed);
 
-        // Update per-message-type stats
+        // Update per-message-type stats. Look up first so we only allocate
+        // a new String key on the rare cold-miss insert, not on every record.
         {
             let mut by_type = self.by_message_type.write().unwrap();
-            by_type
-                .entry(msg_type.to_string())
-                .or_default()
-                .record(payload_size as u64, wire_size as u64);
+            if let Some(stats) = by_type.get_mut(msg_type) {
+                stats.record(payload_size as u64, wire_size as u64);
+            } else {
+                let mut stats = MessageTypeStats::default();
+                stats.record(payload_size as u64, wire_size as u64);
+                by_type.insert(msg_type.to_string(), stats);
+            }
         }
 
         // Update per-node stats (sender and receiver)
@@ -389,7 +393,11 @@ impl NodeTrafficStats {
         self.messages_sent += 1;
         self.bytes_sent += wire_size;
 
-        let entry = self.by_type.entry(msg_type.to_string()).or_default();
+        let entry = if let Some(e) = self.by_type.get_mut(msg_type) {
+            e
+        } else {
+            self.by_type.entry(msg_type.to_string()).or_default()
+        };
         entry.0 += 1;
         entry.2 += wire_size;
     }
@@ -399,7 +407,11 @@ impl NodeTrafficStats {
         self.messages_received += 1;
         self.bytes_received += wire_size;
 
-        let entry = self.by_type.entry(msg_type.to_string()).or_default();
+        let entry = if let Some(e) = self.by_type.get_mut(msg_type) {
+            e
+        } else {
+            self.by_type.entry(msg_type.to_string()).or_default()
+        };
         entry.1 += 1;
         entry.3 += wire_size;
     }
