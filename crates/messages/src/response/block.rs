@@ -29,12 +29,16 @@ pub struct ElidedCertifiedBlock {
     /// Certifying quorum certificate (always inline).
     pub qc: QuorumCertificate,
     /// Per-transaction `(hash, optional body)` pairs; body is `None` when elided.
-    pub transactions: Vec<(TxHash, Option<RoutableTransaction>)>,
+    ///
+    /// Bodies are `Arc`-wrapped so server-side elision and receiver-side
+    /// rehydration share the same allocations as the local mempool /
+    /// pending-block stores rather than deep-cloning every body.
+    pub transactions: Vec<(TxHash, Option<Arc<RoutableTransaction>>)>,
     /// Per-certificate `(wave id, optional body)` pairs; body is `None` when elided.
-    pub certificates: Vec<(WaveId, Option<FinalizedWave>)>,
+    pub certificates: Vec<(WaveId, Option<Arc<FinalizedWave>>)>,
     /// Per-provision `(hash, optional body)` pairs. `None` overall preserves the
     /// `Block::Sealed` shape; `Some(_)` preserves `Block::Live`.
-    pub provisions: Option<Vec<(ProvisionHash, Option<Provisions>)>>,
+    pub provisions: Option<Vec<(ProvisionHash, Option<Arc<Provisions>>)>>,
 }
 
 impl ElidedCertifiedBlock {
@@ -55,7 +59,7 @@ impl ElidedCertifiedBlock {
                 let body = if matches_filter(inventory.tx_have.as_ref(), &hash) {
                     None
                 } else {
-                    Some((**tx).clone())
+                    Some(Arc::clone(tx))
                 };
                 (hash, body)
             })
@@ -69,7 +73,7 @@ impl ElidedCertifiedBlock {
                 let body = if matches_filter(inventory.cert_have.as_ref(), &id) {
                     None
                 } else {
-                    Some((**fw).clone())
+                    Some(Arc::clone(fw))
                 };
                 (id, body)
             })
@@ -85,7 +89,7 @@ impl ElidedCertifiedBlock {
                         let body = if matches_filter(inventory.provision_have.as_ref(), &hash) {
                             None
                         } else {
-                            Some((**p).clone())
+                            Some(Arc::clone(p))
                         };
                         (hash, body)
                     })
@@ -145,7 +149,7 @@ impl ElidedCertifiedBlock {
         let mut txs = Vec::with_capacity(self.transactions.len());
         for (hash, body) in &self.transactions {
             if let Some(tx) = body {
-                txs.push(Some(Arc::new(tx.clone())));
+                txs.push(Some(Arc::clone(tx)));
             } else if let Some(resolved) = tx_lookup(hash) {
                 txs.push(Some(resolved));
             } else {
@@ -157,7 +161,7 @@ impl ElidedCertifiedBlock {
         let mut certs = Vec::with_capacity(self.certificates.len());
         for (id, body) in &self.certificates {
             if let Some(fw) = body {
-                certs.push(Some(Arc::new(fw.clone())));
+                certs.push(Some(Arc::clone(fw)));
             } else if let Some(resolved) = cert_lookup(id) {
                 certs.push(Some(resolved));
             } else {
@@ -170,7 +174,7 @@ impl ElidedCertifiedBlock {
             let mut out = Vec::with_capacity(entries.len());
             for (hash, body) in entries {
                 if let Some(p) = body {
-                    out.push(Some(Arc::new(p.clone())));
+                    out.push(Some(Arc::clone(p)));
                 } else if let Some(resolved) = provision_lookup(hash) {
                     out.push(Some(resolved));
                 } else {
