@@ -291,33 +291,22 @@ where
             let mut cache = self.prepared_commits.lock().unwrap();
             let mut deferring = false;
             for commit in commits {
-                let prepared = if deferring {
-                    None
-                } else {
-                    cache.remove(&commit.block.hash()).map(|(_, p)| p)
-                };
-
-                let not_ready = prepared.is_none();
-
-                if deferring || not_ready {
-                    if !deferring {
-                        tracing::debug!(
-                            height = commit.block.height().0,
-                            certs = commit.block.certificates().len(),
-                            "Deferring block commit — awaiting PreparedCommit from VerifyStateRoot"
-                        );
-                        deferring = true;
+                if !deferring {
+                    if let Some(prepared) = cache.remove(&commit.block.hash()).map(|(_, p)| p) {
+                        prepared_map.push(prepared);
+                        ready_commits.push(commit);
+                        continue;
                     }
-                    if let Some(p) = prepared {
-                        let bh = commit.block.hash();
-                        let h = commit.block.height();
-                        cache.insert(bh, (h, p));
-                    }
-                    self.pending.push(commit);
-                } else {
-                    prepared_map.push(prepared.unwrap());
-                    ready_commits.push(commit);
+                    // First miss — flip to deferring so all later blocks
+                    // defer too, preserving height ordering.
+                    deferring = true;
+                    tracing::debug!(
+                        height = commit.block.height().0,
+                        certs = commit.block.certificates().len(),
+                        "Deferring block commit — awaiting PreparedCommit from VerifyStateRoot"
+                    );
                 }
+                self.pending.push(commit);
             }
             // Prune stale entries that outlived their blocks.
             let before = cache.len();
