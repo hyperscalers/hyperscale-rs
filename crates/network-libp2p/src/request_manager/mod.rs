@@ -37,7 +37,7 @@ mod stream;
 mod timeout;
 
 use crate::adapter::NetworkError;
-use crate::request_pool::RequestStreamPool;
+use crate::request_pool::RequestPool;
 use bytes::Bytes;
 use libp2p::PeerId;
 use peer_health::{PeerHealthConfig, PeerHealthTracker};
@@ -231,7 +231,7 @@ impl Default for RequestManagerConfig {
 /// Actual stream I/O is delegated to a shared [`RequestStreamPool`], which
 /// maintains one persistent stream per peer.
 pub struct RequestManager {
-    pool: Arc<RequestStreamPool>,
+    pool: Arc<dyn RequestPool>,
     config: RequestManagerConfig,
     /// Peer health tracker (uses `DashMap` internally, no external lock needed).
     health: PeerHealthTracker,
@@ -255,8 +255,12 @@ pub struct RequestManager {
 
 impl RequestManager {
     /// Create a new request manager.
+    ///
+    /// `pool` is taken as a trait object so tests can substitute a
+    /// deterministic mock; production callers pass `Arc<RequestStreamPool>`,
+    /// which coerces automatically.
     #[must_use]
-    pub fn new(pool: Arc<RequestStreamPool>, config: RequestManagerConfig) -> Self {
+    pub fn new(pool: Arc<dyn RequestPool>, config: RequestManagerConfig) -> Self {
         let effective = config.max_concurrent;
         Self {
             pool,

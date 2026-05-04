@@ -35,6 +35,8 @@ use futures::{AsyncRead, AsyncReadExt, AsyncWrite};
 use hyperscale_metrics as metrics;
 use hyperscale_network::compression;
 use libp2p::PeerId;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
@@ -42,6 +44,42 @@ use tracing::{debug, warn};
 
 /// Channel capacity per peer. Bounds memory and provides caller backpressure.
 const PEER_CHANNEL_CAPACITY: usize = 64;
+
+/// Abstraction over a per-peer request/response pool.
+///
+/// Lets [`RequestManager`] swap in a deterministic mock for retry-loop tests
+/// without standing up a real libp2p stack. The trait is object-safe (no
+/// generic methods, no `Self` returns), so the manager holds it as a
+/// trait object — `Arc<RequestStreamPool>` coerces to `Arc<dyn RequestPool>`
+/// automatically at construction sites.
+///
+/// [`RequestManager`]: crate::RequestManager
+pub trait RequestPool: Send + Sync + 'static {
+    /// Send a request to `peer` and await the response.
+    ///
+    /// `timeout` bounds the I/O for this request once the pool dispatches
+    /// it. The future is boxed because the trait is object-safe; the
+    /// `'a` lifetime lets implementations borrow from `&self`.
+    fn send<'a>(
+        &'a self,
+        peer: PeerId,
+        type_id: &'static str,
+        data: Vec<u8>,
+        timeout: Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, NetworkError>> + Send + 'a>>;
+}
+
+impl RequestPool for RequestStreamPool {
+    fn send<'a>(
+        &'a self,
+        peer: PeerId,
+        type_id: &'static str,
+        data: Vec<u8>,
+        timeout: Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, NetworkError>> + Send + 'a>> {
+        Box::pin(Self::send(self, peer, type_id, data, timeout))
+    }
+}
 
 /// Proactively close the persistent stream after this long without new
 /// requests. Must be strictly less than the inbound router's

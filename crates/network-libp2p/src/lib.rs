@@ -21,4 +21,4 @@ pub use adapter::{Libp2pAdapter, NetworkError, generate_random_keypair};
 pub use config::{Libp2pConfig, VersionInteroperabilityMode};
 pub use network::Libp2pNetwork;
 pub use request_manager::{RequestManager, RequestManagerConfig};
-pub use request_pool::RequestStreamPool;
+pub use request_pool::{RequestPool, RequestStreamPool};
