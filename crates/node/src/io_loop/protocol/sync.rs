@@ -490,9 +490,11 @@ impl<B: SyncBinding> Sync<B> {
                 state.deferred.entry(h).or_default().advance_round(now);
             }
         }
-        // No new fetches emitted here — Tick promotes deferred heights once
-        // their backoff elapses.
-        vec![]
+        // The freed slot can carry other ready work immediately — heights
+        // past the failed range, ready-deferred entries from earlier
+        // failures, or other scopes' queues. Without this, the slot sits
+        // idle until the next Tick.
+        self.emit_fetches()
     }
 
     fn handle_admitted(&mut self, scope: &B::Scope, height: BlockHeight) -> Vec<SyncOutput<B>> {
@@ -550,11 +552,12 @@ impl<B: SyncBinding> Sync<B> {
 
     fn handle_tick(&mut self, now: Instant) -> Vec<SyncOutput<B>> {
         for state in self.scopes.values_mut() {
-            // Demote pending-admission heights whose deadline elapsed
-            // back to `deferred` (with one round of backoff). Covers the
-            // case where admission never lands — e.g. the consumer
-            // rejected the delivered header and the binding has no
-            // further candidates.
+            // Re-queue pending-admission heights whose deadline elapsed.
+            // The PENDING_ADMISSION_TIMEOUT wait already absorbs the
+            // QC-verification + admission window; if admission never
+            // arrived, every candidate sender's QC failed, and the only
+            // way forward is to re-fetch and find different senders. An
+            // additional `deferred` backoff just delays that.
             let stale: Vec<BlockHeight> = state
                 .pending_admission
                 .iter()
@@ -563,7 +566,7 @@ impl<B: SyncBinding> Sync<B> {
             for h in stale {
                 state.pending_admission.remove(&h);
                 if h > state.committed && h <= state.target {
-                    state.deferred.entry(h).or_default().advance_round(now);
+                    state.queue_height(h);
                 }
             }
 
@@ -1025,11 +1028,12 @@ mod tests {
     }
 
     #[test]
-    fn pending_admission_heights_demote_to_deferred_after_timeout() {
-        // If admission never lands (e.g. consumer rejected the delivered
-        // header and the binding has no further candidates), the
-        // pending-admission slot must not be permanent — Tick demotes it
-        // back to `deferred` so the height eventually re-fetches.
+    fn pending_admission_timeout_requeues_for_immediate_refetch() {
+        // If admission never lands (e.g. every candidate sender's QC
+        // verification failed), the pending-admission slot must not be
+        // permanent — Tick re-queues so the heights re-fetch. The 5s
+        // pending-admission window already absorbed the wait; no extra
+        // deferral backoff on top.
         let mut s: Sync<ShardBinding> = Sync::new(SyncConfig {
             max_per_request: 8,
             window_size: 32,
@@ -1039,6 +1043,7 @@ mod tests {
             scope: 1,
             target: BlockHeight(8),
         });
+        // Drain the initial fetches so we observe Tick's emission below.
         let now = Instant::now();
         let _ = s.handle(SyncInput::FetchSucceeded {
             scope: 1,
@@ -1048,18 +1053,62 @@ mod tests {
             now,
         });
         // Tick before timeout: still pending, no re-fetch.
-        let _ = s.handle(SyncInput::Tick {
+        let outputs = s.handle(SyncInput::Tick {
             now: now + Duration::from_secs(1),
         });
+        assert!(
+            outputs.is_empty(),
+            "no re-fetch before pending-admission timeout"
+        );
         assert!(!s.has_deferred());
 
-        // Tick past PENDING_ADMISSION_TIMEOUT (5s): heights demote to
-        // deferred. They wait one round of deferral backoff before
-        // re-emerging.
-        let _ = s.handle(SyncInput::Tick {
+        // Tick past PENDING_ADMISSION_TIMEOUT (5s): heights re-queue and
+        // emit_fetches dispatches a new range immediately.
+        let outputs = s.handle(SyncInput::Tick {
             now: now + Duration::from_secs(6),
         });
-        assert!(s.has_deferred(), "stale pending heights should demote");
+        assert!(
+            !s.has_deferred(),
+            "timeout should re-queue, not move to deferred"
+        );
+        assert!(
+            outputs
+                .iter()
+                .any(|o| matches!(o, SyncOutput::Fetch { from, .. } if from.0 == 1)),
+            "expected immediate re-fetch starting at the lowest re-queued height"
+        );
+    }
+
+    #[test]
+    fn fetch_failed_emits_next_fetch_when_other_work_is_ready() {
+        // Freeing an in-flight slot via FetchFailed must not leave the
+        // freed slot idle when other heights are queued and ready —
+        // otherwise the lag waits for the next Tick to make progress.
+        let mut s: Sync<UnitBinding> = Sync::new(SyncConfig {
+            max_per_request: 1,
+            window_size: 32,
+            max_concurrent_per_scope: 2,
+        });
+        // Window queues 1..=5; concurrency=2 dispatches heights 1 and 2
+        // and leaves 3..=5 in the heap.
+        let _ = s.handle(SyncInput::StartSync {
+            scope: (),
+            target: BlockHeight(5),
+        });
+        // Failing height 1 frees a slot. The freed slot should immediately
+        // pull height 3 off the heap rather than waiting for Tick.
+        let outputs = s.handle(SyncInput::FetchFailed {
+            scope: (),
+            from: BlockHeight(1),
+            count: 1,
+            now: Instant::now(),
+        });
+        assert!(
+            outputs
+                .iter()
+                .any(|o| matches!(o, SyncOutput::Fetch { from, .. } if from.0 == 3)),
+            "expected immediate emission for height 3 on slot release"
+        );
     }
 
     #[test]
