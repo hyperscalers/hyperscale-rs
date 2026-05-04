@@ -274,11 +274,12 @@ where
         // never fires and sync_awaiting_persistence_height is never satisfied.
         commits.sort_by_key(|c| c.block.height().0);
 
+        // `commits` is non-empty (checked above) and sorted ascending by height.
         let max_committed_height = commits
-            .iter()
-            .map(|c| c.block.height())
-            .max()
-            .unwrap_or(BlockHeight::GENESIS);
+            .last()
+            .expect("commits is non-empty after the early return")
+            .block
+            .height();
 
         // Blocks committed via CommitBlock need the PreparedCommit produced
         // asynchronously by VerifyStateRoot. If it's not ready yet, defer —
@@ -350,11 +351,11 @@ where
 
             let _roots = storage.commit_prepared_blocks(batch);
 
-            let max_persisted = heights
-                .iter()
-                .copied()
-                .max()
-                .unwrap_or(BlockHeight::GENESIS);
+            // `heights` is non-empty (commits was checked above) and sorted
+            // ascending (parallel to the height-sorted commits Vec).
+            let max_persisted = *heights
+                .last()
+                .expect("heights is non-empty after the early return");
 
             // Send deferred BlockCommitted events for blocks that weren't notified
             // at accumulation time (due to persistence backpressure).
