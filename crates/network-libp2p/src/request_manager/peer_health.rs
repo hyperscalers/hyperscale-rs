@@ -275,7 +275,7 @@ impl PeerHealthTracker {
         }
 
         // Should not reach here, but return last candidate as fallback
-        Some(candidates[candidates.len() - 1])
+        candidates.last().copied()
     }
 
     /// Select a peer different from the given one, if possible.
