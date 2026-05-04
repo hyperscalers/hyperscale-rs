@@ -540,6 +540,207 @@ mod tests {
         assert_eq!(fetches[0].0, w_zero);
     }
 
+    #[test]
+    fn on_txs_terminated_cleans_reverse_index_when_entry_evicts() {
+        let mut t = ExpectedCertTracker::new();
+        t.mark_fulfilled(
+            ShardGroupId(1),
+            BlockHeight(5),
+            &wave(5),
+            std::iter::once(tx(1)),
+            ms(60_000),
+        );
+        assert_eq!(t.by_tx.len(), 1);
+
+        t.on_txs_terminated(std::iter::once(tx(1)));
+
+        assert_eq!(t.fulfilled_len(), 0);
+        assert!(t.by_tx.is_empty());
+    }
+
+    #[test]
+    fn on_txs_terminated_drains_one_of_many_entries_sharing_a_tx() {
+        // Two fulfilled entries reference the same tx via `by_tx`.
+        // Terminating the shared tx must update both entries' pending sets
+        // and only evict the one whose set actually drains.
+        let mut t = ExpectedCertTracker::new();
+        let shared = tx(1);
+        let only_in_first = tx(2);
+        let w1 = wave(5);
+        let w2 = wave(6);
+        t.mark_fulfilled(
+            ShardGroupId(1),
+            BlockHeight(5),
+            &w1,
+            [shared, only_in_first],
+            ms(60_000),
+        );
+        t.mark_fulfilled(
+            ShardGroupId(1),
+            BlockHeight(6),
+            &w2,
+            std::iter::once(shared),
+            ms(60_000),
+        );
+
+        t.on_txs_terminated(std::iter::once(shared));
+
+        assert_eq!(t.fulfilled_len(), 1, "first entry survives");
+        assert!(!t.by_tx.contains_key(&shared));
+        assert!(t.by_tx.contains_key(&only_in_first));
+    }
+
+    #[test]
+    fn prune_fulfilled_cleans_reverse_index_for_evicted_entries() {
+        let mut t = ExpectedCertTracker::new();
+        t.mark_fulfilled(
+            ShardGroupId(1),
+            BlockHeight(5),
+            &wave(5),
+            [tx(1), tx(2)],
+            ms(1_000),
+        );
+        assert_eq!(t.by_tx.len(), 2);
+
+        t.prune_fulfilled(ms(2_000));
+
+        assert_eq!(t.fulfilled_len(), 0);
+        assert!(t.by_tx.is_empty());
+    }
+
+    #[test]
+    fn prune_fulfilled_evicts_at_exactly_the_deadline() {
+        // Deadline check is `deadline > now_ts` — strictly greater. At
+        // equality the entry is dropped.
+        let mut t = ExpectedCertTracker::new();
+        t.mark_fulfilled(
+            ShardGroupId(1),
+            BlockHeight(5),
+            &wave(5),
+            std::iter::once(tx(1)),
+            ms(1_000),
+        );
+        t.prune_fulfilled(ms(1_000));
+        assert_eq!(t.fulfilled_len(), 0);
+    }
+
+    #[test]
+    fn check_timeouts_fires_at_exactly_the_fallback_deadline() {
+        let mut t = ExpectedCertTracker::new();
+        t.register(ShardGroupId(1), BlockHeight(5), wave(5), ms(0));
+        let fetches = t.check_timeouts(ms(5_000));
+        assert_eq!(fetches.len(), 1);
+        assert!(!fetches[0].1);
+    }
+
+    #[test]
+    fn check_timeouts_can_mix_initial_and_retry_emissions_in_one_call() {
+        let mut t = ExpectedCertTracker::new();
+        let w_old = wave(5);
+        let w_new = wave(6);
+        // Old entry crosses initial deadline at 5_000 then is due for retry
+        // at 15_000 (cooldown = 10s). New entry registered at 10_000 crosses
+        // its initial deadline at 15_000.
+        t.register(ShardGroupId(1), BlockHeight(5), w_old.clone(), ms(0));
+        let _ = t.check_timeouts(ms(5_000));
+        t.register(ShardGroupId(1), BlockHeight(6), w_new.clone(), ms(10_000));
+
+        let fetches = t.check_timeouts(ms(15_000));
+        assert_eq!(fetches.len(), 2);
+        let old_is_retry = fetches.iter().find(|(w, _)| *w == w_old).map(|(_, r)| *r);
+        let new_is_retry = fetches.iter().find(|(w, _)| *w == w_new).map(|(_, r)| *r);
+        assert_eq!(old_is_retry, Some(true));
+        assert_eq!(new_is_retry, Some(false));
+    }
+
+    #[test]
+    fn retain_if_shard_needed_prunes_at_exactly_grace_boundary() {
+        // `elapsed_since < EXPECTED_RETENTION_GRACE` — at equality the entry
+        // is pruned.
+        let mut t = ExpectedCertTracker::new();
+        t.register(ShardGroupId(1), BlockHeight(5), wave(5), ms(0));
+        let boundary = ms(u64::try_from(EXPECTED_RETENTION_GRACE.as_millis()).unwrap());
+        t.retain_if_shard_needed(&HashSet::new(), boundary);
+        assert_eq!(t.expected_len(), 0);
+    }
+
+    #[test]
+    fn mark_fulfilled_overwrites_pending_set_when_called_twice_for_same_key() {
+        // Re-fulfillment can occur after the deadline backstop evicts a
+        // tombstone and a duplicate EC arrives — the newer call must
+        // replace the pending set wholesale rather than merge with stale
+        // hashes from the prior fulfillment, otherwise drains will not
+        // empty the new set.
+        let mut t = ExpectedCertTracker::new();
+        let w = wave(5);
+        let original_tx = tx(1);
+        let new_tx = tx(2);
+
+        t.mark_fulfilled(
+            ShardGroupId(1),
+            BlockHeight(5),
+            &w,
+            std::iter::once(original_tx),
+            ms(1_000),
+        );
+        t.mark_fulfilled(
+            ShardGroupId(1),
+            BlockHeight(5),
+            &w,
+            std::iter::once(new_tx),
+            ms(70_000),
+        );
+
+        // Terminating only the new tx must drain the surviving entry; the
+        // original tx is no longer part of the pending set.
+        t.on_txs_terminated(std::iter::once(new_tx));
+        assert_eq!(t.fulfilled_len(), 0);
+    }
+
+    #[test]
+    fn mark_fulfilled_with_empty_tx_set_persists_until_deadline() {
+        // ECs with empty tx_outcomes leave a tombstone that only the
+        // deadline backstop can evict — there's nothing to drain.
+        let mut t = ExpectedCertTracker::new();
+        t.mark_fulfilled(
+            ShardGroupId(1),
+            BlockHeight(5),
+            &wave(5),
+            std::iter::empty(),
+            ms(60_000),
+        );
+        assert_eq!(t.fulfilled_len(), 1);
+
+        t.on_txs_terminated(std::iter::once(tx(1)));
+        assert_eq!(t.fulfilled_len(), 1);
+
+        t.prune_fulfilled(ms(60_000));
+        assert_eq!(t.fulfilled_len(), 0);
+    }
+
+    #[test]
+    fn register_succeeds_after_fulfilled_tombstone_drains() {
+        // Once on_txs_terminated empties a tombstone, a duplicate header
+        // arriving later is allowed to re-register the expectation. The
+        // deadline backstop on `prune_fulfilled` exists precisely because
+        // this re-registration path can recreate a tombstone whose pending
+        // set never drains again.
+        let mut t = ExpectedCertTracker::new();
+        let w = wave(5);
+        t.mark_fulfilled(
+            ShardGroupId(1),
+            BlockHeight(5),
+            &w,
+            std::iter::once(tx(1)),
+            ms(60_000),
+        );
+        t.on_txs_terminated(std::iter::once(tx(1)));
+
+        t.register(ShardGroupId(1), BlockHeight(5), w.clone(), ms(70_000));
+
+        assert!(t.is_expected(ShardGroupId(1), BlockHeight(5), &w));
+    }
+
     // ─── Property test ──────────────────────────────────────────────────
 
     use proptest::prelude::*;
