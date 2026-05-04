@@ -125,7 +125,9 @@ pub struct BlockHeader {
     /// congested remote shards.
     ///
     /// BFT-verified within tolerance (validators may differ slightly due to
-    /// execution timing). Zero for genesis, fallback, and sync blocks.
+    /// execution timing). Zero for genesis; fallback and sync blocks carry
+    /// the parent's in-flight count forward unchanged (no txs admitted, none
+    /// finalized).
     pub in_flight: u32,
 }
 
