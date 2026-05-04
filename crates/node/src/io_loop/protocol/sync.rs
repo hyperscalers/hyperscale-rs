@@ -462,11 +462,22 @@ impl<B: SyncBinding> Sync<B> {
 
         // Implicit target advancement: any delivered height past the
         // current target proves the responder has at least committed that
-        // height.
+        // height. Cap the jump at one window plus one batch past
+        // `committed` so a buggy or malicious responder claiming an
+        // arbitrarily high height can't make us chase it — honest peers
+        // serving a slightly larger range than requested still fit under
+        // the cap.
         if let Some(max_delivered) = delivered.iter().max().copied()
             && max_delivered > state.target
         {
-            state.target = max_delivered;
+            let cap = BlockHeight(
+                state
+                    .committed
+                    .0
+                    .saturating_add(self.config.window_size)
+                    .saturating_add(self.config.max_per_request),
+            );
+            state.target = max_delivered.min(cap);
         }
 
         Self::queue_window(state, &self.config);
@@ -908,6 +919,34 @@ mod tests {
         });
         let st = s.scopes.get(&1).unwrap();
         assert_eq!(st.target, BlockHeight(7));
+    }
+
+    #[test]
+    fn implicit_target_advance_caps_at_one_window_past_committed() {
+        // A responder volunteering a height far past `committed + window`
+        // must not slide our target out into space — honest peers won't,
+        // and a malicious one shouldn't be able to make us chase fetches
+        // toward a height that doesn't exist.
+        let mut s: Sync<ShardBinding> = Sync::new(cfg_range());
+        let _ = s.handle(SyncInput::StartSync {
+            scope: 1,
+            target: BlockHeight(5),
+        });
+        // cfg_range: window_size=32, max_per_request=8. Cap from committed=0
+        // is 40. Responder claims a height of 100.
+        let _ = s.handle(SyncInput::FetchSucceeded {
+            scope: 1,
+            from: BlockHeight(1),
+            count: 5,
+            delivered_heights: vec![BlockHeight(100)],
+            now: Instant::now(),
+        });
+        let st = s.scopes.get(&1).unwrap();
+        assert_eq!(
+            st.target,
+            BlockHeight(40),
+            "implicit advance should clamp at committed + window + max_per_request"
+        );
     }
 
     #[test]
