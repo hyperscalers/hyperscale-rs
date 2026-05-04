@@ -71,6 +71,38 @@ pub struct FulfillmentStats {
     pub messages_deduplicated: u64,
 }
 
+/// Common interface for entries on a delivery heap: every scheduled item is
+/// ordered by `(delivery_time, sequence)` and answers "when should this fire?"
+trait Scheduled {
+    fn delivery_time(&self) -> Duration;
+}
+
+/// Drain `heap` of every entry whose `delivery_time` is `<= now`, invoking
+/// `deliver` for each. The closure returns `true` to count the entry as
+/// delivered, `false` to drop it (e.g. no registered handler).
+///
+/// # Panics
+///
+/// Panics if a peeked entry disappears before the matching `pop()` — never
+/// observed in practice; the heap is owned and not concurrently mutated.
+fn flush_heap<T: Scheduled + Ord>(
+    heap: &mut BinaryHeap<Reverse<T>>,
+    now: Duration,
+    mut deliver: impl FnMut(T) -> bool,
+) -> usize {
+    let mut delivered = 0;
+    while let Some(Reverse(scheduled)) = heap.peek() {
+        if scheduled.delivery_time() > now {
+            break;
+        }
+        let Reverse(scheduled) = heap.pop().unwrap();
+        if deliver(scheduled) {
+            delivered += 1;
+        }
+    }
+    delivered
+}
+
 /// A gossip delivery scheduled for future delivery via the internal latency queue.
 struct ScheduledGossip {
     delivery_time: Duration,
@@ -99,6 +131,11 @@ impl Ord for ScheduledGossip {
         (self.delivery_time, self.sequence).cmp(&(other.delivery_time, other.sequence))
     }
 }
+impl Scheduled for ScheduledGossip {
+    fn delivery_time(&self) -> Duration {
+        self.delivery_time
+    }
+}
 
 /// A notification delivery scheduled for future delivery via the internal latency queue.
 struct ScheduledNotification {
@@ -124,6 +161,11 @@ impl PartialOrd for ScheduledNotification {
 impl Ord for ScheduledNotification {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         (self.delivery_time, self.sequence).cmp(&(other.delivery_time, other.sequence))
+    }
+}
+impl Scheduled for ScheduledNotification {
+    fn delivery_time(&self) -> Duration {
+        self.delivery_time
     }
 }
 
@@ -155,6 +197,11 @@ impl PartialOrd for ScheduledResponse {
 impl Ord for ScheduledResponse {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         (self.delivery_time, self.sequence).cmp(&(other.delivery_time, other.sequence))
+    }
+}
+impl Scheduled for ScheduledResponse {
+    fn delivery_time(&self) -> Duration {
+        self.delivery_time
     }
 }
 
@@ -822,34 +869,24 @@ impl SimulatedNetwork {
     ///
     /// Calls each target node's registered `GossipHandler`. Returns the
     /// number of messages delivered.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the heap reports a peek-able entry that disappears before
-    /// the matching `pop()` — never observed in practice.
     pub fn flush_gossip(&mut self, now: Duration) -> usize {
-        let mut delivered = 0;
-        while let Some(Reverse(scheduled)) = self.pending_gossip.peek() {
-            if scheduled.delivery_time > now {
-                break;
-            }
-            let Reverse(scheduled) = self.pending_gossip.pop().unwrap();
+        flush_heap(&mut self.pending_gossip, now, |scheduled| {
             if let Some(handler) = self
                 .registries
                 .get(scheduled.target_node as usize)
                 .and_then(|r| r.get_gossip(scheduled.message_type))
             {
                 let _ = handler(scheduled.payload);
-                delivered += 1;
+                true
             } else {
                 debug!(
                     target_node = scheduled.target_node,
                     message_type = scheduled.message_type,
                     "No gossip handler for message type on target node, dropping"
                 );
+                false
             }
-        }
-        delivered
+        })
     }
 
     /// Earliest pending gossip delivery time (for event loop scheduling).
@@ -871,34 +908,24 @@ impl SimulatedNetwork {
     ///
     /// Calls each target node's registered notification handler. Returns
     /// the number of notifications delivered.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the heap reports a peek-able entry that disappears before
-    /// the matching `pop()` — never observed in practice.
     pub fn flush_notifications(&mut self, now: Duration) -> usize {
-        let mut delivered = 0;
-        while let Some(Reverse(scheduled)) = self.pending_notifications.peek() {
-            if scheduled.delivery_time > now {
-                break;
-            }
-            let Reverse(scheduled) = self.pending_notifications.pop().unwrap();
+        flush_heap(&mut self.pending_notifications, now, |scheduled| {
             if let Some(handler) = self
                 .registries
                 .get(scheduled.target_node as usize)
                 .and_then(|r| r.get_notification(scheduled.message_type))
             {
                 handler(scheduled.payload);
-                delivered += 1;
+                true
             } else {
                 debug!(
                     target_node = scheduled.target_node,
                     message_type = scheduled.message_type,
                     "No notification handler for message type on target node, dropping"
                 );
+                false
             }
-        }
-        delivered
+        })
     }
 
     /// Earliest pending notification delivery time.
@@ -915,22 +942,11 @@ impl SimulatedNetwork {
     ///
     /// Invokes each deferred `on_response` callback with the pre-computed
     /// response bytes. Returns the number of responses delivered.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the heap reports a peek-able entry that disappears before
-    /// the matching `pop()` — never observed in practice.
     pub fn flush_responses(&mut self, now: Duration) -> usize {
-        let mut delivered = 0;
-        while let Some(Reverse(scheduled)) = self.pending_responses.peek() {
-            if scheduled.delivery_time > now {
-                break;
-            }
-            let Reverse(scheduled) = self.pending_responses.pop().unwrap();
+        flush_heap(&mut self.pending_responses, now, |scheduled| {
             (scheduled.on_response)(Ok(scheduled.response));
-            delivered += 1;
-        }
-        delivered
+            true
+        })
     }
 
     /// Earliest pending response delivery time.
