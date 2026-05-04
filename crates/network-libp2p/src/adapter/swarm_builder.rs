@@ -69,17 +69,7 @@ pub(super) fn build_swarm(
                 NoiseConfig::new(&keypair)
                     .map_err(|e| NetworkError::NetworkError(e.to_string()))?,
             )
-            .multiplex({
-                let mut config = YamuxConfig::default();
-                config.set_max_num_streams(4096);
-                // allowing deprecated because replacement (connection-level limits) is not available libp2p 0.56
-                #[allow(deprecated)]
-                {
-                    config.set_max_buffer_size(16 * 1024 * 1024);
-                    config.set_receive_window_size(16 * 1024 * 1024);
-                }
-                config
-            })
+            .multiplex(YamuxConfig::default())
             .map(|(p, c), _| (p, StreamMuxerBox::new(c)));
 
         // Prioritize QUIC by putting it first (Left side of OrTransport)
