@@ -71,9 +71,6 @@ impl RequestManager {
                     // Success! Update health and return.
                     self.health.record_success(&current_peer, elapsed);
 
-                    // Maybe increase concurrency if we're doing well
-                    self.maybe_increase_concurrency();
-
                     trace!(
                         peer = ?current_peer,
                         attempts,
@@ -252,8 +249,6 @@ mod tests {
             initial_backoff: Duration::ZERO,
             max_backoff: Duration::ZERO,
             backoff_multiplier: 1.0,
-            target_success_rate: 0.5,
-            min_concurrent: 1,
             sheddable_max_concurrent: 4,
             cross_shard_max_concurrent: 4,
         }

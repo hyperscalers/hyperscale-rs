@@ -173,12 +173,6 @@ pub struct RequestManagerConfig {
     /// Backoff multiplier (exponential backoff).
     pub backoff_multiplier: f64,
 
-    /// Target success rate. If global rate drops below this, reduce concurrency.
-    pub target_success_rate: f64,
-
-    /// Minimum concurrency (won't reduce below this even under poor conditions).
-    pub min_concurrent: usize,
-
     /// Cap on concurrent in-flight requests in the *sheddable* classes
     /// (`Recovery` + `Bulk`). Counted as a subset of `max_concurrent` —
     /// prevents a flood of catchup / DA-backfill fetches from filling the
@@ -206,8 +200,6 @@ impl Default for RequestManagerConfig {
             initial_backoff: Duration::from_millis(100),
             max_backoff: Duration::from_millis(500), // Cap backoff to match stream timeout
             backoff_multiplier: 1.5,
-            target_success_rate: 0.5,
-            min_concurrent: 8,
             // 32/128 leaves 96 slots for hot-path + cross-shard classes
             // under any sheddable load — sized to absorb catchup / DA
             // bursts without blocking pending-block or cross-shard fetches.
@@ -226,7 +218,7 @@ impl Default for RequestManagerConfig {
 /// Provides:
 /// - Request-centric retry logic (same peer first, then rotate)
 /// - Weighted peer selection based on health metrics
-/// - Adaptive concurrency control
+/// - Per-class admission caps (sheddable / cross-shard subset reservations)
 /// - Exponential backoff between retries
 ///
 /// Actual stream I/O is delegated to a shared [`RequestStreamPool`], which
@@ -250,8 +242,6 @@ pub struct RequestManager {
     /// `request_slots_in_flight{class}` gauge. Indexed by class
     /// discriminant (0..=4). Sum equals `in_flight`.
     per_class_in_flight: [AtomicUsize; 5],
-    /// Current effective concurrency limit (may be reduced adaptively).
-    effective_concurrent: AtomicUsize,
 }
 
 impl RequestManager {
@@ -262,7 +252,6 @@ impl RequestManager {
     /// which coerces automatically.
     #[must_use]
     pub fn new(pool: Arc<dyn RequestPool>, config: RequestManagerConfig) -> Self {
-        let effective = config.max_concurrent;
         Self {
             pool,
             health: PeerHealthTracker::new(PeerHealthConfig {
@@ -279,7 +268,6 @@ impl RequestManager {
                 AtomicUsize::new(0),
                 AtomicUsize::new(0),
             ],
-            effective_concurrent: AtomicUsize::new(effective),
             config,
         }
     }
@@ -352,7 +340,6 @@ impl RequestManager {
     pub fn stats(&self) -> RequestManagerStats {
         RequestManagerStats {
             in_flight: self.in_flight.load(Ordering::Relaxed),
-            effective_concurrent: self.effective_concurrent.load(Ordering::Relaxed),
             max_concurrent: self.config.max_concurrent,
             global_success_rate: self.health.global_success_rate(),
             health_stats: self.health.stats(),
@@ -370,8 +357,6 @@ impl RequestManager {
 pub struct RequestManagerStats {
     /// Requests currently in flight.
     pub in_flight: usize,
-    /// Current effective concurrency limit.
-    pub effective_concurrent: usize,
     /// Maximum configured concurrency.
     pub max_concurrent: usize,
     /// Global success rate across all peers.
@@ -396,8 +381,5 @@ mod tests {
         assert_eq!(config.initial_backoff, Duration::from_millis(100));
         assert_eq!(config.max_backoff, Duration::from_millis(500));
         assert!((config.backoff_multiplier - 1.5).abs() < f64::EPSILON);
-        assert!((config.target_success_rate - 0.5).abs() < f64::EPSILON);
-        assert_eq!(config.min_concurrent, 8);
-        assert!(config.min_concurrent <= config.max_concurrent);
     }
 }
