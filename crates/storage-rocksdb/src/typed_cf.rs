@@ -131,6 +131,39 @@ impl DbEncode<StoredNodeKey> for JmtKeyCodec {
     }
 }
 
+/// Codec for `(u64, Hash)` composite key: `height_BE_8B ++ hash_32B`.
+/// Big-endian height ensures lexicographic ordering by height.
+#[derive(Default)]
+pub struct HeightHashCodec;
+
+impl DbEncode<(u64, Hash)> for HeightHashCodec {
+    fn encode_to(&self, value: &(u64, Hash), buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&value.0.to_be_bytes());
+        buf.extend_from_slice(value.1.as_bytes());
+    }
+}
+
+impl DbCodec<(u64, Hash)> for HeightHashCodec {
+    fn decode(&self, bytes: &[u8]) -> (u64, Hash) {
+        assert!(bytes.len() == 40, "HeightHash key must be 40 bytes");
+        let height = u64::from_be_bytes(bytes[..8].try_into().unwrap());
+        let hash = Hash::from_hash_bytes(&bytes[8..40]);
+        (height, hash)
+    }
+}
+
+/// Codec for `()` — empty value.
+#[derive(Default)]
+pub struct UnitCodec;
+
+impl DbEncode<()> for UnitCodec {
+    fn encode_to(&self, _value: &(), _buf: &mut Vec<u8>) {}
+}
+
+impl DbCodec<()> for UnitCodec {
+    fn decode(&self, _bytes: &[u8]) {}
+}
+
 // ─── TypedCf trait ────────────────────────────────────────────────────────────
 
 /// Trait for typed column family definitions.
