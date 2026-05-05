@@ -14,7 +14,10 @@ use sbor::{
 };
 
 use crate::sbor_codec::decode_bounded_bytes;
-use crate::{Hash, NodeId, TimestampRange, TxHash, shard_for_node};
+use crate::{
+    Hash, MAX_DECLARED_NODES_PER_TX, MAX_TX_BYTES_LEN, NodeId, TimestampRange, TxHash,
+    shard_for_node,
+};
 
 /// A transaction with routing information.
 ///
@@ -230,21 +233,6 @@ impl RoutableTransaction {
 // ============================================================================
 // Manual SBOR implementation since UserTransaction uses ManifestSbor
 // ============================================================================
-
-/// Cap on `tx_bytes` length at decode time.
-///
-/// Bounds the manifest payload a peer can pre-allocate via the SBOR `Vec<u8>`
-/// fast path. Realistic transactions sit comfortably below this; it exists
-/// to reject obviously malformed or oversized payloads early instead of
-/// admitting them and stressing mempool / commit pipelines.
-const MAX_TX_BYTES_LEN: usize = 256 * 1024;
-
-/// Cap on a transaction's declared read or write set length at decode time.
-///
-/// Each `NodeId` is 30 bytes; this cap leaves ~120 KB of declared-set
-/// allocation as the worst case. Tx authors with unusual access patterns
-/// have ample headroom; everything beyond is rejected.
-const MAX_DECLARED_NODES_PER_TX: usize = 4_096;
 
 fn decode_bounded_node_ids<D: Decoder<NoCustomValueKind>>(
     decoder: &mut D,

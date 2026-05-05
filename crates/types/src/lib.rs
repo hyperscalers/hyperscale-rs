@@ -73,6 +73,9 @@ pub use primitives::merkle::{
 };
 pub use primitives::signer_bitfield::SignerBitfield;
 pub use provisioning::batch::Provisions;
+pub use provisioning::limits::{
+    MAX_MERKLE_PROOF_LEN, MAX_STATE_ENTRY_KEY_LEN, MAX_STATE_ENTRY_VALUE_LEN,
+};
 pub use provisioning::proof::MerkleInclusionProof;
 pub use provisioning::state_entry::{StateEntry, StateProvision};
 pub use provisioning::tx_entries::TxEntries;
@@ -98,6 +101,7 @@ pub use topology::validator::{ValidatorInfo, ValidatorSet};
 pub use transaction::constructors::{
     routable_from_notarized_v1, routable_from_notarized_v2, routable_from_user_transaction,
 };
+pub use transaction::limits::{MAX_DECLARED_NODES_PER_TX, MAX_TX_BYTES_LEN};
 pub use transaction::notarize::{sign_and_notarize, sign_and_notarize_with_options};
 pub use transaction::routable::RoutableTransaction;
 pub use transaction::status::{

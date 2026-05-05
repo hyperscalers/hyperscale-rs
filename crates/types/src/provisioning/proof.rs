@@ -5,11 +5,7 @@ use sbor::{
     NoCustomTypeKind, NoCustomValueKind, RustTypeId, TypeData, TypeKind, ValueKind,
 };
 
-/// Cap on a serialized merkle proof at decode time. The proof grows roughly
-/// with `claim_count × tree_depth × hash_size`. With JMT decode-time caps
-/// of `10_000` claims and `100_000` sibling hashes (32 bytes each),
-/// legitimate proofs sit well under 4 MiB; we cap a touch above for headroom.
-const MAX_MERKLE_PROOF_LEN: usize = 4 * 1024 * 1024;
+use crate::MAX_MERKLE_PROOF_LEN;
 
 /// Merkle multiproof authenticating substates' inclusion in the JMT state tree.
 ///

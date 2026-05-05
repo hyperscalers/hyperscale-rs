@@ -9,24 +9,14 @@ use sbor::{
 };
 
 use crate::sbor_codec::decode_bounded_bytes;
-use crate::{BlockHeight, Hash, NodeId, ShardGroupId, TxHash};
+use crate::{
+    BlockHeight, Hash, MAX_STATE_ENTRY_KEY_LEN, MAX_STATE_ENTRY_VALUE_LEN, NodeId, ShardGroupId,
+    TxHash,
+};
 
 // ============================================================================
 // State entry types with pre-computed storage keys
 // ============================================================================
-
-/// Cap on the per-entry storage key length at decode time.
-///
-/// Real keys are `db_node_key` (50 bytes) + partition (1) + `sort_key` (≤ a
-/// few hundred bytes for any realistic substate). 4 KiB is well above any
-/// legitimate Radix substate key and rejects obviously oversized arrivals
-/// before allocation.
-const MAX_STATE_ENTRY_KEY_LEN: usize = 4 * 1024;
-
-/// Cap on a substate value length at decode time. Radix substates have an
-/// engine-side ceiling well below this; the cap exists to bound the SBOR
-/// `Vec<u8>` pre-allocation a peer can force on a single `value` field.
-const MAX_STATE_ENTRY_VALUE_LEN: usize = 1024 * 1024;
 
 /// A state entry with pre-computed storage key for fast engine lookup.
 ///
