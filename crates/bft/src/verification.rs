@@ -1124,7 +1124,7 @@ mod tests {
             shard_group_id: ShardGroupId(0),
             height,
             parent_block_hash,
-            parent_qc: QuorumCertificate::genesis(),
+            parent_qc: QuorumCertificate::genesis(ShardGroupId(0)),
             proposer: ValidatorId(0),
             timestamp: ProposerTimestamp(0),
             round: Round::INITIAL,
@@ -1162,6 +1162,7 @@ mod tests {
         pending: &'a HashMap<BlockHash, PendingBlock>,
     ) -> ChainView<'a> {
         ChainView {
+            local_shard: ShardGroupId(0),
             committed_height,
             committed_hash,
             committed_state_root: StateRoot::ZERO,
@@ -1204,7 +1205,7 @@ mod tests {
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
         let parent = bh(b"parent");
         let mut h = header(BlockHeight(5), parent, 0);
-        let mut parent_qc = QuorumCertificate::genesis();
+        let mut parent_qc = QuorumCertificate::genesis(ShardGroupId(0));
         parent_qc.height = BlockHeight(4);
         parent_qc.block_hash = parent;
         h.parent_qc = parent_qc;

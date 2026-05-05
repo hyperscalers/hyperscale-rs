@@ -83,7 +83,7 @@ mod tests {
         }
         let committed_header = Arc::new(CommittedBlockHeader::new(
             block.header().clone(),
-            QuorumCertificate::genesis(),
+            QuorumCertificate::genesis(ShardGroupId(0)),
         ));
         let _ = node.handle(ProtocolEvent::RemoteHeaderAdmitted { committed_header });
 

@@ -524,7 +524,7 @@ impl SimulationRunner {
                 // so the CertifiedBlock pairing invariant holds.
                 let genesis_qc = QuorumCertificate {
                     block_hash: genesis_block.hash(),
-                    ..QuorumCertificate::genesis()
+                    ..QuorumCertificate::genesis(ShardGroupId(0))
                 };
                 let genesis_certified =
                     CertifiedBlock::new_unchecked(genesis_block.clone(), genesis_qc);

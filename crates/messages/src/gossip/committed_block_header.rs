@@ -76,7 +76,7 @@ mod tests {
             shard_group_id: ShardGroupId(1),
             height: BlockHeight(42),
             parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            parent_qc: QuorumCertificate::genesis(),
+            parent_qc: QuorumCertificate::genesis(ShardGroupId(0)),
             proposer: ValidatorId(0),
             timestamp: ProposerTimestamp(1_234_567_890),
             round: Round::INITIAL,
@@ -90,7 +90,7 @@ mod tests {
             provision_tx_roots: BTreeMap::new(),
             in_flight: 0,
         };
-        let qc = QuorumCertificate::genesis();
+        let qc = QuorumCertificate::genesis(ShardGroupId(0));
 
         let gossip = CommittedBlockHeaderGossip {
             committed_header: CommittedBlockHeader::new(header, qc),

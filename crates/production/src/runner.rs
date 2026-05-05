@@ -639,7 +639,7 @@ impl ProductionRunner {
         // genesis so future blocks compute state_root from the correct base.
         let genesis_qc = QuorumCertificate {
             block_hash: genesis_block.hash(),
-            ..QuorumCertificate::genesis()
+            ..QuorumCertificate::genesis(ShardGroupId(0))
         };
         let genesis_certified = CertifiedBlock::new_unchecked(genesis_block, genesis_qc);
         let genesis_commit_output = io_loop.step(NodeInput::Protocol(Box::new(

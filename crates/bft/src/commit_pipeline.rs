@@ -89,12 +89,12 @@ impl CommitPipeline {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::{Hash, QuorumCertificate};
+    use hyperscale_types::{Hash, QuorumCertificate, ShardGroupId};
 
     use super::*;
 
     fn make_qc(height: u64) -> QuorumCertificate {
-        let mut qc = QuorumCertificate::genesis();
+        let mut qc = QuorumCertificate::genesis(ShardGroupId(0));
         qc.height = BlockHeight(height);
         qc
     }
@@ -165,13 +165,13 @@ mod tests {
 
 #[cfg(test)]
 mod properties {
-    use hyperscale_types::Hash;
+    use hyperscale_types::{Hash, ShardGroupId};
     use proptest::prelude::*;
 
     use super::*;
 
     fn make_qc(height: u64) -> QuorumCertificate {
-        let mut qc = QuorumCertificate::genesis();
+        let mut qc = QuorumCertificate::genesis(ShardGroupId(0));
         qc.height = BlockHeight(height);
         qc
     }

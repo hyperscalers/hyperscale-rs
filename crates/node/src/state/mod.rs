@@ -248,7 +248,8 @@ impl StateMachine for NodeStateMachine {
         };
 
         // Drain any state root verifications that became ready during this event.
-        for ready in self.bft.drain_ready_state_root_verifications() {
+        let local_shard = self.topology.snapshot().local_shard();
+        for ready in self.bft.drain_ready_state_root_verifications(local_shard) {
             actions.push(Action::VerifyStateRoot {
                 block_hash: ready.block_hash,
                 parent_block_hash: ready.parent_block_hash,

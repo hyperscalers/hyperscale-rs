@@ -730,7 +730,7 @@ mod tests {
             shard_group_id: ShardGroupId(0),
             height,
             parent_block_hash: BlockHash::from_raw(Hash::from_bytes(tag)),
-            parent_qc: QuorumCertificate::genesis(),
+            parent_qc: QuorumCertificate::genesis(ShardGroupId(0)),
             proposer: ValidatorId(0),
             timestamp: ProposerTimestamp(0),
             round: Round::INITIAL,
@@ -753,7 +753,7 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
         };
-        let mut qc = QuorumCertificate::genesis();
+        let mut qc = QuorumCertificate::genesis(ShardGroupId(0));
         qc.block_hash = block.hash();
         qc.height = height;
         CertifiedBlock::new_unchecked(block, qc)
@@ -1065,7 +1065,7 @@ mod tests {
     }
 
     fn qc_at(height: BlockHeight) -> QuorumCertificate {
-        let mut qc = QuorumCertificate::genesis();
+        let mut qc = QuorumCertificate::genesis(ShardGroupId(0));
         qc.height = height;
         qc.block_hash = BlockHash::from_raw(Hash::from_bytes(b"qc"));
         qc

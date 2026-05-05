@@ -143,7 +143,7 @@ impl BlockHeader {
             shard_group_id,
             height: BlockHeight(0),
             parent_block_hash: BlockHash::from_raw(Hash::from_bytes(&[0u8; 32])),
-            parent_qc: QuorumCertificate::genesis(),
+            parent_qc: QuorumCertificate::genesis(shard_group_id),
             proposer,
             timestamp: ProposerTimestamp::ZERO,
             round: Round::INITIAL,

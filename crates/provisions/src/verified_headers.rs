@@ -72,7 +72,7 @@ mod tests {
             shard_group_id: shard,
             height,
             parent_block_hash: BlockHash::ZERO,
-            parent_qc: QuorumCertificate::genesis(),
+            parent_qc: QuorumCertificate::genesis(ShardGroupId(0)),
             proposer: ValidatorId(0),
             timestamp: ProposerTimestamp(0),
             round: Round::INITIAL,
@@ -87,7 +87,7 @@ mod tests {
             in_flight: 0,
         };
         let header_hash = header.hash();
-        let mut qc = QuorumCertificate::genesis();
+        let mut qc = QuorumCertificate::genesis(ShardGroupId(0));
         qc.block_hash = header_hash;
         qc.shard_group_id = shard;
         qc.height = height;

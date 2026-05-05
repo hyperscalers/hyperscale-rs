@@ -30,7 +30,10 @@ impl NodeStateMachine {
     ) -> ProposalInputs {
         // Request extra transactions from the mempool to compensate for QC-chain
         // duplicates that will be filtered by BFT during proposal building.
-        let max_txs = self.bft.config().max_transactions_per_block + self.bft.dedup_overhead();
+        let max_txs = self.bft.config().max_transactions_per_block
+            + self
+                .bft
+                .dedup_overhead(self.topology.snapshot().local_shard());
         let ready_txs =
             self.mempool
                 .ready_transactions(max_txs, pending_txs, pending_certs, self.now);

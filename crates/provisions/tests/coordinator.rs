@@ -39,7 +39,7 @@ fn make_block(height: BlockHeight) -> CertifiedBlock {
     let qc = QuorumCertificate {
         block_hash: block.hash(),
         weighted_timestamp: WeightedTimestamp(height.0 * TEST_BLOCK_INTERVAL_MS),
-        ..QuorumCertificate::genesis()
+        ..QuorumCertificate::genesis(ShardGroupId(0))
     };
     CertifiedBlock::new_unchecked(block, qc)
 }
@@ -61,7 +61,7 @@ fn make_remote_header_targeting(
         shard_group_id: source_shard,
         height,
         parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
-        parent_qc: QuorumCertificate::genesis(),
+        parent_qc: QuorumCertificate::genesis(ShardGroupId(0)),
         proposer: ValidatorId(0),
         timestamp: ProposerTimestamp(1000 + height.0),
         round: Round::INITIAL,
@@ -76,7 +76,7 @@ fn make_remote_header_targeting(
         in_flight: 0,
     };
     let header_hash = header.hash();
-    let mut qc = QuorumCertificate::genesis();
+    let mut qc = QuorumCertificate::genesis(ShardGroupId(0));
     qc.block_hash = header_hash;
     qc.shard_group_id = source_shard;
     qc.height = height;

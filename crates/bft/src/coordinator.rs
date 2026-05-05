@@ -14,7 +14,8 @@
 
 use hyperscale_core::{Action, CommitSource, ProtocolEvent, TimerId};
 use hyperscale_types::{
-    BlockHash, LocalTimestamp, ProposerTimestamp, ProvisionHash, WaveId, WeightedTimestamp,
+    BlockHash, LocalTimestamp, ProposerTimestamp, ProvisionHash, ShardGroupId, WaveId,
+    WeightedTimestamp,
 };
 
 /// BFT statistics for monitoring.
@@ -280,9 +281,12 @@ impl BftCoordinator {
     }
 
     /// Borrow-view of the node's knowledge of the chain. Short-lived; see
-    /// [`ChainView`] for the lookup API.
-    const fn chain_view(&self) -> ChainView<'_> {
+    /// [`ChainView`] for the lookup API. `local_shard` (typically supplied
+    /// from the caller's `topology.local_shard()`) tags genesis-fallback
+    /// QCs produced by [`ChainView::proposal_parent`].
+    const fn chain_view(&self, local_shard: ShardGroupId) -> ChainView<'_> {
         ChainView {
+            local_shard,
             committed_height: self.committed_height,
             committed_hash: self.committed_hash,
             committed_state_root: self.committed_state_root,
@@ -311,15 +315,15 @@ impl BftCoordinator {
     /// When syncing:
     /// - Proposer will create empty "sync blocks" instead of skipping their turn
     /// - View changes are suppressed (we're intentionally behind)
-    fn set_block_syncing(&mut self, topology: &TopologySnapshot, syncing: bool) {
+    fn set_block_syncing(&mut self, topology_snapshot: &TopologySnapshot, syncing: bool) {
         if syncing && !self.block_sync.is_syncing() {
             info!(
-                validator = ?topology.local_validator_id(),
+                validator = ?topology_snapshot.local_validator_id(),
                 "Entering sync mode - will propose empty blocks if selected"
             );
         } else if !syncing && self.block_sync.is_syncing() {
             info!(
-                validator = ?topology.local_validator_id(),
+                validator = ?topology_snapshot.local_validator_id(),
                 "Exiting sync mode - resuming normal block production"
             );
             // Reset leader activity timeout since we've caught up
@@ -349,7 +353,7 @@ impl BftCoordinator {
     /// The syncing flag will be cleared when `Event::SyncComplete` arrives.
     fn start_block_sync(
         &mut self,
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         target_height: BlockHeight,
     ) -> Vec<Action> {
         // Don't raise the target while already syncing. The io_loop's
@@ -361,7 +365,7 @@ impl BftCoordinator {
         }
 
         info!(
-            validator = ?topology.local_validator_id(),
+            validator = ?topology_snapshot.local_validator_id(),
             target_height = target_height.0,
             committed_height = self.committed_height.0,
             "Starting sync - setting syncing flag and requesting blocks"
@@ -371,7 +375,7 @@ impl BftCoordinator {
         // - Enables sync block proposals if we're the proposer
         // - Suppresses fetch requests (check_pending_block_fetches returns empty)
         // - Signals to other code that we're catching up
-        self.set_block_syncing(topology, true);
+        self.set_block_syncing(topology_snapshot, true);
         self.block_sync.set_sync_target(target_height);
 
         vec![Action::StartBlockSync {
@@ -385,15 +389,15 @@ impl BftCoordinator {
     /// a submit dispatch or a buffer drain.
     pub fn on_sync_block_ready_to_apply(
         &mut self,
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         certified: CertifiedBlock,
     ) -> Vec<Action> {
         match self.block_sync.ingest(certified, self.committed_height) {
             IngestOutcome::Drop => vec![],
             IngestOutcome::Submit(certified) => {
-                self.submit_synced_block_for_verification(topology, *certified)
+                self.submit_synced_block_for_verification(topology_snapshot, *certified)
             }
-            IngestOutcome::Buffered => self.try_drain_buffered_synced_blocks(topology),
+            IngestOutcome::Buffered => self.try_drain_buffered_synced_blocks(topology_snapshot),
         }
     }
 
@@ -406,12 +410,12 @@ impl BftCoordinator {
     /// `NodeStateMachine` flushes expected remote headers and provisions in
     /// the same `BlockSyncComplete` arm, so this returns only BFT-local
     /// resume actions.
-    pub fn on_block_sync_complete(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
+    pub fn on_block_sync_complete(&mut self, topology_snapshot: &TopologySnapshot) -> Vec<Action> {
         info!(
-            validator = ?topology.local_validator_id(),
+            validator = ?topology_snapshot.local_validator_id(),
             "Sync complete, resuming normal consensus"
         );
-        self.set_block_syncing(topology, false);
+        self.set_block_syncing(topology_snapshot, false);
 
         // Resume fetching for any pending blocks that still need data.
         // During sync, check_pending_block_fetches() returns empty because we
@@ -419,7 +423,7 @@ impl BftCoordinator {
         // is done, we need to fetch any missing transactions/certificates.
         // Use force_immediate=true to bypass the age timeout — blocks received
         // during sync shouldn't wait another timeout period to be fetched.
-        self.check_pending_block_fetches(topology, true)
+        self.check_pending_block_fetches(topology_snapshot, true)
     }
 
     /// Record leader activity (resets the view change timeout).
@@ -516,7 +520,10 @@ impl BftCoordinator {
     ///
     /// If a view change occurs, the caller should NOT proceed to call
     /// `try_propose` in the same event handling cycle.
-    pub fn check_round_timeout(&mut self, topology: &TopologySnapshot) -> Option<Vec<Action>> {
+    pub fn check_round_timeout(
+        &mut self,
+        topology_snapshot: &TopologySnapshot,
+    ) -> Option<Vec<Action>> {
         if !self.should_advance_round() {
             return None;
         }
@@ -533,20 +540,20 @@ impl BftCoordinator {
             .saturating_sub(self.view_change.view_at_height_start.0);
 
         info!(
-            validator = ?topology.local_validator_id(),
+            validator = ?topology_snapshot.local_validator_id(),
             view = self.view_change.view.0,
             rounds_at_height = rounds_at_height,
             timeout_ms = timeout.as_millis(),
             "Round timeout - advancing round (implicit view change)"
         );
 
-        Some(self.advance_round(topology))
+        Some(self.advance_round(topology_snapshot))
     }
 
     /// Initialize with genesis block (for fresh start).
     pub fn initialize_genesis(
         &mut self,
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         genesis: &Block,
     ) -> Vec<Action> {
         let hash = genesis.hash();
@@ -560,7 +567,7 @@ impl BftCoordinator {
         self.view_change.record_leader_activity(self.now);
 
         info!(
-            validator = ?topology.local_validator_id(),
+            validator = ?topology_snapshot.local_validator_id(),
             genesis_hash = ?hash,
             "Initialized genesis block"
         );
@@ -583,9 +590,9 @@ impl BftCoordinator {
     ///
     /// Call this on startup to restore state from persistent storage.
     /// The runner will respond with `Event::CommittedStateRestored`.
-    pub fn request_recovery(&self, topology: &TopologySnapshot) -> Vec<Action> {
+    pub fn request_recovery(&self, topology_snapshot: &TopologySnapshot) -> Vec<Action> {
         info!(
-            validator = ?topology.local_validator_id(),
+            validator = ?topology_snapshot.local_validator_id(),
             "Requesting committed-state restoration"
         );
         vec![Action::RestoreCommittedState]
@@ -597,7 +604,7 @@ impl BftCoordinator {
     #[instrument(skip(self, qc), fields(height = height.0, has_hash = hash.is_some(), has_qc = qc.is_some()))]
     pub fn on_committed_state_restored(
         &mut self,
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         height: BlockHeight,
         hash: Option<BlockHash>,
         qc: Option<QuorumCertificate>,
@@ -605,7 +612,7 @@ impl BftCoordinator {
         if height.0 == 0 && hash.is_none() {
             // No committed blocks - this is a fresh start
             info!(
-                validator = ?topology.local_validator_id(),
+                validator = ?topology_snapshot.local_validator_id(),
                 "No committed blocks found - fresh start"
             );
             return vec![];
@@ -631,7 +638,7 @@ impl BftCoordinator {
         self.view_change.last_leader_activity = Some(self.now);
 
         info!(
-            validator = ?topology.local_validator_id(),
+            validator = ?topology_snapshot.local_validator_id(),
             committed_height = self.committed_height.0,
             committed_hash = ?self.committed_hash,
             has_qc,
@@ -674,7 +681,7 @@ impl BftCoordinator {
     ))]
     pub fn try_propose(
         &mut self,
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         ready_txs: &[Arc<RoutableTransaction>],
         finalized_waves: Vec<Arc<FinalizedWave>>,
         provisions: Vec<Arc<Provisions>>,
@@ -688,7 +695,7 @@ impl BftCoordinator {
             .map_or_else(|| self.committed_height.next(), |qc| qc.height.next());
         let round = self.view_change.view;
 
-        if !self.can_propose(topology, next_height, round) {
+        if !self.can_propose(topology_snapshot, next_height, round) {
             return vec![];
         }
 
@@ -696,14 +703,16 @@ impl BftCoordinator {
         // advancing while catching up on execution state.
         if self.block_sync.is_syncing() {
             return self.build_and_dispatch_proposal(
-                topology,
+                topology_snapshot,
                 next_height,
                 round,
                 ProposalKind::Sync,
             );
         }
 
-        let (parent_block_hash, parent_qc) = self.chain_view().proposal_parent();
+        let (parent_block_hash, parent_qc) = self
+            .chain_view(topology_snapshot.local_shard())
+            .proposal_parent();
 
         // Post-fallback recovery: if the parent is a fallback, propose an
         // empty block too. The QC on this block is what commits the parent
@@ -718,12 +727,12 @@ impl BftCoordinator {
         // so the rule doesn't recurse: the block after this one resumes
         // Normal proposals against pruned coordinator state.
         let parent_is_fallback = self
-            .chain_view()
+            .chain_view(topology_snapshot.local_shard())
             .get_header(parent_block_hash)
             .is_some_and(|h| h.is_fallback);
         if parent_is_fallback {
             return self.build_and_dispatch_proposal(
-                topology,
+                topology_snapshot,
                 next_height,
                 round,
                 ProposalKind::Normal {
@@ -741,7 +750,7 @@ impl BftCoordinator {
         // mempool doesn't clear its ready-set until commit, so we must dedup
         // here to avoid repeating items across consecutive blocks.
         let (qc_chain_cert_hashes, qc_chain_tx_hashes, qc_chain_provision_hashes) =
-            self.collect_qc_chain_hashes(parent_block_hash);
+            self.collect_qc_chain_hashes(topology_snapshot.local_shard(), parent_block_hash);
 
         // Anchor validity-window filtering on the parent QC's weighted
         // timestamp — the deterministic clock voters will use to verify
@@ -766,7 +775,7 @@ impl BftCoordinator {
         );
 
         self.build_and_dispatch_proposal(
-            topology,
+            topology_snapshot,
             next_height,
             round,
             ProposalKind::Normal {
@@ -785,11 +794,11 @@ impl BftCoordinator {
     /// voting for — so skip.
     fn can_propose(
         &self,
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         next_height: BlockHeight,
         round: Round,
     ) -> bool {
-        if !topology.should_propose(next_height, round) {
+        if !topology_snapshot.should_propose(next_height, round) {
             return false;
         }
 
@@ -798,7 +807,7 @@ impl BftCoordinator {
             && pending.round == round
         {
             trace!(
-                validator = ?topology.local_validator_id(),
+                validator = ?topology_snapshot.local_validator_id(),
                 height = next_height.0,
                 round = round.0,
                 "Proposal build already in-flight, skipping"
@@ -817,7 +826,7 @@ impl BftCoordinator {
             && deferred.round == round
         {
             trace!(
-                validator = ?topology.local_validator_id(),
+                validator = ?topology_snapshot.local_validator_id(),
                 height = next_height.0,
                 round = round.0,
                 "Proposal deferred pending parent tree, skipping"
@@ -839,11 +848,11 @@ impl BftCoordinator {
     /// consensus time across extended view changes. `is_fallback = true`.
     fn build_and_broadcast_fallback_block(
         &mut self,
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         height: BlockHeight,
         round: Round,
     ) -> Vec<Action> {
-        self.build_and_dispatch_proposal(topology, height, round, ProposalKind::Fallback)
+        self.build_and_dispatch_proposal(topology_snapshot, height, round, ProposalKind::Fallback)
     }
 
     /// Unified proposal build + dispatch.
@@ -854,16 +863,22 @@ impl BftCoordinator {
     /// verification pipeline when the parent JMT isn't ready yet).
     fn build_and_dispatch_proposal(
         &mut self,
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         height: BlockHeight,
         round: Round,
         kind: ProposalKind,
     ) -> Vec<Action> {
-        let plan =
-            assemble_build_action(topology, &self.chain_view(), height, round, self.now, kind);
+        let plan = assemble_build_action(
+            topology_snapshot,
+            &self.chain_view(topology_snapshot.local_shard()),
+            height,
+            round,
+            self.now,
+            kind,
+        );
 
         info!(
-            validator = ?topology.local_validator_id(),
+            validator = ?topology_snapshot.local_validator_id(),
             height = height.0,
             round = round.0,
             plan.log_label,
@@ -905,7 +920,7 @@ impl BftCoordinator {
     /// we already voted for this block at this height.
     fn repropose_locked_block(
         &mut self,
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         block_hash: BlockHash,
         height: BlockHeight,
     ) -> Vec<Action> {
@@ -916,7 +931,7 @@ impl BftCoordinator {
             // Block not in pending_blocks - might have been cleaned up or committed.
             // View change timer will handle further recovery.
             warn!(
-                validator = ?topology.local_validator_id(),
+                validator = ?topology_snapshot.local_validator_id(),
                 height = height.0,
                 block_hash = ?block_hash,
                 "Cannot re-propose: locked block not found in pending_blocks"
@@ -940,7 +955,7 @@ impl BftCoordinator {
         let manifest = pending.manifest().clone();
 
         info!(
-            validator = ?topology.local_validator_id(),
+            validator = ?topology_snapshot.local_validator_id(),
             height = height.0,
             original_round = original_round.0,
             block_hash = ?block_hash,
@@ -983,7 +998,7 @@ impl BftCoordinator {
     #[allow(clippy::too_many_arguments)]
     pub fn on_block_header(
         &mut self,
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         header: &BlockHeader,
         manifest: BlockManifest,
         lookup_tx: impl Fn(&TxHash) -> Option<Arc<RoutableTransaction>>,
@@ -995,7 +1010,7 @@ impl BftCoordinator {
         let round = header.round;
 
         debug!(
-            validator = ?topology.local_validator_id(),
+            validator = ?topology_snapshot.local_validator_id(),
             proposer = ?header.proposer,
             height = height.0,
             round = round.0,
@@ -1003,10 +1018,10 @@ impl BftCoordinator {
             "Received block header"
         );
 
-        let sync_actions = self.absorb_parent_qc_from_header(topology, header);
-        self.sync_view_to_header_round(topology, header);
+        let sync_actions = self.absorb_parent_qc_from_header(topology_snapshot, header);
+        self.sync_view_to_header_round(topology_snapshot, header);
 
-        if self.reject_invalid_header(topology, header) {
+        if self.reject_invalid_header(topology_snapshot, header) {
             return vec![];
         }
 
@@ -1024,10 +1039,12 @@ impl BftCoordinator {
             lookup_finalized_wave,
             lookup_provision,
         );
-        self.adopt_deferred_qc_if_matches(topology, block_hash);
+        self.adopt_deferred_qc_if_matches(topology_snapshot, block_hash);
         self.link_buffered_votes_to_header(block_hash, header);
 
-        let mut actions = self.votes.maybe_trigger_verification(topology, block_hash);
+        let mut actions = self
+            .votes
+            .maybe_trigger_verification(topology_snapshot, block_hash);
         actions.extend(sync_actions);
 
         // If vote verification was triggered, return those actions. Still want
@@ -1040,11 +1057,11 @@ impl BftCoordinator {
             return actions;
         }
 
-        if self.finalize_complete_block(topology, block_hash, &mut actions) {
+        if self.finalize_complete_block(topology_snapshot, block_hash, &mut actions) {
             return actions;
         }
 
-        self.log_incomplete_block(topology, block_hash);
+        self.log_incomplete_block(topology_snapshot, block_hash);
         actions
     }
 
@@ -1058,7 +1075,7 @@ impl BftCoordinator {
     /// consensus at the tip while catching up on historical blocks.
     fn absorb_parent_qc_from_header(
         &mut self,
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         header: &BlockHeader,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
@@ -1074,13 +1091,13 @@ impl BftCoordinator {
 
         if !have_parent {
             info!(
-                validator = ?topology.local_validator_id(),
+                validator = ?topology_snapshot.local_validator_id(),
                 committed_height = self.committed_height.0,
                 parent_height = parent_height.0,
                 target_height = parent_height.0,
                 "Missing parent block, triggering sync (continuing to process header)"
             );
-            actions = self.start_block_sync(topology, parent_height);
+            actions = self.start_block_sync(topology_snapshot, parent_height);
         }
 
         // Defer adoption until the BLS signature has been verified. Without
@@ -1095,7 +1112,7 @@ impl BftCoordinator {
                 .verification
                 .is_qc_verified(&header.parent_qc.block_hash)
         {
-            actions.extend(self.try_adopt_verified_qc(topology, &header.parent_qc));
+            actions.extend(self.try_adopt_verified_qc(topology_snapshot, &header.parent_qc));
         }
 
         actions
@@ -1108,7 +1125,7 @@ impl BftCoordinator {
     /// and [`Self::on_qc_signature_verified`] for the post-verify entry.
     fn try_adopt_verified_qc(
         &mut self,
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         qc: &QuorumCertificate,
     ) -> Vec<Action> {
         let advances = self
@@ -1119,27 +1136,31 @@ impl BftCoordinator {
             return Vec::new();
         }
         debug!(
-            validator = ?topology.local_validator_id(),
+            validator = ?topology_snapshot.local_validator_id(),
             qc_height = qc.height.0,
             "Adopted verified parent QC"
         );
         self.latest_qc = Some(qc.clone());
-        self.maybe_unlock_for_qc(topology, qc);
+        self.maybe_unlock_for_qc(topology_snapshot, qc);
         // Non-proposers learn about QCs via block headers rather than
         // forming them locally — they need two-chain commit + a proposal
         // kick to advance the chain in the event-driven model.
-        let actions = self.try_two_chain_commit(topology, qc, CommitSource::Header);
+        let actions = self.try_two_chain_commit(topology_snapshot, qc, CommitSource::Header);
         self.queue_ready_proposal();
         actions
     }
 
     /// Advance the local view to the header's round if the header is ahead,
     /// so late joiners converge faster than QC-based view sync alone.
-    fn sync_view_to_header_round(&mut self, topology: &TopologySnapshot, header: &BlockHeader) {
+    fn sync_view_to_header_round(
+        &mut self,
+        topology_snapshot: &TopologySnapshot,
+        header: &BlockHeader,
+    ) {
         let old_view = self.view_change.view;
         if self.view_change.sync_to_qc_round(header.round) {
             info!(
-                validator = ?topology.local_validator_id(),
+                validator = ?topology_snapshot.local_validator_id(),
                 old_view = old_view.0,
                 new_view = header.round.0,
                 header_height = header.height.0,
@@ -1150,16 +1171,20 @@ impl BftCoordinator {
 
     /// Validate the header; logs and returns `true` if the caller should
     /// reject (short-circuit with empty actions).
-    fn reject_invalid_header(&self, topology: &TopologySnapshot, header: &BlockHeader) -> bool {
+    fn reject_invalid_header(
+        &self,
+        topology_snapshot: &TopologySnapshot,
+        header: &BlockHeader,
+    ) -> bool {
         if let Err(e) = validate_header(
-            topology,
+            topology_snapshot,
             header,
             self.committed_height,
             &self.config,
             self.now,
         ) {
             warn!(
-                validator = ?topology.local_validator_id(),
+                validator = ?topology_snapshot.local_validator_id(),
                 error = %e,
                 "Invalid block header"
             );
@@ -1222,7 +1247,11 @@ impl BftCoordinator {
     /// (votes arrived before this header), adopt it now. Latches a
     /// proposal-retry on adoption. If the deferred QC is for a different
     /// block, it's put back.
-    fn adopt_deferred_qc_if_matches(&mut self, topology: &TopologySnapshot, block_hash: BlockHash) {
+    fn adopt_deferred_qc_if_matches(
+        &mut self,
+        topology_snapshot: &TopologySnapshot,
+        block_hash: BlockHash,
+    ) {
         let Some((deferred_hash, deferred_qc)) = self.deferred_qc.take() else {
             return;
         };
@@ -1238,7 +1267,7 @@ impl BftCoordinator {
             .is_none_or(|existing| deferred_qc.height.0 > existing.height.0);
         if should_adopt {
             self.latest_qc = Some(deferred_qc.clone());
-            self.maybe_unlock_for_qc(topology, &deferred_qc);
+            self.maybe_unlock_for_qc(topology_snapshot, &deferred_qc);
             self.queue_ready_proposal();
         }
     }
@@ -1261,7 +1290,7 @@ impl BftCoordinator {
     /// caller should return the accumulated actions).
     fn finalize_complete_block(
         &mut self,
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         block_hash: BlockHash,
         actions: &mut Vec<Action>,
     ) -> bool {
@@ -1281,7 +1310,7 @@ impl BftCoordinator {
             return true;
         }
 
-        actions.extend(self.trigger_qc_verification_or_vote(topology, block_hash));
+        actions.extend(self.trigger_qc_verification_or_vote(topology_snapshot, block_hash));
         true
     }
 
@@ -1289,10 +1318,10 @@ impl BftCoordinator {
     /// `check_pending_block_fetches()` will eventually emit fetch requests;
     /// deferring here avoids unnecessary traffic when gossip or local cert
     /// creation fills in the data.
-    fn log_incomplete_block(&self, topology: &TopologySnapshot, block_hash: BlockHash) {
+    fn log_incomplete_block(&self, topology_snapshot: &TopologySnapshot, block_hash: BlockHash) {
         if let Some(pending) = self.pending_blocks.get(&block_hash) {
             debug!(
-                validator = ?topology.local_validator_id(),
+                validator = ?topology_snapshot.local_validator_id(),
                 block_hash = ?block_hash,
                 missing_txs = pending.missing_transaction_count(),
                 missing_waves = pending.missing_wave_count(),
@@ -1312,7 +1341,7 @@ impl BftCoordinator {
     /// QC signatures are always verified before voting.
     fn trigger_qc_verification_or_vote(
         &mut self,
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         block_hash: BlockHash,
     ) -> Vec<Action> {
         let Some(pending) = self.pending_blocks.get(&block_hash) else {
@@ -1341,7 +1370,7 @@ impl BftCoordinator {
                     block_hash = ?block_hash,
                     "QC already verified, skipping re-verification"
                 );
-                return self.try_vote_on_block(topology, block_hash, height, round);
+                return self.try_vote_on_block(topology_snapshot, block_hash, height, round);
             }
 
             // Check if we already have pending verification for this block
@@ -1351,7 +1380,7 @@ impl BftCoordinator {
             }
 
             // Collect public keys for verification
-            let Some(public_keys) = committee_public_keys(topology) else {
+            let Some(public_keys) = committee_public_keys(topology_snapshot) else {
                 warn!("Failed to collect public keys for QC verification");
                 return vec![];
             };
@@ -1369,7 +1398,7 @@ impl BftCoordinator {
         }
 
         // Genesis QC - vote directly (no signature to verify)
-        self.try_vote_on_block(topology, block_hash, height, round)
+        self.try_vote_on_block(topology_snapshot, block_hash, height, round)
     }
 
     /// Try to vote on a block after it's complete and QC is verified.
@@ -1378,7 +1407,7 @@ impl BftCoordinator {
     /// For the main entry point, use `trigger_qc_verification_or_vote`.
     fn try_vote_on_block(
         &mut self,
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         block_hash: BlockHash,
         height: BlockHeight,
         round: Round,
@@ -1389,7 +1418,7 @@ impl BftCoordinator {
         let vote_locked = match self.votes.lock_decision(height, block_hash) {
             LockDecision::AlreadyVotedSameBlock { existing_round } => {
                 trace!(
-                    validator = ?topology.local_validator_id(),
+                    validator = ?topology_snapshot.local_validator_id(),
                     block_hash = ?block_hash,
                     height = height.0,
                     round = round.0,
@@ -1408,7 +1437,7 @@ impl BftCoordinator {
                 // QC formed by other validators. Expected during view changes —
                 // BFT safety working correctly, not a violation.
                 warn!(
-                    validator = ?topology.local_validator_id(),
+                    validator = ?topology_snapshot.local_validator_id(),
                     existing = ?existing_block,
                     existing_round = existing_round.0,
                     new = ?block_hash,
@@ -1429,7 +1458,7 @@ impl BftCoordinator {
             .get(&block_hash)
             .and_then(PendingBlock::block)
         {
-            if self.reject_invalid_block_contents(topology, block_hash, &block) {
+            if self.reject_invalid_block_contents(topology_snapshot, block_hash, &block) {
                 return vec![];
             }
 
@@ -1437,6 +1466,7 @@ impl BftCoordinator {
             // PreparedCommit. Parent-pruned blocks likewise run verification
             // but can't contribute in-flight accounting.
             let chain = ChainView {
+                local_shard: topology_snapshot.local_shard(),
                 committed_height: self.committed_height,
                 committed_hash: self.committed_hash,
                 committed_state_root: self.committed_state_root,
@@ -1457,7 +1487,7 @@ impl BftCoordinator {
             };
 
             let verification_actions = self.verification.initiate_block_verifications(
-                topology,
+                topology_snapshot,
                 &self.pending_blocks,
                 block_hash,
                 &block,
@@ -1478,7 +1508,7 @@ impl BftCoordinator {
             return vec![];
         }
 
-        self.create_vote(topology, block_hash, height, round)
+        self.create_vote(topology_snapshot, block_hash, height, round)
     }
 
     /// Validate transaction ordering, waves, and cross-ancestor tx uniqueness
@@ -1486,14 +1516,17 @@ impl BftCoordinator {
     /// should reject the block (logs the reason).
     fn reject_invalid_block_contents(
         &self,
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         block_hash: BlockHash,
         block: &Block,
     ) -> bool {
-        let (qc_chain_cert_ids, qc_chain_tx_hashes, qc_chain_provision_hashes) =
-            self.collect_qc_chain_hashes(block.header().parent_block_hash);
+        let (qc_chain_cert_ids, qc_chain_tx_hashes, qc_chain_provision_hashes) = self
+            .collect_qc_chain_hashes(
+                topology_snapshot.local_shard(),
+                block.header().parent_block_hash,
+            );
         if let Err(e) = validate_block_for_vote(
-            topology,
+            topology_snapshot,
             block,
             &qc_chain_tx_hashes,
             &qc_chain_cert_ids,
@@ -1501,7 +1534,7 @@ impl BftCoordinator {
             &self.dedup_index,
         ) {
             warn!(
-                validator = ?topology.local_validator_id(),
+                validator = ?topology_snapshot.local_validator_id(),
                 block_hash = ?block_hash,
                 error = %e,
                 "Block failed pre-vote validation - not voting"
@@ -1519,7 +1552,7 @@ impl BftCoordinator {
     ))]
     fn create_vote(
         &mut self,
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         block_hash: BlockHash,
         height: BlockHeight,
         round: Round,
@@ -1540,14 +1573,14 @@ impl BftCoordinator {
         let timestamp = ProposerTimestamp::from_local(self.now);
 
         debug!(
-            validator = ?topology.local_validator_id(),
+            validator = ?topology_snapshot.local_validator_id(),
             height = height.0,
             round = round.0,
             block_hash = ?block_hash,
             "Emitting vote (signing delegated to crypto pool)"
         );
 
-        let next_proposers = vote_recipients(topology, height, round);
+        let next_proposers = vote_recipients(topology_snapshot, height, round);
 
         // Emit SignAndBroadcastBlockVote — the io_loop signs on the consensus
         // crypto pool, broadcasts, and feeds the signed vote back for local
@@ -1578,15 +1611,19 @@ impl BftCoordinator {
         voter = ?vote.voter,
         block_hash = ?vote.block_hash
     ))]
-    pub fn on_block_vote(&mut self, topology: &TopologySnapshot, vote: BlockVote) -> Vec<Action> {
+    pub fn on_block_vote(
+        &mut self,
+        topology_snapshot: &TopologySnapshot,
+        vote: BlockVote,
+    ) -> Vec<Action> {
         trace!(
-            validator = ?topology.local_validator_id(),
+            validator = ?topology_snapshot.local_validator_id(),
             voter = ?vote.voter,
             block_hash = ?vote.block_hash,
             "Received block vote"
         );
 
-        self.on_block_vote_internal(topology, vote)
+        self.on_block_vote_internal(topology_snapshot, vote)
     }
 
     /// Internal vote processing. Delegates to [`VoteKeeper::accept_vote`]
@@ -1594,15 +1631,19 @@ impl BftCoordinator {
     /// fires batch verification once quorum is reachable.
     fn on_block_vote_internal(
         &mut self,
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         vote: BlockVote,
     ) -> Vec<Action> {
         let header_for_vote = self
             .pending_blocks
             .get(&vote.block_hash)
             .map(PendingBlock::header);
-        self.votes
-            .accept_vote(topology, vote, self.committed_height, header_for_vote)
+        self.votes.accept_vote(
+            topology_snapshot,
+            vote,
+            self.committed_height,
+            header_for_vote,
+        )
     }
 
     /// Handle QC verification and building result.
@@ -1619,7 +1660,7 @@ impl BftCoordinator {
     ))]
     pub fn on_qc_result(
         &mut self,
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         block_hash: BlockHash,
         qc: Option<QuorumCertificate>,
         verified_votes: Vec<(usize, BlockVote, u64)>,
@@ -1639,7 +1680,7 @@ impl BftCoordinator {
 
         // Per-vote: view sync + equivocation tracking. Tracking runs only on
         // verified votes so a forged vote can't pre-empt a legitimate one.
-        let validator_id = topology.local_validator_id();
+        let validator_id = topology_snapshot.local_validator_id();
         for (_, vote, _) in &verified_votes {
             let old_view = self.view_change.view;
             if self.view_change.sync_to_qc_round(vote.round) {
@@ -1657,7 +1698,8 @@ impl BftCoordinator {
 
         self.votes
             .finalize_pending_batch(block_hash, verified_votes);
-        self.votes.maybe_trigger_verification(topology, block_hash)
+        self.votes
+            .maybe_trigger_verification(topology_snapshot, block_hash)
     }
 
     /// Handle QC signature verification result.
@@ -1667,7 +1709,7 @@ impl BftCoordinator {
     #[instrument(skip(self), fields(block_hash = ?block_hash, valid = valid))]
     pub fn on_qc_signature_verified(
         &mut self,
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         block_hash: BlockHash,
         valid: bool,
     ) -> Vec<Action> {
@@ -1685,7 +1727,7 @@ impl BftCoordinator {
                 // The failed block creates a gap that blocks further progress,
                 // but blocks already verified at lower heights can still apply.
                 BlockSyncVerificationResult::Failed | BlockSyncVerificationResult::Verified => {
-                    self.try_apply_verified_synced_blocks(topology)
+                    self.try_apply_verified_synced_blocks(topology_snapshot)
                 }
             };
         }
@@ -1730,13 +1772,13 @@ impl BftCoordinator {
         // commit-related state, not the per-block voting machinery.
         let mut actions = Vec::new();
         if self.has_complete_block_at_height(header.parent_qc.height) {
-            actions.extend(self.try_adopt_verified_qc(topology, &header.parent_qc));
+            actions.extend(self.try_adopt_verified_qc(topology_snapshot, &header.parent_qc));
         }
 
         // QC is valid - proceed to vote on the block
         let height = header.height;
         let round = header.round;
-        actions.extend(self.try_vote_on_block(topology, block_hash, height, round));
+        actions.extend(self.try_vote_on_block(topology_snapshot, block_hash, height, round));
         actions
     }
 
@@ -1752,7 +1794,7 @@ impl BftCoordinator {
     #[instrument(skip(self), fields(block_hash = ?block_hash, ?kind, valid = valid))]
     pub fn on_block_root_verified(
         &mut self,
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         kind: VerificationKind,
         block_hash: BlockHash,
         valid: bool,
@@ -1800,7 +1842,7 @@ impl BftCoordinator {
         let height = pending_block.header().height;
         let round = pending_block.header().round;
 
-        self.create_vote(topology, block_hash, height, round)
+        self.create_vote(topology_snapshot, block_hash, height, round)
     }
 
     /// Handle proposal built by the runner.
@@ -1812,7 +1854,7 @@ impl BftCoordinator {
     #[allow(clippy::too_many_arguments)]
     pub fn on_proposal_built(
         &mut self,
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         height: BlockHeight,
         round: Round,
         block: &Block,
@@ -1850,7 +1892,7 @@ impl BftCoordinator {
 
         let total_tx_count = pending_block.transaction_count();
         info!(
-            validator = ?topology.local_validator_id(),
+            validator = ?topology_snapshot.local_validator_id(),
             height = height.0,
             round = round.0,
             block_hash = ?block_hash,
@@ -1882,7 +1924,7 @@ impl BftCoordinator {
         }];
 
         // Vote for our own block
-        actions.extend(self.create_vote(topology, block_hash, height, round));
+        actions.extend(self.create_vote(topology_snapshot, block_hash, height, round));
 
         actions
     }
@@ -1903,7 +1945,7 @@ impl BftCoordinator {
     /// sync target.
     pub fn on_block_persisted(
         &mut self,
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         block_height: BlockHeight,
     ) -> Vec<Action> {
         self.verification.on_block_persisted(block_height);
@@ -1915,7 +1957,7 @@ impl BftCoordinator {
             && let Some(target) = self.block_sync.sync_target_height()
             && block_height >= target
         {
-            return self.on_block_sync_complete(topology);
+            return self.on_block_sync_complete(topology_snapshot);
         }
         vec![]
     }
@@ -2026,7 +2068,7 @@ impl BftCoordinator {
     #[allow(clippy::too_many_arguments)]
     pub fn on_qc_formed(
         &mut self,
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         block_hash: BlockHash,
         qc: &QuorumCertificate,
         ready_txs: &[Arc<RoutableTransaction>],
@@ -2036,7 +2078,7 @@ impl BftCoordinator {
         let height = qc.height;
 
         info!(
-            validator = ?topology.local_validator_id(),
+            validator = ?topology_snapshot.local_validator_id(),
             block_hash = ?block_hash,
             height = height.0,
             "QC formed"
@@ -2054,9 +2096,13 @@ impl BftCoordinator {
         if should_update {
             // Defer adoption if the header isn't in memory yet — we need it
             // to look up parent_state_root / parent_in_flight at proposal time.
-            if self.chain_view().get_header(block_hash).is_some() {
+            if self
+                .chain_view(topology_snapshot.local_shard())
+                .get_header(block_hash)
+                .is_some()
+            {
                 self.latest_qc = Some(qc.clone());
-                self.maybe_unlock_for_qc(topology, qc);
+                self.maybe_unlock_for_qc(topology_snapshot, qc);
             } else {
                 debug!(
                     block_hash = ?block_hash,
@@ -2073,13 +2119,13 @@ impl BftCoordinator {
             duration: self.current_view_change_timeout(),
         }];
 
-        actions.extend(self.try_two_chain_commit(topology, qc, CommitSource::Aggregator));
+        actions.extend(self.try_two_chain_commit(topology_snapshot, qc, CommitSource::Aggregator));
 
         // Propose the next block immediately — under the 2-chain commit rule,
         // block N+1 is what certifies block N, so any gap in proposing N+1
         // stalls the finalization of N and everything pending behind it.
         // `try_propose` handles the should_propose / backpressure checks.
-        actions.extend(self.try_propose(topology, ready_txs, finalized_waves, provisions));
+        actions.extend(self.try_propose(topology_snapshot, ready_txs, finalized_waves, provisions));
 
         actions
     }
@@ -2092,7 +2138,7 @@ impl BftCoordinator {
     /// they received votes directly.
     fn try_two_chain_commit(
         &self,
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         qc: &QuorumCertificate,
         source: CommitSource,
     ) -> Vec<Action> {
@@ -2119,7 +2165,7 @@ impl BftCoordinator {
                 self.commits.certified_blocks.get(&block_hash).map_or_else(
                     || {
                         warn!(
-                            validator = ?topology.local_validator_id(),
+                            validator = ?topology_snapshot.local_validator_id(),
                             block_hash = ?block_hash,
                             committable_hash = ?committable_hash,
                             "Cannot find block to extract certifying QC for committable block"
@@ -2146,7 +2192,7 @@ impl BftCoordinator {
     ))]
     pub fn on_block_ready_to_commit(
         &mut self,
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         block_hash: BlockHash,
         qc: QuorumCertificate,
         source: CommitSource,
@@ -2165,7 +2211,7 @@ impl BftCoordinator {
                 // Only buffer if not already committed
                 if height > self.committed_height {
                     debug!(
-                        validator = ?topology.local_validator_id(),
+                        validator = ?topology_snapshot.local_validator_id(),
                         block_hash = ?block_hash,
                         height = height.0,
                         missing_txs = pending.missing_transaction_count(),
@@ -2180,7 +2226,7 @@ impl BftCoordinator {
                 // Block not in pending_blocks - check if it's in certified_blocks
                 let in_certified = self.commits.certified_blocks.contains_key(&block_hash);
                 warn!(
-                    validator = ?topology.local_validator_id(),
+                    validator = ?topology_snapshot.local_validator_id(),
                     block_hash = ?block_hash,
                     qc_height = qc.height.0,
                     committed_height = self.committed_height.0,
@@ -2220,7 +2266,7 @@ impl BftCoordinator {
         }
 
         // Commit this block and any buffered subsequent blocks
-        self.commit_block_and_buffered(topology, block_hash, qc, source)
+        self.commit_block_and_buffered(topology_snapshot, block_hash, qc, source)
     }
 
     /// Check if a block that just became complete has a pending commit waiting for it.
@@ -2230,17 +2276,17 @@ impl BftCoordinator {
     /// checks that buffer and retries the commit now that the block is complete.
     fn try_commit_pending_data(
         &mut self,
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         block_hash: BlockHash,
     ) -> Vec<Action> {
         if let Some((height, qc, source)) = self.commits.take_awaiting_data(&block_hash) {
             info!(
-                validator = ?topology.local_validator_id(),
+                validator = ?topology_snapshot.local_validator_id(),
                 block_hash = ?block_hash,
                 height = height.0,
                 "Retrying commit after block data arrived"
             );
-            self.on_block_ready_to_commit(topology, block_hash, qc, source)
+            self.on_block_ready_to_commit(topology_snapshot, block_hash, qc, source)
         } else {
             vec![]
         }
@@ -2291,7 +2337,7 @@ impl BftCoordinator {
     /// exists.
     fn commit_block_and_buffered(
         &mut self,
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         block_hash: BlockHash,
         certifying_qc: QuorumCertificate,
         source: CommitSource,
@@ -2301,7 +2347,7 @@ impl BftCoordinator {
 
         while let Some((hash, qc, source)) = next.take() {
             let Some(committed_height) =
-                self.commit_one_buffered_block(topology, hash, qc, source, &mut actions)
+                self.commit_one_buffered_block(topology_snapshot, hash, qc, source, &mut actions)
             else {
                 break;
             };
@@ -2318,7 +2364,7 @@ impl BftCoordinator {
 
         // Consensus may have unblocked synced blocks that were waiting for a
         // predecessor — try to drain them now.
-        actions.extend(self.try_drain_buffered_synced_blocks(topology));
+        actions.extend(self.try_drain_buffered_synced_blocks(topology_snapshot));
 
         actions
     }
@@ -2333,7 +2379,7 @@ impl BftCoordinator {
     /// caller should stop driving the chain.
     fn commit_one_buffered_block(
         &mut self,
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         block_hash: BlockHash,
         qc: QuorumCertificate,
         source: CommitSource,
@@ -2365,7 +2411,7 @@ impl BftCoordinator {
         }
 
         info!(
-            validator = ?topology.local_validator_id(),
+            validator = ?topology_snapshot.local_validator_id(),
             height = height.0,
             block_hash = ?block_hash,
             transactions = block.transactions().len(),
@@ -2403,7 +2449,7 @@ impl BftCoordinator {
         // Other validators rely on receiving it via gossip propagation. If the
         // proposer is Byzantine/slow, the RemoteHeaderCoordinator will detect
         // the liveness timeout and trigger a fallback fetch.
-        if block.header().proposer == topology.local_validator_id() {
+        if block.header().proposer == topology_snapshot.local_validator_id() {
             let committed_header = CommittedBlockHeader::new(block.header().clone(), qc);
             actions.push(Action::BroadcastCommittedBlockHeader { committed_header });
         }
@@ -2417,7 +2463,7 @@ impl BftCoordinator {
     /// via a `VerifyQcSignature` action.
     fn submit_synced_block_for_verification(
         &mut self,
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         certified: CertifiedBlock,
     ) -> Vec<Action> {
         if certified.qc.is_genesis() {
@@ -2425,7 +2471,7 @@ impl BftCoordinator {
                 height = certified.block.height().0,
                 "Synced block has genesis QC, applying directly"
             );
-            return self.apply_synced_block(topology, certified);
+            return self.apply_synced_block(topology_snapshot, certified);
         }
 
         // Quorum-power gate: `VerifyQcSignature` only checks the BLS
@@ -2433,7 +2479,7 @@ impl BftCoordinator {
         // power. Without this check a single Byzantine signer suffices to
         // pass and fork the local chain. Mirrors the consensus-path gate
         // in `validate_header`.
-        if !qc_has_local_quorum_power(topology, &certified.qc) {
+        if !qc_has_local_quorum_power(topology_snapshot, &certified.qc) {
             warn!(
                 height = certified.block.height().0,
                 signers = certified.qc.signers.count(),
@@ -2442,7 +2488,7 @@ impl BftCoordinator {
             return vec![];
         }
 
-        let Some(public_keys) = committee_public_keys(topology) else {
+        let Some(public_keys) = committee_public_keys(topology_snapshot) else {
             warn!("Failed to collect public keys for synced block QC verification");
             return vec![];
         };
@@ -2456,14 +2502,17 @@ impl BftCoordinator {
     /// Try to drain buffered synced blocks in sequential order. Asks
     /// [`BlockSyncManager::next_submitable`] which blocks are eligible — the
     /// coordinator just dispatches each for QC verification.
-    fn try_drain_buffered_synced_blocks(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
+    fn try_drain_buffered_synced_blocks(
+        &mut self,
+        topology_snapshot: &TopologySnapshot,
+    ) -> Vec<Action> {
         let mut actions = Vec::new();
         let blocks = self.block_sync.next_submitable(
             self.committed_height,
             self.config.max_parallel_sync_verifications,
         );
         for certified in blocks {
-            actions.extend(self.submit_synced_block_for_verification(topology, certified));
+            actions.extend(self.submit_synced_block_for_verification(topology_snapshot, certified));
         }
         actions
     }
@@ -2478,7 +2527,7 @@ impl BftCoordinator {
     /// `PreparedCommit` rendezvous to coordinate.
     fn apply_synced_block(
         &mut self,
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         certified: CertifiedBlock,
     ) -> Vec<Action> {
         let CertifiedBlock { block, qc } = certified;
@@ -2486,7 +2535,7 @@ impl BftCoordinator {
         let height = block.height();
 
         info!(
-            validator = ?topology.local_validator_id(),
+            validator = ?topology_snapshot.local_validator_id(),
             height = height.0,
             block_hash = ?block_hash,
             transactions = block.transactions().len(),
@@ -2496,7 +2545,7 @@ impl BftCoordinator {
 
         // Capture parent state BEFORE record_block_committed advances heights.
         let parent_state_root = self
-            .chain_view()
+            .chain_view(topology_snapshot.local_shard())
             .parent_state_root(block.header().parent_block_hash);
         let parent_block_height = self.committed_height;
 
@@ -2514,7 +2563,7 @@ impl BftCoordinator {
             .is_none_or(|existing| qc.height.0 > existing.height.0)
         {
             self.latest_qc = Some(qc.clone());
-            self.maybe_unlock_for_qc(topology, &qc);
+            self.maybe_unlock_for_qc(topology_snapshot, &qc);
         }
 
         // Adopt the parent_qc from the block header if it's newer still.
@@ -2525,7 +2574,7 @@ impl BftCoordinator {
                 .is_none_or(|existing| block.header().parent_qc.height.0 > existing.height.0)
         {
             self.latest_qc = Some(block.header().parent_qc.clone());
-            self.maybe_unlock_for_qc(topology, &block.header().parent_qc);
+            self.maybe_unlock_for_qc(topology_snapshot, &block.header().parent_qc);
         }
 
         let mut actions = vec![Action::CommitBlockByQcOnly {
@@ -2555,12 +2604,15 @@ impl BftCoordinator {
     /// for further parallel QC verifications. The sync manager computes the
     /// next expected height from its own applied-height marker so we don't
     /// double-apply blocks already handed off.
-    fn try_apply_verified_synced_blocks(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
+    fn try_apply_verified_synced_blocks(
+        &mut self,
+        topology_snapshot: &TopologySnapshot,
+    ) -> Vec<Action> {
         let mut actions = Vec::new();
         while let Some(certified) = self.block_sync.take_next_verified(self.committed_height) {
-            actions.extend(self.apply_synced_block(topology, certified));
+            actions.extend(self.apply_synced_block(topology_snapshot, certified));
         }
-        actions.extend(self.try_drain_buffered_synced_blocks(topology));
+        actions.extend(self.try_drain_buffered_synced_blocks(topology_snapshot));
         actions
     }
 
@@ -2578,7 +2630,7 @@ impl BftCoordinator {
     ///
     /// Returns actions to propose if we're the new proposer.
     #[instrument(skip(self), fields(new_round = self.view_change.view.0 + 1))]
-    fn advance_round(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
+    fn advance_round(&mut self, topology_snapshot: &TopologySnapshot) -> Vec<Action> {
         // The next height to propose is one above the highest certified block,
         // NOT one above the committed block. This matches try_propose behavior.
         let height = self
@@ -2595,7 +2647,7 @@ impl BftCoordinator {
         self.proposal.clear();
 
         info!(
-            validator = ?topology.local_validator_id(),
+            validator = ?topology_snapshot.local_validator_id(),
             height = height.0,
             old_round = old_round.0,
             new_round = self.view_change.view.0,
@@ -2639,7 +2691,7 @@ impl BftCoordinator {
 
             if had_vote || cleared_votes > 0 {
                 info!(
-                    validator = ?topology.local_validator_id(),
+                    validator = ?topology_snapshot.local_validator_id(),
                     height = height.0,
                     new_round = self.view_change.view.0,
                     latest_qc_height = latest_qc_height.0,
@@ -2659,31 +2711,35 @@ impl BftCoordinator {
         };
 
         // Check if we're the new proposer for this height/round
-        if topology.should_propose(height, self.view_change.view) {
+        if topology_snapshot.should_propose(height, self.view_change.view) {
             // Check if we've already voted at this height - if so, we're locked
             if let Some(existing_hash) = self.votes.locked_block(height) {
                 info!(
-                    validator = ?topology.local_validator_id(),
+                    validator = ?topology_snapshot.local_validator_id(),
                     height = height.0,
                     new_round = self.view_change.view.0,
                     existing_block = ?existing_hash,
                     "Vote-locked at this height, re-proposing"
                 );
-                let mut actions = self.repropose_locked_block(topology, existing_hash, height);
+                let mut actions =
+                    self.repropose_locked_block(topology_snapshot, existing_hash, height);
                 actions.push(timer);
                 return actions;
             }
 
             info!(
-                validator = ?topology.local_validator_id(),
+                validator = ?topology_snapshot.local_validator_id(),
                 height = height.0,
                 new_round = self.view_change.view.0,
                 "We are the new proposer after round advance - building block"
             );
 
             // Build and broadcast a new block (use fallback block builder)
-            let mut actions =
-                self.build_and_broadcast_fallback_block(topology, height, self.view_change.view);
+            let mut actions = self.build_and_broadcast_fallback_block(
+                topology_snapshot,
+                height,
+                self.view_change.view,
+            );
             actions.push(timer);
             return actions;
         }
@@ -2725,7 +2781,11 @@ impl BftCoordinator {
     /// This is the key mechanism that prevents view divergence: nodes that fall behind
     /// (e.g., due to network partitions or slow clocks) will catch up when they see
     /// QCs from the rest of the network.
-    fn maybe_unlock_for_qc(&mut self, topology: &TopologySnapshot, qc: &QuorumCertificate) {
+    fn maybe_unlock_for_qc(
+        &mut self,
+        topology_snapshot: &TopologySnapshot,
+        qc: &QuorumCertificate,
+    ) {
         if qc.is_genesis() {
             return;
         }
@@ -2740,7 +2800,7 @@ impl BftCoordinator {
         let old_view = self.view_change.view;
         if self.view_change.sync_to_qc_round(qc.round) {
             info!(
-                validator = ?topology.local_validator_id(),
+                validator = ?topology_snapshot.local_validator_id(),
                 old_view = old_view.0,
                 new_view = qc.round.0,
                 qc_height = qc.height.0,
@@ -2764,7 +2824,7 @@ impl BftCoordinator {
         for height in unlocked {
             if self.votes.unlock_at(height) {
                 trace!(
-                    validator = ?topology.local_validator_id(),
+                    validator = ?topology_snapshot.local_validator_id(),
                     height = height.0,
                     qc_height = qc_height.0,
                     "Unlocked vote due to higher QC"
@@ -2786,17 +2846,17 @@ impl BftCoordinator {
     /// `received_transactions` cache for hashes it was waiting on, and
     /// emits any unblocked vote / commit-resume actions via the shared
     /// `check_pending_blocks_for_arrival` machinery.
-    #[instrument(skip(self, topology, txs), fields(count = txs.len()))]
+    #[instrument(skip(self, topology_snapshot, txs), fields(count = txs.len()))]
     pub fn on_transactions_admitted(
         &mut self,
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         txs: &[Arc<RoutableTransaction>],
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         for tx in txs {
             let tx_hash = tx.hash();
             actions.extend(self.check_pending_blocks_for_arrival(
-                topology,
+                topology_snapshot,
                 "transaction",
                 |pending| pending.needs_transaction(&tx_hash),
                 |pending| {
@@ -2822,7 +2882,7 @@ impl BftCoordinator {
     /// peer.
     pub fn on_finalized_waves_admitted(
         &mut self,
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         waves: &[Arc<FinalizedWave>],
     ) -> Vec<Action> {
         let mut actions = Vec::new();
@@ -2837,7 +2897,7 @@ impl BftCoordinator {
                 continue;
             }
             actions.extend(self.check_pending_blocks_for_arrival(
-                topology,
+                topology_snapshot,
                 "finalized wave",
                 |pending| pending.needs_wave(&wave_id),
                 |pending| {
@@ -2857,14 +2917,14 @@ impl BftCoordinator {
     /// actions.
     pub fn on_provisions_admitted(
         &mut self,
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         provisions: &[Arc<Provisions>],
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         for batch in provisions {
             let provisions_hash = batch.hash();
             actions.extend(self.check_pending_blocks_for_arrival(
-                topology,
+                topology_snapshot,
                 "provisions",
                 |pending| pending.needs_provision(&provisions_hash),
                 |pending| {
@@ -2885,7 +2945,7 @@ impl BftCoordinator {
     /// voting even when data arrives late.
     fn check_pending_blocks_for_arrival<F, M>(
         &mut self,
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         arrival_kind: &'static str,
         needs: F,
         apply: M,
@@ -2930,13 +2990,13 @@ impl BftCoordinator {
 
             if became_ready {
                 debug!(
-                    validator = ?topology.local_validator_id(),
+                    validator = ?topology_snapshot.local_validator_id(),
                     block_hash = ?block_hash,
                     arrival_kind,
                     "Pending block completed"
                 );
-                actions.extend(self.trigger_qc_verification_or_vote(topology, block_hash));
-                actions.extend(self.try_commit_pending_data(topology, block_hash));
+                actions.extend(self.trigger_qc_verification_or_vote(topology_snapshot, block_hash));
+                actions.extend(self.try_commit_pending_data(topology_snapshot, block_hash));
             }
         }
 
@@ -2996,7 +3056,7 @@ impl BftCoordinator {
     #[must_use]
     pub fn check_pending_block_fetches(
         &self,
-        topology: &TopologySnapshot,
+        topology_snapshot: &TopologySnapshot,
         force_immediate: bool,
     ) -> Vec<Action> {
         if self.block_sync.is_syncing() {
@@ -3005,7 +3065,7 @@ impl BftCoordinator {
 
         check_fetches(
             &self.pending_blocks,
-            topology,
+            topology_snapshot,
             self.now,
             self.config.transaction_fetch_timeout,
             force_immediate,
@@ -3016,12 +3076,12 @@ impl BftCoordinator {
     /// periodically by the cleanup timer. Delegates the decision to
     /// [`BlockSyncManager::health_check`] and translates a trigger into a
     /// `start_sync`.
-    pub fn check_sync_health(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
+    pub fn check_sync_health(&mut self, topology_snapshot: &TopologySnapshot) -> Vec<Action> {
         let next_needed_height = self.committed_height.next();
         let has_next_block = self.has_complete_block_at_height(next_needed_height);
 
         match self.block_sync.health_check(
-            topology,
+            topology_snapshot,
             self.committed_height,
             self.latest_qc.as_ref(),
             has_next_block,
@@ -3031,7 +3091,7 @@ impl BftCoordinator {
         ) {
             BlockSyncHealthDecision::Idle => vec![],
             BlockSyncHealthDecision::TriggerSync { target_height } => {
-                self.start_block_sync(topology, target_height)
+                self.start_block_sync(topology_snapshot, target_height)
             }
         }
     }
@@ -3043,8 +3103,12 @@ impl BftCoordinator {
     /// Drain state root verifications that are ready to dispatch. Thin
     /// wrapper over [`VerificationPipeline::drain_ready_state_root_verifications`]
     /// that supplies the chain view and pending-block map.
-    pub fn drain_ready_state_root_verifications(&mut self) -> Vec<ReadyStateRootVerification> {
+    pub fn drain_ready_state_root_verifications(
+        &mut self,
+        local_shard: ShardGroupId,
+    ) -> Vec<ReadyStateRootVerification> {
         let chain = ChainView {
+            local_shard,
             committed_height: self.committed_height,
             committed_hash: self.committed_hash,
             committed_state_root: self.committed_state_root,
@@ -3149,12 +3213,12 @@ impl BftCoordinator {
 
     /// Check if we are the proposer for the current height and round.
     #[must_use]
-    pub fn is_current_proposer(&self, topology: &TopologySnapshot) -> bool {
+    pub fn is_current_proposer(&self, topology_snapshot: &TopologySnapshot) -> bool {
         let next_height = self
             .latest_qc
             .as_ref()
             .map_or(self.committed_height.0 + 1, |qc| qc.height.0 + 1);
-        topology.should_propose(BlockHeight(next_height), self.view_change.view)
+        topology_snapshot.should_propose(BlockHeight(next_height), self.view_change.view)
     }
 
     /// Compute the parent hash for the next proposal.
@@ -3174,9 +3238,9 @@ impl BftCoordinator {
     /// compensate for duplicates that will be filtered during proposal building.
     /// This avoids the caller needing to call `collect_qc_chain_hashes` separately.
     #[must_use]
-    pub fn dedup_overhead(&self) -> usize {
+    pub fn dedup_overhead(&self, local_shard: ShardGroupId) -> usize {
         let parent_block_hash = self.proposal_parent_block_hash();
-        let (_, tx_hashes, _) = self.collect_qc_chain_hashes(parent_block_hash);
+        let (_, tx_hashes, _) = self.collect_qc_chain_hashes(local_shard, parent_block_hash);
         tx_hashes.len()
     }
 
@@ -3187,13 +3251,15 @@ impl BftCoordinator {
     #[must_use]
     pub fn collect_qc_chain_hashes(
         &self,
+        local_shard: ShardGroupId,
         parent_block_hash: BlockHash,
     ) -> (
         std::collections::HashSet<WaveId>,
         std::collections::HashSet<TxHash>,
         std::collections::HashSet<ProvisionHash>,
     ) {
-        self.chain_view().collect_ancestor_hashes(parent_block_hash)
+        self.chain_view(local_shard)
+            .collect_ancestor_hashes(parent_block_hash)
     }
 
     /// Get the BFT configuration.
@@ -3267,14 +3333,15 @@ impl BftCoordinator {
     /// This is used to avoid destructively taking certificates from execution
     /// state when we won't actually be proposing a block.
     #[must_use]
-    pub fn will_propose_next(&self, topology: &TopologySnapshot) -> bool {
+    pub fn will_propose_next(&self, topology_snapshot: &TopologySnapshot) -> bool {
         let next_height = self
             .latest_qc
             .as_ref()
             .map_or_else(|| self.committed_height.next(), |qc| qc.height.next());
         let round = self.view_change.view;
 
-        topology.should_propose(next_height, round) && !self.votes.is_locked_at(next_height)
+        topology_snapshot.should_propose(next_height, round)
+            && !self.votes.is_locked_at(next_height)
     }
 }
 
@@ -3359,7 +3426,7 @@ mod tests {
             shard_group_id: ShardGroupId(0),
             height,
             parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            parent_qc: QuorumCertificate::genesis(),
+            parent_qc: QuorumCertificate::genesis(ShardGroupId(0)),
             proposer: ValidatorId(height.0 % 4), // Round-robin
             timestamp: ProposerTimestamp(timestamp_ms),
             round: Round(0),
@@ -4645,7 +4712,8 @@ mod tests {
         };
 
         let result = {
-            let (_, qc_chain, _) = state.collect_qc_chain_hashes(block.header().parent_block_hash);
+            let (_, qc_chain, _) =
+                state.collect_qc_chain_hashes(ShardGroupId(0), block.header().parent_block_hash);
             validate_no_duplicate_transactions(&block, &qc_chain, &state.dedup_index)
         };
         assert!(result.is_err());
@@ -4690,8 +4758,8 @@ mod tests {
         // Ancestor is at committed height, so walk stops before checking it
         assert!(
             {
-                let (_, qc_chain, _) =
-                    state.collect_qc_chain_hashes(block.header().parent_block_hash);
+                let (_, qc_chain, _) = state
+                    .collect_qc_chain_hashes(ShardGroupId(0), block.header().parent_block_hash);
                 validate_no_duplicate_transactions(&block, &qc_chain, &state.dedup_index)
             }
             .is_ok()

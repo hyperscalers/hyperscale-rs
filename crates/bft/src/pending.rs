@@ -426,7 +426,7 @@ mod tests {
             shard_group_id: ShardGroupId(0),
             height,
             parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            parent_qc: QuorumCertificate::genesis(),
+            parent_qc: QuorumCertificate::genesis(ShardGroupId(0)),
             proposer: ValidatorId(0),
             timestamp: ProposerTimestamp(1_234_567_890),
             round: Round::INITIAL,

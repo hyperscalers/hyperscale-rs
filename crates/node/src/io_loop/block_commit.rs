@@ -398,7 +398,7 @@ mod tests {
     use hyperscale_storage::{BaseReadCache, JmtSnapshot};
     use hyperscale_test_helpers::{TestCommittee, make_live_block};
     use hyperscale_types::{
-        BlockHeight, FinalizedWave, QuorumCertificate as Qc, ShardGroupId, StateRoot, ValidatorId,
+        BlockHeight, FinalizedWave, QuorumCertificate, ShardGroupId, StateRoot, ValidatorId,
     };
 
     use super::*;
@@ -507,9 +507,9 @@ mod tests {
             vec![],
         );
         let block_hash = block.hash();
-        let qc = Qc {
+        let qc = QuorumCertificate {
             block_hash,
-            ..Qc::genesis()
+            ..QuorumCertificate::genesis(ShardGroupId(0))
         };
         let _ = committee; // committee unused here but kept for future signing-required tests
         let pending = PendingCommit {

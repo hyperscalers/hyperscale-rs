@@ -117,7 +117,7 @@ pub fn make_test_block(height: BlockHeight) -> Block {
             shard_group_id: ShardGroupId(0),
             height,
             parent_block_hash: BlockHash::from_raw(Hash::from_bytes(&parent_bytes)),
-            parent_qc: QuorumCertificate::genesis(),
+            parent_qc: QuorumCertificate::genesis(ShardGroupId(0)),
             proposer: ValidatorId(0),
             timestamp: ProposerTimestamp(height.0 * 1000),
             round: Round::INITIAL,

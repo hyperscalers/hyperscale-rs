@@ -42,7 +42,7 @@ mod tests {
             shard_group_id: ShardGroupId(0),
             height: BlockHeight(1),
             parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            parent_qc: QuorumCertificate::genesis(),
+            parent_qc: QuorumCertificate::genesis(ShardGroupId(0)),
             proposer: ValidatorId(0),
             timestamp: ProposerTimestamp(1_234_567_890),
             round: Round::INITIAL,
@@ -70,7 +70,10 @@ mod tests {
         assert_eq!(genesis.height(), BlockHeight(0));
         assert_eq!(genesis.transaction_count(), 0);
         assert_eq!(genesis.header().transaction_root, TransactionRoot::ZERO);
-        assert_eq!(genesis.header().parent_qc, QuorumCertificate::genesis());
+        assert_eq!(
+            genesis.header().parent_qc,
+            QuorumCertificate::genesis(ShardGroupId(0))
+        );
     }
 
     #[test]

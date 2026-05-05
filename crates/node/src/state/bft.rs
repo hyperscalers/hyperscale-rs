@@ -412,7 +412,7 @@ mod tests {
         }
         let committed_header = Arc::new(CommittedBlockHeader::new(
             block.header().clone(),
-            QuorumCertificate::genesis(),
+            QuorumCertificate::genesis(ShardGroupId(0)),
         ));
 
         let pre_exec = node.execution.memory_stats().expected_exec_certs;

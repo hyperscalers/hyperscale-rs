@@ -15,14 +15,15 @@ use std::collections::{HashMap, HashSet};
 #[cfg(test)]
 use hyperscale_types::Hash;
 use hyperscale_types::{
-    Block, BlockHash, BlockHeader, BlockHeight, ProvisionHash, QuorumCertificate, StateRoot,
-    TxHash, WaveId,
+    Block, BlockHash, BlockHeader, BlockHeight, ProvisionHash, QuorumCertificate, ShardGroupId,
+    StateRoot, TxHash, WaveId,
 };
 use tracing::warn;
 
 use crate::pending::PendingBlock;
 
 pub struct ChainView<'a> {
+    pub local_shard: ShardGroupId,
     pub committed_height: BlockHeight,
     pub committed_hash: BlockHash,
     pub committed_state_root: StateRoot,
@@ -98,10 +99,16 @@ impl ChainView<'_> {
     }
 
     /// Parent to use when building the next proposal: the latest QC's block
-    /// if any, otherwise the committed tip under a genesis QC.
+    /// if any, otherwise the committed tip under a genesis QC tagged with
+    /// the local shard.
     pub fn proposal_parent(&self) -> (BlockHash, QuorumCertificate) {
         self.latest_qc.map_or_else(
-            || (self.committed_hash, QuorumCertificate::genesis()),
+            || {
+                (
+                    self.committed_hash,
+                    QuorumCertificate::genesis(self.local_shard),
+                )
+            },
             |qc| (qc.block_hash, qc.clone()),
         )
     }
@@ -179,7 +186,7 @@ mod tests {
             shard_group_id: ShardGroupId(0),
             height: BlockHeight(u64::from(height)),
             parent_block_hash,
-            parent_qc: QuorumCertificate::genesis(),
+            parent_qc: QuorumCertificate::genesis(ShardGroupId(0)),
             proposer: ValidatorId(0),
             timestamp: ProposerTimestamp(1000),
             round: Round::INITIAL,
@@ -218,6 +225,7 @@ mod tests {
         f: impl FnOnce(&ChainView<'_>) -> R,
     ) -> R {
         let view = ChainView {
+            local_shard: ShardGroupId(0),
             committed_height: BlockHeight(committed_height),
             committed_hash,
             committed_state_root,
@@ -398,7 +406,7 @@ mod tests {
     #[test]
     fn proposal_parent_returns_latest_qc_when_present() {
         let qc_block = bh(b"qc_block");
-        let mut qc = QuorumCertificate::genesis();
+        let mut qc = QuorumCertificate::genesis(ShardGroupId(0));
         qc.block_hash = qc_block;
         qc.height = BlockHeight(5);
         qc.weighted_timestamp = WeightedTimestamp(1000);

@@ -608,7 +608,7 @@ mod tests {
             shard_group_id: ShardGroupId(2),
             height: BlockHeight(5),
             parent_block_hash: BlockHash::ZERO,
-            parent_qc: QuorumCertificate::genesis(),
+            parent_qc: QuorumCertificate::genesis(ShardGroupId(0)),
             proposer: ValidatorId(0),
             timestamp: ProposerTimestamp(1_234_567_890),
             round: Round::INITIAL,
@@ -622,7 +622,7 @@ mod tests {
             provision_tx_roots: BTreeMap::new(),
             in_flight: 0,
         };
-        let mut qc = QuorumCertificate::genesis();
+        let mut qc = QuorumCertificate::genesis(ShardGroupId(0));
         // Deliberately set wrong block_hash
         qc.block_hash = BlockHash::from_raw(Hash::from_bytes(b"wrong"));
         qc.shard_group_id = ShardGroupId(2);

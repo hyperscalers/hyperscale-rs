@@ -207,7 +207,7 @@ impl TestCommittee {
 /// Build a minimal `Block::Live` fixture for driving state machines.
 ///
 /// Every non-essential header field takes a zero default: all merkle roots
-/// are `Hash::ZERO`, `parent_qc` is `QuorumCertificate::genesis()`, `round`
+/// are `Hash::ZERO`, `parent_qc` is `QuorumCertificate::genesis(ShardGroupId(0))`, `round`
 /// is `Round::INITIAL`, and there are no wave roots or provisions. Callers
 /// pass only the bits that vary between tests.
 #[must_use]
@@ -223,7 +223,7 @@ pub fn make_live_block(
         shard_group_id,
         height,
         parent_block_hash: BlockHash::ZERO,
-        parent_qc: QuorumCertificate::genesis(),
+        parent_qc: QuorumCertificate::genesis(ShardGroupId(0)),
         proposer,
         timestamp: ProposerTimestamp(timestamp_ms),
         round: Round::INITIAL,
@@ -255,7 +255,7 @@ pub fn certify(block: Block, weighted_timestamp_ms: u64) -> CertifiedBlock {
     let qc = QuorumCertificate {
         block_hash: block.hash(),
         weighted_timestamp: WeightedTimestamp(weighted_timestamp_ms),
-        ..QuorumCertificate::genesis()
+        ..QuorumCertificate::genesis(ShardGroupId(0))
     };
     CertifiedBlock::new_unchecked(block, qc)
 }
