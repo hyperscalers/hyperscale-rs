@@ -102,7 +102,7 @@ use crate::proposal::{
     ProposalKind, ProposalTracker, TakeResult, assemble_build_action, dispatch_or_defer,
     select_finalized_waves, select_provisions, select_transactions,
 };
-use crate::validation::{validate_block_for_vote, validate_header};
+use crate::validation::{qc_has_local_quorum_power, validate_block_for_vote, validate_header};
 use crate::verification::{InFlightCheck, ReadyStateRootVerification, VerificationPipeline};
 use crate::view_change::ViewChangeController;
 use crate::vote_keeper::{LockDecision, VoteKeeper};
@@ -2399,6 +2399,20 @@ impl BftCoordinator {
             return self.apply_synced_block(topology, certified);
         }
 
+        // Quorum-power gate: `VerifyQcSignature` only checks the BLS
+        // aggregation, not whether the signers represent ≥ 2f+1 of voting
+        // power. Without this check a single Byzantine signer suffices to
+        // pass and fork the local chain. Mirrors the consensus-path gate
+        // in `validate_header`.
+        if !qc_has_local_quorum_power(topology, &certified.qc) {
+            warn!(
+                height = certified.block.height().0,
+                signers = certified.qc.signers.count(),
+                "Synced block QC lacks quorum power — rejecting"
+            );
+            return vec![];
+        }
+
         let Some(public_keys) = committee_public_keys(topology) else {
             warn!("Failed to collect public keys for synced block QC verification");
             return vec![];
@@ -4279,6 +4293,47 @@ mod tests {
             actions
                 .iter()
                 .any(|a| matches!(a, Action::StartBlockSync { .. }))
+        );
+    }
+
+    #[test]
+    fn test_sync_block_with_subquorum_qc_is_rejected_before_verification() {
+        // A synced block whose QC has only one signer in a 4-validator
+        // committee (1f+1, not 2f+1) must be rejected before reaching the
+        // BLS-only `VerifyQcSignature` action. Without this gate a Byzantine
+        // peer can fork the local chain by serving a self-signed block.
+        let (mut state, topology) = make_test_state();
+        state.set_time(LocalTimestamp::from_millis(100_000));
+
+        let block = Block::Live {
+            header: BlockHeader {
+                parent_block_hash: BlockHash::ZERO,
+                timestamp: ProposerTimestamp(1000),
+                ..make_header_at_height(BlockHeight(1), 1000)
+            },
+            transactions: Arc::new(vec![]),
+            certificates: Arc::new(vec![]),
+            provisions: Arc::new(vec![]),
+        };
+        let mut sub_quorum_signers = SignerBitfield::new(4);
+        sub_quorum_signers.set(0); // single signer — far below 2f+1 = 3
+        let qc = QuorumCertificate {
+            signers: sub_quorum_signers,
+            weighted_timestamp: WeightedTimestamp(1000),
+            ..make_test_qc(block.hash(), BlockHeight(1))
+        };
+        let certified = CertifiedBlock::new_unchecked(block, qc);
+
+        let actions = state.on_sync_block_ready_to_apply(&topology, certified);
+        assert!(
+            actions.is_empty(),
+            "sub-quorum sync block must produce no VerifyQcSignature dispatch"
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::VerifyQcSignature { .. })),
+            "must not reach BLS verification with sub-quorum signers"
         );
     }
 

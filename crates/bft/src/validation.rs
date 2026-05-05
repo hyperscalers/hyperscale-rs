@@ -17,12 +17,28 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use hyperscale_types::{
-    Block, BlockHeader, BlockHeight, LocalTimestamp, ProvisionHash, RoutableTransaction,
-    TopologySnapshot, TxHash, VotePower, WaveId, compute_waves,
+    Block, BlockHeader, BlockHeight, LocalTimestamp, ProvisionHash, QuorumCertificate,
+    RoutableTransaction, TopologySnapshot, TxHash, VotePower, WaveId, compute_waves,
 };
 
 use crate::commit_dedup::CommitDedupIndex;
 use crate::config::BftConfig;
+
+/// True if `qc.signers` represents at least 2f+1 of the local committee's
+/// voting power. The synced-block apply path and consensus pre-vote path
+/// both call this — without it, a single Byzantine signer suffices to pass
+/// the BLS-only `VerifyQcSignature` check that follows.
+#[must_use]
+pub fn qc_has_local_quorum_power(topology: &TopologySnapshot, qc: &QuorumCertificate) -> bool {
+    let committee = topology.local_committee();
+    let qc_power: u64 = qc
+        .signers
+        .set_indices()
+        .filter_map(|i| committee.get(i))
+        .map(|&vid| topology.voting_power(vid).unwrap_or(0))
+        .sum();
+    VotePower::has_quorum(qc_power, topology.local_voting_power())
+}
 
 /// Validate block header structure, proposer, and parent QC quorum. Returns
 /// `Err(..)` with a human-readable reason on any check failure.
@@ -52,15 +68,7 @@ pub fn validate_header(
     }
 
     if !header.parent_qc.is_genesis() {
-        let committee = topology.local_committee();
-        let qc_power: u64 = header
-            .parent_qc
-            .signers
-            .set_indices()
-            .filter_map(|i| committee.get(i))
-            .map(|&vid| topology.voting_power(vid).unwrap_or(0))
-            .sum();
-        if !VotePower::has_quorum(qc_power, topology.local_voting_power()) {
+        if !qc_has_local_quorum_power(topology, &header.parent_qc) {
             return Err("parent QC does not have quorum".to_string());
         }
 
