@@ -31,20 +31,12 @@
 //!
 //! # Example
 //!
-//! The RPC server is typically created after the `ProductionRunner` to get the shared
-//! validation batcher handle:
+//! The RPC server is typically created after the `ProductionRunner` so it
+//! can share the same async-validation batcher with network gossip:
 //!
 //! ```ignore
-//! // Build runner first to get validation handle
-//! let runner = ProductionRunner::builder()
-//!     // ... configuration ...
-//!     .build()
-//!     .await?;
-//!
-//! // Get validation handle from runner
 //! let validation_handle = runner.tx_validation_handle();
 //!
-//! // Create RPC server with shared validation handle
 //! let config = RpcServerConfig {
 //!     listen_addr: "0.0.0.0:8080".parse()?,
 //!     metrics_enabled: true,
