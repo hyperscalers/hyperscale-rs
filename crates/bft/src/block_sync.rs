@@ -29,6 +29,17 @@ const SPIN_WITHOUT_QC_ADVANCE_THRESHOLD: u64 = 3;
 /// candidates per height.
 const MAX_BUFFERED_PER_HEIGHT: usize = 4;
 
+/// Max distance ahead of `committed_height` at which a synced block is
+/// accepted into the future-height buffer. Pairs with
+/// `MAX_BUFFERED_PER_HEIGHT` to bound total buffered blocks: a Byzantine
+/// peer could otherwise spread distinct heights across the entire
+/// `BlockHeight` range and force the `BTreeMap` to grow without bound, since
+/// the per-height cap only constrains a single height. Tied loosely to
+/// `max_parallel_sync_verifications` × 16: leaves slack for the verify
+/// pipeline plus arrival jitter while keeping worst-case buffered count
+/// bounded.
+const MAX_BUFFER_FUTURE_HORIZON: u64 = 256;
+
 /// Synced block pending QC signature verification.
 ///
 /// When we receive a synced block, we must verify its QC signature before
@@ -243,6 +254,21 @@ impl BlockSyncManager {
                 height = height.0,
                 committed = committed_height.0,
                 "Synced block already committed - filtering"
+            );
+            return IngestOutcome::Drop;
+        }
+
+        // Distinct-height horizon cap: even with `MAX_BUFFERED_PER_HEIGHT`
+        // capping each slot, a Byzantine peer can spread arrivals across
+        // arbitrary future heights and bloat the BTreeMap. Bound the
+        // accepted future window to `committed_height + horizon`.
+        let max_future_height = committed_height.0.saturating_add(MAX_BUFFER_FUTURE_HORIZON);
+        if height.0 > max_future_height {
+            warn!(
+                height = height.0,
+                committed = committed_height.0,
+                horizon = MAX_BUFFER_FUTURE_HORIZON,
+                "Synced block beyond buffer horizon — dropping"
             );
             return IngestOutcome::Drop;
         }
@@ -844,6 +870,28 @@ mod tests {
             sm.ingest(overflow, BlockHeight(5)),
             IngestOutcome::Drop
         ));
+    }
+
+    #[test]
+    fn ingest_drops_block_beyond_buffer_horizon() {
+        let mut sm = BlockSyncManager::new();
+        let committed = BlockHeight(100);
+        let inside = BlockHeight(committed.0 + MAX_BUFFER_FUTURE_HORIZON);
+        let outside = BlockHeight(committed.0 + MAX_BUFFER_FUTURE_HORIZON + 1);
+
+        // Edge of the horizon is buffered; one past is dropped. Without the
+        // distinct-height cap a Byzantine peer could spread arrivals across
+        // arbitrary future heights and bloat the BTreeMap.
+        assert!(matches!(
+            sm.ingest(certified(inside, b"edge"), committed),
+            IngestOutcome::Buffered
+        ));
+        assert!(matches!(
+            sm.ingest(certified(outside, b"far"), committed),
+            IngestOutcome::Drop
+        ));
+        assert!(sm.has_any_buffered_at_height(inside));
+        assert!(!sm.has_any_buffered_at_height(outside));
     }
 
     // ─── next_submitable ────────────────────────────────────────────────
