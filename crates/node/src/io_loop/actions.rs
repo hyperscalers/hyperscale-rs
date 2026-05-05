@@ -500,20 +500,17 @@ where
             .dispatch_pool()
             .expect("dispatch_delegated_action called for delegated actions only");
 
-        // Clone cheap shared state for the 'static spawn closure.
-        let executor = self.executor.clone();
+        let handles = Arc::clone(&self.dispatch_handles);
         let topology_snapshot = self.topology_snapshot.load_full();
-        let prepared_commits = self.block_commit.prepared_commits_handle();
-        let pending_chain = Arc::clone(&self.pending_chain);
-        let network = Arc::clone(&self.network);
-        let signing_key = Arc::clone(&self.signing_key);
         let event_tx = self.event_sender.clone();
 
         self.dispatch.spawn(pool, move || {
             let notify = move |event: NodeInput| {
                 let _ = event_tx.send(event);
             };
-            let pending_chain_for_commit = Arc::clone(&pending_chain);
+            // `commit_prepared` is a `move` closure; it can't borrow from
+            // `handles` (which the outer `ActionContext` borrows below).
+            let handles_for_commit = Arc::clone(&handles);
             let commit_prepared = move |prep: PreparedBlock<S::PreparedCommit>| {
                 let PreparedBlock {
                     block_hash,
@@ -523,7 +520,7 @@ where
                     receipts,
                 } = prep;
                 let jmt_snapshot = Arc::new(S::jmt_snapshot(&prepared).clone());
-                pending_chain_for_commit.insert(
+                handles_for_commit.pending_chain.insert(
                     block_hash,
                     ChainEntry {
                         parent_block_hash,
@@ -532,17 +529,18 @@ where
                         jmt_snapshot,
                     },
                 );
-                prepared_commits
+                handles_for_commit
+                    .prepared_commits
                     .lock()
                     .unwrap()
                     .insert(block_hash, (block_height, prepared));
             };
             let ctx = ActionContext {
-                executor: &executor,
+                executor: &handles.executor,
                 topology_snapshot: &topology_snapshot,
-                pending_chain: &pending_chain,
-                network: &network,
-                signing_key: &signing_key,
+                pending_chain: &handles.pending_chain,
+                network: &handles.network,
+                signing_key: &handles.signing_key,
                 notify: &notify,
                 commit_prepared: &commit_prepared,
             };

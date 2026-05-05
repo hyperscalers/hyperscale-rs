@@ -33,7 +33,7 @@ pub mod sync;
 mod verify;
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -54,7 +54,7 @@ pub use status::NodeStatusSnapshot;
 use crate::NodeStateMachine;
 use crate::batch_accumulator::BatchAccumulator;
 use crate::config::NodeConfig;
-use crate::io_loop::block_commit::BlockCommitCoordinator;
+use crate::io_loop::block_commit::{BlockCommitCoordinator, PreparedCommitMap};
 use crate::io_loop::caches::SharedCaches;
 use crate::io_loop::fetch::binding::{
     ExecCertBinding, FinalizedWaveBinding, LocalProvisionBinding, ProvisionBinding,
@@ -69,6 +69,20 @@ use crate::io_loop::sync::SyncHost;
 /// Updated by the `io_loop` when `Action::TopologyChanged` is processed.
 /// Handler closures call `.load()` to get the current snapshot atomically.
 pub type SharedTopologySnapshot = Arc<ArcSwap<TopologySnapshot>>;
+
+/// Long-lived handles cloned into every delegated-action dispatch.
+///
+/// Wrapped in a single `Arc` so each dispatch pays one atomic-RMW for the
+/// whole bundle. `topology_snapshot` and `event_sender` are not bundled —
+/// the snapshot needs a fresh `load_full` per dispatch, and the crossbeam
+/// `Sender` clone is independent of these handles.
+pub(super) struct DispatchHandles<S: Storage, N, E: Engine> {
+    pub(super) executor: E,
+    pub(super) pending_chain: Arc<PendingChain<S>>,
+    pub(super) network: Arc<N>,
+    pub(super) signing_key: Arc<Bls12381G1PrivateKey>,
+    pub(super) prepared_commits: Arc<Mutex<PreparedCommitMap<S>>>,
+}
 
 // ═══════════════════════════════════════════════════════════════════════
 // TimerOp — buffered timer operations for the runner
@@ -176,11 +190,6 @@ where
     /// each `dispatch.spawn` site calls `event_sender.send` directly.
     event_sender: Sender<NodeInput>,
 
-    /// Local validator's BLS signing key. `Arc` so it can be moved
-    /// into off-thread signing closures (e.g. wave-vote signing on
-    /// the crypto pool).
-    signing_key: Arc<Bls12381G1PrivateKey>,
-
     /// Lock-free topology snapshot shared with network handler closures
     /// and delegated dispatch jobs. The pinned thread is the sole writer
     /// (via `Action::TopologyChanged`); all other readers `.load()` for
@@ -199,6 +208,9 @@ where
     /// parent chain back to the committed tip. Orphaned blocks are not
     /// ancestors and are structurally invisible to anchored views.
     pending_chain: Arc<PendingChain<S>>,
+
+    /// See [`DispatchHandles`]. Cloned once per delegated-action dispatch.
+    dispatch_handles: Arc<DispatchHandles<S, N, E>>,
 
     /// Inbound request-serving caches plus the cross-thread tx-status view
     /// shared with external RPC consumers.
@@ -318,18 +330,28 @@ where
             Arc::clone(state.mempool().tx_store()),
             Arc::clone(state.execution().exec_cert_store()),
         );
+        let network = Arc::new(network);
+        let signing_key = Arc::new(signing_key);
+        let block_commit = BlockCommitCoordinator::new(initial_persisted_height);
+        let dispatch_handles = Arc::new(DispatchHandles {
+            executor: executor.clone(),
+            pending_chain: Arc::clone(&pending_chain),
+            network: Arc::clone(&network),
+            signing_key: Arc::clone(&signing_key),
+            prepared_commits: block_commit.prepared_commits_handle(),
+        });
         Self {
             state,
             storage,
             executor,
-            network: Arc::new(network),
+            network,
             dispatch,
             event_sender,
-            signing_key: Arc::new(signing_key),
             topology_snapshot,
             // At startup, everything committed is also persisted on disk.
-            block_commit: BlockCommitCoordinator::new(initial_persisted_height),
+            block_commit,
             pending_chain,
+            dispatch_handles,
             caches,
             tx_validator,
             pending_validation: HashSet::new(),
