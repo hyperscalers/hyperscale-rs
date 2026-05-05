@@ -63,18 +63,34 @@ where
         count: u64,
         headers: Vec<CommittedBlockHeader>,
     ) {
-        // Filter to in-range deliveries, deliver each to the existing
-        // verification path, and collect the heights for the FSM.
+        // Filter to in-range, in-shard deliveries; deliver each to the
+        // existing verification path and collect the heights for the FSM.
+        // `saturating_add` prevents the `from_height + count` overflow path
+        // when an attacker (or a future caller) supplies values near
+        // `u64::MAX`. The shard filter rejects responses where the
+        // responder served headers from the wrong shard — the responder
+        // gates this too, but defending in depth on the receiver lets us
+        // surface peer misbehavior even if a future serve change drops it.
+        let upper_bound = from_height.0.saturating_add(count);
         let mut delivered_heights = Vec::with_capacity(headers.len());
         for header in headers {
             let h = header.header.height;
-            if h < from_height || h.0 >= from_height.0 + count {
+            if h < from_height || h.0 >= upper_bound {
                 tracing::warn!(
                     source_shard = source_shard.0,
                     requested_from = from_height.0,
                     requested_count = count,
                     height = h.0,
                     "remote-header sync: response contained out-of-range height — discarding"
+                );
+                continue;
+            }
+            if header.shard_group_id() != source_shard {
+                tracing::warn!(
+                    source_shard = source_shard.0,
+                    response_shard = header.shard_group_id().0,
+                    height = h.0,
+                    "remote-header sync: response contained wrong-shard header — discarding"
                 );
                 continue;
             }

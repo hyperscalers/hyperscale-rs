@@ -10,7 +10,7 @@ use hyperscale_messages::request::{GetRemoteHeadersRequest, MAX_REMOTE_HEADERS_P
 use hyperscale_messages::response::GetRemoteHeadersResponse;
 use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_storage::ChainReader;
-use hyperscale_types::BlockHeight;
+use hyperscale_types::{BlockHeight, ShardGroupId};
 
 /// Serve an inbound remote-header range request.
 ///
@@ -19,10 +19,23 @@ use hyperscale_types::BlockHeight;
 /// by [`MAX_REMOTE_HEADERS_PER_REQUEST`]; iteration also stops on the first
 /// missing height so the response is always a contiguous prefix of the
 /// requested range.
+///
+/// Requests for a shard other than `local_shard` get an empty response —
+/// without that gate a shard A node would happily serve its own committed
+/// headers in response to a request for shard B headers, and the requester
+/// (which used to filter only by height) would buffer them under the wrong
+/// shard scope and stall sync until rotation.
 pub fn serve_remote_headers_request(
     storage: &impl ChainReader,
+    local_shard: ShardGroupId,
     req: &GetRemoteHeadersRequest,
 ) -> GetRemoteHeadersResponse {
+    if req.source_shard != local_shard {
+        return GetRemoteHeadersResponse {
+            headers: Vec::new(),
+        };
+    }
+
     let bounded_count = req.count.min(MAX_REMOTE_HEADERS_PER_REQUEST);
     let mut headers = Vec::with_capacity(usize::try_from(bounded_count).unwrap_or(0));
 

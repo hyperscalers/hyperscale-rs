@@ -307,9 +307,11 @@ where
         // ── remote_header.request → range header sync ───────────────────
 
         let storage = Arc::clone(&self.storage);
+        let topology = self.topology_snapshot.clone();
         self.network
             .register_request_handler::<GetRemoteHeadersRequest>(move |req| {
-                serve_remote_headers_request(&*storage, &req)
+                let local_shard = topology.load().local_shard();
+                serve_remote_headers_request(&*storage, local_shard, &req)
             });
     }
 
