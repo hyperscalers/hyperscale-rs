@@ -509,7 +509,7 @@ mod tests {
         let block_hash = block.hash();
         let qc = QuorumCertificate {
             block_hash,
-            ..QuorumCertificate::genesis(ShardGroupId(0))
+            ..QuorumCertificate::genesis(block.header().shard_group_id)
         };
         let _ = committee; // committee unused here but kept for future signing-required tests
         let pending = PendingCommit {
