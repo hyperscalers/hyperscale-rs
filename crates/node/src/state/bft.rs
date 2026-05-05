@@ -67,6 +67,23 @@ use hyperscale_types::{BlockHash, BlockHeader, BlockManifest, CertifiedBlock, Qu
 
 use super::NodeStateMachine;
 
+/// Per-block cap on transaction-hash entries in a header's manifest.
+/// Matches `mempool::DEFAULT_IN_FLIGHT_LIMIT`: no honest proposer can
+/// legitimately exceed the chain-wide in-flight cap, so a header that
+/// names more is provably malicious. Applied at every height, not just
+/// next-block, since the in-flight check itself only fires at
+/// `committed_height + 1`.
+const MAX_TX_HASHES_PER_BLOCK: usize = 12_288;
+
+/// Per-block cap on wave-cert ids. Realistic blocks carry single-digit
+/// wave-cert counts; 4096 leaves comfortable headroom while bounding
+/// fetch-storm exposure from a Byzantine future-height header.
+const MAX_CERT_IDS_PER_BLOCK: usize = 4_096;
+
+/// Per-block cap on provision-batch hashes. One batch per cross-shard tx
+/// in the block; bounding at the same scale as `MAX_TX_HASHES_PER_BLOCK`.
+const MAX_PROVISION_HASHES_PER_BLOCK: usize = 12_288;
+
 impl NodeStateMachine {
     /// Dispatch a BFT-category `ProtocolEvent`.
     #[allow(clippy::too_many_lines)] // single dispatch, one arm per BFT variant
@@ -197,6 +214,28 @@ impl NodeStateMachine {
         manifest: BlockManifest,
     ) -> Vec<Action> {
         let total_tx_count = manifest.transaction_count();
+
+        // Absolute per-block bound on manifest list lengths. Applied at every
+        // height (not just the next-block in-flight check) so a Byzantine
+        // proposer scheduled at a future height can't ship a header carrying
+        // millions of fake hashes — `assemble_pending_block` would otherwise
+        // populate `missing_transaction_hashes` and trigger a fetch storm.
+        // The per-list cap matches the chain-wide in-flight limit; no honest
+        // proposer can legitimately exceed it.
+        if total_tx_count > MAX_TX_HASHES_PER_BLOCK
+            || manifest.cert_ids.len() > MAX_CERT_IDS_PER_BLOCK
+            || manifest.provision_hashes.len() > MAX_PROVISION_HASHES_PER_BLOCK
+        {
+            tracing::warn!(
+                block_hash = ?header.hash(),
+                height = header.height.0,
+                tx_hashes = total_tx_count,
+                cert_ids = manifest.cert_ids.len(),
+                provision_hashes = manifest.provision_hashes.len(),
+                "Rejecting block: manifest list length exceeds per-block cap"
+            );
+            return vec![];
+        }
 
         // Validate in-flight limits only for the next block after committed
         // height. For blocks further ahead, validators at different heights
