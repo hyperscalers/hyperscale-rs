@@ -13,6 +13,7 @@ use sbor::{
     NoCustomTypeKind, NoCustomValueKind, RustTypeId, TypeData, TypeKind, ValueKind,
 };
 
+use crate::sbor_codec::decode_bounded_bytes;
 use crate::{Hash, NodeId, TimestampRange, TxHash, shard_for_node};
 
 /// A transaction with routing information.
@@ -244,23 +245,6 @@ const MAX_TX_BYTES_LEN: usize = 256 * 1024;
 /// allocation as the worst case. Tx authors with unusual access patterns
 /// have ample headroom; everything beyond is rejected.
 const MAX_DECLARED_NODES_PER_TX: usize = 4_096;
-
-fn decode_bounded_bytes<D: Decoder<NoCustomValueKind>>(
-    decoder: &mut D,
-    max_len: usize,
-) -> Result<Vec<u8>, DecodeError> {
-    decoder.read_and_check_value_kind(ValueKind::Array)?;
-    decoder.read_and_check_value_kind(ValueKind::U8)?;
-    let len = decoder.read_size()?;
-    if len > max_len {
-        return Err(DecodeError::UnexpectedSize {
-            expected: max_len,
-            actual: len,
-        });
-    }
-    let slice = decoder.read_slice(len)?;
-    Ok(slice.to_vec())
-}
 
 fn decode_bounded_node_ids<D: Decoder<NoCustomValueKind>>(
     decoder: &mut D,

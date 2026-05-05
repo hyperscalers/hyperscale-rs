@@ -18,6 +18,7 @@ mod crypto;
 mod network;
 mod primitives;
 mod provisioning;
+pub(crate) mod sbor_codec;
 mod signing;
 mod time;
 
