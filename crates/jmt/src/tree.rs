@@ -550,6 +550,10 @@ fn build_fresh_multi<H: Hasher, const ARITY_BITS: u8>(
     }
 
     // Sequential: group `present` by bit-bucket and recurse in place.
+    // `build_fresh` only borrows the sub-path, so a single working buffer
+    // pushed/truncated per bucket replaces N per-bucket path clones.
+    let mut sub_path_buf = path.clone();
+    let base_bits = sub_path_buf.len();
     let mut pos = 0;
     while pos < present.len() {
         let bucket = bits_at(present[pos].0, depth, ARITY_BITS);
@@ -558,11 +562,14 @@ fn build_fresh_multi<H: Hasher, const ARITY_BITS: u8>(
             pos += 1;
         }
         let sub = &present[start..pos];
-        let sub_path = child_path(path, bucket, ARITY_BITS);
+        sub_path_buf.truncate(base_bits);
+        sub_path_buf.push_bits(bucket, ARITY_BITS);
         let sub_kvs: Vec<(&Key, Option<ValueHash>)> =
             sub.iter().map(|(k, v)| (*k, Some(*v))).collect();
 
-        if let Some(node) = build_fresh::<H, ARITY_BITS>(&sub_path, new_version, &sub_kvs, batch) {
+        if let Some(node) =
+            build_fresh::<H, ARITY_BITS>(&sub_path_buf, new_version, &sub_kvs, batch)
+        {
             let hash = node.hash::<H>();
             let kind = kind_of(&node);
             children[bucket as usize] = Some(Child {
