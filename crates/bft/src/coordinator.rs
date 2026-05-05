@@ -2480,6 +2480,18 @@ impl BftCoordinator {
         certified: CertifiedBlock,
     ) -> Vec<Action> {
         if certified.qc.is_genesis() {
+            // The wire decoder enforces `qc.block_hash == block.hash()` on
+            // `CertifiedBlock`, so a genesis QC (qc.block_hash == ZERO) can
+            // only ride alongside the genesis block itself. The local
+            // `block.is_genesis()` guard catches any locally-constructed
+            // pair that bypasses the decoder.
+            if !certified.block.is_genesis() {
+                warn!(
+                    height = certified.block.height().0,
+                    "Genesis QC paired with non-genesis block — rejecting"
+                );
+                return vec![];
+            }
             debug!(
                 height = certified.block.height().0,
                 "Synced block has genesis QC, applying directly"

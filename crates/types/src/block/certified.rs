@@ -3,20 +3,27 @@
 //! Every committed block has exactly one QC where `qc.block_hash == block.hash()`.
 
 use sbor::prelude::*;
+use sbor::{
+    Categorize, Decode, DecodeError, Decoder, Describe, Encode, EncodeError, Encoder,
+    NoCustomTypeKind, NoCustomValueKind, RustTypeId, TypeData, TypeKind, ValueKind,
+};
 
 use crate::{Block, BlockHash, BlockHeight, QuorumCertificate};
 
 /// A block alongside the QC that certifies it.
 ///
-/// Invariant: `qc.block_hash == block.hash()`. The invariant is checked by
-/// `new_checked`; fields are `pub` so wire deserialization and other paths
-/// that rely on separate structural/cryptographic verification can still
-/// construct the type directly.
+/// Invariant: `qc.block_hash == block.hash()`. Enforced at every entry point —
+/// [`Self::new_checked`] for in-process construction and the wire decoder
+/// below for peer-supplied bytes. Without the decode-side check a Byzantine
+/// peer can ship a synced block paired with a forged "genesis QC"
+/// (`qc.block_hash == ZERO`, `qc.height == 0`) for an arbitrary block height,
+/// bypassing every gate keyed on `qc.is_genesis()` (e.g. the synced-block
+/// quorum-power gate in `bft::coordinator`).
 ///
 /// Note this is *not* the same as the `parent_qc` stored inside a block's
 /// header — that QC certifies the *parent* block. The QC on a `CertifiedBlock`
 /// certifies the block it's paired with.
-#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CertifiedBlock {
     /// Block whose hash matches `qc.block_hash` — see invariant on [`Self::qc`].
     pub block: Block,
@@ -89,5 +96,51 @@ impl CertifiedBlock {
     #[must_use]
     pub fn hash(&self) -> BlockHash {
         self.block.hash()
+    }
+}
+
+impl<E: Encoder<NoCustomValueKind>> Encode<NoCustomValueKind, E> for CertifiedBlock {
+    fn encode_value_kind(&self, encoder: &mut E) -> Result<(), EncodeError> {
+        encoder.write_value_kind(ValueKind::Tuple)
+    }
+
+    fn encode_body(&self, encoder: &mut E) -> Result<(), EncodeError> {
+        encoder.write_size(2)?;
+        encoder.encode(&self.block)?;
+        encoder.encode(&self.qc)?;
+        Ok(())
+    }
+}
+
+impl<D: Decoder<NoCustomValueKind>> Decode<NoCustomValueKind, D> for CertifiedBlock {
+    fn decode_body_with_value_kind(
+        decoder: &mut D,
+        value_kind: ValueKind<NoCustomValueKind>,
+    ) -> Result<Self, DecodeError> {
+        decoder.check_preloaded_value_kind(value_kind, ValueKind::Tuple)?;
+        let length = decoder.read_size()?;
+        if length != 2 {
+            return Err(DecodeError::UnexpectedSize {
+                expected: 2,
+                actual: length,
+            });
+        }
+        let block: Block = decoder.decode()?;
+        let qc: QuorumCertificate = decoder.decode()?;
+        Self::new_checked(block, qc).map_err(|_| DecodeError::InvalidCustomValue)
+    }
+}
+
+impl Categorize<NoCustomValueKind> for CertifiedBlock {
+    fn value_kind() -> ValueKind<NoCustomValueKind> {
+        ValueKind::Tuple
+    }
+}
+
+impl Describe<NoCustomTypeKind> for CertifiedBlock {
+    const TYPE_ID: RustTypeId = RustTypeId::novel_with_code("CertifiedBlock", &[], &[]);
+
+    fn type_data() -> TypeData<NoCustomTypeKind, RustTypeId> {
+        TypeData::unnamed(TypeKind::Any)
     }
 }

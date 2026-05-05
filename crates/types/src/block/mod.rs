@@ -183,4 +183,38 @@ mod tests {
         let genesis = Block::genesis(ShardGroupId(0), ValidatorId(0), StateRoot::ZERO);
         assert_eq!(genesis.header().certificate_root, CertificateRoot::ZERO);
     }
+
+    #[test]
+    fn certified_block_decode_rejects_qc_block_hash_mismatch() {
+        use sbor::{DecodeError, basic_decode, basic_encode};
+
+        use crate::CertifiedBlock;
+
+        // Forge a non-genesis block paired with a genesis QC. Without the
+        // pairing check at decode this slips past the synced-block apply
+        // path's `qc.is_genesis()` quorum-power bypass.
+        let mut bad_block = Block::genesis(ShardGroupId(0), ValidatorId(0), StateRoot::ZERO)
+            .into_sealed()
+            .into_live(Arc::new(Vec::new()));
+        if let Block::Live { ref mut header, .. } = bad_block {
+            header.height = BlockHeight(7);
+        }
+        let genesis_qc = QuorumCertificate::genesis(ShardGroupId(0));
+        let bytes = basic_encode(&CertifiedBlockWire {
+            block: bad_block,
+            qc: genesis_qc,
+        })
+        .unwrap();
+        let err = basic_decode::<CertifiedBlock>(&bytes).unwrap_err();
+        assert!(matches!(err, DecodeError::InvalidCustomValue));
+    }
+
+    /// Wire-shape twin of `CertifiedBlock` that skips the pairing invariant
+    /// during encode, so tests can construct adversarial byte streams.
+    #[derive(sbor::BasicSbor)]
+    #[sbor(transparent_name)]
+    struct CertifiedBlockWire {
+        block: Block,
+        qc: QuorumCertificate,
+    }
 }

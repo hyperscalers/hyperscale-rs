@@ -320,11 +320,13 @@ mod tests {
     }
 
     fn make_test_wave_ec(shard: u64, seed: u8) -> Arc<ExecutionCertificate> {
+        let outcomes = vec![make_outcome(seed)];
+        let global_receipt_root = compute_global_receipt_root(&outcomes);
         Arc::new(ExecutionCertificate::new(
             make_wave_id(shard, BlockHeight(42), &[1]),
             WeightedTimestamp(43),
-            GlobalReceiptRoot::from_raw(Hash::from_bytes(&[seed + 100; 4])),
-            vec![make_outcome(seed)],
+            global_receipt_root,
+            outcomes,
             Bls12381G2Signature([0u8; 96]),
             SignerBitfield::new(4),
         ))
@@ -371,11 +373,13 @@ mod tests {
         // exactly one of the contained ECs.
         let wid0 = make_wave_id(0, BlockHeight(42), &[1]);
         let wid1 = make_wave_id(1, BlockHeight(42), &[]);
+        let outcomes_wid1 = vec![make_outcome(3)];
+        let root_wid1 = compute_global_receipt_root(&outcomes_wid1);
         let local_ec_for_wid1 = Arc::new(ExecutionCertificate::new(
             wid1.clone(),
             WeightedTimestamp(43),
-            GlobalReceiptRoot::from_raw(Hash::from_bytes(&[103u8; 4])),
-            vec![make_outcome(3)],
+            root_wid1,
+            outcomes_wid1,
             Bls12381G2Signature([0u8; 96]),
             SignerBitfield::new(4),
         ));
