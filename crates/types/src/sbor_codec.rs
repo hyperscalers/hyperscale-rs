@@ -4,8 +4,14 @@
 //! decoder pre-allocates `len` bytes up front via `read_slice` (other `Vec<T>`
 //! caps `with_capacity` at 1024). Without an explicit length cap a peer can
 //! claim up to the entire libp2p frame budget for a single byte field.
+//!
+//! Set/map decode paths don't pre-allocate, but they still read `len`
+//! elements in a loop — bounded helpers reject oversized claims before any
+//! per-element work happens.
 
-use sbor::{DecodeError, Decoder, NoCustomValueKind, ValueKind};
+use std::collections::BTreeSet;
+
+use sbor::{Categorize, Decode, DecodeError, Decoder, NoCustomValueKind, ValueKind};
 
 /// Decode a `Vec<u8>` field while rejecting peer-claimed lengths above
 /// `max_len` before any allocation.
@@ -24,4 +30,35 @@ pub fn decode_bounded_bytes<D: Decoder<NoCustomValueKind>>(
     }
     let slice = decoder.read_slice(len)?;
     Ok(slice.to_vec())
+}
+
+/// Decode a `BTreeSet<T>` field while rejecting peer-claimed lengths above
+/// `max_len` before any per-element decode work.
+///
+/// Mirrors SBOR's `BTreeSet` decode contract: the wire form is an Array of
+/// `T`, and a duplicate element is a hard error.
+pub fn decode_bounded_btree_set<D, T>(
+    decoder: &mut D,
+    max_len: usize,
+) -> Result<BTreeSet<T>, DecodeError>
+where
+    D: Decoder<NoCustomValueKind>,
+    T: Categorize<NoCustomValueKind> + Decode<NoCustomValueKind, D> + Ord,
+{
+    decoder.read_and_check_value_kind(ValueKind::Array)?;
+    let element_kind = decoder.read_and_check_value_kind(T::value_kind())?;
+    let len = decoder.read_size()?;
+    if len > max_len {
+        return Err(DecodeError::UnexpectedSize {
+            expected: max_len,
+            actual: len,
+        });
+    }
+    let mut out = BTreeSet::new();
+    for _ in 0..len {
+        if !out.insert(decoder.decode_deeper_body_with_value_kind(element_kind)?) {
+            return Err(DecodeError::DuplicateKey);
+        }
+    }
+    Ok(out)
 }

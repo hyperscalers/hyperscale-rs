@@ -116,7 +116,7 @@ pub use wave::execution_certificate::ExecutionCertificate;
 pub use wave::finalized::{
     FinalizedWave, ReceiptValidationError, decode_finalized_wave_vec, encode_finalized_wave_vec,
 };
-pub use wave::id::WaveId;
+pub use wave::id::{MAX_REMOTE_SHARDS_PER_WAVE, WaveId};
 pub use wave::outcome::{ExecutionOutcome, TxOutcome};
 pub use wave::receipt_tree::{
     compute_global_receipt_root, compute_global_receipt_root_with_proof, tx_outcome_leaf,
