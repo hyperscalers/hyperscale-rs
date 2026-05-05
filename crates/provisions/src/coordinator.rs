@@ -20,11 +20,6 @@ use hyperscale_types::{
     ProvisionTxRoot, Provisions, RETENTION_HORIZON, ShardGroupId, TopologySnapshot,
     compute_padded_merkle_root,
 };
-#[cfg(test)]
-use hyperscale_types::{
-    CertificateRoot, LocalReceiptRoot, ProvisionsRoot, StateRoot, TransactionRoot, TxHash,
-    ValidatorId,
-};
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
@@ -684,9 +679,10 @@ impl ProvisionCoordinator {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{
-        Block, BlockHash, BlockHeader, Bls12381G1PrivateKey, Hash, MerkleInclusionProof,
-        ProposerTimestamp, QuorumCertificate, Round, TopologySnapshot, TxEntries, ValidatorInfo,
-        ValidatorSet, WaveId, WeightedTimestamp, bls_keypair_from_seed,
+        Block, BlockHash, BlockHeader, Bls12381G1PrivateKey, CertificateRoot, Hash,
+        LocalReceiptRoot, MerkleInclusionProof, ProposerTimestamp, ProvisionsRoot,
+        QuorumCertificate, Round, StateRoot, TopologySnapshot, TransactionRoot, TxEntries, TxHash,
+        ValidatorId, ValidatorInfo, ValidatorSet, WaveId, WeightedTimestamp, bls_keypair_from_seed,
     };
     use proptest::bool::ANY as ANY_BOOL;
     use proptest::collection::vec as prop_vec;

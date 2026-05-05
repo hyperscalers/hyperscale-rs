@@ -7,8 +7,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_core::{Action, FetchOrigin, FetchPeers, FetchRequest};
-#[cfg(test)]
-use hyperscale_types::Hash;
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockManifest, FinalizedWave, LocalTimestamp, ProvisionHash,
     Provisions, RoutableTransaction, TopologySnapshot, TxHash, WaveId,
@@ -169,12 +167,6 @@ impl PendingBlock {
         self.missing_transaction_hashes.is_empty()
             && self.missing_wave_ids.is_empty()
             && self.missing_provision_hashes.is_empty()
-    }
-
-    /// Check if all transactions have been received (waves may still be pending).
-    #[cfg(test)]
-    pub fn has_all_transactions(&self) -> bool {
-        self.missing_transaction_hashes.is_empty()
     }
 
     /// Get the number of missing transaction hashes.
@@ -409,14 +401,22 @@ pub fn check_fetches(
 }
 
 #[cfg(test)]
+impl PendingBlock {
+    /// Check if all transactions have been received (waves may still be pending).
+    pub fn has_all_transactions(&self) -> bool {
+        self.missing_transaction_hashes.is_empty()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
 
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
-        Block, BlockHeight, CertificateRoot, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
-        QuorumCertificate, Round, ShardGroupId, StateRoot, TransactionRoot, ValidatorId,
-        WaveCertificate, WaveId,
+        Block, BlockHeight, CertificateRoot, Hash, LocalReceiptRoot, ProposerTimestamp,
+        ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, StateRoot, TransactionRoot,
+        ValidatorId, WaveCertificate, WaveId,
     };
 
     use super::*;

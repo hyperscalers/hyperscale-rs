@@ -24,10 +24,6 @@
 
 use blake3::Hasher;
 
-#[cfg(test)]
-use crate::Hash;
-#[cfg(test)]
-use crate::TxHash;
 use crate::{
     BlockHash, BlockHeight, ExecutionCertificate, ExecutionVote, GlobalReceiptRoot, Provisions,
     Round, ShardGroupId, WaveId, WeightedTimestamp,
@@ -262,6 +258,7 @@ pub fn exec_cert_batch_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Hash, TxHash};
 
     #[test]
     fn test_block_vote_message_deterministic() {

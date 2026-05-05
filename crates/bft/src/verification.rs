@@ -12,8 +12,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use hyperscale_core::{Action, VerificationKind};
-#[cfg(test)]
-use hyperscale_types::Hash;
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, FinalizedWave, LocalReceiptRoot,
     ProvisionsRoot, StateRoot, TopologySnapshot,
@@ -1112,8 +1110,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use hyperscale_types::{
-        CertificateRoot, LocalReceiptRoot, LocalTimestamp, ProposerTimestamp, QuorumCertificate,
-        Round, RoutableTransaction, ShardGroupId, TransactionRoot, ValidatorId,
+        CertificateRoot, Hash, LocalReceiptRoot, LocalTimestamp, ProposerTimestamp,
+        QuorumCertificate, Round, RoutableTransaction, ShardGroupId, TransactionRoot, ValidatorId,
     };
 
     use super::*;

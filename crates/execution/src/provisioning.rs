@@ -25,8 +25,6 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
-#[cfg(test)]
-use hyperscale_types::Hash;
 use hyperscale_types::{
     NodeId, Provisions, RETENTION_HORIZON, ShardGroupId, StateProvision, TopologySnapshot, TxHash,
     WeightedTimestamp,
@@ -258,7 +256,7 @@ impl ProvisioningTracker {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::{BlockHeight, MerkleInclusionProof, TxEntries};
+    use hyperscale_types::{BlockHeight, Hash, MerkleInclusionProof, TxEntries};
 
     use super::*;
 

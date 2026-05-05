@@ -21,8 +21,6 @@
 
 use std::collections::HashMap;
 
-#[cfg(test)]
-use hyperscale_types::Hash;
 use hyperscale_types::{TxHash, WeightedTimestamp};
 
 pub struct TombstoneStore {
@@ -74,6 +72,8 @@ impl TombstoneStore {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_types::Hash;
+
     use super::*;
 
     #[test]

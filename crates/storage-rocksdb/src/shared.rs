@@ -11,8 +11,6 @@
 use std::sync::Arc;
 
 use hyperscale_jmt::{Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
-#[cfg(test)]
-use hyperscale_storage::CommittableSubstateDatabase;
 use hyperscale_storage::{
     BaseReadCache, BlockForSync, ChainReader, ChainWriter, DatabaseUpdates, DbPartitionKey,
     DbSortKey, DbSubstateValue, GenesisCommit, JmtSnapshot, PartitionEntry, SubstateDatabase,
@@ -79,14 +77,6 @@ impl SubstateDatabase for SharedStorage {
     ) -> Box<dyn Iterator<Item = PartitionEntry> + '_> {
         self.0
             .list_raw_values_from_db_key(partition_key, from_sort_key)
-    }
-}
-
-#[cfg(test)]
-impl CommittableSubstateDatabase for SharedStorage {
-    fn commit(&mut self, updates: &DatabaseUpdates) {
-        RocksDbStorage::commit(&self.0, updates)
-            .expect("Storage commit failed - cannot maintain consistent state");
     }
 }
 
@@ -244,5 +234,19 @@ impl ChainReader for SharedStorage {
         tx_hash: &TxHash,
     ) -> Option<Vec<(ShardGroupId, ExecutionCertificateHash)>> {
         self.0.get_ec_hashes_for_tx(tx_hash)
+    }
+}
+
+#[cfg(test)]
+mod test_helpers {
+    use hyperscale_storage::CommittableSubstateDatabase;
+
+    use super::*;
+
+    impl CommittableSubstateDatabase for SharedStorage {
+        fn commit(&mut self, updates: &DatabaseUpdates) {
+            RocksDbStorage::commit(&self.0, updates)
+                .expect("Storage commit failed - cannot maintain consistent state");
+        }
     }
 }

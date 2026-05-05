@@ -12,8 +12,6 @@
 
 use std::collections::{HashMap, HashSet};
 
-#[cfg(test)]
-use hyperscale_types::Hash;
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, ProvisionHash, QuorumCertificate, ShardGroupId,
     StateRoot, TxHash, WaveId,
@@ -175,7 +173,7 @@ mod tests {
     use std::sync::Arc;
 
     use hyperscale_types::{
-        BlockManifest, CertificateRoot, LocalReceiptRoot, LocalTimestamp, ProposerTimestamp,
+        BlockManifest, CertificateRoot, Hash, LocalReceiptRoot, LocalTimestamp, ProposerTimestamp,
         ProvisionsRoot, Round, ShardGroupId, TransactionRoot, ValidatorId, WeightedTimestamp,
     };
 

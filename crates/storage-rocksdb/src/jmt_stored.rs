@@ -13,8 +13,6 @@
 // methods (`from_jmt`/`to_jmt`/`version()`/`path_bits()`) say what they do.
 #![allow(missing_docs)]
 
-#[cfg(test)]
-use hyperscale_jmt::NibblePath;
 use hyperscale_jmt::{
     Child, ChildKind, Hash as JmtHash, InternalNode, Key as JmtKey, LeafNode, Node, NodeKey,
     PathDecodeError,
@@ -269,7 +267,9 @@ fn key_from_bytes(bytes: &[u8]) -> JmtKey {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_jmt::{Blake3Hasher, InternalNode as JmtInternal, LeafNode as JmtLeaf};
+    use hyperscale_jmt::{
+        Blake3Hasher, InternalNode as JmtInternal, LeafNode as JmtLeaf, NibblePath,
+    };
 
     use super::*;
 

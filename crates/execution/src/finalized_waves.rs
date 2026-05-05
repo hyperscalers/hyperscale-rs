@@ -90,11 +90,6 @@ impl FinalizedWaveStore {
         self.waves.len()
     }
 
-    #[cfg(test)]
-    pub fn is_empty(&self) -> bool {
-        self.waves.is_empty()
-    }
-
     /// Build a bloom filter over every tracked `WaveId`. Sync
     /// inventory attaches this to `GetBlockRequest` so the responder can
     /// elide finalized-wave certificates the requester already has.
@@ -104,6 +99,13 @@ impl FinalizedWaveStore {
             bf.insert(wave_id);
         }
         Some(bf)
+    }
+}
+
+#[cfg(test)]
+impl FinalizedWaveStore {
+    pub fn is_empty(&self) -> bool {
+        self.waves.is_empty()
     }
 }
 

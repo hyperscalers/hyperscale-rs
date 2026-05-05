@@ -286,8 +286,10 @@ impl ExpectedCertTracker {
     pub fn fulfilled_len(&self) -> usize {
         self.fulfilled.len()
     }
+}
 
-    #[cfg(test)]
+#[cfg(test)]
+impl ExpectedCertTracker {
     fn is_expected(
         &self,
         source_shard: ShardGroupId,

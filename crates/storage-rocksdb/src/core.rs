@@ -19,10 +19,6 @@ use std::time::Instant;
 
 use hyperscale_jmt::{Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_metrics::record_storage_read;
-#[cfg(test)]
-use hyperscale_metrics::record_storage_write;
-#[cfg(test)]
-use hyperscale_storage::CommittableSubstateDatabase;
 use hyperscale_storage::{
     BaseReadCache, DatabaseUpdate, DatabaseUpdates, DbPartitionKey, DbSortKey, DbSubstateValue,
     GenesisCommit, JmtSnapshot, PartitionDatabaseUpdates, PartitionEntry, SubstateDatabase,
@@ -784,86 +780,90 @@ impl TreeReader for RocksDbStorage {
     }
 }
 
-/// Test-only methods with auto-incrementing JMT version logic.
-/// Production uses `commit_block` / `commit_prepared_block` instead.
 #[cfg(test)]
-impl RocksDbStorage {
-    /// Test helper: commits database updates with auto-incrementing JMT version.
-    /// Not used in production (use `commit_block` instead).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StorageError`] if the underlying `RocksDB` write fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the commit lock is poisoned.
-    #[instrument(level = Level::DEBUG, skip_all, fields(
-        node_count = updates.node_updates.len(),
-        latency_us = Empty,
-    ))]
-    pub fn commit(&self, updates: &DatabaseUpdates) -> Result<(), StorageError> {
-        let _commit_guard = self.commit_lock.lock().unwrap();
+mod test_helpers {
+    use hyperscale_metrics::record_storage_write;
+    use hyperscale_storage::CommittableSubstateDatabase;
 
-        let start = Instant::now();
+    use super::*;
 
-        // Compute JMT updates using a snapshot-based store for isolation
-        let snapshot_store = SnapshotTreeStore::new(&self.db);
-        let (base_version, base_root) = snapshot_store.read_jmt_metadata();
+    impl RocksDbStorage {
+        /// Test helper: commits database updates with auto-incrementing JMT version.
+        /// Production uses `commit_block` / `commit_prepared_block` instead.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`StorageError`] if the underlying `RocksDB` write fails.
+        ///
+        /// # Panics
+        ///
+        /// Panics if the commit lock is poisoned.
+        #[instrument(level = Level::DEBUG, skip_all, fields(
+            node_count = updates.node_updates.len(),
+            latency_us = Empty,
+        ))]
+        pub fn commit(&self, updates: &DatabaseUpdates) -> Result<(), StorageError> {
+            let _commit_guard = self.commit_lock.lock().unwrap();
 
-        // Version 0 with a non-zero root means genesis has been computed at version 0.
-        // Only treat as "no parent" when the JMT is truly empty.
-        let parent_version =
-            tree::jmt_parent_height(BlockHeight(base_version), base_root).map(|h| h.0);
-        let new_version = base_version + 1;
+            let start = Instant::now();
 
-        let (mut batch, reset_old_keys) = self.build_substate_write_batch(
-            updates,
-            new_version,
-            /* write_history */ true,
-            /* base_reads */ None,
-        );
+            // Compute JMT updates using a snapshot-based store for isolation
+            let snapshot_store = SnapshotTreeStore::new(&self.db);
+            let (base_version, base_root) = snapshot_store.read_jmt_metadata();
 
-        let (new_root, collected) = tree::put_at_version(
-            &snapshot_store,
-            parent_version,
-            new_version,
-            &[updates],
-            &reset_old_keys,
-        );
-        let jmt_snapshot = JmtSnapshot::from_collected_writes(
-            collected,
-            base_root,
-            BlockHeight(base_version),
-            new_root,
-            BlockHeight(new_version),
-        );
+            // Version 0 with a non-zero root means genesis has been computed at version 0.
+            // Only treat as "no parent" when the JMT is truly empty.
+            let parent_version =
+                tree::jmt_parent_height(BlockHeight(base_version), base_root).map(|h| h.0);
+            let new_version = base_version + 1;
 
-        self.append_jmt_to_batch(&mut batch, &jmt_snapshot, new_version);
+            let (mut batch, reset_old_keys) = self.build_substate_write_batch(
+                updates,
+                new_version,
+                /* write_history */ true,
+                /* base_reads */ None,
+            );
 
-        self.db
-            .write(batch)
-            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+            let (new_root, collected) = tree::put_at_version(
+                &snapshot_store,
+                parent_version,
+                new_version,
+                &[updates],
+                &reset_old_keys,
+            );
+            let jmt_snapshot = JmtSnapshot::from_collected_writes(
+                collected,
+                base_root,
+                BlockHeight(base_version),
+                new_root,
+                BlockHeight(new_version),
+            );
 
-        let elapsed = start.elapsed();
-        record_storage_write(elapsed.as_secs_f64());
+            self.append_jmt_to_batch(&mut batch, &jmt_snapshot, new_version);
 
-        // Record span fields
-        let span = Span::current();
-        span.record(
-            "latency_us",
-            u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
-        );
-        tracing::debug!(new_version, "commit complete");
+            self.db
+                .write(batch)
+                .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
 
-        Ok(())
+            let elapsed = start.elapsed();
+            record_storage_write(elapsed.as_secs_f64());
+
+            // Record span fields
+            let span = Span::current();
+            span.record(
+                "latency_us",
+                u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
+            );
+            tracing::debug!(new_version, "commit complete");
+
+            Ok(())
+        }
     }
-}
 
-#[cfg(test)]
-impl CommittableSubstateDatabase for RocksDbStorage {
-    fn commit(&mut self, updates: &DatabaseUpdates) {
-        Self::commit(self, updates)
-            .expect("Storage commit failed - cannot maintain consistent state");
+    impl CommittableSubstateDatabase for RocksDbStorage {
+        fn commit(&mut self, updates: &DatabaseUpdates) {
+            Self::commit(self, updates)
+                .expect("Storage commit failed - cannot maintain consistent state");
+        }
     }
 }

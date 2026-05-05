@@ -19,8 +19,6 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-#[cfg(test)]
-use hyperscale_types::Hash;
 use hyperscale_types::{
     BlockHash, Bls12381G1PublicKey, ExecutionVote, GlobalReceiptRoot, ValidatorId, WaveId,
     WeightedTimestamp,
@@ -158,13 +156,6 @@ impl VoteTracker {
         self.pending_verification = false;
     }
 
-    /// Check if verification is pending.
-    #[cfg(test)]
-    #[must_use]
-    pub const fn is_verification_pending(&self) -> bool {
-        self.pending_verification
-    }
-
     // ═══════════════════════════════════════════════════════════════════════
     // Verified Vote Methods
     // ═══════════════════════════════════════════════════════════════════════
@@ -236,9 +227,17 @@ impl VoteTracker {
         }
         by_root.into_iter().collect()
     }
+}
+
+#[cfg(test)]
+impl VoteTracker {
+    /// Check if verification is pending.
+    #[must_use]
+    pub const fn is_verification_pending(&self) -> bool {
+        self.pending_verification
+    }
 
     /// Get votes for a specific global receipt root at any height (for tests).
-    #[cfg(test)]
     #[must_use]
     pub fn votes_for_global_receipt_root(
         &self,
@@ -256,7 +255,9 @@ impl VoteTracker {
 mod tests {
     use std::collections::BTreeSet;
 
-    use hyperscale_types::{BlockHeight, ShardGroupId, generate_bls_keypair, zero_bls_signature};
+    use hyperscale_types::{
+        BlockHeight, Hash, ShardGroupId, generate_bls_keypair, zero_bls_signature,
+    };
 
     use super::*;
 

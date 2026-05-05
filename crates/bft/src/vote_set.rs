@@ -9,8 +9,6 @@
 //! Own votes are recorded as already-verified via
 //! [`VoteSet::add_verified_vote`] since we just signed them.
 
-#[cfg(test)]
-use hyperscale_types::QuorumCertificate;
 use hyperscale_types::{
     BlockHash, BlockHeader, BlockHeight, BlockVote, Bls12381G1PublicKey, Round, VotePower,
     WeightedTimestamp,
@@ -328,89 +326,94 @@ impl VoteSet {
 
         true
     }
+}
 
-    /// Build a Quorum Certificate from collected votes (test only).
-    ///
-    /// Two-chain rule (HotStuff-2): when creating a QC for block N,
-    /// the committable block is at height N-1 (the parent). The committable
-    /// information is derived from the QC's height and `parent_block_hash`
-    /// via the `committable_height()` and `committable_hash()` methods.
-    ///
-    /// # Errors
-    ///
-    /// Returns error if called before reaching quorum or with no votes.
-    #[cfg(test)]
-    #[allow(clippy::absolute_paths)] // test-only fn; avoids cfg(test) use at module top
-    pub fn build_qc(
-        &mut self,
-        block_hash: BlockHash,
-        shard_group_id: hyperscale_types::ShardGroupId,
-    ) -> Result<QuorumCertificate, String> {
-        use hyperscale_types::{Bls12381G2Signature, SignerBitfield, WeightedTimestamp};
+#[cfg(test)]
+mod test_helpers {
+    use hyperscale_types::{Bls12381G2Signature, QuorumCertificate, ShardGroupId, SignerBitfield};
 
-        if self.verified_votes.is_empty() {
-            return Err("cannot build QC with no votes".to_string());
+    use super::*;
+
+    impl VoteSet {
+        /// Build a Quorum Certificate from collected votes (test only).
+        ///
+        /// Two-chain rule (HotStuff-2): when creating a QC for block N,
+        /// the committable block is at height N-1 (the parent). The committable
+        /// information is derived from the QC's height and `parent_block_hash`
+        /// via the `committable_height()` and `committable_hash()` methods.
+        ///
+        /// # Errors
+        ///
+        /// Returns error if called before reaching quorum or with no votes.
+        pub fn build_qc(
+            &mut self,
+            block_hash: BlockHash,
+            shard_group_id: ShardGroupId,
+        ) -> Result<QuorumCertificate, String> {
+            if self.verified_votes.is_empty() {
+                return Err("cannot build QC with no votes".to_string());
+            }
+
+            if self.qc_built {
+                return Err("QC already built from this vote set".to_string());
+            }
+
+            // Sort votes by committee index to ensure deterministic signature aggregation.
+            // This is critical: the aggregated signature must be built in the same order
+            // as the public keys will be aggregated during verification.
+            self.verified_votes.sort_by_key(|(idx, _, _)| *idx);
+
+            // Build signers bitfield - size based on max committee index
+            let max_idx = self
+                .verified_votes
+                .iter()
+                .map(|(idx, _, _)| *idx)
+                .max()
+                .unwrap_or(0);
+            let mut signers = SignerBitfield::new(max_idx + 1);
+            for (idx, _, _) in &self.verified_votes {
+                signers.set(*idx);
+            }
+
+            // Extract signatures in sorted order
+            let signatures: Vec<Bls12381G2Signature> = self
+                .verified_votes
+                .iter()
+                .map(|(_, v, _)| v.signature)
+                .collect();
+
+            // Aggregate BLS signatures
+            let aggregated_signature = Bls12381G2Signature::aggregate(&signatures, true)
+                .map_err(|e| format!("failed to aggregate signatures: {e:?}"))?;
+
+            // Compute stake-weighted timestamp: sum(timestamp * stake) / sum(stake)
+            let weighted_timestamp_ms = if self.verified_power == 0 {
+                0
+            } else {
+                // Mean of u64 timestamps weighted by u64 powers always fits in u64.
+                u64::try_from(self.verified_timestamp_weight_sum / u128::from(self.verified_power))
+                    .unwrap_or(u64::MAX)
+            };
+
+            let height = self.height.ok_or("no height in vote set")?;
+            let round = self.round.unwrap_or(Round::INITIAL);
+            let parent_block_hash = self
+                .parent_block_hash
+                .ok_or("no parent block hash in vote set")?;
+
+            self.qc_built = true;
+
+            Ok(QuorumCertificate {
+                block_hash,
+                shard_group_id,
+                height,
+                parent_block_hash,
+                round,
+                aggregated_signature,
+                signers,
+                weighted_timestamp: WeightedTimestamp(weighted_timestamp_ms),
+            })
         }
-
-        if self.qc_built {
-            return Err("QC already built from this vote set".to_string());
-        }
-
-        // Sort votes by committee index to ensure deterministic signature aggregation.
-        // This is critical: the aggregated signature must be built in the same order
-        // as the public keys will be aggregated during verification.
-        self.verified_votes.sort_by_key(|(idx, _, _)| *idx);
-
-        // Build signers bitfield - size based on max committee index
-        let max_idx = self
-            .verified_votes
-            .iter()
-            .map(|(idx, _, _)| *idx)
-            .max()
-            .unwrap_or(0);
-        let mut signers = SignerBitfield::new(max_idx + 1);
-        for (idx, _, _) in &self.verified_votes {
-            signers.set(*idx);
-        }
-
-        // Extract signatures in sorted order
-        let signatures: Vec<Bls12381G2Signature> = self
-            .verified_votes
-            .iter()
-            .map(|(_, v, _)| v.signature)
-            .collect();
-
-        // Aggregate BLS signatures
-        let aggregated_signature = Bls12381G2Signature::aggregate(&signatures, true)
-            .map_err(|e| format!("failed to aggregate signatures: {e:?}"))?;
-
-        // Compute stake-weighted timestamp: sum(timestamp * stake) / sum(stake)
-        let weighted_timestamp_ms = if self.verified_power == 0 {
-            0
-        } else {
-            // Mean of u64 timestamps weighted by u64 powers always fits in u64.
-            u64::try_from(self.verified_timestamp_weight_sum / u128::from(self.verified_power))
-                .unwrap_or(u64::MAX)
-        };
-
-        let height = self.height.ok_or("no height in vote set")?;
-        let round = self.round.unwrap_or(Round::INITIAL);
-        let parent_block_hash = self
-            .parent_block_hash
-            .ok_or("no parent block hash in vote set")?;
-
-        self.qc_built = true;
-
-        Ok(QuorumCertificate {
-            block_hash,
-            shard_group_id,
-            height,
-            parent_block_hash,
-            round,
-            aggregated_signature,
-            signers,
-            weighted_timestamp: WeightedTimestamp(weighted_timestamp_ms),
-        })
     }
 }
 
