@@ -20,6 +20,15 @@ use crate::commit_pipeline::CommitPipeline;
 /// consensus or QC adoption to make progress.
 const SPIN_WITHOUT_QC_ADVANCE_THRESHOLD: u64 = 3;
 
+/// Per-height cap on the future-block buffer. Prevents a Byzantine peer
+/// (or a small pool of them) from blowing up memory by pumping distinct
+/// fake blocks at the same height: we accept up to this many distinct
+/// hashes per height, then drop further arrivals. Honest blocks survive
+/// because legitimate consensus produces one block per (height, round)
+/// — even with extensive view changes you'd rarely exceed a handful of
+/// candidates per height.
+const MAX_BUFFERED_PER_HEIGHT: usize = 4;
+
 /// Synced block pending QC signature verification.
 ///
 /// When we receive a synced block, we must verify its QC signature before
@@ -64,8 +73,12 @@ pub struct BlockSyncManager {
     view_changes_at_last_qc_advance: u64,
 
     /// Buffered out-of-order synced blocks waiting for earlier blocks.
-    /// Maps height -> `CertifiedBlock`.
-    buffered_synced_blocks: BTreeMap<BlockHeight, CertifiedBlock>,
+    /// Maps `height` → `block_hash` → `CertifiedBlock`. Keying on hash (not
+    /// height alone) prevents a slot-squat attack where a Byzantine peer
+    /// races honest peers to plant a wrong-hash block at a future height
+    /// and we'd `Drop` the honest arrival as duplicate. Per-height entry
+    /// count is capped by `MAX_BUFFERED_PER_HEIGHT`.
+    buffered_synced_blocks: BTreeMap<BlockHeight, HashMap<BlockHash, CertifiedBlock>>,
 
     /// Synced blocks pending QC signature verification.
     /// Maps `block_hash` -> pending synced block info.
@@ -129,9 +142,31 @@ impl BlockSyncManager {
             .contains_key(block_hash)
     }
 
-    /// Check if a height is already buffered.
-    pub fn has_buffered_height(&self, height: BlockHeight) -> bool {
-        self.buffered_synced_blocks.contains_key(&height)
+    /// Check if `(height, block_hash)` is already buffered. Used by `ingest`
+    /// to dedup arrivals; keying on hash means a Byzantine wrong-hash block
+    /// at a future height doesn't shadow honest arrivals at the same height.
+    pub fn has_buffered(&self, height: BlockHeight, block_hash: &BlockHash) -> bool {
+        self.buffered_synced_blocks
+            .get(&height)
+            .is_some_and(|entries| entries.contains_key(block_hash))
+    }
+
+    /// Check if any candidate is buffered at `height`, regardless of hash.
+    /// Used by the chain-progress query that just wants to know whether the
+    /// next height has *some* block in the pipeline (it doesn't matter which
+    /// candidate eventually wins QC verification).
+    pub fn has_any_buffered_at_height(&self, height: BlockHeight) -> bool {
+        self.buffered_synced_blocks
+            .get(&height)
+            .is_some_and(|entries| !entries.is_empty())
+    }
+
+    /// Whether the per-height buffer cap leaves room for another arrival
+    /// at `height`. Returns `true` when no entries exist at `height` yet.
+    fn has_capacity_at(&self, height: BlockHeight) -> bool {
+        self.buffered_synced_blocks
+            .get(&height)
+            .is_none_or(|entries| entries.len() < MAX_BUFFERED_PER_HEIGHT)
     }
 
     /// Check if any pending verification has a block at the given height.
@@ -141,10 +176,30 @@ impl BlockSyncManager {
             .any(|p| p.certified.block.height() == height)
     }
 
-    /// Buffer a future synced block for later processing.
-    pub fn buffer_block(&mut self, height: BlockHeight, certified: CertifiedBlock) {
-        debug!(height = height.0, "Buffering future synced block for later");
-        self.buffered_synced_blocks.insert(height, certified);
+    /// Buffer a future synced block for later processing. Returns `false`
+    /// (and silently drops the arrival) when the per-height entry cap is
+    /// already saturated — the cap defends against memory exhaustion via
+    /// many distinct fake blocks at the same height.
+    pub fn buffer_block(&mut self, height: BlockHeight, certified: CertifiedBlock) -> bool {
+        if !self.has_capacity_at(height) {
+            warn!(
+                height = height.0,
+                cap = MAX_BUFFERED_PER_HEIGHT,
+                "Synced-block buffer at per-height cap — dropping arrival"
+            );
+            return false;
+        }
+        let block_hash = certified.block.hash();
+        debug!(
+            height = height.0,
+            ?block_hash,
+            "Buffering future synced block for later"
+        );
+        self.buffered_synced_blocks
+            .entry(height)
+            .or_default()
+            .insert(block_hash, certified);
+        true
     }
 
     /// Plan the next batch of buffered synced blocks to dispatch for QC
@@ -200,9 +255,10 @@ impl BlockSyncManager {
             return IngestOutcome::Drop;
         }
 
-        if self.has_buffered_height(height) {
+        if self.has_buffered(height, &block_hash) {
             info!(
                 height = height.0,
+                ?block_hash,
                 "Synced block already buffered - filtering"
             );
             return IngestOutcome::Drop;
@@ -214,8 +270,10 @@ impl BlockSyncManager {
         }
 
         if height > next_needed {
-            self.buffer_block(height, certified);
-            return IngestOutcome::Buffered;
+            if self.buffer_block(height, certified) {
+                return IngestOutcome::Buffered;
+            }
+            return IngestOutcome::Drop;
         }
 
         warn!(
@@ -399,8 +457,14 @@ impl BlockSyncManager {
 
     /// Drain buffered blocks that can be submitted for verification.
     ///
-    /// Returns blocks in sequential order starting from `start_height`,
-    /// up to `max_count` blocks.
+    /// Walks contiguous heights starting at `start_height`. At each height,
+    /// drains *every* buffered candidate (one Byzantine and several honest
+    /// blocks may sit at the same height under the slot-squat defense);
+    /// each gets dispatched for QC verification independently. Stops at the
+    /// first height with no buffered entries OR once `max_count` is reached.
+    /// May produce slightly more blocks than `max_count` so an entire
+    /// height's candidate set is delivered atomically — the per-height cap
+    /// (`MAX_BUFFERED_PER_HEIGHT`) bounds that overshoot.
     pub fn drain_buffered(
         &mut self,
         start_height: BlockHeight,
@@ -410,13 +474,18 @@ impl BlockSyncManager {
         let mut height = start_height;
 
         while result.len() < max_count {
-            if let Some(entry) = self.buffered_synced_blocks.remove(&height) {
-                debug!(height = height.0, "Draining buffered synced block");
-                result.push(entry);
-                height += 1u64;
-            } else {
+            let Some(entries) = self.buffered_synced_blocks.remove(&height) else {
                 break;
+            };
+            for (block_hash, certified) in entries {
+                debug!(
+                    height = height.0,
+                    ?block_hash,
+                    "Draining buffered synced block"
+                );
+                result.push(certified);
             }
+            height += 1u64;
         }
 
         result
@@ -449,9 +518,11 @@ impl BlockSyncManager {
             .retain(|_, pending| pending.certified.block.height() > committed_height);
     }
 
-    /// Number of buffered out-of-order synced blocks.
+    /// Total number of buffered candidates across all heights. May exceed
+    /// the unique-height count when multiple distinct hashes are buffered
+    /// at the same height (slot-squat defense).
     pub(crate) fn buffered_synced_blocks_len(&self) -> usize {
-        self.buffered_synced_blocks.len()
+        self.buffered_synced_blocks.values().map(HashMap::len).sum()
     }
 }
 
@@ -727,9 +798,52 @@ mod tests {
     fn ingest_buffers_future_block_and_stores_it() {
         let mut sm = BlockSyncManager::new();
         let cb = certified(BlockHeight(8), b"future");
+        let block_hash = cb.block.hash();
         let out = sm.ingest(cb, BlockHeight(5));
         assert!(matches!(out, IngestOutcome::Buffered));
-        assert!(sm.has_buffered_height(BlockHeight(8)));
+        assert!(sm.has_buffered(BlockHeight(8), &block_hash));
+        assert!(sm.has_any_buffered_at_height(BlockHeight(8)));
+    }
+
+    #[test]
+    fn ingest_distinct_hashes_at_same_height_both_buffered() {
+        // Slot-squat defense: a Byzantine wrong-hash block at a future
+        // height must not shadow honest arrivals at the same height.
+        // Pre-fix `has_buffered_height(h)` keyed only on height, so the
+        // honest block at `h` would have been dropped as duplicate.
+        let mut sm = BlockSyncManager::new();
+        let bogus = certified(BlockHeight(8), b"bogus");
+        let honest = certified(BlockHeight(8), b"honest");
+        let bogus_hash = bogus.block.hash();
+        let honest_hash = honest.block.hash();
+        assert!(matches!(
+            sm.ingest(bogus, BlockHeight(5)),
+            IngestOutcome::Buffered
+        ));
+        assert!(matches!(
+            sm.ingest(honest, BlockHeight(5)),
+            IngestOutcome::Buffered
+        ));
+        assert!(sm.has_buffered(BlockHeight(8), &bogus_hash));
+        assert!(sm.has_buffered(BlockHeight(8), &honest_hash));
+    }
+
+    #[test]
+    fn ingest_drops_when_per_height_cap_saturated() {
+        let mut sm = BlockSyncManager::new();
+        for i in 0u8..u8::try_from(MAX_BUFFERED_PER_HEIGHT).unwrap() {
+            let cb = certified(BlockHeight(8), &[i; 4]);
+            assert!(matches!(
+                sm.ingest(cb, BlockHeight(5)),
+                IngestOutcome::Buffered
+            ));
+        }
+        // Past the cap — drop with `IngestOutcome::Drop`.
+        let overflow = certified(BlockHeight(8), b"overflow");
+        assert!(matches!(
+            sm.ingest(overflow, BlockHeight(5)),
+            IngestOutcome::Drop
+        ));
     }
 
     // ─── next_submitable ────────────────────────────────────────────────

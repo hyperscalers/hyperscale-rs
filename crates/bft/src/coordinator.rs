@@ -3222,7 +3222,7 @@ impl BftCoordinator {
         }
 
         // In buffered synced blocks (synced blocks are always complete)
-        if self.block_sync.has_buffered_height(height) {
+        if self.block_sync.has_any_buffered_at_height(height) {
             return true;
         }
 
