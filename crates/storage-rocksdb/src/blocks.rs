@@ -3,31 +3,16 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-#[cfg(test)]
-use hyperscale_metrics::{
-    record_certificate_persisted, record_storage_batch_size, record_storage_write,
-};
 use hyperscale_metrics::{record_storage_operation, record_storage_read};
-#[cfg(test)]
-use hyperscale_storage::DatabaseUpdates;
 use hyperscale_types::{
     Block, BlockHeight, BlockMetadata, CertifiedBlock, FinalizedWave, Hash, ProvisionHash,
     QuorumCertificate, RoutableTransaction, TxHash, WaveCertificate, WaveId,
 };
-use rocksdb::{WriteBatch, WriteOptions};
-#[cfg(test)]
-use tracing::Span;
-#[cfg(test)]
-use tracing::field::Empty;
-#[cfg(test)]
-use tracing::{Level, instrument};
+use rocksdb::WriteBatch;
 
 use crate::column_families::{BlocksCf, CertificatesCf, TransactionsCf};
 use crate::core::RocksDbStorage;
-use crate::metadata::{
-    read_committed_hash, read_committed_height, read_committed_qc, write_committed_hash,
-    write_committed_height, write_committed_qc,
-};
+use crate::metadata::{read_committed_hash, read_committed_height, read_committed_qc};
 use crate::typed_cf::{TypedCf, batch_put, batch_put_raw};
 
 impl RocksDbStorage {
@@ -394,33 +379,6 @@ impl RocksDbStorage {
     // Chain metadata
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Set the highest committed block height and hash.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the synced `WriteBatch` fails — chain metadata writes
-    /// must succeed for BFT safety, so this is treated as fatal.
-    pub fn set_chain_metadata(
-        &self,
-        height: BlockHeight,
-        hash: Option<Hash>,
-        qc: Option<&QuorumCertificate>,
-    ) {
-        let mut batch = WriteBatch::default();
-        write_committed_height(&mut batch, height);
-        if let Some(h) = hash {
-            write_committed_hash(&mut batch, &h);
-        }
-        if let Some(qc) = qc {
-            write_committed_qc(&mut batch, qc);
-        }
-        let mut opts = WriteOptions::default();
-        opts.set_sync(true);
-        self.db
-            .write_opt(batch, &opts)
-            .expect("BFT SAFETY CRITICAL: chain metadata write failed");
-    }
-
     /// Get the chain metadata (committed height, hash, and QC).
     ///
     /// Reads all three chain metadata keys in one call. Use the individual
@@ -488,81 +446,125 @@ impl RocksDbStorage {
 
         certs
     }
+}
 
-    /// Atomically commit a wave certificate and its state writes.
-    ///
-    /// This is the deferred commit operation that applies state writes when
-    /// a `WaveCertificate` is included in a committed block.
-    ///
-    /// Uses a `RocksDB` `WriteBatch` for atomicity - either both the certificate
-    /// and state writes are persisted, or neither is.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the commit fails. This is intentional: if we cannot persist the
-    /// certificate and state writes, the node's state will diverge from the network.
-    #[cfg(test)]
-    #[instrument(level = Level::DEBUG, skip_all, fields(
-        wave_id = ?certificate.wave_id,
-        latency_us = Empty,
-        otel.kind = "INTERNAL",
-    ))]
-    pub fn commit_certificate_with_writes(
-        &self,
-        certificate: &WaveCertificate,
-        updates: &DatabaseUpdates,
-    ) {
-        use hyperscale_storage::PartitionDatabaseUpdates;
+// ─── Test-only helpers ───────────────────────────────────────────────────────
+//
+// These methods bypass the production `commit_lock` discipline (e.g.,
+// `set_chain_metadata` writes the chain-metadata keys outside the main
+// commit batch). They exist purely so tests can seed storage state without
+// going through full block commits. Gated to test builds so production
+// code can't accidentally call them.
+#[cfg(test)]
+mod test_helpers {
+    use hyperscale_metrics::{
+        record_certificate_persisted, record_storage_batch_size, record_storage_operation,
+        record_storage_write,
+    };
+    use hyperscale_storage::{DatabaseUpdates, PartitionDatabaseUpdates};
+    use hyperscale_types::{BlockHeight, Hash, QuorumCertificate, WaveCertificate};
+    use rocksdb::{WriteBatch, WriteOptions};
+    use tracing::field::Empty;
+    use tracing::{Level, Span, instrument};
 
-        let start = Instant::now();
-        let mut batch = WriteBatch::default();
-        let mut write_count = 0usize;
+    use super::Instant;
+    use crate::column_families::CertificatesCf;
+    use crate::core::RocksDbStorage;
+    use crate::metadata::{write_committed_hash, write_committed_height, write_committed_qc};
 
-        // 1. Serialize and add certificate to batch
-        self.cf_put::<CertificatesCf>(&mut batch, &certificate.wave_id, certificate);
-        write_count += 1;
-
-        // 2. Append substate writes to the cert batch at the current
-        //    JMT version. This helper is test-only; production goes
-        //    through `commit_block`. Delegate to
-        //    `append_substate_writes_to_batch` so the state-history
-        //    capture stays single-sourced.
-        let version = self.read_jmt_metadata().0;
-        let _reset_old_keys = self.append_substate_writes_to_batch(
-            &mut batch, updates, version, /* write_history */ true, /* base_reads */ None,
-        );
-        for (_db_node_key, node_updates) in &updates.node_updates {
-            for (_partition_num, partition_updates) in &node_updates.partition_updates {
-                if let PartitionDatabaseUpdates::Delta { substate_updates } = partition_updates {
-                    write_count += substate_updates.len();
-                }
+    impl RocksDbStorage {
+        /// Test-only seed for `committed_height` / `committed_hash` /
+        /// `latest_qc`. Production block commits write these three keys
+        /// inside the main commit batch via `append_consensus_to_batch`,
+        /// folded into the atomic JMT-update flush under `commit_lock`.
+        ///
+        /// # Panics
+        /// Panics if the synced `WriteBatch` fails.
+        pub fn set_chain_metadata(
+            &self,
+            height: BlockHeight,
+            hash: Option<Hash>,
+            qc: Option<&QuorumCertificate>,
+        ) {
+            let mut batch = WriteBatch::default();
+            write_committed_height(&mut batch, height);
+            if let Some(h) = hash {
+                write_committed_hash(&mut batch, &h);
             }
+            if let Some(qc) = qc {
+                write_committed_qc(&mut batch, qc);
+            }
+            let mut opts = WriteOptions::default();
+            opts.set_sync(true);
+            self.db
+                .write_opt(batch, &opts)
+                .expect("set_chain_metadata: synced write failed");
         }
 
-        // 3. Write batch atomically with sync for durability (JMT deferred to block commit)
-        let mut write_opts = WriteOptions::default();
-        write_opts.set_sync(true);
-
-        self.db.write_opt(batch, &write_opts).expect(
-            "BFT SAFETY CRITICAL: certificate commit failed - node state would diverge from network",
-        );
-
-        tracing::debug!(
+        /// Test-only deferred-commit shim for a single wave certificate
+        /// plus its state writes. Production goes through `commit_block`,
+        /// which folds the cert and state writes into the atomic
+        /// JMT-update batch under `commit_lock`.
+        ///
+        /// # Panics
+        /// Panics if the synced commit fails.
+        #[instrument(level = Level::DEBUG, skip_all, fields(
             wave_id = ?certificate.wave_id,
-            write_count,
-            "Certificate state writes committed (JMT deferred to block commit)"
-        );
+            latency_us = Empty,
+            otel.kind = "INTERNAL",
+        ))]
+        pub fn commit_certificate_with_writes(
+            &self,
+            certificate: &WaveCertificate,
+            updates: &DatabaseUpdates,
+        ) {
+            let start = Instant::now();
+            let mut batch = WriteBatch::default();
+            let mut write_count = 0usize;
 
-        let elapsed = start.elapsed();
-        record_storage_write(elapsed.as_secs_f64());
-        record_storage_operation("commit_cert_writes", elapsed.as_secs_f64());
-        record_storage_batch_size(write_count);
-        record_certificate_persisted();
+            self.cf_put::<CertificatesCf>(&mut batch, &certificate.wave_id, certificate);
+            write_count += 1;
 
-        // Record span fields
-        Span::current().record(
-            "latency_us",
-            u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
-        );
+            // Append substate writes to the cert batch at the current JMT
+            // version. Delegates to `append_substate_writes_to_batch` so
+            // the state-history capture stays single-sourced with the
+            // production commit path.
+            let version = self.read_jmt_metadata().0;
+            let _reset_old_keys = self.append_substate_writes_to_batch(
+                &mut batch, updates, version, /* write_history */ true,
+                /* base_reads */ None,
+            );
+            for (_db_node_key, node_updates) in &updates.node_updates {
+                for (_partition_num, partition_updates) in &node_updates.partition_updates {
+                    if let PartitionDatabaseUpdates::Delta { substate_updates } = partition_updates
+                    {
+                        write_count += substate_updates.len();
+                    }
+                }
+            }
+
+            let mut write_opts = WriteOptions::default();
+            write_opts.set_sync(true);
+            self.db
+                .write_opt(batch, &write_opts)
+                .expect("commit_certificate_with_writes: synced commit failed");
+
+            tracing::debug!(
+                wave_id = ?certificate.wave_id,
+                write_count,
+                "Certificate state writes committed (JMT deferred to block commit)"
+            );
+
+            let elapsed = start.elapsed();
+            record_storage_write(elapsed.as_secs_f64());
+            record_storage_operation("commit_cert_writes", elapsed.as_secs_f64());
+            record_storage_batch_size(write_count);
+            record_certificate_persisted();
+
+            Span::current().record(
+                "latency_us",
+                u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
+            );
+        }
     }
 }
