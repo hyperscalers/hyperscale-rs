@@ -33,7 +33,7 @@ pub mod vote;
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeSet, HashSet};
+    use std::collections::HashSet;
     use std::sync::Arc;
 
     use sbor::prelude::*;
@@ -367,18 +367,26 @@ mod tests {
 
     #[test]
     fn test_arc_vec_sbor_roundtrip() {
+        // Both WCs satisfy the local-EC invariant: their wave_id matches
+        // exactly one of the contained ECs.
+        let wid0 = make_wave_id(0, BlockHeight(42), &[1]);
+        let wid1 = make_wave_id(1, BlockHeight(42), &[]);
+        let local_ec_for_wid1 = Arc::new(ExecutionCertificate::new(
+            wid1.clone(),
+            WeightedTimestamp(43),
+            GlobalReceiptRoot::from_raw(Hash::from_bytes(&[103u8; 4])),
+            vec![make_outcome(3)],
+            Bls12381G2Signature([0u8; 96]),
+            SignerBitfield::new(4),
+        ));
         let certs = vec![
             Arc::new(WaveCertificate {
-                wave_id: make_wave_id(0, BlockHeight(42), &[1]),
+                wave_id: wid0,
                 execution_certificates: vec![make_test_wave_ec(0, 1)],
             }),
             Arc::new(WaveCertificate {
-                wave_id: WaveId {
-                    shard_group_id: ShardGroupId(0),
-                    block_height: BlockHeight(42),
-                    remote_shards: BTreeSet::new(),
-                },
-                execution_certificates: vec![make_test_wave_ec(1, 3)],
+                wave_id: wid1,
+                execution_certificates: vec![local_ec_for_wid1],
             }),
         ];
 
@@ -394,6 +402,53 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].as_ref(), certs[0].as_ref());
         assert_eq!(result[1].as_ref(), certs[1].as_ref());
+    }
+
+    #[test]
+    fn decode_rejects_wave_cert_missing_local_ec() {
+        use sbor::DecodeError;
+        // WC's wave_id has shard=0 but its only EC is for shard=1, so no
+        // ec.wave_id matches wc.wave_id. Pre-fix this decoded successfully
+        // and then panicked the IO loop on first call to local_ec().
+        let wc = WaveCertificate {
+            wave_id: make_wave_id(0, BlockHeight(42), &[1]),
+            execution_certificates: vec![make_test_wave_ec(1, 1)],
+        };
+        let bytes = basic_encode(&wc).unwrap();
+        let err = basic_decode::<WaveCertificate>(&bytes).unwrap_err();
+        assert!(matches!(err, DecodeError::InvalidCustomValue));
+    }
+
+    #[test]
+    fn decode_rejects_wave_cert_with_oversized_ec_count() {
+        use sbor::{
+            BASIC_SBOR_V1_PAYLOAD_PREFIX, DecodeError, Encoder, NoCustomValueKind, ValueKind,
+            VecEncoder,
+        };
+        // Hand-roll a WC whose execution_certificates count exceeds the
+        // decoder cap, before any per-EC decode work happens.
+        let wave_id = make_wave_id(0, BlockHeight(42), &[1]);
+        let mut buf = Vec::with_capacity(64);
+        {
+            let mut enc = VecEncoder::<NoCustomValueKind>::new(&mut buf, BASIC_SBOR_V1_MAX_DEPTH);
+            enc.write_payload_prefix(BASIC_SBOR_V1_PAYLOAD_PREFIX)
+                .unwrap();
+            enc.write_value_kind(ValueKind::Tuple).unwrap();
+            enc.write_size(2).unwrap();
+            enc.encode(&wave_id).unwrap();
+            enc.write_value_kind(ValueKind::Array).unwrap();
+            enc.write_value_kind(ValueKind::Tuple).unwrap();
+            // 1024 + 1 — first value above the decoder cap.
+            enc.write_size(1025).unwrap();
+        }
+        let err = basic_decode::<WaveCertificate>(&buf).unwrap_err();
+        assert!(matches!(
+            err,
+            DecodeError::UnexpectedSize {
+                expected: 1024,
+                actual: 1025
+            }
+        ));
     }
 
     #[test]

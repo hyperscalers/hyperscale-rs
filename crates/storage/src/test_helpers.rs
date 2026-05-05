@@ -85,14 +85,24 @@ pub fn make_mapped_database_update(
 }
 
 /// Build a test `WaveCertificate` at the given height.
+///
+/// Includes a single placeholder local EC so the certificate satisfies the
+/// invariant enforced at decode time (one EC per wave whose `wave_id` matches
+/// `wc.wave_id`).
 #[must_use]
-pub const fn make_test_wave_certificate(
-    height: BlockHeight,
-    shard: ShardGroupId,
-) -> WaveCertificate {
+pub fn make_test_wave_certificate(height: BlockHeight, shard: ShardGroupId) -> WaveCertificate {
+    let wave_id = WaveId::new(shard, height, BTreeSet::new());
+    let local_ec = Arc::new(ExecutionCertificate::new(
+        wave_id.clone(),
+        WeightedTimestamp(0),
+        GlobalReceiptRoot::ZERO,
+        Vec::new(),
+        Bls12381G2Signature([0u8; 96]),
+        SignerBitfield::empty(),
+    ));
     WaveCertificate {
-        wave_id: WaveId::new(shard, height, BTreeSet::new()),
-        execution_certificates: vec![],
+        wave_id,
+        execution_certificates: vec![local_ec],
     }
 }
 
@@ -200,6 +210,11 @@ pub fn make_test_execution_certificate(
 }
 
 /// Build a test block that carries ECs inside its wave certificates.
+///
+/// Callers supply ECs whose `wave_id` matches the wave-certificate's
+/// `wave_id` (callers in this module use [`make_test_execution_certificate`]
+/// at the same `(shard, height)`), so the local-EC invariant enforced at
+/// decode time is satisfied without injecting a placeholder.
 fn make_test_block_with_ecs(height: BlockHeight, ecs: Vec<Arc<ExecutionCertificate>>) -> Block {
     let block = make_test_block(height);
     if ecs.is_empty() {

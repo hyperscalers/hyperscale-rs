@@ -12,10 +12,26 @@ use hyperscale_storage::{
     merge_database_updates, merge_into,
 };
 use hyperscale_types::{
-    Block, BlockHash, BlockHeight, ConsensusReceipt, FinalizedWave, GlobalReceiptHash, Hash,
-    ProposerTimestamp, QuorumCertificate, Round, ShardGroupId, StateRoot, StoredReceipt, TxHash,
+    Block, BlockHash, BlockHeight, Bls12381G2Signature, ConsensusReceipt, ExecutionCertificate,
+    FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, ProposerTimestamp,
+    QuorumCertificate, Round, ShardGroupId, SignerBitfield, StateRoot, StoredReceipt, TxHash,
     WaveCertificate, WaveId, WeightedTimestamp,
 };
+
+/// Build a placeholder EC whose `wave_id` matches the WC the caller is about
+/// to construct, so the WC satisfies the local-EC invariant enforced at
+/// SBOR decode time. The EC carries no signers / outcomes — these tests
+/// exercise the storage codec, not consensus.
+fn placeholder_local_ec(shard: ShardGroupId, height: BlockHeight) -> Arc<ExecutionCertificate> {
+    Arc::new(ExecutionCertificate::new(
+        WaveId::new(shard, height, std::collections::BTreeSet::new()),
+        WeightedTimestamp(0),
+        GlobalReceiptRoot::ZERO,
+        Vec::new(),
+        Bls12381G2Signature([0u8; 96]),
+        SignerBitfield::empty(),
+    ))
+}
 use sbor::prelude::IndexMap;
 use tempfile::TempDir;
 
@@ -392,7 +408,7 @@ fn attach_receipts(block: &mut Block, receipts: Vec<StoredReceipt>) {
                 block.height(),
                 std::collections::BTreeSet::new(),
             ),
-            execution_certificates: vec![],
+            execution_certificates: vec![placeholder_local_ec(ShardGroupId(0), block.height())],
         }),
         receipts,
     });
@@ -930,7 +946,7 @@ fn rocks_commit_with(
                     block.height(),
                     std::collections::BTreeSet::new(),
                 ),
-                execution_certificates: vec![],
+                execution_certificates: vec![placeholder_local_ec(ShardGroupId(0), block.height())],
             }),
             receipts: vec![receipt],
         });

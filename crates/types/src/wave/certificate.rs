@@ -13,6 +13,17 @@ use sbor::{
 
 use crate::{ExecutionCertificate, Hash, WaveId, WaveReceiptHash};
 
+/// Cap on execution certificates accepted in a single `WaveCertificate` at
+/// decode time.
+///
+/// A wave's EC set is one local EC plus at most one EC per participating
+/// remote shard (and may include a few extras if a remote shard committed
+/// the wave's transactions across multiple blocks). 1024 is well above any
+/// realistic shard count and bounds the per-element pre-allocation that
+/// would otherwise let a peer claim billions of inner ECs and OOM the
+/// validator at decode time.
+const MAX_EXECUTION_CERTIFICATES_PER_WAVE: usize = 1024;
+
 /// Wave certificate — proof of execution finalization for a wave.
 ///
 /// Contains the execution certificates from all participating shards.
@@ -110,11 +121,26 @@ impl<D: Decoder<NoCustomValueKind>> Decode<NoCustomValueKind, D> for WaveCertifi
         decoder.read_and_check_value_kind(ValueKind::Array)?;
         decoder.read_and_check_value_kind(ValueKind::Tuple)?;
         let count = decoder.read_size()?;
+        if count > MAX_EXECUTION_CERTIFICATES_PER_WAVE {
+            return Err(DecodeError::UnexpectedSize {
+                expected: MAX_EXECUTION_CERTIFICATES_PER_WAVE,
+                actual: count,
+            });
+        }
         let mut execution_certificates = Vec::with_capacity(count);
         for _ in 0..count {
             let ec: ExecutionCertificate =
                 decoder.decode_deeper_body_with_value_kind(ValueKind::Tuple)?;
             execution_certificates.push(Arc::new(ec));
+        }
+        // Reject any WC that violates the local-EC invariant. Without this
+        // check a peer-supplied WC reaches `FinalizedWave::local_ec()`,
+        // which panics on the missing match.
+        if !execution_certificates
+            .iter()
+            .any(|ec| ec.wave_id == wave_id)
+        {
+            return Err(DecodeError::InvalidCustomValue);
         }
         Ok(Self {
             wave_id,
