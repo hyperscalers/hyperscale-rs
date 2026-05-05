@@ -8,6 +8,12 @@ use std::env;
 
 use hex::{decode, encode};
 use hyperscale_types::{bls_keypair_from_seed, generate_bls_keypair};
+#[cfg(not(target_env = "msvc"))]
+use tikv_jemallocator::Jemalloc;
+
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
 
 fn main() {
     let args: Vec<String> = env::args().collect();

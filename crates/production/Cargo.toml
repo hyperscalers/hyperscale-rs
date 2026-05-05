@@ -88,6 +88,9 @@ rand.workspace = true
 radix-common.workspace = true
 tracing-appender = "0.2.4"
 
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { version = "0.6", features = ["background_threads", "unprefixed_malloc_on_supported_platforms"] }
+
 [dev-dependencies]
 hyperscale-dispatch-sync.workspace = true
 tempfile.workspace = true
