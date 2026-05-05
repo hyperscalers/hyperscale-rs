@@ -160,7 +160,8 @@ impl VoteSet {
 
     /// Buffer an unverified vote for later batch verification.
     ///
-    /// Returns `true` if the vote was buffered, `false` if it was a duplicate.
+    /// Returns `true` if the vote was buffered, `false` if it was rejected
+    /// (out-of-range committee index or duplicate).
     pub fn buffer_unverified_vote(
         &mut self,
         committee_index: usize,
@@ -168,6 +169,12 @@ impl VoteSet {
         public_key: Bls12381G1PublicKey,
         voting_power: u64,
     ) -> bool {
+        // Reject malformed index: with no dedup slot we couldn't track the
+        // vote, so a Byzantine sender could buffer arbitrarily many copies.
+        if committee_index >= self.seen_validators.len() {
+            return false;
+        }
+
         // Check for duplicate
         if self.has_seen_validator(committee_index) {
             return false;
@@ -180,11 +187,7 @@ impl VoteSet {
             self.round = Some(vote.round);
         }
 
-        // Mark as seen
-        if committee_index < self.seen_validators.len() {
-            self.seen_validators[committee_index] = true;
-        }
-
+        self.seen_validators[committee_index] = true;
         self.unverified_power += voting_power;
         self.unverified_votes
             .push((committee_index, vote, public_key, voting_power));
@@ -286,13 +289,19 @@ impl VoteSet {
     /// Add an already-verified vote to the set — used for own votes, which
     /// we just signed and so can treat as verified without a BLS check.
     /// Also used by tests that want to seed verified state directly.
-    /// Returns true on insertion, false if the validator has already voted.
+    /// Returns true on insertion, false if rejected (out-of-range committee
+    /// index or duplicate).
     pub fn add_verified_vote(
         &mut self,
         committee_index: usize,
         vote: BlockVote,
         voting_power: u64,
     ) -> bool {
+        // Reject malformed index: see `buffer_unverified_vote` for rationale.
+        if committee_index >= self.seen_validators.len() {
+            return false;
+        }
+
         // Check for duplicate
         if self.has_seen_validator(committee_index) {
             return false;
@@ -305,10 +314,7 @@ impl VoteSet {
             self.round = Some(vote.round);
         }
 
-        // Mark as seen
-        if committee_index < self.seen_validators.len() {
-            self.seen_validators[committee_index] = true;
-        }
+        self.seen_validators[committee_index] = true;
 
         // Per-vote monotonicity clamp; see `on_votes_verified` for rationale.
         let floor_ms = self
