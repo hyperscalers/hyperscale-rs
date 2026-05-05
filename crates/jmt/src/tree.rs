@@ -345,6 +345,13 @@ where
     S: TreeReader,
     H: Hasher,
 {
+    // `BitRangeIter` (the bucket grouper used below) assumes `kvs` is
+    // sorted by key. The top-level `update` sorts at entry; this guard
+    // catches a future caller wiring a recursion that bypasses the sort.
+    debug_assert!(
+        kvs.windows(2).all(|w| w[0].0 <= w[1].0),
+        "update_existing_internal: kvs must be sorted by key",
+    );
     let arity = 1usize << ARITY_BITS as usize;
     let parent_depth = parent_path.len();
 
