@@ -1,23 +1,40 @@
 //! Bitfield for tracking which validators have signed.
 
 use sbor::prelude::*;
+use sbor::{
+    Categorize, Decode, DecodeError, Decoder, Describe, Encode, EncodeError, Encoder,
+    NoCustomTypeKind, NoCustomValueKind, RustTypeId, TypeData, TypeKind, ValueKind,
+};
+
+/// Hard cap on validators a single bitfield may describe.
+///
+/// Bounds attacker-controlled `num_validators` decoded from the wire so
+/// `set_indices()` and `set(_)` cannot iterate or index past sane committee
+/// sizes. Sized ~40× the current production committee (100); covers any
+/// realistic scaling without permitting OOM/DoS via crafted headers.
+pub const MAX_VALIDATORS: usize = 4096;
 
 /// A compact bitfield representing which validators have signed.
 ///
 /// Used in `QuorumCertificate` and other aggregated structures to track
 /// which validators contributed to the aggregated signature.
-#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignerBitfield {
-    /// The bitfield bytes.
     bits: Vec<u8>,
-    /// Number of validators (bits that are valid).
     num_validators: usize,
 }
 
 impl SignerBitfield {
     /// Create a new empty bitfield for the given number of validators.
+    ///
+    /// # Panics
+    /// Panics if `num_validators > MAX_VALIDATORS`.
     #[must_use]
     pub fn new(num_validators: usize) -> Self {
+        assert!(
+            num_validators <= MAX_VALIDATORS,
+            "num_validators {num_validators} exceeds MAX_VALIDATORS {MAX_VALIDATORS}"
+        );
         let num_bytes = num_validators.div_ceil(8);
         Self {
             bits: vec![0u8; num_bytes],
@@ -102,8 +119,71 @@ impl Default for SignerBitfield {
     }
 }
 
+// SBOR: encode as `(Vec<u8>, usize)` matching the prior derived layout, with
+// a manual decoder that rejects attacker-supplied (bits, num_validators) pairs
+// where the bit-length and byte-vector are inconsistent or where
+// num_validators exceeds MAX_VALIDATORS. Without these checks a peer can
+// supply num_validators = u64::MAX, hanging set_indices() and panicking set().
+
+impl<E: Encoder<NoCustomValueKind>> Encode<NoCustomValueKind, E> for SignerBitfield {
+    fn encode_value_kind(&self, encoder: &mut E) -> Result<(), EncodeError> {
+        encoder.write_value_kind(ValueKind::Tuple)
+    }
+
+    fn encode_body(&self, encoder: &mut E) -> Result<(), EncodeError> {
+        encoder.write_size(2)?;
+        encoder.encode(&self.bits)?;
+        encoder.encode(&self.num_validators)?;
+        Ok(())
+    }
+}
+
+impl<D: Decoder<NoCustomValueKind>> Decode<NoCustomValueKind, D> for SignerBitfield {
+    fn decode_body_with_value_kind(
+        decoder: &mut D,
+        value_kind: ValueKind<NoCustomValueKind>,
+    ) -> Result<Self, DecodeError> {
+        decoder.check_preloaded_value_kind(value_kind, ValueKind::Tuple)?;
+        let length = decoder.read_size()?;
+        if length != 2 {
+            return Err(DecodeError::UnexpectedSize {
+                expected: 2,
+                actual: length,
+            });
+        }
+        let bits: Vec<u8> = decoder.decode()?;
+        let num_validators: usize = decoder.decode()?;
+        if num_validators > MAX_VALIDATORS {
+            return Err(DecodeError::InvalidCustomValue);
+        }
+        if bits.len() != num_validators.div_ceil(8) {
+            return Err(DecodeError::InvalidCustomValue);
+        }
+        Ok(Self {
+            bits,
+            num_validators,
+        })
+    }
+}
+
+impl Categorize<NoCustomValueKind> for SignerBitfield {
+    fn value_kind() -> ValueKind<NoCustomValueKind> {
+        ValueKind::Tuple
+    }
+}
+
+impl Describe<NoCustomTypeKind> for SignerBitfield {
+    const TYPE_ID: RustTypeId = RustTypeId::novel_with_code("SignerBitfield", &[], &[]);
+
+    fn type_data() -> TypeData<NoCustomTypeKind, RustTypeId> {
+        TypeData::unnamed(TypeKind::Any)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use sbor::{basic_decode, basic_encode};
+
     use super::*;
 
     #[test]
@@ -153,5 +233,58 @@ mod tests {
         assert!(bf.is_empty());
         assert_eq!(bf.num_validators(), 0);
         assert!(!bf.is_set(0));
+    }
+
+    #[test]
+    fn sbor_roundtrip() {
+        let mut bf = SignerBitfield::new(100);
+        for i in (0..100).step_by(3) {
+            bf.set(i);
+        }
+        let bytes = basic_encode(&bf).unwrap();
+        let decoded: SignerBitfield = basic_decode(&bytes).unwrap();
+        assert_eq!(bf, decoded);
+    }
+
+    #[test]
+    fn decode_rejects_oversized_num_validators() {
+        // Hand-roll a bitfield with num_validators > MAX_VALIDATORS.
+        let attacker = ManualBitfield {
+            bits: vec![0u8; (MAX_VALIDATORS + 8).div_ceil(8)],
+            num_validators: MAX_VALIDATORS + 1,
+        };
+        let bytes = basic_encode(&attacker).unwrap();
+        assert!(basic_decode::<SignerBitfield>(&bytes).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_inconsistent_lengths() {
+        // num_validators says 100 but only one byte of bits supplied.
+        let attacker = ManualBitfield {
+            bits: vec![0u8; 1],
+            num_validators: 100,
+        };
+        let bytes = basic_encode(&attacker).unwrap();
+        assert!(basic_decode::<SignerBitfield>(&bytes).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_empty_bits_with_huge_num_validators() {
+        // The exact attack pattern: bits empty, num_validators large.
+        // Pre-fix this would decode and then panic in set(0) / hang in set_indices().
+        let attacker = ManualBitfield {
+            bits: Vec::new(),
+            num_validators: usize::MAX,
+        };
+        let bytes = basic_encode(&attacker).unwrap();
+        assert!(basic_decode::<SignerBitfield>(&bytes).is_err());
+    }
+
+    /// Mirror of the `SignerBitfield` wire layout, used in tests to forge
+    /// payloads that the production decoder must reject.
+    #[derive(BasicSbor)]
+    struct ManualBitfield {
+        bits: Vec<u8>,
+        num_validators: usize,
     }
 }
