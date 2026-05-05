@@ -369,32 +369,29 @@ impl FetchBinding for ExecCertBinding {
             origin.class_override(),
             Box::new(move |result| {
                 if let Ok(response) = result {
-                    match response.certificates {
-                        Some(certs) if !certs.is_empty() => {
-                            let delivered: HashSet<WaveId> =
-                                certs.iter().map(|c| c.wave_id.clone()).collect();
-                            let missing: Vec<WaveId> = failed_ids
-                                .into_iter()
-                                .filter(|id| !delivered.contains(id))
-                                .collect();
-                            let had_misses = !missing.is_empty();
-                            // Refcount is 1 right after decode, so each unwrap moves.
-                            let certificates =
-                                certs.into_iter().map(Arc::unwrap_or_clone).collect();
-                            let _ = es.send(NodeInput::Protocol(Box::new(
-                                ProtocolEvent::ExecutionCertificatesReceived { certificates },
-                            )));
-                            if had_misses {
-                                let _ = es.send(NodeInput::ExecCertFetchFailed { hashes: missing });
-                                ResponseVerdict::Reject
-                            } else {
-                                ResponseVerdict::Accept
-                            }
-                        }
-                        _ => {
-                            let _ = es.send(NodeInput::ExecCertFetchFailed { hashes: failed_ids });
-                            ResponseVerdict::Reject
-                        }
+                    let certs = response.certificates.unwrap_or_default();
+                    let split = partition_solicited(certs, &failed_ids, |c| c.wave_id.clone());
+                    let had_misses = !split.missing.is_empty();
+                    if !split.kept.is_empty() {
+                        // Refcount is 1 right after decode, so each unwrap moves.
+                        let certificates =
+                            split.kept.into_iter().map(Arc::unwrap_or_clone).collect();
+                        let _ = es.send(NodeInput::Protocol(Box::new(
+                            ProtocolEvent::ExecutionCertificatesReceived { certificates },
+                        )));
+                    }
+                    if had_misses {
+                        let _ = es.send(NodeInput::ExecCertFetchFailed {
+                            hashes: split.missing,
+                        });
+                    }
+                    // Reject the response if the peer shipped unsolicited
+                    // ECs (peer scoring; also avoids wasted BLS verification
+                    // on items we never asked for) or any missing id.
+                    if split.unsolicited > 0 || had_misses {
+                        ResponseVerdict::Reject
+                    } else {
+                        ResponseVerdict::Accept
                     }
                 } else {
                     let _ = es.send(NodeInput::ExecCertFetchFailed { hashes: failed_ids });
