@@ -143,7 +143,12 @@ impl Drop for ShutdownHandle {
 
 /// Builder for constructing a [`ProductionRunner`].
 ///
-/// Required fields:
+/// Required fields are passed directly to
+/// [`ProductionRunner::builder`](crate::ProductionRunner::builder); optional
+/// fields are set via `&mut self` chained setters and then [`Self::build`]
+/// is called.
+///
+/// Required fields (taken at construction):
 /// - `topology` - Network topology defining validators and shards
 /// - `signing_key` - BLS keypair for signing votes and proposals
 /// - `bft_config` - Consensus configuration parameters
@@ -154,12 +159,12 @@ impl Drop for ShutdownHandle {
 /// - `dispatch` - Dispatch implementation (defaults to auto-configured)
 /// - `channel_capacity` - Event channel capacity (defaults to 10,000)
 pub struct ProductionRunnerBuilder {
-    topology: Option<TopologyCoordinator>,
-    signing_key: Option<Bls12381G1PrivateKey>,
-    bft_config: Option<BftConfig>,
+    topology: TopologyCoordinator,
+    signing_key: Bls12381G1PrivateKey,
+    bft_config: BftConfig,
+    storage: Arc<RocksDbStorage>,
+    network_config: Libp2pConfig,
     dispatch: Option<Arc<PooledDispatch>>,
-    storage: Option<Arc<RocksDbStorage>>,
-    network_config: Option<Libp2pConfig>,
     channel_capacity: usize,
     rpc_status: Option<Arc<ArcSwap<NodeStatusState>>>,
     mempool_snapshot: Option<Arc<ArcSwap<MempoolSnapshot>>>,
@@ -175,23 +180,24 @@ pub struct ProductionRunnerBuilder {
     provision_config: ProvisionConfig,
 }
 
-impl Default for ProductionRunnerBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl ProductionRunnerBuilder {
-    /// Create a new builder with default channel capacity.
+    /// Create a new builder with the required fields. Optional fields use
+    /// their defaults until overridden via the setter methods.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(
+        topology: TopologyCoordinator,
+        signing_key: Bls12381G1PrivateKey,
+        bft_config: BftConfig,
+        storage: Arc<RocksDbStorage>,
+        network_config: Libp2pConfig,
+    ) -> Self {
         Self {
-            topology: None,
-            signing_key: None,
-            bft_config: None,
+            topology,
+            signing_key,
+            bft_config,
+            storage,
+            network_config,
             dispatch: None,
-            storage: None,
-            network_config: None,
             channel_capacity: 10_000,
             rpc_status: None,
             mempool_snapshot: None,
@@ -210,45 +216,10 @@ impl ProductionRunnerBuilder {
         self
     }
 
-    /// Set the network topology.
-    #[must_use]
-    pub fn topology(mut self, topology: TopologyCoordinator) -> Self {
-        self.topology = Some(topology);
-        self
-    }
-
-    /// Set the BLS signing key for votes and proposals.
-    #[must_use]
-    pub fn signing_key(mut self, key: Bls12381G1PrivateKey) -> Self {
-        self.signing_key = Some(key);
-        self
-    }
-
-    /// Set the BFT consensus configuration.
-    #[must_use]
-    pub const fn bft_config(mut self, config: BftConfig) -> Self {
-        self.bft_config = Some(config);
-        self
-    }
-
     /// Set the dispatch implementation (optional, defaults to auto-configured pools).
     #[must_use]
     pub fn dispatch(mut self, dispatch: Arc<PooledDispatch>) -> Self {
         self.dispatch = Some(dispatch);
-        self
-    }
-
-    /// Set the `RocksDB` storage for persistence and crash recovery.
-    #[must_use]
-    pub fn storage(mut self, storage: Arc<RocksDbStorage>) -> Self {
-        self.storage = Some(storage);
-        self
-    }
-
-    /// Set the network configuration for libp2p.
-    #[must_use]
-    pub fn network(mut self, config: Libp2pConfig) -> Self {
-        self.network_config = Some(config);
         self
     }
 
@@ -312,28 +283,25 @@ impl ProductionRunnerBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`RunnerError::SendError`] if any required builder field is
-    /// missing, or [`RunnerError::NetworkError`] if libp2p setup fails.
+    /// Returns [`RunnerError::SendError`] if dispatch initialization fails,
+    /// or [`RunnerError::NetworkError`] if libp2p setup fails.
     #[allow(clippy::too_many_lines)] // straight-line construction; further splits add no clarity
     pub fn build(self) -> Result<ProductionRunner, RunnerError> {
         // Install the Prometheus metrics backend before anything records metrics.
         install();
 
-        let RequiredFields {
-            topology_state,
-            signing_key,
-            bft_config,
-            dispatch,
-            storage,
-            network_config,
-        } = take_required_fields(
-            self.topology,
-            self.signing_key,
-            self.bft_config,
-            self.dispatch,
-            self.storage,
-            self.network_config,
-        )?;
+        let topology_state = self.topology;
+        let signing_key = self.signing_key;
+        let bft_config = self.bft_config;
+        let storage = self.storage;
+        let network_config = self.network_config;
+        let dispatch = match self.dispatch {
+            Some(pools) => pools,
+            None => Arc::new(
+                PooledDispatch::new(ThreadPoolConfig::minimal(), TokioHandle::current())
+                    .map_err(|e| RunnerError::SendError(e.to_string()))?,
+            ),
+        };
 
         let ed25519_keypair = generate_random_keypair();
 
@@ -515,10 +483,19 @@ pub struct ProductionRunner {
 }
 
 impl ProductionRunner {
-    /// Create a new builder for constructing a production runner.
+    /// Create a new builder for constructing a production runner. The
+    /// required fields are taken at construction; optional fields are then
+    /// set via the builder's setters before calling
+    /// [`ProductionRunnerBuilder::build`].
     #[must_use]
-    pub fn builder() -> ProductionRunnerBuilder {
-        ProductionRunnerBuilder::new()
+    pub fn builder(
+        topology: TopologyCoordinator,
+        signing_key: Bls12381G1PrivateKey,
+        bft_config: BftConfig,
+        storage: Arc<RocksDbStorage>,
+        network_config: Libp2pConfig,
+    ) -> ProductionRunnerBuilder {
+        ProductionRunnerBuilder::new(topology, signing_key, bft_config, storage, network_config)
     }
 
     /// Get a reference to the dispatch implementation.
@@ -826,48 +803,6 @@ impl ProductionRunner {
             }
         }
     }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Build helpers
-// ═══════════════════════════════════════════════════════════════════════════
-
-struct RequiredFields {
-    topology_state: TopologyCoordinator,
-    signing_key: Bls12381G1PrivateKey,
-    bft_config: BftConfig,
-    dispatch: Arc<PooledDispatch>,
-    storage: Arc<RocksDbStorage>,
-    network_config: Libp2pConfig,
-}
-
-fn take_required_fields(
-    topology: Option<TopologyCoordinator>,
-    signing_key: Option<Bls12381G1PrivateKey>,
-    bft_config: Option<BftConfig>,
-    dispatch: Option<Arc<PooledDispatch>>,
-    storage: Option<Arc<RocksDbStorage>>,
-    network_config: Option<Libp2pConfig>,
-) -> Result<RequiredFields, RunnerError> {
-    let dispatch = match dispatch {
-        Some(pools) => pools,
-        None => Arc::new(
-            PooledDispatch::new(ThreadPoolConfig::minimal(), TokioHandle::current())
-                .map_err(|e| RunnerError::SendError(e.to_string()))?,
-        ),
-    };
-    Ok(RequiredFields {
-        topology_state: topology
-            .ok_or_else(|| RunnerError::SendError("topology is required".into()))?,
-        signing_key: signing_key
-            .ok_or_else(|| RunnerError::SendError("signing_key is required".into()))?,
-        bft_config: bft_config
-            .ok_or_else(|| RunnerError::SendError("bft_config is required".into()))?,
-        dispatch,
-        storage: storage.ok_or_else(|| RunnerError::SendError("storage is required".into()))?,
-        network_config: network_config
-            .ok_or_else(|| RunnerError::SendError("network is required".into()))?,
-    })
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

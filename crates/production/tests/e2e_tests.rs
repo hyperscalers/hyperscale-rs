@@ -474,13 +474,14 @@ async fn test_production_runner_with_network() {
         ..Default::default()
     };
 
-    let runner = ProductionRunner::builder()
-        .topology(fixtures.topology(0))
-        .signing_key(fixtures.signing_key(0))
-        .bft_config(BftConfig::default())
-        .storage(storage)
-        .network(network_config)
-        .build();
+    let runner = ProductionRunner::builder(
+        fixtures.topology(0),
+        fixtures.signing_key(0),
+        BftConfig::default(),
+        storage,
+        network_config,
+    )
+    .build();
 
     assert!(runner.is_ok(), "Runner creation should succeed");
     let mut runner = runner.unwrap();
@@ -533,14 +534,15 @@ async fn test_graceful_shutdown() {
         ..Default::default()
     };
 
-    let mut runner = ProductionRunner::builder()
-        .topology(fixtures.topology(0))
-        .signing_key(fixtures.signing_key(0))
-        .bft_config(BftConfig::default())
-        .storage(storage)
-        .network(network_config)
-        .build()
-        .unwrap();
+    let mut runner = ProductionRunner::builder(
+        fixtures.topology(0),
+        fixtures.signing_key(0),
+        BftConfig::default(),
+        storage,
+        network_config,
+    )
+    .build()
+    .unwrap();
 
     let shutdown = runner
         .shutdown_handle()

@@ -1301,18 +1301,19 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
     // Create production runner first (before RPC server)
     // The runner creates the crossbeam event channel that the RPC server needs
     // for submitting transactions directly to IoLoop.
-    let mut runner_builder = ProductionRunner::builder()
-        .topology(topology)
-        .signing_key(signing_keypair)
-        .bft_config(bft_config)
-        .dispatch(dispatch)
-        .storage(storage)
-        .network(network_config)
-        .rpc_status(rpc_node_status.clone())
-        .mempool_snapshot(rpc_mempool_snapshot.clone())
-        .sync_status(rpc_sync_status.clone())
-        .mempool_config(config.mempool.clone())
-        .provision_config(config.provisions);
+    let mut runner_builder = ProductionRunner::builder(
+        topology,
+        signing_keypair,
+        bft_config,
+        storage,
+        network_config,
+    )
+    .dispatch(dispatch)
+    .rpc_status(rpc_node_status.clone())
+    .mempool_snapshot(rpc_mempool_snapshot.clone())
+    .sync_status(rpc_sync_status.clone())
+    .mempool_config(config.mempool.clone())
+    .provision_config(config.provisions);
 
     // Wire up genesis configuration if XRD balances are specified
     if !config.genesis.xrd_balances.is_empty() {
