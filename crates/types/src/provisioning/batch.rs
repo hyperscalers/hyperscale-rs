@@ -14,6 +14,14 @@ use crate::{
     ShardGroupId, StateEntry, TxEntries, TxHash, WeightedTimestamp,
 };
 
+/// Cap on per-tx entries carried in a single `Provisions` at decode time.
+///
+/// A `Provisions` covers tx-by-tx state transfers from a single source
+/// block to a single target shard, so `transactions.len()` is bounded by
+/// the source block's tx count. `MAX_TX_HASHES_PER_BLOCK` (`12_288` in
+/// `hyperscale-bft`) is the global ceiling.
+const MAX_TX_ENTRIES_PER_PROVISION: usize = 12_288;
+
 /// All provisions from a single source block, scoped to a single target shard.
 ///
 /// Identifies the (source block, target shard) pair: source identifies what
@@ -114,7 +122,22 @@ impl<D: Decoder<NoCustomValueKind>> Decode<NoCustomValueKind, D> for Provisions 
         let target_shard: ShardGroupId = decoder.decode()?;
         let block_height: BlockHeight = decoder.decode()?;
         let proof: MerkleInclusionProof = decoder.decode()?;
-        let transactions: Vec<TxEntries> = decoder.decode()?;
+        // Bounded inline rather than via SBOR's default Vec decoder, which
+        // would honor a peer-supplied `len` up to the entire 10 MB libp2p
+        // message budget.
+        decoder.read_and_check_value_kind(ValueKind::Array)?;
+        let element_kind = decoder.read_and_check_value_kind(TxEntries::value_kind())?;
+        let transactions_len = decoder.read_size()?;
+        if transactions_len > MAX_TX_ENTRIES_PER_PROVISION {
+            return Err(DecodeError::UnexpectedSize {
+                expected: MAX_TX_ENTRIES_PER_PROVISION,
+                actual: transactions_len,
+            });
+        }
+        let mut transactions = Vec::with_capacity(transactions_len.min(1024));
+        for _ in 0..transactions_len {
+            transactions.push(decoder.decode_deeper_body_with_value_kind(element_kind)?);
+        }
         let hash = Self::compute_hash(
             source_shard,
             target_shard,
@@ -371,5 +394,32 @@ mod tests {
         let bytes = basic_encode(&proof).unwrap();
         let decoded: MerkleInclusionProof = basic_decode(&bytes).unwrap();
         assert_eq!(proof, decoded);
+    }
+
+    #[test]
+    fn decode_rejects_oversized_transactions_count() {
+        use sbor::{BASIC_SBOR_V1_MAX_DEPTH, BASIC_SBOR_V1_PAYLOAD_PREFIX, VecEncoder};
+        let mut buf = Vec::with_capacity(64);
+        {
+            let mut enc = VecEncoder::<NoCustomValueKind>::new(&mut buf, BASIC_SBOR_V1_MAX_DEPTH);
+            enc.write_payload_prefix(BASIC_SBOR_V1_PAYLOAD_PREFIX)
+                .unwrap();
+            enc.write_value_kind(ValueKind::Tuple).unwrap();
+            enc.write_size(5).unwrap();
+            enc.encode(&ShardGroupId(1)).unwrap();
+            enc.encode(&ShardGroupId(2)).unwrap();
+            enc.encode(&BlockHeight(10)).unwrap();
+            enc.encode(&MerkleInclusionProof::dummy()).unwrap();
+            enc.write_value_kind(ValueKind::Array).unwrap();
+            enc.write_value_kind(TxEntries::value_kind()).unwrap();
+            enc.write_size(MAX_TX_ENTRIES_PER_PROVISION + 1).unwrap();
+        }
+        let err = basic_decode::<Provisions>(&buf).unwrap_err();
+        assert!(matches!(
+            err,
+            DecodeError::UnexpectedSize { expected, actual }
+                if expected == MAX_TX_ENTRIES_PER_PROVISION
+                    && actual == MAX_TX_ENTRIES_PER_PROVISION + 1
+        ));
     }
 }

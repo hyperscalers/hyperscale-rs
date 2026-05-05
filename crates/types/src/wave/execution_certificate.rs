@@ -15,6 +15,14 @@ use crate::{
     RETENTION_HORIZON, ShardGroupId, SignerBitfield, TxOutcome, WaveId, WeightedTimestamp,
 };
 
+/// Cap on per-tx outcomes carried in a single `ExecutionCertificate` at
+/// decode time.
+///
+/// A wave's tx set is bounded by the proposing block's transaction count;
+/// `MAX_TX_HASHES_PER_BLOCK` (`12_288` in `hyperscale-bft`) is the global
+/// ceiling, so an EC can never legitimately carry more outcomes than that.
+const MAX_TX_OUTCOMES_PER_EC: usize = 12_288;
+
 /// Aggregated certificate for an execution wave.
 ///
 /// Contains the BLS aggregated signature from 2f+1 validators plus per-tx
@@ -119,7 +127,22 @@ impl<D: Decoder<NoCustomValueKind>> Decode<NoCustomValueKind, D> for ExecutionCe
         let wave_id: WaveId = decoder.decode()?;
         let vote_anchor_ts: WeightedTimestamp = decoder.decode()?;
         let global_receipt_root: GlobalReceiptRoot = decoder.decode()?;
-        let tx_outcomes: Vec<TxOutcome> = decoder.decode()?;
+        // Bounded inline rather than via SBOR's default Vec decoder, which
+        // would honor a peer-supplied `len` up to the entire 10 MB libp2p
+        // message budget.
+        decoder.read_and_check_value_kind(ValueKind::Array)?;
+        let element_kind = decoder.read_and_check_value_kind(TxOutcome::value_kind())?;
+        let tx_outcomes_len = decoder.read_size()?;
+        if tx_outcomes_len > MAX_TX_OUTCOMES_PER_EC {
+            return Err(DecodeError::UnexpectedSize {
+                expected: MAX_TX_OUTCOMES_PER_EC,
+                actual: tx_outcomes_len,
+            });
+        }
+        let mut tx_outcomes = Vec::with_capacity(tx_outcomes_len.min(1024));
+        for _ in 0..tx_outcomes_len {
+            tx_outcomes.push(decoder.decode_deeper_body_with_value_kind(element_kind)?);
+        }
         let aggregated_signature: Bls12381G2Signature = decoder.decode()?;
         let signers: SignerBitfield = decoder.decode()?;
         let canonical_hash = Self::compute_canonical_hash(

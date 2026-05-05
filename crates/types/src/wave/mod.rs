@@ -452,6 +452,42 @@ mod tests {
     }
 
     #[test]
+    fn decode_rejects_oversized_tx_outcomes_count() {
+        use sbor::{
+            BASIC_SBOR_V1_PAYLOAD_PREFIX, DecodeError, Encoder, NoCustomValueKind, ValueKind,
+            VecEncoder,
+        };
+
+        use crate::{GlobalReceiptRoot, TxOutcome};
+
+        let wave_id = make_wave_id(0, BlockHeight(1), &[1]);
+        let mut buf = Vec::with_capacity(128);
+        {
+            let mut enc = VecEncoder::<NoCustomValueKind>::new(&mut buf, BASIC_SBOR_V1_MAX_DEPTH);
+            enc.write_payload_prefix(BASIC_SBOR_V1_PAYLOAD_PREFIX)
+                .unwrap();
+            enc.write_value_kind(ValueKind::Tuple).unwrap();
+            enc.write_size(6).unwrap();
+            enc.encode(&wave_id).unwrap();
+            enc.encode(&WeightedTimestamp::ZERO).unwrap();
+            enc.encode(&GlobalReceiptRoot::ZERO).unwrap();
+            enc.write_value_kind(ValueKind::Array).unwrap();
+            enc.write_value_kind(TxOutcome::value_kind()).unwrap();
+            // The cap lives in execution_certificate.rs; 12_288 + 1 is the
+            // first oversized value.
+            enc.write_size(12_289).unwrap();
+        }
+        let err = basic_decode::<ExecutionCertificate>(&buf).unwrap_err();
+        assert!(matches!(
+            err,
+            DecodeError::UnexpectedSize {
+                expected: 12_288,
+                actual: 12_289,
+            }
+        ));
+    }
+
+    #[test]
     fn test_wave_leader_is_attempt_zero() {
         let committee = vec![
             ValidatorId(1),
