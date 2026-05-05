@@ -15,8 +15,8 @@ use hyperscale_types::{
     BlockHash, Bls12381G1PublicKey, Bls12381G2Signature, ExecutionCertificate, ExecutionVote,
     GlobalReceiptRoot, RoutableTransaction, SignerBitfield, StateProvision, StateRoot,
     StoredReceipt, TxHash, ValidatorId, WaveId, WeightedTimestamp, batch_verify_bls_same_message,
-    exec_cert_batch_message, exec_vote_batch_message, exec_vote_message, verify_bls12381_v1,
-    zero_bls_signature,
+    compute_global_receipt_root, exec_cert_batch_message, exec_vote_batch_message,
+    exec_vote_message, verify_bls12381_v1, zero_bls_signature,
 };
 
 use crate::wave_state::WaveState;
@@ -30,8 +30,14 @@ use crate::wave_state::WaveState;
 /// Deduplicates votes by validator, aggregates BLS signatures, and builds a
 /// signer bitfield using the committee's indices.
 ///
-/// `tx_outcomes` are extracted from the first vote — all quorum votes carry
-/// identical outcomes (they share the same `global_receipt_root`).
+/// `tx_outcomes` are taken from the first vote whose outcomes hash to the
+/// signed `global_receipt_root`. The BLS signature only commits to
+/// `(global_receipt_root, tx_count)` directly, but the receipt root is itself
+/// the Merkle root over `tx_outcomes` — so verifying the recomputed root
+/// against the signed one binds the outcomes transitively. Without this
+/// check a Byzantine validator landing first in `votes` could sign honest
+/// `(root, count)` while attaching tampered outcomes, and the resulting
+/// EC's `canonical_hash` would commit to those bogus outcomes.
 #[must_use]
 pub fn aggregate_execution_certificate(
     wave_id: &WaveId,
@@ -40,7 +46,8 @@ pub fn aggregate_execution_certificate(
     committee: &[ValidatorId],
 ) -> ExecutionCertificate {
     let tx_outcomes = votes
-        .first_mut()
+        .iter_mut()
+        .find(|v| compute_global_receipt_root(&v.tx_outcomes) == global_receipt_root)
         .map(|v| std::mem::take(&mut v.tx_outcomes))
         .unwrap_or_default();
     // Deduplicate votes by validator
@@ -525,9 +532,9 @@ mod tests {
             ValidatorId(3),
         ];
         let wid = wave_id(1);
-        let root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root"));
         let tx = TxHash::from_raw(Hash::from_bytes(b"tx"));
         let outcomes = vec![outcome(tx)];
+        let root = compute_global_receipt_root(&outcomes);
 
         let sk1 = keypair(1);
         let sk3 = keypair(3);
@@ -559,11 +566,59 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_skips_byzantine_outcomes_that_dont_hash_to_signed_root() {
+        // Pre-fix: aggregator lifted tx_outcomes from votes.first(), so a
+        // Byzantine vote landing first could ship tampered outcomes
+        // alongside an honest signed (root, count) and the resulting EC
+        // would commit those bogus outcomes via canonical_hash.
+        let committee = vec![ValidatorId(0), ValidatorId(1)];
+        let wid = wave_id(1);
+        let honest_outcomes = vec![outcome(TxHash::from_raw(Hash::from_bytes(b"tx")))];
+        let root = compute_global_receipt_root(&honest_outcomes);
+        let tampered_outcomes = vec![outcome(TxHash::from_raw(Hash::from_bytes(b"evil")))];
+        let sk0 = keypair(0);
+        let sk1 = keypair(1);
+
+        // V0 signs the honest (root, count) but ships tampered outcomes.
+        // signed_vote re-derives the message from the supplied root, so the
+        // BLS signature is valid for the honest payload — the lie is in the
+        // unsigned outcomes vec.
+        let mut byzantine_first = signed_vote(
+            ValidatorId(0),
+            &sk0,
+            &wid,
+            root,
+            WeightedTimestamp(100),
+            honest_outcomes.clone(),
+        );
+        byzantine_first.tx_outcomes = tampered_outcomes.clone();
+
+        let honest_second = signed_vote(
+            ValidatorId(1),
+            &sk1,
+            &wid,
+            root,
+            WeightedTimestamp(100),
+            honest_outcomes.clone(),
+        );
+
+        let ec = aggregate_execution_certificate(
+            &wid,
+            root,
+            vec![byzantine_first, honest_second],
+            &committee,
+        );
+        // Aggregator must pick the outcomes that hash to the signed root.
+        assert_eq!(ec.tx_outcomes, honest_outcomes);
+        assert_ne!(ec.tx_outcomes, tampered_outcomes);
+    }
+
+    #[test]
     fn aggregate_dedups_votes_from_same_validator() {
         let committee = vec![ValidatorId(0), ValidatorId(1)];
         let wid = wave_id(1);
-        let root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root"));
         let outcomes = vec![outcome(TxHash::from_raw(Hash::from_bytes(b"tx")))];
+        let root = compute_global_receipt_root(&outcomes);
         let sk0 = keypair(0);
 
         // Same voter cast twice.
@@ -720,8 +775,8 @@ mod tests {
             ValidatorId(3),
         ];
         let wid = wave_id(1);
-        let root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root"));
         let outcomes = vec![outcome(TxHash::from_raw(Hash::from_bytes(b"tx")))];
+        let root = compute_global_receipt_root(&outcomes);
         let sks: Vec<_> = (0_u8..4).map(keypair).collect();
 
         let votes: Vec<ExecutionVote> = (0_usize..4)
@@ -746,8 +801,8 @@ mod tests {
     fn verify_ec_signature_rejects_wrong_public_keys() {
         let committee = vec![ValidatorId(0), ValidatorId(1)];
         let wid = wave_id(1);
-        let root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root"));
         let outcomes = vec![outcome(TxHash::from_raw(Hash::from_bytes(b"tx")))];
+        let root = compute_global_receipt_root(&outcomes);
         let sk0 = keypair(0);
         let sk1 = keypair(1);
 
