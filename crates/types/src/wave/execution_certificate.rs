@@ -262,6 +262,26 @@ impl ExecutionCertificate {
         self.cached_sbor.as_deref()
     }
 
+    /// Content hash over the full wire encoding (including
+    /// `aggregated_signature` and `signers`). Distinguishes byte-identical
+    /// retransmits — useful as an in-flight dedup key — while still treating
+    /// different aggregations of the same logical EC as distinct, so a peer
+    /// supplying a valid aggregation after a bad one isn't dropped.
+    ///
+    /// # Panics
+    ///
+    /// Panics if SBOR encoding fails — closed type, infallible in practice.
+    #[must_use]
+    pub fn wire_hash(&self) -> Hash {
+        self.cached_sbor.as_deref().map_or_else(
+            || {
+                let bytes = basic_encode(self).expect("EC SBOR encoding must succeed");
+                Hash::from_parts(&[&bytes])
+            },
+            |bytes| Hash::from_parts(&[bytes]),
+        )
+    }
+
     fn populate_cached_sbor(&mut self) {
         self.cached_sbor = Some(basic_encode(self).expect("EC SBOR encoding must succeed"));
     }

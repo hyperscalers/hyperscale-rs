@@ -45,9 +45,9 @@ use hyperscale_core::{
 };
 use hyperscale_types::{
     Attempt, Block, BlockHash, BlockHeader, BlockHeight, BloomFilter, CertifiedBlock,
-    ExecutionCertificate, ExecutionVote, FinalizedWave, GlobalReceiptRoot, NodeId, Provisions,
-    RoutableTransaction, ShardGroupId, StoredReceipt, TopologySnapshot, TxHash, TxOutcome,
-    ValidatorId, WAVE_TIMEOUT, WaveCertificate, WaveId, WeightedTimestamp, wave_leader,
+    ExecutionCertificate, ExecutionVote, FinalizedWave, GlobalReceiptRoot, Hash, NodeId,
+    Provisions, RoutableTransaction, ShardGroupId, StoredReceipt, TopologySnapshot, TxHash,
+    TxOutcome, ValidatorId, WAVE_TIMEOUT, WaveCertificate, WaveId, WeightedTimestamp, wave_leader,
     wave_leader_at,
 };
 use tracing::instrument;
@@ -194,6 +194,19 @@ pub struct ExecutionCoordinator {
     /// a local-shard EC received via broadcast; evicted in
     /// `remove_finalized_wave` once the containing block commits.
     exec_certs: Arc<ExecCertStore>,
+
+    /// In-flight EC BLS-verifications, keyed by a content hash over the
+    /// cached SBOR bytes. A flooding peer would otherwise re-trigger a BLS
+    /// dispatch on every byte-identical retransmit. Different aggregations
+    /// of the same logical EC produce distinct wire bytes and so still
+    /// dispatch — important when a first aggregation's signature is bad and
+    /// a peer follows up with a valid one.
+    pending_ec_verifications: HashSet<Hash>,
+
+    /// In-flight `FinalizedWave` BLS-verifications, keyed by `WaveId`. The
+    /// wave is content-addressed by id (one wave per `WaveId`), so a second
+    /// fetch arrival for the same wave can short-circuit the BLS pool.
+    pending_finalized_wave_verifications: HashSet<WaveId>,
 }
 
 impl Default for ExecutionCoordinator {
@@ -241,6 +254,8 @@ impl ExecutionCoordinator {
             expected_certs: ExpectedCertTracker::new(),
             outbound_certs: OutboundExecutionCertificateTracker::new(),
             exec_certs: Arc::new(ExecCertStore::new()),
+            pending_ec_verifications: HashSet::new(),
+            pending_finalized_wave_verifications: HashSet::new(),
         }
     }
 
@@ -1029,11 +1044,28 @@ impl ExecutionCoordinator {
     ) -> Vec<Action> {
         let shard = cert.shard_group_id();
 
+        // Skip BLS dispatch for byte-identical retransmits while a
+        // verification is already in flight. Different aggregations of the
+        // same logical EC produce distinct wire bytes, so the legitimate
+        // case of "first aggregation invalid, second valid" is preserved.
+        let wire_hash = cert.wire_hash();
+        if !self.pending_ec_verifications.insert(wire_hash) {
+            tracing::debug!(
+                shard = shard.0,
+                wave = %cert.wave_id,
+                "Duplicate EC verification dispatch suppressed"
+            );
+            return vec![];
+        }
+
         let Some(public_keys) = committee_public_keys_for_shard(topology, shard) else {
             tracing::warn!(
                 shard = shard.0,
                 "Could not resolve all public keys for execution cert verification"
             );
+            // Verification will never complete; release the in-flight slot
+            // so a subsequent arrival isn't permanently shadowed.
+            self.pending_ec_verifications.remove(&wire_hash);
             return vec![];
         };
 
@@ -1054,6 +1086,15 @@ impl ExecutionCoordinator {
         certificate: Arc<ExecutionCertificate>,
         valid: bool,
     ) -> Vec<Action> {
+        // Release the in-flight slot regardless of outcome — a failed
+        // signature still lets the next byte-identical retransmit dispatch
+        // again (in case the failure was transient pool error rather than a
+        // real signature mismatch). Subsequent arrivals with a different
+        // aggregation hash to a different `wire_hash` and aren't gated by
+        // this slot.
+        self.pending_ec_verifications
+            .remove(&certificate.wire_hash());
+
         if !valid {
             tracing::warn!(
                 shard = certificate.shard_group_id().0,
@@ -1630,10 +1671,35 @@ impl ExecutionCoordinator {
     /// upstream.
     #[must_use]
     pub fn admit_finalized_wave(
-        &self,
+        &mut self,
         topology: &TopologySnapshot,
         wave: Arc<FinalizedWave>,
     ) -> Vec<Action> {
+        let wave_id = wave.wave_id().clone();
+
+        // Already-finalized short-circuit — a second fetch arrival for a
+        // wave we've already admitted is wasted BLS work.
+        if self.finalized.contains(&wave_id) {
+            tracing::debug!(
+                wave = %wave_id,
+                "FinalizedWave already in canonical store — skipping verification"
+            );
+            return Vec::new();
+        }
+
+        // In-flight dedup — guards against a peer flooding the same fetched
+        // wave while the first dispatch is still running.
+        if !self
+            .pending_finalized_wave_verifications
+            .insert(wave_id.clone())
+        {
+            tracing::debug!(
+                wave = %wave_id,
+                "Duplicate FinalizedWave verification dispatch suppressed"
+            );
+            return Vec::new();
+        }
+
         let ecs = wave.execution_certificates();
         let mut ec_public_keys = Vec::with_capacity(ecs.len());
         for ec in ecs {
@@ -1665,7 +1731,16 @@ impl ExecutionCoordinator {
     /// Handle the result of [`Action::VerifyFinalizedWave`]. Emits the
     /// admission continuation only when every EC's BLS signature passed.
     #[must_use]
-    pub fn on_finalized_wave_verified(&self, wave: Arc<FinalizedWave>, valid: bool) -> Vec<Action> {
+    pub fn on_finalized_wave_verified(
+        &mut self,
+        wave: Arc<FinalizedWave>,
+        valid: bool,
+    ) -> Vec<Action> {
+        // Release the in-flight slot regardless of outcome — symmetry with
+        // `on_certificate_verified`. Future arrivals can dispatch again.
+        self.pending_finalized_wave_verifications
+            .remove(wave.wave_id());
+
         if !valid {
             tracing::warn!(
                 wave = %wave.wave_id(),
@@ -2440,7 +2515,7 @@ mod tests {
     #[test]
     fn admit_finalized_wave_dispatches_async_verify() {
         let topo = make_test_topology();
-        let state = make_test_state();
+        let mut state = make_test_state();
 
         let wave_id = WaveId::new(ShardGroupId(0), BlockHeight(1), BTreeSet::new());
         let mut signers = SignerBitfield::new(4);
@@ -2480,7 +2555,7 @@ mod tests {
     /// poisoning vector this gate exists to close.
     #[test]
     fn on_finalized_wave_verified_drops_invalid() {
-        let state = make_test_state();
+        let mut state = make_test_state();
         let wave_id = WaveId::new(ShardGroupId(0), BlockHeight(1), BTreeSet::new());
         let ec = Arc::new(ExecutionCertificate::new(
             wave_id.clone(),
@@ -2505,7 +2580,7 @@ mod tests {
     /// admission continuation — same shape as the prior synchronous path.
     #[test]
     fn on_finalized_wave_verified_admits_valid() {
-        let state = make_test_state();
+        let mut state = make_test_state();
         let wave_id = WaveId::new(ShardGroupId(0), BlockHeight(1), BTreeSet::new());
         let ec = Arc::new(ExecutionCertificate::new(
             wave_id.clone(),
@@ -2530,6 +2605,146 @@ mod tests {
         ));
     }
 
+    /// Two byte-identical EC arrivals while the first is still in flight
+    /// must produce only one `VerifyExecutionCertificateSignature`
+    /// dispatch. This shields the BLS pool from a flooding peer.
+    #[test]
+    fn on_wave_certificate_dedups_byte_identical_retransmit() {
+        let topo = make_test_topology();
+        let mut state = make_test_state();
+
+        let wave_id = WaveId::new(ShardGroupId(0), BlockHeight(1), BTreeSet::new());
+        let mut signers = SignerBitfield::new(4);
+        signers.set(0);
+        signers.set(1);
+        signers.set(2);
+        let cert = ExecutionCertificate::new(
+            wave_id,
+            WeightedTimestamp::ZERO,
+            GlobalReceiptRoot::ZERO,
+            vec![],
+            zero_bls_signature(),
+            signers,
+        );
+
+        let first = state.on_wave_certificate(&topo, cert.clone());
+        assert_eq!(first.len(), 1);
+        assert!(matches!(
+            first[0],
+            Action::VerifyExecutionCertificateSignature { .. }
+        ));
+
+        // Same bytes mid-flight — must drop without dispatching another
+        // verify.
+        let second = state.on_wave_certificate(&topo, cert);
+        assert!(second.is_empty());
+    }
+
+    /// Once verification completes (success or failure), the in-flight
+    /// slot is released and a subsequent retransmit is allowed to
+    /// re-dispatch.
+    #[test]
+    fn on_wave_certificate_releases_slot_after_verification() {
+        let topo = make_test_topology();
+        let mut state = make_test_state();
+
+        let wave_id = WaveId::new(ShardGroupId(0), BlockHeight(1), BTreeSet::new());
+        let mut signers = SignerBitfield::new(4);
+        signers.set(0);
+        signers.set(1);
+        signers.set(2);
+        let cert = ExecutionCertificate::new(
+            wave_id,
+            WeightedTimestamp::ZERO,
+            GlobalReceiptRoot::ZERO,
+            vec![],
+            zero_bls_signature(),
+            signers,
+        );
+
+        let _ = state.on_wave_certificate(&topo, cert.clone());
+        // Simulate the BLS pool returning an invalid result. The slot is
+        // released so a follow-up arrival can re-dispatch.
+        let _ = state.on_certificate_verified(&topo, Arc::new(cert.clone()), false);
+        let again = state.on_wave_certificate(&topo, cert);
+        assert_eq!(again.len(), 1);
+        assert!(matches!(
+            again[0],
+            Action::VerifyExecutionCertificateSignature { .. }
+        ));
+    }
+
+    /// `admit_finalized_wave` dedups a second arrival for the same
+    /// `WaveId` while verification is still in flight.
+    #[test]
+    fn admit_finalized_wave_dedups_in_flight_arrival() {
+        let topo = make_test_topology();
+        let mut state = make_test_state();
+
+        let wave_id = WaveId::new(ShardGroupId(0), BlockHeight(1), BTreeSet::new());
+        let mut signers = SignerBitfield::new(4);
+        signers.set(0);
+        signers.set(1);
+        signers.set(2);
+        let ec = Arc::new(ExecutionCertificate::new(
+            wave_id.clone(),
+            WeightedTimestamp::ZERO,
+            GlobalReceiptRoot::ZERO,
+            vec![],
+            zero_bls_signature(),
+            signers,
+        ));
+        let wave = Arc::new(FinalizedWave {
+            certificate: Arc::new(WaveCertificate {
+                wave_id,
+                execution_certificates: vec![ec],
+            }),
+            receipts: vec![],
+        });
+
+        let first = state.admit_finalized_wave(&topo, Arc::clone(&wave));
+        assert_eq!(first.len(), 1);
+        assert!(matches!(first[0], Action::VerifyFinalizedWave { .. }));
+
+        let second = state.admit_finalized_wave(&topo, wave);
+        assert!(second.is_empty());
+    }
+
+    /// A `FinalizedWave` already in the canonical store short-circuits
+    /// before any BLS dispatch.
+    #[test]
+    fn admit_finalized_wave_skips_when_already_finalized() {
+        let topo = make_test_topology();
+        let mut state = make_test_state();
+
+        let wave_id = WaveId::new(ShardGroupId(0), BlockHeight(1), BTreeSet::new());
+        let mut signers = SignerBitfield::new(4);
+        signers.set(0);
+        signers.set(1);
+        signers.set(2);
+        let ec = Arc::new(ExecutionCertificate::new(
+            wave_id.clone(),
+            WeightedTimestamp::ZERO,
+            GlobalReceiptRoot::ZERO,
+            vec![],
+            zero_bls_signature(),
+            signers,
+        ));
+        let wave = FinalizedWave {
+            certificate: Arc::new(WaveCertificate {
+                wave_id: wave_id.clone(),
+                execution_certificates: vec![ec],
+            }),
+            receipts: vec![],
+        };
+        // Seed the canonical store directly (mirrors what `finalize_wave`
+        // does on the local-aggregation path).
+        state.finalized.insert(wave_id, wave.clone());
+
+        let actions = state.admit_finalized_wave(&topo, Arc::new(wave));
+        assert!(actions.is_empty());
+    }
+
     /// A `FinalizedWave` delivered by `admit_finalized_wave` (the fetch
     /// entry point) must reject any wave whose contained ECs lack quorum
     /// power or signature validity. Otherwise a peer answering
@@ -2539,7 +2754,7 @@ mod tests {
     #[test]
     fn test_admit_finalized_wave_rejects_subquorum_ec() {
         let topo = make_two_shard_topology();
-        let state = make_test_state();
+        let mut state = make_test_state();
 
         let wave_id = WaveId::new(ShardGroupId(0), BlockHeight(1), BTreeSet::new());
         let bogus_ec = Arc::new(ExecutionCertificate::new(
