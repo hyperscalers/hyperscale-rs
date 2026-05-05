@@ -11,7 +11,7 @@ use hyperscale_types::{
 
 use crate::column_families::{ExecutionCertsByHeightCf, ExecutionCertsCf};
 use crate::core::RocksDbStorage;
-use crate::typed_cf::{TypedCf, prefix_iter};
+use crate::typed_cf::{TypedCf, get, prefix_iter};
 
 impl ChainReader for RocksDbStorage {
     fn get_block(&self, height: BlockHeight) -> Option<CertifiedBlock> {
@@ -59,11 +59,16 @@ impl ChainReader for RocksDbStorage {
         &self,
         block_height: BlockHeight,
     ) -> Vec<ExecutionCertificate> {
-        let cf = ExecutionCertsByHeightCf::handle(&self.cf());
+        // Resolve both column-family handles once. Per-call `cf_get` would
+        // re-walk `RocksDB`'s name → handle map for every match returned by
+        // the prefix iterator.
+        let cfs = self.cf();
+        let index_cf = ExecutionCertsByHeightCf::handle(&cfs);
+        let certs_cf = ExecutionCertsCf::handle(&cfs);
         let prefix = block_height.0.to_be_bytes();
-        prefix_iter::<ExecutionCertsByHeightCf>(&self.db, cf, &prefix)
+        prefix_iter::<ExecutionCertsByHeightCf>(&self.db, index_cf, &prefix)
             .filter_map(|((_height, canonical_hash), ())| {
-                self.cf_get::<ExecutionCertsCf>(&canonical_hash)
+                get::<ExecutionCertsCf>(&*self.db, certs_cf, &canonical_hash)
             })
             .collect()
     }
