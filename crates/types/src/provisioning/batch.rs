@@ -10,17 +10,9 @@ use sbor::{
 };
 
 use crate::{
-    BlockHeight, Hash, MerkleInclusionProof, NodeId, ProvisionHash, RETENTION_HORIZON,
-    ShardGroupId, StateEntry, TxEntries, TxHash, WeightedTimestamp,
+    BlockHeight, Hash, MAX_TX_HASHES_PER_BLOCK, MerkleInclusionProof, NodeId, ProvisionHash,
+    RETENTION_HORIZON, ShardGroupId, StateEntry, TxEntries, TxHash, WeightedTimestamp,
 };
-
-/// Cap on per-tx entries carried in a single `Provisions` at decode time.
-///
-/// A `Provisions` covers tx-by-tx state transfers from a single source
-/// block to a single target shard, so `transactions.len()` is bounded by
-/// the source block's tx count. `MAX_TX_HASHES_PER_BLOCK` (`12_288` in
-/// `hyperscale-bft`) is the global ceiling.
-const MAX_TX_ENTRIES_PER_PROVISION: usize = 12_288;
 
 /// All provisions from a single source block, scoped to a single target shard.
 ///
@@ -128,9 +120,9 @@ impl<D: Decoder<NoCustomValueKind>> Decode<NoCustomValueKind, D> for Provisions 
         decoder.read_and_check_value_kind(ValueKind::Array)?;
         let element_kind = decoder.read_and_check_value_kind(TxEntries::value_kind())?;
         let transactions_len = decoder.read_size()?;
-        if transactions_len > MAX_TX_ENTRIES_PER_PROVISION {
+        if transactions_len > MAX_TX_HASHES_PER_BLOCK {
             return Err(DecodeError::UnexpectedSize {
-                expected: MAX_TX_ENTRIES_PER_PROVISION,
+                expected: MAX_TX_HASHES_PER_BLOCK,
                 actual: transactions_len,
             });
         }
@@ -412,14 +404,14 @@ mod tests {
             enc.encode(&MerkleInclusionProof::dummy()).unwrap();
             enc.write_value_kind(ValueKind::Array).unwrap();
             enc.write_value_kind(TxEntries::value_kind()).unwrap();
-            enc.write_size(MAX_TX_ENTRIES_PER_PROVISION + 1).unwrap();
+            enc.write_size(MAX_TX_HASHES_PER_BLOCK + 1).unwrap();
         }
         let err = basic_decode::<Provisions>(&buf).unwrap_err();
         assert!(matches!(
             err,
             DecodeError::UnexpectedSize { expected, actual }
-                if expected == MAX_TX_ENTRIES_PER_PROVISION
-                    && actual == MAX_TX_ENTRIES_PER_PROVISION + 1
+                if expected == MAX_TX_HASHES_PER_BLOCK
+                    && actual == MAX_TX_HASHES_PER_BLOCK + 1
         ));
     }
 }

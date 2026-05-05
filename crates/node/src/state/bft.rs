@@ -63,26 +63,12 @@
 use std::sync::Arc;
 
 use hyperscale_core::{Action, ProtocolEvent, TimerId};
-use hyperscale_types::{BlockHash, BlockHeader, BlockManifest, CertifiedBlock, QuorumCertificate};
+use hyperscale_types::{
+    BlockHash, BlockHeader, BlockManifest, CertifiedBlock, MAX_CERT_IDS_PER_BLOCK,
+    MAX_PROVISION_HASHES_PER_BLOCK, MAX_TX_HASHES_PER_BLOCK, QuorumCertificate,
+};
 
 use super::NodeStateMachine;
-
-/// Per-block cap on transaction-hash entries in a header's manifest.
-/// Matches `mempool::DEFAULT_IN_FLIGHT_LIMIT`: no honest proposer can
-/// legitimately exceed the chain-wide in-flight cap, so a header that
-/// names more is provably malicious. Applied at every height, not just
-/// next-block, since the in-flight check itself only fires at
-/// `committed_height + 1`.
-const MAX_TX_HASHES_PER_BLOCK: usize = 12_288;
-
-/// Per-block cap on wave-cert ids. Realistic blocks carry single-digit
-/// wave-cert counts; 4096 leaves comfortable headroom while bounding
-/// fetch-storm exposure from a Byzantine future-height header.
-const MAX_CERT_IDS_PER_BLOCK: usize = 4_096;
-
-/// Per-block cap on provision-batch hashes. One batch per cross-shard tx
-/// in the block; bounding at the same scale as `MAX_TX_HASHES_PER_BLOCK`.
-const MAX_PROVISION_HASHES_PER_BLOCK: usize = 12_288;
 
 impl NodeStateMachine {
     /// Dispatch a BFT-category `ProtocolEvent`.

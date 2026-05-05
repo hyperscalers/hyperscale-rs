@@ -9,7 +9,8 @@ use sbor::{
 };
 
 use crate::{
-    BlockHash, BlockHeader, BlockHeight, FinalizedWave, Provisions, RoutableTransaction,
+    BlockHash, BlockHeader, BlockHeight, FinalizedWave, MAX_CERT_IDS_PER_BLOCK,
+    MAX_PROVISION_HASHES_PER_BLOCK, MAX_TX_HASHES_PER_BLOCK, Provisions, RoutableTransaction,
     ShardGroupId, StateRoot, TxHash, ValidatorId, decode_finalized_wave_vec,
     encode_finalized_wave_vec,
 };
@@ -162,15 +163,6 @@ impl<E: Encoder<NoCustomValueKind>> Encode<NoCustomValueKind, E> for Block {
     }
 }
 
-/// Maximum items in a single collection during SBOR decoding.
-///
-/// Prevents allocation bombs where a crafted SBOR payload claims millions of
-/// items, causing multi-GB `Vec::with_capacity()` pre-allocations. This limit
-/// is generous enough for any legitimate block content while blocking malicious
-/// payloads. Applied to transaction arrays, certificate arrays, and commitment
-/// proof maps.
-const MAX_SBOR_COLLECTION_SIZE: usize = 10_000;
-
 /// Helper to decode a Vec<Arc<RoutableTransaction>> from an SBOR array.
 fn decode_tx_vec<D: Decoder<NoCustomValueKind>>(
     decoder: &mut D,
@@ -178,9 +170,9 @@ fn decode_tx_vec<D: Decoder<NoCustomValueKind>>(
     decoder.read_and_check_value_kind(ValueKind::Array)?;
     decoder.read_and_check_value_kind(ValueKind::Tuple)?;
     let count = decoder.read_size()?;
-    if count > MAX_SBOR_COLLECTION_SIZE {
+    if count > MAX_TX_HASHES_PER_BLOCK {
         return Err(DecodeError::UnexpectedSize {
-            expected: MAX_SBOR_COLLECTION_SIZE,
+            expected: MAX_TX_HASHES_PER_BLOCK,
             actual: count,
         });
     }
@@ -200,9 +192,9 @@ fn decode_provision_vec<D: Decoder<NoCustomValueKind>>(
     decoder.read_and_check_value_kind(ValueKind::Array)?;
     decoder.read_and_check_value_kind(ValueKind::Tuple)?;
     let count = decoder.read_size()?;
-    if count > MAX_SBOR_COLLECTION_SIZE {
+    if count > MAX_PROVISION_HASHES_PER_BLOCK {
         return Err(DecodeError::UnexpectedSize {
-            expected: MAX_SBOR_COLLECTION_SIZE,
+            expected: MAX_PROVISION_HASHES_PER_BLOCK,
             actual: count,
         });
     }
@@ -233,10 +225,8 @@ impl<D: Decoder<NoCustomValueKind>> Decode<NoCustomValueKind, D> for Block {
                 }
                 let header: BlockHeader = decoder.decode()?;
                 let transactions = Arc::new(decode_tx_vec(decoder)?);
-                let certificates = Arc::new(decode_finalized_wave_vec(
-                    decoder,
-                    MAX_SBOR_COLLECTION_SIZE,
-                )?);
+                let certificates =
+                    Arc::new(decode_finalized_wave_vec(decoder, MAX_CERT_IDS_PER_BLOCK)?);
                 let provisions = Arc::new(decode_provision_vec(decoder)?);
                 Ok(Self::Live {
                     header,
@@ -254,10 +244,8 @@ impl<D: Decoder<NoCustomValueKind>> Decode<NoCustomValueKind, D> for Block {
                 }
                 let header: BlockHeader = decoder.decode()?;
                 let transactions = Arc::new(decode_tx_vec(decoder)?);
-                let certificates = Arc::new(decode_finalized_wave_vec(
-                    decoder,
-                    MAX_SBOR_COLLECTION_SIZE,
-                )?);
+                let certificates =
+                    Arc::new(decode_finalized_wave_vec(decoder, MAX_CERT_IDS_PER_BLOCK)?);
                 Ok(Self::Sealed {
                     header,
                     transactions,

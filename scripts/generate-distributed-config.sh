@@ -343,8 +343,6 @@ keep_alive_interval_ms = 5000
 
 [consensus]
 view_change_timeout_ms = 3000
-max_transactions_per_block = 4096
-max_finalized_transactions_per_block = 8192
 rpc_mempool_limit = 32768
 
 [threads]

@@ -12,17 +12,9 @@ use sbor::{
 
 use crate::{
     BlockHeight, Bls12381G2Signature, ExecutionCertificateHash, GlobalReceiptRoot, Hash,
-    RETENTION_HORIZON, ShardGroupId, SignerBitfield, TxOutcome, WaveId, WeightedTimestamp,
-    compute_global_receipt_root,
+    MAX_TX_HASHES_PER_BLOCK, RETENTION_HORIZON, ShardGroupId, SignerBitfield, TxOutcome, WaveId,
+    WeightedTimestamp, compute_global_receipt_root,
 };
-
-/// Cap on per-tx outcomes carried in a single `ExecutionCertificate` at
-/// decode time.
-///
-/// A wave's tx set is bounded by the proposing block's transaction count;
-/// `MAX_TX_HASHES_PER_BLOCK` (`12_288` in `hyperscale-bft`) is the global
-/// ceiling, so an EC can never legitimately carry more outcomes than that.
-const MAX_TX_OUTCOMES_PER_EC: usize = 12_288;
 
 /// Aggregated certificate for an execution wave.
 ///
@@ -134,9 +126,9 @@ impl<D: Decoder<NoCustomValueKind>> Decode<NoCustomValueKind, D> for ExecutionCe
         decoder.read_and_check_value_kind(ValueKind::Array)?;
         let element_kind = decoder.read_and_check_value_kind(TxOutcome::value_kind())?;
         let tx_outcomes_len = decoder.read_size()?;
-        if tx_outcomes_len > MAX_TX_OUTCOMES_PER_EC {
+        if tx_outcomes_len > MAX_TX_HASHES_PER_BLOCK {
             return Err(DecodeError::UnexpectedSize {
-                expected: MAX_TX_OUTCOMES_PER_EC,
+                expected: MAX_TX_HASHES_PER_BLOCK,
                 actual: tx_outcomes_len,
             });
         }

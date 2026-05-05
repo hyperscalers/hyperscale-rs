@@ -287,36 +287,18 @@ pub struct ConsensusConfig {
     /// Timeout for view change (milliseconds)
     #[serde(default = "default_view_change_timeout_ms")]
     pub view_change_timeout_ms: u64,
-
-    /// Maximum transactions per block
-    #[serde(default = "default_max_transactions_per_block")]
-    pub max_transactions_per_block: usize,
-
-    /// Maximum finalized transactions per block (across all wave certificates)
-    #[serde(default = "default_max_finalized_transactions_per_block")]
-    pub max_finalized_transactions_per_block: usize,
 }
 
 impl Default for ConsensusConfig {
     fn default() -> Self {
         Self {
             view_change_timeout_ms: default_view_change_timeout_ms(),
-            max_transactions_per_block: default_max_transactions_per_block(),
-            max_finalized_transactions_per_block: default_max_finalized_transactions_per_block(),
         }
     }
 }
 
 const fn default_view_change_timeout_ms() -> u64 {
     3000
-}
-
-const fn default_max_transactions_per_block() -> usize {
-    4096
-}
-
-const fn default_max_finalized_transactions_per_block() -> usize {
-    8192
 }
 
 /// Thread pool configuration.
@@ -909,10 +891,7 @@ fn build_thread_pool_config(config: &ThreadsConfig) -> ThreadPoolConfig {
 
 /// Build BFT configuration from TOML config.
 fn build_bft_config(config: &ConsensusConfig) -> BftConfig {
-    BftConfig::new()
-        .with_view_change_timeout(Duration::from_millis(config.view_change_timeout_ms))
-        .with_max_transactions(config.max_transactions_per_block)
-        .with_max_finalized_transactions(config.max_finalized_transactions_per_block)
+    BftConfig::new().with_view_change_timeout(Duration::from_millis(config.view_change_timeout_ms))
 }
 
 /// Build network configuration from TOML config.

@@ -38,21 +38,6 @@ pub struct BftConfig {
     /// pending work.
     pub max_progress_wait: Duration,
 
-    /// Maximum transactions per block.
-    pub max_transactions_per_block: usize,
-
-    /// Maximum finalized transactions per block (across all wave certificates).
-    /// Older waves (by kickoff `block_height`) are prioritized over newer ones.
-    pub max_finalized_transactions_per_block: usize,
-
-    /// Maximum remote-shard provision transactions per block, summed across
-    /// all provisions. Oldest batches (FIFO queue order) are included
-    /// first; once the running total would exceed this cap, the rest stay
-    /// queued for the next proposal. Bounds build/verify work and the
-    /// per-block `local_provision.request` fetch fan-out on voters who
-    /// missed the original cross-shard gossip.
-    pub max_provision_transactions_per_block: usize,
-
     /// Maximum acceptable delay for proposer timestamp behind our clock (ms).
     pub max_timestamp_delay_ms: u64,
 
@@ -87,9 +72,6 @@ impl Default for BftConfig {
             view_change_timeout_increment: Duration::from_secs(1),
             view_change_timeout_max: Some(Duration::from_secs(30)),
             max_progress_wait: Duration::from_secs(9),
-            max_transactions_per_block: 4096,
-            max_finalized_transactions_per_block: 8192,
-            max_provision_transactions_per_block: 4096,
             max_timestamp_delay_ms: 30_000,
             max_timestamp_rush_ms: 2_000,
             transaction_fetch_timeout: Duration::from_millis(150),
@@ -135,28 +117,6 @@ impl BftConfig {
     #[must_use]
     pub const fn with_max_progress_wait(mut self, wait: Duration) -> Self {
         self.max_progress_wait = wait;
-        self
-    }
-
-    /// Set the maximum transactions per block.
-    #[must_use]
-    pub const fn with_max_transactions(mut self, max: usize) -> Self {
-        self.max_transactions_per_block = max;
-        self
-    }
-
-    /// Set the maximum finalized transactions per block.
-    #[must_use]
-    pub const fn with_max_finalized_transactions(mut self, max: usize) -> Self {
-        self.max_finalized_transactions_per_block = max;
-        self
-    }
-
-    /// Set the maximum provision transactions per block (summed across all
-    /// included provisions).
-    #[must_use]
-    pub const fn with_max_provision_transactions(mut self, max: usize) -> Self {
-        self.max_provision_transactions_per_block = max;
         self
     }
 }

@@ -7,12 +7,14 @@
 //! - [`certified`]: [`CertifiedBlock`] pairing of a block with its certifying QC.
 //! - [`vote`]: [`BlockVote`] BFT vote.
 //! - [`roots`]: per-block merkle root helpers used by [`BlockHeader`] consumers.
+//! - [`limits`]: protocol-level caps on per-block payload sizes.
 
 #[allow(clippy::module_inception)]
 mod block;
 pub mod certified;
 pub mod committed_header;
 pub mod header;
+pub mod limits;
 pub mod manifest;
 pub mod roots;
 pub mod vote;
