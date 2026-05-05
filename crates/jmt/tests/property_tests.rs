@@ -345,6 +345,59 @@ proptest! {
         prop_assert_eq!(Jmt::get(&store, &root2, &target), Some(new_value));
     }
 
+    /// Shared-prefix keys force the JMT to recurse through deep
+    /// shared-prefix nodes, exercising `NibblePath::truncate` at
+    /// intermediate bit lengths that random 32-byte keys rarely reach.
+    /// `prefix_bytes` controls the depth of forced shared prefix: at
+    /// 8/16/24 bytes that's 64/128/192 shared bits, well beyond the
+    /// ~log₂(N) ≈ 5-bit depth random keys produce for N ≤ 32 entries.
+    #[test]
+    fn deep_shared_prefix_roundtrip_and_proof(
+        prefix_bytes in 8usize..=24,
+        suffix_seeds in prop::collection::vec(any::<[u8; 4]>(), 4..32),
+    ) {
+        let mut entries: BTreeMap<Key, ValueHash> = BTreeMap::new();
+        let prefix = [0xA5u8; 32]; // arbitrary fixed prefix bytes
+        let mut value_seed = 0u8;
+        for seed in &suffix_seeds {
+            let mut key = [0u8; 32];
+            key[..prefix_bytes].copy_from_slice(&prefix[..prefix_bytes]);
+            // Suffix differs per entry so keys diverge below the shared prefix.
+            key[prefix_bytes] = seed[0];
+            if prefix_bytes + 1 < 32 {
+                key[prefix_bytes + 1] = seed[1];
+            }
+            if prefix_bytes + 2 < 32 {
+                key[prefix_bytes + 2] = seed[2];
+            }
+            if prefix_bytes + 3 < 32 {
+                key[prefix_bytes + 3] = seed[3];
+            }
+            let mut value = [0u8; 32];
+            value[0] = value_seed;
+            value_seed = value_seed.wrapping_add(1);
+            entries.insert(key, value);
+        }
+        prop_assume!(entries.len() >= 2);
+
+        let (store, root_opt, root_hash) = build_tree(&entries);
+        let root = root_opt.unwrap();
+
+        // Roundtrip: every key resolves to its value.
+        for (k, v) in &entries {
+            prop_assert_eq!(Jmt::get(&store, &root, k), Some(*v));
+        }
+
+        // Inclusion proof for the whole batch verifies — exercises
+        // `prove_rec`'s in-place `NibblePath` truncate at every shared-
+        // prefix level on the way down.
+        let keys: Vec<Key> = entries.keys().copied().collect();
+        let proof = Jmt::prove(&store, &root, &keys).unwrap();
+        let expected: Vec<(Key, Option<ValueHash>)> =
+            entries.iter().map(|(k, v)| (*k, Some(*v))).collect();
+        Jmt::verify(&proof, root_hash, &expected).unwrap();
+    }
+
     /// Any proof generated from a random tree must encode+decode to an
     /// equal proof, and the decoded proof must still verify.
     #[test]
