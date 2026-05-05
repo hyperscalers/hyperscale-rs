@@ -2,11 +2,22 @@
 
 use std::sync::Arc;
 
-use hyperscale_types::{FinalizedWave, MessageClass, NetworkMessage};
+use hyperscale_types::{
+    FinalizedWave, MessageClass, NetworkMessage, decode_finalized_wave_vec,
+    encode_finalized_wave_vec,
+};
 use sbor::{
     Categorize, Decode, DecodeError, Decoder, Describe, Encode, EncodeError, Encoder,
     NoCustomTypeKind, NoCustomValueKind, RustTypeId, TypeData, TypeKind, ValueKind,
 };
+
+/// Cap on finalized waves returned in a single response at decode time.
+///
+/// Matches the per-collection cap used by [`hyperscale_types::Block`].
+/// The fetch dispatcher chunks finalized-wave requests at 4 ids per call,
+/// so legitimate responses sit in single digits; everything beyond is
+/// rejected before any per-wave decode work.
+const MAX_FINALIZED_WAVES_PER_RESPONSE: usize = 10_000;
 
 /// Response to a finalized wave fetch request.
 ///
@@ -54,7 +65,7 @@ impl<E: Encoder<NoCustomValueKind>> Encode<NoCustomValueKind, E> for GetFinalize
 
     fn encode_body(&self, encoder: &mut E) -> Result<(), EncodeError> {
         encoder.write_size(1)?;
-        encoder.encode(&self.waves)?;
+        encode_finalized_wave_vec(encoder, &self.waves)?;
         Ok(())
     }
 }
@@ -72,7 +83,7 @@ impl<D: Decoder<NoCustomValueKind>> Decode<NoCustomValueKind, D> for GetFinalize
                 actual: length,
             });
         }
-        let waves: Vec<Arc<FinalizedWave>> = decoder.decode()?;
+        let waves = decode_finalized_wave_vec(decoder, MAX_FINALIZED_WAVES_PER_RESPONSE)?;
         Ok(Self { waves })
     }
 }
@@ -88,5 +99,46 @@ impl Describe<NoCustomTypeKind> for GetFinalizedWavesResponse {
 
     fn type_data() -> TypeData<NoCustomTypeKind, RustTypeId> {
         TypeData::unnamed(TypeKind::Any)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sbor::{BASIC_SBOR_V1_MAX_DEPTH, BASIC_SBOR_V1_PAYLOAD_PREFIX, VecEncoder, basic_decode};
+
+    use super::*;
+
+    #[test]
+    fn decode_rejects_oversized_waves_count() {
+        // Hand-roll a response whose waves length prefix exceeds the cap.
+        // The cap fires before any per-wave decode work is attempted.
+        let mut buf = Vec::with_capacity(32);
+        {
+            let mut enc = VecEncoder::<NoCustomValueKind>::new(&mut buf, BASIC_SBOR_V1_MAX_DEPTH);
+            enc.write_payload_prefix(BASIC_SBOR_V1_PAYLOAD_PREFIX)
+                .unwrap();
+            enc.write_value_kind(ValueKind::Tuple).unwrap();
+            enc.write_size(1).unwrap();
+            enc.write_value_kind(ValueKind::Array).unwrap();
+            enc.write_value_kind(ValueKind::Tuple).unwrap();
+            enc.write_size(MAX_FINALIZED_WAVES_PER_RESPONSE + 1)
+                .unwrap();
+        }
+        let err = basic_decode::<GetFinalizedWavesResponse>(&buf).unwrap_err();
+        assert!(matches!(
+            err,
+            DecodeError::UnexpectedSize { expected, actual }
+                if expected == MAX_FINALIZED_WAVES_PER_RESPONSE
+                    && actual == MAX_FINALIZED_WAVES_PER_RESPONSE + 1
+        ));
+    }
+
+    #[test]
+    fn empty_response_roundtrips() {
+        use sbor::basic_encode;
+        let original = GetFinalizedWavesResponse::empty();
+        let bytes = basic_encode(&original).unwrap();
+        let decoded: GetFinalizedWavesResponse = basic_decode(&bytes).unwrap();
+        assert!(decoded.waves.is_empty());
     }
 }
