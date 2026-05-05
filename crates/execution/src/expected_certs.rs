@@ -52,6 +52,7 @@
 //! because the tracker cannot see the wave set.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_types::{
@@ -80,6 +81,12 @@ const EXPECTED_RETENTION_GRACE: Duration = WAVE_TIMEOUT;
 
 type ExpectedCertKey = (ShardGroupId, BlockHeight, WaveId);
 
+/// Shared key handle: tracker tables hold an `Arc` so the per-tx reverse
+/// index can register a key with a refcount bump rather than cloning the
+/// `(ShardGroupId, BlockHeight, WaveId)` tuple (and the `WaveId`'s inner
+/// `BTreeSet`) once per tx.
+type SharedKey = Arc<ExpectedCertKey>;
+
 /// Per-expectation bookkeeping.
 #[derive(Debug, Clone)]
 struct ExpectedEntry {
@@ -103,12 +110,12 @@ struct FulfilledEntry {
 }
 
 pub struct ExpectedCertTracker {
-    expected: HashMap<ExpectedCertKey, ExpectedEntry>,
-    fulfilled: HashMap<ExpectedCertKey, FulfilledEntry>,
+    expected: HashMap<SharedKey, ExpectedEntry>,
+    fulfilled: HashMap<SharedKey, FulfilledEntry>,
     /// Reverse index `tx_hash → fulfilled keys still awaiting that tx`.
     /// Lets [`on_txs_terminated`](ExpectedCertTracker::on_txs_terminated)
     /// be `O(matched)` rather than `O(num_fulfilled)` per finalized wave.
-    by_tx: HashMap<TxHash, HashSet<ExpectedCertKey>>,
+    by_tx: HashMap<TxHash, HashSet<SharedKey>>,
 }
 
 impl ExpectedCertTracker {
@@ -133,11 +140,11 @@ impl ExpectedCertTracker {
         wave_id: WaveId,
         now_ts: WeightedTimestamp,
     ) {
-        let key = (source_shard, block_height, wave_id);
+        let key: ExpectedCertKey = (source_shard, block_height, wave_id);
         if self.fulfilled.contains_key(&key) {
             return;
         }
-        self.expected.entry(key).or_insert(ExpectedEntry {
+        self.expected.entry(Arc::new(key)).or_insert(ExpectedEntry {
             discovered_at: now_ts,
             last_requested_at: None,
         });
@@ -158,11 +165,11 @@ impl ExpectedCertTracker {
         tx_hashes: impl IntoIterator<Item = TxHash>,
         deadline: WeightedTimestamp,
     ) -> bool {
-        let key = (source_shard, block_height, wave_id.clone());
+        let key: SharedKey = Arc::new((source_shard, block_height, wave_id.clone()));
         let cleared = self.expected.remove(&key).is_some();
         let pending_txs: HashSet<TxHash> = tx_hashes.into_iter().collect();
         for tx in &pending_txs {
-            self.by_tx.entry(*tx).or_default().insert(key.clone());
+            self.by_tx.entry(*tx).or_default().insert(Arc::clone(&key));
         }
         self.fulfilled.insert(
             key,
@@ -226,7 +233,7 @@ impl ExpectedCertTracker {
     /// them.
     pub fn check_timeouts(&mut self, now_ts: WeightedTimestamp) -> Vec<(WaveId, bool)> {
         let mut fetches = Vec::new();
-        for ((_, _, wave_id), entry) in &mut self.expected {
+        for (key, entry) in &mut self.expected {
             let should_request = match entry.last_requested_at {
                 None => now_ts.elapsed_since(entry.discovered_at) >= EXEC_CERT_FALLBACK_TIMEOUT,
                 Some(last) => now_ts.elapsed_since(last) >= EXEC_CERT_RETRY_INTERVAL,
@@ -234,7 +241,7 @@ impl ExpectedCertTracker {
             if should_request {
                 let is_retry = entry.last_requested_at.is_some();
                 entry.last_requested_at = Some(now_ts);
-                fetches.push((wave_id.clone(), is_retry));
+                fetches.push((key.2.clone(), is_retry));
             }
         }
         fetches
@@ -254,8 +261,8 @@ impl ExpectedCertTracker {
         // grace window, a remote header arriving slightly ahead of the
         // local block that creates the dependent wave is silently pruned
         // and the EC never gets fetched.
-        self.expected.retain(|(source_shard, _, _), entry| {
-            shards_needed.contains(source_shard)
+        self.expected.retain(|key, entry| {
+            shards_needed.contains(&key.0)
                 || now_ts.elapsed_since(entry.discovered_at) < EXPECTED_RETENTION_GRACE
         });
     }
