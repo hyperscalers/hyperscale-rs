@@ -5,7 +5,10 @@
 //! the coordinator so the topology-only parts are unit-testable without a
 //! full driver fixture.
 
-use hyperscale_types::{Bls12381G1PublicKey, ShardGroupId, TopologySnapshot, ValidatorId};
+use hyperscale_types::{
+    Bls12381G1PublicKey, ExecutionCertificate, ShardGroupId, TopologySnapshot, ValidatorId,
+    VotePower,
+};
 
 /// Committee members of `shard` with the local validator filtered out.
 ///
@@ -21,6 +24,23 @@ pub fn peers_excluding_self(topology: &TopologySnapshot, shard: ShardGroupId) ->
         .copied()
         .filter(|&v| v != self_id)
         .collect()
+}
+
+/// True if `ec.signers` represents at least 2f+1 of the voting power on
+/// `ec.shard_group_id()`. Mirrors `qc_has_local_quorum_power` (in the BFT
+/// crate) but resolves committee + voting power for the EC's own shard,
+/// since cross-shard ECs are signed by remote committees.
+#[must_use]
+pub fn ec_has_shard_quorum_power(topology: &TopologySnapshot, ec: &ExecutionCertificate) -> bool {
+    let shard = ec.shard_group_id();
+    let committee = topology.committee_for_shard(shard);
+    let signers_power: u64 = ec
+        .signers
+        .set_indices()
+        .filter_map(|i| committee.get(i))
+        .map(|&vid| topology.voting_power(vid).unwrap_or(0))
+        .sum();
+    VotePower::has_quorum(signers_power, topology.voting_power_for_shard(shard))
 }
 
 /// Public keys for a shard's committee, in canonical committee order.

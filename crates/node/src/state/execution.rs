@@ -59,9 +59,10 @@ impl NodeStateMachine {
                 actions
             }
             ProtocolEvent::FinalizedWavesReceived { waves } => {
+                let topology = self.topology.snapshot();
                 let mut actions = Vec::new();
                 for wave in waves {
-                    actions.extend(self.execution.admit_finalized_wave(wave));
+                    actions.extend(self.execution.admit_finalized_wave(topology, wave));
                 }
                 actions
             }

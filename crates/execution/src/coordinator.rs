@@ -52,13 +52,15 @@ use hyperscale_types::{
 };
 use tracing::instrument;
 
-use crate::action_handlers::build_dispatch_action;
+use crate::action_handlers::{build_dispatch_action, verify_execution_certificate_signature};
 use crate::conflict::DetectedConflict;
 use crate::early_arrivals::{EARLY_VOTE_RETENTION, EarlyArrivalBuffer};
 use crate::exec_cert_store::ExecCertStore;
 use crate::expected_certs::ExpectedCertTracker;
 use crate::finalized_waves::FinalizedWaveStore;
-use crate::lookups::{committee_public_keys_for_shard, peers_excluding_self};
+use crate::lookups::{
+    committee_public_keys_for_shard, ec_has_shard_quorum_power, peers_excluding_self,
+};
 use crate::outbound_certs::OutboundExecutionCertificateTracker;
 use crate::provisioning::ProvisioningTracker;
 use crate::vote_tracker::VoteTracker;
@@ -1580,16 +1582,50 @@ impl ExecutionCoordinator {
     }
 
     /// Admission entry point for fetch-delivered (or otherwise externally
-    /// sourced) finalized waves. Emits
-    /// `Continuation(FinalizedWavesAdmitted)` so `io_loop` drains the fetch
-    /// protocol and BFT's pending-block subscriber receives the wave.
+    /// sourced) finalized waves. Verifies every contained EC's BLS signature
+    /// and quorum power before emitting `Continuation(FinalizedWavesAdmitted)`
+    /// — without this, a peer answering a `finalized_wave.request` could
+    /// poison `caches.finalized_wave` with a bogus wave we'd then re-serve
+    /// to other peers.
     ///
-    /// Locally finalized waves emit the same event from `finalize_wave`, so
-    /// gossip, fetch, and local-finalize all converge on the same path.
-    /// Validation against the wave's EC happens at the BFT subscriber so
-    /// invalid waves don't poison the pending-block view.
+    /// Locally finalized waves bypass this entry point: `finalize_wave`
+    /// emits the same event from a WC built out of already-verified ECs.
+    /// Synced blocks are likewise trusted at admission — the QC chain plus
+    /// the synced-block apply path's quorum gate established their integrity
+    /// upstream.
     #[must_use]
-    pub fn admit_finalized_wave(&self, wave: Arc<FinalizedWave>) -> Vec<Action> {
+    pub fn admit_finalized_wave(
+        &self,
+        topology: &TopologySnapshot,
+        wave: Arc<FinalizedWave>,
+    ) -> Vec<Action> {
+        for ec in wave.execution_certificates() {
+            let shard = ec.shard_group_id();
+            if !ec_has_shard_quorum_power(topology, ec) {
+                tracing::warn!(
+                    wave = %wave.wave_id(),
+                    shard = shard.0,
+                    "Rejecting fetched FinalizedWave: contained EC lacks quorum power"
+                );
+                return Vec::new();
+            }
+            let Some(public_keys) = committee_public_keys_for_shard(topology, shard) else {
+                tracing::warn!(
+                    wave = %wave.wave_id(),
+                    shard = shard.0,
+                    "Rejecting fetched FinalizedWave: cannot resolve EC committee keys"
+                );
+                return Vec::new();
+            };
+            if !verify_execution_certificate_signature(ec, &public_keys) {
+                tracing::warn!(
+                    wave = %wave.wave_id(),
+                    shard = shard.0,
+                    "Rejecting fetched FinalizedWave: contained EC signature invalid"
+                );
+                return Vec::new();
+            }
+        }
         vec![Action::Continuation(
             ProtocolEvent::FinalizedWavesAdmitted { waves: vec![wave] },
         )]
@@ -2267,6 +2303,41 @@ mod tests {
             _ => false,
         });
         assert!(has_remote, "Should include remote shard broadcast");
+    }
+
+    /// A `FinalizedWave` delivered by `admit_finalized_wave` (the fetch
+    /// entry point) must reject any wave whose contained ECs lack quorum
+    /// power or signature validity. Otherwise a peer answering
+    /// `finalized_wave.request` can poison the `io_loop` serving cache
+    /// (via the `Continuation(FinalizedWavesAdmitted)` interception) and
+    /// we re-serve the bogus wave to other peers.
+    #[test]
+    fn test_admit_finalized_wave_rejects_subquorum_ec() {
+        let topo = make_two_shard_topology();
+        let state = make_test_state();
+
+        let wave_id = WaveId::new(ShardGroupId(0), BlockHeight(1), BTreeSet::new());
+        let bogus_ec = Arc::new(ExecutionCertificate::new(
+            wave_id.clone(),
+            WeightedTimestamp(1_000_000),
+            GlobalReceiptRoot::ZERO,
+            vec![],
+            zero_bls_signature(),
+            SignerBitfield::empty(), // no signers — far below 2f+1
+        ));
+        let wave = Arc::new(FinalizedWave {
+            certificate: Arc::new(WaveCertificate {
+                wave_id,
+                execution_certificates: vec![bogus_ec],
+            }),
+            receipts: vec![],
+        });
+
+        let actions = state.admit_finalized_wave(&topo, wave);
+        assert!(
+            actions.is_empty(),
+            "sub-quorum FinalizedWave must produce no admission Continuation"
+        );
     }
 
     /// Receipt of a cross-shard EC must NOT mark its expectation
