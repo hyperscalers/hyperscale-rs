@@ -423,6 +423,30 @@ mod tests {
         assert!(matches!(err, DecodeError::InvalidCustomValue));
     }
 
+    /// The exactly-one-local-EC invariant rejects WCs with more than one
+    /// EC matching `wc.wave_id`. Without this, downstream helpers like
+    /// `FinalizedWave::local_ec()` would silently pick the first match,
+    /// letting two paths disagree on which EC is authoritative.
+    #[test]
+    fn decode_rejects_wave_cert_with_multiple_local_ecs() {
+        use sbor::DecodeError;
+
+        // Build two ECs both keyed to the same wave_id (shard=0, h=42, deps={1}).
+        // Distinct seeds yield distinct canonical hashes so the inner
+        // EC-decode invariants don't reject before we get to the local-EC
+        // count check.
+        let wave_id = make_wave_id(0, BlockHeight(42), &[1]);
+        let ec_a = make_local_ec(&wave_id, vec![make_outcome(1)]);
+        let ec_b = make_local_ec(&wave_id, vec![make_outcome(2)]);
+        let wc = WaveCertificate {
+            wave_id,
+            execution_certificates: vec![ec_a, ec_b],
+        };
+        let bytes = basic_encode(&wc).unwrap();
+        let err = basic_decode::<WaveCertificate>(&bytes).unwrap_err();
+        assert!(matches!(err, DecodeError::InvalidCustomValue));
+    }
+
     #[test]
     fn decode_rejects_wave_cert_with_oversized_ec_count() {
         use sbor::{

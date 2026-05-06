@@ -32,12 +32,16 @@ const MAX_EXECUTION_CERTIFICATES_PER_WAVE: usize = 1024;
 ///
 /// # Invariant (well-formed WC)
 ///
-/// A well-formed `WaveCertificate` always contains the **local EC** — the EC
-/// where `ec.wave_id == wc.wave_id`. The local EC is the authoritative source
-/// for the wave's tx set and canonical (block) ordering. Remote ECs attest
-/// against their own wave decompositions and may cover only subsets.
+/// A well-formed `WaveCertificate` contains **exactly one local EC** — the
+/// EC where `ec.wave_id == wc.wave_id`. The local EC is the authoritative
+/// source for the wave's tx set and canonical (block) ordering. Remote ECs
+/// attest against their own wave decompositions and may cover only subsets;
+/// the local shard, by construction, produces a single EC per wave.
 ///
-/// Enforced by `WaveCertificateTracker::create_wave_certificate`.
+/// Enforced at construction by `WaveCertificateTracker::create_wave_certificate`
+/// and at the wire boundary by [`WaveCertificate::Decode`]. Downstream
+/// helpers like [`FinalizedWave::local_ec`](crate::FinalizedWave::local_ec)
+/// `expect` this invariant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WaveCertificate {
     /// Self-contained wave identifier (shard + height + remote dependencies).
@@ -133,13 +137,15 @@ impl<D: Decoder<NoCustomValueKind>> Decode<NoCustomValueKind, D> for WaveCertifi
                 decoder.decode_deeper_body_with_value_kind(ValueKind::Tuple)?;
             execution_certificates.push(Arc::new(ec));
         }
-        // Reject any WC that violates the local-EC invariant. Without this
-        // check a peer-supplied WC reaches `FinalizedWave::local_ec()`,
-        // which panics on the missing match.
-        if !execution_certificates
+        // Reject any WC that violates the exactly-one-local-EC invariant.
+        // Zero local ECs would crash `FinalizedWave::local_ec()`; multiple
+        // would let downstream code silently disagree on which EC is
+        // authoritative for tx ordering.
+        let local_ec_count = execution_certificates
             .iter()
-            .any(|ec| ec.wave_id == wave_id)
-        {
+            .filter(|ec| ec.wave_id == wave_id)
+            .count();
+        if local_ec_count != 1 {
             return Err(DecodeError::InvalidCustomValue);
         }
         Ok(Self {
