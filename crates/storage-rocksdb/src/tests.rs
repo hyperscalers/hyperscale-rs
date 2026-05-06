@@ -256,7 +256,7 @@ fn test_recovery_with_qc() {
             shard_group_id: ShardGroupId(0),
             height: BlockHeight::new(100),
             parent_block_hash: BlockHash::from_raw(Hash::from_bytes(&[98; 32])),
-            round: Round(5),
+            round: Round::new(5),
             aggregated_signature: zero_bls_signature(),
             signers: SignerBitfield::new(4),
             weighted_timestamp: WeightedTimestamp(100_000),
@@ -274,7 +274,7 @@ fn test_recovery_with_qc() {
 
         let qc = recovered.latest_qc.unwrap();
         assert_eq!(qc.height, BlockHeight::new(100));
-        assert_eq!(qc.round, Round(5));
+        assert_eq!(qc.round, Round::new(5));
         assert_eq!(qc.block_hash, expected_hash);
     }
 }

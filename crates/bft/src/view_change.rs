@@ -95,7 +95,10 @@ impl ViewChangeController {
     /// the same timeout because round numbers are QC- and header-attested,
     /// so the formula is deterministic network-wide.
     pub fn current_timeout(&self) -> Duration {
-        let rounds_at_height = self.view.0.saturating_sub(self.view_at_height_start.0);
+        let rounds_at_height = self
+            .view
+            .inner()
+            .saturating_sub(self.view_at_height_start.inner());
         let rounds_factor = u32::try_from(rounds_at_height).unwrap_or(u32::MAX);
         let timeout = VIEW_CHANGE_TIMEOUT + VIEW_CHANGE_TIMEOUT_INCREMENT * rounds_factor;
         timeout.min(VIEW_CHANGE_TIMEOUT_MAX)
@@ -165,13 +168,13 @@ mod tests {
 
         assert_eq!(vc.current_timeout(), VIEW_CHANGE_TIMEOUT);
 
-        vc.view = Round(1);
+        vc.view = Round::new(1);
         assert_eq!(
             vc.current_timeout(),
             VIEW_CHANGE_TIMEOUT + VIEW_CHANGE_TIMEOUT_INCREMENT
         );
 
-        vc.view = Round(4);
+        vc.view = Round::new(4);
         assert_eq!(
             vc.current_timeout(),
             VIEW_CHANGE_TIMEOUT + VIEW_CHANGE_TIMEOUT_INCREMENT * 4
@@ -181,7 +184,7 @@ mod tests {
     #[test]
     fn current_timeout_respects_cap() {
         let mut vc = ViewChangeController::new();
-        vc.view = Round(10_000);
+        vc.view = Round::new(10_000);
         assert_eq!(vc.current_timeout(), VIEW_CHANGE_TIMEOUT_MAX);
     }
 
@@ -189,7 +192,7 @@ mod tests {
     fn reset_for_height_advance_rebases_round_counter() {
         let mut vc = ViewChangeController::new();
 
-        vc.view = Round(5);
+        vc.view = Round::new(5);
         assert_eq!(
             vc.current_timeout(),
             VIEW_CHANGE_TIMEOUT + VIEW_CHANGE_TIMEOUT_INCREMENT * 5
@@ -202,12 +205,12 @@ mod tests {
     #[test]
     fn advance_increments_view_and_metric_and_clears_header_reset() {
         let mut vc = ViewChangeController::new();
-        vc.last_header_reset = Some((BlockHeight::new(5), Round(0)));
+        vc.last_header_reset = Some((BlockHeight::new(5), Round::new(0)));
 
         let new_round = vc.advance();
 
-        assert_eq!(new_round, Round(1));
-        assert_eq!(vc.view, Round(1));
+        assert_eq!(new_round, Round::new(1));
+        assert_eq!(vc.view, Round::new(1));
         assert_eq!(vc.view_changes, 1);
         assert!(vc.last_header_reset.is_none());
     }
@@ -215,16 +218,16 @@ mod tests {
     #[test]
     fn sync_to_qc_round_only_advances_forward() {
         let mut vc = ViewChangeController::new();
-        vc.view = Round(5);
+        vc.view = Round::new(5);
 
-        assert!(!vc.sync_to_qc_round(Round(3)));
-        assert_eq!(vc.view, Round(5));
+        assert!(!vc.sync_to_qc_round(Round::new(3)));
+        assert_eq!(vc.view, Round::new(5));
 
-        assert!(!vc.sync_to_qc_round(Round(5)));
-        assert_eq!(vc.view, Round(5));
+        assert!(!vc.sync_to_qc_round(Round::new(5)));
+        assert_eq!(vc.view, Round::new(5));
 
-        assert!(vc.sync_to_qc_round(Round(10)));
-        assert_eq!(vc.view, Round(10));
+        assert!(vc.sync_to_qc_round(Round::new(10)));
+        assert_eq!(vc.view, Round::new(10));
     }
 
     #[test]
@@ -233,15 +236,15 @@ mod tests {
         let t1 = LocalTimestamp::from_millis(1_000);
         let t2 = LocalTimestamp::from_millis(2_000);
 
-        vc.record_header_activity(BlockHeight::new(5), Round(0), t1);
+        vc.record_header_activity(BlockHeight::new(5), Round::new(0), t1);
         assert_eq!(vc.last_leader_activity, Some(t1));
 
         // Same (height, round): must not reset again.
-        vc.record_header_activity(BlockHeight::new(5), Round(0), t2);
+        vc.record_header_activity(BlockHeight::new(5), Round::new(0), t2);
         assert_eq!(vc.last_leader_activity, Some(t1));
 
         // Different round at same height: resets.
-        vc.record_header_activity(BlockHeight::new(5), Round(1), t2);
+        vc.record_header_activity(BlockHeight::new(5), Round::new(1), t2);
         assert_eq!(vc.last_leader_activity, Some(t2));
     }
 

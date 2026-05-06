@@ -108,7 +108,7 @@ mod tests {
         //   Block proposer: (0+0)%4 = V0 (self, skipped)
         //   Next proposers for height 1: V1 (round 0), V2 (round 1)
         assert_eq!(
-            vote_recipients(&topology, BlockHeight::new(0), Round(0)),
+            vote_recipients(&topology, BlockHeight::new(0), Round::new(0)),
             vec![ValidatorId(1), ValidatorId(2)]
         );
 
@@ -116,7 +116,7 @@ mod tests {
         //   Block proposer: V1 (included)
         //   Next proposers: V2 (round 0), V3 (round 1)
         assert_eq!(
-            vote_recipients(&topology, BlockHeight::new(1), Round(0)),
+            vote_recipients(&topology, BlockHeight::new(1), Round::new(0)),
             vec![ValidatorId(1), ValidatorId(2), ValidatorId(3)]
         );
     }
@@ -129,7 +129,7 @@ mod tests {
         let committee = TestCommittee::new(4, 42);
         let topology = topology_for(0, &committee);
         assert_eq!(
-            vote_recipients(&topology, BlockHeight::new(3), Round(0)),
+            vote_recipients(&topology, BlockHeight::new(3), Round::new(0)),
             vec![ValidatorId(3), ValidatorId(1), ValidatorId(2)]
         );
     }
@@ -142,7 +142,7 @@ mod tests {
         let committee = TestCommittee::new(4, 42);
         let topology = topology_for(0, &committee);
         assert_eq!(
-            vote_recipients(&topology, BlockHeight::new(0), Round(2)),
+            vote_recipients(&topology, BlockHeight::new(0), Round::new(2)),
             vec![ValidatorId(2), ValidatorId(3), ValidatorId(1)]
         );
     }
@@ -151,7 +151,7 @@ mod tests {
     fn vote_recipients_empty_when_solo_validator() {
         let committee = TestCommittee::new(1, 42);
         let topology = topology_for(0, &committee);
-        assert!(vote_recipients(&topology, BlockHeight::new(0), Round(0)).is_empty());
+        assert!(vote_recipients(&topology, BlockHeight::new(0), Round::new(0)).is_empty());
     }
 
     // ─── committee_public_keys ──────────────────────────────────────────

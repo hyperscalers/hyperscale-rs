@@ -357,7 +357,7 @@ impl TopologySnapshot {
             "proposer_for called with empty committee for shard {:?}",
             self.local_shard
         );
-        let index = usize::try_from((height.inner() + round.0) % committee.len() as u64)
+        let index = usize::try_from((height.inner() + round.inner()) % committee.len() as u64)
             .expect("modulo of usize len fits in usize");
         committee[index]
     }
@@ -515,19 +515,19 @@ mod tests {
         let snapshot = make_snapshot(4, 0);
 
         assert_eq!(
-            snapshot.proposer_for(BlockHeight::new(0), Round(0)),
+            snapshot.proposer_for(BlockHeight::new(0), Round::new(0)),
             ValidatorId(0)
         );
         assert_eq!(
-            snapshot.proposer_for(BlockHeight::new(1), Round(0)),
+            snapshot.proposer_for(BlockHeight::new(1), Round::new(0)),
             ValidatorId(1)
         );
         assert_eq!(
-            snapshot.proposer_for(BlockHeight::new(4), Round(0)),
+            snapshot.proposer_for(BlockHeight::new(4), Round::new(0)),
             ValidatorId(0)
         );
         assert_eq!(
-            snapshot.proposer_for(BlockHeight::new(0), Round(1)),
+            snapshot.proposer_for(BlockHeight::new(0), Round::new(1)),
             ValidatorId(1)
         );
     }

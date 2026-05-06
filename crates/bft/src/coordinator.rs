@@ -511,12 +511,12 @@ impl BftCoordinator {
         let rounds_at_height = self
             .view_change
             .view
-            .0
-            .saturating_sub(self.view_change.view_at_height_start.0);
+            .inner()
+            .saturating_sub(self.view_change.view_at_height_start.inner());
 
         info!(
             validator = ?topology_snapshot.local_validator_id(),
-            view = self.view_change.view.0,
+            view = self.view_change.view.inner(),
             rounds_at_height = rounds_at_height,
             timeout_ms = timeout.as_millis(),
             "Round timeout - advancing round (implicit view change)"
@@ -781,7 +781,7 @@ impl BftCoordinator {
             trace!(
                 validator = ?topology_snapshot.local_validator_id(),
                 height = next_height.inner(),
-                round = round.0,
+                round = round.inner(),
                 "Proposal build already in-flight, skipping"
             );
             return false;
@@ -800,7 +800,7 @@ impl BftCoordinator {
             trace!(
                 validator = ?topology_snapshot.local_validator_id(),
                 height = next_height.inner(),
-                round = round.0,
+                round = round.inner(),
                 "Proposal deferred pending parent tree, skipping"
             );
             return false;
@@ -852,7 +852,7 @@ impl BftCoordinator {
         info!(
             validator = ?topology_snapshot.local_validator_id(),
             height = height.inner(),
-            round = round.0,
+            round = round.inner(),
             plan.log_label,
         );
 
@@ -929,7 +929,7 @@ impl BftCoordinator {
         info!(
             validator = ?topology_snapshot.local_validator_id(),
             height = height.inner(),
-            original_round = original_round.0,
+            original_round = original_round.inner(),
             block_hash = ?block_hash,
             tx_count = manifest.transaction_count(),
             cert_count = manifest.cert_ids.len(),
@@ -963,7 +963,7 @@ impl BftCoordinator {
     /// parameter because sync detection doesn't need it.
     #[instrument(skip(self, header, manifest, lookup_tx, lookup_finalized_wave, lookup_provision), fields(
         height = header.height.inner(),
-        round = header.round.0,
+        round = header.round.inner(),
         proposer = ?header.proposer,
         tx_count = manifest.transaction_count()
     ))]
@@ -985,7 +985,7 @@ impl BftCoordinator {
             validator = ?topology_snapshot.local_validator_id(),
             proposer = ?header.proposer,
             height = height.inner(),
-            round = round.0,
+            round = round.inner(),
             block_hash = ?block_hash,
             "Received block header"
         );
@@ -1140,8 +1140,8 @@ impl BftCoordinator {
         if self.view_change.sync_to_qc_round(header.round) {
             info!(
                 validator = ?topology_snapshot.local_validator_id(),
-                old_view = old_view.0,
-                new_view = header.round.0,
+                old_view = old_view.inner(),
+                new_view = header.round.inner(),
                 header_height = header.height.inner(),
                 "View synchronization: advancing view to match received block header"
             );
@@ -1401,8 +1401,8 @@ impl BftCoordinator {
                     validator = ?topology_snapshot.local_validator_id(),
                     block_hash = ?block_hash,
                     height = height.inner(),
-                    round = round.0,
-                    existing_round = existing_round.0,
+                    round = round.inner(),
+                    existing_round = existing_round.inner(),
                     "Already voted for this block"
                 );
                 return vec![];
@@ -1419,9 +1419,9 @@ impl BftCoordinator {
                 warn!(
                     validator = ?topology_snapshot.local_validator_id(),
                     existing = ?existing_block,
-                    existing_round = existing_round.0,
+                    existing_round = existing_round.inner(),
                     new = ?block_hash,
-                    new_round = round.0,
+                    new_round = round.inner(),
                     height = height.inner(),
                     "Vote locking: already voted for different block at this height (view change)"
                 );
@@ -1527,7 +1527,7 @@ impl BftCoordinator {
     /// Create a vote for a block.
     #[tracing::instrument(level = "debug", skip(self), fields(
         height = height.inner(),
-        round = round.0,
+        round = round.inner(),
         sign_us = Empty,
     ))]
     fn create_vote(
@@ -1555,7 +1555,7 @@ impl BftCoordinator {
         debug!(
             validator = ?topology_snapshot.local_validator_id(),
             height = height.inner(),
-            round = round.0,
+            round = round.inner(),
             block_hash = ?block_hash,
             "Emitting vote (signing delegated to crypto pool)"
         );
@@ -1666,8 +1666,8 @@ impl BftCoordinator {
             if self.view_change.sync_to_qc_round(vote.round) {
                 info!(
                     validator = ?validator_id,
-                    old_view = old_view.0,
-                    new_view = vote.round.0,
+                    old_view = old_view.inner(),
+                    new_view = vote.round.inner(),
                     vote_anchor_ts = vote.height.inner(),
                     voter = ?vote.voter,
                     "View synchronization: advancing view to match verified vote"
@@ -1830,7 +1830,7 @@ impl BftCoordinator {
     /// Called when the runner completes `Action::BuildProposal`. The runner has
     /// computed the state root, built the complete block, and cached the `WriteBatch`
     /// for efficient commit later.
-    #[instrument(skip(self, block, finalized_waves), fields(height = %height.inner(), round = round.0))]
+    #[instrument(skip(self, block, finalized_waves), fields(height = %height.inner(), round = round.inner()))]
     #[allow(clippy::too_many_arguments)]
     pub fn on_proposal_built(
         &mut self,
@@ -1847,7 +1847,7 @@ impl BftCoordinator {
             TakeResult::NotPending => {
                 warn!(
                     height = height.inner(),
-                    round = round.0,
+                    round = round.inner(),
                     "ProposalBuilt received but no pending proposal"
                 );
                 return vec![];
@@ -1855,9 +1855,9 @@ impl BftCoordinator {
             TakeResult::Mismatch { expected } => {
                 warn!(
                     expected_height = expected.height.inner(),
-                    expected_round = expected.round.0,
+                    expected_round = expected.round.inner(),
                     received_height = height.inner(),
-                    received_round = round.0,
+                    received_round = round.inner(),
                     "ProposalBuilt mismatch - discarding stale result"
                 );
                 return vec![];
@@ -1874,7 +1874,7 @@ impl BftCoordinator {
         info!(
             validator = ?topology_snapshot.local_validator_id(),
             height = height.inner(),
-            round = round.0,
+            round = round.inner(),
             block_hash = ?block_hash,
             transactions = total_tx_count,
             certificates = pending_block.certificate_count(),
@@ -2621,7 +2621,7 @@ impl BftCoordinator {
     /// each validator advances locally.
     ///
     /// Returns actions to propose if we're the new proposer.
-    #[instrument(skip(self), fields(new_round = self.view_change.view.0 + 1))]
+    #[instrument(skip(self), fields(new_round = self.view_change.view.inner() + 1))]
     fn advance_round(&mut self, topology_snapshot: &TopologySnapshot) -> Vec<Action> {
         // The next height to propose is one above the highest certified block,
         // NOT one above the committed block. This matches try_propose behavior.
@@ -2641,8 +2641,8 @@ impl BftCoordinator {
         info!(
             validator = ?topology_snapshot.local_validator_id(),
             height = height.inner(),
-            old_round = old_round.0,
-            new_round = self.view_change.view.0,
+            old_round = old_round.inner(),
+            new_round = self.view_change.view.inner(),
             view_changes = self.view_change.view_changes,
             "Advancing round locally (implicit view change)"
         );
@@ -2685,7 +2685,7 @@ impl BftCoordinator {
                 info!(
                     validator = ?topology_snapshot.local_validator_id(),
                     height = height.inner(),
-                    new_round = self.view_change.view.0,
+                    new_round = self.view_change.view.inner(),
                     latest_qc_height = latest_qc_height.inner(),
                     cleared_votes = cleared_votes,
                     "Unlocking vote at height (no QC formed, safe by quorum intersection)"
@@ -2709,7 +2709,7 @@ impl BftCoordinator {
                 info!(
                     validator = ?topology_snapshot.local_validator_id(),
                     height = height.inner(),
-                    new_round = self.view_change.view.0,
+                    new_round = self.view_change.view.inner(),
                     existing_block = ?existing_hash,
                     "Vote-locked at this height, re-proposing"
                 );
@@ -2722,7 +2722,7 @@ impl BftCoordinator {
             info!(
                 validator = ?topology_snapshot.local_validator_id(),
                 height = height.inner(),
-                new_round = self.view_change.view.0,
+                new_round = self.view_change.view.inner(),
                 "We are the new proposer after round advance - building block"
             );
 
@@ -2793,8 +2793,8 @@ impl BftCoordinator {
         if self.view_change.sync_to_qc_round(qc.round) {
             info!(
                 validator = ?topology_snapshot.local_validator_id(),
-                old_view = old_view.0,
-                new_view = qc.round.0,
+                old_view = old_view.inner(),
+                new_view = qc.round.inner(),
                 qc_height = qc.height.inner(),
                 "View synchronization: advancing view to match QC"
             );
@@ -3174,7 +3174,7 @@ impl BftCoordinator {
         BftStats {
             view_changes: self.view_change.view_changes,
             view_syncs: self.view_change.view_syncs,
-            current_round: self.view_change.view.0,
+            current_round: self.view_change.view.inner(),
             committed_height: self.committed_height,
         }
     }
@@ -3387,19 +3387,19 @@ mod tests {
         // proposer_for = (height + round) % committee_size
         let (_state, topology) = make_test_state();
         assert_eq!(
-            topology.proposer_for(BlockHeight::new(0), Round(0)),
+            topology.proposer_for(BlockHeight::new(0), Round::new(0)),
             ValidatorId(0)
         );
         assert_eq!(
-            topology.proposer_for(BlockHeight::new(1), Round(0)),
+            topology.proposer_for(BlockHeight::new(1), Round::new(0)),
             ValidatorId(1)
         );
         assert_eq!(
-            topology.proposer_for(BlockHeight::new(2), Round(0)),
+            topology.proposer_for(BlockHeight::new(2), Round::new(0)),
             ValidatorId(2)
         );
         assert_eq!(
-            topology.proposer_for(BlockHeight::new(0), Round(1)),
+            topology.proposer_for(BlockHeight::new(0), Round::new(1)),
             ValidatorId(1)
         );
     }
@@ -3408,9 +3408,9 @@ mod tests {
     fn test_should_propose() {
         // Local validator is ValidatorId(0) — only proposes when proposer_for = 0.
         let (_state, topology) = make_test_state();
-        assert!(topology.should_propose(BlockHeight::new(0), Round(0)));
-        assert!(!topology.should_propose(BlockHeight::new(1), Round(0)));
-        assert!(!topology.should_propose(BlockHeight::new(0), Round(1)));
+        assert!(topology.should_propose(BlockHeight::new(0), Round::new(0)));
+        assert!(!topology.should_propose(BlockHeight::new(1), Round::new(0)));
+        assert!(!topology.should_propose(BlockHeight::new(0), Round::new(1)));
     }
 
     fn make_header_at_height(height: BlockHeight, timestamp_ms: u64) -> BlockHeader {
@@ -3421,7 +3421,7 @@ mod tests {
             parent_qc: QuorumCertificate::genesis(ShardGroupId(0)),
             proposer: ValidatorId(height.inner() % 4), // Round-robin
             timestamp: ProposerTimestamp(timestamp_ms),
-            round: Round(0),
+            round: Round::new(0),
             is_fallback: false,
             state_root: StateRoot::ZERO,
             transaction_root: TransactionRoot::ZERO,
@@ -3449,7 +3449,7 @@ mod tests {
             shard_group_id: ShardGroupId(0),
             height,
             parent_block_hash: BlockHash::ZERO,
-            round: Round(0),
+            round: Round::new(0),
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
             weighted_timestamp: WeightedTimestamp(100_000),
@@ -3757,7 +3757,7 @@ mod tests {
             BlockHeight::new(1),
             (
                 BlockHash::from_raw(Hash::from_bytes(b"voted_block")),
-                Round(0),
+                Round::new(0),
             ),
         );
         let _ = state.advance_round(&topology);
@@ -3774,7 +3774,7 @@ mod tests {
                 BlockHeight::new(h),
                 (
                     BlockHash::from_raw(Hash::from_bytes(format!("block{h}").as_bytes())),
-                    Round(0),
+                    Round::new(0),
                 ),
             );
         }
@@ -3846,8 +3846,8 @@ mod tests {
         state.set_time(LocalTimestamp::from_millis(100_000));
 
         let height = BlockHeight::new(1);
-        let round_0 = Round(0);
-        let round_1 = Round(1);
+        let round_0 = Round::new(0);
+        let round_1 = Round::new(1);
 
         // Two headers at height 1: A at round 0, B at round 1 with different
         // proposer and timestamp — distinct hashes.
@@ -3880,10 +3880,10 @@ mod tests {
         let height = BlockHeight::new(1);
         let block_hash = make_header_at_height(height, 100_000).hash();
 
-        let actions = state.try_vote_on_block(&topology, block_hash, height, Round(0));
+        let actions = state.try_vote_on_block(&topology, block_hash, height, Round::new(0));
         assert!(!actions.is_empty());
 
-        let actions = state.try_vote_on_block(&topology, block_hash, height, Round(1));
+        let actions = state.try_vote_on_block(&topology, block_hash, height, Round::new(1));
         assert!(actions.is_empty());
         assert_eq!(voted_block_at(&state, height), block_hash);
     }
@@ -3903,7 +3903,7 @@ mod tests {
             block_hash: block_b,
             shard_group_id: ShardGroupId(0),
             height,
-            round: Round(0),
+            round: Round::new(0),
             voter,
             signature: zero_bls_signature(),
             timestamp: ProposerTimestamp(100_000),
@@ -3945,7 +3945,7 @@ mod tests {
         state
             .votes
             .voted_heights
-            .insert(height, (original_block_hash, Round(0)));
+            .insert(height, (original_block_hash, Round::new(0)));
 
         let actions = state.repropose_locked_block(&topology, original_block_hash, height);
 
@@ -3956,7 +3956,7 @@ mod tests {
             panic!("expected BroadcastBlockHeader");
         };
         let reproposed = gossip.as_ref();
-        assert_eq!(reproposed.round, Round(0));
+        assert_eq!(reproposed.round, Round::new(0));
         assert_eq!(reproposed.hash(), original_block_hash);
         assert_eq!(reproposed.proposer, ValidatorId(1));
     }
@@ -4015,18 +4015,18 @@ mod tests {
         };
 
         // Rounds 1 and 2: not proposer, vote lock cleared on each advance.
-        state.view_change.view = Round(0);
-        let _ = vote_and_advance(&mut state, b"block_a", Round(0));
-        assert_eq!(state.view_change.view, Round(1));
+        state.view_change.view = Round::new(0);
+        let _ = vote_and_advance(&mut state, b"block_a", Round::new(0));
+        assert_eq!(state.view_change.view, Round::new(1));
         assert!(!state.votes.voted_heights.contains_key(&height));
 
-        let _ = vote_and_advance(&mut state, b"block_b", Round(1));
-        assert_eq!(state.view_change.view, Round(2));
+        let _ = vote_and_advance(&mut state, b"block_b", Round::new(1));
+        assert_eq!(state.view_change.view, Round::new(2));
         assert!(!state.votes.voted_heights.contains_key(&height));
 
         // Round 3: we're proposer — advance emits a fallback BuildProposal.
-        let actions = vote_and_advance(&mut state, b"block_c", Round(2));
-        assert_eq!(state.view_change.view, Round(3));
+        let actions = vote_and_advance(&mut state, b"block_c", Round::new(2));
+        assert_eq!(state.view_change.view, Round::new(3));
         assert!(!state.votes.voted_heights.contains_key(&height));
         assert!(actions.iter().any(|a| matches!(
             a,
@@ -4050,12 +4050,12 @@ mod tests {
         state
             .votes
             .voted_heights
-            .insert(BlockHeight::new(1), (qc_block, Round(0)));
+            .insert(BlockHeight::new(1), (qc_block, Round::new(0)));
         state.votes.voted_heights.insert(
             BlockHeight::new(2),
             (
                 BlockHash::from_raw(Hash::from_bytes(b"block_at_2")),
-                Round(0),
+                Round::new(0),
             ),
         );
 
@@ -4077,7 +4077,7 @@ mod tests {
         state
             .votes
             .voted_heights
-            .insert(height, (block_a, Round(0)));
+            .insert(height, (block_a, Round::new(0)));
         let qc = QuorumCertificate {
             parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
             ..make_test_qc(block_b, height)
@@ -4242,7 +4242,7 @@ mod tests {
             parent_block_hash,
             parent_qc,
             proposer: ValidatorId(3),
-            round: Round(1),
+            round: Round::new(1),
             ..make_header_at_height(BlockHeight::new(2), 100_001)
         };
         let actions2 = state.on_block_header(
@@ -4449,7 +4449,7 @@ mod tests {
 
         let block_hash = BlockHash::from_raw(Hash::from_bytes(b"other_proposer_block"));
         let height = BlockHeight::new(1);
-        let actions = state.try_vote_on_block(&topology, block_hash, height, Round(0));
+        let actions = state.try_vote_on_block(&topology, block_hash, height, Round::new(0));
 
         assert!(
             actions
@@ -4502,14 +4502,14 @@ mod tests {
         let block_a = BlockHash::from_raw(Hash::from_bytes(b"block_a"));
         let block_b = BlockHash::from_raw(Hash::from_bytes(b"block_b"));
 
-        let actions = state.try_vote_on_block(&topology, block_a, height, Round(0));
+        let actions = state.try_vote_on_block(&topology, block_a, height, Round::new(0));
         assert!(
             actions
                 .iter()
                 .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. }))
         );
 
-        let actions = state.try_vote_on_block(&topology, block_b, height, Round(1));
+        let actions = state.try_vote_on_block(&topology, block_b, height, Round::new(1));
         assert!(
             !actions
                 .iter()
@@ -4664,7 +4664,7 @@ mod tests {
         let sync_actions = state.build_and_dispatch_proposal(
             &topology,
             BlockHeight::new(4),
-            Round(0),
+            Round::new(0),
             ProposalKind::Sync,
         );
         state.set_block_syncing(&topology, false);
@@ -4674,7 +4674,7 @@ mod tests {
         state.votes.voted_heights.clear();
 
         let fallback_actions =
-            state.build_and_broadcast_fallback_block(&topology, BlockHeight::new(4), Round(1));
+            state.build_and_broadcast_fallback_block(&topology, BlockHeight::new(4), Round::new(1));
 
         let find_proposal = |actions: &[Action]| -> (bool, ProposerTimestamp) {
             for a in actions {

@@ -135,11 +135,29 @@ impl Display for BlockHeight {
 /// BFT round / view number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, BasicSbor)]
 #[sbor(transparent)]
-pub struct Round(pub u64);
+pub struct Round(u64);
 
 impl Round {
     /// Initial round.
     pub const INITIAL: Self = Self(0);
+
+    /// Construct a round from a raw `u64`.
+    ///
+    /// Most call sites should use [`Round::next`] or arithmetic operators
+    /// instead — this constructor is the escape hatch for boundaries
+    /// (storage decode, wire decode, tests) where the round genuinely
+    /// originates as a raw integer.
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Inner `u64`. Use sparingly — at boundaries (display, storage encode,
+    /// hashing) only.
+    #[must_use]
+    pub const fn inner(self) -> u64 {
+        self.0
+    }
 
     /// Get the next round.
     #[must_use]
@@ -163,27 +181,29 @@ impl Round {
 impl Add<u64> for Round {
     type Output = Self;
     fn add(self, rhs: u64) -> Self {
-        Self(self.0 + rhs)
+        Self(self.0.checked_add(rhs).expect("Round + u64 overflowed"))
     }
 }
 
 impl Sub<u64> for Round {
     type Output = Self;
     fn sub(self, rhs: u64) -> Self {
-        Self(self.0 - rhs)
+        Self(self.0.checked_sub(rhs).expect("Round - u64 underflowed"))
     }
 }
 
 impl Sub<Self> for Round {
     type Output = u64;
     fn sub(self, rhs: Self) -> u64 {
-        self.0 - rhs.0
+        self.0
+            .checked_sub(rhs.0)
+            .expect("Round distance underflowed (lhs < rhs)")
     }
 }
 
 impl AddAssign<u64> for Round {
     fn add_assign(&mut self, rhs: u64) {
-        self.0 += rhs;
+        self.0 = self.0.checked_add(rhs).expect("Round += u64 overflowed");
     }
 }
 

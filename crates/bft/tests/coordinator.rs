@@ -88,7 +88,7 @@ fn stats_reports_initial_defaults() {
 
     assert_eq!(view_changes, 0);
     assert_eq!(view_syncs, 0);
-    assert_eq!(current_round, Round::INITIAL.0);
+    assert_eq!(current_round, Round::INITIAL.inner());
     assert_eq!(committed_height, BlockHeight::GENESIS);
 }
 
@@ -104,7 +104,7 @@ fn is_current_proposer_matches_topology() {
         let coordinator =
             BftCoordinator::new(local_idx, BftConfig::default(), RecoveredState::default());
         // Fresh coordinator: latest_qc is None → next height = committed_height + 1 = 1.
-        // view = Round::INITIAL = Round(0).
+        // view = Round::INITIAL = Round::new(0).
         let expected = topology.should_propose(BlockHeight::new(1), Round::INITIAL);
         assert_eq!(
             coordinator.is_current_proposer(&topology),

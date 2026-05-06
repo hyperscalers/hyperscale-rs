@@ -334,7 +334,7 @@ mod tests {
             parent_qc: QuorumCertificate::genesis(ShardGroupId(0)),
             proposer: ValidatorId(height.inner() % 4),
             timestamp: ProposerTimestamp(timestamp_ms),
-            round: Round(0),
+            round: Round::new(0),
             is_fallback: false,
             state_root: StateRoot::ZERO,
             transaction_root: TransactionRoot::ZERO,
@@ -459,7 +459,7 @@ mod tests {
         // 50s old would normally fail (MAX_TIMESTAMP_DELAY = 30s), but fallback
         // blocks inherit the parent's weighted timestamp across view changes.
         let mut header = header_at_height(BlockHeight::new(1), 50_000);
-        header.round = Round(5);
+        header.round = Round::new(5);
         header.is_fallback = true;
         assert!(validate_timestamp(&header, now).is_ok());
 

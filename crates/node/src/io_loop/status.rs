@@ -65,7 +65,7 @@ where
 
         NodeStatusSnapshot {
             committed_height: self.state.bft().committed_height(),
-            view: self.state.bft().view().0,
+            view: self.state.bft().view().inner(),
             state_root,
             block_sync: self.syncs.block.block_sync_status(),
             mempool_pending: pending,

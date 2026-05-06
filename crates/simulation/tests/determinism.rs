@@ -525,7 +525,7 @@ fn test_view_change_complete_flow() {
         );
         assert_eq!(
             node.bft().view(),
-            Round(0),
+            Round::new(0),
             "Node {node_idx} should be at round 0"
         );
     }
@@ -538,7 +538,7 @@ fn test_view_change_complete_flow() {
         let node = runner.node(node_idx).expect("Node should exist");
         assert_eq!(
             node.bft().view(),
-            Round(0),
+            Round::new(0),
             "Node {node_idx} should still be at round 0 after 1 second"
         );
     }
@@ -552,7 +552,7 @@ fn test_view_change_complete_flow() {
     for node_idx in 0..4u32 {
         let node = runner.node(node_idx).expect("Node should exist");
         let round = node.bft().view();
-        if round > Round(0) {
+        if round > Round::new(0) {
             nodes_with_round_change += 1;
         }
         println!(
