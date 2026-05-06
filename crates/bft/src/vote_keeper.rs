@@ -232,9 +232,9 @@ impl VoteKeeper {
             trace!(
                 validator = ?validator_id,
                 block_hash = ?block_hash,
-                verified_power = vote_set.verified_power().0,
-                unverified_power = vote_set.unverified_power().0,
-                total_power = total_power.0,
+                verified_power = vote_set.verified_power().inner(),
+                unverified_power = vote_set.unverified_power().inner(),
+                total_power = total_power.inner(),
                 "Vote buffered"
             );
         }
@@ -353,8 +353,8 @@ impl VoteKeeper {
             vote_set.on_votes_verified(verified_votes);
             info!(
                 block_hash = ?block_hash,
-                verified_power = vote_set.verified_power().0,
-                unverified_power = vote_set.unverified_power().0,
+                verified_power = vote_set.verified_power().inner(),
+                unverified_power = vote_set.unverified_power().inner(),
                 "Votes verified but quorum not reached, waiting for more"
             );
         }

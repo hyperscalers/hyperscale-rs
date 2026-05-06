@@ -264,7 +264,7 @@ impl Display for Attempt {
 /// Vote power (stake weight).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, BasicSbor)]
 #[sbor(transparent)]
-pub struct VotePower(pub u64);
+pub struct VotePower(u64);
 
 impl VotePower {
     /// Zero vote power — used as an accumulator initial value.
@@ -273,15 +273,22 @@ impl VotePower {
     /// Minimum positive vote power.
     pub const MIN: Self = Self(1);
 
-    /// Create from u64, ensuring it's at least 1.
+    /// Construct vote power from a raw `u64`.
+    ///
+    /// Most call sites should use the `Add`/`Sub` operators or
+    /// [`VotePower::saturating_add`] instead — this constructor is the escape
+    /// hatch for boundaries (topology decode, tests) where the power genuinely
+    /// originates as a raw integer. Use [`VotePower::ZERO`] / [`VotePower::MIN`]
+    /// for the obvious sentinels rather than `new(0)` / `new(1)`.
     #[must_use]
-    pub fn new(power: u64) -> Self {
-        Self(power.max(1))
+    pub const fn new(value: u64) -> Self {
+        Self(value)
     }
 
-    /// Get the raw value.
+    /// Inner `u64`. Use sparingly — at boundaries (display, hashing,
+    /// stake-weighted timestamp arithmetic that needs `u128` widening) only.
     #[must_use]
-    pub const fn get(self) -> u64 {
+    pub const fn inner(self) -> u64 {
         self.0
     }
 
@@ -310,26 +317,40 @@ impl VotePower {
 impl Add for VotePower {
     type Output = Self;
     fn add(self, rhs: Self) -> Self {
-        Self(self.0 + rhs.0)
+        Self(
+            self.0
+                .checked_add(rhs.0)
+                .expect("VotePower + VotePower overflowed"),
+        )
     }
 }
 
 impl AddAssign for VotePower {
     fn add_assign(&mut self, rhs: Self) {
-        self.0 += rhs.0;
+        self.0 = self
+            .0
+            .checked_add(rhs.0)
+            .expect("VotePower += VotePower overflowed");
     }
 }
 
 impl Sub for VotePower {
     type Output = Self;
     fn sub(self, rhs: Self) -> Self {
-        Self(self.0 - rhs.0)
+        Self(
+            self.0
+                .checked_sub(rhs.0)
+                .expect("VotePower - VotePower underflowed"),
+        )
     }
 }
 
 impl SubAssign for VotePower {
     fn sub_assign(&mut self, rhs: Self) {
-        self.0 -= rhs.0;
+        self.0 = self
+            .0
+            .checked_sub(rhs.0)
+            .expect("VotePower -= VotePower underflowed");
     }
 }
 
@@ -481,18 +502,18 @@ mod tests {
 
     #[test]
     fn test_vote_power_quorum() {
-        let total = VotePower(4);
+        let total = VotePower::new(4);
 
-        assert!(!VotePower::has_quorum(VotePower(2), total)); // 2/4 = 50% (not enough)
-        assert!(VotePower::has_quorum(VotePower(3), total)); // 3/4 = 75% (quorum!)
-        assert!(VotePower::has_quorum(VotePower(4), total)); // 4/4 = 100% (quorum!)
+        assert!(!VotePower::has_quorum(VotePower::new(2), total)); // 2/4 = 50% (not enough)
+        assert!(VotePower::has_quorum(VotePower::new(3), total)); // 3/4 = 75% (quorum!)
+        assert!(VotePower::has_quorum(VotePower::new(4), total)); // 4/4 = 100% (quorum!)
     }
 
     #[test]
     fn test_vote_power_quorum_boundary_conditions() {
         // BFT safety requires STRICTLY GREATER than 2/3
         // Formula: voted * 3 > total * 2
-        let q = |v, t| VotePower::has_quorum(VotePower(v), VotePower(t));
+        let q = |v, t| VotePower::has_quorum(VotePower::new(v), VotePower::new(t));
 
         // Exact 2/3 should NOT be quorum (need > 2/3)
         // 6/9 = 2/3 exactly: 6*3 = 18, 9*2 = 18, 18 > 18 is false
@@ -550,7 +571,10 @@ mod tests {
         // total * 2 = (max/3 + 1) * 2 = 2*max/3 + 2
         // max > 2*max/3 + 2 is true
         assert!(
-            VotePower::has_quorum(VotePower(max_safe_voted), VotePower(max_safe_voted + 1)),
+            VotePower::has_quorum(
+                VotePower::new(max_safe_voted),
+                VotePower::new(max_safe_voted + 1)
+            ),
             "Large values near u64::MAX/3 should work"
         );
 
@@ -559,17 +583,20 @@ mod tests {
         // edge case so a future regression to plain u64 multiplication
         // would surface here.
         assert!(VotePower::has_quorum(
-            VotePower(u64::MAX),
-            VotePower(u64::MAX)
+            VotePower::new(u64::MAX),
+            VotePower::new(u64::MAX)
         ));
-        assert!(!VotePower::has_quorum(VotePower::ZERO, VotePower(u64::MAX)));
+        assert!(!VotePower::has_quorum(
+            VotePower::ZERO,
+            VotePower::new(u64::MAX)
+        ));
     }
 
     #[test]
     fn test_vote_power_quorum_unequal_distribution() {
         // Test quorum with realistic unequal voting power distributions
         // In practice, validators may have different stakes
-        let q = |v, t| VotePower::has_quorum(VotePower(v), VotePower(t));
+        let q = |v, t| VotePower::has_quorum(VotePower::new(v), VotePower::new(t));
 
         // Scenario: 4 validators with powers [3, 2, 2, 1] = 8 total
         // Need > 16/3 = 5.33, so need 6 power for quorum

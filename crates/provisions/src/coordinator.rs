@@ -707,7 +707,7 @@ mod tests {
             .map(|(i, kp)| ValidatorInfo {
                 validator_id: ValidatorId(i as u64),
                 public_key: kp.public_key(),
-                voting_power: VotePower(1),
+                voting_power: VotePower::new(1),
             })
             .collect();
 

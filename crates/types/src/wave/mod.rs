@@ -59,7 +59,7 @@ mod tests {
             .map(|i| ValidatorInfo {
                 validator_id: ValidatorId(i),
                 public_key: generate_bls_keypair().public_key(),
-                voting_power: VotePower(1),
+                voting_power: VotePower::new(1),
             })
             .collect();
         TopologySnapshot::new(ValidatorId(0), 2, ValidatorSet::new(validators))

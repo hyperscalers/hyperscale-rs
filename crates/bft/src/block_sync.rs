@@ -747,7 +747,7 @@ mod tests {
             .map(|i| ValidatorInfo {
                 validator_id: committee.validator_id(i),
                 public_key: *committee.public_key(i),
-                voting_power: VotePower(1),
+                voting_power: VotePower::new(1),
             })
             .collect();
         TopologySnapshot::new(ValidatorId(0), 1, ValidatorSet::new(validators))

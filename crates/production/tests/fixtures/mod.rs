@@ -94,7 +94,7 @@ impl TestFixtures {
             .map(|i| ValidatorInfo {
                 validator_id: ValidatorId(u64::from(i)),
                 public_key: public_keys[i as usize],
-                voting_power: VotePower(1),
+                voting_power: VotePower::new(1),
             })
             .collect();
         let global_validator_set = ValidatorSet::new(global_validators);

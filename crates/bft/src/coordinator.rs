@@ -3372,7 +3372,7 @@ mod tests {
             .map(|(i, k)| ValidatorInfo {
                 validator_id: ValidatorId(i as u64),
                 public_key: k.public_key(),
-                voting_power: VotePower(1),
+                voting_power: VotePower::new(1),
             })
             .collect();
         let validator_set = ValidatorSet::new(validators);
@@ -3820,7 +3820,7 @@ mod tests {
             .map(|(i, k)| ValidatorInfo {
                 validator_id: ValidatorId(i as u64),
                 public_key: k.public_key(),
-                voting_power: VotePower(1),
+                voting_power: VotePower::new(1),
             })
             .collect();
         let validator_set = ValidatorSet::new(validators);
@@ -3909,7 +3909,7 @@ mod tests {
             timestamp: ProposerTimestamp(100_000),
         };
 
-        let _ = state.on_qc_result(&topology, block_b, None, vec![(0, vote, VotePower(1))]);
+        let _ = state.on_qc_result(&topology, block_b, None, vec![(0, vote, VotePower::new(1))]);
 
         let (recorded_hash, _) = state
             .votes

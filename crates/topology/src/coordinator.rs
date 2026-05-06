@@ -108,7 +108,7 @@ mod tests {
         ValidatorInfo {
             validator_id: ValidatorId(id),
             public_key: generate_bls_keypair().public_key(),
-            voting_power: VotePower(power),
+            voting_power: VotePower::new(power),
         }
     }
 

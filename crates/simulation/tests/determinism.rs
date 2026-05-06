@@ -1515,7 +1515,7 @@ fn test_cross_shard_transaction_detection() {
         .map(|(i, k)| ValidatorInfo {
             validator_id: ValidatorId(i as u64),
             public_key: k.public_key(),
-            voting_power: VotePower(1),
+            voting_power: VotePower::new(1),
         })
         .collect();
     let validator_set = ValidatorSet::new(validators);

@@ -331,7 +331,7 @@ mod tests {
         let vs = ValidatorSet::new(vec![ValidatorInfo {
             validator_id: ValidatorId(0),
             public_key: kp.public_key(),
-            voting_power: VotePower(1),
+            voting_power: VotePower::new(1),
         }]);
         // Local shard = 0, 2 shards total
         TopologySnapshot::with_local_shard(ValidatorId(0), ShardGroupId(0), 2, vs)

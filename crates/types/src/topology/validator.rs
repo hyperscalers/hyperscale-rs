@@ -88,7 +88,7 @@ mod tests {
         ValidatorInfo {
             validator_id: ValidatorId(id),
             public_key: generate_bls_keypair().public_key(),
-            voting_power: VotePower(power),
+            voting_power: VotePower::new(power),
         }
     }
 
@@ -118,10 +118,10 @@ mod tests {
         let set = ValidatorSet::new(validators);
 
         assert_eq!(set.len(), 3);
-        assert_eq!(set.total_voting_power(), VotePower(60));
+        assert_eq!(set.total_voting_power(), VotePower::new(60));
 
         let v1 = set.get(ValidatorId(1)).unwrap();
-        assert_eq!(v1.voting_power, VotePower(20));
+        assert_eq!(v1.voting_power, VotePower::new(20));
 
         assert_eq!(set.index_of(ValidatorId(2)), Some(2));
         assert_eq!(set.index_of(ValidatorId(99)), None);

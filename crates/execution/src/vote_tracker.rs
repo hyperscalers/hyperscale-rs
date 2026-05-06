@@ -292,24 +292,24 @@ mod tests {
         let mut tracker = VoteTracker::new(
             WaveId::new(ShardGroupId(0), BlockHeight::new(0), BTreeSet::new()),
             BlockHash::from_raw(Hash::from_bytes(b"block")),
-            VotePower(3),
+            VotePower::new(3),
         );
 
         let root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"receipt_root"));
 
-        tracker.add_verified_vote(make_vote(0, root), VotePower(1));
+        tracker.add_verified_vote(make_vote(0, root), VotePower::new(1));
         assert!(tracker.check_quorum().is_none());
 
-        tracker.add_verified_vote(make_vote(1, root), VotePower(1));
+        tracker.add_verified_vote(make_vote(1, root), VotePower::new(1));
         assert!(tracker.check_quorum().is_none());
 
-        tracker.add_verified_vote(make_vote(2, root), VotePower(1));
+        tracker.add_verified_vote(make_vote(2, root), VotePower::new(1));
         let result = tracker.check_quorum();
         assert!(result.is_some());
         let (r, vh, power) = result.unwrap();
         assert_eq!(r, root);
         assert_eq!(vh, WeightedTimestamp(11)); // vote_anchor_ts from make_vote
-        assert_eq!(power, VotePower(3));
+        assert_eq!(power, VotePower::new(3));
         assert_eq!(tracker.votes_for_global_receipt_root(&root).len(), 3);
     }
 
@@ -318,19 +318,19 @@ mod tests {
         let mut tracker = VoteTracker::new(
             WaveId::new(ShardGroupId(0), BlockHeight::new(0), BTreeSet::new()),
             BlockHash::from_raw(Hash::from_bytes(b"block")),
-            VotePower(3),
+            VotePower::new(3),
         );
 
         let root_a = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root_a"));
         let root_b = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root_b"));
 
-        tracker.add_verified_vote(make_vote(0, root_a), VotePower(1));
-        tracker.add_verified_vote(make_vote(1, root_b), VotePower(1));
-        tracker.add_verified_vote(make_vote(2, root_a), VotePower(1));
+        tracker.add_verified_vote(make_vote(0, root_a), VotePower::new(1));
+        tracker.add_verified_vote(make_vote(1, root_b), VotePower::new(1));
+        tracker.add_verified_vote(make_vote(2, root_a), VotePower::new(1));
         // 2 for root_a, 1 for root_b — no quorum
         assert!(tracker.check_quorum().is_none());
 
-        tracker.add_verified_vote(make_vote(3, root_a), VotePower(1));
+        tracker.add_verified_vote(make_vote(3, root_a), VotePower::new(1));
         let result = tracker.check_quorum().unwrap();
         assert_eq!(result.0, root_a);
     }
@@ -342,16 +342,16 @@ mod tests {
         let mut tracker = VoteTracker::new(
             WaveId::new(ShardGroupId(0), BlockHeight::new(0), BTreeSet::new()),
             BlockHash::from_raw(Hash::from_bytes(b"block")),
-            VotePower(3),
+            VotePower::new(3),
         );
 
         // Buffer 2 votes — not enough for quorum
-        assert!(tracker.buffer_unverified_vote(make_vote(0, root), pk, VotePower(1)));
-        assert!(tracker.buffer_unverified_vote(make_vote(1, root), pk, VotePower(1)));
+        assert!(tracker.buffer_unverified_vote(make_vote(0, root), pk, VotePower::new(1)));
+        assert!(tracker.buffer_unverified_vote(make_vote(1, root), pk, VotePower::new(1)));
         assert!(!tracker.should_trigger_verification());
 
         // Buffer 3rd — now enough
-        assert!(tracker.buffer_unverified_vote(make_vote(2, root), pk, VotePower(1)));
+        assert!(tracker.buffer_unverified_vote(make_vote(2, root), pk, VotePower::new(1)));
         assert!(tracker.should_trigger_verification());
 
         // Take votes
@@ -372,11 +372,11 @@ mod tests {
         let mut tracker = VoteTracker::new(
             WaveId::new(ShardGroupId(0), BlockHeight::new(0), BTreeSet::new()),
             BlockHash::from_raw(Hash::from_bytes(b"block")),
-            VotePower(3),
+            VotePower::new(3),
         );
 
-        assert!(tracker.buffer_unverified_vote(make_vote(0, root), pk, VotePower(1)));
-        assert!(!tracker.buffer_unverified_vote(make_vote(0, root), pk, VotePower(1)));
+        assert!(tracker.buffer_unverified_vote(make_vote(0, root), pk, VotePower::new(1)));
+        assert!(!tracker.buffer_unverified_vote(make_vote(0, root), pk, VotePower::new(1)));
     }
 
     #[test]
@@ -386,15 +386,15 @@ mod tests {
         let mut tracker = VoteTracker::new(
             WaveId::new(ShardGroupId(0), BlockHeight::new(0), BTreeSet::new()),
             BlockHash::from_raw(Hash::from_bytes(b"block")),
-            VotePower(3),
+            VotePower::new(3),
         );
 
         // 1 verified + 2 unverified = 3 → should trigger
-        tracker.add_verified_vote(make_vote(0, root), VotePower(1));
-        assert!(tracker.buffer_unverified_vote(make_vote(1, root), pk, VotePower(1)));
+        tracker.add_verified_vote(make_vote(0, root), VotePower::new(1));
+        assert!(tracker.buffer_unverified_vote(make_vote(1, root), pk, VotePower::new(1)));
         assert!(!tracker.should_trigger_verification());
 
-        assert!(tracker.buffer_unverified_vote(make_vote(2, root), pk, VotePower(1)));
+        assert!(tracker.buffer_unverified_vote(make_vote(2, root), pk, VotePower::new(1)));
         assert!(tracker.should_trigger_verification());
     }
 }

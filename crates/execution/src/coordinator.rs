@@ -883,7 +883,7 @@ impl ExecutionCoordinator {
                 block_hash = ?block_hash,
                 wave = %wave_id,
                 global_receipt_root_split = ?summary,
-                quorum = topology.local_quorum_threshold().0,
+                quorum = topology.local_quorum_threshold().inner(),
                 "Execution vote quorum blocked: global receipt roots are split across validators"
             );
         }
@@ -2066,7 +2066,7 @@ mod tests {
             .map(|(i, k)| ValidatorInfo {
                 validator_id: ValidatorId(i as u64),
                 public_key: k.public_key(),
-                voting_power: VotePower(1),
+                voting_power: VotePower::new(1),
             })
             .collect();
         let validator_set = ValidatorSet::new(validators);
@@ -2141,7 +2141,7 @@ mod tests {
             .map(|(i, k)| ValidatorInfo {
                 validator_id: ValidatorId(i as u64),
                 public_key: k.public_key(),
-                voting_power: VotePower(1),
+                voting_power: VotePower::new(1),
             })
             .collect();
         let validator_set = ValidatorSet::new(validators);
@@ -2885,7 +2885,7 @@ mod tests {
             .map(|(i, k)| ValidatorInfo {
                 validator_id: ValidatorId(i as u64),
                 public_key: k.public_key(),
-                voting_power: VotePower(1),
+                voting_power: VotePower::new(1),
             })
             .collect();
         TopologySnapshot::new(ValidatorId(0), 2, ValidatorSet::new(validators))

@@ -478,7 +478,7 @@ mod tests {
         ValidatorInfo {
             validator_id: ValidatorId(id),
             public_key: generate_bls_keypair().public_key(),
-            voting_power: VotePower(power),
+            voting_power: VotePower::new(power),
         }
     }
 
@@ -502,12 +502,12 @@ mod tests {
     fn test_quorum() {
         let snapshot = make_snapshot(4, 0);
 
-        assert_eq!(snapshot.local_voting_power(), VotePower(4));
-        assert_eq!(snapshot.local_quorum_threshold(), VotePower(3));
+        assert_eq!(snapshot.local_voting_power(), VotePower::new(4));
+        assert_eq!(snapshot.local_quorum_threshold(), VotePower::new(3));
 
-        assert!(!snapshot.local_has_quorum(VotePower(2)));
-        assert!(snapshot.local_has_quorum(VotePower(3)));
-        assert!(snapshot.local_has_quorum(VotePower(4)));
+        assert!(!snapshot.local_has_quorum(VotePower::new(2)));
+        assert!(snapshot.local_has_quorum(VotePower::new(3)));
+        assert!(snapshot.local_has_quorum(VotePower::new(4)));
     }
 
     #[test]
@@ -611,7 +611,7 @@ mod tests {
         );
         assert_eq!(
             snapshot.voting_power_for_shard(ShardGroupId(0)),
-            VotePower(21)
+            VotePower::new(21)
         );
     }
 

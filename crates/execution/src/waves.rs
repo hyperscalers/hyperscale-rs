@@ -346,7 +346,7 @@ impl WaveRegistry {
             } else if tracker.total_verified_power() > VotePower::ZERO {
                 tracing::warn!(
                     wave = %key,
-                    verified_power = tracker.total_verified_power().0,
+                    verified_power = tracker.total_verified_power().inner(),
                     "Pruning vote tracker that never reached quorum — insufficient votes"
                 );
             }
@@ -427,7 +427,7 @@ mod tests {
     }
 
     fn make_tracker(wave_id: WaveId, block_hash: BlockHash) -> VoteTracker {
-        VoteTracker::new(wave_id, block_hash, VotePower(3))
+        VoteTracker::new(wave_id, block_hash, VotePower::new(3))
     }
 
     fn make_outcome(tx_hash: TxHash) -> TxOutcome {

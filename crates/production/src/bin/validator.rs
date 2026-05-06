@@ -652,7 +652,7 @@ fn build_topology(
         vec![ValidatorInfo {
             validator_id: local_validator_id,
             public_key: local_keypair.public_key(),
-            voting_power: VotePower(1),
+            voting_power: VotePower::new(1),
         }]
     } else {
         config
@@ -685,7 +685,7 @@ fn build_topology(
                 Ok(ValidatorInfo {
                     validator_id: ValidatorId(v.id),
                     public_key,
-                    voting_power: VotePower(v.voting_power),
+                    voting_power: VotePower::new(v.voting_power),
                 })
             })
             .collect::<Result<Vec<_>>>()?
@@ -1210,7 +1210,7 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
     let topology = build_topology(&config, &signing_keypair)?;
     info!(
         committee_size = topology.snapshot().local_committee_size(),
-        quorum_threshold = topology.snapshot().local_quorum_threshold().0,
+        quorum_threshold = topology.snapshot().local_quorum_threshold().inner(),
         "Topology initialized"
     );
 

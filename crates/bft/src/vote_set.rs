@@ -276,7 +276,7 @@ impl VoteSet {
             // of slow-clocked or Byzantine voters.
             let clamped_ms = vote.timestamp.as_millis().max(floor_ms);
             self.verified_timestamp_weight_sum +=
-                u128::from(clamped_ms) * u128::from(voting_power.0);
+                u128::from(clamped_ms) * u128::from(voting_power.inner());
             self.verified_power += voting_power;
             self.verified_votes
                 .push((committee_index, vote, voting_power));
@@ -322,7 +322,8 @@ impl VoteSet {
             .parent_weighted_timestamp
             .map_or(0, WeightedTimestamp::as_millis);
         let clamped_ms = vote.timestamp.as_millis().max(floor_ms);
-        self.verified_timestamp_weight_sum += u128::from(clamped_ms) * u128::from(voting_power.0);
+        self.verified_timestamp_weight_sum +=
+            u128::from(clamped_ms) * u128::from(voting_power.inner());
         self.verified_power += voting_power;
         self.verified_votes
             .push((committee_index, vote, voting_power));
@@ -395,7 +396,7 @@ mod test_helpers {
             } else {
                 // Mean of u64 timestamps weighted by u64 powers always fits in u64.
                 u64::try_from(
-                    self.verified_timestamp_weight_sum / u128::from(self.verified_power.0),
+                    self.verified_timestamp_weight_sum / u128::from(self.verified_power.inner()),
                 )
                 .unwrap_or(u64::MAX)
             };
@@ -484,22 +485,22 @@ mod tests {
         // Buffer first vote
         let vote0 = make_vote(&keys, 0, block_hash, BlockHeight::new(1));
         let pk0 = keys[0].public_key();
-        assert!(vote_set.buffer_unverified_vote(0, vote0, pk0, VotePower(1)));
-        assert_eq!(vote_set.unverified_power(), VotePower(1));
+        assert!(vote_set.buffer_unverified_vote(0, vote0, pk0, VotePower::new(1)));
+        assert_eq!(vote_set.unverified_power(), VotePower::new(1));
         assert_eq!(vote_set.verified_power(), VotePower::ZERO);
 
         // Buffer duplicate (should fail)
         let vote0_dup = make_vote(&keys, 0, block_hash, BlockHeight::new(1));
         let pk0_dup = keys[0].public_key();
-        assert!(!vote_set.buffer_unverified_vote(0, vote0_dup, pk0_dup, VotePower(1)));
-        assert_eq!(vote_set.unverified_power(), VotePower(1));
+        assert!(!vote_set.buffer_unverified_vote(0, vote0_dup, pk0_dup, VotePower::new(1)));
+        assert_eq!(vote_set.unverified_power(), VotePower::new(1));
 
         // Buffer more votes
         let vote1 = make_vote(&keys, 1, block_hash, BlockHeight::new(1));
         let vote2 = make_vote(&keys, 2, block_hash, BlockHeight::new(1));
-        assert!(vote_set.buffer_unverified_vote(1, vote1, keys[1].public_key(), VotePower(1)));
-        assert!(vote_set.buffer_unverified_vote(2, vote2, keys[2].public_key(), VotePower(1)));
-        assert_eq!(vote_set.unverified_power(), VotePower(3));
+        assert!(vote_set.buffer_unverified_vote(1, vote1, keys[1].public_key(), VotePower::new(1)));
+        assert!(vote_set.buffer_unverified_vote(2, vote2, keys[2].public_key(), VotePower::new(1)));
+        assert_eq!(vote_set.unverified_power(), VotePower::new(3));
     }
 
     #[test]
@@ -509,21 +510,21 @@ mod tests {
         let block_hash = header.hash();
         let mut vote_set = VoteSet::new(Some(&header), 4);
 
-        let total_power = VotePower(4);
+        let total_power = VotePower::new(4);
 
         // Not enough votes yet
         let vote0 = make_vote(&keys, 0, block_hash, BlockHeight::new(1));
-        vote_set.buffer_unverified_vote(0, vote0, keys[0].public_key(), VotePower(1));
+        vote_set.buffer_unverified_vote(0, vote0, keys[0].public_key(), VotePower::new(1));
         assert!(!vote_set.should_trigger_verification(total_power));
 
         // Still not enough
         let vote1 = make_vote(&keys, 1, block_hash, BlockHeight::new(1));
-        vote_set.buffer_unverified_vote(1, vote1, keys[1].public_key(), VotePower(1));
+        vote_set.buffer_unverified_vote(1, vote1, keys[1].public_key(), VotePower::new(1));
         assert!(!vote_set.should_trigger_verification(total_power));
 
         // Now we have quorum potential (3/4 > 2/3)
         let vote2 = make_vote(&keys, 2, block_hash, BlockHeight::new(1));
-        vote_set.buffer_unverified_vote(2, vote2, keys[2].public_key(), VotePower(1));
+        vote_set.buffer_unverified_vote(2, vote2, keys[2].public_key(), VotePower::new(1));
         assert!(vote_set.should_trigger_verification(total_power));
     }
 
@@ -537,10 +538,10 @@ mod tests {
         // Add verified votes directly (e.g., own votes)
         for i in 0..3 {
             let vote = make_vote(&keys, i, block_hash, BlockHeight::new(1));
-            assert!(vote_set.add_verified_vote(i, vote, VotePower(1)));
+            assert!(vote_set.add_verified_vote(i, vote, VotePower::new(1)));
         }
 
-        assert_eq!(vote_set.verified_power(), VotePower(3));
+        assert_eq!(vote_set.verified_power(), VotePower::new(3));
 
         // Build QC
         let qc = vote_set.build_qc(block_hash, test_shard_group()).unwrap();

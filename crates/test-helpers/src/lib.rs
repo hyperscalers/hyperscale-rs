@@ -196,7 +196,7 @@ impl TestCommittee {
             .map(|i| ValidatorInfo {
                 validator_id: self.validator_id(i),
                 public_key: *self.public_key(i),
-                voting_power: VotePower(1),
+                voting_power: VotePower::new(1),
             })
             .collect();
         let validator_set = ValidatorSet::new(validators);

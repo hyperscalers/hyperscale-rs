@@ -663,7 +663,7 @@ mod tests {
                     outcomes.clone(),
                 ),
                 sk0.public_key(),
-                VotePower(1),
+                VotePower::new(1),
             ),
             (
                 signed_vote(
@@ -675,7 +675,7 @@ mod tests {
                     outcomes,
                 ),
                 sk1.public_key(),
-                VotePower(1),
+                VotePower::new(1),
             ),
         ];
 
@@ -718,9 +718,9 @@ mod tests {
                     outcomes.clone(),
                 ),
                 sk0.public_key(),
-                VotePower(1),
+                VotePower::new(1),
             ),
-            (bad_vote, sk1.public_key(), VotePower(1)),
+            (bad_vote, sk1.public_key(), VotePower::new(1)),
             (
                 signed_vote(
                     ValidatorId(2),
@@ -731,7 +731,7 @@ mod tests {
                     outcomes,
                 ),
                 sk2.public_key(),
-                VotePower(1),
+                VotePower::new(1),
             ),
         ];
 
