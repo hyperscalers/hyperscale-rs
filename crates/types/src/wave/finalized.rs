@@ -12,8 +12,8 @@ use sbor::{
 
 use crate::sbor_codec::decode_bounded_vec;
 use crate::{
-    ConsensusReceipt, ExecutionCertificate, ExecutionOutcome, GlobalReceiptHash,
-    MAX_TX_HASHES_PER_BLOCK, StoredReceipt, TransactionDecision, TxHash, WaveCertificate, WaveId,
+    ConsensusReceipt, ExecutionCertificate, ExecutionOutcome, GlobalReceiptHash, MAX_TXS_PER_BLOCK,
+    StoredReceipt, TransactionDecision, TxHash, WaveCertificate, WaveId,
 };
 
 /// A finalized wave — all participating shards have reported, `WaveCertificate` created.
@@ -339,7 +339,7 @@ impl<D: Decoder<NoCustomValueKind>> Decode<NoCustomValueKind, D> for FinalizedWa
         // `decode_finalized_wave_vec`, which also bounds the outer
         // count, but a direct `basic_decode::<FinalizedWave>` must not
         // honor an unbounded peer-claimed receipts length.
-        let receipts = decode_bounded_vec::<_, StoredReceipt>(decoder, MAX_TX_HASHES_PER_BLOCK)?;
+        let receipts = decode_bounded_vec::<_, StoredReceipt>(decoder, MAX_TXS_PER_BLOCK)?;
         Ok(Self {
             certificate: Arc::new(certificate),
             receipts,

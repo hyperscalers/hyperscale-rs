@@ -486,7 +486,7 @@ mod tests {
             VecEncoder,
         };
 
-        use crate::{GlobalReceiptRoot, TxOutcome};
+        use crate::{GlobalReceiptRoot, MAX_TXS_PER_BLOCK, TxOutcome};
 
         let wave_id = make_wave_id(0, BlockHeight(1), &[1]);
         let mut buf = Vec::with_capacity(128);
@@ -501,17 +501,15 @@ mod tests {
             enc.encode(&GlobalReceiptRoot::ZERO).unwrap();
             enc.write_value_kind(ValueKind::Array).unwrap();
             enc.write_value_kind(TxOutcome::value_kind()).unwrap();
-            // The cap lives in execution_certificate.rs; 12_288 + 1 is the
-            // first oversized value.
-            enc.write_size(12_289).unwrap();
+            enc.write_size(MAX_TXS_PER_BLOCK + 1).unwrap();
         }
         let err = basic_decode::<ExecutionCertificate>(&buf).unwrap_err();
         assert!(matches!(
             err,
             DecodeError::UnexpectedSize {
-                expected: 12_288,
-                actual: 12_289,
-            }
+                expected: MAX_TXS_PER_BLOCK,
+                actual,
+            } if actual == MAX_TXS_PER_BLOCK + 1
         ));
     }
 
@@ -567,7 +565,7 @@ mod tests {
             VecEncoder, basic_decode,
         };
 
-        use crate::MAX_TX_HASHES_PER_BLOCK;
+        use crate::MAX_TXS_PER_BLOCK;
 
         let wave_id = make_wave_id(0, BlockHeight(42), &[1]);
         let wc = WaveCertificate {
@@ -585,15 +583,15 @@ mod tests {
             enc.encode(&wc).unwrap();
             enc.write_value_kind(ValueKind::Array).unwrap();
             enc.write_value_kind(StoredReceipt::value_kind()).unwrap();
-            enc.write_size(MAX_TX_HASHES_PER_BLOCK + 1).unwrap();
+            enc.write_size(MAX_TXS_PER_BLOCK + 1).unwrap();
         }
         let err = basic_decode::<FinalizedWave>(&buf).unwrap_err();
         assert!(matches!(
             err,
             DecodeError::UnexpectedSize {
-                expected: MAX_TX_HASHES_PER_BLOCK,
+                expected: MAX_TXS_PER_BLOCK,
                 actual,
-            } if actual == MAX_TX_HASHES_PER_BLOCK + 1
+            } if actual == MAX_TXS_PER_BLOCK + 1
         ));
     }
 

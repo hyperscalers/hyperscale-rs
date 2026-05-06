@@ -8,7 +8,7 @@ use sbor::{
 
 use crate::sbor_codec::decode_bounded_vec;
 use crate::{
-    BlockHash, BlockHeight, Bls12381G2Signature, GlobalReceiptRoot, MAX_TX_HASHES_PER_BLOCK,
+    BlockHash, BlockHeight, Bls12381G2Signature, GlobalReceiptRoot, MAX_TXS_PER_BLOCK,
     ShardGroupId, TxOutcome, ValidatorId, WaveId, WeightedTimestamp,
 };
 
@@ -92,7 +92,7 @@ impl<D: Decoder<NoCustomValueKind>> Decode<NoCustomValueKind, D> for ExecutionVo
         let shard_group_id: ShardGroupId = decoder.decode()?;
         let global_receipt_root: GlobalReceiptRoot = decoder.decode()?;
         let tx_count: u32 = decoder.decode()?;
-        let tx_outcomes = decode_bounded_vec::<_, TxOutcome>(decoder, MAX_TX_HASHES_PER_BLOCK)?;
+        let tx_outcomes = decode_bounded_vec::<_, TxOutcome>(decoder, MAX_TXS_PER_BLOCK)?;
         let validator: ValidatorId = decoder.decode()?;
         let signature: Bls12381G2Signature = decoder.decode()?;
         Ok(Self {
@@ -191,14 +191,14 @@ mod tests {
         enc.encode(&vote.tx_count).unwrap();
         enc.write_value_kind(ValueKind::Array).unwrap();
         enc.write_value_kind(TxOutcome::value_kind()).unwrap();
-        enc.write_size(MAX_TX_HASHES_PER_BLOCK + 1).unwrap();
+        enc.write_size(MAX_TXS_PER_BLOCK + 1).unwrap();
         let err = basic_decode::<ExecutionVote>(&buf).unwrap_err();
         assert!(matches!(
             err,
             DecodeError::UnexpectedSize {
-                expected: MAX_TX_HASHES_PER_BLOCK,
+                expected: MAX_TXS_PER_BLOCK,
                 actual,
-            } if actual == MAX_TX_HASHES_PER_BLOCK + 1
+            } if actual == MAX_TXS_PER_BLOCK + 1
         ));
     }
 }

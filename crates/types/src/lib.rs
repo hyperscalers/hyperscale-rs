@@ -34,8 +34,7 @@ pub use block::certified::{CertifiedBlock, CertifiedBlockHashMismatch};
 pub use block::committed_header::CommittedBlockHeader;
 pub use block::header::BlockHeader;
 pub use block::limits::{
-    MAX_CERT_IDS_PER_BLOCK, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISION_HASHES_PER_BLOCK,
-    MAX_TX_HASHES_PER_BLOCK,
+    MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK, MAX_TX_IN_FLIGHT, MAX_TXS_PER_BLOCK,
 };
 pub use block::manifest::{BlockManifest, BlockMetadata};
 pub use block::roots::{

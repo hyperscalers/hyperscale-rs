@@ -12,11 +12,14 @@
 //! # Backpressure
 //!
 //! Two limits gate proposal and ingress:
-//! - [`MempoolConfig::max_in_flight`] caps simultaneous lock-holding
-//!   transactions, preventing the execution pipeline from being overrun.
+//! - [`MAX_TX_IN_FLIGHT`] (a protocol constant in `hyperscale-types`) caps
+//!   simultaneous lock-holding transactions, preventing the execution
+//!   pipeline from being overrun. Not operator-tunable: the right value
+//!   is fully determined by block size × pipeline depth.
 //! - [`MempoolConfig::max_pending`] caps RPC-submitted pending transactions
 //!   so that arrival rate exceeding processing capacity translates to
-//!   rejected submissions rather than unbounded memory growth.
+//!   rejected submissions rather than unbounded memory growth. Operator-
+//!   tunable: deployments with different RAM budgets pick different values.
 //!
 //! # Cross-shard DA
 //!
@@ -33,9 +36,9 @@ use std::time::Duration;
 use hyperscale_core::{Action, FetchAbandon, FetchOrigin, FetchPeers, FetchRequest, ProtocolEvent};
 use hyperscale_metrics::{record_expected_tx_dropped, record_transaction_aborted};
 use hyperscale_types::{
-    BlockHeight, CertifiedBlock, LocalTimestamp, NodeId, RETENTION_HORIZON, RoutableTransaction,
-    ShardGroupId, TopologySnapshot, TransactionDecision, TransactionStatus, TxHash,
-    WeightedTimestamp,
+    BlockHeight, CertifiedBlock, LocalTimestamp, MAX_TX_IN_FLIGHT, NodeId, RETENTION_HORIZON,
+    RoutableTransaction, ShardGroupId, TopologySnapshot, TransactionDecision, TransactionStatus,
+    TxHash, WeightedTimestamp,
 };
 use serde::Deserialize;
 use tracing::instrument;
@@ -52,38 +55,18 @@ use crate::tx_store::TxStore;
 /// improving batching and fairness.
 pub const DEFAULT_MIN_DWELL_TIME: Duration = Duration::from_millis(150);
 
-/// Default backpressure limit.
-///
-/// This limits how many transactions can be in-flight (holding state locks) at once.
-/// When at this limit, no new transactions are proposed.
-///
-/// Set to 3× the block transaction limit to allow a full pipeline of blocks
-/// (commit → execute → certify) without stalling proposal of new transactions.
-pub const DEFAULT_IN_FLIGHT_LIMIT: usize = 12288;
-
-/// Default limit on pending transactions for RPC backpressure.
-///
-/// When the number of Pending transactions exceeds this limit, new RPC submissions
-/// are rejected. This is approximately 2 blocks worth of transactions (at 4096 TXs/block),
-/// preventing the mempool from growing unboundedly when transaction arrival rate
-/// exceeds processing capacity.
+/// Default RPC-pending backpressure limit (≈ 2× block size).
 pub const DEFAULT_MAX_PENDING: usize = 8192;
 
-/// Mempool configuration.
+/// Mempool configuration. Operator-tunable knobs only.
 #[derive(Debug, Clone, Deserialize)]
 pub struct MempoolConfig {
-    /// Maximum transactions allowed in-flight (holding state locks).
-    ///
-    /// When at this limit, no new transactions are proposed and RPC submissions
-    /// are rejected. Controls execution/crypto verification pressure.
-    #[serde(default = "default_max_in_flight")]
-    pub max_in_flight: usize,
-
     /// Maximum pending transactions before RPC backpressure kicks in.
     ///
     /// When the number of Pending transactions exceeds this limit, new RPC submissions
     /// are rejected. This prevents unbounded mempool growth when arrival rate exceeds
-    /// processing capacity. Set to approximately a few blocks worth of transactions.
+    /// processing capacity. Gossip-arrived transactions are not gated by this — only
+    /// the public RPC entry point is.
     #[serde(default = "default_max_pending")]
     pub max_pending: usize,
 
@@ -94,10 +77,6 @@ pub struct MempoolConfig {
     /// Set to zero to disable (default).
     #[serde(default = "default_min_dwell_time")]
     pub min_dwell_time: Duration,
-}
-
-const fn default_max_in_flight() -> usize {
-    DEFAULT_IN_FLIGHT_LIMIT
 }
 
 const fn default_max_pending() -> usize {
@@ -111,7 +90,6 @@ const fn default_min_dwell_time() -> Duration {
 impl Default for MempoolConfig {
     fn default() -> Self {
         Self {
-            max_in_flight: DEFAULT_IN_FLIGHT_LIMIT,
             max_pending: DEFAULT_MAX_PENDING,
             min_dwell_time: DEFAULT_MIN_DWELL_TIME,
         }
@@ -851,17 +829,14 @@ impl MempoolCoordinator {
             .in_flight()
             .saturating_add(pending_commit_tx_count)
             .saturating_sub(pending_commit_cert_count);
-        let at_limit = effective_in_flight >= self.config.max_in_flight;
+        let at_limit = effective_in_flight >= MAX_TX_IN_FLIGHT;
 
         if at_limit {
             return Vec::new();
         }
 
         // Cap max_count to stay within limit
-        let room = self
-            .config
-            .max_in_flight
-            .saturating_sub(effective_in_flight);
+        let room = MAX_TX_IN_FLIGHT.saturating_sub(effective_in_flight);
         let max_count = max_count.min(room);
 
         self.ready
@@ -916,7 +891,7 @@ impl MempoolCoordinator {
     /// At this limit, no new transactions are proposed.
     #[must_use]
     pub const fn at_in_flight_limit(&self) -> bool {
-        self.in_flight() >= self.config.max_in_flight
+        self.in_flight() >= MAX_TX_IN_FLIGHT
     }
 
     /// Check whether accepting a block would unacceptably increase in-flight load.
@@ -931,7 +906,7 @@ impl MempoolCoordinator {
         let projected = current
             .saturating_add(new_tx_count)
             .saturating_sub(cert_count);
-        let would_exceed = projected > self.config.max_in_flight;
+        let would_exceed = projected > MAX_TX_IN_FLIGHT;
         let would_increase = projected > current;
         would_exceed && would_increase
     }
@@ -1718,22 +1693,22 @@ mod tests {
     // Backpressure Tests
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// Create a mempool config with a low in-flight limit for testing.
-    fn make_mempool_config_with_limit(limit: usize) -> MempoolConfig {
-        MempoolConfig {
-            max_in_flight: limit,
-            max_pending: DEFAULT_MAX_PENDING,
-            min_dwell_time: Duration::ZERO,
-        }
+    /// Build a `RoutableTransaction` whose write set is a single
+    /// index-derived `NodeId`, so callers can mint up to `MAX_TX_IN_FLIGHT`
+    /// distinct, non-conflicting txs by feeding sequential indices.
+    fn unique_test_tx(idx: usize) -> RoutableTransaction {
+        let seed = idx.to_le_bytes();
+        let mut node = [0u8; 30];
+        node[..seed.len()].copy_from_slice(&seed);
+        test_transaction_with_nodes(&seed, vec![], vec![NodeId(node)])
     }
 
-    /// Put a mempool at the backpressure limit by submitting `max_in_flight`
-    /// transactions and committing a block that contains them all — which
-    /// transitions every tx to `Committed` so they hold state locks.
+    /// Fill a mempool to [`MAX_TX_IN_FLIGHT`] by submitting that many
+    /// distinct transactions and committing a block that contains them
+    /// all — every tx transitions to `Committed`, holding a state lock.
     fn put_mempool_at_limit(mempool: &mut MempoolCoordinator, topology: &TopologySnapshot) {
-        let limit = mempool.config.max_in_flight;
-        let txs: Vec<Arc<RoutableTransaction>> = (0..limit)
-            .map(|i| Arc::new(test_transaction(100 + u8::try_from(i).unwrap_or(u8::MAX))))
+        let txs: Vec<Arc<RoutableTransaction>> = (0..MAX_TX_IN_FLIGHT)
+            .map(|i| Arc::new(unique_test_tx(i)))
             .collect();
         for tx in &txs {
             mempool.on_submit_transaction(topology, Arc::clone(tx), LocalTimestamp::ZERO);
@@ -1750,7 +1725,7 @@ mod tests {
 
         assert!(
             mempool.at_in_flight_limit(),
-            "Mempool should be at in-flight limit after adding {limit} committed TXs",
+            "mempool should be at in-flight limit after committing {MAX_TX_IN_FLIGHT} txs",
         );
     }
 
@@ -1794,28 +1769,29 @@ mod tests {
 
     #[test]
     fn test_backpressure_allows_txns_below_limit() {
-        // Use a limit that leaves room
-        let config = make_mempool_config_with_limit(10);
-        let mut mempool = MempoolCoordinator::with_config(config);
+        // A few txs is far below MAX_TX_IN_FLIGHT, so ready_transactions
+        // returns them all once they've dwelled long enough.
+        let mut mempool = MempoolCoordinator::new();
         let topology = make_cross_shard_topology();
+        let submit_at = LocalTimestamp::ZERO;
+        let read_at = submit_at.plus(DEFAULT_MIN_DWELL_TIME + Duration::from_millis(1));
 
         // Add a single-shard transaction
         let single_shard_tx = test_transaction(1);
-        mempool.on_submit_transaction(&topology, Arc::new(single_shard_tx), LocalTimestamp::ZERO);
+        mempool.on_submit_transaction(&topology, Arc::new(single_shard_tx), submit_at);
 
         // Add a cross-shard transaction
         let cross_shard_tx = test_cross_shard_transaction(50);
-        mempool.on_submit_transaction(&topology, Arc::new(cross_shard_tx), LocalTimestamp::ZERO);
+        mempool.on_submit_transaction(&topology, Arc::new(cross_shard_tx), submit_at);
 
         // Below limit: all TXs should be returned
-        let ready = mempool.ready_transactions(10, 0, 0, LocalTimestamp::ZERO);
+        let ready = mempool.ready_transactions(10, 0, 0, read_at);
         assert_eq!(ready.len(), 2, "All TXs should be allowed below limit");
     }
 
     #[test]
     fn test_backpressure_rejects_all_at_limit() {
-        let config = make_mempool_config_with_limit(2);
-        let mut mempool = MempoolCoordinator::with_config(config);
+        let mut mempool = MempoolCoordinator::new();
         let topology = make_cross_shard_topology();
 
         // Put mempool at the in-flight limit

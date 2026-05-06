@@ -47,7 +47,6 @@ impl TestNode {
 pub struct TestNodeBuilder {
     local_idx: usize,
     num_shards: u64,
-    mempool_config: MempoolConfig,
 }
 
 impl Default for TestNodeBuilder {
@@ -55,7 +54,6 @@ impl Default for TestNodeBuilder {
         Self {
             local_idx: 0,
             num_shards: 1,
-            mempool_config: MempoolConfig::default(),
         }
     }
 }
@@ -68,11 +66,6 @@ impl TestNodeBuilder {
 
     pub fn local_idx(mut self, idx: usize) -> Self {
         self.local_idx = idx;
-        self
-    }
-
-    pub fn mempool_config(mut self, c: MempoolConfig) -> Self {
-        self.mempool_config = c;
         self
     }
 
@@ -89,7 +82,7 @@ impl TestNodeBuilder {
             topology,
             &BftConfig::default(),
             RecoveredState::default(),
-            self.mempool_config,
+            MempoolConfig::default(),
             ProvisionConfig::default(),
             provision_store,
         );

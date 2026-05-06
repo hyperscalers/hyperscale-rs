@@ -9,10 +9,9 @@ use sbor::{
 };
 
 use crate::{
-    BlockHash, BlockHeader, BlockHeight, FinalizedWave, MAX_CERT_IDS_PER_BLOCK,
-    MAX_PROVISION_HASHES_PER_BLOCK, MAX_TX_HASHES_PER_BLOCK, Provisions, RoutableTransaction,
-    ShardGroupId, StateRoot, TxHash, ValidatorId, decode_finalized_wave_vec,
-    encode_finalized_wave_vec,
+    BlockHash, BlockHeader, BlockHeight, FinalizedWave, MAX_FINALIZED_TX_PER_BLOCK,
+    MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, Provisions, RoutableTransaction, ShardGroupId,
+    StateRoot, TxHash, ValidatorId, decode_finalized_wave_vec, encode_finalized_wave_vec,
 };
 
 /// Shared transaction list — wrapped in `Arc` so root-verification actions
@@ -170,9 +169,9 @@ fn decode_tx_vec<D: Decoder<NoCustomValueKind>>(
     decoder.read_and_check_value_kind(ValueKind::Array)?;
     decoder.read_and_check_value_kind(ValueKind::Tuple)?;
     let count = decoder.read_size()?;
-    if count > MAX_TX_HASHES_PER_BLOCK {
+    if count > MAX_TXS_PER_BLOCK {
         return Err(DecodeError::UnexpectedSize {
-            expected: MAX_TX_HASHES_PER_BLOCK,
+            expected: MAX_TXS_PER_BLOCK,
             actual: count,
         });
     }
@@ -192,9 +191,9 @@ fn decode_provision_vec<D: Decoder<NoCustomValueKind>>(
     decoder.read_and_check_value_kind(ValueKind::Array)?;
     decoder.read_and_check_value_kind(ValueKind::Tuple)?;
     let count = decoder.read_size()?;
-    if count > MAX_PROVISION_HASHES_PER_BLOCK {
+    if count > MAX_PROVISIONS_PER_BLOCK {
         return Err(DecodeError::UnexpectedSize {
-            expected: MAX_PROVISION_HASHES_PER_BLOCK,
+            expected: MAX_PROVISIONS_PER_BLOCK,
             actual: count,
         });
     }
@@ -225,8 +224,10 @@ impl<D: Decoder<NoCustomValueKind>> Decode<NoCustomValueKind, D> for Block {
                 }
                 let header: BlockHeader = decoder.decode()?;
                 let transactions = Arc::new(decode_tx_vec(decoder)?);
-                let certificates =
-                    Arc::new(decode_finalized_wave_vec(decoder, MAX_CERT_IDS_PER_BLOCK)?);
+                let certificates = Arc::new(decode_finalized_wave_vec(
+                    decoder,
+                    MAX_FINALIZED_TX_PER_BLOCK,
+                )?);
                 let provisions = Arc::new(decode_provision_vec(decoder)?);
                 Ok(Self::Live {
                     header,
@@ -244,8 +245,10 @@ impl<D: Decoder<NoCustomValueKind>> Decode<NoCustomValueKind, D> for Block {
                 }
                 let header: BlockHeader = decoder.decode()?;
                 let transactions = Arc::new(decode_tx_vec(decoder)?);
-                let certificates =
-                    Arc::new(decode_finalized_wave_vec(decoder, MAX_CERT_IDS_PER_BLOCK)?);
+                let certificates = Arc::new(decode_finalized_wave_vec(
+                    decoder,
+                    MAX_FINALIZED_TX_PER_BLOCK,
+                )?);
                 Ok(Self::Sealed {
                     header,
                     transactions,

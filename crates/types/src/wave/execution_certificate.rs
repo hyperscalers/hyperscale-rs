@@ -13,7 +13,7 @@ use sbor::{
 use crate::sbor_codec::decode_bounded_vec;
 use crate::{
     BlockHeight, Bls12381G2Signature, ExecutionCertificateHash, GlobalReceiptRoot, Hash,
-    MAX_TX_HASHES_PER_BLOCK, RETENTION_HORIZON, ShardGroupId, SignerBitfield, TxOutcome, WaveId,
+    MAX_TXS_PER_BLOCK, RETENTION_HORIZON, ShardGroupId, SignerBitfield, TxOutcome, WaveId,
     WeightedTimestamp, compute_global_receipt_root,
 };
 
@@ -121,7 +121,7 @@ impl<D: Decoder<NoCustomValueKind>> Decode<NoCustomValueKind, D> for ExecutionCe
         let wave_id: WaveId = decoder.decode()?;
         let vote_anchor_ts: WeightedTimestamp = decoder.decode()?;
         let global_receipt_root: GlobalReceiptRoot = decoder.decode()?;
-        let tx_outcomes = decode_bounded_vec::<_, TxOutcome>(decoder, MAX_TX_HASHES_PER_BLOCK)?;
+        let tx_outcomes = decode_bounded_vec::<_, TxOutcome>(decoder, MAX_TXS_PER_BLOCK)?;
         let aggregated_signature: Bls12381G2Signature = decoder.decode()?;
         let signers: SignerBitfield = decoder.decode()?;
         // The BLS aggregate only commits to (global_receipt_root, tx_count),

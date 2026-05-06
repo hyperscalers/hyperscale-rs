@@ -112,16 +112,11 @@ jmt_history_length = 256
 # ═══════════════════════════════════════════════════════════════════════════════
 
 [mempool]
-# Maximum transactions allowed in-flight (soft limit).
-# When at this limit, new transactions without provisions are delayed.
-# Cross-shard TXs WITH provisions can still be proposed.
-max_in_flight = 12288
-
-
 # Maximum pending transactions before RPC backpressure kicks in.
 # When the number of Pending transactions exceeds this limit, new RPC submissions
 # are rejected. This prevents unbounded mempool growth when arrival rate exceeds
-# processing capacity. Set to approximately a few blocks worth of transactions.
+# processing capacity. Gossip-arrived transactions are not gated by this limit —
+# only the public RPC entry point is. Set to roughly a few blocks worth.
 max_pending = 8192
 
 # ═══════════════════════════════════════════════════════════════════════════════

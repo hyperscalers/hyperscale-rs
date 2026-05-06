@@ -31,7 +31,6 @@ REMOTE_PATH="~/git/hyperscale-rs/distributed-cluster-data/"
 REMOTE_USER="$(whoami)"
 
 # Mempool configuration
-MEMPOOL_MAX_IN_FLIGHT=12288
 MEMPOOL_MAX_PENDING=8192
 
 while [[ $# -gt 0 ]]; do
@@ -92,15 +91,6 @@ while [[ $# -gt 0 ]]; do
             REMOTE_USER="$2"
             shift 2
             ;;
-        --mempool-max-in-flight)
-            MEMPOOL_MAX_IN_FLIGHT="$2"
-            shift 2
-            ;;
-        --mempool-max-in-flight-hard-limit)
-            echo "Warning: --mempool-max-in-flight-hard-limit is deprecated, use --mempool-max-in-flight"
-            MEMPOOL_MAX_IN_FLIGHT="$2"
-            shift 2
-            ;;
         --mempool-max-pending)
             MEMPOOL_MAX_PENDING="$2"
             shift 2
@@ -109,7 +99,7 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: $0 --hosts \"IP1,IP2...\" [--nodes-per-host N] [--shards N] [--out-dir DIR] [--clean]"
             echo "       [--node-names \"name1,name2...\"] [--crypto-threads N] [--execution-threads N] [--io-threads N]"
             echo "       [--copy-to-remote] [--remote-path DIR] [--remote-user USER]"
-            echo "       [--mempool-max-in-flight N] [--mempool-max-in-flight-hard-limit N] [--mempool-max-pending N]"
+            echo "       [--mempool-max-pending N]"
             echo ""
             echo "Options:"
             echo "  --node-names    Comma-separated list of node names for deterministic key generation."
@@ -360,7 +350,6 @@ bloom_filter_bits = 10.0
 bytes_per_sync_mb = 4
 
 [mempool]
-max_in_flight = $MEMPOOL_MAX_IN_FLIGHT
 max_pending = $MEMPOOL_MAX_PENDING
 
 [metrics]

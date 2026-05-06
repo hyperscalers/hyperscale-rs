@@ -84,7 +84,7 @@ pub struct MempoolSnapshot {
     /// Per-remote-shard in-flight counts from latest verified block headers.
     /// Used for cross-shard backpressure: reject transactions targeting congested shards.
     pub remote_shard_in_flight: HashMap<ShardGroupId, u32>,
-    /// Threshold for rejecting transactions due to remote shard congestion (80% of `max_in_flight`).
+    /// Threshold for rejecting transactions due to remote shard congestion (80% of [`MAX_TX_IN_FLIGHT`]).
     pub remote_congestion_threshold: u32,
 }
 

@@ -14,9 +14,8 @@
 
 use hyperscale_core::{Action, CommitSource, ProtocolEvent, TimerId};
 use hyperscale_types::{
-    BlockHash, LocalTimestamp, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROGRESS_WAIT,
-    MAX_TX_HASHES_PER_BLOCK, ProposerTimestamp, ProvisionHash, ShardGroupId, WaveId,
-    WeightedTimestamp,
+    BlockHash, LocalTimestamp, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROGRESS_WAIT, MAX_TXS_PER_BLOCK,
+    ProposerTimestamp, ProvisionHash, ShardGroupId, WaveId, WeightedTimestamp,
 };
 
 /// BFT statistics for monitoring.
@@ -744,11 +743,8 @@ impl BftCoordinator {
             &qc_chain_cert_hashes,
             MAX_FINALIZED_TX_PER_BLOCK,
         );
-        let provisions = select_provisions(
-            provisions,
-            &qc_chain_provision_hashes,
-            MAX_TX_HASHES_PER_BLOCK,
-        );
+        let provisions =
+            select_provisions(provisions, &qc_chain_provision_hashes, MAX_TXS_PER_BLOCK);
 
         self.build_and_dispatch_proposal(
             topology_snapshot,

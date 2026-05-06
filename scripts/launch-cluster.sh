@@ -42,7 +42,6 @@ PACKET_LOSS_PERCENT=""                          # Packet loss percentage (empty 
 JMT_HISTORY_LENGTH=256                          # Number of block heights of JMT history to retain (default: 256)
 
 # Mempool configuration
-MEMPOOL_MAX_IN_FLIGHT=12288                     # Max in-flight transactions (3x block limit)
 MEMPOOL_MAX_PENDING=8192                        # Max pending before RPC backpressure
 
 # Define explicit port ranges for Docker and firewall whitelisting
@@ -113,15 +112,6 @@ while [[ $# -gt 0 ]]; do
             PACKET_LOSS_PERCENT="$2"
             shift 2
             ;;
-        --mempool-max-in-flight)
-            MEMPOOL_MAX_IN_FLIGHT="$2"
-            shift 2
-            ;;
-        --mempool-max-in-flight-hard-limit)
-            echo "Warning: --mempool-max-in-flight-hard-limit is deprecated, use --mempool-max-in-flight"
-            MEMPOOL_MAX_IN_FLIGHT="$2"
-            shift 2
-            ;;
         --mempool-max-pending)
             MEMPOOL_MAX_PENDING="$2"
             shift 2
@@ -149,8 +139,6 @@ while [[ $# -gt 0 ]]; do
             echo "  --tcp-fallback           Enable TCP fallback transport (QUIC only)"
             echo "  --latency MS             Add network latency between validators (requires sudo)"
             echo "  --packet-loss PERCENT    Add packet loss between validators (requires sudo)"
-            echo "  --mempool-max-in-flight N          Soft limit on in-flight transactions (default: 2048)"
-            echo "  --mempool-max-in-flight-hard-limit N  Hard limit on in-flight transactions (default: 4096)"
             echo "  --mempool-max-pending N  Max pending transactions before RPC backpressure (default: 8192)"
             echo "  --state-history-length N Number of state versions to retain (default: 60000)"
             echo ""
@@ -444,7 +432,6 @@ block_cache_mb = 256
 jmt_history_length = $JMT_HISTORY_LENGTH
 
 [mempool]
-max_in_flight = $MEMPOOL_MAX_IN_FLIGHT
 max_pending = $MEMPOOL_MAX_PENDING
 
 [metrics]

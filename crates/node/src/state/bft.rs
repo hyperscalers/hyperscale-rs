@@ -64,8 +64,8 @@ use std::sync::Arc;
 
 use hyperscale_core::{Action, ProtocolEvent, TimerId};
 use hyperscale_types::{
-    BlockHash, BlockHeader, BlockManifest, CertifiedBlock, MAX_CERT_IDS_PER_BLOCK,
-    MAX_PROVISION_HASHES_PER_BLOCK, MAX_TX_HASHES_PER_BLOCK, QuorumCertificate,
+    BlockHash, BlockHeader, BlockManifest, CertifiedBlock, MAX_FINALIZED_TX_PER_BLOCK,
+    MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, QuorumCertificate,
 };
 
 use super::NodeStateMachine;
@@ -208,9 +208,9 @@ impl NodeStateMachine {
         // populate `missing_transaction_hashes` and trigger a fetch storm.
         // The per-list cap matches the chain-wide in-flight limit; no honest
         // proposer can legitimately exceed it.
-        if total_tx_count > MAX_TX_HASHES_PER_BLOCK
-            || manifest.cert_ids.len() > MAX_CERT_IDS_PER_BLOCK
-            || manifest.provision_hashes.len() > MAX_PROVISION_HASHES_PER_BLOCK
+        if total_tx_count > MAX_TXS_PER_BLOCK
+            || manifest.cert_ids.len() > MAX_FINALIZED_TX_PER_BLOCK
+            || manifest.provision_hashes.len() > MAX_PROVISIONS_PER_BLOCK
         {
             tracing::warn!(
                 block_hash = ?header.hash(),
@@ -359,7 +359,6 @@ mod tests {
     use std::sync::Arc;
 
     use hyperscale_core::{Action, ProtocolEvent, StateMachine, TimerId};
-    use hyperscale_mempool::MempoolConfig;
     use hyperscale_test_helpers::{certify, make_live_block};
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
@@ -582,54 +581,6 @@ mod tests {
             node.outbound_provisions().memory_stats().tracked_provisions,
             0,
             "outbound entry must be evicted — qc.weighted_timestamp now exceeds the deadline",
-        );
-    }
-
-    /// `on_block_header_received` gates BFT ingest on `would_exceed_in_flight`
-    /// for blocks at exactly `committed_height + 1`. The gate is documented
-    /// as next-block-only because validators at different pending heights
-    /// see different in-flight counts — a wider check would split votes.
-    /// When the gate fires the orchestrator returns immediately without
-    /// consulting BFT; observable as zero pending blocks afterwards.
-    #[test]
-    fn block_header_received_drops_next_block_when_would_exceed_in_flight() {
-        // Tiny in-flight cap so a small manifest trips the projection.
-        let mempool_config = MempoolConfig {
-            max_in_flight: 1,
-            ..MempoolConfig::default()
-        };
-        let TestNode { mut node, .. } = TestNode::builder().mempool_config(mempool_config).build();
-
-        // Manifest claiming 4 new txs; with `max_in_flight = 1` and current
-        // in-flight = 0, projected = 4 > 1 → would_exceed = true.
-        let manifest = BlockManifest {
-            tx_hashes: vec![TxHash::ZERO, TxHash::ZERO, TxHash::ZERO, TxHash::ZERO],
-            cert_ids: vec![],
-            provision_hashes: vec![],
-        };
-
-        // Header at committed_height + 1 = 1 (fresh node committed at GENESIS).
-        let header = make_live_block(
-            ShardGroupId(0),
-            BlockHeight(1),
-            /* timestamp_ms */ 1_000,
-            ValidatorId(0),
-            vec![],
-            vec![],
-        )
-        .header()
-        .clone();
-
-        let actions = node.handle(ProtocolEvent::BlockHeaderReceived { header, manifest });
-
-        assert!(
-            actions.is_empty(),
-            "gated header must produce no actions; got {actions:?}",
-        );
-        assert_eq!(
-            node.bft().pending_block_counts(),
-            (0, 0),
-            "gated header must not reach BFT — pending_blocks should be untouched",
         );
     }
 

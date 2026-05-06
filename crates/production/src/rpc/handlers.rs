@@ -299,7 +299,7 @@ fn check_backpressure(state: &RpcState) -> Option<(StatusCode, Json<SubmitTransa
         ));
     }
 
-    // Threshold is 80% of `max_in_flight`, derived from mempool config.
+    // Threshold is 80% of `MAX_TX_IN_FLIGHT` (block/limits.rs).
     let threshold = snapshot.remote_congestion_threshold;
     if let Some((&congested_shard, &count)) = snapshot
         .remote_shard_in_flight

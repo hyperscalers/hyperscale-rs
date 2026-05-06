@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use hyperscale_core::Action;
-use hyperscale_types::{FinalizedWave, MAX_TX_HASHES_PER_BLOCK, Provisions, RoutableTransaction};
+use hyperscale_types::{FinalizedWave, MAX_TXS_PER_BLOCK, Provisions, RoutableTransaction};
 
 use super::NodeStateMachine;
 
@@ -30,7 +30,7 @@ impl NodeStateMachine {
     ) -> ProposalInputs {
         // Request extra transactions from the mempool to compensate for QC-chain
         // duplicates that will be filtered by BFT during proposal building.
-        let max_txs = MAX_TX_HASHES_PER_BLOCK
+        let max_txs = MAX_TXS_PER_BLOCK
             + self
                 .bft
                 .dedup_overhead(self.topology.snapshot().local_shard());
