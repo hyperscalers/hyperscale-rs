@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_storage::tree::{
     OverlayTreeReader, jmt_parent_height, noop_jmt_snapshot, put_at_version,
 };
@@ -13,7 +14,6 @@ use hyperscale_types::{
 };
 
 use crate::core::SimStorage;
-use crate::lock_recover::{read_or_recover, write_or_recover};
 use crate::state::apply_updates;
 
 /// Precomputed commit work for a `SimStorage` block commit.

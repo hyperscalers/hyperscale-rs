@@ -3,12 +3,12 @@
 use std::sync::Arc;
 
 use hyperscale_jmt::{Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
+use hyperscale_storage::lock_recover::read_or_recover;
 use hyperscale_storage::tree::proofs::generate_proof;
 use hyperscale_storage::{DbSortKey, SubstateStore, VersionedStore};
 use hyperscale_types::{BlockHeight, MerkleInclusionProof, NodeId, StateRoot};
 
 use crate::core::SimStorage;
-use crate::lock_recover::read_or_recover;
 use crate::snapshot::SimSnapshot;
 
 impl SubstateStore for SimStorage {

@@ -6,7 +6,7 @@
 //! chain, so they are structurally invisible to anchored views.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, RwLock};
 
 use hyperscale_jmt::{Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_types::{
@@ -17,6 +17,7 @@ use radix_common::prelude::DatabaseUpdate;
 use radix_substate_store_interface::interface::SubstateDatabase;
 
 use crate::keys::node_entity_key;
+use crate::lock_recover::{lock_or_recover, read_or_recover, write_or_recover};
 use crate::tree::proofs::generate_proof;
 use crate::{
     ChainReader, ChainWriter, DatabaseUpdates, DbPartitionKey, DbSortKey, JmtSnapshot,
@@ -30,22 +31,6 @@ use crate::{
 /// can source priors without a fresh `multi_get_cf` on `StateCf`. Entries
 /// are `(partition_key, sort_key) → value-at-anchor`.
 pub type BaseReadCache = HashMap<(DbPartitionKey, DbSortKey), Option<Vec<u8>>>;
-
-// Lock helpers that recover from poison rather than propagating it. The
-// guarded data has whole-entry mutation only (insert / retain) and never
-// holds a half-updated state across a panic boundary, so reading through
-// a poisoned guard cannot expose a torn invariant.
-fn entries_read<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
-    lock.read().unwrap_or_else(PoisonError::into_inner)
-}
-
-fn entries_write<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
-    lock.write().unwrap_or_else(PoisonError::into_inner)
-}
-
-fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
 
 /// One block's worth of pending state, indexed by block hash in
 /// [`PendingChain::entries`].
@@ -89,26 +74,26 @@ where
 
     /// Append an entry.
     pub fn insert(&self, block_hash: BlockHash, entry: ChainEntry) {
-        entries_write(&self.entries).insert(block_hash, entry);
+        write_or_recover(&self.entries).insert(block_hash, entry);
     }
 
     /// Drop all entries with `height ≤ committed_height`. Called on
     /// `BlockPersisted`. Also drops cache entries whose anchor is at or
     /// below the committed height — higher-anchor views remain valid.
     pub fn prune(&self, committed_height: BlockHeight) {
-        entries_write(&self.entries).retain(|_, e| e.height > committed_height);
+        write_or_recover(&self.entries).retain(|_, e| e.height > committed_height);
     }
 
     /// Number of pending entries (for diagnostics / metrics).
     #[must_use]
     pub fn len(&self) -> usize {
-        entries_read(&self.entries).len()
+        read_or_recover(&self.entries).len()
     }
 
     /// Whether the chain has any pending entries.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        entries_read(&self.entries).is_empty()
+        read_or_recover(&self.entries).is_empty()
     }
 
     /// Build a view anchored at `parent_block_hash`.
@@ -144,7 +129,7 @@ where
     /// Holds the read lock for the duration of the walk; no per-entry
     /// clones.
     fn build_view(&self, parent_block_hash: BlockHash) -> SubstateView<S> {
-        let entries = entries_read(&self.entries);
+        let entries = read_or_recover(&self.entries);
         let mut chain: Vec<&ChainEntry> = Vec::new();
         let mut cursor = parent_block_hash;
         while let Some(entry) = entries.get(&cursor) {
@@ -870,8 +855,8 @@ mod tests {
         chain.insert(h3, entry_at(h2, BlockHeight(3), DatabaseUpdates::default()));
 
         chain.prune(BlockHeight(2));
-        assert_eq!(chain.entries.read().unwrap().len(), 1);
-        assert!(chain.entries.read().unwrap().contains_key(&h3));
+        assert_eq!(read_or_recover(&chain.entries).len(), 1);
+        assert!(read_or_recover(&chain.entries).contains_key(&h3));
     }
 
     #[test]

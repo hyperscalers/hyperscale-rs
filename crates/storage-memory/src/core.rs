@@ -10,6 +10,7 @@
 
 use std::sync::{Arc, RwLock};
 
+use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_storage::tree::put_at_version;
 use hyperscale_storage::{
     DatabaseUpdates, DbPartitionKey, DbSortKey, DbSubstateValue, GenesisCommit, PartitionEntry,
@@ -17,7 +18,6 @@ use hyperscale_storage::{
 };
 use hyperscale_types::{BlockHeight, StateRoot};
 
-use crate::lock_recover::{read_or_recover, write_or_recover};
 use crate::state::{ConsensusState, SharedState, apply_updates};
 
 /// In-memory storage for simulation and testing.

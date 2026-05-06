@@ -26,6 +26,7 @@ mod chain_reader;
 mod chain_writer;
 mod genesis;
 pub mod keys;
+pub mod lock_recover;
 mod overlay;
 pub mod pending_chain;
 mod store;

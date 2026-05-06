@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use hyperscale_storage::lock_recover::read_or_recover;
 use hyperscale_storage::{BlockForSync, ChainReader};
 use hyperscale_types::{
     BlockHash, BlockHeight, BlockManifest, CertifiedBlock, CommittedBlockHeader, ConsensusReceipt,
@@ -10,7 +11,6 @@ use hyperscale_types::{
 };
 
 use crate::core::SimStorage;
-use crate::lock_recover::read_or_recover;
 
 impl ChainReader for SimStorage {
     fn get_block(&self, height: BlockHeight) -> Option<CertifiedBlock> {
