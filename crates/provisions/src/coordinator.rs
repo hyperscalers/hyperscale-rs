@@ -679,7 +679,7 @@ impl ProvisionCoordinator {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{
-        Block, BlockHash, BlockHeader, Bls12381G1PrivateKey, CertificateRoot, Hash,
+        Block, BlockHash, BlockHeader, Bls12381G1PrivateKey, CertificateRoot, Hash, InFlightCount,
         LocalReceiptRoot, MerkleInclusionProof, ProposerTimestamp, ProvisionsRoot,
         QuorumCertificate, Round, StateRoot, TopologySnapshot, TransactionRoot, TxEntries, TxHash,
         ValidatorId, ValidatorInfo, ValidatorSet, VotePower, WaveId, WeightedTimestamp,
@@ -1288,7 +1288,7 @@ mod tests {
             provision_root: ProvisionsRoot::ZERO,
             waves,
             provision_tx_roots: std::collections::BTreeMap::new(),
-            in_flight: 0,
+            in_flight: InFlightCount::ZERO,
         };
         let header_hash = header.hash();
         let mut qc = QuorumCertificate::genesis(ShardGroupId(0));

@@ -299,6 +299,39 @@ impl Display for VotePower {
     }
 }
 
+/// In-flight transaction count on a shard at block-proposal time.
+///
+/// "In-flight" = txs admitted to the proposer's mempool but not yet finalized
+/// by a wave certificate. Carried in `BlockHeader` and gossiped cross-shard so
+/// remote nodes can shed RPC submissions targeting congested shards. Verified
+/// deterministically as `parent + new - finalized`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, BasicSbor)]
+#[sbor(transparent)]
+pub struct InFlightCount(pub u32);
+
+impl InFlightCount {
+    /// Zero in-flight (genesis).
+    pub const ZERO: Self = Self(0);
+
+    /// Add `new_txs` (admissions in this block), saturating at `u32::MAX`.
+    #[must_use]
+    pub const fn saturating_add(self, new_txs: u32) -> Self {
+        Self(self.0.saturating_add(new_txs))
+    }
+
+    /// Subtract `finalized_txs` (finalizations in this block), saturating at zero.
+    #[must_use]
+    pub const fn saturating_sub(self, finalized_txs: u32) -> Self {
+        Self(self.0.saturating_sub(finalized_txs))
+    }
+}
+
+impl Display for InFlightCount {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Node identifier (30-byte address).
 ///
 /// This is a simplified version that doesn't depend on Radix types.

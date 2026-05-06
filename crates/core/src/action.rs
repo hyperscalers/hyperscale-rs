@@ -8,11 +8,11 @@ use hyperscale_dispatch::DispatchPool;
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PublicKey,
     CertificateRoot, CommittedBlockHeader, ExecutionCertificate, ExecutionVote, FinalizedWave,
-    GlobalReceiptRoot, LocalReceiptRoot, NodeId, ProposerTimestamp, ProvisionHash, ProvisionTxRoot,
-    Provisions, ProvisionsRoot, QuorumCertificate, Round, RoutableTransaction, ShardGroupId,
-    SharedCertificates, SharedTransactions, StateProvision, StateRoot, TopologySnapshot,
-    TransactionRoot, TransactionStatus, TxHash, TxOutcome, ValidatorId, VotePower, WaveId,
-    WeightedTimestamp,
+    GlobalReceiptRoot, InFlightCount, LocalReceiptRoot, NodeId, ProposerTimestamp, ProvisionHash,
+    ProvisionTxRoot, Provisions, ProvisionsRoot, QuorumCertificate, Round, RoutableTransaction,
+    ShardGroupId, SharedCertificates, SharedTransactions, StateProvision, StateRoot,
+    TopologySnapshot, TransactionRoot, TransactionStatus, TxHash, TxOutcome, ValidatorId,
+    VotePower, WaveId, WeightedTimestamp,
 };
 
 use crate::{CommitSource, FetchAbandon, FetchRequest, ProtocolEvent, TimerId};
@@ -481,7 +481,7 @@ pub enum Action {
         /// Provisions from remote shards, included in this block.
         provisions: Vec<Arc<Provisions>>,
         /// Parent block's in-flight count (for deterministic computation).
-        parent_in_flight: u32,
+        parent_in_flight: InFlightCount,
         /// Number of transactions finalized by wave certificates in this block.
         finalized_tx_count: u32,
     },

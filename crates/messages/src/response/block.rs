@@ -346,9 +346,9 @@ mod tests {
 
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
-        BlockHash, BlockHeight, BloomFilter, CertificateRoot, Hash, LocalReceiptRoot,
-        ProposerTimestamp, ProvisionsRoot, Round, ShardGroupId, SignerBitfield, StateRoot,
-        TransactionRoot, ValidatorId, WeightedTimestamp, zero_bls_signature,
+        BlockHash, BlockHeight, BloomFilter, CertificateRoot, Hash, InFlightCount,
+        LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, Round, ShardGroupId, SignerBitfield,
+        StateRoot, TransactionRoot, ValidatorId, WeightedTimestamp, zero_bls_signature,
     };
 
     use super::*;
@@ -373,7 +373,7 @@ mod tests {
                 provision_root: ProvisionsRoot::ZERO,
                 waves: vec![],
                 provision_tx_roots: BTreeMap::new(),
-                in_flight: 0,
+                in_flight: InFlightCount::ZERO,
             },
             transactions: Arc::new(vec![Arc::new(tx)]),
             certificates: Arc::new(vec![]),

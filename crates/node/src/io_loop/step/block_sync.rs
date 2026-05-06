@@ -348,9 +348,9 @@ mod tests {
     use hyperscale_types::{
         Block, BlockHash, BlockHeader, Bls12381G2Signature, CertificateRoot, ConsensusReceipt,
         ExecutionCertificate, ExecutionOutcome, FinalizedWave, GlobalReceiptHash,
-        GlobalReceiptRoot, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate,
-        Round, ShardGroupId, SignerBitfield, StateRoot, TransactionRoot, TxHash, TxOutcome,
-        ValidatorId, WaveCertificate, WaveId, WeightedTimestamp, zero_bls_signature,
+        GlobalReceiptRoot, InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
+        QuorumCertificate, Round, ShardGroupId, SignerBitfield, StateRoot, TransactionRoot, TxHash,
+        TxOutcome, ValidatorId, WaveCertificate, WaveId, WeightedTimestamp, zero_bls_signature,
     };
 
     use super::*;
@@ -374,7 +374,7 @@ mod tests {
             provision_root: ProvisionsRoot::ZERO,
             waves: vec![],
             provision_tx_roots: BTreeMap::new(),
-            in_flight: 0,
+            in_flight: InFlightCount::ZERO,
         }
     }
 

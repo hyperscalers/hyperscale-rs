@@ -303,11 +303,11 @@ mod tests {
 
     use hyperscale_test_helpers::{TestCommittee, make_finalized_wave};
     use hyperscale_types::{
-        BlockHash, BlockHeader, CertificateRoot, FinalizedWave, Hash, LocalReceiptRoot,
-        MerkleInclusionProof, ProposerTimestamp, Provisions, ProvisionsRoot, QuorumCertificate,
-        Round, RoutableTransaction, ShardGroupId, StateRoot, TransactionDecision, TransactionRoot,
-        TxEntries, ValidatorId, ValidatorInfo, ValidatorSet, WeightedTimestamp, compute_waves,
-        test_utils,
+        BlockHash, BlockHeader, CertificateRoot, FinalizedWave, Hash, InFlightCount,
+        LocalReceiptRoot, MerkleInclusionProof, ProposerTimestamp, Provisions, ProvisionsRoot,
+        QuorumCertificate, Round, RoutableTransaction, ShardGroupId, StateRoot,
+        TransactionDecision, TransactionRoot, TxEntries, ValidatorId, ValidatorInfo, ValidatorSet,
+        WeightedTimestamp, compute_waves, test_utils,
     };
 
     use super::*;
@@ -341,7 +341,7 @@ mod tests {
             provision_root: ProvisionsRoot::ZERO,
             waves: vec![],
             provision_tx_roots: BTreeMap::new(),
-            in_flight: 0,
+            in_flight: InFlightCount::ZERO,
         }
     }
 
@@ -362,7 +362,7 @@ mod tests {
             provision_root: ProvisionsRoot::ZERO,
             waves,
             provision_tx_roots: BTreeMap::new(),
-            in_flight: 0,
+            in_flight: InFlightCount::ZERO,
         };
         Block::Live {
             header,

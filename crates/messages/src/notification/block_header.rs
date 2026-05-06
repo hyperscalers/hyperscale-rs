@@ -73,9 +73,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use hyperscale_types::{
-        BlockHash, BlockHeight, CertificateRoot, Hash, LocalReceiptRoot, ProposerTimestamp,
-        ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, StateRoot, TransactionRoot, TxHash,
-        ValidatorId,
+        BlockHash, BlockHeight, CertificateRoot, Hash, InFlightCount, LocalReceiptRoot,
+        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, StateRoot,
+        TransactionRoot, TxHash, ValidatorId,
     };
 
     use super::*;
@@ -97,7 +97,7 @@ mod tests {
             provision_root: ProvisionsRoot::ZERO,
             waves: vec![],
             provision_tx_roots: BTreeMap::new(),
-            in_flight: 0,
+            in_flight: InFlightCount::ZERO,
         }
     }
 

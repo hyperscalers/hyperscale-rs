@@ -13,8 +13,8 @@
 use std::collections::{HashMap, HashSet};
 
 use hyperscale_types::{
-    Block, BlockHash, BlockHeader, BlockHeight, ProvisionHash, QuorumCertificate, ShardGroupId,
-    StateRoot, TxHash, WaveId,
+    Block, BlockHash, BlockHeader, BlockHeight, InFlightCount, ProvisionHash, QuorumCertificate,
+    ShardGroupId, StateRoot, TxHash, WaveId,
 };
 use tracing::warn;
 
@@ -89,11 +89,11 @@ impl ChainView<'_> {
         )
     }
 
-    /// In-flight count on the parent header. Returns `0` if the header is
+    /// In-flight count on the parent header. Returns zero if the header is
     /// missing (parent pruned from in-memory caches).
-    pub fn parent_in_flight(&self, parent_block_hash: BlockHash) -> u32 {
+    pub fn parent_in_flight(&self, parent_block_hash: BlockHash) -> InFlightCount {
         self.get_header(parent_block_hash)
-            .map_or(0, |h| h.in_flight)
+            .map_or(InFlightCount::ZERO, |h| h.in_flight)
     }
 
     /// Parent to use when building the next proposal: the latest QC's block
@@ -196,7 +196,7 @@ mod tests {
             provision_root: ProvisionsRoot::ZERO,
             waves: vec![],
             provision_tx_roots: BTreeMap::new(),
-            in_flight: u32::from(height),
+            in_flight: InFlightCount(u32::from(height)),
         }
     }
 
@@ -396,7 +396,7 @@ mod tests {
             None,
             |view| {
                 assert_eq!(view.parent_in_flight(hash), expected_in_flight);
-                assert_eq!(view.parent_in_flight(unknown), 0);
+                assert_eq!(view.parent_in_flight(unknown), InFlightCount::ZERO);
             },
         );
     }

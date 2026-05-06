@@ -414,9 +414,9 @@ mod tests {
 
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
-        Block, BlockHeight, CertificateRoot, Hash, LocalReceiptRoot, ProposerTimestamp,
-        ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, StateRoot, TransactionRoot,
-        ValidatorId, WaveCertificate, WaveId,
+        Block, BlockHeight, CertificateRoot, Hash, InFlightCount, LocalReceiptRoot,
+        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, StateRoot,
+        TransactionRoot, ValidatorId, WaveCertificate, WaveId,
     };
 
     use super::*;
@@ -438,7 +438,7 @@ mod tests {
             provision_root: ProvisionsRoot::ZERO,
             waves: vec![],
             provision_tx_roots: BTreeMap::new(),
-            in_flight: 0,
+            in_flight: InFlightCount::ZERO,
         }
     }
 

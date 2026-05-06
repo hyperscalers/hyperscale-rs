@@ -11,9 +11,9 @@ use hyperscale_provisions::{ProvisionConfig, ProvisionCoordinator, ProvisionMemo
 use hyperscale_test_helpers::TestCommittee;
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, CertificateRoot, CertifiedBlock,
-    CommittedBlockHeader, Hash, LocalReceiptRoot, LocalTimestamp, ProposerTimestamp, ProvisionHash,
-    ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, StateRoot, TopologySnapshot,
-    TransactionRoot, ValidatorId, WaveId, WeightedTimestamp,
+    CommittedBlockHeader, Hash, InFlightCount, LocalReceiptRoot, LocalTimestamp, ProposerTimestamp,
+    ProvisionHash, ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, StateRoot,
+    TopologySnapshot, TransactionRoot, ValidatorId, WaveId, WeightedTimestamp,
 };
 
 const TEST_BLOCK_INTERVAL_MS: u64 = 500;
@@ -73,7 +73,7 @@ fn make_remote_header_targeting(
         provision_root: ProvisionsRoot::ZERO,
         waves,
         provision_tx_roots: std::collections::BTreeMap::new(),
-        in_flight: 0,
+        in_flight: InFlightCount::ZERO,
     };
     let header_hash = header.hash();
     let mut qc = QuorumCertificate::genesis(ShardGroupId(0));

@@ -10,10 +10,11 @@ use std::sync::Arc;
 use hyperscale_types::{
     ApplicationEvent, Block, BlockHash, BlockHeader, BlockHeight, Bls12381G2Signature,
     CertificateRoot, ConsensusReceipt, ExecutionCertificate, ExecutionMetadata, ExecutionOutcome,
-    FeeSummary, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalReceiptRoot,
-    LogLevel, NodeId, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardGroupId,
-    SignerBitfield, StateRoot, StoredReceipt, TransactionRoot, TxHash, TxOutcome, ValidatorId,
-    WaveCertificate, WaveId, WeightedTimestamp, compute_global_receipt_root, zero_bls_signature,
+    FeeSummary, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, InFlightCount,
+    LocalReceiptRoot, LogLevel, NodeId, ProposerTimestamp, ProvisionsRoot, QuorumCertificate,
+    Round, ShardGroupId, SignerBitfield, StateRoot, StoredReceipt, TransactionRoot, TxHash,
+    TxOutcome, ValidatorId, WaveCertificate, WaveId, WeightedTimestamp,
+    compute_global_receipt_root, zero_bls_signature,
 };
 use indexmap::IndexMap;
 use radix_common::math::Decimal;
@@ -130,7 +131,7 @@ pub fn make_test_block(height: BlockHeight) -> Block {
             provision_root: ProvisionsRoot::ZERO,
             waves: vec![],
             provision_tx_roots: BTreeMap::new(),
-            in_flight: 0,
+            in_flight: InFlightCount::ZERO,
         },
         transactions: Arc::new(vec![]),
         certificates: Arc::new(vec![]),

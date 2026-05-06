@@ -437,7 +437,7 @@ pub enum RecordResult {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{
-        CertificateRoot, Hash, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
+        CertificateRoot, Hash, InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
         QuorumCertificate, ShardGroupId, StateRoot, TransactionRoot, ValidatorId,
     };
 
@@ -460,7 +460,7 @@ mod tests {
             provision_root: ProvisionsRoot::ZERO,
             waves: vec![],
             provision_tx_roots: std::collections::BTreeMap::new(),
-            in_flight: 0,
+            in_flight: InFlightCount::ZERO,
         }
     }
 

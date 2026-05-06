@@ -3343,9 +3343,9 @@ mod tests {
 
     use hyperscale_core::Action;
     use hyperscale_types::{
-        Bls12381G1PrivateKey, CertificateRoot, Hash, LocalReceiptRoot, ProvisionsRoot,
-        RoutableTransaction, ShardGroupId, SignerBitfield, TopologySnapshot, TransactionRoot,
-        ValidatorId, ValidatorInfo, ValidatorSet, VotePower, WeightedTimestamp,
+        Bls12381G1PrivateKey, CertificateRoot, Hash, InFlightCount, LocalReceiptRoot,
+        ProvisionsRoot, RoutableTransaction, ShardGroupId, SignerBitfield, TopologySnapshot,
+        TransactionRoot, ValidatorId, ValidatorInfo, ValidatorSet, VotePower, WeightedTimestamp,
         generate_bls_keypair, test_utils, zero_bls_signature,
     };
 
@@ -3430,7 +3430,7 @@ mod tests {
             provision_root: ProvisionsRoot::ZERO,
             waves: vec![],
             provision_tx_roots: BTreeMap::new(),
-            in_flight: 0,
+            in_flight: InFlightCount::ZERO,
         }
     }
 

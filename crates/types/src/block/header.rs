@@ -5,9 +5,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use sbor::prelude::*;
 
 use crate::{
-    BlockHash, BlockHeight, CertificateRoot, Hash, LocalReceiptRoot, ProposerTimestamp,
-    ProvisionTxRoot, ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, StateRoot,
-    TransactionRoot, ValidatorId, WaveId,
+    BlockHash, BlockHeight, CertificateRoot, Hash, InFlightCount, LocalReceiptRoot,
+    ProposerTimestamp, ProvisionTxRoot, ProvisionsRoot, QuorumCertificate, Round, ShardGroupId,
+    StateRoot, TransactionRoot, ValidatorId, WaveId,
 };
 
 /// Block header containing consensus metadata.
@@ -128,7 +128,7 @@ pub struct BlockHeader {
     /// execution timing). Zero for genesis; fallback and sync blocks carry
     /// the parent's in-flight count forward unchanged (no txs admitted, none
     /// finalized).
-    pub in_flight: u32,
+    pub in_flight: InFlightCount,
 }
 
 impl BlockHeader {
@@ -155,7 +155,7 @@ impl BlockHeader {
             provision_root: ProvisionsRoot::ZERO,
             waves: vec![],
             provision_tx_roots: BTreeMap::new(),
-            in_flight: 0,
+            in_flight: InFlightCount::ZERO,
         }
     }
 

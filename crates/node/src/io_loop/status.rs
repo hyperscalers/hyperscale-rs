@@ -10,7 +10,7 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::Engine;
 use hyperscale_network::Network;
 use hyperscale_storage::Storage;
-use hyperscale_types::{BlockHeight, MAX_TX_IN_FLIGHT, ShardGroupId, StateRoot};
+use hyperscale_types::{BlockHeight, InFlightCount, MAX_TX_IN_FLIGHT, ShardGroupId, StateRoot};
 
 use crate::io_loop::IoLoop;
 use crate::io_loop::sync::block::BlockSyncStatus;
@@ -34,9 +34,9 @@ pub struct NodeStatusSnapshot {
     pub accepting_rpc_transactions: bool,
     pub at_pending_limit: bool,
     /// Per-remote-shard in-flight counts from latest verified headers.
-    pub remote_shard_in_flight: HashMap<ShardGroupId, u32>,
+    pub remote_shard_in_flight: HashMap<ShardGroupId, InFlightCount>,
     /// Threshold for rejecting transactions due to remote shard congestion (80% of [`MAX_TX_IN_FLIGHT`]).
-    pub remote_congestion_threshold: u32,
+    pub remote_congestion_threshold: InFlightCount,
 }
 
 impl<S, N, D, E> IoLoop<S, N, D, E>
@@ -56,7 +56,7 @@ where
         // u64-counter → usize and 80% threshold → u32 are status-readout casts
         // bounded by configured pool sizes; saturating coercions are fine.
         #[allow(clippy::cast_possible_truncation)]
-        let remote_congestion_threshold = (MAX_TX_IN_FLIGHT * 4 / 5) as u32;
+        let remote_congestion_threshold = InFlightCount((MAX_TX_IN_FLIGHT * 4 / 5) as u32);
         #[allow(clippy::cast_possible_truncation)]
         let (pending, in_flight) = (
             contention.pending_count as usize,

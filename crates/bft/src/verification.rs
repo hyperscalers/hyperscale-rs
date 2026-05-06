@@ -13,8 +13,8 @@ use std::sync::Arc;
 
 use hyperscale_core::{Action, VerificationKind};
 use hyperscale_types::{
-    Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, FinalizedWave, LocalReceiptRoot,
-    ProvisionsRoot, QuorumCertificate, StateRoot, TopologySnapshot,
+    Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, FinalizedWave, InFlightCount,
+    LocalReceiptRoot, ProvisionsRoot, QuorumCertificate, StateRoot, TopologySnapshot,
 };
 use tracing::{debug, trace, warn};
 
@@ -787,7 +787,7 @@ impl VerificationPipeline {
         }
 
         let parent_in_flight = if block.header().parent_qc.is_genesis() {
-            0
+            InFlightCount::ZERO
         } else if let Some(h) = chain.get_header(block.header().parent_block_hash) {
             h.in_flight
         } else {
@@ -822,7 +822,7 @@ impl VerificationPipeline {
         &mut self,
         block_hash: BlockHash,
         block: &Block,
-        parent_in_flight: u32,
+        parent_in_flight: InFlightCount,
         finalized_tx_count: u32,
     ) -> bool {
         let proposed = block.header().in_flight;
@@ -844,9 +844,9 @@ impl VerificationPipeline {
             warn!(
                 block_hash = ?block_hash,
                 height = block.height().0,
-                proposed = proposed,
-                expected = expected,
-                parent_in_flight = parent_in_flight,
+                proposed = proposed.0,
+                expected = expected.0,
+                parent_in_flight = parent_in_flight.0,
                 new_txs = block.transaction_count(),
                 finalized_txs = certs_finalized,
                 "In-flight count verification failed — proposed value does not match expected"
@@ -1144,7 +1144,7 @@ mod tests {
             provision_root: ProvisionsRoot::ZERO,
             waves: Vec::new(),
             provision_tx_roots: BTreeMap::new(),
-            in_flight,
+            in_flight: InFlightCount(in_flight),
         }
     }
 

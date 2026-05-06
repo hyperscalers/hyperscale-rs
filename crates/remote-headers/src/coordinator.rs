@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use hyperscale_core::{Action, ProtocolEvent};
 use hyperscale_types::{
-    BlockHeight, Bls12381G1PublicKey, CertifiedBlock, CommittedBlockHeader,
+    BlockHeight, Bls12381G1PublicKey, CertifiedBlock, CommittedBlockHeader, InFlightCount,
     REMOTE_HEADER_RETENTION, ShardGroupId, TopologySnapshot, ValidatorId, VotePower,
     WeightedTimestamp,
 };
@@ -470,7 +470,7 @@ impl RemoteHeaderCoordinator {
     /// Used for cross-shard backpressure: RPC nodes can reject transactions
     /// targeting congested remote shards.
     #[must_use]
-    pub fn remote_shard_in_flight(&self) -> HashMap<ShardGroupId, u32> {
+    pub fn remote_shard_in_flight(&self) -> HashMap<ShardGroupId, InFlightCount> {
         self.tips
             .iter()
             .filter_map(|(&shard, &(tip_height, _tip_ts))| {
@@ -583,9 +583,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use hyperscale_types::{
-        BlockHash, BlockHeader, CertificateRoot, Hash, LocalReceiptRoot, ProposerTimestamp,
-        ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, StateRoot, TransactionRoot,
-        ValidatorId,
+        BlockHash, BlockHeader, CertificateRoot, Hash, InFlightCount, LocalReceiptRoot,
+        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, StateRoot,
+        TransactionRoot, ValidatorId,
     };
 
     use super::*;
@@ -621,7 +621,7 @@ mod tests {
             provision_root: ProvisionsRoot::ZERO,
             waves: vec![],
             provision_tx_roots: BTreeMap::new(),
-            in_flight: 0,
+            in_flight: InFlightCount::ZERO,
         };
         let mut qc = QuorumCertificate::genesis(ShardGroupId(0));
         // Deliberately set wrong block_hash

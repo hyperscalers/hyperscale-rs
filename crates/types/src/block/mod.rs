@@ -31,11 +31,11 @@ mod tests {
     use crate::{
         BlockHash, BlockHeader, BlockHeight, Bls12381G2Signature, CertificateRoot,
         ExecutionCertificate, ExecutionOutcome, FinalizedWave, GlobalReceiptHash,
-        GlobalReceiptRoot, Hash, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
-        QuorumCertificate, Round, ShardGroupId, SignerBitfield, StateRoot, TransactionRoot, TxHash,
-        TxOutcome, ValidatorId, WaveCertificate, WaveId, WeightedTimestamp,
-        compute_certificate_root, compute_transaction_root, generate_ed25519_keypair,
-        routable_from_notarized_v1, sign_and_notarize,
+        GlobalReceiptRoot, Hash, InFlightCount, LocalReceiptRoot, ProposerTimestamp,
+        ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, SignerBitfield, StateRoot,
+        TransactionRoot, TxHash, TxOutcome, ValidatorId, WaveCertificate, WaveId,
+        WeightedTimestamp, compute_certificate_root, compute_transaction_root,
+        generate_ed25519_keypair, routable_from_notarized_v1, sign_and_notarize,
     };
 
     #[test]
@@ -56,7 +56,7 @@ mod tests {
             provision_root: ProvisionsRoot::ZERO,
             waves: vec![],
             provision_tx_roots: BTreeMap::new(),
-            in_flight: 0,
+            in_flight: InFlightCount::ZERO,
         };
 
         let hash1 = header.hash();

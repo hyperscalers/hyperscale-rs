@@ -49,7 +49,7 @@ impl NetworkMessage for CommittedBlockHeaderGossip {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::{BlockHash, ProposerTimestamp};
+    use hyperscale_types::{BlockHash, InFlightCount, ProposerTimestamp};
     use sbor::{basic_decode, basic_encode};
 
     use super::*;
@@ -88,7 +88,7 @@ mod tests {
             provision_root: ProvisionsRoot::ZERO,
             waves: vec![],
             provision_tx_roots: BTreeMap::new(),
-            in_flight: 0,
+            in_flight: InFlightCount::ZERO,
         };
         let qc = QuorumCertificate::genesis(ShardGroupId(0));
 

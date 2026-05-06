@@ -32,7 +32,9 @@ use hyperscale_metrics::{
     record_tx_ingress_rejected_syncing,
 };
 use hyperscale_metrics_prometheus::encode_metrics;
-use hyperscale_types::{Hash, RoutableTransaction, TransactionDecision, TransactionStatus, TxHash};
+use hyperscale_types::{
+    Hash, InFlightCount, RoutableTransaction, TransactionDecision, TransactionStatus, TxHash,
+};
 use sbor::prelude::basic_decode;
 
 use super::state::RpcState;
@@ -304,7 +306,7 @@ fn check_backpressure(state: &RpcState) -> Option<(StatusCode, Json<SubmitTransa
     if let Some((&congested_shard, &count)) = snapshot
         .remote_shard_in_flight
         .iter()
-        .find(|&(_, &count)| threshold > 0 && count >= threshold)
+        .find(|&(_, &count)| threshold > InFlightCount::ZERO && count >= threshold)
     {
         record_transaction_rejected("remote_shard_congestion");
         return Some((
@@ -313,8 +315,8 @@ fn check_backpressure(state: &RpcState) -> Option<(StatusCode, Json<SubmitTransa
                 accepted: false,
                 hash: String::new(),
                 error: Some(format!(
-                    "Remote shard {} is congested ({count} in-flight). Try again later.",
-                    congested_shard.0
+                    "Remote shard {} is congested ({} in-flight). Try again later.",
+                    congested_shard.0, count.0,
                 )),
             }),
         ));

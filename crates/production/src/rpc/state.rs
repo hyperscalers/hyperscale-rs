@@ -8,7 +8,7 @@ use std::time::Instant;
 use arc_swap::ArcSwap;
 use crossbeam::channel::Sender;
 use hyperscale_core::NodeInput;
-use hyperscale_types::{ShardGroupId, TransactionStatus, TxHash};
+use hyperscale_types::{InFlightCount, ShardGroupId, TransactionStatus, TxHash};
 use quick_cache::sync::Cache as QuickCache;
 
 use crate::status::SyncStatus;
@@ -83,9 +83,10 @@ pub struct MempoolSnapshot {
     pub at_pending_limit: bool,
     /// Per-remote-shard in-flight counts from latest verified block headers.
     /// Used for cross-shard backpressure: reject transactions targeting congested shards.
-    pub remote_shard_in_flight: HashMap<ShardGroupId, u32>,
-    /// Threshold for rejecting transactions due to remote shard congestion (80% of [`MAX_TX_IN_FLIGHT`]).
-    pub remote_congestion_threshold: u32,
+    pub remote_shard_in_flight: HashMap<ShardGroupId, InFlightCount>,
+    /// Threshold for rejecting transactions due to remote shard congestion
+    /// (80% of [`hyperscale_types::MAX_TX_IN_FLIGHT`]).
+    pub remote_congestion_threshold: InFlightCount,
 }
 
 impl Default for MempoolSnapshot {
@@ -98,7 +99,7 @@ impl Default for MempoolSnapshot {
             accepting_rpc_transactions: true, // Default to accepting until we know otherwise
             at_pending_limit: false,          // Default to not at limit until we know otherwise
             remote_shard_in_flight: HashMap::new(),
-            remote_congestion_threshold: 0,
+            remote_congestion_threshold: InFlightCount::ZERO,
         }
     }
 }

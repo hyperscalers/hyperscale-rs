@@ -22,10 +22,10 @@ use std::sync::Arc;
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey,
     Bls12381G2Signature, CertificateRoot, CertifiedBlock, ExecutionCertificate, ExecutionOutcome,
-    FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, LocalReceiptRoot, ProposerTimestamp,
-    ProvisionsRoot, QuorumCertificate, Round, RoutableTransaction, ShardGroupId, SignerBitfield,
-    StateRoot, TopologySnapshot, TransactionDecision, TransactionRoot, TxHash, TxOutcome,
-    ValidatorId, ValidatorInfo, ValidatorSet, VotePower, WaveCertificate, WaveId,
+    FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, InFlightCount, LocalReceiptRoot,
+    ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, RoutableTransaction, ShardGroupId,
+    SignerBitfield, StateRoot, TopologySnapshot, TransactionDecision, TransactionRoot, TxHash,
+    TxOutcome, ValidatorId, ValidatorInfo, ValidatorSet, VotePower, WaveCertificate, WaveId,
     WeightedTimestamp, bls_keypair_from_seed,
 };
 
@@ -235,7 +235,7 @@ pub fn make_live_block(
         provision_root: ProvisionsRoot::ZERO,
         waves: vec![],
         provision_tx_roots: BTreeMap::new(),
-        in_flight: 0,
+        in_flight: InFlightCount::ZERO,
     };
     Block::Live {
         header,

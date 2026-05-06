@@ -61,8 +61,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use hyperscale_types::{
-        BlockHash, BlockHeader, CertificateRoot, LocalReceiptRoot, ProposerTimestamp,
-        ProvisionsRoot, QuorumCertificate, Round, StateRoot, TransactionRoot, ValidatorId,
+        BlockHash, BlockHeader, CertificateRoot, InFlightCount, LocalReceiptRoot,
+        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, StateRoot, TransactionRoot,
+        ValidatorId,
     };
 
     use super::*;
@@ -84,7 +85,7 @@ mod tests {
             provision_root: ProvisionsRoot::ZERO,
             waves: vec![],
             provision_tx_roots: BTreeMap::new(),
-            in_flight: 0,
+            in_flight: InFlightCount::ZERO,
         };
         let header_hash = header.hash();
         let mut qc = QuorumCertificate::genesis(ShardGroupId(0));

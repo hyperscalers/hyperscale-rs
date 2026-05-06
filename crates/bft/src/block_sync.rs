@@ -732,9 +732,9 @@ mod tests {
 
     use hyperscale_test_helpers::TestCommittee;
     use hyperscale_types::{
-        Block, BlockHeader, CertificateRoot, Hash, LocalReceiptRoot, ProposerTimestamp,
-        ProvisionsRoot, Round, ShardGroupId, StateRoot, TransactionRoot, ValidatorId,
-        ValidatorInfo, ValidatorSet, VotePower,
+        Block, BlockHeader, CertificateRoot, Hash, InFlightCount, LocalReceiptRoot,
+        ProposerTimestamp, ProvisionsRoot, Round, ShardGroupId, StateRoot, TransactionRoot,
+        ValidatorId, ValidatorInfo, ValidatorSet, VotePower,
     };
 
     use super::*;
@@ -768,7 +768,7 @@ mod tests {
             provision_root: ProvisionsRoot::ZERO,
             waves: Vec::new(),
             provision_tx_roots: BTreeMap::new(),
-            in_flight: 0,
+            in_flight: InFlightCount::ZERO,
         }
     }
 

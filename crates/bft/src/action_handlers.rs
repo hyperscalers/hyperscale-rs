@@ -18,11 +18,11 @@ use hyperscale_network::Network;
 use hyperscale_storage::{ChainWriter, JmtSnapshot, Storage, SubstateStore};
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, BlockVote, Bls12381G1PublicKey,
-    Bls12381G2Signature, CertificateRoot, ConsensusReceipt, FinalizedWave, Hash, LocalReceiptRoot,
-    ProposerTimestamp, ProvisionHash, ProvisionTxRoot, Provisions, ProvisionsRoot,
-    QuorumCertificate, Round, RoutableTransaction, ShardGroupId, SignerBitfield, StateRoot,
-    StoredReceipt, TopologySnapshot, TransactionRoot, ValidatorId, VotePower, WeightedTimestamp,
-    batch_verify_bls_same_message, block_header_message, block_vote_message,
+    Bls12381G2Signature, CertificateRoot, ConsensusReceipt, FinalizedWave, Hash, InFlightCount,
+    LocalReceiptRoot, ProposerTimestamp, ProvisionHash, ProvisionTxRoot, Provisions,
+    ProvisionsRoot, QuorumCertificate, Round, RoutableTransaction, ShardGroupId, SignerBitfield,
+    StateRoot, StoredReceipt, TopologySnapshot, TransactionRoot, ValidatorId, VotePower,
+    WeightedTimestamp, batch_verify_bls_same_message, block_header_message, block_vote_message,
     committed_block_header_message, compute_certificate_root, compute_local_receipt_root,
     compute_provision_root, compute_provision_tx_roots, compute_transaction_root, compute_waves,
     verify_bls12381_v1,
@@ -473,7 +473,7 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
     local_shard: ShardGroupId,
     topology: &TopologySnapshot,
     provisions: Vec<Arc<Provisions>>,
-    parent_in_flight: u32,
+    parent_in_flight: InFlightCount,
     finalized_tx_count: u32,
     pending_snapshots: &[Arc<JmtSnapshot>],
 ) -> ProposalResult<S::PreparedCommit> {
