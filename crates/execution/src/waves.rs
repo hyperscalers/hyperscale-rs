@@ -410,7 +410,7 @@ mod tests {
     fn wave(height: u64) -> WaveId {
         WaveId {
             shard_group_id: shard(),
-            block_height: BlockHeight(height),
+            block_height: BlockHeight::new(height),
             remote_shards: BTreeSet::new(),
         }
     }
@@ -516,7 +516,7 @@ mod tests {
             sent_at,
             attempt: Attempt::INITIAL,
             block_hash: BlockHash::ZERO,
-            block_height: BlockHeight(1),
+            block_height: BlockHeight::new(1),
             vote_anchor_ts: ms(0),
             global_receipt_root: GlobalReceiptRoot::ZERO,
             tx_outcomes: Arc::new(vec![]),

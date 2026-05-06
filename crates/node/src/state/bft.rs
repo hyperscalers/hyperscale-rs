@@ -214,7 +214,7 @@ impl NodeStateMachine {
         {
             tracing::warn!(
                 block_hash = ?header.hash(),
-                height = header.height.0,
+                height = header.height.inner(),
                 tx_hashes = total_tx_count,
                 cert_ids = manifest.cert_ids.len(),
                 provision_hashes = manifest.provision_hashes.len(),
@@ -237,7 +237,7 @@ impl NodeStateMachine {
         {
             tracing::warn!(
                 block_hash = ?header.hash(),
-                height = header.height.0,
+                height = header.height.inner(),
                 "Rejecting block that would exceed in-flight limit"
             );
             return vec![];
@@ -382,11 +382,11 @@ mod tests {
         // Wave on remote shard 1 listing local shard 0 as a dependency.
         let mut remote_shards = BTreeSet::new();
         remote_shards.insert(ShardGroupId(0));
-        let wave = WaveId::new(ShardGroupId(1), BlockHeight(5), remote_shards);
+        let wave = WaveId::new(ShardGroupId(1), BlockHeight::new(5), remote_shards);
 
         let mut block = make_live_block(
             ShardGroupId(1),
-            BlockHeight(5),
+            BlockHeight::new(5),
             /* timestamp_ms */ 1_000,
             ValidatorId(0),
             vec![],
@@ -432,7 +432,7 @@ mod tests {
         let TestNode { mut node, .. } = TestNode::builder().local_idx(1).build();
         assert!(
             node.topology()
-                .should_propose(BlockHeight(1), Round::INITIAL),
+                .should_propose(BlockHeight::new(1), Round::INITIAL),
             "local must be the round-0 height-1 proposer for this test",
         );
 
@@ -459,7 +459,7 @@ mod tests {
         assert!(
             !node
                 .topology()
-                .should_propose(BlockHeight(1), Round::INITIAL),
+                .should_propose(BlockHeight::new(1), Round::INITIAL),
             "local must NOT be the round-0 height-1 proposer for this test",
         );
 
@@ -483,7 +483,7 @@ mod tests {
         let TestNode { mut node, .. } = TestNode::new();
 
         let actions = node.handle(ProtocolEvent::BlockPersisted {
-            height: BlockHeight(10),
+            height: BlockHeight::new(10),
         });
 
         let cleanup_timer_set = actions.iter().any(|a| {
@@ -521,7 +521,7 @@ mod tests {
         let provisions = Arc::new(Provisions::new(
             ShardGroupId(0),
             ShardGroupId(1),
-            BlockHeight(1),
+            BlockHeight::new(1),
             MerkleInclusionProof::dummy(),
             vec![TxEntries {
                 tx_hash: TxHash::from_raw(Hash::from_bytes(b"outbound-tx")),
@@ -550,7 +550,7 @@ mod tests {
         // deadline. The orchestrator passes this into the outbound sweep.
         let block = make_live_block(
             ShardGroupId(0),
-            BlockHeight(1),
+            BlockHeight::new(1),
             /* timestamp_ms */ 1_000,
             ValidatorId(0),
             vec![],
@@ -569,7 +569,7 @@ mod tests {
         // deadline. Now the eviction path proper must fire.
         let block = make_live_block(
             ShardGroupId(0),
-            BlockHeight(2),
+            BlockHeight::new(2),
             /* timestamp_ms */ 1_000,
             ValidatorId(0),
             vec![],
@@ -608,7 +608,7 @@ mod tests {
         // the pending-blocks insert.
         let header = make_live_block(
             ShardGroupId(0),
-            BlockHeight(1),
+            BlockHeight::new(1),
             /* timestamp_ms */ 1_000,
             ValidatorId(1),
             vec![],
@@ -654,7 +654,7 @@ mod tests {
 
         let block = make_live_block(
             ShardGroupId(0),
-            BlockHeight(1),
+            BlockHeight::new(1),
             /* timestamp_ms */ 1_000,
             ValidatorId(0),
             vec![tx],
@@ -665,7 +665,7 @@ mod tests {
 
         assert_eq!(
             node.mempool().status(&tx_hash),
-            Some(TransactionStatus::Committed(BlockHeight(1))),
+            Some(TransactionStatus::Committed(BlockHeight::new(1))),
             "on_block_committed must flip the included tx from Pending to Committed(1)",
         );
     }

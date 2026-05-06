@@ -137,7 +137,7 @@ where
 
         self.network
             .register_request_handler::<GetProvisionsRequest>(move |req: GetProvisionsRequest| {
-                let cache_key = (req.block_height.0, req.target_shard.0);
+                let cache_key = (req.block_height.inner(), req.target_shard.0);
 
                 // Outbound fast path: if we still hold the exact batch we
                 // generated for this (source_block_height, target_shard),
@@ -446,7 +446,7 @@ where
                     ) {
                         warn!(
                             proposer = proposer.0,
-                            height = gossip.header.height.0,
+                            height = gossip.header.height.inner(),
                             round = gossip.header.round.0,
                             "Block header proposer signature invalid — dropping"
                         );

@@ -147,11 +147,11 @@ mod tests {
         let outcomes = vec![sample_outcome(1), sample_outcome(2)];
         ExecutionVote {
             block_hash: BlockHash::from_raw(Hash::from_bytes(b"block")),
-            block_height: BlockHeight(7),
+            block_height: BlockHeight::new(7),
             vote_anchor_ts: WeightedTimestamp(11),
             wave_id: WaveId::new(
                 ShardGroupId(0),
-                BlockHeight(7),
+                BlockHeight::new(7),
                 std::iter::once(ShardGroupId(1)).collect(),
             ),
             shard_group_id: ShardGroupId(0),

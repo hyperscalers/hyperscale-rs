@@ -77,7 +77,8 @@ impl ChainWriter for RocksDbStorage {
         }
 
         let snapshot_store = SnapshotTreeStore::new(&self.db);
-        let parent_version = jmt_parent_height(parent_block_height, parent_state_root).map(|h| h.0);
+        let parent_version =
+            jmt_parent_height(parent_block_height, parent_state_root).map(BlockHeight::inner);
 
         // Collect per-receipt DatabaseUpdates references — no merge needed.
         // State locking guarantees no key conflicts between receipts, so
@@ -91,7 +92,7 @@ impl ChainWriter for RocksDbStorage {
             put_at_version(
                 &snapshot_store,
                 parent_version,
-                block_height.0,
+                block_height.inner(),
                 &per_receipt_updates,
                 &std::collections::HashMap::new(),
             )
@@ -100,7 +101,7 @@ impl ChainWriter for RocksDbStorage {
             put_at_version(
                 &overlay,
                 parent_version,
-                block_height.0,
+                block_height.inner(),
                 &per_receipt_updates,
                 &std::collections::HashMap::new(),
             )
@@ -124,7 +125,7 @@ impl ChainWriter for RocksDbStorage {
         // Pre-build substate + receipt writes into a WriteBatch for efficient commit.
         let (mut write_batch, _reset_old_keys) = self.build_substate_write_batch(
             &merged_updates,
-            block_height.0,
+            block_height.inner(),
             /* write_history */ true,
             base_reads,
         );
@@ -184,16 +185,16 @@ impl ChainWriter for RocksDbStorage {
                 // `commit_block_inner_locked`.
                 let _guard = self.commit_lock.lock().unwrap();
                 let (current_version, _) = SnapshotTreeStore::new(&self.db).read_jmt_metadata();
-                if block.height().0 <= current_version {
+                if block.height().inner() <= current_version {
                     tracing::debug!(
-                        height = block.height().0,
+                        height = block.height().inner(),
                         current_version,
                         "PreparedCommit stale — block already committed, skipping"
                     );
                     roots.push(result_root);
                 } else {
                     tracing::debug!(
-                        height = block.height().0,
+                        height = block.height().inner(),
                         current_version,
                         "PreparedCommit stale, falling back to commit_block"
                     );
@@ -266,7 +267,7 @@ impl RocksDbStorage {
         qc: &Arc<QuorumCertificate>,
         receipts: &[StoredReceipt],
     ) -> StateRoot {
-        let block_height = block.height().0;
+        let block_height = block.height().inner();
 
         let snapshot_store = SnapshotTreeStore::new(&self.db);
         let (base_version, base_root) = snapshot_store.read_jmt_metadata();
@@ -299,7 +300,8 @@ impl RocksDbStorage {
         }
 
         // Compute JMT update.
-        let parent_version = jmt_parent_height(BlockHeight(base_version), base_root).map(|h| h.0);
+        let parent_version =
+            jmt_parent_height(BlockHeight::new(base_version), base_root).map(BlockHeight::inner);
         let (new_root, collected) = put_at_version(
             &snapshot_store,
             parent_version,
@@ -310,9 +312,9 @@ impl RocksDbStorage {
         let jmt_snapshot = JmtSnapshot::from_collected_writes(
             collected,
             base_root,
-            BlockHeight(base_version),
+            BlockHeight::new(base_version),
             new_root,
-            BlockHeight(block_height),
+            BlockHeight::new(block_height),
         );
         self.append_jmt_to_batch(&mut batch, &jmt_snapshot, block_height);
 

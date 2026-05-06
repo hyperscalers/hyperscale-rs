@@ -51,7 +51,7 @@ impl QuorumCertificate {
         Self {
             block_hash: BlockHash::ZERO,
             shard_group_id,
-            height: BlockHeight(0),
+            height: BlockHeight::new(0),
             parent_block_hash: BlockHash::ZERO,
             round: Round::INITIAL,
             signers: SignerBitfield::empty(),
@@ -77,7 +77,7 @@ impl QuorumCertificate {
     /// Check if this is a genesis QC.
     #[must_use]
     pub fn is_genesis(&self) -> bool {
-        self.height.0 == 0 && self.block_hash == BlockHash::ZERO
+        self.height == BlockHeight::GENESIS && self.block_hash == BlockHash::ZERO
     }
 
     /// Get the number of signers.
@@ -92,7 +92,7 @@ impl QuorumCertificate {
     /// Genesis QC (height 0) doesn't enable any commit.
     #[must_use]
     pub fn has_committable_block(&self) -> bool {
-        self.height.0 > 0 && !self.is_genesis()
+        self.height != BlockHeight::GENESIS && !self.is_genesis()
     }
 
     /// Get the height of the committable block (parent height).
@@ -101,7 +101,7 @@ impl QuorumCertificate {
     #[must_use]
     pub fn committable_height(&self) -> Option<BlockHeight> {
         if self.has_committable_block() {
-            Some(BlockHeight(self.height.0 - 1))
+            self.height.prev()
         } else {
             None
         }
@@ -129,7 +129,7 @@ mod tests {
     fn test_genesis_qc() {
         let qc = QuorumCertificate::genesis(ShardGroupId(0));
         assert!(qc.is_genesis());
-        assert_eq!(qc.height, BlockHeight(0));
+        assert_eq!(qc.height, BlockHeight::new(0));
         assert_eq!(qc.block_hash, BlockHash::ZERO);
         assert_eq!(qc.signer_count(), 0);
         assert!(!qc.has_committable_block());
@@ -148,7 +148,7 @@ mod tests {
         let qc = QuorumCertificate {
             block_hash: BlockHash::from_raw(Hash::from_bytes(b"block1")),
             shard_group_id: ShardGroupId(0),
-            height: BlockHeight(1),
+            height: BlockHeight::new(1),
             parent_block_hash,
             round: Round::INITIAL,
             signers,
@@ -159,7 +159,7 @@ mod tests {
         assert!(!qc.is_genesis());
         assert_eq!(qc.signer_count(), 3);
         assert!(qc.has_committable_block());
-        assert_eq!(qc.committable_height(), Some(BlockHeight(0)));
+        assert_eq!(qc.committable_height(), Some(BlockHeight::new(0)));
         assert_eq!(qc.committable_hash(), Some(parent_block_hash));
     }
 }

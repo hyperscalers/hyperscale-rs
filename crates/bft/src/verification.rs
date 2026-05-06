@@ -276,7 +276,7 @@ impl VerificationPipeline {
         self.verified_qcs.insert(qc_block_hash, qc);
         trace!(
             qc_block_hash = ?qc_block_hash,
-            qc_height = qc_height.0,
+            qc_height = qc_height.inner(),
             "Cached verified QC"
         );
     }
@@ -422,7 +422,7 @@ impl VerificationPipeline {
 
         warn!(
             block_hash = ?block_hash,
-            height = block.height().0,
+            height = block.height().inner(),
             proposer = ?block.header().proposer,
             certs = block.certificates().len(),
             txs = block.transaction_count(),
@@ -843,7 +843,7 @@ impl VerificationPipeline {
         } else {
             warn!(
                 block_hash = ?block_hash,
-                height = block.height().0,
+                height = block.height().inner(),
                 proposed = proposed.0,
                 expected = expected.0,
                 parent_in_flight = parent_in_flight.0,
@@ -943,7 +943,7 @@ impl VerificationPipeline {
     ) {
         debug!(
             parent_block_hash = ?parent_block_hash,
-            parent_block_height = parent_block_height.0,
+            parent_block_height = parent_block_height.inner(),
             "Deferring proposal — parent tree not yet available"
         );
         self.deferred_proposal = Some((parent_block_hash, parent_block_height));
@@ -1201,7 +1201,7 @@ mod tests {
     #[test]
     fn classify_vote_in_flight_skips_vote_when_locked() {
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
-        let block = block_with(BlockHeight(1), BlockHash::ZERO, 0, vec![]);
+        let block = block_with(BlockHeight::new(1), BlockHash::ZERO, 0, vec![]);
         let block_hash = block.hash();
         let certified = HashMap::new();
         let pending = HashMap::new();
@@ -1223,9 +1223,9 @@ mod tests {
         // effectively pruned, so we skip voting but still keep verifying.
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
         let parent = bh(b"parent");
-        let mut h = header(BlockHeight(5), parent, 0);
+        let mut h = header(BlockHeight::new(5), parent, 0);
         let mut parent_qc = QuorumCertificate::genesis(ShardGroupId(0));
-        parent_qc.height = BlockHeight(4);
+        parent_qc.height = BlockHeight::new(4);
         parent_qc.block_hash = parent;
         h.parent_qc = parent_qc;
         let block = Block::Live {
@@ -1237,7 +1237,13 @@ mod tests {
         let block_hash = block.hash();
         let certified = HashMap::new();
         let pending = HashMap::new();
-        let chain = chain_view(BlockHeight(3), BlockHash::ZERO, None, &certified, &pending);
+        let chain = chain_view(
+            BlockHeight::new(3),
+            BlockHash::ZERO,
+            None,
+            &certified,
+            &pending,
+        );
 
         let out = vp.classify_vote_in_flight(&chain, block_hash, &block, false);
         assert!(matches!(out, InFlightCheck::SkipVote));
@@ -1246,7 +1252,7 @@ mod tests {
     #[test]
     fn classify_vote_in_flight_proceeds_when_genesis_parent_and_counts_match() {
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
-        let block = block_with(BlockHeight(1), BlockHash::ZERO, 0, vec![]);
+        let block = block_with(BlockHeight::new(1), BlockHash::ZERO, 0, vec![]);
         let block_hash = block.hash();
         let certified = HashMap::new();
         let pending = HashMap::new();
@@ -1267,7 +1273,7 @@ mod tests {
         // Genesis parent → parent_in_flight = 0. Block claims in_flight = 5
         // with 0 transactions: proposed doesn't match expected → Abort.
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
-        let block = block_with(BlockHeight(1), BlockHash::ZERO, 5, vec![]);
+        let block = block_with(BlockHeight::new(1), BlockHash::ZERO, 5, vec![]);
         let block_hash = block.hash();
         let certified = HashMap::new();
         let pending = HashMap::new();
@@ -1308,7 +1314,7 @@ mod tests {
         // queues this entry directly into ready_state_root_verifications.
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
         let parent_block_hash = bh(b"parent");
-        let block = block_with(BlockHeight(1), parent_block_hash, 0, vec![]);
+        let block = block_with(BlockHeight::new(1), parent_block_hash, 0, vec![]);
         let block_hash = block.hash();
 
         vp.initiate_state_root_verification(block_hash, &block, BlockHeight::GENESIS);
@@ -1353,7 +1359,7 @@ mod tests {
         // dispatch with empty `finalized_waves` against the wrong inputs.
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
         let parent_block_hash = bh(b"parent");
-        let block = block_with(BlockHeight(1), parent_block_hash, 0, vec![]);
+        let block = block_with(BlockHeight::new(1), parent_block_hash, 0, vec![]);
         let block_hash = block.hash();
 
         vp.initiate_state_root_verification(block_hash, &block, BlockHeight::GENESIS);

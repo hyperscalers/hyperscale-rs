@@ -83,7 +83,7 @@ impl Display for TransactionStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Pending => write!(f, "pending"),
-            Self::Committed(height) => write!(f, "committed({})", height.0),
+            Self::Committed(height) => write!(f, "committed({})", height.inner()),
             Self::Completed(TransactionDecision::Accept) => {
                 write!(f, "completed(accept)")
             }
@@ -125,7 +125,7 @@ impl FromStr for TransactionStatus {
                     .ok_or_else(|| TransactionStatusParseError::MissingValue("committed".into()))?
                     .parse::<u64>()
                     .map_err(|_| TransactionStatusParseError::InvalidValue("height".into()))?;
-                Ok(Self::Committed(BlockHeight(height)))
+                Ok(Self::Committed(BlockHeight::new(height)))
             }
             "completed" => {
                 let decision = parse_decision(inner.ok_or_else(|| {

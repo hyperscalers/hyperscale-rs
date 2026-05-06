@@ -32,11 +32,30 @@ impl Display for ShardGroupId {
 /// Block height.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, BasicSbor)]
 #[sbor(transparent)]
-pub struct BlockHeight(pub u64);
+pub struct BlockHeight(u64);
 
 impl BlockHeight {
     /// Genesis block height.
     pub const GENESIS: Self = Self(0);
+
+    /// Construct a block height from a raw `u64`.
+    ///
+    /// Most call sites should use [`BlockHeight::next`] or arithmetic
+    /// operators instead — this constructor is the escape hatch for
+    /// boundaries (storage decode, sync ranges, tests) where the height
+    /// genuinely originates as a raw integer.
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Inner `u64`. Use sparingly — at boundaries (display, storage encode,
+    /// hashing, distance arithmetic that the operator overloads don't cover)
+    /// only.
+    #[must_use]
+    pub const fn inner(self) -> u64 {
+        self.0
+    }
 
     /// Get the next block height.
     #[must_use]
@@ -70,27 +89,40 @@ impl BlockHeight {
 impl Add<u64> for BlockHeight {
     type Output = Self;
     fn add(self, rhs: u64) -> Self {
-        Self(self.0 + rhs)
+        Self(
+            self.0
+                .checked_add(rhs)
+                .expect("BlockHeight + u64 overflowed"),
+        )
     }
 }
 
 impl Sub<u64> for BlockHeight {
     type Output = Self;
     fn sub(self, rhs: u64) -> Self {
-        Self(self.0 - rhs)
+        Self(
+            self.0
+                .checked_sub(rhs)
+                .expect("BlockHeight - u64 underflowed"),
+        )
     }
 }
 
 impl Sub<Self> for BlockHeight {
     type Output = u64;
     fn sub(self, rhs: Self) -> u64 {
-        self.0 - rhs.0
+        self.0
+            .checked_sub(rhs.0)
+            .expect("BlockHeight distance underflowed (lhs < rhs)")
     }
 }
 
 impl AddAssign<u64> for BlockHeight {
     fn add_assign(&mut self, rhs: u64) {
-        self.0 += rhs;
+        self.0 = self
+            .0
+            .checked_add(rhs)
+            .expect("BlockHeight += u64 overflowed");
     }
 }
 
@@ -419,12 +451,12 @@ mod tests {
 
     #[test]
     fn test_block_height_next_prev() {
-        let height = BlockHeight(10);
-        assert_eq!(height.next(), BlockHeight(11));
-        assert_eq!(height.prev(), Some(BlockHeight(9)));
+        let height = BlockHeight::new(10);
+        assert_eq!(height.next(), BlockHeight::new(11));
+        assert_eq!(height.prev(), Some(BlockHeight::new(9)));
 
         assert_eq!(BlockHeight::GENESIS.prev(), None);
-        assert_eq!(BlockHeight::GENESIS.next(), BlockHeight(1));
+        assert_eq!(BlockHeight::GENESIS.next(), BlockHeight::new(1));
     }
 
     #[test]

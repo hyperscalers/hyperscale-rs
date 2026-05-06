@@ -107,7 +107,7 @@ mod tests {
 
     #[test]
     fn test_block_header_gossip_creation() {
-        let header = make_header(BlockHeight(1));
+        let header = make_header(BlockHeight::new(1));
         let manifest = BlockManifest {
             tx_hashes: vec![
                 TxHash::from_raw(Hash::from_bytes(b"tx1")),
@@ -126,7 +126,7 @@ mod tests {
 
     #[test]
     fn test_block_header_gossip_into_parts() {
-        let header = make_header(BlockHeight(5));
+        let header = make_header(BlockHeight::new(5));
         let manifest = BlockManifest {
             tx_hashes: vec![TxHash::from_raw(Hash::from_bytes(b"tx1"))],
             ..Default::default()
@@ -145,7 +145,7 @@ mod tests {
         let tx3 = TxHash::from_raw(Hash::from_bytes(b"tx3"));
 
         let gossip = BlockHeaderNotification::new(
-            make_header(BlockHeight(1)),
+            make_header(BlockHeight::new(1)),
             BlockManifest {
                 tx_hashes: vec![tx1, tx2, tx3],
                 ..Default::default()

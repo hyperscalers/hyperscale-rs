@@ -158,7 +158,7 @@ mod tests {
         Arc::new(Provisions::new(
             ShardGroupId(1),
             ShardGroupId(0),
-            BlockHeight(height),
+            BlockHeight::new(height),
             MerkleInclusionProof::dummy(),
             vec![TxEntries {
                 tx_hash: TxHash::from_raw(Hash::from_bytes(&[tx_seed])),

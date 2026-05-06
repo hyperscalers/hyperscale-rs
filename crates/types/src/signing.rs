@@ -138,7 +138,7 @@ pub fn state_provisions_message(provisions: &Provisions) -> Vec<u8> {
     message.extend_from_slice(DOMAIN_STATE_PROVISION_BATCH);
     message.extend_from_slice(&provisions.source_shard.0.to_le_bytes());
     message.extend_from_slice(&provisions.target_shard.0.to_le_bytes());
-    message.extend_from_slice(&provisions.block_height.0.to_le_bytes());
+    message.extend_from_slice(&provisions.block_height.to_le_bytes());
     message.extend_from_slice(tx_digest.as_bytes());
     message
 }
@@ -265,8 +265,8 @@ mod tests {
         let shard = ShardGroupId(1);
         let block = BlockHash::from_raw(Hash::from_bytes(b"test_block"));
 
-        let msg1 = block_vote_message(shard, BlockHeight(10), Round::INITIAL, &block);
-        let msg2 = block_vote_message(shard, BlockHeight(10), Round::INITIAL, &block);
+        let msg1 = block_vote_message(shard, BlockHeight::new(10), Round::INITIAL, &block);
+        let msg2 = block_vote_message(shard, BlockHeight::new(10), Round::INITIAL, &block);
 
         assert_eq!(msg1, msg2);
         assert!(msg1.starts_with(DOMAIN_BLOCK_VOTE));
@@ -277,8 +277,8 @@ mod tests {
         let shard = ShardGroupId(1);
         let block = BlockHash::from_raw(Hash::from_bytes(b"test_block"));
 
-        let msg1 = committed_block_header_message(shard, BlockHeight(10), &block);
-        let msg2 = committed_block_header_message(shard, BlockHeight(10), &block);
+        let msg1 = committed_block_header_message(shard, BlockHeight::new(10), &block);
+        let msg2 = committed_block_header_message(shard, BlockHeight::new(10), &block);
 
         assert_eq!(msg1, msg2);
         assert!(msg1.starts_with(DOMAIN_COMMITTED_BLOCK_HEADER));
@@ -289,8 +289,8 @@ mod tests {
         let shard = ShardGroupId(1);
         let block = BlockHash::from_raw(Hash::from_bytes(b"test_block"));
 
-        let msg1 = block_header_message(shard, BlockHeight(10), Round::INITIAL, &block);
-        let msg2 = block_header_message(shard, BlockHeight(10), Round::INITIAL, &block);
+        let msg1 = block_header_message(shard, BlockHeight::new(10), Round::INITIAL, &block);
+        let msg2 = block_header_message(shard, BlockHeight::new(10), Round::INITIAL, &block);
 
         assert_eq!(msg1, msg2);
         assert!(msg1.starts_with(DOMAIN_BLOCK_HEADER));
@@ -301,8 +301,8 @@ mod tests {
         let shard = ShardGroupId(1);
         let block = BlockHash::from_raw(Hash::from_bytes(b"test_block"));
 
-        let header_msg = block_header_message(shard, BlockHeight(10), Round::INITIAL, &block);
-        let vote_msg = block_vote_message(shard, BlockHeight(10), Round::INITIAL, &block);
+        let header_msg = block_header_message(shard, BlockHeight::new(10), Round::INITIAL, &block);
+        let vote_msg = block_vote_message(shard, BlockHeight::new(10), Round::INITIAL, &block);
 
         // Must differ due to different domain tags (prevents cross-protocol replay)
         assert_ne!(header_msg, vote_msg);
@@ -315,7 +315,7 @@ mod tests {
         let provisions = Provisions::new(
             ShardGroupId(1),
             ShardGroupId(2),
-            BlockHeight(10),
+            BlockHeight::new(10),
             MerkleInclusionProof::dummy(),
             vec![TxEntries {
                 tx_hash: TxHash::from_raw(Hash::from_bytes(b"tx1")),

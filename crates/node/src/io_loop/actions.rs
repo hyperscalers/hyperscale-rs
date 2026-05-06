@@ -283,7 +283,7 @@ where
         // byzantine-detection assert below on a self-inflicted race.
         if self.block_commit.has_prepared(&block_hash) {
             debug!(
-                height = height.0,
+                height = height.inner(),
                 ?block_hash,
                 "Reusing prepared commit from consensus path"
             );
@@ -316,12 +316,12 @@ where
             // wipe-and-resync from genesis.
             if computed_root != block.header().state_root {
                 error!(
-                    height = height.0,
+                    height = height.inner(),
                     ?block_hash,
                     expected_root = ?block.header().state_root,
                     computed_root = ?computed_root,
                     ?parent_state_root,
-                    parent_block_height = parent_block_height.0,
+                    parent_block_height = parent_block_height.inner(),
                     ?source,
                     "Local state divergence detected on synced block apply — \
                      parent state does not produce the canonical state root. \
@@ -333,7 +333,7 @@ where
                      {parent_state_root:?} does not produce canonical state \
                      root {expected:?} (computed {computed:?}). Operator \
                      intervention required.",
-                    height.0,
+                    height.inner(),
                     expected = block.header().state_root,
                     computed = computed_root,
                 );
@@ -360,7 +360,7 @@ where
                 .insert_prepared(block_hash, height, prepared);
 
             debug!(
-                height = height.0,
+                height = height.inner(),
                 ?block_hash,
                 "Synced block prepared, queued for persist"
             );
@@ -390,7 +390,7 @@ where
         match decision {
             AccumulateDecision::Skip => {}
             AccumulateDecision::Accepted { height, notify_now } => {
-                debug!(height = height.0, "Block committed");
+                debug!(height = height.inner(), "Block committed");
                 let outputs = self
                     .syncs
                     .block

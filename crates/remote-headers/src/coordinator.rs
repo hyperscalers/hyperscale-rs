@@ -142,7 +142,7 @@ impl RemoteHeaderCoordinator {
             verified: HashMap::new(),
             tips: HashMap::new(),
             expected: HashMap::new(),
-            local_committed_height: BlockHeight(0),
+            local_committed_height: BlockHeight::new(0),
             local_committed_ts: WeightedTimestamp::ZERO,
         }
     }
@@ -180,7 +180,7 @@ impl RemoteHeaderCoordinator {
         if committed_header.qc.block_hash != header_hash {
             warn!(
                 shard = shard.0,
-                height = height.0,
+                height = height.inner(),
                 sender = sender.0,
                 "Rejected remote header: QC block_hash does not match header hash"
             );
@@ -191,7 +191,7 @@ impl RemoteHeaderCoordinator {
         if committed_header.qc.shard_group_id != shard {
             warn!(
                 shard = shard.0,
-                height = height.0,
+                height = height.inner(),
                 sender = sender.0,
                 qc_shard = committed_header.qc.shard_group_id.0,
                 "Rejected remote header: QC shard_group_id does not match header shard"
@@ -201,7 +201,7 @@ impl RemoteHeaderCoordinator {
 
         debug!(
             shard = shard.0,
-            height = height.0,
+            height = height.inner(),
             sender = sender.0,
             state_root = %committed_header.state_root(),
             "Received remote committed block header (pending QC verification)"
@@ -212,7 +212,7 @@ impl RemoteHeaderCoordinator {
         if sender_map.contains_key(&sender) {
             trace!(
                 shard = shard.0,
-                height = height.0,
+                height = height.inner(),
                 sender = sender.0,
                 "Duplicate remote header from same sender — skipping"
             );
@@ -256,7 +256,7 @@ impl RemoteHeaderCoordinator {
         if !valid {
             warn!(
                 shard = shard.0,
-                height = height.0,
+                height = height.inner(),
                 "Remote header QC verification failed"
             );
 
@@ -280,7 +280,7 @@ impl RemoteHeaderCoordinator {
         // QC verified — promote to verified storage.
         debug!(
             shard = shard.0,
-            height = height.0,
+            height = height.inner(),
             "Remote header QC verified — promoting"
         );
 
@@ -354,7 +354,7 @@ impl RemoteHeaderCoordinator {
                 .entry(shard)
                 .or_insert_with(|| ExpectedHeader {
                     discovered_at: self.local_committed_ts,
-                    last_verified_height: BlockHeight(0),
+                    last_verified_height: BlockHeight::new(0),
                     last_verified_at: None,
                 });
         }
@@ -382,11 +382,12 @@ impl RemoteHeaderCoordinator {
             // `RemoteHeaderSync`. The action is idempotent — the
             // FSM short-circuits if its target is already at or past
             // `target`, and applies its own per-fetch backoff on failures.
-            let target = BlockHeight(expected.last_verified_height.0 + DEFAULT_PROBE_LOOKAHEAD);
+            let target =
+                BlockHeight::new(expected.last_verified_height.inner() + DEFAULT_PROBE_LOOKAHEAD);
 
             info!(
                 source_shard = shard.0,
-                target = target.0,
+                target = target.inner(),
                 age_ms = u64::try_from(now.elapsed_since(baseline).as_millis()).unwrap_or(u64::MAX),
                 "Remote header liveness timeout — raising sync target"
             );
@@ -413,11 +414,12 @@ impl RemoteHeaderCoordinator {
                 continue;
             }
 
-            let target = BlockHeight(expected.last_verified_height.0 + DEFAULT_PROBE_LOOKAHEAD);
+            let target =
+                BlockHeight::new(expected.last_verified_height.inner() + DEFAULT_PROBE_LOOKAHEAD);
 
             info!(
                 source_shard = shard.0,
-                target = target.0,
+                target = target.inner(),
                 "Sync catchup — raising remote-header sync target"
             );
 
@@ -524,7 +526,7 @@ impl RemoteHeaderCoordinator {
         let tip = self
             .tips
             .entry(shard)
-            .or_insert((BlockHeight(0), WeightedTimestamp::ZERO));
+            .or_insert((BlockHeight::new(0), WeightedTimestamp::ZERO));
         if height > tip.0 {
             *tip = (height, header_ts);
         }
@@ -607,7 +609,7 @@ mod tests {
         // This test verifies the structural pre-check without needing a real topology.
         let header = BlockHeader {
             shard_group_id: ShardGroupId(2),
-            height: BlockHeight(5),
+            height: BlockHeight::new(5),
             parent_block_hash: BlockHash::ZERO,
             parent_qc: QuorumCertificate::genesis(ShardGroupId(0)),
             proposer: ValidatorId(0),
@@ -627,7 +629,7 @@ mod tests {
         // Deliberately set wrong block_hash
         qc.block_hash = BlockHash::from_raw(Hash::from_bytes(b"wrong"));
         qc.shard_group_id = ShardGroupId(2);
-        qc.height = BlockHeight(5);
+        qc.height = BlockHeight::new(5);
 
         let committed = CommittedBlockHeader::new(header, qc);
         let _coord = RemoteHeaderCoordinator::new();
@@ -643,9 +645,9 @@ mod tests {
         let coord = RemoteHeaderCoordinator::new();
         assert!(
             coord
-                .get_verified(ShardGroupId(1), BlockHeight(5))
+                .get_verified(ShardGroupId(1), BlockHeight::new(5))
                 .is_none()
         );
-        assert!(!coord.has_verified(ShardGroupId(1), BlockHeight(5)));
+        assert!(!coord.has_verified(ShardGroupId(1), BlockHeight::new(5)));
     }
 }

@@ -524,20 +524,20 @@ pub fn meta_write<E: MetadataEntry>(batch: &mut WriteBatch, value: &E::Value) {
 
 // ─── Metadata codecs ─────────────────────────────────────────────────────────
 
-/// `BlockHeight` codec — wraps BE u64, maps through `BlockHeight(u64)`.
+/// `BlockHeight` codec — wraps BE u64, maps through `BlockHeight::new(u64)`.
 #[derive(Default)]
 pub struct BlockHeightCodec;
 
 impl DbEncode<BlockHeight> for BlockHeightCodec {
     fn encode_to(&self, value: &BlockHeight, buf: &mut Vec<u8>) {
-        buf.extend_from_slice(&value.0.to_be_bytes());
+        buf.extend_from_slice(&value.inner().to_be_bytes());
     }
 }
 
 impl DbCodec<BlockHeight> for BlockHeightCodec {
     fn decode(&self, bytes: &[u8]) -> BlockHeight {
         let arr: [u8; 8] = bytes.try_into().unwrap_or([0; 8]);
-        BlockHeight(u64::from_be_bytes(arr))
+        BlockHeight::new(u64::from_be_bytes(arr))
     }
 }
 

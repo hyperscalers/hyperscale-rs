@@ -182,7 +182,7 @@ mod tests {
     fn make_header(height: u8, parent_block_hash: BlockHash) -> BlockHeader {
         BlockHeader {
             shard_group_id: ShardGroupId(0),
-            height: BlockHeight(u64::from(height)),
+            height: BlockHeight::new(u64::from(height)),
             parent_block_hash,
             parent_qc: QuorumCertificate::genesis(ShardGroupId(0)),
             proposer: ValidatorId(0),
@@ -224,7 +224,7 @@ mod tests {
     ) -> R {
         let view = ChainView {
             local_shard: ShardGroupId(0),
-            committed_height: BlockHeight(committed_height),
+            committed_height: BlockHeight::new(committed_height),
             committed_hash,
             committed_state_root,
             latest_qc,
@@ -306,7 +306,7 @@ mod tests {
             |view| {
                 assert!(view.get_block(block_hash).is_none());
                 let h = view.get_header(block_hash).expect("header available");
-                assert_eq!(h.height, BlockHeight(3));
+                assert_eq!(h.height, BlockHeight::new(3));
             },
         );
     }
@@ -406,7 +406,7 @@ mod tests {
         let qc_block = bh(b"qc_block");
         let mut qc = QuorumCertificate::genesis(ShardGroupId(0));
         qc.block_hash = qc_block;
-        qc.height = BlockHeight(5);
+        qc.height = BlockHeight::new(5);
         qc.weighted_timestamp = WeightedTimestamp(1000);
 
         run_view(
@@ -420,7 +420,7 @@ mod tests {
             |view| {
                 let (hash, returned_qc) = view.proposal_parent();
                 assert_eq!(hash, qc_block);
-                assert_eq!(returned_qc.height, BlockHeight(5));
+                assert_eq!(returned_qc.height, BlockHeight::new(5));
             },
         );
     }

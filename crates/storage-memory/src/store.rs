@@ -33,12 +33,12 @@ impl SubstateStore for SimStorage {
         node_id: &NodeId,
         block_height: BlockHeight,
     ) -> Option<Vec<(u8, DbSortKey, Vec<u8>)>> {
-        let current_version = read_or_recover(&self.state).current_block_height.0;
-        if block_height.0 > current_version {
+        let current_version = read_or_recover(&self.state).current_block_height.inner();
+        if block_height.inner() > current_version {
             return None;
         }
         let floor = current_version.saturating_sub(self.jmt_history_length);
-        if block_height.0 < floor {
+        if block_height.inner() < floor {
             // Below retention — historical state no longer recoverable.
             // External API: return None (network-supplied heights may
             // legitimately fall out of range; `snapshot_at` would panic,
@@ -67,10 +67,10 @@ impl VersionedStore for SimStorage {
         // full reasoning. Below the floor we can't serve historical
         // reads; hitting this is a DA-assumption bug in the caller.
         let guard = read_or_recover(&self.state);
-        let current_version = guard.current_block_height.0;
+        let current_version = guard.current_block_height.inner();
         let floor = current_version.saturating_sub(self.jmt_history_length);
         assert!(
-            height.0 >= floor,
+            height.inner() >= floor,
             "snapshot_at({height}) below retention floor {floor} \
              (current_version={current_version}, jmt_history_length={}) — \
              BFT/DA invariant broken; caller must anchor within retention",
@@ -82,7 +82,7 @@ impl VersionedStore for SimStorage {
         SimSnapshot {
             current_state: guard.current_state.clone(),
             state_history: guard.state_history.clone(),
-            version: height.0,
+            version: height.inner(),
             current_version,
         }
     }

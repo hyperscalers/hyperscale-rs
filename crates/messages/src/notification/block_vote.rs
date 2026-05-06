@@ -58,7 +58,7 @@ mod tests {
         let vote = BlockVote {
             block_hash: BlockHash::from_raw(Hash::from_bytes(b"block_hash")),
             shard_group_id: ShardGroupId(0),
-            height: BlockHeight(10),
+            height: BlockHeight::new(10),
             round: Round::INITIAL,
             voter: ValidatorId(2),
             signature: zero_bls_signature(),
@@ -74,7 +74,7 @@ mod tests {
         let vote = BlockVote {
             block_hash: BlockHash::from_raw(Hash::from_bytes(b"test")),
             shard_group_id: ShardGroupId(0),
-            height: BlockHeight(5),
+            height: BlockHeight::new(5),
             round: Round::INITIAL,
             voter: ValidatorId(1),
             signature: zero_bls_signature(),

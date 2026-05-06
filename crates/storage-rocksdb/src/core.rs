@@ -794,8 +794,8 @@ mod test_helpers {
 
             // Version 0 with a non-zero root means genesis has been computed at version 0.
             // Only treat as "no parent" when the JMT is truly empty.
-            let parent_version =
-                tree::jmt_parent_height(BlockHeight(base_version), base_root).map(|h| h.0);
+            let parent_version = tree::jmt_parent_height(BlockHeight::new(base_version), base_root)
+                .map(BlockHeight::inner);
             let new_version = base_version + 1;
 
             let (mut batch, reset_old_keys) = self.build_substate_write_batch(
@@ -815,9 +815,9 @@ mod test_helpers {
             let jmt_snapshot = JmtSnapshot::from_collected_writes(
                 collected,
                 base_root,
-                BlockHeight(base_version),
+                BlockHeight::new(base_version),
                 new_root,
-                BlockHeight(new_version),
+                BlockHeight::new(new_version),
             );
 
             self.append_jmt_to_batch(&mut batch, &jmt_snapshot, new_version);

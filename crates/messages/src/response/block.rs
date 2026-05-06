@@ -359,7 +359,7 @@ mod tests {
         Block::Live {
             header: BlockHeader {
                 shard_group_id: ShardGroupId(0),
-                height: BlockHeight(1),
+                height: BlockHeight::new(1),
                 parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
                 parent_qc: QuorumCertificate::genesis(ShardGroupId(0)),
                 proposer: ValidatorId(0),

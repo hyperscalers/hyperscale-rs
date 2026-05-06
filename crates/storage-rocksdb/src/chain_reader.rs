@@ -65,7 +65,7 @@ impl ChainReader for RocksDbStorage {
         let cfs = self.cf();
         let index_cf = ExecutionCertsByHeightCf::handle(&cfs);
         let certs_cf = ExecutionCertsCf::handle(&cfs);
-        let prefix = block_height.0.to_be_bytes();
+        let prefix = block_height.inner().to_be_bytes();
         prefix_iter::<ExecutionCertsByHeightCf>(&self.db, index_cf, &prefix)
             .filter_map(|((_height, canonical_hash), ())| {
                 get::<ExecutionCertsCf>(&*self.db, certs_cf, &canonical_hash)

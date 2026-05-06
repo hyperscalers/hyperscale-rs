@@ -181,21 +181,21 @@ mod tests {
         let pl = ProvisionPipeline::new(Arc::new(ProvisionStore::new()));
         assert_eq!(pl.pending_len(), 0);
         assert_eq!(pl.verified_len(), 0);
-        assert!(!pl.has_verified((ShardGroupId(1), BlockHeight(1))));
+        assert!(!pl.has_verified((ShardGroupId(1), BlockHeight::new(1))));
     }
 
     #[test]
     fn buffer_and_drain_round_trip() {
         let mut pl = ProvisionPipeline::new(Arc::new(ProvisionStore::new()));
-        let key = (ShardGroupId(1), BlockHeight(10));
+        let key = (ShardGroupId(1), BlockHeight::new(10));
         pl.buffer_pending(
             key,
-            make_provisions(1, ShardGroupId(1), BlockHeight(10)),
+            make_provisions(1, ShardGroupId(1), BlockHeight::new(10)),
             ts(100),
         );
         pl.buffer_pending(
             key,
-            make_provisions(2, ShardGroupId(1), BlockHeight(10)),
+            make_provisions(2, ShardGroupId(1), BlockHeight::new(10)),
             ts(100),
         );
         assert_eq!(pl.pending_len(), 1);
@@ -208,7 +208,7 @@ mod tests {
     fn drain_for_unknown_key_returns_empty() {
         let mut pl = ProvisionPipeline::new(Arc::new(ProvisionStore::new()));
         assert!(
-            pl.drain_pending_for_key((ShardGroupId(1), BlockHeight(10)))
+            pl.drain_pending_for_key((ShardGroupId(1), BlockHeight::new(10)))
                 .is_empty()
         );
     }
@@ -217,10 +217,10 @@ mod tests {
     fn insert_verified_populates_store_and_index() {
         let store = Arc::new(ProvisionStore::new());
         let mut pl = ProvisionPipeline::new(Arc::clone(&store));
-        let provisions = make_provisions(1, ShardGroupId(1), BlockHeight(10));
+        let provisions = make_provisions(1, ShardGroupId(1), BlockHeight::new(10));
         let hash = provisions.hash();
         let arc = pl.insert_verified(Arc::new(provisions), ts(1_000));
-        assert!(pl.has_verified((ShardGroupId(1), BlockHeight(10))));
+        assert!(pl.has_verified((ShardGroupId(1), BlockHeight::new(10))));
         assert!(store.get(&hash).is_some());
         assert_eq!(arc.source_shard, ShardGroupId(1));
     }
@@ -230,15 +230,15 @@ mod tests {
         let store = Arc::new(ProvisionStore::new());
         let mut pl = ProvisionPipeline::new(Arc::clone(&store));
 
-        let key_v = (ShardGroupId(1), BlockHeight(10));
-        let provisions_v = make_provisions(1, ShardGroupId(1), BlockHeight(10));
+        let key_v = (ShardGroupId(1), BlockHeight::new(10));
+        let provisions_v = make_provisions(1, ShardGroupId(1), BlockHeight::new(10));
         let source_ts = ts(1_000);
         let live_after = provisions_v.deadline(source_ts);
         pl.insert_verified(Arc::new(provisions_v), source_ts);
 
         pl.buffer_pending(
-            (ShardGroupId(2), BlockHeight(5)),
-            make_provisions(2, ShardGroupId(2), BlockHeight(5)),
+            (ShardGroupId(2), BlockHeight::new(5)),
+            make_provisions(2, ShardGroupId(2), BlockHeight::new(5)),
             ts(1_000),
         );
 

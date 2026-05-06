@@ -220,7 +220,7 @@ mod tests {
     fn wave(local: u64, h: u64, remote: &[u64]) -> WaveId {
         WaveId {
             shard_group_id: ShardGroupId(local),
-            block_height: BlockHeight(h),
+            block_height: BlockHeight::new(h),
             remote_shards: remote.iter().copied().map(ShardGroupId).collect(),
         }
     }

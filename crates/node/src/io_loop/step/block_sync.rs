@@ -129,7 +129,7 @@ where
         height: BlockHeight,
         reason: &'static str,
     ) {
-        tracing::warn!(height = height.0, reason, "Sync: rejecting response");
+        tracing::warn!(height = height.inner(), reason, "Sync: rejecting response");
         record_sync_block_filtered("block", reason);
         self.feed_block_sync_fetch_failed(height);
     }
@@ -150,7 +150,7 @@ where
                 }
                 SyncOutput::Complete { height, .. } => {
                     tracing::info!(
-                        height = height.0,
+                        height = height.inner(),
                         "Sync protocol complete, resuming consensus"
                     );
                     self.feed_event(ProtocolEvent::BlockSyncComplete { height });
@@ -355,7 +355,7 @@ mod tests {
 
     use super::*;
 
-    const HEIGHT: BlockHeight = BlockHeight(1);
+    const HEIGHT: BlockHeight = BlockHeight::new(1);
 
     fn header() -> BlockHeader {
         BlockHeader {
@@ -466,7 +466,7 @@ mod tests {
         let qc = qc_for(&block);
         let certified = CertifiedBlock::new_unchecked(block, qc);
         assert_eq!(
-            validate_synced_block(BlockHeight(99), &certified).unwrap_err(),
+            validate_synced_block(BlockHeight::new(99), &certified).unwrap_err(),
             "height_mismatch"
         );
     }
@@ -494,7 +494,7 @@ mod tests {
             provisions: Arc::new(vec![]),
         };
         let mut qc = qc_for(&block);
-        qc.height = BlockHeight(99);
+        qc.height = BlockHeight::new(99);
         let certified = CertifiedBlock::new_unchecked(block, qc);
         assert_eq!(
             validate_synced_block(HEIGHT, &certified).unwrap_err(),

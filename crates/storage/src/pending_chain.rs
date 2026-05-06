@@ -748,7 +748,7 @@ mod tests {
             None
         }
         fn committed_height(&self) -> BlockHeight {
-            BlockHeight(0)
+            BlockHeight::new(0)
         }
         fn committed_hash(&self) -> Option<BlockHash> {
             None
@@ -849,12 +849,22 @@ mod tests {
         let h3 = bh(b"h3");
         chain.insert(
             h1,
-            entry_at(BlockHash::ZERO, BlockHeight(1), DatabaseUpdates::default()),
+            entry_at(
+                BlockHash::ZERO,
+                BlockHeight::new(1),
+                DatabaseUpdates::default(),
+            ),
         );
-        chain.insert(h2, entry_at(h1, BlockHeight(2), DatabaseUpdates::default()));
-        chain.insert(h3, entry_at(h2, BlockHeight(3), DatabaseUpdates::default()));
+        chain.insert(
+            h2,
+            entry_at(h1, BlockHeight::new(2), DatabaseUpdates::default()),
+        );
+        chain.insert(
+            h3,
+            entry_at(h2, BlockHeight::new(3), DatabaseUpdates::default()),
+        );
 
-        chain.prune(BlockHeight(2));
+        chain.prune(BlockHeight::new(2));
         assert_eq!(read_or_recover(&chain.entries).len(), 1);
         assert!(read_or_recover(&chain.entries).contains_key(&h3));
     }
@@ -874,7 +884,7 @@ mod tests {
             h1,
             entry_at(
                 BlockHash::ZERO,
-                BlockHeight(1),
+                BlockHeight::new(1),
                 make_delta(b"node", 0, vec![1], vec![10]),
             ),
         );
@@ -882,7 +892,7 @@ mod tests {
             h2,
             entry_at(
                 h1,
-                BlockHeight(2),
+                BlockHeight::new(2),
                 make_delta(b"node", 0, vec![2], vec![20]),
             ),
         );
@@ -914,7 +924,7 @@ mod tests {
             h1,
             entry_at(
                 BlockHash::ZERO,
-                BlockHeight(1),
+                BlockHeight::new(1),
                 make_delta(b"node", 0, vec![1], vec![10]),
             ),
         );
@@ -923,7 +933,7 @@ mod tests {
             orphan,
             entry_at(
                 BlockHash::ZERO,
-                BlockHeight(1),
+                BlockHeight::new(1),
                 make_delta(b"node", 0, vec![1], vec![99]),
             ),
         );

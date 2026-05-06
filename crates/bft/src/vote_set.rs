@@ -477,26 +477,26 @@ mod tests {
     #[test]
     fn test_buffer_unverified_votes() {
         let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
-        let header = make_header(BlockHeight(1));
+        let header = make_header(BlockHeight::new(1));
         let block_hash = header.hash();
         let mut vote_set = VoteSet::new(Some(&header), 4);
 
         // Buffer first vote
-        let vote0 = make_vote(&keys, 0, block_hash, BlockHeight(1));
+        let vote0 = make_vote(&keys, 0, block_hash, BlockHeight::new(1));
         let pk0 = keys[0].public_key();
         assert!(vote_set.buffer_unverified_vote(0, vote0, pk0, VotePower(1)));
         assert_eq!(vote_set.unverified_power(), VotePower(1));
         assert_eq!(vote_set.verified_power(), VotePower::ZERO);
 
         // Buffer duplicate (should fail)
-        let vote0_dup = make_vote(&keys, 0, block_hash, BlockHeight(1));
+        let vote0_dup = make_vote(&keys, 0, block_hash, BlockHeight::new(1));
         let pk0_dup = keys[0].public_key();
         assert!(!vote_set.buffer_unverified_vote(0, vote0_dup, pk0_dup, VotePower(1)));
         assert_eq!(vote_set.unverified_power(), VotePower(1));
 
         // Buffer more votes
-        let vote1 = make_vote(&keys, 1, block_hash, BlockHeight(1));
-        let vote2 = make_vote(&keys, 2, block_hash, BlockHeight(1));
+        let vote1 = make_vote(&keys, 1, block_hash, BlockHeight::new(1));
+        let vote2 = make_vote(&keys, 2, block_hash, BlockHeight::new(1));
         assert!(vote_set.buffer_unverified_vote(1, vote1, keys[1].public_key(), VotePower(1)));
         assert!(vote_set.buffer_unverified_vote(2, vote2, keys[2].public_key(), VotePower(1)));
         assert_eq!(vote_set.unverified_power(), VotePower(3));
@@ -505,24 +505,24 @@ mod tests {
     #[test]
     fn test_should_trigger_verification() {
         let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
-        let header = make_header(BlockHeight(1));
+        let header = make_header(BlockHeight::new(1));
         let block_hash = header.hash();
         let mut vote_set = VoteSet::new(Some(&header), 4);
 
         let total_power = VotePower(4);
 
         // Not enough votes yet
-        let vote0 = make_vote(&keys, 0, block_hash, BlockHeight(1));
+        let vote0 = make_vote(&keys, 0, block_hash, BlockHeight::new(1));
         vote_set.buffer_unverified_vote(0, vote0, keys[0].public_key(), VotePower(1));
         assert!(!vote_set.should_trigger_verification(total_power));
 
         // Still not enough
-        let vote1 = make_vote(&keys, 1, block_hash, BlockHeight(1));
+        let vote1 = make_vote(&keys, 1, block_hash, BlockHeight::new(1));
         vote_set.buffer_unverified_vote(1, vote1, keys[1].public_key(), VotePower(1));
         assert!(!vote_set.should_trigger_verification(total_power));
 
         // Now we have quorum potential (3/4 > 2/3)
-        let vote2 = make_vote(&keys, 2, block_hash, BlockHeight(1));
+        let vote2 = make_vote(&keys, 2, block_hash, BlockHeight::new(1));
         vote_set.buffer_unverified_vote(2, vote2, keys[2].public_key(), VotePower(1));
         assert!(vote_set.should_trigger_verification(total_power));
     }
@@ -530,13 +530,13 @@ mod tests {
     #[test]
     fn test_add_verified_votes() {
         let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
-        let header = make_header(BlockHeight(1));
+        let header = make_header(BlockHeight::new(1));
         let block_hash = header.hash();
         let mut vote_set = VoteSet::new(Some(&header), 4);
 
         // Add verified votes directly (e.g., own votes)
         for i in 0..3 {
-            let vote = make_vote(&keys, i, block_hash, BlockHeight(1));
+            let vote = make_vote(&keys, i, block_hash, BlockHeight::new(1));
             assert!(vote_set.add_verified_vote(i, vote, VotePower(1)));
         }
 
@@ -545,7 +545,7 @@ mod tests {
         // Build QC
         let qc = vote_set.build_qc(block_hash, test_shard_group()).unwrap();
         assert_eq!(qc.block_hash, block_hash);
-        assert_eq!(qc.height.0, 1);
+        assert_eq!(qc.height.inner(), 1);
         assert_eq!(qc.signers.count(), 3);
 
         // Can't build again

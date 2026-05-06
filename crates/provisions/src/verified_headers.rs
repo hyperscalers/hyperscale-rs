@@ -99,14 +99,14 @@ mod tests {
     fn empty_buffer_has_no_entries() {
         let buf = VerifiedHeaderBuffer::new();
         assert_eq!(buf.len(), 0);
-        assert!(buf.get((ShardGroupId(1), BlockHeight(0))).is_none());
+        assert!(buf.get((ShardGroupId(1), BlockHeight::new(0))).is_none());
     }
 
     #[test]
     fn insert_and_get_round_trip() {
         let mut buf = VerifiedHeaderBuffer::new();
-        let key = (ShardGroupId(1), BlockHeight(10));
-        let header = make_header(ShardGroupId(1), BlockHeight(10));
+        let key = (ShardGroupId(1), BlockHeight::new(10));
+        let header = make_header(ShardGroupId(1), BlockHeight::new(10));
         buf.insert(key, Arc::clone(&header));
         assert_eq!(buf.len(), 1);
         let stored = buf.get(key).expect("present");
@@ -116,17 +116,17 @@ mod tests {
     #[test]
     fn insert_overwrites_existing_key() {
         let mut buf = VerifiedHeaderBuffer::new();
-        let key = (ShardGroupId(1), BlockHeight(10));
-        buf.insert(key, make_header(ShardGroupId(1), BlockHeight(10)));
-        buf.insert(key, make_header(ShardGroupId(1), BlockHeight(10)));
+        let key = (ShardGroupId(1), BlockHeight::new(10));
+        buf.insert(key, make_header(ShardGroupId(1), BlockHeight::new(10)));
+        buf.insert(key, make_header(ShardGroupId(1), BlockHeight::new(10)));
         assert_eq!(buf.len(), 1);
     }
 
     #[test]
     fn remove_returns_stored_header_and_drops_entry() {
         let mut buf = VerifiedHeaderBuffer::new();
-        let key = (ShardGroupId(1), BlockHeight(10));
-        buf.insert(key, make_header(ShardGroupId(1), BlockHeight(10)));
+        let key = (ShardGroupId(1), BlockHeight::new(10));
+        buf.insert(key, make_header(ShardGroupId(1), BlockHeight::new(10)));
         assert!(buf.remove(key).is_some());
         assert_eq!(buf.len(), 0);
         assert!(buf.remove(key).is_none());

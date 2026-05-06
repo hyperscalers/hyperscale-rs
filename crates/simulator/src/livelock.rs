@@ -394,7 +394,7 @@ mod tests {
     fn test_status_name() {
         assert_eq!(status_name(&TransactionStatus::Pending), "pending");
         assert_eq!(
-            status_name(&TransactionStatus::Committed(BlockHeight(1))),
+            status_name(&TransactionStatus::Committed(BlockHeight::new(1))),
             "committed(1)"
         );
         assert_eq!(

@@ -95,7 +95,7 @@ mod tests {
 
     fn make_qc(height: u64) -> QuorumCertificate {
         let mut qc = QuorumCertificate::genesis(ShardGroupId(0));
-        qc.height = BlockHeight(height);
+        qc.height = BlockHeight::new(height);
         qc
     }
 
@@ -107,11 +107,12 @@ mod tests {
     fn take_out_of_order_removes_and_returns_entry() {
         let mut pipeline = CommitPipeline::new();
         let hash = bh(b"h5");
-        pipeline
-            .out_of_order
-            .insert(BlockHeight(5), (hash, make_qc(5), CommitSource::Aggregator));
+        pipeline.out_of_order.insert(
+            BlockHeight::new(5),
+            (hash, make_qc(5), CommitSource::Aggregator),
+        );
 
-        let taken = pipeline.take_out_of_order(BlockHeight(5));
+        let taken = pipeline.take_out_of_order(BlockHeight::new(5));
         assert!(taken.is_some());
         assert_eq!(taken.unwrap().0, hash);
         assert_eq!(pipeline.out_of_order_len(), 0);
@@ -121,13 +122,14 @@ mod tests {
     fn take_awaiting_data_removes_and_returns_entry() {
         let mut pipeline = CommitPipeline::new();
         let hash = bh(b"h5");
-        pipeline
-            .awaiting_data
-            .insert(hash, (BlockHeight(5), make_qc(5), CommitSource::Aggregator));
+        pipeline.awaiting_data.insert(
+            hash,
+            (BlockHeight::new(5), make_qc(5), CommitSource::Aggregator),
+        );
 
         let taken = pipeline.take_awaiting_data(&hash);
         assert!(taken.is_some());
-        assert_eq!(taken.unwrap().0, BlockHeight(5));
+        assert_eq!(taken.unwrap().0, BlockHeight::new(5));
         assert_eq!(pipeline.awaiting_data_len(), 0);
     }
 
@@ -138,26 +140,31 @@ mod tests {
         let h5 = bh(b"h5");
         let h6 = bh(b"h6");
 
-        pipeline
-            .out_of_order
-            .insert(BlockHeight(4), (h4, make_qc(4), CommitSource::Aggregator));
-        pipeline
-            .out_of_order
-            .insert(BlockHeight(5), (h5, make_qc(5), CommitSource::Aggregator));
-        pipeline
-            .out_of_order
-            .insert(BlockHeight(6), (h6, make_qc(6), CommitSource::Aggregator));
-        pipeline
-            .awaiting_data
-            .insert(h5, (BlockHeight(5), make_qc(5), CommitSource::Aggregator));
-        pipeline
-            .awaiting_data
-            .insert(h6, (BlockHeight(6), make_qc(6), CommitSource::Aggregator));
+        pipeline.out_of_order.insert(
+            BlockHeight::new(4),
+            (h4, make_qc(4), CommitSource::Aggregator),
+        );
+        pipeline.out_of_order.insert(
+            BlockHeight::new(5),
+            (h5, make_qc(5), CommitSource::Aggregator),
+        );
+        pipeline.out_of_order.insert(
+            BlockHeight::new(6),
+            (h6, make_qc(6), CommitSource::Aggregator),
+        );
+        pipeline.awaiting_data.insert(
+            h5,
+            (BlockHeight::new(5), make_qc(5), CommitSource::Aggregator),
+        );
+        pipeline.awaiting_data.insert(
+            h6,
+            (BlockHeight::new(6), make_qc(6), CommitSource::Aggregator),
+        );
 
-        pipeline.cleanup_committed(BlockHeight(5));
+        pipeline.cleanup_committed(BlockHeight::new(5));
 
         assert_eq!(pipeline.out_of_order_len(), 1);
-        assert!(pipeline.out_of_order.contains_key(&BlockHeight(6)));
+        assert!(pipeline.out_of_order.contains_key(&BlockHeight::new(6)));
         assert_eq!(pipeline.awaiting_data_len(), 1);
         assert!(pipeline.awaiting_data.contains_key(&h6));
     }
@@ -172,7 +179,7 @@ mod properties {
 
     fn make_qc(height: u64) -> QuorumCertificate {
         let mut qc = QuorumCertificate::genesis(ShardGroupId(0));
-        qc.height = BlockHeight(height);
+        qc.height = BlockHeight::new(height);
         qc
     }
 
@@ -197,27 +204,27 @@ mod properties {
                 for &h in heights {
                     let hash = hash_for(h);
                     p.out_of_order.insert(
-                        BlockHeight(h),
+                        BlockHeight::new(h),
                         (hash, make_qc(h), CommitSource::Aggregator),
                     );
                     p.awaiting_data.insert(
                         hash,
-                        (BlockHeight(h), make_qc(h), CommitSource::Aggregator),
+                        (BlockHeight::new(h), make_qc(h), CommitSource::Aggregator),
                     );
                 }
                 p
             };
 
             let mut a = seed(&heights);
-            a.cleanup_committed(BlockHeight(h1));
-            a.cleanup_committed(BlockHeight(h2));
+            a.cleanup_committed(BlockHeight::new(h1));
+            a.cleanup_committed(BlockHeight::new(h2));
 
             let mut b = seed(&heights);
-            b.cleanup_committed(BlockHeight(h2));
-            b.cleanup_committed(BlockHeight(h1));
+            b.cleanup_committed(BlockHeight::new(h2));
+            b.cleanup_committed(BlockHeight::new(h1));
 
             let mut c = seed(&heights);
-            c.cleanup_committed(BlockHeight(h1.max(h2)));
+            c.cleanup_committed(BlockHeight::new(h1.max(h2)));
 
             prop_assert_eq!(a.out_of_order_len(), b.out_of_order_len());
             prop_assert_eq!(a.out_of_order_len(), c.out_of_order_len());
@@ -236,22 +243,22 @@ mod properties {
             for &h in &heights {
                 let hash = hash_for(h);
                 p.out_of_order.insert(
-                    BlockHeight(h),
+                    BlockHeight::new(h),
                     (hash, make_qc(h), CommitSource::Aggregator),
                 );
                 p.awaiting_data.insert(
                     hash,
-                    (BlockHeight(h), make_qc(h), CommitSource::Aggregator),
+                    (BlockHeight::new(h), make_qc(h), CommitSource::Aggregator),
                 );
             }
 
-            p.cleanup_committed(BlockHeight(cutoff));
+            p.cleanup_committed(BlockHeight::new(cutoff));
 
             for height in p.out_of_order.keys() {
-                prop_assert!(height.0 > cutoff);
+                prop_assert!(height.inner() > cutoff);
             }
             for (height, _, _) in p.awaiting_data.values() {
-                prop_assert!(height.0 > cutoff);
+                prop_assert!(height.inner() > cutoff);
             }
         }
 
@@ -266,21 +273,21 @@ mod properties {
             let hash = hash_for(tag);
 
             p.out_of_order.insert(
-                BlockHeight(height),
+                BlockHeight::new(height),
                 (hash, make_qc(height), CommitSource::Aggregator),
             );
-            let taken = p.take_out_of_order(BlockHeight(height));
+            let taken = p.take_out_of_order(BlockHeight::new(height));
             prop_assert!(taken.is_some());
             prop_assert_eq!(taken.unwrap().0, hash);
-            prop_assert!(!p.out_of_order.contains_key(&BlockHeight(height)));
+            prop_assert!(!p.out_of_order.contains_key(&BlockHeight::new(height)));
 
             p.awaiting_data.insert(
                 hash,
-                (BlockHeight(height), make_qc(height), CommitSource::Aggregator),
+                (BlockHeight::new(height), make_qc(height), CommitSource::Aggregator),
             );
             let taken = p.take_awaiting_data(&hash);
             prop_assert!(taken.is_some());
-            prop_assert_eq!(taken.unwrap().0, BlockHeight(height));
+            prop_assert_eq!(taken.unwrap().0, BlockHeight::new(height));
             prop_assert!(!p.awaiting_data.contains_key(&hash));
         }
     }

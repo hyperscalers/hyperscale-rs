@@ -141,13 +141,15 @@ impl Display for WaveId {
             write!(
                 f,
                 "Wave(shard={}, h={}, ∅)",
-                self.shard_group_id.0, self.block_height.0
+                self.shard_group_id.0,
+                self.block_height.inner()
             )
         } else {
             write!(
                 f,
                 "Wave(shard={}, h={}, {{",
-                self.shard_group_id.0, self.block_height.0
+                self.shard_group_id.0,
+                self.block_height.inner()
             )?;
             for (i, shard) in self.remote_shards.iter().enumerate() {
                 if i > 0 {
@@ -172,7 +174,7 @@ mod tests {
     fn sample_wave_id() -> WaveId {
         WaveId {
             shard_group_id: ShardGroupId(3),
-            block_height: BlockHeight(42),
+            block_height: BlockHeight::new(42),
             remote_shards: [ShardGroupId(1), ShardGroupId(7)].into_iter().collect(),
         }
     }
@@ -189,7 +191,7 @@ mod tests {
     fn sbor_roundtrip_empty_remote_shards() {
         let wave = WaveId {
             shard_group_id: ShardGroupId(0),
-            block_height: BlockHeight(1),
+            block_height: BlockHeight::new(1),
             remote_shards: BTreeSet::new(),
         };
         let bytes = basic_encode(&wave).unwrap();
@@ -208,7 +210,7 @@ mod tests {
         enc.write_value_kind(ValueKind::Tuple).unwrap();
         enc.write_size(3).unwrap();
         enc.encode(&ShardGroupId(0)).unwrap();
-        enc.encode(&BlockHeight(0)).unwrap();
+        enc.encode(&BlockHeight::new(0)).unwrap();
         enc.write_value_kind(ValueKind::Array).unwrap();
         enc.write_value_kind(ShardGroupId::value_kind()).unwrap();
         enc.write_size(MAX_REMOTE_SHARDS_PER_WAVE + 1).unwrap();
@@ -233,7 +235,7 @@ mod tests {
         enc.write_value_kind(ValueKind::Tuple).unwrap();
         enc.write_size(3).unwrap();
         enc.encode(&ShardGroupId(0)).unwrap();
-        enc.encode(&BlockHeight(0)).unwrap();
+        enc.encode(&BlockHeight::new(0)).unwrap();
         enc.write_value_kind(ValueKind::Array).unwrap();
         enc.write_value_kind(ShardGroupId::value_kind()).unwrap();
         enc.write_size(2).unwrap();

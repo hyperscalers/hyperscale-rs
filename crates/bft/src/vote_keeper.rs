@@ -177,8 +177,8 @@ impl VoteKeeper {
 
         if height <= committed_height {
             trace!(
-                vote_anchor_ts = height.0,
-                committed_height = committed_height.0,
+                vote_anchor_ts = height.inner(),
+                committed_height = committed_height.inner(),
                 voter = ?vote.voter,
                 "Skipping vote for already-committed height"
             );
@@ -276,7 +276,7 @@ impl VoteKeeper {
 
         info!(
             block_hash = ?block_hash,
-            height = height.0,
+            height = height.inner(),
             votes_to_verify = votes_to_verify.len(),
             already_verified = verified_votes.len(),
             "Triggering batch vote verification (quorum possible)"
@@ -315,7 +315,7 @@ impl VoteKeeper {
             } => {
                 warn!(
                     voter = ?vote.voter,
-                    height = vote.height.0,
+                    height = vote.height.inner(),
                     round = vote.round.0,
                     existing_block = ?existing_block,
                     new_block = ?block_hash,
@@ -468,33 +468,33 @@ mod tests {
     fn keeper_cleanup_committed_drops_entries_at_and_below_height() {
         let mut vk = VoteKeeper::new();
         vk.voted_heights.insert(
-            BlockHeight(1),
+            BlockHeight::new(1),
             (BlockHash::from_raw(Hash::from_bytes(b"b1")), Round(0)),
         );
         vk.voted_heights.insert(
-            BlockHeight(2),
+            BlockHeight::new(2),
             (BlockHash::from_raw(Hash::from_bytes(b"b2")), Round(0)),
         );
         vk.voted_heights.insert(
-            BlockHeight(3),
+            BlockHeight::new(3),
             (BlockHash::from_raw(Hash::from_bytes(b"b3")), Round(0)),
         );
         vk.received_votes_by_height.insert(
-            (BlockHeight(2), ValidatorId(7)),
+            (BlockHeight::new(2), ValidatorId(7)),
             (BlockHash::from_raw(Hash::from_bytes(b"b2")), Round(0)),
         );
 
-        vk.cleanup_committed(BlockHeight(2));
+        vk.cleanup_committed(BlockHeight::new(2));
 
         assert_eq!(vk.voted_heights_len(), 1);
-        assert!(vk.voted_heights.contains_key(&BlockHeight(3)));
+        assert!(vk.voted_heights.contains_key(&BlockHeight::new(3)));
         assert_eq!(vk.received_votes_len(), 0);
     }
 
     #[test]
     fn keeper_clear_for_height_keeps_current_or_later_round_vote_sets() {
         let header_at = |round: Round| {
-            let mut h = make_header(BlockHeight(5));
+            let mut h = make_header(BlockHeight::new(5));
             h.round = round;
             h
         };
@@ -509,10 +509,12 @@ mod tests {
             .insert(hdr_r1.hash(), VoteSet::new(Some(&hdr_r1), 4));
         vk.vote_sets
             .insert(hdr_r2.hash(), VoteSet::new(Some(&hdr_r2), 4));
-        vk.received_votes_by_height
-            .insert((BlockHeight(5), ValidatorId(1)), (hdr_r0.hash(), Round(0)));
+        vk.received_votes_by_height.insert(
+            (BlockHeight::new(5), ValidatorId(1)),
+            (hdr_r0.hash(), Round(0)),
+        );
 
-        let cleared = vk.clear_for_height(BlockHeight(5), Round(1));
+        let cleared = vk.clear_for_height(BlockHeight::new(5), Round(1));
 
         // Received-vote records for the height are always cleared.
         assert_eq!(cleared, 1);
@@ -531,7 +533,7 @@ mod tests {
     #[test]
     fn record_received_vote_accepts_first_vote() {
         let mut vk = VoteKeeper::new();
-        let h = BlockHeight(5);
+        let h = BlockHeight::new(5);
         let v = ValidatorId(2);
         let block = BlockHash::from_raw(Hash::from_bytes(b"block_a"));
 
@@ -545,7 +547,7 @@ mod tests {
     #[test]
     fn record_received_vote_flags_equivocation_at_same_height_round() {
         let mut vk = VoteKeeper::new();
-        let h = BlockHeight(5);
+        let h = BlockHeight::new(5);
         let v = ValidatorId(2);
         let block_a = BlockHash::from_raw(Hash::from_bytes(b"block_a"));
         let block_b = BlockHash::from_raw(Hash::from_bytes(b"block_b"));
@@ -571,7 +573,7 @@ mod tests {
     #[test]
     fn record_received_vote_allows_revote_at_later_round() {
         let mut vk = VoteKeeper::new();
-        let h = BlockHeight(5);
+        let h = BlockHeight::new(5);
         let v = ValidatorId(2);
         let block_a = BlockHash::from_raw(Hash::from_bytes(b"block_a"));
         let block_b = BlockHash::from_raw(Hash::from_bytes(b"block_b"));
@@ -597,12 +599,12 @@ mod tests {
         let block_b = BlockHash::from_raw(Hash::from_bytes(b"block_b"));
 
         assert_eq!(
-            vk.record_received_vote(BlockHeight(5), v, block_a, round),
+            vk.record_received_vote(BlockHeight::new(5), v, block_a, round),
             RecordResult::Accepted
         );
         // Different block at DIFFERENT height: independent, accepted.
         assert_eq!(
-            vk.record_received_vote(BlockHeight(6), v, block_b, round),
+            vk.record_received_vote(BlockHeight::new(6), v, block_b, round),
             RecordResult::Accepted
         );
         assert_eq!(vk.received_votes_len(), 2);
@@ -611,7 +613,7 @@ mod tests {
     #[test]
     fn record_received_vote_is_idempotent_on_duplicate() {
         let mut vk = VoteKeeper::new();
-        let h = BlockHeight(5);
+        let h = BlockHeight::new(5);
         let v = ValidatorId(2);
         let block = BlockHash::from_raw(Hash::from_bytes(b"block_a"));
 
@@ -625,7 +627,7 @@ mod tests {
     #[test]
     fn record_received_vote_drops_stale_lower_round() {
         let mut vk = VoteKeeper::new();
-        let h = BlockHeight(5);
+        let h = BlockHeight::new(5);
         let v = ValidatorId(2);
         let block_a = BlockHash::from_raw(Hash::from_bytes(b"block_a"));
         let block_b = BlockHash::from_raw(Hash::from_bytes(b"block_b"));
@@ -650,7 +652,10 @@ mod tests {
     fn lock_decision_is_unlocked_without_prior_vote() {
         let vk = VoteKeeper::new();
         assert_eq!(
-            vk.lock_decision(BlockHeight(1), BlockHash::from_raw(Hash::from_bytes(b"b"))),
+            vk.lock_decision(
+                BlockHeight::new(1),
+                BlockHash::from_raw(Hash::from_bytes(b"b"))
+            ),
             LockDecision::Unlocked
         );
     }
@@ -658,7 +663,7 @@ mod tests {
     #[test]
     fn lock_decision_reports_same_block_after_own_vote() {
         let mut vk = VoteKeeper::new();
-        let h = BlockHeight(1);
+        let h = BlockHeight::new(1);
         let block = BlockHash::from_raw(Hash::from_bytes(b"b"));
         vk.record_own_vote(h, block, Round(0));
 
@@ -673,7 +678,7 @@ mod tests {
     #[test]
     fn lock_decision_reports_locked_to_other_for_conflicting_block() {
         let mut vk = VoteKeeper::new();
-        let h = BlockHeight(1);
+        let h = BlockHeight::new(1);
         let block_a = BlockHash::from_raw(Hash::from_bytes(b"block_a"));
         let block_b = BlockHash::from_raw(Hash::from_bytes(b"block_b"));
         vk.record_own_vote(h, block_a, Round(0));
@@ -693,7 +698,7 @@ mod tests {
     #[test]
     fn unlock_at_releases_lock_and_reports_prior_presence() {
         let mut vk = VoteKeeper::new();
-        let h = BlockHeight(1);
+        let h = BlockHeight::new(1);
         vk.record_own_vote(h, BlockHash::from_raw(Hash::from_bytes(b"b")), Round(0));
 
         assert!(vk.unlock_at(h));
@@ -724,7 +729,7 @@ mod properties {
         )
             .prop_map(|(h, v, block_variant, r)| {
                 let block = BlockHash::from_raw(Hash::from_bytes(&[block_variant; 32]));
-                (BlockHeight(h), ValidatorId(v), block, Round(r))
+                (BlockHeight::new(h), ValidatorId(v), block, Round(r))
             })
     }
 
@@ -804,7 +809,7 @@ mod properties {
             round in 0u64..=10,
         ) {
             let mut vk = VoteKeeper::new();
-            let h = BlockHeight(height);
+            let h = BlockHeight::new(height);
             let block = BlockHash::from_raw(Hash::from_bytes(&[block_variant; 32]));
 
             vk.record_own_vote(h, block, Round(round));

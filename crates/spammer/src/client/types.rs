@@ -107,7 +107,7 @@ impl TransactionStatusResponse {
 
         match self.status.as_str() {
             "pending" => Some(TransactionStatus::Pending),
-            "committed" => Some(TransactionStatus::Committed(BlockHeight(
+            "committed" => Some(TransactionStatus::Committed(BlockHeight::new(
                 self.committed_height.unwrap_or(0),
             ))),
             "completed" => Some(TransactionStatus::Completed(decision()?)),

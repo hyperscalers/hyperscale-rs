@@ -202,7 +202,7 @@ mod tests {
     #[test]
     fn advance_increments_view_and_metric_and_clears_header_reset() {
         let mut vc = ViewChangeController::new();
-        vc.last_header_reset = Some((BlockHeight(5), Round(0)));
+        vc.last_header_reset = Some((BlockHeight::new(5), Round(0)));
 
         let new_round = vc.advance();
 
@@ -233,15 +233,15 @@ mod tests {
         let t1 = LocalTimestamp::from_millis(1_000);
         let t2 = LocalTimestamp::from_millis(2_000);
 
-        vc.record_header_activity(BlockHeight(5), Round(0), t1);
+        vc.record_header_activity(BlockHeight::new(5), Round(0), t1);
         assert_eq!(vc.last_leader_activity, Some(t1));
 
         // Same (height, round): must not reset again.
-        vc.record_header_activity(BlockHeight(5), Round(0), t2);
+        vc.record_header_activity(BlockHeight::new(5), Round(0), t2);
         assert_eq!(vc.last_leader_activity, Some(t1));
 
         // Different round at same height: resets.
-        vc.record_header_activity(BlockHeight(5), Round(1), t2);
+        vc.record_header_activity(BlockHeight::new(5), Round(1), t2);
         assert_eq!(vc.last_leader_activity, Some(t2));
     }
 

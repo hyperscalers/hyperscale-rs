@@ -141,7 +141,7 @@ impl BlockHeader {
     ) -> Self {
         Self {
             shard_group_id,
-            height: BlockHeight(0),
+            height: BlockHeight::new(0),
             parent_block_hash: BlockHash::from_raw(Hash::from_bytes(&[0u8; 32])),
             parent_qc: QuorumCertificate::genesis(shard_group_id),
             proposer,
@@ -186,12 +186,12 @@ impl BlockHeader {
     /// Check if this is the genesis block header.
     #[must_use]
     pub const fn is_genesis(&self) -> bool {
-        self.height.0 == 0
+        self.height.inner() == 0
     }
 
     /// Get the expected proposer for this height (round-robin).
     #[must_use]
     pub const fn expected_proposer(&self, num_validators: u64) -> ValidatorId {
-        ValidatorId((self.height.0 + self.round.0) % num_validators)
+        ValidatorId((self.height.inner() + self.round.0) % num_validators)
     }
 }

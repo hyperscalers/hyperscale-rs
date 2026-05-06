@@ -194,7 +194,7 @@ impl BlockSyncManager {
     pub fn buffer_block(&mut self, height: BlockHeight, certified: CertifiedBlock) -> bool {
         if !self.has_capacity_at(height) {
             warn!(
-                height = height.0,
+                height = height.inner(),
                 cap = MAX_BUFFERED_PER_HEIGHT,
                 "Synced-block buffer at per-height cap — dropping arrival"
             );
@@ -202,7 +202,7 @@ impl BlockSyncManager {
         }
         let block_hash = certified.block.hash();
         debug!(
-            height = height.0,
+            height = height.inner(),
             ?block_hash,
             "Buffering future synced block for later"
         );
@@ -251,8 +251,8 @@ impl BlockSyncManager {
 
         if height <= committed_height {
             info!(
-                height = height.0,
-                committed = committed_height.0,
+                height = height.inner(),
+                committed = committed_height.inner(),
                 "Synced block already committed - filtering"
             );
             return IngestOutcome::Drop;
@@ -262,11 +262,13 @@ impl BlockSyncManager {
         // capping each slot, a Byzantine peer can spread arrivals across
         // arbitrary future heights and bloat the BTreeMap. Bound the
         // accepted future window to `committed_height + horizon`.
-        let max_future_height = committed_height.0.saturating_add(MAX_BUFFER_FUTURE_HORIZON);
-        if height.0 > max_future_height {
+        let max_future_height = committed_height
+            .inner()
+            .saturating_add(MAX_BUFFER_FUTURE_HORIZON);
+        if height.inner() > max_future_height {
             warn!(
-                height = height.0,
-                committed = committed_height.0,
+                height = height.inner(),
+                committed = committed_height.inner(),
                 horizon = MAX_BUFFER_FUTURE_HORIZON,
                 "Synced block beyond buffer horizon — dropping"
             );
@@ -275,7 +277,7 @@ impl BlockSyncManager {
 
         if self.has_pending_verification(&block_hash) {
             info!(
-                height = height.0,
+                height = height.inner(),
                 "Synced block already pending verification - filtering"
             );
             return IngestOutcome::Drop;
@@ -283,7 +285,7 @@ impl BlockSyncManager {
 
         if self.has_buffered(height, &block_hash) {
             info!(
-                height = height.0,
+                height = height.inner(),
                 ?block_hash,
                 "Synced block already buffered - filtering"
             );
@@ -303,9 +305,9 @@ impl BlockSyncManager {
         }
 
         warn!(
-            height = height.0,
-            next_needed = next_needed.0,
-            committed = committed_height.0,
+            height = height.inner(),
+            next_needed = next_needed.inner(),
+            committed = committed_height.inner(),
             "Unexpected synced block height - already have or past this"
         );
         IngestOutcome::Drop
@@ -335,13 +337,13 @@ impl BlockSyncManager {
             .contains_key(&block_hash)
         {
             warn!(
-                height = height.0,
+                height = height.inner(),
                 ?block_hash,
                 "Overwriting existing pending synced block verification — this is unexpected"
             );
         }
         info!(
-            height = height.0,
+            height = height.inner(),
             ?block_hash,
             signers = qc.signers.count(),
             "Submitting synced block for QC verification"
@@ -377,7 +379,7 @@ impl BlockSyncManager {
         if !valid {
             warn!(
                 block_hash = ?block_hash,
-                height = pending.certified.block.height().0,
+                height = pending.certified.block.height().inner(),
                 "Synced block QC signature verification FAILED - rejecting block"
             );
             // Only this block is removed (already done above). Other pending
@@ -389,7 +391,7 @@ impl BlockSyncManager {
 
         info!(
             block_hash = ?block_hash,
-            height = pending.certified.block.height().0,
+            height = pending.certified.block.height().inner(),
             "Synced block QC verified successfully"
         );
 
@@ -460,17 +462,17 @@ impl BlockSyncManager {
             .pending_synced_block_verifications
             .values()
             .filter(|p| p.verified)
-            .map(|p| p.certified.block.height().0)
+            .map(|p| p.certified.block.height().inner())
             .collect();
         let unverified_heights: Vec<_> = self
             .pending_synced_block_verifications
             .values()
             .filter(|p| !p.verified)
-            .map(|p| p.certified.block.height().0)
+            .map(|p| p.certified.block.height().inner())
             .collect();
         info!(
-            committed_height = committed_height.0,
-            next_height = next_height.0,
+            committed_height = committed_height.inner(),
+            next_height = next_height.inner(),
             verified_heights = ?verified_heights,
             unverified_heights = ?unverified_heights,
             "try_apply_verified_synced_blocks: checking"
@@ -505,7 +507,7 @@ impl BlockSyncManager {
             };
             for (block_hash, certified) in entries {
                 debug!(
-                    height = height.0,
+                    height = height.inner(),
                     ?block_hash,
                     "Draining buffered synced block"
                 );
@@ -649,8 +651,8 @@ impl BlockSyncManager {
         if view_changes_since_qc_advance >= SPIN_WITHOUT_QC_ADVANCE_THRESHOLD {
             warn!(
                 validator = ?topology.local_validator_id(),
-                committed_height = committed_height.0,
-                qc_height = qc_height.0,
+                committed_height = committed_height.inner(),
+                qc_height = qc_height.inner(),
                 gap = gap,
                 view_changes_since_qc_advance,
                 "Spinning view changes without QC advance — triggering sync to recover"
@@ -663,9 +665,9 @@ impl BlockSyncManager {
         if gap > 5 {
             warn!(
                 validator = ?topology.local_validator_id(),
-                committed_height = committed_height.0,
-                next_needed_height = next_needed_height.0,
-                qc_height = qc_height.0,
+                committed_height = committed_height.inner(),
+                next_needed_height = next_needed_height.inner(),
+                qc_height = qc_height.inner(),
                 gap = gap,
                 has_next_complete = has_next_block,
                 has_pending_commit = has_pending_commit,
@@ -682,9 +684,9 @@ impl BlockSyncManager {
                 if gap > 10 {
                     warn!(
                         validator = ?topology.local_validator_id(),
-                        committed_height = committed_height.0,
-                        next_needed_height = next_needed_height.0,
-                        qc_height = qc_height.0,
+                        committed_height = committed_height.inner(),
+                        next_needed_height = next_needed_height.inner(),
+                        qc_height = qc_height.inner(),
                         gap = gap,
                         "Have complete block and pending commit but significantly behind - triggering sync to recover"
                     );
@@ -698,9 +700,9 @@ impl BlockSyncManager {
             if gap > 3 {
                 warn!(
                     validator = ?topology.local_validator_id(),
-                    committed_height = committed_height.0,
-                    next_needed_height = next_needed_height.0,
-                    qc_height = qc_height.0,
+                    committed_height = committed_height.inner(),
+                    next_needed_height = next_needed_height.inner(),
+                    qc_height = qc_height.inner(),
                     gap = gap,
                     "Have complete block but no pending commit (missing QC) - triggering sync to recover"
                 );
@@ -713,9 +715,9 @@ impl BlockSyncManager {
 
         info!(
             validator = ?topology.local_validator_id(),
-            committed_height = committed_height.0,
-            next_needed_height = next_needed_height.0,
-            qc_height = qc_height.0,
+            committed_height = committed_height.inner(),
+            next_needed_height = next_needed_height.inner(),
+            qc_height = qc_height.inner(),
             "Sync health check: can't make progress, triggering catch-up sync"
         );
 
@@ -790,45 +792,45 @@ mod tests {
     #[test]
     fn ingest_drops_stale_block_at_or_below_committed() {
         let mut sm = BlockSyncManager::new();
-        let out = sm.ingest(certified(BlockHeight(3), b"s"), BlockHeight(5));
+        let out = sm.ingest(certified(BlockHeight::new(3), b"s"), BlockHeight::new(5));
         assert!(matches!(out, IngestOutcome::Drop));
     }
 
     #[test]
     fn ingest_drops_block_already_pending_verification() {
         let mut sm = BlockSyncManager::new();
-        let cb = certified(BlockHeight(6), b"p");
+        let cb = certified(BlockHeight::new(6), b"p");
         sm.track_pending_verification_for_test(cb.clone());
-        let out = sm.ingest(cb, BlockHeight(5));
+        let out = sm.ingest(cb, BlockHeight::new(5));
         assert!(matches!(out, IngestOutcome::Drop));
     }
 
     #[test]
     fn ingest_drops_block_already_buffered() {
         let mut sm = BlockSyncManager::new();
-        let cb = certified(BlockHeight(7), b"b");
-        sm.buffer_block(BlockHeight(7), cb.clone());
-        let out = sm.ingest(cb, BlockHeight(5));
+        let cb = certified(BlockHeight::new(7), b"b");
+        sm.buffer_block(BlockHeight::new(7), cb.clone());
+        let out = sm.ingest(cb, BlockHeight::new(5));
         assert!(matches!(out, IngestOutcome::Drop));
     }
 
     #[test]
     fn ingest_submits_when_block_is_next_needed_height() {
         let mut sm = BlockSyncManager::new();
-        let cb = certified(BlockHeight(6), b"next");
-        let out = sm.ingest(cb, BlockHeight(5));
+        let cb = certified(BlockHeight::new(6), b"next");
+        let out = sm.ingest(cb, BlockHeight::new(5));
         assert!(matches!(out, IngestOutcome::Submit(_)));
     }
 
     #[test]
     fn ingest_buffers_future_block_and_stores_it() {
         let mut sm = BlockSyncManager::new();
-        let cb = certified(BlockHeight(8), b"future");
+        let cb = certified(BlockHeight::new(8), b"future");
         let block_hash = cb.block.hash();
-        let out = sm.ingest(cb, BlockHeight(5));
+        let out = sm.ingest(cb, BlockHeight::new(5));
         assert!(matches!(out, IngestOutcome::Buffered));
-        assert!(sm.has_buffered(BlockHeight(8), &block_hash));
-        assert!(sm.has_any_buffered_at_height(BlockHeight(8)));
+        assert!(sm.has_buffered(BlockHeight::new(8), &block_hash));
+        assert!(sm.has_any_buffered_at_height(BlockHeight::new(8)));
     }
 
     #[test]
@@ -838,36 +840,36 @@ mod tests {
         // Pre-fix `has_buffered_height(h)` keyed only on height, so the
         // honest block at `h` would have been dropped as duplicate.
         let mut sm = BlockSyncManager::new();
-        let bogus = certified(BlockHeight(8), b"bogus");
-        let honest = certified(BlockHeight(8), b"honest");
+        let bogus = certified(BlockHeight::new(8), b"bogus");
+        let honest = certified(BlockHeight::new(8), b"honest");
         let bogus_hash = bogus.block.hash();
         let honest_hash = honest.block.hash();
         assert!(matches!(
-            sm.ingest(bogus, BlockHeight(5)),
+            sm.ingest(bogus, BlockHeight::new(5)),
             IngestOutcome::Buffered
         ));
         assert!(matches!(
-            sm.ingest(honest, BlockHeight(5)),
+            sm.ingest(honest, BlockHeight::new(5)),
             IngestOutcome::Buffered
         ));
-        assert!(sm.has_buffered(BlockHeight(8), &bogus_hash));
-        assert!(sm.has_buffered(BlockHeight(8), &honest_hash));
+        assert!(sm.has_buffered(BlockHeight::new(8), &bogus_hash));
+        assert!(sm.has_buffered(BlockHeight::new(8), &honest_hash));
     }
 
     #[test]
     fn ingest_drops_when_per_height_cap_saturated() {
         let mut sm = BlockSyncManager::new();
         for i in 0u8..u8::try_from(MAX_BUFFERED_PER_HEIGHT).unwrap() {
-            let cb = certified(BlockHeight(8), &[i; 4]);
+            let cb = certified(BlockHeight::new(8), &[i; 4]);
             assert!(matches!(
-                sm.ingest(cb, BlockHeight(5)),
+                sm.ingest(cb, BlockHeight::new(5)),
                 IngestOutcome::Buffered
             ));
         }
         // Past the cap — drop with `IngestOutcome::Drop`.
-        let overflow = certified(BlockHeight(8), b"overflow");
+        let overflow = certified(BlockHeight::new(8), b"overflow");
         assert!(matches!(
-            sm.ingest(overflow, BlockHeight(5)),
+            sm.ingest(overflow, BlockHeight::new(5)),
             IngestOutcome::Drop
         ));
     }
@@ -875,9 +877,9 @@ mod tests {
     #[test]
     fn ingest_drops_block_beyond_buffer_horizon() {
         let mut sm = BlockSyncManager::new();
-        let committed = BlockHeight(100);
-        let inside = BlockHeight(committed.0 + MAX_BUFFER_FUTURE_HORIZON);
-        let outside = BlockHeight(committed.0 + MAX_BUFFER_FUTURE_HORIZON + 1);
+        let committed = BlockHeight::new(100);
+        let inside = BlockHeight::new(committed.inner() + MAX_BUFFER_FUTURE_HORIZON);
+        let outside = BlockHeight::new(committed.inner() + MAX_BUFFER_FUTURE_HORIZON + 1);
 
         // Edge of the horizon is buffered; one past is dropped. Without the
         // distinct-height cap a Byzantine peer could spread arrivals across
@@ -899,30 +901,33 @@ mod tests {
     #[test]
     fn next_submitable_is_empty_when_pending_saturates_parallelism() {
         let mut sm = BlockSyncManager::new();
-        sm.track_pending_verification_for_test(certified(BlockHeight(6), b"a"));
-        sm.track_pending_verification_for_test(certified(BlockHeight(7), b"b"));
-        let out = sm.next_submitable(BlockHeight(5), 2);
+        sm.track_pending_verification_for_test(certified(BlockHeight::new(6), b"a"));
+        sm.track_pending_verification_for_test(certified(BlockHeight::new(7), b"b"));
+        let out = sm.next_submitable(BlockHeight::new(5), 2);
         assert!(out.is_empty());
     }
 
     #[test]
     fn next_submitable_drains_slots_from_buffer_starting_above_pending() {
         let mut sm = BlockSyncManager::new();
-        sm.track_pending_verification_for_test(certified(BlockHeight(6), b"pending"));
-        sm.buffer_block(BlockHeight(7), certified(BlockHeight(7), b"buf1"));
-        sm.buffer_block(BlockHeight(8), certified(BlockHeight(8), b"buf2"));
-        sm.buffer_block(BlockHeight(9), certified(BlockHeight(9), b"buf3"));
+        sm.track_pending_verification_for_test(certified(BlockHeight::new(6), b"pending"));
+        sm.buffer_block(BlockHeight::new(7), certified(BlockHeight::new(7), b"buf1"));
+        sm.buffer_block(BlockHeight::new(8), certified(BlockHeight::new(8), b"buf2"));
+        sm.buffer_block(BlockHeight::new(9), certified(BlockHeight::new(9), b"buf3"));
 
-        let out = sm.next_submitable(BlockHeight(5), 3);
-        let heights: Vec<_> = out.iter().map(|c| c.block.height().0).collect();
+        let out = sm.next_submitable(BlockHeight::new(5), 3);
+        let heights: Vec<_> = out.iter().map(|c| c.block.height().inner()).collect();
         assert_eq!(heights, vec![7, 8]);
     }
 
     #[test]
     fn next_submitable_skips_non_contiguous_buffered_entries() {
         let mut sm = BlockSyncManager::new();
-        sm.buffer_block(BlockHeight(8), certified(BlockHeight(8), b"later"));
-        let out = sm.next_submitable(BlockHeight(5), 4);
+        sm.buffer_block(
+            BlockHeight::new(8),
+            certified(BlockHeight::new(8), b"later"),
+        );
+        let out = sm.next_submitable(BlockHeight::new(5), 4);
         assert!(
             out.is_empty(),
             "drain requires contiguous sequence from start_height"
@@ -935,7 +940,15 @@ mod tests {
     fn health_check_idle_without_latest_qc() {
         let mut sm = BlockSyncManager::new();
         let commits = CommitPipeline::new();
-        let decision = sm.health_check(&topology(), BlockHeight(0), None, false, &commits, 0, 0);
+        let decision = sm.health_check(
+            &topology(),
+            BlockHeight::new(0),
+            None,
+            false,
+            &commits,
+            0,
+            0,
+        );
         assert!(matches!(decision, BlockSyncHealthDecision::Idle));
     }
 
@@ -943,10 +956,10 @@ mod tests {
     fn health_check_idle_when_already_at_qc_height() {
         let mut sm = BlockSyncManager::new();
         let commits = CommitPipeline::new();
-        let qc = qc_at(BlockHeight(10));
+        let qc = qc_at(BlockHeight::new(10));
         let decision = sm.health_check(
             &topology(),
-            BlockHeight(10),
+            BlockHeight::new(10),
             Some(&qc),
             true,
             &commits,
@@ -961,10 +974,10 @@ mod tests {
         let mut sm = BlockSyncManager::new();
         sm.set_syncing(true);
         let commits = CommitPipeline::new();
-        let qc = qc_at(BlockHeight(10));
+        let qc = qc_at(BlockHeight::new(10));
         let decision = sm.health_check(
             &topology(),
-            BlockHeight(5),
+            BlockHeight::new(5),
             Some(&qc),
             false,
             &commits,
@@ -978,10 +991,10 @@ mod tests {
     fn health_check_triggers_sync_when_next_block_missing() {
         let mut sm = BlockSyncManager::new();
         let commits = CommitPipeline::new();
-        let qc = qc_at(BlockHeight(10));
+        let qc = qc_at(BlockHeight::new(10));
         let decision = sm.health_check(
             &topology(),
-            BlockHeight(5),
+            BlockHeight::new(5),
             Some(&qc),
             false,
             &commits,
@@ -990,7 +1003,7 @@ mod tests {
         );
         match decision {
             BlockSyncHealthDecision::TriggerSync { target_height } => {
-                assert_eq!(target_height, BlockHeight(10));
+                assert_eq!(target_height, BlockHeight::new(10));
             }
             BlockSyncHealthDecision::Idle => {
                 panic!("expected TriggerSync for missing-next-block gap")
@@ -1004,9 +1017,16 @@ mod tests {
         // fires when gap > 3.
         let mut sm = BlockSyncManager::new();
         let commits = CommitPipeline::new();
-        let qc = qc_at(BlockHeight(10));
-        let decision =
-            sm.health_check(&topology(), BlockHeight(5), Some(&qc), true, &commits, 0, 0);
+        let qc = qc_at(BlockHeight::new(10));
+        let decision = sm.health_check(
+            &topology(),
+            BlockHeight::new(5),
+            Some(&qc),
+            true,
+            &commits,
+            0,
+            0,
+        );
         assert!(matches!(
             decision,
             BlockSyncHealthDecision::TriggerSync { .. }
@@ -1017,10 +1037,17 @@ mod tests {
     fn health_check_idle_when_gap_is_small_and_block_present() {
         let mut sm = BlockSyncManager::new();
         let commits = CommitPipeline::new();
-        let qc = qc_at(BlockHeight(7));
+        let qc = qc_at(BlockHeight::new(7));
         // gap = 2, <= 3, view_changes=0 → wait for normal consensus.
-        let decision =
-            sm.health_check(&topology(), BlockHeight(5), Some(&qc), true, &commits, 0, 0);
+        let decision = sm.health_check(
+            &topology(),
+            BlockHeight::new(5),
+            Some(&qc),
+            true,
+            &commits,
+            0,
+            0,
+        );
         assert!(matches!(decision, BlockSyncHealthDecision::Idle));
     }
 
@@ -1032,11 +1059,11 @@ mod tests {
         // post-recovery spin observed in cluster logs.
         let mut sm = BlockSyncManager::new();
         let commits = CommitPipeline::new();
-        let qc = qc_at(BlockHeight(7));
+        let qc = qc_at(BlockHeight::new(7));
         // First call snapshots view_changes=10 against qc=7.
         let _ = sm.health_check(
             &topology(),
-            BlockHeight(5),
+            BlockHeight::new(5),
             Some(&qc),
             true,
             &commits,
@@ -1046,7 +1073,7 @@ mod tests {
         // Second call: same QC, view_changes climbed by 3 → escalate.
         let decision = sm.health_check(
             &topology(),
-            BlockHeight(5),
+            BlockHeight::new(5),
             Some(&qc),
             true,
             &commits,
@@ -1055,7 +1082,7 @@ mod tests {
         );
         match decision {
             BlockSyncHealthDecision::TriggerSync { target_height } => {
-                assert_eq!(target_height, BlockHeight(7));
+                assert_eq!(target_height, BlockHeight::new(7));
             }
             BlockSyncHealthDecision::Idle => panic!("expected spin escalation"),
         }
@@ -1065,10 +1092,10 @@ mod tests {
     fn health_check_idle_when_view_change_spin_below_threshold() {
         let mut sm = BlockSyncManager::new();
         let commits = CommitPipeline::new();
-        let qc = qc_at(BlockHeight(7));
+        let qc = qc_at(BlockHeight::new(7));
         let _ = sm.health_check(
             &topology(),
-            BlockHeight(5),
+            BlockHeight::new(5),
             Some(&qc),
             true,
             &commits,
@@ -1078,7 +1105,7 @@ mod tests {
         // Only +2 view changes since snapshot — still under threshold.
         let decision = sm.health_check(
             &topology(),
-            BlockHeight(5),
+            BlockHeight::new(5),
             Some(&qc),
             true,
             &commits,
@@ -1095,10 +1122,10 @@ mod tests {
         let mut sm = BlockSyncManager::new();
         let commits = CommitPipeline::new();
         for h in 5..15u64 {
-            let qc = qc_at(BlockHeight(h));
+            let qc = qc_at(BlockHeight::new(h));
             let decision = sm.health_check(
                 &topology(),
-                BlockHeight(h - 1),
+                BlockHeight::new(h - 1),
                 Some(&qc),
                 true,
                 &commits,

@@ -96,7 +96,7 @@ fn fresh_get_finalized_wave_returns_none_for_any_id() {
     let coord = fresh_coordinator();
     let wid = WaveId::new(
         ShardGroupId(0),
-        BlockHeight(1),
+        BlockHeight::new(1),
         std::collections::BTreeSet::new(),
     );
     assert!(coord.get_finalized_wave(&wid).is_none());
@@ -151,10 +151,10 @@ fn on_verified_remote_header_registers_expectation_for_wave_targeting_local_shar
     let remote_shard = ShardGroupId(99);
     let wave = WaveId::new(
         remote_shard,
-        BlockHeight(5),
+        BlockHeight::new(5),
         std::iter::once(local_shard).collect(),
     );
-    coord.on_verified_remote_header(&topology, remote_shard, BlockHeight(5), &[wave]);
+    coord.on_verified_remote_header(&topology, remote_shard, BlockHeight::new(5), &[wave]);
 
     assert_eq!(
         coord.memory_stats().expected_exec_certs,
@@ -170,10 +170,10 @@ fn on_verified_remote_header_ignores_waves_not_targeting_local_shard() {
     // expectation should land.
     let wave = WaveId::new(
         ShardGroupId(99),
-        BlockHeight(5),
+        BlockHeight::new(5),
         std::iter::once(ShardGroupId(7)).collect(),
     );
-    coord.on_verified_remote_header(&topology, ShardGroupId(99), BlockHeight(5), &[wave]);
+    coord.on_verified_remote_header(&topology, ShardGroupId(99), BlockHeight::new(5), &[wave]);
 
     assert_eq!(
         coord.memory_stats().expected_exec_certs,

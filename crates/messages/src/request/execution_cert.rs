@@ -47,7 +47,7 @@ mod tests {
         let request = GetExecutionCertsRequest {
             wave_ids: vec![WaveId::new(
                 ShardGroupId(0),
-                BlockHeight(42),
+                BlockHeight::new(42),
                 BTreeSet::from([ShardGroupId(1), ShardGroupId(2)]),
             )],
         };

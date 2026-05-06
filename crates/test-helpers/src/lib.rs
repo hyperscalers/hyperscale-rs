@@ -284,7 +284,7 @@ pub fn make_finalized_wave(
     let wave_id = WaveId::new(ShardGroupId(0), block_height, BTreeSet::new());
     let ec = ExecutionCertificate::new(
         wave_id.clone(),
-        WeightedTimestamp(block_height.0 + 1),
+        WeightedTimestamp(block_height.inner() + 1),
         GlobalReceiptRoot::ZERO,
         vec![TxOutcome { tx_hash, outcome }],
         Bls12381G2Signature([0u8; 96]),

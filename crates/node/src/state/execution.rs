@@ -142,7 +142,7 @@ mod tests {
         let ec = make_ec(
             ShardGroupId(1),
             remote_shards,
-            BlockHeight(1),
+            BlockHeight::new(1),
             vec![TxOutcome {
                 tx_hash: TxHash::ZERO,
                 outcome: ExecutionOutcome::Failed,
@@ -174,7 +174,12 @@ mod tests {
     fn execution_certificate_admitted_skips_continuation_for_same_shard_ec() {
         let TestNode { mut node, .. } = TestNode::new();
 
-        let ec = make_ec(ShardGroupId(0), BTreeSet::new(), BlockHeight(1), vec![]);
+        let ec = make_ec(
+            ShardGroupId(0),
+            BTreeSet::new(),
+            BlockHeight::new(1),
+            vec![],
+        );
 
         let actions = node.handle(ProtocolEvent::ExecutionCertificateAdmitted { certificate: ec });
 
@@ -194,7 +199,7 @@ mod tests {
         // EC at shard 1, dependencies = {2}; local (0) is not in the set.
         let mut remote_shards = BTreeSet::new();
         remote_shards.insert(ShardGroupId(2));
-        let ec = make_ec(ShardGroupId(1), remote_shards, BlockHeight(1), vec![]);
+        let ec = make_ec(ShardGroupId(1), remote_shards, BlockHeight::new(1), vec![]);
 
         let actions = node.handle(ProtocolEvent::ExecutionCertificateAdmitted { certificate: ec });
 

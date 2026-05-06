@@ -574,7 +574,7 @@ impl ProductionRunner {
 
         // Check if we already have committed blocks
         let height = io_loop.storage().committed_height();
-        let has_blocks = height.0 > 0;
+        let has_blocks = height.inner() > 0;
 
         if has_blocks {
             info!("Existing blocks found, skipping genesis initialization");
@@ -951,7 +951,7 @@ fn update_rpc_state(config: &PinnedLoopConfig, snapshot: &NodeStatusSnapshot) {
     if let Some(ref rpc_status) = config.rpc_status {
         let current = rpc_status.load();
         rpc_status.store(Arc::new(NodeStatusState {
-            block_height: snapshot.committed_height.0,
+            block_height: snapshot.committed_height.inner(),
             view: snapshot.view,
             state_root_hash: hex_encode(snapshot.state_root.as_bytes()),
             // Preserve fields set by other writers (runner sets connected_peers)

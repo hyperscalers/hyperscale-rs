@@ -300,7 +300,7 @@ mod tests {
         let provisions = Provisions::new(
             ShardGroupId(1),
             ShardGroupId(2),
-            BlockHeight(100),
+            BlockHeight::new(100),
             MerkleInclusionProof::new(vec![]),
             vec![],
         );
@@ -316,7 +316,7 @@ mod tests {
         let original = Provisions::new(
             ShardGroupId(1),
             ShardGroupId(2),
-            BlockHeight(42),
+            BlockHeight::new(42),
             MerkleInclusionProof::new(vec![1, 2, 3]),
             vec![],
         );
@@ -345,7 +345,7 @@ mod tests {
         let provisions = Provisions::new(
             ShardGroupId(0),
             ShardGroupId(1),
-            BlockHeight(10),
+            BlockHeight::new(10),
             MerkleInclusionProof::dummy(),
             vec![TxEntries {
                 tx_hash: TxHash::from_raw(Hash::from_bytes(b"tx1")),
@@ -362,7 +362,8 @@ mod tests {
     #[test]
     fn test_provisions_all_entries_deduped() {
         let entry = test_entry(1);
-        let mut provisions = Provisions::dummy(ShardGroupId(0), ShardGroupId(1), BlockHeight(10));
+        let mut provisions =
+            Provisions::dummy(ShardGroupId(0), ShardGroupId(1), BlockHeight::new(10));
         provisions.transactions = vec![
             TxEntries {
                 tx_hash: TxHash::from_raw(Hash::from_bytes(b"tx1")),
@@ -400,7 +401,7 @@ mod tests {
             enc.write_size(5).unwrap();
             enc.encode(&ShardGroupId(1)).unwrap();
             enc.encode(&ShardGroupId(2)).unwrap();
-            enc.encode(&BlockHeight(10)).unwrap();
+            enc.encode(&BlockHeight::new(10)).unwrap();
             enc.encode(&MerkleInclusionProof::dummy()).unwrap();
             enc.write_value_kind(ValueKind::Array).unwrap();
             enc.write_value_kind(TxEntries::value_kind()).unwrap();

@@ -684,7 +684,7 @@ impl WaveState {
         tracing::warn!(
             wave = %self.wave_id,
             block_hash = ?self.block_hash,
-            block_height = self.wave_id.block_height.0,
+            block_height = self.wave_id.block_height.inner(),
             wave_start_ts = self.wave_start_ts.as_millis(),
             committed_ts = committed_ts.as_millis(),
             age_ms = u64::try_from(age.as_millis()).unwrap_or(u64::MAX),
@@ -776,7 +776,7 @@ mod tests {
 
     use super::*;
 
-    const WAVE_START: BlockHeight = BlockHeight(10);
+    const WAVE_START: BlockHeight = BlockHeight::new(10);
 
     fn make_tx(seed: u8) -> Arc<RoutableTransaction> {
         Arc::new(test_transaction_with_nodes(
@@ -791,7 +791,7 @@ mod tests {
     const TEST_BLOCK_INTERVAL_MS: u64 = 500;
 
     fn ts_for(height: BlockHeight) -> WeightedTimestamp {
-        WeightedTimestamp(height.0 * TEST_BLOCK_INTERVAL_MS)
+        WeightedTimestamp(height.inner() * TEST_BLOCK_INTERVAL_MS)
     }
 
     fn make_single_shard_wave(n: usize) -> WaveState {
@@ -886,7 +886,7 @@ mod tests {
         );
         Arc::new(ExecutionCertificate::new(
             ec_wave_id,
-            WeightedTimestamp(wave_id.block_height.0 + 1),
+            WeightedTimestamp(wave_id.block_height.inner() + 1),
             GlobalReceiptRoot::from_raw(Hash::from_bytes(b"global_receipt_root")),
             outcomes,
             Bls12381G2Signature([0u8; 96]),
@@ -996,10 +996,10 @@ mod tests {
     fn abort_marks_tx_as_aborted() {
         let mut w = make_single_shard_wave(1);
         let h0 = w.tx_hashes()[0];
-        w.record_abort(h0, ts_for(BlockHeight(20)));
+        w.record_abort(h0, ts_for(BlockHeight::new(20)));
         assert!(w.explicit_aborts.contains(&h0));
         // Idempotent: calling again doesn't clear or duplicate.
-        w.record_abort(h0, ts_for(BlockHeight(15)));
+        w.record_abort(h0, ts_for(BlockHeight::new(15)));
         assert!(w.explicit_aborts.contains(&h0));
         assert_eq!(w.explicit_aborts.len(), 1);
     }
@@ -1143,7 +1143,7 @@ mod tests {
         assert_ne!(local_root, divergent_root);
         let ec_local = Arc::new(ExecutionCertificate::new(
             w.wave_id().clone(),
-            WeightedTimestamp(WAVE_START.0 + 1),
+            WeightedTimestamp(WAVE_START.inner() + 1),
             divergent_root,
             outcomes,
             Bls12381G2Signature([0u8; 96]),
@@ -1168,7 +1168,7 @@ mod tests {
 
         let ec_local = Arc::new(ExecutionCertificate::new(
             w.wave_id().clone(),
-            WeightedTimestamp(WAVE_START.0 + 1),
+            WeightedTimestamp(WAVE_START.inner() + 1),
             local_root,
             outcomes,
             Bls12381G2Signature([0u8; 96]),
@@ -1194,7 +1194,7 @@ mod tests {
         let ec_root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"ec"));
         let ec_local = Arc::new(ExecutionCertificate::new(
             w.wave_id().clone(),
-            WeightedTimestamp(WAVE_START.0 + 1),
+            WeightedTimestamp(WAVE_START.inner() + 1),
             ec_root,
             vec![TxOutcome {
                 tx_hash: h0,
@@ -1324,7 +1324,7 @@ mod tests {
         );
         let ec_remote = Arc::new(ExecutionCertificate::new(
             ec_wave_id,
-            WeightedTimestamp(w.wave_id().block_height.0 + 1),
+            WeightedTimestamp(w.wave_id().block_height.inner() + 1),
             GlobalReceiptRoot::from_raw(Hash::from_bytes(b"gr")),
             std::mem::take(&mut outcomes),
             Bls12381G2Signature([0u8; 96]),

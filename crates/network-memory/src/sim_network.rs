@@ -336,7 +336,7 @@ mod tests {
         // Second handler should have won (overwrites).
         // Encode a real request, call the raw handler, verify it works.
         let handler = adapter.registry.get_request("block.request").unwrap();
-        let req = GetBlockRequest::new(BlockHeight(1), BlockHeight(1));
+        let req = GetBlockRequest::new(BlockHeight::new(1), BlockHeight::new(1));
         let req_bytes = basic_encode(&req).unwrap();
         let response_bytes = handler(&req_bytes);
         assert!(!response_bytes.is_empty());
@@ -353,7 +353,7 @@ mod tests {
         adapter.request(
             peers,
             preferred,
-            GetBlockRequest::new(BlockHeight(42), BlockHeight(42)),
+            GetBlockRequest::new(BlockHeight::new(42), BlockHeight::new(42)),
             None,
             Box::new(|_| ResponseVerdict::Accept),
         );
@@ -367,7 +367,7 @@ mod tests {
 
         // Verify the request bytes decode correctly
         let decoded: GetBlockRequest = basic_decode(&requests[0].request_bytes).unwrap();
-        assert_eq!(decoded.height, BlockHeight(42));
+        assert_eq!(decoded.height, BlockHeight::new(42));
     }
 
     #[test]
@@ -383,7 +383,7 @@ mod tests {
         adapter.request(
             &[ValidatorId(1)],
             None,
-            GetBlockRequest::new(BlockHeight(1), BlockHeight(1)),
+            GetBlockRequest::new(BlockHeight::new(1), BlockHeight::new(1)),
             None,
             Box::new(move |r| {
                 *result_clone.lock().unwrap() = Some(r);
@@ -417,7 +417,7 @@ mod tests {
         adapter.request(
             &[ValidatorId(1)],
             None,
-            GetBlockRequest::new(BlockHeight(1), BlockHeight(1)),
+            GetBlockRequest::new(BlockHeight::new(1), BlockHeight::new(1)),
             None,
             Box::new(move |r| {
                 *result_clone.lock().unwrap() = Some(r);

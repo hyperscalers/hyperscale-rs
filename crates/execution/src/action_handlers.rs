@@ -512,7 +512,7 @@ mod tests {
     fn wave_id(height: u64) -> WaveId {
         WaveId {
             shard_group_id: shard(),
-            block_height: BlockHeight(height),
+            block_height: BlockHeight::new(height),
             remote_shards: BTreeSet::new(),
         }
     }
@@ -520,7 +520,7 @@ mod tests {
     fn cross_shard_wave_id(height: u64, remotes: &[ShardGroupId]) -> WaveId {
         WaveId {
             shard_group_id: shard(),
-            block_height: BlockHeight(height),
+            block_height: BlockHeight::new(height),
             remote_shards: remotes.iter().copied().collect(),
         }
     }
@@ -550,7 +550,7 @@ mod tests {
         let msg = exec_vote_message(anchor, wid, shard(), &global_receipt_root, tx_count);
         ExecutionVote {
             block_hash: BlockHash::ZERO,
-            block_height: BlockHeight(1),
+            block_height: BlockHeight::new(1),
             vote_anchor_ts: anchor,
             wave_id: wid.clone(),
             shard_group_id: shard(),
@@ -925,7 +925,7 @@ mod tests {
                 transaction_hash: tx_hash,
                 target_shard: shard(),
                 source_shard: ShardGroupId(1),
-                block_height: BlockHeight(5),
+                block_height: BlockHeight::new(5),
                 entries: Arc::new(vec![]),
             }],
         );

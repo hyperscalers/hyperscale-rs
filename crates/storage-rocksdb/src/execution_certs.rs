@@ -56,7 +56,7 @@ fn append_ec_to_batch(
     batch_put::<ExecutionCertsByHeightCf>(
         batch,
         index_cf,
-        &(cert.block_height().0, canonical_hash),
+        &(cert.block_height().inner(), canonical_hash),
         &(),
     );
 }

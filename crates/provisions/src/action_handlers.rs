@@ -56,7 +56,7 @@ where
     if per_tx.is_empty() {
         warn!(
             source_shard = source_shard.0,
-            block_height = block_height.0,
+            block_height = block_height.inner(),
             request_count = requests.len(),
             "All fetch_state_entries failed — no provisions to broadcast"
         );
@@ -88,7 +88,7 @@ where
         else {
             warn!(
                 source_shard = source_shard.0,
-                block_height = block_height.0,
+                block_height = block_height.inner(),
                 tx_hash = %req.tx_hash,
                 "expand_nodes_with_owned_at_height: JMT version unavailable"
             );
@@ -97,7 +97,7 @@ where
         let Some(entries) = fetch_state_entries(view, &expanded_nodes, block_height) else {
             warn!(
                 source_shard = source_shard.0,
-                block_height = block_height.0,
+                block_height = block_height.inner(),
                 tx_hash = %req.tx_hash,
                 node_count = expanded_nodes.len(),
                 "fetch_state_entries returned None — JMT version unavailable"
@@ -147,7 +147,7 @@ where
         let Some(proof) = view.generate_merkle_proofs_overlay(&shard_keys, block_height) else {
             warn!(
                 source_shard = source_shard.0,
-                block_height = block_height.0,
+                block_height = block_height.inner(),
                 target_shard = shard.0,
                 key_count = shard_keys.len(),
                 "generate_merkle_proofs returned None — JMT version unavailable"
@@ -192,8 +192,8 @@ where
                     if !valid {
                         warn!(
                             source_shard = provisions.source_shard.0,
-                            block_height = provisions.block_height.0,
-                            header_height = committed_header.header.height.0,
+                            block_height = provisions.block_height.inner(),
+                            header_height = committed_header.header.height.inner(),
                             header_state_root = ?committed_header.header.state_root,
                             entry_count = all_entries.len(),
                             proof_len = provisions.proof.as_bytes().len(),

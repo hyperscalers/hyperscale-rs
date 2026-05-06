@@ -359,7 +359,7 @@ impl<B: SyncBinding> Sync<B> {
     pub fn total_blocks_behind(&self) -> u64 {
         self.scopes
             .values()
-            .map(|s| s.target.0.saturating_sub(s.committed.0))
+            .map(|s| s.target.inner().saturating_sub(s.committed.inner()))
             .sum()
     }
 
@@ -381,9 +381,9 @@ impl<B: SyncBinding> Sync<B> {
         self.scopes
             .get(scope)
             .map(|s| ScopeStatus {
-                target_height: s.target.0,
-                current_height: s.committed.0,
-                blocks_behind: s.target.0.saturating_sub(s.committed.0),
+                target_height: s.target.inner(),
+                current_height: s.committed.inner(),
+                blocks_behind: s.target.inner().saturating_sub(s.committed.inner()),
                 pending_fetches: s.in_flight_ranges,
                 queued_heights: s.heights_queued.len()
                     + s.deferred.len()
@@ -435,8 +435,8 @@ impl<B: SyncBinding> Sync<B> {
         info!(
             binding = B::NAME,
             ?scope,
-            target = target.0,
-            committed = state.committed.0,
+            target = target.inner(),
+            committed = state.committed.inner(),
             "sync: target raised"
         );
 
@@ -463,7 +463,7 @@ impl<B: SyncBinding> Sync<B> {
         let pending_deadline = now + PENDING_ADMISSION_TIMEOUT;
 
         for offset in 0..count {
-            let h = BlockHeight(from.0 + offset);
+            let h = BlockHeight::new(from.inner() + offset);
             state.in_flight.remove(&h);
             if delivered.contains(&h) {
                 if h > state.committed {
@@ -488,10 +488,10 @@ impl<B: SyncBinding> Sync<B> {
         if let Some(max_delivered) = delivered.iter().max().copied()
             && max_delivered > state.target
         {
-            let cap = BlockHeight(
+            let cap = BlockHeight::new(
                 state
                     .committed
-                    .0
+                    .inner()
                     .saturating_add(self.config.window_size)
                     .saturating_add(self.config.max_per_request),
             );
@@ -514,7 +514,7 @@ impl<B: SyncBinding> Sync<B> {
         };
         state.in_flight_ranges = state.in_flight_ranges.saturating_sub(1);
         for offset in 0..count {
-            let h = BlockHeight(from.0 + offset);
+            let h = BlockHeight::new(from.inner() + offset);
             if state.in_flight.remove(&h) && h <= state.target && h > state.committed {
                 state.deferred.entry(h).or_default().advance_round(now);
             }
@@ -563,7 +563,7 @@ impl<B: SyncBinding> Sync<B> {
             info!(
                 binding = B::NAME,
                 ?scope,
-                height = committed.0,
+                height = committed.inner(),
                 "sync: caught up"
             );
             B::on_complete(&mut self.binding_state, scope, committed);
@@ -630,14 +630,14 @@ impl<B: SyncBinding> Sync<B> {
         if state.committed >= state.target {
             return;
         }
-        let first = state.committed.0 + 1;
+        let first = state.committed.inner() + 1;
         let window_end = if config.window_size == 0 {
-            state.target.0
+            state.target.inner()
         } else {
-            (state.committed.0 + config.window_size).min(state.target.0)
+            (state.committed.inner() + config.window_size).min(state.target.inner())
         };
         for h in first..=window_end {
-            state.queue_height(BlockHeight(h));
+            state.queue_height(BlockHeight::new(h));
         }
     }
 
@@ -668,7 +668,7 @@ impl<B: SyncBinding> Sync<B> {
                     let popped = state.pop_next_height().expect("peek matched");
                     state.in_flight.insert(popped);
                     covered.push(popped);
-                    next = BlockHeight(next.0 + 1);
+                    next = BlockHeight::new(next.inner() + 1);
                 }
                 if covered.is_empty() {
                     break;
@@ -678,7 +678,7 @@ impl<B: SyncBinding> Sync<B> {
                 trace!(
                     binding = B::NAME,
                     ?scope_id,
-                    from = range_start.0,
+                    from = range_start.inner(),
                     count,
                     "sync: emitting fetch"
                 );
@@ -734,7 +734,7 @@ mod tests {
         let mut s: Sync<UnitBinding> = Sync::new(cfg_per_id());
         let outputs = s.handle(SyncInput::StartSync {
             scope: (),
-            target: BlockHeight(10),
+            target: BlockHeight::new(10),
         });
         // max_per_request=1 → one Fetch per slot, count=1 each.
         let fetches: Vec<_> = outputs
@@ -753,7 +753,7 @@ mod tests {
         let mut s: Sync<ShardBinding> = Sync::new(cfg_range());
         let outputs = s.handle(SyncInput::StartSync {
             scope: 1,
-            target: BlockHeight(20),
+            target: BlockHeight::new(20),
         });
         // First emission packs heights 1..=8 into one range.
         let first = outputs
@@ -765,7 +765,7 @@ mod tests {
                 SyncOutput::Complete { .. } => None,
             })
             .expect("expected at least one Fetch");
-        assert_eq!(first, (1, BlockHeight(1), 8));
+        assert_eq!(first, (1, BlockHeight::new(1), 8));
     }
 
     #[test]
@@ -773,18 +773,18 @@ mod tests {
         let mut s: Sync<UnitBinding> = Sync::new(cfg_per_id());
         let _ = s.handle(SyncInput::StartSync {
             scope: (),
-            target: BlockHeight(10),
+            target: BlockHeight::new(10),
         });
         // Admit height 3.
         let _ = s.handle(SyncInput::Admitted {
             scope: (),
-            height: BlockHeight(3),
+            height: BlockHeight::new(3),
         });
         let st = s.scopes.get(&()).unwrap();
-        assert_eq!(st.committed, BlockHeight(3));
+        assert_eq!(st.committed, BlockHeight::new(3));
         // Heights at or below 3 are dropped from in_flight / queued / deferred.
-        assert!(st.heights_queued.iter().all(|&h| h > BlockHeight(3)));
-        assert!(st.in_flight.iter().all(|&h| h > BlockHeight(3)));
+        assert!(st.heights_queued.iter().all(|&h| h > BlockHeight::new(3)));
+        assert!(st.in_flight.iter().all(|&h| h > BlockHeight::new(3)));
     }
 
     #[test]
@@ -796,19 +796,19 @@ mod tests {
         });
         let _ = s.handle(SyncInput::StartSync {
             scope: (),
-            target: BlockHeight(2),
+            target: BlockHeight::new(2),
         });
         let _ = s.handle(SyncInput::Admitted {
             scope: (),
-            height: BlockHeight(1),
+            height: BlockHeight::new(1),
         });
         let outputs = s.handle(SyncInput::Admitted {
             scope: (),
-            height: BlockHeight(2),
+            height: BlockHeight::new(2),
         });
         assert!(outputs.iter().any(|o| matches!(
             o,
-            SyncOutput::Complete { height, .. } if height.0 == 2
+            SyncOutput::Complete { height, .. } if height.inner() == 2
         )));
         assert!(!s.is_syncing());
     }
@@ -824,12 +824,12 @@ mod tests {
         });
         let _ = s.handle(SyncInput::StartSync {
             scope: (),
-            target: BlockHeight(1),
+            target: BlockHeight::new(1),
         });
         let now = Instant::now();
         let _ = s.handle(SyncInput::FetchFailed {
             scope: (),
-            from: BlockHeight(1),
+            from: BlockHeight::new(1),
             count: 1,
             now,
         });
@@ -841,7 +841,7 @@ mod tests {
         });
         assert!(!outputs.iter().any(|o| matches!(
             o,
-            SyncOutput::Fetch { from, .. } if from.0 == 1
+            SyncOutput::Fetch { from, .. } if from.inner() == 1
         )));
 
         // Tick past first-round backoff: re-emerges.
@@ -850,7 +850,7 @@ mod tests {
         });
         assert!(outputs.iter().any(|o| matches!(
             o,
-            SyncOutput::Fetch { from, .. } if from.0 == 1
+            SyncOutput::Fetch { from, .. } if from.inner() == 1
         )));
     }
 
@@ -859,14 +859,14 @@ mod tests {
         let mut s: Sync<ShardBinding> = Sync::new(cfg_range());
         let _ = s.handle(SyncInput::StartSync {
             scope: 1,
-            target: BlockHeight(20),
+            target: BlockHeight::new(20),
         });
         let now = Instant::now();
         // Asked for 1..=8, responder only had 1..=5.
-        let delivered = (1..=5).map(BlockHeight).collect::<Vec<_>>();
+        let delivered = (1..=5).map(BlockHeight::new).collect::<Vec<_>>();
         let _ = s.handle(SyncInput::FetchSucceeded {
             scope: 1,
-            from: BlockHeight(1),
+            from: BlockHeight::new(1),
             count: 8,
             delivered_heights: delivered,
             now,
@@ -880,17 +880,17 @@ mod tests {
         let mut s: Sync<ShardBinding> = Sync::new(cfg_range());
         let _ = s.handle(SyncInput::StartSync {
             scope: 1,
-            target: BlockHeight(10),
+            target: BlockHeight::new(10),
         });
         let _ = s.handle(SyncInput::StartSync {
             scope: 2,
-            target: BlockHeight(20),
+            target: BlockHeight::new(20),
         });
         // Admit scope 1 fully; scope 2 still has work.
         for h in 1..=10 {
             let _ = s.handle(SyncInput::Admitted {
                 scope: 1,
-                height: BlockHeight(h),
+                height: BlockHeight::new(h),
             });
         }
         assert!(s.is_syncing(), "scope 2 still has gap");
@@ -920,7 +920,7 @@ mod tests {
         let mut s: Sync<ShardBinding> = Sync::new(cfg_range());
         let _ = s.handle(SyncInput::StartSync {
             scope: 1,
-            target: BlockHeight(5),
+            target: BlockHeight::new(5),
         });
         // Responder volunteered higher heights than we asked for? No —
         // but our recorded `target` should bump if a delivered height
@@ -930,13 +930,13 @@ mod tests {
         let now = Instant::now();
         let _ = s.handle(SyncInput::FetchSucceeded {
             scope: 1,
-            from: BlockHeight(1),
+            from: BlockHeight::new(1),
             count: 5,
-            delivered_heights: (1..=7).map(BlockHeight).collect(),
+            delivered_heights: (1..=7).map(BlockHeight::new).collect(),
             now,
         });
         let st = s.scopes.get(&1).unwrap();
-        assert_eq!(st.target, BlockHeight(7));
+        assert_eq!(st.target, BlockHeight::new(7));
     }
 
     #[test]
@@ -948,21 +948,21 @@ mod tests {
         let mut s: Sync<ShardBinding> = Sync::new(cfg_range());
         let _ = s.handle(SyncInput::StartSync {
             scope: 1,
-            target: BlockHeight(5),
+            target: BlockHeight::new(5),
         });
         // cfg_range: window_size=32, max_per_request=8. Cap from committed=0
         // is 40. Responder claims a height of 100.
         let _ = s.handle(SyncInput::FetchSucceeded {
             scope: 1,
-            from: BlockHeight(1),
+            from: BlockHeight::new(1),
             count: 5,
-            delivered_heights: vec![BlockHeight(100)],
+            delivered_heights: vec![BlockHeight::new(100)],
             now: Instant::now(),
         });
         let st = s.scopes.get(&1).unwrap();
         assert_eq!(
             st.target,
-            BlockHeight(40),
+            BlockHeight::new(40),
             "implicit advance should clamp at committed + window + max_per_request"
         );
     }
@@ -976,7 +976,7 @@ mod tests {
         for h in 1..=5 {
             let outputs = s.handle(SyncInput::Admitted {
                 scope: (),
-                height: BlockHeight(h),
+                height: BlockHeight::new(h),
             });
             // Pre-sync admissions must not emit Complete (no sync was active).
             assert!(
@@ -989,12 +989,12 @@ mod tests {
         // Now request sync to height 8. Should only fetch heights 6, 7, 8.
         let outputs = s.handle(SyncInput::StartSync {
             scope: (),
-            target: BlockHeight(8),
+            target: BlockHeight::new(8),
         });
         let fetched_heights: Vec<u64> = outputs
             .iter()
             .filter_map(|o| match o {
-                SyncOutput::Fetch { from, .. } => Some(from.0),
+                SyncOutput::Fetch { from, .. } => Some(from.inner()),
                 SyncOutput::Complete { .. } => None,
             })
             .collect();
@@ -1012,15 +1012,15 @@ mod tests {
         });
         let _ = s.handle(SyncInput::StartSync {
             scope: (),
-            target: BlockHeight(2),
+            target: BlockHeight::new(2),
         });
         let _ = s.handle(SyncInput::Admitted {
             scope: (),
-            height: BlockHeight(1),
+            height: BlockHeight::new(1),
         });
         let outputs = s.handle(SyncInput::Admitted {
             scope: (),
-            height: BlockHeight(2),
+            height: BlockHeight::new(2),
         });
         // First catch-up: Complete fires.
         assert_eq!(
@@ -1034,7 +1034,7 @@ mod tests {
         for h in 3..=10 {
             let outputs = s.handle(SyncInput::Admitted {
                 scope: (),
-                height: BlockHeight(h),
+                height: BlockHeight::new(h),
             });
             assert!(
                 !outputs
@@ -1060,14 +1060,14 @@ mod tests {
         });
         let _ = s.handle(SyncInput::StartSync {
             scope: 1,
-            target: BlockHeight(20),
+            target: BlockHeight::new(20),
         });
         let now = Instant::now();
         let outputs = s.handle(SyncInput::FetchSucceeded {
             scope: 1,
-            from: BlockHeight(1),
+            from: BlockHeight::new(1),
             count: 8,
-            delivered_heights: (1..=8).map(BlockHeight).collect(),
+            delivered_heights: (1..=8).map(BlockHeight::new).collect(),
             now,
         });
         let new_fetches: Vec<(BlockHeight, u64)> = outputs
@@ -1078,7 +1078,9 @@ mod tests {
             })
             .collect();
         assert!(
-            !new_fetches.iter().any(|(from, _)| *from == BlockHeight(1)),
+            !new_fetches
+                .iter()
+                .any(|(from, _)| *from == BlockHeight::new(1)),
             "should not re-dispatch a fetch starting at height 1 — we just got 1..=8 \
              back from the network. Got: {new_fetches:?}"
         );
@@ -1098,15 +1100,15 @@ mod tests {
         });
         let _ = s.handle(SyncInput::StartSync {
             scope: 1,
-            target: BlockHeight(8),
+            target: BlockHeight::new(8),
         });
         // Drain the initial fetches so we observe Tick's emission below.
         let now = Instant::now();
         let _ = s.handle(SyncInput::FetchSucceeded {
             scope: 1,
-            from: BlockHeight(1),
+            from: BlockHeight::new(1),
             count: 8,
-            delivered_heights: (1..=8).map(BlockHeight).collect(),
+            delivered_heights: (1..=8).map(BlockHeight::new).collect(),
             now,
         });
         // Tick before timeout: still pending, no re-fetch.
@@ -1131,7 +1133,7 @@ mod tests {
         assert!(
             outputs
                 .iter()
-                .any(|o| matches!(o, SyncOutput::Fetch { from, .. } if from.0 == 1)),
+                .any(|o| matches!(o, SyncOutput::Fetch { from, .. } if from.inner() == 1)),
             "expected immediate re-fetch starting at the lowest re-queued height"
         );
     }
@@ -1150,20 +1152,20 @@ mod tests {
         // and leaves 3..=5 in the heap.
         let _ = s.handle(SyncInput::StartSync {
             scope: (),
-            target: BlockHeight(5),
+            target: BlockHeight::new(5),
         });
         // Failing height 1 frees a slot. The freed slot should immediately
         // pull height 3 off the heap rather than waiting for Tick.
         let outputs = s.handle(SyncInput::FetchFailed {
             scope: (),
-            from: BlockHeight(1),
+            from: BlockHeight::new(1),
             count: 1,
             now: Instant::now(),
         });
         assert!(
             outputs
                 .iter()
-                .any(|o| matches!(o, SyncOutput::Fetch { from, .. } if from.0 == 3)),
+                .any(|o| matches!(o, SyncOutput::Fetch { from, .. } if from.inner() == 3)),
             "expected immediate emission for height 3 on slot release"
         );
     }
@@ -1177,25 +1179,29 @@ mod tests {
         });
         let _ = s.handle(SyncInput::StartSync {
             scope: 1,
-            target: BlockHeight(8),
+            target: BlockHeight::new(8),
         });
         let now = Instant::now();
         let _ = s.handle(SyncInput::FetchSucceeded {
             scope: 1,
-            from: BlockHeight(1),
+            from: BlockHeight::new(1),
             count: 8,
-            delivered_heights: (1..=8).map(BlockHeight).collect(),
+            delivered_heights: (1..=8).map(BlockHeight::new).collect(),
             now,
         });
         // Admit half the range; pending entries ≤ committed should drop.
         for h in 1..=4 {
             let _ = s.handle(SyncInput::Admitted {
                 scope: 1,
-                height: BlockHeight(h),
+                height: BlockHeight::new(h),
             });
         }
         let st = s.scopes.get(&1).unwrap();
-        assert!(st.pending_admission.keys().all(|&h| h > BlockHeight(4)));
+        assert!(
+            st.pending_admission
+                .keys()
+                .all(|&h| h > BlockHeight::new(4))
+        );
         assert_eq!(st.pending_admission.len(), 4);
     }
 
@@ -1217,7 +1223,7 @@ mod tests {
         // 5..=10).
         let _ = s.handle(SyncInput::StartSync {
             scope: (),
-            target: BlockHeight(10),
+            target: BlockHeight::new(10),
         });
 
         // Consensus admits past the entire queued window. This prunes
@@ -1225,7 +1231,7 @@ mod tests {
         for h in 1..=10 {
             let _ = s.handle(SyncInput::Admitted {
                 scope: (),
-                height: BlockHeight(h),
+                height: BlockHeight::new(h),
             });
         }
 
@@ -1234,9 +1240,9 @@ mod tests {
         // heap full of stale tops, exercising the self-pruning peek.
         let _ = s.handle(SyncInput::FetchSucceeded {
             scope: (),
-            from: BlockHeight(1),
+            from: BlockHeight::new(1),
             count: 1,
-            delivered_heights: vec![BlockHeight(1)],
+            delivered_heights: vec![BlockHeight::new(1)],
             now: Instant::now(),
         });
     }

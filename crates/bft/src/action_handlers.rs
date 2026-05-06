@@ -423,8 +423,8 @@ pub fn verify_state_root<S: ChainWriter + SubstateStore>(
             ?expected_root,
             ?computed_root,
             ?parent_state_root,
-            block_height = block_height.0,
-            parent_block_height = parent_block_height.0,
+            block_height = block_height.inner(),
+            parent_block_height = parent_block_height.inner(),
             "State root verification FAILED"
         );
     }
@@ -974,7 +974,14 @@ mod tests {
     fn verify_vote_batch_empty_input_returns_already_verified_unchanged() {
         let keys = keypairs(2);
         let block_hash = BlockHash::from_raw(Hash::from_bytes(b"block"));
-        let v = make_vote(&keys, 0, block_hash, BlockHeight(1), Round::INITIAL, 1000);
+        let v = make_vote(
+            &keys,
+            0,
+            block_hash,
+            BlockHeight::new(1),
+            Round::INITIAL,
+            1000,
+        );
         let already = vec![(0usize, v, VotePower(1))];
         let out = verify_vote_batch(block_hash, b"msg", Vec::new(), already.clone());
         assert_eq!(out.len(), already.len());
@@ -984,7 +991,7 @@ mod tests {
     fn verify_vote_batch_accepts_all_valid_signatures() {
         let keys = keypairs(3);
         let block_hash = BlockHash::from_raw(Hash::from_bytes(b"b1"));
-        let height = BlockHeight(1);
+        let height = BlockHeight::new(1);
         let round = Round::INITIAL;
         let msg = block_vote_message(shard(), height, round, &block_hash);
 
@@ -1003,7 +1010,7 @@ mod tests {
     fn verify_vote_batch_falls_back_when_one_signature_bad() {
         let keys = keypairs(3);
         let block_hash = BlockHash::from_raw(Hash::from_bytes(b"b1"));
-        let height = BlockHeight(1);
+        let height = BlockHeight::new(1);
         let round = Round::INITIAL;
         let msg = block_vote_message(shard(), height, round, &block_hash);
 
@@ -1041,7 +1048,14 @@ mod tests {
         let wrong_msg = b"unrelated";
         let to_verify: Vec<_> = (0..2)
             .map(|i| {
-                let vote = make_vote(&keys, i, block_hash, BlockHeight(1), Round::INITIAL, 1000);
+                let vote = make_vote(
+                    &keys,
+                    i,
+                    block_hash,
+                    BlockHeight::new(1),
+                    Round::INITIAL,
+                    1000,
+                );
                 (i, vote, keys[i].public_key(), VotePower(1))
             })
             .collect();
@@ -1055,7 +1069,7 @@ mod tests {
     fn build_qc_from_verified_produces_round_trippable_qc() {
         let keys = keypairs(3);
         let block_hash = BlockHash::from_raw(Hash::from_bytes(b"block"));
-        let height = BlockHeight(5);
+        let height = BlockHeight::new(5);
         let round = Round::INITIAL;
         let parent = BlockHash::from_raw(Hash::from_bytes(b"parent"));
 
@@ -1092,7 +1106,14 @@ mod tests {
         let verified: Vec<_> = [2, 0, 3]
             .into_iter()
             .map(|i: usize| {
-                let vote = make_vote(&keys, i, block_hash, BlockHeight(1), Round::INITIAL, 1000);
+                let vote = make_vote(
+                    &keys,
+                    i,
+                    block_hash,
+                    BlockHeight::new(1),
+                    Round::INITIAL,
+                    1000,
+                );
                 (i, vote, VotePower(1))
             })
             .collect();
@@ -1100,7 +1121,7 @@ mod tests {
         let qc = build_qc_from_verified(
             block_hash,
             shard(),
-            BlockHeight(1),
+            BlockHeight::new(1),
             Round::INITIAL,
             BlockHash::ZERO,
             WeightedTimestamp::ZERO,
@@ -1120,17 +1141,38 @@ mod tests {
         let verified = vec![
             (
                 0,
-                make_vote(&keys, 0, block_hash, BlockHeight(1), Round::INITIAL, 1000),
+                make_vote(
+                    &keys,
+                    0,
+                    block_hash,
+                    BlockHeight::new(1),
+                    Round::INITIAL,
+                    1000,
+                ),
                 VotePower(1),
             ),
             (
                 1,
-                make_vote(&keys, 1, block_hash, BlockHeight(1), Round::INITIAL, 2000),
+                make_vote(
+                    &keys,
+                    1,
+                    block_hash,
+                    BlockHeight::new(1),
+                    Round::INITIAL,
+                    2000,
+                ),
                 VotePower(2),
             ),
             (
                 2,
-                make_vote(&keys, 2, block_hash, BlockHeight(1), Round::INITIAL, 3000),
+                make_vote(
+                    &keys,
+                    2,
+                    block_hash,
+                    BlockHeight::new(1),
+                    Round::INITIAL,
+                    3000,
+                ),
                 VotePower(3),
             ),
         ];
@@ -1138,7 +1180,7 @@ mod tests {
         let qc = build_qc_from_verified(
             block_hash,
             shard(),
-            BlockHeight(1),
+            BlockHeight::new(1),
             Round::INITIAL,
             BlockHash::ZERO,
             WeightedTimestamp::ZERO,
@@ -1160,17 +1202,38 @@ mod tests {
         let verified = vec![
             (
                 0,
-                make_vote(&keys, 0, block_hash, BlockHeight(1), Round::INITIAL, 500),
+                make_vote(
+                    &keys,
+                    0,
+                    block_hash,
+                    BlockHeight::new(1),
+                    Round::INITIAL,
+                    500,
+                ),
                 VotePower(1),
             ),
             (
                 1,
-                make_vote(&keys, 1, block_hash, BlockHeight(1), Round::INITIAL, 800),
+                make_vote(
+                    &keys,
+                    1,
+                    block_hash,
+                    BlockHeight::new(1),
+                    Round::INITIAL,
+                    800,
+                ),
                 VotePower(1),
             ),
             (
                 2,
-                make_vote(&keys, 2, block_hash, BlockHeight(1), Round::INITIAL, 3000),
+                make_vote(
+                    &keys,
+                    2,
+                    block_hash,
+                    BlockHeight::new(1),
+                    Round::INITIAL,
+                    3000,
+                ),
                 VotePower(1),
             ),
         ];
@@ -1179,7 +1242,7 @@ mod tests {
         let qc = build_qc_from_verified(
             block_hash,
             shard(),
-            BlockHeight(1),
+            BlockHeight::new(1),
             Round::INITIAL,
             BlockHash::ZERO,
             parent_floor,
@@ -1199,7 +1262,7 @@ mod tests {
         // Use total_voting_power=10 to force failure (3 < 2/3*10 = 6.67).
         let keys = keypairs(3);
         let block_hash = BlockHash::from_raw(Hash::from_bytes(b"b"));
-        let height = BlockHeight(1);
+        let height = BlockHeight::new(1);
         let round = Round::INITIAL;
         let to_verify: Vec<_> = (0..3)
             .map(|i| {
@@ -1228,7 +1291,7 @@ mod tests {
     fn verify_and_build_qc_builds_qc_when_quorum_reached() {
         let keys = keypairs(4);
         let block_hash = BlockHash::from_raw(Hash::from_bytes(b"b"));
-        let height = BlockHeight(1);
+        let height = BlockHeight::new(1);
         let round = Round::INITIAL;
         let to_verify: Vec<_> = (0..3)
             .map(|i| {
@@ -1262,14 +1325,21 @@ mod tests {
         let block_hash = BlockHash::from_raw(Hash::from_bytes(b"b"));
         let verified: Vec<_> = (0..3)
             .map(|i| {
-                let vote = make_vote(&keys, i, block_hash, BlockHeight(1), Round::INITIAL, 1000);
+                let vote = make_vote(
+                    &keys,
+                    i,
+                    block_hash,
+                    BlockHeight::new(1),
+                    Round::INITIAL,
+                    1000,
+                );
                 (i, vote, VotePower(1))
             })
             .collect();
         let mut qc = build_qc_from_verified(
             block_hash,
             shard(),
-            BlockHeight(1),
+            BlockHeight::new(1),
             Round::INITIAL,
             BlockHash::ZERO,
             WeightedTimestamp::ZERO,
@@ -1288,14 +1358,21 @@ mod tests {
         let block_hash = BlockHash::from_raw(Hash::from_bytes(b"b"));
         let verified: Vec<_> = (0..3)
             .map(|i| {
-                let vote = make_vote(&keys, i, block_hash, BlockHeight(1), Round::INITIAL, 1000);
+                let vote = make_vote(
+                    &keys,
+                    i,
+                    block_hash,
+                    BlockHeight::new(1),
+                    Round::INITIAL,
+                    1000,
+                );
                 (i, vote, VotePower(1))
             })
             .collect();
         let qc = build_qc_from_verified(
             block_hash,
             shard(),
-            BlockHeight(1),
+            BlockHeight::new(1),
             Round::INITIAL,
             BlockHash::ZERO,
             WeightedTimestamp::ZERO,

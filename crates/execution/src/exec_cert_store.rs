@@ -106,7 +106,11 @@ mod tests {
     use super::*;
 
     fn cert(block_height: u64) -> Arc<ExecutionCertificate> {
-        let wave_id = WaveId::new(ShardGroupId(0), BlockHeight(block_height), BTreeSet::new());
+        let wave_id = WaveId::new(
+            ShardGroupId(0),
+            BlockHeight::new(block_height),
+            BTreeSet::new(),
+        );
         Arc::new(ExecutionCertificate::new(
             wave_id,
             WeightedTimestamp::ZERO,

@@ -58,7 +58,8 @@ pub fn validate_header(
     if height <= committed_height {
         return Err(format!(
             "height {} is at or below committed height {}",
-            height.0, committed_height.0
+            height.inner(),
+            committed_height.inner()
         ));
     }
 
@@ -75,10 +76,11 @@ pub fn validate_header(
             return Err("parent QC does not have quorum".to_string());
         }
 
-        if header.parent_qc.height.0 + 1 != height.0 {
+        if header.parent_qc.height.inner() + 1 != height.inner() {
             return Err(format!(
                 "parent QC height {} doesn't match block height {} - 1",
-                header.parent_qc.height.0, height.0
+                header.parent_qc.height.inner(),
+                height.inner()
             ));
         }
 
@@ -88,10 +90,10 @@ pub fn validate_header(
                 header.parent_block_hash, header.parent_qc.block_hash
             ));
         }
-    } else if height.0 != committed_height.0 + 1 {
+    } else if height.inner() != committed_height.inner() + 1 {
         return Err(format!(
             "genesis QC only valid for first block after committed height, got height {}",
-            height.0
+            height.inner()
         ));
     }
 
@@ -330,7 +332,7 @@ mod tests {
             height,
             parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
             parent_qc: QuorumCertificate::genesis(ShardGroupId(0)),
-            proposer: ValidatorId(height.0 % 4),
+            proposer: ValidatorId(height.inner() % 4),
             timestamp: ProposerTimestamp(timestamp_ms),
             round: Round(0),
             is_fallback: false,
@@ -375,7 +377,7 @@ mod tests {
     #[test]
     fn validate_waves_accepts_recomputed_waves() {
         let topo = topology();
-        let height = BlockHeight(1);
+        let height = BlockHeight::new(1);
         let expected = compute_waves(&topo, height, &[]);
         let block = block_with_waves(height, expected);
         assert!(validate_waves(&topo, &block).is_ok());
@@ -385,10 +387,10 @@ mod tests {
     fn validate_waves_rejects_tampered_waves() {
         let topo = topology();
         let block = block_with_waves(
-            BlockHeight(1),
+            BlockHeight::new(1),
             vec![WaveId::new(
                 ShardGroupId(99),
-                BlockHeight(1),
+                BlockHeight::new(1),
                 BTreeSet::new(),
             )],
         );
@@ -402,7 +404,7 @@ mod tests {
     #[test]
     fn validate_timestamp_skips_genesis() {
         let now = LocalTimestamp::from_millis(100_000);
-        let mut header = header_at_height(BlockHeight(0), 0);
+        let mut header = header_at_height(BlockHeight::new(0), 0);
         header.parent_block_hash = BlockHash::from_raw(Hash::from_bytes(b"genesis_parent"));
         header.proposer = ValidatorId(0);
         assert!(validate_timestamp(&header, now).is_ok());
@@ -412,7 +414,7 @@ mod tests {
     fn validate_timestamp_accepts_within_bounds() {
         let now = LocalTimestamp::from_millis(100_000);
         for ts_ms in [99_000, 100_000, 101_000] {
-            let header = header_at_height(BlockHeight(1), ts_ms);
+            let header = header_at_height(BlockHeight::new(1), ts_ms);
             assert!(
                 validate_timestamp(&header, now).is_ok(),
                 "ts_ms={ts_ms} should be within bounds"
@@ -423,7 +425,7 @@ mod tests {
     #[test]
     fn validate_timestamp_rejects_too_old() {
         let now = LocalTimestamp::from_millis(100_000);
-        let header = header_at_height(BlockHeight(1), 50_000);
+        let header = header_at_height(BlockHeight::new(1), 50_000);
         let err = validate_timestamp(&header, now).unwrap_err();
         assert!(err.contains("too old"));
     }
@@ -431,7 +433,7 @@ mod tests {
     #[test]
     fn validate_timestamp_rejects_too_far_ahead() {
         let now = LocalTimestamp::from_millis(100_000);
-        let header = header_at_height(BlockHeight(1), 110_000);
+        let header = header_at_height(BlockHeight::new(1), 110_000);
         let err = validate_timestamp(&header, now).unwrap_err();
         assert!(err.contains("too far ahead"));
     }
@@ -441,13 +443,13 @@ mod tests {
         let now = LocalTimestamp::from_millis(100_000);
 
         // Exactly max delay (now - 30s) — OK.
-        assert!(validate_timestamp(&header_at_height(BlockHeight(1), 70_000), now).is_ok());
+        assert!(validate_timestamp(&header_at_height(BlockHeight::new(1), 70_000), now).is_ok());
         // Just past max delay — fail.
-        assert!(validate_timestamp(&header_at_height(BlockHeight(1), 69_999), now).is_err());
+        assert!(validate_timestamp(&header_at_height(BlockHeight::new(1), 69_999), now).is_err());
         // Exactly max rush (now + 2s) — OK.
-        assert!(validate_timestamp(&header_at_height(BlockHeight(1), 102_000), now).is_ok());
+        assert!(validate_timestamp(&header_at_height(BlockHeight::new(1), 102_000), now).is_ok());
         // Just past max rush — fail.
-        assert!(validate_timestamp(&header_at_height(BlockHeight(1), 102_001), now).is_err());
+        assert!(validate_timestamp(&header_at_height(BlockHeight::new(1), 102_001), now).is_err());
     }
 
     #[test]
@@ -456,7 +458,7 @@ mod tests {
 
         // 50s old would normally fail (MAX_TIMESTAMP_DELAY = 30s), but fallback
         // blocks inherit the parent's weighted timestamp across view changes.
-        let mut header = header_at_height(BlockHeight(1), 50_000);
+        let mut header = header_at_height(BlockHeight::new(1), 50_000);
         header.round = Round(5);
         header.is_fallback = true;
         assert!(validate_timestamp(&header, now).is_ok());
@@ -493,19 +495,19 @@ mod tests {
 
     #[test]
     fn validate_transaction_ordering_accepts_empty_block() {
-        let block = block_with_transactions(BlockHeight(5), vec![]);
+        let block = block_with_transactions(BlockHeight::new(5), vec![]);
         assert!(validate_transaction_ordering(&block).is_ok());
     }
 
     #[test]
     fn validate_transaction_ordering_accepts_single_tx() {
-        let block = block_with_transactions(BlockHeight(5), vec![tx(1)]);
+        let block = block_with_transactions(BlockHeight::new(5), vec![tx(1)]);
         assert!(validate_transaction_ordering(&block).is_ok());
     }
 
     #[test]
     fn validate_transaction_ordering_accepts_sorted() {
-        let block = block_with_transactions(BlockHeight(5), sorted_txs(&[10, 20, 30]));
+        let block = block_with_transactions(BlockHeight::new(5), sorted_txs(&[10, 20, 30]));
         assert!(validate_transaction_ordering(&block).is_ok());
     }
 
@@ -513,7 +515,7 @@ mod tests {
     fn validate_transaction_ordering_rejects_reversed() {
         let mut txs = sorted_txs(&[10, 20, 30]);
         txs.reverse();
-        let block = block_with_transactions(BlockHeight(5), txs);
+        let block = block_with_transactions(BlockHeight::new(5), txs);
         let err = validate_transaction_ordering(&block).unwrap_err();
         assert!(err.contains("not in hash order"));
     }
@@ -524,7 +526,7 @@ mod tests {
 
     #[test]
     fn validate_no_duplicate_transactions_accepts_empty_block() {
-        let block = block_with_transactions(BlockHeight(5), vec![]);
+        let block = block_with_transactions(BlockHeight::new(5), vec![]);
         let qc_chain = HashSet::new();
         let dedup_index = CommitDedupIndex::new();
         assert!(validate_no_duplicate_transactions(&block, &qc_chain, &dedup_index).is_ok());
@@ -532,7 +534,7 @@ mod tests {
 
     #[test]
     fn validate_no_duplicate_transactions_accepts_unique() {
-        let block = block_with_transactions(BlockHeight(5), sorted_txs(&[10, 20]));
+        let block = block_with_transactions(BlockHeight::new(5), sorted_txs(&[10, 20]));
         let qc_chain = HashSet::new();
         let dedup_index = CommitDedupIndex::new();
         assert!(validate_no_duplicate_transactions(&block, &qc_chain, &dedup_index).is_ok());
@@ -542,7 +544,7 @@ mod tests {
     fn validate_no_duplicate_transactions_rejects_qc_chain_dup() {
         let txs = sorted_txs(&[10, 20]);
         let dup_hash = txs[0].hash();
-        let block = block_with_transactions(BlockHeight(6), txs);
+        let block = block_with_transactions(BlockHeight::new(6), txs);
         let qc_chain: HashSet<_> = std::iter::once(dup_hash).collect();
         let dedup_index = CommitDedupIndex::new();
         let err = validate_no_duplicate_transactions(&block, &qc_chain, &dedup_index).unwrap_err();
@@ -553,7 +555,7 @@ mod tests {
     fn validate_no_duplicate_transactions_rejects_retention_dup() {
         let txs = sorted_txs(&[10, 20]);
         let dup_tx = Arc::clone(&txs[0]);
-        let block = block_with_transactions(BlockHeight(6), txs);
+        let block = block_with_transactions(BlockHeight::new(6), txs);
         let qc_chain = HashSet::new();
         let mut dedup_index = CommitDedupIndex::new();
         dedup_index.register_committed_txs(&[dup_tx]);
@@ -579,7 +581,7 @@ mod tests {
 
     fn finalized_wave_at(height: u64) -> Arc<FinalizedWave> {
         Arc::new(make_finalized_wave(
-            BlockHeight(height),
+            BlockHeight::new(height),
             TxHash::from_raw(Hash::from_bytes(
                 &[u8::try_from(height).unwrap_or(u8::MAX); 32],
             )),
@@ -589,7 +591,7 @@ mod tests {
 
     #[test]
     fn validate_no_duplicate_certificates_accepts_empty_block() {
-        let block = block_with_certificates(BlockHeight(5), vec![]);
+        let block = block_with_certificates(BlockHeight::new(5), vec![]);
         let qc_chain = HashSet::new();
         let dedup_index = CommitDedupIndex::new();
         assert!(validate_no_duplicate_certificates(&block, &qc_chain, &dedup_index).is_ok());
@@ -597,7 +599,7 @@ mod tests {
 
     #[test]
     fn validate_no_duplicate_certificates_accepts_unique() {
-        let block = block_with_certificates(BlockHeight(5), vec![finalized_wave_at(1)]);
+        let block = block_with_certificates(BlockHeight::new(5), vec![finalized_wave_at(1)]);
         let qc_chain = HashSet::new();
         let dedup_index = CommitDedupIndex::new();
         assert!(validate_no_duplicate_certificates(&block, &qc_chain, &dedup_index).is_ok());
@@ -607,7 +609,7 @@ mod tests {
     fn validate_no_duplicate_certificates_rejects_qc_chain_dup() {
         let fw = finalized_wave_at(1);
         let dup_id = fw.wave_id().clone();
-        let block = block_with_certificates(BlockHeight(6), vec![fw]);
+        let block = block_with_certificates(BlockHeight::new(6), vec![fw]);
         let qc_chain: HashSet<_> = std::iter::once(dup_id).collect();
         let dedup_index = CommitDedupIndex::new();
         let err = validate_no_duplicate_certificates(&block, &qc_chain, &dedup_index).unwrap_err();
@@ -617,7 +619,7 @@ mod tests {
     #[test]
     fn validate_no_duplicate_certificates_rejects_retention_dup() {
         let fw = finalized_wave_at(1);
-        let block = block_with_certificates(BlockHeight(6), vec![Arc::clone(&fw)]);
+        let block = block_with_certificates(BlockHeight::new(6), vec![Arc::clone(&fw)]);
         let qc_chain = HashSet::new();
         let mut dedup_index = CommitDedupIndex::new();
         dedup_index.register_committed_certs(&[fw]);
@@ -643,7 +645,7 @@ mod tests {
         Arc::new(Provisions::new(
             ShardGroupId(0),
             ShardGroupId(1),
-            BlockHeight(u64::from(seed)),
+            BlockHeight::new(u64::from(seed)),
             MerkleInclusionProof::dummy(),
             vec![TxEntries {
                 tx_hash,
@@ -655,7 +657,7 @@ mod tests {
 
     #[test]
     fn validate_no_duplicate_provisions_accepts_empty_block() {
-        let block = block_with_provisions(BlockHeight(5), vec![]);
+        let block = block_with_provisions(BlockHeight::new(5), vec![]);
         let qc_chain = HashSet::new();
         let dedup_index = CommitDedupIndex::new();
         assert!(validate_no_duplicate_provisions(&block, &qc_chain, &dedup_index).is_ok());
@@ -663,7 +665,7 @@ mod tests {
 
     #[test]
     fn validate_no_duplicate_provisions_accepts_unique() {
-        let block = block_with_provisions(BlockHeight(5), vec![provisions_with_seed(1)]);
+        let block = block_with_provisions(BlockHeight::new(5), vec![provisions_with_seed(1)]);
         let qc_chain = HashSet::new();
         let dedup_index = CommitDedupIndex::new();
         assert!(validate_no_duplicate_provisions(&block, &qc_chain, &dedup_index).is_ok());
@@ -673,7 +675,7 @@ mod tests {
     fn validate_no_duplicate_provisions_rejects_qc_chain_dup() {
         let p = provisions_with_seed(1);
         let dup_hash = p.hash();
-        let block = block_with_provisions(BlockHeight(6), vec![p]);
+        let block = block_with_provisions(BlockHeight::new(6), vec![p]);
         let qc_chain: HashSet<_> = std::iter::once(dup_hash).collect();
         let dedup_index = CommitDedupIndex::new();
         let err = validate_no_duplicate_provisions(&block, &qc_chain, &dedup_index).unwrap_err();
@@ -683,7 +685,7 @@ mod tests {
     #[test]
     fn validate_no_duplicate_provisions_rejects_retention_dup() {
         let p = provisions_with_seed(1);
-        let block = block_with_provisions(BlockHeight(6), vec![Arc::clone(&p)]);
+        let block = block_with_provisions(BlockHeight::new(6), vec![Arc::clone(&p)]);
         let qc_chain = HashSet::new();
         let mut dedup_index = CommitDedupIndex::new();
         dedup_index.register_committed_provisions(&[p], WeightedTimestamp(1_000));

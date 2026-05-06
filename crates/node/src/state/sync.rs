@@ -69,10 +69,10 @@ mod tests {
         // wave depends on local.
         let mut remote_shards = BTreeSet::new();
         remote_shards.insert(ShardGroupId(0));
-        let wave = WaveId::new(ShardGroupId(1), BlockHeight(5), remote_shards);
+        let wave = WaveId::new(ShardGroupId(1), BlockHeight::new(5), remote_shards);
         let mut block = make_live_block(
             ShardGroupId(1),
-            BlockHeight(5),
+            BlockHeight::new(5),
             /* timestamp_ms */ 1_000,
             ValidatorId(0),
             vec![],
@@ -90,7 +90,7 @@ mod tests {
         // Now trigger sync-complete. The provisions flush must surface
         // a fetch request for the seeded expected entry.
         let actions = node.handle(ProtocolEvent::BlockSyncComplete {
-            height: BlockHeight(5),
+            height: BlockHeight::new(5),
         });
 
         assert_emits!(
@@ -113,11 +113,11 @@ mod tests {
         let TestNode { mut node, .. } = TestNode::new();
         assert_eq!(
             node.bft().committed_height(),
-            BlockHeight(0),
+            BlockHeight::new(0),
             "fresh node must start at genesis",
         );
 
-        let restored_height = BlockHeight(42);
+        let restored_height = BlockHeight::new(42);
         let _ = node.handle(ProtocolEvent::CommittedStateRestored {
             height: restored_height,
             hash: Some(BlockHash::ZERO),

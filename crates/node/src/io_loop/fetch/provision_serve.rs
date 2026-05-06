@@ -27,7 +27,7 @@ pub fn serve_provision_request(
 ) -> GetProvisionResponse {
     let Some(certified) = storage.get_block(req.block_height) else {
         warn!(
-            block_height = req.block_height.0,
+            block_height = req.block_height.inner(),
             "Provision request: block not found"
         );
         return GetProvisionResponse { provisions: None };
@@ -69,8 +69,8 @@ pub fn serve_provision_request(
 
         let Some(entries) = fetch_state_entries(storage, &owned_nodes, jmt_height) else {
             warn!(
-                block_height = req.block_height.0,
-                jmt_height = jmt_height.0,
+                block_height = req.block_height.inner(),
+                jmt_height = jmt_height.inner(),
                 "Provision request: historical JMT version unavailable"
             );
             return GetProvisionResponse { provisions: None };
@@ -90,7 +90,7 @@ pub fn serve_provision_request(
         p
     } else {
         tracing::warn!(
-            block_height = req.block_height.0,
+            block_height = req.block_height.inner(),
             "Fallback provision: batched proof generation failed (version unavailable)"
         );
         return GetProvisionResponse { provisions: None };

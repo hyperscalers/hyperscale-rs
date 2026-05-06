@@ -37,9 +37,9 @@ impl RocksDbStorage {
     /// transaction/certificate entries.
     pub fn get_blocks_range(&self, from: BlockHeight, to: BlockHeight) -> Vec<CertifiedBlock> {
         let mut result = Vec::new();
-        let mut h = from.0;
-        while h < to.0 {
-            if let Some(certified) = self.get_block_denormalized(BlockHeight(h)) {
+        let mut h = from.inner();
+        while h < to.inner() {
+            if let Some(certified) = self.get_block_denormalized(BlockHeight::new(h)) {
                 result.push(certified);
             }
             h += 1;
@@ -124,7 +124,7 @@ impl RocksDbStorage {
         let certificates_cf = CertificatesCf::handle(&cf);
 
         let metadata = BlockMetadata::from_block(block, qc.clone());
-        batch_put::<BlocksCf>(batch, blocks_cf, &block.height().0, &metadata);
+        batch_put::<BlocksCf>(batch, blocks_cf, &block.height().inner(), &metadata);
         for tx in block.transactions().iter() {
             batch_put_raw::<TransactionsCf>(
                 batch,
@@ -167,7 +167,7 @@ impl RocksDbStorage {
         let consensus_cf = ConsensusReceiptsCf::handle(&cf);
 
         // 1. Get block metadata
-        let metadata: BlockMetadata = get::<BlocksCf>(&*self.db, blocks_cf, &height.0)?;
+        let metadata: BlockMetadata = get::<BlocksCf>(&*self.db, blocks_cf, &height.inner())?;
 
         // 2. Batch-fetch transactions (preserving order)
         let transactions =
@@ -177,7 +177,7 @@ impl RocksDbStorage {
         let total_expected = metadata.manifest.transaction_count();
         if transactions.len() != total_expected {
             tracing::warn!(
-                height = height.0,
+                height = height.inner(),
                 expected = total_expected,
                 found = transactions.len(),
                 "Block has missing transactions - cannot serve sync request"
@@ -192,7 +192,7 @@ impl RocksDbStorage {
         // Verify we got ALL certificates - return None if any are missing
         if certs.len() != metadata.manifest.cert_ids.len() {
             tracing::warn!(
-                height = height.0,
+                height = height.inner(),
                 expected = metadata.manifest.cert_ids.len(),
                 found = certs.len(),
                 "Block has missing certificates - cannot serve sync request"
@@ -212,7 +212,7 @@ impl RocksDbStorage {
             .collect();
         let Some(certificates) = certificates else {
             tracing::warn!(
-                height = height.0,
+                height = height.inner(),
                 "Block has missing receipts for a non-aborted tx - cannot reconstruct FinalizedWave"
             );
             return None;
@@ -236,7 +236,7 @@ impl RocksDbStorage {
             Ok(certified) => Some(certified),
             Err(err) => {
                 tracing::error!(
-                    height = height.0,
+                    height = height.inner(),
                     block_hash = ?err.block_hash,
                     qc_block_hash = ?err.qc_block_hash,
                     "Stored block and QC have mismatched hashes — possible corruption"
@@ -256,7 +256,7 @@ impl RocksDbStorage {
     /// reconstructed (e.g., missing transactions or certificates).
     pub fn get_block_metadata(&self, height: BlockHeight) -> Option<BlockMetadata> {
         let start = Instant::now();
-        let metadata = self.cf_get::<BlocksCf>(&height.0)?;
+        let metadata = self.cf_get::<BlocksCf>(&height.inner())?;
         let elapsed = start.elapsed().as_secs_f64();
         record_storage_read(elapsed);
         record_storage_operation("get_block_metadata", elapsed);
@@ -287,7 +287,7 @@ impl RocksDbStorage {
         let consensus_cf = ConsensusReceiptsCf::handle(&cf);
 
         // 1. Get block metadata
-        let metadata: BlockMetadata = get::<BlocksCf>(&*self.db, blocks_cf, &height.0)?;
+        let metadata: BlockMetadata = get::<BlocksCf>(&*self.db, blocks_cf, &height.inner())?;
 
         // 2. Try to batch-fetch transactions (preserving order)
         let transactions =
@@ -297,7 +297,7 @@ impl RocksDbStorage {
         let total_expected = metadata.manifest.transaction_count();
         if transactions.len() != total_expected {
             tracing::debug!(
-                height = height.0,
+                height = height.inner(),
                 expected = total_expected,
                 found = transactions.len(),
                 "Block has missing transactions - cannot serve sync request"
@@ -314,7 +314,7 @@ impl RocksDbStorage {
         // Check if all certificates are present - if not, return None
         if certs.len() != metadata.manifest.cert_ids.len() {
             tracing::debug!(
-                height = height.0,
+                height = height.inner(),
                 expected = metadata.manifest.cert_ids.len(),
                 found = certs.len(),
                 "Block has missing certificates - cannot serve sync request"
@@ -338,7 +338,7 @@ impl RocksDbStorage {
             .collect();
         let Some(certificates) = certificates else {
             tracing::debug!(
-                height = height.0,
+                height = height.inner(),
                 "Block has missing receipts - cannot reconstruct FinalizedWave for sync"
             );
             let elapsed = start.elapsed().as_secs_f64();

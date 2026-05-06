@@ -362,7 +362,7 @@ fn format_transaction_status(
     match status {
         TransactionStatus::Pending => ("pending".to_string(), None, None, None),
         TransactionStatus::Committed(height) => {
-            ("committed".to_string(), Some(height.0), None, None)
+            ("committed".to_string(), Some(height.inner()), None, None)
         }
         TransactionStatus::Completed(decision) => {
             let decision_str = match decision {
@@ -513,7 +513,7 @@ mod tests {
     #[test]
     fn test_format_committed() {
         let (status, height, decision, error) =
-            format_transaction_status(&TransactionStatus::Committed(BlockHeight(42)));
+            format_transaction_status(&TransactionStatus::Committed(BlockHeight::new(42)));
         assert_eq!(status, "committed");
         assert_eq!(height, Some(42));
         assert!(decision.is_none());

@@ -415,18 +415,18 @@ mod tests {
         let mut tracker = ProposalTracker::new();
         assert!(tracker.pending().is_none());
 
-        tracker.start(BlockHeight(5), Round(1));
+        tracker.start(BlockHeight::new(5), Round(1));
         let p = tracker.pending().unwrap();
-        assert_eq!(p.height, BlockHeight(5));
+        assert_eq!(p.height, BlockHeight::new(5));
         assert_eq!(p.round, Round(1));
     }
 
     #[test]
     fn take_matching_clears_on_match() {
         let mut tracker = ProposalTracker::new();
-        tracker.start(BlockHeight(5), Round(1));
+        tracker.start(BlockHeight::new(5), Round(1));
 
-        let result = tracker.take_matching(BlockHeight(5), Round(1));
+        let result = tracker.take_matching(BlockHeight::new(5), Round(1));
         assert!(matches!(result, TakeResult::Matched));
         assert!(tracker.pending().is_none());
     }
@@ -434,12 +434,12 @@ mod tests {
     #[test]
     fn take_matching_preserves_slot_on_mismatch() {
         let mut tracker = ProposalTracker::new();
-        tracker.start(BlockHeight(5), Round(1));
+        tracker.start(BlockHeight::new(5), Round(1));
 
-        let result = tracker.take_matching(BlockHeight(5), Round(2));
+        let result = tracker.take_matching(BlockHeight::new(5), Round(2));
         match result {
             TakeResult::Mismatch { expected } => {
-                assert_eq!(expected.height, BlockHeight(5));
+                assert_eq!(expected.height, BlockHeight::new(5));
                 assert_eq!(expected.round, Round(1));
             }
             other => panic!("expected Mismatch, got {other:?}"),
@@ -454,7 +454,7 @@ mod tests {
     fn take_matching_returns_not_pending_when_empty() {
         let mut tracker = ProposalTracker::new();
         assert!(matches!(
-            tracker.take_matching(BlockHeight(5), Round(1)),
+            tracker.take_matching(BlockHeight::new(5), Round(1)),
             TakeResult::NotPending
         ));
     }
@@ -462,10 +462,10 @@ mod tests {
     #[test]
     fn mark_deferred_records_slot_without_touching_pending() {
         let mut tracker = ProposalTracker::new();
-        tracker.mark_deferred(BlockHeight(5), Round(1));
+        tracker.mark_deferred(BlockHeight::new(5), Round(1));
 
         let d = tracker.deferred().unwrap();
-        assert_eq!(d.height, BlockHeight(5));
+        assert_eq!(d.height, BlockHeight::new(5));
         assert_eq!(d.round, Round(1));
         assert!(tracker.pending().is_none());
     }
@@ -473,8 +473,8 @@ mod tests {
     #[test]
     fn start_clears_deferred() {
         let mut tracker = ProposalTracker::new();
-        tracker.mark_deferred(BlockHeight(5), Round(1));
-        tracker.start(BlockHeight(5), Round(1));
+        tracker.mark_deferred(BlockHeight::new(5), Round(1));
+        tracker.start(BlockHeight::new(5), Round(1));
 
         assert!(tracker.deferred().is_none());
         assert!(tracker.pending().is_some());
@@ -483,8 +483,8 @@ mod tests {
     #[test]
     fn clear_drops_both_slots() {
         let mut tracker = ProposalTracker::new();
-        tracker.start(BlockHeight(5), Round(1));
-        tracker.mark_deferred(BlockHeight(6), Round(2));
+        tracker.start(BlockHeight::new(5), Round(1));
+        tracker.mark_deferred(BlockHeight::new(6), Round(2));
         tracker.clear();
 
         assert!(tracker.pending().is_none());
@@ -494,8 +494,8 @@ mod tests {
     #[test]
     fn clear_deferred_leaves_pending_intact() {
         let mut tracker = ProposalTracker::new();
-        tracker.start(BlockHeight(5), Round(1));
-        tracker.mark_deferred(BlockHeight(6), Round(2));
+        tracker.start(BlockHeight::new(5), Round(1));
+        tracker.mark_deferred(BlockHeight::new(6), Round(2));
         tracker.clear_deferred();
 
         assert!(tracker.deferred().is_none());

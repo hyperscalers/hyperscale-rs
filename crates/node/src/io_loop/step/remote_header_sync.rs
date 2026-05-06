@@ -73,16 +73,16 @@ where
         // responder served headers from the wrong shard — the responder
         // gates this too, but defending in depth on the receiver lets us
         // surface peer misbehavior even if a future serve change drops it.
-        let upper_bound = from_height.0.saturating_add(count.0);
+        let upper_bound = from_height.inner().saturating_add(count.0);
         let mut delivered_heights = Vec::with_capacity(headers.len());
         for header in headers {
             let h = header.header.height;
-            if h < from_height || h.0 >= upper_bound {
+            if h < from_height || h.inner() >= upper_bound {
                 tracing::warn!(
                     source_shard = source_shard.0,
-                    requested_from = from_height.0,
+                    requested_from = from_height.inner(),
                     requested_count = count.0,
-                    height = h.0,
+                    height = h.inner(),
                     "remote-header sync: response contained out-of-range height — discarding"
                 );
                 continue;
@@ -91,7 +91,7 @@ where
                 tracing::warn!(
                     source_shard = source_shard.0,
                     response_shard = header.shard_group_id().0,
-                    height = h.0,
+                    height = h.inner(),
                     "remote-header sync: response contained wrong-shard header — discarding"
                 );
                 continue;
@@ -199,7 +199,7 @@ where
                 } => {
                     tracing::info!(
                         source_shard = source_shard.0,
-                        height = height.0,
+                        height = height.inner(),
                         "remote-header sync caught up"
                     );
                     self.feed_event(ProtocolEvent::RemoteHeaderSyncComplete {

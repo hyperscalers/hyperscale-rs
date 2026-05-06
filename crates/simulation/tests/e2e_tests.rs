@@ -117,7 +117,7 @@ fn test_e2e_single_shard_transaction() {
         let node = runner.node(node_idx).expect("Node should exist");
         assert_eq!(
             node.bft().committed_height(),
-            BlockHeight(0),
+            BlockHeight::new(0),
             "Node {node_idx} should be at genesis height"
         );
     }
@@ -335,7 +335,7 @@ fn test_e2e_single_shard_transaction() {
 
     // Assertions
     assert!(
-        max_height >= BlockHeight(1),
+        max_height >= BlockHeight::new(1),
         "Should have committed at least one block beyond genesis"
     );
     assert!(
@@ -493,11 +493,11 @@ fn test_e2e_multi_shard_consensus() {
     let shard1_max = *shard1_heights.iter().max().unwrap();
 
     assert!(
-        shard0_max >= BlockHeight(1),
+        shard0_max >= BlockHeight::new(1),
         "Shard 0 should have made progress"
     );
     assert!(
-        shard1_max >= BlockHeight(1),
+        shard1_max >= BlockHeight::new(1),
         "Shard 1 should have made progress"
     );
 
@@ -734,11 +734,11 @@ fn test_e2e_cross_shard_transaction() {
 
     // Assertions
     assert!(
-        shard0_max >= BlockHeight(2),
+        shard0_max >= BlockHeight::new(2),
         "Shard 0 should have committed blocks"
     );
     assert!(
-        shard1_max >= BlockHeight(2),
+        shard1_max >= BlockHeight::new(2),
         "Shard 1 should have committed blocks"
     );
     assert!(in_mempool, "Transaction should have entered mempool");
@@ -886,7 +886,7 @@ fn test_e2e_transaction_throughput() {
     }
 
     // Run simulation. After the 3s warmup we only need a few more blocks past
-    // the BlockHeight(5) assertion floor; ~1 block/sec means 5s is sufficient.
+    // the BlockHeight::new(5) assertion floor; ~1 block/sec means 5s is sufficient.
     let start = runner.now();
     runner.run_until(Duration::from_secs(5));
     let elapsed = runner.now().checked_sub(start).unwrap();
@@ -907,12 +907,12 @@ fn test_e2e_transaction_throughput() {
 
     if max_height > BlockHeight::GENESIS {
         #[allow(clippy::cast_precision_loss)] // headline throughput stat for human-readable output
-        let blocks_per_second = max_height.0 as f64 / elapsed.as_secs_f64();
+        let blocks_per_second = max_height.inner() as f64 / elapsed.as_secs_f64();
         println!("  Blocks per second: {blocks_per_second:.2}");
     }
 
     assert!(
-        max_height >= BlockHeight(5),
+        max_height >= BlockHeight::new(5),
         "Should have committed multiple blocks"
     );
 

@@ -73,7 +73,8 @@ impl ChainWriter for SimStorage {
         // Read lock: compute speculative JMT root.
         let s = read_or_recover(&self.state);
 
-        let parent_version = jmt_parent_height(parent_block_height, parent_state_root).map(|h| h.0);
+        let parent_version =
+            jmt_parent_height(parent_block_height, parent_state_root).map(BlockHeight::inner);
 
         // Collect per-receipt DatabaseUpdates references — no merge needed.
         let per_receipt_updates: Vec<&DatabaseUpdates> = receipts
@@ -85,7 +86,7 @@ impl ChainWriter for SimStorage {
             put_at_version(
                 &s.tree_store,
                 parent_version,
-                block_height.0,
+                block_height.inner(),
                 &per_receipt_updates,
                 &std::collections::HashMap::new(),
             )
@@ -94,7 +95,7 @@ impl ChainWriter for SimStorage {
             put_at_version(
                 &overlay,
                 parent_version,
-                block_height.0,
+                block_height.inner(),
                 &per_receipt_updates,
                 &std::collections::HashMap::new(),
             )
@@ -130,7 +131,7 @@ impl ChainWriter for SimStorage {
         blocks
             .into_iter()
             .map(|(prepared, block, qc)| {
-                let block_height_u64 = prepared.snapshot.new_height.0;
+                let block_height_u64 = prepared.snapshot.new_height.inner();
                 let result_root = prepared.snapshot.result_root;
 
                 {
@@ -219,17 +220,17 @@ impl SimStorage {
         apply_updates(
             &mut s,
             merged_updates,
-            block_height.0,
+            block_height.inner(),
             /* write_history */ true,
         );
 
         let parent_version =
-            jmt_parent_height(s.current_block_height, s.current_root_hash).map(|h| h.0);
+            jmt_parent_height(s.current_block_height, s.current_root_hash).map(BlockHeight::inner);
 
         let (new_root, collected) = put_at_version(
             &s.tree_store,
             parent_version,
-            block_height.0,
+            block_height.inner(),
             &[merged_updates],
             &std::collections::HashMap::new(),
         );

@@ -147,7 +147,7 @@ fn on_block_committed_transitions_pending_to_committed_and_bumps_in_flight() {
 
     let block = make_live_block(
         ShardGroupId(0),
-        BlockHeight(1),
+        BlockHeight::new(1),
         1_000,
         ValidatorId(0),
         vec![Arc::new(tx)],
@@ -158,7 +158,7 @@ fn on_block_committed_transitions_pending_to_committed_and_bumps_in_flight() {
     assert_eq!(coord.in_flight(), 1);
     assert_eq!(
         coord.status(&tx_hash),
-        Some(TransactionStatus::Committed(BlockHeight(1)))
+        Some(TransactionStatus::Committed(BlockHeight::new(1)))
     );
 }
 
@@ -173,10 +173,10 @@ fn on_block_committed_with_finalized_wave_tombstones_and_evicts() {
 
     // Single block that both includes the tx and carries the wave cert
     // completing it — drives Pending → Committed → Completed in one call.
-    let fw = make_finalized_wave(BlockHeight(1), tx_hash, TransactionDecision::Accept);
+    let fw = make_finalized_wave(BlockHeight::new(1), tx_hash, TransactionDecision::Accept);
     let block = make_live_block(
         ShardGroupId(0),
-        BlockHeight(1),
+        BlockHeight::new(1),
         1_000,
         ValidatorId(0),
         vec![Arc::new(tx.clone())],

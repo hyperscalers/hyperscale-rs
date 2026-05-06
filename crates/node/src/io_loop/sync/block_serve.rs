@@ -46,8 +46,8 @@ pub fn serve_block_request(
     req: &GetBlockRequest,
 ) -> GetBlockResponse {
     trace!(
-        height = req.height.0,
-        target_height = req.target_height.0,
+        height = req.height.inner(),
+        target_height = req.target_height.inner(),
         "Handling block sync request"
     );
     let Some(BlockForSync {
@@ -86,7 +86,7 @@ pub fn serve_block_request(
         // the peer-rotation retry storm the old `not_found` path caused
         // when provisions had aged out everywhere.
         trace!(
-            height = req.height.0,
+            height = req.height.inner(),
             "Cache miss for provisions inside live window — serving sealed"
         );
         record_sync_response_error("block", "provision_cache_miss");

@@ -393,7 +393,7 @@ mod tests {
         let remote_tx = TxHash::from_raw(Hash::from_bytes(b"tx_beta"));
         let provisions = make_provisions(
             ShardGroupId(1),
-            BlockHeight(10),
+            BlockHeight::new(10),
             vec![(remote_tx, vec![node_b], vec![local_node])],
         );
         let conflicts = detector.detect_conflicts(&provisions, WeightedTimestamp(10 * 500));
@@ -416,7 +416,7 @@ mod tests {
         let remote_tx = TxHash::from_raw(Hash::from_bytes(b"tx_beta"));
         let provisions = make_provisions(
             ShardGroupId(1),
-            BlockHeight(10),
+            BlockHeight::new(10),
             vec![(remote_tx, vec![remote_node], vec![local_b])],
         );
         let conflicts = detector.detect_conflicts(&provisions, WeightedTimestamp(10 * 500));
@@ -438,7 +438,7 @@ mod tests {
         // Remote provision: source has remote_node (overlap dir 1), targets local_node (overlap dir 2)
         let provisions = make_provisions(
             ShardGroupId(1),
-            BlockHeight(10),
+            BlockHeight::new(10),
             vec![(lower, vec![remote_node], vec![local_node])],
         );
         let conflicts = detector.detect_conflicts(&provisions, WeightedTimestamp(10 * 500));
@@ -462,7 +462,7 @@ mod tests {
 
         let provisions = make_provisions(
             ShardGroupId(1),
-            BlockHeight(10),
+            BlockHeight::new(10),
             vec![(higher, vec![remote_node], vec![local_node])],
         );
         let conflicts = detector.detect_conflicts(&provisions, WeightedTimestamp(10 * 500));
@@ -481,7 +481,7 @@ mod tests {
         // Provisions commit FIRST
         let provisions = make_provisions(
             ShardGroupId(1),
-            BlockHeight(5),
+            BlockHeight::new(5),
             vec![(lower, vec![remote_node], vec![local_node])],
         );
         let fwd_conflicts = detector.detect_conflicts(&provisions, WeightedTimestamp(5 * 500));
@@ -506,7 +506,7 @@ mod tests {
         // Provisions commit first with the higher hash
         let provisions = make_provisions(
             ShardGroupId(1),
-            BlockHeight(5),
+            BlockHeight::new(5),
             vec![(higher, vec![remote_node], vec![local_node])],
         );
         detector.detect_conflicts(&provisions, WeightedTimestamp(5 * 500));
@@ -531,7 +531,7 @@ mod tests {
         let remote_tx = TxHash::from_raw(Hash::from_bytes(b"tx_beta"));
         let provisions = make_provisions(
             ShardGroupId(1),
-            BlockHeight(10),
+            BlockHeight::new(10),
             vec![(remote_tx, vec![remote_node], vec![local_node])],
         );
         let conflicts = detector.detect_conflicts(&provisions, WeightedTimestamp(10 * 500));
@@ -552,7 +552,7 @@ mod tests {
         let remote_tx = TxHash::from_raw(Hash::from_bytes(b"tx_beta"));
         let provisions = make_provisions(
             ShardGroupId(0),
-            BlockHeight(10),
+            BlockHeight::new(10),
             vec![(remote_tx, vec![remote_node], vec![local_node])],
         );
         let conflicts = detector.detect_conflicts(&provisions, WeightedTimestamp(10 * 500));
@@ -570,7 +570,7 @@ mod tests {
 
         let provisions = make_provisions(
             ShardGroupId(1),
-            BlockHeight(5),
+            BlockHeight::new(5),
             vec![(lower, vec![remote_node], vec![local_node])],
         );
         detector.detect_conflicts(&provisions, WeightedTimestamp(5 * 500));

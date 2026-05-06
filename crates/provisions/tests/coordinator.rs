@@ -38,7 +38,7 @@ fn make_block(height: BlockHeight) -> CertifiedBlock {
     };
     let qc = QuorumCertificate {
         block_hash: block.hash(),
-        weighted_timestamp: WeightedTimestamp(height.0 * TEST_BLOCK_INTERVAL_MS),
+        weighted_timestamp: WeightedTimestamp(height.inner() * TEST_BLOCK_INTERVAL_MS),
         ..QuorumCertificate::genesis(ShardGroupId(0))
     };
     CertifiedBlock::new_unchecked(block, qc)
@@ -63,7 +63,7 @@ fn make_remote_header_targeting(
         parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
         parent_qc: QuorumCertificate::genesis(ShardGroupId(0)),
         proposer: ValidatorId(0),
-        timestamp: ProposerTimestamp(1000 + height.0),
+        timestamp: ProposerTimestamp(1000 + height.inner()),
         round: Round::INITIAL,
         is_fallback: false,
         state_root: StateRoot::ZERO,
@@ -89,7 +89,7 @@ fn fresh_coordinator_reports_no_state() {
     assert_eq!(coord.verified_remote_header_count(), 0);
     assert!(
         coord
-            .get_remote_header(ShardGroupId(1), BlockHeight(1))
+            .get_remote_header(ShardGroupId(1), BlockHeight::new(1))
             .is_none()
     );
     assert!(
@@ -139,7 +139,7 @@ fn with_config_honours_dwell_time_setting() {
 #[test]
 fn on_block_committed_empty_block_yields_no_actions() {
     let (mut coord, topology) = fresh_coordinator_with_topology();
-    let actions = coord.on_block_committed(&topology, &make_block(BlockHeight(1)));
+    let actions = coord.on_block_committed(&topology, &make_block(BlockHeight::new(1)));
     assert!(actions.is_empty());
 }
 
@@ -155,7 +155,7 @@ fn on_verified_remote_header_for_own_shard_is_no_op() {
     let (mut coord, topology) = fresh_coordinator_with_topology();
     let local = topology.local_shard();
     // Header from our own shard must not register an expectation.
-    let own_header = make_remote_header_targeting(local, BlockHeight(5), local);
+    let own_header = make_remote_header_targeting(local, BlockHeight::new(5), local);
     let actions = coord.on_verified_remote_header(&topology, &own_header);
     assert!(actions.is_empty());
     assert_eq!(coord.memory_stats().expected_provisions, 0);
@@ -167,7 +167,7 @@ fn on_verified_remote_header_targeting_local_shard_registers_expectation() {
     let (mut coord, topology) = fresh_coordinator_with_topology();
     let local = topology.local_shard();
     let remote = ShardGroupId(u64::from(local.0 == 0));
-    let header = make_remote_header_targeting(remote, BlockHeight(5), local);
+    let header = make_remote_header_targeting(remote, BlockHeight::new(5), local);
     coord.on_verified_remote_header(&topology, &header);
 
     let stats = coord.memory_stats();
@@ -180,7 +180,7 @@ fn on_verified_remote_header_targeting_local_shard_registers_expectation() {
         "header must be retained while the expectation is outstanding"
     );
     let stored = coord
-        .get_remote_header(remote, BlockHeight(5))
+        .get_remote_header(remote, BlockHeight::new(5))
         .expect("present");
     assert!(Arc::ptr_eq(stored, &header));
 }
@@ -194,11 +194,11 @@ fn first_commit_retro_stamps_pre_genesis_expectations() {
     let (mut coord, topology) = fresh_coordinator_with_topology();
     let local = topology.local_shard();
     let remote = ShardGroupId(u64::from(local.0 == 0));
-    let header = make_remote_header_targeting(remote, BlockHeight(5), local);
+    let header = make_remote_header_targeting(remote, BlockHeight::new(5), local);
     coord.on_verified_remote_header(&topology, &header);
 
     // First commit must NOT trigger a fallback fetch storm.
-    let actions = coord.on_block_committed(&topology, &make_block(BlockHeight(1)));
+    let actions = coord.on_block_committed(&topology, &make_block(BlockHeight::new(1)));
     assert!(
         actions.is_empty(),
         "first commit must retro-stamp before timeout sweep so no fallback fires"

@@ -40,7 +40,7 @@ pub fn serve_remote_headers_request(
     let mut headers = Vec::with_capacity(usize::try_from(bounded_count.0).unwrap_or(0));
 
     for offset in 0..bounded_count.0 {
-        let height = BlockHeight(req.from_height.0.saturating_add(offset));
+        let height = BlockHeight::new(req.from_height.inner().saturating_add(offset));
         let Some(header) = storage.get_committed_header(height) else {
             break;
         };

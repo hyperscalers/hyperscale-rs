@@ -42,7 +42,7 @@ mod tests {
     fn test_block_header_hash_deterministic() {
         let header = BlockHeader {
             shard_group_id: ShardGroupId(0),
-            height: BlockHeight(1),
+            height: BlockHeight::new(1),
             parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
             parent_qc: QuorumCertificate::genesis(ShardGroupId(0)),
             proposer: ValidatorId(0),
@@ -69,7 +69,7 @@ mod tests {
         let genesis = Block::genesis(ShardGroupId(0), ValidatorId(0), StateRoot::ZERO);
 
         assert!(genesis.is_genesis());
-        assert_eq!(genesis.height(), BlockHeight(0));
+        assert_eq!(genesis.height(), BlockHeight::new(0));
         assert_eq!(genesis.transaction_count(), 0);
         assert_eq!(genesis.header().transaction_root, TransactionRoot::ZERO);
         assert_eq!(
@@ -114,7 +114,7 @@ mod tests {
             let ec = Arc::new(ExecutionCertificate::new(
                 WaveId::new(
                     ShardGroupId(0),
-                    BlockHeight(10),
+                    BlockHeight::new(10),
                     BTreeSet::from([ShardGroupId(1)]),
                 ),
                 WeightedTimestamp(11),
@@ -134,7 +134,7 @@ mod tests {
                 certificate: Arc::new(WaveCertificate {
                     wave_id: WaveId::new(
                         ShardGroupId(0),
-                        BlockHeight(10),
+                        BlockHeight::new(10),
                         BTreeSet::from([ShardGroupId(1)]),
                     ),
                     execution_certificates: vec![ec],
@@ -153,7 +153,7 @@ mod tests {
     #[test]
     fn test_compute_certificate_root_single_cert() {
         let ec = Arc::new(ExecutionCertificate::new(
-            WaveId::new(ShardGroupId(0), BlockHeight(10), BTreeSet::new()),
+            WaveId::new(ShardGroupId(0), BlockHeight::new(10), BTreeSet::new()),
             WeightedTimestamp(11),
             GlobalReceiptRoot::from_raw(Hash::from_bytes(b"receipt")),
             vec![TxOutcome {
@@ -166,7 +166,7 @@ mod tests {
             SignerBitfield::new(4),
         ));
         let cert = Arc::new(WaveCertificate {
-            wave_id: WaveId::new(ShardGroupId(0), BlockHeight(10), BTreeSet::new()),
+            wave_id: WaveId::new(ShardGroupId(0), BlockHeight::new(10), BTreeSet::new()),
             execution_certificates: vec![ec],
         });
         let expected_receipt_hash = cert.receipt_hash();
@@ -199,7 +199,7 @@ mod tests {
             .into_sealed()
             .into_live(Arc::new(Vec::new()));
         if let Block::Live { ref mut header, .. } = bad_block {
-            header.height = BlockHeight(7);
+            header.height = BlockHeight::new(7);
         }
         let genesis_qc = QuorumCertificate::genesis(ShardGroupId(0));
         let bytes = basic_encode(&CertifiedBlockWire {

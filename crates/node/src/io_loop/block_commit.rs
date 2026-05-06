@@ -200,21 +200,21 @@ where
         #[allow(clippy::cast_precision_loss)] // latency readout for metrics; ms→f64 lossy is fine
         let commit_latency_secs =
             (now_ms.saturating_sub(commit.block.header().timestamp.as_millis())) as f64 / 1000.0;
-        record_block_committed(height.0, commit_latency_secs, commit.source.as_str());
-        set_block_height(height.0);
+        record_block_committed(height.inner(), commit_latency_secs, commit.source.as_str());
+        set_block_height(height.inner());
 
         // Fire BlockCommitted immediately unless persistence is falling
         // too far behind (backpressure). When deferred, flush sends
         // BlockCommitted after the disk write instead.
-        let persistence_lag = height.0.saturating_sub(self.persisted_height.0);
+        let persistence_lag = height.inner().saturating_sub(self.persisted_height.inner());
         let notify_now_decision = persistence_lag <= Self::MAX_PERSISTENCE_LAG;
 
         let notify_now = if notify_now_decision {
             Some((Arc::clone(&commit.block), Arc::clone(&commit.qc)))
         } else {
             tracing::debug!(
-                height = height.0,
-                persisted = self.persisted_height.0,
+                height = height.inner(),
+                persisted = self.persisted_height.inner(),
                 lag = persistence_lag,
                 "Deferring BlockCommitted — persistence backpressure"
             );
@@ -260,8 +260,8 @@ where
         let mut commits = std::mem::take(&mut self.pending);
 
         // Drop blocks already persisted by the sync path.
-        let persisted = self.persisted_height.0;
-        commits.retain(|c| c.block.height().0 > persisted);
+        let persisted = self.persisted_height.inner();
+        commits.retain(|c| c.block.height().inner() > persisted);
         if commits.is_empty() {
             return;
         }
@@ -273,7 +273,7 @@ where
         // sorting, the child block (which may lack a PreparedCommit) would defer
         // and block the ready parent, causing a deadlock where BlockPersisted
         // never fires and sync_awaiting_persistence_height is never satisfied.
-        commits.sort_by_key(|c| c.block.height().0);
+        commits.sort_by_key(|c| c.block.height().inner());
 
         // `commits` is non-empty (checked above) and sorted ascending by height.
         let max_committed_height = commits
@@ -303,7 +303,7 @@ where
                     // defer too, preserving height ordering.
                     deferring = true;
                     tracing::debug!(
-                        height = commit.block.height().0,
+                        height = commit.block.height().inner(),
                         certs = commit.block.certificates().len(),
                         "Deferring block commit — awaiting PreparedCommit from VerifyStateRoot"
                     );
@@ -426,7 +426,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .map(|(h, _)| h.0)
+                .map(|(h, _)| h.inner())
                 .collect()
         }
 
@@ -501,7 +501,7 @@ mod tests {
         let block = make_live_block(
             ShardGroupId(0),
             height,
-            /* timestamp_ms */ 1_000 + height.0,
+            /* timestamp_ms */ 1_000 + height.inner(),
             ValidatorId(0),
             vec![],
             vec![],
@@ -520,7 +520,7 @@ mod tests {
         };
         let prepared = MockPrepared {
             snapshot: empty_snapshot(height),
-            tag: height.0,
+            tag: height.inner(),
         };
         (pending, prepared)
     }
@@ -566,10 +566,10 @@ mod tests {
     #[test]
     fn accumulate_skips_block_at_or_below_persisted_height() {
         let committee = TestCommittee::new(4, 1);
-        let mut coord = BlockCommitCoordinator::<MockStorage>::new(BlockHeight(5));
+        let mut coord = BlockCommitCoordinator::<MockStorage>::new(BlockHeight::new(5));
 
         for h in [1u64, 5] {
-            let (commit, _) = make_commit(&committee, BlockHeight(h), CommitSource::Sync);
+            let (commit, _) = make_commit(&committee, BlockHeight::new(h), CommitSource::Sync);
             assert!(matches!(
                 coord.accumulate(commit, now()),
                 AccumulateDecision::Skip
@@ -583,8 +583,8 @@ mod tests {
         let committee = TestCommittee::new(4, 1);
         let mut coord = BlockCommitCoordinator::<MockStorage>::new(BlockHeight::GENESIS);
 
-        let (first, _) = make_commit(&committee, BlockHeight(1), CommitSource::Aggregator);
-        let (dup, _) = make_commit(&committee, BlockHeight(1), CommitSource::Sync);
+        let (first, _) = make_commit(&committee, BlockHeight::new(1), CommitSource::Aggregator);
+        let (dup, _) = make_commit(&committee, BlockHeight::new(1), CommitSource::Sync);
         // Same height + builder-deterministic header → same hash.
         assert_eq!(first.block.hash(), dup.block.hash());
 
@@ -606,12 +606,13 @@ mod tests {
 
         // Heights 1..=MAX_PERSISTENCE_LAG should all notify immediately.
         for h in 1..=BlockCommitCoordinator::<MockStorage>::MAX_PERSISTENCE_LAG {
-            let (commit, _) = make_commit(&committee, BlockHeight(h), CommitSource::Aggregator);
+            let (commit, _) =
+                make_commit(&committee, BlockHeight::new(h), CommitSource::Aggregator);
             match coord.accumulate(commit, now()) {
                 AccumulateDecision::Accepted {
                     height,
                     notify_now: Some(_),
-                } => assert_eq!(height.0, h),
+                } => assert_eq!(height.inner(), h),
                 _ => panic!("expected immediate notify at height {h}"),
             }
         }
@@ -624,7 +625,11 @@ mod tests {
 
         let max_lag = BlockCommitCoordinator::<MockStorage>::MAX_PERSISTENCE_LAG;
         // Anything beyond MAX_PERSISTENCE_LAG should defer the notification.
-        let (commit, _) = make_commit(&committee, BlockHeight(max_lag + 1), CommitSource::Header);
+        let (commit, _) = make_commit(
+            &committee,
+            BlockHeight::new(max_lag + 1),
+            CommitSource::Header,
+        );
         match coord.accumulate(commit, now()) {
             AccumulateDecision::Accepted {
                 notify_now: None, ..
@@ -643,8 +648,12 @@ mod tests {
         let mut coord = BlockCommitCoordinator::<MockStorage>::new(BlockHeight::GENESIS);
 
         let max_lag = BlockCommitCoordinator::<MockStorage>::MAX_PERSISTENCE_LAG;
-        let (deferred, _) = make_commit(&committee, BlockHeight(max_lag + 1), CommitSource::Header);
-        let (immediate, _) = make_commit(&committee, BlockHeight(1), CommitSource::Aggregator);
+        let (deferred, _) = make_commit(
+            &committee,
+            BlockHeight::new(max_lag + 1),
+            CommitSource::Header,
+        );
+        let (immediate, _) = make_commit(&committee, BlockHeight::new(1), CommitSource::Aggregator);
 
         let _ = coord.accumulate(deferred, now());
         let _ = coord.accumulate(immediate, now());
@@ -652,9 +661,12 @@ mod tests {
         let pending = &coord.pending;
         let h_deferred = pending
             .iter()
-            .find(|c| c.block.height().0 == max_lag + 1)
+            .find(|c| c.block.height().inner() == max_lag + 1)
             .unwrap();
-        let h_immediate = pending.iter().find(|c| c.block.height().0 == 1).unwrap();
+        let h_immediate = pending
+            .iter()
+            .find(|c| c.block.height().inner() == 1)
+            .unwrap();
         assert!(!h_deferred.committed_notified);
         assert!(h_immediate.committed_notified);
     }
@@ -663,12 +675,12 @@ mod tests {
 
     #[test]
     fn mark_persisted_is_monotonic() {
-        let mut coord = BlockCommitCoordinator::<MockStorage>::new(BlockHeight(3));
-        coord.mark_persisted(BlockHeight(7));
-        assert_eq!(coord.persisted_height().0, 7);
+        let mut coord = BlockCommitCoordinator::<MockStorage>::new(BlockHeight::new(3));
+        coord.mark_persisted(BlockHeight::new(7));
+        assert_eq!(coord.persisted_height().inner(), 7);
         // Going backwards must not regress the high-water mark.
-        coord.mark_persisted(BlockHeight(2));
-        assert_eq!(coord.persisted_height().0, 7);
+        coord.mark_persisted(BlockHeight::new(2));
+        assert_eq!(coord.persisted_height().inner(), 7);
     }
 
     // ── prepared cache helpers ────────────────────────────────────────
@@ -677,11 +689,11 @@ mod tests {
     fn has_prepared_and_insert_prepared_roundtrip() {
         let committee = TestCommittee::new(4, 1);
         let coord = BlockCommitCoordinator::<MockStorage>::new(BlockHeight::GENESIS);
-        let (commit, prepared) = make_commit(&committee, BlockHeight(1), CommitSource::Sync);
+        let (commit, prepared) = make_commit(&committee, BlockHeight::new(1), CommitSource::Sync);
         let hash = commit.block.hash();
 
         assert!(!coord.has_prepared(&hash));
-        coord.insert_prepared(hash, BlockHeight(1), prepared);
+        coord.insert_prepared(hash, BlockHeight::new(1), prepared);
         assert!(coord.has_prepared(&hash));
         assert_eq!(coord.prepared_len(), 1);
     }
@@ -744,7 +756,7 @@ mod tests {
             enqueue(
                 &mut coord,
                 &committee,
-                BlockHeight(h),
+                BlockHeight::new(h),
                 CommitSource::Aggregator,
             );
         }
@@ -755,7 +767,7 @@ mod tests {
         // No deferred BlockCommitted (all immediate); BlockPersisted at top.
         let events = drain_protocol_events(&rx);
         assert_eq!(count_committed(&events), 0);
-        assert_eq!(last_persisted_height(&events), Some(BlockHeight(3)));
+        assert_eq!(last_persisted_height(&events), Some(BlockHeight::new(3)));
     }
 
     #[test]
@@ -772,23 +784,23 @@ mod tests {
         enqueue(
             &mut coord,
             &committee,
-            BlockHeight(1),
+            BlockHeight::new(1),
             CommitSource::Aggregator,
         );
         enqueue(
             &mut coord,
             &committee,
-            BlockHeight(2),
+            BlockHeight::new(2),
             CommitSource::Aggregator,
         );
         // Sync races ahead and persists h=1 before flush.
-        coord.mark_persisted(BlockHeight(1));
+        coord.mark_persisted(BlockHeight::new(1));
 
         coord.flush(&storage, &tx, &dispatch);
 
         assert_eq!(storage.committed_heights(), vec![2]);
         let events = drain_protocol_events(&rx);
-        assert_eq!(last_persisted_height(&events), Some(BlockHeight(2)));
+        assert_eq!(last_persisted_height(&events), Some(BlockHeight::new(2)));
     }
 
     #[test]
@@ -800,7 +812,7 @@ mod tests {
         let dispatch = SyncDispatch::new();
 
         // Accumulate without ever inserting a prepared commit.
-        let (commit, _) = make_commit(&committee, BlockHeight(1), CommitSource::Aggregator);
+        let (commit, _) = make_commit(&committee, BlockHeight::new(1), CommitSource::Aggregator);
         let _ = coord.accumulate(commit, now());
 
         coord.flush(&storage, &tx, &dispatch);
@@ -827,17 +839,17 @@ mod tests {
         enqueue(
             &mut coord,
             &committee,
-            BlockHeight(1),
+            BlockHeight::new(1),
             CommitSource::Aggregator,
         );
         // h=2 accumulated but no prepared cached
-        let (h2, _) = make_commit(&committee, BlockHeight(2), CommitSource::Aggregator);
+        let (h2, _) = make_commit(&committee, BlockHeight::new(2), CommitSource::Aggregator);
         let _ = coord.accumulate(h2, now());
         // h=3 ready
         enqueue(
             &mut coord,
             &committee,
-            BlockHeight(3),
+            BlockHeight::new(3),
             CommitSource::Aggregator,
         );
 
@@ -845,12 +857,16 @@ mod tests {
 
         // Only h=1 should make it through; h=2 and h=3 stay pending.
         assert_eq!(storage.committed_heights(), vec![1]);
-        let pending_heights: Vec<u64> = coord.pending.iter().map(|c| c.block.height().0).collect();
+        let pending_heights: Vec<u64> = coord
+            .pending
+            .iter()
+            .map(|c| c.block.height().inner())
+            .collect();
         assert!(pending_heights.contains(&2));
         assert!(pending_heights.contains(&3));
 
         let events = drain_protocol_events(&rx);
-        assert_eq!(last_persisted_height(&events), Some(BlockHeight(1)));
+        assert_eq!(last_persisted_height(&events), Some(BlockHeight::new(1)));
     }
 
     #[test]
@@ -871,7 +887,7 @@ mod tests {
             enqueue(
                 &mut coord,
                 &committee,
-                BlockHeight(h),
+                BlockHeight::new(h),
                 CommitSource::Aggregator,
             );
         }
@@ -883,7 +899,10 @@ mod tests {
         // through the channel — immediate notifies were short-circuited at
         // accumulate time and aren't re-fired.
         assert_eq!(count_committed(&events), 2, "events: {events:?}");
-        assert_eq!(last_persisted_height(&events), Some(BlockHeight(total)));
+        assert_eq!(
+            last_persisted_height(&events),
+            Some(BlockHeight::new(total))
+        );
     }
 
     #[test]
@@ -902,7 +921,7 @@ mod tests {
         enqueue(
             &mut coord,
             &committee,
-            BlockHeight(1),
+            BlockHeight::new(1),
             CommitSource::Aggregator,
         );
 
@@ -926,7 +945,7 @@ mod tests {
         enqueue(
             &mut coord,
             &committee,
-            BlockHeight(1),
+            BlockHeight::new(1),
             CommitSource::Aggregator,
         );
         coord.flush(&storage, &tx, &dispatch);
@@ -936,7 +955,7 @@ mod tests {
         enqueue(
             &mut coord,
             &committee,
-            BlockHeight(2),
+            BlockHeight::new(2),
             CommitSource::Aggregator,
         );
         coord.flush(&storage, &tx, &dispatch);
@@ -958,7 +977,7 @@ mod tests {
         let hash = enqueue(
             &mut coord,
             &committee,
-            BlockHeight(1),
+            BlockHeight::new(1),
             CommitSource::Aggregator,
         );
         coord.flush(&storage, &tx, &dispatch);
@@ -978,10 +997,10 @@ mod tests {
         let (tx, _rx) = unbounded();
         let dispatch = SyncDispatch::new();
 
-        let (commit, _) = make_commit(&committee, BlockHeight(1), CommitSource::Sync);
+        let (commit, _) = make_commit(&committee, BlockHeight::new(1), CommitSource::Sync);
         let hash = commit.block.hash();
         let tag = next_tag();
-        install_prepared(&coord, hash, BlockHeight(1), tag);
+        install_prepared(&coord, hash, BlockHeight::new(1), tag);
         let _ = coord.accumulate(commit, now());
 
         coord.flush(&storage, &tx, &dispatch);

@@ -134,7 +134,7 @@ pub fn noop_jmt_snapshot<S: TreeReader>(
 
     // Try to find the parent's root node so the version chain is unbroken.
     if let Some(parent_ver) = jmt_parent_height(parent_block_height, parent_state_root) {
-        let root_key = NodeKey::root(parent_ver.0);
+        let root_key = NodeKey::root(parent_ver.inner());
 
         // Check pending snapshots first (overlay), then the base store.
         let root_node = pending_snapshots
@@ -148,7 +148,7 @@ pub fn noop_jmt_snapshot<S: TreeReader>(
             .or_else(|| store.get_node(&root_key));
 
         if let Some(node) = root_node {
-            nodes.push((NodeKey::root(block_height.0), node));
+            nodes.push((NodeKey::root(block_height.inner()), node));
         }
     }
 

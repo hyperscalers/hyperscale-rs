@@ -74,7 +74,7 @@ mod tests {
 
         let header = BlockHeader {
             shard_group_id: ShardGroupId(1),
-            height: BlockHeight(42),
+            height: BlockHeight::new(42),
             parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
             parent_qc: QuorumCertificate::genesis(ShardGroupId(0)),
             proposer: ValidatorId(0),

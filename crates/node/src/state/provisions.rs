@@ -78,7 +78,7 @@ mod tests {
         let provisions = Arc::new(Provisions::new(
             ShardGroupId(1), // source
             ShardGroupId(0), // target (local)
-            BlockHeight(1),
+            BlockHeight::new(1),
             MerkleInclusionProof(vec![]),
             vec![],
         ));

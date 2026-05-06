@@ -304,12 +304,12 @@ mod tests {
         assert!(!t.is_fully_provisioned(&tx));
 
         // Only shard 1 landed.
-        let batch1 = make_provisions(shard(1), BlockHeight(5), vec![tx]);
+        let batch1 = make_provisions(shard(1), BlockHeight::new(5), vec![tx]);
         t.absorb_provisions(&batch1, shard(0));
         assert!(!t.is_fully_provisioned(&tx));
 
         // Shard 2 lands → fully provisioned.
-        let batch2 = make_provisions(shard(2), BlockHeight(5), vec![tx]);
+        let batch2 = make_provisions(shard(2), BlockHeight::new(5), vec![tx]);
         t.absorb_provisions(&batch2, shard(0));
         assert!(t.is_fully_provisioned(&tx));
     }
@@ -321,7 +321,7 @@ mod tests {
         // Absorbed provisions records `received[tx]` but there's no `required` —
         // the query must not report fully-provisioned just because
         // anything landed.
-        let provisions = make_provisions(shard(1), BlockHeight(5), vec![tx]);
+        let provisions = make_provisions(shard(1), BlockHeight::new(5), vec![tx]);
         t.absorb_provisions(&provisions, shard(0));
         assert!(!t.is_fully_provisioned(&tx));
     }
@@ -331,7 +331,7 @@ mod tests {
         let mut t = ProvisioningTracker::new();
         let tx_a = TxHash::from_raw(Hash::from_bytes(b"a"));
         let tx_b = TxHash::from_raw(Hash::from_bytes(b"b"));
-        let provisions = make_provisions(shard(1), BlockHeight(5), vec![tx_a, tx_b]);
+        let provisions = make_provisions(shard(1), BlockHeight::new(5), vec![tx_a, tx_b]);
         let touched = t.absorb_provisions(&provisions, shard(0));
         assert_eq!(touched, vec![tx_a, tx_b]);
     }
@@ -340,7 +340,7 @@ mod tests {
     fn absorb_provisions_populates_verified_and_received_maps() {
         let mut t = ProvisioningTracker::new();
         let tx = TxHash::from_raw(Hash::from_bytes(b"tx"));
-        let provisions = make_provisions(shard(1), BlockHeight(5), vec![tx]);
+        let provisions = make_provisions(shard(1), BlockHeight::new(5), vec![tx]);
         t.absorb_provisions(&provisions, shard(0));
 
         assert_eq!(t.verified_len(), 1);
@@ -357,11 +357,11 @@ mod tests {
         let mut t = ProvisioningTracker::new();
         let tx = TxHash::from_raw(Hash::from_bytes(b"tx"));
         t.absorb_provisions(
-            &make_provisions(shard(1), BlockHeight(5), vec![tx]),
+            &make_provisions(shard(1), BlockHeight::new(5), vec![tx]),
             shard(0),
         );
         t.absorb_provisions(
-            &make_provisions(shard(2), BlockHeight(5), vec![tx]),
+            &make_provisions(shard(2), BlockHeight::new(5), vec![tx]),
             shard(0),
         );
 
@@ -380,7 +380,7 @@ mod tests {
         let mut t = ProvisioningTracker::new();
         let tx = TxHash::from_raw(Hash::from_bytes(b"tx"));
         t.record_required(tx, std::iter::once(shard(1)).collect());
-        let provisions = make_provisions(shard(1), BlockHeight(5), vec![tx]);
+        let provisions = make_provisions(shard(1), BlockHeight::new(5), vec![tx]);
         t.absorb_provisions(&provisions, shard(0));
         assert!(t.is_fully_provisioned(&tx));
 
@@ -414,7 +414,7 @@ mod tests {
         t.advance_clock(WeightedTimestamp(1_000));
         t.record_required(tx_old, std::iter::once(shard(1)).collect());
         t.absorb_provisions(
-            &make_provisions(shard(1), BlockHeight(5), vec![tx_old]),
+            &make_provisions(shard(1), BlockHeight::new(5), vec![tx_old]),
             shard(0),
         );
 
@@ -422,7 +422,7 @@ mod tests {
         t.advance_clock(WeightedTimestamp(60_000));
         t.record_required(tx_fresh, std::iter::once(shard(1)).collect());
         t.absorb_provisions(
-            &make_provisions(shard(1), BlockHeight(6), vec![tx_fresh]),
+            &make_provisions(shard(1), BlockHeight::new(6), vec![tx_fresh]),
             shard(0),
         );
 
@@ -453,7 +453,7 @@ mod tests {
         // First insert at clock = ms(1_000) → deadline = 1_000 + horizon.
         t.advance_clock(WeightedTimestamp(1_000));
         t.absorb_provisions(
-            &make_provisions(shard(1), BlockHeight(5), vec![tx]),
+            &make_provisions(shard(1), BlockHeight::new(5), vec![tx]),
             shard(0),
         );
 
@@ -461,7 +461,7 @@ mod tests {
         // 60_000 + horizon.
         t.advance_clock(WeightedTimestamp(60_000));
         t.absorb_provisions(
-            &make_provisions(shard(2), BlockHeight(5), vec![tx]),
+            &make_provisions(shard(2), BlockHeight::new(5), vec![tx]),
             shard(0),
         );
 

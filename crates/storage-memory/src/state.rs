@@ -129,7 +129,7 @@ impl ConsensusState {
     pub(crate) fn new() -> Self {
         Self {
             blocks: BTreeMap::new(),
-            committed_height: BlockHeight(0),
+            committed_height: BlockHeight::new(0),
             committed_hash: None,
             committed_qc: None,
             transactions: HashMap::new(),

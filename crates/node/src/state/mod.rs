@@ -212,7 +212,7 @@ impl StateMachine for NodeStateMachine {
         node = self.node_index,
         shard = self.topology.snapshot().local_shard().0,
         event = %event.type_name(),
-        height = self.bft.committed_height().0,
+        height = self.bft.committed_height().inner(),
     ))]
     fn handle(&mut self, event: ProtocolEvent) -> Vec<Action> {
         let mut actions = match event {

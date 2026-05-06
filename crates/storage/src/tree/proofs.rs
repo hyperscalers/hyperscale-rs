@@ -24,7 +24,7 @@ pub fn generate_proof<S: TreeReader>(
     storage_keys: &[Vec<u8>],
     block_height: BlockHeight,
 ) -> Option<MerkleInclusionProof> {
-    let root_key = NodeKey::root(block_height.0);
+    let root_key = NodeKey::root(block_height.inner());
 
     let jmt_keys: Vec<Key> = storage_keys.iter().map(|sk| hash_storage_key(sk)).collect();
 

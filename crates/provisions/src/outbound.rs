@@ -123,7 +123,7 @@ impl OutboundProvisionTracker {
         debug!(
             provision_hash = ?provision_hash,
             target_shard = target_shard.0,
-            source_block_height = provisions.block_height.0,
+            source_block_height = provisions.block_height.inner(),
             tx_count = provisions.transactions.len(),
             "Tracking outbound provisions"
         );
@@ -193,7 +193,7 @@ impl OutboundProvisionTracker {
             warn!(
                 provision_hash = ?provision_hash,
                 target_shard = entry.target_shard.0,
-                source_block_height = entry.source_block_height.0,
+                source_block_height = entry.source_block_height.inner(),
                 pending_txs = entry.pending_txs.len(),
                 past_deadline_secs = now.elapsed_since(entry.deadline).as_secs(),
                 "Evicting outbound provisions past deadline — no terminal EC observed"
@@ -284,14 +284,14 @@ mod tests {
 
         let a = tx(b"a");
         let b = tx(b"b");
-        let provisions = make_provisions(BlockHeight(10), &[a, b]);
+        let provisions = make_provisions(BlockHeight::new(10), &[a, b]);
         let provision_hash = provisions.hash();
         tracker.on_broadcast(&provisions, ShardGroupId(1));
 
         assert_eq!(tracker.memory_stats().tracked_provisions, 1);
         assert_eq!(tracker.memory_stats().tracked_tx_entries, 2);
         assert!(store.get(&provision_hash).is_some());
-        let hit = store.get_outbound(BlockHeight(10), ShardGroupId(1));
+        let hit = store.get_outbound(BlockHeight::new(10), ShardGroupId(1));
         assert!(hit.is_some());
     }
 
@@ -302,7 +302,7 @@ mod tests {
 
         let a = tx(b"a");
         let b = tx(b"b");
-        let provisions = make_provisions(BlockHeight(10), &[a, b]);
+        let provisions = make_provisions(BlockHeight::new(10), &[a, b]);
         let provision_hash = provisions.hash();
         tracker.on_broadcast(&provisions, ShardGroupId(1));
 
@@ -321,7 +321,7 @@ mod tests {
         let mut tracker = OutboundProvisionTracker::new(Arc::clone(&store));
 
         let a = tx(b"a");
-        let provisions = make_provisions(BlockHeight(7), &[a]);
+        let provisions = make_provisions(BlockHeight::new(7), &[a]);
         let provision_hash = provisions.hash();
         tracker.on_broadcast(&provisions, ShardGroupId(2));
 
@@ -335,7 +335,7 @@ mod tests {
         let mut tracker = OutboundProvisionTracker::new(Arc::clone(&store));
 
         let a = tx(b"a");
-        let provisions = make_provisions(BlockHeight(5), &[a]);
+        let provisions = make_provisions(BlockHeight::new(5), &[a]);
         tracker.on_broadcast(&provisions, ShardGroupId(1));
 
         // EC from a different target shard must not acknowledge these provisions.
@@ -350,7 +350,7 @@ mod tests {
         tracker.on_block_committed(ts(1_000_000));
 
         let a = tx(b"a");
-        let provisions = make_provisions(BlockHeight(5), &[a]);
+        let provisions = make_provisions(BlockHeight::new(5), &[a]);
         let provision_hash = provisions.hash();
         tracker.on_broadcast(&provisions, ShardGroupId(1));
 
@@ -368,7 +368,7 @@ mod tests {
         let mut tracker = OutboundProvisionTracker::new(Arc::clone(&store));
 
         let a = tx(b"a");
-        let provisions = make_provisions(BlockHeight(10), &[a]);
+        let provisions = make_provisions(BlockHeight::new(10), &[a]);
         tracker.on_broadcast(&provisions, ShardGroupId(1));
         tracker.on_broadcast(&provisions, ShardGroupId(1));
         assert_eq!(tracker.memory_stats().tracked_provisions, 1);

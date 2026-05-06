@@ -154,7 +154,7 @@ mod tests {
 
     fn make_fw(height: u64) -> Arc<FinalizedWave> {
         Arc::new(make_finalized_wave(
-            BlockHeight(height),
+            BlockHeight::new(height),
             TxHash::from_raw(Hash::from_bytes(
                 &[u8::try_from(height).unwrap_or(u8::MAX); 32],
             )),
@@ -167,7 +167,7 @@ mod tests {
         Arc::new(Provisions::new(
             ShardGroupId(0),
             ShardGroupId(1),
-            BlockHeight(u64::from(seed)),
+            BlockHeight::new(u64::from(seed)),
             MerkleInclusionProof::dummy(),
             vec![TxEntries {
                 tx_hash,

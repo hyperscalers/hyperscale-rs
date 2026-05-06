@@ -19,7 +19,7 @@ pub fn write_committed_height(batch: &mut WriteBatch, height: BlockHeight) {
 }
 
 pub fn read_committed_height(store: &impl ReadableStore) -> BlockHeight {
-    typed_cf::meta_read::<CommittedHeightEntry>(store).unwrap_or(BlockHeight(0))
+    typed_cf::meta_read::<CommittedHeightEntry>(store).unwrap_or(BlockHeight::new(0))
 }
 
 pub fn write_committed_hash(batch: &mut WriteBatch, hash: &Hash) {

@@ -31,8 +31,8 @@ impl RocksDbStorage {
         // mismatch indicates storage corruption.
         if committed_height > BlockHeight::GENESIS && jmt_block_height != committed_height {
             tracing::error!(
-                committed_height = committed_height.0,
-                jmt_block_height = jmt_block_height.0,
+                committed_height = committed_height.inner(),
+                jmt_block_height = jmt_block_height.inner(),
                 "RECOVERY: JMT version does not match committed height — \
                  this should not happen with atomic commits. Possible storage corruption."
             );
@@ -42,10 +42,10 @@ impl RocksDbStorage {
         record_storage_operation("load_recovered_state", elapsed);
 
         tracing::info!(
-            committed_height = committed_height.0,
+            committed_height = committed_height.inner(),
             has_committed_hash = committed_hash.is_some(),
             has_latest_qc = latest_qc.is_some(),
-            jmt_block_height = jmt_block_height.0,
+            jmt_block_height = jmt_block_height.inner(),
             jmt_root = ?jmt_root,
             load_time_ms = elapsed * 1000.0,
             "Loaded recovered state from storage"

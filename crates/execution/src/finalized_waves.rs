@@ -124,7 +124,7 @@ mod tests {
     fn make_wave_id(block_height: u64) -> WaveId {
         WaveId {
             shard_group_id: ShardGroupId(0),
-            block_height: BlockHeight(block_height),
+            block_height: BlockHeight::new(block_height),
             remote_shards: BTreeSet::new(),
         }
     }
@@ -281,7 +281,7 @@ mod tests {
         let waves = store.all_waves();
         assert_eq!(waves.len(), 2);
         // BTreeMap iteration is ordered by key; lower block_height comes first.
-        assert_eq!(waves[0].certificate.wave_id.block_height.0, 1);
-        assert_eq!(waves[1].certificate.wave_id.block_height.0, 5);
+        assert_eq!(waves[0].certificate.wave_id.block_height.inner(), 1);
+        assert_eq!(waves[1].certificate.wave_id.block_height.inner(), 5);
     }
 }

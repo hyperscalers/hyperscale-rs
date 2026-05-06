@@ -81,8 +81,8 @@ impl GetBlockRequest {
         assert!(
             target_height >= height,
             "GetBlockRequest: target_height ({}) must be >= height ({})",
-            target_height.0,
-            height.0,
+            target_height.inner(),
+            height.inner(),
         );
         Self {
             height,
@@ -127,9 +127,9 @@ mod tests {
 
     #[test]
     fn test_get_block_request() {
-        let request = GetBlockRequest::new(BlockHeight(42), BlockHeight(100));
-        assert_eq!(request.height, BlockHeight(42));
-        assert_eq!(request.target_height, BlockHeight(100));
+        let request = GetBlockRequest::new(BlockHeight::new(42), BlockHeight::new(100));
+        assert_eq!(request.height, BlockHeight::new(42));
+        assert_eq!(request.target_height, BlockHeight::new(100));
         assert!(request.inventory.is_empty());
     }
 
@@ -142,7 +142,8 @@ mod tests {
             cert_have: None,
             provision_have: None,
         };
-        let req = GetBlockRequest::new(BlockHeight(1), BlockHeight(10)).with_inventory(inv);
+        let req =
+            GetBlockRequest::new(BlockHeight::new(1), BlockHeight::new(10)).with_inventory(inv);
         assert!(!req.inventory.is_empty());
         assert!(req.inventory.tx_have.is_some());
     }
@@ -152,11 +153,13 @@ mod tests {
         let mut bf: BloomFilter<TxHash> = BloomFilter::with_capacity(100, 0.01).unwrap();
         let h = TxHash::from_raw(Hash::from_bytes(b"tx"));
         bf.insert(&h);
-        let req = GetBlockRequest::new(BlockHeight(1), BlockHeight(10)).with_inventory(Inventory {
-            tx_have: Some(bf),
-            cert_have: None,
-            provision_have: None,
-        });
+        let req = GetBlockRequest::new(BlockHeight::new(1), BlockHeight::new(10)).with_inventory(
+            Inventory {
+                tx_have: Some(bf),
+                cert_have: None,
+                provision_have: None,
+            },
+        );
         let bytes = basic_encode(&req).unwrap();
         let decoded: GetBlockRequest = basic_decode(&bytes).unwrap();
         assert_eq!(req, decoded);

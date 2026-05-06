@@ -34,7 +34,7 @@ impl SubstateStore for RocksDbStorage {
     }
 
     fn jmt_height(&self) -> BlockHeight {
-        BlockHeight(self.read_jmt_metadata().0)
+        BlockHeight::new(self.read_jmt_metadata().0)
     }
 
     fn state_root(&self) -> StateRoot {
@@ -51,11 +51,11 @@ impl SubstateStore for RocksDbStorage {
         // reads all see one consistent LSN (see `snapshot_at` for why).
         let snapshot = self.db.snapshot();
         let (current_version, _) = read_jmt_metadata(&snapshot);
-        if block_height.0 > current_version {
+        if block_height.inner() > current_version {
             return None;
         }
         let floor = current_version.saturating_sub(self.jmt_history_length);
-        if block_height.0 < floor {
+        if block_height.inner() < floor {
             // Below retention — historical state no longer recoverable.
             // External API: return None (network-supplied heights may
             // legitimately fall out of range; `snapshot_at` would panic,
@@ -65,7 +65,7 @@ impl SubstateStore for RocksDbStorage {
         let snap = RocksDbSnapshot {
             snapshot,
             db: &self.db,
-            version: block_height.0,
+            version: block_height.inner(),
             current_version,
         };
         Some(snap.list_raw_values_for_node(node_id))
@@ -106,7 +106,7 @@ impl VersionedStore for RocksDbStorage {
         // boundary invariant there. Zero-margin by design.
         let floor = current_version.saturating_sub(self.jmt_history_length);
         assert!(
-            height.0 >= floor,
+            height.inner() >= floor,
             "snapshot_at({height}) below retention floor {floor} \
              (current_version={current_version}, jmt_history_length={}) — \
              BFT/DA invariant broken; caller must anchor within retention",
@@ -115,7 +115,7 @@ impl VersionedStore for RocksDbStorage {
         RocksDbSnapshot {
             snapshot,
             db: &self.db,
-            version: height.0,
+            version: height.inner(),
             current_version,
         }
     }
@@ -156,9 +156,9 @@ impl RocksDbStorage {
             );
             return false;
         }
-        if current_version != jmt_snapshot.base_height.0 {
+        if current_version != jmt_snapshot.base_height.inner() {
             tracing::debug!(
-                expected_version = jmt_snapshot.base_height.0,
+                expected_version = jmt_snapshot.base_height.inner(),
                 actual_version = current_version,
                 "JMT snapshot base VERSION mismatch (root matches) - proceeding with fast path. \
                  This is expected when empty commits advance the version counter."
@@ -168,7 +168,7 @@ impl RocksDbStorage {
         let nodes_count = jmt_snapshot.nodes.len();
         let stale_count = jmt_snapshot.stale_node_keys.len();
         let associations_count = jmt_snapshot.leaf_substate_associations.len();
-        let new_version = jmt_snapshot.new_height.0;
+        let new_version = jmt_snapshot.new_height.inner();
         let new_root = jmt_snapshot.result_root;
 
         self.append_jmt_to_batch(&mut write_batch, jmt_snapshot, new_version);

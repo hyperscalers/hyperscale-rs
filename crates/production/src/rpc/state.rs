@@ -157,10 +157,10 @@ mod tests {
 
         // Pending -> Committed
         cache.insert(tx_hash, TransactionStatus::Pending);
-        cache.insert(tx_hash, TransactionStatus::Committed(BlockHeight(10)));
+        cache.insert(tx_hash, TransactionStatus::Committed(BlockHeight::new(10)));
 
         let status = cache.get(&tx_hash).unwrap();
-        assert!(matches!(status, TransactionStatus::Committed(h) if h.0 == 10));
+        assert!(matches!(status, TransactionStatus::Committed(h) if h.inner() == 10));
 
         // Committed -> Completed
         cache.insert(

@@ -261,7 +261,7 @@ mod tests {
     fn wave(height: u64) -> WaveId {
         WaveId {
             shard_group_id: shard(),
-            block_height: BlockHeight(height),
+            block_height: BlockHeight::new(height),
             remote_shards: BTreeSet::new(),
         }
     }
@@ -313,7 +313,7 @@ mod tests {
         let signature = kp.sign_v1(&msg);
         ExecutionVote {
             block_hash: BlockHash::ZERO,
-            block_height: BlockHeight(1),
+            block_height: BlockHeight::new(1),
             vote_anchor_ts: anchor_ts,
             wave_id,
             shard_group_id: shard(),

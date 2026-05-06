@@ -906,7 +906,8 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            expand_nodes_with_owned_at_height(&store, &[account_id(1)], BlockHeight(5)).is_none()
+            expand_nodes_with_owned_at_height(&store, &[account_id(1)], BlockHeight::new(5))
+                .is_none()
         );
     }
 
@@ -914,7 +915,7 @@ mod tests {
     fn expand_at_height_includes_owned_vaults_sorted_dedup() {
         let account = account_id(1);
         let vault = fungible_vault_id(2);
-        let height = BlockHeight(5);
+        let height = BlockHeight::new(5);
         let mut store = MockStore::default();
         store.substates_at_height.insert(
             (account, height),
@@ -933,8 +934,8 @@ mod tests {
     fn expand_at_height_returns_declared_when_no_ownership() {
         let account = account_id(1);
         let store = MockStore::default(); // no substates at any height
-        let expanded =
-            expand_nodes_with_owned_at_height(&store, &[account], BlockHeight(5)).expect("present");
+        let expanded = expand_nodes_with_owned_at_height(&store, &[account], BlockHeight::new(5))
+            .expect("present");
         assert_eq!(expanded, vec![account]);
     }
 }

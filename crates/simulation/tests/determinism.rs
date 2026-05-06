@@ -520,7 +520,7 @@ fn test_view_change_complete_flow() {
         let node = runner.node(node_idx).expect("Node should exist");
         assert_eq!(
             node.bft().committed_height(),
-            BlockHeight(0),
+            BlockHeight::new(0),
             "Node {node_idx} should be at height 0"
         );
         assert_eq!(
@@ -814,7 +814,7 @@ fn test_block_commit_diagnostic() {
 
     for node_idx in 0..4u32 {
         let node = runner.node(node_idx).expect("Node should exist");
-        let qc_height = node.bft().latest_qc().map(|qc| qc.height.0);
+        let qc_height = node.bft().latest_qc().map(|qc| qc.height.inner());
         println!(
             "Node {}: committed_height={}, view={}, latest_qc_height={:?}",
             node_idx,
@@ -838,7 +838,7 @@ fn test_block_commit_diagnostic() {
 
     for node_idx in 0..4u32 {
         let node = runner.node(node_idx).expect("Node should exist");
-        let qc_height = node.bft().latest_qc().map(|qc| qc.height.0);
+        let qc_height = node.bft().latest_qc().map(|qc| qc.height.inner());
         println!(
             "Node {}: committed_height={}, view={}, latest_qc_height={:?}",
             node_idx,
@@ -932,7 +932,7 @@ fn test_block_commit_verification() {
     let max_height = *committed_heights.iter().max().unwrap();
     let min_height = *committed_heights.iter().min().unwrap();
     assert!(
-        max_height > BlockHeight(0),
+        max_height > BlockHeight::new(0),
         "Should have committed at least one block"
     );
     assert!(
@@ -997,7 +997,7 @@ fn test_block_commit_determinism() {
                 .unwrap()
                 .bft()
                 .latest_qc()
-                .map(|qc| qc.height.0)
+                .map(|qc| qc.height.inner())
         })
         .collect();
     let stats1 = runner1.stats().clone();
@@ -1017,7 +1017,7 @@ fn test_block_commit_determinism() {
                 .unwrap()
                 .bft()
                 .latest_qc()
-                .map(|qc| qc.height.0)
+                .map(|qc| qc.height.inner())
         })
         .collect();
     let stats2 = runner2.stats().clone();
@@ -1084,7 +1084,7 @@ fn test_sequential_commit() {
 
     // With 1000ms proposal interval, expect ~5 blocks in 7 seconds
     assert!(
-        max_h >= BlockHeight(5),
+        max_h >= BlockHeight::new(5),
         "Should have committed at least 5 blocks in 7 seconds, got {max_h}"
     );
     println!("Sequential commit verified: {max_h} blocks committed (heights: {final_heights:?})");
@@ -1112,10 +1112,10 @@ fn test_consensus_throughput() {
     let stats = runner.stats();
 
     #[allow(clippy::cast_precision_loss)] // headline throughput metric for human-readable output
-    let blocks_per_second = committed_height.0 as f64 / 10.0;
+    let blocks_per_second = committed_height.inner() as f64 / 10.0;
     #[allow(clippy::cast_precision_loss)] // headline throughput metric for human-readable output
     let messages_per_block = if committed_height > BlockHeight::GENESIS {
-        stats.messages_sent as f64 / committed_height.0 as f64
+        stats.messages_sent as f64 / committed_height.inner() as f64
     } else {
         0.0
     };
@@ -1129,7 +1129,7 @@ fn test_consensus_throughput() {
 
     // Pipeline-limited with no rate-limit floor; expect comfortable progress.
     assert!(
-        committed_height >= BlockHeight(5),
+        committed_height >= BlockHeight::new(5),
         "Should commit at least 5 blocks in 10 seconds"
     );
     assert!(
@@ -1383,7 +1383,7 @@ fn test_multi_shard_initialization() {
         assert_eq!(node.shard().0, 0, "Node {node_idx} should be in shard 0");
         assert_eq!(
             node.bft().committed_height(),
-            BlockHeight(0),
+            BlockHeight::new(0),
             "Node {node_idx} should be at genesis"
         );
     }
@@ -1394,7 +1394,7 @@ fn test_multi_shard_initialization() {
         assert_eq!(node.shard().0, 1, "Node {node_idx} should be in shard 1");
         assert_eq!(
             node.bft().committed_height(),
-            BlockHeight(0),
+            BlockHeight::new(0),
             "Node {node_idx} should be at genesis"
         );
     }
@@ -1822,7 +1822,7 @@ fn test_partition_recovery_hotstuff2() {
 
     // After partition heals, nodes should resume making progress
     // The key assertion: max_height should be higher than height_during
-    let height_diff = max_height.0.saturating_sub(min_height.0);
+    let height_diff = max_height.inner().saturating_sub(min_height.inner());
     println!("Height difference: {height_diff}");
 
     // With HotStuff-2 style view changes, recovery may be slower initially
@@ -1833,7 +1833,7 @@ fn test_partition_recovery_hotstuff2() {
          height_during={}, max_height={} (expected > {})",
         height_during,
         max_height,
-        (height_during + 3).0
+        (height_during + 3).inner()
     );
 
     // Small divergence is expected due to in-flight messages and sync timing
@@ -1954,7 +1954,7 @@ fn test_packet_loss_application() {
     // Some progress should still be made (consensus isn't completely broken)
     let max_height = *heights.iter().max().unwrap();
     assert!(
-        max_height > BlockHeight(0),
+        max_height > BlockHeight::new(0),
         "Some progress should be made even with 10% loss"
     );
 }
@@ -2039,7 +2039,7 @@ fn test_sync_triggers_when_behind() {
     let min_height = *heights.iter().min().unwrap();
 
     assert!(
-        max_height >= BlockHeight(5),
+        max_height >= BlockHeight::new(5),
         "Should have committed at least 5 blocks, got {max_height}"
     );
     // With targeted voting, nodes may differ by at most 1 committed height
@@ -2102,7 +2102,7 @@ fn test_committed_blocks_stored_for_sync() {
     // Check that node 0 has committed blocks
     let height = runner.node(0).unwrap().bft().committed_height();
     assert!(
-        height >= BlockHeight(5),
+        height >= BlockHeight::new(5),
         "Should have committed at least 5 blocks"
     );
 
@@ -2125,7 +2125,7 @@ fn test_sync_state_isolation() {
         let node = runner.node(i).unwrap();
         assert_eq!(
             node.bft().committed_height(),
-            BlockHeight(0),
+            BlockHeight::new(0),
             "Fresh node {i} should be at height 0"
         );
     }
@@ -2194,10 +2194,10 @@ fn test_isolated_node_divergence() {
     for i in 0..4u32 {
         let count = runner.committed_block_count(i);
         // Check specific heights
-        let has_46 = runner.has_committed_block(i, BlockHeight(46));
-        let has_47 = runner.has_committed_block(i, BlockHeight(47));
-        let has_48 = runner.has_committed_block(i, BlockHeight(48));
-        let has_49 = runner.has_committed_block(i, BlockHeight(49));
+        let has_46 = runner.has_committed_block(i, BlockHeight::new(46));
+        let has_47 = runner.has_committed_block(i, BlockHeight::new(47));
+        let has_48 = runner.has_committed_block(i, BlockHeight::new(48));
+        let has_49 = runner.has_committed_block(i, BlockHeight::new(49));
         println!(
             "  Node {i}: {count} blocks, has 46={has_46}, 47={has_47}, 48={has_48}, 49={has_49}"
         );

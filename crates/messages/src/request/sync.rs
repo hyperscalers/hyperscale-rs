@@ -55,9 +55,12 @@ mod tests {
 
     #[test]
     fn test_sync_complete_announcement() {
-        let announcement =
-            SyncCompleteAnnouncement::new(BlockHeight(100), ValidatorId(1), zero_bls_signature());
-        assert_eq!(announcement.synced_height, BlockHeight(100));
+        let announcement = SyncCompleteAnnouncement::new(
+            BlockHeight::new(100),
+            ValidatorId(1),
+            zero_bls_signature(),
+        );
+        assert_eq!(announcement.synced_height, BlockHeight::new(100));
         assert_eq!(announcement.validator, ValidatorId(1));
     }
 }

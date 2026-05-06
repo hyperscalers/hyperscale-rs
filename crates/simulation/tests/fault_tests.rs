@@ -190,7 +190,7 @@ fn transaction_fetch_fallback_when_gossip_dropped() {
             .max()
             .unwrap();
         assert!(
-            max_height > BlockHeight(0),
+            max_height > BlockHeight::new(0),
             "expected chain to advance past genesis, got max height {max_height}"
         );
     });
