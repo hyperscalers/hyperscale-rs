@@ -4,10 +4,11 @@
 //! - The generic [`Fetch`] state machine in this file owns scheduling
 //!   only — pending sets, chunking, in-flight caps.
 //! - [`binding`] provides per-payload glue: which `Fetch<Id>` instance on
-//!   [`FetchHost`] backs each payload, the wire shape of each request,
-//!   and which `ProtocolEvent` admits ids out of the in-flight set.
+//!   [`FetchHost`] backs each payload and the wire shape of each request.
+//!   The `ProtocolEvent` → in-flight-drain mapping lives outside the
+//!   binding, in `io_loop::drive_fetch_admission`.
 //! - [`host`] bundles the per-payload `Fetch<Id>` instances owned by the
-//!   I/O loop, plus the `apply_admission` fan-out and metrics readouts.
+//!   I/O loop, plus metrics readouts.
 //! - [`transaction_serve`] / [`provision_serve`] answer inbound requests
 //!   for the fetch payloads that have a dedicated wire request type.
 
@@ -71,8 +72,9 @@ pub enum FetchInput<Id> {
         ids: Vec<Id>,
     },
     /// Payload for `ids` landed via fetch response, gossip, or local
-    /// production. Fed by the binding's `apply_admission` hook on canonical
-    /// admission events. Records `record_fetch_completed` per id removed.
+    /// production. Fed by `io_loop::drive_fetch_admission` on canonical
+    /// admission `ProtocolEvent`s. Records `record_fetch_completed` per
+    /// id removed.
     Admitted {
         /// Ids whose payloads have been admitted.
         ids: Vec<Id>,

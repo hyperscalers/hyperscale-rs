@@ -78,9 +78,9 @@ where
     }
 
     /// Route an admission `ProtocolEvent` to whichever fetch bindings
-    /// drain in-flight tracking on it. Mirrors `apply_admission` but goes
-    /// through `drive_fetch` so the freed slots' `spawn_pending_fetches`
-    /// outputs reach the network instead of being silently dropped.
+    /// drain in-flight tracking on it. Goes through `drive_fetch` so the
+    /// freed slots' `spawn_pending_fetches` outputs reach the network in
+    /// the same event-loop turn instead of being silently dropped.
     pub(in crate::io_loop) fn drive_fetch_admission(&mut self, event: &ProtocolEvent) {
         match event {
             // Drain on TransactionsReceived to catch every delivered hash —

@@ -576,10 +576,11 @@ impl ProvisionCoordinator {
         // header's only job — verify these provisions — is done; hanging on
         // to it wastes memory. The in-flight fallback fetch (if any) is
         // drained by the `ProvisionsAdmitted` continuation emitted below —
-        // `apply_admission` translates that into `FetchInput::Admitted`,
-        // which counts toward `record_fetch_completed`. Explicit
-        // `AbandonFetch` is reserved for paths where no admission event
-        // fires (orphan cleanup in `on_block_committed`).
+        // `drive_fetch_admission` translates that into
+        // `FetchInput::Admitted`, which counts toward
+        // `record_fetch_completed`. Explicit `AbandonFetch` is reserved
+        // for paths where no admission event fires (orphan cleanup in
+        // `on_block_committed`).
         if let Some(header) = committed_header {
             let shard = header.header.shard_group_id;
             let height = header.header.height;

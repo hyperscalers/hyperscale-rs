@@ -6,8 +6,12 @@
 //! - the `Id` type the fetch is keyed by;
 //! - which `Fetch<Id>` instance on [`FetchHost`] backs it;
 //! - the request/response shape and the per-binding rules for translating
-//!   responses back into [`NodeInput`] events;
-//! - which `ProtocolEvent` admits ids out of the in-flight set.
+//!   responses back into [`NodeInput`] events.
+//!
+//! The `ProtocolEvent` → in-flight-drain mapping is *not* a per-binding
+//! concern: it lives in `io_loop::drive_fetch_admission`, which calls
+//! `Fetch::handle(FetchInput::Admitted { .. })` on the right binding
+//! when each canonical admission event fires.
 //!
 //! `IoLoop` invokes the trait methods through generic helpers
 //! (`process_fetch_outputs`, `dispatch_fetch_request`), so adding a new

@@ -2,10 +2,10 @@
 //!
 //! `NodeInput::FetchTick` fires on the periodic `FetchTick` timer. It
 //! advances every fetch protocol's idle clock so retries / chunk emission
-//! progresses without waiting for an admission event. Pending entries are
-//! drained by `apply_admission` on canonical admission events and by
-//! explicit `Action::AbandonFetch` actions emitted from the originating
-//! coordinator at every expected-set drop site.
+//! progresses without waiting for an admission event. Pending entries
+//! are drained by `drive_fetch_admission` on canonical admission events
+//! and by explicit `Action::AbandonFetch` actions emitted from the
+//! originating coordinator at every expected-set drop site.
 
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::Engine;
