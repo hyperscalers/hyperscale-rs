@@ -10,6 +10,7 @@ use sbor::{
     NoCustomTypeKind, NoCustomValueKind, RustTypeId, TypeData, TypeKind, ValueKind,
 };
 
+use crate::sbor_codec::decode_bounded_vec;
 use crate::{
     BlockHeight, Bls12381G2Signature, ExecutionCertificateHash, GlobalReceiptRoot, Hash,
     MAX_TX_HASHES_PER_BLOCK, RETENTION_HORIZON, ShardGroupId, SignerBitfield, TxOutcome, WaveId,
@@ -120,22 +121,7 @@ impl<D: Decoder<NoCustomValueKind>> Decode<NoCustomValueKind, D> for ExecutionCe
         let wave_id: WaveId = decoder.decode()?;
         let vote_anchor_ts: WeightedTimestamp = decoder.decode()?;
         let global_receipt_root: GlobalReceiptRoot = decoder.decode()?;
-        // Bounded inline rather than via SBOR's default Vec decoder, which
-        // would honor a peer-supplied `len` up to the entire 10 MB libp2p
-        // message budget.
-        decoder.read_and_check_value_kind(ValueKind::Array)?;
-        let element_kind = decoder.read_and_check_value_kind(TxOutcome::value_kind())?;
-        let tx_outcomes_len = decoder.read_size()?;
-        if tx_outcomes_len > MAX_TX_HASHES_PER_BLOCK {
-            return Err(DecodeError::UnexpectedSize {
-                expected: MAX_TX_HASHES_PER_BLOCK,
-                actual: tx_outcomes_len,
-            });
-        }
-        let mut tx_outcomes = Vec::with_capacity(tx_outcomes_len.min(1024));
-        for _ in 0..tx_outcomes_len {
-            tx_outcomes.push(decoder.decode_deeper_body_with_value_kind(element_kind)?);
-        }
+        let tx_outcomes = decode_bounded_vec::<_, TxOutcome>(decoder, MAX_TX_HASHES_PER_BLOCK)?;
         let aggregated_signature: Bls12381G2Signature = decoder.decode()?;
         let signers: SignerBitfield = decoder.decode()?;
         // The BLS aggregate only commits to (global_receipt_root, tx_count),
