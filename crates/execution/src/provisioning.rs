@@ -149,7 +149,7 @@ impl ProvisioningTracker {
                 target_shard: local_shard,
                 source_shard,
                 block_height: provisions.block_height,
-                entries: Arc::new(tx_entry.entries.clone()),
+                entries: Arc::new(tx_entry.entries.0.clone()),
             };
             self.verified.entry(tx_hash).or_default().push(provision);
             self.received
@@ -271,11 +271,7 @@ mod tests {
     ) -> Arc<Provisions> {
         let transactions: Vec<TxEntries> = tx_hashes
             .into_iter()
-            .map(|tx_hash| TxEntries {
-                tx_hash,
-                entries: vec![],
-                target_nodes: vec![],
-            })
+            .map(|tx_hash| TxEntries::new(tx_hash, vec![], vec![]))
             .collect();
         Arc::new(Provisions::new(
             source,

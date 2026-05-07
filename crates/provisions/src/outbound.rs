@@ -246,11 +246,7 @@ mod tests {
     fn make_provisions(source_block: BlockHeight, txs: &[TxHash]) -> Arc<Provisions> {
         let transactions = txs
             .iter()
-            .map(|h| TxEntries {
-                tx_hash: *h,
-                entries: vec![],
-                target_nodes: vec![],
-            })
+            .map(|h| TxEntries::new(*h, vec![], vec![]))
             .collect();
         Arc::new(Provisions::new(
             ShardGroupId::new(0),

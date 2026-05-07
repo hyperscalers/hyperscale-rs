@@ -3,35 +3,42 @@
 use std::collections::HashSet;
 
 use sbor::prelude::*;
-use sbor::{
-    Categorize, Decode, DecodeError, Decoder, Describe, Encode, EncodeError, Encoder,
-    NoCustomTypeKind, NoCustomValueKind, RustTypeId, TypeData, TypeKind, ValueKind,
-};
 
-use crate::sbor_codec::decode_bounded_vec;
-use crate::{MAX_DECLARED_NODES_PER_TX, MAX_STATE_ENTRIES_PER_TX, NodeId, StateEntry, TxHash};
+use crate::{
+    BoundedVec, MAX_DECLARED_NODES_PER_TX, MAX_STATE_ENTRIES_PER_TX, NodeId, StateEntry, TxHash,
+};
 
 /// Per-transaction state entries within a provision.
 ///
 /// Identifies which transaction, what state it touched on the source shard,
 /// and what nodes it needs from the target shard (for conflict detection).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct TxEntries {
     /// Hash of the transaction.
     pub tx_hash: TxHash,
 
     /// The state entries this transaction touched on the source shard.
-    pub entries: Vec<StateEntry>,
+    pub entries: BoundedVec<StateEntry, MAX_STATE_ENTRIES_PER_TX>,
 
     /// Node IDs this transaction needs from the target shard.
     ///
     /// Used for bidirectional conflict detection: a true deadlock requires
     /// overlap in both directions (source nodes vs local needs, AND target
     /// nodes vs local owns).
-    pub target_nodes: Vec<NodeId>,
+    pub target_nodes: BoundedVec<NodeId, MAX_DECLARED_NODES_PER_TX>,
 }
 
 impl TxEntries {
+    /// Build a `TxEntries` from raw `Vec`s — wraps each in its bounded type.
+    #[must_use]
+    pub fn new(tx_hash: TxHash, entries: Vec<StateEntry>, target_nodes: Vec<NodeId>) -> Self {
+        Self {
+            tx_hash,
+            entries: entries.into(),
+            target_nodes: target_nodes.into(),
+        }
+    }
+
     /// Get the node IDs referenced by this transaction's entries.
     #[must_use]
     pub fn node_ids(&self) -> HashSet<NodeId> {
@@ -42,63 +49,11 @@ impl TxEntries {
     }
 }
 
-impl<E: Encoder<NoCustomValueKind>> Encode<NoCustomValueKind, E> for TxEntries {
-    fn encode_value_kind(&self, encoder: &mut E) -> Result<(), EncodeError> {
-        encoder.write_value_kind(ValueKind::Tuple)
-    }
-
-    fn encode_body(&self, encoder: &mut E) -> Result<(), EncodeError> {
-        encoder.write_size(3)?;
-        encoder.encode(&self.tx_hash)?;
-        encoder.encode(&self.entries)?;
-        encoder.encode(&self.target_nodes)?;
-        Ok(())
-    }
-}
-
-impl<D: Decoder<NoCustomValueKind>> Decode<NoCustomValueKind, D> for TxEntries {
-    fn decode_body_with_value_kind(
-        decoder: &mut D,
-        value_kind: ValueKind<NoCustomValueKind>,
-    ) -> Result<Self, DecodeError> {
-        decoder.check_preloaded_value_kind(value_kind, ValueKind::Tuple)?;
-        let length = decoder.read_size()?;
-        if length != 3 {
-            return Err(DecodeError::UnexpectedSize {
-                expected: 3,
-                actual: length,
-            });
-        }
-        let tx_hash: TxHash = decoder.decode()?;
-        let entries = decode_bounded_vec::<_, StateEntry>(decoder, MAX_STATE_ENTRIES_PER_TX)?;
-        let target_nodes = decode_bounded_vec::<_, NodeId>(decoder, MAX_DECLARED_NODES_PER_TX)?;
-        Ok(Self {
-            tx_hash,
-            entries,
-            target_nodes,
-        })
-    }
-}
-
-impl Categorize<NoCustomValueKind> for TxEntries {
-    fn value_kind() -> ValueKind<NoCustomValueKind> {
-        ValueKind::Tuple
-    }
-}
-
-impl Describe<NoCustomTypeKind> for TxEntries {
-    const TYPE_ID: RustTypeId = RustTypeId::novel_with_code("TxEntries", &[], &[]);
-
-    fn type_data() -> TypeData<NoCustomTypeKind, RustTypeId> {
-        TypeData::unnamed(TypeKind::Any)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use sbor::{
-        BASIC_SBOR_V1_MAX_DEPTH, BASIC_SBOR_V1_PAYLOAD_PREFIX, VecEncoder, basic_decode,
-        basic_encode,
+        BASIC_SBOR_V1_MAX_DEPTH, BASIC_SBOR_V1_PAYLOAD_PREFIX, Categorize as _, DecodeError,
+        Encoder as _, NoCustomValueKind, ValueKind, VecEncoder, basic_decode, basic_encode,
     };
 
     use super::*;
@@ -110,11 +65,11 @@ mod tests {
 
     #[test]
     fn sbor_roundtrip() {
-        let tx_entries = TxEntries {
-            tx_hash: TxHash::from_raw(Hash::from_bytes(b"tx")),
-            entries: vec![sample_entry(1), sample_entry(2)],
-            target_nodes: vec![NodeId([3u8; 30]), NodeId([4u8; 30])],
-        };
+        let tx_entries = TxEntries::new(
+            TxHash::from_raw(Hash::from_bytes(b"tx")),
+            vec![sample_entry(1), sample_entry(2)],
+            vec![NodeId([3u8; 30]), NodeId([4u8; 30])],
+        );
         let bytes = basic_encode(&tx_entries).unwrap();
         let decoded: TxEntries = basic_decode(&bytes).unwrap();
         assert_eq!(decoded, tx_entries);

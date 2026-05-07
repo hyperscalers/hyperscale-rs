@@ -523,11 +523,11 @@ mod tests {
             ShardGroupId::new(1),
             BlockHeight::new(1),
             MerkleInclusionProof::dummy(),
-            vec![TxEntries {
-                tx_hash: TxHash::from_raw(Hash::from_bytes(b"outbound-tx")),
-                entries: vec![],
-                target_nodes: vec![],
-            }],
+            vec![TxEntries::new(
+                TxHash::from_raw(Hash::from_bytes(b"outbound-tx")),
+                vec![],
+                vec![],
+            )],
         ));
         let _ = node.handle(ProtocolEvent::OutboundProvisionBroadcast {
             provisions,

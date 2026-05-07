@@ -329,11 +329,11 @@ mod tests {
 
     #[test]
     fn test_tx_entries_node_ids() {
-        let tx = TxEntries {
-            tx_hash: TxHash::from_raw(Hash::from_bytes(b"tx")),
-            entries: vec![test_entry(1), test_entry(2)],
-            target_nodes: vec![],
-        };
+        let tx = TxEntries::new(
+            TxHash::from_raw(Hash::from_bytes(b"tx")),
+            vec![test_entry(1), test_entry(2)],
+            vec![],
+        );
         let nodes = tx.node_ids();
         assert_eq!(nodes.len(), 2);
         assert!(nodes.contains(&NodeId([1; 30])));
@@ -347,11 +347,11 @@ mod tests {
             ShardGroupId::new(1),
             BlockHeight::new(10),
             MerkleInclusionProof::dummy(),
-            vec![TxEntries {
-                tx_hash: TxHash::from_raw(Hash::from_bytes(b"tx1")),
-                entries: vec![test_entry(1)],
-                target_nodes: vec![],
-            }],
+            vec![TxEntries::new(
+                TxHash::from_raw(Hash::from_bytes(b"tx1")),
+                vec![test_entry(1)],
+                vec![],
+            )],
         );
 
         let bytes = basic_encode(&provisions).unwrap();
@@ -368,16 +368,16 @@ mod tests {
             BlockHeight::new(10),
         );
         provisions.transactions = vec![
-            TxEntries {
-                tx_hash: TxHash::from_raw(Hash::from_bytes(b"tx1")),
-                entries: vec![entry.clone()],
-                target_nodes: vec![],
-            },
-            TxEntries {
-                tx_hash: TxHash::from_raw(Hash::from_bytes(b"tx2")),
-                entries: vec![entry, test_entry(2)],
-                target_nodes: vec![],
-            },
+            TxEntries::new(
+                TxHash::from_raw(Hash::from_bytes(b"tx1")),
+                vec![entry.clone()],
+                vec![],
+            ),
+            TxEntries::new(
+                TxHash::from_raw(Hash::from_bytes(b"tx2")),
+                vec![entry, test_entry(2)],
+                vec![],
+            ),
         ];
 
         let deduped = provisions.all_entries_deduped();

@@ -127,11 +127,7 @@ where
             shard_tx_entries
                 .entry(target_shard)
                 .or_default()
-                .push(TxEntries {
-                    tx_hash,
-                    entries: (*entries).clone(),
-                    target_nodes,
-                });
+                .push(TxEntries::new(tx_hash, (*entries).clone(), target_nodes));
         }
     }
 

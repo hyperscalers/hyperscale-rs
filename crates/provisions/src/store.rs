@@ -160,11 +160,11 @@ mod tests {
             ShardGroupId::new(0),
             BlockHeight::new(height),
             MerkleInclusionProof::dummy(),
-            vec![TxEntries {
-                tx_hash: TxHash::from_raw(Hash::from_bytes(&[tx_seed])),
-                entries: vec![],
-                target_nodes: vec![],
-            }],
+            vec![TxEntries::new(
+                TxHash::from_raw(Hash::from_bytes(&[tx_seed])),
+                vec![],
+                vec![],
+            )],
         ))
     }
 

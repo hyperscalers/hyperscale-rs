@@ -330,11 +330,11 @@ mod tests {
             ShardGroupId::new(2),
             BlockHeight::new(10),
             MerkleInclusionProof::dummy(),
-            vec![TxEntries {
-                tx_hash: TxHash::from_raw(Hash::from_bytes(b"tx1")),
-                entries: vec![],
-                target_nodes: vec![],
-            }],
+            vec![TxEntries::new(
+                TxHash::from_raw(Hash::from_bytes(b"tx1")),
+                vec![],
+                vec![],
+            )],
         );
 
         let msg1 = state_provisions_message(&provisions);

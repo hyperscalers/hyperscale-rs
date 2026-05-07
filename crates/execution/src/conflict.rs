@@ -357,10 +357,12 @@ mod tests {
             height,
             MerkleInclusionProof::dummy(),
             txs.into_iter()
-                .map(|(hash, source_nodes, target_nodes)| TxEntries {
-                    tx_hash: hash,
-                    entries: source_nodes.into_iter().map(make_entry).collect(),
-                    target_nodes,
+                .map(|(hash, source_nodes, target_nodes)| {
+                    TxEntries::new(
+                        hash,
+                        source_nodes.into_iter().map(make_entry).collect(),
+                        target_nodes,
+                    )
                 })
                 .collect(),
         )
