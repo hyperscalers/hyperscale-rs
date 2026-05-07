@@ -69,7 +69,7 @@ impl PartialEq for GetTransactionsResponse {
 impl Eq for GetTransactionsResponse {}
 
 // ============================================================================
-// Manual SBOR implementation (since Arc doesn't derive BasicSbor)
+// Manual SBOR. Bounds the decoded transaction count at 1000.
 // ============================================================================
 
 impl<E: Encoder<NoCustomValueKind>> Encode<NoCustomValueKind, E> for GetTransactionsResponse {

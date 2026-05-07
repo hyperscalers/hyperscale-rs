@@ -88,8 +88,10 @@ impl PartialEq for Block {
 impl Eq for Block {}
 
 // ============================================================================
-// Manual SBOR implementation (since Arc doesn't derive BasicSbor)
-// We serialize/deserialize the inner types directly.
+// Manual SBOR. Bounds the decoded transaction count at `MAX_TXS_PER_BLOCK`
+// and the provision count at `MAX_PROVISIONS_PER_BLOCK`; pins variant
+// discriminators (`BLOCK_VARIANT_LIVE`, `BLOCK_VARIANT_SEALED`) so future
+// enum additions can't silently renumber.
 // ============================================================================
 
 /// Helper to encode a Vec<Arc<RoutableTransaction>> as an SBOR array.

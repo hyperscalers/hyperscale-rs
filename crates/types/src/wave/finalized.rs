@@ -304,8 +304,7 @@ impl FinalizedWave {
     }
 }
 
-// Manual SBOR implementation for FinalizedWave (Arc fields prevent BasicSbor derive).
-// Encodes Arc<T> as T, decodes T and wraps in Arc.
+// Manual SBOR. Bounds the decoded `receipts` count at `MAX_TXS_PER_BLOCK`.
 
 impl<E: Encoder<NoCustomValueKind>> Encode<NoCustomValueKind, E> for FinalizedWave {
     fn encode_value_kind(&self, encoder: &mut E) -> Result<(), EncodeError> {
