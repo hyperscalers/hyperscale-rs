@@ -41,7 +41,7 @@ pub use action::{Action, CrossShardExecutionRequest, ProvisionsRequest};
 pub use action_context::{ActionContext, PreparedBlock};
 pub use fetch_abandon::FetchAbandon;
 pub use fetch_request::{FetchOrigin, FetchPeers, FetchRequest};
-pub use input::{EventPriority, NodeInput};
+pub use input::{EventPriority, FetchFailureKind, NodeInput};
 pub use protocol_event::{CommitSource, ProtocolEvent, VerificationKind};
 pub use timer::{TimerId, TimerScheduler};
 pub use traits::StateMachine;

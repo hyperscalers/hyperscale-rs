@@ -253,6 +253,8 @@ impl ScopeState {
     }
 }
 
+pub use hyperscale_core::FetchFailureKind;
+
 /// Inputs to the generic sync state machine.
 #[derive(Debug)]
 #[allow(missing_docs)] // payloads are self-describing
@@ -274,12 +276,13 @@ pub enum SyncInput<B: SyncBinding> {
         delivered_heights: Vec<BlockHeight>,
         now: Instant,
     },
-    /// The fetch round-trip failed (transport error / no peer / rejected).
-    /// All heights in `[from, from + count)` get deferred.
+    /// The fetch round-trip failed. Heights are re-queued; whether they
+    /// pay an exponential-backoff penalty depends on `kind`.
     FetchFailed {
         scope: B::Scope,
         from: BlockHeight,
         count: u64,
+        kind: FetchFailureKind,
         now: Instant,
     },
     /// The consumer admitted a height for `scope` (e.g. via QC verification).
@@ -407,8 +410,9 @@ impl<B: SyncBinding> Sync<B> {
                 scope,
                 from,
                 count,
+                kind,
                 now,
-            } => self.handle_fetch_failed(&scope, from, count, now),
+            } => self.handle_fetch_failed(&scope, from, count, kind, now),
             SyncInput::Admitted { scope, height } => self.handle_admitted(&scope, height),
             SyncInput::Tick { now } => self.handle_tick(now),
         }
@@ -507,6 +511,7 @@ impl<B: SyncBinding> Sync<B> {
         scope: &B::Scope,
         from: BlockHeight,
         count: u64,
+        kind: FetchFailureKind,
         now: Instant,
     ) -> Vec<SyncOutput<B>> {
         let Some(state) = self.scopes.get_mut(scope) else {
@@ -516,7 +521,24 @@ impl<B: SyncBinding> Sync<B> {
         for offset in 0..count {
             let h = BlockHeight::new(from.inner() + offset);
             if state.in_flight.remove(&h) && h <= state.target && h > state.committed {
-                state.deferred.entry(h).or_default().advance_round(now);
+                match kind {
+                    // The request manager already retried against rotated
+                    // peers (per-peer pool backoff + per-request retries
+                    // absorbed seconds of waiting). Adding an FSM-level
+                    // exponential deferral on top just stalls catch-up while
+                    // the source committee is recovering. Re-queue so the
+                    // freed slot can be used immediately; the per-peer
+                    // backoff layer keeps us off any genuinely dead peer.
+                    FetchFailureKind::Exhausted => {
+                        state.deferred.remove(&h);
+                        state.queue_height(h);
+                    }
+                    // Empty committee or transport-level fault — no point
+                    // retrying immediately. Apply the standard backoff.
+                    FetchFailureKind::NoPeers | FetchFailureKind::Transport => {
+                        state.deferred.entry(h).or_default().advance_round(now);
+                    }
+                }
             }
         }
         // The freed slot can carry other ready work immediately — heights
@@ -831,6 +853,7 @@ mod tests {
             scope: (),
             from: BlockHeight::new(1),
             count: 1,
+            kind: FetchFailureKind::Transport,
             now,
         });
         assert!(s.has_deferred());
@@ -852,6 +875,44 @@ mod tests {
             o,
             SyncOutput::Fetch { from, .. } if from.inner() == 1
         )));
+    }
+
+    #[test]
+    fn exhausted_failure_skips_backoff() {
+        // When the request manager exhausts retries against rotated peers,
+        // it has already absorbed seconds of waiting — the FSM should
+        // re-queue the height for immediate retry rather than piling its
+        // own exponential deferral on top.
+        let mut s: Sync<UnitBinding> = Sync::new(SyncConfig {
+            max_per_request: 1,
+            window_size: 32,
+            max_concurrent_per_scope: 1,
+        });
+        let _ = s.handle(SyncInput::StartSync {
+            scope: (),
+            target: BlockHeight::new(1),
+        });
+        let now = Instant::now();
+        let outputs = s.handle(SyncInput::FetchFailed {
+            scope: (),
+            from: BlockHeight::new(1),
+            count: 1,
+            kind: FetchFailureKind::Exhausted,
+            now,
+        });
+        // Height 1 should re-emerge as a Fetch in the same turn — no
+        // deferred backoff, no waiting for Tick.
+        assert!(
+            outputs.iter().any(|o| matches!(
+                o,
+                SyncOutput::Fetch { from, .. } if from.inner() == 1
+            )),
+            "Exhausted failure must re-queue immediately"
+        );
+        assert!(
+            !s.has_deferred(),
+            "Exhausted failure must not park the height in deferred"
+        );
     }
 
     #[test]
@@ -1160,6 +1221,7 @@ mod tests {
             scope: (),
             from: BlockHeight::new(1),
             count: 1,
+            kind: FetchFailureKind::Transport,
             now: Instant::now(),
         });
         assert!(

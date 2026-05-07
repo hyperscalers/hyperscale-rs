@@ -23,6 +23,20 @@ use tracing::{info, warn};
 use crate::adapter::Libp2pAdapter;
 use crate::inbound_router::{InboundRouterHandle, spawn_inbound_router};
 use crate::notify_pool::NotifyStreamPool;
+use crate::request_manager::RequestError as RmRequestError;
+
+/// Map a transport-level [`RmRequestError`] to the abstract
+/// [`RequestError`] without losing variant info — the FSM uses
+/// `Exhausted` to skip its own deferral after the transport already
+/// retried against rotated peers.
+fn translate_request_error(err: RmRequestError) -> RequestError {
+    match err {
+        RmRequestError::Exhausted { attempts } => RequestError::Exhausted { attempts },
+        RmRequestError::NoPeers => RequestError::NoPeers,
+        RmRequestError::Network(e) => RequestError::PeerError(format!("{e}")),
+        RmRequestError::Shutdown => RequestError::Shutdown,
+    }
+}
 use crate::request_manager::RequestManager;
 use crate::request_manager::peer_health::FailureKind;
 
@@ -254,7 +268,7 @@ impl Network for Libp2pNetwork {
                     }
                 }
                 Err(e) => {
-                    let _ = on_response(Err(RequestError::PeerError(format!("{e}"))));
+                    let _ = on_response(Err(translate_request_error(e)));
                 }
             }
         });

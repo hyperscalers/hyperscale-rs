@@ -467,8 +467,8 @@ where
             NodeInput::BlockSyncResponseReceived { height, block } => {
                 self.handle_block_sync_response_received(height, block);
             }
-            NodeInput::BlockSyncFetchFailed { height } => {
-                self.handle_block_sync_fetch_failed(height);
+            NodeInput::BlockSyncFetchFailed { height, kind } => {
+                self.handle_block_sync_fetch_failed(height, kind);
             }
             NodeInput::SyncBlockValidated { height, certified } => {
                 self.handle_sync_block_validated(height, *certified);
@@ -493,8 +493,9 @@ where
                 source_shard,
                 from_height,
                 count,
+                kind,
             } => {
-                self.handle_remote_headers_fetch_failed(source_shard, from_height, count);
+                self.handle_remote_headers_fetch_failed(source_shard, from_height, count, kind);
             }
 
             // ── Fetch protocol ─────────────────────────────────────────

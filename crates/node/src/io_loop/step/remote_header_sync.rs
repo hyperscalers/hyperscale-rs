@@ -6,7 +6,7 @@
 //! response decoding, and feeding delivered headers into per-header QC
 //! verification.
 
-use hyperscale_core::{NodeInput, ProtocolEvent};
+use hyperscale_core::{FetchFailureKind, NodeInput, ProtocolEvent};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::Engine;
 use hyperscale_messages::request::GetRemoteHeadersRequest;
@@ -21,6 +21,7 @@ use hyperscale_types::{
 };
 
 use crate::io_loop::IoLoop;
+use crate::io_loop::step::block_sync::classify_fetch_error;
 use crate::io_loop::sync::SyncOutput;
 use crate::io_loop::sync::remote_header::{RemoteHeaderSyncInput, RemoteHeaderSyncOutput};
 
@@ -125,6 +126,7 @@ where
         source_shard: ShardGroupId,
         from_height: BlockHeight,
         count: HeaderFetchCount,
+        kind: FetchFailureKind,
     ) {
         let outputs = self
             .syncs
@@ -133,6 +135,7 @@ where
                 scope: source_shard,
                 from: from_height,
                 count: count.inner(),
+                kind,
                 now: std::time::Instant::now(),
             });
         self.process_remote_header_sync_outputs(outputs);
@@ -173,21 +176,26 @@ where
                         request,
                         None,
                         Box::new(move |result: Result<GetRemoteHeadersResponse, _>| {
-                            if let Ok(resp) = result {
-                                record_sync_round_completed("remote_header");
-                                let _ = es.send(NodeInput::RemoteHeadersResponseReceived {
-                                    source_shard,
-                                    from_height,
-                                    count: typed_count,
-                                    headers: resp.headers,
-                                });
-                            } else {
-                                record_sync_round_retried("remote_header");
-                                let _ = es.send(NodeInput::RemoteHeadersFetchFailed {
-                                    source_shard,
-                                    from_height,
-                                    count: typed_count,
-                                });
+                            match result {
+                                Ok(resp) => {
+                                    record_sync_round_completed("remote_header");
+                                    let _ = es.send(NodeInput::RemoteHeadersResponseReceived {
+                                        source_shard,
+                                        from_height,
+                                        count: typed_count,
+                                        headers: resp.headers,
+                                    });
+                                }
+                                Err(err) => {
+                                    record_sync_round_retried("remote_header");
+                                    let kind = classify_fetch_error(&err);
+                                    let _ = es.send(NodeInput::RemoteHeadersFetchFailed {
+                                        source_shard,
+                                        from_height,
+                                        count: typed_count,
+                                        kind,
+                                    });
+                                }
                             }
                             ResponseVerdict::Accept
                         }),

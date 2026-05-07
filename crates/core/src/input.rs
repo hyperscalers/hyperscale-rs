@@ -79,6 +79,9 @@ pub enum NodeInput {
     BlockSyncFetchFailed {
         /// Height that failed to fetch.
         height: BlockHeight,
+        /// Why the fetch failed — drives whether the sync FSM re-queues
+        /// immediately or applies exponential deferral.
+        kind: FetchFailureKind,
     },
 
     /// Sync block passed structural validation off-thread (Merkle roots,
@@ -122,6 +125,9 @@ pub enum NodeInput {
         from_height: BlockHeight,
         /// Number of heights the request covered.
         count: HeaderFetchCount,
+        /// Why the fetch failed — drives whether the sync FSM re-queues
+        /// immediately or applies exponential deferral.
+        kind: FetchFailureKind,
     },
 
     /// Periodic tick for the fetch protocol to retry pending operations.
@@ -278,4 +284,26 @@ impl From<ProtocolEvent> for NodeInput {
     fn from(event: ProtocolEvent) -> Self {
         Self::Protocol(Box::new(event))
     }
+}
+
+/// Why a sync fetch failed, picked by the I/O glue when translating a
+/// network-layer `RequestError` into a [`NodeInput::BlockSyncFetchFailed`]
+/// or [`NodeInput::RemoteHeadersFetchFailed`].
+///
+/// The sync FSM uses this to decide whether to apply exponential deferral.
+/// `Exhausted` only arrives after the request manager has already retried
+/// against rotated peers — the network layer absorbed seconds of waiting,
+/// so the FSM re-queues immediately. Other kinds reflect transport
+/// conditions where a brief deferral is appropriate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchFailureKind {
+    /// Request manager retried against rotated peers and gave up. The
+    /// network layer already absorbed the wait — re-queue immediately.
+    Exhausted,
+    /// No peers available to send to (empty topology committee). Defer
+    /// with backoff so we don't spin until the committee populates.
+    NoPeers,
+    /// Transport-level error (connection issue, network shutdown). Rare;
+    /// defer with backoff.
+    Transport,
 }

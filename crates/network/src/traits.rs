@@ -27,9 +27,22 @@ pub enum RequestError {
     /// No response received within the configured timeout.
     #[error("Request timed out")]
     Timeout,
+    /// The transport's request manager retried the request against rotated
+    /// peers and exhausted its retry budget. The transport already absorbed
+    /// per-peer + per-request backoff before surfacing this — callers
+    /// should retry immediately rather than pile additional deferral on
+    /// top.
+    #[error("Request exhausted after {attempts} attempts")]
+    Exhausted {
+        /// Number of attempts the transport made.
+        attempts: u32,
+    },
     /// Network layer could not reach the named peer.
     #[error("Peer unreachable: {0}")]
     PeerUnreachable(ValidatorId),
+    /// No peers available in the target pool.
+    #[error("No peers available")]
+    NoPeers,
     /// Peer answered with an application-level error.
     #[error("Peer returned error: {0}")]
     PeerError(String),

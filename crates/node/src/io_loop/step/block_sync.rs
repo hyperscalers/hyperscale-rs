@@ -16,7 +16,23 @@
 //! tracks heights and emits `Fetch { from, count }` for the binding to
 //! turn into a network round-trip.
 
-use hyperscale_core::{NodeInput, ProtocolEvent};
+use hyperscale_core::{FetchFailureKind, NodeInput, ProtocolEvent};
+use hyperscale_network::RequestError;
+
+/// Classify a transport-level request error for the sync FSM. `Exhausted`
+/// already absorbed retries against rotated peers — re-queue immediately;
+/// other variants reflect transport conditions where a brief deferral is
+/// appropriate.
+pub(in crate::io_loop) const fn classify_fetch_error(err: &RequestError) -> FetchFailureKind {
+    match err {
+        RequestError::Exhausted { .. } => FetchFailureKind::Exhausted,
+        RequestError::NoPeers => FetchFailureKind::NoPeers,
+        RequestError::Timeout
+        | RequestError::PeerUnreachable(_)
+        | RequestError::PeerError(_)
+        | RequestError::Shutdown => FetchFailureKind::Transport,
+    }
+}
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_engine::Engine;
 use hyperscale_messages::request::Inventory;
@@ -72,7 +88,9 @@ where
     ) {
         let Some(elided) = block else {
             // Peer didn't have the block — re-queue via fetch-failed.
-            self.feed_block_sync_fetch_failed(height);
+            // Treat as exhausted so the FSM doesn't pile its own backoff on
+            // top of the request manager's; we just want another attempt.
+            self.feed_block_sync_fetch_failed(height, FetchFailureKind::Exhausted);
             return;
         };
         let cert = match self.rehydrate_elided_block(&elided) {
@@ -84,7 +102,10 @@ where
                 };
                 record_sync_response_error("block", reason);
                 self.syncs.block.mark_force_full_refetch(height);
-                self.feed_block_sync_fetch_failed(height);
+                // Rehydration is a local-data issue resolved by force-full
+                // on the next attempt — re-queue immediately rather than
+                // backing off.
+                self.feed_block_sync_fetch_failed(height, FetchFailureKind::Exhausted);
                 return;
             }
         };
@@ -107,9 +128,13 @@ where
     }
 
     /// Handle a sync block fetch failure (network error / not-found).
-    pub(in crate::io_loop) fn handle_block_sync_fetch_failed(&mut self, height: BlockHeight) {
+    pub(in crate::io_loop) fn handle_block_sync_fetch_failed(
+        &mut self,
+        height: BlockHeight,
+        kind: FetchFailureKind,
+    ) {
         record_sync_response_error("block", "fetch_failed");
-        self.feed_block_sync_fetch_failed(height);
+        self.feed_block_sync_fetch_failed(height, kind);
     }
 
     /// Resume the post-validation delivery path after off-thread
@@ -131,7 +156,10 @@ where
     ) {
         tracing::warn!(height = height.inner(), reason, "Sync: rejecting response");
         record_sync_block_filtered("block", reason);
-        self.feed_block_sync_fetch_failed(height);
+        // Validation failure is a peer-content issue, not a transport
+        // exhaustion — apply the standard backoff so we don't spin if a
+        // peer keeps shipping malformed responses.
+        self.feed_block_sync_fetch_failed(height, FetchFailureKind::Transport);
     }
 
     // ─── Sync output processing + helpers ───────────────────────────────
@@ -194,8 +222,9 @@ where
                         let block = resp.into_elided().map(Box::new);
                         let _ = es.send(NodeInput::BlockSyncResponseReceived { height, block });
                     }
-                    Err(_) => {
-                        let _ = es.send(NodeInput::BlockSyncFetchFailed { height });
+                    Err(err) => {
+                        let kind = classify_fetch_error(&err);
+                        let _ = es.send(NodeInput::BlockSyncFetchFailed { height, kind });
                     }
                 }
                 // "Peer doesn't have this height" is ambiguous (peer may
@@ -251,12 +280,13 @@ where
     }
 
     /// Common back-edge: re-queue a height via `FetchFailed`.
-    fn feed_block_sync_fetch_failed(&mut self, height: BlockHeight) {
+    fn feed_block_sync_fetch_failed(&mut self, height: BlockHeight, kind: FetchFailureKind) {
         record_sync_round_retried("block");
         let outputs = self.syncs.block.handle(BlockSyncInput::FetchFailed {
             scope: (),
             from: height,
             count: 1,
+            kind,
             now: std::time::Instant::now(),
         });
         self.process_block_sync_outputs(outputs);
