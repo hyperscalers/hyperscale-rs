@@ -1278,6 +1278,7 @@ impl BftCoordinator {
                 block_hash = ?block_hash,
                 missing_txs = pending.missing_transaction_count(),
                 missing_waves = pending.missing_wave_count(),
+                missing_provisions = pending.missing_provision_count(),
                 "Block incomplete, will fetch after timeout if still missing"
             );
         }
@@ -2617,6 +2618,7 @@ impl BftCoordinator {
                         height = height.inner(),
                         missing_txs = pending.missing_transaction_count(),
                         missing_waves = pending.missing_wave_count(),
+                        missing_provisions = pending.missing_provision_count(),
                         "View change — block still incomplete (missing data)"
                     );
                 }

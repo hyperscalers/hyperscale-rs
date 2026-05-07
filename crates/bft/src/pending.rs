@@ -189,6 +189,11 @@ impl PendingBlock {
         self.missing_wave_ids.len()
     }
 
+    /// Get the number of missing provision batches.
+    pub fn missing_provision_count(&self) -> usize {
+        self.missing_provision_hashes.len()
+    }
+
     /// Check if this pending block needs a specific finalized wave.
     pub fn needs_wave(&self, wave_id: &WaveId) -> bool {
         self.missing_wave_ids.contains(wave_id)
