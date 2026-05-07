@@ -202,10 +202,14 @@ apply_network_conditions() {
             # Create dummynet pipe with delay and packet loss
             sudo dnctl pipe 1 config delay ${latency}ms plr ${plr}
 
-            # Create pf rules for validator P2P ports only (not RPC)
+            # Create pf rules for validator P2P ports only (not RPC).
+            # Egress-only: on loopback, the same packet traverses pf at both the
+            # sender's `out` hook and the receiver's `in` hook. Matching both
+            # would feed the packet through pipe 1 twice, doubling the simulated
+            # one-way delay (and compounding loss). Source-port match catches
+            # every validator->validator packet since both endpoints are in range.
             cat <<EOF | sudo pfctl -f -
 # Hyperscale network simulation rules (P2P only)
-dummynet in proto udp from any to any port ${quic_port_start}:${quic_port_end} pipe 1
 dummynet out proto udp from any port ${quic_port_start}:${quic_port_end} to any pipe 1
 EOF
             sudo pfctl -e 2>/dev/null || true
