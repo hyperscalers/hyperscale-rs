@@ -58,7 +58,10 @@ impl<'a, S: SubstateDatabase> ProvisionedSnapshot<'a, S> {
 
         for entries in provisions_list {
             for entry in *entries {
-                provisions.insert(entry.storage_key.clone(), entry.value.clone());
+                provisions.insert(
+                    entry.storage_key.0.clone(),
+                    entry.value.as_ref().map(|v| v.0.clone()),
+                );
             }
         }
 
@@ -276,10 +279,7 @@ mod tests {
 
     /// Build a `StateEntry` whose `storage_key` lives in `partition()` at `sort(b)`.
     fn entry(part: &DbPartitionKey, b: u8, value: Option<Vec<u8>>) -> StateEntry {
-        StateEntry {
-            storage_key: keys::to_storage_key(part, &sort(b)),
-            value,
-        }
+        StateEntry::new(keys::to_storage_key(part, &sort(b)), value)
     }
 
     #[test]

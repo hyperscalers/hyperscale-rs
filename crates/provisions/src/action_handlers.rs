@@ -141,7 +141,7 @@ where
     for (shard, transactions) in sorted_shard_entries {
         let shard_keys: Vec<Vec<u8>> = transactions
             .iter()
-            .flat_map(|te| te.entries.iter().map(|e| e.storage_key.clone()))
+            .flat_map(|te| te.entries.iter().map(|e| e.storage_key.0.clone()))
             .collect();
 
         let Some(proof) = view.generate_merkle_proofs_overlay(&shard_keys, block_height) else {

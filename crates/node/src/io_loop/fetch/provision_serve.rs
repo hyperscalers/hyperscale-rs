@@ -76,7 +76,7 @@ pub fn serve_provision_request(
             return GetProvisionResponse { provisions: None };
         };
         for e in &entries {
-            all_storage_keys.push(e.storage_key.clone());
+            all_storage_keys.push(e.storage_key.0.clone());
         }
         per_tx.push((tx.hash(), entries));
     }

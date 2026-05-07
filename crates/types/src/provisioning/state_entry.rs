@@ -3,15 +3,10 @@
 use std::sync::Arc;
 
 use sbor::prelude::*;
-use sbor::{
-    Categorize, Decode, DecodeError, Decoder, Describe, Encode, EncodeError, Encoder,
-    NoCustomTypeKind, NoCustomValueKind, RustTypeId, TypeData, TypeKind, ValueKind,
-};
 
-use crate::sbor_codec::decode_bounded_bytes;
 use crate::{
-    BlockHeight, Hash, MAX_STATE_ENTRY_KEY_LEN, MAX_STATE_ENTRY_VALUE_LEN, NodeId, ShardGroupId,
-    TxHash,
+    BlockHeight, BoundedBytes, Hash, MAX_STATE_ENTRY_KEY_LEN, MAX_STATE_ENTRY_VALUE_LEN, NodeId,
+    ShardGroupId, TxHash,
 };
 
 // ============================================================================
@@ -25,76 +20,14 @@ use crate::{
 ///
 /// The storage key format is: `db_node_key(50) + partition_num(1) + sort_key(var)`
 /// where `db_node_key` is the `SpreadPrefixKeyMapper` hash (expensive to compute).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct StateEntry {
     /// Pre-computed full storage key (ready for direct DB lookup).
     /// Format: `db_node_key` (50 bytes) + partition (1 byte) + `sort_key`
-    pub storage_key: Vec<u8>,
+    pub storage_key: BoundedBytes<MAX_STATE_ENTRY_KEY_LEN>,
 
     /// SBOR-encoded substate value (None if deleted/doesn't exist).
-    pub value: Option<Vec<u8>>,
-}
-
-impl<E: Encoder<NoCustomValueKind>> Encode<NoCustomValueKind, E> for StateEntry {
-    fn encode_value_kind(&self, encoder: &mut E) -> Result<(), EncodeError> {
-        encoder.write_value_kind(ValueKind::Tuple)
-    }
-
-    fn encode_body(&self, encoder: &mut E) -> Result<(), EncodeError> {
-        encoder.write_size(2)?;
-        encoder.encode(&self.storage_key)?;
-        encoder.encode(&self.value)?;
-        Ok(())
-    }
-}
-
-impl<D: Decoder<NoCustomValueKind>> Decode<NoCustomValueKind, D> for StateEntry {
-    fn decode_body_with_value_kind(
-        decoder: &mut D,
-        value_kind: ValueKind<NoCustomValueKind>,
-    ) -> Result<Self, DecodeError> {
-        decoder.check_preloaded_value_kind(value_kind, ValueKind::Tuple)?;
-        let length = decoder.read_size()?;
-        if length != 2 {
-            return Err(DecodeError::UnexpectedSize {
-                expected: 2,
-                actual: length,
-            });
-        }
-        let storage_key = decode_bounded_bytes(decoder, MAX_STATE_ENTRY_KEY_LEN)?;
-        // `Option<Vec<u8>>` is `Enum::Some(Vec<u8>)` / `Enum::None` on the
-        // wire. Decode the discriminant manually so we can route the inner
-        // bytes through the bounded decoder rather than SBOR's default
-        // `Vec<u8>` fast path.
-        decoder.read_and_check_value_kind(ValueKind::Enum)?;
-        let discriminant = decoder.read_discriminator()?;
-        let value = match discriminant {
-            0 => {
-                decoder.read_and_check_size(0)?;
-                None
-            }
-            1 => {
-                decoder.read_and_check_size(1)?;
-                Some(decode_bounded_bytes(decoder, MAX_STATE_ENTRY_VALUE_LEN)?)
-            }
-            _ => return Err(DecodeError::UnknownDiscriminator(discriminant)),
-        };
-        Ok(Self { storage_key, value })
-    }
-}
-
-impl Categorize<NoCustomValueKind> for StateEntry {
-    fn value_kind() -> ValueKind<NoCustomValueKind> {
-        ValueKind::Tuple
-    }
-}
-
-impl Describe<NoCustomTypeKind> for StateEntry {
-    const TYPE_ID: RustTypeId = RustTypeId::novel_with_code("StateEntry", &[], &[]);
-
-    fn type_data() -> TypeData<NoCustomTypeKind, RustTypeId> {
-        TypeData::unnamed(TypeKind::Any)
-    }
+    pub value: Option<BoundedBytes<MAX_STATE_ENTRY_VALUE_LEN>>,
 }
 
 /// Hash prefix length in `db_node_key` (`SpreadPrefixKeyMapper` adds 20-byte hash)
@@ -103,8 +36,11 @@ const HASH_PREFIX_LEN: usize = 20;
 impl StateEntry {
     /// Create a new DB state entry with pre-computed storage key.
     #[must_use]
-    pub const fn new(storage_key: Vec<u8>, value: Option<Vec<u8>>) -> Self {
-        Self { storage_key, value }
+    pub fn new(storage_key: Vec<u8>, value: Option<Vec<u8>>) -> Self {
+        Self {
+            storage_key: storage_key.into(),
+            value: value.map(Into::into),
+        }
     }
 
     /// Extract the `NodeId` from the storage key.
@@ -166,7 +102,7 @@ impl StateEntry {
         storage_key.extend_from_slice(&node_id.0); // Node ID
         storage_key.push(partition); // Partition number
         storage_key.extend_from_slice(sort_key); // Sort key
-        Self { storage_key, value }
+        Self::new(storage_key, value)
     }
 }
 
@@ -210,8 +146,8 @@ impl Eq for StateProvision {}
 #[cfg(test)]
 mod tests {
     use sbor::{
-        BASIC_SBOR_V1_MAX_DEPTH, BASIC_SBOR_V1_PAYLOAD_PREFIX, Encoder as _, VecEncoder,
-        basic_decode, basic_encode,
+        BASIC_SBOR_V1_MAX_DEPTH, BASIC_SBOR_V1_PAYLOAD_PREFIX, DecodeError, Encoder as _,
+        NoCustomValueKind, ValueKind, VecEncoder, basic_decode, basic_encode,
     };
 
     use super::*;
