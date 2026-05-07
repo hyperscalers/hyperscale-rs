@@ -35,10 +35,14 @@ fn apply_quic_tuning(quic_config: &mut QuicConfig, app_config: &Libp2pConfig) {
     // Matches our max stream timeout (5s) for consistent timeout behavior.
     quic_config.handshake_timeout = Duration::from_secs(5);
     // Flow control: large windows to avoid stalls during block sync.
-    // max_stream_data: 2MB per stream handles large block transfers without WINDOW_UPDATE round-trips.
-    quic_config.max_stream_data = 2 * 1024 * 1024;
-    // max_connection_data: 8MB aggregate across all streams for burst sync scenarios.
-    quic_config.max_connection_data = 8 * 1024 * 1024;
+    // max_stream_data: 16MB per stream handles large cross-shard provision
+    // bodies (multi-MB merkle proofs + tx bundles) without WINDOW_UPDATE
+    // round-trips on high-RTT paths.
+    quic_config.max_stream_data = 16 * 1024 * 1024;
+    // max_connection_data: 64MB aggregate across all streams so several
+    // large cross-shard transfers can overlap on one connection without
+    // serializing on the connection-level receive window.
+    quic_config.max_connection_data = 64 * 1024 * 1024;
     // QUIC keep-alive: sends PING frames at this interval to keep connections alive
     quic_config.keep_alive_interval = app_config.keep_alive_interval;
     // QUIC idle timeout: connections are closed after this duration of inactivity
