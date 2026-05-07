@@ -606,7 +606,7 @@ impl ProductionRunner {
             .committee_for_shard(self.local_shard)
             .first()
             .copied()
-            .unwrap_or(ValidatorId(0));
+            .unwrap_or(ValidatorId::new(0));
 
         let genesis_block = Block::genesis(self.local_shard, first_validator, genesis_jmt_root);
 

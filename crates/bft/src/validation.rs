@@ -323,16 +323,16 @@ mod tests {
                 voting_power: VotePower::new(1),
             })
             .collect();
-        TopologySnapshot::new(ValidatorId(0), 1, ValidatorSet::new(validators))
+        TopologySnapshot::new(ValidatorId::new(0), 1, ValidatorSet::new(validators))
     }
 
     fn header_at_height(height: BlockHeight, timestamp_ms: u64) -> BlockHeader {
         BlockHeader {
-            shard_group_id: ShardGroupId(0),
+            shard_group_id: ShardGroupId::new(0),
             height,
             parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            parent_qc: QuorumCertificate::genesis(ShardGroupId(0)),
-            proposer: ValidatorId(height.inner() % 4),
+            parent_qc: QuorumCertificate::genesis(ShardGroupId::new(0)),
+            proposer: ValidatorId::new(height.inner() % 4),
             timestamp: ProposerTimestamp::from_millis(timestamp_ms),
             round: Round::new(0),
             is_fallback: false,
@@ -349,11 +349,11 @@ mod tests {
 
     fn block_with_waves(height: BlockHeight, waves: Vec<WaveId>) -> Block {
         let header = BlockHeader {
-            shard_group_id: ShardGroupId(0),
+            shard_group_id: ShardGroupId::new(0),
             height,
             parent_block_hash: BlockHash::ZERO,
-            parent_qc: QuorumCertificate::genesis(ShardGroupId(0)),
-            proposer: ValidatorId(0),
+            parent_qc: QuorumCertificate::genesis(ShardGroupId::new(0)),
+            proposer: ValidatorId::new(0),
             timestamp: ProposerTimestamp::from_millis(0),
             round: Round::INITIAL,
             is_fallback: false,
@@ -389,7 +389,7 @@ mod tests {
         let block = block_with_waves(
             BlockHeight::new(1),
             vec![WaveId::new(
-                ShardGroupId(99),
+                ShardGroupId::new(99),
                 BlockHeight::new(1),
                 BTreeSet::new(),
             )],
@@ -406,7 +406,7 @@ mod tests {
         let now = LocalTimestamp::from_millis(100_000);
         let mut header = header_at_height(BlockHeight::new(0), 0);
         header.parent_block_hash = BlockHash::from_raw(Hash::from_bytes(b"genesis_parent"));
-        header.proposer = ValidatorId(0);
+        header.proposer = ValidatorId::new(0);
         assert!(validate_timestamp(&header, now).is_ok());
     }
 
@@ -643,8 +643,8 @@ mod tests {
     fn provisions_with_seed(seed: u8) -> Arc<Provisions> {
         let tx_hash = TxHash::from_raw(Hash::from_bytes(&[seed; 32]));
         Arc::new(Provisions::new(
-            ShardGroupId(0),
-            ShardGroupId(1),
+            ShardGroupId::new(0),
+            ShardGroupId::new(1),
             BlockHeight::new(u64::from(seed)),
             MerkleInclusionProof::dummy(),
             vec![TxEntries {

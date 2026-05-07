@@ -71,13 +71,13 @@ mod tests {
     /// round-0 height-1 proposer.
     #[test]
     fn provisions_admitted_drives_proposal_through_post_dispatch_hook() {
-        // committee[1] = ValidatorId(1) is the round-0 height-1
+        // committee[1] = ValidatorId::new(1) is the round-0 height-1
         // proposer; pick local_idx=1 so we are it.
         let TestNode { mut node, .. } = TestNode::builder().local_idx(1).build();
 
         let provisions = Arc::new(Provisions::new(
-            ShardGroupId(1), // source
-            ShardGroupId(0), // target (local)
+            ShardGroupId::new(1), // source
+            ShardGroupId::new(0), // target (local)
             BlockHeight::new(1),
             MerkleInclusionProof(vec![]),
             vec![],

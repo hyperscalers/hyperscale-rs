@@ -1380,7 +1380,11 @@ fn test_multi_shard_initialization() {
     // Check nodes in shard 0 (nodes 0-3)
     for node_idx in 0..4u32 {
         let node = runner.node(node_idx).expect("Node should exist");
-        assert_eq!(node.shard().0, 0, "Node {node_idx} should be in shard 0");
+        assert_eq!(
+            node.shard().inner(),
+            0,
+            "Node {node_idx} should be in shard 0"
+        );
         assert_eq!(
             node.bft().committed_height(),
             BlockHeight::new(0),
@@ -1391,7 +1395,11 @@ fn test_multi_shard_initialization() {
     // Check nodes in shard 1 (nodes 4-7)
     for node_idx in 4..8u32 {
         let node = runner.node(node_idx).expect("Node should exist");
-        assert_eq!(node.shard().0, 1, "Node {node_idx} should be in shard 1");
+        assert_eq!(
+            node.shard().inner(),
+            1,
+            "Node {node_idx} should be in shard 1"
+        );
         assert_eq!(
             node.bft().committed_height(),
             BlockHeight::new(0),
@@ -1487,8 +1495,8 @@ fn test_cross_shard_latency() {
     );
 
     // Verify shard assignment
-    assert_eq!(shard_0.0, 0);
-    assert_eq!(shard_4.0, 1);
+    assert_eq!(shard_0.inner(), 0);
+    assert_eq!(shard_4.inner(), 1);
 
     println!("Cross-shard latency test passed");
     println!("  Intra-shard latency: {:?}", config.intra_shard_latency);
@@ -1513,7 +1521,7 @@ fn test_cross_shard_transaction_detection() {
         .iter()
         .enumerate()
         .map(|(i, k)| ValidatorInfo {
-            validator_id: ValidatorId(i as u64),
+            validator_id: ValidatorId::new(i as u64),
             public_key: k.public_key(),
             voting_power: VotePower::new(1),
         })
@@ -1522,12 +1530,18 @@ fn test_cross_shard_transaction_detection() {
 
     // Build shard committees
     let mut shard_committees: HashMap<ShardGroupId, Vec<ValidatorId>> = HashMap::new();
-    shard_committees.insert(ShardGroupId(0), vec![ValidatorId(0), ValidatorId(1)]);
-    shard_committees.insert(ShardGroupId(1), vec![ValidatorId(2), ValidatorId(3)]);
+    shard_committees.insert(
+        ShardGroupId::new(0),
+        vec![ValidatorId::new(0), ValidatorId::new(1)],
+    );
+    shard_committees.insert(
+        ShardGroupId::new(1),
+        vec![ValidatorId::new(2), ValidatorId::new(3)],
+    );
 
     let topology = TopologyCoordinator::with_shard_committees(
-        ValidatorId(0),
-        ShardGroupId(0),
+        ValidatorId::new(0),
+        ShardGroupId::new(0),
         2, // num_shards
         &validator_set,
         shard_committees,
@@ -1549,7 +1563,7 @@ fn test_cross_shard_transaction_detection() {
     // Create a single-shard transaction (all nodes in same shard)
     let same_shard_nodes: Vec<_> = (0..10u8)
         .map(test_node)
-        .filter(|n| topology.snapshot().shard_for_node_id(n) == ShardGroupId(0))
+        .filter(|n| topology.snapshot().shard_for_node_id(n) == ShardGroupId::new(0))
         .take(2)
         .collect();
 
@@ -1567,10 +1581,10 @@ fn test_cross_shard_transaction_detection() {
     // Create a cross-shard transaction (nodes in different shards)
     let shard0_node = (0..255u8)
         .map(test_node)
-        .find(|n| topology.snapshot().shard_for_node_id(n) == ShardGroupId(0));
+        .find(|n| topology.snapshot().shard_for_node_id(n) == ShardGroupId::new(0));
     let shard1_node = (0..255u8)
         .map(test_node)
-        .find(|n| topology.snapshot().shard_for_node_id(n) == ShardGroupId(1));
+        .find(|n| topology.snapshot().shard_for_node_id(n) == ShardGroupId::new(1));
 
     if let (Some(node0), Some(node1)) = (shard0_node, shard1_node) {
         let tx = test_transaction_with_nodes(b"cross_shard_tx", vec![node0], vec![node1]);

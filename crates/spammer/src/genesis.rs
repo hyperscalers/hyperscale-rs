@@ -52,7 +52,7 @@ pub fn generate_genesis_toml_for_shard(
     shard: u64,
 ) -> Result<String, GenesisError> {
     let pool = AccountPool::generate(num_shards, accounts_per_shard)?;
-    let shard_id = ShardGroupId(shard);
+    let shard_id = ShardGroupId::new(shard);
     let balances = pool.genesis_balances_for_shard(shard_id, balance);
 
     Ok(format_balances_toml(&balances, Some(shard)))

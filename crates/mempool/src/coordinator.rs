@@ -1082,10 +1082,10 @@ mod tests {
         fw: FinalizedWave,
     ) -> CertifiedBlock {
         let block = make_live_block(
-            ShardGroupId(0),
+            ShardGroupId::new(0),
             height,
             1_234_567_890,
-            ValidatorId(0),
+            ValidatorId::new(0),
             vec![Arc::new(tx)],
             vec![Arc::new(fw)],
         );
@@ -1110,16 +1110,16 @@ mod tests {
             .collect();
         let provision = Provisions::new(
             source_shard,
-            ShardGroupId(0),
+            ShardGroupId::new(0),
             height,
             MerkleInclusionProof::dummy(),
             transactions,
         );
         let block = match make_live_block(
-            ShardGroupId(0),
+            ShardGroupId::new(0),
             height,
             1_234_567_890,
-            ValidatorId(0),
+            ValidatorId::new(0),
             vec![],
             vec![],
         ) {
@@ -1152,7 +1152,7 @@ mod tests {
 
         let certified = certified_block_with_provisions(
             BlockHeight::new(5),
-            ShardGroupId(1),
+            ShardGroupId::new(1),
             &[already_seen_hash, unseen_hash],
         );
         mempool.on_block_committed(&topology, &certified);
@@ -1165,7 +1165,7 @@ mod tests {
         );
         assert_eq!(
             mempool.expected_tx_source(&unseen_hash),
-            Some(ShardGroupId(1))
+            Some(ShardGroupId::new(1))
         );
         assert!(
             mempool
@@ -1185,17 +1185,29 @@ mod tests {
         // Earliest sighting at H=3 from shard 1.
         mempool.on_block_committed(
             &topology,
-            &certified_block_with_provisions(BlockHeight::new(3), ShardGroupId(1), &[unseen_hash]),
+            &certified_block_with_provisions(
+                BlockHeight::new(3),
+                ShardGroupId::new(1),
+                &[unseen_hash],
+            ),
         );
         // Same source at a later height — no-op.
         mempool.on_block_committed(
             &topology,
-            &certified_block_with_provisions(BlockHeight::new(7), ShardGroupId(1), &[unseen_hash]),
+            &certified_block_with_provisions(
+                BlockHeight::new(7),
+                ShardGroupId::new(1),
+                &[unseen_hash],
+            ),
         );
         // A different source at a later height — also no-op (first sighting wins).
         mempool.on_block_committed(
             &topology,
-            &certified_block_with_provisions(BlockHeight::new(7), ShardGroupId(2), &[unseen_hash]),
+            &certified_block_with_provisions(
+                BlockHeight::new(7),
+                ShardGroupId::new(2),
+                &[unseen_hash],
+            ),
         );
 
         assert_eq!(mempool.pending_expected_count(), 1);
@@ -1205,7 +1217,7 @@ mod tests {
         );
         assert_eq!(
             mempool.expected_tx_source(&unseen_hash),
-            Some(ShardGroupId(1))
+            Some(ShardGroupId::new(1))
         );
     }
 
@@ -1220,7 +1232,7 @@ mod tests {
         // Provision arrives first, mempool starts expecting the tx.
         mempool.on_block_committed(
             &topology,
-            &certified_block_with_provisions(BlockHeight::new(1), ShardGroupId(1), &[tx_hash]),
+            &certified_block_with_provisions(BlockHeight::new(1), ShardGroupId::new(1), &[tx_hash]),
         );
         assert_eq!(mempool.pending_expected_count(), 1);
 
@@ -1239,7 +1251,7 @@ mod tests {
 
         mempool.on_block_committed(
             &topology,
-            &certified_block_with_provisions(BlockHeight::new(1), ShardGroupId(1), &[tx_hash]),
+            &certified_block_with_provisions(BlockHeight::new(1), ShardGroupId::new(1), &[tx_hash]),
         );
         assert_eq!(mempool.pending_expected_count(), 1);
 
@@ -1257,7 +1269,7 @@ mod tests {
 
         mempool.on_block_committed(
             &topology,
-            &certified_block_with_provisions(BlockHeight::new(1), ShardGroupId(1), &[tx_hash]),
+            &certified_block_with_provisions(BlockHeight::new(1), ShardGroupId::new(1), &[tx_hash]),
         );
         assert_eq!(mempool.pending_expected_count(), 1);
 
@@ -1284,11 +1296,15 @@ mod tests {
 
         mempool.on_block_committed(
             &topology,
-            &certified_block_with_provisions(BlockHeight::new(1), ShardGroupId(0), &[unseen_hash]),
+            &certified_block_with_provisions(
+                BlockHeight::new(1),
+                ShardGroupId::new(0),
+                &[unseen_hash],
+            ),
         );
         let actions = mempool.on_block_committed(
             &topology,
-            &certified_block_with_provisions(BlockHeight::new(4), ShardGroupId(0), &[]),
+            &certified_block_with_provisions(BlockHeight::new(4), ShardGroupId::new(0), &[]),
         );
         assert!(
             !actions
@@ -1303,7 +1319,7 @@ mod tests {
     fn fetch_emitted_after_grace_window_targets_source_committee() {
         // First sighting at H=1 (ts=500); H=5 (ts=2_500) → elapsed 2_000ms.
         let topology = make_test_topology();
-        let source = ShardGroupId(0);
+        let source = ShardGroupId::new(0);
         let mut mempool = MempoolCoordinator::new();
 
         let unseen_hash = test_transaction(1).hash();
@@ -1341,15 +1357,23 @@ mod tests {
         // committee even though shard 1 also referenced it.
         mempool.on_block_committed(
             &topology,
-            &certified_block_with_provisions(BlockHeight::new(1), ShardGroupId(0), &[unseen_hash]),
+            &certified_block_with_provisions(
+                BlockHeight::new(1),
+                ShardGroupId::new(0),
+                &[unseen_hash],
+            ),
         );
         mempool.on_block_committed(
             &topology,
-            &certified_block_with_provisions(BlockHeight::new(2), ShardGroupId(1), &[unseen_hash]),
+            &certified_block_with_provisions(
+                BlockHeight::new(2),
+                ShardGroupId::new(1),
+                &[unseen_hash],
+            ),
         );
         let actions = mempool.on_block_committed(
             &topology,
-            &certified_block_with_provisions(BlockHeight::new(5), ShardGroupId(0), &[]),
+            &certified_block_with_provisions(BlockHeight::new(5), ShardGroupId::new(0), &[]),
         );
 
         let fetches: Vec<_> = actions
@@ -1363,7 +1387,7 @@ mod tests {
         assert_eq!(fetches[0].0, &vec![unseen_hash]);
         assert_eq!(
             fetches[0].1.peers,
-            topology.committee_for_shard(ShardGroupId(0)).to_vec()
+            topology.committee_for_shard(ShardGroupId::new(0)).to_vec()
         );
     }
 
@@ -1383,7 +1407,7 @@ mod tests {
                 &topology,
                 &certified_block_with_provisions(
                     BlockHeight::new(1),
-                    ShardGroupId(0),
+                    ShardGroupId::new(0),
                     &[unseen_hash],
                 ),
             );
@@ -1392,7 +1416,7 @@ mod tests {
 
             mempool.on_block_committed(
                 &topology,
-                &certified_block_with_provisions(BlockHeight::new(700), ShardGroupId(0), &[]),
+                &certified_block_with_provisions(BlockHeight::new(700), ShardGroupId::new(0), &[]),
             );
             assert_eq!(mempool.pending_expected_count(), 0);
             assert_eq!(recorder.counter("expected_tx_dropped", None), 1);
@@ -1411,11 +1435,15 @@ mod tests {
 
         mempool.on_block_committed(
             &topology,
-            &certified_block_with_provisions(BlockHeight::new(1), ShardGroupId(0), &[unseen_hash]),
+            &certified_block_with_provisions(
+                BlockHeight::new(1),
+                ShardGroupId::new(0),
+                &[unseen_hash],
+            ),
         );
         mempool.on_block_committed(
             &topology,
-            &certified_block_with_provisions(BlockHeight::new(100), ShardGroupId(0), &[]),
+            &certified_block_with_provisions(BlockHeight::new(100), ShardGroupId::new(0), &[]),
         );
         assert_eq!(mempool.pending_expected_count(), 1);
     }
@@ -1432,11 +1460,15 @@ mod tests {
 
         mempool.on_block_committed(
             &topology,
-            &certified_block_with_provisions(BlockHeight::new(1), ShardGroupId(0), &[unseen_hash]),
+            &certified_block_with_provisions(
+                BlockHeight::new(1),
+                ShardGroupId::new(0),
+                &[unseen_hash],
+            ),
         );
         let actions = mempool.on_block_committed(
             &topology,
-            &certified_block_with_provisions(BlockHeight::new(700), ShardGroupId(0), &[]),
+            &certified_block_with_provisions(BlockHeight::new(700), ShardGroupId::new(0), &[]),
         );
 
         let abandoned: Vec<TxHash> = actions
@@ -1470,7 +1502,7 @@ mod tests {
 
         mempool.on_block_committed(
             &topology,
-            &certified_block_with_provisions(BlockHeight::new(1), ShardGroupId(1), &[tx_hash]),
+            &certified_block_with_provisions(BlockHeight::new(1), ShardGroupId::new(1), &[tx_hash]),
         );
         assert_eq!(mempool.pending_expected_count(), 1);
 
@@ -1510,7 +1542,7 @@ mod tests {
         // Block H=1 records the expectation.
         mempool.on_block_committed(
             &topology,
-            &certified_block_with_provisions(BlockHeight::new(1), ShardGroupId(0), &[tx_hash]),
+            &certified_block_with_provisions(BlockHeight::new(1), ShardGroupId::new(0), &[tx_hash]),
         );
         assert_eq!(mempool.pending_expected_count(), 1);
 
@@ -1518,7 +1550,7 @@ mod tests {
         // ends at 60_000ms; TEST_BLOCK_INTERVAL_MS=500 → past validity at H≥121.
         mempool.on_block_committed(
             &topology,
-            &certified_block_with_provisions(BlockHeight::new(125), ShardGroupId(0), &[]),
+            &certified_block_with_provisions(BlockHeight::new(125), ShardGroupId::new(0), &[]),
         );
 
         // Source committee delivers the tx body — but admission rejects
@@ -1552,13 +1584,13 @@ mod tests {
 
         mempool.on_block_committed(
             &topology,
-            &certified_block_with_provisions(BlockHeight::new(1), ShardGroupId(0), &[tx_hash]),
+            &certified_block_with_provisions(BlockHeight::new(1), ShardGroupId::new(0), &[tx_hash]),
         );
         mempool.on_transaction_gossip(&topology, Arc::new(tx), false, LocalTimestamp::ZERO);
 
         let actions = mempool.on_block_committed(
             &topology,
-            &certified_block_with_provisions(BlockHeight::new(5), ShardGroupId(0), &[]),
+            &certified_block_with_provisions(BlockHeight::new(5), ShardGroupId::new(0), &[]),
         );
         assert!(
             !actions
@@ -1722,10 +1754,10 @@ mod tests {
             mempool.on_submit_transaction(topology, Arc::clone(tx), LocalTimestamp::ZERO);
         }
         let block = make_live_block(
-            ShardGroupId(0),
+            ShardGroupId::new(0),
             BlockHeight::new(1),
             1_234_567_890,
-            ValidatorId(0),
+            ValidatorId::new(0),
             txs,
             vec![],
         );
@@ -1860,10 +1892,10 @@ mod tests {
 
         // Block 1 commits both txs — both transition Pending → Committed.
         let block1 = make_live_block(
-            ShardGroupId(0),
+            ShardGroupId::new(0),
             BlockHeight::new(1),
             1_000,
-            ValidatorId(0),
+            ValidatorId::new(0),
             vec![Arc::new(single_tx), Arc::new(cross_tx)],
             vec![],
         );
@@ -1872,10 +1904,10 @@ mod tests {
 
         // Block 2 carries the wave cert for the cross-shard tx — completes it.
         let block2 = make_live_block(
-            ShardGroupId(0),
+            ShardGroupId::new(0),
             BlockHeight::new(2),
             2_000,
-            ValidatorId(0),
+            ValidatorId::new(0),
             vec![],
             vec![Arc::new(make_finalized_wave(
                 BlockHeight::new(2),
@@ -1887,10 +1919,10 @@ mod tests {
         assert_eq!(mempool.in_flight(), 1, "Completed TX releases its lock");
 
         let block3 = make_live_block(
-            ShardGroupId(0),
+            ShardGroupId::new(0),
             BlockHeight::new(3),
             3_000,
-            ValidatorId(0),
+            ValidatorId::new(0),
             vec![],
             vec![Arc::new(make_finalized_wave(
                 BlockHeight::new(3),

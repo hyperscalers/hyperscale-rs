@@ -192,6 +192,6 @@ impl BlockHeader {
     /// Get the expected proposer for this height (round-robin).
     #[must_use]
     pub const fn expected_proposer(&self, num_validators: u64) -> ValidatorId {
-        ValidatorId((self.height.inner() + self.round.inner()) % num_validators)
+        ValidatorId::new((self.height.inner() + self.round.inner()) % num_validators)
     }
 }

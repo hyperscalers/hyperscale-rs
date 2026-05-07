@@ -261,7 +261,7 @@ mod tests {
     use super::*;
 
     fn shard(n: u64) -> ShardGroupId {
-        ShardGroupId(n)
+        ShardGroupId::new(n)
     }
 
     fn make_provisions(
@@ -279,7 +279,7 @@ mod tests {
             .collect();
         Arc::new(Provisions::new(
             source,
-            ShardGroupId(0),
+            ShardGroupId::new(0),
             block_height,
             MerkleInclusionProof::dummy(),
             transactions,

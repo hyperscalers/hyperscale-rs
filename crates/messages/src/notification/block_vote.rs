@@ -57,10 +57,10 @@ mod tests {
     fn test_block_vote_gossip_creation() {
         let vote = BlockVote {
             block_hash: BlockHash::from_raw(Hash::from_bytes(b"block_hash")),
-            shard_group_id: ShardGroupId(0),
+            shard_group_id: ShardGroupId::new(0),
             height: BlockHeight::new(10),
             round: Round::INITIAL,
-            voter: ValidatorId(2),
+            voter: ValidatorId::new(2),
             signature: zero_bls_signature(),
             timestamp: ProposerTimestamp::from_millis(1_000_000_000_000),
         };
@@ -73,10 +73,10 @@ mod tests {
     fn test_block_vote_gossip_into_vote() {
         let vote = BlockVote {
             block_hash: BlockHash::from_raw(Hash::from_bytes(b"test")),
-            shard_group_id: ShardGroupId(0),
+            shard_group_id: ShardGroupId::new(0),
             height: BlockHeight::new(5),
             round: Round::INITIAL,
-            voter: ValidatorId(1),
+            voter: ValidatorId::new(1),
             signature: zero_bls_signature(),
             timestamp: ProposerTimestamp::from_millis(1_000_000_000_000),
         };

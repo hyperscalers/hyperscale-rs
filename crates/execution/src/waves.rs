@@ -404,7 +404,7 @@ mod tests {
     use super::*;
 
     fn shard() -> ShardGroupId {
-        ShardGroupId(0)
+        ShardGroupId::new(0)
     }
 
     fn wave(height: u64) -> WaveId {

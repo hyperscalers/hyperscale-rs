@@ -750,16 +750,16 @@ mod tests {
                 voting_power: VotePower::new(1),
             })
             .collect();
-        TopologySnapshot::new(ValidatorId(0), 1, ValidatorSet::new(validators))
+        TopologySnapshot::new(ValidatorId::new(0), 1, ValidatorSet::new(validators))
     }
 
     fn header(height: BlockHeight, tag: &[u8]) -> BlockHeader {
         BlockHeader {
-            shard_group_id: ShardGroupId(0),
+            shard_group_id: ShardGroupId::new(0),
             height,
             parent_block_hash: BlockHash::from_raw(Hash::from_bytes(tag)),
-            parent_qc: QuorumCertificate::genesis(ShardGroupId(0)),
-            proposer: ValidatorId(0),
+            parent_qc: QuorumCertificate::genesis(ShardGroupId::new(0)),
+            proposer: ValidatorId::new(0),
             timestamp: ProposerTimestamp::from_millis(0),
             round: Round::INITIAL,
             is_fallback: false,
@@ -781,7 +781,7 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
         };
-        let mut qc = QuorumCertificate::genesis(ShardGroupId(0));
+        let mut qc = QuorumCertificate::genesis(ShardGroupId::new(0));
         qc.block_hash = block.hash();
         qc.height = height;
         CertifiedBlock::new_unchecked(block, qc)
@@ -1140,7 +1140,7 @@ mod tests {
     }
 
     fn qc_at(height: BlockHeight) -> QuorumCertificate {
-        let mut qc = QuorumCertificate::genesis(ShardGroupId(0));
+        let mut qc = QuorumCertificate::genesis(ShardGroupId::new(0));
         qc.height = height;
         qc.block_hash = BlockHash::from_raw(Hash::from_bytes(b"qc"));
         qc

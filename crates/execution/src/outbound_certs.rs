@@ -116,7 +116,7 @@ impl OutboundExecutionCertificateTracker {
         }
         debug!(
             wave = %certificate.wave_id,
-            target_shard = target_shard.0,
+            target_shard = target_shard.inner(),
             recipients = recipients.len(),
             "Tracking outbound execution certificate"
         );
@@ -152,7 +152,7 @@ impl OutboundExecutionCertificateTracker {
             if let Some(entry) = self.entries.remove(&key) {
                 debug!(
                     wave = %key.0,
-                    target_shard = key.1.0,
+                    target_shard = key.1.inner(),
                     rebroadcasts = entry.rebroadcast_count,
                     "Evicted outbound execution certificate (wave finalized)"
                 );
@@ -191,7 +191,7 @@ impl OutboundExecutionCertificateTracker {
             if let Some(entry) = self.entries.remove(&key) {
                 warn!(
                     wave = %key.0,
-                    target_shard = key.1.0,
+                    target_shard = key.1.inner(),
                     rebroadcasts = entry.rebroadcast_count,
                     past_deadline_secs = now.elapsed_since(entry.deadline).as_secs(),
                     "Evicting outbound execution certificate past deadline — \
@@ -219,9 +219,9 @@ mod tests {
 
     fn wave(local: u64, h: u64, remote: &[u64]) -> WaveId {
         WaveId {
-            shard_group_id: ShardGroupId(local),
+            shard_group_id: ShardGroupId::new(local),
             block_height: BlockHeight::new(h),
-            remote_shards: remote.iter().copied().map(ShardGroupId).collect(),
+            remote_shards: remote.iter().copied().map(ShardGroupId::new).collect(),
         }
     }
 
@@ -237,7 +237,7 @@ mod tests {
     }
 
     fn vids(ids: &[u64]) -> Vec<ValidatorId> {
-        ids.iter().copied().map(ValidatorId).collect()
+        ids.iter().copied().map(ValidatorId::new).collect()
     }
 
     #[test]
@@ -246,7 +246,7 @@ mod tests {
         t.on_block_committed(ts(1_000));
 
         let w = wave(0, 100, &[1]);
-        t.on_broadcast(cert(w), ShardGroupId(1), vids(&[4, 5, 6, 7]));
+        t.on_broadcast(cert(w), ShardGroupId::new(1), vids(&[4, 5, 6, 7]));
         assert_eq!(t.memory_stats().tracked_certificates, 1);
     }
 
@@ -254,7 +254,7 @@ mod tests {
     fn on_broadcast_skips_when_no_recipients() {
         let mut t = OutboundExecutionCertificateTracker::new();
         let w = wave(0, 100, &[1]);
-        t.on_broadcast(cert(w), ShardGroupId(1), vec![]);
+        t.on_broadcast(cert(w), ShardGroupId::new(1), vec![]);
         assert_eq!(t.memory_stats().tracked_certificates, 0);
     }
 
@@ -262,8 +262,8 @@ mod tests {
     fn on_broadcast_is_idempotent_per_target() {
         let mut t = OutboundExecutionCertificateTracker::new();
         let w = wave(0, 100, &[1]);
-        t.on_broadcast(cert(w.clone()), ShardGroupId(1), vids(&[4]));
-        t.on_broadcast(cert(w), ShardGroupId(1), vids(&[4, 5]));
+        t.on_broadcast(cert(w.clone()), ShardGroupId::new(1), vids(&[4]));
+        t.on_broadcast(cert(w), ShardGroupId::new(1), vids(&[4, 5]));
         assert_eq!(t.memory_stats().tracked_certificates, 1);
     }
 
@@ -273,7 +273,7 @@ mod tests {
         t.on_block_committed(ts(0));
 
         let w = wave(0, 100, &[1]);
-        t.on_broadcast(cert(w), ShardGroupId(1), vids(&[4]));
+        t.on_broadcast(cert(w), ShardGroupId::new(1), vids(&[4]));
 
         // Just before interval — no directive.
         let directives = t.on_block_committed(ts(u64::try_from(REBROADCAST_INTERVAL.as_millis())
@@ -286,7 +286,7 @@ mod tests {
             u64::try_from(REBROADCAST_INTERVAL.as_millis()).unwrap_or(u64::MAX)
         ));
         assert_eq!(directives.len(), 1);
-        assert_eq!(directives[0].target_shard, ShardGroupId(1));
+        assert_eq!(directives[0].target_shard, ShardGroupId::new(1));
         assert_eq!(directives[0].recipients, vids(&[4]));
     }
 
@@ -296,7 +296,7 @@ mod tests {
         t.on_block_committed(ts(0));
 
         let w = wave(0, 100, &[1]);
-        t.on_broadcast(cert(w), ShardGroupId(1), vids(&[4]));
+        t.on_broadcast(cert(w), ShardGroupId::new(1), vids(&[4]));
 
         let interval_ms = u64::try_from(REBROADCAST_INTERVAL.as_millis()).unwrap_or(u64::MAX);
         let d1 = t.on_block_committed(ts(interval_ms));
@@ -313,7 +313,7 @@ mod tests {
         t.on_block_committed(ts(1_000));
 
         let w = wave(0, 100, &[1]);
-        t.on_broadcast(cert(w), ShardGroupId(1), vids(&[4]));
+        t.on_broadcast(cert(w), ShardGroupId::new(1), vids(&[4]));
 
         let past = RETENTION_HORIZON + Duration::from_secs(1);
         t.on_block_committed(ts(
@@ -326,8 +326,8 @@ mod tests {
     fn wave_finalization_evicts_all_targets() {
         let mut t = OutboundExecutionCertificateTracker::new();
         let w = wave(0, 100, &[1, 2]);
-        t.on_broadcast(cert(w.clone()), ShardGroupId(1), vids(&[4]));
-        t.on_broadcast(cert(w.clone()), ShardGroupId(2), vids(&[8]));
+        t.on_broadcast(cert(w.clone()), ShardGroupId::new(1), vids(&[4]));
+        t.on_broadcast(cert(w.clone()), ShardGroupId::new(2), vids(&[8]));
         assert_eq!(t.memory_stats().tracked_certificates, 2);
 
         t.on_wave_finalized(&w);
@@ -339,7 +339,7 @@ mod tests {
         let mut t = OutboundExecutionCertificateTracker::new();
         let w1 = wave(0, 100, &[1]);
         let w2 = wave(0, 101, &[1]);
-        t.on_broadcast(cert(w1), ShardGroupId(1), vids(&[4]));
+        t.on_broadcast(cert(w1), ShardGroupId::new(1), vids(&[4]));
         t.on_wave_finalized(&w2);
         assert_eq!(t.memory_stats().tracked_certificates, 1);
     }

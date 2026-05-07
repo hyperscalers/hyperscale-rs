@@ -234,7 +234,7 @@ where
         self.network.update_validator_keys(Arc::new(keys));
 
         tracing::info!(
-            local_shard = topology.local_shard().0,
+            local_shard = topology.local_shard().inner(),
             local_peers = self.local_peers().len(),
             "Network topology updated"
         );

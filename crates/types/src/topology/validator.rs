@@ -86,7 +86,7 @@ mod tests {
 
     fn make_validator(id: u64, power: u64) -> ValidatorInfo {
         ValidatorInfo {
-            validator_id: ValidatorId(id),
+            validator_id: ValidatorId::new(id),
             public_key: generate_bls_keypair().public_key(),
             voting_power: VotePower::new(power),
         }
@@ -102,9 +102,9 @@ mod tests {
 
         let set = ValidatorSet::new(validators);
 
-        assert_eq!(set.validators[0].validator_id, ValidatorId(1));
-        assert_eq!(set.validators[1].validator_id, ValidatorId(2));
-        assert_eq!(set.validators[2].validator_id, ValidatorId(3));
+        assert_eq!(set.validators[0].validator_id, ValidatorId::new(1));
+        assert_eq!(set.validators[1].validator_id, ValidatorId::new(2));
+        assert_eq!(set.validators[2].validator_id, ValidatorId::new(3));
     }
 
     #[test]
@@ -120,10 +120,10 @@ mod tests {
         assert_eq!(set.len(), 3);
         assert_eq!(set.total_voting_power(), VotePower::new(60));
 
-        let v1 = set.get(ValidatorId(1)).unwrap();
+        let v1 = set.get(ValidatorId::new(1)).unwrap();
         assert_eq!(v1.voting_power, VotePower::new(20));
 
-        assert_eq!(set.index_of(ValidatorId(2)), Some(2));
-        assert_eq!(set.index_of(ValidatorId(99)), None);
+        assert_eq!(set.index_of(ValidatorId::new(2)), Some(2));
+        assert_eq!(set.index_of(ValidatorId::new(99)), None);
     }
 }

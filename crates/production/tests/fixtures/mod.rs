@@ -92,7 +92,7 @@ impl TestFixtures {
         // Build global validator set
         let global_validators: Vec<ValidatorInfo> = (0..num_validators)
             .map(|i| ValidatorInfo {
-                validator_id: ValidatorId(u64::from(i)),
+                validator_id: ValidatorId::new(u64::from(i)),
                 public_key: public_keys[i as usize],
                 voting_power: VotePower::new(1),
             })
@@ -102,12 +102,12 @@ impl TestFixtures {
         // Build per-shard committee mappings
         let mut shard_committees: HashMap<ShardGroupId, Vec<ValidatorId>> = HashMap::new();
         for shard_id in 0..num_shards {
-            let shard = ShardGroupId(shard_id);
+            let shard = ShardGroupId::new(shard_id);
             let shard_start = u32::try_from(shard_id).expect("shard_id fits in u32 for tests")
                 * validators_per_shard;
             let shard_end = shard_start + validators_per_shard;
             let committee: Vec<ValidatorId> = (shard_start..shard_end)
-                .map(|i| ValidatorId(u64::from(i)))
+                .map(|i| ValidatorId::new(u64::from(i)))
                 .collect();
             shard_committees.insert(shard, committee);
         }
@@ -116,8 +116,8 @@ impl TestFixtures {
         let topologies: Vec<TopologyCoordinator> = (0..num_validators)
             .map(|i| {
                 let shard_id = u64::from(i) / u64::from(validators_per_shard);
-                let shard = ShardGroupId(shard_id);
-                let validator_id = ValidatorId(u64::from(i));
+                let shard = ShardGroupId::new(shard_id);
+                let validator_id = ValidatorId::new(u64::from(i));
 
                 TopologyCoordinator::with_shard_committees(
                     validator_id,
@@ -175,7 +175,7 @@ impl TestFixtures {
 
     /// Get validators in a shard.
     pub fn validators_in_shard(&self, shard: ShardGroupId) -> Vec<u32> {
-        let start = u32::try_from(shard.0).expect("shard fits in u32 for tests")
+        let start = u32::try_from(shard.inner()).expect("shard fits in u32 for tests")
             * self.validators_per_shard;
         let end = start + self.validators_per_shard;
         (start..end).collect()
@@ -245,10 +245,10 @@ mod tests {
         assert_eq!(fixtures.validators_per_shard, 3);
 
         // Check shard assignments
-        let shard0_validators = fixtures.validators_in_shard(ShardGroupId(0));
+        let shard0_validators = fixtures.validators_in_shard(ShardGroupId::new(0));
         assert_eq!(shard0_validators, vec![0, 1, 2]);
 
-        let shard1_validators = fixtures.validators_in_shard(ShardGroupId(1));
+        let shard1_validators = fixtures.validators_in_shard(ShardGroupId::new(1));
         assert_eq!(shard1_validators, vec![3, 4, 5]);
     }
 
@@ -257,10 +257,16 @@ mod tests {
         let fixtures = TestFixtures::new(42, 4);
 
         let topology = fixtures.topology(0);
-        assert_eq!(topology.snapshot().local_validator_id(), ValidatorId(0));
-        assert_eq!(topology.snapshot().local_shard(), ShardGroupId(0));
+        assert_eq!(
+            topology.snapshot().local_validator_id(),
+            ValidatorId::new(0)
+        );
+        assert_eq!(topology.snapshot().local_shard(), ShardGroupId::new(0));
 
         let topology2 = fixtures.topology(2);
-        assert_eq!(topology2.snapshot().local_validator_id(), ValidatorId(2));
+        assert_eq!(
+            topology2.snapshot().local_validator_id(),
+            ValidatorId::new(2)
+        );
     }
 }

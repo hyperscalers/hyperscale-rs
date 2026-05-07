@@ -68,13 +68,13 @@ mod tests {
         // Seed provisions.expected via a verified remote header whose
         // wave depends on local.
         let mut remote_shards = BTreeSet::new();
-        remote_shards.insert(ShardGroupId(0));
-        let wave = WaveId::new(ShardGroupId(1), BlockHeight::new(5), remote_shards);
+        remote_shards.insert(ShardGroupId::new(0));
+        let wave = WaveId::new(ShardGroupId::new(1), BlockHeight::new(5), remote_shards);
         let mut block = make_live_block(
-            ShardGroupId(1),
+            ShardGroupId::new(1),
             BlockHeight::new(5),
             /* timestamp_ms */ 1_000,
-            ValidatorId(0),
+            ValidatorId::new(0),
             vec![],
             vec![],
         );
@@ -83,7 +83,7 @@ mod tests {
         }
         let committed_header = Arc::new(CommittedBlockHeader::new(
             block.header().clone(),
-            QuorumCertificate::genesis(ShardGroupId(0)),
+            QuorumCertificate::genesis(ShardGroupId::new(0)),
         ));
         let _ = node.handle(ProtocolEvent::RemoteHeaderAdmitted { committed_header });
 
@@ -96,7 +96,7 @@ mod tests {
         assert_emits!(
             actions,
             Action::Fetch(FetchRequest::RemoteProvisions { source_shard, .. })
-                if *source_shard == ShardGroupId(1)
+                if *source_shard == ShardGroupId::new(1)
         );
     }
 

@@ -95,7 +95,7 @@ where
                     )));
                 } else {
                     tracing::warn!(
-                        sender = sender.0,
+                        sender = sender.inner(),
                         height = committed_header.header.height.inner(),
                         "Committed header sender signature verification failed"
                     );

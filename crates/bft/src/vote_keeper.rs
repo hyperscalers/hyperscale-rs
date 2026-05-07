@@ -445,11 +445,11 @@ mod tests {
 
     fn make_header(height: BlockHeight) -> BlockHeader {
         BlockHeader {
-            shard_group_id: ShardGroupId(0),
+            shard_group_id: ShardGroupId::new(0),
             height,
             parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            parent_qc: QuorumCertificate::genesis(ShardGroupId(0)),
-            proposer: ValidatorId(0),
+            parent_qc: QuorumCertificate::genesis(ShardGroupId::new(0)),
+            proposer: ValidatorId::new(0),
             timestamp: ProposerTimestamp::from_millis(1_234_567_890),
             round: Round::INITIAL,
             is_fallback: false,
@@ -480,7 +480,7 @@ mod tests {
             (BlockHash::from_raw(Hash::from_bytes(b"b3")), Round::new(0)),
         );
         vk.received_votes_by_height.insert(
-            (BlockHeight::new(2), ValidatorId(7)),
+            (BlockHeight::new(2), ValidatorId::new(7)),
             (BlockHash::from_raw(Hash::from_bytes(b"b2")), Round::new(0)),
         );
 
@@ -510,7 +510,7 @@ mod tests {
         vk.vote_sets
             .insert(hdr_r2.hash(), VoteSet::new(Some(&hdr_r2), 4));
         vk.received_votes_by_height.insert(
-            (BlockHeight::new(5), ValidatorId(1)),
+            (BlockHeight::new(5), ValidatorId::new(1)),
             (hdr_r0.hash(), Round::new(0)),
         );
 
@@ -534,7 +534,7 @@ mod tests {
     fn record_received_vote_accepts_first_vote() {
         let mut vk = VoteKeeper::new();
         let h = BlockHeight::new(5);
-        let v = ValidatorId(2);
+        let v = ValidatorId::new(2);
         let block = BlockHash::from_raw(Hash::from_bytes(b"block_a"));
 
         assert_eq!(
@@ -548,7 +548,7 @@ mod tests {
     fn record_received_vote_flags_equivocation_at_same_height_round() {
         let mut vk = VoteKeeper::new();
         let h = BlockHeight::new(5);
-        let v = ValidatorId(2);
+        let v = ValidatorId::new(2);
         let block_a = BlockHash::from_raw(Hash::from_bytes(b"block_a"));
         let block_b = BlockHash::from_raw(Hash::from_bytes(b"block_b"));
 
@@ -574,7 +574,7 @@ mod tests {
     fn record_received_vote_allows_revote_at_later_round() {
         let mut vk = VoteKeeper::new();
         let h = BlockHeight::new(5);
-        let v = ValidatorId(2);
+        let v = ValidatorId::new(2);
         let block_a = BlockHash::from_raw(Hash::from_bytes(b"block_a"));
         let block_b = BlockHash::from_raw(Hash::from_bytes(b"block_b"));
 
@@ -593,7 +593,7 @@ mod tests {
     #[test]
     fn record_received_vote_independent_per_height() {
         let mut vk = VoteKeeper::new();
-        let v = ValidatorId(2);
+        let v = ValidatorId::new(2);
         let round = Round::new(0);
         let block_a = BlockHash::from_raw(Hash::from_bytes(b"block_a"));
         let block_b = BlockHash::from_raw(Hash::from_bytes(b"block_b"));
@@ -614,7 +614,7 @@ mod tests {
     fn record_received_vote_is_idempotent_on_duplicate() {
         let mut vk = VoteKeeper::new();
         let h = BlockHeight::new(5);
-        let v = ValidatorId(2);
+        let v = ValidatorId::new(2);
         let block = BlockHash::from_raw(Hash::from_bytes(b"block_a"));
 
         vk.record_received_vote(h, v, block, Round::new(0));
@@ -628,7 +628,7 @@ mod tests {
     fn record_received_vote_drops_stale_lower_round() {
         let mut vk = VoteKeeper::new();
         let h = BlockHeight::new(5);
-        let v = ValidatorId(2);
+        let v = ValidatorId::new(2);
         let block_a = BlockHash::from_raw(Hash::from_bytes(b"block_a"));
         let block_b = BlockHash::from_raw(Hash::from_bytes(b"block_b"));
 
@@ -733,7 +733,12 @@ mod properties {
         )
             .prop_map(|(h, v, block_variant, r)| {
                 let block = BlockHash::from_raw(Hash::from_bytes(&[block_variant; 32]));
-                (BlockHeight::new(h), ValidatorId(v), block, Round::new(r))
+                (
+                    BlockHeight::new(h),
+                    ValidatorId::new(v),
+                    block,
+                    Round::new(r),
+                )
             })
     }
 

@@ -28,7 +28,8 @@ fn fresh_coordinator_with_topology() -> (ProvisionCoordinator, TopologySnapshot)
 }
 
 fn make_block(height: BlockHeight) -> CertifiedBlock {
-    let mut header = BlockHeader::genesis(ShardGroupId(0), ValidatorId(0), StateRoot::ZERO);
+    let mut header =
+        BlockHeader::genesis(ShardGroupId::new(0), ValidatorId::new(0), StateRoot::ZERO);
     header.height = height;
     let block = Block::Live {
         header,
@@ -39,7 +40,7 @@ fn make_block(height: BlockHeight) -> CertifiedBlock {
     let qc = QuorumCertificate {
         block_hash: block.hash(),
         weighted_timestamp: WeightedTimestamp::from_millis(height.inner() * TEST_BLOCK_INTERVAL_MS),
-        ..QuorumCertificate::genesis(ShardGroupId(0))
+        ..QuorumCertificate::genesis(ShardGroupId::new(0))
     };
     CertifiedBlock::new_unchecked(block, qc)
 }
@@ -61,8 +62,8 @@ fn make_remote_header_targeting(
         shard_group_id: source_shard,
         height,
         parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
-        parent_qc: QuorumCertificate::genesis(ShardGroupId(0)),
-        proposer: ValidatorId(0),
+        parent_qc: QuorumCertificate::genesis(ShardGroupId::new(0)),
+        proposer: ValidatorId::new(0),
         timestamp: ProposerTimestamp::from_millis(1000 + height.inner()),
         round: Round::INITIAL,
         is_fallback: false,
@@ -76,7 +77,7 @@ fn make_remote_header_targeting(
         in_flight: InFlightCount::ZERO,
     };
     let header_hash = header.hash();
-    let mut qc = QuorumCertificate::genesis(ShardGroupId(0));
+    let mut qc = QuorumCertificate::genesis(ShardGroupId::new(0));
     qc.block_hash = header_hash;
     qc.shard_group_id = source_shard;
     qc.height = height;
@@ -89,7 +90,7 @@ fn fresh_coordinator_reports_no_state() {
     assert_eq!(coord.verified_remote_header_count(), 0);
     assert!(
         coord
-            .get_remote_header(ShardGroupId(1), BlockHeight::new(1))
+            .get_remote_header(ShardGroupId::new(1), BlockHeight::new(1))
             .is_none()
     );
     assert!(
@@ -166,7 +167,7 @@ fn on_verified_remote_header_for_own_shard_is_no_op() {
 fn on_verified_remote_header_targeting_local_shard_registers_expectation() {
     let (mut coord, topology) = fresh_coordinator_with_topology();
     let local = topology.local_shard();
-    let remote = ShardGroupId(u64::from(local.0 == 0));
+    let remote = ShardGroupId::new(u64::from(local.inner() == 0));
     let header = make_remote_header_targeting(remote, BlockHeight::new(5), local);
     coord.on_verified_remote_header(&topology, &header);
 
@@ -193,7 +194,7 @@ fn first_commit_retro_stamps_pre_genesis_expectations() {
     // committed_ts is suddenly ~now, age reports ~57 years).
     let (mut coord, topology) = fresh_coordinator_with_topology();
     let local = topology.local_shard();
-    let remote = ShardGroupId(u64::from(local.0 == 0));
+    let remote = ShardGroupId::new(u64::from(local.inner() == 0));
     let header = make_remote_header_targeting(remote, BlockHeight::new(5), local);
     coord.on_verified_remote_header(&topology, &header);
 

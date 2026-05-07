@@ -95,9 +95,9 @@ impl TransferWorkload {
         // transactions complete.
         let shard = if self.selection_mode == SelectionMode::NoContention {
             let counter = self.shard_counter.fetch_add(1, Ordering::Relaxed);
-            ShardGroupId(counter % accounts.num_shards())
+            ShardGroupId::new(counter % accounts.num_shards())
         } else {
-            ShardGroupId(rng.random_range(0..accounts.num_shards()))
+            ShardGroupId::new(rng.random_range(0..accounts.num_shards()))
         };
         let (from, to) = accounts.pair_for_shard(shard, rng, self.selection_mode)?;
         self.build_transfer(from, to)
@@ -206,9 +206,9 @@ impl TransferWorkload {
         }
 
         // Pick another shard randomly (different from target)
-        let mut other_shard = ShardGroupId(rng.random_range(0..accounts.num_shards()));
+        let mut other_shard = ShardGroupId::new(rng.random_range(0..accounts.num_shards()));
         while other_shard == target_shard {
-            other_shard = ShardGroupId(rng.random_range(0..accounts.num_shards()));
+            other_shard = ShardGroupId::new(rng.random_range(0..accounts.num_shards()));
         }
 
         // Randomly decide if target shard is sender or receiver
@@ -333,7 +333,7 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         // Generate transactions targeting shard 2
-        let target_shard = ShardGroupId(2);
+        let target_shard = ShardGroupId::new(2);
         for _ in 0..20 {
             let tx = workload
                 .generate_for_shard(&accounts, target_shard, &mut rng)
@@ -359,7 +359,7 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         // Generate transactions targeting shard 1
-        let target_shard = ShardGroupId(1);
+        let target_shard = ShardGroupId::new(1);
         for _ in 0..20 {
             let tx = workload
                 .generate_for_shard(&accounts, target_shard, &mut rng)
@@ -393,7 +393,7 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         // Generate a batch targeting shard 0
-        let target_shard = ShardGroupId(0);
+        let target_shard = ShardGroupId::new(0);
         let batch = workload.generate_batch_for_shard(&accounts, target_shard, 50, &mut rng);
 
         assert!(!batch.is_empty(), "Should generate transactions");

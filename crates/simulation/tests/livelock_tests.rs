@@ -71,9 +71,9 @@ fn accounts_on_different_shards(
         let hs_node = NodeId(node_id.0[..30].try_into().unwrap());
         let shard = shard_for_node(&hs_node, num_shards);
 
-        if shard == ShardGroupId(0) && shard0.is_none() {
+        if shard == ShardGroupId::new(0) && shard0.is_none() {
             shard0 = Some((kp, acc));
-        } else if shard == ShardGroupId(1) && shard1.is_none() {
+        } else if shard == ShardGroupId::new(1) && shard1.is_none() {
             shard1 = Some((kp, acc));
         }
         if shard0.is_some() && shard1.is_some() {

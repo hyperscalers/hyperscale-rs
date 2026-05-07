@@ -181,11 +181,11 @@ mod tests {
 
     fn make_header(height: u8, parent_block_hash: BlockHash) -> BlockHeader {
         BlockHeader {
-            shard_group_id: ShardGroupId(0),
+            shard_group_id: ShardGroupId::new(0),
             height: BlockHeight::new(u64::from(height)),
             parent_block_hash,
-            parent_qc: QuorumCertificate::genesis(ShardGroupId(0)),
-            proposer: ValidatorId(0),
+            parent_qc: QuorumCertificate::genesis(ShardGroupId::new(0)),
+            proposer: ValidatorId::new(0),
             timestamp: ProposerTimestamp::from_millis(1000),
             round: Round::INITIAL,
             is_fallback: false,
@@ -223,7 +223,7 @@ mod tests {
         f: impl FnOnce(&ChainView<'_>) -> R,
     ) -> R {
         let view = ChainView {
-            local_shard: ShardGroupId(0),
+            local_shard: ShardGroupId::new(0),
             committed_height: BlockHeight::new(committed_height),
             committed_hash,
             committed_state_root,
@@ -404,7 +404,7 @@ mod tests {
     #[test]
     fn proposal_parent_returns_latest_qc_when_present() {
         let qc_block = bh(b"qc_block");
-        let mut qc = QuorumCertificate::genesis(ShardGroupId(0));
+        let mut qc = QuorumCertificate::genesis(ShardGroupId::new(0));
         qc.block_hash = qc_block;
         qc.height = BlockHeight::new(5);
         qc.weighted_timestamp = WeightedTimestamp::from_millis(1000);

@@ -79,7 +79,7 @@ where
             let h = header.header.height;
             if h < from_height || h.inner() >= upper_bound {
                 tracing::warn!(
-                    source_shard = source_shard.0,
+                    source_shard = source_shard.inner(),
                     requested_from = from_height.inner(),
                     requested_count = count.inner(),
                     height = h.inner(),
@@ -89,8 +89,8 @@ where
             }
             if header.shard_group_id() != source_shard {
                 tracing::warn!(
-                    source_shard = source_shard.0,
-                    response_shard = header.shard_group_id().0,
+                    source_shard = source_shard.inner(),
+                    response_shard = header.shard_group_id().inner(),
                     height = h.inner(),
                     "remote-header sync: response contained wrong-shard header — discarding"
                 );
@@ -101,7 +101,7 @@ where
             // a sentinel value avoids confusion with real validator ids.
             self.feed_event(ProtocolEvent::RemoteHeaderReceived {
                 committed_header: header,
-                sender: ValidatorId(u64::MAX),
+                sender: ValidatorId::new(u64::MAX),
             });
         }
 
@@ -198,7 +198,7 @@ where
                     height,
                 } => {
                     tracing::info!(
-                        source_shard = source_shard.0,
+                        source_shard = source_shard.inner(),
                         height = height.inner(),
                         "remote-header sync caught up"
                     );

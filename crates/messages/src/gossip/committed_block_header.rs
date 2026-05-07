@@ -73,11 +73,11 @@ mod tests {
         };
 
         let header = BlockHeader {
-            shard_group_id: ShardGroupId(1),
+            shard_group_id: ShardGroupId::new(1),
             height: BlockHeight::new(42),
             parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            parent_qc: QuorumCertificate::genesis(ShardGroupId(0)),
-            proposer: ValidatorId(0),
+            parent_qc: QuorumCertificate::genesis(ShardGroupId::new(0)),
+            proposer: ValidatorId::new(0),
             timestamp: ProposerTimestamp::from_millis(1_234_567_890),
             round: Round::INITIAL,
             is_fallback: false,
@@ -90,11 +90,11 @@ mod tests {
             provision_tx_roots: BTreeMap::new(),
             in_flight: InFlightCount::ZERO,
         };
-        let qc = QuorumCertificate::genesis(ShardGroupId(0));
+        let qc = QuorumCertificate::genesis(ShardGroupId::new(0));
 
         let gossip = CommittedBlockHeaderGossip {
             committed_header: CommittedBlockHeader::new(header, qc),
-            sender: ValidatorId(0),
+            sender: ValidatorId::new(0),
             sender_signature: zero_bls_signature(),
         };
 

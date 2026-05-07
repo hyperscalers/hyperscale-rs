@@ -104,7 +104,7 @@ fn encode_response(
     nonce: &[u8; VALIDATOR_BIND_NONCE_LEN],
 ) -> Vec<u8> {
     let mut buf = Vec::with_capacity(RESPONSE_FRAME_LEN);
-    buf.extend_from_slice(&validator_id.0.to_le_bytes());
+    buf.extend_from_slice(&validator_id.to_le_bytes());
     buf.extend_from_slice(&signature.0);
     buf.extend_from_slice(nonce);
     buf
@@ -126,13 +126,13 @@ fn decode_response(
     sig_bytes.copy_from_slice(&data[8..104]);
     let mut nonce = [0u8; VALIDATOR_BIND_NONCE_LEN];
     nonce.copy_from_slice(&data[104..136]);
-    Some((ValidatorId(vid), Bls12381G2Signature(sig_bytes), nonce))
+    Some((ValidatorId::new(vid), Bls12381G2Signature(sig_bytes), nonce))
 }
 
 /// Encode the initiator's final response: `[8-byte LE validator_id][96-byte sig]`.
 fn encode_final(validator_id: ValidatorId, signature: &Bls12381G2Signature) -> Vec<u8> {
     let mut buf = Vec::with_capacity(FINAL_FRAME_LEN);
-    buf.extend_from_slice(&validator_id.0.to_le_bytes());
+    buf.extend_from_slice(&validator_id.to_le_bytes());
     buf.extend_from_slice(&signature.0);
     buf
 }
@@ -145,7 +145,7 @@ fn decode_final(data: &[u8]) -> Option<(ValidatorId, Bls12381G2Signature)> {
     let vid = u64::from_le_bytes(data[..8].try_into().ok()?);
     let mut sig_bytes = [0u8; 96];
     sig_bytes.copy_from_slice(&data[8..104]);
-    Some((ValidatorId(vid), Bls12381G2Signature(sig_bytes)))
+    Some((ValidatorId::new(vid), Bls12381G2Signature(sig_bytes)))
 }
 
 /// Generate a fresh 32-byte nonce from the thread-local CSPRNG (seeded from OS).
@@ -195,9 +195,9 @@ enum BindError {
 impl std::fmt::Display for BindError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UnknownValidator(v) => write!(f, "unknown validator {}", v.0),
+            Self::UnknownValidator(v) => write!(f, "unknown validator {}", v.inner()),
             Self::InvalidSignature(v) => {
-                write!(f, "invalid BLS signature for validator {}", v.0)
+                write!(f, "invalid BLS signature for validator {}", v.inner())
             }
             Self::InvalidMessage => write!(f, "malformed bind message"),
             Self::StreamOpen(e) => write!(f, "stream open failed: {e}"),
@@ -455,7 +455,7 @@ async fn handle_inbound(
 
         info!(
             peer = %peer_id,
-            validator_id = remote_vid.0,
+            validator_id = remote_vid.inner(),
             "Validator-bind verified (inbound)"
         );
         ctx.validator_peers.insert(remote_vid, peer_id);
@@ -509,7 +509,7 @@ async fn handle_outbound(
 
         info!(
             peer = %peer_id,
-            validator_id = remote_vid.0,
+            validator_id = remote_vid.inner(),
             "Validator-bind verified (outbound)"
         );
         ctx.validator_peers.insert(remote_vid, peer_id);
@@ -544,7 +544,7 @@ mod tests {
 
     #[test]
     fn response_roundtrip() {
-        let vid = ValidatorId(42);
+        let vid = ValidatorId::new(42);
         let sig = zero_bls_signature();
         let nonce = [0xCD; VALIDATOR_BIND_NONCE_LEN];
 
@@ -559,7 +559,7 @@ mod tests {
 
     #[test]
     fn final_roundtrip() {
-        let vid = ValidatorId(7);
+        let vid = ValidatorId::new(7);
         let sig = zero_bls_signature();
 
         let encoded = encode_final(vid, &sig);
@@ -584,7 +584,7 @@ mod tests {
         let keypair = generate_bls_keypair();
         let pubkey = keypair.public_key();
         let peer_id = Libp2pPeerId::random();
-        let vid = ValidatorId(7);
+        let vid = ValidatorId::new(7);
         let nonce = [9u8; VALIDATOR_BIND_NONCE_LEN];
 
         let sig = keypair.sign_v1(&validator_bind_message(&peer_id.to_bytes(), &nonce));
@@ -601,7 +601,7 @@ mod tests {
         let keypair = generate_bls_keypair();
         let pubkey = keypair.public_key();
         let peer_id = Libp2pPeerId::random();
-        let vid = ValidatorId(7);
+        let vid = ValidatorId::new(7);
 
         let nonce_a = [1u8; VALIDATOR_BIND_NONCE_LEN];
         let nonce_b = [2u8; VALIDATOR_BIND_NONCE_LEN];
@@ -624,7 +624,7 @@ mod tests {
         let pubkey = keypair.public_key();
         let peer_a = Libp2pPeerId::random();
         let peer_b = Libp2pPeerId::random();
-        let vid = ValidatorId(7);
+        let vid = ValidatorId::new(7);
         let nonce = [3u8; VALIDATOR_BIND_NONCE_LEN];
 
         // Sign peer_a's id but try to verify as peer_b.
@@ -644,9 +644,9 @@ mod tests {
         let sig = keypair.sign_v1(&validator_bind_message(&peer_id.to_bytes(), &nonce));
 
         // Key map has validator 7 but we claim to be validator 99.
-        let keys = make_bind_keys(ValidatorId(7), pubkey);
+        let keys = make_bind_keys(ValidatorId::new(7), pubkey);
         assert!(matches!(
-            verify_bind(&peer_id, ValidatorId(99), &nonce, &sig, &keys),
+            verify_bind(&peer_id, ValidatorId::new(99), &nonce, &sig, &keys),
             Err(BindError::UnknownValidator(_))
         ));
     }
@@ -656,7 +656,7 @@ mod tests {
         let keypair_a = generate_bls_keypair();
         let keypair_b = generate_bls_keypair();
         let peer_id = Libp2pPeerId::random();
-        let vid = ValidatorId(7);
+        let vid = ValidatorId::new(7);
         let nonce = [5u8; VALIDATOR_BIND_NONCE_LEN];
 
         // Sign with key_a but key map has key_b for this validator.

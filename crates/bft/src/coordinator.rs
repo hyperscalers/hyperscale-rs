@@ -3370,13 +3370,13 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, k)| ValidatorInfo {
-                validator_id: ValidatorId(i as u64),
+                validator_id: ValidatorId::new(i as u64),
                 public_key: k.public_key(),
                 voting_power: VotePower::new(1),
             })
             .collect();
         let validator_set = ValidatorSet::new(validators);
-        let topology = TopologySnapshot::new(ValidatorId(0), 1, validator_set);
+        let topology = TopologySnapshot::new(ValidatorId::new(0), 1, validator_set);
 
         let state = BftCoordinator::new(0, config, RecoveredState::default());
         (state, topology)
@@ -3388,25 +3388,25 @@ mod tests {
         let (_state, topology) = make_test_state();
         assert_eq!(
             topology.proposer_for(BlockHeight::new(0), Round::new(0)),
-            ValidatorId(0)
+            ValidatorId::new(0)
         );
         assert_eq!(
             topology.proposer_for(BlockHeight::new(1), Round::new(0)),
-            ValidatorId(1)
+            ValidatorId::new(1)
         );
         assert_eq!(
             topology.proposer_for(BlockHeight::new(2), Round::new(0)),
-            ValidatorId(2)
+            ValidatorId::new(2)
         );
         assert_eq!(
             topology.proposer_for(BlockHeight::new(0), Round::new(1)),
-            ValidatorId(1)
+            ValidatorId::new(1)
         );
     }
 
     #[test]
     fn test_should_propose() {
-        // Local validator is ValidatorId(0) — only proposes when proposer_for = 0.
+        // Local validator is ValidatorId::new(0) — only proposes when proposer_for = 0.
         let (_state, topology) = make_test_state();
         assert!(topology.should_propose(BlockHeight::new(0), Round::new(0)));
         assert!(!topology.should_propose(BlockHeight::new(1), Round::new(0)));
@@ -3415,11 +3415,11 @@ mod tests {
 
     fn make_header_at_height(height: BlockHeight, timestamp_ms: u64) -> BlockHeader {
         BlockHeader {
-            shard_group_id: ShardGroupId(0),
+            shard_group_id: ShardGroupId::new(0),
             height,
             parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            parent_qc: QuorumCertificate::genesis(ShardGroupId(0)),
-            proposer: ValidatorId(height.inner() % 4), // Round-robin
+            parent_qc: QuorumCertificate::genesis(ShardGroupId::new(0)),
+            proposer: ValidatorId::new(height.inner() % 4), // Round-robin
             timestamp: ProposerTimestamp::from_millis(timestamp_ms),
             round: Round::new(0),
             is_fallback: false,
@@ -3446,7 +3446,7 @@ mod tests {
     fn make_test_qc(block_hash: BlockHash, height: BlockHeight) -> QuorumCertificate {
         QuorumCertificate {
             block_hash,
-            shard_group_id: ShardGroupId(0),
+            shard_group_id: ShardGroupId::new(0),
             height,
             parent_block_hash: BlockHash::ZERO,
             round: Round::new(0),
@@ -3734,7 +3734,7 @@ mod tests {
 
     #[test]
     fn test_advance_round_proposer_broadcasts() {
-        // Local = ValidatorId(2) is proposer at (1, 1) since (1+1)%4 = 2.
+        // Local = ValidatorId::new(2) is proposer at (1, 1) since (1+1)%4 = 2.
         let (mut state, topology) = make_multi_validator_state_at(2);
         state.set_time(LocalTimestamp::from_millis(100_000));
 
@@ -3818,13 +3818,14 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, k)| ValidatorInfo {
-                validator_id: ValidatorId(i as u64),
+                validator_id: ValidatorId::new(i as u64),
                 public_key: k.public_key(),
                 voting_power: VotePower::new(1),
             })
             .collect();
         let validator_set = ValidatorSet::new(validators);
-        let topology = TopologySnapshot::new(ValidatorId(u64::from(local_idx)), 1, validator_set);
+        let topology =
+            TopologySnapshot::new(ValidatorId::new(u64::from(local_idx)), 1, validator_set);
         let state = BftCoordinator::new(local_idx, BftConfig::default(), RecoveredState::default());
         (state, topology, keys)
     }
@@ -3854,7 +3855,7 @@ mod tests {
         let first_block = make_header_at_height(height, 100_000);
         let first_hash = first_block.hash();
         let second_block = BlockHeader {
-            proposer: ValidatorId(2),
+            proposer: ValidatorId::new(2),
             round: round_1,
             ..make_header_at_height(height, 100_001)
         };
@@ -3897,11 +3898,11 @@ mod tests {
         state.set_time(LocalTimestamp::from_millis(100_000));
 
         let height = BlockHeight::new(5);
-        let voter = ValidatorId(2);
+        let voter = ValidatorId::new(2);
         let block_b = BlockHash::from_raw(Hash::from_bytes(b"legitimate_block"));
         let vote = BlockVote {
             block_hash: block_b,
-            shard_group_id: ShardGroupId(0),
+            shard_group_id: ShardGroupId::new(0),
             height,
             round: Round::new(0),
             voter,
@@ -3932,7 +3933,7 @@ mod tests {
         state.set_time(LocalTimestamp::from_millis(100_000));
 
         let height = BlockHeight::new(1);
-        // proposer_for(1, 0) = ValidatorId(1)
+        // proposer_for(1, 0) = ValidatorId::new(1)
         let original_header = make_header_at_height(height, 100_000);
         let original_block_hash = original_header.hash();
 
@@ -3958,7 +3959,7 @@ mod tests {
         let reproposed = gossip.as_ref();
         assert_eq!(reproposed.round, Round::new(0));
         assert_eq!(reproposed.hash(), original_block_hash);
-        assert_eq!(reproposed.proposer, ValidatorId(1));
+        assert_eq!(reproposed.proposer, ValidatorId::new(1));
     }
 
     #[test]
@@ -3975,9 +3976,9 @@ mod tests {
     #[test]
     fn test_reproposed_block_with_wrong_proposer_fails_validation() {
         let (state, topology) = make_multi_validator_state();
-        // proposer_for(1, 0) = ValidatorId(1), but the header claims ValidatorId(3).
+        // proposer_for(1, 0) = ValidatorId::new(1), but the header claims ValidatorId::new(3).
         let header = BlockHeader {
-            proposer: ValidatorId(3),
+            proposer: ValidatorId::new(3),
             ..make_header_at_height(BlockHeight::new(1), state.now.as_millis())
         };
 
@@ -4000,7 +4001,7 @@ mod tests {
     fn test_multiple_consecutive_view_changes_unlock_and_revote() {
         // Three view changes with no QC: each must unlock the current vote. The
         // third advance lands us as proposer and must emit a fallback.
-        // proposer_for(1, R) = (1 + R) % 4 — local is ValidatorId(0), so we're
+        // proposer_for(1, R) = (1 + R) % 4 — local is ValidatorId::new(0), so we're
         // proposer at R=3.
         let (mut state, topology) = make_test_state();
         state.set_time(LocalTimestamp::from_millis(100_000));
@@ -4135,9 +4136,9 @@ mod tests {
         let (mut state, topology) = make_test_state();
         state.set_time(LocalTimestamp::from_millis(100_000));
 
-        // Local validator is ValidatorId(0). Proposer for (h=1, r=0) is
-        // ValidatorId((1+0)%4)=ValidatorId(1) — not us. Point the chain at
-        // (h=4, r=0) where proposer = (4+0)%4 = ValidatorId(0).
+        // Local validator is ValidatorId::new(0). Proposer for (h=1, r=0) is
+        // ValidatorId::new((1+0)%4)=ValidatorId::new(1) — not us. Point the chain at
+        // (h=4, r=0) where proposer = (4+0)%4 = ValidatorId::new(0).
         let parent_block_hash = BlockHash::from_raw(Hash::from_bytes(b"parent_tree_missing"));
         state.committed_height = BlockHeight::new(3);
         state.committed_hash = parent_block_hash;
@@ -4241,7 +4242,7 @@ mod tests {
         let header2 = BlockHeader {
             parent_block_hash,
             parent_qc,
-            proposer: ValidatorId(3),
+            proposer: ValidatorId::new(3),
             round: Round::new(1),
             ..make_header_at_height(BlockHeight::new(2), 100_001)
         };
@@ -4761,8 +4762,8 @@ mod tests {
         };
 
         let result = {
-            let (_, qc_chain, _) =
-                state.collect_qc_chain_hashes(ShardGroupId(0), block.header().parent_block_hash);
+            let (_, qc_chain, _) = state
+                .collect_qc_chain_hashes(ShardGroupId::new(0), block.header().parent_block_hash);
             validate_no_duplicate_transactions(&block, &qc_chain, &state.dedup_index)
         };
         assert!(result.is_err());
@@ -4807,8 +4808,10 @@ mod tests {
         // Ancestor is at committed height, so walk stops before checking it
         assert!(
             {
-                let (_, qc_chain, _) = state
-                    .collect_qc_chain_hashes(ShardGroupId(0), block.header().parent_block_hash);
+                let (_, qc_chain, _) = state.collect_qc_chain_hashes(
+                    ShardGroupId::new(0),
+                    block.header().parent_block_hash,
+                );
                 validate_no_duplicate_transactions(&block, &qc_chain, &state.dedup_index)
             }
             .is_ok()

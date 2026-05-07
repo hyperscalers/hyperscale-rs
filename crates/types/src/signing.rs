@@ -57,7 +57,7 @@ pub fn block_vote_message(
 ) -> Vec<u8> {
     let mut message = Vec::with_capacity(80);
     message.extend_from_slice(DOMAIN_BLOCK_VOTE);
-    message.extend_from_slice(&shard_group.0.to_le_bytes());
+    message.extend_from_slice(&shard_group.to_le_bytes());
     message.extend_from_slice(&height.to_le_bytes());
     message.extend_from_slice(&round.to_le_bytes());
     message.extend_from_slice(block_hash.as_bytes());
@@ -76,7 +76,7 @@ pub fn committed_block_header_message(
 ) -> Vec<u8> {
     let mut message = Vec::with_capacity(64);
     message.extend_from_slice(DOMAIN_COMMITTED_BLOCK_HEADER);
-    message.extend_from_slice(&shard_group_id.0.to_le_bytes());
+    message.extend_from_slice(&shard_group_id.to_le_bytes());
     message.extend_from_slice(&height.to_le_bytes());
     message.extend_from_slice(block_hash.as_bytes());
     message
@@ -105,7 +105,7 @@ pub fn block_header_message(
 ) -> Vec<u8> {
     let mut message = Vec::with_capacity(80);
     message.extend_from_slice(DOMAIN_BLOCK_HEADER);
-    message.extend_from_slice(&shard_group.0.to_le_bytes());
+    message.extend_from_slice(&shard_group.to_le_bytes());
     message.extend_from_slice(&height.to_le_bytes());
     message.extend_from_slice(&round.to_le_bytes());
     message.extend_from_slice(block_hash.as_bytes());
@@ -136,8 +136,8 @@ pub fn state_provisions_message(provisions: &Provisions) -> Vec<u8> {
 
     let mut message = Vec::with_capacity(96);
     message.extend_from_slice(DOMAIN_STATE_PROVISION_BATCH);
-    message.extend_from_slice(&provisions.source_shard.0.to_le_bytes());
-    message.extend_from_slice(&provisions.target_shard.0.to_le_bytes());
+    message.extend_from_slice(&provisions.source_shard.to_le_bytes());
+    message.extend_from_slice(&provisions.target_shard.to_le_bytes());
     message.extend_from_slice(&provisions.block_height.to_le_bytes());
     message.extend_from_slice(tx_digest.as_bytes());
     message
@@ -217,7 +217,7 @@ pub fn exec_vote_message(
     message.extend_from_slice(&vote_anchor_ts.as_millis().to_le_bytes());
     // WaveId is self-contained (shard + block_height + remote_shards),
     // so no separate block_hash needed in the signing message.
-    message.extend_from_slice(&wave_id.shard_group_id.0.to_le_bytes());
+    message.extend_from_slice(&wave_id.shard_group_id.to_le_bytes());
     message.extend_from_slice(&wave_id.block_height.to_le_bytes());
     message.extend_from_slice(
         &u32::try_from(wave_id.remote_shards.len())
@@ -225,9 +225,9 @@ pub fn exec_vote_message(
             .to_le_bytes(),
     );
     for shard in &wave_id.remote_shards {
-        message.extend_from_slice(&shard.0.to_le_bytes());
+        message.extend_from_slice(&shard.to_le_bytes());
     }
-    message.extend_from_slice(&shard_group.0.to_le_bytes());
+    message.extend_from_slice(&shard_group.to_le_bytes());
     message.extend_from_slice(global_receipt_root.as_raw().as_bytes());
     message.extend_from_slice(&tx_count.to_le_bytes());
     message
@@ -244,7 +244,7 @@ pub fn exec_vote_batch_message(shard_group: ShardGroupId, votes: &[ExecutionVote
 
     let mut message = Vec::with_capacity(64);
     message.extend_from_slice(DOMAIN_EXEC_VOTE_BATCH);
-    message.extend_from_slice(&shard_group.0.to_le_bytes());
+    message.extend_from_slice(&shard_group.to_le_bytes());
     message.extend_from_slice(digest.as_bytes());
     message
 }
@@ -263,7 +263,7 @@ pub fn exec_cert_batch_message(
 
     let mut message = Vec::with_capacity(64);
     message.extend_from_slice(DOMAIN_EXEC_CERT_BATCH);
-    message.extend_from_slice(&shard_group.0.to_le_bytes());
+    message.extend_from_slice(&shard_group.to_le_bytes());
     message.extend_from_slice(digest.as_bytes());
     message
 }
@@ -275,7 +275,7 @@ mod tests {
 
     #[test]
     fn test_block_vote_message_deterministic() {
-        let shard = ShardGroupId(1);
+        let shard = ShardGroupId::new(1);
         let block = BlockHash::from_raw(Hash::from_bytes(b"test_block"));
 
         let msg1 = block_vote_message(shard, BlockHeight::new(10), Round::INITIAL, &block);
@@ -287,7 +287,7 @@ mod tests {
 
     #[test]
     fn test_committed_block_header_message_deterministic() {
-        let shard = ShardGroupId(1);
+        let shard = ShardGroupId::new(1);
         let block = BlockHash::from_raw(Hash::from_bytes(b"test_block"));
 
         let msg1 = committed_block_header_message(shard, BlockHeight::new(10), &block);
@@ -299,7 +299,7 @@ mod tests {
 
     #[test]
     fn test_block_header_message_deterministic() {
-        let shard = ShardGroupId(1);
+        let shard = ShardGroupId::new(1);
         let block = BlockHash::from_raw(Hash::from_bytes(b"test_block"));
 
         let msg1 = block_header_message(shard, BlockHeight::new(10), Round::INITIAL, &block);
@@ -311,7 +311,7 @@ mod tests {
 
     #[test]
     fn test_block_header_differs_from_block_vote() {
-        let shard = ShardGroupId(1);
+        let shard = ShardGroupId::new(1);
         let block = BlockHash::from_raw(Hash::from_bytes(b"test_block"));
 
         let header_msg = block_header_message(shard, BlockHeight::new(10), Round::INITIAL, &block);
@@ -326,8 +326,8 @@ mod tests {
         use crate::{MerkleInclusionProof, TxEntries};
 
         let provisions = Provisions::new(
-            ShardGroupId(1),
-            ShardGroupId(2),
+            ShardGroupId::new(1),
+            ShardGroupId::new(2),
             BlockHeight::new(10),
             MerkleInclusionProof::dummy(),
             vec![TxEntries {
@@ -376,7 +376,7 @@ mod tests {
 
         let bind_msg = validator_bind_message(bytes, &nonce);
         let block_msg = block_vote_message(
-            ShardGroupId(0),
+            ShardGroupId::new(0),
             BlockHeight::GENESIS,
             Round::INITIAL,
             &BlockHash::from_raw(Hash::from_bytes(bytes)),

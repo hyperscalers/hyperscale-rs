@@ -210,7 +210,7 @@ impl NodeStateMachine {
 impl StateMachine for NodeStateMachine {
     #[instrument(skip(self), fields(
         node = self.node_index,
-        shard = self.topology.snapshot().local_shard().0,
+        shard = self.topology.snapshot().local_shard().inner(),
         event = %event.type_name(),
         height = self.bft.committed_height().inner(),
     ))]

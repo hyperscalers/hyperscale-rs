@@ -10,7 +10,32 @@ use sbor::prelude::*;
 /// Validator identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, BasicSbor)]
 #[sbor(transparent)]
-pub struct ValidatorId(pub u64);
+pub struct ValidatorId(u64);
+
+impl ValidatorId {
+    /// Construct a validator id from a raw `u64`.
+    ///
+    /// Boundary constructor — committee enumeration, wire decode, sentinel
+    /// values (`ValidatorId::new(u64::MAX)` for fetched-no-real-sender), and
+    /// tests.
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Inner `u64`. Use sparingly — at boundaries (display, structured log
+    /// fields, hashing) only.
+    #[must_use]
+    pub const fn inner(self) -> u64 {
+        self.0
+    }
+
+    /// Little-endian byte representation of the inner value.
+    #[must_use]
+    pub const fn to_le_bytes(self) -> [u8; 8] {
+        self.0.to_le_bytes()
+    }
+}
 
 impl Display for ValidatorId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -21,7 +46,31 @@ impl Display for ValidatorId {
 /// Shard group identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, BasicSbor)]
 #[sbor(transparent)]
-pub struct ShardGroupId(pub u64);
+pub struct ShardGroupId(u64);
+
+impl ShardGroupId {
+    /// Construct a shard group id from a raw `u64`.
+    ///
+    /// Boundary constructor — topology decode, `shard_for_node` routing,
+    /// tests.
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Inner `u64`. Use sparingly — at boundaries (display, structured log
+    /// fields, hashing) only.
+    #[must_use]
+    pub const fn inner(self) -> u64 {
+        self.0
+    }
+
+    /// Little-endian byte representation of the inner value.
+    #[must_use]
+    pub const fn to_le_bytes(self) -> [u8; 8] {
+        self.0.to_le_bytes()
+    }
+}
 
 impl Display for ShardGroupId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

@@ -117,11 +117,11 @@ pub fn make_test_block(height: BlockHeight) -> Block {
     parent_bytes[..8].copy_from_slice(&height.to_le_bytes());
     Block::Live {
         header: BlockHeader {
-            shard_group_id: ShardGroupId(0),
+            shard_group_id: ShardGroupId::new(0),
             height,
             parent_block_hash: BlockHash::from_raw(Hash::from_bytes(&parent_bytes)),
-            parent_qc: QuorumCertificate::genesis(ShardGroupId(0)),
-            proposer: ValidatorId(0),
+            parent_qc: QuorumCertificate::genesis(ShardGroupId::new(0)),
+            proposer: ValidatorId::new(0),
             timestamp: ProposerTimestamp::from_millis(height.inner() * 1000),
             round: Round::INITIAL,
             is_fallback: false,
@@ -145,7 +145,7 @@ pub fn make_test_block(height: BlockHeight) -> Block {
 pub fn make_test_qc(block: &Block) -> QuorumCertificate {
     QuorumCertificate {
         block_hash: block.hash(),
-        shard_group_id: ShardGroupId(0),
+        shard_group_id: ShardGroupId::new(0),
         height: block.height(),
         parent_block_hash: block.header().parent_block_hash,
         round: Round::INITIAL,
@@ -205,7 +205,7 @@ pub fn make_test_execution_certificate(
     }];
     let global_receipt_root = compute_global_receipt_root(&outcomes);
     ExecutionCertificate::new(
-        WaveId::new(ShardGroupId(0), block_height, BTreeSet::new()),
+        WaveId::new(ShardGroupId::new(0), block_height, BTreeSet::new()),
         WeightedTimestamp::from_millis(block_height.inner() + 1),
         global_receipt_root,
         outcomes,
@@ -226,7 +226,7 @@ fn make_test_block_with_ecs(height: BlockHeight, ecs: Vec<Arc<ExecutionCertifica
         return block;
     }
     let certificate = Arc::new(WaveCertificate {
-        wave_id: WaveId::new(ShardGroupId(0), height, BTreeSet::new()),
+        wave_id: WaveId::new(ShardGroupId::new(0), height, BTreeSet::new()),
         execution_certificates: ecs,
     });
     let new_fw = Arc::new(FinalizedWave {

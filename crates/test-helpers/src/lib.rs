@@ -83,7 +83,7 @@ impl TestCommittee {
 
             keypairs.push(kp);
             public_keys.push(pk);
-            validator_ids.push(ValidatorId(i as u64));
+            validator_ids.push(ValidatorId::new(i as u64));
         }
 
         Self {
@@ -104,11 +104,11 @@ impl TestCommittee {
     ///
     /// // Shard 0: validators 0, 1, 2, 3
     /// let shard0 = TestCommittee::for_shard(4, 42, 0);
-    /// assert_eq!(shard0.validator_id(0).0, 0);
+    /// assert_eq!(shard0.validator_id(0).inner(), 0);
     ///
     /// // Shard 1: validators 4, 5, 6, 7
     /// let shard1 = TestCommittee::for_shard(4, 42, 1);
-    /// assert_eq!(shard1.validator_id(0).0, 4);
+    /// assert_eq!(shard1.validator_id(0).inner(), 4);
     /// ```
     #[must_use]
     pub fn for_shard(size: usize, seed: u64, shard_index: u64) -> Self {
@@ -117,7 +117,7 @@ impl TestCommittee {
         // Offset validator IDs by shard
         let offset = shard_index * size as u64;
         for (i, vid) in committee.validator_ids.iter_mut().enumerate() {
-            *vid = ValidatorId(offset + i as u64);
+            *vid = ValidatorId::new(offset + i as u64);
         }
 
         committee
@@ -207,7 +207,7 @@ impl TestCommittee {
 /// Build a minimal `Block::Live` fixture for driving state machines.
 ///
 /// Every non-essential header field takes a zero default: all merkle roots
-/// are `Hash::ZERO`, `parent_qc` is `QuorumCertificate::genesis(ShardGroupId(0))`, `round`
+/// are `Hash::ZERO`, `parent_qc` is `QuorumCertificate::genesis(ShardGroupId::new(0))`, `round`
 /// is `Round::INITIAL`, and there are no wave roots or provisions. Callers
 /// pass only the bits that vary between tests.
 #[must_use]
@@ -223,7 +223,7 @@ pub fn make_live_block(
         shard_group_id,
         height,
         parent_block_hash: BlockHash::ZERO,
-        parent_qc: QuorumCertificate::genesis(ShardGroupId(0)),
+        parent_qc: QuorumCertificate::genesis(ShardGroupId::new(0)),
         proposer,
         timestamp: ProposerTimestamp::from_millis(timestamp_ms),
         round: Round::INITIAL,
@@ -255,14 +255,14 @@ pub fn certify(block: Block, weighted_timestamp_ms: u64) -> CertifiedBlock {
     let qc = QuorumCertificate {
         block_hash: block.hash(),
         weighted_timestamp: WeightedTimestamp::from_millis(weighted_timestamp_ms),
-        ..QuorumCertificate::genesis(ShardGroupId(0))
+        ..QuorumCertificate::genesis(ShardGroupId::new(0))
     };
     CertifiedBlock::new_unchecked(block, qc)
 }
 
 /// Build a minimal `FinalizedWave` carrying a single tx decision.
 ///
-/// The wave is anchored on `ShardGroupId(0)` with `block_height` as its
+/// The wave is anchored on `ShardGroupId::new(0)` with `block_height` as its
 /// identity and no remote shard dependencies — sufficient for driving
 /// `on_block_committed` when tests only care about tx-terminal-state side
 /// effects. The inner EC carries a zeroed BLS signature and a 4-seat
@@ -281,7 +281,7 @@ pub fn make_finalized_wave(
         TransactionDecision::Reject => ExecutionOutcome::Failed,
         TransactionDecision::Aborted => ExecutionOutcome::Aborted,
     };
-    let wave_id = WaveId::new(ShardGroupId(0), block_height, BTreeSet::new());
+    let wave_id = WaveId::new(ShardGroupId::new(0), block_height, BTreeSet::new());
     let ec = ExecutionCertificate::new(
         wave_id.clone(),
         WeightedTimestamp::from_millis(block_height.inner() + 1),
@@ -310,8 +310,8 @@ mod tests {
         let committee = TestCommittee::new(4, 42);
 
         assert_eq!(committee.size(), 4);
-        assert_eq!(committee.validator_id(0), ValidatorId(0));
-        assert_eq!(committee.validator_id(3), ValidatorId(3));
+        assert_eq!(committee.validator_id(0), ValidatorId::new(0));
+        assert_eq!(committee.validator_id(3), ValidatorId::new(3));
     }
 
     #[test]
@@ -340,12 +340,12 @@ mod tests {
         let shard1 = TestCommittee::for_shard(4, 42, 1);
 
         // Shard 0 has validators 0-3
-        assert_eq!(shard0.validator_id(0), ValidatorId(0));
-        assert_eq!(shard0.validator_id(3), ValidatorId(3));
+        assert_eq!(shard0.validator_id(0), ValidatorId::new(0));
+        assert_eq!(shard0.validator_id(3), ValidatorId::new(3));
 
         // Shard 1 has validators 4-7
-        assert_eq!(shard1.validator_id(0), ValidatorId(4));
-        assert_eq!(shard1.validator_id(3), ValidatorId(7));
+        assert_eq!(shard1.validator_id(0), ValidatorId::new(4));
+        assert_eq!(shard1.validator_id(3), ValidatorId::new(7));
     }
 
     #[test]

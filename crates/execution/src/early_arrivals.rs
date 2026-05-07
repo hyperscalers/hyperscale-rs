@@ -255,7 +255,7 @@ mod tests {
     use super::*;
 
     fn shard() -> ShardGroupId {
-        ShardGroupId(0)
+        ShardGroupId::new(0)
     }
 
     fn wave(height: u64) -> WaveId {
@@ -320,7 +320,7 @@ mod tests {
             global_receipt_root,
             tx_count: u32::try_from(tx_outcomes.len()).unwrap_or(u32::MAX),
             tx_outcomes,
-            validator: ValidatorId(0),
+            validator: ValidatorId::new(0),
             signature,
         }
     }

@@ -427,10 +427,10 @@ impl FetchBinding for ProvisionBinding {
                     || provisions.block_height != block_height
                 {
                     tracing::warn!(
-                        expected_source = source_shard.0,
-                        got_source = provisions.source_shard.0,
-                        expected_target = target_shard.0,
-                        got_target = provisions.target_shard.0,
+                        expected_source = source_shard.inner(),
+                        got_source = provisions.source_shard.inner(),
+                        expected_target = target_shard.inner(),
+                        got_target = provisions.target_shard.inner(),
                         expected_height = block_height.inner(),
                         got_height = provisions.block_height.inner(),
                         "Dropping provision fetch response: scope mismatch"
@@ -556,8 +556,8 @@ mod tests {
             BlockHeight, Hash, MerkleInclusionProof, Provisions, ShardGroupId, TxEntries, TxHash,
         };
         let asked = Arc::new(Provisions::new(
-            ShardGroupId(1),
-            ShardGroupId(2),
+            ShardGroupId::new(1),
+            ShardGroupId::new(2),
             BlockHeight::new(10),
             MerkleInclusionProof::dummy(),
             vec![TxEntries {
@@ -567,8 +567,8 @@ mod tests {
             }],
         ));
         let extra = Arc::new(Provisions::new(
-            ShardGroupId(3),
-            ShardGroupId(2),
+            ShardGroupId::new(3),
+            ShardGroupId::new(2),
             BlockHeight::new(11),
             MerkleInclusionProof::dummy(),
             vec![TxEntries {

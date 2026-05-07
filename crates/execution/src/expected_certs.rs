@@ -310,9 +310,9 @@ mod tests {
 
     fn wave(height: u64) -> WaveId {
         WaveId {
-            shard_group_id: ShardGroupId(1),
+            shard_group_id: ShardGroupId::new(1),
             block_height: BlockHeight::new(height),
-            remote_shards: std::iter::once(ShardGroupId(0)).collect(),
+            remote_shards: std::iter::once(ShardGroupId::new(0)).collect(),
         }
     }
 
@@ -324,9 +324,14 @@ mod tests {
     fn register_inserts_expectation_with_discovery_timestamp() {
         let mut t = ExpectedCertTracker::new();
         let w = wave(5);
-        t.register(ShardGroupId(1), BlockHeight::new(5), w.clone(), ms(1000));
+        t.register(
+            ShardGroupId::new(1),
+            BlockHeight::new(5),
+            w.clone(),
+            ms(1000),
+        );
 
-        assert!(t.is_expected(ShardGroupId(1), BlockHeight::new(5), &w));
+        assert!(t.is_expected(ShardGroupId::new(1), BlockHeight::new(5), &w));
         assert_eq!(t.expected_len(), 1);
     }
 
@@ -334,11 +339,16 @@ mod tests {
     fn register_is_idempotent_and_does_not_reset_discovery() {
         let mut t = ExpectedCertTracker::new();
         let w = wave(5);
-        t.register(ShardGroupId(1), BlockHeight::new(5), w.clone(), ms(1000));
+        t.register(
+            ShardGroupId::new(1),
+            BlockHeight::new(5),
+            w.clone(),
+            ms(1000),
+        );
         // Second register at a later timestamp; discovery timestamp must
         // stick to the earlier value, otherwise the fallback deadline gets
         // perpetually pushed out.
-        t.register(ShardGroupId(1), BlockHeight::new(5), w, ms(9999));
+        t.register(ShardGroupId::new(1), BlockHeight::new(5), w, ms(9999));
         let fetches = t.check_timeouts(ms(1000 + 5_000));
         assert_eq!(fetches.len(), 1, "deadline anchors on first register");
     }
@@ -352,15 +362,20 @@ mod tests {
         let mut t = ExpectedCertTracker::new();
         let w = wave(5);
         t.mark_fulfilled(
-            ShardGroupId(1),
+            ShardGroupId::new(1),
             BlockHeight::new(5),
             &w,
             std::iter::once(tx(1)),
             ms(500),
         );
-        t.register(ShardGroupId(1), BlockHeight::new(5), w.clone(), ms(1000));
+        t.register(
+            ShardGroupId::new(1),
+            BlockHeight::new(5),
+            w.clone(),
+            ms(1000),
+        );
 
-        assert!(!t.is_expected(ShardGroupId(1), BlockHeight::new(5), &w));
+        assert!(!t.is_expected(ShardGroupId::new(1), BlockHeight::new(5), &w));
         assert_eq!(t.expected_len(), 0);
     }
 
@@ -368,10 +383,10 @@ mod tests {
     fn mark_fulfilled_returns_true_when_clearing_active_expectation() {
         let mut t = ExpectedCertTracker::new();
         let w = wave(5);
-        t.register(ShardGroupId(1), BlockHeight::new(5), w.clone(), ms(0));
+        t.register(ShardGroupId::new(1), BlockHeight::new(5), w.clone(), ms(0));
 
         let cleared = t.mark_fulfilled(
-            ShardGroupId(1),
+            ShardGroupId::new(1),
             BlockHeight::new(5),
             &w,
             std::iter::once(tx(1)),
@@ -387,7 +402,7 @@ mod tests {
         let mut t = ExpectedCertTracker::new();
         let w = wave(5);
         let cleared = t.mark_fulfilled(
-            ShardGroupId(1),
+            ShardGroupId::new(1),
             BlockHeight::new(5),
             &w,
             std::iter::once(tx(1)),
@@ -404,7 +419,7 @@ mod tests {
         let tx_a = tx(1);
         let tx_b = tx(2);
         t.mark_fulfilled(
-            ShardGroupId(1),
+            ShardGroupId::new(1),
             BlockHeight::new(5),
             &w,
             [tx_a, tx_b],
@@ -425,7 +440,7 @@ mod tests {
     fn check_timeouts_fires_after_initial_window_and_records_request_ts() {
         let mut t = ExpectedCertTracker::new();
         let w = wave(5);
-        t.register(ShardGroupId(1), BlockHeight::new(5), w, ms(1_000));
+        t.register(ShardGroupId::new(1), BlockHeight::new(5), w, ms(1_000));
 
         // Just before the deadline: no fetch.
         let fetches = t.check_timeouts(ms(1_000 + 4_999));
@@ -441,7 +456,7 @@ mod tests {
     fn check_timeouts_respects_retry_interval_after_first_request() {
         let mut t = ExpectedCertTracker::new();
         let w = wave(5);
-        t.register(ShardGroupId(1), BlockHeight::new(5), w, ms(0));
+        t.register(ShardGroupId::new(1), BlockHeight::new(5), w, ms(0));
 
         // First fetch fires.
         let _ = t.check_timeouts(ms(5_000));
@@ -460,16 +475,16 @@ mod tests {
         let mut t = ExpectedCertTracker::new();
         let w1 = wave(5);
         let w2 = wave(6);
-        t.register(ShardGroupId(1), BlockHeight::new(5), w1.clone(), ms(0));
-        t.register(ShardGroupId(2), BlockHeight::new(6), w2.clone(), ms(0));
+        t.register(ShardGroupId::new(1), BlockHeight::new(5), w1.clone(), ms(0));
+        t.register(ShardGroupId::new(2), BlockHeight::new(6), w2.clone(), ms(0));
 
-        let needed: HashSet<ShardGroupId> = std::iter::once(ShardGroupId(1)).collect();
+        let needed: HashSet<ShardGroupId> = std::iter::once(ShardGroupId::new(1)).collect();
         // Advance past the grace window so the unneeded entry is actually pruned.
         let now = ms(u64::try_from(EXPECTED_RETENTION_GRACE.as_millis()).unwrap() + 1);
         t.retain_if_shard_needed(&needed, now);
 
-        assert!(t.is_expected(ShardGroupId(1), BlockHeight::new(5), &w1));
-        assert!(!t.is_expected(ShardGroupId(2), BlockHeight::new(6), &w2));
+        assert!(t.is_expected(ShardGroupId::new(1), BlockHeight::new(5), &w1));
+        assert!(!t.is_expected(ShardGroupId::new(2), BlockHeight::new(6), &w2));
     }
 
     #[test]
@@ -479,14 +494,14 @@ mod tests {
         // that race.
         let mut t = ExpectedCertTracker::new();
         let w = wave(5);
-        t.register(ShardGroupId(1), BlockHeight::new(5), w.clone(), ms(0));
+        t.register(ShardGroupId::new(1), BlockHeight::new(5), w.clone(), ms(0));
 
         // Within grace window, no local wave references shard 1 yet —
         // expectation must still be retained.
         let needed: HashSet<ShardGroupId> = HashSet::new();
         t.retain_if_shard_needed(&needed, ms(1_000));
 
-        assert!(t.is_expected(ShardGroupId(1), BlockHeight::new(5), &w));
+        assert!(t.is_expected(ShardGroupId::new(1), BlockHeight::new(5), &w));
     }
 
     #[test]
@@ -497,14 +512,14 @@ mod tests {
         // Per-entry deadlines. Old entry's deadline has passed by now_ts;
         // fresh entry's deadline is in the future.
         t.mark_fulfilled(
-            ShardGroupId(1),
+            ShardGroupId::new(1),
             BlockHeight::new(5),
             &w_old,
             std::iter::once(tx(1)),
             ms(60_000),
         );
         t.mark_fulfilled(
-            ShardGroupId(1),
+            ShardGroupId::new(1),
             BlockHeight::new(6),
             &w_fresh,
             std::iter::once(tx(2)),
@@ -524,9 +539,14 @@ mod tests {
         // Pre-first-commit entry has discovery timestamp ZERO. A
         // freshly-registered entry at a post-stamp timestamp simulates the
         // ordinary case the retro-stamp must leave alone.
-        t.register(ShardGroupId(1), BlockHeight::new(5), w_zero.clone(), ms(0));
         t.register(
-            ShardGroupId(1),
+            ShardGroupId::new(1),
+            BlockHeight::new(5),
+            w_zero.clone(),
+            ms(0),
+        );
+        t.register(
+            ShardGroupId::new(1),
             BlockHeight::new(6),
             w_stamped.clone(),
             ms(9_000),
@@ -557,7 +577,7 @@ mod tests {
     fn on_txs_terminated_cleans_reverse_index_when_entry_evicts() {
         let mut t = ExpectedCertTracker::new();
         t.mark_fulfilled(
-            ShardGroupId(1),
+            ShardGroupId::new(1),
             BlockHeight::new(5),
             &wave(5),
             std::iter::once(tx(1)),
@@ -582,14 +602,14 @@ mod tests {
         let w1 = wave(5);
         let w2 = wave(6);
         t.mark_fulfilled(
-            ShardGroupId(1),
+            ShardGroupId::new(1),
             BlockHeight::new(5),
             &w1,
             [shared, only_in_first],
             ms(60_000),
         );
         t.mark_fulfilled(
-            ShardGroupId(1),
+            ShardGroupId::new(1),
             BlockHeight::new(6),
             &w2,
             std::iter::once(shared),
@@ -607,7 +627,7 @@ mod tests {
     fn prune_fulfilled_cleans_reverse_index_for_evicted_entries() {
         let mut t = ExpectedCertTracker::new();
         t.mark_fulfilled(
-            ShardGroupId(1),
+            ShardGroupId::new(1),
             BlockHeight::new(5),
             &wave(5),
             [tx(1), tx(2)],
@@ -627,7 +647,7 @@ mod tests {
         // equality the entry is dropped.
         let mut t = ExpectedCertTracker::new();
         t.mark_fulfilled(
-            ShardGroupId(1),
+            ShardGroupId::new(1),
             BlockHeight::new(5),
             &wave(5),
             std::iter::once(tx(1)),
@@ -640,7 +660,7 @@ mod tests {
     #[test]
     fn check_timeouts_fires_at_exactly_the_fallback_deadline() {
         let mut t = ExpectedCertTracker::new();
-        t.register(ShardGroupId(1), BlockHeight::new(5), wave(5), ms(0));
+        t.register(ShardGroupId::new(1), BlockHeight::new(5), wave(5), ms(0));
         let fetches = t.check_timeouts(ms(5_000));
         assert_eq!(fetches.len(), 1);
         assert!(!fetches[0].1);
@@ -654,10 +674,15 @@ mod tests {
         // Old entry crosses initial deadline at 5_000 then is due for retry
         // at 15_000 (cooldown = 10s). New entry registered at 10_000 crosses
         // its initial deadline at 15_000.
-        t.register(ShardGroupId(1), BlockHeight::new(5), w_old.clone(), ms(0));
+        t.register(
+            ShardGroupId::new(1),
+            BlockHeight::new(5),
+            w_old.clone(),
+            ms(0),
+        );
         let _ = t.check_timeouts(ms(5_000));
         t.register(
-            ShardGroupId(1),
+            ShardGroupId::new(1),
             BlockHeight::new(6),
             w_new.clone(),
             ms(10_000),
@@ -676,7 +701,7 @@ mod tests {
         // `elapsed_since < EXPECTED_RETENTION_GRACE` — at equality the entry
         // is pruned.
         let mut t = ExpectedCertTracker::new();
-        t.register(ShardGroupId(1), BlockHeight::new(5), wave(5), ms(0));
+        t.register(ShardGroupId::new(1), BlockHeight::new(5), wave(5), ms(0));
         let boundary = ms(u64::try_from(EXPECTED_RETENTION_GRACE.as_millis()).unwrap());
         t.retain_if_shard_needed(&HashSet::new(), boundary);
         assert_eq!(t.expected_len(), 0);
@@ -695,14 +720,14 @@ mod tests {
         let new_tx = tx(2);
 
         t.mark_fulfilled(
-            ShardGroupId(1),
+            ShardGroupId::new(1),
             BlockHeight::new(5),
             &w,
             std::iter::once(original_tx),
             ms(1_000),
         );
         t.mark_fulfilled(
-            ShardGroupId(1),
+            ShardGroupId::new(1),
             BlockHeight::new(5),
             &w,
             std::iter::once(new_tx),
@@ -721,7 +746,7 @@ mod tests {
         // deadline backstop can evict — there's nothing to drain.
         let mut t = ExpectedCertTracker::new();
         t.mark_fulfilled(
-            ShardGroupId(1),
+            ShardGroupId::new(1),
             BlockHeight::new(5),
             &wave(5),
             std::iter::empty(),
@@ -746,7 +771,7 @@ mod tests {
         let mut t = ExpectedCertTracker::new();
         let w = wave(5);
         t.mark_fulfilled(
-            ShardGroupId(1),
+            ShardGroupId::new(1),
             BlockHeight::new(5),
             &w,
             std::iter::once(tx(1)),
@@ -754,9 +779,14 @@ mod tests {
         );
         t.on_txs_terminated(std::iter::once(tx(1)));
 
-        t.register(ShardGroupId(1), BlockHeight::new(5), w.clone(), ms(70_000));
+        t.register(
+            ShardGroupId::new(1),
+            BlockHeight::new(5),
+            w.clone(),
+            ms(70_000),
+        );
 
-        assert!(t.is_expected(ShardGroupId(1), BlockHeight::new(5), &w));
+        assert!(t.is_expected(ShardGroupId::new(1), BlockHeight::new(5), &w));
     }
 
     // ─── Property test ──────────────────────────────────────────────────
@@ -774,7 +804,7 @@ mod tests {
             timeouts in prop_vec(0u64..100_000, 1..10),
         ) {
             let mut t = ExpectedCertTracker::new();
-            let shard = ShardGroupId(1);
+            let shard = ShardGroupId::new(1);
 
             // Register expectations at t=0 so deadlines are all crossed
             // well before the latest poll time.

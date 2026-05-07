@@ -46,9 +46,9 @@ mod tests {
     fn test_sbor_roundtrip() {
         let request = GetExecutionCertsRequest {
             wave_ids: vec![WaveId::new(
-                ShardGroupId(0),
+                ShardGroupId::new(0),
                 BlockHeight::new(42),
-                BTreeSet::from([ShardGroupId(1), ShardGroupId(2)]),
+                BTreeSet::from([ShardGroupId::new(1), ShardGroupId::new(2)]),
             )],
         };
 

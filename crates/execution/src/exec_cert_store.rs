@@ -107,7 +107,7 @@ mod tests {
 
     fn cert(block_height: u64) -> Arc<ExecutionCertificate> {
         let wave_id = WaveId::new(
-            ShardGroupId(0),
+            ShardGroupId::new(0),
             BlockHeight::new(block_height),
             BTreeSet::new(),
         );

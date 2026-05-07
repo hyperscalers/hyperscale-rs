@@ -150,15 +150,15 @@ mod tests {
             block_height: BlockHeight::new(7),
             vote_anchor_ts: WeightedTimestamp::from_millis(11),
             wave_id: WaveId::new(
-                ShardGroupId(0),
+                ShardGroupId::new(0),
                 BlockHeight::new(7),
-                std::iter::once(ShardGroupId(1)).collect(),
+                std::iter::once(ShardGroupId::new(1)).collect(),
             ),
-            shard_group_id: ShardGroupId(0),
+            shard_group_id: ShardGroupId::new(0),
             global_receipt_root: GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root")),
             tx_count: u32::try_from(outcomes.len()).unwrap(),
             tx_outcomes: outcomes,
-            validator: ValidatorId(3),
+            validator: ValidatorId::new(3),
             signature: Bls12381G2Signature([0u8; 96]),
         }
     }

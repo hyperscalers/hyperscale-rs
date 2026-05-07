@@ -41,11 +41,11 @@ mod tests {
     #[test]
     fn test_block_header_hash_deterministic() {
         let header = BlockHeader {
-            shard_group_id: ShardGroupId(0),
+            shard_group_id: ShardGroupId::new(0),
             height: BlockHeight::new(1),
             parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            parent_qc: QuorumCertificate::genesis(ShardGroupId(0)),
-            proposer: ValidatorId(0),
+            parent_qc: QuorumCertificate::genesis(ShardGroupId::new(0)),
+            proposer: ValidatorId::new(0),
             timestamp: ProposerTimestamp::from_millis(1_234_567_890),
             round: Round::INITIAL,
             is_fallback: false,
@@ -66,7 +66,7 @@ mod tests {
 
     #[test]
     fn test_genesis_block() {
-        let genesis = Block::genesis(ShardGroupId(0), ValidatorId(0), StateRoot::ZERO);
+        let genesis = Block::genesis(ShardGroupId::new(0), ValidatorId::new(0), StateRoot::ZERO);
 
         assert!(genesis.is_genesis());
         assert_eq!(genesis.height(), BlockHeight::new(0));
@@ -74,7 +74,7 @@ mod tests {
         assert_eq!(genesis.header().transaction_root, TransactionRoot::ZERO);
         assert_eq!(
             genesis.header().parent_qc,
-            QuorumCertificate::genesis(ShardGroupId(0))
+            QuorumCertificate::genesis(ShardGroupId::new(0))
         );
     }
 
@@ -113,9 +113,9 @@ mod tests {
         let make_fw = |seed: u8| -> Arc<FinalizedWave> {
             let ec = Arc::new(ExecutionCertificate::new(
                 WaveId::new(
-                    ShardGroupId(0),
+                    ShardGroupId::new(0),
                     BlockHeight::new(10),
-                    BTreeSet::from([ShardGroupId(1)]),
+                    BTreeSet::from([ShardGroupId::new(1)]),
                 ),
                 WeightedTimestamp::from_millis(11),
                 GlobalReceiptRoot::from_raw(Hash::from_bytes(&[seed + 100; 4])),
@@ -133,9 +133,9 @@ mod tests {
             Arc::new(FinalizedWave {
                 certificate: Arc::new(WaveCertificate {
                     wave_id: WaveId::new(
-                        ShardGroupId(0),
+                        ShardGroupId::new(0),
                         BlockHeight::new(10),
-                        BTreeSet::from([ShardGroupId(1)]),
+                        BTreeSet::from([ShardGroupId::new(1)]),
                     ),
                     execution_certificates: vec![ec],
                 }),
@@ -153,7 +153,7 @@ mod tests {
     #[test]
     fn test_compute_certificate_root_single_cert() {
         let ec = Arc::new(ExecutionCertificate::new(
-            WaveId::new(ShardGroupId(0), BlockHeight::new(10), BTreeSet::new()),
+            WaveId::new(ShardGroupId::new(0), BlockHeight::new(10), BTreeSet::new()),
             WeightedTimestamp::from_millis(11),
             GlobalReceiptRoot::from_raw(Hash::from_bytes(b"receipt")),
             vec![TxOutcome {
@@ -166,7 +166,7 @@ mod tests {
             SignerBitfield::new(4),
         ));
         let cert = Arc::new(WaveCertificate {
-            wave_id: WaveId::new(ShardGroupId(0), BlockHeight::new(10), BTreeSet::new()),
+            wave_id: WaveId::new(ShardGroupId::new(0), BlockHeight::new(10), BTreeSet::new()),
             execution_certificates: vec![ec],
         });
         let expected_receipt_hash = cert.receipt_hash();
@@ -182,7 +182,7 @@ mod tests {
 
     #[test]
     fn test_genesis_certificate_root_is_zero() {
-        let genesis = Block::genesis(ShardGroupId(0), ValidatorId(0), StateRoot::ZERO);
+        let genesis = Block::genesis(ShardGroupId::new(0), ValidatorId::new(0), StateRoot::ZERO);
         assert_eq!(genesis.header().certificate_root, CertificateRoot::ZERO);
     }
 
@@ -195,13 +195,14 @@ mod tests {
         // Forge a non-genesis block paired with a genesis QC. Without the
         // pairing check at decode this slips past the synced-block apply
         // path's `qc.is_genesis()` quorum-power bypass.
-        let mut bad_block = Block::genesis(ShardGroupId(0), ValidatorId(0), StateRoot::ZERO)
-            .into_sealed()
-            .into_live(Arc::new(Vec::new()));
+        let mut bad_block =
+            Block::genesis(ShardGroupId::new(0), ValidatorId::new(0), StateRoot::ZERO)
+                .into_sealed()
+                .into_live(Arc::new(Vec::new()));
         if let Block::Live { ref mut header, .. } = bad_block {
             header.height = BlockHeight::new(7);
         }
-        let genesis_qc = QuorumCertificate::genesis(ShardGroupId(0));
+        let genesis_qc = QuorumCertificate::genesis(ShardGroupId::new(0));
         let bytes = basic_encode(&CertifiedBlockWire {
             block: bad_block,
             qc: genesis_qc,

@@ -137,7 +137,7 @@ where
 
         self.network
             .register_request_handler::<GetProvisionsRequest>(move |req: GetProvisionsRequest| {
-                let cache_key = (req.block_height.inner(), req.target_shard.0);
+                let cache_key = (req.block_height.inner(), req.target_shard.inner());
 
                 // Outbound fast path: if we still hold the exact batch we
                 // generated for this (source_block_height, target_shard),
@@ -434,7 +434,10 @@ where
                     let topo = topology.load();
                     let proposer = gossip.header.proposer;
                     let Some(public_key) = topo.public_key(proposer) else {
-                        warn!(proposer = proposer.0, "Unknown proposer for block header");
+                        warn!(
+                            proposer = proposer.inner(),
+                            "Unknown proposer for block header"
+                        );
                         return;
                     };
                     let msg = gossip.signing_message();
@@ -445,7 +448,7 @@ where
                         "block_header",
                     ) {
                         warn!(
-                            proposer = proposer.0,
+                            proposer = proposer.inner(),
                             height = gossip.header.height.inner(),
                             round = gossip.header.round.inner(),
                             "Block header proposer signature invalid — dropping"
@@ -472,9 +475,9 @@ where
                     // the BLS verification cost. Catches misroutes and spam early.
                     if notification.provisions.target_shard != topo.local_shard() {
                         warn!(
-                            source_shard = notification.provisions.source_shard.0,
-                            target_shard = notification.provisions.target_shard.0,
-                            local_shard = topo.local_shard().0,
+                            source_shard = notification.provisions.source_shard.inner(),
+                            target_shard = notification.provisions.target_shard.inner(),
+                            local_shard = topo.local_shard().inner(),
                             "Dropping provisions notification: target_shard mismatch"
                         );
                         return;
@@ -558,7 +561,7 @@ where
                         .any(|c| c.shard_group_id() != source_shard)
                     {
                         warn!(
-                            sender = sender.0,
+                            sender = sender.inner(),
                             "Execution certificate batch contains mixed shard_group_ids — dropping"
                         );
                         return;

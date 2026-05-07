@@ -106,7 +106,7 @@ mod tests {
 
     fn make_test_validator(id: u64, power: u64) -> ValidatorInfo {
         ValidatorInfo {
-            validator_id: ValidatorId(id),
+            validator_id: ValidatorId::new(id),
             public_key: generate_bls_keypair().public_key(),
             voting_power: VotePower::new(power),
         }
@@ -116,7 +116,7 @@ mod tests {
         let validators: Vec<_> = (0..num_validators)
             .map(|i| make_test_validator(i, 1))
             .collect();
-        TopologyCoordinator::new(ValidatorId(local_id), 1, ValidatorSet::new(validators))
+        TopologyCoordinator::new(ValidatorId::new(local_id), 1, ValidatorSet::new(validators))
     }
 
     #[test]
@@ -125,8 +125,8 @@ mod tests {
         let snap = topology.snapshot();
 
         assert_eq!(snap.local_committee_size(), 4);
-        assert_eq!(snap.local_validator_id(), ValidatorId(0));
-        assert_eq!(snap.local_shard(), ShardGroupId(0));
+        assert_eq!(snap.local_validator_id(), ValidatorId::new(0));
+        assert_eq!(snap.local_shard(), ShardGroupId::new(0));
     }
 
     #[test]
@@ -134,24 +134,30 @@ mod tests {
         // with_local_shard
         let validators: Vec<_> = (0..4).map(|i| make_test_validator(i, 1)).collect();
         let topology = TopologyCoordinator::with_local_shard(
-            ValidatorId(0),
-            ShardGroupId(1),
+            ValidatorId::new(0),
+            ShardGroupId::new(1),
             2,
             ValidatorSet::new(validators),
         );
-        assert_eq!(topology.snapshot().local_shard(), ShardGroupId(1));
+        assert_eq!(topology.snapshot().local_shard(), ShardGroupId::new(1));
         assert_eq!(topology.snapshot().local_committee_size(), 4);
 
         // with_shard_committees
         let validators: Vec<_> = (0..4).map(|i| make_test_validator(i, 1)).collect();
         let vs = ValidatorSet::new(validators);
         let mut committees = HashMap::new();
-        committees.insert(ShardGroupId(0), vec![ValidatorId(0), ValidatorId(2)]);
-        committees.insert(ShardGroupId(1), vec![ValidatorId(1), ValidatorId(3)]);
+        committees.insert(
+            ShardGroupId::new(0),
+            vec![ValidatorId::new(0), ValidatorId::new(2)],
+        );
+        committees.insert(
+            ShardGroupId::new(1),
+            vec![ValidatorId::new(1), ValidatorId::new(3)],
+        );
 
         let topology = TopologyCoordinator::with_shard_committees(
-            ValidatorId(0),
-            ShardGroupId(0),
+            ValidatorId::new(0),
+            ShardGroupId::new(0),
             2,
             &vs,
             committees,
@@ -159,7 +165,7 @@ mod tests {
         assert_eq!(
             topology
                 .snapshot()
-                .committee_for_shard(ShardGroupId(0))
+                .committee_for_shard(ShardGroupId::new(0))
                 .len(),
             2
         );

@@ -73,8 +73,8 @@ mod tests {
             shard_group_id: shard,
             height,
             parent_block_hash: BlockHash::ZERO,
-            parent_qc: QuorumCertificate::genesis(ShardGroupId(0)),
-            proposer: ValidatorId(0),
+            parent_qc: QuorumCertificate::genesis(ShardGroupId::new(0)),
+            proposer: ValidatorId::new(0),
             timestamp: ProposerTimestamp::from_millis(0),
             round: Round::INITIAL,
             is_fallback: false,
@@ -88,7 +88,7 @@ mod tests {
             in_flight: InFlightCount::ZERO,
         };
         let header_hash = header.hash();
-        let mut qc = QuorumCertificate::genesis(ShardGroupId(0));
+        let mut qc = QuorumCertificate::genesis(ShardGroupId::new(0));
         qc.block_hash = header_hash;
         qc.shard_group_id = shard;
         qc.height = height;
@@ -99,14 +99,17 @@ mod tests {
     fn empty_buffer_has_no_entries() {
         let buf = VerifiedHeaderBuffer::new();
         assert_eq!(buf.len(), 0);
-        assert!(buf.get((ShardGroupId(1), BlockHeight::new(0))).is_none());
+        assert!(
+            buf.get((ShardGroupId::new(1), BlockHeight::new(0)))
+                .is_none()
+        );
     }
 
     #[test]
     fn insert_and_get_round_trip() {
         let mut buf = VerifiedHeaderBuffer::new();
-        let key = (ShardGroupId(1), BlockHeight::new(10));
-        let header = make_header(ShardGroupId(1), BlockHeight::new(10));
+        let key = (ShardGroupId::new(1), BlockHeight::new(10));
+        let header = make_header(ShardGroupId::new(1), BlockHeight::new(10));
         buf.insert(key, Arc::clone(&header));
         assert_eq!(buf.len(), 1);
         let stored = buf.get(key).expect("present");
@@ -116,17 +119,17 @@ mod tests {
     #[test]
     fn insert_overwrites_existing_key() {
         let mut buf = VerifiedHeaderBuffer::new();
-        let key = (ShardGroupId(1), BlockHeight::new(10));
-        buf.insert(key, make_header(ShardGroupId(1), BlockHeight::new(10)));
-        buf.insert(key, make_header(ShardGroupId(1), BlockHeight::new(10)));
+        let key = (ShardGroupId::new(1), BlockHeight::new(10));
+        buf.insert(key, make_header(ShardGroupId::new(1), BlockHeight::new(10)));
+        buf.insert(key, make_header(ShardGroupId::new(1), BlockHeight::new(10)));
         assert_eq!(buf.len(), 1);
     }
 
     #[test]
     fn remove_returns_stored_header_and_drops_entry() {
         let mut buf = VerifiedHeaderBuffer::new();
-        let key = (ShardGroupId(1), BlockHeight::new(10));
-        buf.insert(key, make_header(ShardGroupId(1), BlockHeight::new(10)));
+        let key = (ShardGroupId::new(1), BlockHeight::new(10));
+        buf.insert(key, make_header(ShardGroupId::new(1), BlockHeight::new(10)));
         assert!(buf.remove(key).is_some());
         assert_eq!(buf.len(), 0);
         assert!(buf.remove(key).is_none());

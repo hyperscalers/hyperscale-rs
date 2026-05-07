@@ -169,7 +169,7 @@ impl SimulationRunner {
         // Build global validator set
         let global_validators: Vec<ValidatorInfo> = (0..total_validators)
             .map(|i| ValidatorInfo {
-                validator_id: ValidatorId(u64::from(i)),
+                validator_id: ValidatorId::new(u64::from(i)),
                 public_key: public_keys[i as usize],
                 voting_power: VotePower::new(1),
             })
@@ -179,11 +179,11 @@ impl SimulationRunner {
         // Build per-shard committee mappings
         let mut shard_committees: HashMap<ShardGroupId, Vec<ValidatorId>> = HashMap::new();
         for shard_id in 0..network_config.num_shards {
-            let shard = ShardGroupId(u64::from(shard_id));
+            let shard = ShardGroupId::new(u64::from(shard_id));
             let shard_start = shard_id * network_config.validators_per_shard;
             let shard_end = shard_start + network_config.validators_per_shard;
             let committee: Vec<ValidatorId> = (shard_start..shard_end)
-                .map(|i| ValidatorId(u64::from(i)))
+                .map(|i| ValidatorId::new(u64::from(i)))
                 .collect();
             shard_committees.insert(shard, committee);
         }
@@ -194,7 +194,7 @@ impl SimulationRunner {
         let mut event_rxs = Vec::with_capacity(num_nodes);
 
         for shard_id in 0..network_config.num_shards {
-            let shard = ShardGroupId(u64::from(shard_id));
+            let shard = ShardGroupId::new(u64::from(shard_id));
             let shard_start = shard_id * network_config.validators_per_shard;
 
             // Shared execution cache for all validators in this shard.
@@ -204,7 +204,7 @@ impl SimulationRunner {
 
             for v in 0..network_config.validators_per_shard {
                 let node_index = shard_start + v;
-                let validator_id = ValidatorId(u64::from(node_index));
+                let validator_id = ValidatorId::new(u64::from(node_index));
 
                 let topology_state = TopologyCoordinator::with_shard_committees(
                     validator_id,
@@ -445,10 +445,10 @@ impl SimulationRunner {
         let empty_config = GenesisConfig::test_default();
 
         for shard_idx in 0..self.network.config().num_shards {
-            let shard_id = ShardGroupId(u64::from(shard_idx));
+            let shard_id = ShardGroupId::new(u64::from(shard_idx));
             let config = configs_by_shard.get(&shard_id).unwrap_or(&empty_config);
             self.install_engine_genesis(config, |node_idx| {
-                ShardGroupId(node_idx as u64 / u64::from(validators_per_shard)) == shard_id
+                ShardGroupId::new(node_idx as u64 / u64::from(validators_per_shard)) == shard_id
             });
         }
 
@@ -498,9 +498,9 @@ impl SimulationRunner {
                 "JMT state after genesis bootstrap"
             );
 
-            let proposer = ValidatorId(u64::from(shard_id * validators_per_shard));
+            let proposer = ValidatorId::new(u64::from(shard_id * validators_per_shard));
             let genesis_block = Block::genesis(
-                ShardGroupId(u64::from(shard_id)),
+                ShardGroupId::new(u64::from(shard_id)),
                 proposer,
                 genesis_jmt_root,
             );

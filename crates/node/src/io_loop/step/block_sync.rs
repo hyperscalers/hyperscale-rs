@@ -359,11 +359,11 @@ mod tests {
 
     fn header() -> BlockHeader {
         BlockHeader {
-            shard_group_id: ShardGroupId(0),
+            shard_group_id: ShardGroupId::new(0),
             height: HEIGHT,
             parent_block_hash: BlockHash::ZERO,
-            parent_qc: QuorumCertificate::genesis(ShardGroupId(0)),
-            proposer: ValidatorId(0),
+            parent_qc: QuorumCertificate::genesis(ShardGroupId::new(0)),
+            proposer: ValidatorId::new(0),
             timestamp: ProposerTimestamp::from_millis(1_000),
             round: Round::INITIAL,
             is_fallback: false,
@@ -381,7 +381,7 @@ mod tests {
     fn qc_for(block: &Block) -> QuorumCertificate {
         QuorumCertificate {
             block_hash: block.hash(),
-            shard_group_id: ShardGroupId(0),
+            shard_group_id: ShardGroupId::new(0),
             height: block.height(),
             parent_block_hash: BlockHash::ZERO,
             round: Round::INITIAL,
@@ -397,7 +397,11 @@ mod tests {
     /// header.
     fn make_wave(success: bool) -> (Arc<FinalizedWave>, LocalReceiptRoot, CertificateRoot) {
         let tx_hash = TxHash::from_raw(Hash::from_bytes(b"tx"));
-        let wave_id = WaveId::new(ShardGroupId(0), HEIGHT, std::collections::BTreeSet::new());
+        let wave_id = WaveId::new(
+            ShardGroupId::new(0),
+            HEIGHT,
+            std::collections::BTreeSet::new(),
+        );
         let outcome = TxOutcome {
             tx_hash,
             outcome: if success {
@@ -564,7 +568,11 @@ mod tests {
         // certificate_root and local_receipt_root are computed off the
         // (corrupted) body and would tautologically match.
         let tx_hash = TxHash::from_raw(Hash::from_bytes(b"tx_divergent"));
-        let wave_id = WaveId::new(ShardGroupId(0), HEIGHT, std::collections::BTreeSet::new());
+        let wave_id = WaveId::new(
+            ShardGroupId::new(0),
+            HEIGHT,
+            std::collections::BTreeSet::new(),
+        );
         let ec = ExecutionCertificate::new(
             wave_id.clone(),
             WeightedTimestamp::from_millis(1),

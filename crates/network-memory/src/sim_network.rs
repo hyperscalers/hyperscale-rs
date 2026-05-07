@@ -269,7 +269,7 @@ mod tests {
     fn test_broadcast_to_shard_creates_outbox_entry() {
         let adapter = SimNetworkAdapter::default();
         let gossip = test_gossip();
-        let shard = ShardGroupId(3);
+        let shard = ShardGroupId::new(3);
 
         adapter.broadcast_to_shard(shard, &gossip);
 
@@ -347,9 +347,9 @@ mod tests {
         use hyperscale_messages::request::GetBlockRequest;
 
         let adapter = SimNetworkAdapter::default();
-        let preferred = Some(ValidatorId(7));
+        let preferred = Some(ValidatorId::new(7));
 
-        let peers = &[ValidatorId(7)];
+        let peers = &[ValidatorId::new(7)];
         adapter.request(
             peers,
             preferred,
@@ -381,7 +381,7 @@ mod tests {
         let result_clone = result.clone();
 
         adapter.request(
-            &[ValidatorId(1)],
+            &[ValidatorId::new(1)],
             None,
             GetBlockRequest::new(BlockHeight::new(1), BlockHeight::new(1)),
             None,
@@ -415,7 +415,7 @@ mod tests {
         let result_clone = result.clone();
 
         adapter.request(
-            &[ValidatorId(1)],
+            &[ValidatorId::new(1)],
             None,
             GetBlockRequest::new(BlockHeight::new(1), BlockHeight::new(1)),
             None,

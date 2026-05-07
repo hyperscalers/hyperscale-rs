@@ -119,7 +119,7 @@ fn commit_with(
         };
         let new_fw = Arc::new(FinalizedWave {
             certificate: Arc::new(WaveCertificate {
-                wave_id: WaveId::new(ShardGroupId(0), block.height(), BTreeSet::new()),
+                wave_id: WaveId::new(ShardGroupId::new(0), block.height(), BTreeSet::new()),
                 execution_certificates: vec![],
             }),
             receipts: vec![receipt],

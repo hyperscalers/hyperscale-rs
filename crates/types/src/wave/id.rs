@@ -141,21 +141,21 @@ impl Display for WaveId {
             write!(
                 f,
                 "Wave(shard={}, h={}, ∅)",
-                self.shard_group_id.0,
+                self.shard_group_id.inner(),
                 self.block_height.inner()
             )
         } else {
             write!(
                 f,
                 "Wave(shard={}, h={}, {{",
-                self.shard_group_id.0,
+                self.shard_group_id.inner(),
                 self.block_height.inner()
             )?;
             for (i, shard) in self.remote_shards.iter().enumerate() {
                 if i > 0 {
                     write!(f, ",")?;
                 }
-                write!(f, "{}", shard.0)?;
+                write!(f, "{}", shard.inner())?;
             }
             write!(f, "}})")
         }
@@ -173,9 +173,11 @@ mod tests {
 
     fn sample_wave_id() -> WaveId {
         WaveId {
-            shard_group_id: ShardGroupId(3),
+            shard_group_id: ShardGroupId::new(3),
             block_height: BlockHeight::new(42),
-            remote_shards: [ShardGroupId(1), ShardGroupId(7)].into_iter().collect(),
+            remote_shards: [ShardGroupId::new(1), ShardGroupId::new(7)]
+                .into_iter()
+                .collect(),
         }
     }
 
@@ -190,7 +192,7 @@ mod tests {
     #[test]
     fn sbor_roundtrip_empty_remote_shards() {
         let wave = WaveId {
-            shard_group_id: ShardGroupId(0),
+            shard_group_id: ShardGroupId::new(0),
             block_height: BlockHeight::new(1),
             remote_shards: BTreeSet::new(),
         };
@@ -209,7 +211,7 @@ mod tests {
             .unwrap();
         enc.write_value_kind(ValueKind::Tuple).unwrap();
         enc.write_size(3).unwrap();
-        enc.encode(&ShardGroupId(0)).unwrap();
+        enc.encode(&ShardGroupId::new(0)).unwrap();
         enc.encode(&BlockHeight::new(0)).unwrap();
         enc.write_value_kind(ValueKind::Array).unwrap();
         enc.write_value_kind(ShardGroupId::value_kind()).unwrap();
@@ -234,13 +236,13 @@ mod tests {
             .unwrap();
         enc.write_value_kind(ValueKind::Tuple).unwrap();
         enc.write_size(3).unwrap();
-        enc.encode(&ShardGroupId(0)).unwrap();
+        enc.encode(&ShardGroupId::new(0)).unwrap();
         enc.encode(&BlockHeight::new(0)).unwrap();
         enc.write_value_kind(ValueKind::Array).unwrap();
         enc.write_value_kind(ShardGroupId::value_kind()).unwrap();
         enc.write_size(2).unwrap();
-        enc.encode_deeper_body(&ShardGroupId(5)).unwrap();
-        enc.encode_deeper_body(&ShardGroupId(5)).unwrap();
+        enc.encode_deeper_body(&ShardGroupId::new(5)).unwrap();
+        enc.encode_deeper_body(&ShardGroupId::new(5)).unwrap();
         let err = basic_decode::<WaveId>(&buf).unwrap_err();
         assert!(matches!(err, DecodeError::DuplicateKey));
     }

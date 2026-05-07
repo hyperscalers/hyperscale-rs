@@ -391,7 +391,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Generate a transaction specifically for shard 0
             let target_shard: usize = 0;
             let tx = workload
-                .generate_for_shard(&accounts, ShardGroupId(target_shard as u64), &mut rng)
+                .generate_for_shard(&accounts, ShardGroupId::new(target_shard as u64), &mut rng)
                 .expect("Failed to generate transaction for shard 0");
 
             // Calculate client index: endpoints are organized as shard0_v0, shard0_v1, ..., shard1_v0, ...

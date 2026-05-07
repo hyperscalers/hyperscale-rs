@@ -316,7 +316,7 @@ fn check_backpressure(state: &RpcState) -> Option<(StatusCode, Json<SubmitTransa
                 hash: String::new(),
                 error: Some(format!(
                     "Remote shard {} is congested ({} in-flight). Try again later.",
-                    congested_shard.0,
+                    congested_shard.inner(),
                     count.inner(),
                 )),
             }),

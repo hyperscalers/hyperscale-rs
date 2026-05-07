@@ -20,6 +20,7 @@ use hyperscale_core::{FetchOrigin, FetchPeers};
 use hyperscale_metrics::{
     record_fetch_abandoned, record_fetch_completed, record_fetch_retried, record_fetch_started,
 };
+use hyperscale_types::ValidatorId;
 use tracing::{debug, trace};
 
 pub mod binding;
@@ -282,8 +283,8 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
         let mut group_order: Vec<GroupKey> = groups.keys().cloned().collect();
         group_order.sort_unstable_by(|a, b| {
             a.0.preferred
-                .map(|v| v.0)
-                .cmp(&b.0.preferred.map(|v| v.0))
+                .map(ValidatorId::inner)
+                .cmp(&b.0.preferred.map(ValidatorId::inner))
                 .then_with(|| a.0.peers.cmp(&b.0.peers))
                 .then_with(|| a.1.cmp(&b.1))
         });
@@ -324,7 +325,7 @@ mod tests {
     }
 
     fn vid(n: u64) -> ValidatorId {
-        ValidatorId(n)
+        ValidatorId::new(n)
     }
 
     fn config() -> FetchConfig {

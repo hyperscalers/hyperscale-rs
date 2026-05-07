@@ -95,7 +95,7 @@ fn fresh_get_finalized_certificate_returns_none_for_any_tx() {
 fn fresh_get_finalized_wave_returns_none_for_any_id() {
     let coord = fresh_coordinator();
     let wid = WaveId::new(
-        ShardGroupId(0),
+        ShardGroupId::new(0),
         BlockHeight::new(1),
         std::collections::BTreeSet::new(),
     );
@@ -148,7 +148,7 @@ fn on_verified_remote_header_registers_expectation_for_wave_targeting_local_shar
     // A remote shard's wave that targets our local shard must register an
     // expectation. With committed_ts still ZERO the initial-deadline
     // gate is silenced, but the expectation count must reflect the header.
-    let remote_shard = ShardGroupId(99);
+    let remote_shard = ShardGroupId::new(99);
     let wave = WaveId::new(
         remote_shard,
         BlockHeight::new(5),
@@ -166,14 +166,19 @@ fn on_verified_remote_header_registers_expectation_for_wave_targeting_local_shar
 #[test]
 fn on_verified_remote_header_ignores_waves_not_targeting_local_shard() {
     let (mut coord, topology) = fresh_coordinator_with_topology();
-    // Wave targets ShardGroupId(7) only; local is ShardGroupId(0). No
+    // Wave targets ShardGroupId::new(7) only; local is ShardGroupId::new(0). No
     // expectation should land.
     let wave = WaveId::new(
-        ShardGroupId(99),
+        ShardGroupId::new(99),
         BlockHeight::new(5),
-        std::iter::once(ShardGroupId(7)).collect(),
+        std::iter::once(ShardGroupId::new(7)).collect(),
     );
-    coord.on_verified_remote_header(&topology, ShardGroupId(99), BlockHeight::new(5), &[wave]);
+    coord.on_verified_remote_header(
+        &topology,
+        ShardGroupId::new(99),
+        BlockHeight::new(5),
+        &[wave],
+    );
 
     assert_eq!(
         coord.memory_stats().expected_exec_certs,

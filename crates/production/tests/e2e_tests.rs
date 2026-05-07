@@ -58,8 +58,8 @@ async fn test_network_adapter_starts() {
     let _ = fmt().with_test_writer().try_init();
 
     let keypair = Keypair::generate_ed25519();
-    let validator_id = ValidatorId(0);
-    let shard = ShardGroupId(0);
+    let validator_id = ValidatorId::new(0);
+    let shard = ShardGroupId::new(0);
 
     // Use port 0 for OS-assigned port
     let config = Libp2pConfig {
@@ -98,7 +98,7 @@ async fn test_two_node_connection() {
 
     // Node 1
     let keypair1 = Keypair::generate_ed25519();
-    let (bind_sig1, topo1) = test_bind_args(ValidatorId(0));
+    let (bind_sig1, topo1) = test_bind_args(ValidatorId::new(0));
     let config1 = Libp2pConfig {
         listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()],
         bootstrap_peers: vec![],
@@ -107,8 +107,8 @@ async fn test_two_node_connection() {
     let adapter1 = Libp2pAdapter::new(
         config1,
         keypair1,
-        ValidatorId(0),
-        ShardGroupId(0),
+        ValidatorId::new(0),
+        ShardGroupId::new(0),
         Arc::new(HandlerRegistry::new()),
         bind_sig1,
         topo1,
@@ -124,7 +124,7 @@ async fn test_two_node_connection() {
 
     // Node 2 - bootstrap to node 1
     let keypair2 = Keypair::generate_ed25519();
-    let (bind_sig2, topo2) = test_bind_args(ValidatorId(1));
+    let (bind_sig2, topo2) = test_bind_args(ValidatorId::new(1));
     let config2 = Libp2pConfig {
         listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()],
         bootstrap_peers: vec![node1_addr.clone()],
@@ -133,8 +133,8 @@ async fn test_two_node_connection() {
     let adapter2 = Libp2pAdapter::new(
         config2,
         keypair2,
-        ValidatorId(1),
-        ShardGroupId(0),
+        ValidatorId::new(1),
+        ShardGroupId::new(0),
         Arc::new(HandlerRegistry::new()),
         bind_sig2,
         topo2,
@@ -175,7 +175,7 @@ async fn test_topic_subscription() {
     let _ = fmt().with_test_writer().try_init();
 
     let keypair = Keypair::generate_ed25519();
-    let (bind_sig, topo) = test_bind_args(ValidatorId(0));
+    let (bind_sig, topo) = test_bind_args(ValidatorId::new(0));
     let config = Libp2pConfig {
         listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()],
         bootstrap_peers: vec![],
@@ -184,8 +184,8 @@ async fn test_topic_subscription() {
     let adapter = Libp2pAdapter::new(
         config,
         keypair,
-        ValidatorId(0),
-        ShardGroupId(0),
+        ValidatorId::new(0),
+        ShardGroupId::new(0),
         Arc::new(HandlerRegistry::new()),
         bind_sig,
         topo,
@@ -222,8 +222,8 @@ async fn test_validator_bind_success() {
     let adapter0 = Libp2pAdapter::new(
         config0,
         keypair0,
-        ValidatorId(0),
-        ShardGroupId(0),
+        ValidatorId::new(0),
+        ShardGroupId::new(0),
         Arc::new(HandlerRegistry::new()),
         bind_sig0,
         fixtures.validator_key_map(0),
@@ -246,8 +246,8 @@ async fn test_validator_bind_success() {
     let adapter1 = Libp2pAdapter::new(
         config1,
         keypair1,
-        ValidatorId(1),
-        ShardGroupId(0),
+        ValidatorId::new(1),
+        ShardGroupId::new(0),
         Arc::new(HandlerRegistry::new()),
         bind_sig1,
         fixtures.validator_key_map(1),
@@ -258,8 +258,8 @@ async fn test_validator_bind_success() {
     let bound = timeout(CONNECTION_TIMEOUT, async {
         loop {
             if let (Some(p1), Some(p0)) = (
-                adapter0.peer_for_validator(ValidatorId(1)),
-                adapter1.peer_for_validator(ValidatorId(0)),
+                adapter0.peer_for_validator(ValidatorId::new(1)),
+                adapter1.peer_for_validator(ValidatorId::new(0)),
             ) {
                 return (p1, p0);
             }
@@ -299,8 +299,8 @@ async fn test_validator_bind_rejects_wrong_key() {
     let adapter0 = Libp2pAdapter::new(
         config0,
         keypair0,
-        ValidatorId(0),
-        ShardGroupId(0),
+        ValidatorId::new(0),
+        ShardGroupId::new(0),
         Arc::new(HandlerRegistry::new()),
         bind_sig0,
         fixtures.validator_key_map(0),
@@ -325,8 +325,8 @@ async fn test_validator_bind_rejects_wrong_key() {
     let adapter1 = Libp2pAdapter::new(
         config1,
         keypair1,
-        ValidatorId(1),
-        ShardGroupId(0),
+        ValidatorId::new(1),
+        ShardGroupId::new(0),
         Arc::new(HandlerRegistry::new()),
         wrong_signing_key,
         fixtures.validator_key_map(1),
@@ -350,7 +350,7 @@ async fn test_validator_bind_rejects_wrong_key() {
 
     // Node 0 must NOT trust the impersonator.
     assert!(
-        adapter0.peer_for_validator(ValidatorId(1)).is_none(),
+        adapter0.peer_for_validator(ValidatorId::new(1)).is_none(),
         "Node 0 should NOT resolve validator 1 (wrong BLS key)"
     );
 
@@ -378,8 +378,8 @@ async fn test_validator_bind_evicted_on_disconnect() {
     let adapter0 = Libp2pAdapter::new(
         config0,
         keypair0,
-        ValidatorId(0),
-        ShardGroupId(0),
+        ValidatorId::new(0),
+        ShardGroupId::new(0),
         Arc::new(HandlerRegistry::new()),
         bind_sig0,
         fixtures.validator_key_map(0),
@@ -402,8 +402,8 @@ async fn test_validator_bind_evicted_on_disconnect() {
     let adapter1 = Libp2pAdapter::new(
         config1,
         keypair1,
-        ValidatorId(1),
-        ShardGroupId(0),
+        ValidatorId::new(1),
+        ShardGroupId::new(0),
         Arc::new(HandlerRegistry::new()),
         bind_sig1,
         fixtures.validator_key_map(1),
@@ -413,7 +413,7 @@ async fn test_validator_bind_evicted_on_disconnect() {
     // Wait for bind to complete.
     let bound = timeout(CONNECTION_TIMEOUT, async {
         loop {
-            if adapter0.peer_for_validator(ValidatorId(1)).is_some() {
+            if adapter0.peer_for_validator(ValidatorId::new(1)).is_some() {
                 return;
             }
             sleep(Duration::from_millis(50)).await;
@@ -431,7 +431,7 @@ async fn test_validator_bind_evicted_on_disconnect() {
     // Node 0 should evict the mapping once the disconnect is detected.
     let evicted = timeout(CONNECTION_TIMEOUT, async {
         loop {
-            if adapter0.peer_for_validator(ValidatorId(1)).is_none() {
+            if adapter0.peer_for_validator(ValidatorId::new(1)).is_none() {
                 return;
             }
             sleep(Duration::from_millis(50)).await;

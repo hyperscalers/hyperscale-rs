@@ -358,11 +358,11 @@ mod tests {
 
         Block::Live {
             header: BlockHeader {
-                shard_group_id: ShardGroupId(0),
+                shard_group_id: ShardGroupId::new(0),
                 height: BlockHeight::new(1),
                 parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
-                parent_qc: QuorumCertificate::genesis(ShardGroupId(0)),
-                proposer: ValidatorId(0),
+                parent_qc: QuorumCertificate::genesis(ShardGroupId::new(0)),
+                proposer: ValidatorId::new(0),
                 timestamp: ProposerTimestamp::from_millis(1_234_567_890),
                 round: Round::INITIAL,
                 is_fallback: false,
@@ -384,7 +384,7 @@ mod tests {
     fn create_test_qc(block: &Block) -> QuorumCertificate {
         QuorumCertificate {
             block_hash: block.hash(),
-            shard_group_id: ShardGroupId(0),
+            shard_group_id: ShardGroupId::new(0),
             height: block.height(),
             parent_block_hash: block.header().parent_block_hash,
             round: block.header().round,

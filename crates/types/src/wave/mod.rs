@@ -56,12 +56,12 @@ mod tests {
     fn two_shard_topology() -> TopologySnapshot {
         let validators: Vec<_> = (0..4)
             .map(|i| ValidatorInfo {
-                validator_id: ValidatorId(i),
+                validator_id: ValidatorId::new(i),
                 public_key: generate_bls_keypair().public_key(),
                 voting_power: VotePower::new(1),
             })
             .collect();
-        TopologySnapshot::new(ValidatorId(0), 2, ValidatorSet::new(validators))
+        TopologySnapshot::new(ValidatorId::new(0), 2, ValidatorSet::new(validators))
     }
 
     /// Find a node seed that routes to `target_shard` under modulo-2 sharding.
@@ -86,9 +86,9 @@ mod tests {
 
     fn make_wave_id(shard: u64, height: BlockHeight, remote: &[u64]) -> WaveId {
         WaveId {
-            shard_group_id: ShardGroupId(shard),
+            shard_group_id: ShardGroupId::new(shard),
             block_height: height,
-            remote_shards: remote.iter().map(|&s| ShardGroupId(s)).collect(),
+            remote_shards: remote.iter().map(|&s| ShardGroupId::new(s)).collect(),
         }
     }
 
@@ -151,7 +151,7 @@ mod tests {
     fn test_compute_provision_tx_roots_covers_all_touched_targets() {
         let topology = two_shard_topology();
         let local_node = node_on_shard(&topology, topology.local_shard());
-        let remote_node = node_on_shard(&topology, ShardGroupId(1));
+        let remote_node = node_on_shard(&topology, ShardGroupId::new(1));
 
         // Cross-shard tx: writes span local shard 0 and remote shard 1.
         let tx_a = Arc::new(test_transaction_with_nodes(
@@ -169,13 +169,13 @@ mod tests {
 
         // Local shard excluded; only shard 1 receives provisions.
         assert_eq!(roots.len(), 1);
-        assert!(roots.contains_key(&ShardGroupId(1)));
+        assert!(roots.contains_key(&ShardGroupId::new(1)));
 
         let expected = ProvisionTxRoot::from_raw(compute_merkle_root(&[
             tx_a.hash().into_raw(),
             tx_b.hash().into_raw(),
         ]));
-        assert_eq!(roots[&ShardGroupId(1)], expected);
+        assert_eq!(roots[&ShardGroupId::new(1)], expected);
     }
 
     #[test]
@@ -597,10 +597,10 @@ mod tests {
     #[test]
     fn test_wave_leader_is_attempt_zero() {
         let committee = vec![
-            ValidatorId(1),
-            ValidatorId(2),
-            ValidatorId(3),
-            ValidatorId(4),
+            ValidatorId::new(1),
+            ValidatorId::new(2),
+            ValidatorId::new(3),
+            ValidatorId::new(4),
         ];
         let wave_id = make_wave_id(0, BlockHeight::new(100), &[1]);
         assert_eq!(
@@ -612,10 +612,10 @@ mod tests {
     #[test]
     fn test_wave_leader_at_rotates() {
         let committee = vec![
-            ValidatorId(1),
-            ValidatorId(2),
-            ValidatorId(3),
-            ValidatorId(4),
+            ValidatorId::new(1),
+            ValidatorId::new(2),
+            ValidatorId::new(3),
+            ValidatorId::new(4),
         ];
         let wave_id = make_wave_id(0, BlockHeight::new(100), &[1]);
         let mut leaders: HashSet<ValidatorId> = HashSet::new();
@@ -632,7 +632,11 @@ mod tests {
 
     #[test]
     fn test_wave_leader_at_wraps() {
-        let committee = vec![ValidatorId(1), ValidatorId(2), ValidatorId(3)];
+        let committee = vec![
+            ValidatorId::new(1),
+            ValidatorId::new(2),
+            ValidatorId::new(3),
+        ];
         let wave_id = make_wave_id(0, BlockHeight::new(100), &[1]);
         // Large attempt values should not panic — they wrap via modulo.
         let _ = wave_leader_at(&wave_id, Attempt::new(1000), &committee);
@@ -641,10 +645,10 @@ mod tests {
     #[test]
     fn test_wave_leader_deterministic() {
         let committee = vec![
-            ValidatorId(1),
-            ValidatorId(2),
-            ValidatorId(3),
-            ValidatorId(4),
+            ValidatorId::new(1),
+            ValidatorId::new(2),
+            ValidatorId::new(3),
+            ValidatorId::new(4),
         ];
         let wave_id = make_wave_id(0, BlockHeight::new(100), &[1]);
         let leader1 = wave_leader_at(&wave_id, Attempt::new(2), &committee);

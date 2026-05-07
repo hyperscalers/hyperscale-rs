@@ -52,8 +52,8 @@ mod tests {
     fn test_sbor_roundtrip() {
         let request = GetFinalizedWavesRequest {
             wave_ids: vec![
-                WaveId::new(ShardGroupId(0), BlockHeight::new(1), BTreeSet::new()),
-                WaveId::new(ShardGroupId(0), BlockHeight::new(2), BTreeSet::new()),
+                WaveId::new(ShardGroupId::new(0), BlockHeight::new(1), BTreeSet::new()),
+                WaveId::new(ShardGroupId::new(0), BlockHeight::new(2), BTreeSet::new()),
             ],
         };
         let encoded = basic_encode(&request).unwrap();

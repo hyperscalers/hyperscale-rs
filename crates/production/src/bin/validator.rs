@@ -641,8 +641,8 @@ fn build_topology(
 ) -> Result<TopologyCoordinator> {
     use std::collections::HashMap;
 
-    let local_validator_id = ValidatorId(config.node.validator_id);
-    let local_shard = ShardGroupId(config.node.shard);
+    let local_validator_id = ValidatorId::new(config.node.validator_id);
+    let local_shard = ShardGroupId::new(config.node.shard);
     let num_shards = config.node.num_shards;
 
     // Build validator set from genesis config
@@ -683,7 +683,7 @@ fn build_topology(
                 };
 
                 Ok(ValidatorInfo {
-                    validator_id: ValidatorId(v.id),
+                    validator_id: ValidatorId::new(v.id),
                     public_key,
                     voting_power: VotePower::new(v.voting_power),
                 })
@@ -704,11 +704,11 @@ fn build_topology(
 
         for v in &config.genesis.validators {
             // Use explicit shard if provided, otherwise fall back to validator_id % num_shards
-            let shard = ShardGroupId(v.shard.unwrap_or(v.id % num_shards));
+            let shard = ShardGroupId::new(v.shard.unwrap_or(v.id % num_shards));
             shard_committees
                 .entry(shard)
                 .or_default()
-                .push(ValidatorId(v.id));
+                .push(ValidatorId::new(v.id));
         }
 
         info!(

@@ -138,9 +138,9 @@ mod tests {
         let TestNode { mut node, .. } = TestNode::builder().num_shards(2).build();
 
         let mut remote_shards = BTreeSet::new();
-        remote_shards.insert(ShardGroupId(0));
+        remote_shards.insert(ShardGroupId::new(0));
         let ec = make_ec(
-            ShardGroupId(1),
+            ShardGroupId::new(1),
             remote_shards,
             BlockHeight::new(1),
             vec![TxOutcome {
@@ -160,7 +160,7 @@ mod tests {
             tx_outcomes,
         }) = cont
         {
-            assert_eq!(*target_shard, ShardGroupId(1));
+            assert_eq!(*target_shard, ShardGroupId::new(1));
             assert_eq!(tx_outcomes.len(), 1);
         } else {
             unreachable!()
@@ -175,7 +175,7 @@ mod tests {
         let TestNode { mut node, .. } = TestNode::new();
 
         let ec = make_ec(
-            ShardGroupId(0),
+            ShardGroupId::new(0),
             BTreeSet::new(),
             BlockHeight::new(1),
             vec![],
@@ -198,8 +198,13 @@ mod tests {
 
         // EC at shard 1, dependencies = {2}; local (0) is not in the set.
         let mut remote_shards = BTreeSet::new();
-        remote_shards.insert(ShardGroupId(2));
-        let ec = make_ec(ShardGroupId(1), remote_shards, BlockHeight::new(1), vec![]);
+        remote_shards.insert(ShardGroupId::new(2));
+        let ec = make_ec(
+            ShardGroupId::new(1),
+            remote_shards,
+            BlockHeight::new(1),
+            vec![],
+        );
 
         let actions = node.handle(ProtocolEvent::ExecutionCertificateAdmitted { certificate: ec });
 

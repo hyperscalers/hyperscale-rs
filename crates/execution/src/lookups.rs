@@ -92,10 +92,10 @@ mod tests {
 
         let peers = peers_excluding_self(&topology, topology.local_shard());
         assert_eq!(peers.len(), 3);
-        assert!(!peers.contains(&ValidatorId(0)));
-        assert!(peers.contains(&ValidatorId(1)));
-        assert!(peers.contains(&ValidatorId(2)));
-        assert!(peers.contains(&ValidatorId(3)));
+        assert!(!peers.contains(&ValidatorId::new(0)));
+        assert!(peers.contains(&ValidatorId::new(1)));
+        assert!(peers.contains(&ValidatorId::new(2)));
+        assert!(peers.contains(&ValidatorId::new(3)));
     }
 
     #[test]
@@ -105,7 +105,7 @@ mod tests {
 
         // Shard 99 has no committee — filter returns an empty vec regardless
         // of who the local validator is.
-        let peers = peers_excluding_self(&topology, ShardGroupId(99));
+        let peers = peers_excluding_self(&topology, ShardGroupId::new(99));
         assert!(peers.is_empty());
     }
 
@@ -141,7 +141,7 @@ mod tests {
 
         // An unknown shard has an empty committee, so the result is
         // `Some(vec![])` — not `None` (which is reserved for corruption).
-        let keys = committee_public_keys_for_shard(&topology, ShardGroupId(99))
+        let keys = committee_public_keys_for_shard(&topology, ShardGroupId::new(99))
             .expect("empty committee is not corruption");
         assert!(keys.is_empty());
     }

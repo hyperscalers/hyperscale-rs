@@ -151,8 +151,8 @@ pub(super) fn handle_gossipsub_event(
             {
                 warn!(
                     topic = %topic_str,
-                    topic_shard = topic_shard.0,
-                    local_shard = local_shard.0,
+                    topic_shard = topic_shard.inner(),
+                    local_shard = local_shard.inner(),
                     msg_type = msg_type,
                     "Dropping shard-local message from wrong shard (cross-shard contamination attempt)"
                 );

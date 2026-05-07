@@ -205,7 +205,7 @@ impl Spammer {
 
             // Generate and submit batches per shard
             for shard_idx in 0..num_shards {
-                let target_shard = ShardGroupId(shard_idx as u64);
+                let target_shard = ShardGroupId::new(shard_idx as u64);
 
                 // Generate transactions
                 let batch = workload.generate_batch_for_shard(
@@ -544,7 +544,7 @@ impl Worker {
 
             // Generate and submit batches per shard
             for shard_idx in 0..num_shards {
-                let target_shard = ShardGroupId(shard_idx as u64);
+                let target_shard = ShardGroupId::new(shard_idx as u64);
 
                 // Generate transactions from this worker's partition
                 let batch = workload.generate_batch_for_shard(
@@ -685,9 +685,9 @@ impl PartitionWorkload {
             return None;
         }
 
-        let mut other_shard = ShardGroupId(rng.random_range(0..partition.num_shards()));
+        let mut other_shard = ShardGroupId::new(rng.random_range(0..partition.num_shards()));
         while other_shard == target_shard {
-            other_shard = ShardGroupId(rng.random_range(0..partition.num_shards()));
+            other_shard = ShardGroupId::new(rng.random_range(0..partition.num_shards()));
         }
 
         let target_is_sender = rng.random_bool(0.5);

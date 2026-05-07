@@ -106,8 +106,8 @@ impl Libp2pAdapter {
 
         info!(
             local_peer_id = %local_peer_id,
-            validator_id = validator_id.0,
-            shard = shard.0,
+            validator_id = validator_id.inner(),
+            shard = shard.inner(),
             "Creating libp2p network adapter"
         );
 

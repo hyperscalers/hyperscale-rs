@@ -499,10 +499,10 @@ mod tests {
         source: CommitSource,
     ) -> (PendingCommit, MockPrepared) {
         let block = make_live_block(
-            ShardGroupId(0),
+            ShardGroupId::new(0),
             height,
             /* timestamp_ms */ 1_000 + height.inner(),
-            ValidatorId(0),
+            ValidatorId::new(0),
             vec![],
             vec![],
         );

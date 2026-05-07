@@ -122,7 +122,7 @@ impl OutboundProvisionTracker {
 
         debug!(
             provision_hash = ?provision_hash,
-            target_shard = target_shard.0,
+            target_shard = target_shard.inner(),
             source_block_height = provisions.block_height.inner(),
             tx_count = provisions.transactions.len(),
             "Tracking outbound provisions"
@@ -192,7 +192,7 @@ impl OutboundProvisionTracker {
                 .expect("entry exists by construction");
             warn!(
                 provision_hash = ?provision_hash,
-                target_shard = entry.target_shard.0,
+                target_shard = entry.target_shard.inner(),
                 source_block_height = entry.source_block_height.inner(),
                 pending_txs = entry.pending_txs.len(),
                 past_deadline_secs = now.elapsed_since(entry.deadline).as_secs(),
@@ -217,7 +217,7 @@ impl OutboundProvisionTracker {
         self.store.evict(std::iter::once(*provision_hash));
         debug!(
             provision_hash = ?provision_hash,
-            target_shard = entry.target_shard.0,
+            target_shard = entry.target_shard.inner(),
             reason,
             "Evicted outbound provisions"
         );
@@ -253,8 +253,8 @@ mod tests {
             })
             .collect();
         Arc::new(Provisions::new(
-            ShardGroupId(0),
-            ShardGroupId(1),
+            ShardGroupId::new(0),
+            ShardGroupId::new(1),
             source_block,
             MerkleInclusionProof::dummy(),
             transactions,
@@ -286,12 +286,12 @@ mod tests {
         let b = tx(b"b");
         let provisions = make_provisions(BlockHeight::new(10), &[a, b]);
         let provision_hash = provisions.hash();
-        tracker.on_broadcast(&provisions, ShardGroupId(1));
+        tracker.on_broadcast(&provisions, ShardGroupId::new(1));
 
         assert_eq!(tracker.memory_stats().tracked_provisions, 1);
         assert_eq!(tracker.memory_stats().tracked_tx_entries, 2);
         assert!(store.get(&provision_hash).is_some());
-        let hit = store.get_outbound(BlockHeight::new(10), ShardGroupId(1));
+        let hit = store.get_outbound(BlockHeight::new(10), ShardGroupId::new(1));
         assert!(hit.is_some());
     }
 
@@ -304,13 +304,13 @@ mod tests {
         let b = tx(b"b");
         let provisions = make_provisions(BlockHeight::new(10), &[a, b]);
         let provision_hash = provisions.hash();
-        tracker.on_broadcast(&provisions, ShardGroupId(1));
+        tracker.on_broadcast(&provisions, ShardGroupId::new(1));
 
-        tracker.on_ec_observed(ShardGroupId(1), &[executed(a)]);
+        tracker.on_ec_observed(ShardGroupId::new(1), &[executed(a)]);
         assert_eq!(tracker.memory_stats().tracked_provisions, 1);
         assert!(store.get(&provision_hash).is_some());
 
-        tracker.on_ec_observed(ShardGroupId(1), &[executed(b)]);
+        tracker.on_ec_observed(ShardGroupId::new(1), &[executed(b)]);
         assert_eq!(tracker.memory_stats().tracked_provisions, 0);
         assert!(store.get(&provision_hash).is_none());
     }
@@ -323,9 +323,9 @@ mod tests {
         let a = tx(b"a");
         let provisions = make_provisions(BlockHeight::new(7), &[a]);
         let provision_hash = provisions.hash();
-        tracker.on_broadcast(&provisions, ShardGroupId(2));
+        tracker.on_broadcast(&provisions, ShardGroupId::new(2));
 
-        tracker.on_ec_observed(ShardGroupId(2), &[aborted(a)]);
+        tracker.on_ec_observed(ShardGroupId::new(2), &[aborted(a)]);
         assert!(store.get(&provision_hash).is_none());
     }
 
@@ -336,10 +336,10 @@ mod tests {
 
         let a = tx(b"a");
         let provisions = make_provisions(BlockHeight::new(5), &[a]);
-        tracker.on_broadcast(&provisions, ShardGroupId(1));
+        tracker.on_broadcast(&provisions, ShardGroupId::new(1));
 
         // EC from a different target shard must not acknowledge these provisions.
-        tracker.on_ec_observed(ShardGroupId(2), &[executed(a)]);
+        tracker.on_ec_observed(ShardGroupId::new(2), &[executed(a)]);
         assert_eq!(tracker.memory_stats().tracked_provisions, 1);
     }
 
@@ -352,7 +352,7 @@ mod tests {
         let a = tx(b"a");
         let provisions = make_provisions(BlockHeight::new(5), &[a]);
         let provision_hash = provisions.hash();
-        tracker.on_broadcast(&provisions, ShardGroupId(1));
+        tracker.on_broadcast(&provisions, ShardGroupId::new(1));
 
         let past_max = RETENTION_HORIZON + Duration::from_secs(1);
         tracker.on_block_committed(ts(
@@ -369,8 +369,8 @@ mod tests {
 
         let a = tx(b"a");
         let provisions = make_provisions(BlockHeight::new(10), &[a]);
-        tracker.on_broadcast(&provisions, ShardGroupId(1));
-        tracker.on_broadcast(&provisions, ShardGroupId(1));
+        tracker.on_broadcast(&provisions, ShardGroupId::new(1));
+        tracker.on_broadcast(&provisions, ShardGroupId::new(1));
         assert_eq!(tracker.memory_stats().tracked_provisions, 1);
         assert_eq!(tracker.memory_stats().tracked_tx_entries, 1);
     }

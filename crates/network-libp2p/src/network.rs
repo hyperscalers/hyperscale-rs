@@ -145,7 +145,7 @@ impl Network for Libp2pNetwork {
         for &validator in recipients {
             let Some(peer_id) = self.validator_peer_id(validator) else {
                 warn!(
-                    validator = validator.0,
+                    validator = validator.inner(),
                     "No peer ID for notify target, skipping"
                 );
                 continue;
@@ -199,7 +199,7 @@ impl Network for Libp2pNetwork {
             // Verdict ignored on the Err path — the network already recorded
             // the failure (or there's nothing to penalize).
             let _ = on_response(Err(RequestError::PeerUnreachable(
-                preferred_peer.unwrap_or(ValidatorId(0)),
+                preferred_peer.unwrap_or(ValidatorId::new(0)),
             )));
             return;
         }

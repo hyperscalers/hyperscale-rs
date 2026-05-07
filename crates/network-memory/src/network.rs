@@ -467,13 +467,13 @@ impl SimulatedNetwork {
     /// Get the shard for a node index.
     #[must_use]
     pub fn shard_for_node(&self, node: NodeIndex) -> ShardGroupId {
-        ShardGroupId(u64::from(node / self.config.validators_per_shard))
+        ShardGroupId::new(u64::from(node / self.config.validators_per_shard))
     }
 
     /// Get all nodes in a shard.
     #[must_use]
     pub fn peers_in_shard(&self, shard: ShardGroupId) -> Vec<NodeIndex> {
-        let start = (shard.0 as u32) * self.config.validators_per_shard;
+        let start = (shard.inner() as u32) * self.config.validators_per_shard;
         let end = start + self.config.validators_per_shard;
         (start..end).collect()
     }
@@ -530,16 +530,16 @@ impl SimulatedNetwork {
 
             // Select target peer from the caller-provided peer list.
             let peer = if let Some(vid) = preferred_peer {
-                vid.0 as NodeIndex
+                vid.inner() as NodeIndex
             } else {
                 // Pick a random peer from the provided list.
                 let mut candidates: Vec<NodeIndex> =
-                    peers.iter().map(|v| v.0 as NodeIndex).collect();
+                    peers.iter().map(|v| v.inner() as NodeIndex).collect();
                 candidates.shuffle(rng);
                 if let Some(&p) = candidates.first() {
                     p
                 } else {
-                    let _ = on_response(Err(RequestError::PeerUnreachable(ValidatorId(
+                    let _ = on_response(Err(RequestError::PeerUnreachable(ValidatorId::new(
                         u64::from(requester),
                     ))));
                     continue;
@@ -550,9 +550,9 @@ impl SimulatedNetwork {
             if self.is_partitioned(requester, peer) {
                 stats.messages_dropped_partition += 1;
                 trace!(requester, peer, "Request dropped: partition");
-                let _ = on_response(Err(RequestError::PeerUnreachable(ValidatorId(u64::from(
-                    peer,
-                )))));
+                let _ = on_response(Err(RequestError::PeerUnreachable(ValidatorId::new(
+                    u64::from(peer),
+                ))));
                 continue;
             }
 
@@ -560,9 +560,9 @@ impl SimulatedNetwork {
             if self.should_drop_packet(rng) {
                 stats.messages_dropped_loss += 1;
                 trace!(requester, peer, "Request dropped: packet loss");
-                let _ = on_response(Err(RequestError::PeerUnreachable(ValidatorId(u64::from(
-                    peer,
-                )))));
+                let _ = on_response(Err(RequestError::PeerUnreachable(ValidatorId::new(
+                    u64::from(peer),
+                ))));
                 continue;
             }
 
@@ -570,9 +570,9 @@ impl SimulatedNetwork {
             if self.should_drop_packet(rng) {
                 stats.messages_dropped_loss += 1;
                 trace!(requester, peer, "Response dropped: packet loss");
-                let _ = on_response(Err(RequestError::PeerUnreachable(ValidatorId(u64::from(
-                    peer,
-                )))));
+                let _ = on_response(Err(RequestError::PeerUnreachable(ValidatorId::new(
+                    u64::from(peer),
+                ))));
                 continue;
             }
 
@@ -590,7 +590,7 @@ impl SimulatedNetwork {
                 Decision::Drop => {
                     stats.messages_dropped_fault += 1;
                     trace!(requester, peer, type_id, "Request dropped: fault rule");
-                    let _ = on_response(Err(RequestError::PeerUnreachable(ValidatorId(
+                    let _ = on_response(Err(RequestError::PeerUnreachable(ValidatorId::new(
                         u64::from(peer),
                     ))));
                     continue;
@@ -613,7 +613,7 @@ impl SimulatedNetwork {
                 Decision::Drop => {
                     stats.messages_dropped_fault += 1;
                     trace!(requester, peer, type_id, "Response dropped: fault rule");
-                    let _ = on_response(Err(RequestError::PeerUnreachable(ValidatorId(
+                    let _ = on_response(Err(RequestError::PeerUnreachable(ValidatorId::new(
                         u64::from(peer),
                     ))));
                     continue;
@@ -726,7 +726,7 @@ impl SimulatedNetwork {
             };
 
             for &recipient in &recipients {
-                let to = recipient.0 as NodeIndex;
+                let to = recipient.inner() as NodeIndex;
 
                 match self.should_deliver(sender, to, rng) {
                     None => {
@@ -1016,12 +1016,12 @@ mod tests {
             ..Default::default()
         });
 
-        assert_eq!(network.shard_for_node(0), ShardGroupId(0));
-        assert_eq!(network.shard_for_node(1), ShardGroupId(0));
-        assert_eq!(network.shard_for_node(2), ShardGroupId(0));
-        assert_eq!(network.shard_for_node(3), ShardGroupId(1));
-        assert_eq!(network.shard_for_node(4), ShardGroupId(1));
-        assert_eq!(network.shard_for_node(5), ShardGroupId(1));
+        assert_eq!(network.shard_for_node(0), ShardGroupId::new(0));
+        assert_eq!(network.shard_for_node(1), ShardGroupId::new(0));
+        assert_eq!(network.shard_for_node(2), ShardGroupId::new(0));
+        assert_eq!(network.shard_for_node(3), ShardGroupId::new(1));
+        assert_eq!(network.shard_for_node(4), ShardGroupId::new(1));
+        assert_eq!(network.shard_for_node(5), ShardGroupId::new(1));
     }
 
     #[test]
@@ -1288,7 +1288,7 @@ mod tests {
         register_echo(&adapter1, "test.request");
 
         let (request, result) =
-            make_request_with_capture(vec![ValidatorId(1)], Some(ValidatorId(1)));
+            make_request_with_capture(vec![ValidatorId::new(1)], Some(ValidatorId::new(1)));
 
         let stats = network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
 
@@ -1322,7 +1322,7 @@ mod tests {
         network.partition_unidirectional(0, 1);
 
         let (request, result) =
-            make_request_with_capture(vec![ValidatorId(1)], Some(ValidatorId(1)));
+            make_request_with_capture(vec![ValidatorId::new(1)], Some(ValidatorId::new(1)));
         let stats = network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
 
         assert_eq!(stats.messages_dropped_partition, 1);
@@ -1347,7 +1347,7 @@ mod tests {
         register_echo(&adapter1, "test.request");
 
         let (request, result) =
-            make_request_with_capture(vec![ValidatorId(1)], Some(ValidatorId(1)));
+            make_request_with_capture(vec![ValidatorId::new(1)], Some(ValidatorId::new(1)));
         let stats = network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
 
         assert_eq!(stats.messages_dropped_loss, 1);
@@ -1371,7 +1371,7 @@ mod tests {
         let _adapter1 = network.create_adapter(1);
 
         let (request, result) =
-            make_request_with_capture(vec![ValidatorId(1)], Some(ValidatorId(1)));
+            make_request_with_capture(vec![ValidatorId::new(1)], Some(ValidatorId::new(1)));
         network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
 
         // Error callbacks are immediate
@@ -1396,7 +1396,7 @@ mod tests {
             .register_raw_request("test.request", handler);
 
         let (request, result) =
-            make_request_with_capture(vec![ValidatorId(1)], Some(ValidatorId(1)));
+            make_request_with_capture(vec![ValidatorId::new(1)], Some(ValidatorId::new(1)));
         network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
 
         // Error callbacks are immediate
@@ -1420,7 +1420,11 @@ mod tests {
         }
 
         // No preferred peer — should pick a random peer from the provided list
-        let peers = vec![ValidatorId(1), ValidatorId(2), ValidatorId(3)];
+        let peers = vec![
+            ValidatorId::new(1),
+            ValidatorId::new(2),
+            ValidatorId::new(3),
+        ];
         let (request, result) = make_request_with_capture(peers, None);
         let stats = network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
 
@@ -1467,7 +1471,7 @@ mod tests {
         register_echo(&adapter1, "test.request");
 
         let (request, result) =
-            make_request_with_capture(vec![ValidatorId(1)], Some(ValidatorId(1)));
+            make_request_with_capture(vec![ValidatorId::new(1)], Some(ValidatorId::new(1)));
 
         network.accept_requests(0, Duration::from_millis(100), vec![request], &mut rng);
 
@@ -1563,7 +1567,7 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         // Node 0 is in shard 0, along with node 1. Nodes 2,3 are in shard 1.
-        let entry = make_gossip_entry(BroadcastTarget::Shard(ShardGroupId(0)));
+        let entry = make_gossip_entry(BroadcastTarget::Shard(ShardGroupId::new(0)));
         let stats = network.accept_gossip(0, Duration::ZERO, entry, &mut rng);
         network.flush_gossip(FAR_FUTURE);
 
@@ -1819,7 +1823,7 @@ mod tests {
 
         // accept_requests should be able to find the handler
         let (request, result) =
-            make_request_with_capture(vec![ValidatorId(1)], Some(ValidatorId(1)));
+            make_request_with_capture(vec![ValidatorId::new(1)], Some(ValidatorId::new(1)));
         let stats = network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
 
         assert_eq!(stats.messages_sent, 2);
@@ -1870,7 +1874,7 @@ mod tests {
             vec![test_node(1)],
             vec![test_node(2)],
         ))]);
-        Network::broadcast_to_shard(&adapter0, ShardGroupId(0), &gossip);
+        Network::broadcast_to_shard(&adapter0, ShardGroupId::new(0), &gossip);
 
         // Drain and deliver via accept_gossip + flush_gossip
         let entries = adapter0.drain_outbox();

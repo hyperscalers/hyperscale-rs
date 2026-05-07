@@ -277,12 +277,12 @@ mod tests {
             block_hash: BlockHash::from_raw(Hash::from_bytes(b"block")),
             block_height: BlockHeight::new(10),
             vote_anchor_ts: WeightedTimestamp::from_millis(11),
-            wave_id: WaveId::new(ShardGroupId(0), BlockHeight::new(0), BTreeSet::new()),
-            shard_group_id: ShardGroupId(0),
+            wave_id: WaveId::new(ShardGroupId::new(0), BlockHeight::new(0), BTreeSet::new()),
+            shard_group_id: ShardGroupId::new(0),
             global_receipt_root,
             tx_count: 5,
             tx_outcomes: vec![],
-            validator: ValidatorId(validator),
+            validator: ValidatorId::new(validator),
             signature: zero_bls_signature(),
         }
     }
@@ -290,7 +290,7 @@ mod tests {
     #[test]
     fn test_vote_tracker_quorum() {
         let mut tracker = VoteTracker::new(
-            WaveId::new(ShardGroupId(0), BlockHeight::new(0), BTreeSet::new()),
+            WaveId::new(ShardGroupId::new(0), BlockHeight::new(0), BTreeSet::new()),
             BlockHash::from_raw(Hash::from_bytes(b"block")),
             VotePower::new(3),
         );
@@ -316,7 +316,7 @@ mod tests {
     #[test]
     fn test_vote_tracker_conflicting_roots() {
         let mut tracker = VoteTracker::new(
-            WaveId::new(ShardGroupId(0), BlockHeight::new(0), BTreeSet::new()),
+            WaveId::new(ShardGroupId::new(0), BlockHeight::new(0), BTreeSet::new()),
             BlockHash::from_raw(Hash::from_bytes(b"block")),
             VotePower::new(3),
         );
@@ -340,7 +340,7 @@ mod tests {
         let pk = make_test_public_key();
         let root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root"));
         let mut tracker = VoteTracker::new(
-            WaveId::new(ShardGroupId(0), BlockHeight::new(0), BTreeSet::new()),
+            WaveId::new(ShardGroupId::new(0), BlockHeight::new(0), BTreeSet::new()),
             BlockHash::from_raw(Hash::from_bytes(b"block")),
             VotePower::new(3),
         );
@@ -370,7 +370,7 @@ mod tests {
         let pk = make_test_public_key();
         let root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root"));
         let mut tracker = VoteTracker::new(
-            WaveId::new(ShardGroupId(0), BlockHeight::new(0), BTreeSet::new()),
+            WaveId::new(ShardGroupId::new(0), BlockHeight::new(0), BTreeSet::new()),
             BlockHash::from_raw(Hash::from_bytes(b"block")),
             VotePower::new(3),
         );
@@ -384,7 +384,7 @@ mod tests {
         let pk = make_test_public_key();
         let root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root"));
         let mut tracker = VoteTracker::new(
-            WaveId::new(ShardGroupId(0), BlockHeight::new(0), BTreeSet::new()),
+            WaveId::new(ShardGroupId::new(0), BlockHeight::new(0), BTreeSet::new()),
             BlockHash::from_raw(Hash::from_bytes(b"block")),
             VotePower::new(3),
         );

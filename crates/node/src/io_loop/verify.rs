@@ -33,8 +33,8 @@ pub(super) fn resolve_sender_key(
     let committee = topology.committee_for_shard(shard);
     if !committee.contains(&sender) {
         warn!(
-            sender = sender.0,
-            shard = shard.0,
+            sender = sender.inner(),
+            shard = shard.inner(),
             "{} sender not in shard committee",
             context
         );
@@ -42,7 +42,7 @@ pub(super) fn resolve_sender_key(
     }
     let Some(public_key) = topology.public_key(sender) else {
         warn!(
-            sender = sender.0,
+            sender = sender.inner(),
             "Could not resolve public key for {} sender", context
         );
         return None;
@@ -69,7 +69,7 @@ pub(super) fn verify_sender_signature(
     let valid = verify_bls_with_metrics(msg, &public_key, signature, metric_label);
     if !valid {
         warn!(
-            sender = sender.0,
+            sender = sender.inner(),
             "{} sender signature invalid — dropping", context
         );
     }

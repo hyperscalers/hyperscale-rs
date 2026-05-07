@@ -94,7 +94,7 @@ mod tests {
     use super::*;
 
     fn make_qc(height: u64) -> QuorumCertificate {
-        let mut qc = QuorumCertificate::genesis(ShardGroupId(0));
+        let mut qc = QuorumCertificate::genesis(ShardGroupId::new(0));
         qc.height = BlockHeight::new(height);
         qc
     }
@@ -178,7 +178,7 @@ mod properties {
     use super::*;
 
     fn make_qc(height: u64) -> QuorumCertificate {
-        let mut qc = QuorumCertificate::genesis(ShardGroupId(0));
+        let mut qc = QuorumCertificate::genesis(ShardGroupId::new(0));
         qc.height = BlockHeight::new(height);
         qc
     }

@@ -942,7 +942,7 @@ mod tests {
     use super::*;
 
     fn shard() -> ShardGroupId {
-        ShardGroupId(0)
+        ShardGroupId::new(0)
     }
 
     fn make_vote(
@@ -958,7 +958,7 @@ mod tests {
             shard(),
             height,
             round,
-            ValidatorId(voter_index as u64),
+            ValidatorId::new(voter_index as u64),
             &keys[voter_index],
             ProposerTimestamp::from_millis(timestamp_ms),
         )

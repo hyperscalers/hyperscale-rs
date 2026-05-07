@@ -423,11 +423,11 @@ mod tests {
 
     fn make_header(height: BlockHeight) -> BlockHeader {
         BlockHeader {
-            shard_group_id: ShardGroupId(0),
+            shard_group_id: ShardGroupId::new(0),
             height,
             parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            parent_qc: QuorumCertificate::genesis(ShardGroupId(0)),
-            proposer: ValidatorId(0),
+            parent_qc: QuorumCertificate::genesis(ShardGroupId::new(0)),
+            proposer: ValidatorId::new(0),
             timestamp: ProposerTimestamp::from_millis(1_234_567_890),
             round: Round::INITIAL,
             is_fallback: false,
@@ -476,8 +476,8 @@ mod tests {
     #[test]
     fn test_pending_block_with_waves() {
         let tx1 = TxHash::from_raw(Hash::from_bytes(b"tx1"));
-        let wave1 = WaveId::new(ShardGroupId(0), BlockHeight::new(1), BTreeSet::new());
-        let wave2 = WaveId::new(ShardGroupId(0), BlockHeight::new(2), BTreeSet::new());
+        let wave1 = WaveId::new(ShardGroupId::new(0), BlockHeight::new(1), BTreeSet::new());
+        let wave2 = WaveId::new(ShardGroupId::new(0), BlockHeight::new(2), BTreeSet::new());
         let header = make_header(BlockHeight::new(1));
 
         let pb = PendingBlock::from_manifest(
@@ -499,7 +499,7 @@ mod tests {
 
     #[test]
     fn test_add_finalized_wave() {
-        let wave_id = WaveId::new(ShardGroupId(0), BlockHeight::new(1), BTreeSet::new());
+        let wave_id = WaveId::new(ShardGroupId::new(0), BlockHeight::new(1), BTreeSet::new());
         let header = make_header(BlockHeight::new(1));
 
         let mut pb = PendingBlock::from_manifest(
@@ -532,7 +532,7 @@ mod tests {
     fn test_block_needs_transactions_and_waves() {
         let tx = Arc::new(test_transaction(1));
         let tx_hash = tx.hash();
-        let wave_id = WaveId::new(ShardGroupId(0), BlockHeight::new(1), BTreeSet::new());
+        let wave_id = WaveId::new(ShardGroupId::new(0), BlockHeight::new(1), BTreeSet::new());
         let header = make_header(BlockHeight::new(1));
 
         let mut pb = PendingBlock::from_manifest(
@@ -566,7 +566,7 @@ mod tests {
 
     #[test]
     fn test_from_complete_block_is_complete() {
-        let wave_id = WaveId::new(ShardGroupId(0), BlockHeight::new(1), BTreeSet::new());
+        let wave_id = WaveId::new(ShardGroupId::new(0), BlockHeight::new(1), BTreeSet::new());
         let cert = Arc::new(WaveCertificate {
             wave_id,
             execution_certificates: vec![],

@@ -44,7 +44,7 @@ mod tests {
     fn test_sbor_roundtrip() {
         let request = GetProvisionsRequest {
             block_height: BlockHeight::new(42),
-            target_shard: ShardGroupId(1),
+            target_shard: ShardGroupId::new(1),
         };
 
         let encoded = basic_encode(&request).unwrap();

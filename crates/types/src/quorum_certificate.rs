@@ -43,7 +43,7 @@ impl QuorumCertificate {
     ///
     /// The shard is tagged on the QC so any committee lookup keyed off
     /// `qc.shard_group_id` resolves the same shard the QC anchors. A
-    /// fixed-`ShardGroupId(0)` default would silently route shard-N
+    /// fixed-`ShardGroupId::new(0)` default would silently route shard-N
     /// committee lookups to shard 0 for any genesis-anchored header.
     /// The genesis QC has a zero block hash and zero signature.
     #[must_use]
@@ -127,7 +127,7 @@ mod tests {
 
     #[test]
     fn test_genesis_qc() {
-        let qc = QuorumCertificate::genesis(ShardGroupId(0));
+        let qc = QuorumCertificate::genesis(ShardGroupId::new(0));
         assert!(qc.is_genesis());
         assert_eq!(qc.height, BlockHeight::new(0));
         assert_eq!(qc.block_hash, BlockHash::ZERO);
@@ -147,7 +147,7 @@ mod tests {
         let parent_block_hash = BlockHash::from_raw(Hash::from_bytes(b"parent"));
         let qc = QuorumCertificate {
             block_hash: BlockHash::from_raw(Hash::from_bytes(b"block1")),
-            shard_group_id: ShardGroupId(0),
+            shard_group_id: ShardGroupId::new(0),
             height: BlockHeight::new(1),
             parent_block_hash,
             round: Round::INITIAL,

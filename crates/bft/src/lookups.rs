@@ -109,7 +109,7 @@ mod tests {
         //   Next proposers for height 1: V1 (round 0), V2 (round 1)
         assert_eq!(
             vote_recipients(&topology, BlockHeight::new(0), Round::new(0)),
-            vec![ValidatorId(1), ValidatorId(2)]
+            vec![ValidatorId::new(1), ValidatorId::new(2)]
         );
 
         // Voting at (1, 0):
@@ -117,7 +117,11 @@ mod tests {
         //   Next proposers: V2 (round 0), V3 (round 1)
         assert_eq!(
             vote_recipients(&topology, BlockHeight::new(1), Round::new(0)),
-            vec![ValidatorId(1), ValidatorId(2), ValidatorId(3)]
+            vec![
+                ValidatorId::new(1),
+                ValidatorId::new(2),
+                ValidatorId::new(3)
+            ]
         );
     }
 
@@ -130,7 +134,11 @@ mod tests {
         let topology = topology_for(0, &committee);
         assert_eq!(
             vote_recipients(&topology, BlockHeight::new(3), Round::new(0)),
-            vec![ValidatorId(3), ValidatorId(1), ValidatorId(2)]
+            vec![
+                ValidatorId::new(3),
+                ValidatorId::new(1),
+                ValidatorId::new(2)
+            ]
         );
     }
 
@@ -143,7 +151,11 @@ mod tests {
         let topology = topology_for(0, &committee);
         assert_eq!(
             vote_recipients(&topology, BlockHeight::new(0), Round::new(2)),
-            vec![ValidatorId(2), ValidatorId(3), ValidatorId(1)]
+            vec![
+                ValidatorId::new(2),
+                ValidatorId::new(3),
+                ValidatorId::new(1)
+            ]
         );
     }
 

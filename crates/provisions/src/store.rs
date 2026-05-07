@@ -156,8 +156,8 @@ mod tests {
 
     fn make_provisions(tx_seed: u8, height: u64) -> Arc<Provisions> {
         Arc::new(Provisions::new(
-            ShardGroupId(1),
-            ShardGroupId(0),
+            ShardGroupId::new(1),
+            ShardGroupId::new(0),
             BlockHeight::new(height),
             MerkleInclusionProof::dummy(),
             vec![TxEntries {

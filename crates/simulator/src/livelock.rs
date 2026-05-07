@@ -128,7 +128,7 @@ impl LivelockReport {
         // Shard breakdown
         println!("🗂️  By Shard:");
         let mut shard_ids: Vec<_> = self.by_shard.keys().collect();
-        shard_ids.sort_by_key(|s| s.0);
+        shard_ids.sort_by_key(|s| s.inner());
         for shard_id in shard_ids {
             if let Some(txs) = self.by_shard.get(shard_id)
                 && !txs.is_empty()
@@ -136,7 +136,7 @@ impl LivelockReport {
                 let cross_shard_count = txs.iter().filter(|tx| tx.is_cross_shard).count();
                 println!(
                     "  Shard {}: {} transactions ({} cross-shard)",
-                    shard_id.0,
+                    shard_id.inner(),
                     txs.len(),
                     cross_shard_count
                 );
@@ -187,7 +187,7 @@ impl LivelockAnalyzer {
 
         // Collect from first validator of each shard (all validators see same mempool)
         for shard_idx in 0..num_shards {
-            let shard = ShardGroupId(shard_idx);
+            let shard = ShardGroupId::new(shard_idx);
             let first_node_idx =
                 u32::try_from(shard_idx).unwrap_or(u32::MAX) * validators_per_shard;
 

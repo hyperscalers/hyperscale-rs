@@ -171,7 +171,7 @@ impl ExpectedProvisionTracker {
                 continue;
             }
             warn!(
-                source_shard = source_shard.0,
+                source_shard = source_shard.inner(),
                 block_height = block_height.inner(),
                 age_ms = u64::try_from(now.elapsed_since(expected.discovered_at).as_millis())
                     .unwrap_or(u64::MAX),
@@ -233,31 +233,51 @@ mod tests {
     #[test]
     fn register_inserts_expectation() {
         let mut t = ExpectedProvisionTracker::new();
-        t.register(ShardGroupId(1), BlockHeight::new(10), ValidatorId(3));
+        t.register(
+            ShardGroupId::new(1),
+            BlockHeight::new(10),
+            ValidatorId::new(3),
+        );
         assert_eq!(t.len(), 1);
     }
 
     #[test]
     fn register_is_idempotent() {
         let mut t = ExpectedProvisionTracker::new();
-        t.register(ShardGroupId(1), BlockHeight::new(10), ValidatorId(3));
-        t.register(ShardGroupId(1), BlockHeight::new(10), ValidatorId(7));
+        t.register(
+            ShardGroupId::new(1),
+            BlockHeight::new(10),
+            ValidatorId::new(3),
+        );
+        t.register(
+            ShardGroupId::new(1),
+            BlockHeight::new(10),
+            ValidatorId::new(7),
+        );
         assert_eq!(t.len(), 1);
     }
 
     #[test]
     fn on_provisions_verified_clears_entry() {
         let mut t = ExpectedProvisionTracker::new();
-        t.register(ShardGroupId(1), BlockHeight::new(10), ValidatorId(3));
-        assert!(t.on_provisions_verified(ShardGroupId(1), BlockHeight::new(10)));
-        assert!(!t.on_provisions_verified(ShardGroupId(1), BlockHeight::new(10)));
+        t.register(
+            ShardGroupId::new(1),
+            BlockHeight::new(10),
+            ValidatorId::new(3),
+        );
+        assert!(t.on_provisions_verified(ShardGroupId::new(1), BlockHeight::new(10)));
+        assert!(!t.on_provisions_verified(ShardGroupId::new(1), BlockHeight::new(10)));
         assert_eq!(t.len(), 0);
     }
 
     #[test]
     fn first_commit_retro_stamps_pregenesis_entries() {
         let mut t = ExpectedProvisionTracker::new();
-        t.register(ShardGroupId(1), BlockHeight::new(10), ValidatorId(3));
+        t.register(
+            ShardGroupId::new(1),
+            BlockHeight::new(10),
+            ValidatorId::new(3),
+        );
 
         // Before any commit, an immediate timeout sweep at a non-zero `now`
         // would fire — the entry's discovered_at is still ZERO. The
@@ -273,7 +293,11 @@ mod tests {
     fn timeout_emits_effect_after_threshold() {
         let mut t = ExpectedProvisionTracker::new();
         t.record_block_committed(BlockHeight::new(1), ts(1_000));
-        t.register(ShardGroupId(1), BlockHeight::new(10), ValidatorId(3));
+        t.register(
+            ShardGroupId::new(1),
+            BlockHeight::new(10),
+            ValidatorId::new(3),
+        );
 
         // Just under threshold: no firings.
         let just_under = ts(1_000
@@ -289,9 +313,9 @@ mod tests {
         assert_eq!(
             effects[0],
             TimeoutEffect {
-                source_shard: ShardGroupId(1),
+                source_shard: ShardGroupId::new(1),
                 block_height: BlockHeight::new(10),
-                proposer: ValidatorId(3),
+                proposer: ValidatorId::new(3),
             }
         );
 
@@ -303,10 +327,14 @@ mod tests {
     fn verified_before_timeout_never_emits() {
         let mut t = ExpectedProvisionTracker::new();
         t.record_block_committed(BlockHeight::new(1), ts(1_000));
-        t.register(ShardGroupId(1), BlockHeight::new(10), ValidatorId(3));
+        t.register(
+            ShardGroupId::new(1),
+            BlockHeight::new(10),
+            ValidatorId::new(3),
+        );
 
         // Verify before the timeout fires.
-        assert!(t.on_provisions_verified(ShardGroupId(1), BlockHeight::new(10)));
+        assert!(t.on_provisions_verified(ShardGroupId::new(1), BlockHeight::new(10)));
 
         let well_past =
             ts(1_000
@@ -318,8 +346,16 @@ mod tests {
     fn flush_all_bypasses_timeout() {
         let mut t = ExpectedProvisionTracker::new();
         t.record_block_committed(BlockHeight::new(1), ts(1_000));
-        t.register(ShardGroupId(1), BlockHeight::new(10), ValidatorId(3));
-        t.register(ShardGroupId(2), BlockHeight::new(5), ValidatorId(7));
+        t.register(
+            ShardGroupId::new(1),
+            BlockHeight::new(10),
+            ValidatorId::new(3),
+        );
+        t.register(
+            ShardGroupId::new(2),
+            BlockHeight::new(5),
+            ValidatorId::new(7),
+        );
 
         let effects = t.flush_all();
         assert_eq!(effects.len(), 2);
@@ -332,7 +368,11 @@ mod tests {
     fn cleanup_orphans_drops_aged_entries() {
         let mut t = ExpectedProvisionTracker::new();
         t.record_block_committed(BlockHeight::new(1), ts(1_000));
-        t.register(ShardGroupId(1), BlockHeight::new(10), ValidatorId(3));
+        t.register(
+            ShardGroupId::new(1),
+            BlockHeight::new(10),
+            ValidatorId::new(3),
+        );
 
         // Advance well past RETENTION_HORIZON.
         let far_future =
@@ -341,14 +381,18 @@ mod tests {
 
         let cutoff = far_future.minus(RETENTION_HORIZON);
         let dropped = t.cleanup_orphans(cutoff);
-        assert_eq!(dropped, vec![(ShardGroupId(1), BlockHeight::new(10))]);
+        assert_eq!(dropped, vec![(ShardGroupId::new(1), BlockHeight::new(10))]);
         assert_eq!(t.len(), 0);
     }
 
     #[test]
     fn cleanup_orphans_no_op_when_cutoff_zero() {
         let mut t = ExpectedProvisionTracker::new();
-        t.register(ShardGroupId(1), BlockHeight::new(10), ValidatorId(3));
+        t.register(
+            ShardGroupId::new(1),
+            BlockHeight::new(10),
+            ValidatorId::new(3),
+        );
         let dropped = t.cleanup_orphans(WeightedTimestamp::ZERO);
         assert!(dropped.is_empty());
         assert_eq!(t.len(), 1);

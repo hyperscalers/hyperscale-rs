@@ -506,7 +506,7 @@ mod tests {
     use super::*;
 
     fn shard() -> ShardGroupId {
-        ShardGroupId(0)
+        ShardGroupId::new(0)
     }
 
     fn wave_id(height: u64) -> WaveId {
@@ -569,10 +569,10 @@ mod tests {
         // Committee is [V0, V1, V2, V3]; voters are V1 and V3.
         // Expected bits set: 1, 3.
         let committee = vec![
-            ValidatorId(0),
-            ValidatorId(1),
-            ValidatorId(2),
-            ValidatorId(3),
+            ValidatorId::new(0),
+            ValidatorId::new(1),
+            ValidatorId::new(2),
+            ValidatorId::new(3),
         ];
         let wid = wave_id(1);
         let tx = TxHash::from_raw(Hash::from_bytes(b"tx"));
@@ -583,7 +583,7 @@ mod tests {
         let sk3 = keypair(3);
         let votes = vec![
             signed_vote(
-                ValidatorId(1),
+                ValidatorId::new(1),
                 &sk1,
                 &wid,
                 root,
@@ -591,7 +591,7 @@ mod tests {
                 outcomes.clone(),
             ),
             signed_vote(
-                ValidatorId(3),
+                ValidatorId::new(3),
                 &sk3,
                 &wid,
                 root,
@@ -610,7 +610,7 @@ mod tests {
 
     #[test]
     fn aggregate_dedups_votes_from_same_validator() {
-        let committee = vec![ValidatorId(0), ValidatorId(1)];
+        let committee = vec![ValidatorId::new(0), ValidatorId::new(1)];
         let wid = wave_id(1);
         let outcomes = vec![outcome(TxHash::from_raw(Hash::from_bytes(b"tx")))];
         let root = compute_global_receipt_root(&outcomes);
@@ -619,7 +619,7 @@ mod tests {
         // Same voter cast twice.
         let votes = vec![
             signed_vote(
-                ValidatorId(0),
+                ValidatorId::new(0),
                 &sk0,
                 &wid,
                 root,
@@ -627,7 +627,7 @@ mod tests {
                 outcomes.clone(),
             ),
             signed_vote(
-                ValidatorId(0),
+                ValidatorId::new(0),
                 &sk0,
                 &wid,
                 root,
@@ -655,7 +655,7 @@ mod tests {
         let votes = vec![
             (
                 signed_vote(
-                    ValidatorId(0),
+                    ValidatorId::new(0),
                     &sk0,
                     &wid,
                     root,
@@ -667,7 +667,7 @@ mod tests {
             ),
             (
                 signed_vote(
-                    ValidatorId(1),
+                    ValidatorId::new(1),
                     &sk1,
                     &wid,
                     root,
@@ -695,7 +695,7 @@ mod tests {
         // (wrong root) — the batch verify fails, then the individual fallback
         // drops only V1's vote.
         let mut bad_vote = signed_vote(
-            ValidatorId(1),
+            ValidatorId::new(1),
             &sk1,
             &wid,
             GlobalReceiptRoot::from_raw(Hash::from_bytes(b"other")),
@@ -710,7 +710,7 @@ mod tests {
         let votes = vec![
             (
                 signed_vote(
-                    ValidatorId(0),
+                    ValidatorId::new(0),
                     &sk0,
                     &wid,
                     root,
@@ -723,7 +723,7 @@ mod tests {
             (bad_vote, sk1.public_key(), VotePower::new(1)),
             (
                 signed_vote(
-                    ValidatorId(2),
+                    ValidatorId::new(2),
                     &sk2,
                     &wid,
                     root,
@@ -737,7 +737,7 @@ mod tests {
 
         let verified: Vec<_> = batch_verify_execution_votes(votes).collect();
         let validators: Vec<ValidatorId> = verified.iter().map(|(v, _)| v.validator).collect();
-        assert_eq!(validators, vec![ValidatorId(0), ValidatorId(2)]);
+        assert_eq!(validators, vec![ValidatorId::new(0), ValidatorId::new(2)]);
     }
 
     #[test]
@@ -760,7 +760,7 @@ mod tests {
         let sk1 = keypair(1);
 
         let mut byzantine = signed_vote(
-            ValidatorId(0),
+            ValidatorId::new(0),
             &sk0,
             &wid,
             root,
@@ -770,7 +770,7 @@ mod tests {
         byzantine.tx_outcomes = tampered_outcomes;
 
         let honest = signed_vote(
-            ValidatorId(1),
+            ValidatorId::new(1),
             &sk1,
             &wid,
             root,
@@ -787,7 +787,7 @@ mod tests {
         let validators: Vec<ValidatorId> = verified.iter().map(|(v, _)| v.validator).collect();
         assert_eq!(
             validators,
-            vec![ValidatorId(1)],
+            vec![ValidatorId::new(1)],
             "Byzantine vote with mismatched outcomes must be filtered"
         );
     }
@@ -797,10 +797,10 @@ mod tests {
     #[test]
     fn verify_ec_signature_accepts_valid_aggregation() {
         let committee = vec![
-            ValidatorId(0),
-            ValidatorId(1),
-            ValidatorId(2),
-            ValidatorId(3),
+            ValidatorId::new(0),
+            ValidatorId::new(1),
+            ValidatorId::new(2),
+            ValidatorId::new(3),
         ];
         let wid = wave_id(1);
         let outcomes = vec![outcome(TxHash::from_raw(Hash::from_bytes(b"tx")))];
@@ -810,7 +810,7 @@ mod tests {
         let votes: Vec<ExecutionVote> = (0_usize..4)
             .map(|i| {
                 signed_vote(
-                    ValidatorId(u64::try_from(i).unwrap()),
+                    ValidatorId::new(u64::try_from(i).unwrap()),
                     &sks[i],
                     &wid,
                     root,
@@ -827,7 +827,7 @@ mod tests {
 
     #[test]
     fn verify_ec_signature_rejects_wrong_public_keys() {
-        let committee = vec![ValidatorId(0), ValidatorId(1)];
+        let committee = vec![ValidatorId::new(0), ValidatorId::new(1)];
         let wid = wave_id(1);
         let outcomes = vec![outcome(TxHash::from_raw(Hash::from_bytes(b"tx")))];
         let root = compute_global_receipt_root(&outcomes);
@@ -836,7 +836,7 @@ mod tests {
 
         let votes = vec![
             signed_vote(
-                ValidatorId(0),
+                ValidatorId::new(0),
                 &sk0,
                 &wid,
                 root,
@@ -844,7 +844,7 @@ mod tests {
                 outcomes.clone(),
             ),
             signed_vote(
-                ValidatorId(1),
+                ValidatorId::new(1),
                 &sk1,
                 &wid,
                 root,
@@ -914,7 +914,7 @@ mod tests {
 
     #[test]
     fn build_dispatch_cross_shard_returns_none_when_provisions_missing() {
-        let wave = cross_shard_wave_with(&[1], ShardGroupId(1));
+        let wave = cross_shard_wave_with(&[1], ShardGroupId::new(1));
         let provisions = HashMap::new();
 
         assert!(build_dispatch_action(&wave, &provisions, BlockHash::ZERO).is_none());
@@ -922,7 +922,7 @@ mod tests {
 
     #[test]
     fn build_dispatch_cross_shard_succeeds_with_all_provisions() {
-        let wave = cross_shard_wave_with(&[1], ShardGroupId(1));
+        let wave = cross_shard_wave_with(&[1], ShardGroupId::new(1));
         let tx_hash = wave.tx_hashes()[0];
         let mut provisions = HashMap::new();
         provisions.insert(
@@ -930,7 +930,7 @@ mod tests {
             vec![StateProvision {
                 transaction_hash: tx_hash,
                 target_shard: shard(),
-                source_shard: ShardGroupId(1),
+                source_shard: ShardGroupId::new(1),
                 block_height: BlockHeight::new(5),
                 entries: Arc::new(vec![]),
             }],

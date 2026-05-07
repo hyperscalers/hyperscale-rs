@@ -298,8 +298,8 @@ mod tests {
     #[test]
     fn test_provision_deadline_is_source_ts_plus_retention_horizon() {
         let provisions = Provisions::new(
-            ShardGroupId(1),
-            ShardGroupId(2),
+            ShardGroupId::new(1),
+            ShardGroupId::new(2),
             BlockHeight::new(100),
             MerkleInclusionProof::new(vec![]),
             vec![],
@@ -314,8 +314,8 @@ mod tests {
     #[test]
     fn test_provisions_fields_roundtrip() {
         let original = Provisions::new(
-            ShardGroupId(1),
-            ShardGroupId(2),
+            ShardGroupId::new(1),
+            ShardGroupId::new(2),
             BlockHeight::new(42),
             MerkleInclusionProof::new(vec![1, 2, 3]),
             vec![],
@@ -324,7 +324,7 @@ mod tests {
         let bytes = basic_encode(&original).unwrap();
         let decoded: Provisions = basic_decode(&bytes).unwrap();
         assert_eq!(original, decoded);
-        assert_eq!(decoded.target_shard, ShardGroupId(2));
+        assert_eq!(decoded.target_shard, ShardGroupId::new(2));
     }
 
     #[test]
@@ -343,8 +343,8 @@ mod tests {
     #[test]
     fn test_provisions_roundtrip() {
         let provisions = Provisions::new(
-            ShardGroupId(0),
-            ShardGroupId(1),
+            ShardGroupId::new(0),
+            ShardGroupId::new(1),
             BlockHeight::new(10),
             MerkleInclusionProof::dummy(),
             vec![TxEntries {
@@ -362,8 +362,11 @@ mod tests {
     #[test]
     fn test_provisions_all_entries_deduped() {
         let entry = test_entry(1);
-        let mut provisions =
-            Provisions::dummy(ShardGroupId(0), ShardGroupId(1), BlockHeight::new(10));
+        let mut provisions = Provisions::dummy(
+            ShardGroupId::new(0),
+            ShardGroupId::new(1),
+            BlockHeight::new(10),
+        );
         provisions.transactions = vec![
             TxEntries {
                 tx_hash: TxHash::from_raw(Hash::from_bytes(b"tx1")),
@@ -399,8 +402,8 @@ mod tests {
                 .unwrap();
             enc.write_value_kind(ValueKind::Tuple).unwrap();
             enc.write_size(5).unwrap();
-            enc.encode(&ShardGroupId(1)).unwrap();
-            enc.encode(&ShardGroupId(2)).unwrap();
+            enc.encode(&ShardGroupId::new(1)).unwrap();
+            enc.encode(&ShardGroupId::new(2)).unwrap();
             enc.encode(&BlockHeight::new(10)).unwrap();
             enc.encode(&MerkleInclusionProof::dummy()).unwrap();
             enc.write_value_kind(ValueKind::Array).unwrap();

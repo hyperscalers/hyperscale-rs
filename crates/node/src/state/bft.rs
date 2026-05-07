@@ -381,14 +381,14 @@ mod tests {
 
         // Wave on remote shard 1 listing local shard 0 as a dependency.
         let mut remote_shards = BTreeSet::new();
-        remote_shards.insert(ShardGroupId(0));
-        let wave = WaveId::new(ShardGroupId(1), BlockHeight::new(5), remote_shards);
+        remote_shards.insert(ShardGroupId::new(0));
+        let wave = WaveId::new(ShardGroupId::new(1), BlockHeight::new(5), remote_shards);
 
         let mut block = make_live_block(
-            ShardGroupId(1),
+            ShardGroupId::new(1),
             BlockHeight::new(5),
             /* timestamp_ms */ 1_000,
-            ValidatorId(0),
+            ValidatorId::new(0),
             vec![],
             vec![],
         );
@@ -397,7 +397,7 @@ mod tests {
         }
         let committed_header = Arc::new(CommittedBlockHeader::new(
             block.header().clone(),
-            QuorumCertificate::genesis(ShardGroupId(0)),
+            QuorumCertificate::genesis(ShardGroupId::new(0)),
         ));
 
         let pre_exec = node.execution.memory_stats().expected_exec_certs;
@@ -428,7 +428,7 @@ mod tests {
     #[test]
     fn transactions_admitted_drives_proposal_through_post_dispatch_hook() {
         // proposer_for(h=1, r=0) = committee[(1+0) % 4] = committee[1]
-        // = ValidatorId(1). Pick local_idx=1 to be the leader.
+        // = ValidatorId::new(1). Pick local_idx=1 to be the leader.
         let TestNode { mut node, .. } = TestNode::builder().local_idx(1).build();
         assert!(
             node.topology()
@@ -453,7 +453,7 @@ mod tests {
     /// guard is at the proposer level, not the latch level.
     #[test]
     fn transactions_admitted_does_not_emit_proposal_on_non_leader() {
-        // local_idx=0 → ValidatorId(0); committee[1] = ValidatorId(1)
+        // local_idx=0 → ValidatorId::new(0); committee[1] = ValidatorId::new(1)
         // is the proposer, so we are not.
         let TestNode { mut node, .. } = TestNode::new();
         assert!(
@@ -519,8 +519,8 @@ mod tests {
         // Register an outbound batch (local shard 0 → remote shard 1).
         // Deadline = self.now (ZERO) + RETENTION_HORIZON ≈ 5m24s.
         let provisions = Arc::new(Provisions::new(
-            ShardGroupId(0),
-            ShardGroupId(1),
+            ShardGroupId::new(0),
+            ShardGroupId::new(1),
             BlockHeight::new(1),
             MerkleInclusionProof::dummy(),
             vec![TxEntries {
@@ -531,7 +531,7 @@ mod tests {
         ));
         let _ = node.handle(ProtocolEvent::OutboundProvisionBroadcast {
             provisions,
-            target_shard: ShardGroupId(1),
+            target_shard: ShardGroupId::new(1),
         });
         assert_eq!(
             node.outbound_provisions().memory_stats().tracked_provisions,
@@ -549,10 +549,10 @@ mod tests {
         // Commit a block whose qc.weighted_timestamp is BELOW the entry
         // deadline. The orchestrator passes this into the outbound sweep.
         let block = make_live_block(
-            ShardGroupId(0),
+            ShardGroupId::new(0),
             BlockHeight::new(1),
             /* timestamp_ms */ 1_000,
-            ValidatorId(0),
+            ValidatorId::new(0),
             vec![],
             vec![],
         );
@@ -568,10 +568,10 @@ mod tests {
         // Commit a second block whose qc.weighted_timestamp IS past the
         // deadline. Now the eviction path proper must fire.
         let block = make_live_block(
-            ShardGroupId(0),
+            ShardGroupId::new(0),
             BlockHeight::new(2),
             /* timestamp_ms */ 1_000,
-            ValidatorId(0),
+            ValidatorId::new(0),
             vec![],
             vec![],
         );
@@ -602,15 +602,15 @@ mod tests {
             provision_hashes: vec![],
         };
 
-        // proposer_for(h=1, r=0) = committee[(1+0) % 4] = ValidatorId(1).
+        // proposer_for(h=1, r=0) = committee[(1+0) % 4] = ValidatorId::new(1).
         // BFT's header validation rejects on proposer mismatch, so the
         // header must name the actual round-0 height-1 leader to reach
         // the pending-blocks insert.
         let header = make_live_block(
-            ShardGroupId(0),
+            ShardGroupId::new(0),
             BlockHeight::new(1),
             /* timestamp_ms */ 1_000,
-            ValidatorId(1),
+            ValidatorId::new(1),
             vec![],
             vec![],
         )
@@ -653,10 +653,10 @@ mod tests {
         );
 
         let block = make_live_block(
-            ShardGroupId(0),
+            ShardGroupId::new(0),
             BlockHeight::new(1),
             /* timestamp_ms */ 1_000,
-            ValidatorId(0),
+            ValidatorId::new(0),
             vec![tx],
             vec![],
         );
