@@ -8,6 +8,15 @@
 //! Set/map decode paths don't pre-allocate, but they still read `len`
 //! elements in a loop — bounded helpers reject oversized claims before any
 //! per-element work happens.
+//!
+//! ## No `HashMap`/`HashSet` in wire types
+//!
+//! SBOR upstream impls `Encode`/`Decode` for `HashMap`/`HashSet`, but their
+//! iteration order is undefined — encoding a logically equal value produces
+//! different byte sequences across runs, and any merkle root or signature
+//! over the bytes diverges. Use `BTreeMap`/`BTreeSet` (or a sorted `Vec`)
+//! for fields on any encoded type. Enforced by
+//! `crates/types/tests/no_hash_collections_on_wire.rs`.
 
 use std::collections::BTreeSet;
 
