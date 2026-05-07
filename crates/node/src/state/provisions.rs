@@ -79,7 +79,7 @@ mod tests {
             ShardGroupId::new(1), // source
             ShardGroupId::new(0), // target (local)
             BlockHeight::new(1),
-            MerkleInclusionProof(vec![]),
+            MerkleInclusionProof::dummy(),
             vec![],
         ));
 
