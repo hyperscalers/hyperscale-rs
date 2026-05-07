@@ -5,8 +5,7 @@ use std::sync::Arc;
 use hyperscale_storage::{BlockForSync, ChainReader};
 use hyperscale_types::{
     BlockHash, BlockHeight, CertifiedBlock, CommittedBlockHeader, ConsensusReceipt,
-    ExecutionCertificate, ExecutionCertificateHash, QuorumCertificate, RoutableTransaction,
-    ShardGroupId, TxHash, WaveCertificate, WaveId,
+    ExecutionCertificate, QuorumCertificate, RoutableTransaction, TxHash, WaveCertificate, WaveId,
 };
 
 use crate::column_families::{ExecutionCertsByHeightCf, ExecutionCertsCf};
@@ -71,18 +70,5 @@ impl ChainReader for RocksDbStorage {
                 get::<ExecutionCertsCf>(&*self.db, certs_cf, &canonical_hash)
             })
             .collect()
-    }
-
-    fn get_wave_certificate_for_tx(&self, _tx_hash: &TxHash) -> Option<WaveCertificate> {
-        // TODO: populate and read a `tx_to_wave` CF at block commit time.
-        None
-    }
-
-    fn get_ec_hashes_for_tx(
-        &self,
-        _tx_hash: &TxHash,
-    ) -> Option<Vec<(ShardGroupId, ExecutionCertificateHash)>> {
-        // TODO: populate and read a `tx_to_ec` CF at block commit time.
-        None
     }
 }

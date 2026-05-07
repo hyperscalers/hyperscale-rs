@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use hyperscale_types::{
     Block, BlockHash, BlockHeight, CertifiedBlock, CommittedBlockHeader, ConsensusReceipt,
-    ExecutionCertificate, ExecutionCertificateHash, ProvisionHash, QuorumCertificate,
-    RoutableTransaction, ShardGroupId, TxHash, WaveCertificate, WaveId,
+    ExecutionCertificate, ProvisionHash, QuorumCertificate, RoutableTransaction, TxHash,
+    WaveCertificate, WaveId,
 };
 
 /// A sync-ready block retrieved from storage.
@@ -85,21 +85,4 @@ pub trait ChainReader: Send + Sync + 'static {
         &self,
         block_height: BlockHeight,
     ) -> Vec<ExecutionCertificate>;
-
-    // ─── Wave Certificate Indexes ─────────────────────────────────────────
-
-    /// Get the wave certificate that finalized a given transaction.
-    ///
-    /// Returns `None` if no wave cert has been recorded for this tx.
-    fn get_wave_certificate_for_tx(&self, tx_hash: &TxHash) -> Option<WaveCertificate>;
-
-    /// Get the execution certificate hashes associated with a transaction.
-    ///
-    /// Returns the `(ShardGroupId, ec_hash)` pairs from every shard that
-    /// produced an EC covering this transaction. Returns `None` if no
-    /// index entry exists for this tx.
-    fn get_ec_hashes_for_tx(
-        &self,
-        tx_hash: &TxHash,
-    ) -> Option<Vec<(ShardGroupId, ExecutionCertificateHash)>>;
 }

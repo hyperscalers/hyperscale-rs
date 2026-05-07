@@ -6,8 +6,7 @@ use hyperscale_storage::lock_recover::read_or_recover;
 use hyperscale_storage::{BlockForSync, ChainReader};
 use hyperscale_types::{
     BlockHash, BlockHeight, BlockManifest, CertifiedBlock, CommittedBlockHeader, ConsensusReceipt,
-    ExecutionCertificate, ExecutionCertificateHash, QuorumCertificate, RoutableTransaction,
-    ShardGroupId, TxHash, WaveCertificate, WaveId,
+    ExecutionCertificate, QuorumCertificate, RoutableTransaction, TxHash, WaveCertificate, WaveId,
 };
 
 use crate::core::SimStorage;
@@ -92,21 +91,5 @@ impl ChainReader for SimStorage {
                     .collect()
             })
             .unwrap_or_default()
-    }
-
-    fn get_wave_certificate_for_tx(&self, tx_hash: &TxHash) -> Option<WaveCertificate> {
-        let c = read_or_recover(&self.consensus);
-        let wave_id = c.tx_to_wave.get(tx_hash)?;
-        c.certificates.get(wave_id).cloned()
-    }
-
-    fn get_ec_hashes_for_tx(
-        &self,
-        tx_hash: &TxHash,
-    ) -> Option<Vec<(ShardGroupId, ExecutionCertificateHash)>> {
-        read_or_recover(&self.consensus)
-            .tx_to_ec
-            .get(tx_hash)
-            .cloned()
     }
 }

@@ -11,8 +11,8 @@ use hyperscale_storage::{
 };
 use hyperscale_types::{
     BlockHash, BlockHeight, CertifiedBlock, ConsensusReceipt, ExecutionCertificate,
-    ExecutionCertificateHash, ExecutionMetadata, QuorumCertificate, RoutableTransaction,
-    ShardGroupId, StateRoot, StoredReceipt, TxHash, WaveCertificate, WaveId,
+    ExecutionCertificateHash, ExecutionMetadata, QuorumCertificate, RoutableTransaction, StateRoot,
+    StoredReceipt, TxHash, WaveCertificate, WaveId,
 };
 
 use crate::tree_store::SimTreeStore;
@@ -116,10 +116,6 @@ pub struct ConsensusState {
     pub execution_certs_by_height: HashMap<BlockHeight, Vec<ExecutionCertificateHash>>,
     /// Index: `block_height` → `WaveId`s at that height.
     pub wave_certs_by_height: HashMap<BlockHeight, Vec<WaveId>>,
-    /// Index: `tx_hash` → `WaveId` of the wave cert that finalized it.
-    pub tx_to_wave: HashMap<TxHash, WaveId>,
-    /// Index: `tx_hash` → vec of (`shard_group_id`, `ec_hash`) pairs covering it.
-    pub tx_to_ec: HashMap<TxHash, Vec<(ShardGroupId, ExecutionCertificateHash)>>,
 }
 
 /// Maximum number of blocks worth of receipts to retain in simulation storage.
@@ -140,8 +136,6 @@ impl ConsensusState {
             execution_certs: HashMap::new(),
             execution_certs_by_height: HashMap::new(),
             wave_certs_by_height: HashMap::new(),
-            tx_to_wave: HashMap::new(),
-            tx_to_ec: HashMap::new(),
         }
     }
 

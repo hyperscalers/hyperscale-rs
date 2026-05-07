@@ -19,9 +19,8 @@ use hyperscale_storage::{
 };
 use hyperscale_types::{
     Block, BlockHash, BlockHeight, CertifiedBlock, CommittedBlockHeader, ConsensusReceipt,
-    ExecutionCertificate, ExecutionCertificateHash, FinalizedWave, MerkleInclusionProof, NodeId,
-    QuorumCertificate, RoutableTransaction, ShardGroupId, StateRoot, TxHash, WaveCertificate,
-    WaveId,
+    ExecutionCertificate, FinalizedWave, MerkleInclusionProof, NodeId, QuorumCertificate,
+    RoutableTransaction, StateRoot, TxHash, WaveCertificate, WaveId,
 };
 
 use crate::chain_writer::RocksDbPreparedCommit;
@@ -224,17 +223,6 @@ impl ChainReader for SharedStorage {
         block_height: BlockHeight,
     ) -> Vec<ExecutionCertificate> {
         self.0.get_execution_certificates_by_height(block_height)
-    }
-
-    fn get_wave_certificate_for_tx(&self, tx_hash: &TxHash) -> Option<WaveCertificate> {
-        self.0.get_wave_certificate_for_tx(tx_hash)
-    }
-
-    fn get_ec_hashes_for_tx(
-        &self,
-        tx_hash: &TxHash,
-    ) -> Option<Vec<(ShardGroupId, ExecutionCertificateHash)>> {
-        self.0.get_ec_hashes_for_tx(tx_hash)
     }
 }
 

@@ -647,9 +647,8 @@ impl<S: ChainWriter> ChainWriter for SubstateView<S> {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{
-        CertifiedBlock, CommittedBlockHeader, ExecutionCertificate, ExecutionCertificateHash,
-        GlobalReceiptHash, Hash, RoutableTransaction, ShardGroupId, TxHash, WaveCertificate,
-        WaveId,
+        CertifiedBlock, CommittedBlockHeader, ExecutionCertificate, GlobalReceiptHash, Hash,
+        RoutableTransaction, TxHash, WaveCertificate, WaveId,
     };
     use indexmap::IndexMap;
     use radix_substate_store_interface::interface::{DatabaseUpdates, PartitionDatabaseUpdates};
@@ -773,15 +772,6 @@ mod tests {
             _block_height: BlockHeight,
         ) -> Vec<ExecutionCertificate> {
             Vec::new()
-        }
-        fn get_wave_certificate_for_tx(&self, _tx_hash: &TxHash) -> Option<WaveCertificate> {
-            None
-        }
-        fn get_ec_hashes_for_tx(
-            &self,
-            _tx_hash: &TxHash,
-        ) -> Option<Vec<(ShardGroupId, ExecutionCertificateHash)>> {
-            None
         }
     }
 
