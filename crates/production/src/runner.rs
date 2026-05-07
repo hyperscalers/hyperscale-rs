@@ -70,11 +70,9 @@ use hyperscale_storage::ChainReader;
 use hyperscale_storage_rocksdb::{RocksDbStorage, SharedStorage};
 use hyperscale_topology::TopologyCoordinator;
 use hyperscale_types::{
-    Block, Bls12381G1PrivateKey, Bls12381G2Signature, CertifiedBlock, LocalTimestamp,
-    QuorumCertificate, ShardGroupId, TransactionStatus, TxHash, ValidatorId,
-    validator_bind_message,
+    Block, Bls12381G1PrivateKey, CertifiedBlock, LocalTimestamp, QuorumCertificate, ShardGroupId,
+    TransactionStatus, TxHash, ValidatorId,
 };
-use libp2p::PeerId;
 use libp2p::identity::Keypair;
 use quick_cache::sync::Cache as QuickCache;
 use thiserror::Error;
@@ -329,13 +327,11 @@ impl ProductionRunnerBuilder {
         let io_loop_signing_key =
             Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes");
 
-        // BLS signature binding our `ValidatorId` to our libp2p `PeerId`,
-        // consumed by the validator-bind protocol.
-        let local_peer_id = PeerId::from(ed25519_keypair.public());
+        // BLS signing key consumed by the validator-bind protocol. The bind
+        // service generates a fresh signature per session (challenge-response),
+        // so we hand it the key rather than a precomputed signature.
         let bind_signing_key =
-            Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes");
-        let local_bind_signature =
-            bind_signing_key.sign_v1(&validator_bind_message(&local_peer_id.to_bytes()));
+            Arc::new(Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes"));
 
         let (xb_timer_tx, xb_timer_rx) = unbounded();
         let (xb_callback_tx, xb_callback_rx) = unbounded();
@@ -369,7 +365,7 @@ impl ProductionRunnerBuilder {
             ed25519_keypair,
             validator_id,
             local_shard,
-            local_bind_signature,
+            bind_signing_key,
             initial_validator_keys,
         })?;
 
@@ -814,7 +810,7 @@ struct NetworkBuildArgs {
     ed25519_keypair: Keypair,
     validator_id: ValidatorId,
     local_shard: ShardGroupId,
-    local_bind_signature: Bls12381G2Signature,
+    bind_signing_key: Arc<Bls12381G1PrivateKey>,
     initial_validator_keys: Arc<ValidatorKeyMap>,
 }
 
@@ -832,7 +828,7 @@ fn build_network_stack(args: NetworkBuildArgs) -> Result<NetworkStack, RunnerErr
         args.validator_id,
         args.local_shard,
         registry.clone(),
-        args.local_bind_signature,
+        args.bind_signing_key,
         args.initial_validator_keys,
     )?;
 

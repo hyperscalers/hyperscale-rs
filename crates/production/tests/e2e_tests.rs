@@ -18,10 +18,7 @@ use hyperscale_network::{HandlerRegistry, ValidatorKeyMap};
 use hyperscale_network_libp2p::{Libp2pAdapter, Libp2pConfig};
 use hyperscale_production::ProductionRunner;
 use hyperscale_storage_rocksdb::RocksDbStorage;
-use hyperscale_types::{
-    Bls12381G2Signature, ShardGroupId, ValidatorId, generate_bls_keypair, validator_bind_message,
-};
-use libp2p::PeerId;
+use hyperscale_types::{Bls12381G1PrivateKey, ShardGroupId, ValidatorId, generate_bls_keypair};
 use libp2p::identity::Keypair;
 use serial_test::serial;
 use tempfile::TempDir;
@@ -43,18 +40,16 @@ const OVERALL_TEST_TIMEOUT: Duration = Duration::from_mins(1);
 // Network Tests (localhost QUIC)
 // ============================================================================
 
-/// Create a dummy bind signature + validator key map for tests that create adapters directly.
-fn test_bind_args(
-    keypair: &Keypair,
-    validator_id: ValidatorId,
-) -> (Bls12381G2Signature, Arc<ValidatorKeyMap>) {
+/// Create a dummy bind signing key + validator key map for tests that create
+/// adapters directly. Returns the BLS signing key (consumed by the validator-bind
+/// service to produce per-session signatures) plus the keymap that will verify
+/// signatures from this validator.
+fn test_bind_args(validator_id: ValidatorId) -> (Arc<Bls12381G1PrivateKey>, Arc<ValidatorKeyMap>) {
     let bls_key = generate_bls_keypair();
     let pubkey = bls_key.public_key();
-    let peer_id = PeerId::from(keypair.public());
-    let sig = bls_key.sign_v1(&validator_bind_message(&peer_id.to_bytes()));
     let mut keys = ValidatorKeyMap::new();
     keys.insert(validator_id, pubkey);
-    (sig, Arc::new(keys))
+    (Arc::new(bls_key), Arc::new(keys))
 }
 
 #[tokio::test]
@@ -73,7 +68,7 @@ async fn test_network_adapter_starts() {
         ..Default::default()
     };
 
-    let (bind_sig, topo) = test_bind_args(&keypair, validator_id);
+    let (bind_sig, topo) = test_bind_args(validator_id);
     let adapter = Libp2pAdapter::new(
         config,
         keypair,
@@ -103,7 +98,7 @@ async fn test_two_node_connection() {
 
     // Node 1
     let keypair1 = Keypair::generate_ed25519();
-    let (bind_sig1, topo1) = test_bind_args(&keypair1, ValidatorId(0));
+    let (bind_sig1, topo1) = test_bind_args(ValidatorId(0));
     let config1 = Libp2pConfig {
         listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()],
         bootstrap_peers: vec![],
@@ -129,7 +124,7 @@ async fn test_two_node_connection() {
 
     // Node 2 - bootstrap to node 1
     let keypair2 = Keypair::generate_ed25519();
-    let (bind_sig2, topo2) = test_bind_args(&keypair2, ValidatorId(1));
+    let (bind_sig2, topo2) = test_bind_args(ValidatorId(1));
     let config2 = Libp2pConfig {
         listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()],
         bootstrap_peers: vec![node1_addr.clone()],
@@ -180,7 +175,7 @@ async fn test_topic_subscription() {
     let _ = fmt().with_test_writer().try_init();
 
     let keypair = Keypair::generate_ed25519();
-    let (bind_sig, topo) = test_bind_args(&keypair, ValidatorId(0));
+    let (bind_sig, topo) = test_bind_args(ValidatorId(0));
     let config = Libp2pConfig {
         listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()],
         bootstrap_peers: vec![],
@@ -218,7 +213,7 @@ async fn test_validator_bind_success() {
 
     // Node 0
     let keypair0 = fixtures.ed25519_keypair(0);
-    let bind_sig0 = fixtures.bind_signature(0, &keypair0);
+    let bind_sig0 = fixtures.bind_signing_key(0);
     let config0 = Libp2pConfig {
         listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()],
         bootstrap_peers: vec![],
@@ -242,7 +237,7 @@ async fn test_validator_bind_success() {
 
     // Node 1 — bootstrap to node 0
     let keypair1 = fixtures.ed25519_keypair(1);
-    let bind_sig1 = fixtures.bind_signature(1, &keypair1);
+    let bind_sig1 = fixtures.bind_signing_key(1);
     let config1 = Libp2pConfig {
         listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()],
         bootstrap_peers: vec![node0_addr],
@@ -295,7 +290,7 @@ async fn test_validator_bind_rejects_wrong_key() {
 
     // Node 0 — legitimate
     let keypair0 = fixtures.ed25519_keypair(0);
-    let bind_sig0 = fixtures.bind_signature(0, &keypair0);
+    let bind_sig0 = fixtures.bind_signing_key(0);
     let config0 = Libp2pConfig {
         listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()],
         bootstrap_peers: vec![],
@@ -318,10 +313,10 @@ async fn test_validator_bind_rejects_wrong_key() {
     let node0_addr = addrs0[0].clone();
 
     // Node 1 — impersonator: signs with a BLS key that doesn't match the topology.
+    // The bind service will produce per-session sigs under this wrong key, and
+    // every verification in the peer's topology lookup will fail.
     let keypair1 = fixtures.ed25519_keypair(1);
-    let wrong_bls_key = generate_bls_keypair();
-    let peer1_id = PeerId::from(keypair1.public());
-    let wrong_sig = wrong_bls_key.sign_v1(&validator_bind_message(&peer1_id.to_bytes()));
+    let wrong_signing_key = Arc::new(generate_bls_keypair());
     let config1 = Libp2pConfig {
         listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()],
         bootstrap_peers: vec![node0_addr],
@@ -333,7 +328,7 @@ async fn test_validator_bind_rejects_wrong_key() {
         ValidatorId(1),
         ShardGroupId(0),
         Arc::new(HandlerRegistry::new()),
-        wrong_sig,
+        wrong_signing_key,
         fixtures.validator_key_map(1),
     )
     .unwrap();
@@ -374,7 +369,7 @@ async fn test_validator_bind_evicted_on_disconnect() {
 
     // Node 0
     let keypair0 = fixtures.ed25519_keypair(0);
-    let bind_sig0 = fixtures.bind_signature(0, &keypair0);
+    let bind_sig0 = fixtures.bind_signing_key(0);
     let config0 = Libp2pConfig {
         listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()],
         bootstrap_peers: vec![],
@@ -398,7 +393,7 @@ async fn test_validator_bind_evicted_on_disconnect() {
 
     // Node 1
     let keypair1 = fixtures.ed25519_keypair(1);
-    let bind_sig1 = fixtures.bind_signature(1, &keypair1);
+    let bind_sig1 = fixtures.bind_signing_key(1);
     let config1 = Libp2pConfig {
         listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()],
         bootstrap_peers: vec![node0_addr],

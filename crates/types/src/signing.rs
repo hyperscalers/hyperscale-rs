@@ -145,23 +145,36 @@ pub fn state_provisions_message(provisions: &Provisions) -> Vec<u8> {
 
 /// Domain tag for validator-bind protocol.
 ///
-/// Format: `VALIDATOR_BIND` || `peer_id_bytes`
+/// Format: `VALIDATOR_BIND` || `peer_id_bytes` || `nonce` (32 bytes)
 ///
 /// Signed by a validator's BLS key to cryptographically bind their
 /// consensus identity (`ValidatorId`) to their ephemeral libp2p `PeerId`.
 /// Verified by peers using the BLS public key from the topology.
+///
+/// The nonce is supplied by the *verifier* in a challenge-response exchange,
+/// so the signature is fresh per session and cannot be replayed against the
+/// same `(validator_id, peer_id)` pair across different sessions.
 pub const DOMAIN_VALIDATOR_BIND: &[u8] = b"VALIDATOR_BIND";
+
+/// Length of the bind-protocol nonce, in bytes.
+pub const VALIDATOR_BIND_NONCE_LEN: usize = 32;
 
 /// Build the signing message for the validator-bind protocol.
 ///
-/// The message binds a validator's BLS identity to their ephemeral libp2p `PeerId`.
-/// The Noise handshake proves `PeerId` ownership; this signature proves the BLS key
-/// holder authorised that `PeerId`.
+/// Binds a validator's BLS identity to their ephemeral libp2p `PeerId` over a
+/// per-session `nonce` chosen by the verifier. The Noise handshake proves
+/// `PeerId` ownership; this signature proves the BLS key holder authorised
+/// that `PeerId` *for this specific session*.
 #[must_use]
-pub fn validator_bind_message(peer_id_bytes: &[u8]) -> Vec<u8> {
-    let mut message = Vec::with_capacity(DOMAIN_VALIDATOR_BIND.len() + peer_id_bytes.len());
+pub fn validator_bind_message(
+    peer_id_bytes: &[u8],
+    nonce: &[u8; VALIDATOR_BIND_NONCE_LEN],
+) -> Vec<u8> {
+    let mut message =
+        Vec::with_capacity(DOMAIN_VALIDATOR_BIND.len() + peer_id_bytes.len() + nonce.len());
     message.extend_from_slice(DOMAIN_VALIDATOR_BIND);
     message.extend_from_slice(peer_id_bytes);
+    message.extend_from_slice(nonce);
     message
 }
 
@@ -332,21 +345,36 @@ mod tests {
     }
 
     #[test]
-    fn test_validator_bind_message_deterministic() {
+    fn test_validator_bind_message_deterministic_for_fixed_nonce() {
         let peer_id = b"12D3KooWDummyPeerId000000000000000";
+        let nonce = [7u8; VALIDATOR_BIND_NONCE_LEN];
 
-        let msg1 = validator_bind_message(peer_id);
-        let msg2 = validator_bind_message(peer_id);
+        let msg1 = validator_bind_message(peer_id, &nonce);
+        let msg2 = validator_bind_message(peer_id, &nonce);
 
         assert_eq!(msg1, msg2);
         assert!(msg1.starts_with(DOMAIN_VALIDATOR_BIND));
     }
 
     #[test]
+    fn test_validator_bind_message_differs_per_nonce() {
+        let peer_id = b"12D3KooWDummyPeerId000000000000000";
+        let nonce_a = [1u8; VALIDATOR_BIND_NONCE_LEN];
+        let nonce_b = [2u8; VALIDATOR_BIND_NONCE_LEN];
+
+        let msg_a = validator_bind_message(peer_id, &nonce_a);
+        let msg_b = validator_bind_message(peer_id, &nonce_b);
+
+        // Different nonces must produce different messages — replay protection.
+        assert_ne!(msg_a, msg_b);
+    }
+
+    #[test]
     fn test_validator_bind_differs_from_other_domains() {
         let bytes = b"some_bytes_here_for_testing_1234";
+        let nonce = [0u8; VALIDATOR_BIND_NONCE_LEN];
 
-        let bind_msg = validator_bind_message(bytes);
+        let bind_msg = validator_bind_message(bytes, &nonce);
         let block_msg = block_vote_message(
             ShardGroupId(0),
             BlockHeight::GENESIS,

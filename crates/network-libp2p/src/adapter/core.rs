@@ -8,7 +8,7 @@ use dashmap::DashMap;
 use futures::FutureExt;
 use hyperscale_metrics::{record_libp2p_bandwidth, record_network_message_sent};
 use hyperscale_network::{HandlerRegistry, Topic, ValidatorKeyMap};
-use hyperscale_types::{Bls12381G2Signature, MessageClass, ShardGroupId, ValidatorId};
+use hyperscale_types::{Bls12381G1PrivateKey, MessageClass, ShardGroupId, ValidatorId};
 use libp2p::connection_limits::{Behaviour as ConnectionLimitsBehaviour, ConnectionLimits};
 use libp2p::gossipsub::{
     Behaviour as GossipsubBehaviour, ConfigBuilder as GossipsubConfigBuilder, MessageAuthenticity,
@@ -78,7 +78,7 @@ impl Libp2pAdapter {
     /// * `validator_id` - Local validator ID
     /// * `shard` - Local shard assignment
     /// * `registry` - Shared handler registry for per-type message dispatch
-    /// * `local_bind_signature` - Pre-computed BLS signature over our `PeerId` (for validator-bind)
+    /// * `signing_key` - BLS signing key (used to produce a fresh bind signature per session)
     /// * `validator_keys` - Initial validator key map for bind verification
     ///
     /// # Returns
@@ -99,7 +99,7 @@ impl Libp2pAdapter {
         validator_id: ValidatorId,
         shard: ShardGroupId,
         registry: Arc<HandlerRegistry>,
-        local_bind_signature: Bls12381G2Signature,
+        signing_key: Arc<Bls12381G1PrivateKey>,
         validator_keys: Arc<ValidatorKeyMap>,
     ) -> Result<Arc<Self>, NetworkError> {
         let local_peer_id = Libp2pPeerId::from(keypair.public());
@@ -236,8 +236,9 @@ impl Libp2pAdapter {
         let bind_handle = spawn_validator_bind_service(
             stream_control.clone(),
             validator_peers.clone(),
+            signing_key,
             validator_id,
-            local_bind_signature,
+            local_peer_id,
             Arc::clone(&shared_keys),
         );
 

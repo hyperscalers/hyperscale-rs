@@ -8,8 +8,8 @@ use std::sync::Arc;
 use hyperscale_network::ValidatorKeyMap;
 use hyperscale_topology::TopologyCoordinator;
 use hyperscale_types::{
-    Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature, ShardGroupId, ValidatorId,
-    ValidatorInfo, ValidatorSet, VotePower, bls_keypair_from_seed, validator_bind_message,
+    Bls12381G1PrivateKey, Bls12381G1PublicKey, ShardGroupId, ValidatorId, ValidatorInfo,
+    ValidatorSet, VotePower, bls_keypair_from_seed,
 };
 use libp2p::identity::Keypair;
 use libp2p::identity::ed25519::{Keypair as Ed25519Keypair, SecretKey};
@@ -181,14 +181,10 @@ impl TestFixtures {
         (start..end).collect()
     }
 
-    /// Compute the BLS bind signature for a validator's `PeerId`.
-    ///
-    /// Used by the validator-bind protocol to prove identity.
-    pub fn bind_signature(&self, index: u32, keypair: &Keypair) -> Bls12381G2Signature {
-        let peer_id = PeerId::from(keypair.public());
-        let msg = validator_bind_message(&peer_id.to_bytes());
-        let signing_key = self.signing_key(index);
-        signing_key.sign_v1(&msg)
+    /// Get the BLS signing key for a validator, wrapped in `Arc` for the
+    /// validator-bind service.
+    pub fn bind_signing_key(&self, index: u32) -> Arc<Bls12381G1PrivateKey> {
+        Arc::new(self.signing_key(index))
     }
 
     /// Create a listen address using port 0 (OS-assigned).
