@@ -37,9 +37,9 @@ pub fn serve_remote_headers_request(
     }
 
     let bounded_count = req.count.min(MAX_REMOTE_HEADERS_PER_REQUEST);
-    let mut headers = Vec::with_capacity(usize::try_from(bounded_count.0).unwrap_or(0));
+    let mut headers = Vec::with_capacity(usize::try_from(bounded_count.inner()).unwrap_or(0));
 
-    for offset in 0..bounded_count.0 {
+    for offset in 0..bounded_count.inner() {
         let height = BlockHeight::new(req.from_height.inner().saturating_add(offset));
         let Some(header) = storage.get_committed_header(height) else {
             break;

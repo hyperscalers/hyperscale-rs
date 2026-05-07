@@ -13,7 +13,7 @@ use crate::response::GetRemoteHeadersResponse;
 
 /// Server-enforced upper bound on `count`. Sized to match the block-sync
 /// window so the two protocols share batch granularity.
-pub const MAX_REMOTE_HEADERS_PER_REQUEST: HeaderFetchCount = HeaderFetchCount(64);
+pub const MAX_REMOTE_HEADERS_PER_REQUEST: HeaderFetchCount = HeaderFetchCount::new(64);
 
 /// Request to fetch a contiguous range of committed block headers from a
 /// source shard.
@@ -57,7 +57,7 @@ mod tests {
         let request = GetRemoteHeadersRequest {
             source_shard: ShardGroupId(2),
             from_height: BlockHeight::new(42),
-            count: HeaderFetchCount(16),
+            count: HeaderFetchCount::new(16),
         };
 
         let encoded = basic_encode(&request).unwrap();

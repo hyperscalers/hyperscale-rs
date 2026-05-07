@@ -73,7 +73,7 @@ where
         // responder served headers from the wrong shard — the responder
         // gates this too, but defending in depth on the receiver lets us
         // surface peer misbehavior even if a future serve change drops it.
-        let upper_bound = from_height.inner().saturating_add(count.0);
+        let upper_bound = from_height.inner().saturating_add(count.inner());
         let mut delivered_heights = Vec::with_capacity(headers.len());
         for header in headers {
             let h = header.header.height;
@@ -81,7 +81,7 @@ where
                 tracing::warn!(
                     source_shard = source_shard.0,
                     requested_from = from_height.inner(),
-                    requested_count = count.0,
+                    requested_count = count.inner(),
                     height = h.inner(),
                     "remote-header sync: response contained out-of-range height — discarding"
                 );
@@ -111,7 +111,7 @@ where
             .handle(RemoteHeaderSyncInput::FetchSucceeded {
                 scope: source_shard,
                 from: from_height,
-                count: count.0,
+                count: count.inner(),
                 delivered_heights,
                 now: std::time::Instant::now(),
             });
@@ -132,7 +132,7 @@ where
             .handle(RemoteHeaderSyncInput::FetchFailed {
                 scope: source_shard,
                 from: from_height,
-                count: count.0,
+                count: count.inner(),
                 now: std::time::Instant::now(),
             });
         self.process_remote_header_sync_outputs(outputs);
@@ -160,7 +160,7 @@ where
                         .load()
                         .committee_for_shard(source_shard)
                         .to_vec();
-                    let typed_count = HeaderFetchCount(count);
+                    let typed_count = HeaderFetchCount::new(count);
                     let request = GetRemoteHeadersRequest {
                         source_shard,
                         from_height,

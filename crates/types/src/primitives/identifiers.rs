@@ -450,11 +450,30 @@ impl Display for InFlightCount {
 /// between the two `u64` fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, BasicSbor)]
 #[sbor(transparent)]
-pub struct HeaderFetchCount(pub u64);
+pub struct HeaderFetchCount(u64);
 
 impl HeaderFetchCount {
     /// Zero headers requested.
     pub const ZERO: Self = Self(0);
+
+    /// Construct a header-fetch count from a raw `u64`.
+    ///
+    /// Most call sites should use [`HeaderFetchCount::min`] against the
+    /// configured cap instead — this constructor is the escape hatch for
+    /// boundaries (FSM-internal counts, request-builder constants, tests)
+    /// where the count genuinely originates as a raw integer.
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Inner `u64`. Use sparingly — at boundaries (loop bounds, FSM input,
+    /// arithmetic against raw `BlockHeight` offsets, structured log fields)
+    /// only.
+    #[must_use]
+    pub const fn inner(self) -> u64 {
+        self.0
+    }
 
     /// Return the smaller of `self` and `cap`.
     #[must_use]
