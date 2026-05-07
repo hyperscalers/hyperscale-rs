@@ -6,6 +6,8 @@ use sbor::{
     NoCustomTypeKind, NoCustomValueKind, RustTypeId, TypeData, TypeKind, ValueKind,
 };
 
+use crate::BoundedBytes;
+
 /// Hard cap on validators a single bitfield may describe.
 ///
 /// Bounds attacker-controlled `num_validators` decoded from the wire so
@@ -14,13 +16,17 @@ use sbor::{
 /// realistic scaling without permitting OOM/DoS via crafted headers.
 pub const MAX_VALIDATORS: usize = 4096;
 
+/// Cap on the byte-vector length that backs a `SignerBitfield`. Tied to
+/// `MAX_VALIDATORS` — one bit per validator, packed eight per byte.
+const MAX_BITS_BYTES_LEN: usize = MAX_VALIDATORS.div_ceil(8);
+
 /// A compact bitfield representing which validators have signed.
 ///
 /// Used in `QuorumCertificate` and other aggregated structures to track
 /// which validators contributed to the aggregated signature.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignerBitfield {
-    bits: Vec<u8>,
+    bits: BoundedBytes<MAX_BITS_BYTES_LEN>,
     num_validators: usize,
 }
 
@@ -37,7 +43,7 @@ impl SignerBitfield {
         );
         let num_bytes = num_validators.div_ceil(8);
         Self {
-            bits: vec![0u8; num_bytes],
+            bits: BoundedBytes::from(vec![0u8; num_bytes]),
             num_validators,
         }
     }
@@ -46,7 +52,7 @@ impl SignerBitfield {
     #[must_use]
     pub const fn empty() -> Self {
         Self {
-            bits: Vec::new(),
+            bits: BoundedBytes::new(),
             num_validators: 0,
         }
     }
@@ -56,7 +62,7 @@ impl SignerBitfield {
         if index < self.num_validators {
             let byte_idx = index / 8;
             let bit_idx = index % 8;
-            self.bits[byte_idx] |= 1 << bit_idx;
+            self.bits.0[byte_idx] |= 1 << bit_idx;
         }
     }
 
@@ -65,7 +71,7 @@ impl SignerBitfield {
         if index < self.num_validators {
             let byte_idx = index / 8;
             let bit_idx = index % 8;
-            self.bits[byte_idx] &= !(1 << bit_idx);
+            self.bits.0[byte_idx] &= !(1 << bit_idx);
         }
     }
 
@@ -119,11 +125,12 @@ impl Default for SignerBitfield {
     }
 }
 
-// SBOR: encode as `(Vec<u8>, usize)` matching the prior derived layout, with
-// a manual decoder that rejects attacker-supplied (bits, num_validators) pairs
-// where the bit-length and byte-vector are inconsistent or where
-// num_validators exceeds MAX_VALIDATORS. Without these checks a peer can
-// supply num_validators = u64::MAX, hanging set_indices() and panicking set().
+// Manual SBOR impl — `BoundedBytes` covers the byte-length cap on `bits`,
+// but the cross-field validation (bits.len() must equal num_validators
+// div_ceil 8, num_validators must not exceed MAX_VALIDATORS, padding bits
+// in the trailing byte must be zero) doesn't fit a derive. Without these
+// checks a peer can supply num_validators = u64::MAX, hanging
+// set_indices() and panicking set().
 
 impl<E: Encoder<NoCustomValueKind>> Encode<NoCustomValueKind, E> for SignerBitfield {
     fn encode_value_kind(&self, encoder: &mut E) -> Result<(), EncodeError> {
@@ -151,7 +158,7 @@ impl<D: Decoder<NoCustomValueKind>> Decode<NoCustomValueKind, D> for SignerBitfi
                 actual: length,
             });
         }
-        let bits: Vec<u8> = decoder.decode()?;
+        let bits: BoundedBytes<MAX_BITS_BYTES_LEN> = decoder.decode()?;
         let num_validators: usize = decoder.decode()?;
         if num_validators > MAX_VALIDATORS {
             return Err(DecodeError::InvalidCustomValue);
