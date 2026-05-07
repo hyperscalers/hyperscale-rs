@@ -19,12 +19,35 @@
 //! `crates/types/tests/no_hash_collections_on_wire.rs`.
 
 use std::collections::BTreeSet;
-use std::ops::{Deref, DerefMut};
+use std::fmt::{self, Display, Formatter};
+use std::ops::Deref;
 
 use sbor::{
     Categorize, Decode, DecodeError, Decoder, Describe, Encode, EncodeError, Encoder,
     NoCustomTypeKind, NoCustomValueKind, RustTypeId, TypeData, ValueKind,
 };
+
+/// Returned by the `try_from_*` constructors on `Bounded*` types when an
+/// input exceeds the type's `MAX`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundedLengthError {
+    /// The compile-time maximum.
+    pub max: usize,
+    /// The actual length of the rejected input.
+    pub actual: usize,
+}
+
+impl Display for BoundedLengthError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "bounded value overflow: max {}, got {}",
+            self.max, self.actual
+        )
+    }
+}
+
+impl std::error::Error for BoundedLengthError {}
 
 /// Decode a `Vec<u8>` field while rejecting peer-claimed lengths above
 /// `max_len` before any allocation.
@@ -131,8 +154,17 @@ where
 // declaration without scrolling into a manual decode impl.
 //
 // All wrappers `Deref` to the inner collection so call-site reads
-// (`bytes.len()`, `vec.iter()`, etc.) work unchanged. Construction goes
-// through `From<Inner>` or the public tuple field.
+// (`bytes.len()`, `vec.iter()`, etc.) work unchanged. Wrappers do *not*
+// implement `DerefMut` — bound-violating mutations should require
+// reaching into the public tuple field on purpose, and the encode-time
+// check catches the bypass either way.
+//
+// Bound enforcement is layered: `From<Inner>` panics on overflow,
+// inherent `try_from_*` methods return `BoundedLengthError`, and
+// `Encode::encode_body` fails with `EncodeError::SizeTooLarge` if the
+// value somehow grew past `MAX` between construction and the wire (e.g.
+// via direct `.0` access). `Decode` rejects oversized peer payloads as
+// before.
 //
 // `Describe` forwards to the inner collection's schema, so wrappers are
 // schema-transparent: a `BoundedBytes<MAX>` field describes the same as
@@ -155,10 +187,33 @@ impl<const MAX: usize> BoundedBytes<MAX> {
     pub fn into_inner(self) -> Vec<u8> {
         self.0
     }
+
+    /// Fallible counterpart of `From<Vec<u8>>` — returns `Err` instead of
+    /// panicking when `value.len() > MAX`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BoundedLengthError`] when the input exceeds `MAX`.
+    pub fn try_from_vec(value: Vec<u8>) -> Result<Self, BoundedLengthError> {
+        if value.len() > MAX {
+            return Err(BoundedLengthError {
+                max: MAX,
+                actual: value.len(),
+            });
+        }
+        Ok(Self(value))
+    }
 }
 
 impl<const MAX: usize> From<Vec<u8>> for BoundedBytes<MAX> {
+    /// Panics if `value.len() > MAX`. Use [`Self::try_from_vec`] for
+    /// fallible construction from untrusted input.
     fn from(value: Vec<u8>) -> Self {
+        assert!(
+            value.len() <= MAX,
+            "BoundedBytes<{MAX}> overflow: got {} bytes",
+            value.len()
+        );
         Self(value)
     }
 }
@@ -167,12 +222,6 @@ impl<const MAX: usize> Deref for BoundedBytes<MAX> {
     type Target = Vec<u8>;
     fn deref(&self) -> &Vec<u8> {
         &self.0
-    }
-}
-
-impl<const MAX: usize> DerefMut for BoundedBytes<MAX> {
-    fn deref_mut(&mut self) -> &mut Vec<u8> {
-        &mut self.0
     }
 }
 
@@ -189,6 +238,12 @@ impl<E: Encoder<NoCustomValueKind>, const MAX: usize> Encode<NoCustomValueKind, 
         encoder.write_value_kind(ValueKind::Array)
     }
     fn encode_body(&self, encoder: &mut E) -> Result<(), EncodeError> {
+        if self.0.len() > MAX {
+            return Err(EncodeError::SizeTooLarge {
+                actual: self.0.len(),
+                max_allowed: MAX,
+            });
+        }
         self.0.encode_body(encoder)
     }
 }
@@ -237,10 +292,33 @@ impl<const MAX: usize> BoundedString<MAX> {
     pub fn into_inner(self) -> String {
         self.0
     }
+
+    /// Fallible counterpart of `From<String>` — returns `Err` when the
+    /// input exceeds `MAX` bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BoundedLengthError`] when `value.len() > MAX`.
+    pub fn try_from_string(value: String) -> Result<Self, BoundedLengthError> {
+        if value.len() > MAX {
+            return Err(BoundedLengthError {
+                max: MAX,
+                actual: value.len(),
+            });
+        }
+        Ok(Self(value))
+    }
 }
 
 impl<const MAX: usize> From<String> for BoundedString<MAX> {
+    /// Panics if `value.len() > MAX`. Use [`Self::try_from_string`] for
+    /// fallible construction from untrusted input.
     fn from(value: String) -> Self {
+        assert!(
+            value.len() <= MAX,
+            "BoundedString<{MAX}> overflow: got {} bytes",
+            value.len()
+        );
         Self(value)
     }
 }
@@ -265,6 +343,12 @@ impl<E: Encoder<NoCustomValueKind>, const MAX: usize> Encode<NoCustomValueKind, 
         encoder.write_value_kind(ValueKind::String)
     }
     fn encode_body(&self, encoder: &mut E) -> Result<(), EncodeError> {
+        if self.0.len() > MAX {
+            return Err(EncodeError::SizeTooLarge {
+                actual: self.0.len(),
+                max_allowed: MAX,
+            });
+        }
         self.0.encode_body(encoder)
     }
 }
@@ -313,10 +397,33 @@ impl<T, const MAX: usize> BoundedVec<T, MAX> {
     pub fn into_inner(self) -> Vec<T> {
         self.0
     }
+
+    /// Fallible counterpart of `From<Vec<T>>` — returns `Err` when the
+    /// input exceeds `MAX` elements.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BoundedLengthError`] when `value.len() > MAX`.
+    pub fn try_from_vec(value: Vec<T>) -> Result<Self, BoundedLengthError> {
+        if value.len() > MAX {
+            return Err(BoundedLengthError {
+                max: MAX,
+                actual: value.len(),
+            });
+        }
+        Ok(Self(value))
+    }
 }
 
 impl<T, const MAX: usize> From<Vec<T>> for BoundedVec<T, MAX> {
+    /// Panics if `value.len() > MAX`. Use [`Self::try_from_vec`] for
+    /// fallible construction from untrusted input.
     fn from(value: Vec<T>) -> Self {
+        assert!(
+            value.len() <= MAX,
+            "BoundedVec<_, {MAX}> overflow: got {} elements",
+            value.len()
+        );
         Self(value)
     }
 }
@@ -325,12 +432,6 @@ impl<T, const MAX: usize> Deref for BoundedVec<T, MAX> {
     type Target = Vec<T>;
     fn deref(&self) -> &Vec<T> {
         &self.0
-    }
-}
-
-impl<T, const MAX: usize> DerefMut for BoundedVec<T, MAX> {
-    fn deref_mut(&mut self) -> &mut Vec<T> {
-        &mut self.0
     }
 }
 
@@ -349,6 +450,12 @@ where
         encoder.write_value_kind(ValueKind::Array)
     }
     fn encode_body(&self, encoder: &mut E) -> Result<(), EncodeError> {
+        if self.0.len() > MAX {
+            return Err(EncodeError::SizeTooLarge {
+                actual: self.0.len(),
+                max_allowed: MAX,
+            });
+        }
         self.0.encode_body(encoder)
     }
 }
@@ -404,10 +511,33 @@ impl<T: Ord, const MAX: usize> BoundedBTreeSet<T, MAX> {
     pub fn into_inner(self) -> BTreeSet<T> {
         self.0
     }
+
+    /// Fallible counterpart of `From<BTreeSet<T>>` — returns `Err` when
+    /// the input exceeds `MAX` elements.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BoundedLengthError`] when `value.len() > MAX`.
+    pub fn try_from_btree_set(value: BTreeSet<T>) -> Result<Self, BoundedLengthError> {
+        if value.len() > MAX {
+            return Err(BoundedLengthError {
+                max: MAX,
+                actual: value.len(),
+            });
+        }
+        Ok(Self(value))
+    }
 }
 
 impl<T: Ord, const MAX: usize> From<BTreeSet<T>> for BoundedBTreeSet<T, MAX> {
+    /// Panics if `value.len() > MAX`. Use [`Self::try_from_btree_set`] for
+    /// fallible construction from untrusted input.
     fn from(value: BTreeSet<T>) -> Self {
+        assert!(
+            value.len() <= MAX,
+            "BoundedBTreeSet<_, {MAX}> overflow: got {} elements",
+            value.len()
+        );
         Self(value)
     }
 }
@@ -434,6 +564,12 @@ where
         encoder.write_value_kind(ValueKind::Array)
     }
     fn encode_body(&self, encoder: &mut E) -> Result<(), EncodeError> {
+        if self.0.len() > MAX {
+            return Err(EncodeError::SizeTooLarge {
+                actual: self.0.len(),
+                max_allowed: MAX,
+            });
+        }
         self.0.encode_body(encoder)
     }
 }
@@ -562,5 +698,110 @@ mod tests {
         let raw = vec![7u8; 16];
         let bounded = BoundedBytes::<32>(raw.clone());
         assert_eq!(basic_encode(&bounded).unwrap(), basic_encode(&raw).unwrap());
+    }
+
+    #[test]
+    #[should_panic(expected = "BoundedBytes<2> overflow")]
+    fn bounded_bytes_from_panics_on_overflow() {
+        let _ = BoundedBytes::<2>::from(vec![0u8; 3]);
+    }
+
+    #[test]
+    fn bounded_bytes_try_from_vec_returns_err_on_overflow() {
+        let err = BoundedBytes::<2>::try_from_vec(vec![0u8; 5]).unwrap_err();
+        assert_eq!(err, BoundedLengthError { max: 2, actual: 5 });
+    }
+
+    /// Bypasses construction by reaching into the public tuple field, then
+    /// asserts that `Encode` still refuses to ship oversized bytes.
+    #[test]
+    fn bounded_bytes_encode_rejects_oversize_when_field_bypassed() {
+        let smuggled = BoundedBytes::<2>(vec![0u8; 5]);
+        let err = basic_encode(&smuggled).unwrap_err();
+        assert!(matches!(
+            err,
+            EncodeError::SizeTooLarge {
+                actual: 5,
+                max_allowed: 2,
+            }
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "BoundedString<2> overflow")]
+    fn bounded_string_from_panics_on_overflow() {
+        let _ = BoundedString::<2>::from("abc".to_string());
+    }
+
+    #[test]
+    fn bounded_string_try_from_string_returns_err_on_overflow() {
+        let err = BoundedString::<2>::try_from_string("abcd".to_string()).unwrap_err();
+        assert_eq!(err, BoundedLengthError { max: 2, actual: 4 });
+    }
+
+    #[test]
+    fn bounded_string_encode_rejects_oversize_when_field_bypassed() {
+        let smuggled = BoundedString::<2>("abcd".to_string());
+        let err = basic_encode(&smuggled).unwrap_err();
+        assert!(matches!(
+            err,
+            EncodeError::SizeTooLarge {
+                actual: 4,
+                max_allowed: 2,
+            }
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "BoundedVec<_, 2> overflow")]
+    fn bounded_vec_from_panics_on_overflow() {
+        let _ = BoundedVec::<u32, 2>::from(vec![1u32, 2, 3]);
+    }
+
+    #[test]
+    fn bounded_vec_try_from_vec_returns_err_on_overflow() {
+        let err = BoundedVec::<u32, 2>::try_from_vec(vec![1u32, 2, 3, 4]).unwrap_err();
+        assert_eq!(err, BoundedLengthError { max: 2, actual: 4 });
+    }
+
+    #[test]
+    fn bounded_vec_encode_rejects_oversize_when_field_bypassed() {
+        let smuggled = BoundedVec::<u32, 2>(vec![1u32, 2, 3, 4]);
+        let err = basic_encode(&smuggled).unwrap_err();
+        assert!(matches!(
+            err,
+            EncodeError::SizeTooLarge {
+                actual: 4,
+                max_allowed: 2,
+            }
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "BoundedBTreeSet<_, 2> overflow")]
+    fn bounded_btree_set_from_panics_on_overflow() {
+        let huge: BTreeSet<u16> = (0..3).collect();
+        let _ = BoundedBTreeSet::<u16, 2>::from(huge);
+    }
+
+    #[test]
+    fn bounded_btree_set_try_from_btree_set_returns_err_on_overflow() {
+        let huge: BTreeSet<u16> = (0..5).collect();
+        let err = BoundedBTreeSet::<u16, 2>::try_from_btree_set(huge).unwrap_err();
+        assert_eq!(err, BoundedLengthError { max: 2, actual: 5 });
+    }
+
+    #[test]
+    fn bounded_btree_set_encode_rejects_oversize_when_field_bypassed() {
+        let huge: BTreeSet<u16> = (0..5).collect();
+        let smuggled = BoundedBTreeSet::<u16, 2>(huge);
+        let err = basic_encode(&smuggled).unwrap_err();
+        assert!(matches!(
+            err,
+            EncodeError::SizeTooLarge {
+                actual: 5,
+                max_allowed: 2,
+            }
+        ));
     }
 }

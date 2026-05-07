@@ -86,7 +86,9 @@ pub use receipt::consensus::{ConsensusReceipt, FAILED_RECEIPT_HASH};
 pub use receipt::global::GlobalReceipt;
 pub use receipt::metadata::{ApplicationEvent, EventData, ExecutionMetadata, FeeSummary, LogLevel};
 pub use receipt::stored::StoredReceipt;
-pub use sbor_codec::{BoundedBTreeSet, BoundedBytes, BoundedString, BoundedVec};
+pub use sbor_codec::{
+    BoundedBTreeSet, BoundedBytes, BoundedLengthError, BoundedString, BoundedVec,
+};
 pub use signing::{
     DOMAIN_BLOCK_HEADER, DOMAIN_BLOCK_VOTE, DOMAIN_COMMITTED_BLOCK_HEADER, DOMAIN_EXEC_CERT_BATCH,
     DOMAIN_EXEC_VOTE, DOMAIN_EXEC_VOTE_BATCH, DOMAIN_STATE_PROVISION_BATCH, DOMAIN_VALIDATOR_BIND,
