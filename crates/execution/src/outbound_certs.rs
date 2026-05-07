@@ -218,11 +218,11 @@ mod tests {
     }
 
     fn wave(local: u64, h: u64, remote: &[u64]) -> WaveId {
-        WaveId {
-            shard_group_id: ShardGroupId::new(local),
-            block_height: BlockHeight::new(h),
-            remote_shards: remote.iter().copied().map(ShardGroupId::new).collect(),
-        }
+        WaveId::new(
+            ShardGroupId::new(local),
+            BlockHeight::new(h),
+            remote.iter().copied().map(ShardGroupId::new).collect(),
+        )
     }
 
     fn cert(wave_id: WaveId) -> Arc<ExecutionCertificate> {

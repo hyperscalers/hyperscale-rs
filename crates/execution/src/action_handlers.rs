@@ -510,19 +510,15 @@ mod tests {
     }
 
     fn wave_id(height: u64) -> WaveId {
-        WaveId {
-            shard_group_id: shard(),
-            block_height: BlockHeight::new(height),
-            remote_shards: BTreeSet::new(),
-        }
+        WaveId::new(shard(), BlockHeight::new(height), BTreeSet::new())
     }
 
     fn cross_shard_wave_id(height: u64, remotes: &[ShardGroupId]) -> WaveId {
-        WaveId {
-            shard_group_id: shard(),
-            block_height: BlockHeight::new(height),
-            remote_shards: remotes.iter().copied().collect(),
-        }
+        WaveId::new(
+            shard(),
+            BlockHeight::new(height),
+            remotes.iter().copied().collect(),
+        )
     }
 
     fn keypair(seed: u8) -> Bls12381G1PrivateKey {

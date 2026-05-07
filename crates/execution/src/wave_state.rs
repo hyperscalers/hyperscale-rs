@@ -881,7 +881,7 @@ mod tests {
         let ec_wave_id = WaveId::new(
             ec_shard,
             wave_id.block_height,
-            wave_id.remote_shards.clone(),
+            wave_id.remote_shards.0.clone(),
         );
         Arc::new(ExecutionCertificate::new(
             ec_wave_id,
@@ -1319,7 +1319,7 @@ mod tests {
         let ec_wave_id = WaveId::new(
             ShardGroupId::new(1),
             w.wave_id().block_height,
-            w.wave_id().remote_shards.clone(),
+            w.wave_id().remote_shards.0.clone(),
         );
         let ec_remote = Arc::new(ExecutionCertificate::new(
             ec_wave_id,

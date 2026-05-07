@@ -309,11 +309,11 @@ mod tests {
     use super::*;
 
     fn wave(height: u64) -> WaveId {
-        WaveId {
-            shard_group_id: ShardGroupId::new(1),
-            block_height: BlockHeight::new(height),
-            remote_shards: std::iter::once(ShardGroupId::new(0)).collect(),
-        }
+        WaveId::new(
+            ShardGroupId::new(1),
+            BlockHeight::new(height),
+            std::iter::once(ShardGroupId::new(0)).collect(),
+        )
     }
 
     fn ms(value: u64) -> WeightedTimestamp {

@@ -45,11 +45,7 @@ pub fn compute_waves(
 
     remote_shard_sets
         .into_iter()
-        .map(|remote_shards| WaveId {
-            shard_group_id: local_shard,
-            block_height,
-            remote_shards,
-        })
+        .map(|remote_shards| WaveId::new(local_shard, block_height, remote_shards))
         .collect()
 }
 

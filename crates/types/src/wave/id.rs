@@ -4,14 +4,9 @@ use std::collections::BTreeSet;
 use std::fmt::{self, Display};
 
 use sbor::prelude::*;
-use sbor::{
-    Categorize, Decode, DecodeError, Decoder, Describe, Encode, EncodeError, Encoder,
-    NoCustomTypeKind, NoCustomValueKind, RustTypeId, TypeData, TypeKind, ValueKind,
-};
 
 use crate::primitives::bloom::BloomKey;
-use crate::sbor_codec::decode_bounded_btree_set;
-use crate::{BlockHeight, Hash, ShardGroupId};
+use crate::{BlockHeight, BoundedBTreeSet, Hash, ShardGroupId};
 
 /// Cap on `WaveId.remote_shards` length at decode time.
 ///
@@ -33,20 +28,24 @@ pub const MAX_REMOTE_SHARDS_PER_WAVE: usize = 1024;
 /// dependency sets belong to the same wave and can be voted on together.
 ///
 /// A wave with empty `remote_shards` represents single-shard transactions.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, BasicSbor)]
 pub struct WaveId {
     /// The shard that committed the block containing this wave's transactions.
     pub shard_group_id: ShardGroupId,
     /// Block height at which the wave's transactions were committed.
     pub block_height: BlockHeight,
     /// Set of remote shards the transactions depend on (empty for single-shard waves).
-    pub remote_shards: BTreeSet<ShardGroupId>,
+    pub remote_shards: BoundedBTreeSet<ShardGroupId, MAX_REMOTE_SHARDS_PER_WAVE>,
 }
 
 impl WaveId {
     /// Create a new `WaveId`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `remote_shards.len() > MAX_REMOTE_SHARDS_PER_WAVE`.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         shard_group_id: ShardGroupId,
         block_height: BlockHeight,
         remote_shards: BTreeSet<ShardGroupId>,
@@ -54,7 +53,7 @@ impl WaveId {
         Self {
             shard_group_id,
             block_height,
-            remote_shards,
+            remote_shards: remote_shards.into(),
         }
     }
 
@@ -68,59 +67,6 @@ impl WaveId {
     #[must_use]
     pub fn dependency_count(&self) -> usize {
         self.remote_shards.len()
-    }
-}
-
-impl<E: Encoder<NoCustomValueKind>> Encode<NoCustomValueKind, E> for WaveId {
-    fn encode_value_kind(&self, encoder: &mut E) -> Result<(), EncodeError> {
-        encoder.write_value_kind(ValueKind::Tuple)
-    }
-
-    fn encode_body(&self, encoder: &mut E) -> Result<(), EncodeError> {
-        encoder.write_size(3)?;
-        encoder.encode(&self.shard_group_id)?;
-        encoder.encode(&self.block_height)?;
-        encoder.encode(&self.remote_shards)?;
-        Ok(())
-    }
-}
-
-impl<D: Decoder<NoCustomValueKind>> Decode<NoCustomValueKind, D> for WaveId {
-    fn decode_body_with_value_kind(
-        decoder: &mut D,
-        value_kind: ValueKind<NoCustomValueKind>,
-    ) -> Result<Self, DecodeError> {
-        decoder.check_preloaded_value_kind(value_kind, ValueKind::Tuple)?;
-        let length = decoder.read_size()?;
-        if length != 3 {
-            return Err(DecodeError::UnexpectedSize {
-                expected: 3,
-                actual: length,
-            });
-        }
-        let shard_group_id: ShardGroupId = decoder.decode()?;
-        let block_height: BlockHeight = decoder.decode()?;
-        let remote_shards =
-            decode_bounded_btree_set::<_, ShardGroupId>(decoder, MAX_REMOTE_SHARDS_PER_WAVE)?;
-        Ok(Self {
-            shard_group_id,
-            block_height,
-            remote_shards,
-        })
-    }
-}
-
-impl Categorize<NoCustomValueKind> for WaveId {
-    fn value_kind() -> ValueKind<NoCustomValueKind> {
-        ValueKind::Tuple
-    }
-}
-
-impl Describe<NoCustomTypeKind> for WaveId {
-    const TYPE_ID: RustTypeId = RustTypeId::novel_with_code("WaveId", &[], &[]);
-
-    fn type_data() -> TypeData<NoCustomTypeKind, RustTypeId> {
-        TypeData::unnamed(TypeKind::Any)
     }
 }
 
@@ -165,20 +111,20 @@ impl Display for WaveId {
 #[cfg(test)]
 mod tests {
     use sbor::{
-        BASIC_SBOR_V1_MAX_DEPTH, BASIC_SBOR_V1_PAYLOAD_PREFIX, VecEncoder, basic_decode,
-        basic_encode,
+        BASIC_SBOR_V1_MAX_DEPTH, BASIC_SBOR_V1_PAYLOAD_PREFIX, Categorize as _, DecodeError,
+        Encoder as _, NoCustomValueKind, ValueKind, VecEncoder, basic_decode, basic_encode,
     };
 
     use super::*;
 
     fn sample_wave_id() -> WaveId {
-        WaveId {
-            shard_group_id: ShardGroupId::new(3),
-            block_height: BlockHeight::new(42),
-            remote_shards: [ShardGroupId::new(1), ShardGroupId::new(7)]
+        WaveId::new(
+            ShardGroupId::new(3),
+            BlockHeight::new(42),
+            [ShardGroupId::new(1), ShardGroupId::new(7)]
                 .into_iter()
                 .collect(),
-        }
+        )
     }
 
     #[test]
@@ -191,11 +137,7 @@ mod tests {
 
     #[test]
     fn sbor_roundtrip_empty_remote_shards() {
-        let wave = WaveId {
-            shard_group_id: ShardGroupId::new(0),
-            block_height: BlockHeight::new(1),
-            remote_shards: BTreeSet::new(),
-        };
+        let wave = WaveId::new(ShardGroupId::new(0), BlockHeight::new(1), BTreeSet::new());
         let bytes = basic_encode(&wave).unwrap();
         let decoded: WaveId = basic_decode(&bytes).unwrap();
         assert_eq!(decoded, wave);
@@ -226,8 +168,7 @@ mod tests {
         ));
     }
 
-    /// SBOR rejects duplicate `BTreeSet` elements at decode time; preserve
-    /// that behavior across the manual impl.
+    /// SBOR rejects duplicate `BTreeSet` elements at decode time.
     #[test]
     fn decode_rejects_duplicate_remote_shards() {
         let mut buf = Vec::with_capacity(64);

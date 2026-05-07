@@ -259,11 +259,7 @@ mod tests {
     }
 
     fn wave(height: u64) -> WaveId {
-        WaveId {
-            shard_group_id: shard(),
-            block_height: BlockHeight::new(height),
-            remote_shards: BTreeSet::new(),
-        }
+        WaveId::new(shard(), BlockHeight::new(height), BTreeSet::new())
     }
 
     fn ms(value: u64) -> WeightedTimestamp {

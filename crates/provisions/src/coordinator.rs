@@ -1313,11 +1313,7 @@ mod tests {
         // `provision_targets()` on the resulting header yields the input set.
         let waves: Vec<WaveId> = provision_targets
             .into_iter()
-            .map(|s| WaveId {
-                shard_group_id: shard,
-                block_height: height,
-                remote_shards: std::collections::BTreeSet::from([s]),
-            })
+            .map(|s| WaveId::new(shard, height, std::collections::BTreeSet::from([s])))
             .collect();
         let header = BlockHeader {
             shard_group_id: shard,

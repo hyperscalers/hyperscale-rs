@@ -85,11 +85,11 @@ mod tests {
     }
 
     fn make_wave_id(shard: u64, height: BlockHeight, remote: &[u64]) -> WaveId {
-        WaveId {
-            shard_group_id: ShardGroupId::new(shard),
-            block_height: height,
-            remote_shards: remote.iter().map(|&s| ShardGroupId::new(s)).collect(),
-        }
+        WaveId::new(
+            ShardGroupId::new(shard),
+            height,
+            remote.iter().map(|&s| ShardGroupId::new(s)).collect(),
+        )
     }
 
     #[test]

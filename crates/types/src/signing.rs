@@ -224,7 +224,7 @@ pub fn exec_vote_message(
             .unwrap_or(u32::MAX)
             .to_le_bytes(),
     );
-    for shard in &wave_id.remote_shards {
+    for shard in wave_id.remote_shards.iter() {
         message.extend_from_slice(&shard.to_le_bytes());
     }
     message.extend_from_slice(&shard_group.to_le_bytes());

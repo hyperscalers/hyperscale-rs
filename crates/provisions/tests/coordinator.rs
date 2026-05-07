@@ -53,11 +53,11 @@ fn make_remote_header_targeting(
     height: BlockHeight,
     local_shard: ShardGroupId,
 ) -> Arc<CommittedBlockHeader> {
-    let waves = vec![WaveId {
-        shard_group_id: source_shard,
-        block_height: height,
-        remote_shards: std::collections::BTreeSet::from([local_shard]),
-    }];
+    let waves = vec![WaveId::new(
+        source_shard,
+        height,
+        std::collections::BTreeSet::from([local_shard]),
+    )];
     let header = BlockHeader {
         shard_group_id: source_shard,
         height,
