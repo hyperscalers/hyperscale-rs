@@ -2,15 +2,12 @@
 
 use std::collections::HashSet;
 use std::fmt::{self, Debug, Formatter};
+use std::sync::OnceLock;
 
 use sbor::prelude::*;
-use sbor::{
-    Categorize, Decode, DecodeError, Decoder, Describe, Encode, EncodeError, Encoder,
-    NoCustomTypeKind, NoCustomValueKind, RustTypeId, TypeData, TypeKind, ValueKind,
-};
 
 use crate::{
-    BlockHeight, Hash, MAX_TXS_PER_BLOCK, MerkleInclusionProof, NodeId, ProvisionHash,
+    BlockHeight, BoundedVec, Hash, MAX_TXS_PER_BLOCK, MerkleInclusionProof, NodeId, ProvisionHash,
     RETENTION_HORIZON, ShardGroupId, StateEntry, TxEntries, TxHash, WeightedTimestamp,
 };
 
@@ -26,7 +23,9 @@ use crate::{
 /// The QC and `state_root` are obtained from `CommittedBlockHeader` received
 /// via gossip — they don't travel with the provisions.
 ///
-/// The content hash is computed eagerly at construction and on deserialization.
+/// The content hash is computed lazily on first call to [`Self::hash`] and
+/// cached for the lifetime of the value.
+#[derive(BasicSbor)]
 pub struct Provisions {
     /// Source shard that committed this block.
     pub source_shard: ShardGroupId,
@@ -41,16 +40,18 @@ pub struct Provisions {
     pub proof: MerkleInclusionProof,
 
     /// Per-transaction entries.
-    pub transactions: Vec<TxEntries>,
+    pub transactions: BoundedVec<TxEntries, MAX_TXS_PER_BLOCK>,
 
-    /// Cached content hash (blake3 over SBOR-encoded content fields).
-    hash: ProvisionHash,
+    /// Lazily-computed content hash (blake3 over SBOR-encoded content fields).
+    /// Populated on first [`Self::hash`] call; not on the wire.
+    #[sbor(skip)]
+    hash: OnceLock<ProvisionHash>,
 }
 
 impl Debug for Provisions {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("Provision")
-            .field("hash", &self.hash)
+            .field("hash", &self.hash())
             .field("source_shard", &self.source_shard)
             .field("target_shard", &self.target_shard)
             .field("block_height", &self.block_height)
@@ -61,109 +62,36 @@ impl Debug for Provisions {
 
 impl Clone for Provisions {
     fn clone(&self) -> Self {
+        let cloned_hash = OnceLock::new();
+        if let Some(h) = self.hash.get() {
+            let _ = cloned_hash.set(*h);
+        }
         Self {
             source_shard: self.source_shard,
             target_shard: self.target_shard,
             block_height: self.block_height,
             proof: self.proof.clone(),
             transactions: self.transactions.clone(),
-            hash: self.hash,
+            hash: cloned_hash,
         }
     }
 }
 
 impl PartialEq for Provisions {
     fn eq(&self, other: &Self) -> bool {
-        self.hash == other.hash
+        self.hash() == other.hash()
     }
 }
 
 impl Eq for Provisions {}
 
-// Manual SBOR: the cached hash is derived, not serialized.
-impl<E: Encoder<NoCustomValueKind>> Encode<NoCustomValueKind, E> for Provisions {
-    fn encode_value_kind(&self, encoder: &mut E) -> Result<(), EncodeError> {
-        encoder.write_value_kind(ValueKind::Tuple)
-    }
-
-    fn encode_body(&self, encoder: &mut E) -> Result<(), EncodeError> {
-        encoder.write_size(5)?;
-        encoder.encode(&self.source_shard)?;
-        encoder.encode(&self.target_shard)?;
-        encoder.encode(&self.block_height)?;
-        encoder.encode(&self.proof)?;
-        encoder.encode(&self.transactions)?;
-        Ok(())
-    }
-}
-
-impl<D: Decoder<NoCustomValueKind>> Decode<NoCustomValueKind, D> for Provisions {
-    fn decode_body_with_value_kind(
-        decoder: &mut D,
-        value_kind: ValueKind<NoCustomValueKind>,
-    ) -> Result<Self, DecodeError> {
-        decoder.check_preloaded_value_kind(value_kind, ValueKind::Tuple)?;
-        let length = decoder.read_size()?;
-        if length != 5 {
-            return Err(DecodeError::UnexpectedSize {
-                expected: 5,
-                actual: length,
-            });
-        }
-        let source_shard: ShardGroupId = decoder.decode()?;
-        let target_shard: ShardGroupId = decoder.decode()?;
-        let block_height: BlockHeight = decoder.decode()?;
-        let proof: MerkleInclusionProof = decoder.decode()?;
-        // Bounded inline rather than via SBOR's default Vec decoder, which
-        // would honor a peer-supplied `len` up to the entire 10 MB libp2p
-        // message budget.
-        decoder.read_and_check_value_kind(ValueKind::Array)?;
-        let element_kind = decoder.read_and_check_value_kind(TxEntries::value_kind())?;
-        let transactions_len = decoder.read_size()?;
-        if transactions_len > MAX_TXS_PER_BLOCK {
-            return Err(DecodeError::UnexpectedSize {
-                expected: MAX_TXS_PER_BLOCK,
-                actual: transactions_len,
-            });
-        }
-        let mut transactions = Vec::with_capacity(transactions_len.min(1024));
-        for _ in 0..transactions_len {
-            transactions.push(decoder.decode_deeper_body_with_value_kind(element_kind)?);
-        }
-        let hash = Self::compute_hash(
-            source_shard,
-            target_shard,
-            block_height,
-            &proof,
-            &transactions,
-        );
-        Ok(Self {
-            source_shard,
-            target_shard,
-            block_height,
-            proof,
-            transactions,
-            hash,
-        })
-    }
-}
-
-impl Categorize<NoCustomValueKind> for Provisions {
-    fn value_kind() -> ValueKind<NoCustomValueKind> {
-        ValueKind::Tuple
-    }
-}
-
-impl Describe<NoCustomTypeKind> for Provisions {
-    const TYPE_ID: RustTypeId = RustTypeId::novel_with_code("Provision", &[], &[]);
-
-    fn type_data() -> TypeData<NoCustomTypeKind, RustTypeId> {
-        TypeData::unnamed(TypeKind::Any)
-    }
-}
-
 impl Provisions {
-    /// Create a new provisions, computing the content hash eagerly.
+    /// Create a new provisions. The content hash is computed lazily on
+    /// first call to [`Self::hash`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `transactions.len() > MAX_TXS_PER_BLOCK`.
     #[must_use]
     pub fn new(
         source_shard: ShardGroupId,
@@ -172,27 +100,28 @@ impl Provisions {
         proof: MerkleInclusionProof,
         transactions: Vec<TxEntries>,
     ) -> Self {
-        let hash = Self::compute_hash(
-            source_shard,
-            target_shard,
-            block_height,
-            &proof,
-            &transactions,
-        );
         Self {
             source_shard,
             target_shard,
             block_height,
             proof,
-            transactions,
-            hash,
+            transactions: transactions.into(),
+            hash: OnceLock::new(),
         }
     }
 
-    /// Content hash (precomputed at construction / deserialization).
+    /// Content hash, computed on first call and cached.
     #[must_use]
-    pub const fn hash(&self) -> ProvisionHash {
-        self.hash
+    pub fn hash(&self) -> ProvisionHash {
+        *self.hash.get_or_init(|| {
+            Self::compute_hash(
+                self.source_shard,
+                self.target_shard,
+                self.block_height,
+                &self.proof,
+                &self.transactions,
+            )
+        })
     }
 
     /// Deadline past which these provisions are provably useless on every
@@ -284,6 +213,8 @@ impl Provisions {
 
 #[cfg(test)]
 mod tests {
+    use sbor::{Categorize as _, DecodeError, Encoder as _, NoCustomValueKind, ValueKind};
+
     use super::*;
 
     fn test_entry(seed: u8) -> StateEntry {
@@ -378,7 +309,8 @@ mod tests {
                 vec![entry, test_entry(2)],
                 vec![],
             ),
-        ];
+        ]
+        .into();
 
         let deduped = provisions.all_entries_deduped();
         assert_eq!(deduped.len(), 2);

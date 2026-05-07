@@ -142,7 +142,7 @@ impl ProvisioningTracker {
     ) -> Vec<TxHash> {
         let mut touched = Vec::with_capacity(provisions.transactions.len());
         let source_shard = provisions.source_shard;
-        for tx_entry in &provisions.transactions {
+        for tx_entry in provisions.transactions.iter() {
             let tx_hash = tx_entry.tx_hash;
             let provision = StateProvision {
                 transaction_hash: tx_hash,
