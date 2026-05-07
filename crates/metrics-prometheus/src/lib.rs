@@ -1177,10 +1177,6 @@ impl MetricsRecorder for PrometheusRecorder {
             .set(m.bft_vote_sets as f64);
         self.metrics
             .memory_bft
-            .with_label_values(&["certified_blocks"])
-            .set(m.bft_certified_blocks as f64);
-        self.metrics
-            .memory_bft
             .with_label_values(&["pending_commits"])
             .set(m.bft_pending_commits as f64);
         self.metrics

@@ -44,7 +44,6 @@ fn memory_stats_reports_all_zeros_for_fresh_coordinator() {
     let BftMemoryStats {
         pending_blocks,
         vote_sets,
-        certified_blocks,
         pending_commits,
         pending_commits_awaiting_data,
         voted_heights,
@@ -61,7 +60,6 @@ fn memory_stats_reports_all_zeros_for_fresh_coordinator() {
 
     assert_eq!(pending_blocks, 0);
     assert_eq!(vote_sets, 0);
-    assert_eq!(certified_blocks, 0);
     assert_eq!(pending_commits, 0);
     assert_eq!(pending_commits_awaiting_data, 0);
     assert_eq!(voted_heights, 0);

@@ -60,8 +60,6 @@ pub struct MemoryMetrics {
     pub bft_pending_blocks: usize,
     /// Vote sets per block (unverified + verified votes).
     pub bft_vote_sets: usize,
-    /// Blocks with QC but not yet committed.
-    pub bft_certified_blocks: usize,
     /// Out-of-order commits buffered.
     pub bft_pending_commits: usize,
     /// Commits waiting for block data (header/txs).

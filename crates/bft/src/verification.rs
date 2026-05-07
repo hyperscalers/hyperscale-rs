@@ -1177,7 +1177,6 @@ mod tests {
         committed_height: BlockHeight,
         committed_hash: BlockHash,
         latest_qc: Option<&'a QuorumCertificate>,
-        certified: &'a HashMap<BlockHash, Block>,
         pending: &'a HashMap<BlockHash, PendingBlock>,
     ) -> ChainView<'a> {
         ChainView {
@@ -1187,7 +1186,6 @@ mod tests {
             committed_state_root: StateRoot::ZERO,
             latest_qc,
             genesis: None,
-            certified,
             pending,
         }
     }
@@ -1203,15 +1201,8 @@ mod tests {
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
         let block = block_with(BlockHeight::new(1), BlockHash::ZERO, 0, vec![]);
         let block_hash = block.hash();
-        let certified = HashMap::new();
         let pending = HashMap::new();
-        let chain = chain_view(
-            BlockHeight::GENESIS,
-            BlockHash::ZERO,
-            None,
-            &certified,
-            &pending,
-        );
+        let chain = chain_view(BlockHeight::GENESIS, BlockHash::ZERO, None, &pending);
 
         let out = vp.classify_vote_in_flight(&chain, block_hash, &block, true);
         assert!(matches!(out, InFlightCheck::SkipVote));
@@ -1235,15 +1226,8 @@ mod tests {
             provisions: Arc::new(Vec::new()),
         };
         let block_hash = block.hash();
-        let certified = HashMap::new();
         let pending = HashMap::new();
-        let chain = chain_view(
-            BlockHeight::new(3),
-            BlockHash::ZERO,
-            None,
-            &certified,
-            &pending,
-        );
+        let chain = chain_view(BlockHeight::new(3), BlockHash::ZERO, None, &pending);
 
         let out = vp.classify_vote_in_flight(&chain, block_hash, &block, false);
         assert!(matches!(out, InFlightCheck::SkipVote));
@@ -1254,15 +1238,8 @@ mod tests {
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
         let block = block_with(BlockHeight::new(1), BlockHash::ZERO, 0, vec![]);
         let block_hash = block.hash();
-        let certified = HashMap::new();
         let pending = HashMap::new();
-        let chain = chain_view(
-            BlockHeight::GENESIS,
-            BlockHash::ZERO,
-            None,
-            &certified,
-            &pending,
-        );
+        let chain = chain_view(BlockHeight::GENESIS, BlockHash::ZERO, None, &pending);
 
         let out = vp.classify_vote_in_flight(&chain, block_hash, &block, false);
         assert!(matches!(out, InFlightCheck::Proceed));
@@ -1275,15 +1252,8 @@ mod tests {
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
         let block = block_with(BlockHeight::new(1), BlockHash::ZERO, 5, vec![]);
         let block_hash = block.hash();
-        let certified = HashMap::new();
         let pending = HashMap::new();
-        let chain = chain_view(
-            BlockHeight::GENESIS,
-            BlockHash::ZERO,
-            None,
-            &certified,
-            &pending,
-        );
+        let chain = chain_view(BlockHeight::GENESIS, BlockHash::ZERO, None, &pending);
 
         let out = vp.classify_vote_in_flight(&chain, block_hash, &block, false);
         assert!(matches!(out, InFlightCheck::Abort));
@@ -1294,15 +1264,8 @@ mod tests {
     #[test]
     fn drain_ready_state_root_verifications_returns_empty_when_nothing_ready() {
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
-        let certified = HashMap::new();
         let pending = HashMap::new();
-        let chain = chain_view(
-            BlockHeight::GENESIS,
-            BlockHash::ZERO,
-            None,
-            &certified,
-            &pending,
-        );
+        let chain = chain_view(BlockHeight::GENESIS, BlockHash::ZERO, None, &pending);
 
         let out = vp.drain_ready_state_root_verifications(&chain);
         assert!(out.is_empty());
@@ -1325,12 +1288,10 @@ mod tests {
             .expect("complete block constructs cleanly");
         let mut pending_with_block = HashMap::new();
         pending_with_block.insert(block_hash, pb);
-        let certified = HashMap::new();
         let chain = chain_view(
             BlockHeight::GENESIS,
             BlockHash::ZERO,
             None,
-            &certified,
             &pending_with_block,
         );
 
@@ -1342,13 +1303,7 @@ mod tests {
 
         // Draining again without another initiate yields nothing.
         let empty_pending: HashMap<BlockHash, PendingBlock> = HashMap::new();
-        let chain2 = chain_view(
-            BlockHeight::GENESIS,
-            BlockHash::ZERO,
-            None,
-            &certified,
-            &empty_pending,
-        );
+        let chain2 = chain_view(BlockHeight::GENESIS, BlockHash::ZERO, None, &empty_pending);
         assert!(vp.drain_ready_state_root_verifications(&chain2).is_empty());
     }
 
@@ -1365,14 +1320,7 @@ mod tests {
         vp.initiate_state_root_verification(block_hash, &block, BlockHeight::GENESIS);
 
         let empty_pending: HashMap<BlockHash, PendingBlock> = HashMap::new();
-        let certified = HashMap::new();
-        let chain = chain_view(
-            BlockHeight::GENESIS,
-            BlockHash::ZERO,
-            None,
-            &certified,
-            &empty_pending,
-        );
+        let chain = chain_view(BlockHeight::GENESIS, BlockHash::ZERO, None, &empty_pending);
 
         let out = vp.drain_ready_state_root_verifications(&chain);
         assert!(

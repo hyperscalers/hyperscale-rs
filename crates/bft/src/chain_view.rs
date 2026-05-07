@@ -1,14 +1,14 @@
 //! Read-only view over the node's knowledge of the chain.
 //!
 //! `ChainView<'a>` bundles the committed-tip scalars, the latest QC, the
-//! genesis block, and borrowed references to the pending + certified block
-//! maps. It unifies reads that would otherwise have to thread half a dozen
+//! genesis block, and a borrowed reference to the pending block map. It
+//! unifies reads that would otherwise have to thread half a dozen
 //! coordinator fields through every helper — proposal building, header
 //! validation, commit decisions all consult the same chain state.
 //!
 //! The view is **strictly a borrow**: no state is owned here, no lifecycle,
 //! no mutations. It's a lens, not a sub-machine. The underlying fields live
-//! on `BftCoordinator` / `CommitPipeline` / `PendingBlock` just as before.
+//! on `BftCoordinator` / `PendingBlock` just as before.
 
 use std::collections::{HashMap, HashSet};
 
@@ -27,17 +27,13 @@ pub struct ChainView<'a> {
     pub committed_state_root: StateRoot,
     pub latest_qc: Option<&'a QuorumCertificate>,
     pub genesis: Option<&'a Block>,
-    pub certified: &'a HashMap<BlockHash, Block>,
     pub pending: &'a HashMap<BlockHash, PendingBlock>,
 }
 
 impl ChainView<'_> {
-    /// Look up a block by hash across certified, pending (if assembled), and
-    /// genesis. Returns `None` if no source has the block.
+    /// Look up a block by hash across pending (if assembled) and genesis.
+    /// Returns `None` if no source has the block.
     pub fn get_block(&self, block_hash: BlockHash) -> Option<Block> {
-        if let Some(block) = self.certified.get(&block_hash) {
-            return Some(block.clone());
-        }
         if let Some(pending) = self.pending.get(&block_hash)
             && let Some(block) = pending.block()
         {
@@ -55,9 +51,6 @@ impl ChainView<'_> {
     /// are needed. Pending blocks always carry their header even before full
     /// assembly, so this succeeds in cases where `get_block` would fail.
     pub fn get_header(&self, block_hash: BlockHash) -> Option<BlockHeader> {
-        if let Some(block) = self.certified.get(&block_hash) {
-            return Some(block.header().clone());
-        }
         if let Some(pending) = self.pending.get(&block_hash) {
             return Some(pending.header().clone());
         }
@@ -211,12 +204,10 @@ mod tests {
 
     /// Build a `ChainView` referencing scoped dummy state. Ownership stays
     /// with the closure so the view's borrows are safe.
-    #[allow(clippy::too_many_arguments)]
     fn run_view<R>(
         committed_height: u64,
         committed_hash: BlockHash,
         committed_state_root: StateRoot,
-        certified: &HashMap<BlockHash, Block>,
         pending: &HashMap<BlockHash, PendingBlock>,
         latest_qc: Option<&QuorumCertificate>,
         genesis: Option<&Block>,
@@ -229,7 +220,6 @@ mod tests {
             committed_state_root,
             latest_qc,
             genesis,
-            certified,
             pending,
         };
         f(&view)
@@ -239,21 +229,21 @@ mod tests {
         BlockHash::from_raw(Hash::from_bytes(tag))
     }
 
+    fn pending_from_block(block: &Block) -> PendingBlock {
+        let mut pb = PendingBlock::from_complete_block(block, vec![], vec![], LocalTimestamp::ZERO);
+        pb.construct_block().expect("construct block");
+        pb
+    }
+
     #[test]
-    fn get_block_finds_certified_pending_and_genesis() {
-        let hash_c = bh(b"certified");
-        let hash_p = bh(b"pending");
+    fn get_block_finds_pending_and_genesis() {
+        let hash_missing = bh(b"missing");
         let genesis = make_block(0, BlockHash::ZERO);
         let genesis_hash = genesis.hash();
 
-        let certified_block = make_block(5, BlockHash::ZERO);
-        let certified_hash = certified_block.hash();
-        let mut certified = HashMap::new();
-        certified.insert(certified_hash, certified_block);
-
         let pending_block = {
             let mut pb = PendingBlock::from_manifest(
-                make_header(6, certified_hash),
+                make_header(6, genesis_hash),
                 BlockManifest::default(),
                 LocalTimestamp::ZERO,
             );
@@ -268,16 +258,13 @@ mod tests {
             0,
             BlockHash::ZERO,
             StateRoot::ZERO,
-            &certified,
             &pending,
             None,
             Some(&genesis),
             |view| {
-                assert!(view.get_block(certified_hash).is_some());
                 assert!(view.get_block(pending_hash).is_some());
                 assert!(view.get_block(genesis_hash).is_some());
-                assert!(view.get_block(hash_c).is_none());
-                assert!(view.get_block(hash_p).is_none());
+                assert!(view.get_block(hash_missing).is_none());
             },
         );
     }
@@ -299,7 +286,6 @@ mod tests {
             0,
             BlockHash::ZERO,
             StateRoot::ZERO,
-            &HashMap::new(),
             &pending,
             None,
             None,
@@ -321,7 +307,6 @@ mod tests {
             tip_hash,
             tip_root,
             &HashMap::new(),
-            &HashMap::new(),
             None,
             None,
             |view| {
@@ -339,21 +324,12 @@ mod tests {
         let hash = block.hash();
         let expected_state_root = block.header().state_root;
 
-        let mut certified = HashMap::new();
-        certified.insert(hash, block);
+        let mut pending = HashMap::new();
+        pending.insert(hash, pending_from_block(&block));
 
-        run_view(
-            4,
-            tip_hash,
-            tip_root,
-            &certified,
-            &HashMap::new(),
-            None,
-            None,
-            |view| {
-                assert_eq!(view.parent_state_root(hash), expected_state_root);
-            },
-        );
+        run_view(4, tip_hash, tip_root, &pending, None, None, |view| {
+            assert_eq!(view.parent_state_root(hash), expected_state_root);
+        });
     }
 
     #[test]
@@ -366,7 +342,6 @@ mod tests {
             10,
             tip_hash,
             tip_root,
-            &HashMap::new(),
             &HashMap::new(),
             None,
             None,
@@ -383,15 +358,14 @@ mod tests {
         let expected_in_flight = block.header().in_flight;
         let unknown = bh(b"unknown");
 
-        let mut certified = HashMap::new();
-        certified.insert(hash, block);
+        let mut pending = HashMap::new();
+        pending.insert(hash, pending_from_block(&block));
 
         run_view(
             0,
             BlockHash::ZERO,
             StateRoot::ZERO,
-            &certified,
-            &HashMap::new(),
+            &pending,
             None,
             None,
             |view| {
@@ -414,7 +388,6 @@ mod tests {
             BlockHash::ZERO,
             StateRoot::ZERO,
             &HashMap::new(),
-            &HashMap::new(),
             Some(&qc),
             None,
             |view| {
@@ -433,7 +406,6 @@ mod tests {
             0,
             tip_hash,
             StateRoot::ZERO,
-            &HashMap::new(),
             &HashMap::new(),
             None,
             None,

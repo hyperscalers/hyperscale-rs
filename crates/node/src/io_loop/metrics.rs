@@ -144,7 +144,6 @@ where
                 // BFT
                 bft_pending_blocks: bft_mem.pending_blocks,
                 bft_vote_sets: bft_mem.vote_sets,
-                bft_certified_blocks: bft_mem.certified_blocks,
                 bft_pending_commits: bft_mem.pending_commits,
                 bft_pending_commits_awaiting_data: bft_mem.pending_commits_awaiting_data,
                 bft_voted_heights: bft_mem.voted_heights,

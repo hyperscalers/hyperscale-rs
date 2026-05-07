@@ -43,8 +43,6 @@ pub struct BftMemoryStats {
     pub pending_blocks: usize,
     /// Per-block vote sets aggregating received votes.
     pub vote_sets: usize,
-    /// Certified blocks (have a QC) cached in the commit pipeline.
-    pub certified_blocks: usize,
     /// Commits queued out-of-order (parent not yet committed).
     pub pending_commits: usize,
     /// Commits whose block data hasn't fully arrived yet.
@@ -269,7 +267,6 @@ impl BftCoordinator {
             committed_state_root: self.committed_state_root,
             latest_qc: self.latest_qc.as_ref(),
             genesis: self.genesis_block.as_ref(),
-            certified: &self.commits.certified_blocks,
             pending: &self.pending_blocks,
         }
     }
@@ -1452,7 +1449,6 @@ impl BftCoordinator {
                 committed_state_root: self.committed_state_root,
                 latest_qc: self.latest_qc.as_ref(),
                 genesis: self.genesis_block.as_ref(),
-                certified: &self.commits.certified_blocks,
                 pending: &self.pending_blocks,
             };
             let skip_vote = match self.verification.classify_vote_in_flight(
@@ -1985,21 +1981,12 @@ impl BftCoordinator {
         }
 
         // Look up the block to count transactions and certificates
-        self.pending_blocks.get(&committable_hash).map_or_else(
-            || {
-                self.commits
-                    .certified_blocks
-                    .get(&committable_hash)
-                    .map_or((0, 0), |block| {
-                        (block.transactions().len(), block.certificates().len())
-                    })
-            },
-            |pending| {
-                pending.block().map_or((0, 0), |block| {
-                    (block.transactions().len(), block.certificates().len())
-                })
-            },
-        )
+        self.pending_blocks
+            .get(&committable_hash)
+            .and_then(PendingBlock::block)
+            .map_or((0, 0), |block| {
+                (block.transactions().len(), block.certificates().len())
+            })
     }
 
     /// Count transactions and certificates in ALL pending blocks above committed height.
@@ -2142,18 +2129,13 @@ impl BftCoordinator {
         let block_hash = qc.block_hash;
         let certifying_qc = self.pending_blocks.get(&block_hash).map_or_else(
             || {
-                self.commits.certified_blocks.get(&block_hash).map_or_else(
-                    || {
-                        warn!(
-                            validator = ?topology_snapshot.local_validator_id(),
-                            block_hash = ?block_hash,
-                            committable_hash = ?committable_hash,
-                            "Cannot find block to extract certifying QC for committable block"
-                        );
-                        qc.clone()
-                    },
-                    |block| block.header().parent_qc.clone(),
-                )
+                warn!(
+                    validator = ?topology_snapshot.local_validator_id(),
+                    block_hash = ?block_hash,
+                    committable_hash = ?committable_hash,
+                    "Cannot find block to extract certifying QC for committable block"
+                );
+                qc.clone()
             },
             |pending| pending.header().parent_qc.clone(),
         );
@@ -2177,12 +2159,10 @@ impl BftCoordinator {
         qc: QuorumCertificate,
         source: CommitSource,
     ) -> Vec<Action> {
-        // Get the block to commit
-        let block = if let Some(pending) = self.pending_blocks.get(&block_hash) {
-            pending.block().map(|b| (*b).clone())
-        } else {
-            self.commits.certified_blocks.get(&block_hash).cloned()
-        };
+        let block = self
+            .pending_blocks
+            .get(&block_hash)
+            .and_then(|pending| pending.block().map(|b| (*b).clone()));
 
         let Some(block) = block else {
             // Block not yet constructed - check if it's pending (waiting for transactions/certificates)
@@ -2203,15 +2183,11 @@ impl BftCoordinator {
                         .insert(block_hash, (height, qc, source));
                 }
             } else {
-                // Block not in pending_blocks - check if it's in certified_blocks
-                let in_certified = self.commits.certified_blocks.contains_key(&block_hash);
                 warn!(
                     validator = ?topology_snapshot.local_validator_id(),
                     block_hash = ?block_hash,
                     qc_height = qc.height.inner(),
                     committed_height = self.committed_height.inner(),
-                    in_certified_blocks = in_certified,
-                    certified_blocks_count = self.commits.certified_blocks.len(),
                     pending_blocks_count = self.pending_blocks.len(),
                     "Block not found for commit"
                 );
@@ -3106,7 +3082,6 @@ impl BftCoordinator {
             committed_state_root: self.committed_state_root,
             latest_qc: self.latest_qc.as_ref(),
             genesis: self.genesis_block.as_ref(),
-            certified: &self.commits.certified_blocks,
             pending: &self.pending_blocks,
         };
         self.verification
@@ -3185,7 +3160,6 @@ impl BftCoordinator {
         BftMemoryStats {
             pending_blocks: self.pending_blocks.len(),
             vote_sets: self.votes.vote_sets_len(),
-            certified_blocks: self.commits.certified_blocks_len(),
             pending_commits: self.commits.out_of_order_len(),
             pending_commits_awaiting_data: self.commits.awaiting_data_len(),
             voted_heights: self.votes.voted_heights_len(),
@@ -3275,7 +3249,6 @@ impl BftCoordinator {
     /// Returns true if:
     /// - Height is already committed
     /// - Block is in `pending_blocks` AND is complete (has all data, block constructed)
-    /// - Block is in `certified_blocks` (always complete)
     /// - Block is in `pending_synced_block_verifications` (synced blocks are always complete)
     /// - Block is in `buffered_synced_blocks` (synced blocks are always complete)
     fn has_complete_block_at_height(&self, height: BlockHeight) -> bool {
@@ -3289,16 +3262,6 @@ impl BftCoordinator {
             .pending_blocks
             .values()
             .any(|pb| pb.header().height == height && pb.is_complete() && pb.block().is_some())
-        {
-            return true;
-        }
-
-        // In certified blocks (always complete)
-        if self
-            .commits
-            .certified_blocks
-            .values()
-            .any(|block| block.height() == height)
         {
             return true;
         }
@@ -3351,6 +3314,16 @@ mod tests {
 
     use super::*;
     use crate::validation::validate_no_duplicate_transactions;
+
+    fn install_complete_block(state: &mut BftCoordinator, block: Block) {
+        let hash = block.hash();
+        let mut pending =
+            PendingBlock::from_complete_block(&block, vec![], vec![], LocalTimestamp::ZERO);
+        pending
+            .construct_block()
+            .expect("complete block constructs cleanly");
+        state.pending_blocks.insert(hash, pending);
+    }
 
     fn make_test_state() -> (BftCoordinator, TopologySnapshot) {
         make_test_state_with_validators(4)
@@ -3434,15 +3407,6 @@ mod tests {
         }
     }
 
-    fn make_empty_block(height: BlockHeight) -> Block {
-        Block::Live {
-            header: make_header_at_height(height, 1000),
-            transactions: Arc::new(vec![]),
-            certificates: Arc::new(vec![]),
-            provisions: Arc::new(vec![]),
-        }
-    }
-
     fn make_test_qc(block_hash: BlockHash, height: BlockHeight) -> QuorumCertificate {
         QuorumCertificate {
             block_hash,
@@ -3513,10 +3477,6 @@ mod tests {
         let parent_block_hash = BlockHash::from_raw(Hash::from_bytes(b"parent_block"));
         state.committed_height = BlockHeight::new(1);
         state.committed_hash = parent_block_hash;
-        state
-            .commits
-            .certified_blocks
-            .insert(parent_block_hash, make_empty_block(BlockHeight::new(1)));
         let prior_latest_qc = state.latest_qc.clone();
 
         let mut signers = SignerBitfield::new(4);
@@ -3563,10 +3523,6 @@ mod tests {
         let parent_block_hash = BlockHash::from_raw(Hash::from_bytes(b"parent_block"));
         state.committed_height = BlockHeight::new(1);
         state.committed_hash = parent_block_hash;
-        state
-            .commits
-            .certified_blocks
-            .insert(parent_block_hash, make_empty_block(BlockHeight::new(1)));
 
         let mut signers = SignerBitfield::new(4);
         signers.set(0);
@@ -3611,13 +3567,16 @@ mod tests {
         let (mut state, topology) = make_multi_validator_state_at(1);
         state.set_time(LocalTimestamp::from_millis(100_000));
 
-        let parent_block_hash = BlockHash::from_raw(Hash::from_bytes(b"parent_block"));
+        let parent_block = Block::Live {
+            header: make_header_at_height(BlockHeight::new(1), 99_000),
+            transactions: Arc::new(vec![]),
+            certificates: Arc::new(vec![]),
+            provisions: Arc::new(vec![]),
+        };
+        let parent_block_hash = parent_block.hash();
         state.committed_height = BlockHeight::new(1);
         state.committed_hash = parent_block_hash;
-        state
-            .commits
-            .certified_blocks
-            .insert(parent_block_hash, make_empty_block(BlockHeight::new(1)));
+        install_complete_block(&mut state, parent_block);
 
         let mut signers = SignerBitfield::new(4);
         signers.set(0);
@@ -4100,10 +4059,6 @@ mod tests {
         state.verification.on_block_persisted(BlockHeight::new(3));
 
         let block_3_hash = BlockHash::from_raw(Hash::from_bytes(b"block_3"));
-        state
-            .commits
-            .certified_blocks
-            .insert(block_3_hash, make_empty_block(BlockHeight::new(3)));
 
         let qc = QuorumCertificate {
             parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"block_2")),
@@ -4142,10 +4097,6 @@ mod tests {
         let parent_block_hash = BlockHash::from_raw(Hash::from_bytes(b"parent_tree_missing"));
         state.committed_height = BlockHeight::new(3);
         state.committed_hash = parent_block_hash;
-        state
-            .commits
-            .certified_blocks
-            .insert(parent_block_hash, make_empty_block(BlockHeight::new(3)));
         state.latest_qc = Some(make_test_qc(parent_block_hash, BlockHeight::new(3)));
         // Intentionally do NOT call on_block_persisted — parent tree
         // unavailable forces the defer branch.
@@ -4200,10 +4151,6 @@ mod tests {
         let parent_block_hash = BlockHash::from_raw(Hash::from_bytes(b"parent_block"));
         state.committed_height = BlockHeight::new(1);
         state.committed_hash = parent_block_hash;
-        state
-            .commits
-            .certified_blocks
-            .insert(parent_block_hash, make_empty_block(BlockHeight::new(1)));
 
         let mut signers = SignerBitfield::new(4);
         signers.set(0);
@@ -4275,10 +4222,6 @@ mod tests {
         let parent_block_hash = BlockHash::from_raw(Hash::from_bytes(b"parent_block"));
         state.committed_height = BlockHeight::new(1);
         state.committed_hash = parent_block_hash;
-        state
-            .commits
-            .certified_blocks
-            .insert(parent_block_hash, make_empty_block(BlockHeight::new(1)));
 
         let mut signers = SignerBitfield::new(4);
         signers.set(0);
@@ -4671,7 +4614,6 @@ mod tests {
         state.set_block_syncing(&topology, false);
 
         state.pending_blocks.clear();
-        state.commits.certified_blocks.clear();
         state.votes.voted_heights.clear();
 
         let fallback_actions =
@@ -4743,10 +4685,7 @@ mod tests {
             provisions: Arc::new(vec![]),
         };
         let ancestor_hash = ancestor_block.hash();
-        state
-            .commits
-            .certified_blocks
-            .insert(ancestor_hash, ancestor_block);
+        install_complete_block(&mut state, ancestor_block);
 
         // New block at height 6, parent = ancestor, contains tx1 (duplicate) + tx2
         let mut txs = vec![tx1, tx2];
@@ -4788,10 +4727,6 @@ mod tests {
             provisions: Arc::new(vec![]),
         };
         let ancestor_hash = ancestor_block.hash();
-        state
-            .commits
-            .certified_blocks
-            .insert(ancestor_hash, ancestor_block);
 
         // Block at height 6, parent = ancestor. tx1 is in ancestor but ancestor
         // is at committed height so the walk stops — this should be allowed.

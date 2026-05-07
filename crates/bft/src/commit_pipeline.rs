@@ -1,27 +1,22 @@
-//! Commit pipeline: certified blocks awaiting commit, out-of-order commit
-//! buffering, and commit buffering for blocks still awaiting data.
+//! Commit pipeline: out-of-order commit buffering, and commit buffering for
+//! blocks still awaiting data.
 //!
 //! A block travels through this pipeline after its QC forms:
 //!
-//! 1. QC forms → block enters [`CommitPipeline::certified_blocks`]
-//! 2. Two-chain rule fires `BlockReadyToCommit` for the committable parent
-//! 3. If the block data (transactions/certificates) has not fully arrived,
+//! 1. Two-chain rule fires `BlockReadyToCommit` for the committable parent.
+//! 2. If the block data (transactions/certificates) has not fully arrived,
 //!    the commit is parked in [`CommitPipeline::awaiting_data`] keyed by
 //!    block hash, to be retried when data arrives.
-//! 4. If the commit arrives out of order (height > `committed_height + 1`),
+//! 3. If the commit arrives out of order (height > `committed_height + 1`),
 //!    it is parked in [`CommitPipeline::out_of_order`] keyed by height, to
 //!    be drained in sequence once the predecessor commits.
 
 use std::collections::{BTreeMap, HashMap};
 
 use hyperscale_core::CommitSource;
-use hyperscale_types::{Block, BlockHash, BlockHeight, QuorumCertificate};
+use hyperscale_types::{BlockHash, BlockHeight, QuorumCertificate};
 
 pub struct CommitPipeline {
-    /// Blocks that have been certified (have QC) but not yet committed.
-    /// Keyed by block hash.
-    pub(crate) certified_blocks: HashMap<BlockHash, Block>,
-
     /// Out-of-order commit buffer: commits received with height greater than
     /// `committed_height + 1`, parked until the predecessor commits.
     /// Keyed by target height.
@@ -36,7 +31,6 @@ pub struct CommitPipeline {
 impl CommitPipeline {
     pub fn new() -> Self {
         Self {
-            certified_blocks: HashMap::new(),
             out_of_order: BTreeMap::new(),
             awaiting_data: HashMap::new(),
         }
@@ -44,8 +38,6 @@ impl CommitPipeline {
 
     /// Drop all pipeline entries at or below `committed_height`.
     pub fn cleanup_committed(&mut self, committed_height: BlockHeight) {
-        self.certified_blocks
-            .retain(|_, block| block.height() > committed_height);
         self.awaiting_data
             .retain(|_, (height, _, _)| *height > committed_height);
         self.out_of_order
@@ -72,10 +64,6 @@ impl CommitPipeline {
         block_hash: &BlockHash,
     ) -> Option<(BlockHeight, QuorumCertificate, CommitSource)> {
         self.awaiting_data.remove(block_hash)
-    }
-
-    pub fn certified_blocks_len(&self) -> usize {
-        self.certified_blocks.len()
     }
 
     pub fn out_of_order_len(&self) -> usize {
