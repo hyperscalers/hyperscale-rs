@@ -154,9 +154,6 @@ pub struct BftCoordinator {
     /// Adopted in `on_block_header` when the header arrives.
     deferred_qc: Option<(BlockHash, QuorumCertificate)>,
 
-    /// Genesis block (needed for bootstrapping).
-    genesis_block: Option<Block>,
-
     // ═══════════════════════════════════════════════════════════════════════════
     // Pending State
     // ═══════════════════════════════════════════════════════════════════════════
@@ -234,7 +231,6 @@ impl BftCoordinator {
             committed_state_root: recovered.jmt_root.unwrap_or(StateRoot::ZERO),
             latest_qc: recovered.latest_qc,
             deferred_qc: None,
-            genesis_block: None,
             pending_blocks: HashMap::new(),
             votes: VoteKeeper::new(),
             commits: CommitPipeline::new(),
@@ -266,7 +262,6 @@ impl BftCoordinator {
             committed_hash: self.committed_hash,
             committed_state_root: self.committed_state_root,
             latest_qc: self.latest_qc.as_ref(),
-            genesis: self.genesis_block.as_ref(),
             pending: &self.pending_blocks,
         }
     }
@@ -532,7 +527,6 @@ impl BftCoordinator {
 
         self.committed_hash = hash;
         self.committed_state_root = genesis.header().state_root;
-        self.genesis_block = Some(genesis.clone());
 
         // Record genesis time as initial leader activity so that the view
         // change timeout counts from startup rather than being disabled.
@@ -1448,7 +1442,6 @@ impl BftCoordinator {
                 committed_hash: self.committed_hash,
                 committed_state_root: self.committed_state_root,
                 latest_qc: self.latest_qc.as_ref(),
-                genesis: self.genesis_block.as_ref(),
                 pending: &self.pending_blocks,
             };
             let skip_vote = match self.verification.classify_vote_in_flight(
@@ -3081,7 +3074,6 @@ impl BftCoordinator {
             committed_hash: self.committed_hash,
             committed_state_root: self.committed_state_root,
             latest_qc: self.latest_qc.as_ref(),
-            genesis: self.genesis_block.as_ref(),
             pending: &self.pending_blocks,
         };
         self.verification
@@ -3315,14 +3307,13 @@ mod tests {
     use super::*;
     use crate::validation::validate_no_duplicate_transactions;
 
-    fn install_complete_block(state: &mut BftCoordinator, block: Block) {
-        let hash = block.hash();
+    fn install_complete_block(state: &mut BftCoordinator, block: &Block) {
         let mut pending =
-            PendingBlock::from_complete_block(&block, vec![], vec![], LocalTimestamp::ZERO);
+            PendingBlock::from_complete_block(block, vec![], vec![], LocalTimestamp::ZERO);
         pending
             .construct_block()
             .expect("complete block constructs cleanly");
-        state.pending_blocks.insert(hash, pending);
+        state.pending_blocks.insert(block.hash(), pending);
     }
 
     fn make_test_state() -> (BftCoordinator, TopologySnapshot) {
@@ -3576,7 +3567,7 @@ mod tests {
         let parent_block_hash = parent_block.hash();
         state.committed_height = BlockHeight::new(1);
         state.committed_hash = parent_block_hash;
-        install_complete_block(&mut state, parent_block);
+        install_complete_block(&mut state, &parent_block);
 
         let mut signers = SignerBitfield::new(4);
         signers.set(0);
@@ -4685,7 +4676,7 @@ mod tests {
             provisions: Arc::new(vec![]),
         };
         let ancestor_hash = ancestor_block.hash();
-        install_complete_block(&mut state, ancestor_block);
+        install_complete_block(&mut state, &ancestor_block);
 
         // New block at height 6, parent = ancestor, contains tx1 (duplicate) + tx2
         let mut txs = vec![tx1, tx2];

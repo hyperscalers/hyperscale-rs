@@ -1185,7 +1185,6 @@ mod tests {
             committed_hash,
             committed_state_root: StateRoot::ZERO,
             latest_qc,
-            genesis: None,
             pending,
         }
     }
