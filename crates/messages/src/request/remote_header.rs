@@ -38,7 +38,7 @@ impl NetworkMessage for GetRemoteHeadersRequest {
     }
 
     fn class() -> MessageClass {
-        MessageClass::Recovery
+        MessageClass::CrossShardProgress
     }
 }
 
