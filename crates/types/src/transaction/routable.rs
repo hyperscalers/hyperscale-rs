@@ -13,7 +13,7 @@ use sbor::{
     NoCustomTypeKind, NoCustomValueKind, RustTypeId, TypeData, TypeKind, ValueKind,
 };
 
-use crate::sbor_codec::decode_bounded_bytes;
+use crate::sbor_codec::{decode_bounded_bytes, decode_bounded_vec};
 use crate::{
     Hash, MAX_DECLARED_NODES_PER_TX, MAX_TX_BYTES_LEN, NodeId, TimestampRange, TxHash,
     shard_for_node,
@@ -234,28 +234,6 @@ impl RoutableTransaction {
 // Manual SBOR implementation since UserTransaction uses ManifestSbor
 // ============================================================================
 
-fn decode_bounded_node_ids<D: Decoder<NoCustomValueKind>>(
-    decoder: &mut D,
-    max_len: usize,
-) -> Result<Vec<NodeId>, DecodeError> {
-    decoder.read_and_check_value_kind(ValueKind::Array)?;
-    let element_kind = decoder.read_and_check_value_kind(NodeId::value_kind())?;
-    let len = decoder.read_size()?;
-    if len > max_len {
-        return Err(DecodeError::UnexpectedSize {
-            expected: max_len,
-            actual: len,
-        });
-    }
-    // Cap the with_capacity hint so a peer-claimed huge `len` can't
-    // pre-allocate before the decode loop short-circuits on missing data.
-    let mut out = Vec::with_capacity(len.min(1024));
-    for _ in 0..len {
-        out.push(decoder.decode_deeper_body_with_value_kind(element_kind)?);
-    }
-    Ok(out)
-}
-
 impl<E: Encoder<NoCustomValueKind>> Encode<NoCustomValueKind, E> for RoutableTransaction {
     fn encode_value_kind(&self, encoder: &mut E) -> Result<(), EncodeError> {
         encoder.write_value_kind(ValueKind::Tuple)
@@ -293,8 +271,8 @@ impl<D: Decoder<NoCustomValueKind>> Decode<NoCustomValueKind, D> for RoutableTra
         let tx_bytes = decode_bounded_bytes(decoder, MAX_TX_BYTES_LEN)?;
         let transaction: UserTransaction =
             manifest_decode(&tx_bytes).map_err(|_| DecodeError::InvalidCustomValue)?;
-        let declared_reads = decode_bounded_node_ids(decoder, MAX_DECLARED_NODES_PER_TX)?;
-        let declared_writes = decode_bounded_node_ids(decoder, MAX_DECLARED_NODES_PER_TX)?;
+        let declared_reads = decode_bounded_vec::<_, NodeId>(decoder, MAX_DECLARED_NODES_PER_TX)?;
+        let declared_writes = decode_bounded_vec::<_, NodeId>(decoder, MAX_DECLARED_NODES_PER_TX)?;
         let validity_range: TimestampRange = decoder.decode()?;
 
         // Recompute the hash from `tx_bytes` — it's content-derived and
