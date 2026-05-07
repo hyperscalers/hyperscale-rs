@@ -68,26 +68,6 @@ pub fn decode_bounded_bytes<D: Decoder<NoCustomValueKind>>(
     Ok(slice.to_vec())
 }
 
-/// Decode a `String` field while rejecting peer-claimed lengths above
-/// `max_len` before any allocation. SBOR's default `String` decode reads
-/// `len` bytes via `read_slice` up front — same pre-allocation footgun as
-/// `Vec<u8>`.
-pub fn decode_bounded_string<D: Decoder<NoCustomValueKind>>(
-    decoder: &mut D,
-    max_len: usize,
-) -> Result<String, DecodeError> {
-    decoder.read_and_check_value_kind(ValueKind::String)?;
-    let len = decoder.read_size()?;
-    if len > max_len {
-        return Err(DecodeError::UnexpectedSize {
-            expected: max_len,
-            actual: len,
-        });
-    }
-    let slice = decoder.read_slice(len)?;
-    String::from_utf8(slice.to_vec()).map_err(|_| DecodeError::InvalidUtf8)
-}
-
 /// Decode a `Vec<T>` field while rejecting peer-claimed lengths above
 /// `max_len` before any per-element decode work, and capping the
 /// `with_capacity` hint so the pre-allocation can't be driven past the

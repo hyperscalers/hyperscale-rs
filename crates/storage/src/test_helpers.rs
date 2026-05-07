@@ -169,16 +169,16 @@ pub fn make_test_receipt(seed: u8) -> StoredReceipt {
             data: EventData(vec![seed, seed + 1]),
         }],
     };
-    let metadata = Some(ExecutionMetadata {
-        fee_summary: FeeSummary {
+    let metadata = Some(ExecutionMetadata::new(
+        FeeSummary {
             total_execution_cost: Some(Decimal::from(u64::from(seed))),
             total_royalty_cost: None,
             total_storage_cost: None,
             total_tipping_cost: None,
         },
-        log_messages: vec![(LogLevel::Info, format!("tx {seed}"))],
-        error_message: None,
-    });
+        vec![(LogLevel::Info, format!("tx {seed}"))],
+        None,
+    ));
     StoredReceipt {
         tx_hash,
         consensus: Arc::new(consensus),

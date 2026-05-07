@@ -3,13 +3,14 @@
 use radix_common::data::scrypto::{scrypto_decode, scrypto_encode};
 use radix_common::math::Decimal;
 use radix_engine_interface::types::EventTypeIdentifier;
+use sbor::prelude::*;
 use sbor::{
     Categorize, Decode, DecodeError, Decoder, Describe, Encode, EncodeError, Encoder,
     NoCustomTypeKind, NoCustomValueKind, RustTypeId, TypeData, TypeKind, ValueKind,
 };
 
-use crate::Hash;
-use crate::sbor_codec::{decode_bounded_bytes, decode_bounded_string};
+use crate::sbor_codec::decode_bounded_bytes;
+use crate::{BoundedString, BoundedVec, Hash};
 
 /// Cap on `ApplicationEvent.type_id` and `ApplicationEvent.data` at decode
 /// time. Events are short user-defined strings + SBOR payloads; 64 KiB is
@@ -20,13 +21,13 @@ const MAX_APPLICATION_EVENT_FIELD_LEN: usize = 64 * 1024;
 /// Cap on `ExecutionMetadata.log_messages` count at decode time. Receipts
 /// emit a handful of log lines per tx; 1024 is far above any legitimate
 /// workload.
-const MAX_LOG_MESSAGES_PER_TX: usize = 1024;
+pub const MAX_LOG_MESSAGES_PER_TX: usize = 1024;
 
 /// Cap on a single engine-produced diagnostic string at decode time —
 /// applies to both each `log_messages` entry and `error_message`. Engine
 /// diagnostics are short; 4 KiB rejects obviously oversized arrivals
 /// before any per-byte allocation.
-const MAX_DIAGNOSTIC_STRING_LEN: usize = 4 * 1024;
+pub const MAX_DIAGNOSTIC_STRING_LEN: usize = 4 * 1024;
 
 /// `Decimal` is `I192`, a 192-bit signed integer. We encode it on the wire
 /// as exactly this many little-endian bytes — fixed-size, no length
@@ -269,116 +270,43 @@ pub enum LogLevel {
 ///
 /// Written atomically with block commit but on a separate pruning cycle
 /// (can be pruned earlier than the consensus receipt since not needed for state verification).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct ExecutionMetadata {
     /// Fee breakdown reported by the engine.
     pub fee_summary: FeeSummary,
     /// Engine log lines emitted during execution.
-    pub log_messages: Vec<(LogLevel, String)>,
+    pub log_messages:
+        BoundedVec<(LogLevel, BoundedString<MAX_DIAGNOSTIC_STRING_LEN>), MAX_LOG_MESSAGES_PER_TX>,
     /// Engine error message when `outcome == Failure`.
-    pub error_message: Option<String>,
-}
-
-impl<E: Encoder<NoCustomValueKind>> Encode<NoCustomValueKind, E> for ExecutionMetadata {
-    fn encode_value_kind(&self, encoder: &mut E) -> Result<(), EncodeError> {
-        encoder.write_value_kind(ValueKind::Tuple)
-    }
-
-    fn encode_body(&self, encoder: &mut E) -> Result<(), EncodeError> {
-        encoder.write_size(3)?;
-        encoder.encode(&self.fee_summary)?;
-        encoder.encode(&self.log_messages)?;
-        encoder.encode(&self.error_message)?;
-        Ok(())
-    }
-}
-
-impl<D: Decoder<NoCustomValueKind>> Decode<NoCustomValueKind, D> for ExecutionMetadata {
-    fn decode_body_with_value_kind(
-        decoder: &mut D,
-        value_kind: ValueKind<NoCustomValueKind>,
-    ) -> Result<Self, DecodeError> {
-        decoder.check_preloaded_value_kind(value_kind, ValueKind::Tuple)?;
-        let length = decoder.read_size()?;
-        if length != 3 {
-            return Err(DecodeError::UnexpectedSize {
-                expected: 3,
-                actual: length,
-            });
-        }
-        let fee_summary: FeeSummary = decoder.decode()?;
-        let log_messages = decode_bounded_log_messages(decoder)?;
-        let error_message = decode_bounded_optional_diagnostic(decoder)?;
-        Ok(Self {
-            fee_summary,
-            log_messages,
-            error_message,
-        })
-    }
-}
-
-impl Categorize<NoCustomValueKind> for ExecutionMetadata {
-    fn value_kind() -> ValueKind<NoCustomValueKind> {
-        ValueKind::Tuple
-    }
-}
-
-impl Describe<NoCustomTypeKind> for ExecutionMetadata {
-    const TYPE_ID: RustTypeId = RustTypeId::novel_with_code("ExecutionMetadata", &[], &[]);
-
-    fn type_data() -> TypeData<NoCustomTypeKind, RustTypeId> {
-        TypeData::unnamed(TypeKind::Any)
-    }
-}
-
-/// Decode `Vec<(LogLevel, String)>` with both vec-count and per-string
-/// bounds. The default `Vec` decoder honors a peer-claimed `len`, and
-/// the default `String` decoder pre-allocates by `len`.
-fn decode_bounded_log_messages<D: Decoder<NoCustomValueKind>>(
-    decoder: &mut D,
-) -> Result<Vec<(LogLevel, String)>, DecodeError> {
-    decoder.read_and_check_value_kind(ValueKind::Array)?;
-    decoder.read_and_check_value_kind(ValueKind::Tuple)?;
-    let len = decoder.read_size()?;
-    if len > MAX_LOG_MESSAGES_PER_TX {
-        return Err(DecodeError::UnexpectedSize {
-            expected: MAX_LOG_MESSAGES_PER_TX,
-            actual: len,
-        });
-    }
-    let mut out = Vec::with_capacity(len.min(1024));
-    for _ in 0..len {
-        decoder.read_and_check_size(2)?;
-        let level: LogLevel = decoder.decode()?;
-        let msg = decode_bounded_string(decoder, MAX_DIAGNOSTIC_STRING_LEN)?;
-        out.push((level, msg));
-    }
-    Ok(out)
-}
-
-/// Decode `Option<String>` with a peer-bounded inner-string length.
-fn decode_bounded_optional_diagnostic<D: Decoder<NoCustomValueKind>>(
-    decoder: &mut D,
-) -> Result<Option<String>, DecodeError> {
-    decoder.read_and_check_value_kind(ValueKind::Enum)?;
-    let discriminator = decoder.read_discriminator()?;
-    match discriminator {
-        0 => {
-            decoder.read_and_check_size(0)?;
-            Ok(None)
-        }
-        1 => {
-            decoder.read_and_check_size(1)?;
-            Ok(Some(decode_bounded_string(
-                decoder,
-                MAX_DIAGNOSTIC_STRING_LEN,
-            )?))
-        }
-        other => Err(DecodeError::UnknownDiscriminator(other)),
-    }
+    pub error_message: Option<BoundedString<MAX_DIAGNOSTIC_STRING_LEN>>,
 }
 
 impl ExecutionMetadata {
+    /// Build from raw `Vec`/`String` inputs, wrapping each into its
+    /// bounded type.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `log_messages.len() > MAX_LOG_MESSAGES_PER_TX`, if any
+    /// `log_messages` entry's string exceeds `MAX_DIAGNOSTIC_STRING_LEN`,
+    /// or if `error_message` exceeds `MAX_DIAGNOSTIC_STRING_LEN`.
+    #[must_use]
+    pub fn new(
+        fee_summary: FeeSummary,
+        log_messages: Vec<(LogLevel, String)>,
+        error_message: Option<String>,
+    ) -> Self {
+        Self {
+            fee_summary,
+            log_messages: log_messages
+                .into_iter()
+                .map(|(level, msg)| (level, BoundedString::from(msg)))
+                .collect::<Vec<_>>()
+                .into(),
+            error_message: error_message.map(BoundedString::from),
+        }
+    }
+
     /// All-zero metadata: empty fees, no logs, no error.
     ///
     /// Used by the engine's synthetic-failure path (`ExecutedTx::failure`
@@ -397,7 +325,7 @@ impl ExecutionMetadata {
                 total_storage_cost: None,
                 total_tipping_cost: None,
             },
-            log_messages: vec![],
+            log_messages: BoundedVec::new(),
             error_message: None,
         }
     }
@@ -473,19 +401,19 @@ mod tests {
     }
 
     fn sample_metadata() -> ExecutionMetadata {
-        ExecutionMetadata {
-            fee_summary: FeeSummary {
+        ExecutionMetadata::new(
+            FeeSummary {
                 total_execution_cost: None,
                 total_royalty_cost: None,
                 total_storage_cost: None,
                 total_tipping_cost: None,
             },
-            log_messages: vec![
+            vec![
                 (LogLevel::Info, "started".to_string()),
                 (LogLevel::Error, "boom".to_string()),
             ],
-            error_message: Some("explanatory text".to_string()),
-        }
+            Some("explanatory text".to_string()),
+        )
     }
 
     #[test]

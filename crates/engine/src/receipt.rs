@@ -132,11 +132,7 @@ pub fn build_execution_metadata(receipt: &TransactionReceipt) -> ExecutionMetada
         TransactionResult::Abort(abort) => (vec![], Some(format!("{:?}", abort.reason))),
     };
 
-    ExecutionMetadata {
-        fee_summary,
-        log_messages,
-        error_message,
-    }
+    ExecutionMetadata::new(fee_summary, log_messages, error_message)
 }
 
 /// Extract application events from a committed receipt.
@@ -226,18 +222,12 @@ mod tests {
         let local = build_execution_metadata(&receipt);
 
         assert_eq!(local.log_messages.len(), 3);
-        assert_eq!(
-            local.log_messages[0],
-            (LogLevel::Info, "hello world".to_string())
-        );
-        assert_eq!(
-            local.log_messages[1],
-            (LogLevel::Error, "something broke".to_string())
-        );
-        assert_eq!(
-            local.log_messages[2],
-            (LogLevel::Debug, "debug info".to_string())
-        );
+        assert_eq!(local.log_messages[0].0, LogLevel::Info);
+        assert_eq!(local.log_messages[0].1.as_str(), "hello world");
+        assert_eq!(local.log_messages[1].0, LogLevel::Error);
+        assert_eq!(local.log_messages[1].1.as_str(), "something broke");
+        assert_eq!(local.log_messages[2].0, LogLevel::Debug);
+        assert_eq!(local.log_messages[2].1.as_str(), "debug info");
         assert!(local.error_message.is_none());
     }
 

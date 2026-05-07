@@ -130,16 +130,16 @@ mod tests {
         let local = StoredReceipt {
             tx_hash: TxHash::from_raw(Hash::from_bytes(b"local_tx")),
             consensus: Arc::new(ConsensusReceipt::Failed),
-            metadata: Some(ExecutionMetadata {
-                fee_summary: FeeSummary {
+            metadata: Some(ExecutionMetadata::new(
+                FeeSummary {
                     total_execution_cost: None,
                     total_royalty_cost: None,
                     total_storage_cost: None,
                     total_tipping_cost: None,
                 },
-                log_messages: vec![],
-                error_message: Some("test error".into()),
-            }),
+                vec![],
+                Some("test error".to_string()),
+            )),
         };
         assert!(local.metadata.is_some());
         assert!(!local.consensus.is_success());
