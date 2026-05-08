@@ -85,25 +85,57 @@ impl Inventory {
 /// natural ceilings.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct ElidedCertifiedBlock {
+    header: BlockHeader,
+    qc: QuorumCertificate,
+    transactions: BoundedVec<(TxHash, Option<Arc<RoutableTransaction>>), MAX_TXS_PER_BLOCK>,
+    certificates: BoundedVec<(WaveId, Option<Arc<FinalizedWave>>), MAX_FINALIZED_TX_PER_BLOCK>,
+    provisions:
+        Option<BoundedVec<(ProvisionHash, Option<Arc<Provisions>>), MAX_PROVISIONS_PER_BLOCK>>,
+}
+
+impl ElidedCertifiedBlock {
     /// Block header (always inline).
-    pub header: BlockHeader,
+    #[must_use]
+    pub const fn header(&self) -> &BlockHeader {
+        &self.header
+    }
+
     /// Certifying quorum certificate (always inline).
-    pub qc: QuorumCertificate,
+    #[must_use]
+    pub const fn qc(&self) -> &QuorumCertificate {
+        &self.qc
+    }
+
     /// Per-transaction `(hash, optional body)` pairs; body is `None` when elided.
     ///
     /// Bodies are `Arc`-wrapped so server-side elision and receiver-side
     /// rehydration share the same allocations as the local mempool /
     /// pending-block stores rather than deep-cloning every body.
-    pub transactions: BoundedVec<(TxHash, Option<Arc<RoutableTransaction>>), MAX_TXS_PER_BLOCK>,
+    #[must_use]
+    pub const fn transactions(
+        &self,
+    ) -> &BoundedVec<(TxHash, Option<Arc<RoutableTransaction>>), MAX_TXS_PER_BLOCK> {
+        &self.transactions
+    }
+
     /// Per-certificate `(wave id, optional body)` pairs; body is `None` when elided.
-    pub certificates: BoundedVec<(WaveId, Option<Arc<FinalizedWave>>), MAX_FINALIZED_TX_PER_BLOCK>,
+    #[must_use]
+    pub const fn certificates(
+        &self,
+    ) -> &BoundedVec<(WaveId, Option<Arc<FinalizedWave>>), MAX_FINALIZED_TX_PER_BLOCK> {
+        &self.certificates
+    }
+
     /// Per-provision `(hash, optional body)` pairs. `None` overall preserves the
     /// `Block::Sealed` shape; `Some(_)` preserves `Block::Live`.
-    pub provisions:
-        Option<BoundedVec<(ProvisionHash, Option<Arc<Provisions>>), MAX_PROVISIONS_PER_BLOCK>>,
-}
-
-impl ElidedCertifiedBlock {
+    #[must_use]
+    #[allow(clippy::type_complexity)] // mirrors the field's natural shape
+    pub const fn provisions(
+        &self,
+    ) -> Option<&BoundedVec<(ProvisionHash, Option<Arc<Provisions>>), MAX_PROVISIONS_PER_BLOCK>>
+    {
+        self.provisions.as_ref()
+    }
     /// Build an elided response from a full block + QC + the requester's
     /// inventory. Bodies whose hashes appear in the inventory filters are
     /// replaced with `None`; hashes are always included so the requester
