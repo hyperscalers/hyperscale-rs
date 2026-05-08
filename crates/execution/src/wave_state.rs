@@ -266,17 +266,6 @@ impl WaveState {
         self.local_ec_emitted
     }
 
-    /// Mark the wave as having dispatched execution. Idempotent: second calls
-    /// are no-ops. Returns whether this call flipped the flag.
-    pub const fn mark_dispatched(&mut self) -> bool {
-        if self.dispatched {
-            false
-        } else {
-            self.dispatched = true;
-            true
-        }
-    }
-
     /// Build the one-shot execution dispatch [`Action`] for a fully-provisioned
     /// wave and flip `dispatched` if one is produced.
     ///
@@ -1310,14 +1299,15 @@ mod tests {
         let h0 = w.tx_hashes()[0];
         let h1 = w.tx_hashes()[1];
 
-        // Fully provision and dispatch.
         w.mark_tx_provisioned(h0, ts_for(WAVE_START + 1));
         w.mark_tx_provisioned(h1, ts_for(WAVE_START + 1));
-        assert!(w.mark_dispatched());
+        let mut provisions: HashMap<TxHash, Vec<Arc<Vec<SubstateEntry>>>> = HashMap::new();
+        provisions.insert(h0, vec![Arc::new(Vec::new())]);
+        provisions.insert(h1, vec![Arc::new(Vec::new())]);
+        assert!(w.dispatch_if_ready(&provisions).is_some());
+        assert!(w.dispatched());
 
-        // A post-dispatch conflict abort must be rejected.
         assert!(!w.record_abort(h0, ts_for(WAVE_START + 2)));
-        // No explicit abort was recorded.
         w.record_execution_result(h0, executed(true));
         w.record_execution_result(h1, executed(true));
         // If record_abort had mutated, h0's outcome would have flipped to Aborted.
