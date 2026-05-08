@@ -20,7 +20,6 @@ impl NodeStateMachine {
                 committed_header,
                 valid,
             } => self.provisions.on_state_provisions_verified(
-                self.topology.snapshot(),
                 provisions,
                 committed_header.as_ref(),
                 valid,

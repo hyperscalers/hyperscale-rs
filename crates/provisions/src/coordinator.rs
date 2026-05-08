@@ -476,7 +476,6 @@ impl ProvisionCoordinator {
     /// Uses the verified header returned by the action handler directly (no re-lookup).
     pub fn on_state_provisions_verified(
         &mut self,
-        _topology: &TopologySnapshot,
         provisions: Arc<Provisions>,
         committed_header: Option<&Arc<CommittedBlockHeader>>,
         valid: bool,
@@ -929,7 +928,6 @@ mod tests {
         );
         coordinator.on_state_provisions_received(&topology, provisions.clone());
         coordinator.on_state_provisions_verified(
-            &topology,
             Arc::new(provisions),
             Some(&header),
             true,
@@ -970,7 +968,6 @@ mod tests {
 
         // Verify
         let actions = coordinator.on_state_provisions_verified(
-            &topology,
             Arc::new(provisions),
             Some(&header),
             true,
@@ -1005,7 +1002,6 @@ mod tests {
 
         // Verification fails — no committed_header returned
         let actions = coordinator.on_state_provisions_verified(
-            &topology,
             Arc::new(provisions),
             None,
             false,
@@ -1220,7 +1216,6 @@ mod tests {
 
         // Entire provisions fails verification
         let actions = coordinator.on_state_provisions_verified(
-            &topology,
             Arc::new(provisions),
             Some(&header),
             false,
@@ -1390,7 +1385,6 @@ mod tests {
         );
         coordinator.on_state_provisions_received(&topology, provisions.clone());
         coordinator.on_state_provisions_verified(
-            &topology,
             Arc::new(provisions),
             Some(&header),
             true,
@@ -1534,7 +1528,6 @@ mod tests {
         );
         coordinator.on_state_provisions_received(&topology, provisions.clone());
         coordinator.on_state_provisions_verified(
-            &topology,
             Arc::new(provisions),
             Some(&header),
             true,
@@ -1579,7 +1572,6 @@ mod tests {
         );
         coordinator.on_state_provisions_received(&topology, provisions.clone());
         coordinator.on_state_provisions_verified(
-            &topology,
             Arc::new(provisions),
             Some(&header),
             true,
@@ -1699,7 +1691,6 @@ mod tests {
         );
         coordinator.on_state_provisions_received(&topology, provisions.clone());
         coordinator.on_state_provisions_verified(
-            &topology,
             Arc::new(provisions),
             Some(&header),
             true,
@@ -1778,7 +1769,6 @@ mod tests {
         );
         coordinator.on_state_provisions_received(&topology, provisions.clone());
         coordinator.on_state_provisions_verified(
-            &topology,
             Arc::new(provisions),
             Some(&header),
             true,
@@ -1916,13 +1906,7 @@ mod tests {
         coordinator.on_verified_remote_header(topology, &header);
         let provisions = make_provisions(tx_hash, source_shard, ShardGroupId::new(0), height);
         coordinator.on_state_provisions_received(topology, provisions.clone());
-        coordinator.on_state_provisions_verified(
-            topology,
-            Arc::new(provisions),
-            Some(&header),
-            true,
-            now,
-        );
+        coordinator.on_state_provisions_verified(Arc::new(provisions), Some(&header), true, now);
     }
 
     #[test]
@@ -2064,7 +2048,6 @@ mod tests {
                     coordinator.on_verified_remote_header(&topology, &header);
                     coordinator.on_state_provisions_received(&topology, provisions.clone());
                     coordinator.on_state_provisions_verified(
-                        &topology,
                         Arc::new(provisions),
                         Some(&header),
                         true,
