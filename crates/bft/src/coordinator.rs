@@ -93,6 +93,7 @@ use crate::chain_view::ChainView;
 use crate::commit_dedup::CommitDedupIndex;
 use crate::commit_pipeline::CommitPipeline;
 use crate::config::BftConfig;
+use crate::deferred_qc::DeferredQc;
 use crate::lookups::{committee_public_keys, vote_recipients};
 use crate::pending::{PendingBlock, PendingBlocks};
 use crate::proposal::{
@@ -143,7 +144,7 @@ pub struct BftCoordinator {
 
     /// QC deferred because the block header wasn't in memory when it formed.
     /// Adopted in `on_block_header` when the header arrives.
-    deferred_qc: Option<(BlockHash, QuorumCertificate)>,
+    deferred_qc: DeferredQc,
 
     // ═══════════════════════════════════════════════════════════════════════════
     // Pending State
@@ -218,7 +219,7 @@ impl BftCoordinator {
             ),
             committed_state_root: recovered.jmt_root.unwrap_or(StateRoot::ZERO),
             latest_qc: recovered.latest_qc,
-            deferred_qc: None,
+            deferred_qc: DeferredQc::new(),
             pending_blocks: PendingBlocks::new(),
             votes: VoteKeeper::new(),
             commits: CommitPipeline::new(),
@@ -1154,14 +1155,9 @@ impl BftCoordinator {
         topology_snapshot: &TopologySnapshot,
         block_hash: BlockHash,
     ) {
-        let Some((deferred_hash, deferred_qc)) = self.deferred_qc.take() else {
+        let Some(deferred_qc) = self.deferred_qc.take_for(block_hash) else {
             return;
         };
-
-        if deferred_hash != block_hash {
-            self.deferred_qc = Some((deferred_hash, deferred_qc));
-            return;
-        }
 
         let should_adopt = self
             .latest_qc
@@ -1986,7 +1982,7 @@ impl BftCoordinator {
                     height = height.inner(),
                     "Deferring QC adoption — block header not yet in memory"
                 );
-                self.deferred_qc = Some((block_hash, qc.clone()));
+                self.deferred_qc.defer(block_hash, qc.clone());
             }
         }
 
