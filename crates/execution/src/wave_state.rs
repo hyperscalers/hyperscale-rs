@@ -258,7 +258,7 @@ impl WaveState {
     }
 
     /// Whether the local EC has been fed into this wave (via
-    /// `add_execution_certificate` with `ec.wave_id == self.wave_id`).
+    /// `add_execution_certificate` with `ec.wave_id() == &self.wave_id`).
     #[must_use]
     pub const fn local_ec_emitted(&self) -> bool {
         self.local_ec_emitted
@@ -408,11 +408,11 @@ impl WaveState {
         let Some(local_ec) = self
             .execution_certificates
             .iter()
-            .find(|ec| ec.wave_id == self.wave_id)
+            .find(|ec| ec.wave_id() == &self.wave_id)
         else {
             return false;
         };
-        local_ec.tx_outcomes.iter().all(|outcome| {
+        local_ec.tx_outcomes().iter().all(|outcome| {
             outcome.is_aborted() || self.execution_receipts.contains_key(&outcome.tx_hash())
         })
     }
@@ -505,7 +505,7 @@ impl WaveState {
 
     /// Feed an EC into the wave. Handles dedup (by canonical hash), updates
     /// per-tx coverage, and tracks aborts/failures. For our own local EC
-    /// (`ec.wave_id == self.wave_id`), records the admitted root and runs
+    /// (`ec.wave_id() == &self.wave_id`), records the admitted root and runs
     /// `reconcile_local_ec_decision` — which compares against the local
     /// vote when both are known. The local EC may arrive before the local
     /// vote in cross-shard waves where peers aggregate the EC before this
@@ -514,14 +514,14 @@ impl WaveState {
     ///
     /// Returns `true` if the wave is now complete (ready for `finalize_wave`).
     pub fn add_execution_certificate(&mut self, ec: Arc<ExecutionCertificate>) -> bool {
-        if !self.seen_ec_wave_ids.insert(ec.wave_id.clone()) {
+        if !self.seen_ec_wave_ids.insert(ec.wave_id().clone()) {
             return self.is_complete();
         }
 
         let shard = ec.shard_group_id();
-        let is_local = ec.wave_id == self.wave_id;
+        let is_local = ec.wave_id() == &self.wave_id;
 
-        for outcome in &ec.tx_outcomes {
+        for outcome in ec.tx_outcomes() {
             if let Some(covered) = self.covered_shards.get_mut(&outcome.tx_hash()) {
                 covered.insert(shard);
                 if outcome.is_aborted() {
@@ -534,7 +534,7 @@ impl WaveState {
         }
 
         if is_local {
-            self.admitted_local_ec_root = Some(ec.global_receipt_root);
+            self.admitted_local_ec_root = Some(ec.global_receipt_root());
             self.local_ec_emitted = true;
             self.reconcile_local_ec_root();
         }
@@ -714,27 +714,27 @@ impl WaveState {
         let required_remote_wave_ids: HashSet<WaveId> = self
             .execution_certificates
             .iter()
-            .filter(|ec| ec.wave_id != self.wave_id)
+            .filter(|ec| ec.wave_id() != &self.wave_id)
             .filter(|ec| {
-                ec.tx_outcomes.iter().any(|outcome| {
+                ec.tx_outcomes().iter().any(|outcome| {
                     self.participating_shards.contains_key(&outcome.tx_hash())
                         && !self.tracker_aborted.contains(&outcome.tx_hash())
                 })
             })
-            .map(|ec| ec.wave_id.clone())
+            .map(|ec| ec.wave_id().clone())
             .collect();
 
         let mut ecs: Vec<Arc<ExecutionCertificate>> = self
             .execution_certificates
             .iter()
             .filter(|ec| {
-                ec.wave_id == self.wave_id || required_remote_wave_ids.contains(&ec.wave_id)
+                ec.wave_id() == &self.wave_id || required_remote_wave_ids.contains(ec.wave_id())
             })
             .cloned()
             .collect();
 
         ecs.sort_by(|a, b| {
-            (&a.shard_group_id(), &a.wave_id).cmp(&(&b.shard_group_id(), &b.wave_id))
+            (&a.shard_group_id(), a.wave_id()).cmp(&(&b.shard_group_id(), b.wave_id()))
         });
 
         WaveCertificate::new(self.wave_id.clone(), ecs)
@@ -1275,7 +1275,7 @@ mod tests {
         let wc = w.create_wave_certificate();
         assert_eq!(wc.execution_certificates().len(), 1);
         assert_eq!(
-            wc.execution_certificates()[0].wave_id.shard_group_id(),
+            wc.execution_certificates()[0].wave_id().shard_group_id(),
             ShardGroupId::new(0)
         );
     }

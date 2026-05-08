@@ -269,7 +269,7 @@ impl WaveRegistry {
     /// early-arrival buffer.
     pub fn classify_attestation(&self, ec: &ExecutionCertificate) -> AttestationRouting {
         let mut routing = AttestationRouting::default();
-        for outcome in &ec.tx_outcomes {
+        for outcome in ec.tx_outcomes() {
             match self.assignments.get(&outcome.tx_hash()) {
                 Some(wave_id) => {
                     routing.affected_waves.insert(wave_id.clone());

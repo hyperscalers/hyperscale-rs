@@ -79,7 +79,7 @@ pub struct EarlyArrivalBuffer {
 
     /// Per-EC bookkeeping. `tx_index` and `pending_routing` must stay
     /// consistent: an EC present in `tx_index[tx_hash]` for some `tx_hash`
-    /// MUST have a `BufferedEc` entry in `pending_routing[ec.wave_id]` with
+    /// MUST have a `BufferedEc` entry in `pending_routing[ec.wave_id()]` with
     /// that `tx_hash` in its `pending_txs` set. Enforced by `buffer_ec`,
     /// `clear_routed`, `drain_ecs_for_txs`, and `gc_stale_ecs`.
     pending_routing: HashMap<WaveId, BufferedEc>,
@@ -132,7 +132,7 @@ impl EarlyArrivalBuffer {
         }
         let entry = self
             .pending_routing
-            .entry(ec.wave_id.clone())
+            .entry(ec.wave_id().clone())
             .or_insert_with(|| BufferedEc {
                 ec: Arc::clone(ec),
                 pending_txs: HashSet::new(),
@@ -152,14 +152,14 @@ impl EarlyArrivalBuffer {
     /// The reverse index is NOT touched here — the EC's `tx_hashes` are
     /// drained explicitly by [`drain_ecs_for_txs`] when those txs commit.
     pub fn clear_routed(&mut self, ec: &Arc<ExecutionCertificate>, tx_hashes: &[TxHash]) {
-        let Some(entry) = self.pending_routing.get_mut(&ec.wave_id) else {
+        let Some(entry) = self.pending_routing.get_mut(ec.wave_id()) else {
             return;
         };
         for tx_hash in tx_hashes {
             entry.pending_txs.remove(tx_hash);
         }
         if entry.pending_txs.is_empty() {
-            self.pending_routing.remove(&ec.wave_id);
+            self.pending_routing.remove(ec.wave_id());
         }
     }
 
@@ -188,7 +188,7 @@ impl EarlyArrivalBuffer {
     }
 
     /// Drop buffered ECs whose own deadline has elapsed. The deadline is
-    /// `ec.vote_anchor_ts + RETENTION_HORIZON`, BFT-attested by the
+    /// `ec.vote_anchor_ts() + RETENTION_HORIZON`, BFT-attested by the
     /// remote committee — the same bound the sender uses on the outbound
     /// side. Past it, every tx the EC mentions has expired its
     /// `validity_range` and either terminated or aborted, so no local

@@ -40,7 +40,7 @@ fn append_ec_to_batch(
     batch_put_raw::<ExecutionCertsCf>(
         batch,
         primary_cf,
-        &cert.wave_id,
+        cert.wave_id(),
         cert,
         cert.cached_sbor_bytes(),
     );

@@ -21,21 +21,12 @@ use crate::{
 /// Contains the BLS aggregated signature from 2f+1 validators plus per-tx
 /// outcomes so remote shards can extract individual transaction results.
 pub struct ExecutionCertificate {
-    /// Self-contained wave identifier (shard + height + remote dependencies).
-    pub wave_id: WaveId,
-    /// Consensus height at which quorum was reached.
-    ///
-    /// Must match the `vote_anchor_ts` in the aggregated votes. Needed to
-    /// reconstruct the BLS signing message for signature verification.
-    pub vote_anchor_ts: WeightedTimestamp,
-    /// Merkle root over per-tx outcome leaves.
-    pub global_receipt_root: GlobalReceiptRoot,
-    /// Per-transaction outcomes (in wave order = block order).
-    pub tx_outcomes: Vec<TxOutcome>,
-    /// BLS aggregated signature from 2f+1 validators.
-    pub aggregated_signature: Bls12381G2Signature,
-    /// Which validators signed (bitfield indexed by committee position).
-    pub signers: SignerBitfield,
+    wave_id: WaveId,
+    vote_anchor_ts: WeightedTimestamp,
+    global_receipt_root: GlobalReceiptRoot,
+    tx_outcomes: Vec<TxOutcome>,
+    aggregated_signature: Bls12381G2Signature,
+    signers: SignerBitfield,
     /// Cached SBOR-encoded bytes. Populated at construction or after
     /// deserialization to avoid re-serialization on storage writes.
     cached_sbor: Option<Vec<u8>>,
@@ -177,6 +168,45 @@ impl ExecutionCertificate {
         };
         ec.populate_cached_sbor();
         ec
+    }
+
+    /// Self-contained wave identifier (shard + height + remote dependencies).
+    #[must_use]
+    pub const fn wave_id(&self) -> &WaveId {
+        &self.wave_id
+    }
+
+    /// Consensus height at which quorum was reached.
+    ///
+    /// Must match the `vote_anchor_ts` in the aggregated votes. Needed to
+    /// reconstruct the BLS signing message for signature verification.
+    #[must_use]
+    pub const fn vote_anchor_ts(&self) -> WeightedTimestamp {
+        self.vote_anchor_ts
+    }
+
+    /// Merkle root over per-tx outcome leaves.
+    #[must_use]
+    pub const fn global_receipt_root(&self) -> GlobalReceiptRoot {
+        self.global_receipt_root
+    }
+
+    /// Per-transaction outcomes (in wave order = block order).
+    #[must_use]
+    pub const fn tx_outcomes(&self) -> &Vec<TxOutcome> {
+        &self.tx_outcomes
+    }
+
+    /// BLS aggregated signature from 2f+1 validators.
+    #[must_use]
+    pub const fn aggregated_signature(&self) -> Bls12381G2Signature {
+        self.aggregated_signature
+    }
+
+    /// Which validators signed (bitfield indexed by committee position).
+    #[must_use]
+    pub const fn signers(&self) -> &SignerBitfield {
+        &self.signers
     }
 
     /// The shard that produced this certificate.

@@ -110,12 +110,12 @@ impl OutboundExecutionCertificateTracker {
         if recipients.is_empty() {
             return;
         }
-        let key = (certificate.wave_id.clone(), target_shard);
+        let key = (certificate.wave_id().clone(), target_shard);
         if self.entries.contains_key(&key) {
             return;
         }
         debug!(
-            wave = %certificate.wave_id,
+            wave = %certificate.wave_id(),
             target_shard = target_shard.inner(),
             recipients = recipients.len(),
             "Tracking outbound execution certificate"

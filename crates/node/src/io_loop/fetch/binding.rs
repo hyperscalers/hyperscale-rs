@@ -338,7 +338,7 @@ impl FetchBinding for ExecCertBinding {
             Box::new(move |result| {
                 if let Ok(response) = result {
                     let certs = response.certificates.unwrap_or_default();
-                    let split = partition_solicited(certs, &failed_ids, |c| c.wave_id.clone());
+                    let split = partition_solicited(certs, &failed_ids, |c| c.wave_id().clone());
                     let had_misses = !split.missing.is_empty();
                     if !split.kept.is_empty() {
                         // Refcount is 1 right after decode, so each unwrap moves.

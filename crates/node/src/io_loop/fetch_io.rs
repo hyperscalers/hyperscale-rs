@@ -114,7 +114,7 @@ where
             }
             ProtocolEvent::ExecutionCertificateAdmitted { certificate } => {
                 self.drive_fetch::<ExecCertBinding>(FetchInput::Admitted {
-                    ids: vec![certificate.wave_id.clone()],
+                    ids: vec![certificate.wave_id().clone()],
                 });
             }
             _ => {}

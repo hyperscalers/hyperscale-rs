@@ -226,7 +226,7 @@ fn make_test_block_with_ecs(height: BlockHeight, ecs: Vec<Arc<ExecutionCertifica
     if ecs.is_empty() {
         return block;
     }
-    let certificate = Arc::new(WaveCertificate::new(ecs[0].wave_id.clone(), ecs));
+    let certificate = Arc::new(WaveCertificate::new(ecs[0].wave_id().clone(), ecs));
     let new_fw = Arc::new(FinalizedWave::new(certificate, vec![]));
     match block {
         Block::Live {
@@ -277,7 +277,7 @@ fn commit_empty_blocks_up_to(storage: &(impl ChainReader + ChainWriter), target:
 /// Panics if any assertion fails (this is a test helper).
 pub fn test_ec_storage_roundtrip(storage: &(impl ChainReader + ChainWriter)) {
     let ec = make_test_execution_certificate(1, BlockHeight::new(10));
-    let wave_id = ec.wave_id.clone();
+    let wave_id = ec.wave_id().clone();
 
     // Initially absent.
     assert!(storage.get_execution_certificate(&wave_id).is_none());
@@ -290,7 +290,7 @@ pub fn test_ec_storage_roundtrip(storage: &(impl ChainReader + ChainWriter)) {
     let direct = storage
         .get_execution_certificate(&wave_id)
         .expect("EC must be retrievable by wave_id");
-    assert_eq!(direct.wave_id, wave_id);
+    assert_eq!(direct.wave_id(), &wave_id);
     assert_eq!(direct.block_height(), BlockHeight::new(10));
 }
 
@@ -322,7 +322,11 @@ pub fn test_ec_storage_batch(storage: &(impl ChainReader + ChainWriter)) {
     let qc20 = make_test_qc(&block20);
     storage.commit_block(&Arc::new(block20), &Arc::new(qc20));
 
-    let known = [ec1.wave_id, ec2.wave_id, ec3.wave_id.clone()];
+    let known = [
+        ec1.wave_id().clone(),
+        ec2.wave_id().clone(),
+        ec3.wave_id().clone(),
+    ];
     let batch = storage.get_execution_certificates_batch(&known);
     assert_eq!(batch.len(), 3);
 
@@ -331,7 +335,8 @@ pub fn test_ec_storage_batch(storage: &(impl ChainReader + ChainWriter)) {
         BlockHeight::new(999),
         known[0].remote_shards().iter().copied().collect(),
     );
-    let partial = storage.get_execution_certificates_batch(&[ec3.wave_id.clone(), missing_wave_id]);
+    let partial =
+        storage.get_execution_certificates_batch(&[ec3.wave_id().clone(), missing_wave_id]);
     assert_eq!(partial.len(), 1);
-    assert_eq!(partial[0].wave_id, ec3.wave_id);
+    assert_eq!(partial[0].wave_id(), ec3.wave_id());
 }

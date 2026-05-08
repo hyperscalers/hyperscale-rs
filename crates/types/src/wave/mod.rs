@@ -272,7 +272,7 @@ mod tests {
     #[test]
     fn ec_deadline_is_vote_anchor_ts_plus_retention_horizon() {
         let ec = make_test_wave_ec(0, 1);
-        assert_eq!(ec.deadline(), ec.vote_anchor_ts.plus(RETENTION_HORIZON));
+        assert_eq!(ec.deadline(), ec.vote_anchor_ts().plus(RETENTION_HORIZON));
     }
 
     fn make_test_wave_ec(shard: u64, seed: u8) -> Arc<ExecutionCertificate> {
@@ -358,7 +358,7 @@ mod tests {
     fn decode_rejects_wave_cert_missing_local_ec() {
         use sbor::DecodeError;
         // WC's wave_id has shard=0 but its only EC is for shard=1, so no
-        // ec.wave_id matches wc.wave_id. Pre-fix this decoded successfully
+        // ec.wave_id() matches wc.wave_id. Pre-fix this decoded successfully
         // and then panicked the IO loop on first call to local_ec().
         let wc = WaveCertificate::new(
             make_wave_id(0, BlockHeight::new(42), &[1]),

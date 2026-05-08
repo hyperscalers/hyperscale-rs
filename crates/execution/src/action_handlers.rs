@@ -196,25 +196,25 @@ pub fn verify_execution_certificate_signature(
     public_keys: &[Bls12381G1PublicKey],
 ) -> bool {
     let msg = exec_vote_message(
-        certificate.vote_anchor_ts,
-        &certificate.wave_id,
+        certificate.vote_anchor_ts(),
+        certificate.wave_id(),
         certificate.shard_group_id(),
-        &certificate.global_receipt_root,
-        u32::try_from(certificate.tx_outcomes.len()).unwrap_or(u32::MAX),
+        &certificate.global_receipt_root(),
+        u32::try_from(certificate.tx_outcomes().len()).unwrap_or(u32::MAX),
     );
 
     let signer_keys: Vec<_> = public_keys
         .iter()
         .enumerate()
-        .filter(|(i, _)| certificate.signers.is_set(*i))
+        .filter(|(i, _)| certificate.signers().is_set(*i))
         .map(|(_, pk)| *pk)
         .collect();
 
     if signer_keys.is_empty() {
-        certificate.aggregated_signature == zero_bls_signature()
+        certificate.aggregated_signature() == zero_bls_signature()
     } else {
         Bls12381G1PublicKey::aggregate(&signer_keys, false).is_ok_and(|aggregated_pk| {
-            verify_bls12381_v1(&msg, &aggregated_pk, &certificate.aggregated_signature)
+            verify_bls12381_v1(&msg, &aggregated_pk, &certificate.aggregated_signature())
         })
     }
 }
@@ -599,11 +599,11 @@ mod tests {
         ];
 
         let ec = aggregate_execution_certificate(&wid, root, &votes, &committee);
-        assert!(ec.signers.is_set(1));
-        assert!(ec.signers.is_set(3));
-        assert!(!ec.signers.is_set(0));
-        assert!(!ec.signers.is_set(2));
-        assert_eq!(ec.tx_outcomes, outcomes);
+        assert!(ec.signers().is_set(1));
+        assert!(ec.signers().is_set(3));
+        assert!(!ec.signers().is_set(0));
+        assert!(!ec.signers().is_set(2));
+        assert_eq!(ec.tx_outcomes(), &outcomes);
     }
 
     #[test]
@@ -635,9 +635,13 @@ mod tests {
         ];
 
         let ec = aggregate_execution_certificate(&wid, root, &votes, &committee);
-        assert!(ec.signers.is_set(0));
-        assert!(!ec.signers.is_set(1));
-        assert_eq!(ec.signers.count_ones(), 1, "duplicate votes must collapse");
+        assert!(ec.signers().is_set(0));
+        assert!(!ec.signers().is_set(1));
+        assert_eq!(
+            ec.signers().count_ones(),
+            1,
+            "duplicate votes must collapse"
+        );
     }
 
     // ─── batch_verify_execution_votes ────────────────────────────────────

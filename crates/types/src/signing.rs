@@ -257,7 +257,7 @@ pub fn exec_cert_batch_message(
 ) -> Vec<u8> {
     let mut hasher = Hasher::new();
     for c in certificates {
-        hasher.update(c.global_receipt_root.as_raw().as_bytes());
+        hasher.update(c.global_receipt_root().as_raw().as_bytes());
     }
     let digest = hasher.finalize();
 

@@ -33,7 +33,7 @@ const MAX_EXECUTION_CERTIFICATES_PER_WAVE: usize = 1024;
 /// # Invariant (well-formed WC)
 ///
 /// A well-formed `WaveCertificate` contains **exactly one local EC** — the
-/// EC where `ec.wave_id == wc.wave_id`. The local EC is the authoritative
+/// EC where `ec.wave_id() == wc.wave_id`. The local EC is the authoritative
 /// source for the wave's tx set and canonical (block) ordering. Remote ECs
 /// attest against their own wave decompositions and may cover only subsets;
 /// the local shard, by construction, produces a single EC per wave.
@@ -99,7 +99,7 @@ impl WaveCertificate {
         let mut hasher = Hasher::new();
         for ec in &self.execution_certificates {
             hasher.update(&basic_encode(&ec.shard_group_id()).unwrap());
-            hasher.update(&basic_encode(&ec.wave_id).unwrap());
+            hasher.update(&basic_encode(&ec.wave_id()).unwrap());
         }
         WaveReceiptHash::from_raw(Hash::from_hash_bytes(hasher.finalize().as_bytes()))
     }
@@ -162,7 +162,7 @@ impl<D: Decoder<NoCustomValueKind>> Decode<NoCustomValueKind, D> for WaveCertifi
         // authoritative for tx ordering.
         let local_ec_count = execution_certificates
             .iter()
-            .filter(|ec| ec.wave_id == wave_id)
+            .filter(|ec| ec.wave_id() == &wave_id)
             .count();
         if local_ec_count != 1 {
             return Err(DecodeError::InvalidCustomValue);

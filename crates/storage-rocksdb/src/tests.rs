@@ -840,7 +840,7 @@ fn test_ec_storage_batch() {
 fn test_ec_survives_reopen() {
     let temp_dir = TempDir::new().unwrap();
     let ec = make_test_execution_certificate(1, BlockHeight::new(1));
-    let wave_id = ec.wave_id.clone();
+    let wave_id = ec.wave_id().clone();
 
     {
         let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
@@ -874,7 +874,7 @@ fn test_ec_atomic_with_block_commit() {
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
     let ec = make_test_execution_certificate(1, BlockHeight::new(1));
-    let wave_id = ec.wave_id.clone();
+    let wave_id = ec.wave_id().clone();
     let mut block = make_test_block(BlockHeight::new(1));
     push_wave(
         &mut block,

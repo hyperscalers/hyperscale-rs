@@ -1005,7 +1005,7 @@ impl ExecutionCoordinator {
 
         tracing::debug!(
             wave = %wave_id,
-            tx_count = certificate.tx_outcomes.len(),
+            tx_count = certificate.tx_outcomes().len(),
             remote_shards = remote_shards.len(),
             "Wave leader broadcasting EC to local peers and remote shards"
         );
@@ -1039,7 +1039,7 @@ impl ExecutionCoordinator {
         if !self.pending_ec_verifications.insert(wire_hash) {
             tracing::debug!(
                 shard = shard.inner(),
-                wave = %cert.wave_id,
+                wave = %cert.wave_id(),
                 "Duplicate EC verification dispatch suppressed"
             );
             return vec![];
@@ -1085,7 +1085,7 @@ impl ExecutionCoordinator {
         if !valid {
             tracing::warn!(
                 shard = certificate.shard_group_id().inner(),
-                wave = %certificate.wave_id,
+                wave = %certificate.wave_id(),
                 "Invalid execution certificate signature"
             );
             return vec![];
@@ -1097,7 +1097,7 @@ impl ExecutionCoordinator {
         if !ec_has_shard_quorum_power(topology, &certificate) {
             tracing::warn!(
                 shard = certificate.shard_group_id().inner(),
-                wave = %certificate.wave_id,
+                wave = %certificate.wave_id(),
                 "Discarding sub-quorum execution certificate"
             );
             return vec![];
@@ -1114,15 +1114,15 @@ impl ExecutionCoordinator {
         let cleared = self.expected_certs.mark_fulfilled(
             shard,
             ec_arc.block_height(),
-            &ec_arc.wave_id,
-            ec_arc.tx_outcomes.iter().map(TxOutcome::tx_hash),
+            ec_arc.wave_id(),
+            ec_arc.tx_outcomes().iter().map(TxOutcome::tx_hash),
             ec_arc.deadline(),
         );
         if cleared {
             tracing::debug!(
                 source_shard = shard.inner(),
                 block_height = ec_arc.block_height().inner(),
-                wave = %ec_arc.wave_id,
+                wave = %ec_arc.wave_id(),
                 at_local_ts_ms = self.committed_ts.as_millis(),
                 "Fulfilled expected exec cert"
             );
@@ -1138,9 +1138,9 @@ impl ExecutionCoordinator {
         // it in scan_complete_waves, and persist it for fallback serving to
         // remote shards.
         if shard == topology.local_shard() {
-            self.waves.mark_ec_dispatched(ec_arc.wave_id.clone());
+            self.waves.mark_ec_dispatched(ec_arc.wave_id().clone());
             // EC received from wave leader — cancel any pending vote retry.
-            self.waves.clear_vote_retry(&ec_arc.wave_id);
+            self.waves.clear_vote_retry(ec_arc.wave_id());
             // Make the verified cert available to the io_loop's inbound EC
             // fetch handler for fallback serving until block commit.
             self.exec_certs.insert(Arc::clone(&ec_arc));
@@ -1612,10 +1612,10 @@ impl ExecutionCoordinator {
         let local_ec = wc
             .execution_certificates()
             .iter()
-            .find(|ec| &ec.wave_id == wc.wave_id())
+            .find(|ec| ec.wave_id() == wc.wave_id())
             .expect("WaveCertificate invariant: local EC must be present");
-        let mut receipts: Vec<StoredReceipt> = Vec::with_capacity(local_ec.tx_outcomes.len());
-        for outcome in &local_ec.tx_outcomes {
+        let mut receipts: Vec<StoredReceipt> = Vec::with_capacity(local_ec.tx_outcomes().len());
+        for outcome in local_ec.tx_outcomes() {
             if outcome.is_aborted() {
                 continue;
             }
