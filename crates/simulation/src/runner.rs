@@ -600,7 +600,8 @@ impl SimulationRunner {
             if next_time > end_time {
                 debug!(
                     remaining_events = self.event_queue.len(),
-                    "Time limit reached, remaining events stay in the queue until the next simulation step (call to run_until)"
+                    "Time limit reached, remaining events stay in the queue until the next simulation step 
+                    (i.e.  `run_until` is called again)"
                 );
                 break;
             }
