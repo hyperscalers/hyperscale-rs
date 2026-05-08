@@ -454,7 +454,7 @@ impl Simulator {
 
     /// Determine the target shard for a transaction.
     fn get_target_shard(&self, tx: &RoutableTransaction) -> ShardGroupId {
-        tx.declared_writes
+        tx.declared_writes()
             .first()
             .map_or(ShardGroupId::new(0), |node_id| {
                 shard_for_node(node_id, u64::from(self.config.num_shards))

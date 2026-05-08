@@ -302,7 +302,7 @@ mod tests {
 
         let tx = tx.unwrap();
         assert!(
-            !tx.declared_writes.is_empty(),
+            !tx.declared_writes().is_empty(),
             "Transaction should have declared writes"
         );
     }
@@ -340,7 +340,7 @@ mod tests {
                 .expect("Should generate a transaction");
 
             // All writes should be on the target shard
-            for write in tx.declared_writes.iter() {
+            for write in tx.declared_writes().iter() {
                 let write_shard = shard_for_node(write, num_shards);
                 assert_eq!(
                     write_shard, target_shard,
@@ -373,7 +373,7 @@ mod tests {
 
             // At least one write should be on the target shard
             let shards_written: std::collections::HashSet<_> = tx
-                .declared_writes
+                .declared_writes()
                 .iter()
                 .map(|w| shard_for_node(w, num_shards))
                 .collect();
@@ -401,9 +401,9 @@ mod tests {
         // All transactions should involve the target shard
         for tx in &batch {
             let shards_involved: std::collections::HashSet<_> = tx
-                .declared_writes
+                .declared_writes()
                 .iter()
-                .chain(tx.declared_reads.iter())
+                .chain(tx.declared_reads().iter())
                 .map(|n| shard_for_node(n, num_shards))
                 .collect();
 

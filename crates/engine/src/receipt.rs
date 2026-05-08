@@ -63,9 +63,9 @@ pub fn build_executed_tx<S: SubstateDatabase>(
     let success = matches!(commit.outcome, TransactionOutcome::Success(_));
 
     let declared_nodes: Vec<NodeId> = tx
-        .declared_reads
+        .declared_reads()
         .iter()
-        .chain(tx.declared_writes.iter())
+        .chain(tx.declared_writes().iter())
         .copied()
         .collect();
 

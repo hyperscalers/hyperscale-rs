@@ -174,8 +174,8 @@ pub fn select_transactions(
                 deduped += 1;
                 return false;
             }
-            if !tx.validity_range.is_well_formed(validity_anchor)
-                || !tx.validity_range.contains(validity_anchor)
+            if !tx.validity_range().is_well_formed(validity_anchor)
+                || !tx.validity_range().contains(validity_anchor)
             {
                 expired += 1;
                 return false;

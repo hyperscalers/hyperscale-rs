@@ -381,9 +381,9 @@ impl TopologySnapshot {
     /// every touched shard needs every input substate it doesn't own
     /// locally — reads and writes participate symmetrically here.
     pub fn all_shards_for_transaction(&self, tx: &RoutableTransaction) -> Vec<ShardGroupId> {
-        tx.declared_reads
+        tx.declared_reads()
             .iter()
-            .chain(tx.declared_writes.iter())
+            .chain(tx.declared_writes().iter())
             .map(|node_id| self.shard_for_node_id(node_id))
             .collect::<BTreeSet<_>>()
             .into_iter()
@@ -402,7 +402,7 @@ impl TopologySnapshot {
 
     /// Check if a transaction involves the local shard for consensus.
     pub fn involves_local_shard_for_consensus(&self, tx: &RoutableTransaction) -> bool {
-        tx.declared_writes
+        tx.declared_writes()
             .iter()
             .any(|node_id| self.shard_for_node_id(node_id) == self.local_shard)
     }
@@ -410,9 +410,9 @@ impl TopologySnapshot {
     /// Check if this shard is involved in a transaction at all.
     pub fn involves_local_shard(&self, tx: &RoutableTransaction) -> bool {
         let local = self.local_shard;
-        tx.declared_writes
+        tx.declared_writes()
             .iter()
-            .chain(tx.declared_reads.iter())
+            .chain(tx.declared_reads().iter())
             .any(|node_id| self.shard_for_node_id(node_id) == local)
     }
 }

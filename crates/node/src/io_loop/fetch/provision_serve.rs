@@ -45,18 +45,18 @@ pub fn serve_provision_request(
     for tx in all_txs {
         // Check if this transaction involves the requesting target shard.
         let involves_target = tx
-            .declared_reads
+            .declared_reads()
             .iter()
-            .chain(tx.declared_writes.iter())
+            .chain(tx.declared_writes().iter())
             .any(|node_id| shard_for_node(node_id, num_shards) == req.target_shard);
         if !involves_target {
             continue;
         }
 
         let mut owned_nodes: Vec<_> = tx
-            .declared_reads
+            .declared_reads()
             .iter()
-            .chain(tx.declared_writes.iter())
+            .chain(tx.declared_writes().iter())
             .filter(|&node_id| shard_for_node(node_id, num_shards) == local_shard)
             .copied()
             .collect();

@@ -355,8 +355,8 @@ impl ExecutionCoordinator {
                     let conflicts = self.provisioning.register_tx(
                         tx_hash,
                         topology,
-                        &tx.declared_reads,
-                        &tx.declared_writes,
+                        tx.declared_reads(),
+                        tx.declared_writes(),
                     );
                     if !self.provisioning.is_fully_provisioned(&tx_hash) {
                         reverse_conflicts.extend(conflicts);
@@ -1931,9 +1931,9 @@ impl ExecutionCoordinator {
                 continue;
             }
             let mut owned_nodes: Vec<_> = tx
-                .declared_reads
+                .declared_reads()
                 .iter()
-                .chain(tx.declared_writes.iter())
+                .chain(tx.declared_writes().iter())
                 .filter(|&node_id| topology.shard_for_node_id(node_id) == local_shard)
                 .copied()
                 .collect();
@@ -1944,9 +1944,9 @@ impl ExecutionCoordinator {
                 // Build per-target-shard node needs for conflict detection.
                 let mut target_nodes: Vec<(ShardGroupId, Vec<NodeId>)> = Vec::new();
                 let all_nodes: Vec<&NodeId> = tx
-                    .declared_reads
+                    .declared_reads()
                     .iter()
-                    .chain(tx.declared_writes.iter())
+                    .chain(tx.declared_writes().iter())
                     .collect();
                 for &target_shard in &topology
                     .all_shards_for_transaction(tx)

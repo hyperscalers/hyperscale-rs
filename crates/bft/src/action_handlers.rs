@@ -290,14 +290,14 @@ pub fn verify_transaction_root(
 
     let mut windows_valid = true;
     for tx in transactions {
-        if !tx.validity_range.is_well_formed(validity_anchor)
-            || !tx.validity_range.contains(validity_anchor)
+        if !tx.validity_range().is_well_formed(validity_anchor)
+            || !tx.validity_range().contains(validity_anchor)
         {
             tracing::warn!(
                 tx_hash = ?tx.hash(),
                 anchor_ms = validity_anchor.as_millis(),
-                start_ms = tx.validity_range.start_timestamp_inclusive.as_millis(),
-                end_ms = tx.validity_range.end_timestamp_exclusive.as_millis(),
+                start_ms = tx.validity_range().start_timestamp_inclusive.as_millis(),
+                end_ms = tx.validity_range().end_timestamp_exclusive.as_millis(),
                 "Transaction validity range check FAILED"
             );
             windows_valid = false;
