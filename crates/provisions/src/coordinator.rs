@@ -494,8 +494,8 @@ impl ProvisionCoordinator {
         // for paths where no admission event fires (orphan cleanup in
         // `on_block_committed`).
         if let Some(header) = committed_header {
-            let shard = header.header().shard_group_id();
-            let height = header.header().height();
+            let shard = header.shard_group_id();
+            let height = header.height();
             let key = (shard, height);
 
             if self.expected.on_provisions_verified(shard, height) {
