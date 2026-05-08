@@ -331,7 +331,7 @@ impl ExecutionCoordinator {
             }
 
             // Dispatch execution if fully provisioned at creation.
-            if let Some(action) = wave_state.dispatch_if_ready(self.provisioning.verified()) {
+            if let Some(action) = wave_state.dispatch_if_ready(&self.provisioning) {
                 dispatch_actions.push(action);
             }
 
@@ -599,7 +599,7 @@ impl ExecutionCoordinator {
 
             wave.absorb_ready_provisions(&self.provisioning, committed_ts);
 
-            if let Some(action) = wave.dispatch_if_ready(self.provisioning.verified()) {
+            if let Some(action) = wave.dispatch_if_ready(&self.provisioning) {
                 actions.push(action);
             }
         }

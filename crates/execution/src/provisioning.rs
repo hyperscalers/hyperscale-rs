@@ -224,12 +224,13 @@ impl ProvisioningTracker {
 
     // ─── Accessors ──────────────────────────────────────────────────────
 
-    /// Borrow the verified-provisions map. Threaded into
+    /// Verified provision entries for `tx_hash`, one slice element per
+    /// source-shard contribution. Threaded into
     /// [`WaveState::dispatch_if_ready`](crate::wave_state::WaveState::dispatch_if_ready)
-    /// so the wave can assemble cross-shard execution requests with a per-tx
-    /// lookup against committed provisions.
-    pub const fn verified(&self) -> &HashMap<TxHash, Vec<Arc<Vec<SubstateEntry>>>> {
-        &self.verified
+    /// so the wave can assemble cross-shard execution requests with a
+    /// per-tx lookup against committed provisions.
+    pub fn provisions_for(&self, tx_hash: TxHash) -> Option<&[Arc<Vec<SubstateEntry>>]> {
+        self.verified.get(&tx_hash).map(Vec::as_slice)
     }
 
     pub fn verified_len(&self) -> usize {
@@ -242,6 +243,17 @@ impl ProvisioningTracker {
 
     pub fn received_len(&self) -> usize {
         self.received.len()
+    }
+}
+
+#[cfg(test)]
+impl ProvisioningTracker {
+    /// Test-only door for seeding `verified` directly. Production code
+    /// populates this map via [`Self::absorb_provisions`]; tests that only
+    /// exercise the dispatch lookup don't need to construct full
+    /// [`Provisions`](hyperscale_types::Provisions) batches.
+    pub fn seed_provisions(&mut self, tx_hash: TxHash, entries: Vec<Arc<Vec<SubstateEntry>>>) {
+        self.verified.insert(tx_hash, entries);
     }
 }
 

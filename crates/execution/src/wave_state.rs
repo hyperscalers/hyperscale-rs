@@ -31,7 +31,7 @@ use std::time::Duration;
 use hyperscale_core::{Action, CrossShardExecutionRequest};
 use hyperscale_types::{
     BlockHash, BlockHeight, ExecutionCertificate, ExecutionOutcome, FinalizedWave,
-    GlobalReceiptRoot, RoutableTransaction, ShardGroupId, StateRoot, StoredReceipt, SubstateEntry,
+    GlobalReceiptRoot, RoutableTransaction, ShardGroupId, StateRoot, StoredReceipt,
     TransactionDecision, TxHash, TxOutcome, WAVE_TIMEOUT, WaveCertificate, WaveId,
     WeightedTimestamp, compute_global_receipt_root,
 };
@@ -241,12 +241,6 @@ impl WaveState {
         &self.tx_hashes
     }
 
-    /// Transaction data by hash (for building execution requests).
-    #[must_use]
-    pub fn transaction(&self, tx_hash: TxHash) -> Option<&Arc<RoutableTransaction>> {
-        self.transactions.get(&tx_hash)
-    }
-
     // ── Provisioning ────────────────────────────────────────────────────
 
     /// Whether this wave has reached full provisioning.
@@ -284,24 +278,18 @@ impl WaveState {
     /// `committed_block_hash` would fold intervening blocks' cert writes
     /// (sourced from each validator's own local receipts) into the view,
     /// seeding divergence downstream.
-    pub fn dispatch_if_ready(
-        &mut self,
-        verified_provisions: &HashMap<TxHash, Vec<Arc<Vec<SubstateEntry>>>>,
-    ) -> Option<Action> {
+    pub fn dispatch_if_ready(&mut self, provisioning: &ProvisioningTracker) -> Option<Action> {
         if !self.is_fully_provisioned() || self.dispatched {
             return None;
         }
-        let action = self.build_dispatch_action(verified_provisions)?;
+        let action = self.build_dispatch_action(provisioning)?;
         self.dispatched = true;
         Some(action)
     }
 
     /// Pre-aborted txs are excluded — they produce no state change, so there's
     /// no reason to execute them.
-    fn build_dispatch_action(
-        &self,
-        verified_provisions: &HashMap<TxHash, Vec<Arc<Vec<SubstateEntry>>>>,
-    ) -> Option<Action> {
+    fn build_dispatch_action(&self, provisioning: &ProvisioningTracker) -> Option<Action> {
         if self.wave_id.is_zero() {
             // Single-shard wave: no provisions needed.
             let transactions: Vec<Arc<RoutableTransaction>> = self
@@ -329,7 +317,7 @@ impl WaveState {
                 continue;
             }
             let tx = self.transactions.get(&tx_hash)?;
-            let provisions = verified_provisions.get(&tx_hash)?.clone();
+            let provisions = provisioning.provisions_for(tx_hash)?.to_vec();
             requests.push(CrossShardExecutionRequest {
                 tx_hash,
                 transaction: Arc::clone(tx),
@@ -353,7 +341,7 @@ impl WaveState {
     /// Returns `true` iff this call transitioned the wave from "partial" to
     /// "all provisioned" — the caller uses that signal to emit the single
     /// per-wave execution dispatch action.
-    pub fn mark_tx_provisioned(&mut self, tx_hash: TxHash, at: WeightedTimestamp) -> bool {
+    fn mark_tx_provisioned(&mut self, tx_hash: TxHash, at: WeightedTimestamp) -> bool {
         if !self.tx_hash_set.contains(&tx_hash) {
             return false;
         }
@@ -711,8 +699,7 @@ impl WaveState {
     /// Whether a tx was aborted before dispatch (pre-dispatch reverse-conflict).
     /// Used by dispatch to skip executing txs the wave has already decided to
     /// abort.
-    #[must_use]
-    pub fn is_tx_explicitly_aborted(&self, tx_hash: TxHash) -> bool {
+    fn is_tx_explicitly_aborted(&self, tx_hash: TxHash) -> bool {
         self.explicit_aborts.contains(&tx_hash)
     }
 
@@ -898,6 +885,7 @@ mod tests {
     use hyperscale_types::test_utils::{test_node, test_transaction_with_nodes};
     use hyperscale_types::{
         Bls12381G2Signature, ConsensusReceipt, GlobalReceiptHash, Hash, SignerBitfield,
+        SubstateEntry,
     };
 
     use super::*;
@@ -1365,10 +1353,10 @@ mod tests {
 
         w.mark_tx_provisioned(h0, ts_for(WAVE_START + 1));
         w.mark_tx_provisioned(h1, ts_for(WAVE_START + 1));
-        let mut provisions: HashMap<TxHash, Vec<Arc<Vec<SubstateEntry>>>> = HashMap::new();
-        provisions.insert(h0, vec![Arc::new(Vec::new())]);
-        provisions.insert(h1, vec![Arc::new(Vec::new())]);
-        assert!(w.dispatch_if_ready(&provisions).is_some());
+        let mut provisioning = ProvisioningTracker::new();
+        provisioning.seed_provisions(h0, vec![Arc::new(Vec::new())]);
+        provisioning.seed_provisions(h1, vec![Arc::new(Vec::new())]);
+        assert!(w.dispatch_if_ready(&provisioning).is_some());
         assert!(w.dispatched());
 
         assert!(!w.record_abort(h0, ts_for(WAVE_START + 2)));
@@ -1458,15 +1446,15 @@ mod tests {
     #[test]
     fn dispatch_if_ready_single_shard_emits_execute_transactions_and_flips_flag() {
         let mut w = make_single_shard_wave(2);
-        let action = w.dispatch_if_ready(&HashMap::new());
-        match action {
+        let provisioning = ProvisioningTracker::new();
+        match w.dispatch_if_ready(&provisioning) {
             Some(Action::ExecuteTransactions { transactions, .. }) => {
                 assert_eq!(transactions.len(), 2);
             }
             other => panic!("expected ExecuteTransactions, got {other:?}"),
         }
         assert!(w.dispatched());
-        assert!(w.dispatch_if_ready(&HashMap::new()).is_none());
+        assert!(w.dispatch_if_ready(&provisioning).is_none());
     }
 
     #[test]
@@ -1475,7 +1463,8 @@ mod tests {
         let h0 = w.tx_hashes()[0];
         w.mark_tx_provisioned(h0, ts_for(WAVE_START + 1));
 
-        assert!(w.dispatch_if_ready(&HashMap::new()).is_none());
+        let provisioning = ProvisioningTracker::new();
+        assert!(w.dispatch_if_ready(&provisioning).is_none());
         assert!(!w.dispatched());
     }
 
@@ -1485,10 +1474,10 @@ mod tests {
         let h0 = w.tx_hashes()[0];
         w.mark_tx_provisioned(h0, ts_for(WAVE_START + 1));
 
-        let mut provisions: HashMap<TxHash, Vec<Arc<Vec<SubstateEntry>>>> = HashMap::new();
-        provisions.insert(h0, vec![Arc::new(Vec::<SubstateEntry>::new())]);
+        let mut provisioning = ProvisioningTracker::new();
+        provisioning.seed_provisions(h0, vec![Arc::new(Vec::<SubstateEntry>::new())]);
 
-        match w.dispatch_if_ready(&provisions) {
+        match w.dispatch_if_ready(&provisioning) {
             Some(Action::ExecuteCrossShardTransactions { requests, .. }) => {
                 assert_eq!(requests.len(), 1);
                 assert_eq!(requests[0].tx_hash, h0);
@@ -1504,7 +1493,8 @@ mod tests {
         let aborted = w.tx_hashes()[0];
         w.record_abort(aborted, ts_for(WAVE_START));
 
-        match w.dispatch_if_ready(&HashMap::new()) {
+        let provisioning = ProvisioningTracker::new();
+        match w.dispatch_if_ready(&provisioning) {
             Some(Action::ExecuteTransactions { transactions, .. }) => {
                 assert_eq!(transactions.len(), 1);
                 assert_ne!(transactions[0].hash(), aborted);
@@ -1519,7 +1509,8 @@ mod tests {
         let aborted = w.tx_hashes()[0];
         w.record_abort(aborted, ts_for(WAVE_START));
 
-        assert!(w.dispatch_if_ready(&HashMap::new()).is_none());
+        let provisioning = ProvisioningTracker::new();
+        assert!(w.dispatch_if_ready(&provisioning).is_none());
         assert!(!w.dispatched());
     }
 
@@ -1529,7 +1520,8 @@ mod tests {
         let h0 = w.tx_hashes()[0];
         w.mark_tx_provisioned(h0, ts_for(WAVE_START + 1));
 
-        assert!(w.dispatch_if_ready(&HashMap::new()).is_none());
+        let provisioning = ProvisioningTracker::new();
+        assert!(w.dispatch_if_ready(&provisioning).is_none());
         assert!(!w.dispatched());
     }
 }
