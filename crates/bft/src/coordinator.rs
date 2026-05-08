@@ -94,7 +94,7 @@ use crate::commit_dedup::CommitDedupIndex;
 use crate::commit_pipeline::CommitPipeline;
 use crate::config::BftConfig;
 use crate::lookups::{committee_public_keys, vote_recipients};
-use crate::pending::{PendingBlock, check_fetches};
+use crate::pending::{PendingBlock, PendingBlocks};
 use crate::proposal::{
     ProposalKind, ProposalTracker, TakeResult, assemble_build_action, dispatch_or_defer,
     select_finalized_waves, select_provisions, select_transactions,
@@ -149,7 +149,7 @@ pub struct BftCoordinator {
     // Pending State
     // ═══════════════════════════════════════════════════════════════════════════
     /// Pending blocks being assembled (hash -> pending block).
-    pending_blocks: HashMap<BlockHash, PendingBlock>,
+    pending_blocks: PendingBlocks,
 
     /// Vote accounting: per-block vote sets, own-vote locks, and
     /// received-vote equivocation tracking.
@@ -219,7 +219,7 @@ impl BftCoordinator {
             committed_state_root: recovered.jmt_root.unwrap_or(StateRoot::ZERO),
             latest_qc: recovered.latest_qc,
             deferred_qc: None,
-            pending_blocks: HashMap::new(),
+            pending_blocks: PendingBlocks::new(),
             votes: VoteKeeper::new(),
             commits: CommitPipeline::new(),
             verification: VerificationPipeline::new(recovered.committed_height),
@@ -450,8 +450,7 @@ impl BftCoordinator {
         );
         let has_pending_at_tip = self
             .pending_blocks
-            .values()
-            .any(|pb| pb.header().height().inner() == next_height);
+            .has_any_at(BlockHeight::new(next_height));
         let suppressed = self.verification.has_verification_in_flight()
             || has_pending_at_tip
             || self.block_sync.has_unverified_in_flight();
@@ -876,7 +875,7 @@ impl BftCoordinator {
         let mut actions = vec![];
 
         // Try to get the pending block we voted for
-        let Some(pending) = self.pending_blocks.get(&block_hash) else {
+        let Some(pending) = self.pending_blocks.get(block_hash) else {
             // Block not in pending_blocks - might have been cleaned up or committed.
             // View change timer will handle further recovery.
             warn!(
@@ -976,14 +975,15 @@ impl BftCoordinator {
 
         self.record_header_activity(height, round);
 
-        if self.pending_blocks.contains_key(&block_hash) {
+        if self.pending_blocks.contains_key(block_hash) {
             trace!("Already have pending block {}", block_hash);
             return vec![];
         }
 
-        self.assemble_pending_block(
+        self.pending_blocks.assemble(
             header.clone(),
             manifest,
+            self.now,
             lookup_tx,
             lookup_finalized_wave,
             lookup_provision,
@@ -1145,55 +1145,6 @@ impl BftCoordinator {
         }
     }
 
-    /// Build a `PendingBlock` from the header+manifest, eagerly pulling any
-    /// transactions/waves/provisions already in local stores (mempool, wave
-    /// cache, provision cache), and insert into `pending_blocks`.
-    fn assemble_pending_block(
-        &mut self,
-        header: BlockHeader,
-        manifest: BlockManifest,
-        lookup_tx: impl Fn(&TxHash) -> Option<Arc<RoutableTransaction>>,
-        lookup_finalized_wave: impl Fn(&WaveId) -> Option<Arc<FinalizedWave>>,
-        lookup_provision: impl Fn(&ProvisionHash) -> Option<Arc<Provisions>>,
-    ) {
-        let block_hash = header.hash();
-        let mut pending = PendingBlock::from_manifest(header, manifest, self.now);
-
-        // Borrow the manifest only long enough to collect locally-available
-        // Arcs, releasing it before the mutable `add_*` calls below.
-        let txs: Vec<Arc<RoutableTransaction>> = pending
-            .manifest()
-            .tx_hashes()
-            .iter()
-            .filter_map(&lookup_tx)
-            .collect();
-        for tx in txs {
-            pending.add_transaction(tx);
-        }
-
-        let waves: Vec<Arc<FinalizedWave>> = pending
-            .manifest()
-            .cert_ids()
-            .iter()
-            .filter_map(&lookup_finalized_wave)
-            .collect();
-        for fw in waves {
-            pending.add_finalized_wave(fw);
-        }
-
-        let provisions: Vec<Arc<Provisions>> = pending
-            .manifest()
-            .provision_hashes()
-            .iter()
-            .filter_map(&lookup_provision)
-            .collect();
-        for p in provisions {
-            pending.add_provision(p);
-        }
-
-        self.pending_blocks.insert(block_hash, pending);
-    }
-
     /// If we have a `deferred_qc` whose `block_hash` matches `block_hash`
     /// (votes arrived before this header), adopt it now. Latches a
     /// proposal-retry on adoption. If the deferred QC is for a different
@@ -1244,15 +1195,12 @@ impl BftCoordinator {
         block_hash: BlockHash,
         actions: &mut Vec<Action>,
     ) -> bool {
-        let is_complete = self
-            .pending_blocks
-            .get(&block_hash)
-            .is_some_and(PendingBlock::is_complete);
+        let is_complete = self.pending_blocks.is_complete(block_hash);
         if !is_complete {
             return false;
         }
 
-        if let Some(pending) = self.pending_blocks.get_mut(&block_hash)
+        if let Some(pending) = self.pending_blocks.get_mut(block_hash)
             && pending.block().is_none()
             && let Err(e) = pending.construct_block()
         {
@@ -1269,7 +1217,7 @@ impl BftCoordinator {
     /// deferring here avoids unnecessary traffic when gossip or local cert
     /// creation fills in the data.
     fn log_incomplete_block(&self, topology_snapshot: &TopologySnapshot, block_hash: BlockHash) {
-        if let Some(pending) = self.pending_blocks.get(&block_hash) {
+        if let Some(pending) = self.pending_blocks.get(block_hash) {
             debug!(
                 validator = ?topology_snapshot.local_validator_id(),
                 block_hash = ?block_hash,
@@ -1295,7 +1243,7 @@ impl BftCoordinator {
         topology_snapshot: &TopologySnapshot,
         block_hash: BlockHash,
     ) -> Vec<Action> {
-        let Some(pending) = self.pending_blocks.get(&block_hash) else {
+        let Some(pending) = self.pending_blocks.get(block_hash) else {
             warn!(
                 "trigger_qc_verification_or_vote: no pending block for {}",
                 block_hash
@@ -1410,11 +1358,7 @@ impl BftCoordinator {
         // Otherwise fall through to the voting path directly — reachable only
         // from test fixtures; production always assembles before reaching
         // here.
-        if let Some(block) = self
-            .pending_blocks
-            .get(&block_hash)
-            .and_then(PendingBlock::block)
-        {
+        if let Some(block) = self.pending_blocks.get_block(block_hash) {
             if self.reject_invalid_block_contents(topology_snapshot, block_hash, &block) {
                 return vec![];
             }
@@ -1589,10 +1533,7 @@ impl BftCoordinator {
         topology_snapshot: &TopologySnapshot,
         vote: BlockVote,
     ) -> Vec<Action> {
-        let header_for_vote = self
-            .pending_blocks
-            .get(&vote.block_hash())
-            .map(PendingBlock::header);
+        let header_for_vote = self.pending_blocks.get_header(vote.block_hash());
         self.votes.accept_vote(
             topology_snapshot,
             vote,
@@ -1770,7 +1711,7 @@ impl BftCoordinator {
             return vec![];
         }
 
-        let Some(pending_block) = self.pending_blocks.get(&block_hash) else {
+        let Some(pending_block) = self.pending_blocks.get(block_hash) else {
             // Block not in pending — likely already committed or evicted.
             debug!(
                 block_hash = ?block_hash,
@@ -1863,7 +1804,7 @@ impl BftCoordinator {
 
         let manifest = pending_block.manifest().clone();
 
-        self.pending_blocks.insert(block_hash, pending_block);
+        self.pending_blocks.insert(pending_block);
         self.record_leader_activity();
 
         // The proposer built the block, so all roots are inherently correct.
@@ -1960,8 +1901,7 @@ impl BftCoordinator {
 
         // Look up the block to count transactions and certificates
         self.pending_blocks
-            .get(&committable_hash)
-            .and_then(PendingBlock::block)
+            .get_block(committable_hash)
             .map_or((0, 0), |block| {
                 (block.transactions().len(), block.certificates().len())
             })
@@ -1977,18 +1917,10 @@ impl BftCoordinator {
     /// Returns (`total_tx_count`, `total_cert_count`) across all pending blocks.
     #[must_use]
     pub fn pending_block_counts(&self) -> (usize, usize) {
-        let mut total_txs = 0;
-        let mut total_certs = 0;
-
-        for pending in self.pending_blocks.values() {
-            // Use original_tx_order/original_cert_order which are available even
-            // before the block is fully constructed (waiting for tx/cert data).
-            // These give us the counts from the block header.
-            total_txs += pending.transaction_count();
-            total_certs += pending.certificate_count();
-        }
-
-        (total_txs, total_certs)
+        (
+            self.pending_blocks.total_transaction_count(),
+            self.pending_blocks.total_certificate_count(),
+        )
     }
 
     /// Handle QC formation.
@@ -2105,7 +2037,7 @@ impl BftCoordinator {
         // The certifying QC for the committable block (block N-1) is the
         // parent_qc of the block whose QC this is (block N).
         let block_hash = qc.block_hash();
-        let certifying_qc = self.pending_blocks.get(&block_hash).map_or_else(
+        let certifying_qc = self.pending_blocks.get(block_hash).map_or_else(
             || {
                 warn!(
                     validator = ?topology_snapshot.local_validator_id(),
@@ -2139,12 +2071,12 @@ impl BftCoordinator {
     ) -> Vec<Action> {
         let block = self
             .pending_blocks
-            .get(&block_hash)
-            .and_then(|pending| pending.block().map(|b| (*b).clone()));
+            .get_block(block_hash)
+            .map(|arc| (*arc).clone());
 
         let Some(block) = block else {
             // Block not yet constructed - check if it's pending (waiting for transactions/certificates)
-            if let Some(pending) = self.pending_blocks.get(&block_hash) {
+            if let Some(pending) = self.pending_blocks.get(block_hash) {
                 let height = pending.header().height();
                 // Only buffer if not already committed
                 if height > self.committed_height {
@@ -2321,7 +2253,7 @@ impl BftCoordinator {
         // `PendingBlock` gates itself on `is_complete()`; `construct_block`
         // attaches provisions inline on `Block::Live` — no external cache
         // lookup needed.
-        let Some(pending) = self.pending_blocks.get(&block_hash) else {
+        let Some(pending) = self.pending_blocks.get(block_hash) else {
             warn!(?block_hash, "Block not found in pending_blocks for commit");
             return None;
         };
@@ -2790,7 +2722,7 @@ impl BftCoordinator {
     /// reaches BFT here. Walks pending blocks, populates each one's
     /// `received_transactions` cache for hashes it was waiting on, and
     /// emits any unblocked vote / commit-resume actions via the shared
-    /// `check_pending_blocks_for_arrival` machinery.
+    /// machinery on [`PendingBlocks`].
     #[instrument(skip(self, topology_snapshot, txs), fields(count = txs.len()))]
     pub fn on_transactions_admitted(
         &mut self,
@@ -2799,15 +2731,9 @@ impl BftCoordinator {
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         for tx in txs {
-            let tx_hash = tx.hash();
-            actions.extend(self.check_pending_blocks_for_arrival(
-                topology_snapshot,
-                "transaction",
-                |pending| pending.needs_transaction(&tx_hash),
-                |pending| {
-                    pending.add_transaction(Arc::clone(tx));
-                },
-            ));
+            for block_hash in self.pending_blocks.receive_transaction(tx) {
+                actions.extend(self.dispatch_block_complete(topology_snapshot, block_hash));
+            }
         }
         actions
     }
@@ -2832,23 +2758,17 @@ impl BftCoordinator {
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         for fw in waves {
-            let wave_id = fw.wave_id().clone();
             if let Err(err) = fw.validate_receipts_against_ec() {
                 warn!(
-                    ?wave_id,
+                    wave_id = ?fw.wave_id(),
                     ?err,
                     "Rejecting FinalizedWave: receipts inconsistent with its EC"
                 );
                 continue;
             }
-            actions.extend(self.check_pending_blocks_for_arrival(
-                topology_snapshot,
-                "finalized wave",
-                |pending| pending.needs_wave(&wave_id),
-                |pending| {
-                    pending.add_finalized_wave(Arc::clone(fw));
-                },
-            ));
+            for block_hash in self.pending_blocks.receive_finalized_wave(fw) {
+                actions.extend(self.dispatch_block_complete(topology_snapshot, block_hash));
+            }
         }
         actions
     }
@@ -2867,84 +2787,29 @@ impl BftCoordinator {
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         for batch in provisions {
-            let provisions_hash = batch.hash();
-            actions.extend(self.check_pending_blocks_for_arrival(
-                topology_snapshot,
-                "provisions",
-                |pending| pending.needs_provision(&provisions_hash),
-                |pending| {
-                    pending.add_provision(Arc::clone(batch));
-                },
-            ));
+            for block_hash in self.pending_blocks.receive_provision(batch) {
+                actions.extend(self.dispatch_block_complete(topology_snapshot, block_hash));
+            }
         }
         actions
     }
 
-    /// Shared machinery for post-arrival pending-block completion.
-    ///
-    /// Scans pending blocks in hash order (deterministic), applies `apply` to
-    /// each one matching `needs`, and for any that become complete as a result
-    /// emits QC-verification / vote actions plus any commits parked on the
-    /// now-available block data. Triggering QC verification (rather than
-    /// voting directly) is critical: signatures must be verified before
-    /// voting even when data arrives late.
-    fn check_pending_blocks_for_arrival<F, M>(
+    /// Common dispatch tail for a pending block that just became complete:
+    /// emit QC-verification / vote actions, then drain any parked commit.
+    /// Triggering QC verification (rather than voting directly) is critical:
+    /// signatures must be verified before voting even when data arrives late.
+    fn dispatch_block_complete(
         &mut self,
         topology_snapshot: &TopologySnapshot,
-        arrival_kind: &'static str,
-        needs: F,
-        apply: M,
-    ) -> Vec<Action>
-    where
-        F: Fn(&PendingBlock) -> bool,
-        M: Fn(&mut PendingBlock),
-    {
-        let mut actions = Vec::new();
-        let mut block_hashes: Vec<BlockHash> = self
-            .pending_blocks
-            .iter()
-            .filter(|(_, pending)| needs(pending))
-            .map(|(hash, _)| *hash)
-            .collect();
-        block_hashes.sort();
-
-        for block_hash in block_hashes {
-            let became_ready = self
-                .pending_blocks
-                .get_mut(&block_hash)
-                .is_some_and(|pending| {
-                    apply(pending);
-                    if !pending.is_complete() {
-                        false
-                    } else if pending.block().is_some() {
-                        true
-                    } else {
-                        match pending.construct_block() {
-                            Ok(_) => true,
-                            Err(e) => {
-                                warn!(
-                                    arrival_kind,
-                                    error = %e,
-                                    "Failed to construct block after arrival"
-                                );
-                                false
-                            }
-                        }
-                    }
-                });
-
-            if became_ready {
-                debug!(
-                    validator = ?topology_snapshot.local_validator_id(),
-                    block_hash = ?block_hash,
-                    arrival_kind,
-                    "Pending block completed"
-                );
-                actions.extend(self.trigger_qc_verification_or_vote(topology_snapshot, block_hash));
-                actions.extend(self.try_commit_pending_data(topology_snapshot, block_hash));
-            }
-        }
-
+        block_hash: BlockHash,
+    ) -> Vec<Action> {
+        debug!(
+            validator = ?topology_snapshot.local_validator_id(),
+            block_hash = ?block_hash,
+            "Pending block completed"
+        );
+        let mut actions = self.trigger_qc_verification_or_vote(topology_snapshot, block_hash);
+        actions.extend(self.try_commit_pending_data(topology_snapshot, block_hash));
         actions
     }
 
@@ -2973,8 +2838,7 @@ impl BftCoordinator {
     /// Clean up old state after commit. Drops pending-block, vote, and
     /// commit-tracking entries at or below `committed_height`.
     fn cleanup_old_state(&mut self, committed_height: BlockHeight) {
-        self.pending_blocks
-            .retain(|_, pending| pending.header().height() > committed_height);
+        self.pending_blocks.prune_committed(committed_height);
 
         self.votes.cleanup_committed(committed_height);
         self.commits.cleanup_committed(committed_height);
@@ -3008,8 +2872,7 @@ impl BftCoordinator {
             return vec![];
         }
 
-        check_fetches(
-            &self.pending_blocks,
+        self.pending_blocks.check_fetches(
             topology_snapshot,
             self.now,
             self.config.transaction_fetch_timeout,
@@ -3098,7 +2961,7 @@ impl BftCoordinator {
     /// hook. Bulk pruning at commit time uses `cleanup_old_state` which
     /// retains in-place.
     fn remove_pending_block(&mut self, block_hash: BlockHash) -> Option<PendingBlock> {
-        self.pending_blocks.remove(&block_hash)
+        self.pending_blocks.remove(block_hash)
     }
 
     /// Get the committed block hash.
@@ -3232,11 +3095,7 @@ impl BftCoordinator {
             return true;
         }
 
-        if self
-            .pending_blocks
-            .values()
-            .any(|pb| pb.header().height() == height && pb.is_complete() && pb.block().is_some())
-        {
+        if self.pending_blocks.has_complete_at(height) {
             return true;
         }
 
@@ -3292,7 +3151,7 @@ mod tests {
         pending
             .construct_block()
             .expect("complete block constructs cleanly");
-        state.pending_blocks.insert(block.hash(), pending);
+        state.pending_blocks.insert(pending);
     }
 
     fn make_test_state() -> (BftCoordinator, TopologySnapshot) {
@@ -3744,11 +3603,11 @@ mod tests {
             |_| None,
             |_| None,
         );
-        assert!(state.pending_blocks.contains_key(&block_hash));
+        assert!(state.pending_blocks.contains_key(block_hash));
 
         let actions = state.on_qc_signature_verified(&topology, block_hash, false);
         assert!(actions.is_empty());
-        assert!(!state.pending_blocks.contains_key(&block_hash));
+        assert!(!state.pending_blocks.contains_key(block_hash));
     }
 
     #[test]
@@ -4026,7 +3885,7 @@ mod tests {
             BlockManifest::default(),
             LocalTimestamp::ZERO,
         );
-        state.pending_blocks.insert(original_block_hash, pending);
+        state.pending_blocks.insert(pending);
         state
             .votes
             .record_own_vote(height, original_block_hash, Round::new(0));

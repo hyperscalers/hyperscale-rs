@@ -10,7 +10,7 @@
 //! no mutations. It's a lens, not a sub-machine. The underlying fields live
 //! on `BftCoordinator` / `PendingBlock` just as before.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, InFlightCount, ProvisionHash, QuorumCertificate,
@@ -18,7 +18,7 @@ use hyperscale_types::{
 };
 use tracing::warn;
 
-use crate::pending::PendingBlock;
+use crate::pending::{PendingBlock, PendingBlocks};
 
 pub struct ChainView<'a> {
     local_shard: ShardGroupId,
@@ -26,7 +26,7 @@ pub struct ChainView<'a> {
     committed_hash: BlockHash,
     committed_state_root: StateRoot,
     latest_qc: Option<&'a QuorumCertificate>,
-    pending: &'a HashMap<BlockHash, PendingBlock>,
+    pending: &'a PendingBlocks,
 }
 
 impl<'a> ChainView<'a> {
@@ -36,7 +36,7 @@ impl<'a> ChainView<'a> {
         committed_hash: BlockHash,
         committed_state_root: StateRoot,
         latest_qc: Option<&'a QuorumCertificate>,
-        pending: &'a HashMap<BlockHash, PendingBlock>,
+        pending: &'a PendingBlocks,
     ) -> Self {
         Self {
             local_shard,
@@ -52,13 +52,13 @@ impl<'a> ChainView<'a> {
     /// per-block state (received transactions, finalized waves) beyond what
     /// the dedicated header / state-root accessors expose.
     pub fn get_pending(&self, block_hash: BlockHash) -> Option<&PendingBlock> {
-        self.pending.get(&block_hash)
+        self.pending.get(block_hash)
     }
 
     /// Look up a block by hash in the pending block map (if assembled).
     /// Returns `None` if the block isn't pending or hasn't been constructed.
     fn get_block(&self, block_hash: BlockHash) -> Option<Block> {
-        let pending = self.pending.get(&block_hash)?;
+        let pending = self.pending.get(block_hash)?;
         let block = pending.block()?;
         Some((*block).clone())
     }
@@ -67,7 +67,7 @@ impl<'a> ChainView<'a> {
     /// are needed. Pending blocks always carry their header even before full
     /// assembly, so this succeeds in cases where `get_block` would fail.
     pub fn get_header(&self, block_hash: BlockHash) -> Option<&BlockHeader> {
-        self.pending.get(&block_hash).map(PendingBlock::header)
+        self.pending.get(block_hash).map(PendingBlock::header)
     }
 
     /// State root of the parent block. Returns the committed-tip state root
@@ -147,7 +147,7 @@ impl<'a> ChainView<'a> {
         }
 
         let mut current_hash = parent_block_hash;
-        while let Some(pending) = self.pending.get(&current_hash) {
+        while let Some(pending) = self.pending.get(current_hash) {
             let h = pending.header().height();
             if h <= self.committed_height {
                 break;
@@ -216,7 +216,7 @@ mod tests {
         committed_height: u64,
         committed_hash: BlockHash,
         committed_state_root: StateRoot,
-        pending: &HashMap<BlockHash, PendingBlock>,
+        pending: &PendingBlocks,
         latest_qc: Option<&QuorumCertificate>,
         f: impl FnOnce(&ChainView<'_>) -> R,
     ) -> R {
@@ -255,8 +255,8 @@ mod tests {
             pb
         };
         let pending_hash = pending_block.header().hash();
-        let mut pending = HashMap::new();
-        pending.insert(pending_hash, pending_block);
+        let mut pending = PendingBlocks::new();
+        pending.insert(pending_block);
 
         run_view(
             0,
@@ -281,8 +281,8 @@ mod tests {
         // yield a header.
         let pending_block =
             PendingBlock::from_manifest(header, BlockManifest::default(), LocalTimestamp::ZERO);
-        let mut pending = HashMap::new();
-        pending.insert(block_hash, pending_block);
+        let mut pending = PendingBlocks::new();
+        pending.insert(pending_block);
 
         run_view(
             0,
@@ -303,9 +303,16 @@ mod tests {
         let tip_hash = bh(b"tip");
         let tip_root = StateRoot::from_raw(Hash::from_bytes(b"tip_root"));
 
-        run_view(10, tip_hash, tip_root, &HashMap::new(), None, |view| {
-            assert_eq!(view.parent_state_root(tip_hash), tip_root);
-        });
+        run_view(
+            10,
+            tip_hash,
+            tip_root,
+            &PendingBlocks::new(),
+            None,
+            |view| {
+                assert_eq!(view.parent_state_root(tip_hash), tip_root);
+            },
+        );
     }
 
     #[test]
@@ -317,8 +324,8 @@ mod tests {
         let hash = block.hash();
         let expected_state_root = block.header().state_root();
 
-        let mut pending = HashMap::new();
-        pending.insert(hash, pending_from_block(&block));
+        let mut pending = PendingBlocks::new();
+        pending.insert(pending_from_block(&block));
 
         run_view(4, tip_hash, tip_root, &pending, None, |view| {
             assert_eq!(view.parent_state_root(hash), expected_state_root);
@@ -331,9 +338,16 @@ mod tests {
         let tip_root = StateRoot::from_raw(Hash::from_bytes(b"tip_root"));
         let unknown = bh(b"unknown");
 
-        run_view(10, tip_hash, tip_root, &HashMap::new(), None, |view| {
-            assert_eq!(view.parent_state_root(unknown), tip_root);
-        });
+        run_view(
+            10,
+            tip_hash,
+            tip_root,
+            &PendingBlocks::new(),
+            None,
+            |view| {
+                assert_eq!(view.parent_state_root(unknown), tip_root);
+            },
+        );
     }
 
     #[test]
@@ -343,8 +357,8 @@ mod tests {
         let expected_in_flight = block.header().in_flight();
         let unknown = bh(b"unknown");
 
-        let mut pending = HashMap::new();
-        pending.insert(hash, pending_from_block(&block));
+        let mut pending = PendingBlocks::new();
+        pending.insert(pending_from_block(&block));
 
         run_view(
             0,
@@ -377,7 +391,7 @@ mod tests {
             0,
             BlockHash::ZERO,
             StateRoot::ZERO,
-            &HashMap::new(),
+            &PendingBlocks::new(),
             Some(&qc),
             |view| {
                 let (hash, returned_qc) = view.proposal_parent();
@@ -395,7 +409,7 @@ mod tests {
             0,
             tip_hash,
             StateRoot::ZERO,
-            &HashMap::new(),
+            &PendingBlocks::new(),
             None,
             |view| {
                 let (hash, qc) = view.proposal_parent();
