@@ -194,8 +194,8 @@ impl ElidedCertifiedBlock {
 
         let txs: Vec<Arc<RoutableTransaction>> = txs.into_iter().map(Option::unwrap).collect();
         let certs: Vec<Arc<FinalizedWave>> = certs.into_iter().map(Option::unwrap).collect();
-        let txs = Arc::new(txs);
-        let certs = Arc::new(certs);
+        let txs = Arc::new(txs.into());
+        let certs = Arc::new(certs.into());
         let block = match provs {
             Some(entries) => {
                 let provisions: Vec<Arc<Provisions>> =
@@ -204,7 +204,7 @@ impl ElidedCertifiedBlock {
                     header: self.header.clone(),
                     transactions: txs,
                     certificates: certs,
-                    provisions: Arc::new(provisions),
+                    provisions: Arc::new(provisions.into()),
                 }
             }
             None => Block::Sealed {
@@ -346,7 +346,7 @@ mod tests {
 
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
-        BlockHash, BlockHeight, BloomFilter, CertificateRoot, Hash, InFlightCount,
+        BlockHash, BlockHeight, BloomFilter, BoundedVec, CertificateRoot, Hash, InFlightCount,
         LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, Round, ShardGroupId, SignerBitfield,
         StateRoot, TransactionRoot, ValidatorId, WeightedTimestamp, zero_bls_signature,
     };
@@ -375,9 +375,9 @@ mod tests {
                 provision_tx_roots: BTreeMap::new(),
                 in_flight: InFlightCount::ZERO,
             },
-            transactions: Arc::new(vec![Arc::new(tx)]),
-            certificates: Arc::new(vec![]),
-            provisions: Arc::new(vec![]),
+            transactions: Arc::new(vec![Arc::new(tx)].into()),
+            certificates: Arc::new(BoundedVec::new()),
+            provisions: Arc::new(BoundedVec::new()),
         }
     }
 

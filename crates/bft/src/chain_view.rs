@@ -174,8 +174,9 @@ mod tests {
     use std::sync::Arc;
 
     use hyperscale_types::{
-        BlockManifest, CertificateRoot, Hash, LocalReceiptRoot, LocalTimestamp, ProposerTimestamp,
-        ProvisionsRoot, Round, ShardGroupId, TransactionRoot, ValidatorId, WeightedTimestamp,
+        BlockManifest, BoundedVec, CertificateRoot, Hash, LocalReceiptRoot, LocalTimestamp,
+        ProposerTimestamp, ProvisionsRoot, Round, ShardGroupId, TransactionRoot, ValidatorId,
+        WeightedTimestamp,
     };
 
     use super::*;
@@ -204,9 +205,9 @@ mod tests {
     fn make_block(height: u8, parent_block_hash: BlockHash) -> Block {
         Block::Live {
             header: make_header(height, parent_block_hash),
-            transactions: Arc::new(vec![]),
-            certificates: Arc::new(vec![]),
-            provisions: Arc::new(vec![]),
+            transactions: Arc::new(BoundedVec::new()),
+            certificates: Arc::new(BoundedVec::new()),
+            provisions: Arc::new(BoundedVec::new()),
         }
     }
 

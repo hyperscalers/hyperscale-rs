@@ -1059,8 +1059,8 @@ mod tests {
     use hyperscale_test_helpers::{TestCommittee, certify, make_finalized_wave, make_live_block};
     use hyperscale_types::test_utils::{test_transaction, test_transaction_with_nodes};
     use hyperscale_types::{
-        Block, FinalizedWave, MerkleInclusionProof, Provisions, ShardGroupId, TxEntries,
-        ValidatorId,
+        Block, FinalizedWave, MAX_TXS_PER_BLOCK, MerkleInclusionProof, Provisions, ShardGroupId,
+        TxEntries, ValidatorId,
     };
 
     use super::*;
@@ -1128,7 +1128,7 @@ mod tests {
                 header,
                 transactions,
                 certificates,
-                provisions: Arc::new(vec![Arc::new(provision)]),
+                provisions: Arc::new(vec![Arc::new(provision)].into()),
             },
             sealed @ Block::Sealed { .. } => sealed,
         };
@@ -1740,8 +1740,9 @@ mod tests {
     }
 
     /// Fill a mempool to [`MAX_TX_IN_FLIGHT`] by submitting that many
-    /// distinct transactions and committing a block that contains them
-    /// all — every tx transitions to `Committed`, holding a state lock.
+    /// distinct transactions and committing them across enough blocks to
+    /// stay within `MAX_TXS_PER_BLOCK` per block — every tx transitions
+    /// to `Committed`, holding a state lock.
     fn put_mempool_at_limit(mempool: &mut MempoolCoordinator, topology: &TopologySnapshot) {
         let txs: Vec<Arc<RoutableTransaction>> = (0..MAX_TX_IN_FLIGHT)
             .map(|i| Arc::new(unique_test_tx(i)))
@@ -1749,15 +1750,17 @@ mod tests {
         for tx in &txs {
             mempool.on_submit_transaction(topology, Arc::clone(tx), LocalTimestamp::ZERO);
         }
-        let block = make_live_block(
-            ShardGroupId::new(0),
-            BlockHeight::new(1),
-            1_234_567_890,
-            ValidatorId::new(0),
-            txs,
-            vec![],
-        );
-        mempool.on_block_committed(topology, &certify(block, TEST_BLOCK_INTERVAL_MS));
+        for (i, chunk) in txs.chunks(MAX_TXS_PER_BLOCK).enumerate() {
+            let block = make_live_block(
+                ShardGroupId::new(0),
+                BlockHeight::new(u64::try_from(i + 1).unwrap()),
+                1_234_567_890,
+                ValidatorId::new(0),
+                chunk.to_vec(),
+                vec![],
+            );
+            mempool.on_block_committed(topology, &certify(block, TEST_BLOCK_INTERVAL_MS));
+        }
 
         assert!(
             mempool.at_in_flight_limit(),

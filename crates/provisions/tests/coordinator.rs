@@ -10,7 +10,7 @@ use std::sync::Arc;
 use hyperscale_provisions::{ProvisionConfig, ProvisionCoordinator, ProvisionMemoryStats};
 use hyperscale_test_helpers::TestCommittee;
 use hyperscale_types::{
-    Block, BlockHash, BlockHeader, BlockHeight, CertificateRoot, CertifiedBlock,
+    Block, BlockHash, BlockHeader, BlockHeight, BoundedVec, CertificateRoot, CertifiedBlock,
     CommittedBlockHeader, Hash, InFlightCount, LocalReceiptRoot, LocalTimestamp, ProposerTimestamp,
     ProvisionHash, ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, StateRoot,
     TopologySnapshot, TransactionRoot, ValidatorId, WaveId, WeightedTimestamp,
@@ -33,9 +33,9 @@ fn make_block(height: BlockHeight) -> CertifiedBlock {
     header.height = height;
     let block = Block::Live {
         header,
-        transactions: Arc::new(vec![]),
-        certificates: Arc::new(vec![]),
-        provisions: Arc::new(vec![]),
+        transactions: Arc::new(BoundedVec::new()),
+        certificates: Arc::new(BoundedVec::new()),
+        provisions: Arc::new(BoundedVec::new()),
     };
     let qc = QuorumCertificate {
         block_hash: block.hash(),

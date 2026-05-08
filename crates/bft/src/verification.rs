@@ -1130,7 +1130,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use hyperscale_types::{
-        CertificateRoot, Hash, LocalReceiptRoot, LocalTimestamp, ProposerTimestamp,
+        BoundedVec, CertificateRoot, Hash, LocalReceiptRoot, LocalTimestamp, ProposerTimestamp,
         QuorumCertificate, Round, RoutableTransaction, ShardGroupId, TransactionRoot, ValidatorId,
     };
 
@@ -1166,9 +1166,9 @@ mod tests {
     ) -> Block {
         Block::Live {
             header: header(height, parent_block_hash, in_flight),
-            transactions: Arc::new(transactions),
-            certificates: Arc::new(Vec::new()),
-            provisions: Arc::new(Vec::new()),
+            transactions: Arc::new(transactions.into()),
+            certificates: Arc::new(BoundedVec::new()),
+            provisions: Arc::new(BoundedVec::new()),
         }
     }
 
@@ -1219,9 +1219,9 @@ mod tests {
         h.parent_qc = parent_qc;
         let block = Block::Live {
             header: h,
-            transactions: Arc::new(Vec::new()),
-            certificates: Arc::new(Vec::new()),
-            provisions: Arc::new(Vec::new()),
+            transactions: Arc::new(BoundedVec::new()),
+            certificates: Arc::new(BoundedVec::new()),
+            provisions: Arc::new(BoundedVec::new()),
         };
         let block_hash = block.hash();
         let pending = HashMap::new();

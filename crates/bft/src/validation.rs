@@ -305,7 +305,7 @@ mod tests {
 
     use hyperscale_test_helpers::{TestCommittee, make_finalized_wave};
     use hyperscale_types::{
-        BlockHash, BlockHeader, CertificateRoot, FinalizedWave, Hash, InFlightCount,
+        BlockHash, BlockHeader, BoundedVec, CertificateRoot, FinalizedWave, Hash, InFlightCount,
         LocalReceiptRoot, MerkleInclusionProof, ProposerTimestamp, Provisions, ProvisionsRoot,
         QuorumCertificate, Round, RoutableTransaction, ShardGroupId, StateRoot,
         TransactionDecision, TransactionRoot, TxEntries, ValidatorId, ValidatorInfo, ValidatorSet,
@@ -368,9 +368,9 @@ mod tests {
         };
         Block::Live {
             header,
-            transactions: Arc::new(Vec::new()),
-            certificates: Arc::new(Vec::new()),
-            provisions: Arc::new(Vec::new()),
+            transactions: Arc::new(BoundedVec::new()),
+            certificates: Arc::new(BoundedVec::new()),
+            provisions: Arc::new(BoundedVec::new()),
         }
     }
 
@@ -477,9 +477,9 @@ mod tests {
     ) -> Block {
         Block::Live {
             header: header_at_height(height, 100_000),
-            transactions: Arc::new(transactions),
-            certificates: Arc::new(Vec::new()),
-            provisions: Arc::new(Vec::new()),
+            transactions: Arc::new(transactions.into()),
+            certificates: Arc::new(BoundedVec::new()),
+            provisions: Arc::new(BoundedVec::new()),
         }
     }
 
@@ -573,9 +573,9 @@ mod tests {
     ) -> Block {
         Block::Live {
             header: header_at_height(height, 100_000),
-            transactions: Arc::new(Vec::new()),
-            certificates: Arc::new(certificates),
-            provisions: Arc::new(Vec::new()),
+            transactions: Arc::new(BoundedVec::new()),
+            certificates: Arc::new(certificates.into()),
+            provisions: Arc::new(BoundedVec::new()),
         }
     }
 
@@ -634,9 +634,9 @@ mod tests {
     fn block_with_provisions(height: BlockHeight, provisions: Vec<Arc<Provisions>>) -> Block {
         Block::Live {
             header: header_at_height(height, 100_000),
-            transactions: Arc::new(Vec::new()),
-            certificates: Arc::new(Vec::new()),
-            provisions: Arc::new(provisions),
+            transactions: Arc::new(BoundedVec::new()),
+            certificates: Arc::new(BoundedVec::new()),
+            provisions: Arc::new(provisions.into()),
         }
     }
 

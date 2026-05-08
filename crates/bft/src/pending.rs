@@ -276,9 +276,9 @@ impl PendingBlock {
 
         let block = Arc::new(Block::Live {
             header: self.header.clone(),
-            transactions: Arc::new(transactions),
-            certificates: Arc::new(certificates),
-            provisions: Arc::new(provisions),
+            transactions: Arc::new(transactions.into()),
+            certificates: Arc::new(certificates.into()),
+            provisions: Arc::new(provisions.into()),
         });
 
         self.constructed_block = Some(Arc::clone(&block));
@@ -584,9 +584,9 @@ mod tests {
 
         let block = Block::Live {
             header: make_header(BlockHeight::new(1)),
-            transactions: Arc::new(vec![]),
-            certificates: Arc::new(vec![Arc::clone(&fw)]),
-            provisions: Arc::new(vec![]),
+            transactions: Arc::new(BoundedVec::new()),
+            certificates: Arc::new(vec![Arc::clone(&fw)].into()),
+            provisions: Arc::new(BoundedVec::new()),
         };
 
         let pending =

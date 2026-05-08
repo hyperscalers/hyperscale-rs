@@ -362,6 +362,35 @@ impl<T, const MAX: usize> BoundedVec<T, MAX> {
         }
         Ok(Self(value))
     }
+
+    /// Append an element to the back of the inner `Vec`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if pushing would exceed `MAX`. Use [`Self::try_push`] for
+    /// fallible append.
+    pub fn push(&mut self, value: T) {
+        assert!(
+            self.0.len() < MAX,
+            "BoundedVec<_, {MAX}> overflow on push: already at {} elements",
+            self.0.len()
+        );
+        self.0.push(value);
+    }
+
+    /// Fallible counterpart of [`Self::push`] — returns the rejected
+    /// element back to the caller when the wrapper is at capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns the input `value` unchanged when `self.len() == MAX`.
+    pub fn try_push(&mut self, value: T) -> Result<(), T> {
+        if self.0.len() >= MAX {
+            return Err(value);
+        }
+        self.0.push(value);
+        Ok(())
+    }
 }
 
 impl<T, const MAX: usize> From<Vec<T>> for BoundedVec<T, MAX> {

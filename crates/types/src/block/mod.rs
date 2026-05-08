@@ -198,7 +198,7 @@ mod tests {
         let mut bad_block =
             Block::genesis(ShardGroupId::new(0), ValidatorId::new(0), StateRoot::ZERO)
                 .into_sealed()
-                .into_live(Arc::new(Vec::new()));
+                .into_live(Arc::new(BoundedVec::new()));
         if let Block::Live { ref mut header, .. } = bad_block {
             header.height = BlockHeight::new(7);
         }

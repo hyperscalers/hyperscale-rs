@@ -733,7 +733,7 @@ mod tests {
 
     use hyperscale_test_helpers::TestCommittee;
     use hyperscale_types::{
-        Block, BlockHeader, CertificateRoot, Hash, InFlightCount, LocalReceiptRoot,
+        Block, BlockHeader, BoundedVec, CertificateRoot, Hash, InFlightCount, LocalReceiptRoot,
         ProposerTimestamp, ProvisionsRoot, Round, ShardGroupId, StateRoot, TransactionRoot,
         ValidatorId, ValidatorInfo, ValidatorSet, VotePower,
     };
@@ -776,9 +776,9 @@ mod tests {
     fn certified(height: BlockHeight, tag: &[u8]) -> CertifiedBlock {
         let block = Block::Live {
             header: header(height, tag),
-            transactions: Arc::new(Vec::new()),
-            certificates: Arc::new(Vec::new()),
-            provisions: Arc::new(Vec::new()),
+            transactions: Arc::new(BoundedVec::new()),
+            certificates: Arc::new(BoundedVec::new()),
+            provisions: Arc::new(BoundedVec::new()),
         };
         let mut qc = QuorumCertificate::genesis(ShardGroupId::new(0));
         qc.block_hash = block.hash();

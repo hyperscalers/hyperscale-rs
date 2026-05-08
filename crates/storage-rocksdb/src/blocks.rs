@@ -224,8 +224,8 @@ impl RocksDbStorage {
         // execution window.
         let block = Block::Sealed {
             header: metadata.header,
-            transactions: Arc::new(transactions),
-            certificates: Arc::new(certificates),
+            transactions: Arc::new(transactions.into()),
+            certificates: Arc::new(certificates.into()),
         };
 
         let elapsed = start.elapsed().as_secs_f64();
@@ -352,8 +352,8 @@ impl RocksDbStorage {
         // in-memory cache when the requester needs them.
         let block = Block::Sealed {
             header: metadata.header,
-            transactions: Arc::new(transactions),
-            certificates: Arc::new(certificates),
+            transactions: Arc::new(transactions.into()),
+            certificates: Arc::new(certificates.into()),
         };
         let provision_hashes = metadata.manifest.provision_hashes;
 

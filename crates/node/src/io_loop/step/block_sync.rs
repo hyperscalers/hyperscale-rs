@@ -376,8 +376,8 @@ mod tests {
 
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
-        Block, BlockHash, BlockHeader, Bls12381G2Signature, CertificateRoot, ConsensusReceipt,
-        ExecutionCertificate, ExecutionOutcome, FinalizedWave, GlobalReceiptHash,
+        Block, BlockHash, BlockHeader, Bls12381G2Signature, BoundedVec, CertificateRoot,
+        ConsensusReceipt, ExecutionCertificate, ExecutionOutcome, FinalizedWave, GlobalReceiptHash,
         GlobalReceiptRoot, InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
         QuorumCertificate, Round, ShardGroupId, SignerBitfield, StateRoot, TransactionRoot, TxHash,
         TxOutcome, ValidatorId, WaveCertificate, WaveId, WeightedTimestamp, zero_bls_signature,
@@ -480,9 +480,9 @@ mod tests {
     fn validate_passes_for_canonical_block() {
         let block = Block::Live {
             header: header(),
-            transactions: Arc::new(vec![]),
-            certificates: Arc::new(vec![]),
-            provisions: Arc::new(vec![]),
+            transactions: Arc::new(BoundedVec::new()),
+            certificates: Arc::new(BoundedVec::new()),
+            provisions: Arc::new(BoundedVec::new()),
         };
         let qc = qc_for(&block);
         let certified = CertifiedBlock::new_unchecked(block, qc);
@@ -493,9 +493,9 @@ mod tests {
     fn validate_rejects_height_mismatch() {
         let block = Block::Live {
             header: header(),
-            transactions: Arc::new(vec![]),
-            certificates: Arc::new(vec![]),
-            provisions: Arc::new(vec![]),
+            transactions: Arc::new(BoundedVec::new()),
+            certificates: Arc::new(BoundedVec::new()),
+            provisions: Arc::new(BoundedVec::new()),
         };
         let qc = qc_for(&block);
         let certified = CertifiedBlock::new_unchecked(block, qc);
@@ -510,9 +510,9 @@ mod tests {
     fn certified_block_rejects_qc_hash_mismatch() {
         let block = Block::Live {
             header: header(),
-            transactions: Arc::new(vec![]),
-            certificates: Arc::new(vec![]),
-            provisions: Arc::new(vec![]),
+            transactions: Arc::new(BoundedVec::new()),
+            certificates: Arc::new(BoundedVec::new()),
+            provisions: Arc::new(BoundedVec::new()),
         };
         let mut qc = qc_for(&block);
         qc.block_hash = BlockHash::from_raw(Hash::from_bytes(b"wrong"));
@@ -523,9 +523,9 @@ mod tests {
     fn validate_rejects_qc_height_mismatch() {
         let block = Block::Live {
             header: header(),
-            transactions: Arc::new(vec![]),
-            certificates: Arc::new(vec![]),
-            provisions: Arc::new(vec![]),
+            transactions: Arc::new(BoundedVec::new()),
+            certificates: Arc::new(BoundedVec::new()),
+            provisions: Arc::new(BoundedVec::new()),
         };
         let mut qc = qc_for(&block);
         qc.height = BlockHeight::new(99);
@@ -543,9 +543,9 @@ mod tests {
         h.transaction_root = TransactionRoot::ZERO; // canonical would be non-zero
         let block = Block::Live {
             header: h,
-            transactions: Arc::new(vec![tx]),
-            certificates: Arc::new(vec![]),
-            provisions: Arc::new(vec![]),
+            transactions: Arc::new(vec![tx].into()),
+            certificates: Arc::new(BoundedVec::new()),
+            provisions: Arc::new(BoundedVec::new()),
         };
         let qc = qc_for(&block);
         let certified = CertifiedBlock::new_unchecked(block, qc);
@@ -562,9 +562,9 @@ mod tests {
         h.transaction_root = compute_transaction_root(std::slice::from_ref(&tx));
         let block = Block::Live {
             header: h,
-            transactions: Arc::new(vec![tx]),
-            certificates: Arc::new(vec![]),
-            provisions: Arc::new(vec![]),
+            transactions: Arc::new(vec![tx].into()),
+            certificates: Arc::new(BoundedVec::new()),
+            provisions: Arc::new(BoundedVec::new()),
         };
         let qc = qc_for(&block);
         let certified = CertifiedBlock::new_unchecked(block, qc);
@@ -579,9 +579,9 @@ mod tests {
         h.local_receipt_root = lrr;
         let block = Block::Live {
             header: h,
-            transactions: Arc::new(vec![]),
-            certificates: Arc::new(vec![fw]),
-            provisions: Arc::new(vec![]),
+            transactions: Arc::new(BoundedVec::new()),
+            certificates: Arc::new(vec![fw].into()),
+            provisions: Arc::new(BoundedVec::new()),
         };
         let qc = qc_for(&block);
         let certified = CertifiedBlock::new_unchecked(block, qc);
@@ -634,9 +634,9 @@ mod tests {
         h.local_receipt_root = compute_local_receipt_root(&[receipt]);
         let block = Block::Live {
             header: h,
-            transactions: Arc::new(vec![]),
-            certificates: Arc::new(vec![fw]),
-            provisions: Arc::new(vec![]),
+            transactions: Arc::new(BoundedVec::new()),
+            certificates: Arc::new(vec![fw].into()),
+            provisions: Arc::new(BoundedVec::new()),
         };
         let qc = qc_for(&block);
         let certified = CertifiedBlock::new_unchecked(block, qc);
@@ -658,9 +658,9 @@ mod tests {
         h.local_receipt_root = LocalReceiptRoot::from_raw(Hash::from_bytes(b"wrong"));
         let block = Block::Live {
             header: h,
-            transactions: Arc::new(vec![]),
-            certificates: Arc::new(vec![fw]),
-            provisions: Arc::new(vec![]),
+            transactions: Arc::new(BoundedVec::new()),
+            certificates: Arc::new(vec![fw].into()),
+            provisions: Arc::new(BoundedVec::new()),
         };
         let qc = qc_for(&block);
         let certified = CertifiedBlock::new_unchecked(block, qc);
@@ -678,9 +678,9 @@ mod tests {
         h.local_receipt_root = lrr;
         let block = Block::Live {
             header: h,
-            transactions: Arc::new(vec![]),
-            certificates: Arc::new(vec![fw]),
-            provisions: Arc::new(vec![]),
+            transactions: Arc::new(BoundedVec::new()),
+            certificates: Arc::new(vec![fw].into()),
+            provisions: Arc::new(BoundedVec::new()),
         };
         let qc = qc_for(&block);
         let certified = CertifiedBlock::new_unchecked(block, qc);

@@ -679,8 +679,8 @@ impl ProvisionCoordinator {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{
-        Block, BlockHash, BlockHeader, Bls12381G1PrivateKey, CertificateRoot, Hash, InFlightCount,
-        LocalReceiptRoot, MerkleInclusionProof, ProposerTimestamp, ProvisionsRoot,
+        Block, BlockHash, BlockHeader, Bls12381G1PrivateKey, BoundedVec, CertificateRoot, Hash,
+        InFlightCount, LocalReceiptRoot, MerkleInclusionProof, ProposerTimestamp, ProvisionsRoot,
         QuorumCertificate, Round, StateRoot, TopologySnapshot, TransactionRoot, TxEntries, TxHash,
         ValidatorId, ValidatorInfo, ValidatorSet, VotePower, WaveId, WeightedTimestamp,
         bls_keypair_from_seed,
@@ -1355,9 +1355,9 @@ mod tests {
         header.height = height;
         let block = Block::Live {
             header,
-            transactions: Arc::new(vec![]),
-            certificates: Arc::new(vec![]),
-            provisions: Arc::new(vec![]),
+            transactions: Arc::new(BoundedVec::new()),
+            certificates: Arc::new(BoundedVec::new()),
+            provisions: Arc::new(BoundedVec::new()),
         };
         let qc = QuorumCertificate {
             block_hash: block.hash(),

@@ -364,8 +364,8 @@ fn push_wave(block: &mut Block, fw: Arc<FinalizedWave>) {
         block,
         Block::Sealed {
             header: block.header().clone(),
-            transactions: Arc::new(vec![]),
-            certificates: Arc::new(vec![]),
+            transactions: Arc::new(BoundedVec::new()),
+            certificates: Arc::new(BoundedVec::new()),
         },
     );
     *block = match taken {
@@ -423,8 +423,8 @@ fn attach_receipts(block: &mut Block, receipts: Vec<StoredReceipt>) {
         block,
         Block::Sealed {
             header: block.header().clone(),
-            transactions: Arc::new(vec![]),
-            certificates: Arc::new(vec![]),
+            transactions: Arc::new(BoundedVec::new()),
+            certificates: Arc::new(BoundedVec::new()),
         },
     );
     *block = match taken {
@@ -552,10 +552,13 @@ fn test_commit_block_stores_certificates() {
         } => Block::Live {
             header,
             transactions,
-            certificates: Arc::new(vec![Arc::new(FinalizedWave {
-                certificate: cert,
-                receipts: BoundedVec::new(),
-            })]),
+            certificates: Arc::new(
+                vec![Arc::new(FinalizedWave {
+                    certificate: cert,
+                    receipts: BoundedVec::new(),
+                })]
+                .into(),
+            ),
             provisions,
         },
         Block::Sealed {
@@ -565,10 +568,13 @@ fn test_commit_block_stores_certificates() {
         } => Block::Sealed {
             header,
             transactions,
-            certificates: Arc::new(vec![Arc::new(FinalizedWave {
-                certificate: cert,
-                receipts: BoundedVec::new(),
-            })]),
+            certificates: Arc::new(
+                vec![Arc::new(FinalizedWave {
+                    certificate: cert,
+                    receipts: BoundedVec::new(),
+                })]
+                .into(),
+            ),
         },
     };
     let qc = make_test_qc(&block);
