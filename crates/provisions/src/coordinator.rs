@@ -13,7 +13,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_core::{Action, FetchAbandon, FetchOrigin, FetchPeers, FetchRequest, ProtocolEvent};
+use hyperscale_core::{Action, FetchAbandon, ProtocolEvent};
 use hyperscale_types::{
     BlockHeight, CertifiedBlock, CommittedBlockHeader, Hash, LocalTimestamp, ProvisionHash,
     ProvisionTxRoot, Provisions, RETENTION_HORIZON, ShardGroupId, TopologySnapshot,
@@ -240,22 +240,7 @@ impl ProvisionCoordinator {
             self.expected
                 .check_timeouts(local_ts)
                 .into_iter()
-                .map(|effect| {
-                    Action::Fetch(FetchRequest::RemoteProvisions {
-                        source_shard: effect.source_shard,
-                        block_height: effect.block_height,
-                        peers: FetchPeers::with_preferred(
-                            effect.proposer,
-                            topology
-                                .committee_for_shard(effect.source_shard)
-                                .iter()
-                                .copied()
-                                .filter(|p| *p != effect.proposer)
-                                .collect(),
-                        ),
-                        origin: FetchOrigin::CrossShard,
-                    })
-                }),
+                .map(|effect| effect.into_fetch_action(topology)),
         );
         actions
     }
@@ -309,20 +294,7 @@ impl ProvisionCoordinator {
                     block_height = effect.block_height.inner(),
                     "Eager fetch — immediately requesting missing provisions"
                 );
-                Action::Fetch(FetchRequest::RemoteProvisions {
-                    source_shard: effect.source_shard,
-                    block_height: effect.block_height,
-                    peers: FetchPeers::with_preferred(
-                        effect.proposer,
-                        topology
-                            .committee_for_shard(effect.source_shard)
-                            .iter()
-                            .copied()
-                            .filter(|p| *p != effect.proposer)
-                            .collect(),
-                    ),
-                    origin: FetchOrigin::CrossShard,
-                })
+                effect.into_fetch_action(topology)
             })
             .collect()
     }
@@ -678,6 +650,7 @@ impl ProvisionCoordinator {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_core::FetchRequest;
     use hyperscale_types::{
         Block, BlockHash, BlockHeader, Bls12381G1PrivateKey, BoundedVec, CertificateRoot, Hash,
         InFlightCount, LocalReceiptRoot, MerkleInclusionProof, ProposerTimestamp, ProvisionEntry,

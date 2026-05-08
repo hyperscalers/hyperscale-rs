@@ -22,7 +22,10 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use hyperscale_types::{BlockHeight, ShardGroupId, ValidatorId, WeightedTimestamp};
+use hyperscale_core::{Action, FetchOrigin, FetchPeers, FetchRequest};
+use hyperscale_types::{
+    BlockHeight, ShardGroupId, TopologySnapshot, ValidatorId, WeightedTimestamp,
+};
 use tracing::warn;
 
 /// How long to wait before falling back to peer-fetch for missing
@@ -45,13 +48,33 @@ struct ExpectedProvision {
     proposer: ValidatorId,
 }
 
-/// Lifted by the coordinator into an `Action::Fetch(FetchRequest::RemoteProvisions)` once
-/// peers are attached from the topology snapshot.
+/// Lifted into an `Action::Fetch(FetchRequest::RemoteProvisions)` via
+/// [`Self::into_fetch_action`] once peers are attached from the topology
+/// snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimeoutEffect {
     pub source_shard: ShardGroupId,
     pub block_height: BlockHeight,
     pub proposer: ValidatorId,
+}
+
+impl TimeoutEffect {
+    /// Build the `RemoteProvisions` fetch action: the proposer is preferred,
+    /// the rest of the source shard's committee is fallback.
+    pub(crate) fn into_fetch_action(self, topology: &TopologySnapshot) -> Action {
+        let fallback = topology
+            .committee_for_shard(self.source_shard)
+            .iter()
+            .copied()
+            .filter(|p| *p != self.proposer)
+            .collect();
+        Action::Fetch(FetchRequest::RemoteProvisions {
+            source_shard: self.source_shard,
+            block_height: self.block_height,
+            peers: FetchPeers::with_preferred(self.proposer, fallback),
+            origin: FetchOrigin::CrossShard,
+        })
+    }
 }
 
 /// Liveness tracker for cross-shard provisions we expect but haven't yet
