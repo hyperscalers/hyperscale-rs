@@ -1512,12 +1512,12 @@ impl ExecutionCoordinator {
         actions
     }
 
-    /// Finalize a wave: create `WaveCertificate`, record `FinalizedWave`, emit events.
+    /// Finalize a wave: build the [`FinalizedWave`], record it, emit events.
     ///
     /// Called when the wave's local EC is present and every non-aborted tx is
     /// covered by all participating shards.
     fn finalize_wave(&mut self, wave_id: &WaveId) -> Vec<Action> {
-        let Some(mut wave) = self.waves.remove_wave(wave_id) else {
+        let Some(wave) = self.waves.remove_wave(wave_id) else {
             return vec![];
         };
 
@@ -1527,37 +1527,7 @@ impl ExecutionCoordinator {
         // re-broadcast tracker entry to stop wasting bandwidth.
         self.outbound_certs.on_wave_finalized(wave_id);
 
-        let wc = wave.create_wave_certificate();
-
-        // Walk the local EC's tx_outcomes in canonical order and collect a
-        // receipt for each non-aborted outcome. Aborted outcomes contribute
-        // no receipt; stray receipts for aborted txs (e.g. local execution
-        // completed before the aggregated EC attested `Aborted`) are dropped
-        // with the wave. This mirrors `FinalizedWave::reconstruct` and is
-        // what `validate_receipts_against_ec` enforces at peer ingress.
-        let local_ec = wc
-            .execution_certificates()
-            .iter()
-            .find(|ec| ec.wave_id() == wc.wave_id())
-            .expect("WaveCertificate invariant: local EC must be present");
-        let mut receipts: Vec<StoredReceipt> = Vec::with_capacity(local_ec.tx_outcomes().len());
-        for outcome in local_ec.tx_outcomes() {
-            if outcome.is_aborted() {
-                continue;
-            }
-            if let Some(receipt) = wave.take_receipt(outcome.tx_hash()) {
-                receipts.push(receipt);
-            } else {
-                tracing::error!(
-                    wave = %wave_id,
-                    tx_hash = ?outcome.tx_hash(),
-                    "finalize_wave: non-aborted tx is missing its stored receipt \
-                     (is_complete gate bypassed)"
-                );
-            }
-        }
-
-        let finalized_arc = Arc::new(FinalizedWave::new(Arc::new(wc), receipts));
+        let finalized_arc = Arc::new(wave.into_finalized());
         self.finalized
             .insert(wave_id.clone(), Arc::clone(&finalized_arc));
 

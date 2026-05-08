@@ -30,8 +30,8 @@ use std::time::Duration;
 
 use hyperscale_core::{Action, CrossShardExecutionRequest};
 use hyperscale_types::{
-    BlockHash, BlockHeight, ExecutionCertificate, ExecutionOutcome, GlobalReceiptRoot,
-    RoutableTransaction, ShardGroupId, StateRoot, StoredReceipt, SubstateEntry,
+    BlockHash, BlockHeight, ExecutionCertificate, ExecutionOutcome, FinalizedWave,
+    GlobalReceiptRoot, RoutableTransaction, ShardGroupId, StateRoot, StoredReceipt, SubstateEntry,
     TransactionDecision, TxHash, TxOutcome, WAVE_TIMEOUT, WaveCertificate, WaveId,
     WeightedTimestamp, compute_global_receipt_root,
 };
@@ -409,15 +409,9 @@ impl WaveState {
         self.execution_receipts.len()
     }
 
-    /// Take the receipt for a tx, removing it from the wave.
-    ///
-    /// Used at finalization time, walking the local EC's `tx_outcomes` in
-    /// canonical order and pulling a receipt for each non-aborted outcome.
-    /// Returns `None` if the receipt is absent — for an aborted outcome this
-    /// is expected; for a non-aborted outcome it indicates the
-    /// `has_local_receipts_for_non_aborted` gate was bypassed, which would
-    /// be a bug.
-    pub fn take_receipt(&mut self, tx_hash: TxHash) -> Option<StoredReceipt> {
+    /// Take the receipt for a tx, removing it from the wave. Used internally
+    /// by [`Self::into_finalized`] to drain receipts in canonical order.
+    fn take_receipt(&mut self, tx_hash: TxHash) -> Option<StoredReceipt> {
         self.execution_receipts.remove(&tx_hash)
     }
 
@@ -807,6 +801,56 @@ impl WaveState {
         });
 
         WaveCertificate::new(self.wave_id.clone(), ecs)
+    }
+
+    /// Consume the wave and produce its terminal [`FinalizedWave`].
+    ///
+    /// Builds the [`WaveCertificate`] and drains a stored receipt for each
+    /// non-aborted outcome in the local EC, in canonical order. Aborted
+    /// outcomes contribute no receipt; stray receipts for aborted txs (e.g.
+    /// local execution finished before the aggregated EC attested
+    /// `Aborted`) drop with the wave. Mirrors `FinalizedWave::reconstruct`,
+    /// matching the invariant peers enforce via
+    /// `validate_receipts_against_ec` at ingress.
+    ///
+    /// Should only be called when [`Self::is_complete`] is true; that gate
+    /// guarantees both the local EC's presence and a receipt for every
+    /// non-aborted outcome. A missing receipt under those conditions is an
+    /// invariant violation, logged but not fatal so the canonical
+    /// `FinalizedWave` admitted via block sync can still recover the node.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the constructed [`WaveCertificate`] doesn't carry the
+    /// local EC. `is_complete` requires `local_ec_emitted`, so that ECs
+    /// presence in `execution_certificates` — and thus in the WC — is
+    /// guaranteed at the legitimate call site.
+    #[must_use]
+    pub fn into_finalized(mut self) -> FinalizedWave {
+        let wc = self.create_wave_certificate();
+        let local_ec = wc
+            .execution_certificates()
+            .iter()
+            .find(|ec| ec.wave_id() == wc.wave_id())
+            .expect("WaveCertificate invariant: local EC must be present")
+            .clone();
+        let mut receipts: Vec<StoredReceipt> = Vec::with_capacity(local_ec.tx_outcomes().len());
+        for outcome in local_ec.tx_outcomes() {
+            if outcome.is_aborted() {
+                continue;
+            }
+            if let Some(receipt) = self.take_receipt(outcome.tx_hash()) {
+                receipts.push(receipt);
+            } else {
+                tracing::error!(
+                    wave = %self.wave_id,
+                    tx_hash = ?outcome.tx_hash(),
+                    "into_finalized: non-aborted tx is missing its stored receipt \
+                     (is_complete gate bypassed)"
+                );
+            }
+        }
+        FinalizedWave::new(Arc::new(wc), receipts)
     }
 
     /// Per-tx terminal decisions derived from collected ECs.
