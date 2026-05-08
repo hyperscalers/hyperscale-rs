@@ -14,10 +14,10 @@
 //! Both produce [`TimeoutEffect`]s; the coordinator attaches peers from
 //! topology and lifts each effect into an `Action::Fetch(FetchRequest::RemoteProvisions)`.
 //!
-//! The tracker also owns `local_committed_height` and `local_committed_ts`
-//! because every other consumer of those values reads them through here
-//! (deadline sweeps, receipt-time stamping, etc.) — keeping them
-//! co-located with the timestamp-driven sweeps that update them.
+//! The tracker also owns `local_committed_ts` because every other consumer
+//! of that value reads it through here (deadline sweeps, receipt-time
+//! stamping, etc.) — keeping it co-located with the timestamp-driven
+//! sweeps that update it.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -81,7 +81,6 @@ impl TimeoutEffect {
 /// verified.
 pub struct ExpectedProvisionTracker {
     expected: BTreeMap<Key, ExpectedProvision>,
-    local_committed_height: BlockHeight,
     local_committed_ts: WeightedTimestamp,
 }
 
@@ -89,7 +88,6 @@ impl ExpectedProvisionTracker {
     pub(crate) const fn new() -> Self {
         Self {
             expected: BTreeMap::new(),
-            local_committed_height: BlockHeight::new(0),
             local_committed_ts: WeightedTimestamp::ZERO,
         }
     }
@@ -144,9 +142,8 @@ impl ExpectedProvisionTracker {
     /// `local_committed_ts` is still zero; without retro-stamping, every
     /// such entry would report a ~57-year age on the next commit and
     /// trigger a fallback fetch storm.
-    pub(crate) fn record_block_committed(&mut self, height: BlockHeight, ts: WeightedTimestamp) {
+    pub(crate) fn record_block_committed(&mut self, ts: WeightedTimestamp) {
         let first_commit = self.local_committed_ts == WeightedTimestamp::ZERO;
-        self.local_committed_height = height;
         self.local_committed_ts = ts;
 
         if first_commit {
@@ -305,7 +302,7 @@ mod tests {
         // Before any commit, an immediate timeout sweep at a non-zero `now`
         // would fire — the entry's discovered_at is still ZERO. The
         // record_block_committed retro-stamp closes that gap.
-        t.record_block_committed(BlockHeight::new(1), ts(1_000));
+        t.record_block_committed(ts(1_000));
 
         // Now sweep at the same instant: no firings (we just registered).
         let effects = t.check_timeouts(ts(1_000));
@@ -315,7 +312,7 @@ mod tests {
     #[test]
     fn timeout_emits_effect_after_threshold() {
         let mut t = ExpectedProvisionTracker::new();
-        t.record_block_committed(BlockHeight::new(1), ts(1_000));
+        t.record_block_committed(ts(1_000));
         t.register(
             ShardGroupId::new(1),
             BlockHeight::new(10),
@@ -349,7 +346,7 @@ mod tests {
     #[test]
     fn verified_before_timeout_never_emits() {
         let mut t = ExpectedProvisionTracker::new();
-        t.record_block_committed(BlockHeight::new(1), ts(1_000));
+        t.record_block_committed(ts(1_000));
         t.register(
             ShardGroupId::new(1),
             BlockHeight::new(10),
@@ -368,7 +365,7 @@ mod tests {
     #[test]
     fn flush_all_bypasses_timeout() {
         let mut t = ExpectedProvisionTracker::new();
-        t.record_block_committed(BlockHeight::new(1), ts(1_000));
+        t.record_block_committed(ts(1_000));
         t.register(
             ShardGroupId::new(1),
             BlockHeight::new(10),
@@ -390,7 +387,7 @@ mod tests {
     #[test]
     fn cleanup_orphans_drops_aged_entries() {
         let mut t = ExpectedProvisionTracker::new();
-        t.record_block_committed(BlockHeight::new(1), ts(1_000));
+        t.record_block_committed(ts(1_000));
         t.register(
             ShardGroupId::new(1),
             BlockHeight::new(10),
@@ -400,7 +397,7 @@ mod tests {
         // Advance well past RETENTION_HORIZON.
         let far_future =
             ts(1_000 + 2 * u64::try_from(RETENTION_HORIZON.as_millis()).unwrap_or(u64::MAX));
-        t.record_block_committed(BlockHeight::new(100), far_future);
+        t.record_block_committed(far_future);
 
         let cutoff = far_future.minus(RETENTION_HORIZON);
         let dropped = t.cleanup_orphans(cutoff);

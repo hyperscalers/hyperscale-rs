@@ -102,8 +102,8 @@ pub struct ProvisionCoordinator {
     // Expected Provision Tracking (fallback detection)
     // ═══════════════════════════════════════════════════════════════════
     /// Outstanding expectations driven by remote header arrivals. Owns
-    /// the local committed anchor every other sub-machine reads through
-    /// (`local_ts`, `local_height`).
+    /// the local committed `local_ts` anchor every other sub-machine reads
+    /// through.
     expected: ExpectedProvisionTracker,
 
     // ═══════════════════════════════════════════════════════════════════
@@ -194,7 +194,7 @@ impl ProvisionCoordinator {
         let mut actions: Vec<Action> = Vec::new();
         let block = certified.block();
         let new_ts = certified.qc().weighted_timestamp();
-        self.expected.record_block_committed(block.height(), new_ts);
+        self.expected.record_block_committed(new_ts);
         let local_ts = self.expected.local_ts();
 
         // Drop provisions committed in this block from the proposer queue
