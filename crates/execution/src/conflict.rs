@@ -287,7 +287,7 @@ impl ConflictDetector {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{
-        BlockHeight, Hash, MerkleInclusionProof, NodeId, ShardGroupId, StateEntry,
+        BlockHeight, Hash, MerkleInclusionProof, NodeId, ShardGroupId, SubstateEntry,
         TopologySnapshot, TxEntries, ValidatorId, ValidatorInfo, ValidatorSet, VotePower,
         bls_keypair_from_seed, shard_for_node,
     };
@@ -337,12 +337,12 @@ mod tests {
         TopologySnapshot::with_local_shard(ValidatorId::new(0), ShardGroupId::new(0), 2, vs)
     }
 
-    fn make_entry(node: NodeId) -> StateEntry {
+    fn make_entry(node: NodeId) -> SubstateEntry {
         // Storage key: 20-byte hash prefix + 30-byte NodeId + 1-byte partition
         let mut key = vec![0u8; 20];
         key.extend_from_slice(&node.0);
         key.push(0);
-        StateEntry::new(key, Some(vec![1]))
+        SubstateEntry::new(key, Some(vec![1]))
     }
 
     /// Create a provision with source nodes (entries) and target nodes per tx.

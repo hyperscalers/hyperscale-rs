@@ -6,7 +6,7 @@
 //! hyperscale type system.
 
 use hyperscale_jmt::{Blake3Hasher, Key, MultiProof, NodeKey, Tree, TreeReader, ValueHash};
-use hyperscale_types::{BlockHeight, MerkleInclusionProof, StateEntry, StateRoot};
+use hyperscale_types::{BlockHeight, MerkleInclusionProof, StateRoot, SubstateEntry};
 
 use super::{Jmt, hash_storage_key, hash_value};
 
@@ -39,9 +39,9 @@ pub fn generate_proof<S: TreeReader>(
 /// (with `hash_value(value)` for `Set`) or non-inclusion (for `None`).
 pub fn verify_proof(
     proof: &MerkleInclusionProof,
-    entries: &[StateEntry],
+    entries: &[SubstateEntry],
     state_root: StateRoot,
-    storage_key_for_entry: impl Fn(&StateEntry) -> &[u8],
+    storage_key_for_entry: impl Fn(&SubstateEntry) -> &[u8],
 ) -> bool {
     if proof.as_bytes().is_empty() {
         return entries.is_empty();

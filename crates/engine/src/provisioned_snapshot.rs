@@ -1,7 +1,7 @@
 //! Read-only overlay that layers cross-shard provisions on top of local storage.
 //!
 //! When a transaction reads state owned by another shard, the sending
-//! shard ships a [`StateEntry`] list with pre-computed storage keys
+//! shard ships a [`SubstateEntry`] list with pre-computed storage keys
 //! (full `db_node_key || partition || sort_key`). The receiving shard
 //! wraps its base storage in [`ProvisionedSnapshot`] so the Radix
 //! Engine sees a unified view: provisions shadow base, deletions in
@@ -25,7 +25,7 @@
 use std::collections::BTreeMap;
 
 use hyperscale_storage::keys;
-use hyperscale_types::StateEntry;
+use hyperscale_types::SubstateEntry;
 use radix_engine::transaction::{ExecutionConfig, TransactionReceipt, execute_transaction};
 use radix_engine::vm::DefaultVmModules;
 use radix_substate_store_interface::interface::{DbPartitionKey, DbSortKey, SubstateDatabase};
@@ -40,7 +40,7 @@ use radix_transactions::prelude::ExecutableTransaction;
 /// # Usage
 ///
 /// ```ignore
-/// let entries: Vec<StateEntry> = /* provisions with pre-computed keys */;
+/// let entries: Vec<SubstateEntry> = /* provisions with pre-computed keys */;
 /// let snapshot = ProvisionedSnapshot::from_provisions(&base_storage, &[entries.as_slice()]);
 /// let receipt = execute_transaction(&snapshot, vm_modules, config, executable);
 /// ```
@@ -53,7 +53,7 @@ pub struct ProvisionedSnapshot<'a, S> {
 
 impl<'a, S: SubstateDatabase> ProvisionedSnapshot<'a, S> {
     /// Create from one or more provision lists (typically one per source shard).
-    pub fn from_provisions(base: &'a S, provisions_list: &[&[StateEntry]]) -> Self {
+    pub fn from_provisions(base: &'a S, provisions_list: &[&[SubstateEntry]]) -> Self {
         let mut provisions = BTreeMap::new();
 
         for entries in provisions_list {
@@ -277,9 +277,9 @@ mod tests {
         DbSortKey(vec![b])
     }
 
-    /// Build a `StateEntry` whose `storage_key` lives in `partition()` at `sort(b)`.
-    fn entry(part: &DbPartitionKey, b: u8, value: Option<Vec<u8>>) -> StateEntry {
-        StateEntry::new(keys::to_storage_key(part, &sort(b)), value)
+    /// Build a `SubstateEntry` whose `storage_key` lives in `partition()` at `sort(b)`.
+    fn entry(part: &DbPartitionKey, b: u8, value: Option<Vec<u8>>) -> SubstateEntry {
+        SubstateEntry::new(keys::to_storage_key(part, &sort(b)), value)
     }
 
     #[test]

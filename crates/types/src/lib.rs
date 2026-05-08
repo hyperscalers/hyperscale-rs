@@ -78,7 +78,7 @@ pub use provisioning::limits::{
     MAX_STATE_ENTRY_VALUE_LEN,
 };
 pub use provisioning::proof::MerkleInclusionProof;
-pub use provisioning::state_entry::{StateEntry, StateProvision};
+pub use provisioning::substate::{StateProvision, SubstateEntry};
 pub use provisioning::tx_entries::TxEntries;
 pub use quorum_certificate::QuorumCertificate;
 // Re-export DatabaseUpdates from radix for cross-crate use (execution cache, block commit)

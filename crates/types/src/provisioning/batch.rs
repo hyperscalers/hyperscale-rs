@@ -8,7 +8,7 @@ use sbor::prelude::*;
 
 use crate::{
     BlockHeight, BoundedVec, Hash, MAX_TXS_PER_BLOCK, MerkleInclusionProof, NodeId, ProvisionHash,
-    RETENTION_HORIZON, ShardGroupId, StateEntry, TxEntries, TxHash, WeightedTimestamp,
+    RETENTION_HORIZON, ShardGroupId, SubstateEntry, TxEntries, TxHash, WeightedTimestamp,
 };
 
 /// All provisions from a single source block, scoped to a single target shard.
@@ -191,14 +191,14 @@ impl Provisions {
     pub fn all_node_ids(&self) -> HashSet<NodeId> {
         self.transactions
             .iter()
-            .flat_map(|tx| tx.entries.iter().filter_map(StateEntry::node_id))
+            .flat_map(|tx| tx.entries.iter().filter_map(SubstateEntry::node_id))
             .collect()
     }
 
     /// Get all entries across all transactions, sorted and deduped by `storage_key`.
     #[must_use]
-    pub fn all_entries_deduped(&self) -> Vec<StateEntry> {
-        let mut entries: Vec<StateEntry> = self
+    pub fn all_entries_deduped(&self) -> Vec<SubstateEntry> {
+        let mut entries: Vec<SubstateEntry> = self
             .transactions
             .iter()
             .flat_map(|tx| tx.entries.iter().cloned())
@@ -238,13 +238,13 @@ mod tests {
 
     use super::*;
 
-    fn test_entry(seed: u8) -> StateEntry {
+    fn test_entry(seed: u8) -> SubstateEntry {
         let mut storage_key = Vec::with_capacity(20 + 30 + 1 + 1);
         storage_key.extend_from_slice(&[0u8; 20]);
         storage_key.extend_from_slice(&[seed; 30]);
         storage_key.push(0);
         storage_key.push(seed);
-        StateEntry::new(storage_key, Some(vec![seed, seed + 1]))
+        SubstateEntry::new(storage_key, Some(vec![seed, seed + 1]))
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //! can claim — independent of how many transactions a block carries
 //! (which is governed by [`crate::block::limits`]).
 
-/// Cap on `StateEntry.storage_key` length at decode time.
+/// Cap on `SubstateEntry.storage_key` length at decode time.
 ///
 /// Real keys are `db_node_key` (50 bytes) + partition (1) + `sort_key`
 /// (≤ a few hundred bytes for any realistic substate). 4 KiB is well
@@ -13,7 +13,7 @@
 /// oversized arrivals before allocation.
 pub const MAX_STATE_ENTRY_KEY_LEN: usize = 4 * 1024;
 
-/// Cap on `StateEntry.value` length at decode time.
+/// Cap on `SubstateEntry.value` length at decode time.
 ///
 /// Radix substates have an engine-side ceiling well below this; the cap
 /// exists to bound the SBOR `Vec<u8>` pre-allocation a peer can force on

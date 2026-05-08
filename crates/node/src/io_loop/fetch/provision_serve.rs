@@ -7,7 +7,8 @@ use hyperscale_storage::{ChainReader, SubstateStore};
 use hyperscale_types::network::request::GetProvisionsRequest;
 use hyperscale_types::network::response::GetProvisionResponse;
 use hyperscale_types::{
-    MerkleInclusionProof, Provisions, ShardGroupId, StateEntry, TxEntries, TxHash, shard_for_node,
+    MerkleInclusionProof, Provisions, ShardGroupId, SubstateEntry, TxEntries, TxHash,
+    shard_for_node,
 };
 use tracing::warn;
 
@@ -39,7 +40,7 @@ pub fn serve_provision_request(
     let all_txs = block.transactions().iter();
 
     // Phase 1: Fetch state entries for all matching transactions.
-    let mut per_tx: Vec<(TxHash, Vec<StateEntry>)> = Vec::new();
+    let mut per_tx: Vec<(TxHash, Vec<SubstateEntry>)> = Vec::new();
     let mut all_storage_keys: Vec<Vec<u8>> = Vec::new();
 
     for tx in all_txs {

@@ -20,7 +20,7 @@ use hyperscale_storage::tree::proofs::verify_proof;
 use hyperscale_storage::{Storage, SubstateStore, SubstateView, VersionedStore};
 use hyperscale_types::network::notification::ProvisionsNotification;
 use hyperscale_types::{
-    BlockHeight, NodeId, Provisions, ShardGroupId, StateEntry, TxEntries, TxHash, ValidatorId,
+    BlockHeight, NodeId, Provisions, ShardGroupId, SubstateEntry, TxEntries, TxHash, ValidatorId,
     state_provisions_message,
 };
 use tracing::warn;
@@ -29,7 +29,7 @@ use tracing::warn;
 type FetchedTxEntries = (
     TxHash,
     Vec<(ShardGroupId, Vec<NodeId>)>,
-    Arc<Vec<StateEntry>>,
+    Arc<Vec<SubstateEntry>>,
 );
 
 /// One outbound provision batch destined for a single target shard.
