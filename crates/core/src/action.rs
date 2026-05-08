@@ -10,7 +10,7 @@ use hyperscale_types::{
     CertificateRoot, CommittedBlockHeader, ExecutionCertificate, ExecutionVote, FinalizedWave,
     GlobalReceiptRoot, InFlightCount, LocalReceiptRoot, NodeId, ProposerTimestamp, ProvisionHash,
     ProvisionTxRoot, Provisions, ProvisionsRoot, QuorumCertificate, Round, RoutableTransaction,
-    ShardGroupId, SharedCertificates, SharedTransactions, StateProvision, StateRoot,
+    ShardGroupId, SharedCertificates, SharedTransactions, StateRoot, SubstateEntry,
     TopologySnapshot, TransactionRoot, TransactionStatus, TxHash, TxOutcome, ValidatorId,
     VotePower, WaveId, WeightedTimestamp,
 };
@@ -24,8 +24,9 @@ pub struct CrossShardExecutionRequest {
     pub tx_hash: TxHash,
     /// The transaction to execute.
     pub transaction: Arc<RoutableTransaction>,
-    /// State provisions from other shards.
-    pub provisions: Vec<StateProvision>,
+    /// State entries provisioned by other shards (one `Arc` per source shard
+    /// contribution). Engine layers them on top of the local snapshot.
+    pub provisions: Vec<Arc<Vec<SubstateEntry>>>,
 }
 
 /// A single cross-shard transaction's provisioning needs.
@@ -123,7 +124,7 @@ pub enum Action {
     ///
     /// Only the block proposer emits this (once per block). Delegated to the
     /// execution pool where it fetches entries, generates merkle proofs, builds
-    /// `StateProvision`s, groups by target shard, and returns batches via
+    /// per-shard provision batches, groups by target shard, and returns batches via
     /// `ProtocolEvent::OutboundProvisionBroadcast` for network broadcast.
     FetchAndBroadcastProvisions {
         /// The committed block whose state is being attested to. Anchors

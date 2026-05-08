@@ -6,7 +6,7 @@
 //! ## Provision Flow
 //!
 //! 1. The source shard proposer broadcasts `ProvisionsNotification`
-//!    messages carrying `StateProvision` entries with JMT inclusion proofs.
+//!    messages carrying `Provisions` bundles with JMT inclusion proofs.
 //! 2. The target shard receives them and associates the provisions with
 //!    the corresponding remote block headers.
 //! 3. `VerifyProvisions` validates the quorum certificate (QC) signature

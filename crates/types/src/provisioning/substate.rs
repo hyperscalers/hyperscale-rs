@@ -1,17 +1,8 @@
-//! State-related types for cross-shard execution.
-
-use std::sync::Arc;
+//! Pre-computed-key substate entries shipped between shards as provisions.
 
 use sbor::prelude::*;
 
-use crate::{
-    BlockHeight, BoundedBytes, Hash, MAX_STATE_ENTRY_KEY_LEN, MAX_STATE_ENTRY_VALUE_LEN, NodeId,
-    ShardGroupId, TxHash,
-};
-
-// ============================================================================
-// State entry types with pre-computed storage keys
-// ============================================================================
+use crate::{BoundedBytes, Hash, MAX_STATE_ENTRY_KEY_LEN, MAX_STATE_ENTRY_VALUE_LEN, NodeId};
 
 /// A state entry with pre-computed storage key for fast engine lookup.
 ///
@@ -105,84 +96,6 @@ impl SubstateEntry {
         Self::new(storage_key, value)
     }
 }
-
-/// Per-tx provision view used inside the execution path.
-///
-/// Built from a [`crate::Provisions`] bundle when it lands at the execution
-/// coordinator: each `ProvisionEntry` in the bundle becomes one `StateProvision`
-/// keyed to the tx, carrying the bundle's source/target shard and block
-/// height alongside the tx's slice of state entries. Not on the wire.
-#[derive(Debug, Clone)]
-pub struct StateProvision {
-    transaction_hash: TxHash,
-    target_shard: ShardGroupId,
-    source_shard: ShardGroupId,
-    block_height: BlockHeight,
-    entries: Arc<Vec<SubstateEntry>>,
-}
-
-impl StateProvision {
-    /// Build a `StateProvision` from its parts.
-    #[must_use]
-    pub const fn new(
-        transaction_hash: TxHash,
-        target_shard: ShardGroupId,
-        source_shard: ShardGroupId,
-        block_height: BlockHeight,
-        entries: Arc<Vec<SubstateEntry>>,
-    ) -> Self {
-        Self {
-            transaction_hash,
-            target_shard,
-            source_shard,
-            block_height,
-            entries,
-        }
-    }
-
-    /// Hash of the transaction this provision is for.
-    #[must_use]
-    pub const fn transaction_hash(&self) -> TxHash {
-        self.transaction_hash
-    }
-
-    /// Target shard (the shard executing the transaction).
-    #[must_use]
-    pub const fn target_shard(&self) -> ShardGroupId {
-        self.target_shard
-    }
-
-    /// Source shard (the shard providing the state).
-    #[must_use]
-    pub const fn source_shard(&self) -> ShardGroupId {
-        self.source_shard
-    }
-
-    /// Block height when this provision was created (anchors merkle proofs).
-    #[must_use]
-    pub const fn block_height(&self) -> BlockHeight {
-        self.block_height
-    }
-
-    /// The state entries with pre-computed storage keys.
-    #[must_use]
-    pub const fn entries(&self) -> &Arc<Vec<SubstateEntry>> {
-        &self.entries
-    }
-}
-
-impl PartialEq for StateProvision {
-    fn eq(&self, other: &Self) -> bool {
-        self.transaction_hash == other.transaction_hash
-            && self.target_shard == other.target_shard
-            && self.source_shard == other.source_shard
-            && self.block_height == other.block_height
-            && *self.entries == *other.entries
-    }
-}
-
-impl Eq for StateProvision {}
-
 #[cfg(test)]
 mod tests {
     use sbor::{

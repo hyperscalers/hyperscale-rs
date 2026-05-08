@@ -596,7 +596,6 @@ impl ExecutionCoordinator {
     /// which diverges abort decisions across validators.
     fn apply_committed_provisions(
         &mut self,
-        topology: &TopologySnapshot,
         batches: &[Arc<Provisions>],
         committed_height: BlockHeight,
         committed_ts: WeightedTimestamp,
@@ -607,10 +606,9 @@ impl ExecutionCoordinator {
 
         // Phase 1: absorb all provisions. Populated unconditionally so
         // `setup_waves_and_dispatch` can replay them at wave-creation time.
-        let local_shard = topology.local_shard();
         let mut affected_waves: BTreeSet<WaveId> = BTreeSet::new();
         for provisions in &ordered {
-            for tx_hash in self.provisioning.absorb_provisions(provisions, local_shard) {
+            for tx_hash in self.provisioning.absorb_provisions(provisions) {
                 if let Some(wave_id) = self.waves.wave_assignment(&tx_hash) {
                     affected_waves.insert(wave_id);
                 }
@@ -1467,12 +1465,7 @@ impl ExecutionCoordinator {
         // Apply this block's provisions after wave setup so newly-created
         // waves can transition to provisioned from the same block's batches.
         if !provisions.is_empty() {
-            actions.extend(self.apply_committed_provisions(
-                topology,
-                provisions,
-                height,
-                self.committed_ts,
-            ));
+            actions.extend(self.apply_committed_provisions(provisions, height, self.committed_ts));
         }
 
         actions

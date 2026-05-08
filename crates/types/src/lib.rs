@@ -79,7 +79,7 @@ pub use provisioning::limits::{
 };
 pub use provisioning::proof::MerkleInclusionProof;
 pub use provisioning::provisions::Provisions;
-pub use provisioning::substate::{StateProvision, SubstateEntry};
+pub use provisioning::substate::SubstateEntry;
 pub use quorum_certificate::QuorumCertificate;
 // Re-export DatabaseUpdates from radix for cross-crate use (execution cache, block commit)
 pub use radix_substate_store_interface::interface::DatabaseUpdates;

@@ -89,7 +89,7 @@ impl NetworkTrafficAnalyzer {
     ///
     /// # Arguments
     ///
-    /// * `msg_type` - The message type name (e.g., `BlockHeader`, `StateProvision`)
+    /// * `msg_type` - The message type name (e.g., `BlockHeader`, `Provisions`)
     /// * `payload_size` - Size of the message payload in bytes
     /// * `wire_size` - Size on the wire including framing overhead
     /// * `from` - Sender node index

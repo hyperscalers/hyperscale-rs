@@ -3,9 +3,9 @@
 //!
 //! Three correlated maps plus an inner [`ConflictDetector`]:
 //!
-//! - [`verified`](ProvisioningTracker::verified) — committed
-//!   [`StateProvision`]s keyed by `tx_hash`. Feeds the cross-shard dispatch
-//!   action for each tx.
+//! - [`verified`](ProvisioningTracker::verified) — committed entry lists
+//!   keyed by `tx_hash`, one `Arc<Vec<SubstateEntry>>` per source shard
+//!   contribution. Feeds the cross-shard dispatch action for each tx.
 //! - `required` — the set of remote shards each cross-shard tx needs
 //!   provisions from. Populated when the tx's wave is created.
 //! - `received` — the set of remote shards whose provisions have actually
@@ -26,7 +26,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use hyperscale_types::{
-    NodeId, Provisions, RETENTION_HORIZON, ShardGroupId, StateProvision, TopologySnapshot, TxHash,
+    NodeId, Provisions, RETENTION_HORIZON, ShardGroupId, SubstateEntry, TopologySnapshot, TxHash,
     WeightedTimestamp,
 };
 
@@ -38,7 +38,7 @@ pub struct ProvisioningTracker {
     /// terminal-state path ([`remove_tx`]) when a wave certificate
     /// commits, and swept by [`gc_stale_provisions`] for txs whose
     /// retention horizon elapsed without ever finalizing.
-    verified: HashMap<TxHash, Vec<StateProvision>>,
+    verified: HashMap<TxHash, Vec<Arc<Vec<SubstateEntry>>>>,
 
     /// Remote shards each cross-shard tx needs provisions from. Populated
     /// at wave creation.
@@ -127,31 +127,21 @@ impl ProvisioningTracker {
 
     // ─── Batch absorption ───────────────────────────────────────────────
 
-    /// Absorb a committed provisions. Adds one [`StateProvision`] per
-    /// `tx_entry` to the verified map and records `provisions.source_shard`
-    /// under `received[tx_hash]`.
+    /// Absorb a committed provisions. Appends each tx's entry list to the
+    /// verified map (one entry list per source-shard contribution) and
+    /// records `provisions.source_shard` under `received[tx_hash]`.
     ///
     /// Returns the `tx_hash`es touched — the caller uses these to compute
     /// which local waves are affected and to drive the dispatch check.
     /// Preserves iteration order of `provisions.transactions` (callers sort
     /// batches upstream for determinism).
-    pub fn absorb_provisions(
-        &mut self,
-        provisions: &Provisions,
-        local_shard: ShardGroupId,
-    ) -> Vec<TxHash> {
+    pub fn absorb_provisions(&mut self, provisions: &Provisions) -> Vec<TxHash> {
         let mut touched = Vec::with_capacity(provisions.transactions().len());
         let source_shard = provisions.source_shard();
         for tx_entry in provisions.transactions().iter() {
             let tx_hash = tx_entry.tx_hash;
-            let provision = StateProvision::new(
-                tx_hash,
-                local_shard,
-                source_shard,
-                provisions.block_height(),
-                Arc::new(tx_entry.entries.0.clone()),
-            );
-            self.verified.entry(tx_hash).or_default().push(provision);
+            let entries = Arc::new(tx_entry.entries.0.clone());
+            self.verified.entry(tx_hash).or_default().push(entries);
             self.received
                 .entry(tx_hash)
                 .or_default()
@@ -237,7 +227,7 @@ impl ProvisioningTracker {
     /// Borrow the verified-provisions map. Used by the coordinator when
     /// passing it to `handlers::build_dispatch_action`, which needs a
     /// per-tx lookup and doesn't care about the surrounding tracker state.
-    pub const fn verified(&self) -> &HashMap<TxHash, Vec<StateProvision>> {
+    pub const fn verified(&self) -> &HashMap<TxHash, Vec<Arc<Vec<SubstateEntry>>>> {
         &self.verified
     }
 
@@ -301,12 +291,12 @@ mod tests {
 
         // Only shard 1 landed.
         let batch1 = make_provisions(shard(1), BlockHeight::new(5), vec![tx]);
-        t.absorb_provisions(&batch1, shard(0));
+        t.absorb_provisions(&batch1);
         assert!(!t.is_fully_provisioned(&tx));
 
         // Shard 2 lands → fully provisioned.
         let batch2 = make_provisions(shard(2), BlockHeight::new(5), vec![tx]);
-        t.absorb_provisions(&batch2, shard(0));
+        t.absorb_provisions(&batch2);
         assert!(t.is_fully_provisioned(&tx));
     }
 
@@ -318,7 +308,7 @@ mod tests {
         // the query must not report fully-provisioned just because
         // anything landed.
         let provisions = make_provisions(shard(1), BlockHeight::new(5), vec![tx]);
-        t.absorb_provisions(&provisions, shard(0));
+        t.absorb_provisions(&provisions);
         assert!(!t.is_fully_provisioned(&tx));
     }
 
@@ -328,7 +318,7 @@ mod tests {
         let tx_a = TxHash::from_raw(Hash::from_bytes(b"a"));
         let tx_b = TxHash::from_raw(Hash::from_bytes(b"b"));
         let provisions = make_provisions(shard(1), BlockHeight::new(5), vec![tx_a, tx_b]);
-        let touched = t.absorb_provisions(&provisions, shard(0));
+        let touched = t.absorb_provisions(&provisions);
         assert_eq!(touched, vec![tx_a, tx_b]);
     }
 
@@ -337,7 +327,7 @@ mod tests {
         let mut t = ProvisioningTracker::new();
         let tx = TxHash::from_raw(Hash::from_bytes(b"tx"));
         let provisions = make_provisions(shard(1), BlockHeight::new(5), vec![tx]);
-        t.absorb_provisions(&provisions, shard(0));
+        t.absorb_provisions(&provisions);
 
         assert_eq!(t.verified_len(), 1);
         assert_eq!(t.received_len(), 1);
@@ -352,17 +342,11 @@ mod tests {
     fn absorb_multiple_batches_for_same_tx_accumulates() {
         let mut t = ProvisioningTracker::new();
         let tx = TxHash::from_raw(Hash::from_bytes(b"tx"));
-        t.absorb_provisions(
-            &make_provisions(shard(1), BlockHeight::new(5), vec![tx]),
-            shard(0),
-        );
-        t.absorb_provisions(
-            &make_provisions(shard(2), BlockHeight::new(5), vec![tx]),
-            shard(0),
-        );
+        t.absorb_provisions(&make_provisions(shard(1), BlockHeight::new(5), vec![tx]));
+        t.absorb_provisions(&make_provisions(shard(2), BlockHeight::new(5), vec![tx]));
 
-        // Two distinct source shards → two StateProvisions and two received
-        // entries.
+        // Two distinct source shards → two verified entry lists and two
+        // received entries.
         assert_eq!(t.verified.get(&tx).map_or(0, Vec::len), 2);
         assert_eq!(
             t.received.get(&tx).map_or(0, BTreeSet::len),
@@ -377,7 +361,7 @@ mod tests {
         let tx = TxHash::from_raw(Hash::from_bytes(b"tx"));
         t.record_required(tx, std::iter::once(shard(1)).collect());
         let provisions = make_provisions(shard(1), BlockHeight::new(5), vec![tx]);
-        t.absorb_provisions(&provisions, shard(0));
+        t.absorb_provisions(&provisions);
         assert!(t.is_fully_provisioned(&tx));
 
         t.remove_tx(&tx);
@@ -409,18 +393,20 @@ mod tests {
         // Old tx absorbed at clock = ms(1_000).
         t.advance_clock(WeightedTimestamp::from_millis(1_000));
         t.record_required(tx_old, std::iter::once(shard(1)).collect());
-        t.absorb_provisions(
-            &make_provisions(shard(1), BlockHeight::new(5), vec![tx_old]),
-            shard(0),
-        );
+        t.absorb_provisions(&make_provisions(
+            shard(1),
+            BlockHeight::new(5),
+            vec![tx_old],
+        ));
 
         // Fresh tx absorbed at clock = ms(60_000).
         t.advance_clock(WeightedTimestamp::from_millis(60_000));
         t.record_required(tx_fresh, std::iter::once(shard(1)).collect());
-        t.absorb_provisions(
-            &make_provisions(shard(1), BlockHeight::new(6), vec![tx_fresh]),
-            shard(0),
-        );
+        t.absorb_provisions(&make_provisions(
+            shard(1),
+            BlockHeight::new(6),
+            vec![tx_fresh],
+        ));
 
         let horizon_ms = u64::try_from(RETENTION_HORIZON.as_millis()).unwrap_or(u64::MAX);
         // Past tx_old's deadline (1_000 + horizon) but not tx_fresh's
@@ -448,18 +434,12 @@ mod tests {
 
         // First insert at clock = ms(1_000) → deadline = 1_000 + horizon.
         t.advance_clock(WeightedTimestamp::from_millis(1_000));
-        t.absorb_provisions(
-            &make_provisions(shard(1), BlockHeight::new(5), vec![tx]),
-            shard(0),
-        );
+        t.absorb_provisions(&make_provisions(shard(1), BlockHeight::new(5), vec![tx]));
 
         // Second insert at clock = ms(60_000) → deadline extended to
         // 60_000 + horizon.
         t.advance_clock(WeightedTimestamp::from_millis(60_000));
-        t.absorb_provisions(
-            &make_provisions(shard(2), BlockHeight::new(5), vec![tx]),
-            shard(0),
-        );
+        t.absorb_provisions(&make_provisions(shard(2), BlockHeight::new(5), vec![tx]));
 
         let horizon_ms = u64::try_from(RETENTION_HORIZON.as_millis()).unwrap_or(u64::MAX);
         // Past the FIRST deadline but not the SECOND. Entry must survive.

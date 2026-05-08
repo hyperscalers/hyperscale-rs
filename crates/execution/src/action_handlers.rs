@@ -23,8 +23,8 @@ use hyperscale_types::network::notification::{
 };
 use hyperscale_types::{
     BlockHash, Bls12381G1PublicKey, Bls12381G2Signature, ExecutionCertificate, ExecutionVote,
-    GlobalReceiptRoot, RoutableTransaction, SignerBitfield, StateProvision, StateRoot,
-    StoredReceipt, TxHash, ValidatorId, VotePower, WaveId, WeightedTimestamp,
+    GlobalReceiptRoot, RoutableTransaction, SignerBitfield, StateRoot, StoredReceipt,
+    SubstateEntry, TxHash, ValidatorId, VotePower, WaveId, WeightedTimestamp,
     batch_verify_bls_same_message, compute_global_receipt_root, exec_cert_batch_message,
     exec_vote_batch_message, exec_vote_message, verify_bls12381_v1, zero_bls_signature,
 };
@@ -236,7 +236,7 @@ pub fn verify_execution_certificate_signature(
 /// reason to execute them.
 pub(crate) fn build_dispatch_action(
     wave: &WaveState,
-    verified_provisions: &HashMap<TxHash, Vec<StateProvision>>,
+    verified_provisions: &HashMap<TxHash, Vec<Arc<Vec<SubstateEntry>>>>,
     block_hash: BlockHash,
 ) -> Option<Action> {
     if wave.wave_id().is_zero() {
@@ -949,16 +949,7 @@ mod tests {
         let wave = cross_shard_wave_with(&[1], ShardGroupId::new(1));
         let tx_hash = wave.tx_hashes()[0];
         let mut provisions = HashMap::new();
-        provisions.insert(
-            tx_hash,
-            vec![StateProvision::new(
-                tx_hash,
-                shard(),
-                ShardGroupId::new(1),
-                BlockHeight::new(5),
-                Arc::new(vec![]),
-            )],
-        );
+        provisions.insert(tx_hash, vec![Arc::new(Vec::<SubstateEntry>::new())]);
 
         let action = build_dispatch_action(&wave, &provisions, BlockHash::ZERO);
         match action {

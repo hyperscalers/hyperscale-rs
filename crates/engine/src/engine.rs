@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use hyperscale_storage::SubstateDatabase;
-use hyperscale_types::{RoutableTransaction, ShardGroupId, StateProvision};
+use hyperscale_types::{RoutableTransaction, ShardGroupId, SubstateEntry};
 use radix_common::network::NetworkDefinition;
 
 use crate::output::ExecutionOutput;
@@ -58,7 +58,7 @@ pub trait Engine: Clone + Send + Sync + 'static {
         &self,
         snapshot: &D,
         transactions: &[Arc<RoutableTransaction>],
-        provisions: &[StateProvision],
+        provisions: &[Arc<Vec<SubstateEntry>>],
         local_shard: ShardGroupId,
         num_shards: u64,
     ) -> ExecutionOutput;

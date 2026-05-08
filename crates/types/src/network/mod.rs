@@ -30,7 +30,7 @@
 //!
 //! 3. **`CrossShardProgress`** — Execution and finalization across shards.
 //!    Delay stalls cross-shard execution but local consensus continues
-//!    (`StateProvision`, `ExecutionVotes`, `ExecutionCertificates`,
+//!    (`Provisions`, `ExecutionVotes`, `ExecutionCertificates`,
 //!    `CommittedBlockHeader` gossip).
 //!
 //! 4. **Recovery** — Catch-up traffic. Steady-state volume is zero

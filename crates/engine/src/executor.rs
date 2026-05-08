@@ -14,9 +14,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use hyperscale_storage::{SubstateDatabase, SubstateStore};
-use hyperscale_types::{
-    BlockHeight, NodeId, RoutableTransaction, ShardGroupId, StateProvision, SubstateEntry,
-};
+use hyperscale_types::{BlockHeight, NodeId, RoutableTransaction, ShardGroupId, SubstateEntry};
 use radix_common::network::NetworkDefinition;
 use radix_common::types::NodeId as RadixNodeId;
 use radix_engine::transaction::{ExecutionConfig, execute_transaction};
@@ -230,15 +228,14 @@ impl Engine for RadixExecutor {
         &self,
         snapshot: &D,
         transactions: &[Arc<RoutableTransaction>],
-        provisions: &[StateProvision],
+        provisions: &[Arc<Vec<SubstateEntry>>],
         local_shard: ShardGroupId,
         num_shards: u64,
     ) -> ExecutionOutput {
         let start = Instant::now();
         let mut results = Vec::with_capacity(transactions.len());
 
-        let entry_slices: Vec<&[SubstateEntry]> =
-            provisions.iter().map(|p| p.entries().as_slice()).collect();
+        let entry_slices: Vec<&[SubstateEntry]> = provisions.iter().map(|p| p.as_slice()).collect();
         let provisioned = ProvisionedSnapshot::from_provisions(snapshot, &entry_slices);
 
         for tx in transactions {

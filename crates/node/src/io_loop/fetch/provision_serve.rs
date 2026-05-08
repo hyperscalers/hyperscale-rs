@@ -16,7 +16,7 @@ use tracing::warn;
 ///
 /// Looks up the block at the requested height, identifies transactions
 /// that involve the requesting shard, collects the local state entries
-/// and merkle proofs, and returns them as `StateProvision`s.
+/// and merkle proofs, and returns them as `Provisions` bundles.
 ///
 /// Takes `local_shard` and `num_shards` instead of `&TopologyCoordinator`
 /// to avoid topology dependency in the I/O layer.
