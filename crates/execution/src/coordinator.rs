@@ -52,7 +52,6 @@ use hyperscale_types::{
 };
 use tracing::instrument;
 
-use crate::action_handlers::build_dispatch_action;
 use crate::conflict::DetectedConflict;
 use crate::early_arrivals::{EARLY_VOTE_RETENTION, EarlyArrivalBuffer};
 use crate::exec_cert_store::ExecCertStore;
@@ -387,12 +386,7 @@ impl ExecutionCoordinator {
             }
 
             // Dispatch execution if fully provisioned at creation.
-            if wave_state.is_fully_provisioned()
-                && !wave_state.dispatched()
-                && let Some(action) =
-                    build_dispatch_action(&wave_state, self.provisioning.verified(), block_hash)
-            {
-                wave_state.mark_dispatched();
+            if let Some(action) = wave_state.dispatch_if_ready(self.provisioning.verified()) {
                 dispatch_actions.push(action);
             }
 
@@ -666,17 +660,7 @@ impl ExecutionCoordinator {
                 }
             }
 
-            // Anchor reads at the wave-start block, matching the single-shard
-            // path (which dispatches at wave-start and uses the same block
-            // hash). Using `committed_block_hash` would include intervening
-            // blocks' cert writes in the view, and those writes come from
-            // each validator's own local receipts — one validator's
-            // divergence there seeds divergence everywhere downstream.
-            if wave.is_fully_provisioned()
-                && let Some(action) =
-                    build_dispatch_action(wave, self.provisioning.verified(), wave.block_hash())
-            {
-                wave.mark_dispatched();
+            if let Some(action) = wave.dispatch_if_ready(self.provisioning.verified()) {
                 actions.push(action);
             }
         }

@@ -28,10 +28,12 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use hyperscale_core::{Action, CrossShardExecutionRequest};
 use hyperscale_types::{
     BlockHash, BlockHeight, ExecutionCertificate, ExecutionOutcome, GlobalReceiptRoot,
-    RoutableTransaction, ShardGroupId, StoredReceipt, TransactionDecision, TxHash, TxOutcome,
-    WAVE_TIMEOUT, WaveCertificate, WaveId, WeightedTimestamp, compute_global_receipt_root,
+    RoutableTransaction, ShardGroupId, StateRoot, StoredReceipt, SubstateEntry,
+    TransactionDecision, TxHash, TxOutcome, WAVE_TIMEOUT, WaveCertificate, WaveId,
+    WeightedTimestamp, compute_global_receipt_root,
 };
 
 /// Age at which a still-alive wave emits a single diagnostic warning.
@@ -273,6 +275,84 @@ impl WaveState {
             self.dispatched = true;
             true
         }
+    }
+
+    /// Build the one-shot execution dispatch [`Action`] for a fully-provisioned
+    /// wave and flip `dispatched` if one is produced.
+    ///
+    /// Returns `None` (without mutating) when the wave isn't fully provisioned,
+    /// has already dispatched, every tx is pre-aborted, or a cross-shard tx is
+    /// missing its provisions. Pairing the build with the flag flip closes the
+    /// invariant that a dispatch action and the dispatched marker move
+    /// together.
+    ///
+    /// The action carries the wave-starting block's hash, not whatever block
+    /// the dispatcher is processing. Anchoring reads to the wave-start block
+    /// keeps the cross-shard provisioned-dispatch path consistent with the
+    /// single-shard dispatch-at-wave-start path; threading
+    /// `committed_block_hash` would fold intervening blocks' cert writes
+    /// (sourced from each validator's own local receipts) into the view,
+    /// seeding divergence downstream.
+    pub fn dispatch_if_ready(
+        &mut self,
+        verified_provisions: &HashMap<TxHash, Vec<Arc<Vec<SubstateEntry>>>>,
+    ) -> Option<Action> {
+        if !self.is_fully_provisioned() || self.dispatched {
+            return None;
+        }
+        let action = self.build_dispatch_action(verified_provisions)?;
+        self.dispatched = true;
+        Some(action)
+    }
+
+    /// Pre-aborted txs are excluded — they produce no state change, so there's
+    /// no reason to execute them.
+    fn build_dispatch_action(
+        &self,
+        verified_provisions: &HashMap<TxHash, Vec<Arc<Vec<SubstateEntry>>>>,
+    ) -> Option<Action> {
+        if self.wave_id.is_zero() {
+            // Single-shard wave: no provisions needed.
+            let transactions: Vec<Arc<RoutableTransaction>> = self
+                .tx_hashes
+                .iter()
+                .filter(|h| !self.is_tx_explicitly_aborted(h))
+                .filter_map(|h| self.transactions.get(h).cloned())
+                .collect();
+            if transactions.is_empty() {
+                return None;
+            }
+            return Some(Action::ExecuteTransactions {
+                wave_id: self.wave_id.clone(),
+                block_hash: self.block_hash,
+                transactions,
+                state_root: StateRoot::ZERO,
+            });
+        }
+
+        // Cross-shard wave: every non-aborted tx needs its verified provisions assembled.
+        let mut requests: Vec<CrossShardExecutionRequest> =
+            Vec::with_capacity(self.tx_hashes.len());
+        for tx_hash in &self.tx_hashes {
+            if self.is_tx_explicitly_aborted(tx_hash) {
+                continue;
+            }
+            let tx = self.transactions.get(tx_hash)?;
+            let provisions = verified_provisions.get(tx_hash)?.clone();
+            requests.push(CrossShardExecutionRequest {
+                tx_hash: *tx_hash,
+                transaction: Arc::clone(tx),
+                provisions,
+            });
+        }
+        if requests.is_empty() {
+            return None;
+        }
+        Some(Action::ExecuteCrossShardTransactions {
+            wave_id: self.wave_id.clone(),
+            block_hash: self.block_hash,
+            requests,
+        })
     }
 
     /// Mark a single tx as provisioned. Keeps the earliest `at` per tx
@@ -1317,5 +1397,89 @@ mod tests {
         assert_eq!(decisions[&h1], TransactionDecision::Aborted);
         assert_eq!(decisions[&h2], TransactionDecision::Reject);
         assert_eq!(decisions[&h0], TransactionDecision::Accept);
+    }
+
+    // ─── dispatch_if_ready ──────────────────────────────────────────────
+
+    #[test]
+    fn dispatch_if_ready_single_shard_emits_execute_transactions_and_flips_flag() {
+        let mut w = make_single_shard_wave(2);
+        let action = w.dispatch_if_ready(&HashMap::new());
+        match action {
+            Some(Action::ExecuteTransactions { transactions, .. }) => {
+                assert_eq!(transactions.len(), 2);
+            }
+            other => panic!("expected ExecuteTransactions, got {other:?}"),
+        }
+        assert!(w.dispatched());
+        // Idempotent: a second call after dispatch returns None and doesn't re-flip.
+        assert!(w.dispatch_if_ready(&HashMap::new()).is_none());
+    }
+
+    #[test]
+    fn dispatch_if_ready_cross_shard_returns_none_when_provisions_missing() {
+        let mut w = make_cross_shard_wave(1);
+        let h0 = w.tx_hashes()[0];
+        w.mark_tx_provisioned(h0, ts_for(WAVE_START + 1));
+
+        // Empty provisions map → can't assemble cross-shard request, no flip.
+        assert!(w.dispatch_if_ready(&HashMap::new()).is_none());
+        assert!(!w.dispatched());
+    }
+
+    #[test]
+    fn dispatch_if_ready_cross_shard_succeeds_with_all_provisions() {
+        let mut w = make_cross_shard_wave(1);
+        let h0 = w.tx_hashes()[0];
+        w.mark_tx_provisioned(h0, ts_for(WAVE_START + 1));
+
+        let mut provisions: HashMap<TxHash, Vec<Arc<Vec<SubstateEntry>>>> = HashMap::new();
+        provisions.insert(h0, vec![Arc::new(Vec::<SubstateEntry>::new())]);
+
+        match w.dispatch_if_ready(&provisions) {
+            Some(Action::ExecuteCrossShardTransactions { requests, .. }) => {
+                assert_eq!(requests.len(), 1);
+                assert_eq!(requests[0].tx_hash, h0);
+            }
+            other => panic!("expected ExecuteCrossShardTransactions, got {other:?}"),
+        }
+        assert!(w.dispatched());
+    }
+
+    #[test]
+    fn dispatch_if_ready_skips_pre_aborted_txs() {
+        let mut w = make_single_shard_wave(2);
+        let aborted = w.tx_hashes()[0];
+        w.record_abort(aborted, ts_for(WAVE_START));
+
+        match w.dispatch_if_ready(&HashMap::new()) {
+            Some(Action::ExecuteTransactions { transactions, .. }) => {
+                assert_eq!(transactions.len(), 1);
+                assert_ne!(transactions[0].hash(), aborted);
+            }
+            other => panic!("expected ExecuteTransactions, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_if_ready_returns_none_when_all_txs_aborted() {
+        let mut w = make_single_shard_wave(1);
+        let aborted = w.tx_hashes()[0];
+        w.record_abort(aborted, ts_for(WAVE_START));
+
+        assert!(w.dispatch_if_ready(&HashMap::new()).is_none());
+        // Wave wasn't dispatched — no action was produced.
+        assert!(!w.dispatched());
+    }
+
+    #[test]
+    fn dispatch_if_ready_returns_none_when_not_fully_provisioned() {
+        let mut w = make_cross_shard_wave(2);
+        // Only one of two txs marked provisioned.
+        let h0 = w.tx_hashes()[0];
+        w.mark_tx_provisioned(h0, ts_for(WAVE_START + 1));
+
+        assert!(w.dispatch_if_ready(&HashMap::new()).is_none());
+        assert!(!w.dispatched());
     }
 }
