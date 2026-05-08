@@ -144,13 +144,13 @@ impl ProvisioningTracker {
         let source_shard = provisions.source_shard;
         for tx_entry in provisions.transactions.iter() {
             let tx_hash = tx_entry.tx_hash;
-            let provision = StateProvision {
-                transaction_hash: tx_hash,
-                target_shard: local_shard,
+            let provision = StateProvision::new(
+                tx_hash,
+                local_shard,
                 source_shard,
-                block_height: provisions.block_height,
-                entries: Arc::new(tx_entry.entries.0.clone()),
-            };
+                provisions.block_height,
+                Arc::new(tx_entry.entries.0.clone()),
+            );
             self.verified.entry(tx_hash).or_default().push(provision);
             self.received
                 .entry(tx_hash)

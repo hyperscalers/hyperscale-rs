@@ -114,21 +114,61 @@ impl StateEntry {
 /// height alongside the tx's slice of state entries. Not on the wire.
 #[derive(Debug, Clone)]
 pub struct StateProvision {
+    transaction_hash: TxHash,
+    target_shard: ShardGroupId,
+    source_shard: ShardGroupId,
+    block_height: BlockHeight,
+    entries: Arc<Vec<StateEntry>>,
+}
+
+impl StateProvision {
+    /// Build a `StateProvision` from its parts.
+    #[must_use]
+    pub const fn new(
+        transaction_hash: TxHash,
+        target_shard: ShardGroupId,
+        source_shard: ShardGroupId,
+        block_height: BlockHeight,
+        entries: Arc<Vec<StateEntry>>,
+    ) -> Self {
+        Self {
+            transaction_hash,
+            target_shard,
+            source_shard,
+            block_height,
+            entries,
+        }
+    }
+
     /// Hash of the transaction this provision is for.
-    pub transaction_hash: TxHash,
+    #[must_use]
+    pub const fn transaction_hash(&self) -> TxHash {
+        self.transaction_hash
+    }
 
     /// Target shard (the shard executing the transaction).
-    pub target_shard: ShardGroupId,
+    #[must_use]
+    pub const fn target_shard(&self) -> ShardGroupId {
+        self.target_shard
+    }
 
     /// Source shard (the shard providing the state).
-    pub source_shard: ShardGroupId,
+    #[must_use]
+    pub const fn source_shard(&self) -> ShardGroupId {
+        self.source_shard
+    }
 
     /// Block height when this provision was created (anchors merkle proofs).
-    pub block_height: BlockHeight,
+    #[must_use]
+    pub const fn block_height(&self) -> BlockHeight {
+        self.block_height
+    }
 
     /// The state entries with pre-computed storage keys.
-    /// Wrapped in Arc for efficient sharing.
-    pub entries: Arc<Vec<StateEntry>>,
+    #[must_use]
+    pub const fn entries(&self) -> &Arc<Vec<StateEntry>> {
+        &self.entries
+    }
 }
 
 impl PartialEq for StateProvision {

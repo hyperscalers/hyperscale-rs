@@ -925,13 +925,13 @@ mod tests {
         let mut provisions = HashMap::new();
         provisions.insert(
             tx_hash,
-            vec![StateProvision {
-                transaction_hash: tx_hash,
-                target_shard: shard(),
-                source_shard: ShardGroupId::new(1),
-                block_height: BlockHeight::new(5),
-                entries: Arc::new(vec![]),
-            }],
+            vec![StateProvision::new(
+                tx_hash,
+                shard(),
+                ShardGroupId::new(1),
+                BlockHeight::new(5),
+                Arc::new(vec![]),
+            )],
         );
 
         let action = build_dispatch_action(&wave, &provisions, BlockHash::ZERO);
