@@ -1355,7 +1355,7 @@ impl BftCoordinator {
         // from test fixtures; production always assembles before reaching
         // here.
         if let Some(block) = self.pending_blocks.get_block(block_hash) {
-            if self.reject_invalid_block_contents(topology_snapshot, block_hash, &block) {
+            if self.reject_invalid_block_contents(topology_snapshot, block_hash, block) {
                 return vec![];
             }
 
@@ -1373,7 +1373,7 @@ impl BftCoordinator {
             let skip_vote = match self.verification.classify_vote_in_flight(
                 &chain,
                 block_hash,
-                &block,
+                block,
                 vote_locked,
             ) {
                 InFlightCheck::Proceed => false,
@@ -1385,7 +1385,7 @@ impl BftCoordinator {
                 topology_snapshot,
                 &self.pending_blocks,
                 block_hash,
-                &block,
+                block,
             );
 
             // Wait for initiated verifications, or exit early when we're
@@ -1393,7 +1393,7 @@ impl BftCoordinator {
             // fully verified yet.
             if skip_vote
                 || !verification_actions.is_empty()
-                || !self.verification.is_block_verified(&block)
+                || !self.verification.is_block_verified(block)
             {
                 return verification_actions;
             }
@@ -1721,7 +1721,7 @@ impl BftCoordinator {
             return vec![];
         };
 
-        if !self.verification.is_block_verified(&block) {
+        if !self.verification.is_block_verified(block) {
             debug!(
                 block_hash = ?block_hash,
                 ?kind,
@@ -2068,7 +2068,7 @@ impl BftCoordinator {
         let block = self
             .pending_blocks
             .get_block(block_hash)
-            .map(|arc| (*arc).clone());
+            .map(|arc| (**arc).clone());
 
         let Some(block) = block else {
             // Block not yet constructed - check if it's pending (waiting for transactions/certificates)
@@ -2254,7 +2254,7 @@ impl BftCoordinator {
             warn!(?block_hash, "Block not found in pending_blocks for commit");
             return None;
         };
-        let Some(block) = pending.block().map(|b| (*b).clone()) else {
+        let Some(block) = pending.block().map(|b| (**b).clone()) else {
             warn!(
                 ?block_hash,
                 "PendingBlock not yet fully assembled at commit time"
@@ -2533,8 +2533,8 @@ impl BftCoordinator {
         for pending in self.pending_blocks.values() {
             if pending.header().height() == height {
                 if let Some(block) = pending.block() {
-                    if !self.verification.is_block_verified(&block) {
-                        self.verification.log_incomplete_verification(&block);
+                    if !self.verification.is_block_verified(block) {
+                        self.verification.log_incomplete_verification(block);
                     }
                 } else {
                     warn!(

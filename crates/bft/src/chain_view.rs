@@ -60,7 +60,7 @@ impl<'a> ChainView<'a> {
     fn get_block(&self, block_hash: BlockHash) -> Option<Block> {
         let pending = self.pending.get(block_hash)?;
         let block = pending.block()?;
-        Some((*block).clone())
+        Some((**block).clone())
     }
 
     /// Header-only lookup, cheaper than `get_block` when only header fields

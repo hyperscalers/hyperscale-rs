@@ -15,12 +15,7 @@ use tracing::{debug, warn};
 
 /// Map of block hash → [`PendingBlock`] for blocks currently being assembled.
 ///
-/// The key for each entry is derived from `block.header().hash()`; callers
-/// pass a `PendingBlock` to [`insert`](Self::insert) and the wrapper
-/// extracts the key. Domain helpers (`get_header`, `get_block`,
-/// `is_complete`, `has_complete_at`, `has_any_at`) lift the patterns the
-/// coordinator and chain-view repeatedly need so the `HashMap` shape stays
-/// internal.
+/// Keys are derived from `block.header().hash()` on insert.
 #[derive(Default)]
 pub struct PendingBlocks(HashMap<BlockHash, PendingBlock>);
 
@@ -61,7 +56,7 @@ impl PendingBlocks {
     }
 
     /// Drop pending blocks whose header height is at or below
-    /// `committed_height`. Called from `cleanup_old_state` after a commit.
+    /// `committed_height`.
     pub fn prune_committed(&mut self, committed_height: BlockHeight) {
         self.0
             .retain(|_, pending| pending.header().height() > committed_height);
@@ -75,8 +70,8 @@ impl PendingBlocks {
     /// Constructed [`Block`] for `block_hash`, if the pending block has fully
     /// assembled. Returns `None` when the hash is unknown OR when the block
     /// is still awaiting transactions/waves/provisions.
-    pub fn get_block(&self, block_hash: BlockHash) -> Option<Arc<Block>> {
-        self.0.get(&block_hash).and_then(PendingBlock::block)
+    pub fn get_block(&self, block_hash: BlockHash) -> Option<&Arc<Block>> {
+        self.0.get(&block_hash)?.block()
     }
 
     /// True when the pending block at `block_hash` has all data and the
@@ -88,7 +83,7 @@ impl PendingBlocks {
     }
 
     /// True when some pending block at `height` is complete AND already has
-    /// its inner [`Block`] constructed (i.e. ready to commit).
+    /// its inner [`Block`] constructed.
     pub fn has_complete_at(&self, height: BlockHeight) -> bool {
         self.0.values().any(|pending| {
             pending.header().height() == height
@@ -98,8 +93,7 @@ impl PendingBlocks {
     }
 
     /// True when any pending block sits at `height`, regardless of completion
-    /// state. Used by the proposer-skip gate to detect that we already have
-    /// something to chain onto.
+    /// state.
     pub fn has_any_at(&self, height: BlockHeight) -> bool {
         self.0
             .values()
@@ -118,9 +112,7 @@ impl PendingBlocks {
     }
 
     /// Build a [`PendingBlock`] from `header` + `manifest`, populate it from
-    /// the supplied lookup closures (transactions, finalized waves, and
-    /// provision batches the caller already has locally), and insert it.
-    /// Lookups run only for hashes the manifest declares.
+    /// the supplied lookups, and insert it.
     pub fn assemble(
         &mut self,
         header: BlockHeader,
@@ -168,9 +160,8 @@ impl PendingBlocks {
     }
 
     /// Fold an arrival into every pending block that needs it. Returns the
-    /// hashes of blocks that became complete (and successfully constructed
-    /// their inner [`Block`]) as a result. The coordinator dispatches
-    /// verification / commit triggers from those hashes.
+    /// hashes of blocks that became complete and successfully constructed
+    /// their inner [`Block`].
     fn fold_arrival<F, M>(&mut self, needs: F, apply: M) -> Vec<BlockHash>
     where
         F: Fn(&PendingBlock) -> bool,
@@ -618,8 +609,8 @@ impl PendingBlock {
     }
 
     /// Get the constructed block, if available.
-    pub fn block(&self) -> Option<Arc<Block>> {
-        self.constructed_block.as_ref().map(Arc::clone)
+    pub const fn block(&self) -> Option<&Arc<Block>> {
+        self.constructed_block.as_ref()
     }
 
     /// Get the block header.
