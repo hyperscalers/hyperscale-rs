@@ -106,7 +106,7 @@ impl PendingBlock {
             provisions.iter().map(|p| p.hash()).collect();
         provision_hashes.sort();
         let mut manifest = BlockManifest::from_block(block);
-        manifest.provision_hashes = provision_hashes;
+        manifest.provision_hashes = provision_hashes.into();
         let mut received_provisions: BTreeMap<ProvisionHash, Arc<Provisions>> = BTreeMap::new();
         for p in provisions {
             received_provisions.insert(p.hash(), p);
@@ -456,7 +456,7 @@ mod tests {
         let pb = PendingBlock::from_manifest(
             header,
             BlockManifest {
-                tx_hashes: vec![tx1, tx2],
+                tx_hashes: vec![tx1, tx2].into(),
                 ..Default::default()
             },
             LocalTimestamp::ZERO,
@@ -488,8 +488,8 @@ mod tests {
         let pb = PendingBlock::from_manifest(
             header,
             BlockManifest {
-                tx_hashes: vec![tx1],
-                cert_ids: vec![wave1.clone(), wave2.clone()],
+                tx_hashes: vec![tx1].into(),
+                cert_ids: vec![wave1.clone(), wave2.clone()].into(),
                 ..Default::default()
             },
             LocalTimestamp::ZERO,
@@ -510,7 +510,7 @@ mod tests {
         let mut pb = PendingBlock::from_manifest(
             header,
             BlockManifest {
-                cert_ids: vec![wave_id.clone()],
+                cert_ids: vec![wave_id.clone()].into(),
                 ..Default::default()
             },
             LocalTimestamp::ZERO,
@@ -543,8 +543,8 @@ mod tests {
         let mut pb = PendingBlock::from_manifest(
             header,
             BlockManifest {
-                tx_hashes: vec![tx_hash],
-                cert_ids: vec![wave_id.clone()],
+                tx_hashes: vec![tx_hash].into(),
+                cert_ids: vec![wave_id.clone()].into(),
                 ..Default::default()
             },
             LocalTimestamp::ZERO,

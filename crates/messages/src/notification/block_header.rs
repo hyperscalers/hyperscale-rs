@@ -114,7 +114,8 @@ mod tests {
                 TxHash::from_raw(Hash::from_bytes(b"tx2")),
                 TxHash::from_raw(Hash::from_bytes(b"tx3")),
                 TxHash::from_raw(Hash::from_bytes(b"tx4")),
-            ],
+            ]
+            .into(),
             ..Default::default()
         };
 
@@ -128,7 +129,7 @@ mod tests {
     fn test_block_header_gossip_into_parts() {
         let header = make_header(BlockHeight::new(5));
         let manifest = BlockManifest {
-            tx_hashes: vec![TxHash::from_raw(Hash::from_bytes(b"tx1"))],
+            tx_hashes: vec![TxHash::from_raw(Hash::from_bytes(b"tx1"))].into(),
             ..Default::default()
         };
 
@@ -147,13 +148,13 @@ mod tests {
         let gossip = BlockHeaderNotification::new(
             make_header(BlockHeight::new(1)),
             BlockManifest {
-                tx_hashes: vec![tx1, tx2, tx3],
+                tx_hashes: vec![tx1, tx2, tx3].into(),
                 ..Default::default()
             },
             zero_sig(),
         );
 
-        let all: Vec<TxHash> = gossip.manifest.tx_hashes;
+        let all: Vec<TxHash> = gossip.manifest.tx_hashes.into_inner();
         assert_eq!(all, vec![tx1, tx2, tx3]);
     }
 }

@@ -355,7 +355,7 @@ impl RocksDbStorage {
             transactions: Arc::new(transactions.into()),
             certificates: Arc::new(certificates.into()),
         };
-        let provision_hashes = metadata.manifest.provision_hashes;
+        let provision_hashes = metadata.manifest.provision_hashes.into_inner();
 
         let elapsed = start.elapsed().as_secs_f64();
         record_storage_read(elapsed);

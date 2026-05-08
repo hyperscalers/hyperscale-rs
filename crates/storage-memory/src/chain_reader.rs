@@ -46,7 +46,9 @@ impl ChainReader for SimStorage {
             .get(&height)
             .cloned()
             .map(|certified| {
-                let provision_hashes = BlockManifest::from_block(&certified.block).provision_hashes;
+                let provision_hashes = BlockManifest::from_block(&certified.block)
+                    .provision_hashes
+                    .into_inner();
                 BlockForSync {
                     block: certified.block,
                     qc: certified.qc,

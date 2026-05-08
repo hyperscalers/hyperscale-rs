@@ -41,13 +41,13 @@ impl GetTransactionsResponse {
 
     /// Get the number of transactions in the response.
     #[must_use]
-    pub fn count(&self) -> usize {
+    pub const fn count(&self) -> usize {
         self.transactions.len()
     }
 
     /// Check if the response is empty.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.transactions.is_empty()
     }
 

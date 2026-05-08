@@ -154,11 +154,11 @@ impl<'a> ChainView<'a> {
             }
             let manifest = pending.manifest();
             if pending.block().is_none() {
-                for tx_hash in &manifest.tx_hashes {
+                for tx_hash in manifest.tx_hashes.iter() {
                     tx_hashes.insert(*tx_hash);
                 }
             }
-            for batch_hash in &manifest.provision_hashes {
+            for batch_hash in manifest.provision_hashes.iter() {
                 provision_hashes.insert(*batch_hash);
             }
             current_hash = pending.header().parent_block_hash;

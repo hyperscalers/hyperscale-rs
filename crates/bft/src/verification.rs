@@ -677,7 +677,7 @@ impl VerificationPipeline {
         vec![Action::VerifyProvisionRoot {
             block_hash,
             expected_root: block.header().provision_root,
-            batch_hashes: manifest.provision_hashes.clone(),
+            batch_hashes: manifest.provision_hashes.0.clone(),
         }]
     }
 

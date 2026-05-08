@@ -597,9 +597,9 @@ mod tests {
         let TestNode { mut node, .. } = TestNode::new();
 
         let manifest = BlockManifest {
-            tx_hashes: vec![TxHash::ZERO],
-            cert_ids: vec![],
-            provision_hashes: vec![],
+            tx_hashes: vec![TxHash::ZERO].into(),
+            cert_ids: vec![].into(),
+            provision_hashes: vec![].into(),
         };
 
         // proposer_for(h=1, r=0) = committee[(1+0) % 4] = ValidatorId::new(1).

@@ -331,14 +331,38 @@ impl<const MAX: usize> Describe<NoCustomTypeKind> for BoundedString<MAX> {
 }
 
 /// `Vec<T>` with a compile-time max-length cap on decode.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BoundedVec<T, const MAX: usize>(pub Vec<T>);
+
+// Manual `Default` so the impl doesn't pick up a spurious `T: Default`
+// bound from the derive — an empty `Vec<T>` is constructible regardless
+// of `T`, and downstream wire types whose element type isn't `Default`
+// (e.g. `BoundedVec<TxHash, _>`) need this to derive `Default` themselves.
+impl<T, const MAX: usize> Default for BoundedVec<T, MAX> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl<T, const MAX: usize> BoundedVec<T, MAX> {
     /// Construct an empty `BoundedVec`.
     #[must_use]
     pub const fn new() -> Self {
         Self(Vec::new())
+    }
+
+    /// Number of elements held. Mirrors [`Vec::len`] but is callable from
+    /// `const fn` (the [`Deref`]-routed `.len()` is not).
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether the wrapper is empty. `const`-callable counterpart of
+    /// `Vec::is_empty` reachable via `Deref`.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 
     /// Consume the wrapper and return the inner `Vec<T>`.
