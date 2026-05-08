@@ -131,7 +131,7 @@ impl RocksDbStorage {
                 transactions_cf,
                 tx.hash().as_raw(),
                 tx.as_ref(),
-                tx.cached_sbor_bytes(),
+                Some(tx.cached_sbor_bytes()),
             );
         }
         for fw in block.certificates().iter() {

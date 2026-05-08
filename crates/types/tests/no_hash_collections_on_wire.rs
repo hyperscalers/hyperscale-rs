@@ -14,6 +14,16 @@
 //! Anything else (e.g. `TopologySnapshot`, which lives in-process behind an
 //! `ArcSwap` and is never serialized) is ignored without an allowlist
 //! entry.
+//!
+//! ## Known limitation
+//!
+//! Detection is purely syntactic: a type alias that hides a `HashMap` /
+//! `HashSet` (e.g. `type FooMap = HashMap<K, V>;` followed by a `foo:
+//! FooMap` field) will slip past, since the field's path segment reads
+//! `FooMap`, not `HashMap`. We don't resolve aliases — the cost of
+//! introducing a real type checker outweighs the leak surface, and SBOR
+//! conventions in this crate write hash collections directly. If aliases
+//! become common, swap this scan for a `cargo expand`-based check.
 
 use std::collections::HashSet;
 use std::fs;

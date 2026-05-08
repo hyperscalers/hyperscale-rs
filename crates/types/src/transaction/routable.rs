@@ -252,10 +252,10 @@ impl RoutableTransaction {
     ///
     /// Panics if SBOR encoding fails — that's a programmer error since
     /// every field is `BasicSbor` and the type itself is closed.
-    pub fn cached_sbor_bytes(&self) -> Option<&[u8]> {
-        Some(self.cached_sbor.get_or_init(|| {
+    pub fn cached_sbor_bytes(&self) -> &[u8] {
+        self.cached_sbor.get_or_init(|| {
             basic_encode(self).expect("RoutableTransaction SBOR encode is infallible")
-        }))
+        })
     }
 
     /// Check if this transaction is cross-shard for the given number of shards.
