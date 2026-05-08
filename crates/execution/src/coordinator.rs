@@ -1423,11 +1423,11 @@ impl ExecutionCoordinator {
         transactions: &[Arc<RoutableTransaction>],
         provisions: &[Arc<Provisions>],
     ) -> Vec<Action> {
-        let height = header.height;
+        let height = header.height();
         let mut actions = Vec::new();
 
         // ── Provision broadcasting (proposer only) ─────────────────────
-        if topology.local_validator_id() == header.proposer {
+        if topology.local_validator_id() == header.proposer() {
             let local_shard = topology.local_shard();
             if let Some((requests, shard_recipients)) =
                 Self::build_provision_requests(topology, transactions, local_shard)
@@ -1493,7 +1493,7 @@ impl ExecutionCoordinator {
         if transactions.is_empty() {
             return Vec::new();
         }
-        self.register_sealed_wave_assignments(topology, header.height, transactions);
+        self.register_sealed_wave_assignments(topology, header.height(), transactions);
         self.replay_early_wave_attestations(topology, transactions)
     }
 

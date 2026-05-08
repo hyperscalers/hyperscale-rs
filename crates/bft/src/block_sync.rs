@@ -728,13 +728,14 @@ impl BlockSyncManager {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     use hyperscale_test_helpers::TestCommittee;
     use hyperscale_types::{
-        Block, BlockHeader, BoundedBTreeMap, BoundedVec, CertificateRoot, Hash, InFlightCount,
-        LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, Round, ShardGroupId, StateRoot,
-        TransactionRoot, ValidatorId, ValidatorInfo, ValidatorSet, VotePower,
+        Block, BlockHeader, BoundedVec, CertificateRoot, Hash, InFlightCount, LocalReceiptRoot,
+        ProposerTimestamp, ProvisionsRoot, Round, ShardGroupId, StateRoot, TransactionRoot,
+        ValidatorId, ValidatorInfo, ValidatorSet, VotePower,
     };
 
     use super::*;
@@ -752,24 +753,24 @@ mod tests {
     }
 
     fn header(height: BlockHeight, tag: &[u8]) -> BlockHeader {
-        BlockHeader {
-            shard_group_id: ShardGroupId::new(0),
+        BlockHeader::new(
+            ShardGroupId::new(0),
             height,
-            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(tag)),
-            parent_qc: QuorumCertificate::genesis(ShardGroupId::new(0)),
-            proposer: ValidatorId::new(0),
-            timestamp: ProposerTimestamp::from_millis(0),
-            round: Round::INITIAL,
-            is_fallback: false,
-            state_root: StateRoot::ZERO,
-            transaction_root: TransactionRoot::ZERO,
-            certificate_root: CertificateRoot::ZERO,
-            local_receipt_root: LocalReceiptRoot::ZERO,
-            provision_root: ProvisionsRoot::ZERO,
-            waves: BoundedVec::new(),
-            provision_tx_roots: BoundedBTreeMap::new(),
-            in_flight: InFlightCount::ZERO,
-        }
+            BlockHash::from_raw(Hash::from_bytes(tag)),
+            QuorumCertificate::genesis(ShardGroupId::new(0)),
+            ValidatorId::new(0),
+            ProposerTimestamp::from_millis(0),
+            Round::INITIAL,
+            false,
+            StateRoot::ZERO,
+            TransactionRoot::ZERO,
+            CertificateRoot::ZERO,
+            LocalReceiptRoot::ZERO,
+            ProvisionsRoot::ZERO,
+            Vec::new(),
+            BTreeMap::new(),
+            InFlightCount::ZERO,
+        )
     }
 
     fn certified(height: BlockHeight, tag: &[u8]) -> CertifiedBlock {

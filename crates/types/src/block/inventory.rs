@@ -385,37 +385,38 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use crate::test_utils::test_transaction;
     use crate::{
-        BlockHash, BlockHeight, BloomFilter, BoundedBTreeMap, BoundedVec, CertificateRoot, Hash,
-        InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, Round, ShardGroupId,
-        SignerBitfield, StateRoot, TransactionRoot, ValidatorId, WeightedTimestamp,
-        zero_bls_signature,
+        BlockHash, BlockHeight, BloomFilter, BoundedVec, CertificateRoot, Hash, InFlightCount,
+        LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, Round, ShardGroupId, SignerBitfield,
+        StateRoot, TransactionRoot, ValidatorId, WeightedTimestamp, zero_bls_signature,
     };
 
     fn create_test_block() -> Block {
         let tx = test_transaction(1);
 
         Block::Live {
-            header: BlockHeader {
-                shard_group_id: ShardGroupId::new(0),
-                height: BlockHeight::new(1),
-                parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
-                parent_qc: QuorumCertificate::genesis(ShardGroupId::new(0)),
-                proposer: ValidatorId::new(0),
-                timestamp: ProposerTimestamp::from_millis(1_234_567_890),
-                round: Round::INITIAL,
-                is_fallback: false,
-                state_root: StateRoot::ZERO,
-                transaction_root: TransactionRoot::ZERO,
-                certificate_root: CertificateRoot::ZERO,
-                local_receipt_root: LocalReceiptRoot::ZERO,
-                provision_root: ProvisionsRoot::ZERO,
-                waves: BoundedVec::new(),
-                provision_tx_roots: BoundedBTreeMap::new(),
-                in_flight: InFlightCount::ZERO,
-            },
+            header: BlockHeader::new(
+                ShardGroupId::new(0),
+                BlockHeight::new(1),
+                BlockHash::from_raw(Hash::from_bytes(b"parent")),
+                QuorumCertificate::genesis(ShardGroupId::new(0)),
+                ValidatorId::new(0),
+                ProposerTimestamp::from_millis(1_234_567_890),
+                Round::INITIAL,
+                false,
+                StateRoot::ZERO,
+                TransactionRoot::ZERO,
+                CertificateRoot::ZERO,
+                LocalReceiptRoot::ZERO,
+                ProvisionsRoot::ZERO,
+                Vec::new(),
+                BTreeMap::new(),
+                InFlightCount::ZERO,
+            ),
             transactions: Arc::new(vec![Arc::new(tx)].into()),
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),
@@ -427,8 +428,8 @@ mod tests {
             block_hash: block.hash(),
             shard_group_id: ShardGroupId::new(0),
             height: block.height(),
-            parent_block_hash: block.header().parent_block_hash,
-            round: block.header().round,
+            parent_block_hash: block.header().parent_block_hash(),
+            round: block.header().round(),
             aggregated_signature: zero_bls_signature(),
             signers: SignerBitfield::new(0),
             weighted_timestamp: WeightedTimestamp::ZERO,

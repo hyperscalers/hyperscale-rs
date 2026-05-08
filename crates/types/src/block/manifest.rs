@@ -143,7 +143,7 @@ impl BlockMetadata {
     /// Get block height.
     #[must_use]
     pub const fn height(&self) -> BlockHeight {
-        self.header.height
+        self.header.height()
     }
 
     /// Compute hash of this block (hashes the header).

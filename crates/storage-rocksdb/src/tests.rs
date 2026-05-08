@@ -220,7 +220,7 @@ fn test_block_storage_and_retrieval() {
     let stored = storage.get_block(BlockHeight::new(1)).unwrap();
     assert_eq!(stored.block().height(), BlockHeight::new(1));
     assert_eq!(
-        stored.block().header().timestamp,
+        stored.block().header().timestamp(),
         ProposerTimestamp::from_millis(1_000)
     );
     assert_eq!(stored.qc().block_hash, block.hash());

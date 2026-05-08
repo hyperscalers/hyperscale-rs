@@ -182,15 +182,15 @@ where
                     let valid = verify_proof(
                         provisions.proof(),
                         &all_entries,
-                        committed_header.header().state_root,
+                        committed_header.header().state_root(),
                         |e| &e.storage_key,
                     );
                     if !valid {
                         warn!(
                             source_shard = provisions.source_shard().inner(),
                             block_height = provisions.block_height().inner(),
-                            header_height = committed_header.header().height.inner(),
-                            header_state_root = ?committed_header.header().state_root,
+                            header_height = committed_header.header().height().inner(),
+                            header_state_root = ?committed_header.header().state_root(),
                             entry_count = all_entries.len(),
                             proof_len = provisions.proof().as_bytes().len(),
                             "Provision merkle proof verification failed"

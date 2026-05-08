@@ -438,32 +438,31 @@ pub enum RecordResult {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{
-        BoundedBTreeMap, BoundedVec, CertificateRoot, Hash, InFlightCount, LocalReceiptRoot,
-        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, ShardGroupId, StateRoot,
-        TransactionRoot, ValidatorId,
+        CertificateRoot, Hash, InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
+        QuorumCertificate, ShardGroupId, StateRoot, TransactionRoot, ValidatorId,
     };
 
     use super::*;
 
-    fn make_header(height: BlockHeight) -> BlockHeader {
-        BlockHeader {
-            shard_group_id: ShardGroupId::new(0),
+    fn make_header_at_round(height: BlockHeight, round: Round) -> BlockHeader {
+        BlockHeader::new(
+            ShardGroupId::new(0),
             height,
-            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            parent_qc: QuorumCertificate::genesis(ShardGroupId::new(0)),
-            proposer: ValidatorId::new(0),
-            timestamp: ProposerTimestamp::from_millis(1_234_567_890),
-            round: Round::INITIAL,
-            is_fallback: false,
-            state_root: StateRoot::ZERO,
-            transaction_root: TransactionRoot::ZERO,
-            certificate_root: CertificateRoot::ZERO,
-            local_receipt_root: LocalReceiptRoot::ZERO,
-            provision_root: ProvisionsRoot::ZERO,
-            waves: BoundedVec::new(),
-            provision_tx_roots: BoundedBTreeMap::new(),
-            in_flight: InFlightCount::ZERO,
-        }
+            BlockHash::from_raw(Hash::from_bytes(b"parent")),
+            QuorumCertificate::genesis(ShardGroupId::new(0)),
+            ValidatorId::new(0),
+            ProposerTimestamp::from_millis(1_234_567_890),
+            round,
+            false,
+            StateRoot::ZERO,
+            TransactionRoot::ZERO,
+            CertificateRoot::ZERO,
+            LocalReceiptRoot::ZERO,
+            ProvisionsRoot::ZERO,
+            Vec::new(),
+            std::collections::BTreeMap::new(),
+            InFlightCount::ZERO,
+        )
     }
 
     #[test]
@@ -495,11 +494,7 @@ mod tests {
 
     #[test]
     fn keeper_clear_for_height_keeps_current_or_later_round_vote_sets() {
-        let header_at = |round: Round| {
-            let mut h = make_header(BlockHeight::new(5));
-            h.round = round;
-            h
-        };
+        let header_at = |round: Round| make_header_at_round(BlockHeight::new(5), round);
 
         let mut vk = VoteKeeper::new();
         let hdr_r0 = header_at(Round::new(0));

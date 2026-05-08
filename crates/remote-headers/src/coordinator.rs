@@ -478,7 +478,7 @@ impl RemoteHeaderCoordinator {
             .filter_map(|(&shard, &(tip_height, _tip_ts))| {
                 self.verified
                     .get(&(shard, tip_height))
-                    .map(|h| (shard, h.header().in_flight))
+                    .map(|h| (shard, h.header().in_flight()))
             })
             .collect()
     }
@@ -583,9 +583,9 @@ impl RemoteHeaderCoordinator {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{
-        BlockHash, BlockHeader, BoundedBTreeMap, BoundedVec, CertificateRoot, Hash, InFlightCount,
-        LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round,
-        ShardGroupId, StateRoot, TransactionRoot, ValidatorId,
+        BlockHash, BlockHeader, CertificateRoot, Hash, InFlightCount, LocalReceiptRoot,
+        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, StateRoot,
+        TransactionRoot, ValidatorId,
     };
 
     use super::*;
@@ -605,24 +605,24 @@ mod tests {
     #[test]
     fn test_structural_precheck_rejects_mismatched_qc_hash() {
         // This test verifies the structural pre-check without needing a real topology.
-        let header = BlockHeader {
-            shard_group_id: ShardGroupId::new(2),
-            height: BlockHeight::new(5),
-            parent_block_hash: BlockHash::ZERO,
-            parent_qc: QuorumCertificate::genesis(ShardGroupId::new(0)),
-            proposer: ValidatorId::new(0),
-            timestamp: ProposerTimestamp::from_millis(1_234_567_890),
-            round: Round::INITIAL,
-            is_fallback: false,
-            state_root: StateRoot::ZERO,
-            transaction_root: TransactionRoot::ZERO,
-            certificate_root: CertificateRoot::ZERO,
-            local_receipt_root: LocalReceiptRoot::ZERO,
-            provision_root: ProvisionsRoot::ZERO,
-            waves: BoundedVec::new(),
-            provision_tx_roots: BoundedBTreeMap::new(),
-            in_flight: InFlightCount::ZERO,
-        };
+        let header = BlockHeader::new(
+            ShardGroupId::new(2),
+            BlockHeight::new(5),
+            BlockHash::ZERO,
+            QuorumCertificate::genesis(ShardGroupId::new(0)),
+            ValidatorId::new(0),
+            ProposerTimestamp::from_millis(1_234_567_890),
+            Round::INITIAL,
+            false,
+            StateRoot::ZERO,
+            TransactionRoot::ZERO,
+            CertificateRoot::ZERO,
+            LocalReceiptRoot::ZERO,
+            ProvisionsRoot::ZERO,
+            Vec::new(),
+            std::collections::BTreeMap::new(),
+            InFlightCount::ZERO,
+        );
         let mut qc = QuorumCertificate::genesis(ShardGroupId::new(0));
         // Deliberately set wrong block_hash
         qc.block_hash = BlockHash::from_raw(Hash::from_bytes(b"wrong"));

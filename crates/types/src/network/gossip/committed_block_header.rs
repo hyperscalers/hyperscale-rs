@@ -31,8 +31,8 @@ impl CommittedBlockHeaderGossip {
     #[must_use]
     pub fn signing_message(&self) -> Vec<u8> {
         committed_block_header_message(
-            self.committed_header.header().shard_group_id,
-            self.committed_header.header().height,
+            self.committed_header.header().shard_group_id(),
+            self.committed_header.header().height(),
             &self.committed_header.header().hash(),
         )
     }
@@ -50,6 +50,8 @@ impl NetworkMessage for CommittedBlockHeaderGossip {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use sbor::{basic_decode, basic_encode};
 
     use super::*;
@@ -66,29 +68,29 @@ mod tests {
     #[test]
     fn test_sbor_roundtrip() {
         use crate::{
-            BlockHeader, BlockHeight, BoundedBTreeMap, BoundedVec, CertificateRoot, Hash,
-            LocalReceiptRoot, ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, StateRoot,
-            TransactionRoot, ValidatorId, zero_bls_signature,
+            BlockHeader, BlockHeight, CertificateRoot, Hash, LocalReceiptRoot, ProvisionsRoot,
+            QuorumCertificate, Round, ShardGroupId, StateRoot, TransactionRoot, ValidatorId,
+            zero_bls_signature,
         };
 
-        let header = BlockHeader {
-            shard_group_id: ShardGroupId::new(1),
-            height: BlockHeight::new(42),
-            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            parent_qc: QuorumCertificate::genesis(ShardGroupId::new(0)),
-            proposer: ValidatorId::new(0),
-            timestamp: ProposerTimestamp::from_millis(1_234_567_890),
-            round: Round::INITIAL,
-            is_fallback: false,
-            state_root: StateRoot::ZERO,
-            transaction_root: TransactionRoot::ZERO,
-            certificate_root: CertificateRoot::ZERO,
-            local_receipt_root: LocalReceiptRoot::ZERO,
-            provision_root: ProvisionsRoot::ZERO,
-            waves: BoundedVec::new(),
-            provision_tx_roots: BoundedBTreeMap::new(),
-            in_flight: InFlightCount::ZERO,
-        };
+        let header = BlockHeader::new(
+            ShardGroupId::new(1),
+            BlockHeight::new(42),
+            BlockHash::from_raw(Hash::from_bytes(b"parent")),
+            QuorumCertificate::genesis(ShardGroupId::new(0)),
+            ValidatorId::new(0),
+            ProposerTimestamp::from_millis(1_234_567_890),
+            Round::INITIAL,
+            false,
+            StateRoot::ZERO,
+            TransactionRoot::ZERO,
+            CertificateRoot::ZERO,
+            LocalReceiptRoot::ZERO,
+            ProvisionsRoot::ZERO,
+            Vec::new(),
+            BTreeMap::new(),
+            InFlightCount::ZERO,
+        );
         let qc = QuorumCertificate::genesis(ShardGroupId::new(0));
 
         let gossip = CommittedBlockHeaderGossip {

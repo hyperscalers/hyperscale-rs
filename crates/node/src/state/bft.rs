@@ -136,8 +136,8 @@ impl NodeStateMachine {
                 self.execution.on_verified_remote_header(
                     topology,
                     shard,
-                    committed_header.header().height,
-                    &committed_header.header().waves,
+                    committed_header.header().height(),
+                    committed_header.header().waves(),
                 );
 
                 self.provisions
@@ -214,7 +214,7 @@ impl NodeStateMachine {
         {
             tracing::warn!(
                 block_hash = ?header.hash(),
-                height = header.height.inner(),
+                height = header.height().inner(),
                 tx_hashes = total_tx_count,
                 cert_ids = manifest.cert_ids().len(),
                 provision_hashes = manifest.provision_hashes().len(),
@@ -228,7 +228,7 @@ impl NodeStateMachine {
         // see different in_flight() counts — checking would split votes and
         // trigger view changes.
         let committed_height = self.bft.committed_height();
-        let is_next_block = header.height == committed_height + 1;
+        let is_next_block = header.height() == committed_height + 1;
 
         if is_next_block
             && self
@@ -237,7 +237,7 @@ impl NodeStateMachine {
         {
             tracing::warn!(
                 block_hash = ?header.hash(),
-                height = header.height.inner(),
+                height = header.height().inner(),
                 "Rejecting block that would exceed in-flight limit"
             );
             return vec![];
@@ -362,7 +362,7 @@ mod tests {
     use hyperscale_test_helpers::{certify, make_live_block};
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
-        Block, BlockHeight, BlockManifest, CommittedBlockHeader, Hash, LocalTimestamp,
+        Block, BlockHeader, BlockHeight, BlockManifest, CommittedBlockHeader, Hash, LocalTimestamp,
         MerkleInclusionProof, Provisions, QuorumCertificate, RETENTION_HORIZON, Round,
         ShardGroupId, TransactionStatus, TxEntries, TxHash, ValidatorId, WaveId,
     };
@@ -393,7 +393,24 @@ mod tests {
             vec![],
         );
         if let Block::Live { ref mut header, .. } = block {
-            header.waves = vec![wave].into();
+            *header = BlockHeader::new(
+                header.shard_group_id(),
+                header.height(),
+                header.parent_block_hash(),
+                header.parent_qc().clone(),
+                header.proposer(),
+                header.timestamp(),
+                header.round(),
+                header.is_fallback(),
+                header.state_root(),
+                header.transaction_root(),
+                header.certificate_root(),
+                header.local_receipt_root(),
+                header.provision_root(),
+                vec![wave],
+                header.provision_tx_roots().clone().into_inner(),
+                header.in_flight(),
+            );
         }
         let committed_header = Arc::new(CommittedBlockHeader::new(
             block.header().clone(),

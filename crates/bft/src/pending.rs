@@ -348,7 +348,7 @@ pub fn check_fetches(
             continue;
         }
 
-        let proposer = pending.header().proposer;
+        let proposer = pending.header().proposer();
         let local_self = topology.local_validator_id();
         let local_committee: Vec<_> = topology
             .committee_for_shard(topology.local_shard())
@@ -420,36 +420,36 @@ impl PendingBlock {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
-        Block, BlockHeight, BoundedBTreeMap, BoundedVec, CertificateRoot, Hash, InFlightCount,
-        LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round,
-        ShardGroupId, StateRoot, TransactionRoot, ValidatorId, WaveCertificate, WaveId,
+        Block, BlockHeight, BoundedVec, CertificateRoot, Hash, InFlightCount, LocalReceiptRoot,
+        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, StateRoot,
+        TransactionRoot, ValidatorId, WaveCertificate, WaveId,
     };
 
     use super::*;
 
     fn make_header(height: BlockHeight) -> BlockHeader {
-        BlockHeader {
-            shard_group_id: ShardGroupId::new(0),
+        BlockHeader::new(
+            ShardGroupId::new(0),
             height,
-            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            parent_qc: QuorumCertificate::genesis(ShardGroupId::new(0)),
-            proposer: ValidatorId::new(0),
-            timestamp: ProposerTimestamp::from_millis(1_234_567_890),
-            round: Round::INITIAL,
-            is_fallback: false,
-            state_root: StateRoot::ZERO,
-            transaction_root: TransactionRoot::ZERO,
-            certificate_root: CertificateRoot::ZERO,
-            local_receipt_root: LocalReceiptRoot::ZERO,
-            provision_root: ProvisionsRoot::ZERO,
-            waves: BoundedVec::new(),
-            provision_tx_roots: BoundedBTreeMap::new(),
-            in_flight: InFlightCount::ZERO,
-        }
+            BlockHash::from_raw(Hash::from_bytes(b"parent")),
+            QuorumCertificate::genesis(ShardGroupId::new(0)),
+            ValidatorId::new(0),
+            ProposerTimestamp::from_millis(1_234_567_890),
+            Round::INITIAL,
+            false,
+            StateRoot::ZERO,
+            TransactionRoot::ZERO,
+            CertificateRoot::ZERO,
+            LocalReceiptRoot::ZERO,
+            ProvisionsRoot::ZERO,
+            Vec::new(),
+            BTreeMap::new(),
+            InFlightCount::ZERO,
+        )
     }
 
     #[test]

@@ -80,10 +80,10 @@ impl VoteSet {
             .map_or((None, None, None, None, None), |h| {
                 (
                     Some(h.hash()),
-                    Some(h.height),
-                    Some(h.round),
-                    Some(h.parent_block_hash),
-                    Some(h.parent_qc.weighted_timestamp),
+                    Some(h.height()),
+                    Some(h.round()),
+                    Some(h.parent_block_hash()),
+                    Some(h.parent_qc().weighted_timestamp),
                 )
             });
 
@@ -136,16 +136,16 @@ impl VoteSet {
     /// `parent_block_hash`) to trigger verification.
     pub fn set_header(&mut self, header: &BlockHeader) {
         if self.height.is_none() {
-            self.height = Some(header.height);
+            self.height = Some(header.height());
         }
         if self.round.is_none() {
-            self.round = Some(header.round);
+            self.round = Some(header.round());
         }
         if self.parent_block_hash.is_none() {
-            self.parent_block_hash = Some(header.parent_block_hash);
+            self.parent_block_hash = Some(header.parent_block_hash());
         }
         if self.parent_weighted_timestamp.is_none() {
-            self.parent_weighted_timestamp = Some(header.parent_qc.weighted_timestamp);
+            self.parent_weighted_timestamp = Some(header.parent_qc().weighted_timestamp);
         }
         if self.block_hash.is_none() {
             self.block_hash = Some(header.hash());
@@ -425,10 +425,12 @@ mod test_helpers {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use hyperscale_types::{
-        Bls12381G1PrivateKey, BoundedBTreeMap, BoundedVec, CertificateRoot, Hash, InFlightCount,
-        LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, ShardGroupId,
-        StateRoot, TransactionRoot, ValidatorId, generate_bls_keypair,
+        Bls12381G1PrivateKey, CertificateRoot, Hash, InFlightCount, LocalReceiptRoot,
+        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, ShardGroupId, StateRoot,
+        TransactionRoot, ValidatorId, generate_bls_keypair,
     };
 
     use super::*;
@@ -438,24 +440,24 @@ mod tests {
     }
 
     fn make_header(height: BlockHeight) -> BlockHeader {
-        BlockHeader {
-            shard_group_id: ShardGroupId::new(0),
+        BlockHeader::new(
+            ShardGroupId::new(0),
             height,
-            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            parent_qc: QuorumCertificate::genesis(ShardGroupId::new(0)),
-            proposer: ValidatorId::new(0),
-            timestamp: ProposerTimestamp::from_millis(1_234_567_890),
-            round: Round::INITIAL,
-            is_fallback: false,
-            state_root: StateRoot::ZERO,
-            transaction_root: TransactionRoot::ZERO,
-            certificate_root: CertificateRoot::ZERO,
-            local_receipt_root: LocalReceiptRoot::ZERO,
-            provision_root: ProvisionsRoot::ZERO,
-            waves: BoundedVec::new(),
-            provision_tx_roots: BoundedBTreeMap::new(),
-            in_flight: InFlightCount::ZERO,
-        }
+            BlockHash::from_raw(Hash::from_bytes(b"parent")),
+            QuorumCertificate::genesis(ShardGroupId::new(0)),
+            ValidatorId::new(0),
+            ProposerTimestamp::from_millis(1_234_567_890),
+            Round::INITIAL,
+            false,
+            StateRoot::ZERO,
+            TransactionRoot::ZERO,
+            CertificateRoot::ZERO,
+            LocalReceiptRoot::ZERO,
+            ProvisionsRoot::ZERO,
+            Vec::new(),
+            BTreeMap::new(),
+            InFlightCount::ZERO,
+        )
     }
 
     fn make_vote(

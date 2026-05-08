@@ -499,8 +499,8 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
     let local_receipt_root = compute_local_receipt_root(&receipts);
     let raw_provision_hashes: Vec<Hash> = provision_hashes.iter().map(|h| h.into_raw()).collect();
     let provision_root = compute_provision_root(&raw_provision_hashes);
-    let waves = compute_waves(topology, height, &transactions).into();
-    let provision_tx_roots = compute_provision_tx_roots(topology, &transactions).into();
+    let waves = compute_waves(topology, height, &transactions);
+    let provision_tx_roots = compute_provision_tx_roots(topology, &transactions);
 
     // in_flight is deterministic from chain state:
     // parent's in_flight + new transactions committed - transactions finalized by certificates.
@@ -509,8 +509,8 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
         .saturating_add(new_tx_count)
         .saturating_sub(finalized_tx_count);
 
-    let header = BlockHeader {
-        shard_group_id: local_shard,
+    let header = BlockHeader::new(
+        local_shard,
         height,
         parent_block_hash,
         parent_qc,
@@ -526,7 +526,7 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
         waves,
         provision_tx_roots,
         in_flight,
-    };
+    );
 
     let block = Block::Live {
         header,
@@ -870,9 +870,9 @@ where
         Action::BroadcastBlockHeader { header, manifest } => {
             let block_hash = header.hash();
             let msg = block_header_message(
-                header.shard_group_id,
-                header.height,
-                header.round,
+                header.shard_group_id(),
+                header.height(),
+                header.round(),
                 &block_hash,
             );
             let sig = ctx.signing_key.sign_v1(&msg);
@@ -913,8 +913,8 @@ where
 
         Action::BroadcastCommittedBlockHeader { committed_header } => {
             let msg = committed_block_header_message(
-                committed_header.header().shard_group_id,
-                committed_header.header().height,
+                committed_header.header().shard_group_id(),
+                committed_header.header().height(),
                 &committed_header.header().hash(),
             );
             let sig = ctx.signing_key.sign_v1(&msg);

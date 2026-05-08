@@ -344,11 +344,11 @@ impl VerificationPipeline {
             )
             && root_ok(
                 VerificationKind::ProvisionRoot,
-                h.provision_root != ProvisionsRoot::ZERO,
+                h.provision_root() != ProvisionsRoot::ZERO,
             )
             && root_ok(
                 VerificationKind::ProvisionTxRoots,
-                !h.provision_tx_roots.is_empty(),
+                !h.provision_tx_roots().is_empty(),
             )
             && self.verified_in_flight.contains(&block_hash)
     }
@@ -406,12 +406,12 @@ impl VerificationPipeline {
         let provision_root_status = root_status(
             VerificationKind::ProvisionRoot,
             "skipped(no_provisions)",
-            h.provision_root != ProvisionsRoot::ZERO,
+            h.provision_root() != ProvisionsRoot::ZERO,
         );
         let provision_tx_root_status = root_status(
             VerificationKind::ProvisionTxRoots,
             "skipped(no_provision_targets)",
-            !h.provision_tx_roots.is_empty(),
+            !h.provision_tx_roots().is_empty(),
         );
 
         let in_flight_status = if self.verified_in_flight.contains(&block_hash) {
@@ -423,7 +423,7 @@ impl VerificationPipeline {
         warn!(
             block_hash = ?block_hash,
             height = block.height().inner(),
-            proposer = ?block.header().proposer,
+            proposer = ?block.header().proposer(),
             certs = block.certificates().len(),
             txs = block.transaction_count(),
             state_root = state_root_status,
@@ -488,13 +488,13 @@ impl VerificationPipeline {
         block: &Block,
         parent_block_height: BlockHeight,
     ) {
-        let parent_block_hash = block.header().parent_block_hash;
+        let parent_block_hash = block.header().parent_block_hash();
         let ready = PendingStateRootVerification {
             block_hash,
             parent_block_hash,
             parent_block_height,
-            expected_root: block.header().state_root,
-            expected_local_receipt_root: block.header().local_receipt_root,
+            expected_root: block.header().state_root(),
+            expected_local_receipt_root: block.header().local_receipt_root(),
             block_height: block.height(),
         };
 
@@ -628,15 +628,15 @@ impl VerificationPipeline {
         debug!(
             ?block_hash,
             tx_count = block.transactions().len(),
-            expected_root = ?block.header().transaction_root,
+            expected_root = ?block.header().transaction_root(),
             "Initiating transaction root verification"
         );
         self.mark_root_in_flight(block_hash, VerificationKind::TransactionRoot);
         vec![Action::VerifyTransactionRoot {
             block_hash,
-            expected_root: block.header().transaction_root,
+            expected_root: block.header().transaction_root(),
             transactions: block.transactions().clone(),
-            validity_anchor: block.header().parent_qc.weighted_timestamp,
+            validity_anchor: block.header().parent_qc().weighted_timestamp,
         }]
     }
 
@@ -649,13 +649,13 @@ impl VerificationPipeline {
         debug!(
             ?block_hash,
             cert_count = block.certificates().len(),
-            expected_root = ?block.header().certificate_root,
+            expected_root = ?block.header().certificate_root(),
             "Initiating receipt root verification"
         );
         self.mark_root_in_flight(block_hash, VerificationKind::CertificateRoot);
         vec![Action::VerifyCertificateRoot {
             block_hash,
-            expected_root: block.header().certificate_root,
+            expected_root: block.header().certificate_root(),
             certificates: block.certificates().clone(),
         }]
     }
@@ -670,13 +670,13 @@ impl VerificationPipeline {
         debug!(
             ?block_hash,
             batch_count = manifest.provision_hashes().len(),
-            expected_root = ?block.header().provision_root,
+            expected_root = ?block.header().provision_root(),
             "Initiating provisions root verification"
         );
         self.mark_root_in_flight(block_hash, VerificationKind::ProvisionRoot);
         vec![Action::VerifyProvisionRoot {
             block_hash,
-            expected_root: block.header().provision_root,
+            expected_root: block.header().provision_root(),
             batch_hashes: manifest.provision_hashes().0.clone(),
         }]
     }
@@ -690,13 +690,13 @@ impl VerificationPipeline {
     ) -> Vec<Action> {
         debug!(
             ?block_hash,
-            target_count = block.header().provision_tx_roots.len(),
+            target_count = block.header().provision_tx_roots().len(),
             "Initiating provision tx-root verification"
         );
         self.mark_root_in_flight(block_hash, VerificationKind::ProvisionTxRoots);
         vec![Action::VerifyProvisionTxRoots {
             block_hash,
-            expected: block.header().provision_tx_roots.0.clone(),
+            expected: block.header().provision_tx_roots().0.clone(),
             transactions: block.transactions().clone(),
             topology_snapshot: topology.clone(),
         }]
@@ -722,7 +722,7 @@ impl VerificationPipeline {
         let h = block.header();
 
         if self.needs_state_root_verification(block) {
-            let parent_block_height = h.parent_qc.height;
+            let parent_block_height = h.parent_qc().height;
             self.initiate_state_root_verification(block_hash, block, parent_block_height);
         }
 
@@ -737,7 +737,7 @@ impl VerificationPipeline {
         if self.needs_root(
             block_hash,
             VerificationKind::ProvisionRoot,
-            h.provision_root != ProvisionsRoot::ZERO,
+            h.provision_root() != ProvisionsRoot::ZERO,
         ) && let Some(pending) = pending_blocks.get(&block_hash)
         {
             actions.extend(self.initiate_provision_root_verification(
@@ -758,7 +758,7 @@ impl VerificationPipeline {
         if self.needs_root(
             block_hash,
             VerificationKind::ProvisionTxRoots,
-            !h.provision_tx_roots.is_empty(),
+            !h.provision_tx_roots().is_empty(),
         ) {
             actions
                 .extend(self.initiate_provision_tx_root_verification(block_hash, block, topology));
@@ -786,10 +786,10 @@ impl VerificationPipeline {
             return InFlightCheck::SkipVote;
         }
 
-        let parent_in_flight = if block.header().parent_qc.is_genesis() {
+        let parent_in_flight = if block.header().parent_qc().is_genesis() {
             InFlightCount::ZERO
-        } else if let Some(h) = chain.get_header(block.header().parent_block_hash) {
-            h.in_flight
+        } else if let Some(h) = chain.get_header(block.header().parent_block_hash()) {
+            h.in_flight()
         } else {
             trace!(
                 block_hash = ?block_hash,
@@ -814,7 +814,7 @@ impl VerificationPipeline {
 
     /// Verify the proposed in-flight count is deterministically correct.
     ///
-    /// `in_flight` = `parent.in_flight` + `new_txs` - `finalized_txs`
+    /// `in_flight` = `parent.in_flight()` + `new_txs` - `finalized_txs`
     ///
     /// All validators can compute this from chain state, so it must be exact.
     /// Certificates are only counted when actually included (JMT was ready).
@@ -825,7 +825,7 @@ impl VerificationPipeline {
         parent_in_flight: InFlightCount,
         finalized_tx_count: u32,
     ) -> bool {
-        let proposed = block.header().in_flight;
+        let proposed = block.header().in_flight();
 
         // Compute expected: only subtract finalized txs when certs are actually included.
         let certs_finalized = if block.certificates().is_empty() {
@@ -1129,33 +1129,58 @@ impl VerificationPipeline {
 mod tests {
 
     use hyperscale_types::{
-        BoundedBTreeMap, BoundedVec, CertificateRoot, Hash, LocalReceiptRoot, LocalTimestamp,
-        ProposerTimestamp, QuorumCertificate, Round, RoutableTransaction, ShardGroupId,
-        TransactionRoot, ValidatorId,
+        BoundedVec, CertificateRoot, Hash, LocalReceiptRoot, LocalTimestamp, ProposerTimestamp,
+        QuorumCertificate, Round, RoutableTransaction, ShardGroupId, TransactionRoot, ValidatorId,
     };
 
     use super::*;
     use crate::pending::PendingBlock;
 
     fn header(height: BlockHeight, parent_block_hash: BlockHash, in_flight: u32) -> BlockHeader {
-        BlockHeader {
-            shard_group_id: ShardGroupId::new(0),
+        BlockHeader::new(
+            ShardGroupId::new(0),
             height,
             parent_block_hash,
-            parent_qc: QuorumCertificate::genesis(ShardGroupId::new(0)),
-            proposer: ValidatorId::new(0),
-            timestamp: ProposerTimestamp::from_millis(0),
-            round: Round::INITIAL,
-            is_fallback: false,
-            state_root: StateRoot::ZERO,
-            transaction_root: TransactionRoot::ZERO,
-            certificate_root: CertificateRoot::ZERO,
-            local_receipt_root: LocalReceiptRoot::ZERO,
-            provision_root: ProvisionsRoot::ZERO,
-            waves: BoundedVec::new(),
-            provision_tx_roots: BoundedBTreeMap::new(),
-            in_flight: InFlightCount::new(in_flight),
-        }
+            QuorumCertificate::genesis(ShardGroupId::new(0)),
+            ValidatorId::new(0),
+            ProposerTimestamp::from_millis(0),
+            Round::INITIAL,
+            false,
+            StateRoot::ZERO,
+            TransactionRoot::ZERO,
+            CertificateRoot::ZERO,
+            LocalReceiptRoot::ZERO,
+            ProvisionsRoot::ZERO,
+            Vec::new(),
+            std::collections::BTreeMap::new(),
+            InFlightCount::new(in_flight),
+        )
+    }
+
+    fn header_with_parent_qc(
+        height: BlockHeight,
+        parent_block_hash: BlockHash,
+        in_flight: u32,
+        parent_qc: QuorumCertificate,
+    ) -> BlockHeader {
+        BlockHeader::new(
+            ShardGroupId::new(0),
+            height,
+            parent_block_hash,
+            parent_qc,
+            ValidatorId::new(0),
+            ProposerTimestamp::from_millis(0),
+            Round::INITIAL,
+            false,
+            StateRoot::ZERO,
+            TransactionRoot::ZERO,
+            CertificateRoot::ZERO,
+            LocalReceiptRoot::ZERO,
+            ProvisionsRoot::ZERO,
+            Vec::new(),
+            std::collections::BTreeMap::new(),
+            InFlightCount::new(in_flight),
+        )
     }
 
     fn block_with(
@@ -1212,11 +1237,10 @@ mod tests {
         // effectively pruned, so we skip voting but still keep verifying.
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
         let parent = bh(b"parent");
-        let mut h = header(BlockHeight::new(5), parent, 0);
         let mut parent_qc = QuorumCertificate::genesis(ShardGroupId::new(0));
         parent_qc.height = BlockHeight::new(4);
         parent_qc.block_hash = parent;
-        h.parent_qc = parent_qc;
+        let h = header_with_parent_qc(BlockHeight::new(5), parent, 0, parent_qc);
         let block = Block::Live {
             header: h,
             transactions: Arc::new(BoundedVec::new()),

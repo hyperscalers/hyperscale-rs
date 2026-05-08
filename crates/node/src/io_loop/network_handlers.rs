@@ -381,7 +381,7 @@ where
                 TopicScope::Global,
                 move |gossip: CommittedBlockHeaderGossip| -> GossipVerdict {
                     let sender = gossip.sender;
-                    let header_shard = gossip.committed_header.header().shard_group_id;
+                    let header_shard = gossip.committed_header.header().shard_group_id();
                     let topo = topology.load();
 
                     // Own-shard headers are valid but not needed — accept to forward.
@@ -430,7 +430,7 @@ where
             .register_notification_handler::<BlockHeaderNotification>(
                 move |gossip: BlockHeaderNotification| {
                     let topo = topology.load();
-                    let proposer = gossip.header.proposer;
+                    let proposer = gossip.header.proposer();
                     let Some(public_key) = topo.public_key(proposer) else {
                         warn!(
                             proposer = proposer.inner(),
@@ -447,8 +447,8 @@ where
                     ) {
                         warn!(
                             proposer = proposer.inner(),
-                            height = gossip.header.height.inner(),
-                            round = gossip.header.round.inner(),
+                            height = gossip.header.height().inner(),
+                            round = gossip.header.round().inner(),
                             "Block header proposer signature invalid — dropping"
                         );
                         return;

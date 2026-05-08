@@ -86,7 +86,7 @@ impl<'a> ChainView<'a> {
                 );
                 self.committed_state_root
             },
-            |h| h.state_root,
+            BlockHeader::state_root,
         )
     }
 
@@ -94,7 +94,7 @@ impl<'a> ChainView<'a> {
     /// missing (parent pruned from `pending`).
     pub fn parent_in_flight(&self, parent_block_hash: BlockHash) -> InFlightCount {
         self.get_header(parent_block_hash)
-            .map_or(InFlightCount::ZERO, |h| h.in_flight)
+            .map_or(InFlightCount::ZERO, BlockHeader::in_flight)
     }
 
     /// Parent to use when building the next proposal: the latest QC's block
@@ -143,12 +143,12 @@ impl<'a> ChainView<'a> {
             for tx in block.transactions().iter() {
                 tx_hashes.insert(tx.hash());
             }
-            current_hash = block.header().parent_block_hash;
+            current_hash = block.header().parent_block_hash();
         }
 
         let mut current_hash = parent_block_hash;
         while let Some(pending) = self.pending.get(&current_hash) {
-            let h = pending.header().height;
+            let h = pending.header().height();
             if h <= self.committed_height {
                 break;
             }
@@ -161,7 +161,7 @@ impl<'a> ChainView<'a> {
             for batch_hash in manifest.provision_hashes().iter() {
                 provision_hashes.insert(*batch_hash);
             }
-            current_hash = pending.header().parent_block_hash;
+            current_hash = pending.header().parent_block_hash();
         }
 
         (cert_ids, tx_hashes, provision_hashes)
@@ -173,32 +173,32 @@ mod tests {
     use std::sync::Arc;
 
     use hyperscale_types::{
-        BlockManifest, BoundedBTreeMap, BoundedVec, CertificateRoot, Hash, LocalReceiptRoot,
-        LocalTimestamp, ProposerTimestamp, ProvisionsRoot, Round, ShardGroupId, TransactionRoot,
-        ValidatorId, WeightedTimestamp,
+        BlockManifest, BoundedVec, CertificateRoot, Hash, LocalReceiptRoot, LocalTimestamp,
+        ProposerTimestamp, ProvisionsRoot, Round, ShardGroupId, TransactionRoot, ValidatorId,
+        WeightedTimestamp,
     };
 
     use super::*;
 
     fn make_header(height: u8, parent_block_hash: BlockHash) -> BlockHeader {
-        BlockHeader {
-            shard_group_id: ShardGroupId::new(0),
-            height: BlockHeight::new(u64::from(height)),
+        BlockHeader::new(
+            ShardGroupId::new(0),
+            BlockHeight::new(u64::from(height)),
             parent_block_hash,
-            parent_qc: QuorumCertificate::genesis(ShardGroupId::new(0)),
-            proposer: ValidatorId::new(0),
-            timestamp: ProposerTimestamp::from_millis(1000),
-            round: Round::INITIAL,
-            is_fallback: false,
-            state_root: StateRoot::from_raw(Hash::from_bytes(&[height; 32])),
-            transaction_root: TransactionRoot::ZERO,
-            certificate_root: CertificateRoot::ZERO,
-            local_receipt_root: LocalReceiptRoot::ZERO,
-            provision_root: ProvisionsRoot::ZERO,
-            waves: BoundedVec::new(),
-            provision_tx_roots: BoundedBTreeMap::new(),
-            in_flight: InFlightCount::new(u32::from(height)),
-        }
+            QuorumCertificate::genesis(ShardGroupId::new(0)),
+            ValidatorId::new(0),
+            ProposerTimestamp::from_millis(1000),
+            Round::INITIAL,
+            false,
+            StateRoot::from_raw(Hash::from_bytes(&[height; 32])),
+            TransactionRoot::ZERO,
+            CertificateRoot::ZERO,
+            LocalReceiptRoot::ZERO,
+            ProvisionsRoot::ZERO,
+            Vec::new(),
+            std::collections::BTreeMap::new(),
+            InFlightCount::new(u32::from(height)),
+        )
     }
 
     fn make_block(height: u8, parent_block_hash: BlockHash) -> Block {
@@ -293,7 +293,7 @@ mod tests {
             |view| {
                 assert!(view.get_block(block_hash).is_none());
                 let h = view.get_header(block_hash).expect("header available");
-                assert_eq!(h.height, BlockHeight::new(3));
+                assert_eq!(h.height(), BlockHeight::new(3));
             },
         );
     }
@@ -315,7 +315,7 @@ mod tests {
 
         let block = make_block(5, BlockHash::ZERO);
         let hash = block.hash();
-        let expected_state_root = block.header().state_root;
+        let expected_state_root = block.header().state_root();
 
         let mut pending = HashMap::new();
         pending.insert(hash, pending_from_block(&block));
@@ -340,7 +340,7 @@ mod tests {
     fn parent_in_flight_returns_header_value_or_zero() {
         let block = make_block(7, BlockHash::ZERO);
         let hash = block.hash();
-        let expected_in_flight = block.header().in_flight;
+        let expected_in_flight = block.header().in_flight();
         let unknown = bh(b"unknown");
 
         let mut pending = HashMap::new();

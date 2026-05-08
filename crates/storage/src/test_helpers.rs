@@ -9,13 +9,13 @@ use std::sync::Arc;
 
 use hyperscale_types::test_utils::test_event_type_identifier;
 use hyperscale_types::{
-    ApplicationEvent, Block, BlockHash, BlockHeader, BlockHeight, Bls12381G2Signature,
-    BoundedBTreeMap, BoundedVec, CertificateRoot, ConsensusReceipt, EventData,
-    ExecutionCertificate, ExecutionMetadata, ExecutionOutcome, FeeSummary, FinalizedWave,
-    GlobalReceiptHash, GlobalReceiptRoot, Hash, InFlightCount, LocalReceiptRoot, LogLevel, NodeId,
-    ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, SignerBitfield,
-    StateRoot, StoredReceipt, TransactionRoot, TxHash, TxOutcome, ValidatorId, WaveCertificate,
-    WaveId, WeightedTimestamp, compute_global_receipt_root, zero_bls_signature,
+    ApplicationEvent, Block, BlockHash, BlockHeader, BlockHeight, Bls12381G2Signature, BoundedVec,
+    CertificateRoot, ConsensusReceipt, EventData, ExecutionCertificate, ExecutionMetadata,
+    ExecutionOutcome, FeeSummary, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash,
+    InFlightCount, LocalReceiptRoot, LogLevel, NodeId, ProposerTimestamp, ProvisionsRoot,
+    QuorumCertificate, Round, ShardGroupId, SignerBitfield, StateRoot, StoredReceipt,
+    TransactionRoot, TxHash, TxOutcome, ValidatorId, WaveCertificate, WaveId, WeightedTimestamp,
+    compute_global_receipt_root, zero_bls_signature,
 };
 use indexmap::IndexMap;
 use radix_common::math::Decimal;
@@ -113,24 +113,24 @@ pub fn make_test_block(height: BlockHeight) -> Block {
     let mut parent_bytes = [0u8; 32];
     parent_bytes[..8].copy_from_slice(&height.to_le_bytes());
     Block::Live {
-        header: BlockHeader {
-            shard_group_id: ShardGroupId::new(0),
+        header: BlockHeader::new(
+            ShardGroupId::new(0),
             height,
-            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(&parent_bytes)),
-            parent_qc: QuorumCertificate::genesis(ShardGroupId::new(0)),
-            proposer: ValidatorId::new(0),
-            timestamp: ProposerTimestamp::from_millis(height.inner() * 1000),
-            round: Round::INITIAL,
-            is_fallback: false,
-            state_root: StateRoot::ZERO,
-            transaction_root: TransactionRoot::ZERO,
-            certificate_root: CertificateRoot::ZERO,
-            local_receipt_root: LocalReceiptRoot::ZERO,
-            provision_root: ProvisionsRoot::ZERO,
-            waves: BoundedVec::new(),
-            provision_tx_roots: BoundedBTreeMap::new(),
-            in_flight: InFlightCount::ZERO,
-        },
+            BlockHash::from_raw(Hash::from_bytes(&parent_bytes)),
+            QuorumCertificate::genesis(ShardGroupId::new(0)),
+            ValidatorId::new(0),
+            ProposerTimestamp::from_millis(height.inner() * 1000),
+            Round::INITIAL,
+            false,
+            StateRoot::ZERO,
+            TransactionRoot::ZERO,
+            CertificateRoot::ZERO,
+            LocalReceiptRoot::ZERO,
+            ProvisionsRoot::ZERO,
+            Vec::new(),
+            std::collections::BTreeMap::new(),
+            InFlightCount::ZERO,
+        ),
         transactions: Arc::new(BoundedVec::new()),
         certificates: Arc::new(BoundedVec::new()),
         provisions: Arc::new(BoundedVec::new()),
@@ -144,11 +144,11 @@ pub fn make_test_qc(block: &Block) -> QuorumCertificate {
         block_hash: block.hash(),
         shard_group_id: ShardGroupId::new(0),
         height: block.height(),
-        parent_block_hash: block.header().parent_block_hash,
+        parent_block_hash: block.header().parent_block_hash(),
         round: Round::INITIAL,
         aggregated_signature: zero_bls_signature(),
         signers: SignerBitfield::new(4),
-        weighted_timestamp: WeightedTimestamp::from_millis(block.header().timestamp.as_millis()),
+        weighted_timestamp: WeightedTimestamp::from_millis(block.header().timestamp().as_millis()),
     }
 }
 

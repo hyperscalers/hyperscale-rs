@@ -213,7 +213,7 @@ impl Block {
     /// Get block height.
     #[must_use]
     pub const fn height(&self) -> BlockHeight {
-        self.header().height
+        self.header().height()
     }
 
     /// Get total number of transactions.
