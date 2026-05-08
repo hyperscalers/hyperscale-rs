@@ -63,7 +63,7 @@ impl FinalizedWaveStore {
         self.waves
             .values()
             .find(|fw| fw.contains_tx(tx_hash))
-            .map(|fw| Arc::clone(&fw.certificate))
+            .map(|fw| Arc::clone(fw.certificate()))
     }
 
     /// Whether `tx_hash` is part of any currently-tracked finalized wave.
@@ -114,9 +114,9 @@ mod tests {
     use std::collections::BTreeSet;
 
     use hyperscale_types::{
-        BlockHeight, BoundedVec, ExecutionCertificate, ExecutionOutcome, GlobalReceiptHash,
-        GlobalReceiptRoot, Hash, ShardGroupId, SignerBitfield, TxHash, TxOutcome,
-        WeightedTimestamp, zero_bls_signature,
+        BlockHeight, ExecutionCertificate, ExecutionOutcome, GlobalReceiptHash, GlobalReceiptRoot,
+        Hash, ShardGroupId, SignerBitfield, TxHash, TxOutcome, WeightedTimestamp,
+        zero_bls_signature,
     };
 
     use super::*;
@@ -153,10 +153,7 @@ mod tests {
         let cert = WaveCertificate::new(wave_id.clone(), vec![Arc::new(ec)]);
         // Lookups in this module only inspect the certificate's outcomes; an
         // empty receipts vector is fine for the store's contract.
-        let fw = FinalizedWave {
-            certificate: Arc::new(cert),
-            receipts: BoundedVec::new(),
-        };
+        let fw = FinalizedWave::new(Arc::new(cert), vec![]);
         (wave_id, fw)
     }
 
@@ -194,7 +191,7 @@ mod tests {
         store.insert(wid.clone(), fw);
 
         let looked_up = store.get(&wid).expect("wave present by id");
-        assert_eq!(looked_up.certificate.wave_id(), &wid);
+        assert_eq!(looked_up.certificate().wave_id(), &wid);
 
         // Unknown id returns None.
         assert!(store.get(&make_wave_id(99)).is_none());
@@ -280,7 +277,7 @@ mod tests {
         let waves = store.all_waves();
         assert_eq!(waves.len(), 2);
         // BTreeMap iteration is ordered by key; lower block_height comes first.
-        assert_eq!(waves[0].certificate.wave_id().block_height().inner(), 1);
-        assert_eq!(waves[1].certificate.wave_id().block_height().inner(), 5);
+        assert_eq!(waves[0].certificate().wave_id().block_height().inner(), 1);
+        assert_eq!(waves[1].certificate().wave_id().block_height().inner(), 5);
     }
 }

@@ -519,10 +519,10 @@ mod tests {
         assert_eq!(pb.missing_wave_count(), 1);
         assert!(!pb.is_complete());
 
-        let fw = Arc::new(FinalizedWave {
-            certificate: Arc::new(WaveCertificate::new(wave_id, vec![])),
-            receipts: BoundedVec::new(),
-        });
+        let fw = Arc::new(FinalizedWave::new(
+            Arc::new(WaveCertificate::new(wave_id, vec![])),
+            vec![],
+        ));
 
         let added = pb.add_finalized_wave(fw);
         assert!(added);
@@ -555,10 +555,10 @@ mod tests {
         assert!(!pb.is_complete()); // Still missing wave
 
         // Add finalized wave
-        let fw = Arc::new(FinalizedWave {
-            certificate: Arc::new(WaveCertificate::new(wave_id, vec![])),
-            receipts: BoundedVec::new(),
-        });
+        let fw = Arc::new(FinalizedWave::new(
+            Arc::new(WaveCertificate::new(wave_id, vec![])),
+            vec![],
+        ));
         pb.add_finalized_wave(fw);
         assert!(pb.is_complete());
     }
@@ -568,10 +568,7 @@ mod tests {
         let wave_id = WaveId::new(ShardGroupId::new(0), BlockHeight::new(1), BTreeSet::new());
         let cert = Arc::new(WaveCertificate::new(wave_id, vec![]));
 
-        let fw = Arc::new(FinalizedWave {
-            certificate: cert,
-            receipts: BoundedVec::new(),
-        });
+        let fw = Arc::new(FinalizedWave::new(cert, vec![]));
 
         let block = Block::Live {
             header: make_header(BlockHeight::new(1)),

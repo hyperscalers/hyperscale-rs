@@ -131,8 +131,8 @@ mod tests {
                 Bls12381G2Signature([0u8; 96]),
                 SignerBitfield::new(4),
             ));
-            Arc::new(FinalizedWave {
-                certificate: Arc::new(WaveCertificate::new(
+            Arc::new(FinalizedWave::new(
+                Arc::new(WaveCertificate::new(
                     WaveId::new(
                         ShardGroupId::new(0),
                         BlockHeight::new(10),
@@ -140,8 +140,8 @@ mod tests {
                     ),
                     vec![ec],
                 )),
-                receipts: BoundedVec::new(),
-            })
+                vec![],
+            ))
         };
 
         let certs = vec![make_fw(1), make_fw(2)];
@@ -171,10 +171,7 @@ mod tests {
             vec![ec],
         ));
         let expected_receipt_hash = cert.receipt_hash();
-        let fw = Arc::new(FinalizedWave {
-            certificate: cert,
-            receipts: BoundedVec::new(),
-        });
+        let fw = Arc::new(FinalizedWave::new(cert, vec![]));
 
         let root = compute_certificate_root(std::slice::from_ref(&fw));
         // Single cert: certificate_root should equal the cert's receipt_hash

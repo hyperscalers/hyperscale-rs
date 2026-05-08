@@ -34,12 +34,8 @@ use crate::{
 /// pending blocks, actions, and into the commit path.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct FinalizedWave {
-    /// The wave certificate carrying per-shard ECs and tx outcomes.
-    pub certificate: Arc<WaveCertificate>,
-    /// Stored receipts for txs that executed. Aborted txs are absent —
-    /// `receipts.len() <= tx_count()`. Preserves canonical block order.
-    /// Held in-memory until block commit, then written atomically with block metadata.
-    pub receipts: BoundedVec<StoredReceipt, MAX_TXS_PER_BLOCK>,
+    certificate: Arc<WaveCertificate>,
+    receipts: BoundedVec<StoredReceipt, MAX_TXS_PER_BLOCK>,
 }
 
 /// Reason a `FinalizedWave`'s receipts don't agree with its own EC.
@@ -92,6 +88,20 @@ pub enum ReceiptValidationError {
 }
 
 impl FinalizedWave {
+    /// The wave certificate carrying per-shard ECs and tx outcomes.
+    #[must_use]
+    pub const fn certificate(&self) -> &Arc<WaveCertificate> {
+        &self.certificate
+    }
+
+    /// Stored receipts for txs that executed. Aborted txs are absent —
+    /// `receipts.len() <= tx_count()`. Preserves canonical block order.
+    /// Held in-memory until block commit, then written atomically with block metadata.
+    #[must_use]
+    pub const fn receipts(&self) -> &BoundedVec<StoredReceipt, MAX_TXS_PER_BLOCK> {
+        &self.receipts
+    }
+
     /// Get the wave ID from the certificate.
     #[must_use]
     pub fn wave_id(&self) -> &WaveId {

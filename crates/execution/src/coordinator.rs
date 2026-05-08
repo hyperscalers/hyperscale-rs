@@ -1631,10 +1631,7 @@ impl ExecutionCoordinator {
             }
         }
 
-        let finalized = FinalizedWave {
-            certificate: Arc::new(wc),
-            receipts: receipts.into(),
-        };
+        let finalized = FinalizedWave::new(Arc::new(wc), receipts);
         let finalized_arc = Arc::new(finalized.clone());
         self.finalized.insert(wave_id.clone(), finalized);
 
@@ -2051,8 +2048,8 @@ mod tests {
     };
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
-        Bls12381G1PrivateKey, BoundedVec, ConsensusReceipt, ExecutionOutcome, GlobalReceiptHash,
-        Hash, SignerBitfield, ValidatorInfo, ValidatorSet, VotePower, generate_bls_keypair,
+        Bls12381G1PrivateKey, ConsensusReceipt, ExecutionOutcome, GlobalReceiptHash, Hash,
+        SignerBitfield, ValidatorInfo, ValidatorSet, VotePower, generate_bls_keypair,
         zero_bls_signature,
     };
 
@@ -2528,10 +2525,10 @@ mod tests {
             zero_bls_signature(),
             signers,
         ));
-        let wave = Arc::new(FinalizedWave {
-            certificate: Arc::new(WaveCertificate::new(wave_id, vec![ec])),
-            receipts: BoundedVec::new(),
-        });
+        let wave = Arc::new(FinalizedWave::new(
+            Arc::new(WaveCertificate::new(wave_id, vec![ec])),
+            vec![],
+        ));
 
         let actions = state.admit_finalized_wave(&topo, wave);
         assert_eq!(actions.len(), 1);
@@ -2560,10 +2557,10 @@ mod tests {
             zero_bls_signature(),
             SignerBitfield::new(4),
         ));
-        let wave = Arc::new(FinalizedWave {
-            certificate: Arc::new(WaveCertificate::new(wave_id, vec![ec])),
-            receipts: BoundedVec::new(),
-        });
+        let wave = Arc::new(FinalizedWave::new(
+            Arc::new(WaveCertificate::new(wave_id, vec![ec])),
+            vec![],
+        ));
         let actions = state.on_finalized_wave_verified(wave, false);
         assert!(actions.is_empty());
     }
@@ -2582,10 +2579,10 @@ mod tests {
             zero_bls_signature(),
             SignerBitfield::new(4),
         ));
-        let wave = Arc::new(FinalizedWave {
-            certificate: Arc::new(WaveCertificate::new(wave_id, vec![ec])),
-            receipts: BoundedVec::new(),
-        });
+        let wave = Arc::new(FinalizedWave::new(
+            Arc::new(WaveCertificate::new(wave_id, vec![ec])),
+            vec![],
+        ));
         let actions = state.on_finalized_wave_verified(wave, true);
         assert_eq!(actions.len(), 1);
         assert!(matches!(
@@ -2683,10 +2680,10 @@ mod tests {
             zero_bls_signature(),
             signers,
         ));
-        let wave = Arc::new(FinalizedWave {
-            certificate: Arc::new(WaveCertificate::new(wave_id, vec![ec])),
-            receipts: BoundedVec::new(),
-        });
+        let wave = Arc::new(FinalizedWave::new(
+            Arc::new(WaveCertificate::new(wave_id, vec![ec])),
+            vec![],
+        ));
 
         let first = state.admit_finalized_wave(&topo, Arc::clone(&wave));
         assert_eq!(first.len(), 1);
@@ -2716,10 +2713,10 @@ mod tests {
             zero_bls_signature(),
             signers,
         ));
-        let wave = FinalizedWave {
-            certificate: Arc::new(WaveCertificate::new(wave_id.clone(), vec![ec])),
-            receipts: BoundedVec::new(),
-        };
+        let wave = FinalizedWave::new(
+            Arc::new(WaveCertificate::new(wave_id.clone(), vec![ec])),
+            vec![],
+        );
         // Seed the canonical store directly (mirrors what `finalize_wave`
         // does on the local-aggregation path).
         state.finalized.insert(wave_id, wave.clone());
@@ -2748,10 +2745,10 @@ mod tests {
             zero_bls_signature(),
             SignerBitfield::empty(), // no signers — far below 2f+1
         ));
-        let wave = Arc::new(FinalizedWave {
-            certificate: Arc::new(WaveCertificate::new(wave_id, vec![bogus_ec])),
-            receipts: BoundedVec::new(),
-        });
+        let wave = Arc::new(FinalizedWave::new(
+            Arc::new(WaveCertificate::new(wave_id, vec![bogus_ec])),
+            vec![],
+        ));
 
         let actions = state.admit_finalized_wave(&topo, wave);
         assert!(

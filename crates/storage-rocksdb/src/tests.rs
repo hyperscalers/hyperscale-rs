@@ -404,8 +404,8 @@ fn push_wave(block: &mut Block, fw: Arc<FinalizedWave>) {
 /// so the new `commit_block` (which derives receipts from `block.certificates`)
 /// can apply them.
 fn attach_receipts(block: &mut Block, receipts: Vec<StoredReceipt>) {
-    let new_fw = Arc::new(FinalizedWave {
-        certificate: Arc::new(WaveCertificate::new(
+    let new_fw = Arc::new(FinalizedWave::new(
+        Arc::new(WaveCertificate::new(
             WaveId::new(
                 ShardGroupId::new(0),
                 block.height(),
@@ -413,8 +413,8 @@ fn attach_receipts(block: &mut Block, receipts: Vec<StoredReceipt>) {
             ),
             vec![placeholder_local_ec(ShardGroupId::new(0), block.height())],
         )),
-        receipts: receipts.into(),
-    });
+        receipts,
+    ));
     // Take block out, mutate, and put back.
     let taken = std::mem::replace(
         block,
@@ -549,13 +549,7 @@ fn test_commit_block_stores_certificates() {
         } => Block::Live {
             header,
             transactions,
-            certificates: Arc::new(
-                vec![Arc::new(FinalizedWave {
-                    certificate: cert,
-                    receipts: BoundedVec::new(),
-                })]
-                .into(),
-            ),
+            certificates: Arc::new(vec![Arc::new(FinalizedWave::new(cert, vec![]))].into()),
             provisions,
         },
         Block::Sealed {
@@ -565,13 +559,7 @@ fn test_commit_block_stores_certificates() {
         } => Block::Sealed {
             header,
             transactions,
-            certificates: Arc::new(
-                vec![Arc::new(FinalizedWave {
-                    certificate: cert,
-                    receipts: BoundedVec::new(),
-                })]
-                .into(),
-            ),
+            certificates: Arc::new(vec![Arc::new(FinalizedWave::new(cert, vec![]))].into()),
         },
     };
     let qc = make_test_qc(&block);
@@ -862,10 +850,10 @@ fn test_ec_survives_reopen() {
         let mut block = make_test_block(BlockHeight::new(1));
         push_wave(
             &mut block,
-            Arc::new(FinalizedWave {
-                certificate: Arc::new(WaveCertificate::new(wave_id.clone(), vec![Arc::new(ec)])),
-                receipts: BoundedVec::new(),
-            }),
+            Arc::new(FinalizedWave::new(
+                Arc::new(WaveCertificate::new(wave_id.clone(), vec![Arc::new(ec)])),
+                vec![],
+            )),
         );
         let qc = make_test_qc(&block);
         storage.commit_block(&Arc::new(block), &Arc::new(qc));
@@ -890,10 +878,10 @@ fn test_ec_atomic_with_block_commit() {
     let mut block = make_test_block(BlockHeight::new(1));
     push_wave(
         &mut block,
-        Arc::new(FinalizedWave {
-            certificate: Arc::new(WaveCertificate::new(wave_id.clone(), vec![Arc::new(ec)])),
-            receipts: BoundedVec::new(),
-        }),
+        Arc::new(FinalizedWave::new(
+            Arc::new(WaveCertificate::new(wave_id.clone(), vec![Arc::new(ec)])),
+            vec![],
+        )),
     );
     let qc = make_test_qc(&block);
 
@@ -937,8 +925,8 @@ fn rocks_commit_with(
             }),
             metadata: None,
         };
-        let wave = Arc::new(FinalizedWave {
-            certificate: Arc::new(WaveCertificate::new(
+        let wave = Arc::new(FinalizedWave::new(
+            Arc::new(WaveCertificate::new(
                 WaveId::new(
                     ShardGroupId::new(0),
                     block.height(),
@@ -946,8 +934,8 @@ fn rocks_commit_with(
                 ),
                 vec![placeholder_local_ec(ShardGroupId::new(0), block.height())],
             )),
-            receipts: vec![receipt].into(),
-        });
+            vec![receipt],
+        ));
         push_wave(&mut block, wave);
     }
     storage.commit_block(&Arc::new(block), &Arc::new(qc.clone()));

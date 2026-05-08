@@ -487,7 +487,7 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
 
     let receipts: Vec<StoredReceipt> = certificates
         .iter()
-        .flat_map(|fw| fw.receipts.iter().cloned())
+        .flat_map(|fw| fw.receipts().iter().cloned())
         .collect();
 
     let mut provision_hashes: Vec<ProvisionHash> = provisions.iter().map(|p| p.hash()).collect();
@@ -744,7 +744,7 @@ where
             // events are emitted.
             let stored_receipts: Vec<StoredReceipt> = finalized_waves
                 .iter()
-                .flat_map(|fw| fw.receipts.iter().cloned())
+                .flat_map(|fw| fw.receipts().iter().cloned())
                 .collect();
 
             let receipt_start = std::time::Instant::now();

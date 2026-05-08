@@ -139,7 +139,7 @@ impl RocksDbStorage {
                 batch,
                 certificates_cf,
                 fw.wave_id(),
-                fw.certificate.as_ref(),
+                fw.certificate().as_ref(),
             );
         }
     }

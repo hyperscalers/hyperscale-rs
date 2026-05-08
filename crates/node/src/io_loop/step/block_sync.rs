@@ -347,7 +347,7 @@ fn validate_synced_block(
             .block
             .certificates()
             .iter()
-            .flat_map(|fw| fw.receipts.iter().cloned())
+            .flat_map(|fw| fw.receipts().iter().cloned())
             .collect();
         if compute_local_receipt_root(&receipts) != header.local_receipt_root {
             return Err("local_receipt_root_mismatch");
@@ -464,10 +464,10 @@ mod tests {
             }),
             metadata: None,
         };
-        let fw = Arc::new(FinalizedWave {
-            certificate: Arc::new(WaveCertificate::new(wave_id, vec![Arc::new(ec)])),
-            receipts: vec![receipt.clone()].into(),
-        });
+        let fw = Arc::new(FinalizedWave::new(
+            Arc::new(WaveCertificate::new(wave_id, vec![Arc::new(ec)])),
+            vec![receipt.clone()],
+        ));
         let lrr = compute_local_receipt_root(&[receipt]);
         let cr = compute_certificate_root(std::slice::from_ref(&fw));
         (fw, lrr, cr)
@@ -619,10 +619,10 @@ mod tests {
             consensus: Arc::new(ConsensusReceipt::Failed),
             metadata: None,
         };
-        let fw = Arc::new(FinalizedWave {
-            certificate: Arc::new(WaveCertificate::new(wave_id, vec![Arc::new(ec)])),
-            receipts: vec![receipt.clone()].into(),
-        });
+        let fw = Arc::new(FinalizedWave::new(
+            Arc::new(WaveCertificate::new(wave_id, vec![Arc::new(ec)])),
+            vec![receipt.clone()],
+        ));
         let mut h = header();
         h.certificate_root = compute_certificate_root(std::slice::from_ref(&fw));
         h.local_receipt_root = compute_local_receipt_root(&[receipt]);
