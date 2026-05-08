@@ -419,7 +419,7 @@ mod tests {
 
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
-        Block, BlockHeight, CertificateRoot, Hash, InFlightCount, LocalReceiptRoot,
+        Block, BlockHeight, BoundedVec, CertificateRoot, Hash, InFlightCount, LocalReceiptRoot,
         ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, StateRoot,
         TransactionRoot, ValidatorId, WaveCertificate, WaveId,
     };
@@ -524,7 +524,7 @@ mod tests {
                 wave_id,
                 execution_certificates: vec![],
             }),
-            receipts: vec![],
+            receipts: BoundedVec::new(),
         });
 
         let added = pb.add_finalized_wave(fw);
@@ -563,7 +563,7 @@ mod tests {
                 wave_id,
                 execution_certificates: vec![],
             }),
-            receipts: vec![],
+            receipts: BoundedVec::new(),
         });
         pb.add_finalized_wave(fw);
         assert!(pb.is_complete());
@@ -579,7 +579,7 @@ mod tests {
 
         let fw = Arc::new(FinalizedWave {
             certificate: cert,
-            receipts: vec![],
+            receipts: BoundedVec::new(),
         });
 
         let block = Block::Live {

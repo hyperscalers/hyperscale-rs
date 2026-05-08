@@ -29,7 +29,7 @@ mod tests {
     use super::*;
     use crate::test_utils::test_validity_range;
     use crate::{
-        BlockHash, BlockHeader, BlockHeight, Bls12381G2Signature, CertificateRoot,
+        BlockHash, BlockHeader, BlockHeight, Bls12381G2Signature, BoundedVec, CertificateRoot,
         ExecutionCertificate, ExecutionOutcome, FinalizedWave, GlobalReceiptHash,
         GlobalReceiptRoot, Hash, InFlightCount, LocalReceiptRoot, ProposerTimestamp,
         ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, SignerBitfield, StateRoot,
@@ -139,7 +139,7 @@ mod tests {
                     ),
                     execution_certificates: vec![ec],
                 }),
-                receipts: vec![],
+                receipts: BoundedVec::new(),
             })
         };
 
@@ -172,7 +172,7 @@ mod tests {
         let expected_receipt_hash = cert.receipt_hash();
         let fw = Arc::new(FinalizedWave {
             certificate: cert,
-            receipts: vec![],
+            receipts: BoundedVec::new(),
         });
 
         let root = compute_certificate_root(std::slice::from_ref(&fw));

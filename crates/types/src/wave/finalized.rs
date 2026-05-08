@@ -5,15 +5,11 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use sbor::prelude::*;
-use sbor::{
-    Categorize, Decode, DecodeError, Decoder, Describe, Encode, EncodeError, Encoder,
-    NoCustomTypeKind, NoCustomValueKind, RustTypeId, TypeData, TypeKind, ValueKind,
-};
+use sbor::{DecodeError, Decoder, EncodeError, Encoder, NoCustomValueKind, ValueKind};
 
-use crate::sbor_codec::decode_bounded_vec;
 use crate::{
-    ConsensusReceipt, ExecutionCertificate, ExecutionOutcome, GlobalReceiptHash, MAX_TXS_PER_BLOCK,
-    StoredReceipt, TransactionDecision, TxHash, WaveCertificate, WaveId,
+    BoundedVec, ConsensusReceipt, ExecutionCertificate, ExecutionOutcome, GlobalReceiptHash,
+    MAX_TXS_PER_BLOCK, StoredReceipt, TransactionDecision, TxHash, WaveCertificate, WaveId,
 };
 
 /// A finalized wave — all participating shards have reported, `WaveCertificate` created.
@@ -35,14 +31,14 @@ use crate::{
 ///
 /// Shared via `Arc` across the system — flows from execution state through
 /// pending blocks, actions, and into the commit path.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct FinalizedWave {
     /// The wave certificate carrying per-shard ECs and tx outcomes.
     pub certificate: Arc<WaveCertificate>,
     /// Stored receipts for txs that executed. Aborted txs are absent —
     /// `receipts.len() <= tx_count()`. Preserves canonical block order.
     /// Held in-memory until block commit, then written atomically with block metadata.
-    pub receipts: Vec<StoredReceipt>,
+    pub receipts: BoundedVec<StoredReceipt, MAX_TXS_PER_BLOCK>,
 }
 
 /// Reason a `FinalizedWave`'s receipts don't agree with its own EC.
@@ -185,10 +181,21 @@ impl FinalizedWave {
             }
         }
 
-        Some(Self {
+        Some(Self::new(certificate, receipts))
+    }
+
+    /// Build a `FinalizedWave` from raw inputs, wrapping `receipts` into
+    /// its bounded type.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `receipts.len() > MAX_TXS_PER_BLOCK`.
+    #[must_use]
+    pub fn new(certificate: Arc<WaveCertificate>, receipts: Vec<StoredReceipt>) -> Self {
+        Self {
             certificate,
-            receipts,
-        })
+            receipts: receipts.into(),
+        }
     }
 
     /// Validate that `receipts` are consistent with the local EC's
@@ -301,62 +308,6 @@ impl FinalizedWave {
                 (h, d)
             })
             .collect()
-    }
-}
-
-// Manual SBOR. Bounds the decoded `receipts` count at `MAX_TXS_PER_BLOCK`.
-
-impl<E: Encoder<NoCustomValueKind>> Encode<NoCustomValueKind, E> for FinalizedWave {
-    fn encode_value_kind(&self, encoder: &mut E) -> Result<(), EncodeError> {
-        encoder.write_value_kind(ValueKind::Tuple)
-    }
-
-    fn encode_body(&self, encoder: &mut E) -> Result<(), EncodeError> {
-        encoder.write_size(2)?;
-        encoder.encode(self.certificate.as_ref())?;
-        encoder.encode(&self.receipts)?;
-        Ok(())
-    }
-}
-
-impl<D: Decoder<NoCustomValueKind>> Decode<NoCustomValueKind, D> for FinalizedWave {
-    fn decode_body_with_value_kind(
-        decoder: &mut D,
-        value_kind: ValueKind<NoCustomValueKind>,
-    ) -> Result<Self, DecodeError> {
-        decoder.check_preloaded_value_kind(value_kind, ValueKind::Tuple)?;
-        let length = decoder.read_size()?;
-        if length != 2 {
-            return Err(DecodeError::UnexpectedSize {
-                expected: 2,
-                actual: length,
-            });
-        }
-        let certificate: WaveCertificate = decoder.decode()?;
-        // Bounded so the inline `Decode` impl stands on its own — the
-        // primary `Vec<Arc<FinalizedWave>>` path goes through
-        // `decode_finalized_wave_vec`, which also bounds the outer
-        // count, but a direct `basic_decode::<FinalizedWave>` must not
-        // honor an unbounded peer-claimed receipts length.
-        let receipts = decode_bounded_vec::<_, StoredReceipt>(decoder, MAX_TXS_PER_BLOCK)?;
-        Ok(Self {
-            certificate: Arc::new(certificate),
-            receipts,
-        })
-    }
-}
-
-impl Categorize<NoCustomValueKind> for FinalizedWave {
-    fn value_kind() -> ValueKind<NoCustomValueKind> {
-        ValueKind::Tuple
-    }
-}
-
-impl Describe<NoCustomTypeKind> for FinalizedWave {
-    const TYPE_ID: RustTypeId = RustTypeId::novel_with_code("FinalizedWave", &[], &[]);
-
-    fn type_data() -> TypeData<NoCustomTypeKind, RustTypeId> {
-        TypeData::unnamed(TypeKind::Any)
     }
 }
 

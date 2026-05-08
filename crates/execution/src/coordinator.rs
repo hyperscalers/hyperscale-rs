@@ -1632,7 +1632,7 @@ impl ExecutionCoordinator {
 
         let finalized = FinalizedWave {
             certificate: Arc::new(wc),
-            receipts,
+            receipts: receipts.into(),
         };
         let finalized_arc = Arc::new(finalized.clone());
         self.finalized.insert(wave_id.clone(), finalized);
@@ -2050,8 +2050,8 @@ mod tests {
     };
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
-        Bls12381G1PrivateKey, ConsensusReceipt, ExecutionOutcome, GlobalReceiptHash, Hash,
-        SignerBitfield, ValidatorInfo, ValidatorSet, VotePower, generate_bls_keypair,
+        Bls12381G1PrivateKey, BoundedVec, ConsensusReceipt, ExecutionOutcome, GlobalReceiptHash,
+        Hash, SignerBitfield, ValidatorInfo, ValidatorSet, VotePower, generate_bls_keypair,
         zero_bls_signature,
     };
 
@@ -2532,7 +2532,7 @@ mod tests {
                 wave_id,
                 execution_certificates: vec![ec],
             }),
-            receipts: vec![],
+            receipts: BoundedVec::new(),
         });
 
         let actions = state.admit_finalized_wave(&topo, wave);
@@ -2567,7 +2567,7 @@ mod tests {
                 wave_id,
                 execution_certificates: vec![ec],
             }),
-            receipts: vec![],
+            receipts: BoundedVec::new(),
         });
         let actions = state.on_finalized_wave_verified(wave, false);
         assert!(actions.is_empty());
@@ -2592,7 +2592,7 @@ mod tests {
                 wave_id,
                 execution_certificates: vec![ec],
             }),
-            receipts: vec![],
+            receipts: BoundedVec::new(),
         });
         let actions = state.on_finalized_wave_verified(wave, true);
         assert_eq!(actions.len(), 1);
@@ -2696,7 +2696,7 @@ mod tests {
                 wave_id,
                 execution_certificates: vec![ec],
             }),
-            receipts: vec![],
+            receipts: BoundedVec::new(),
         });
 
         let first = state.admit_finalized_wave(&topo, Arc::clone(&wave));
@@ -2732,7 +2732,7 @@ mod tests {
                 wave_id: wave_id.clone(),
                 execution_certificates: vec![ec],
             }),
-            receipts: vec![],
+            receipts: BoundedVec::new(),
         };
         // Seed the canonical store directly (mirrors what `finalize_wave`
         // does on the local-aggregation path).
@@ -2767,7 +2767,7 @@ mod tests {
                 wave_id,
                 execution_certificates: vec![bogus_ec],
             }),
-            receipts: vec![],
+            receipts: BoundedVec::new(),
         });
 
         let actions = state.admit_finalized_wave(&topo, wave);

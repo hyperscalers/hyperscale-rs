@@ -233,10 +233,7 @@ fn make_test_block_with_ecs(height: BlockHeight, ecs: Vec<Arc<ExecutionCertifica
         wave_id: ecs[0].wave_id.clone(),
         execution_certificates: ecs,
     });
-    let new_fw = Arc::new(FinalizedWave {
-        certificate,
-        receipts: vec![],
-    });
+    let new_fw = Arc::new(FinalizedWave::new(certificate, vec![]));
     match block {
         Block::Live {
             header,

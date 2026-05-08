@@ -12,10 +12,10 @@ use hyperscale_storage::{
     merge_database_updates, merge_into,
 };
 use hyperscale_types::{
-    Block, BlockHash, BlockHeight, Bls12381G2Signature, ConsensusReceipt, ExecutionCertificate,
-    FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, ProposerTimestamp,
-    QuorumCertificate, Round, ShardGroupId, SignerBitfield, StateRoot, StoredReceipt, TxHash,
-    WaveCertificate, WaveId, WeightedTimestamp,
+    Block, BlockHash, BlockHeight, Bls12381G2Signature, BoundedVec, ConsensusReceipt,
+    ExecutionCertificate, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash,
+    ProposerTimestamp, QuorumCertificate, Round, ShardGroupId, SignerBitfield, StateRoot,
+    StoredReceipt, TxHash, WaveCertificate, WaveId, WeightedTimestamp,
 };
 
 /// Build a placeholder EC whose `wave_id` matches the WC the caller is about
@@ -416,7 +416,7 @@ fn attach_receipts(block: &mut Block, receipts: Vec<StoredReceipt>) {
                 block.height(),
             )],
         }),
-        receipts,
+        receipts: receipts.into(),
     });
     // Take block out, mutate, and put back.
     let taken = std::mem::replace(
@@ -554,7 +554,7 @@ fn test_commit_block_stores_certificates() {
             transactions,
             certificates: Arc::new(vec![Arc::new(FinalizedWave {
                 certificate: cert,
-                receipts: vec![],
+                receipts: BoundedVec::new(),
             })]),
             provisions,
         },
@@ -567,7 +567,7 @@ fn test_commit_block_stores_certificates() {
             transactions,
             certificates: Arc::new(vec![Arc::new(FinalizedWave {
                 certificate: cert,
-                receipts: vec![],
+                receipts: BoundedVec::new(),
             })]),
         },
     };
@@ -864,7 +864,7 @@ fn test_ec_survives_reopen() {
                     wave_id: wave_id.clone(),
                     execution_certificates: vec![Arc::new(ec)],
                 }),
-                receipts: vec![],
+                receipts: BoundedVec::new(),
             }),
         );
         let qc = make_test_qc(&block);
@@ -895,7 +895,7 @@ fn test_ec_atomic_with_block_commit() {
                 wave_id: wave_id.clone(),
                 execution_certificates: vec![Arc::new(ec)],
             }),
-            receipts: vec![],
+            receipts: BoundedVec::new(),
         }),
     );
     let qc = make_test_qc(&block);
@@ -952,7 +952,7 @@ fn rocks_commit_with(
                     block.height(),
                 )],
             }),
-            receipts: vec![receipt],
+            receipts: vec![receipt].into(),
         });
         push_wave(&mut block, wave);
     }

@@ -469,7 +469,7 @@ mod tests {
                 wave_id,
                 execution_certificates: vec![Arc::new(ec)],
             }),
-            receipts: vec![receipt.clone()],
+            receipts: vec![receipt.clone()].into(),
         });
         let lrr = compute_local_receipt_root(&[receipt]);
         let cr = compute_certificate_root(std::slice::from_ref(&fw));
@@ -627,7 +627,7 @@ mod tests {
                 wave_id,
                 execution_certificates: vec![Arc::new(ec)],
             }),
-            receipts: vec![receipt.clone()],
+            receipts: vec![receipt.clone()].into(),
         });
         let mut h = header();
         h.certificate_root = compute_certificate_root(std::slice::from_ref(&fw));

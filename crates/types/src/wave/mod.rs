@@ -41,7 +41,7 @@ mod tests {
 
     use crate::test_utils::test_transaction_with_nodes;
     use crate::{
-        Attempt, BlockHeight, Bls12381G2Signature, ConsensusReceipt, DatabaseUpdates,
+        Attempt, BlockHeight, Bls12381G2Signature, BoundedVec, ConsensusReceipt, DatabaseUpdates,
         ExecutionCertificate, ExecutionOutcome, FinalizedWave, GlobalReceiptHash,
         GlobalReceiptRoot, Hash, NodeId, ProvisionTxRoot, RETENTION_HORIZON,
         ReceiptValidationError, ShardGroupId, SignerBitfield, StoredReceipt, TopologySnapshot,
@@ -793,7 +793,8 @@ mod tests {
                     consensus: Arc::new(ConsensusReceipt::Failed),
                     metadata: None,
                 },
-            ],
+            ]
+            .into(),
         };
         assert_eq!(fw.validate_receipts_against_ec(), Ok(()));
     }
@@ -818,7 +819,8 @@ mod tests {
                 tx_hash: tx_a,
                 consensus: Arc::new(ConsensusReceipt::Failed),
                 metadata: None,
-            }],
+            }]
+            .into(),
         };
         assert!(matches!(
             fw.validate_receipts_against_ec(),
@@ -848,7 +850,8 @@ mod tests {
                     application_events: vec![],
                 }),
                 metadata: None,
-            }],
+            }]
+            .into(),
         };
         assert!(matches!(
             fw.validate_receipts_against_ec(),
@@ -882,7 +885,8 @@ mod tests {
                     application_events: vec![],
                 }),
                 metadata: None,
-            }],
+            }]
+            .into(),
         };
         assert!(matches!(
             fw.validate_receipts_against_ec(),
@@ -906,7 +910,7 @@ mod tests {
                 wave_id: wave_id.clone(),
                 execution_certificates: vec![make_local_ec(&wave_id, outcomes)],
             }),
-            receipts: vec![],
+            receipts: BoundedVec::new(),
         };
         assert!(matches!(
             fw.validate_receipts_against_ec(),
@@ -935,7 +939,8 @@ mod tests {
                     application_events: vec![],
                 }),
                 metadata: None,
-            }],
+            }]
+            .into(),
         };
         assert!(matches!(
             fw.validate_receipts_against_ec(),
@@ -967,7 +972,8 @@ mod tests {
                     application_events: vec![],
                 }),
                 metadata: None,
-            }],
+            }]
+            .into(),
         };
         assert!(matches!(
             fw.validate_receipts_against_ec(),
@@ -985,7 +991,7 @@ mod tests {
                 wave_id,
                 execution_certificates: vec![remote_ec],
             }),
-            receipts: vec![],
+            receipts: BoundedVec::new(),
         };
         assert_eq!(
             fw.validate_receipts_against_ec(),
@@ -1005,7 +1011,7 @@ mod tests {
                 wave_id: wave_id.clone(),
                 execution_certificates: vec![make_local_ec(&wave_id, outcomes)],
             }),
-            receipts: vec![],
+            receipts: BoundedVec::new(),
         };
         assert_eq!(fw.validate_receipts_against_ec(), Ok(()));
     }

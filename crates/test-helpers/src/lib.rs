@@ -290,13 +290,13 @@ pub fn make_finalized_wave(
         Bls12381G2Signature([0u8; 96]),
         SignerBitfield::new(4),
     );
-    FinalizedWave {
-        certificate: Arc::new(WaveCertificate {
+    FinalizedWave::new(
+        Arc::new(WaveCertificate {
             wave_id,
             execution_certificates: vec![Arc::new(ec)],
         }),
-        receipts: vec![],
-    }
+        vec![],
+    )
 }
 
 #[cfg(test)]

@@ -117,13 +117,13 @@ fn commit_with(
             }),
             metadata: None,
         };
-        let new_fw = Arc::new(FinalizedWave {
-            certificate: Arc::new(WaveCertificate {
+        let new_fw = Arc::new(FinalizedWave::new(
+            Arc::new(WaveCertificate {
                 wave_id: WaveId::new(ShardGroupId::new(0), block.height(), BTreeSet::new()),
                 execution_certificates: vec![],
             }),
-            receipts: vec![receipt],
-        });
+            vec![receipt],
+        ));
         match block {
             Block::Live {
                 header,
