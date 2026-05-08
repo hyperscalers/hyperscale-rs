@@ -41,31 +41,19 @@ mod tests {
 
     #[test]
     fn test_global_receipt_hash_changes_with_outcome() {
-        let success = GlobalReceipt {
-            success: true,
-            event_root: EventRoot::ZERO,
-            writes_root: WritesRoot::ZERO,
-        };
-        let failure = GlobalReceipt {
-            success: false,
-            event_root: EventRoot::ZERO,
-            writes_root: WritesRoot::ZERO,
-        };
+        let success = GlobalReceipt::new(true, EventRoot::ZERO, WritesRoot::ZERO);
+        let failure = GlobalReceipt::new(false, EventRoot::ZERO, WritesRoot::ZERO);
         assert_ne!(success.receipt_hash(), failure.receipt_hash());
     }
 
     #[test]
     fn test_global_receipt_hash_changes_with_writes_root() {
-        let a = GlobalReceipt {
-            success: true,
-            event_root: EventRoot::ZERO,
-            writes_root: WritesRoot::ZERO,
-        };
-        let b = GlobalReceipt {
-            success: true,
-            event_root: EventRoot::ZERO,
-            writes_root: WritesRoot::from_raw(Hash::from_bytes(b"different")),
-        };
+        let a = GlobalReceipt::new(true, EventRoot::ZERO, WritesRoot::ZERO);
+        let b = GlobalReceipt::new(
+            true,
+            EventRoot::ZERO,
+            WritesRoot::from_raw(Hash::from_bytes(b"different")),
+        );
         assert_ne!(a.receipt_hash(), b.receipt_hash());
     }
 

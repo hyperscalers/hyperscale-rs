@@ -96,12 +96,7 @@ pub fn build_executed_tx<S: SubstateDatabase>(
         .map(ApplicationEvent::hash)
         .collect();
     let event_root = EventRoot::from_raw(compute_merkle_root(&event_hashes));
-    let receipt_hash = GlobalReceipt {
-        success: true,
-        event_root,
-        writes_root,
-    }
-    .receipt_hash();
+    let receipt_hash = GlobalReceipt::new(true, event_root, writes_root).receipt_hash();
 
     let consensus = ConsensusReceipt::Succeeded {
         receipt_hash,

@@ -43,14 +43,8 @@ const RECEIPT_VARIANT_FAILED: u8 = 1;
 /// All failed transactions hash to the same value — derived from the
 /// fixed `(success=false, EventRoot::ZERO, WritesRoot::ZERO)` triple.
 /// Cached to avoid recomputing per failure.
-pub static FAILED_RECEIPT_HASH: LazyLock<GlobalReceiptHash> = LazyLock::new(|| {
-    GlobalReceipt {
-        success: false,
-        event_root: EventRoot::ZERO,
-        writes_root: WritesRoot::ZERO,
-    }
-    .receipt_hash()
-});
+pub static FAILED_RECEIPT_HASH: LazyLock<GlobalReceiptHash> =
+    LazyLock::new(|| GlobalReceipt::new(false, EventRoot::ZERO, WritesRoot::ZERO).receipt_hash());
 
 /// The consensus-bound portion of an execution result.
 ///
