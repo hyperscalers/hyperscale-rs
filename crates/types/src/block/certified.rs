@@ -53,10 +53,10 @@ impl CertifiedBlock {
         qc: QuorumCertificate,
     ) -> Result<Self, CertifiedBlockHashMismatch> {
         let block_hash = block.hash();
-        if qc.block_hash != block_hash {
+        if qc.block_hash() != block_hash {
             return Err(CertifiedBlockHashMismatch {
                 block_hash,
-                qc_block_hash: qc.block_hash,
+                qc_block_hash: qc.block_hash(),
             });
         }
         Ok(Self { block, qc })
@@ -77,7 +77,7 @@ impl CertifiedBlock {
     #[must_use]
     pub fn new_unchecked(block: Block, qc: QuorumCertificate) -> Self {
         assert_eq!(
-            qc.block_hash,
+            qc.block_hash(),
             block.hash(),
             "CertifiedBlock pairing invariant"
         );

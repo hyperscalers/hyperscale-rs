@@ -313,10 +313,10 @@ fn validate_synced_block(
         return Err("height_mismatch");
     }
     let block_hash = certified.block().hash();
-    if certified.qc().block_hash != block_hash {
+    if certified.qc().block_hash() != block_hash {
         return Err("qc_hash_mismatch");
     }
-    if certified.qc().height != height {
+    if certified.qc().height() != height {
         return Err("qc_height_mismatch");
     }
 
@@ -435,16 +435,16 @@ mod tests {
     }
 
     fn qc_for(block: &Block) -> QuorumCertificate {
-        QuorumCertificate {
-            block_hash: block.hash(),
-            shard_group_id: ShardGroupId::new(0),
-            height: block.height(),
-            parent_block_hash: BlockHash::ZERO,
-            round: Round::INITIAL,
-            aggregated_signature: zero_bls_signature(),
-            signers: SignerBitfield::new(0),
-            weighted_timestamp: WeightedTimestamp::ZERO,
-        }
+        QuorumCertificate::new(
+            block.hash(),
+            ShardGroupId::new(0),
+            block.height(),
+            BlockHash::ZERO,
+            Round::INITIAL,
+            SignerBitfield::new(0),
+            zero_bls_signature(),
+            WeightedTimestamp::ZERO,
+        )
     }
 
     /// Build a single-tx, single-wave wave with consistent EC + receipt.
@@ -537,8 +537,16 @@ mod tests {
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),
         };
-        let mut qc = qc_for(&block);
-        qc.block_hash = BlockHash::from_raw(Hash::from_bytes(b"wrong"));
+        let qc = QuorumCertificate::new(
+            BlockHash::from_raw(Hash::from_bytes(b"wrong")),
+            ShardGroupId::new(0),
+            block.height(),
+            BlockHash::ZERO,
+            Round::INITIAL,
+            SignerBitfield::new(0),
+            zero_bls_signature(),
+            WeightedTimestamp::ZERO,
+        );
         let _ = CertifiedBlock::new_unchecked(block, qc);
     }
 
@@ -550,8 +558,16 @@ mod tests {
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),
         };
-        let mut qc = qc_for(&block);
-        qc.height = BlockHeight::new(99);
+        let qc = QuorumCertificate::new(
+            block.hash(),
+            ShardGroupId::new(0),
+            BlockHeight::new(99),
+            BlockHash::ZERO,
+            Round::INITIAL,
+            SignerBitfield::new(0),
+            zero_bls_signature(),
+            WeightedTimestamp::ZERO,
+        );
         let certified = CertifiedBlock::new_unchecked(block, qc);
         assert_eq!(
             validate_synced_block(HEIGHT, &certified).unwrap_err(),

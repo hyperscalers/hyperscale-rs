@@ -507,9 +507,18 @@ mod tests {
             vec![],
         );
         let block_hash = block.hash();
-        let qc = QuorumCertificate {
-            block_hash,
-            ..QuorumCertificate::genesis(block.header().shard_group_id())
+        let qc = {
+            let __qc = QuorumCertificate::genesis(block.header().shard_group_id());
+            QuorumCertificate::new(
+                block_hash,
+                __qc.shard_group_id(),
+                __qc.height(),
+                __qc.parent_block_hash(),
+                __qc.round(),
+                __qc.signers().clone(),
+                __qc.aggregated_signature(),
+                __qc.weighted_timestamp(),
+            )
         };
         let _ = committee; // committee unused here but kept for future signing-required tests
         let pending = PendingCommit {

@@ -43,7 +43,7 @@
 //!    inline; `Block::Sealed` has none). Independent of mempool and
 //!    remote-headers; sequenced before execution because execution may
 //!    consume provisions queued here on the next proposal attempt.
-//! 5. `outbound_provisions.on_block_committed(qc.weighted_timestamp)` —
+//! 5. `outbound_provisions.on_block_committed(qc.weighted_timestamp())` —
 //!    deterministic eviction sweep. Uses the BFT-authenticated weighted
 //!    timestamp from the QC so every validator evicts identically. Must
 //!    follow earlier steps because eviction reads the now-up-to-date
@@ -312,7 +312,7 @@ impl NodeStateMachine {
         // Outbound provision safety sweep — runs on the BFT-authenticated
         // weighted timestamp so every validator evicts deterministically.
         self.outbound_provisions
-            .on_block_committed(certified.qc().weighted_timestamp);
+            .on_block_committed(certified.qc().weighted_timestamp());
 
         actions.extend(self.apply_block_to_execution(certified));
 
@@ -519,13 +519,13 @@ mod tests {
     }
 
     /// The orchestrator's outbound-provisions sweep on `BlockCommitted` must
-    /// run on `qc.weighted_timestamp` — never on local clock. Every
+    /// run on `qc.weighted_timestamp()` — never on local clock. Every
     /// validator sees the same QC, so they evict in lockstep; if local
     /// clock leaks in, validators with skew evict at different commits
     /// and the outbound tracker forks across the network.
     ///
     /// Test pumps local clock far past the entry's deadline and commits a
-    /// block whose `qc.weighted_timestamp` is BELOW that deadline. The
+    /// block whose `qc.weighted_timestamp()` is BELOW that deadline. The
     /// entry must survive — proves the sweep ignored the local clock. A
     /// second commit with `weighted_timestamp` past the deadline then
     /// confirms the eviction path itself works.
@@ -563,7 +563,7 @@ mod tests {
         let past_deadline_ms = retention_ms * 10;
         node.set_time(LocalTimestamp::from_millis(past_deadline_ms));
 
-        // Commit a block whose qc.weighted_timestamp is BELOW the entry
+        // Commit a block whose qc.weighted_timestamp() is BELOW the entry
         // deadline. The orchestrator passes this into the outbound sweep.
         let block = make_live_block(
             ShardGroupId::new(0),
@@ -578,11 +578,11 @@ mod tests {
         assert_eq!(
             node.outbound_provisions().memory_stats().tracked_provisions,
             1,
-            "outbound entry must survive — qc.weighted_timestamp is below the deadline, \
+            "outbound entry must survive — qc.weighted_timestamp() is below the deadline, \
              local clock past it must not leak in",
         );
 
-        // Commit a second block whose qc.weighted_timestamp IS past the
+        // Commit a second block whose qc.weighted_timestamp() IS past the
         // deadline. Now the eviction path proper must fire.
         let block = make_live_block(
             ShardGroupId::new(0),
@@ -597,7 +597,7 @@ mod tests {
         assert_eq!(
             node.outbound_provisions().memory_stats().tracked_provisions,
             0,
-            "outbound entry must be evicted — qc.weighted_timestamp now exceeds the deadline",
+            "outbound entry must be evicted — qc.weighted_timestamp() now exceeds the deadline",
         );
     }
 

@@ -193,7 +193,7 @@ impl ProvisionCoordinator {
     ) -> Vec<Action> {
         let mut actions: Vec<Action> = Vec::new();
         let block = certified.block();
-        let new_ts = certified.qc().weighted_timestamp;
+        let new_ts = certified.qc().weighted_timestamp();
         self.expected.record_block_committed(block.height(), new_ts);
         let local_ts = self.expected.local_ts();
 
@@ -387,7 +387,7 @@ impl ProvisionCoordinator {
                 "Found buffered provisions for verified header"
             );
             let local_ts = self.expected.local_ts();
-            let source_block_ts = committed_header.qc().weighted_timestamp;
+            let source_block_ts = committed_header.qc().weighted_timestamp();
             for provisions in drained {
                 if provisions.deadline(source_block_ts) <= local_ts {
                     debug!(
@@ -472,7 +472,7 @@ impl ProvisionCoordinator {
         if let Some(verified_header) = self.headers.get(key).cloned() {
             // Reject if the source block has aged past `RETENTION_HORIZON` —
             // every tx in it has expired and no shard can still need this data.
-            let deadline = provisions.deadline(verified_header.qc().weighted_timestamp);
+            let deadline = provisions.deadline(verified_header.qc().weighted_timestamp());
             if deadline <= self.expected.local_ts() {
                 debug!(
                     source_shard = source_shard.inner(),
@@ -606,7 +606,7 @@ impl ProvisionCoordinator {
             );
             return actions;
         };
-        let source_block_ts = header.qc().weighted_timestamp;
+        let source_block_ts = header.qc().weighted_timestamp();
 
         let provisions = self.pipeline.insert_verified(provisions, source_block_ts);
 
@@ -681,9 +681,9 @@ mod tests {
     use hyperscale_types::{
         Block, BlockHash, BlockHeader, Bls12381G1PrivateKey, BoundedVec, CertificateRoot, Hash,
         InFlightCount, LocalReceiptRoot, MerkleInclusionProof, ProposerTimestamp, ProvisionsRoot,
-        QuorumCertificate, Round, StateRoot, TopologySnapshot, TransactionRoot, TxEntries, TxHash,
-        ValidatorId, ValidatorInfo, ValidatorSet, VotePower, WaveId, WeightedTimestamp,
-        bls_keypair_from_seed,
+        QuorumCertificate, Round, ShardGroupId, SignerBitfield, StateRoot, TopologySnapshot,
+        TransactionRoot, TxEntries, TxHash, ValidatorId, ValidatorInfo, ValidatorSet, VotePower,
+        WaveId, WeightedTimestamp, bls_keypair_from_seed, zero_bls_signature,
     };
     use proptest::bool::ANY as ANY_BOOL;
     use proptest::collection::vec as prop_vec;
@@ -1355,9 +1355,16 @@ mod tests {
             InFlightCount::ZERO,
         );
         let header_hash = header.hash();
-        let mut qc = QuorumCertificate::genesis(ShardGroupId::new(0));
-        qc.block_hash = header_hash;
-        qc.shard_group_id = shard;
+        let qc = QuorumCertificate::new(
+            header_hash,
+            shard,
+            BlockHeight::new(0),
+            BlockHash::ZERO,
+            Round::INITIAL,
+            SignerBitfield::empty(),
+            zero_bls_signature(),
+            WeightedTimestamp::ZERO,
+        );
         Arc::new(CommittedBlockHeader::new(header, qc))
     }
 
@@ -1393,12 +1400,18 @@ mod tests {
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),
         };
-        let qc = QuorumCertificate {
-            block_hash: block.hash(),
-            weighted_timestamp: WeightedTimestamp::from_millis(
-                height.inner() * TEST_BLOCK_INTERVAL_MS,
-            ),
-            ..QuorumCertificate::genesis(ShardGroupId::new(0))
+        let qc = {
+            let __qc = QuorumCertificate::genesis(ShardGroupId::new(0));
+            QuorumCertificate::new(
+                block.hash(),
+                __qc.shard_group_id(),
+                __qc.height(),
+                __qc.parent_block_hash(),
+                __qc.round(),
+                __qc.signers().clone(),
+                __qc.aggregated_signature(),
+                WeightedTimestamp::from_millis(height.inner() * TEST_BLOCK_INTERVAL_MS),
+            )
         };
         CertifiedBlock::new_unchecked(block, qc)
     }

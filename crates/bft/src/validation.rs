@@ -24,7 +24,7 @@ use hyperscale_types::{
 
 use crate::commit_dedup::CommitDedupIndex;
 
-/// True if `qc.signers` represents at least 2f+1 of the local committee's
+/// True if `qc.signers()` represents at least 2f+1 of the local committee's
 /// voting power. The synced-block apply path and consensus pre-vote path
 /// both call this — without it, a single Byzantine signer suffices to pass
 /// the BLS-only `VerifyQcSignature` check that follows.
@@ -32,7 +32,7 @@ use crate::commit_dedup::CommitDedupIndex;
 pub fn qc_has_local_quorum_power(topology: &TopologySnapshot, qc: &QuorumCertificate) -> bool {
     let committee = topology.local_committee();
     let qc_power: VotePower = qc
-        .signers
+        .signers()
         .set_indices()
         .filter_map(|i| committee.get(i))
         .map(|&vid| {
@@ -77,19 +77,19 @@ pub fn validate_header(
             return Err("parent QC does not have quorum".to_string());
         }
 
-        if header.parent_qc().height.inner() + 1 != height.inner() {
+        if header.parent_qc().height().inner() + 1 != height.inner() {
             return Err(format!(
                 "parent QC height {} doesn't match block height {} - 1",
-                header.parent_qc().height.inner(),
+                header.parent_qc().height().inner(),
                 height.inner()
             ));
         }
 
-        if header.parent_block_hash() != header.parent_qc().block_hash {
+        if header.parent_block_hash() != header.parent_qc().block_hash() {
             return Err(format!(
-                "parent_block_hash {:?} doesn't match parent_qc.block_hash {:?}",
+                "parent_block_hash {:?} doesn't match parent_qc.block_hash() {:?}",
                 header.parent_block_hash(),
-                header.parent_qc().block_hash
+                header.parent_qc().block_hash()
             ));
         }
     } else if height.inner() != committed_height.inner() + 1 {

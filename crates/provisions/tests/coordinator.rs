@@ -12,8 +12,9 @@ use hyperscale_test_helpers::TestCommittee;
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, BoundedVec, CertificateRoot, CertifiedBlock,
     CommittedBlockHeader, Hash, InFlightCount, LocalReceiptRoot, LocalTimestamp, ProposerTimestamp,
-    ProvisionHash, ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, StateRoot,
-    TopologySnapshot, TransactionRoot, ValidatorId, WaveId, WeightedTimestamp,
+    ProvisionHash, ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, SignerBitfield,
+    StateRoot, TopologySnapshot, TransactionRoot, ValidatorId, WaveId, WeightedTimestamp,
+    zero_bls_signature,
 };
 
 const TEST_BLOCK_INTERVAL_MS: u64 = 500;
@@ -52,10 +53,18 @@ fn make_block(height: BlockHeight) -> CertifiedBlock {
         certificates: Arc::new(BoundedVec::new()),
         provisions: Arc::new(BoundedVec::new()),
     };
-    let qc = QuorumCertificate {
-        block_hash: block.hash(),
-        weighted_timestamp: WeightedTimestamp::from_millis(height.inner() * TEST_BLOCK_INTERVAL_MS),
-        ..QuorumCertificate::genesis(ShardGroupId::new(0))
+    let qc = {
+        let __qc = QuorumCertificate::genesis(ShardGroupId::new(0));
+        QuorumCertificate::new(
+            block.hash(),
+            __qc.shard_group_id(),
+            __qc.height(),
+            __qc.parent_block_hash(),
+            __qc.round(),
+            __qc.signers().clone(),
+            __qc.aggregated_signature(),
+            WeightedTimestamp::from_millis(height.inner() * TEST_BLOCK_INTERVAL_MS),
+        )
     };
     CertifiedBlock::new_unchecked(block, qc)
 }
@@ -92,10 +101,16 @@ fn make_remote_header_targeting(
         InFlightCount::ZERO,
     );
     let header_hash = header.hash();
-    let mut qc = QuorumCertificate::genesis(ShardGroupId::new(0));
-    qc.block_hash = header_hash;
-    qc.shard_group_id = source_shard;
-    qc.height = height;
+    let qc = QuorumCertificate::new(
+        header_hash,
+        source_shard,
+        height,
+        BlockHash::ZERO,
+        Round::INITIAL,
+        SignerBitfield::empty(),
+        zero_bls_signature(),
+        WeightedTimestamp::ZERO,
+    );
     Arc::new(CommittedBlockHeader::new(header, qc))
 }
 

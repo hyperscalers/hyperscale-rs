@@ -71,7 +71,7 @@ pub struct BlockSyncManager {
     /// next height without racing the commit pipeline's own advancement.
     sync_applied_height: BlockHeight,
 
-    /// Highest `latest_qc.height` `health_check` has observed. Together with
+    /// Highest `latest_qc.height()` `health_check` has observed. Together with
     /// `view_changes_at_last_qc_advance` lets the health check distinguish
     /// "I'm spinning view changes but the chain is also moving" from
     /// "I'm spinning while the chain is stuck somewhere I can't see."
@@ -345,7 +345,7 @@ impl BlockSyncManager {
         info!(
             height = height.inner(),
             ?block_hash,
-            signers = qc.signers.count(),
+            signers = qc.signers().count(),
             "Submitting synced block for QC verification"
         );
         self.pending_synced_block_verifications.insert(
@@ -618,7 +618,7 @@ impl BlockSyncManager {
             return BlockSyncHealthDecision::Idle;
         };
 
-        let qc_height = latest_qc.height;
+        let qc_height = latest_qc.height();
 
         // Snapshot the view-change counter every time the QC advances. The
         // delta against the current counter is "view changes spun without
@@ -734,8 +734,9 @@ mod tests {
     use hyperscale_test_helpers::TestCommittee;
     use hyperscale_types::{
         Block, BlockHeader, BoundedVec, CertificateRoot, Hash, InFlightCount, LocalReceiptRoot,
-        ProposerTimestamp, ProvisionsRoot, Round, ShardGroupId, StateRoot, TransactionRoot,
-        ValidatorId, ValidatorInfo, ValidatorSet, VotePower,
+        ProposerTimestamp, ProvisionsRoot, Round, ShardGroupId, SignerBitfield, StateRoot,
+        TransactionRoot, ValidatorId, ValidatorInfo, ValidatorSet, VotePower, WeightedTimestamp,
+        zero_bls_signature,
     };
 
     use super::*;
@@ -780,9 +781,16 @@ mod tests {
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),
         };
-        let mut qc = QuorumCertificate::genesis(ShardGroupId::new(0));
-        qc.block_hash = block.hash();
-        qc.height = height;
+        let qc = QuorumCertificate::new(
+            block.hash(),
+            ShardGroupId::new(0),
+            height,
+            BlockHash::ZERO,
+            Round::INITIAL,
+            SignerBitfield::empty(),
+            zero_bls_signature(),
+            WeightedTimestamp::ZERO,
+        );
         CertifiedBlock::new_unchecked(block, qc)
     }
 
@@ -1139,10 +1147,16 @@ mod tests {
     }
 
     fn qc_at(height: BlockHeight) -> QuorumCertificate {
-        let mut qc = QuorumCertificate::genesis(ShardGroupId::new(0));
-        qc.height = height;
-        qc.block_hash = BlockHash::from_raw(Hash::from_bytes(b"qc"));
-        qc
+        QuorumCertificate::new(
+            BlockHash::from_raw(Hash::from_bytes(b"qc")),
+            ShardGroupId::new(0),
+            height,
+            BlockHash::ZERO,
+            Round::INITIAL,
+            SignerBitfield::empty(),
+            zero_bls_signature(),
+            WeightedTimestamp::ZERO,
+        )
     }
 
     // Test-only shim avoiding the `pub fn` gate on the tracked insertion,

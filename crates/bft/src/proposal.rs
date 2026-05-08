@@ -295,7 +295,7 @@ pub fn assemble_build_action(
     kind: ProposalKind,
 ) -> BuildActionPlan {
     let (parent_block_hash, parent_qc) = chain.proposal_parent();
-    let parent_block_height = parent_qc.height;
+    let parent_block_height = parent_qc.height();
     let parent_state_root = chain.parent_state_root(parent_block_hash);
     let parent_in_flight = chain.parent_in_flight(parent_block_hash);
 
@@ -325,7 +325,7 @@ pub fn assemble_build_action(
             false,
         ),
         ProposalKind::Fallback => (
-            ProposerTimestamp::from_millis(parent_qc.weighted_timestamp.as_millis()),
+            ProposerTimestamp::from_millis(parent_qc.weighted_timestamp().as_millis()),
             true,
             Vec::new(),
             Vec::new(),

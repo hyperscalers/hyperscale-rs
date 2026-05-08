@@ -212,10 +212,10 @@ impl BftCoordinator {
             view_change: ViewChangeController::new(),
             committed_height: recovered.committed_height,
             committed_hash: recovered.committed_hash.unwrap_or(BlockHash::ZERO),
-            committed_ts: recovered
-                .latest_qc
-                .as_ref()
-                .map_or(WeightedTimestamp::ZERO, |qc| qc.weighted_timestamp),
+            committed_ts: recovered.latest_qc.as_ref().map_or(
+                WeightedTimestamp::ZERO,
+                QuorumCertificate::weighted_timestamp,
+            ),
             committed_state_root: recovered.jmt_root.unwrap_or(StateRoot::ZERO),
             latest_qc: recovered.latest_qc,
             deferred_qc: None,
@@ -446,7 +446,7 @@ impl BftCoordinator {
         // 3. Block sync has unverified work in flight.
         let next_height = self.latest_qc.as_ref().map_or_else(
             || self.committed_height.inner() + 1,
-            |qc| qc.height.inner() + 1,
+            |qc| qc.height().inner() + 1,
         );
         let has_pending_at_tip = self
             .pending_blocks
@@ -646,7 +646,7 @@ impl BftCoordinator {
         let next_height = self
             .latest_qc
             .as_ref()
-            .map_or_else(|| self.committed_height.next(), |qc| qc.height.next());
+            .map_or_else(|| self.committed_height.next(), |qc| qc.height().next());
         let round = self.view_change.view;
 
         if !self.can_propose(topology_snapshot, next_height, round) {
@@ -710,7 +710,7 @@ impl BftCoordinator {
         // timestamp — the deterministic clock voters will use to verify
         // this block. The one-block lag (this block's own QC may carry a
         // slightly later timestamp) is bounded by MAX_VALIDITY_RANGE.
-        let validity_anchor = parent_qc.weighted_timestamp;
+        let validity_anchor = parent_qc.weighted_timestamp();
         let transactions = select_transactions(
             ready_txs,
             &qc_chain_tx_hashes,
@@ -1034,7 +1034,7 @@ impl BftCoordinator {
             return actions;
         }
 
-        let parent_height = header.parent_qc().height;
+        let parent_height = header.parent_qc().height();
 
         // Check for a COMPLETE parent block; an incomplete pending block still
         // requires sync for the full data.
@@ -1067,7 +1067,7 @@ impl BftCoordinator {
         if have_parent
             && self
                 .verification
-                .cached_qc(&header.parent_qc().block_hash)
+                .cached_qc(&header.parent_qc().block_hash())
                 .is_some_and(|cached| cached == header.parent_qc())
         {
             actions.extend(self.try_adopt_verified_qc(topology_snapshot, header.parent_qc()));
@@ -1089,13 +1089,13 @@ impl BftCoordinator {
         let advances = self
             .latest_qc
             .as_ref()
-            .is_none_or(|existing| qc.height.inner() > existing.height.inner());
+            .is_none_or(|existing| qc.height().inner() > existing.height().inner());
         if !advances {
             return Vec::new();
         }
         debug!(
             validator = ?topology_snapshot.local_validator_id(),
-            qc_height = qc.height.inner(),
+            qc_height = qc.height().inner(),
             "Adopted verified parent QC"
         );
         self.latest_qc = Some(qc.clone());
@@ -1217,7 +1217,7 @@ impl BftCoordinator {
         let should_adopt = self
             .latest_qc
             .as_ref()
-            .is_none_or(|existing| deferred_qc.height.inner() > existing.height.inner());
+            .is_none_or(|existing| deferred_qc.height().inner() > existing.height().inner());
         if should_adopt {
             self.latest_qc = Some(deferred_qc.clone());
             self.maybe_unlock_for_qc(topology_snapshot, &deferred_qc);
@@ -1319,7 +1319,7 @@ impl BftCoordinator {
             // `absorb_parent_qc_from_header` for the same trust gap. A
             // mismatch falls through to BLS verification rather than being
             // accepted.
-            let qc_block_hash = header.parent_qc().block_hash;
+            let qc_block_hash = header.parent_qc().block_hash();
             if self
                 .verification
                 .cached_qc(&qc_block_hash)
@@ -1626,7 +1626,7 @@ impl BftCoordinator {
         if let Some(qc) = qc {
             info!(
                 block_hash = ?block_hash,
-                height = qc.height.inner(),
+                height = qc.height().inner(),
                 signers = qc.signer_count(),
                 "QC built successfully"
             );
@@ -1729,7 +1729,7 @@ impl BftCoordinator {
         // `try_vote_on_block` — adoption only mutates `latest_qc` /
         // commit-related state, not the per-block voting machinery.
         let mut actions = Vec::new();
-        if self.has_complete_block_at_height(header.parent_qc().height) {
+        if self.has_complete_block_at_height(header.parent_qc().height()) {
             actions.extend(self.try_adopt_verified_qc(topology_snapshot, header.parent_qc()));
         }
 
@@ -2011,7 +2011,7 @@ impl BftCoordinator {
     /// `state_root` is the computed JMT root after applying writes from the certificates.
     /// If certificates is empty, parent state is inherited.
     #[instrument(skip(self, qc, ready_txs, finalized_waves), fields(
-        height = qc.height.inner(),
+        height = qc.height().inner(),
         block_hash = ?block_hash
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -2024,7 +2024,7 @@ impl BftCoordinator {
         finalized_waves: Vec<Arc<FinalizedWave>>,
         provisions: Vec<Arc<Provisions>>,
     ) -> Vec<Action> {
-        let height = qc.height;
+        let height = qc.height();
 
         info!(
             validator = ?topology_snapshot.local_validator_id(),
@@ -2040,7 +2040,7 @@ impl BftCoordinator {
         let should_update = self
             .latest_qc
             .as_ref()
-            .is_none_or(|existing| qc.height.inner() > existing.height.inner());
+            .is_none_or(|existing| qc.height().inner() > existing.height().inner());
 
         if should_update {
             // Defer adoption if the header isn't in memory yet — we need it
@@ -2108,7 +2108,7 @@ impl BftCoordinator {
 
         // The certifying QC for the committable block (block N-1) is the
         // parent_qc of the block whose QC this is (block N).
-        let block_hash = qc.block_hash;
+        let block_hash = qc.block_hash();
         let certifying_qc = self.pending_blocks.get(&block_hash).map_or_else(
             || {
                 warn!(
@@ -2131,7 +2131,7 @@ impl BftCoordinator {
 
     /// Handle block ready to commit.
     #[instrument(skip(self, qc), fields(
-        height = qc.height.inner(),
+        height = qc.height().inner(),
         block_hash = ?block_hash
     ))]
     pub fn on_block_ready_to_commit(
@@ -2168,7 +2168,7 @@ impl BftCoordinator {
                 warn!(
                     validator = ?topology_snapshot.local_validator_id(),
                     block_hash = ?block_hash,
-                    qc_height = qc.height.inner(),
+                    qc_height = qc.height().inner(),
                     committed_height = self.committed_height.inner(),
                     pending_blocks_count = self.pending_blocks.len(),
                     "Block not found for commit"
@@ -2365,7 +2365,7 @@ impl BftCoordinator {
         let parent_state_root = self.committed_state_root;
         let parent_block_height = self.committed_height;
 
-        self.record_block_committed(&block, block_hash, qc.weighted_timestamp);
+        self.record_block_committed(&block, block_hash, qc.weighted_timestamp());
         self.record_leader_activity();
 
         actions.push(if state_root_verified {
@@ -2406,8 +2406,8 @@ impl BftCoordinator {
         certified: CertifiedBlock,
     ) -> Vec<Action> {
         if certified.qc().is_genesis() {
-            // The wire decoder enforces `qc.block_hash == block.hash()` on
-            // `CertifiedBlock`, so a genesis QC (qc.block_hash == ZERO) can
+            // The wire decoder enforces `qc.block_hash() == block.hash()` on
+            // `CertifiedBlock`, so a genesis QC (qc.block_hash() == ZERO) can
             // only ride alongside the genesis block itself. The local
             // `block.is_genesis()` guard catches any locally-constructed
             // pair that bypasses the decoder.
@@ -2433,7 +2433,7 @@ impl BftCoordinator {
         if !qc_has_local_quorum_power(topology_snapshot, certified.qc()) {
             warn!(
                 height = certified.block().height().inner(),
-                signers = certified.qc().signers.count(),
+                signers = certified.qc().signers().count(),
                 "Synced block QC lacks quorum power — rejecting"
             );
             return vec![];
@@ -2502,7 +2502,7 @@ impl BftCoordinator {
 
         // Advance committed_height. The QC is the proof of commit — same
         // timing as the consensus path.
-        self.record_block_committed(&block, block_hash, qc.weighted_timestamp);
+        self.record_block_committed(&block, block_hash, qc.weighted_timestamp());
 
         // Track sync progress for the loop iterator.
         self.block_sync.set_sync_applied_height(height);
@@ -2511,7 +2511,7 @@ impl BftCoordinator {
         if self
             .latest_qc
             .as_ref()
-            .is_none_or(|existing| qc.height.inner() > existing.height.inner())
+            .is_none_or(|existing| qc.height().inner() > existing.height().inner())
         {
             self.latest_qc = Some(qc.clone());
             self.maybe_unlock_for_qc(topology_snapshot, &qc);
@@ -2520,7 +2520,7 @@ impl BftCoordinator {
         // Adopt the parent_qc from the block header if it's newer still.
         if !block.header().parent_qc().is_genesis()
             && self.latest_qc.as_ref().is_none_or(|existing| {
-                block.header().parent_qc().height.inner() > existing.height.inner()
+                block.header().parent_qc().height().inner() > existing.height().inner()
             })
         {
             self.latest_qc = Some(block.header().parent_qc().clone());
@@ -2586,7 +2586,7 @@ impl BftCoordinator {
         let height = self
             .latest_qc
             .as_ref()
-            .map_or_else(|| self.committed_height.next(), |qc| qc.height.next());
+            .map_or_else(|| self.committed_height.next(), |qc| qc.height().next());
         let old_round = self.view_change.view;
         self.view_change.advance();
 
@@ -2634,7 +2634,7 @@ impl BftCoordinator {
         let latest_qc_height = self
             .latest_qc
             .as_ref()
-            .map_or(BlockHeight::GENESIS, |qc| qc.height);
+            .map_or(BlockHeight::GENESIS, QuorumCertificate::height);
         if latest_qc_height < height {
             // No QC formed at current height - safe to unlock
             let had_vote = self.votes.unlock_at(height);
@@ -2744,17 +2744,17 @@ impl BftCoordinator {
         // View synchronization: advance our view to match the QC's round.
         // This ensures liveness by keeping nodes in sync with network progress.
         //
-        // We sync to qc.round (not qc.round + 1) because:
+        // We sync to qc.round (not qc.round() + 1) because:
         // - The QC proves consensus succeeded at this round
         // - We should be ready to participate in this round or later
         // - The proposer for the next height will use their current view
         let old_view = self.view_change.view;
-        if self.view_change.sync_to_qc_round(qc.round) {
+        if self.view_change.sync_to_qc_round(qc.round()) {
             info!(
                 validator = ?topology_snapshot.local_validator_id(),
                 old_view = old_view.inner(),
-                new_view = qc.round.inner(),
-                qc_height = qc.height.inner(),
+                new_view = qc.round().inner(),
+                qc_height = qc.height().inner(),
                 "View synchronization: advancing view to match QC"
             );
         }
@@ -2763,7 +2763,7 @@ impl BftCoordinator {
         // This is safe because:
         // 1. Heights < H: consensus has moved past these heights
         // 2. Height = H: if we voted for a different block, it can never get a QC (quorum intersection)
-        let qc_height = qc.height;
+        let qc_height = qc.height();
         let unlocked: Vec<BlockHeight> = self
             .votes
             .voted_heights
@@ -3164,7 +3164,7 @@ impl BftCoordinator {
     pub fn is_current_proposer(&self, topology_snapshot: &TopologySnapshot) -> bool {
         let next_height = self.latest_qc.as_ref().map_or_else(
             || self.committed_height.inner() + 1,
-            |qc| qc.height.inner() + 1,
+            |qc| qc.height().inner() + 1,
         );
         topology_snapshot.should_propose(BlockHeight::new(next_height), self.view_change.view)
     }
@@ -3177,7 +3177,7 @@ impl BftCoordinator {
     pub fn proposal_parent_block_hash(&self) -> BlockHash {
         self.latest_qc
             .as_ref()
-            .map_or(self.committed_hash, |qc| qc.block_hash)
+            .map_or(self.committed_hash, QuorumCertificate::block_hash)
     }
 
     /// Returns the number of transactions in the QC chain above committed height.
@@ -3274,7 +3274,7 @@ impl BftCoordinator {
         let next_height = self
             .latest_qc
             .as_ref()
-            .map_or_else(|| self.committed_height.next(), |qc| qc.height.next());
+            .map_or_else(|| self.committed_height.next(), |qc| qc.height().next());
         let round = self.view_change.view;
 
         topology_snapshot.should_propose(next_height, round)
@@ -3388,16 +3388,16 @@ mod tests {
     }
 
     fn make_test_qc(block_hash: BlockHash, height: BlockHeight) -> QuorumCertificate {
-        QuorumCertificate {
+        QuorumCertificate::new(
             block_hash,
-            shard_group_id: ShardGroupId::new(0),
+            ShardGroupId::new(0),
             height,
-            parent_block_hash: BlockHash::ZERO,
-            round: Round::new(0),
-            signers: SignerBitfield::empty(),
-            aggregated_signature: zero_bls_signature(),
-            weighted_timestamp: WeightedTimestamp::from_millis(100_000),
-        }
+            BlockHash::ZERO,
+            Round::new(0),
+            SignerBitfield::empty(),
+            zero_bls_signature(),
+            WeightedTimestamp::from_millis(100_000),
+        )
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -3418,10 +3418,18 @@ mod tests {
         signers.set(0);
         signers.set(1);
         signers.set(2);
-        let parent_qc = QuorumCertificate {
-            signers,
-            weighted_timestamp: WeightedTimestamp::from_millis(99_000),
-            ..make_test_qc(parent_block_hash, BlockHeight::new(1))
+        let parent_qc = {
+            let __qc = make_test_qc(parent_block_hash, BlockHeight::new(1));
+            QuorumCertificate::new(
+                __qc.block_hash(),
+                __qc.shard_group_id(),
+                __qc.height(),
+                __qc.parent_block_hash(),
+                __qc.round(),
+                signers,
+                __qc.aggregated_signature(),
+                WeightedTimestamp::from_millis(99_000),
+            )
         };
         let header = {
             let __h = make_header_at_height(BlockHeight::new(2), 100_000);
@@ -3479,10 +3487,18 @@ mod tests {
         signers.set(0);
         signers.set(1);
         signers.set(2);
-        let parent_qc = QuorumCertificate {
-            signers,
-            weighted_timestamp: WeightedTimestamp::from_millis(99_000),
-            ..make_test_qc(parent_block_hash, BlockHeight::new(1))
+        let parent_qc = {
+            let __qc = make_test_qc(parent_block_hash, BlockHeight::new(1));
+            QuorumCertificate::new(
+                __qc.block_hash(),
+                __qc.shard_group_id(),
+                __qc.height(),
+                __qc.parent_block_hash(),
+                __qc.round(),
+                signers,
+                __qc.aggregated_signature(),
+                WeightedTimestamp::from_millis(99_000),
+            )
         };
         let header = {
             let __h = make_header_at_height(BlockHeight::new(2), 100_000);
@@ -3518,8 +3534,8 @@ mod tests {
         // latest_qc must still be the pre-header value — adoption is gated
         // on BLS verification, which hasn't happened yet.
         assert_eq!(
-            state.latest_qc.as_ref().map(|q| q.height),
-            prior_latest_qc.as_ref().map(|q| q.height),
+            state.latest_qc.as_ref().map(QuorumCertificate::height),
+            prior_latest_qc.as_ref().map(QuorumCertificate::height),
             "unverified parent_qc must not advance latest_qc"
         );
     }
@@ -3540,10 +3556,18 @@ mod tests {
         signers.set(0);
         signers.set(1);
         signers.set(2);
-        let parent_qc = QuorumCertificate {
-            signers,
-            weighted_timestamp: WeightedTimestamp::from_millis(99_000),
-            ..make_test_qc(parent_block_hash, BlockHeight::new(1))
+        let parent_qc = {
+            let __qc = make_test_qc(parent_block_hash, BlockHeight::new(1));
+            QuorumCertificate::new(
+                __qc.block_hash(),
+                __qc.shard_group_id(),
+                __qc.height(),
+                __qc.parent_block_hash(),
+                __qc.round(),
+                signers,
+                __qc.aggregated_signature(),
+                WeightedTimestamp::from_millis(99_000),
+            )
         };
         let header = {
             let __h = make_header_at_height(BlockHeight::new(2), 100_000);
@@ -3577,14 +3601,14 @@ mod tests {
             |_| None,
         );
         assert_ne!(
-            state.latest_qc.as_ref().map(|q| q.height),
+            state.latest_qc.as_ref().map(QuorumCertificate::height),
             Some(BlockHeight::new(1)),
             "precondition: latest_qc not yet at height 1"
         );
 
         let _ = state.on_qc_signature_verified(&topology, block_hash, true);
         assert_eq!(
-            state.latest_qc.as_ref().map(|q| q.height),
+            state.latest_qc.as_ref().map(QuorumCertificate::height),
             Some(BlockHeight::new(1)),
             "successful verification must trigger the deferred adoption"
         );
@@ -3610,10 +3634,18 @@ mod tests {
         signers.set(0);
         signers.set(1);
         signers.set(2);
-        let parent_qc = QuorumCertificate {
-            signers,
-            weighted_timestamp: WeightedTimestamp::from_millis(99_000),
-            ..make_test_qc(parent_block_hash, BlockHeight::new(1))
+        let parent_qc = {
+            let __qc = make_test_qc(parent_block_hash, BlockHeight::new(1));
+            QuorumCertificate::new(
+                __qc.block_hash(),
+                __qc.shard_group_id(),
+                __qc.height(),
+                __qc.parent_block_hash(),
+                __qc.round(),
+                signers,
+                __qc.aggregated_signature(),
+                WeightedTimestamp::from_millis(99_000),
+            )
         };
         let header = {
             let __h = make_header_at_height(BlockHeight::new(2), 100_000);
@@ -3678,10 +3710,18 @@ mod tests {
         signers.set(0);
         signers.set(1);
         signers.set(2);
-        let parent_qc = QuorumCertificate {
-            signers,
-            weighted_timestamp: WeightedTimestamp::from_millis(99_000),
-            ..make_test_qc(parent_block_hash, BlockHeight::new(1))
+        let parent_qc = {
+            let __qc = make_test_qc(parent_block_hash, BlockHeight::new(1));
+            QuorumCertificate::new(
+                __qc.block_hash(),
+                __qc.shard_group_id(),
+                __qc.height(),
+                __qc.parent_block_hash(),
+                __qc.round(),
+                signers,
+                __qc.aggregated_signature(),
+                WeightedTimestamp::from_millis(99_000),
+            )
         };
         let header = {
             let __h = make_header_at_height(BlockHeight::new(2), 100_000);
@@ -3815,11 +3855,20 @@ mod tests {
             );
         }
 
-        let qc = QuorumCertificate {
-            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            ..make_test_qc(
+        let qc = {
+            let __qc = make_test_qc(
                 BlockHash::from_raw(Hash::from_bytes(b"qc_block")),
                 BlockHeight::new(2),
+            );
+            QuorumCertificate::new(
+                __qc.block_hash(),
+                __qc.shard_group_id(),
+                __qc.height(),
+                BlockHash::from_raw(Hash::from_bytes(b"parent")),
+                __qc.round(),
+                __qc.signers().clone(),
+                __qc.aggregated_signature(),
+                __qc.weighted_timestamp(),
             )
         };
         state.maybe_unlock_for_qc(&topology, &qc);
@@ -4110,7 +4159,7 @@ mod tests {
     #[test]
     fn test_view_change_does_not_unlock_lower_heights() {
         // advance_round only unlocks at the height we're now proposing for
-        // (latest_qc.height + 1). Vote locks at lower heights are left for
+        // (latest_qc.height() + 1). Vote locks at lower heights are left for
         // cleanup_committed to remove on commit.
         let (mut state, topology) = make_test_state();
         state.set_time(LocalTimestamp::from_millis(100_000));
@@ -4148,9 +4197,18 @@ mod tests {
             .votes
             .voted_heights
             .insert(height, (block_a, Round::new(0)));
-        let qc = QuorumCertificate {
-            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            ..make_test_qc(block_b, height)
+        let qc = {
+            let __qc = make_test_qc(block_b, height);
+            QuorumCertificate::new(
+                __qc.block_hash(),
+                __qc.shard_group_id(),
+                __qc.height(),
+                BlockHash::from_raw(Hash::from_bytes(b"parent")),
+                __qc.round(),
+                __qc.signers().clone(),
+                __qc.aggregated_signature(),
+                __qc.weighted_timestamp(),
+            )
         };
         state.maybe_unlock_for_qc(&topology, &qc);
 
@@ -4170,9 +4228,18 @@ mod tests {
 
         let block_3_hash = BlockHash::from_raw(Hash::from_bytes(b"block_3"));
 
-        let qc = QuorumCertificate {
-            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"block_2")),
-            ..make_test_qc(block_3_hash, BlockHeight::new(3))
+        let qc = {
+            let __qc = make_test_qc(block_3_hash, BlockHeight::new(3));
+            QuorumCertificate::new(
+                __qc.block_hash(),
+                __qc.shard_group_id(),
+                __qc.height(),
+                BlockHash::from_raw(Hash::from_bytes(b"block_2")),
+                __qc.round(),
+                __qc.signers().clone(),
+                __qc.aggregated_signature(),
+                __qc.weighted_timestamp(),
+            )
         };
 
         let actions = state.on_qc_formed(&topology, block_3_hash, &qc, &[], vec![], vec![]);
@@ -4266,10 +4333,18 @@ mod tests {
         signers.set(0);
         signers.set(1);
         signers.set(2);
-        let parent_qc = QuorumCertificate {
-            signers,
-            weighted_timestamp: WeightedTimestamp::from_millis(99_000),
-            ..make_test_qc(parent_block_hash, BlockHeight::new(1))
+        let parent_qc = {
+            let __qc = make_test_qc(parent_block_hash, BlockHeight::new(1));
+            QuorumCertificate::new(
+                __qc.block_hash(),
+                __qc.shard_group_id(),
+                __qc.height(),
+                __qc.parent_block_hash(),
+                __qc.round(),
+                signers,
+                __qc.aggregated_signature(),
+                WeightedTimestamp::from_millis(99_000),
+            )
         };
 
         let header1 = {
@@ -4367,10 +4442,18 @@ mod tests {
         signers.set(0);
         signers.set(1);
         signers.set(2);
-        let honest_qc = QuorumCertificate {
-            signers: signers.clone(),
-            weighted_timestamp: WeightedTimestamp::from_millis(99_000),
-            ..make_test_qc(parent_block_hash, BlockHeight::new(1))
+        let honest_qc = {
+            let __qc = make_test_qc(parent_block_hash, BlockHeight::new(1));
+            QuorumCertificate::new(
+                __qc.block_hash(),
+                __qc.shard_group_id(),
+                __qc.height(),
+                __qc.parent_block_hash(),
+                __qc.round(),
+                signers.clone(),
+                __qc.aggregated_signature(),
+                WeightedTimestamp::from_millis(99_000),
+            )
         };
 
         // Cache the honest QC as if it had been verified.
@@ -4381,9 +4464,18 @@ mod tests {
         // but mutates fields outside the cache key, e.g. the weighted timestamp —
         // the cache must bind every signed field, otherwise a hit would skip
         // re-verifying a forged signature.
-        let forged_qc = QuorumCertificate {
-            weighted_timestamp: WeightedTimestamp::from_millis(123_456_789),
-            ..honest_qc
+        let forged_qc = {
+            let __qc = honest_qc;
+            QuorumCertificate::new(
+                __qc.block_hash(),
+                __qc.shard_group_id(),
+                __qc.height(),
+                __qc.parent_block_hash(),
+                __qc.round(),
+                __qc.signers().clone(),
+                __qc.aggregated_signature(),
+                WeightedTimestamp::from_millis(123_456_789),
+            )
         };
         let forged_header = {
             let __h = make_header_at_height(BlockHeight::new(2), 100_000);
@@ -4429,7 +4521,7 @@ mod tests {
         // weighted_timestamp on the cache-hit path.
         assert!(
             state.latest_qc.as_ref().is_none_or(
-                |qc| qc.weighted_timestamp != forged_header.parent_qc().weighted_timestamp
+                |qc| qc.weighted_timestamp() != forged_header.parent_qc().weighted_timestamp()
             ),
             "forged QC must not be adopted as latest_qc on cache hit"
         );
@@ -4460,11 +4552,20 @@ mod tests {
         state.verification.on_block_persisted(BlockHeight::new(3));
 
         // Validator 0 proposes for height 4 since (4+0)%4 = 0.
-        state.latest_qc = Some(QuorumCertificate {
-            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"block_2")),
-            ..make_test_qc(
+        state.latest_qc = Some({
+            let __qc = make_test_qc(
                 BlockHash::from_raw(Hash::from_bytes(b"block_3")),
                 BlockHeight::new(3),
+            );
+            QuorumCertificate::new(
+                __qc.block_hash(),
+                __qc.shard_group_id(),
+                __qc.height(),
+                BlockHash::from_raw(Hash::from_bytes(b"block_2")),
+                __qc.round(),
+                __qc.signers().clone(),
+                __qc.aggregated_signature(),
+                __qc.weighted_timestamp(),
             )
         });
 
@@ -4504,12 +4605,20 @@ mod tests {
         state.verification.on_block_persisted(BlockHeight::new(3));
 
         let old_timestamp = 1000u64;
-        state.latest_qc = Some(QuorumCertificate {
-            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"block_2")),
-            weighted_timestamp: WeightedTimestamp::from_millis(old_timestamp),
-            ..make_test_qc(
+        state.latest_qc = Some({
+            let __qc = make_test_qc(
                 BlockHash::from_raw(Hash::from_bytes(b"block_3")),
                 BlockHeight::new(3),
+            );
+            QuorumCertificate::new(
+                __qc.block_hash(),
+                __qc.shard_group_id(),
+                __qc.height(),
+                BlockHash::from_raw(Hash::from_bytes(b"block_2")),
+                __qc.round(),
+                __qc.signers().clone(),
+                __qc.aggregated_signature(),
+                WeightedTimestamp::from_millis(old_timestamp),
             )
         });
         state.set_block_syncing(&topology, true);
@@ -4629,12 +4738,20 @@ mod tests {
         state.set_time(LocalTimestamp::from_millis(100_000));
         assert!(!state.is_block_syncing());
 
-        state.latest_qc = Some(QuorumCertificate {
-            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"block_4")),
-            weighted_timestamp: WeightedTimestamp::from_millis(1000),
-            ..make_test_qc(
+        state.latest_qc = Some({
+            let __qc = make_test_qc(
                 BlockHash::from_raw(Hash::from_bytes(b"block_5")),
                 BlockHeight::new(5),
+            );
+            QuorumCertificate::new(
+                __qc.block_hash(),
+                __qc.shard_group_id(),
+                __qc.height(),
+                BlockHash::from_raw(Hash::from_bytes(b"block_4")),
+                __qc.round(),
+                __qc.signers().clone(),
+                __qc.aggregated_signature(),
+                WeightedTimestamp::from_millis(1000),
             )
         });
         let actions = state.check_sync_health(&topology);
@@ -4684,10 +4801,18 @@ mod tests {
         };
         let mut sub_quorum_signers = SignerBitfield::new(4);
         sub_quorum_signers.set(0); // single signer — far below 2f+1 = 3
-        let qc = QuorumCertificate {
-            signers: sub_quorum_signers,
-            weighted_timestamp: WeightedTimestamp::from_millis(1000),
-            ..make_test_qc(block.hash(), BlockHeight::new(1))
+        let qc = {
+            let __qc = make_test_qc(block.hash(), BlockHeight::new(1));
+            QuorumCertificate::new(
+                __qc.block_hash(),
+                __qc.shard_group_id(),
+                __qc.height(),
+                __qc.parent_block_hash(),
+                __qc.round(),
+                sub_quorum_signers,
+                __qc.aggregated_signature(),
+                WeightedTimestamp::from_millis(1000),
+            )
         };
         let certified = CertifiedBlock::new_unchecked(block, qc);
 
@@ -4738,9 +4863,18 @@ mod tests {
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),
         };
-        let qc = QuorumCertificate {
-            weighted_timestamp: WeightedTimestamp::from_millis(1000),
-            ..make_test_qc(block.hash(), BlockHeight::new(1))
+        let qc = {
+            let __qc = make_test_qc(block.hash(), BlockHeight::new(1));
+            QuorumCertificate::new(
+                __qc.block_hash(),
+                __qc.shard_group_id(),
+                __qc.height(),
+                __qc.parent_block_hash(),
+                __qc.round(),
+                __qc.signers().clone(),
+                __qc.aggregated_signature(),
+                WeightedTimestamp::from_millis(1000),
+            )
         };
         let certified = CertifiedBlock::new_unchecked(block, qc);
 
@@ -4757,11 +4891,20 @@ mod tests {
         state.set_time(LocalTimestamp::from_millis(100_000));
         state.view_change.last_leader_activity = Some(LocalTimestamp::ZERO);
 
-        state.latest_qc = Some(QuorumCertificate {
-            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"block_2")),
-            ..make_test_qc(
+        state.latest_qc = Some({
+            let __qc = make_test_qc(
                 BlockHash::from_raw(Hash::from_bytes(b"block_3")),
                 BlockHeight::new(3),
+            );
+            QuorumCertificate::new(
+                __qc.block_hash(),
+                __qc.shard_group_id(),
+                __qc.height(),
+                BlockHash::from_raw(Hash::from_bytes(b"block_2")),
+                __qc.round(),
+                __qc.signers().clone(),
+                __qc.aggregated_signature(),
+                __qc.weighted_timestamp(),
             )
         });
         state.set_block_syncing(&topology, true);
@@ -4783,12 +4926,20 @@ mod tests {
         state.verification.on_block_persisted(BlockHeight::new(3));
 
         let parent_timestamp = 50_000u64;
-        state.latest_qc = Some(QuorumCertificate {
-            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"block_2")),
-            weighted_timestamp: WeightedTimestamp::from_millis(parent_timestamp),
-            ..make_test_qc(
+        state.latest_qc = Some({
+            let __qc = make_test_qc(
                 BlockHash::from_raw(Hash::from_bytes(b"block_3")),
                 BlockHeight::new(3),
+            );
+            QuorumCertificate::new(
+                __qc.block_hash(),
+                __qc.shard_group_id(),
+                __qc.height(),
+                BlockHash::from_raw(Hash::from_bytes(b"block_2")),
+                __qc.round(),
+                __qc.signers().clone(),
+                __qc.aggregated_signature(),
+                WeightedTimestamp::from_millis(parent_timestamp),
             )
         });
 
@@ -4838,11 +4989,20 @@ mod tests {
         state.committed_height = BlockHeight::new(3);
         state.verification.on_block_persisted(BlockHeight::new(3));
 
-        state.latest_qc = Some(QuorumCertificate {
-            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"block_2")),
-            ..make_test_qc(
+        state.latest_qc = Some({
+            let __qc = make_test_qc(
                 BlockHash::from_raw(Hash::from_bytes(b"block_3")),
                 BlockHeight::new(3),
+            );
+            QuorumCertificate::new(
+                __qc.block_hash(),
+                __qc.shard_group_id(),
+                __qc.height(),
+                BlockHash::from_raw(Hash::from_bytes(b"block_2")),
+                __qc.round(),
+                __qc.signers().clone(),
+                __qc.aggregated_signature(),
+                __qc.weighted_timestamp(),
             )
         });
         state.set_block_syncing(&topology, true);

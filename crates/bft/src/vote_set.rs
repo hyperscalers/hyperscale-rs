@@ -83,7 +83,7 @@ impl VoteSet {
                     Some(h.height()),
                     Some(h.round()),
                     Some(h.parent_block_hash()),
-                    Some(h.parent_qc().weighted_timestamp),
+                    Some(h.parent_qc().weighted_timestamp()),
                 )
             });
 
@@ -145,7 +145,7 @@ impl VoteSet {
             self.parent_block_hash = Some(header.parent_block_hash());
         }
         if self.parent_weighted_timestamp.is_none() {
-            self.parent_weighted_timestamp = Some(header.parent_qc().weighted_timestamp);
+            self.parent_weighted_timestamp = Some(header.parent_qc().weighted_timestamp());
         }
         if self.block_hash.is_none() {
             self.block_hash = Some(header.hash());
@@ -409,16 +409,16 @@ mod test_helpers {
 
             self.qc_built = true;
 
-            Ok(QuorumCertificate {
+            Ok(QuorumCertificate::new(
                 block_hash,
                 shard_group_id,
                 height,
                 parent_block_hash,
                 round,
-                aggregated_signature,
                 signers,
-                weighted_timestamp: WeightedTimestamp::from_millis(weighted_timestamp_ms),
-            })
+                aggregated_signature,
+                WeightedTimestamp::from_millis(weighted_timestamp_ms),
+            ))
         }
     }
 }
@@ -547,9 +547,9 @@ mod tests {
 
         // Build QC
         let qc = vote_set.build_qc(block_hash, test_shard_group()).unwrap();
-        assert_eq!(qc.block_hash, block_hash);
-        assert_eq!(qc.height.inner(), 1);
-        assert_eq!(qc.signers.count(), 3);
+        assert_eq!(qc.block_hash(), block_hash);
+        assert_eq!(qc.height().inner(), 1);
+        assert_eq!(qc.signers().count(), 3);
 
         // Can't build again
         assert!(vote_set.build_qc(block_hash, test_shard_group()).is_err());

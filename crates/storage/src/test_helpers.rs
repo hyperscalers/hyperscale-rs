@@ -140,16 +140,16 @@ pub fn make_test_block(height: BlockHeight) -> Block {
 /// Build a `QuorumCertificate` that references the given block.
 #[must_use]
 pub fn make_test_qc(block: &Block) -> QuorumCertificate {
-    QuorumCertificate {
-        block_hash: block.hash(),
-        shard_group_id: ShardGroupId::new(0),
-        height: block.height(),
-        parent_block_hash: block.header().parent_block_hash(),
-        round: Round::INITIAL,
-        aggregated_signature: zero_bls_signature(),
-        signers: SignerBitfield::new(4),
-        weighted_timestamp: WeightedTimestamp::from_millis(block.header().timestamp().as_millis()),
-    }
+    QuorumCertificate::new(
+        block.hash(),
+        ShardGroupId::new(0),
+        block.height(),
+        block.header().parent_block_hash(),
+        Round::INITIAL,
+        SignerBitfield::new(4),
+        zero_bls_signature(),
+        WeightedTimestamp::from_millis(block.header().timestamp().as_millis()),
+    )
 }
 
 /// Build a deterministic locally-executed `StoredReceipt` from `seed`

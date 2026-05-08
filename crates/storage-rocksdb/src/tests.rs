@@ -223,7 +223,7 @@ fn test_block_storage_and_retrieval() {
         stored.block().header().timestamp(),
         ProposerTimestamp::from_millis(1_000)
     );
-    assert_eq!(stored.qc().block_hash, block.hash());
+    assert_eq!(stored.qc().block_hash(), block.hash());
 }
 
 #[test]
@@ -254,16 +254,16 @@ fn test_recovery_with_qc() {
 
     {
         let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
-        let qc = QuorumCertificate {
-            block_hash: expected_hash,
-            shard_group_id: ShardGroupId::new(0),
-            height: BlockHeight::new(100),
-            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(&[98; 32])),
-            round: Round::new(5),
-            aggregated_signature: zero_bls_signature(),
-            signers: SignerBitfield::new(4),
-            weighted_timestamp: WeightedTimestamp::from_millis(100_000),
-        };
+        let qc = QuorumCertificate::new(
+            expected_hash,
+            ShardGroupId::new(0),
+            BlockHeight::new(100),
+            BlockHash::from_raw(Hash::from_bytes(&[98; 32])),
+            Round::new(5),
+            SignerBitfield::new(4),
+            zero_bls_signature(),
+            WeightedTimestamp::from_millis(100_000),
+        );
         storage.set_chain_metadata(BlockHeight::new(100), Some(expected_raw), Some(&qc));
     }
 
@@ -276,9 +276,9 @@ fn test_recovery_with_qc() {
         assert!(recovered.latest_qc.is_some());
 
         let qc = recovered.latest_qc.unwrap();
-        assert_eq!(qc.height, BlockHeight::new(100));
-        assert_eq!(qc.round, Round::new(5));
-        assert_eq!(qc.block_hash, expected_hash);
+        assert_eq!(qc.height(), BlockHeight::new(100));
+        assert_eq!(qc.round(), Round::new(5));
+        assert_eq!(qc.block_hash(), expected_hash);
     }
 }
 
@@ -789,7 +789,7 @@ fn test_blocks_survive_reopen() {
             .get_block(BlockHeight::new(1))
             .expect("block should survive reopen");
         assert_eq!(stored.block().height(), BlockHeight::new(1));
-        assert_eq!(stored.qc().height, BlockHeight::new(1));
+        assert_eq!(stored.qc().height(), BlockHeight::new(1));
     }
 }
 

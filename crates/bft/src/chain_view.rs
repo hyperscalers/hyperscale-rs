@@ -108,7 +108,7 @@ impl<'a> ChainView<'a> {
                     QuorumCertificate::genesis(self.local_shard),
                 )
             },
-            |qc| (qc.block_hash, qc.clone()),
+            |qc| (qc.block_hash(), qc.clone()),
         )
     }
 
@@ -174,8 +174,8 @@ mod tests {
 
     use hyperscale_types::{
         BlockManifest, BoundedVec, CertificateRoot, Hash, LocalReceiptRoot, LocalTimestamp,
-        ProposerTimestamp, ProvisionsRoot, Round, ShardGroupId, TransactionRoot, ValidatorId,
-        WeightedTimestamp,
+        ProposerTimestamp, ProvisionsRoot, Round, ShardGroupId, SignerBitfield, TransactionRoot,
+        ValidatorId, WeightedTimestamp, zero_bls_signature,
     };
 
     use super::*;
@@ -362,10 +362,16 @@ mod tests {
     #[test]
     fn proposal_parent_returns_latest_qc_when_present() {
         let qc_block = bh(b"qc_block");
-        let mut qc = QuorumCertificate::genesis(ShardGroupId::new(0));
-        qc.block_hash = qc_block;
-        qc.height = BlockHeight::new(5);
-        qc.weighted_timestamp = WeightedTimestamp::from_millis(1000);
+        let qc = QuorumCertificate::new(
+            qc_block,
+            ShardGroupId::new(0),
+            BlockHeight::new(5),
+            BlockHash::ZERO,
+            Round::INITIAL,
+            SignerBitfield::empty(),
+            zero_bls_signature(),
+            WeightedTimestamp::from_millis(1000),
+        );
 
         run_view(
             0,
@@ -376,7 +382,7 @@ mod tests {
             |view| {
                 let (hash, returned_qc) = view.proposal_parent();
                 assert_eq!(hash, qc_block);
-                assert_eq!(returned_qc.height, BlockHeight::new(5));
+                assert_eq!(returned_qc.height(), BlockHeight::new(5));
             },
         );
     }

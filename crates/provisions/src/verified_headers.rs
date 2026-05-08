@@ -60,8 +60,8 @@ impl VerifiedHeaderBuffer {
 mod tests {
     use hyperscale_types::{
         BlockHash, BlockHeader, CertificateRoot, InFlightCount, LocalReceiptRoot,
-        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, StateRoot, TransactionRoot,
-        ValidatorId,
+        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, SignerBitfield, StateRoot,
+        TransactionRoot, ValidatorId, WeightedTimestamp, zero_bls_signature,
     };
 
     use super::*;
@@ -86,10 +86,16 @@ mod tests {
             InFlightCount::ZERO,
         );
         let header_hash = header.hash();
-        let mut qc = QuorumCertificate::genesis(ShardGroupId::new(0));
-        qc.block_hash = header_hash;
-        qc.shard_group_id = shard;
-        qc.height = height;
+        let qc = QuorumCertificate::new(
+            header_hash,
+            shard,
+            height,
+            BlockHash::ZERO,
+            Round::INITIAL,
+            SignerBitfield::empty(),
+            zero_bls_signature(),
+            WeightedTimestamp::ZERO,
+        );
         Arc::new(CommittedBlockHeader::new(header, qc))
     }
 

@@ -203,16 +203,16 @@ pub fn build_qc_from_verified(
         u64::try_from(timestamp_weight_sum / u128::from(verified_power.inner())).unwrap_or(u64::MAX)
     };
 
-    Some(QuorumCertificate {
+    Some(QuorumCertificate::new(
         block_hash,
         shard_group_id,
         height,
         parent_block_hash,
         round,
-        aggregated_signature,
         signers,
-        weighted_timestamp: WeightedTimestamp::from_millis(weighted_timestamp_ms),
-    })
+        aggregated_signature,
+        WeightedTimestamp::from_millis(weighted_timestamp_ms),
+    ))
 }
 
 /// Verify a quorum certificate's aggregated BLS signature.
@@ -226,7 +226,7 @@ pub fn verify_qc_signature(qc: &QuorumCertificate, public_keys: &[Bls12381G1Publ
     let signer_keys: Vec<_> = public_keys
         .iter()
         .enumerate()
-        .filter(|(i, _)| qc.signers.is_set(*i))
+        .filter(|(i, _)| qc.signers().is_set(*i))
         .map(|(_, pk)| *pk)
         .collect();
 
@@ -237,7 +237,7 @@ pub fn verify_qc_signature(qc: &QuorumCertificate, public_keys: &[Bls12381G1Publ
 
     // Aggregate the public keys and verify (skip PK validation - trusted topology)
     Bls12381G1PublicKey::aggregate(&signer_keys, false).is_ok_and(|aggregated_pk| {
-        verify_bls12381_v1(&signing_message, &aggregated_pk, &qc.aggregated_signature)
+        verify_bls12381_v1(&signing_message, &aggregated_pk, &qc.aggregated_signature())
     })
 }
 
@@ -624,12 +624,12 @@ where
             let valid = if qc_valid {
                 let total_power: VotePower = committed_header
                     .qc()
-                    .signers
+                    .signers()
                     .set_indices()
                     .filter_map(|idx| committee_voting_power.get(idx).copied())
                     .sum();
                 total_power >= quorum_threshold
-                    && committed_header.qc().block_hash == committed_header.header().hash()
+                    && committed_header.qc().block_hash() == committed_header.header().hash()
             } else {
                 false
             };
@@ -1102,9 +1102,9 @@ mod tests {
 
         let pubs: Vec<_> = keys.iter().map(Bls12381G1PrivateKey::public_key).collect();
         assert!(verify_qc_signature(&qc, &pubs));
-        assert_eq!(qc.block_hash, block_hash);
-        assert_eq!(qc.height, height);
-        assert_eq!(qc.parent_block_hash, parent);
+        assert_eq!(qc.block_hash(), block_hash);
+        assert_eq!(qc.height(), height);
+        assert_eq!(qc.parent_block_hash(), parent);
         assert_eq!(qc.signer_count(), 3);
     }
 
@@ -1138,7 +1138,7 @@ mod tests {
         )
         .unwrap();
 
-        let set: Vec<_> = qc.signers.set_indices().collect();
+        let set: Vec<_> = qc.signers().set_indices().collect();
         assert_eq!(set, vec![0, 2, 3]);
     }
 
@@ -1197,7 +1197,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(qc.weighted_timestamp.as_millis(), 2333);
+        assert_eq!(qc.weighted_timestamp().as_millis(), 2333);
     }
 
     #[test]
@@ -1259,8 +1259,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(qc.weighted_timestamp.as_millis(), 2333);
-        assert!(qc.weighted_timestamp.as_millis() >= parent_floor.as_millis());
+        assert_eq!(qc.weighted_timestamp().as_millis(), 2333);
+        assert!(qc.weighted_timestamp().as_millis() >= parent_floor.as_millis());
     }
 
     // ─── verify_and_build_qc (composition) ──────────────────────────────
@@ -1345,7 +1345,7 @@ mod tests {
                 (i, vote, VotePower::new(1))
             })
             .collect();
-        let mut qc = build_qc_from_verified(
+        let qc = build_qc_from_verified(
             block_hash,
             shard(),
             BlockHeight::new(1),
@@ -1355,7 +1355,16 @@ mod tests {
             &verified,
         )
         .unwrap();
-        qc.signers = SignerBitfield::new(3);
+        let qc = QuorumCertificate::new(
+            qc.block_hash(),
+            qc.shard_group_id(),
+            qc.height(),
+            qc.parent_block_hash(),
+            qc.round(),
+            SignerBitfield::new(3),
+            qc.aggregated_signature(),
+            qc.weighted_timestamp(),
+        );
 
         let pubs: Vec<_> = keys.iter().map(Bls12381G1PrivateKey::public_key).collect();
         assert!(!verify_qc_signature(&qc, &pubs));

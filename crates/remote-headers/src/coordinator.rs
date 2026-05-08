@@ -177,7 +177,7 @@ impl RemoteHeaderCoordinator {
 
         // Structural pre-check: certifying QC must match header hash.
         let header_hash = committed_header.header().hash();
-        if committed_header.qc().block_hash != header_hash {
+        if committed_header.qc().block_hash() != header_hash {
             warn!(
                 shard = shard.inner(),
                 height = height.inner(),
@@ -188,12 +188,12 @@ impl RemoteHeaderCoordinator {
         }
 
         // Structural pre-check: QC shard must match header shard.
-        if committed_header.qc().shard_group_id != shard {
+        if committed_header.qc().shard_group_id() != shard {
             warn!(
                 shard = shard.inner(),
                 height = height.inner(),
                 sender = sender.inner(),
-                qc_shard = committed_header.qc().shard_group_id.inner(),
+                qc_shard = committed_header.qc().shard_group_id().inner(),
                 "Rejected remote header: QC shard_group_id does not match header shard"
             );
             return vec![];
@@ -224,7 +224,7 @@ impl RemoteHeaderCoordinator {
         sender_map.insert(sender, Arc::clone(&committed_header));
 
         // Update tip and prune old entries.
-        let header_ts = committed_header.qc().weighted_timestamp;
+        let header_ts = committed_header.qc().weighted_timestamp();
         self.update_tip_and_prune(shard, height, header_ts);
 
         if first_for_key {
@@ -323,7 +323,7 @@ impl RemoteHeaderCoordinator {
         topology: &TopologySnapshot,
         certified: &CertifiedBlock,
     ) -> Vec<Action> {
-        let new_ts = certified.qc().weighted_timestamp;
+        let new_ts = certified.qc().weighted_timestamp();
         let first_commit = self.local_committed_ts == WeightedTimestamp::ZERO;
         self.local_committed_height = certified.block().height();
         self.local_committed_ts = new_ts;
@@ -507,7 +507,7 @@ impl RemoteHeaderCoordinator {
             let cutoff = tip_ts.minus(REMOTE_HEADER_RETENTION);
             if cutoff > WeightedTimestamp::ZERO {
                 self.verified
-                    .retain(|&(s, _), hdr| s != shard || hdr.qc().weighted_timestamp >= cutoff);
+                    .retain(|&(s, _), hdr| s != shard || hdr.qc().weighted_timestamp() >= cutoff);
             }
         }
     }
@@ -536,10 +536,10 @@ impl RemoteHeaderCoordinator {
                 s != shard
                     || sender_map
                         .values()
-                        .any(|h| h.qc().weighted_timestamp >= cutoff)
+                        .any(|h| h.qc().weighted_timestamp() >= cutoff)
             });
             self.verified
-                .retain(|&(s, _), hdr| s != shard || hdr.qc().weighted_timestamp >= cutoff);
+                .retain(|&(s, _), hdr| s != shard || hdr.qc().weighted_timestamp() >= cutoff);
         }
     }
 
@@ -584,8 +584,8 @@ impl RemoteHeaderCoordinator {
 mod tests {
     use hyperscale_types::{
         BlockHash, BlockHeader, CertificateRoot, Hash, InFlightCount, LocalReceiptRoot,
-        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, StateRoot,
-        TransactionRoot, ValidatorId,
+        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, SignerBitfield,
+        StateRoot, TransactionRoot, ValidatorId, zero_bls_signature,
     };
 
     use super::*;
@@ -623,11 +623,17 @@ mod tests {
             std::collections::BTreeMap::new(),
             InFlightCount::ZERO,
         );
-        let mut qc = QuorumCertificate::genesis(ShardGroupId::new(0));
         // Deliberately set wrong block_hash
-        qc.block_hash = BlockHash::from_raw(Hash::from_bytes(b"wrong"));
-        qc.shard_group_id = ShardGroupId::new(2);
-        qc.height = BlockHeight::new(5);
+        let qc = QuorumCertificate::new(
+            BlockHash::from_raw(Hash::from_bytes(b"wrong")),
+            ShardGroupId::new(2),
+            BlockHeight::new(5),
+            BlockHash::ZERO,
+            Round::INITIAL,
+            SignerBitfield::empty(),
+            zero_bls_signature(),
+            WeightedTimestamp::ZERO,
+        );
 
         let committed = CommittedBlockHeader::new(header, qc);
         let _coord = RemoteHeaderCoordinator::new();
@@ -635,7 +641,7 @@ mod tests {
         // The structural check happens inside on_remote_header_received which
         // needs a topology. We test the logic directly here by checking the
         // condition that would cause rejection.
-        assert_ne!(committed.qc().block_hash, committed.header().hash());
+        assert_ne!(committed.qc().block_hash(), committed.header().hash());
     }
 
     #[test]

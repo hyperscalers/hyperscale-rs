@@ -252,10 +252,18 @@ pub fn make_live_block(
 /// `0` when retention-window behavior doesn't matter.
 #[must_use]
 pub fn certify(block: Block, weighted_timestamp_ms: u64) -> CertifiedBlock {
-    let qc = QuorumCertificate {
-        block_hash: block.hash(),
-        weighted_timestamp: WeightedTimestamp::from_millis(weighted_timestamp_ms),
-        ..QuorumCertificate::genesis(ShardGroupId::new(0))
+    let qc = {
+        let __qc = QuorumCertificate::genesis(ShardGroupId::new(0));
+        QuorumCertificate::new(
+            block.hash(),
+            __qc.shard_group_id(),
+            __qc.height(),
+            __qc.parent_block_hash(),
+            __qc.round(),
+            __qc.signers().clone(),
+            __qc.aggregated_signature(),
+            WeightedTimestamp::from_millis(weighted_timestamp_ms),
+        )
     };
     CertifiedBlock::new_unchecked(block, qc)
 }

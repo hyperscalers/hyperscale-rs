@@ -342,7 +342,7 @@ fn test_block_storage_and_retrieval() {
         stored.block().header().timestamp(),
         ProposerTimestamp::from_millis(1_000)
     );
-    assert_eq!(stored.qc().block_hash, block.hash());
+    assert_eq!(stored.qc().block_hash(), block.hash());
 }
 
 #[test]

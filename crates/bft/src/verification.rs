@@ -271,8 +271,8 @@ impl VerificationPipeline {
 
     /// Cache a verified QC to skip future re-verification.
     pub fn cache_verified_qc(&mut self, qc: QuorumCertificate) {
-        let qc_block_hash = qc.block_hash;
-        let qc_height = qc.height;
+        let qc_block_hash = qc.block_hash();
+        let qc_height = qc.height();
         self.verified_qcs.insert(qc_block_hash, qc);
         trace!(
             qc_block_hash = ?qc_block_hash,
@@ -636,7 +636,7 @@ impl VerificationPipeline {
             block_hash,
             expected_root: block.header().transaction_root(),
             transactions: block.transactions().clone(),
-            validity_anchor: block.header().parent_qc().weighted_timestamp,
+            validity_anchor: block.header().parent_qc().weighted_timestamp(),
         }]
     }
 
@@ -722,7 +722,7 @@ impl VerificationPipeline {
         let h = block.header();
 
         if self.needs_state_root_verification(block) {
-            let parent_block_height = h.parent_qc().height;
+            let parent_block_height = h.parent_qc().height();
             self.initiate_state_root_verification(block_hash, block, parent_block_height);
         }
 
@@ -1103,7 +1103,7 @@ impl VerificationPipeline {
         // committed_height covers view-change scenarios where multiple proposals
         // at the same height reference the same parent QC.
         self.verified_qcs
-            .retain(|_, qc| qc.height > committed_height.saturating_sub(2));
+            .retain(|_, qc| qc.height() > committed_height.saturating_sub(2));
     }
 
     /// Number of pending QC verifications.
@@ -1130,7 +1130,8 @@ mod tests {
 
     use hyperscale_types::{
         BoundedVec, CertificateRoot, Hash, LocalReceiptRoot, LocalTimestamp, ProposerTimestamp,
-        QuorumCertificate, Round, RoutableTransaction, ShardGroupId, TransactionRoot, ValidatorId,
+        QuorumCertificate, Round, RoutableTransaction, ShardGroupId, SignerBitfield,
+        TransactionRoot, ValidatorId, WeightedTimestamp, zero_bls_signature,
     };
 
     use super::*;
@@ -1237,9 +1238,16 @@ mod tests {
         // effectively pruned, so we skip voting but still keep verifying.
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
         let parent = bh(b"parent");
-        let mut parent_qc = QuorumCertificate::genesis(ShardGroupId::new(0));
-        parent_qc.height = BlockHeight::new(4);
-        parent_qc.block_hash = parent;
+        let parent_qc = QuorumCertificate::new(
+            parent,
+            ShardGroupId::new(0),
+            BlockHeight::new(4),
+            BlockHash::ZERO,
+            Round::INITIAL,
+            SignerBitfield::empty(),
+            zero_bls_signature(),
+            WeightedTimestamp::ZERO,
+        );
         let h = header_with_parent_qc(BlockHeight::new(5), parent, 0, parent_qc);
         let block = Block::Live {
             header: h,

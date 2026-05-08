@@ -1321,7 +1321,7 @@ impl ExecutionCoordinator {
         let first_commit = self.committed_ts == WeightedTimestamp::ZERO;
         if height > self.committed_height {
             self.committed_height = height;
-            self.committed_ts = certified.qc().weighted_timestamp;
+            self.committed_ts = certified.qc().weighted_timestamp();
         }
         self.provisioning.advance_clock(self.committed_ts);
 
@@ -2049,8 +2049,8 @@ mod tests {
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
         Bls12381G1PrivateKey, ConsensusReceipt, ExecutionOutcome, GlobalReceiptHash, Hash,
-        SignerBitfield, ValidatorInfo, ValidatorSet, VotePower, generate_bls_keypair,
-        zero_bls_signature,
+        QuorumCertificate, SignerBitfield, ValidatorInfo, ValidatorSet, VotePower,
+        generate_bls_keypair, zero_bls_signature,
     };
 
     use super::*;
@@ -3173,8 +3173,17 @@ mod tests {
             ValidatorId::new(0),
             vec![],
         );
-        let (block, mut qc) = certify(block).into_parts();
-        qc.weighted_timestamp = WeightedTimestamp::from_millis(30_000);
+        let (block, qc) = certify(block).into_parts();
+        let qc = QuorumCertificate::new(
+            qc.block_hash(),
+            qc.shard_group_id(),
+            qc.height(),
+            qc.parent_block_hash(),
+            qc.round(),
+            qc.signers().clone(),
+            qc.aggregated_signature(),
+            WeightedTimestamp::from_millis(30_000),
+        );
         let certified = CertifiedBlock::new_unchecked(block, qc);
 
         let actions = state.on_block_committed(&topo, &certified);

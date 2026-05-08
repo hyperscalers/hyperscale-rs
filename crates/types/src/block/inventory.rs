@@ -236,10 +236,10 @@ impl ElidedCertifiedBlock {
         // before resolving any bodies. A peer that sends a mismatched
         // (header, qc) pair fails fast without us doing lookup work.
         let header_hash = self.header.hash();
-        if self.qc.block_hash != header_hash {
+        if self.qc.block_hash() != header_hash {
             return Err(RehydrateError::QcMismatch {
                 header_hash,
-                qc_block_hash: self.qc.block_hash,
+                qc_block_hash: self.qc.block_hash(),
             });
         }
         let mut miss = RehydrationMiss::default();
@@ -424,16 +424,16 @@ mod tests {
     }
 
     fn create_test_qc(block: &Block) -> QuorumCertificate {
-        QuorumCertificate {
-            block_hash: block.hash(),
-            shard_group_id: ShardGroupId::new(0),
-            height: block.height(),
-            parent_block_hash: block.header().parent_block_hash(),
-            round: block.header().round(),
-            aggregated_signature: zero_bls_signature(),
-            signers: SignerBitfield::new(0),
-            weighted_timestamp: WeightedTimestamp::ZERO,
-        }
+        QuorumCertificate::new(
+            block.hash(),
+            ShardGroupId::new(0),
+            block.height(),
+            block.header().parent_block_hash(),
+            block.header().round(),
+            SignerBitfield::new(0),
+            zero_bls_signature(),
+            WeightedTimestamp::ZERO,
+        )
     }
 
     #[test]

@@ -59,10 +59,10 @@ pub fn serve_block_request(
         return GetBlockResponse::not_found();
     };
 
-    let block_ts = qc.weighted_timestamp;
+    let block_ts = qc.weighted_timestamp();
     let tip_ts = storage
         .latest_qc()
-        .map_or(block_ts, |q| q.weighted_timestamp);
+        .map_or(block_ts, |q| q.weighted_timestamp());
     let wave_window_open = tip_ts.elapsed_since(block_ts) < LIVE_WINDOW;
 
     if !wave_window_open || provision_hashes.is_empty() {

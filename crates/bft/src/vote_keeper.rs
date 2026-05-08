@@ -139,7 +139,7 @@ impl VoteKeeper {
     }
 
     /// Read-only view of own-vote locks, for callers that need to iterate
-    /// (e.g., QC-based unlock iterates all heights ≤ qc.height).
+    /// (e.g., QC-based unlock iterates all heights ≤ `qc.height()`).
     pub const fn voted_heights(&self) -> &HashMap<BlockHeight, (BlockHash, Round)> {
         &self.voted_heights
     }

@@ -77,14 +77,24 @@ impl CommitPipeline {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::{Hash, QuorumCertificate, ShardGroupId};
+    use hyperscale_types::{
+        BlockHash, Hash, QuorumCertificate, Round, ShardGroupId, SignerBitfield, WeightedTimestamp,
+        zero_bls_signature,
+    };
 
     use super::*;
 
     fn make_qc(height: u64) -> QuorumCertificate {
-        let mut qc = QuorumCertificate::genesis(ShardGroupId::new(0));
-        qc.height = BlockHeight::new(height);
-        qc
+        QuorumCertificate::new(
+            BlockHash::ZERO,
+            ShardGroupId::new(0),
+            BlockHeight::new(height),
+            BlockHash::ZERO,
+            Round::INITIAL,
+            SignerBitfield::empty(),
+            zero_bls_signature(),
+            WeightedTimestamp::ZERO,
+        )
     }
 
     fn bh(tag: &[u8]) -> BlockHash {
@@ -160,15 +170,24 @@ mod tests {
 
 #[cfg(test)]
 mod properties {
-    use hyperscale_types::{Hash, ShardGroupId};
+    use hyperscale_types::{
+        BlockHash, Hash, Round, ShardGroupId, SignerBitfield, WeightedTimestamp, zero_bls_signature,
+    };
     use proptest::prelude::*;
 
     use super::*;
 
     fn make_qc(height: u64) -> QuorumCertificate {
-        let mut qc = QuorumCertificate::genesis(ShardGroupId::new(0));
-        qc.height = BlockHeight::new(height);
-        qc
+        QuorumCertificate::new(
+            BlockHash::ZERO,
+            ShardGroupId::new(0),
+            BlockHeight::new(height),
+            BlockHash::ZERO,
+            Round::INITIAL,
+            SignerBitfield::empty(),
+            zero_bls_signature(),
+            WeightedTimestamp::ZERO,
+        )
     }
 
     fn hash_for(tag: u64) -> BlockHash {
