@@ -1608,9 +1608,9 @@ impl ExecutionCoordinator {
             }
         }
 
-        let finalized = FinalizedWave::new(Arc::new(wc), receipts);
-        let finalized_arc = Arc::new(finalized.clone());
-        self.finalized.insert(wave_id.clone(), finalized);
+        let finalized_arc = Arc::new(FinalizedWave::new(Arc::new(wc), receipts));
+        self.finalized
+            .insert(wave_id.clone(), Arc::clone(&finalized_arc));
 
         // Single admission event covers both the BFT subscriber and the
         // io_loop serving cache (via the Continuation interception arm).
@@ -2692,15 +2692,15 @@ mod tests {
             zero_bls_signature(),
             signers,
         ));
-        let wave = FinalizedWave::new(
+        let wave = Arc::new(FinalizedWave::new(
             Arc::new(WaveCertificate::new(wave_id.clone(), vec![ec])),
             vec![],
-        );
+        ));
         // Seed the canonical store directly (mirrors what `finalize_wave`
         // does on the local-aggregation path).
-        state.finalized.insert(wave_id, wave.clone());
+        state.finalized.insert(wave_id, Arc::clone(&wave));
 
-        let actions = state.admit_finalized_wave(&topo, Arc::new(wave));
+        let actions = state.admit_finalized_wave(&topo, wave);
         assert!(actions.is_empty());
     }
 

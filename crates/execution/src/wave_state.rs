@@ -1412,7 +1412,6 @@ mod tests {
             other => panic!("expected ExecuteTransactions, got {other:?}"),
         }
         assert!(w.dispatched());
-        // Idempotent: a second call after dispatch returns None and doesn't re-flip.
         assert!(w.dispatch_if_ready(&HashMap::new()).is_none());
     }
 
@@ -1422,7 +1421,6 @@ mod tests {
         let h0 = w.tx_hashes()[0];
         w.mark_tx_provisioned(h0, ts_for(WAVE_START + 1));
 
-        // Empty provisions map → can't assemble cross-shard request, no flip.
         assert!(w.dispatch_if_ready(&HashMap::new()).is_none());
         assert!(!w.dispatched());
     }
@@ -1468,14 +1466,12 @@ mod tests {
         w.record_abort(aborted, ts_for(WAVE_START));
 
         assert!(w.dispatch_if_ready(&HashMap::new()).is_none());
-        // Wave wasn't dispatched — no action was produced.
         assert!(!w.dispatched());
     }
 
     #[test]
     fn dispatch_if_ready_returns_none_when_not_fully_provisioned() {
         let mut w = make_cross_shard_wave(2);
-        // Only one of two txs marked provisioned.
         let h0 = w.tx_hashes()[0];
         w.mark_tx_provisioned(h0, ts_for(WAVE_START + 1));
 

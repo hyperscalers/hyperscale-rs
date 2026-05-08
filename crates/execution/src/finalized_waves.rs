@@ -11,10 +11,10 @@
 //! the mutable in-flight lifecycle (waves, vote trackers, retries) and hands
 //! wave off to this store at the moment of finalization.
 //!
-//! The underlying map is a `BTreeMap<WaveId, FinalizedWave>` so iteration is
-//! deterministic — load-bearing for simulation determinism and for proposal
-//! building, which iterates the store to include finalized waves in block
-//! order.
+//! The underlying map is a `BTreeMap<WaveId, Arc<FinalizedWave>>` so
+//! iteration is deterministic — load-bearing for simulation determinism and
+//! for proposal building, which iterates the store to include finalized
+//! waves in block order.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -22,7 +22,7 @@ use std::sync::Arc;
 use hyperscale_types::{BloomFilter, DEFAULT_FPR, FinalizedWave, TxHash, WaveCertificate, WaveId};
 
 pub struct FinalizedWaveStore {
-    waves: BTreeMap<WaveId, FinalizedWave>,
+    waves: BTreeMap<WaveId, Arc<FinalizedWave>>,
 }
 
 impl FinalizedWaveStore {
@@ -33,7 +33,7 @@ impl FinalizedWaveStore {
     }
 
     /// Record a newly-finalized wave under its `WaveId`.
-    pub fn insert(&mut self, wave_id: WaveId, fw: FinalizedWave) {
+    pub fn insert(&mut self, wave_id: WaveId, fw: Arc<FinalizedWave>) {
         self.waves.insert(wave_id, fw);
     }
 
@@ -43,16 +43,16 @@ impl FinalizedWaveStore {
         self.waves.remove(wave_id);
     }
 
-    /// All finalized waves in `WaveId` order, each wrapped in a fresh `Arc`.
-    /// Used by the proposer to include finalized waves in the next block.
+    /// All finalized waves in `WaveId` order. Used by the proposer to
+    /// include finalized waves in the next block.
     pub fn all_waves(&self) -> Vec<Arc<FinalizedWave>> {
-        self.waves.values().map(|fw| Arc::new(fw.clone())).collect()
+        self.waves.values().map(Arc::clone).collect()
     }
 
     /// Lookup by `WaveId`. Peers reference waves by id in fetch requests,
     /// so this is the primary ingress lookup for serving finalized-wave data.
     pub fn get(&self, wave_id: &WaveId) -> Option<Arc<FinalizedWave>> {
-        self.waves.get(wave_id).map(|fw| Arc::new(fw.clone()))
+        self.waves.get(wave_id).map(Arc::clone)
     }
 
     /// Certificate containing `tx_hash`, if any. Used to answer
@@ -76,7 +76,6 @@ impl FinalizedWaveStore {
     /// The node passes this to BFT for conflict filtering — a transaction
     /// whose wave is already finalized should not be re-proposed.
     pub fn all_tx_hashes(&self) -> HashSet<TxHash> {
-        #[allow(clippy::redundant_closure_for_method_calls)] // closure required for HRTB inference
         self.waves.values().flat_map(|fw| fw.tx_hashes()).collect()
     }
 
@@ -129,7 +128,10 @@ mod tests {
         )
     }
 
-    fn make_finalized_wave(block_height: u64, tx_hashes: &[TxHash]) -> (WaveId, FinalizedWave) {
+    fn make_finalized_wave(
+        block_height: u64,
+        tx_hashes: &[TxHash],
+    ) -> (WaveId, Arc<FinalizedWave>) {
         let wave_id = make_wave_id(block_height);
         let tx_outcomes: Vec<TxOutcome> = tx_hashes
             .iter()
@@ -153,7 +155,7 @@ mod tests {
         let cert = WaveCertificate::new(wave_id.clone(), vec![Arc::new(ec)]);
         // Lookups in this module only inspect the certificate's outcomes; an
         // empty receipts vector is fine for the store's contract.
-        let fw = FinalizedWave::new(Arc::new(cert), vec![]);
+        let fw = Arc::new(FinalizedWave::new(Arc::new(cert), vec![]));
         (wave_id, fw)
     }
 
