@@ -195,10 +195,10 @@ impl VoteTracker {
     /// Take votes for a specific (`global_receipt_root`, `vote_anchor_ts`) pair.
     pub fn take_votes(
         &mut self,
-        global_receipt_root: &GlobalReceiptRoot,
+        global_receipt_root: GlobalReceiptRoot,
         vote_anchor_ts: WeightedTimestamp,
     ) -> Vec<ExecutionVote> {
-        let key = (*global_receipt_root, vote_anchor_ts);
+        let key = (global_receipt_root, vote_anchor_ts);
         self.votes_by_key.remove(&key).unwrap_or_default()
     }
 
@@ -248,11 +248,11 @@ impl VoteTracker {
     #[must_use]
     pub fn votes_for_global_receipt_root(
         &self,
-        global_receipt_root: &GlobalReceiptRoot,
+        global_receipt_root: GlobalReceiptRoot,
     ) -> Vec<&ExecutionVote> {
         self.votes_by_key
             .iter()
-            .filter(|((root, _), _)| root == global_receipt_root)
+            .filter(|((root, _), _)| *root == global_receipt_root)
             .flat_map(|(_, votes)| votes.iter())
             .collect()
     }
@@ -310,7 +310,7 @@ mod tests {
         assert_eq!(r, root);
         assert_eq!(vh, WeightedTimestamp::from_millis(11)); // vote_anchor_ts from make_vote
         assert_eq!(power, VotePower::new(3));
-        assert_eq!(tracker.votes_for_global_receipt_root(&root).len(), 3);
+        assert_eq!(tracker.votes_for_global_receipt_root(root).len(), 3);
     }
 
     #[test]

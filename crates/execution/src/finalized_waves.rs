@@ -59,16 +59,16 @@ impl FinalizedWaveStore {
     /// terminal-state queries for a single transaction (e.g. RPC, mempool
     /// status). Returns `None` once the wave has been removed — callers
     /// then fall back to persisted storage.
-    pub fn get_certificate_for_tx(&self, tx_hash: &TxHash) -> Option<Arc<WaveCertificate>> {
+    pub fn get_certificate_for_tx(&self, tx_hash: TxHash) -> Option<Arc<WaveCertificate>> {
         self.waves
             .values()
-            .find(|fw| fw.contains_tx(tx_hash))
+            .find(|fw| fw.contains_tx(&tx_hash))
             .map(|fw| Arc::clone(fw.certificate()))
     }
 
     /// Whether `tx_hash` is part of any currently-tracked finalized wave.
-    pub fn is_finalized(&self, tx_hash: &TxHash) -> bool {
-        self.waves.values().any(|fw| fw.contains_tx(tx_hash))
+    pub fn is_finalized(&self, tx_hash: TxHash) -> bool {
+        self.waves.values().any(|fw| fw.contains_tx(&tx_hash))
     }
 
     /// Flatten every tracked wave's tx hashes into a single set.
@@ -164,7 +164,7 @@ mod tests {
         let store = FinalizedWaveStore::new();
         assert_eq!(store.len(), 0);
         assert!(store.is_empty());
-        assert!(!store.is_finalized(&TxHash::from_raw(Hash::from_bytes(b"anything"))));
+        assert!(!store.is_finalized(TxHash::from_raw(Hash::from_bytes(b"anything"))));
         assert!(store.all_tx_hashes().is_empty());
         assert!(store.all_waves().is_empty());
     }
@@ -177,10 +177,10 @@ mod tests {
 
         store.insert(wid.clone(), fw);
 
-        assert!(store.is_finalized(&tx));
+        assert!(store.is_finalized(tx));
         assert!(store.contains(&wid));
         assert_eq!(store.len(), 1);
-        let cert = store.get_certificate_for_tx(&tx).expect("cert present");
+        let cert = store.get_certificate_for_tx(tx).expect("cert present");
         assert_eq!(cert.wave_id(), &wid);
     }
 
@@ -233,8 +233,8 @@ mod tests {
 
         assert!(!store.contains(&wid1));
         assert!(store.contains(&wid2));
-        assert!(!store.is_finalized(&tx1));
-        assert!(store.is_finalized(&tx2));
+        assert!(!store.is_finalized(tx1));
+        assert!(store.is_finalized(tx2));
         assert_eq!(store.len(), 1);
     }
 

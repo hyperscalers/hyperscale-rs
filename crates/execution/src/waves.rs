@@ -209,12 +209,12 @@ impl WaveRegistry {
         self.assignments.insert(tx_hash, wave_id);
     }
 
-    pub fn remove_assignment(&mut self, tx_hash: &TxHash) {
-        self.assignments.remove(tx_hash);
+    pub fn remove_assignment(&mut self, tx_hash: TxHash) {
+        self.assignments.remove(&tx_hash);
     }
 
-    pub fn wave_assignment(&self, tx_hash: &TxHash) -> Option<WaveId> {
-        self.assignments.get(tx_hash).cloned()
+    pub fn wave_assignment(&self, tx_hash: TxHash) -> Option<WaveId> {
+        self.assignments.get(&tx_hash).cloned()
     }
 
     // ─── Vote retries ───────────────────────────────────────────────────
@@ -286,8 +286,8 @@ impl WaveRegistry {
     /// Whether `tx_hash` is assigned to a wave that's still waiting on
     /// provisions. False when the tx has no assignment, the wave is gone,
     /// or the wave is already fully provisioned.
-    pub fn is_awaiting_provisioning(&self, tx_hash: &TxHash) -> bool {
-        let Some(wave_id) = self.assignments.get(tx_hash) else {
+    pub fn is_awaiting_provisioning(&self, tx_hash: TxHash) -> bool {
+        let Some(wave_id) = self.assignments.get(&tx_hash) else {
             return false;
         };
         self.states
@@ -499,10 +499,10 @@ mod tests {
         let tx = TxHash::from_raw(Hash::from_bytes(b"tx"));
         let wid = wave(1);
         r.assign_tx(tx, wid.clone());
-        assert_eq!(r.wave_assignment(&tx), Some(wid));
+        assert_eq!(r.wave_assignment(tx), Some(wid));
 
-        r.remove_assignment(&tx);
-        assert_eq!(r.wave_assignment(&tx), None);
+        r.remove_assignment(tx);
+        assert_eq!(r.wave_assignment(tx), None);
     }
 
     // ─── Vote-retry timeouts ───────────────────────────────────────────
@@ -575,7 +575,7 @@ mod tests {
     #[test]
     fn is_awaiting_provisioning_false_without_assignment() {
         let r = WaveRegistry::new();
-        assert!(!r.is_awaiting_provisioning(&TxHash::from_raw(Hash::from_bytes(b"orphan"))));
+        assert!(!r.is_awaiting_provisioning(TxHash::from_raw(Hash::from_bytes(b"orphan"))));
     }
 
     #[test]
@@ -589,7 +589,7 @@ mod tests {
         r.insert_wave(wid.clone(), ws);
         r.assign_tx(tx_hash_in_wave, wid);
 
-        assert!(!r.is_awaiting_provisioning(&tx_hash_in_wave));
+        assert!(!r.is_awaiting_provisioning(tx_hash_in_wave));
         let _ = tx;
     }
 
@@ -667,7 +667,7 @@ mod tests {
 
             // Invariant 1: every assignment points to a live wave.
             for wid in (0_u8..20).filter_map(|i| {
-                r.wave_assignment(&TxHash::from_raw(Hash::from_bytes(&[i; 32])))
+                r.wave_assignment(TxHash::from_raw(Hash::from_bytes(&[i; 32])))
             }) {
                 prop_assert!(r.contains_wave(&wid));
             }
@@ -677,7 +677,7 @@ mod tests {
             for (wid, _) in r.waves_iter() {
                 // Surviving waves must have at least one assignment.
                 let referenced = (0_u8..20).any(|i| {
-                    r.wave_assignment(&TxHash::from_raw(Hash::from_bytes(&[i; 32])))
+                    r.wave_assignment(TxHash::from_raw(Hash::from_bytes(&[i; 32])))
                         .as_ref()
                         == Some(wid)
                 });

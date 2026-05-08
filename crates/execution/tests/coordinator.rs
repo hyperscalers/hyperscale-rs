@@ -21,7 +21,7 @@ fn fresh_coordinator_with_topology() -> (ExecutionCoordinator, TopologySnapshot)
 #[test]
 fn fresh_coordinator_reports_no_finalized_state() {
     let coord = fresh_coordinator();
-    assert!(!coord.is_finalized(&TxHash::from_raw(Hash::from_bytes(b"anything"))));
+    assert!(!coord.is_finalized(TxHash::from_raw(Hash::from_bytes(b"anything"))));
     assert!(coord.finalized_tx_hashes().is_empty());
     assert!(coord.get_finalized_waves().is_empty());
 }
@@ -75,10 +75,10 @@ fn fresh_get_wave_assignment_returns_none_for_any_tx() {
     let coord = fresh_coordinator();
     assert!(
         coord
-            .get_wave_assignment(&TxHash::from_raw(Hash::from_bytes(b"tx1")))
+            .get_wave_assignment(TxHash::from_raw(Hash::from_bytes(b"tx1")))
             .is_none()
     );
-    assert!(coord.get_wave_assignment(&TxHash::ZERO).is_none());
+    assert!(coord.get_wave_assignment(TxHash::ZERO).is_none());
 }
 
 #[test]
@@ -86,7 +86,7 @@ fn fresh_get_finalized_certificate_returns_none_for_any_tx() {
     let coord = fresh_coordinator();
     assert!(
         coord
-            .get_finalized_certificate(&TxHash::from_raw(Hash::from_bytes(b"tx1")))
+            .get_finalized_certificate(TxHash::from_raw(Hash::from_bytes(b"tx1")))
             .is_none()
     );
 }
@@ -111,7 +111,7 @@ fn fresh_cross_shard_pending_count_is_zero() {
 #[test]
 fn fresh_is_awaiting_provisioning_is_false_for_any_tx() {
     let coord = fresh_coordinator();
-    assert!(!coord.is_awaiting_provisioning(&TxHash::from_raw(Hash::from_bytes(b"tx1"))));
+    assert!(!coord.is_awaiting_provisioning(TxHash::from_raw(Hash::from_bytes(b"tx1"))));
 }
 
 #[test]
@@ -130,7 +130,7 @@ fn fresh_scan_complete_waves_is_empty() {
 #[test]
 fn certificate_tracking_debug_reports_no_assignment_for_unknown_tx() {
     let coord = fresh_coordinator();
-    let debug = coord.certificate_tracking_debug(&TxHash::from_raw(Hash::from_bytes(b"tx1")));
+    let debug = coord.certificate_tracking_debug(TxHash::from_raw(Hash::from_bytes(b"tx1")));
     assert!(
         debug.contains("no wave assignment"),
         "unexpected debug output: {debug}"

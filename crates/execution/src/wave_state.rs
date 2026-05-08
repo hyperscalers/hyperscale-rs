@@ -241,8 +241,8 @@ impl WaveState {
 
     /// Transaction data by hash (for building execution requests).
     #[must_use]
-    pub fn transaction(&self, tx_hash: &TxHash) -> Option<&Arc<RoutableTransaction>> {
-        self.transactions.get(tx_hash)
+    pub fn transaction(&self, tx_hash: TxHash) -> Option<&Arc<RoutableTransaction>> {
+        self.transactions.get(&tx_hash)
     }
 
     // ── Provisioning ────────────────────────────────────────────────────
@@ -316,7 +316,7 @@ impl WaveState {
             let transactions: Vec<Arc<RoutableTransaction>> = self
                 .tx_hashes
                 .iter()
-                .filter(|h| !self.is_tx_explicitly_aborted(h))
+                .filter(|h| !self.is_tx_explicitly_aborted(**h))
                 .filter_map(|h| self.transactions.get(h).cloned())
                 .collect();
             if transactions.is_empty() {
@@ -333,14 +333,14 @@ impl WaveState {
         // Cross-shard wave: every non-aborted tx needs its verified provisions assembled.
         let mut requests: Vec<CrossShardExecutionRequest> =
             Vec::with_capacity(self.tx_hashes.len());
-        for tx_hash in &self.tx_hashes {
+        for &tx_hash in &self.tx_hashes {
             if self.is_tx_explicitly_aborted(tx_hash) {
                 continue;
             }
-            let tx = self.transactions.get(tx_hash)?;
-            let provisions = verified_provisions.get(tx_hash)?.clone();
+            let tx = self.transactions.get(&tx_hash)?;
+            let provisions = verified_provisions.get(&tx_hash)?.clone();
             requests.push(CrossShardExecutionRequest {
-                tx_hash: *tx_hash,
+                tx_hash,
                 transaction: Arc::clone(tx),
                 provisions,
             });
@@ -428,8 +428,8 @@ impl WaveState {
     /// is expected; for a non-aborted outcome it indicates the
     /// `has_local_receipts_for_non_aborted` gate was bypassed, which would
     /// be a bug.
-    pub fn take_receipt(&mut self, tx_hash: &TxHash) -> Option<StoredReceipt> {
-        self.execution_receipts.remove(tx_hash)
+    pub fn take_receipt(&mut self, tx_hash: TxHash) -> Option<StoredReceipt> {
+        self.execution_receipts.remove(&tx_hash)
     }
 
     /// Record an explicit abort from `ConflictDetector`. Keeps the earliest
@@ -709,8 +709,8 @@ impl WaveState {
     /// Used by dispatch to skip executing txs the wave has already decided to
     /// abort.
     #[must_use]
-    pub fn is_tx_explicitly_aborted(&self, tx_hash: &TxHash) -> bool {
-        self.explicit_aborts.contains(tx_hash)
+    pub fn is_tx_explicitly_aborted(&self, tx_hash: TxHash) -> bool {
+        self.explicit_aborts.contains(&tx_hash)
     }
 
     /// Emit a `warn!` log exactly once, when the wave reaches

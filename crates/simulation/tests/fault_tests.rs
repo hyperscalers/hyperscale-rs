@@ -125,9 +125,9 @@ fn build_transfer_tx(signer_seed: u8, recipient_seed: u8) -> RoutableTransaction
 /// (executed or tombstoned post-eviction). Does not distinguish between
 /// success and abort — pair with `transactions_aborted` counter when the
 /// distinction matters.
-fn tx_reached_terminal_state(runner: &SimulationRunner, node_idx: u32, tx_hash: &TxHash) -> bool {
+fn tx_reached_terminal_state(runner: &SimulationRunner, node_idx: u32, tx_hash: TxHash) -> bool {
     let node = runner.node(node_idx).expect("node exists");
-    node.execution().is_finalized(tx_hash) || node.mempool().is_tombstoned(tx_hash)
+    node.execution().is_finalized(tx_hash) || node.mempool().is_tombstoned(&tx_hash)
 }
 
 #[traced_test]
@@ -178,7 +178,7 @@ fn transaction_fetch_fallback_when_gossip_dropped() {
         // advanced past genesis.
         for node_idx in 0..4u32 {
             assert!(
-                tx_reached_terminal_state(&runner, node_idx, &tx_hash),
+                tx_reached_terminal_state(&runner, node_idx, tx_hash),
                 "node {node_idx} did not reach terminal state for tx {tx_hash:?}; \
              gossip drops fired {} times, fetch_items_sent={fetch_items_sent}",
                 rule.fired()
@@ -311,7 +311,7 @@ fn run_cross_shard_fault_scenario_with_seed<F>(
         let total_nodes = config.num_shards * config.validators_per_shard;
         for node_idx in 0..total_nodes {
             assert!(
-                tx_reached_terminal_state(&runner, node_idx, &tx_hash),
+                tx_reached_terminal_state(&runner, node_idx, tx_hash),
                 "node {node_idx} did not reach terminal state for tx {tx_hash:?}",
             );
         }

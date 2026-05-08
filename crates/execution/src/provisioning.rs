@@ -117,10 +117,10 @@ impl ProvisioningTracker {
     /// Whether every remote shard's provision for `tx_hash` has been
     /// received. Returns `false` for txs with no recorded requirements
     /// (single-shard txs or txs we aren't tracking).
-    pub fn is_fully_provisioned(&self, tx_hash: &TxHash) -> bool {
-        self.required.get(tx_hash).is_some_and(|required| {
+    pub fn is_fully_provisioned(&self, tx_hash: TxHash) -> bool {
+        self.required.get(&tx_hash).is_some_and(|required| {
             self.received
-                .get(tx_hash)
+                .get(&tx_hash)
                 .is_some_and(|received| required.is_subset(received))
         })
     }
@@ -193,11 +193,11 @@ impl ProvisioningTracker {
 
     /// Drop all state for `tx_hash` across every owned map. Called when a
     /// wave certificate commits and the transaction reaches terminal state.
-    pub fn remove_tx(&mut self, tx_hash: &TxHash) {
-        self.verified.remove(tx_hash);
-        self.required.remove(tx_hash);
-        self.received.remove(tx_hash);
-        self.deadlines.remove(tx_hash);
+    pub fn remove_tx(&mut self, tx_hash: TxHash) {
+        self.verified.remove(&tx_hash);
+        self.required.remove(&tx_hash);
+        self.received.remove(&tx_hash);
+        self.deadlines.remove(&tx_hash);
         self.conflict_detector.remove_tx(tx_hash);
     }
 
@@ -217,7 +217,7 @@ impl ProvisioningTracker {
             .collect();
         let count = stale.len();
         for tx in stale {
-            self.remove_tx(&tx);
+            self.remove_tx(tx);
         }
         count
     }
@@ -278,7 +278,7 @@ mod tests {
         assert_eq!(t.verified_len(), 0);
         assert_eq!(t.required_len(), 0);
         assert_eq!(t.received_len(), 0);
-        assert!(!t.is_fully_provisioned(&TxHash::from_raw(Hash::from_bytes(b"missing"))));
+        assert!(!t.is_fully_provisioned(TxHash::from_raw(Hash::from_bytes(b"missing"))));
     }
 
     #[test]
@@ -287,17 +287,17 @@ mod tests {
         let tx = TxHash::from_raw(Hash::from_bytes(b"tx"));
         t.record_required(tx, [shard(1), shard(2)].into_iter().collect());
 
-        assert!(!t.is_fully_provisioned(&tx));
+        assert!(!t.is_fully_provisioned(tx));
 
         // Only shard 1 landed.
         let batch1 = make_provisions(shard(1), BlockHeight::new(5), vec![tx]);
         t.absorb_provisions(&batch1);
-        assert!(!t.is_fully_provisioned(&tx));
+        assert!(!t.is_fully_provisioned(tx));
 
         // Shard 2 lands → fully provisioned.
         let batch2 = make_provisions(shard(2), BlockHeight::new(5), vec![tx]);
         t.absorb_provisions(&batch2);
-        assert!(t.is_fully_provisioned(&tx));
+        assert!(t.is_fully_provisioned(tx));
     }
 
     #[test]
@@ -309,7 +309,7 @@ mod tests {
         // anything landed.
         let provisions = make_provisions(shard(1), BlockHeight::new(5), vec![tx]);
         t.absorb_provisions(&provisions);
-        assert!(!t.is_fully_provisioned(&tx));
+        assert!(!t.is_fully_provisioned(tx));
     }
 
     #[test]
@@ -362,11 +362,11 @@ mod tests {
         t.record_required(tx, std::iter::once(shard(1)).collect());
         let provisions = make_provisions(shard(1), BlockHeight::new(5), vec![tx]);
         t.absorb_provisions(&provisions);
-        assert!(t.is_fully_provisioned(&tx));
+        assert!(t.is_fully_provisioned(tx));
 
-        t.remove_tx(&tx);
+        t.remove_tx(tx);
 
-        assert!(!t.is_fully_provisioned(&tx));
+        assert!(!t.is_fully_provisioned(tx));
         assert_eq!(t.verified_len(), 0);
         assert_eq!(t.required_len(), 0);
         assert_eq!(t.received_len(), 0);

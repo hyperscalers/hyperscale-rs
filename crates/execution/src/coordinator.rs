@@ -357,7 +357,7 @@ impl ExecutionCoordinator {
                         tx.declared_reads(),
                         tx.declared_writes(),
                     );
-                    if !self.provisioning.is_fully_provisioned(&tx_hash) {
+                    if !self.provisioning.is_fully_provisioned(tx_hash) {
                         reverse_conflicts.extend(conflicts);
                     }
                 }
@@ -379,7 +379,7 @@ impl ExecutionCoordinator {
             // "provisioned" at block_height.
             if !is_single_shard {
                 for &tx_hash in &tx_hashes {
-                    if self.provisioning.is_fully_provisioned(&tx_hash) {
+                    if self.provisioning.is_fully_provisioned(tx_hash) {
                         wave_state.mark_tx_provisioned(tx_hash, block_ts);
                     }
                 }
@@ -603,7 +603,7 @@ impl ExecutionCoordinator {
         let mut affected_waves: BTreeSet<WaveId> = BTreeSet::new();
         for provisions in &ordered {
             for tx_hash in self.provisioning.absorb_provisions(provisions) {
-                if let Some(wave_id) = self.waves.wave_assignment(&tx_hash) {
+                if let Some(wave_id) = self.waves.wave_assignment(tx_hash) {
                     affected_waves.insert(wave_id);
                 }
             }
@@ -617,10 +617,10 @@ impl ExecutionCoordinator {
             let source_shard = provisions.source_shard();
             for conflict in self.provisioning.detect_conflicts(provisions, committed_ts) {
                 let loser = conflict.loser_tx;
-                if self.provisioning.is_fully_provisioned(&loser) {
+                if self.provisioning.is_fully_provisioned(loser) {
                     continue;
                 }
-                let Some(wave_id) = self.waves.wave_assignment(&loser) else {
+                let Some(wave_id) = self.waves.wave_assignment(loser) else {
                     continue;
                 };
                 let Some(wave) = self.waves.get_wave_mut(&wave_id) else {
@@ -654,9 +654,9 @@ impl ExecutionCoordinator {
 
             // Identify txs that are now all-shards-ready.
             let tx_hashes: Vec<TxHash> = wave.tx_hashes().to_vec();
-            for tx_hash in &tx_hashes {
+            for &tx_hash in &tx_hashes {
                 if self.provisioning.is_fully_provisioned(tx_hash) {
-                    wave.mark_tx_provisioned(*tx_hash, committed_ts);
+                    wave.mark_tx_provisioned(tx_hash, committed_ts);
                 }
             }
 
@@ -896,7 +896,7 @@ impl ExecutionCoordinator {
             "Execution vote quorum reached — aggregating certificate"
         );
 
-        let votes = tracker.take_votes(&global_receipt_root, vote_anchor_ts);
+        let votes = tracker.take_votes(global_receipt_root, vote_anchor_ts);
         let committee = topology.local_committee().to_vec();
 
         // Remove the vote tracker — this EC is the shard's final answer.
@@ -1596,7 +1596,7 @@ impl ExecutionCoordinator {
             if outcome.is_aborted() {
                 continue;
             }
-            if let Some(receipt) = wave.take_receipt(&outcome.tx_hash()) {
+            if let Some(receipt) = wave.take_receipt(outcome.tx_hash()) {
                 receipts.push(receipt);
             } else {
                 tracing::error!(
@@ -1730,7 +1730,7 @@ impl ExecutionCoordinator {
 
     /// Get the local wave assignment for a transaction.
     #[must_use]
-    pub fn get_wave_assignment(&self, tx_hash: &TxHash) -> Option<WaveId> {
+    pub fn get_wave_assignment(&self, tx_hash: TxHash) -> Option<WaveId> {
         self.waves.wave_assignment(tx_hash)
     }
 
@@ -1760,7 +1760,7 @@ impl ExecutionCoordinator {
     /// Returns the wave certificate if the tx is part of a finalized wave.
     /// Once committed, certificates are persisted to storage and should be fetched from there.
     #[must_use]
-    pub fn get_finalized_certificate(&self, tx_hash: &TxHash) -> Option<Arc<WaveCertificate>> {
+    pub fn get_finalized_certificate(&self, tx_hash: TxHash) -> Option<Arc<WaveCertificate>> {
         self.finalized.get_certificate_for_tx(tx_hash)
     }
 
@@ -1784,7 +1784,7 @@ impl ExecutionCoordinator {
         self.waves.remove_wave(wave_id);
 
         let tx_hashes: Vec<TxHash> = fw.tx_hashes().collect();
-        for tx_hash in &tx_hashes {
+        for &tx_hash in &tx_hashes {
             self.waves.remove_assignment(tx_hash);
             self.provisioning.remove_tx(tx_hash);
         }
@@ -1847,7 +1847,7 @@ impl ExecutionCoordinator {
 
     /// Check if a transaction is finalized (part of a finalized wave).
     #[must_use]
-    pub fn is_finalized(&self, tx_hash: &TxHash) -> bool {
+    pub fn is_finalized(&self, tx_hash: TxHash) -> bool {
         self.finalized.is_finalized(tx_hash)
     }
 
@@ -1863,13 +1863,13 @@ impl ExecutionCoordinator {
     ///
     /// Note: Actual provision tracking is handled by `ProvisionCoordinator`.
     #[must_use]
-    pub fn is_awaiting_provisioning(&self, tx_hash: &TxHash) -> bool {
+    pub fn is_awaiting_provisioning(&self, tx_hash: TxHash) -> bool {
         self.waves.is_awaiting_provisioning(tx_hash)
     }
 
     /// Get debug info about wave state for a transaction.
     #[must_use]
-    pub fn certificate_tracking_debug(&self, tx_hash: &TxHash) -> String {
+    pub fn certificate_tracking_debug(&self, tx_hash: TxHash) -> String {
         let wave_info = self.waves.wave_assignment(tx_hash).map_or_else(
             || "no wave assignment".to_string(),
             |wave_id| {
@@ -2104,7 +2104,7 @@ mod tests {
         );
 
         // WaveState should be set up for this wave.
-        let wave_id = state.waves.wave_assignment(&tx_hash);
+        let wave_id = state.waves.wave_assignment(tx_hash);
         assert!(wave_id.is_some());
         assert!(state.waves.contains_wave(&wave_id.unwrap()));
     }
@@ -2927,7 +2927,7 @@ mod tests {
         // Once the local wave resolves (simulating finalize_wave), the
         // expectation is no longer needed and gets pruned.
         state.waves.remove_wave(&local_wave);
-        state.waves.remove_assignment(&tx_hash);
+        state.waves.remove_assignment(tx_hash);
         state.committed_height = BlockHeight::new(600);
         state.committed_ts = WeightedTimestamp::from_millis(120_000);
         let _ = state.check_exec_cert_timeouts(&topo);

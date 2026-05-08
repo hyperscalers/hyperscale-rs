@@ -236,8 +236,8 @@ impl EarlyArrivalBuffer {
 
     /// How many buffered ECs mention `tx_hash` — the count surfaced by the
     /// coordinator's `certificate_tracking_debug` output.
-    pub fn attestation_count_for_tx(&self, tx_hash: &TxHash) -> usize {
-        self.tx_index.get(tx_hash).map_or(0, Vec::len)
+    pub fn attestation_count_for_tx(&self, tx_hash: TxHash) -> usize {
+        self.tx_index.get(&tx_hash).map_or(0, Vec::len)
     }
 }
 
@@ -379,8 +379,8 @@ mod tests {
         b.buffer_ec(&ec, &[tx_a, tx_b]);
 
         assert_eq!(b.pending_routing_len(), 1);
-        assert_eq!(b.attestation_count_for_tx(&tx_a), 1);
-        assert_eq!(b.attestation_count_for_tx(&tx_b), 1);
+        assert_eq!(b.attestation_count_for_tx(tx_a), 1);
+        assert_eq!(b.attestation_count_for_tx(tx_b), 1);
     }
 
     #[test]
@@ -395,7 +395,7 @@ mod tests {
 
         assert_eq!(b.pending_routing_len(), 1);
         assert_eq!(
-            b.attestation_count_for_tx(&tx),
+            b.attestation_count_for_tx(tx),
             1,
             "duplicate buffer must not stack Arcs in the reverse index"
         );
@@ -431,9 +431,9 @@ mod tests {
 
         let drained = b.drain_ecs_for_txs(&[tx_a]);
         assert_eq!(drained.len(), 1);
-        assert_eq!(b.attestation_count_for_tx(&tx_a), 0);
+        assert_eq!(b.attestation_count_for_tx(tx_a), 0);
         // tx_b still indexed — this drain only targeted tx_a.
-        assert_eq!(b.attestation_count_for_tx(&tx_b), 1);
+        assert_eq!(b.attestation_count_for_tx(tx_b), 1);
     }
 
     #[test]
@@ -479,8 +479,8 @@ mod tests {
         let evicted = b.gc_stale_ecs(now);
         assert_eq!(evicted, 1);
         assert_eq!(b.pending_routing_len(), 1);
-        assert_eq!(b.attestation_count_for_tx(&tx_old), 0);
-        assert_eq!(b.attestation_count_for_tx(&tx_fresh), 1);
+        assert_eq!(b.attestation_count_for_tx(tx_old), 0);
+        assert_eq!(b.attestation_count_for_tx(tx_fresh), 1);
     }
 
     #[test]

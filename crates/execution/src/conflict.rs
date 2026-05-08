@@ -217,12 +217,12 @@ impl ConflictDetector {
     }
 
     /// Remove a transaction from local tx tracking (terminal state reached).
-    pub fn remove_tx(&mut self, tx_hash: &TxHash) {
-        self.tx_owned.remove(tx_hash);
-        if let Some(needs) = self.tx_needs.remove(tx_hash) {
+    pub fn remove_tx(&mut self, tx_hash: TxHash) {
+        self.tx_owned.remove(&tx_hash);
+        if let Some(needs) = self.tx_needs.remove(&tx_hash) {
             for shard in needs.keys() {
                 if let Some(txs) = self.txs_by_shard.get_mut(shard) {
-                    txs.remove(tx_hash);
+                    txs.remove(&tx_hash);
                     if txs.is_empty() {
                         self.txs_by_shard.remove(shard);
                     }
@@ -232,14 +232,14 @@ impl ConflictDetector {
     }
 
     /// Remove stored provision data for a remote tx (committed provisions pruned).
-    pub fn remove_provision(&mut self, remote_tx: &TxHash, source_shard: ShardGroupId) {
+    pub fn remove_provision(&mut self, remote_tx: TxHash, source_shard: ShardGroupId) {
         if self
             .stored_provisions
-            .remove(&(*remote_tx, source_shard))
+            .remove(&(remote_tx, source_shard))
             .is_some()
             && let Some(txs) = self.provisions_by_shard.get_mut(&source_shard)
         {
-            txs.remove(remote_tx);
+            txs.remove(&remote_tx);
             if txs.is_empty() {
                 self.provisions_by_shard.remove(&source_shard);
             }
@@ -538,7 +538,7 @@ mod tests {
 
         let local_tx = TxHash::from_raw(Hash::from_bytes(b"tx_alpha"));
         detector.register_tx(local_tx, &topo, &[remote_node, local_node], &[]);
-        detector.remove_tx(&local_tx);
+        detector.remove_tx(local_tx);
         assert_eq!(detector.tracked_tx_count(), 0);
 
         let remote_tx = TxHash::from_raw(Hash::from_bytes(b"tx_beta"));
@@ -591,7 +591,7 @@ mod tests {
         detector.detect_conflicts(&provisions, WeightedTimestamp::from_millis(5 * 500));
         assert_eq!(detector.stored_provision_count(), 1);
 
-        detector.remove_provision(&lower, ShardGroupId::new(1));
+        detector.remove_provision(lower, ShardGroupId::new(1));
         assert_eq!(detector.stored_provision_count(), 0);
 
         let rev_conflicts = detector.register_tx(higher, &topo, &[remote_node, local_node], &[]);
