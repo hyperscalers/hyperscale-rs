@@ -209,15 +209,15 @@ impl NodeStateMachine {
         // The per-list cap matches the chain-wide in-flight limit; no honest
         // proposer can legitimately exceed it.
         if total_tx_count > MAX_TXS_PER_BLOCK
-            || manifest.cert_ids.len() > MAX_FINALIZED_TX_PER_BLOCK
-            || manifest.provision_hashes.len() > MAX_PROVISIONS_PER_BLOCK
+            || manifest.cert_ids().len() > MAX_FINALIZED_TX_PER_BLOCK
+            || manifest.provision_hashes().len() > MAX_PROVISIONS_PER_BLOCK
         {
             tracing::warn!(
                 block_hash = ?header.hash(),
                 height = header.height.inner(),
                 tx_hashes = total_tx_count,
-                cert_ids = manifest.cert_ids.len(),
-                provision_hashes = manifest.provision_hashes.len(),
+                cert_ids = manifest.cert_ids().len(),
+                provision_hashes = manifest.provision_hashes().len(),
                 "Rejecting block: manifest list length exceeds per-block cap"
             );
             return vec![];
@@ -233,7 +233,7 @@ impl NodeStateMachine {
         if is_next_block
             && self
                 .mempool
-                .would_exceed_in_flight(total_tx_count, manifest.cert_ids.len())
+                .would_exceed_in_flight(total_tx_count, manifest.cert_ids().len())
         {
             tracing::warn!(
                 block_hash = ?header.hash(),
@@ -596,11 +596,7 @@ mod tests {
         // single-tx manifest so the projection cleanly fits.
         let TestNode { mut node, .. } = TestNode::new();
 
-        let manifest = BlockManifest {
-            tx_hashes: vec![TxHash::ZERO].into(),
-            cert_ids: vec![].into(),
-            provision_hashes: vec![].into(),
-        };
+        let manifest = BlockManifest::new(vec![TxHash::ZERO], vec![], vec![]);
 
         // proposer_for(h=1, r=0) = committee[(1+0) % 4] = ValidatorId::new(1).
         // BFT's header validation rejects on proposer mismatch, so the

@@ -106,16 +106,16 @@ mod tests {
     #[test]
     fn test_block_header_gossip_creation() {
         let header = make_header(BlockHeight::new(1));
-        let manifest = BlockManifest {
-            tx_hashes: vec![
+        let manifest = BlockManifest::new(
+            vec![
                 TxHash::from_raw(Hash::from_bytes(b"tx1")),
                 TxHash::from_raw(Hash::from_bytes(b"tx2")),
                 TxHash::from_raw(Hash::from_bytes(b"tx3")),
                 TxHash::from_raw(Hash::from_bytes(b"tx4")),
-            ]
-            .into(),
-            ..Default::default()
-        };
+            ],
+            vec![],
+            vec![],
+        );
 
         let gossip = BlockHeaderNotification::new(header.clone(), manifest.clone(), zero_sig());
         assert_eq!(gossip.header, header);
@@ -126,10 +126,11 @@ mod tests {
     #[test]
     fn test_block_header_gossip_into_parts() {
         let header = make_header(BlockHeight::new(5));
-        let manifest = BlockManifest {
-            tx_hashes: vec![TxHash::from_raw(Hash::from_bytes(b"tx1"))].into(),
-            ..Default::default()
-        };
+        let manifest = BlockManifest::new(
+            vec![TxHash::from_raw(Hash::from_bytes(b"tx1"))],
+            vec![],
+            vec![],
+        );
 
         let gossip = BlockHeaderNotification::new(header.clone(), manifest.clone(), zero_sig());
         let (h, m, _sig) = gossip.into_parts();
@@ -145,14 +146,11 @@ mod tests {
 
         let gossip = BlockHeaderNotification::new(
             make_header(BlockHeight::new(1)),
-            BlockManifest {
-                tx_hashes: vec![tx1, tx2, tx3].into(),
-                ..Default::default()
-            },
+            BlockManifest::new(vec![tx1, tx2, tx3], vec![], vec![]),
             zero_sig(),
         );
 
-        let all: Vec<TxHash> = gossip.manifest.tx_hashes.into_inner();
+        let all: Vec<TxHash> = gossip.manifest.tx_hashes().clone().into_inner();
         assert_eq!(all, vec![tx1, tx2, tx3]);
     }
 }

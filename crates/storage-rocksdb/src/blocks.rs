@@ -171,7 +171,7 @@ impl RocksDbStorage {
 
         // 2. Batch-fetch transactions (preserving order)
         let transactions =
-            self.get_transactions_batch_ordered(transactions_cf, &metadata.manifest.tx_hashes);
+            self.get_transactions_batch_ordered(transactions_cf, metadata.manifest.tx_hashes());
 
         // Verify we got ALL transactions - return None if any are missing
         let total_expected = metadata.manifest.transaction_count();
@@ -187,13 +187,13 @@ impl RocksDbStorage {
 
         // 3. Batch-fetch certificates (preserving order)
         let certs =
-            self.get_certificates_batch_ordered(certificates_cf, &metadata.manifest.cert_ids);
+            self.get_certificates_batch_ordered(certificates_cf, metadata.manifest.cert_ids());
 
         // Verify we got ALL certificates - return None if any are missing
-        if certs.len() != metadata.manifest.cert_ids.len() {
+        if certs.len() != metadata.manifest.cert_ids().len() {
             tracing::warn!(
                 height = height.inner(),
-                expected = metadata.manifest.cert_ids.len(),
+                expected = metadata.manifest.cert_ids().len(),
                 found = certs.len(),
                 "Block has missing certificates - cannot serve sync request"
             );
@@ -291,7 +291,7 @@ impl RocksDbStorage {
 
         // 2. Try to batch-fetch transactions (preserving order)
         let transactions =
-            self.get_transactions_batch_ordered(transactions_cf, &metadata.manifest.tx_hashes);
+            self.get_transactions_batch_ordered(transactions_cf, metadata.manifest.tx_hashes());
 
         // Check if all transactions are present - if not, return None
         let total_expected = metadata.manifest.transaction_count();
@@ -309,13 +309,13 @@ impl RocksDbStorage {
 
         // 3. Try to batch-fetch certificates (preserving order)
         let certs =
-            self.get_certificates_batch_ordered(certificates_cf, &metadata.manifest.cert_ids);
+            self.get_certificates_batch_ordered(certificates_cf, metadata.manifest.cert_ids());
 
         // Check if all certificates are present - if not, return None
-        if certs.len() != metadata.manifest.cert_ids.len() {
+        if certs.len() != metadata.manifest.cert_ids().len() {
             tracing::debug!(
                 height = height.inner(),
-                expected = metadata.manifest.cert_ids.len(),
+                expected = metadata.manifest.cert_ids().len(),
                 found = certs.len(),
                 "Block has missing certificates - cannot serve sync request"
             );
@@ -355,7 +355,7 @@ impl RocksDbStorage {
             transactions: Arc::new(transactions.into()),
             certificates: Arc::new(certificates.into()),
         };
-        let provision_hashes = metadata.manifest.provision_hashes.into_inner();
+        let provision_hashes = metadata.manifest.provision_hashes().clone().into_inner();
 
         let elapsed = start.elapsed().as_secs_f64();
         record_storage_read(elapsed);

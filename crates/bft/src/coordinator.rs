@@ -911,7 +911,7 @@ impl BftCoordinator {
             original_round = original_round.inner(),
             block_hash = ?block_hash,
             tx_count = manifest.transaction_count(),
-            cert_count = manifest.cert_ids.len(),
+            cert_count = manifest.cert_ids().len(),
             "Re-proposing vote-locked block after view change (keeping original round)"
         );
 
@@ -1165,7 +1165,7 @@ impl BftCoordinator {
         // Arcs, releasing it before the mutable `add_*` calls below.
         let txs: Vec<Arc<RoutableTransaction>> = pending
             .manifest()
-            .tx_hashes
+            .tx_hashes()
             .iter()
             .filter_map(&lookup_tx)
             .collect();
@@ -1175,7 +1175,7 @@ impl BftCoordinator {
 
         let waves: Vec<Arc<FinalizedWave>> = pending
             .manifest()
-            .cert_ids
+            .cert_ids()
             .iter()
             .filter_map(&lookup_finalized_wave)
             .collect();
@@ -1185,7 +1185,7 @@ impl BftCoordinator {
 
         let provisions: Vec<Arc<Provisions>> = pending
             .manifest()
-            .provision_hashes
+            .provision_hashes()
             .iter()
             .filter_map(&lookup_provision)
             .collect();

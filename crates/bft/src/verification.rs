@@ -669,7 +669,7 @@ impl VerificationPipeline {
     ) -> Vec<Action> {
         debug!(
             ?block_hash,
-            batch_count = manifest.provision_hashes.len(),
+            batch_count = manifest.provision_hashes().len(),
             expected_root = ?block.header().provision_root,
             "Initiating provisions root verification"
         );
@@ -677,7 +677,7 @@ impl VerificationPipeline {
         vec![Action::VerifyProvisionRoot {
             block_hash,
             expected_root: block.header().provision_root,
-            batch_hashes: manifest.provision_hashes.0.clone(),
+            batch_hashes: manifest.provision_hashes().0.clone(),
         }]
     }
 

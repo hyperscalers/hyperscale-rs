@@ -71,10 +71,10 @@ impl PendingBlock {
     ) -> Self {
         let total_tx_count = manifest.transaction_count();
         let missing_transaction_hashes: HashSet<TxHash> =
-            manifest.tx_hashes.iter().copied().collect();
-        let missing_wave_ids: HashSet<WaveId> = manifest.cert_ids.iter().cloned().collect();
+            manifest.tx_hashes().iter().copied().collect();
+        let missing_wave_ids: HashSet<WaveId> = manifest.cert_ids().iter().cloned().collect();
         let missing_provision_hashes: HashSet<ProvisionHash> =
-            manifest.provision_hashes.iter().copied().collect();
+            manifest.provision_hashes().iter().copied().collect();
 
         Self {
             header,
@@ -105,8 +105,13 @@ impl PendingBlock {
         let mut provision_hashes: Vec<ProvisionHash> =
             provisions.iter().map(|p| p.hash()).collect();
         provision_hashes.sort();
-        let mut manifest = BlockManifest::from_block(block);
-        manifest.provision_hashes = provision_hashes.into();
+        let tx_hashes: Vec<TxHash> = block.transactions().iter().map(|tx| tx.hash()).collect();
+        let cert_ids: Vec<WaveId> = block
+            .certificates()
+            .iter()
+            .map(|c| c.wave_id().clone())
+            .collect();
+        let manifest = BlockManifest::new(tx_hashes, cert_ids, provision_hashes);
         let mut received_provisions: BTreeMap<ProvisionHash, Arc<Provisions>> = BTreeMap::new();
         for p in provisions {
             received_provisions.insert(p.hash(), p);
@@ -251,7 +256,7 @@ impl PendingBlock {
         // Build transactions in the ORIGINAL order from the gossip message.
         let transactions: Vec<Arc<RoutableTransaction>> = self
             .manifest
-            .tx_hashes
+            .tx_hashes()
             .iter()
             .filter_map(|hash| self.received_transactions.remove(hash))
             .collect();
@@ -259,7 +264,7 @@ impl PendingBlock {
         // Pass finalized waves into the block in manifest order.
         let certificates: Vec<Arc<FinalizedWave>> = self
             .manifest
-            .cert_ids
+            .cert_ids()
             .iter()
             .filter_map(|id| self.received_waves.get(id).cloned())
             .collect();
@@ -269,7 +274,7 @@ impl PendingBlock {
         // and `is_complete()` gates assembly on all of them being present.
         let provisions: Vec<Arc<Provisions>> = self
             .manifest
-            .provision_hashes
+            .provision_hashes()
             .iter()
             .filter_map(|hash| self.received_provisions.get(hash).cloned())
             .collect();
@@ -312,7 +317,7 @@ impl PendingBlock {
 
     /// Get certificate count.
     pub const fn certificate_count(&self) -> usize {
-        self.manifest.cert_ids.len()
+        self.manifest.cert_ids().len()
     }
 }
 
@@ -455,10 +460,7 @@ mod tests {
 
         let pb = PendingBlock::from_manifest(
             header,
-            BlockManifest {
-                tx_hashes: vec![tx1, tx2].into(),
-                ..Default::default()
-            },
+            BlockManifest::new(vec![tx1, tx2], vec![], vec![]),
             LocalTimestamp::ZERO,
         );
 
@@ -487,11 +489,7 @@ mod tests {
 
         let pb = PendingBlock::from_manifest(
             header,
-            BlockManifest {
-                tx_hashes: vec![tx1].into(),
-                cert_ids: vec![wave1.clone(), wave2.clone()].into(),
-                ..Default::default()
-            },
+            BlockManifest::new(vec![tx1], vec![wave1.clone(), wave2.clone()], vec![]),
             LocalTimestamp::ZERO,
         );
 
@@ -509,10 +507,7 @@ mod tests {
 
         let mut pb = PendingBlock::from_manifest(
             header,
-            BlockManifest {
-                cert_ids: vec![wave_id.clone()].into(),
-                ..Default::default()
-            },
+            BlockManifest::new(vec![], vec![wave_id.clone()], vec![]),
             LocalTimestamp::ZERO,
         );
 
@@ -539,11 +534,7 @@ mod tests {
 
         let mut pb = PendingBlock::from_manifest(
             header,
-            BlockManifest {
-                tx_hashes: vec![tx_hash].into(),
-                cert_ids: vec![wave_id.clone()].into(),
-                ..Default::default()
-            },
+            BlockManifest::new(vec![tx_hash], vec![wave_id.clone()], vec![]),
             LocalTimestamp::ZERO,
         );
 
