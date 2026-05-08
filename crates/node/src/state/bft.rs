@@ -276,7 +276,7 @@ impl NodeStateMachine {
     /// Block committed — notify all subsystems in commit order.
     fn on_block_committed(&mut self, certified: &CertifiedBlock) -> Vec<Action> {
         let mut actions = Vec::new();
-        let block_hash = certified.block.hash();
+        let block_hash = certified.block().hash();
 
         // Mark this block as a usable parent for child state-root
         // verifications. By the time `BlockCommitted` fires, the block's JMT
@@ -312,7 +312,7 @@ impl NodeStateMachine {
         // Outbound provision safety sweep — runs on the BFT-authenticated
         // weighted timestamp so every validator evicts deterministically.
         self.outbound_provisions
-            .on_block_committed(certified.qc.weighted_timestamp);
+            .on_block_committed(certified.qc().weighted_timestamp);
 
         actions.extend(self.apply_block_to_execution(certified));
 
@@ -335,7 +335,7 @@ impl NodeStateMachine {
         // handled separately by `on_block_committed` reading
         // `block.certificates`.
         self.execution
-            .cleanup_committed_waves(certified.block.certificates());
+            .cleanup_committed_waves(certified.block().certificates());
 
         actions.extend(
             self.execution

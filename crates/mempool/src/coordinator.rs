@@ -508,8 +508,8 @@ impl MempoolCoordinator {
     /// 2. Process certificates → mark completed
     /// 3. Process aborts → update status to terminal
     #[instrument(skip(self, certified), fields(
-        height = certified.block.height().inner(),
-        tx_count = certified.block.transaction_count()
+        height = certified.block().height().inner(),
+        tx_count = certified.block().transaction_count()
     ))]
     #[allow(clippy::too_many_lines)] // sequential orchestration: block-include, expected-tx sweep, certificate processing
     pub fn on_block_committed(
@@ -517,12 +517,12 @@ impl MempoolCoordinator {
         topology: &TopologySnapshot,
         certified: &CertifiedBlock,
     ) -> Vec<Action> {
-        let block = &certified.block;
+        let block = certified.block();
         let height = block.height();
         let mut actions = Vec::new();
 
         self.current_height = height;
-        self.current_ts = certified.qc.weighted_timestamp;
+        self.current_ts = certified.qc().weighted_timestamp;
 
         // Ensure all committed transactions are in the mempool.
         // This handles the case where we fetched transactions to vote on a block

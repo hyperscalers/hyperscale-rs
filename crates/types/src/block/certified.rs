@@ -25,10 +25,8 @@ use crate::{Block, BlockHash, BlockHeight, QuorumCertificate};
 /// certifies the block it's paired with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CertifiedBlock {
-    /// Block whose hash matches `qc.block_hash` — see invariant on [`Self::qc`].
-    pub block: Block,
-    /// QC certifying [`Self::block`]. Invariant: `qc.block_hash == block.hash()`.
-    pub qc: QuorumCertificate,
+    block: Block,
+    qc: QuorumCertificate,
 }
 
 /// Error returned when the block hash doesn't match the QC's `block_hash`.
@@ -84,6 +82,24 @@ impl CertifiedBlock {
             "CertifiedBlock pairing invariant"
         );
         Self { block, qc }
+    }
+
+    /// Block whose hash matches `qc.block_hash`.
+    #[must_use]
+    pub const fn block(&self) -> &Block {
+        &self.block
+    }
+
+    /// QC certifying [`Self::block`]. Invariant: `qc.block_hash == block.hash()`.
+    #[must_use]
+    pub const fn qc(&self) -> &QuorumCertificate {
+        &self.qc
+    }
+
+    /// Consume the pair and return its parts.
+    #[must_use]
+    pub fn into_parts(self) -> (Block, QuorumCertificate) {
+        (self.block, self.qc)
     }
 
     /// The block's height.

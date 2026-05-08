@@ -309,27 +309,27 @@ fn validate_synced_block(
     height: BlockHeight,
     certified: &CertifiedBlock,
 ) -> Result<(), &'static str> {
-    if certified.block.height() != height {
+    if certified.block().height() != height {
         return Err("height_mismatch");
     }
-    let block_hash = certified.block.hash();
-    if certified.qc.block_hash != block_hash {
+    let block_hash = certified.block().hash();
+    if certified.qc().block_hash != block_hash {
         return Err("qc_hash_mismatch");
     }
-    if certified.qc.height != height {
+    if certified.qc().height != height {
         return Err("qc_height_mismatch");
     }
 
-    let header = certified.block.header();
+    let header = certified.block().header();
 
-    if !certified.block.transactions().is_empty()
-        && compute_transaction_root(certified.block.transactions()) != header.transaction_root
+    if !certified.block().transactions().is_empty()
+        && compute_transaction_root(certified.block().transactions()) != header.transaction_root
     {
         return Err("transaction_root_mismatch");
     }
 
-    if !certified.block.certificates().is_empty() {
-        if compute_certificate_root(certified.block.certificates()) != header.certificate_root {
+    if !certified.block().certificates().is_empty() {
+        if compute_certificate_root(certified.block().certificates()) != header.certificate_root {
             return Err("certificate_root_mismatch");
         }
 
@@ -337,14 +337,14 @@ fn validate_synced_block(
         // (one receipt per non-aborted outcome, canonical order, matching
         // success/failure). `local_receipt_root` below catches content
         // mismatches but doesn't enforce per-wave grouping.
-        for fw in certified.block.certificates().iter() {
+        for fw in certified.block().certificates().iter() {
             if fw.validate_receipts_against_ec().is_err() {
                 return Err("receipts_vs_ec_mismatch");
             }
         }
 
         let receipts: Vec<StoredReceipt> = certified
-            .block
+            .block()
             .certificates()
             .iter()
             .flat_map(|fw| fw.receipts().iter().cloned())
@@ -354,9 +354,9 @@ fn validate_synced_block(
         }
     }
 
-    if !certified.block.provisions().is_empty() {
+    if !certified.block().provisions().is_empty() {
         let provision_hashes: Vec<Hash> = certified
-            .block
+            .block()
             .provisions()
             .iter()
             .map(|p| p.hash().into_raw())

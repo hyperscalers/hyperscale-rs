@@ -2405,21 +2405,21 @@ impl BftCoordinator {
         topology_snapshot: &TopologySnapshot,
         certified: CertifiedBlock,
     ) -> Vec<Action> {
-        if certified.qc.is_genesis() {
+        if certified.qc().is_genesis() {
             // The wire decoder enforces `qc.block_hash == block.hash()` on
             // `CertifiedBlock`, so a genesis QC (qc.block_hash == ZERO) can
             // only ride alongside the genesis block itself. The local
             // `block.is_genesis()` guard catches any locally-constructed
             // pair that bypasses the decoder.
-            if !certified.block.is_genesis() {
+            if !certified.block().is_genesis() {
                 warn!(
-                    height = certified.block.height().inner(),
+                    height = certified.block().height().inner(),
                     "Genesis QC paired with non-genesis block — rejecting"
                 );
                 return vec![];
             }
             debug!(
-                height = certified.block.height().inner(),
+                height = certified.block().height().inner(),
                 "Synced block has genesis QC, applying directly"
             );
             return self.apply_synced_block(topology_snapshot, certified);
@@ -2430,10 +2430,10 @@ impl BftCoordinator {
         // power. Without this check a single Byzantine signer suffices to
         // pass and fork the local chain. Mirrors the consensus-path gate
         // in `validate_header`.
-        if !qc_has_local_quorum_power(topology_snapshot, &certified.qc) {
+        if !qc_has_local_quorum_power(topology_snapshot, certified.qc()) {
             warn!(
-                height = certified.block.height().inner(),
-                signers = certified.qc.signers.count(),
+                height = certified.block().height().inner(),
+                signers = certified.qc().signers.count(),
                 "Synced block QC lacks quorum power — rejecting"
             );
             return vec![];
@@ -2481,7 +2481,7 @@ impl BftCoordinator {
         topology_snapshot: &TopologySnapshot,
         certified: CertifiedBlock,
     ) -> Vec<Action> {
-        let CertifiedBlock { block, qc } = certified;
+        let (block, qc) = certified.into_parts();
         let block_hash = block.hash();
         let height = block.height();
 

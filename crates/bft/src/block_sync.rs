@@ -184,7 +184,7 @@ impl BlockSyncManager {
     pub fn has_pending_at_height(&self, height: BlockHeight) -> bool {
         self.pending_synced_block_verifications
             .values()
-            .any(|p| p.certified.block.height() == height)
+            .any(|p| p.certified.block().height() == height)
     }
 
     /// Buffer a future synced block for later processing. Returns `false`
@@ -200,7 +200,7 @@ impl BlockSyncManager {
             );
             return false;
         }
-        let block_hash = certified.block.hash();
+        let block_hash = certified.block().hash();
         debug!(
             height = height.inner(),
             ?block_hash,
@@ -246,8 +246,8 @@ impl BlockSyncManager {
         certified: CertifiedBlock,
         committed_height: BlockHeight,
     ) -> IngestOutcome {
-        let block_hash = certified.block.hash();
-        let height = certified.block.height();
+        let block_hash = certified.block().hash();
+        let height = certified.block().height();
 
         if height <= committed_height {
             info!(
@@ -328,9 +328,9 @@ impl BlockSyncManager {
         certified: CertifiedBlock,
         public_keys: Vec<Bls12381G1PublicKey>,
     ) -> Action {
-        let block_hash = certified.block.hash();
-        let height = certified.block.height();
-        let qc = certified.qc.clone();
+        let block_hash = certified.block().hash();
+        let height = certified.block().height();
+        let qc = certified.qc().clone();
 
         if self
             .pending_synced_block_verifications
@@ -379,7 +379,7 @@ impl BlockSyncManager {
         if !valid {
             warn!(
                 block_hash = ?block_hash,
-                height = pending.certified.block.height().inner(),
+                height = pending.certified.block().height().inner(),
                 "Synced block QC signature verification FAILED - rejecting block"
             );
             // Only this block is removed (already done above). Other pending
@@ -391,7 +391,7 @@ impl BlockSyncManager {
 
         info!(
             block_hash = ?block_hash,
-            height = pending.certified.block.height().inner(),
+            height = pending.certified.block().height().inner(),
             "Synced block QC verified successfully"
         );
 
@@ -432,7 +432,7 @@ impl BlockSyncManager {
         let block_hash = self
             .pending_synced_block_verifications
             .iter()
-            .find(|(_, p)| p.verified && p.certified.block.height() == height)
+            .find(|(_, p)| p.verified && p.certified.block().height() == height)
             .map(|(h, _)| *h)?;
 
         let pending = self
@@ -462,13 +462,13 @@ impl BlockSyncManager {
             .pending_synced_block_verifications
             .values()
             .filter(|p| p.verified)
-            .map(|p| p.certified.block.height().inner())
+            .map(|p| p.certified.block().height().inner())
             .collect();
         let unverified_heights: Vec<_> = self
             .pending_synced_block_verifications
             .values()
             .filter(|p| !p.verified)
-            .map(|p| p.certified.block.height().inner())
+            .map(|p| p.certified.block().height().inner())
             .collect();
         info!(
             committed_height = committed_height.inner(),
@@ -523,7 +523,7 @@ impl BlockSyncManager {
     pub fn highest_pending_height(&self, committed_height: BlockHeight) -> BlockHeight {
         self.pending_synced_block_verifications
             .values()
-            .map(|p| p.certified.block.height())
+            .map(|p| p.certified.block().height())
             .max()
             .unwrap_or(committed_height)
     }
@@ -543,7 +543,7 @@ impl BlockSyncManager {
             .retain(|height, _| *height > committed_height);
 
         self.pending_synced_block_verifications
-            .retain(|_, pending| pending.certified.block.height() > committed_height);
+            .retain(|_, pending| pending.certified.block().height() > committed_height);
     }
 
     /// Total number of buffered candidates across all heights. May exceed
@@ -824,7 +824,7 @@ mod tests {
     fn ingest_buffers_future_block_and_stores_it() {
         let mut sm = BlockSyncManager::new();
         let cb = certified(BlockHeight::new(8), b"future");
-        let block_hash = cb.block.hash();
+        let block_hash = cb.block().hash();
         let out = sm.ingest(cb, BlockHeight::new(5));
         assert!(matches!(out, IngestOutcome::Buffered));
         assert!(sm.has_buffered(BlockHeight::new(8), &block_hash));
@@ -840,8 +840,8 @@ mod tests {
         let mut sm = BlockSyncManager::new();
         let bogus = certified(BlockHeight::new(8), b"bogus");
         let honest = certified(BlockHeight::new(8), b"honest");
-        let bogus_hash = bogus.block.hash();
-        let honest_hash = honest.block.hash();
+        let bogus_hash = bogus.block().hash();
+        let honest_hash = honest.block().hash();
         assert!(matches!(
             sm.ingest(bogus, BlockHeight::new(5)),
             IngestOutcome::Buffered
@@ -914,7 +914,7 @@ mod tests {
         sm.buffer_block(BlockHeight::new(9), certified(BlockHeight::new(9), b"buf3"));
 
         let out = sm.next_submitable(BlockHeight::new(5), 3);
-        let heights: Vec<_> = out.iter().map(|c| c.block.height().inner()).collect();
+        let heights: Vec<_> = out.iter().map(|c| c.block().height().inner()).collect();
         assert_eq!(heights, vec![7, 8]);
     }
 
@@ -1148,7 +1148,7 @@ mod tests {
     // which is otherwise reached only via `register_for_verification`.
     impl BlockSyncManager {
         fn track_pending_verification_for_test(&mut self, certified: CertifiedBlock) {
-            let block_hash = certified.block.hash();
+            let block_hash = certified.block().hash();
             self.pending_synced_block_verifications.insert(
                 block_hash,
                 PendingSyncedBlockVerification {

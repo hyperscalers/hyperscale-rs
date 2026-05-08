@@ -192,8 +192,8 @@ impl ProvisionCoordinator {
         certified: &CertifiedBlock,
     ) -> Vec<Action> {
         let mut actions: Vec<Action> = Vec::new();
-        let block = &certified.block;
-        let new_ts = certified.qc.weighted_timestamp;
+        let block = certified.block();
+        let new_ts = certified.qc().weighted_timestamp;
         self.expected.record_block_committed(block.height(), new_ts);
         let local_ts = self.expected.local_ts();
 

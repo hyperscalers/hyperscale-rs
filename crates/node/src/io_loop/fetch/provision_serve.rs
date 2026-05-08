@@ -32,7 +32,7 @@ pub fn serve_provision_request(
         );
         return GetProvisionResponse { provisions: None };
     };
-    let block = certified.block;
+    let (block, _qc) = certified.into_parts();
 
     let jmt_height = block.height();
 

@@ -461,7 +461,7 @@ mod tests {
             )
             .expect("rehydration should succeed when lookup has body");
         assert_eq!(rehydrated.height(), block.height());
-        assert_eq!(&rehydrated.block, &block);
+        assert_eq!(rehydrated.block(), &block);
     }
 
     #[test]
@@ -526,7 +526,7 @@ mod tests {
                 |_| None,
             )
             .expect("second pass with topup body should succeed");
-        assert_eq!(&recovered.block, &block);
+        assert_eq!(recovered.block(), &block);
     }
 
     /// Hand-roll an `ElidedCertifiedBlock` whose `transactions` length

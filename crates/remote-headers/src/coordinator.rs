@@ -323,9 +323,9 @@ impl RemoteHeaderCoordinator {
         topology: &TopologySnapshot,
         certified: &CertifiedBlock,
     ) -> Vec<Action> {
-        let new_ts = certified.qc.weighted_timestamp;
+        let new_ts = certified.qc().weighted_timestamp;
         let first_commit = self.local_committed_ts == WeightedTimestamp::ZERO;
-        self.local_committed_height = certified.block.height();
+        self.local_committed_height = certified.block().height();
         self.local_committed_ts = new_ts;
 
         // Retro-stamp entries recorded before the first local commit: remote

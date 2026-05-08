@@ -1302,17 +1302,17 @@ impl ExecutionCoordinator {
     /// 5. **Dispatch** — route to the live or sealed path for block-specific
     ///    work (wave setup + dispatch, or late-cert routing).
     #[instrument(skip(self, certified), fields(
-        height = certified.block.height().inner(),
-        block_hash = ?certified.block.hash(),
-        tx_count = certified.block.transactions().len(),
-        is_live = certified.block.is_live(),
+        height = certified.block().height().inner(),
+        block_hash = ?certified.block().hash(),
+        tx_count = certified.block().transactions().len(),
+        is_live = certified.block().is_live(),
     ))]
     pub fn on_block_committed(
         &mut self,
         topology: &TopologySnapshot,
         certified: &CertifiedBlock,
     ) -> Vec<Action> {
-        let block = &certified.block;
+        let block = certified.block();
         let height = block.height();
 
         // Update committed height + timestamp before anything else — needed
@@ -1321,7 +1321,7 @@ impl ExecutionCoordinator {
         let first_commit = self.committed_ts == WeightedTimestamp::ZERO;
         if height > self.committed_height {
             self.committed_height = height;
-            self.committed_ts = certified.qc.weighted_timestamp;
+            self.committed_ts = certified.qc().weighted_timestamp;
         }
         self.provisioning.advance_clock(self.committed_ts);
 
@@ -3173,8 +3173,9 @@ mod tests {
             ValidatorId::new(0),
             vec![],
         );
-        let mut certified = certify(block);
-        certified.qc.weighted_timestamp = WeightedTimestamp::from_millis(30_000);
+        let (block, mut qc) = certify(block).into_parts();
+        qc.weighted_timestamp = WeightedTimestamp::from_millis(30_000);
+        let certified = CertifiedBlock::new_unchecked(block, qc);
 
         let actions = state.on_block_committed(&topo, &certified);
 
