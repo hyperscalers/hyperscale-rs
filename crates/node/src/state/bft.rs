@@ -43,7 +43,7 @@
 //!    inline; `Block::Sealed` has none). Independent of mempool and
 //!    remote-headers; sequenced before execution because execution may
 //!    consume provisions queued here on the next proposal attempt.
-//! 5. `outbound_provisions.on_block_committed(qc.weighted_timestamp)` —
+//! 5. `outbound_provisions.on_block_committed(qc.weighted_timestamp())` —
 //!    deterministic eviction sweep. Uses the BFT-authenticated weighted
 //!    timestamp from the QC so every validator evicts identically. Must
 //!    follow earlier steps because eviction reads the now-up-to-date
@@ -136,8 +136,8 @@ impl NodeStateMachine {
                 self.execution.on_verified_remote_header(
                     topology,
                     shard,
-                    committed_header.header.height,
-                    &committed_header.header.waves,
+                    committed_header.header().height(),
+                    committed_header.header().waves(),
                 );
 
                 self.provisions
@@ -209,15 +209,15 @@ impl NodeStateMachine {
         // The per-list cap matches the chain-wide in-flight limit; no honest
         // proposer can legitimately exceed it.
         if total_tx_count > MAX_TXS_PER_BLOCK
-            || manifest.cert_ids.len() > MAX_FINALIZED_TX_PER_BLOCK
-            || manifest.provision_hashes.len() > MAX_PROVISIONS_PER_BLOCK
+            || manifest.cert_ids().len() > MAX_FINALIZED_TX_PER_BLOCK
+            || manifest.provision_hashes().len() > MAX_PROVISIONS_PER_BLOCK
         {
             tracing::warn!(
                 block_hash = ?header.hash(),
-                height = header.height.inner(),
+                height = header.height().inner(),
                 tx_hashes = total_tx_count,
-                cert_ids = manifest.cert_ids.len(),
-                provision_hashes = manifest.provision_hashes.len(),
+                cert_ids = manifest.cert_ids().len(),
+                provision_hashes = manifest.provision_hashes().len(),
                 "Rejecting block: manifest list length exceeds per-block cap"
             );
             return vec![];
@@ -228,16 +228,16 @@ impl NodeStateMachine {
         // see different in_flight() counts — checking would split votes and
         // trigger view changes.
         let committed_height = self.bft.committed_height();
-        let is_next_block = header.height == committed_height + 1;
+        let is_next_block = header.height() == committed_height + 1;
 
         if is_next_block
             && self
                 .mempool
-                .would_exceed_in_flight(total_tx_count, manifest.cert_ids.len())
+                .would_exceed_in_flight(total_tx_count, manifest.cert_ids().len())
         {
             tracing::warn!(
                 block_hash = ?header.hash(),
-                height = header.height.inner(),
+                height = header.height().inner(),
                 "Rejecting block that would exceed in-flight limit"
             );
             return vec![];
@@ -276,7 +276,7 @@ impl NodeStateMachine {
     /// Block committed — notify all subsystems in commit order.
     fn on_block_committed(&mut self, certified: &CertifiedBlock) -> Vec<Action> {
         let mut actions = Vec::new();
-        let block_hash = certified.block.hash();
+        let block_hash = certified.block().hash();
 
         // Mark this block as a usable parent for child state-root
         // verifications. By the time `BlockCommitted` fires, the block's JMT
@@ -312,7 +312,7 @@ impl NodeStateMachine {
         // Outbound provision safety sweep — runs on the BFT-authenticated
         // weighted timestamp so every validator evicts deterministically.
         self.outbound_provisions
-            .on_block_committed(certified.qc.weighted_timestamp);
+            .on_block_committed(certified.qc().weighted_timestamp());
 
         actions.extend(self.apply_block_to_execution(certified));
 
@@ -335,7 +335,7 @@ impl NodeStateMachine {
         // handled separately by `on_block_committed` reading
         // `block.certificates`.
         self.execution
-            .cleanup_committed_waves(certified.block.certificates());
+            .cleanup_committed_waves(certified.block().certificates());
 
         actions.extend(
             self.execution
@@ -362,7 +362,7 @@ mod tests {
     use hyperscale_test_helpers::{certify, make_live_block};
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
-        Block, BlockHeight, BlockManifest, CommittedBlockHeader, Hash, LocalTimestamp,
+        Block, BlockHeader, BlockHeight, BlockManifest, CommittedBlockHeader, Hash, LocalTimestamp,
         MerkleInclusionProof, Provisions, QuorumCertificate, RETENTION_HORIZON, Round,
         ShardGroupId, TransactionStatus, TxEntries, TxHash, ValidatorId, WaveId,
     };
@@ -393,7 +393,24 @@ mod tests {
             vec![],
         );
         if let Block::Live { ref mut header, .. } = block {
-            header.waves = vec![wave].into();
+            *header = BlockHeader::new(
+                header.shard_group_id(),
+                header.height(),
+                header.parent_block_hash(),
+                header.parent_qc().clone(),
+                header.proposer(),
+                header.timestamp(),
+                header.round(),
+                header.is_fallback(),
+                header.state_root(),
+                header.transaction_root(),
+                header.certificate_root(),
+                header.local_receipt_root(),
+                header.provision_root(),
+                vec![wave],
+                header.provision_tx_roots().clone().into_inner(),
+                header.in_flight(),
+            );
         }
         let committed_header = Arc::new(CommittedBlockHeader::new(
             block.header().clone(),
@@ -502,13 +519,13 @@ mod tests {
     }
 
     /// The orchestrator's outbound-provisions sweep on `BlockCommitted` must
-    /// run on `qc.weighted_timestamp` — never on local clock. Every
+    /// run on `qc.weighted_timestamp()` — never on local clock. Every
     /// validator sees the same QC, so they evict in lockstep; if local
     /// clock leaks in, validators with skew evict at different commits
     /// and the outbound tracker forks across the network.
     ///
     /// Test pumps local clock far past the entry's deadline and commits a
-    /// block whose `qc.weighted_timestamp` is BELOW that deadline. The
+    /// block whose `qc.weighted_timestamp()` is BELOW that deadline. The
     /// entry must survive — proves the sweep ignored the local clock. A
     /// second commit with `weighted_timestamp` past the deadline then
     /// confirms the eviction path itself works.
@@ -546,7 +563,7 @@ mod tests {
         let past_deadline_ms = retention_ms * 10;
         node.set_time(LocalTimestamp::from_millis(past_deadline_ms));
 
-        // Commit a block whose qc.weighted_timestamp is BELOW the entry
+        // Commit a block whose qc.weighted_timestamp() is BELOW the entry
         // deadline. The orchestrator passes this into the outbound sweep.
         let block = make_live_block(
             ShardGroupId::new(0),
@@ -561,11 +578,11 @@ mod tests {
         assert_eq!(
             node.outbound_provisions().memory_stats().tracked_provisions,
             1,
-            "outbound entry must survive — qc.weighted_timestamp is below the deadline, \
+            "outbound entry must survive — qc.weighted_timestamp() is below the deadline, \
              local clock past it must not leak in",
         );
 
-        // Commit a second block whose qc.weighted_timestamp IS past the
+        // Commit a second block whose qc.weighted_timestamp() IS past the
         // deadline. Now the eviction path proper must fire.
         let block = make_live_block(
             ShardGroupId::new(0),
@@ -580,7 +597,7 @@ mod tests {
         assert_eq!(
             node.outbound_provisions().memory_stats().tracked_provisions,
             0,
-            "outbound entry must be evicted — qc.weighted_timestamp now exceeds the deadline",
+            "outbound entry must be evicted — qc.weighted_timestamp() now exceeds the deadline",
         );
     }
 
@@ -596,11 +613,7 @@ mod tests {
         // single-tx manifest so the projection cleanly fits.
         let TestNode { mut node, .. } = TestNode::new();
 
-        let manifest = BlockManifest {
-            tx_hashes: vec![TxHash::ZERO].into(),
-            cert_ids: vec![].into(),
-            provision_hashes: vec![].into(),
-        };
+        let manifest = BlockManifest::new(vec![TxHash::ZERO], vec![], vec![]);
 
         // proposer_for(h=1, r=0) = committee[(1+0) % 4] = ValidatorId::new(1).
         // BFT's header validation rejects on proposer mismatch, so the

@@ -633,9 +633,18 @@ impl ProductionRunner {
         // The state machine was created BEFORE genesis bootstrap ran, so it has
         // stale/zero state. We need to sync it with the actual JMT state from
         // genesis so future blocks compute state_root from the correct base.
-        let genesis_qc = QuorumCertificate {
-            block_hash: genesis_block.hash(),
-            ..QuorumCertificate::genesis(self.local_shard)
+        let genesis_qc = {
+            let __qc = QuorumCertificate::genesis(self.local_shard);
+            QuorumCertificate::new(
+                genesis_block.hash(),
+                __qc.shard_group_id(),
+                __qc.height(),
+                __qc.parent_block_hash(),
+                __qc.round(),
+                __qc.signers().clone(),
+                __qc.aggregated_signature(),
+                __qc.weighted_timestamp(),
+            )
         };
         let genesis_certified = CertifiedBlock::new_unchecked(genesis_block, genesis_qc);
         let genesis_commit_output = io_loop.step(NodeInput::Protocol(Box::new(

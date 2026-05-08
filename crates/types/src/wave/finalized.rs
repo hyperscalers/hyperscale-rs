@@ -9,7 +9,8 @@ use sbor::{DecodeError, Decoder, EncodeError, Encoder, NoCustomValueKind, ValueK
 
 use crate::{
     BoundedVec, ConsensusReceipt, ExecutionCertificate, ExecutionOutcome, GlobalReceiptHash,
-    MAX_TXS_PER_BLOCK, StoredReceipt, TransactionDecision, TxHash, WaveCertificate, WaveId,
+    MAX_TXS_PER_BLOCK, StoredReceipt, TransactionDecision, TxHash, TxOutcome, WaveCertificate,
+    WaveId,
 };
 
 /// A finalized wave — all participating shards have reported, `WaveCertificate` created.
@@ -22,7 +23,7 @@ use crate::{
 ///
 /// The wave's canonical tx list, ordering, and per-tx decisions are all **derived**
 /// from the `WaveCertificate`, not stored alongside it. See:
-/// - [`FinalizedWave::local_ec`] — the authoritative EC (where `ec.wave_id == wc.wave_id`)
+/// - [`FinalizedWave::local_ec`] — the authoritative EC (where `ec.wave_id() == wc.wave_id`)
 /// - [`FinalizedWave::tx_hashes`] — iterator over the wave's tx hashes in block order
 /// - [`FinalizedWave::tx_decisions`] — aggregated (Aborted > Reject > Accept) per tx
 ///
@@ -33,12 +34,8 @@ use crate::{
 /// pending blocks, actions, and into the commit path.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct FinalizedWave {
-    /// The wave certificate carrying per-shard ECs and tx outcomes.
-    pub certificate: Arc<WaveCertificate>,
-    /// Stored receipts for txs that executed. Aborted txs are absent —
-    /// `receipts.len() <= tx_count()`. Preserves canonical block order.
-    /// Held in-memory until block commit, then written atomically with block metadata.
-    pub receipts: BoundedVec<StoredReceipt, MAX_TXS_PER_BLOCK>,
+    certificate: Arc<WaveCertificate>,
+    receipts: BoundedVec<StoredReceipt, MAX_TXS_PER_BLOCK>,
 }
 
 /// Reason a `FinalizedWave`'s receipts don't agree with its own EC.
@@ -91,21 +88,35 @@ pub enum ReceiptValidationError {
 }
 
 impl FinalizedWave {
+    /// The wave certificate carrying per-shard ECs and tx outcomes.
+    #[must_use]
+    pub const fn certificate(&self) -> &Arc<WaveCertificate> {
+        &self.certificate
+    }
+
+    /// Stored receipts for txs that executed. Aborted txs are absent —
+    /// `receipts.len() <= tx_count()`. Preserves canonical block order.
+    /// Held in-memory until block commit, then written atomically with block metadata.
+    #[must_use]
+    pub const fn receipts(&self) -> &BoundedVec<StoredReceipt, MAX_TXS_PER_BLOCK> {
+        &self.receipts
+    }
+
     /// Get the wave ID from the certificate.
     #[must_use]
     pub fn wave_id(&self) -> &WaveId {
-        &self.certificate.wave_id
+        self.certificate.wave_id()
     }
 
     /// Get the execution certificates (from the wave certificate).
     #[must_use]
     pub fn execution_certificates(&self) -> &[Arc<ExecutionCertificate>] {
-        &self.certificate.execution_certificates
+        self.certificate.execution_certificates()
     }
 
     /// The local shard's EC — authoritative for wave membership and ordering.
     ///
-    /// A well-formed `WaveCertificate` has exactly one EC with `ec.wave_id == wc.wave_id`
+    /// A well-formed `WaveCertificate` has exactly one EC with `ec.wave_id() == wc.wave_id`
     /// (invariant established by `WaveCertificateTracker::create_wave_certificate`
     /// and the endorsement + convergence gate).
     ///
@@ -116,16 +127,16 @@ impl FinalizedWave {
     #[must_use]
     pub fn local_ec(&self) -> &ExecutionCertificate {
         self.certificate
-            .execution_certificates
+            .execution_certificates()
             .iter()
-            .find(|ec| ec.wave_id == self.certificate.wave_id)
+            .find(|ec| ec.wave_id() == self.certificate.wave_id())
             .expect("WaveCertificate invariant: local EC must be present")
     }
 
     /// Number of transactions in this wave.
     #[must_use]
     pub fn tx_count(&self) -> usize {
-        self.local_ec().tx_outcomes.len()
+        self.local_ec().tx_outcomes().len()
     }
 
     /// Iterator over each receipt's consensus payload, in canonical
@@ -137,16 +148,16 @@ impl FinalizedWave {
 
     /// Iterator over the wave's tx hashes in canonical block order.
     pub fn tx_hashes(&self) -> impl Iterator<Item = TxHash> + '_ {
-        self.local_ec().tx_outcomes.iter().map(|o| o.tx_hash)
+        self.local_ec().tx_outcomes().iter().map(TxOutcome::tx_hash)
     }
 
     /// Whether the wave contains a given tx.
     #[must_use]
     pub fn contains_tx(&self, tx_hash: &TxHash) -> bool {
         self.local_ec()
-            .tx_outcomes
+            .tx_outcomes()
             .iter()
-            .any(|o| &o.tx_hash == tx_hash)
+            .any(|o| &o.tx_hash() == tx_hash)
     }
 
     /// Reconstruct a `FinalizedWave` from a `WaveCertificate` and a receipt lookup.
@@ -166,15 +177,15 @@ impl FinalizedWave {
         F: FnMut(&TxHash) -> Option<Arc<ConsensusReceipt>>,
     {
         let local_ec = certificate
-            .execution_certificates
+            .execution_certificates()
             .iter()
-            .find(|ec| ec.wave_id == certificate.wave_id)?;
+            .find(|ec| ec.wave_id() == certificate.wave_id())?;
 
-        let mut receipts: Vec<StoredReceipt> = Vec::with_capacity(local_ec.tx_outcomes.len());
-        for outcome in &local_ec.tx_outcomes {
-            match lookup(&outcome.tx_hash) {
+        let mut receipts: Vec<StoredReceipt> = Vec::with_capacity(local_ec.tx_outcomes().len());
+        for outcome in local_ec.tx_outcomes() {
+            match lookup(&outcome.tx_hash()) {
                 Some(receipt) => {
-                    receipts.push(StoredReceipt::synced(outcome.tx_hash, receipt));
+                    receipts.push(StoredReceipt::synced(outcome.tx_hash(), receipt));
                 }
                 None if outcome.is_aborted() => {}
                 None => return None,
@@ -216,28 +227,29 @@ impl FinalizedWave {
     pub fn validate_receipts_against_ec(&self) -> Result<(), ReceiptValidationError> {
         let local_ec = self
             .certificate
-            .execution_certificates
+            .execution_certificates()
             .iter()
-            .find(|ec| ec.wave_id == self.certificate.wave_id)
+            .find(|ec| ec.wave_id() == self.certificate.wave_id())
             .ok_or(ReceiptValidationError::MissingLocalEc)?;
 
         let mut receipt_iter = self.receipts.iter();
-        for outcome in &local_ec.tx_outcomes {
+        for outcome in local_ec.tx_outcomes() {
             // Aborted outcomes carry no stored receipt; skip.
-            let ec_kind = match &outcome.outcome {
+            let ec_kind = match outcome.outcome() {
                 ExecutionOutcome::Aborted => continue,
                 ExecutionOutcome::Succeeded { receipt_hash } => Some(*receipt_hash),
                 ExecutionOutcome::Failed => None,
             };
 
-            let receipt = receipt_iter
-                .next()
-                .ok_or(ReceiptValidationError::MissingReceipt {
-                    tx_hash: outcome.tx_hash,
-                })?;
-            if receipt.tx_hash != outcome.tx_hash {
+            let receipt =
+                receipt_iter
+                    .next()
+                    .ok_or_else(|| ReceiptValidationError::MissingReceipt {
+                        tx_hash: outcome.tx_hash(),
+                    })?;
+            if receipt.tx_hash != outcome.tx_hash() {
                 return Err(ReceiptValidationError::TxHashMismatch {
-                    expected: outcome.tx_hash,
+                    expected: outcome.tx_hash(),
                     actual: receipt.tx_hash,
                 });
             }
@@ -252,7 +264,7 @@ impl FinalizedWave {
                 ) => {
                     if *actual_hash != expected_hash {
                         return Err(ReceiptValidationError::ReceiptHashMismatch {
-                            tx_hash: outcome.tx_hash,
+                            tx_hash: outcome.tx_hash(),
                             expected: expected_hash,
                             actual: *actual_hash,
                         });
@@ -260,12 +272,12 @@ impl FinalizedWave {
                 }
                 (Some(_), ConsensusReceipt::Failed) => {
                     return Err(ReceiptValidationError::UnexpectedFailure {
-                        tx_hash: outcome.tx_hash,
+                        tx_hash: outcome.tx_hash(),
                     });
                 }
                 (None, ConsensusReceipt::Succeeded { .. }) => {
                     return Err(ReceiptValidationError::UnexpectedSuccess {
-                        tx_hash: outcome.tx_hash,
+                        tx_hash: outcome.tx_hash(),
                     });
                 }
                 (None, ConsensusReceipt::Failed) => { /* match — both Failed */ }
@@ -286,13 +298,13 @@ impl FinalizedWave {
     pub fn tx_decisions(&self) -> Vec<(TxHash, TransactionDecision)> {
         let mut aborted: HashSet<TxHash> = HashSet::new();
         let mut failure: HashSet<TxHash> = HashSet::new();
-        for ec in &self.certificate.execution_certificates {
-            for outcome in &ec.tx_outcomes {
+        for ec in self.certificate.execution_certificates() {
+            for outcome in ec.tx_outcomes() {
                 if outcome.is_aborted() {
-                    aborted.insert(outcome.tx_hash);
+                    aborted.insert(outcome.tx_hash());
                 }
-                if !matches!(outcome.outcome, ExecutionOutcome::Succeeded { .. }) {
-                    failure.insert(outcome.tx_hash);
+                if !matches!(outcome.outcome(), ExecutionOutcome::Succeeded { .. }) {
+                    failure.insert(outcome.tx_hash());
                 }
             }
         }

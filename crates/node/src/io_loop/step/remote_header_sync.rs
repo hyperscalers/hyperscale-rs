@@ -77,7 +77,7 @@ where
         let upper_bound = from_height.inner().saturating_add(count.inner());
         let mut delivered_heights = Vec::with_capacity(headers.len());
         for header in headers {
-            let h = header.header.height;
+            let h = header.header().height();
             if h < from_height || h.inner() >= upper_bound {
                 tracing::warn!(
                     source_shard = source_shard.inner(),

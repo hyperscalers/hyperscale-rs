@@ -129,16 +129,16 @@ pub const DOMAIN_STATE_PROVISION_BATCH: &[u8] = b"STATE_PROVISION_BATCH";
 #[must_use]
 pub fn state_provisions_message(provisions: &Provisions) -> Vec<u8> {
     let mut hasher = Hasher::new();
-    for tx in provisions.transactions.iter() {
+    for tx in provisions.transactions().iter() {
         hasher.update(tx.tx_hash.as_bytes());
     }
     let tx_digest = hasher.finalize();
 
     let mut message = Vec::with_capacity(96);
     message.extend_from_slice(DOMAIN_STATE_PROVISION_BATCH);
-    message.extend_from_slice(&provisions.source_shard.to_le_bytes());
-    message.extend_from_slice(&provisions.target_shard.to_le_bytes());
-    message.extend_from_slice(&provisions.block_height.to_le_bytes());
+    message.extend_from_slice(&provisions.source_shard().to_le_bytes());
+    message.extend_from_slice(&provisions.target_shard().to_le_bytes());
+    message.extend_from_slice(&provisions.block_height().to_le_bytes());
     message.extend_from_slice(tx_digest.as_bytes());
     message
 }
@@ -217,14 +217,14 @@ pub fn exec_vote_message(
     message.extend_from_slice(&vote_anchor_ts.as_millis().to_le_bytes());
     // WaveId is self-contained (shard + block_height + remote_shards),
     // so no separate block_hash needed in the signing message.
-    message.extend_from_slice(&wave_id.shard_group_id.to_le_bytes());
-    message.extend_from_slice(&wave_id.block_height.to_le_bytes());
+    message.extend_from_slice(&wave_id.shard_group_id().to_le_bytes());
+    message.extend_from_slice(&wave_id.block_height().to_le_bytes());
     message.extend_from_slice(
-        &u32::try_from(wave_id.remote_shards.len())
+        &u32::try_from(wave_id.remote_shards().len())
             .unwrap_or(u32::MAX)
             .to_le_bytes(),
     );
-    for shard in wave_id.remote_shards.iter() {
+    for shard in wave_id.remote_shards().iter() {
         message.extend_from_slice(&shard.to_le_bytes());
     }
     message.extend_from_slice(&shard_group.to_le_bytes());
@@ -238,7 +238,7 @@ pub fn exec_vote_message(
 pub fn exec_vote_batch_message(shard_group: ShardGroupId, votes: &[ExecutionVote]) -> Vec<u8> {
     let mut hasher = Hasher::new();
     for v in votes {
-        hasher.update(v.global_receipt_root.as_raw().as_bytes());
+        hasher.update(v.global_receipt_root().as_raw().as_bytes());
     }
     let digest = hasher.finalize();
 
@@ -257,7 +257,7 @@ pub fn exec_cert_batch_message(
 ) -> Vec<u8> {
     let mut hasher = Hasher::new();
     for c in certificates {
-        hasher.update(c.global_receipt_root.as_raw().as_bytes());
+        hasher.update(c.global_receipt_root().as_raw().as_bytes());
     }
     let digest = hasher.finalize();
 

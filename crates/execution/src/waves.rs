@@ -269,13 +269,13 @@ impl WaveRegistry {
     /// early-arrival buffer.
     pub fn classify_attestation(&self, ec: &ExecutionCertificate) -> AttestationRouting {
         let mut routing = AttestationRouting::default();
-        for outcome in &ec.tx_outcomes {
-            match self.assignments.get(&outcome.tx_hash) {
+        for outcome in ec.tx_outcomes() {
+            match self.assignments.get(&outcome.tx_hash()) {
                 Some(wave_id) => {
                     routing.affected_waves.insert(wave_id.clone());
-                    routing.routed_tx_hashes.push(outcome.tx_hash);
+                    routing.routed_tx_hashes.push(outcome.tx_hash());
                 }
-                None => routing.unrouted_tx_hashes.push(outcome.tx_hash),
+                None => routing.unrouted_tx_hashes.push(outcome.tx_hash()),
             }
         }
         routing
@@ -427,12 +427,12 @@ mod tests {
     }
 
     fn make_outcome(tx_hash: TxHash) -> TxOutcome {
-        TxOutcome {
+        TxOutcome::new(
             tx_hash,
-            outcome: ExecutionOutcome::Succeeded {
+            ExecutionOutcome::Succeeded {
                 receipt_hash: GlobalReceiptHash::ZERO,
             },
-        }
+        )
     }
 
     fn make_ec(wave_id: WaveId, tx_hashes: &[TxHash]) -> ExecutionCertificate {

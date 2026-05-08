@@ -53,7 +53,7 @@ impl ChainWriter for RocksDbStorage {
     ) -> (StateRoot, Self::PreparedCommit) {
         let receipts: Vec<&StoredReceipt> = finalized_waves
             .iter()
-            .flat_map(|fw| fw.receipts.iter())
+            .flat_map(|fw| fw.receipts().iter())
             .collect();
 
         // No receipts → no state changes → state root is unchanged.
@@ -201,7 +201,7 @@ impl ChainWriter for RocksDbStorage {
                     let receipts: Vec<StoredReceipt> = block
                         .certificates()
                         .iter()
-                        .flat_map(|fw| fw.receipts.iter().cloned())
+                        .flat_map(|fw| fw.receipts().iter().cloned())
                         .collect();
                     let merged_updates = merge_updates_from_receipts(&receipts);
                     let root =
@@ -218,7 +218,7 @@ impl ChainWriter for RocksDbStorage {
         let receipts: Vec<StoredReceipt> = block
             .certificates()
             .iter()
-            .flat_map(|fw| fw.receipts.iter().cloned())
+            .flat_map(|fw| fw.receipts().iter().cloned())
             .collect();
         let merged_updates = merge_updates_from_receipts(&receipts);
         let _commit_guard = self.commit_lock.lock().unwrap();

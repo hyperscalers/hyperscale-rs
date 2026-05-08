@@ -254,9 +254,9 @@ fn run_cross_shard_fault_scenario_with_seed<F>(
         let tx_hash = tx.hash();
 
         let touched_shards: std::collections::BTreeSet<ShardGroupId> = tx
-            .declared_reads
+            .declared_reads()
             .iter()
-            .chain(tx.declared_writes.iter())
+            .chain(tx.declared_writes().iter())
             .map(|nid| shard_for_node(nid, num_shards))
             .collect();
         assert!(

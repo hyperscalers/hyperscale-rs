@@ -12,33 +12,42 @@ use crate::{
 /// Contains an aggregated BLS signature from the voting validators.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct QuorumCertificate {
-    /// Hash of the block this QC certifies.
-    pub block_hash: BlockHash,
-
-    /// Shard group this QC belongs to (prevents cross-shard replay).
-    pub shard_group_id: ShardGroupId,
-
-    /// Height of the certified block.
-    pub height: BlockHeight,
-
-    /// Hash of the parent block (for two-chain commit rule).
-    pub parent_block_hash: BlockHash,
-
-    /// Round number when this QC was formed.
-    pub round: Round,
-
-    /// Bitfield indicating which validators signed.
-    pub signers: SignerBitfield,
-
-    /// Aggregated BLS signature from all signers.
-    pub aggregated_signature: Bls12381G2Signature,
-
-    /// BFT-authenticated stake-weighted block timestamp.
-    /// Computed as: `sum(timestamp_i` * `stake_i`) / `sum(stake_i)`
-    pub weighted_timestamp: WeightedTimestamp,
+    block_hash: BlockHash,
+    shard_group_id: ShardGroupId,
+    height: BlockHeight,
+    parent_block_hash: BlockHash,
+    round: Round,
+    signers: SignerBitfield,
+    aggregated_signature: Bls12381G2Signature,
+    weighted_timestamp: WeightedTimestamp,
 }
 
 impl QuorumCertificate {
+    /// Build a `QuorumCertificate` from its parts.
+    #[allow(clippy::too_many_arguments)] // mirrors the 8 stored fields
+    #[must_use]
+    pub const fn new(
+        block_hash: BlockHash,
+        shard_group_id: ShardGroupId,
+        height: BlockHeight,
+        parent_block_hash: BlockHash,
+        round: Round,
+        signers: SignerBitfield,
+        aggregated_signature: Bls12381G2Signature,
+        weighted_timestamp: WeightedTimestamp,
+    ) -> Self {
+        Self {
+            block_hash,
+            shard_group_id,
+            height,
+            parent_block_hash,
+            round,
+            signers,
+            aggregated_signature,
+            weighted_timestamp,
+        }
+    }
+
     /// Create a genesis QC (for block 0) for the given shard.
     ///
     /// The shard is tagged on the QC so any committee lookup keyed off
@@ -58,6 +67,81 @@ impl QuorumCertificate {
             aggregated_signature: zero_bls_signature(),
             weighted_timestamp: WeightedTimestamp::ZERO,
         }
+    }
+
+    /// Hash of the block this QC certifies.
+    #[must_use]
+    pub const fn block_hash(&self) -> BlockHash {
+        self.block_hash
+    }
+
+    /// Shard group this QC belongs to (prevents cross-shard replay).
+    #[must_use]
+    pub const fn shard_group_id(&self) -> ShardGroupId {
+        self.shard_group_id
+    }
+
+    /// Height of the certified block.
+    #[must_use]
+    pub const fn height(&self) -> BlockHeight {
+        self.height
+    }
+
+    /// Hash of the parent block (for two-chain commit rule).
+    #[must_use]
+    pub const fn parent_block_hash(&self) -> BlockHash {
+        self.parent_block_hash
+    }
+
+    /// Round number when this QC was formed.
+    #[must_use]
+    pub const fn round(&self) -> Round {
+        self.round
+    }
+
+    /// Bitfield indicating which validators signed.
+    #[must_use]
+    pub const fn signers(&self) -> &SignerBitfield {
+        &self.signers
+    }
+
+    /// Aggregated BLS signature from all signers.
+    #[must_use]
+    pub const fn aggregated_signature(&self) -> Bls12381G2Signature {
+        self.aggregated_signature
+    }
+
+    /// BFT-authenticated stake-weighted block timestamp.
+    /// Computed as: `sum(timestamp_i` * `stake_i`) / `sum(stake_i)`
+    #[must_use]
+    pub const fn weighted_timestamp(&self) -> WeightedTimestamp {
+        self.weighted_timestamp
+    }
+
+    /// Decompose into the raw fields, in struct-declaration order.
+    #[must_use]
+    pub fn into_parts(
+        self,
+    ) -> (
+        BlockHash,
+        ShardGroupId,
+        BlockHeight,
+        BlockHash,
+        Round,
+        SignerBitfield,
+        Bls12381G2Signature,
+        WeightedTimestamp,
+    ) {
+        (
+            self.block_hash,
+            self.shard_group_id,
+            self.height,
+            self.parent_block_hash,
+            self.round,
+            self.signers,
+            self.aggregated_signature,
+            self.weighted_timestamp,
+        )
     }
 
     /// Build the canonical signing message for this QC.
@@ -129,8 +213,8 @@ mod tests {
     fn test_genesis_qc() {
         let qc = QuorumCertificate::genesis(ShardGroupId::new(0));
         assert!(qc.is_genesis());
-        assert_eq!(qc.height, BlockHeight::new(0));
-        assert_eq!(qc.block_hash, BlockHash::ZERO);
+        assert_eq!(qc.height(), BlockHeight::new(0));
+        assert_eq!(qc.block_hash(), BlockHash::ZERO);
         assert_eq!(qc.signer_count(), 0);
         assert!(!qc.has_committable_block());
         assert!(qc.committable_height().is_none());
@@ -145,16 +229,16 @@ mod tests {
         signers.set(2);
 
         let parent_block_hash = BlockHash::from_raw(Hash::from_bytes(b"parent"));
-        let qc = QuorumCertificate {
-            block_hash: BlockHash::from_raw(Hash::from_bytes(b"block1")),
-            shard_group_id: ShardGroupId::new(0),
-            height: BlockHeight::new(1),
+        let qc = QuorumCertificate::new(
+            BlockHash::from_raw(Hash::from_bytes(b"block1")),
+            ShardGroupId::new(0),
+            BlockHeight::new(1),
             parent_block_hash,
-            round: Round::INITIAL,
+            Round::INITIAL,
             signers,
-            aggregated_signature: zero_bls_signature(),
-            weighted_timestamp: WeightedTimestamp::from_millis(1000),
-        };
+            zero_bls_signature(),
+            WeightedTimestamp::from_millis(1000),
+        );
 
         assert!(!qc.is_genesis());
         assert_eq!(qc.signer_count(), 3);

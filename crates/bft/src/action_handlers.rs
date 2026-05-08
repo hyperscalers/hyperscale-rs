@@ -117,7 +117,7 @@ pub fn verify_vote_batch(
 
     let signatures: Vec<Bls12381G2Signature> = votes_to_verify
         .iter()
-        .map(|(_, v, _, _)| v.signature)
+        .map(|(_, v, _, _)| v.signature())
         .collect();
     let public_keys: Vec<Bls12381G1PublicKey> =
         votes_to_verify.iter().map(|(_, _, pk, _)| *pk).collect();
@@ -136,11 +136,11 @@ pub fn verify_vote_batch(
     );
 
     for (idx, vote, pk, power) in votes_to_verify {
-        if verify_bls12381_v1(signing_message, &pk, &vote.signature) {
+        if verify_bls12381_v1(signing_message, &pk, &vote.signature()) {
             all_verified.push((idx, vote, power));
         } else {
             tracing::warn!(
-                voter = ?vote.voter,
+                voter = ?vote.voter(),
                 ?block_hash,
                 "Invalid vote signature detected"
             );
@@ -170,7 +170,8 @@ pub fn build_qc_from_verified(
     let mut sorted: Vec<_> = verified_votes.to_vec();
     sorted.sort_by_key(|(idx, _, _)| *idx);
 
-    let signatures: Vec<Bls12381G2Signature> = sorted.iter().map(|(_, v, _)| v.signature).collect();
+    let signatures: Vec<Bls12381G2Signature> =
+        sorted.iter().map(|(_, v, _)| v.signature()).collect();
     let aggregated_signature = match Bls12381G2Signature::aggregate(&signatures, true) {
         Ok(sig) => sig,
         Err(e) => {
@@ -190,7 +191,7 @@ pub fn build_qc_from_verified(
         // `weighted_timestamp` (slow honest clock or Byzantine voter) is
         // raised to the floor before aggregation, so the resulting QC's
         // `weighted_timestamp` is guaranteed >= parent's.
-        let clamped_ms = vote.timestamp.as_millis().max(floor_ms);
+        let clamped_ms = vote.timestamp().as_millis().max(floor_ms);
         timestamp_weight_sum += u128::from(clamped_ms) * u128::from(power.inner());
         verified_power += *power;
     }
@@ -202,16 +203,16 @@ pub fn build_qc_from_verified(
         u64::try_from(timestamp_weight_sum / u128::from(verified_power.inner())).unwrap_or(u64::MAX)
     };
 
-    Some(QuorumCertificate {
+    Some(QuorumCertificate::new(
         block_hash,
         shard_group_id,
         height,
         parent_block_hash,
         round,
-        aggregated_signature,
         signers,
-        weighted_timestamp: WeightedTimestamp::from_millis(weighted_timestamp_ms),
-    })
+        aggregated_signature,
+        WeightedTimestamp::from_millis(weighted_timestamp_ms),
+    ))
 }
 
 /// Verify a quorum certificate's aggregated BLS signature.
@@ -225,7 +226,7 @@ pub fn verify_qc_signature(qc: &QuorumCertificate, public_keys: &[Bls12381G1Publ
     let signer_keys: Vec<_> = public_keys
         .iter()
         .enumerate()
-        .filter(|(i, _)| qc.signers.is_set(*i))
+        .filter(|(i, _)| qc.signers().is_set(*i))
         .map(|(_, pk)| *pk)
         .collect();
 
@@ -236,7 +237,7 @@ pub fn verify_qc_signature(qc: &QuorumCertificate, public_keys: &[Bls12381G1Publ
 
     // Aggregate the public keys and verify (skip PK validation - trusted topology)
     Bls12381G1PublicKey::aggregate(&signer_keys, false).is_ok_and(|aggregated_pk| {
-        verify_bls12381_v1(&signing_message, &aggregated_pk, &qc.aggregated_signature)
+        verify_bls12381_v1(&signing_message, &aggregated_pk, &qc.aggregated_signature())
     })
 }
 
@@ -290,14 +291,14 @@ pub fn verify_transaction_root(
 
     let mut windows_valid = true;
     for tx in transactions {
-        if !tx.validity_range.is_well_formed(validity_anchor)
-            || !tx.validity_range.contains(validity_anchor)
+        if !tx.validity_range().is_well_formed(validity_anchor)
+            || !tx.validity_range().contains(validity_anchor)
         {
             tracing::warn!(
                 tx_hash = ?tx.hash(),
                 anchor_ms = validity_anchor.as_millis(),
-                start_ms = tx.validity_range.start_timestamp_inclusive.as_millis(),
-                end_ms = tx.validity_range.end_timestamp_exclusive.as_millis(),
+                start_ms = tx.validity_range().start_timestamp_inclusive.as_millis(),
+                end_ms = tx.validity_range().end_timestamp_exclusive.as_millis(),
                 "Transaction validity range check FAILED"
             );
             windows_valid = false;
@@ -487,7 +488,7 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
 
     let receipts: Vec<StoredReceipt> = certificates
         .iter()
-        .flat_map(|fw| fw.receipts.iter().cloned())
+        .flat_map(|fw| fw.receipts().iter().cloned())
         .collect();
 
     let mut provision_hashes: Vec<ProvisionHash> = provisions.iter().map(|p| p.hash()).collect();
@@ -498,8 +499,8 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
     let local_receipt_root = compute_local_receipt_root(&receipts);
     let raw_provision_hashes: Vec<Hash> = provision_hashes.iter().map(|h| h.into_raw()).collect();
     let provision_root = compute_provision_root(&raw_provision_hashes);
-    let waves = compute_waves(topology, height, &transactions).into();
-    let provision_tx_roots = compute_provision_tx_roots(topology, &transactions).into();
+    let waves = compute_waves(topology, height, &transactions);
+    let provision_tx_roots = compute_provision_tx_roots(topology, &transactions);
 
     // in_flight is deterministic from chain state:
     // parent's in_flight + new transactions committed - transactions finalized by certificates.
@@ -508,8 +509,8 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
         .saturating_add(new_tx_count)
         .saturating_sub(finalized_tx_count);
 
-    let header = BlockHeader {
-        shard_group_id: local_shard,
+    let header = BlockHeader::new(
+        local_shard,
         height,
         parent_block_hash,
         parent_qc,
@@ -525,7 +526,7 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
         waves,
         provision_tx_roots,
         in_flight,
-    };
+    );
 
     let block = Block::Live {
         header,
@@ -619,16 +620,16 @@ where
             height,
         } => {
             let start = std::time::Instant::now();
-            let qc_valid = verify_qc_signature(&committed_header.qc, &committee_public_keys);
+            let qc_valid = verify_qc_signature(committed_header.qc(), &committee_public_keys);
             let valid = if qc_valid {
                 let total_power: VotePower = committed_header
-                    .qc
-                    .signers
+                    .qc()
+                    .signers()
                     .set_indices()
                     .filter_map(|idx| committee_voting_power.get(idx).copied())
                     .sum();
                 total_power >= quorum_threshold
-                    && committed_header.qc.block_hash == committed_header.header.hash()
+                    && committed_header.qc().block_hash() == committed_header.header().hash()
             } else {
                 false
             };
@@ -744,7 +745,7 @@ where
             // events are emitted.
             let stored_receipts: Vec<StoredReceipt> = finalized_waves
                 .iter()
-                .flat_map(|fw| fw.receipts.iter().cloned())
+                .flat_map(|fw| fw.receipts().iter().cloned())
                 .collect();
 
             let receipt_start = std::time::Instant::now();
@@ -869,9 +870,9 @@ where
         Action::BroadcastBlockHeader { header, manifest } => {
             let block_hash = header.hash();
             let msg = block_header_message(
-                header.shard_group_id,
-                header.height,
-                header.round,
+                header.shard_group_id(),
+                header.height(),
+                header.round(),
                 &block_hash,
             );
             let sig = ctx.signing_key.sign_v1(&msg);
@@ -912,9 +913,9 @@ where
 
         Action::BroadcastCommittedBlockHeader { committed_header } => {
             let msg = committed_block_header_message(
-                committed_header.header.shard_group_id,
-                committed_header.header.height,
-                &committed_header.header.hash(),
+                committed_header.header().shard_group_id(),
+                committed_header.header().height(),
+                &committed_header.header().hash(),
             );
             let sig = ctx.signing_key.sign_v1(&msg);
             let gossip = CommittedBlockHeaderGossip {
@@ -1015,9 +1016,18 @@ mod tests {
 
         // Vote 1's signature is replaced by a signature over a different block.
         let other_hash = BlockHash::from_raw(Hash::from_bytes(b"other"));
-        let mut bad_vote = make_vote(&keys, 1, block_hash, height, round, 1000);
+        let bad_vote = make_vote(&keys, 1, block_hash, height, round, 1000);
         let bad_signing_vote = make_vote(&keys, 1, other_hash, height, round, 1000);
-        bad_vote.signature = bad_signing_vote.signature;
+        let (block_hash_v, sg, h, r, voter, _, ts) = bad_vote.into_parts();
+        let bad_vote = BlockVote::from_parts(
+            block_hash_v,
+            sg,
+            h,
+            r,
+            voter,
+            bad_signing_vote.signature(),
+            ts,
+        );
 
         let to_verify = vec![
             (
@@ -1092,9 +1102,9 @@ mod tests {
 
         let pubs: Vec<_> = keys.iter().map(Bls12381G1PrivateKey::public_key).collect();
         assert!(verify_qc_signature(&qc, &pubs));
-        assert_eq!(qc.block_hash, block_hash);
-        assert_eq!(qc.height, height);
-        assert_eq!(qc.parent_block_hash, parent);
+        assert_eq!(qc.block_hash(), block_hash);
+        assert_eq!(qc.height(), height);
+        assert_eq!(qc.parent_block_hash(), parent);
         assert_eq!(qc.signer_count(), 3);
     }
 
@@ -1128,7 +1138,7 @@ mod tests {
         )
         .unwrap();
 
-        let set: Vec<_> = qc.signers.set_indices().collect();
+        let set: Vec<_> = qc.signers().set_indices().collect();
         assert_eq!(set, vec![0, 2, 3]);
     }
 
@@ -1187,7 +1197,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(qc.weighted_timestamp.as_millis(), 2333);
+        assert_eq!(qc.weighted_timestamp().as_millis(), 2333);
     }
 
     #[test]
@@ -1249,8 +1259,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(qc.weighted_timestamp.as_millis(), 2333);
-        assert!(qc.weighted_timestamp.as_millis() >= parent_floor.as_millis());
+        assert_eq!(qc.weighted_timestamp().as_millis(), 2333);
+        assert!(qc.weighted_timestamp().as_millis() >= parent_floor.as_millis());
     }
 
     // ─── verify_and_build_qc (composition) ──────────────────────────────
@@ -1335,7 +1345,7 @@ mod tests {
                 (i, vote, VotePower::new(1))
             })
             .collect();
-        let mut qc = build_qc_from_verified(
+        let qc = build_qc_from_verified(
             block_hash,
             shard(),
             BlockHeight::new(1),
@@ -1345,7 +1355,16 @@ mod tests {
             &verified,
         )
         .unwrap();
-        qc.signers = SignerBitfield::new(3);
+        let qc = QuorumCertificate::new(
+            qc.block_hash(),
+            qc.shard_group_id(),
+            qc.height(),
+            qc.parent_block_hash(),
+            qc.round(),
+            SignerBitfield::new(3),
+            qc.aggregated_signature(),
+            qc.weighted_timestamp(),
+        );
 
         let pubs: Vec<_> = keys.iter().map(Bls12381G1PrivateKey::public_key).collect();
         assert!(!verify_qc_signature(&qc, &pubs));

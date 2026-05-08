@@ -355,8 +355,8 @@ impl ExecutionCoordinator {
                     let conflicts = self.provisioning.register_tx(
                         tx_hash,
                         topology,
-                        &tx.declared_reads,
-                        &tx.declared_writes,
+                        tx.declared_reads(),
+                        tx.declared_writes(),
                     );
                     if !self.provisioning.is_fully_provisioned(&tx_hash) {
                         reverse_conflicts.extend(conflicts);
@@ -514,7 +514,8 @@ impl ExecutionCoordinator {
             wave.record_receipt(result);
         }
         for wr in tx_outcomes {
-            wave.record_execution_result(wr.tx_hash, wr.outcome);
+            let (tx_hash, outcome) = wr.into_parts();
+            wave.record_execution_result(tx_hash, outcome);
         }
 
         // With local receipts in hand, the wave may have crossed into
@@ -621,7 +622,7 @@ impl ExecutionCoordinator {
         // fully provisioned (execution can proceed) or its wave has already
         // dispatched (inert to mid-flight input).
         for provisions in &ordered {
-            let source_shard = provisions.source_shard;
+            let source_shard = provisions.source_shard();
             for conflict in self.provisioning.detect_conflicts(provisions, committed_ts) {
                 let loser = conflict.loser_tx;
                 if self.provisioning.is_fully_provisioned(&loser) {
@@ -706,8 +707,8 @@ impl ExecutionCoordinator {
         topology: &TopologySnapshot,
         vote: ExecutionVote,
     ) -> Vec<Action> {
-        let wave_id = vote.wave_id.clone();
-        let validator_id = vote.validator;
+        let wave_id = vote.wave_id().clone();
+        let validator_id = vote.validator();
 
         // Only votes from local-committee members count. A globally-known
         // validator outside this shard's committee whose vote pooled into
@@ -834,12 +835,12 @@ impl ExecutionCoordinator {
         topology: &TopologySnapshot,
         vote: ExecutionVote,
     ) -> Vec<Action> {
-        let wave_id = vote.wave_id.clone();
+        let wave_id = vote.wave_id().clone();
         // Callers (`on_execution_vote` for own votes, `on_votes_verified`
         // for verified votes that already passed the committee filter)
-        // guarantee `vote.validator` is in the local committee.
+        // guarantee `vote.validator()` is in the local committee.
         let voting_power = topology
-            .voting_power(vote.validator)
+            .voting_power(vote.validator())
             .expect("committee member has voting power (TopologySnapshot invariant)");
 
         let Some(tracker) = self.waves.get_tracker_mut(&wave_id) else {
@@ -969,7 +970,7 @@ impl ExecutionCoordinator {
         // The wave_id IS the set of remote shards — no need to look up the
         // accumulator (which may have been pruned by the time the cert is
         // aggregated, especially with many shards where provision flow is slower).
-        let remote_shards: Vec<ShardGroupId> = wave_id.remote_shards.iter().copied().collect();
+        let remote_shards: Vec<ShardGroupId> = wave_id.remote_shards().iter().copied().collect();
 
         // Make the cert available to the io_loop's inbound EC fetch handler
         // for fallback serving until the containing block commits.
@@ -1004,7 +1005,7 @@ impl ExecutionCoordinator {
 
         tracing::debug!(
             wave = %wave_id,
-            tx_count = certificate.tx_outcomes.len(),
+            tx_count = certificate.tx_outcomes().len(),
             remote_shards = remote_shards.len(),
             "Wave leader broadcasting EC to local peers and remote shards"
         );
@@ -1038,7 +1039,7 @@ impl ExecutionCoordinator {
         if !self.pending_ec_verifications.insert(wire_hash) {
             tracing::debug!(
                 shard = shard.inner(),
-                wave = %cert.wave_id,
+                wave = %cert.wave_id(),
                 "Duplicate EC verification dispatch suppressed"
             );
             return vec![];
@@ -1084,7 +1085,7 @@ impl ExecutionCoordinator {
         if !valid {
             tracing::warn!(
                 shard = certificate.shard_group_id().inner(),
-                wave = %certificate.wave_id,
+                wave = %certificate.wave_id(),
                 "Invalid execution certificate signature"
             );
             return vec![];
@@ -1096,7 +1097,7 @@ impl ExecutionCoordinator {
         if !ec_has_shard_quorum_power(topology, &certificate) {
             tracing::warn!(
                 shard = certificate.shard_group_id().inner(),
-                wave = %certificate.wave_id,
+                wave = %certificate.wave_id(),
                 "Discarding sub-quorum execution certificate"
             );
             return vec![];
@@ -1113,15 +1114,15 @@ impl ExecutionCoordinator {
         let cleared = self.expected_certs.mark_fulfilled(
             shard,
             ec_arc.block_height(),
-            &ec_arc.wave_id,
-            ec_arc.tx_outcomes.iter().map(|o| o.tx_hash),
+            ec_arc.wave_id(),
+            ec_arc.tx_outcomes().iter().map(TxOutcome::tx_hash),
             ec_arc.deadline(),
         );
         if cleared {
             tracing::debug!(
                 source_shard = shard.inner(),
                 block_height = ec_arc.block_height().inner(),
-                wave = %ec_arc.wave_id,
+                wave = %ec_arc.wave_id(),
                 at_local_ts_ms = self.committed_ts.as_millis(),
                 "Fulfilled expected exec cert"
             );
@@ -1137,9 +1138,9 @@ impl ExecutionCoordinator {
         // it in scan_complete_waves, and persist it for fallback serving to
         // remote shards.
         if shard == topology.local_shard() {
-            self.waves.mark_ec_dispatched(ec_arc.wave_id.clone());
+            self.waves.mark_ec_dispatched(ec_arc.wave_id().clone());
             // EC received from wave leader — cancel any pending vote retry.
-            self.waves.clear_vote_retry(&ec_arc.wave_id);
+            self.waves.clear_vote_retry(ec_arc.wave_id());
             // Make the verified cert available to the io_loop's inbound EC
             // fetch handler for fallback serving until block commit.
             self.exec_certs.insert(Arc::clone(&ec_arc));
@@ -1168,7 +1169,7 @@ impl ExecutionCoordinator {
         let local_shard = topology.local_shard();
 
         for wave in waves {
-            if wave.remote_shards.contains(&local_shard) {
+            if wave.remote_shards().contains(&local_shard) {
                 self.expected_certs.register(
                     source_shard,
                     block_height,
@@ -1190,11 +1191,11 @@ impl ExecutionCoordinator {
         let mut actions = Vec::with_capacity(fetches.len());
         for (wave_id, is_retry) in fetches {
             let peers = topology
-                .committee_for_shard(wave_id.shard_group_id)
+                .committee_for_shard(wave_id.shard_group_id())
                 .to_vec();
             tracing::info!(
-                source_shard = wave_id.shard_group_id.inner(),
-                block_height = wave_id.block_height.inner(),
+                source_shard = wave_id.shard_group_id().inner(),
+                block_height = wave_id.block_height().inner(),
                 wave = %wave_id,
                 retry = is_retry,
                 "Execution cert timeout — requesting fallback"
@@ -1216,7 +1217,7 @@ impl ExecutionCoordinator {
         let shards_needed: HashSet<ShardGroupId> = self
             .waves
             .waves_iter()
-            .flat_map(|(wid, _)| wid.remote_shards.iter().copied())
+            .flat_map(|(wid, _)| wid.remote_shards().iter().copied())
             .filter(|s| *s != local_shard)
             .collect();
         self.expected_certs
@@ -1301,17 +1302,17 @@ impl ExecutionCoordinator {
     /// 5. **Dispatch** — route to the live or sealed path for block-specific
     ///    work (wave setup + dispatch, or late-cert routing).
     #[instrument(skip(self, certified), fields(
-        height = certified.block.height().inner(),
-        block_hash = ?certified.block.hash(),
-        tx_count = certified.block.transactions().len(),
-        is_live = certified.block.is_live(),
+        height = certified.block().height().inner(),
+        block_hash = ?certified.block().hash(),
+        tx_count = certified.block().transactions().len(),
+        is_live = certified.block().is_live(),
     ))]
     pub fn on_block_committed(
         &mut self,
         topology: &TopologySnapshot,
         certified: &CertifiedBlock,
     ) -> Vec<Action> {
-        let block = &certified.block;
+        let block = certified.block();
         let height = block.height();
 
         // Update committed height + timestamp before anything else — needed
@@ -1320,7 +1321,7 @@ impl ExecutionCoordinator {
         let first_commit = self.committed_ts == WeightedTimestamp::ZERO;
         if height > self.committed_height {
             self.committed_height = height;
-            self.committed_ts = certified.qc.weighted_timestamp;
+            self.committed_ts = certified.qc().weighted_timestamp();
         }
         self.provisioning.advance_clock(self.committed_ts);
 
@@ -1422,11 +1423,11 @@ impl ExecutionCoordinator {
         transactions: &[Arc<RoutableTransaction>],
         provisions: &[Arc<Provisions>],
     ) -> Vec<Action> {
-        let height = header.height;
+        let height = header.height();
         let mut actions = Vec::new();
 
         // ── Provision broadcasting (proposer only) ─────────────────────
-        if topology.local_validator_id() == header.proposer {
+        if topology.local_validator_id() == header.proposer() {
             let local_shard = topology.local_shard();
             if let Some((requests, shard_recipients)) =
                 Self::build_provision_requests(topology, transactions, local_shard)
@@ -1492,7 +1493,7 @@ impl ExecutionCoordinator {
         if transactions.is_empty() {
             return Vec::new();
         }
-        self.register_sealed_wave_assignments(topology, header.height, transactions);
+        self.register_sealed_wave_assignments(topology, header.height(), transactions);
         self.replay_early_wave_attestations(topology, transactions)
     }
 
@@ -1609,31 +1610,28 @@ impl ExecutionCoordinator {
         // with the wave. This mirrors `FinalizedWave::reconstruct` and is
         // what `validate_receipts_against_ec` enforces at peer ingress.
         let local_ec = wc
-            .execution_certificates
+            .execution_certificates()
             .iter()
-            .find(|ec| ec.wave_id == wc.wave_id)
+            .find(|ec| ec.wave_id() == wc.wave_id())
             .expect("WaveCertificate invariant: local EC must be present");
-        let mut receipts: Vec<StoredReceipt> = Vec::with_capacity(local_ec.tx_outcomes.len());
-        for outcome in &local_ec.tx_outcomes {
+        let mut receipts: Vec<StoredReceipt> = Vec::with_capacity(local_ec.tx_outcomes().len());
+        for outcome in local_ec.tx_outcomes() {
             if outcome.is_aborted() {
                 continue;
             }
-            if let Some(receipt) = wave.take_receipt(&outcome.tx_hash) {
+            if let Some(receipt) = wave.take_receipt(&outcome.tx_hash()) {
                 receipts.push(receipt);
             } else {
                 tracing::error!(
                     wave = %wave_id,
-                    tx_hash = ?outcome.tx_hash,
+                    tx_hash = ?outcome.tx_hash(),
                     "finalize_wave: non-aborted tx is missing its stored receipt \
                      (is_complete gate bypassed)"
                 );
             }
         }
 
-        let finalized = FinalizedWave {
-            certificate: Arc::new(wc),
-            receipts: receipts.into(),
-        };
+        let finalized = FinalizedWave::new(Arc::new(wc), receipts);
         let finalized_arc = Arc::new(finalized.clone());
         self.finalized.insert(wave_id.clone(), finalized);
 
@@ -1853,7 +1851,9 @@ impl ExecutionCoordinator {
             if registry.contains_wave(key) {
                 return true;
             }
-            votes.first().is_some_and(|v| v.vote_anchor_ts > ev_cutoff)
+            votes
+                .first()
+                .is_some_and(|v| v.vote_anchor_ts() > ev_cutoff)
         });
         let pruned_ev = before_ev - self.early.vote_len();
 
@@ -1933,9 +1933,9 @@ impl ExecutionCoordinator {
                 continue;
             }
             let mut owned_nodes: Vec<_> = tx
-                .declared_reads
+                .declared_reads()
                 .iter()
-                .chain(tx.declared_writes.iter())
+                .chain(tx.declared_writes().iter())
                 .filter(|&node_id| topology.shard_for_node_id(node_id) == local_shard)
                 .copied()
                 .collect();
@@ -1946,9 +1946,9 @@ impl ExecutionCoordinator {
                 // Build per-target-shard node needs for conflict detection.
                 let mut target_nodes: Vec<(ShardGroupId, Vec<NodeId>)> = Vec::new();
                 let all_nodes: Vec<&NodeId> = tx
-                    .declared_reads
+                    .declared_reads()
                     .iter()
-                    .chain(tx.declared_writes.iter())
+                    .chain(tx.declared_writes().iter())
                     .collect();
                 for &target_shard in &topology
                     .all_shards_for_transaction(tx)
@@ -2050,9 +2050,9 @@ mod tests {
     };
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
-        Bls12381G1PrivateKey, BoundedVec, ConsensusReceipt, ExecutionOutcome, GlobalReceiptHash,
-        Hash, SignerBitfield, ValidatorInfo, ValidatorSet, VotePower, generate_bls_keypair,
-        zero_bls_signature,
+        Bls12381G1PrivateKey, ConsensusReceipt, ExecutionOutcome, GlobalReceiptHash, Hash,
+        QuorumCertificate, SignerBitfield, ValidatorInfo, ValidatorSet, VotePower,
+        generate_bls_keypair, zero_bls_signature,
     };
 
     use super::*;
@@ -2251,18 +2251,18 @@ mod tests {
         assert!(state_non.waves.contains_wave(&wave_id));
 
         // Simulate receiving a vote (as if we're a fallback leader).
-        let fake_vote = ExecutionVote {
+        let fake_vote = ExecutionVote::new(
             block_hash,
-            block_height: BlockHeight::new(1),
-            vote_anchor_ts: WeightedTimestamp::ZERO,
-            wave_id: wave_id.clone(),
-            shard_group_id: ShardGroupId::new(0),
-            global_receipt_root: GlobalReceiptRoot::ZERO,
-            tx_count: 1,
-            tx_outcomes: vec![],
-            validator: leader, // vote from the original leader
-            signature: zero_bls_signature(),
-        };
+            BlockHeight::new(1),
+            WeightedTimestamp::ZERO,
+            wave_id.clone(),
+            ShardGroupId::new(0),
+            GlobalReceiptRoot::ZERO,
+            1,
+            vec![],
+            leader,
+            zero_bls_signature(),
+        );
 
         state_non.on_execution_vote(&topo_non, fake_vote);
 
@@ -2289,18 +2289,18 @@ mod tests {
 
         let mut state = make_test_state();
         let wave_id = WaveId::new(ShardGroupId::new(0), BlockHeight::new(1), BTreeSet::new());
-        let vote = ExecutionVote {
-            block_hash: BlockHash::ZERO,
-            block_height: BlockHeight::new(1),
-            vote_anchor_ts: WeightedTimestamp::ZERO,
-            wave_id: wave_id.clone(),
-            shard_group_id: ShardGroupId::new(0),
-            global_receipt_root: GlobalReceiptRoot::ZERO,
-            tx_count: 0,
-            tx_outcomes: vec![],
-            validator: outsider,
-            signature: zero_bls_signature(),
-        };
+        let vote = ExecutionVote::new(
+            BlockHash::ZERO,
+            BlockHeight::new(1),
+            WeightedTimestamp::ZERO,
+            wave_id.clone(),
+            ShardGroupId::new(0),
+            GlobalReceiptRoot::ZERO,
+            0,
+            vec![],
+            outsider,
+            zero_bls_signature(),
+        );
 
         let actions = state.on_execution_vote(&topo, vote);
         assert!(actions.is_empty(), "non-committee vote must be dropped");
@@ -2527,13 +2527,10 @@ mod tests {
             zero_bls_signature(),
             signers,
         ));
-        let wave = Arc::new(FinalizedWave {
-            certificate: Arc::new(WaveCertificate {
-                wave_id,
-                execution_certificates: vec![ec],
-            }),
-            receipts: BoundedVec::new(),
-        });
+        let wave = Arc::new(FinalizedWave::new(
+            Arc::new(WaveCertificate::new(wave_id, vec![ec])),
+            vec![],
+        ));
 
         let actions = state.admit_finalized_wave(&topo, wave);
         assert_eq!(actions.len(), 1);
@@ -2562,13 +2559,10 @@ mod tests {
             zero_bls_signature(),
             SignerBitfield::new(4),
         ));
-        let wave = Arc::new(FinalizedWave {
-            certificate: Arc::new(WaveCertificate {
-                wave_id,
-                execution_certificates: vec![ec],
-            }),
-            receipts: BoundedVec::new(),
-        });
+        let wave = Arc::new(FinalizedWave::new(
+            Arc::new(WaveCertificate::new(wave_id, vec![ec])),
+            vec![],
+        ));
         let actions = state.on_finalized_wave_verified(wave, false);
         assert!(actions.is_empty());
     }
@@ -2587,13 +2581,10 @@ mod tests {
             zero_bls_signature(),
             SignerBitfield::new(4),
         ));
-        let wave = Arc::new(FinalizedWave {
-            certificate: Arc::new(WaveCertificate {
-                wave_id,
-                execution_certificates: vec![ec],
-            }),
-            receipts: BoundedVec::new(),
-        });
+        let wave = Arc::new(FinalizedWave::new(
+            Arc::new(WaveCertificate::new(wave_id, vec![ec])),
+            vec![],
+        ));
         let actions = state.on_finalized_wave_verified(wave, true);
         assert_eq!(actions.len(), 1);
         assert!(matches!(
@@ -2691,13 +2682,10 @@ mod tests {
             zero_bls_signature(),
             signers,
         ));
-        let wave = Arc::new(FinalizedWave {
-            certificate: Arc::new(WaveCertificate {
-                wave_id,
-                execution_certificates: vec![ec],
-            }),
-            receipts: BoundedVec::new(),
-        });
+        let wave = Arc::new(FinalizedWave::new(
+            Arc::new(WaveCertificate::new(wave_id, vec![ec])),
+            vec![],
+        ));
 
         let first = state.admit_finalized_wave(&topo, Arc::clone(&wave));
         assert_eq!(first.len(), 1);
@@ -2727,13 +2715,10 @@ mod tests {
             zero_bls_signature(),
             signers,
         ));
-        let wave = FinalizedWave {
-            certificate: Arc::new(WaveCertificate {
-                wave_id: wave_id.clone(),
-                execution_certificates: vec![ec],
-            }),
-            receipts: BoundedVec::new(),
-        };
+        let wave = FinalizedWave::new(
+            Arc::new(WaveCertificate::new(wave_id.clone(), vec![ec])),
+            vec![],
+        );
         // Seed the canonical store directly (mirrors what `finalize_wave`
         // does on the local-aggregation path).
         state.finalized.insert(wave_id, wave.clone());
@@ -2762,13 +2747,10 @@ mod tests {
             zero_bls_signature(),
             SignerBitfield::empty(), // no signers — far below 2f+1
         ));
-        let wave = Arc::new(FinalizedWave {
-            certificate: Arc::new(WaveCertificate {
-                wave_id,
-                execution_certificates: vec![bogus_ec],
-            }),
-            receipts: BoundedVec::new(),
-        });
+        let wave = Arc::new(FinalizedWave::new(
+            Arc::new(WaveCertificate::new(wave_id, vec![bogus_ec])),
+            vec![],
+        ));
 
         let actions = state.admit_finalized_wave(&topo, wave);
         assert!(
@@ -2851,10 +2833,10 @@ mod tests {
             wave_id,
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
-            vec![TxOutcome {
-                tx_hash: TxHash::from_raw(Hash::from_bytes(b"untracked_tx")),
-                outcome: ExecutionOutcome::Aborted,
-            }],
+            vec![TxOutcome::new(
+                TxHash::from_raw(Hash::from_bytes(b"untracked_tx")),
+                ExecutionOutcome::Aborted,
+            )],
             zero_bls_signature(),
             SignerBitfield::new(4),
         );
@@ -3009,11 +2991,13 @@ mod tests {
         let tx_hashes: Vec<TxHash> = wave.tx_hashes().to_vec();
         let tx_outcomes: Vec<TxOutcome> = tx_hashes
             .iter()
-            .map(|h| TxOutcome {
-                tx_hash: *h,
-                outcome: ExecutionOutcome::Succeeded {
-                    receipt_hash: GlobalReceiptHash::ZERO,
-                },
+            .map(|h| {
+                TxOutcome::new(
+                    *h,
+                    ExecutionOutcome::Succeeded {
+                        receipt_hash: GlobalReceiptHash::ZERO,
+                    },
+                )
             })
             .collect();
         for h in &tx_hashes {
@@ -3191,8 +3175,18 @@ mod tests {
             ValidatorId::new(0),
             vec![],
         );
-        let mut certified = certify(block);
-        certified.qc.weighted_timestamp = WeightedTimestamp::from_millis(30_000);
+        let (block, qc) = certify(block).into_parts();
+        let qc = QuorumCertificate::new(
+            qc.block_hash(),
+            qc.shard_group_id(),
+            qc.height(),
+            qc.parent_block_hash(),
+            qc.round(),
+            qc.signers().clone(),
+            qc.aggregated_signature(),
+            WeightedTimestamp::from_millis(30_000),
+        );
+        let certified = CertifiedBlock::new_unchecked(block, qc);
 
         let actions = state.on_block_committed(&topo, &certified);
 

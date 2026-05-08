@@ -10,10 +10,11 @@ use std::sync::Arc;
 use hyperscale_provisions::{ProvisionConfig, ProvisionCoordinator, ProvisionMemoryStats};
 use hyperscale_test_helpers::TestCommittee;
 use hyperscale_types::{
-    Block, BlockHash, BlockHeader, BlockHeight, BoundedBTreeMap, BoundedVec, CertificateRoot,
-    CertifiedBlock, CommittedBlockHeader, Hash, InFlightCount, LocalReceiptRoot, LocalTimestamp,
-    ProposerTimestamp, ProvisionHash, ProvisionsRoot, QuorumCertificate, Round, ShardGroupId,
+    Block, BlockHash, BlockHeader, BlockHeight, BoundedVec, CertificateRoot, CertifiedBlock,
+    CommittedBlockHeader, Hash, InFlightCount, LocalReceiptRoot, LocalTimestamp, ProposerTimestamp,
+    ProvisionHash, ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, SignerBitfield,
     StateRoot, TopologySnapshot, TransactionRoot, ValidatorId, WaveId, WeightedTimestamp,
+    zero_bls_signature,
 };
 
 const TEST_BLOCK_INTERVAL_MS: u64 = 500;
@@ -28,19 +29,42 @@ fn fresh_coordinator_with_topology() -> (ProvisionCoordinator, TopologySnapshot)
 }
 
 fn make_block(height: BlockHeight) -> CertifiedBlock {
-    let mut header =
-        BlockHeader::genesis(ShardGroupId::new(0), ValidatorId::new(0), StateRoot::ZERO);
-    header.height = height;
+    let header = BlockHeader::new(
+        ShardGroupId::new(0),
+        height,
+        BlockHash::from_raw(Hash::from_bytes(&[0u8; 32])),
+        QuorumCertificate::genesis(ShardGroupId::new(0)),
+        ValidatorId::new(0),
+        ProposerTimestamp::ZERO,
+        Round::INITIAL,
+        false,
+        StateRoot::ZERO,
+        TransactionRoot::ZERO,
+        CertificateRoot::ZERO,
+        LocalReceiptRoot::ZERO,
+        ProvisionsRoot::ZERO,
+        Vec::new(),
+        std::collections::BTreeMap::new(),
+        InFlightCount::ZERO,
+    );
     let block = Block::Live {
         header,
         transactions: Arc::new(BoundedVec::new()),
         certificates: Arc::new(BoundedVec::new()),
         provisions: Arc::new(BoundedVec::new()),
     };
-    let qc = QuorumCertificate {
-        block_hash: block.hash(),
-        weighted_timestamp: WeightedTimestamp::from_millis(height.inner() * TEST_BLOCK_INTERVAL_MS),
-        ..QuorumCertificate::genesis(ShardGroupId::new(0))
+    let qc = {
+        let __qc = QuorumCertificate::genesis(ShardGroupId::new(0));
+        QuorumCertificate::new(
+            block.hash(),
+            __qc.shard_group_id(),
+            __qc.height(),
+            __qc.parent_block_hash(),
+            __qc.round(),
+            __qc.signers().clone(),
+            __qc.aggregated_signature(),
+            WeightedTimestamp::from_millis(height.inner() * TEST_BLOCK_INTERVAL_MS),
+        )
     };
     CertifiedBlock::new_unchecked(block, qc)
 }
@@ -58,29 +82,35 @@ fn make_remote_header_targeting(
         height,
         std::collections::BTreeSet::from([local_shard]),
     )];
-    let header = BlockHeader {
-        shard_group_id: source_shard,
+    let header = BlockHeader::new(
+        source_shard,
         height,
-        parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
-        parent_qc: QuorumCertificate::genesis(ShardGroupId::new(0)),
-        proposer: ValidatorId::new(0),
-        timestamp: ProposerTimestamp::from_millis(1000 + height.inner()),
-        round: Round::INITIAL,
-        is_fallback: false,
-        state_root: StateRoot::ZERO,
-        transaction_root: TransactionRoot::ZERO,
-        certificate_root: CertificateRoot::ZERO,
-        local_receipt_root: LocalReceiptRoot::ZERO,
-        provision_root: ProvisionsRoot::ZERO,
-        waves: waves.into(),
-        provision_tx_roots: BoundedBTreeMap::new(),
-        in_flight: InFlightCount::ZERO,
-    };
+        BlockHash::from_raw(Hash::from_bytes(b"parent")),
+        QuorumCertificate::genesis(ShardGroupId::new(0)),
+        ValidatorId::new(0),
+        ProposerTimestamp::from_millis(1000 + height.inner()),
+        Round::INITIAL,
+        false,
+        StateRoot::ZERO,
+        TransactionRoot::ZERO,
+        CertificateRoot::ZERO,
+        LocalReceiptRoot::ZERO,
+        ProvisionsRoot::ZERO,
+        waves,
+        std::collections::BTreeMap::new(),
+        InFlightCount::ZERO,
+    );
     let header_hash = header.hash();
-    let mut qc = QuorumCertificate::genesis(ShardGroupId::new(0));
-    qc.block_hash = header_hash;
-    qc.shard_group_id = source_shard;
-    qc.height = height;
+    let qc = QuorumCertificate::new(
+        header_hash,
+        source_shard,
+        height,
+        BlockHash::ZERO,
+        Round::INITIAL,
+        SignerBitfield::empty(),
+        zero_bls_signature(),
+        WeightedTimestamp::ZERO,
+    );
     Arc::new(CommittedBlockHeader::new(header, qc))
 }
 

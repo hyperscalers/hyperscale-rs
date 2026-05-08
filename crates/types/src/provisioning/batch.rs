@@ -27,20 +27,11 @@ use crate::{
 /// cached for the lifetime of the value.
 #[derive(BasicSbor)]
 pub struct Provisions {
-    /// Source shard that committed this block.
-    pub source_shard: ShardGroupId,
-
-    /// Target shard the bundle is destined for.
-    pub target_shard: ShardGroupId,
-
-    /// Block height at which the state was committed.
-    pub block_height: BlockHeight,
-
-    /// Aggregated merkle multiproof covering all entries for this block.
-    pub proof: MerkleInclusionProof,
-
-    /// Per-transaction entries.
-    pub transactions: BoundedVec<TxEntries, MAX_TXS_PER_BLOCK>,
+    source_shard: ShardGroupId,
+    target_shard: ShardGroupId,
+    block_height: BlockHeight,
+    proof: MerkleInclusionProof,
+    transactions: BoundedVec<TxEntries, MAX_TXS_PER_BLOCK>,
 
     /// Lazily-computed content hash (blake3 over SBOR-encoded content fields).
     /// Populated on first [`Self::hash`] call; not on the wire.
@@ -108,6 +99,36 @@ impl Provisions {
             transactions: transactions.into(),
             hash: OnceLock::new(),
         }
+    }
+
+    /// Source shard that committed this block.
+    #[must_use]
+    pub const fn source_shard(&self) -> ShardGroupId {
+        self.source_shard
+    }
+
+    /// Target shard the bundle is destined for.
+    #[must_use]
+    pub const fn target_shard(&self) -> ShardGroupId {
+        self.target_shard
+    }
+
+    /// Block height at which the state was committed.
+    #[must_use]
+    pub const fn block_height(&self) -> BlockHeight {
+        self.block_height
+    }
+
+    /// Aggregated merkle multiproof covering all entries for this block.
+    #[must_use]
+    pub const fn proof(&self) -> &MerkleInclusionProof {
+        &self.proof
+    }
+
+    /// Per-transaction entries.
+    #[must_use]
+    pub const fn transactions(&self) -> &BoundedVec<TxEntries, MAX_TXS_PER_BLOCK> {
+        &self.transactions
     }
 
     /// Content hash, computed on first call and cached.
@@ -255,7 +276,7 @@ mod tests {
         let bytes = basic_encode(&original).unwrap();
         let decoded: Provisions = basic_decode(&bytes).unwrap();
         assert_eq!(original, decoded);
-        assert_eq!(decoded.target_shard, ShardGroupId::new(2));
+        assert_eq!(decoded.target_shard(), ShardGroupId::new(2));
     }
 
     #[test]
@@ -293,24 +314,24 @@ mod tests {
     #[test]
     fn test_provisions_all_entries_deduped() {
         let entry = test_entry(1);
-        let mut provisions = Provisions::dummy(
+        let provisions = Provisions::new(
             ShardGroupId::new(0),
             ShardGroupId::new(1),
             BlockHeight::new(10),
+            MerkleInclusionProof::dummy(),
+            vec![
+                TxEntries::new(
+                    TxHash::from_raw(Hash::from_bytes(b"tx1")),
+                    vec![entry.clone()],
+                    vec![],
+                ),
+                TxEntries::new(
+                    TxHash::from_raw(Hash::from_bytes(b"tx2")),
+                    vec![entry, test_entry(2)],
+                    vec![],
+                ),
+            ],
         );
-        provisions.transactions = vec![
-            TxEntries::new(
-                TxHash::from_raw(Hash::from_bytes(b"tx1")),
-                vec![entry.clone()],
-                vec![],
-            ),
-            TxEntries::new(
-                TxHash::from_raw(Hash::from_bytes(b"tx2")),
-                vec![entry, test_entry(2)],
-                vec![],
-            ),
-        ]
-        .into();
 
         let deduped = provisions.all_entries_deduped();
         assert_eq!(deduped.len(), 2);

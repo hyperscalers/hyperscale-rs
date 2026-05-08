@@ -192,8 +192,8 @@ impl ProvisionCoordinator {
         certified: &CertifiedBlock,
     ) -> Vec<Action> {
         let mut actions: Vec<Action> = Vec::new();
-        let block = &certified.block;
-        let new_ts = certified.qc.weighted_timestamp;
+        let block = certified.block();
+        let new_ts = certified.qc().weighted_timestamp();
         self.expected.record_block_committed(block.height(), new_ts);
         let local_ts = self.expected.local_ts();
 
@@ -354,16 +354,16 @@ impl ProvisionCoordinator {
         // Only store headers that target our shard (i.e., we expect provisions).
         let local_shard = topology.local_shard();
         let targets_us = committed_header
-            .header
-            .waves
+            .header()
+            .waves()
             .iter()
-            .any(|w| w.remote_shards.contains(&local_shard));
+            .any(|w| w.remote_shards().contains(&local_shard));
 
         if targets_us {
             // Store as verified (QC already checked by coordinator).
             self.headers.insert(key, Arc::clone(committed_header));
 
-            let proposer = committed_header.header.proposer;
+            let proposer = committed_header.header().proposer();
             debug!(
                 shard = shard.inner(),
                 height = height.inner(),
@@ -387,7 +387,7 @@ impl ProvisionCoordinator {
                 "Found buffered provisions for verified header"
             );
             let local_ts = self.expected.local_ts();
-            let source_block_ts = committed_header.qc.weighted_timestamp;
+            let source_block_ts = committed_header.qc().weighted_timestamp();
             for provisions in drained {
                 if provisions.deadline(source_block_ts) <= local_ts {
                     debug!(
@@ -425,17 +425,17 @@ impl ProvisionCoordinator {
         topology: &TopologySnapshot,
         provisions: Provisions,
     ) -> Vec<Action> {
-        if provisions.transactions.is_empty() {
+        if provisions.transactions().is_empty() {
             return vec![];
         }
 
-        let source_shard = provisions.source_shard;
-        let block_height = provisions.block_height;
+        let source_shard = provisions.source_shard();
+        let block_height = provisions.block_height();
 
         debug!(
             source_shard = source_shard.inner(),
             block_height = block_height.inner(),
-            count = provisions.transactions.len(),
+            count = provisions.transactions().len(),
             "Provisions received"
         );
 
@@ -447,10 +447,10 @@ impl ProvisionCoordinator {
         // Reject provisions not destined for our shard. Indicates a proposer
         // bug, a network misroute, or an adversarial attempt — log loudly so
         // it's visible but don't propagate.
-        if provisions.target_shard != topology.local_shard() {
+        if provisions.target_shard() != topology.local_shard() {
             warn!(
                 source_shard = source_shard.inner(),
-                target_shard = provisions.target_shard.inner(),
+                target_shard = provisions.target_shard().inner(),
                 local_shard = topology.local_shard().inner(),
                 block_height = block_height.inner(),
                 "Dropping provisions: target_shard does not match local shard"
@@ -472,7 +472,7 @@ impl ProvisionCoordinator {
         if let Some(verified_header) = self.headers.get(key).cloned() {
             // Reject if the source block has aged past `RETENTION_HORIZON` —
             // every tx in it has expired and no shard can still need this data.
-            let deadline = provisions.deadline(verified_header.qc.weighted_timestamp);
+            let deadline = provisions.deadline(verified_header.qc().weighted_timestamp());
             if deadline <= self.expected.local_ts() {
                 debug!(
                     source_shard = source_shard.inner(),
@@ -488,7 +488,7 @@ impl ProvisionCoordinator {
         debug!(
             source_shard = source_shard.inner(),
             block_height = block_height.inner(),
-            count = provisions.transactions.len(),
+            count = provisions.transactions().len(),
             "Buffering provisions (waiting for remote header)"
         );
         self.pipeline
@@ -515,14 +515,14 @@ impl ProvisionCoordinator {
     ) -> Vec<Action> {
         let local_shard = topology.local_shard();
         let Some(expected_root) = committed_header
-            .header
-            .provision_tx_roots
+            .header()
+            .provision_tx_roots()
             .get(&local_shard)
             .copied()
         else {
             warn!(
-                source_shard = provisions.source_shard.inner(),
-                block_height = provisions.block_height.inner(),
+                source_shard = provisions.source_shard().inner(),
+                block_height = provisions.block_height().inner(),
                 local_shard = local_shard.inner(),
                 "Dropping provisions: source header has no provision_tx_root for us"
             );
@@ -530,7 +530,7 @@ impl ProvisionCoordinator {
         };
 
         let leaves: Vec<Hash> = provisions
-            .transactions
+            .transactions()
             .iter()
             .map(|t| t.tx_hash.into_raw())
             .collect();
@@ -538,10 +538,10 @@ impl ProvisionCoordinator {
 
         if computed_root != expected_root {
             warn!(
-                source_shard = provisions.source_shard.inner(),
-                block_height = provisions.block_height.inner(),
+                source_shard = provisions.source_shard().inner(),
+                block_height = provisions.block_height().inner(),
                 local_shard = local_shard.inner(),
-                tx_count = provisions.transactions.len(),
+                tx_count = provisions.transactions().len(),
                 ?expected_root,
                 ?computed_root,
                 "Rejecting incomplete provisions — tx-root mismatch; \
@@ -569,7 +569,7 @@ impl ProvisionCoordinator {
         now: LocalTimestamp,
     ) -> Vec<Action> {
         let mut actions = vec![];
-        let source_shard = provisions.source_shard;
+        let source_shard = provisions.source_shard();
 
         // Clear expected-provision tracking and the matching header. The
         // header's only job — verify these provisions — is done; hanging on
@@ -581,8 +581,8 @@ impl ProvisionCoordinator {
         // for paths where no admission event fires (orphan cleanup in
         // `on_block_committed`).
         if let Some(header) = committed_header {
-            let shard = header.header.shard_group_id;
-            let height = header.header.height;
+            let shard = header.header().shard_group_id();
+            let height = header.header().height();
             let key = (shard, height);
 
             if self.expected.on_provisions_verified(shard, height) {
@@ -593,7 +593,7 @@ impl ProvisionCoordinator {
         if !valid {
             warn!(
                 source_shard = source_shard.inner(),
-                tx_count = provisions.transactions.len(),
+                tx_count = provisions.transactions().len(),
                 "Provisions verification failed"
             );
             return actions;
@@ -606,7 +606,7 @@ impl ProvisionCoordinator {
             );
             return actions;
         };
-        let source_block_ts = header.qc.weighted_timestamp;
+        let source_block_ts = header.qc().weighted_timestamp();
 
         let provisions = self.pipeline.insert_verified(provisions, source_block_ts);
 
@@ -619,7 +619,7 @@ impl ProvisionCoordinator {
 
         debug!(
             source_shard = source_shard.inner(),
-            tx_count = provisions.transactions.len(),
+            tx_count = provisions.transactions().len(),
             "Provisions verified and queued"
         );
 
@@ -679,11 +679,11 @@ impl ProvisionCoordinator {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{
-        Block, BlockHash, BlockHeader, Bls12381G1PrivateKey, BoundedBTreeMap, BoundedVec,
-        CertificateRoot, Hash, InFlightCount, LocalReceiptRoot, MerkleInclusionProof,
-        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, StateRoot, TopologySnapshot,
+        Block, BlockHash, BlockHeader, Bls12381G1PrivateKey, BoundedVec, CertificateRoot, Hash,
+        InFlightCount, LocalReceiptRoot, MerkleInclusionProof, ProposerTimestamp, ProvisionsRoot,
+        QuorumCertificate, Round, ShardGroupId, SignerBitfield, StateRoot, TopologySnapshot,
         TransactionRoot, TxEntries, TxHash, ValidatorId, ValidatorInfo, ValidatorSet, VotePower,
-        WaveId, WeightedTimestamp, bls_keypair_from_seed,
+        WaveId, WeightedTimestamp, bls_keypair_from_seed, zero_bls_signature,
     };
     use proptest::bool::ANY as ANY_BOOL;
     use proptest::collection::vec as prop_vec;
@@ -741,12 +741,31 @@ mod tests {
         local_shard: ShardGroupId,
         tx_hashes: &[TxHash],
     ) -> Arc<CommittedBlockHeader> {
-        let mut header_arc = make_committed_header_with_targets(shard, height, vec![local_shard]);
-        let header = Arc::get_mut(&mut header_arc).unwrap();
+        let header_arc = make_committed_header_with_targets(shard, height, vec![local_shard]);
         let raw: Vec<Hash> = tx_hashes.iter().map(|h| h.into_raw()).collect();
         let root = ProvisionTxRoot::from_raw(compute_merkle_root(&raw));
-        header.header.provision_tx_roots.0.insert(local_shard, root);
-        header_arc
+        let (header, qc) = Arc::unwrap_or_clone(header_arc).into_parts();
+        let mut roots = header.provision_tx_roots().clone().into_inner();
+        roots.insert(local_shard, root);
+        let header = BlockHeader::new(
+            header.shard_group_id(),
+            header.height(),
+            header.parent_block_hash(),
+            header.parent_qc().clone(),
+            header.proposer(),
+            header.timestamp(),
+            header.round(),
+            header.is_fallback(),
+            header.state_root(),
+            header.transaction_root(),
+            header.certificate_root(),
+            header.local_receipt_root(),
+            header.provision_root(),
+            header.waves().clone().into_inner(),
+            roots,
+            header.in_flight(),
+        );
+        Arc::new(CommittedBlockHeader::new(header, qc))
     }
 
     #[test]
@@ -897,7 +916,7 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             &actions[0],
-            Action::VerifyProvisions { provisions, .. } if provisions.transactions[0].tx_hash == tx_hash
+            Action::VerifyProvisions { provisions, .. } if provisions.transactions()[0].tx_hash == tx_hash
         ));
     }
 
@@ -950,7 +969,7 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             &actions[0],
-            Action::VerifyProvisions { provisions, .. } if provisions.transactions[0].tx_hash == tx_hash
+            Action::VerifyProvisions { provisions, .. } if provisions.transactions()[0].tx_hash == tx_hash
         ));
     }
 
@@ -1046,7 +1065,7 @@ mod tests {
         assert!(actions.iter().any(|a| matches!(
             a,
             Action::Continuation(ProtocolEvent::ProvisionsAdmitted { provisions, .. })
-            if provisions.transactions[0].tx_hash == tx_hash
+            if provisions.transactions()[0].tx_hash == tx_hash
         )));
     }
 
@@ -1120,7 +1139,7 @@ mod tests {
         assert_eq!(actions.len(), 1);
         match &actions[0] {
             Action::VerifyProvisions { provisions, .. } => {
-                assert_eq!(provisions.transactions.len(), 3);
+                assert_eq!(provisions.transactions().len(), 3);
             }
             other => panic!("Expected VerifyProvisions, got {other:?}"),
         }
@@ -1315,30 +1334,37 @@ mod tests {
             .into_iter()
             .map(|s| WaveId::new(shard, height, std::collections::BTreeSet::from([s])))
             .collect();
-        let header = BlockHeader {
-            shard_group_id: shard,
+        let header = BlockHeader::new(
+            shard,
             height,
-            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            parent_qc: QuorumCertificate::genesis(ShardGroupId::new(0)),
-            proposer: ValidatorId::new(0),
-            timestamp: ProposerTimestamp::from_millis(1000 + height.inner()),
-            round: Round::INITIAL,
-            is_fallback: false,
-            state_root: StateRoot::from_raw(Hash::from_bytes(
+            BlockHash::from_raw(Hash::from_bytes(b"parent")),
+            QuorumCertificate::genesis(ShardGroupId::new(0)),
+            ValidatorId::new(0),
+            ProposerTimestamp::from_millis(1000 + height.inner()),
+            Round::INITIAL,
+            false,
+            StateRoot::from_raw(Hash::from_bytes(
                 format!("root_{shard}_{height}").as_bytes(),
             )),
-            transaction_root: TransactionRoot::ZERO,
-            certificate_root: CertificateRoot::ZERO,
-            local_receipt_root: LocalReceiptRoot::ZERO,
-            provision_root: ProvisionsRoot::ZERO,
-            waves: waves.into(),
-            provision_tx_roots: BoundedBTreeMap::new(),
-            in_flight: InFlightCount::ZERO,
-        };
+            TransactionRoot::ZERO,
+            CertificateRoot::ZERO,
+            LocalReceiptRoot::ZERO,
+            ProvisionsRoot::ZERO,
+            waves,
+            std::collections::BTreeMap::new(),
+            InFlightCount::ZERO,
+        );
         let header_hash = header.hash();
-        let mut qc = QuorumCertificate::genesis(ShardGroupId::new(0));
-        qc.block_hash = header_hash;
-        qc.shard_group_id = shard;
+        let qc = QuorumCertificate::new(
+            header_hash,
+            shard,
+            BlockHeight::new(0),
+            BlockHash::ZERO,
+            Round::INITIAL,
+            SignerBitfield::empty(),
+            zero_bls_signature(),
+            WeightedTimestamp::ZERO,
+        );
         Arc::new(CommittedBlockHeader::new(header, qc))
     }
 
@@ -1350,21 +1376,42 @@ mod tests {
     /// Make a minimal `Block` at the given height for `on_block_committed` calls.
     /// The attached QC's `weighted_timestamp_ms` is `height * TEST_BLOCK_INTERVAL_MS`.
     fn make_block(height: BlockHeight) -> CertifiedBlock {
-        let mut header =
-            BlockHeader::genesis(ShardGroupId::new(0), ValidatorId::new(0), StateRoot::ZERO);
-        header.height = height;
+        let header = BlockHeader::new(
+            ShardGroupId::new(0),
+            height,
+            BlockHash::from_raw(Hash::from_bytes(&[0u8; 32])),
+            QuorumCertificate::genesis(ShardGroupId::new(0)),
+            ValidatorId::new(0),
+            ProposerTimestamp::ZERO,
+            Round::INITIAL,
+            false,
+            StateRoot::ZERO,
+            TransactionRoot::ZERO,
+            CertificateRoot::ZERO,
+            LocalReceiptRoot::ZERO,
+            ProvisionsRoot::ZERO,
+            Vec::new(),
+            std::collections::BTreeMap::new(),
+            InFlightCount::ZERO,
+        );
         let block = Block::Live {
             header,
             transactions: Arc::new(BoundedVec::new()),
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),
         };
-        let qc = QuorumCertificate {
-            block_hash: block.hash(),
-            weighted_timestamp: WeightedTimestamp::from_millis(
-                height.inner() * TEST_BLOCK_INTERVAL_MS,
-            ),
-            ..QuorumCertificate::genesis(ShardGroupId::new(0))
+        let qc = {
+            let __qc = QuorumCertificate::genesis(ShardGroupId::new(0));
+            QuorumCertificate::new(
+                block.hash(),
+                __qc.shard_group_id(),
+                __qc.height(),
+                __qc.parent_block_hash(),
+                __qc.round(),
+                __qc.signers().clone(),
+                __qc.aggregated_signature(),
+                WeightedTimestamp::from_millis(height.inner() * TEST_BLOCK_INTERVAL_MS),
+            )
         };
         CertifiedBlock::new_unchecked(block, qc)
     }
@@ -2053,7 +2100,7 @@ mod tests {
         let eligible = coordinator.queued_provisions(LocalTimestamp::from_millis(1_400));
         assert_eq!(eligible.len(), 1);
         assert_eq!(
-            eligible[0].transactions[0].tx_hash,
+            eligible[0].transactions()[0].tx_hash,
             TxHash::from_raw(Hash::from_bytes(b"tx_old"))
         );
     }

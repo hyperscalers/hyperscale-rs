@@ -121,10 +121,7 @@ impl ExecutedTx {
             },
             ConsensusReceipt::Failed => ExecutionOutcome::Failed,
         };
-        TxOutcome {
-            tx_hash: self.tx_hash,
-            outcome,
-        }
+        TxOutcome::new(self.tx_hash, outcome)
     }
 }
 

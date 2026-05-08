@@ -1,6 +1,6 @@
 //! Block header containing consensus metadata.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use sbor::prelude::*;
 
@@ -21,126 +21,71 @@ use crate::{
 /// - Transaction commitment (merkle root of all transactions in the block)
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct BlockHeader {
-    /// Shard group this block belongs to.
-    ///
-    /// Makes headers self-describing for cross-shard verification. A remote shard
-    /// needs to know which shard's committee to verify the QC against.
-    pub shard_group_id: ShardGroupId,
-
-    /// Block height in the chain (genesis = 0).
-    pub height: BlockHeight,
-
-    /// Hash of parent block.
-    pub parent_block_hash: BlockHash,
-
-    /// Quorum certificate proving parent block was committed.
-    pub parent_qc: QuorumCertificate,
-
-    /// Validator that proposed this block.
-    pub proposer: ValidatorId,
-
-    /// Proposer's local wall-clock when this block was proposed.
-    ///
-    /// **Not** BFT-authenticated. Used only for BFT liveness bounds (rejecting
-    /// rushed/stale proposals against the local validator's clock) and local
-    /// latency metrics. Never anchor a deterministic timeout on this — use
-    /// `qc.weighted_timestamp` / `ts_ms` fields derived from it instead.
-    pub timestamp: ProposerTimestamp,
-
-    /// View/round number for view change protocol.
-    pub round: Round,
-
-    /// Whether this block was created as a fallback when leader timed out.
-    pub is_fallback: bool,
-
-    /// JMT state root hash after applying all certificates in this block.
-    pub state_root: StateRoot,
-
-    /// Merkle root of all transactions in this block.
-    ///
-    /// Each transaction's hash is a leaf in a padded binary merkle tree.
-    /// For empty blocks (fallback, sync), this is `TransactionRoot::ZERO`.
-    pub transaction_root: TransactionRoot,
-
-    /// Merkle root of all certificate receipt hashes in this block.
-    ///
-    /// Each certificate's `receipt_hash` (hash of outcome + `event_root`) is a leaf
-    /// in a binary merkle tree. This enables light-client proof of "did transaction
-    /// X succeed/fail in block N?" without replaying the block.
-    ///
-    /// For empty blocks (genesis, fallback, no certificates), this is `CertificateRoot::ZERO`.
-    pub certificate_root: CertificateRoot,
-
-    /// Merkle root of per-tx consensus-receipt hashes
-    /// ([`ConsensusReceipt::local_receipt_hash`](crate::ConsensusReceipt::local_receipt_hash))
-    /// for all transactions covered by this block's wave certificates.
-    ///
-    /// Commits to the specific per-tx state deltas (shard-filtered `DatabaseUpdates`)
-    /// that were applied to produce `state_root`. Enables per-tx delta attribution
-    /// and receipt integrity verification by sync nodes.
-    ///
-    /// For empty blocks (genesis, fallback, no certificates), this is `LocalReceiptRoot::ZERO`.
-    pub local_receipt_root: LocalReceiptRoot,
-
-    /// Merkle root of provisions included in this block.
-    ///
-    /// Commits to which remote-shard provisions are available at this height.
-    /// Validators who voted for the BFT proposal have this data locally.
-    /// `ProvisionsRoot::ZERO` when no provisions are included (single-shard or empty block).
-    pub provision_root: ProvisionsRoot,
-
-    /// Cross-shard execution waves in this block.
-    ///
-    /// Each `WaveId` is the set of remote shards that a group of transactions
-    /// depends on for provisions. Transactions with identical remote shard sets
-    /// share a wave. Wave-zero (single-shard txs) is excluded.
-    ///
-    /// QC-attested (covered by the block hash), so a byzantine proposer
-    /// cannot forge it without the block being rejected by honest validators —
-    /// `validate_waves` recomputes this from `transactions` and compares.
-    ///
-    /// Used by remote shards to know which execution certificates to expect.
-    /// Provisions completeness is handled separately via
-    /// [`BlockHeader::provision_tx_roots`]. Empty for genesis, fallback, and
-    /// sync blocks.
-    ///
-    /// Capped at [`MAX_TXS_PER_BLOCK`] — every wave covers ≥1 distinct tx,
-    /// so the wave count is bounded by the per-block tx count.
-    pub waves: BoundedVec<WaveId, MAX_TXS_PER_BLOCK>,
-
-    /// Per-target-shard merkle commitment over the tx hashes a target shard
-    /// should receive provisions for from this block.
-    ///
-    /// Key = target shard; value = `compute_merkle_root` over the
-    /// ordered tx hashes destined for that target (block order, already
-    /// hash-ascending). Lets the target verify a received `Provisions`
-    /// contains the full set it was meant to receive — catches silently
-    /// dropped txs on the broadcast path.
-    ///
-    /// Entries only exist for targets with ≥1 tx. Empty for genesis,
-    /// single-shard-only blocks, and empty blocks.
-    ///
-    /// Capped at [`MAX_REMOTE_SHARDS_PER_WAVE`] — same domain (remote
-    /// shards) as the per-wave dependency set; one entry per touched
-    /// target shard.
-    pub provision_tx_roots:
-        BoundedBTreeMap<ShardGroupId, ProvisionTxRoot, MAX_REMOTE_SHARDS_PER_WAVE>,
-
-    /// Approximate number of in-flight transactions on this shard at proposal time.
-    ///
-    /// "In-flight" = committed + executed transactions in the proposer's mempool,
-    /// i.e. transactions actively holding state locks. Gossiped cross-shard via
-    /// `CommittedBlockHeaderGossip` so RPC nodes can reject transactions targeting
-    /// congested remote shards.
-    ///
-    /// BFT-verified within tolerance (validators may differ slightly due to
-    /// execution timing). Zero for genesis; fallback and sync blocks carry
-    /// the parent's in-flight count forward unchanged (no txs admitted, none
-    /// finalized).
-    pub in_flight: InFlightCount,
+    shard_group_id: ShardGroupId,
+    height: BlockHeight,
+    parent_block_hash: BlockHash,
+    parent_qc: QuorumCertificate,
+    proposer: ValidatorId,
+    timestamp: ProposerTimestamp,
+    round: Round,
+    is_fallback: bool,
+    state_root: StateRoot,
+    transaction_root: TransactionRoot,
+    certificate_root: CertificateRoot,
+    local_receipt_root: LocalReceiptRoot,
+    provision_root: ProvisionsRoot,
+    waves: BoundedVec<WaveId, MAX_TXS_PER_BLOCK>,
+    provision_tx_roots: BoundedBTreeMap<ShardGroupId, ProvisionTxRoot, MAX_REMOTE_SHARDS_PER_WAVE>,
+    in_flight: InFlightCount,
 }
 
 impl BlockHeader {
+    /// Build a `BlockHeader` from its parts.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `waves.len() > MAX_TXS_PER_BLOCK` or
+    /// `provision_tx_roots.len() > MAX_REMOTE_SHARDS_PER_WAVE`.
+    #[allow(clippy::too_many_arguments)] // mirrors the 16 stored fields
+    #[must_use]
+    pub fn new(
+        shard_group_id: ShardGroupId,
+        height: BlockHeight,
+        parent_block_hash: BlockHash,
+        parent_qc: QuorumCertificate,
+        proposer: ValidatorId,
+        timestamp: ProposerTimestamp,
+        round: Round,
+        is_fallback: bool,
+        state_root: StateRoot,
+        transaction_root: TransactionRoot,
+        certificate_root: CertificateRoot,
+        local_receipt_root: LocalReceiptRoot,
+        provision_root: ProvisionsRoot,
+        waves: Vec<WaveId>,
+        provision_tx_roots: BTreeMap<ShardGroupId, ProvisionTxRoot>,
+        in_flight: InFlightCount,
+    ) -> Self {
+        Self {
+            shard_group_id,
+            height,
+            parent_block_hash,
+            parent_qc,
+            proposer,
+            timestamp,
+            round,
+            is_fallback,
+            state_root,
+            transaction_root,
+            certificate_root,
+            local_receipt_root,
+            provision_root,
+            waves: waves.into(),
+            provision_tx_roots: provision_tx_roots.into(),
+            in_flight,
+        }
+    }
+
     /// Create a genesis block header (height 0) with the given proposer and JMT state.
     #[must_use]
     pub fn genesis(
@@ -168,6 +113,206 @@ impl BlockHeader {
         }
     }
 
+    /// Shard group this block belongs to.
+    ///
+    /// Makes headers self-describing for cross-shard verification. A remote shard
+    /// needs to know which shard's committee to verify the QC against.
+    #[must_use]
+    pub const fn shard_group_id(&self) -> ShardGroupId {
+        self.shard_group_id
+    }
+
+    /// Block height in the chain (genesis = 0).
+    #[must_use]
+    pub const fn height(&self) -> BlockHeight {
+        self.height
+    }
+
+    /// Hash of parent block.
+    #[must_use]
+    pub const fn parent_block_hash(&self) -> BlockHash {
+        self.parent_block_hash
+    }
+
+    /// Quorum certificate proving parent block was committed.
+    #[must_use]
+    pub const fn parent_qc(&self) -> &QuorumCertificate {
+        &self.parent_qc
+    }
+
+    /// Validator that proposed this block.
+    #[must_use]
+    pub const fn proposer(&self) -> ValidatorId {
+        self.proposer
+    }
+
+    /// Proposer's local wall-clock when this block was proposed.
+    ///
+    /// **Not** BFT-authenticated. Used only for BFT liveness bounds (rejecting
+    /// rushed/stale proposals against the local validator's clock) and local
+    /// latency metrics. Never anchor a deterministic timeout on this — use
+    /// `qc.weighted_timestamp` / `ts_ms` fields derived from it instead.
+    #[must_use]
+    pub const fn timestamp(&self) -> ProposerTimestamp {
+        self.timestamp
+    }
+
+    /// View/round number for view change protocol.
+    #[must_use]
+    pub const fn round(&self) -> Round {
+        self.round
+    }
+
+    /// Whether this block was created as a fallback when leader timed out.
+    #[must_use]
+    pub const fn is_fallback(&self) -> bool {
+        self.is_fallback
+    }
+
+    /// JMT state root hash after applying all certificates in this block.
+    #[must_use]
+    pub const fn state_root(&self) -> StateRoot {
+        self.state_root
+    }
+
+    /// Merkle root of all transactions in this block.
+    ///
+    /// Each transaction's hash is a leaf in a padded binary merkle tree.
+    /// For empty blocks (fallback, sync), this is `TransactionRoot::ZERO`.
+    #[must_use]
+    pub const fn transaction_root(&self) -> TransactionRoot {
+        self.transaction_root
+    }
+
+    /// Merkle root of all certificate receipt hashes in this block.
+    ///
+    /// Each certificate's `receipt_hash` (hash of outcome + `event_root`) is a leaf
+    /// in a binary merkle tree. This enables light-client proof of "did transaction
+    /// X succeed/fail in block N?" without replaying the block.
+    ///
+    /// For empty blocks (genesis, fallback, no certificates), this is `CertificateRoot::ZERO`.
+    #[must_use]
+    pub const fn certificate_root(&self) -> CertificateRoot {
+        self.certificate_root
+    }
+
+    /// Merkle root of per-tx consensus-receipt hashes
+    /// ([`ConsensusReceipt::local_receipt_hash`](crate::ConsensusReceipt::local_receipt_hash))
+    /// for all transactions covered by this block's wave certificates.
+    ///
+    /// Commits to the specific per-tx state deltas (shard-filtered `DatabaseUpdates`)
+    /// that were applied to produce `state_root`. Enables per-tx delta attribution
+    /// and receipt integrity verification by sync nodes.
+    ///
+    /// For empty blocks (genesis, fallback, no certificates), this is `LocalReceiptRoot::ZERO`.
+    #[must_use]
+    pub const fn local_receipt_root(&self) -> LocalReceiptRoot {
+        self.local_receipt_root
+    }
+
+    /// Merkle root of provisions included in this block.
+    ///
+    /// Commits to which remote-shard provisions are available at this height.
+    /// Validators who voted for the BFT proposal have this data locally.
+    /// `ProvisionsRoot::ZERO` when no provisions are included (single-shard or empty block).
+    #[must_use]
+    pub const fn provision_root(&self) -> ProvisionsRoot {
+        self.provision_root
+    }
+
+    /// Cross-shard execution waves in this block.
+    ///
+    /// Each `WaveId` is the set of remote shards that a group of transactions
+    /// depends on for provisions. Transactions with identical remote shard sets
+    /// share a wave. Wave-zero (single-shard txs) is excluded.
+    ///
+    /// QC-attested (covered by the block hash), so a byzantine proposer
+    /// cannot forge it without the block being rejected by honest validators —
+    /// `validate_waves` recomputes this from `transactions` and compares.
+    ///
+    /// Used by remote shards to know which execution certificates to expect.
+    /// Provisions completeness is handled separately via
+    /// [`BlockHeader::provision_tx_roots`]. Empty for genesis, fallback, and
+    /// sync blocks.
+    #[must_use]
+    pub const fn waves(&self) -> &BoundedVec<WaveId, MAX_TXS_PER_BLOCK> {
+        &self.waves
+    }
+
+    /// Per-target-shard merkle commitment over the tx hashes a target shard
+    /// should receive provisions for from this block.
+    ///
+    /// Key = target shard; value = `compute_merkle_root` over the
+    /// ordered tx hashes destined for that target (block order, already
+    /// hash-ascending). Lets the target verify a received `Provisions`
+    /// contains the full set it was meant to receive — catches silently
+    /// dropped txs on the broadcast path.
+    #[must_use]
+    pub const fn provision_tx_roots(
+        &self,
+    ) -> &BoundedBTreeMap<ShardGroupId, ProvisionTxRoot, MAX_REMOTE_SHARDS_PER_WAVE> {
+        &self.provision_tx_roots
+    }
+
+    /// Approximate number of in-flight transactions on this shard at proposal time.
+    ///
+    /// "In-flight" = committed + executed transactions in the proposer's mempool,
+    /// i.e. transactions actively holding state locks. Gossiped cross-shard via
+    /// `CommittedBlockHeaderGossip` so RPC nodes can reject transactions targeting
+    /// congested remote shards.
+    ///
+    /// BFT-verified within tolerance (validators may differ slightly due to
+    /// execution timing). Zero for genesis; fallback and sync blocks carry
+    /// the parent's in-flight count forward unchanged (no txs admitted, none
+    /// finalized).
+    #[must_use]
+    pub const fn in_flight(&self) -> InFlightCount {
+        self.in_flight
+    }
+
+    /// Decompose into the raw fields, in struct-declaration order.
+    #[allow(clippy::type_complexity)] // mirrors the 16 stored fields
+    #[must_use]
+    pub fn into_parts(
+        self,
+    ) -> (
+        ShardGroupId,
+        BlockHeight,
+        BlockHash,
+        QuorumCertificate,
+        ValidatorId,
+        ProposerTimestamp,
+        Round,
+        bool,
+        StateRoot,
+        TransactionRoot,
+        CertificateRoot,
+        LocalReceiptRoot,
+        ProvisionsRoot,
+        BoundedVec<WaveId, MAX_TXS_PER_BLOCK>,
+        BoundedBTreeMap<ShardGroupId, ProvisionTxRoot, MAX_REMOTE_SHARDS_PER_WAVE>,
+        InFlightCount,
+    ) {
+        (
+            self.shard_group_id,
+            self.height,
+            self.parent_block_hash,
+            self.parent_qc,
+            self.proposer,
+            self.timestamp,
+            self.round,
+            self.is_fallback,
+            self.state_root,
+            self.transaction_root,
+            self.certificate_root,
+            self.local_receipt_root,
+            self.provision_root,
+            self.waves,
+            self.provision_tx_roots,
+            self.in_flight,
+        )
+    }
+
     /// Derive provision targets from waves (union of all shards across all waves).
     ///
     /// Returns the sorted set of all remote shards that need provisions from this block.
@@ -175,7 +320,7 @@ impl BlockHeader {
     pub fn provision_targets(&self) -> Vec<ShardGroupId> {
         let mut set = BTreeSet::new();
         for wave in self.waves.iter() {
-            set.extend(wave.remote_shards.iter().copied());
+            set.extend(wave.remote_shards().iter().copied());
         }
         set.into_iter().collect()
     }

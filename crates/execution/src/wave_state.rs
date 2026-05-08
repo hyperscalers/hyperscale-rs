@@ -228,7 +228,7 @@ impl WaveState {
     /// Height of the wave-starting block (mirrors `wave_id.block_height`).
     #[must_use]
     pub const fn block_height(&self) -> BlockHeight {
-        self.wave_id.block_height
+        self.wave_id.block_height()
     }
 
     /// Transaction hashes in this wave, in block order.
@@ -258,7 +258,7 @@ impl WaveState {
     }
 
     /// Whether the local EC has been fed into this wave (via
-    /// `add_execution_certificate` with `ec.wave_id == self.wave_id`).
+    /// `add_execution_certificate` with `ec.wave_id() == &self.wave_id`).
     #[must_use]
     pub const fn local_ec_emitted(&self) -> bool {
         self.local_ec_emitted
@@ -408,12 +408,12 @@ impl WaveState {
         let Some(local_ec) = self
             .execution_certificates
             .iter()
-            .find(|ec| ec.wave_id == self.wave_id)
+            .find(|ec| ec.wave_id() == &self.wave_id)
         else {
             return false;
         };
-        local_ec.tx_outcomes.iter().all(|outcome| {
-            outcome.is_aborted() || self.execution_receipts.contains_key(&outcome.tx_hash)
+        local_ec.tx_outcomes().iter().all(|outcome| {
+            outcome.is_aborted() || self.execution_receipts.contains_key(&outcome.tx_hash())
         })
     }
 
@@ -490,10 +490,7 @@ impl WaveState {
                         .cloned()
                         .expect("execution result must be present under provisioned branch")
                 };
-                TxOutcome {
-                    tx_hash: *tx_hash,
-                    outcome,
-                }
+                TxOutcome::new(*tx_hash, outcome)
             })
             .collect();
 
@@ -508,7 +505,7 @@ impl WaveState {
 
     /// Feed an EC into the wave. Handles dedup (by canonical hash), updates
     /// per-tx coverage, and tracks aborts/failures. For our own local EC
-    /// (`ec.wave_id == self.wave_id`), records the admitted root and runs
+    /// (`ec.wave_id() == &self.wave_id`), records the admitted root and runs
     /// `reconcile_local_ec_decision` — which compares against the local
     /// vote when both are known. The local EC may arrive before the local
     /// vote in cross-shard waves where peers aggregate the EC before this
@@ -517,27 +514,27 @@ impl WaveState {
     ///
     /// Returns `true` if the wave is now complete (ready for `finalize_wave`).
     pub fn add_execution_certificate(&mut self, ec: Arc<ExecutionCertificate>) -> bool {
-        if !self.seen_ec_wave_ids.insert(ec.wave_id.clone()) {
+        if !self.seen_ec_wave_ids.insert(ec.wave_id().clone()) {
             return self.is_complete();
         }
 
         let shard = ec.shard_group_id();
-        let is_local = ec.wave_id == self.wave_id;
+        let is_local = ec.wave_id() == &self.wave_id;
 
-        for outcome in &ec.tx_outcomes {
-            if let Some(covered) = self.covered_shards.get_mut(&outcome.tx_hash) {
+        for outcome in ec.tx_outcomes() {
+            if let Some(covered) = self.covered_shards.get_mut(&outcome.tx_hash()) {
                 covered.insert(shard);
                 if outcome.is_aborted() {
-                    self.tracker_aborted.insert(outcome.tx_hash);
+                    self.tracker_aborted.insert(outcome.tx_hash());
                 }
-                if !matches!(outcome.outcome, ExecutionOutcome::Succeeded { .. }) {
-                    self.tx_has_failure.insert(outcome.tx_hash);
+                if !matches!(outcome.outcome(), ExecutionOutcome::Succeeded { .. }) {
+                    self.tx_has_failure.insert(outcome.tx_hash());
                 }
             }
         }
 
         if is_local {
-            self.admitted_local_ec_root = Some(ec.global_receipt_root);
+            self.admitted_local_ec_root = Some(ec.global_receipt_root());
             self.local_ec_emitted = true;
             self.reconcile_local_ec_root();
         }
@@ -685,7 +682,7 @@ impl WaveState {
         tracing::warn!(
             wave = %self.wave_id,
             block_hash = ?self.block_hash,
-            block_height = self.wave_id.block_height.inner(),
+            block_height = self.wave_id.block_height().inner(),
             wave_start_ts = self.wave_start_ts.as_millis(),
             committed_ts = committed_ts.as_millis(),
             age_ms = u64::try_from(age.as_millis()).unwrap_or(u64::MAX),
@@ -717,33 +714,30 @@ impl WaveState {
         let required_remote_wave_ids: HashSet<WaveId> = self
             .execution_certificates
             .iter()
-            .filter(|ec| ec.wave_id != self.wave_id)
+            .filter(|ec| ec.wave_id() != &self.wave_id)
             .filter(|ec| {
-                ec.tx_outcomes.iter().any(|outcome| {
-                    self.participating_shards.contains_key(&outcome.tx_hash)
-                        && !self.tracker_aborted.contains(&outcome.tx_hash)
+                ec.tx_outcomes().iter().any(|outcome| {
+                    self.participating_shards.contains_key(&outcome.tx_hash())
+                        && !self.tracker_aborted.contains(&outcome.tx_hash())
                 })
             })
-            .map(|ec| ec.wave_id.clone())
+            .map(|ec| ec.wave_id().clone())
             .collect();
 
         let mut ecs: Vec<Arc<ExecutionCertificate>> = self
             .execution_certificates
             .iter()
             .filter(|ec| {
-                ec.wave_id == self.wave_id || required_remote_wave_ids.contains(&ec.wave_id)
+                ec.wave_id() == &self.wave_id || required_remote_wave_ids.contains(ec.wave_id())
             })
             .cloned()
             .collect();
 
         ecs.sort_by(|a, b| {
-            (&a.shard_group_id(), &a.wave_id).cmp(&(&b.shard_group_id(), &b.wave_id))
+            (&a.shard_group_id(), a.wave_id()).cmp(&(&b.shard_group_id(), b.wave_id()))
         });
 
-        WaveCertificate {
-            wave_id: self.wave_id.clone(),
-            execution_certificates: ecs,
-        }
+        WaveCertificate::new(self.wave_id.clone(), ecs)
     }
 
     /// Per-tx terminal decisions derived from collected ECs.
@@ -869,23 +863,25 @@ mod tests {
     ) -> Arc<ExecutionCertificate> {
         let outcomes: Vec<TxOutcome> = tx_hashes
             .iter()
-            .map(|h| TxOutcome {
-                tx_hash: *h,
-                outcome: if success {
-                    executed(true)
-                } else {
-                    ExecutionOutcome::Aborted
-                },
+            .map(|h| {
+                TxOutcome::new(
+                    *h,
+                    if success {
+                        executed(true)
+                    } else {
+                        ExecutionOutcome::Aborted
+                    },
+                )
             })
             .collect();
         let ec_wave_id = WaveId::new(
             ec_shard,
-            wave_id.block_height,
-            wave_id.remote_shards.0.clone(),
+            wave_id.block_height(),
+            wave_id.remote_shards().iter().copied().collect(),
         );
         Arc::new(ExecutionCertificate::new(
             ec_wave_id,
-            WeightedTimestamp::from_millis(wave_id.block_height.inner() + 1),
+            WeightedTimestamp::from_millis(wave_id.block_height().inner() + 1),
             GlobalReceiptRoot::from_raw(Hash::from_bytes(b"global_receipt_root")),
             outcomes,
             Bls12381G2Signature([0u8; 96]),
@@ -958,7 +954,7 @@ mod tests {
         assert!(
             outcomes
                 .iter()
-                .all(|o| matches!(o.outcome, ExecutionOutcome::Aborted))
+                .all(|o| matches!(o.outcome(), ExecutionOutcome::Aborted))
         );
     }
 
@@ -985,10 +981,10 @@ mod tests {
 
         let (_, _, outcomes) = w.build_vote_data(ts_for(WAVE_START + 3)).unwrap();
         assert!(matches!(
-            outcomes[0].outcome,
+            outcomes[0].outcome(),
             ExecutionOutcome::Succeeded { .. } | ExecutionOutcome::Failed
         ));
-        assert!(matches!(outcomes[1].outcome, ExecutionOutcome::Aborted));
+        assert!(matches!(outcomes[1].outcome(), ExecutionOutcome::Aborted));
     }
 
     #[test]
@@ -1133,10 +1129,7 @@ mod tests {
         let outcomes: Vec<TxOutcome> = w
             .tx_hashes()
             .iter()
-            .map(|h| TxOutcome {
-                tx_hash: *h,
-                outcome: executed(true),
-            })
+            .map(|h| TxOutcome::new(*h, executed(true)))
             .collect();
         let divergent_root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"divergent"));
         assert_ne!(local_root, divergent_root);
@@ -1195,10 +1188,7 @@ mod tests {
             w.wave_id().clone(),
             WeightedTimestamp::from_millis(WAVE_START.inner() + 1),
             ec_root,
-            vec![TxOutcome {
-                tx_hash: h0,
-                outcome: executed(true),
-            }],
+            vec![TxOutcome::new(h0, executed(true))],
             Bls12381G2Signature([0u8; 96]),
             SignerBitfield::new(4),
         ));
@@ -1253,7 +1243,7 @@ mod tests {
         // If record_abort had mutated, h0's outcome would have flipped to Aborted.
         let (_, _, outcomes) = w.build_vote_data(ts_for(WAVE_START + 2)).unwrap();
         assert!(matches!(
-            outcomes[0].outcome,
+            outcomes[0].outcome(),
             ExecutionOutcome::Succeeded { .. }
         ));
     }
@@ -1285,7 +1275,7 @@ mod tests {
         let wc = w.create_wave_certificate();
         assert_eq!(wc.execution_certificates().len(), 1);
         assert_eq!(
-            wc.execution_certificates()[0].wave_id.shard_group_id,
+            wc.execution_certificates()[0].wave_id().shard_group_id(),
             ShardGroupId::new(0)
         );
     }
@@ -1303,27 +1293,18 @@ mod tests {
 
         // Remote aborts h1, succeeds h0, h2
         let mut outcomes = vec![
-            TxOutcome {
-                tx_hash: h0,
-                outcome: executed(true),
-            },
-            TxOutcome {
-                tx_hash: h1,
-                outcome: ExecutionOutcome::Aborted,
-            },
-            TxOutcome {
-                tx_hash: h2,
-                outcome: executed(false),
-            },
+            TxOutcome::new(h0, executed(true)),
+            TxOutcome::new(h1, ExecutionOutcome::Aborted),
+            TxOutcome::new(h2, executed(false)),
         ];
         let ec_wave_id = WaveId::new(
             ShardGroupId::new(1),
-            w.wave_id().block_height,
-            w.wave_id().remote_shards.0.clone(),
+            w.wave_id().block_height(),
+            w.wave_id().remote_shards().iter().copied().collect(),
         );
         let ec_remote = Arc::new(ExecutionCertificate::new(
             ec_wave_id,
-            WeightedTimestamp::from_millis(w.wave_id().block_height.inner() + 1),
+            WeightedTimestamp::from_millis(w.wave_id().block_height().inner() + 1),
             GlobalReceiptRoot::from_raw(Hash::from_bytes(b"gr")),
             std::mem::take(&mut outcomes),
             Bls12381G2Signature([0u8; 96]),

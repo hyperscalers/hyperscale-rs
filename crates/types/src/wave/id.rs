@@ -30,12 +30,9 @@ pub const MAX_REMOTE_SHARDS_PER_WAVE: usize = 1024;
 /// A wave with empty `remote_shards` represents single-shard transactions.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, BasicSbor)]
 pub struct WaveId {
-    /// The shard that committed the block containing this wave's transactions.
-    pub shard_group_id: ShardGroupId,
-    /// Block height at which the wave's transactions were committed.
-    pub block_height: BlockHeight,
-    /// Set of remote shards the transactions depend on (empty for single-shard waves).
-    pub remote_shards: BoundedBTreeSet<ShardGroupId, MAX_REMOTE_SHARDS_PER_WAVE>,
+    shard_group_id: ShardGroupId,
+    block_height: BlockHeight,
+    remote_shards: BoundedBTreeSet<ShardGroupId, MAX_REMOTE_SHARDS_PER_WAVE>,
 }
 
 impl WaveId {
@@ -55,6 +52,26 @@ impl WaveId {
             block_height,
             remote_shards: remote_shards.into(),
         }
+    }
+
+    /// The shard that committed the block containing this wave's transactions.
+    #[must_use]
+    pub const fn shard_group_id(&self) -> ShardGroupId {
+        self.shard_group_id
+    }
+
+    /// Block height at which the wave's transactions were committed.
+    #[must_use]
+    pub const fn block_height(&self) -> BlockHeight {
+        self.block_height
+    }
+
+    /// Set of remote shards the transactions depend on (empty for single-shard waves).
+    #[must_use]
+    pub const fn remote_shards(
+        &self,
+    ) -> &BoundedBTreeSet<ShardGroupId, MAX_REMOTE_SHARDS_PER_WAVE> {
+        &self.remote_shards
     }
 
     /// Whether this is a single-shard wave (no remote dependencies).

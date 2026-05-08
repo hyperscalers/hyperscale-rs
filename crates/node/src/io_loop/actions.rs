@@ -167,7 +167,7 @@ where
         if let ProtocolEvent::RemoteHeaderAdmitted { committed_header } = &pe {
             let outputs = self.syncs.on_remote_header_admitted(
                 committed_header.shard_group_id(),
-                committed_header.header.height,
+                committed_header.header().height(),
             );
             self.process_remote_header_sync_outputs(outputs);
         }
@@ -290,7 +290,9 @@ where
         } else {
             // Build view anchored at parent — includes prior synced blocks'
             // JMT snapshots so chained verification can find parent nodes.
-            let view = self.pending_chain.view_at(block.header().parent_block_hash);
+            let view = self
+                .pending_chain
+                .view_at(block.header().parent_block_hash());
             let pending_snapshots = view.pending_snapshots().to_vec();
 
             // Inline JMT computation (no commit_lock — only reads).
@@ -314,11 +316,11 @@ where
             // `StateCf`. Block-by-block sync can't repair this; the
             // operator must restore from a state snapshot or
             // wipe-and-resync from genesis.
-            if computed_root != block.header().state_root {
+            if computed_root != block.header().state_root() {
                 error!(
                     height = height.inner(),
                     ?block_hash,
-                    expected_root = ?block.header().state_root,
+                    expected_root = ?block.header().state_root(),
                     computed_root = ?computed_root,
                     ?parent_state_root,
                     parent_block_height = parent_block_height.inner(),
@@ -334,7 +336,7 @@ where
                      root {expected:?} (computed {computed:?}). Operator \
                      intervention required.",
                     height.inner(),
-                    expected = block.header().state_root,
+                    expected = block.header().state_root(),
                     computed = computed_root,
                 );
             }
@@ -349,7 +351,7 @@ where
             self.pending_chain.insert(
                 block_hash,
                 ChainEntry {
-                    parent_block_hash: block.header().parent_block_hash,
+                    parent_block_hash: block.header().parent_block_hash(),
                     height,
                     receipts,
                     jmt_snapshot,

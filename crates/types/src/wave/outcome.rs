@@ -11,13 +11,35 @@ use crate::{GlobalReceiptHash, TxHash};
 /// individual transaction results for cross-shard finalization.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct TxOutcome {
-    /// Transaction hash.
-    pub tx_hash: TxHash,
-    /// The execution outcome for this transaction.
-    pub outcome: ExecutionOutcome,
+    tx_hash: TxHash,
+    outcome: ExecutionOutcome,
 }
 
 impl TxOutcome {
+    /// Create a new `TxOutcome`.
+    #[must_use]
+    pub const fn new(tx_hash: TxHash, outcome: ExecutionOutcome) -> Self {
+        Self { tx_hash, outcome }
+    }
+
+    /// Transaction hash.
+    #[must_use]
+    pub const fn tx_hash(&self) -> TxHash {
+        self.tx_hash
+    }
+
+    /// The execution outcome for this transaction.
+    #[must_use]
+    pub const fn outcome(&self) -> &ExecutionOutcome {
+        &self.outcome
+    }
+
+    /// Consume the outcome and return its parts.
+    #[must_use]
+    pub const fn into_parts(self) -> (TxHash, ExecutionOutcome) {
+        (self.tx_hash, self.outcome)
+    }
+
     /// Whether this outcome is an abort.
     #[must_use]
     pub const fn is_aborted(&self) -> bool {

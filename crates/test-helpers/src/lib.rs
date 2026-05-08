@@ -21,9 +21,9 @@ use std::sync::Arc;
 
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey,
-    Bls12381G2Signature, BoundedBTreeMap, BoundedVec, CertificateRoot, CertifiedBlock,
-    ExecutionCertificate, ExecutionOutcome, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot,
-    InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round,
+    Bls12381G2Signature, BoundedVec, CertificateRoot, CertifiedBlock, ExecutionCertificate,
+    ExecutionOutcome, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, InFlightCount,
+    LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round,
     RoutableTransaction, ShardGroupId, SignerBitfield, StateRoot, TopologySnapshot,
     TransactionDecision, TransactionRoot, TxHash, TxOutcome, ValidatorId, ValidatorInfo,
     ValidatorSet, VotePower, WaveCertificate, WaveId, WeightedTimestamp, bls_keypair_from_seed,
@@ -219,24 +219,24 @@ pub fn make_live_block(
     transactions: Vec<Arc<RoutableTransaction>>,
     certificates: Vec<Arc<FinalizedWave>>,
 ) -> Block {
-    let header = BlockHeader {
+    let header = BlockHeader::new(
         shard_group_id,
         height,
-        parent_block_hash: BlockHash::ZERO,
-        parent_qc: QuorumCertificate::genesis(ShardGroupId::new(0)),
+        BlockHash::ZERO,
+        QuorumCertificate::genesis(ShardGroupId::new(0)),
         proposer,
-        timestamp: ProposerTimestamp::from_millis(timestamp_ms),
-        round: Round::INITIAL,
-        is_fallback: false,
-        state_root: StateRoot::ZERO,
-        transaction_root: TransactionRoot::ZERO,
-        certificate_root: CertificateRoot::ZERO,
-        local_receipt_root: LocalReceiptRoot::ZERO,
-        provision_root: ProvisionsRoot::ZERO,
-        waves: BoundedVec::new(),
-        provision_tx_roots: BoundedBTreeMap::new(),
-        in_flight: InFlightCount::ZERO,
-    };
+        ProposerTimestamp::from_millis(timestamp_ms),
+        Round::INITIAL,
+        false,
+        StateRoot::ZERO,
+        TransactionRoot::ZERO,
+        CertificateRoot::ZERO,
+        LocalReceiptRoot::ZERO,
+        ProvisionsRoot::ZERO,
+        Vec::new(),
+        std::collections::BTreeMap::new(),
+        InFlightCount::ZERO,
+    );
     Block::Live {
         header,
         transactions: Arc::new(transactions.into()),
@@ -252,10 +252,18 @@ pub fn make_live_block(
 /// `0` when retention-window behavior doesn't matter.
 #[must_use]
 pub fn certify(block: Block, weighted_timestamp_ms: u64) -> CertifiedBlock {
-    let qc = QuorumCertificate {
-        block_hash: block.hash(),
-        weighted_timestamp: WeightedTimestamp::from_millis(weighted_timestamp_ms),
-        ..QuorumCertificate::genesis(ShardGroupId::new(0))
+    let qc = {
+        let __qc = QuorumCertificate::genesis(ShardGroupId::new(0));
+        QuorumCertificate::new(
+            block.hash(),
+            __qc.shard_group_id(),
+            __qc.height(),
+            __qc.parent_block_hash(),
+            __qc.round(),
+            __qc.signers().clone(),
+            __qc.aggregated_signature(),
+            WeightedTimestamp::from_millis(weighted_timestamp_ms),
+        )
     };
     CertifiedBlock::new_unchecked(block, qc)
 }
@@ -286,15 +294,12 @@ pub fn make_finalized_wave(
         wave_id.clone(),
         WeightedTimestamp::from_millis(block_height.inner() + 1),
         GlobalReceiptRoot::ZERO,
-        vec![TxOutcome { tx_hash, outcome }],
+        vec![TxOutcome::new(tx_hash, outcome)],
         Bls12381G2Signature([0u8; 96]),
         SignerBitfield::new(4),
     );
     FinalizedWave::new(
-        Arc::new(WaveCertificate {
-            wave_id,
-            execution_certificates: vec![Arc::new(ec)],
-        }),
+        Arc::new(WaveCertificate::new(wave_id, vec![Arc::new(ec)])),
         vec![],
     )
 }

@@ -19,25 +19,95 @@ use crate::{
 /// where each leaf = `H(tx_hash` || `receipt_hash` || `success_byte`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionVote {
+    block_hash: BlockHash,
+    block_height: BlockHeight,
+    vote_anchor_ts: WeightedTimestamp,
+    wave_id: WaveId,
+    shard_group_id: ShardGroupId,
+    global_receipt_root: GlobalReceiptRoot,
+    tx_count: u32,
+    tx_outcomes: Vec<TxOutcome>,
+    validator: ValidatorId,
+    signature: Bls12381G2Signature,
+}
+
+impl ExecutionVote {
+    /// Build an `ExecutionVote` from its parts.
+    #[allow(clippy::too_many_arguments)] // mirrors the 10 stored fields
+    #[must_use]
+    pub const fn new(
+        block_hash: BlockHash,
+        block_height: BlockHeight,
+        vote_anchor_ts: WeightedTimestamp,
+        wave_id: WaveId,
+        shard_group_id: ShardGroupId,
+        global_receipt_root: GlobalReceiptRoot,
+        tx_count: u32,
+        tx_outcomes: Vec<TxOutcome>,
+        validator: ValidatorId,
+        signature: Bls12381G2Signature,
+    ) -> Self {
+        Self {
+            block_hash,
+            block_height,
+            vote_anchor_ts,
+            wave_id,
+            shard_group_id,
+            global_receipt_root,
+            tx_count,
+            tx_outcomes,
+            validator,
+            signature,
+        }
+    }
+
     /// Block this wave belongs to.
-    pub block_hash: BlockHash,
+    #[must_use]
+    pub const fn block_hash(&self) -> BlockHash {
+        self.block_hash
+    }
+
     /// Block height (the block containing the wave's transactions).
-    pub block_height: BlockHeight,
+    #[must_use]
+    pub const fn block_height(&self) -> BlockHeight {
+        self.block_height
+    }
+
     /// BFT-authenticated anchor at which this vote was cast.
     ///
     /// Validators vote at each block commit where the wave is complete.
     /// Including `vote_anchor_ts` in the BLS-signed message prevents
     /// cross-height aggregation, ensuring that if an abort intent changes
     /// the `global_receipt_root` between heights, stale votes cannot combine.
-    pub vote_anchor_ts: WeightedTimestamp,
+    #[must_use]
+    pub const fn vote_anchor_ts(&self) -> WeightedTimestamp {
+        self.vote_anchor_ts
+    }
+
     /// Which wave within the block.
-    pub wave_id: WaveId,
+    #[must_use]
+    pub const fn wave_id(&self) -> &WaveId {
+        &self.wave_id
+    }
+
     /// Which shard produced this vote.
-    pub shard_group_id: ShardGroupId,
+    #[must_use]
+    pub const fn shard_group_id(&self) -> ShardGroupId {
+        self.shard_group_id
+    }
+
     /// Merkle root over per-tx outcome leaves.
-    pub global_receipt_root: GlobalReceiptRoot,
+    #[must_use]
+    pub const fn global_receipt_root(&self) -> GlobalReceiptRoot {
+        self.global_receipt_root
+    }
+
     /// Number of transactions in this wave.
-    pub tx_count: u32,
+    #[must_use]
+    pub const fn tx_count(&self) -> u32 {
+        self.tx_count
+    }
+
     /// Per-tx execution outcomes in wave order.
     ///
     /// Carried alongside the vote so any aggregator can extract `tx_outcomes`
@@ -45,11 +115,53 @@ pub struct ExecutionVote {
     /// BLS-signed message (`global_receipt_root` already commits to the content).
     /// This avoids relying on each aggregator's local accumulator, which may
     /// have diverged due to different abort timing.
-    pub tx_outcomes: Vec<TxOutcome>,
+    #[must_use]
+    pub const fn tx_outcomes(&self) -> &Vec<TxOutcome> {
+        &self.tx_outcomes
+    }
+
     /// Validator who cast this vote.
-    pub validator: ValidatorId,
+    #[must_use]
+    pub const fn validator(&self) -> ValidatorId {
+        self.validator
+    }
+
     /// BLS signature over the vote signing message.
-    pub signature: Bls12381G2Signature,
+    #[must_use]
+    pub const fn signature(&self) -> Bls12381G2Signature {
+        self.signature
+    }
+
+    /// Decompose into the raw fields, in struct-declaration order.
+    #[allow(clippy::type_complexity)] // mirrors the 10 stored fields
+    #[must_use]
+    pub fn into_parts(
+        self,
+    ) -> (
+        BlockHash,
+        BlockHeight,
+        WeightedTimestamp,
+        WaveId,
+        ShardGroupId,
+        GlobalReceiptRoot,
+        u32,
+        Vec<TxOutcome>,
+        ValidatorId,
+        Bls12381G2Signature,
+    ) {
+        (
+            self.block_hash,
+            self.block_height,
+            self.vote_anchor_ts,
+            self.wave_id,
+            self.shard_group_id,
+            self.global_receipt_root,
+            self.tx_count,
+            self.tx_outcomes,
+            self.validator,
+            self.signature,
+        )
+    }
 }
 
 impl<E: Encoder<NoCustomValueKind>> Encode<NoCustomValueKind, E> for ExecutionVote {
@@ -135,32 +247,32 @@ mod tests {
     use crate::{ExecutionOutcome, GlobalReceiptHash, Hash, TxHash};
 
     fn sample_outcome(seed: u8) -> TxOutcome {
-        TxOutcome {
-            tx_hash: TxHash::from_raw(Hash::from_bytes(&[seed; 4])),
-            outcome: ExecutionOutcome::Succeeded {
+        TxOutcome::new(
+            TxHash::from_raw(Hash::from_bytes(&[seed; 4])),
+            ExecutionOutcome::Succeeded {
                 receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(&[seed + 1; 4])),
             },
-        }
+        )
     }
 
     fn sample_vote() -> ExecutionVote {
         let outcomes = vec![sample_outcome(1), sample_outcome(2)];
-        ExecutionVote {
-            block_hash: BlockHash::from_raw(Hash::from_bytes(b"block")),
-            block_height: BlockHeight::new(7),
-            vote_anchor_ts: WeightedTimestamp::from_millis(11),
-            wave_id: WaveId::new(
+        ExecutionVote::new(
+            BlockHash::from_raw(Hash::from_bytes(b"block")),
+            BlockHeight::new(7),
+            WeightedTimestamp::from_millis(11),
+            WaveId::new(
                 ShardGroupId::new(0),
                 BlockHeight::new(7),
                 std::iter::once(ShardGroupId::new(1)).collect(),
             ),
-            shard_group_id: ShardGroupId::new(0),
-            global_receipt_root: GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root")),
-            tx_count: u32::try_from(outcomes.len()).unwrap(),
-            tx_outcomes: outcomes,
-            validator: ValidatorId::new(3),
-            signature: Bls12381G2Signature([0u8; 96]),
-        }
+            ShardGroupId::new(0),
+            GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root")),
+            u32::try_from(outcomes.len()).unwrap(),
+            outcomes,
+            ValidatorId::new(3),
+            Bls12381G2Signature([0u8; 96]),
+        )
     }
 
     #[test]

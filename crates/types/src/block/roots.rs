@@ -19,7 +19,7 @@ pub fn compute_certificate_root(certificates: &[Arc<FinalizedWave>]) -> Certific
 
     let leaves: Vec<Hash> = certificates
         .iter()
-        .map(|fw| fw.certificate.receipt_hash().into_raw())
+        .map(|fw| fw.certificate().receipt_hash().into_raw())
         .collect();
     CertificateRoot::from_raw(compute_merkle_root(&leaves))
 }

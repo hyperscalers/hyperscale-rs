@@ -60,7 +60,7 @@ impl ExecCertStore {
     /// `WaveId` is a no-op (the existing `Arc` is preserved so callers
     /// holding clones keep pointing at the same allocation).
     pub fn insert(&self, cert: Arc<ExecutionCertificate>) {
-        let wave_id = cert.wave_id.clone();
+        let wave_id = cert.wave_id().clone();
         self.inner.pin().get_or_insert_with(wave_id, || cert);
     }
 
@@ -125,9 +125,9 @@ mod tests {
     fn insert_then_get_round_trips() {
         let store = ExecCertStore::new();
         let c = cert(1);
-        let id = c.wave_id.clone();
+        let id = c.wave_id().clone();
         store.insert(Arc::clone(&c));
-        assert_eq!(store.get(&id).map(|a| a.wave_id.clone()), Some(id));
+        assert_eq!(store.get(&id).map(|a| a.wave_id().clone()), Some(id));
     }
 
     #[test]
@@ -146,16 +146,16 @@ mod tests {
         let b = cert(2);
         store.insert(Arc::clone(&a));
         store.insert(Arc::clone(&b));
-        store.evict(&a.wave_id);
-        assert!(store.get(&a.wave_id).is_none());
-        assert!(store.get(&b.wave_id).is_some());
+        store.evict(a.wave_id());
+        assert!(store.get(a.wave_id()).is_none());
+        assert!(store.get(b.wave_id()).is_some());
     }
 
     #[test]
     fn evict_absent_is_noop() {
         let store = ExecCertStore::new();
         let a = cert(1);
-        store.evict(&a.wave_id);
+        store.evict(a.wave_id());
         assert!(store.is_empty());
     }
 }

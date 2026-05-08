@@ -199,7 +199,7 @@ where
         let now_ms = now.as_millis();
         #[allow(clippy::cast_precision_loss)] // latency readout for metrics; ms→f64 lossy is fine
         let commit_latency_secs =
-            (now_ms.saturating_sub(commit.block.header().timestamp.as_millis())) as f64 / 1000.0;
+            (now_ms.saturating_sub(commit.block.header().timestamp().as_millis())) as f64 / 1000.0;
         record_block_committed(height.inner(), commit_latency_secs, commit.source.as_str());
         set_block_height(height.inner());
 
@@ -507,9 +507,18 @@ mod tests {
             vec![],
         );
         let block_hash = block.hash();
-        let qc = QuorumCertificate {
-            block_hash,
-            ..QuorumCertificate::genesis(block.header().shard_group_id)
+        let qc = {
+            let __qc = QuorumCertificate::genesis(block.header().shard_group_id());
+            QuorumCertificate::new(
+                block_hash,
+                __qc.shard_group_id(),
+                __qc.height(),
+                __qc.parent_block_hash(),
+                __qc.round(),
+                __qc.signers().clone(),
+                __qc.aggregated_signature(),
+                __qc.weighted_timestamp(),
+            )
         };
         let _ = committee; // committee unused here but kept for future signing-required tests
         let pending = PendingCommit {

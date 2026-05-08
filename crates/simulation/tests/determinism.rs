@@ -10,7 +10,7 @@ use std::time::Duration;
 use hyperscale_core::{NodeInput, ProtocolEvent};
 use hyperscale_network_memory::NetworkConfig;
 use hyperscale_simulation::SimulationRunner;
-use hyperscale_types::{BlockHeight, LocalTimestamp, Round, TransactionStatus};
+use hyperscale_types::{BlockHeight, LocalTimestamp, QuorumCertificate, Round, TransactionStatus};
 use tracing_test::traced_test;
 
 /// Create a basic network configuration for testing.
@@ -814,7 +814,7 @@ fn test_block_commit_diagnostic() {
 
     for node_idx in 0..4u32 {
         let node = runner.node(node_idx).expect("Node should exist");
-        let qc_height = node.bft().latest_qc().map(|qc| qc.height.inner());
+        let qc_height = node.bft().latest_qc().map(|qc| qc.height().inner());
         println!(
             "Node {}: committed_height={}, view={}, latest_qc_height={:?}",
             node_idx,
@@ -838,7 +838,7 @@ fn test_block_commit_diagnostic() {
 
     for node_idx in 0..4u32 {
         let node = runner.node(node_idx).expect("Node should exist");
-        let qc_height = node.bft().latest_qc().map(|qc| qc.height.inner());
+        let qc_height = node.bft().latest_qc().map(|qc| qc.height().inner());
         println!(
             "Node {}: committed_height={}, view={}, latest_qc_height={:?}",
             node_idx,
@@ -949,7 +949,7 @@ fn test_block_commit_verification() {
                 .unwrap()
                 .bft()
                 .latest_qc()
-                .map_or(BlockHeight::GENESIS, |qc| qc.height)
+                .map_or(BlockHeight::GENESIS, QuorumCertificate::height)
         })
         .collect();
 
@@ -997,7 +997,7 @@ fn test_block_commit_determinism() {
                 .unwrap()
                 .bft()
                 .latest_qc()
-                .map(|qc| qc.height.inner())
+                .map(|qc| qc.height().inner())
         })
         .collect();
     let stats1 = runner1.stats().clone();
@@ -1017,7 +1017,7 @@ fn test_block_commit_determinism() {
                 .unwrap()
                 .bft()
                 .latest_qc()
-                .map(|qc| qc.height.inner())
+                .map(|qc| qc.height().inner())
         })
         .collect();
     let stats2 = runner2.stats().clone();

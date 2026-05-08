@@ -63,9 +63,9 @@ pub fn build_executed_tx<S: SubstateDatabase>(
     let success = matches!(commit.outcome, TransactionOutcome::Success(_));
 
     let declared_nodes: Vec<NodeId> = tx
-        .declared_reads
+        .declared_reads()
         .iter()
-        .chain(tx.declared_writes.iter())
+        .chain(tx.declared_writes().iter())
         .copied()
         .collect();
 
@@ -96,12 +96,7 @@ pub fn build_executed_tx<S: SubstateDatabase>(
         .map(ApplicationEvent::hash)
         .collect();
     let event_root = EventRoot::from_raw(compute_merkle_root(&event_hashes));
-    let receipt_hash = GlobalReceipt {
-        success: true,
-        event_root,
-        writes_root,
-    }
-    .receipt_hash();
+    let receipt_hash = GlobalReceipt::new(true, event_root, writes_root).receipt_hash();
 
     let consensus = ConsensusReceipt::Succeeded {
         receipt_hash,

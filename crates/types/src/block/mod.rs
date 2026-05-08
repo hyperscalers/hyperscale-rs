@@ -30,8 +30,8 @@ mod tests {
     use super::*;
     use crate::test_utils::test_validity_range;
     use crate::{
-        BlockHash, BlockHeader, BlockHeight, Bls12381G2Signature, BoundedBTreeMap, BoundedVec,
-        CertificateRoot, ExecutionCertificate, ExecutionOutcome, FinalizedWave, GlobalReceiptHash,
+        BlockHash, BlockHeader, BlockHeight, Bls12381G2Signature, BoundedVec, CertificateRoot,
+        ExecutionCertificate, ExecutionOutcome, FinalizedWave, GlobalReceiptHash,
         GlobalReceiptRoot, Hash, InFlightCount, LocalReceiptRoot, ProposerTimestamp,
         ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, SignerBitfield, StateRoot,
         TransactionRoot, TxHash, TxOutcome, ValidatorId, WaveCertificate, WaveId,
@@ -41,24 +41,24 @@ mod tests {
 
     #[test]
     fn test_block_header_hash_deterministic() {
-        let header = BlockHeader {
-            shard_group_id: ShardGroupId::new(0),
-            height: BlockHeight::new(1),
-            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            parent_qc: QuorumCertificate::genesis(ShardGroupId::new(0)),
-            proposer: ValidatorId::new(0),
-            timestamp: ProposerTimestamp::from_millis(1_234_567_890),
-            round: Round::INITIAL,
-            is_fallback: false,
-            state_root: StateRoot::ZERO,
-            transaction_root: TransactionRoot::ZERO,
-            certificate_root: CertificateRoot::ZERO,
-            local_receipt_root: LocalReceiptRoot::ZERO,
-            provision_root: ProvisionsRoot::ZERO,
-            waves: BoundedVec::new(),
-            provision_tx_roots: BoundedBTreeMap::new(),
-            in_flight: InFlightCount::ZERO,
-        };
+        let header = BlockHeader::new(
+            ShardGroupId::new(0),
+            BlockHeight::new(1),
+            BlockHash::from_raw(Hash::from_bytes(b"parent")),
+            QuorumCertificate::genesis(ShardGroupId::new(0)),
+            ValidatorId::new(0),
+            ProposerTimestamp::from_millis(1_234_567_890),
+            Round::INITIAL,
+            false,
+            StateRoot::ZERO,
+            TransactionRoot::ZERO,
+            CertificateRoot::ZERO,
+            LocalReceiptRoot::ZERO,
+            ProvisionsRoot::ZERO,
+            Vec::new(),
+            std::collections::BTreeMap::new(),
+            InFlightCount::ZERO,
+        );
 
         let hash1 = header.hash();
         let hash2 = header.hash();
@@ -72,10 +72,10 @@ mod tests {
         assert!(genesis.is_genesis());
         assert_eq!(genesis.height(), BlockHeight::new(0));
         assert_eq!(genesis.transaction_count(), 0);
-        assert_eq!(genesis.header().transaction_root, TransactionRoot::ZERO);
+        assert_eq!(genesis.header().transaction_root(), TransactionRoot::ZERO);
         assert_eq!(
-            genesis.header().parent_qc,
-            QuorumCertificate::genesis(ShardGroupId::new(0))
+            genesis.header().parent_qc(),
+            &QuorumCertificate::genesis(ShardGroupId::new(0))
         );
     }
 
@@ -120,28 +120,28 @@ mod tests {
                 ),
                 WeightedTimestamp::from_millis(11),
                 GlobalReceiptRoot::from_raw(Hash::from_bytes(&[seed + 100; 4])),
-                vec![TxOutcome {
-                    tx_hash: TxHash::from_raw(Hash::from_bytes(&[seed; 4])),
-                    outcome: ExecutionOutcome::Succeeded {
+                vec![TxOutcome::new(
+                    TxHash::from_raw(Hash::from_bytes(&[seed; 4])),
+                    ExecutionOutcome::Succeeded {
                         receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(
                             &[seed + 50; 4],
                         )),
                     },
-                }],
+                )],
                 Bls12381G2Signature([0u8; 96]),
                 SignerBitfield::new(4),
             ));
-            Arc::new(FinalizedWave {
-                certificate: Arc::new(WaveCertificate {
-                    wave_id: WaveId::new(
+            Arc::new(FinalizedWave::new(
+                Arc::new(WaveCertificate::new(
+                    WaveId::new(
                         ShardGroupId::new(0),
                         BlockHeight::new(10),
                         BTreeSet::from([ShardGroupId::new(1)]),
                     ),
-                    execution_certificates: vec![ec],
-                }),
-                receipts: BoundedVec::new(),
-            })
+                    vec![ec],
+                )),
+                vec![],
+            ))
         };
 
         let certs = vec![make_fw(1), make_fw(2)];
@@ -157,24 +157,21 @@ mod tests {
             WaveId::new(ShardGroupId::new(0), BlockHeight::new(10), BTreeSet::new()),
             WeightedTimestamp::from_millis(11),
             GlobalReceiptRoot::from_raw(Hash::from_bytes(b"receipt")),
-            vec![TxOutcome {
-                tx_hash: TxHash::from_raw(Hash::from_bytes(b"tx1")),
-                outcome: ExecutionOutcome::Succeeded {
+            vec![TxOutcome::new(
+                TxHash::from_raw(Hash::from_bytes(b"tx1")),
+                ExecutionOutcome::Succeeded {
                     receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(b"rh")),
                 },
-            }],
+            )],
             Bls12381G2Signature([0u8; 96]),
             SignerBitfield::new(4),
         ));
-        let cert = Arc::new(WaveCertificate {
-            wave_id: WaveId::new(ShardGroupId::new(0), BlockHeight::new(10), BTreeSet::new()),
-            execution_certificates: vec![ec],
-        });
+        let cert = Arc::new(WaveCertificate::new(
+            WaveId::new(ShardGroupId::new(0), BlockHeight::new(10), BTreeSet::new()),
+            vec![ec],
+        ));
         let expected_receipt_hash = cert.receipt_hash();
-        let fw = Arc::new(FinalizedWave {
-            certificate: cert,
-            receipts: BoundedVec::new(),
-        });
+        let fw = Arc::new(FinalizedWave::new(cert, vec![]));
 
         let root = compute_certificate_root(std::slice::from_ref(&fw));
         // Single cert: certificate_root should equal the cert's receipt_hash
@@ -184,7 +181,7 @@ mod tests {
     #[test]
     fn test_genesis_certificate_root_is_zero() {
         let genesis = Block::genesis(ShardGroupId::new(0), ValidatorId::new(0), StateRoot::ZERO);
-        assert_eq!(genesis.header().certificate_root, CertificateRoot::ZERO);
+        assert_eq!(genesis.header().certificate_root(), CertificateRoot::ZERO);
     }
 
     #[test]
@@ -201,7 +198,24 @@ mod tests {
                 .into_sealed()
                 .into_live(Arc::new(BoundedVec::new()));
         if let Block::Live { ref mut header, .. } = bad_block {
-            header.height = BlockHeight::new(7);
+            *header = BlockHeader::new(
+                header.shard_group_id(),
+                BlockHeight::new(7),
+                header.parent_block_hash(),
+                header.parent_qc().clone(),
+                header.proposer(),
+                header.timestamp(),
+                header.round(),
+                header.is_fallback(),
+                header.state_root(),
+                header.transaction_root(),
+                header.certificate_root(),
+                header.local_receipt_root(),
+                header.provision_root(),
+                header.waves().clone().into_inner(),
+                header.provision_tx_roots().clone().into_inner(),
+                header.in_flight(),
+            );
         }
         let genesis_qc = QuorumCertificate::genesis(ShardGroupId::new(0));
         let bytes = basic_encode(&CertifiedBlockWire {

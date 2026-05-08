@@ -85,25 +85,57 @@ impl Inventory {
 /// natural ceilings.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct ElidedCertifiedBlock {
+    header: BlockHeader,
+    qc: QuorumCertificate,
+    transactions: BoundedVec<(TxHash, Option<Arc<RoutableTransaction>>), MAX_TXS_PER_BLOCK>,
+    certificates: BoundedVec<(WaveId, Option<Arc<FinalizedWave>>), MAX_FINALIZED_TX_PER_BLOCK>,
+    provisions:
+        Option<BoundedVec<(ProvisionHash, Option<Arc<Provisions>>), MAX_PROVISIONS_PER_BLOCK>>,
+}
+
+impl ElidedCertifiedBlock {
     /// Block header (always inline).
-    pub header: BlockHeader,
+    #[must_use]
+    pub const fn header(&self) -> &BlockHeader {
+        &self.header
+    }
+
     /// Certifying quorum certificate (always inline).
-    pub qc: QuorumCertificate,
+    #[must_use]
+    pub const fn qc(&self) -> &QuorumCertificate {
+        &self.qc
+    }
+
     /// Per-transaction `(hash, optional body)` pairs; body is `None` when elided.
     ///
     /// Bodies are `Arc`-wrapped so server-side elision and receiver-side
     /// rehydration share the same allocations as the local mempool /
     /// pending-block stores rather than deep-cloning every body.
-    pub transactions: BoundedVec<(TxHash, Option<Arc<RoutableTransaction>>), MAX_TXS_PER_BLOCK>,
+    #[must_use]
+    pub const fn transactions(
+        &self,
+    ) -> &BoundedVec<(TxHash, Option<Arc<RoutableTransaction>>), MAX_TXS_PER_BLOCK> {
+        &self.transactions
+    }
+
     /// Per-certificate `(wave id, optional body)` pairs; body is `None` when elided.
-    pub certificates: BoundedVec<(WaveId, Option<Arc<FinalizedWave>>), MAX_FINALIZED_TX_PER_BLOCK>,
+    #[must_use]
+    pub const fn certificates(
+        &self,
+    ) -> &BoundedVec<(WaveId, Option<Arc<FinalizedWave>>), MAX_FINALIZED_TX_PER_BLOCK> {
+        &self.certificates
+    }
+
     /// Per-provision `(hash, optional body)` pairs. `None` overall preserves the
     /// `Block::Sealed` shape; `Some(_)` preserves `Block::Live`.
-    pub provisions:
-        Option<BoundedVec<(ProvisionHash, Option<Arc<Provisions>>), MAX_PROVISIONS_PER_BLOCK>>,
-}
-
-impl ElidedCertifiedBlock {
+    #[must_use]
+    #[allow(clippy::type_complexity)] // mirrors the field's natural shape
+    pub const fn provisions(
+        &self,
+    ) -> Option<&BoundedVec<(ProvisionHash, Option<Arc<Provisions>>), MAX_PROVISIONS_PER_BLOCK>>
+    {
+        self.provisions.as_ref()
+    }
     /// Build an elided response from a full block + QC + the requester's
     /// inventory. Bodies whose hashes appear in the inventory filters are
     /// replaced with `None`; hashes are always included so the requester
@@ -204,10 +236,10 @@ impl ElidedCertifiedBlock {
         // before resolving any bodies. A peer that sends a mismatched
         // (header, qc) pair fails fast without us doing lookup work.
         let header_hash = self.header.hash();
-        if self.qc.block_hash != header_hash {
+        if self.qc.block_hash() != header_hash {
             return Err(RehydrateError::QcMismatch {
                 header_hash,
-                qc_block_hash: self.qc.block_hash,
+                qc_block_hash: self.qc.block_hash(),
             });
         }
         let mut miss = RehydrationMiss::default();
@@ -353,37 +385,38 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use crate::test_utils::test_transaction;
     use crate::{
-        BlockHash, BlockHeight, BloomFilter, BoundedBTreeMap, BoundedVec, CertificateRoot, Hash,
-        InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, Round, ShardGroupId,
-        SignerBitfield, StateRoot, TransactionRoot, ValidatorId, WeightedTimestamp,
-        zero_bls_signature,
+        BlockHash, BlockHeight, BloomFilter, BoundedVec, CertificateRoot, Hash, InFlightCount,
+        LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, Round, ShardGroupId, SignerBitfield,
+        StateRoot, TransactionRoot, ValidatorId, WeightedTimestamp, zero_bls_signature,
     };
 
     fn create_test_block() -> Block {
         let tx = test_transaction(1);
 
         Block::Live {
-            header: BlockHeader {
-                shard_group_id: ShardGroupId::new(0),
-                height: BlockHeight::new(1),
-                parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
-                parent_qc: QuorumCertificate::genesis(ShardGroupId::new(0)),
-                proposer: ValidatorId::new(0),
-                timestamp: ProposerTimestamp::from_millis(1_234_567_890),
-                round: Round::INITIAL,
-                is_fallback: false,
-                state_root: StateRoot::ZERO,
-                transaction_root: TransactionRoot::ZERO,
-                certificate_root: CertificateRoot::ZERO,
-                local_receipt_root: LocalReceiptRoot::ZERO,
-                provision_root: ProvisionsRoot::ZERO,
-                waves: BoundedVec::new(),
-                provision_tx_roots: BoundedBTreeMap::new(),
-                in_flight: InFlightCount::ZERO,
-            },
+            header: BlockHeader::new(
+                ShardGroupId::new(0),
+                BlockHeight::new(1),
+                BlockHash::from_raw(Hash::from_bytes(b"parent")),
+                QuorumCertificate::genesis(ShardGroupId::new(0)),
+                ValidatorId::new(0),
+                ProposerTimestamp::from_millis(1_234_567_890),
+                Round::INITIAL,
+                false,
+                StateRoot::ZERO,
+                TransactionRoot::ZERO,
+                CertificateRoot::ZERO,
+                LocalReceiptRoot::ZERO,
+                ProvisionsRoot::ZERO,
+                Vec::new(),
+                BTreeMap::new(),
+                InFlightCount::ZERO,
+            ),
             transactions: Arc::new(vec![Arc::new(tx)].into()),
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),
@@ -391,16 +424,16 @@ mod tests {
     }
 
     fn create_test_qc(block: &Block) -> QuorumCertificate {
-        QuorumCertificate {
-            block_hash: block.hash(),
-            shard_group_id: ShardGroupId::new(0),
-            height: block.height(),
-            parent_block_hash: block.header().parent_block_hash,
-            round: block.header().round,
-            aggregated_signature: zero_bls_signature(),
-            signers: SignerBitfield::new(0),
-            weighted_timestamp: WeightedTimestamp::ZERO,
-        }
+        QuorumCertificate::new(
+            block.hash(),
+            ShardGroupId::new(0),
+            block.height(),
+            block.header().parent_block_hash(),
+            block.header().round(),
+            SignerBitfield::new(0),
+            zero_bls_signature(),
+            WeightedTimestamp::ZERO,
+        )
     }
 
     #[test]
@@ -461,7 +494,7 @@ mod tests {
             )
             .expect("rehydration should succeed when lookup has body");
         assert_eq!(rehydrated.height(), block.height());
-        assert_eq!(&rehydrated.block, &block);
+        assert_eq!(rehydrated.block(), &block);
     }
 
     #[test]
@@ -526,7 +559,7 @@ mod tests {
                 |_| None,
             )
             .expect("second pass with topup body should succeed");
-        assert_eq!(&recovered.block, &block);
+        assert_eq!(recovered.block(), &block);
     }
 
     /// Hand-roll an `ElidedCertifiedBlock` whose `transactions` length

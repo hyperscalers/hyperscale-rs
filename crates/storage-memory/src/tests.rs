@@ -48,7 +48,7 @@ impl SimStorage {
             .write()
             .unwrap()
             .certificates
-            .insert(certificate.wave_id.clone(), certificate.clone());
+            .insert(certificate.wave_id().clone(), certificate.clone());
     }
 
     /// Test helper: commits database updates with auto-incrementing JMT version.
@@ -118,10 +118,10 @@ fn commit_with(
             metadata: None,
         };
         let new_fw = Arc::new(FinalizedWave::new(
-            Arc::new(WaveCertificate {
-                wave_id: WaveId::new(ShardGroupId::new(0), block.height(), BTreeSet::new()),
-                execution_certificates: vec![],
-            }),
+            Arc::new(WaveCertificate::new(
+                WaveId::new(ShardGroupId::new(0), block.height(), BTreeSet::new()),
+                vec![],
+            )),
             vec![receipt],
         ));
         match block {
@@ -337,12 +337,12 @@ fn test_block_storage_and_retrieval() {
     commit_empty(&storage, &block, &qc);
 
     let stored = storage.get_block(BlockHeight::new(1)).unwrap();
-    assert_eq!(stored.block.height(), BlockHeight::new(1));
+    assert_eq!(stored.block().height(), BlockHeight::new(1));
     assert_eq!(
-        stored.block.header().timestamp,
+        stored.block().header().timestamp(),
         ProposerTimestamp::from_millis(1_000)
     );
-    assert_eq!(stored.qc.block_hash, block.hash());
+    assert_eq!(stored.qc().block_hash(), block.hash());
 }
 
 #[test]

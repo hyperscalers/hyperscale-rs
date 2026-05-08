@@ -47,8 +47,8 @@ mod tests {
     use hyperscale_core::{Action, FetchRequest, ProtocolEvent, StateMachine};
     use hyperscale_test_helpers::make_live_block;
     use hyperscale_types::{
-        Block, BlockHash, BlockHeight, CommittedBlockHeader, QuorumCertificate, ShardGroupId,
-        ValidatorId, WaveId,
+        Block, BlockHash, BlockHeader, BlockHeight, CommittedBlockHeader, QuorumCertificate,
+        ShardGroupId, ValidatorId, WaveId,
     };
 
     use super::super::test_support::TestNode;
@@ -79,7 +79,24 @@ mod tests {
             vec![],
         );
         if let Block::Live { ref mut header, .. } = block {
-            header.waves = vec![wave].into();
+            *header = BlockHeader::new(
+                header.shard_group_id(),
+                header.height(),
+                header.parent_block_hash(),
+                header.parent_qc().clone(),
+                header.proposer(),
+                header.timestamp(),
+                header.round(),
+                header.is_fallback(),
+                header.state_root(),
+                header.transaction_root(),
+                header.certificate_root(),
+                header.local_receipt_root(),
+                header.provision_root(),
+                vec![wave],
+                header.provision_tx_roots().clone().into_inner(),
+                header.in_flight(),
+            );
         }
         let committed_header = Arc::new(CommittedBlockHeader::new(
             block.header().clone(),

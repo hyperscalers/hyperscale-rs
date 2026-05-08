@@ -29,16 +29,9 @@ pub struct RoutableTransaction {
     /// Manifest-encoded `UserTransaction` bytes — the canonical wire form.
     serialized_bytes: BoundedBytes<MAX_TX_BYTES_LEN>,
 
-    /// `NodeIds` that this transaction reads from.
-    pub declared_reads: BoundedVec<NodeId, MAX_DECLARED_NODES_PER_TX>,
-
-    /// `NodeIds` that this transaction writes to.
-    pub declared_writes: BoundedVec<NodeId, MAX_DECLARED_NODES_PER_TX>,
-
-    /// Half-open `WeightedTimestamp` range during which this tx may be
-    /// included in a block. Anchored on the parent QC's `weighted_timestamp`
-    /// at every check site. Signer-chosen, chain-enforced.
-    pub validity_range: TimestampRange,
+    declared_reads: BoundedVec<NodeId, MAX_DECLARED_NODES_PER_TX>,
+    declared_writes: BoundedVec<NodeId, MAX_DECLARED_NODES_PER_TX>,
+    validity_range: TimestampRange,
 
     /// Deserialized `UserTransaction`, populated by `transaction()` on
     /// first access via `manifest_decode(&serialized_bytes)`. `::new`
@@ -119,6 +112,26 @@ impl Debug for RoutableTransaction {
 }
 
 impl RoutableTransaction {
+    /// `NodeIds` that this transaction reads from.
+    #[must_use]
+    pub const fn declared_reads(&self) -> &BoundedVec<NodeId, MAX_DECLARED_NODES_PER_TX> {
+        &self.declared_reads
+    }
+
+    /// `NodeIds` that this transaction writes to.
+    #[must_use]
+    pub const fn declared_writes(&self) -> &BoundedVec<NodeId, MAX_DECLARED_NODES_PER_TX> {
+        &self.declared_writes
+    }
+
+    /// Half-open `WeightedTimestamp` range during which this tx may be
+    /// included in a block. Anchored on the parent QC's `weighted_timestamp`
+    /// at every check site. Signer-chosen, chain-enforced.
+    #[must_use]
+    pub const fn validity_range(&self) -> TimestampRange {
+        self.validity_range
+    }
+
     /// Create a new routable transaction from a `UserTransaction`.
     ///
     /// `validity_range` must be supplied explicitly — there is no chain-side

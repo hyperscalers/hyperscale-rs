@@ -68,7 +68,7 @@ impl ProvisionStore {
     /// the same content are no-ops.
     pub fn insert_outbound(&self, provisions: Arc<Provisions>, target_shard: ShardGroupId) {
         let hash = provisions.hash();
-        let block_height = provisions.block_height;
+        let block_height = provisions.block_height();
         self.inner
             .pin()
             .get_or_insert_with(hash, || Arc::clone(&provisions));

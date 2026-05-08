@@ -309,27 +309,27 @@ fn validate_synced_block(
     height: BlockHeight,
     certified: &CertifiedBlock,
 ) -> Result<(), &'static str> {
-    if certified.block.height() != height {
+    if certified.block().height() != height {
         return Err("height_mismatch");
     }
-    let block_hash = certified.block.hash();
-    if certified.qc.block_hash != block_hash {
+    let block_hash = certified.block().hash();
+    if certified.qc().block_hash() != block_hash {
         return Err("qc_hash_mismatch");
     }
-    if certified.qc.height != height {
+    if certified.qc().height() != height {
         return Err("qc_height_mismatch");
     }
 
-    let header = certified.block.header();
+    let header = certified.block().header();
 
-    if !certified.block.transactions().is_empty()
-        && compute_transaction_root(certified.block.transactions()) != header.transaction_root
+    if !certified.block().transactions().is_empty()
+        && compute_transaction_root(certified.block().transactions()) != header.transaction_root()
     {
         return Err("transaction_root_mismatch");
     }
 
-    if !certified.block.certificates().is_empty() {
-        if compute_certificate_root(certified.block.certificates()) != header.certificate_root {
+    if !certified.block().certificates().is_empty() {
+        if compute_certificate_root(certified.block().certificates()) != header.certificate_root() {
             return Err("certificate_root_mismatch");
         }
 
@@ -337,31 +337,31 @@ fn validate_synced_block(
         // (one receipt per non-aborted outcome, canonical order, matching
         // success/failure). `local_receipt_root` below catches content
         // mismatches but doesn't enforce per-wave grouping.
-        for fw in certified.block.certificates().iter() {
+        for fw in certified.block().certificates().iter() {
             if fw.validate_receipts_against_ec().is_err() {
                 return Err("receipts_vs_ec_mismatch");
             }
         }
 
         let receipts: Vec<StoredReceipt> = certified
-            .block
+            .block()
             .certificates()
             .iter()
-            .flat_map(|fw| fw.receipts.iter().cloned())
+            .flat_map(|fw| fw.receipts().iter().cloned())
             .collect();
-        if compute_local_receipt_root(&receipts) != header.local_receipt_root {
+        if compute_local_receipt_root(&receipts) != header.local_receipt_root() {
             return Err("local_receipt_root_mismatch");
         }
     }
 
-    if !certified.block.provisions().is_empty() {
+    if !certified.block().provisions().is_empty() {
         let provision_hashes: Vec<Hash> = certified
-            .block
+            .block()
             .provisions()
             .iter()
             .map(|p| p.hash().into_raw())
             .collect();
-        if compute_provision_root(&provision_hashes) != header.provision_root {
+        if compute_provision_root(&provision_hashes) != header.provision_root() {
             return Err("provision_root_mismatch");
         }
     }
@@ -375,12 +375,11 @@ mod tests {
 
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
-        Block, BlockHash, BlockHeader, Bls12381G2Signature, BoundedBTreeMap, BoundedVec,
-        CertificateRoot, ConsensusReceipt, ExecutionCertificate, ExecutionOutcome, FinalizedWave,
-        GlobalReceiptHash, GlobalReceiptRoot, InFlightCount, LocalReceiptRoot, ProposerTimestamp,
-        ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, SignerBitfield, StateRoot,
-        TransactionRoot, TxHash, TxOutcome, ValidatorId, WaveCertificate, WaveId,
-        WeightedTimestamp, zero_bls_signature,
+        Block, BlockHash, BlockHeader, Bls12381G2Signature, BoundedVec, CertificateRoot,
+        ConsensusReceipt, ExecutionCertificate, ExecutionOutcome, FinalizedWave, GlobalReceiptHash,
+        GlobalReceiptRoot, InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
+        QuorumCertificate, Round, ShardGroupId, SignerBitfield, StateRoot, TransactionRoot, TxHash,
+        TxOutcome, ValidatorId, WaveCertificate, WaveId, WeightedTimestamp, zero_bls_signature,
     };
 
     use super::*;
@@ -388,37 +387,64 @@ mod tests {
     const HEIGHT: BlockHeight = BlockHeight::new(1);
 
     fn header() -> BlockHeader {
-        BlockHeader {
-            shard_group_id: ShardGroupId::new(0),
-            height: HEIGHT,
-            parent_block_hash: BlockHash::ZERO,
-            parent_qc: QuorumCertificate::genesis(ShardGroupId::new(0)),
-            proposer: ValidatorId::new(0),
-            timestamp: ProposerTimestamp::from_millis(1_000),
-            round: Round::INITIAL,
-            is_fallback: false,
-            state_root: StateRoot::ZERO,
-            transaction_root: TransactionRoot::ZERO,
-            certificate_root: CertificateRoot::ZERO,
-            local_receipt_root: LocalReceiptRoot::ZERO,
-            provision_root: ProvisionsRoot::ZERO,
-            waves: BoundedVec::new(),
-            provision_tx_roots: BoundedBTreeMap::new(),
-            in_flight: InFlightCount::ZERO,
-        }
+        BlockHeader::new(
+            ShardGroupId::new(0),
+            HEIGHT,
+            BlockHash::ZERO,
+            QuorumCertificate::genesis(ShardGroupId::new(0)),
+            ValidatorId::new(0),
+            ProposerTimestamp::from_millis(1_000),
+            Round::INITIAL,
+            false,
+            StateRoot::ZERO,
+            TransactionRoot::ZERO,
+            CertificateRoot::ZERO,
+            LocalReceiptRoot::ZERO,
+            ProvisionsRoot::ZERO,
+            Vec::new(),
+            std::collections::BTreeMap::new(),
+            InFlightCount::ZERO,
+        )
+    }
+
+    /// Rebuild a header with selected roots overridden.
+    fn header_with_roots(
+        h: &BlockHeader,
+        transaction_root: Option<TransactionRoot>,
+        certificate_root: Option<CertificateRoot>,
+        local_receipt_root: Option<LocalReceiptRoot>,
+    ) -> BlockHeader {
+        BlockHeader::new(
+            h.shard_group_id(),
+            h.height(),
+            h.parent_block_hash(),
+            h.parent_qc().clone(),
+            h.proposer(),
+            h.timestamp(),
+            h.round(),
+            h.is_fallback(),
+            h.state_root(),
+            transaction_root.unwrap_or_else(|| h.transaction_root()),
+            certificate_root.unwrap_or_else(|| h.certificate_root()),
+            local_receipt_root.unwrap_or_else(|| h.local_receipt_root()),
+            h.provision_root(),
+            h.waves().clone().into_inner(),
+            h.provision_tx_roots().clone().into_inner(),
+            h.in_flight(),
+        )
     }
 
     fn qc_for(block: &Block) -> QuorumCertificate {
-        QuorumCertificate {
-            block_hash: block.hash(),
-            shard_group_id: ShardGroupId::new(0),
-            height: block.height(),
-            parent_block_hash: BlockHash::ZERO,
-            round: Round::INITIAL,
-            aggregated_signature: zero_bls_signature(),
-            signers: SignerBitfield::new(0),
-            weighted_timestamp: WeightedTimestamp::ZERO,
-        }
+        QuorumCertificate::new(
+            block.hash(),
+            ShardGroupId::new(0),
+            block.height(),
+            BlockHash::ZERO,
+            Round::INITIAL,
+            SignerBitfield::new(0),
+            zero_bls_signature(),
+            WeightedTimestamp::ZERO,
+        )
     }
 
     /// Build a single-tx, single-wave wave with consistent EC + receipt.
@@ -432,16 +458,16 @@ mod tests {
             HEIGHT,
             std::collections::BTreeSet::new(),
         );
-        let outcome = TxOutcome {
+        let outcome = TxOutcome::new(
             tx_hash,
-            outcome: if success {
+            if success {
                 ExecutionOutcome::Succeeded {
                     receipt_hash: GlobalReceiptHash::ZERO,
                 }
             } else {
                 ExecutionOutcome::Failed
             },
-        };
+        );
         let ec = ExecutionCertificate::new(
             wave_id.clone(),
             WeightedTimestamp::from_millis(1),
@@ -464,13 +490,10 @@ mod tests {
             }),
             metadata: None,
         };
-        let fw = Arc::new(FinalizedWave {
-            certificate: Arc::new(WaveCertificate {
-                wave_id,
-                execution_certificates: vec![Arc::new(ec)],
-            }),
-            receipts: vec![receipt.clone()].into(),
-        });
+        let fw = Arc::new(FinalizedWave::new(
+            Arc::new(WaveCertificate::new(wave_id, vec![Arc::new(ec)])),
+            vec![receipt.clone()],
+        ));
         let lrr = compute_local_receipt_root(&[receipt]);
         let cr = compute_certificate_root(std::slice::from_ref(&fw));
         (fw, lrr, cr)
@@ -514,8 +537,16 @@ mod tests {
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),
         };
-        let mut qc = qc_for(&block);
-        qc.block_hash = BlockHash::from_raw(Hash::from_bytes(b"wrong"));
+        let qc = QuorumCertificate::new(
+            BlockHash::from_raw(Hash::from_bytes(b"wrong")),
+            ShardGroupId::new(0),
+            block.height(),
+            BlockHash::ZERO,
+            Round::INITIAL,
+            SignerBitfield::new(0),
+            zero_bls_signature(),
+            WeightedTimestamp::ZERO,
+        );
         let _ = CertifiedBlock::new_unchecked(block, qc);
     }
 
@@ -527,8 +558,16 @@ mod tests {
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),
         };
-        let mut qc = qc_for(&block);
-        qc.height = BlockHeight::new(99);
+        let qc = QuorumCertificate::new(
+            block.hash(),
+            ShardGroupId::new(0),
+            BlockHeight::new(99),
+            BlockHash::ZERO,
+            Round::INITIAL,
+            SignerBitfield::new(0),
+            zero_bls_signature(),
+            WeightedTimestamp::ZERO,
+        );
         let certified = CertifiedBlock::new_unchecked(block, qc);
         assert_eq!(
             validate_synced_block(HEIGHT, &certified).unwrap_err(),
@@ -539,8 +578,7 @@ mod tests {
     #[test]
     fn validate_rejects_transaction_root_mismatch() {
         let tx = Arc::new(test_transaction(1));
-        let mut h = header();
-        h.transaction_root = TransactionRoot::ZERO; // canonical would be non-zero
+        let h = header_with_roots(&header(), Some(TransactionRoot::ZERO), None, None); // canonical would be non-zero
         let block = Block::Live {
             header: h,
             transactions: Arc::new(vec![tx].into()),
@@ -558,8 +596,12 @@ mod tests {
     #[test]
     fn validate_passes_when_transaction_root_matches() {
         let tx = Arc::new(test_transaction(1));
-        let mut h = header();
-        h.transaction_root = compute_transaction_root(std::slice::from_ref(&tx));
+        let h = header_with_roots(
+            &header(),
+            Some(compute_transaction_root(std::slice::from_ref(&tx))),
+            None,
+            None,
+        );
         let block = Block::Live {
             header: h,
             transactions: Arc::new(vec![tx].into()),
@@ -574,9 +616,12 @@ mod tests {
     #[test]
     fn validate_rejects_certificate_root_mismatch() {
         let (fw, lrr, _cr) = make_wave(true);
-        let mut h = header();
-        h.certificate_root = CertificateRoot::from_raw(Hash::from_bytes(b"wrong"));
-        h.local_receipt_root = lrr;
+        let h = header_with_roots(
+            &header(),
+            None,
+            Some(CertificateRoot::from_raw(Hash::from_bytes(b"wrong"))),
+            Some(lrr),
+        );
         let block = Block::Live {
             header: h,
             transactions: Arc::new(BoundedVec::new()),
@@ -607,12 +652,12 @@ mod tests {
             wave_id.clone(),
             WeightedTimestamp::from_millis(1),
             GlobalReceiptRoot::ZERO,
-            vec![TxOutcome {
+            vec![TxOutcome::new(
                 tx_hash,
-                outcome: ExecutionOutcome::Succeeded {
+                ExecutionOutcome::Succeeded {
                     receipt_hash: GlobalReceiptHash::ZERO,
                 },
-            }],
+            )],
             Bls12381G2Signature([0u8; 96]),
             SignerBitfield::new(4),
         );
@@ -622,16 +667,16 @@ mod tests {
             consensus: Arc::new(ConsensusReceipt::Failed),
             metadata: None,
         };
-        let fw = Arc::new(FinalizedWave {
-            certificate: Arc::new(WaveCertificate {
-                wave_id,
-                execution_certificates: vec![Arc::new(ec)],
-            }),
-            receipts: vec![receipt.clone()].into(),
-        });
-        let mut h = header();
-        h.certificate_root = compute_certificate_root(std::slice::from_ref(&fw));
-        h.local_receipt_root = compute_local_receipt_root(&[receipt]);
+        let fw = Arc::new(FinalizedWave::new(
+            Arc::new(WaveCertificate::new(wave_id, vec![Arc::new(ec)])),
+            vec![receipt.clone()],
+        ));
+        let h = header_with_roots(
+            &header(),
+            None,
+            Some(compute_certificate_root(std::slice::from_ref(&fw))),
+            Some(compute_local_receipt_root(&[receipt])),
+        );
         let block = Block::Live {
             header: h,
             transactions: Arc::new(BoundedVec::new()),
@@ -653,9 +698,12 @@ mod tests {
         // receipt body with `database_updates` content that doesn't
         // hash to the QC'd root.
         let (fw, _lrr, cr) = make_wave(true);
-        let mut h = header();
-        h.certificate_root = cr;
-        h.local_receipt_root = LocalReceiptRoot::from_raw(Hash::from_bytes(b"wrong"));
+        let h = header_with_roots(
+            &header(),
+            None,
+            Some(cr),
+            Some(LocalReceiptRoot::from_raw(Hash::from_bytes(b"wrong"))),
+        );
         let block = Block::Live {
             header: h,
             transactions: Arc::new(BoundedVec::new()),
@@ -673,9 +721,7 @@ mod tests {
     #[test]
     fn validate_passes_for_canonical_certificate_block() {
         let (fw, lrr, cr) = make_wave(true);
-        let mut h = header();
-        h.certificate_root = cr;
-        h.local_receipt_root = lrr;
+        let h = header_with_roots(&header(), None, Some(cr), Some(lrr));
         let block = Block::Live {
             header: h,
             transactions: Arc::new(BoundedVec::new()),

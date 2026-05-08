@@ -9,13 +9,13 @@ use std::sync::Arc;
 
 use hyperscale_types::test_utils::test_event_type_identifier;
 use hyperscale_types::{
-    ApplicationEvent, Block, BlockHash, BlockHeader, BlockHeight, Bls12381G2Signature,
-    BoundedBTreeMap, BoundedVec, CertificateRoot, ConsensusReceipt, EventData,
-    ExecutionCertificate, ExecutionMetadata, ExecutionOutcome, FeeSummary, FinalizedWave,
-    GlobalReceiptHash, GlobalReceiptRoot, Hash, InFlightCount, LocalReceiptRoot, LogLevel, NodeId,
-    ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, SignerBitfield,
-    StateRoot, StoredReceipt, TransactionRoot, TxHash, TxOutcome, ValidatorId, WaveCertificate,
-    WaveId, WeightedTimestamp, compute_global_receipt_root, zero_bls_signature,
+    ApplicationEvent, Block, BlockHash, BlockHeader, BlockHeight, Bls12381G2Signature, BoundedVec,
+    CertificateRoot, ConsensusReceipt, EventData, ExecutionCertificate, ExecutionMetadata,
+    ExecutionOutcome, FeeSummary, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash,
+    InFlightCount, LocalReceiptRoot, LogLevel, NodeId, ProposerTimestamp, ProvisionsRoot,
+    QuorumCertificate, Round, ShardGroupId, SignerBitfield, StateRoot, StoredReceipt,
+    TransactionRoot, TxHash, TxOutcome, ValidatorId, WaveCertificate, WaveId, WeightedTimestamp,
+    compute_global_receipt_root, zero_bls_signature,
 };
 use indexmap::IndexMap;
 use radix_common::math::Decimal;
@@ -103,10 +103,7 @@ pub fn make_test_wave_certificate(height: BlockHeight, shard: ShardGroupId) -> W
         Bls12381G2Signature([0u8; 96]),
         SignerBitfield::empty(),
     ));
-    WaveCertificate {
-        wave_id,
-        execution_certificates: vec![local_ec],
-    }
+    WaveCertificate::new(wave_id, vec![local_ec])
 }
 
 /// Build a minimal `Block` at the given height.
@@ -116,24 +113,24 @@ pub fn make_test_block(height: BlockHeight) -> Block {
     let mut parent_bytes = [0u8; 32];
     parent_bytes[..8].copy_from_slice(&height.to_le_bytes());
     Block::Live {
-        header: BlockHeader {
-            shard_group_id: ShardGroupId::new(0),
+        header: BlockHeader::new(
+            ShardGroupId::new(0),
             height,
-            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(&parent_bytes)),
-            parent_qc: QuorumCertificate::genesis(ShardGroupId::new(0)),
-            proposer: ValidatorId::new(0),
-            timestamp: ProposerTimestamp::from_millis(height.inner() * 1000),
-            round: Round::INITIAL,
-            is_fallback: false,
-            state_root: StateRoot::ZERO,
-            transaction_root: TransactionRoot::ZERO,
-            certificate_root: CertificateRoot::ZERO,
-            local_receipt_root: LocalReceiptRoot::ZERO,
-            provision_root: ProvisionsRoot::ZERO,
-            waves: BoundedVec::new(),
-            provision_tx_roots: BoundedBTreeMap::new(),
-            in_flight: InFlightCount::ZERO,
-        },
+            BlockHash::from_raw(Hash::from_bytes(&parent_bytes)),
+            QuorumCertificate::genesis(ShardGroupId::new(0)),
+            ValidatorId::new(0),
+            ProposerTimestamp::from_millis(height.inner() * 1000),
+            Round::INITIAL,
+            false,
+            StateRoot::ZERO,
+            TransactionRoot::ZERO,
+            CertificateRoot::ZERO,
+            LocalReceiptRoot::ZERO,
+            ProvisionsRoot::ZERO,
+            Vec::new(),
+            std::collections::BTreeMap::new(),
+            InFlightCount::ZERO,
+        ),
         transactions: Arc::new(BoundedVec::new()),
         certificates: Arc::new(BoundedVec::new()),
         provisions: Arc::new(BoundedVec::new()),
@@ -143,16 +140,16 @@ pub fn make_test_block(height: BlockHeight) -> Block {
 /// Build a `QuorumCertificate` that references the given block.
 #[must_use]
 pub fn make_test_qc(block: &Block) -> QuorumCertificate {
-    QuorumCertificate {
-        block_hash: block.hash(),
-        shard_group_id: ShardGroupId::new(0),
-        height: block.height(),
-        parent_block_hash: block.header().parent_block_hash,
-        round: Round::INITIAL,
-        aggregated_signature: zero_bls_signature(),
-        signers: SignerBitfield::new(4),
-        weighted_timestamp: WeightedTimestamp::from_millis(block.header().timestamp.as_millis()),
-    }
+    QuorumCertificate::new(
+        block.hash(),
+        ShardGroupId::new(0),
+        block.height(),
+        block.header().parent_block_hash(),
+        Round::INITIAL,
+        SignerBitfield::new(4),
+        zero_bls_signature(),
+        WeightedTimestamp::from_millis(block.header().timestamp().as_millis()),
+    )
 }
 
 /// Build a deterministic locally-executed `StoredReceipt` from `seed`
@@ -201,12 +198,12 @@ pub fn make_test_execution_certificate(
     seed: u8,
     block_height: BlockHeight,
 ) -> ExecutionCertificate {
-    let outcomes = vec![TxOutcome {
-        tx_hash: TxHash::from_raw(Hash::from_bytes(&[seed + 100; 32])),
-        outcome: ExecutionOutcome::Succeeded {
+    let outcomes = vec![TxOutcome::new(
+        TxHash::from_raw(Hash::from_bytes(&[seed + 100; 32])),
+        ExecutionOutcome::Succeeded {
             receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(&[seed + 150; 32])),
         },
-    }];
+    )];
     let global_receipt_root = compute_global_receipt_root(&outcomes);
     let mut remote_shards = BTreeSet::new();
     remote_shards.insert(ShardGroupId::new(u64::from(seed) + 1));
@@ -229,10 +226,7 @@ fn make_test_block_with_ecs(height: BlockHeight, ecs: Vec<Arc<ExecutionCertifica
     if ecs.is_empty() {
         return block;
     }
-    let certificate = Arc::new(WaveCertificate {
-        wave_id: ecs[0].wave_id.clone(),
-        execution_certificates: ecs,
-    });
+    let certificate = Arc::new(WaveCertificate::new(ecs[0].wave_id().clone(), ecs));
     let new_fw = Arc::new(FinalizedWave::new(certificate, vec![]));
     match block {
         Block::Live {
@@ -283,7 +277,7 @@ fn commit_empty_blocks_up_to(storage: &(impl ChainReader + ChainWriter), target:
 /// Panics if any assertion fails (this is a test helper).
 pub fn test_ec_storage_roundtrip(storage: &(impl ChainReader + ChainWriter)) {
     let ec = make_test_execution_certificate(1, BlockHeight::new(10));
-    let wave_id = ec.wave_id.clone();
+    let wave_id = ec.wave_id().clone();
 
     // Initially absent.
     assert!(storage.get_execution_certificate(&wave_id).is_none());
@@ -296,7 +290,7 @@ pub fn test_ec_storage_roundtrip(storage: &(impl ChainReader + ChainWriter)) {
     let direct = storage
         .get_execution_certificate(&wave_id)
         .expect("EC must be retrievable by wave_id");
-    assert_eq!(direct.wave_id, wave_id);
+    assert_eq!(direct.wave_id(), &wave_id);
     assert_eq!(direct.block_height(), BlockHeight::new(10));
 }
 
@@ -328,13 +322,21 @@ pub fn test_ec_storage_batch(storage: &(impl ChainReader + ChainWriter)) {
     let qc20 = make_test_qc(&block20);
     storage.commit_block(&Arc::new(block20), &Arc::new(qc20));
 
-    let known = [ec1.wave_id, ec2.wave_id, ec3.wave_id.clone()];
+    let known = [
+        ec1.wave_id().clone(),
+        ec2.wave_id().clone(),
+        ec3.wave_id().clone(),
+    ];
     let batch = storage.get_execution_certificates_batch(&known);
     assert_eq!(batch.len(), 3);
 
-    let mut missing_wave_id = known[0].clone();
-    missing_wave_id.block_height = BlockHeight::new(999);
-    let partial = storage.get_execution_certificates_batch(&[ec3.wave_id.clone(), missing_wave_id]);
+    let missing_wave_id = WaveId::new(
+        known[0].shard_group_id(),
+        BlockHeight::new(999),
+        known[0].remote_shards().iter().copied().collect(),
+    );
+    let partial =
+        storage.get_execution_certificates_batch(&[ec3.wave_id().clone(), missing_wave_id]);
     assert_eq!(partial.len(), 1);
-    assert_eq!(partial[0].wave_id, ec3.wave_id);
+    assert_eq!(partial[0].wave_id(), ec3.wave_id());
 }

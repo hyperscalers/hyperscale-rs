@@ -71,10 +71,10 @@ impl PendingBlock {
     ) -> Self {
         let total_tx_count = manifest.transaction_count();
         let missing_transaction_hashes: HashSet<TxHash> =
-            manifest.tx_hashes.iter().copied().collect();
-        let missing_wave_ids: HashSet<WaveId> = manifest.cert_ids.iter().cloned().collect();
+            manifest.tx_hashes().iter().copied().collect();
+        let missing_wave_ids: HashSet<WaveId> = manifest.cert_ids().iter().cloned().collect();
         let missing_provision_hashes: HashSet<ProvisionHash> =
-            manifest.provision_hashes.iter().copied().collect();
+            manifest.provision_hashes().iter().copied().collect();
 
         Self {
             header,
@@ -105,8 +105,13 @@ impl PendingBlock {
         let mut provision_hashes: Vec<ProvisionHash> =
             provisions.iter().map(|p| p.hash()).collect();
         provision_hashes.sort();
-        let mut manifest = BlockManifest::from_block(block);
-        manifest.provision_hashes = provision_hashes.into();
+        let tx_hashes: Vec<TxHash> = block.transactions().iter().map(|tx| tx.hash()).collect();
+        let cert_ids: Vec<WaveId> = block
+            .certificates()
+            .iter()
+            .map(|c| c.wave_id().clone())
+            .collect();
+        let manifest = BlockManifest::new(tx_hashes, cert_ids, provision_hashes);
         let mut received_provisions: BTreeMap<ProvisionHash, Arc<Provisions>> = BTreeMap::new();
         for p in provisions {
             received_provisions.insert(p.hash(), p);
@@ -251,7 +256,7 @@ impl PendingBlock {
         // Build transactions in the ORIGINAL order from the gossip message.
         let transactions: Vec<Arc<RoutableTransaction>> = self
             .manifest
-            .tx_hashes
+            .tx_hashes()
             .iter()
             .filter_map(|hash| self.received_transactions.remove(hash))
             .collect();
@@ -259,7 +264,7 @@ impl PendingBlock {
         // Pass finalized waves into the block in manifest order.
         let certificates: Vec<Arc<FinalizedWave>> = self
             .manifest
-            .cert_ids
+            .cert_ids()
             .iter()
             .filter_map(|id| self.received_waves.get(id).cloned())
             .collect();
@@ -269,7 +274,7 @@ impl PendingBlock {
         // and `is_complete()` gates assembly on all of them being present.
         let provisions: Vec<Arc<Provisions>> = self
             .manifest
-            .provision_hashes
+            .provision_hashes()
             .iter()
             .filter_map(|hash| self.received_provisions.get(hash).cloned())
             .collect();
@@ -312,7 +317,7 @@ impl PendingBlock {
 
     /// Get certificate count.
     pub const fn certificate_count(&self) -> usize {
-        self.manifest.cert_ids.len()
+        self.manifest.cert_ids().len()
     }
 }
 
@@ -343,7 +348,7 @@ pub fn check_fetches(
             continue;
         }
 
-        let proposer = pending.header().proposer;
+        let proposer = pending.header().proposer();
         let local_self = topology.local_validator_id();
         let local_committee: Vec<_> = topology
             .committee_for_shard(topology.local_shard())
@@ -415,36 +420,36 @@ impl PendingBlock {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
-        Block, BlockHeight, BoundedBTreeMap, BoundedVec, CertificateRoot, Hash, InFlightCount,
-        LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round,
-        ShardGroupId, StateRoot, TransactionRoot, ValidatorId, WaveCertificate, WaveId,
+        Block, BlockHeight, BoundedVec, CertificateRoot, Hash, InFlightCount, LocalReceiptRoot,
+        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, StateRoot,
+        TransactionRoot, ValidatorId, WaveCertificate, WaveId,
     };
 
     use super::*;
 
     fn make_header(height: BlockHeight) -> BlockHeader {
-        BlockHeader {
-            shard_group_id: ShardGroupId::new(0),
+        BlockHeader::new(
+            ShardGroupId::new(0),
             height,
-            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            parent_qc: QuorumCertificate::genesis(ShardGroupId::new(0)),
-            proposer: ValidatorId::new(0),
-            timestamp: ProposerTimestamp::from_millis(1_234_567_890),
-            round: Round::INITIAL,
-            is_fallback: false,
-            state_root: StateRoot::ZERO,
-            transaction_root: TransactionRoot::ZERO,
-            certificate_root: CertificateRoot::ZERO,
-            local_receipt_root: LocalReceiptRoot::ZERO,
-            provision_root: ProvisionsRoot::ZERO,
-            waves: BoundedVec::new(),
-            provision_tx_roots: BoundedBTreeMap::new(),
-            in_flight: InFlightCount::ZERO,
-        }
+            BlockHash::from_raw(Hash::from_bytes(b"parent")),
+            QuorumCertificate::genesis(ShardGroupId::new(0)),
+            ValidatorId::new(0),
+            ProposerTimestamp::from_millis(1_234_567_890),
+            Round::INITIAL,
+            false,
+            StateRoot::ZERO,
+            TransactionRoot::ZERO,
+            CertificateRoot::ZERO,
+            LocalReceiptRoot::ZERO,
+            ProvisionsRoot::ZERO,
+            Vec::new(),
+            BTreeMap::new(),
+            InFlightCount::ZERO,
+        )
     }
 
     #[test]
@@ -455,10 +460,7 @@ mod tests {
 
         let pb = PendingBlock::from_manifest(
             header,
-            BlockManifest {
-                tx_hashes: vec![tx1, tx2].into(),
-                ..Default::default()
-            },
+            BlockManifest::new(vec![tx1, tx2], vec![], vec![]),
             LocalTimestamp::ZERO,
         );
 
@@ -487,11 +489,7 @@ mod tests {
 
         let pb = PendingBlock::from_manifest(
             header,
-            BlockManifest {
-                tx_hashes: vec![tx1].into(),
-                cert_ids: vec![wave1.clone(), wave2.clone()].into(),
-                ..Default::default()
-            },
+            BlockManifest::new(vec![tx1], vec![wave1.clone(), wave2.clone()], vec![]),
             LocalTimestamp::ZERO,
         );
 
@@ -509,23 +507,17 @@ mod tests {
 
         let mut pb = PendingBlock::from_manifest(
             header,
-            BlockManifest {
-                cert_ids: vec![wave_id.clone()].into(),
-                ..Default::default()
-            },
+            BlockManifest::new(vec![], vec![wave_id.clone()], vec![]),
             LocalTimestamp::ZERO,
         );
 
         assert_eq!(pb.missing_wave_count(), 1);
         assert!(!pb.is_complete());
 
-        let fw = Arc::new(FinalizedWave {
-            certificate: Arc::new(WaveCertificate {
-                wave_id,
-                execution_certificates: vec![],
-            }),
-            receipts: BoundedVec::new(),
-        });
+        let fw = Arc::new(FinalizedWave::new(
+            Arc::new(WaveCertificate::new(wave_id, vec![])),
+            vec![],
+        ));
 
         let added = pb.add_finalized_wave(fw);
         assert!(added);
@@ -542,11 +534,7 @@ mod tests {
 
         let mut pb = PendingBlock::from_manifest(
             header,
-            BlockManifest {
-                tx_hashes: vec![tx_hash].into(),
-                cert_ids: vec![wave_id.clone()].into(),
-                ..Default::default()
-            },
+            BlockManifest::new(vec![tx_hash], vec![wave_id.clone()], vec![]),
             LocalTimestamp::ZERO,
         );
 
@@ -558,13 +546,10 @@ mod tests {
         assert!(!pb.is_complete()); // Still missing wave
 
         // Add finalized wave
-        let fw = Arc::new(FinalizedWave {
-            certificate: Arc::new(WaveCertificate {
-                wave_id,
-                execution_certificates: vec![],
-            }),
-            receipts: BoundedVec::new(),
-        });
+        let fw = Arc::new(FinalizedWave::new(
+            Arc::new(WaveCertificate::new(wave_id, vec![])),
+            vec![],
+        ));
         pb.add_finalized_wave(fw);
         assert!(pb.is_complete());
     }
@@ -572,15 +557,9 @@ mod tests {
     #[test]
     fn test_from_complete_block_is_complete() {
         let wave_id = WaveId::new(ShardGroupId::new(0), BlockHeight::new(1), BTreeSet::new());
-        let cert = Arc::new(WaveCertificate {
-            wave_id,
-            execution_certificates: vec![],
-        });
+        let cert = Arc::new(WaveCertificate::new(wave_id, vec![]));
 
-        let fw = Arc::new(FinalizedWave {
-            certificate: cert,
-            receipts: BoundedVec::new(),
-        });
+        let fw = Arc::new(FinalizedWave::new(cert, vec![]));
 
         let block = Block::Live {
             header: make_header(BlockHeight::new(1)),

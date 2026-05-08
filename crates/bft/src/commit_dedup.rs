@@ -66,7 +66,7 @@ impl CommitDedupIndex {
     pub fn register_committed_txs(&mut self, transactions: &[Arc<RoutableTransaction>]) {
         for tx in transactions {
             let tx_hash = tx.hash();
-            let end = tx.validity_range.end_timestamp_exclusive;
+            let end = tx.validity_range().end_timestamp_exclusive;
             self.tx_retention.entry(tx_hash).or_insert(end);
         }
     }

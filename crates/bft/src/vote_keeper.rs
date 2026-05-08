@@ -139,7 +139,7 @@ impl VoteKeeper {
     }
 
     /// Read-only view of own-vote locks, for callers that need to iterate
-    /// (e.g., QC-based unlock iterates all heights ≤ qc.height).
+    /// (e.g., QC-based unlock iterates all heights ≤ `qc.height()`).
     pub const fn voted_heights(&self) -> &HashMap<BlockHeight, (BlockHash, Round)> {
         &self.voted_heights
     }
@@ -171,22 +171,23 @@ impl VoteKeeper {
         committed_height: BlockHeight,
         header_for_vote: Option<&BlockHeader>,
     ) -> Vec<Action> {
-        let block_hash = vote.block_hash;
-        let height = vote.height;
-        let is_own_vote = vote.voter == topology.local_validator_id();
+        let block_hash = vote.block_hash();
+        let height = vote.height();
+        let voter = vote.voter();
+        let is_own_vote = voter == topology.local_validator_id();
 
         if height <= committed_height {
             trace!(
                 vote_anchor_ts = height.inner(),
                 committed_height = committed_height.inner(),
-                voter = ?vote.voter,
+                voter = ?voter,
                 "Skipping vote for already-committed height"
             );
             return vec![];
         }
 
-        let Some(voter_index) = topology.local_committee_index(vote.voter) else {
-            warn!("Vote from validator {:?} not in committee", vote.voter);
+        let Some(voter_index) = topology.local_committee_index(voter) else {
+            warn!("Vote from validator {:?} not in committee", voter);
             return vec![];
         };
 
@@ -194,7 +195,7 @@ impl VoteKeeper {
         // local committee, and the topology snapshot invariant guarantees
         // every committee member has a positive voting power entry.
         let voting_power = topology
-            .voting_power(vote.voter)
+            .voting_power(voter)
             .expect("committee member has voting power (TopologySnapshot invariant)");
 
         let committee_size = topology.local_committee().len();
@@ -203,10 +204,10 @@ impl VoteKeeper {
 
         let public_key = if is_own_vote {
             None
-        } else if let Some(pk) = topology.public_key(vote.voter) {
+        } else if let Some(pk) = topology.public_key(voter) {
             Some(pk)
         } else {
-            warn!("No public key for validator {:?}", vote.voter);
+            warn!("No public key for validator {:?}", voter);
             return vec![];
         };
 
@@ -216,7 +217,7 @@ impl VoteKeeper {
             .or_insert_with(|| VoteSet::new(header_for_vote, committee_size));
 
         if vote_set.has_seen_validator(voter_index) {
-            trace!("Already seen vote from validator {:?}", vote.voter);
+            trace!("Already seen vote from validator {:?}", voter);
             return vec![];
         }
 
@@ -307,16 +308,16 @@ impl VoteKeeper {
     /// on a different-block vote at the same round. Called after signature
     /// verification so a forged vote can't pre-empt a legitimate one.
     pub fn track_verified_received_vote(&mut self, block_hash: BlockHash, vote: &BlockVote) {
-        match self.record_received_vote(vote.height, vote.voter, block_hash, vote.round) {
+        match self.record_received_vote(vote.height(), vote.voter(), block_hash, vote.round()) {
             RecordResult::Accepted | RecordResult::Duplicate => {}
             RecordResult::Equivocation {
                 existing_block,
                 existing_round: _,
             } => {
                 warn!(
-                    voter = ?vote.voter,
-                    height = vote.height.inner(),
-                    round = vote.round.inner(),
+                    voter = ?vote.voter(),
+                    height = vote.height().inner(),
+                    round = vote.round().inner(),
                     existing_block = ?existing_block,
                     new_block = ?block_hash,
                     "EQUIVOCATION DETECTED: validator voted for different blocks at same height/round"
@@ -437,32 +438,31 @@ pub enum RecordResult {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{
-        BoundedBTreeMap, BoundedVec, CertificateRoot, Hash, InFlightCount, LocalReceiptRoot,
-        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, ShardGroupId, StateRoot,
-        TransactionRoot, ValidatorId,
+        CertificateRoot, Hash, InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
+        QuorumCertificate, ShardGroupId, StateRoot, TransactionRoot, ValidatorId,
     };
 
     use super::*;
 
-    fn make_header(height: BlockHeight) -> BlockHeader {
-        BlockHeader {
-            shard_group_id: ShardGroupId::new(0),
+    fn make_header_at_round(height: BlockHeight, round: Round) -> BlockHeader {
+        BlockHeader::new(
+            ShardGroupId::new(0),
             height,
-            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            parent_qc: QuorumCertificate::genesis(ShardGroupId::new(0)),
-            proposer: ValidatorId::new(0),
-            timestamp: ProposerTimestamp::from_millis(1_234_567_890),
-            round: Round::INITIAL,
-            is_fallback: false,
-            state_root: StateRoot::ZERO,
-            transaction_root: TransactionRoot::ZERO,
-            certificate_root: CertificateRoot::ZERO,
-            local_receipt_root: LocalReceiptRoot::ZERO,
-            provision_root: ProvisionsRoot::ZERO,
-            waves: BoundedVec::new(),
-            provision_tx_roots: BoundedBTreeMap::new(),
-            in_flight: InFlightCount::ZERO,
-        }
+            BlockHash::from_raw(Hash::from_bytes(b"parent")),
+            QuorumCertificate::genesis(ShardGroupId::new(0)),
+            ValidatorId::new(0),
+            ProposerTimestamp::from_millis(1_234_567_890),
+            round,
+            false,
+            StateRoot::ZERO,
+            TransactionRoot::ZERO,
+            CertificateRoot::ZERO,
+            LocalReceiptRoot::ZERO,
+            ProvisionsRoot::ZERO,
+            Vec::new(),
+            std::collections::BTreeMap::new(),
+            InFlightCount::ZERO,
+        )
     }
 
     #[test]
@@ -494,11 +494,7 @@ mod tests {
 
     #[test]
     fn keeper_clear_for_height_keeps_current_or_later_round_vote_sets() {
-        let header_at = |round: Round| {
-            let mut h = make_header(BlockHeight::new(5));
-            h.round = round;
-            h
-        };
+        let header_at = |round: Round| make_header_at_round(BlockHeight::new(5), round);
 
         let mut vk = VoteKeeper::new();
         let hdr_r0 = header_at(Round::new(0));

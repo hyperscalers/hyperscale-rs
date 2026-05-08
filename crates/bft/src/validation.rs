@@ -24,7 +24,7 @@ use hyperscale_types::{
 
 use crate::commit_dedup::CommitDedupIndex;
 
-/// True if `qc.signers` represents at least 2f+1 of the local committee's
+/// True if `qc.signers()` represents at least 2f+1 of the local committee's
 /// voting power. The synced-block apply path and consensus pre-vote path
 /// both call this — without it, a single Byzantine signer suffices to pass
 /// the BLS-only `VerifyQcSignature` check that follows.
@@ -32,7 +32,7 @@ use crate::commit_dedup::CommitDedupIndex;
 pub fn qc_has_local_quorum_power(topology: &TopologySnapshot, qc: &QuorumCertificate) -> bool {
     let committee = topology.local_committee();
     let qc_power: VotePower = qc
-        .signers
+        .signers()
         .set_indices()
         .filter_map(|i| committee.get(i))
         .map(|&vid| {
@@ -52,8 +52,8 @@ pub fn validate_header(
     committed_height: BlockHeight,
     now: LocalTimestamp,
 ) -> Result<(), String> {
-    let height = header.height;
-    let round = header.round;
+    let height = header.height();
+    let round = header.round();
 
     if height <= committed_height {
         return Err(format!(
@@ -64,30 +64,32 @@ pub fn validate_header(
     }
 
     let expected_proposer = topology.proposer_for(height, round);
-    if header.proposer != expected_proposer {
+    if header.proposer() != expected_proposer {
         return Err(format!(
             "wrong proposer: expected {:?}, got {:?}",
-            expected_proposer, header.proposer
+            expected_proposer,
+            header.proposer()
         ));
     }
 
-    if !header.parent_qc.is_genesis() {
-        if !qc_has_local_quorum_power(topology, &header.parent_qc) {
+    if !header.parent_qc().is_genesis() {
+        if !qc_has_local_quorum_power(topology, header.parent_qc()) {
             return Err("parent QC does not have quorum".to_string());
         }
 
-        if header.parent_qc.height.inner() + 1 != height.inner() {
+        if header.parent_qc().height().inner() + 1 != height.inner() {
             return Err(format!(
                 "parent QC height {} doesn't match block height {} - 1",
-                header.parent_qc.height.inner(),
+                header.parent_qc().height().inner(),
                 height.inner()
             ));
         }
 
-        if header.parent_block_hash != header.parent_qc.block_hash {
+        if header.parent_block_hash() != header.parent_qc().block_hash() {
             return Err(format!(
-                "parent_block_hash {:?} doesn't match parent_qc.block_hash {:?}",
-                header.parent_block_hash, header.parent_qc.block_hash
+                "parent_block_hash {:?} doesn't match parent_qc.block_hash() {:?}",
+                header.parent_block_hash(),
+                header.parent_qc().block_hash()
             ));
         }
     } else if height.inner() != committed_height.inner() + 1 {
@@ -115,7 +117,7 @@ pub fn validate_timestamp(header: &BlockHeader, now: LocalTimestamp) -> Result<(
     if header.is_genesis() {
         return Ok(());
     }
-    if header.is_fallback {
+    if header.is_fallback() {
         return Ok(());
     }
 
@@ -123,7 +125,7 @@ pub fn validate_timestamp(header: &BlockHeader, now: LocalTimestamp) -> Result<(
     let max_rush_ms = u64::try_from(MAX_TIMESTAMP_RUSH.as_millis()).unwrap_or(u64::MAX);
 
     let now_ms = now.as_millis();
-    let header_ts_ms = header.timestamp.as_millis();
+    let header_ts_ms = header.timestamp().as_millis();
 
     if header_ts_ms < now_ms.saturating_sub(max_delay_ms) {
         return Err(format!(
@@ -153,10 +155,10 @@ pub fn validate_transaction_ordering(block: &Block) -> Result<(), String> {
 pub fn validate_waves(topology: &TopologySnapshot, block: &Block) -> Result<(), String> {
     let expected = compute_waves(topology, block.height(), block.transactions());
 
-    if block.header().waves.0 != expected {
+    if block.header().waves().0 != expected {
         return Err(format!(
             "waves mismatch: header={:?}, computed={:?}",
-            block.header().waves,
+            block.header().waves(),
             expected
         ));
     }
@@ -305,9 +307,9 @@ mod tests {
 
     use hyperscale_test_helpers::{TestCommittee, make_finalized_wave};
     use hyperscale_types::{
-        BlockHash, BlockHeader, BoundedBTreeMap, BoundedVec, CertificateRoot, FinalizedWave, Hash,
-        InFlightCount, LocalReceiptRoot, MerkleInclusionProof, ProposerTimestamp, Provisions,
-        ProvisionsRoot, QuorumCertificate, Round, RoutableTransaction, ShardGroupId, StateRoot,
+        BlockHash, BlockHeader, BoundedVec, CertificateRoot, FinalizedWave, Hash, InFlightCount,
+        LocalReceiptRoot, MerkleInclusionProof, ProposerTimestamp, Provisions, ProvisionsRoot,
+        QuorumCertificate, Round, RoutableTransaction, ShardGroupId, StateRoot,
         TransactionDecision, TransactionRoot, TxEntries, ValidatorId, ValidatorInfo, ValidatorSet,
         WeightedTimestamp, compute_waves, test_utils,
     };
@@ -327,45 +329,72 @@ mod tests {
     }
 
     fn header_at_height(height: BlockHeight, timestamp_ms: u64) -> BlockHeader {
-        BlockHeader {
-            shard_group_id: ShardGroupId::new(0),
+        BlockHeader::new(
+            ShardGroupId::new(0),
             height,
-            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            parent_qc: QuorumCertificate::genesis(ShardGroupId::new(0)),
-            proposer: ValidatorId::new(height.inner() % 4),
-            timestamp: ProposerTimestamp::from_millis(timestamp_ms),
-            round: Round::new(0),
-            is_fallback: false,
-            state_root: StateRoot::ZERO,
-            transaction_root: TransactionRoot::ZERO,
-            certificate_root: CertificateRoot::ZERO,
-            local_receipt_root: LocalReceiptRoot::ZERO,
-            provision_root: ProvisionsRoot::ZERO,
-            waves: BoundedVec::new(),
-            provision_tx_roots: BoundedBTreeMap::new(),
-            in_flight: InFlightCount::ZERO,
-        }
+            BlockHash::from_raw(Hash::from_bytes(b"parent")),
+            QuorumCertificate::genesis(ShardGroupId::new(0)),
+            ValidatorId::new(height.inner() % 4),
+            ProposerTimestamp::from_millis(timestamp_ms),
+            Round::new(0),
+            false,
+            StateRoot::ZERO,
+            TransactionRoot::ZERO,
+            CertificateRoot::ZERO,
+            LocalReceiptRoot::ZERO,
+            ProvisionsRoot::ZERO,
+            Vec::new(),
+            std::collections::BTreeMap::new(),
+            InFlightCount::ZERO,
+        )
+    }
+
+    fn header_with_overrides(
+        base: &BlockHeader,
+        round: Option<Round>,
+        is_fallback: Option<bool>,
+        parent_block_hash: Option<BlockHash>,
+        proposer: Option<ValidatorId>,
+    ) -> BlockHeader {
+        BlockHeader::new(
+            base.shard_group_id(),
+            base.height(),
+            parent_block_hash.unwrap_or_else(|| base.parent_block_hash()),
+            base.parent_qc().clone(),
+            proposer.unwrap_or_else(|| base.proposer()),
+            base.timestamp(),
+            round.unwrap_or_else(|| base.round()),
+            is_fallback.unwrap_or_else(|| base.is_fallback()),
+            base.state_root(),
+            base.transaction_root(),
+            base.certificate_root(),
+            base.local_receipt_root(),
+            base.provision_root(),
+            base.waves().clone().into_inner(),
+            base.provision_tx_roots().clone().into_inner(),
+            base.in_flight(),
+        )
     }
 
     fn block_with_waves(height: BlockHeight, waves: Vec<WaveId>) -> Block {
-        let header = BlockHeader {
-            shard_group_id: ShardGroupId::new(0),
+        let header = BlockHeader::new(
+            ShardGroupId::new(0),
             height,
-            parent_block_hash: BlockHash::ZERO,
-            parent_qc: QuorumCertificate::genesis(ShardGroupId::new(0)),
-            proposer: ValidatorId::new(0),
-            timestamp: ProposerTimestamp::from_millis(0),
-            round: Round::INITIAL,
-            is_fallback: false,
-            state_root: StateRoot::ZERO,
-            transaction_root: TransactionRoot::ZERO,
-            certificate_root: CertificateRoot::ZERO,
-            local_receipt_root: LocalReceiptRoot::ZERO,
-            provision_root: ProvisionsRoot::ZERO,
-            waves: waves.into(),
-            provision_tx_roots: BoundedBTreeMap::new(),
-            in_flight: InFlightCount::ZERO,
-        };
+            BlockHash::ZERO,
+            QuorumCertificate::genesis(ShardGroupId::new(0)),
+            ValidatorId::new(0),
+            ProposerTimestamp::from_millis(0),
+            Round::INITIAL,
+            false,
+            StateRoot::ZERO,
+            TransactionRoot::ZERO,
+            CertificateRoot::ZERO,
+            LocalReceiptRoot::ZERO,
+            ProvisionsRoot::ZERO,
+            waves,
+            std::collections::BTreeMap::new(),
+            InFlightCount::ZERO,
+        );
         Block::Live {
             header,
             transactions: Arc::new(BoundedVec::new()),
@@ -404,9 +433,13 @@ mod tests {
     #[test]
     fn validate_timestamp_skips_genesis() {
         let now = LocalTimestamp::from_millis(100_000);
-        let mut header = header_at_height(BlockHeight::new(0), 0);
-        header.parent_block_hash = BlockHash::from_raw(Hash::from_bytes(b"genesis_parent"));
-        header.proposer = ValidatorId::new(0);
+        let header = header_with_overrides(
+            &header_at_height(BlockHeight::new(0), 0),
+            None,
+            None,
+            Some(BlockHash::from_raw(Hash::from_bytes(b"genesis_parent"))),
+            Some(ValidatorId::new(0)),
+        );
         assert!(validate_timestamp(&header, now).is_ok());
     }
 
@@ -458,13 +491,14 @@ mod tests {
 
         // 50s old would normally fail (MAX_TIMESTAMP_DELAY = 30s), but fallback
         // blocks inherit the parent's weighted timestamp across view changes.
-        let mut header = header_at_height(BlockHeight::new(1), 50_000);
-        header.round = Round::new(5);
-        header.is_fallback = true;
-        assert!(validate_timestamp(&header, now).is_ok());
+        let base = header_at_height(BlockHeight::new(1), 50_000);
+        let header_fallback =
+            header_with_overrides(&base, Some(Round::new(5)), Some(true), None, None);
+        assert!(validate_timestamp(&header_fallback, now).is_ok());
 
-        header.is_fallback = false;
-        assert!(validate_timestamp(&header, now).is_err());
+        let header_normal =
+            header_with_overrides(&base, Some(Round::new(5)), Some(false), None, None);
+        assert!(validate_timestamp(&header_normal, now).is_err());
     }
 
     // ═══════════════════════════════════════════════════════════════════════

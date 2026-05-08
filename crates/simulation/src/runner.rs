@@ -522,9 +522,18 @@ impl SimulationRunner {
                 // Sync state machine with actual JMT state after genesis bootstrap.
                 // Pair the genesis block with a zeroed QC whose `block_hash` matches
                 // so the CertifiedBlock pairing invariant holds.
-                let genesis_qc = QuorumCertificate {
-                    block_hash: genesis_block.hash(),
-                    ..QuorumCertificate::genesis(genesis_block.header().shard_group_id)
+                let genesis_qc = {
+                    let __qc = QuorumCertificate::genesis(genesis_block.header().shard_group_id());
+                    QuorumCertificate::new(
+                        genesis_block.hash(),
+                        __qc.shard_group_id(),
+                        __qc.height(),
+                        __qc.parent_block_hash(),
+                        __qc.round(),
+                        __qc.signers().clone(),
+                        __qc.aggregated_signature(),
+                        __qc.weighted_timestamp(),
+                    )
                 };
                 let genesis_certified =
                     CertifiedBlock::new_unchecked(genesis_block.clone(), genesis_qc);

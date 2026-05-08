@@ -79,11 +79,11 @@ impl NodeStateMachine {
                 // target shard's tx_outcomes acknowledge outbound batches we
                 // sent. Surface the ACK to the outbound tracker.
                 if certificate.shard_group_id() != local_shard
-                    && certificate.wave_id.remote_shards.contains(&local_shard)
+                    && certificate.wave_id().remote_shards().contains(&local_shard)
                 {
                     actions.push(Action::Continuation(ProtocolEvent::OutboundEcObserved {
                         target_shard: certificate.shard_group_id(),
-                        tx_outcomes: certificate.tx_outcomes.clone(),
+                        tx_outcomes: certificate.tx_outcomes().clone(),
                     }));
                 }
                 // Remote EC abort propagation may unlock local accumulators — re-scan.
@@ -143,10 +143,7 @@ mod tests {
             ShardGroupId::new(1),
             remote_shards,
             BlockHeight::new(1),
-            vec![TxOutcome {
-                tx_hash: TxHash::ZERO,
-                outcome: ExecutionOutcome::Failed,
-            }],
+            vec![TxOutcome::new(TxHash::ZERO, ExecutionOutcome::Failed)],
         );
 
         let actions = node.handle(ProtocolEvent::ExecutionCertificateAdmitted { certificate: ec });

@@ -146,7 +146,7 @@ where
                 if let Some(provisions) =
                     outbound_cache.get_outbound(req.block_height, req.target_shard)
                 {
-                    record_fetch_response_sent("provision", provisions.transactions.len().max(1));
+                    record_fetch_response_sent("provision", provisions.transactions().len().max(1));
                     return GetProvisionResponse {
                         provisions: Some(provisions),
                     };
@@ -160,7 +160,7 @@ where
                     let mut guard = dedup.lock().unwrap();
                     if let Some(cached) = guard.cache.get(&cache_key) {
                         if let Some(p) = &cached.provisions {
-                            record_fetch_response_sent("provision", p.transactions.len().max(1));
+                            record_fetch_response_sent("provision", p.transactions().len().max(1));
                         }
                         return cached.clone();
                     }
@@ -231,7 +231,7 @@ where
                 let response =
                     serve_provision_request(&*storage, topo.local_shard(), topo.num_shards(), &req);
                 if let Some(p) = &response.provisions {
-                    record_fetch_response_sent("provision", p.transactions.len());
+                    record_fetch_response_sent("provision", p.transactions().len());
                 }
 
                 if response.provisions.is_some() {
@@ -381,7 +381,7 @@ where
                 TopicScope::Global,
                 move |gossip: CommittedBlockHeaderGossip| -> GossipVerdict {
                     let sender = gossip.sender;
-                    let header_shard = gossip.committed_header.header.shard_group_id;
+                    let header_shard = gossip.committed_header.header().shard_group_id();
                     let topo = topology.load();
 
                     // Own-shard headers are valid but not needed — accept to forward.
@@ -430,7 +430,7 @@ where
             .register_notification_handler::<BlockHeaderNotification>(
                 move |gossip: BlockHeaderNotification| {
                     let topo = topology.load();
-                    let proposer = gossip.header.proposer;
+                    let proposer = gossip.header.proposer();
                     let Some(public_key) = topo.public_key(proposer) else {
                         warn!(
                             proposer = proposer.inner(),
@@ -447,8 +447,8 @@ where
                     ) {
                         warn!(
                             proposer = proposer.inner(),
-                            height = gossip.header.height.inner(),
-                            round = gossip.header.round.inner(),
+                            height = gossip.header.height().inner(),
+                            round = gossip.header.round().inner(),
                             "Block header proposer signature invalid — dropping"
                         );
                         return;
@@ -471,10 +471,10 @@ where
 
                     // Drop provisions not destined for our shard before paying
                     // the BLS verification cost. Catches misroutes and spam early.
-                    if notification.provisions.target_shard != topo.local_shard() {
+                    if notification.provisions.target_shard() != topo.local_shard() {
                         warn!(
-                            source_shard = notification.provisions.source_shard.inner(),
-                            target_shard = notification.provisions.target_shard.inner(),
+                            source_shard = notification.provisions.source_shard().inner(),
+                            target_shard = notification.provisions.target_shard().inner(),
                             local_shard = topo.local_shard().inner(),
                             "Dropping provisions notification: target_shard mismatch"
                         );
@@ -482,7 +482,7 @@ where
                     }
 
                     let sender = notification.sender;
-                    let source_shard = notification.provisions.source_shard;
+                    let source_shard = notification.provisions.source_shard();
                     let msg = notification.signing_message();
                     if !verify_sender_signature(
                         &topo,

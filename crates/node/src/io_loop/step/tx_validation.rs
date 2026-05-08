@@ -93,9 +93,9 @@ where
 
         let num_shards = self.topology_snapshot.load().num_shards();
         let shards: std::collections::BTreeSet<ShardGroupId> = tx
-            .declared_reads
+            .declared_reads()
             .iter()
-            .chain(tx.declared_writes.iter())
+            .chain(tx.declared_writes().iter())
             .map(|node_id| shard_for_node(node_id, num_shards))
             .collect();
         for shard in shards {

@@ -810,7 +810,7 @@ mod tests {
             // well before the latest poll time.
             let waves: Vec<WaveId> = heights.iter().map(|h| wave(*h)).collect();
             for w in &waves {
-                t.register(shard, w.block_height, w.clone(), ms(0));
+                t.register(shard, w.block_height(), w.clone(), ms(0));
             }
 
             // Fulfill a subset BEFORE any deadline could fire. Using ms(1)
@@ -819,7 +819,7 @@ mod tests {
                 let w = &waves[usize::try_from(*idx).unwrap_or(usize::MAX) % waves.len()];
                 t.mark_fulfilled(
                     shard,
-                    w.block_height,
+                    w.block_height(),
                     w,
                     std::iter::once(tx(1)),
                     ms(60_000),
@@ -832,7 +832,7 @@ mod tests {
                 let fetches = t.check_timeouts(now);
                 // Any fetch emitted must correspond to a still-expected key.
                 for (wave_id, _) in &fetches {
-                    let key = (wave_id.shard_group_id, wave_id.block_height, wave_id.clone());
+                    let key = (wave_id.shard_group_id(), wave_id.block_height(), wave_id.clone());
                     prop_assert!(
                         !t.fulfilled.contains_key(&key),
                         "fallback fetch emitted for a fulfilled key: {:?}",

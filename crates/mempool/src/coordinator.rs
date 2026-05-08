@@ -307,10 +307,10 @@ impl MempoolCoordinator {
         // Reject if past `validity_range.end_timestamp_exclusive`. Same
         // expression the proposer/validator apply, enforced at the admission
         // boundary so expired txs never enter the pool.
-        if tx.validity_range.end_timestamp_exclusive <= self.current_ts {
+        if tx.validity_range().end_timestamp_exclusive <= self.current_ts {
             tracing::debug!(
                 tx_hash = ?hash,
-                end_ms = tx.validity_range.end_timestamp_exclusive.as_millis(),
+                end_ms = tx.validity_range().end_timestamp_exclusive.as_millis(),
                 now_ms = self.current_ts.as_millis(),
                 "Rejecting expired transaction"
             );
@@ -492,7 +492,7 @@ impl MempoolCoordinator {
         // `tx_store` so peers can still fetch by hash; both expire on the
         // same `end_timestamp_exclusive` via `prune_tombstones`.
         self.tombstones
-            .tombstone(tx_hash, entry.tx.validity_range.end_timestamp_exclusive);
+            .tombstone(tx_hash, entry.tx.validity_range().end_timestamp_exclusive);
     }
 
     /// Check if a transaction hash is tombstoned (reached terminal state).
@@ -508,8 +508,8 @@ impl MempoolCoordinator {
     /// 2. Process certificates → mark completed
     /// 3. Process aborts → update status to terminal
     #[instrument(skip(self, certified), fields(
-        height = certified.block.height().inner(),
-        tx_count = certified.block.transaction_count()
+        height = certified.block().height().inner(),
+        tx_count = certified.block().transaction_count()
     ))]
     #[allow(clippy::too_many_lines)] // sequential orchestration: block-include, expected-tx sweep, certificate processing
     pub fn on_block_committed(
@@ -517,12 +517,12 @@ impl MempoolCoordinator {
         topology: &TopologySnapshot,
         certified: &CertifiedBlock,
     ) -> Vec<Action> {
-        let block = &certified.block;
+        let block = certified.block();
         let height = block.height();
         let mut actions = Vec::new();
 
         self.current_height = height;
-        self.current_ts = certified.qc.weighted_timestamp;
+        self.current_ts = certified.qc().weighted_timestamp();
 
         // Ensure all committed transactions are in the mempool.
         // This handles the case where we fetched transactions to vote on a block
@@ -595,8 +595,8 @@ impl MempoolCoordinator {
         // for txs already in pool (gossip already won); per-(tx, source) dedup
         // is handled by `ExpectedTxs::record`.
         for provision in block.provisions() {
-            let source_shard = provision.source_shard;
-            for tx_entries in provision.transactions.iter() {
+            let source_shard = provision.source_shard();
+            for tx_entries in provision.transactions().iter() {
                 let tx_hash = tx_entries.tx_hash;
                 if self.pool.contains_key(&tx_hash) {
                     continue;
@@ -1032,7 +1032,7 @@ impl MempoolCoordinator {
             .pool
             .iter()
             .filter(|(_, entry)| matches!(entry.status, TransactionStatus::Pending))
-            .filter(|(_, entry)| entry.tx.validity_range.end_timestamp_exclusive <= now)
+            .filter(|(_, entry)| entry.tx.validity_range().end_timestamp_exclusive <= now)
             .map(|(hash, _)| *hash)
             .collect();
         for hash in &expired {

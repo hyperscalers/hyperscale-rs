@@ -60,25 +60,25 @@ use crate::wave_state::WaveState;
 pub fn aggregate_execution_certificate(
     wave_id: &WaveId,
     global_receipt_root: GlobalReceiptRoot,
-    mut votes: Vec<ExecutionVote>,
+    votes: &[ExecutionVote],
     committee: &[ValidatorId],
 ) -> ExecutionCertificate {
     let tx_outcomes = votes
-        .iter_mut()
-        .find(|v| compute_global_receipt_root(&v.tx_outcomes) == global_receipt_root)
-        .map(|v| std::mem::take(&mut v.tx_outcomes))
+        .iter()
+        .find(|v| compute_global_receipt_root(v.tx_outcomes()) == global_receipt_root)
+        .map(|v| v.tx_outcomes().clone())
         .expect("intake filter guarantees a vote with matching outcomes");
 
     // Deduplicate votes by validator
     let mut seen_validators = HashSet::new();
     let unique_votes: Vec<_> = votes
         .iter()
-        .filter(|vote| seen_validators.insert(vote.validator))
+        .filter(|vote| seen_validators.insert(vote.validator()))
         .collect();
 
     // Aggregate BLS signatures
     let bls_signatures: Vec<Bls12381G2Signature> =
-        unique_votes.iter().map(|vote| vote.signature).collect();
+        unique_votes.iter().map(|vote| vote.signature()).collect();
 
     let aggregated_signature = if bls_signatures.is_empty() {
         zero_bls_signature()
@@ -95,14 +95,14 @@ pub fn aggregate_execution_certificate(
         .collect();
     let mut signers = SignerBitfield::new(committee.len());
     for vote in &unique_votes {
-        if let Some(&idx) = committee_index.get(&vote.validator) {
+        if let Some(&idx) = committee_index.get(&vote.validator()) {
             signers.set(idx);
         }
     }
 
     let vote_anchor_ts = votes
         .first()
-        .map_or(WeightedTimestamp::ZERO, |v| v.vote_anchor_ts);
+        .map_or(WeightedTimestamp::ZERO, ExecutionVote::vote_anchor_ts);
 
     ExecutionCertificate::new(
         wave_id.clone(),
@@ -134,7 +134,7 @@ pub fn batch_verify_execution_votes(
 ) -> impl Iterator<Item = (ExecutionVote, VotePower)> {
     let votes: Vec<_> = votes
         .into_iter()
-        .filter(|(v, _, _)| compute_global_receipt_root(&v.tx_outcomes) == v.global_receipt_root)
+        .filter(|(v, _, _)| compute_global_receipt_root(v.tx_outcomes()) == v.global_receipt_root())
         .collect();
 
     if votes.is_empty() {
@@ -146,11 +146,11 @@ pub fn batch_verify_execution_votes(
         HashMap::new();
     for (vote, pk, power) in votes {
         let msg = exec_vote_message(
-            vote.vote_anchor_ts,
-            &vote.wave_id,
-            vote.shard_group_id,
-            &vote.global_receipt_root,
-            vote.tx_count,
+            vote.vote_anchor_ts(),
+            vote.wave_id(),
+            vote.shard_group_id(),
+            &vote.global_receipt_root(),
+            vote.tx_count(),
         );
         by_message.entry(msg).or_default().push((vote, pk, power));
     }
@@ -159,7 +159,7 @@ pub fn batch_verify_execution_votes(
 
     for (message, group) in by_message {
         if group.len() >= 2 {
-            let signatures: Vec<_> = group.iter().map(|(v, _, _)| v.signature).collect();
+            let signatures: Vec<_> = group.iter().map(|(v, _, _)| v.signature()).collect();
             let pubkeys: Vec<_> = group.iter().map(|(_, pk, _)| *pk).collect();
 
             if batch_verify_bls_same_message(&message, &signatures, &pubkeys) {
@@ -169,7 +169,7 @@ pub fn batch_verify_execution_votes(
             } else {
                 // Batch failed — verify individually
                 for (vote, pk, power) in group {
-                    if verify_bls12381_v1(&message, &pk, &vote.signature) {
+                    if verify_bls12381_v1(&message, &pk, &vote.signature()) {
                         verified.push((vote, power));
                     }
                 }
@@ -177,7 +177,7 @@ pub fn batch_verify_execution_votes(
         } else {
             // Single vote — verify directly
             for (vote, pk, power) in group {
-                if verify_bls12381_v1(&message, &pk, &vote.signature) {
+                if verify_bls12381_v1(&message, &pk, &vote.signature()) {
                     verified.push((vote, power));
                 }
             }
@@ -196,25 +196,25 @@ pub fn verify_execution_certificate_signature(
     public_keys: &[Bls12381G1PublicKey],
 ) -> bool {
     let msg = exec_vote_message(
-        certificate.vote_anchor_ts,
-        &certificate.wave_id,
+        certificate.vote_anchor_ts(),
+        certificate.wave_id(),
         certificate.shard_group_id(),
-        &certificate.global_receipt_root,
-        u32::try_from(certificate.tx_outcomes.len()).unwrap_or(u32::MAX),
+        &certificate.global_receipt_root(),
+        u32::try_from(certificate.tx_outcomes().len()).unwrap_or(u32::MAX),
     );
 
     let signer_keys: Vec<_> = public_keys
         .iter()
         .enumerate()
-        .filter(|(i, _)| certificate.signers.is_set(*i))
+        .filter(|(i, _)| certificate.signers().is_set(*i))
         .map(|(_, pk)| *pk)
         .collect();
 
     if signer_keys.is_empty() {
-        certificate.aggregated_signature == zero_bls_signature()
+        certificate.aggregated_signature() == zero_bls_signature()
     } else {
         Bls12381G1PublicKey::aggregate(&signer_keys, false).is_ok_and(|aggregated_pk| {
-            verify_bls12381_v1(&msg, &aggregated_pk, &certificate.aggregated_signature)
+            verify_bls12381_v1(&msg, &aggregated_pk, &certificate.aggregated_signature())
         })
     }
 }
@@ -307,7 +307,7 @@ where
             committee,
         } => {
             let certificate =
-                aggregate_execution_certificate(&wave_id, global_receipt_root, votes, &committee);
+                aggregate_execution_certificate(&wave_id, global_receipt_root, &votes, &committee);
             (ctx.notify)(NodeInput::Protocol(Box::new(
                 ProtocolEvent::ExecutionCertificateAggregated {
                     wave_id,
@@ -445,18 +445,18 @@ where
                 tx_count,
             );
             let sig = ctx.signing_key.sign_v1(&msg);
-            let vote = ExecutionVote {
+            let vote = ExecutionVote::new(
                 block_hash,
                 block_height,
                 vote_anchor_ts,
                 wave_id,
-                shard_group_id: local_shard,
+                local_shard,
                 global_receipt_root,
                 tx_count,
                 tx_outcomes,
-                validator: validator_id,
-                signature: sig,
-            };
+                validator_id,
+                sig,
+            );
 
             // Send vote to the wave leader (unicast).
             if leader != validator_id {
@@ -528,12 +528,12 @@ mod tests {
     }
 
     fn outcome(tx: TxHash) -> TxOutcome {
-        TxOutcome {
-            tx_hash: tx,
-            outcome: ExecutionOutcome::Succeeded {
+        TxOutcome::new(
+            tx,
+            ExecutionOutcome::Succeeded {
                 receipt_hash: GlobalReceiptHash::ZERO,
             },
-        }
+        )
     }
 
     fn signed_vote(
@@ -546,18 +546,18 @@ mod tests {
     ) -> ExecutionVote {
         let tx_count = u32::try_from(tx_outcomes.len()).unwrap_or(u32::MAX);
         let msg = exec_vote_message(anchor, wid, shard(), &global_receipt_root, tx_count);
-        ExecutionVote {
-            block_hash: BlockHash::ZERO,
-            block_height: BlockHeight::new(1),
-            vote_anchor_ts: anchor,
-            wave_id: wid.clone(),
-            shard_group_id: shard(),
+        ExecutionVote::new(
+            BlockHash::ZERO,
+            BlockHeight::new(1),
+            anchor,
+            wid.clone(),
+            shard(),
             global_receipt_root,
             tx_count,
             tx_outcomes,
-            validator: voter,
-            signature: sk.sign_v1(&msg),
-        }
+            voter,
+            sk.sign_v1(&msg),
+        )
     }
 
     // ─── aggregate_execution_certificate ─────────────────────────────────
@@ -598,12 +598,12 @@ mod tests {
             ),
         ];
 
-        let ec = aggregate_execution_certificate(&wid, root, votes, &committee);
-        assert!(ec.signers.is_set(1));
-        assert!(ec.signers.is_set(3));
-        assert!(!ec.signers.is_set(0));
-        assert!(!ec.signers.is_set(2));
-        assert_eq!(ec.tx_outcomes, outcomes);
+        let ec = aggregate_execution_certificate(&wid, root, &votes, &committee);
+        assert!(ec.signers().is_set(1));
+        assert!(ec.signers().is_set(3));
+        assert!(!ec.signers().is_set(0));
+        assert!(!ec.signers().is_set(2));
+        assert_eq!(ec.tx_outcomes(), &outcomes);
     }
 
     #[test]
@@ -634,10 +634,14 @@ mod tests {
             ),
         ];
 
-        let ec = aggregate_execution_certificate(&wid, root, votes, &committee);
-        assert!(ec.signers.is_set(0));
-        assert!(!ec.signers.is_set(1));
-        assert_eq!(ec.signers.count_ones(), 1, "duplicate votes must collapse");
+        let ec = aggregate_execution_certificate(&wid, root, &votes, &committee);
+        assert!(ec.signers().is_set(0));
+        assert!(!ec.signers().is_set(1));
+        assert_eq!(
+            ec.signers().count_ones(),
+            1,
+            "duplicate votes must collapse"
+        );
     }
 
     // ─── batch_verify_execution_votes ────────────────────────────────────
@@ -692,7 +696,7 @@ mod tests {
         // V1 signs with sk1 but submits a signature over a DIFFERENT message
         // (wrong root) — the batch verify fails, then the individual fallback
         // drops only V1's vote.
-        let mut bad_vote = signed_vote(
+        let bad_vote = signed_vote(
             ValidatorId::new(1),
             &sk1,
             &wid,
@@ -703,7 +707,18 @@ mod tests {
         // Re-stamp the vote's visible receipt_root back to the correct one so
         // the batch-verify message computation matches the other votes (and
         // thus groups them), but the signature still covers the wrong root.
-        bad_vote.global_receipt_root = root;
+        let bad_vote = ExecutionVote::new(
+            bad_vote.block_hash(),
+            bad_vote.block_height(),
+            bad_vote.vote_anchor_ts(),
+            bad_vote.wave_id().clone(),
+            bad_vote.shard_group_id(),
+            root,
+            bad_vote.tx_count(),
+            bad_vote.tx_outcomes().clone(),
+            bad_vote.validator(),
+            bad_vote.signature(),
+        );
 
         let votes = vec![
             (
@@ -734,7 +749,7 @@ mod tests {
         ];
 
         let verified: Vec<_> = batch_verify_execution_votes(votes).collect();
-        let validators: Vec<ValidatorId> = verified.iter().map(|(v, _)| v.validator).collect();
+        let validators: Vec<ValidatorId> = verified.iter().map(|(v, _)| v.validator()).collect();
         assert_eq!(validators, vec![ValidatorId::new(0), ValidatorId::new(2)]);
     }
 
@@ -757,7 +772,7 @@ mod tests {
         let sk0 = keypair(0);
         let sk1 = keypair(1);
 
-        let mut byzantine = signed_vote(
+        let byzantine = signed_vote(
             ValidatorId::new(0),
             &sk0,
             &wid,
@@ -765,7 +780,18 @@ mod tests {
             WeightedTimestamp::from_millis(100),
             honest_outcomes.clone(),
         );
-        byzantine.tx_outcomes = tampered_outcomes;
+        let byzantine = ExecutionVote::new(
+            byzantine.block_hash(),
+            byzantine.block_height(),
+            byzantine.vote_anchor_ts(),
+            byzantine.wave_id().clone(),
+            byzantine.shard_group_id(),
+            byzantine.global_receipt_root(),
+            byzantine.tx_count(),
+            tampered_outcomes,
+            byzantine.validator(),
+            byzantine.signature(),
+        );
 
         let honest = signed_vote(
             ValidatorId::new(1),
@@ -782,7 +808,7 @@ mod tests {
         ];
 
         let verified: Vec<_> = batch_verify_execution_votes(votes).collect();
-        let validators: Vec<ValidatorId> = verified.iter().map(|(v, _)| v.validator).collect();
+        let validators: Vec<ValidatorId> = verified.iter().map(|(v, _)| v.validator()).collect();
         assert_eq!(
             validators,
             vec![ValidatorId::new(1)],
@@ -817,7 +843,7 @@ mod tests {
                 )
             })
             .collect();
-        let ec = aggregate_execution_certificate(&wid, root, votes, &committee);
+        let ec = aggregate_execution_certificate(&wid, root, &votes, &committee);
 
         let pubs: Vec<_> = sks.iter().map(Bls12381G1PrivateKey::public_key).collect();
         assert!(verify_execution_certificate_signature(&ec, &pubs));
@@ -850,7 +876,7 @@ mod tests {
                 outcomes,
             ),
         ];
-        let ec = aggregate_execution_certificate(&wid, root, votes, &committee);
+        let ec = aggregate_execution_certificate(&wid, root, &votes, &committee);
 
         // Provide the wrong public keys — signature must not verify.
         let wrong_pubs = vec![keypair(42).public_key(), keypair(43).public_key()];
@@ -925,13 +951,13 @@ mod tests {
         let mut provisions = HashMap::new();
         provisions.insert(
             tx_hash,
-            vec![StateProvision {
-                transaction_hash: tx_hash,
-                target_shard: shard(),
-                source_shard: ShardGroupId::new(1),
-                block_height: BlockHeight::new(5),
-                entries: Arc::new(vec![]),
-            }],
+            vec![StateProvision::new(
+                tx_hash,
+                shard(),
+                ShardGroupId::new(1),
+                BlockHeight::new(5),
+                Arc::new(vec![]),
+            )],
         );
 
         let action = build_dispatch_action(&wave, &provisions, BlockHash::ZERO);

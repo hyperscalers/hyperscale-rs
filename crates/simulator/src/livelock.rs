@@ -198,7 +198,7 @@ impl LivelockAnalyzer {
                     // Avoid duplicates (same transaction may appear on multiple shards)
                     if seen_hashes.insert(hash) {
                         let write_shards: Vec<_> = tx
-                            .declared_writes
+                            .declared_writes()
                             .iter()
                             .map(|node_id| shard_for_node(node_id, num_shards))
                             .collect::<HashSet<_>>()
@@ -206,7 +206,7 @@ impl LivelockAnalyzer {
                             .collect();
 
                         let read_shards: Vec<_> = tx
-                            .declared_reads
+                            .declared_reads()
                             .iter()
                             .map(|node_id| shard_for_node(node_id, num_shards))
                             .collect::<HashSet<_>>()
@@ -263,7 +263,7 @@ impl LivelockAnalyzer {
         // Build address contention map
         let mut address_contention: HashMap<NodeId, Vec<TxHash>> = HashMap::new();
         for tx in &self.stuck_transactions {
-            for addr in tx.transaction.declared_writes.iter() {
+            for addr in tx.transaction.declared_writes().iter() {
                 address_contention.entry(*addr).or_default().push(tx.hash);
             }
         }
@@ -306,10 +306,10 @@ impl LivelockAnalyzer {
                 }
 
                 // Check if tx_a's writes conflict with tx_b's reads and vice versa
-                let a_writes: HashSet<_> = tx_a.transaction.declared_writes.iter().collect();
-                let b_writes: HashSet<_> = tx_b.transaction.declared_writes.iter().collect();
-                let a_reads: HashSet<_> = tx_a.transaction.declared_reads.iter().collect();
-                let b_reads: HashSet<_> = tx_b.transaction.declared_reads.iter().collect();
+                let a_writes: HashSet<_> = tx_a.transaction.declared_writes().iter().collect();
+                let b_writes: HashSet<_> = tx_b.transaction.declared_writes().iter().collect();
+                let a_reads: HashSet<_> = tx_a.transaction.declared_reads().iter().collect();
+                let b_reads: HashSet<_> = tx_b.transaction.declared_reads().iter().collect();
 
                 // Check for bidirectional dependency
                 let a_blocks_b = a_writes.intersection(&b_reads).count() > 0

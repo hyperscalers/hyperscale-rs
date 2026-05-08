@@ -96,7 +96,7 @@ impl ProvisionPipeline {
         provisions: Arc<Provisions>,
         source_block_ts: WeightedTimestamp,
     ) -> Arc<Provisions> {
-        let key = (provisions.source_shard, provisions.block_height);
+        let key = (provisions.source_shard(), provisions.block_height());
         self.verified.insert(
             key,
             VerifiedProvision {
@@ -222,7 +222,7 @@ mod tests {
         let arc = pl.insert_verified(Arc::new(provisions), ts(1_000));
         assert!(pl.has_verified((ShardGroupId::new(1), BlockHeight::new(10))));
         assert!(store.get(&hash).is_some());
-        assert_eq!(arc.source_shard, ShardGroupId::new(1));
+        assert_eq!(arc.source_shard(), ShardGroupId::new(1));
     }
 
     #[test]

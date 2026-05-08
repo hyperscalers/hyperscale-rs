@@ -44,9 +44,9 @@ impl BlockHeaderNotification {
     #[must_use]
     pub fn signing_message(&self) -> Vec<u8> {
         block_header_message(
-            self.header.shard_group_id,
-            self.header.height,
-            self.header.round,
+            self.header.shard_group_id(),
+            self.header.height(),
+            self.header.round(),
             &self.header.hash(),
         )
     }
@@ -71,32 +71,34 @@ impl NetworkMessage for BlockHeaderNotification {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use crate::{
-        BlockHash, BlockHeight, BoundedBTreeMap, BoundedVec, CertificateRoot, Hash, InFlightCount,
-        LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round,
-        ShardGroupId, StateRoot, TransactionRoot, TxHash, ValidatorId,
+        BlockHash, BlockHeight, CertificateRoot, Hash, InFlightCount, LocalReceiptRoot,
+        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, StateRoot,
+        TransactionRoot, TxHash, ValidatorId,
     };
 
     fn make_header(height: BlockHeight) -> BlockHeader {
-        BlockHeader {
-            shard_group_id: ShardGroupId::new(0),
+        BlockHeader::new(
+            ShardGroupId::new(0),
             height,
-            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            parent_qc: QuorumCertificate::genesis(ShardGroupId::new(0)),
-            proposer: ValidatorId::new(0),
-            timestamp: ProposerTimestamp::from_millis(1_234_567_890),
-            round: Round::INITIAL,
-            is_fallback: false,
-            state_root: StateRoot::ZERO,
-            transaction_root: TransactionRoot::ZERO,
-            certificate_root: CertificateRoot::ZERO,
-            local_receipt_root: LocalReceiptRoot::ZERO,
-            provision_root: ProvisionsRoot::ZERO,
-            waves: BoundedVec::new(),
-            provision_tx_roots: BoundedBTreeMap::new(),
-            in_flight: InFlightCount::ZERO,
-        }
+            BlockHash::from_raw(Hash::from_bytes(b"parent")),
+            QuorumCertificate::genesis(ShardGroupId::new(0)),
+            ValidatorId::new(0),
+            ProposerTimestamp::from_millis(1_234_567_890),
+            Round::INITIAL,
+            false,
+            StateRoot::ZERO,
+            TransactionRoot::ZERO,
+            CertificateRoot::ZERO,
+            LocalReceiptRoot::ZERO,
+            ProvisionsRoot::ZERO,
+            Vec::new(),
+            BTreeMap::new(),
+            InFlightCount::ZERO,
+        )
     }
 
     fn zero_sig() -> Bls12381G2Signature {
@@ -106,16 +108,16 @@ mod tests {
     #[test]
     fn test_block_header_gossip_creation() {
         let header = make_header(BlockHeight::new(1));
-        let manifest = BlockManifest {
-            tx_hashes: vec![
+        let manifest = BlockManifest::new(
+            vec![
                 TxHash::from_raw(Hash::from_bytes(b"tx1")),
                 TxHash::from_raw(Hash::from_bytes(b"tx2")),
                 TxHash::from_raw(Hash::from_bytes(b"tx3")),
                 TxHash::from_raw(Hash::from_bytes(b"tx4")),
-            ]
-            .into(),
-            ..Default::default()
-        };
+            ],
+            vec![],
+            vec![],
+        );
 
         let gossip = BlockHeaderNotification::new(header.clone(), manifest.clone(), zero_sig());
         assert_eq!(gossip.header, header);
@@ -126,10 +128,11 @@ mod tests {
     #[test]
     fn test_block_header_gossip_into_parts() {
         let header = make_header(BlockHeight::new(5));
-        let manifest = BlockManifest {
-            tx_hashes: vec![TxHash::from_raw(Hash::from_bytes(b"tx1"))].into(),
-            ..Default::default()
-        };
+        let manifest = BlockManifest::new(
+            vec![TxHash::from_raw(Hash::from_bytes(b"tx1"))],
+            vec![],
+            vec![],
+        );
 
         let gossip = BlockHeaderNotification::new(header.clone(), manifest.clone(), zero_sig());
         let (h, m, _sig) = gossip.into_parts();
@@ -145,14 +148,11 @@ mod tests {
 
         let gossip = BlockHeaderNotification::new(
             make_header(BlockHeight::new(1)),
-            BlockManifest {
-                tx_hashes: vec![tx1, tx2, tx3].into(),
-                ..Default::default()
-            },
+            BlockManifest::new(vec![tx1, tx2, tx3], vec![], vec![]),
             zero_sig(),
         );
 
-        let all: Vec<TxHash> = gossip.manifest.tx_hashes.into_inner();
+        let all: Vec<TxHash> = gossip.manifest.tx_hashes().clone().into_inner();
         assert_eq!(all, vec![tx1, tx2, tx3]);
     }
 }

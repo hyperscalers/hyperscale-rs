@@ -112,7 +112,7 @@ impl VoteTracker {
         public_key: Bls12381G1PublicKey,
         voting_power: VotePower,
     ) -> bool {
-        let dedup_key = (vote.validator, vote.vote_anchor_ts);
+        let dedup_key = (vote.validator(), vote.vote_anchor_ts());
 
         if self.seen.contains(&dedup_key) {
             return false;
@@ -169,7 +169,7 @@ impl VoteTracker {
 
     /// Add a verified vote and its voting power.
     pub fn add_verified_vote(&mut self, vote: ExecutionVote, power: VotePower) {
-        let key = (vote.global_receipt_root, vote.vote_anchor_ts);
+        let key = (vote.global_receipt_root(), vote.vote_anchor_ts());
         self.votes_by_key.entry(key).or_default().push(vote);
         *self.power_by_key.entry(key).or_insert(VotePower::ZERO) += power;
     }
@@ -273,18 +273,18 @@ mod tests {
     }
 
     fn make_vote(validator: u64, global_receipt_root: GlobalReceiptRoot) -> ExecutionVote {
-        ExecutionVote {
-            block_hash: BlockHash::from_raw(Hash::from_bytes(b"block")),
-            block_height: BlockHeight::new(10),
-            vote_anchor_ts: WeightedTimestamp::from_millis(11),
-            wave_id: WaveId::new(ShardGroupId::new(0), BlockHeight::new(0), BTreeSet::new()),
-            shard_group_id: ShardGroupId::new(0),
+        ExecutionVote::new(
+            BlockHash::from_raw(Hash::from_bytes(b"block")),
+            BlockHeight::new(10),
+            WeightedTimestamp::from_millis(11),
+            WaveId::new(ShardGroupId::new(0), BlockHeight::new(0), BTreeSet::new()),
+            ShardGroupId::new(0),
             global_receipt_root,
-            tx_count: 5,
-            tx_outcomes: vec![],
-            validator: ValidatorId::new(validator),
-            signature: zero_bls_signature(),
-        }
+            5,
+            vec![],
+            ValidatorId::new(validator),
+            zero_bls_signature(),
+        )
     }
 
     #[test]

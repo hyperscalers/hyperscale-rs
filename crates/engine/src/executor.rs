@@ -238,7 +238,7 @@ impl Engine for RadixExecutor {
         let mut results = Vec::with_capacity(transactions.len());
 
         let entry_slices: Vec<&[StateEntry]> =
-            provisions.iter().map(|p| p.entries.as_slice()).collect();
+            provisions.iter().map(|p| p.entries().as_slice()).collect();
         let provisioned = ProvisionedSnapshot::from_provisions(snapshot, &entry_slices);
 
         for tx in transactions {

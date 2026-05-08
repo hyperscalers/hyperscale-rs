@@ -95,7 +95,7 @@ impl OutboundProvisionTracker {
         }
 
         let tx_hashes: HashSet<TxHash> = provisions
-            .transactions
+            .transactions()
             .iter()
             .map(|tx| tx.tx_hash)
             .collect();
@@ -114,7 +114,7 @@ impl OutboundProvisionTracker {
             provision_hash,
             OutboundEntry {
                 target_shard,
-                source_block_height: provisions.block_height,
+                source_block_height: provisions.block_height(),
                 pending_txs: tx_hashes,
                 deadline: provisions.deadline(self.now),
             },
@@ -123,8 +123,8 @@ impl OutboundProvisionTracker {
         debug!(
             provision_hash = ?provision_hash,
             target_shard = target_shard.inner(),
-            source_block_height = provisions.block_height.inner(),
-            tx_count = provisions.transactions.len(),
+            source_block_height = provisions.block_height().inner(),
+            tx_count = provisions.transactions().len(),
             "Tracking outbound provisions"
         );
     }
@@ -136,7 +136,7 @@ impl OutboundProvisionTracker {
         let mut to_evict: Vec<ProvisionHash> = Vec::new();
 
         for outcome in tx_outcomes {
-            let Some(hashes) = self.by_tx.get_mut(&outcome.tx_hash) else {
+            let Some(hashes) = self.by_tx.get_mut(&outcome.tx_hash()) else {
                 continue;
             };
             hashes.retain(|provision_hash| {
@@ -146,14 +146,14 @@ impl OutboundProvisionTracker {
                 if entry.target_shard != target_shard {
                     return true;
                 }
-                entry.pending_txs.remove(&outcome.tx_hash);
+                entry.pending_txs.remove(&outcome.tx_hash());
                 if entry.pending_txs.is_empty() {
                     to_evict.push(*provision_hash);
                 }
                 false
             });
             if hashes.is_empty() {
-                self.by_tx.remove(&outcome.tx_hash);
+                self.by_tx.remove(&outcome.tx_hash());
             }
         }
 
@@ -258,19 +258,16 @@ mod tests {
     }
 
     fn executed(tx_hash: TxHash) -> TxOutcome {
-        TxOutcome {
+        TxOutcome::new(
             tx_hash,
-            outcome: ExecutionOutcome::Succeeded {
+            ExecutionOutcome::Succeeded {
                 receipt_hash: GlobalReceiptHash::from_raw(Hash::ZERO),
             },
-        }
+        )
     }
 
     fn aborted(tx_hash: TxHash) -> TxOutcome {
-        TxOutcome {
-            tx_hash,
-            outcome: ExecutionOutcome::Aborted,
-        }
+        TxOutcome::new(tx_hash, ExecutionOutcome::Aborted)
     }
 
     #[test]

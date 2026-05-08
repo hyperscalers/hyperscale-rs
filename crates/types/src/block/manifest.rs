@@ -18,19 +18,50 @@ use crate::{
 /// hash-only projection of a `Block` and inherits its natural ceilings.
 #[derive(Debug, Clone, Default, PartialEq, Eq, BasicSbor)]
 pub struct BlockManifest {
-    /// Transaction hashes in block order.
-    pub tx_hashes: BoundedVec<TxHash, MAX_TXS_PER_BLOCK>,
-
-    /// Wave identifiers in block order.
-    /// Validators use these to match against their locally finalized waves.
-    pub cert_ids: BoundedVec<WaveId, MAX_FINALIZED_TX_PER_BLOCK>,
-
-    /// Hashes of provisions included in this block.
-    /// Used for provision data availability — validators fetch missing batches by hash.
-    pub provision_hashes: BoundedVec<ProvisionHash, MAX_PROVISIONS_PER_BLOCK>,
+    tx_hashes: BoundedVec<TxHash, MAX_TXS_PER_BLOCK>,
+    cert_ids: BoundedVec<WaveId, MAX_FINALIZED_TX_PER_BLOCK>,
+    provision_hashes: BoundedVec<ProvisionHash, MAX_PROVISIONS_PER_BLOCK>,
 }
 
 impl BlockManifest {
+    /// Build a manifest from its parts.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any input vec exceeds its bounded cap.
+    #[must_use]
+    pub fn new(
+        tx_hashes: Vec<TxHash>,
+        cert_ids: Vec<WaveId>,
+        provision_hashes: Vec<ProvisionHash>,
+    ) -> Self {
+        Self {
+            tx_hashes: tx_hashes.into(),
+            cert_ids: cert_ids.into(),
+            provision_hashes: provision_hashes.into(),
+        }
+    }
+
+    /// Transaction hashes in block order.
+    #[must_use]
+    pub const fn tx_hashes(&self) -> &BoundedVec<TxHash, MAX_TXS_PER_BLOCK> {
+        &self.tx_hashes
+    }
+
+    /// Wave identifiers in block order.
+    /// Validators use these to match against their locally finalized waves.
+    #[must_use]
+    pub const fn cert_ids(&self) -> &BoundedVec<WaveId, MAX_FINALIZED_TX_PER_BLOCK> {
+        &self.cert_ids
+    }
+
+    /// Hashes of provisions included in this block.
+    /// Used for provision data availability — validators fetch missing batches by hash.
+    #[must_use]
+    pub const fn provision_hashes(&self) -> &BoundedVec<ProvisionHash, MAX_PROVISIONS_PER_BLOCK> {
+        &self.provision_hashes
+    }
+
     /// Get total transaction count.
     #[must_use]
     pub const fn transaction_count(&self) -> usize {
@@ -49,11 +80,7 @@ impl BlockManifest {
             .iter()
             .map(|c| c.wave_id().clone())
             .collect();
-        Self {
-            tx_hashes: tx_hashes.into(),
-            cert_ids: cert_ids.into(),
-            provision_hashes: BoundedVec::new(),
-        }
+        Self::new(tx_hashes, cert_ids, vec![])
     }
 }
 
@@ -73,14 +100,9 @@ impl BlockManifest {
 /// transactions and certificates using the stored hashes.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct BlockMetadata {
-    /// Block header (contains height, parent hash, proposer, etc.)
-    pub header: BlockHeader,
-
-    /// Block contents (transaction hashes, certificates, deferrals, etc.)
-    pub manifest: BlockManifest,
-
-    /// Quorum certificate that commits this block.
-    pub qc: QuorumCertificate,
+    header: BlockHeader,
+    manifest: BlockManifest,
+    qc: QuorumCertificate,
 }
 
 impl BlockMetadata {
@@ -94,10 +116,34 @@ impl BlockMetadata {
         }
     }
 
+    /// Block header (contains height, parent hash, proposer, etc.)
+    #[must_use]
+    pub const fn header(&self) -> &BlockHeader {
+        &self.header
+    }
+
+    /// Block contents (transaction hashes, certificates, deferrals, etc.)
+    #[must_use]
+    pub const fn manifest(&self) -> &BlockManifest {
+        &self.manifest
+    }
+
+    /// Quorum certificate that commits this block.
+    #[must_use]
+    pub const fn qc(&self) -> &QuorumCertificate {
+        &self.qc
+    }
+
+    /// Consume the metadata and return its parts.
+    #[must_use]
+    pub fn into_parts(self) -> (BlockHeader, BlockManifest, QuorumCertificate) {
+        (self.header, self.manifest, self.qc)
+    }
+
     /// Get block height.
     #[must_use]
     pub const fn height(&self) -> BlockHeight {
-        self.header.height
+        self.header.height()
     }
 
     /// Compute hash of this block (hashes the header).

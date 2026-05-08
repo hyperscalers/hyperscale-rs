@@ -46,7 +46,7 @@ impl ChainWriter for SimStorage {
     ) -> (StateRoot, Self::PreparedCommit) {
         let receipts: Vec<StoredReceipt> = finalized_waves
             .iter()
-            .flat_map(|fw| fw.receipts.iter().cloned())
+            .flat_map(|fw| fw.receipts().iter().cloned())
             .collect();
 
         // No receipts → no state changes → state root is unchanged.
@@ -156,18 +156,19 @@ impl ChainWriter for SimStorage {
                     CertifiedBlock::new_unchecked((*block).clone().into_sealed(), (*qc).clone()),
                 );
                 for fw in block.certificates().iter() {
-                    let cert = &fw.certificate;
-                    let wave_id = cert.wave_id.clone();
+                    let cert = fw.certificate();
+                    let wave_id = cert.wave_id().clone();
                     c.certificates.insert(wave_id.clone(), (**cert).clone());
                     c.wave_certs_by_height
-                        .entry(wave_id.block_height)
+                        .entry(wave_id.block_height())
                         .or_default()
                         .push(wave_id);
                 }
                 c.insert_receipts(&prepared.receipts);
                 for fw in block.certificates().iter() {
-                    for ec in &fw.certificate.execution_certificates {
-                        c.execution_certs.insert(ec.wave_id.clone(), (**ec).clone());
+                    for ec in fw.certificate().execution_certificates() {
+                        c.execution_certs
+                            .insert(ec.wave_id().clone(), (**ec).clone());
                     }
                 }
                 c.committed_height = block.height();
@@ -184,7 +185,7 @@ impl ChainWriter for SimStorage {
         let receipts: Vec<StoredReceipt> = block
             .certificates()
             .iter()
-            .flat_map(|fw| fw.receipts.iter().cloned())
+            .flat_map(|fw| fw.receipts().iter().cloned())
             .collect();
         let merged_updates = merge_updates_from_receipts(&receipts);
         self.commit_block_inner(&merged_updates, block, qc, &receipts)
@@ -254,11 +255,11 @@ impl SimStorage {
                 CertifiedBlock::new_unchecked((**block).clone().into_sealed(), (**qc).clone()),
             );
             for fw in block.certificates().iter() {
-                let cert = &fw.certificate;
-                let wave_id = cert.wave_id.clone();
+                let cert = fw.certificate();
+                let wave_id = cert.wave_id().clone();
                 c.certificates.insert(wave_id.clone(), (**cert).clone());
                 c.wave_certs_by_height
-                    .entry(wave_id.block_height)
+                    .entry(wave_id.block_height())
                     .or_default()
                     .push(wave_id);
             }
@@ -266,8 +267,9 @@ impl SimStorage {
             c.insert_receipts(receipts);
             // Store execution certificates (extracted from wave certs) atomically.
             for fw in block.certificates().iter() {
-                for ec in &fw.certificate.execution_certificates {
-                    c.execution_certs.insert(ec.wave_id.clone(), (**ec).clone());
+                for ec in fw.certificate().execution_certificates() {
+                    c.execution_certs
+                        .insert(ec.wave_id().clone(), (**ec).clone());
                 }
             }
             c.committed_height = block.height();

@@ -174,8 +174,8 @@ pub fn select_transactions(
                 deduped += 1;
                 return false;
             }
-            if !tx.validity_range.is_well_formed(validity_anchor)
-                || !tx.validity_range.contains(validity_anchor)
+            if !tx.validity_range().is_well_formed(validity_anchor)
+                || !tx.validity_range().contains(validity_anchor)
             {
                 expired += 1;
                 return false;
@@ -213,7 +213,7 @@ pub fn select_finalized_waves(
         .into_iter()
         .filter(|fw| !qc_chain_cert_ids.contains(fw.wave_id()))
         .collect();
-    candidate_waves.sort_by_key(|fw| (fw.wave_id().block_height, fw.wave_id().clone()));
+    candidate_waves.sort_by_key(|fw| (fw.wave_id().block_height(), fw.wave_id().clone()));
 
     let mut finalized_tx_count = 0usize;
     let waves_to_propose: Vec<_> = candidate_waves
@@ -246,7 +246,7 @@ pub fn select_provisions(
         .into_iter()
         .filter(|b| !qc_chain_provision_hashes.contains(&b.hash()))
         .take_while(|b| {
-            let new_total = running_tx_count.saturating_add(b.transactions.len());
+            let new_total = running_tx_count.saturating_add(b.transactions().len());
             if new_total <= max_provision_txs {
                 running_tx_count = new_total;
                 true
@@ -295,7 +295,7 @@ pub fn assemble_build_action(
     kind: ProposalKind,
 ) -> BuildActionPlan {
     let (parent_block_hash, parent_qc) = chain.proposal_parent();
-    let parent_block_height = parent_qc.height;
+    let parent_block_height = parent_qc.height();
     let parent_state_root = chain.parent_state_root(parent_block_hash);
     let parent_in_flight = chain.parent_in_flight(parent_block_hash);
 
@@ -325,7 +325,7 @@ pub fn assemble_build_action(
             false,
         ),
         ProposalKind::Fallback => (
-            ProposerTimestamp::from_millis(parent_qc.weighted_timestamp.as_millis()),
+            ProposerTimestamp::from_millis(parent_qc.weighted_timestamp().as_millis()),
             true,
             Vec::new(),
             Vec::new(),
