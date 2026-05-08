@@ -5,10 +5,24 @@
 //! the coordinator so the topology-only parts are unit-testable without a
 //! full driver fixture.
 
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
+
+use hyperscale_core::ProvisionsRequest;
 use hyperscale_types::{
-    Bls12381G1PublicKey, ExecutionCertificate, ShardGroupId, TopologySnapshot, ValidatorId,
-    VotePower,
+    BlockHeight, Bls12381G1PublicKey, ExecutionCertificate, NodeId, RoutableTransaction,
+    ShardGroupId, TopologySnapshot, ValidatorId, VotePower, WaveId,
 };
+
+/// Per-shard recipient lists for provision broadcasting.
+pub type ShardRecipients = HashMap<ShardGroupId, Vec<ValidatorId>>;
+
+/// A single tx's layout within a wave: the transaction plus the set of shards
+/// that participate in its execution (local + any remote provision sources).
+pub type WaveTxEntry = (Arc<RoutableTransaction>, BTreeSet<ShardGroupId>);
+
+/// Deterministic grouping of a block's transactions into waves.
+pub type WaveAssignments = BTreeMap<WaveId, Vec<WaveTxEntry>>;
 
 /// Committee members of `shard` with the local validator filtered out.
 ///
@@ -62,6 +76,124 @@ pub fn committee_public_keys_for_shard(
         pubkeys.push(topology.public_key(vid)?);
     }
     Some(pubkeys)
+}
+
+/// Compute deterministic wave assignments for a block's transactions.
+///
+/// Partitions transactions by their provision dependency set (remote shards
+/// needed). All validators compute identical assignments from the same block.
+///
+/// Returns a map from `WaveId` to list of (tx, `participating_shards`) in
+/// block order within each wave.
+pub fn assign_waves(
+    topology: &TopologySnapshot,
+    block_height: BlockHeight,
+    transactions: &[Arc<RoutableTransaction>],
+) -> WaveAssignments {
+    let local_shard = topology.local_shard();
+    let mut waves: WaveAssignments = BTreeMap::new();
+
+    for tx in transactions {
+        // Compute provision dependency set = remote shards needed
+        let all_shards: BTreeSet<ShardGroupId> = topology
+            .all_shards_for_transaction(tx)
+            .into_iter()
+            .collect();
+
+        let remote_shards: BTreeSet<ShardGroupId> = all_shards
+            .iter()
+            .filter(|&&s| s != local_shard)
+            .copied()
+            .collect();
+
+        let wave_id = WaveId::new(local_shard, block_height, remote_shards);
+
+        waves
+            .entry(wave_id)
+            .or_default()
+            .push((Arc::clone(tx), all_shards));
+    }
+
+    waves
+}
+
+/// Build provision requests and shard recipients for cross-shard transactions.
+///
+/// Returns `None` if there are no cross-shard transactions needing provisions.
+pub fn build_provision_requests(
+    topology: &TopologySnapshot,
+    transactions: &[Arc<RoutableTransaction>],
+    local_shard: ShardGroupId,
+) -> Option<(Vec<ProvisionsRequest>, ShardRecipients)> {
+    let local_vid = topology.local_validator_id();
+
+    let mut provision_requests = Vec::new();
+    for tx in transactions {
+        if topology.is_single_shard_transaction(tx) {
+            continue;
+        }
+        let mut owned_nodes: Vec<_> = tx
+            .declared_reads()
+            .iter()
+            .chain(tx.declared_writes().iter())
+            .filter(|&node_id| topology.shard_for_node_id(node_id) == local_shard)
+            .copied()
+            .collect();
+        owned_nodes.sort();
+        owned_nodes.dedup();
+
+        if !owned_nodes.is_empty() {
+            // Build per-target-shard node needs for conflict detection.
+            let mut target_nodes: Vec<(ShardGroupId, Vec<NodeId>)> = Vec::new();
+            let all_nodes: Vec<&NodeId> = tx
+                .declared_reads()
+                .iter()
+                .chain(tx.declared_writes().iter())
+                .collect();
+            for &target_shard in &topology
+                .all_shards_for_transaction(tx)
+                .into_iter()
+                .filter(|&s| s != local_shard)
+                .collect::<Vec<_>>()
+            {
+                let needed: Vec<NodeId> = all_nodes
+                    .iter()
+                    .filter(|&&n| topology.shard_for_node_id(n) == target_shard)
+                    .copied()
+                    .copied()
+                    .collect();
+                target_nodes.push((target_shard, needed));
+            }
+
+            if !target_nodes.is_empty() {
+                provision_requests.push(ProvisionsRequest {
+                    tx_hash: tx.hash(),
+                    local_nodes: owned_nodes,
+                    target_nodes,
+                });
+            }
+        }
+    }
+
+    if provision_requests.is_empty() {
+        return None;
+    }
+
+    let mut shard_recipients = HashMap::new();
+    for req in &provision_requests {
+        for &(target_shard, _) in &req.target_nodes {
+            shard_recipients.entry(target_shard).or_insert_with(|| {
+                topology
+                    .committee_for_shard(target_shard)
+                    .iter()
+                    .copied()
+                    .filter(|&v| v != local_vid)
+                    .collect()
+            });
+        }
+    }
+
+    Some((provision_requests, shard_recipients))
 }
 
 #[cfg(test)]
