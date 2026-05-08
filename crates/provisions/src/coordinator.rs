@@ -15,9 +15,8 @@ use std::time::Duration;
 
 use hyperscale_core::{Action, FetchAbandon, ProtocolEvent};
 use hyperscale_types::{
-    BlockHeight, CertifiedBlock, CommittedBlockHeader, Hash, LocalTimestamp, ProvisionHash,
-    ProvisionTxRoot, Provisions, RETENTION_HORIZON, ShardGroupId, TopologySnapshot,
-    compute_merkle_root,
+    BlockHeight, CertifiedBlock, CommittedBlockHeader, LocalTimestamp, ProvisionHash, Provisions,
+    RETENTION_HORIZON, ShardGroupId, TopologySnapshot,
 };
 use serde::Deserialize;
 use tracing::{debug, info, warn};
@@ -26,6 +25,7 @@ use crate::expected::ExpectedProvisionTracker;
 use crate::pipeline::ProvisionPipeline;
 use crate::queue::QueuedProvisionBuffer;
 use crate::store::ProvisionStore;
+use crate::verification::build_verify_action;
 use crate::verified_headers::VerifiedHeaderBuffer;
 
 /// Default minimum dwell time verified provisions sit in the queue before
@@ -369,8 +369,8 @@ impl ProvisionCoordinator {
                     );
                     continue;
                 }
-                actions.extend(Self::emit_provision_verification(
-                    topology,
+                actions.extend(build_verify_action(
+                    topology.local_shard(),
                     provisions,
                     Arc::clone(committed_header),
                 ));
@@ -453,7 +453,9 @@ impl ProvisionCoordinator {
                 );
                 return vec![];
             }
-            return Self::emit_provision_verification(topology, provisions, verified_header);
+            return build_verify_action(topology.local_shard(), provisions, verified_header)
+                .into_iter()
+                .collect();
         }
 
         // No verified header yet — buffer the provisions
@@ -466,66 +468,6 @@ impl ProvisionCoordinator {
         self.pipeline
             .buffer_pending(key, provisions, self.expected.local_ts());
         vec![]
-    }
-
-    /// Emit a `VerifyProvisions` action for async merkle proof verification.
-    ///
-    /// Runs the provisions completeness check first: the source block's
-    /// `provision_tx_roots[local_shard]` commits to the ordered tx hashes the
-    /// target shard is meant to receive. A mismatch means the proposer
-    /// dropped txs on the broadcast path (or the provisions were tampered
-    /// with) — reject entirely so the 10-block fallback timer refetches a
-    /// complete set from a peer.
-    ///
-    /// The QC was already verified by `RemoteHeaderCoordinator`, so the
-    /// downstream `VerifyProvisions` action only needs to check merkle proofs
-    /// against the committed state root.
-    fn emit_provision_verification(
-        topology: &TopologySnapshot,
-        provisions: Provisions,
-        committed_header: Arc<CommittedBlockHeader>,
-    ) -> Vec<Action> {
-        let local_shard = topology.local_shard();
-        let Some(expected_root) = committed_header
-            .header()
-            .provision_tx_roots()
-            .get(&local_shard)
-            .copied()
-        else {
-            warn!(
-                source_shard = provisions.source_shard().inner(),
-                block_height = provisions.block_height().inner(),
-                local_shard = local_shard.inner(),
-                "Dropping provisions: source header has no provision_tx_root for us"
-            );
-            return vec![];
-        };
-
-        let leaves: Vec<Hash> = provisions
-            .transactions()
-            .iter()
-            .map(|t| t.tx_hash.into_raw())
-            .collect();
-        let computed_root = ProvisionTxRoot::from_raw(compute_merkle_root(&leaves));
-
-        if computed_root != expected_root {
-            warn!(
-                source_shard = provisions.source_shard().inner(),
-                block_height = provisions.block_height().inner(),
-                local_shard = local_shard.inner(),
-                tx_count = provisions.transactions().len(),
-                ?expected_root,
-                ?computed_root,
-                "Rejecting incomplete provisions — tx-root mismatch; \
-                 fallback fetch will request a complete set"
-            );
-            return vec![];
-        }
-
-        vec![Action::VerifyProvisions {
-            provisions,
-            committed_header,
-        }]
     }
 
     /// Handle the verification result for a provisions entry.
@@ -654,9 +596,10 @@ mod tests {
     use hyperscale_types::{
         Block, BlockHash, BlockHeader, Bls12381G1PrivateKey, BoundedVec, CertificateRoot, Hash,
         InFlightCount, LocalReceiptRoot, MerkleInclusionProof, ProposerTimestamp, ProvisionEntry,
-        ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, SignerBitfield, StateRoot,
-        TopologySnapshot, TransactionRoot, TxHash, ValidatorId, ValidatorInfo, ValidatorSet,
-        VotePower, WaveId, WeightedTimestamp, bls_keypair_from_seed, zero_bls_signature,
+        ProvisionTxRoot, ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, SignerBitfield,
+        StateRoot, TopologySnapshot, TransactionRoot, TxHash, ValidatorId, ValidatorInfo,
+        ValidatorSet, VotePower, WaveId, WeightedTimestamp, bls_keypair_from_seed,
+        compute_merkle_root, zero_bls_signature,
     };
     use proptest::bool::ANY as ANY_BOOL;
     use proptest::collection::vec as prop_vec;

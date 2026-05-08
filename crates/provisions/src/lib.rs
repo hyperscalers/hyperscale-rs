@@ -22,6 +22,7 @@ mod outbound;
 mod pipeline;
 mod queue;
 mod store;
+mod verification;
 mod verified_headers;
 
 pub use coordinator::{ProvisionConfig, ProvisionCoordinator, ProvisionMemoryStats};
