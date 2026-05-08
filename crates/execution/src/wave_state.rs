@@ -36,6 +36,8 @@ use hyperscale_types::{
     WeightedTimestamp, compute_global_receipt_root,
 };
 
+use crate::provisioning::ProvisioningTracker;
+
 /// Age at which a still-alive wave emits a single diagnostic warning.
 ///
 /// Under the two-stage lifecycle (windows gate admission, the wave/execution
@@ -372,6 +374,24 @@ impl WaveState {
             true
         } else {
             false
+        }
+    }
+
+    /// Mark every tx the tracker reports fully-provisioned at `at`. Cheap
+    /// no-op for txs already marked. Drives the partial → fully-provisioned
+    /// transition from both wave creation (when prior batches arrived
+    /// before the wave existed) and per-batch absorption (when this
+    /// commit's provisions land).
+    pub fn absorb_ready_provisions(
+        &mut self,
+        provisioning: &ProvisioningTracker,
+        at: WeightedTimestamp,
+    ) {
+        let tx_hashes: Vec<TxHash> = self.tx_hashes.clone();
+        for tx_hash in tx_hashes {
+            if provisioning.is_fully_provisioned(tx_hash) {
+                self.mark_tx_provisioned(tx_hash, at);
+            }
         }
     }
 

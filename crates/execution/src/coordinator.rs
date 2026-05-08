@@ -327,11 +327,7 @@ impl ExecutionCoordinator {
             // If every tx is fully covered, the wave transitions to
             // "provisioned" at block_height.
             if !is_single_shard {
-                for &tx_hash in &tx_hashes {
-                    if self.provisioning.is_fully_provisioned(tx_hash) {
-                        wave_state.mark_tx_provisioned(tx_hash, block_ts);
-                    }
-                }
+                wave_state.absorb_ready_provisions(&self.provisioning, block_ts);
             }
 
             // Dispatch execution if fully provisioned at creation.
@@ -601,13 +597,7 @@ impl ExecutionCoordinator {
                 continue;
             }
 
-            // Identify txs that are now all-shards-ready.
-            let tx_hashes: Vec<TxHash> = wave.tx_hashes().to_vec();
-            for &tx_hash in &tx_hashes {
-                if self.provisioning.is_fully_provisioned(tx_hash) {
-                    wave.mark_tx_provisioned(tx_hash, committed_ts);
-                }
-            }
+            wave.absorb_ready_provisions(&self.provisioning, committed_ts);
 
             if let Some(action) = wave.dispatch_if_ready(self.provisioning.verified()) {
                 actions.push(action);
