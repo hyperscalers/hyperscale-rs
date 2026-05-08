@@ -354,7 +354,7 @@ impl ProvisionCoordinator {
         // Only store headers that target our shard (i.e., we expect provisions).
         let local_shard = topology.local_shard();
         let targets_us = committed_header
-            .header
+            .header()
             .waves
             .iter()
             .any(|w| w.remote_shards().contains(&local_shard));
@@ -363,7 +363,7 @@ impl ProvisionCoordinator {
             // Store as verified (QC already checked by coordinator).
             self.headers.insert(key, Arc::clone(committed_header));
 
-            let proposer = committed_header.header.proposer;
+            let proposer = committed_header.header().proposer;
             debug!(
                 shard = shard.inner(),
                 height = height.inner(),
@@ -387,7 +387,7 @@ impl ProvisionCoordinator {
                 "Found buffered provisions for verified header"
             );
             let local_ts = self.expected.local_ts();
-            let source_block_ts = committed_header.qc.weighted_timestamp;
+            let source_block_ts = committed_header.qc().weighted_timestamp;
             for provisions in drained {
                 if provisions.deadline(source_block_ts) <= local_ts {
                     debug!(
@@ -472,7 +472,7 @@ impl ProvisionCoordinator {
         if let Some(verified_header) = self.headers.get(key).cloned() {
             // Reject if the source block has aged past `RETENTION_HORIZON` —
             // every tx in it has expired and no shard can still need this data.
-            let deadline = provisions.deadline(verified_header.qc.weighted_timestamp);
+            let deadline = provisions.deadline(verified_header.qc().weighted_timestamp);
             if deadline <= self.expected.local_ts() {
                 debug!(
                     source_shard = source_shard.inner(),
@@ -515,7 +515,7 @@ impl ProvisionCoordinator {
     ) -> Vec<Action> {
         let local_shard = topology.local_shard();
         let Some(expected_root) = committed_header
-            .header
+            .header()
             .provision_tx_roots
             .get(&local_shard)
             .copied()
@@ -581,8 +581,8 @@ impl ProvisionCoordinator {
         // for paths where no admission event fires (orphan cleanup in
         // `on_block_committed`).
         if let Some(header) = committed_header {
-            let shard = header.header.shard_group_id;
-            let height = header.header.height;
+            let shard = header.header().shard_group_id;
+            let height = header.header().height;
             let key = (shard, height);
 
             if self.expected.on_provisions_verified(shard, height) {
@@ -606,7 +606,7 @@ impl ProvisionCoordinator {
             );
             return actions;
         };
-        let source_block_ts = header.qc.weighted_timestamp;
+        let source_block_ts = header.qc().weighted_timestamp;
 
         let provisions = self.pipeline.insert_verified(provisions, source_block_ts);
 
@@ -741,12 +741,12 @@ mod tests {
         local_shard: ShardGroupId,
         tx_hashes: &[TxHash],
     ) -> Arc<CommittedBlockHeader> {
-        let mut header_arc = make_committed_header_with_targets(shard, height, vec![local_shard]);
-        let header = Arc::get_mut(&mut header_arc).unwrap();
+        let header_arc = make_committed_header_with_targets(shard, height, vec![local_shard]);
         let raw: Vec<Hash> = tx_hashes.iter().map(|h| h.into_raw()).collect();
         let root = ProvisionTxRoot::from_raw(compute_merkle_root(&raw));
-        header.header.provision_tx_roots.0.insert(local_shard, root);
-        header_arc
+        let (mut header, qc) = Arc::unwrap_or_clone(header_arc).into_parts();
+        header.provision_tx_roots.0.insert(local_shard, root);
+        Arc::new(CommittedBlockHeader::new(header, qc))
     }
 
     #[test]

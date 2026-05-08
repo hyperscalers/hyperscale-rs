@@ -167,7 +167,7 @@ where
         if let ProtocolEvent::RemoteHeaderAdmitted { committed_header } = &pe {
             let outputs = self.syncs.on_remote_header_admitted(
                 committed_header.shard_group_id(),
-                committed_header.header.height,
+                committed_header.header().height,
             );
             self.process_remote_header_sync_outputs(outputs);
         }

@@ -12,12 +12,8 @@ use crate::{BlockHash, BlockHeader, BlockHeight, QuorumCertificate, ShardGroupId
 /// the `state_root` in the header for merkle inclusion proof verification.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct CommittedBlockHeader {
-    /// Header whose `hash()` matches the QC's `block_hash` (see [`Self::qc`]).
-    pub header: BlockHeader,
-
-    /// QC committing [`Self::header`]; verifiable against the source shard's
-    /// validator keys without access to the block body.
-    pub qc: QuorumCertificate,
+    header: BlockHeader,
+    qc: QuorumCertificate,
 }
 
 impl CommittedBlockHeader {
@@ -25,6 +21,25 @@ impl CommittedBlockHeader {
     #[must_use]
     pub const fn new(header: BlockHeader, qc: QuorumCertificate) -> Self {
         Self { header, qc }
+    }
+
+    /// Header whose `hash()` matches the QC's `block_hash`.
+    #[must_use]
+    pub const fn header(&self) -> &BlockHeader {
+        &self.header
+    }
+
+    /// QC committing [`Self::header`]; verifiable against the source shard's
+    /// validator keys without access to the block body.
+    #[must_use]
+    pub const fn qc(&self) -> &QuorumCertificate {
+        &self.qc
+    }
+
+    /// Consume the pair and return its parts.
+    #[must_use]
+    pub fn into_parts(self) -> (BlockHeader, QuorumCertificate) {
+        (self.header, self.qc)
     }
 
     /// Compute the block hash (hashes the header).

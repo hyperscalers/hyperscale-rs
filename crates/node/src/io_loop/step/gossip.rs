@@ -76,9 +76,9 @@ where
         self.dispatch.spawn(DispatchPool::Crypto, move || {
             for (committed_header, sender, public_key, sender_signature) in items {
                 let msg = committed_block_header_message(
-                    committed_header.header.shard_group_id,
-                    committed_header.header.height,
-                    &committed_header.header.hash(),
+                    committed_header.header().shard_group_id,
+                    committed_header.header().height,
+                    &committed_header.header().hash(),
                 );
                 let valid = verify_bls_with_metrics(
                     &msg,
@@ -96,7 +96,7 @@ where
                 } else {
                     tracing::warn!(
                         sender = sender.inner(),
-                        height = committed_header.header.height.inner(),
+                        height = committed_header.header().height.inner(),
                         "Committed header sender signature verification failed"
                     );
                 }

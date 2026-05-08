@@ -136,8 +136,8 @@ impl NodeStateMachine {
                 self.execution.on_verified_remote_header(
                     topology,
                     shard,
-                    committed_header.header.height,
-                    &committed_header.header.waves,
+                    committed_header.header().height,
+                    &committed_header.header().waves,
                 );
 
                 self.provisions

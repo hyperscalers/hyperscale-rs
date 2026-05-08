@@ -619,16 +619,16 @@ where
             height,
         } => {
             let start = std::time::Instant::now();
-            let qc_valid = verify_qc_signature(&committed_header.qc, &committee_public_keys);
+            let qc_valid = verify_qc_signature(committed_header.qc(), &committee_public_keys);
             let valid = if qc_valid {
                 let total_power: VotePower = committed_header
-                    .qc
+                    .qc()
                     .signers
                     .set_indices()
                     .filter_map(|idx| committee_voting_power.get(idx).copied())
                     .sum();
                 total_power >= quorum_threshold
-                    && committed_header.qc.block_hash == committed_header.header.hash()
+                    && committed_header.qc().block_hash == committed_header.header().hash()
             } else {
                 false
             };
@@ -912,9 +912,9 @@ where
 
         Action::BroadcastCommittedBlockHeader { committed_header } => {
             let msg = committed_block_header_message(
-                committed_header.header.shard_group_id,
-                committed_header.header.height,
-                &committed_header.header.hash(),
+                committed_header.header().shard_group_id,
+                committed_header.header().height,
+                &committed_header.header().hash(),
             );
             let sig = ctx.signing_key.sign_v1(&msg);
             let gossip = CommittedBlockHeaderGossip {

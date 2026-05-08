@@ -381,7 +381,7 @@ where
                 TopicScope::Global,
                 move |gossip: CommittedBlockHeaderGossip| -> GossipVerdict {
                     let sender = gossip.sender;
-                    let header_shard = gossip.committed_header.header.shard_group_id;
+                    let header_shard = gossip.committed_header.header().shard_group_id;
                     let topo = topology.load();
 
                     // Own-shard headers are valid but not needed — accept to forward.
