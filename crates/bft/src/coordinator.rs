@@ -2132,15 +2132,16 @@ impl BftCoordinator {
 
     /// Check if a block that just became complete has a pending commit waiting for it.
     ///
-    /// When `BlockReadyToCommit` fires but the block data (transactions/certificates) hasn't
-    /// arrived yet, we buffer the commit in `pending_commits_awaiting_data`. This method
-    /// checks that buffer and retries the commit now that the block is complete.
+    /// When `BlockReadyToCommit` fires but the block data (transactions/certificates)
+    /// hasn't arrived yet, the commit is parked via `CommitPipeline::buffer_awaiting_data`.
+    /// This method drains that buffer and retries the commit now that the block is
+    /// complete.
     fn try_commit_pending_data(
         &mut self,
         topology_snapshot: &TopologySnapshot,
         block_hash: BlockHash,
     ) -> Vec<Action> {
-        if let Some((height, qc, source)) = self.commits.take_awaiting_data(&block_hash) {
+        if let Some((height, qc, source)) = self.commits.take_awaiting_data(block_hash) {
             info!(
                 validator = ?topology_snapshot.local_validator_id(),
                 block_hash = ?block_hash,

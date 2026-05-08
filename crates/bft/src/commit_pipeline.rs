@@ -83,9 +83,9 @@ impl CommitPipeline {
     /// parked commit should be retried.
     pub fn take_awaiting_data(
         &mut self,
-        block_hash: &BlockHash,
+        block_hash: BlockHash,
     ) -> Option<(BlockHeight, QuorumCertificate, CommitSource)> {
-        self.awaiting_data.remove(block_hash)
+        self.awaiting_data.remove(&block_hash)
     }
 
     pub fn out_of_order_len(&self) -> usize {
@@ -152,7 +152,7 @@ mod tests {
             (BlockHeight::new(5), make_qc(5), CommitSource::Aggregator),
         );
 
-        let taken = pipeline.take_awaiting_data(&hash);
+        let taken = pipeline.take_awaiting_data(hash);
         assert!(taken.is_some());
         assert_eq!(taken.unwrap().0, BlockHeight::new(5));
         assert_eq!(pipeline.awaiting_data_len(), 0);
@@ -319,7 +319,7 @@ mod properties {
                 hash,
                 (BlockHeight::new(height), make_qc(height), CommitSource::Aggregator),
             );
-            let taken = p.take_awaiting_data(&hash);
+            let taken = p.take_awaiting_data(hash);
             prop_assert!(taken.is_some());
             prop_assert_eq!(taken.unwrap().0, BlockHeight::new(height));
             prop_assert!(!p.awaiting_data.contains_key(&hash));
