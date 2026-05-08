@@ -158,7 +158,7 @@ impl OutboundProvisionTracker {
         }
 
         for provision_hash in to_evict {
-            self.evict(&provision_hash, "acknowledged");
+            self.evict(provision_hash, "acknowledged");
         }
     }
 
@@ -198,23 +198,23 @@ impl OutboundProvisionTracker {
                 past_deadline_secs = now.elapsed_since(entry.deadline).as_secs(),
                 "Evicting outbound provisions past deadline — no terminal EC observed"
             );
-            self.evict(&provision_hash, "deadline-passed");
+            self.evict(provision_hash, "deadline-passed");
         }
     }
 
-    fn evict(&mut self, provision_hash: &ProvisionHash, reason: &'static str) {
-        let Some(entry) = self.entries.remove(provision_hash) else {
+    fn evict(&mut self, provision_hash: ProvisionHash, reason: &'static str) {
+        let Some(entry) = self.entries.remove(&provision_hash) else {
             return;
         };
         for tx in &entry.pending_txs {
             if let Some(hashes) = self.by_tx.get_mut(tx) {
-                hashes.remove(provision_hash);
+                hashes.remove(&provision_hash);
                 if hashes.is_empty() {
                     self.by_tx.remove(tx);
                 }
             }
         }
-        self.store.evict(std::iter::once(*provision_hash));
+        self.store.evict(std::iter::once(provision_hash));
         debug!(
             provision_hash = ?provision_hash,
             target_shard = entry.target_shard.inner(),
@@ -283,7 +283,7 @@ mod tests {
 
         assert_eq!(tracker.memory_stats().tracked_provisions, 1);
         assert_eq!(tracker.memory_stats().tracked_tx_entries, 2);
-        assert!(store.get(&provision_hash).is_some());
+        assert!(store.get(provision_hash).is_some());
         let hit = store.get_outbound(BlockHeight::new(10), ShardGroupId::new(1));
         assert!(hit.is_some());
     }
@@ -301,11 +301,11 @@ mod tests {
 
         tracker.on_ec_observed(ShardGroupId::new(1), &[executed(a)]);
         assert_eq!(tracker.memory_stats().tracked_provisions, 1);
-        assert!(store.get(&provision_hash).is_some());
+        assert!(store.get(provision_hash).is_some());
 
         tracker.on_ec_observed(ShardGroupId::new(1), &[executed(b)]);
         assert_eq!(tracker.memory_stats().tracked_provisions, 0);
-        assert!(store.get(&provision_hash).is_none());
+        assert!(store.get(provision_hash).is_none());
     }
 
     #[test]
@@ -319,7 +319,7 @@ mod tests {
         tracker.on_broadcast(&provisions, ShardGroupId::new(2));
 
         tracker.on_ec_observed(ShardGroupId::new(2), &[aborted(a)]);
-        assert!(store.get(&provision_hash).is_none());
+        assert!(store.get(provision_hash).is_none());
     }
 
     #[test]
@@ -351,7 +351,7 @@ mod tests {
         tracker.on_block_committed(ts(
             1_000_000 + u64::try_from(past_max.as_millis()).unwrap_or(u64::MAX)
         ));
-        assert!(store.get(&provision_hash).is_none());
+        assert!(store.get(provision_hash).is_none());
         assert_eq!(tracker.memory_stats().tracked_provisions, 0);
     }
 

@@ -562,7 +562,7 @@ impl ProvisionCoordinator {
 
     /// Look up verified provisions by their content hash.
     #[must_use]
-    pub fn get_provisions_by_hash(&self, hash: &ProvisionHash) -> Option<Arc<Provisions>> {
+    pub fn get_provisions_by_hash(&self, hash: ProvisionHash) -> Option<Arc<Provisions>> {
         self.pipeline.get_provisions_by_hash(hash)
     }
 

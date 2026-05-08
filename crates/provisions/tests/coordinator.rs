@@ -125,7 +125,7 @@ fn fresh_coordinator_reports_no_state() {
     );
     assert!(
         coord
-            .get_provisions_by_hash(&ProvisionHash::from_raw(Hash::from_bytes(b"any")))
+            .get_provisions_by_hash(ProvisionHash::from_raw(Hash::from_bytes(b"any")))
             .is_none()
     );
     assert!(coord.queued_provisions(LocalTimestamp::ZERO).is_empty());

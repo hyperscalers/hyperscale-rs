@@ -71,7 +71,7 @@ pub fn serve_block_request(
 
     let resolved: Option<Vec<Arc<Provisions>>> = provision_hashes
         .iter()
-        .map(|h| provision_store.get(h))
+        .map(|h| provision_store.get(*h))
         .collect();
 
     if let Some(provisions) = resolved {

@@ -249,7 +249,7 @@ impl NodeStateMachine {
             manifest,
             |h| self.mempool.get_transaction(h),
             |id| self.execution.get_finalized_wave(id),
-            |h| self.provisions.get_provisions_by_hash(h),
+            |h| self.provisions.get_provisions_by_hash(*h),
         )
     }
 

@@ -256,7 +256,7 @@ where
         elided.try_rehydrate(
             |h| mempool.get_transaction(h),
             |id| execution.get_finalized_wave(id),
-            |h| provision_store.get(h),
+            |h| provision_store.get(*h),
         )
     }
 

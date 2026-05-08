@@ -135,7 +135,7 @@ impl ProvisionPipeline {
         evicted_keys
     }
 
-    pub(crate) fn get_provisions_by_hash(&self, hash: &ProvisionHash) -> Option<Arc<Provisions>> {
+    pub(crate) fn get_provisions_by_hash(&self, hash: ProvisionHash) -> Option<Arc<Provisions>> {
         self.store.get(hash)
     }
 
@@ -221,7 +221,7 @@ mod tests {
         let hash = provisions.hash();
         let arc = pl.insert_verified(Arc::new(provisions), ts(1_000));
         assert!(pl.has_verified((ShardGroupId::new(1), BlockHeight::new(10))));
-        assert!(store.get(&hash).is_some());
+        assert!(store.get(hash).is_some());
         assert_eq!(arc.source_shard(), ShardGroupId::new(1));
     }
 

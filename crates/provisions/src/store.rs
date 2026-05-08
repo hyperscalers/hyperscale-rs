@@ -78,8 +78,8 @@ impl ProvisionStore {
     }
 
     /// Look up provisions by content hash.
-    pub fn get(&self, hash: &ProvisionHash) -> Option<Arc<Provisions>> {
-        self.inner.pin().get(hash).cloned()
+    pub fn get(&self, hash: ProvisionHash) -> Option<Arc<Provisions>> {
+        self.inner.pin().get(&hash).cloned()
     }
 
     /// Fetch the outbound provisions registered for
