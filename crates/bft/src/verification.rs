@@ -19,7 +19,7 @@ use hyperscale_types::{
 use tracing::{debug, trace, warn};
 
 use crate::chain_view::ChainView;
-use crate::pending::PendingBlock;
+use crate::pending::{PendingBlock, PendingBlocks};
 
 /// Block header pending QC signature verification.
 ///
@@ -714,7 +714,7 @@ impl VerificationPipeline {
     pub(crate) fn initiate_block_verifications(
         &mut self,
         topology: &TopologySnapshot,
-        pending_blocks: &HashMap<BlockHash, PendingBlock>,
+        pending_blocks: &PendingBlocks,
         block_hash: BlockHash,
         block: &Block,
     ) -> Vec<Action> {
@@ -738,7 +738,7 @@ impl VerificationPipeline {
             block_hash,
             VerificationKind::ProvisionRoot,
             h.provision_root() != ProvisionsRoot::ZERO,
-        ) && let Some(pending) = pending_blocks.get(&block_hash)
+        ) && let Some(pending) = pending_blocks.get(block_hash)
         {
             actions.extend(self.initiate_provision_root_verification(
                 block_hash,
@@ -1056,27 +1056,23 @@ impl VerificationPipeline {
     /// QC's certified block hash (not the proposing block), so it uses
     /// height-based retention with a 2-block buffer to support view-change
     /// scenarios where multiple proposals share the same parent QC.
-    pub fn cleanup(
-        &mut self,
-        pending_blocks: &HashMap<BlockHash, PendingBlock>,
-        committed_height: BlockHeight,
-    ) {
+    pub fn cleanup(&mut self, pending_blocks: &PendingBlocks, committed_height: BlockHeight) {
         self.pending_qc_verifications
-            .retain(|hash, _| pending_blocks.contains_key(hash));
+            .retain(|hash, _| pending_blocks.contains_key(*hash));
 
         self.state_root_verifications_in_flight
-            .retain(|hash| pending_blocks.contains_key(hash));
+            .retain(|hash| pending_blocks.contains_key(*hash));
 
         self.verified_state_roots
-            .retain(|hash| pending_blocks.contains_key(hash));
+            .retain(|hash| pending_blocks.contains_key(*hash));
 
         self.ready_state_root_verifications
-            .retain(|r| pending_blocks.contains_key(&r.block_hash));
+            .retain(|r| pending_blocks.contains_key(r.block_hash));
 
         // Clean up deferred verifications: remove entries whose child blocks
         // are no longer pending, and remove parent keys with empty lists.
         for entries in self.deferred_state_root_verifications.values_mut() {
-            entries.retain(|r| pending_blocks.contains_key(&r.block_hash));
+            entries.retain(|r| pending_blocks.contains_key(r.block_hash));
         }
         self.deferred_state_root_verifications
             .retain(|_, entries| !entries.is_empty());
@@ -1090,12 +1086,12 @@ impl VerificationPipeline {
         }
 
         self.in_flight_roots
-            .retain(|(hash, _)| pending_blocks.contains_key(hash));
+            .retain(|(hash, _)| pending_blocks.contains_key(*hash));
         self.verified_roots
-            .retain(|(hash, _)| pending_blocks.contains_key(hash));
+            .retain(|(hash, _)| pending_blocks.contains_key(*hash));
 
         self.verified_in_flight
-            .retain(|hash| pending_blocks.contains_key(hash));
+            .retain(|hash| pending_blocks.contains_key(*hash));
 
         // verified_qcs uses height-based retention (not pending_blocks membership)
         // because QC cache entries are keyed by the certified block's hash, which
@@ -1202,7 +1198,7 @@ mod tests {
         committed_height: BlockHeight,
         committed_hash: BlockHash,
         latest_qc: Option<&'a QuorumCertificate>,
-        pending: &'a HashMap<BlockHash, PendingBlock>,
+        pending: &'a PendingBlocks,
     ) -> ChainView<'a> {
         ChainView::new(
             ShardGroupId::new(0),
@@ -1225,7 +1221,7 @@ mod tests {
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
         let block = block_with(BlockHeight::new(1), BlockHash::ZERO, 0, vec![]);
         let block_hash = block.hash();
-        let pending = HashMap::new();
+        let pending = PendingBlocks::new();
         let chain = chain_view(BlockHeight::GENESIS, BlockHash::ZERO, None, &pending);
 
         let out = vp.classify_vote_in_flight(&chain, block_hash, &block, true);
@@ -1256,7 +1252,7 @@ mod tests {
             provisions: Arc::new(BoundedVec::new()),
         };
         let block_hash = block.hash();
-        let pending = HashMap::new();
+        let pending = PendingBlocks::new();
         let chain = chain_view(BlockHeight::new(3), BlockHash::ZERO, None, &pending);
 
         let out = vp.classify_vote_in_flight(&chain, block_hash, &block, false);
@@ -1268,7 +1264,7 @@ mod tests {
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
         let block = block_with(BlockHeight::new(1), BlockHash::ZERO, 0, vec![]);
         let block_hash = block.hash();
-        let pending = HashMap::new();
+        let pending = PendingBlocks::new();
         let chain = chain_view(BlockHeight::GENESIS, BlockHash::ZERO, None, &pending);
 
         let out = vp.classify_vote_in_flight(&chain, block_hash, &block, false);
@@ -1282,7 +1278,7 @@ mod tests {
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
         let block = block_with(BlockHeight::new(1), BlockHash::ZERO, 5, vec![]);
         let block_hash = block.hash();
-        let pending = HashMap::new();
+        let pending = PendingBlocks::new();
         let chain = chain_view(BlockHeight::GENESIS, BlockHash::ZERO, None, &pending);
 
         let out = vp.classify_vote_in_flight(&chain, block_hash, &block, false);
@@ -1294,7 +1290,7 @@ mod tests {
     #[test]
     fn drain_ready_state_root_verifications_returns_empty_when_nothing_ready() {
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
-        let pending = HashMap::new();
+        let pending = PendingBlocks::new();
         let chain = chain_view(BlockHeight::GENESIS, BlockHash::ZERO, None, &pending);
 
         let out = vp.drain_ready_state_root_verifications(&chain);
@@ -1316,8 +1312,8 @@ mod tests {
             PendingBlock::from_complete_block(&block, vec![], vec![], LocalTimestamp::ZERO);
         pb.construct_block()
             .expect("complete block constructs cleanly");
-        let mut pending_with_block = HashMap::new();
-        pending_with_block.insert(block_hash, pb);
+        let mut pending_with_block = PendingBlocks::new();
+        pending_with_block.insert(pb);
         let chain = chain_view(
             BlockHeight::GENESIS,
             BlockHash::ZERO,
@@ -1332,7 +1328,7 @@ mod tests {
         assert_eq!(out[0].parent_block_height, BlockHeight::GENESIS);
 
         // Draining again without another initiate yields nothing.
-        let empty_pending: HashMap<BlockHash, PendingBlock> = HashMap::new();
+        let empty_pending = PendingBlocks::new();
         let chain2 = chain_view(BlockHeight::GENESIS, BlockHash::ZERO, None, &empty_pending);
         assert!(vp.drain_ready_state_root_verifications(&chain2).is_empty());
     }
@@ -1349,7 +1345,7 @@ mod tests {
 
         vp.initiate_state_root_verification(block_hash, &block, BlockHeight::GENESIS);
 
-        let empty_pending: HashMap<BlockHash, PendingBlock> = HashMap::new();
+        let empty_pending = PendingBlocks::new();
         let chain = chain_view(BlockHeight::GENESIS, BlockHash::ZERO, None, &empty_pending);
 
         let out = vp.drain_ready_state_root_verifications(&chain);

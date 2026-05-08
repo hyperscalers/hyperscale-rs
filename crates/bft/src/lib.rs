@@ -64,6 +64,7 @@ mod commit_dedup;
 mod commit_pipeline;
 mod config;
 mod coordinator;
+mod deferred_qc;
 mod lookups;
 mod pending;
 mod proposal;

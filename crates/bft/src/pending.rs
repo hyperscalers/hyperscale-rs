@@ -8,10 +8,328 @@ use std::time::Duration;
 
 use hyperscale_core::{Action, FetchOrigin, FetchPeers, FetchRequest};
 use hyperscale_types::{
-    Block, BlockHash, BlockHeader, BlockManifest, FinalizedWave, LocalTimestamp, ProvisionHash,
-    Provisions, RoutableTransaction, TopologySnapshot, TxHash, WaveId,
+    Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, FinalizedWave, LocalTimestamp,
+    ProvisionHash, Provisions, RoutableTransaction, TopologySnapshot, TxHash, WaveId,
 };
-use tracing::debug;
+use tracing::{debug, warn};
+
+/// Map of block hash → [`PendingBlock`] for blocks currently being assembled.
+///
+/// Keys are derived from `block.header().hash()` on insert.
+#[derive(Default)]
+pub struct PendingBlocks(HashMap<BlockHash, PendingBlock>);
+
+impl PendingBlocks {
+    pub fn new() -> Self {
+        Self(HashMap::new())
+    }
+
+    pub fn get(&self, block_hash: BlockHash) -> Option<&PendingBlock> {
+        self.0.get(&block_hash)
+    }
+
+    pub fn get_mut(&mut self, block_hash: BlockHash) -> Option<&mut PendingBlock> {
+        self.0.get_mut(&block_hash)
+    }
+
+    /// Insert `block` keyed on its own header hash. Silently overwrites any
+    /// prior entry under the same hash; callers that need to gate on
+    /// duplicates check [`contains_key`](Self::contains_key) first.
+    pub fn insert(&mut self, block: PendingBlock) {
+        self.0.insert(block.header().hash(), block);
+    }
+
+    pub fn remove(&mut self, block_hash: BlockHash) -> Option<PendingBlock> {
+        self.0.remove(&block_hash)
+    }
+
+    pub fn contains_key(&self, block_hash: BlockHash) -> bool {
+        self.0.contains_key(&block_hash)
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &PendingBlock> {
+        self.0.values()
+    }
+
+    /// Drop pending blocks whose header height is at or below
+    /// `committed_height`.
+    pub fn prune_committed(&mut self, committed_height: BlockHeight) {
+        self.0
+            .retain(|_, pending| pending.header().height() > committed_height);
+    }
+
+    /// Header for the pending block at `block_hash`, if present.
+    pub fn get_header(&self, block_hash: BlockHash) -> Option<&BlockHeader> {
+        self.0.get(&block_hash).map(PendingBlock::header)
+    }
+
+    /// Constructed [`Block`] for `block_hash`, if the pending block has fully
+    /// assembled. Returns `None` when the hash is unknown OR when the block
+    /// is still awaiting transactions/waves/provisions.
+    pub fn get_block(&self, block_hash: BlockHash) -> Option<&Arc<Block>> {
+        self.0.get(&block_hash)?.block()
+    }
+
+    /// True when the pending block at `block_hash` has all data and the
+    /// inner [`Block`] is ready to be built. False when the hash is unknown.
+    pub fn is_complete(&self, block_hash: BlockHash) -> bool {
+        self.0
+            .get(&block_hash)
+            .is_some_and(PendingBlock::is_complete)
+    }
+
+    /// True when some pending block at `height` is complete AND already has
+    /// its inner [`Block`] constructed.
+    pub fn has_complete_at(&self, height: BlockHeight) -> bool {
+        self.0.values().any(|pending| {
+            pending.header().height() == height
+                && pending.is_complete()
+                && pending.block().is_some()
+        })
+    }
+
+    /// True when any pending block sits at `height`, regardless of completion
+    /// state.
+    pub fn has_any_at(&self, height: BlockHeight) -> bool {
+        self.0
+            .values()
+            .any(|pending| pending.header().height() == height)
+    }
+
+    /// Total transaction count across all pending blocks (manifest counts,
+    /// independent of how much data has actually arrived).
+    pub fn total_transaction_count(&self) -> usize {
+        self.0.values().map(PendingBlock::transaction_count).sum()
+    }
+
+    /// Total certificate count across all pending blocks.
+    pub fn total_certificate_count(&self) -> usize {
+        self.0.values().map(PendingBlock::certificate_count).sum()
+    }
+
+    /// Build a [`PendingBlock`] from `header` + `manifest`, populate it from
+    /// the supplied lookups, and insert it.
+    pub fn assemble(
+        &mut self,
+        header: BlockHeader,
+        manifest: BlockManifest,
+        now: LocalTimestamp,
+        lookup_tx: impl Fn(&TxHash) -> Option<Arc<RoutableTransaction>>,
+        lookup_finalized_wave: impl Fn(&WaveId) -> Option<Arc<FinalizedWave>>,
+        lookup_provision: impl Fn(&ProvisionHash) -> Option<Arc<Provisions>>,
+    ) {
+        let mut pending = PendingBlock::from_manifest(header, manifest, now);
+
+        // Borrow the manifest only long enough to collect locally-available
+        // Arcs, releasing it before the mutable `add_*` calls below.
+        let txs: Vec<Arc<RoutableTransaction>> = pending
+            .manifest()
+            .tx_hashes()
+            .iter()
+            .filter_map(&lookup_tx)
+            .collect();
+        for tx in txs {
+            pending.add_transaction(tx);
+        }
+
+        let waves: Vec<Arc<FinalizedWave>> = pending
+            .manifest()
+            .cert_ids()
+            .iter()
+            .filter_map(&lookup_finalized_wave)
+            .collect();
+        for fw in waves {
+            pending.add_finalized_wave(fw);
+        }
+
+        let provisions: Vec<Arc<Provisions>> = pending
+            .manifest()
+            .provision_hashes()
+            .iter()
+            .filter_map(&lookup_provision)
+            .collect();
+        for p in provisions {
+            pending.add_provision(p);
+        }
+
+        self.insert(pending);
+    }
+
+    /// Fold an arrival into every pending block that needs it. Returns the
+    /// hashes of blocks that became complete and successfully constructed
+    /// their inner [`Block`].
+    fn fold_arrival<F, M>(&mut self, needs: F, apply: M) -> Vec<BlockHash>
+    where
+        F: Fn(&PendingBlock) -> bool,
+        M: Fn(&mut PendingBlock),
+    {
+        let mut block_hashes: Vec<BlockHash> = self
+            .0
+            .iter()
+            .filter(|(_, pending)| needs(pending))
+            .map(|(hash, _)| *hash)
+            .collect();
+        block_hashes.sort();
+
+        let mut newly_complete = Vec::new();
+        for block_hash in block_hashes {
+            if let Some(pending) = self.0.get_mut(&block_hash) {
+                apply(pending);
+                if Self::try_construct(pending) {
+                    newly_complete.push(block_hash);
+                }
+            }
+        }
+        newly_complete
+    }
+
+    fn try_construct(pending: &mut PendingBlock) -> bool {
+        if !pending.is_complete() {
+            return false;
+        }
+        if pending.block().is_some() {
+            return true;
+        }
+        match pending.construct_block() {
+            Ok(_) => true,
+            Err(e) => {
+                warn!(error = %e, "Failed to construct block after arrival");
+                false
+            }
+        }
+    }
+
+    /// Record an arrived transaction against any pending block that needs it.
+    /// Returns the hashes of blocks that became complete as a result.
+    pub fn receive_transaction(&mut self, tx: &Arc<RoutableTransaction>) -> Vec<BlockHash> {
+        let tx_hash = tx.hash();
+        self.fold_arrival(
+            |pending| pending.needs_transaction(&tx_hash),
+            |pending| {
+                pending.add_transaction(Arc::clone(tx));
+            },
+        )
+    }
+
+    /// Record an arrived finalized wave against any pending block that needs
+    /// it. Returns the hashes of blocks that became complete as a result.
+    pub fn receive_finalized_wave(&mut self, fw: &Arc<FinalizedWave>) -> Vec<BlockHash> {
+        let wave_id = fw.wave_id().clone();
+        self.fold_arrival(
+            |pending| pending.needs_wave(&wave_id),
+            |pending| {
+                pending.add_finalized_wave(Arc::clone(fw));
+            },
+        )
+    }
+
+    /// Record an arrived provisions batch against any pending block that
+    /// needs it. Returns the hashes of blocks that became complete as a
+    /// result.
+    pub fn receive_provision(&mut self, batch: &Arc<Provisions>) -> Vec<BlockHash> {
+        let provisions_hash = batch.hash();
+        self.fold_arrival(
+            |pending| pending.needs_provision(&provisions_hash),
+            |pending| {
+                pending.add_provision(Arc::clone(batch));
+            },
+        )
+    }
+
+    /// Emit fetch actions for pending blocks whose missing data has been
+    /// outstanding longer than `timeout`. Skips complete blocks.
+    /// `force_immediate` bypasses the age check.
+    pub fn check_fetches(
+        &self,
+        topology: &TopologySnapshot,
+        now: LocalTimestamp,
+        timeout: Duration,
+        force_immediate: bool,
+    ) -> Vec<Action> {
+        let mut actions = Vec::new();
+
+        for (block_hash, pending) in &self.0 {
+            if pending.is_complete() {
+                continue;
+            }
+
+            let age = now.elapsed_since(pending.created_at());
+            let ready = force_immediate || age >= timeout;
+            if !ready {
+                continue;
+            }
+
+            let proposer = pending.header().proposer();
+            let local_self = topology.local_validator_id();
+            let local_committee: Vec<_> = topology
+                .committee_for_shard(topology.local_shard())
+                .iter()
+                .copied()
+                .filter(|v| *v != local_self && *v != proposer)
+                .collect();
+
+            let missing_txs = pending.missing_transactions();
+            if !missing_txs.is_empty() {
+                debug!(
+                    validator = ?topology.local_validator_id(),
+                    block_hash = ?block_hash,
+                    missing_tx_count = missing_txs.len(),
+                    age_ms = age.as_millis(),
+                    timeout_ms = timeout.as_millis(),
+                    "Fetch timeout reached, requesting missing transactions"
+                );
+                actions.push(Action::Fetch(FetchRequest::Transactions {
+                    ids: missing_txs,
+                    peers: FetchPeers::with_preferred(proposer, local_committee.clone()),
+                    origin: FetchOrigin::PendingBlock,
+                }));
+            }
+
+            let missing_provisions = pending.missing_provisions();
+            if !missing_provisions.is_empty() {
+                debug!(
+                    validator = ?topology.local_validator_id(),
+                    block_hash = ?block_hash,
+                    missing_provision_count = missing_provisions.len(),
+                    age_ms = age.as_millis(),
+                    "Fetch timeout reached, requesting missing provisions"
+                );
+                actions.push(Action::Fetch(FetchRequest::LocalProvisions {
+                    ids: missing_provisions,
+                    peers: FetchPeers::with_preferred(proposer, local_committee.clone()),
+                    origin: FetchOrigin::PendingBlock,
+                }));
+            }
+
+            let missing_waves = pending.missing_waves();
+            if !missing_waves.is_empty() {
+                debug!(
+                    validator = ?topology.local_validator_id(),
+                    block_hash = ?block_hash,
+                    missing_wave_count = missing_waves.len(),
+                    age_ms = age.as_millis(),
+                    "Fetch timeout reached, requesting missing finalized waves"
+                );
+                actions.push(Action::Fetch(FetchRequest::FinalizedWaves {
+                    ids: missing_waves,
+                    peers: FetchPeers::with_preferred(proposer, local_committee),
+                    origin: FetchOrigin::PendingBlock,
+                }));
+            }
+        }
+
+        actions
+    }
+
+    #[cfg(test)]
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+}
 
 /// Tracks a block being assembled from header + gossiped transactions + finalized waves.
 ///
@@ -291,8 +609,8 @@ impl PendingBlock {
     }
 
     /// Get the constructed block, if available.
-    pub fn block(&self) -> Option<Arc<Block>> {
-        self.constructed_block.as_ref().map(Arc::clone)
+    pub const fn block(&self) -> Option<&Arc<Block>> {
+        self.constructed_block.as_ref()
     }
 
     /// Get the block header.
@@ -319,95 +637,6 @@ impl PendingBlock {
     pub const fn certificate_count(&self) -> usize {
         self.manifest.cert_ids().len()
     }
-}
-
-/// Emit fetch actions for pending blocks whose missing data has been
-/// outstanding longer than `timeout`. Skips complete blocks.
-///
-/// Called periodically by the cleanup timer so gossip and local certificate
-/// production have a chance to fill the data first. `force_immediate`
-/// bypasses the age check — used after sync resumes to pull any lingering
-/// holes without another timeout cycle.
-pub fn check_fetches(
-    pending_blocks: &HashMap<BlockHash, PendingBlock>,
-    topology: &TopologySnapshot,
-    now: LocalTimestamp,
-    timeout: Duration,
-    force_immediate: bool,
-) -> Vec<Action> {
-    let mut actions = Vec::new();
-
-    for (block_hash, pending) in pending_blocks {
-        if pending.is_complete() {
-            continue;
-        }
-
-        let age = now.elapsed_since(pending.created_at());
-        let ready = force_immediate || age >= timeout;
-        if !ready {
-            continue;
-        }
-
-        let proposer = pending.header().proposer();
-        let local_self = topology.local_validator_id();
-        let local_committee: Vec<_> = topology
-            .committee_for_shard(topology.local_shard())
-            .iter()
-            .copied()
-            .filter(|v| *v != local_self && *v != proposer)
-            .collect();
-
-        let missing_txs = pending.missing_transactions();
-        if !missing_txs.is_empty() {
-            debug!(
-                validator = ?topology.local_validator_id(),
-                block_hash = ?block_hash,
-                missing_tx_count = missing_txs.len(),
-                age_ms = age.as_millis(),
-                timeout_ms = timeout.as_millis(),
-                "Fetch timeout reached, requesting missing transactions"
-            );
-            actions.push(Action::Fetch(FetchRequest::Transactions {
-                ids: missing_txs,
-                peers: FetchPeers::with_preferred(proposer, local_committee.clone()),
-                origin: FetchOrigin::PendingBlock,
-            }));
-        }
-
-        let missing_provisions = pending.missing_provisions();
-        if !missing_provisions.is_empty() {
-            debug!(
-                validator = ?topology.local_validator_id(),
-                block_hash = ?block_hash,
-                missing_provision_count = missing_provisions.len(),
-                age_ms = age.as_millis(),
-                "Fetch timeout reached, requesting missing provisions"
-            );
-            actions.push(Action::Fetch(FetchRequest::LocalProvisions {
-                ids: missing_provisions,
-                peers: FetchPeers::with_preferred(proposer, local_committee.clone()),
-                origin: FetchOrigin::PendingBlock,
-            }));
-        }
-
-        let missing_waves = pending.missing_waves();
-        if !missing_waves.is_empty() {
-            debug!(
-                validator = ?topology.local_validator_id(),
-                block_hash = ?block_hash,
-                missing_wave_count = missing_waves.len(),
-                age_ms = age.as_millis(),
-                "Fetch timeout reached, requesting missing finalized waves"
-            );
-            actions.push(Action::Fetch(FetchRequest::FinalizedWaves {
-                ids: missing_waves,
-                peers: FetchPeers::with_preferred(proposer, local_committee),
-                origin: FetchOrigin::PendingBlock,
-            }));
-        }
-    }
-
-    actions
 }
 
 #[cfg(test)]
