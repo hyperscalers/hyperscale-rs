@@ -150,7 +150,7 @@ impl Default for ProvisionStore {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::{Hash, MerkleInclusionProof, TxEntries, TxHash};
+    use hyperscale_types::{Hash, MerkleInclusionProof, ProvisionEntry, TxHash};
 
     use super::*;
 
@@ -160,7 +160,7 @@ mod tests {
             ShardGroupId::new(0),
             BlockHeight::new(height),
             MerkleInclusionProof::dummy(),
-            vec![TxEntries::new(
+            vec![ProvisionEntry::new(
                 TxHash::from_raw(Hash::from_bytes(&[tx_seed])),
                 vec![],
                 vec![],

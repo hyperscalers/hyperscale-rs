@@ -308,9 +308,9 @@ mod tests {
     use hyperscale_test_helpers::{TestCommittee, make_finalized_wave};
     use hyperscale_types::{
         BlockHash, BlockHeader, BoundedVec, CertificateRoot, FinalizedWave, Hash, InFlightCount,
-        LocalReceiptRoot, MerkleInclusionProof, ProposerTimestamp, Provisions, ProvisionsRoot,
-        QuorumCertificate, Round, RoutableTransaction, ShardGroupId, StateRoot,
-        TransactionDecision, TransactionRoot, TxEntries, ValidatorId, ValidatorInfo, ValidatorSet,
+        LocalReceiptRoot, MerkleInclusionProof, ProposerTimestamp, ProvisionEntry, Provisions,
+        ProvisionsRoot, QuorumCertificate, Round, RoutableTransaction, ShardGroupId, StateRoot,
+        TransactionDecision, TransactionRoot, ValidatorId, ValidatorInfo, ValidatorSet,
         WeightedTimestamp, compute_waves, test_utils,
     };
 
@@ -681,7 +681,7 @@ mod tests {
             ShardGroupId::new(1),
             BlockHeight::new(u64::from(seed)),
             MerkleInclusionProof::dummy(),
-            vec![TxEntries::new(tx_hash, vec![], vec![])],
+            vec![ProvisionEntry::new(tx_hash, vec![], vec![])],
         ))
     }
 

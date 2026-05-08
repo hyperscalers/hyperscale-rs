@@ -323,14 +323,14 @@ mod tests {
 
     #[test]
     fn test_state_provisions_message_deterministic() {
-        use crate::{MerkleInclusionProof, TxEntries};
+        use crate::{MerkleInclusionProof, ProvisionEntry};
 
         let provisions = Provisions::new(
             ShardGroupId::new(1),
             ShardGroupId::new(2),
             BlockHeight::new(10),
             MerkleInclusionProof::dummy(),
-            vec![TxEntries::new(
+            vec![ProvisionEntry::new(
                 TxHash::from_raw(Hash::from_bytes(b"tx1")),
                 vec![],
                 vec![],

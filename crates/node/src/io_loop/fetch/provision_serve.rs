@@ -7,7 +7,7 @@ use hyperscale_storage::{ChainReader, SubstateStore};
 use hyperscale_types::network::request::GetProvisionsRequest;
 use hyperscale_types::network::response::GetProvisionResponse;
 use hyperscale_types::{
-    MerkleInclusionProof, Provisions, ShardGroupId, SubstateEntry, TxEntries, TxHash,
+    MerkleInclusionProof, ProvisionEntry, Provisions, ShardGroupId, SubstateEntry, TxHash,
     shard_for_node,
 };
 use tracing::warn;
@@ -100,7 +100,7 @@ pub fn serve_provision_request(
     // Phase 3: Build the bundle.
     let transactions = per_tx
         .into_iter()
-        .map(|(tx_hash, entries)| TxEntries::new(tx_hash, entries, vec![]))
+        .map(|(tx_hash, entries)| ProvisionEntry::new(tx_hash, entries, vec![]))
         .collect();
 
     GetProvisionResponse {

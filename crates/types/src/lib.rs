@@ -72,14 +72,14 @@ pub use primitives::merkle::{
     compute_merkle_root, compute_merkle_root_with_proof, verify_merkle_inclusion,
 };
 pub use primitives::signer_bitfield::SignerBitfield;
-pub use provisioning::batch::Provisions;
+pub use provisioning::entry::ProvisionEntry;
 pub use provisioning::limits::{
     MAX_MERKLE_PROOF_LEN, MAX_STATE_ENTRIES_PER_TX, MAX_STATE_ENTRY_KEY_LEN,
     MAX_STATE_ENTRY_VALUE_LEN,
 };
 pub use provisioning::proof::MerkleInclusionProof;
+pub use provisioning::provisions::Provisions;
 pub use provisioning::substate::{StateProvision, SubstateEntry};
-pub use provisioning::tx_entries::TxEntries;
 pub use quorum_certificate::QuorumCertificate;
 // Re-export DatabaseUpdates from radix for cross-crate use (execution cache, block commit)
 pub use radix_substate_store_interface::interface::DatabaseUpdates;

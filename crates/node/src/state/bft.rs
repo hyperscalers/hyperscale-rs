@@ -363,8 +363,8 @@ mod tests {
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
         Block, BlockHeader, BlockHeight, BlockManifest, CommittedBlockHeader, Hash, LocalTimestamp,
-        MerkleInclusionProof, Provisions, QuorumCertificate, RETENTION_HORIZON, Round,
-        ShardGroupId, TransactionStatus, TxEntries, TxHash, ValidatorId, WaveId,
+        MerkleInclusionProof, ProvisionEntry, Provisions, QuorumCertificate, RETENTION_HORIZON,
+        Round, ShardGroupId, TransactionStatus, TxHash, ValidatorId, WaveId,
     };
 
     use super::super::test_support::TestNode;
@@ -540,7 +540,7 @@ mod tests {
             ShardGroupId::new(1),
             BlockHeight::new(1),
             MerkleInclusionProof::dummy(),
-            vec![TxEntries::new(
+            vec![ProvisionEntry::new(
                 TxHash::from_raw(Hash::from_bytes(b"outbound-tx")),
                 vec![],
                 vec![],

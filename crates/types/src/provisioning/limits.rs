@@ -28,7 +28,7 @@ pub const MAX_STATE_ENTRY_VALUE_LEN: usize = 1024 * 1024;
 /// cap a touch above for headroom.
 pub const MAX_MERKLE_PROOF_LEN: usize = 4 * 1024 * 1024;
 
-/// Cap on `TxEntries.entries` length at decode time.
+/// Cap on `ProvisionEntry.entries` length at decode time.
 ///
 /// Each entry is one substate the transaction touched on the source
 /// shard. A transaction's substate footprint is bounded by its declared

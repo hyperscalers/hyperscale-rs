@@ -596,8 +596,8 @@ impl MempoolCoordinator {
         // is handled by `ExpectedTxs::record`.
         for provision in block.provisions() {
             let source_shard = provision.source_shard();
-            for tx_entries in provision.transactions().iter() {
-                let tx_hash = tx_entries.tx_hash;
+            for entry in provision.transactions().iter() {
+                let tx_hash = entry.tx_hash;
                 if self.pool.contains_key(&tx_hash) {
                     continue;
                 }
@@ -1059,8 +1059,8 @@ mod tests {
     use hyperscale_test_helpers::{TestCommittee, certify, make_finalized_wave, make_live_block};
     use hyperscale_types::test_utils::{test_transaction, test_transaction_with_nodes};
     use hyperscale_types::{
-        Block, FinalizedWave, MAX_TXS_PER_BLOCK, MerkleInclusionProof, Provisions, ShardGroupId,
-        TxEntries, ValidatorId,
+        Block, FinalizedWave, MAX_TXS_PER_BLOCK, MerkleInclusionProof, ProvisionEntry, Provisions,
+        ShardGroupId, ValidatorId,
     };
 
     use super::*;
@@ -1102,7 +1102,7 @@ mod tests {
     ) -> CertifiedBlock {
         let transactions = tx_hashes
             .iter()
-            .map(|h| TxEntries::new(*h, vec![], vec![]))
+            .map(|h| ProvisionEntry::new(*h, vec![], vec![]))
             .collect();
         let provision = Provisions::new(
             source_shard,

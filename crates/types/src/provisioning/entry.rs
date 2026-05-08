@@ -13,7 +13,7 @@ use crate::{
 /// Identifies which transaction, what state it touched on the source shard,
 /// and what nodes it needs from the target shard (for conflict detection).
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
-pub struct TxEntries {
+pub struct ProvisionEntry {
     /// Hash of the transaction.
     pub tx_hash: TxHash,
 
@@ -28,8 +28,8 @@ pub struct TxEntries {
     pub target_nodes: BoundedVec<NodeId, MAX_DECLARED_NODES_PER_TX>,
 }
 
-impl TxEntries {
-    /// Build a `TxEntries` from raw `Vec`s — wraps each in its bounded type.
+impl ProvisionEntry {
+    /// Build a `ProvisionEntry` from raw `Vec`s — wraps each in its bounded type.
     #[must_use]
     pub fn new(tx_hash: TxHash, entries: Vec<SubstateEntry>, target_nodes: Vec<NodeId>) -> Self {
         Self {
@@ -65,14 +65,14 @@ mod tests {
 
     #[test]
     fn sbor_roundtrip() {
-        let tx_entries = TxEntries::new(
+        let entry = ProvisionEntry::new(
             TxHash::from_raw(Hash::from_bytes(b"tx")),
             vec![sample_entry(1), sample_entry(2)],
             vec![NodeId([3u8; 30]), NodeId([4u8; 30])],
         );
-        let bytes = basic_encode(&tx_entries).unwrap();
-        let decoded: TxEntries = basic_decode(&bytes).unwrap();
-        assert_eq!(decoded, tx_entries);
+        let bytes = basic_encode(&entry).unwrap();
+        let decoded: ProvisionEntry = basic_decode(&bytes).unwrap();
+        assert_eq!(decoded, entry);
     }
 
     #[test]
@@ -88,7 +88,7 @@ mod tests {
         enc.write_value_kind(ValueKind::Array).unwrap();
         enc.write_value_kind(SubstateEntry::value_kind()).unwrap();
         enc.write_size(MAX_STATE_ENTRIES_PER_TX + 1).unwrap();
-        let err = basic_decode::<TxEntries>(&buf).unwrap_err();
+        let err = basic_decode::<ProvisionEntry>(&buf).unwrap_err();
         assert!(matches!(
             err,
             DecodeError::UnexpectedSize {
@@ -112,7 +112,7 @@ mod tests {
         enc.write_value_kind(ValueKind::Array).unwrap();
         enc.write_value_kind(NodeId::value_kind()).unwrap();
         enc.write_size(MAX_DECLARED_NODES_PER_TX + 1).unwrap();
-        let err = basic_decode::<TxEntries>(&buf).unwrap_err();
+        let err = basic_decode::<ProvisionEntry>(&buf).unwrap_err();
         assert!(matches!(
             err,
             DecodeError::UnexpectedSize {

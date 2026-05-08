@@ -229,8 +229,8 @@ mod tests {
     use std::time::Duration;
 
     use hyperscale_types::{
-        ExecutionOutcome, GlobalReceiptHash, Hash, MerkleInclusionProof, RETENTION_HORIZON,
-        TxEntries,
+        ExecutionOutcome, GlobalReceiptHash, Hash, MerkleInclusionProof, ProvisionEntry,
+        RETENTION_HORIZON,
     };
 
     use super::*;
@@ -246,7 +246,7 @@ mod tests {
     fn make_provisions(source_block: BlockHeight, txs: &[TxHash]) -> Arc<Provisions> {
         let transactions = txs
             .iter()
-            .map(|h| TxEntries::new(*h, vec![], vec![]))
+            .map(|h| ProvisionEntry::new(*h, vec![], vec![]))
             .collect();
         Arc::new(Provisions::new(
             ShardGroupId::new(0),

@@ -99,7 +99,7 @@ impl QueuedProvisionBuffer {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{
-        BlockHeight, Hash, MerkleInclusionProof, ShardGroupId, TxEntries, TxHash,
+        BlockHeight, Hash, MerkleInclusionProof, ProvisionEntry, ShardGroupId, TxHash,
     };
 
     use super::*;
@@ -122,7 +122,7 @@ mod tests {
             ShardGroupId::new(0),
             height,
             MerkleInclusionProof::dummy(),
-            vec![TxEntries::new(
+            vec![ProvisionEntry::new(
                 TxHash::from_raw(Hash::from_bytes(&[seed])),
                 vec![],
                 vec![],

@@ -287,8 +287,8 @@ impl ConflictDetector {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{
-        BlockHeight, Hash, MerkleInclusionProof, NodeId, ShardGroupId, SubstateEntry,
-        TopologySnapshot, TxEntries, ValidatorId, ValidatorInfo, ValidatorSet, VotePower,
+        BlockHeight, Hash, MerkleInclusionProof, NodeId, ProvisionEntry, ShardGroupId,
+        SubstateEntry, TopologySnapshot, ValidatorId, ValidatorInfo, ValidatorSet, VotePower,
         bls_keypair_from_seed, shard_for_node,
     };
 
@@ -358,7 +358,7 @@ mod tests {
             MerkleInclusionProof::dummy(),
             txs.into_iter()
                 .map(|(hash, source_nodes, target_nodes)| {
-                    TxEntries::new(
+                    ProvisionEntry::new(
                         hash,
                         source_nodes.into_iter().map(make_entry).collect(),
                         target_nodes,

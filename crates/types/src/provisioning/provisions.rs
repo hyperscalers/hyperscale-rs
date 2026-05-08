@@ -7,8 +7,8 @@ use std::sync::OnceLock;
 use sbor::prelude::*;
 
 use crate::{
-    BlockHeight, BoundedVec, Hash, MAX_TXS_PER_BLOCK, MerkleInclusionProof, NodeId, ProvisionHash,
-    RETENTION_HORIZON, ShardGroupId, SubstateEntry, TxEntries, TxHash, WeightedTimestamp,
+    BlockHeight, BoundedVec, Hash, MAX_TXS_PER_BLOCK, MerkleInclusionProof, NodeId, ProvisionEntry,
+    ProvisionHash, RETENTION_HORIZON, ShardGroupId, SubstateEntry, TxHash, WeightedTimestamp,
 };
 
 /// All provisions from a single source block, scoped to a single target shard.
@@ -31,7 +31,7 @@ pub struct Provisions {
     target_shard: ShardGroupId,
     block_height: BlockHeight,
     proof: MerkleInclusionProof,
-    transactions: BoundedVec<TxEntries, MAX_TXS_PER_BLOCK>,
+    transactions: BoundedVec<ProvisionEntry, MAX_TXS_PER_BLOCK>,
 
     /// Lazily-computed content hash (blake3 over SBOR-encoded content fields).
     /// Populated on first [`Self::hash`] call; not on the wire.
@@ -89,7 +89,7 @@ impl Provisions {
         target_shard: ShardGroupId,
         block_height: BlockHeight,
         proof: MerkleInclusionProof,
-        transactions: Vec<TxEntries>,
+        transactions: Vec<ProvisionEntry>,
     ) -> Self {
         Self {
             source_shard,
@@ -127,7 +127,7 @@ impl Provisions {
 
     /// Per-transaction entries.
     #[must_use]
-    pub const fn transactions(&self) -> &BoundedVec<TxEntries, MAX_TXS_PER_BLOCK> {
+    pub const fn transactions(&self) -> &BoundedVec<ProvisionEntry, MAX_TXS_PER_BLOCK> {
         &self.transactions
     }
 
@@ -164,7 +164,7 @@ impl Provisions {
         target_shard: ShardGroupId,
         block_height: BlockHeight,
         proof: &MerkleInclusionProof,
-        transactions: &[TxEntries],
+        transactions: &[ProvisionEntry],
     ) -> ProvisionHash {
         // Encode the content fields (excluding the hash itself) for hashing.
         let mut bytes = Vec::new();
@@ -181,7 +181,8 @@ impl Provisions {
             &basic_encode(proof).expect("MerkleInclusionProof serialization should never fail"),
         );
         bytes.extend_from_slice(
-            &basic_encode(transactions).expect("Vec<TxEntries> serialization should never fail"),
+            &basic_encode(transactions)
+                .expect("Vec<ProvisionEntry> serialization should never fail"),
         );
         ProvisionHash::from_raw(Hash::from_bytes(&bytes))
     }
@@ -280,8 +281,8 @@ mod tests {
     }
 
     #[test]
-    fn test_tx_entries_node_ids() {
-        let tx = TxEntries::new(
+    fn test_provision_entry_node_ids() {
+        let tx = ProvisionEntry::new(
             TxHash::from_raw(Hash::from_bytes(b"tx")),
             vec![test_entry(1), test_entry(2)],
             vec![],
@@ -299,7 +300,7 @@ mod tests {
             ShardGroupId::new(1),
             BlockHeight::new(10),
             MerkleInclusionProof::dummy(),
-            vec![TxEntries::new(
+            vec![ProvisionEntry::new(
                 TxHash::from_raw(Hash::from_bytes(b"tx1")),
                 vec![test_entry(1)],
                 vec![],
@@ -320,12 +321,12 @@ mod tests {
             BlockHeight::new(10),
             MerkleInclusionProof::dummy(),
             vec![
-                TxEntries::new(
+                ProvisionEntry::new(
                     TxHash::from_raw(Hash::from_bytes(b"tx1")),
                     vec![entry.clone()],
                     vec![],
                 ),
-                TxEntries::new(
+                ProvisionEntry::new(
                     TxHash::from_raw(Hash::from_bytes(b"tx2")),
                     vec![entry, test_entry(2)],
                     vec![],
@@ -360,7 +361,7 @@ mod tests {
             enc.encode(&BlockHeight::new(10)).unwrap();
             enc.encode(&MerkleInclusionProof::dummy()).unwrap();
             enc.write_value_kind(ValueKind::Array).unwrap();
-            enc.write_value_kind(TxEntries::value_kind()).unwrap();
+            enc.write_value_kind(ProvisionEntry::value_kind()).unwrap();
             enc.write_size(MAX_TXS_PER_BLOCK + 1).unwrap();
         }
         let err = basic_decode::<Provisions>(&buf).unwrap_err();

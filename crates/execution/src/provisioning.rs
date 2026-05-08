@@ -256,7 +256,7 @@ impl ProvisioningTracker {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::{BlockHeight, Hash, MerkleInclusionProof, TxEntries};
+    use hyperscale_types::{BlockHeight, Hash, MerkleInclusionProof, ProvisionEntry};
 
     use super::*;
 
@@ -269,9 +269,9 @@ mod tests {
         block_height: BlockHeight,
         tx_hashes: Vec<TxHash>,
     ) -> Arc<Provisions> {
-        let transactions: Vec<TxEntries> = tx_hashes
+        let transactions: Vec<ProvisionEntry> = tx_hashes
             .into_iter()
-            .map(|tx_hash| TxEntries::new(tx_hash, vec![], vec![]))
+            .map(|tx_hash| ProvisionEntry::new(tx_hash, vec![], vec![]))
             .collect();
         Arc::new(Provisions::new(
             source,

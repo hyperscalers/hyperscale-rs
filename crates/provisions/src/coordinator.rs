@@ -680,10 +680,10 @@ impl ProvisionCoordinator {
 mod tests {
     use hyperscale_types::{
         Block, BlockHash, BlockHeader, Bls12381G1PrivateKey, BoundedVec, CertificateRoot, Hash,
-        InFlightCount, LocalReceiptRoot, MerkleInclusionProof, ProposerTimestamp, ProvisionsRoot,
-        QuorumCertificate, Round, ShardGroupId, SignerBitfield, StateRoot, TopologySnapshot,
-        TransactionRoot, TxEntries, TxHash, ValidatorId, ValidatorInfo, ValidatorSet, VotePower,
-        WaveId, WeightedTimestamp, bls_keypair_from_seed, zero_bls_signature,
+        InFlightCount, LocalReceiptRoot, MerkleInclusionProof, ProposerTimestamp, ProvisionEntry,
+        ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, SignerBitfield, StateRoot,
+        TopologySnapshot, TransactionRoot, TxHash, ValidatorId, ValidatorInfo, ValidatorSet,
+        VotePower, WaveId, WeightedTimestamp, bls_keypair_from_seed, zero_bls_signature,
     };
     use proptest::bool::ANY as ANY_BOOL;
     use proptest::collection::vec as prop_vec;
@@ -876,7 +876,7 @@ mod tests {
     ) -> Provisions {
         let transactions = tx_hashes
             .into_iter()
-            .map(|tx_hash| TxEntries::new(tx_hash, vec![], vec![]))
+            .map(|tx_hash| ProvisionEntry::new(tx_hash, vec![], vec![]))
             .collect();
         Provisions::new(
             source_shard,

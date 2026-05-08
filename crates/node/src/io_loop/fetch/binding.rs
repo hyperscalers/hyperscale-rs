@@ -554,14 +554,15 @@ mod tests {
         // before signature/merkle verification — so unsolicited deliveries
         // must be dropped at the response boundary.
         use hyperscale_types::{
-            BlockHeight, Hash, MerkleInclusionProof, Provisions, ShardGroupId, TxEntries, TxHash,
+            BlockHeight, Hash, MerkleInclusionProof, ProvisionEntry, Provisions, ShardGroupId,
+            TxHash,
         };
         let asked = Arc::new(Provisions::new(
             ShardGroupId::new(1),
             ShardGroupId::new(2),
             BlockHeight::new(10),
             MerkleInclusionProof::dummy(),
-            vec![TxEntries::new(
+            vec![ProvisionEntry::new(
                 TxHash::from_raw(Hash::from_bytes(b"asked")),
                 vec![],
                 vec![],
@@ -572,7 +573,7 @@ mod tests {
             ShardGroupId::new(2),
             BlockHeight::new(11),
             MerkleInclusionProof::dummy(),
-            vec![TxEntries::new(
+            vec![ProvisionEntry::new(
                 TxHash::from_raw(Hash::from_bytes(b"extra")),
                 vec![],
                 vec![],

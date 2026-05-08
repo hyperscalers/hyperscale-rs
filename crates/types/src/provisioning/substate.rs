@@ -109,7 +109,7 @@ impl SubstateEntry {
 /// Per-tx provision view used inside the execution path.
 ///
 /// Built from a [`crate::Provisions`] bundle when it lands at the execution
-/// coordinator: each `TxEntries` in the bundle becomes one `StateProvision`
+/// coordinator: each `ProvisionEntry` in the bundle becomes one `StateProvision`
 /// keyed to the tx, carrying the bundle's source/target shard and block
 /// height alongside the tx's slice of state entries. Not on the wire.
 #[derive(Debug, Clone)]

@@ -20,13 +20,13 @@ use hyperscale_storage::tree::proofs::verify_proof;
 use hyperscale_storage::{Storage, SubstateStore, SubstateView, VersionedStore};
 use hyperscale_types::network::notification::ProvisionsNotification;
 use hyperscale_types::{
-    BlockHeight, NodeId, Provisions, ShardGroupId, SubstateEntry, TxEntries, TxHash, ValidatorId,
-    state_provisions_message,
+    BlockHeight, NodeId, ProvisionEntry, Provisions, ShardGroupId, SubstateEntry, TxHash,
+    ValidatorId, state_provisions_message,
 };
 use tracing::warn;
 
 /// Per-tx fetched entries: (`tx_hash`, `target_shards_with_nodes`, `state_entries`).
-type FetchedTxEntries = (
+type FetchedProvisionEntry = (
     TxHash,
     Vec<(ShardGroupId, Vec<NodeId>)>,
     Arc<Vec<SubstateEntry>>,
@@ -75,7 +75,7 @@ fn fetch_entries_for_requests<S>(
     requests: &[ProvisionsRequest],
     source_shard: ShardGroupId,
     block_height: BlockHeight,
-) -> Vec<FetchedTxEntries>
+) -> Vec<FetchedProvisionEntry>
 where
     S: SubstateStore + VersionedStore,
 {
@@ -112,7 +112,7 @@ where
 /// Group fetched entries by target shard and generate one merkle proof per shard.
 fn build_provision_groups<S, H>(
     view: &SubstateView<S>,
-    per_tx: Vec<FetchedTxEntries>,
+    per_tx: Vec<FetchedProvisionEntry>,
     source_shard: ShardGroupId,
     block_height: BlockHeight,
     shard_recipients: &HashMap<ShardGroupId, Vec<ValidatorId>, H>,
@@ -121,17 +121,21 @@ where
     S: SubstateStore + VersionedStore + JmtTreeReader + Sync,
     H: BuildHasher,
 {
-    let mut shard_tx_entries: HashMap<ShardGroupId, Vec<TxEntries>> = HashMap::new();
+    let mut shard_entries: HashMap<ShardGroupId, Vec<ProvisionEntry>> = HashMap::new();
     for (tx_hash, targets, entries) in per_tx {
         for (target_shard, target_nodes) in targets {
-            shard_tx_entries
+            shard_entries
                 .entry(target_shard)
                 .or_default()
-                .push(TxEntries::new(tx_hash, (*entries).clone(), target_nodes));
+                .push(ProvisionEntry::new(
+                    tx_hash,
+                    (*entries).clone(),
+                    target_nodes,
+                ));
         }
     }
 
-    let mut sorted_shard_entries: Vec<_> = shard_tx_entries.into_iter().collect();
+    let mut sorted_shard_entries: Vec<_> = shard_entries.into_iter().collect();
     sorted_shard_entries.sort_by_key(|(shard, _)| *shard);
     let mut batches = Vec::with_capacity(sorted_shard_entries.len());
     for (shard, transactions) in sorted_shard_entries {

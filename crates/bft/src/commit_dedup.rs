@@ -139,8 +139,8 @@ mod tests {
     use hyperscale_test_helpers::make_finalized_wave;
     use hyperscale_types::test_utils::test_notarized_transaction_v1;
     use hyperscale_types::{
-        BlockHeight, Hash, MerkleInclusionProof, ShardGroupId, TimestampRange, TransactionDecision,
-        TxEntries, routable_from_notarized_v1,
+        BlockHeight, Hash, MerkleInclusionProof, ProvisionEntry, ShardGroupId, TimestampRange,
+        TransactionDecision, routable_from_notarized_v1,
     };
 
     use super::*;
@@ -172,7 +172,7 @@ mod tests {
             ShardGroupId::new(1),
             BlockHeight::new(u64::from(seed)),
             MerkleInclusionProof::dummy(),
-            vec![TxEntries::new(tx_hash, vec![], vec![])],
+            vec![ProvisionEntry::new(tx_hash, vec![], vec![])],
         ))
     }
 
