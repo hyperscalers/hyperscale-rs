@@ -140,15 +140,15 @@ impl ProvisioningTracker {
         provisions: &Provisions,
         local_shard: ShardGroupId,
     ) -> Vec<TxHash> {
-        let mut touched = Vec::with_capacity(provisions.transactions.len());
-        let source_shard = provisions.source_shard;
-        for tx_entry in provisions.transactions.iter() {
+        let mut touched = Vec::with_capacity(provisions.transactions().len());
+        let source_shard = provisions.source_shard();
+        for tx_entry in provisions.transactions().iter() {
             let tx_hash = tx_entry.tx_hash;
             let provision = StateProvision::new(
                 tx_hash,
                 local_shard,
                 source_shard,
-                provisions.block_height,
+                provisions.block_height(),
                 Arc::new(tx_entry.entries.0.clone()),
             );
             self.verified.entry(tx_hash).or_default().push(provision);

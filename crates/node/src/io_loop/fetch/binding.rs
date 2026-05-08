@@ -423,17 +423,17 @@ impl FetchBinding for ProvisionBinding {
                     });
                     return ResponseVerdict::Reject;
                 };
-                if provisions.source_shard != source_shard
-                    || provisions.target_shard != target_shard
-                    || provisions.block_height != block_height
+                if provisions.source_shard() != source_shard
+                    || provisions.target_shard() != target_shard
+                    || provisions.block_height() != block_height
                 {
                     tracing::warn!(
                         expected_source = source_shard.inner(),
-                        got_source = provisions.source_shard.inner(),
+                        got_source = provisions.source_shard().inner(),
                         expected_target = target_shard.inner(),
-                        got_target = provisions.target_shard.inner(),
+                        got_target = provisions.target_shard().inner(),
                         expected_height = block_height.inner(),
-                        got_height = provisions.block_height.inner(),
+                        got_height = provisions.block_height().inner(),
                         "Dropping provision fetch response: scope mismatch"
                     );
                     let _ = es.send(NodeInput::ProvisionsFetchFailed {
@@ -442,7 +442,7 @@ impl FetchBinding for ProvisionBinding {
                     });
                     return ResponseVerdict::Reject;
                 }
-                if provisions.transactions.is_empty() {
+                if provisions.transactions().is_empty() {
                     // Empty-but-scope-matched response is still a miss for
                     // the requester: the FSM has nothing to admit, so
                     // without an explicit `Failed` the id stays in_flight

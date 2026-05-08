@@ -425,17 +425,17 @@ impl ProvisionCoordinator {
         topology: &TopologySnapshot,
         provisions: Provisions,
     ) -> Vec<Action> {
-        if provisions.transactions.is_empty() {
+        if provisions.transactions().is_empty() {
             return vec![];
         }
 
-        let source_shard = provisions.source_shard;
-        let block_height = provisions.block_height;
+        let source_shard = provisions.source_shard();
+        let block_height = provisions.block_height();
 
         debug!(
             source_shard = source_shard.inner(),
             block_height = block_height.inner(),
-            count = provisions.transactions.len(),
+            count = provisions.transactions().len(),
             "Provisions received"
         );
 
@@ -447,10 +447,10 @@ impl ProvisionCoordinator {
         // Reject provisions not destined for our shard. Indicates a proposer
         // bug, a network misroute, or an adversarial attempt — log loudly so
         // it's visible but don't propagate.
-        if provisions.target_shard != topology.local_shard() {
+        if provisions.target_shard() != topology.local_shard() {
             warn!(
                 source_shard = source_shard.inner(),
-                target_shard = provisions.target_shard.inner(),
+                target_shard = provisions.target_shard().inner(),
                 local_shard = topology.local_shard().inner(),
                 block_height = block_height.inner(),
                 "Dropping provisions: target_shard does not match local shard"
@@ -488,7 +488,7 @@ impl ProvisionCoordinator {
         debug!(
             source_shard = source_shard.inner(),
             block_height = block_height.inner(),
-            count = provisions.transactions.len(),
+            count = provisions.transactions().len(),
             "Buffering provisions (waiting for remote header)"
         );
         self.pipeline
@@ -521,8 +521,8 @@ impl ProvisionCoordinator {
             .copied()
         else {
             warn!(
-                source_shard = provisions.source_shard.inner(),
-                block_height = provisions.block_height.inner(),
+                source_shard = provisions.source_shard().inner(),
+                block_height = provisions.block_height().inner(),
                 local_shard = local_shard.inner(),
                 "Dropping provisions: source header has no provision_tx_root for us"
             );
@@ -530,7 +530,7 @@ impl ProvisionCoordinator {
         };
 
         let leaves: Vec<Hash> = provisions
-            .transactions
+            .transactions()
             .iter()
             .map(|t| t.tx_hash.into_raw())
             .collect();
@@ -538,10 +538,10 @@ impl ProvisionCoordinator {
 
         if computed_root != expected_root {
             warn!(
-                source_shard = provisions.source_shard.inner(),
-                block_height = provisions.block_height.inner(),
+                source_shard = provisions.source_shard().inner(),
+                block_height = provisions.block_height().inner(),
                 local_shard = local_shard.inner(),
-                tx_count = provisions.transactions.len(),
+                tx_count = provisions.transactions().len(),
                 ?expected_root,
                 ?computed_root,
                 "Rejecting incomplete provisions — tx-root mismatch; \
@@ -569,7 +569,7 @@ impl ProvisionCoordinator {
         now: LocalTimestamp,
     ) -> Vec<Action> {
         let mut actions = vec![];
-        let source_shard = provisions.source_shard;
+        let source_shard = provisions.source_shard();
 
         // Clear expected-provision tracking and the matching header. The
         // header's only job — verify these provisions — is done; hanging on
@@ -593,7 +593,7 @@ impl ProvisionCoordinator {
         if !valid {
             warn!(
                 source_shard = source_shard.inner(),
-                tx_count = provisions.transactions.len(),
+                tx_count = provisions.transactions().len(),
                 "Provisions verification failed"
             );
             return actions;
@@ -619,7 +619,7 @@ impl ProvisionCoordinator {
 
         debug!(
             source_shard = source_shard.inner(),
-            tx_count = provisions.transactions.len(),
+            tx_count = provisions.transactions().len(),
             "Provisions verified and queued"
         );
 
@@ -897,7 +897,7 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             &actions[0],
-            Action::VerifyProvisions { provisions, .. } if provisions.transactions[0].tx_hash == tx_hash
+            Action::VerifyProvisions { provisions, .. } if provisions.transactions()[0].tx_hash == tx_hash
         ));
     }
 
@@ -950,7 +950,7 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             &actions[0],
-            Action::VerifyProvisions { provisions, .. } if provisions.transactions[0].tx_hash == tx_hash
+            Action::VerifyProvisions { provisions, .. } if provisions.transactions()[0].tx_hash == tx_hash
         ));
     }
 
@@ -1046,7 +1046,7 @@ mod tests {
         assert!(actions.iter().any(|a| matches!(
             a,
             Action::Continuation(ProtocolEvent::ProvisionsAdmitted { provisions, .. })
-            if provisions.transactions[0].tx_hash == tx_hash
+            if provisions.transactions()[0].tx_hash == tx_hash
         )));
     }
 
@@ -1120,7 +1120,7 @@ mod tests {
         assert_eq!(actions.len(), 1);
         match &actions[0] {
             Action::VerifyProvisions { provisions, .. } => {
-                assert_eq!(provisions.transactions.len(), 3);
+                assert_eq!(provisions.transactions().len(), 3);
             }
             other => panic!("Expected VerifyProvisions, got {other:?}"),
         }
@@ -2053,7 +2053,7 @@ mod tests {
         let eligible = coordinator.queued_provisions(LocalTimestamp::from_millis(1_400));
         assert_eq!(eligible.len(), 1);
         assert_eq!(
-            eligible[0].transactions[0].tx_hash,
+            eligible[0].transactions()[0].tx_hash,
             TxHash::from_raw(Hash::from_bytes(b"tx_old"))
         );
     }

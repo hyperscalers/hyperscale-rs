@@ -246,7 +246,7 @@ pub fn select_provisions(
         .into_iter()
         .filter(|b| !qc_chain_provision_hashes.contains(&b.hash()))
         .take_while(|b| {
-            let new_total = running_tx_count.saturating_add(b.transactions.len());
+            let new_total = running_tx_count.saturating_add(b.transactions().len());
             if new_total <= max_provision_txs {
                 running_tx_count = new_total;
                 true

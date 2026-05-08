@@ -105,7 +105,7 @@ where
                     ids: vec![provisions.hash()],
                 });
                 self.drive_fetch::<ProvisionBinding>(FetchInput::Admitted {
-                    ids: vec![(provisions.source_shard, provisions.block_height)],
+                    ids: vec![(provisions.source_shard(), provisions.block_height())],
                 });
             }
             ProtocolEvent::FinalizedWavesAdmitted { waves } => {

@@ -129,16 +129,16 @@ pub const DOMAIN_STATE_PROVISION_BATCH: &[u8] = b"STATE_PROVISION_BATCH";
 #[must_use]
 pub fn state_provisions_message(provisions: &Provisions) -> Vec<u8> {
     let mut hasher = Hasher::new();
-    for tx in provisions.transactions.iter() {
+    for tx in provisions.transactions().iter() {
         hasher.update(tx.tx_hash.as_bytes());
     }
     let tx_digest = hasher.finalize();
 
     let mut message = Vec::with_capacity(96);
     message.extend_from_slice(DOMAIN_STATE_PROVISION_BATCH);
-    message.extend_from_slice(&provisions.source_shard.to_le_bytes());
-    message.extend_from_slice(&provisions.target_shard.to_le_bytes());
-    message.extend_from_slice(&provisions.block_height.to_le_bytes());
+    message.extend_from_slice(&provisions.source_shard().to_le_bytes());
+    message.extend_from_slice(&provisions.target_shard().to_le_bytes());
+    message.extend_from_slice(&provisions.block_height().to_le_bytes());
     message.extend_from_slice(tx_digest.as_bytes());
     message
 }

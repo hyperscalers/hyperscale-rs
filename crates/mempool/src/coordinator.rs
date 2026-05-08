@@ -595,8 +595,8 @@ impl MempoolCoordinator {
         // for txs already in pool (gossip already won); per-(tx, source) dedup
         // is handled by `ExpectedTxs::record`.
         for provision in block.provisions() {
-            let source_shard = provision.source_shard;
-            for tx_entries in provision.transactions.iter() {
+            let source_shard = provision.source_shard();
+            for tx_entries in provision.transactions().iter() {
                 let tx_hash = tx_entries.tx_hash;
                 if self.pool.contains_key(&tx_hash) {
                     continue;

@@ -622,7 +622,7 @@ impl ExecutionCoordinator {
         // fully provisioned (execution can proceed) or its wave has already
         // dispatched (inert to mid-flight input).
         for provisions in &ordered {
-            let source_shard = provisions.source_shard;
+            let source_shard = provisions.source_shard();
             for conflict in self.provisioning.detect_conflicts(provisions, committed_ts) {
                 let loser = conflict.loser_tx;
                 if self.provisioning.is_fully_provisioned(&loser) {

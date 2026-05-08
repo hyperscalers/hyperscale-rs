@@ -150,10 +150,10 @@ impl ConflictDetector {
         provisions: &Provisions,
         committed_at: WeightedTimestamp,
     ) -> Vec<DetectedConflict> {
-        let source_shard = provisions.source_shard;
+        let source_shard = provisions.source_shard();
         let mut conflicts = Vec::new();
 
-        for tx_entry in provisions.transactions.iter() {
+        for tx_entry in provisions.transactions().iter() {
             let remote_tx = tx_entry.tx_hash;
             let source_nodes: HashSet<NodeId> = tx_entry.node_ids();
             let target_nodes: HashSet<NodeId> = tx_entry.target_nodes.iter().copied().collect();

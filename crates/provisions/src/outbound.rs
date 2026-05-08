@@ -95,7 +95,7 @@ impl OutboundProvisionTracker {
         }
 
         let tx_hashes: HashSet<TxHash> = provisions
-            .transactions
+            .transactions()
             .iter()
             .map(|tx| tx.tx_hash)
             .collect();
@@ -114,7 +114,7 @@ impl OutboundProvisionTracker {
             provision_hash,
             OutboundEntry {
                 target_shard,
-                source_block_height: provisions.block_height,
+                source_block_height: provisions.block_height(),
                 pending_txs: tx_hashes,
                 deadline: provisions.deadline(self.now),
             },
@@ -123,8 +123,8 @@ impl OutboundProvisionTracker {
         debug!(
             provision_hash = ?provision_hash,
             target_shard = target_shard.inner(),
-            source_block_height = provisions.block_height.inner(),
-            tx_count = provisions.transactions.len(),
+            source_block_height = provisions.block_height().inner(),
+            tx_count = provisions.transactions().len(),
             "Tracking outbound provisions"
         );
     }
