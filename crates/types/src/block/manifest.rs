@@ -100,14 +100,9 @@ impl BlockManifest {
 /// transactions and certificates using the stored hashes.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct BlockMetadata {
-    /// Block header (contains height, parent hash, proposer, etc.)
-    pub header: BlockHeader,
-
-    /// Block contents (transaction hashes, certificates, deferrals, etc.)
-    pub manifest: BlockManifest,
-
-    /// Quorum certificate that commits this block.
-    pub qc: QuorumCertificate,
+    header: BlockHeader,
+    manifest: BlockManifest,
+    qc: QuorumCertificate,
 }
 
 impl BlockMetadata {
@@ -119,6 +114,30 @@ impl BlockMetadata {
             manifest: BlockManifest::from_block(block),
             qc,
         }
+    }
+
+    /// Block header (contains height, parent hash, proposer, etc.)
+    #[must_use]
+    pub const fn header(&self) -> &BlockHeader {
+        &self.header
+    }
+
+    /// Block contents (transaction hashes, certificates, deferrals, etc.)
+    #[must_use]
+    pub const fn manifest(&self) -> &BlockManifest {
+        &self.manifest
+    }
+
+    /// Quorum certificate that commits this block.
+    #[must_use]
+    pub const fn qc(&self) -> &QuorumCertificate {
+        &self.qc
+    }
+
+    /// Consume the metadata and return its parts.
+    #[must_use]
+    pub fn into_parts(self) -> (BlockHeader, BlockManifest, QuorumCertificate) {
+        (self.header, self.manifest, self.qc)
     }
 
     /// Get block height.

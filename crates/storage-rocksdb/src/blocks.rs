@@ -169,12 +169,14 @@ impl RocksDbStorage {
         // 1. Get block metadata
         let metadata: BlockMetadata = get::<BlocksCf>(&*self.db, blocks_cf, &height.inner())?;
 
+        let (header, manifest, qc) = metadata.into_parts();
+
         // 2. Batch-fetch transactions (preserving order)
         let transactions =
-            self.get_transactions_batch_ordered(transactions_cf, metadata.manifest.tx_hashes());
+            self.get_transactions_batch_ordered(transactions_cf, manifest.tx_hashes());
 
         // Verify we got ALL transactions - return None if any are missing
-        let total_expected = metadata.manifest.transaction_count();
+        let total_expected = manifest.transaction_count();
         if transactions.len() != total_expected {
             tracing::warn!(
                 height = height.inner(),
@@ -186,14 +188,13 @@ impl RocksDbStorage {
         }
 
         // 3. Batch-fetch certificates (preserving order)
-        let certs =
-            self.get_certificates_batch_ordered(certificates_cf, metadata.manifest.cert_ids());
+        let certs = self.get_certificates_batch_ordered(certificates_cf, manifest.cert_ids());
 
         // Verify we got ALL certificates - return None if any are missing
-        if certs.len() != metadata.manifest.cert_ids().len() {
+        if certs.len() != manifest.cert_ids().len() {
             tracing::warn!(
                 height = height.inner(),
-                expected = metadata.manifest.cert_ids().len(),
+                expected = manifest.cert_ids().len(),
                 found = certs.len(),
                 "Block has missing certificates - cannot serve sync request"
             );
@@ -223,7 +224,7 @@ impl RocksDbStorage {
         // in-memory cache when a requester is still within the
         // execution window.
         let block = Block::Sealed {
-            header: metadata.header,
+            header,
             transactions: Arc::new(transactions.into()),
             certificates: Arc::new(certificates.into()),
         };
@@ -232,7 +233,7 @@ impl RocksDbStorage {
         record_storage_read(elapsed);
         record_storage_operation("get_block_denormalized", elapsed);
 
-        match CertifiedBlock::new_checked(block, metadata.qc) {
+        match CertifiedBlock::new_checked(block, qc) {
             Ok(certified) => Some(certified),
             Err(err) => {
                 tracing::error!(
@@ -288,13 +289,14 @@ impl RocksDbStorage {
 
         // 1. Get block metadata
         let metadata: BlockMetadata = get::<BlocksCf>(&*self.db, blocks_cf, &height.inner())?;
+        let (header, manifest, qc) = metadata.into_parts();
 
         // 2. Try to batch-fetch transactions (preserving order)
         let transactions =
-            self.get_transactions_batch_ordered(transactions_cf, metadata.manifest.tx_hashes());
+            self.get_transactions_batch_ordered(transactions_cf, manifest.tx_hashes());
 
         // Check if all transactions are present - if not, return None
-        let total_expected = metadata.manifest.transaction_count();
+        let total_expected = manifest.transaction_count();
         if transactions.len() != total_expected {
             tracing::debug!(
                 height = height.inner(),
@@ -308,14 +310,13 @@ impl RocksDbStorage {
         }
 
         // 3. Try to batch-fetch certificates (preserving order)
-        let certs =
-            self.get_certificates_batch_ordered(certificates_cf, metadata.manifest.cert_ids());
+        let certs = self.get_certificates_batch_ordered(certificates_cf, manifest.cert_ids());
 
         // Check if all certificates are present - if not, return None
-        if certs.len() != metadata.manifest.cert_ids().len() {
+        if certs.len() != manifest.cert_ids().len() {
             tracing::debug!(
                 height = height.inner(),
-                expected = metadata.manifest.cert_ids().len(),
+                expected = manifest.cert_ids().len(),
                 found = certs.len(),
                 "Block has missing certificates - cannot serve sync request"
             );
@@ -351,17 +352,17 @@ impl RocksDbStorage {
         // optionally upgrades to `Live` by attaching provisions from the
         // in-memory cache when the requester needs them.
         let block = Block::Sealed {
-            header: metadata.header,
+            header,
             transactions: Arc::new(transactions.into()),
             certificates: Arc::new(certificates.into()),
         };
-        let provision_hashes = metadata.manifest.provision_hashes().clone().into_inner();
+        let provision_hashes = manifest.provision_hashes().clone().into_inner();
 
         let elapsed = start.elapsed().as_secs_f64();
         record_storage_read(elapsed);
         record_storage_operation("get_block_for_sync_complete", elapsed);
 
-        Some((block, metadata.qc, provision_hashes))
+        Some((block, qc, provision_hashes))
     }
 
     /// Get multiple transactions by hash, preserving order.
