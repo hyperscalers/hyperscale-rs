@@ -514,7 +514,8 @@ impl ExecutionCoordinator {
             wave.record_receipt(result);
         }
         for wr in tx_outcomes {
-            wave.record_execution_result(wr.tx_hash, wr.outcome);
+            let (tx_hash, outcome) = wr.into_parts();
+            wave.record_execution_result(tx_hash, outcome);
         }
 
         // With local receipts in hand, the wave may have crossed into
@@ -1114,7 +1115,7 @@ impl ExecutionCoordinator {
             shard,
             ec_arc.block_height(),
             &ec_arc.wave_id,
-            ec_arc.tx_outcomes.iter().map(|o| o.tx_hash),
+            ec_arc.tx_outcomes.iter().map(TxOutcome::tx_hash),
             ec_arc.deadline(),
         );
         if cleared {
@@ -1618,12 +1619,12 @@ impl ExecutionCoordinator {
             if outcome.is_aborted() {
                 continue;
             }
-            if let Some(receipt) = wave.take_receipt(&outcome.tx_hash) {
+            if let Some(receipt) = wave.take_receipt(&outcome.tx_hash()) {
                 receipts.push(receipt);
             } else {
                 tracing::error!(
                     wave = %wave_id,
-                    tx_hash = ?outcome.tx_hash,
+                    tx_hash = ?outcome.tx_hash(),
                     "finalize_wave: non-aborted tx is missing its stored receipt \
                      (is_complete gate bypassed)"
                 );
@@ -2851,10 +2852,10 @@ mod tests {
             wave_id,
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
-            vec![TxOutcome {
-                tx_hash: TxHash::from_raw(Hash::from_bytes(b"untracked_tx")),
-                outcome: ExecutionOutcome::Aborted,
-            }],
+            vec![TxOutcome::new(
+                TxHash::from_raw(Hash::from_bytes(b"untracked_tx")),
+                ExecutionOutcome::Aborted,
+            )],
             zero_bls_signature(),
             SignerBitfield::new(4),
         );
@@ -3009,11 +3010,13 @@ mod tests {
         let tx_hashes: Vec<TxHash> = wave.tx_hashes().to_vec();
         let tx_outcomes: Vec<TxOutcome> = tx_hashes
             .iter()
-            .map(|h| TxOutcome {
-                tx_hash: *h,
-                outcome: ExecutionOutcome::Succeeded {
-                    receipt_hash: GlobalReceiptHash::ZERO,
-                },
+            .map(|h| {
+                TxOutcome::new(
+                    *h,
+                    ExecutionOutcome::Succeeded {
+                        receipt_hash: GlobalReceiptHash::ZERO,
+                    },
+                )
             })
             .collect();
         for h in &tx_hashes {

@@ -267,12 +267,12 @@ mod tests {
     }
 
     fn make_tx_outcome(tx: TxHash) -> TxOutcome {
-        TxOutcome {
-            tx_hash: tx,
-            outcome: ExecutionOutcome::Succeeded {
+        TxOutcome::new(
+            tx,
+            ExecutionOutcome::Succeeded {
                 receipt_hash: GlobalReceiptHash::ZERO,
             },
-        }
+        )
     }
 
     fn make_ec(wave_id: WaveId, tx_hashes: &[TxHash]) -> Arc<ExecutionCertificate> {

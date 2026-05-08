@@ -120,14 +120,14 @@ mod tests {
                 ),
                 WeightedTimestamp::from_millis(11),
                 GlobalReceiptRoot::from_raw(Hash::from_bytes(&[seed + 100; 4])),
-                vec![TxOutcome {
-                    tx_hash: TxHash::from_raw(Hash::from_bytes(&[seed; 4])),
-                    outcome: ExecutionOutcome::Succeeded {
+                vec![TxOutcome::new(
+                    TxHash::from_raw(Hash::from_bytes(&[seed; 4])),
+                    ExecutionOutcome::Succeeded {
                         receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(
                             &[seed + 50; 4],
                         )),
                     },
-                }],
+                )],
                 Bls12381G2Signature([0u8; 96]),
                 SignerBitfield::new(4),
             ));
@@ -157,12 +157,12 @@ mod tests {
             WaveId::new(ShardGroupId::new(0), BlockHeight::new(10), BTreeSet::new()),
             WeightedTimestamp::from_millis(11),
             GlobalReceiptRoot::from_raw(Hash::from_bytes(b"receipt")),
-            vec![TxOutcome {
-                tx_hash: TxHash::from_raw(Hash::from_bytes(b"tx1")),
-                outcome: ExecutionOutcome::Succeeded {
+            vec![TxOutcome::new(
+                TxHash::from_raw(Hash::from_bytes(b"tx1")),
+                ExecutionOutcome::Succeeded {
                     receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(b"rh")),
                 },
-            }],
+            )],
             Bls12381G2Signature([0u8; 96]),
             SignerBitfield::new(4),
         ));

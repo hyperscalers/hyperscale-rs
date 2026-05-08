@@ -76,12 +76,12 @@ mod tests {
     }
 
     fn make_outcome(seed: u8) -> TxOutcome {
-        TxOutcome {
-            tx_hash: TxHash::from_raw(Hash::from_bytes(&[seed; 4])),
-            outcome: ExecutionOutcome::Succeeded {
+        TxOutcome::new(
+            TxHash::from_raw(Hash::from_bytes(&[seed; 4])),
+            ExecutionOutcome::Succeeded {
                 receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(&[seed + 100; 4])),
             },
-        }
+        )
     }
 
     fn make_wave_id(shard: u64, height: BlockHeight, remote: &[u64]) -> WaveId {
@@ -241,31 +241,31 @@ mod tests {
 
     #[test]
     fn test_tx_outcome_leaf_success_matters() {
-        let success = TxOutcome {
-            tx_hash: TxHash::from_raw(Hash::from_bytes(b"tx")),
-            outcome: ExecutionOutcome::Succeeded {
+        let success = TxOutcome::new(
+            TxHash::from_raw(Hash::from_bytes(b"tx")),
+            ExecutionOutcome::Succeeded {
                 receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(b"receipt")),
             },
-        };
-        let failure = TxOutcome {
-            tx_hash: TxHash::from_raw(Hash::from_bytes(b"tx")),
-            outcome: ExecutionOutcome::Failed,
-        };
+        );
+        let failure = TxOutcome::new(
+            TxHash::from_raw(Hash::from_bytes(b"tx")),
+            ExecutionOutcome::Failed,
+        );
         assert_ne!(tx_outcome_leaf(&success), tx_outcome_leaf(&failure));
     }
 
     #[test]
     fn test_tx_outcome_leaf_aborted_differs_from_executed() {
-        let executed = TxOutcome {
-            tx_hash: TxHash::from_raw(Hash::from_bytes(b"tx")),
-            outcome: ExecutionOutcome::Succeeded {
+        let executed = TxOutcome::new(
+            TxHash::from_raw(Hash::from_bytes(b"tx")),
+            ExecutionOutcome::Succeeded {
                 receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(b"receipt")),
             },
-        };
-        let aborted = TxOutcome {
-            tx_hash: TxHash::from_raw(Hash::from_bytes(b"tx")),
-            outcome: ExecutionOutcome::Aborted,
-        };
+        );
+        let aborted = TxOutcome::new(
+            TxHash::from_raw(Hash::from_bytes(b"tx")),
+            ExecutionOutcome::Aborted,
+        );
         assert_ne!(tx_outcome_leaf(&executed), tx_outcome_leaf(&aborted));
     }
 
@@ -641,18 +641,18 @@ mod tests {
         let tx_b = TxHash::from_raw(Hash::from_bytes(b"tx_b"));
 
         let outcomes = vec![
-            TxOutcome {
-                tx_hash: tx_a,
-                outcome: ExecutionOutcome::Succeeded {
+            TxOutcome::new(
+                tx_a,
+                ExecutionOutcome::Succeeded {
                     receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(b"r_a")),
                 },
-            },
-            TxOutcome {
-                tx_hash: tx_b,
-                outcome: ExecutionOutcome::Succeeded {
+            ),
+            TxOutcome::new(
+                tx_b,
+                ExecutionOutcome::Succeeded {
                     receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(b"r_b")),
                 },
-            },
+            ),
         ];
         let wc = Arc::new(WaveCertificate {
             wave_id: wave_id.clone(),
@@ -676,16 +676,13 @@ mod tests {
         let tx_b = TxHash::from_raw(Hash::from_bytes(b"tx_b_aborted"));
 
         let outcomes = vec![
-            TxOutcome {
-                tx_hash: tx_a,
-                outcome: ExecutionOutcome::Succeeded {
+            TxOutcome::new(
+                tx_a,
+                ExecutionOutcome::Succeeded {
                     receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(b"r_a")),
                 },
-            },
-            TxOutcome {
-                tx_hash: tx_b,
-                outcome: ExecutionOutcome::Aborted,
-            },
+            ),
+            TxOutcome::new(tx_b, ExecutionOutcome::Aborted),
         ];
         let wc = Arc::new(WaveCertificate {
             wave_id: wave_id.clone(),
@@ -712,12 +709,12 @@ mod tests {
         let wave_id = make_wave_id(0, BlockHeight::new(42), &[1]);
         let tx_a = TxHash::from_raw(Hash::from_bytes(b"tx_a"));
 
-        let outcomes = vec![TxOutcome {
-            tx_hash: tx_a,
-            outcome: ExecutionOutcome::Succeeded {
+        let outcomes = vec![TxOutcome::new(
+            tx_a,
+            ExecutionOutcome::Succeeded {
                 receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(b"r_a")),
             },
-        }];
+        )];
         let wc = Arc::new(WaveCertificate {
             wave_id: wave_id.clone(),
             execution_certificates: vec![make_local_ec(&wave_id, outcomes)],
@@ -736,10 +733,10 @@ mod tests {
         let remote_wave_id = make_wave_id(1, BlockHeight::new(42), &[0]);
         let remote_ec = make_local_ec(
             &remote_wave_id,
-            vec![TxOutcome {
-                tx_hash: TxHash::from_raw(Hash::from_bytes(b"tx")),
-                outcome: ExecutionOutcome::Aborted,
-            }],
+            vec![TxOutcome::new(
+                TxHash::from_raw(Hash::from_bytes(b"tx")),
+                ExecutionOutcome::Aborted,
+            )],
         );
         let wc = Arc::new(WaveCertificate {
             wave_id,
@@ -758,20 +755,14 @@ mod tests {
         let tx_c = TxHash::from_raw(Hash::from_bytes(b"tx_c_fail"));
 
         let outcomes = vec![
-            TxOutcome {
-                tx_hash: tx_a,
-                outcome: ExecutionOutcome::Succeeded {
+            TxOutcome::new(
+                tx_a,
+                ExecutionOutcome::Succeeded {
                     receipt_hash: GlobalReceiptHash::ZERO,
                 },
-            },
-            TxOutcome {
-                tx_hash: tx_b,
-                outcome: ExecutionOutcome::Aborted,
-            },
-            TxOutcome {
-                tx_hash: tx_c,
-                outcome: ExecutionOutcome::Failed,
-            },
+            ),
+            TxOutcome::new(tx_b, ExecutionOutcome::Aborted),
+            TxOutcome::new(tx_c, ExecutionOutcome::Failed),
         ];
         let fw = FinalizedWave {
             certificate: Arc::new(WaveCertificate {
@@ -804,12 +795,12 @@ mod tests {
         // EC says Succeeded, receipt says Failed.
         let wave_id = make_wave_id(0, BlockHeight::new(42), &[1]);
         let tx_a = TxHash::from_raw(Hash::from_bytes(b"tx_a"));
-        let outcomes = vec![TxOutcome {
-            tx_hash: tx_a,
-            outcome: ExecutionOutcome::Succeeded {
+        let outcomes = vec![TxOutcome::new(
+            tx_a,
+            ExecutionOutcome::Succeeded {
                 receipt_hash: GlobalReceiptHash::ZERO,
             },
-        }];
+        )];
         let fw = FinalizedWave {
             certificate: Arc::new(WaveCertificate {
                 wave_id: wave_id.clone(),
@@ -833,10 +824,7 @@ mod tests {
         // EC says Failed, receipt says Succeeded.
         let wave_id = make_wave_id(0, BlockHeight::new(42), &[1]);
         let tx_a = TxHash::from_raw(Hash::from_bytes(b"tx_a"));
-        let outcomes = vec![TxOutcome {
-            tx_hash: tx_a,
-            outcome: ExecutionOutcome::Failed,
-        }];
+        let outcomes = vec![TxOutcome::new(tx_a, ExecutionOutcome::Failed)];
         let fw = FinalizedWave {
             certificate: Arc::new(WaveCertificate {
                 wave_id: wave_id.clone(),
@@ -866,12 +854,12 @@ mod tests {
         let tx_a = TxHash::from_raw(Hash::from_bytes(b"tx_a"));
         let ec_hash = GlobalReceiptHash::from_raw(Hash::from_bytes(b"ec"));
         let receipt_hash = GlobalReceiptHash::from_raw(Hash::from_bytes(b"receipt"));
-        let outcomes = vec![TxOutcome {
-            tx_hash: tx_a,
-            outcome: ExecutionOutcome::Succeeded {
+        let outcomes = vec![TxOutcome::new(
+            tx_a,
+            ExecutionOutcome::Succeeded {
                 receipt_hash: ec_hash,
             },
-        }];
+        )];
         let fw = FinalizedWave {
             certificate: Arc::new(WaveCertificate {
                 wave_id: wave_id.clone(),
@@ -899,12 +887,12 @@ mod tests {
     fn validate_rejects_missing_receipt() {
         let wave_id = make_wave_id(0, BlockHeight::new(42), &[1]);
         let tx_a = TxHash::from_raw(Hash::from_bytes(b"tx_a"));
-        let outcomes = vec![TxOutcome {
-            tx_hash: tx_a,
-            outcome: ExecutionOutcome::Succeeded {
+        let outcomes = vec![TxOutcome::new(
+            tx_a,
+            ExecutionOutcome::Succeeded {
                 receipt_hash: GlobalReceiptHash::ZERO,
             },
-        }];
+        )];
         let fw = FinalizedWave {
             certificate: Arc::new(WaveCertificate {
                 wave_id: wave_id.clone(),
@@ -922,10 +910,7 @@ mod tests {
     fn validate_rejects_extra_receipt() {
         let wave_id = make_wave_id(0, BlockHeight::new(42), &[1]);
         let tx_a = TxHash::from_raw(Hash::from_bytes(b"tx_a"));
-        let outcomes = vec![TxOutcome {
-            tx_hash: tx_a,
-            outcome: ExecutionOutcome::Aborted,
-        }];
+        let outcomes = vec![TxOutcome::new(tx_a, ExecutionOutcome::Aborted)];
         let fw = FinalizedWave {
             certificate: Arc::new(WaveCertificate {
                 wave_id: wave_id.clone(),
@@ -953,12 +938,12 @@ mod tests {
         let wave_id = make_wave_id(0, BlockHeight::new(42), &[1]);
         let tx_a = TxHash::from_raw(Hash::from_bytes(b"tx_a"));
         let tx_b = TxHash::from_raw(Hash::from_bytes(b"tx_b"));
-        let outcomes = vec![TxOutcome {
-            tx_hash: tx_a,
-            outcome: ExecutionOutcome::Succeeded {
+        let outcomes = vec![TxOutcome::new(
+            tx_a,
+            ExecutionOutcome::Succeeded {
                 receipt_hash: GlobalReceiptHash::ZERO,
             },
-        }];
+        )];
         let fw = FinalizedWave {
             certificate: Arc::new(WaveCertificate {
                 wave_id: wave_id.clone(),
@@ -1002,10 +987,10 @@ mod tests {
     #[test]
     fn validate_all_aborted_wave_with_empty_receipts_passes() {
         let wave_id = make_wave_id(0, BlockHeight::new(42), &[1]);
-        let outcomes = vec![TxOutcome {
-            tx_hash: TxHash::from_raw(Hash::from_bytes(b"aborted")),
-            outcome: ExecutionOutcome::Aborted,
-        }];
+        let outcomes = vec![TxOutcome::new(
+            TxHash::from_raw(Hash::from_bytes(b"aborted")),
+            ExecutionOutcome::Aborted,
+        )];
         let fw = FinalizedWave {
             certificate: Arc::new(WaveCertificate {
                 wave_id: wave_id.clone(),

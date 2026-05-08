@@ -528,12 +528,12 @@ mod tests {
     }
 
     fn outcome(tx: TxHash) -> TxOutcome {
-        TxOutcome {
-            tx_hash: tx,
-            outcome: ExecutionOutcome::Succeeded {
+        TxOutcome::new(
+            tx,
+            ExecutionOutcome::Succeeded {
                 receipt_hash: GlobalReceiptHash::ZERO,
             },
-        }
+        )
     }
 
     fn signed_vote(

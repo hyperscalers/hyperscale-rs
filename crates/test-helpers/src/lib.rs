@@ -286,7 +286,7 @@ pub fn make_finalized_wave(
         wave_id.clone(),
         WeightedTimestamp::from_millis(block_height.inner() + 1),
         GlobalReceiptRoot::ZERO,
-        vec![TxOutcome { tx_hash, outcome }],
+        vec![TxOutcome::new(tx_hash, outcome)],
         Bls12381G2Signature([0u8; 96]),
         SignerBitfield::new(4),
     );

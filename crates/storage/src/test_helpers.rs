@@ -201,12 +201,12 @@ pub fn make_test_execution_certificate(
     seed: u8,
     block_height: BlockHeight,
 ) -> ExecutionCertificate {
-    let outcomes = vec![TxOutcome {
-        tx_hash: TxHash::from_raw(Hash::from_bytes(&[seed + 100; 32])),
-        outcome: ExecutionOutcome::Succeeded {
+    let outcomes = vec![TxOutcome::new(
+        TxHash::from_raw(Hash::from_bytes(&[seed + 100; 32])),
+        ExecutionOutcome::Succeeded {
             receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(&[seed + 150; 32])),
         },
-    }];
+    )];
     let global_receipt_root = compute_global_receipt_root(&outcomes);
     let mut remote_shards = BTreeSet::new();
     remote_shards.insert(ShardGroupId::new(u64::from(seed) + 1));

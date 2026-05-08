@@ -413,7 +413,7 @@ impl WaveState {
             return false;
         };
         local_ec.tx_outcomes.iter().all(|outcome| {
-            outcome.is_aborted() || self.execution_receipts.contains_key(&outcome.tx_hash)
+            outcome.is_aborted() || self.execution_receipts.contains_key(&outcome.tx_hash())
         })
     }
 
@@ -490,10 +490,7 @@ impl WaveState {
                         .cloned()
                         .expect("execution result must be present under provisioned branch")
                 };
-                TxOutcome {
-                    tx_hash: *tx_hash,
-                    outcome,
-                }
+                TxOutcome::new(*tx_hash, outcome)
             })
             .collect();
 
@@ -525,13 +522,13 @@ impl WaveState {
         let is_local = ec.wave_id == self.wave_id;
 
         for outcome in &ec.tx_outcomes {
-            if let Some(covered) = self.covered_shards.get_mut(&outcome.tx_hash) {
+            if let Some(covered) = self.covered_shards.get_mut(&outcome.tx_hash()) {
                 covered.insert(shard);
                 if outcome.is_aborted() {
-                    self.tracker_aborted.insert(outcome.tx_hash);
+                    self.tracker_aborted.insert(outcome.tx_hash());
                 }
-                if !matches!(outcome.outcome, ExecutionOutcome::Succeeded { .. }) {
-                    self.tx_has_failure.insert(outcome.tx_hash);
+                if !matches!(outcome.outcome(), ExecutionOutcome::Succeeded { .. }) {
+                    self.tx_has_failure.insert(outcome.tx_hash());
                 }
             }
         }
@@ -720,8 +717,8 @@ impl WaveState {
             .filter(|ec| ec.wave_id != self.wave_id)
             .filter(|ec| {
                 ec.tx_outcomes.iter().any(|outcome| {
-                    self.participating_shards.contains_key(&outcome.tx_hash)
-                        && !self.tracker_aborted.contains(&outcome.tx_hash)
+                    self.participating_shards.contains_key(&outcome.tx_hash())
+                        && !self.tracker_aborted.contains(&outcome.tx_hash())
                 })
             })
             .map(|ec| ec.wave_id.clone())
@@ -869,13 +866,15 @@ mod tests {
     ) -> Arc<ExecutionCertificate> {
         let outcomes: Vec<TxOutcome> = tx_hashes
             .iter()
-            .map(|h| TxOutcome {
-                tx_hash: *h,
-                outcome: if success {
-                    executed(true)
-                } else {
-                    ExecutionOutcome::Aborted
-                },
+            .map(|h| {
+                TxOutcome::new(
+                    *h,
+                    if success {
+                        executed(true)
+                    } else {
+                        ExecutionOutcome::Aborted
+                    },
+                )
             })
             .collect();
         let ec_wave_id = WaveId::new(
@@ -958,7 +957,7 @@ mod tests {
         assert!(
             outcomes
                 .iter()
-                .all(|o| matches!(o.outcome, ExecutionOutcome::Aborted))
+                .all(|o| matches!(o.outcome(), ExecutionOutcome::Aborted))
         );
     }
 
@@ -985,10 +984,10 @@ mod tests {
 
         let (_, _, outcomes) = w.build_vote_data(ts_for(WAVE_START + 3)).unwrap();
         assert!(matches!(
-            outcomes[0].outcome,
+            outcomes[0].outcome(),
             ExecutionOutcome::Succeeded { .. } | ExecutionOutcome::Failed
         ));
-        assert!(matches!(outcomes[1].outcome, ExecutionOutcome::Aborted));
+        assert!(matches!(outcomes[1].outcome(), ExecutionOutcome::Aborted));
     }
 
     #[test]
@@ -1133,10 +1132,7 @@ mod tests {
         let outcomes: Vec<TxOutcome> = w
             .tx_hashes()
             .iter()
-            .map(|h| TxOutcome {
-                tx_hash: *h,
-                outcome: executed(true),
-            })
+            .map(|h| TxOutcome::new(*h, executed(true)))
             .collect();
         let divergent_root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"divergent"));
         assert_ne!(local_root, divergent_root);
@@ -1195,10 +1191,7 @@ mod tests {
             w.wave_id().clone(),
             WeightedTimestamp::from_millis(WAVE_START.inner() + 1),
             ec_root,
-            vec![TxOutcome {
-                tx_hash: h0,
-                outcome: executed(true),
-            }],
+            vec![TxOutcome::new(h0, executed(true))],
             Bls12381G2Signature([0u8; 96]),
             SignerBitfield::new(4),
         ));
@@ -1253,7 +1246,7 @@ mod tests {
         // If record_abort had mutated, h0's outcome would have flipped to Aborted.
         let (_, _, outcomes) = w.build_vote_data(ts_for(WAVE_START + 2)).unwrap();
         assert!(matches!(
-            outcomes[0].outcome,
+            outcomes[0].outcome(),
             ExecutionOutcome::Succeeded { .. }
         ));
     }
@@ -1303,18 +1296,9 @@ mod tests {
 
         // Remote aborts h1, succeeds h0, h2
         let mut outcomes = vec![
-            TxOutcome {
-                tx_hash: h0,
-                outcome: executed(true),
-            },
-            TxOutcome {
-                tx_hash: h1,
-                outcome: ExecutionOutcome::Aborted,
-            },
-            TxOutcome {
-                tx_hash: h2,
-                outcome: executed(false),
-            },
+            TxOutcome::new(h0, executed(true)),
+            TxOutcome::new(h1, ExecutionOutcome::Aborted),
+            TxOutcome::new(h2, executed(false)),
         ];
         let ec_wave_id = WaveId::new(
             ShardGroupId::new(1),

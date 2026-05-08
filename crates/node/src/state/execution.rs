@@ -143,10 +143,7 @@ mod tests {
             ShardGroupId::new(1),
             remote_shards,
             BlockHeight::new(1),
-            vec![TxOutcome {
-                tx_hash: TxHash::ZERO,
-                outcome: ExecutionOutcome::Failed,
-            }],
+            vec![TxOutcome::new(TxHash::ZERO, ExecutionOutcome::Failed)],
         );
 
         let actions = node.handle(ProtocolEvent::ExecutionCertificateAdmitted { certificate: ec });

@@ -133,11 +133,13 @@ mod tests {
         let wave_id = make_wave_id(block_height);
         let tx_outcomes: Vec<TxOutcome> = tx_hashes
             .iter()
-            .map(|h| TxOutcome {
-                tx_hash: *h,
-                outcome: ExecutionOutcome::Succeeded {
-                    receipt_hash: GlobalReceiptHash::ZERO,
-                },
+            .map(|h| {
+                TxOutcome::new(
+                    *h,
+                    ExecutionOutcome::Succeeded {
+                        receipt_hash: GlobalReceiptHash::ZERO,
+                    },
+                )
             })
             .collect();
         let ec = ExecutionCertificate::new(

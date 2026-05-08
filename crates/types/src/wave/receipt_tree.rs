@@ -14,12 +14,12 @@ use crate::{
 /// The domain tags ensure the three variants can never collide.
 #[must_use]
 pub fn tx_outcome_leaf(outcome: &TxOutcome) -> Hash {
-    match &outcome.outcome {
+    match outcome.outcome() {
         ExecutionOutcome::Succeeded { receipt_hash } => {
-            Hash::from_parts(&[outcome.tx_hash.as_bytes(), receipt_hash.as_bytes()])
+            Hash::from_parts(&[outcome.tx_hash().as_bytes(), receipt_hash.as_bytes()])
         }
-        ExecutionOutcome::Failed => Hash::from_parts(&[outcome.tx_hash.as_bytes(), b"FAILED:"]),
-        ExecutionOutcome::Aborted => Hash::from_parts(&[outcome.tx_hash.as_bytes(), b"ABORTED:"]),
+        ExecutionOutcome::Failed => Hash::from_parts(&[outcome.tx_hash().as_bytes(), b"FAILED:"]),
+        ExecutionOutcome::Aborted => Hash::from_parts(&[outcome.tx_hash().as_bytes(), b"ABORTED:"]),
     }
 }
 

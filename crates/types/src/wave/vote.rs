@@ -135,12 +135,12 @@ mod tests {
     use crate::{ExecutionOutcome, GlobalReceiptHash, Hash, TxHash};
 
     fn sample_outcome(seed: u8) -> TxOutcome {
-        TxOutcome {
-            tx_hash: TxHash::from_raw(Hash::from_bytes(&[seed; 4])),
-            outcome: ExecutionOutcome::Succeeded {
+        TxOutcome::new(
+            TxHash::from_raw(Hash::from_bytes(&[seed; 4])),
+            ExecutionOutcome::Succeeded {
                 receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(&[seed + 1; 4])),
             },
-        }
+        )
     }
 
     fn sample_vote() -> ExecutionVote {

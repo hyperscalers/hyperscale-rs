@@ -432,16 +432,16 @@ mod tests {
             HEIGHT,
             std::collections::BTreeSet::new(),
         );
-        let outcome = TxOutcome {
+        let outcome = TxOutcome::new(
             tx_hash,
-            outcome: if success {
+            if success {
                 ExecutionOutcome::Succeeded {
                     receipt_hash: GlobalReceiptHash::ZERO,
                 }
             } else {
                 ExecutionOutcome::Failed
             },
-        };
+        );
         let ec = ExecutionCertificate::new(
             wave_id.clone(),
             WeightedTimestamp::from_millis(1),
@@ -607,12 +607,12 @@ mod tests {
             wave_id.clone(),
             WeightedTimestamp::from_millis(1),
             GlobalReceiptRoot::ZERO,
-            vec![TxOutcome {
+            vec![TxOutcome::new(
                 tx_hash,
-                outcome: ExecutionOutcome::Succeeded {
+                ExecutionOutcome::Succeeded {
                     receipt_hash: GlobalReceiptHash::ZERO,
                 },
-            }],
+            )],
             Bls12381G2Signature([0u8; 96]),
             SignerBitfield::new(4),
         );
