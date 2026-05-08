@@ -340,7 +340,7 @@ mod tests {
                 .expect("Should generate a transaction");
 
             // All writes should be on the target shard
-            for write in &tx.declared_writes {
+            for write in tx.declared_writes.iter() {
                 let write_shard = shard_for_node(write, num_shards);
                 assert_eq!(
                     write_shard, target_shard,

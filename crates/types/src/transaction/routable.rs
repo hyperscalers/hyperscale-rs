@@ -8,90 +8,109 @@ use radix_common::data::manifest::{manifest_decode, manifest_encode};
 use radix_transactions::model::{UserTransaction, ValidatedUserTransaction};
 use radix_transactions::validation::TransactionValidator;
 use sbor::prelude::*;
-use sbor::{
-    Categorize, Decode, DecodeError, Decoder, Describe, Encode, EncodeError, Encoder,
-    NoCustomTypeKind, NoCustomValueKind, RustTypeId, TypeData, TypeKind, ValueKind,
-};
 
-use crate::sbor_codec::{decode_bounded_bytes, decode_bounded_vec};
 use crate::{
-    Hash, MAX_DECLARED_NODES_PER_TX, MAX_TX_BYTES_LEN, NodeId, TimestampRange, TxHash,
-    shard_for_node,
+    BoundedBytes, BoundedVec, Hash, MAX_DECLARED_NODES_PER_TX, MAX_TX_BYTES_LEN, NodeId,
+    TimestampRange, TxHash, shard_for_node,
 };
 
 /// A transaction with routing information.
 ///
 /// Wraps a Radix `UserTransaction` with routing metadata for sharding.
+///
+/// `serialized_bytes` is the canonical wire form. The `transaction` view
+/// (a deserialized `UserTransaction`) is kept around because basic-SBOR
+/// can't reach into manifest-SBOR's custom value kinds — the bytes are
+/// the SBOR-universe bridge. Other cached fields (`hash`, `validated`,
+/// `cached_sbor`) are skipped on the wire and lazily populated from
+/// `serialized_bytes`.
+#[derive(BasicSbor)]
 pub struct RoutableTransaction {
-    /// The underlying Radix transaction.
-    transaction: UserTransaction,
+    /// Manifest-encoded `UserTransaction` bytes — the canonical wire form.
+    serialized_bytes: BoundedBytes<MAX_TX_BYTES_LEN>,
 
     /// `NodeIds` that this transaction reads from.
-    pub declared_reads: Vec<NodeId>,
+    pub declared_reads: BoundedVec<NodeId, MAX_DECLARED_NODES_PER_TX>,
 
     /// `NodeIds` that this transaction writes to.
-    pub declared_writes: Vec<NodeId>,
+    pub declared_writes: BoundedVec<NodeId, MAX_DECLARED_NODES_PER_TX>,
 
     /// Half-open `WeightedTimestamp` range during which this tx may be
     /// included in a block. Anchored on the parent QC's `weighted_timestamp`
     /// at every check site. Signer-chosen, chain-enforced.
     pub validity_range: TimestampRange,
 
-    /// Cached hash (computed on first access).
-    hash: Hash,
+    /// Deserialized `UserTransaction`, populated by `transaction()` on
+    /// first access via `manifest_decode(&serialized_bytes)`. `::new`
+    /// pre-populates from the input. Not on the wire.
+    #[sbor(skip)]
+    transaction: OnceLock<UserTransaction>,
 
-    /// Cached serialized transaction bytes.
-    ///
-    /// These are the SBOR-encoded bytes of the `UserTransaction`, captured during
-    /// construction or deserialization. This avoids redundant re-serialization when:
-    /// - Computing transaction merkle roots for block headers
-    /// - Re-encoding for network transmission
-    ///
-    /// The hash is computed from these bytes.
-    serialized_bytes: Vec<u8>,
+    /// Content hash, populated on first call to `hash()` via
+    /// `blake3(&serialized_bytes)`. `::new` pre-populates. Not on the
+    /// wire — recomputed at each end so a peer can't ship `(hash=X,
+    /// tx_bytes=Y)` and have us key the bogus body by X.
+    #[sbor(skip)]
+    hash: OnceLock<Hash>,
 
-    /// Cached validated transaction (computed on first validation).
-    /// This avoids re-validating signatures during execution.
-    /// Not serialized - reconstructed on demand.
-    /// Option because validation can theoretically fail (though shouldn't for RPC-validated txs).
+    /// Cached signature-validated transaction. Populated lazily by
+    /// `get_or_validate(validator)`. `Option` carries validation
+    /// success/failure (the latter shouldn't happen for RPC-validated
+    /// txs).
+    #[sbor(skip)]
     validated: OnceLock<Option<ValidatedUserTransaction>>,
 
-    /// Cached full SBOR encoding of this `RoutableTransaction`.
-    /// Set eagerly at construction/decode time so the commit thread
-    /// never re-encodes — the bytes are ready for `cf_put_raw`.
-    cached_sbor: Option<Vec<u8>>,
+    /// Pre-encoded SBOR bytes of the full `RoutableTransaction`,
+    /// populated lazily by `cached_sbor_bytes()`. Lets the commit thread
+    /// hand bytes to `cf_put_raw` without re-encoding.
+    #[sbor(skip)]
+    cached_sbor: OnceLock<Vec<u8>>,
 }
 
 // Manual PartialEq/Eq - compare by hash for efficiency
 impl PartialEq for RoutableTransaction {
     fn eq(&self, other: &Self) -> bool {
-        self.hash == other.hash
+        self.hash() == other.hash()
     }
 }
 
 impl Eq for RoutableTransaction {}
 
-// Manual Clone - OnceLock doesn't implement Clone, and we don't want to clone the cached value
+// Manual Clone - OnceLock doesn't implement Clone. Eagerly-populated
+// caches (`transaction`, `hash`) are copied if present so the clone
+// doesn't pay first-access cost twice.
 impl Clone for RoutableTransaction {
     fn clone(&self) -> Self {
+        let transaction = OnceLock::new();
+        if let Some(t) = self.transaction.get() {
+            let _ = transaction.set(t.clone());
+        }
+        let hash = OnceLock::new();
+        if let Some(h) = self.hash.get() {
+            let _ = hash.set(*h);
+        }
+        let cached_sbor = OnceLock::new();
+        if let Some(b) = self.cached_sbor.get() {
+            let _ = cached_sbor.set(b.clone());
+        }
         Self {
-            transaction: self.transaction.clone(),
+            serialized_bytes: self.serialized_bytes.clone(),
             declared_reads: self.declared_reads.clone(),
             declared_writes: self.declared_writes.clone(),
             validity_range: self.validity_range,
-            hash: self.hash,
-            serialized_bytes: self.serialized_bytes.clone(),
+            transaction,
+            hash,
             validated: OnceLock::new(),
-            cached_sbor: self.cached_sbor.clone(),
+            cached_sbor,
         }
     }
 }
 
-// Manual Debug - skip the validated field
+// Manual Debug — skip the validated and cached_sbor fields.
 impl Debug for RoutableTransaction {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("RoutableTransaction")
-            .field("hash", &self.hash)
+            .field("hash", &self.hash())
             .field("declared_reads", &self.declared_reads)
             .field("declared_writes", &self.declared_writes)
             .field("validity_range", &self.validity_range)
@@ -117,43 +136,69 @@ impl RoutableTransaction {
         declared_writes: Vec<NodeId>,
         validity_range: TimestampRange,
     ) -> Self {
-        // Serialize the transaction payload - we keep these bytes for:
-        // 1. Computing the hash (below)
-        // 2. Efficient re-encoding for network/merkle (via serialized_bytes())
         let payload = manifest_encode(&transaction).expect("transaction should be encodable");
-
-        // Hash the transaction payload directly
         let mut hasher = Hasher::new();
         hasher.update(&payload);
         let hash = Hash::from_hash_bytes(hasher.finalize().as_bytes());
 
-        let mut tx = Self {
-            transaction,
-            declared_reads,
-            declared_writes,
+        let tx_lock = OnceLock::new();
+        let _ = tx_lock.set(transaction);
+        let hash_lock = OnceLock::new();
+        let _ = hash_lock.set(hash);
+
+        Self {
+            serialized_bytes: payload.into(),
+            declared_reads: declared_reads.into(),
+            declared_writes: declared_writes.into(),
             validity_range,
-            hash,
-            serialized_bytes: payload,
+            transaction: tx_lock,
+            hash: hash_lock,
             validated: OnceLock::new(),
-            cached_sbor: None,
-        };
-        tx.populate_cached_sbor();
-        tx
+            cached_sbor: OnceLock::new(),
+        }
     }
 
     /// Get the transaction hash (content-addressed).
-    pub const fn hash(&self) -> TxHash {
-        TxHash::from_raw(self.hash)
+    ///
+    /// Computes `blake3(serialized_bytes)` on first call and caches the
+    /// result. `::new` pre-populates the cache.
+    pub fn hash(&self) -> TxHash {
+        TxHash::from_raw(*self.hash.get_or_init(|| {
+            let mut hasher = Hasher::new();
+            hasher.update(&self.serialized_bytes);
+            Hash::from_hash_bytes(hasher.finalize().as_bytes())
+        }))
     }
 
     /// Get a reference to the underlying Radix transaction.
-    pub const fn transaction(&self) -> &UserTransaction {
-        &self.transaction
+    ///
+    /// Decodes `serialized_bytes` via `manifest_decode` on first call.
+    /// `::new` pre-populates the cache.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `serialized_bytes` doesn't decode under `manifest_decode`.
+    /// Wire-decoded transactions are validated by callers (admission /
+    /// pre-vote) before this is invoked.
+    pub fn transaction(&self) -> &UserTransaction {
+        self.transaction.get_or_init(|| {
+            manifest_decode(&self.serialized_bytes)
+                .expect("RoutableTransaction.serialized_bytes failed manifest_decode")
+        })
     }
 
-    /// Consume self and return the underlying transaction.
+    /// Consume self and return the underlying transaction, decoding from
+    /// the cached bytes if no decoded form is available.
+    ///
+    /// # Panics
+    ///
+    /// Same conditions as [`Self::transaction`].
     pub fn into_transaction(self) -> UserTransaction {
-        self.transaction
+        // Force population, then take.
+        let _ = self.transaction();
+        self.transaction.into_inner().expect(
+            "transaction OnceLock populated by self.transaction() invocation immediately above",
+        )
     }
 
     /// Get or create a validated transaction.
@@ -169,7 +214,7 @@ impl RoutableTransaction {
     ) -> Option<&ValidatedUserTransaction> {
         self.validated
             .get_or_init(|| {
-                self.transaction
+                self.transaction()
                     .clone()
                     .prepare_and_validate(validator)
                     .ok()
@@ -184,29 +229,33 @@ impl RoutableTransaction {
 
     /// Get the cached serialized transaction bytes.
     ///
-    /// These are the SBOR-encoded bytes of the underlying `UserTransaction`,
-    /// captured during construction or deserialization. Use this for:
+    /// These are the manifest-encoded bytes of the underlying
+    /// `UserTransaction`. Use this for:
     /// - Computing transaction merkle roots (avoids re-serialization)
     /// - Network encoding (bytes are ready to use)
     pub fn serialized_bytes(&self) -> &[u8] {
         &self.serialized_bytes
     }
 
-    /// Get the transaction as SBOR-encoded bytes.
+    /// Get the transaction as manifest-encoded bytes.
     ///
-    /// This returns a clone of the cached serialized bytes. For read-only access,
-    /// prefer `serialized_bytes()` which returns a reference.
+    /// Returns a clone of the cached serialized bytes. For read-only access,
+    /// prefer `serialized_bytes()`.
     pub fn transaction_bytes(&self) -> Vec<u8> {
-        self.serialized_bytes.clone()
+        self.serialized_bytes.0.clone()
     }
 
     /// Pre-serialized SBOR bytes of the full `RoutableTransaction`.
+    /// Computed on first call and cached.
+    ///
+    /// # Panics
+    ///
+    /// Panics if SBOR encoding fails — that's a programmer error since
+    /// every field is `BasicSbor` and the type itself is closed.
     pub fn cached_sbor_bytes(&self) -> Option<&[u8]> {
-        self.cached_sbor.as_deref()
-    }
-
-    fn populate_cached_sbor(&mut self) {
-        self.cached_sbor = Some(basic_encode(self).expect("RoutableTransaction SBOR encode"));
+        Some(self.cached_sbor.get_or_init(|| {
+            basic_encode(self).expect("RoutableTransaction SBOR encode is infallible")
+        }))
     }
 
     /// Check if this transaction is cross-shard for the given number of shards.
@@ -230,91 +279,11 @@ impl RoutableTransaction {
     }
 }
 
-// ============================================================================
-// Manual SBOR implementation since UserTransaction uses ManifestSbor
-// ============================================================================
-
-impl<E: Encoder<NoCustomValueKind>> Encode<NoCustomValueKind, E> for RoutableTransaction {
-    fn encode_value_kind(&self, encoder: &mut E) -> Result<(), EncodeError> {
-        encoder.write_value_kind(ValueKind::Tuple)
-    }
-
-    fn encode_body(&self, encoder: &mut E) -> Result<(), EncodeError> {
-        // Hash is content-derived (blake3 over `serialized_bytes`); the
-        // decoder recomputes it. Sending the hash on the wire would let a
-        // peer ship `(hash=X, tx_bytes=Y)` and have us key the bogus body
-        // by X, diverging from any later re-hash from `tx_bytes`.
-        encoder.write_size(4)?;
-        encoder.encode(&self.serialized_bytes)?;
-        encoder.encode(&self.declared_reads)?;
-        encoder.encode(&self.declared_writes)?;
-        encoder.encode(&self.validity_range)?;
-        Ok(())
-    }
-}
-
-impl<D: Decoder<NoCustomValueKind>> Decode<NoCustomValueKind, D> for RoutableTransaction {
-    fn decode_body_with_value_kind(
-        decoder: &mut D,
-        value_kind: ValueKind<NoCustomValueKind>,
-    ) -> Result<Self, DecodeError> {
-        decoder.check_preloaded_value_kind(value_kind, ValueKind::Tuple)?;
-        let length = decoder.read_size()?;
-
-        if length != 4 {
-            return Err(DecodeError::UnexpectedSize {
-                expected: 4,
-                actual: length,
-            });
-        }
-
-        let tx_bytes = decode_bounded_bytes(decoder, MAX_TX_BYTES_LEN)?;
-        let transaction: UserTransaction =
-            manifest_decode(&tx_bytes).map_err(|_| DecodeError::InvalidCustomValue)?;
-        let declared_reads = decode_bounded_vec::<_, NodeId>(decoder, MAX_DECLARED_NODES_PER_TX)?;
-        let declared_writes = decode_bounded_vec::<_, NodeId>(decoder, MAX_DECLARED_NODES_PER_TX)?;
-        let validity_range: TimestampRange = decoder.decode()?;
-
-        // Recompute the hash from `tx_bytes` — it's content-derived and
-        // must not be trusted from the wire (see Encode::encode_body).
-        let mut hasher = Hasher::new();
-        hasher.update(&tx_bytes);
-        let hash = Hash::from_hash_bytes(hasher.finalize().as_bytes());
-
-        let mut tx = Self {
-            hash,
-            transaction,
-            declared_reads,
-            declared_writes,
-            validity_range,
-            serialized_bytes: tx_bytes,
-            validated: OnceLock::new(),
-            cached_sbor: None,
-        };
-        tx.populate_cached_sbor();
-        Ok(tx)
-    }
-}
-
-impl Categorize<NoCustomValueKind> for RoutableTransaction {
-    fn value_kind() -> ValueKind<NoCustomValueKind> {
-        ValueKind::Tuple
-    }
-}
-
-impl Describe<NoCustomTypeKind> for RoutableTransaction {
-    const TYPE_ID: RustTypeId = RustTypeId::novel_with_code("RoutableTransaction", &[], &[]);
-
-    fn type_data() -> TypeData<NoCustomTypeKind, RustTypeId> {
-        TypeData::unnamed(TypeKind::Any)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use sbor::{
-        BASIC_SBOR_V1_MAX_DEPTH, BASIC_SBOR_V1_PAYLOAD_PREFIX, VecEncoder, basic_decode,
-        basic_encode,
+        BASIC_SBOR_V1_MAX_DEPTH, BASIC_SBOR_V1_PAYLOAD_PREFIX, Categorize as _, DecodeError,
+        Encoder as _, NoCustomValueKind, ValueKind, VecEncoder, basic_decode, basic_encode,
     };
 
     use super::*;
@@ -332,9 +301,8 @@ mod tests {
 
     #[test]
     fn decoded_hash_is_blake3_of_tx_bytes_not_wire_value() {
-        // Hand-roll a 4-field payload where field 0 (tx_bytes) is the real
-        // tx, and confirm the decoded hash matches blake3(tx_bytes) — i.e.
-        // there is no wire field a peer could populate to spoof the hash.
+        // The hash isn't on the wire; decode pulls only `serialized_bytes`
+        // and the lazy `hash()` call computes blake3 over those bytes.
         let tx = test_transaction_with_nodes(&[7, 8, 9], vec![test_node(3)], vec![test_node(4)]);
         let bytes = basic_encode(&tx).unwrap();
         let decoded: RoutableTransaction = basic_decode(&bytes).unwrap();
@@ -347,8 +315,8 @@ mod tests {
     #[test]
     fn decode_rejects_oversized_tx_bytes() {
         // Hand-roll a 4-field payload whose `tx_bytes` length prefix
-        // exceeds MAX_TX_BYTES_LEN. The decoder must error before the
-        // SBOR fast path attempts a Vec::with_capacity(huge_len).
+        // exceeds MAX_TX_BYTES_LEN. The `BoundedBytes` decoder must
+        // error before allocating the full Vec.
         let mut buf = Vec::with_capacity(32);
         {
             let mut enc = VecEncoder::<NoCustomValueKind>::new(&mut buf, BASIC_SBOR_V1_MAX_DEPTH);
@@ -356,7 +324,6 @@ mod tests {
                 .unwrap();
             enc.write_value_kind(ValueKind::Tuple).unwrap();
             enc.write_size(4).unwrap();
-            // tx_bytes prefix: Array<U8> with claimed_len = MAX + 1.
             enc.write_value_kind(ValueKind::Array).unwrap();
             enc.write_value_kind(ValueKind::U8).unwrap();
             enc.write_size(MAX_TX_BYTES_LEN + 1).unwrap();
@@ -373,7 +340,7 @@ mod tests {
     fn decode_rejects_oversized_declared_reads() {
         // Hand-roll a 4-field payload: a real (decodable) tx_bytes
         // followed by a declared_reads array whose length exceeds the
-        // cap. The cap fires before the loop attempts to consume any
+        // cap. The `BoundedVec` decoder fires before consuming any
         // element bytes.
         let real = test_transaction_with_nodes(&[1], vec![test_node(1)], vec![test_node(1)]);
         let mut buf = Vec::with_capacity(real.serialized_bytes().len() + 16);

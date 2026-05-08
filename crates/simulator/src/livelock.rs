@@ -263,7 +263,7 @@ impl LivelockAnalyzer {
         // Build address contention map
         let mut address_contention: HashMap<NodeId, Vec<TxHash>> = HashMap::new();
         for tx in &self.stuck_transactions {
-            for addr in &tx.transaction.declared_writes {
+            for addr in tx.transaction.declared_writes.iter() {
                 address_contention.entry(*addr).or_default().push(tx.hash);
             }
         }
