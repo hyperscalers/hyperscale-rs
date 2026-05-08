@@ -10,12 +10,11 @@ use hyperscale_core::{
     Action, ActionContext, NodeInput, PreparedBlock, ProtocolEvent, VerificationKind,
 };
 use hyperscale_engine::Engine;
-use hyperscale_messages::{
-    BlockHeaderNotification, BlockVoteNotification, CommittedBlockHeaderGossip,
-};
 use hyperscale_metrics::record_signature_verification_latency;
 use hyperscale_network::Network;
 use hyperscale_storage::{ChainWriter, JmtSnapshot, Storage, SubstateStore};
+use hyperscale_types::network::gossip::CommittedBlockHeaderGossip;
+use hyperscale_types::network::notification::{BlockHeaderNotification, BlockVoteNotification};
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, BlockVote, Bls12381G1PublicKey,
     Bls12381G2Signature, CertificateRoot, ConsensusReceipt, FinalizedWave, Hash, InFlightCount,

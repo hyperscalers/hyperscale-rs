@@ -15,10 +15,12 @@ use hyperscale_core::{
     Action, ActionContext, CrossShardExecutionRequest, NodeInput, ProtocolEvent,
 };
 use hyperscale_engine::Engine;
-use hyperscale_messages::{ExecutionCertificatesNotification, ExecutionVotesNotification};
 use hyperscale_metrics::record_execution_latency;
 use hyperscale_network::Network;
 use hyperscale_storage::{Storage, SubstateStore, SubstateView};
+use hyperscale_types::network::notification::{
+    ExecutionCertificatesNotification, ExecutionVotesNotification,
+};
 use hyperscale_types::{
     BlockHash, Bls12381G1PublicKey, Bls12381G2Signature, ExecutionCertificate, ExecutionVote,
     GlobalReceiptRoot, RoutableTransaction, SignerBitfield, StateProvision, StateRoot,

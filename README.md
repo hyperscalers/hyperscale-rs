@@ -18,7 +18,6 @@ Rust implementation of Hyperscale consensus protocol.
 |-------|---------|
 | `hyperscale-types` | Core types: hashes, blocks, votes, QCs, keys, transactions, topology |
 | `hyperscale-core` | The `StateMachine` and `SubStateMachine` traits that everything implements |
-| `hyperscale-messages` | Network message serialization (SBOR encoding) |
 | `hyperscale-bft` | BFT consensus: block proposal, voting, QC formation, view changes |
 | `hyperscale-execution` | Transaction execution with cross-shard coordination |
 | `hyperscale-mempool` | Transaction pool management |

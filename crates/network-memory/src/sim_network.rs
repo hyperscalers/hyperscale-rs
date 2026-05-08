@@ -251,7 +251,7 @@ impl Network for SimNetworkAdapter {
 mod tests {
     use std::sync::Mutex as StdMutex;
 
-    use hyperscale_messages::TransactionGossip;
+    use hyperscale_types::network::gossip::TransactionGossip;
     use hyperscale_types::test_utils::{test_node, test_transaction_with_nodes};
     use hyperscale_types::{BlockHeight, ShardGroupId};
 
@@ -312,8 +312,8 @@ mod tests {
 
     #[test]
     fn test_register_request_handler() {
-        use hyperscale_messages::request::GetBlockRequest;
-        use hyperscale_messages::response::GetBlockResponse;
+        use hyperscale_types::network::request::GetBlockRequest;
+        use hyperscale_types::network::response::GetBlockResponse;
 
         let registry = Arc::new(HandlerRegistry::new());
         let adapter = SimNetworkAdapter::new(registry.clone());
@@ -325,8 +325,8 @@ mod tests {
 
     #[test]
     fn test_register_request_handler_overwrites() {
-        use hyperscale_messages::request::GetBlockRequest;
-        use hyperscale_messages::response::GetBlockResponse;
+        use hyperscale_types::network::request::GetBlockRequest;
+        use hyperscale_types::network::response::GetBlockResponse;
 
         let adapter = SimNetworkAdapter::default();
 
@@ -344,7 +344,7 @@ mod tests {
 
     #[test]
     fn test_request_creates_pending_request() {
-        use hyperscale_messages::request::GetBlockRequest;
+        use hyperscale_types::network::request::GetBlockRequest;
 
         let adapter = SimNetworkAdapter::default();
         let preferred = Some(ValidatorId::new(7));
@@ -372,8 +372,8 @@ mod tests {
 
     #[test]
     fn test_request_callback_decodes_response() {
-        use hyperscale_messages::request::GetBlockRequest;
-        use hyperscale_messages::response::GetBlockResponse;
+        use hyperscale_types::network::request::GetBlockRequest;
+        use hyperscale_types::network::response::GetBlockResponse;
 
         let adapter = SimNetworkAdapter::default();
         let result: Arc<StdMutex<Option<Result<GetBlockResponse, RequestError>>>> =
@@ -406,8 +406,8 @@ mod tests {
 
     #[test]
     fn test_request_callback_propagates_error() {
-        use hyperscale_messages::request::GetBlockRequest;
-        use hyperscale_messages::response::GetBlockResponse;
+        use hyperscale_types::network::request::GetBlockRequest;
+        use hyperscale_types::network::response::GetBlockResponse;
 
         let adapter = SimNetworkAdapter::default();
         let result: Arc<StdMutex<Option<Result<GetBlockResponse, RequestError>>>> =

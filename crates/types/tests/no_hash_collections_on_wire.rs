@@ -4,9 +4,9 @@
 //! bytes across runs, and any merkle root or signature over the bytes
 //! diverges. Use `BTreeMap`/`BTreeSet` (or a sorted `Vec`) instead.
 //!
-//! The test scans `crates/types/src/` and `crates/messages/src/` (every
-//! wire type lives in one of those two), and considers a type "SBOR-encoded"
-//! if it either:
+//! The test scans `crates/types/src/` (every wire type in the workspace
+//! lives here, including the network message types under
+//! [`crate::network`]), and considers a type "SBOR-encoded" if it either:
 //! - derives one of `Encode`, `Decode`, `BasicEncode`, `BasicDecode`,
 //!   `BasicSbor`, or `Sbor`, **or**
 //! - has a manual `impl <SborTrait>` block in the same file.
@@ -50,10 +50,8 @@ fn no_hash_collections_in_wire_types() {
         .expect("CARGO_MANIFEST_DIR has a workspace root two levels up");
 
     let mut violations = Vec::new();
-    for crate_name in ["types", "messages"] {
-        let src = workspace_root.join("crates").join(crate_name).join("src");
-        scan_dir(&src, &mut violations);
-    }
+    let src = workspace_root.join("crates").join("types").join("src");
+    scan_dir(&src, &mut violations);
 
     assert!(
         violations.is_empty(),

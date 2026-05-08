@@ -3,9 +3,9 @@
 use std::sync::Arc;
 
 use hyperscale_engine::fetch_state_entries;
-use hyperscale_messages::request::GetProvisionsRequest;
-use hyperscale_messages::response::GetProvisionResponse;
 use hyperscale_storage::{ChainReader, SubstateStore};
+use hyperscale_types::network::request::GetProvisionsRequest;
+use hyperscale_types::network::response::GetProvisionResponse;
 use hyperscale_types::{
     MerkleInclusionProof, Provisions, ShardGroupId, StateEntry, TxEntries, TxHash, shard_for_node,
 };

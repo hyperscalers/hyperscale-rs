@@ -6,10 +6,10 @@
 //! [`MAX_REMOTE_HEADERS_PER_REQUEST`] and the local tip. The response
 //! short-caps on the first missing height rather than failing.
 
-use hyperscale_messages::request::{GetRemoteHeadersRequest, MAX_REMOTE_HEADERS_PER_REQUEST};
-use hyperscale_messages::response::GetRemoteHeadersResponse;
 use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_storage::ChainReader;
+use hyperscale_types::network::request::{GetRemoteHeadersRequest, MAX_REMOTE_HEADERS_PER_REQUEST};
+use hyperscale_types::network::response::GetRemoteHeadersResponse;
 use hyperscale_types::{BlockHeight, ShardGroupId};
 
 /// Serve an inbound remote-header range request.

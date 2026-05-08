@@ -14,6 +14,7 @@ mod block;
 pub mod certified;
 pub mod committed_header;
 pub mod header;
+pub mod inventory;
 pub mod limits;
 pub mod manifest;
 pub mod roots;

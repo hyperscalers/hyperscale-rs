@@ -3,21 +3,21 @@
 use hyperscale_core::{NodeInput, ProtocolEvent};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::Engine;
-use hyperscale_messages::request::{
-    GetExecutionCertsRequest, GetFinalizedWavesRequest, GetLocalProvisionsRequest,
-};
-use hyperscale_messages::response::{
-    GetExecutionCertsResponse, GetFinalizedWavesResponse, GetLocalProvisionsResponse,
-    GetProvisionResponse,
-};
-use hyperscale_messages::{
-    BlockHeaderNotification, BlockVoteNotification, CommittedBlockHeaderGossip,
-    ExecutionCertificatesNotification, ExecutionVotesNotification, ProvisionsNotification,
-    TransactionGossip,
-};
 use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_network::Network;
 use hyperscale_storage::Storage;
+use hyperscale_types::network::gossip::{CommittedBlockHeaderGossip, TransactionGossip};
+use hyperscale_types::network::notification::{
+    BlockHeaderNotification, BlockVoteNotification, ExecutionCertificatesNotification,
+    ExecutionVotesNotification, ProvisionsNotification,
+};
+use hyperscale_types::network::request::{
+    GetExecutionCertsRequest, GetFinalizedWavesRequest, GetLocalProvisionsRequest,
+};
+use hyperscale_types::network::response::{
+    GetExecutionCertsResponse, GetFinalizedWavesResponse, GetLocalProvisionsResponse,
+    GetProvisionResponse,
+};
 use hyperscale_types::{ExecutionCertificate, FinalizedWave, WaveId};
 use tracing::warn;
 
@@ -40,7 +40,7 @@ where
         use std::collections::HashMap;
         use std::sync::Arc;
 
-        use hyperscale_messages::request::{
+        use hyperscale_types::network::request::{
             GetBlockRequest, GetProvisionsRequest, GetRemoteHeadersRequest, GetTransactionsRequest,
         };
 

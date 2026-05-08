@@ -15,7 +15,7 @@
 //! any other workspace crates, making it the foundation layer.
 
 mod crypto;
-mod network;
+pub mod network;
 mod primitives;
 mod provisioning;
 mod sbor_codec;
@@ -33,6 +33,7 @@ mod wave;
 pub use block::certified::{CertifiedBlock, CertifiedBlockHashMismatch};
 pub use block::committed_header::CommittedBlockHeader;
 pub use block::header::BlockHeader;
+pub use block::inventory::{ElidedCertifiedBlock, Inventory, RehydrateError, RehydrationMiss};
 pub use block::limits::{
     MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK, MAX_TX_IN_FLIGHT, MAX_TXS_PER_BLOCK,
 };

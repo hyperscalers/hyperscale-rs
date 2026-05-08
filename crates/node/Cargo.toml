@@ -12,7 +12,6 @@ hyperscale-dispatch.workspace = true
 hyperscale-engine.workspace = true
 hyperscale-execution.workspace = true
 hyperscale-mempool.workspace = true
-hyperscale-messages.workspace = true
 hyperscale-network.workspace = true
 hyperscale-provisions.workspace = true
 hyperscale-remote-headers.workspace = true

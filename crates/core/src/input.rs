@@ -2,11 +2,10 @@
 
 use std::sync::Arc;
 
-use hyperscale_messages::response::ElidedCertifiedBlock;
 use hyperscale_types::{
     BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, CertifiedBlock, CommittedBlockHeader,
-    HeaderFetchCount, ProvisionHash, RoutableTransaction, ShardGroupId, TxHash, ValidatorId,
-    WaveId,
+    ElidedCertifiedBlock, HeaderFetchCount, ProvisionHash, RoutableTransaction, ShardGroupId,
+    TxHash, ValidatorId, WaveId,
 };
 
 use crate::ProtocolEvent;

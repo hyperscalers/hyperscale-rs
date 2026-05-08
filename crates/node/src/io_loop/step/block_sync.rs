@@ -35,17 +35,17 @@ pub(in crate::io_loop) const fn classify_fetch_error(err: &RequestError) -> Fetc
 }
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_engine::Engine;
-use hyperscale_messages::request::Inventory;
-use hyperscale_messages::response::{ElidedCertifiedBlock, GetBlockResponse, RehydrateError};
 use hyperscale_metrics::{
     record_sync_block_filtered, record_sync_response_error, record_sync_round_completed,
     record_sync_round_retried, record_sync_round_started,
 };
 use hyperscale_network::{Network, ResponseVerdict};
 use hyperscale_storage::Storage;
+use hyperscale_types::network::response::GetBlockResponse;
 use hyperscale_types::{
-    BlockHeight, CertifiedBlock, Hash, StoredReceipt, compute_certificate_root,
-    compute_local_receipt_root, compute_provision_root, compute_transaction_root,
+    BlockHeight, CertifiedBlock, ElidedCertifiedBlock, Hash, Inventory, RehydrateError,
+    StoredReceipt, compute_certificate_root, compute_local_receipt_root, compute_provision_root,
+    compute_transaction_root,
 };
 
 use crate::io_loop::IoLoop;
@@ -194,7 +194,7 @@ where
         height: BlockHeight,
         inventory_cache: &mut Option<Inventory>,
     ) {
-        use hyperscale_messages::request::GetBlockRequest;
+        use hyperscale_types::network::request::GetBlockRequest;
 
         let target_height = self.syncs.block.target(&()).unwrap_or(height);
         let force_full = self.syncs.block.force_full(height);

@@ -14,11 +14,11 @@ use hyperscale_core::{Action, ActionContext, NodeInput, ProtocolEvent, Provision
 use hyperscale_engine::sharding::expand_nodes_with_owned_at_height;
 use hyperscale_engine::{Engine, fetch_state_entries};
 use hyperscale_jmt::TreeReader as JmtTreeReader;
-use hyperscale_messages::ProvisionsNotification;
 use hyperscale_metrics::record_signature_verification_latency;
 use hyperscale_network::Network;
 use hyperscale_storage::tree::proofs::verify_proof;
 use hyperscale_storage::{Storage, SubstateStore, SubstateView, VersionedStore};
+use hyperscale_types::network::notification::ProvisionsNotification;
 use hyperscale_types::{
     BlockHeight, NodeId, Provisions, ShardGroupId, StateEntry, TxEntries, TxHash, ValidatorId,
     state_provisions_message,

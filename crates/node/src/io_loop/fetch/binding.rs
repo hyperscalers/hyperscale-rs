@@ -24,11 +24,11 @@ use std::sync::Arc;
 
 use crossbeam::channel::Sender;
 use hyperscale_core::{FetchOrigin, FetchPeers, NodeInput, ProtocolEvent};
-use hyperscale_messages::request::{
+use hyperscale_network::{Network, ResponseVerdict};
+use hyperscale_types::network::request::{
     GetExecutionCertsRequest, GetFinalizedWavesRequest, GetLocalProvisionsRequest,
     GetProvisionsRequest, GetTransactionsRequest,
 };
-use hyperscale_network::{Network, ResponseVerdict};
 use hyperscale_types::{BlockHeight, ProvisionHash, ShardGroupId, TxHash, WaveId};
 
 use super::Fetch;

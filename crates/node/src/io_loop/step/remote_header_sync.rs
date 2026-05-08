@@ -9,13 +9,13 @@
 use hyperscale_core::{FetchFailureKind, NodeInput, ProtocolEvent};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::Engine;
-use hyperscale_messages::request::GetRemoteHeadersRequest;
-use hyperscale_messages::response::GetRemoteHeadersResponse;
 use hyperscale_metrics::{
     record_sync_round_completed, record_sync_round_retried, record_sync_round_started,
 };
 use hyperscale_network::{Network, ResponseVerdict};
 use hyperscale_storage::Storage;
+use hyperscale_types::network::request::GetRemoteHeadersRequest;
+use hyperscale_types::network::response::GetRemoteHeadersResponse;
 use hyperscale_types::{
     BlockHeight, CommittedBlockHeader, HeaderFetchCount, ShardGroupId, ValidatorId,
 };

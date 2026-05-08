@@ -8,12 +8,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_messages::request::GetBlockRequest;
-use hyperscale_messages::response::{ElidedCertifiedBlock, GetBlockResponse};
 use hyperscale_metrics::record_sync_response_error;
 use hyperscale_provisions::ProvisionStore;
 use hyperscale_storage::{BlockForSync, ChainReader};
-use hyperscale_types::{Provisions, WAVE_TIMEOUT};
+use hyperscale_types::network::request::GetBlockRequest;
+use hyperscale_types::network::response::GetBlockResponse;
+use hyperscale_types::{ElidedCertifiedBlock, Provisions, WAVE_TIMEOUT};
 use tracing::trace;
 
 /// Retention margin beyond `WAVE_TIMEOUT` for the serve decision.

@@ -29,7 +29,6 @@ hyperscale-topology.workspace = true
 hyperscale-types.workspace = true
 hyperscale-network.workspace = true
 hyperscale-network-libp2p.workspace = true
-hyperscale-messages.workspace = true
 
 # Networking - libp2p (used directly by validator/keygen binaries for Multiaddr/PeerId)
 libp2p.workspace = true

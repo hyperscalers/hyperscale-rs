@@ -20,9 +20,9 @@ use std::sync::Arc;
 use hyperscale_core::{NodeInput, ProtocolEvent, StateMachine};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_engine::Engine;
-use hyperscale_messages::TransactionGossip;
 use hyperscale_network::Network;
 use hyperscale_storage::Storage;
+use hyperscale_types::network::gossip::TransactionGossip;
 use hyperscale_types::{RoutableTransaction, ShardGroupId, TxHash, shard_for_node};
 
 use crate::batch_accumulator::BatchAccumulator;

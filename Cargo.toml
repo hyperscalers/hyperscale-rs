@@ -9,7 +9,6 @@ members = [
     "crates/engine",
     "crates/execution",
     "crates/mempool",
-    "crates/messages",
     "crates/metrics",
     "crates/metrics-memory",
     "crates/metrics-prometheus",
@@ -50,7 +49,6 @@ hyperscale-engine = { path = "crates/engine" }
 hyperscale-execution = { path = "crates/execution" }
 hyperscale-jmt = { path = "crates/jmt", features = ["parallel"] }
 hyperscale-mempool = { path = "crates/mempool" }
-hyperscale-messages = { path = "crates/messages" }
 hyperscale-network = { path = "crates/network" }
 hyperscale-network-libp2p = { path = "crates/network-libp2p" }
 hyperscale-network-memory = { path = "crates/network-memory" }

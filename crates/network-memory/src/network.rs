@@ -1834,10 +1834,10 @@ mod tests {
 
     #[test]
     fn test_full_gossip_roundtrip() {
-        use hyperscale_messages::TransactionGossip;
         use hyperscale_network::GossipVerdict;
         use hyperscale_network::registry::RawGossipHandler;
         use hyperscale_types::ShardGroupId;
+        use hyperscale_types::network::gossip::TransactionGossip;
         use hyperscale_types::test_utils::{test_node, test_transaction_with_nodes};
 
         let mut network = SimulatedNetwork::new(NetworkConfig {

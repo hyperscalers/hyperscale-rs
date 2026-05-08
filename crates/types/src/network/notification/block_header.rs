@@ -1,0 +1,158 @@
+//! `BlockHeader` notification message.
+
+use sbor::prelude::BasicSbor;
+
+use crate::{
+    BlockHeader, BlockManifest, Bls12381G2Signature, MessageClass, NetworkMessage,
+    block_header_message,
+};
+
+/// Notifies committee members of a block proposal (header + manifest, not full block).
+/// Validators construct the full Block locally from header + mempool transactions.
+///
+/// The `proposer_signature` is a BLS signature by the proposer over a domain-separated
+/// message, ensuring that block proposals cannot be forged by non-proposers.
+#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
+pub struct BlockHeaderNotification {
+    /// The block header being proposed.
+    pub header: BlockHeader,
+
+    /// Block contents manifest (transaction hashes, certificates, deferrals, etc.)
+    pub manifest: BlockManifest,
+
+    /// BLS signature by the proposer over the domain-separated block header message.
+    /// Verifies that the claimed proposer actually created this proposal.
+    pub proposer_signature: Bls12381G2Signature,
+}
+
+impl BlockHeaderNotification {
+    /// Create a block header notification message.
+    #[must_use]
+    pub const fn new(
+        header: BlockHeader,
+        manifest: BlockManifest,
+        proposer_signature: Bls12381G2Signature,
+    ) -> Self {
+        Self {
+            header,
+            manifest,
+            proposer_signature,
+        }
+    }
+
+    /// Build the domain-separated signing message for this block header.
+    #[must_use]
+    pub fn signing_message(&self) -> Vec<u8> {
+        block_header_message(
+            self.header.shard_group_id,
+            self.header.height,
+            self.header.round,
+            &self.header.hash(),
+        )
+    }
+
+    /// Consume and return header, manifest, and proposer signature.
+    #[must_use]
+    pub fn into_parts(self) -> (BlockHeader, BlockManifest, Bls12381G2Signature) {
+        (self.header, self.manifest, self.proposer_signature)
+    }
+}
+
+// Network message implementation
+impl NetworkMessage for BlockHeaderNotification {
+    fn message_type_id() -> &'static str {
+        "block.header"
+    }
+
+    fn class() -> MessageClass {
+        MessageClass::Consensus
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        BlockHash, BlockHeight, BoundedBTreeMap, BoundedVec, CertificateRoot, Hash, InFlightCount,
+        LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round,
+        ShardGroupId, StateRoot, TransactionRoot, TxHash, ValidatorId,
+    };
+
+    fn make_header(height: BlockHeight) -> BlockHeader {
+        BlockHeader {
+            shard_group_id: ShardGroupId::new(0),
+            height,
+            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
+            parent_qc: QuorumCertificate::genesis(ShardGroupId::new(0)),
+            proposer: ValidatorId::new(0),
+            timestamp: ProposerTimestamp::from_millis(1_234_567_890),
+            round: Round::INITIAL,
+            is_fallback: false,
+            state_root: StateRoot::ZERO,
+            transaction_root: TransactionRoot::ZERO,
+            certificate_root: CertificateRoot::ZERO,
+            local_receipt_root: LocalReceiptRoot::ZERO,
+            provision_root: ProvisionsRoot::ZERO,
+            waves: BoundedVec::new(),
+            provision_tx_roots: BoundedBTreeMap::new(),
+            in_flight: InFlightCount::ZERO,
+        }
+    }
+
+    fn zero_sig() -> Bls12381G2Signature {
+        Bls12381G2Signature([0u8; Bls12381G2Signature::LENGTH])
+    }
+
+    #[test]
+    fn test_block_header_gossip_creation() {
+        let header = make_header(BlockHeight::new(1));
+        let manifest = BlockManifest {
+            tx_hashes: vec![
+                TxHash::from_raw(Hash::from_bytes(b"tx1")),
+                TxHash::from_raw(Hash::from_bytes(b"tx2")),
+                TxHash::from_raw(Hash::from_bytes(b"tx3")),
+                TxHash::from_raw(Hash::from_bytes(b"tx4")),
+            ]
+            .into(),
+            ..Default::default()
+        };
+
+        let gossip = BlockHeaderNotification::new(header.clone(), manifest.clone(), zero_sig());
+        assert_eq!(gossip.header, header);
+        assert_eq!(gossip.manifest, manifest);
+        assert_eq!(gossip.manifest.transaction_count(), 4);
+    }
+
+    #[test]
+    fn test_block_header_gossip_into_parts() {
+        let header = make_header(BlockHeight::new(5));
+        let manifest = BlockManifest {
+            tx_hashes: vec![TxHash::from_raw(Hash::from_bytes(b"tx1"))].into(),
+            ..Default::default()
+        };
+
+        let gossip = BlockHeaderNotification::new(header.clone(), manifest.clone(), zero_sig());
+        let (h, m, _sig) = gossip.into_parts();
+        assert_eq!(h, header);
+        assert_eq!(m, manifest);
+    }
+
+    #[test]
+    fn test_block_header_gossip_all_transaction_hashes() {
+        let tx1 = TxHash::from_raw(Hash::from_bytes(b"tx1"));
+        let tx2 = TxHash::from_raw(Hash::from_bytes(b"tx2"));
+        let tx3 = TxHash::from_raw(Hash::from_bytes(b"tx3"));
+
+        let gossip = BlockHeaderNotification::new(
+            make_header(BlockHeight::new(1)),
+            BlockManifest {
+                tx_hashes: vec![tx1, tx2, tx3].into(),
+                ..Default::default()
+            },
+            zero_sig(),
+        );
+
+        let all: Vec<TxHash> = gossip.manifest.tx_hashes.into_inner();
+        assert_eq!(all, vec![tx1, tx2, tx3]);
+    }
+}
