@@ -228,7 +228,7 @@ impl WaveState {
     /// Height of the wave-starting block (mirrors `wave_id.block_height`).
     #[must_use]
     pub const fn block_height(&self) -> BlockHeight {
-        self.wave_id.block_height
+        self.wave_id.block_height()
     }
 
     /// Transaction hashes in this wave, in block order.
@@ -685,7 +685,7 @@ impl WaveState {
         tracing::warn!(
             wave = %self.wave_id,
             block_hash = ?self.block_hash,
-            block_height = self.wave_id.block_height.inner(),
+            block_height = self.wave_id.block_height().inner(),
             wave_start_ts = self.wave_start_ts.as_millis(),
             committed_ts = committed_ts.as_millis(),
             age_ms = u64::try_from(age.as_millis()).unwrap_or(u64::MAX),
@@ -880,12 +880,12 @@ mod tests {
             .collect();
         let ec_wave_id = WaveId::new(
             ec_shard,
-            wave_id.block_height,
-            wave_id.remote_shards.0.clone(),
+            wave_id.block_height(),
+            wave_id.remote_shards().iter().copied().collect(),
         );
         Arc::new(ExecutionCertificate::new(
             ec_wave_id,
-            WeightedTimestamp::from_millis(wave_id.block_height.inner() + 1),
+            WeightedTimestamp::from_millis(wave_id.block_height().inner() + 1),
             GlobalReceiptRoot::from_raw(Hash::from_bytes(b"global_receipt_root")),
             outcomes,
             Bls12381G2Signature([0u8; 96]),
@@ -1285,7 +1285,7 @@ mod tests {
         let wc = w.create_wave_certificate();
         assert_eq!(wc.execution_certificates().len(), 1);
         assert_eq!(
-            wc.execution_certificates()[0].wave_id.shard_group_id,
+            wc.execution_certificates()[0].wave_id.shard_group_id(),
             ShardGroupId::new(0)
         );
     }
@@ -1318,12 +1318,12 @@ mod tests {
         ];
         let ec_wave_id = WaveId::new(
             ShardGroupId::new(1),
-            w.wave_id().block_height,
-            w.wave_id().remote_shards.0.clone(),
+            w.wave_id().block_height(),
+            w.wave_id().remote_shards().iter().copied().collect(),
         );
         let ec_remote = Arc::new(ExecutionCertificate::new(
             ec_wave_id,
-            WeightedTimestamp::from_millis(w.wave_id().block_height.inner() + 1),
+            WeightedTimestamp::from_millis(w.wave_id().block_height().inner() + 1),
             GlobalReceiptRoot::from_raw(Hash::from_bytes(b"gr")),
             std::mem::take(&mut outcomes),
             Bls12381G2Signature([0u8; 96]),

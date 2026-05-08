@@ -969,7 +969,7 @@ impl ExecutionCoordinator {
         // The wave_id IS the set of remote shards — no need to look up the
         // accumulator (which may have been pruned by the time the cert is
         // aggregated, especially with many shards where provision flow is slower).
-        let remote_shards: Vec<ShardGroupId> = wave_id.remote_shards.iter().copied().collect();
+        let remote_shards: Vec<ShardGroupId> = wave_id.remote_shards().iter().copied().collect();
 
         // Make the cert available to the io_loop's inbound EC fetch handler
         // for fallback serving until the containing block commits.
@@ -1168,7 +1168,7 @@ impl ExecutionCoordinator {
         let local_shard = topology.local_shard();
 
         for wave in waves {
-            if wave.remote_shards.contains(&local_shard) {
+            if wave.remote_shards().contains(&local_shard) {
                 self.expected_certs.register(
                     source_shard,
                     block_height,
@@ -1190,11 +1190,11 @@ impl ExecutionCoordinator {
         let mut actions = Vec::with_capacity(fetches.len());
         for (wave_id, is_retry) in fetches {
             let peers = topology
-                .committee_for_shard(wave_id.shard_group_id)
+                .committee_for_shard(wave_id.shard_group_id())
                 .to_vec();
             tracing::info!(
-                source_shard = wave_id.shard_group_id.inner(),
-                block_height = wave_id.block_height.inner(),
+                source_shard = wave_id.shard_group_id().inner(),
+                block_height = wave_id.block_height().inner(),
                 wave = %wave_id,
                 retry = is_retry,
                 "Execution cert timeout — requesting fallback"
@@ -1216,7 +1216,7 @@ impl ExecutionCoordinator {
         let shards_needed: HashSet<ShardGroupId> = self
             .waves
             .waves_iter()
-            .flat_map(|(wid, _)| wid.remote_shards.iter().copied())
+            .flat_map(|(wid, _)| wid.remote_shards().iter().copied())
             .filter(|s| *s != local_shard)
             .collect();
         self.expected_certs

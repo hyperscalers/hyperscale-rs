@@ -618,7 +618,7 @@ mod tests {
     fn make_local_ec(wave_id: &WaveId, outcomes: Vec<TxOutcome>) -> Arc<ExecutionCertificate> {
         Arc::new(ExecutionCertificate::new(
             wave_id.clone(),
-            WeightedTimestamp::from_millis(wave_id.block_height.inner() + 1),
+            WeightedTimestamp::from_millis(wave_id.block_height().inner() + 1),
             compute_global_receipt_root(&outcomes),
             outcomes,
             Bls12381G2Signature([0u8; 96]),

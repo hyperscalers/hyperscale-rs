@@ -332,8 +332,11 @@ pub fn test_ec_storage_batch(storage: &(impl ChainReader + ChainWriter)) {
     let batch = storage.get_execution_certificates_batch(&known);
     assert_eq!(batch.len(), 3);
 
-    let mut missing_wave_id = known[0].clone();
-    missing_wave_id.block_height = BlockHeight::new(999);
+    let missing_wave_id = WaveId::new(
+        known[0].shard_group_id(),
+        BlockHeight::new(999),
+        known[0].remote_shards().iter().copied().collect(),
+    );
     let partial = storage.get_execution_certificates_batch(&[ec3.wave_id.clone(), missing_wave_id]);
     assert_eq!(partial.len(), 1);
     assert_eq!(partial[0].wave_id, ec3.wave_id);

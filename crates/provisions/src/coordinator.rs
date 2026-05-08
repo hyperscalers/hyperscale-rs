@@ -357,7 +357,7 @@ impl ProvisionCoordinator {
             .header
             .waves
             .iter()
-            .any(|w| w.remote_shards.contains(&local_shard));
+            .any(|w| w.remote_shards().contains(&local_shard));
 
         if targets_us {
             // Store as verified (QC already checked by coordinator).

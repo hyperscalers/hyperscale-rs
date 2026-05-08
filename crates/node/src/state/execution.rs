@@ -79,7 +79,7 @@ impl NodeStateMachine {
                 // target shard's tx_outcomes acknowledge outbound batches we
                 // sent. Surface the ACK to the outbound tracker.
                 if certificate.shard_group_id() != local_shard
-                    && certificate.wave_id.remote_shards.contains(&local_shard)
+                    && certificate.wave_id.remote_shards().contains(&local_shard)
                 {
                     actions.push(Action::Continuation(ProtocolEvent::OutboundEcObserved {
                         target_shard: certificate.shard_group_id(),

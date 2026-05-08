@@ -301,7 +301,7 @@ mod tests {
         let msg = exec_vote_message(
             anchor_ts,
             &wave_id,
-            wave_id.shard_group_id,
+            wave_id.shard_group_id(),
             &global_receipt_root,
             u32::try_from(tx_outcomes.len()).unwrap_or(u32::MAX),
         );

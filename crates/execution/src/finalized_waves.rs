@@ -281,7 +281,7 @@ mod tests {
         let waves = store.all_waves();
         assert_eq!(waves.len(), 2);
         // BTreeMap iteration is ordered by key; lower block_height comes first.
-        assert_eq!(waves[0].certificate.wave_id.block_height.inner(), 1);
-        assert_eq!(waves[1].certificate.wave_id.block_height.inner(), 5);
+        assert_eq!(waves[0].certificate.wave_id.block_height().inner(), 1);
+        assert_eq!(waves[1].certificate.wave_id.block_height().inner(), 5);
     }
 }

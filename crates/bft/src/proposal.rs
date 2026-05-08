@@ -213,7 +213,7 @@ pub fn select_finalized_waves(
         .into_iter()
         .filter(|fw| !qc_chain_cert_ids.contains(fw.wave_id()))
         .collect();
-    candidate_waves.sort_by_key(|fw| (fw.wave_id().block_height, fw.wave_id().clone()));
+    candidate_waves.sort_by_key(|fw| (fw.wave_id().block_height(), fw.wave_id().clone()));
 
     let mut finalized_tx_count = 0usize;
     let waves_to_propose: Vec<_> = candidate_waves

@@ -160,7 +160,7 @@ impl ChainWriter for SimStorage {
                     let wave_id = cert.wave_id.clone();
                     c.certificates.insert(wave_id.clone(), (**cert).clone());
                     c.wave_certs_by_height
-                        .entry(wave_id.block_height)
+                        .entry(wave_id.block_height())
                         .or_default()
                         .push(wave_id);
                 }
@@ -258,7 +258,7 @@ impl SimStorage {
                 let wave_id = cert.wave_id.clone();
                 c.certificates.insert(wave_id.clone(), (**cert).clone());
                 c.wave_certs_by_height
-                    .entry(wave_id.block_height)
+                    .entry(wave_id.block_height())
                     .or_default()
                     .push(wave_id);
             }

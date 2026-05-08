@@ -175,7 +175,7 @@ impl BlockHeader {
     pub fn provision_targets(&self) -> Vec<ShardGroupId> {
         let mut set = BTreeSet::new();
         for wave in self.waves.iter() {
-            set.extend(wave.remote_shards.iter().copied());
+            set.extend(wave.remote_shards().iter().copied());
         }
         set.into_iter().collect()
     }

@@ -182,7 +182,7 @@ impl ExecutionCertificate {
     /// The shard that produced this certificate.
     #[must_use]
     pub const fn shard_group_id(&self) -> ShardGroupId {
-        self.wave_id.shard_group_id
+        self.wave_id.shard_group_id()
     }
 
     /// Deadline past which this certificate is provably useless on every shard.
@@ -199,7 +199,7 @@ impl ExecutionCertificate {
     /// Block height (the block containing the wave's transactions).
     #[must_use]
     pub const fn block_height(&self) -> BlockHeight {
-        self.wave_id.block_height
+        self.wave_id.block_height()
     }
 
     /// Pre-serialized SBOR bytes, if available.
