@@ -224,9 +224,10 @@ impl ProvisioningTracker {
 
     // ─── Accessors ──────────────────────────────────────────────────────
 
-    /// Borrow the verified-provisions map. Used by the coordinator when
-    /// passing it to `handlers::build_dispatch_action`, which needs a
-    /// per-tx lookup and doesn't care about the surrounding tracker state.
+    /// Borrow the verified-provisions map. Threaded into
+    /// [`WaveState::dispatch_if_ready`](crate::wave_state::WaveState::dispatch_if_ready)
+    /// so the wave can assemble cross-shard execution requests with a per-tx
+    /// lookup against committed provisions.
     pub const fn verified(&self) -> &HashMap<TxHash, Vec<Arc<Vec<SubstateEntry>>>> {
         &self.verified
     }

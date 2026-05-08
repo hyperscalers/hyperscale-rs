@@ -74,7 +74,7 @@ use crate::waves::{PendingVoteRetry, RetryEffect, WaveRegistry};
 pub struct CompletionData {
     /// Block this wave belongs to; pairs with `wave_id` to identify the vote target.
     pub block_hash: BlockHash,
-    /// Block height (= `wave_starting_height`).
+    /// Height of the wave-starting block.
     pub block_height: BlockHeight,
     /// BFT-authenticated weighted timestamp at which this wave's outcome is
     /// fixed. Included in the vote payload and the EC canonical hash, so all
@@ -1860,8 +1860,6 @@ impl ExecutionCoordinator {
     }
 
     /// Check if we're waiting for provisioning to complete for a transaction.
-    ///
-    /// Note: Actual provision tracking is handled by `ProvisionCoordinator`.
     #[must_use]
     pub fn is_awaiting_provisioning(&self, tx_hash: TxHash) -> bool {
         self.waves.is_awaiting_provisioning(tx_hash)

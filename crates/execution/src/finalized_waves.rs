@@ -7,9 +7,9 @@
 //! store answers tx-membership and wave-id-hash lookups for peers that need
 //! to fetch the finalized data to vote.
 //!
-//! This is write-once, read-many — the [`WaveRegistry`](crate::state) owns
-//! the mutable in-flight lifecycle (waves, vote trackers, retries) and hands
-//! wave off to this store at the moment of finalization.
+//! This is write-once, read-many — [`WaveRegistry`](crate::waves::WaveRegistry)
+//! owns the mutable in-flight lifecycle (waves, vote trackers, retries) and
+//! hands waves off to this store at the moment of finalization.
 //!
 //! The underlying map is a `BTreeMap<WaveId, Arc<FinalizedWave>>` so
 //! iteration is deterministic — load-bearing for simulation determinism and
