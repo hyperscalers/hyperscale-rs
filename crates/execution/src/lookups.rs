@@ -132,46 +132,46 @@ pub fn build_provision_requests(
         if topology.is_single_shard_transaction(tx) {
             continue;
         }
-        let mut owned_nodes: Vec<_> = tx
+        let all_nodes: Vec<NodeId> = tx
             .declared_reads()
             .iter()
             .chain(tx.declared_writes().iter())
-            .filter(|&node_id| topology.shard_for_node_id(node_id) == local_shard)
             .copied()
+            .collect();
+
+        let mut owned_nodes: Vec<NodeId> = all_nodes
+            .iter()
+            .copied()
+            .filter(|n| topology.shard_for_node_id(n) == local_shard)
             .collect();
         owned_nodes.sort();
         owned_nodes.dedup();
 
-        if !owned_nodes.is_empty() {
-            // Build per-target-shard node needs for conflict detection.
-            let mut target_nodes: Vec<(ShardGroupId, Vec<NodeId>)> = Vec::new();
-            let all_nodes: Vec<&NodeId> = tx
-                .declared_reads()
-                .iter()
-                .chain(tx.declared_writes().iter())
-                .collect();
-            for &target_shard in &topology
-                .all_shards_for_transaction(tx)
-                .into_iter()
-                .filter(|&s| s != local_shard)
-                .collect::<Vec<_>>()
-            {
-                let needed: Vec<NodeId> = all_nodes
-                    .iter()
-                    .filter(|&&n| topology.shard_for_node_id(n) == target_shard)
-                    .copied()
-                    .copied()
-                    .collect();
-                target_nodes.push((target_shard, needed));
-            }
+        if owned_nodes.is_empty() {
+            continue;
+        }
 
-            if !target_nodes.is_empty() {
-                provision_requests.push(ProvisionsRequest {
-                    tx_hash: tx.hash(),
-                    local_nodes: owned_nodes,
-                    target_nodes,
-                });
-            }
+        // Per-target-shard node needs for conflict detection on the remote side.
+        let mut target_nodes: Vec<(ShardGroupId, Vec<NodeId>)> = Vec::new();
+        for target_shard in topology
+            .all_shards_for_transaction(tx)
+            .into_iter()
+            .filter(|&s| s != local_shard)
+        {
+            let needed: Vec<NodeId> = all_nodes
+                .iter()
+                .copied()
+                .filter(|n| topology.shard_for_node_id(n) == target_shard)
+                .collect();
+            target_nodes.push((target_shard, needed));
+        }
+
+        if !target_nodes.is_empty() {
+            provision_requests.push(ProvisionsRequest {
+                tx_hash: tx.hash(),
+                local_nodes: owned_nodes,
+                target_nodes,
+            });
         }
     }
 
