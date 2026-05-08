@@ -88,17 +88,14 @@ pub(super) async fn run(
 
     loop {
         tokio::select! {
-            // Handle shutdown signal
             _ = shutdown_rx.recv() => {
                 info!("Shutting down libp2p network event loop");
                 break;
             }
 
-            // Periodic maintenance tasks
             _ = maintenance_interval.tick() => {
                 let now = std::time::Instant::now();
 
-                // Process pending reconnections
                 let reconnects_due: Vec<_> = pending_reconnects
                     .iter()
                     .filter(|(_, scheduled)| now >= **scheduled)
@@ -108,7 +105,6 @@ pub(super) async fn run(
                 for peer in reconnects_due {
                     pending_reconnects.remove(&peer);
 
-                    // Reconnect if we have a known address and are not already connected
                     if !swarm.is_connected(&peer) {
                         if let Some(addr) = validator_addresses.get(&peer) {
                             info!(
@@ -122,18 +118,16 @@ pub(super) async fn run(
                                     error = ?e,
                                     "Failed to dial peer for reconnection"
                                 );
-                                // Schedule another reconnect attempt
                                 pending_reconnects.insert(peer, now + RECONNECT_DELAY * 2);
                             }
                         } else {
-                            // No known address, try to find via Kademlia
                             warn!(peer = %peer, "No known address for peer, relying on Kademlia discovery");
                         }
                     }
                 }
 
-                // Re-dial bootstrap peers if Kademlia hasn't bootstrapped yet.
-                // Handles the case where bootstrap peers were down at startup.
+                // Re-dial bootstrap peers if Kademlia hasn't bootstrapped yet —
+                // covers the case where bootstrap peers were down at startup.
                 if !kademlia_bootstrapped && !bootstrap_peers.is_empty() {
                     for addr in &bootstrap_peers {
                         if let Err(e) = swarm.dial(addr.clone()) {
@@ -146,16 +140,14 @@ pub(super) async fn run(
                     }
                 }
 
-                // Periodic Kademlia refresh for peer discovery
+                // Periodic Kademlia random-walk to discover new peers.
                 if kademlia_bootstrapped && now.saturating_duration_since(last_kademlia_refresh) > KADEMLIA_REFRESH_INTERVAL {
-                    // Trigger a random walk to discover new peers
                     let random_peer = Libp2pPeerId::random();
                     swarm.behaviour_mut().kademlia.get_closest_peers(random_peer);
                     last_kademlia_refresh = now;
                     debug!("Triggered Kademlia refresh for peer discovery");
                 }
 
-                // Check connection health
                 let connected_count = swarm.connected_peers().count();
                 let known_peers = validator_addresses.len();
                 if known_peers > 0 && connected_count < known_peers / 2 {
@@ -164,7 +156,6 @@ pub(super) async fn run(
                         known_peers = known_peers,
                         "Low peer connectivity - connected to less than half of known peers"
                     );
-                    // Trigger Kademlia bootstrap to find more peers
                     if kademlia_bootstrapped {
                         let _ = swarm.behaviour_mut().kademlia.bootstrap();
                     }
@@ -235,15 +226,13 @@ pub(super) async fn run(
                 );
             }
 
-            // Handle swarm events
             event = swarm.select_next_some() => {
-                // Check if this is a connection event that changes peer count
                 let is_connection_event = matches!(
                     &event,
                     SwarmEvent::ConnectionEstablished { .. } | SwarmEvent::ConnectionClosed { .. }
                 );
 
-                // Handle Identify events — version check + trigger validator-bind
+                // Identify events drive version compatibility check + validator-bind handshake.
                 if let SwarmEvent::Behaviour(BehaviourEvent::Identify(IdentifyEvent::Received { peer_id, info, .. })) = &event {
                     let local_version = option_env!("HYPERSCALE_VERSION").unwrap_or("localdev");
 
@@ -255,7 +244,6 @@ pub(super) async fn run(
                             "Identified hyperscale peer"
                         );
 
-                        // Version compatibility check
                         if version_interop_mode.check(local_version, remote_version) {
                             // Version OK — trigger the validator-bind protocol.
                             // The bind service will open a stream, exchange BLS-signed

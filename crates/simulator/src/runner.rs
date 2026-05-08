@@ -74,7 +74,6 @@ impl Simulator {
         let network_config = config.to_network_config();
         let runner = SimulationRunner::new(&network_config, config.seed);
 
-        // Generate accounts
         let accounts =
             AccountPool::generate(u64::from(config.num_shards), config.accounts_per_shard)?;
 
@@ -99,10 +98,10 @@ impl Simulator {
 
         let batch_size = config.workload.batch_size;
 
-        // RNG for workload (separate from simulation RNG for independence)
+        // Workload RNG is independent from the simulation RNG.
         let rng = ChaCha8Rng::seed_from_u64(config.seed.wrapping_add(1));
 
-        // Metrics start at time zero (will be reset when we actually start)
+        // Metrics duration is reset when the simulation actually starts.
         let metrics = MetricsCollector::new(Duration::ZERO);
 
         info!(
@@ -246,7 +245,6 @@ impl Simulator {
         for chunk in all_txs.chunks(batch_size) {
             let mut pending: HashMap<TxHash, ShardGroupId> = HashMap::new();
 
-            // Submit the batch.
             for (shard, tx) in chunk {
                 let hash = tx.hash();
                 let tx = Arc::new(tx.clone());
@@ -264,7 +262,7 @@ impl Simulator {
                 total_submitted += 1;
             }
 
-            // Process until all complete (with a timeout to avoid infinite loops).
+            // 30s timeout guards against an unbounded loop if any tx never finalizes.
             let deadline = self.runner.now() + Duration::from_secs(30);
             let step = Duration::from_millis(100);
 
@@ -322,12 +320,10 @@ impl Simulator {
             "Starting simulation"
         );
 
-        // Main simulation loop
         let mut last_progress_time = start_time;
         let progress_interval = Duration::from_secs(5);
 
         while self.runner.now() < submission_end_time {
-            // Generate and submit a batch of transactions
             let current_time = self.runner.now();
             self.sim_now_ms.store(
                 u64::try_from(current_time.as_millis()).unwrap_or(u64::MAX),
@@ -361,21 +357,17 @@ impl Simulator {
                 self.metrics.record_submission();
             }
 
-            // First, run a tiny step to process the submitted transactions
-            // This ensures they're in mempools before any proposal timers fire.
-            // The event priority system processes Client events last, so we need
-            // to advance time slightly to get them processed.
+            // The event priority system processes Client events last, so a 1µs
+            // advance is needed to drain the just-submitted txs into mempools
+            // before any proposal timer fires this batch.
             self.runner
                 .run_until(self.runner.now() + Duration::from_micros(1));
 
-            // Advance simulation by one batch interval
             let next_time = self.runner.now() + batch_interval;
             self.runner.run_until(next_time);
 
-            // Check for completed transactions
             self.check_completions();
 
-            // Progress logging
             if self
                 .runner
                 .now()
@@ -388,7 +380,6 @@ impl Simulator {
             }
         }
 
-        // Simulation complete
         let end_time = self.runner.now();
         self.metrics.set_submission_end_time(end_time);
         self.metrics

@@ -173,12 +173,11 @@ impl VoteSet {
             return false;
         }
 
-        // Check for duplicate
         if self.has_seen_validator(committee_index) {
             return false;
         }
 
-        // Update block hash, height, and round from first vote if not set
+        // Latch block hash, height, and round from the first vote.
         if self.block_hash.is_none() {
             self.block_hash = Some(vote.block_hash());
             self.height = Some(vote.height());
@@ -303,12 +302,11 @@ impl VoteSet {
             return false;
         }
 
-        // Check for duplicate
         if self.has_seen_validator(committee_index) {
             return false;
         }
 
-        // Update block hash, height, and round from first vote if not set
+        // Latch block hash, height, and round from the first vote.
         if self.block_hash.is_none() {
             self.block_hash = Some(vote.block_hash());
             self.height = Some(vote.height());
@@ -367,7 +365,7 @@ mod test_helpers {
             // as the public keys will be aggregated during verification.
             self.verified_votes.sort_by_key(|(idx, _, _)| *idx);
 
-            // Build signers bitfield - size based on max committee index
+            // Bitfield is sized to fit the largest committee index seen, not the full committee.
             let max_idx = self
                 .verified_votes
                 .iter()
@@ -379,14 +377,12 @@ mod test_helpers {
                 signers.set(*idx);
             }
 
-            // Extract signatures in sorted order
             let signatures: Vec<Bls12381G2Signature> = self
                 .verified_votes
                 .iter()
                 .map(|(_, v, _)| v.signature())
                 .collect();
 
-            // Aggregate BLS signatures
             let aggregated_signature = Bls12381G2Signature::aggregate(&signatures, true)
                 .map_err(|e| format!("failed to aggregate signatures: {e:?}"))?;
 

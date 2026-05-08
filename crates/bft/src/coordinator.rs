@@ -572,7 +572,6 @@ impl BftCoordinator {
             return vec![];
         }
 
-        // Restore committed state
         self.committed_height = height;
         if let Some(h) = hash {
             self.committed_hash = h;
@@ -580,7 +579,6 @@ impl BftCoordinator {
         let has_qc = qc.is_some();
         self.latest_qc = qc;
 
-        // Reset backoff tracking - we're starting fresh at this height
         self.view_change.reset_for_height_advance();
 
         // Clean up any votes for heights at or below the committed height.
@@ -1699,7 +1697,6 @@ impl BftCoordinator {
             return vec![];
         };
 
-        // Check verification result
         if !is_valid {
             warn!(
                 block_hash = ?block_hash,
@@ -2695,7 +2692,6 @@ impl BftCoordinator {
             return actions;
         }
 
-        // Not the proposer
         vec![timer]
     }
 
@@ -3234,12 +3230,10 @@ impl BftCoordinator {
     /// - Block is in `pending_synced_block_verifications` (synced blocks are always complete)
     /// - Block is in `buffered_synced_blocks` (synced blocks are always complete)
     fn has_complete_block_at_height(&self, height: BlockHeight) -> bool {
-        // Already committed
         if height <= self.committed_height {
             return true;
         }
 
-        // In pending blocks - but only if complete and constructed
         if self
             .pending_blocks
             .values()
@@ -3248,12 +3242,10 @@ impl BftCoordinator {
             return true;
         }
 
-        // In pending synced block verifications (synced blocks are always complete)
         if self.block_sync.has_pending_at_height(height) {
             return true;
         }
 
-        // In buffered synced blocks (synced blocks are always complete)
         if self.block_sync.has_any_buffered_at_height(height) {
             return true;
         }

@@ -206,7 +206,6 @@ mod tests {
         let hashes: Vec<Hash> = (0..100u8).map(|i| Hash::from_bytes(&[i])).collect();
         let root = compute_merkle_root(&hashes);
 
-        // Verify every leaf
         for idx in 0..100 {
             let (proof_root, siblings, leaf_index) = compute_merkle_root_with_proof(&hashes, idx);
             assert_eq!(proof_root, root);

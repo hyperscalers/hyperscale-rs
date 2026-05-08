@@ -58,21 +58,17 @@ impl Spammer {
     pub fn new(config: SpammerConfig) -> Result<Self, SpammerError> {
         config.validate().map_err(SpammerError::Config)?;
 
-        // Generate accounts
         let accounts = AccountPool::generate(config.num_shards, config.accounts_per_shard)
             .map_err(SpammerError::AccountGeneration)?;
 
-        // Load nonces from file to continue where previous runs left off
         match accounts.load_nonces_default() {
             Ok(n) if n > 0 => info!(loaded = n, "Loaded account nonces from file"),
-            Ok(_) => {} // No file or empty, starting fresh
+            Ok(_) => {}
             Err(e) => warn!(error = %e, "Failed to load nonces, starting fresh"),
         }
 
-        // Create RPC clients
         let clients: Vec<RpcClient> = config.rpc_endpoints.iter().map(RpcClient::new).collect();
 
-        // Create latency tracker if enabled
         let latency_tracker = if config.latency_tracking {
             Some(LatencyTracker::new(
                 clients.clone(),
@@ -82,7 +78,6 @@ impl Spammer {
             None
         };
 
-        // Initialize round-robin counters for each shard
         let shard_round_robin = (0..config.num_shards).map(|_| AtomicU64::new(0)).collect();
 
         Ok(Self {
@@ -100,7 +95,6 @@ impl Spammer {
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
 
-        // Spawn a task to cancel after duration
         spawn(async move {
             sleep(duration).await;
             cancel_clone.cancel();
@@ -113,11 +107,10 @@ impl Spammer {
     pub async fn run_until_cancelled(&mut self, cancel: CancellationToken) -> SpammerReport {
         let start = Instant::now();
         self.stats.start_time.store(
-            u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX), // Store start reference
+            u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX),
             Ordering::SeqCst,
         );
 
-        // Start latency tracking if enabled
         if let Some(ref mut tracker) = self.latency_tracker {
             tracker.start_polling();
         }
@@ -125,24 +118,19 @@ impl Spammer {
         let num_workers = self.config.num_workers;
 
         if num_workers <= 1 {
-            // Single-threaded mode (original behavior but with join_all for concurrent submission)
             self.run_single_threaded(cancel.clone(), start).await;
         } else {
-            // Multi-threaded mode: partition accounts and spawn workers
             self.run_multi_threaded(cancel.clone(), start, num_workers)
                 .await;
         }
 
-        // Print final progress
         self.print_progress(start.elapsed());
 
-        // Save nonces for next run
         match self.accounts.save_nonces_default() {
             Ok(n) => info!(saved = n, "Saved account nonces to file"),
             Err(e) => warn!(error = %e, "Failed to save nonces"),
         }
 
-        // Finalize latency tracking
         let latency_report = if let Some(tracker) = self.latency_tracker.take() {
             Some(
                 tracker
@@ -171,7 +159,6 @@ impl Spammer {
         let num_shards = usize::try_from(self.config.num_shards).unwrap_or(usize::MAX);
         let txs_per_shard = self.config.batch_size.div_ceil(num_shards);
 
-        // Use current time as seed for RNG
         let seed = u64::try_from(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -182,7 +169,6 @@ impl Spammer {
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         let mut latency_rng = ChaCha8Rng::seed_from_u64(seed.wrapping_add(1));
 
-        // Create workload generator
         let workload = TransferWorkload::new(self.config.network.clone())
             .with_cross_shard_ratio(self.config.cross_shard_ratio)
             .with_selection_mode(self.config.selection_mode);
@@ -203,11 +189,9 @@ impl Spammer {
                 break;
             }
 
-            // Generate and submit batches per shard
             for shard_idx in 0..num_shards {
                 let target_shard = ShardGroupId::new(shard_idx as u64);
 
-                // Generate transactions
                 let batch = workload.generate_batch_for_shard(
                     &self.accounts,
                     target_shard,
@@ -215,7 +199,6 @@ impl Spammer {
                     &mut rng,
                 );
 
-                // Submit all transactions concurrently using join_all
                 let futures: Vec<_> = batch
                     .into_iter()
                     .map(|tx| {
@@ -228,13 +211,11 @@ impl Spammer {
                 join_all(futures).await;
             }
 
-            // Print progress periodically
             if last_progress.elapsed() >= self.config.progress_interval {
                 self.print_progress(start.elapsed());
                 last_progress = Instant::now();
             }
 
-            // Sleep to maintain target TPS
             sleep(batch_interval).await;
         }
     }
@@ -249,10 +230,8 @@ impl Spammer {
         let batch_interval = self.config.batch_interval();
         let num_shards = usize::try_from(self.config.num_shards).unwrap_or(usize::MAX);
 
-        // Partition accounts across workers
         let partitions = self.accounts.partition(num_workers);
 
-        // Calculate TPS per worker
         let tps_per_worker = self.config.target_tps / num_workers as u64;
         let batch_size_per_worker = self.config.batch_size / num_workers;
 
@@ -271,7 +250,6 @@ impl Spammer {
             "Starting spammer (multi-threaded mode)"
         );
 
-        // Spawn worker tasks
         let mut handles = Vec::with_capacity(num_workers);
 
         for (id, partition) in partitions.into_iter().enumerate() {
@@ -304,7 +282,6 @@ impl Spammer {
             handles.push(handle);
         }
 
-        // Spawn progress reporter
         let stats_for_progress = Arc::clone(&self.stats);
         let latency_tracker_for_progress = self
             .latency_tracker
@@ -334,7 +311,6 @@ impl Spammer {
             }
         });
 
-        // Wait for all workers to complete
         for handle in handles {
             let _ = handle.await;
         }
@@ -519,7 +495,6 @@ impl Worker {
         let num_shards = usize::try_from(self.config.num_shards).unwrap_or(usize::MAX);
         let txs_per_shard = self.config.batch_size.div_ceil(num_shards);
 
-        // Each worker has its own RNG with a unique seed
         let seed = u64::try_from(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -532,7 +507,6 @@ impl Worker {
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         let mut latency_rng = ChaCha8Rng::seed_from_u64(seed.wrapping_add(1));
 
-        // Create workload generator for this partition
         let workload = PartitionWorkload::new(self.config.network.clone())
             .with_cross_shard_ratio(self.config.cross_shard_ratio)
             .with_selection_mode(self.config.selection_mode);
@@ -542,11 +516,9 @@ impl Worker {
                 break;
             }
 
-            // Generate and submit batches per shard
             for shard_idx in 0..num_shards {
                 let target_shard = ShardGroupId::new(shard_idx as u64);
 
-                // Generate transactions from this worker's partition
                 let batch = workload.generate_batch_for_shard(
                     &mut self.partition,
                     target_shard,
@@ -554,7 +526,6 @@ impl Worker {
                     &mut rng,
                 );
 
-                // Submit all transactions concurrently
                 let futures: Vec<_> = batch
                     .into_iter()
                     .map(|tx| {
@@ -567,7 +538,6 @@ impl Worker {
                 join_all(futures).await;
             }
 
-            // Sleep to maintain target TPS
             sleep(self.config.batch_interval).await;
         }
     }

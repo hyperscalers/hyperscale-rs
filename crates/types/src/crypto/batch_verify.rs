@@ -43,7 +43,6 @@ pub fn batch_verify_ed25519(
         }
     }
 
-    // Use batch verification
     verify_batch(messages, &dalek_sigs, &dalek_pks).is_ok()
 }
 

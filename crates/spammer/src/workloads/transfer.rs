@@ -119,17 +119,14 @@ impl TransferWorkload {
         from: &FundedAccount,
         to: &FundedAccount,
     ) -> Option<RoutableTransaction> {
-        // Build manifest: withdraw from sender, deposit to receiver
         let manifest = ManifestBuilder::new()
             .lock_fee(from.address, Decimal::from(10u32))
             .withdraw_from_account(from.address, XRD, self.amount)
             .try_deposit_entire_worktop_or_abort(to.address, None)
             .build();
 
-        // Get and increment nonce atomically
         let nonce = from.next_nonce();
 
-        // Sign and notarize
         let notarized = match sign_and_notarize(
             manifest,
             &self.network,
@@ -143,7 +140,6 @@ impl TransferWorkload {
             }
         };
 
-        // Convert to RoutableTransaction
         let tx: RoutableTransaction =
             match routable_from_notarized_v1(notarized, (self.validity_clock)()) {
                 Ok(t) => t,

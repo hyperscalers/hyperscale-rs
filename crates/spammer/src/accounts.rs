@@ -464,7 +464,6 @@ impl AccountPool {
             (idx1, idx2)
         };
 
-        // Track usage
         self.record_usage(from_shard, idx1);
         self.record_usage(to_shard, idx2);
 
@@ -542,7 +541,6 @@ impl AccountPool {
             }
         };
 
-        // Track usage
         self.record_usage(shard, idx1);
         self.record_usage(shard, idx2);
 
@@ -573,7 +571,6 @@ impl AccountPool {
             }
         };
 
-        // Track usage
         self.record_usage(shard, idx);
 
         idx
@@ -649,7 +646,6 @@ impl AccountPool {
     pub fn partition(&self, num_partitions: usize) -> Vec<AccountPartition> {
         let num_partitions = num_partitions.max(1);
 
-        // Initialize empty partitions
         let mut partitions: Vec<AccountPartition> = (0..num_partitions)
             .map(|_| AccountPartition::new(self.num_shards))
             .collect();

@@ -166,7 +166,6 @@ impl Libp2pAdapter {
                 .with_agent_version(format!("hyperscale/{version}"));
         let identify = IdentifyBehaviour::new(identify_config);
 
-        // Create behaviour
         let behaviour = Behaviour {
             gossipsub,
             kademlia,

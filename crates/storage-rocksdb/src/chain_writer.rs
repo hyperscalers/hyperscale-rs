@@ -286,12 +286,10 @@ impl RocksDbStorage {
             /* base_reads */ None,
         );
 
-        // Persist block data (header, transactions, certificates) atomically.
         self.append_block_to_batch(&mut batch, block, qc);
 
         append_block_certs_to_batch(self, &mut batch, block);
 
-        // Add receipts to the batch atomically.
         let cf = self.cf();
         let consensus_cf = ConsensusReceiptsCf::handle(&cf);
         let metadata_cf = ExecutionMetadataCf::handle(&cf);

@@ -63,7 +63,6 @@ pub fn routable_from_notarized_v2(
         write_nodes.extend(sub_writes);
     }
 
-    // Deduplicate
     let write_set: HashSet<_> = write_nodes.into_iter().collect();
     let read_set: HashSet<_> = read_nodes
         .into_iter()

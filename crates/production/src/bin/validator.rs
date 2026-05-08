@@ -581,12 +581,9 @@ fn load_or_generate_keypair(key_path: Option<&PathBuf>) -> Result<Bls12381G1Priv
         let key_bytes = fs::read(path)
             .with_context(|| format!("Failed to read key file: {}", path.display()))?;
 
-        // Try to decode as hex first, then as raw bytes
         let decoded = if key_bytes.len() == 64 {
-            // Likely hex-encoded (64 hex chars = 32 bytes)
             hex_decode(&key_bytes).with_context(|| "Failed to decode hex key")?
         } else if key_bytes.len() == 32 {
-            // Raw bytes
             key_bytes
         } else {
             bail!(
@@ -595,23 +592,19 @@ fn load_or_generate_keypair(key_path: Option<&PathBuf>) -> Result<Bls12381G1Priv
             );
         };
 
-        // Convert to fixed array
         let seed: [u8; 32] = decoded
             .try_into()
             .map_err(|_| anyhow::anyhow!("Key must be exactly 32 bytes"))?;
 
-        // Use BLS12-381 for consensus (supports signature aggregation)
         Ok(bls_keypair_from_seed(&seed))
     } else {
         info!("Key file not found, generating new keypair");
 
-        // Generate random seed
         let mut seed = [0u8; 32];
         rng().fill_bytes(&mut seed);
 
         let keypair = bls_keypair_from_seed(&seed);
 
-        // Save the seed
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -746,9 +739,7 @@ fn build_engine_genesis_config(config: &GenesisConfig) -> Result<EngineGenesisCo
 
     let mut engine_config = EngineGenesisConfig::test_default();
 
-    // Convert XRD balances
     for entry in &config.xrd_balances {
-        // Decode bech32 address
         let (_, address_bytes) = decoder
             .validate_and_decode(&entry.address)
             .map_err(|e| anyhow::anyhow!("Invalid address '{}': {:?}", entry.address, e))?;
@@ -757,7 +748,6 @@ fn build_engine_genesis_config(config: &GenesisConfig) -> Result<EngineGenesisCo
             anyhow::anyhow!("Invalid component address '{}': {:?}", entry.address, e)
         })?;
 
-        // Parse balance
         let balance = Decimal::from_str(&entry.balance)
             .map_err(|e| anyhow::anyhow!("Invalid balance '{}': {:?}", entry.balance, e))?;
 
@@ -1049,9 +1039,8 @@ fn main() -> Result<()> {
 
 #[allow(clippy::too_many_lines)] // straight-line startup wiring; helpers would just shuffle locals
 async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
-    // Initialize telemetry/logging
-    // If telemetry is enabled, init_telemetry sets up the global subscriber with OTLP export.
-    // Otherwise, use basic fmt subscriber.
+    // If telemetry is enabled, init_telemetry sets up the global subscriber with OTLP export;
+    // otherwise the basic fmt subscriber is used.
     #[allow(dead_code)]
     enum UnifiedGuard {
         Telemetry(TelemetryGuard),
@@ -1143,20 +1132,16 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
         }
     }
 
-    // Ensure data directory exists
     fs::create_dir_all(&config.node.data_dir)?;
 
-    // Setup UPnP
     setup_upnp(&config.network).await;
 
-    // Load or generate keys
     let signing_keypair = load_or_generate_keypair(config.node.key_path.as_ref())?;
     info!(
         public_key = %format_public_key(&signing_keypair.public_key()),
         "Loaded signing keypair"
     );
 
-    // Build topology
     let topology = build_topology(&config, &signing_keypair)?;
     info!(
         committee_size = topology.snapshot().local_committee_size(),
@@ -1164,28 +1149,25 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
         "Topology initialized"
     );
 
-    // Build configurations
     let thread_config = build_thread_pool_config(&config.threads);
     let bft_config = BftConfig::default();
     let network_config = build_network_config(&config.network)?;
     let rocksdb_config = build_rocksdb_config(&config.storage);
 
-    // Initialize dispatch pools
     let dispatch = Arc::new(
         PooledDispatch::new(thread_config, TokioHandle::current())
             .context("Failed to initialize thread pools")?,
     );
 
-    // Open storage
     let db_path = config.node.data_dir.join("db");
     let storage = RocksDbStorage::open_with_config(&db_path, rocksdb_config)
         .with_context(|| format!("Failed to open database at {}", db_path.display()))?;
     let storage = Arc::new(storage);
     info!("Storage opened at {}", db_path.display());
 
-    // Create shared RPC state objects used by both runner and RPC server.
+    // Shared RPC state objects used by both runner and RPC server. ArcSwap gives
+    // HTTP handlers lock-free reads.
     let rpc_ready = Arc::new(AtomicBool::new(false));
-    // Use ArcSwap for lock-free reads of sync status from HTTP handlers
     let rpc_sync_status = Arc::new(ArcSwap::new(Arc::new(SyncStatus::default())));
     let rpc_node_status = Arc::new(ArcSwap::new(Arc::new(NodeStatusState {
         validator_id: config.node.validator_id,
@@ -1195,9 +1177,8 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
     })));
     let rpc_mempool_snapshot = Arc::new(ArcSwap::new(Arc::new(MempoolSnapshot::default())));
 
-    // Create production runner first (before RPC server)
-    // The runner creates the crossbeam event channel that the RPC server needs
-    // for submitting transactions directly to IoLoop.
+    // The runner is built before the RPC server because it owns the crossbeam
+    // event channel the RPC server submits transactions through.
     let mut runner_builder = ProductionRunner::builder(
         topology,
         signing_keypair,
@@ -1212,7 +1193,6 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
     .mempool_config(config.mempool.clone())
     .provision_config(config.provisions);
 
-    // Wire up genesis configuration if XRD balances are specified
     if !config.genesis.xrd_balances.is_empty() {
         let engine_genesis = build_engine_genesis_config(&config.genesis)
             .context("Failed to parse genesis configuration")?;
@@ -1223,15 +1203,11 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
         .build()
         .context("Failed to create production runner")?;
 
-    // Get the transaction submission sender from the runner
-    // RPC-submitted transactions go through this channel to:
-    // 1. Gossip to all relevant shards (RPC submissions need gossip)
-    // 2. Validate via the shared batcher
-    // 3. Dispatch to mempool
+    // RPC-submitted transactions flow through this channel: gossip to all
+    // relevant shards, validate via the shared batcher, dispatch to mempool.
     let tx_submission_sender = runner.tx_submission_sender();
     let rpc_tx_status_cache = runner.tx_status_cache();
 
-    // Start RPC server with the transaction submission channel and state
     let rpc_handle = if config.metrics.enabled {
         let rpc_config = RpcServerConfig {
             listen_addr: config.metrics.listen_addr.parse().with_context(|| {
@@ -1244,7 +1220,6 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
             sync_backpressure_threshold: Some(10),
         };
 
-        // Use with_state to pass all shared state objects
         let rpc_server = RpcServer::with_state(
             rpc_config,
             rpc_ready.clone(),
@@ -1264,10 +1239,8 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
         None
     };
 
-    // Get shutdown handle
     let shutdown_handle = runner.shutdown_handle();
 
-    // Spawn shutdown signal handler
     spawn(async move {
         let ctrl_c = async {
             signal::ctrl_c()
@@ -1297,19 +1270,16 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
         }
     });
 
-    // Mark node as ready
     if let Some(ref handle) = rpc_handle {
         handle.set_ready(true);
     }
 
     info!("Validator node started, press Ctrl+C to stop");
 
-    // Run the main event loop
     if let Err(e) = runner.run().await {
         bail!("Runner error: {e}");
     }
 
-    // Cleanup RPC server
     if let Some(handle) = rpc_handle {
         handle.abort();
     }

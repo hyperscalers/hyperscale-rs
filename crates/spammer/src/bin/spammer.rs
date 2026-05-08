@@ -323,7 +323,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Shards: {num_shards}");
             println!("Validators per shard: {validators_per_shard}");
 
-            // Create RPC clients
             let clients: Vec<RpcClient> = endpoints
                 .iter()
                 .map(|e| RpcClient::new(e.clone()))
@@ -400,7 +399,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let client_idx = base_idx % clients.len();
             let client = &clients[client_idx];
 
-            // Submit the transaction
             println!("Submitting transaction to shard {target_shard}...");
             let submit_start = Instant::now();
 

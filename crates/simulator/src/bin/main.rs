@@ -70,7 +70,6 @@ struct Args {
 }
 
 fn main() {
-    // Initialize tracing
     fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
@@ -119,7 +118,6 @@ fn main() {
         "Workload parameters"
     );
 
-    // Configure workload
     let mut workload = WorkloadConfig::transfers_only()
         .with_batch_size(batch_size)
         .with_batch_interval(Duration::from_millis(batch_interval_ms))
@@ -129,39 +127,33 @@ fn main() {
         workload = workload.with_no_contention();
     }
 
-    // Create simulator config
     let config = SimulatorConfig::new(args.shards, args.validators)
         .with_accounts_per_shard(args.accounts)
         .with_seed(seed)
         .with_workload(workload);
 
-    // Create and initialize simulator
     let mut simulator = Simulator::new(config).expect("Failed to create simulator");
 
-    // Enable traffic analysis if requested
     if args.network_analysis {
         simulator.enable_traffic_analysis();
     }
 
     simulator.initialize();
 
-    // Run simulation for the specified duration (hard stop, no ramp-down)
+    // Hard stop, no ramp-down.
     let _report = simulator.run_for(Duration::from_secs(args.duration));
 
-    // Network traffic analysis
     if args.network_analysis
         && let Some(traffic_report) = simulator.traffic_report()
     {
         traffic_report.print_summary();
     }
 
-    // Livelock analysis
     if args.analyze_livelocks {
         let livelock_report = simulator.analyze_livelocks();
         livelock_report.print_summary();
     }
 
-    // Account usage stats
     let usage = simulator.account_usage_stats();
     if usage.skew_ratio() > 0.0 {
         println!("\n=== Account Usage ===");

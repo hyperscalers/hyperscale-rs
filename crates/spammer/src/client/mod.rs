@@ -45,18 +45,13 @@ impl RpcClient {
         &self,
         tx: &RoutableTransaction,
     ) -> Result<SubmissionResult, RpcError> {
-        // Encode transaction as SBOR
         let tx_bytes = basic_encode(tx).map_err(|e| RpcError::EncodingFailed(format!("{e:?}")))?;
-
-        // Convert to hex
         let tx_hex = hex_encode(tx_bytes);
 
-        // Build request
         let request = SubmitTransactionRequest {
             transaction_hex: tx_hex,
         };
 
-        // Send request
         let response = self
             .client
             .post(format!("{}/api/v1/transactions", self.base_url))
@@ -66,8 +61,6 @@ impl RpcClient {
             .map_err(RpcError::Http)?;
 
         let status = response.status();
-
-        // Parse response
         let body: SubmitTransactionResponse = response.json().await.map_err(RpcError::Http)?;
 
         Ok(SubmissionResult {
