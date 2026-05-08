@@ -20,12 +20,12 @@ pub struct CommitPipeline {
     /// Out-of-order commit buffer: commits received with height greater than
     /// `committed_height + 1`, parked until the predecessor commits.
     /// Keyed by target height.
-    pub(crate) out_of_order: BTreeMap<BlockHeight, (BlockHash, QuorumCertificate, CommitSource)>,
+    out_of_order: BTreeMap<BlockHeight, (BlockHash, QuorumCertificate, CommitSource)>,
 
     /// Awaiting-data commit buffer: commits whose block payload
     /// (transactions/certificates) has not fully arrived yet, retried when
     /// the block completes. Keyed by block hash.
-    pub(crate) awaiting_data: HashMap<BlockHash, (BlockHeight, QuorumCertificate, CommitSource)>,
+    awaiting_data: HashMap<BlockHash, (BlockHeight, QuorumCertificate, CommitSource)>,
 }
 
 impl CommitPipeline {
@@ -42,6 +42,28 @@ impl CommitPipeline {
             .retain(|_, (height, _, _)| *height > committed_height);
         self.out_of_order
             .retain(|height, _| *height > committed_height);
+    }
+
+    /// Park a commit whose block payload hasn't fully arrived yet.
+    pub fn buffer_awaiting_data(
+        &mut self,
+        block_hash: BlockHash,
+        height: BlockHeight,
+        qc: QuorumCertificate,
+        source: CommitSource,
+    ) {
+        self.awaiting_data.insert(block_hash, (height, qc, source));
+    }
+
+    /// Park a commit received with height beyond the next expected height.
+    pub fn buffer_out_of_order(
+        &mut self,
+        height: BlockHeight,
+        block_hash: BlockHash,
+        qc: QuorumCertificate,
+        source: CommitSource,
+    ) {
+        self.out_of_order.insert(height, (block_hash, qc, source));
     }
 
     /// Take the buffered out-of-order commit at `height`, if any.
@@ -72,6 +94,11 @@ impl CommitPipeline {
 
     pub fn awaiting_data_len(&self) -> usize {
         self.awaiting_data.len()
+    }
+
+    /// True if a commit is buffered for `height` in the out-of-order pipeline.
+    pub fn has_out_of_order_at(&self, height: BlockHeight) -> bool {
+        self.out_of_order.contains_key(&height)
     }
 }
 

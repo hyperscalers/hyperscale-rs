@@ -1227,8 +1227,7 @@ impl BftCoordinator {
     /// Stamp the header info into the set so QC aggregation has the
     /// `parent_block_hash` it needs.
     fn link_buffered_votes_to_header(&mut self, block_hash: BlockHash, header: &BlockHeader) {
-        if let Some(vote_set) = self.votes.vote_sets.get_mut(&block_hash) {
-            vote_set.set_header(header);
+        if self.votes.link_header(block_hash, header) {
             info!(
                 block_hash = ?block_hash,
                 "Updated VoteSet with header info via on_block_header"
@@ -2158,8 +2157,7 @@ impl BftCoordinator {
                         "Block not yet complete, buffering commit until data arrives"
                     );
                     self.commits
-                        .awaiting_data
-                        .insert(block_hash, (height, qc, source));
+                        .buffer_awaiting_data(block_hash, height, qc, source);
                 }
             } else {
                 warn!(
@@ -2196,8 +2194,7 @@ impl BftCoordinator {
                 height.inner()
             );
             self.commits
-                .out_of_order
-                .insert(height, (block_hash, qc, source));
+                .buffer_out_of_order(height, block_hash, qc, source);
             return vec![];
         }
 
@@ -2763,7 +2760,7 @@ impl BftCoordinator {
         let qc_height = qc.height();
         let unlocked: Vec<BlockHeight> = self
             .votes
-            .voted_heights
+            .voted_heights()
             .keys()
             .filter(|h| **h <= qc_height)
             .copied()
@@ -3822,16 +3819,14 @@ mod tests {
         let (mut state, topology) = make_test_state();
         state.set_time(LocalTimestamp::from_millis(100_000));
 
-        state.votes.voted_heights.insert(
+        state.votes.record_own_vote(
             BlockHeight::new(1),
-            (
-                BlockHash::from_raw(Hash::from_bytes(b"voted_block")),
-                Round::new(0),
-            ),
+            BlockHash::from_raw(Hash::from_bytes(b"voted_block")),
+            Round::new(0),
         );
         let _ = state.advance_round(&topology);
 
-        assert!(!state.votes.voted_heights.contains_key(&BlockHeight::new(1)));
+        assert!(!state.votes.is_locked_at(BlockHeight::new(1)));
     }
 
     #[test]
@@ -3839,12 +3834,10 @@ mod tests {
         // QC at height H unlocks vote locks at all heights ≤ H.
         let (mut state, topology) = make_test_state();
         for h in 1..=3 {
-            state.votes.voted_heights.insert(
+            state.votes.record_own_vote(
                 BlockHeight::new(h),
-                (
-                    BlockHash::from_raw(Hash::from_bytes(format!("block{h}").as_bytes())),
-                    Round::new(0),
-                ),
+                BlockHash::from_raw(Hash::from_bytes(format!("block{h}").as_bytes())),
+                Round::new(0),
             );
         }
 
@@ -3866,9 +3859,9 @@ mod tests {
         };
         state.maybe_unlock_for_qc(&topology, &qc);
 
-        assert!(!state.votes.voted_heights.contains_key(&BlockHeight::new(1)));
-        assert!(!state.votes.voted_heights.contains_key(&BlockHeight::new(2)));
-        assert!(state.votes.voted_heights.contains_key(&BlockHeight::new(3)));
+        assert!(!state.votes.is_locked_at(BlockHeight::new(1)));
+        assert!(!state.votes.is_locked_at(BlockHeight::new(2)));
+        assert!(state.votes.is_locked_at(BlockHeight::new(3)));
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -3913,10 +3906,8 @@ mod tests {
     fn voted_block_at(state: &BftCoordinator, height: BlockHeight) -> BlockHash {
         state
             .votes
-            .voted_heights
-            .get(&height)
+            .locked_block(height)
             .expect("voted_heights must contain height after try_vote_on_block")
-            .0
     }
 
     #[test]
@@ -4008,10 +3999,9 @@ mod tests {
 
         let (recorded_hash, _) = state
             .votes
-            .received_votes_by_height
-            .get(&(height, voter))
+            .received_vote(height, voter)
             .expect("legitimate vote must be recorded");
-        assert_eq!(*recorded_hash, block_b);
+        assert_eq!(recorded_hash, block_b);
     }
     // ═══════════════════════════════════════════════════════════════════════════
     // Re-proposal After View Change Tests
@@ -4039,8 +4029,7 @@ mod tests {
         state.pending_blocks.insert(original_block_hash, pending);
         state
             .votes
-            .voted_heights
-            .insert(height, (original_block_hash, Round::new(0)));
+            .record_own_vote(height, original_block_hash, Round::new(0));
 
         let actions = state.repropose_locked_block(&topology, original_block_hash, height);
 
@@ -4119,9 +4108,10 @@ mod tests {
         let height = BlockHeight::new(1);
 
         let vote_and_advance = |state: &mut BftCoordinator, block: &[u8], round: Round| {
-            state.votes.voted_heights.insert(
+            state.votes.record_own_vote(
                 height,
-                (BlockHash::from_raw(Hash::from_bytes(block)), round),
+                BlockHash::from_raw(Hash::from_bytes(block)),
+                round,
             );
             state.advance_round(&topology)
         };
@@ -4130,16 +4120,16 @@ mod tests {
         state.view_change.view = Round::new(0);
         let _ = vote_and_advance(&mut state, b"block_a", Round::new(0));
         assert_eq!(state.view_change.view, Round::new(1));
-        assert!(!state.votes.voted_heights.contains_key(&height));
+        assert!(!state.votes.is_locked_at(height));
 
         let _ = vote_and_advance(&mut state, b"block_b", Round::new(1));
         assert_eq!(state.view_change.view, Round::new(2));
-        assert!(!state.votes.voted_heights.contains_key(&height));
+        assert!(!state.votes.is_locked_at(height));
 
         // Round 3: we're proposer — advance emits a fallback BuildProposal.
         let actions = vote_and_advance(&mut state, b"block_c", Round::new(2));
         assert_eq!(state.view_change.view, Round::new(3));
-        assert!(!state.votes.voted_heights.contains_key(&height));
+        assert!(!state.votes.is_locked_at(height));
         assert!(actions.iter().any(|a| matches!(
             a,
             Action::BuildProposal {
@@ -4161,20 +4151,17 @@ mod tests {
         state.latest_qc = Some(make_test_qc(qc_block, BlockHeight::new(1)));
         state
             .votes
-            .voted_heights
-            .insert(BlockHeight::new(1), (qc_block, Round::new(0)));
-        state.votes.voted_heights.insert(
+            .record_own_vote(BlockHeight::new(1), qc_block, Round::new(0));
+        state.votes.record_own_vote(
             BlockHeight::new(2),
-            (
-                BlockHash::from_raw(Hash::from_bytes(b"block_at_2")),
-                Round::new(0),
-            ),
+            BlockHash::from_raw(Hash::from_bytes(b"block_at_2")),
+            Round::new(0),
         );
 
         let _ = state.advance_round(&topology);
 
-        assert!(state.votes.voted_heights.contains_key(&BlockHeight::new(1)));
-        assert!(!state.votes.voted_heights.contains_key(&BlockHeight::new(2)));
+        assert!(state.votes.is_locked_at(BlockHeight::new(1)));
+        assert!(!state.votes.is_locked_at(BlockHeight::new(2)));
     }
 
     #[test]
@@ -4186,10 +4173,7 @@ mod tests {
         let block_b = BlockHash::from_raw(Hash::from_bytes(b"block_b"));
         let height = BlockHeight::new(5);
 
-        state
-            .votes
-            .voted_heights
-            .insert(height, (block_a, Round::new(0)));
+        state.votes.record_own_vote(height, block_a, Round::new(0));
         let qc = {
             let __qc = make_test_qc(block_b, height);
             QuorumCertificate::new(
@@ -4205,7 +4189,7 @@ mod tests {
         };
         state.maybe_unlock_for_qc(&topology, &qc);
 
-        assert!(!state.votes.voted_heights.contains_key(&height));
+        assert!(!state.votes.is_locked_at(height));
     }
 
     #[test]
@@ -4658,7 +4642,7 @@ mod tests {
                 .iter()
                 .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. }))
         );
-        assert!(state.votes.voted_heights.contains_key(&height));
+        assert!(state.votes.is_locked_at(height));
     }
 
     #[test]
@@ -4717,10 +4701,7 @@ mod tests {
                 .iter()
                 .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. }))
         );
-        assert_eq!(
-            state.votes.voted_heights.get(&height).map(|(h, _)| *h),
-            Some(block_a)
-        );
+        assert_eq!(state.votes.locked_block(height), Some(block_a));
     }
 
     #[test]
@@ -4946,7 +4927,7 @@ mod tests {
         state.set_block_syncing(&topology, false);
 
         state.pending_blocks.clear();
-        state.votes.voted_heights.clear();
+        state.votes.clear_voted_heights();
 
         let fallback_actions =
             state.build_and_broadcast_fallback_block(&topology, BlockHeight::new(4), Round::new(1));

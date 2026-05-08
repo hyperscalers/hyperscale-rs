@@ -637,7 +637,7 @@ impl BlockSyncManager {
         }
 
         let next_needed_height = committed_height.next();
-        let has_pending_commit = commits.out_of_order.contains_key(&next_needed_height);
+        let has_pending_commit = commits.has_out_of_order_at(next_needed_height);
         let gap = qc_height - committed_height;
         let view_changes_since_qc_advance =
             view_changes.saturating_sub(self.view_changes_at_last_qc_advance);
@@ -671,8 +671,8 @@ impl BlockSyncManager {
                 gap = gap,
                 has_next_complete = has_next_block,
                 has_pending_commit = has_pending_commit,
-                pending_commits = commits.out_of_order.len(),
-                pending_commits_awaiting_data = commits.awaiting_data.len(),
+                pending_commits = commits.out_of_order_len(),
+                pending_commits_awaiting_data = commits.awaiting_data_len(),
                 pending_blocks = pending_blocks_len,
                 "Sync health check status"
             );

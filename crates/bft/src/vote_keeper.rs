@@ -35,7 +35,7 @@ pub use crate::vote_set::VoteSet;
 /// record used for equivocation detection.
 pub struct VoteKeeper {
     /// Vote sets for blocks being voted on (`block_hash` -> vote set).
-    pub(crate) vote_sets: HashMap<BlockHash, VoteSet>,
+    vote_sets: HashMap<BlockHash, VoteSet>,
 
     /// Own-vote locking: tracks which block hash we voted for at each height.
     /// Critical for BFT safety — prevents voting for conflicting blocks at the
@@ -43,13 +43,13 @@ pub struct VoteKeeper {
     /// timeout or when a QC proves the lock is irrelevant.
     ///
     /// Key: height, Value: (`block_hash`, round)
-    pub(crate) voted_heights: HashMap<BlockHeight, (BlockHash, Round)>,
+    voted_heights: HashMap<BlockHeight, (BlockHash, Round)>,
 
     /// Per-validator record of received verified votes for equivocation
     /// detection. Key: (height, validator), Value: (`block_hash`, round).
     /// A different-block vote at the same (height, round) is equivocation;
     /// at a later round it's a legitimate revote after unlock.
-    pub(crate) received_votes_by_height: HashMap<(BlockHeight, ValidatorId), (BlockHash, Round)>,
+    received_votes_by_height: HashMap<(BlockHeight, ValidatorId), (BlockHash, Round)>,
 }
 
 impl VoteKeeper {
@@ -152,6 +152,34 @@ impl VoteKeeper {
     /// True if any own vote has been recorded at `height`.
     pub fn is_locked_at(&self, height: BlockHeight) -> bool {
         self.voted_heights.contains_key(&height)
+    }
+
+    /// Drop every own-vote lock. Test/recovery use only.
+    #[cfg(test)]
+    pub fn clear_voted_heights(&mut self) {
+        self.voted_heights.clear();
+    }
+
+    /// Verified received vote for `(height, voter)`, if any.
+    #[cfg(test)]
+    #[must_use]
+    pub fn received_vote(
+        &self,
+        height: BlockHeight,
+        voter: ValidatorId,
+    ) -> Option<(BlockHash, Round)> {
+        self.received_votes_by_height.get(&(height, voter)).copied()
+    }
+
+    /// Stamp a late-arriving header into a buffered vote set so QC aggregation
+    /// has the `parent_block_hash` it needs. Returns `true` if a matching
+    /// vote set was present and updated.
+    pub fn link_header(&mut self, block_hash: BlockHash, header: &BlockHeader) -> bool {
+        let Some(vote_set) = self.vote_sets.get_mut(&block_hash) else {
+            return false;
+        };
+        vote_set.set_header(header);
+        true
     }
 
     // ═══════════════════════════════════════════════════════════════════════
