@@ -1,13 +1,14 @@
 //! Block header containing consensus metadata.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use sbor::prelude::*;
 
 use crate::{
-    BlockHash, BlockHeight, CertificateRoot, Hash, InFlightCount, LocalReceiptRoot,
-    ProposerTimestamp, ProvisionTxRoot, ProvisionsRoot, QuorumCertificate, Round, ShardGroupId,
-    StateRoot, TransactionRoot, ValidatorId, WaveId,
+    BlockHash, BlockHeight, BoundedBTreeMap, BoundedVec, CertificateRoot, Hash, InFlightCount,
+    LocalReceiptRoot, MAX_REMOTE_SHARDS_PER_WAVE, MAX_TXS_PER_BLOCK, ProposerTimestamp,
+    ProvisionTxRoot, ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, StateRoot,
+    TransactionRoot, ValidatorId, WaveId,
 };
 
 /// Block header containing consensus metadata.
@@ -102,7 +103,10 @@ pub struct BlockHeader {
     /// Provisions completeness is handled separately via
     /// [`BlockHeader::provision_tx_roots`]. Empty for genesis, fallback, and
     /// sync blocks.
-    pub waves: Vec<WaveId>,
+    ///
+    /// Capped at [`MAX_TXS_PER_BLOCK`] — every wave covers ≥1 distinct tx,
+    /// so the wave count is bounded by the per-block tx count.
+    pub waves: BoundedVec<WaveId, MAX_TXS_PER_BLOCK>,
 
     /// Per-target-shard merkle commitment over the tx hashes a target shard
     /// should receive provisions for from this block.
@@ -115,7 +119,12 @@ pub struct BlockHeader {
     ///
     /// Entries only exist for targets with ≥1 tx. Empty for genesis,
     /// single-shard-only blocks, and empty blocks.
-    pub provision_tx_roots: BTreeMap<ShardGroupId, ProvisionTxRoot>,
+    ///
+    /// Capped at [`MAX_REMOTE_SHARDS_PER_WAVE`] — same domain (remote
+    /// shards) as the per-wave dependency set; one entry per touched
+    /// target shard.
+    pub provision_tx_roots:
+        BoundedBTreeMap<ShardGroupId, ProvisionTxRoot, MAX_REMOTE_SHARDS_PER_WAVE>,
 
     /// Approximate number of in-flight transactions on this shard at proposal time.
     ///
@@ -153,8 +162,8 @@ impl BlockHeader {
             certificate_root: CertificateRoot::ZERO,
             local_receipt_root: LocalReceiptRoot::ZERO,
             provision_root: ProvisionsRoot::ZERO,
-            waves: vec![],
-            provision_tx_roots: BTreeMap::new(),
+            waves: BoundedVec::new(),
+            provision_tx_roots: BoundedBTreeMap::new(),
             in_flight: InFlightCount::ZERO,
         }
     }
@@ -165,7 +174,7 @@ impl BlockHeader {
     #[must_use]
     pub fn provision_targets(&self) -> Vec<ShardGroupId> {
         let mut set = BTreeSet::new();
-        for wave in &self.waves {
+        for wave in self.waves.iter() {
             set.extend(wave.remote_shards.iter().copied());
         }
         set.into_iter().collect()
@@ -193,5 +202,101 @@ impl BlockHeader {
     #[must_use]
     pub const fn expected_proposer(&self, num_validators: u64) -> ValidatorId {
         ValidatorId::new((self.height.inner() + self.round.inner()) % num_validators)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sbor::{
+        BASIC_SBOR_V1_MAX_DEPTH, BASIC_SBOR_V1_PAYLOAD_PREFIX, Categorize as _, DecodeError,
+        Encoder as _, NoCustomValueKind, ValueKind, VecEncoder, basic_decode,
+    };
+
+    use super::*;
+
+    fn sample_header() -> BlockHeader {
+        BlockHeader::genesis(ShardGroupId::new(0), ValidatorId::new(0), StateRoot::ZERO)
+    }
+
+    /// Hand-roll a `BlockHeader` whose `waves` length prefix exceeds the cap.
+    /// The `BoundedVec` decoder fires before any per-element work happens.
+    #[test]
+    fn decode_rejects_oversized_waves_count() {
+        let h = sample_header();
+        let mut buf = Vec::with_capacity(256);
+        {
+            let mut enc = VecEncoder::<NoCustomValueKind>::new(&mut buf, BASIC_SBOR_V1_MAX_DEPTH);
+            enc.write_payload_prefix(BASIC_SBOR_V1_PAYLOAD_PREFIX)
+                .unwrap();
+            enc.write_value_kind(ValueKind::Tuple).unwrap();
+            // BlockHeader has 16 fields.
+            enc.write_size(16).unwrap();
+            enc.encode(&h.shard_group_id).unwrap();
+            enc.encode(&h.height).unwrap();
+            enc.encode(&h.parent_block_hash).unwrap();
+            enc.encode(&h.parent_qc).unwrap();
+            enc.encode(&h.proposer).unwrap();
+            enc.encode(&h.timestamp).unwrap();
+            enc.encode(&h.round).unwrap();
+            enc.encode(&h.is_fallback).unwrap();
+            enc.encode(&h.state_root).unwrap();
+            enc.encode(&h.transaction_root).unwrap();
+            enc.encode(&h.certificate_root).unwrap();
+            enc.encode(&h.local_receipt_root).unwrap();
+            enc.encode(&h.provision_root).unwrap();
+            // Oversized waves array.
+            enc.write_value_kind(ValueKind::Array).unwrap();
+            enc.write_value_kind(WaveId::value_kind()).unwrap();
+            enc.write_size(MAX_TXS_PER_BLOCK + 1).unwrap();
+        }
+        let err = basic_decode::<BlockHeader>(&buf).unwrap_err();
+        assert!(matches!(
+            err,
+            DecodeError::UnexpectedSize { expected, actual }
+                if expected == MAX_TXS_PER_BLOCK && actual == MAX_TXS_PER_BLOCK + 1
+        ));
+    }
+
+    /// Hand-roll a `BlockHeader` whose `provision_tx_roots` map size exceeds
+    /// the cap. The `BoundedBTreeMap` decoder fires before any per-entry
+    /// work happens.
+    #[test]
+    fn decode_rejects_oversized_provision_tx_roots_count() {
+        let h = sample_header();
+        let mut buf = Vec::with_capacity(256);
+        {
+            let mut enc = VecEncoder::<NoCustomValueKind>::new(&mut buf, BASIC_SBOR_V1_MAX_DEPTH);
+            enc.write_payload_prefix(BASIC_SBOR_V1_PAYLOAD_PREFIX)
+                .unwrap();
+            enc.write_value_kind(ValueKind::Tuple).unwrap();
+            enc.write_size(16).unwrap();
+            enc.encode(&h.shard_group_id).unwrap();
+            enc.encode(&h.height).unwrap();
+            enc.encode(&h.parent_block_hash).unwrap();
+            enc.encode(&h.parent_qc).unwrap();
+            enc.encode(&h.proposer).unwrap();
+            enc.encode(&h.timestamp).unwrap();
+            enc.encode(&h.round).unwrap();
+            enc.encode(&h.is_fallback).unwrap();
+            enc.encode(&h.state_root).unwrap();
+            enc.encode(&h.transaction_root).unwrap();
+            enc.encode(&h.certificate_root).unwrap();
+            enc.encode(&h.local_receipt_root).unwrap();
+            enc.encode(&h.provision_root).unwrap();
+            // Empty waves.
+            enc.encode(&Vec::<WaveId>::new()).unwrap();
+            // Oversized provision_tx_roots map.
+            enc.write_value_kind(ValueKind::Map).unwrap();
+            enc.write_value_kind(ShardGroupId::value_kind()).unwrap();
+            enc.write_value_kind(ProvisionTxRoot::value_kind()).unwrap();
+            enc.write_size(MAX_REMOTE_SHARDS_PER_WAVE + 1).unwrap();
+        }
+        let err = basic_decode::<BlockHeader>(&buf).unwrap_err();
+        assert!(matches!(
+            err,
+            DecodeError::UnexpectedSize { expected, actual }
+                if expected == MAX_REMOTE_SHARDS_PER_WAVE
+                    && actual == MAX_REMOTE_SHARDS_PER_WAVE + 1
+        ));
     }
 }

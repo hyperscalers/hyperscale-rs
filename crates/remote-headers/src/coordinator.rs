@@ -582,12 +582,10 @@ impl RemoteHeaderCoordinator {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use hyperscale_types::{
-        BlockHash, BlockHeader, CertificateRoot, Hash, InFlightCount, LocalReceiptRoot,
-        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, StateRoot,
-        TransactionRoot, ValidatorId,
+        BlockHash, BlockHeader, BoundedBTreeMap, BoundedVec, CertificateRoot, Hash, InFlightCount,
+        LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round,
+        ShardGroupId, StateRoot, TransactionRoot, ValidatorId,
     };
 
     use super::*;
@@ -621,8 +619,8 @@ mod tests {
             certificate_root: CertificateRoot::ZERO,
             local_receipt_root: LocalReceiptRoot::ZERO,
             provision_root: ProvisionsRoot::ZERO,
-            waves: vec![],
-            provision_tx_roots: BTreeMap::new(),
+            waves: BoundedVec::new(),
+            provision_tx_roots: BoundedBTreeMap::new(),
             in_flight: InFlightCount::ZERO,
         };
         let mut qc = QuorumCertificate::genesis(ShardGroupId::new(0));

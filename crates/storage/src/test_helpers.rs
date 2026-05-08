@@ -4,18 +4,18 @@
 //! `WaveCertificate`, `Block`, and `QuorumCertificate` so that
 //! storage-memory and storage-rocksdb tests can share a single source of truth.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use hyperscale_types::test_utils::test_event_type_identifier;
 use hyperscale_types::{
-    ApplicationEvent, Block, BlockHash, BlockHeader, BlockHeight, Bls12381G2Signature, BoundedVec,
-    CertificateRoot, ConsensusReceipt, EventData, ExecutionCertificate, ExecutionMetadata,
-    ExecutionOutcome, FeeSummary, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash,
-    InFlightCount, LocalReceiptRoot, LogLevel, NodeId, ProposerTimestamp, ProvisionsRoot,
-    QuorumCertificate, Round, ShardGroupId, SignerBitfield, StateRoot, StoredReceipt,
-    TransactionRoot, TxHash, TxOutcome, ValidatorId, WaveCertificate, WaveId, WeightedTimestamp,
-    compute_global_receipt_root, zero_bls_signature,
+    ApplicationEvent, Block, BlockHash, BlockHeader, BlockHeight, Bls12381G2Signature,
+    BoundedBTreeMap, BoundedVec, CertificateRoot, ConsensusReceipt, EventData,
+    ExecutionCertificate, ExecutionMetadata, ExecutionOutcome, FeeSummary, FinalizedWave,
+    GlobalReceiptHash, GlobalReceiptRoot, Hash, InFlightCount, LocalReceiptRoot, LogLevel, NodeId,
+    ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, SignerBitfield,
+    StateRoot, StoredReceipt, TransactionRoot, TxHash, TxOutcome, ValidatorId, WaveCertificate,
+    WaveId, WeightedTimestamp, compute_global_receipt_root, zero_bls_signature,
 };
 use indexmap::IndexMap;
 use radix_common::math::Decimal;
@@ -130,8 +130,8 @@ pub fn make_test_block(height: BlockHeight) -> Block {
             certificate_root: CertificateRoot::ZERO,
             local_receipt_root: LocalReceiptRoot::ZERO,
             provision_root: ProvisionsRoot::ZERO,
-            waves: vec![],
-            provision_tx_roots: BTreeMap::new(),
+            waves: BoundedVec::new(),
+            provision_tx_roots: BoundedBTreeMap::new(),
             in_flight: InFlightCount::ZERO,
         },
         transactions: Arc::new(BoundedVec::new()),

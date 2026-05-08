@@ -58,12 +58,10 @@ impl VerifiedHeaderBuffer {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use hyperscale_types::{
-        BlockHash, BlockHeader, CertificateRoot, InFlightCount, LocalReceiptRoot,
-        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, StateRoot, TransactionRoot,
-        ValidatorId,
+        BlockHash, BlockHeader, BoundedBTreeMap, BoundedVec, CertificateRoot, InFlightCount,
+        LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, StateRoot,
+        TransactionRoot, ValidatorId,
     };
 
     use super::*;
@@ -83,8 +81,8 @@ mod tests {
             certificate_root: CertificateRoot::ZERO,
             local_receipt_root: LocalReceiptRoot::ZERO,
             provision_root: ProvisionsRoot::ZERO,
-            waves: vec![],
-            provision_tx_roots: BTreeMap::new(),
+            waves: BoundedVec::new(),
+            provision_tx_roots: BoundedBTreeMap::new(),
             in_flight: InFlightCount::ZERO,
         };
         let header_hash = header.hash();

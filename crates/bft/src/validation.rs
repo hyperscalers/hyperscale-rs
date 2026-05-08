@@ -153,7 +153,7 @@ pub fn validate_transaction_ordering(block: &Block) -> Result<(), String> {
 pub fn validate_waves(topology: &TopologySnapshot, block: &Block) -> Result<(), String> {
     let expected = compute_waves(topology, block.height(), block.transactions());
 
-    if block.header().waves != expected {
+    if block.header().waves.0 != expected {
         return Err(format!(
             "waves mismatch: header={:?}, computed={:?}",
             block.header().waves,
@@ -301,13 +301,13 @@ fn verify_hash_sorted(txs: &[Arc<RoutableTransaction>], section: &str) -> Result
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeSet;
 
     use hyperscale_test_helpers::{TestCommittee, make_finalized_wave};
     use hyperscale_types::{
-        BlockHash, BlockHeader, BoundedVec, CertificateRoot, FinalizedWave, Hash, InFlightCount,
-        LocalReceiptRoot, MerkleInclusionProof, ProposerTimestamp, Provisions, ProvisionsRoot,
-        QuorumCertificate, Round, RoutableTransaction, ShardGroupId, StateRoot,
+        BlockHash, BlockHeader, BoundedBTreeMap, BoundedVec, CertificateRoot, FinalizedWave, Hash,
+        InFlightCount, LocalReceiptRoot, MerkleInclusionProof, ProposerTimestamp, Provisions,
+        ProvisionsRoot, QuorumCertificate, Round, RoutableTransaction, ShardGroupId, StateRoot,
         TransactionDecision, TransactionRoot, TxEntries, ValidatorId, ValidatorInfo, ValidatorSet,
         WeightedTimestamp, compute_waves, test_utils,
     };
@@ -341,8 +341,8 @@ mod tests {
             certificate_root: CertificateRoot::ZERO,
             local_receipt_root: LocalReceiptRoot::ZERO,
             provision_root: ProvisionsRoot::ZERO,
-            waves: vec![],
-            provision_tx_roots: BTreeMap::new(),
+            waves: BoundedVec::new(),
+            provision_tx_roots: BoundedBTreeMap::new(),
             in_flight: InFlightCount::ZERO,
         }
     }
@@ -362,8 +362,8 @@ mod tests {
             certificate_root: CertificateRoot::ZERO,
             local_receipt_root: LocalReceiptRoot::ZERO,
             provision_root: ProvisionsRoot::ZERO,
-            waves,
-            provision_tx_roots: BTreeMap::new(),
+            waves: waves.into(),
+            provision_tx_roots: BoundedBTreeMap::new(),
             in_flight: InFlightCount::ZERO,
         };
         Block::Live {

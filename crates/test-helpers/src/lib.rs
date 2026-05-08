@@ -16,14 +16,14 @@
 //! assert!(verify_bls12381_v1(message, committee.public_key(0), &signature));
 //! ```
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey,
-    Bls12381G2Signature, BoundedVec, CertificateRoot, CertifiedBlock, ExecutionCertificate,
-    ExecutionOutcome, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, InFlightCount,
-    LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round,
+    Bls12381G2Signature, BoundedBTreeMap, BoundedVec, CertificateRoot, CertifiedBlock,
+    ExecutionCertificate, ExecutionOutcome, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot,
+    InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round,
     RoutableTransaction, ShardGroupId, SignerBitfield, StateRoot, TopologySnapshot,
     TransactionDecision, TransactionRoot, TxHash, TxOutcome, ValidatorId, ValidatorInfo,
     ValidatorSet, VotePower, WaveCertificate, WaveId, WeightedTimestamp, bls_keypair_from_seed,
@@ -233,8 +233,8 @@ pub fn make_live_block(
         certificate_root: CertificateRoot::ZERO,
         local_receipt_root: LocalReceiptRoot::ZERO,
         provision_root: ProvisionsRoot::ZERO,
-        waves: vec![],
-        provision_tx_roots: BTreeMap::new(),
+        waves: BoundedVec::new(),
+        provision_tx_roots: BoundedBTreeMap::new(),
         in_flight: InFlightCount::ZERO,
     };
     Block::Live {

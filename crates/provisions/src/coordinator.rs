@@ -679,11 +679,11 @@ impl ProvisionCoordinator {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{
-        Block, BlockHash, BlockHeader, Bls12381G1PrivateKey, BoundedVec, CertificateRoot, Hash,
-        InFlightCount, LocalReceiptRoot, MerkleInclusionProof, ProposerTimestamp, ProvisionsRoot,
-        QuorumCertificate, Round, StateRoot, TopologySnapshot, TransactionRoot, TxEntries, TxHash,
-        ValidatorId, ValidatorInfo, ValidatorSet, VotePower, WaveId, WeightedTimestamp,
-        bls_keypair_from_seed,
+        Block, BlockHash, BlockHeader, Bls12381G1PrivateKey, BoundedBTreeMap, BoundedVec,
+        CertificateRoot, Hash, InFlightCount, LocalReceiptRoot, MerkleInclusionProof,
+        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, StateRoot, TopologySnapshot,
+        TransactionRoot, TxEntries, TxHash, ValidatorId, ValidatorInfo, ValidatorSet, VotePower,
+        WaveId, WeightedTimestamp, bls_keypair_from_seed,
     };
     use proptest::bool::ANY as ANY_BOOL;
     use proptest::collection::vec as prop_vec;
@@ -745,7 +745,7 @@ mod tests {
         let header = Arc::get_mut(&mut header_arc).unwrap();
         let raw: Vec<Hash> = tx_hashes.iter().map(|h| h.into_raw()).collect();
         let root = ProvisionTxRoot::from_raw(compute_merkle_root(&raw));
-        header.header.provision_tx_roots.insert(local_shard, root);
+        header.header.provision_tx_roots.0.insert(local_shard, root);
         header_arc
     }
 
@@ -1331,8 +1331,8 @@ mod tests {
             certificate_root: CertificateRoot::ZERO,
             local_receipt_root: LocalReceiptRoot::ZERO,
             provision_root: ProvisionsRoot::ZERO,
-            waves,
-            provision_tx_roots: std::collections::BTreeMap::new(),
+            waves: waves.into(),
+            provision_tx_roots: BoundedBTreeMap::new(),
             in_flight: InFlightCount::ZERO,
         };
         let header_hash = header.hash();

@@ -87,7 +87,7 @@ pub use receipt::global::GlobalReceipt;
 pub use receipt::metadata::{ApplicationEvent, EventData, ExecutionMetadata, FeeSummary, LogLevel};
 pub use receipt::stored::StoredReceipt;
 pub use sbor_codec::{
-    BoundedBTreeSet, BoundedBytes, BoundedLengthError, BoundedString, BoundedVec,
+    BoundedBTreeMap, BoundedBTreeSet, BoundedBytes, BoundedLengthError, BoundedString, BoundedVec,
 };
 pub use signing::{
     DOMAIN_BLOCK_HEADER, DOMAIN_BLOCK_VOTE, DOMAIN_COMMITTED_BLOCK_HEADER, DOMAIN_EXEC_CERT_BATCH,

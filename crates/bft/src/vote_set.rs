@@ -426,9 +426,9 @@ mod test_helpers {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{
-        Bls12381G1PrivateKey, CertificateRoot, Hash, InFlightCount, LocalReceiptRoot,
-        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, ShardGroupId, StateRoot,
-        TransactionRoot, ValidatorId, generate_bls_keypair,
+        Bls12381G1PrivateKey, BoundedBTreeMap, BoundedVec, CertificateRoot, Hash, InFlightCount,
+        LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, ShardGroupId,
+        StateRoot, TransactionRoot, ValidatorId, generate_bls_keypair,
     };
 
     use super::*;
@@ -452,8 +452,8 @@ mod tests {
             certificate_root: CertificateRoot::ZERO,
             local_receipt_root: LocalReceiptRoot::ZERO,
             provision_root: ProvisionsRoot::ZERO,
-            waves: vec![],
-            provision_tx_roots: std::collections::BTreeMap::new(),
+            waves: BoundedVec::new(),
+            provision_tx_roots: BoundedBTreeMap::new(),
             in_flight: InFlightCount::ZERO,
         }
     }

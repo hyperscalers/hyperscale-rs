@@ -3284,14 +3284,13 @@ impl BftCoordinator {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
 
     use hyperscale_core::Action;
     use hyperscale_types::{
-        Bls12381G1PrivateKey, BoundedVec, CertificateRoot, Hash, InFlightCount, LocalReceiptRoot,
-        ProvisionsRoot, RoutableTransaction, ShardGroupId, SignerBitfield, TopologySnapshot,
-        TransactionRoot, ValidatorId, ValidatorInfo, ValidatorSet, VotePower, WeightedTimestamp,
-        generate_bls_keypair, test_utils, zero_bls_signature,
+        Bls12381G1PrivateKey, BoundedBTreeMap, BoundedVec, CertificateRoot, Hash, InFlightCount,
+        LocalReceiptRoot, ProvisionsRoot, RoutableTransaction, ShardGroupId, SignerBitfield,
+        TopologySnapshot, TransactionRoot, ValidatorId, ValidatorInfo, ValidatorSet, VotePower,
+        WeightedTimestamp, generate_bls_keypair, test_utils, zero_bls_signature,
     };
 
     use super::*;
@@ -3382,8 +3381,8 @@ mod tests {
             certificate_root: CertificateRoot::ZERO,
             local_receipt_root: LocalReceiptRoot::ZERO,
             provision_root: ProvisionsRoot::ZERO,
-            waves: vec![],
-            provision_tx_roots: BTreeMap::new(),
+            waves: BoundedVec::new(),
+            provision_tx_roots: BoundedBTreeMap::new(),
             in_flight: InFlightCount::ZERO,
         }
     }

@@ -351,13 +351,12 @@ impl NetworkMessage for GetBlockResponse {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
-        BlockHash, BlockHeight, BloomFilter, BoundedVec, CertificateRoot, Hash, InFlightCount,
-        LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, Round, ShardGroupId, SignerBitfield,
-        StateRoot, TransactionRoot, ValidatorId, WeightedTimestamp, zero_bls_signature,
+        BlockHash, BlockHeight, BloomFilter, BoundedBTreeMap, BoundedVec, CertificateRoot, Hash,
+        InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, Round, ShardGroupId,
+        SignerBitfield, StateRoot, TransactionRoot, ValidatorId, WeightedTimestamp,
+        zero_bls_signature,
     };
 
     use super::*;
@@ -380,8 +379,8 @@ mod tests {
                 certificate_root: CertificateRoot::ZERO,
                 local_receipt_root: LocalReceiptRoot::ZERO,
                 provision_root: ProvisionsRoot::ZERO,
-                waves: vec![],
-                provision_tx_roots: BTreeMap::new(),
+                waves: BoundedVec::new(),
+                provision_tx_roots: BoundedBTreeMap::new(),
                 in_flight: InFlightCount::ZERO,
             },
             transactions: Arc::new(vec![Arc::new(tx)].into()),

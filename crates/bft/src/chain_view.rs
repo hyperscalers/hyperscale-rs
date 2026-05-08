@@ -170,13 +170,12 @@ impl<'a> ChainView<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     use hyperscale_types::{
-        BlockManifest, BoundedVec, CertificateRoot, Hash, LocalReceiptRoot, LocalTimestamp,
-        ProposerTimestamp, ProvisionsRoot, Round, ShardGroupId, TransactionRoot, ValidatorId,
-        WeightedTimestamp,
+        BlockManifest, BoundedBTreeMap, BoundedVec, CertificateRoot, Hash, LocalReceiptRoot,
+        LocalTimestamp, ProposerTimestamp, ProvisionsRoot, Round, ShardGroupId, TransactionRoot,
+        ValidatorId, WeightedTimestamp,
     };
 
     use super::*;
@@ -196,8 +195,8 @@ mod tests {
             certificate_root: CertificateRoot::ZERO,
             local_receipt_root: LocalReceiptRoot::ZERO,
             provision_root: ProvisionsRoot::ZERO,
-            waves: vec![],
-            provision_tx_roots: BTreeMap::new(),
+            waves: BoundedVec::new(),
+            provision_tx_roots: BoundedBTreeMap::new(),
             in_flight: InFlightCount::new(u32::from(height)),
         }
     }

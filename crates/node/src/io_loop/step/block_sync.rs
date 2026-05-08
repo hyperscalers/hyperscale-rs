@@ -371,16 +371,16 @@ fn validate_synced_block(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
-        Block, BlockHash, BlockHeader, Bls12381G2Signature, BoundedVec, CertificateRoot,
-        ConsensusReceipt, ExecutionCertificate, ExecutionOutcome, FinalizedWave, GlobalReceiptHash,
-        GlobalReceiptRoot, InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
-        QuorumCertificate, Round, ShardGroupId, SignerBitfield, StateRoot, TransactionRoot, TxHash,
-        TxOutcome, ValidatorId, WaveCertificate, WaveId, WeightedTimestamp, zero_bls_signature,
+        Block, BlockHash, BlockHeader, Bls12381G2Signature, BoundedBTreeMap, BoundedVec,
+        CertificateRoot, ConsensusReceipt, ExecutionCertificate, ExecutionOutcome, FinalizedWave,
+        GlobalReceiptHash, GlobalReceiptRoot, InFlightCount, LocalReceiptRoot, ProposerTimestamp,
+        ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, SignerBitfield, StateRoot,
+        TransactionRoot, TxHash, TxOutcome, ValidatorId, WaveCertificate, WaveId,
+        WeightedTimestamp, zero_bls_signature,
     };
 
     use super::*;
@@ -402,8 +402,8 @@ mod tests {
             certificate_root: CertificateRoot::ZERO,
             local_receipt_root: LocalReceiptRoot::ZERO,
             provision_root: ProvisionsRoot::ZERO,
-            waves: vec![],
-            provision_tx_roots: BTreeMap::new(),
+            waves: BoundedVec::new(),
+            provision_tx_roots: BoundedBTreeMap::new(),
             in_flight: InFlightCount::ZERO,
         }
     }

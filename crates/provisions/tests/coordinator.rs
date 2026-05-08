@@ -10,10 +10,10 @@ use std::sync::Arc;
 use hyperscale_provisions::{ProvisionConfig, ProvisionCoordinator, ProvisionMemoryStats};
 use hyperscale_test_helpers::TestCommittee;
 use hyperscale_types::{
-    Block, BlockHash, BlockHeader, BlockHeight, BoundedVec, CertificateRoot, CertifiedBlock,
-    CommittedBlockHeader, Hash, InFlightCount, LocalReceiptRoot, LocalTimestamp, ProposerTimestamp,
-    ProvisionHash, ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, StateRoot,
-    TopologySnapshot, TransactionRoot, ValidatorId, WaveId, WeightedTimestamp,
+    Block, BlockHash, BlockHeader, BlockHeight, BoundedBTreeMap, BoundedVec, CertificateRoot,
+    CertifiedBlock, CommittedBlockHeader, Hash, InFlightCount, LocalReceiptRoot, LocalTimestamp,
+    ProposerTimestamp, ProvisionHash, ProvisionsRoot, QuorumCertificate, Round, ShardGroupId,
+    StateRoot, TopologySnapshot, TransactionRoot, ValidatorId, WaveId, WeightedTimestamp,
 };
 
 const TEST_BLOCK_INTERVAL_MS: u64 = 500;
@@ -72,8 +72,8 @@ fn make_remote_header_targeting(
         certificate_root: CertificateRoot::ZERO,
         local_receipt_root: LocalReceiptRoot::ZERO,
         provision_root: ProvisionsRoot::ZERO,
-        waves,
-        provision_tx_roots: std::collections::BTreeMap::new(),
+        waves: waves.into(),
+        provision_tx_roots: BoundedBTreeMap::new(),
         in_flight: InFlightCount::ZERO,
     };
     let header_hash = header.hash();

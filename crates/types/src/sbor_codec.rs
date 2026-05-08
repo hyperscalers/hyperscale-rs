@@ -18,7 +18,7 @@
 //! for fields on any encoded type. Enforced by
 //! `crates/types/tests/no_hash_collections_on_wire.rs`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Display, Formatter};
 use std::ops::Deref;
 
@@ -613,6 +613,136 @@ impl<T: Describe<NoCustomTypeKind>, const MAX: usize> Describe<NoCustomTypeKind>
     }
 }
 
+/// `BTreeMap<K, V>` with a compile-time max-entry-count cap on decode.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct BoundedBTreeMap<K, V, const MAX: usize>(pub BTreeMap<K, V>);
+
+// Manual `Default` so the impl doesn't pick up spurious `K: Default + Ord`
+// or `V: Default` bounds from the derive — an empty `BTreeMap` is
+// constructible regardless. Mirrors `BoundedVec`'s rationale.
+impl<K, V, const MAX: usize> Default for BoundedBTreeMap<K, V, MAX> {
+    fn default() -> Self {
+        Self(BTreeMap::new())
+    }
+}
+
+impl<K: Ord, V, const MAX: usize> BoundedBTreeMap<K, V, MAX> {
+    /// Construct an empty `BoundedBTreeMap`.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self(BTreeMap::new())
+    }
+
+    /// Consume the wrapper and return the inner `BTreeMap<K, V>`.
+    #[must_use]
+    pub fn into_inner(self) -> BTreeMap<K, V> {
+        self.0
+    }
+
+    /// Fallible counterpart of `From<BTreeMap<K, V>>` — returns `Err`
+    /// when the input exceeds `MAX` entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BoundedLengthError`] when `value.len() > MAX`.
+    pub fn try_from_btree_map(value: BTreeMap<K, V>) -> Result<Self, BoundedLengthError> {
+        if value.len() > MAX {
+            return Err(BoundedLengthError {
+                max: MAX,
+                actual: value.len(),
+            });
+        }
+        Ok(Self(value))
+    }
+}
+
+impl<K: Ord, V, const MAX: usize> From<BTreeMap<K, V>> for BoundedBTreeMap<K, V, MAX> {
+    /// Panics if `value.len() > MAX`. Use [`Self::try_from_btree_map`] for
+    /// fallible construction from untrusted input.
+    fn from(value: BTreeMap<K, V>) -> Self {
+        assert!(
+            value.len() <= MAX,
+            "BoundedBTreeMap<_, _, {MAX}> overflow: got {} entries",
+            value.len()
+        );
+        Self(value)
+    }
+}
+
+impl<K, V, const MAX: usize> Deref for BoundedBTreeMap<K, V, MAX> {
+    type Target = BTreeMap<K, V>;
+    fn deref(&self) -> &BTreeMap<K, V> {
+        &self.0
+    }
+}
+
+impl<K, V, const MAX: usize> Categorize<NoCustomValueKind> for BoundedBTreeMap<K, V, MAX> {
+    fn value_kind() -> ValueKind<NoCustomValueKind> {
+        ValueKind::Map
+    }
+}
+
+impl<K, V, E, const MAX: usize> Encode<NoCustomValueKind, E> for BoundedBTreeMap<K, V, MAX>
+where
+    K: Categorize<NoCustomValueKind> + Encode<NoCustomValueKind, E>,
+    V: Categorize<NoCustomValueKind> + Encode<NoCustomValueKind, E>,
+    E: Encoder<NoCustomValueKind>,
+{
+    fn encode_value_kind(&self, encoder: &mut E) -> Result<(), EncodeError> {
+        encoder.write_value_kind(ValueKind::Map)
+    }
+    fn encode_body(&self, encoder: &mut E) -> Result<(), EncodeError> {
+        if self.0.len() > MAX {
+            return Err(EncodeError::SizeTooLarge {
+                actual: self.0.len(),
+                max_allowed: MAX,
+            });
+        }
+        self.0.encode_body(encoder)
+    }
+}
+
+impl<K, V, D, const MAX: usize> Decode<NoCustomValueKind, D> for BoundedBTreeMap<K, V, MAX>
+where
+    K: Categorize<NoCustomValueKind> + Decode<NoCustomValueKind, D> + Ord,
+    V: Categorize<NoCustomValueKind> + Decode<NoCustomValueKind, D>,
+    D: Decoder<NoCustomValueKind>,
+{
+    fn decode_body_with_value_kind(
+        decoder: &mut D,
+        value_kind: ValueKind<NoCustomValueKind>,
+    ) -> Result<Self, DecodeError> {
+        decoder.check_preloaded_value_kind(value_kind, ValueKind::Map)?;
+        let key_kind = decoder.read_and_check_value_kind(K::value_kind())?;
+        let value_kind = decoder.read_and_check_value_kind(V::value_kind())?;
+        let len = decoder.read_size()?;
+        if len > MAX {
+            return Err(DecodeError::UnexpectedSize {
+                expected: MAX,
+                actual: len,
+            });
+        }
+        let mut out = BTreeMap::new();
+        for _ in 0..len {
+            let k = decoder.decode_deeper_body_with_value_kind(key_kind)?;
+            let v = decoder.decode_deeper_body_with_value_kind(value_kind)?;
+            if out.insert(k, v).is_some() {
+                return Err(DecodeError::DuplicateKey);
+            }
+        }
+        Ok(Self(out))
+    }
+}
+
+impl<K: Describe<NoCustomTypeKind>, V: Describe<NoCustomTypeKind>, const MAX: usize>
+    Describe<NoCustomTypeKind> for BoundedBTreeMap<K, V, MAX>
+{
+    const TYPE_ID: RustTypeId = <BTreeMap<K, V> as Describe<NoCustomTypeKind>>::TYPE_ID;
+    fn type_data() -> TypeData<NoCustomTypeKind, RustTypeId> {
+        <BTreeMap<K, V> as Describe<NoCustomTypeKind>>::type_data()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use sbor::{basic_decode, basic_encode};
@@ -688,6 +818,65 @@ mod tests {
             DecodeError::UnexpectedSize {
                 expected: 2,
                 actual: 3
+            }
+        ));
+    }
+
+    #[test]
+    fn bounded_btree_map_roundtrip_and_reject_oversize() {
+        let inner: BTreeMap<u16, u32> = [(1u16, 10u32), (2, 20), (3, 30)].into_iter().collect();
+        let value = BoundedBTreeMap::<u16, u32, 8>(inner.clone());
+        let bytes = basic_encode(&value).unwrap();
+        let decoded: BoundedBTreeMap<u16, u32, 8> = basic_decode(&bytes).unwrap();
+        assert_eq!(decoded.0, inner);
+
+        // Same wire bytes refused by a tighter bound.
+        let err = basic_decode::<BoundedBTreeMap<u16, u32, 2>>(&bytes).unwrap_err();
+        assert!(matches!(
+            err,
+            DecodeError::UnexpectedSize {
+                expected: 2,
+                actual: 3
+            }
+        ));
+    }
+
+    /// Confirms wire-identity with the unwrapped `BTreeMap` — wrapping a
+    /// field can't shift any merkle root.
+    #[test]
+    fn bounded_btree_map_wire_matches_btree_map() {
+        let inner: BTreeMap<u16, u32> = [(1u16, 10u32), (2, 20)].into_iter().collect();
+        let bounded = BoundedBTreeMap::<u16, u32, 32>(inner.clone());
+        assert_eq!(
+            basic_encode(&bounded).unwrap(),
+            basic_encode(&inner).unwrap()
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "BoundedBTreeMap<_, _, 2> overflow")]
+    fn bounded_btree_map_from_panics_on_overflow() {
+        let huge: BTreeMap<u16, u8> = (0..3u16).map(|i| (i, 0u8)).collect();
+        let _ = BoundedBTreeMap::<u16, u8, 2>::from(huge);
+    }
+
+    #[test]
+    fn bounded_btree_map_try_from_returns_err_on_overflow() {
+        let huge: BTreeMap<u16, u8> = (0..5u16).map(|i| (i, 0u8)).collect();
+        let err = BoundedBTreeMap::<u16, u8, 2>::try_from_btree_map(huge).unwrap_err();
+        assert_eq!(err, BoundedLengthError { max: 2, actual: 5 });
+    }
+
+    #[test]
+    fn bounded_btree_map_encode_rejects_oversize_when_field_bypassed() {
+        let huge: BTreeMap<u16, u8> = (0..5u16).map(|i| (i, 0u8)).collect();
+        let smuggled = BoundedBTreeMap::<u16, u8, 2>(huge);
+        let err = basic_encode(&smuggled).unwrap_err();
+        assert!(matches!(
+            err,
+            EncodeError::SizeTooLarge {
+                actual: 5,
+                max_allowed: 2,
             }
         ));
     }

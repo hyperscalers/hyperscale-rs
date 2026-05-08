@@ -79,7 +79,7 @@ mod tests {
             vec![],
         );
         if let Block::Live { ref mut header, .. } = block {
-            header.waves = vec![wave];
+            header.waves = vec![wave].into();
         }
         let committed_header = Arc::new(CommittedBlockHeader::new(
             block.header().clone(),

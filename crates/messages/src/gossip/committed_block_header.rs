@@ -64,12 +64,10 @@ mod tests {
 
     #[test]
     fn test_sbor_roundtrip() {
-        use std::collections::BTreeMap;
-
         use hyperscale_types::{
-            BlockHeader, BlockHeight, CertificateRoot, Hash, LocalReceiptRoot, ProvisionsRoot,
-            QuorumCertificate, Round, ShardGroupId, StateRoot, TransactionRoot, ValidatorId,
-            zero_bls_signature,
+            BlockHeader, BlockHeight, BoundedBTreeMap, BoundedVec, CertificateRoot, Hash,
+            LocalReceiptRoot, ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, StateRoot,
+            TransactionRoot, ValidatorId, zero_bls_signature,
         };
 
         let header = BlockHeader {
@@ -86,8 +84,8 @@ mod tests {
             certificate_root: CertificateRoot::ZERO,
             local_receipt_root: LocalReceiptRoot::ZERO,
             provision_root: ProvisionsRoot::ZERO,
-            waves: vec![],
-            provision_tx_roots: BTreeMap::new(),
+            waves: BoundedVec::new(),
+            provision_tx_roots: BoundedBTreeMap::new(),
             in_flight: InFlightCount::ZERO,
         };
         let qc = QuorumCertificate::genesis(ShardGroupId::new(0));

@@ -728,14 +728,13 @@ impl BlockSyncManager {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     use hyperscale_test_helpers::TestCommittee;
     use hyperscale_types::{
-        Block, BlockHeader, BoundedVec, CertificateRoot, Hash, InFlightCount, LocalReceiptRoot,
-        ProposerTimestamp, ProvisionsRoot, Round, ShardGroupId, StateRoot, TransactionRoot,
-        ValidatorId, ValidatorInfo, ValidatorSet, VotePower,
+        Block, BlockHeader, BoundedBTreeMap, BoundedVec, CertificateRoot, Hash, InFlightCount,
+        LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, Round, ShardGroupId, StateRoot,
+        TransactionRoot, ValidatorId, ValidatorInfo, ValidatorSet, VotePower,
     };
 
     use super::*;
@@ -767,8 +766,8 @@ mod tests {
             certificate_root: CertificateRoot::ZERO,
             local_receipt_root: LocalReceiptRoot::ZERO,
             provision_root: ProvisionsRoot::ZERO,
-            waves: Vec::new(),
-            provision_tx_roots: BTreeMap::new(),
+            waves: BoundedVec::new(),
+            provision_tx_roots: BoundedBTreeMap::new(),
             in_flight: InFlightCount::ZERO,
         }
     }

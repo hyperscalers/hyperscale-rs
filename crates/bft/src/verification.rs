@@ -696,7 +696,7 @@ impl VerificationPipeline {
         self.mark_root_in_flight(block_hash, VerificationKind::ProvisionTxRoots);
         vec![Action::VerifyProvisionTxRoots {
             block_hash,
-            expected: block.header().provision_tx_roots.clone(),
+            expected: block.header().provision_tx_roots.0.clone(),
             transactions: block.transactions().clone(),
             topology_snapshot: topology.clone(),
         }]
@@ -1127,11 +1127,11 @@ impl VerificationPipeline {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
 
     use hyperscale_types::{
-        BoundedVec, CertificateRoot, Hash, LocalReceiptRoot, LocalTimestamp, ProposerTimestamp,
-        QuorumCertificate, Round, RoutableTransaction, ShardGroupId, TransactionRoot, ValidatorId,
+        BoundedBTreeMap, BoundedVec, CertificateRoot, Hash, LocalReceiptRoot, LocalTimestamp,
+        ProposerTimestamp, QuorumCertificate, Round, RoutableTransaction, ShardGroupId,
+        TransactionRoot, ValidatorId,
     };
 
     use super::*;
@@ -1152,8 +1152,8 @@ mod tests {
             certificate_root: CertificateRoot::ZERO,
             local_receipt_root: LocalReceiptRoot::ZERO,
             provision_root: ProvisionsRoot::ZERO,
-            waves: Vec::new(),
-            provision_tx_roots: BTreeMap::new(),
+            waves: BoundedVec::new(),
+            provision_tx_roots: BoundedBTreeMap::new(),
             in_flight: InFlightCount::new(in_flight),
         }
     }

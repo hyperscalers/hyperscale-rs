@@ -499,8 +499,8 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
     let local_receipt_root = compute_local_receipt_root(&receipts);
     let raw_provision_hashes: Vec<Hash> = provision_hashes.iter().map(|h| h.into_raw()).collect();
     let provision_root = compute_provision_root(&raw_provision_hashes);
-    let waves = compute_waves(topology, height, &transactions);
-    let provision_tx_roots = compute_provision_tx_roots(topology, &transactions);
+    let waves = compute_waves(topology, height, &transactions).into();
+    let provision_tx_roots = compute_provision_tx_roots(topology, &transactions).into();
 
     // in_flight is deterministic from chain state:
     // parent's in_flight + new transactions committed - transactions finalized by certificates.
