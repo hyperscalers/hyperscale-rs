@@ -171,22 +171,23 @@ impl VoteKeeper {
         committed_height: BlockHeight,
         header_for_vote: Option<&BlockHeader>,
     ) -> Vec<Action> {
-        let block_hash = vote.block_hash;
-        let height = vote.height;
-        let is_own_vote = vote.voter == topology.local_validator_id();
+        let block_hash = vote.block_hash();
+        let height = vote.height();
+        let voter = vote.voter();
+        let is_own_vote = voter == topology.local_validator_id();
 
         if height <= committed_height {
             trace!(
                 vote_anchor_ts = height.inner(),
                 committed_height = committed_height.inner(),
-                voter = ?vote.voter,
+                voter = ?voter,
                 "Skipping vote for already-committed height"
             );
             return vec![];
         }
 
-        let Some(voter_index) = topology.local_committee_index(vote.voter) else {
-            warn!("Vote from validator {:?} not in committee", vote.voter);
+        let Some(voter_index) = topology.local_committee_index(voter) else {
+            warn!("Vote from validator {:?} not in committee", voter);
             return vec![];
         };
 
@@ -194,7 +195,7 @@ impl VoteKeeper {
         // local committee, and the topology snapshot invariant guarantees
         // every committee member has a positive voting power entry.
         let voting_power = topology
-            .voting_power(vote.voter)
+            .voting_power(voter)
             .expect("committee member has voting power (TopologySnapshot invariant)");
 
         let committee_size = topology.local_committee().len();
@@ -203,10 +204,10 @@ impl VoteKeeper {
 
         let public_key = if is_own_vote {
             None
-        } else if let Some(pk) = topology.public_key(vote.voter) {
+        } else if let Some(pk) = topology.public_key(voter) {
             Some(pk)
         } else {
-            warn!("No public key for validator {:?}", vote.voter);
+            warn!("No public key for validator {:?}", voter);
             return vec![];
         };
 
@@ -216,7 +217,7 @@ impl VoteKeeper {
             .or_insert_with(|| VoteSet::new(header_for_vote, committee_size));
 
         if vote_set.has_seen_validator(voter_index) {
-            trace!("Already seen vote from validator {:?}", vote.voter);
+            trace!("Already seen vote from validator {:?}", voter);
             return vec![];
         }
 
@@ -307,16 +308,16 @@ impl VoteKeeper {
     /// on a different-block vote at the same round. Called after signature
     /// verification so a forged vote can't pre-empt a legitimate one.
     pub fn track_verified_received_vote(&mut self, block_hash: BlockHash, vote: &BlockVote) {
-        match self.record_received_vote(vote.height, vote.voter, block_hash, vote.round) {
+        match self.record_received_vote(vote.height(), vote.voter(), block_hash, vote.round()) {
             RecordResult::Accepted | RecordResult::Duplicate => {}
             RecordResult::Equivocation {
                 existing_block,
                 existing_round: _,
             } => {
                 warn!(
-                    voter = ?vote.voter,
-                    height = vote.height.inner(),
-                    round = vote.round.inner(),
+                    voter = ?vote.voter(),
+                    height = vote.height().inner(),
+                    round = vote.round().inner(),
                     existing_block = ?existing_block,
                     new_block = ?block_hash,
                     "EQUIVOCATION DETECTED: validator voted for different blocks at same height/round"

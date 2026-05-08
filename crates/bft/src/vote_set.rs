@@ -180,9 +180,9 @@ impl VoteSet {
 
         // Update block hash, height, and round from first vote if not set
         if self.block_hash.is_none() {
-            self.block_hash = Some(vote.block_hash);
-            self.height = Some(vote.height);
-            self.round = Some(vote.round);
+            self.block_hash = Some(vote.block_hash());
+            self.height = Some(vote.height());
+            self.round = Some(vote.round());
         }
 
         self.seen_validators[committee_index] = true;
@@ -274,7 +274,7 @@ impl VoteSet {
             // Per-vote monotonicity clamp against parent's weighted timestamp
             // — keeps the aggregated `weighted_timestamp` monotonic regardless
             // of slow-clocked or Byzantine voters.
-            let clamped_ms = vote.timestamp.as_millis().max(floor_ms);
+            let clamped_ms = vote.timestamp().as_millis().max(floor_ms);
             self.verified_timestamp_weight_sum +=
                 u128::from(clamped_ms) * u128::from(voting_power.inner());
             self.verified_power += voting_power;
@@ -310,9 +310,9 @@ impl VoteSet {
 
         // Update block hash, height, and round from first vote if not set
         if self.block_hash.is_none() {
-            self.block_hash = Some(vote.block_hash);
-            self.height = Some(vote.height);
-            self.round = Some(vote.round);
+            self.block_hash = Some(vote.block_hash());
+            self.height = Some(vote.height());
+            self.round = Some(vote.round());
         }
 
         self.seen_validators[committee_index] = true;
@@ -321,7 +321,7 @@ impl VoteSet {
         let floor_ms = self
             .parent_weighted_timestamp
             .map_or(0, WeightedTimestamp::as_millis);
-        let clamped_ms = vote.timestamp.as_millis().max(floor_ms);
+        let clamped_ms = vote.timestamp().as_millis().max(floor_ms);
         self.verified_timestamp_weight_sum +=
             u128::from(clamped_ms) * u128::from(voting_power.inner());
         self.verified_power += voting_power;
@@ -383,7 +383,7 @@ mod test_helpers {
             let signatures: Vec<Bls12381G2Signature> = self
                 .verified_votes
                 .iter()
-                .map(|(_, v, _)| v.signature)
+                .map(|(_, v, _)| v.signature())
                 .collect();
 
             // Aggregate BLS signatures

@@ -55,15 +55,15 @@ mod tests {
 
     #[test]
     fn test_block_vote_gossip_creation() {
-        let vote = BlockVote {
-            block_hash: BlockHash::from_raw(Hash::from_bytes(b"block_hash")),
-            shard_group_id: ShardGroupId::new(0),
-            height: BlockHeight::new(10),
-            round: Round::INITIAL,
-            voter: ValidatorId::new(2),
-            signature: zero_bls_signature(),
-            timestamp: ProposerTimestamp::from_millis(1_000_000_000_000),
-        };
+        let vote = BlockVote::from_parts(
+            BlockHash::from_raw(Hash::from_bytes(b"block_hash")),
+            ShardGroupId::new(0),
+            BlockHeight::new(10),
+            Round::INITIAL,
+            ValidatorId::new(2),
+            zero_bls_signature(),
+            ProposerTimestamp::from_millis(1_000_000_000_000),
+        );
 
         let gossip = BlockVoteNotification::new(vote.clone());
         assert_eq!(gossip.vote(), &vote);
@@ -71,15 +71,15 @@ mod tests {
 
     #[test]
     fn test_block_vote_gossip_into_vote() {
-        let vote = BlockVote {
-            block_hash: BlockHash::from_raw(Hash::from_bytes(b"test")),
-            shard_group_id: ShardGroupId::new(0),
-            height: BlockHeight::new(5),
-            round: Round::INITIAL,
-            voter: ValidatorId::new(1),
-            signature: zero_bls_signature(),
-            timestamp: ProposerTimestamp::from_millis(1_000_000_000_000),
-        };
+        let vote = BlockVote::from_parts(
+            BlockHash::from_raw(Hash::from_bytes(b"test")),
+            ShardGroupId::new(0),
+            BlockHeight::new(5),
+            Round::INITIAL,
+            ValidatorId::new(1),
+            zero_bls_signature(),
+            ProposerTimestamp::from_millis(1_000_000_000_000),
+        );
 
         let gossip = BlockVoteNotification::new(vote.clone());
         let extracted = gossip.into_vote();

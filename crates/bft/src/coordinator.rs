@@ -1565,9 +1565,9 @@ impl BftCoordinator {
     /// Note: The sender identity comes from `vote.voter` (`ValidatorId`), which is
     /// signed and verified.
     #[instrument(skip(self, vote), fields(
-        height = vote.height.inner(),
-        voter = ?vote.voter,
-        block_hash = ?vote.block_hash
+        height = vote.height().inner(),
+        voter = ?vote.voter(),
+        block_hash = ?vote.block_hash()
     ))]
     pub fn on_block_vote(
         &mut self,
@@ -1576,8 +1576,8 @@ impl BftCoordinator {
     ) -> Vec<Action> {
         trace!(
             validator = ?topology_snapshot.local_validator_id(),
-            voter = ?vote.voter,
-            block_hash = ?vote.block_hash,
+            voter = ?vote.voter(),
+            block_hash = ?vote.block_hash(),
             "Received block vote"
         );
 
@@ -1594,7 +1594,7 @@ impl BftCoordinator {
     ) -> Vec<Action> {
         let header_for_vote = self
             .pending_blocks
-            .get(&vote.block_hash)
+            .get(&vote.block_hash())
             .map(PendingBlock::header);
         self.votes.accept_vote(
             topology_snapshot,
@@ -1641,13 +1641,13 @@ impl BftCoordinator {
         let validator_id = topology_snapshot.local_validator_id();
         for (_, vote, _) in &verified_votes {
             let old_view = self.view_change.view;
-            if self.view_change.sync_to_qc_round(vote.round) {
+            if self.view_change.sync_to_qc_round(vote.round()) {
                 info!(
                     validator = ?validator_id,
                     old_view = old_view.inner(),
-                    new_view = vote.round.inner(),
-                    vote_anchor_ts = vote.height.inner(),
-                    voter = ?vote.voter,
+                    new_view = vote.round().inner(),
+                    vote_anchor_ts = vote.height().inner(),
+                    voter = ?vote.voter(),
                     "View synchronization: advancing view to match verified vote"
                 );
             }
@@ -3839,15 +3839,15 @@ mod tests {
         let height = BlockHeight::new(5);
         let voter = ValidatorId::new(2);
         let block_b = BlockHash::from_raw(Hash::from_bytes(b"legitimate_block"));
-        let vote = BlockVote {
-            block_hash: block_b,
-            shard_group_id: ShardGroupId::new(0),
+        let vote = BlockVote::from_parts(
+            block_b,
+            ShardGroupId::new(0),
             height,
-            round: Round::new(0),
+            Round::new(0),
             voter,
-            signature: zero_bls_signature(),
-            timestamp: ProposerTimestamp::from_millis(100_000),
-        };
+            zero_bls_signature(),
+            ProposerTimestamp::from_millis(100_000),
+        );
 
         let _ = state.on_qc_result(&topology, block_b, None, vec![(0, vote, VotePower::new(1))]);
 

@@ -117,7 +117,7 @@ pub fn verify_vote_batch(
 
     let signatures: Vec<Bls12381G2Signature> = votes_to_verify
         .iter()
-        .map(|(_, v, _, _)| v.signature)
+        .map(|(_, v, _, _)| v.signature())
         .collect();
     let public_keys: Vec<Bls12381G1PublicKey> =
         votes_to_verify.iter().map(|(_, _, pk, _)| *pk).collect();
@@ -136,11 +136,11 @@ pub fn verify_vote_batch(
     );
 
     for (idx, vote, pk, power) in votes_to_verify {
-        if verify_bls12381_v1(signing_message, &pk, &vote.signature) {
+        if verify_bls12381_v1(signing_message, &pk, &vote.signature()) {
             all_verified.push((idx, vote, power));
         } else {
             tracing::warn!(
-                voter = ?vote.voter,
+                voter = ?vote.voter(),
                 ?block_hash,
                 "Invalid vote signature detected"
             );
@@ -170,7 +170,8 @@ pub fn build_qc_from_verified(
     let mut sorted: Vec<_> = verified_votes.to_vec();
     sorted.sort_by_key(|(idx, _, _)| *idx);
 
-    let signatures: Vec<Bls12381G2Signature> = sorted.iter().map(|(_, v, _)| v.signature).collect();
+    let signatures: Vec<Bls12381G2Signature> =
+        sorted.iter().map(|(_, v, _)| v.signature()).collect();
     let aggregated_signature = match Bls12381G2Signature::aggregate(&signatures, true) {
         Ok(sig) => sig,
         Err(e) => {
@@ -190,7 +191,7 @@ pub fn build_qc_from_verified(
         // `weighted_timestamp` (slow honest clock or Byzantine voter) is
         // raised to the floor before aggregation, so the resulting QC's
         // `weighted_timestamp` is guaranteed >= parent's.
-        let clamped_ms = vote.timestamp.as_millis().max(floor_ms);
+        let clamped_ms = vote.timestamp().as_millis().max(floor_ms);
         timestamp_weight_sum += u128::from(clamped_ms) * u128::from(power.inner());
         verified_power += *power;
     }
@@ -1015,9 +1016,18 @@ mod tests {
 
         // Vote 1's signature is replaced by a signature over a different block.
         let other_hash = BlockHash::from_raw(Hash::from_bytes(b"other"));
-        let mut bad_vote = make_vote(&keys, 1, block_hash, height, round, 1000);
+        let bad_vote = make_vote(&keys, 1, block_hash, height, round, 1000);
         let bad_signing_vote = make_vote(&keys, 1, other_hash, height, round, 1000);
-        bad_vote.signature = bad_signing_vote.signature;
+        let (block_hash_v, sg, h, r, voter, _, ts) = bad_vote.into_parts();
+        let bad_vote = BlockVote::from_parts(
+            block_hash_v,
+            sg,
+            h,
+            r,
+            voter,
+            bad_signing_vote.signature(),
+            ts,
+        );
 
         let to_verify = vec![
             (
