@@ -103,10 +103,7 @@ pub fn make_test_wave_certificate(height: BlockHeight, shard: ShardGroupId) -> W
         Bls12381G2Signature([0u8; 96]),
         SignerBitfield::empty(),
     ));
-    WaveCertificate {
-        wave_id,
-        execution_certificates: vec![local_ec],
-    }
+    WaveCertificate::new(wave_id, vec![local_ec])
 }
 
 /// Build a minimal `Block` at the given height.
@@ -229,10 +226,7 @@ fn make_test_block_with_ecs(height: BlockHeight, ecs: Vec<Arc<ExecutionCertifica
     if ecs.is_empty() {
         return block;
     }
-    let certificate = Arc::new(WaveCertificate {
-        wave_id: ecs[0].wave_id.clone(),
-        execution_certificates: ecs,
-    });
+    let certificate = Arc::new(WaveCertificate::new(ecs[0].wave_id.clone(), ecs));
     let new_fw = Arc::new(FinalizedWave::new(certificate, vec![]));
     match block {
         Block::Live {

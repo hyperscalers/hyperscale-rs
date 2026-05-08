@@ -132,14 +132,14 @@ mod tests {
                 SignerBitfield::new(4),
             ));
             Arc::new(FinalizedWave {
-                certificate: Arc::new(WaveCertificate {
-                    wave_id: WaveId::new(
+                certificate: Arc::new(WaveCertificate::new(
+                    WaveId::new(
                         ShardGroupId::new(0),
                         BlockHeight::new(10),
                         BTreeSet::from([ShardGroupId::new(1)]),
                     ),
-                    execution_certificates: vec![ec],
-                }),
+                    vec![ec],
+                )),
                 receipts: BoundedVec::new(),
             })
         };
@@ -166,10 +166,10 @@ mod tests {
             Bls12381G2Signature([0u8; 96]),
             SignerBitfield::new(4),
         ));
-        let cert = Arc::new(WaveCertificate {
-            wave_id: WaveId::new(ShardGroupId::new(0), BlockHeight::new(10), BTreeSet::new()),
-            execution_certificates: vec![ec],
-        });
+        let cert = Arc::new(WaveCertificate::new(
+            WaveId::new(ShardGroupId::new(0), BlockHeight::new(10), BTreeSet::new()),
+            vec![ec],
+        ));
         let expected_receipt_hash = cert.receipt_hash();
         let fw = Arc::new(FinalizedWave {
             certificate: cert,

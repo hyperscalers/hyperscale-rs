@@ -520,10 +520,7 @@ mod tests {
         assert!(!pb.is_complete());
 
         let fw = Arc::new(FinalizedWave {
-            certificate: Arc::new(WaveCertificate {
-                wave_id,
-                execution_certificates: vec![],
-            }),
+            certificate: Arc::new(WaveCertificate::new(wave_id, vec![])),
             receipts: BoundedVec::new(),
         });
 
@@ -559,10 +556,7 @@ mod tests {
 
         // Add finalized wave
         let fw = Arc::new(FinalizedWave {
-            certificate: Arc::new(WaveCertificate {
-                wave_id,
-                execution_certificates: vec![],
-            }),
+            certificate: Arc::new(WaveCertificate::new(wave_id, vec![])),
             receipts: BoundedVec::new(),
         });
         pb.add_finalized_wave(fw);
@@ -572,10 +566,7 @@ mod tests {
     #[test]
     fn test_from_complete_block_is_complete() {
         let wave_id = WaveId::new(ShardGroupId::new(0), BlockHeight::new(1), BTreeSet::new());
-        let cert = Arc::new(WaveCertificate {
-            wave_id,
-            execution_certificates: vec![],
-        });
+        let cert = Arc::new(WaveCertificate::new(wave_id, vec![]));
 
         let fw = Arc::new(FinalizedWave {
             certificate: cert,

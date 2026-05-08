@@ -465,10 +465,7 @@ mod tests {
             metadata: None,
         };
         let fw = Arc::new(FinalizedWave {
-            certificate: Arc::new(WaveCertificate {
-                wave_id,
-                execution_certificates: vec![Arc::new(ec)],
-            }),
+            certificate: Arc::new(WaveCertificate::new(wave_id, vec![Arc::new(ec)])),
             receipts: vec![receipt.clone()].into(),
         });
         let lrr = compute_local_receipt_root(&[receipt]);
@@ -623,10 +620,7 @@ mod tests {
             metadata: None,
         };
         let fw = Arc::new(FinalizedWave {
-            certificate: Arc::new(WaveCertificate {
-                wave_id,
-                execution_certificates: vec![Arc::new(ec)],
-            }),
+            certificate: Arc::new(WaveCertificate::new(wave_id, vec![Arc::new(ec)])),
             receipts: vec![receipt.clone()].into(),
         });
         let mut h = header();

@@ -44,19 +44,45 @@ const MAX_EXECUTION_CERTIFICATES_PER_WAVE: usize = 1024;
 /// `expect` this invariant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WaveCertificate {
+    wave_id: WaveId,
+    execution_certificates: Vec<Arc<ExecutionCertificate>>,
+}
+
+impl WaveCertificate {
+    /// Build a `WaveCertificate` from its parts.
+    ///
+    /// Does not validate the exactly-one-local-EC invariant; that is
+    /// enforced at the wire boundary by the `Decode` impl and at the
+    /// build boundary by `WaveCertificateTracker::create_wave_certificate`.
+    #[must_use]
+    pub const fn new(
+        wave_id: WaveId,
+        execution_certificates: Vec<Arc<ExecutionCertificate>>,
+    ) -> Self {
+        Self {
+            wave_id,
+            execution_certificates,
+        }
+    }
+
     /// Self-contained wave identifier (shard + height + remote dependencies).
     /// Globally unique. `hash(wave_id)` = identity key for manifest/storage.
-    pub wave_id: WaveId,
+    #[must_use]
+    pub const fn wave_id(&self) -> &WaveId {
+        &self.wave_id
+    }
+
     /// Execution certificates from all participating shards.
     /// Always includes the local EC (see invariant above).
     /// May contain multiple ECs from the same remote shard — this happens when
     /// a remote shard committed this wave's transactions across multiple blocks,
     /// producing separate ECs.
     /// Sorted by (`shard_group_id`, `wave_id`) for deterministic `receipt_hash`.
-    pub execution_certificates: Vec<Arc<ExecutionCertificate>>,
-}
+    #[must_use]
+    pub fn execution_certificates(&self) -> &[Arc<ExecutionCertificate>] {
+        &self.execution_certificates
+    }
 
-impl WaveCertificate {
     /// Compute the receipt hash for this wave certificate.
     ///
     /// Hashes sorted (`shard_group_id`, `wave_id`) pairs. The vec is
@@ -76,12 +102,6 @@ impl WaveCertificate {
             hasher.update(&basic_encode(&ec.wave_id).unwrap());
         }
         WaveReceiptHash::from_raw(Hash::from_hash_bytes(hasher.finalize().as_bytes()))
-    }
-
-    /// Get the execution certificates.
-    #[must_use]
-    pub fn execution_certificates(&self) -> &[Arc<ExecutionCertificate>] {
-        &self.execution_certificates
     }
 }
 

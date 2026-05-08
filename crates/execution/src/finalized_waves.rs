@@ -150,10 +150,7 @@ mod tests {
             zero_bls_signature(),
             SignerBitfield::new(4),
         );
-        let cert = WaveCertificate {
-            wave_id: wave_id.clone(),
-            execution_certificates: vec![Arc::new(ec)],
-        };
+        let cert = WaveCertificate::new(wave_id.clone(), vec![Arc::new(ec)]);
         // Lookups in this module only inspect the certificate's outcomes; an
         // empty receipts vector is fine for the store's contract.
         let fw = FinalizedWave {
@@ -185,7 +182,7 @@ mod tests {
         assert!(store.contains(&wid));
         assert_eq!(store.len(), 1);
         let cert = store.get_certificate_for_tx(&tx).expect("cert present");
-        assert_eq!(cert.wave_id, wid);
+        assert_eq!(cert.wave_id(), &wid);
     }
 
     #[test]
@@ -197,7 +194,7 @@ mod tests {
         store.insert(wid.clone(), fw);
 
         let looked_up = store.get(&wid).expect("wave present by id");
-        assert_eq!(looked_up.certificate.wave_id, wid);
+        assert_eq!(looked_up.certificate.wave_id(), &wid);
 
         // Unknown id returns None.
         assert!(store.get(&make_wave_id(99)).is_none());
@@ -283,7 +280,7 @@ mod tests {
         let waves = store.all_waves();
         assert_eq!(waves.len(), 2);
         // BTreeMap iteration is ordered by key; lower block_height comes first.
-        assert_eq!(waves[0].certificate.wave_id.block_height().inner(), 1);
-        assert_eq!(waves[1].certificate.wave_id.block_height().inner(), 5);
+        assert_eq!(waves[0].certificate.wave_id().block_height().inner(), 1);
+        assert_eq!(waves[1].certificate.wave_id().block_height().inner(), 5);
     }
 }

@@ -559,7 +559,7 @@ mod test_helpers {
         /// # Panics
         /// Panics if the synced commit fails.
         #[instrument(level = Level::DEBUG, skip_all, fields(
-            wave_id = ?certificate.wave_id,
+            wave_id = ?certificate.wave_id(),
             latency_us = Empty,
             otel.kind = "INTERNAL",
         ))]
@@ -572,7 +572,7 @@ mod test_helpers {
             let mut batch = WriteBatch::default();
             let mut write_count = 0usize;
 
-            self.cf_put::<CertificatesCf>(&mut batch, &certificate.wave_id, certificate);
+            self.cf_put::<CertificatesCf>(&mut batch, certificate.wave_id(), certificate);
             write_count += 1;
 
             // Append substate writes to the cert batch at the current JMT
@@ -600,7 +600,7 @@ mod test_helpers {
                 .expect("commit_certificate_with_writes: synced commit failed");
 
             tracing::debug!(
-                wave_id = ?certificate.wave_id,
+                wave_id = ?certificate.wave_id(),
                 write_count,
                 "Certificate state writes committed (JMT deferred to block commit)"
             );

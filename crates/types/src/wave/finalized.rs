@@ -95,13 +95,13 @@ impl FinalizedWave {
     /// Get the wave ID from the certificate.
     #[must_use]
     pub fn wave_id(&self) -> &WaveId {
-        &self.certificate.wave_id
+        self.certificate.wave_id()
     }
 
     /// Get the execution certificates (from the wave certificate).
     #[must_use]
     pub fn execution_certificates(&self) -> &[Arc<ExecutionCertificate>] {
-        &self.certificate.execution_certificates
+        self.certificate.execution_certificates()
     }
 
     /// The local shard's EC — authoritative for wave membership and ordering.
@@ -117,9 +117,9 @@ impl FinalizedWave {
     #[must_use]
     pub fn local_ec(&self) -> &ExecutionCertificate {
         self.certificate
-            .execution_certificates
+            .execution_certificates()
             .iter()
-            .find(|ec| ec.wave_id == self.certificate.wave_id)
+            .find(|ec| &ec.wave_id == self.certificate.wave_id())
             .expect("WaveCertificate invariant: local EC must be present")
     }
 
@@ -167,9 +167,9 @@ impl FinalizedWave {
         F: FnMut(&TxHash) -> Option<Arc<ConsensusReceipt>>,
     {
         let local_ec = certificate
-            .execution_certificates
+            .execution_certificates()
             .iter()
-            .find(|ec| ec.wave_id == certificate.wave_id)?;
+            .find(|ec| &ec.wave_id == certificate.wave_id())?;
 
         let mut receipts: Vec<StoredReceipt> = Vec::with_capacity(local_ec.tx_outcomes.len());
         for outcome in &local_ec.tx_outcomes {
@@ -217,9 +217,9 @@ impl FinalizedWave {
     pub fn validate_receipts_against_ec(&self) -> Result<(), ReceiptValidationError> {
         let local_ec = self
             .certificate
-            .execution_certificates
+            .execution_certificates()
             .iter()
-            .find(|ec| ec.wave_id == self.certificate.wave_id)
+            .find(|ec| &ec.wave_id == self.certificate.wave_id())
             .ok_or(ReceiptValidationError::MissingLocalEc)?;
 
         let mut receipt_iter = self.receipts.iter();
@@ -288,7 +288,7 @@ impl FinalizedWave {
     pub fn tx_decisions(&self) -> Vec<(TxHash, TransactionDecision)> {
         let mut aborted: HashSet<TxHash> = HashSet::new();
         let mut failure: HashSet<TxHash> = HashSet::new();
-        for ec in &self.certificate.execution_certificates {
+        for ec in self.certificate.execution_certificates() {
             for outcome in &ec.tx_outcomes {
                 if outcome.is_aborted() {
                     aborted.insert(outcome.tx_hash());

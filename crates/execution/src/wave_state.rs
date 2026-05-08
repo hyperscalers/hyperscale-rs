@@ -737,10 +737,7 @@ impl WaveState {
             (&a.shard_group_id(), &a.wave_id).cmp(&(&b.shard_group_id(), &b.wave_id))
         });
 
-        WaveCertificate {
-            wave_id: self.wave_id.clone(),
-            execution_certificates: ecs,
-        }
+        WaveCertificate::new(self.wave_id.clone(), ecs)
     }
 
     /// Per-tx terminal decisions derived from collected ECs.

@@ -179,13 +179,13 @@ fn test_commit_certificate_with_writes_persists_both() {
 
     let updates = make_mapped_database_update(1, 0, vec![10, 20], vec![99, 88, 77]);
     let cert = make_test_wave_certificate(BlockHeight::new(42), ShardGroupId::new(0));
-    let wave_id = cert.wave_id.clone();
+    let wave_id = cert.wave_id().clone();
 
     storage.commit_certificate_with_writes(&cert, &updates);
 
     let stored_cert = storage.get_certificate(&wave_id);
     assert!(stored_cert.is_some());
-    assert_eq!(stored_cert.unwrap().wave_id, wave_id);
+    assert_eq!(stored_cert.unwrap().wave_id(), &wave_id);
 
     // Verify the substate was written to the state CF via direct key lookup.
     // make_mapped_database_update uses SpreadPrefixKeyMapper, so extract the
@@ -289,14 +289,14 @@ fn test_certificate_idempotency() {
 
     let updates = make_mapped_database_update(1, 0, vec![10, 20], vec![99, 88, 77]);
     let cert = make_test_wave_certificate(BlockHeight::new(42), ShardGroupId::new(0));
-    let wave_id = cert.wave_id.clone();
+    let wave_id = cert.wave_id().clone();
 
     storage.commit_certificate_with_writes(&cert, &updates);
     storage.commit_certificate_with_writes(&cert, &updates);
 
     let stored = storage.get_certificate(&wave_id);
     assert!(stored.is_some());
-    assert_eq!(stored.unwrap().wave_id, wave_id);
+    assert_eq!(stored.unwrap().wave_id(), &wave_id);
 }
 
 #[test]
@@ -405,17 +405,14 @@ fn push_wave(block: &mut Block, fw: Arc<FinalizedWave>) {
 /// can apply them.
 fn attach_receipts(block: &mut Block, receipts: Vec<StoredReceipt>) {
     let new_fw = Arc::new(FinalizedWave {
-        certificate: Arc::new(WaveCertificate {
-            wave_id: WaveId::new(
+        certificate: Arc::new(WaveCertificate::new(
+            WaveId::new(
                 ShardGroupId::new(0),
                 block.height(),
                 std::collections::BTreeSet::new(),
             ),
-            execution_certificates: vec![placeholder_local_ec(
-                ShardGroupId::new(0),
-                block.height(),
-            )],
-        }),
+            vec![placeholder_local_ec(ShardGroupId::new(0), block.height())],
+        )),
         receipts: receipts.into(),
     });
     // Take block out, mutate, and put back.
@@ -539,7 +536,7 @@ fn test_commit_block_stores_certificates() {
 
     let shard = ShardGroupId::new(0);
     let cert = Arc::new(make_test_wave_certificate(BlockHeight::new(1), shard));
-    let wave_id = cert.wave_id.clone();
+    let wave_id = cert.wave_id().clone();
 
     // Create a block that includes this certificate
     let block = make_test_block(BlockHeight::new(1));
@@ -604,8 +601,8 @@ fn test_certificates_batch() {
 
     let cert1 = make_test_wave_certificate(BlockHeight::new(1), ShardGroupId::new(0));
     let cert2 = make_test_wave_certificate(BlockHeight::new(2), ShardGroupId::new(0));
-    let id1 = cert1.wave_id.clone();
-    let id2 = cert2.wave_id.clone();
+    let id1 = cert1.wave_id().clone();
+    let id2 = cert2.wave_id().clone();
 
     storage.put_certificate(&id1, &cert1);
     storage.put_certificate(&id2, &cert2);
@@ -620,7 +617,7 @@ fn test_certificates_batch() {
     );
     let partial = storage.get_certificates_batch(&[id1.clone(), missing]);
     assert_eq!(partial.len(), 1);
-    assert_eq!(partial[0].wave_id, id1);
+    assert_eq!(partial[0].wave_id(), &id1);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -678,12 +675,12 @@ fn test_certificate_store_and_retrieve() {
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
     let cert = make_test_wave_certificate(BlockHeight::new(1), ShardGroupId::new(0));
-    let wave_id = cert.wave_id.clone();
+    let wave_id = cert.wave_id().clone();
 
     storage.put_certificate(&wave_id, &cert);
 
     let stored = storage.get_certificate(&wave_id).unwrap();
-    assert_eq!(stored.wave_id, wave_id);
+    assert_eq!(stored.wave_id(), &wave_id);
 }
 
 #[test]
@@ -726,7 +723,7 @@ fn test_commit_certificate_via_commit_store() {
 
     assert_eq!(storage.jmt_height(), BlockHeight::new(0));
     assert_eq!(storage.state_root(), StateRoot::ZERO);
-    assert!(storage.get_certificate(&cert.wave_id).is_some());
+    assert!(storage.get_certificate(cert.wave_id()).is_some());
 }
 
 #[test]
@@ -754,7 +751,7 @@ fn test_substates_survive_reopen() {
         let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
         let updates = make_mapped_database_update(1, 0, vec![10], vec![42]);
         let cert = make_test_wave_certificate(BlockHeight::new(1), ShardGroupId::new(0));
-        cert_id = cert.wave_id.clone();
+        cert_id = cert.wave_id().clone();
         storage.commit_certificate_with_writes(&cert, &updates);
         root_after_write = storage.state_root();
         version_after_write = storage.jmt_height();
@@ -768,7 +765,7 @@ fn test_substates_survive_reopen() {
 
         let cert = storage.get_certificate(&cert_id);
         assert!(cert.is_some(), "certificate should survive reopen");
-        assert_eq!(cert.unwrap().wave_id, cert_id);
+        assert_eq!(cert.unwrap().wave_id(), &cert_id);
 
         // Verify the substate was written via direct key lookup.
         // make_mapped_database_update uses SpreadPrefixKeyMapper, so use the
@@ -866,10 +863,7 @@ fn test_ec_survives_reopen() {
         push_wave(
             &mut block,
             Arc::new(FinalizedWave {
-                certificate: Arc::new(WaveCertificate {
-                    wave_id: wave_id.clone(),
-                    execution_certificates: vec![Arc::new(ec)],
-                }),
+                certificate: Arc::new(WaveCertificate::new(wave_id.clone(), vec![Arc::new(ec)])),
                 receipts: BoundedVec::new(),
             }),
         );
@@ -897,10 +891,7 @@ fn test_ec_atomic_with_block_commit() {
     push_wave(
         &mut block,
         Arc::new(FinalizedWave {
-            certificate: Arc::new(WaveCertificate {
-                wave_id: wave_id.clone(),
-                execution_certificates: vec![Arc::new(ec)],
-            }),
+            certificate: Arc::new(WaveCertificate::new(wave_id.clone(), vec![Arc::new(ec)])),
             receipts: BoundedVec::new(),
         }),
     );
@@ -947,17 +938,14 @@ fn rocks_commit_with(
             metadata: None,
         };
         let wave = Arc::new(FinalizedWave {
-            certificate: Arc::new(WaveCertificate {
-                wave_id: WaveId::new(
+            certificate: Arc::new(WaveCertificate::new(
+                WaveId::new(
                     ShardGroupId::new(0),
                     block.height(),
                     std::collections::BTreeSet::new(),
                 ),
-                execution_certificates: vec![placeholder_local_ec(
-                    ShardGroupId::new(0),
-                    block.height(),
-                )],
-            }),
+                vec![placeholder_local_ec(ShardGroupId::new(0), block.height())],
+            )),
             receipts: vec![receipt].into(),
         });
         push_wave(&mut block, wave);

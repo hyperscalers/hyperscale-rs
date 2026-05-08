@@ -291,10 +291,7 @@ pub fn make_finalized_wave(
         SignerBitfield::new(4),
     );
     FinalizedWave::new(
-        Arc::new(WaveCertificate {
-            wave_id,
-            execution_certificates: vec![Arc::new(ec)],
-        }),
+        Arc::new(WaveCertificate::new(wave_id, vec![Arc::new(ec)])),
         vec![],
     )
 }

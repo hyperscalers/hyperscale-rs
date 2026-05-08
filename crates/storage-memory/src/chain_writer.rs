@@ -157,7 +157,7 @@ impl ChainWriter for SimStorage {
                 );
                 for fw in block.certificates().iter() {
                     let cert = &fw.certificate;
-                    let wave_id = cert.wave_id.clone();
+                    let wave_id = cert.wave_id().clone();
                     c.certificates.insert(wave_id.clone(), (**cert).clone());
                     c.wave_certs_by_height
                         .entry(wave_id.block_height())
@@ -166,7 +166,7 @@ impl ChainWriter for SimStorage {
                 }
                 c.insert_receipts(&prepared.receipts);
                 for fw in block.certificates().iter() {
-                    for ec in &fw.certificate.execution_certificates {
+                    for ec in fw.certificate.execution_certificates() {
                         c.execution_certs.insert(ec.wave_id.clone(), (**ec).clone());
                     }
                 }
@@ -255,7 +255,7 @@ impl SimStorage {
             );
             for fw in block.certificates().iter() {
                 let cert = &fw.certificate;
-                let wave_id = cert.wave_id.clone();
+                let wave_id = cert.wave_id().clone();
                 c.certificates.insert(wave_id.clone(), (**cert).clone());
                 c.wave_certs_by_height
                     .entry(wave_id.block_height())
@@ -266,7 +266,7 @@ impl SimStorage {
             c.insert_receipts(receipts);
             // Store execution certificates (extracted from wave certs) atomically.
             for fw in block.certificates().iter() {
-                for ec in &fw.certificate.execution_certificates {
+                for ec in fw.certificate.execution_certificates() {
                     c.execution_certs.insert(ec.wave_id.clone(), (**ec).clone());
                 }
             }

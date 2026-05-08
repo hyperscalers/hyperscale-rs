@@ -1610,9 +1610,9 @@ impl ExecutionCoordinator {
         // with the wave. This mirrors `FinalizedWave::reconstruct` and is
         // what `validate_receipts_against_ec` enforces at peer ingress.
         let local_ec = wc
-            .execution_certificates
+            .execution_certificates()
             .iter()
-            .find(|ec| ec.wave_id == wc.wave_id)
+            .find(|ec| &ec.wave_id == wc.wave_id())
             .expect("WaveCertificate invariant: local EC must be present");
         let mut receipts: Vec<StoredReceipt> = Vec::with_capacity(local_ec.tx_outcomes.len());
         for outcome in &local_ec.tx_outcomes {
@@ -2529,10 +2529,7 @@ mod tests {
             signers,
         ));
         let wave = Arc::new(FinalizedWave {
-            certificate: Arc::new(WaveCertificate {
-                wave_id,
-                execution_certificates: vec![ec],
-            }),
+            certificate: Arc::new(WaveCertificate::new(wave_id, vec![ec])),
             receipts: BoundedVec::new(),
         });
 
@@ -2564,10 +2561,7 @@ mod tests {
             SignerBitfield::new(4),
         ));
         let wave = Arc::new(FinalizedWave {
-            certificate: Arc::new(WaveCertificate {
-                wave_id,
-                execution_certificates: vec![ec],
-            }),
+            certificate: Arc::new(WaveCertificate::new(wave_id, vec![ec])),
             receipts: BoundedVec::new(),
         });
         let actions = state.on_finalized_wave_verified(wave, false);
@@ -2589,10 +2583,7 @@ mod tests {
             SignerBitfield::new(4),
         ));
         let wave = Arc::new(FinalizedWave {
-            certificate: Arc::new(WaveCertificate {
-                wave_id,
-                execution_certificates: vec![ec],
-            }),
+            certificate: Arc::new(WaveCertificate::new(wave_id, vec![ec])),
             receipts: BoundedVec::new(),
         });
         let actions = state.on_finalized_wave_verified(wave, true);
@@ -2693,10 +2684,7 @@ mod tests {
             signers,
         ));
         let wave = Arc::new(FinalizedWave {
-            certificate: Arc::new(WaveCertificate {
-                wave_id,
-                execution_certificates: vec![ec],
-            }),
+            certificate: Arc::new(WaveCertificate::new(wave_id, vec![ec])),
             receipts: BoundedVec::new(),
         });
 
@@ -2729,10 +2717,7 @@ mod tests {
             signers,
         ));
         let wave = FinalizedWave {
-            certificate: Arc::new(WaveCertificate {
-                wave_id: wave_id.clone(),
-                execution_certificates: vec![ec],
-            }),
+            certificate: Arc::new(WaveCertificate::new(wave_id.clone(), vec![ec])),
             receipts: BoundedVec::new(),
         };
         // Seed the canonical store directly (mirrors what `finalize_wave`
@@ -2764,10 +2749,7 @@ mod tests {
             SignerBitfield::empty(), // no signers — far below 2f+1
         ));
         let wave = Arc::new(FinalizedWave {
-            certificate: Arc::new(WaveCertificate {
-                wave_id,
-                execution_certificates: vec![bogus_ec],
-            }),
+            certificate: Arc::new(WaveCertificate::new(wave_id, vec![bogus_ec])),
             receipts: BoundedVec::new(),
         });
 
