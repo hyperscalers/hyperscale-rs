@@ -707,8 +707,8 @@ impl ExecutionCoordinator {
         topology: &TopologySnapshot,
         vote: ExecutionVote,
     ) -> Vec<Action> {
-        let wave_id = vote.wave_id.clone();
-        let validator_id = vote.validator;
+        let wave_id = vote.wave_id().clone();
+        let validator_id = vote.validator();
 
         // Only votes from local-committee members count. A globally-known
         // validator outside this shard's committee whose vote pooled into
@@ -835,12 +835,12 @@ impl ExecutionCoordinator {
         topology: &TopologySnapshot,
         vote: ExecutionVote,
     ) -> Vec<Action> {
-        let wave_id = vote.wave_id.clone();
+        let wave_id = vote.wave_id().clone();
         // Callers (`on_execution_vote` for own votes, `on_votes_verified`
         // for verified votes that already passed the committee filter)
-        // guarantee `vote.validator` is in the local committee.
+        // guarantee `vote.validator()` is in the local committee.
         let voting_power = topology
-            .voting_power(vote.validator)
+            .voting_power(vote.validator())
             .expect("committee member has voting power (TopologySnapshot invariant)");
 
         let Some(tracker) = self.waves.get_tracker_mut(&wave_id) else {
@@ -1851,7 +1851,9 @@ impl ExecutionCoordinator {
             if registry.contains_wave(key) {
                 return true;
             }
-            votes.first().is_some_and(|v| v.vote_anchor_ts > ev_cutoff)
+            votes
+                .first()
+                .is_some_and(|v| v.vote_anchor_ts() > ev_cutoff)
         });
         let pruned_ev = before_ev - self.early.vote_len();
 
@@ -2249,18 +2251,18 @@ mod tests {
         assert!(state_non.waves.contains_wave(&wave_id));
 
         // Simulate receiving a vote (as if we're a fallback leader).
-        let fake_vote = ExecutionVote {
+        let fake_vote = ExecutionVote::new(
             block_hash,
-            block_height: BlockHeight::new(1),
-            vote_anchor_ts: WeightedTimestamp::ZERO,
-            wave_id: wave_id.clone(),
-            shard_group_id: ShardGroupId::new(0),
-            global_receipt_root: GlobalReceiptRoot::ZERO,
-            tx_count: 1,
-            tx_outcomes: vec![],
-            validator: leader, // vote from the original leader
-            signature: zero_bls_signature(),
-        };
+            BlockHeight::new(1),
+            WeightedTimestamp::ZERO,
+            wave_id.clone(),
+            ShardGroupId::new(0),
+            GlobalReceiptRoot::ZERO,
+            1,
+            vec![],
+            leader,
+            zero_bls_signature(),
+        );
 
         state_non.on_execution_vote(&topo_non, fake_vote);
 
@@ -2287,18 +2289,18 @@ mod tests {
 
         let mut state = make_test_state();
         let wave_id = WaveId::new(ShardGroupId::new(0), BlockHeight::new(1), BTreeSet::new());
-        let vote = ExecutionVote {
-            block_hash: BlockHash::ZERO,
-            block_height: BlockHeight::new(1),
-            vote_anchor_ts: WeightedTimestamp::ZERO,
-            wave_id: wave_id.clone(),
-            shard_group_id: ShardGroupId::new(0),
-            global_receipt_root: GlobalReceiptRoot::ZERO,
-            tx_count: 0,
-            tx_outcomes: vec![],
-            validator: outsider,
-            signature: zero_bls_signature(),
-        };
+        let vote = ExecutionVote::new(
+            BlockHash::ZERO,
+            BlockHeight::new(1),
+            WeightedTimestamp::ZERO,
+            wave_id.clone(),
+            ShardGroupId::new(0),
+            GlobalReceiptRoot::ZERO,
+            0,
+            vec![],
+            outsider,
+            zero_bls_signature(),
+        );
 
         let actions = state.on_execution_vote(&topo, vote);
         assert!(actions.is_empty(), "non-committee vote must be dropped");

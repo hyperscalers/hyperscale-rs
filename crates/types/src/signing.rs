@@ -238,7 +238,7 @@ pub fn exec_vote_message(
 pub fn exec_vote_batch_message(shard_group: ShardGroupId, votes: &[ExecutionVote]) -> Vec<u8> {
     let mut hasher = Hasher::new();
     for v in votes {
-        hasher.update(v.global_receipt_root.as_raw().as_bytes());
+        hasher.update(v.global_receipt_root().as_raw().as_bytes());
     }
     let digest = hasher.finalize();
 

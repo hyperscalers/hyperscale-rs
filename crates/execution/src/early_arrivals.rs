@@ -307,18 +307,18 @@ mod tests {
         );
         let kp = bls_keypair_from_seed(&[7u8; 32]);
         let signature = kp.sign_v1(&msg);
-        ExecutionVote {
-            block_hash: BlockHash::ZERO,
-            block_height: BlockHeight::new(1),
-            vote_anchor_ts: anchor_ts,
+        ExecutionVote::new(
+            BlockHash::ZERO,
+            BlockHeight::new(1),
+            anchor_ts,
             wave_id,
-            shard_group_id: shard(),
+            shard(),
             global_receipt_root,
-            tx_count: u32::try_from(tx_outcomes.len()).unwrap_or(u32::MAX),
+            u32::try_from(tx_outcomes.len()).unwrap_or(u32::MAX),
             tx_outcomes,
-            validator: ValidatorId::new(0),
+            ValidatorId::new(0),
             signature,
-        }
+        )
     }
 
     // ─── Votes ──────────────────────────────────────────────────────────
