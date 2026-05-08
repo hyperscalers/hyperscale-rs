@@ -11,9 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use hyperscale_core::{
-    Action, ActionContext, CrossShardExecutionRequest, NodeInput, ProtocolEvent,
-};
+use hyperscale_core::{Action, ActionContext, NodeInput, ProtocolEvent};
 use hyperscale_engine::Engine;
 use hyperscale_metrics::record_execution_latency;
 use hyperscale_network::Network;
@@ -22,14 +20,12 @@ use hyperscale_types::network::notification::{
     ExecutionCertificatesNotification, ExecutionVotesNotification,
 };
 use hyperscale_types::{
-    BlockHash, Bls12381G1PublicKey, Bls12381G2Signature, ExecutionCertificate, ExecutionVote,
-    GlobalReceiptRoot, RoutableTransaction, SignerBitfield, StateRoot, StoredReceipt,
-    SubstateEntry, TxHash, ValidatorId, VotePower, WaveId, WeightedTimestamp,
-    batch_verify_bls_same_message, compute_global_receipt_root, exec_cert_batch_message,
-    exec_vote_batch_message, exec_vote_message, verify_bls12381_v1, zero_bls_signature,
+    Bls12381G1PublicKey, Bls12381G2Signature, ExecutionCertificate, ExecutionVote,
+    GlobalReceiptRoot, SignerBitfield, StoredReceipt, ValidatorId, VotePower, WaveId,
+    WeightedTimestamp, batch_verify_bls_same_message, compute_global_receipt_root,
+    exec_cert_batch_message, exec_vote_batch_message, exec_vote_message, verify_bls12381_v1,
+    zero_bls_signature,
 };
-
-use crate::wave_state::WaveState;
 
 // ============================================================================
 // Wave-based execution voting handlers
@@ -217,69 +213,6 @@ pub fn verify_execution_certificate_signature(
             verify_bls12381_v1(&msg, &aggregated_pk, &certificate.aggregated_signature())
         })
     }
-}
-
-// ============================================================================
-// Wave dispatch
-// ============================================================================
-
-/// Build the one-shot execution dispatch action for a fully-provisioned wave.
-///
-/// Returns `Some(Action::ExecuteTransactions)` for single-shard waves, or
-/// `Some(Action::ExecuteCrossShardTransactions)` for cross-shard waves with
-/// all required `verified_provisions` present. Returns `None` if a cross-shard
-/// tx is missing its provisions, or if every tx in the wave is pre-aborted —
-/// caller must not mark the wave dispatched.
-///
-/// Txs with pre-dispatch explicit aborts (from reverse-conflict detection) are
-/// excluded from the dispatch: they produce no state change, so there's no
-/// reason to execute them.
-pub(crate) fn build_dispatch_action(
-    wave: &WaveState,
-    verified_provisions: &HashMap<TxHash, Vec<Arc<Vec<SubstateEntry>>>>,
-    block_hash: BlockHash,
-) -> Option<Action> {
-    if wave.wave_id().is_zero() {
-        // Single-shard wave: no provisions needed.
-        let transactions: Vec<Arc<RoutableTransaction>> = wave
-            .tx_hashes()
-            .iter()
-            .filter(|h| !wave.is_tx_explicitly_aborted(h))
-            .filter_map(|h| wave.transaction(h).cloned())
-            .collect();
-        if transactions.is_empty() {
-            return None;
-        }
-        return Some(Action::ExecuteTransactions {
-            wave_id: wave.wave_id().clone(),
-            block_hash,
-            transactions,
-            state_root: StateRoot::ZERO,
-        });
-    }
-
-    // Cross-shard wave: every non-aborted tx needs its verified provisions assembled.
-    let mut requests: Vec<CrossShardExecutionRequest> = Vec::with_capacity(wave.tx_hashes().len());
-    for tx_hash in wave.tx_hashes() {
-        if wave.is_tx_explicitly_aborted(tx_hash) {
-            continue;
-        }
-        let tx = wave.transaction(tx_hash)?;
-        let provisions = verified_provisions.get(tx_hash)?.clone();
-        requests.push(CrossShardExecutionRequest {
-            tx_hash: *tx_hash,
-            transaction: Arc::clone(tx),
-            provisions,
-        });
-    }
-    if requests.is_empty() {
-        return None;
-    }
-    Some(Action::ExecuteCrossShardTransactions {
-        wave_id: wave.wave_id().clone(),
-        block_hash,
-        requests,
-    })
 }
 
 /// Handle the execution-owned delegated [`Action`] variants.
@@ -499,10 +432,9 @@ where
 mod tests {
     use std::collections::BTreeSet;
 
-    use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
-        BlockHeight, Bls12381G1PrivateKey, ExecutionOutcome, GlobalReceiptHash, Hash, ShardGroupId,
-        TxOutcome, bls_keypair_from_seed,
+        BlockHash, BlockHeight, Bls12381G1PrivateKey, ExecutionOutcome, GlobalReceiptHash, Hash,
+        ShardGroupId, TxHash, TxOutcome, bls_keypair_from_seed,
     };
 
     use super::*;
@@ -513,14 +445,6 @@ mod tests {
 
     fn wave_id(height: u64) -> WaveId {
         WaveId::new(shard(), BlockHeight::new(height), BTreeSet::new())
-    }
-
-    fn cross_shard_wave_id(height: u64, remotes: &[ShardGroupId]) -> WaveId {
-        WaveId::new(
-            shard(),
-            BlockHeight::new(height),
-            remotes.iter().copied().collect(),
-        )
     }
 
     fn keypair(seed: u8) -> Bls12381G1PrivateKey {
@@ -881,108 +805,5 @@ mod tests {
         // Provide the wrong public keys — signature must not verify.
         let wrong_pubs = vec![keypair(42).public_key(), keypair(43).public_key()];
         assert!(!verify_execution_certificate_signature(&ec, &wrong_pubs));
-    }
-
-    // ─── build_dispatch_action ───────────────────────────────────────────
-
-    fn single_shard_wave_with(tx_seeds: &[u8]) -> WaveState {
-        let txs: Vec<_> = tx_seeds
-            .iter()
-            .map(|s| {
-                let mut participating = BTreeSet::new();
-                participating.insert(shard());
-                (Arc::new(test_transaction(*s)), participating)
-            })
-            .collect();
-        WaveState::new(
-            wave_id(0),
-            BlockHash::ZERO,
-            WeightedTimestamp::from_millis(0),
-            txs,
-            true,
-        )
-    }
-
-    fn cross_shard_wave_with(tx_seeds: &[u8], remote: ShardGroupId) -> WaveState {
-        let txs: Vec<_> = tx_seeds
-            .iter()
-            .map(|s| {
-                let mut participating = BTreeSet::new();
-                participating.insert(shard());
-                participating.insert(remote);
-                (Arc::new(test_transaction(*s)), participating)
-            })
-            .collect();
-        WaveState::new(
-            cross_shard_wave_id(1, &[remote]),
-            BlockHash::ZERO,
-            WeightedTimestamp::from_millis(0),
-            txs,
-            false,
-        )
-    }
-
-    #[test]
-    fn build_dispatch_single_shard_returns_execute_transactions() {
-        let wave = single_shard_wave_with(&[1, 2]);
-        let provisions = HashMap::new();
-
-        let action = build_dispatch_action(&wave, &provisions, BlockHash::ZERO);
-        match action {
-            Some(Action::ExecuteTransactions { transactions, .. }) => {
-                assert_eq!(transactions.len(), 2);
-            }
-            other => panic!("expected ExecuteTransactions, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn build_dispatch_cross_shard_returns_none_when_provisions_missing() {
-        let wave = cross_shard_wave_with(&[1], ShardGroupId::new(1));
-        let provisions = HashMap::new();
-
-        assert!(build_dispatch_action(&wave, &provisions, BlockHash::ZERO).is_none());
-    }
-
-    #[test]
-    fn build_dispatch_cross_shard_succeeds_with_all_provisions() {
-        let wave = cross_shard_wave_with(&[1], ShardGroupId::new(1));
-        let tx_hash = wave.tx_hashes()[0];
-        let mut provisions = HashMap::new();
-        provisions.insert(tx_hash, vec![Arc::new(Vec::<SubstateEntry>::new())]);
-
-        let action = build_dispatch_action(&wave, &provisions, BlockHash::ZERO);
-        match action {
-            Some(Action::ExecuteCrossShardTransactions { requests, .. }) => {
-                assert_eq!(requests.len(), 1);
-                assert_eq!(requests[0].tx_hash, tx_hash);
-            }
-            other => panic!("expected ExecuteCrossShardTransactions, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn build_dispatch_skips_pre_aborted_txs() {
-        let mut wave = single_shard_wave_with(&[1, 2]);
-        let aborted = wave.tx_hashes()[0];
-        wave.record_abort(aborted, WeightedTimestamp::from_millis(0));
-
-        let action = build_dispatch_action(&wave, &HashMap::new(), BlockHash::ZERO);
-        match action {
-            Some(Action::ExecuteTransactions { transactions, .. }) => {
-                assert_eq!(transactions.len(), 1);
-                assert_ne!(transactions[0].hash(), aborted);
-            }
-            other => panic!("expected ExecuteTransactions, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn build_dispatch_returns_none_when_all_txs_aborted() {
-        let mut wave = single_shard_wave_with(&[1]);
-        let aborted = wave.tx_hashes()[0];
-        wave.record_abort(aborted, WeightedTimestamp::from_millis(0));
-
-        assert!(build_dispatch_action(&wave, &HashMap::new(), BlockHash::ZERO).is_none());
     }
 }

@@ -187,7 +187,7 @@ fn test_e2e_single_shard_transaction() {
         // Note: is_finalized checks finalized_certificates which are also cleaned up
         // after the TC is committed in a block. Use is_tombstoned as a fallback.
         let is_executed =
-            node0.execution().is_finalized(&tx_hash) || node0.mempool().is_tombstoned(&tx_hash);
+            node0.execution().is_finalized(tx_hash) || node0.mempool().is_tombstoned(&tx_hash);
         if is_executed {
             println!("✓ Transaction already completed and evicted after initial consensus!\n");
 
@@ -276,7 +276,7 @@ fn test_e2e_single_shard_transaction() {
         }
 
         // Check execution status
-        if node0.execution().is_finalized(&tx_hash) && !executed {
+        if node0.execution().is_finalized(tx_hash) && !executed {
             let elapsed = runner.now().checked_sub(start_time).unwrap();
             println!("  ✓ Transaction executed (iteration {iteration}, {elapsed:?})");
             executed = true;
@@ -321,7 +321,7 @@ fn test_e2e_single_shard_transaction() {
 
         // Check transaction status on each node
         let mempool_status = node.mempool().status(&tx_hash);
-        let is_executed = node.execution().is_finalized(&tx_hash);
+        let is_executed = node.execution().is_finalized(tx_hash);
 
         println!(
             "Node {}: height={}, view={}, tx_status={:?}, executed={}",
@@ -652,14 +652,14 @@ fn test_e2e_cross_shard_transaction() {
         }
 
         // Check execution status
-        if !executed && node0.execution().is_finalized(&tx_hash) {
+        if !executed && node0.execution().is_finalized(tx_hash) {
             let elapsed = runner.now().checked_sub(start_time).unwrap();
             println!("  ✓ Transaction executed (iteration {iteration}, {elapsed:?})");
             executed = true;
         }
 
         // Check finalization status (for cross-shard, this means certificate created)
-        if !finalized && node0.execution().is_finalized(&tx_hash) {
+        if !finalized && node0.execution().is_finalized(tx_hash) {
             let elapsed = runner.now().checked_sub(start_time).unwrap();
             println!(
                 "  ✓ Transaction finalized with certificate (iteration {iteration}, {elapsed:?})"
@@ -698,7 +698,7 @@ fn test_e2e_cross_shard_transaction() {
     for i in 0..3 {
         let node = runner.node(i).unwrap();
         let tx_state = node.mempool().status(&tx_hash);
-        let is_final = node.execution().is_finalized(&tx_hash);
+        let is_final = node.execution().is_finalized(tx_hash);
         println!(
             "  Node {}: height={}, tx_status={:?}, finalized={}",
             i,
@@ -712,7 +712,7 @@ fn test_e2e_cross_shard_transaction() {
     for i in 3..6 {
         let node = runner.node(i).unwrap();
         let tx_state = node.mempool().status(&tx_hash);
-        let is_final = node.execution().is_finalized(&tx_hash);
+        let is_final = node.execution().is_finalized(tx_hash);
         println!(
             "  Node {}: height={}, tx_status={:?}, finalized={}",
             i,

@@ -28,11 +28,15 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use hyperscale_core::{Action, CrossShardExecutionRequest};
 use hyperscale_types::{
-    BlockHash, BlockHeight, ExecutionCertificate, ExecutionOutcome, GlobalReceiptRoot,
-    RoutableTransaction, ShardGroupId, StoredReceipt, TransactionDecision, TxHash, TxOutcome,
-    WAVE_TIMEOUT, WaveCertificate, WaveId, WeightedTimestamp, compute_global_receipt_root,
+    BlockHash, BlockHeight, ExecutionCertificate, ExecutionOutcome, FinalizedWave,
+    GlobalReceiptRoot, RoutableTransaction, ShardGroupId, StateRoot, StoredReceipt,
+    TransactionDecision, TxHash, TxOutcome, WAVE_TIMEOUT, WaveCertificate, WaveId,
+    WeightedTimestamp, compute_global_receipt_root,
 };
+
+use crate::provisioning::ProvisioningTracker;
 
 /// Age at which a still-alive wave emits a single diagnostic warning.
 ///
@@ -237,12 +241,6 @@ impl WaveState {
         &self.tx_hashes
     }
 
-    /// Transaction data by hash (for building execution requests).
-    #[must_use]
-    pub fn transaction(&self, tx_hash: &TxHash) -> Option<&Arc<RoutableTransaction>> {
-        self.transactions.get(tx_hash)
-    }
-
     // ── Provisioning ────────────────────────────────────────────────────
 
     /// Whether this wave has reached full provisioning.
@@ -264,15 +262,76 @@ impl WaveState {
         self.local_ec_emitted
     }
 
-    /// Mark the wave as having dispatched execution. Idempotent: second calls
-    /// are no-ops. Returns whether this call flipped the flag.
-    pub const fn mark_dispatched(&mut self) -> bool {
-        if self.dispatched {
-            false
-        } else {
-            self.dispatched = true;
-            true
+    /// Build the one-shot execution dispatch [`Action`] for a fully-provisioned
+    /// wave and flip `dispatched` if one is produced.
+    ///
+    /// Returns `None` (without mutating) when the wave isn't fully provisioned,
+    /// has already dispatched, every tx is pre-aborted, or a cross-shard tx is
+    /// missing its provisions. Pairing the build with the flag flip closes the
+    /// invariant that a dispatch action and the dispatched marker move
+    /// together.
+    ///
+    /// The action carries the wave-starting block's hash, not whatever block
+    /// the dispatcher is processing. Anchoring reads to the wave-start block
+    /// keeps the cross-shard provisioned-dispatch path consistent with the
+    /// single-shard dispatch-at-wave-start path; threading
+    /// `committed_block_hash` would fold intervening blocks' cert writes
+    /// (sourced from each validator's own local receipts) into the view,
+    /// seeding divergence downstream.
+    pub fn dispatch_if_ready(&mut self, provisioning: &ProvisioningTracker) -> Option<Action> {
+        if !self.is_fully_provisioned() || self.dispatched {
+            return None;
         }
+        let action = self.build_dispatch_action(provisioning)?;
+        self.dispatched = true;
+        Some(action)
+    }
+
+    /// Pre-aborted txs are excluded — they produce no state change, so there's
+    /// no reason to execute them.
+    fn build_dispatch_action(&self, provisioning: &ProvisioningTracker) -> Option<Action> {
+        if self.wave_id.is_zero() {
+            // Single-shard wave: no provisions needed.
+            let transactions: Vec<Arc<RoutableTransaction>> = self
+                .tx_hashes
+                .iter()
+                .filter(|h| !self.is_tx_explicitly_aborted(**h))
+                .filter_map(|h| self.transactions.get(h).cloned())
+                .collect();
+            if transactions.is_empty() {
+                return None;
+            }
+            return Some(Action::ExecuteTransactions {
+                wave_id: self.wave_id.clone(),
+                block_hash: self.block_hash,
+                transactions,
+                state_root: StateRoot::ZERO,
+            });
+        }
+
+        // Cross-shard wave: every non-aborted tx needs its verified provisions assembled.
+        let mut requests: Vec<CrossShardExecutionRequest> =
+            Vec::with_capacity(self.tx_hashes.len());
+        for &tx_hash in &self.tx_hashes {
+            if self.is_tx_explicitly_aborted(tx_hash) {
+                continue;
+            }
+            let tx = self.transactions.get(&tx_hash)?;
+            let provisions = provisioning.provisions_for(tx_hash)?.to_vec();
+            requests.push(CrossShardExecutionRequest {
+                tx_hash,
+                transaction: Arc::clone(tx),
+                provisions,
+            });
+        }
+        if requests.is_empty() {
+            return None;
+        }
+        Some(Action::ExecuteCrossShardTransactions {
+            wave_id: self.wave_id.clone(),
+            block_hash: self.block_hash,
+            requests,
+        })
     }
 
     /// Mark a single tx as provisioned. Keeps the earliest `at` per tx
@@ -282,7 +341,7 @@ impl WaveState {
     /// Returns `true` iff this call transitioned the wave from "partial" to
     /// "all provisioned" — the caller uses that signal to emit the single
     /// per-wave execution dispatch action.
-    pub fn mark_tx_provisioned(&mut self, tx_hash: TxHash, at: WeightedTimestamp) -> bool {
+    fn mark_tx_provisioned(&mut self, tx_hash: TxHash, at: WeightedTimestamp) -> bool {
         if !self.tx_hash_set.contains(&tx_hash) {
             return false;
         }
@@ -303,6 +362,24 @@ impl WaveState {
             true
         } else {
             false
+        }
+    }
+
+    /// Mark every tx the tracker reports fully-provisioned at `at`. Cheap
+    /// no-op for txs already marked. Drives the partial → fully-provisioned
+    /// transition from both wave creation (when prior batches arrived
+    /// before the wave existed) and per-batch absorption (when this
+    /// commit's provisions land).
+    pub fn absorb_ready_provisions(
+        &mut self,
+        provisioning: &ProvisioningTracker,
+        at: WeightedTimestamp,
+    ) {
+        let tx_hashes: Vec<TxHash> = self.tx_hashes.clone();
+        for tx_hash in tx_hashes {
+            if provisioning.is_fully_provisioned(tx_hash) {
+                self.mark_tx_provisioned(tx_hash, at);
+            }
         }
     }
 
@@ -340,16 +417,10 @@ impl WaveState {
         self.execution_receipts.len()
     }
 
-    /// Take the receipt for a tx, removing it from the wave.
-    ///
-    /// Used at finalization time, walking the local EC's `tx_outcomes` in
-    /// canonical order and pulling a receipt for each non-aborted outcome.
-    /// Returns `None` if the receipt is absent — for an aborted outcome this
-    /// is expected; for a non-aborted outcome it indicates the
-    /// `has_local_receipts_for_non_aborted` gate was bypassed, which would
-    /// be a bug.
-    pub fn take_receipt(&mut self, tx_hash: &TxHash) -> Option<StoredReceipt> {
-        self.execution_receipts.remove(tx_hash)
+    /// Take the receipt for a tx, removing it from the wave. Used internally
+    /// by [`Self::into_finalized`] to drain receipts in canonical order.
+    fn take_receipt(&mut self, tx_hash: TxHash) -> Option<StoredReceipt> {
+        self.execution_receipts.remove(&tx_hash)
     }
 
     /// Record an explicit abort from `ConflictDetector`. Keeps the earliest
@@ -628,9 +699,8 @@ impl WaveState {
     /// Whether a tx was aborted before dispatch (pre-dispatch reverse-conflict).
     /// Used by dispatch to skip executing txs the wave has already decided to
     /// abort.
-    #[must_use]
-    pub fn is_tx_explicitly_aborted(&self, tx_hash: &TxHash) -> bool {
-        self.explicit_aborts.contains(tx_hash)
+    fn is_tx_explicitly_aborted(&self, tx_hash: TxHash) -> bool {
+        self.explicit_aborts.contains(&tx_hash)
     }
 
     /// Emit a `warn!` log exactly once, when the wave reaches
@@ -740,6 +810,56 @@ impl WaveState {
         WaveCertificate::new(self.wave_id.clone(), ecs)
     }
 
+    /// Consume the wave and produce its terminal [`FinalizedWave`].
+    ///
+    /// Builds the [`WaveCertificate`] and drains a stored receipt for each
+    /// non-aborted outcome in the local EC, in canonical order. Aborted
+    /// outcomes contribute no receipt; stray receipts for aborted txs (e.g.
+    /// local execution finished before the aggregated EC attested
+    /// `Aborted`) drop with the wave. Mirrors `FinalizedWave::reconstruct`,
+    /// matching the invariant peers enforce via
+    /// `validate_receipts_against_ec` at ingress.
+    ///
+    /// Should only be called when [`Self::is_complete`] is true; that gate
+    /// guarantees both the local EC's presence and a receipt for every
+    /// non-aborted outcome. A missing receipt under those conditions is an
+    /// invariant violation, logged but not fatal so the canonical
+    /// `FinalizedWave` admitted via block sync can still recover the node.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the constructed [`WaveCertificate`] doesn't carry the
+    /// local EC. `is_complete` requires `local_ec_emitted`, so that ECs
+    /// presence in `execution_certificates` — and thus in the WC — is
+    /// guaranteed at the legitimate call site.
+    #[must_use]
+    pub fn into_finalized(mut self) -> FinalizedWave {
+        let wc = self.create_wave_certificate();
+        let local_ec = wc
+            .execution_certificates()
+            .iter()
+            .find(|ec| ec.wave_id() == wc.wave_id())
+            .expect("WaveCertificate invariant: local EC must be present")
+            .clone();
+        let mut receipts: Vec<StoredReceipt> = Vec::with_capacity(local_ec.tx_outcomes().len());
+        for outcome in local_ec.tx_outcomes() {
+            if outcome.is_aborted() {
+                continue;
+            }
+            if let Some(receipt) = self.take_receipt(outcome.tx_hash()) {
+                receipts.push(receipt);
+            } else {
+                tracing::error!(
+                    wave = %self.wave_id,
+                    tx_hash = ?outcome.tx_hash(),
+                    "into_finalized: non-aborted tx is missing its stored receipt \
+                     (is_complete gate bypassed)"
+                );
+            }
+        }
+        FinalizedWave::new(Arc::new(wc), receipts)
+    }
+
     /// Per-tx terminal decisions derived from collected ECs.
     /// Priority: Aborted > Reject > Accept.
     #[must_use]
@@ -765,6 +885,7 @@ mod tests {
     use hyperscale_types::test_utils::{test_node, test_transaction_with_nodes};
     use hyperscale_types::{
         Bls12381G2Signature, ConsensusReceipt, GlobalReceiptHash, Hash, SignerBitfield,
+        SubstateEntry,
     };
 
     use super::*;
@@ -1230,14 +1351,15 @@ mod tests {
         let h0 = w.tx_hashes()[0];
         let h1 = w.tx_hashes()[1];
 
-        // Fully provision and dispatch.
         w.mark_tx_provisioned(h0, ts_for(WAVE_START + 1));
         w.mark_tx_provisioned(h1, ts_for(WAVE_START + 1));
-        assert!(w.mark_dispatched());
+        let mut provisioning = ProvisioningTracker::new();
+        provisioning.seed_provisions(h0, vec![Arc::new(Vec::new())]);
+        provisioning.seed_provisions(h1, vec![Arc::new(Vec::new())]);
+        assert!(w.dispatch_if_ready(&provisioning).is_some());
+        assert!(w.dispatched());
 
-        // A post-dispatch conflict abort must be rejected.
         assert!(!w.record_abort(h0, ts_for(WAVE_START + 2)));
-        // No explicit abort was recorded.
         w.record_execution_result(h0, executed(true));
         w.record_execution_result(h1, executed(true));
         // If record_abort had mutated, h0's outcome would have flipped to Aborted.
@@ -1317,5 +1439,89 @@ mod tests {
         assert_eq!(decisions[&h1], TransactionDecision::Aborted);
         assert_eq!(decisions[&h2], TransactionDecision::Reject);
         assert_eq!(decisions[&h0], TransactionDecision::Accept);
+    }
+
+    // ─── dispatch_if_ready ──────────────────────────────────────────────
+
+    #[test]
+    fn dispatch_if_ready_single_shard_emits_execute_transactions_and_flips_flag() {
+        let mut w = make_single_shard_wave(2);
+        let provisioning = ProvisioningTracker::new();
+        match w.dispatch_if_ready(&provisioning) {
+            Some(Action::ExecuteTransactions { transactions, .. }) => {
+                assert_eq!(transactions.len(), 2);
+            }
+            other => panic!("expected ExecuteTransactions, got {other:?}"),
+        }
+        assert!(w.dispatched());
+        assert!(w.dispatch_if_ready(&provisioning).is_none());
+    }
+
+    #[test]
+    fn dispatch_if_ready_cross_shard_returns_none_when_provisions_missing() {
+        let mut w = make_cross_shard_wave(1);
+        let h0 = w.tx_hashes()[0];
+        w.mark_tx_provisioned(h0, ts_for(WAVE_START + 1));
+
+        let provisioning = ProvisioningTracker::new();
+        assert!(w.dispatch_if_ready(&provisioning).is_none());
+        assert!(!w.dispatched());
+    }
+
+    #[test]
+    fn dispatch_if_ready_cross_shard_succeeds_with_all_provisions() {
+        let mut w = make_cross_shard_wave(1);
+        let h0 = w.tx_hashes()[0];
+        w.mark_tx_provisioned(h0, ts_for(WAVE_START + 1));
+
+        let mut provisioning = ProvisioningTracker::new();
+        provisioning.seed_provisions(h0, vec![Arc::new(Vec::<SubstateEntry>::new())]);
+
+        match w.dispatch_if_ready(&provisioning) {
+            Some(Action::ExecuteCrossShardTransactions { requests, .. }) => {
+                assert_eq!(requests.len(), 1);
+                assert_eq!(requests[0].tx_hash, h0);
+            }
+            other => panic!("expected ExecuteCrossShardTransactions, got {other:?}"),
+        }
+        assert!(w.dispatched());
+    }
+
+    #[test]
+    fn dispatch_if_ready_skips_pre_aborted_txs() {
+        let mut w = make_single_shard_wave(2);
+        let aborted = w.tx_hashes()[0];
+        w.record_abort(aborted, ts_for(WAVE_START));
+
+        let provisioning = ProvisioningTracker::new();
+        match w.dispatch_if_ready(&provisioning) {
+            Some(Action::ExecuteTransactions { transactions, .. }) => {
+                assert_eq!(transactions.len(), 1);
+                assert_ne!(transactions[0].hash(), aborted);
+            }
+            other => panic!("expected ExecuteTransactions, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_if_ready_returns_none_when_all_txs_aborted() {
+        let mut w = make_single_shard_wave(1);
+        let aborted = w.tx_hashes()[0];
+        w.record_abort(aborted, ts_for(WAVE_START));
+
+        let provisioning = ProvisioningTracker::new();
+        assert!(w.dispatch_if_ready(&provisioning).is_none());
+        assert!(!w.dispatched());
+    }
+
+    #[test]
+    fn dispatch_if_ready_returns_none_when_not_fully_provisioned() {
+        let mut w = make_cross_shard_wave(2);
+        let h0 = w.tx_hashes()[0];
+        w.mark_tx_provisioned(h0, ts_for(WAVE_START + 1));
+
+        let provisioning = ProvisioningTracker::new();
+        assert!(w.dispatch_if_ready(&provisioning).is_none());
+        assert!(!w.dispatched());
     }
 }

@@ -7,14 +7,14 @@
 //! store answers tx-membership and wave-id-hash lookups for peers that need
 //! to fetch the finalized data to vote.
 //!
-//! This is write-once, read-many — the [`WaveRegistry`](crate::state) owns
-//! the mutable in-flight lifecycle (waves, vote trackers, retries) and hands
-//! wave off to this store at the moment of finalization.
+//! This is write-once, read-many — [`WaveRegistry`](crate::waves::WaveRegistry)
+//! owns the mutable in-flight lifecycle (waves, vote trackers, retries) and
+//! hands waves off to this store at the moment of finalization.
 //!
-//! The underlying map is a `BTreeMap<WaveId, FinalizedWave>` so iteration is
-//! deterministic — load-bearing for simulation determinism and for proposal
-//! building, which iterates the store to include finalized waves in block
-//! order.
+//! The underlying map is a `BTreeMap<WaveId, Arc<FinalizedWave>>` so
+//! iteration is deterministic — load-bearing for simulation determinism and
+//! for proposal building, which iterates the store to include finalized
+//! waves in block order.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -22,7 +22,7 @@ use std::sync::Arc;
 use hyperscale_types::{BloomFilter, DEFAULT_FPR, FinalizedWave, TxHash, WaveCertificate, WaveId};
 
 pub struct FinalizedWaveStore {
-    waves: BTreeMap<WaveId, FinalizedWave>,
+    waves: BTreeMap<WaveId, Arc<FinalizedWave>>,
 }
 
 impl FinalizedWaveStore {
@@ -33,7 +33,7 @@ impl FinalizedWaveStore {
     }
 
     /// Record a newly-finalized wave under its `WaveId`.
-    pub fn insert(&mut self, wave_id: WaveId, fw: FinalizedWave) {
+    pub fn insert(&mut self, wave_id: WaveId, fw: Arc<FinalizedWave>) {
         self.waves.insert(wave_id, fw);
     }
 
@@ -43,32 +43,32 @@ impl FinalizedWaveStore {
         self.waves.remove(wave_id);
     }
 
-    /// All finalized waves in `WaveId` order, each wrapped in a fresh `Arc`.
-    /// Used by the proposer to include finalized waves in the next block.
+    /// All finalized waves in `WaveId` order. Used by the proposer to
+    /// include finalized waves in the next block.
     pub fn all_waves(&self) -> Vec<Arc<FinalizedWave>> {
-        self.waves.values().map(|fw| Arc::new(fw.clone())).collect()
+        self.waves.values().map(Arc::clone).collect()
     }
 
     /// Lookup by `WaveId`. Peers reference waves by id in fetch requests,
     /// so this is the primary ingress lookup for serving finalized-wave data.
     pub fn get(&self, wave_id: &WaveId) -> Option<Arc<FinalizedWave>> {
-        self.waves.get(wave_id).map(|fw| Arc::new(fw.clone()))
+        self.waves.get(wave_id).map(Arc::clone)
     }
 
     /// Certificate containing `tx_hash`, if any. Used to answer
     /// terminal-state queries for a single transaction (e.g. RPC, mempool
     /// status). Returns `None` once the wave has been removed — callers
     /// then fall back to persisted storage.
-    pub fn get_certificate_for_tx(&self, tx_hash: &TxHash) -> Option<Arc<WaveCertificate>> {
+    pub fn get_certificate_for_tx(&self, tx_hash: TxHash) -> Option<Arc<WaveCertificate>> {
         self.waves
             .values()
-            .find(|fw| fw.contains_tx(tx_hash))
+            .find(|fw| fw.contains_tx(&tx_hash))
             .map(|fw| Arc::clone(fw.certificate()))
     }
 
     /// Whether `tx_hash` is part of any currently-tracked finalized wave.
-    pub fn is_finalized(&self, tx_hash: &TxHash) -> bool {
-        self.waves.values().any(|fw| fw.contains_tx(tx_hash))
+    pub fn is_finalized(&self, tx_hash: TxHash) -> bool {
+        self.waves.values().any(|fw| fw.contains_tx(&tx_hash))
     }
 
     /// Flatten every tracked wave's tx hashes into a single set.
@@ -76,7 +76,6 @@ impl FinalizedWaveStore {
     /// The node passes this to BFT for conflict filtering — a transaction
     /// whose wave is already finalized should not be re-proposed.
     pub fn all_tx_hashes(&self) -> HashSet<TxHash> {
-        #[allow(clippy::redundant_closure_for_method_calls)] // closure required for HRTB inference
         self.waves.values().flat_map(|fw| fw.tx_hashes()).collect()
     }
 
@@ -129,7 +128,10 @@ mod tests {
         )
     }
 
-    fn make_finalized_wave(block_height: u64, tx_hashes: &[TxHash]) -> (WaveId, FinalizedWave) {
+    fn make_finalized_wave(
+        block_height: u64,
+        tx_hashes: &[TxHash],
+    ) -> (WaveId, Arc<FinalizedWave>) {
         let wave_id = make_wave_id(block_height);
         let tx_outcomes: Vec<TxOutcome> = tx_hashes
             .iter()
@@ -153,7 +155,7 @@ mod tests {
         let cert = WaveCertificate::new(wave_id.clone(), vec![Arc::new(ec)]);
         // Lookups in this module only inspect the certificate's outcomes; an
         // empty receipts vector is fine for the store's contract.
-        let fw = FinalizedWave::new(Arc::new(cert), vec![]);
+        let fw = Arc::new(FinalizedWave::new(Arc::new(cert), vec![]));
         (wave_id, fw)
     }
 
@@ -162,7 +164,7 @@ mod tests {
         let store = FinalizedWaveStore::new();
         assert_eq!(store.len(), 0);
         assert!(store.is_empty());
-        assert!(!store.is_finalized(&TxHash::from_raw(Hash::from_bytes(b"anything"))));
+        assert!(!store.is_finalized(TxHash::from_raw(Hash::from_bytes(b"anything"))));
         assert!(store.all_tx_hashes().is_empty());
         assert!(store.all_waves().is_empty());
     }
@@ -175,10 +177,10 @@ mod tests {
 
         store.insert(wid.clone(), fw);
 
-        assert!(store.is_finalized(&tx));
+        assert!(store.is_finalized(tx));
         assert!(store.contains(&wid));
         assert_eq!(store.len(), 1);
-        let cert = store.get_certificate_for_tx(&tx).expect("cert present");
+        let cert = store.get_certificate_for_tx(tx).expect("cert present");
         assert_eq!(cert.wave_id(), &wid);
     }
 
@@ -231,8 +233,8 @@ mod tests {
 
         assert!(!store.contains(&wid1));
         assert!(store.contains(&wid2));
-        assert!(!store.is_finalized(&tx1));
-        assert!(store.is_finalized(&tx2));
+        assert!(!store.is_finalized(tx1));
+        assert!(store.is_finalized(tx2));
         assert_eq!(store.len(), 1);
     }
 
