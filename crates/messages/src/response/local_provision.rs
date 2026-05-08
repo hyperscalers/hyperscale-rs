@@ -2,7 +2,9 @@
 
 use std::sync::Arc;
 
-use hyperscale_types::{MessageClass, NetworkMessage, Provisions};
+use hyperscale_types::{
+    BoundedVec, MAX_PROVISIONS_PER_BLOCK, MessageClass, NetworkMessage, Provisions,
+};
 use sbor::prelude::BasicSbor;
 
 /// Response to a local provisions fetch request.
@@ -14,22 +16,34 @@ use sbor::prelude::BasicSbor;
 pub struct GetLocalProvisionsResponse {
     /// Provision batches the responder had locally.
     ///
-    /// `Arc`-wrapped because the server-side provision store holds each
-    /// batch behind `Arc` already.
-    pub provisions: Vec<Arc<Provisions>>,
+    /// Capped at [`MAX_PROVISIONS_PER_BLOCK`] — the natural ceiling since a
+    /// single block can't reference more provisions than this, and the fetch
+    /// dispatcher chunks at 16 ids per call. `Arc`-wrapped because the
+    /// server-side provision store holds each batch behind `Arc` already.
+    pub provisions: BoundedVec<Arc<Provisions>, MAX_PROVISIONS_PER_BLOCK>,
 }
 
 impl GetLocalProvisionsResponse {
     /// Build a response carrying `provisions`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `provisions.len() > MAX_PROVISIONS_PER_BLOCK`. The fetch
+    /// dispatcher chunks at 16 ids per call, so well-behaved callers sit
+    /// far below the cap.
     #[must_use]
-    pub const fn new(provisions: Vec<Arc<Provisions>>) -> Self {
-        Self { provisions }
+    pub fn new(provisions: Vec<Arc<Provisions>>) -> Self {
+        Self {
+            provisions: provisions.into(),
+        }
     }
 
     /// Build an empty response (responder had none of the requested batches).
     #[must_use]
     pub const fn empty() -> Self {
-        Self { provisions: vec![] }
+        Self {
+            provisions: BoundedVec::new(),
+        }
     }
 }
 
@@ -45,11 +59,48 @@ impl NetworkMessage for GetLocalProvisionsResponse {
 
 #[cfg(test)]
 mod tests {
+    use sbor::{
+        BASIC_SBOR_V1_MAX_DEPTH, BASIC_SBOR_V1_PAYLOAD_PREFIX, DecodeError, Encoder as _,
+        NoCustomValueKind, ValueKind, VecEncoder, basic_decode, basic_encode,
+    };
+
     use super::*;
 
     #[test]
     fn test_empty_response() {
         let resp = GetLocalProvisionsResponse::empty();
         assert!(resp.provisions.is_empty());
+    }
+
+    #[test]
+    fn empty_response_roundtrips() {
+        let original = GetLocalProvisionsResponse::empty();
+        let bytes = basic_encode(&original).unwrap();
+        let decoded: GetLocalProvisionsResponse = basic_decode(&bytes).unwrap();
+        assert!(decoded.provisions.is_empty());
+    }
+
+    /// Hand-roll a response whose `provisions` length exceeds the cap. The
+    /// `BoundedVec` decoder fires before any per-batch decode work happens.
+    #[test]
+    fn decode_rejects_oversized_provisions_count() {
+        let mut buf = Vec::with_capacity(32);
+        {
+            let mut enc = VecEncoder::<NoCustomValueKind>::new(&mut buf, BASIC_SBOR_V1_MAX_DEPTH);
+            enc.write_payload_prefix(BASIC_SBOR_V1_PAYLOAD_PREFIX)
+                .unwrap();
+            enc.write_value_kind(ValueKind::Tuple).unwrap();
+            enc.write_size(1).unwrap();
+            enc.write_value_kind(ValueKind::Array).unwrap();
+            enc.write_value_kind(ValueKind::Tuple).unwrap();
+            enc.write_size(MAX_PROVISIONS_PER_BLOCK + 1).unwrap();
+        }
+        let err = basic_decode::<GetLocalProvisionsResponse>(&buf).unwrap_err();
+        assert!(matches!(
+            err,
+            DecodeError::UnexpectedSize { expected, actual }
+                if expected == MAX_PROVISIONS_PER_BLOCK
+                    && actual == MAX_PROVISIONS_PER_BLOCK + 1
+        ));
     }
 }

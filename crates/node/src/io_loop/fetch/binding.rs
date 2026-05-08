@@ -219,7 +219,8 @@ impl FetchBinding for LocalProvisionBinding {
             origin.class_override(),
             Box::new(move |result| {
                 if let Ok(resp) = result {
-                    let split = partition_solicited(resp.provisions, &hs, |p| p.hash());
+                    let split =
+                        partition_solicited(resp.provisions.into_inner(), &hs, |p| p.hash());
                     for provisions in split.kept {
                         // Refcount is 1 right after decode, so this moves rather than clones.
                         let provisions = Arc::unwrap_or_clone(provisions);
