@@ -34,7 +34,7 @@ hyperscale-network-libp2p.workspace = true
 libp2p.workspace = true
 
 # UPnP
-igd-next = { version = "0.14.3", features = ["aio_tokio"] }
+igd-next = { version = "0.17.0", features = ["aio_tokio"] }
 
 # Serialization
 sbor.workspace = true
@@ -67,28 +67,28 @@ serde.workspace = true
 serde_json.workspace = true
 
 # HTTP server for metrics endpoint
-axum = "0.8.7"
+axum = "0.8.9"
 
 # CLI and configuration (for validator binary)
 clap.workspace = true
 toml.workspace = true
-anyhow = "1.0"
+anyhow = "1.0.102"
 hex.workspace = true
 rand.workspace = true
 
 # Radix types for genesis configuration parsing
 radix-common.workspace = true
-tracing-appender = "0.2.4"
+tracing-appender = "0.2.5"
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
-tikv-jemallocator = { version = "0.6", features = ["background_threads", "unprefixed_malloc_on_supported_platforms"] }
+tikv-jemallocator = { version = "0.6.1", features = ["background_threads", "unprefixed_malloc_on_supported_platforms"] }
 
 [dev-dependencies]
 hyperscale-dispatch-sync.workspace = true
 tempfile.workspace = true
-serial_test = "3"
+serial_test = "3.4.0"
 tracing-subscriber = { workspace = true, features = ["fmt", "env-filter"] }
-tower = "0.5"
+tower = "0.5.3"
 
 [lints]
 workspace = true

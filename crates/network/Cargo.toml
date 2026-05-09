@@ -6,9 +6,8 @@ description = "Shared network protocol logic: Network trait, compression, topics
 
 [dependencies]
 hyperscale-types.workspace = true
-
+lz4_flex = "0.13.0"
 sbor.workspace = true
-lz4_flex = "0.12.0"
 thiserror.workspace = true
 tracing.workspace = true
 

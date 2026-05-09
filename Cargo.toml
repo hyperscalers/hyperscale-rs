@@ -69,42 +69,44 @@ hyperscale-types = { path = "crates/types" }
 # External dependencies
 arc-swap = "1.9.1"
 blake3 = "1.8.5"
-bytes = "1.9"
+blst = "0.3.16"
+bytes = "1.11.1"
 clap = { version = "4.6.1", features = ["derive"] }
-core_affinity = "0.8"
-crossbeam = "0.8.2"
+core_affinity = "0.8.3"
+crossbeam = "0.8.4"
 dashmap = "6.1.0"
-ed25519-dalek = { version = "2.1", features = ["rand_core"] }
-futures = "0.3"
-hdrhistogram = "7.5"
+ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
+futures = "0.3.32"
+hdrhistogram = "7.5.4"
 hex = { version = "0.4.3", default-features = false }
-im = "15.1"
+im = "15.1.0"
 indexmap = "2.14.0"
 libp2p = { version = "0.56.0", features = ["gossipsub", "kad", "quic", "tokio", "macros", "identify"] }
 libp2p-stream = "0.4.0-alpha"
-opentelemetry = "0.31.0"
-opentelemetry_sdk = "0.31.0"
-opentelemetry-otlp = { version = "0.31.1", features = ["grpc-tonic", "reqwest-rustls"] }
-opentelemetry-semantic-conventions = "0.31.0"
+# Pin opentelemetry until tracing-opentelemetry update
+opentelemetry = "=0.31.0"
+opentelemetry_sdk = "=0.31.0"
+opentelemetry-otlp = { version = "=0.31.1", features = ["grpc-tonic", "reqwest-rustls"] }
+opentelemetry-semantic-conventions = "=0.31.0"
 papaya = "0.2.4"
-parking_lot = "0.12"
-proptest = "1"
+parking_lot = "0.12.5"
+proptest = "1.11.0"
 quick_cache = "0.6.21"
 rand = "0.10.1"
 rand_chacha = "0.10.0"
 rayon = "1.12.0"
 rocksdb = "0.24.0"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
 strum = { version = "0.28.0", features = ["derive"] }
-tempfile = "3.8.0"
+tempfile = "3.27.0"
 thiserror = "2.0.18"
-tokio = { version = "1.52.1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net"] }
 toml = "1.1.2"
 tracing = "0.1.44"
-tracing-opentelemetry = "0.32.0"
+tracing-opentelemetry = "0.32.1"
 tracing-subscriber = "0.3.23"
-tracing-test = "0.2.5"
+tracing-test = "0.2.6"
 
 # Radix dependencies (github.com/hyperscalers/radixdlt-scrypto @ 21c0c4c)
 radix-common = { git = "https://github.com/hyperscalers/radixdlt-scrypto", rev = "21c0c4c", default-features = false, features = ["std"] }

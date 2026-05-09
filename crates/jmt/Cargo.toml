@@ -13,7 +13,7 @@ rayon = { workspace = true, optional = true }
 thiserror.workspace = true
 
 [dev-dependencies]
-criterion = { version = "0.8", features = ["html_reports"] }
+criterion = { version = "0.8.2", features = ["html_reports"] }
 proptest.workspace = true
 
 [[bench]]
