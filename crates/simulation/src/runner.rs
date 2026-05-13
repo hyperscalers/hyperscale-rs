@@ -580,7 +580,14 @@ impl SimulationRunner {
         );
 
         loop {
-            // Determine next time: min(event_queue, all pending deliveries)
+            // Next simulated instant = min(two independent sources):
+            // - `next_event`: earliest simulation‑scheduled NodeInput (`event_queue`: timers,
+            //   test/harness injections like SubmitTransaction, and any other inputs keyed with an
+            //   `EventKey` time).
+            // - `next_delivery`: earliest in-flight delivery scheduled by node output on the
+            //   simulated network (gossip / notifications / responses after latency).
+            // Both are required: skipping either would ignore queued work or drop deliveries still
+            // in transit.
             let next_event = self.event_queue.first_key_value().map(|(k, _)| k.time);
             let next_delivery = self.network.next_delivery_time();
 
@@ -593,7 +600,7 @@ impl SimulationRunner {
             if next_time > end_time {
                 debug!(
                     remaining_events = self.event_queue.len(),
-                    "Time limit reached"
+                    "Time limit reached; remaining events stay queued until the next run_until()"
                 );
                 break;
             }
@@ -606,14 +613,19 @@ impl SimulationRunner {
                 self.last_gossip_dedup_prune = self.now;
             }
 
-            // Flush all delivery queues that are due — handlers/callbacks push
-            // events into crossbeam channels.
+            // Flush (= deliver) only those pending network items with `delivery_time <= now`: pop them
+            // from the pending queues and invoke the registered handlers/callbacks. Future
+            // deliveries remain queued; delivered handlers may enqueue new `NodeInput`s into
+            // crossbeam channels.
             let gossip_delivered = self.network.flush_gossip(self.now);
             let notif_delivered = self.network.flush_notifications(self.now);
             let response_delivered = self.network.flush_responses(self.now);
 
             if gossip_delivered + notif_delivered + response_delivered > 0 {
-                // Drain events that handlers pushed into channels.
+                // Network delivery handlers may push `NodeInput`s onto per-node crossbeam channels.
+                // Drain: `try_recv` in a loop until each channel has no ready messages, scheduling
+                // each into `event_queue` at `self.now` so the following `event_queue` loop can run
+                // them in the same simulated instant.
                 for node_idx in 0..u32::try_from(self.io_loops.len()).unwrap_or(u32::MAX) {
                     while let Ok(event) = self.event_rxs[node_idx as usize].try_recv() {
                         self.schedule_event(node_idx, self.now, event);
@@ -623,11 +635,16 @@ impl SimulationRunner {
 
             // Process all events at current time.
             while let Some((&key, _)) = self.event_queue.first_key_value() {
+                // `event_queue` is ordered by time; stop once the head is after `now`.
                 if key.time > self.now {
                     break;
                 }
 
-                let (key, event) = self.event_queue.pop_first().unwrap();
+                // impossible to be None because we checked above that the head is before `now`
+                let Some((key, event)) = self.event_queue.pop_first() else {
+                    break;
+                };
+
                 let node_index = key.node_index;
 
                 trace!(
