@@ -600,8 +600,7 @@ impl SimulationRunner {
             if next_time > end_time {
                 debug!(
                     remaining_events = self.event_queue.len(),
-                    "Time limit reached, remaining events stay in the queue until the next simulation step 
-                    (i.e.  `run_until` is called again)"
+                    "Time limit reached; remaining events stay queued until the next run_until()"
                 );
                 break;
             }
@@ -641,7 +640,11 @@ impl SimulationRunner {
                     break;
                 }
 
-                let (key, event) = self.event_queue.pop_first().unwrap();
+                // impossible to be None because we checked above that the head is before `now`
+                let Some((key, event)) = self.event_queue.pop_first() else {
+                    break;
+                };
+
                 let node_index = key.node_index;
 
                 trace!(
