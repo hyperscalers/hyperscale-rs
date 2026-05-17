@@ -13,8 +13,8 @@ use hyperscale_network::Network;
 use hyperscale_storage::Storage;
 
 use crate::io_loop::IoLoop;
-use crate::io_loop::fetch::FetchInput;
-use crate::io_loop::fetch::binding::{
+use crate::shard::fetch::FetchInput;
+use crate::shard::fetch::binding::{
     ExecCertBinding, FinalizedWaveBinding, LocalProvisionBinding, ProvisionBinding,
     TransactionBinding,
 };

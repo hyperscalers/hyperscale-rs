@@ -112,7 +112,7 @@ where
         let bft_stats = state.bft().stats();
         let mempool = state.mempool();
         let contention = mempool.lock_contention_stats();
-        let fetches = self.fetches.metrics();
+        let fetches = self.shard_fetches().metrics();
         let syncs = self.syncs.metrics();
         let block_sync_status = &syncs.block_sync_status;
 

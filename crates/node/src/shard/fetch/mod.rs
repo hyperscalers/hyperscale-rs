@@ -28,7 +28,7 @@ pub mod host;
 pub mod provision_serve;
 pub mod transaction_serve;
 
-pub use host::{FetchHost, FetchMetrics};
+pub use host::FetchHost;
 
 /// Tunables for a [`Fetch`] instance.
 #[derive(Debug, Clone)]

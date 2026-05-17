@@ -44,10 +44,10 @@ where
             GetBlockRequest, GetProvisionsRequest, GetRemoteHeadersRequest, GetTransactionsRequest,
         };
 
-        use crate::io_loop::fetch::provision_serve::serve_provision_request;
-        use crate::io_loop::fetch::transaction_serve::serve_transaction_request;
         use crate::io_loop::sync::block_serve::serve_block_request;
         use crate::io_loop::sync::remote_header_serve::serve_remote_headers_request;
+        use crate::shard::fetch::provision_serve::serve_provision_request;
+        use crate::shard::fetch::transaction_serve::serve_transaction_request;
 
         type ProvisionResponse = GetProvisionResponse;
         type ProvisionWaiter = Arc<(

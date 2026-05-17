@@ -9,11 +9,11 @@ use hyperscale_network::Network;
 use hyperscale_storage::Storage;
 
 use super::{IoLoop, TimerOp};
-use crate::io_loop::fetch::binding::{
+use crate::shard::fetch::binding::{
     ExecCertBinding, FetchBinding, FinalizedWaveBinding, LocalProvisionBinding, ProvisionBinding,
     TransactionBinding,
 };
-use crate::io_loop::fetch::{FetchInput, FetchOutput};
+use crate::shard::fetch::{FetchInput, FetchOutput};
 
 impl<S, N, D, E> IoLoop<S, N, D, E>
 where
@@ -73,7 +73,7 @@ where
                 "Dispatching fetch request"
             );
         }
-        let outputs = B::fetch_mut(&mut self.fetches).handle(input);
+        let outputs = B::fetch_mut(self.shard_fetches_mut()).handle(input);
         self.process_fetch_outputs::<B>(outputs);
     }
 
@@ -122,7 +122,7 @@ where
     }
 
     pub(in crate::io_loop) fn update_fetch_tick_timer(&mut self) {
-        let op = if self.fetches.has_any_pending() || self.syncs.has_any_pending() {
+        let op = if self.shard_fetches().has_any_pending() || self.syncs.has_any_pending() {
             TimerOp::Set {
                 id: TimerId::FetchTick,
                 duration: Self::FETCH_TICK_INTERVAL,

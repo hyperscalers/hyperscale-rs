@@ -21,13 +21,13 @@ use hyperscale_types::{
 use tracing::{debug, error, trace, warn};
 
 use super::{IoLoop, TimerOp};
-use crate::io_loop::fetch::FetchInput;
-use crate::io_loop::fetch::binding::{
+use crate::io_loop::sync::block::BlockSyncInput;
+use crate::shard::block_commit::{AccumulateDecision, PendingCommit};
+use crate::shard::fetch::FetchInput;
+use crate::shard::fetch::binding::{
     ExecCertBinding, FinalizedWaveBinding, LocalProvisionBinding, ProvisionBinding,
     TransactionBinding,
 };
-use crate::io_loop::sync::block::BlockSyncInput;
-use crate::shard::block_commit::{AccumulateDecision, PendingCommit};
 impl<S, N, D, E> IoLoop<S, N, D, E>
 where
     S: Storage,

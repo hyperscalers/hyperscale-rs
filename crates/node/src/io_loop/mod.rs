@@ -19,7 +19,6 @@
 //! production (wall clock) and simulation (logical clock) use the same paths.
 
 mod actions;
-pub mod fetch;
 mod fetch_io;
 mod init;
 mod metrics;
@@ -52,16 +51,16 @@ pub use status::NodeStatusSnapshot;
 use crate::NodeStateMachine;
 use crate::batch_accumulator::BatchAccumulator;
 use crate::config::NodeConfig;
-use crate::io_loop::fetch::binding::{
-    ExecCertBinding, FinalizedWaveBinding, LocalProvisionBinding, ProvisionBinding,
-    TransactionBinding,
-};
-use crate::io_loop::fetch::{FetchHost, FetchInput};
 use crate::io_loop::step::CommittedHeaderVerificationItem;
 use crate::io_loop::sync::SyncHost;
 use crate::shard::ShardIo;
 use crate::shard::block_commit::{BlockCommitCoordinator, PreparedCommitMap};
 use crate::shard::caches::SharedCaches;
+use crate::shard::fetch::binding::{
+    ExecCertBinding, FinalizedWaveBinding, LocalProvisionBinding, ProvisionBinding,
+    TransactionBinding,
+};
+use crate::shard::fetch::{FetchHost, FetchInput};
 use crate::vnode::Vnode;
 
 /// Lock-free shared topology snapshot for handler closures and dispatch.
@@ -205,9 +204,6 @@ where
     /// See [`DispatchHandles`]. Cloned once per delegated-action dispatch.
     dispatch_handles: Arc<DispatchHandles<S, N, E>>,
 
-    /// Per-payload fetch state machines.
-    fetches: FetchHost,
-
     /// Sync state machines (block-sync, remote-header sync).
     syncs: SyncHost,
 
@@ -343,6 +339,7 @@ where
                 // At startup, everything committed is also persisted on disk.
                 block_commit,
                 caches,
+                fetches,
             },
         )]);
         assert_eq!(
@@ -362,7 +359,6 @@ where
             tx_validator,
             pending_validation: HashSet::new(),
             locally_submitted: HashSet::new(),
-            fetches,
             syncs,
             validation_batch: BatchAccumulator::new(b.tx_validation_max, b.tx_validation_window),
             committed_header_batch: BatchAccumulator::new(
@@ -447,6 +443,23 @@ where
     /// Internal: shared inbound-serving caches for the shard.
     pub(super) fn shard_caches(&self) -> &SharedCaches {
         &self.shards.values().next().expect("V_shard == 1").caches
+    }
+
+    /// Internal: per-payload fetch state machines for the shard.
+    pub(super) fn shard_fetches(&self) -> &FetchHost {
+        &self.shards.values().next().expect("V_shard == 1").fetches
+    }
+
+    /// Internal: mutable view of the shard's fetch host. Required by
+    /// `FetchBinding::fetch_mut`, which routes inputs to the correct
+    /// per-payload state machine.
+    pub(super) fn shard_fetches_mut(&mut self) -> &mut FetchHost {
+        &mut self
+            .shards
+            .values_mut()
+            .next()
+            .expect("V_shard == 1")
+            .fetches
     }
 
     /// Access the network.
