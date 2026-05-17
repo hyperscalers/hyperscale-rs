@@ -53,9 +53,6 @@ where
         let tx_hash = tx.hash();
         self.shard_io_mut(shard).pending_validation.remove(&tx_hash);
         let submitted_locally = self.shard_io_mut(shard).locally_submitted.remove(&tx_hash);
-        for vnode in &mut self.vnodes {
-            vnode.actions_generated = 0;
-        }
         self.feed_event_to_shard_vnodes(
             shard,
             ProtocolEvent::TransactionValidated {
