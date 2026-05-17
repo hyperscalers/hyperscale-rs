@@ -65,17 +65,20 @@ use crate::vnode::Vnode;
 /// Handler closures call `.load()` to get the current snapshot atomically.
 pub type SharedTopologySnapshot = Arc<ArcSwap<TopologySnapshot>>;
 
-/// Long-lived handles cloned into every delegated-action dispatch.
+/// Long-lived shard-scoped handles cloned into every delegated-action
+/// dispatch.
 ///
-/// Wrapped in a single `Arc` so each dispatch pays one atomic-RMW for the
-/// whole bundle. `topology_snapshot` and `event_sender` are not bundled —
-/// the snapshot needs a fresh `load_full` per dispatch, and the crossbeam
-/// `Sender` clone is independent of these handles.
+/// Wrapped in a single `Arc` so each dispatch pays one atomic-RMW for
+/// the whole bundle. `topology_snapshot`, `event_sender`, and the
+/// emitting vnode's signing key are not bundled — the snapshot needs
+/// a fresh `load_full` per dispatch, the crossbeam `Sender` clone is
+/// independent of these handles, and the signing key is per-vnode
+/// (cloned separately at each dispatch site so the right validator
+/// signs).
 pub(super) struct DispatchHandles<S: Storage, N, E: Engine> {
     pub(super) executor: E,
     pub(super) pending_chain: Arc<PendingChain<S>>,
     pub(super) network: Arc<N>,
-    pub(super) signing_key: Arc<Bls12381G1PrivateKey>,
     pub(super) prepared_commits: Arc<Mutex<PreparedCommitMap<S>>>,
 }
 
@@ -264,7 +267,6 @@ where
             executor: executor.clone(),
             pending_chain: Arc::clone(&pending_chain),
             network: Arc::clone(&network),
-            signing_key: Arc::clone(&signing_key),
             prepared_commits: block_commit.prepared_commits_handle(),
         });
         let vnode = Vnode {
@@ -609,24 +611,26 @@ where
         }
     }
 
-    /// Feed a protocol event to the state machine and process all resulting actions.
+    /// Feed a protocol event to the named vnode's state machine and
+    /// process all resulting actions.
     ///
-    /// This is the common pattern used throughout `IoLoop`: route an event through
-    /// the state machine, then dispatch each resulting action.
-    fn feed_event(&mut self, event: ProtocolEvent) {
-        let actions = self.vnodes[0].state.handle(event);
-        self.process_actions(actions);
+    /// This is the common pattern used throughout `IoLoop`: route an
+    /// event through a state machine, then dispatch each resulting
+    /// action with the originating vnode's signing context.
+    fn feed_event(&mut self, vnode_idx: usize, event: ProtocolEvent) {
+        let actions = self.vnodes[vnode_idx].state.handle(event);
+        self.process_actions(vnode_idx, actions);
     }
 
-    /// Dispatch a `Vec<Action>` produced by a direct state-machine method
-    /// call. Mirrors [`Self::feed_event`]'s post-`handle` block — bumps
-    /// `actions_generated`, dispatches each action, and flushes pending
-    /// block commits. The flush is the load-bearing part: it's easy to
-    /// forget when copy-pasting the loop inline.
-    fn process_actions(&mut self, actions: Vec<Action>) {
-        self.vnodes[0].actions_generated += actions.len();
+    /// Dispatch a `Vec<Action>` produced by a direct state-machine
+    /// method call. Mirrors [`Self::feed_event`]'s post-`handle` block
+    /// — bumps `actions_generated`, dispatches each action, and
+    /// flushes pending block commits. The flush is the load-bearing
+    /// part: it's easy to forget when copy-pasting the loop inline.
+    fn process_actions(&mut self, vnode_idx: usize, actions: Vec<Action>) {
+        self.vnodes[vnode_idx].actions_generated += actions.len();
         for action in actions {
-            self.process_action(action);
+            self.process_action(vnode_idx, action);
         }
         self.flush_block_commits();
     }

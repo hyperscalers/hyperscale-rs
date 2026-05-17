@@ -35,7 +35,7 @@ where
     /// that must be processed through the `IoLoop`'s action handler.
     pub fn handle_actions(&mut self, actions: Vec<Action>) {
         for action in actions {
-            self.process_action(action);
+            self.process_action(0, action);
         }
         self.flush_block_commits();
     }

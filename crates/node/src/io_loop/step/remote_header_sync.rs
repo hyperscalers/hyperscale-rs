@@ -100,10 +100,13 @@ where
             delivered_heights.push(h);
             // The `sender` field carries no meaning for fetched headers —
             // a sentinel value avoids confusion with real validator ids.
-            self.feed_event(ProtocolEvent::RemoteHeaderReceived {
-                committed_header: header,
-                sender: ValidatorId::new(u64::MAX),
-            });
+            self.feed_event(
+                0,
+                ProtocolEvent::RemoteHeaderReceived {
+                    committed_header: header,
+                    sender: ValidatorId::new(u64::MAX),
+                },
+            );
         }
 
         let outputs =
@@ -210,10 +213,13 @@ where
                         height = height.inner(),
                         "remote-header sync caught up"
                     );
-                    self.feed_event(ProtocolEvent::RemoteHeaderSyncComplete {
-                        source_shard,
-                        height,
-                    });
+                    self.feed_event(
+                        0,
+                        ProtocolEvent::RemoteHeaderSyncComplete {
+                            source_shard,
+                            height,
+                        },
+                    );
                 }
             }
         }

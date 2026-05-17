@@ -181,7 +181,7 @@ where
                         height = height.inner(),
                         "Sync protocol complete, resuming consensus"
                     );
-                    self.feed_event(ProtocolEvent::BlockSyncComplete { height });
+                    self.feed_event(0, ProtocolEvent::BlockSyncComplete { height });
                 }
             }
         }
@@ -271,7 +271,7 @@ where
         record_sync_round_completed("block");
 
         // Hand the block off to BFT; tell the FSM the height was delivered.
-        self.feed_event(ProtocolEvent::BlockSyncReadyToApply { certified });
+        self.feed_event(0, ProtocolEvent::BlockSyncReadyToApply { certified });
         let outputs = self
             .shard_syncs_mut()
             .block

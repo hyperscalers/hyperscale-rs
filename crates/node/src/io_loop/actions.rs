@@ -37,7 +37,11 @@ where
 {
     // ─── Action Processing ──────────────────────────────────────────────
 
-    /// Process a single action from the state machine.
+    /// Process a single action emitted by `vnode_idx`'s state machine.
+    ///
+    /// `vnode_idx` identifies the vnode that produced the action so
+    /// dispatched off-thread work can sign with the right validator's
+    /// key.
     ///
     /// Two categories of arm:
     /// - **Coordinator policy** — delegated to coordinator crates via
@@ -46,7 +50,7 @@ where
     ///   `io_loop` machinery (timers, caches consumed by `io_loop`-side
     ///   serving, RPC observability, block commit pipeline, topology
     ///   plumbing).
-    pub(super) fn process_action(&mut self, action: Action) {
+    pub(super) fn process_action(&mut self, vnode_idx: usize, action: Action) {
         match action {
             // ─── Coordinator policy: delegated to worker pools ─────────────
             Action::AggregateExecutionCertificate { .. }
@@ -71,7 +75,7 @@ where
             | Action::BroadcastCommittedBlockHeader { .. }
             | Action::SignAndSendExecutionVote { .. }
             | Action::BroadcastExecutionCertificate { .. } => {
-                self.dispatch_delegated_action(action);
+                self.dispatch_delegated_action(vnode_idx, action);
             }
 
             // ─── Sync / fetch protocol drive ───────────────────────────────
@@ -410,7 +414,7 @@ where
                         Arc::unwrap_or_clone(block),
                         Arc::unwrap_or_clone(qc),
                     );
-                    self.feed_event(ProtocolEvent::BlockCommitted { certified });
+                    self.feed_event(0, ProtocolEvent::BlockCommitted { certified });
                 }
             }
         }
@@ -510,7 +514,7 @@ where
     /// `event_sender` channel and are processed on a future `step()` call.
     /// With `SyncDispatch` (simulation), `spawn_*` runs inline so events
     /// enter the channel immediately and are drained by the harness.
-    fn dispatch_delegated_action(&self, action: Action) {
+    fn dispatch_delegated_action(&self, vnode_idx: usize, action: Action) {
         let pool = action
             .dispatch_pool()
             .expect("dispatch_delegated_action called for delegated actions only");
@@ -518,6 +522,7 @@ where
         let handles = Arc::clone(&self.dispatch_handles);
         let topology_snapshot = self.topology_snapshot.load_full();
         let event_tx = self.event_sender.clone();
+        let signing_key = Arc::clone(&self.vnodes[vnode_idx].signing_key);
 
         self.dispatch.spawn(pool, move || {
             let notify = move |event: NodeInput| {
@@ -555,7 +560,7 @@ where
                 topology_snapshot: &topology_snapshot,
                 pending_chain: &handles.pending_chain,
                 network: &handles.network,
-                signing_key: &handles.signing_key,
+                signing_key: &signing_key,
                 notify: &notify,
                 commit_prepared: &commit_prepared,
             };

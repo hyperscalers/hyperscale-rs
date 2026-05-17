@@ -53,10 +53,13 @@ where
         self.shard_io_mut().pending_validation.remove(&tx_hash);
         let submitted_locally = self.shard_io_mut().locally_submitted.remove(&tx_hash);
         self.vnodes[0].actions_generated = 0;
-        self.feed_event(ProtocolEvent::TransactionValidated {
-            tx,
-            submitted_locally,
-        });
+        self.feed_event(
+            0,
+            ProtocolEvent::TransactionValidated {
+                tx,
+                submitted_locally,
+            },
+        );
     }
 
     /// Validation failed — drop tracking entries so the tx can be
