@@ -180,9 +180,10 @@ where
     }
 
     fn handle_restore_committed_state(&self) {
-        let height = self.storage.committed_height();
-        let hash = self.storage.committed_hash();
-        let qc = self.storage.latest_qc();
+        let storage = self.storage();
+        let height = storage.committed_height();
+        let hash = storage.committed_hash();
+        let qc = storage.latest_qc();
         let _ = self.event_sender.send(NodeInput::Protocol(Box::new(
             ProtocolEvent::CommittedStateRestored { height, hash, qc },
         )));
@@ -414,8 +415,9 @@ where
     }
 
     pub(super) fn flush_block_commits(&mut self) {
+        let storage = Arc::clone(self.shard_storage());
         self.block_commit
-            .flush(&self.storage, &self.event_sender, &self.dispatch);
+            .flush(&storage, &self.event_sender, &self.dispatch);
     }
 
     /// Dispatch a typed fetch request to the corresponding binding.
