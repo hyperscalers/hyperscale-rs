@@ -182,14 +182,20 @@ pub trait Network: Send + Sync + 'static {
         handler: impl GossipHandler<M>,
     );
 
-    /// Register a typed request handler for a message type.
+    /// Register a typed request handler for a message type on `shard`.
     ///
     /// The `HandlerRegistry` SBOR-decodes the raw request into `R` and SBOR-encodes
     /// the `R::Response` before sending it back. Decode/encode errors are logged
     /// and an empty response is returned.
     ///
-    /// Called during node initialization — once per request type.
-    fn register_request_handler<R: Request>(&self, handler: impl RequestHandler<R>);
+    /// Called during node initialization — once per `(type, hosted shard)` pair.
+    /// A multi-shard host registers one handler per hosted shard so each
+    /// closure can capture its own `ShardIo`'s storage.
+    fn register_request_handler<R: Request>(
+        &self,
+        shard: ShardGroupId,
+        handler: impl RequestHandler<R>,
+    );
 
     // ── Unicast notifications ──
 

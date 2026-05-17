@@ -211,9 +211,13 @@ impl Network for SimNetworkAdapter {
         self.registry.register_notification(handler);
     }
 
-    fn register_request_handler<R: Request>(&self, handler: impl RequestHandler<R>) {
+    fn register_request_handler<R: Request>(
+        &self,
+        shard: ShardGroupId,
+        handler: impl RequestHandler<R>,
+    ) {
         // Registry owns SBOR decode/encode — just forward.
-        self.registry.register_request(handler);
+        self.registry.register_request(shard, handler);
     }
 
     fn request<R: Request + 'static>(
@@ -318,10 +322,13 @@ mod tests {
 
         let registry = Arc::new(HandlerRegistry::new());
         let adapter = SimNetworkAdapter::new(registry.clone());
+        let shard = ShardGroupId::new(0);
 
-        assert!(registry.get_request("block.request").is_none());
-        adapter.register_request_handler::<GetBlockRequest>(|_req| GetBlockResponse::not_found());
-        assert!(registry.get_request("block.request").is_some());
+        assert!(registry.get_request("block.request", shard).is_none());
+        adapter.register_request_handler::<GetBlockRequest>(shard, |_req| {
+            GetBlockResponse::not_found()
+        });
+        assert!(registry.get_request("block.request", shard).is_some());
     }
 
     #[test]
@@ -330,13 +337,21 @@ mod tests {
         use hyperscale_types::network::response::GetBlockResponse;
 
         let adapter = SimNetworkAdapter::default();
+        let shard = ShardGroupId::new(0);
 
-        adapter.register_request_handler::<GetBlockRequest>(|_req| GetBlockResponse::not_found());
-        adapter.register_request_handler::<GetBlockRequest>(|_req| GetBlockResponse::not_found());
+        adapter.register_request_handler::<GetBlockRequest>(shard, |_req| {
+            GetBlockResponse::not_found()
+        });
+        adapter.register_request_handler::<GetBlockRequest>(shard, |_req| {
+            GetBlockResponse::not_found()
+        });
 
         // Second handler should have won (overwrites).
         // Encode a real request, call the raw handler, verify it works.
-        let handler = adapter.registry.get_request("block.request").unwrap();
+        let handler = adapter
+            .registry
+            .get_request("block.request", shard)
+            .unwrap();
         let req = GetBlockRequest::new(BlockHeight::new(1), BlockHeight::new(1));
         let req_bytes = basic_encode(&req).unwrap();
         let response_bytes = handler(&req_bytes);

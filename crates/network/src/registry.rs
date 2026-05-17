@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, PoisonError, RwLock};
 
-use hyperscale_types::{NetworkMessage, Request};
+use hyperscale_types::{NetworkMessage, Request, ShardGroupId};
 use sbor::{basic_decode, basic_encode};
 
 use crate::traits::{GossipHandler, GossipVerdict, NotificationHandler, RequestHandler};
@@ -37,9 +37,15 @@ pub type RawRequestHandler = dyn Fn(&[u8]) -> Vec<u8> + Send + Sync;
 ///
 /// Three maps: `gossip`, `request`, and `notification`. A message type
 /// can be registered in multiple maps simultaneously.
+///
+/// Requests are keyed by `(type_id, ShardGroupId)`: a multi-shard host
+/// registers one handler per hosted shard so each closure can capture
+/// its own `ShardIo`'s storage. Gossip and notifications stay flat
+/// because their closures dispatch into the state machine, which
+/// internally fans out across hosted shards.
 pub struct HandlerRegistry {
     gossip: RwLock<HashMap<&'static str, Arc<RawGossipHandler>>>,
-    request: RwLock<HashMap<&'static str, Arc<RawRequestHandler>>>,
+    request: RwLock<HashMap<(&'static str, ShardGroupId), Arc<RawRequestHandler>>>,
     notification: RwLock<HashMap<&'static str, Arc<RawNotificationHandler>>>,
 }
 
@@ -79,11 +85,19 @@ impl HandlerRegistry {
             .insert(M::message_type_id(), raw);
     }
 
-    /// Register a typed request handler for a message type.
+    /// Register a typed request handler for a message type on `shard`.
+    ///
+    /// A multi-shard host registers one handler per hosted shard; the
+    /// inbound router looks up `(type_id, shard)` based on which per-shard
+    /// stream protocol the request arrived on.
     ///
     /// Wraps the handler in a closure that SBOR-decodes the request,
     /// calls the handler, and SBOR-encodes the response.
-    pub fn register_request<R: Request>(&self, handler: impl RequestHandler<R>) {
+    pub fn register_request<R: Request>(
+        &self,
+        shard: ShardGroupId,
+        handler: impl RequestHandler<R>,
+    ) {
         let raw: Arc<RawRequestHandler> = Arc::new(move |payload: &[u8]| -> Vec<u8> {
             let req = match basic_decode::<R>(payload) {
                 Ok(r) => r,
@@ -113,7 +127,7 @@ impl HandlerRegistry {
         self.request
             .write()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(R::message_type_id(), raw);
+            .insert((R::message_type_id(), shard), raw);
     }
 
     /// Register a typed notification handler for a message type.
@@ -151,15 +165,20 @@ impl HandlerRegistry {
             .insert(type_id, handler);
     }
 
-    /// Register a raw request handler by `type_id` string.
+    /// Register a raw request handler for `(type_id, shard)`.
     ///
     /// Prefer [`register_request`](Self::register_request) for production code.
     /// This is useful for infrastructure tests that work with raw bytes.
-    pub fn register_raw_request(&self, type_id: &'static str, handler: Arc<RawRequestHandler>) {
+    pub fn register_raw_request(
+        &self,
+        type_id: &'static str,
+        shard: ShardGroupId,
+        handler: Arc<RawRequestHandler>,
+    ) {
         self.request
             .write()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(type_id, handler);
+            .insert((type_id, shard), handler);
     }
 
     /// Register a raw notification handler by `type_id` string.
@@ -189,13 +208,17 @@ impl HandlerRegistry {
             .cloned()
     }
 
-    /// Look up the request handler for a message type.
+    /// Look up the request handler for `(type_id, shard)`.
     #[must_use]
-    pub fn get_request(&self, message_type_id: &str) -> Option<Arc<RawRequestHandler>> {
+    pub fn get_request(
+        &self,
+        message_type_id: &str,
+        shard: ShardGroupId,
+    ) -> Option<Arc<RawRequestHandler>> {
         self.request
             .read()
             .unwrap_or_else(PoisonError::into_inner)
-            .get(message_type_id)
+            .get(&(message_type_id, shard))
             .cloned()
     }
 
@@ -284,16 +307,22 @@ mod tests {
         }
 
         let registry = HandlerRegistry::new();
+        let shard = ShardGroupId::new(0);
 
-        registry.register_request(|req: TestReq| TestResp(req.0 * 2));
+        registry.register_request(shard, |req: TestReq| TestResp(req.0 * 2));
 
-        let handler = registry.get_request("test.request").unwrap();
+        let handler = registry.get_request("test.request", shard).unwrap();
         let req_bytes = basic_encode(&TestReq(21)).unwrap();
         let response_bytes = handler(&req_bytes);
         let response: TestResp = basic_decode(&response_bytes).unwrap();
         assert_eq!(response, TestResp(42));
 
-        assert!(registry.get_request("unknown.request").is_none());
+        assert!(registry.get_request("unknown.request", shard).is_none());
+        assert!(
+            registry
+                .get_request("test.request", ShardGroupId::new(1))
+                .is_none()
+        );
     }
 
     #[test]
