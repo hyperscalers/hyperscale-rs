@@ -56,10 +56,13 @@ where
         for vnode in &mut self.vnodes {
             vnode.actions_generated = 0;
         }
-        self.feed_event_to_all_vnodes(ProtocolEvent::TransactionValidated {
-            tx,
-            submitted_locally,
-        });
+        self.feed_event_to_shard_vnodes(
+            shard,
+            ProtocolEvent::TransactionValidated {
+                tx,
+                submitted_locally,
+            },
+        );
     }
 
     /// Validation failed — drop tracking entries so the tx can be

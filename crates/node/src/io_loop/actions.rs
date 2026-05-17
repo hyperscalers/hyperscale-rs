@@ -434,7 +434,10 @@ where
                         Arc::unwrap_or_clone(block),
                         Arc::unwrap_or_clone(qc),
                     );
-                    self.feed_event_to_all_vnodes(ProtocolEvent::BlockCommitted { certified });
+                    self.feed_event_to_shard_vnodes(
+                        shard,
+                        ProtocolEvent::BlockCommitted { certified },
+                    );
                 }
             }
         }

@@ -713,23 +713,32 @@ where
         self.process_actions(vnode_idx, actions);
     }
 
-    /// Fan a protocol event out to every hosted vnode's state machine.
+    /// Fan a shard-scoped protocol event out to every hosted vnode in
+    /// `shard`'s state machine.
     ///
-    /// Use this for shard-derived events (block persisted, sync block
-    /// validated, remote header received, etc.) — each same-shard
-    /// vnode independently applies the event and produces its own
-    /// signed actions. Per-vnode events (where only the emitting vnode
-    /// should react) should call [`Self::feed_event`] directly with
-    /// the originating index.
-    fn feed_event_to_all_vnodes(&mut self, event: ProtocolEvent) {
-        // Clone for every vnode except the last; move into the last so
-        // we don't pay a final clone whose result is immediately
+    /// Use this for events that mean "something happened in shard S"
+    /// (block persisted, sync block validated, remote header received,
+    /// etc.) — every same-shard vnode independently applies the event
+    /// and produces its own signed actions, while vnodes in other
+    /// shards correctly ignore it. Per-vnode events (where only the
+    /// emitting vnode should react) should call [`Self::feed_event`]
+    /// directly with the originating index.
+    fn feed_event_to_shard_vnodes(&mut self, shard: ShardGroupId, event: ProtocolEvent) {
+        // Collect indices up front so we can `&mut self` through
+        // `feed_event` without holding a borrow of `vnodes`.
+        let targets: Vec<usize> = self
+            .vnodes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, v)| (v.shard == shard).then_some(i))
+            .collect();
+        // Clone for every recipient except the last; move into the last
+        // so we don't pay a final clone whose result is immediately
         // dropped.
-        let last = self.vnodes.len().saturating_sub(1);
-        for vnode_idx in 0..last {
-            self.feed_event(vnode_idx, event.clone());
-        }
-        if !self.vnodes.is_empty() {
+        if let Some((&last, rest)) = targets.split_last() {
+            for &vnode_idx in rest {
+                self.feed_event(vnode_idx, event.clone());
+            }
             self.feed_event(last, event);
         }
     }

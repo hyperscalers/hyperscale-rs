@@ -102,10 +102,13 @@ where
             delivered_heights.push(h);
             // The `sender` field carries no meaning for fetched headers —
             // a sentinel value avoids confusion with real validator ids.
-            self.feed_event_to_all_vnodes(ProtocolEvent::RemoteHeaderReceived {
-                committed_header: header,
-                sender: ValidatorId::new(u64::MAX),
-            });
+            self.feed_event_to_shard_vnodes(
+                local_shard,
+                ProtocolEvent::RemoteHeaderReceived {
+                    committed_header: header,
+                    sender: ValidatorId::new(u64::MAX),
+                },
+            );
         }
 
         let outputs = self.shard_syncs_mut(local_shard).remote_header.handle(
@@ -149,7 +152,7 @@ where
     /// `RemoteHeaderSyncComplete` event.
     pub(in crate::io_loop) fn process_remote_header_sync_outputs(
         &mut self,
-        _local_shard: ShardGroupId,
+        local_shard: ShardGroupId,
         outputs: Vec<RemoteHeaderSyncOutput>,
     ) {
         for output in outputs {
@@ -207,10 +210,13 @@ where
                         height = height.inner(),
                         "remote-header sync caught up"
                     );
-                    self.feed_event_to_all_vnodes(ProtocolEvent::RemoteHeaderSyncComplete {
-                        source_shard,
-                        height,
-                    });
+                    self.feed_event_to_shard_vnodes(
+                        local_shard,
+                        ProtocolEvent::RemoteHeaderSyncComplete {
+                            source_shard,
+                            height,
+                        },
+                    );
                 }
             }
         }
