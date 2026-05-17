@@ -215,9 +215,13 @@ impl Network for Libp2pNetwork {
         self.registry.register_notification(handler);
     }
 
-    fn register_request_handler<R: Request>(&self, handler: impl RequestHandler<R>) {
+    fn register_request_handler<R: Request>(
+        &self,
+        shard: ShardGroupId,
+        handler: impl RequestHandler<R>,
+    ) {
         // Registry owns SBOR decode/encode — just forward.
-        self.registry.register_request(handler);
+        self.registry.register_request(shard, handler);
     }
 
     fn request<R: Request + 'static>(

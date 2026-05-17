@@ -15,6 +15,7 @@ use dashmap::DashMap;
 use futures::{AsyncWriteExt, StreamExt};
 use hyperscale_metrics::{record_libp2p_bandwidth, set_inbound_streams_in_use};
 use hyperscale_network::HandlerRegistry;
+use hyperscale_types::ShardGroupId;
 use libp2p::{PeerId, Stream};
 use tokio::spawn;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -163,7 +164,7 @@ impl InboundRouter {
                             spawn(async move {
                                 let _permit = permit;
                                 let result = router_clone
-                                    .handle_request_stream(peer_id, stream)
+                                    .handle_request_stream(peer_id, shard, stream)
                                     .await;
                                 router_clone.decrement_peer_count(&peer_id);
                                 match result {
@@ -363,6 +364,7 @@ impl InboundRouter {
     async fn handle_request_stream(
         &self,
         peer: PeerId,
+        shard: ShardGroupId,
         mut stream: Stream,
     ) -> Result<(), StreamError> {
         loop {
@@ -391,10 +393,12 @@ impl InboundRouter {
 
             record_libp2p_bandwidth(req_wire_bytes as u64, 0);
 
-            // Look up the per-type request handler.
+            // Look up the per-(type, shard) request handler. The shard
+            // is the one this accept loop was registered for — every
+            // request that lands here arrived on `shard`'s protocol.
             let handler = self
                 .registry
-                .get_request(&type_id)
+                .get_request(&type_id, shard)
                 .ok_or(StreamError::UnknownMessageType)?;
 
             // Delegate to the handler on the blocking thread pool.

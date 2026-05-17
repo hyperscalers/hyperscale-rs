@@ -682,11 +682,13 @@ impl SimulatedNetwork {
                 );
             }
 
-            // Look up the per-type request handler from the peer's registry.
+            // Look up the per-(type, shard) request handler from the peer's
+            // registry. `shard` is the routing shard the requester sent on,
+            // which a multi-shard host registers handlers under separately.
             let Some(handler) = self
                 .registries
                 .get(peer as usize)
-                .and_then(|r| r.get_request(type_id))
+                .and_then(|r| r.get_request(type_id, shard))
             else {
                 let _ = on_response(Err(RequestError::PeerError(format!(
                     "no handler for {type_id} on node {peer}"
@@ -1290,15 +1292,18 @@ mod tests {
 
     // ─── accept_requests() Tests ───
 
-    /// Helper: register an echo handler on a node's adapter for a given `type_id`.
+    /// Helper: register an echo handler on a node's adapter for a given
+    /// `type_id` under `shard`.
     ///
     /// Registers directly on the shared registry since these tests exercise
     /// the `SimulatedNetwork` infrastructure (partitions, latency), not the
     /// typed handler registration API.
-    fn register_echo(adapter: &SimNetworkAdapter, type_id: &'static str) {
+    fn register_echo(adapter: &SimNetworkAdapter, type_id: &'static str, shard: ShardGroupId) {
         let handler: Arc<RawRequestHandler> =
             Arc::new(|payload: &[u8]| -> Vec<u8> { payload.to_vec() });
-        adapter.registry.register_raw_request(type_id, handler);
+        adapter
+            .registry
+            .register_raw_request(type_id, shard, handler);
     }
 
     /// Helper: build a `PendingRequest` with a callback that captures the result.
@@ -1332,7 +1337,7 @@ mod tests {
 
         // Register echo handler on node 1
         let adapter1 = network.create_adapter(1);
-        register_echo(&adapter1, "test.request");
+        register_echo(&adapter1, "test.request", ShardGroupId::new(0));
 
         let (request, result) =
             make_request_with_capture(ShardGroupId::new(0), Some(ValidatorId::new(1)));
@@ -1363,7 +1368,7 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         let adapter1 = network.create_adapter(1);
-        register_echo(&adapter1, "test.request");
+        register_echo(&adapter1, "test.request", ShardGroupId::new(0));
 
         // Partition node 0 → node 1
         network.partition_unidirectional(0, 1);
@@ -1391,7 +1396,7 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         let adapter1 = network.create_adapter(1);
-        register_echo(&adapter1, "test.request");
+        register_echo(&adapter1, "test.request", ShardGroupId::new(0));
 
         let (request, result) =
             make_request_with_capture(ShardGroupId::new(0), Some(ValidatorId::new(1)));
@@ -1440,7 +1445,7 @@ mod tests {
         let handler: Arc<RawRequestHandler> = Arc::new(|_: &[u8]| -> Vec<u8> { vec![] });
         adapter1
             .registry
-            .register_raw_request("test.request", handler);
+            .register_raw_request("test.request", ShardGroupId::new(0), handler);
 
         let (request, result) =
             make_request_with_capture(ShardGroupId::new(0), Some(ValidatorId::new(1)));
@@ -1463,7 +1468,7 @@ mod tests {
         // Register handlers on all nodes
         for i in 0..4 {
             let adapter = network.create_adapter(i);
-            register_echo(&adapter, "test.request");
+            register_echo(&adapter, "test.request", ShardGroupId::new(0));
         }
 
         // No preferred peer — should pick a random peer from the shard
@@ -1490,7 +1495,7 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         let adapter0 = network.create_adapter(0);
-        register_echo(&adapter0, "test.request");
+        register_echo(&adapter0, "test.request", ShardGroupId::new(0));
 
         // No preferred peer, and empty peer list
         let (request, result) = make_request_with_capture(ShardGroupId::new(0), None);
@@ -1512,7 +1517,7 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         let adapter1 = network.create_adapter(1);
-        register_echo(&adapter1, "test.request");
+        register_echo(&adapter1, "test.request", ShardGroupId::new(0));
 
         let (request, result) =
             make_request_with_capture(ShardGroupId::new(0), Some(ValidatorId::new(1)));
@@ -1863,7 +1868,7 @@ mod tests {
 
         // Create adapter for node 1 and register handler through it
         let adapter1 = network.create_adapter(1);
-        register_echo(&adapter1, "test.request");
+        register_echo(&adapter1, "test.request", ShardGroupId::new(0));
 
         // accept_requests should be able to find the handler
         let (request, result) =
