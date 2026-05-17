@@ -587,8 +587,9 @@ where
                 source_shard,
                 block_height,
             } => {
+                let target_shard = self.topology_snapshot.load().local_shard();
                 self.drive_fetch::<ProvisionBinding>(FetchInput::Failed {
-                    ids: vec![(source_shard, block_height)],
+                    ids: vec![(source_shard, target_shard, block_height)],
                 });
                 self.update_fetch_tick_timer();
             }

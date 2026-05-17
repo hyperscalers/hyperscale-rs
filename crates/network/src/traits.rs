@@ -12,13 +12,13 @@ use std::sync::Arc;
 
 use hyperscale_types::{
     Bls12381G1PublicKey, MessageClass, NetworkMessage, Request, ShardGroupId, ShardMessage,
-    ValidatorId,
+    TopologySnapshot, ValidatorId,
 };
 
 /// Maps `ValidatorId` to BLS public key for identity verification (e.g. validator-bind).
 ///
-/// Extracted from the topology snapshot and pushed to the network layer via
-/// [`Network::update_validator_keys`] on topology changes.
+/// Derived from the topology snapshot inside network impls when
+/// [`Network::update_topology`] is called.
 pub type ValidatorKeyMap = HashMap<ValidatorId, Bls12381G1PublicKey>;
 
 /// Error returned when a network request fails.
@@ -209,24 +209,30 @@ pub trait Network: Send + Sync + 'static {
 
     // ── Topology updates ──
 
-    /// Update the validator key map used for identity verification.
+    /// Update the topology snapshot used for peer selection and identity
+    /// verification.
     ///
-    /// Called by the `io_loop` when topology changes.
-    /// Production implementations use this to update the validator-bind
-    /// handshake's key lookup. Default is a no-op (simulation doesn't need it).
-    fn update_validator_keys(&self, _keys: Arc<ValidatorKeyMap>) {}
+    /// Called by the `io_loop` when topology changes. The network impl reads
+    /// shard committees, validator BLS pubkeys, and the local validator set
+    /// from the snapshot — callers don't pass any of that explicitly.
+    ///
+    /// Default is a no-op (simulation impls without committee routing don't
+    /// need it).
+    fn update_topology(&self, _snapshot: Arc<TopologySnapshot>) {}
 
     // ── Request-response ──
 
     /// Send a typed request and receive the response via callback.
     ///
-    /// * `peers` — the set of validators eligible to serve this request.
-    ///   Typically the local shard committee (excluding self) for intra-shard
-    ///   fetches, or a remote shard's committee for cross-shard requests.
-    /// * `preferred_peer` — optional hint for which peer to try first (e.g.,
-    ///   the block proposer for fetch requests). `None` means any peer from
-    ///   the `peers` list.
-    /// * Implementation handles peer selection, retry, and failover internally.
+    /// * `shard` — the shard whose committee answers the request. The
+    ///   network impl resolves `shard` to its committee using the current
+    ///   topology snapshot and picks the actual peer(s) to try (filtering
+    ///   out locally-hosted validator ids automatically).
+    /// * `preferred_peer` — optional hint for which peer to try first
+    ///   (e.g. the block proposer for fetch requests). `None` means the
+    ///   network's health-weighted selection picks freely. If the
+    ///   `preferred_peer` is not in `shard`'s committee, the hint is
+    ///   ignored.
     ///
     /// The callback is called on a network thread when the response arrives,
     /// or with an error on timeout/failure. Compatible with sync main loops —
@@ -244,7 +250,7 @@ pub trait Network: Send + Sync + 'static {
     /// pending-block fetches from sync / DA-backfill fetches.
     fn request<R: Request + 'static>(
         &self,
-        peers: &[ValidatorId],
+        shard: ShardGroupId,
         preferred_peer: Option<ValidatorId>,
         request: R,
         class_override: Option<MessageClass>,

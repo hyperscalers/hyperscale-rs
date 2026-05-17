@@ -58,8 +58,9 @@ pub struct PendingNotification {
 /// request bytes directly (no framing needed), and calls `on_response`
 /// with the raw SBOR response bytes.
 pub struct PendingRequest {
-    /// Validators eligible to serve this request.
-    pub peers: Vec<ValidatorId>,
+    /// Shard whose committee should serve this request. The harness
+    /// resolves it to a peer list from its topology view.
+    pub shard: ShardGroupId,
     /// Optional preferred peer (e.g., block proposer for fetch).
     pub preferred_peer: Option<ValidatorId>,
     /// Message type ID for handler lookup (e.g., "block.request").
@@ -217,7 +218,7 @@ impl Network for SimNetworkAdapter {
 
     fn request<R: Request + 'static>(
         &self,
-        peers: &[ValidatorId],
+        shard: ShardGroupId,
         preferred_peer: Option<ValidatorId>,
         request: R,
         _class_override: Option<MessageClass>,
@@ -238,7 +239,7 @@ impl Network for SimNetworkAdapter {
         });
 
         self.pending_requests.lock().unwrap().push(PendingRequest {
-            peers: peers.to_vec(),
+            shard,
             preferred_peer,
             type_id: R::message_type_id(),
             request_bytes,
@@ -348,10 +349,10 @@ mod tests {
 
         let adapter = SimNetworkAdapter::default();
         let preferred = Some(ValidatorId::new(7));
+        let shard = ShardGroupId::new(3);
 
-        let peers = &[ValidatorId::new(7)];
         adapter.request(
-            peers,
+            shard,
             preferred,
             GetBlockRequest::new(BlockHeight::new(42), BlockHeight::new(42)),
             None,
@@ -360,7 +361,7 @@ mod tests {
 
         let requests = adapter.drain_pending_requests();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].peers, peers);
+        assert_eq!(requests[0].shard, shard);
         assert_eq!(requests[0].preferred_peer, preferred);
         assert_eq!(requests[0].type_id, "block.request");
         assert!(!requests[0].request_bytes.is_empty());
@@ -381,7 +382,7 @@ mod tests {
         let result_clone = result.clone();
 
         adapter.request(
-            &[ValidatorId::new(1)],
+            ShardGroupId::new(0),
             None,
             GetBlockRequest::new(BlockHeight::new(1), BlockHeight::new(1)),
             None,
@@ -415,7 +416,7 @@ mod tests {
         let result_clone = result.clone();
 
         adapter.request(
-            &[ValidatorId::new(1)],
+            ShardGroupId::new(0),
             None,
             GetBlockRequest::new(BlockHeight::new(1), BlockHeight::new(1)),
             None,

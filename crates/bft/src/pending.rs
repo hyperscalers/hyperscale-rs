@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_core::{Action, FetchOrigin, FetchPeers, FetchRequest};
+use hyperscale_core::{Action, FetchOrigin, FetchRequest};
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, FinalizedWave, LocalTimestamp,
     ProvisionHash, Provisions, RoutableTransaction, TopologySnapshot, TxHash, WaveId,
@@ -264,13 +264,7 @@ impl PendingBlocks {
             }
 
             let proposer = pending.header().proposer();
-            let local_self = topology.local_validator_id();
-            let local_committee: Vec<_> = topology
-                .committee_for_shard(topology.local_shard())
-                .iter()
-                .copied()
-                .filter(|v| *v != local_self && *v != proposer)
-                .collect();
+            let local_shard = topology.local_shard();
 
             let missing_txs = pending.missing_transactions();
             if !missing_txs.is_empty() {
@@ -284,7 +278,8 @@ impl PendingBlocks {
                 );
                 actions.push(Action::Fetch(FetchRequest::Transactions {
                     ids: missing_txs,
-                    peers: FetchPeers::with_preferred(proposer, local_committee.clone()),
+                    shard: local_shard,
+                    preferred: Some(proposer),
                     origin: FetchOrigin::PendingBlock,
                 }));
             }
@@ -300,7 +295,8 @@ impl PendingBlocks {
                 );
                 actions.push(Action::Fetch(FetchRequest::LocalProvisions {
                     ids: missing_provisions,
-                    peers: FetchPeers::with_preferred(proposer, local_committee.clone()),
+                    shard: local_shard,
+                    preferred: Some(proposer),
                     origin: FetchOrigin::PendingBlock,
                 }));
             }
@@ -316,7 +312,8 @@ impl PendingBlocks {
                 );
                 actions.push(Action::Fetch(FetchRequest::FinalizedWaves {
                     ids: missing_waves,
-                    peers: FetchPeers::with_preferred(proposer, local_committee),
+                    shard: local_shard,
+                    preferred: Some(proposer),
                     origin: FetchOrigin::PendingBlock,
                 }));
             }

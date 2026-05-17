@@ -33,7 +33,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_core::{Action, FetchAbandon, FetchOrigin, FetchPeers, FetchRequest, ProtocolEvent};
+use hyperscale_core::{Action, FetchAbandon, FetchOrigin, FetchRequest, ProtocolEvent};
 use hyperscale_metrics::{record_expected_tx_dropped, record_transaction_aborted};
 use hyperscale_types::{
     BlockHeight, CertifiedBlock, LocalTimestamp, MAX_TX_IN_FLIGHT, NodeId, RETENTION_HORIZON,
@@ -616,8 +616,7 @@ impl MempoolCoordinator {
             .expected_txs
             .due_for_fetch(self.current_ts, EXPECTED_TX_GRACE)
         {
-            let peers = topology.committee_for_shard(source_shard).to_vec();
-            if peers.is_empty() {
+            if topology.committee_for_shard(source_shard).is_empty() {
                 tracing::warn!(
                     ?source_shard,
                     missing_count = ids.len(),
@@ -633,7 +632,8 @@ impl MempoolCoordinator {
             );
             actions.push(Action::Fetch(FetchRequest::Transactions {
                 ids,
-                peers: FetchPeers::rotation(peers),
+                shard: source_shard,
+                preferred: None,
                 origin: FetchOrigin::Mempool,
             }));
         }
@@ -1332,13 +1332,14 @@ mod tests {
         let fetch = actions
             .iter()
             .find_map(|a| match a {
-                Action::Fetch(FetchRequest::Transactions { ids, peers, .. }) => Some((ids, peers)),
+                Action::Fetch(FetchRequest::Transactions { ids, preferred, .. }) => {
+                    Some((ids, preferred))
+                }
                 _ => None,
             })
             .expect("fetch action emitted past grace");
         assert_eq!(fetch.0, &vec![unseen_hash]);
-        assert_eq!(fetch.1.preferred, None);
-        assert_eq!(fetch.1.peers, topology.committee_for_shard(source).to_vec());
+        assert_eq!(*fetch.1, None);
     }
 
     #[test]
@@ -1375,16 +1376,15 @@ mod tests {
         let fetches: Vec<_> = actions
             .iter()
             .filter_map(|a| match a {
-                Action::Fetch(FetchRequest::Transactions { ids, peers, .. }) => Some((ids, peers)),
+                Action::Fetch(FetchRequest::Transactions { ids, preferred, .. }) => {
+                    Some((ids, preferred))
+                }
                 _ => None,
             })
             .collect();
         assert_eq!(fetches.len(), 1);
         assert_eq!(fetches[0].0, &vec![unseen_hash]);
-        assert_eq!(
-            fetches[0].1.peers,
-            topology.committee_for_shard(ShardGroupId::new(0)).to_vec()
-        );
+        assert_eq!(*fetches[0].1, None);
     }
 
     #[test]

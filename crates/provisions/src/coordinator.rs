@@ -21,7 +21,7 @@ use hyperscale_types::{
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
-use crate::expected::ExpectedProvisionTracker;
+use crate::expected::{ExpectedProvisionTracker, TimeoutEffect};
 use crate::pipeline::ProvisionPipeline;
 use crate::queue::QueuedProvisionBuffer;
 use crate::store::ProvisionStore;
@@ -186,11 +186,7 @@ impl ProvisionCoordinator {
     ///    and prunes their matching headers.
     /// 4. `drop_past_deadline` sweeps verified entries past their deadline.
     /// 5. Timeout sweep emits fallback fetches for late expectations.
-    pub fn on_block_committed(
-        &mut self,
-        topology: &TopologySnapshot,
-        certified: &CertifiedBlock,
-    ) -> Vec<Action> {
+    pub fn on_block_committed(&mut self, certified: &CertifiedBlock) -> Vec<Action> {
         let mut actions: Vec<Action> = Vec::new();
         let block = certified.block();
         let new_ts = certified.qc().weighted_timestamp();
@@ -240,7 +236,7 @@ impl ProvisionCoordinator {
             self.expected
                 .check_timeouts(local_ts)
                 .into_iter()
-                .map(|effect| effect.into_fetch_action(topology)),
+                .map(TimeoutEffect::into_fetch_action),
         );
         actions
     }
@@ -284,7 +280,7 @@ impl ProvisionCoordinator {
     /// Called when urgency overrides the default patience — sync completion
     /// (validator needs to catch up before `WAVE_TIMEOUT` runs out) and the
     /// execution advance gate stalling on missing data.
-    pub fn flush_expected_provisions(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
+    pub fn flush_expected_provisions(&mut self) -> Vec<Action> {
         self.expected
             .flush_all()
             .into_iter()
@@ -294,7 +290,7 @@ impl ProvisionCoordinator {
                     block_height = effect.block_height.inner(),
                     "Eager fetch — immediately requesting missing provisions"
                 );
-                effect.into_fetch_action(topology)
+                effect.into_fetch_action()
             })
             .collect()
     }
@@ -1402,7 +1398,7 @@ mod tests {
 
         // Prime local clock with a first commit so the expected-provision
         // entry stamped below gets a real baseline (not the zero sentinel).
-        coordinator.on_block_committed(&topology, &make_block(BlockHeight::new(1)));
+        coordinator.on_block_committed(&make_block(BlockHeight::new(1)));
 
         // Remote header arrives targeting our shard; discovered_at stamped at ts=500ms.
         let header = make_committed_header_with_targets(
@@ -1416,24 +1412,24 @@ mod tests {
         // discovered_at = 500ms; fires when now_ms - 500 >= 5000 → h = 11.
         for h in 2..=10 {
             let block = make_block(BlockHeight::new(h));
-            let actions = coordinator.on_block_committed(&topology, &block);
+            let actions = coordinator.on_block_committed(&block);
             assert!(actions.is_empty(), "Should not emit request at height {h}");
         }
 
         // At height 11, age = 5500 - 500 = 5000 >= PROVISION_FALLBACK_TIMEOUT → fires.
         let block = make_block(BlockHeight::new(11));
-        let actions = coordinator.on_block_committed(&topology, &block);
+        let actions = coordinator.on_block_committed(&block);
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             &actions[0],
             Action::Fetch(FetchRequest::RemoteProvisions {
                 source_shard,
                 block_height,
-                peers,
+                preferred,
                 ..
             }) if *source_shard == ShardGroupId::new(1)
                 && *block_height == BlockHeight::new(10)
-                && peers.preferred == Some(ValidatorId::new(0))
+                && *preferred == Some(ValidatorId::new(0))
         ));
     }
 
@@ -1457,7 +1453,7 @@ mod tests {
 
         // First local commit at ts=500ms. Should NOT fire — the pre-genesis
         // entry has just been retro-stamped to 500ms.
-        let actions = coordinator.on_block_committed(&topology, &make_block(BlockHeight::new(1)));
+        let actions = coordinator.on_block_committed(&make_block(BlockHeight::new(1)));
         assert!(
             actions.is_empty(),
             "Pre-genesis entry must be retro-stamped, not fire immediately"
@@ -1465,11 +1461,10 @@ mod tests {
 
         // Fires on schedule from the retro-stamp baseline, not absolute zero.
         for h in 2..=10 {
-            let actions =
-                coordinator.on_block_committed(&topology, &make_block(BlockHeight::new(h)));
+            let actions = coordinator.on_block_committed(&make_block(BlockHeight::new(h)));
             assert!(actions.is_empty(), "Should not emit at height {h}");
         }
-        let actions = coordinator.on_block_committed(&topology, &make_block(BlockHeight::new(11)));
+        let actions = coordinator.on_block_committed(&make_block(BlockHeight::new(11)));
         assert_eq!(actions.len(), 1);
     }
 
@@ -1487,13 +1482,12 @@ mod tests {
 
         // Advance past timeout to trigger the one-time request at height 30
         for h in 1..=30 {
-            coordinator.on_block_committed(&topology, &make_block(BlockHeight::new(h)));
+            coordinator.on_block_committed(&make_block(BlockHeight::new(h)));
         }
 
         // Coordinator is fire-and-forget: no further emissions at any height.
         for h in 31..=100 {
-            let actions =
-                coordinator.on_block_committed(&topology, &make_block(BlockHeight::new(h)));
+            let actions = coordinator.on_block_committed(&make_block(BlockHeight::new(h)));
             assert!(
                 actions.is_empty(),
                 "Should never re-emit after initial request (height {h})"
@@ -1516,7 +1510,7 @@ mod tests {
 
         // Advance a few blocks
         for h in 1..=5 {
-            coordinator.on_block_committed(&topology, &make_block(BlockHeight::new(h)));
+            coordinator.on_block_committed(&make_block(BlockHeight::new(h)));
         }
 
         // Batch arrives and is verified before timeout
@@ -1536,8 +1530,7 @@ mod tests {
 
         // Continue past timeout threshold
         for h in 6..=15 {
-            let actions =
-                coordinator.on_block_committed(&topology, &make_block(BlockHeight::new(h)));
+            let actions = coordinator.on_block_committed(&make_block(BlockHeight::new(h)));
             assert!(
                 actions.is_empty(),
                 "Should not request at height {h} (provision already verified)"
@@ -1591,7 +1584,7 @@ mod tests {
 
         // Prime local clock so the expected-provision entry gets a real
         // baseline rather than the zero sentinel retro-stamped on first commit.
-        coordinator.on_block_committed(&topology, &make_block(BlockHeight::new(1)));
+        coordinator.on_block_committed(&make_block(BlockHeight::new(1)));
 
         let source_shard = ShardGroupId::new(1);
         let block_height = BlockHeight::new(10);
@@ -1608,8 +1601,7 @@ mod tests {
 
         // Walk up to (but not past) the orphan cutoff — no Abandon yet.
         for h in 2..=orphan_cutoff_blocks + 1 {
-            let actions =
-                coordinator.on_block_committed(&topology, &make_block(BlockHeight::new(h)));
+            let actions = coordinator.on_block_committed(&make_block(BlockHeight::new(h)));
             assert!(
                 !actions.iter().any(|a| matches!(a, Action::AbandonFetch(_))),
                 "AbandonFetch fired before orphan cutoff at h={h}"
@@ -1618,10 +1610,8 @@ mod tests {
 
         // One past the cutoff — orphan sweep drops the expected entry and
         // emits AbandonFetch for the dropped key.
-        let actions = coordinator.on_block_committed(
-            &topology,
-            &make_block(BlockHeight::new(orphan_cutoff_blocks + 2)),
-        );
+        let actions =
+            coordinator.on_block_committed(&make_block(BlockHeight::new(orphan_cutoff_blocks + 2)));
         assert!(
             actions.iter().any(|a| matches!(
                 a,
@@ -1656,7 +1646,7 @@ mod tests {
         let orphan_cutoff_blocks = u64::try_from(RETENTION_HORIZON.as_millis()).unwrap_or(u64::MAX)
             / TEST_BLOCK_INTERVAL_MS;
         for h in 1..=(orphan_cutoff_blocks / 2) {
-            coordinator.on_block_committed(&topology, &make_block(BlockHeight::new(h)));
+            coordinator.on_block_committed(&make_block(BlockHeight::new(h)));
         }
 
         assert_eq!(
@@ -1711,7 +1701,7 @@ mod tests {
 
         // Prime local clock so the expected-provision entry gets a real
         // baseline rather than the zero sentinel retro-stamped on first commit.
-        coordinator.on_block_committed(&topology, &make_block(BlockHeight::new(1)));
+        coordinator.on_block_committed(&make_block(BlockHeight::new(1)));
 
         // Header arrives but the provisions never does — this is the orphan case
         // the long-horizon sweep guards against.
@@ -1728,16 +1718,13 @@ mod tests {
         let orphan_cutoff_blocks = u64::try_from(RETENTION_HORIZON.as_millis()).unwrap_or(u64::MAX)
             / TEST_BLOCK_INTERVAL_MS;
         for h in 2..=orphan_cutoff_blocks + 1 {
-            coordinator.on_block_committed(&topology, &make_block(BlockHeight::new(h)));
+            coordinator.on_block_committed(&make_block(BlockHeight::new(h)));
         }
         assert_eq!(coordinator.verified_remote_header_count(), 1);
         assert_eq!(coordinator.expected.len(), 1);
 
         // One past — orphan sweep drops header and expected entry together.
-        coordinator.on_block_committed(
-            &topology,
-            &make_block(BlockHeight::new(orphan_cutoff_blocks + 2)),
-        );
+        coordinator.on_block_committed(&make_block(BlockHeight::new(orphan_cutoff_blocks + 2)));
         assert_eq!(coordinator.verified_remote_header_count(), 0);
         assert_eq!(coordinator.expected.len(), 0);
     }
@@ -1783,7 +1770,7 @@ mod tests {
             / TEST_BLOCK_INTERVAL_MS)
             + 11;
         for h in 100..=deadline_height + 1 {
-            coordinator.on_block_committed(&topology, &make_block(BlockHeight::new(h)));
+            coordinator.on_block_committed(&make_block(BlockHeight::new(h)));
         }
 
         assert_eq!(
@@ -1820,7 +1807,7 @@ mod tests {
             / TEST_BLOCK_INTERVAL_MS)
             + 11;
         for h in 100..=deadline_height + 1 {
-            coordinator.on_block_committed(&topology, &make_block(BlockHeight::new(h)));
+            coordinator.on_block_committed(&make_block(BlockHeight::new(h)));
         }
 
         // The header itself has been swept by the orphan path; re-add it so
@@ -1857,7 +1844,7 @@ mod tests {
         let mut coordinator = ProvisionCoordinator::new();
 
         // Prime local clock so received_at is non-zero.
-        coordinator.on_block_committed(&topology, &make_block(BlockHeight::new(1)));
+        coordinator.on_block_committed(&make_block(BlockHeight::new(1)));
 
         let tx_hash = TxHash::from_raw(Hash::from_bytes(b"tx-pending"));
         let provisions = make_provisions(
@@ -1873,7 +1860,7 @@ mod tests {
         let cutoff_blocks = u64::try_from(RETENTION_HORIZON.as_millis()).unwrap_or(u64::MAX)
             / TEST_BLOCK_INTERVAL_MS;
         for h in 2..=cutoff_blocks + 3 {
-            coordinator.on_block_committed(&topology, &make_block(BlockHeight::new(h)));
+            coordinator.on_block_committed(&make_block(BlockHeight::new(h)));
         }
 
         assert_eq!(
@@ -2023,7 +2010,7 @@ mod tests {
             let topology = make_test_topology(ShardGroupId::new(0));
             let mut coordinator = ProvisionCoordinator::new();
             // Prime so received_at is non-zero on pending entries.
-            coordinator.on_block_committed(&topology, &make_block(BlockHeight::new(1)));
+            coordinator.on_block_committed(&make_block(BlockHeight::new(1)));
 
             let n = source_heights.len().min(verify_path.len());
             for i in 0..n {
@@ -2065,7 +2052,7 @@ mod tests {
                 25_000 + u64::try_from(RETENTION_HORIZON.as_millis()).unwrap_or(u64::MAX) + 5 * TEST_BLOCK_INTERVAL_MS;
             let cutoff_height = cutoff_ms / TEST_BLOCK_INTERVAL_MS;
             for h in 2..=cutoff_height {
-                coordinator.on_block_committed(&topology, &make_block(BlockHeight::new(h)));
+                coordinator.on_block_committed(&make_block(BlockHeight::new(h)));
             }
 
             proptest::prop_assert_eq!(coordinator.queue.queue_len(), 0);

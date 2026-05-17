@@ -209,10 +209,10 @@ where
                 .clone()
         };
         let es = self.event_sender.clone();
-        let peers = self.local_peers();
+        let local_shard = self.topology_snapshot.load().local_shard();
         record_sync_round_started("block");
         self.network.request(
-            &peers,
+            local_shard,
             None,
             GetBlockRequest::new(height, target_height).with_inventory(inventory),
             None,

@@ -304,10 +304,7 @@ impl NodeStateMachine {
         // Provisions coordinator: prune + schedule fallback timeouts. Reads
         // provision hashes directly off the block — `Live` carries them
         // inline, `Sealed` has none (empty slice).
-        actions.extend(
-            self.provisions
-                .on_block_committed(self.topology.snapshot(), certified),
-        );
+        actions.extend(self.provisions.on_block_committed(certified));
 
         // Outbound provision safety sweep — runs on the BFT-authenticated
         // weighted timestamp so every validator evicts deterministically.

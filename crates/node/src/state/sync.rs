@@ -24,7 +24,7 @@ impl NodeStateMachine {
                 let topo = self.topology.snapshot();
                 let mut actions = self.bft.on_block_sync_complete(topo);
                 actions.extend(self.remote_headers.flush_expected_headers(topo));
-                actions.extend(self.provisions.flush_expected_provisions(topo));
+                actions.extend(self.provisions.flush_expected_provisions());
                 actions
             }
             ProtocolEvent::CommittedStateRestored { height, hash, qc } => self
