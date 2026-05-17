@@ -239,9 +239,12 @@ where
     /// requester already has.
     fn build_sync_inventory(&self) -> Inventory {
         Inventory {
-            tx_have: self.caches.tx_store.tx_bloom_snapshot(),
+            tx_have: self.shard_caches().tx_store.tx_bloom_snapshot(),
             cert_have: self.vnodes[0].state.execution().cert_bloom_snapshot(),
-            provision_have: self.caches.provision_store.provision_bloom_snapshot(),
+            provision_have: self
+                .shard_caches()
+                .provision_store
+                .provision_bloom_snapshot(),
         }
     }
 
@@ -253,7 +256,7 @@ where
         let state = &self.vnodes[0].state;
         let mempool = state.mempool();
         let execution = state.execution();
-        let provision_store = &self.caches.provision_store;
+        let provision_store = &self.shard_caches().provision_store;
         elided.try_rehydrate(
             |h| mempool.get_transaction(h),
             |id| execution.get_finalized_wave(id),

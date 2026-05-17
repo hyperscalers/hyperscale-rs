@@ -8,12 +8,14 @@
 //! structure without leaking state across `IoLoop`s.
 
 pub mod block_commit;
+pub mod caches;
 
 use std::sync::Arc;
 
 use hyperscale_storage::{PendingChain, Storage};
 
 use crate::shard::block_commit::BlockCommitCoordinator;
+pub use crate::shard::caches::SharedCaches;
 
 /// Per-shard I/O state hosted by the `IoLoop`.
 pub struct ShardIo<S: Storage> {
@@ -34,4 +36,8 @@ pub struct ShardIo<S: Storage> {
     /// runs on the execution pool. Owns the prepared-commit cache
     /// shared with delegated dispatch closures.
     pub block_commit: BlockCommitCoordinator<S>,
+
+    /// Inbound request-serving caches plus the cross-thread tx-status
+    /// view shared with external RPC consumers.
+    pub caches: SharedCaches,
 }

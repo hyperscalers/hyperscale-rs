@@ -78,7 +78,7 @@ where
         let tx_hash = tx.hash();
         // Already-vouched (in TxStore) or terminally-rejected (tombstoned)
         // are skipped. `pending_validation` blocks duplicate enqueues.
-        if !self.caches.tx_store.contains(&tx_hash)
+        if !self.shard_caches().tx_store.contains(&tx_hash)
             && !self.vnodes[0].state.mempool().is_tombstoned(&tx_hash)
         {
             self.pending_validation.insert(tx_hash);
@@ -103,7 +103,9 @@ where
             self.enqueue_tx_for_gossip(shard, Arc::clone(&tx));
         }
 
-        if !self.pending_validation.contains(&tx_hash) && !self.caches.tx_store.contains(&tx_hash) {
+        if !self.pending_validation.contains(&tx_hash)
+            && !self.shard_caches().tx_store.contains(&tx_hash)
+        {
             // Paired with validation: only queued txs are removed on completion.
             self.locally_submitted.insert(tx_hash);
             self.pending_validation.insert(tx_hash);

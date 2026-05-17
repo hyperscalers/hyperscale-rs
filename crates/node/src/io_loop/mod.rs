@@ -19,7 +19,6 @@
 //! production (wall clock) and simulation (logical clock) use the same paths.
 
 mod actions;
-mod caches;
 pub mod fetch;
 mod fetch_io;
 mod init;
@@ -53,7 +52,6 @@ pub use status::NodeStatusSnapshot;
 use crate::NodeStateMachine;
 use crate::batch_accumulator::BatchAccumulator;
 use crate::config::NodeConfig;
-use crate::io_loop::caches::SharedCaches;
 use crate::io_loop::fetch::binding::{
     ExecCertBinding, FinalizedWaveBinding, LocalProvisionBinding, ProvisionBinding,
     TransactionBinding,
@@ -63,6 +61,7 @@ use crate::io_loop::step::CommittedHeaderVerificationItem;
 use crate::io_loop::sync::SyncHost;
 use crate::shard::ShardIo;
 use crate::shard::block_commit::{BlockCommitCoordinator, PreparedCommitMap};
+use crate::shard::caches::SharedCaches;
 use crate::vnode::Vnode;
 
 /// Lock-free shared topology snapshot for handler closures and dispatch.
@@ -206,10 +205,6 @@ where
     /// See [`DispatchHandles`]. Cloned once per delegated-action dispatch.
     dispatch_handles: Arc<DispatchHandles<S, N, E>>,
 
-    /// Inbound request-serving caches plus the cross-thread tx-status view
-    /// shared with external RPC consumers.
-    caches: SharedCaches,
-
     /// Per-payload fetch state machines.
     fetches: FetchHost,
 
@@ -347,6 +342,7 @@ where
                 pending_chain,
                 // At startup, everything committed is also persisted on disk.
                 block_commit,
+                caches,
             },
         )]);
         assert_eq!(
@@ -363,7 +359,6 @@ where
             event_sender,
             topology_snapshot,
             dispatch_handles,
-            caches,
             tx_validator,
             pending_validation: HashSet::new(),
             locally_submitted: HashSet::new(),
@@ -449,6 +444,11 @@ where
             .block_commit
     }
 
+    /// Internal: shared inbound-serving caches for the shard.
+    pub(super) fn shard_caches(&self) -> &SharedCaches {
+        &self.shards.values().next().expect("V_shard == 1").caches
+    }
+
     /// Access the network.
     pub fn network(&self) -> &N {
         &self.network
@@ -461,15 +461,15 @@ where
     /// `StepOutput::emitted_statuses`, this cache persists across steps and
     /// survives mempool eviction.
     pub fn tx_status(&self, hash: &TxHash) -> Option<TransactionStatus> {
-        self.caches.tx_status.get(hash)
+        self.shard_caches().tx_status.get(hash)
     }
 
     /// Access the transaction status cache.
     ///
     /// The cache is an `Arc<QuickCache>` so it can be shared with external
     /// consumers (e.g. RPC handlers) across threads without locking.
-    pub const fn tx_status_cache(&self) -> &Arc<QuickCache<TxHash, TransactionStatus>> {
-        &self.caches.tx_status
+    pub fn tx_status_cache(&self) -> &Arc<QuickCache<TxHash, TransactionStatus>> {
+        &self.shard_caches().tx_status
     }
 
     // ─── Event Processing ───────────────────────────────────────────────

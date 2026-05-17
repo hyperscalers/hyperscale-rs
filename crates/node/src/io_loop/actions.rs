@@ -159,7 +159,7 @@ where
         // instance concern — keep it here.
         if let ProtocolEvent::FinalizedWavesAdmitted { waves } = &pe {
             for wave in waves {
-                self.caches
+                self.shard_caches()
                     .finalized_wave
                     .insert(wave.wave_id().clone(), Arc::clone(wave));
             }
@@ -222,7 +222,9 @@ where
             }
             record_transaction_finalized(latency_secs, cross_shard);
         }
-        self.caches.tx_status.insert(tx_hash, status.clone());
+        self.shard_caches()
+            .tx_status
+            .insert(tx_hash, status.clone());
         self.vnodes[0].emitted_statuses.push((tx_hash, status));
     }
 

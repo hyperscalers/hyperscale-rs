@@ -102,7 +102,7 @@ where
         // ── block.request → sync protocol ────────────────────────────
 
         let storage = Arc::clone(self.shard_storage());
-        let provision_store = Arc::clone(&self.caches.provision_store);
+        let provision_store = Arc::clone(&self.shard_caches().provision_store);
         self.network
             .register_request_handler::<GetBlockRequest>(move |req| {
                 serve_block_request(&*storage, &provision_store, &req)
@@ -111,7 +111,7 @@ where
         // ── transaction.request → fetch protocol ─────────────────────
 
         let storage = Arc::clone(self.shard_storage());
-        let tx_store = Arc::clone(&self.caches.tx_store);
+        let tx_store = Arc::clone(&self.shard_caches().tx_store);
         self.network
             .register_request_handler::<GetTransactionsRequest>(move |req| {
                 serve_transaction_request(&*storage, &tx_store, &req)
@@ -127,7 +127,7 @@ where
 
         let storage = Arc::clone(self.shard_storage());
         let topology = self.topology_snapshot.clone();
-        let outbound_cache = Arc::clone(&self.caches.provision_store);
+        let outbound_cache = Arc::clone(&self.shard_caches().provision_store);
 
         let dedup: Arc<std::sync::Mutex<ProvisionsRequestDedup>> =
             Arc::new(std::sync::Mutex::new(ProvisionsRequestDedup {
@@ -251,7 +251,7 @@ where
 
         // ── local_provision.request → provision cache lookup ─────────
 
-        let provision_store = Arc::clone(&self.caches.provision_store);
+        let provision_store = Arc::clone(&self.shard_caches().provision_store);
         self.network
             .register_request_handler::<GetLocalProvisionsRequest>(
                 move |req: GetLocalProvisionsRequest| {
@@ -268,7 +268,7 @@ where
 
         // ── finalized_wave.request → cache lookup + storage fallback ─────
 
-        let fw_cache = Arc::clone(&self.caches.finalized_wave);
+        let fw_cache = Arc::clone(&self.shard_caches().finalized_wave);
         let fw_storage = Arc::clone(self.shard_storage());
         self.network
             .register_request_handler::<GetFinalizedWavesRequest>(
@@ -305,7 +305,7 @@ where
 
         // ── execution_cert.request → cert store lookup ────────────────
 
-        let exec_cert_store = Arc::clone(&self.caches.exec_cert_store);
+        let exec_cert_store = Arc::clone(&self.shard_caches().exec_cert_store);
         let storage = Arc::clone(self.shard_storage());
         self.network
             .register_request_handler::<GetExecutionCertsRequest>(
