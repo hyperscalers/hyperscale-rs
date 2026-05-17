@@ -37,9 +37,7 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{Engine, RadixExecutor, TransactionValidation};
 use hyperscale_network::Network;
 use hyperscale_storage::{PendingChain, Storage};
-use hyperscale_types::{
-    Bls12381G1PrivateKey, LocalTimestamp, ShardGroupId, TopologySnapshot, TransactionStatus, TxHash,
-};
+use hyperscale_types::{LocalTimestamp, ShardGroupId, TopologySnapshot, TransactionStatus, TxHash};
 pub use metrics::{MetricsSnapshot, record_metrics};
 use quick_cache::sync::Cache as QuickCache;
 pub use status::NodeStatusSnapshot;
@@ -57,7 +55,7 @@ use crate::shard::fetch::binding::{
 use crate::shard::fetch::{FetchHost, FetchInput};
 use crate::shard::phase_times::TxPhaseTimesCache;
 use crate::shard::sync::SyncHost;
-use crate::vnode::Vnode;
+use crate::vnode::{Vnode, VnodeInit};
 
 /// Lock-free shared topology snapshot for handler closures and dispatch.
 ///
@@ -138,8 +136,9 @@ where
     D: Dispatch,
 {
     /// Per-validator bundles. Each [`Vnode`] holds a `NodeStateMachine`,
-    /// signing key, and per-step scratch buffers. Currently enforced
-    /// to `len() == 1`.
+    /// signing key, and per-step scratch buffers. Two or more vnodes
+    /// in the same shard share a single [`ShardIo`] and consume the
+    /// same inbound events.
     ///
     /// State machines are driven exclusively from the pinned thread
     /// via `vnodes[i].state.handle()`. All `ProtocolEvent` ingestion
@@ -147,9 +146,8 @@ where
     /// touch them.
     vnodes: Vec<Vnode>,
 
-    /// Per-shard I/O state, keyed by shard id. Each [`ShardIo`] holds
-    /// the persistent storage handle. Currently enforced to
-    /// `len() == 1`.
+    /// Per-shard I/O state, keyed by shard id. All hosted vnodes must
+    /// currently share the same shard (`len() == 1`).
     shards: HashMap<ShardGroupId, ShardIo<S>>,
 
     /// Transaction executor. Cloned (cheaply) into the block-commit
@@ -225,43 +223,61 @@ where
     D: Dispatch,
     E: Engine,
 {
-    /// Create a new `IoLoop`.
+    /// Create a new `IoLoop` hosting one or more `Vnode`s.
     ///
     /// # Panics
     ///
-    /// Panics during construction if more than one `Vnode` or
-    /// `ShardIo` is configured; V=1 is currently enforced.
+    /// Panics if `vnodes` is empty, or if any vnode is not in the
+    /// same shard as the first one (single-`ShardIo` is still
+    /// enforced).
     // `config: NodeConfig` is taken by value: every caller hands over a fresh
     // config and we destructure sub-configs via `.clone()`, so a `&NodeConfig`
     // would just force the body to clone each subfield.
     #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
     pub fn new(
-        state: NodeStateMachine,
+        vnodes: Vec<VnodeInit>,
         storage: S,
         executor: E,
         network: N,
         dispatch: D,
         event_sender: Sender<NodeInput>,
-        signing_key: Bls12381G1PrivateKey,
         topology_snapshot: SharedTopologySnapshot,
         config: NodeConfig,
         tx_validator: Arc<TransactionValidation>,
     ) -> Self {
-        let initial_persisted_height = state.bft().committed_height();
-        let validator_id = state.topology().local_validator_id();
-        let shard = state.topology().local_shard();
+        assert!(!vnodes.is_empty(), "IoLoop requires at least one Vnode");
+
+        // Shard-scoped state is derived from the first vnode's
+        // topology; all other vnodes must be in the same shard until
+        // multi-shard hosting lands.
+        let first = vnodes.first().expect("non-empty checked above");
+        let shard = first.state.topology().local_shard();
+        let initial_persisted_height = first.state.bft().committed_height();
+        // Inbound-serving caches read from a single set of stores per
+        // shard. Same-shard vnodes admit identical transactions and
+        // provisions by determinism, so picking the first vnode's
+        // stores is consistent (with V copies of each store living in
+        // the V state machines — a known redundancy until same-shard
+        // store sharing lands).
+        let caches = SharedCaches::new(
+            Arc::clone(first.state.provisions().store()),
+            Arc::clone(first.state.mempool().tx_store()),
+            Arc::clone(first.state.execution().exec_cert_store()),
+        );
+        for vnode in &vnodes {
+            assert_eq!(
+                vnode.state.topology().local_shard(),
+                shard,
+                "IoLoop currently supports a single hosted shard"
+            );
+        }
+
         let b = &config.batch;
         let fetches = FetchHost::new(&config);
         let syncs = SyncHost::new(&config);
         let storage = Arc::new(storage);
         let pending_chain = Arc::new(PendingChain::new(Arc::clone(&storage)));
-        let caches = SharedCaches::new(
-            Arc::clone(state.provisions().store()),
-            Arc::clone(state.mempool().tx_store()),
-            Arc::clone(state.execution().exec_cert_store()),
-        );
         let network = Arc::new(network);
-        let signing_key = Arc::new(signing_key);
         let block_commit = BlockCommitCoordinator::new(initial_persisted_height);
         let dispatch_handles = Arc::new(DispatchHandles {
             executor: executor.clone(),
@@ -269,21 +285,18 @@ where
             network: Arc::clone(&network),
             prepared_commits: block_commit.prepared_commits_handle(),
         });
-        let vnode = Vnode {
-            validator_id,
-            shard,
-            state,
-            signing_key,
-            emitted_statuses: Vec::new(),
-            actions_generated: 0,
-            pending_timer_ops: Vec::new(),
-        };
-        let vnodes = vec![vnode];
-        assert_eq!(
-            vnodes.len(),
-            1,
-            "IoLoop currently supports exactly one Vnode"
-        );
+        let vnodes: Vec<Vnode> = vnodes
+            .into_iter()
+            .map(|init| Vnode {
+                validator_id: init.state.topology().local_validator_id(),
+                shard: init.state.topology().local_shard(),
+                state: init.state,
+                signing_key: Arc::new(init.signing_key),
+                emitted_statuses: Vec::new(),
+                actions_generated: 0,
+                pending_timer_ops: Vec::new(),
+            })
+            .collect();
         let shards = HashMap::from([(
             shard,
             ShardIo {

@@ -37,4 +37,4 @@ pub use io_loop::{NodeStatusSnapshot, SharedTopologySnapshot, TimerOp};
 pub use shard::ShardIo;
 pub use shard::sync::block::BlockSyncStateKind;
 pub use state::NodeStateMachine;
-pub use vnode::Vnode;
+pub use vnode::{Vnode, VnodeInit};

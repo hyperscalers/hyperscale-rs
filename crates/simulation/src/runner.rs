@@ -21,7 +21,7 @@ use hyperscale_network_memory::{
     SimulatedNetwork,
 };
 use hyperscale_node::io_loop::{IoLoop, StepOutput};
-use hyperscale_node::{NodeConfig, NodeStateMachine, TimerOp};
+use hyperscale_node::{NodeConfig, NodeStateMachine, TimerOp, VnodeInit};
 use hyperscale_provisions::{ProvisionConfig, ProvisionStore};
 use hyperscale_storage::{ChainReader, RecoveredState};
 use hyperscale_storage_memory::SimStorage;
@@ -240,13 +240,12 @@ impl SimulationRunner {
                     SimulationEngine::new(RadixExecutor::new(network_def), shard_cache.clone());
 
                 let io_loop = IoLoop::new(
-                    state,
+                    vec![VnodeInit { state, signing_key }],
                     SimStorage::new(),
                     sim_engine,
                     network.create_adapter(node_index),
                     SyncDispatch,
                     event_tx,
-                    signing_key,
                     topology_arc,
                     NodeConfig::default(),
                     tx_validator,

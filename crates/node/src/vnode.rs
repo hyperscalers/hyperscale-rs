@@ -18,6 +18,18 @@ use hyperscale_types::{
 use crate::NodeStateMachine;
 use crate::io_loop::TimerOp;
 
+/// Caller-supplied bundle for constructing one [`Vnode`]. The
+/// `IoLoop` constructor wraps each entry into a full [`Vnode`] and
+/// shares one `ShardIo` across same-shard entries.
+pub struct VnodeInit {
+    /// Per-validator state machine, already populated with its
+    /// `TopologyCoordinator` (the constructor reads `validator_id`
+    /// and `shard` from there).
+    pub state: NodeStateMachine,
+    /// BLS signing key for this validator's votes and proposals.
+    pub signing_key: Bls12381G1PrivateKey,
+}
+
 /// Per-validator bundle hosted by the `IoLoop`.
 pub struct Vnode {
     /// This validator's network identity.

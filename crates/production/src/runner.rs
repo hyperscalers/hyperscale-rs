@@ -64,7 +64,7 @@ use hyperscale_network_libp2p::{
     RequestStreamPool, generate_random_keypair,
 };
 use hyperscale_node::io_loop::{IoLoop, NodeStatusSnapshot, TimerOp, record_metrics};
-use hyperscale_node::{NodeConfig, NodeStateMachine, SharedTopologySnapshot};
+use hyperscale_node::{NodeConfig, NodeStateMachine, SharedTopologySnapshot, VnodeInit};
 use hyperscale_provisions::{ProvisionConfig, ProvisionStore};
 use hyperscale_storage::ChainReader;
 use hyperscale_storage_rocksdb::{RocksDbStorage, SharedStorage};
@@ -372,13 +372,15 @@ impl ProductionRunnerBuilder {
         let executor = RadixExecutor::new(network_definition);
 
         let io_loop = IoLoop::new(
-            state,
+            vec![VnodeInit {
+                state,
+                signing_key: io_loop_signing_key,
+            }],
             shared_storage,
             executor,
             libp2p_network,
             (*dispatch).clone(),
             xb_callback_tx.clone(),
-            io_loop_signing_key,
             topology.clone(),
             NodeConfig::default(),
             tx_validator,
