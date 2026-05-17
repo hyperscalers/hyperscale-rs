@@ -14,9 +14,12 @@ impl NodeStateMachine {
     /// Dispatch a sync-category `ProtocolEvent`.
     pub(super) fn handle_sync(&mut self, event: ProtocolEvent) -> Vec<Action> {
         match event {
-            ProtocolEvent::BlockSyncReadyToApply { certified } => self
-                .bft
-                .on_sync_block_ready_to_apply(self.topology.snapshot(), certified),
+            ProtocolEvent::BlockSyncReadyToApply { certified } => {
+                self.bft.on_sync_block_ready_to_apply(
+                    self.topology.snapshot(),
+                    std::sync::Arc::unwrap_or_clone(certified),
+                )
+            }
             // BlockSync finished fetching: exit BFT sync mode + flush
             // expected provisions + flush expected headers, all in one
             // pass.

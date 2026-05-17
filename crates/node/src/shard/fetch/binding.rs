@@ -226,8 +226,6 @@ impl FetchBinding for LocalProvisionBinding {
                     let split =
                         partition_solicited(resp.provisions.into_inner(), &hs, |p| p.hash());
                     for provisions in split.kept {
-                        // Refcount is 1 right after decode, so this moves rather than clones.
-                        let provisions = Arc::unwrap_or_clone(provisions);
                         let _ = es.send(NodeInput::Protocol(Box::new(
                             ProtocolEvent::ProvisionsReceived { provisions },
                         )));
@@ -463,8 +461,6 @@ impl FetchBinding for ProvisionBinding {
                     });
                     return ResponseVerdict::Reject;
                 }
-                // Refcount is 1 right after decode, so this moves rather than clones.
-                let provisions = Arc::unwrap_or_clone(provisions);
                 let _ = es.send(NodeInput::Protocol(Box::new(
                     ProtocolEvent::ProvisionsReceived { provisions },
                 )));

@@ -13,6 +13,8 @@
 //!    directly as `ProtocolEvent::RemoteHeaderReceived` for the state
 //!    machine to dispatch QC verification.
 
+use std::sync::Arc;
+
 use hyperscale_core::{NodeInput, ProtocolEvent, StateMachine};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_engine::Engine;
@@ -89,7 +91,7 @@ where
                 if valid {
                     let _ = event_tx.send(NodeInput::Protocol(Box::new(
                         ProtocolEvent::RemoteHeaderReceived {
-                            committed_header,
+                            committed_header: Arc::new(committed_header),
                             sender,
                         },
                     )));

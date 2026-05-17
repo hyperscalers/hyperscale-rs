@@ -734,7 +734,8 @@ impl ProductionRunner {
                     __qc.weighted_timestamp(),
                 )
             };
-            let genesis_certified = CertifiedBlock::new_unchecked(genesis_block, genesis_qc);
+            let genesis_certified =
+                Arc::new(CertifiedBlock::new_unchecked(genesis_block, genesis_qc));
             let genesis_commit_output = io_loop.step(NodeInput::Protocol(Box::new(
                 ProtocolEvent::BlockCommitted {
                     certified: genesis_certified,

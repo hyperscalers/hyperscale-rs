@@ -370,10 +370,10 @@ where
             for (i, _) in heights.iter().enumerate() {
                 if !already_notified[i] {
                     let commit = commit_slots[i].take().unwrap();
-                    let certified = CertifiedBlock::new_unchecked(
+                    let certified = Arc::new(CertifiedBlock::new_unchecked(
                         Arc::unwrap_or_clone(commit.block),
                         Arc::unwrap_or_clone(commit.qc),
-                    );
+                    ));
                     let _ = event_tx.send(NodeInput::Protocol(Box::new(
                         ProtocolEvent::BlockCommitted { certified },
                     )));

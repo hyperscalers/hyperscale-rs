@@ -90,7 +90,7 @@ pub enum ProtocolEvent {
     /// Received a block header from another node.
     BlockHeaderReceived {
         /// Block header received over gossip.
-        header: BlockHeader,
+        header: Arc<BlockHeader>,
         /// Manifest listing the block's tx / cert / provision hashes.
         manifest: BlockManifest,
     },
@@ -104,7 +104,7 @@ pub enum ProtocolEvent {
     /// verified the sender's BLS signature before admitting this event.
     RemoteHeaderReceived {
         /// Header + QC bundle from the remote shard.
-        committed_header: CommittedBlockHeader,
+        committed_header: Arc<CommittedBlockHeader>,
         /// Authenticated sender identity (BLS-verified by `IoLoop`).
         sender: ValidatorId,
     },
@@ -141,7 +141,7 @@ pub enum ProtocolEvent {
     /// `PendingChain::view_at` to see unpersisted state.
     BlockCommitted {
         /// The committed block + its certifying QC.
-        certified: CertifiedBlock,
+        certified: Arc<CertifiedBlock>,
     },
 
     /// A block has been durably persisted to `RocksDB`.
@@ -239,7 +239,7 @@ pub enum ProtocolEvent {
     /// because they originate from a single `FetchAndBroadcastProvisions` action.
     ProvisionsReceived {
         /// Provisions batch received from a source shard.
-        provisions: Provisions,
+        provisions: Arc<Provisions>,
     },
 
     /// Batch-level provision verification completed.
@@ -468,7 +468,7 @@ pub enum ProtocolEvent {
     /// A synced block is ready to be applied to local state.
     BlockSyncReadyToApply {
         /// The synced block + its certifying QC, ready to apply.
-        certified: CertifiedBlock,
+        certified: Arc<CertifiedBlock>,
     },
 
     /// The `io_loop`'s [`BlockSync`] state machine has finished fetching all

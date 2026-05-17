@@ -16,6 +16,8 @@
 //! tracks heights and emits `Fetch { from, count }` for the binding to
 //! turn into a network round-trip.
 
+use std::sync::Arc;
+
 use hyperscale_core::{FetchFailureKind, NodeInput, ProtocolEvent};
 use hyperscale_network::RequestError;
 
@@ -294,6 +296,7 @@ where
         record_sync_round_completed("block");
 
         // Hand the block off to BFT; tell the FSM the height was delivered.
+        let certified = Arc::new(certified);
         self.feed_event_to_shard_vnodes(shard, ProtocolEvent::BlockSyncReadyToApply { certified });
         let outputs = self
             .shard_syncs_mut(shard)

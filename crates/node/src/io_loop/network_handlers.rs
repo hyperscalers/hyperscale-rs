@@ -1,5 +1,7 @@
 //! Network handler registration (gossip, notifications, requests).
 
+use std::sync::Arc;
+
 use hyperscale_core::{NodeInput, ProtocolEvent};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::Engine;
@@ -474,7 +476,10 @@ where
                     }
                     let (header, manifest, _sig) = gossip.into_parts();
                     let _ = tx.send(NodeInput::Protocol(Box::new(
-                        ProtocolEvent::BlockHeaderReceived { header, manifest },
+                        ProtocolEvent::BlockHeaderReceived {
+                            header: Arc::new(header),
+                            manifest,
+                        },
                     )));
                 },
             );
@@ -517,7 +522,7 @@ where
 
                     let _ = tx.send(NodeInput::Protocol(Box::new(
                         ProtocolEvent::ProvisionsReceived {
-                            provisions: notification.provisions,
+                            provisions: Arc::new(notification.provisions),
                         },
                     )));
                 },

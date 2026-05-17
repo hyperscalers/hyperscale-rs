@@ -60,8 +60,6 @@
 //! proposer needs to re-evaluate. The post-dispatch drain in `mod.rs::handle`
 //! invokes `try_event_driven_proposal` once.
 
-use std::sync::Arc;
-
 use hyperscale_core::{Action, ProtocolEvent, TimerId};
 use hyperscale_types::{
     BlockHash, BlockHeader, BlockManifest, CertifiedBlock, MAX_FINALIZED_TX_PER_BLOCK,
@@ -88,10 +86,9 @@ impl NodeStateMachine {
                 // Route through the centralized remote header coordinator.
                 // Structural pre-checks happen there; downstream consumers
                 // receive headers via `RemoteHeaderAdmitted`.
-                let header = Arc::new(committed_header);
                 let topology = self.topology.snapshot();
                 self.remote_headers
-                    .on_remote_header_received(topology, header, sender)
+                    .on_remote_header_received(topology, committed_header, sender)
             }
             ProtocolEvent::BlockVoteReceived { vote } => {
                 self.bft.on_block_vote(self.topology.snapshot(), vote)
@@ -571,7 +568,7 @@ mod tests {
             vec![],
             vec![],
         );
-        let certified = certify(block, /* weighted_timestamp_ms */ 1_000);
+        let certified = Arc::new(certify(block, /* weighted_timestamp_ms */ 1_000));
         let _ = node.handle(ProtocolEvent::BlockCommitted { certified });
         assert_eq!(
             node.outbound_provisions().memory_stats().tracked_provisions,
@@ -590,7 +587,7 @@ mod tests {
             vec![],
             vec![],
         );
-        let certified = certify(block, past_deadline_ms);
+        let certified = Arc::new(certify(block, past_deadline_ms));
         let _ = node.handle(ProtocolEvent::BlockCommitted { certified });
         assert_eq!(
             node.outbound_provisions().memory_stats().tracked_provisions,
@@ -628,7 +625,10 @@ mod tests {
         .header()
         .clone();
 
-        let _ = node.handle(ProtocolEvent::BlockHeaderReceived { header, manifest });
+        let _ = node.handle(ProtocolEvent::BlockHeaderReceived {
+            header: Arc::new(header),
+            manifest,
+        });
 
         let (pending_blocks, _) = node.bft().pending_block_counts();
         assert_eq!(
@@ -671,7 +671,7 @@ mod tests {
             vec![tx],
             vec![],
         );
-        let certified = certify(block, /* weighted_timestamp_ms */ 1_000);
+        let certified = Arc::new(certify(block, /* weighted_timestamp_ms */ 1_000));
         let _ = node.handle(ProtocolEvent::BlockCommitted { certified });
 
         assert_eq!(

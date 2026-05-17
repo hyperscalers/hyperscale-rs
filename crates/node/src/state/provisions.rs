@@ -12,9 +12,12 @@ impl NodeStateMachine {
     /// Dispatch a provision-category `ProtocolEvent`.
     pub(super) fn handle_provisions(&mut self, event: ProtocolEvent) -> Vec<Action> {
         match event {
-            ProtocolEvent::ProvisionsReceived { provisions } => self
-                .provisions
-                .on_state_provisions_received(self.topology.snapshot(), provisions),
+            ProtocolEvent::ProvisionsReceived { provisions } => {
+                self.provisions.on_state_provisions_received(
+                    self.topology.snapshot(),
+                    std::sync::Arc::unwrap_or_clone(provisions),
+                )
+            }
             ProtocolEvent::StateProvisionsVerified {
                 provisions,
                 committed_header,

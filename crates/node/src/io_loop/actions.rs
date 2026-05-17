@@ -430,10 +430,10 @@ where
                     .handle(BlockSyncInput::Admitted { scope: (), height });
                 self.process_block_sync_outputs(shard, outputs);
                 if let Some((block, qc)) = notify_now {
-                    let certified = CertifiedBlock::new_unchecked(
+                    let certified = Arc::new(CertifiedBlock::new_unchecked(
                         Arc::unwrap_or_clone(block),
                         Arc::unwrap_or_clone(qc),
-                    );
+                    ));
                     self.feed_event_to_shard_vnodes(
                         shard,
                         ProtocolEvent::BlockCommitted { certified },

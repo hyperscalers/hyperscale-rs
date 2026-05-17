@@ -6,6 +6,8 @@
 //! response decoding, and feeding delivered headers into per-header QC
 //! verification.
 
+use std::sync::Arc;
+
 use hyperscale_core::{FetchFailureKind, NodeInput, ProtocolEvent};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::Engine;
@@ -105,7 +107,7 @@ where
             self.feed_event_to_shard_vnodes(
                 local_shard,
                 ProtocolEvent::RemoteHeaderReceived {
-                    committed_header: header,
+                    committed_header: Arc::new(header),
                     sender: ValidatorId::new(u64::MAX),
                 },
             );
