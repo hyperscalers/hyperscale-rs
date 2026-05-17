@@ -219,8 +219,7 @@ impl Libp2pAdapter {
         let bind_handle = spawn_validator_bind_service(
             stream_control.clone(),
             validator_peers.clone(),
-            signing_key,
-            validator_id,
+            vec![(validator_id, signing_key)],
             local_peer_id,
             Arc::clone(&shared_keys),
         );
