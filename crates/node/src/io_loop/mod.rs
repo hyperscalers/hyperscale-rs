@@ -341,7 +341,7 @@ where
                 validator_id: init.state.topology().local_validator_id(),
                 shard: init.state.topology().local_shard(),
                 state: init.state,
-                signing_key: Arc::new(init.signing_key),
+                signing_key: init.signing_key,
                 emitted_statuses: Vec::new(),
                 actions_generated: 0,
                 pending_timer_ops: Vec::new(),

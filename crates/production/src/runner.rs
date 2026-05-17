@@ -150,8 +150,10 @@ pub struct VnodeConfig {
     /// `local_shard`, and the shard committee membership it participates in.
     pub topology: TopologyCoordinator,
     /// BLS signing key for this validator's votes, proposals, and the
-    /// per-session validator-bind attestation.
-    pub signing_key: Bls12381G1PrivateKey,
+    /// per-session validator-bind attestation. Held by `Arc` so the same
+    /// allocation is shared between the bind service, the state machine,
+    /// and delegated dispatch closures.
+    pub signing_key: Arc<Bls12381G1PrivateKey>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -369,17 +371,13 @@ impl ProductionRunnerBuilder {
                 .collect(),
         );
 
-        // `Bls12381G1PrivateKey` doesn't impl `Clone`, so round-trip via bytes
-        // to keep one copy for each consumer (state machine + bind service).
+        // `Arc::clone` lets the bind service and the state machine share the
+        // single key allocation each `VnodeConfig` carries.
         let bind_vnodes: Vec<(ValidatorId, Arc<Bls12381G1PrivateKey>)> = vnode_configs
             .iter()
             .map(|cfg| {
                 let vid = cfg.topology.snapshot().local_validator_id();
-                let key_bytes = cfg.signing_key.to_bytes();
-                let key = Arc::new(
-                    Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes"),
-                );
-                (vid, key)
+                (vid, Arc::clone(&cfg.signing_key))
             })
             .collect();
 

@@ -1183,7 +1183,7 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
     let mut runner_builder = ProductionRunner::builder(
         vec![VnodeConfig {
             topology,
-            signing_key: signing_keypair,
+            signing_key: Arc::new(signing_keypair),
         }],
         bft_config,
         std::collections::HashMap::from([(local_shard, storage)]),
