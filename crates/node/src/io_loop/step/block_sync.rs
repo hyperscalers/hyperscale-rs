@@ -75,7 +75,7 @@ where
             .block
             .handle(BlockSyncInput::StartSync { scope: (), target });
         self.process_block_sync_outputs(shard, outputs);
-        self.update_fetch_tick_timer(shard);
+        self.update_fetch_tick_timer();
     }
 
     // ─── step() handlers ────────────────────────────────────────────────
@@ -309,7 +309,7 @@ where
                 now: std::time::Instant::now(),
             });
         self.process_block_sync_outputs(shard, outputs);
-        self.update_fetch_tick_timer(shard);
+        self.update_fetch_tick_timer();
     }
 
     /// Common back-edge: re-queue a height via `FetchFailed`.
@@ -331,7 +331,7 @@ where
                 now: std::time::Instant::now(),
             });
         self.process_block_sync_outputs(shard, outputs);
-        self.update_fetch_tick_timer(shard);
+        self.update_fetch_tick_timer();
     }
 }
 

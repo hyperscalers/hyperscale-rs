@@ -52,7 +52,7 @@ where
             },
         );
         self.process_remote_header_sync_outputs(local_shard, outputs);
-        self.update_fetch_tick_timer(local_shard);
+        self.update_fetch_tick_timer();
     }
 
     // ─── step() handlers ────────────────────────────────────────────────
@@ -123,7 +123,7 @@ where
             },
         );
         self.process_remote_header_sync_outputs(local_shard, outputs);
-        self.update_fetch_tick_timer(local_shard);
+        self.update_fetch_tick_timer();
     }
 
     /// Network callback: a range fetch failed.
@@ -145,7 +145,7 @@ where
             },
         );
         self.process_remote_header_sync_outputs(local_shard, outputs);
-        self.update_fetch_tick_timer(local_shard);
+        self.update_fetch_tick_timer();
     }
 
     // ─── Output processing ──────────────────────────────────────────────
