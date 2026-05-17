@@ -3,6 +3,7 @@
 //! [`Libp2pNetwork`] wraps [`Libp2pAdapter`] and [`RequestManager`] to provide
 //! the [`Network`] interface used by `IoLoop` in the production runner.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -156,6 +157,11 @@ impl Network for Libp2pNetwork {
         let sbor = basic_encode(message).expect("SBOR encode failed");
         let compressed = compress(&sbor);
         let type_id = M::message_type_id();
+
+        // Collapse recipients to unique peers: under multi-validator bind a
+        // single peer can serve several validator ids, and sending the same
+        // notification twice on the same stream is wasted bandwidth.
+        let mut unique_peers: HashSet<PeerId> = HashSet::with_capacity(recipients.len());
         for &validator in recipients {
             let Some(peer_id) = self.validator_peer_id(validator) else {
                 warn!(
@@ -164,6 +170,10 @@ impl Network for Libp2pNetwork {
                 );
                 continue;
             };
+            unique_peers.insert(peer_id);
+        }
+
+        for peer_id in unique_peers {
             self.notify_pool.send(peer_id, type_id, compressed.clone());
         }
     }
