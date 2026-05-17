@@ -11,6 +11,7 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::Engine;
 use hyperscale_network::Network;
 use hyperscale_storage::Storage;
+use hyperscale_types::ShardGroupId;
 
 use crate::io_loop::IoLoop;
 use crate::shard::fetch::FetchInput;
@@ -28,18 +29,21 @@ where
 {
     pub(in crate::io_loop) fn handle_fetch_tick(&mut self) {
         let now = std::time::Instant::now();
-        let outputs = self.shard_syncs_mut().block_tick(now);
-        self.process_block_sync_outputs(outputs);
+        let hosted: Vec<ShardGroupId> = self.hosted_shards().collect();
+        for shard in hosted {
+            let outputs = self.shard_syncs_mut(shard).block_tick(now);
+            self.process_block_sync_outputs(shard, outputs);
 
-        let outputs = self.shard_syncs_mut().remote_header_tick(now);
-        self.process_remote_header_sync_outputs(outputs);
+            let outputs = self.shard_syncs_mut(shard).remote_header_tick(now);
+            self.process_remote_header_sync_outputs(shard, outputs);
 
-        self.drive_fetch::<TransactionBinding>(FetchInput::Tick);
-        self.drive_fetch::<LocalProvisionBinding>(FetchInput::Tick);
-        self.drive_fetch::<FinalizedWaveBinding>(FetchInput::Tick);
-        self.drive_fetch::<ProvisionBinding>(FetchInput::Tick);
-        self.drive_fetch::<ExecCertBinding>(FetchInput::Tick);
+            self.drive_fetch::<TransactionBinding>(shard, FetchInput::Tick);
+            self.drive_fetch::<LocalProvisionBinding>(shard, FetchInput::Tick);
+            self.drive_fetch::<FinalizedWaveBinding>(shard, FetchInput::Tick);
+            self.drive_fetch::<ProvisionBinding>(shard, FetchInput::Tick);
+            self.drive_fetch::<ExecCertBinding>(shard, FetchInput::Tick);
 
-        self.update_fetch_tick_timer();
+            self.update_fetch_tick_timer(shard);
+        }
     }
 }

@@ -34,22 +34,23 @@ where
 {
     // ─── Action dispatch ────────────────────────────────────────────────
 
-    /// Handle `Action::StartRemoteHeaderSync`: feed the FSM and dispatch
-    /// any range fetches it emits.
+    /// Handle `Action::StartRemoteHeaderSync`: feed `local_shard`'s FSM
+    /// and dispatch any range fetches it emits. `source_shard` is the
+    /// remote shard whose committed headers we're catching up on.
     pub(in crate::io_loop) fn process_start_remote_header_sync(
         &mut self,
+        local_shard: ShardGroupId,
         source_shard: ShardGroupId,
         target: BlockHeight,
     ) {
-        let outputs =
-            self.shard_syncs_mut()
-                .remote_header
-                .handle(RemoteHeaderSyncInput::StartSync {
-                    scope: source_shard,
-                    target,
-                });
-        self.process_remote_header_sync_outputs(outputs);
-        self.update_fetch_tick_timer();
+        let outputs = self.shard_syncs_mut(local_shard).remote_header.handle(
+            RemoteHeaderSyncInput::StartSync {
+                scope: source_shard,
+                target,
+            },
+        );
+        self.process_remote_header_sync_outputs(local_shard, outputs);
+        self.update_fetch_tick_timer(local_shard);
     }
 
     // ─── step() handlers ────────────────────────────────────────────────
@@ -61,6 +62,7 @@ where
     /// it can defer the short-capped tail.
     pub(in crate::io_loop) fn handle_remote_headers_response_received(
         &mut self,
+        local_shard: ShardGroupId,
         source_shard: ShardGroupId,
         from_height: BlockHeight,
         count: HeaderFetchCount,
@@ -106,40 +108,39 @@ where
             });
         }
 
-        let outputs =
-            self.shard_syncs_mut()
-                .remote_header
-                .handle(RemoteHeaderSyncInput::FetchSucceeded {
-                    scope: source_shard,
-                    from: from_height,
-                    count: count.inner(),
-                    delivered_heights,
-                    now: std::time::Instant::now(),
-                });
-        self.process_remote_header_sync_outputs(outputs);
-        self.update_fetch_tick_timer();
+        let outputs = self.shard_syncs_mut(local_shard).remote_header.handle(
+            RemoteHeaderSyncInput::FetchSucceeded {
+                scope: source_shard,
+                from: from_height,
+                count: count.inner(),
+                delivered_heights,
+                now: std::time::Instant::now(),
+            },
+        );
+        self.process_remote_header_sync_outputs(local_shard, outputs);
+        self.update_fetch_tick_timer(local_shard);
     }
 
     /// Network callback: a range fetch failed.
     pub(in crate::io_loop) fn handle_remote_headers_fetch_failed(
         &mut self,
+        local_shard: ShardGroupId,
         source_shard: ShardGroupId,
         from_height: BlockHeight,
         count: HeaderFetchCount,
         kind: FetchFailureKind,
     ) {
-        let outputs =
-            self.shard_syncs_mut()
-                .remote_header
-                .handle(RemoteHeaderSyncInput::FetchFailed {
-                    scope: source_shard,
-                    from: from_height,
-                    count: count.inner(),
-                    kind,
-                    now: std::time::Instant::now(),
-                });
-        self.process_remote_header_sync_outputs(outputs);
-        self.update_fetch_tick_timer();
+        let outputs = self.shard_syncs_mut(local_shard).remote_header.handle(
+            RemoteHeaderSyncInput::FetchFailed {
+                scope: source_shard,
+                from: from_height,
+                count: count.inner(),
+                kind,
+                now: std::time::Instant::now(),
+            },
+        );
+        self.process_remote_header_sync_outputs(local_shard, outputs);
+        self.update_fetch_tick_timer(local_shard);
     }
 
     // ─── Output processing ──────────────────────────────────────────────
@@ -148,6 +149,7 @@ where
     /// `RemoteHeaderSyncComplete` event.
     pub(in crate::io_loop) fn process_remote_header_sync_outputs(
         &mut self,
+        _local_shard: ShardGroupId,
         outputs: Vec<RemoteHeaderSyncOutput>,
     ) {
         for output in outputs {

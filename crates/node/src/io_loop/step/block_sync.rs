@@ -44,8 +44,8 @@ use hyperscale_storage::Storage;
 use hyperscale_types::network::response::GetBlockResponse;
 use hyperscale_types::{
     BlockHeight, CertifiedBlock, ElidedCertifiedBlock, Hash, Inventory, RehydrateError,
-    StoredReceipt, compute_certificate_root, compute_local_receipt_root, compute_provision_root,
-    compute_transaction_root,
+    ShardGroupId, StoredReceipt, compute_certificate_root, compute_local_receipt_root,
+    compute_provision_root, compute_transaction_root,
 };
 
 use crate::io_loop::IoLoop;
@@ -61,15 +61,19 @@ where
 {
     // ─── Action dispatch ────────────────────────────────────────────────
 
-    /// Handle `Action::StartBlockSync`: feed the FSM and dispatch any
-    /// fetches it emits.
-    pub(in crate::io_loop) fn process_start_block_sync(&mut self, target: BlockHeight) {
+    /// Handle `Action::StartBlockSync`: feed `shard`'s FSM and dispatch
+    /// any fetches it emits.
+    pub(in crate::io_loop) fn process_start_block_sync(
+        &mut self,
+        shard: ShardGroupId,
+        target: BlockHeight,
+    ) {
         let outputs = self
-            .shard_syncs_mut()
+            .shard_syncs_mut(shard)
             .block
             .handle(BlockSyncInput::StartSync { scope: (), target });
-        self.process_block_sync_outputs(outputs);
-        self.update_fetch_tick_timer();
+        self.process_block_sync_outputs(shard, outputs);
+        self.update_fetch_tick_timer(shard);
     }
 
     // ─── step() handlers ────────────────────────────────────────────────
@@ -83,6 +87,7 @@ where
     /// routing convention.
     pub(in crate::io_loop) fn handle_block_sync_response_received(
         &mut self,
+        shard: ShardGroupId,
         height: BlockHeight,
         block: Option<Box<ElidedCertifiedBlock>>,
     ) {
@@ -90,10 +95,10 @@ where
             // Peer didn't have the block — re-queue via fetch-failed.
             // Treat as exhausted so the FSM doesn't pile its own backoff on
             // top of the request manager's; we just want another attempt.
-            self.feed_block_sync_fetch_failed(height, FetchFailureKind::Exhausted);
+            self.feed_block_sync_fetch_failed(shard, height, FetchFailureKind::Exhausted);
             return;
         };
-        let cert = match self.rehydrate_elided_block(&elided) {
+        let cert = match self.rehydrate_elided_block(shard, &elided) {
             Ok(c) => c,
             Err(err) => {
                 let reason = match err {
@@ -101,11 +106,13 @@ where
                     RehydrateError::QcMismatch { .. } => "qc_hash_mismatch",
                 };
                 record_sync_response_error("block", reason);
-                self.shard_syncs_mut().block.mark_force_full_refetch(height);
+                self.shard_syncs_mut(shard)
+                    .block
+                    .mark_force_full_refetch(height);
                 // Rehydration is a local-data issue resolved by force-full
                 // on the next attempt — re-queue immediately rather than
                 // backing off.
-                self.feed_block_sync_fetch_failed(height, FetchFailureKind::Exhausted);
+                self.feed_block_sync_fetch_failed(shard, height, FetchFailureKind::Exhausted);
                 return;
             }
         };
@@ -130,27 +137,30 @@ where
     /// Handle a sync block fetch failure (network error / not-found).
     pub(in crate::io_loop) fn handle_block_sync_fetch_failed(
         &mut self,
+        shard: ShardGroupId,
         height: BlockHeight,
         kind: FetchFailureKind,
     ) {
         record_sync_response_error("block", "fetch_failed");
-        self.feed_block_sync_fetch_failed(height, kind);
+        self.feed_block_sync_fetch_failed(shard, height, kind);
     }
 
     /// Resume the post-validation delivery path after off-thread
     /// structural validation succeeded.
     pub(in crate::io_loop) fn handle_sync_block_validated(
         &mut self,
+        shard: ShardGroupId,
         height: BlockHeight,
         certified: CertifiedBlock,
     ) {
-        self.deliver_validated_sync_block(height, certified);
+        self.deliver_validated_sync_block(shard, height, certified);
     }
 
     /// Resume the failure path after off-thread structural validation
     /// rejected the response.
     pub(in crate::io_loop) fn handle_sync_block_validation_failed(
         &mut self,
+        shard: ShardGroupId,
         height: BlockHeight,
         reason: &'static str,
     ) {
@@ -159,14 +169,18 @@ where
         // Validation failure is a peer-content issue, not a transport
         // exhaustion — apply the standard backoff so we don't spin if a
         // peer keeps shipping malformed responses.
-        self.feed_block_sync_fetch_failed(height, FetchFailureKind::Transport);
+        self.feed_block_sync_fetch_failed(shard, height, FetchFailureKind::Transport);
     }
 
     // ─── Sync output processing + helpers ───────────────────────────────
 
     /// Process FSM outputs: `Fetch` → network request, `Complete` →
     /// fed into the state machine as `BlockSyncComplete`.
-    pub(in crate::io_loop) fn process_block_sync_outputs(&mut self, outputs: Vec<BlockSyncOutput>) {
+    pub(in crate::io_loop) fn process_block_sync_outputs(
+        &mut self,
+        shard: ShardGroupId,
+        outputs: Vec<BlockSyncOutput>,
+    ) {
         // Snapshot the sync inventory once per batch so every Fetch in
         // this tick shares a consistent view of mempool / cert-cache /
         // provision-store membership. Built lazily.
@@ -174,7 +188,7 @@ where
         for output in outputs {
             match output {
                 SyncOutput::Fetch { from: height, .. } => {
-                    self.dispatch_block_sync_fetch(height, &mut inventory_cache);
+                    self.dispatch_block_sync_fetch(shard, height, &mut inventory_cache);
                 }
                 SyncOutput::Complete { height, .. } => {
                     tracing::info!(
@@ -191,13 +205,14 @@ where
     /// target and `force_full` flag from the FSM at dispatch time.
     fn dispatch_block_sync_fetch(
         &self,
+        shard: ShardGroupId,
         height: BlockHeight,
         inventory_cache: &mut Option<Inventory>,
     ) {
         use hyperscale_types::network::request::GetBlockRequest;
 
-        let target_height = self.shard_syncs().block.target(&()).unwrap_or(height);
-        let force_full = self.shard_syncs().block.force_full(height);
+        let target_height = self.shard_syncs(shard).block.target(&()).unwrap_or(height);
+        let force_full = self.shard_syncs(shard).block.force_full(height);
 
         // Heights flagged `force_full` were rehydration misses last time —
         // request with empty inventory so the responder cannot elide bodies.
@@ -205,14 +220,13 @@ where
             Inventory::empty()
         } else {
             inventory_cache
-                .get_or_insert_with(|| self.build_sync_inventory())
+                .get_or_insert_with(|| self.build_sync_inventory(shard))
                 .clone()
         };
         let es = self.event_sender.clone();
-        let local_shard = self.topology_snapshot.load().local_shard();
         record_sync_round_started("block");
         self.network.request(
-            local_shard,
+            shard,
             None,
             GetBlockRequest::new(height, target_height).with_inventory(inventory),
             None,
@@ -237,12 +251,12 @@ where
     /// Snapshot local mempool / finalized-wave cache / provision store
     /// into an [`Inventory`] so the responder can elide bodies the
     /// requester already has.
-    fn build_sync_inventory(&self) -> Inventory {
+    fn build_sync_inventory(&self, shard: ShardGroupId) -> Inventory {
         Inventory {
-            tx_have: self.shard_caches().tx_store.tx_bloom_snapshot(),
+            tx_have: self.shard_caches(shard).tx_store.tx_bloom_snapshot(),
             cert_have: self.vnodes[0].state.execution().cert_bloom_snapshot(),
             provision_have: self
-                .shard_caches()
+                .shard_caches(shard)
                 .provision_store
                 .provision_bloom_snapshot(),
         }
@@ -251,12 +265,13 @@ where
     /// Rehydrate an elided sync response into a full `CertifiedBlock`.
     fn rehydrate_elided_block(
         &self,
+        shard: ShardGroupId,
         elided: &ElidedCertifiedBlock,
     ) -> Result<CertifiedBlock, RehydrateError> {
         let state = &self.vnodes[0].state;
         let mempool = state.mempool();
         let execution = state.execution();
-        let provision_store = &self.shard_caches().provision_store;
+        let provision_store = &self.shard_caches(shard).provision_store;
         elided.try_rehydrate(
             |h| mempool.get_transaction(h),
             |id| execution.get_finalized_wave(id),
@@ -267,13 +282,18 @@ where
     /// Hand a validated synced block to BFT and advance the sync FSM.
     /// Structural validation runs off-thread; this is the
     /// post-verdict pinned-thread continuation.
-    fn deliver_validated_sync_block(&mut self, height: BlockHeight, certified: CertifiedBlock) {
+    fn deliver_validated_sync_block(
+        &mut self,
+        shard: ShardGroupId,
+        height: BlockHeight,
+        certified: CertifiedBlock,
+    ) {
         record_sync_round_completed("block");
 
         // Hand the block off to BFT; tell the FSM the height was delivered.
         self.feed_event_to_all_vnodes(ProtocolEvent::BlockSyncReadyToApply { certified });
         let outputs = self
-            .shard_syncs_mut()
+            .shard_syncs_mut(shard)
             .block
             .handle(BlockSyncInput::FetchSucceeded {
                 scope: (),
@@ -282,15 +302,20 @@ where
                 delivered_heights: vec![height],
                 now: std::time::Instant::now(),
             });
-        self.process_block_sync_outputs(outputs);
-        self.update_fetch_tick_timer();
+        self.process_block_sync_outputs(shard, outputs);
+        self.update_fetch_tick_timer(shard);
     }
 
     /// Common back-edge: re-queue a height via `FetchFailed`.
-    fn feed_block_sync_fetch_failed(&mut self, height: BlockHeight, kind: FetchFailureKind) {
+    fn feed_block_sync_fetch_failed(
+        &mut self,
+        shard: ShardGroupId,
+        height: BlockHeight,
+        kind: FetchFailureKind,
+    ) {
         record_sync_round_retried("block");
         let outputs = self
-            .shard_syncs_mut()
+            .shard_syncs_mut(shard)
             .block
             .handle(BlockSyncInput::FetchFailed {
                 scope: (),
@@ -299,8 +324,8 @@ where
                 kind,
                 now: std::time::Instant::now(),
             });
-        self.process_block_sync_outputs(outputs);
-        self.update_fetch_tick_timer();
+        self.process_block_sync_outputs(shard, outputs);
+        self.update_fetch_tick_timer(shard);
     }
 }
 

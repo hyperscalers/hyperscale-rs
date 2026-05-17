@@ -12,7 +12,7 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::Engine;
 use hyperscale_network::Network;
 use hyperscale_storage::Storage;
-use hyperscale_types::BlockHeight;
+use hyperscale_types::{BlockHeight, ShardGroupId};
 
 use crate::io_loop::IoLoop;
 
@@ -26,18 +26,26 @@ where
     /// Update `IoLoop`'s commit pipeline before forwarding `BlockPersisted`
     /// to the state machine: the persisted height advances `block_commit`'s
     /// gate and `pending_chain`'s pruning watermark.
-    pub(in crate::io_loop) fn handle_block_persisted(&mut self, height: BlockHeight) {
-        self.shard_block_commit_mut().mark_persisted(height);
+    pub(in crate::io_loop) fn handle_block_persisted(
+        &mut self,
+        shard: ShardGroupId,
+        height: BlockHeight,
+    ) {
+        self.shard_block_commit_mut(shard).mark_persisted(height);
         // Drop pending state for blocks now persisted to RocksDB.
-        self.shard_pending_chain().prune(height);
+        self.shard_pending_chain(shard).prune(height);
         self.feed_event_to_all_vnodes(ProtocolEvent::BlockPersisted { height });
     }
 
     /// Default `Protocol(_)` passthrough — fan the event across fetch-binding
     /// drain hooks (so e.g. `TransactionsReceived` clears in-flight tracking)
     /// and feed the variant into the state machine.
-    pub(in crate::io_loop) fn handle_protocol_passthrough(&mut self, event: ProtocolEvent) {
-        self.drive_fetch_admission(&event);
+    pub(in crate::io_loop) fn handle_protocol_passthrough(
+        &mut self,
+        shard: ShardGroupId,
+        event: ProtocolEvent,
+    ) {
+        self.drive_fetch_admission(shard, &event);
         self.feed_event_to_all_vnodes(event);
     }
 }

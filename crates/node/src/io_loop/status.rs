@@ -64,11 +64,15 @@ where
             contention.in_flight_count as usize,
         );
 
+        // Per-shard status aggregation is a follow-up; surface the
+        // primary (`vnodes[0]`) shard's block-sync state for now since
+        // the RPC contract assumes one block-sync stream per node.
+        let primary_shard = self.vnodes[0].shard;
         NodeStatusSnapshot {
             committed_height: state.bft().committed_height(),
             view: state.bft().view().inner(),
             state_root,
-            block_sync: self.shard_syncs().block.block_sync_status(),
+            block_sync: self.shard_syncs(primary_shard).block.block_sync_status(),
             mempool_pending: pending,
             mempool_in_flight: in_flight,
             mempool_total: mempool.len(),

@@ -47,11 +47,12 @@ where
     /// [`MempoolCoordinator::on_transaction_gossip`]: hyperscale_mempool::MempoolCoordinator
     pub(in crate::io_loop) fn handle_transaction_validated(
         &mut self,
+        shard: ShardGroupId,
         tx: Arc<RoutableTransaction>,
     ) {
         let tx_hash = tx.hash();
-        self.shard_io_mut().pending_validation.remove(&tx_hash);
-        let submitted_locally = self.shard_io_mut().locally_submitted.remove(&tx_hash);
+        self.shard_io_mut(shard).pending_validation.remove(&tx_hash);
+        let submitted_locally = self.shard_io_mut(shard).locally_submitted.remove(&tx_hash);
         for vnode in &mut self.vnodes {
             vnode.actions_generated = 0;
         }
@@ -63,10 +64,14 @@ where
 
     /// Validation failed — drop tracking entries so the tx can be
     /// re-validated if it shows up again.
-    pub(in crate::io_loop) fn handle_transaction_validations_failed(&mut self, hashes: &[TxHash]) {
+    pub(in crate::io_loop) fn handle_transaction_validations_failed(
+        &mut self,
+        shard: ShardGroupId,
+        hashes: &[TxHash],
+    ) {
         for hash in hashes {
-            self.shard_io_mut().pending_validation.remove(hash);
-            self.shard_io_mut().locally_submitted.remove(hash);
+            self.shard_io_mut(shard).pending_validation.remove(hash);
+            self.shard_io_mut(shard).locally_submitted.remove(hash);
         }
     }
 
@@ -75,71 +80,89 @@ where
     /// have it cached and it isn't tombstoned by mempool.
     pub(in crate::io_loop) fn handle_gossip_received_tx_for_validation(
         &mut self,
+        shard: ShardGroupId,
         tx: Arc<RoutableTransaction>,
     ) {
         let tx_hash = tx.hash();
         // Already-vouched (in TxStore) or terminally-rejected (tombstoned)
         // are skipped. `pending_validation` blocks duplicate enqueues.
-        if !self.shard_caches().tx_store.contains(&tx_hash)
+        if !self.shard_caches(shard).tx_store.contains(&tx_hash)
             && !self.vnodes[0].state.mempool().is_tombstoned(&tx_hash)
         {
-            self.shard_io_mut().pending_validation.insert(tx_hash);
-            self.queue_validation(tx);
+            self.shard_io_mut(shard).pending_validation.insert(tx_hash);
+            self.queue_validation(shard, tx);
         }
     }
 
     /// Locally-submitted transaction (RPC/sim): enqueue into the per-shard
     /// outbound gossip accumulators (reads ∪ writes) and queue for
     /// validation if not already in flight or cached.
-    pub(in crate::io_loop) fn handle_submit_transaction(&mut self, tx: Arc<RoutableTransaction>) {
+    pub(in crate::io_loop) fn handle_submit_transaction(
+        &mut self,
+        shard: ShardGroupId,
+        tx: Arc<RoutableTransaction>,
+    ) {
         let tx_hash = tx.hash();
 
         let num_shards = self.topology_snapshot.load().num_shards();
-        let shards: std::collections::BTreeSet<ShardGroupId> = tx
+        let dst_shards: std::collections::BTreeSet<ShardGroupId> = tx
             .declared_reads()
             .iter()
             .chain(tx.declared_writes().iter())
             .map(|node_id| shard_for_node(node_id, num_shards))
             .collect();
-        for shard in shards {
-            self.enqueue_tx_for_gossip(shard, Arc::clone(&tx));
+        for dst in dst_shards {
+            self.enqueue_tx_for_gossip(shard, dst, Arc::clone(&tx));
         }
 
-        if !self.shard_io_mut().pending_validation.contains(&tx_hash)
-            && !self.shard_caches().tx_store.contains(&tx_hash)
+        if !self
+            .shard_io_mut(shard)
+            .pending_validation
+            .contains(&tx_hash)
+            && !self.shard_caches(shard).tx_store.contains(&tx_hash)
         {
             // Paired with validation: only queued txs are removed on completion.
-            self.shard_io_mut().locally_submitted.insert(tx_hash);
-            self.shard_io_mut().pending_validation.insert(tx_hash);
-            self.queue_validation(tx);
+            self.shard_io_mut(shard).locally_submitted.insert(tx_hash);
+            self.shard_io_mut(shard).pending_validation.insert(tx_hash);
+            self.queue_validation(shard, tx);
         }
     }
 
-    /// Append a tx to the destination shard's outbound gossip accumulator,
-    /// flushing immediately if the count cap is hit. Time-based flushes
-    /// happen via [`IoLoop::flush_expired_batches`].
+    /// Append a tx to the destination shard's outbound gossip accumulator
+    /// on `local_shard`, flushing immediately if the count cap is hit.
+    /// Time-based flushes happen via [`IoLoop::flush_expired_batches`].
     pub(in crate::io_loop) fn enqueue_tx_for_gossip(
         &mut self,
-        shard: ShardGroupId,
+        local_shard: ShardGroupId,
+        dst: ShardGroupId,
         tx: Arc<RoutableTransaction>,
     ) {
         let now = self.vnodes[0].state.now();
-        let max = self.shard_io().tx_gossip_max;
-        let window = self.shard_io().tx_gossip_window;
+        let max = self.shard_io(local_shard).tx_gossip_max;
+        let window = self.shard_io(local_shard).tx_gossip_window;
         let batch = self
-            .shard_io_mut()
+            .shard_io_mut(local_shard)
             .tx_gossip_batches
-            .entry(shard)
+            .entry(dst)
             .or_insert_with(|| BatchAccumulator::new(max, window));
         if batch.push(tx, now) {
-            self.flush_tx_gossip_batch(shard);
+            self.flush_tx_gossip_batch(local_shard, dst);
         }
     }
 
-    /// Drain the destination shard's outbound gossip accumulator and
-    /// publish it as a single `TransactionGossip` batch. No-op if empty.
-    pub(in crate::io_loop) fn flush_tx_gossip_batch(&mut self, shard: ShardGroupId) {
-        let Some(batch) = self.shard_io_mut().tx_gossip_batches.get_mut(&shard) else {
+    /// Drain `local_shard`'s outbound gossip accumulator for destination
+    /// shard `dst` and publish it as a single `TransactionGossip` batch.
+    /// No-op if empty.
+    pub(in crate::io_loop) fn flush_tx_gossip_batch(
+        &mut self,
+        local_shard: ShardGroupId,
+        dst: ShardGroupId,
+    ) {
+        let Some(batch) = self
+            .shard_io_mut(local_shard)
+            .tx_gossip_batches
+            .get_mut(&dst)
+        else {
             return;
         };
         let txs = batch.take();
@@ -147,20 +170,25 @@ where
             return;
         }
         let gossip = TransactionGossip::new(txs);
-        self.network.broadcast_to_shard(shard, &gossip);
+        self.network.broadcast_to_shard(dst, &gossip);
     }
 
     // ─── Validation batching ────────────────────────────────────────────
 
-    /// Queue a transaction for batch validation.
-    pub(in crate::io_loop) fn queue_validation(&mut self, tx: Arc<RoutableTransaction>) {
+    /// Queue a transaction for batch validation on `shard`'s validator.
+    pub(in crate::io_loop) fn queue_validation(
+        &mut self,
+        shard: ShardGroupId,
+        tx: Arc<RoutableTransaction>,
+    ) {
         let now = self.vnodes[0].state.now();
-        if self.shard_io_mut().validation_batch.push(tx, now) {
-            self.flush_validation_batch();
+        if self.shard_io_mut(shard).validation_batch.push(tx, now) {
+            self.flush_validation_batch(shard);
         }
     }
 
-    /// Flush the validation batch, dispatching to the `tx_validation` pool.
+    /// Flush `shard`'s validation batch, dispatching to the
+    /// `tx_validation` pool.
     ///
     /// Valid transactions are sent back as `TransactionValidated` events
     /// through the event channel; failures land as
@@ -168,8 +196,8 @@ where
     /// `pending_validation` / `locally_submitted`. See
     /// `IoLoop::event_sender` for the off-thread → pinned-thread
     /// routing convention.
-    pub(in crate::io_loop) fn flush_validation_batch(&mut self) {
-        let batch = self.shard_io_mut().validation_batch.take();
+    pub(in crate::io_loop) fn flush_validation_batch(&mut self, shard: ShardGroupId) {
+        let batch = self.shard_io_mut(shard).validation_batch.take();
         if batch.is_empty() {
             return;
         }

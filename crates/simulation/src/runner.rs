@@ -263,9 +263,13 @@ impl SimulationRunner {
                 let sim_engine =
                     SimulationEngine::new(RadixExecutor::new(network_def), shard_cache.clone());
 
+                // Simulator hosts always carry one shard per host
+                // (same-shard hosting only); construct a single-entry
+                // storage map keyed by that shard.
+                let storages = HashMap::from([(shard, SimStorage::new())]);
                 let io_loop = IoLoop::new(
                     vnode_inits,
-                    SimStorage::new(),
+                    storages,
                     sim_engine,
                     network.create_adapter(host_index),
                     SyncDispatch,
@@ -341,10 +345,14 @@ impl SimulationRunner {
     // Accessors
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Get a reference to a node's storage.
+    /// Get a reference to a node's storage. Simulator hosts always
+    /// carry one shard per host, so we resolve through the host's
+    /// state machine.
     #[must_use]
     pub fn node_storage(&self, node: NodeIndex) -> Option<&SimStorage> {
-        self.io_loops.get(node as usize).map(IoLoop::storage)
+        let io_loop = self.io_loops.get(node as usize)?;
+        let shard = io_loop.state().topology().local_shard();
+        Some(io_loop.shard_storage(shard))
     }
 
     /// Get the last emitted transaction status for a node.
@@ -403,7 +411,8 @@ impl SimulationRunner {
     #[must_use]
     pub fn committed_block_count(&self, node: NodeIndex) -> usize {
         self.io_loops.get(node as usize).map_or(0, |nl| {
-            let s = nl.storage();
+            let shard = nl.state().topology().local_shard();
+            let s = nl.shard_storage(shard);
             let committed = s.committed_height();
             if committed == BlockHeight::GENESIS {
                 usize::from(s.get_block(BlockHeight::GENESIS).is_some())
@@ -416,9 +425,10 @@ impl SimulationRunner {
     /// Check if a specific block is stored for a node.
     #[must_use]
     pub fn has_committed_block(&self, node: NodeIndex, height: BlockHeight) -> bool {
-        self.io_loops
-            .get(node as usize)
-            .is_some_and(|nl| nl.storage().get_block(height).is_some())
+        self.io_loops.get(node as usize).is_some_and(|nl| {
+            let shard = nl.state().topology().local_shard();
+            nl.shard_storage(shard).get_block(height).is_some()
+        })
     }
 
     /// Schedule an initial event (e.g., to start the simulation).
@@ -512,7 +522,8 @@ impl SimulationRunner {
             if self.genesis_executed[node_idx] || !select(node_idx) {
                 continue;
             }
-            self.io_loops[node_idx].install_engine_genesis(config);
+            let shard = self.io_loops[node_idx].state().topology().local_shard();
+            self.io_loops[node_idx].install_engine_genesis(shard, config);
             self.genesis_executed[node_idx] = true;
         }
     }
@@ -530,7 +541,8 @@ impl SimulationRunner {
 
         for shard_id in 0..num_shards {
             let host_start = shard_id * hosts_per_shard;
-            let first_node_storage = self.io_loops[host_start as usize].storage();
+            let shard = ShardGroupId::new(u64::from(shard_id));
+            let first_node_storage = self.io_loops[host_start as usize].shard_storage(shard);
             let genesis_jmt_root = first_node_storage.state_root();
 
             info!(

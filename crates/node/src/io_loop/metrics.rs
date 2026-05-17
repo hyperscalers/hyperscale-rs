@@ -112,8 +112,12 @@ where
         let bft_stats = state.bft().stats();
         let mempool = state.mempool();
         let contention = mempool.lock_contention_stats();
-        let fetches = self.shard_fetches().metrics();
-        let syncs = self.shard_syncs().metrics();
+        // Per-shard prometheus aggregation is a follow-up; the metrics
+        // backend uses flat gauges, so read the primary (`vnodes[0]`)
+        // shard's hosts as a representative snapshot.
+        let primary_shard = self.vnodes[0].shard;
+        let fetches = self.shard_fetches(primary_shard).metrics();
+        let syncs = self.shard_syncs(primary_shard).metrics();
         let block_sync_status = &syncs.block_sync_status;
 
         let bft_mem = state.bft().memory_stats();
@@ -130,12 +134,18 @@ where
             contention_ratio: contention.contention_ratio(),
             in_flight: mempool.in_flight(),
             backpressure_active: mempool.at_in_flight_limit(),
-            blocks_behind: self.shard_syncs().block.blocks_behind(),
-            is_syncing: self.shard_syncs().block.is_syncing(),
-            block_sync_round_in_flight: self.shard_syncs().block.in_flight_ranges(),
-            remote_header_blocks_behind: self.shard_syncs().remote_header.total_blocks_behind(),
-            remote_header_is_syncing: self.shard_syncs().remote_header.is_syncing(),
-            remote_header_round_in_flight: self.shard_syncs().remote_header.in_flight_ranges(),
+            blocks_behind: self.shard_syncs(primary_shard).block.blocks_behind(),
+            is_syncing: self.shard_syncs(primary_shard).block.is_syncing(),
+            block_sync_round_in_flight: self.shard_syncs(primary_shard).block.in_flight_ranges(),
+            remote_header_blocks_behind: self
+                .shard_syncs(primary_shard)
+                .remote_header
+                .total_blocks_behind(),
+            remote_header_is_syncing: self.shard_syncs(primary_shard).remote_header.is_syncing(),
+            remote_header_round_in_flight: self
+                .shard_syncs(primary_shard)
+                .remote_header
+                .in_flight_ranges(),
             fetch_transaction: fetches.transaction_in_flight,
             fetch_provision: fetches.provision_in_flight,
             fetch_local_provision: fetches.local_provision_in_flight,
@@ -194,17 +204,20 @@ where
                 prov_provisions_by_hash: prov_mem.provisions_by_hash,
                 prov_queued_provisions: prov_mem.queued_provisions,
                 // Node (io_loop)
-                node_tx_store: self.shard_caches().tx_store.len(),
-                node_tx_status_cache: self.shard_caches().tx_status.len(),
-                node_finalized_wave_cache: self.shard_caches().finalized_wave.len(),
-                node_provision_cache: self.shard_caches().provision_store.len(),
-                node_exec_cert_cache: self.shard_caches().exec_cert_store.len(),
-                node_prepared_commits: self.shard_block_commit().prepared_len(),
-                node_pending_validation: self.shard_io().pending_validation.len(),
-                node_locally_submitted: self.shard_io().locally_submitted.len(),
-                node_pending_block_commits: self.shard_block_commit().pending_len(),
-                node_validation_batch: self.shard_io().validation_batch.len(),
-                node_committed_header_batch: self.shard_io().committed_header_batch.len(),
+                node_tx_store: self.shard_caches(primary_shard).tx_store.len(),
+                node_tx_status_cache: self.shard_caches(primary_shard).tx_status.len(),
+                node_finalized_wave_cache: self.shard_caches(primary_shard).finalized_wave.len(),
+                node_provision_cache: self.shard_caches(primary_shard).provision_store.len(),
+                node_exec_cert_cache: self.shard_caches(primary_shard).exec_cert_store.len(),
+                node_prepared_commits: self.shard_block_commit(primary_shard).prepared_len(),
+                node_pending_validation: self.shard_io(primary_shard).pending_validation.len(),
+                node_locally_submitted: self.shard_io(primary_shard).locally_submitted.len(),
+                node_pending_block_commits: self.shard_block_commit(primary_shard).pending_len(),
+                node_validation_batch: self.shard_io(primary_shard).validation_batch.len(),
+                node_committed_header_batch: self
+                    .shard_io(primary_shard)
+                    .committed_header_batch
+                    .len(),
                 node_block_sync_queued_heights: block_sync_status.queued_heights,
                 node_block_sync_in_flight_fetches: block_sync_status.pending_fetches,
                 node_tx_fetch_blocks: fetches.transaction_pending,
@@ -213,7 +226,7 @@ where
                 node_provision_fetch_pending: fetches.provision_pending,
                 node_exec_cert_fetch_pending: fetches.exec_cert_pending,
                 node_remote_header_fetch_pending: self
-                    .shard_syncs()
+                    .shard_syncs(primary_shard)
                     .remote_header
                     .in_flight_ranges(),
                 // Storage — filled in by record_metrics off-thread.

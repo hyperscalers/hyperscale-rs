@@ -16,7 +16,7 @@ use hyperscale_provisions::action_handlers::handle_action as handle_provisions_a
 use hyperscale_storage::{ChainEntry, ChainWriter, Storage};
 use hyperscale_types::{
     Block, BlockHeight, CertifiedBlock, ConsensusReceipt, FinalizedWave, QuorumCertificate,
-    StateRoot, TopologySnapshot, TransactionStatus, TxHash,
+    ShardGroupId, StateRoot, TopologySnapshot, TransactionStatus, TxHash,
 };
 use tracing::{debug, error, trace, warn};
 
@@ -51,6 +51,7 @@ where
     ///   serving, RPC observability, block commit pipeline, topology
     ///   plumbing).
     pub(super) fn process_action(&mut self, vnode_idx: usize, action: Action) {
+        let shard = self.vnodes[vnode_idx].shard;
         match action {
             // ─── Coordinator policy: delegated to worker pools ─────────────
             Action::AggregateExecutionCertificate { .. }
@@ -80,14 +81,14 @@ where
 
             // ─── Sync / fetch protocol drive ───────────────────────────────
             Action::StartBlockSync { target } => {
-                self.process_start_block_sync(target);
+                self.process_start_block_sync(shard, target);
             }
             Action::StartRemoteHeaderSync {
                 source_shard,
                 target,
-            } => self.process_start_remote_header_sync(source_shard, target),
-            Action::Fetch(req) => self.process_fetch_request(req),
-            Action::AbandonFetch(req) => self.process_fetch_abandon(req),
+            } => self.process_start_remote_header_sync(shard, source_shard, target),
+            Action::Fetch(req) => self.process_fetch_request(shard, req),
+            Action::AbandonFetch(req) => self.process_fetch_abandon(shard, req),
 
             // ─── io_loop-internal effects ──────────────────────────────────
             Action::SetTimer { id, duration } => {
@@ -100,15 +101,18 @@ where
                     .pending_timer_ops
                     .push(TimerOp::Cancel { id });
             }
-            Action::Continuation(pe) => self.handle_continuation(pe),
-            Action::RestoreCommittedState => self.handle_restore_committed_state(),
+            Action::Continuation(pe) => self.handle_continuation(shard, pe),
+            Action::RestoreCommittedState => self.handle_restore_committed_state(shard),
             Action::CommitBlock { block, qc, source } => {
-                self.accept_block_commit(PendingCommit {
-                    block: Arc::new(block),
-                    qc: Arc::new(qc),
-                    source,
-                    committed_notified: false, // set by accumulate
-                });
+                self.accept_block_commit(
+                    shard,
+                    PendingCommit {
+                        block: Arc::new(block),
+                        qc: Arc::new(qc),
+                        source,
+                        committed_notified: false, // set by accumulate
+                    },
+                );
             }
             Action::CommitBlockByQcOnly {
                 block,
@@ -118,6 +122,7 @@ where
                 source,
             } => {
                 self.handle_commit_block_by_qc_only(
+                    shard,
                     block,
                     qc,
                     parent_state_root,
@@ -132,6 +137,7 @@ where
                 submitted_locally,
             } => {
                 self.handle_emit_transaction_status(
+                    shard,
                     tx_hash,
                     status,
                     cross_shard,
@@ -156,14 +162,14 @@ where
     // crates would force a typed cache reference onto `ActionContext` per
     // arm, with no architectural payoff.
 
-    fn handle_continuation(&mut self, pe: ProtocolEvent) {
-        self.drive_fetch_admission(&pe);
+    fn handle_continuation(&mut self, shard: ShardGroupId, pe: ProtocolEvent) {
+        self.drive_fetch_admission(shard, &pe);
 
         // Serving-cache insertion is io_loop's own state, not an
         // instance concern — keep it here.
         if let ProtocolEvent::FinalizedWavesAdmitted { waves } = &pe {
             for wave in waves {
-                self.shard_caches()
+                self.shard_caches(shard)
                     .finalized_wave
                     .insert(wave.wave_id().clone(), Arc::clone(wave));
             }
@@ -173,18 +179,18 @@ where
         // advance per-shard `committed` and emit `SyncComplete` once the
         // chain catches up. Drives any newly-emitted range fetches inline.
         if let ProtocolEvent::RemoteHeaderAdmitted { committed_header } = &pe {
-            let outputs = self.shard_syncs_mut().on_remote_header_admitted(
+            let outputs = self.shard_syncs_mut(shard).on_remote_header_admitted(
                 committed_header.shard_group_id(),
                 committed_header.header().height(),
             );
-            self.process_remote_header_sync_outputs(outputs);
+            self.process_remote_header_sync_outputs(shard, outputs);
         }
 
         let _ = self.event_sender.send(NodeInput::Protocol(Box::new(pe)));
     }
 
-    fn handle_restore_committed_state(&self) {
-        let storage = self.storage();
+    fn handle_restore_committed_state(&self, shard: ShardGroupId) {
+        let storage = self.shard_storage(shard);
         let height = storage.committed_height();
         let hash = storage.committed_hash();
         let qc = storage.latest_qc();
@@ -195,6 +201,7 @@ where
 
     fn handle_emit_transaction_status(
         &mut self,
+        shard: ShardGroupId,
         tx_hash: TxHash,
         status: TransactionStatus,
         cross_shard: bool,
@@ -226,7 +233,7 @@ where
             }
             record_transaction_finalized(latency_secs, cross_shard);
         }
-        self.shard_caches()
+        self.shard_caches(shard)
             .tx_status
             .insert(tx_hash, status.clone());
         self.vnodes[0].emitted_statuses.push((tx_hash, status));
@@ -261,6 +268,7 @@ where
     /// recompute.
     fn handle_commit_block_by_qc_only(
         &mut self,
+        shard: ShardGroupId,
         block: Block,
         qc: QuorumCertificate,
         parent_state_root: StateRoot,
@@ -279,7 +287,7 @@ where
         // prepared commit orphaned in the cache, and the next block to
         // reach flush trips the strict ordering assert in
         // `commit_block_inner` because its parent was never applied.
-        if height <= self.shard_block_commit().persisted_height() {
+        if height <= self.shard_block_commit(shard).persisted_height() {
             return;
         }
 
@@ -287,7 +295,7 @@ where
         // (VerifyStateRoot/ExecuteTransactions), reuse it — recomputing JMT
         // here can produce a transient root mismatch and trip the
         // byzantine-detection assert below on a self-inflicted race.
-        if self.shard_block_commit().has_prepared(&block_hash) {
+        if self.shard_block_commit(shard).has_prepared(&block_hash) {
             debug!(
                 height = height.inner(),
                 ?block_hash,
@@ -297,7 +305,7 @@ where
             // Build view anchored at parent — includes prior synced blocks'
             // JMT snapshots so chained verification can find parent nodes.
             let view = self
-                .shard_pending_chain()
+                .shard_pending_chain(shard)
                 .view_at(block.header().parent_block_hash());
             let pending_snapshots = view.pending_snapshots().to_vec();
 
@@ -354,7 +362,7 @@ where
                 .iter()
                 .flat_map(|fw| fw.consensus_receipts())
                 .collect();
-            self.shard_pending_chain().insert(
+            self.shard_pending_chain(shard).insert(
                 block_hash,
                 ChainEntry {
                     parent_block_hash: block.header().parent_block_hash(),
@@ -364,7 +372,7 @@ where
                 },
             );
 
-            self.shard_block_commit_mut()
+            self.shard_block_commit_mut(shard)
                 .insert_prepared(block_hash, height, prepared);
 
             debug!(
@@ -379,12 +387,15 @@ where
         // RocksDB write with a single fsync. The coordinator dedups by
         // block_hash so double-emission (consensus + sync both reaching
         // commit) is safe.
-        self.accept_block_commit(PendingCommit {
-            block: Arc::new(block),
-            qc: Arc::new(qc),
-            source,
-            committed_notified: false,
-        });
+        self.accept_block_commit(
+            shard,
+            PendingCommit {
+                block: Arc::new(block),
+                qc: Arc::new(qc),
+                source,
+                committed_notified: false,
+            },
+        );
     }
 
     /// Hand a commit to the [`BlockCommitCoordinator`] and act on its
@@ -392,18 +403,18 @@ where
     /// unless persistence backpressure is active, fire `BlockCommitted`.
     ///
     /// [`BlockCommitCoordinator`]: crate::shard::block_commit::BlockCommitCoordinator
-    fn accept_block_commit(&mut self, commit: PendingCommit) {
+    fn accept_block_commit(&mut self, shard: ShardGroupId, commit: PendingCommit) {
         let now = self.vnodes[0].state.now();
-        let decision = self.shard_block_commit_mut().accumulate(commit, now);
+        let decision = self.shard_block_commit_mut(shard).accumulate(commit, now);
         match decision {
             AccumulateDecision::Skip => {}
             AccumulateDecision::Accepted { height, notify_now } => {
                 debug!(height = height.inner(), "Block committed");
                 let outputs = self
-                    .shard_syncs_mut()
+                    .shard_syncs_mut(shard)
                     .block
                     .handle(BlockSyncInput::Admitted { scope: (), height });
-                self.process_block_sync_outputs(outputs);
+                self.process_block_sync_outputs(shard, outputs);
                 if let Some((block, qc)) = notify_now {
                     let certified = CertifiedBlock::new_unchecked(
                         Arc::unwrap_or_clone(block),
@@ -415,23 +426,28 @@ where
         }
     }
 
-    pub(super) fn flush_block_commits(&mut self) {
+    pub(super) fn flush_block_commits(&mut self, shard: ShardGroupId) {
         // Clone shared handles before the `&mut self` reborrow for
-        // `shard_block_commit_mut()`. Dispatch is `Arc`-backed; cheap.
-        let storage = Arc::clone(self.shard_storage());
+        // `shard_block_commit_mut(shard)`. Dispatch is `Arc`-backed; cheap.
+        let storage = Arc::clone(self.shard_storage(shard));
         let event_sender = self.event_sender.clone();
         let dispatch = self.dispatch.clone();
-        self.shard_block_commit_mut()
+        self.shard_block_commit_mut(shard)
             .flush(&storage, &event_sender, &dispatch);
     }
 
     /// Dispatch a typed fetch request to the corresponding binding.
     ///
-    /// `Request` never emits `Send`s on its own — it only adds the ids to
-    /// the pending set; chunks fan out under the per-tick cap. Each arm
-    /// translates the variant payload into ids+peers and delegates to
-    /// `drive_fetch::<B>`. The tick timer is refreshed once at the end.
-    fn process_fetch_request(&mut self, req: FetchRequest) {
+    /// `local_shard` identifies which hosted shard's [`FetchHost`] owns
+    /// the request — it's the shard of the emitting vnode, not the
+    /// routing target. The routing target (where to send the request)
+    /// lives on the [`FetchRequest`] variant itself as a `shard` /
+    /// `source_shard` field. `Request` never emits `Send`s on its own —
+    /// it only adds the ids to the pending set; chunks fan out under
+    /// the per-tick cap. The tick timer is refreshed once at the end.
+    ///
+    /// [`FetchHost`]: crate::shard::fetch::FetchHost
+    fn process_fetch_request(&mut self, local_shard: ShardGroupId, req: FetchRequest) {
         match req {
             FetchRequest::Transactions {
                 ids,
@@ -439,12 +455,15 @@ where
                 preferred,
                 origin,
             } => {
-                self.drive_fetch::<TransactionBinding>(FetchInput::Request {
-                    ids,
-                    shard,
-                    preferred,
-                    origin,
-                });
+                self.drive_fetch::<TransactionBinding>(
+                    local_shard,
+                    FetchInput::Request {
+                        ids,
+                        shard,
+                        preferred,
+                        origin,
+                    },
+                );
             }
             FetchRequest::LocalProvisions {
                 ids,
@@ -452,12 +471,15 @@ where
                 preferred,
                 origin,
             } => {
-                self.drive_fetch::<LocalProvisionBinding>(FetchInput::Request {
-                    ids,
-                    shard,
-                    preferred,
-                    origin,
-                });
+                self.drive_fetch::<LocalProvisionBinding>(
+                    local_shard,
+                    FetchInput::Request {
+                        ids,
+                        shard,
+                        preferred,
+                        origin,
+                    },
+                );
             }
             FetchRequest::FinalizedWaves {
                 ids,
@@ -465,12 +487,15 @@ where
                 preferred,
                 origin,
             } => {
-                self.drive_fetch::<FinalizedWaveBinding>(FetchInput::Request {
-                    ids,
-                    shard,
-                    preferred,
-                    origin,
-                });
+                self.drive_fetch::<FinalizedWaveBinding>(
+                    local_shard,
+                    FetchInput::Request {
+                        ids,
+                        shard,
+                        preferred,
+                        origin,
+                    },
+                );
             }
             FetchRequest::RemoteProvisions {
                 source_shard,
@@ -478,13 +503,15 @@ where
                 preferred,
                 origin,
             } => {
-                let target_shard = self.topology_snapshot.load().local_shard();
-                self.drive_fetch::<ProvisionBinding>(FetchInput::Request {
-                    ids: vec![(source_shard, target_shard, block_height)],
-                    shard: source_shard,
-                    preferred,
-                    origin,
-                });
+                self.drive_fetch::<ProvisionBinding>(
+                    local_shard,
+                    FetchInput::Request {
+                        ids: vec![(source_shard, local_shard, block_height)],
+                        shard: source_shard,
+                        preferred,
+                        origin,
+                    },
+                );
             }
             FetchRequest::ExecutionCerts {
                 wave_id,
@@ -492,44 +519,54 @@ where
                 origin,
             } => {
                 let source_shard = wave_id.shard_group_id();
-                self.drive_fetch::<ExecCertBinding>(FetchInput::Request {
-                    ids: vec![wave_id],
-                    shard: source_shard,
-                    preferred,
-                    origin,
-                });
+                self.drive_fetch::<ExecCertBinding>(
+                    local_shard,
+                    FetchInput::Request {
+                        ids: vec![wave_id],
+                        shard: source_shard,
+                        preferred,
+                        origin,
+                    },
+                );
             }
         }
 
-        self.update_fetch_tick_timer();
+        self.update_fetch_tick_timer(local_shard);
     }
 
     /// Dispatch a typed fetch-abandon to the corresponding binding.
     ///
-    /// Symmetric to [`Self::process_fetch_request`] — translates the
-    /// variant payload into ids and feeds them through `FetchInput::Abandoned`,
-    /// which removes them from the binding's pending set and increments
-    /// `record_fetch_abandoned` so the cancellation is observable separately
-    /// from genuine admissions. Refreshes the tick timer once at the end
-    /// (the pending set may now be empty).
+    /// `local_shard` selects which hosted shard's [`FetchHost`] to
+    /// notify — the abandoning vnode's shard, not the routing target
+    /// of the original request. Symmetric to
+    /// [`Self::process_fetch_request`] — translates the variant payload
+    /// into ids and feeds them through `FetchInput::Abandoned`, which
+    /// removes them from the binding's pending set and increments
+    /// `record_fetch_abandoned` so the cancellation is observable
+    /// separately from genuine admissions. Refreshes the tick timer
+    /// once at the end (the pending set may now be empty).
+    ///
+    /// [`FetchHost`]: crate::shard::fetch::FetchHost
     #[allow(clippy::needless_pass_by_value)] // mirrors process_fetch_request; future variants carry Vec ids
-    fn process_fetch_abandon(&mut self, req: FetchAbandon) {
+    fn process_fetch_abandon(&mut self, local_shard: ShardGroupId, req: FetchAbandon) {
         match req {
             FetchAbandon::Transactions { ids } => {
-                self.drive_fetch::<TransactionBinding>(FetchInput::Abandoned { ids });
+                self.drive_fetch::<TransactionBinding>(local_shard, FetchInput::Abandoned { ids });
             }
             FetchAbandon::RemoteProvisions {
                 source_shard,
                 block_height,
             } => {
-                let target_shard = self.topology_snapshot.load().local_shard();
-                self.drive_fetch::<ProvisionBinding>(FetchInput::Abandoned {
-                    ids: vec![(source_shard, target_shard, block_height)],
-                });
+                self.drive_fetch::<ProvisionBinding>(
+                    local_shard,
+                    FetchInput::Abandoned {
+                        ids: vec![(source_shard, local_shard, block_height)],
+                    },
+                );
             }
         }
 
-        self.update_fetch_tick_timer();
+        self.update_fetch_tick_timer(local_shard);
     }
 
     // ─── Delegated Work ─────────────────────────────────────────────────
@@ -546,6 +583,7 @@ where
             .expect("dispatch_delegated_action called for delegated actions only");
 
         let handles = Arc::clone(&self.dispatch_handles);
+        let shard = self.vnodes[vnode_idx].shard;
         // Per-vnode snapshot so the handler's `local_validator_id`
         // matches the signing key used.
         let topology_snapshot = Arc::clone(self.vnodes[vnode_idx].state.topology_arc());
@@ -556,9 +594,15 @@ where
             let notify = move |event: NodeInput| {
                 let _ = event_tx.send(event);
             };
-            // `commit_prepared` is a `move` closure; it can't borrow from
-            // `handles` (which the outer `ActionContext` borrows below).
-            let handles_for_commit = Arc::clone(&handles);
+            let shard_handles = handles
+                .per_shard
+                .get(&shard)
+                .expect("hosted shard derived from vnode");
+            // `commit_prepared` is a `move` closure; capture per-shard Arcs
+            // rather than borrowing `handles` (which the outer
+            // `ActionContext` borrows below).
+            let pending_chain_for_commit = Arc::clone(&shard_handles.pending_chain);
+            let prepared_commits_for_commit = Arc::clone(&shard_handles.prepared_commits);
             let commit_prepared = move |prep: PreparedBlock<S::PreparedCommit>| {
                 let PreparedBlock {
                     block_hash,
@@ -568,7 +612,7 @@ where
                     receipts,
                 } = prep;
                 let jmt_snapshot = Arc::new(S::jmt_snapshot(&prepared).clone());
-                handles_for_commit.pending_chain.insert(
+                pending_chain_for_commit.insert(
                     block_hash,
                     ChainEntry {
                         parent_block_hash,
@@ -577,8 +621,7 @@ where
                         jmt_snapshot,
                     },
                 );
-                handles_for_commit
-                    .prepared_commits
+                prepared_commits_for_commit
                     .lock()
                     .unwrap()
                     .insert(block_hash, (block_height, prepared));
@@ -586,7 +629,7 @@ where
             let ctx = ActionContext {
                 executor: &handles.executor,
                 topology_snapshot: &topology_snapshot,
-                pending_chain: &handles.pending_chain,
+                pending_chain: &shard_handles.pending_chain,
                 network: &handles.network,
                 signing_key: &signing_key,
                 notify: &notify,

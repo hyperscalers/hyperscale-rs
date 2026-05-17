@@ -166,10 +166,12 @@ pub struct VnodeConfig {
 /// is called.
 ///
 /// Required fields (taken at construction):
-/// - `vnodes` - One [`VnodeConfig`] per hosted validator. All entries must
-///   target the same shard (same-shard hosting only at this phase).
+/// - `vnodes` - One [`VnodeConfig`] per hosted validator. Vnodes may
+///   target different shards; the host derives its `local_shards` set
+///   from the supplied vnodes.
 /// - `bft_config` - Consensus configuration parameters
-/// - `storage` - `RocksDB` storage for persistence and crash recovery
+/// - `storages` - One `RocksDB` storage per hosted shard. Every shard
+///   referenced by a vnode must have a matching entry.
 /// - `network` - libp2p configuration for peer-to-peer communication
 ///
 /// Optional fields:
@@ -178,7 +180,7 @@ pub struct VnodeConfig {
 pub struct ProductionRunnerBuilder {
     vnodes: Vec<VnodeConfig>,
     bft_config: BftConfig,
-    storage: Arc<RocksDbStorage>,
+    storages: HashMap<ShardGroupId, Arc<RocksDbStorage>>,
     network_config: Libp2pConfig,
     dispatch: Option<Arc<PooledDispatch>>,
     channel_capacity: usize,
@@ -207,7 +209,7 @@ impl ProductionRunnerBuilder {
     pub fn new(
         vnodes: Vec<VnodeConfig>,
         bft_config: BftConfig,
-        storage: Arc<RocksDbStorage>,
+        storages: HashMap<ShardGroupId, Arc<RocksDbStorage>>,
         network_config: Libp2pConfig,
     ) -> Self {
         assert!(
@@ -217,7 +219,7 @@ impl ProductionRunnerBuilder {
         Self {
             vnodes,
             bft_config,
-            storage,
+            storages,
             network_config,
             dispatch: None,
             channel_capacity: 10_000,
@@ -314,7 +316,7 @@ impl ProductionRunnerBuilder {
 
         let vnode_configs = self.vnodes;
         let bft_config = self.bft_config;
-        let storage = self.storage;
+        let storages = self.storages;
         let network_config = self.network_config;
         let dispatch = match self.dispatch {
             Some(pools) => pools,
@@ -326,25 +328,31 @@ impl ProductionRunnerBuilder {
 
         let ed25519_keypair = generate_random_keypair();
 
-        // Same-shard hosting only: every hosted vnode must agree on
-        // `local_shard`. Cross-shard hosting lifts this in a later phase.
-        let local_shard = vnode_configs[0].topology.snapshot().local_shard();
-        for cfg in &vnode_configs {
-            assert_eq!(
-                cfg.topology.snapshot().local_shard(),
-                local_shard,
-                "all hosted vnodes must share one shard (got {:?} and {:?})",
-                local_shard,
-                cfg.topology.snapshot().local_shard(),
+        // Derive the hosted shard set from the vnodes; every shard
+        // referenced by a vnode must have a matching storage entry.
+        let local_shards: HashSet<ShardGroupId> = vnode_configs
+            .iter()
+            .map(|cfg| cfg.topology.snapshot().local_shard())
+            .collect();
+        for shard in &local_shards {
+            assert!(
+                storages.contains_key(shard),
+                "ProductionRunnerBuilder: missing storage for hosted shard {shard:?}"
             );
         }
+        // The runner needs a single representative shard for status,
+        // metrics, and genesis bookkeeping until those become per-shard
+        // surfaces.
+        let primary_shard = vnode_configs[0].topology.snapshot().local_shard();
+        let primary_storage = Arc::clone(
+            storages
+                .get(&primary_shard)
+                .expect("primary shard checked above"),
+        );
 
         // The shared snapshot drives off-thread handlers that read
-        // shard-level info only — `local_validator_id` on the snapshot
-        // doesn't propagate to per-vnode signing paths, which carry their
-        // own signing keys via `ActionContext`. The first vnode's snapshot
-        // is a representative; same-shard equivalence guarantees the
-        // shard-level fields agree.
+        // shard-level info only. We seed it with the first vnode's
+        // snapshot; per-vnode snapshots are taken inside dispatch.
         let topology: SharedTopologySnapshot = Arc::new(ArcSwap::from(Arc::clone(
             vnode_configs[0].topology.snapshot(),
         )));
@@ -381,7 +389,10 @@ impl ProductionRunnerBuilder {
         let (xb_shutdown_tx, xb_shutdown_rx) = unbounded();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
-        let recovered = storage.load_recovered_state();
+        // Recovery state is read from the primary shard's storage; this
+        // matches the prior single-shard semantics. Real multi-shard
+        // hosting needs per-shard recovery state — a Phase 2c follow-up.
+        let recovered = primary_storage.load_recovered_state();
         let provision_store = Arc::new(ProvisionStore::new());
 
         let vnode_inits: Vec<VnodeInit> = vnode_configs
@@ -408,7 +419,13 @@ impl ProductionRunnerBuilder {
             })
             .collect();
 
-        let shared_storage = SharedStorage::new(Arc::clone(&storage));
+        // Wrap each per-shard `RocksDbStorage` in a `SharedStorage` for
+        // the io-loop's `HashMap<ShardGroupId, S>` argument; the runner
+        // keeps the bare `Arc<RocksDbStorage>`s alive for GC + metrics.
+        let shared_storages: HashMap<ShardGroupId, SharedStorage> = storages
+            .iter()
+            .map(|(shard, st)| (*shard, SharedStorage::new(Arc::clone(st))))
+            .collect();
         let network_definition = self
             .network_definition
             .unwrap_or_else(NetworkDefinition::simulator);
@@ -420,7 +437,7 @@ impl ProductionRunnerBuilder {
         } = build_network_stack(NetworkBuildArgs {
             network_config,
             ed25519_keypair,
-            local_shards: HashSet::from([local_shard]),
+            local_shards: local_shards.clone(),
             bind_vnodes,
             initial_validator_keys,
             topology: topology.clone(),
@@ -430,7 +447,7 @@ impl ProductionRunnerBuilder {
 
         let io_loop = IoLoop::new(
             vnode_inits,
-            shared_storage,
+            shared_storages,
             executor,
             libp2p_network,
             (*dispatch).clone(),
@@ -440,7 +457,15 @@ impl ProductionRunnerBuilder {
             tx_validator,
         );
 
-        let tx_status_cache = Arc::clone(io_loop.tx_status_cache());
+        // The status RPC surface assumes a single primary cache; surface
+        // the primary shard's status cache. Multi-shard hosting will
+        // need a per-shard RPC tier — Phase 2c.
+        let tx_status_caches = io_loop.tx_status_caches();
+        let tx_status_cache = Arc::clone(
+            tx_status_caches
+                .get(&primary_shard)
+                .expect("primary shard hosted by IoLoop"),
+        );
 
         Ok(ProductionRunner {
             io_loop: Some(io_loop),
@@ -454,13 +479,15 @@ impl ProductionRunnerBuilder {
             xb_shutdown_rx: Some(xb_shutdown_rx),
             network: adapter,
             topology_snapshot: topology,
-            storage,
+            storages,
+            primary_storage,
             dispatch,
             rpc_status: self.rpc_status,
             mempool_snapshot: self.mempool_snapshot,
             sync_status: self.sync_status,
             genesis_config: self.genesis_config,
-            local_shard,
+            primary_shard,
+            local_shards,
             tx_status_cache,
             shutdown_rx: Some(shutdown_rx),
             shutdown_tx: Some(shutdown_tx),
@@ -507,13 +534,21 @@ pub struct ProductionRunner {
     network: Arc<Libp2pAdapter>,
     /// Network topology snapshot (lock-free `ArcSwap`, updated on topology changes).
     topology_snapshot: SharedTopologySnapshot,
-    /// `RocksDB` storage (for `InboundRouter` and genesis).
+    /// One `RocksDB` storage per hosted shard. The runner keeps these
+    /// alive for periodic JMT GC and storage-memory metrics.
     #[allow(dead_code)]
-    storage: Arc<RocksDbStorage>,
+    storages: HashMap<ShardGroupId, Arc<RocksDbStorage>>,
+    /// Primary storage handle (`storages[primary_shard]`) used by
+    /// single-storage code paths (genesis bookkeeping, JMT GC, storage
+    /// memory metrics) until those become per-shard.
+    primary_storage: Arc<RocksDbStorage>,
     /// Thread pool dispatch.
     dispatch: Arc<PooledDispatch>,
-    /// Local shard for network broadcasts.
-    local_shard: ShardGroupId,
+    /// Primary shard for status / RPC / single-storage operations.
+    primary_shard: ShardGroupId,
+    /// Every shard this runner hosts vnodes for.
+    #[allow(dead_code)]
+    local_shards: HashSet<ShardGroupId>,
 
     /// Shared RPC `NodeStatusState` updated by the metrics tick.
     rpc_status: Option<Arc<ArcSwap<NodeStatusState>>>,
@@ -543,10 +578,10 @@ impl ProductionRunner {
     pub fn builder(
         vnodes: Vec<VnodeConfig>,
         bft_config: BftConfig,
-        storage: Arc<RocksDbStorage>,
+        storages: HashMap<ShardGroupId, Arc<RocksDbStorage>>,
         network_config: Libp2pConfig,
     ) -> ProductionRunnerBuilder {
-        ProductionRunnerBuilder::new(vnodes, bft_config, storage, network_config)
+        ProductionRunnerBuilder::new(vnodes, bft_config, storages, network_config)
     }
 
     /// Get a reference to the dispatch implementation.
@@ -561,10 +596,12 @@ impl ProductionRunner {
         &self.network
     }
 
-    /// Get the local shard ID.
+    /// Get the runner's primary shard ID — the shard whose status,
+    /// metrics, and genesis bookkeeping the runner surfaces to its
+    /// callers.
     #[must_use]
-    pub const fn local_shard(&self) -> ShardGroupId {
-        self.local_shard
+    pub const fn primary_shard(&self) -> ShardGroupId {
+        self.primary_shard
     }
 
     /// Get the transaction status cache shared from `IoLoop`.
@@ -623,102 +660,101 @@ impl ProductionRunner {
             .as_mut()
             .expect("io_loop must exist for genesis");
 
-        // Check if we already have committed blocks
-        let height = io_loop.storage().committed_height();
-        let has_blocks = height > BlockHeight::GENESIS;
+        // Multi-shard genesis: run the genesis ceremony for every
+        // hosted shard. Each shard has its own RocksDB store, its own
+        // committed height, and its own genesis block.
+        let mut timer_ops = Vec::new();
+        let local_shards: Vec<ShardGroupId> = io_loop.hosted_shards().collect();
+        let topology = Arc::clone(&self.topology_snapshot);
+        // Shared genesis config across hosted shards. Real multi-shard
+        // deployments will likely want per-shard genesis; that's a Phase
+        // 2c follow-up. The current `GenesisConfig::production` default
+        // is shared, so a single `take()` is fine.
+        let mut shared_genesis_config: Option<GenesisConfig> = self.genesis_config.take();
+        for shard in local_shards {
+            let height = io_loop.shard_storage(shard).committed_height();
+            if height > BlockHeight::GENESIS {
+                info!(
+                    shard = ?shard,
+                    "Existing blocks found, skipping genesis initialization for shard"
+                );
+                continue;
+            }
+            info!(shard = ?shard, "No committed blocks - initializing genesis for shard");
 
-        if has_blocks {
-            info!("Existing blocks found, skipping genesis initialization");
-            // Resume path: state machine already has recovered state.
-            io_loop.register_inbound_handlers();
-            return Vec::new();
+            let genesis_config = shared_genesis_config
+                .take()
+                .unwrap_or_else(GenesisConfig::production);
+            info!(
+                shard = ?shard,
+                xrd_balances = genesis_config.xrd_balances.len(),
+                "Running genesis"
+            );
+            let genesis_jmt_root = io_loop.install_engine_genesis(shard, &genesis_config);
+
+            info!(
+                shard = ?shard,
+                genesis_jmt_root = ?genesis_jmt_root,
+                "JMT state after genesis bootstrap"
+            );
+
+            let first_validator = topology
+                .load()
+                .committee_for_shard(shard)
+                .first()
+                .copied()
+                .unwrap_or(ValidatorId::new(0));
+
+            let genesis_block = Block::genesis(shard, first_validator, genesis_jmt_root);
+
+            let genesis_hash = genesis_block.hash();
+            info!(
+                shard = ?shard,
+                genesis_hash = ?genesis_hash,
+                proposer = ?first_validator,
+                "Created genesis block"
+            );
+
+            io_loop.initialize_all_vnodes_genesis(&genesis_block);
+            io_loop.flush_all_batches();
+
+            let genesis_output = io_loop.drain_pending_output();
+            timer_ops.extend(genesis_output.timer_ops);
+
+            // Sync the state machine with the JMT state genesis just
+            // installed — vnodes were created with zero state.
+            let genesis_qc = {
+                let __qc = QuorumCertificate::genesis(shard);
+                QuorumCertificate::new(
+                    genesis_block.hash(),
+                    __qc.shard_group_id(),
+                    __qc.height(),
+                    __qc.parent_block_hash(),
+                    __qc.round(),
+                    __qc.signers().clone(),
+                    __qc.aggregated_signature(),
+                    __qc.weighted_timestamp(),
+                )
+            };
+            let genesis_certified = CertifiedBlock::new_unchecked(genesis_block, genesis_qc);
+            let genesis_commit_output = io_loop.step(NodeInput::Protocol(Box::new(
+                ProtocolEvent::BlockCommitted {
+                    certified: genesis_certified,
+                },
+            )));
+
+            info!(
+                shard = ?shard,
+                genesis_jmt_root = ?genesis_jmt_root,
+                actions = genesis_commit_output.actions_generated,
+                "Updated state machine with genesis JMT state"
+            );
+
+            timer_ops.extend(genesis_commit_output.timer_ops);
+            io_loop.flush_all_batches();
         }
 
-        info!(
-            shard = ?self.local_shard,
-            "No committed blocks - initializing genesis"
-        );
-
-        let genesis_config = self
-            .genesis_config
-            .take()
-            .unwrap_or_else(GenesisConfig::production);
-        info!(
-            xrd_balances = genesis_config.xrd_balances.len(),
-            "Running genesis"
-        );
-        let genesis_jmt_root = io_loop.install_engine_genesis(&genesis_config);
-
-        info!(
-            genesis_jmt_root = ?genesis_jmt_root,
-            "JMT state after genesis bootstrap"
-        );
-
-        // Create genesis block.
-        let first_validator = self
-            .topology_snapshot
-            .load()
-            .committee_for_shard(self.local_shard)
-            .first()
-            .copied()
-            .unwrap_or(ValidatorId::new(0));
-
-        let genesis_block = Block::genesis(self.local_shard, first_validator, genesis_jmt_root);
-
-        let genesis_hash = genesis_block.hash();
-        info!(
-            genesis_hash = ?genesis_hash,
-            proposer = ?first_validator,
-            "Created genesis block"
-        );
-
-        // Initialize state machine with genesis (this sets up proposal timer).
-        io_loop.initialize_all_vnodes_genesis(&genesis_block);
-        io_loop.flush_all_batches();
-
-        // Drain timer ops from genesis actions (includes ViewChange timer).
-        let genesis_output = io_loop.drain_pending_output();
-        let mut timer_ops = genesis_output.timer_ops;
-
-        // CRITICAL: Update state machine with the genesis JMT state.
-        // The state machine was created BEFORE genesis bootstrap ran, so it has
-        // stale/zero state. We need to sync it with the actual JMT state from
-        // genesis so future blocks compute state_root from the correct base.
-        let genesis_qc = {
-            let __qc = QuorumCertificate::genesis(self.local_shard);
-            QuorumCertificate::new(
-                genesis_block.hash(),
-                __qc.shard_group_id(),
-                __qc.height(),
-                __qc.parent_block_hash(),
-                __qc.round(),
-                __qc.signers().clone(),
-                __qc.aggregated_signature(),
-                __qc.weighted_timestamp(),
-            )
-        };
-        let genesis_certified = CertifiedBlock::new_unchecked(genesis_block, genesis_qc);
-        let genesis_commit_output = io_loop.step(NodeInput::Protocol(Box::new(
-            ProtocolEvent::BlockCommitted {
-                certified: genesis_certified,
-            },
-        )));
-
-        info!(
-            genesis_jmt_root = ?genesis_jmt_root,
-            actions = genesis_commit_output.actions_generated,
-            "Updated state machine with genesis JMT state"
-        );
-
-        // Collect any additional timer ops from the commit step.
-        timer_ops.extend(genesis_commit_output.timer_ops);
-
-        // Flush any batches from the genesis commit step.
-        io_loop.flush_all_batches();
-
-        // Genesis path: state machine is in sync with the JMT root.
         io_loop.register_inbound_handlers();
-
         timer_ops
     }
 
@@ -746,7 +782,7 @@ impl ProductionRunner {
     pub async fn run(mut self) -> Result<(), RunnerError> {
         let config = self.dispatch.config();
         info!(
-            shard = ?self.local_shard,
+            shards = ?self.local_shards,
             crypto_threads = config.crypto_threads,
             execution_threads = config.execution_threads,
             pin_cores = config.pin_cores,
@@ -782,6 +818,7 @@ impl ProductionRunner {
             rpc_status: self.rpc_status.clone(),
             sync_status: self.sync_status.clone(),
             mempool_snapshot: self.mempool_snapshot.clone(),
+            primary_storage: Arc::clone(&self.primary_storage),
         };
 
         // ── 3. Spawn pinned thread ───────────────────────────────────────
@@ -935,6 +972,10 @@ struct PinnedLoopConfig {
     rpc_status: Option<Arc<ArcSwap<NodeStatusState>>>,
     sync_status: Option<Arc<ArcSwap<SyncStatus>>>,
     mempool_snapshot: Option<Arc<ArcSwap<MempoolSnapshot>>>,
+    /// Primary `RocksDbStorage` used by the pinned loop's periodic
+    /// metrics dispatch and JMT GC. Currently a single handle until
+    /// per-shard metrics / GC fanout lands.
+    primary_storage: Arc<RocksDbStorage>,
 }
 
 /// Manages tokio-based timers for the production pinned event loop.
@@ -1145,7 +1186,7 @@ fn run_pinned_loop(mut io_loop: ProdIoLoop, mut config: PinnedLoopConfig) {
                 tx_request: 0,
                 cert_request: 0,
             };
-            let storage = io_loop.storage().clone();
+            let storage = Arc::clone(&config.primary_storage);
             config.tokio_handle.spawn_blocking(move || {
                 record_metrics(snapshot, &*storage);
                 set_channel_depths(&channel_depths);
@@ -1161,7 +1202,7 @@ fn run_pinned_loop(mut io_loop: ProdIoLoop, mut config: PinnedLoopConfig) {
         {
             last_gc = Instant::now();
             gc_in_flight.store(true, std::sync::atomic::Ordering::Relaxed);
-            let storage = io_loop.storage().clone();
+            let storage = Arc::clone(&config.primary_storage);
             let gc_flag = gc_in_flight.clone();
             config.tokio_handle.spawn_blocking(move || {
                 let deleted = storage.run_jmt_gc();

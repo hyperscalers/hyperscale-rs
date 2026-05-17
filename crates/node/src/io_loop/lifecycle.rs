@@ -18,7 +18,7 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{Engine, GenesisConfig, prepared_genesis};
 use hyperscale_network::Network;
 use hyperscale_storage::{GenesisCommit, Storage};
-use hyperscale_types::{Block, StateRoot};
+use hyperscale_types::{Block, ShardGroupId, StateRoot};
 
 use crate::io_loop::IoLoop;
 
@@ -36,16 +36,26 @@ where
     /// [`Self::initialize_all_vnodes_genesis`] which does both steps
     /// for every hosted vnode.
     pub fn handle_actions(&mut self, vnode_idx: usize, actions: Vec<Action>) {
+        let shard = self.vnodes[vnode_idx].shard;
         for action in actions {
             self.process_action(vnode_idx, action);
         }
-        self.flush_block_commits();
+        self.flush_block_commits(shard);
     }
 
     /// Initialize every hosted vnode's state machine with `genesis_block`
     /// and dispatch the resulting actions per-vnode.
+    ///
+    /// Callers hosting vnodes across multiple shards drive this once per
+    /// shard with the shard-appropriate genesis block; this method
+    /// initializes the vnodes whose `local_shard()` matches
+    /// `genesis_block`'s shard, leaving the others untouched.
     pub fn initialize_all_vnodes_genesis(&mut self, genesis_block: &Block) {
+        let target_shard = genesis_block.header().shard_group_id();
         for vnode_idx in 0..self.vnodes_len() {
+            if self.vnodes[vnode_idx].shard != target_shard {
+                continue;
+            }
             let actions = self
                 .vnode_state_mut(vnode_idx)
                 .initialize_genesis(genesis_block);
@@ -53,7 +63,7 @@ where
         }
     }
 
-    /// Install engine genesis on this node's storage.
+    /// Install engine genesis on `shard`'s storage.
     ///
     /// Builds (or reuses) the cached merged [`hyperscale_storage::DatabaseUpdates`]
     /// for `(network, config)`, commits substates, and computes the JMT root
@@ -62,12 +72,16 @@ where
     /// Independent of network-handler registration — runners call
     /// [`Self::register_inbound_handlers`] once their genesis-or-resume
     /// decision is settled.
-    pub fn install_engine_genesis(&mut self, config: &GenesisConfig) -> StateRoot
+    pub fn install_engine_genesis(
+        &mut self,
+        shard: ShardGroupId,
+        config: &GenesisConfig,
+    ) -> StateRoot
     where
         S: GenesisCommit,
     {
         let merged = prepared_genesis(self.executor.network(), config);
-        self.storage().install_genesis(&merged)
+        self.shard_storage(shard).install_genesis(&merged)
     }
 
     /// Register inbound network handlers (requests, gossip, notifications).

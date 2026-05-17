@@ -1179,13 +1179,14 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
 
     // The runner is built before the RPC server because it owns the crossbeam
     // event channel the RPC server submits transactions through.
+    let local_shard = ShardGroupId::new(config.node.shard);
     let mut runner_builder = ProductionRunner::builder(
         vec![VnodeConfig {
             topology,
             signing_key: signing_keypair,
         }],
         bft_config,
-        storage,
+        std::collections::HashMap::from([(local_shard, storage)]),
         network_config,
     )
     .dispatch(dispatch)
