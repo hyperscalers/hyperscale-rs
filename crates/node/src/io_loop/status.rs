@@ -49,8 +49,9 @@ where
     /// Capture a snapshot of node state for external status APIs.
     #[must_use]
     pub fn status_snapshot(&self) -> NodeStatusSnapshot {
-        let state_root = self.state.last_committed_jmt_root();
-        let mempool = self.state.mempool();
+        let state = &self.vnodes[0].state;
+        let state_root = state.last_committed_jmt_root();
+        let mempool = state.mempool();
         let contention = mempool.lock_contention_stats();
 
         // u64-counter → usize and 80% threshold → u32 are status-readout casts
@@ -64,8 +65,8 @@ where
         );
 
         NodeStatusSnapshot {
-            committed_height: self.state.bft().committed_height(),
-            view: self.state.bft().view().inner(),
+            committed_height: state.bft().committed_height(),
+            view: state.bft().view().inner(),
             state_root,
             block_sync: self.syncs.block.block_sync_status(),
             mempool_pending: pending,
@@ -73,7 +74,7 @@ where
             mempool_total: mempool.len(),
             accepting_rpc_transactions: !mempool.at_in_flight_limit(),
             at_pending_limit: mempool.at_pending_limit(),
-            remote_shard_in_flight: self.state.remote_headers().remote_shard_in_flight(),
+            remote_shard_in_flight: state.remote_headers().remote_shard_in_flight(),
             remote_congestion_threshold,
         }
     }

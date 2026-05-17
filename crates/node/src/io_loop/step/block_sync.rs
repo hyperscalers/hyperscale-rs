@@ -240,7 +240,7 @@ where
     fn build_sync_inventory(&self) -> Inventory {
         Inventory {
             tx_have: self.caches.tx_store.tx_bloom_snapshot(),
-            cert_have: self.state.execution().cert_bloom_snapshot(),
+            cert_have: self.vnodes[0].state.execution().cert_bloom_snapshot(),
             provision_have: self.caches.provision_store.provision_bloom_snapshot(),
         }
     }
@@ -250,8 +250,9 @@ where
         &self,
         elided: &ElidedCertifiedBlock,
     ) -> Result<CertifiedBlock, RehydrateError> {
-        let mempool = self.state.mempool();
-        let execution = self.state.execution();
+        let state = &self.vnodes[0].state;
+        let mempool = state.mempool();
+        let execution = state.execution();
         let provision_store = &self.caches.provision_store;
         elided.try_rehydrate(
             |h| mempool.get_transaction(h),
