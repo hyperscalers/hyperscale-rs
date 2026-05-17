@@ -480,10 +480,11 @@ where
     ///    production receives these via its crossbeam channel receivers)
     #[allow(clippy::too_many_lines)] // single dispatch over NodeInput; one arm per event variant
     pub fn step(&mut self, event: NodeInput) -> StepOutput {
-        let vnode = &mut self.vnodes[0];
-        vnode.emitted_statuses.clear();
-        vnode.actions_generated = 0;
-        vnode.pending_timer_ops.clear();
+        for vnode in &mut self.vnodes {
+            vnode.emitted_statuses.clear();
+            vnode.actions_generated = 0;
+            vnode.pending_timer_ops.clear();
+        }
 
         match event {
             // ── Transaction validation pipeline ────────────────────────
@@ -587,15 +588,24 @@ where
         self.drain_pending_output()
     }
 
-    /// Drain accumulated outputs (statuses, timer ops) without processing an event.
+    /// Drain accumulated outputs (statuses, timer ops) across every
+    /// vnode without processing an event.
     ///
-    /// Used after `handle_actions()` to collect outputs produced by those actions.
+    /// Used after `handle_actions()` to collect outputs produced by
+    /// those actions.
     pub fn drain_pending_output(&mut self) -> StepOutput {
-        let vnode = &mut self.vnodes[0];
+        let mut emitted_statuses = Vec::new();
+        let mut timer_ops = Vec::new();
+        let mut actions_generated = 0usize;
+        for vnode in &mut self.vnodes {
+            emitted_statuses.append(&mut vnode.emitted_statuses);
+            timer_ops.append(&mut vnode.pending_timer_ops);
+            actions_generated += vnode.actions_generated;
+        }
         StepOutput {
-            emitted_statuses: std::mem::take(&mut vnode.emitted_statuses),
-            actions_generated: vnode.actions_generated,
-            timer_ops: std::mem::take(&mut vnode.pending_timer_ops),
+            emitted_statuses,
+            actions_generated,
+            timer_ops,
         }
     }
 
