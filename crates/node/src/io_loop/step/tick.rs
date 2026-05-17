@@ -42,8 +42,7 @@ where
             self.drive_fetch::<FinalizedWaveBinding>(shard, FetchInput::Tick);
             self.drive_fetch::<ProvisionBinding>(shard, FetchInput::Tick);
             self.drive_fetch::<ExecCertBinding>(shard, FetchInput::Tick);
-
-            self.update_fetch_tick_timer(shard);
         }
+        self.update_fetch_tick_timer();
     }
 }

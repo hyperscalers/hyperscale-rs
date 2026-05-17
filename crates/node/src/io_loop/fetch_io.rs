@@ -170,14 +170,17 @@ where
         }
     }
 
-    /// Refresh the `FetchTick` timer based on `local_shard`'s pending
-    /// fetches and sync state. Each hosted shard refreshes its own
-    /// timer; the timer fires once globally and the tick handler fans
-    /// out across hosted shards.
-    pub(in crate::io_loop) fn update_fetch_tick_timer(&mut self, local_shard: ShardGroupId) {
-        let op = if self.shard_fetches(local_shard).has_any_pending()
-            || self.shard_syncs_mut(local_shard).has_any_pending()
-        {
+    /// Refresh the global `FetchTick` timer based on whether any hosted
+    /// shard has pending fetches or in-progress sync. The timer is
+    /// process-scoped — it fires once and the tick handler fans out
+    /// across every hosted shard — so the Set/Cancel decision must look
+    /// at the union, not a single shard.
+    pub(in crate::io_loop) fn update_fetch_tick_timer(&mut self) {
+        let any_pending = self
+            .shards
+            .values_mut()
+            .any(|sio| sio.fetches.has_any_pending() || sio.syncs.has_any_pending());
+        let op = if any_pending {
             TimerOp::Set {
                 id: TimerId::FetchTick,
                 duration: Self::FETCH_TICK_INTERVAL,
@@ -187,6 +190,6 @@ where
                 id: TimerId::FetchTick,
             }
         };
-        self.vnodes[0].pending_timer_ops.push(op);
+        self.pending_timer_ops.push(op);
     }
 }

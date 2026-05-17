@@ -548,7 +548,7 @@ where
             }
         }
 
-        self.update_fetch_tick_timer(local_shard);
+        self.update_fetch_tick_timer();
     }
 
     /// Dispatch a typed fetch-abandon to the corresponding binding.
@@ -583,7 +583,7 @@ where
             }
         }
 
-        self.update_fetch_tick_timer(local_shard);
+        self.update_fetch_tick_timer();
     }
 
     // ─── Delegated Work ─────────────────────────────────────────────────

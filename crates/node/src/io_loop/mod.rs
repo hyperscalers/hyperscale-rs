@@ -224,6 +224,13 @@ where
     /// from `EmitTransactionStatus` and `RecordTxEcCreated` actions; entries
     /// are dropped on terminal status.
     tx_phase_times: TxPhaseTimesCache,
+
+    /// Process-scoped timer operations buffered for the runner. Used by
+    /// timers whose lifetime is the host's, not a specific vnode's — chiefly
+    /// `TimerId::FetchTick`, which fires once globally and fans out across
+    /// every hosted shard's fetch/sync state. Drained alongside the per-vnode
+    /// buffers in [`Self::drain_pending_output`].
+    pending_timer_ops: Vec<TimerOp>,
 }
 
 impl<S, N, D, E> IoLoop<S, N, D, E>
@@ -359,6 +366,7 @@ where
             tx_validator,
             last_slow_tx_warn: LocalTimestamp::ZERO,
             tx_phase_times: TxPhaseTimesCache::default(),
+            pending_timer_ops: Vec::new(),
         }
     }
 
@@ -532,6 +540,7 @@ where
             vnode.actions_generated = 0;
             vnode.pending_timer_ops.clear();
         }
+        self.pending_timer_ops.clear();
 
         // Inbound-callback events (`*FetchFailed`, sync responses,
         // validation results, gossip arrivals) don't yet carry the
@@ -614,7 +623,7 @@ where
                     primary_shard,
                     FetchInput::Failed { ids: hashes },
                 );
-                self.update_fetch_tick_timer(primary_shard);
+                self.update_fetch_tick_timer();
             }
 
             NodeInput::FetchTick => self.handle_fetch_tick(),
@@ -629,7 +638,7 @@ where
                         ids: vec![(source_shard, primary_shard, block_height)],
                     },
                 );
-                self.update_fetch_tick_timer(primary_shard);
+                self.update_fetch_tick_timer();
             }
 
             NodeInput::ExecCertFetchFailed { hashes } => {
@@ -637,7 +646,7 @@ where
                     primary_shard,
                     FetchInput::Failed { ids: hashes },
                 );
-                self.update_fetch_tick_timer(primary_shard);
+                self.update_fetch_tick_timer();
             }
 
             // ── Committed header (gossip → BLS verify → state machine) ──
@@ -659,12 +668,12 @@ where
                     primary_shard,
                     FetchInput::Failed { ids: hashes },
                 );
-                self.update_fetch_tick_timer(primary_shard);
+                self.update_fetch_tick_timer();
             }
 
             NodeInput::FinalizedWavesFetchFailed { ids } => {
                 self.drive_fetch::<FinalizedWaveBinding>(primary_shard, FetchInput::Failed { ids });
-                self.update_fetch_tick_timer(primary_shard);
+                self.update_fetch_tick_timer();
             }
         }
 
@@ -678,7 +687,7 @@ where
     /// those actions.
     pub fn drain_pending_output(&mut self) -> StepOutput {
         let mut emitted_statuses = Vec::new();
-        let mut timer_ops = Vec::new();
+        let mut timer_ops = std::mem::take(&mut self.pending_timer_ops);
         let mut actions_generated = 0usize;
         for vnode in &mut self.vnodes {
             emitted_statuses.append(&mut vnode.emitted_statuses);
