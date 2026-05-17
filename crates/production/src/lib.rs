@@ -73,6 +73,6 @@ pub mod rpc;
 mod runner;
 mod status;
 mod telemetry;
-pub use runner::{ProductionRunner, RunnerError};
+pub use runner::{ProductionRunner, RunnerError, VnodeConfig};
 pub use status::SyncStatus;
 pub use telemetry::{TelemetryConfig, TelemetryGuard, init_telemetry};

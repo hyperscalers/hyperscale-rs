@@ -16,7 +16,7 @@ use fixtures::TestFixtures;
 use hyperscale_bft::BftConfig;
 use hyperscale_network::{HandlerRegistry, ValidatorKeyMap};
 use hyperscale_network_libp2p::{Libp2pAdapter, Libp2pConfig};
-use hyperscale_production::ProductionRunner;
+use hyperscale_production::{ProductionRunner, VnodeConfig};
 use hyperscale_storage_rocksdb::RocksDbStorage;
 use hyperscale_types::{Bls12381G1PrivateKey, ShardGroupId, ValidatorId, generate_bls_keypair};
 use libp2p::identity::Keypair;
@@ -72,16 +72,15 @@ async fn test_network_adapter_starts() {
     let adapter = Libp2pAdapter::new(
         config,
         keypair,
-        validator_id,
+        vec![(validator_id, bind_sig)],
         shard,
         Arc::new(HandlerRegistry::new()),
-        bind_sig,
         topo,
     )
     .unwrap();
 
     // Verify adapter state
-    assert_eq!(adapter.local_validator_id(), validator_id);
+    assert_eq!(adapter.local_validator_ids(), &[validator_id]);
 
     // Get listen addresses (should have at least one after initialization)
     sleep(Duration::from_millis(100)).await;
@@ -107,10 +106,9 @@ async fn test_two_node_connection() {
     let adapter1 = Libp2pAdapter::new(
         config1,
         keypair1,
-        ValidatorId::new(0),
+        vec![(ValidatorId::new(0), bind_sig1)],
         ShardGroupId::new(0),
         Arc::new(HandlerRegistry::new()),
-        bind_sig1,
         topo1,
     )
     .unwrap();
@@ -133,10 +131,9 @@ async fn test_two_node_connection() {
     let adapter2 = Libp2pAdapter::new(
         config2,
         keypair2,
-        ValidatorId::new(1),
+        vec![(ValidatorId::new(1), bind_sig2)],
         ShardGroupId::new(0),
         Arc::new(HandlerRegistry::new()),
-        bind_sig2,
         topo2,
     )
     .unwrap();
@@ -184,10 +181,9 @@ async fn test_topic_subscription() {
     let adapter = Libp2pAdapter::new(
         config,
         keypair,
-        ValidatorId::new(0),
+        vec![(ValidatorId::new(0), bind_sig)],
         ShardGroupId::new(0),
         Arc::new(HandlerRegistry::new()),
-        bind_sig,
         topo,
     )
     .unwrap();
@@ -222,10 +218,9 @@ async fn test_validator_bind_success() {
     let adapter0 = Libp2pAdapter::new(
         config0,
         keypair0,
-        ValidatorId::new(0),
+        vec![(ValidatorId::new(0), bind_sig0)],
         ShardGroupId::new(0),
         Arc::new(HandlerRegistry::new()),
-        bind_sig0,
         fixtures.validator_key_map(0),
     )
     .unwrap();
@@ -246,10 +241,9 @@ async fn test_validator_bind_success() {
     let adapter1 = Libp2pAdapter::new(
         config1,
         keypair1,
-        ValidatorId::new(1),
+        vec![(ValidatorId::new(1), bind_sig1)],
         ShardGroupId::new(0),
         Arc::new(HandlerRegistry::new()),
-        bind_sig1,
         fixtures.validator_key_map(1),
     )
     .unwrap();
@@ -299,10 +293,9 @@ async fn test_validator_bind_rejects_wrong_key() {
     let adapter0 = Libp2pAdapter::new(
         config0,
         keypair0,
-        ValidatorId::new(0),
+        vec![(ValidatorId::new(0), bind_sig0)],
         ShardGroupId::new(0),
         Arc::new(HandlerRegistry::new()),
-        bind_sig0,
         fixtures.validator_key_map(0),
     )
     .unwrap();
@@ -325,10 +318,9 @@ async fn test_validator_bind_rejects_wrong_key() {
     let adapter1 = Libp2pAdapter::new(
         config1,
         keypair1,
-        ValidatorId::new(1),
+        vec![(ValidatorId::new(1), wrong_signing_key)],
         ShardGroupId::new(0),
         Arc::new(HandlerRegistry::new()),
-        wrong_signing_key,
         fixtures.validator_key_map(1),
     )
     .unwrap();
@@ -378,10 +370,9 @@ async fn test_validator_bind_evicted_on_disconnect() {
     let adapter0 = Libp2pAdapter::new(
         config0,
         keypair0,
-        ValidatorId::new(0),
+        vec![(ValidatorId::new(0), bind_sig0)],
         ShardGroupId::new(0),
         Arc::new(HandlerRegistry::new()),
-        bind_sig0,
         fixtures.validator_key_map(0),
     )
     .unwrap();
@@ -402,10 +393,9 @@ async fn test_validator_bind_evicted_on_disconnect() {
     let adapter1 = Libp2pAdapter::new(
         config1,
         keypair1,
-        ValidatorId::new(1),
+        vec![(ValidatorId::new(1), bind_sig1)],
         ShardGroupId::new(0),
         Arc::new(HandlerRegistry::new()),
-        bind_sig1,
         fixtures.validator_key_map(1),
     )
     .unwrap();
@@ -470,8 +460,10 @@ async fn test_production_runner_with_network() {
     };
 
     let runner = ProductionRunner::builder(
-        fixtures.topology(0),
-        fixtures.signing_key(0),
+        vec![VnodeConfig {
+            topology: fixtures.topology(0),
+            signing_key: fixtures.signing_key(0),
+        }],
         BftConfig::default(),
         storage,
         network_config,
@@ -530,8 +522,10 @@ async fn test_graceful_shutdown() {
     };
 
     let mut runner = ProductionRunner::builder(
-        fixtures.topology(0),
-        fixtures.signing_key(0),
+        vec![VnodeConfig {
+            topology: fixtures.topology(0),
+            signing_key: fixtures.signing_key(0),
+        }],
         BftConfig::default(),
         storage,
         network_config,
@@ -561,4 +555,144 @@ async fn test_graceful_shutdown() {
     assert!(run_result.is_ok(), "Runner should return Ok on shutdown");
 
     info!("Graceful shutdown test completed");
+}
+
+// ============================================================================
+// Multi-vnode hosting (same shard)
+// ============================================================================
+
+/// Spin up two hosts that each carry two same-shard vnodes, let them peer,
+/// and check that the multi-validator bind plumbing lands every hosted
+/// validator id on the remote adapter's `validator_peers` map. Real libp2p,
+/// real `RocksDB`; consensus progress is exercised separately by the
+/// simulator's V=2 test and is timing-sensitive over real network — this
+/// test scopes itself to validating the production-runner construction
+/// path and the multi-validator handshake.
+#[tokio::test]
+#[serial]
+async fn test_v2_same_shard_production_runner_binds_all_vnodes() {
+    let _ = fmt().with_test_writer().try_init();
+
+    // Four validators, all in shard 0; two per host.
+    let fixtures = TestFixtures::new(7, 4);
+
+    let temp_dir0 = TempDir::new().unwrap();
+    let temp_dir1 = TempDir::new().unwrap();
+    let storage0 = Arc::new(RocksDbStorage::open(temp_dir0.path().join("db0")).unwrap());
+    let storage1 = Arc::new(RocksDbStorage::open(temp_dir1.path().join("db1")).unwrap());
+
+    let network_config0 = Libp2pConfig {
+        listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()],
+        bootstrap_peers: vec![],
+        ..Default::default()
+    };
+
+    let host0_vnodes = vec![
+        VnodeConfig {
+            topology: fixtures.topology(0),
+            signing_key: fixtures.signing_key(0),
+        },
+        VnodeConfig {
+            topology: fixtures.topology(1),
+            signing_key: fixtures.signing_key(1),
+        },
+    ];
+    let mut runner0 = ProductionRunner::builder(
+        host0_vnodes,
+        BftConfig::default(),
+        storage0,
+        network_config0,
+    )
+    .build()
+    .expect("host 0 builder");
+
+    let adapter0 = Arc::clone(runner0.network());
+    assert_eq!(
+        adapter0.local_validator_ids(),
+        &[ValidatorId::new(0), ValidatorId::new(1)],
+        "host 0 should expose both hosted validator ids"
+    );
+
+    // Bind host 1 to host 0's listen address.
+    sleep(Duration::from_millis(200)).await;
+    let host0_addrs = adapter0.listen_addresses().await;
+    assert!(!host0_addrs.is_empty(), "host 0 must be listening");
+    let host0_addr = host0_addrs[0].clone();
+
+    let network_config1 = Libp2pConfig {
+        listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()],
+        bootstrap_peers: vec![host0_addr],
+        ..Default::default()
+    };
+    let host1_vnodes = vec![
+        VnodeConfig {
+            topology: fixtures.topology(2),
+            signing_key: fixtures.signing_key(2),
+        },
+        VnodeConfig {
+            topology: fixtures.topology(3),
+            signing_key: fixtures.signing_key(3),
+        },
+    ];
+    let mut runner1 = ProductionRunner::builder(
+        host1_vnodes,
+        BftConfig::default(),
+        storage1,
+        network_config1,
+    )
+    .build()
+    .expect("host 1 builder");
+
+    let adapter1 = Arc::clone(runner1.network());
+    assert_eq!(
+        adapter1.local_validator_ids(),
+        &[ValidatorId::new(2), ValidatorId::new(3)],
+        "host 1 should expose both hosted validator ids"
+    );
+
+    let shutdown0 = runner0.shutdown_handle().expect("shutdown0");
+    let shutdown1 = runner1.shutdown_handle().expect("shutdown1");
+    let h0 = spawn(runner0.run());
+    let h1 = spawn(runner1.run());
+
+    // Each handshake (Noise → identify → validator-bind) takes a few
+    // hundred ms; wait until both sides resolve every remote vid or the
+    // bind timeout elapses.
+    let bound = timeout(Duration::from_secs(10), async {
+        loop {
+            let host0_sees = [
+                adapter0.peer_for_validator(ValidatorId::new(2)),
+                adapter0.peer_for_validator(ValidatorId::new(3)),
+            ];
+            let host1_sees = [
+                adapter1.peer_for_validator(ValidatorId::new(0)),
+                adapter1.peer_for_validator(ValidatorId::new(1)),
+            ];
+            if host0_sees.iter().all(Option::is_some) && host1_sees.iter().all(Option::is_some) {
+                return (host0_sees, host1_sees);
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("multi-vnode bind should complete within timeout");
+
+    let (host0_sees, host1_sees) = bound;
+    let host1_peer = adapter1.local_peer_id();
+    let host0_peer = adapter0.local_peer_id();
+    // Every remote validator id on host 0 resolves to host 1's single peer,
+    // and vice versa — this is the load-bearing multi-vnode bind property.
+    for resolved in host0_sees {
+        assert_eq!(resolved, Some(host1_peer));
+    }
+    for resolved in host1_sees {
+        assert_eq!(resolved, Some(host0_peer));
+    }
+
+    drop(shutdown0);
+    drop(shutdown1);
+    let _ = timeout(Duration::from_secs(5), h0).await;
+    let _ = timeout(Duration::from_secs(5), h1).await;
+
+    info!("V=2 same-shard production-runner bind test completed");
 }

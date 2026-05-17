@@ -8,7 +8,7 @@ use dashmap::DashMap;
 use futures::FutureExt;
 use hyperscale_metrics::{record_libp2p_bandwidth, record_network_message_sent};
 use hyperscale_network::{HandlerRegistry, Topic, ValidatorKeyMap};
-use hyperscale_types::{Bls12381G1PrivateKey, MessageClass, ShardGroupId, ValidatorId};
+use hyperscale_types::{MessageClass, ShardGroupId, ValidatorId};
 use libp2p::connection_limits::{Behaviour as ConnectionLimitsBehaviour, ConnectionLimits};
 use libp2p::gossipsub::{
     Behaviour as GossipsubBehaviour, ConfigBuilder as GossipsubConfigBuilder, MessageAuthenticity,
@@ -28,7 +28,7 @@ use super::behaviour::{Behaviour, NOTIFY_PROTOCOL, REQUEST_PROTOCOL};
 use super::command::{ClassCommandChannels, SwarmCommand};
 use super::error::NetworkError;
 use crate::config::Libp2pConfig;
-use crate::validator_bind::spawn_validator_bind_service;
+use crate::validator_bind::{LocalVnodeIdentity, spawn_validator_bind_service};
 
 /// libp2p-based network adapter for production use.
 ///
@@ -41,8 +41,9 @@ pub struct Libp2pAdapter {
     /// Local peer ID.
     local_peer_id: Libp2pPeerId,
 
-    /// Local validator ID (from topology).
-    local_validator_id: ValidatorId,
+    /// Validator ids hosted by this peer. One under V=1; multiple when
+    /// the host runs several same-shard vnodes off one libp2p identity.
+    local_validator_ids: Vec<ValidatorId>,
 
     /// Priority-based command channels to swarm task.
     /// Commands are routed to the appropriate channel based on message priority.
@@ -75,10 +76,11 @@ impl Libp2pAdapter {
     ///
     /// * `config` - Network configuration
     /// * `keypair` - Ed25519 keypair for libp2p transport encryption
-    /// * `validator_id` - Local validator ID
-    /// * `shard` - Local shard assignment
+    /// * `vnodes` - One `(validator_id, signing_key)` per hosted vnode.
+    ///   The bind service attests as every entry on each handshake. Must
+    ///   be non-empty.
+    /// * `shard` - Local shard assignment (same-shard hosting only)
     /// * `registry` - Shared handler registry for per-type message dispatch
-    /// * `signing_key` - BLS signing key (used to produce a fresh bind signature per session)
     /// * `validator_keys` - Initial validator key map for bind verification
     ///
     /// # Returns
@@ -88,6 +90,10 @@ impl Libp2pAdapter {
     /// # Errors
     ///
     /// Returns [`NetworkError`] if swarm construction or transport setup fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `vnodes` is empty.
     // Single setup path mirroring the libp2p builder structure.
     // `config` is taken by value: every caller constructs a fresh config and hands
     // it over, and the body picks fields out, so converting to `&Libp2pConfig`
@@ -96,17 +102,21 @@ impl Libp2pAdapter {
     pub fn new(
         config: Libp2pConfig,
         keypair: Keypair,
-        validator_id: ValidatorId,
+        vnodes: Vec<LocalVnodeIdentity>,
         shard: ShardGroupId,
         registry: Arc<HandlerRegistry>,
-        signing_key: Arc<Bls12381G1PrivateKey>,
         validator_keys: Arc<ValidatorKeyMap>,
     ) -> Result<Arc<Self>, NetworkError> {
+        assert!(
+            !vnodes.is_empty(),
+            "Libp2pAdapter needs at least one hosted vnode"
+        );
         let local_peer_id = Libp2pPeerId::from(keypair.public());
+        let local_validator_ids: Vec<ValidatorId> = vnodes.iter().map(|(vid, _)| *vid).collect();
 
         info!(
             local_peer_id = %local_peer_id,
-            validator_id = validator_id.inner(),
+            validator_ids = ?local_validator_ids,
             shard = shard.inner(),
             "Creating libp2p network adapter"
         );
@@ -219,14 +229,14 @@ impl Libp2pAdapter {
         let bind_handle = spawn_validator_bind_service(
             stream_control.clone(),
             validator_peers.clone(),
-            vec![(validator_id, signing_key)],
+            vnodes,
             local_peer_id,
             Arc::clone(&shared_keys),
         );
 
         let adapter = Arc::new(Self {
             local_peer_id,
-            local_validator_id: validator_id,
+            local_validator_ids,
             priority_channels,
             validator_peers: validator_peers.clone(),
             shutdown_tx: Some(shutdown_tx),
@@ -367,10 +377,12 @@ impl Libp2pAdapter {
         self.local_peer_id
     }
 
-    /// Get the local validator ID.
+    /// Validator ids hosted by this libp2p peer. Length is 1 under
+    /// single-vnode hosting and larger when the host runs several
+    /// same-shard vnodes off one peer identity.
     #[must_use]
-    pub const fn local_validator_id(&self) -> ValidatorId {
-        self.local_validator_id
+    pub fn local_validator_ids(&self) -> &[ValidatorId] {
+        &self.local_validator_ids
     }
 
     /// Get the cached connected peer count (non-blocking).

@@ -57,7 +57,7 @@ use hyperscale_mempool::MempoolConfig;
 use hyperscale_network_libp2p::{Libp2pConfig, VersionInteroperabilityMode};
 use hyperscale_production::rpc::{MempoolSnapshot, NodeStatusState, RpcServer, RpcServerConfig};
 use hyperscale_production::{
-    ProductionRunner, SyncStatus, TelemetryConfig, TelemetryGuard, init_telemetry,
+    ProductionRunner, SyncStatus, TelemetryConfig, TelemetryGuard, VnodeConfig, init_telemetry,
 };
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_storage_rocksdb::{
@@ -1180,8 +1180,10 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
     // The runner is built before the RPC server because it owns the crossbeam
     // event channel the RPC server submits transactions through.
     let mut runner_builder = ProductionRunner::builder(
-        topology,
-        signing_keypair,
+        vec![VnodeConfig {
+            topology,
+            signing_key: signing_keypair,
+        }],
         bft_config,
         storage,
         network_config,

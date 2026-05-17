@@ -136,6 +136,25 @@ impl Drop for ShutdownHandle {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// VnodeConfig
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// One hosted validator's identity + per-validator state inputs.
+///
+/// A [`ProductionRunner`] hosts a `Vec<VnodeConfig>`. Same-shard hosting
+/// (V > 1 with every entry mapped to the same `local_shard()`) collapses
+/// onto one `IoLoop`, one libp2p peer, and one `ShardIo`, with per-vnode
+/// signing keys and per-vnode `NodeStateMachine`s.
+pub struct VnodeConfig {
+    /// Per-validator topology view. Provides this vnode's `validator_id`,
+    /// `local_shard`, and the shard committee membership it participates in.
+    pub topology: TopologyCoordinator,
+    /// BLS signing key for this validator's votes, proposals, and the
+    /// per-session validator-bind attestation.
+    pub signing_key: Bls12381G1PrivateKey,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // ProductionRunnerBuilder
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -147,8 +166,8 @@ impl Drop for ShutdownHandle {
 /// is called.
 ///
 /// Required fields (taken at construction):
-/// - `topology` - Network topology defining validators and shards
-/// - `signing_key` - BLS keypair for signing votes and proposals
+/// - `vnodes` - One [`VnodeConfig`] per hosted validator. All entries must
+///   target the same shard (same-shard hosting only at this phase).
 /// - `bft_config` - Consensus configuration parameters
 /// - `storage` - `RocksDB` storage for persistence and crash recovery
 /// - `network` - libp2p configuration for peer-to-peer communication
@@ -157,8 +176,7 @@ impl Drop for ShutdownHandle {
 /// - `dispatch` - Dispatch implementation (defaults to auto-configured)
 /// - `channel_capacity` - Event channel capacity (defaults to 10,000)
 pub struct ProductionRunnerBuilder {
-    topology: TopologyCoordinator,
-    signing_key: Bls12381G1PrivateKey,
+    vnodes: Vec<VnodeConfig>,
     bft_config: BftConfig,
     storage: Arc<RocksDbStorage>,
     network_config: Libp2pConfig,
@@ -181,17 +199,23 @@ pub struct ProductionRunnerBuilder {
 impl ProductionRunnerBuilder {
     /// Create a new builder with the required fields. Optional fields use
     /// their defaults until overridden via the setter methods.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `vnodes` is empty.
     #[must_use]
     pub fn new(
-        topology: TopologyCoordinator,
-        signing_key: Bls12381G1PrivateKey,
+        vnodes: Vec<VnodeConfig>,
         bft_config: BftConfig,
         storage: Arc<RocksDbStorage>,
         network_config: Libp2pConfig,
     ) -> Self {
+        assert!(
+            !vnodes.is_empty(),
+            "ProductionRunnerBuilder needs at least one vnode"
+        );
         Self {
-            topology,
-            signing_key,
+            vnodes,
             bft_config,
             storage,
             network_config,
@@ -288,8 +312,7 @@ impl ProductionRunnerBuilder {
         // Install the Prometheus metrics backend before anything records metrics.
         install();
 
-        let topology_state = self.topology;
-        let signing_key = self.signing_key;
+        let vnode_configs = self.vnodes;
         let bft_config = self.bft_config;
         let storage = self.storage;
         let network_config = self.network_config;
@@ -303,16 +326,33 @@ impl ProductionRunnerBuilder {
 
         let ed25519_keypair = generate_random_keypair();
 
-        let validator_id = topology_state.snapshot().local_validator_id();
-        let local_shard = topology_state.snapshot().local_shard();
+        // Same-shard hosting only: every hosted vnode must agree on
+        // `local_shard`. Cross-shard hosting lifts this in a later phase.
+        let local_shard = vnode_configs[0].topology.snapshot().local_shard();
+        for cfg in &vnode_configs {
+            assert_eq!(
+                cfg.topology.snapshot().local_shard(),
+                local_shard,
+                "all hosted vnodes must share one shard (got {:?} and {:?})",
+                local_shard,
+                cfg.topology.snapshot().local_shard(),
+            );
+        }
 
-        // ArcSwap so `Action::TopologyChanged` can atomically swap in a new snapshot.
-        let topology: SharedTopologySnapshot =
-            Arc::new(ArcSwap::from(Arc::clone(topology_state.snapshot())));
+        // The shared snapshot drives off-thread handlers that read
+        // shard-level info only — `local_validator_id` on the snapshot
+        // doesn't propagate to per-vnode signing paths, which carry their
+        // own signing keys via `ActionContext`. The first vnode's snapshot
+        // is a representative; same-shard equivalence guarantees the
+        // shard-level fields agree.
+        let topology: SharedTopologySnapshot = Arc::new(ArcSwap::from(Arc::clone(
+            vnode_configs[0].topology.snapshot(),
+        )));
 
         // Extract initial validator keys for network-layer bind verification.
         let initial_validator_keys: Arc<ValidatorKeyMap> = Arc::new(
-            topology_state
+            vnode_configs[0]
+                .topology
                 .snapshot()
                 .global_validator_set()
                 .validators
@@ -322,16 +362,18 @@ impl ProductionRunnerBuilder {
         );
 
         // `Bls12381G1PrivateKey` doesn't impl `Clone`, so round-trip via bytes
-        // to keep one copy for the state machine and one for the bind signature.
-        let key_bytes = signing_key.to_bytes();
-        let io_loop_signing_key =
-            Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes");
-
-        // BLS signing key consumed by the validator-bind protocol. The bind
-        // service generates a fresh signature per session (challenge-response),
-        // so we hand it the key rather than a precomputed signature.
-        let bind_signing_key =
-            Arc::new(Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes"));
+        // to keep one copy for each consumer (state machine + bind service).
+        let bind_vnodes: Vec<(ValidatorId, Arc<Bls12381G1PrivateKey>)> = vnode_configs
+            .iter()
+            .map(|cfg| {
+                let vid = cfg.topology.snapshot().local_validator_id();
+                let key_bytes = cfg.signing_key.to_bytes();
+                let key = Arc::new(
+                    Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes"),
+                );
+                (vid, key)
+            })
+            .collect();
 
         let (xb_timer_tx, xb_timer_rx) = unbounded();
         let (xb_callback_tx, xb_callback_rx) = unbounded();
@@ -341,15 +383,30 @@ impl ProductionRunnerBuilder {
 
         let recovered = storage.load_recovered_state();
         let provision_store = Arc::new(ProvisionStore::new());
-        let state = NodeStateMachine::new(
-            0, // node_index is not meaningful in production
-            topology_state,
-            &bft_config,
-            recovered,
-            self.mempool_config,
-            self.provision_config,
-            provision_store,
-        );
+
+        let vnode_inits: Vec<VnodeInit> = vnode_configs
+            .into_iter()
+            .enumerate()
+            .map(|(idx, cfg)| {
+                // node_index is not meaningful in production; pick a stable
+                // disambiguator across same-host vnodes.
+                let node_index =
+                    u32::try_from(idx).expect("vnode count fits in u32 (capped well below 2^32)");
+                let state = NodeStateMachine::new(
+                    node_index,
+                    cfg.topology,
+                    &bft_config,
+                    recovered.clone(),
+                    self.mempool_config.clone(),
+                    self.provision_config,
+                    Arc::clone(&provision_store),
+                );
+                VnodeInit {
+                    state,
+                    signing_key: cfg.signing_key,
+                }
+            })
+            .collect();
 
         let shared_storage = SharedStorage::new(Arc::clone(&storage));
         let network_definition = self
@@ -363,19 +420,15 @@ impl ProductionRunnerBuilder {
         } = build_network_stack(NetworkBuildArgs {
             network_config,
             ed25519_keypair,
-            validator_id,
             local_shard,
-            bind_signing_key,
+            bind_vnodes,
             initial_validator_keys,
         })?;
 
         let executor = RadixExecutor::new(network_definition);
 
         let io_loop = IoLoop::new(
-            vec![VnodeInit {
-                state,
-                signing_key: io_loop_signing_key,
-            }],
+            vnode_inits,
             shared_storage,
             executor,
             libp2p_network,
@@ -487,13 +540,12 @@ impl ProductionRunner {
     /// [`ProductionRunnerBuilder::build`].
     #[must_use]
     pub fn builder(
-        topology: TopologyCoordinator,
-        signing_key: Bls12381G1PrivateKey,
+        vnodes: Vec<VnodeConfig>,
         bft_config: BftConfig,
         storage: Arc<RocksDbStorage>,
         network_config: Libp2pConfig,
     ) -> ProductionRunnerBuilder {
-        ProductionRunnerBuilder::new(topology, signing_key, bft_config, storage, network_config)
+        ProductionRunnerBuilder::new(vnodes, bft_config, storage, network_config)
     }
 
     /// Get a reference to the dispatch implementation.
@@ -815,9 +867,10 @@ impl ProductionRunner {
 struct NetworkBuildArgs {
     network_config: Libp2pConfig,
     ed25519_keypair: Keypair,
-    validator_id: ValidatorId,
     local_shard: ShardGroupId,
-    bind_signing_key: Arc<Bls12381G1PrivateKey>,
+    /// One `(validator_id, signing_key)` per hosted vnode. The bind
+    /// service attests as every entry on each handshake.
+    bind_vnodes: Vec<(ValidatorId, Arc<Bls12381G1PrivateKey>)>,
     initial_validator_keys: Arc<ValidatorKeyMap>,
 }
 
@@ -832,10 +885,9 @@ fn build_network_stack(args: NetworkBuildArgs) -> Result<NetworkStack, RunnerErr
     let adapter = Libp2pAdapter::new(
         args.network_config,
         args.ed25519_keypair,
-        args.validator_id,
+        args.bind_vnodes,
         args.local_shard,
         registry.clone(),
-        args.bind_signing_key,
         args.initial_validator_keys,
     )?;
 
