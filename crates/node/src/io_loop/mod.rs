@@ -231,6 +231,15 @@ where
     /// every hosted shard's fetch/sync state. Drained alongside the per-vnode
     /// buffers in [`Self::drain_pending_output`].
     pending_timer_ops: Vec<TimerOp>,
+
+    /// Size cap for new tx-gossip accumulators. Consulted lazily by
+    /// `enqueue_tx_for_gossip` when it inserts a new per-destination-shard
+    /// accumulator into a `ShardIo`'s `tx_gossip_batches`.
+    tx_gossip_max: usize,
+
+    /// Time window for new tx-gossip accumulators. Same role as
+    /// `tx_gossip_max`.
+    tx_gossip_window: Duration,
 }
 
 impl<S, N, D, E> IoLoop<S, N, D, E>
@@ -331,8 +340,6 @@ where
                         b.committed_header_window,
                     ),
                     tx_gossip_batches: std::collections::BTreeMap::new(),
-                    tx_gossip_max: b.tx_gossip_max,
-                    tx_gossip_window: b.tx_gossip_window,
                 },
             );
         }
@@ -367,6 +374,8 @@ where
             last_slow_tx_warn: LocalTimestamp::ZERO,
             tx_phase_times: TxPhaseTimesCache::default(),
             pending_timer_ops: Vec::new(),
+            tx_gossip_max: b.tx_gossip_max,
+            tx_gossip_window: b.tx_gossip_window,
         }
     }
 

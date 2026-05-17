@@ -16,7 +16,6 @@ pub mod verify;
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
 
 use hyperscale_storage::{PendingChain, Storage};
 use hyperscale_types::{
@@ -98,12 +97,7 @@ pub struct ShardIo<S: Storage> {
     /// Locally-submitted transactions are appended to one accumulator
     /// per shard the tx touches (declared reads ∪ writes); each fills
     /// until its count cap or time window expires, then flushes as a
-    /// single batched gossip message.
+    /// single batched gossip message. New accumulators are sized from
+    /// the `IoLoop`'s tx-gossip batch config.
     pub tx_gossip_batches: BTreeMap<ShardGroupId, BatchAccumulator<Arc<RoutableTransaction>>>,
-
-    /// Cap for new tx-gossip accumulators (mirrored from `BatchConfig`).
-    pub tx_gossip_max: usize,
-
-    /// Window for new tx-gossip accumulators (mirrored from `BatchConfig`).
-    pub tx_gossip_window: Duration,
 }
