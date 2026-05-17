@@ -1,11 +1,9 @@
-//! [`FinalizedWave`] — wave certificate plus locally-executed receipts, with
-//! reconstruction, validation, and `Vec<Arc<FinalizedWave>>` SBOR helpers.
+//! [`FinalizedWave`] — wave certificate plus locally-executed receipts.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use sbor::prelude::*;
-use sbor::{DecodeError, Decoder, EncodeError, Encoder, NoCustomValueKind, ValueKind};
 
 use crate::{
     BoundedVec, ConsensusReceipt, ExecutionCertificate, ExecutionOutcome, GlobalReceiptHash,
@@ -321,50 +319,4 @@ impl FinalizedWave {
             })
             .collect()
     }
-}
-
-/// Encode a `Vec<Arc<FinalizedWave>>` as an SBOR array.
-///
-/// # Errors
-///
-/// Forwards [`EncodeError`] from the underlying encoder.
-pub fn encode_finalized_wave_vec<E: Encoder<NoCustomValueKind>>(
-    encoder: &mut E,
-    waves: &[Arc<FinalizedWave>],
-) -> Result<(), EncodeError> {
-    encoder.write_value_kind(ValueKind::Array)?;
-    encoder.write_value_kind(ValueKind::Tuple)?;
-    encoder.write_size(waves.len())?;
-    for wave in waves {
-        encoder.encode_deeper_body(wave.as_ref())?;
-    }
-    Ok(())
-}
-
-/// Decode a `Vec<Arc<FinalizedWave>>` from an SBOR array.
-///
-/// # Errors
-///
-/// Returns [`DecodeError::UnexpectedSize`] if the encoded count
-/// exceeds `max_size`, or any decoder error from reading individual
-/// finalized waves.
-pub fn decode_finalized_wave_vec<D: Decoder<NoCustomValueKind>>(
-    decoder: &mut D,
-    max_size: usize,
-) -> Result<Vec<Arc<FinalizedWave>>, DecodeError> {
-    decoder.read_and_check_value_kind(ValueKind::Array)?;
-    decoder.read_and_check_value_kind(ValueKind::Tuple)?;
-    let count = decoder.read_size()?;
-    if count > max_size {
-        return Err(DecodeError::UnexpectedSize {
-            expected: max_size,
-            actual: count,
-        });
-    }
-    let mut waves = Vec::with_capacity(count);
-    for _ in 0..count {
-        let wave: FinalizedWave = decoder.decode_deeper_body_with_value_kind(ValueKind::Tuple)?;
-        waves.push(Arc::new(wave));
-    }
-    Ok(waves)
 }

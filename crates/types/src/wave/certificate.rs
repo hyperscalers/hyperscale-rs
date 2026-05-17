@@ -1,17 +1,13 @@
 //! [`WaveCertificate`] — proof of execution finalization carrying every
-//! participating shard's [`ExecutionCertificate`], plus encode/decode helpers
-//! for `Vec<Arc<WaveCertificate>>`.
+//! participating shard's [`ExecutionCertificate`].
 
 use std::sync::Arc;
 
 use blake3::Hasher;
 use sbor::prelude::*;
-use sbor::{
-    Categorize, Decode, DecodeError, Decoder, Describe, Encode, EncodeError, Encoder,
-    NoCustomTypeKind, NoCustomValueKind, RustTypeId, TypeData, TypeKind, ValueKind,
-};
+use sbor::{Decode, DecodeError, Decoder, NoCustomValueKind, ValueKind};
 
-use crate::{ExecutionCertificate, Hash, WaveId, WaveReceiptHash};
+use crate::{BoundedVec, ExecutionCertificate, Hash, WaveId, WaveReceiptHash};
 
 /// Cap on execution certificates accepted in a single `WaveCertificate` at
 /// decode time.
@@ -42,10 +38,11 @@ const MAX_EXECUTION_CERTIFICATES_PER_WAVE: usize = 1024;
 /// and at the wire boundary by `WaveCertificate`'s SBOR `Decode` impl.
 /// Downstream helpers like [`FinalizedWave::local_ec`](crate::FinalizedWave::local_ec)
 /// `expect` this invariant.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, BasicEncode, BasicCategorize, BasicDescribe)]
 pub struct WaveCertificate {
     wave_id: WaveId,
-    execution_certificates: Vec<Arc<ExecutionCertificate>>,
+    execution_certificates:
+        BoundedVec<Arc<ExecutionCertificate>, MAX_EXECUTION_CERTIFICATES_PER_WAVE>,
 }
 
 impl WaveCertificate {
@@ -54,14 +51,15 @@ impl WaveCertificate {
     /// Does not validate the exactly-one-local-EC invariant; that is
     /// enforced at the wire boundary by the `Decode` impl and at the
     /// build boundary by `WaveCertificateTracker::create_wave_certificate`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `execution_certificates.len() > MAX_EXECUTION_CERTIFICATES_PER_WAVE`.
     #[must_use]
-    pub const fn new(
-        wave_id: WaveId,
-        execution_certificates: Vec<Arc<ExecutionCertificate>>,
-    ) -> Self {
+    pub fn new(wave_id: WaveId, execution_certificates: Vec<Arc<ExecutionCertificate>>) -> Self {
         Self {
             wave_id,
-            execution_certificates,
+            execution_certificates: execution_certificates.into(),
         }
     }
 
@@ -97,7 +95,7 @@ impl WaveCertificate {
     #[must_use]
     pub fn receipt_hash(&self) -> WaveReceiptHash {
         let mut hasher = Hasher::new();
-        for ec in &self.execution_certificates {
+        for ec in self.execution_certificates.iter() {
             hasher.update(&basic_encode(&ec.shard_group_id()).unwrap());
             hasher.update(&basic_encode(&ec.wave_id()).unwrap());
         }
@@ -105,27 +103,9 @@ impl WaveCertificate {
     }
 }
 
-// Manual SBOR implementation (since we need stable encoding)
-
-impl<E: Encoder<NoCustomValueKind>> Encode<NoCustomValueKind, E> for WaveCertificate {
-    fn encode_value_kind(&self, encoder: &mut E) -> Result<(), EncodeError> {
-        encoder.write_value_kind(ValueKind::Tuple)
-    }
-
-    fn encode_body(&self, encoder: &mut E) -> Result<(), EncodeError> {
-        encoder.write_size(2)?;
-        encoder.encode(&self.wave_id)?;
-        // Encode Vec<Arc<ExecutionCertificate>> as Vec<ExecutionCertificate>
-        encoder.write_value_kind(ValueKind::Array)?;
-        encoder.write_value_kind(ValueKind::Tuple)?;
-        encoder.write_size(self.execution_certificates.len())?;
-        for ec in &self.execution_certificates {
-            encoder.encode_deeper_body(ec.as_ref())?;
-        }
-        Ok(())
-    }
-}
-
+// Manual `Decode` overrides the derive purely to enforce the
+// exactly-one-local-EC invariant at the wire boundary; encode / categorize
+// / describe are derived against the inner field.
 impl<D: Decoder<NoCustomValueKind>> Decode<NoCustomValueKind, D> for WaveCertificate {
     fn decode_body_with_value_kind(
         decoder: &mut D,
@@ -140,22 +120,10 @@ impl<D: Decoder<NoCustomValueKind>> Decode<NoCustomValueKind, D> for WaveCertifi
             });
         }
         let wave_id: WaveId = decoder.decode()?;
-        // Decode Vec<ExecutionCertificate> into Vec<Arc<ExecutionCertificate>>
-        decoder.read_and_check_value_kind(ValueKind::Array)?;
-        decoder.read_and_check_value_kind(ValueKind::Tuple)?;
-        let count = decoder.read_size()?;
-        if count > MAX_EXECUTION_CERTIFICATES_PER_WAVE {
-            return Err(DecodeError::UnexpectedSize {
-                expected: MAX_EXECUTION_CERTIFICATES_PER_WAVE,
-                actual: count,
-            });
-        }
-        let mut execution_certificates = Vec::with_capacity(count);
-        for _ in 0..count {
-            let ec: ExecutionCertificate =
-                decoder.decode_deeper_body_with_value_kind(ValueKind::Tuple)?;
-            execution_certificates.push(Arc::new(ec));
-        }
+        let execution_certificates: BoundedVec<
+            Arc<ExecutionCertificate>,
+            MAX_EXECUTION_CERTIFICATES_PER_WAVE,
+        > = decoder.decode()?;
         // Reject any WC that violates the exactly-one-local-EC invariant.
         // Zero local ECs would crash `FinalizedWave::local_ec()`; multiple
         // would let downstream code silently disagree on which EC is
@@ -172,64 +140,4 @@ impl<D: Decoder<NoCustomValueKind>> Decode<NoCustomValueKind, D> for WaveCertifi
             execution_certificates,
         })
     }
-}
-
-impl Categorize<NoCustomValueKind> for WaveCertificate {
-    fn value_kind() -> ValueKind<NoCustomValueKind> {
-        ValueKind::Tuple
-    }
-}
-
-impl Describe<NoCustomTypeKind> for WaveCertificate {
-    const TYPE_ID: RustTypeId = RustTypeId::novel_with_code("WaveCertificate", &[], &[]);
-
-    fn type_data() -> TypeData<NoCustomTypeKind, RustTypeId> {
-        TypeData::unnamed(TypeKind::Any)
-    }
-}
-
-/// Encode a `Vec<Arc<WaveCertificate>>` as an SBOR array.
-///
-/// # Errors
-///
-/// Forwards [`EncodeError`] from the underlying encoder.
-pub fn encode_wave_cert_vec<E: Encoder<NoCustomValueKind>>(
-    encoder: &mut E,
-    certs: &[Arc<WaveCertificate>],
-) -> Result<(), EncodeError> {
-    encoder.write_value_kind(ValueKind::Array)?;
-    encoder.write_value_kind(ValueKind::Tuple)?;
-    encoder.write_size(certs.len())?;
-    for cert in certs {
-        encoder.encode_deeper_body(cert.as_ref())?;
-    }
-    Ok(())
-}
-
-/// Decode a `Vec<Arc<WaveCertificate>>` from an SBOR array.
-///
-/// # Errors
-///
-/// Returns [`DecodeError::UnexpectedSize`] if the encoded count
-/// exceeds `max_size`, or any decoder error from reading individual
-/// certificates.
-pub fn decode_wave_cert_vec<D: Decoder<NoCustomValueKind>>(
-    decoder: &mut D,
-    max_size: usize,
-) -> Result<Vec<Arc<WaveCertificate>>, DecodeError> {
-    decoder.read_and_check_value_kind(ValueKind::Array)?;
-    decoder.read_and_check_value_kind(ValueKind::Tuple)?;
-    let count = decoder.read_size()?;
-    if count > max_size {
-        return Err(DecodeError::UnexpectedSize {
-            expected: max_size,
-            actual: count,
-        });
-    }
-    let mut certs = Vec::with_capacity(count);
-    for _ in 0..count {
-        let cert: WaveCertificate = decoder.decode_deeper_body_with_value_kind(ValueKind::Tuple)?;
-        certs.push(Arc::new(cert));
-    }
-    Ok(certs)
 }

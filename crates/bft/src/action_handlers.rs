@@ -919,7 +919,7 @@ where
             );
             let sig = ctx.signing_key.sign_v1(&msg);
             let gossip = CommittedBlockHeaderGossip {
-                committed_header,
+                committed_header: Arc::new(committed_header),
                 sender: ctx.topology_snapshot.local_validator_id(),
                 sender_signature: sig,
             };

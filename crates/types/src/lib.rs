@@ -115,14 +115,12 @@ pub use transaction::routable::RoutableTransaction;
 pub use transaction::status::{
     TransactionDecision, TransactionError, TransactionStatus, TransactionStatusParseError,
 };
-pub use wave::certificate::{WaveCertificate, decode_wave_cert_vec, encode_wave_cert_vec};
+pub use wave::certificate::WaveCertificate;
 pub use wave::computation::{
     compute_provision_tx_roots, compute_waves, wave_leader, wave_leader_at,
 };
 pub use wave::execution_certificate::ExecutionCertificate;
-pub use wave::finalized::{
-    FinalizedWave, ReceiptValidationError, decode_finalized_wave_vec, encode_finalized_wave_vec,
-};
+pub use wave::finalized::{FinalizedWave, ReceiptValidationError};
 pub use wave::id::{MAX_REMOTE_SHARDS_PER_WAVE, WaveId};
 pub use wave::outcome::{ExecutionOutcome, TxOutcome};
 pub use wave::receipt_tree::{

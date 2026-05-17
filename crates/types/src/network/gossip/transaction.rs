@@ -10,12 +10,9 @@
 
 use std::sync::Arc;
 
-use sbor::{
-    Categorize, Decode, DecodeError, Decoder, Describe, Encode, EncodeError, Encoder,
-    NoCustomTypeKind, NoCustomValueKind, RustTypeId, TypeData, TypeKind, ValueKind,
-};
+use sbor::prelude::BasicSbor;
 
-use crate::{MessageClass, NetworkMessage, RoutableTransaction, ShardMessage};
+use crate::{BoundedVec, MessageClass, NetworkMessage, RoutableTransaction, ShardMessage};
 
 /// Cap on transactions accepted in a single gossip batch at decode time.
 ///
@@ -29,17 +26,23 @@ const MAX_GOSSIP_TX_BATCH: usize = 1_000;
 ///
 /// Each tx is broadcast on its declared (read ∪ write) shard set; a tx
 /// touching multiple shards appears in multiple batches, one per audience.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, BasicSbor)]
 pub struct TransactionGossip {
     /// The transactions in this batch.
-    pub transactions: Vec<Arc<RoutableTransaction>>,
+    pub transactions: BoundedVec<Arc<RoutableTransaction>, MAX_GOSSIP_TX_BATCH>,
 }
 
 impl TransactionGossip {
     /// Build a gossip batch from a vector of `Arc`-wrapped transactions.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `transactions.len() > MAX_GOSSIP_TX_BATCH`.
     #[must_use]
-    pub const fn new(transactions: Vec<Arc<RoutableTransaction>>) -> Self {
-        Self { transactions }
+    pub fn new(transactions: Vec<Arc<RoutableTransaction>>) -> Self {
+        Self {
+            transactions: transactions.into(),
+        }
     }
 
     /// Number of transactions in the batch.
@@ -62,87 +65,12 @@ impl PartialEq for TransactionGossip {
             && self
                 .transactions
                 .iter()
-                .zip(&other.transactions)
+                .zip(other.transactions.iter())
                 .all(|(a, b)| a.hash() == b.hash())
     }
 }
 
 impl Eq for TransactionGossip {}
-
-// ============================================================================
-// Manual SBOR implementation: `Arc<RoutableTransaction>` doesn't derive
-// BasicSbor, so we (de)serialize the inner data ourselves. Encoded as a
-// 1-tuple to match the layout `BasicSbor` would produce for a single-field
-// struct, leaving room to add fields without re-breaking wire.
-// ============================================================================
-
-impl<E: Encoder<NoCustomValueKind>> Encode<NoCustomValueKind, E> for TransactionGossip {
-    fn encode_value_kind(&self, encoder: &mut E) -> Result<(), EncodeError> {
-        encoder.write_value_kind(ValueKind::Tuple)
-    }
-
-    fn encode_body(&self, encoder: &mut E) -> Result<(), EncodeError> {
-        encoder.write_size(1)?;
-
-        encoder.write_value_kind(ValueKind::Array)?;
-        encoder.write_value_kind(
-            <RoutableTransaction as Categorize<NoCustomValueKind>>::value_kind(),
-        )?;
-        encoder.write_size(self.transactions.len())?;
-        for tx in &self.transactions {
-            encoder.encode_deeper_body(tx.as_ref())?;
-        }
-
-        Ok(())
-    }
-}
-
-impl<D: Decoder<NoCustomValueKind>> Decode<NoCustomValueKind, D> for TransactionGossip {
-    fn decode_body_with_value_kind(
-        decoder: &mut D,
-        value_kind: ValueKind<NoCustomValueKind>,
-    ) -> Result<Self, DecodeError> {
-        decoder.check_preloaded_value_kind(value_kind, ValueKind::Tuple)?;
-        let length = decoder.read_size()?;
-        if length != 1 {
-            return Err(DecodeError::UnexpectedSize {
-                expected: 1,
-                actual: length,
-            });
-        }
-
-        decoder.read_and_check_value_kind(ValueKind::Array)?;
-        let elem_kind = decoder.read_value_kind()?;
-        let tx_count = decoder.read_size()?;
-        if tx_count > MAX_GOSSIP_TX_BATCH {
-            return Err(DecodeError::UnexpectedSize {
-                expected: MAX_GOSSIP_TX_BATCH,
-                actual: tx_count,
-            });
-        }
-        let mut transactions = Vec::with_capacity(tx_count);
-        for _ in 0..tx_count {
-            let tx: RoutableTransaction = decoder.decode_deeper_body_with_value_kind(elem_kind)?;
-            transactions.push(Arc::new(tx));
-        }
-
-        Ok(Self { transactions })
-    }
-}
-
-impl Categorize<NoCustomValueKind> for TransactionGossip {
-    fn value_kind() -> ValueKind<NoCustomValueKind> {
-        ValueKind::Tuple
-    }
-}
-
-impl Describe<NoCustomTypeKind> for TransactionGossip {
-    const TYPE_ID: RustTypeId = RustTypeId::novel_with_code("TransactionGossip", &[], &[]);
-
-    fn type_data() -> TypeData<NoCustomTypeKind, RustTypeId> {
-        TypeData::unnamed(TypeKind::Any)
-    }
-}
 
 // Network message implementation
 impl NetworkMessage for TransactionGossip {
@@ -227,7 +155,10 @@ mod tests {
         // MAX_GOSSIP_TX_BATCH. Without the cap the decoder would call
         // Vec::with_capacity(huge) and OOM; with the cap it errors before
         // touching memory.
-        use sbor::{BASIC_SBOR_V1_MAX_DEPTH, BASIC_SBOR_V1_PAYLOAD_PREFIX, VecEncoder};
+        use sbor::{
+            BASIC_SBOR_V1_MAX_DEPTH, BASIC_SBOR_V1_PAYLOAD_PREFIX, DecodeError, Encoder,
+            NoCustomValueKind, ValueKind, VecEncoder,
+        };
         let mut buf = Vec::with_capacity(32);
         {
             let mut enc = VecEncoder::<NoCustomValueKind>::new(&mut buf, BASIC_SBOR_V1_MAX_DEPTH);

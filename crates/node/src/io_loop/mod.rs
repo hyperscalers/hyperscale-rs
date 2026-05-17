@@ -648,7 +648,7 @@ where
                 sender_signature,
             } => self.handle_committed_block_gossip_received(
                 primary_shard,
-                *committed_header,
+                committed_header,
                 sender,
                 public_key,
                 sender_signature,

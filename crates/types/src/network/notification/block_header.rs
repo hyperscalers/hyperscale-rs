@@ -1,5 +1,7 @@
 //! `BlockHeader` notification message.
 
+use std::sync::Arc;
+
 use sbor::prelude::BasicSbor;
 
 use crate::{
@@ -15,7 +17,7 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct BlockHeaderNotification {
     /// The block header being proposed.
-    pub header: BlockHeader,
+    pub header: Arc<BlockHeader>,
 
     /// Block contents manifest (transaction hashes, certificates, deferrals, etc.)
     pub manifest: BlockManifest,
@@ -26,15 +28,16 @@ pub struct BlockHeaderNotification {
 }
 
 impl BlockHeaderNotification {
-    /// Create a block header notification message.
+    /// Create a block header notification message. Accepts either a
+    /// freshly-built `BlockHeader` or an existing `Arc<BlockHeader>`.
     #[must_use]
-    pub const fn new(
-        header: BlockHeader,
+    pub fn new(
+        header: impl Into<Arc<BlockHeader>>,
         manifest: BlockManifest,
         proposer_signature: Bls12381G2Signature,
     ) -> Self {
         Self {
-            header,
+            header: header.into(),
             manifest,
             proposer_signature,
         }
@@ -51,9 +54,9 @@ impl BlockHeaderNotification {
         )
     }
 
-    /// Consume and return header, manifest, and proposer signature.
+    /// Consume and return header (as `Arc`), manifest, and proposer signature.
     #[must_use]
-    pub fn into_parts(self) -> (BlockHeader, BlockManifest, Bls12381G2Signature) {
+    pub fn into_parts(self) -> (Arc<BlockHeader>, BlockManifest, Bls12381G2Signature) {
         (self.header, self.manifest, self.proposer_signature)
     }
 }
@@ -120,7 +123,7 @@ mod tests {
         );
 
         let gossip = BlockHeaderNotification::new(header.clone(), manifest.clone(), zero_sig());
-        assert_eq!(gossip.header, header);
+        assert_eq!(*gossip.header, header);
         assert_eq!(gossip.manifest, manifest);
         assert_eq!(gossip.manifest.transaction_count(), 4);
     }
@@ -136,7 +139,7 @@ mod tests {
 
         let gossip = BlockHeaderNotification::new(header.clone(), manifest.clone(), zero_sig());
         let (h, m, _sig) = gossip.into_parts();
-        assert_eq!(h, header);
+        assert_eq!(*h, header);
         assert_eq!(m, manifest);
     }
 

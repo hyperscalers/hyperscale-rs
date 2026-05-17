@@ -253,7 +253,7 @@ where
                 let msg = state_provisions_message(&provisions_arc);
                 let sig = ctx.signing_key.sign_v1(&msg);
                 let notification =
-                    ProvisionsNotification::new((*provisions_arc).clone(), validator_id, sig);
+                    ProvisionsNotification::new(Arc::clone(&provisions_arc), validator_id, sig);
                 ctx.network.notify(&recipients, &notification);
             }
         }

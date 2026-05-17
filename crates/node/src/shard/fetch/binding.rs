@@ -281,8 +281,9 @@ impl FetchBinding for FinalizedWaveBinding {
             origin.class_override(),
             Box::new(move |result| {
                 if let Ok(resp) = result {
-                    let split =
-                        partition_solicited(resp.waves, &requested_ids, |w| w.wave_id().clone());
+                    let split = partition_solicited(resp.waves.into_inner(), &requested_ids, |w| {
+                        w.wave_id().clone()
+                    });
                     if !split.kept.is_empty() {
                         let _ = es.send(NodeInput::Protocol(Box::new(
                             ProtocolEvent::FinalizedWavesReceived { waves: split.kept },

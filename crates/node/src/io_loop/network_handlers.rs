@@ -1,7 +1,5 @@
 //! Network handler registration (gossip, notifications, requests).
 
-use std::sync::Arc;
-
 use hyperscale_core::{NodeInput, ProtocolEvent};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::Engine;
@@ -386,7 +384,7 @@ where
         self.network.register_gossip_handler::<TransactionGossip>(
             TopicScope::Shard,
             move |gossip: TransactionGossip| -> GossipVerdict {
-                for transaction in gossip.transactions {
+                for transaction in gossip.transactions.into_inner() {
                     let _ = tx.send(NodeInput::TransactionGossipReceived { tx: transaction });
                 }
                 GossipVerdict::Accept
@@ -417,7 +415,7 @@ where
                     };
 
                     let _ = tx.send(NodeInput::CommittedBlockGossipReceived {
-                        committed_header: Box::new(gossip.committed_header),
+                        committed_header: gossip.committed_header,
                         sender,
                         public_key,
                         sender_signature: gossip.sender_signature,
@@ -476,10 +474,7 @@ where
                     }
                     let (header, manifest, _sig) = gossip.into_parts();
                     let _ = tx.send(NodeInput::Protocol(Box::new(
-                        ProtocolEvent::BlockHeaderReceived {
-                            header: Arc::new(header),
-                            manifest,
-                        },
+                        ProtocolEvent::BlockHeaderReceived { header, manifest },
                     )));
                 },
             );
@@ -522,7 +517,7 @@ where
 
                     let _ = tx.send(NodeInput::Protocol(Box::new(
                         ProtocolEvent::ProvisionsReceived {
-                            provisions: Arc::new(notification.provisions),
+                            provisions: notification.provisions,
                         },
                     )));
                 },

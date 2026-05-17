@@ -33,7 +33,7 @@ use crate::shard::sync::SyncHost;
 /// A committed header pending sender-signature verification, queued in
 /// `ShardIo::committed_header_batch` and drained on the crypto pool.
 pub type CommittedHeaderVerificationItem = (
-    CommittedBlockHeader,
+    Arc<CommittedBlockHeader>,
     ValidatorId,
     Bls12381G1PublicKey,
     Bls12381G2Signature,

@@ -1,5 +1,7 @@
 //! `ProvisionsNotification` message for cross-shard provisions.
 
+use std::sync::Arc;
+
 use sbor::prelude::BasicSbor;
 
 use crate::{
@@ -15,7 +17,7 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct ProvisionsNotification {
     /// The provisions bundle being sent (one bundle per target shard).
-    pub provisions: Provisions,
+    pub provisions: Arc<Provisions>,
     /// The validator who sent this notification.
     pub sender: ValidatorId,
     /// BLS signature over the domain-separated signing message, by the sender.
@@ -23,15 +25,18 @@ pub struct ProvisionsNotification {
 }
 
 impl ProvisionsNotification {
-    /// Create a new signed provisions notification.
+    /// Create a new signed provisions notification. Accepts either a
+    /// freshly-built `Provisions` or an existing `Arc<Provisions>` —
+    /// pass the `Arc` directly when the producer already holds one to
+    /// avoid an extra clone.
     #[must_use]
-    pub const fn new(
-        provisions: Provisions,
+    pub fn new(
+        provisions: impl Into<Arc<Provisions>>,
         sender: ValidatorId,
         sender_signature: Bls12381G2Signature,
     ) -> Self {
         Self {
-            provisions,
+            provisions: provisions.into(),
             sender,
             sender_signature,
         }

@@ -36,8 +36,8 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::Arc;
 
+    use sbor::BASIC_SBOR_V1_MAX_DEPTH;
     use sbor::prelude::*;
-    use sbor::{BASIC_SBOR_V1_MAX_DEPTH, BasicDecoder, BasicEncoder};
 
     use crate::test_utils::test_transaction_with_nodes;
     use crate::{
@@ -48,8 +48,8 @@ mod tests {
         TxHash, TxOutcome, ValidatorId, ValidatorInfo, ValidatorSet, VotePower, WaveCertificate,
         WaveId, WaveReceiptHash, WeightedTimestamp, compute_global_receipt_root,
         compute_global_receipt_root_with_proof, compute_merkle_root, compute_provision_tx_roots,
-        decode_wave_cert_vec, encode_wave_cert_vec, generate_bls_keypair, tx_outcome_leaf,
-        verify_merkle_inclusion, wave_leader, wave_leader_at,
+        generate_bls_keypair, tx_outcome_leaf, verify_merkle_inclusion, wave_leader,
+        wave_leader_at,
     };
 
     /// Build a 2-shard topology with validator 0 on shard 0.
@@ -317,41 +317,6 @@ mod tests {
         let encoded = basic_encode(&wc).unwrap();
         let decoded: WaveCertificate = basic_decode(&encoded).unwrap();
         assert_eq!(wc, decoded);
-    }
-
-    #[test]
-    fn test_arc_vec_sbor_roundtrip() {
-        // Both WCs satisfy the local-EC invariant: their wave_id matches
-        // exactly one of the contained ECs.
-        let wid0 = make_wave_id(0, BlockHeight::new(42), &[1]);
-        let wid1 = make_wave_id(1, BlockHeight::new(42), &[]);
-        let outcomes_wid1 = vec![make_outcome(3)];
-        let root_wid1 = compute_global_receipt_root(&outcomes_wid1);
-        let local_ec_for_wid1 = Arc::new(ExecutionCertificate::new(
-            wid1.clone(),
-            WeightedTimestamp::from_millis(43),
-            root_wid1,
-            outcomes_wid1,
-            Bls12381G2Signature([0u8; 96]),
-            SignerBitfield::new(4),
-        ));
-        let certs = vec![
-            Arc::new(WaveCertificate::new(wid0, vec![make_test_wave_ec(0, 1)])),
-            Arc::new(WaveCertificate::new(wid1, vec![local_ec_for_wid1])),
-        ];
-
-        // Encode
-        let mut buf = Vec::new();
-        let mut encoder = BasicEncoder::new(&mut buf, BASIC_SBOR_V1_MAX_DEPTH);
-        encode_wave_cert_vec(&mut encoder, &certs).unwrap();
-
-        // Decode
-        let mut decoder = BasicDecoder::new(&buf, BASIC_SBOR_V1_MAX_DEPTH);
-        let result = decode_wave_cert_vec(&mut decoder, 100).unwrap();
-
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].as_ref(), certs[0].as_ref());
-        assert_eq!(result[1].as_ref(), certs[1].as_ref());
     }
 
     #[test]

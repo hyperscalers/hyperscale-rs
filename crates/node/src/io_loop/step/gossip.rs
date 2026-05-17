@@ -42,7 +42,7 @@ where
     pub(in crate::io_loop) fn handle_committed_block_gossip_received(
         &mut self,
         shard: ShardGroupId,
-        committed_header: CommittedBlockHeader,
+        committed_header: Arc<CommittedBlockHeader>,
         sender: ValidatorId,
         public_key: Bls12381G1PublicKey,
         sender_signature: Bls12381G2Signature,
@@ -91,7 +91,7 @@ where
                 if valid {
                     let _ = event_tx.send(NodeInput::Protocol(Box::new(
                         ProtocolEvent::RemoteHeaderReceived {
-                            committed_header: Arc::new(committed_header),
+                            committed_header,
                             sender,
                         },
                     )));

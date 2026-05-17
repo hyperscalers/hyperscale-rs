@@ -1,5 +1,7 @@
 //! `CommittedBlockHeader` gossip message for cross-shard header broadcast.
 
+use std::sync::Arc;
+
 use sbor::prelude::BasicSbor;
 
 use crate::{
@@ -17,7 +19,7 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct CommittedBlockHeaderGossip {
     /// The committed block header (header + QC).
-    pub committed_header: CommittedBlockHeader,
+    pub committed_header: Arc<CommittedBlockHeader>,
     /// The validator who sent this gossip (should be the block proposer).
     pub sender: ValidatorId,
     /// BLS signature over the domain-separated signing message, by the sender.
@@ -94,7 +96,7 @@ mod tests {
         let qc = QuorumCertificate::genesis(ShardGroupId::new(0));
 
         let gossip = CommittedBlockHeaderGossip {
-            committed_header: CommittedBlockHeader::new(header, qc),
+            committed_header: Arc::new(CommittedBlockHeader::new(header, qc)),
             sender: ValidatorId::new(0),
             sender_signature: zero_bls_signature(),
         };

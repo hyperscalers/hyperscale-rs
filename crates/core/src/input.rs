@@ -169,11 +169,12 @@ pub enum NodeInput {
     /// (sender committee check + public key resolution) but still needs
     /// batched BLS signature verification.
     CommittedBlockGossipReceived {
-        /// Header carried in the gossip envelope. Boxed so the variant
-        /// stays small — `CommittedBlockHeader` is the bulky field; the
-        /// BLS pubkey/sig stay inline since boxing them adds an
-        /// allocation per gossip without crossing a meaningful threshold.
-        committed_header: Box<CommittedBlockHeader>,
+        /// Header carried in the gossip envelope. `Arc`-shared so local
+        /// publishers and the BLS-verify batch all hold the same
+        /// allocation — `RemoteHeaderReceived` downstream takes
+        /// `Arc<CommittedBlockHeader>` and the wire type's
+        /// `SborArc<CommittedBlockHeader>` exposes the same inner.
+        committed_header: Arc<CommittedBlockHeader>,
         /// Sender validator id.
         sender: ValidatorId,
         /// Sender's public key, resolved from topology.
