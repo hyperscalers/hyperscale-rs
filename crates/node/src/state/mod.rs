@@ -54,7 +54,7 @@ pub type NodeIndex = u32;
 /// in `BftCoordinator` (HotStuff-2 style).
 ///
 /// The block-sync state machine itself lives on `IoLoop` (in
-/// `io_loop::sync::block`); when a synced block is ready to apply,
+/// `shard::sync::block`); when a synced block is ready to apply,
 /// `IoLoop` fires a `BlockSyncReadyToApply` event into this state machine,
 /// which routes it to BFT.
 pub struct NodeStateMachine {

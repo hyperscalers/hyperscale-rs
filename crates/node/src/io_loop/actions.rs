@@ -21,13 +21,13 @@ use hyperscale_types::{
 use tracing::{debug, error, trace, warn};
 
 use super::{IoLoop, TimerOp};
-use crate::io_loop::sync::block::BlockSyncInput;
 use crate::shard::block_commit::{AccumulateDecision, PendingCommit};
 use crate::shard::fetch::FetchInput;
 use crate::shard::fetch::binding::{
     ExecCertBinding, FinalizedWaveBinding, LocalProvisionBinding, ProvisionBinding,
     TransactionBinding,
 };
+use crate::shard::sync::block::BlockSyncInput;
 impl<S, N, D, E> IoLoop<S, N, D, E>
 where
     S: Storage,
@@ -169,7 +169,7 @@ where
         // advance per-shard `committed` and emit `SyncComplete` once the
         // chain catches up. Drives any newly-emitted range fetches inline.
         if let ProtocolEvent::RemoteHeaderAdmitted { committed_header } = &pe {
-            let outputs = self.syncs.on_remote_header_admitted(
+            let outputs = self.shard_syncs_mut().on_remote_header_admitted(
                 committed_header.shard_group_id(),
                 committed_header.header().height(),
             );
@@ -401,7 +401,7 @@ where
             AccumulateDecision::Accepted { height, notify_now } => {
                 debug!(height = height.inner(), "Block committed");
                 let outputs = self
-                    .syncs
+                    .shard_syncs_mut()
                     .block
                     .handle(BlockSyncInput::Admitted { scope: (), height });
                 self.process_block_sync_outputs(outputs);

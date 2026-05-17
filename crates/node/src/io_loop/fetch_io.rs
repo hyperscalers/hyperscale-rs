@@ -122,16 +122,17 @@ where
     }
 
     pub(in crate::io_loop) fn update_fetch_tick_timer(&mut self) {
-        let op = if self.shard_fetches().has_any_pending() || self.syncs.has_any_pending() {
-            TimerOp::Set {
-                id: TimerId::FetchTick,
-                duration: Self::FETCH_TICK_INTERVAL,
-            }
-        } else {
-            TimerOp::Cancel {
-                id: TimerId::FetchTick,
-            }
-        };
+        let op =
+            if self.shard_fetches().has_any_pending() || self.shard_syncs_mut().has_any_pending() {
+                TimerOp::Set {
+                    id: TimerId::FetchTick,
+                    duration: Self::FETCH_TICK_INTERVAL,
+                }
+            } else {
+                TimerOp::Cancel {
+                    id: TimerId::FetchTick,
+                }
+            };
         self.vnodes[0].pending_timer_ops.push(op);
     }
 }

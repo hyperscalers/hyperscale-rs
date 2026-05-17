@@ -113,7 +113,7 @@ where
         let mempool = state.mempool();
         let contention = mempool.lock_contention_stats();
         let fetches = self.shard_fetches().metrics();
-        let syncs = self.syncs.metrics();
+        let syncs = self.shard_syncs().metrics();
         let block_sync_status = &syncs.block_sync_status;
 
         let bft_mem = state.bft().memory_stats();
@@ -130,12 +130,12 @@ where
             contention_ratio: contention.contention_ratio(),
             in_flight: mempool.in_flight(),
             backpressure_active: mempool.at_in_flight_limit(),
-            blocks_behind: self.syncs.block.blocks_behind(),
-            is_syncing: self.syncs.block.is_syncing(),
-            block_sync_round_in_flight: self.syncs.block.in_flight_ranges(),
-            remote_header_blocks_behind: self.syncs.remote_header.total_blocks_behind(),
-            remote_header_is_syncing: self.syncs.remote_header.is_syncing(),
-            remote_header_round_in_flight: self.syncs.remote_header.in_flight_ranges(),
+            blocks_behind: self.shard_syncs().block.blocks_behind(),
+            is_syncing: self.shard_syncs().block.is_syncing(),
+            block_sync_round_in_flight: self.shard_syncs().block.in_flight_ranges(),
+            remote_header_blocks_behind: self.shard_syncs().remote_header.total_blocks_behind(),
+            remote_header_is_syncing: self.shard_syncs().remote_header.is_syncing(),
+            remote_header_round_in_flight: self.shard_syncs().remote_header.in_flight_ranges(),
             fetch_transaction: fetches.transaction_in_flight,
             fetch_provision: fetches.provision_in_flight,
             fetch_local_provision: fetches.local_provision_in_flight,
@@ -212,7 +212,10 @@ where
                 node_finalized_wave_fetch_pending: fetches.finalized_wave_pending,
                 node_provision_fetch_pending: fetches.provision_pending,
                 node_exec_cert_fetch_pending: fetches.exec_cert_pending,
-                node_remote_header_fetch_pending: self.syncs.remote_header.in_flight_ranges(),
+                node_remote_header_fetch_pending: self
+                    .shard_syncs()
+                    .remote_header
+                    .in_flight_ranges(),
                 // Storage — filled in by record_metrics off-thread.
                 rocksdb_block_cache_usage_bytes: 0,
                 rocksdb_memtable_usage_bytes: 0,

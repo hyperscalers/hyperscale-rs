@@ -59,7 +59,7 @@ pub mod host;
 pub mod remote_header;
 pub mod remote_header_serve;
 
-pub use host::{SyncHost, SyncMetrics};
+pub use host::SyncHost;
 
 /// Initial backoff for a deferred height after its first fetch failure.
 const DEFERRAL_BASE_MS: u64 = 1_000;

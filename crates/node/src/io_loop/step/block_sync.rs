@@ -49,8 +49,8 @@ use hyperscale_types::{
 };
 
 use crate::io_loop::IoLoop;
-use crate::io_loop::sync::SyncOutput;
-use crate::io_loop::sync::block::{BlockSyncInput, BlockSyncOutput};
+use crate::shard::sync::SyncOutput;
+use crate::shard::sync::block::{BlockSyncInput, BlockSyncOutput};
 
 impl<S, N, D, E> IoLoop<S, N, D, E>
 where
@@ -65,7 +65,7 @@ where
     /// fetches it emits.
     pub(in crate::io_loop) fn process_start_block_sync(&mut self, target: BlockHeight) {
         let outputs = self
-            .syncs
+            .shard_syncs_mut()
             .block
             .handle(BlockSyncInput::StartSync { scope: (), target });
         self.process_block_sync_outputs(outputs);
@@ -101,7 +101,7 @@ where
                     RehydrateError::QcMismatch { .. } => "qc_hash_mismatch",
                 };
                 record_sync_response_error("block", reason);
-                self.syncs.block.mark_force_full_refetch(height);
+                self.shard_syncs_mut().block.mark_force_full_refetch(height);
                 // Rehydration is a local-data issue resolved by force-full
                 // on the next attempt — re-queue immediately rather than
                 // backing off.
@@ -196,8 +196,8 @@ where
     ) {
         use hyperscale_types::network::request::GetBlockRequest;
 
-        let target_height = self.syncs.block.target(&()).unwrap_or(height);
-        let force_full = self.syncs.block.force_full(height);
+        let target_height = self.shard_syncs().block.target(&()).unwrap_or(height);
+        let force_full = self.shard_syncs().block.force_full(height);
 
         // Heights flagged `force_full` were rehydration misses last time —
         // request with empty inventory so the responder cannot elide bodies.
@@ -272,13 +272,16 @@ where
 
         // Hand the block off to BFT; tell the FSM the height was delivered.
         self.feed_event(ProtocolEvent::BlockSyncReadyToApply { certified });
-        let outputs = self.syncs.block.handle(BlockSyncInput::FetchSucceeded {
-            scope: (),
-            from: height,
-            count: 1,
-            delivered_heights: vec![height],
-            now: std::time::Instant::now(),
-        });
+        let outputs = self
+            .shard_syncs_mut()
+            .block
+            .handle(BlockSyncInput::FetchSucceeded {
+                scope: (),
+                from: height,
+                count: 1,
+                delivered_heights: vec![height],
+                now: std::time::Instant::now(),
+            });
         self.process_block_sync_outputs(outputs);
         self.update_fetch_tick_timer();
     }
@@ -286,13 +289,16 @@ where
     /// Common back-edge: re-queue a height via `FetchFailed`.
     fn feed_block_sync_fetch_failed(&mut self, height: BlockHeight, kind: FetchFailureKind) {
         record_sync_round_retried("block");
-        let outputs = self.syncs.block.handle(BlockSyncInput::FetchFailed {
-            scope: (),
-            from: height,
-            count: 1,
-            kind,
-            now: std::time::Instant::now(),
-        });
+        let outputs = self
+            .shard_syncs_mut()
+            .block
+            .handle(BlockSyncInput::FetchFailed {
+                scope: (),
+                from: height,
+                count: 1,
+                kind,
+                now: std::time::Instant::now(),
+            });
         self.process_block_sync_outputs(outputs);
         self.update_fetch_tick_timer();
     }
