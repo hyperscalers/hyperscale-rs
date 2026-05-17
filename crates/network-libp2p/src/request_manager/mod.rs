@@ -41,7 +41,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
-use hyperscale_types::MessageClass;
+use hyperscale_types::{MessageClass, ShardGroupId};
 use libp2p::PeerId;
 use peer_health::{PeerHealthConfig, PeerHealthTracker};
 use thiserror::Error;
@@ -305,10 +305,12 @@ impl RequestManager {
     ///
     /// Returns [`RequestError`] when retries are exhausted, the request times out,
     /// or no peer in `peers` is reachable.
+    #[allow(clippy::too_many_arguments)] // single retry/peer-rotation entry point
     pub async fn request(
         &self,
         peers: &[PeerId],
         preferred_peer: Option<PeerId>,
+        shard: ShardGroupId,
         request_desc: String,
         type_id: &'static str,
         sbor_data: Vec<u8>,
@@ -320,6 +322,7 @@ impl RequestManager {
             .request_inner(
                 peers,
                 preferred_peer,
+                shard,
                 &request_desc,
                 type_id,
                 &sbor_data,

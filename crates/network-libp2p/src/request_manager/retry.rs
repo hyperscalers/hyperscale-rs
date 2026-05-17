@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use hyperscale_metrics::{increment_dispatch_failures, record_request_retry};
-use hyperscale_types::MessageClass;
+use hyperscale_types::{MessageClass, ShardGroupId};
 use libp2p::PeerId;
 use tokio::time::sleep;
 use tracing::{debug, trace, warn};
@@ -17,11 +17,12 @@ use super::{RequestError, RequestManager};
 use crate::adapter::NetworkError;
 
 impl RequestManager {
-    #[allow(clippy::too_many_lines)] // single retry/backoff/peer-rotation loop; splitting would scatter shared state
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)] // single retry/backoff/peer-rotation loop; splitting would scatter shared state
     pub(super) async fn request_inner(
         &self,
         peers: &[PeerId],
         preferred_peer: Option<PeerId>,
+        shard: ShardGroupId,
         request_desc: &str,
         type_id: &'static str,
         data: &[u8],
@@ -55,7 +56,9 @@ impl RequestManager {
             );
 
             let start = Instant::now();
-            let result = self.send_request(&current_peer, type_id, data, class).await;
+            let result = self
+                .send_request(&current_peer, shard, type_id, data, class)
+                .await;
             let elapsed = start.elapsed();
 
             debug!(
@@ -216,6 +219,7 @@ mod tests {
         fn send<'a>(
             &'a self,
             peer: PeerId,
+            _shard: ShardGroupId,
             type_id: &'static str,
             _data: Vec<u8>,
             _timeout: Duration,
@@ -271,6 +275,7 @@ mod tests {
             .request(
                 peers,
                 preferred,
+                ShardGroupId::new(0),
                 "test".to_string(),
                 "test.req",
                 vec![1, 2, 3],

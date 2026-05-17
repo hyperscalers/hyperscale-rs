@@ -63,8 +63,9 @@ pub struct Libp2pNetwork {
     tokio_handle: Handle,
     /// Shared handler registry for per-type gossip and request dispatch.
     registry: Arc<HandlerRegistry>,
-    /// Local shard for deriving topic subscriptions.
-    local_shard: ShardGroupId,
+    /// Shards hosted by this host. Drives per-shard gossipsub
+    /// subscriptions on `register_gossip_handler`.
+    local_shards: HashSet<ShardGroupId>,
     /// Topology snapshot used to resolve shard → committee for outbound
     /// requests. Updated lock-free via [`Self::update_topology`].
     topology: Arc<ArcSwap<TopologySnapshot>>,
@@ -87,7 +88,6 @@ impl Libp2pNetwork {
         request_manager: Arc<RequestManager>,
         tokio_handle: Handle,
         registry: Arc<HandlerRegistry>,
-        local_shard: ShardGroupId,
         topology: Arc<ArcSwap<TopologySnapshot>>,
     ) -> Self {
         // Eagerly spawn the inbound router. It will dispatch incoming
@@ -97,12 +97,17 @@ impl Libp2pNetwork {
 
         let notify_pool = NotifyStreamPool::new(adapter.clone(), tokio_handle.clone());
 
+        // Mirror the adapter's hosted-shard set so `register_gossip_handler`
+        // can subscribe to one topic per hosted shard without consulting
+        // the topology snapshot.
+        let local_shards = adapter.local_shards().clone();
+
         Self {
             adapter,
             request_manager,
             tokio_handle,
             registry,
-            local_shard,
+            local_shards,
             topology,
             peer_unreachable_count: AtomicUsize::new(0),
             notify_pool,
@@ -154,19 +159,27 @@ impl Network for Libp2pNetwork {
         // Registry owns SBOR decode — just forward.
         self.registry.register_gossip(handler);
 
-        // Auto-subscribe to the corresponding gossipsub topic.
-        let topic = match scope {
-            TopicScope::Shard => Topic::shard(M::message_type_id(), self.local_shard),
-            TopicScope::Global => Topic::global(M::message_type_id()),
+        // Auto-subscribe to the corresponding gossipsub topic(s). Shard-
+        // scoped handlers register one topic per hosted shard so a
+        // multi-shard host receives gossip for every shard it serves.
+        let topics: Vec<Topic> = match scope {
+            TopicScope::Shard => self
+                .local_shards
+                .iter()
+                .map(|shard| Topic::shard(M::message_type_id(), *shard))
+                .collect(),
+            TopicScope::Global => vec![Topic::global(M::message_type_id())],
         };
-        if let Err(e) = self.adapter.subscribe_topic(topic.to_string()) {
-            warn!(
-                message_type = M::message_type_id(),
-                error = ?e,
-                "Failed to subscribe to topic"
-            );
-        } else {
-            info!(topic = %topic, "Subscribed to topic");
+        for topic in topics {
+            if let Err(e) = self.adapter.subscribe_topic(topic.to_string()) {
+                warn!(
+                    message_type = M::message_type_id(),
+                    error = ?e,
+                    "Failed to subscribe to topic"
+                );
+            } else {
+                info!(topic = %topic, "Subscribed to topic");
+            }
         }
     }
 
@@ -278,6 +291,7 @@ impl Network for Libp2pNetwork {
                 .request(
                     &resolved_peers,
                     preferred_libp2p,
+                    shard,
                     description,
                     type_id,
                     request_bytes,

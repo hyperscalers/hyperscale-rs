@@ -36,6 +36,7 @@ use dashmap::DashMap;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite};
 use hyperscale_metrics::record_libp2p_bandwidth;
 use hyperscale_network::compression::decompress;
+use hyperscale_types::ShardGroupId;
 use libp2p::PeerId;
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
@@ -59,7 +60,8 @@ const PEER_CHANNEL_CAPACITY: usize = 64;
 ///
 /// [`RequestManager`]: crate::RequestManager
 pub trait RequestPool: Send + Sync + 'static {
-    /// Send a request to `peer` and await the response.
+    /// Send a request to `peer` over `shard`'s request protocol and await
+    /// the response.
     ///
     /// `timeout` bounds the I/O for this request once the pool dispatches
     /// it. The future is boxed because the trait is object-safe; the
@@ -67,6 +69,7 @@ pub trait RequestPool: Send + Sync + 'static {
     fn send<'a>(
         &'a self,
         peer: PeerId,
+        shard: ShardGroupId,
         type_id: &'static str,
         data: Vec<u8>,
         timeout: Duration,
@@ -77,11 +80,12 @@ impl RequestPool for RequestStreamPool {
     fn send<'a>(
         &'a self,
         peer: PeerId,
+        shard: ShardGroupId,
         type_id: &'static str,
         data: Vec<u8>,
         timeout: Duration,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, NetworkError>> + Send + 'a>> {
-        Box::pin(Self::send(self, peer, type_id, data, timeout))
+        Box::pin(Self::send(self, peer, shard, type_id, data, timeout))
     }
 }
 
@@ -108,16 +112,22 @@ struct PeerRequestActor {
     req_tx: mpsc::Sender<PendingRequest>,
 }
 
-/// Manages persistent outbound request streams, one per peer.
+/// Per-actor key: one persistent stream per `(peer, shard)` pair. With
+/// V=1 single-shard hosting this collapses to one entry per peer; under
+/// multi-shard hosting the key grows with hosted-shard cardinality.
+type ActorKey = (PeerId, ShardGroupId);
+
+/// Manages persistent outbound request streams, one per `(peer, shard)` pair.
 pub struct RequestStreamPool {
     adapter: Arc<Libp2pAdapter>,
-    peers: Arc<DashMap<PeerId, PeerRequestActor>>,
-    backoff: Arc<DashMap<PeerId, BackoffState>>,
+    peers: Arc<DashMap<ActorKey, PeerRequestActor>>,
+    backoff: Arc<DashMap<ActorKey, BackoffState>>,
     tokio_handle: Handle,
 }
 
 impl RequestStreamPool {
-    /// Build an empty pool that lazily spawns one per-peer request actor on demand.
+    /// Build an empty pool that lazily spawns one per-(peer,shard) request
+    /// actor on demand.
     #[must_use]
     pub fn new(adapter: Arc<Libp2pAdapter>, tokio_handle: Handle) -> Self {
         Self {
@@ -128,19 +138,23 @@ impl RequestStreamPool {
         }
     }
 
-    /// Send a request to `peer` and await the response.
+    /// Send a request to `peer` over `shard`'s request protocol and await
+    /// the response.
     ///
     /// `timeout` bounds the I/O for this request once the actor picks it up —
     /// it does not bound queueing delay behind other pending requests on the
-    /// same peer (peer rotation at the request-manager layer handles that).
+    /// same `(peer, shard)` actor (peer rotation at the request-manager
+    /// layer handles that).
     ///
     /// # Errors
     ///
-    /// Returns the underlying [`NetworkError`] if the per-peer actor cannot be
-    /// spawned, the stream open fails, or the request times out.
+    /// Returns the underlying [`NetworkError`] if the per-(peer,shard)
+    /// actor cannot be spawned, the stream open fails, or the request
+    /// times out.
     pub async fn send(
         &self,
         peer: PeerId,
+        shard: ShardGroupId,
         type_id: &'static str,
         data: Vec<u8>,
         timeout: Duration,
@@ -153,7 +167,7 @@ impl RequestStreamPool {
             resp_tx,
         };
 
-        self.dispatch(peer, req).await?;
+        self.dispatch((peer, shard), req).await?;
 
         resp_rx.await.unwrap_or_else(|_| {
             Err(NetworkError::StreamIo(
@@ -163,26 +177,26 @@ impl RequestStreamPool {
     }
 
     /// Route a request to a live actor, spawning one if necessary.
-    async fn dispatch(&self, peer: PeerId, req: PendingRequest) -> Result<(), NetworkError> {
-        if let Some(actor) = self.peers.get(&peer) {
+    async fn dispatch(&self, key: ActorKey, req: PendingRequest) -> Result<(), NetworkError> {
+        if let Some(actor) = self.peers.get(&key) {
             let tx = actor.req_tx.clone();
             drop(actor);
             match tx.send(req).await {
                 Ok(()) => return Ok(()),
                 Err(mpsc::error::SendError(returned)) => {
                     // Actor task is dead. Remove and fall through to spawn.
-                    self.peers.remove(&peer);
-                    return self.spawn_and_send(peer, returned).await;
+                    self.peers.remove(&key);
+                    return self.spawn_and_send(key, returned).await;
                 }
             }
         }
 
-        self.spawn_and_send(peer, req).await
+        self.spawn_and_send(key, req).await
     }
 
-    /// Spawn a new actor for `peer` (respecting backoff) and enqueue `req`.
-    async fn spawn_and_send(&self, peer: PeerId, req: PendingRequest) -> Result<(), NetworkError> {
-        if let Some(state) = self.backoff.get(&peer)
+    /// Spawn a new actor for `key` (respecting backoff) and enqueue `req`.
+    async fn spawn_and_send(&self, key: ActorKey, req: PendingRequest) -> Result<(), NetworkError> {
+        if let Some(state) = self.backoff.get(&key)
             && Instant::now() < state.next_attempt
         {
             return Err(NetworkError::StreamIo(
@@ -196,14 +210,14 @@ impl RequestStreamPool {
             return Err(NetworkError::StreamIo("failed to enqueue request".into()));
         }
 
-        self.peers.insert(peer, PeerRequestActor { req_tx });
+        self.peers.insert(key, PeerRequestActor { req_tx });
 
         let peers = self.peers.clone();
         let backoff = self.backoff.clone();
         let adapter = self.adapter.clone();
 
         self.tokio_handle.spawn(async move {
-            Self::run_actor(peer, req_rx, adapter, peers, backoff).await;
+            Self::run_actor(key, req_rx, adapter, peers, backoff).await;
         });
 
         Ok(())
@@ -213,27 +227,28 @@ impl RequestStreamPool {
     /// in order. Closes cleanly after `CLIENT_IDLE_TIMEOUT` of inactivity.
     /// Tears down (and applies backoff) on a response-phase error or timeout.
     async fn run_actor(
-        peer: PeerId,
+        key: ActorKey,
         mut req_rx: mpsc::Receiver<PendingRequest>,
         adapter: Arc<Libp2pAdapter>,
-        peers: Arc<DashMap<PeerId, PeerRequestActor>>,
-        backoff_map: Arc<DashMap<PeerId, BackoffState>>,
+        peers: Arc<DashMap<ActorKey, PeerRequestActor>>,
+        backoff_map: Arc<DashMap<ActorKey, BackoffState>>,
     ) {
-        let mut stream = match adapter.open_request_stream(peer).await {
+        let (peer, shard) = key;
+        let mut stream = match adapter.open_request_stream(peer, shard).await {
             Ok(s) => s,
             Err(e) => {
-                warn!(peer = %peer, error = ?e, "Failed to open persistent request stream");
+                warn!(peer = %peer, shard = shard.inner(), error = ?e, "Failed to open persistent request stream");
                 // Fail every pending request so callers see the error promptly.
                 drain_with_error(&mut req_rx, || {
                     NetworkError::StreamOpenFailed(format!("{e:?}"))
                 });
-                peer_backoff::apply_backoff(&backoff_map, &peer);
-                peers.remove(&peer);
+                peer_backoff::apply_backoff(&backoff_map, &key);
+                peers.remove(&key);
                 return;
             }
         };
 
-        backoff_map.remove(&peer);
+        backoff_map.remove(&key);
 
         loop {
             let req = tokio::select! {
@@ -242,7 +257,7 @@ impl RequestStreamPool {
                     None => break,
                 },
                 () = sleep(CLIENT_IDLE_TIMEOUT) => {
-                    debug!(peer = %peer, "Client idle timeout — closing persistent stream");
+                    debug!(peer = %peer, shard = shard.inner(), "Client idle timeout — closing persistent stream");
                     break;
                 }
             };
@@ -259,8 +274,8 @@ impl RequestStreamPool {
             // tearing down.
             let outcome = match outcome {
                 Ok(IoOutcome::WriteFailed(e)) => {
-                    debug!(peer = %peer, error = ?e, "Write failed on persistent stream — reopening and retrying once");
-                    match adapter.open_request_stream(peer).await {
+                    debug!(peer = %peer, shard = shard.inner(), error = ?e, "Write failed on persistent stream — reopening and retrying once");
+                    match adapter.open_request_stream(peer, shard).await {
                         Ok(new_stream) => {
                             stream = new_stream;
                             tokio_timeout(
@@ -270,7 +285,7 @@ impl RequestStreamPool {
                             .await
                         }
                         Err(reopen_err) => {
-                            warn!(peer = %peer, error = ?reopen_err, "Failed to reopen persistent request stream");
+                            warn!(peer = %peer, shard = shard.inner(), error = ?reopen_err, "Failed to reopen persistent request stream");
                             Ok(IoOutcome::ResponseFailed(NetworkError::StreamOpenFailed(
                                 format!("{reopen_err:?}"),
                             )))
@@ -287,12 +302,12 @@ impl RequestStreamPool {
                 Ok(IoOutcome::WriteFailed(e) | IoOutcome::ResponseFailed(e)) => {
                     let msg = format!("{e:?}");
                     let _ = req.resp_tx.send(Err(e));
-                    warn!(peer = %peer, error = %msg, "Persistent request stream I/O failed");
+                    warn!(peer = %peer, shard = shard.inner(), error = %msg, "Persistent request stream I/O failed");
                     drain_with_error(&mut req_rx, || {
                         NetworkError::StreamIo("peer stream reset after prior failure".into())
                     });
-                    peer_backoff::apply_backoff(&backoff_map, &peer);
-                    peers.remove(&peer);
+                    peer_backoff::apply_backoff(&backoff_map, &key);
+                    peers.remove(&key);
                     return;
                 }
                 Err(_) => {
@@ -302,14 +317,14 @@ impl RequestStreamPool {
                     drain_with_error(&mut req_rx, || {
                         NetworkError::StreamIo("peer stream reset after request timeout".into())
                     });
-                    peer_backoff::apply_backoff(&backoff_map, &peer);
-                    peers.remove(&peer);
+                    peer_backoff::apply_backoff(&backoff_map, &key);
+                    peers.remove(&key);
                     return;
                 }
             }
         }
 
-        peers.remove(&peer);
+        peers.remove(&key);
     }
 }
 

@@ -60,7 +60,7 @@ pub(super) async fn run(
     mut bulk_rx: mpsc::Receiver<SwarmCommand>,
     mut shutdown_rx: mpsc::Receiver<()>,
     cached_peer_count: Arc<AtomicUsize>,
-    local_shard: ShardGroupId,
+    local_shards: std::collections::HashSet<ShardGroupId>,
     version_interop_mode: VersionInteroperabilityMode,
     registry: Arc<HandlerRegistry>,
     validator_peers: Arc<DashMap<ValidatorId, Libp2pPeerId>>,
@@ -375,7 +375,7 @@ pub(super) async fn run(
                 // Delegate gossipsub messages to the event handler
                 super::gossipsub::handle_gossipsub_event(
                     event,
-                    local_shard,
+                    &local_shards,
                     &registry,
                     &validation_tx,
                 );

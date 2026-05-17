@@ -1,5 +1,6 @@
 //! Core `Libp2pAdapter`: construction, public API, and shutdown.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -24,7 +25,7 @@ use tokio::spawn;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, trace};
 
-use super::behaviour::{Behaviour, NOTIFY_PROTOCOL, REQUEST_PROTOCOL};
+use super::behaviour::{Behaviour, NOTIFY_PROTOCOL, request_protocol};
 use super::command::{ClassCommandChannels, SwarmCommand};
 use super::error::NetworkError;
 use crate::config::Libp2pConfig;
@@ -44,6 +45,10 @@ pub struct Libp2pAdapter {
     /// Validator ids hosted by this peer. One under V=1; multiple when
     /// the host runs several same-shard vnodes off one libp2p identity.
     local_validator_ids: Vec<ValidatorId>,
+
+    /// Shards hosted by this peer. Drives per-shard request stream
+    /// protocol registration and per-shard gossipsub topic subscription.
+    local_shards: HashSet<ShardGroupId>,
 
     /// Priority-based command channels to swarm task.
     /// Commands are routed to the appropriate channel based on message priority.
@@ -79,7 +84,10 @@ impl Libp2pAdapter {
     /// * `vnodes` - One `(validator_id, signing_key)` per hosted vnode.
     ///   The bind service attests as every entry on each handshake. Must
     ///   be non-empty.
-    /// * `shard` - Local shard assignment (same-shard hosting only)
+    /// * `local_shards` - Shards hosted by this peer. The adapter
+    ///   registers one inbound request accept loop per shard and
+    ///   subscribes to per-shard gossipsub topics for the union.
+    ///   Must be non-empty.
     /// * `registry` - Shared handler registry for per-type message dispatch
     /// * `validator_keys` - Initial validator key map for bind verification
     ///
@@ -93,7 +101,7 @@ impl Libp2pAdapter {
     ///
     /// # Panics
     ///
-    /// Panics if `vnodes` is empty.
+    /// Panics if `vnodes` or `local_shards` is empty.
     // Single setup path mirroring the libp2p builder structure.
     // `config` is taken by value: every caller constructs a fresh config and hands
     // it over, and the body picks fields out, so converting to `&Libp2pConfig`
@@ -103,7 +111,7 @@ impl Libp2pAdapter {
         config: Libp2pConfig,
         keypair: Keypair,
         vnodes: Vec<LocalVnodeIdentity>,
-        shard: ShardGroupId,
+        local_shards: HashSet<ShardGroupId>,
         registry: Arc<HandlerRegistry>,
         validator_keys: Arc<ValidatorKeyMap>,
     ) -> Result<Arc<Self>, NetworkError> {
@@ -111,13 +119,17 @@ impl Libp2pAdapter {
             !vnodes.is_empty(),
             "Libp2pAdapter needs at least one hosted vnode"
         );
+        assert!(
+            !local_shards.is_empty(),
+            "Libp2pAdapter needs at least one hosted shard"
+        );
         let local_peer_id = Libp2pPeerId::from(keypair.public());
         let local_validator_ids: Vec<ValidatorId> = vnodes.iter().map(|(vid, _)| *vid).collect();
 
         info!(
             local_peer_id = %local_peer_id,
             validator_ids = ?local_validator_ids,
-            shard = shard.inner(),
+            shard_count = local_shards.len(),
             "Creating libp2p network adapter"
         );
 
@@ -237,6 +249,7 @@ impl Libp2pAdapter {
         let adapter = Arc::new(Self {
             local_peer_id,
             local_validator_ids,
+            local_shards,
             priority_channels,
             validator_peers: validator_peers.clone(),
             shutdown_tx: Some(shutdown_tx),
@@ -248,6 +261,7 @@ impl Libp2pAdapter {
         // Spawn with panic catching - network loop panics are critical but shouldn't
         // crash the entire node. The process supervisor (systemd/k8s) should restart.
         let event_loop_validator_peers = validator_peers;
+        let event_loop_local_shards = adapter.local_shards.clone();
         let bind_trigger_tx = bind_handle.bind_tx.clone();
         let bootstrap_peers = config.bootstrap_peers.clone();
         spawn(async move {
@@ -263,7 +277,7 @@ impl Libp2pAdapter {
                 bulk_rx,
                 shutdown_rx,
                 cached_peer_count,
-                shard,
+                event_loop_local_shards,
                 config.version_interop_mode,
                 registry,
                 event_loop_validator_peers,
@@ -385,6 +399,13 @@ impl Libp2pAdapter {
         &self.local_validator_ids
     }
 
+    /// Shards hosted by this libp2p peer. Drives per-shard request stream
+    /// protocol registration and per-shard gossipsub subscriptions.
+    #[must_use]
+    pub const fn local_shards(&self) -> &HashSet<ShardGroupId> {
+        &self.local_shards
+    }
+
     /// Get the cached connected peer count (non-blocking).
     ///
     /// This returns instantly from an atomic counter that's updated by the
@@ -437,10 +458,14 @@ impl Libp2pAdapter {
     ///
     /// Returns [`NetworkError::StreamOpenFailed`] if the underlying libp2p
     /// stream control rejects the open (peer unknown, protocol unsupported, etc.).
-    pub async fn open_request_stream(&self, peer: Libp2pPeerId) -> Result<Stream, NetworkError> {
+    pub async fn open_request_stream(
+        &self,
+        peer: Libp2pPeerId,
+        shard: ShardGroupId,
+    ) -> Result<Stream, NetworkError> {
         self.stream_control
             .clone()
-            .open_stream(peer, REQUEST_PROTOCOL)
+            .open_stream(peer, request_protocol(shard))
             .await
             .map_err(|e| NetworkError::StreamOpenFailed(format!("{e:?}")))
     }

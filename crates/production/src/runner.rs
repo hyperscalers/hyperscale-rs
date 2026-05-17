@@ -40,7 +40,7 @@
 //! ProdTimerManager ──crossbeam──→ pinned thread (timer events)
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -420,7 +420,7 @@ impl ProductionRunnerBuilder {
         } = build_network_stack(NetworkBuildArgs {
             network_config,
             ed25519_keypair,
-            local_shard,
+            local_shards: HashSet::from([local_shard]),
             bind_vnodes,
             initial_validator_keys,
             topology: topology.clone(),
@@ -868,7 +868,9 @@ impl ProductionRunner {
 struct NetworkBuildArgs {
     network_config: Libp2pConfig,
     ed25519_keypair: Keypair,
-    local_shard: ShardGroupId,
+    /// Shards hosted by this host. Drives per-shard request stream
+    /// protocols and gossipsub subscriptions on the adapter.
+    local_shards: HashSet<ShardGroupId>,
     /// One `(validator_id, signing_key)` per hosted vnode. The bind
     /// service attests as every entry on each handshake.
     bind_vnodes: Vec<(ValidatorId, Arc<Bls12381G1PrivateKey>)>,
@@ -890,7 +892,7 @@ fn build_network_stack(args: NetworkBuildArgs) -> Result<NetworkStack, RunnerErr
         args.network_config,
         args.ed25519_keypair,
         args.bind_vnodes,
-        args.local_shard,
+        args.local_shards,
         registry.clone(),
         args.initial_validator_keys,
     )?;
@@ -909,7 +911,6 @@ fn build_network_stack(args: NetworkBuildArgs) -> Result<NetworkStack, RunnerErr
         request_manager,
         TokioHandle::current(),
         registry,
-        args.local_shard,
         args.topology,
     );
 

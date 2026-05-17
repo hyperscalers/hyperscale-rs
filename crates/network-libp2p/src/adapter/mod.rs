@@ -15,7 +15,7 @@ mod gossipsub;
 mod identity;
 mod swarm_builder;
 
-pub use behaviour::{NOTIFY_PROTOCOL, REQUEST_PROTOCOL};
+pub use behaviour::{NOTIFY_PROTOCOL, request_protocol};
 pub use error::NetworkError;
 pub use identity::generate_random_keypair;
 

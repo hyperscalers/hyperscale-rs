@@ -106,7 +106,7 @@ const fn acceptance_label(acceptance: &MessageAcceptance) -> &'static str {
 #[allow(clippy::too_many_lines)] // single dispatch over gossipsub events; sub-events share local state
 pub(super) fn handle_gossipsub_event(
     event: SwarmEvent<BehaviourEvent>,
-    local_shard: ShardGroupId,
+    local_shards: &std::collections::HashSet<ShardGroupId>,
     registry: &Arc<HandlerRegistry>,
     validation_tx: &mpsc::UnboundedSender<ValidationReport>,
 ) {
@@ -147,14 +147,13 @@ pub(super) fn handle_gossipsub_event(
 
             if is_shard_local_message
                 && let Some(topic_shard) = parsed.shard_id
-                && topic_shard != local_shard
+                && !local_shards.contains(&topic_shard)
             {
                 warn!(
                     topic = %topic_str,
                     topic_shard = topic_shard.inner(),
-                    local_shard = local_shard.inner(),
                     msg_type = msg_type,
-                    "Dropping shard-local message from wrong shard (cross-shard contamination attempt)"
+                    "Dropping shard-local message from non-hosted shard (cross-shard contamination attempt)"
                 );
                 record_invalid_message();
                 record_gossipsub_validation(acceptance_label(&MessageAcceptance::Reject));

@@ -9,6 +9,7 @@
 
 mod fixtures;
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -73,7 +74,7 @@ async fn test_network_adapter_starts() {
         config,
         keypair,
         vec![(validator_id, bind_sig)],
-        shard,
+        HashSet::from([shard]),
         Arc::new(HandlerRegistry::new()),
         topo,
     )
@@ -107,7 +108,7 @@ async fn test_two_node_connection() {
         config1,
         keypair1,
         vec![(ValidatorId::new(0), bind_sig1)],
-        ShardGroupId::new(0),
+        HashSet::from([ShardGroupId::new(0)]),
         Arc::new(HandlerRegistry::new()),
         topo1,
     )
@@ -132,7 +133,7 @@ async fn test_two_node_connection() {
         config2,
         keypair2,
         vec![(ValidatorId::new(1), bind_sig2)],
-        ShardGroupId::new(0),
+        HashSet::from([ShardGroupId::new(0)]),
         Arc::new(HandlerRegistry::new()),
         topo2,
     )
@@ -182,7 +183,7 @@ async fn test_topic_subscription() {
         config,
         keypair,
         vec![(ValidatorId::new(0), bind_sig)],
-        ShardGroupId::new(0),
+        HashSet::from([ShardGroupId::new(0)]),
         Arc::new(HandlerRegistry::new()),
         topo,
     )
@@ -219,7 +220,7 @@ async fn test_validator_bind_success() {
         config0,
         keypair0,
         vec![(ValidatorId::new(0), bind_sig0)],
-        ShardGroupId::new(0),
+        HashSet::from([ShardGroupId::new(0)]),
         Arc::new(HandlerRegistry::new()),
         fixtures.validator_key_map(0),
     )
@@ -242,7 +243,7 @@ async fn test_validator_bind_success() {
         config1,
         keypair1,
         vec![(ValidatorId::new(1), bind_sig1)],
-        ShardGroupId::new(0),
+        HashSet::from([ShardGroupId::new(0)]),
         Arc::new(HandlerRegistry::new()),
         fixtures.validator_key_map(1),
     )
@@ -294,7 +295,7 @@ async fn test_validator_bind_rejects_wrong_key() {
         config0,
         keypair0,
         vec![(ValidatorId::new(0), bind_sig0)],
-        ShardGroupId::new(0),
+        HashSet::from([ShardGroupId::new(0)]),
         Arc::new(HandlerRegistry::new()),
         fixtures.validator_key_map(0),
     )
@@ -319,7 +320,7 @@ async fn test_validator_bind_rejects_wrong_key() {
         config1,
         keypair1,
         vec![(ValidatorId::new(1), wrong_signing_key)],
-        ShardGroupId::new(0),
+        HashSet::from([ShardGroupId::new(0)]),
         Arc::new(HandlerRegistry::new()),
         fixtures.validator_key_map(1),
     )
@@ -371,7 +372,7 @@ async fn test_validator_bind_evicted_on_disconnect() {
         config0,
         keypair0,
         vec![(ValidatorId::new(0), bind_sig0)],
-        ShardGroupId::new(0),
+        HashSet::from([ShardGroupId::new(0)]),
         Arc::new(HandlerRegistry::new()),
         fixtures.validator_key_map(0),
     )
@@ -394,7 +395,7 @@ async fn test_validator_bind_evicted_on_disconnect() {
         config1,
         keypair1,
         vec![(ValidatorId::new(1), bind_sig1)],
-        ShardGroupId::new(0),
+        HashSet::from([ShardGroupId::new(0)]),
         Arc::new(HandlerRegistry::new()),
         fixtures.validator_key_map(1),
     )

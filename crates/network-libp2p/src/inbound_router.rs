@@ -22,7 +22,7 @@ use tokio::task::{JoinHandle, spawn_blocking};
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
-use crate::adapter::{Libp2pAdapter, NOTIFY_PROTOCOL, REQUEST_PROTOCOL};
+use crate::adapter::{Libp2pAdapter, NOTIFY_PROTOCOL, request_protocol};
 use crate::stream_framing::{self, FrameError, MAX_FRAME_SIZE};
 
 /// Timeout for reading requests and writing responses on streams.
@@ -88,10 +88,11 @@ impl PeerRateState {
 /// Handle for the inbound router tasks.
 ///
 /// Kept alive inside `Libp2pNetwork` to prevent the tokio tasks from being
-/// aborted when the `JoinHandle`s are dropped.
+/// aborted when the `JoinHandle`s are dropped. One request handle per
+/// hosted shard plus the singleton notify handle.
 pub struct InboundRouterHandle {
     #[allow(dead_code)]
-    request_handle: JoinHandle<()>,
+    request_handles: Vec<JoinHandle<()>>,
     #[allow(dead_code)]
     notify_handle: JoinHandle<()>,
 }
@@ -126,46 +127,64 @@ impl InboundRouter {
             per_peer_failures: Arc::new(DashMap::new()),
         });
 
-        // ── Request accept loop (REQUEST_PROTOCOL) ──
-        let request_handle = {
-            let router = router.clone();
-            let mut control = adapter.stream_control();
-            spawn(async move {
-                let mut incoming = match control.accept(REQUEST_PROTOCOL) {
-                    Ok(incoming) => incoming,
-                    Err(e) => {
-                        error!(error = ?e, "Failed to register request protocol");
-                        return;
-                    }
-                };
+        // ── Request accept loops (one per hosted shard) ──
+        //
+        // Each hosted shard has its own protocol identifier
+        // (`/hyperscale/request/shard-N/1.0.0`). The accept loops share
+        // the router's admission/dispatch logic; what the protocol
+        // identifier carries is purely routing — the body is unchanged
+        // and the per-type handler in the registry answers either way.
+        let request_handles: Vec<JoinHandle<()>> = adapter
+            .local_shards()
+            .iter()
+            .copied()
+            .map(|shard| {
+                let router = router.clone();
+                let mut control = adapter.stream_control();
+                spawn(async move {
+                    let protocol = request_protocol(shard);
+                    let mut incoming = match control.accept(protocol.clone()) {
+                        Ok(incoming) => incoming,
+                        Err(e) => {
+                            error!(
+                                error = ?e,
+                                shard = shard.inner(),
+                                "Failed to register request protocol"
+                            );
+                            return;
+                        }
+                    };
 
-                info!("InboundRouter: request loop started");
+                    info!(shard = shard.inner(), "InboundRouter: request loop started");
 
-                while let Some((peer_id, stream)) = incoming.next().await {
-                    if let Some(permit) = router.try_admit(&peer_id) {
-                        let router_clone = router.clone();
-                        spawn(async move {
-                            let _permit = permit;
-                            let result = router_clone.handle_request_stream(peer_id, stream).await;
-                            router_clone.decrement_peer_count(&peer_id);
-                            match result {
-                                Ok(()) => router_clone.record_success(&peer_id),
-                                Err(ref e) => {
-                                    if !e.is_client_abandonment() {
-                                        router_clone.record_failure(&peer_id);
+                    while let Some((peer_id, stream)) = incoming.next().await {
+                        if let Some(permit) = router.try_admit(&peer_id) {
+                            let router_clone = router.clone();
+                            spawn(async move {
+                                let _permit = permit;
+                                let result = router_clone
+                                    .handle_request_stream(peer_id, stream)
+                                    .await;
+                                router_clone.decrement_peer_count(&peer_id);
+                                match result {
+                                    Ok(()) => router_clone.record_success(&peer_id),
+                                    Err(ref e) => {
+                                        if !e.is_client_abandonment() {
+                                            router_clone.record_failure(&peer_id);
+                                        }
+                                        debug!(peer = %peer_id, error = ?e, "Request stream handling failed");
                                     }
-                                    debug!(peer = %peer_id, error = ?e, "Request stream handling failed");
                                 }
-                            }
-                        });
-                    } else {
-                        drop(stream);
+                            });
+                        } else {
+                            drop(stream);
+                        }
                     }
-                }
 
-                info!("InboundRouter: request loop shutting down");
+                    info!(shard = shard.inner(), "InboundRouter: request loop shutting down");
+                })
             })
-        };
+            .collect();
 
         // ── Notification accept loop (NOTIFY_PROTOCOL) ──
         let notify_handle = {
@@ -211,7 +230,7 @@ impl InboundRouter {
         };
 
         InboundRouterHandle {
-            request_handle,
+            request_handles,
             notify_handle,
         }
     }

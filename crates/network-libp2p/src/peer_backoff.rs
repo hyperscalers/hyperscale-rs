@@ -9,9 +9,11 @@
 //! [`RequestStreamPool`]: crate::RequestStreamPool
 //! [`NotifyStreamPool`]: crate::notify_pool
 
+use std::hash::Hash;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+#[cfg(test)]
 use libp2p::PeerId;
 
 /// Initial reconnection backoff after the first stream failure.
@@ -23,23 +25,28 @@ pub const MAX_BACKOFF: Duration = Duration::from_secs(5);
 /// Multiplier applied on each consecutive failure.
 pub const BACKOFF_MULTIPLIER: u32 = 2;
 
-/// Per-peer backoff state. Callers store this in a `DashMap` keyed by
-/// `PeerId` and clear the entry on successful reconnect to reset the series.
+/// Per-key backoff state. Callers store this in a `DashMap` keyed by
+/// whatever identifies the connection target (`PeerId` for the notify
+/// pool, `(PeerId, ShardGroupId)` for the per-shard request pool) and
+/// clear the entry on successful reconnect to reset the series.
 pub struct BackoffState {
     pub next_attempt: Instant,
     pub current_backoff: Duration,
 }
 
-/// Apply (or escalate) backoff for `peer`. The first call sets
+/// Apply (or escalate) backoff for `key`. The first call sets
 /// [`INITIAL_BACKOFF`]; subsequent calls double the previous duration up to
 /// [`MAX_BACKOFF`]. Replaces any existing entry.
-pub fn apply_backoff(backoff_map: &DashMap<PeerId, BackoffState>, peer: &PeerId) {
-    let current_backoff = backoff_map.get(peer).map_or(INITIAL_BACKOFF, |state| {
+pub fn apply_backoff<K>(backoff_map: &DashMap<K, BackoffState>, key: &K)
+where
+    K: Eq + Hash + Clone,
+{
+    let current_backoff = backoff_map.get(key).map_or(INITIAL_BACKOFF, |state| {
         (state.current_backoff * BACKOFF_MULTIPLIER).min(MAX_BACKOFF)
     });
 
     backoff_map.insert(
-        *peer,
+        key.clone(),
         BackoffState {
             next_attempt: Instant::now() + current_backoff,
             current_backoff,
