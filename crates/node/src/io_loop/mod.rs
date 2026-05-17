@@ -366,6 +366,28 @@ where
         &mut self.vnodes[0].state
     }
 
+    /// Number of vnodes hosted by this `IoLoop`.
+    #[must_use]
+    pub const fn vnodes_len(&self) -> usize {
+        self.vnodes.len()
+    }
+
+    /// Access the state machine of the vnode at `vnode_idx`.
+    ///
+    /// # Panics
+    /// Panics if `vnode_idx >= vnodes_len()`.
+    pub fn vnode_state(&self, vnode_idx: usize) -> &NodeStateMachine {
+        &self.vnodes[vnode_idx].state
+    }
+
+    /// Mutably access the state machine of the vnode at `vnode_idx`.
+    ///
+    /// # Panics
+    /// Panics if `vnode_idx >= vnodes_len()`.
+    pub fn vnode_state_mut(&mut self, vnode_idx: usize) -> &mut NodeStateMachine {
+        &mut self.vnodes[vnode_idx].state
+    }
+
     /// Access the (sole) shard's storage.
     pub fn storage(&self) -> &S {
         self.shard_storage()

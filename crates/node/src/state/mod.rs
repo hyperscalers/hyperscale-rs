@@ -156,6 +156,16 @@ impl NodeStateMachine {
         self.topology.snapshot()
     }
 
+    /// Get the current topology snapshot as an `Arc`, for sites that
+    /// need to clone it into off-thread closures (delegated action
+    /// dispatch). Carries this vnode's `local_validator_id`, so per-
+    /// vnode signing context stays consistent with the snapshot the
+    /// handler reads.
+    #[must_use]
+    pub const fn topology_arc(&self) -> &Arc<TopologySnapshot> {
+        self.topology.snapshot()
+    }
+
     /// Get a reference to the mempool state.
     #[must_use]
     pub const fn mempool(&self) -> &MempoolCoordinator {

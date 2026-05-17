@@ -18,7 +18,7 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{Engine, GenesisConfig, prepared_genesis};
 use hyperscale_network::Network;
 use hyperscale_storage::{GenesisCommit, Storage};
-use hyperscale_types::StateRoot;
+use hyperscale_types::{Block, StateRoot};
 
 use crate::io_loop::IoLoop;
 
@@ -29,15 +29,28 @@ where
     D: Dispatch,
     E: Engine,
 {
-    /// Process actions from genesis initialization.
+    /// Process actions emitted by a single vnode's genesis init.
     ///
-    /// `NodeStateMachine::initialize_genesis()` returns actions (timer sets)
-    /// that must be processed through the `IoLoop`'s action handler.
-    pub fn handle_actions(&mut self, actions: Vec<Action>) {
+    /// Called by runners that drive `NodeStateMachine::initialize_genesis`
+    /// directly on `vnodes[vnode_idx].state`. Most callers prefer
+    /// [`Self::initialize_all_vnodes_genesis`] which does both steps
+    /// for every hosted vnode.
+    pub fn handle_actions(&mut self, vnode_idx: usize, actions: Vec<Action>) {
         for action in actions {
-            self.process_action(0, action);
+            self.process_action(vnode_idx, action);
         }
         self.flush_block_commits();
+    }
+
+    /// Initialize every hosted vnode's state machine with `genesis_block`
+    /// and dispatch the resulting actions per-vnode.
+    pub fn initialize_all_vnodes_genesis(&mut self, genesis_block: &Block) {
+        for vnode_idx in 0..self.vnodes_len() {
+            let actions = self
+                .vnode_state_mut(vnode_idx)
+                .initialize_genesis(genesis_block);
+            self.handle_actions(vnode_idx, actions);
+        }
     }
 
     /// Install engine genesis on this node's storage.

@@ -520,7 +520,9 @@ where
             .expect("dispatch_delegated_action called for delegated actions only");
 
         let handles = Arc::clone(&self.dispatch_handles);
-        let topology_snapshot = self.topology_snapshot.load_full();
+        // Per-vnode snapshot so the handler's `local_validator_id`
+        // matches the signing key used.
+        let topology_snapshot = Arc::clone(self.vnodes[vnode_idx].state.topology_arc());
         let event_tx = self.event_sender.clone();
         let signing_key = Arc::clone(&self.vnodes[vnode_idx].signing_key);
 

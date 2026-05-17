@@ -65,6 +65,11 @@ pub struct NetworkConfig {
     pub num_shards: u32,
     /// Packet loss rate (0.0 - 1.0). Messages are dropped with this probability.
     pub packet_loss_rate: f64,
+    /// Number of consecutive validators bundled into each simulated
+    /// host (i.e. each `IoLoop`). Default `1` means one validator per
+    /// host. With `> 1`, validators `[k*N .. (k+1)*N)` share host
+    /// index `k`. Must divide `validators_per_shard`.
+    pub vnodes_per_host: u32,
 }
 
 impl Default for NetworkConfig {
@@ -76,6 +81,7 @@ impl Default for NetworkConfig {
             validators_per_shard: 4,
             num_shards: 2,
             packet_loss_rate: 0.0,
+            vnodes_per_host: 1,
         }
     }
 }
@@ -285,11 +291,26 @@ impl std::fmt::Debug for SimulatedNetwork {
 }
 
 impl SimulatedNetwork {
-    /// Create a new simulated network with per-node handler registries.
+    /// Create a new simulated network with per-host handler registries.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `config.vnodes_per_host` does not divide
+    /// `config.validators_per_shard` (host count must be integral).
     #[must_use]
     pub fn new(config: NetworkConfig) -> Self {
-        let num_nodes = (config.num_shards * config.validators_per_shard) as usize;
-        let registries = (0..num_nodes)
+        assert!(
+            config.vnodes_per_host >= 1,
+            "vnodes_per_host must be at least 1"
+        );
+        assert_eq!(
+            config.validators_per_shard % config.vnodes_per_host,
+            0,
+            "vnodes_per_host must divide validators_per_shard"
+        );
+        let total_validators = (config.num_shards * config.validators_per_shard) as usize;
+        let num_hosts = total_validators / config.vnodes_per_host as usize;
+        let registries = (0..num_hosts)
             .map(|_| Arc::new(HandlerRegistry::new()))
             .collect();
         Self {
@@ -303,9 +324,16 @@ impl SimulatedNetwork {
             pending_responses: BinaryHeap::new(),
             response_sequence: 0,
             traffic_analyzer: None,
-            gossip_seen: (0..num_nodes).map(|_| HashSet::new()).collect(),
+            gossip_seen: (0..num_hosts).map(|_| HashSet::new()).collect(),
             faults: FaultInjector::default(),
         }
+    }
+
+    /// Translate a `ValidatorId` to its hosting `NodeIndex` under the
+    /// current `vnodes_per_host` bundling.
+    #[must_use]
+    pub fn validator_to_node(&self, validator: ValidatorId) -> NodeIndex {
+        (validator.inner() / u64::from(self.config.vnodes_per_host)) as NodeIndex
     }
 
     /// Builder for installing or removing per-message-type fault rules.
@@ -464,31 +492,38 @@ impl SimulatedNetwork {
         Duration::from_secs_f64(latency_secs)
     }
 
-    /// Get the shard for a node index.
+    /// Get the shard for a host (`IoLoop`) index. Same-shard
+    /// `vnodes_per_host` validators bundle into one host.
     #[must_use]
     pub fn shard_for_node(&self, node: NodeIndex) -> ShardGroupId {
-        ShardGroupId::new(u64::from(node / self.config.validators_per_shard))
+        let hosts_per_shard = self.config.validators_per_shard / self.config.vnodes_per_host;
+        ShardGroupId::new(u64::from(node / hosts_per_shard))
     }
 
-    /// Get all nodes in a shard.
+    /// Get all hosts (`IoLoop` indices) that have at least one
+    /// validator in `shard`.
     #[must_use]
     pub fn peers_in_shard(&self, shard: ShardGroupId) -> Vec<NodeIndex> {
-        let start = (shard.inner() as u32) * self.config.validators_per_shard;
-        let end = start + self.config.validators_per_shard;
+        let hosts_per_shard = self.config.validators_per_shard / self.config.vnodes_per_host;
+        let start = (shard.inner() as u32) * hosts_per_shard;
+        let end = start + hosts_per_shard;
         (start..end).collect()
     }
 
-    /// Get all nodes in the network.
+    /// Get all hosts in the network.
     #[must_use]
     pub fn all_nodes(&self) -> Vec<NodeIndex> {
-        let total = self.config.num_shards * self.config.validators_per_shard;
+        let total =
+            self.config.num_shards * self.config.validators_per_shard / self.config.vnodes_per_host;
         (0..total).collect()
     }
 
-    /// Get the total number of nodes.
+    /// Get the total number of hosts (`IoLoop`s). With
+    /// `vnodes_per_host > 1` this is less than the validator count.
     #[must_use]
     pub const fn total_nodes(&self) -> usize {
-        (self.config.num_shards * self.config.validators_per_shard) as usize
+        (self.config.num_shards * self.config.validators_per_shard / self.config.vnodes_per_host)
+            as usize
     }
 
     /// Get network configuration.
@@ -530,11 +565,11 @@ impl SimulatedNetwork {
 
             // Select target peer from the caller-provided peer list.
             let peer = if let Some(vid) = preferred_peer {
-                vid.inner() as NodeIndex
+                self.validator_to_node(vid)
             } else {
                 // Pick a random peer from the provided list.
                 let mut candidates: Vec<NodeIndex> =
-                    peers.iter().map(|v| v.inner() as NodeIndex).collect();
+                    peers.iter().map(|v| self.validator_to_node(*v)).collect();
                 candidates.shuffle(rng);
                 if let Some(&p) = candidates.first() {
                     p
@@ -726,7 +761,7 @@ impl SimulatedNetwork {
             };
 
             for &recipient in &recipients {
-                let to = recipient.inner() as NodeIndex;
+                let to = self.validator_to_node(recipient);
 
                 match self.should_deliver(sender, to, rng) {
                     None => {
