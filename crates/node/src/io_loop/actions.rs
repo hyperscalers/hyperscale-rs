@@ -11,12 +11,12 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::Engine;
 use hyperscale_execution::action_handlers::handle_action as handle_execution_action;
 use hyperscale_metrics::record_transaction_finalized;
-use hyperscale_network::{Network, ValidatorKeyMap};
+use hyperscale_network::Network;
 use hyperscale_provisions::action_handlers::handle_action as handle_provisions_action;
 use hyperscale_storage::{ChainEntry, ChainWriter, Storage};
 use hyperscale_types::{
     Block, BlockHeight, CertifiedBlock, ConsensusReceipt, FinalizedWave, QuorumCertificate,
-    StateRoot, TopologySnapshot, TransactionStatus, TxHash, ValidatorId,
+    StateRoot, TopologySnapshot, TransactionStatus, TxHash,
 };
 use tracing::{debug, error, trace, warn};
 
@@ -235,18 +235,13 @@ where
     fn handle_topology_changed(&self, topology: &Arc<TopologySnapshot>) {
         self.topology_snapshot.store(Arc::clone(topology));
 
-        // Push updated validator keys to the network layer for bind verification.
-        let keys: ValidatorKeyMap = topology
-            .global_validator_set()
-            .validators
-            .iter()
-            .map(|v| (v.validator_id, v.public_key))
-            .collect();
-        self.network.update_validator_keys(Arc::new(keys));
+        // Network impl reads validator keys + shard committees off the
+        // snapshot it gets here — no separate keymap push.
+        self.network.update_topology(Arc::clone(topology));
 
         tracing::info!(
             local_shard = topology.local_shard().inner(),
-            local_peers = self.local_peers().len(),
+            committee_size = topology.committee_for_shard(topology.local_shard()).len(),
             "Network topology updated"
         );
     }
@@ -438,41 +433,69 @@ where
     /// `drive_fetch::<B>`. The tick timer is refreshed once at the end.
     fn process_fetch_request(&mut self, req: FetchRequest) {
         match req {
-            FetchRequest::Transactions { ids, peers, origin } => {
-                self.drive_fetch::<TransactionBinding>(FetchInput::Request { ids, peers, origin });
-            }
-            FetchRequest::LocalProvisions { ids, peers, origin } => {
-                self.drive_fetch::<LocalProvisionBinding>(FetchInput::Request {
+            FetchRequest::Transactions {
+                ids,
+                shard,
+                preferred,
+                origin,
+            } => {
+                self.drive_fetch::<TransactionBinding>(FetchInput::Request {
                     ids,
-                    peers,
+                    shard,
+                    preferred,
                     origin,
                 });
             }
-            FetchRequest::FinalizedWaves { ids, peers, origin } => {
+            FetchRequest::LocalProvisions {
+                ids,
+                shard,
+                preferred,
+                origin,
+            } => {
+                self.drive_fetch::<LocalProvisionBinding>(FetchInput::Request {
+                    ids,
+                    shard,
+                    preferred,
+                    origin,
+                });
+            }
+            FetchRequest::FinalizedWaves {
+                ids,
+                shard,
+                preferred,
+                origin,
+            } => {
                 self.drive_fetch::<FinalizedWaveBinding>(FetchInput::Request {
                     ids,
-                    peers,
+                    shard,
+                    preferred,
                     origin,
                 });
             }
             FetchRequest::RemoteProvisions {
                 source_shard,
                 block_height,
-                peers,
-                origin,
-            } => self.drive_fetch::<ProvisionBinding>(FetchInput::Request {
-                ids: vec![(source_shard, block_height)],
-                peers,
-                origin,
-            }),
-            FetchRequest::ExecutionCerts {
-                wave_id,
-                peers,
+                preferred,
                 origin,
             } => {
+                let target_shard = self.topology_snapshot.load().local_shard();
+                self.drive_fetch::<ProvisionBinding>(FetchInput::Request {
+                    ids: vec![(source_shard, target_shard, block_height)],
+                    shard: source_shard,
+                    preferred,
+                    origin,
+                });
+            }
+            FetchRequest::ExecutionCerts {
+                wave_id,
+                preferred,
+                origin,
+            } => {
+                let source_shard = wave_id.shard_group_id();
                 self.drive_fetch::<ExecCertBinding>(FetchInput::Request {
                     ids: vec![wave_id],
-                    peers,
+                    shard: source_shard,
+                    preferred,
                     origin,
                 });
             }
@@ -498,9 +521,12 @@ where
             FetchAbandon::RemoteProvisions {
                 source_shard,
                 block_height,
-            } => self.drive_fetch::<ProvisionBinding>(FetchInput::Abandoned {
-                ids: vec![(source_shard, block_height)],
-            }),
+            } => {
+                let target_shard = self.topology_snapshot.load().local_shard();
+                self.drive_fetch::<ProvisionBinding>(FetchInput::Abandoned {
+                    ids: vec![(source_shard, target_shard, block_height)],
+                });
+            }
         }
 
         self.update_fetch_tick_timer();
@@ -601,17 +627,5 @@ where
                 _ => {}
             }
         });
-    }
-
-    /// Local shard committee excluding self, for use as the `peers` argument
-    /// to `network.request()`.
-    pub(super) fn local_peers(&self) -> Vec<ValidatorId> {
-        let topo = self.topology_snapshot.load();
-        let self_id = topo.local_validator_id();
-        topo.committee_for_shard(topo.local_shard())
-            .iter()
-            .filter(|&&v| v != self_id)
-            .copied()
-            .collect()
     }
 }

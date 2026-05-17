@@ -556,22 +556,34 @@ impl SimulatedNetwork {
 
         for request in requests {
             let PendingRequest {
-                peers,
+                shard,
                 preferred_peer,
                 type_id,
                 request_bytes,
                 on_response,
             } = request;
 
-            // Select target peer from the caller-provided peer list.
-            let peer = if let Some(vid) = preferred_peer {
-                self.validator_to_node(vid)
+            // Resolve target shard → host index list, dropping ourselves so
+            // we never round-trip a request through our own node. With V=1
+            // there's one host per validator, so this is a tight committee
+            // membership filter.
+            let candidates: Vec<NodeIndex> = self
+                .peers_in_shard(shard)
+                .into_iter()
+                .filter(|&n| n != requester)
+                .collect();
+
+            // Pick first attempt: preferred_peer if it resolves into a
+            // committee member, otherwise a random pick.
+            let peer = if let Some(vid) = preferred_peer
+                && let preferred = self.validator_to_node(vid)
+                && candidates.contains(&preferred)
+            {
+                preferred
             } else {
-                // Pick a random peer from the provided list.
-                let mut candidates: Vec<NodeIndex> =
-                    peers.iter().map(|v| self.validator_to_node(*v)).collect();
-                candidates.shuffle(rng);
-                if let Some(&p) = candidates.first() {
+                let mut shuffled = candidates.clone();
+                shuffled.shuffle(rng);
+                if let Some(&p) = shuffled.first() {
                     p
                 } else {
                     let _ = on_response(Err(RequestError::PeerUnreachable(ValidatorId::new(
@@ -1291,13 +1303,13 @@ mod tests {
 
     /// Helper: build a `PendingRequest` with a callback that captures the result.
     fn make_request_with_capture(
-        peers: Vec<ValidatorId>,
+        shard: ShardGroupId,
         preferred_peer: Option<ValidatorId>,
     ) -> (PendingRequest, SharedRequestResult) {
         let result = Arc::new(std::sync::Mutex::new(None));
         let result_clone = result.clone();
         let request = PendingRequest {
-            peers,
+            shard,
             preferred_peer,
             type_id: "test.request",
             request_bytes: vec![1, 2, 3],
@@ -1323,7 +1335,7 @@ mod tests {
         register_echo(&adapter1, "test.request");
 
         let (request, result) =
-            make_request_with_capture(vec![ValidatorId::new(1)], Some(ValidatorId::new(1)));
+            make_request_with_capture(ShardGroupId::new(0), Some(ValidatorId::new(1)));
 
         let stats = network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
 
@@ -1357,7 +1369,7 @@ mod tests {
         network.partition_unidirectional(0, 1);
 
         let (request, result) =
-            make_request_with_capture(vec![ValidatorId::new(1)], Some(ValidatorId::new(1)));
+            make_request_with_capture(ShardGroupId::new(0), Some(ValidatorId::new(1)));
         let stats = network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
 
         assert_eq!(stats.messages_dropped_partition, 1);
@@ -1382,7 +1394,7 @@ mod tests {
         register_echo(&adapter1, "test.request");
 
         let (request, result) =
-            make_request_with_capture(vec![ValidatorId::new(1)], Some(ValidatorId::new(1)));
+            make_request_with_capture(ShardGroupId::new(0), Some(ValidatorId::new(1)));
         let stats = network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
 
         assert_eq!(stats.messages_dropped_loss, 1);
@@ -1406,7 +1418,7 @@ mod tests {
         let _adapter1 = network.create_adapter(1);
 
         let (request, result) =
-            make_request_with_capture(vec![ValidatorId::new(1)], Some(ValidatorId::new(1)));
+            make_request_with_capture(ShardGroupId::new(0), Some(ValidatorId::new(1)));
         network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
 
         // Error callbacks are immediate
@@ -1431,7 +1443,7 @@ mod tests {
             .register_raw_request("test.request", handler);
 
         let (request, result) =
-            make_request_with_capture(vec![ValidatorId::new(1)], Some(ValidatorId::new(1)));
+            make_request_with_capture(ShardGroupId::new(0), Some(ValidatorId::new(1)));
         network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
 
         // Error callbacks are immediate
@@ -1454,13 +1466,10 @@ mod tests {
             register_echo(&adapter, "test.request");
         }
 
-        // No preferred peer — should pick a random peer from the provided list
-        let peers = vec![
-            ValidatorId::new(1),
-            ValidatorId::new(2),
-            ValidatorId::new(3),
-        ];
-        let (request, result) = make_request_with_capture(peers, None);
+        // No preferred peer — should pick a random peer from the shard
+        // committee (validators 1..=3 after the requester at index 0
+        // filters itself out).
+        let (request, result) = make_request_with_capture(ShardGroupId::new(0), None);
         let stats = network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
 
         assert_eq!(stats.messages_sent, 2);
@@ -1484,7 +1493,7 @@ mod tests {
         register_echo(&adapter0, "test.request");
 
         // No preferred peer, and empty peer list
-        let (request, result) = make_request_with_capture(vec![], None);
+        let (request, result) = make_request_with_capture(ShardGroupId::new(0), None);
         network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
 
         // Error callbacks are immediate
@@ -1506,7 +1515,7 @@ mod tests {
         register_echo(&adapter1, "test.request");
 
         let (request, result) =
-            make_request_with_capture(vec![ValidatorId::new(1)], Some(ValidatorId::new(1)));
+            make_request_with_capture(ShardGroupId::new(0), Some(ValidatorId::new(1)));
 
         network.accept_requests(0, Duration::from_millis(100), vec![request], &mut rng);
 
@@ -1858,7 +1867,7 @@ mod tests {
 
         // accept_requests should be able to find the handler
         let (request, result) =
-            make_request_with_capture(vec![ValidatorId::new(1)], Some(ValidatorId::new(1)));
+            make_request_with_capture(ShardGroupId::new(0), Some(ValidatorId::new(1)));
         let stats = network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
 
         assert_eq!(stats.messages_sent, 2);

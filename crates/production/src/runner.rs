@@ -423,6 +423,7 @@ impl ProductionRunnerBuilder {
             local_shard,
             bind_vnodes,
             initial_validator_keys,
+            topology: topology.clone(),
         })?;
 
         let executor = RadixExecutor::new(network_definition);
@@ -872,6 +873,9 @@ struct NetworkBuildArgs {
     /// service attests as every entry on each handshake.
     bind_vnodes: Vec<(ValidatorId, Arc<Bls12381G1PrivateKey>)>,
     initial_validator_keys: Arc<ValidatorKeyMap>,
+    /// Topology snapshot shared with `Libp2pNetwork` for shard-based
+    /// peer resolution on outbound `Network::request` calls.
+    topology: SharedTopologySnapshot,
 }
 
 struct NetworkStack {
@@ -906,6 +910,7 @@ fn build_network_stack(args: NetworkBuildArgs) -> Result<NetworkStack, RunnerErr
         TokioHandle::current(),
         registry,
         args.local_shard,
+        args.topology,
     );
 
     Ok(NetworkStack {

@@ -169,15 +169,15 @@ fn with_config_honours_dwell_time_setting() {
 
 #[test]
 fn on_block_committed_empty_block_yields_no_actions() {
-    let (mut coord, topology) = fresh_coordinator_with_topology();
-    let actions = coord.on_block_committed(&topology, &make_block(BlockHeight::new(1)));
+    let (mut coord, _) = fresh_coordinator_with_topology();
+    let actions = coord.on_block_committed(&make_block(BlockHeight::new(1)));
     assert!(actions.is_empty());
 }
 
 #[test]
 fn flush_expected_provisions_with_no_expectations_yields_no_actions() {
-    let (mut coord, topology) = fresh_coordinator_with_topology();
-    let actions = coord.flush_expected_provisions(&topology);
+    let (mut coord, _) = fresh_coordinator_with_topology();
+    let actions = coord.flush_expected_provisions();
     assert!(actions.is_empty());
 }
 
@@ -229,7 +229,7 @@ fn first_commit_retro_stamps_pre_genesis_expectations() {
     coord.on_verified_remote_header(&topology, &header);
 
     // First commit must NOT trigger a fallback fetch storm.
-    let actions = coord.on_block_committed(&topology, &make_block(BlockHeight::new(1)));
+    let actions = coord.on_block_committed(&make_block(BlockHeight::new(1)));
     assert!(
         actions.is_empty(),
         "first commit must retro-stamp before timeout sweep so no fallback fires"

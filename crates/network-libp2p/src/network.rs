@@ -7,6 +7,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use arc_swap::ArcSwap;
 use hyperscale_metrics::record_request_retry;
 use hyperscale_network::compression::compress;
 use hyperscale_network::{
@@ -14,7 +15,8 @@ use hyperscale_network::{
     ResponseVerdict, Topic, TopicScope, ValidatorKeyMap,
 };
 use hyperscale_types::{
-    MessageClass, NetworkMessage, Request, ShardGroupId, ShardMessage, ValidatorId,
+    MessageClass, NetworkMessage, Request, ShardGroupId, ShardMessage, TopologySnapshot,
+    ValidatorId,
 };
 use libp2p::PeerId;
 use sbor::{basic_decode, basic_encode};
@@ -63,6 +65,9 @@ pub struct Libp2pNetwork {
     registry: Arc<HandlerRegistry>,
     /// Local shard for deriving topic subscriptions.
     local_shard: ShardGroupId,
+    /// Topology snapshot used to resolve shard → committee for outbound
+    /// requests. Updated lock-free via [`Self::update_topology`].
+    topology: Arc<ArcSwap<TopologySnapshot>>,
     /// Count of `PeerUnreachable` errors (cold-start diagnostics).
     peer_unreachable_count: AtomicUsize,
     /// Persistent per-peer notification stream pool.
@@ -83,6 +88,7 @@ impl Libp2pNetwork {
         tokio_handle: Handle,
         registry: Arc<HandlerRegistry>,
         local_shard: ShardGroupId,
+        topology: Arc<ArcSwap<TopologySnapshot>>,
     ) -> Self {
         // Eagerly spawn the inbound router. It will dispatch incoming
         // requests to handlers as they are registered in the registry.
@@ -97,6 +103,7 @@ impl Libp2pNetwork {
             tokio_handle,
             registry,
             local_shard,
+            topology,
             peer_unreachable_count: AtomicUsize::new(0),
             notify_pool,
             _inbound_router: inbound_router,
@@ -109,8 +116,18 @@ impl Libp2pNetwork {
 }
 
 impl Network for Libp2pNetwork {
-    fn update_validator_keys(&self, keys: Arc<ValidatorKeyMap>) {
-        self.adapter.update_validator_keys(keys);
+    fn update_topology(&self, snapshot: Arc<TopologySnapshot>) {
+        // Extract a fresh key map for validator-bind verification.
+        let keys: ValidatorKeyMap = snapshot
+            .global_validator_set()
+            .validators
+            .iter()
+            .map(|v| (v.validator_id, v.public_key))
+            .collect();
+        self.adapter.update_validator_keys(Arc::new(keys));
+        // Cache the snapshot for shard → committee resolution on outbound
+        // requests. ArcSwap is lock-free; readers in `request` use `.load()`.
+        self.topology.store(snapshot);
     }
 
     fn broadcast_to_shard<M: ShardMessage>(&self, shard: ShardGroupId, message: &M) {
@@ -192,15 +209,23 @@ impl Network for Libp2pNetwork {
 
     fn request<R: Request + 'static>(
         &self,
-        peers: &[ValidatorId],
+        shard: ShardGroupId,
         preferred_peer: Option<ValidatorId>,
         request: R,
         class_override: Option<MessageClass>,
         on_response: Box<dyn FnOnce(Result<R::Response, RequestError>) -> ResponseVerdict + Send>,
     ) {
-        // Resolve ValidatorIds → PeerIds via the adapter's global registry
-        let resolved_peers: Vec<PeerId> = peers
+        // Resolve `shard` → committee → libp2p PeerIds via the topology
+        // snapshot and the adapter's validator-bind registry. Filter out
+        // every validator-id this host carries — we never round-trip a
+        // request through our own peer.
+        let topology = self.topology.load();
+        let committee = topology.committee_for_shard(shard);
+        let self_ids: HashSet<ValidatorId> =
+            self.adapter.local_validator_ids().iter().copied().collect();
+        let resolved_peers: Vec<PeerId> = committee
             .iter()
+            .filter(|v| !self_ids.contains(v))
             .filter_map(|&v| self.adapter.peer_for_validator(v))
             .collect();
 
@@ -209,13 +234,15 @@ impl Network for Libp2pNetwork {
             if count == 0 {
                 info!(
                     request_type = R::message_type_id(),
-                    peer_count = peers.len(),
+                    shard = shard.inner(),
+                    committee_size = committee.len(),
                     "No validator-to-peer mappings resolved yet \
                      (expected during cold start, protocol-level retries will resolve)"
                 );
             } else if count.is_multiple_of(100) {
                 warn!(
                     request_type = R::message_type_id(),
+                    shard = shard.inner(),
                     total_unreachable = count,
                     "PeerUnreachable errors continue (validator-bind still in progress)"
                 );

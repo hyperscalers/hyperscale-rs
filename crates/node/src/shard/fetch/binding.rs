@@ -23,13 +23,13 @@ use std::hash::Hash;
 use std::sync::Arc;
 
 use crossbeam::channel::Sender;
-use hyperscale_core::{FetchOrigin, FetchPeers, NodeInput, ProtocolEvent};
+use hyperscale_core::{FetchOrigin, NodeInput, ProtocolEvent};
 use hyperscale_network::{Network, ResponseVerdict};
 use hyperscale_types::network::request::{
     GetExecutionCertsRequest, GetFinalizedWavesRequest, GetLocalProvisionsRequest,
     GetProvisionsRequest, GetTransactionsRequest,
 };
-use hyperscale_types::{BlockHeight, ProvisionHash, ShardGroupId, TxHash, WaveId};
+use hyperscale_types::{BlockHeight, ProvisionHash, ShardGroupId, TxHash, ValidatorId, WaveId};
 
 use super::Fetch;
 use super::host::FetchHost;
@@ -44,8 +44,11 @@ pub type LocalProvisionFetch = Fetch<ProvisionHash>;
 pub type FinalizedWaveFetch = Fetch<WaveId>;
 /// Cross-shard execution-cert fetch keyed by [`WaveId`].
 pub type ExecCertFetch = Fetch<WaveId>;
-/// Cross-shard provision fetch keyed by `(source_shard, block_height)`.
-pub type ProvisionFetch = Fetch<(ShardGroupId, BlockHeight)>;
+/// Cross-shard provision fetch keyed by
+/// `(source_shard, target_shard, block_height)`. `source_shard` selects
+/// the responding committee; `target_shard` rides in the body for
+/// response filtering on the responder.
+pub type ProvisionFetch = Fetch<(ShardGroupId, ShardGroupId, BlockHeight)>;
 
 // ─── Trait ─────────────────────────────────────────────────────────────
 
@@ -65,15 +68,16 @@ pub trait FetchBinding: 'static {
     /// Locate the `Fetch<Id>` instance for this binding inside the host.
     fn fetch_mut(host: &mut FetchHost) -> &mut Fetch<Self::Id>;
 
-    /// Send one request covering `ids` and route the response back through
-    /// the event sender. `origin` flows down to `Network::request` as the
-    /// per-call class override. For [`PER_ID`](Self::PER_ID) bindings the
-    /// dispatcher pre-splits into single-element chunks before calling this.
+    /// Send one request covering `ids` against `shard`'s committee and
+    /// route the response back through the event sender. `origin` flows
+    /// down to `Network::request` as the per-call class override. For
+    /// [`PER_ID`](Self::PER_ID) bindings the dispatcher pre-splits into
+    /// single-element chunks before calling this.
     fn dispatch_chunk<N: Network>(
         ids: Vec<Self::Id>,
-        peers: &FetchPeers,
+        shard: ShardGroupId,
+        preferred: Option<ValidatorId>,
         origin: FetchOrigin,
-        local_shard: ShardGroupId,
         network: &N,
         sender: &Sender<NodeInput>,
     );
@@ -145,17 +149,17 @@ impl FetchBinding for TransactionBinding {
 
     fn dispatch_chunk<N: Network>(
         ids: Vec<TxHash>,
-        peers: &FetchPeers,
+        shard: ShardGroupId,
+        preferred: Option<ValidatorId>,
         origin: FetchOrigin,
-        _local_shard: ShardGroupId,
         network: &N,
         sender: &Sender<NodeInput>,
     ) {
         let es = sender.clone();
         let hs = ids.clone();
         network.request(
-            &peers.peers,
-            peers.preferred,
+            shard,
+            preferred,
             GetTransactionsRequest::new(ids),
             origin.class_override(),
             Box::new(move |result| {
@@ -204,17 +208,17 @@ impl FetchBinding for LocalProvisionBinding {
 
     fn dispatch_chunk<N: Network>(
         ids: Vec<ProvisionHash>,
-        peers: &FetchPeers,
+        shard: ShardGroupId,
+        preferred: Option<ValidatorId>,
         origin: FetchOrigin,
-        _local_shard: ShardGroupId,
         network: &N,
         sender: &Sender<NodeInput>,
     ) {
         let es = sender.clone();
         let hs = ids.clone();
         network.request(
-            &peers.peers,
-            peers.preferred,
+            shard,
+            preferred,
             GetLocalProvisionsRequest::new(ids),
             origin.class_override(),
             Box::new(move |result| {
@@ -264,17 +268,17 @@ impl FetchBinding for FinalizedWaveBinding {
 
     fn dispatch_chunk<N: Network>(
         ids: Vec<WaveId>,
-        peers: &FetchPeers,
+        shard: ShardGroupId,
+        preferred: Option<ValidatorId>,
         origin: FetchOrigin,
-        _local_shard: ShardGroupId,
         network: &N,
         sender: &Sender<NodeInput>,
     ) {
         let es = sender.clone();
         let requested_ids = ids.clone();
         network.request(
-            &peers.peers,
-            peers.preferred,
+            shard,
+            preferred,
             GetFinalizedWavesRequest::new(ids),
             origin.class_override(),
             Box::new(move |result| {
@@ -322,17 +326,17 @@ impl FetchBinding for ExecCertBinding {
 
     fn dispatch_chunk<N: Network>(
         ids: Vec<WaveId>,
-        peers: &FetchPeers,
+        shard: ShardGroupId,
+        preferred: Option<ValidatorId>,
         origin: FetchOrigin,
-        _local_shard: ShardGroupId,
         network: &N,
         sender: &Sender<NodeInput>,
     ) {
         let es = sender.clone();
         let failed_ids = ids.clone();
         network.request(
-            &peers.peers,
-            peers.preferred,
+            shard,
+            preferred,
             GetExecutionCertsRequest { wave_ids: ids },
             origin.class_override(),
             Box::new(move |result| {
@@ -374,7 +378,7 @@ impl FetchBinding for ExecCertBinding {
 pub struct ProvisionBinding;
 
 impl FetchBinding for ProvisionBinding {
-    type Id = (ShardGroupId, BlockHeight);
+    type Id = (ShardGroupId, ShardGroupId, BlockHeight);
 
     const NAME: &'static str = "provision";
 
@@ -387,25 +391,31 @@ impl FetchBinding for ProvisionBinding {
     }
 
     fn dispatch_chunk<N: Network>(
-        ids: Vec<(ShardGroupId, BlockHeight)>,
-        peers: &FetchPeers,
+        ids: Vec<(ShardGroupId, ShardGroupId, BlockHeight)>,
+        shard: ShardGroupId,
+        preferred: Option<ValidatorId>,
         origin: FetchOrigin,
-        local_shard: ShardGroupId,
         network: &N,
         sender: &Sender<NodeInput>,
     ) {
         // PER_ID means the dispatcher hands us exactly one id at a time.
         debug_assert_eq!(ids.len(), 1);
-        let (source_shard, block_height) = ids[0];
-        let target_shard = local_shard;
+        let (source_shard, target_shard, block_height) = ids[0];
+        debug_assert_eq!(
+            shard, source_shard,
+            "ProvisionBinding routes to the source shard; the runner sets it from the variant"
+        );
+        // `target_shard` (the requester's shard) is the body field: the
+        // source filters provisions by which shard is asking. Routing
+        // shard `shard = source_shard` picks the responding committee.
         let request = GetProvisionsRequest {
             block_height,
             target_shard,
         };
         let es = sender.clone();
         network.request(
-            &peers.peers,
-            peers.preferred,
+            shard,
+            preferred,
             request,
             origin.class_override(),
             Box::new(move |result| {

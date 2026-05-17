@@ -40,7 +40,7 @@
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
-use hyperscale_core::{Action, FetchOrigin, FetchPeers, FetchRequest, ProtocolEvent};
+use hyperscale_core::{Action, FetchOrigin, FetchRequest, ProtocolEvent};
 use hyperscale_types::{
     Attempt, Block, BlockHash, BlockHeader, BlockHeight, BloomFilter, CertifiedBlock,
     ExecutionCertificate, ExecutionVote, FinalizedWave, GlobalReceiptRoot, Hash, Provisions,
@@ -1111,9 +1111,6 @@ impl ExecutionCoordinator {
 
         let mut actions = Vec::with_capacity(fetches.len());
         for (wave_id, is_retry) in fetches {
-            let peers = topology
-                .committee_for_shard(wave_id.shard_group_id())
-                .to_vec();
             tracing::info!(
                 source_shard = wave_id.shard_group_id().inner(),
                 block_height = wave_id.block_height().inner(),
@@ -1123,7 +1120,7 @@ impl ExecutionCoordinator {
             );
             actions.push(Action::Fetch(FetchRequest::ExecutionCerts {
                 wave_id,
-                peers: FetchPeers::rotation(peers),
+                preferred: None,
                 origin: FetchOrigin::CrossShard,
             }));
         }

@@ -32,15 +32,20 @@ where
         &self,
         outputs: Vec<FetchOutput<B::Id>>,
     ) {
-        let local_shard = self.topology_snapshot.load().local_shard();
-        for FetchOutput::Send { ids, peers, origin } in outputs {
+        for FetchOutput::Send {
+            ids,
+            shard,
+            preferred,
+            origin,
+        } in outputs
+        {
             if B::PER_ID {
                 for id in ids {
                     B::dispatch_chunk(
                         vec![id],
-                        &peers,
+                        shard,
+                        preferred,
                         origin,
-                        local_shard,
                         &*self.network,
                         &self.event_sender,
                     );
@@ -48,9 +53,9 @@ where
             } else {
                 B::dispatch_chunk(
                     ids,
-                    &peers,
+                    shard,
+                    preferred,
                     origin,
-                    local_shard,
                     &*self.network,
                     &self.event_sender,
                 );
@@ -64,11 +69,18 @@ where
     /// event-loop turn — this wrapper just routes the FSM-emitted Sends
     /// to the network.
     pub(in crate::io_loop) fn drive_fetch<B: FetchBinding>(&mut self, input: FetchInput<B::Id>) {
-        if let FetchInput::Request { ids, peers, origin } = &input {
+        if let FetchInput::Request {
+            ids,
+            shard,
+            preferred,
+            origin,
+        } = &input
+        {
             tracing::trace!(
                 binding = B::NAME,
                 ids = ids.len(),
-                peer_count = peers.peers.len() + usize::from(peers.preferred.is_some()),
+                shard = ?shard,
+                preferred = ?preferred,
                 origin = ?origin,
                 "Dispatching fetch request"
             );
@@ -105,7 +117,11 @@ where
                     ids: vec![provisions.hash()],
                 });
                 self.drive_fetch::<ProvisionBinding>(FetchInput::Admitted {
-                    ids: vec![(provisions.source_shard(), provisions.block_height())],
+                    ids: vec![(
+                        provisions.source_shard(),
+                        provisions.target_shard(),
+                        provisions.block_height(),
+                    )],
                 });
             }
             ProtocolEvent::FinalizedWavesAdmitted { waves } => {

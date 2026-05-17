@@ -22,10 +22,8 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use hyperscale_core::{Action, FetchOrigin, FetchPeers, FetchRequest};
-use hyperscale_types::{
-    BlockHeight, ShardGroupId, TopologySnapshot, ValidatorId, WeightedTimestamp,
-};
+use hyperscale_core::{Action, FetchOrigin, FetchRequest};
+use hyperscale_types::{BlockHeight, ShardGroupId, ValidatorId, WeightedTimestamp};
 use tracing::warn;
 
 /// How long to wait before falling back to peer-fetch for missing
@@ -60,18 +58,13 @@ pub struct TimeoutEffect {
 
 impl TimeoutEffect {
     /// Build the `RemoteProvisions` fetch action: the proposer is preferred,
-    /// the rest of the source shard's committee is fallback.
-    pub(crate) fn into_fetch_action(self, topology: &TopologySnapshot) -> Action {
-        let fallback = topology
-            .committee_for_shard(self.source_shard)
-            .iter()
-            .copied()
-            .filter(|p| *p != self.proposer)
-            .collect();
+    /// the rest of the source shard's committee is rotation fallback (picked
+    /// by the network layer from the source shard's current committee).
+    pub(crate) const fn into_fetch_action(self) -> Action {
         Action::Fetch(FetchRequest::RemoteProvisions {
             source_shard: self.source_shard,
             block_height: self.block_height,
-            peers: FetchPeers::with_preferred(self.proposer, fallback),
+            preferred: Some(self.proposer),
             origin: FetchOrigin::CrossShard,
         })
     }
