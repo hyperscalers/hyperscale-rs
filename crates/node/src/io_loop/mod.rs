@@ -40,8 +40,7 @@ use hyperscale_engine::{Engine, RadixExecutor, TransactionValidation};
 use hyperscale_network::Network;
 use hyperscale_storage::{PendingChain, Storage};
 use hyperscale_types::{
-    Bls12381G1PrivateKey, LocalTimestamp, RoutableTransaction, ShardGroupId, TopologySnapshot,
-    TransactionStatus, TxHash,
+    Bls12381G1PrivateKey, LocalTimestamp, ShardGroupId, TopologySnapshot, TransactionStatus, TxHash,
 };
 pub use metrics::{MetricsSnapshot, record_metrics};
 use quick_cache::sync::Cache as QuickCache;
@@ -50,7 +49,6 @@ pub use status::NodeStatusSnapshot;
 use crate::NodeStateMachine;
 use crate::batch_accumulator::BatchAccumulator;
 use crate::config::NodeConfig;
-use crate::io_loop::step::CommittedHeaderVerificationItem;
 use crate::shard::ShardIo;
 use crate::shard::block_commit::{BlockCommitCoordinator, PreparedCommitMap};
 use crate::shard::caches::SharedCaches;
@@ -208,48 +206,6 @@ where
     /// on each batch flush.
     tx_validator: Arc<TransactionValidation>,
 
-    /// Hashes currently in the validation pipeline — either sitting in
-    /// `validation_batch` or being verified off-thread. Acts as a dedup
-    /// guard so duplicate gossip / re-submits don't enqueue twice.
-    /// Entries are removed by `TransactionValidated` /
-    /// `TransactionValidationsFailed` handlers.
-    pending_validation: HashSet<TxHash>,
-
-    /// Subset of `pending_validation` that originated from a local RPC /
-    /// sim submission rather than gossip. Carried through validation so
-    /// the resulting `TransactionValidated` event can flag
-    /// `submitted_locally = true` for mempool admission accounting.
-    locally_submitted: HashSet<TxHash>,
-
-    /// Pending transactions awaiting batched signature / format /
-    /// declared-shard verification on the `tx_validation` pool.
-    /// Bounded by `tx_validation_max` count and `tx_validation_window`
-    /// time; flushed on either trigger or on explicit pre-step deadline
-    /// check.
-    validation_batch: BatchAccumulator<Arc<RoutableTransaction>>,
-
-    /// Pending remote-committed-header gossip awaiting batched BLS
-    /// sender-signature verification on the crypto pool. Inbound
-    /// committee-membership and pubkey resolution happen on the network
-    /// thread; only the per-message BLS verify is deferred here.
-    committed_header_batch: BatchAccumulator<CommittedHeaderVerificationItem>,
-
-    /// Per-destination-shard outbound `TransactionGossip` accumulators.
-    /// Locally-submitted transactions are appended to one accumulator per
-    /// shard the tx touches (declared reads ∪ writes); each fills until
-    /// its count cap or time window expires, then flushes as a single
-    /// batched gossip message. Sized via [`BatchConfig::tx_gossip_max`]
-    /// and [`BatchConfig::tx_gossip_window`].
-    ///
-    /// [`BatchConfig::tx_gossip_max`]: crate::config::BatchConfig::tx_gossip_max
-    /// [`BatchConfig::tx_gossip_window`]: crate::config::BatchConfig::tx_gossip_window
-    tx_gossip_batches:
-        std::collections::BTreeMap<ShardGroupId, BatchAccumulator<Arc<RoutableTransaction>>>,
-    /// Cap for new tx-gossip accumulators (mirrored from `BatchConfig`).
-    tx_gossip_max: usize,
-    /// Window for new tx-gossip accumulators (mirrored from `BatchConfig`).
-    tx_gossip_window: Duration,
-
     /// Last time a "transaction finalization exceeded 10s" warning was emitted.
     /// Rate-limited to avoid flooding logs during cross-shard latency spikes.
     last_slow_tx_warn: LocalTimestamp,
@@ -337,6 +293,19 @@ where
                 caches,
                 fetches,
                 syncs,
+                pending_validation: HashSet::new(),
+                locally_submitted: HashSet::new(),
+                validation_batch: BatchAccumulator::new(
+                    b.tx_validation_max,
+                    b.tx_validation_window,
+                ),
+                committed_header_batch: BatchAccumulator::new(
+                    b.committed_header_max,
+                    b.committed_header_window,
+                ),
+                tx_gossip_batches: std::collections::BTreeMap::new(),
+                tx_gossip_max: b.tx_gossip_max,
+                tx_gossip_window: b.tx_gossip_window,
             },
         )]);
         assert_eq!(
@@ -354,16 +323,6 @@ where
             topology_snapshot,
             dispatch_handles,
             tx_validator,
-            pending_validation: HashSet::new(),
-            locally_submitted: HashSet::new(),
-            validation_batch: BatchAccumulator::new(b.tx_validation_max, b.tx_validation_window),
-            committed_header_batch: BatchAccumulator::new(
-                b.committed_header_max,
-                b.committed_header_window,
-            ),
-            tx_gossip_batches: std::collections::BTreeMap::new(),
-            tx_gossip_max: b.tx_gossip_max,
-            tx_gossip_window: b.tx_gossip_window,
             last_slow_tx_warn: LocalTimestamp::ZERO,
             tx_phase_times: phase_times::TxPhaseTimesCache::default(),
         }
@@ -396,6 +355,18 @@ where
     /// Access the (sole) shard's storage.
     pub fn storage(&self) -> &S {
         self.shard_storage()
+    }
+
+    /// Internal: shared `ShardIo` for the (sole) hosted shard. Call
+    /// sites that touch several fields of the shard prefer this over
+    /// the per-field helpers below.
+    pub(super) fn shard_io(&self) -> &ShardIo<S> {
+        self.shards.values().next().expect("V_shard == 1")
+    }
+
+    /// Internal: mutable `ShardIo` for the (sole) hosted shard.
+    pub(super) fn shard_io_mut(&mut self) -> &mut ShardIo<S> {
+        self.shards.values_mut().next().expect("V_shard == 1")
     }
 
     /// Internal: shard storage as `&Arc<S>` for sites that need to
@@ -657,13 +628,15 @@ where
     /// the loop calls this with wall-clock time. In simulation, the harness
     /// calls it with logical time.
     pub fn flush_expired_batches(&mut self, now: LocalTimestamp) {
-        if self.validation_batch.is_expired(now) {
+        let shard_io = self.shard_io();
+        if shard_io.validation_batch.is_expired(now) {
             self.flush_validation_batch();
         }
-        if self.committed_header_batch.is_expired(now) {
+        if self.shard_io().committed_header_batch.is_expired(now) {
             self.flush_committed_header_verifications();
         }
         let expired_shards: Vec<ShardGroupId> = self
+            .shard_io()
             .tx_gossip_batches
             .iter()
             .filter_map(|(shard, batch)| batch.is_expired(now).then_some(*shard))
@@ -678,14 +651,15 @@ where
     /// Used by the production `run()` loop for `recv_timeout()` and by the
     /// simulation harness to know when to schedule a flush.
     pub fn nearest_batch_deadline(&self) -> Option<LocalTimestamp> {
-        let tx_gossip_min = self
+        let shard_io = self.shard_io();
+        let tx_gossip_min = shard_io
             .tx_gossip_batches
             .values()
             .filter_map(BatchAccumulator::deadline)
             .min();
         [
-            self.validation_batch.deadline(),
-            self.committed_header_batch.deadline(),
+            shard_io.validation_batch.deadline(),
+            shard_io.committed_header_batch.deadline(),
             tx_gossip_min,
         ]
         .into_iter()
@@ -700,7 +674,7 @@ where
         self.flush_block_commits();
         self.flush_validation_batch();
         self.flush_committed_header_verifications();
-        let shards: Vec<ShardGroupId> = self.tx_gossip_batches.keys().copied().collect();
+        let shards: Vec<ShardGroupId> = self.shard_io().tx_gossip_batches.keys().copied().collect();
         for shard in shards {
             self.flush_tx_gossip_batch(shard);
         }

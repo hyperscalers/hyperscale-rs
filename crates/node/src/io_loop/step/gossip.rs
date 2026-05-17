@@ -25,14 +25,7 @@ use hyperscale_types::{
 
 use crate::io_loop::IoLoop;
 use crate::io_loop::verify::verify_bls_with_metrics;
-
-/// A committed header pending sender-signature verification.
-pub(in crate::io_loop) type CommittedHeaderVerificationItem = (
-    CommittedBlockHeader,
-    ValidatorId,
-    Bls12381G1PublicKey,
-    Bls12381G2Signature,
-);
+use crate::shard::CommittedHeaderVerificationItem;
 
 impl<S, N, D, E> IoLoop<S, N, D, E>
 where
@@ -53,10 +46,8 @@ where
     ) {
         let item: CommittedHeaderVerificationItem =
             (committed_header, sender, public_key, sender_signature);
-        if self
-            .committed_header_batch
-            .push(item, self.vnodes[0].state.now())
-        {
+        let now = self.vnodes[0].state.now();
+        if self.shard_io_mut().committed_header_batch.push(item, now) {
             self.flush_committed_header_verifications();
         }
     }
@@ -70,7 +61,7 @@ where
     /// cleanup needed). See `IoLoop::event_sender` for the off-thread
     /// → pinned-thread routing convention.
     pub(in crate::io_loop) fn flush_committed_header_verifications(&mut self) {
-        let items = self.committed_header_batch.take();
+        let items = self.shard_io_mut().committed_header_batch.take();
         if items.is_empty() {
             return;
         }

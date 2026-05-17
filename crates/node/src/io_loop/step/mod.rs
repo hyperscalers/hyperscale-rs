@@ -11,5 +11,3 @@ mod protocol_event;
 mod remote_header_sync;
 mod tick;
 mod tx_validation;
-
-pub(super) use gossip::CommittedHeaderVerificationItem;

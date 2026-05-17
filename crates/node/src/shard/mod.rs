@@ -12,14 +12,30 @@ pub mod caches;
 pub mod fetch;
 pub mod sync;
 
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use hyperscale_storage::{PendingChain, Storage};
+use hyperscale_types::{
+    Bls12381G1PublicKey, Bls12381G2Signature, CommittedBlockHeader, RoutableTransaction,
+    ShardGroupId, TxHash, ValidatorId,
+};
 
+use crate::batch_accumulator::BatchAccumulator;
 use crate::shard::block_commit::BlockCommitCoordinator;
 pub use crate::shard::caches::SharedCaches;
 use crate::shard::fetch::FetchHost;
 use crate::shard::sync::SyncHost;
+
+/// A committed header pending sender-signature verification, queued in
+/// `ShardIo::committed_header_batch` and drained on the crypto pool.
+pub type CommittedHeaderVerificationItem = (
+    CommittedBlockHeader,
+    ValidatorId,
+    Bls12381G1PublicKey,
+    Bls12381G2Signature,
+);
 
 /// Per-shard I/O state hosted by the `IoLoop`.
 pub struct ShardIo<S: Storage> {
@@ -53,4 +69,39 @@ pub struct ShardIo<S: Storage> {
     /// remote-header sync (track other shards' committed headers for
     /// cross-shard data dependencies).
     pub syncs: SyncHost,
+
+    /// Hashes currently in the validation pipeline — either sitting in
+    /// `validation_batch` or being verified off-thread. Acts as a
+    /// dedup guard so duplicate gossip / re-submits don't enqueue
+    /// twice. Entries are removed by `TransactionValidated` /
+    /// `TransactionValidationsFailed` handlers.
+    pub pending_validation: HashSet<TxHash>,
+
+    /// Subset of `pending_validation` that originated from a local
+    /// RPC / sim submission rather than gossip. Carried through
+    /// validation so the resulting `TransactionValidated` event can
+    /// flag `submitted_locally = true` for mempool admission
+    /// accounting.
+    pub locally_submitted: HashSet<TxHash>,
+
+    /// Pending transactions awaiting batched signature / format /
+    /// declared-shard verification on the `tx_validation` pool.
+    pub validation_batch: BatchAccumulator<Arc<RoutableTransaction>>,
+
+    /// Pending remote-committed-header gossip awaiting batched BLS
+    /// sender-signature verification on the crypto pool.
+    pub committed_header_batch: BatchAccumulator<CommittedHeaderVerificationItem>,
+
+    /// Per-destination-shard outbound `TransactionGossip` accumulators.
+    /// Locally-submitted transactions are appended to one accumulator
+    /// per shard the tx touches (declared reads ∪ writes); each fills
+    /// until its count cap or time window expires, then flushes as a
+    /// single batched gossip message.
+    pub tx_gossip_batches: BTreeMap<ShardGroupId, BatchAccumulator<Arc<RoutableTransaction>>>,
+
+    /// Cap for new tx-gossip accumulators (mirrored from `BatchConfig`).
+    pub tx_gossip_max: usize,
+
+    /// Window for new tx-gossip accumulators (mirrored from `BatchConfig`).
+    pub tx_gossip_window: Duration,
 }
