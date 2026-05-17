@@ -332,7 +332,8 @@ mod tests {
     }
 
     #[test]
-    fn test_register_request_handler_overwrites() {
+    #[should_panic(expected = "duplicate request handler registration")]
+    fn test_register_request_handler_rejects_duplicate() {
         use hyperscale_types::network::request::GetBlockRequest;
         use hyperscale_types::network::response::GetBlockResponse;
 
@@ -345,17 +346,6 @@ mod tests {
         adapter.register_request_handler::<GetBlockRequest>(shard, |_req| {
             GetBlockResponse::not_found()
         });
-
-        // Second handler should have won (overwrites).
-        // Encode a real request, call the raw handler, verify it works.
-        let handler = adapter
-            .registry
-            .get_request("block.request", shard)
-            .unwrap();
-        let req = GetBlockRequest::new(BlockHeight::new(1), BlockHeight::new(1));
-        let req_bytes = basic_encode(&req).unwrap();
-        let response_bytes = handler(&req_bytes);
-        assert!(!response_bytes.is_empty());
     }
 
     #[test]

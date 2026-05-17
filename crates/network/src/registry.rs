@@ -66,6 +66,11 @@ impl HandlerRegistry {
     ///
     /// Wraps the handler in a closure that SBOR-decodes the payload before
     /// calling the handler. Decode errors are logged and the message is dropped.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a handler is already registered for this message type. All
+    /// registrations happen once at init; a duplicate is a programmer error.
     pub fn register_gossip<M: NetworkMessage>(&self, handler: impl GossipHandler<M>) {
         let raw: Arc<RawGossipHandler> =
             Arc::new(move |payload: Vec<u8>| match basic_decode::<M>(&payload) {
@@ -79,10 +84,16 @@ impl HandlerRegistry {
                     GossipVerdict::Reject
                 }
             });
-        self.gossip
+        let prior = self
+            .gossip
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(M::message_type_id(), raw);
+        assert!(
+            prior.is_none(),
+            "duplicate gossip handler registration for {}",
+            M::message_type_id(),
+        );
     }
 
     /// Register a typed request handler for a message type on `shard`.
@@ -93,6 +104,12 @@ impl HandlerRegistry {
     ///
     /// Wraps the handler in a closure that SBOR-decodes the request,
     /// calls the handler, and SBOR-encodes the response.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a handler is already registered for `(type_id, shard)`.
+    /// All registrations happen once at init; a duplicate is a programmer
+    /// error.
     pub fn register_request<R: Request>(
         &self,
         shard: ShardGroupId,
@@ -124,16 +141,27 @@ impl HandlerRegistry {
             }
         });
 
-        self.request
+        let prior = self
+            .request
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .insert((R::message_type_id(), shard), raw);
+        assert!(
+            prior.is_none(),
+            "duplicate request handler registration for ({}, {shard:?})",
+            R::message_type_id(),
+        );
     }
 
     /// Register a typed notification handler for a message type.
     ///
     /// SBOR-decodes the payload before calling the handler. Stored in a separate
     /// map so a message type can be registered as both gossip and notification.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a handler is already registered for this message type. All
+    /// registrations happen once at init; a duplicate is a programmer error.
     pub fn register_notification<M: NetworkMessage>(&self, handler: impl NotificationHandler<M>) {
         let raw: Arc<RawNotificationHandler> =
             Arc::new(move |payload: Vec<u8>| match basic_decode::<M>(&payload) {
@@ -146,10 +174,16 @@ impl HandlerRegistry {
                     );
                 }
             });
-        self.notification
+        let prior = self
+            .notification
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(M::message_type_id(), raw);
+        assert!(
+            prior.is_none(),
+            "duplicate notification handler registration for {}",
+            M::message_type_id(),
+        );
     }
 
     // ── Raw registration (used by infrastructure tests) ──
@@ -326,9 +360,10 @@ mod tests {
     }
 
     #[test]
-    fn test_overwrite_handler() {
+    #[should_panic(expected = "duplicate gossip handler registration")]
+    fn test_double_registration_panics() {
         use hyperscale_types::NetworkMessage;
-        use sbor::{Decode, Encode, basic_encode};
+        use sbor::{Decode, Encode};
 
         #[derive(Debug, Encode, Decode)]
         struct TestMsg(u32);
@@ -339,26 +374,7 @@ mod tests {
         }
 
         let registry = HandlerRegistry::new();
-        let counter1 = Arc::new(AtomicUsize::new(0));
-        let counter2 = Arc::new(AtomicUsize::new(0));
-
-        let c1 = counter1.clone();
-        registry.register_gossip(move |_: TestMsg| -> GossipVerdict {
-            c1.fetch_add(1, Ordering::SeqCst);
-            GossipVerdict::Accept
-        });
-        let c2 = counter2.clone();
-        registry.register_gossip(move |_: TestMsg| -> GossipVerdict {
-            c2.fetch_add(1, Ordering::SeqCst);
-            GossipVerdict::Accept
-        });
-
-        let handler = registry.get_gossip("test").unwrap();
-        let encoded = basic_encode(&TestMsg(1)).unwrap();
-        handler(encoded);
-
-        // Second handler should have won
-        assert_eq!(counter1.load(Ordering::SeqCst), 0);
-        assert_eq!(counter2.load(Ordering::SeqCst), 1);
+        registry.register_gossip(|_: TestMsg| -> GossipVerdict { GossipVerdict::Accept });
+        registry.register_gossip(|_: TestMsg| -> GossipVerdict { GossipVerdict::Accept });
     }
 }
