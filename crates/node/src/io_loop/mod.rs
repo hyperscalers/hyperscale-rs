@@ -376,16 +376,6 @@ where
 
     // ─── Accessors ──────────────────────────────────────────────────────
 
-    /// Access the (sole) vnode's state machine.
-    pub fn state(&self) -> &NodeStateMachine {
-        &self.vnodes[0].state
-    }
-
-    /// Mutably access the (sole) vnode's state machine.
-    pub fn state_mut(&mut self) -> &mut NodeStateMachine {
-        &mut self.vnodes[0].state
-    }
-
     /// Number of vnodes hosted by this `IoLoop`.
     #[must_use]
     pub const fn vnodes_len(&self) -> usize {

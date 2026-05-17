@@ -351,7 +351,7 @@ impl SimulationRunner {
     #[must_use]
     pub fn node_storage(&self, node: NodeIndex) -> Option<&SimStorage> {
         let io_loop = self.io_loops.get(node as usize)?;
-        let shard = io_loop.state().topology().local_shard();
+        let shard = io_loop.vnode_state(0).topology().local_shard();
         Some(io_loop.shard_storage(shard))
     }
 
@@ -382,7 +382,9 @@ impl SimulationRunner {
     /// [`Self::vnode_state`] to pick a specific validator.
     #[must_use]
     pub fn node(&self, index: NodeIndex) -> Option<&NodeStateMachine> {
-        self.io_loops.get(index as usize).map(IoLoop::state)
+        self.io_loops
+            .get(index as usize)
+            .map(|nl| nl.vnode_state(0))
     }
 
     /// Get a reference to a specific validator's state machine,
@@ -411,7 +413,7 @@ impl SimulationRunner {
     #[must_use]
     pub fn committed_block_count(&self, node: NodeIndex) -> usize {
         self.io_loops.get(node as usize).map_or(0, |nl| {
-            let shard = nl.state().topology().local_shard();
+            let shard = nl.vnode_state(0).topology().local_shard();
             let s = nl.shard_storage(shard);
             let committed = s.committed_height();
             if committed == BlockHeight::GENESIS {
@@ -426,7 +428,7 @@ impl SimulationRunner {
     #[must_use]
     pub fn has_committed_block(&self, node: NodeIndex, height: BlockHeight) -> bool {
         self.io_loops.get(node as usize).is_some_and(|nl| {
-            let shard = nl.state().topology().local_shard();
+            let shard = nl.vnode_state(0).topology().local_shard();
             nl.shard_storage(shard).get_block(height).is_some()
         })
     }
@@ -522,7 +524,10 @@ impl SimulationRunner {
             if self.genesis_executed[node_idx] || !select(node_idx) {
                 continue;
             }
-            let shard = self.io_loops[node_idx].state().topology().local_shard();
+            let shard = self.io_loops[node_idx]
+                .vnode_state(0)
+                .topology()
+                .local_shard();
             self.io_loops[node_idx].install_engine_genesis(shard, config);
             self.genesis_executed[node_idx] = true;
         }
