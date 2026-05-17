@@ -20,7 +20,7 @@
 
 mod actions;
 mod fetch_io;
-mod init;
+mod lifecycle;
 mod metrics;
 mod network_handlers;
 mod status;

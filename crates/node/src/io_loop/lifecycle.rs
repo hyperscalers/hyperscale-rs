@@ -1,7 +1,8 @@
-//! Genesis-time initialization helpers for the I/O loop.
+//! Lifecycle helpers for the I/O loop — bring-up and (eventually)
+//! tear-down.
 //!
-//! These methods run once during startup (genesis or resume) and are
-//! distinct from the run-loop methods in [`super`]:
+//! These methods run at well-defined points in the host's life, not
+//! on every event. The run-loop methods live in [`super`].
 //!
 //! - [`IoLoop::handle_actions`] drains the action vec returned by
 //!   `NodeStateMachine::initialize_genesis` (initial timer sets, etc.).
