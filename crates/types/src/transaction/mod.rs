@@ -1,6 +1,6 @@
 //! Transaction types for consensus.
 //!
-//! - [`routable`]: [`RoutableTransaction`] (the wrapper + manual SBOR).
+//! - [`routable`]: [`RoutableTransaction`] (the network-routing wrapper around a Radix `NotarizedTransactionV1`/`V2`).
 //! - [`status`]: [`TransactionDecision`], [`TransactionStatus`], [`TransactionError`],
 //!   and the RPC-string parser.
 //! - [`constructors`]: `routable_from_*` constructors that derive read/write sets

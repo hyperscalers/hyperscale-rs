@@ -1,4 +1,4 @@
-//! [`Block`] enum (Live/Sealed) plus its manual SBOR encoding.
+//! [`Block`] enum (Live/Sealed).
 
 use std::sync::Arc;
 
