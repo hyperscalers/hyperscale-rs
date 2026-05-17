@@ -160,10 +160,10 @@ pub trait Network: Send + Sync + 'static {
     // ── Pub/sub messaging ──
 
     /// Broadcast a shard-scoped message to all peers subscribed to that shard's topic.
-    fn broadcast_to_shard<M: ShardMessage>(&self, shard: ShardGroupId, message: &M);
+    fn broadcast_to_shard<M: ShardMessage + 'static>(&self, shard: ShardGroupId, message: &M);
 
     /// Broadcast a message to all connected peers globally.
-    fn broadcast_global<M: NetworkMessage>(&self, message: &M);
+    fn broadcast_global<M: NetworkMessage + 'static>(&self, message: &M);
 
     // ── Handler registration ──
 
@@ -176,7 +176,7 @@ pub trait Network: Send + Sync + 'static {
     /// topic (shard-scoped or global, per `scope`).
     ///
     /// Called during node initialization — once per message type.
-    fn register_gossip_handler<M: NetworkMessage>(
+    fn register_gossip_handler<M: NetworkMessage + Clone + 'static>(
         &self,
         scope: TopicScope,
         handler: impl GossipHandler<M>,
@@ -203,12 +203,12 @@ pub trait Network: Send + Sync + 'static {
     ///
     /// No response is expected. TCP provides packet-level reliability;
     /// protocol-level timeouts handle the rest.
-    fn notify<M: NetworkMessage>(&self, recipients: &[ValidatorId], message: &M);
+    fn notify<M: NetworkMessage + 'static>(&self, recipients: &[ValidatorId], message: &M);
 
     /// Register a handler for inbound notification messages (fire-and-forget unicast).
     ///
     /// Called during node initialization — once per notification type.
-    fn register_notification_handler<M: NetworkMessage>(
+    fn register_notification_handler<M: NetworkMessage + Clone + 'static>(
         &self,
         handler: impl NotificationHandler<M>,
     );

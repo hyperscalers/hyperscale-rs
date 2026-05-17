@@ -135,7 +135,15 @@ impl Network for Libp2pNetwork {
         self.topology.store(snapshot);
     }
 
-    fn broadcast_to_shard<M: ShardMessage>(&self, shard: ShardGroupId, message: &M) {
+    fn broadcast_to_shard<M: ShardMessage + 'static>(&self, shard: ShardGroupId, message: &M) {
+        // Tee to in-process subscribers when we host a vnode in this
+        // shard — gossipsub never loops the publication back to the
+        // publisher, so colocated vnodes would otherwise miss it.
+        if self.local_shards.contains(&shard) {
+            // Verdict only matters for forwarding decisions; we're the
+            // publisher so peer-side gossipsub handles that.
+            let _ = self.registry.local_dispatch_gossip(message);
+        }
         let topic = Topic::shard(M::message_type_id(), shard);
         let data = compress(&basic_encode(message).expect("SBOR encode failed"));
         if let Err(e) = self.adapter.publish(&topic, data, M::class()) {
@@ -143,7 +151,10 @@ impl Network for Libp2pNetwork {
         }
     }
 
-    fn broadcast_global<M: NetworkMessage>(&self, message: &M) {
+    fn broadcast_global<M: NetworkMessage + 'static>(&self, message: &M) {
+        // Every host subscribes to the global topic, so always tee
+        // locally; handlers dedup or self-filter their own emissions.
+        let _ = self.registry.local_dispatch_gossip(message);
         let topic = Topic::global(M::message_type_id());
         let data = compress(&basic_encode(message).expect("SBOR encode failed"));
         if let Err(e) = self.adapter.publish(&topic, data, M::class()) {
@@ -151,7 +162,7 @@ impl Network for Libp2pNetwork {
         }
     }
 
-    fn register_gossip_handler<M: NetworkMessage>(
+    fn register_gossip_handler<M: NetworkMessage + Clone + 'static>(
         &self,
         scope: TopicScope,
         handler: impl GossipHandler<M>,
@@ -183,16 +194,27 @@ impl Network for Libp2pNetwork {
         }
     }
 
-    fn notify<M: NetworkMessage>(&self, recipients: &[ValidatorId], message: &M) {
-        let sbor = basic_encode(message).expect("SBOR encode failed");
-        let compressed = compress(&sbor);
-        let type_id = M::message_type_id();
+    fn notify<M: NetworkMessage + 'static>(&self, recipients: &[ValidatorId], message: &M) {
+        // Split into local + remote. Local recipients (our own hosted
+        // vnodes) never get a `validator_peers` entry from the bind
+        // handshake, so without this branch they'd be silently dropped.
+        // A single typed dispatch reaches every same-shard vnode through
+        // the handler's `feed_event_to_shard_vnodes` fan-out.
+        let self_ids: HashSet<ValidatorId> =
+            self.adapter.local_validator_ids().iter().copied().collect();
+        let has_local = recipients.iter().any(|v| self_ids.contains(v));
+        if has_local {
+            self.registry.local_dispatch_notification(message);
+        }
 
-        // Collapse recipients to unique peers: under multi-validator bind a
-        // single peer can serve several validator ids, and sending the same
-        // notification twice on the same stream is wasted bandwidth.
+        // Remote: collapse to unique peers (multi-validator bind can map
+        // several recipient vids to one peer, and sending twice on the
+        // same stream is wasted bandwidth).
         let mut unique_peers: HashSet<PeerId> = HashSet::with_capacity(recipients.len());
         for &validator in recipients {
+            if self_ids.contains(&validator) {
+                continue;
+            }
             let Some(peer_id) = self.validator_peer_id(validator) else {
                 warn!(
                     validator = validator.inner(),
@@ -203,12 +225,18 @@ impl Network for Libp2pNetwork {
             unique_peers.insert(peer_id);
         }
 
+        if unique_peers.is_empty() {
+            return;
+        }
+        let sbor = basic_encode(message).expect("SBOR encode failed");
+        let compressed = compress(&sbor);
+        let type_id = M::message_type_id();
         for peer_id in unique_peers {
             self.notify_pool.send(peer_id, type_id, compressed.clone());
         }
     }
 
-    fn register_notification_handler<M: NetworkMessage>(
+    fn register_notification_handler<M: NetworkMessage + Clone + 'static>(
         &self,
         handler: impl NotificationHandler<M>,
     ) {
