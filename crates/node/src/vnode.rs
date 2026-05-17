@@ -27,7 +27,10 @@ pub struct VnodeInit {
     /// and `shard` from there).
     pub state: NodeStateMachine,
     /// BLS signing key for this validator's votes and proposals.
-    pub signing_key: Bls12381G1PrivateKey,
+    /// Shared with the validator-bind service (production) by `Arc`
+    /// so the key has exactly one allocation regardless of how many
+    /// off-thread consumers hold it.
+    pub signing_key: Arc<Bls12381G1PrivateKey>,
 }
 
 /// Per-validator bundle hosted by the `IoLoop`.

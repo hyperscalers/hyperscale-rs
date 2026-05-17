@@ -158,9 +158,9 @@ impl TestFixtures {
     }
 
     /// Get the BLS signing key for a validator.
-    pub fn signing_key(&self, index: u32) -> Bls12381G1PrivateKey {
+    pub fn signing_key(&self, index: u32) -> Arc<Bls12381G1PrivateKey> {
         let key_bytes = self.bls_keys[index as usize].to_bytes();
-        Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
+        Arc::new(Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes"))
     }
 
     /// Get the Ed25519 keypair for a validator.
@@ -182,9 +182,11 @@ impl TestFixtures {
     }
 
     /// Get the BLS signing key for a validator, wrapped in `Arc` for the
-    /// validator-bind service.
+    /// validator-bind service. Identical to [`Self::signing_key`] now that
+    /// `signing_key` returns `Arc`; kept as a name-at-callsite signal that
+    /// the bind tests use the key purely as a bind credential.
     pub fn bind_signing_key(&self, index: u32) -> Arc<Bls12381G1PrivateKey> {
-        Arc::new(self.signing_key(index))
+        self.signing_key(index)
     }
 
     /// Create a listen address using port 0 (OS-assigned).

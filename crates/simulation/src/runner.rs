@@ -228,8 +228,9 @@ impl SimulationRunner {
                     );
 
                     let key_bytes = keys[validator_idx as usize].to_bytes();
-                    let signing_key =
-                        Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes");
+                    let signing_key = Arc::new(
+                        Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes"),
+                    );
 
                     // First vnode's topology drives the `IoLoop`'s
                     // shared snapshot. Same-shard vnodes have
