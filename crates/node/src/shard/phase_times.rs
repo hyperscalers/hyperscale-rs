@@ -24,7 +24,7 @@ use hyperscale_types::{LocalTimestamp, TransactionStatus, TxHash};
 /// Phase-time stamps for a single transaction's mempool → terminal flow.
 #[derive(Debug, Clone, Copy)]
 #[allow(clippy::struct_field_names)] // every field is a timestamp; suffix carries the role
-pub(super) struct TxPhaseTimes {
+pub struct TxPhaseTimes {
     /// First time this validator saw the tx (RPC submit or gossip arrival).
     added_at: LocalTimestamp,
     committed_at: Option<LocalTimestamp>,
@@ -40,14 +40,14 @@ impl TxPhaseTimes {
         }
     }
 
-    pub(super) const fn added_at(&self) -> LocalTimestamp {
+    pub const fn added_at(&self) -> LocalTimestamp {
         self.added_at
     }
 
     /// Renders the phase breakdown for the slow-tx log, formatting the
     /// completed-at duration relative to `completed_at` (the terminal stamp
     /// the `io_loop` computed when it observed the `Completed` status).
-    pub(super) fn display_at(&self, completed_at: LocalTimestamp) -> impl fmt::Display + '_ {
+    pub fn display_at(&self, completed_at: LocalTimestamp) -> impl fmt::Display + '_ {
         TxPhaseTimesDisplay {
             phases: self,
             completed_at,
@@ -58,7 +58,7 @@ impl TxPhaseTimes {
 /// Per-tx side cache. Keys are `TxHash`, values are stamps the `io_loop`
 /// records as `EmitTransactionStatus` / `RecordTxEcCreated` actions arrive.
 #[derive(Default)]
-pub(super) struct TxPhaseTimesCache {
+pub struct TxPhaseTimesCache {
     entries: HashMap<TxHash, TxPhaseTimes>,
 }
 
@@ -67,7 +67,7 @@ impl TxPhaseTimesCache {
     /// the populated entry on terminal statuses (so the caller can render
     /// the slow-tx log) and removes it from the cache. Returns `None` for
     /// non-terminal statuses or unknown transitions.
-    pub(super) fn observe_status(
+    pub fn observe_status(
         &mut self,
         tx_hash: TxHash,
         status: &TransactionStatus,
@@ -97,7 +97,7 @@ impl TxPhaseTimesCache {
 
     /// Stamp `ec_created_at` for each tx hash. Pure stamp — no terminal
     /// status flows through here.
-    pub(super) fn record_ec_created(&mut self, tx_hashes: &[TxHash], now: LocalTimestamp) {
+    pub fn record_ec_created(&mut self, tx_hashes: &[TxHash], now: LocalTimestamp) {
         for hash in tx_hashes {
             let entry = self
                 .entries

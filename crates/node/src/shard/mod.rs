@@ -10,7 +10,9 @@
 pub mod block_commit;
 pub mod caches;
 pub mod fetch;
+pub mod phase_times;
 pub mod sync;
+pub mod verify;
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;

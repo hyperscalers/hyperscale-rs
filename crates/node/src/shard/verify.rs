@@ -8,7 +8,7 @@ use hyperscale_types::{
 use tracing::warn;
 
 /// Verify a BLS12-381 signature and record latency metrics.
-pub(super) fn verify_bls_with_metrics(
+pub fn verify_bls_with_metrics(
     msg: &[u8],
     public_key: &Bls12381G1PublicKey,
     signature: &Bls12381G2Signature,
@@ -24,7 +24,7 @@ pub(super) fn verify_bls_with_metrics(
 ///
 /// Returns `None` (with a warning) if the sender is not in the shard's
 /// committee or their public key cannot be resolved.
-pub(super) fn resolve_sender_key(
+pub fn resolve_sender_key(
     topology: &TopologySnapshot,
     sender: ValidatorId,
     shard: ShardGroupId,
@@ -54,7 +54,7 @@ pub(super) fn resolve_sender_key(
 /// is valid. Combines [`resolve_sender_key`] and [`verify_bls_with_metrics`].
 ///
 /// Returns `false` (with warnings) on any failure.
-pub(super) fn verify_sender_signature(
+pub fn verify_sender_signature(
     topology: &TopologySnapshot,
     sender: ValidatorId,
     shard: ShardGroupId,

@@ -23,10 +23,8 @@ mod fetch_io;
 mod init;
 mod metrics;
 mod network_handlers;
-mod phase_times;
 mod status;
 mod step;
-mod verify;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -57,6 +55,7 @@ use crate::shard::fetch::binding::{
     TransactionBinding,
 };
 use crate::shard::fetch::{FetchHost, FetchInput};
+use crate::shard::phase_times::TxPhaseTimesCache;
 use crate::shard::sync::SyncHost;
 use crate::vnode::Vnode;
 
@@ -213,7 +212,7 @@ where
     /// Per-tx phase-time stamps for the slow-tx finalization log. Populated
     /// from `EmitTransactionStatus` and `RecordTxEcCreated` actions; entries
     /// are dropped on terminal status.
-    tx_phase_times: phase_times::TxPhaseTimesCache,
+    tx_phase_times: TxPhaseTimesCache,
 }
 
 impl<S, N, D, E> IoLoop<S, N, D, E>
@@ -324,7 +323,7 @@ where
             dispatch_handles,
             tx_validator,
             last_slow_tx_warn: LocalTimestamp::ZERO,
-            tx_phase_times: phase_times::TxPhaseTimesCache::default(),
+            tx_phase_times: TxPhaseTimesCache::default(),
         }
     }
 

@@ -22,7 +22,7 @@ use hyperscale_types::{ExecutionCertificate, FinalizedWave, WaveId};
 use tracing::warn;
 
 use super::IoLoop;
-use super::verify::{resolve_sender_key, verify_bls_with_metrics, verify_sender_signature};
+use crate::shard::verify::{resolve_sender_key, verify_bls_with_metrics, verify_sender_signature};
 
 impl<S, N, D, E> IoLoop<S, N, D, E>
 where
