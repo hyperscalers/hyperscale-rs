@@ -92,12 +92,12 @@ where
 
             // ─── io_loop-internal effects ──────────────────────────────────
             Action::SetTimer { id, duration } => {
-                self.vnodes[0]
+                self.vnodes[vnode_idx]
                     .pending_timer_ops
                     .push(TimerOp::Set { id, duration });
             }
             Action::CancelTimer { id } => {
-                self.vnodes[0]
+                self.vnodes[vnode_idx]
                     .pending_timer_ops
                     .push(TimerOp::Cancel { id });
             }
@@ -105,6 +105,7 @@ where
             Action::RestoreCommittedState => self.handle_restore_committed_state(shard),
             Action::CommitBlock { block, qc, source } => {
                 self.accept_block_commit(
+                    vnode_idx,
                     shard,
                     PendingCommit {
                         block: Arc::new(block),
@@ -122,6 +123,7 @@ where
                 source,
             } => {
                 self.handle_commit_block_by_qc_only(
+                    vnode_idx,
                     shard,
                     block,
                     qc,
@@ -137,6 +139,7 @@ where
                 submitted_locally,
             } => {
                 self.handle_emit_transaction_status(
+                    vnode_idx,
                     shard,
                     tx_hash,
                     status,
@@ -146,7 +149,7 @@ where
             }
             Action::RecordTxEcCreated { tx_hashes } => {
                 self.tx_phase_times
-                    .record_ec_created(&tx_hashes, self.vnodes[0].state.now());
+                    .record_ec_created(&tx_hashes, self.vnodes[vnode_idx].state.now());
             }
             Action::TopologyChanged { topology_snapshot } => {
                 self.handle_topology_changed(&topology_snapshot);
@@ -201,6 +204,7 @@ where
 
     fn handle_emit_transaction_status(
         &mut self,
+        vnode_idx: usize,
         shard: ShardGroupId,
         tx_hash: TxHash,
         status: TransactionStatus,
@@ -208,7 +212,7 @@ where
         submitted_locally: bool,
     ) {
         trace!(?tx_hash, ?status, "Transaction status");
-        let now = self.vnodes[0].state.now();
+        let now = self.vnodes[vnode_idx].state.now();
         let terminal_phases = self.tx_phase_times.observe_status(tx_hash, &status, now);
         if status.is_final()
             && submitted_locally
@@ -236,7 +240,9 @@ where
         self.shard_caches(shard)
             .tx_status
             .insert(tx_hash, status.clone());
-        self.vnodes[0].emitted_statuses.push((tx_hash, status));
+        self.vnodes[vnode_idx]
+            .emitted_statuses
+            .push((tx_hash, status));
     }
 
     fn handle_topology_changed(&self, topology: &Arc<TopologySnapshot>) {
@@ -266,8 +272,10 @@ where
     /// flush time (other blocks committed in between). `commit_prepared_blocks`
     /// handles that via its fallback path — skip if already committed, else
     /// recompute.
+    #[allow(clippy::too_many_arguments)] // unpacks Action::CommitBlockByQcOnly + emitting vnode context
     fn handle_commit_block_by_qc_only(
         &mut self,
+        vnode_idx: usize,
         shard: ShardGroupId,
         block: Block,
         qc: QuorumCertificate,
@@ -388,6 +396,7 @@ where
         // block_hash so double-emission (consensus + sync both reaching
         // commit) is safe.
         self.accept_block_commit(
+            vnode_idx,
             shard,
             PendingCommit {
                 block: Arc::new(block),
@@ -403,8 +412,13 @@ where
     /// unless persistence backpressure is active, fire `BlockCommitted`.
     ///
     /// [`BlockCommitCoordinator`]: crate::shard::block_commit::BlockCommitCoordinator
-    fn accept_block_commit(&mut self, shard: ShardGroupId, commit: PendingCommit) {
-        let now = self.vnodes[0].state.now();
+    fn accept_block_commit(
+        &mut self,
+        vnode_idx: usize,
+        shard: ShardGroupId,
+        commit: PendingCommit,
+    ) {
+        let now = self.vnodes[vnode_idx].state.now();
         let decision = self.shard_block_commit_mut(shard).accumulate(commit, now);
         match decision {
             AccumulateDecision::Skip => {}
