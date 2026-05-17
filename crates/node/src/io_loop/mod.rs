@@ -622,6 +622,27 @@ where
         self.process_actions(vnode_idx, actions);
     }
 
+    /// Fan a protocol event out to every hosted vnode's state machine.
+    ///
+    /// Use this for shard-derived events (block persisted, sync block
+    /// validated, remote header received, etc.) — each same-shard
+    /// vnode independently applies the event and produces its own
+    /// signed actions. Per-vnode events (where only the emitting vnode
+    /// should react) should call [`Self::feed_event`] directly with
+    /// the originating index.
+    fn feed_event_to_all_vnodes(&mut self, event: ProtocolEvent) {
+        // Clone for every vnode except the last; move into the last so
+        // we don't pay a final clone whose result is immediately
+        // dropped.
+        let last = self.vnodes.len().saturating_sub(1);
+        for vnode_idx in 0..last {
+            self.feed_event(vnode_idx, event.clone());
+        }
+        if !self.vnodes.is_empty() {
+            self.feed_event(last, event);
+        }
+    }
+
     /// Dispatch a `Vec<Action>` produced by a direct state-machine
     /// method call. Mirrors [`Self::feed_event`]'s post-`handle` block
     /// — bumps `actions_generated`, dispatches each action, and

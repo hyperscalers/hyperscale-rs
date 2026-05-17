@@ -30,7 +30,7 @@ where
         self.shard_block_commit_mut().mark_persisted(height);
         // Drop pending state for blocks now persisted to RocksDB.
         self.shard_pending_chain().prune(height);
-        self.feed_event(0, ProtocolEvent::BlockPersisted { height });
+        self.feed_event_to_all_vnodes(ProtocolEvent::BlockPersisted { height });
     }
 
     /// Default `Protocol(_)` passthrough — fan the event across fetch-binding
@@ -38,6 +38,6 @@ where
     /// and feed the variant into the state machine.
     pub(in crate::io_loop) fn handle_protocol_passthrough(&mut self, event: ProtocolEvent) {
         self.drive_fetch_admission(&event);
-        self.feed_event(0, event);
+        self.feed_event_to_all_vnodes(event);
     }
 }
