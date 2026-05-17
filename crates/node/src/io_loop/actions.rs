@@ -296,7 +296,7 @@ where
             // Build view anchored at parent — includes prior synced blocks'
             // JMT snapshots so chained verification can find parent nodes.
             let view = self
-                .pending_chain
+                .shard_pending_chain()
                 .view_at(block.header().parent_block_hash());
             let pending_snapshots = view.pending_snapshots().to_vec();
 
@@ -353,7 +353,7 @@ where
                 .iter()
                 .flat_map(|fw| fw.consensus_receipts())
                 .collect();
-            self.pending_chain.insert(
+            self.shard_pending_chain().insert(
                 block_hash,
                 ChainEntry {
                     parent_block_hash: block.header().parent_block_hash(),

@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use hyperscale_storage::Storage;
+use hyperscale_storage::{PendingChain, Storage};
 
 /// Per-shard I/O state hosted by the `IoLoop`.
 pub struct ShardIo<S: Storage> {
@@ -17,4 +17,11 @@ pub struct ShardIo<S: Storage> {
     /// delegated closures (block-commit, fetch-serve, sync) can read
     /// it from thread pools without crossing back to the pinned thread.
     pub storage: Arc<S>,
+
+    /// Chain-anchored pending state. Indexed by block hash; reads
+    /// happen through `PendingChain::view_at(parent_block_hash)` which
+    /// walks the parent chain back to the committed tip. Orphaned
+    /// blocks are not ancestors and are structurally invisible to
+    /// anchored views.
+    pub pending_chain: Arc<PendingChain<S>>,
 }

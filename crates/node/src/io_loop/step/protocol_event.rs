@@ -29,7 +29,7 @@ where
     pub(in crate::io_loop) fn handle_block_persisted(&mut self, height: BlockHeight) {
         self.block_commit.mark_persisted(height);
         // Drop pending state for blocks now persisted to RocksDB.
-        self.pending_chain.prune(height);
+        self.shard_pending_chain().prune(height);
         self.feed_event(ProtocolEvent::BlockPersisted { height });
     }
 

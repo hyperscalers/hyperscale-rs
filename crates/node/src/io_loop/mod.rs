@@ -210,12 +210,6 @@ where
     /// with delegated dispatch closures.
     block_commit: BlockCommitCoordinator<S>,
 
-    /// Chain-anchored pending state. Indexed by block hash; reads happen
-    /// through `PendingChain::view_at(parent_block_hash)` which walks the
-    /// parent chain back to the committed tip. Orphaned blocks are not
-    /// ancestors and are structurally invisible to anchored views.
-    pending_chain: Arc<PendingChain<S>>,
-
     /// See [`DispatchHandles`]. Cloned once per delegated-action dispatch.
     dispatch_handles: Arc<DispatchHandles<S, N, E>>,
 
@@ -353,7 +347,13 @@ where
             1,
             "IoLoop currently supports exactly one Vnode"
         );
-        let shards = HashMap::from([(shard, ShardIo { storage })]);
+        let shards = HashMap::from([(
+            shard,
+            ShardIo {
+                storage,
+                pending_chain,
+            },
+        )]);
         assert_eq!(
             shards.len(),
             1,
@@ -369,7 +369,6 @@ where
             topology_snapshot,
             // At startup, everything committed is also persisted on disk.
             block_commit,
-            pending_chain,
             dispatch_handles,
             caches,
             tx_validator,
@@ -423,6 +422,18 @@ where
     /// `Arc::clone` it into off-thread handler closures.
     pub(super) fn shard_storage(&self) -> &Arc<S> {
         &self.shards.values().next().expect("V_shard == 1").storage
+    }
+
+    /// Internal: shard pending-chain handle. Used by JMT-snapshot
+    /// inserts and persistence prunes that need to mutate the pending
+    /// chain through its `Arc`-shared interior mutability.
+    pub(super) fn shard_pending_chain(&self) -> &Arc<PendingChain<S>> {
+        &self
+            .shards
+            .values()
+            .next()
+            .expect("V_shard == 1")
+            .pending_chain
     }
 
     /// Access the network.
