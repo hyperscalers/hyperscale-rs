@@ -155,7 +155,12 @@ impl Default for SimNetworkAdapter {
 }
 
 impl Network for SimNetworkAdapter {
-    fn broadcast_to_shard<M: ShardMessage>(&self, shard: ShardGroupId, message: &M) {
+    fn broadcast_to_shard<M: ShardMessage + 'static>(&self, shard: ShardGroupId, message: &M) {
+        // Tee to in-process subscribers — the harness's `accept_gossip`
+        // skips the publisher's own node (matching gossipsub's no-loop
+        // semantics), so colocated vnodes would otherwise miss their
+        // own host's broadcasts. Verdict ignored: we are the publisher.
+        let _ = self.registry.local_dispatch_gossip(message);
         let data = compression::compress(
             &basic_encode(message).expect("SimNetworkAdapter: failed to encode message"),
         );
@@ -166,7 +171,8 @@ impl Network for SimNetworkAdapter {
         });
     }
 
-    fn broadcast_global<M: NetworkMessage>(&self, message: &M) {
+    fn broadcast_global<M: NetworkMessage + 'static>(&self, message: &M) {
+        let _ = self.registry.local_dispatch_gossip(message);
         let data = compression::compress(
             &basic_encode(message).expect("SimNetworkAdapter: failed to encode message"),
         );
@@ -177,7 +183,7 @@ impl Network for SimNetworkAdapter {
         });
     }
 
-    fn register_gossip_handler<M: NetworkMessage>(
+    fn register_gossip_handler<M: NetworkMessage + Clone + 'static>(
         &self,
         _scope: TopicScope,
         handler: impl GossipHandler<M>,
@@ -187,7 +193,7 @@ impl Network for SimNetworkAdapter {
         self.registry.register_gossip(handler);
     }
 
-    fn notify<M: NetworkMessage>(&self, recipients: &[ValidatorId], message: &M) {
+    fn notify<M: NetworkMessage + 'static>(&self, recipients: &[ValidatorId], message: &M) {
         // Note: compression happens here at send-time, then accept_notifications()
         // decompresses before queueing for delivery. In production (Libp2pNetwork),
         // compression happens inside the stream framing layer (write_typed_frame) instead.
@@ -204,7 +210,7 @@ impl Network for SimNetworkAdapter {
             });
     }
 
-    fn register_notification_handler<M: NetworkMessage>(
+    fn register_notification_handler<M: NetworkMessage + Clone + 'static>(
         &self,
         handler: impl NotificationHandler<M>,
     ) {

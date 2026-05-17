@@ -13,7 +13,9 @@
 //! All registrations happen at init (before any messages arrive), so
 //! the read-heavy `RwLock` pattern is ideal.
 
+use std::any::{Any, TypeId};
 use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::sync::{Arc, PoisonError, RwLock};
 
 use hyperscale_types::{NetworkMessage, Request, ShardGroupId};
@@ -29,6 +31,59 @@ pub type RawNotificationHandler = dyn Fn(Vec<u8>) + Send + Sync;
 
 /// Type-erased request handler: receives SBOR request bytes, returns SBOR response bytes.
 pub type RawRequestHandler = dyn Fn(&[u8]) -> Vec<u8> + Send + Sync;
+
+/// Dispatch a typed gossip message into its handler without SBOR
+/// encode/decode. Used by network backends to deliver locally-published
+/// messages to in-process subscribers.
+pub trait LocalGossipDispatcher: Send + Sync {
+    /// Dispatch `msg` (downcast from `&dyn Any` to the registered `M`)
+    /// to the typed handler. The handler consumes `M`, so the dispatcher
+    /// clones internally.
+    fn dispatch(&self, msg: &dyn Any) -> GossipVerdict;
+}
+
+/// Counterpart to [`LocalGossipDispatcher`] for fire-and-forget notifications.
+pub trait LocalNotificationDispatcher: Send + Sync {
+    /// Dispatch `msg` (downcast from `&dyn Any` to the registered `M`)
+    /// to the typed handler.
+    fn dispatch(&self, msg: &dyn Any);
+}
+
+struct TypedGossipDispatcher<M, H> {
+    handler: Arc<H>,
+    _phantom: PhantomData<fn() -> M>,
+}
+
+impl<M, H> LocalGossipDispatcher for TypedGossipDispatcher<M, H>
+where
+    M: NetworkMessage + Clone + 'static,
+    H: GossipHandler<M>,
+{
+    fn dispatch(&self, msg: &dyn Any) -> GossipVerdict {
+        let typed = msg
+            .downcast_ref::<M>()
+            .expect("local gossip dispatch type mismatch");
+        self.handler.on_message(typed.clone())
+    }
+}
+
+struct TypedNotificationDispatcher<M, H> {
+    handler: Arc<H>,
+    _phantom: PhantomData<fn() -> M>,
+}
+
+impl<M, H> LocalNotificationDispatcher for TypedNotificationDispatcher<M, H>
+where
+    M: NetworkMessage + Clone + 'static,
+    H: NotificationHandler<M>,
+{
+    fn dispatch(&self, msg: &dyn Any) {
+        let typed = msg
+            .downcast_ref::<M>()
+            .expect("local notification dispatch type mismatch");
+        self.handler.on_notification(typed.clone());
+    }
+}
 
 /// Registry of per-message-type handlers.
 ///
@@ -47,6 +102,11 @@ pub struct HandlerRegistry {
     gossip: RwLock<HashMap<&'static str, Arc<RawGossipHandler>>>,
     request: RwLock<HashMap<(&'static str, ShardGroupId), Arc<RawRequestHandler>>>,
     notification: RwLock<HashMap<&'static str, Arc<RawNotificationHandler>>>,
+    /// Typed gossip dispatchers keyed by message `TypeId` for
+    /// zero-encode local delivery to colocated subscribers.
+    local_gossip: RwLock<HashMap<TypeId, Arc<dyn LocalGossipDispatcher>>>,
+    /// Typed notification dispatchers (same role as `local_gossip`).
+    local_notification: RwLock<HashMap<TypeId, Arc<dyn LocalNotificationDispatcher>>>,
 }
 
 impl HandlerRegistry {
@@ -57,6 +117,8 @@ impl HandlerRegistry {
             gossip: RwLock::new(HashMap::new()),
             request: RwLock::new(HashMap::new()),
             notification: RwLock::new(HashMap::new()),
+            local_gossip: RwLock::new(HashMap::new()),
+            local_notification: RwLock::new(HashMap::new()),
         }
     }
 
@@ -71,10 +133,16 @@ impl HandlerRegistry {
     ///
     /// Panics if a handler is already registered for this message type. All
     /// registrations happen once at init; a duplicate is a programmer error.
-    pub fn register_gossip<M: NetworkMessage>(&self, handler: impl GossipHandler<M>) {
+    pub fn register_gossip<M>(&self, handler: impl GossipHandler<M>)
+    where
+        M: NetworkMessage + Clone + 'static,
+    {
+        let handler = Arc::new(handler);
+
+        let bytes_handler = Arc::clone(&handler);
         let raw: Arc<RawGossipHandler> =
             Arc::new(move |payload: Vec<u8>| match basic_decode::<M>(&payload) {
-                Ok(msg) => handler.on_message(msg),
+                Ok(msg) => bytes_handler.on_message(msg),
                 Err(e) => {
                     tracing::warn!(
                         message_type = M::message_type_id(),
@@ -94,6 +162,15 @@ impl HandlerRegistry {
             "duplicate gossip handler registration for {}",
             M::message_type_id(),
         );
+
+        let typed: Arc<dyn LocalGossipDispatcher> = Arc::new(TypedGossipDispatcher::<M, _> {
+            handler,
+            _phantom: PhantomData,
+        });
+        self.local_gossip
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(TypeId::of::<M>(), typed);
     }
 
     /// Register a typed request handler for a message type on `shard`.
@@ -162,10 +239,16 @@ impl HandlerRegistry {
     ///
     /// Panics if a handler is already registered for this message type. All
     /// registrations happen once at init; a duplicate is a programmer error.
-    pub fn register_notification<M: NetworkMessage>(&self, handler: impl NotificationHandler<M>) {
+    pub fn register_notification<M>(&self, handler: impl NotificationHandler<M>)
+    where
+        M: NetworkMessage + Clone + 'static,
+    {
+        let handler = Arc::new(handler);
+
+        let bytes_handler = Arc::clone(&handler);
         let raw: Arc<RawNotificationHandler> =
             Arc::new(move |payload: Vec<u8>| match basic_decode::<M>(&payload) {
-                Ok(msg) => handler.on_notification(msg),
+                Ok(msg) => bytes_handler.on_notification(msg),
                 Err(e) => {
                     tracing::warn!(
                         message_type = M::message_type_id(),
@@ -184,6 +267,16 @@ impl HandlerRegistry {
             "duplicate notification handler registration for {}",
             M::message_type_id(),
         );
+
+        let typed: Arc<dyn LocalNotificationDispatcher> =
+            Arc::new(TypedNotificationDispatcher::<M, _> {
+                handler,
+                _phantom: PhantomData,
+            });
+        self.local_notification
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(TypeId::of::<M>(), typed);
     }
 
     // ── Raw registration (used by infrastructure tests) ──
@@ -265,6 +358,39 @@ impl HandlerRegistry {
             .get(message_type_id)
             .cloned()
     }
+
+    /// Dispatch a typed gossip message into its in-process handler,
+    /// skipping SBOR encode/decode. Returns `None` if no handler for
+    /// `M` is registered. Network backends use this to short-circuit
+    /// local delivery for messages they publish.
+    #[must_use]
+    pub fn local_dispatch_gossip<M>(&self, msg: &M) -> Option<GossipVerdict>
+    where
+        M: NetworkMessage + 'static,
+    {
+        self.local_gossip
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&TypeId::of::<M>())
+            .map(|d| d.dispatch(msg as &dyn Any))
+    }
+
+    /// Dispatch a typed notification message into its in-process handler,
+    /// skipping SBOR encode/decode. Returns `false` if no handler for
+    /// `M` is registered.
+    pub fn local_dispatch_notification<M>(&self, msg: &M) -> bool
+    where
+        M: NetworkMessage + 'static,
+    {
+        self.local_notification
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&TypeId::of::<M>())
+            .is_some_and(|d| {
+                d.dispatch(msg as &dyn Any);
+                true
+            })
+    }
 }
 
 impl Default for HandlerRegistry {
@@ -284,7 +410,7 @@ mod tests {
         use hyperscale_types::NetworkMessage;
         use sbor::{Decode, Encode, basic_encode};
 
-        #[derive(Debug, Encode, Decode)]
+        #[derive(Debug, Clone, Encode, Decode)]
         struct TestMsg(u32);
         impl NetworkMessage for TestMsg {
             fn message_type_id() -> &'static str {
@@ -365,7 +491,7 @@ mod tests {
         use hyperscale_types::NetworkMessage;
         use sbor::{Decode, Encode};
 
-        #[derive(Debug, Encode, Decode)]
+        #[derive(Debug, Clone, Encode, Decode)]
         struct TestMsg(u32);
         impl NetworkMessage for TestMsg {
             fn message_type_id() -> &'static str {
