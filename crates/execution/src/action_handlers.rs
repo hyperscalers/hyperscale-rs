@@ -62,7 +62,7 @@ pub fn aggregate_execution_certificate(
     let tx_outcomes = votes
         .iter()
         .find(|v| compute_global_receipt_root(v.tx_outcomes()) == global_receipt_root)
-        .map(|v| v.tx_outcomes().clone())
+        .map(|v| v.tx_outcomes().to_vec())
         .expect("intake filter guarantees a vote with matching outcomes");
 
     // Deduplicate votes by validator
@@ -639,7 +639,7 @@ mod tests {
             bad_vote.shard_group_id(),
             root,
             bad_vote.tx_count(),
-            bad_vote.tx_outcomes().clone(),
+            bad_vote.tx_outcomes().to_vec(),
             bad_vote.validator(),
             bad_vote.signature(),
         );

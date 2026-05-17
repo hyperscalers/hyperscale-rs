@@ -1,7 +1,7 @@
 //! Block types for consensus.
 //!
 //! - [`header`]: [`BlockHeader`] (BFT-voted metadata).
-//! - [`block`]: [`Block`] (the Live/Sealed enum + manual SBOR encoding).
+//! - [`block`]: [`Block`] (the Live/Sealed enum).
 //! - [`manifest`]: hash-level [`BlockManifest`] and denormalized [`BlockMetadata`].
 //! - [`committed_header`]: [`CommittedBlockHeader`] cross-shard trust attestation.
 //! - [`certified`]: [`CertifiedBlock`] pairing of a block with its certifying QC.

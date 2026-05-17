@@ -1,14 +1,9 @@
 //! Per-validator [`ExecutionVote`] over an entire wave's transactions.
 
-use sbor::prelude::*;
-use sbor::{
-    Categorize, Decode, DecodeError, Decoder, Describe, Encode, EncodeError, Encoder,
-    NoCustomTypeKind, NoCustomValueKind, RustTypeId, TypeData, TypeKind, ValueKind,
-};
+use sbor::prelude::BasicSbor;
 
-use crate::sbor_codec::decode_bounded_vec;
 use crate::{
-    BlockHash, BlockHeight, Bls12381G2Signature, GlobalReceiptRoot, MAX_TXS_PER_BLOCK,
+    BlockHash, BlockHeight, Bls12381G2Signature, BoundedVec, GlobalReceiptRoot, MAX_TXS_PER_BLOCK,
     ShardGroupId, TxOutcome, ValidatorId, WaveId, WeightedTimestamp,
 };
 
@@ -17,7 +12,7 @@ use crate::{
 /// One vote covers all transactions sharing the same provision dependency set,
 /// with `global_receipt_root` being a padded merkle root over per-tx leaf hashes
 /// where each leaf = `H(tx_hash` || `receipt_hash` || `success_byte`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct ExecutionVote {
     block_hash: BlockHash,
     block_height: BlockHeight,
@@ -26,16 +21,20 @@ pub struct ExecutionVote {
     shard_group_id: ShardGroupId,
     global_receipt_root: GlobalReceiptRoot,
     tx_count: u32,
-    tx_outcomes: Vec<TxOutcome>,
+    tx_outcomes: BoundedVec<TxOutcome, MAX_TXS_PER_BLOCK>,
     validator: ValidatorId,
     signature: Bls12381G2Signature,
 }
 
 impl ExecutionVote {
     /// Build an `ExecutionVote` from its parts.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `tx_outcomes.len() > MAX_TXS_PER_BLOCK`.
     #[allow(clippy::too_many_arguments)] // mirrors the 10 stored fields
     #[must_use]
-    pub const fn new(
+    pub fn new(
         block_hash: BlockHash,
         block_height: BlockHeight,
         vote_anchor_ts: WeightedTimestamp,
@@ -55,7 +54,7 @@ impl ExecutionVote {
             shard_group_id,
             global_receipt_root,
             tx_count,
-            tx_outcomes,
+            tx_outcomes: tx_outcomes.into(),
             validator,
             signature,
         }
@@ -116,7 +115,7 @@ impl ExecutionVote {
     /// This avoids relying on each aggregator's local accumulator, which may
     /// have diverged due to different abort timing.
     #[must_use]
-    pub const fn tx_outcomes(&self) -> &Vec<TxOutcome> {
+    pub fn tx_outcomes(&self) -> &[TxOutcome] {
         &self.tx_outcomes
     }
 
@@ -157,90 +156,18 @@ impl ExecutionVote {
             self.shard_group_id,
             self.global_receipt_root,
             self.tx_count,
-            self.tx_outcomes,
+            self.tx_outcomes.into_inner(),
             self.validator,
             self.signature,
         )
     }
 }
 
-impl<E: Encoder<NoCustomValueKind>> Encode<NoCustomValueKind, E> for ExecutionVote {
-    fn encode_value_kind(&self, encoder: &mut E) -> Result<(), EncodeError> {
-        encoder.write_value_kind(ValueKind::Tuple)
-    }
-
-    fn encode_body(&self, encoder: &mut E) -> Result<(), EncodeError> {
-        encoder.write_size(9)?;
-        encoder.encode(&self.block_hash)?;
-        encoder.encode(&self.block_height)?;
-        encoder.encode(&self.vote_anchor_ts)?;
-        encoder.encode(&self.wave_id)?;
-        encoder.encode(&self.shard_group_id)?;
-        encoder.encode(&self.global_receipt_root)?;
-        encoder.encode(&self.tx_count)?;
-        encoder.encode(&self.tx_outcomes)?;
-        encoder.encode(&self.validator)?;
-        encoder.encode(&self.signature)
-    }
-}
-
-impl<D: Decoder<NoCustomValueKind>> Decode<NoCustomValueKind, D> for ExecutionVote {
-    fn decode_body_with_value_kind(
-        decoder: &mut D,
-        value_kind: ValueKind<NoCustomValueKind>,
-    ) -> Result<Self, DecodeError> {
-        decoder.check_preloaded_value_kind(value_kind, ValueKind::Tuple)?;
-        let length = decoder.read_size()?;
-        if length != 9 {
-            return Err(DecodeError::UnexpectedSize {
-                expected: 9,
-                actual: length,
-            });
-        }
-        let block_hash: BlockHash = decoder.decode()?;
-        let block_height: BlockHeight = decoder.decode()?;
-        let vote_anchor_ts: WeightedTimestamp = decoder.decode()?;
-        let wave_id: WaveId = decoder.decode()?;
-        let shard_group_id: ShardGroupId = decoder.decode()?;
-        let global_receipt_root: GlobalReceiptRoot = decoder.decode()?;
-        let tx_count: u32 = decoder.decode()?;
-        let tx_outcomes = decode_bounded_vec::<_, TxOutcome>(decoder, MAX_TXS_PER_BLOCK)?;
-        let validator: ValidatorId = decoder.decode()?;
-        let signature: Bls12381G2Signature = decoder.decode()?;
-        Ok(Self {
-            block_hash,
-            block_height,
-            vote_anchor_ts,
-            wave_id,
-            shard_group_id,
-            global_receipt_root,
-            tx_count,
-            tx_outcomes,
-            validator,
-            signature,
-        })
-    }
-}
-
-impl Categorize<NoCustomValueKind> for ExecutionVote {
-    fn value_kind() -> ValueKind<NoCustomValueKind> {
-        ValueKind::Tuple
-    }
-}
-
-impl Describe<NoCustomTypeKind> for ExecutionVote {
-    const TYPE_ID: RustTypeId = RustTypeId::novel_with_code("ExecutionVote", &[], &[]);
-
-    fn type_data() -> TypeData<NoCustomTypeKind, RustTypeId> {
-        TypeData::unnamed(TypeKind::Any)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use sbor::{
-        BASIC_SBOR_V1_MAX_DEPTH, BASIC_SBOR_V1_PAYLOAD_PREFIX, VecEncoder, basic_decode,
-        basic_encode,
+        BASIC_SBOR_V1_MAX_DEPTH, BASIC_SBOR_V1_PAYLOAD_PREFIX, Categorize, DecodeError, Encoder,
+        NoCustomValueKind, ValueKind, VecEncoder, basic_decode, basic_encode,
     };
 
     use super::*;
@@ -293,7 +220,7 @@ mod tests {
         enc.write_payload_prefix(BASIC_SBOR_V1_PAYLOAD_PREFIX)
             .unwrap();
         enc.write_value_kind(ValueKind::Tuple).unwrap();
-        enc.write_size(9).unwrap();
+        enc.write_size(10).unwrap();
         enc.encode(&vote.block_hash).unwrap();
         enc.encode(&vote.block_height).unwrap();
         enc.encode(&vote.vote_anchor_ts).unwrap();

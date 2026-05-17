@@ -2,10 +2,7 @@
 
 use std::sync::Arc;
 
-use sbor::{
-    Categorize, Decode, DecodeError, Decoder, Describe, Encode, EncodeError, Encoder,
-    NoCustomTypeKind, NoCustomValueKind, RustTypeId, TypeData, TypeKind, ValueKind,
-};
+use sbor::prelude::BasicSbor;
 
 use crate::{ConsensusReceipt, ExecutionMetadata, TxHash};
 
@@ -15,7 +12,7 @@ use crate::{ConsensusReceipt, ExecutionMetadata, TxHash};
 /// `metadata` is `None` when this receipt was received from a peer (sync
 /// or catch-up) — peers don't ship their local logs/fees/errors. When
 /// the local node executed the transaction, `metadata` is `Some`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct StoredReceipt {
     /// Primary key in the per-tx receipt store and the join key against
     /// `WaveCertificate` outcomes during validation.
@@ -42,58 +39,6 @@ impl StoredReceipt {
             consensus,
             metadata: None,
         }
-    }
-}
-
-impl<E: Encoder<NoCustomValueKind>> Encode<NoCustomValueKind, E> for StoredReceipt {
-    fn encode_value_kind(&self, encoder: &mut E) -> Result<(), EncodeError> {
-        encoder.write_value_kind(ValueKind::Tuple)
-    }
-
-    fn encode_body(&self, encoder: &mut E) -> Result<(), EncodeError> {
-        encoder.write_size(3)?;
-        encoder.encode(&self.tx_hash)?;
-        encoder.encode(self.consensus.as_ref())?;
-        encoder.encode(&self.metadata)?;
-        Ok(())
-    }
-}
-
-impl<D: Decoder<NoCustomValueKind>> Decode<NoCustomValueKind, D> for StoredReceipt {
-    fn decode_body_with_value_kind(
-        decoder: &mut D,
-        value_kind: ValueKind<NoCustomValueKind>,
-    ) -> Result<Self, DecodeError> {
-        decoder.check_preloaded_value_kind(value_kind, ValueKind::Tuple)?;
-        let length = decoder.read_size()?;
-        if length != 3 {
-            return Err(DecodeError::UnexpectedSize {
-                expected: 3,
-                actual: length,
-            });
-        }
-        let tx_hash: TxHash = decoder.decode()?;
-        let consensus: ConsensusReceipt = decoder.decode()?;
-        let metadata: Option<ExecutionMetadata> = decoder.decode()?;
-        Ok(Self {
-            tx_hash,
-            consensus: Arc::new(consensus),
-            metadata,
-        })
-    }
-}
-
-impl Categorize<NoCustomValueKind> for StoredReceipt {
-    fn value_kind() -> ValueKind<NoCustomValueKind> {
-        ValueKind::Tuple
-    }
-}
-
-impl Describe<NoCustomTypeKind> for StoredReceipt {
-    const TYPE_ID: RustTypeId = RustTypeId::novel_with_code("StoredReceipt", &[], &[]);
-
-    fn type_data() -> TypeData<NoCustomTypeKind, RustTypeId> {
-        TypeData::unnamed(TypeKind::Any)
     }
 }
 
