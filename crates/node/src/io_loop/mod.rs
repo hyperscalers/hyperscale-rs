@@ -296,7 +296,7 @@ where
                 .unwrap_or_else(|| panic!("IoLoop: missing storage for hosted shard {shard:?}"));
             let storage = Arc::new(storage);
             let pending_chain = Arc::new(PendingChain::new(Arc::clone(&storage)));
-            let block_commit = BlockCommitCoordinator::new(initial_persisted_height);
+            let block_commit = BlockCommitCoordinator::new(*shard, initial_persisted_height);
             per_shard_dispatch.insert(
                 *shard,
                 ShardDispatchHandles {
@@ -567,8 +567,8 @@ where
                 self.handle_transaction_validations_failed(primary_shard, &hashes);
             }
             NodeInput::Protocol(pe) => match *pe {
-                ProtocolEvent::BlockPersisted { height } => {
-                    self.handle_block_persisted(primary_shard, height);
+                ProtocolEvent::BlockPersisted { shard, height } => {
+                    self.handle_block_persisted(shard, height);
                 }
                 other => self.handle_protocol_passthrough(primary_shard, other),
             },

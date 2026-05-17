@@ -173,7 +173,7 @@ impl NodeStateMachine {
             // boot-time catch-up (freshly-booted node has persisted state
             // but an empty in-memory set, so child verifications of just-
             // persisted parents unblock here) and for auto-resume-from-sync.
-            ProtocolEvent::BlockPersisted { height } => {
+            ProtocolEvent::BlockPersisted { height, .. } => {
                 let mut actions = self
                     .bft
                     .on_block_persisted(self.topology.snapshot(), height);
@@ -497,6 +497,7 @@ mod tests {
         let TestNode { mut node, .. } = TestNode::new();
 
         let actions = node.handle(ProtocolEvent::BlockPersisted {
+            shard: ShardGroupId::new(0),
             height: BlockHeight::new(10),
         });
 

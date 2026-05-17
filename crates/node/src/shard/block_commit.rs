@@ -25,7 +25,7 @@ use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_metrics::{record_block_committed, set_block_height};
 use hyperscale_storage::ChainWriter;
 use hyperscale_types::{
-    Block, BlockHash, BlockHeight, CertifiedBlock, LocalTimestamp, QuorumCertificate,
+    Block, BlockHash, BlockHeight, CertifiedBlock, LocalTimestamp, QuorumCertificate, ShardGroupId,
 };
 
 /// Block + QC pair handed back to the `io_loop` to build a [`CertifiedBlock`]
@@ -76,6 +76,11 @@ pub enum AccumulateDecision {
 }
 
 pub struct BlockCommitCoordinator<S: ChainWriter> {
+    /// Shard this coordinator persists for. Stamped onto
+    /// `ProtocolEvent::BlockPersisted` so the `IoLoop` routes the
+    /// post-write event to the correct `ShardIo`.
+    shard: ShardGroupId,
+
     /// Prepared commit cache shared with delegated dispatch closures.
     /// Stores `(block_height, prepared_commit)` keyed by block hash so
     /// stale entries can be pruned when they outlive their block.
@@ -108,8 +113,9 @@ where
     /// before falling back to deferred `BlockCommitted` notification.
     pub const MAX_PERSISTENCE_LAG: u64 = 5;
 
-    pub fn new(initial_persisted_height: BlockHeight) -> Self {
+    pub fn new(shard: ShardGroupId, initial_persisted_height: BlockHeight) -> Self {
         Self {
+            shard,
             prepared_commits: Arc::new(Mutex::new(HashMap::new())),
             pending: Vec::new(),
             persisted_height: initial_persisted_height,
@@ -332,6 +338,7 @@ where
         let storage = Arc::clone(storage);
         let event_tx = event_tx.clone();
         let in_flight = Arc::clone(&self.commit_in_flight);
+        let shard = self.shard;
 
         self.commit_in_flight.store(true, Ordering::Release);
 
@@ -381,6 +388,7 @@ where
 
             let _ = event_tx.send(NodeInput::Protocol(Box::new(
                 ProtocolEvent::BlockPersisted {
+                    shard,
                     height: max_persisted,
                 },
             )));
@@ -559,7 +567,7 @@ mod tests {
 
     fn last_persisted_height(events: &[ProtocolEvent]) -> Option<BlockHeight> {
         events.iter().rev().find_map(|e| match e {
-            ProtocolEvent::BlockPersisted { height } => Some(*height),
+            ProtocolEvent::BlockPersisted { height, .. } => Some(*height),
             _ => None,
         })
     }
@@ -575,7 +583,8 @@ mod tests {
     #[test]
     fn accumulate_skips_block_at_or_below_persisted_height() {
         let committee = TestCommittee::new(4, 1);
-        let mut coord = BlockCommitCoordinator::<MockStorage>::new(BlockHeight::new(5));
+        let mut coord =
+            BlockCommitCoordinator::<MockStorage>::new(ShardGroupId::new(0), BlockHeight::new(5));
 
         for h in [1u64, 5] {
             let (commit, _) = make_commit(&committee, BlockHeight::new(h), CommitSource::Sync);
@@ -590,7 +599,8 @@ mod tests {
     #[test]
     fn accumulate_dedups_same_block_hash() {
         let committee = TestCommittee::new(4, 1);
-        let mut coord = BlockCommitCoordinator::<MockStorage>::new(BlockHeight::GENESIS);
+        let mut coord =
+            BlockCommitCoordinator::<MockStorage>::new(ShardGroupId::new(0), BlockHeight::GENESIS);
 
         let (first, _) = make_commit(&committee, BlockHeight::new(1), CommitSource::Aggregator);
         let (dup, _) = make_commit(&committee, BlockHeight::new(1), CommitSource::Sync);
@@ -611,7 +621,8 @@ mod tests {
     #[test]
     fn accumulate_notifies_immediately_within_lag_window() {
         let committee = TestCommittee::new(4, 1);
-        let mut coord = BlockCommitCoordinator::<MockStorage>::new(BlockHeight::GENESIS);
+        let mut coord =
+            BlockCommitCoordinator::<MockStorage>::new(ShardGroupId::new(0), BlockHeight::GENESIS);
 
         // Heights 1..=MAX_PERSISTENCE_LAG should all notify immediately.
         for h in 1..=BlockCommitCoordinator::<MockStorage>::MAX_PERSISTENCE_LAG {
@@ -630,7 +641,8 @@ mod tests {
     #[test]
     fn accumulate_defers_notification_when_persistence_lag_exceeded() {
         let committee = TestCommittee::new(4, 1);
-        let mut coord = BlockCommitCoordinator::<MockStorage>::new(BlockHeight::GENESIS);
+        let mut coord =
+            BlockCommitCoordinator::<MockStorage>::new(ShardGroupId::new(0), BlockHeight::GENESIS);
 
         let max_lag = BlockCommitCoordinator::<MockStorage>::MAX_PERSISTENCE_LAG;
         // Anything beyond MAX_PERSISTENCE_LAG should defer the notification.
@@ -654,7 +666,8 @@ mod tests {
         // accumulate time. This guards against a re-derivation bug where
         // a later `mark_persisted` could change the answer mid-flight.
         let committee = TestCommittee::new(4, 1);
-        let mut coord = BlockCommitCoordinator::<MockStorage>::new(BlockHeight::GENESIS);
+        let mut coord =
+            BlockCommitCoordinator::<MockStorage>::new(ShardGroupId::new(0), BlockHeight::GENESIS);
 
         let max_lag = BlockCommitCoordinator::<MockStorage>::MAX_PERSISTENCE_LAG;
         let (deferred, _) = make_commit(
@@ -684,7 +697,8 @@ mod tests {
 
     #[test]
     fn mark_persisted_is_monotonic() {
-        let mut coord = BlockCommitCoordinator::<MockStorage>::new(BlockHeight::new(3));
+        let mut coord =
+            BlockCommitCoordinator::<MockStorage>::new(ShardGroupId::new(0), BlockHeight::new(3));
         coord.mark_persisted(BlockHeight::new(7));
         assert_eq!(coord.persisted_height().inner(), 7);
         // Going backwards must not regress the high-water mark.
@@ -697,7 +711,8 @@ mod tests {
     #[test]
     fn has_prepared_and_insert_prepared_roundtrip() {
         let committee = TestCommittee::new(4, 1);
-        let coord = BlockCommitCoordinator::<MockStorage>::new(BlockHeight::GENESIS);
+        let coord =
+            BlockCommitCoordinator::<MockStorage>::new(ShardGroupId::new(0), BlockHeight::GENESIS);
         let (commit, prepared) = make_commit(&committee, BlockHeight::new(1), CommitSource::Sync);
         let hash = commit.block.hash();
 
@@ -740,7 +755,8 @@ mod tests {
 
     #[test]
     fn flush_is_noop_when_pending_is_empty() {
-        let mut coord = BlockCommitCoordinator::<MockStorage>::new(BlockHeight::GENESIS);
+        let mut coord =
+            BlockCommitCoordinator::<MockStorage>::new(ShardGroupId::new(0), BlockHeight::GENESIS);
         let storage = Arc::new(MockStorage::default());
         let (tx, rx) = unbounded();
         let dispatch = SyncDispatch::new();
@@ -754,7 +770,8 @@ mod tests {
     #[test]
     fn flush_writes_blocks_in_height_order_even_when_accumulated_out_of_order() {
         let committee = TestCommittee::new(4, 1);
-        let mut coord = BlockCommitCoordinator::<MockStorage>::new(BlockHeight::GENESIS);
+        let mut coord =
+            BlockCommitCoordinator::<MockStorage>::new(ShardGroupId::new(0), BlockHeight::GENESIS);
         let storage = Arc::new(MockStorage::default());
         let (tx, rx) = unbounded();
         let dispatch = SyncDispatch::new();
@@ -785,7 +802,8 @@ mod tests {
         // because persisted_height was lower) and flush (where the height
         // is now stale). The retain step must drop these silently.
         let committee = TestCommittee::new(4, 1);
-        let mut coord = BlockCommitCoordinator::<MockStorage>::new(BlockHeight::GENESIS);
+        let mut coord =
+            BlockCommitCoordinator::<MockStorage>::new(ShardGroupId::new(0), BlockHeight::GENESIS);
         let storage = Arc::new(MockStorage::default());
         let (tx, rx) = unbounded();
         let dispatch = SyncDispatch::new();
@@ -815,7 +833,8 @@ mod tests {
     #[test]
     fn flush_defers_when_prepared_commit_missing_for_first_block() {
         let committee = TestCommittee::new(4, 1);
-        let mut coord = BlockCommitCoordinator::<MockStorage>::new(BlockHeight::GENESIS);
+        let mut coord =
+            BlockCommitCoordinator::<MockStorage>::new(ShardGroupId::new(0), BlockHeight::GENESIS);
         let storage = Arc::new(MockStorage::default());
         let (tx, rx) = unbounded();
         let dispatch = SyncDispatch::new();
@@ -839,7 +858,8 @@ mod tests {
         // is missing its prepared commit, h=3 must wait too — even though its
         // own prepared commit is ready — to keep parents before children.
         let committee = TestCommittee::new(4, 1);
-        let mut coord = BlockCommitCoordinator::<MockStorage>::new(BlockHeight::GENESIS);
+        let mut coord =
+            BlockCommitCoordinator::<MockStorage>::new(ShardGroupId::new(0), BlockHeight::GENESIS);
         let storage = Arc::new(MockStorage::default());
         let (tx, rx) = unbounded();
         let dispatch = SyncDispatch::new();
@@ -885,7 +905,8 @@ mod tests {
         // notify immediately; the tail defers and must receive a
         // BlockCommitted from the spawned write closure.
         let committee = TestCommittee::new(4, 1);
-        let mut coord = BlockCommitCoordinator::<MockStorage>::new(BlockHeight::GENESIS);
+        let mut coord =
+            BlockCommitCoordinator::<MockStorage>::new(ShardGroupId::new(0), BlockHeight::GENESIS);
         let storage = Arc::new(MockStorage::default());
         let (tx, rx) = unbounded();
         let dispatch = SyncDispatch::new();
@@ -920,7 +941,8 @@ mod tests {
         // writes from racing on the I/O pool, where ordering between
         // separate spawn() calls is not guaranteed.
         let committee = TestCommittee::new(4, 1);
-        let mut coord = BlockCommitCoordinator::<MockStorage>::new(BlockHeight::GENESIS);
+        let mut coord =
+            BlockCommitCoordinator::<MockStorage>::new(ShardGroupId::new(0), BlockHeight::GENESIS);
         let storage = Arc::new(MockStorage::default());
         let (tx, _rx) = unbounded();
         let dispatch = SyncDispatch::new();
@@ -946,7 +968,8 @@ mod tests {
         // before sending BlockPersisted; the next feed_event → flush call
         // sees the cleared flag and proceeds.
         let committee = TestCommittee::new(4, 1);
-        let mut coord = BlockCommitCoordinator::<MockStorage>::new(BlockHeight::GENESIS);
+        let mut coord =
+            BlockCommitCoordinator::<MockStorage>::new(ShardGroupId::new(0), BlockHeight::GENESIS);
         let storage = Arc::new(MockStorage::default());
         let (tx, _rx) = unbounded();
         let dispatch = SyncDispatch::new();
@@ -978,7 +1001,8 @@ mod tests {
         // the entry must be gone so a stray re-flush of the same height
         // can't double-write.
         let committee = TestCommittee::new(4, 1);
-        let mut coord = BlockCommitCoordinator::<MockStorage>::new(BlockHeight::GENESIS);
+        let mut coord =
+            BlockCommitCoordinator::<MockStorage>::new(ShardGroupId::new(0), BlockHeight::GENESIS);
         let storage = Arc::new(MockStorage::default());
         let (tx, _rx) = unbounded();
         let dispatch = SyncDispatch::new();
@@ -1001,7 +1025,8 @@ mod tests {
         // insert_prepared) rather than asynchronously through VerifyStateRoot.
         // Flush must consume that handle the same way the async path does.
         let committee = TestCommittee::new(4, 1);
-        let mut coord = BlockCommitCoordinator::<MockStorage>::new(BlockHeight::GENESIS);
+        let mut coord =
+            BlockCommitCoordinator::<MockStorage>::new(ShardGroupId::new(0), BlockHeight::GENESIS);
         let storage = Arc::new(MockStorage::default());
         let (tx, _rx) = unbounded();
         let dispatch = SyncDispatch::new();
