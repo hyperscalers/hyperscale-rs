@@ -26,7 +26,6 @@ mod network_handlers;
 mod phase_times;
 mod status;
 mod step;
-pub mod sync;
 mod verify;
 
 use std::collections::{HashMap, HashSet};
@@ -52,7 +51,6 @@ use crate::NodeStateMachine;
 use crate::batch_accumulator::BatchAccumulator;
 use crate::config::NodeConfig;
 use crate::io_loop::step::CommittedHeaderVerificationItem;
-use crate::io_loop::sync::SyncHost;
 use crate::shard::ShardIo;
 use crate::shard::block_commit::{BlockCommitCoordinator, PreparedCommitMap};
 use crate::shard::caches::SharedCaches;
@@ -61,6 +59,7 @@ use crate::shard::fetch::binding::{
     TransactionBinding,
 };
 use crate::shard::fetch::{FetchHost, FetchInput};
+use crate::shard::sync::SyncHost;
 use crate::vnode::Vnode;
 
 /// Lock-free shared topology snapshot for handler closures and dispatch.
@@ -204,9 +203,6 @@ where
     /// See [`DispatchHandles`]. Cloned once per delegated-action dispatch.
     dispatch_handles: Arc<DispatchHandles<S, N, E>>,
 
-    /// Sync state machines (block-sync, remote-header sync).
-    syncs: SyncHost,
-
     /// Stateless transaction validator (signature + format + EC checks).
     /// `Arc` so it can be cloned into the `tx_validation` pool closure
     /// on each batch flush.
@@ -340,6 +336,7 @@ where
                 block_commit,
                 caches,
                 fetches,
+                syncs,
             },
         )]);
         assert_eq!(
@@ -359,7 +356,6 @@ where
             tx_validator,
             pending_validation: HashSet::new(),
             locally_submitted: HashSet::new(),
-            syncs,
             validation_batch: BatchAccumulator::new(b.tx_validation_max, b.tx_validation_window),
             committed_header_batch: BatchAccumulator::new(
                 b.committed_header_max,
@@ -460,6 +456,17 @@ where
             .next()
             .expect("V_shard == 1")
             .fetches
+    }
+
+    /// Internal: sync state machines for the shard (block-sync,
+    /// remote-header sync).
+    pub(super) fn shard_syncs(&self) -> &SyncHost {
+        &self.shards.values().next().expect("V_shard == 1").syncs
+    }
+
+    /// Internal: mutable view of the shard's sync state.
+    pub(super) fn shard_syncs_mut(&mut self) -> &mut SyncHost {
+        &mut self.shards.values_mut().next().expect("V_shard == 1").syncs
     }
 
     /// Access the network.

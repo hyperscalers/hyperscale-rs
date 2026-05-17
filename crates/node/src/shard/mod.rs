@@ -10,6 +10,7 @@
 pub mod block_commit;
 pub mod caches;
 pub mod fetch;
+pub mod sync;
 
 use std::sync::Arc;
 
@@ -18,6 +19,7 @@ use hyperscale_storage::{PendingChain, Storage};
 use crate::shard::block_commit::BlockCommitCoordinator;
 pub use crate::shard::caches::SharedCaches;
 use crate::shard::fetch::FetchHost;
+use crate::shard::sync::SyncHost;
 
 /// Per-shard I/O state hosted by the `IoLoop`.
 pub struct ShardIo<S: Storage> {
@@ -46,4 +48,9 @@ pub struct ShardIo<S: Storage> {
     /// Per-payload fetch state machines (transactions, exec certs,
     /// provisions, finalized waves, local provisions).
     pub fetches: FetchHost,
+
+    /// Sync state machines: block-sync (catch up the shard chain) and
+    /// remote-header sync (track other shards' committed headers for
+    /// cross-shard data dependencies).
+    pub syncs: SyncHost,
 }

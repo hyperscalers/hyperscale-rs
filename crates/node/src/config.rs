@@ -2,8 +2,8 @@
 
 use std::time::Duration;
 
-use crate::io_loop::sync::block::BlockSyncConfig;
 use crate::shard::fetch::FetchConfig;
+use crate::shard::sync::block::BlockSyncConfig;
 
 /// Configuration for [`IoLoop`](crate::io_loop::IoLoop).
 ///

@@ -28,10 +28,10 @@ where
 {
     pub(in crate::io_loop) fn handle_fetch_tick(&mut self) {
         let now = std::time::Instant::now();
-        let outputs = self.syncs.block_tick(now);
+        let outputs = self.shard_syncs_mut().block_tick(now);
         self.process_block_sync_outputs(outputs);
 
-        let outputs = self.syncs.remote_header_tick(now);
+        let outputs = self.shard_syncs_mut().remote_header_tick(now);
         self.process_remote_header_sync_outputs(outputs);
 
         self.drive_fetch::<TransactionBinding>(FetchInput::Tick);
