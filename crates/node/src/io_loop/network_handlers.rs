@@ -101,7 +101,7 @@ where
 
         // ── block.request → sync protocol ────────────────────────────
 
-        let storage = Arc::clone(&self.storage);
+        let storage = Arc::clone(self.shard_storage());
         let provision_store = Arc::clone(&self.caches.provision_store);
         self.network
             .register_request_handler::<GetBlockRequest>(move |req| {
@@ -110,7 +110,7 @@ where
 
         // ── transaction.request → fetch protocol ─────────────────────
 
-        let storage = Arc::clone(&self.storage);
+        let storage = Arc::clone(self.shard_storage());
         let tx_store = Arc::clone(&self.caches.tx_store);
         self.network
             .register_request_handler::<GetTransactionsRequest>(move |req| {
@@ -125,7 +125,7 @@ where
         // and under load 40+ redundant generations per height cause CPU
         // thrashing.
 
-        let storage = Arc::clone(&self.storage);
+        let storage = Arc::clone(self.shard_storage());
         let topology = self.topology_snapshot.clone();
         let outbound_cache = Arc::clone(&self.caches.provision_store);
 
@@ -269,7 +269,7 @@ where
         // ── finalized_wave.request → cache lookup + storage fallback ─────
 
         let fw_cache = Arc::clone(&self.caches.finalized_wave);
-        let fw_storage = Arc::clone(&self.storage);
+        let fw_storage = Arc::clone(self.shard_storage());
         self.network
             .register_request_handler::<GetFinalizedWavesRequest>(
                 move |req: GetFinalizedWavesRequest| {
@@ -306,7 +306,7 @@ where
         // ── execution_cert.request → cert store lookup ────────────────
 
         let exec_cert_store = Arc::clone(&self.caches.exec_cert_store);
-        let storage = Arc::clone(&self.storage);
+        let storage = Arc::clone(self.shard_storage());
         self.network
             .register_request_handler::<GetExecutionCertsRequest>(
                 move |req: GetExecutionCertsRequest| {
@@ -343,7 +343,7 @@ where
 
         // ── remote_header.request → range header sync ───────────────────
 
-        let storage = Arc::clone(&self.storage);
+        let storage = Arc::clone(self.shard_storage());
         let topology = self.topology_snapshot.clone();
         self.network
             .register_request_handler::<GetRemoteHeadersRequest>(move |req| {

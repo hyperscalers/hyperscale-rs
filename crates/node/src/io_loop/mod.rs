@@ -32,7 +32,7 @@ mod step;
 pub mod sync;
 mod verify;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -63,6 +63,7 @@ use crate::io_loop::fetch::binding::{
 use crate::io_loop::fetch::{FetchHost, FetchInput};
 use crate::io_loop::step::CommittedHeaderVerificationItem;
 use crate::io_loop::sync::SyncHost;
+use crate::shard::ShardIo;
 use crate::vnode::Vnode;
 
 /// Lock-free shared topology snapshot for handler closures and dispatch.
@@ -141,8 +142,8 @@ where
     D: Dispatch,
 {
     /// Per-validator bundles. Each [`Vnode`] holds a `NodeStateMachine`,
-    /// signing key, and per-step scratch buffers. Phase 1 enforces
-    /// `len() == 1`; Phase 2 (multi-vnode bind) lifts that.
+    /// signing key, and per-step scratch buffers. Currently enforced
+    /// to `len() == 1`.
     ///
     /// State machines are driven exclusively from the pinned thread
     /// via `vnodes[i].state.handle()`. All `ProtocolEvent` ingestion
@@ -150,10 +151,10 @@ where
     /// touch them.
     vnodes: Vec<Vnode>,
 
-    /// Persistent block / receipt / JMT store. `Arc` so delegated
-    /// closures (block-commit, fetch-serve, sync) can read it from
-    /// thread pools without crossing back to the pinned thread.
-    storage: Arc<S>,
+    /// Per-shard I/O state, keyed by shard id. Each [`ShardIo`] holds
+    /// the persistent storage handle. Currently enforced to
+    /// `len() == 1`.
+    shards: HashMap<ShardGroupId, ShardIo<S>>,
 
     /// Transaction executor. Cloned (cheaply) into the block-commit
     /// closure on each drain — `Engine` requires `Clone`, so this is
@@ -296,8 +297,8 @@ where
     ///
     /// # Panics
     ///
-    /// Panics during construction if more than one `Vnode` is ever
-    /// pushed; Phase 1 of the virtual-nodes plan enforces V=1.
+    /// Panics during construction if more than one `Vnode` or
+    /// `ShardIo` is configured; V=1 is currently enforced.
     // `config: NodeConfig` is taken by value: every caller hands over a fresh
     // config and we destructure sub-configs via `.clone()`, so a `&NodeConfig`
     // would just force the body to clone each subfield.
@@ -347,16 +348,20 @@ where
             pending_timer_ops: Vec::new(),
         };
         let vnodes = vec![vnode];
-        // Phase 1 of the virtual-nodes plan enforces V=1; Phase 2
-        // (multi-validator bind) lifts this constraint.
         assert_eq!(
             vnodes.len(),
             1,
             "IoLoop currently supports exactly one Vnode"
         );
+        let shards = HashMap::from([(shard, ShardIo { storage })]);
+        assert_eq!(
+            shards.len(),
+            1,
+            "IoLoop currently supports exactly one ShardIo"
+        );
         Self {
             vnodes,
-            storage,
+            shards,
             executor,
             network,
             dispatch,
@@ -399,19 +404,25 @@ where
 
     // ─── Accessors ──────────────────────────────────────────────────────
 
-    /// Access the (sole, Phase 1) vnode's state machine.
+    /// Access the (sole) vnode's state machine.
     pub fn state(&self) -> &NodeStateMachine {
         &self.vnodes[0].state
     }
 
-    /// Mutably access the (sole, Phase 1) vnode's state machine.
+    /// Mutably access the (sole) vnode's state machine.
     pub fn state_mut(&mut self) -> &mut NodeStateMachine {
         &mut self.vnodes[0].state
     }
 
-    /// Access the storage.
+    /// Access the (sole) shard's storage.
     pub fn storage(&self) -> &S {
-        &self.storage
+        self.shard_storage()
+    }
+
+    /// Internal: shard storage as `&Arc<S>` for sites that need to
+    /// `Arc::clone` it into off-thread handler closures.
+    pub(super) fn shard_storage(&self) -> &Arc<S> {
+        &self.shards.values().next().expect("V_shard == 1").storage
     }
 
     /// Access the network.
