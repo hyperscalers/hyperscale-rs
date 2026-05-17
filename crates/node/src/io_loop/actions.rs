@@ -87,10 +87,14 @@ where
 
             // ─── io_loop-internal effects ──────────────────────────────────
             Action::SetTimer { id, duration } => {
-                self.pending_timer_ops.push(TimerOp::Set { id, duration });
+                self.vnodes[0]
+                    .pending_timer_ops
+                    .push(TimerOp::Set { id, duration });
             }
             Action::CancelTimer { id } => {
-                self.pending_timer_ops.push(TimerOp::Cancel { id });
+                self.vnodes[0]
+                    .pending_timer_ops
+                    .push(TimerOp::Cancel { id });
             }
             Action::Continuation(pe) => self.handle_continuation(pe),
             Action::RestoreCommittedState => self.handle_restore_committed_state(),
@@ -132,7 +136,7 @@ where
             }
             Action::RecordTxEcCreated { tx_hashes } => {
                 self.tx_phase_times
-                    .record_ec_created(&tx_hashes, self.state.now());
+                    .record_ec_created(&tx_hashes, self.vnodes[0].state.now());
             }
             Action::TopologyChanged { topology_snapshot } => {
                 self.handle_topology_changed(&topology_snapshot);
@@ -192,7 +196,7 @@ where
         submitted_locally: bool,
     ) {
         trace!(?tx_hash, ?status, "Transaction status");
-        let now = self.state.now();
+        let now = self.vnodes[0].state.now();
         let terminal_phases = self.tx_phase_times.observe_status(tx_hash, &status, now);
         if status.is_final()
             && submitted_locally
@@ -218,7 +222,7 @@ where
             record_transaction_finalized(latency_secs, cross_shard);
         }
         self.caches.tx_status.insert(tx_hash, status.clone());
-        self.emitted_statuses.push((tx_hash, status));
+        self.vnodes[0].emitted_statuses.push((tx_hash, status));
     }
 
     fn handle_topology_changed(&self, topology: &Arc<TopologySnapshot>) {
@@ -387,7 +391,7 @@ where
     ///
     /// [`BlockCommitCoordinator`]: super::block_commit::BlockCommitCoordinator
     fn accept_block_commit(&mut self, commit: PendingCommit) {
-        let now = self.state.now();
+        let now = self.vnodes[0].state.now();
         let decision = self.block_commit.accumulate(commit, now);
         match decision {
             AccumulateDecision::Skip => {}

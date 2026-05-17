@@ -29,8 +29,10 @@ mod batch_accumulator;
 mod config;
 pub mod io_loop;
 mod state;
+mod vnode;
 
 pub use config::NodeConfig;
 pub use io_loop::sync::block::BlockSyncStateKind;
 pub use io_loop::{NodeStatusSnapshot, SharedTopologySnapshot, TimerOp};
 pub use state::NodeStateMachine;
+pub use vnode::Vnode;

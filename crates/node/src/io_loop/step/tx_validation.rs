@@ -52,7 +52,7 @@ where
         let tx_hash = tx.hash();
         self.pending_validation.remove(&tx_hash);
         let submitted_locally = self.locally_submitted.remove(&tx_hash);
-        self.actions_generated = 0;
+        self.vnodes[0].actions_generated = 0;
         self.feed_event(ProtocolEvent::TransactionValidated {
             tx,
             submitted_locally,
@@ -78,7 +78,8 @@ where
         let tx_hash = tx.hash();
         // Already-vouched (in TxStore) or terminally-rejected (tombstoned)
         // are skipped. `pending_validation` blocks duplicate enqueues.
-        if !self.caches.tx_store.contains(&tx_hash) && !self.state.mempool().is_tombstoned(&tx_hash)
+        if !self.caches.tx_store.contains(&tx_hash)
+            && !self.vnodes[0].state.mempool().is_tombstoned(&tx_hash)
         {
             self.pending_validation.insert(tx_hash);
             self.queue_validation(tx);
@@ -118,7 +119,7 @@ where
         shard: ShardGroupId,
         tx: Arc<RoutableTransaction>,
     ) {
-        let now = self.state.now();
+        let now = self.vnodes[0].state.now();
         let max = self.tx_gossip_max;
         let window = self.tx_gossip_window;
         let batch = self
@@ -148,7 +149,7 @@ where
 
     /// Queue a transaction for batch validation.
     pub(in crate::io_loop) fn queue_validation(&mut self, tx: Arc<RoutableTransaction>) {
-        if self.validation_batch.push(tx, self.state.now()) {
+        if self.validation_batch.push(tx, self.vnodes[0].state.now()) {
             self.flush_validation_batch();
         }
     }

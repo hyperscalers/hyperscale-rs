@@ -53,7 +53,10 @@ where
     ) {
         let item: CommittedHeaderVerificationItem =
             (committed_header, sender, public_key, sender_signature);
-        if self.committed_header_batch.push(item, self.state.now()) {
+        if self
+            .committed_header_batch
+            .push(item, self.vnodes[0].state.now())
+        {
             self.flush_committed_header_verifications();
         }
     }

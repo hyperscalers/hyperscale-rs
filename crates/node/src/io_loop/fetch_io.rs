@@ -132,6 +132,6 @@ where
                 id: TimerId::FetchTick,
             }
         };
-        self.pending_timer_ops.push(op);
+        self.vnodes[0].pending_timer_ops.push(op);
     }
 }

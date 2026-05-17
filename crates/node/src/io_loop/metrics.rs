@@ -108,18 +108,19 @@ where
     #[must_use]
     #[allow(clippy::too_many_lines)] // single aggregation snapshot; cheap reads stitched together
     pub fn metrics_snapshot(&self) -> MetricsSnapshot {
-        let bft_stats = self.state.bft().stats();
-        let mempool = self.state.mempool();
+        let state = &self.vnodes[0].state;
+        let bft_stats = state.bft().stats();
+        let mempool = state.mempool();
         let contention = mempool.lock_contention_stats();
         let fetches = self.fetches.metrics();
         let syncs = self.syncs.metrics();
         let block_sync_status = &syncs.block_sync_status;
 
-        let bft_mem = self.state.bft().memory_stats();
-        let exec_mem = self.state.execution().memory_stats();
-        let mempool_mem = self.state.mempool().memory_stats();
-        let prov_mem = self.state.provisions().memory_stats();
-        let rh_mem = self.state.remote_headers().memory_stats();
+        let bft_mem = state.bft().memory_stats();
+        let exec_mem = state.execution().memory_stats();
+        let mempool_mem = state.mempool().memory_stats();
+        let prov_mem = state.provisions().memory_stats();
+        let rh_mem = state.remote_headers().memory_stats();
 
         MetricsSnapshot {
             bft_round: bft_stats.current_round,

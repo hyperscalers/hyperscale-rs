@@ -63,6 +63,7 @@ use crate::io_loop::fetch::binding::{
 use crate::io_loop::fetch::{FetchHost, FetchInput};
 use crate::io_loop::step::CommittedHeaderVerificationItem;
 use crate::io_loop::sync::SyncHost;
+use crate::vnode::Vnode;
 
 /// Lock-free shared topology snapshot for handler closures and dispatch.
 ///
@@ -139,10 +140,15 @@ where
     S: Storage,
     D: Dispatch,
 {
-    /// State machine driven exclusively from the pinned thread via
-    /// `state.handle()`. All `ProtocolEvent` ingestion and `Action`
-    /// emission happen here; off-thread closures never touch it.
-    state: NodeStateMachine,
+    /// Per-validator bundles. Each [`Vnode`] holds a `NodeStateMachine`,
+    /// signing key, and per-step scratch buffers. Phase 1 enforces
+    /// `len() == 1`; Phase 2 (multi-vnode bind) lifts that.
+    ///
+    /// State machines are driven exclusively from the pinned thread
+    /// via `vnodes[i].state.handle()`. All `ProtocolEvent` ingestion
+    /// and `Action` emission happen here; off-thread closures never
+    /// touch them.
+    vnodes: Vec<Vnode>,
 
     /// Persistent block / receipt / JMT store. `Arc` so delegated
     /// closures (block-commit, fetch-serve, sync) can read it from
@@ -277,22 +283,6 @@ where
     /// from `EmitTransactionStatus` and `RecordTxEcCreated` actions; entries
     /// are dropped on terminal status.
     tx_phase_times: phase_times::TxPhaseTimesCache,
-
-    /// Per-step buffer of `(tx_hash, status)` pairs emitted via
-    /// `Action::EmitTransactionStatus`. Drained into `StepOutput` at the
-    /// end of each `step()` for the runner to forward to RPC subscribers.
-    emitted_statuses: Vec<(TxHash, TransactionStatus)>,
-
-    /// Per-step counter of actions produced by the state machine. Drained
-    /// into `StepOutput` for the runner's metrics; reset by `step()` (and
-    /// cleared mid-step by handlers that synthesize follow-up events).
-    actions_generated: usize,
-
-    /// Per-step buffer of timer set / cancel operations. The runner is
-    /// responsible for translating these into actual timer-driver calls
-    /// since timer firing is inherently runner-specific (wall-clock in
-    /// production, logical-clock in simulation).
-    pending_timer_ops: Vec<TimerOp>,
 }
 
 impl<S, N, D, E> IoLoop<S, N, D, E>
@@ -303,6 +293,11 @@ where
     E: Engine,
 {
     /// Create a new `IoLoop`.
+    ///
+    /// # Panics
+    ///
+    /// Panics during construction if more than one `Vnode` is ever
+    /// pushed; Phase 1 of the virtual-nodes plan enforces V=1.
     // `config: NodeConfig` is taken by value: every caller hands over a fresh
     // config and we destructure sub-configs via `.clone()`, so a `&NodeConfig`
     // would just force the body to clone each subfield.
@@ -320,6 +315,8 @@ where
         tx_validator: Arc<TransactionValidation>,
     ) -> Self {
         let initial_persisted_height = state.bft().committed_height();
+        let validator_id = state.topology().local_validator_id();
+        let shard = state.topology().local_shard();
         let b = &config.batch;
         let fetches = FetchHost::new(&config);
         let syncs = SyncHost::new(&config);
@@ -340,8 +337,25 @@ where
             signing_key: Arc::clone(&signing_key),
             prepared_commits: block_commit.prepared_commits_handle(),
         });
-        Self {
+        let vnode = Vnode {
+            validator_id,
+            shard,
             state,
+            signing_key,
+            emitted_statuses: Vec::new(),
+            actions_generated: 0,
+            pending_timer_ops: Vec::new(),
+        };
+        let vnodes = vec![vnode];
+        // Phase 1 of the virtual-nodes plan enforces V=1; Phase 2
+        // (multi-validator bind) lifts this constraint.
+        assert_eq!(
+            vnodes.len(),
+            1,
+            "IoLoop currently supports exactly one Vnode"
+        );
+        Self {
+            vnodes,
             storage,
             executor,
             network,
@@ -368,9 +382,6 @@ where
             tx_gossip_window: b.tx_gossip_window,
             last_slow_tx_warn: LocalTimestamp::ZERO,
             tx_phase_times: phase_times::TxPhaseTimesCache::default(),
-            emitted_statuses: Vec::new(),
-            actions_generated: 0,
-            pending_timer_ops: Vec::new(),
         }
     }
 
@@ -381,19 +392,21 @@ where
     /// Must be called before `step()` to keep the state machine's clock
     /// in sync with the driving environment.
     pub fn set_time(&mut self, now: LocalTimestamp) {
-        self.state.set_time(now);
+        for vnode in &mut self.vnodes {
+            vnode.state.set_time(now);
+        }
     }
 
     // ─── Accessors ──────────────────────────────────────────────────────
 
-    /// Access the state machine.
-    pub const fn state(&self) -> &NodeStateMachine {
-        &self.state
+    /// Access the (sole, Phase 1) vnode's state machine.
+    pub fn state(&self) -> &NodeStateMachine {
+        &self.vnodes[0].state
     }
 
-    /// Mutably access the state machine.
-    pub const fn state_mut(&mut self) -> &mut NodeStateMachine {
-        &mut self.state
+    /// Mutably access the (sole, Phase 1) vnode's state machine.
+    pub fn state_mut(&mut self) -> &mut NodeStateMachine {
+        &mut self.vnodes[0].state
     }
 
     /// Access the storage.
@@ -442,9 +455,10 @@ where
     ///    production receives these via its crossbeam channel receivers)
     #[allow(clippy::too_many_lines)] // single dispatch over NodeInput; one arm per event variant
     pub fn step(&mut self, event: NodeInput) -> StepOutput {
-        self.emitted_statuses.clear();
-        self.actions_generated = 0;
-        self.pending_timer_ops.clear();
+        let vnode = &mut self.vnodes[0];
+        vnode.emitted_statuses.clear();
+        vnode.actions_generated = 0;
+        vnode.pending_timer_ops.clear();
 
         match event {
             // ── Transaction validation pipeline ────────────────────────
@@ -552,10 +566,11 @@ where
     ///
     /// Used after `handle_actions()` to collect outputs produced by those actions.
     pub fn drain_pending_output(&mut self) -> StepOutput {
+        let vnode = &mut self.vnodes[0];
         StepOutput {
-            emitted_statuses: std::mem::take(&mut self.emitted_statuses),
-            actions_generated: self.actions_generated,
-            timer_ops: std::mem::take(&mut self.pending_timer_ops),
+            emitted_statuses: std::mem::take(&mut vnode.emitted_statuses),
+            actions_generated: vnode.actions_generated,
+            timer_ops: std::mem::take(&mut vnode.pending_timer_ops),
         }
     }
 
@@ -564,7 +579,7 @@ where
     /// This is the common pattern used throughout `IoLoop`: route an event through
     /// the state machine, then dispatch each resulting action.
     fn feed_event(&mut self, event: ProtocolEvent) {
-        let actions = self.state.handle(event);
+        let actions = self.vnodes[0].state.handle(event);
         self.process_actions(actions);
     }
 
@@ -574,7 +589,7 @@ where
     /// block commits. The flush is the load-bearing part: it's easy to
     /// forget when copy-pasting the loop inline.
     fn process_actions(&mut self, actions: Vec<Action>) {
-        self.actions_generated += actions.len();
+        self.vnodes[0].actions_generated += actions.len();
         for action in actions {
             self.process_action(action);
         }
