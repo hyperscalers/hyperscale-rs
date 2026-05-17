@@ -138,8 +138,8 @@ where
         tx: Arc<RoutableTransaction>,
     ) {
         let now = self.vnodes[0].state.now();
-        let max = self.shard_io(local_shard).tx_gossip_max;
-        let window = self.shard_io(local_shard).tx_gossip_window;
+        let max = self.tx_gossip_max;
+        let window = self.tx_gossip_window;
         let batch = self
             .shard_io_mut(local_shard)
             .tx_gossip_batches
