@@ -7,9 +7,13 @@
 //! here so that multi-vnode hosting captures the natural sharing
 //! structure without leaking state across `IoLoop`s.
 
+pub mod block_commit;
+
 use std::sync::Arc;
 
 use hyperscale_storage::{PendingChain, Storage};
+
+use crate::shard::block_commit::BlockCommitCoordinator;
 
 /// Per-shard I/O state hosted by the `IoLoop`.
 pub struct ShardIo<S: Storage> {
@@ -24,4 +28,10 @@ pub struct ShardIo<S: Storage> {
     /// blocks are not ancestors and are structurally invisible to
     /// anchored views.
     pub pending_chain: Arc<PendingChain<S>>,
+
+    /// Block commit pipeline: accumulates commits, applies persistence
+    /// backpressure, and drains them into a single async closure that
+    /// runs on the execution pool. Owns the prepared-commit cache
+    /// shared with delegated dispatch closures.
+    pub block_commit: BlockCommitCoordinator<S>,
 }

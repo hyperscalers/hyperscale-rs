@@ -27,7 +27,7 @@ where
     /// to the state machine: the persisted height advances `block_commit`'s
     /// gate and `pending_chain`'s pruning watermark.
     pub(in crate::io_loop) fn handle_block_persisted(&mut self, height: BlockHeight) {
-        self.block_commit.mark_persisted(height);
+        self.shard_block_commit_mut().mark_persisted(height);
         // Drop pending state for blocks now persisted to RocksDB.
         self.shard_pending_chain().prune(height);
         self.feed_event(ProtocolEvent::BlockPersisted { height });

@@ -19,7 +19,6 @@
 //! production (wall clock) and simulation (logical clock) use the same paths.
 
 mod actions;
-mod block_commit;
 mod caches;
 pub mod fetch;
 mod fetch_io;
@@ -54,7 +53,6 @@ pub use status::NodeStatusSnapshot;
 use crate::NodeStateMachine;
 use crate::batch_accumulator::BatchAccumulator;
 use crate::config::NodeConfig;
-use crate::io_loop::block_commit::{BlockCommitCoordinator, PreparedCommitMap};
 use crate::io_loop::caches::SharedCaches;
 use crate::io_loop::fetch::binding::{
     ExecCertBinding, FinalizedWaveBinding, LocalProvisionBinding, ProvisionBinding,
@@ -64,6 +62,7 @@ use crate::io_loop::fetch::{FetchHost, FetchInput};
 use crate::io_loop::step::CommittedHeaderVerificationItem;
 use crate::io_loop::sync::SyncHost;
 use crate::shard::ShardIo;
+use crate::shard::block_commit::{BlockCommitCoordinator, PreparedCommitMap};
 use crate::vnode::Vnode;
 
 /// Lock-free shared topology snapshot for handler closures and dispatch.
@@ -203,12 +202,6 @@ where
     /// an atomic snapshot. The state machine owns its own copy — this
     /// field exists for off-thread consumers that can't reach into it.
     topology_snapshot: SharedTopologySnapshot,
-
-    /// Block commit pipeline: accumulates commits, applies persistence
-    /// backpressure, and drains them into a single async closure that
-    /// runs on the execution pool. Owns the prepared-commit cache shared
-    /// with delegated dispatch closures.
-    block_commit: BlockCommitCoordinator<S>,
 
     /// See [`DispatchHandles`]. Cloned once per delegated-action dispatch.
     dispatch_handles: Arc<DispatchHandles<S, N, E>>,
@@ -352,6 +345,8 @@ where
             ShardIo {
                 storage,
                 pending_chain,
+                // At startup, everything committed is also persisted on disk.
+                block_commit,
             },
         )]);
         assert_eq!(
@@ -367,8 +362,6 @@ where
             dispatch,
             event_sender,
             topology_snapshot,
-            // At startup, everything committed is also persisted on disk.
-            block_commit,
             dispatch_handles,
             caches,
             tx_validator,
@@ -434,6 +427,26 @@ where
             .next()
             .expect("V_shard == 1")
             .pending_chain
+    }
+
+    /// Internal: immutable view of the shard's block-commit pipeline.
+    pub(super) fn shard_block_commit(&self) -> &BlockCommitCoordinator<S> {
+        &self
+            .shards
+            .values()
+            .next()
+            .expect("V_shard == 1")
+            .block_commit
+    }
+
+    /// Internal: mutable view of the shard's block-commit pipeline.
+    pub(super) fn shard_block_commit_mut(&mut self) -> &mut BlockCommitCoordinator<S> {
+        &mut self
+            .shards
+            .values_mut()
+            .next()
+            .expect("V_shard == 1")
+            .block_commit
     }
 
     /// Access the network.

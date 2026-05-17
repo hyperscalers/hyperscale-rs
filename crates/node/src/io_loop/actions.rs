@@ -20,7 +20,6 @@ use hyperscale_types::{
 };
 use tracing::{debug, error, trace, warn};
 
-use super::block_commit::{AccumulateDecision, PendingCommit};
 use super::{IoLoop, TimerOp};
 use crate::io_loop::fetch::FetchInput;
 use crate::io_loop::fetch::binding::{
@@ -28,6 +27,7 @@ use crate::io_loop::fetch::binding::{
     TransactionBinding,
 };
 use crate::io_loop::sync::block::BlockSyncInput;
+use crate::shard::block_commit::{AccumulateDecision, PendingCommit};
 impl<S, N, D, E> IoLoop<S, N, D, E>
 where
     S: Storage,
@@ -278,7 +278,7 @@ where
         // prepared commit orphaned in the cache, and the next block to
         // reach flush trips the strict ordering assert in
         // `commit_block_inner` because its parent was never applied.
-        if height <= self.block_commit.persisted_height() {
+        if height <= self.shard_block_commit().persisted_height() {
             return;
         }
 
@@ -286,7 +286,7 @@ where
         // (VerifyStateRoot/ExecuteTransactions), reuse it — recomputing JMT
         // here can produce a transient root mismatch and trip the
         // byzantine-detection assert below on a self-inflicted race.
-        if self.block_commit.has_prepared(&block_hash) {
+        if self.shard_block_commit().has_prepared(&block_hash) {
             debug!(
                 height = height.inner(),
                 ?block_hash,
@@ -363,7 +363,7 @@ where
                 },
             );
 
-            self.block_commit
+            self.shard_block_commit_mut()
                 .insert_prepared(block_hash, height, prepared);
 
             debug!(
@@ -390,10 +390,10 @@ where
     /// decision: feed the sync protocol with the new committed height and,
     /// unless persistence backpressure is active, fire `BlockCommitted`.
     ///
-    /// [`BlockCommitCoordinator`]: super::block_commit::BlockCommitCoordinator
+    /// [`BlockCommitCoordinator`]: crate::shard::block_commit::BlockCommitCoordinator
     fn accept_block_commit(&mut self, commit: PendingCommit) {
         let now = self.vnodes[0].state.now();
-        let decision = self.block_commit.accumulate(commit, now);
+        let decision = self.shard_block_commit_mut().accumulate(commit, now);
         match decision {
             AccumulateDecision::Skip => {}
             AccumulateDecision::Accepted { height, notify_now } => {
@@ -415,9 +415,13 @@ where
     }
 
     pub(super) fn flush_block_commits(&mut self) {
+        // Clone shared handles before the `&mut self` reborrow for
+        // `shard_block_commit_mut()`. Dispatch is `Arc`-backed; cheap.
         let storage = Arc::clone(self.shard_storage());
-        self.block_commit
-            .flush(&storage, &self.event_sender, &self.dispatch);
+        let event_sender = self.event_sender.clone();
+        let dispatch = self.dispatch.clone();
+        self.shard_block_commit_mut()
+            .flush(&storage, &event_sender, &dispatch);
     }
 
     /// Dispatch a typed fetch request to the corresponding binding.
