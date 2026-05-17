@@ -32,8 +32,8 @@ use std::sync::Arc;
 
 use hyperscale_bft::{BftConfig, BftCoordinator};
 use hyperscale_core::{Action, ProtocolEvent, StateMachine};
-use hyperscale_execution::ExecutionCoordinator;
-use hyperscale_mempool::{MempoolConfig, MempoolCoordinator};
+use hyperscale_execution::{ExecCertStore, ExecutionCoordinator};
+use hyperscale_mempool::{MempoolConfig, MempoolCoordinator, TxStore};
 use hyperscale_provisions::{
     OutboundProvisionTracker, ProvisionConfig, ProvisionCoordinator, ProvisionStore,
 };
@@ -110,7 +110,14 @@ impl NodeStateMachine {
     /// * `recovered` - State recovered from storage. Use `RecoveredState::default()` for fresh start.
     /// * `mempool_config` - Mempool configuration
     /// * `provision_config` - Provision coordinator configuration
+    /// * `provision_store` - Shared provision store
+    /// * `tx_store` - Shared mempool body store, scoped per shard so
+    ///   same-shard vnodes admit into one canonical map.
+    /// * `exec_cert_store` - Shared local-shard execution-certificate
+    ///   store, scoped per shard for the same reason.
     #[must_use]
+    #[allow(clippy::too_many_arguments)] // per-shard-shared stores threaded explicitly so
+    // same-shard vnodes converge on one canonical store
     pub fn new(
         node_index: NodeIndex,
         topology: TopologyCoordinator,
@@ -119,12 +126,14 @@ impl NodeStateMachine {
         mempool_config: MempoolConfig,
         provision_config: ProvisionConfig,
         provision_store: Arc<ProvisionStore>,
+        tx_store: Arc<TxStore>,
+        exec_cert_store: Arc<ExecCertStore>,
     ) -> Self {
         Self {
             node_index,
             bft: BftCoordinator::new(bft_config.clone(), recovered),
-            execution: ExecutionCoordinator::new(),
-            mempool: MempoolCoordinator::with_config(mempool_config),
+            execution: ExecutionCoordinator::with_exec_cert_store(exec_cert_store),
+            mempool: MempoolCoordinator::with_tx_store(mempool_config, tx_store),
             provisions: ProvisionCoordinator::with_config_and_store(
                 provision_config,
                 Arc::clone(&provision_store),

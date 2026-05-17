@@ -14,7 +14,8 @@
 use std::sync::Arc;
 
 use hyperscale_bft::BftConfig;
-use hyperscale_mempool::MempoolConfig;
+use hyperscale_execution::ExecCertStore;
+use hyperscale_mempool::{MempoolConfig, TxStore};
 use hyperscale_provisions::{ProvisionConfig, ProvisionStore};
 use hyperscale_storage::RecoveredState;
 use hyperscale_test_helpers::TestCommittee;
@@ -85,6 +86,8 @@ impl TestNodeBuilder {
             MempoolConfig::default(),
             ProvisionConfig::default(),
             provision_store,
+            Arc::new(TxStore::new()),
+            Arc::new(ExecCertStore::new()),
         );
 
         TestNode { node, committee }

@@ -214,9 +214,22 @@ impl Default for ExecutionCoordinator {
 }
 
 impl ExecutionCoordinator {
-    /// Create a new execution state machine.
+    /// Create a new execution state machine with its own fresh
+    /// `ExecCertStore`. For hosts running multiple same-shard validators,
+    /// prefer [`Self::with_exec_cert_store`] to share one store across
+    /// every coordinator in the shard.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_exec_cert_store(Arc::new(ExecCertStore::new()))
+    }
+
+    /// Create a new execution state machine sharing an externally-owned
+    /// `ExecCertStore`. Same-shard vnodes share one store so the
+    /// `IoLoop`'s inbound EC fetch handler can serve from a single
+    /// canonical view rather than vnode-0's incidentally-convergent
+    /// copy.
+    #[must_use]
+    pub fn with_exec_cert_store(exec_certs: Arc<ExecCertStore>) -> Self {
         Self {
             finalized: FinalizedWaveStore::new(),
             committed_height: BlockHeight::GENESIS,
@@ -226,7 +239,7 @@ impl ExecutionCoordinator {
             provisioning: ProvisioningTracker::new(),
             expected_certs: ExpectedCertTracker::new(),
             outbound_certs: OutboundExecutionCertificateTracker::new(),
-            exec_certs: Arc::new(ExecCertStore::new()),
+            exec_certs,
             pending_ec_verifications: HashSet::new(),
             pending_finalized_wave_verifications: HashSet::new(),
         }

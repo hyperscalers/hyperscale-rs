@@ -53,7 +53,8 @@ use hyperscale_core::{NodeInput, ProtocolEvent, TimerId};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_dispatch_pooled::{PooledDispatch, ThreadPoolConfig};
 use hyperscale_engine::{GenesisConfig, NetworkDefinition, RadixExecutor, TransactionValidation};
-use hyperscale_mempool::MempoolConfig;
+use hyperscale_execution::ExecCertStore;
+use hyperscale_mempool::{MempoolConfig, TxStore};
 use hyperscale_metrics::{
     ChannelDepths, set_channel_depths, set_libp2p_peers, set_pool_queue_depths,
 };
@@ -393,6 +394,20 @@ impl ProductionRunnerBuilder {
         let recovered = primary_storage.load_recovered_state();
         let provision_store = Arc::new(ProvisionStore::new());
 
+        // One `TxStore` + `ExecCertStore` per hosted shard, shared across
+        // every same-shard vnode and into the `IoLoop`'s `SharedCaches`.
+        // Determinism guarantees same-shard vnodes admit identical sets,
+        // but co-owning the store makes the canonical view explicit and
+        // gives the request handler one place to read.
+        let tx_stores: HashMap<ShardGroupId, Arc<TxStore>> = local_shards
+            .iter()
+            .map(|s| (*s, Arc::new(TxStore::new())))
+            .collect();
+        let exec_cert_stores: HashMap<ShardGroupId, Arc<ExecCertStore>> = local_shards
+            .iter()
+            .map(|s| (*s, Arc::new(ExecCertStore::new())))
+            .collect();
+
         let vnode_inits: Vec<VnodeInit> = vnode_configs
             .into_iter()
             .enumerate()
@@ -401,6 +416,17 @@ impl ProductionRunnerBuilder {
                 // disambiguator across same-host vnodes.
                 let node_index =
                     u32::try_from(idx).expect("vnode count fits in u32 (capped well below 2^32)");
+                let shard = cfg.topology.snapshot().local_shard();
+                let tx_store = Arc::clone(
+                    tx_stores
+                        .get(&shard)
+                        .expect("hosted shard derived from vnodes"),
+                );
+                let exec_cert_store = Arc::clone(
+                    exec_cert_stores
+                        .get(&shard)
+                        .expect("hosted shard derived from vnodes"),
+                );
                 let state = NodeStateMachine::new(
                     node_index,
                     cfg.topology,
@@ -409,6 +435,8 @@ impl ProductionRunnerBuilder {
                     self.mempool_config.clone(),
                     self.provision_config,
                     Arc::clone(&provision_store),
+                    tx_store,
+                    exec_cert_store,
                 );
                 VnodeInit {
                     state,

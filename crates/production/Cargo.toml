@@ -18,6 +18,7 @@ hyperscale-dispatch.workspace = true
 hyperscale-dispatch-pooled.workspace = true
 hyperscale-bft.workspace = true
 hyperscale-engine.workspace = true
+hyperscale-execution.workspace = true
 hyperscale-mempool.workspace = true
 hyperscale-metrics.workspace = true
 hyperscale-metrics-prometheus.workspace = true
