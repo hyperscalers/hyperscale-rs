@@ -176,6 +176,33 @@ pub enum Action {
     /// The state machine emits this when processing one event produces
     /// a follow-on protocol event that should be processed immediately
     /// (at the same timestamp with Internal priority).
+    ///
+    /// # Invariant: shard coherence
+    ///
+    /// The I/O loop reroutes a `Continuation` through `event_sender`,
+    /// where it re-enters the next `step()` as a [`ProtocolEvent`] and
+    /// fans out to **every same-shard vnode** via `dispatch_event` →
+    /// `handle_protocol_passthrough`. The emitting vnode is one of the
+    /// recipients but not the only one.
+    ///
+    /// The carried event MUST therefore be *shard-coherent* — meaningful
+    /// to every same-shard vnode, not just the emitter. All current
+    /// emissions satisfy this by construction:
+    ///
+    /// - `BlockReadyToCommit` — QC-driven commit-readiness, deterministic
+    ///   per shard.
+    /// - `FinalizedWavesAdmitted` — shard-level admission of finalized
+    ///   waves.
+    /// - `OutboundEcObserved` — observing one of our own shard's ECs,
+    ///   identical readout per same-shard vnode by determinism.
+    /// - `ProvisionsAdmitted` — shard-level provision admission.
+    /// - `RemoteHeaderAdmitted` — shard-level remote-header admission.
+    /// - `TransactionsAdmitted` — shard-deterministic mempool admission.
+    ///
+    /// Any new continuation variant that is genuinely per-vnode (state
+    /// only the emitter should react to) needs a different transport
+    /// — emitting it via `Continuation` would silently apply it to the
+    /// vnode's same-shard peers.
     Continuation(ProtocolEvent),
 
     // ═══════════════════════════════════════════════════════════════════════
