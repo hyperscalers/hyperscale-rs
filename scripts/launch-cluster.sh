@@ -24,6 +24,7 @@ set -e
 NUM_SHARDS=2                                    # Number of shards
 VALIDATORS_PER_SHARD=4                          # Minimum 4 required for BFT (3 validators can't tolerate any delays)
 VNODES_PER_HOST=1                               # Validators bundled into each host process. Must divide VALIDATORS_PER_SHARD.
+CROSS_SHARD_PACK=false                          # Stripe one vnode from every shard into each host process.
 BASE_PORT=9000                                  # libp2p port
 BASE_RPC_PORT=8080                              # HTTP RPC port
 DATA_DIR="./cluster-data"                       # Data directory
@@ -61,6 +62,10 @@ while [[ $# -gt 0 ]]; do
         --vnodes-per-host)
             VNODES_PER_HOST="$2"
             shift 2
+            ;;
+        --cross-shard-pack)
+            CROSS_SHARD_PACK=true
+            shift
             ;;
         --clean)
             CLEAN=true
@@ -124,7 +129,8 @@ while [[ $# -gt 0 ]]; do
             echo "Options:"
             echo "  --shards N               Number of shards (default: 2)"
             echo "  --validators-per-shard M Validators per shard (default: 4, minimum: 4)"
-            echo "  --vnodes-per-host K      Validators bundled into each host process (default: 1). Must divide validators-per-shard."
+            echo "  --vnodes-per-host K      Validators bundled into each host process (default: 1). Must divide validators-per-shard. Same-shard packing."
+            echo "  --cross-shard-pack       Stripe one vnode from every shard into each host (requires shards >= 2; not combinable with --vnodes-per-host > 1)."
             echo "  --accounts-per-shard N   Spammer accounts per shard (default: 100)"
             echo "  --initial-balance N      Initial XRD balance per account (default: 1000000)"
             echo "  --smoke-timeout DURATION Smoke test timeout (default: 60s)"
@@ -256,25 +262,46 @@ if [ "$VALIDATORS_PER_SHARD" -lt 4 ]; then
     exit 1
 fi
 
-# Validate vnodes-per-host divides validators-per-shard. Initial multi-vnode
-# packing is same-shard only: K vnodes from the same shard land in one host.
+# Validate packing flags and derive host count.
+#
+# Two packing strategies:
+#   - Same-shard (default): K consecutive same-shard validators per host. Each
+#     host serves exactly one shard. HOSTS_PER_SHARD = VPS / K.
+#   - Cross-shard: each host runs one vnode from every shard. Stripes the
+#     validator-index "position" across shards. TOTAL_HOSTS = VPS, each host
+#     holds NUM_SHARDS vnodes. Validator binary already handles cross-shard
+#     hosting; the per-shard RocksDB instances open at data_dir/shard-{N}/db.
 if [ "$VNODES_PER_HOST" -lt 1 ]; then
     echo "ERROR: --vnodes-per-host must be >= 1."
     exit 1
 fi
-if [ $((VALIDATORS_PER_SHARD % VNODES_PER_HOST)) -ne 0 ]; then
-    echo "ERROR: --vnodes-per-host ($VNODES_PER_HOST) must divide --validators-per-shard ($VALIDATORS_PER_SHARD)."
-    exit 1
-fi
 
-HOSTS_PER_SHARD=$((VALIDATORS_PER_SHARD / VNODES_PER_HOST))
-TOTAL_HOSTS=$((NUM_SHARDS * HOSTS_PER_SHARD))
+if [ "$CROSS_SHARD_PACK" = true ]; then
+    if [ "$NUM_SHARDS" -lt 2 ]; then
+        echo "ERROR: --cross-shard-pack requires --shards >= 2."
+        exit 1
+    fi
+    if [ "$VNODES_PER_HOST" -gt 1 ]; then
+        echo "ERROR: --cross-shard-pack cannot be combined with --vnodes-per-host > 1."
+        exit 1
+    fi
+    HOSTS_PER_SHARD=$VALIDATORS_PER_SHARD
+    TOTAL_HOSTS=$VALIDATORS_PER_SHARD
+    PACK_DESCRIPTION="cross-shard (one vnode from each shard per host)"
+else
+    if [ $((VALIDATORS_PER_SHARD % VNODES_PER_HOST)) -ne 0 ]; then
+        echo "ERROR: --vnodes-per-host ($VNODES_PER_HOST) must divide --validators-per-shard ($VALIDATORS_PER_SHARD)."
+        exit 1
+    fi
+    HOSTS_PER_SHARD=$((VALIDATORS_PER_SHARD / VNODES_PER_HOST))
+    TOTAL_HOSTS=$((NUM_SHARDS * HOSTS_PER_SHARD))
+    PACK_DESCRIPTION="same-shard ($VNODES_PER_HOST vnodes/host)"
+fi
 
 echo "=== Hyperscale Local Cluster ==="
 echo "Shards: $NUM_SHARDS"
 echo "Validators per shard: $VALIDATORS_PER_SHARD"
-echo "Vnodes per host: $VNODES_PER_HOST"
-echo "Hosts per shard: $HOSTS_PER_SHARD"
+echo "Packing: $PACK_DESCRIPTION"
 echo "Total hosts: $TOTAL_HOSTS"
 echo "Total validators: $TOTAL_VALIDATORS"
 echo "Accounts per shard: $ACCOUNTS_PER_SHARD"
@@ -359,13 +386,17 @@ for shard in $(seq 0 $((NUM_SHARDS - 1))); do
 done
 echo "  Generated balances for $((NUM_SHARDS * ACCOUNTS_PER_SHARD)) accounts total"
 
-# Calculate bootstrap peer addresses. The first host of each shard
-# (host_idx = shard * HOSTS_PER_SHARD) advertises its QUIC port; all other
-# hosts dial those.
+# Calculate bootstrap peer addresses. Pick NUM_SHARDS hosts for redundancy.
+# - Same-shard: the first host of each shard (host_idx = shard * HOSTS_PER_SHARD).
+# - Cross-shard: every host serves every shard, so the first NUM_SHARDS hosts.
 BOOTSTRAP_PEERS=""
 for shard in $(seq 0 $((NUM_SHARDS - 1))); do
-    first_host_idx=$((shard * HOSTS_PER_SHARD))
-    quic_port=$((BASE_PORT + first_host_idx))
+    if [ "$CROSS_SHARD_PACK" = true ]; then
+        bootstrap_host_idx=$shard
+    else
+        bootstrap_host_idx=$((shard * HOSTS_PER_SHARD))
+    fi
+    quic_port=$((BASE_PORT + bootstrap_host_idx))
     if [ -n "$BOOTSTRAP_PEERS" ]; then
         BOOTSTRAP_PEERS="$BOOTSTRAP_PEERS,"
     fi
@@ -389,14 +420,13 @@ public_key = \"${PUBLIC_KEYS[$j]}\"
 voting_power = 1"
 done
 
-# Generate one TOML per host. With VNODES_PER_HOST=K, host h packs K same-shard
-# validators starting at validator index (shard * VALIDATORS_PER_SHARD + h_in_shard * K).
+# Generate one TOML per host. Packing strategy:
+#   - Same-shard: host h packs K consecutive same-shard validators starting at
+#     index (shard * VPS + h_in_shard * K).
+#   - Cross-shard: host h packs one validator from each shard at index
+#     (shard * VPS + h), so host h holds validators [h, VPS+h, 2*VPS+h, ...].
 echo "Generating config files..."
 for host_idx in $(seq 0 $((TOTAL_HOSTS - 1))); do
-    shard=$((host_idx / HOSTS_PER_SHARD))
-    h_in_shard=$((host_idx % HOSTS_PER_SHARD))
-    first_vnode=$((shard * VALIDATORS_PER_SHARD + h_in_shard * VNODES_PER_HOST))
-
     quic_port=$((BASE_PORT + host_idx))
     rpc_port=$((BASE_RPC_PORT + host_idx))
 
@@ -405,29 +435,64 @@ for host_idx in $(seq 0 $((TOTAL_HOSTS - 1))); do
     NODE_DATA_DIR="$HOST_DIR/data"
     mkdir -p "$NODE_DATA_DIR"
 
-    # Build [[vnode]] blocks for the K vnodes this host runs.
+    # Build [[vnode]] blocks and accumulate the per-shard genesis balance
+    # blocks this host needs (one block per distinct hosted shard). Shard
+    # indices are small integers, so an indexed array doubles as a dedup
+    # set without needing bash-4-only associative arrays.
     VNODE_BLOCKS=""
     HOSTED_LIST=""
-    for k in $(seq 0 $((VNODES_PER_HOST - 1))); do
-        vnode_id=$((first_vnode + k))
+    SHARD_SUMMARY=""
+    HOST_GENESIS_BALANCES=""
+    HOST_SHARDS_INCLUDED=()
+
+    add_vnode_block() {
+        local vid=$1
+        local sh=$2
         if [ -n "$VNODE_BLOCKS" ]; then
             VNODE_BLOCKS="$VNODE_BLOCKS
 "
         fi
         VNODE_BLOCKS="$VNODE_BLOCKS[[vnode]]
-validator_id = $vnode_id
-shard = $shard
-key_path = \"${KEY_FILES[$vnode_id]}\""
+validator_id = $vid
+shard = $sh
+key_path = \"${KEY_FILES[$vid]}\""
         if [ -n "$HOSTED_LIST" ]; then
             HOSTED_LIST="$HOSTED_LIST, "
         fi
-        HOSTED_LIST="$HOSTED_LIST$vnode_id"
-    done
+        HOSTED_LIST="$HOSTED_LIST$vid"
+        if [ -z "${HOST_SHARDS_INCLUDED[$sh]:-}" ]; then
+            HOST_SHARDS_INCLUDED[$sh]=1
+            if [ -n "$HOST_GENESIS_BALANCES" ]; then
+                HOST_GENESIS_BALANCES="$HOST_GENESIS_BALANCES
+
+"
+            fi
+            HOST_GENESIS_BALANCES="$HOST_GENESIS_BALANCES${SHARD_GENESIS_BALANCES[$sh]}"
+        fi
+    }
+
+    if [ "$CROSS_SHARD_PACK" = true ]; then
+        # One vnode from each shard at validator index (shard * VPS + host_idx).
+        for shard in $(seq 0 $((NUM_SHARDS - 1))); do
+            vnode_id=$((shard * VALIDATORS_PER_SHARD + host_idx))
+            add_vnode_block "$vnode_id" "$shard"
+        done
+        SHARD_SUMMARY="shards [0..$((NUM_SHARDS - 1))]"
+    else
+        shard=$((host_idx / HOSTS_PER_SHARD))
+        h_in_shard=$((host_idx % HOSTS_PER_SHARD))
+        first_vnode=$((shard * VALIDATORS_PER_SHARD + h_in_shard * VNODES_PER_HOST))
+        for k in $(seq 0 $((VNODES_PER_HOST - 1))); do
+            vnode_id=$((first_vnode + k))
+            add_vnode_block "$vnode_id" "$shard"
+        done
+        SHARD_SUMMARY="shard $shard"
+    fi
 
     cat > "$CONFIG_FILE" << EOF
 # Hyperscale Validator Configuration
 # Auto-generated for local cluster testing
-# Host $host_idx: shard $shard, vnodes [$HOSTED_LIST]
+# Host $host_idx: $SHARD_SUMMARY, vnodes [$HOSTED_LIST]
 
 [node]
 num_shards = $NUM_SHARDS
@@ -471,10 +536,11 @@ log_file = "$HOST_DIR/output.log"
 
 $GENESIS_VALIDATORS
 
-${SHARD_GENESIS_BALANCES[$shard]}
+$HOST_GENESIS_BALANCES
 EOF
 
-    echo "  Created config for host $host_idx (shard $shard, vnodes [$HOSTED_LIST], rpc port $rpc_port)"
+    echo "  Created config for host $host_idx ($SHARD_SUMMARY, vnodes [$HOSTED_LIST], rpc port $rpc_port)"
+    unset HOST_SHARDS_INCLUDED
 done
 
 # Apply network conditions before starting validators so they experience
@@ -489,12 +555,16 @@ PID_FILE="$DATA_DIR/pids.txt"
 declare -a HOST_PIDS
 
 for host_idx in $(seq 0 $((TOTAL_HOSTS - 1))); do
-    shard=$((host_idx / HOSTS_PER_SHARD))
     HOST_DIR="$DATA_DIR/host-$host_idx"
     CONFIG_FILE="$HOST_DIR/config.toml"
     LOG_FILE="$HOST_DIR/output.log"
 
-    echo "  Starting host $host_idx (shard $shard)..."
+    if [ "$CROSS_SHARD_PACK" = true ]; then
+        host_summary="cross-shard"
+    else
+        host_summary="shard $((host_idx / HOSTS_PER_SHARD))"
+    fi
+    echo "  Starting host $host_idx ($host_summary)..."
 
     # Tracing output goes to log_file (configured in TOML) with ANSI disabled.
     # Stderr redirect captures panics/crash output only.
@@ -538,12 +608,25 @@ echo "=== Cluster Started ==="
 echo ""
 echo "Host endpoints:"
 for host_idx in $(seq 0 $((TOTAL_HOSTS - 1))); do
-    shard=$((host_idx / HOSTS_PER_SHARD))
-    h_in_shard=$((host_idx % HOSTS_PER_SHARD))
-    first_vnode=$((shard * VALIDATORS_PER_SHARD + h_in_shard * VNODES_PER_HOST))
-    last_vnode=$((first_vnode + VNODES_PER_HOST - 1))
     rpc_port=$((BASE_RPC_PORT + host_idx))
-    echo "  Host $host_idx (shard $shard, vnodes $first_vnode..$last_vnode): http://$NODE_HOSTNAME:$rpc_port"
+    if [ "$CROSS_SHARD_PACK" = true ]; then
+        # Cross-shard host runs one vnode from each shard at index (s * VPS + host_idx).
+        vnodes_str=""
+        for s in $(seq 0 $((NUM_SHARDS - 1))); do
+            vid=$((s * VALIDATORS_PER_SHARD + host_idx))
+            if [ -n "$vnodes_str" ]; then
+                vnodes_str="$vnodes_str, "
+            fi
+            vnodes_str="$vnodes_str$vid"
+        done
+        echo "  Host $host_idx (cross-shard, vnodes [$vnodes_str]): http://$NODE_HOSTNAME:$rpc_port"
+    else
+        shard=$((host_idx / HOSTS_PER_SHARD))
+        h_in_shard=$((host_idx % HOSTS_PER_SHARD))
+        first_vnode=$((shard * VALIDATORS_PER_SHARD + h_in_shard * VNODES_PER_HOST))
+        last_vnode=$((first_vnode + VNODES_PER_HOST - 1))
+        echo "  Host $host_idx (shard $shard, vnodes $first_vnode..$last_vnode): http://$NODE_HOSTNAME:$rpc_port"
+    fi
 done
 
 echo ""
@@ -652,30 +735,51 @@ if [ "$MONITORING" = true ] || [ "$TRACING" = true ]; then
     # expose a single metrics port; per-vnode prometheus labels are deferred).
     echo "Generating Prometheus configuration for $TOTAL_HOSTS hosts across $NUM_SHARDS shards..."
 
-    # Build static configs grouped by shard. Each host in a shard contributes
-    # one scrape target. The shard label reports the host's primary shard.
+    # Build static configs. Under same-shard packing, group by shard with a
+    # per-shard label. Under cross-shard packing every host spans every shard,
+    # so the shard label loses meaning — emit one group with a `pack` label.
     PROM_STATIC_CONFIGS=""
-    for shard in $(seq 0 $((NUM_SHARDS - 1))); do
-        SHARD_TARGETS=""
-        for h in $(seq 0 $((HOSTS_PER_SHARD - 1))); do
-            host_idx=$((shard * HOSTS_PER_SHARD + h))
+    if [ "$CROSS_SHARD_PACK" = true ]; then
+        ALL_TARGETS=""
+        for host_idx in $(seq 0 $((TOTAL_HOSTS - 1))); do
             rpc_port=$((BASE_RPC_PORT + host_idx))
-            if [ -n "$SHARD_TARGETS" ]; then
-                SHARD_TARGETS="$SHARD_TARGETS
+            if [ -n "$ALL_TARGETS" ]; then
+                ALL_TARGETS="$ALL_TARGETS
           - 'host.docker.internal:$rpc_port'"
             else
-                SHARD_TARGETS="- 'host.docker.internal:$rpc_port'"
+                ALL_TARGETS="- 'host.docker.internal:$rpc_port'"
             fi
         done
+        PROM_STATIC_CONFIGS="
+      # Cross-shard hosts (each serves every shard)
+      - targets:
+          $ALL_TARGETS
+        labels:
+          cluster: 'local'
+          pack: 'cross-shard'"
+    else
+        for shard in $(seq 0 $((NUM_SHARDS - 1))); do
+            SHARD_TARGETS=""
+            for h in $(seq 0 $((HOSTS_PER_SHARD - 1))); do
+                host_idx=$((shard * HOSTS_PER_SHARD + h))
+                rpc_port=$((BASE_RPC_PORT + host_idx))
+                if [ -n "$SHARD_TARGETS" ]; then
+                    SHARD_TARGETS="$SHARD_TARGETS
+          - 'host.docker.internal:$rpc_port'"
+                else
+                    SHARD_TARGETS="- 'host.docker.internal:$rpc_port'"
+                fi
+            done
 
-        PROM_STATIC_CONFIGS="$PROM_STATIC_CONFIGS
+            PROM_STATIC_CONFIGS="$PROM_STATIC_CONFIGS
       # Shard $shard hosts
       - targets:
           $SHARD_TARGETS
         labels:
           cluster: 'local'
           shard: '$shard'"
-    done
+        done
+    fi
 
     cat > "$MONITORING_DIR/prometheus.yml" << EOF
 # Prometheus configuration for Hyperscale local cluster
