@@ -45,7 +45,7 @@ where
             ids,
             shard,
             preferred,
-            origin,
+            class,
         } in outputs
         {
             if B::PER_ID {
@@ -55,7 +55,7 @@ where
                         local_shard,
                         shard,
                         preferred,
-                        origin,
+                        class,
                         &*self.network,
                         &self.event_sender,
                     );
@@ -66,7 +66,7 @@ where
                     local_shard,
                     shard,
                     preferred,
-                    origin,
+                    class,
                     &*self.network,
                     &self.event_sender,
                 );
@@ -88,7 +88,7 @@ where
             ids,
             shard,
             preferred,
-            origin,
+            class,
         } = &input
         {
             tracing::trace!(
@@ -97,7 +97,7 @@ where
                 ids = ids.len(),
                 shard = ?shard,
                 preferred = ?preferred,
-                origin = ?origin,
+                class = ?class,
                 "Dispatching fetch request"
             );
         }

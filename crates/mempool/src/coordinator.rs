@@ -33,12 +33,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_core::{Action, FetchAbandon, FetchOrigin, FetchRequest, ProtocolEvent};
+use hyperscale_core::{Action, FetchAbandon, FetchRequest, ProtocolEvent};
 use hyperscale_metrics::{record_expected_tx_dropped, record_transaction_aborted};
 use hyperscale_types::{
-    BlockHeight, CertifiedBlock, LocalTimestamp, MAX_TX_IN_FLIGHT, NodeId, RETENTION_HORIZON,
-    RoutableTransaction, ShardGroupId, TopologySnapshot, TransactionDecision, TransactionStatus,
-    TxHash, WeightedTimestamp,
+    BlockHeight, CertifiedBlock, LocalTimestamp, MAX_TX_IN_FLIGHT, MessageClass, NodeId,
+    RETENTION_HORIZON, RoutableTransaction, ShardGroupId, TopologySnapshot, TransactionDecision,
+    TransactionStatus, TxHash, WeightedTimestamp,
 };
 use serde::Deserialize;
 use tracing::instrument;
@@ -634,7 +634,7 @@ impl MempoolCoordinator {
                 ids,
                 shard: source_shard,
                 preferred: None,
-                origin: FetchOrigin::Mempool,
+                class: Some(MessageClass::Recovery),
             }));
         }
 

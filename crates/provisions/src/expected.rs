@@ -22,7 +22,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use hyperscale_core::{Action, FetchOrigin, FetchRequest};
+use hyperscale_core::{Action, FetchRequest};
 use hyperscale_types::{BlockHeight, ShardGroupId, ValidatorId, WeightedTimestamp};
 use tracing::warn;
 
@@ -65,7 +65,7 @@ impl TimeoutEffect {
             source_shard: self.source_shard,
             block_height: self.block_height,
             preferred: Some(self.proposer),
-            origin: FetchOrigin::CrossShard,
+            class: None,
         })
     }
 }

@@ -15,11 +15,10 @@
 use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
 
-use hyperscale_core::FetchOrigin;
 use hyperscale_metrics::{
     record_fetch_abandoned, record_fetch_completed, record_fetch_retried, record_fetch_started,
 };
-use hyperscale_types::{ShardGroupId, ValidatorId};
+use hyperscale_types::{MessageClass, ShardGroupId, ValidatorId};
 use tracing::{debug, trace};
 
 pub mod binding;
@@ -55,7 +54,7 @@ impl Default for FetchConfig {
 pub enum FetchInput<Id> {
     /// Request `ids` against `shard`'s committee with `preferred` as the
     /// canonical-source hint. Idempotent: ids already pending keep their
-    /// existing `(shard, preferred, origin)` triple; new ids are added
+    /// existing `(shard, preferred, class)` triple; new ids are added
     /// with the supplied values.
     Request {
         /// Ids to fetch.
@@ -66,9 +65,8 @@ pub enum FetchInput<Id> {
         /// Canonical-source hint passed to `Network::request`. `None` lets
         /// the network's health-weighted rotation pick freely.
         preferred: Option<ValidatorId>,
-        /// Why the fetch is being issued. Drives the message-class override
-        /// when the binding ultimately calls `Network::request`.
-        origin: FetchOrigin,
+        /// Class override forwarded to `Network::request`.
+        class: Option<MessageClass>,
     },
     /// A network attempt for `ids` failed (or returned an unusable response);
     /// reclaim them for retry on the next tick.
@@ -100,8 +98,7 @@ pub enum FetchInput<Id> {
 #[derive(Debug)]
 pub enum FetchOutput<Id> {
     /// Issue a network request for `ids`. The output handler translates this
-    /// into `Network::request(shard, preferred, .., origin.class_override(),
-    /// ..)`.
+    /// into `Network::request(shard, preferred, .., class, ..)`.
     Send {
         /// Ids in this chunk.
         ids: Vec<Id>,
@@ -110,9 +107,9 @@ pub enum FetchOutput<Id> {
         shard: ShardGroupId,
         /// Canonical-source hint forwarded to the network layer.
         preferred: Option<ValidatorId>,
-        /// Origin shared by every id in this chunk; chunks are grouped by
-        /// `(shard, preferred, origin)` so this is well-defined.
-        origin: FetchOrigin,
+        /// Class override shared by every id in this chunk; chunks are
+        /// grouped by `(shard, preferred, class)` so this is well-defined.
+        class: Option<MessageClass>,
     },
 }
 
@@ -120,7 +117,7 @@ pub enum FetchOutput<Id> {
 struct Entry {
     shard: ShardGroupId,
     preferred: Option<ValidatorId>,
-    origin: FetchOrigin,
+    class: Option<MessageClass>,
     in_flight: bool,
 }
 
@@ -133,11 +130,11 @@ enum DropKind {
 }
 
 /// Group key for ready ids during chunk assembly: same `(shard, preferred,
-/// origin)` coalesce; chunks that differ on any of those three issue as
+/// class)` coalesce; chunks that differ on any of those three issue as
 /// separate `Send`s (different shards route to different committees,
-/// different preferreds bias different peers, different origins carry
-/// different `MessageClass` overrides downstream).
-type GroupKey = (ShardGroupId, Option<ValidatorId>, FetchOrigin);
+/// different preferreds bias different peers, different classes carry
+/// different network urgencies).
+type GroupKey = (ShardGroupId, Option<ValidatorId>, Option<MessageClass>);
 
 /// Id-keyed fetch state machine.
 pub struct Fetch<Id: Eq + Hash + Ord + Clone> {
@@ -168,8 +165,8 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
                 ids,
                 shard,
                 preferred,
-                origin,
-            } => self.handle_request(ids, shard, preferred, origin),
+                class,
+            } => self.handle_request(ids, shard, preferred, class),
             FetchInput::Failed { ids } => self.handle_failed(&ids),
             FetchInput::Admitted { ids } => self.handle_drop(&ids, DropKind::Admitted),
             FetchInput::Abandoned { ids } => self.handle_drop(&ids, DropKind::Abandoned),
@@ -200,7 +197,7 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
         ids: Vec<Id>,
         shard: ShardGroupId,
         preferred: Option<ValidatorId>,
-        origin: FetchOrigin,
+        class: Option<MessageClass>,
     ) -> Vec<FetchOutput<Id>> {
         if ids.is_empty() {
             return vec![];
@@ -212,7 +209,7 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
                 Entry {
                     shard,
                     preferred,
-                    origin,
+                    class,
                     in_flight: false,
                 }
             });
@@ -268,7 +265,7 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
 
         // Group ready ids by `(preferred, origin)`. Different origins differ
         // in network class, so two ids with the same shard+preferred but
-        // different origins issue as separate `Send`s.
+        // different classes issue as separate `Send`s.
         let mut groups: HashMap<GroupKey, Vec<Id>> = HashMap::new();
         let mut taken = 0usize;
         for (id, entry) in &self.pending {
@@ -279,7 +276,7 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
                 continue;
             }
             groups
-                .entry((entry.shard, entry.preferred, entry.origin))
+                .entry((entry.shard, entry.preferred, entry.class))
                 .or_default()
                 .push(id.clone());
             taken += 1;
@@ -300,7 +297,7 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
         let mut outputs = Vec::new();
         let mut chunks_emitted = 0usize;
         'outer: for key in group_order {
-            let (shard, preferred, origin) = key;
+            let (shard, preferred, class) = key;
             let ids = groups.remove(&key).expect("key just collected");
             for chunk in ids.chunks(self.config.max_ids_per_request) {
                 if chunks_emitted >= self.config.parallel_chunks_per_tick {
@@ -315,7 +312,7 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
                     ids: chunk.to_vec(),
                     shard,
                     preferred,
-                    origin,
+                    class,
                 });
                 chunks_emitted += 1;
             }
@@ -355,7 +352,7 @@ mod tests {
             ids: vec![tx(1), tx(2), tx(3), tx(4), tx(5)],
             shard: SHARD,
             preferred: Some(vid(1)),
-            origin: FetchOrigin::PendingBlock,
+            class: None,
         });
         assert_eq!(out.len(), 3);
         for o in &out {
@@ -372,7 +369,7 @@ mod tests {
             ids: vec![tx(1), tx(2)],
             shard: SHARD,
             preferred: Some(vid(1)),
-            origin: FetchOrigin::PendingBlock,
+            class: None,
         });
         assert_eq!(out.len(), 1);
         let FetchOutput::Send { ids, .. } = &out[0];
@@ -393,7 +390,7 @@ mod tests {
             ids: vec![tx(1), tx(2)],
             shard: SHARD,
             preferred: Some(vid(1)),
-            origin: FetchOrigin::PendingBlock,
+            class: None,
         });
         p.handle(FetchInput::Tick);
 
@@ -417,7 +414,7 @@ mod tests {
             ids: vec![tx(1), tx(2)],
             shard: SHARD,
             preferred: Some(vid(1)),
-            origin: FetchOrigin::PendingBlock,
+            class: None,
         });
         p.handle(FetchInput::Tick);
 
@@ -434,7 +431,7 @@ mod tests {
             ids: vec![tx(1)],
             shard: SHARD,
             preferred: Some(vid(1)),
-            origin: FetchOrigin::PendingBlock,
+            class: None,
         });
         // First request marks tx(1) in_flight under vid(1) and emits its Send.
         assert_eq!(first.len(), 1);
@@ -445,7 +442,7 @@ mod tests {
             ids: vec![tx(1), tx(2)],
             shard: SHARD,
             preferred: Some(vid(2)),
-            origin: FetchOrigin::PendingBlock,
+            class: None,
         });
         assert_eq!(second.len(), 1);
         let FetchOutput::Send { preferred, ids, .. } = &second[0];
@@ -467,7 +464,7 @@ mod tests {
             ids: (0..30).map(tx).collect(),
             shard: SHARD,
             preferred: Some(vid(1)),
-            origin: FetchOrigin::PendingBlock,
+            class: None,
         });
         assert_eq!(out.len(), 1);
         let FetchOutput::Send { ids, .. } = &out[0];
@@ -488,7 +485,7 @@ mod tests {
             ids: (0..10).map(tx).collect(),
             shard: SHARD,
             preferred: Some(vid(1)),
-            origin: FetchOrigin::PendingBlock,
+            class: None,
         });
         p.handle(FetchInput::Tick);
         assert_eq!(p.in_flight_count(), 3, "global cap honoured");

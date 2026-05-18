@@ -23,13 +23,15 @@ use std::hash::Hash;
 use std::sync::Arc;
 
 use crossbeam::channel::Sender;
-use hyperscale_core::{FetchOrigin, NodeInput, ProtocolEvent};
+use hyperscale_core::{NodeInput, ProtocolEvent};
 use hyperscale_network::{Network, ResponseVerdict};
 use hyperscale_types::network::request::{
     GetExecutionCertsRequest, GetFinalizedWavesRequest, GetLocalProvisionsRequest,
     GetProvisionsRequest, GetTransactionsRequest,
 };
-use hyperscale_types::{BlockHeight, ProvisionHash, ShardGroupId, TxHash, ValidatorId, WaveId};
+use hyperscale_types::{
+    BlockHeight, MessageClass, ProvisionHash, ShardGroupId, TxHash, ValidatorId, WaveId,
+};
 
 use super::Fetch;
 use super::host::FetchHost;
@@ -69,7 +71,7 @@ pub trait FetchBinding: 'static {
     fn fetch_mut(host: &mut FetchHost) -> &mut Fetch<Self::Id>;
 
     /// Send one request covering `ids` against `shard`'s committee and
-    /// route the response back through the event sender. `origin` flows
+    /// route the response back through the event sender. `class` flows
     /// down to `Network::request` as the per-call class override. For
     /// [`PER_ID`](Self::PER_ID) bindings the dispatcher pre-splits into
     /// single-element chunks before calling this.
@@ -84,7 +86,7 @@ pub trait FetchBinding: 'static {
         local_shard: ShardGroupId,
         shard: ShardGroupId,
         preferred: Option<ValidatorId>,
-        origin: FetchOrigin,
+        class: Option<MessageClass>,
         network: &N,
         sender: &Sender<NodeInput>,
     );
@@ -159,7 +161,7 @@ impl FetchBinding for TransactionBinding {
         local_shard: ShardGroupId,
         shard: ShardGroupId,
         preferred: Option<ValidatorId>,
-        origin: FetchOrigin,
+        class: Option<MessageClass>,
         network: &N,
         sender: &Sender<NodeInput>,
     ) {
@@ -169,7 +171,7 @@ impl FetchBinding for TransactionBinding {
             shard,
             preferred,
             GetTransactionsRequest::new(ids),
-            origin.class_override(),
+            class,
             Box::new(move |result| {
                 if let Ok(resp) = result {
                     let split = partition_solicited(resp.into_transactions(), &hs, |tx| tx.hash());
@@ -224,7 +226,7 @@ impl FetchBinding for LocalProvisionBinding {
         local_shard: ShardGroupId,
         shard: ShardGroupId,
         preferred: Option<ValidatorId>,
-        origin: FetchOrigin,
+        class: Option<MessageClass>,
         network: &N,
         sender: &Sender<NodeInput>,
     ) {
@@ -234,7 +236,7 @@ impl FetchBinding for LocalProvisionBinding {
             shard,
             preferred,
             GetLocalProvisionsRequest::new(ids),
-            origin.class_override(),
+            class,
             Box::new(move |result| {
                 if let Ok(resp) = result {
                     let split =
@@ -288,7 +290,7 @@ impl FetchBinding for FinalizedWaveBinding {
         local_shard: ShardGroupId,
         shard: ShardGroupId,
         preferred: Option<ValidatorId>,
-        origin: FetchOrigin,
+        class: Option<MessageClass>,
         network: &N,
         sender: &Sender<NodeInput>,
     ) {
@@ -298,7 +300,7 @@ impl FetchBinding for FinalizedWaveBinding {
             shard,
             preferred,
             GetFinalizedWavesRequest::new(ids),
-            origin.class_override(),
+            class,
             Box::new(move |result| {
                 if let Ok(resp) = result {
                     let split = partition_solicited(resp.waves.into_inner(), &requested_ids, |w| {
@@ -354,7 +356,7 @@ impl FetchBinding for ExecCertBinding {
         local_shard: ShardGroupId,
         shard: ShardGroupId,
         preferred: Option<ValidatorId>,
-        origin: FetchOrigin,
+        class: Option<MessageClass>,
         network: &N,
         sender: &Sender<NodeInput>,
     ) {
@@ -364,7 +366,7 @@ impl FetchBinding for ExecCertBinding {
             shard,
             preferred,
             GetExecutionCertsRequest { wave_ids: ids },
-            origin.class_override(),
+            class,
             Box::new(move |result| {
                 if let Ok(response) = result {
                     let certs = response.certificates.unwrap_or_default();
@@ -426,7 +428,7 @@ impl FetchBinding for ProvisionBinding {
         local_shard: ShardGroupId,
         shard: ShardGroupId,
         preferred: Option<ValidatorId>,
-        origin: FetchOrigin,
+        class: Option<MessageClass>,
         network: &N,
         sender: &Sender<NodeInput>,
     ) {
@@ -449,7 +451,7 @@ impl FetchBinding for ProvisionBinding {
             shard,
             preferred,
             request,
-            origin.class_override(),
+            class,
             Box::new(move |result| {
                 let Ok(response) = result else {
                     let _ = es.send(NodeInput::ProvisionsFetchFailed {
