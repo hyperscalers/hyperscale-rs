@@ -23,8 +23,10 @@ use sbor::{basic_decode, basic_encode};
 
 use crate::traits::{GossipHandler, GossipVerdict, NotificationHandler, RequestHandler};
 
-/// Type-erased gossip handler: receives decompressed SBOR bytes, returns verdict.
-pub type RawGossipHandler = dyn Fn(Vec<u8>) -> GossipVerdict + Send + Sync;
+/// Type-erased gossip handler: receives decompressed SBOR bytes plus the
+/// shard the topic encoded (`None` for global-scoped topics), returns
+/// verdict.
+pub type RawGossipHandler = dyn Fn(Vec<u8>, Option<ShardGroupId>) -> GossipVerdict + Send + Sync;
 
 /// Type-erased notification handler: receives decompressed SBOR bytes, no return value.
 pub type RawNotificationHandler = dyn Fn(Vec<u8>) + Send + Sync;
@@ -38,8 +40,9 @@ pub type RawRequestHandler = dyn Fn(&[u8]) -> Vec<u8> + Send + Sync;
 pub trait LocalGossipDispatcher: Send + Sync {
     /// Dispatch `msg` (downcast from `&dyn Any` to the registered `M`)
     /// to the typed handler. The handler consumes `M`, so the dispatcher
-    /// clones internally.
-    fn dispatch(&self, msg: &dyn Any) -> GossipVerdict;
+    /// clones internally. `shard` is the broadcast target shard for
+    /// shard-scoped messages and `None` for global-scoped messages.
+    fn dispatch(&self, msg: &dyn Any, shard: Option<ShardGroupId>) -> GossipVerdict;
 }
 
 /// Counterpart to [`LocalGossipDispatcher`] for fire-and-forget notifications.
@@ -75,11 +78,11 @@ where
     M: NetworkMessage + Clone + 'static,
     H: GossipHandler<M>,
 {
-    fn dispatch(&self, msg: &dyn Any) -> GossipVerdict {
+    fn dispatch(&self, msg: &dyn Any, shard: Option<ShardGroupId>) -> GossipVerdict {
         let typed = msg
             .downcast_ref::<M>()
             .expect("local gossip dispatch type mismatch");
-        self.handler.on_message(typed.clone())
+        self.handler.on_message(typed.clone(), shard)
     }
 }
 
@@ -183,15 +186,17 @@ impl HandlerRegistry {
 
         let bytes_handler = Arc::clone(&handler);
         let raw: Arc<RawGossipHandler> =
-            Arc::new(move |payload: Vec<u8>| match basic_decode::<M>(&payload) {
-                Ok(msg) => bytes_handler.on_message(msg),
-                Err(e) => {
-                    tracing::warn!(
-                        message_type = M::message_type_id(),
-                        error = ?e,
-                        "Failed to SBOR-decode gossip message — rejecting"
-                    );
-                    GossipVerdict::Reject
+            Arc::new(move |payload: Vec<u8>, shard: Option<ShardGroupId>| {
+                match basic_decode::<M>(&payload) {
+                    Ok(msg) => bytes_handler.on_message(msg, shard),
+                    Err(e) => {
+                        tracing::warn!(
+                            message_type = M::message_type_id(),
+                            error = ?e,
+                            "Failed to SBOR-decode gossip message — rejecting"
+                        );
+                        GossipVerdict::Reject
+                    }
                 }
             });
         let prior = self
@@ -418,9 +423,16 @@ impl HandlerRegistry {
     /// Dispatch a typed gossip message into its in-process handler,
     /// skipping SBOR encode/decode. Returns `None` if no handler for
     /// `M` is registered. Network backends use this to short-circuit
-    /// local delivery for messages they publish.
+    /// local delivery for messages they publish. `shard` is the
+    /// broadcast target shard for shard-scoped publishes and `None`
+    /// for global publishes — the handler receives the same value the
+    /// inbound libp2p path supplies.
     #[must_use]
-    pub fn local_dispatch_gossip<M>(&self, msg: &M) -> Option<GossipVerdict>
+    pub fn local_dispatch_gossip<M>(
+        &self,
+        msg: &M,
+        shard: Option<ShardGroupId>,
+    ) -> Option<GossipVerdict>
     where
         M: NetworkMessage + 'static,
     {
@@ -428,7 +440,7 @@ impl HandlerRegistry {
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .get(&TypeId::of::<M>())
-            .map(|d| d.dispatch(msg as &dyn Any))
+            .map(|d| d.dispatch(msg as &dyn Any, shard))
     }
 
     /// Dispatch a typed notification message into its in-process handler,
@@ -512,19 +524,21 @@ mod tests {
         let counter = Arc::new(AtomicUsize::new(0));
         let counter_clone = counter.clone();
 
-        registry.register_gossip(move |_msg: TestMsg| -> GossipVerdict {
-            counter_clone.fetch_add(1, Ordering::SeqCst);
-            GossipVerdict::Accept
-        });
+        registry.register_gossip(
+            move |_msg: TestMsg, _shard: Option<ShardGroupId>| -> GossipVerdict {
+                counter_clone.fetch_add(1, Ordering::SeqCst);
+                GossipVerdict::Accept
+            },
+        );
 
         let handler = registry.get_gossip("test.gossip").unwrap();
         let encoded = basic_encode(&TestMsg(42)).unwrap();
-        let verdict = handler(encoded);
+        let verdict = handler(encoded, None);
         assert_eq!(counter.load(Ordering::SeqCst), 1);
         assert_eq!(verdict, GossipVerdict::Accept);
 
         // SBOR decode failure should return Reject.
-        let verdict = handler(vec![0xFF, 0xFE]);
+        let verdict = handler(vec![0xFF, 0xFE], None);
         assert_eq!(verdict, GossipVerdict::Reject);
         assert_eq!(counter.load(Ordering::SeqCst), 1); // handler not called
 
@@ -590,7 +604,11 @@ mod tests {
         }
 
         let registry = HandlerRegistry::new();
-        registry.register_gossip(|_: TestMsg| -> GossipVerdict { GossipVerdict::Accept });
-        registry.register_gossip(|_: TestMsg| -> GossipVerdict { GossipVerdict::Accept });
+        registry.register_gossip(
+            |_: TestMsg, _shard: Option<ShardGroupId>| -> GossipVerdict { GossipVerdict::Accept },
+        );
+        registry.register_gossip(
+            |_: TestMsg, _shard: Option<ShardGroupId>| -> GossipVerdict { GossipVerdict::Accept },
+        );
     }
 }

@@ -1,5 +1,7 @@
 //! Network handler registration (gossip, notifications, requests).
 
+use std::collections::HashSet;
+
 use hyperscale_core::{NodeInput, ProtocolEvent};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::Engine;
@@ -381,11 +383,31 @@ where
         // enqueues for batched async validation.
 
         let tx = self.event_sender.clone();
+        let hosted_shards_for_tx =
+            std::sync::Arc::new(self.hosted_shards().collect::<HashSet<_>>());
         self.network.register_gossip_handler::<TransactionGossip>(
             TopicScope::Shard,
-            move |gossip: TransactionGossip| -> GossipVerdict {
+            move |gossip: TransactionGossip, shard: Option<ShardGroupId>| -> GossipVerdict {
+                // TransactionGossip is shard-scoped: the topic
+                // determines admission. Drop early if we don't host
+                // this shard (cold-start race when subscriptions
+                // outlive the local-shards set).
+                let Some(local_shard) = shard else {
+                    warn!("TransactionGossip arrived without shard tag — dropping");
+                    return GossipVerdict::Reject;
+                };
+                if !hosted_shards_for_tx.contains(&local_shard) {
+                    warn!(
+                        target_shard = local_shard.inner(),
+                        "Dropping TransactionGossip: shard not hosted"
+                    );
+                    return GossipVerdict::Reject;
+                }
                 for transaction in gossip.transactions.into_inner() {
-                    let _ = tx.send(NodeInput::TransactionGossipReceived { tx: transaction });
+                    let _ = tx.send(NodeInput::TransactionGossipReceived {
+                        local_shard,
+                        tx: transaction,
+                    });
                 }
                 GossipVerdict::Accept
             },
@@ -395,16 +417,28 @@ where
 
         let tx = self.event_sender.clone();
         let topology = self.topology_snapshot.clone();
+        let hosted_shards_for_hdr =
+            std::sync::Arc::new(self.hosted_shards().collect::<HashSet<_>>());
         self.network
             .register_gossip_handler::<CommittedBlockHeaderGossip>(
                 TopicScope::Global,
-                move |gossip: CommittedBlockHeaderGossip| -> GossipVerdict {
+                move |gossip: CommittedBlockHeaderGossip,
+                      _shard: Option<ShardGroupId>|
+                      -> GossipVerdict {
+                    // CommittedBlockHeader is global-scoped — the
+                    // gossip topic doesn't pin a shard. The relevant
+                    // "local" shard for routing is any hosted shard
+                    // *other* than the header's source shard, since
+                    // our hosted shards consume remote headers to
+                    // track cross-shard provision dependencies.
                     let sender = gossip.sender;
                     let header_shard = gossip.committed_header.header().shard_group_id();
                     let topo = topology.load();
 
-                    // Own-shard headers are valid but not needed — accept to forward.
-                    if header_shard == topo.local_shard() {
+                    // Own-shard headers are valid but not needed — accept
+                    // to forward. We're only interested in remote shards'
+                    // headers.
+                    if hosted_shards_for_hdr.contains(&header_shard) {
                         return GossipVerdict::Accept;
                     }
 
@@ -414,12 +448,19 @@ where
                         return GossipVerdict::Reject;
                     };
 
-                    let _ = tx.send(NodeInput::CommittedBlockGossipReceived {
-                        committed_header: gossip.committed_header,
-                        sender,
-                        public_key,
-                        sender_signature: gossip.sender_signature,
-                    });
+                    // Route to every hosted shard — each
+                    // `RemoteHeaderCoordinator` independently tracks
+                    // remote headers for its shard's cross-shard
+                    // provisioning needs.
+                    for local_shard in hosted_shards_for_hdr.iter() {
+                        let _ = tx.send(NodeInput::CommittedBlockGossipReceived {
+                            local_shard: *local_shard,
+                            committed_header: gossip.committed_header.clone(),
+                            sender,
+                            public_key,
+                            sender_signature: gossip.sender_signature,
+                        });
+                    }
                     GossipVerdict::Accept
                 },
             );
@@ -433,7 +474,7 @@ where
         // `add_vnode` will need to refresh this when a new shard is
         // hosted at runtime; today registration runs once at startup
         // after every initial vnode is in place.
-        let hosted_shards: std::sync::Arc<std::collections::HashSet<ShardGroupId>> =
+        let hosted_shards: std::sync::Arc<HashSet<ShardGroupId>> =
             std::sync::Arc::new(self.hosted_shards().collect());
 
         // ── block.vote → ProtocolEvent::BlockVoteReceived ────────────

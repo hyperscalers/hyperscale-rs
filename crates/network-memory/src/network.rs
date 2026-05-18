@@ -142,6 +142,11 @@ struct ScheduledGossip {
     target_node: NodeIndex,
     message_type: &'static str,
     payload: Vec<u8>,
+    /// Shard the topic encoded for shard-scoped messages; `None` for
+    /// global-scoped messages. Threaded through to the typed handler so
+    /// cross-shard hosting can route the resulting `NodeInput` to the
+    /// right hosted shard.
+    shard: Option<ShardGroupId>,
 }
 
 // Only (delivery_time, sequence) matters for ordering/identity — `sequence` is a
@@ -926,12 +931,17 @@ impl SimulatedNetwork {
                         );
                     }
                     self.gossip_sequence += 1;
+                    let shard = match entry.target {
+                        BroadcastTarget::Shard(s) => Some(s),
+                        BroadcastTarget::Global => None,
+                    };
                     self.pending_gossip.push(Reverse(ScheduledGossip {
                         delivery_time: now + latency + extra,
                         sequence: self.gossip_sequence,
                         target_node: to,
                         message_type,
                         payload: payload.clone(),
+                        shard,
                     }));
                 }
             }
@@ -951,7 +961,7 @@ impl SimulatedNetwork {
                 .get(scheduled.target_node as usize)
                 .and_then(|r| r.get_gossip(scheduled.message_type))
             {
-                let _ = handler(scheduled.payload);
+                let _ = handler(scheduled.payload, scheduled.shard);
                 true
             } else {
                 debug!(
@@ -1591,10 +1601,11 @@ mod tests {
                 let handler = RecordingHandler::new();
                 let adapter = network.create_adapter(i);
                 let handler_clone = handler.clone();
-                let raw: Arc<RawGossipHandler> = Arc::new(move |payload: Vec<u8>| {
-                    handler_clone.received.lock().unwrap().push(payload);
-                    GossipVerdict::Accept
-                });
+                let raw: Arc<RawGossipHandler> =
+                    Arc::new(move |payload: Vec<u8>, _shard: Option<ShardGroupId>| {
+                        handler_clone.received.lock().unwrap().push(payload);
+                        GossipVerdict::Accept
+                    });
                 adapter.registry.register_raw_gossip(TEST_GOSSIP_TYPE, raw);
                 handler
             })
@@ -1904,10 +1915,11 @@ mod tests {
                 let handler = RecordingHandler::new();
                 let adapter = network.create_adapter(i);
                 let handler_clone = handler.clone();
-                let raw: Arc<RawGossipHandler> = Arc::new(move |payload: Vec<u8>| {
-                    handler_clone.received.lock().unwrap().push(payload);
-                    GossipVerdict::Accept
-                });
+                let raw: Arc<RawGossipHandler> =
+                    Arc::new(move |payload: Vec<u8>, _shard: Option<ShardGroupId>| {
+                        handler_clone.received.lock().unwrap().push(payload);
+                        GossipVerdict::Accept
+                    });
                 adapter
                     .registry
                     .register_raw_gossip("transaction.gossip", raw);

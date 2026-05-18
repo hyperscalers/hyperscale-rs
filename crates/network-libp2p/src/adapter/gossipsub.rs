@@ -187,11 +187,12 @@ pub(super) fn handle_gossipsub_event(
             // `VerdictGuard` ensures gossipsub gets exactly one verdict per
             // message even if `handler` panics or the task is cancelled.
             let vtx = validation_tx.clone();
+            let topic_shard = parsed.shard_id;
             spawn(async move {
                 let mut guard = VerdictGuard::new(message_id, propagation_source, vtx);
                 match decompress(&message.data) {
                     Ok(payload) => {
-                        let verdict = handler(payload);
+                        let verdict = handler(payload, topic_shard);
                         let acceptance = match verdict {
                             GossipVerdict::Accept => {
                                 record_network_message_received();

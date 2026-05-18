@@ -102,17 +102,28 @@ pub enum ResponseVerdict {
 /// Implementations typically convert the message into a `ProtocolEvent` and
 /// send it to the `IoLoop` via a captured channel sender.
 ///
+/// `shard` is the shard the topic encoded for [`TopicScope::Shard`]
+/// gossip and `None` for [`TopicScope::Global`] gossip; cross-shard
+/// hosting uses it to route the emitted `NodeInput` to the right
+/// hosted shard. Global handlers (e.g. `CommittedBlockHeaderGossip`)
+/// usually extract the relevant shard from the message body itself.
+///
 /// Returns [`GossipVerdict`] to indicate whether the message should be
 /// accepted (forwarded) or rejected (dropped with peer penalty).
 pub trait GossipHandler<M: NetworkMessage>: Send + Sync + 'static {
     /// Process a decoded gossip message; return whether to forward it.
-    fn on_message(&self, message: M) -> GossipVerdict;
+    fn on_message(&self, message: M, shard: Option<ShardGroupId>) -> GossipVerdict;
 }
 
-/// Blanket impl: any `Fn(M) -> GossipVerdict` can serve as a typed gossip handler.
-impl<M: NetworkMessage, F: Fn(M) -> GossipVerdict + Send + Sync + 'static> GossipHandler<M> for F {
-    fn on_message(&self, message: M) -> GossipVerdict {
-        (self)(message)
+/// Blanket impl: any `Fn(M, Option<ShardGroupId>) -> GossipVerdict` can serve
+/// as a typed gossip handler.
+impl<M, F> GossipHandler<M> for F
+where
+    M: NetworkMessage,
+    F: Fn(M, Option<ShardGroupId>) -> GossipVerdict + Send + Sync + 'static,
+{
+    fn on_message(&self, message: M, shard: Option<ShardGroupId>) -> GossipVerdict {
+        (self)(message, shard)
     }
 }
 
@@ -292,11 +303,11 @@ mod tests {
 
         let counter = Arc::new(AtomicUsize::new(0));
         let counter_clone = counter.clone();
-        let handler = move |_msg: TestMsg| -> GossipVerdict {
+        let handler = move |_msg: TestMsg, _shard: Option<ShardGroupId>| -> GossipVerdict {
             counter_clone.fetch_add(1, Ordering::SeqCst);
             GossipVerdict::Accept
         };
-        let verdict = handler.on_message(TestMsg(42));
+        let verdict = handler.on_message(TestMsg(42), None);
         assert_eq!(counter.load(Ordering::SeqCst), 1);
         assert_eq!(verdict, GossipVerdict::Accept);
     }

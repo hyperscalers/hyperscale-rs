@@ -593,8 +593,8 @@ where
 
         match event {
             // ── Transaction validation pipeline ────────────────────────
-            NodeInput::TransactionGossipReceived { tx } => {
-                self.handle_gossip_received_tx_for_validation(primary_shard, tx);
+            NodeInput::TransactionGossipReceived { local_shard, tx } => {
+                self.handle_gossip_received_tx_for_validation(local_shard, tx);
             }
             NodeInput::TransactionValidated { tx } => {
                 self.handle_transaction_validated(primary_shard, tx);
@@ -696,12 +696,13 @@ where
 
             // ── Committed header (gossip → BLS verify → state machine) ──
             NodeInput::CommittedBlockGossipReceived {
+                local_shard,
                 committed_header,
                 sender,
                 public_key,
                 sender_signature,
             } => self.handle_committed_block_gossip_received(
-                primary_shard,
+                local_shard,
                 committed_header,
                 sender,
                 public_key,

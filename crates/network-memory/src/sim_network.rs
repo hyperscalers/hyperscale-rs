@@ -160,7 +160,7 @@ impl Network for SimNetworkAdapter {
         // skips the publisher's own node (matching gossipsub's no-loop
         // semantics), so colocated vnodes would otherwise miss their
         // own host's broadcasts. Verdict ignored: we are the publisher.
-        let _ = self.registry.local_dispatch_gossip(message);
+        let _ = self.registry.local_dispatch_gossip(message, Some(shard));
         let data = compression::compress(
             &basic_encode(message).expect("SimNetworkAdapter: failed to encode message"),
         );
@@ -172,7 +172,7 @@ impl Network for SimNetworkAdapter {
     }
 
     fn broadcast_global<M: NetworkMessage + 'static>(&self, message: &M) {
-        let _ = self.registry.local_dispatch_gossip(message);
+        let _ = self.registry.local_dispatch_gossip(message, None);
         let data = compression::compress(
             &basic_encode(message).expect("SimNetworkAdapter: failed to encode message"),
         );

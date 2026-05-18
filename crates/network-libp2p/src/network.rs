@@ -138,11 +138,13 @@ impl Network for Libp2pNetwork {
     fn broadcast_to_shard<M: ShardMessage + 'static>(&self, shard: ShardGroupId, message: &M) {
         // Tee to in-process subscribers when we host a vnode in this
         // shard — gossipsub never loops the publication back to the
-        // publisher, so colocated vnodes would otherwise miss it.
+        // publisher, so colocated vnodes would otherwise miss it. The
+        // shard is supplied to the local dispatcher so the handler
+        // tags the resulting `NodeInput` with the right hosted shard.
         if self.local_shards.contains(&shard) {
             // Verdict only matters for forwarding decisions; we're the
             // publisher so peer-side gossipsub handles that.
-            let _ = self.registry.local_dispatch_gossip(message);
+            let _ = self.registry.local_dispatch_gossip(message, Some(shard));
         }
         let topic = Topic::shard(M::message_type_id(), shard);
         let data = compress(&basic_encode(message).expect("SBOR encode failed"));
@@ -154,7 +156,9 @@ impl Network for Libp2pNetwork {
     fn broadcast_global<M: NetworkMessage + 'static>(&self, message: &M) {
         // Every host subscribes to the global topic, so always tee
         // locally; handlers dedup or self-filter their own emissions.
-        let _ = self.registry.local_dispatch_gossip(message);
+        // Global-scoped publishes pass `None` as the shard — the
+        // handler extracts any relevant shard from the message body.
+        let _ = self.registry.local_dispatch_gossip(message, None);
         let topic = Topic::global(M::message_type_id());
         let data = compress(&basic_encode(message).expect("SBOR encode failed"));
         if let Err(e) = self.adapter.publish(&topic, data, M::class()) {

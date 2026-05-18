@@ -73,6 +73,10 @@ pub enum NodeInput {
     /// validation; the validated form is surfaced as
     /// `ProtocolEvent::TransactionValidated`.
     TransactionGossipReceived {
+        /// Hosted shard the gossip arrived on. Cross-shard hosting
+        /// keys mempool/validation pipeline state by this shard rather
+        /// than `vnodes[0].shard`.
+        local_shard: ShardGroupId,
         /// The transaction.
         tx: Arc<RoutableTransaction>,
     },
@@ -183,6 +187,10 @@ pub enum NodeInput {
     /// (sender committee check + public key resolution) but still needs
     /// batched BLS signature verification.
     CommittedBlockGossipReceived {
+        /// Hosted shard this gossip is consumed by — derived from the
+        /// receiving vnode's `local_shard`, not from the header's shard
+        /// (the header is from a remote shard).
+        local_shard: ShardGroupId,
         /// Header carried in the gossip envelope. `Arc`-shared so local
         /// publishers and the BLS-verify batch all hold the same
         /// allocation — `RemoteHeaderReceived` downstream takes
