@@ -45,7 +45,7 @@ where
         source_shard: ShardGroupId,
         target: BlockHeight,
     ) {
-        let outputs = self.shard_syncs_mut(local_shard).remote_header.handle(
+        let outputs = self.shard_io_mut(local_shard).syncs.remote_header.handle(
             RemoteHeaderSyncInput::StartSync {
                 scope: source_shard,
                 target,
@@ -113,7 +113,7 @@ where
             );
         }
 
-        let outputs = self.shard_syncs_mut(local_shard).remote_header.handle(
+        let outputs = self.shard_io_mut(local_shard).syncs.remote_header.handle(
             RemoteHeaderSyncInput::FetchSucceeded {
                 scope: source_shard,
                 from: from_height,
@@ -135,7 +135,7 @@ where
         count: HeaderFetchCount,
         kind: FetchFailureKind,
     ) {
-        let outputs = self.shard_syncs_mut(local_shard).remote_header.handle(
+        let outputs = self.shard_io_mut(local_shard).syncs.remote_header.handle(
             RemoteHeaderSyncInput::FetchFailed {
                 scope: source_shard,
                 from: from_height,

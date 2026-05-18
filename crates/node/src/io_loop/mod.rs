@@ -575,71 +575,19 @@ where
         &mut self.shard_group_mut(shard).vnodes[vnode_idx]
     }
 
-    /// Internal: shared `ShardIo` for `shard`. Call sites that touch
-    /// several fields of one shard prefer this over the per-field
-    /// helpers below.
-    pub(super) fn shard_io(&self, shard: ShardGroupId) -> &ShardIo<S> {
+    /// Shared `ShardIo` for `shard`. The single per-shard accessor;
+    /// fields like `storage`, `caches`, `fetches`, `syncs`, `block_commit`,
+    /// `pending_chain` are read directly off the returned reference.
+    pub fn shard_io(&self, shard: ShardGroupId) -> &ShardIo<S> {
         &self.shard_group(shard).io
     }
 
-    /// Internal: mutable `ShardIo` for `shard`.
+    /// Mutable `ShardIo` for `shard`. Use over multiple `_mut` calls
+    /// when the borrow needs to span field-level reads and mutations
+    /// (e.g. block-commit flush reading `&storage` while mutating
+    /// `&mut block_commit`).
     pub(super) fn shard_io_mut(&mut self, shard: ShardGroupId) -> &mut ShardIo<S> {
         &mut self.shard_group_mut(shard).io
-    }
-
-    /// Shard storage as `&Arc<S>` for sites that need to `Arc::clone`
-    /// it into off-thread handler closures (e.g. runners executing
-    /// genesis on per-shard storage).
-    pub fn shard_storage(&self, shard: ShardGroupId) -> &Arc<S> {
-        &self.shard_io(shard).storage
-    }
-
-    /// Internal: shard pending-chain handle. Used by JMT-snapshot
-    /// inserts and persistence prunes that need to mutate the pending
-    /// chain through its `Arc`-shared interior mutability.
-    pub(super) fn shard_pending_chain(&self, shard: ShardGroupId) -> &Arc<PendingChain<S>> {
-        &self.shard_io(shard).pending_chain
-    }
-
-    /// Internal: immutable view of the shard's block-commit pipeline.
-    pub(super) fn shard_block_commit(&self, shard: ShardGroupId) -> &BlockCommitCoordinator<S> {
-        &self.shard_io(shard).block_commit
-    }
-
-    /// Internal: mutable view of the shard's block-commit pipeline.
-    pub(super) fn shard_block_commit_mut(
-        &mut self,
-        shard: ShardGroupId,
-    ) -> &mut BlockCommitCoordinator<S> {
-        &mut self.shard_io_mut(shard).block_commit
-    }
-
-    /// Internal: shared inbound-serving caches for the shard.
-    pub(super) fn shard_caches(&self, shard: ShardGroupId) -> &SharedCaches {
-        &self.shard_io(shard).caches
-    }
-
-    /// Internal: per-payload fetch state machines for the shard.
-    pub(super) fn shard_fetches(&self, shard: ShardGroupId) -> &FetchHost {
-        &self.shard_io(shard).fetches
-    }
-
-    /// Internal: mutable view of the shard's fetch host. Required by
-    /// `FetchBinding::fetch_mut`, which routes inputs to the correct
-    /// per-payload state machine.
-    pub(super) fn shard_fetches_mut(&mut self, shard: ShardGroupId) -> &mut FetchHost {
-        &mut self.shard_io_mut(shard).fetches
-    }
-
-    /// Internal: sync state machines for the shard (block-sync,
-    /// remote-header sync).
-    pub(super) fn shard_syncs(&self, shard: ShardGroupId) -> &SyncHost {
-        &self.shard_io(shard).syncs
-    }
-
-    /// Internal: mutable view of the shard's sync state.
-    pub(super) fn shard_syncs_mut(&mut self, shard: ShardGroupId) -> &mut SyncHost {
-        &mut self.shard_io_mut(shard).syncs
     }
 
     /// Access the network.

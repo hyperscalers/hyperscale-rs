@@ -169,7 +169,8 @@ where
         // instance concern — keep it here.
         if let ProtocolEvent::FinalizedWavesAdmitted { waves } = &pe {
             for wave in waves {
-                self.shard_caches(shard)
+                self.shard_io(shard)
+                    .caches
                     .finalized_wave
                     .insert(wave.wave_id().clone(), Arc::clone(wave));
             }
@@ -179,7 +180,7 @@ where
         // advance per-shard `committed` and emit `SyncComplete` once the
         // chain catches up. Drives any newly-emitted range fetches inline.
         if let ProtocolEvent::RemoteHeaderAdmitted { committed_header } = &pe {
-            let outputs = self.shard_syncs_mut(shard).on_remote_header_admitted(
+            let outputs = self.shard_io_mut(shard).syncs.on_remote_header_admitted(
                 committed_header.shard_group_id(),
                 committed_header.header().height(),
             );
@@ -190,7 +191,7 @@ where
     }
 
     fn handle_restore_committed_state(&self, shard: ShardGroupId) {
-        let storage = self.shard_storage(shard);
+        let storage = &self.shard_io(shard).storage;
         let height = storage.committed_height();
         let hash = storage.committed_hash();
         let qc = storage.latest_qc();
@@ -234,7 +235,8 @@ where
             }
             record_transaction_finalized(latency_secs, cross_shard);
         }
-        self.shard_caches(shard)
+        self.shard_io(shard)
+            .caches
             .tx_status
             .insert(tx_hash, status.clone());
         self.emitted_statuses.push((tx_hash, status));
@@ -289,7 +291,7 @@ where
         // prepared commit orphaned in the cache, and the next block to
         // reach flush trips the strict ordering assert in
         // `commit_block_inner` because its parent was never applied.
-        if height <= self.shard_block_commit(shard).persisted_height() {
+        if height <= self.shard_io(shard).block_commit.persisted_height() {
             return;
         }
 
@@ -297,7 +299,7 @@ where
         // (VerifyStateRoot/ExecuteTransactions), reuse it — recomputing JMT
         // here can produce a transient root mismatch and trip the
         // byzantine-detection assert below on a self-inflicted race.
-        if self.shard_block_commit(shard).has_prepared(&block_hash) {
+        if self.shard_io(shard).block_commit.has_prepared(&block_hash) {
             debug!(
                 height = height.inner(),
                 ?block_hash,
@@ -307,7 +309,8 @@ where
             // Build view anchored at parent — includes prior synced blocks'
             // JMT snapshots so chained verification can find parent nodes.
             let view = self
-                .shard_pending_chain(shard)
+                .shard_io(shard)
+                .pending_chain
                 .view_at(block.header().parent_block_hash());
             let pending_snapshots = view.pending_snapshots().to_vec();
 
@@ -364,7 +367,7 @@ where
                 .iter()
                 .flat_map(|fw| fw.consensus_receipts())
                 .collect();
-            self.shard_pending_chain(shard).insert(
+            self.shard_io(shard).pending_chain.insert(
                 block_hash,
                 ChainEntry {
                     parent_block_hash: block.header().parent_block_hash(),
@@ -374,7 +377,8 @@ where
                 },
             );
 
-            self.shard_block_commit_mut(shard)
+            self.shard_io_mut(shard)
+                .block_commit
                 .insert_prepared(block_hash, height, prepared);
 
             debug!(
@@ -407,13 +411,17 @@ where
     /// [`BlockCommitCoordinator`]: crate::shard::block_commit::BlockCommitCoordinator
     fn accept_block_commit(&mut self, shard: ShardGroupId, commit: PendingCommit) {
         let now = self.now();
-        let decision = self.shard_block_commit_mut(shard).accumulate(commit, now);
+        let decision = self
+            .shard_io_mut(shard)
+            .block_commit
+            .accumulate(commit, now);
         match decision {
             AccumulateDecision::Skip => {}
             AccumulateDecision::Accepted { height, notify_now } => {
                 debug!(height = height.inner(), "Block committed");
                 let outputs = self
-                    .shard_syncs_mut(shard)
+                    .shard_io_mut(shard)
+                    .syncs
                     .block
                     .handle(BlockSyncInput::Admitted { scope: (), height });
                 self.process_block_sync_outputs(shard, outputs);
@@ -429,13 +437,10 @@ where
     }
 
     pub(super) fn flush_block_commits(&mut self, shard: ShardGroupId) {
-        // Clone shared handles before the `&mut self` reborrow for
-        // `shard_block_commit_mut(shard)`. Dispatch is `Arc`-backed; cheap.
-        let storage = Arc::clone(self.shard_storage(shard));
         let event_sender = self.event_sender.clone();
         let dispatch = self.dispatch.clone();
-        self.shard_block_commit_mut(shard)
-            .flush(&storage, &event_sender, &dispatch);
+        let io = self.shard_io_mut(shard);
+        io.block_commit.flush(&io.storage, &event_sender, &dispatch);
     }
 
     /// Dispatch a typed fetch request to the corresponding binding.

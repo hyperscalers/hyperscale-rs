@@ -91,7 +91,7 @@ where
         // representative. A freshly-added vnode with an empty tombstone set
         // would re-enqueue tombstoned txs; ShardIo-level tombstones are the
         // right home for this and are a follow-up.
-        if !self.shard_caches(shard).tx_store.contains(&tx_hash)
+        if !self.shard_io(shard).caches.tx_store.contains(&tx_hash)
             && !self.vnode(shard, 0).state.mempool().is_tombstoned(&tx_hash)
         {
             self.shard_io_mut(shard).pending_validation.insert(tx_hash);
@@ -141,7 +141,7 @@ where
                 .shard_io_mut(shard)
                 .pending_validation
                 .contains(&tx_hash)
-                && !self.shard_caches(shard).tx_store.contains(&tx_hash)
+                && !self.shard_io(shard).caches.tx_store.contains(&tx_hash)
             {
                 // Paired with validation: only queued txs are removed on completion.
                 self.shard_io_mut(shard).locally_submitted.insert(tx_hash);

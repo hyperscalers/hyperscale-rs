@@ -106,8 +106,8 @@ where
         for shard in self.hosted_shards() {
             // ── block.request → sync protocol ────────────────────────────
 
-            let storage = Arc::clone(self.shard_storage(shard));
-            let provision_store = Arc::clone(&self.shard_caches(shard).provision_store);
+            let storage = Arc::clone(&self.shard_io(shard).storage);
+            let provision_store = Arc::clone(&self.shard_io(shard).caches.provision_store);
             self.network
                 .register_request_handler::<GetBlockRequest>(shard, move |req| {
                     serve_block_request(&*storage, &provision_store, &req)
@@ -115,8 +115,8 @@ where
 
             // ── transaction.request → fetch protocol ─────────────────────
 
-            let storage = Arc::clone(self.shard_storage(shard));
-            let tx_store = Arc::clone(&self.shard_caches(shard).tx_store);
+            let storage = Arc::clone(&self.shard_io(shard).storage);
+            let tx_store = Arc::clone(&self.shard_io(shard).caches.tx_store);
             self.network
                 .register_request_handler::<GetTransactionsRequest>(shard, move |req| {
                     serve_transaction_request(&*storage, &tx_store, &req)
@@ -130,9 +130,9 @@ where
             // and under load 40+ redundant generations per height cause CPU
             // thrashing.
 
-            let storage = Arc::clone(self.shard_storage(shard));
+            let storage = Arc::clone(&self.shard_io(shard).storage);
             let topology = self.topology_snapshot.clone();
-            let outbound_cache = Arc::clone(&self.shard_caches(shard).provision_store);
+            let outbound_cache = Arc::clone(&self.shard_io(shard).caches.provision_store);
 
             let dedup: Arc<std::sync::Mutex<ProvisionsRequestDedup>> =
                 Arc::new(std::sync::Mutex::new(ProvisionsRequestDedup {
@@ -270,7 +270,7 @@ where
 
             // ── local_provision.request → provision cache lookup ─────────
 
-            let provision_store = Arc::clone(&self.shard_caches(shard).provision_store);
+            let provision_store = Arc::clone(&self.shard_io(shard).caches.provision_store);
             self.network
                 .register_request_handler::<GetLocalProvisionsRequest>(
                     shard,
@@ -288,8 +288,8 @@ where
 
             // ── finalized_wave.request → cache lookup + storage fallback ─────
 
-            let fw_cache = Arc::clone(&self.shard_caches(shard).finalized_wave);
-            let fw_storage = Arc::clone(self.shard_storage(shard));
+            let fw_cache = Arc::clone(&self.shard_io(shard).caches.finalized_wave);
+            let fw_storage = Arc::clone(&self.shard_io(shard).storage);
             self.network
                 .register_request_handler::<GetFinalizedWavesRequest>(
                     shard,
@@ -326,8 +326,8 @@ where
 
             // ── execution_cert.request → cert store lookup ────────────────
 
-            let exec_cert_store = Arc::clone(&self.shard_caches(shard).exec_cert_store);
-            let storage = Arc::clone(self.shard_storage(shard));
+            let exec_cert_store = Arc::clone(&self.shard_io(shard).caches.exec_cert_store);
+            let storage = Arc::clone(&self.shard_io(shard).storage);
             self.network
                 .register_request_handler::<GetExecutionCertsRequest>(
                     shard,
@@ -365,7 +365,7 @@ where
 
             // ── remote_header.request → range header sync ───────────────────
 
-            let storage = Arc::clone(self.shard_storage(shard));
+            let storage = Arc::clone(&self.shard_io(shard).storage);
             self.network
                 .register_request_handler::<GetRemoteHeadersRequest>(shard, move |req| {
                     serve_remote_headers_request(&*storage, shard, &req)

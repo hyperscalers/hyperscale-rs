@@ -65,7 +65,7 @@ where
         S: GenesisCommit,
     {
         let merged = prepared_genesis(self.executor.network(), config);
-        self.shard_storage(shard).install_genesis(&merged)
+        self.shard_io(shard).storage.install_genesis(&merged)
     }
 
     /// Register inbound network handlers (requests, gossip, notifications).

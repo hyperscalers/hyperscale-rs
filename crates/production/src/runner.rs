@@ -705,7 +705,7 @@ impl ProductionRunner {
         // is shared, so a single `take()` is fine.
         let mut shared_genesis_config: Option<GenesisConfig> = self.genesis_config.take();
         for shard in local_shards {
-            let height = io_loop.shard_storage(shard).committed_height();
+            let height = io_loop.shard_io(shard).storage.committed_height();
             if height > BlockHeight::GENESIS {
                 info!(
                     shard = ?shard,

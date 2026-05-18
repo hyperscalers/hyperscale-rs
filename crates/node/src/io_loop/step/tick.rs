@@ -31,10 +31,10 @@ where
         let now = std::time::Instant::now();
         let hosted: Vec<ShardGroupId> = self.hosted_shards().collect();
         for shard in hosted {
-            let outputs = self.shard_syncs_mut(shard).block_tick(now);
+            let outputs = self.shard_io_mut(shard).syncs.block_tick(now);
             self.process_block_sync_outputs(shard, outputs);
 
-            let outputs = self.shard_syncs_mut(shard).remote_header_tick(now);
+            let outputs = self.shard_io_mut(shard).syncs.remote_header_tick(now);
             self.process_remote_header_sync_outputs(shard, outputs);
 
             self.drive_fetch::<TransactionBinding>(shard, FetchInput::Tick);

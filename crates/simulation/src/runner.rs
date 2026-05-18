@@ -392,7 +392,7 @@ impl SimulationRunner {
     pub fn node_storage(&self, node: NodeIndex) -> Option<&SimStorage> {
         let io_loop = self.io_loops.get(node as usize)?;
         let shard = io_loop.hosted_shards().next()?;
-        Some(io_loop.shard_storage(shard))
+        Some(&io_loop.shard_io(shard).storage)
     }
 
     /// Get the last emitted transaction status for a node.
@@ -464,7 +464,7 @@ impl SimulationRunner {
             let Some(shard) = nl.hosted_shards().next() else {
                 return 0;
             };
-            let s = nl.shard_storage(shard);
+            let s = &nl.shard_io(shard).storage;
             let committed = s.committed_height();
             if committed == BlockHeight::GENESIS {
                 usize::from(s.get_block(BlockHeight::GENESIS).is_some())
@@ -480,7 +480,7 @@ impl SimulationRunner {
         self.io_loops.get(node as usize).is_some_and(|nl| {
             nl.hosted_shards()
                 .next()
-                .is_some_and(|shard| nl.shard_storage(shard).get_block(height).is_some())
+                .is_some_and(|shard| nl.shard_io(shard).storage.get_block(height).is_some())
         })
     }
 
@@ -618,7 +618,7 @@ impl SimulationRunner {
             let first_host = *hosts_for_shard
                 .first()
                 .expect("every shard must have at least one host");
-            let first_node_storage = self.io_loops[first_host as usize].shard_storage(shard);
+            let first_node_storage = &self.io_loops[first_host as usize].shard_io(shard).storage;
             let genesis_jmt_root = first_node_storage.state_root();
 
             info!(

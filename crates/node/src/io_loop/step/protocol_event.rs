@@ -31,9 +31,9 @@ where
         shard: ShardGroupId,
         height: BlockHeight,
     ) {
-        self.shard_block_commit_mut(shard).mark_persisted(height);
+        self.shard_io_mut(shard).block_commit.mark_persisted(height);
         // Drop pending state for blocks now persisted to RocksDB.
-        self.shard_pending_chain(shard).prune(height);
+        self.shard_io(shard).pending_chain.prune(height);
         self.dispatch_event(shard, ProtocolEvent::BlockPersisted { height });
     }
 

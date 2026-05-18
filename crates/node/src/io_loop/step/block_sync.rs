@@ -71,7 +71,8 @@ where
         target: BlockHeight,
     ) {
         let outputs = self
-            .shard_syncs_mut(shard)
+            .shard_io_mut(shard)
+            .syncs
             .block
             .handle(BlockSyncInput::StartSync { scope: (), target });
         self.process_block_sync_outputs(shard, outputs);
@@ -108,7 +109,8 @@ where
                     RehydrateError::QcMismatch { .. } => "qc_hash_mismatch",
                 };
                 record_sync_response_error("block", reason);
-                self.shard_syncs_mut(shard)
+                self.shard_io_mut(shard)
+                    .syncs
                     .block
                     .mark_force_full_refetch(height);
                 // Rehydration is a local-data issue resolved by force-full
@@ -214,8 +216,13 @@ where
     ) {
         use hyperscale_types::network::request::GetBlockRequest;
 
-        let target_height = self.shard_syncs(shard).block.target(&()).unwrap_or(height);
-        let force_full = self.shard_syncs(shard).block.force_full(height);
+        let target_height = self
+            .shard_io(shard)
+            .syncs
+            .block
+            .target(&())
+            .unwrap_or(height);
+        let force_full = self.shard_io(shard).syncs.block.force_full(height);
 
         // Heights flagged `force_full` were rehydration misses last time —
         // request with empty inventory so the responder cannot elide bodies.
@@ -263,7 +270,7 @@ where
     /// already has. Every read is scoped to `shard`'s `SharedCaches`,
     /// so cross-shard hosting picks the right view automatically.
     fn build_sync_inventory(&self, shard: ShardGroupId) -> Inventory {
-        let caches = self.shard_caches(shard);
+        let caches = &self.shard_io(shard).caches;
         Inventory {
             tx_have: caches.tx_store.tx_bloom_snapshot(),
             cert_have: caches.finalized_wave_store.cert_bloom_snapshot(),
@@ -279,7 +286,7 @@ where
         shard: ShardGroupId,
         elided: &ElidedCertifiedBlock,
     ) -> Result<CertifiedBlock, RehydrateError> {
-        let caches = self.shard_caches(shard);
+        let caches = &self.shard_io(shard).caches;
         elided.try_rehydrate(
             |h| caches.tx_store.get(h),
             |id| caches.finalized_wave_store.get(id),
@@ -302,7 +309,8 @@ where
         let certified = Arc::new(certified);
         self.dispatch_event(shard, ProtocolEvent::BlockSyncReadyToApply { certified });
         let outputs = self
-            .shard_syncs_mut(shard)
+            .shard_io_mut(shard)
+            .syncs
             .block
             .handle(BlockSyncInput::FetchSucceeded {
                 scope: (),
@@ -324,7 +332,8 @@ where
     ) {
         record_sync_round_retried("block");
         let outputs = self
-            .shard_syncs_mut(shard)
+            .shard_io_mut(shard)
+            .syncs
             .block
             .handle(BlockSyncInput::FetchFailed {
                 scope: (),

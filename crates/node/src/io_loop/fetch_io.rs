@@ -101,7 +101,7 @@ where
                 "Dispatching fetch request"
             );
         }
-        let outputs = B::fetch_mut(self.shard_fetches_mut(local_shard)).handle(input);
+        let outputs = B::fetch_mut(&mut self.shard_io_mut(local_shard).fetches).handle(input);
         self.process_fetch_outputs::<B>(local_shard, outputs);
     }
 
