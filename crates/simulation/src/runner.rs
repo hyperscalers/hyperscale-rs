@@ -636,7 +636,7 @@ impl SimulationRunner {
 
             for host_index in &hosts_for_shard {
                 let i = *host_index as usize;
-                self.io_loops[i].initialize_all_vnodes_genesis(&genesis_block);
+                self.io_loops[i].initialize_shard_genesis(&genesis_block);
                 self.io_loops[i].flush_all_batches();
 
                 // Drain outputs from genesis initialization (timer sets, etc.)

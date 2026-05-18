@@ -4,9 +4,9 @@
 //! These methods run at well-defined points in the host's life, not
 //! on every event. The run-loop methods live in [`super`].
 //!
-//! - [`IoLoop::initialize_all_vnodes_genesis`] feeds the supplied
-//!   genesis block into every vnode of its shard and drains the
-//!   resulting actions via the common [`IoLoop::drain_actions`] path.
+//! - [`IoLoop::initialize_shard_genesis`] feeds the supplied genesis
+//!   block into every vnode of its shard and drains the resulting
+//!   actions via the common [`IoLoop::drain_actions`] path.
 //! - [`IoLoop::install_engine_genesis`] commits the genesis substates +
 //!   computes the genesis state root. Only runs on a fresh node.
 //! - [`IoLoop::register_inbound_handlers`] wires the request / gossip /
@@ -29,14 +29,12 @@ where
     D: Dispatch,
     E: Engine,
 {
-    /// Initialize every hosted vnode's state machine with `genesis_block`
-    /// and dispatch the resulting actions per-vnode.
-    ///
-    /// Callers hosting vnodes across multiple shards drive this once per
-    /// shard with the shard-appropriate genesis block; this method
-    /// initializes the vnodes in `genesis_block`'s shard, leaving the
-    /// others untouched.
-    pub fn initialize_all_vnodes_genesis(&mut self, genesis_block: &Block) {
+    /// Initialize every vnode in `genesis_block`'s shard with the
+    /// supplied genesis block, dispatching the resulting actions
+    /// per-vnode. Vnodes in other hosted shards are untouched —
+    /// cross-shard hosts call this once per shard with that shard's
+    /// genesis block.
+    pub fn initialize_shard_genesis(&mut self, genesis_block: &Block) {
         let shard = genesis_block.header().shard_group_id();
         let count = self.vnodes_len(shard);
         for vnode_idx in 0..count {

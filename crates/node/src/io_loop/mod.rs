@@ -883,7 +883,7 @@ where
     /// to forget when copy-pasting the loop inline).
     ///
     /// Called by [`Self::dispatch_event`] after `state.handle()`, by
-    /// [`Self::initialize_all_vnodes_genesis`] for genesis init, and
+    /// [`Self::initialize_shard_genesis`] for genesis init, and
     /// by the sync-output dispatch helpers.
     pub(super) fn drain_actions(
         &mut self,

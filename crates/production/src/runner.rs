@@ -700,9 +700,9 @@ impl ProductionRunner {
         let local_shards: Vec<ShardGroupId> = io_loop.hosted_shards().collect();
         let topology = Arc::clone(&self.topology_snapshot);
         // Shared genesis config across hosted shards. Real multi-shard
-        // deployments will likely want per-shard genesis; that's a Phase
-        // 2c follow-up. The current `GenesisConfig::production` default
-        // is shared, so a single `take()` is fine.
+        // deployments will likely want per-shard genesis configs; the
+        // current `GenesisConfig::production` default is shared, so a
+        // single `take()` is fine.
         let mut shared_genesis_config: Option<GenesisConfig> = self.genesis_config.take();
         for shard in local_shards {
             let height = io_loop.shard_io(shard).storage.committed_height();
@@ -748,7 +748,7 @@ impl ProductionRunner {
                 "Created genesis block"
             );
 
-            io_loop.initialize_all_vnodes_genesis(&genesis_block);
+            io_loop.initialize_shard_genesis(&genesis_block);
             io_loop.flush_all_batches();
 
             let genesis_output = io_loop.drain_pending_output();
