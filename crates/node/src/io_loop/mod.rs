@@ -310,12 +310,24 @@ where
     /// are dropped on terminal status.
     tx_phase_times: TxPhaseTimesCache,
 
-    /// Process-scoped timer operations buffered for the runner. Used by
-    /// timers whose lifetime is the host's, not a specific vnode's — chiefly
-    /// `TimerId::FetchTick`, which fires once globally and fans out across
-    /// every hosted shard's fetch/sync state. Drained alongside the per-vnode
-    /// buffers in [`Self::drain_pending_output`].
+    /// Per-step scratch: timer set/cancel operations emitted during the
+    /// step. Both shard-scoped timers (`ViewChange`, `Cleanup` — pushed
+    /// from `Action::SetTimer` / `CancelTimer` arms) and process-scoped
+    /// timers (`FetchTick` — pushed from the fetch tick refresh) land
+    /// here. Cleared at the top of [`Self::step`]; drained into the
+    /// returned [`StepOutput`] for the runner to translate into actual
+    /// timer-driver calls.
     pending_timer_ops: Vec<TimerOp>,
+
+    /// Per-step scratch: `(tx_hash, status)` pairs emitted via
+    /// `Action::EmitTransactionStatus`. Drained into [`StepOutput`] for
+    /// the runner to forward to RPC subscribers.
+    emitted_statuses: Vec<(TxHash, TransactionStatus)>,
+
+    /// Per-step scratch: count of actions produced by every vnode's
+    /// state machine during the step. Drained into [`StepOutput`] for
+    /// the runner's metrics; reset at the top of [`Self::step`].
+    actions_generated: usize,
 
     /// Size cap for new tx-gossip accumulators. Consulted lazily by
     /// `enqueue_tx_for_gossip` when it inserts a new per-destination-shard
@@ -429,9 +441,6 @@ where
                     validator_id: init.state.topology().local_validator_id(),
                     state: init.state,
                     signing_key: init.signing_key,
-                    emitted_statuses: Vec::new(),
-                    actions_generated: 0,
-                    pending_timer_ops: Vec::new(),
                 })
                 .collect();
             shards.insert(
@@ -478,6 +487,8 @@ where
             last_slow_tx_warn: LocalTimestamp::ZERO,
             tx_phase_times: TxPhaseTimesCache::default(),
             pending_timer_ops: Vec::new(),
+            emitted_statuses: Vec::new(),
+            actions_generated: 0,
             tx_gossip_max: b.tx_gossip_max,
             tx_gossip_window: b.tx_gossip_window,
             now: LocalTimestamp::ZERO,
@@ -489,7 +500,7 @@ where
     /// Set the cached process-wide wall-clock time.
     ///
     /// Must be called before `step()`. The value is pushed into a
-    /// vnode's state machine just-in-time in [`Self::feed_event`] so
+    /// vnode's state machine just-in-time in [`Self::dispatch_event`] so
     /// each `state.handle()` observes the latest tick without paying
     /// for V identical writes per runner iteration.
     pub const fn set_time(&mut self, now: LocalTimestamp) {
@@ -686,14 +697,9 @@ where
     /// `shard` is `None` — this is a wiring bug, not a runtime input.
     #[allow(clippy::too_many_lines)] // single dispatch over NodeInput; one arm per event variant
     pub fn step(&mut self, event: ShardEvent) -> StepOutput {
-        for group in self.shards.values_mut() {
-            for vnode in &mut group.vnodes {
-                vnode.emitted_statuses.clear();
-                vnode.actions_generated = 0;
-                vnode.pending_timer_ops.clear();
-            }
-        }
         self.pending_timer_ops.clear();
+        self.emitted_statuses.clear();
+        self.actions_generated = 0;
 
         let ShardEvent { shard, input } = event;
         // Shard-scoped variants reach for the envelope shard; process-scoped
@@ -860,79 +866,65 @@ where
         self.drain_pending_output()
     }
 
-    /// Drain accumulated outputs (statuses, timer ops) across every
-    /// vnode without processing an event.
+    /// Drain accumulated step outputs (statuses, timer ops, action
+    /// count) without processing an event.
     ///
-    /// Used after `handle_actions()` to collect outputs produced by
-    /// those actions.
+    /// Used after [`Self::drain_actions`] to collect outputs produced
+    /// by directly-dispatched action vecs (genesis init, sync-output
+    /// continuations).
     pub fn drain_pending_output(&mut self) -> StepOutput {
-        let mut emitted_statuses = Vec::new();
-        let mut timer_ops = std::mem::take(&mut self.pending_timer_ops);
-        let mut actions_generated = 0usize;
-        for group in self.shards.values_mut() {
-            for vnode in &mut group.vnodes {
-                emitted_statuses.append(&mut vnode.emitted_statuses);
-                timer_ops.append(&mut vnode.pending_timer_ops);
-                actions_generated += vnode.actions_generated;
-            }
-        }
         StepOutput {
-            emitted_statuses,
-            actions_generated,
-            timer_ops,
+            emitted_statuses: std::mem::take(&mut self.emitted_statuses),
+            actions_generated: std::mem::replace(&mut self.actions_generated, 0),
+            timer_ops: std::mem::take(&mut self.pending_timer_ops),
         }
-    }
-
-    /// Feed a protocol event to the named vnode's state machine and
-    /// process all resulting actions.
-    ///
-    /// This is the common pattern used throughout `IoLoop`: route an
-    /// event through a state machine, then dispatch each resulting
-    /// action with the originating vnode's signing context. The
-    /// vnode's clock is synced with the `IoLoop`'s cached `now` here so
-    /// `set_time` itself can stay O(1).
-    fn feed_event(&mut self, shard: ShardGroupId, vnode_idx: usize, event: ProtocolEvent) {
-        let now = self.now;
-        let state = &mut self.vnode_mut(shard, vnode_idx).state;
-        state.set_time(now);
-        let actions = state.handle(event);
-        self.process_actions(shard, vnode_idx, actions);
     }
 
     /// Fan a shard-scoped protocol event out to every hosted vnode in
-    /// `shard`'s state machine.
+    /// `shard` and dispatch each vnode's resulting actions.
     ///
-    /// Use this for events that mean "something happened in shard S"
-    /// (block persisted, sync block validated, remote header received,
-    /// etc.) — every same-shard vnode independently applies the event
-    /// and produces its own signed actions. No-op when `shard` isn't
-    /// hosted. Per-vnode events (where only the emitting vnode should
-    /// react) should call [`Self::feed_event`] directly with the
-    /// originating index.
-    fn feed_event_to_shard_vnodes(&mut self, shard: ShardGroupId, event: ProtocolEvent) {
-        let Some(group) = self.shards.get(&shard) else {
-            return;
-        };
-        let count = group.vnodes.len();
+    /// Every same-shard vnode independently applies the event and
+    /// produces its own signed actions, with `IoLoop`'s cached `now`
+    /// pushed into the state machine just-in-time. No-op when `shard`
+    /// isn't hosted.
+    pub(super) fn dispatch_event(&mut self, shard: ShardGroupId, event: ProtocolEvent) {
+        let count = self.shards.get(&shard).map_or(0, |g| g.vnodes.len());
         if count == 0 {
             return;
         }
+        let now = self.now;
         // Clone for every recipient except the last; move into the last
         // so we don't pay a final clone whose result is immediately
         // dropped.
         for vnode_idx in 0..count - 1 {
-            self.feed_event(shard, vnode_idx, event.clone());
+            let ev = event.clone();
+            let state = &mut self.vnode_mut(shard, vnode_idx).state;
+            state.set_time(now);
+            let actions = state.handle(ev);
+            self.drain_actions(shard, vnode_idx, actions);
         }
-        self.feed_event(shard, count - 1, event);
+        let state = &mut self.vnode_mut(shard, count - 1).state;
+        state.set_time(now);
+        let actions = state.handle(event);
+        self.drain_actions(shard, count - 1, actions);
     }
 
-    /// Dispatch a `Vec<Action>` produced by a direct state-machine
-    /// method call. Mirrors [`Self::feed_event`]'s post-`handle` block
-    /// — bumps `actions_generated`, dispatches each action, and
-    /// flushes pending block commits. The flush is the load-bearing
-    /// part: it's easy to forget when copy-pasting the loop inline.
-    fn process_actions(&mut self, shard: ShardGroupId, vnode_idx: usize, actions: Vec<Action>) {
-        self.vnode_mut(shard, vnode_idx).actions_generated += actions.len();
+    /// Dispatch a `Vec<Action>` produced by a vnode's state machine.
+    /// Bumps the step's action counter, processes each action with the
+    /// emitting vnode's signing context, and flushes pending block
+    /// commits at the tail (the flush is the load-bearing part — easy
+    /// to forget when copy-pasting the loop inline).
+    ///
+    /// Called by [`Self::dispatch_event`] after `state.handle()`, by
+    /// [`Self::initialize_all_vnodes_genesis`] for genesis init, and
+    /// by the sync-output dispatch helpers.
+    pub(super) fn drain_actions(
+        &mut self,
+        shard: ShardGroupId,
+        vnode_idx: usize,
+        actions: Vec<Action>,
+    ) {
+        self.actions_generated += actions.len();
         for action in actions {
             self.process_action(shard, vnode_idx, action);
         }

@@ -1,7 +1,7 @@
 //! Protocol-event passthrough step handlers.
 //!
 //! `NodeInput::Protocol(_)` is the channel for state-machine events that
-//! re-enter `IoLoop` via `feed_event` (continuation-style). Most are pure
+//! re-enter `IoLoop` via `dispatch_event` (continuation-style). Most are pure
 //! passthrough — feed the variant straight into the state machine. The
 //! one exception is `BlockPersisted`, which carries IoLoop-side commit
 //! pipeline state (`block_commit`, `pending_chain`) that needs updating
@@ -34,7 +34,7 @@ where
         self.shard_block_commit_mut(shard).mark_persisted(height);
         // Drop pending state for blocks now persisted to RocksDB.
         self.shard_pending_chain(shard).prune(height);
-        self.feed_event_to_shard_vnodes(shard, ProtocolEvent::BlockPersisted { height });
+        self.dispatch_event(shard, ProtocolEvent::BlockPersisted { height });
     }
 
     /// Default `Protocol(_)` passthrough — fan the event across fetch-binding
@@ -46,6 +46,6 @@ where
         event: ProtocolEvent,
     ) {
         self.drive_fetch_admission(shard, &event);
-        self.feed_event_to_shard_vnodes(shard, event);
+        self.dispatch_event(shard, event);
     }
 }

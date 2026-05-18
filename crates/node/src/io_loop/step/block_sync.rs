@@ -198,10 +198,7 @@ where
                         height = height.inner(),
                         "Sync protocol complete, resuming consensus"
                     );
-                    self.feed_event_to_shard_vnodes(
-                        shard,
-                        ProtocolEvent::BlockSyncComplete { height },
-                    );
+                    self.dispatch_event(shard, ProtocolEvent::BlockSyncComplete { height });
                 }
             }
         }
@@ -303,7 +300,7 @@ where
 
         // Hand the block off to BFT; tell the FSM the height was delivered.
         let certified = Arc::new(certified);
-        self.feed_event_to_shard_vnodes(shard, ProtocolEvent::BlockSyncReadyToApply { certified });
+        self.dispatch_event(shard, ProtocolEvent::BlockSyncReadyToApply { certified });
         let outputs = self
             .shard_syncs_mut(shard)
             .block
