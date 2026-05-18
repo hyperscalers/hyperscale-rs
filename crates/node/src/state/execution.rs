@@ -103,7 +103,7 @@ mod tests {
     use hyperscale_core::{Action, ProtocolEvent, StateMachine};
     use hyperscale_types::{
         BlockHeight, Bls12381G2Signature, ExecutionCertificate, ExecutionOutcome,
-        GlobalReceiptRoot, ShardGroupId, SignerBitfield, TxHash, TxOutcome, WaveId,
+        GlobalReceiptRoot, LocalTimestamp, ShardGroupId, SignerBitfield, TxHash, TxOutcome, WaveId,
         WeightedTimestamp,
     };
 
@@ -146,7 +146,10 @@ mod tests {
             vec![TxOutcome::new(TxHash::ZERO, ExecutionOutcome::Failed)],
         );
 
-        let actions = node.handle(ProtocolEvent::ExecutionCertificateAdmitted { certificate: ec });
+        let actions = node.handle(
+            LocalTimestamp::ZERO,
+            ProtocolEvent::ExecutionCertificateAdmitted { certificate: ec },
+        );
 
         let cont = extract_one!(
             actions,
@@ -178,7 +181,10 @@ mod tests {
             vec![],
         );
 
-        let actions = node.handle(ProtocolEvent::ExecutionCertificateAdmitted { certificate: ec });
+        let actions = node.handle(
+            LocalTimestamp::ZERO,
+            ProtocolEvent::ExecutionCertificateAdmitted { certificate: ec },
+        );
 
         assert_no_emit!(
             actions,
@@ -203,7 +209,10 @@ mod tests {
             vec![],
         );
 
-        let actions = node.handle(ProtocolEvent::ExecutionCertificateAdmitted { certificate: ec });
+        let actions = node.handle(
+            LocalTimestamp::ZERO,
+            ProtocolEvent::ExecutionCertificateAdmitted { certificate: ec },
+        );
 
         assert_no_emit!(
             actions,

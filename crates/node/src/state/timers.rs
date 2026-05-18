@@ -60,6 +60,7 @@ impl NodeStateMachine {
 #[cfg(test)]
 mod tests {
     use hyperscale_core::{Action, ProtocolEvent, StateMachine, TimerId};
+    use hyperscale_types::LocalTimestamp;
 
     use super::super::test_support::TestNode;
     use crate::assert_emits;
@@ -71,7 +72,7 @@ mod tests {
     fn cleanup_timer_reschedules_itself() {
         let TestNode { mut node, .. } = TestNode::new();
 
-        let actions = node.handle(ProtocolEvent::CleanupTimer);
+        let actions = node.handle(LocalTimestamp::ZERO, ProtocolEvent::CleanupTimer);
 
         assert!(
             matches!(
@@ -94,7 +95,7 @@ mod tests {
         let TestNode { mut node, .. } = TestNode::new();
         let expected = node.bft.remaining_view_change_timeout();
 
-        let actions = node.handle(ProtocolEvent::ViewChangeTimer);
+        let actions = node.handle(LocalTimestamp::ZERO, ProtocolEvent::ViewChangeTimer);
 
         assert_eq!(
             actions.len(),

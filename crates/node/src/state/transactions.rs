@@ -78,6 +78,7 @@ mod tests {
     use std::sync::Arc;
 
     use hyperscale_core::{ProtocolEvent, StateMachine};
+    use hyperscale_types::LocalTimestamp;
     use hyperscale_types::test_utils::{test_transaction, test_transaction_with_nodes};
 
     use super::super::test_support::TestNode;
@@ -96,10 +97,13 @@ mod tests {
             /* write_nodes */ vec![],
         ));
 
-        let actions = node.handle(ProtocolEvent::TransactionValidated {
-            tx,
-            submitted_locally: false,
-        });
+        let actions = node.handle(
+            LocalTimestamp::ZERO,
+            ProtocolEvent::TransactionValidated {
+                tx,
+                submitted_locally: false,
+            },
+        );
 
         assert!(actions.is_empty());
         assert_eq!(
@@ -117,10 +121,13 @@ mod tests {
         let TestNode { mut node, .. } = TestNode::new();
         let tx = Arc::new(test_transaction(/* seed */ 1));
 
-        let _ = node.handle(ProtocolEvent::TransactionValidated {
-            tx,
-            submitted_locally: true,
-        });
+        let _ = node.handle(
+            LocalTimestamp::ZERO,
+            ProtocolEvent::TransactionValidated {
+                tx,
+                submitted_locally: true,
+            },
+        );
 
         assert_eq!(
             node.mempool.len(),
@@ -145,7 +152,10 @@ mod tests {
             Arc::new(test_transaction(/* seed */ 2)),
         ];
 
-        let _ = node.handle(ProtocolEvent::TransactionsReceived { transactions: txs });
+        let _ = node.handle(
+            LocalTimestamp::ZERO,
+            ProtocolEvent::TransactionsReceived { transactions: txs },
+        );
 
         assert_eq!(
             node.mempool.len(),

@@ -883,10 +883,9 @@ where
     /// Fan a shard-scoped protocol event out to every hosted vnode in
     /// `shard` and dispatch each vnode's resulting actions.
     ///
-    /// Every same-shard vnode independently applies the event and
-    /// produces its own signed actions, with `IoLoop`'s cached `now`
-    /// pushed into the state machine just-in-time. No-op when `shard`
-    /// isn't hosted.
+    /// Every same-shard vnode independently applies the event at the
+    /// `IoLoop`'s cached `now` and produces its own signed actions.
+    /// No-op when `shard` isn't hosted.
     pub(super) fn dispatch_event(&mut self, shard: ShardGroupId, event: ProtocolEvent) {
         let count = self.shards.get(&shard).map_or(0, |g| g.vnodes.len());
         if count == 0 {
@@ -898,14 +897,10 @@ where
         // dropped.
         for vnode_idx in 0..count - 1 {
             let ev = event.clone();
-            let state = &mut self.vnode_mut(shard, vnode_idx).state;
-            state.set_time(now);
-            let actions = state.handle(ev);
+            let actions = self.vnode_mut(shard, vnode_idx).state.handle(now, ev);
             self.drain_actions(shard, vnode_idx, actions);
         }
-        let state = &mut self.vnode_mut(shard, count - 1).state;
-        state.set_time(now);
-        let actions = state.handle(event);
+        let actions = self.vnode_mut(shard, count - 1).state.handle(now, event);
         self.drain_actions(shard, count - 1, actions);
     }
 

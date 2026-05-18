@@ -62,7 +62,8 @@ mod tests {
 
     use hyperscale_core::{Action, ProtocolEvent, StateMachine};
     use hyperscale_types::{
-        BlockHeight, MerkleInclusionProof, Provisions, ShardGroupId, WeightedTimestamp,
+        BlockHeight, LocalTimestamp, MerkleInclusionProof, Provisions, ShardGroupId,
+        WeightedTimestamp,
     };
 
     use super::super::test_support::TestNode;
@@ -85,10 +86,13 @@ mod tests {
             vec![],
         ));
 
-        let actions = node.handle(ProtocolEvent::ProvisionsAdmitted {
-            provisions,
-            source_block_ts: WeightedTimestamp::from_millis(0),
-        });
+        let actions = node.handle(
+            LocalTimestamp::ZERO,
+            ProtocolEvent::ProvisionsAdmitted {
+                provisions,
+                source_block_ts: WeightedTimestamp::from_millis(0),
+            },
+        );
 
         let saw_proposal = actions
             .iter()

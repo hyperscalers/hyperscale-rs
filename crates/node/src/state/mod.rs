@@ -223,7 +223,9 @@ impl StateMachine for NodeStateMachine {
         event = %event.type_name(),
         height = self.bft.committed_height().inner(),
     ))]
-    fn handle(&mut self, event: ProtocolEvent) -> Vec<Action> {
+    fn handle(&mut self, now: LocalTimestamp, event: ProtocolEvent) -> Vec<Action> {
+        self.now = now;
+        self.bft.set_time(now);
         let mut actions = match event {
             // ── Timers ───────────────────────────────────────────────────
             ProtocolEvent::CleanupTimer => self.on_cleanup_timer(),
@@ -299,14 +301,5 @@ impl StateMachine for NodeStateMachine {
         }
 
         actions
-    }
-
-    fn set_time(&mut self, now: LocalTimestamp) {
-        self.now = now;
-        self.bft.set_time(now);
-    }
-
-    fn now(&self) -> LocalTimestamp {
-        self.now
     }
 }

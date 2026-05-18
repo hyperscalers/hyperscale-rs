@@ -414,7 +414,10 @@ mod tests {
         let pre_exec = node.execution.memory_stats().expected_exec_certs;
         let pre_prov = node.provisions.verified_remote_header_count();
 
-        let _ = node.handle(ProtocolEvent::RemoteHeaderAdmitted { committed_header });
+        let _ = node.handle(
+            LocalTimestamp::ZERO,
+            ProtocolEvent::RemoteHeaderAdmitted { committed_header },
+        );
 
         assert_eq!(
             node.execution.memory_stats().expected_exec_certs,
@@ -447,7 +450,10 @@ mod tests {
             "local must be the round-0 height-1 proposer for this test",
         );
 
-        let actions = node.handle(ProtocolEvent::TransactionsAdmitted { txs: vec![] });
+        let actions = node.handle(
+            LocalTimestamp::ZERO,
+            ProtocolEvent::TransactionsAdmitted { txs: vec![] },
+        );
 
         let saw_proposal = actions
             .iter()
@@ -474,7 +480,10 @@ mod tests {
             "local must NOT be the round-0 height-1 proposer for this test",
         );
 
-        let actions = node.handle(ProtocolEvent::TransactionsAdmitted { txs: vec![] });
+        let actions = node.handle(
+            LocalTimestamp::ZERO,
+            ProtocolEvent::TransactionsAdmitted { txs: vec![] },
+        );
 
         let saw_proposal = actions
             .iter()
@@ -493,9 +502,12 @@ mod tests {
     fn block_persisted_does_not_reschedule_cleanup_timer_in_steady_state() {
         let TestNode { mut node, .. } = TestNode::new();
 
-        let actions = node.handle(ProtocolEvent::BlockPersisted {
-            height: BlockHeight::new(10),
-        });
+        let actions = node.handle(
+            LocalTimestamp::ZERO,
+            ProtocolEvent::BlockPersisted {
+                height: BlockHeight::new(10),
+            },
+        );
 
         let cleanup_timer_set = actions.iter().any(|a| {
             matches!(
@@ -540,10 +552,13 @@ mod tests {
                 vec![],
             )],
         ));
-        let _ = node.handle(ProtocolEvent::OutboundProvisionBroadcast {
-            provisions,
-            target_shard: ShardGroupId::new(1),
-        });
+        let _ = node.handle(
+            LocalTimestamp::ZERO,
+            ProtocolEvent::OutboundProvisionBroadcast {
+                provisions,
+                target_shard: ShardGroupId::new(1),
+            },
+        );
         assert_eq!(
             node.outbound_provisions().memory_stats().tracked_provisions,
             1,
@@ -555,7 +570,7 @@ mod tests {
         let retention_ms =
             u64::try_from(RETENTION_HORIZON.as_millis()).expect("RETENTION_HORIZON fits u64");
         let past_deadline_ms = retention_ms * 10;
-        node.set_time(LocalTimestamp::from_millis(past_deadline_ms));
+        let past_deadline = LocalTimestamp::from_millis(past_deadline_ms);
 
         // Commit a block whose qc.weighted_timestamp() is BELOW the entry
         // deadline. The orchestrator passes this into the outbound sweep.
@@ -568,7 +583,7 @@ mod tests {
             vec![],
         );
         let certified = Arc::new(certify(block, /* weighted_timestamp_ms */ 1_000));
-        let _ = node.handle(ProtocolEvent::BlockCommitted { certified });
+        let _ = node.handle(past_deadline, ProtocolEvent::BlockCommitted { certified });
         assert_eq!(
             node.outbound_provisions().memory_stats().tracked_provisions,
             1,
@@ -587,7 +602,7 @@ mod tests {
             vec![],
         );
         let certified = Arc::new(certify(block, past_deadline_ms));
-        let _ = node.handle(ProtocolEvent::BlockCommitted { certified });
+        let _ = node.handle(past_deadline, ProtocolEvent::BlockCommitted { certified });
         assert_eq!(
             node.outbound_provisions().memory_stats().tracked_provisions,
             0,
@@ -624,10 +639,13 @@ mod tests {
         .header()
         .clone();
 
-        let _ = node.handle(ProtocolEvent::BlockHeaderReceived {
-            header: Arc::new(header),
-            manifest,
-        });
+        let _ = node.handle(
+            LocalTimestamp::ZERO,
+            ProtocolEvent::BlockHeaderReceived {
+                header: Arc::new(header),
+                manifest,
+            },
+        );
 
         let (pending_blocks, _) = node.bft().pending_block_counts();
         assert_eq!(
@@ -652,10 +670,13 @@ mod tests {
         let tx = Arc::new(test_transaction(/* seed */ 1));
         let tx_hash = tx.hash();
 
-        let _ = node.handle(ProtocolEvent::TransactionValidated {
-            tx: Arc::clone(&tx),
-            submitted_locally: true,
-        });
+        let _ = node.handle(
+            LocalTimestamp::ZERO,
+            ProtocolEvent::TransactionValidated {
+                tx: Arc::clone(&tx),
+                submitted_locally: true,
+            },
+        );
         assert_eq!(
             node.mempool().status(&tx_hash),
             Some(TransactionStatus::Pending),
@@ -671,7 +692,10 @@ mod tests {
             vec![],
         );
         let certified = Arc::new(certify(block, /* weighted_timestamp_ms */ 1_000));
-        let _ = node.handle(ProtocolEvent::BlockCommitted { certified });
+        let _ = node.handle(
+            LocalTimestamp::ZERO,
+            ProtocolEvent::BlockCommitted { certified },
+        );
 
         assert_eq!(
             node.mempool().status(&tx_hash),

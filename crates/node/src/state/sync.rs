@@ -50,8 +50,8 @@ mod tests {
     use hyperscale_core::{Action, FetchRequest, ProtocolEvent, StateMachine};
     use hyperscale_test_helpers::make_live_block;
     use hyperscale_types::{
-        Block, BlockHash, BlockHeader, BlockHeight, CommittedBlockHeader, QuorumCertificate,
-        ShardGroupId, ValidatorId, WaveId,
+        Block, BlockHash, BlockHeader, BlockHeight, CommittedBlockHeader, LocalTimestamp,
+        QuorumCertificate, ShardGroupId, ValidatorId, WaveId,
     };
 
     use super::super::test_support::TestNode;
@@ -105,13 +105,19 @@ mod tests {
             block.header().clone(),
             QuorumCertificate::genesis(ShardGroupId::new(0)),
         ));
-        let _ = node.handle(ProtocolEvent::RemoteHeaderAdmitted { committed_header });
+        let _ = node.handle(
+            LocalTimestamp::ZERO,
+            ProtocolEvent::RemoteHeaderAdmitted { committed_header },
+        );
 
         // Now trigger sync-complete. The provisions flush must surface
         // a fetch request for the seeded expected entry.
-        let actions = node.handle(ProtocolEvent::BlockSyncComplete {
-            height: BlockHeight::new(5),
-        });
+        let actions = node.handle(
+            LocalTimestamp::ZERO,
+            ProtocolEvent::BlockSyncComplete {
+                height: BlockHeight::new(5),
+            },
+        );
 
         assert_emits!(
             actions,
@@ -138,11 +144,14 @@ mod tests {
         );
 
         let restored_height = BlockHeight::new(42);
-        let _ = node.handle(ProtocolEvent::CommittedStateRestored {
-            height: restored_height,
-            hash: Some(BlockHash::ZERO),
-            qc: None,
-        });
+        let _ = node.handle(
+            LocalTimestamp::ZERO,
+            ProtocolEvent::CommittedStateRestored {
+                height: restored_height,
+                hash: Some(BlockHash::ZERO),
+                qc: None,
+            },
+        );
 
         assert_eq!(
             node.bft().committed_height(),
