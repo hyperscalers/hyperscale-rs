@@ -124,13 +124,19 @@ where
         // every receipt's `database_updates`); off-loading keeps the
         // pinned thread responsive during catch-up.
         let event_tx = self.event_sender.clone();
+        let local_shard = shard;
         self.dispatch.spawn(DispatchPool::ConsensusCrypto, move || {
             let event = match validate_synced_block(height, &cert) {
                 Ok(()) => NodeInput::SyncBlockValidated {
+                    local_shard,
                     height,
                     certified: Box::new(cert),
                 },
-                Err(reason) => NodeInput::SyncBlockValidationFailed { height, reason },
+                Err(reason) => NodeInput::SyncBlockValidationFailed {
+                    local_shard,
+                    height,
+                    reason,
+                },
             };
             let _ = event_tx.send(event);
         });
@@ -229,6 +235,7 @@ where
                 .clone()
         };
         let es = self.event_sender.clone();
+        let local_shard = shard;
         record_sync_round_started("block");
         self.network.request(
             shard,
@@ -239,11 +246,19 @@ where
                 match result {
                     Ok(resp) => {
                         let block = resp.into_elided().map(Box::new);
-                        let _ = es.send(NodeInput::BlockSyncResponseReceived { height, block });
+                        let _ = es.send(NodeInput::BlockSyncResponseReceived {
+                            local_shard,
+                            height,
+                            block,
+                        });
                     }
                     Err(err) => {
                         let kind = classify_fetch_error(&err);
-                        let _ = es.send(NodeInput::BlockSyncFetchFailed { height, kind });
+                        let _ = es.send(NodeInput::BlockSyncFetchFailed {
+                            local_shard,
+                            height,
+                            kind,
+                        });
                     }
                 }
                 // "Peer doesn't have this height" is ambiguous (peer may

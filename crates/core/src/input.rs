@@ -86,6 +86,9 @@ pub enum NodeInput {
     /// by looking up omitted bodies in the local mempool / cert cache /
     /// provision store before handing off to the sync state machine.
     BlockSyncResponseReceived {
+        /// Hosted shard whose sync FSM dispatched the fetch and now
+        /// admits the response.
+        local_shard: ShardGroupId,
         /// Height of the block being synced.
         height: BlockHeight,
         /// Elided block payload, or `None` if the peer couldn't serve this height.
@@ -94,6 +97,8 @@ pub enum NodeInput {
 
     /// Sync block fetch failed from network callback.
     BlockSyncFetchFailed {
+        /// Hosted shard whose sync FSM dispatched the fetch.
+        local_shard: ShardGroupId,
         /// Height that failed to fetch.
         height: BlockHeight,
         /// Why the fetch failed — drives whether the sync FSM re-queues
@@ -105,6 +110,8 @@ pub enum NodeInput {
     /// QC binding, per-wave shape). The pinned-thread `IoLoop` re-enters
     /// the post-validation delivery path on receipt.
     SyncBlockValidated {
+        /// Hosted shard the block belongs to.
+        local_shard: ShardGroupId,
         /// Height of the validated block.
         height: BlockHeight,
         /// Rehydrated, structurally-valid certified block ready for BFT.
@@ -114,6 +121,8 @@ pub enum NodeInput {
     /// Sync block failed structural validation off-thread. The pinned
     /// thread re-queues the height for retry.
     SyncBlockValidationFailed {
+        /// Hosted shard whose sync FSM re-queues the height.
+        local_shard: ShardGroupId,
         /// Height that failed to validate.
         height: BlockHeight,
         /// Static reason tag — used for both metrics labels and warn logs.
@@ -124,6 +133,9 @@ pub enum NodeInput {
     /// ascending height order starting at `from_height`; missing tail
     /// heights (responder short-capped) get re-deferred by the FSM.
     RemoteHeadersResponseReceived {
+        /// Hosted shard whose `RemoteHeaderCoordinator` admits these
+        /// headers (the "consumer" side; distinct from `source_shard`).
+        local_shard: ShardGroupId,
         /// Source shard the fetch targeted.
         source_shard: ShardGroupId,
         /// First height of the requested range.
@@ -136,6 +148,8 @@ pub enum NodeInput {
 
     /// Remote-header range fetch failed (transport error / no peer).
     RemoteHeadersFetchFailed {
+        /// Hosted shard whose `RemoteHeaderCoordinator` re-queues.
+        local_shard: ShardGroupId,
         /// Source shard the fetch targeted.
         source_shard: ShardGroupId,
         /// First height of the requested range.
@@ -152,18 +166,25 @@ pub enum NodeInput {
 
     /// A transaction fetch request failed (network error or peer returned None).
     TransactionsFetchFailed {
+        /// Hosted shard whose `FetchHost` owns the in-flight tracking
+        /// for these ids.
+        local_shard: ShardGroupId,
         /// Transaction hashes that failed to fetch.
         hashes: Vec<TxHash>,
     },
 
     /// Local provision fetch failed.
     LocalProvisionsFetchFailed {
+        /// Hosted shard whose `FetchHost` owns the in-flight tracking.
+        local_shard: ShardGroupId,
         /// Provision hashes that failed to fetch.
         hashes: Vec<ProvisionHash>,
     },
 
     /// A finalized-wave fetch request failed.
     FinalizedWavesFetchFailed {
+        /// Hosted shard whose `FetchHost` owns the in-flight tracking.
+        local_shard: ShardGroupId,
         /// Wave ids that weren't returned.
         ids: Vec<WaveId>,
     },
@@ -214,6 +235,10 @@ pub enum NodeInput {
 
     /// A provision fetch request failed (network error or peer returned None).
     ProvisionsFetchFailed {
+        /// Hosted shard whose `FetchHost` owns the in-flight tracking
+        /// (the "target" shard from the perspective of the provision
+        /// flow; distinct from `source_shard`).
+        local_shard: ShardGroupId,
         /// Source shard whose provisions were being fetched.
         source_shard: ShardGroupId,
         /// Source-shard block height the provisions were anchored to.
@@ -222,6 +247,8 @@ pub enum NodeInput {
 
     /// An execution certificate fetch request failed.
     ExecCertFetchFailed {
+        /// Hosted shard whose `FetchHost` owns the in-flight tracking.
+        local_shard: ShardGroupId,
         /// Wave ids that weren't returned.
         hashes: Vec<WaveId>,
     },

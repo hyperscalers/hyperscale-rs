@@ -183,6 +183,7 @@ impl FetchBinding for TransactionBinding {
                     }
                     if !split.missing.is_empty() {
                         let _ = es.send(NodeInput::TransactionsFetchFailed {
+                            local_shard,
                             hashes: split.missing.clone(),
                         });
                     }
@@ -195,7 +196,10 @@ impl FetchBinding for TransactionBinding {
                         ResponseVerdict::Accept
                     }
                 } else {
-                    let _ = es.send(NodeInput::TransactionsFetchFailed { hashes: hs });
+                    let _ = es.send(NodeInput::TransactionsFetchFailed {
+                        local_shard,
+                        hashes: hs,
+                    });
                     ResponseVerdict::Accept
                 }
             }),
@@ -244,6 +248,7 @@ impl FetchBinding for LocalProvisionBinding {
                     let had_misses = !split.missing.is_empty();
                     if had_misses {
                         let _ = es.send(NodeInput::LocalProvisionsFetchFailed {
+                            local_shard,
                             hashes: split.missing,
                         });
                     }
@@ -255,7 +260,10 @@ impl FetchBinding for LocalProvisionBinding {
                         ResponseVerdict::Accept
                     }
                 } else {
-                    let _ = es.send(NodeInput::LocalProvisionsFetchFailed { hashes: hs });
+                    let _ = es.send(NodeInput::LocalProvisionsFetchFailed {
+                        local_shard,
+                        hashes: hs,
+                    });
                     ResponseVerdict::Accept
                 }
             }),
@@ -304,8 +312,10 @@ impl FetchBinding for FinalizedWaveBinding {
                     }
                     let had_misses = !split.missing.is_empty();
                     if had_misses {
-                        let _ =
-                            es.send(NodeInput::FinalizedWavesFetchFailed { ids: split.missing });
+                        let _ = es.send(NodeInput::FinalizedWavesFetchFailed {
+                            local_shard,
+                            ids: split.missing,
+                        });
                     }
                     // Reject responses with unsolicited waves (peer scoring;
                     // also avoids wasted BLS verification on items we never
@@ -316,7 +326,10 @@ impl FetchBinding for FinalizedWaveBinding {
                         ResponseVerdict::Accept
                     }
                 } else {
-                    let _ = es.send(NodeInput::FinalizedWavesFetchFailed { ids: requested_ids });
+                    let _ = es.send(NodeInput::FinalizedWavesFetchFailed {
+                        local_shard,
+                        ids: requested_ids,
+                    });
                     ResponseVerdict::Accept
                 }
             }),
@@ -368,6 +381,7 @@ impl FetchBinding for ExecCertBinding {
                     }
                     if had_misses {
                         let _ = es.send(NodeInput::ExecCertFetchFailed {
+                            local_shard,
                             hashes: split.missing,
                         });
                     }
@@ -380,7 +394,10 @@ impl FetchBinding for ExecCertBinding {
                         ResponseVerdict::Accept
                     }
                 } else {
-                    let _ = es.send(NodeInput::ExecCertFetchFailed { hashes: failed_ids });
+                    let _ = es.send(NodeInput::ExecCertFetchFailed {
+                        local_shard,
+                        hashes: failed_ids,
+                    });
                     ResponseVerdict::Accept
                 }
             }),
@@ -436,6 +453,7 @@ impl FetchBinding for ProvisionBinding {
             Box::new(move |result| {
                 let Ok(response) = result else {
                     let _ = es.send(NodeInput::ProvisionsFetchFailed {
+                        local_shard,
                         source_shard,
                         block_height,
                     });
@@ -443,6 +461,7 @@ impl FetchBinding for ProvisionBinding {
                 };
                 let Some(provisions) = response.provisions else {
                     let _ = es.send(NodeInput::ProvisionsFetchFailed {
+                        local_shard,
                         source_shard,
                         block_height,
                     });
@@ -462,6 +481,7 @@ impl FetchBinding for ProvisionBinding {
                         "Dropping provision fetch response: scope mismatch"
                     );
                     let _ = es.send(NodeInput::ProvisionsFetchFailed {
+                        local_shard,
                         source_shard,
                         block_height,
                     });
@@ -473,6 +493,7 @@ impl FetchBinding for ProvisionBinding {
                     // without an explicit `Failed` the id stays in_flight
                     // forever.
                     let _ = es.send(NodeInput::ProvisionsFetchFailed {
+                        local_shard,
                         source_shard,
                         block_height,
                     });

@@ -182,6 +182,7 @@ where
                                 Ok(resp) => {
                                     record_sync_round_completed("remote_header");
                                     let _ = es.send(NodeInput::RemoteHeadersResponseReceived {
+                                        local_shard,
                                         source_shard,
                                         from_height,
                                         count: typed_count,
@@ -192,6 +193,7 @@ where
                                     record_sync_round_retried("remote_header");
                                     let kind = classify_fetch_error(&err);
                                     let _ = es.send(NodeInput::RemoteHeadersFetchFailed {
+                                        local_shard,
                                         source_shard,
                                         from_height,
                                         count: typed_count,

@@ -624,26 +624,43 @@ where
             }
 
             // ── Sync protocol ──────────────────────────────────────────
-            NodeInput::BlockSyncResponseReceived { height, block } => {
-                self.handle_block_sync_response_received(primary_shard, height, block);
+            NodeInput::BlockSyncResponseReceived {
+                local_shard,
+                height,
+                block,
+            } => {
+                self.handle_block_sync_response_received(local_shard, height, block);
             }
-            NodeInput::BlockSyncFetchFailed { height, kind } => {
-                self.handle_block_sync_fetch_failed(primary_shard, height, kind);
+            NodeInput::BlockSyncFetchFailed {
+                local_shard,
+                height,
+                kind,
+            } => {
+                self.handle_block_sync_fetch_failed(local_shard, height, kind);
             }
-            NodeInput::SyncBlockValidated { height, certified } => {
-                self.handle_sync_block_validated(primary_shard, height, *certified);
+            NodeInput::SyncBlockValidated {
+                local_shard,
+                height,
+                certified,
+            } => {
+                self.handle_sync_block_validated(local_shard, height, *certified);
             }
-            NodeInput::SyncBlockValidationFailed { height, reason } => {
-                self.handle_sync_block_validation_failed(primary_shard, height, reason);
+            NodeInput::SyncBlockValidationFailed {
+                local_shard,
+                height,
+                reason,
+            } => {
+                self.handle_sync_block_validation_failed(local_shard, height, reason);
             }
             NodeInput::RemoteHeadersResponseReceived {
+                local_shard,
                 source_shard,
                 from_height,
                 count,
                 headers,
             } => {
                 self.handle_remote_headers_response_received(
-                    primary_shard,
+                    local_shard,
                     source_shard,
                     from_height,
                     count,
@@ -651,13 +668,14 @@ where
                 );
             }
             NodeInput::RemoteHeadersFetchFailed {
+                local_shard,
                 source_shard,
                 from_height,
                 count,
                 kind,
             } => {
                 self.handle_remote_headers_fetch_failed(
-                    primary_shard,
+                    local_shard,
                     source_shard,
                     from_height,
                     count,
@@ -666,9 +684,12 @@ where
             }
 
             // ── Fetch protocol ─────────────────────────────────────────
-            NodeInput::TransactionsFetchFailed { hashes } => {
+            NodeInput::TransactionsFetchFailed {
+                local_shard,
+                hashes,
+            } => {
                 self.drive_fetch::<TransactionBinding>(
-                    primary_shard,
+                    local_shard,
                     FetchInput::Failed { ids: hashes },
                 );
                 self.update_fetch_tick_timer();
@@ -677,21 +698,25 @@ where
             NodeInput::FetchTick => self.handle_fetch_tick(),
 
             NodeInput::ProvisionsFetchFailed {
+                local_shard,
                 source_shard,
                 block_height,
             } => {
                 self.drive_fetch::<ProvisionBinding>(
-                    primary_shard,
+                    local_shard,
                     FetchInput::Failed {
-                        ids: vec![(source_shard, primary_shard, block_height)],
+                        ids: vec![(source_shard, local_shard, block_height)],
                     },
                 );
                 self.update_fetch_tick_timer();
             }
 
-            NodeInput::ExecCertFetchFailed { hashes } => {
+            NodeInput::ExecCertFetchFailed {
+                local_shard,
+                hashes,
+            } => {
                 self.drive_fetch::<ExecCertBinding>(
-                    primary_shard,
+                    local_shard,
                     FetchInput::Failed { ids: hashes },
                 );
                 self.update_fetch_tick_timer();
@@ -712,16 +737,19 @@ where
                 sender_signature,
             ),
 
-            NodeInput::LocalProvisionsFetchFailed { hashes } => {
+            NodeInput::LocalProvisionsFetchFailed {
+                local_shard,
+                hashes,
+            } => {
                 self.drive_fetch::<LocalProvisionBinding>(
-                    primary_shard,
+                    local_shard,
                     FetchInput::Failed { ids: hashes },
                 );
                 self.update_fetch_tick_timer();
             }
 
-            NodeInput::FinalizedWavesFetchFailed { ids } => {
-                self.drive_fetch::<FinalizedWaveBinding>(primary_shard, FetchInput::Failed { ids });
+            NodeInput::FinalizedWavesFetchFailed { local_shard, ids } => {
+                self.drive_fetch::<FinalizedWaveBinding>(local_shard, FetchInput::Failed { ids });
                 self.update_fetch_tick_timer();
             }
         }
