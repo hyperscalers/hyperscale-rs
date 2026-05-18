@@ -72,6 +72,18 @@ enum Commands {
         #[arg(long, default_value = "1")]
         validators_per_shard: usize,
 
+        /// Validators bundled into each host process (matches
+        /// `launch-cluster.sh --vnodes-per-host`). Same-shard packing only;
+        /// must divide `validators_per_shard`.
+        #[arg(long, default_value = "1")]
+        vnodes_per_host: usize,
+
+        /// Hosts run one vnode from each shard (matches
+        /// `launch-cluster.sh --cross-shard-pack`). When set, every endpoint
+        /// is a candidate for every shard.
+        #[arg(long)]
+        cross_shard_pack: bool,
+
         /// Target transactions per second
         #[arg(long, default_value = "1000")]
         tps: u64,
@@ -155,6 +167,16 @@ enum Commands {
         #[arg(long, default_value = "1")]
         validators_per_shard: usize,
 
+        /// Validators bundled into each host process (matches
+        /// `launch-cluster.sh --vnodes-per-host`).
+        #[arg(long, default_value = "1")]
+        vnodes_per_host: usize,
+
+        /// Hosts run one vnode from each shard (matches
+        /// `launch-cluster.sh --cross-shard-pack`).
+        #[arg(long)]
+        cross_shard_pack: bool,
+
         /// Accounts per shard (must match genesis configuration)
         #[arg(long, default_value = "100")]
         accounts_per_shard: usize,
@@ -219,6 +241,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             endpoints,
             num_shards,
             validators_per_shard,
+            vnodes_per_host,
+            cross_shard_pack,
             tps,
             duration,
             cross_shard_ratio,
@@ -248,6 +272,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut config = SpammerConfig::new(endpoints)
                 .with_num_shards(num_shards)
                 .with_validators_per_shard(validators_per_shard)
+                .with_vnodes_per_host(vnodes_per_host)
+                .with_cross_shard_pack(cross_shard_pack)
                 .with_target_tps(tps)
                 .with_cross_shard_ratio(cross_shard_ratio)
                 .with_accounts_per_shard(accounts_per_shard)
@@ -310,6 +336,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             endpoints,
             num_shards,
             validators_per_shard,
+            vnodes_per_host,
+            cross_shard_pack,
             accounts_per_shard,
             timeout,
             poll_interval,
@@ -393,10 +421,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .generate_for_shard(&accounts, ShardGroupId::new(target_shard as u64), &mut rng)
                 .expect("Failed to generate transaction for shard 0");
 
-            // Calculate client index: endpoints are organized as shard0_v0, shard0_v1, ..., shard1_v0, ...
-            // So for shard N, the validators are at indices [N*validators_per_shard .. (N+1)*validators_per_shard)
-            let base_idx = target_shard * validators_per_shard;
-            let client_idx = base_idx % clients.len();
+            // Pick the first endpoint serving shard 0 under the configured
+            // packing layout. EndpointRouting honours --vnodes-per-host and
+            // --cross-shard-pack so the smoke test routes correctly under
+            // every layout launch-cluster.sh can produce.
+            let routing = SpammerConfig::new(endpoints.clone())
+                .with_num_shards(num_shards)
+                .with_validators_per_shard(validators_per_shard)
+                .with_vnodes_per_host(vnodes_per_host)
+                .with_cross_shard_pack(cross_shard_pack)
+                .routing();
+            let client_idx = routing.range_for_shard(target_shard).start % clients.len();
             let client = &clients[client_idx];
 
             println!("Submitting transaction to shard {target_shard}...");

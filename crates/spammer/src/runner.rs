@@ -22,7 +22,7 @@ use crate::accounts::{
     AccountPartition, AccountPool, AccountPoolError, FundedAccount, SelectionMode,
 };
 use crate::client::{RpcClient, RpcError};
-use crate::config::{ConfigError, SpammerConfig};
+use crate::config::{ConfigError, EndpointRouting, SpammerConfig};
 use crate::latency::{LatencyReport, LatencyTracker};
 use crate::validity::validity_range_for_now;
 use crate::workloads::TransferWorkload;
@@ -259,13 +259,13 @@ impl Spammer {
                 clients: Arc::clone(&self.clients),
                 stats: Arc::clone(&self.stats),
                 shard_round_robin: Arc::clone(&self.shard_round_robin),
+                routing: self.config.routing(),
                 latency_tracker: self
                     .latency_tracker
                     .as_ref()
                     .map(LatencyTracker::clone_tracker),
                 config: WorkerConfig {
                     num_shards: num_shards as u64,
-                    validators_per_shard: self.config.validators_per_shard,
                     batch_size: batch_size_per_worker.max(1),
                     batch_interval,
                     cross_shard_ratio: self.config.cross_shard_ratio,
@@ -327,14 +327,12 @@ impl Spammer {
     ) {
         self.stats.submitted.fetch_add(1, Ordering::SeqCst);
 
-        let validators_per_shard = self.config.validators_per_shard;
-        let base_idx = target_shard * validators_per_shard;
-
+        let range = self.config.endpoint_range_for_shard(target_shard);
+        let span = range.end - range.start;
         let rr_counter = &self.shard_round_robin[target_shard];
-        let offset = usize::try_from(rr_counter.fetch_add(1, Ordering::Relaxed)).unwrap_or(0)
-            % validators_per_shard;
-
-        let client_idx = (base_idx + offset) % self.clients.len();
+        let offset =
+            usize::try_from(rr_counter.fetch_add(1, Ordering::Relaxed)).unwrap_or(0) % span;
+        let client_idx = (range.start + offset) % self.clients.len();
         let client = &self.clients[client_idx];
 
         match client.submit_transaction(&tx).await {
@@ -470,7 +468,6 @@ fn print_progress_static(
 #[derive(Clone)]
 struct WorkerConfig {
     num_shards: u64,
-    validators_per_shard: usize,
     batch_size: usize,
     batch_interval: Duration,
     cross_shard_ratio: f64,
@@ -486,6 +483,7 @@ struct Worker {
     clients: Arc<Vec<RpcClient>>,
     stats: Arc<SpammerStats>,
     shard_round_robin: Arc<Vec<AtomicU64>>,
+    routing: EndpointRouting,
     latency_tracker: Option<LatencyTracker>,
     config: WorkerConfig,
 }
@@ -550,14 +548,12 @@ impl Worker {
     ) {
         self.stats.submitted.fetch_add(1, Ordering::SeqCst);
 
-        let validators_per_shard = self.config.validators_per_shard;
-        let base_idx = target_shard * validators_per_shard;
-
+        let range = self.routing.range_for_shard(target_shard);
+        let span = range.end - range.start;
         let rr_counter = &self.shard_round_robin[target_shard];
-        let offset = usize::try_from(rr_counter.fetch_add(1, Ordering::Relaxed)).unwrap_or(0)
-            % validators_per_shard;
-
-        let client_idx = (base_idx + offset) % self.clients.len();
+        let offset =
+            usize::try_from(rr_counter.fetch_add(1, Ordering::Relaxed)).unwrap_or(0) % span;
+        let client_idx = (range.start + offset) % self.clients.len();
         let client = &self.clients[client_idx];
 
         match client.submit_transaction(&tx).await {

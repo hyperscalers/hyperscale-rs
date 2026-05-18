@@ -648,11 +648,17 @@ for host_idx in $(seq 0 $((TOTAL_HOSTS - 1))); do
     SPAMMER_ENDPOINTS="${SPAMMER_ENDPOINTS}http://$NODE_HOSTNAME:$rpc_port"
 done
 
+SPAMMER_PACKING_FLAGS="--vnodes-per-host $VNODES_PER_HOST"
+if [ "$CROSS_SHARD_PACK" = true ]; then
+    SPAMMER_PACKING_FLAGS="$SPAMMER_PACKING_FLAGS --cross-shard-pack"
+fi
+
 echo "Run spammer:"
 echo "  $SPAMMER_BIN run \\"
 echo "    --endpoints $SPAMMER_ENDPOINTS \\"
 echo "    --num-shards $NUM_SHARDS \\"
 echo "    --validators-per-shard $VALIDATORS_PER_SHARD \\"
+echo "    $SPAMMER_PACKING_FLAGS \\"
 echo "    --tps 100 \\"
 echo "    --duration 30s \\"
 echo "    --measure-latency"
@@ -665,10 +671,16 @@ echo "=== Running Smoke Test ==="
 
 # Temporarily disable exit-on-error for smoke test
 set +e
+SMOKE_TEST_PACKING_FLAGS=(--vnodes-per-host "$VNODES_PER_HOST")
+if [ "$CROSS_SHARD_PACK" = true ]; then
+    SMOKE_TEST_PACKING_FLAGS+=(--cross-shard-pack)
+fi
+
 "$SPAMMER_BIN" smoke-test \
     --endpoints "$SPAMMER_ENDPOINTS" \
     --num-shards "$NUM_SHARDS" \
     --validators-per-shard "$VALIDATORS_PER_SHARD" \
+    "${SMOKE_TEST_PACKING_FLAGS[@]}" \
     --accounts-per-shard "$ACCOUNTS_PER_SHARD" \
     --wait-ready \
     --timeout "$SMOKE_TEST_TIMEOUT" \

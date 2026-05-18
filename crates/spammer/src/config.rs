@@ -13,11 +13,27 @@ pub struct SpammerConfig {
     /// Number of shards in the network.
     pub num_shards: u64,
 
-    /// Number of validators (endpoints) per shard.
+    /// Number of validators per shard.
     /// Used to distribute load across multiple nodes in each shard.
     pub validators_per_shard: usize,
 
-    /// RPC endpoints for each shard (at least one per shard).
+    /// Number of validators packed into each host process. Matches
+    /// `launch-cluster.sh --vnodes-per-host`. Under same-shard packing the
+    /// per-shard host count is `validators_per_shard / vnodes_per_host`,
+    /// so each endpoint serves exactly one shard. Under cross-shard packing
+    /// every endpoint serves every shard and this value is unused.
+    pub vnodes_per_host: usize,
+
+    /// True iff hosts run one vnode from each shard (the
+    /// `launch-cluster.sh --cross-shard-pack` layout). Routing then ignores
+    /// the per-shard endpoint partition because every host is reachable for
+    /// every shard.
+    pub cross_shard_pack: bool,
+
+    /// RPC endpoints. Indexed in host order. Under same-shard packing
+    /// endpoints are flat-grouped by shard:
+    /// `[shard0_host0, shard0_host1, …, shard1_host0, …]`. Under
+    /// cross-shard packing every endpoint serves every shard.
     pub rpc_endpoints: Vec<String>,
 
     /// Number of accounts to generate per shard.
@@ -67,6 +83,8 @@ impl Default for SpammerConfig {
         Self {
             num_shards: 2,
             validators_per_shard: 1,
+            vnodes_per_host: 1,
+            cross_shard_pack: false,
             rpc_endpoints: vec![
                 "http://localhost:8080".into(),
                 "http://localhost:8083".into(),
@@ -110,6 +128,35 @@ impl SpammerConfig {
     pub fn with_validators_per_shard(mut self, validators: usize) -> Self {
         self.validators_per_shard = validators.max(1);
         self
+    }
+
+    /// Set the number of vnodes bundled into each host process.
+    #[must_use]
+    pub fn with_vnodes_per_host(mut self, vnodes: usize) -> Self {
+        self.vnodes_per_host = vnodes.max(1);
+        self
+    }
+
+    /// Toggle cross-shard packing (one vnode from each shard per host).
+    #[must_use]
+    pub const fn with_cross_shard_pack(mut self, pack: bool) -> Self {
+        self.cross_shard_pack = pack;
+        self
+    }
+
+    /// Build the standalone [`EndpointRouting`] policy implied by this
+    /// config. Held by spammer workers so they can pick endpoints without
+    /// carrying the whole config.
+    #[must_use]
+    pub fn routing(&self) -> EndpointRouting {
+        EndpointRouting::from_config(self)
+    }
+
+    /// Return the `[base, end)` range of `rpc_endpoints` indices that serve
+    /// `shard`. Convenience wrapper around [`EndpointRouting`].
+    #[must_use]
+    pub fn endpoint_range_for_shard(&self, shard: usize) -> std::ops::Range<usize> {
+        self.routing().range_for_shard(shard)
     }
 
     /// Set accounts per shard.
@@ -219,7 +266,7 @@ impl SpammerConfig {
     ///
     /// Returns a [`ConfigError`] if RPC endpoints are missing, shard count is
     /// zero, or per-shard account count is zero.
-    pub const fn validate(&self) -> Result<(), ConfigError> {
+    pub fn validate(&self) -> Result<(), ConfigError> {
         if self.rpc_endpoints.is_empty() {
             return Err(ConfigError::NoEndpoints);
         }
@@ -229,7 +276,69 @@ impl SpammerConfig {
         if self.accounts_per_shard == 0 {
             return Err(ConfigError::InvalidAccounts);
         }
+        if self.vnodes_per_host == 0 {
+            return Err(ConfigError::InvalidVnodesPerHost);
+        }
+        if !self
+            .validators_per_shard
+            .is_multiple_of(self.vnodes_per_host)
+        {
+            return Err(ConfigError::VnodesPerHostDoesNotDivide {
+                vnodes_per_host: self.vnodes_per_host,
+                validators_per_shard: self.validators_per_shard,
+            });
+        }
+        let expected_hosts = if self.cross_shard_pack {
+            self.validators_per_shard
+        } else {
+            let hosts_per_shard = self.validators_per_shard / self.vnodes_per_host;
+            usize::try_from(self.num_shards).unwrap_or(usize::MAX) * hosts_per_shard
+        };
+        if self.rpc_endpoints.len() != expected_hosts {
+            return Err(ConfigError::EndpointCountMismatch {
+                got: self.rpc_endpoints.len(),
+                expected: expected_hosts,
+            });
+        }
         Ok(())
+    }
+}
+
+/// Routing policy used to pick which endpoint to send a shard-X transaction
+/// to. Standalone Clone struct so workers can hold a copy without keeping
+/// the whole [`SpammerConfig`] around.
+#[derive(Clone, Debug)]
+pub struct EndpointRouting {
+    cross_shard_pack: bool,
+    hosts_per_shard: usize,
+    total_endpoints: usize,
+}
+
+impl EndpointRouting {
+    /// Derive the policy from a [`SpammerConfig`].
+    #[must_use]
+    pub fn from_config(cfg: &SpammerConfig) -> Self {
+        let hosts_per_shard = if cfg.cross_shard_pack {
+            0
+        } else {
+            (cfg.validators_per_shard / cfg.vnodes_per_host.max(1)).max(1)
+        };
+        Self {
+            cross_shard_pack: cfg.cross_shard_pack,
+            hosts_per_shard,
+            total_endpoints: cfg.rpc_endpoints.len(),
+        }
+    }
+
+    /// `[base, end)` slice of `rpc_endpoints` that serves `shard`.
+    #[must_use]
+    pub const fn range_for_shard(&self, shard: usize) -> std::ops::Range<usize> {
+        if self.cross_shard_pack {
+            0..self.total_endpoints
+        } else {
+            let base = shard * self.hosts_per_shard;
+            base..base + self.hosts_per_shard
+        }
     }
 }
 
@@ -247,4 +356,32 @@ pub enum ConfigError {
     /// Configured `accounts_per_shard` is zero.
     #[error("Accounts per shard must be greater than 0")]
     InvalidAccounts,
+
+    /// Configured `vnodes_per_host` is zero.
+    #[error("Vnodes per host must be greater than 0")]
+    InvalidVnodesPerHost,
+
+    /// `vnodes_per_host` doesn't evenly divide `validators_per_shard`,
+    /// so same-shard hosts can't be enumerated cleanly.
+    #[error(
+        "vnodes_per_host ({vnodes_per_host}) must divide validators_per_shard ({validators_per_shard})"
+    )]
+    VnodesPerHostDoesNotDivide {
+        /// Configured `vnodes_per_host`.
+        vnodes_per_host: usize,
+        /// Configured `validators_per_shard`.
+        validators_per_shard: usize,
+    },
+
+    /// The number of supplied endpoints doesn't match the host count
+    /// implied by `(num_shards, validators_per_shard, vnodes_per_host,
+    /// cross_shard_pack)`. Without one endpoint per host the per-shard
+    /// routing can't pick the right target.
+    #[error("Expected {expected} endpoints (one per host) but got {got}")]
+    EndpointCountMismatch {
+        /// Number of endpoints supplied.
+        got: usize,
+        /// Number of endpoints expected.
+        expected: usize,
+    },
 }
