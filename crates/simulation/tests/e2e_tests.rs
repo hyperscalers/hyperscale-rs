@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use hyperscale_core::NodeInput;
 use hyperscale_network_memory::NetworkConfig;
+use hyperscale_node::io_loop::ShardEvent;
 use hyperscale_simulation::SimulationRunner;
 use hyperscale_types::test_utils::test_validity_range;
 use hyperscale_types::{
@@ -147,9 +148,9 @@ fn test_e2e_single_shard_transaction() {
     runner.schedule_initial_event(
         0,
         Duration::ZERO,
-        NodeInput::SubmitTransaction {
+        ShardEvent::process(NodeInput::SubmitTransaction {
             tx: Arc::new(transaction),
-        },
+        }),
     );
 
     println!("✓ Transaction submitted to node 0\n");
@@ -385,9 +386,9 @@ fn test_e2e_single_shard_determinism() {
     runner1.schedule_initial_event(
         0,
         Duration::from_millis(100),
-        NodeInput::SubmitTransaction {
+        ShardEvent::process(NodeInput::SubmitTransaction {
             tx: Arc::new(transaction.clone()),
-        },
+        }),
     );
     runner1.run_until(Duration::from_secs(5));
 
@@ -402,9 +403,9 @@ fn test_e2e_single_shard_determinism() {
     runner2.schedule_initial_event(
         0,
         Duration::from_millis(100),
-        NodeInput::SubmitTransaction {
+        ShardEvent::process(NodeInput::SubmitTransaction {
             tx: Arc::new(transaction),
-        },
+        }),
     );
     runner2.run_until(Duration::from_secs(5));
 
@@ -608,9 +609,9 @@ fn test_e2e_cross_shard_transaction() {
     runner.schedule_initial_event(
         0,
         Duration::ZERO,
-        NodeInput::SubmitTransaction {
+        ShardEvent::process(NodeInput::SubmitTransaction {
             tx: Arc::new(cross_shard_tx),
-        },
+        }),
     );
 
     // Poll for transaction status progression
@@ -792,9 +793,9 @@ fn test_e2e_cross_shard_determinism() {
     runner1.schedule_initial_event(
         0,
         Duration::from_millis(100),
-        NodeInput::SubmitTransaction {
+        ShardEvent::process(NodeInput::SubmitTransaction {
             tx: Arc::new(transaction.clone()),
-        },
+        }),
     );
     runner1.run_until(Duration::from_secs(5));
 
@@ -809,9 +810,9 @@ fn test_e2e_cross_shard_determinism() {
     runner2.schedule_initial_event(
         0,
         Duration::from_millis(100),
-        NodeInput::SubmitTransaction {
+        ShardEvent::process(NodeInput::SubmitTransaction {
             tx: Arc::new(transaction),
-        },
+        }),
     );
     runner2.run_until(Duration::from_secs(5));
 
@@ -881,7 +882,7 @@ fn test_e2e_transaction_throughput() {
         runner.schedule_initial_event(
             u32::try_from(i % 4).unwrap_or(0), // Distribute across validators
             Duration::from_millis(u64::try_from(i).unwrap_or(u64::MAX) * 50),
-            NodeInput::SubmitTransaction { tx: Arc::new(tx) },
+            ShardEvent::process(NodeInput::SubmitTransaction { tx: Arc::new(tx) }),
         );
     }
 
@@ -970,9 +971,9 @@ fn test_wave_leader_failure_recovers_via_rotation() {
         runner.schedule_initial_event(
             submit_node,
             Duration::ZERO,
-            NodeInput::SubmitTransaction {
+            ShardEvent::process(NodeInput::SubmitTransaction {
                 tx: Arc::new(transaction),
-            },
+            }),
         );
 
         // Run long enough for:

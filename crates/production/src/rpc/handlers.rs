@@ -32,6 +32,7 @@ use hyperscale_metrics::{
     record_tx_ingress_rejected_syncing,
 };
 use hyperscale_metrics_prometheus::encode_metrics;
+use hyperscale_node::io_loop::ShardEvent;
 use hyperscale_types::{
     Hash, InFlightCount, RoutableTransaction, TransactionDecision, TransactionStatus, TxHash,
 };
@@ -178,7 +179,9 @@ pub async fn submit_transaction_handler(
     // 3. Dispatch to mempool after validation
     if state
         .tx_submission_tx
-        .send(NodeInput::SubmitTransaction { tx: tx_arc })
+        .send(ShardEvent::process(NodeInput::SubmitTransaction {
+            tx: tx_arc,
+        }))
         .is_err()
     {
         return (

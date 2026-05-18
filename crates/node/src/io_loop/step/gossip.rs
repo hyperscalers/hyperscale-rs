@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use hyperscale_core::{NodeInput, ProtocolEvent};
+use hyperscale_core::ProtocolEvent;
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_engine::Engine;
 use hyperscale_network::Network;
@@ -25,7 +25,7 @@ use hyperscale_types::{
     committed_block_header_message,
 };
 
-use crate::io_loop::IoLoop;
+use crate::io_loop::{IoLoop, ShardEvent};
 use crate::shard::CommittedHeaderVerificationItem;
 use crate::shard::verify::verify_bls_with_metrics;
 
@@ -89,7 +89,7 @@ where
                     "committed_header",
                 );
                 if valid {
-                    let _ = event_tx.send(NodeInput::protocol(
+                    let _ = event_tx.send(ShardEvent::protocol(
                         shard,
                         ProtocolEvent::RemoteHeaderReceived {
                             committed_header,

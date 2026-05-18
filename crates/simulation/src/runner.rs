@@ -10,7 +10,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use crossbeam::channel::{Receiver, unbounded};
 use hyperscale_bft::BftConfig;
-use hyperscale_core::{NodeInput, ProtocolEvent, TimerId};
+use hyperscale_core::{ProtocolEvent, TimerId};
 use hyperscale_dispatch_sync::SyncDispatch;
 use hyperscale_engine::{
     GenesisConfig, RadixExecutor, SimExecutionCache, SimulationEngine, TransactionValidation,
@@ -21,7 +21,7 @@ use hyperscale_network_memory::{
     BandwidthReport, HostingMode, NetworkConfig, NetworkTrafficAnalyzer, NodeIndex,
     SimNetworkAdapter, SimulatedNetwork,
 };
-use hyperscale_node::io_loop::{IoLoop, StepOutput};
+use hyperscale_node::io_loop::{IoLoop, ShardEvent, StepOutput};
 use hyperscale_node::{NodeConfig, NodeStateMachine, TimerOp, VnodeInit, timer_event};
 use hyperscale_provisions::{ProvisionConfig, ProvisionStore};
 use hyperscale_storage::{ChainReader, RecoveredState};
@@ -62,10 +62,10 @@ pub struct SimulationRunner {
     io_loops: Vec<SimIoLoop>,
 
     /// Per-node event receivers (from crossbeam channels passed to `IoLoop`).
-    event_rxs: Vec<Receiver<NodeInput>>,
+    event_rxs: Vec<Receiver<ShardEvent>>,
 
     /// Global event queue, ordered deterministically.
-    event_queue: BTreeMap<EventKey, NodeInput>,
+    event_queue: BTreeMap<EventKey, ShardEvent>,
 
     /// Sequence counter for deterministic ordering.
     sequence: u64,
@@ -485,7 +485,11 @@ impl SimulationRunner {
     }
 
     /// Schedule an initial event (e.g., to start the simulation).
-    pub fn schedule_initial_event(&mut self, node: NodeIndex, delay: Duration, event: NodeInput) {
+    /// Schedule an event for initial delivery. The event must be wrapped
+    /// in the appropriate [`ShardEvent`] envelope: shard-scoped variants
+    /// via [`ShardEvent::shard`] / [`ShardEvent::protocol`], process-scoped
+    /// variants (`SubmitTransaction`, `FetchTick`) via [`ShardEvent::process`].
+    pub fn schedule_initial_event(&mut self, node: NodeIndex, delay: Duration, event: ShardEvent) {
         let time = self.now + delay;
         self.schedule_event(node, time, event);
     }
@@ -660,7 +664,7 @@ impl SimulationRunner {
                     genesis_block.clone(),
                     genesis_qc,
                 ));
-                let genesis_commit_event = NodeInput::protocol(
+                let genesis_commit_event = ShardEvent::protocol(
                     shard,
                     ProtocolEvent::BlockCommitted {
                         certified: genesis_certified,
@@ -762,7 +766,7 @@ impl SimulationRunner {
                 );
 
                 self.stats.events_processed += 1;
-                self.stats.events_by_priority[event.priority() as usize] += 1;
+                self.stats.events_by_priority[event.input.priority() as usize] += 1;
 
                 self.io_loops[node_index as usize].set_time(LocalTimestamp::from_millis(
                     u64::try_from(self.now.as_millis()).unwrap_or(u64::MAX),
@@ -887,7 +891,7 @@ impl SimulationRunner {
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Schedule a [`NodeInput`] event for delivery at the given time.
-    fn schedule_event(&mut self, node: NodeIndex, time: Duration, event: NodeInput) -> EventKey {
+    fn schedule_event(&mut self, node: NodeIndex, time: Duration, event: ShardEvent) -> EventKey {
         self.sequence += 1;
         let key = EventKey::new(time, &event, node, self.sequence);
         self.event_queue.insert(key, event);

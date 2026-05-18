@@ -11,6 +11,7 @@ use std::time::Duration;
 use hyperscale_core::NodeInput;
 use hyperscale_mempool::LockContentionStats;
 use hyperscale_network_memory::{BandwidthReport, NodeIndex};
+use hyperscale_node::io_loop::ShardEvent;
 use hyperscale_simulation::SimulationRunner;
 use hyperscale_spammer::validity::{ValidityClock, range_starting_at};
 use hyperscale_spammer::{
@@ -253,9 +254,9 @@ impl Simulator {
                     self.runner.schedule_initial_event(
                         node_idx,
                         Duration::ZERO,
-                        NodeInput::SubmitTransaction {
+                        ShardEvent::process(NodeInput::SubmitTransaction {
                             tx: Arc::clone(&tx),
-                        },
+                        }),
                     );
                 }
                 pending.insert(hash, *shard);
@@ -347,9 +348,9 @@ impl Simulator {
                     self.runner.schedule_initial_event(
                         node_idx,
                         Duration::ZERO,
-                        NodeInput::SubmitTransaction {
+                        ShardEvent::process(NodeInput::SubmitTransaction {
                             tx: Arc::clone(&tx),
-                        },
+                        }),
                     );
                 }
 

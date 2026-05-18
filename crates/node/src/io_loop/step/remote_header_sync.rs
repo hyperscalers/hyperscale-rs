@@ -22,8 +22,8 @@ use hyperscale_types::{
     BlockHeight, CommittedBlockHeader, HeaderFetchCount, ShardGroupId, ValidatorId,
 };
 
-use crate::io_loop::IoLoop;
 use crate::io_loop::step::block_sync::classify_fetch_error;
+use crate::io_loop::{IoLoop, ShardEvent};
 use crate::shard::sync::SyncOutput;
 use crate::shard::sync::remote_header::{RemoteHeaderSyncInput, RemoteHeaderSyncOutput};
 
@@ -181,24 +181,28 @@ where
                             match result {
                                 Ok(resp) => {
                                     record_sync_round_completed("remote_header");
-                                    let _ = es.send(NodeInput::RemoteHeadersResponseReceived {
+                                    let _ = es.send(ShardEvent::shard(
                                         local_shard,
-                                        source_shard,
-                                        from_height,
-                                        count: typed_count,
-                                        headers: resp.headers,
-                                    });
+                                        NodeInput::RemoteHeadersResponseReceived {
+                                            source_shard,
+                                            from_height,
+                                            count: typed_count,
+                                            headers: resp.headers,
+                                        },
+                                    ));
                                 }
                                 Err(err) => {
                                     record_sync_round_retried("remote_header");
                                     let kind = classify_fetch_error(&err);
-                                    let _ = es.send(NodeInput::RemoteHeadersFetchFailed {
+                                    let _ = es.send(ShardEvent::shard(
                                         local_shard,
-                                        source_shard,
-                                        from_height,
-                                        count: typed_count,
-                                        kind,
-                                    });
+                                        NodeInput::RemoteHeadersFetchFailed {
+                                            source_shard,
+                                            from_height,
+                                            count: typed_count,
+                                            kind,
+                                        },
+                                    ));
                                 }
                             }
                             ResponseVerdict::Accept

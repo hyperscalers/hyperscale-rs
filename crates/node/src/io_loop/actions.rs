@@ -20,7 +20,7 @@ use hyperscale_types::{
 };
 use tracing::{debug, error, trace, warn};
 
-use super::{IoLoop, TimerOp};
+use super::{IoLoop, ShardEvent, TimerOp};
 use crate::shard::block_commit::{AccumulateDecision, PendingCommit};
 use crate::shard::fetch::FetchInput;
 use crate::shard::fetch::binding::{
@@ -191,7 +191,7 @@ where
             self.process_remote_header_sync_outputs(shard, outputs);
         }
 
-        let _ = self.event_sender.send(NodeInput::protocol(shard, pe));
+        let _ = self.event_sender.send(ShardEvent::protocol(shard, pe));
     }
 
     fn handle_restore_committed_state(&self, shard: ShardGroupId) {
@@ -199,7 +199,7 @@ where
         let height = storage.committed_height();
         let hash = storage.committed_hash();
         let qc = storage.latest_qc();
-        let _ = self.event_sender.send(NodeInput::protocol(
+        let _ = self.event_sender.send(ShardEvent::protocol(
             shard,
             ProtocolEvent::CommittedStateRestored { height, hash, qc },
         ));
@@ -604,8 +604,11 @@ where
         let signing_key = Arc::clone(&vnode.signing_key);
 
         self.dispatch.spawn(pool, move || {
+            // Action handlers emit raw `NodeInput`s; wrap each with the
+            // dispatching vnode's shard so the receiver routes back to the
+            // right `ShardGroup`.
             let notify = move |event: NodeInput| {
-                let _ = event_tx.send(event);
+                let _ = event_tx.send(ShardEvent::shard(shard, event));
             };
             let shard_handles = handles
                 .per_shard

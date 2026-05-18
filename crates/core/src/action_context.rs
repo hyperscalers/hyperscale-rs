@@ -47,15 +47,12 @@ pub struct ActionContext<'a, S: Storage, E: Engine, N: Network> {
 
 impl<S: Storage, E: Engine, N: Network> ActionContext<'_, S, E, N> {
     /// Convenience wrapper around `notify` for the common case of
-    /// emitting a `ProtocolEvent`. Tags the event with the emitting
-    /// vnode's shard (read off `topology_snapshot.local_shard()`) so
-    /// cross-shard hosting routes the resulting `NodeInput::Protocol`
-    /// to the right hosted shard.
+    /// emitting a `ProtocolEvent`. The transport-layer envelope
+    /// (installed by the dispatch wrapper that captured the emitting
+    /// vnode's shard) routes the resulting `NodeInput::Protocol` back to
+    /// the right hosted shard.
     pub fn notify_protocol(&self, event: ProtocolEvent) {
-        (self.notify)(NodeInput::protocol(
-            self.topology_snapshot.local_shard(),
-            event,
-        ));
+        (self.notify)(NodeInput::Protocol(Box::new(event)));
     }
 }
 

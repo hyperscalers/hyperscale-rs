@@ -494,7 +494,6 @@ mod tests {
         let TestNode { mut node, .. } = TestNode::new();
 
         let actions = node.handle(ProtocolEvent::BlockPersisted {
-            shard: ShardGroupId::new(0),
             height: BlockHeight::new(10),
         });
 

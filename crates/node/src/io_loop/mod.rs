@@ -121,18 +121,62 @@ pub enum TimerOp {
     },
 }
 
-/// Translate a fired [`TimerId`] back into the [`NodeInput`] the runner
+/// Translate a fired [`TimerId`] back into the [`ShardEvent`] the runner
 /// pushes onto its event channel.
 ///
-/// Shard-scoped timers tag the shard so the resulting `NodeInput::Protocol`
-/// routes to the right hosted shard; `FetchTick` ignores the shard
-/// (process-scoped).
+/// Shard-scoped timers tag the envelope with `shard` so the resulting
+/// `NodeInput::Protocol` routes to the right hosted shard; `FetchTick`
+/// is process-scoped.
 #[must_use]
-pub fn timer_event(id: &TimerId, shard: ShardGroupId) -> NodeInput {
+pub fn timer_event(id: &TimerId, shard: ShardGroupId) -> ShardEvent {
     match id {
-        TimerId::ViewChange => NodeInput::protocol(shard, ProtocolEvent::ViewChangeTimer),
-        TimerId::Cleanup => NodeInput::protocol(shard, ProtocolEvent::CleanupTimer),
-        TimerId::FetchTick => NodeInput::FetchTick,
+        TimerId::ViewChange => ShardEvent::protocol(shard, ProtocolEvent::ViewChangeTimer),
+        TimerId::Cleanup => ShardEvent::protocol(shard, ProtocolEvent::CleanupTimer),
+        TimerId::FetchTick => ShardEvent::process(NodeInput::FetchTick),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// ShardEvent — transport-layer envelope carrying shard routing
+// ═══════════════════════════════════════════════════════════════════════
+
+/// A [`NodeInput`] plus the hosted-shard routing tag that the `IoLoop`'s
+/// transport uses to pick the right `ShardGroup`.
+///
+/// Shard-scoped variants set `shard = Some(_)`; process-scoped variants
+/// (`FetchTick`, `SubmitTransaction`) set `shard = None`. The `NodeInput`
+/// variants themselves carry no shard field — the envelope is the single
+/// source of truth, so off-thread callbacks just capture the shard once
+/// at dispatch time and stamp every result.
+#[derive(Debug, Clone)]
+pub struct ShardEvent {
+    /// Hosted shard the input routes to. `None` for process-scoped inputs
+    /// that don't belong to any one shard.
+    pub shard: Option<ShardGroupId>,
+    /// The payload.
+    pub input: NodeInput,
+}
+
+impl ShardEvent {
+    /// Construct a shard-scoped envelope.
+    #[must_use]
+    pub const fn shard(shard: ShardGroupId, input: NodeInput) -> Self {
+        Self {
+            shard: Some(shard),
+            input,
+        }
+    }
+
+    /// Construct a process-scoped envelope.
+    #[must_use]
+    pub const fn process(input: NodeInput) -> Self {
+        Self { shard: None, input }
+    }
+
+    /// Construct a shard-scoped `Protocol` envelope for `event`.
+    #[must_use]
+    pub fn protocol(shard: ShardGroupId, event: ProtocolEvent) -> Self {
+        Self::shard(shard, NodeInput::Protocol(Box::new(event)))
     }
 }
 
@@ -219,8 +263,9 @@ where
     /// Channel back to the pinned-thread event loop.
     ///
     /// Off-thread work spawned via `dispatch.spawn(pool, ...)` returns
-    /// results here as `NodeInput` events, which the next pinned-thread
-    /// `step()` iteration drains. Two routing rules:
+    /// results here as [`ShardEvent`] envelopes (a `NodeInput` plus its
+    /// hosted-shard tag), which the next pinned-thread `step()`
+    /// iteration drains. Two routing rules for the payload:
     ///
     /// - **State-machine consumers** (BFT / execution / mempool — anything
     ///   driven by `state.handle()`) ride
@@ -239,7 +284,7 @@ where
     /// `SyncBlockValidationFailed`), abort on storage faults
     /// (block-commit). Don't paper over these in a generic helper —
     /// each `dispatch.spawn` site calls `event_sender.send` directly.
-    event_sender: Sender<NodeInput>,
+    event_sender: Sender<ShardEvent>,
 
     /// Lock-free topology snapshot shared with network handler closures
     /// and delegated dispatch jobs. The pinned thread is the sole writer
@@ -316,7 +361,7 @@ where
         executor: E,
         network: N,
         dispatch: D,
-        event_sender: Sender<NodeInput>,
+        event_sender: Sender<ShardEvent>,
         topology_snapshot: SharedTopologySnapshot,
         config: NodeConfig,
         tx_validator: Arc<TransactionValidation>,
@@ -638,8 +683,12 @@ where
     /// 3. Process `emitted_statuses` from the returned [`StepOutput`]
     /// 4. Drain any events produced through the event channel (simulation only —
     ///    production receives these via its crossbeam channel receivers)
+    ///
+    /// # Panics
+    /// Panics if `event` is a shard-scoped variant but the envelope's
+    /// `shard` is `None` — this is a wiring bug, not a runtime input.
     #[allow(clippy::too_many_lines)] // single dispatch over NodeInput; one arm per event variant
-    pub fn step(&mut self, event: NodeInput) -> StepOutput {
+    pub fn step(&mut self, event: ShardEvent) -> StepOutput {
         for group in self.shards.values_mut() {
             for vnode in &mut group.vnodes {
                 vnode.emitted_statuses.clear();
@@ -649,76 +698,83 @@ where
         }
         self.pending_timer_ops.clear();
 
-        match event {
+        let ShardEvent { shard, input } = event;
+        // Shard-scoped variants reach for the envelope shard; process-scoped
+        // variants (`FetchTick`, `SubmitTransaction`) ignore it. We unwrap
+        // here so the per-arm code stays compact — a missing shard on a
+        // shard-scoped variant is a wiring bug.
+        let with_shard = |label: &'static str| -> ShardGroupId {
+            shard.unwrap_or_else(|| {
+                panic!("ShardEvent for shard-scoped variant `{label}` missing envelope shard")
+            })
+        };
+        match input {
             // ── Transaction validation pipeline ────────────────────────
-            NodeInput::TransactionGossipReceived { local_shard, tx } => {
-                self.handle_gossip_received_tx_for_validation(local_shard, tx);
+            NodeInput::TransactionGossipReceived { tx } => {
+                self.handle_gossip_received_tx_for_validation(
+                    with_shard("TransactionGossipReceived"),
+                    tx,
+                );
             }
-            NodeInput::TransactionValidated { local_shard, tx } => {
-                self.handle_transaction_validated(local_shard, tx);
+            NodeInput::TransactionValidated { tx } => {
+                self.handle_transaction_validated(with_shard("TransactionValidated"), tx);
             }
-            NodeInput::TransactionValidationsFailed {
-                local_shard,
-                hashes,
-            } => {
-                self.handle_transaction_validations_failed(local_shard, &hashes);
+            NodeInput::TransactionValidationsFailed { hashes } => {
+                self.handle_transaction_validations_failed(
+                    with_shard("TransactionValidationsFailed"),
+                    &hashes,
+                );
             }
-            NodeInput::Protocol { shard, event } => match *event {
-                ProtocolEvent::BlockPersisted {
-                    shard: persisted_shard,
-                    height,
-                } => {
-                    // `BlockPersisted` carries its own shard on the event
-                    // (it's emitted by storage drain, not by a vnode) — use
-                    // it directly so the commit-pipeline plumbing works
-                    // even if the carrier `NodeInput::Protocol.shard`
-                    // disagrees (shouldn't, but defensive).
-                    self.handle_block_persisted(persisted_shard, height);
+            NodeInput::Protocol(event) => {
+                let shard = with_shard("Protocol");
+                match *event {
+                    ProtocolEvent::BlockPersisted { height } => {
+                        self.handle_block_persisted(shard, height);
+                    }
+                    other => self.handle_protocol_passthrough(shard, other),
                 }
-                other => self.handle_protocol_passthrough(shard, other),
-            },
+            }
             NodeInput::SubmitTransaction { tx } => {
                 self.handle_submit_transaction(&tx);
             }
 
             // ── Sync protocol ──────────────────────────────────────────
-            NodeInput::BlockSyncResponseReceived {
-                local_shard,
-                height,
-                block,
-            } => {
-                self.handle_block_sync_response_received(local_shard, height, block);
+            NodeInput::BlockSyncResponseReceived { height, block } => {
+                self.handle_block_sync_response_received(
+                    with_shard("BlockSyncResponseReceived"),
+                    height,
+                    block,
+                );
             }
-            NodeInput::BlockSyncFetchFailed {
-                local_shard,
-                height,
-                kind,
-            } => {
-                self.handle_block_sync_fetch_failed(local_shard, height, kind);
+            NodeInput::BlockSyncFetchFailed { height, kind } => {
+                self.handle_block_sync_fetch_failed(
+                    with_shard("BlockSyncFetchFailed"),
+                    height,
+                    kind,
+                );
             }
-            NodeInput::SyncBlockValidated {
-                local_shard,
-                height,
-                certified,
-            } => {
-                self.handle_sync_block_validated(local_shard, height, *certified);
+            NodeInput::SyncBlockValidated { height, certified } => {
+                self.handle_sync_block_validated(
+                    with_shard("SyncBlockValidated"),
+                    height,
+                    *certified,
+                );
             }
-            NodeInput::SyncBlockValidationFailed {
-                local_shard,
-                height,
-                reason,
-            } => {
-                self.handle_sync_block_validation_failed(local_shard, height, reason);
+            NodeInput::SyncBlockValidationFailed { height, reason } => {
+                self.handle_sync_block_validation_failed(
+                    with_shard("SyncBlockValidationFailed"),
+                    height,
+                    reason,
+                );
             }
             NodeInput::RemoteHeadersResponseReceived {
-                local_shard,
                 source_shard,
                 from_height,
                 count,
                 headers,
             } => {
                 self.handle_remote_headers_response_received(
-                    local_shard,
+                    with_shard("RemoteHeadersResponseReceived"),
                     source_shard,
                     from_height,
                     count,
@@ -726,14 +782,13 @@ where
                 );
             }
             NodeInput::RemoteHeadersFetchFailed {
-                local_shard,
                 source_shard,
                 from_height,
                 count,
                 kind,
             } => {
                 self.handle_remote_headers_fetch_failed(
-                    local_shard,
+                    with_shard("RemoteHeadersFetchFailed"),
                     source_shard,
                     from_height,
                     count,
@@ -742,12 +797,9 @@ where
             }
 
             // ── Fetch protocol ─────────────────────────────────────────
-            NodeInput::TransactionsFetchFailed {
-                local_shard,
-                hashes,
-            } => {
+            NodeInput::TransactionsFetchFailed { hashes } => {
                 self.drive_fetch::<TransactionBinding>(
-                    local_shard,
+                    with_shard("TransactionsFetchFailed"),
                     FetchInput::Failed { ids: hashes },
                 );
                 self.update_fetch_tick_timer();
@@ -756,10 +808,10 @@ where
             NodeInput::FetchTick => self.handle_fetch_tick(),
 
             NodeInput::ProvisionsFetchFailed {
-                local_shard,
                 source_shard,
                 block_height,
             } => {
+                let local_shard = with_shard("ProvisionsFetchFailed");
                 self.drive_fetch::<ProvisionBinding>(
                     local_shard,
                     FetchInput::Failed {
@@ -769,12 +821,9 @@ where
                 self.update_fetch_tick_timer();
             }
 
-            NodeInput::ExecCertFetchFailed {
-                local_shard,
-                hashes,
-            } => {
+            NodeInput::ExecCertFetchFailed { hashes } => {
                 self.drive_fetch::<ExecCertBinding>(
-                    local_shard,
+                    with_shard("ExecCertFetchFailed"),
                     FetchInput::Failed { ids: hashes },
                 );
                 self.update_fetch_tick_timer();
@@ -782,32 +831,31 @@ where
 
             // ── Committed header (gossip → BLS verify → state machine) ──
             NodeInput::CommittedBlockGossipReceived {
-                local_shard,
                 committed_header,
                 sender,
                 public_key,
                 sender_signature,
             } => self.handle_committed_block_gossip_received(
-                local_shard,
+                with_shard("CommittedBlockGossipReceived"),
                 committed_header,
                 sender,
                 public_key,
                 sender_signature,
             ),
 
-            NodeInput::LocalProvisionsFetchFailed {
-                local_shard,
-                hashes,
-            } => {
+            NodeInput::LocalProvisionsFetchFailed { hashes } => {
                 self.drive_fetch::<LocalProvisionBinding>(
-                    local_shard,
+                    with_shard("LocalProvisionsFetchFailed"),
                     FetchInput::Failed { ids: hashes },
                 );
                 self.update_fetch_tick_timer();
             }
 
-            NodeInput::FinalizedWavesFetchFailed { local_shard, ids } => {
-                self.drive_fetch::<FinalizedWaveBinding>(local_shard, FetchInput::Failed { ids });
+            NodeInput::FinalizedWavesFetchFailed { ids } => {
+                self.drive_fetch::<FinalizedWaveBinding>(
+                    with_shard("FinalizedWavesFetchFailed"),
+                    FetchInput::Failed { ids },
+                );
                 self.update_fetch_tick_timer();
             }
         }

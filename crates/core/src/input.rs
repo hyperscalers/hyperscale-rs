@@ -42,26 +42,18 @@ pub enum EventPriority {
 /// - `NodeInput`-specific variants: events that `IoLoop` handles internally
 ///   (sync, fetch, validation pipeline) before potentially converting them
 ///   into `ProtocolEvent`s.
+///
+/// Shard routing is carried by the transport-layer envelope (see
+/// `hyperscale_node::io_loop::ShardEvent`), not by the variants
+/// themselves. Process-scoped variants (`FetchTick`, `SubmitTransaction`)
+/// have no shard in the envelope; everything else does.
 #[derive(Debug, Clone, strum::IntoStaticStr)]
 pub enum NodeInput {
     /// Pass-through to state machine. `IoLoop` extracts the `ProtocolEvent`
-    /// and passes it to `state.handle()` directly on every vnode hosted in
-    /// `shard`. Boxed because `ProtocolEvent` dwarfs every other variant
-    /// and would inflate the event queue otherwise.
-    ///
-    /// `shard` is supplied at emission time so cross-shard hosting can
-    /// fan the event out to the right vnodes — the prior single-shard
-    /// design fell back to `vnodes[0].shard` and broke quietly when the
-    /// host carried vnodes across multiple shards. Off-thread emission
-    /// sites (BLS verify, sync rehydrate, fetch response callbacks)
-    /// capture the shard at their dispatch point.
-    Protocol {
-        /// Hosted shard this event applies to. Used by `IoLoop::step()`
-        /// to select which vnodes receive the event.
-        shard: ShardGroupId,
-        /// Boxed protocol event payload.
-        event: Box<ProtocolEvent>,
-    },
+    /// and feeds it to every vnode hosted in the envelope's shard. Boxed
+    /// because `ProtocolEvent` dwarfs every other variant and would inflate
+    /// the event queue otherwise.
+    Protocol(Box<ProtocolEvent>),
 
     /// Client submitted a transaction.
     SubmitTransaction {
@@ -73,10 +65,6 @@ pub enum NodeInput {
     /// validation; the validated form is surfaced as
     /// `ProtocolEvent::TransactionValidated`.
     TransactionGossipReceived {
-        /// Hosted shard the gossip arrived on. Cross-shard hosting
-        /// keys mempool/validation pipeline state by this shard rather
-        /// than `vnodes[0].shard`.
-        local_shard: ShardGroupId,
         /// The transaction.
         tx: Arc<RoutableTransaction>,
     },
@@ -86,9 +74,6 @@ pub enum NodeInput {
     /// by looking up omitted bodies in the local mempool / cert cache /
     /// provision store before handing off to the sync state machine.
     BlockSyncResponseReceived {
-        /// Hosted shard whose sync FSM dispatched the fetch and now
-        /// admits the response.
-        local_shard: ShardGroupId,
         /// Height of the block being synced.
         height: BlockHeight,
         /// Elided block payload, or `None` if the peer couldn't serve this height.
@@ -97,8 +82,6 @@ pub enum NodeInput {
 
     /// Sync block fetch failed from network callback.
     BlockSyncFetchFailed {
-        /// Hosted shard whose sync FSM dispatched the fetch.
-        local_shard: ShardGroupId,
         /// Height that failed to fetch.
         height: BlockHeight,
         /// Why the fetch failed — drives whether the sync FSM re-queues
@@ -110,8 +93,6 @@ pub enum NodeInput {
     /// QC binding, per-wave shape). The pinned-thread `IoLoop` re-enters
     /// the post-validation delivery path on receipt.
     SyncBlockValidated {
-        /// Hosted shard the block belongs to.
-        local_shard: ShardGroupId,
         /// Height of the validated block.
         height: BlockHeight,
         /// Rehydrated, structurally-valid certified block ready for BFT.
@@ -121,8 +102,6 @@ pub enum NodeInput {
     /// Sync block failed structural validation off-thread. The pinned
     /// thread re-queues the height for retry.
     SyncBlockValidationFailed {
-        /// Hosted shard whose sync FSM re-queues the height.
-        local_shard: ShardGroupId,
         /// Height that failed to validate.
         height: BlockHeight,
         /// Static reason tag — used for both metrics labels and warn logs.
@@ -133,9 +112,6 @@ pub enum NodeInput {
     /// ascending height order starting at `from_height`; missing tail
     /// heights (responder short-capped) get re-deferred by the FSM.
     RemoteHeadersResponseReceived {
-        /// Hosted shard whose `RemoteHeaderCoordinator` admits these
-        /// headers (the "consumer" side; distinct from `source_shard`).
-        local_shard: ShardGroupId,
         /// Source shard the fetch targeted.
         source_shard: ShardGroupId,
         /// First height of the requested range.
@@ -148,8 +124,6 @@ pub enum NodeInput {
 
     /// Remote-header range fetch failed (transport error / no peer).
     RemoteHeadersFetchFailed {
-        /// Hosted shard whose `RemoteHeaderCoordinator` re-queues.
-        local_shard: ShardGroupId,
         /// Source shard the fetch targeted.
         source_shard: ShardGroupId,
         /// First height of the requested range.
@@ -166,25 +140,18 @@ pub enum NodeInput {
 
     /// A transaction fetch request failed (network error or peer returned None).
     TransactionsFetchFailed {
-        /// Hosted shard whose `FetchHost` owns the in-flight tracking
-        /// for these ids.
-        local_shard: ShardGroupId,
         /// Transaction hashes that failed to fetch.
         hashes: Vec<TxHash>,
     },
 
     /// Local provision fetch failed.
     LocalProvisionsFetchFailed {
-        /// Hosted shard whose `FetchHost` owns the in-flight tracking.
-        local_shard: ShardGroupId,
         /// Provision hashes that failed to fetch.
         hashes: Vec<ProvisionHash>,
     },
 
     /// A finalized-wave fetch request failed.
     FinalizedWavesFetchFailed {
-        /// Hosted shard whose `FetchHost` owns the in-flight tracking.
-        local_shard: ShardGroupId,
         /// Wave ids that weren't returned.
         ids: Vec<WaveId>,
     },
@@ -193,11 +160,6 @@ pub enum NodeInput {
     /// resolves `submitted_locally` from its `locally_submitted` set
     /// before forwarding as `ProtocolEvent::TransactionValidated`.
     TransactionValidated {
-        /// Hosted shard whose `ShardIo` owns the validation tracking
-        /// sets for this batch. Captured at `flush_validation_batch`
-        /// dispatch so the result routes to the right hosted shard
-        /// under cross-shard hosting.
-        local_shard: ShardGroupId,
         /// Validated transaction ready for the mempool.
         tx: Arc<RoutableTransaction>,
     },
@@ -205,8 +167,6 @@ pub enum NodeInput {
     /// Transactions that failed validation — sent back so the `IoLoop` can
     /// remove their hashes from `pending_validation` and `locally_submitted`.
     TransactionValidationsFailed {
-        /// Hosted shard whose tracking sets to clean up.
-        local_shard: ShardGroupId,
         /// Hashes of transactions that failed validation.
         hashes: Vec<TxHash>,
     },
@@ -215,10 +175,6 @@ pub enum NodeInput {
     /// (sender committee check + public key resolution) but still needs
     /// batched BLS signature verification.
     CommittedBlockGossipReceived {
-        /// Hosted shard this gossip is consumed by — derived from the
-        /// receiving vnode's `local_shard`, not from the header's shard
-        /// (the header is from a remote shard).
-        local_shard: ShardGroupId,
         /// Header carried in the gossip envelope. `Arc`-shared so local
         /// publishers and the BLS-verify batch all hold the same
         /// allocation — `RemoteHeaderReceived` downstream takes
@@ -234,11 +190,10 @@ pub enum NodeInput {
     },
 
     /// A provision fetch request failed (network error or peer returned None).
+    /// The envelope shard is the consumer (target) shard whose `FetchHost`
+    /// owns the in-flight tracking; `source_shard` here is the originating
+    /// shard whose provisions were being fetched.
     ProvisionsFetchFailed {
-        /// Hosted shard whose `FetchHost` owns the in-flight tracking
-        /// (the "target" shard from the perspective of the provision
-        /// flow; distinct from `source_shard`).
-        local_shard: ShardGroupId,
         /// Source shard whose provisions were being fetched.
         source_shard: ShardGroupId,
         /// Source-shard block height the provisions were anchored to.
@@ -247,8 +202,6 @@ pub enum NodeInput {
 
     /// An execution certificate fetch request failed.
     ExecCertFetchFailed {
-        /// Hosted shard whose `FetchHost` owns the in-flight tracking.
-        local_shard: ShardGroupId,
         /// Wave ids that weren't returned.
         hashes: Vec<WaveId>,
     },
@@ -266,7 +219,7 @@ impl NodeInput {
             // Priority is a scheduling concern, not a protocol concern.
             // Timers and network-received messages are classified explicitly;
             // everything else (callbacks, continuations, completions) defaults to Internal.
-            Self::Protocol { event, .. } => match event.as_ref() {
+            Self::Protocol(event) => match event.as_ref() {
                 ProtocolEvent::ViewChangeTimer | ProtocolEvent::CleanupTimer => {
                     EventPriority::Timer
                 }
@@ -330,22 +283,8 @@ impl NodeInput {
     #[must_use]
     pub fn type_name(&self) -> &'static str {
         match self {
-            Self::Protocol { event, .. } => event.type_name(),
+            Self::Protocol(event) => event.type_name(),
             other => other.into(),
-        }
-    }
-}
-
-impl NodeInput {
-    /// Construct a `NodeInput::Protocol` for `shard` from `event`.
-    /// Convenience for the common case where the caller has both
-    /// `shard` and `event` in scope and doesn't want to spell out the
-    /// boxing + struct construction.
-    #[must_use]
-    pub fn protocol(shard: ShardGroupId, event: ProtocolEvent) -> Self {
-        Self::Protocol {
-            shard,
-            event: Box::new(event),
         }
     }
 }

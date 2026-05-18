@@ -49,7 +49,7 @@ use core_affinity::{get_core_ids, set_for_current};
 use crossbeam::channel::{Receiver, Sender, unbounded};
 use hex::encode as hex_encode;
 use hyperscale_bft::BftConfig;
-use hyperscale_core::{NodeInput, ProtocolEvent, TimerId};
+use hyperscale_core::{ProtocolEvent, TimerId};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_dispatch_pooled::{PooledDispatch, ThreadPoolConfig};
 use hyperscale_engine::{GenesisConfig, NetworkDefinition, RadixExecutor, TransactionValidation};
@@ -64,7 +64,9 @@ use hyperscale_network_libp2p::{
     Libp2pAdapter, Libp2pConfig, Libp2pNetwork, NetworkError, RequestManager, RequestManagerConfig,
     RequestStreamPool, generate_random_keypair,
 };
-use hyperscale_node::io_loop::{IoLoop, NodeStatusSnapshot, TimerOp, record_metrics, timer_event};
+use hyperscale_node::io_loop::{
+    IoLoop, NodeStatusSnapshot, ShardEvent, TimerOp, record_metrics, timer_event,
+};
 use hyperscale_node::{NodeConfig, NodeStateMachine, SharedTopologySnapshot, VnodeInit};
 use hyperscale_provisions::{ProvisionConfig, ProvisionStore};
 use hyperscale_storage::ChainReader;
@@ -543,21 +545,21 @@ pub struct ProductionRunner {
 
     /// Timer events to pinned thread (for external timer injection if needed).
     #[allow(dead_code)]
-    xb_timer_tx: Sender<NodeInput>,
+    xb_timer_tx: Sender<ShardEvent>,
     /// Consensus events to pinned thread (from libp2p adapter routing).
-    xb_consensus_tx: Sender<NodeInput>,
+    xb_consensus_tx: Sender<ShardEvent>,
     /// Kept alive solely to prevent the crossbeam callback channel from closing.
     #[allow(dead_code)]
-    xb_callback_tx: Sender<NodeInput>,
+    xb_callback_tx: Sender<ShardEvent>,
     /// Shutdown signal to pinned thread.
     xb_shutdown_tx: Sender<()>,
 
     /// Timer receiver (moved to `PinnedLoopConfig`).
-    xb_timer_rx: Option<Receiver<NodeInput>>,
+    xb_timer_rx: Option<Receiver<ShardEvent>>,
     /// Callback receiver (moved to `PinnedLoopConfig`).
-    xb_callback_rx: Option<Receiver<NodeInput>>,
+    xb_callback_rx: Option<Receiver<ShardEvent>>,
     /// Consensus receiver (moved to `PinnedLoopConfig`).
-    xb_consensus_rx: Option<Receiver<NodeInput>>,
+    xb_consensus_rx: Option<Receiver<ShardEvent>>,
     /// Shutdown receiver (moved to `PinnedLoopConfig`).
     xb_shutdown_rx: Option<Receiver<()>>,
 
@@ -650,7 +652,7 @@ impl ProductionRunner {
     /// Events sent through this sender are forwarded to the pinned `IoLoop`
     /// thread via the crossbeam consensus channel.
     #[must_use]
-    pub fn event_sender(&self) -> Sender<NodeInput> {
+    pub fn event_sender(&self) -> Sender<ShardEvent> {
         self.xb_consensus_tx.clone()
     }
 
@@ -660,7 +662,7 @@ impl ProductionRunner {
     /// RPC handlers wrap transactions in `Event::SubmitTransaction` before sending.
     /// `IoLoop` handles gossip, validation, and mempool dispatch.
     #[must_use]
-    pub fn tx_submission_sender(&self) -> Sender<NodeInput> {
+    pub fn tx_submission_sender(&self) -> Sender<ShardEvent> {
         self.xb_consensus_tx.clone()
     }
 
@@ -769,7 +771,7 @@ impl ProductionRunner {
             };
             let genesis_certified =
                 Arc::new(CertifiedBlock::new_unchecked(genesis_block, genesis_qc));
-            let genesis_commit_output = io_loop.step(NodeInput::protocol(
+            let genesis_commit_output = io_loop.step(ShardEvent::protocol(
                 shard,
                 ProtocolEvent::BlockCommitted {
                     certified: genesis_certified,
@@ -995,10 +997,10 @@ type ProdIoLoop = IoLoop<SharedStorage, Libp2pNetwork, PooledDispatch>;
 
 /// Configuration for the pinned event loop.
 struct PinnedLoopConfig {
-    timer_tx: Sender<NodeInput>,
-    timer_rx: Receiver<NodeInput>,
-    callback_rx: Receiver<NodeInput>,
-    consensus_rx: Receiver<NodeInput>,
+    timer_tx: Sender<ShardEvent>,
+    timer_rx: Receiver<ShardEvent>,
+    callback_rx: Receiver<ShardEvent>,
+    consensus_rx: Receiver<ShardEvent>,
     shutdown_rx: Receiver<()>,
     tokio_handle: TokioHandle,
     initial_timer_ops: Vec<TimerOp>,
@@ -1017,12 +1019,12 @@ struct PinnedLoopConfig {
 /// into the crossbeam timer channel.
 struct ProdTimerManager {
     tokio_handle: TokioHandle,
-    timer_tx: Sender<NodeInput>,
+    timer_tx: Sender<ShardEvent>,
     active: HashMap<(ShardGroupId, TimerId), JoinHandle<()>>,
 }
 
 impl ProdTimerManager {
-    fn new(tokio_handle: TokioHandle, timer_tx: Sender<NodeInput>) -> Self {
+    fn new(tokio_handle: TokioHandle, timer_tx: Sender<ShardEvent>) -> Self {
         Self {
             tokio_handle,
             timer_tx,

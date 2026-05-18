@@ -23,7 +23,7 @@ use hyperscale_types::network::response::{
 use hyperscale_types::{ExecutionCertificate, FinalizedWave, ShardGroupId, WaveId};
 use tracing::warn;
 
-use super::IoLoop;
+use super::{IoLoop, ShardEvent};
 use crate::shard::verify::{resolve_sender_key, verify_bls_with_metrics, verify_sender_signature};
 
 impl<S, N, D, E> IoLoop<S, N, D, E>
@@ -404,10 +404,10 @@ where
                     return GossipVerdict::Reject;
                 }
                 for transaction in gossip.transactions.into_inner() {
-                    let _ = tx.send(NodeInput::TransactionGossipReceived {
+                    let _ = tx.send(ShardEvent::shard(
                         local_shard,
-                        tx: transaction,
-                    });
+                        NodeInput::TransactionGossipReceived { tx: transaction },
+                    ));
                 }
                 GossipVerdict::Accept
             },
@@ -453,13 +453,15 @@ where
                     // remote headers for its shard's cross-shard
                     // provisioning needs.
                     for local_shard in hosted_shards_for_hdr.iter() {
-                        let _ = tx.send(NodeInput::CommittedBlockGossipReceived {
-                            local_shard: *local_shard,
-                            committed_header: gossip.committed_header.clone(),
-                            sender,
-                            public_key,
-                            sender_signature: gossip.sender_signature,
-                        });
+                        let _ = tx.send(ShardEvent::shard(
+                            *local_shard,
+                            NodeInput::CommittedBlockGossipReceived {
+                                committed_header: gossip.committed_header.clone(),
+                                sender,
+                                public_key,
+                                sender_signature: gossip.sender_signature,
+                            },
+                        ));
                     }
                     GossipVerdict::Accept
                 },
@@ -497,7 +499,7 @@ where
                         );
                         return;
                     }
-                    let _ = tx.send(NodeInput::protocol(
+                    let _ = tx.send(ShardEvent::protocol(
                         shard,
                         ProtocolEvent::BlockVoteReceived { vote: gossip.vote },
                     ));
@@ -545,7 +547,7 @@ where
                         return;
                     }
                     let (header, manifest, _sig) = gossip.into_parts();
-                    let _ = tx.send(NodeInput::protocol(
+                    let _ = tx.send(ShardEvent::protocol(
                         shard,
                         ProtocolEvent::BlockHeaderReceived { header, manifest },
                     ));
@@ -588,7 +590,7 @@ where
                         return;
                     }
 
-                    let _ = tx.send(NodeInput::protocol(
+                    let _ = tx.send(ShardEvent::protocol(
                         target_shard,
                         ProtocolEvent::ProvisionsReceived {
                             provisions: notification.provisions,
@@ -638,7 +640,7 @@ where
                     }
 
                     for vote in batch.into_votes() {
-                        let _ = tx.send(NodeInput::protocol(
+                        let _ = tx.send(ShardEvent::protocol(
                             target_shard,
                             ProtocolEvent::ExecutionVoteReceived { vote },
                         ));
@@ -699,7 +701,7 @@ where
                     // expected-cert sets, so each hosted shard decides
                     // whether to admit (no-op if unexpected).
                     for hosted_shard in shards.iter() {
-                        let _ = tx.send(NodeInput::protocol(
+                        let _ = tx.send(ShardEvent::protocol(
                             *hosted_shard,
                             ProtocolEvent::ExecutionCertificatesReceived {
                                 certificates: certificates.clone(),

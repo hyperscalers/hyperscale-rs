@@ -20,13 +20,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crossbeam::channel::Sender;
-use hyperscale_core::{CommitSource, NodeInput, ProtocolEvent};
+use hyperscale_core::{CommitSource, ProtocolEvent};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_metrics::{record_block_committed, set_block_height};
 use hyperscale_storage::ChainWriter;
 use hyperscale_types::{
     Block, BlockHash, BlockHeight, CertifiedBlock, LocalTimestamp, QuorumCertificate, ShardGroupId,
 };
+
+use crate::io_loop::ShardEvent;
 
 /// Block + QC pair handed back to the `io_loop` to build a [`CertifiedBlock`]
 /// for immediate `BlockCommitted` delivery. Cloned `Arc` handles to the
@@ -251,7 +253,7 @@ where
     pub fn flush<D: Dispatch>(
         &mut self,
         storage: &Arc<S>,
-        event_tx: &Sender<NodeInput>,
+        event_tx: &Sender<ShardEvent>,
         dispatch: &D,
     ) {
         if self.pending.is_empty() {
@@ -374,7 +376,7 @@ where
                         Arc::unwrap_or_clone(commit.block),
                         Arc::unwrap_or_clone(commit.qc),
                     ));
-                    let _ = event_tx.send(NodeInput::protocol(
+                    let _ = event_tx.send(ShardEvent::protocol(
                         shard,
                         ProtocolEvent::BlockCommitted { certified },
                     ));
@@ -387,10 +389,9 @@ where
             // calls flush to drain any backlog.
             in_flight.store(false, Ordering::Release);
 
-            let _ = event_tx.send(NodeInput::protocol(
+            let _ = event_tx.send(ShardEvent::protocol(
                 shard,
                 ProtocolEvent::BlockPersisted {
-                    shard,
                     height: max_persisted,
                 },
             ));
@@ -403,6 +404,7 @@ mod tests {
     use std::sync::atomic::AtomicU64;
 
     use crossbeam::channel::{Receiver, unbounded};
+    use hyperscale_core::NodeInput;
     use hyperscale_dispatch_sync::SyncDispatch;
     use hyperscale_storage::tree::CollectedWrites;
     use hyperscale_storage::{BaseReadCache, JmtSnapshot};
@@ -552,9 +554,13 @@ mod tests {
         TAG_GEN.fetch_add(1, Ordering::Relaxed)
     }
 
-    fn drain_protocol_events(rx: &Receiver<NodeInput>) -> Vec<ProtocolEvent> {
+    fn drain_protocol_events(rx: &Receiver<ShardEvent>) -> Vec<ProtocolEvent> {
         let mut out = Vec::new();
-        while let Ok(NodeInput::Protocol { event, .. }) = rx.try_recv() {
+        while let Ok(ShardEvent {
+            input: NodeInput::Protocol(event),
+            ..
+        }) = rx.try_recv()
+        {
             out.push(*event);
         }
         out

@@ -14,6 +14,7 @@ use hyperscale_core::NodeInput;
 use hyperscale_metrics::{MetricsRecorder, with_scoped_recorder};
 use hyperscale_metrics_memory::MemoryRecorder;
 use hyperscale_network_memory::{NetworkConfig, RuleHandle};
+use hyperscale_node::io_loop::ShardEvent;
 use hyperscale_simulation::SimulationRunner;
 use hyperscale_types::test_utils::test_validity_range;
 use hyperscale_types::{
@@ -151,7 +152,7 @@ fn transaction_fetch_fallback_when_gossip_dropped() {
         runner.schedule_initial_event(
             0,
             Duration::ZERO,
-            NodeInput::SubmitTransaction { tx: Arc::new(tx) },
+            ShardEvent::process(NodeInput::SubmitTransaction { tx: Arc::new(tx) }),
         );
 
         runner.run_until(Duration::from_secs(10));
@@ -267,7 +268,7 @@ fn run_cross_shard_fault_scenario_with_seed<F>(
         runner.schedule_initial_event(
             0,
             runner.now(),
-            NodeInput::SubmitTransaction { tx: Arc::new(tx) },
+            ShardEvent::process(NodeInput::SubmitTransaction { tx: Arc::new(tx) }),
         );
 
         runner.run_until(runner.now() + Duration::from_secs(30));

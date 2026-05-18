@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use crossbeam::channel::Sender;
-use hyperscale_core::NodeInput;
+use hyperscale_node::io_loop::ShardEvent;
 use hyperscale_types::{InFlightCount, ShardGroupId, TransactionStatus, TxHash};
 use quick_cache::sync::Cache as QuickCache;
 
@@ -15,9 +15,10 @@ use crate::status::SyncStatus;
 
 /// Type alias for the transaction submission channel.
 ///
-/// RPC handlers send `Event::SubmitTransaction` directly to the `IoLoop`'s
-/// crossbeam event channel, bypassing tokio mpsc bridges entirely.
-pub type TxSubmissionSender = Sender<NodeInput>;
+/// RPC handlers wrap `NodeInput::SubmitTransaction` in a process-scoped
+/// [`ShardEvent`] before sending; the `IoLoop`'s event loop unwraps it
+/// and dispatches across every hosted shard the tx touches.
+pub type TxSubmissionSender = Sender<ShardEvent>;
 
 /// Shared state for RPC handlers.
 #[derive(Clone)]

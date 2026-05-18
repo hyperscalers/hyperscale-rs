@@ -50,7 +50,7 @@ use hyperscale_types::{
     compute_provision_root, compute_transaction_root,
 };
 
-use crate::io_loop::IoLoop;
+use crate::io_loop::{IoLoop, ShardEvent};
 use crate::shard::sync::SyncOutput;
 use crate::shard::sync::block::{BlockSyncInput, BlockSyncOutput};
 
@@ -126,19 +126,14 @@ where
         let event_tx = self.event_sender.clone();
         let local_shard = shard;
         self.dispatch.spawn(DispatchPool::ConsensusCrypto, move || {
-            let event = match validate_synced_block(height, &cert) {
+            let input = match validate_synced_block(height, &cert) {
                 Ok(()) => NodeInput::SyncBlockValidated {
-                    local_shard,
                     height,
                     certified: Box::new(cert),
                 },
-                Err(reason) => NodeInput::SyncBlockValidationFailed {
-                    local_shard,
-                    height,
-                    reason,
-                },
+                Err(reason) => NodeInput::SyncBlockValidationFailed { height, reason },
             };
-            let _ = event_tx.send(event);
+            let _ = event_tx.send(ShardEvent::shard(local_shard, input));
         });
     }
 
@@ -246,19 +241,17 @@ where
                 match result {
                     Ok(resp) => {
                         let block = resp.into_elided().map(Box::new);
-                        let _ = es.send(NodeInput::BlockSyncResponseReceived {
+                        let _ = es.send(ShardEvent::shard(
                             local_shard,
-                            height,
-                            block,
-                        });
+                            NodeInput::BlockSyncResponseReceived { height, block },
+                        ));
                     }
                     Err(err) => {
                         let kind = classify_fetch_error(&err);
-                        let _ = es.send(NodeInput::BlockSyncFetchFailed {
+                        let _ = es.send(ShardEvent::shard(
                             local_shard,
-                            height,
-                            kind,
-                        });
+                            NodeInput::BlockSyncFetchFailed { height, kind },
+                        ));
                     }
                 }
                 // "Peer doesn't have this height" is ambiguous (peer may

@@ -35,6 +35,7 @@ use hyperscale_types::{
 
 use super::Fetch;
 use super::host::FetchHost;
+use crate::io_loop::ShardEvent;
 
 // ─── Type aliases used across the module tree ──────────────────────────
 
@@ -88,7 +89,7 @@ pub trait FetchBinding: 'static {
         preferred: Option<ValidatorId>,
         class: Option<MessageClass>,
         network: &N,
-        sender: &Sender<NodeInput>,
+        sender: &Sender<ShardEvent>,
     );
 }
 
@@ -163,7 +164,7 @@ impl FetchBinding for TransactionBinding {
         preferred: Option<ValidatorId>,
         class: Option<MessageClass>,
         network: &N,
-        sender: &Sender<NodeInput>,
+        sender: &Sender<ShardEvent>,
     ) {
         let es = sender.clone();
         let hs = ids.clone();
@@ -176,7 +177,7 @@ impl FetchBinding for TransactionBinding {
                 if let Ok(resp) = result {
                     let split = partition_solicited(resp.into_transactions(), &hs, |tx| tx.hash());
                     if !split.kept.is_empty() {
-                        let _ = es.send(NodeInput::protocol(
+                        let _ = es.send(ShardEvent::protocol(
                             local_shard,
                             ProtocolEvent::TransactionsReceived {
                                 transactions: split.kept,
@@ -184,10 +185,12 @@ impl FetchBinding for TransactionBinding {
                         ));
                     }
                     if !split.missing.is_empty() {
-                        let _ = es.send(NodeInput::TransactionsFetchFailed {
+                        let _ = es.send(ShardEvent::shard(
                             local_shard,
-                            hashes: split.missing.clone(),
-                        });
+                            NodeInput::TransactionsFetchFailed {
+                                hashes: split.missing.clone(),
+                            },
+                        ));
                     }
                     // Reject the response if the peer shipped unsolicited
                     // txs (injection attempt or buggy peer) OR if any
@@ -198,10 +201,10 @@ impl FetchBinding for TransactionBinding {
                         ResponseVerdict::Accept
                     }
                 } else {
-                    let _ = es.send(NodeInput::TransactionsFetchFailed {
+                    let _ = es.send(ShardEvent::shard(
                         local_shard,
-                        hashes: hs,
-                    });
+                        NodeInput::TransactionsFetchFailed { hashes: hs },
+                    ));
                     ResponseVerdict::Accept
                 }
             }),
@@ -228,7 +231,7 @@ impl FetchBinding for LocalProvisionBinding {
         preferred: Option<ValidatorId>,
         class: Option<MessageClass>,
         network: &N,
-        sender: &Sender<NodeInput>,
+        sender: &Sender<ShardEvent>,
     ) {
         let es = sender.clone();
         let hs = ids.clone();
@@ -242,17 +245,19 @@ impl FetchBinding for LocalProvisionBinding {
                     let split =
                         partition_solicited(resp.provisions.into_inner(), &hs, |p| p.hash());
                     for provisions in split.kept {
-                        let _ = es.send(NodeInput::protocol(
+                        let _ = es.send(ShardEvent::protocol(
                             local_shard,
                             ProtocolEvent::ProvisionsReceived { provisions },
                         ));
                     }
                     let had_misses = !split.missing.is_empty();
                     if had_misses {
-                        let _ = es.send(NodeInput::LocalProvisionsFetchFailed {
+                        let _ = es.send(ShardEvent::shard(
                             local_shard,
-                            hashes: split.missing,
-                        });
+                            NodeInput::LocalProvisionsFetchFailed {
+                                hashes: split.missing,
+                            },
+                        ));
                     }
                     // Reject the response if the peer shipped unsolicited
                     // provisions OR if any requested hash was missing.
@@ -262,10 +267,10 @@ impl FetchBinding for LocalProvisionBinding {
                         ResponseVerdict::Accept
                     }
                 } else {
-                    let _ = es.send(NodeInput::LocalProvisionsFetchFailed {
+                    let _ = es.send(ShardEvent::shard(
                         local_shard,
-                        hashes: hs,
-                    });
+                        NodeInput::LocalProvisionsFetchFailed { hashes: hs },
+                    ));
                     ResponseVerdict::Accept
                 }
             }),
@@ -292,7 +297,7 @@ impl FetchBinding for FinalizedWaveBinding {
         preferred: Option<ValidatorId>,
         class: Option<MessageClass>,
         network: &N,
-        sender: &Sender<NodeInput>,
+        sender: &Sender<ShardEvent>,
     ) {
         let es = sender.clone();
         let requested_ids = ids.clone();
@@ -307,17 +312,17 @@ impl FetchBinding for FinalizedWaveBinding {
                         w.wave_id().clone()
                     });
                     if !split.kept.is_empty() {
-                        let _ = es.send(NodeInput::protocol(
+                        let _ = es.send(ShardEvent::protocol(
                             local_shard,
                             ProtocolEvent::FinalizedWavesReceived { waves: split.kept },
                         ));
                     }
                     let had_misses = !split.missing.is_empty();
                     if had_misses {
-                        let _ = es.send(NodeInput::FinalizedWavesFetchFailed {
+                        let _ = es.send(ShardEvent::shard(
                             local_shard,
-                            ids: split.missing,
-                        });
+                            NodeInput::FinalizedWavesFetchFailed { ids: split.missing },
+                        ));
                     }
                     // Reject responses with unsolicited waves (peer scoring;
                     // also avoids wasted BLS verification on items we never
@@ -328,10 +333,10 @@ impl FetchBinding for FinalizedWaveBinding {
                         ResponseVerdict::Accept
                     }
                 } else {
-                    let _ = es.send(NodeInput::FinalizedWavesFetchFailed {
+                    let _ = es.send(ShardEvent::shard(
                         local_shard,
-                        ids: requested_ids,
-                    });
+                        NodeInput::FinalizedWavesFetchFailed { ids: requested_ids },
+                    ));
                     ResponseVerdict::Accept
                 }
             }),
@@ -358,7 +363,7 @@ impl FetchBinding for ExecCertBinding {
         preferred: Option<ValidatorId>,
         class: Option<MessageClass>,
         network: &N,
-        sender: &Sender<NodeInput>,
+        sender: &Sender<ShardEvent>,
     ) {
         let es = sender.clone();
         let failed_ids = ids.clone();
@@ -376,16 +381,18 @@ impl FetchBinding for ExecCertBinding {
                         // Refcount is 1 right after decode, so each unwrap moves.
                         let certificates =
                             split.kept.into_iter().map(Arc::unwrap_or_clone).collect();
-                        let _ = es.send(NodeInput::protocol(
+                        let _ = es.send(ShardEvent::protocol(
                             local_shard,
                             ProtocolEvent::ExecutionCertificatesReceived { certificates },
                         ));
                     }
                     if had_misses {
-                        let _ = es.send(NodeInput::ExecCertFetchFailed {
+                        let _ = es.send(ShardEvent::shard(
                             local_shard,
-                            hashes: split.missing,
-                        });
+                            NodeInput::ExecCertFetchFailed {
+                                hashes: split.missing,
+                            },
+                        ));
                     }
                     // Reject the response if the peer shipped unsolicited
                     // ECs (peer scoring; also avoids wasted BLS verification
@@ -396,10 +403,10 @@ impl FetchBinding for ExecCertBinding {
                         ResponseVerdict::Accept
                     }
                 } else {
-                    let _ = es.send(NodeInput::ExecCertFetchFailed {
+                    let _ = es.send(ShardEvent::shard(
                         local_shard,
-                        hashes: failed_ids,
-                    });
+                        NodeInput::ExecCertFetchFailed { hashes: failed_ids },
+                    ));
                     ResponseVerdict::Accept
                 }
             }),
@@ -430,7 +437,7 @@ impl FetchBinding for ProvisionBinding {
         preferred: Option<ValidatorId>,
         class: Option<MessageClass>,
         network: &N,
-        sender: &Sender<NodeInput>,
+        sender: &Sender<ShardEvent>,
     ) {
         // PER_ID means the dispatcher hands us exactly one id at a time.
         debug_assert_eq!(ids.len(), 1);
@@ -453,20 +460,21 @@ impl FetchBinding for ProvisionBinding {
             request,
             class,
             Box::new(move |result| {
-                let Ok(response) = result else {
-                    let _ = es.send(NodeInput::ProvisionsFetchFailed {
+                let fetch_failed = || {
+                    ShardEvent::shard(
                         local_shard,
-                        source_shard,
-                        block_height,
-                    });
+                        NodeInput::ProvisionsFetchFailed {
+                            source_shard,
+                            block_height,
+                        },
+                    )
+                };
+                let Ok(response) = result else {
+                    let _ = es.send(fetch_failed());
                     return ResponseVerdict::Accept;
                 };
                 let Some(provisions) = response.provisions else {
-                    let _ = es.send(NodeInput::ProvisionsFetchFailed {
-                        local_shard,
-                        source_shard,
-                        block_height,
-                    });
+                    let _ = es.send(fetch_failed());
                     return ResponseVerdict::Reject;
                 };
                 if provisions.source_shard() != source_shard
@@ -482,11 +490,7 @@ impl FetchBinding for ProvisionBinding {
                         got_height = provisions.block_height().inner(),
                         "Dropping provision fetch response: scope mismatch"
                     );
-                    let _ = es.send(NodeInput::ProvisionsFetchFailed {
-                        local_shard,
-                        source_shard,
-                        block_height,
-                    });
+                    let _ = es.send(fetch_failed());
                     return ResponseVerdict::Reject;
                 }
                 if provisions.transactions().is_empty() {
@@ -494,14 +498,10 @@ impl FetchBinding for ProvisionBinding {
                     // the requester: the FSM has nothing to admit, so
                     // without an explicit `Failed` the id stays in_flight
                     // forever.
-                    let _ = es.send(NodeInput::ProvisionsFetchFailed {
-                        local_shard,
-                        source_shard,
-                        block_height,
-                    });
+                    let _ = es.send(fetch_failed());
                     return ResponseVerdict::Reject;
                 }
-                let _ = es.send(NodeInput::protocol(
+                let _ = es.send(ShardEvent::protocol(
                     local_shard,
                     ProtocolEvent::ProvisionsReceived { provisions },
                 ));

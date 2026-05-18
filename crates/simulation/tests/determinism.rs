@@ -7,8 +7,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_core::{NodeInput, ProtocolEvent};
+use hyperscale_core::ProtocolEvent;
 use hyperscale_network_memory::{HostingMode, NetworkConfig};
+use hyperscale_node::io_loop::ShardEvent;
 use hyperscale_simulation::SimulationRunner;
 use hyperscale_types::{
     BlockHeight, LocalTimestamp, QuorumCertificate, Round, ShardGroupId, TransactionStatus,
@@ -52,7 +53,7 @@ fn test_schedule_initial_events() {
         runner.schedule_initial_event(
             node,
             Duration::from_millis(100),
-            NodeInput::protocol(ShardGroupId::new(0), ProtocolEvent::CleanupTimer),
+            ShardEvent::protocol(ShardGroupId::new(0), ProtocolEvent::CleanupTimer),
         );
     }
 
@@ -79,7 +80,7 @@ fn test_determinism_same_seed() {
         runner1.schedule_initial_event(
             node,
             Duration::from_millis(100),
-            NodeInput::protocol(ShardGroupId::new(0), ProtocolEvent::CleanupTimer),
+            ShardEvent::protocol(ShardGroupId::new(0), ProtocolEvent::CleanupTimer),
         );
     }
     runner1.run_until(Duration::from_secs(1));
@@ -91,7 +92,7 @@ fn test_determinism_same_seed() {
         runner2.schedule_initial_event(
             node,
             Duration::from_millis(100),
-            NodeInput::protocol(ShardGroupId::new(0), ProtocolEvent::CleanupTimer),
+            ShardEvent::protocol(ShardGroupId::new(0), ProtocolEvent::CleanupTimer),
         );
     }
     runner2.run_until(Duration::from_secs(1));
@@ -127,7 +128,7 @@ fn test_different_seeds_diverge() {
         runner1.schedule_initial_event(
             node,
             Duration::from_millis(100),
-            NodeInput::protocol(ShardGroupId::new(0), ProtocolEvent::CleanupTimer),
+            ShardEvent::protocol(ShardGroupId::new(0), ProtocolEvent::CleanupTimer),
         );
     }
     runner1.run_until(Duration::from_secs(1));
@@ -138,7 +139,7 @@ fn test_different_seeds_diverge() {
         runner2.schedule_initial_event(
             node,
             Duration::from_millis(100),
-            NodeInput::protocol(ShardGroupId::new(0), ProtocolEvent::CleanupTimer),
+            ShardEvent::protocol(ShardGroupId::new(0), ProtocolEvent::CleanupTimer),
         );
     }
     runner2.run_until(Duration::from_secs(1));
@@ -175,7 +176,7 @@ fn test_multi_shard_simulation() {
         runner.schedule_initial_event(
             node,
             Duration::from_millis(100),
-            NodeInput::protocol(ShardGroupId::new(0), ProtocolEvent::CleanupTimer),
+            ShardEvent::protocol(ShardGroupId::new(0), ProtocolEvent::CleanupTimer),
         );
     }
 
@@ -202,7 +203,7 @@ fn test_round_advancement_via_view_change_timer() {
         runner.schedule_initial_event(
             node,
             Duration::from_millis(100),
-            NodeInput::protocol(ShardGroupId::new(0), ProtocolEvent::CleanupTimer),
+            ShardEvent::protocol(ShardGroupId::new(0), ProtocolEvent::CleanupTimer),
         );
     }
 
@@ -255,7 +256,7 @@ fn test_extended_simulation_determinism() {
         runner1.schedule_initial_event(
             node,
             Duration::from_millis(100),
-            NodeInput::protocol(ShardGroupId::new(0), ProtocolEvent::CleanupTimer),
+            ShardEvent::protocol(ShardGroupId::new(0), ProtocolEvent::CleanupTimer),
         );
     }
     runner1.run_until(Duration::from_secs(5));
@@ -267,7 +268,7 @@ fn test_extended_simulation_determinism() {
         runner2.schedule_initial_event(
             node,
             Duration::from_millis(100),
-            NodeInput::protocol(ShardGroupId::new(0), ProtocolEvent::CleanupTimer),
+            ShardEvent::protocol(ShardGroupId::new(0), ProtocolEvent::CleanupTimer),
         );
     }
     runner2.run_until(Duration::from_secs(5));
@@ -1174,17 +1175,17 @@ fn test_mempool_to_block_integration() {
     runner.schedule_initial_event(
         0,
         Duration::from_millis(50),
-        NodeInput::SubmitTransaction { tx: Arc::new(tx1) },
+        ShardEvent::process(NodeInput::SubmitTransaction { tx: Arc::new(tx1) }),
     );
     runner.schedule_initial_event(
         0,
         Duration::from_millis(51),
-        NodeInput::SubmitTransaction { tx: Arc::new(tx2) },
+        ShardEvent::process(NodeInput::SubmitTransaction { tx: Arc::new(tx2) }),
     );
     runner.schedule_initial_event(
         0,
         Duration::from_millis(52),
-        NodeInput::SubmitTransaction { tx: Arc::new(tx3) },
+        ShardEvent::process(NodeInput::SubmitTransaction { tx: Arc::new(tx3) }),
     );
 
     // Run past transaction submission (50-52ms) but before dwell time expires
@@ -1268,7 +1269,7 @@ fn test_execution_flow() {
     runner.schedule_initial_event(
         0,
         Duration::from_millis(50),
-        NodeInput::SubmitTransaction { tx: Arc::new(tx) },
+        ShardEvent::process(NodeInput::SubmitTransaction { tx: Arc::new(tx) }),
     );
 
     // Single tx happy path: a couple of blocks is enough to drive the full
@@ -1319,7 +1320,7 @@ fn test_transaction_gossip() {
     runner.schedule_initial_event(
         0,
         Duration::from_millis(10),
-        NodeInput::SubmitTransaction { tx: Arc::new(tx) },
+        ShardEvent::process(NodeInput::SubmitTransaction { tx: Arc::new(tx) }),
     );
 
     // Run briefly - transaction should be in node 0's mempool
