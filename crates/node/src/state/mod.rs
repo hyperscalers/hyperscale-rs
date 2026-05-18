@@ -43,10 +43,6 @@ use hyperscale_topology::TopologyCoordinator;
 use hyperscale_types::{Block, LocalTimestamp, ShardGroupId, StateRoot, TopologySnapshot};
 use tracing::instrument;
 
-/// Index type for simulation-only node routing.
-/// Production uses `ValidatorId` (from message signatures) and `PeerId` (libp2p).
-pub type NodeIndex = u32;
-
 /// Combined node state machine.
 ///
 /// Composes BFT, execution, mempool, and provisions into a single state
@@ -58,9 +54,6 @@ pub type NodeIndex = u32;
 /// `IoLoop` fires a `BlockSyncReadyToApply` event into this state machine,
 /// which routes it to BFT.
 pub struct NodeStateMachine {
-    /// This node's index (simulation-only, for routing).
-    node_index: NodeIndex,
-
     /// Network topology — passed by reference to subsystem methods.
     topology: TopologyCoordinator,
 
@@ -90,7 +83,7 @@ pub struct NodeStateMachine {
 impl std::fmt::Debug for NodeStateMachine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NodeStateMachine")
-            .field("node_index", &self.node_index)
+            .field("validator", &self.topology.snapshot().local_validator_id())
             .field("shard", &self.topology.snapshot().local_shard())
             .field("bft", &self.bft)
             .field("now", &self.now)
@@ -103,9 +96,7 @@ impl NodeStateMachine {
     ///
     /// # Arguments
     ///
-    /// * `node_index` - Deterministic node index for ordering
     /// * `topology` - Network topology
-    /// * `signing_key` - Key for signing votes and proposals
     /// * `bft_config` - BFT configuration
     /// * `recovered` - State recovered from storage. Use `RecoveredState::default()` for fresh start.
     /// * `mempool_config` - Mempool configuration
@@ -122,7 +113,6 @@ impl NodeStateMachine {
     #[allow(clippy::too_many_arguments)] // per-shard-shared stores threaded explicitly so
     // same-shard vnodes converge on one canonical store
     pub fn new(
-        node_index: NodeIndex,
         topology: TopologyCoordinator,
         bft_config: &BftConfig,
         recovered: RecoveredState,
@@ -134,7 +124,6 @@ impl NodeStateMachine {
         finalized_wave_store: Arc<FinalizedWaveStore>,
     ) -> Self {
         Self {
-            node_index,
             bft: BftCoordinator::new(bft_config.clone(), recovered),
             execution: ExecutionCoordinator::with_shared_stores(
                 exec_cert_store,
@@ -153,12 +142,6 @@ impl NodeStateMachine {
     }
 
     // ─── Accessors ──────────────────────────────────────────────────────
-
-    /// Get this node's index.
-    #[must_use]
-    pub const fn node_index(&self) -> NodeIndex {
-        self.node_index
-    }
 
     /// Get this node's shard.
     #[must_use]
@@ -235,7 +218,7 @@ impl NodeStateMachine {
 
 impl StateMachine for NodeStateMachine {
     #[instrument(skip(self), fields(
-        node = self.node_index,
+        validator = self.topology.snapshot().local_validator_id().inner(),
         shard = self.topology.snapshot().local_shard().inner(),
         event = %event.type_name(),
         height = self.bft.committed_height().inner(),

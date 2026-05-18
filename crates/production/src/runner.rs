@@ -415,12 +415,7 @@ impl ProductionRunnerBuilder {
 
         let vnode_inits: Vec<VnodeInit> = vnode_configs
             .into_iter()
-            .enumerate()
-            .map(|(idx, cfg)| {
-                // node_index is not meaningful in production; pick a stable
-                // disambiguator across same-host vnodes.
-                let node_index =
-                    u32::try_from(idx).expect("vnode count fits in u32 (capped well below 2^32)");
+            .map(|cfg| {
                 let shard = cfg.topology.snapshot().local_shard();
                 let tx_store = Arc::clone(
                     tx_stores
@@ -438,7 +433,6 @@ impl ProductionRunnerBuilder {
                         .expect("hosted shard derived from vnodes"),
                 );
                 let state = NodeStateMachine::new(
-                    node_index,
                     cfg.topology,
                     &bft_config,
                     recovered.clone(),

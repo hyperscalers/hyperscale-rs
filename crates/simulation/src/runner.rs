@@ -273,7 +273,6 @@ impl SimulationRunner {
                     }
 
                     let state = NodeStateMachine::new(
-                        validator_idx as NodeIndex,
                         topology_state,
                         &BftConfig::default(),
                         RecoveredState::default(),

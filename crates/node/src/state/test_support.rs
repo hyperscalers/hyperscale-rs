@@ -22,7 +22,7 @@ use hyperscale_test_helpers::TestCommittee;
 use hyperscale_topology::TopologyCoordinator;
 use hyperscale_types::ValidatorSet;
 
-use super::{NodeIndex, NodeStateMachine};
+use super::NodeStateMachine;
 
 /// Real `NodeStateMachine` plus the committee that produced its topology.
 /// The committee stays alive so tests can mint signed messages targeting
@@ -79,7 +79,6 @@ impl TestNodeBuilder {
         let provision_store = Arc::new(ProvisionStore::new());
 
         let node = NodeStateMachine::new(
-            NodeIndex::try_from(self.local_idx).expect("local_idx fits NodeIndex"),
             topology,
             &BftConfig::default(),
             RecoveredState::default(),
