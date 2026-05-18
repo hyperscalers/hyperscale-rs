@@ -20,7 +20,7 @@ use hyperscale_types::{
 };
 use tracing::{debug, error, trace, warn};
 
-use super::{IoLoop, ShardEvent, TimerOp};
+use super::{IoLoop, TimerOp, push_protocol_event, push_shard_input};
 use crate::shard::block_commit::{AccumulateDecision, PendingCommit};
 use crate::shard::fetch::FetchInput;
 use crate::shard::fetch::binding::{
@@ -187,7 +187,7 @@ where
             self.process_remote_header_sync_outputs(shard, outputs);
         }
 
-        let _ = self.event_sender.send(ShardEvent::protocol(shard, pe));
+        push_protocol_event(&self.event_sender, shard, pe);
     }
 
     fn handle_restore_committed_state(&self, shard: ShardGroupId) {
@@ -195,10 +195,11 @@ where
         let height = storage.committed_height();
         let hash = storage.committed_hash();
         let qc = storage.latest_qc();
-        let _ = self.event_sender.send(ShardEvent::protocol(
+        push_protocol_event(
+            &self.event_sender,
             shard,
             ProtocolEvent::CommittedStateRestored { height, hash, qc },
-        ));
+        );
     }
 
     fn handle_emit_transaction_status(
@@ -602,7 +603,7 @@ where
             // dispatching vnode's shard so the receiver routes back to the
             // right `ShardGroup`.
             let notify = move |event: NodeInput| {
-                let _ = event_tx.send(ShardEvent::shard(shard, event));
+                push_shard_input(&event_tx, shard, event);
             };
             let shard_handles = handles
                 .per_shard

@@ -26,7 +26,7 @@ use hyperscale_types::network::gossip::TransactionGossip;
 use hyperscale_types::{RoutableTransaction, ShardGroupId, TxHash, shard_for_node};
 
 use crate::batch_accumulator::BatchAccumulator;
-use crate::io_loop::{IoLoop, ShardEvent};
+use crate::io_loop::{IoLoop, push_shard_input};
 
 impl<S, N, D, E> IoLoop<S, N, D, E>
 where
@@ -237,21 +237,23 @@ where
             let mut failed_hashes = Vec::new();
             for (tx, valid) in batch.into_iter().zip(results) {
                 if valid {
-                    let _ = event_tx.send(ShardEvent::shard(
+                    push_shard_input(
+                        &event_tx,
                         local_shard,
                         NodeInput::TransactionValidated { tx },
-                    ));
+                    );
                 } else {
                     failed_hashes.push(tx.hash());
                 }
             }
             if !failed_hashes.is_empty() {
-                let _ = event_tx.send(ShardEvent::shard(
+                push_shard_input(
+                    &event_tx,
                     local_shard,
                     NodeInput::TransactionValidationsFailed {
                         hashes: failed_hashes,
                     },
-                ));
+                );
             }
         });
     }

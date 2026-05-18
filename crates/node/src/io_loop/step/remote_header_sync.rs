@@ -23,7 +23,7 @@ use hyperscale_types::{
 };
 
 use crate::io_loop::step::block_sync::classify_fetch_error;
-use crate::io_loop::{IoLoop, ShardEvent};
+use crate::io_loop::{IoLoop, push_shard_input};
 use crate::shard::sync::SyncOutput;
 use crate::shard::sync::remote_header::{RemoteHeaderSyncInput, RemoteHeaderSyncOutput};
 
@@ -181,7 +181,8 @@ where
                             match result {
                                 Ok(resp) => {
                                     record_sync_round_completed("remote_header");
-                                    let _ = es.send(ShardEvent::shard(
+                                    push_shard_input(
+                                        &es,
                                         local_shard,
                                         NodeInput::RemoteHeadersResponseReceived {
                                             source_shard,
@@ -189,12 +190,13 @@ where
                                             count: typed_count,
                                             headers: resp.headers,
                                         },
-                                    ));
+                                    );
                                 }
                                 Err(err) => {
                                     record_sync_round_retried("remote_header");
                                     let kind = classify_fetch_error(&err);
-                                    let _ = es.send(ShardEvent::shard(
+                                    push_shard_input(
+                                        &es,
                                         local_shard,
                                         NodeInput::RemoteHeadersFetchFailed {
                                             source_shard,
@@ -202,7 +204,7 @@ where
                                             count: typed_count,
                                             kind,
                                         },
-                                    ));
+                                    );
                                 }
                             }
                             ResponseVerdict::Accept

@@ -180,6 +180,29 @@ impl ShardEvent {
     }
 }
 
+/// Push a shard-scoped [`NodeInput`] into the I/O loop's event channel.
+///
+/// Off-thread closures and `IoLoop` methods both use this to feed
+/// results back to the next `step()`. The channel is unbounded; send
+/// failure is silently ignored by design (the only failure mode is the
+/// receiver having been dropped at shutdown, in which case there's
+/// nothing to do).
+pub(crate) fn push_shard_input(tx: &Sender<ShardEvent>, shard: ShardGroupId, input: NodeInput) {
+    let _ = tx.send(ShardEvent::shard(shard, input));
+}
+
+/// Push a [`ProtocolEvent`] (wrapped in `NodeInput::Protocol`) into
+/// the I/O loop's event channel. The receiver fans the event across
+/// every hosted vnode in `shard`. See [`push_shard_input`] for the
+/// drop-on-shutdown convention.
+pub(crate) fn push_protocol_event(
+    tx: &Sender<ShardEvent>,
+    shard: ShardGroupId,
+    event: ProtocolEvent,
+) {
+    let _ = tx.send(ShardEvent::protocol(shard, event));
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // StepOutput — returned to the caller after processing an event
 // ═══════════════════════════════════════════════════════════════════════
@@ -282,8 +305,9 @@ where
     /// byzantine input (gossip), emit a typed failure variant when the
     /// `IoLoop` has cleanup to do (`TransactionValidationsFailed`,
     /// `SyncBlockValidationFailed`), abort on storage faults
-    /// (block-commit). Don't paper over these in a generic helper —
-    /// each `dispatch.spawn` site calls `event_sender.send` directly.
+    /// (block-commit). Sends go through [`push_shard_input`] /
+    /// [`push_protocol_event`] so the "drop on shutdown" convention
+    /// has one named home.
     event_sender: Sender<ShardEvent>,
 
     /// Lock-free topology snapshot shared with network handler closures

@@ -50,7 +50,7 @@ use hyperscale_types::{
     compute_provision_root, compute_transaction_root,
 };
 
-use crate::io_loop::{IoLoop, ShardEvent};
+use crate::io_loop::{IoLoop, push_shard_input};
 use crate::shard::sync::SyncOutput;
 use crate::shard::sync::block::{BlockSyncInput, BlockSyncOutput};
 
@@ -135,7 +135,7 @@ where
                 },
                 Err(reason) => NodeInput::SyncBlockValidationFailed { height, reason },
             };
-            let _ = event_tx.send(ShardEvent::shard(local_shard, input));
+            push_shard_input(&event_tx, local_shard, input);
         });
     }
 
@@ -245,17 +245,19 @@ where
                 match result {
                     Ok(resp) => {
                         let block = resp.into_elided().map(Box::new);
-                        let _ = es.send(ShardEvent::shard(
+                        push_shard_input(
+                            &es,
                             local_shard,
                             NodeInput::BlockSyncResponseReceived { height, block },
-                        ));
+                        );
                     }
                     Err(err) => {
                         let kind = classify_fetch_error(&err);
-                        let _ = es.send(ShardEvent::shard(
+                        push_shard_input(
+                            &es,
                             local_shard,
                             NodeInput::BlockSyncFetchFailed { height, kind },
-                        ));
+                        );
                     }
                 }
                 // "Peer doesn't have this height" is ambiguous (peer may

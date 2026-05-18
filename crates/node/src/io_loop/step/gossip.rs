@@ -25,7 +25,7 @@ use hyperscale_types::{
     committed_block_header_message,
 };
 
-use crate::io_loop::{IoLoop, ShardEvent};
+use crate::io_loop::{IoLoop, push_protocol_event};
 use crate::shard::CommittedHeaderVerificationItem;
 use crate::shard::verify::verify_bls_with_metrics;
 
@@ -89,13 +89,14 @@ where
                     "committed_header",
                 );
                 if valid {
-                    let _ = event_tx.send(ShardEvent::protocol(
+                    push_protocol_event(
+                        &event_tx,
                         shard,
                         ProtocolEvent::RemoteHeaderReceived {
                             committed_header,
                             sender,
                         },
-                    ));
+                    );
                 } else {
                     tracing::warn!(
                         sender = sender.inner(),

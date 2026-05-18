@@ -28,7 +28,7 @@ use hyperscale_types::{
     Block, BlockHash, BlockHeight, CertifiedBlock, LocalTimestamp, QuorumCertificate, ShardGroupId,
 };
 
-use crate::io_loop::ShardEvent;
+use crate::io_loop::{ShardEvent, push_protocol_event};
 
 /// Block + QC pair handed back to the `io_loop` to build a [`CertifiedBlock`]
 /// for immediate `BlockCommitted` delivery. Cloned `Arc` handles to the
@@ -376,10 +376,11 @@ where
                         Arc::unwrap_or_clone(commit.block),
                         Arc::unwrap_or_clone(commit.qc),
                     ));
-                    let _ = event_tx.send(ShardEvent::protocol(
+                    push_protocol_event(
+                        &event_tx,
                         shard,
                         ProtocolEvent::BlockCommitted { certified },
-                    ));
+                    );
                 }
             }
 
@@ -389,12 +390,13 @@ where
             // calls flush to drain any backlog.
             in_flight.store(false, Ordering::Release);
 
-            let _ = event_tx.send(ShardEvent::protocol(
+            push_protocol_event(
+                &event_tx,
                 shard,
                 ProtocolEvent::BlockPersisted {
                     height: max_persisted,
                 },
-            ));
+            );
         });
     }
 }
