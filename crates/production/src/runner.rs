@@ -73,11 +73,12 @@ use hyperscale_storage::ChainReader;
 use hyperscale_storage_rocksdb::{RocksDbStorage, SharedStorage};
 use hyperscale_topology::TopologyCoordinator;
 use hyperscale_types::{
-    Block, BlockHeight, Bls12381G1PrivateKey, CertifiedBlock, LocalTimestamp, QuorumCertificate,
-    ShardGroupId, TransactionStatus, TxHash, ValidatorId,
+    Block, BlockHeight, Bls12381G1PrivateKey, CertifiedBlock, LocalTimestamp, NodeId,
+    QuorumCertificate, ShardGroupId, TransactionStatus, TxHash, ValidatorId, shard_for_node,
 };
 use libp2p::identity::Keypair;
 use quick_cache::sync::Cache as QuickCache;
+use radix_common::types::ComponentAddress;
 use thiserror::Error;
 use tokio::runtime::Handle as TokioHandle;
 use tokio::sync::oneshot;
@@ -695,9 +696,13 @@ impl ProductionRunner {
         let mut timer_ops = Vec::new();
         let local_shards: Vec<ShardGroupId> = io_loop.hosted_shards().collect();
         let topology = Arc::clone(&self.topology_snapshot);
-        // `GenesisConfig::production` is shared across hosted shards, so one
-        // `take()` covers every shard.
-        let mut shared_genesis_config: Option<GenesisConfig> = self.genesis_config.take();
+        // The host's `GenesisConfig` enumerates every account across every
+        // hosted shard. Each shard's storage only gets the accounts whose
+        // address hashes to that shard, so genesis doesn't reapply other
+        // shards' state into the wrong store. Single-shard hosts (the
+        // historical default) end up running an identity filter.
+        let shared_genesis_config = self.genesis_config.take();
+        let num_shards = self.topology_snapshot.load().num_shards();
         for shard in local_shards {
             let height = io_loop.shard_io(shard).storage.committed_height();
             if height > BlockHeight::GENESIS {
@@ -710,8 +715,10 @@ impl ProductionRunner {
             info!(shard = ?shard, "No committed blocks - initializing genesis for shard");
 
             let genesis_config = shared_genesis_config
-                .take()
-                .unwrap_or_else(GenesisConfig::production);
+                .clone()
+                .map_or_else(GenesisConfig::production, |cfg| {
+                    filter_genesis_for_shard(cfg, shard, num_shards)
+                });
             info!(
                 shard = ?shard,
                 xrd_balances = genesis_config.xrd_balances.len(),
@@ -1064,6 +1071,33 @@ impl Drop for ProdTimerManager {
 const METRICS_INTERVAL: Duration = Duration::from_secs(1);
 const GC_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Drop `xrd_balance` entries whose address doesn't hash to `shard`. The
+/// network-wide [`GenesisConfig`] enumerates accounts across every shard;
+/// installing it verbatim into one shard's storage would create accounts
+/// that consensus on that shard never owns.
+fn filter_genesis_for_shard(
+    mut config: GenesisConfig,
+    shard: ShardGroupId,
+    num_shards: u64,
+) -> GenesisConfig {
+    config
+        .xrd_balances
+        .retain(|(address, _)| shard_for_address(address, num_shards) == shard);
+    config
+}
+
+/// Compute the shard a [`ComponentAddress`] belongs to. Mirrors the helper
+/// the spammer uses for the same purpose (`crates/spammer/src/accounts.rs`).
+fn shard_for_address(address: &ComponentAddress, num_shards: u64) -> ShardGroupId {
+    let radix_node_id = address.into_node_id();
+    let det_node_id = NodeId(
+        radix_node_id.0[..30]
+            .try_into()
+            .expect("NodeId is 30 bytes"),
+    );
+    shard_for_node(&det_node_id, num_shards)
+}
 
 /// Mint the `io_loop`'s monotonic local clock as a `LocalTimestamp` (ms since
 /// UNIX epoch). Used to set the state machine's clock before each step.
