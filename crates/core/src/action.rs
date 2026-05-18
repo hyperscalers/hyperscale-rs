@@ -719,4 +719,77 @@ impl Action {
             _ => None,
         }
     }
+
+    /// Which coordinator crate owns this action's delegated work.
+    ///
+    /// Used by the I/O loop's delegated dispatch to route the action to
+    /// the right `handle_action` entry point without re-enumerating the
+    /// variants at the call site. Local-owned variants (timers, commits,
+    /// fetch driving, status emission) are handled inline by the I/O
+    /// loop and never reach delegated dispatch.
+    #[must_use]
+    pub const fn owner(&self) -> ActionOwner {
+        match self {
+            // BFT consensus: QC build/verify, block roots, proposal,
+            // sign-and-broadcast header/vote/committed-header.
+            Self::VerifyAndBuildQuorumCertificate { .. }
+            | Self::VerifyQcSignature { .. }
+            | Self::VerifyRemoteHeaderQc { .. }
+            | Self::VerifyTransactionRoot { .. }
+            | Self::VerifyProvisionRoot { .. }
+            | Self::VerifyCertificateRoot { .. }
+            | Self::VerifyProvisionTxRoots { .. }
+            | Self::VerifyStateRoot { .. }
+            | Self::BuildProposal { .. }
+            | Self::BroadcastBlockHeader { .. }
+            | Self::SignAndBroadcastBlockVote { .. }
+            | Self::BroadcastCommittedBlockHeader { .. } => ActionOwner::Bft,
+
+            // Execution: wave/EC aggregation + verification, transaction
+            // execution, sign-and-broadcast exec vote/cert.
+            Self::AggregateExecutionCertificate { .. }
+            | Self::VerifyAndAggregateExecutionVotes { .. }
+            | Self::VerifyExecutionCertificateSignature { .. }
+            | Self::VerifyFinalizedWave { .. }
+            | Self::ExecuteTransactions { .. }
+            | Self::ExecuteCrossShardTransactions { .. }
+            | Self::SignAndSendExecutionVote { .. }
+            | Self::BroadcastExecutionCertificate { .. } => ActionOwner::Execution,
+
+            // Provisions: state-provision verify, outbound provision
+            // fetch + broadcast.
+            Self::VerifyProvisions { .. } | Self::FetchAndBroadcastProvisions { .. } => {
+                ActionOwner::Provisions
+            }
+
+            // Inline / I/O-loop-internal effects.
+            _ => ActionOwner::Local,
+        }
+    }
+}
+
+/// Which coordinator crate owns an [`Action`]'s delegated work.
+///
+/// Used by [`Action::owner`] so the I/O loop's delegated dispatch can
+/// route to a coordinator crate's `handle_action` entry point without
+/// re-enumerating variants. [`Local`](Self::Local) variants are handled
+/// inline by the I/O loop and never delegated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ActionOwner {
+    /// BFT consensus actions (QC build / verify, proposal, header
+    /// and vote sign-and-broadcast). Routed to
+    /// `hyperscale_bft::action_handlers::handle_action`.
+    Bft,
+    /// Execution-coordinator actions (wave / EC aggregation,
+    /// transaction execution, exec vote / cert sign-and-broadcast).
+    /// Routed to `hyperscale_execution::action_handlers::handle_action`.
+    Execution,
+    /// Provision-coordinator actions (state-provision verification,
+    /// outbound provision fetch + broadcast). Routed to
+    /// `hyperscale_provisions::action_handlers::handle_action`.
+    Provisions,
+    /// I/O-loop-internal effects (timers, commits, status emission,
+    /// fetch driving, topology plumbing). Not delegated to a worker
+    /// pool.
+    Local,
 }

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use hyperscale_bft::action_handlers::handle_action as handle_bft_action;
 use hyperscale_core::{
-    Action, ActionContext, CommitSource, FetchAbandon, FetchRequest, NodeInput, PreparedBlock,
+    Action, ActionContext, ActionOwner, CommitSource, FetchAbandon, FetchRequest, NodeInput,
     ProtocolEvent,
 };
 use hyperscale_dispatch::Dispatch;
@@ -13,7 +13,7 @@ use hyperscale_execution::action_handlers::handle_action as handle_execution_act
 use hyperscale_metrics::record_transaction_finalized;
 use hyperscale_network::Network;
 use hyperscale_provisions::action_handlers::handle_action as handle_provisions_action;
-use hyperscale_storage::{ChainEntry, Storage};
+use hyperscale_storage::Storage;
 use hyperscale_types::{
     Block, BlockHeight, CertifiedBlock, QuorumCertificate, ShardGroupId, StateRoot,
     TopologySnapshot, TransactionStatus, TxHash,
@@ -21,7 +21,7 @@ use hyperscale_types::{
 use tracing::{debug, trace, warn};
 
 use super::{IoLoop, TimerOp, push_protocol_event, push_shard_input};
-use crate::shard::block_commit::{AccumulateDecision, PendingCommit};
+use crate::shard::block_commit::{AccumulateDecision, PendingCommit, make_commit_prepared};
 use crate::shard::fetch::FetchInput;
 use crate::shard::fetch::binding::{
     ExecCertBinding, FinalizedWaveBinding, LocalProvisionBinding, ProvisionBinding,
@@ -487,44 +487,20 @@ where
         let signing_key = Arc::clone(&vnode.signing_key);
 
         self.dispatch.spawn(pool, move || {
+            let shard_handles = handles
+                .per_shard
+                .get(&shard)
+                .expect("hosted shard derived from vnode");
             // Action handlers emit raw `NodeInput`s; wrap each with the
             // dispatching vnode's shard so the receiver routes back to the
             // right `ShardGroup`.
             let notify = move |event: NodeInput| {
                 push_shard_input(&event_tx, shard, event);
             };
-            let shard_handles = handles
-                .per_shard
-                .get(&shard)
-                .expect("hosted shard derived from vnode");
-            // `commit_prepared` is a `move` closure; capture per-shard Arcs
-            // rather than borrowing `handles` (which the outer
-            // `ActionContext` borrows below).
-            let pending_chain_for_commit = Arc::clone(&shard_handles.pending_chain);
-            let prepared_commits_for_commit = Arc::clone(&shard_handles.prepared_commits);
-            let commit_prepared = move |prep: PreparedBlock<S::PreparedCommit>| {
-                let PreparedBlock {
-                    block_hash,
-                    parent_block_hash,
-                    block_height,
-                    prepared,
-                    receipts,
-                } = prep;
-                let jmt_snapshot = Arc::new(S::jmt_snapshot(&prepared).clone());
-                pending_chain_for_commit.insert(
-                    block_hash,
-                    ChainEntry {
-                        parent_block_hash,
-                        height: block_height,
-                        receipts,
-                        jmt_snapshot,
-                    },
-                );
-                prepared_commits_for_commit
-                    .lock()
-                    .unwrap()
-                    .insert(block_hash, (block_height, prepared));
-            };
+            let commit_prepared = make_commit_prepared(
+                Arc::clone(&shard_handles.pending_chain),
+                Arc::clone(&shard_handles.prepared_commits),
+            );
             let ctx = ActionContext {
                 executor: &handles.executor,
                 topology_snapshot: &topology_snapshot,
@@ -534,39 +510,14 @@ where
                 notify: &notify,
                 commit_prepared: &commit_prepared,
             };
-            // Route to the coordinator crate that owns this Action variant.
-            match &action {
-                Action::VerifyAndBuildQuorumCertificate { .. }
-                | Action::VerifyQcSignature { .. }
-                | Action::VerifyRemoteHeaderQc { .. }
-                | Action::VerifyTransactionRoot { .. }
-                | Action::VerifyProvisionTxRoots { .. }
-                | Action::VerifyProvisionRoot { .. }
-                | Action::VerifyCertificateRoot { .. }
-                | Action::VerifyStateRoot { .. }
-                | Action::BuildProposal { .. }
-                | Action::BroadcastBlockHeader { .. }
-                | Action::SignAndBroadcastBlockVote { .. }
-                | Action::BroadcastCommittedBlockHeader { .. } => {
-                    handle_bft_action(action, &ctx);
-                }
-
-                Action::AggregateExecutionCertificate { .. }
-                | Action::VerifyAndAggregateExecutionVotes { .. }
-                | Action::VerifyExecutionCertificateSignature { .. }
-                | Action::VerifyFinalizedWave { .. }
-                | Action::ExecuteTransactions { .. }
-                | Action::ExecuteCrossShardTransactions { .. }
-                | Action::SignAndSendExecutionVote { .. }
-                | Action::BroadcastExecutionCertificate { .. } => {
-                    handle_execution_action(action, &ctx);
-                }
-
-                Action::VerifyProvisions { .. } | Action::FetchAndBroadcastProvisions { .. } => {
-                    handle_provisions_action(action, &ctx);
-                }
-
-                _ => {}
+            match action.owner() {
+                ActionOwner::Bft => handle_bft_action(action, &ctx),
+                ActionOwner::Execution => handle_execution_action(action, &ctx),
+                ActionOwner::Provisions => handle_provisions_action(action, &ctx),
+                ActionOwner::Local => unreachable!(
+                    "dispatch_delegated_action called with Local-owned action — \
+                     process_action's outer match should have routed inline"
+                ),
             }
         });
     }

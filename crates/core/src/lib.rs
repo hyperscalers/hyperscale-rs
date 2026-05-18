@@ -37,7 +37,7 @@ mod protocol_event;
 mod timer;
 mod traits;
 
-pub use action::{Action, CrossShardExecutionRequest, ProvisionsRequest};
+pub use action::{Action, ActionOwner, CrossShardExecutionRequest, ProvisionsRequest};
 pub use action_context::{ActionContext, PreparedBlock};
 pub use fetch_abandon::FetchAbandon;
 pub use fetch_request::FetchRequest;
