@@ -97,10 +97,10 @@ pub(super) struct ShardDispatchHandles<S: Storage> {
 /// `shard` is the hosted shard that owns the timer. Shard-scoped timers
 /// (`ViewChange`, `Cleanup`) use it for both keying (so cross-shard
 /// hosting doesn't collide `ViewChange` handles) and event routing
-/// (`TimerId::into_event(shard)` produces a `NodeInput::Protocol` for
-/// the right shard). Process-scoped timers (`FetchTick`) push with a
-/// sentinel — the `IoLoop` holds the canonical `FetchTick` op on its own
-/// buffer and the firing path ignores `shard`.
+/// ([`timer_event`] produces a `NodeInput::Protocol` for the right
+/// shard). Process-scoped timers (`FetchTick`) push with a sentinel —
+/// the `IoLoop` holds the canonical `FetchTick` op on its own buffer
+/// and the firing path ignores `shard`.
 #[derive(Debug, Clone)]
 pub enum TimerOp {
     /// Set a timer to fire after `duration`.
@@ -119,6 +119,21 @@ pub enum TimerOp {
         /// Logical timer identifier to cancel.
         id: TimerId,
     },
+}
+
+/// Translate a fired [`TimerId`] back into the [`NodeInput`] the runner
+/// pushes onto its event channel.
+///
+/// Shard-scoped timers tag the shard so the resulting `NodeInput::Protocol`
+/// routes to the right hosted shard; `FetchTick` ignores the shard
+/// (process-scoped).
+#[must_use]
+pub fn timer_event(id: &TimerId, shard: ShardGroupId) -> NodeInput {
+    match id {
+        TimerId::ViewChange => NodeInput::protocol(shard, ProtocolEvent::ViewChangeTimer),
+        TimerId::Cleanup => NodeInput::protocol(shard, ProtocolEvent::CleanupTimer),
+        TimerId::FetchTick => NodeInput::FetchTick,
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════

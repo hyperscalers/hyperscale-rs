@@ -186,7 +186,7 @@ where
         // FetchTick is process-global. The `shard` on `TimerOp` exists
         // to key the runner's timer manager by `(TimerId, ShardGroupId)`;
         // pick a stable sentinel from the hosted set so set/cancel pairs
-        // match. The firing path passes `shard` to `into_event` which
+        // match. The firing path passes `shard` to `timer_event` which
         // ignores it for `FetchTick`.
         let sentinel_shard = *self
             .shards

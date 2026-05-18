@@ -43,5 +43,5 @@ pub use fetch_abandon::FetchAbandon;
 pub use fetch_request::FetchRequest;
 pub use input::{EventPriority, FetchFailureKind, NodeInput};
 pub use protocol_event::{CommitSource, ProtocolEvent, VerificationKind};
-pub use timer::{TimerId, TimerScheduler};
+pub use timer::TimerId;
 pub use traits::StateMachine;

@@ -64,7 +64,7 @@ use hyperscale_network_libp2p::{
     Libp2pAdapter, Libp2pConfig, Libp2pNetwork, NetworkError, RequestManager, RequestManagerConfig,
     RequestStreamPool, generate_random_keypair,
 };
-use hyperscale_node::io_loop::{IoLoop, NodeStatusSnapshot, TimerOp, record_metrics};
+use hyperscale_node::io_loop::{IoLoop, NodeStatusSnapshot, TimerOp, record_metrics, timer_event};
 use hyperscale_node::{NodeConfig, NodeStateMachine, SharedTopologySnapshot, VnodeInit};
 use hyperscale_provisions::{ProvisionConfig, ProvisionStore};
 use hyperscale_storage::ChainReader;
@@ -1045,7 +1045,7 @@ impl ProdTimerManager {
                 let timer_id = id;
                 let handle = self.tokio_handle.spawn(async move {
                     sleep(duration).await;
-                    let _ = timer_tx.send(timer_id.into_event(shard));
+                    let _ = timer_tx.send(timer_event(&timer_id, shard));
                 });
                 self.active.insert(key, handle);
             }
