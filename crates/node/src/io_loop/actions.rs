@@ -5,7 +5,7 @@ use std::sync::Arc;
 use hyperscale_bft::action_handlers::handle_action as handle_bft_action;
 use hyperscale_core::{
     Action, ActionContext, CommitSource, FetchAbandon, FetchRequest, NodeInput, PreparedBlock,
-    ProtocolEvent, StateMachine,
+    ProtocolEvent,
 };
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::Engine;
@@ -105,7 +105,6 @@ where
             Action::RestoreCommittedState => self.handle_restore_committed_state(shard),
             Action::CommitBlock { block, qc, source } => {
                 self.accept_block_commit(
-                    vnode_idx,
                     shard,
                     PendingCommit {
                         block: Arc::new(block),
@@ -123,7 +122,6 @@ where
                 source,
             } => {
                 self.handle_commit_block_by_qc_only(
-                    vnode_idx,
                     shard,
                     block,
                     qc,
@@ -149,7 +147,7 @@ where
             }
             Action::RecordTxEcCreated { tx_hashes } => {
                 self.tx_phase_times
-                    .record_ec_created(&tx_hashes, self.vnodes[vnode_idx].state.now());
+                    .record_ec_created(&tx_hashes, self.now());
             }
             Action::TopologyChanged { topology_snapshot } => {
                 self.handle_topology_changed(&topology_snapshot);
@@ -212,7 +210,7 @@ where
         submitted_locally: bool,
     ) {
         trace!(?tx_hash, ?status, "Transaction status");
-        let now = self.vnodes[vnode_idx].state.now();
+        let now = self.now();
         let terminal_phases = self.tx_phase_times.observe_status(tx_hash, &status, now);
         if status.is_final()
             && submitted_locally
@@ -272,10 +270,9 @@ where
     /// flush time (other blocks committed in between). `commit_prepared_blocks`
     /// handles that via its fallback path — skip if already committed, else
     /// recompute.
-    #[allow(clippy::too_many_arguments)] // unpacks Action::CommitBlockByQcOnly + emitting vnode context
+    #[allow(clippy::too_many_arguments)] // unpacks Action::CommitBlockByQcOnly
     fn handle_commit_block_by_qc_only(
         &mut self,
-        vnode_idx: usize,
         shard: ShardGroupId,
         block: Block,
         qc: QuorumCertificate,
@@ -396,7 +393,6 @@ where
         // block_hash so double-emission (consensus + sync both reaching
         // commit) is safe.
         self.accept_block_commit(
-            vnode_idx,
             shard,
             PendingCommit {
                 block: Arc::new(block),
@@ -412,13 +408,8 @@ where
     /// unless persistence backpressure is active, fire `BlockCommitted`.
     ///
     /// [`BlockCommitCoordinator`]: crate::shard::block_commit::BlockCommitCoordinator
-    fn accept_block_commit(
-        &mut self,
-        vnode_idx: usize,
-        shard: ShardGroupId,
-        commit: PendingCommit,
-    ) {
-        let now = self.vnodes[vnode_idx].state.now();
+    fn accept_block_commit(&mut self, shard: ShardGroupId, commit: PendingCommit) {
+        let now = self.now();
         let decision = self.shard_block_commit_mut(shard).accumulate(commit, now);
         match decision {
             AccumulateDecision::Skip => {}

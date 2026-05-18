@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use hyperscale_core::{NodeInput, ProtocolEvent, StateMachine};
+use hyperscale_core::{NodeInput, ProtocolEvent};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_engine::Engine;
 use hyperscale_network::Network;
@@ -137,7 +137,7 @@ where
         dst: ShardGroupId,
         tx: Arc<RoutableTransaction>,
     ) {
-        let now = self.vnodes[0].state.now();
+        let now = self.now();
         let max = self.tx_gossip_max;
         let window = self.tx_gossip_window;
         let batch = self
@@ -181,7 +181,7 @@ where
         shard: ShardGroupId,
         tx: Arc<RoutableTransaction>,
     ) {
-        let now = self.vnodes[0].state.now();
+        let now = self.now();
         if self.shard_io_mut(shard).validation_batch.push(tx, now) {
             self.flush_validation_batch(shard);
         }

@@ -240,6 +240,12 @@ where
     /// Time window for new tx-gossip accumulators. Same role as
     /// `tx_gossip_max`.
     tx_gossip_window: Duration,
+
+    /// Process-wide wall-clock cache. Pushed lazily into a vnode's state
+    /// machine right before `state.handle()` so each handle observes the
+    /// runner's most recent `set_time`. Replaces the previous pattern of
+    /// V identical `now` values updated in a per-iteration loop.
+    now: LocalTimestamp,
 }
 
 impl<S, N, D, E> IoLoop<S, N, D, E>
@@ -376,19 +382,28 @@ where
             pending_timer_ops: Vec::new(),
             tx_gossip_max: b.tx_gossip_max,
             tx_gossip_window: b.tx_gossip_window,
+            now: LocalTimestamp::ZERO,
         }
     }
 
     // ─── Time ────────────────────────────────────────────────────────────
 
-    /// Set the state machine's current time.
+    /// Set the cached process-wide wall-clock time.
     ///
-    /// Must be called before `step()` to keep the state machine's clock
-    /// in sync with the driving environment.
-    pub fn set_time(&mut self, now: LocalTimestamp) {
-        for vnode in &mut self.vnodes {
-            vnode.state.set_time(now);
-        }
+    /// Must be called before `step()`. The value is pushed into a
+    /// vnode's state machine just-in-time in [`Self::feed_event`] so
+    /// each `state.handle()` observes the latest tick without paying
+    /// for V identical writes per runner iteration.
+    pub const fn set_time(&mut self, now: LocalTimestamp) {
+        self.now = now;
+    }
+
+    /// Current cached wall-clock time. Reads from the `IoLoop`'s own
+    /// cache rather than reaching through `vnodes[0].state.now()` — the
+    /// state machines hold a copy only to make their internal
+    /// timing logic observable through the `StateMachine` trait.
+    pub(super) const fn now(&self) -> LocalTimestamp {
+        self.now
     }
 
     // ─── Accessors ──────────────────────────────────────────────────────
@@ -715,8 +730,11 @@ where
     ///
     /// This is the common pattern used throughout `IoLoop`: route an
     /// event through a state machine, then dispatch each resulting
-    /// action with the originating vnode's signing context.
+    /// action with the originating vnode's signing context. The
+    /// vnode's clock is synced with the `IoLoop`'s cached `now` here so
+    /// `set_time` itself can stay O(1).
     fn feed_event(&mut self, vnode_idx: usize, event: ProtocolEvent) {
+        self.vnodes[vnode_idx].state.set_time(self.now);
         let actions = self.vnodes[vnode_idx].state.handle(event);
         self.process_actions(vnode_idx, actions);
     }

@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use hyperscale_core::{NodeInput, ProtocolEvent, StateMachine};
+use hyperscale_core::{NodeInput, ProtocolEvent};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_engine::Engine;
 use hyperscale_network::Network;
@@ -49,7 +49,7 @@ where
     ) {
         let item: CommittedHeaderVerificationItem =
             (committed_header, sender, public_key, sender_signature);
-        let now = self.vnodes[0].state.now();
+        let now = self.now();
         if self
             .shard_io_mut(shard)
             .committed_header_batch
