@@ -15,96 +15,162 @@
 //! iteration is deterministic — load-bearing for simulation determinism and
 //! for proposal building, which iterates the store to include finalized
 //! waves in block order.
+//!
+//! Held behind an `RwLock` so an `Arc<FinalizedWaveStore>` can be shared
+//! across every same-shard vnode's `ExecutionCoordinator`. In practice
+//! the pinned thread serializes every write, so the lock never contends
+//! — it exists to satisfy the type system around shared mutability.
 
 use std::collections::{BTreeMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 
 use hyperscale_types::{BloomFilter, DEFAULT_FPR, FinalizedWave, TxHash, WaveCertificate, WaveId};
 
+/// Per-shard finalized-wave store. See module docs for lifecycle.
 pub struct FinalizedWaveStore {
-    waves: BTreeMap<WaveId, Arc<FinalizedWave>>,
+    waves: RwLock<BTreeMap<WaveId, Arc<FinalizedWave>>>,
+}
+
+impl Default for FinalizedWaveStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FinalizedWaveStore {
+    /// Construct an empty store.
+    #[must_use]
     pub const fn new() -> Self {
         Self {
-            waves: BTreeMap::new(),
+            waves: RwLock::new(BTreeMap::new()),
         }
     }
 
+    /// True if no finalized waves are currently tracked.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.waves
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty()
+    }
+
     /// Record a newly-finalized wave under its `WaveId`.
-    pub fn insert(&mut self, wave_id: WaveId, fw: Arc<FinalizedWave>) {
-        self.waves.insert(wave_id, fw);
+    pub fn insert(&self, wave_id: WaveId, fw: Arc<FinalizedWave>) {
+        self.waves
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(wave_id, fw);
     }
 
     /// Remove the entry for `wave_id`, if any. No-op when absent (sync
     /// paths may remove a wave the local node never aggregated).
-    pub fn remove(&mut self, wave_id: &WaveId) {
-        self.waves.remove(wave_id);
+    pub fn remove(&self, wave_id: &WaveId) {
+        self.waves
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(wave_id);
     }
 
     /// All finalized waves in `WaveId` order. Used by the proposer to
     /// include finalized waves in the next block.
+    #[must_use]
     pub fn all_waves(&self) -> Vec<Arc<FinalizedWave>> {
-        self.waves.values().map(Arc::clone).collect()
+        self.waves
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .map(Arc::clone)
+            .collect()
     }
 
     /// Lookup by `WaveId`. Peers reference waves by id in fetch requests,
     /// so this is the primary ingress lookup for serving finalized-wave data.
+    #[must_use]
     pub fn get(&self, wave_id: &WaveId) -> Option<Arc<FinalizedWave>> {
-        self.waves.get(wave_id).map(Arc::clone)
+        self.waves
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(wave_id)
+            .map(Arc::clone)
     }
 
     /// Certificate containing `tx_hash`, if any. Used to answer
     /// terminal-state queries for a single transaction (e.g. RPC, mempool
     /// status). Returns `None` once the wave has been removed — callers
     /// then fall back to persisted storage.
+    #[must_use]
     pub fn get_certificate_for_tx(&self, tx_hash: TxHash) -> Option<Arc<WaveCertificate>> {
         self.waves
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
             .values()
             .find(|fw| fw.contains_tx(&tx_hash))
             .map(|fw| Arc::clone(fw.certificate()))
     }
 
     /// Whether `tx_hash` is part of any currently-tracked finalized wave.
+    #[must_use]
     pub fn is_finalized(&self, tx_hash: TxHash) -> bool {
-        self.waves.values().any(|fw| fw.contains_tx(&tx_hash))
+        self.waves
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .any(|fw| fw.contains_tx(&tx_hash))
     }
 
     /// Flatten every tracked wave's tx hashes into a single set.
     ///
     /// The node passes this to BFT for conflict filtering — a transaction
     /// whose wave is already finalized should not be re-proposed.
+    #[must_use]
     pub fn all_tx_hashes(&self) -> HashSet<TxHash> {
-        self.waves.values().flat_map(|fw| fw.tx_hashes()).collect()
+        self.waves
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .flat_map(|fw| fw.tx_hashes())
+            .collect()
     }
 
     /// Whether a wave with this `WaveId` is tracked. Used by debug/query
     /// paths to distinguish "wave is finalized" from "wave has no tracker".
+    #[must_use]
     pub fn contains(&self, wave_id: &WaveId) -> bool {
-        self.waves.contains_key(wave_id)
+        self.waves
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(wave_id)
     }
 
+    /// Number of finalized waves currently tracked.
+    #[must_use]
     pub fn len(&self) -> usize {
-        self.waves.len()
+        self.waves
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
     }
 
     /// Build a bloom filter over every tracked `WaveId`. Sync
     /// inventory attaches this to `GetBlockRequest` so the responder can
     /// elide finalized-wave certificates the requester already has.
+    #[must_use]
     pub fn cert_bloom_snapshot(&self) -> Option<BloomFilter<WaveId>> {
-        let mut bf = BloomFilter::with_capacity(self.waves.len(), DEFAULT_FPR)?;
-        for wave_id in self.waves.keys() {
+        // Snapshot ids under the lock, build the bloom after release so
+        // we don't hold the read guard across the heavier filter inserts.
+        let wave_ids: Vec<WaveId> = self
+            .waves
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .keys()
+            .cloned()
+            .collect();
+        let mut bf = BloomFilter::with_capacity(wave_ids.len(), DEFAULT_FPR)?;
+        for wave_id in &wave_ids {
             bf.insert(wave_id);
         }
         Some(bf)
-    }
-}
-
-#[cfg(test)]
-impl FinalizedWaveStore {
-    pub fn is_empty(&self) -> bool {
-        self.waves.is_empty()
     }
 }
 
@@ -171,7 +237,7 @@ mod tests {
 
     #[test]
     fn insert_then_lookup_by_tx_hash() {
-        let mut store = FinalizedWaveStore::new();
+        let store = FinalizedWaveStore::new();
         let tx = TxHash::from_raw(Hash::from_bytes(b"tx1"));
         let (wid, fw) = make_finalized_wave(1, &[tx]);
 
@@ -186,7 +252,7 @@ mod tests {
 
     #[test]
     fn lookup_by_wave_id_matches_inserted_wave() {
-        let mut store = FinalizedWaveStore::new();
+        let store = FinalizedWaveStore::new();
         let tx = TxHash::from_raw(Hash::from_bytes(b"tx1"));
         let (wid, fw) = make_finalized_wave(1, &[tx]);
 
@@ -201,7 +267,7 @@ mod tests {
 
     #[test]
     fn all_tx_hashes_flattens_across_waves() {
-        let mut store = FinalizedWaveStore::new();
+        let store = FinalizedWaveStore::new();
         let a = TxHash::from_raw(Hash::from_bytes(b"a"));
         let b = TxHash::from_raw(Hash::from_bytes(b"b"));
         let c = TxHash::from_raw(Hash::from_bytes(b"c"));
@@ -220,7 +286,7 @@ mod tests {
 
     #[test]
     fn remove_drops_only_the_named_wave() {
-        let mut store = FinalizedWaveStore::new();
+        let store = FinalizedWaveStore::new();
         let tx1 = TxHash::from_raw(Hash::from_bytes(b"tx1"));
         let tx2 = TxHash::from_raw(Hash::from_bytes(b"tx2"));
         let (wid1, fw1) = make_finalized_wave(1, &[tx1]);
@@ -240,7 +306,7 @@ mod tests {
 
     #[test]
     fn cert_bloom_snapshot_contains_every_tracked_wave() {
-        let mut store = FinalizedWaveStore::new();
+        let store = FinalizedWaveStore::new();
         let tx1 = TxHash::from_raw(Hash::from_bytes(b"tx1"));
         let tx2 = TxHash::from_raw(Hash::from_bytes(b"tx2"));
         let (wid1, fw1) = make_finalized_wave(1, &[tx1]);
@@ -258,7 +324,7 @@ mod tests {
 
     #[test]
     fn remove_absent_wave_is_noop() {
-        let mut store = FinalizedWaveStore::new();
+        let store = FinalizedWaveStore::new();
         let missing = make_wave_id(42);
         // No panic, no state change.
         store.remove(&missing);
@@ -267,7 +333,7 @@ mod tests {
 
     #[test]
     fn all_waves_iterates_in_wave_id_order() {
-        let mut store = FinalizedWaveStore::new();
+        let store = FinalizedWaveStore::new();
         let (wid_high, fw_high) =
             make_finalized_wave(5, &[TxHash::from_raw(Hash::from_bytes(b"hi"))]);
         let (wid_low, fw_low) =

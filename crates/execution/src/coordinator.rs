@@ -130,8 +130,12 @@ pub struct ExecutionMemoryStats {
 pub struct ExecutionCoordinator {
     /// Finalized wave certificates ready for block inclusion, keyed by
     /// `WaveId`. Terminal-state lookup surface for wave-id fetches,
-    /// tx-membership queries, and proposal building.
-    finalized: FinalizedWaveStore,
+    /// tx-membership queries, and proposal building. Held behind an
+    /// `Arc` and shared across same-shard `ExecutionCoordinator`s so
+    /// `IoLoop`'s sync-inventory bloom and elided-block rehydration read
+    /// from one canonical store per shard rather than vnode-0's
+    /// incidentally-convergent copy.
+    finalized: Arc<FinalizedWaveStore>,
 
     /// Current committed height for pruning stale entries.
     committed_height: BlockHeight,
@@ -214,24 +218,30 @@ impl Default for ExecutionCoordinator {
 }
 
 impl ExecutionCoordinator {
-    /// Create a new execution state machine with its own fresh
-    /// `ExecCertStore`. For hosts running multiple same-shard validators,
-    /// prefer [`Self::with_exec_cert_store`] to share one store across
+    /// Create a new execution state machine with its own fresh stores.
+    /// For hosts running multiple same-shard validators, prefer
+    /// [`Self::with_shared_stores`] to share one set of stores across
     /// every coordinator in the shard.
     #[must_use]
     pub fn new() -> Self {
-        Self::with_exec_cert_store(Arc::new(ExecCertStore::new()))
+        Self::with_shared_stores(
+            Arc::new(ExecCertStore::new()),
+            Arc::new(FinalizedWaveStore::new()),
+        )
     }
 
-    /// Create a new execution state machine sharing an externally-owned
-    /// `ExecCertStore`. Same-shard vnodes share one store so the
-    /// `IoLoop`'s inbound EC fetch handler can serve from a single
-    /// canonical view rather than vnode-0's incidentally-convergent
-    /// copy.
+    /// Create a new execution state machine sharing both externally-owned
+    /// `ExecCertStore` and `FinalizedWaveStore`. Same-shard vnodes share
+    /// one set of stores so the `IoLoop`'s inbound fetch handler and
+    /// sync-inventory bloom read from a single canonical view per shard
+    /// rather than vnode-0's incidentally-convergent copy.
     #[must_use]
-    pub fn with_exec_cert_store(exec_certs: Arc<ExecCertStore>) -> Self {
+    pub fn with_shared_stores(
+        exec_certs: Arc<ExecCertStore>,
+        finalized: Arc<FinalizedWaveStore>,
+    ) -> Self {
         Self {
-            finalized: FinalizedWaveStore::new(),
+            finalized,
             committed_height: BlockHeight::GENESIS,
             committed_ts: WeightedTimestamp::ZERO,
             waves: WaveRegistry::new(),
@@ -243,6 +253,16 @@ impl ExecutionCoordinator {
             pending_ec_verifications: HashSet::new(),
             pending_finalized_wave_verifications: HashSet::new(),
         }
+    }
+
+    /// Reference to the shared finalized-wave store. The `io_loop`
+    /// clones this `Arc` into its `SharedCaches` so sync-inventory
+    /// blooms and elided-block rehydration read from a single canonical
+    /// per-shard store rather than vnode-0's incidentally-convergent
+    /// copy.
+    #[must_use]
+    pub const fn finalized_wave_store(&self) -> &Arc<FinalizedWaveStore> {
+        &self.finalized
     }
 
     /// Reference to the shared execution-certificate store. The `io_loop`

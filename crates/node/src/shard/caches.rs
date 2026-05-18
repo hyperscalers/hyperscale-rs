@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use hyperscale_execution::ExecCertStore;
+use hyperscale_execution::{ExecCertStore, FinalizedWaveStore};
 use hyperscale_mempool::TxStore;
 use hyperscale_provisions::ProvisionStore;
 use hyperscale_types::{FinalizedWave, TransactionStatus, TxHash, WaveId};
@@ -57,17 +57,23 @@ pub struct SharedCaches {
     ///
     /// [`ExecutionCoordinator`]: hyperscale_execution::ExecutionCoordinator
     pub exec_cert_store: Arc<ExecCertStore>,
+    /// Per-shard finalized-wave store, shared with every same-shard
+    /// `ExecutionCoordinator`. Read by sync-inventory bloom and
+    /// elided-block rehydration so neither has to reach through
+    /// `vnodes[0].state` for shard-scoped data.
+    pub finalized_wave_store: Arc<FinalizedWaveStore>,
 }
 
 impl SharedCaches {
     /// Construct caches at `io_loop` startup. The `ProvisionStore`,
-    /// `TxStore`, and `ExecCertStore` are owned by their respective state
-    /// machines; clones are passed in so the same `Arc`s flow into network
-    /// handler closures.
+    /// `TxStore`, `ExecCertStore`, and `FinalizedWaveStore` are owned
+    /// by their respective state machines; clones are passed in so the
+    /// same `Arc`s flow into network handler closures and sync helpers.
     pub fn new(
         provision_store: Arc<ProvisionStore>,
         tx_store: Arc<TxStore>,
         exec_cert_store: Arc<ExecCertStore>,
+        finalized_wave_store: Arc<FinalizedWaveStore>,
     ) -> Self {
         Self {
             tx_store,
@@ -75,6 +81,7 @@ impl SharedCaches {
             finalized_wave: Arc::new(QuickCache::new(DEFAULT_CERT_CACHE_SIZE)),
             provision_store,
             exec_cert_store,
+            finalized_wave_store,
         }
     }
 }

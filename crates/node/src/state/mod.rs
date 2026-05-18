@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 use hyperscale_bft::{BftConfig, BftCoordinator};
 use hyperscale_core::{Action, ProtocolEvent, StateMachine};
-use hyperscale_execution::{ExecCertStore, ExecutionCoordinator};
+use hyperscale_execution::{ExecCertStore, ExecutionCoordinator, FinalizedWaveStore};
 use hyperscale_mempool::{MempoolConfig, MempoolCoordinator, TxStore};
 use hyperscale_provisions::{
     OutboundProvisionTracker, ProvisionConfig, ProvisionCoordinator, ProvisionStore,
@@ -115,6 +115,9 @@ impl NodeStateMachine {
     ///   same-shard vnodes admit into one canonical map.
     /// * `exec_cert_store` - Shared local-shard execution-certificate
     ///   store, scoped per shard for the same reason.
+    /// * `finalized_wave_store` - Shared finalized-wave store, scoped
+    ///   per shard so the sync-inventory bloom and elided-block
+    ///   rehydration read one canonical map.
     #[must_use]
     #[allow(clippy::too_many_arguments)] // per-shard-shared stores threaded explicitly so
     // same-shard vnodes converge on one canonical store
@@ -128,11 +131,15 @@ impl NodeStateMachine {
         provision_store: Arc<ProvisionStore>,
         tx_store: Arc<TxStore>,
         exec_cert_store: Arc<ExecCertStore>,
+        finalized_wave_store: Arc<FinalizedWaveStore>,
     ) -> Self {
         Self {
             node_index,
             bft: BftCoordinator::new(bft_config.clone(), recovered),
-            execution: ExecutionCoordinator::with_exec_cert_store(exec_cert_store),
+            execution: ExecutionCoordinator::with_shared_stores(
+                exec_cert_store,
+                finalized_wave_store,
+            ),
             mempool: MempoolCoordinator::with_tx_store(mempool_config, tx_store),
             provisions: ProvisionCoordinator::with_config_and_store(
                 provision_config,

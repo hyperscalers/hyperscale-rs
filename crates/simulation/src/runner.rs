@@ -15,7 +15,7 @@ use hyperscale_dispatch_sync::SyncDispatch;
 use hyperscale_engine::{
     GenesisConfig, RadixExecutor, SimExecutionCache, SimulationEngine, TransactionValidation,
 };
-use hyperscale_execution::ExecCertStore;
+use hyperscale_execution::{ExecCertStore, FinalizedWaveStore};
 use hyperscale_mempool::{MempoolConfig, TxStore};
 use hyperscale_network_memory::{
     BandwidthReport, NetworkConfig, NetworkTrafficAnalyzer, NodeIndex, SimNetworkAdapter,
@@ -214,10 +214,12 @@ impl SimulationRunner {
                 let host_index = shard_id * hosts_per_shard + h;
                 let first_validator = host_index * vnodes_per_host;
 
-                // One `TxStore` + `ExecCertStore` per host's shard,
-                // shared across every same-shard vnode on this host.
+                // One `TxStore` + `ExecCertStore` + `FinalizedWaveStore`
+                // per host's shard, shared across every same-shard vnode
+                // on this host.
                 let host_tx_store = Arc::new(TxStore::new());
                 let host_exec_cert_store = Arc::new(ExecCertStore::new());
+                let host_finalized_wave_store = Arc::new(FinalizedWaveStore::new());
 
                 let mut vnode_inits: Vec<VnodeInit> = Vec::with_capacity(vnodes_per_host as usize);
                 let mut topology_arc_for_io_loop = None;
@@ -259,6 +261,7 @@ impl SimulationRunner {
                         Arc::new(ProvisionStore::new()),
                         Arc::clone(&host_tx_store),
                         Arc::clone(&host_exec_cert_store),
+                        Arc::clone(&host_finalized_wave_store),
                     );
 
                     vnode_inits.push(VnodeInit { state, signing_key });
