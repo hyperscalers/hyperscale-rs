@@ -23,79 +23,76 @@ use hyperscale_types::{
 
 /// Fetch family — one variant per payload type.
 ///
-/// Each variant carries:
-/// - `shard: ShardGroupId` — the shard whose committee serves the
-///   request. Pending-block / intra-shard fetches use the local shard;
-///   cross-shard DA paths use the source shard.
-/// - `preferred: Option<ValidatorId>` — canonical-source hint passed to
-///   `Network::request`. `Some(proposer)` for BFT-path fetches;
-///   `None` for catch-up / DA paths.
-/// - `class: Option<MessageClass>` — class override forwarded to
-///   `Network::request`. `None` keeps the wire type's static
-///   `NetworkMessage::class()`; `Some` demotes to a less-urgent class
-///   for catch-up / best-effort traffic (typically `Recovery`).
+/// Common field semantics across variants:
+///
+/// - `shard` — committee whose members will serve the request. Local for
+///   intra-shard fetches; source shard for cross-shard DA fetches.
+/// - `preferred` — canonical-source hint passed straight to
+///   `Network::request`. `Some(proposer)` on BFT-path fetches where one
+///   peer is authoritative; `None` on catch-up / DA paths that fan out.
+/// - `class` — overrides the wire type's static `NetworkMessage::class()`.
+///   `None` keeps the default; `Some` demotes to a less-urgent class
+///   (typically `Recovery`) for catch-up / best-effort traffic.
 #[derive(Debug, Clone)]
 pub enum FetchRequest {
-    /// Transaction fetch by id.
+    /// Transaction bodies by `TxHash` — BFT-path fetches against the
+    /// local shard's committee.
     Transactions {
         /// Transaction hashes to fetch.
         ids: Vec<TxHash>,
-        /// Shard whose committee serves the request (local for BFT-path
-        /// fetches, source shard for the mempool's cross-shard DA path).
+        /// Committee shard serving the request.
         shard: ShardGroupId,
         /// Canonical-source hint, when one exists.
         preferred: Option<ValidatorId>,
-        /// Class override forwarded to `Network::request`.
+        /// Optional class override; see enum-level doc.
         class: Option<MessageClass>,
     },
-    /// Local-provision fetch by id.
+    /// Intra-shard DA payload — `shard` is always local.
     LocalProvisions {
         /// Provision hashes to fetch.
         ids: Vec<ProvisionHash>,
-        /// Shard whose committee serves the request (always local — the
-        /// payload is intra-shard DA).
+        /// Always the local shard for this variant.
         shard: ShardGroupId,
         /// Canonical-source hint, when one exists.
         preferred: Option<ValidatorId>,
-        /// Class override forwarded to `Network::request`.
+        /// Optional class override; see enum-level doc.
         class: Option<MessageClass>,
     },
-    /// Finalized-wave fetch by id.
+    /// Intra-shard DA payload — `shard` is always local.
     FinalizedWaves {
-        /// Wave ids to fetch.
+        /// Wave ids whose finalized waves are missing.
         ids: Vec<WaveId>,
-        /// Shard whose committee serves the request (always local — the
-        /// payload is intra-shard DA).
+        /// Always the local shard for this variant.
         shard: ShardGroupId,
         /// Canonical-source hint, when one exists.
         preferred: Option<ValidatorId>,
-        /// Class override forwarded to `Network::request`.
+        /// Optional class override; see enum-level doc.
         class: Option<MessageClass>,
     },
     /// Cross-shard provisions fetch keyed by `(source_shard, block_height)`.
-    /// Routing shard is `source_shard`.
+    /// Routing shard is `source_shard`; `preferred` is the source-block
+    /// proposer that originated the provisions.
     RemoteProvisions {
         /// Source shard whose provisions are missing.
         source_shard: ShardGroupId,
-        /// Source-shard block height for the missing provisions.
+        /// Source-shard block height the missing provisions are anchored to.
         block_height: BlockHeight,
-        /// Canonical-source hint — `Some(source-block proposer)`; they
-        /// originated the provisions.
+        /// Canonical-source hint, when one exists.
         preferred: Option<ValidatorId>,
-        /// Class override forwarded to `Network::request`.
+        /// Optional class override; see enum-level doc.
         class: Option<MessageClass>,
     },
     /// Cross-shard execution-cert fetch by `WaveId`. Routing shard is
     /// `wave_id.shard_group_id()` (the shard that committed the source
-    /// block).
+    /// block). `preferred` is `None` — the wave's designated broadcaster
+    /// role is computable but health-weighted selection works equally
+    /// well empirically.
     ExecutionCerts {
-        /// Wave whose EC is missing.
+        /// Wave whose execution certificate is missing.
         wave_id: WaveId,
-        /// No canonical preferred — the wave's designated broadcaster
-        /// role is computable but the network's health-weighted
-        /// selection works equally well empirically.
+        /// Always `None` for this variant; see variant-level doc.
         preferred: Option<ValidatorId>,
-        /// Class override forwarded to `Network::request`.
+        /// Optional class override; see enum-level doc.
         class: Option<MessageClass>,
     },
 }

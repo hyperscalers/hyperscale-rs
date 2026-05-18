@@ -149,8 +149,6 @@ pub enum ProtocolEvent {
     /// Fires after the async `RocksDB` write completes. Used for bookkeeping
     /// (persistence lag tracking) — not consensus-critical.
     /// The `height` is the highest block height in the persistence batch.
-    /// The shard is carried by the transport-layer envelope so the
-    /// `IoLoop` can route to the right `ShardGroup`.
     BlockPersisted {
         /// Highest block height in the persistence batch that just completed.
         height: BlockHeight,

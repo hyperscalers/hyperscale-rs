@@ -86,11 +86,8 @@ where
         let tx_hash = tx.hash();
         // Already-vouched (in TxStore) or terminally-rejected (tombstoned)
         // are skipped. `pending_validation` blocks duplicate enqueues.
-        // Tombstones are coincidentally identical across same-shard vnodes
-        // (deterministic mempool processing) — peek at vnode 0's set as
-        // representative. A freshly-added vnode with an empty tombstone set
-        // would re-enqueue tombstoned txs; ShardIo-level tombstones are the
-        // right home for this and are a follow-up.
+        // Tombstones are identical across same-shard vnodes (deterministic
+        // mempool processing) — peek at vnode 0's set as representative.
         if !self.shard_io(shard).caches.tx_store.contains(&tx_hash)
             && !self.vnode(shard, 0).state.mempool().is_tombstoned(&tx_hash)
         {
@@ -103,13 +100,10 @@ where
     /// gossip accumulators for every shard the tx touches, and admit
     /// locally on every hosted shard the tx touches.
     ///
-    /// For same-shard hosting the touched-and-hosted set has 0 or 1
-    /// element and this matches the prior behaviour. For cross-shard
-    /// hosting the tx may admit on multiple hosted shards (e.g. a tx
-    /// reading shard A and writing shard B on a host that carries
-    /// vnodes in both). Gossip uses the first hosted shard as the
-    /// "from" for batching — gossipsub dedup handles any incidental
-    /// duplication on the wire.
+    /// A tx may admit on multiple hosted shards (e.g. reading shard A
+    /// and writing shard B on a host that carries vnodes in both).
+    /// Gossip uses the first hosted shard as the "from" for batching —
+    /// gossipsub dedup handles any incidental duplication on the wire.
     pub(in crate::io_loop) fn handle_submit_transaction(&mut self, tx: &Arc<RoutableTransaction>) {
         let tx_hash = tx.hash();
 

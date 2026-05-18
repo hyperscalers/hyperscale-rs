@@ -332,8 +332,7 @@ where
 
     /// Process-wide wall-clock cache. Pushed lazily into a vnode's state
     /// machine right before `state.handle()` so each handle observes the
-    /// runner's most recent `set_time`. Replaces the previous pattern of
-    /// V identical `now` values updated in a per-iteration loop.
+    /// runner's most recent `set_time`.
     now: LocalTimestamp,
 }
 
@@ -811,12 +810,7 @@ where
     /// Dispatch a `Vec<Action>` produced by a vnode's state machine.
     /// Bumps the step's action counter, processes each action with the
     /// emitting vnode's signing context, and flushes pending block
-    /// commits at the tail (the flush is the load-bearing part — easy
-    /// to forget when copy-pasting the loop inline).
-    ///
-    /// Called by [`Self::dispatch_event`] after `state.handle()`, by
-    /// [`Self::initialize_shard_genesis`] for genesis init, and
-    /// by the sync-output dispatch helpers.
+    /// commits at the tail.
     pub(super) fn drain_actions(
         &mut self,
         shard: ShardGroupId,

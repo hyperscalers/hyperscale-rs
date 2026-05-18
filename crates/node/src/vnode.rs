@@ -36,10 +36,14 @@ pub struct VnodeInit {
 
 /// Per-validator bundle hosted by the `IoLoop`.
 pub struct Vnode {
-    /// This validator's network identity.
+    /// Identity this vnode votes as. Stable for the vnode's lifetime;
+    /// keys the network adapter's bind handshake and the per-vnode
+    /// metrics / status maps.
     pub validator_id: ValidatorId,
 
-    /// Per-validator state machine.
+    /// Per-validator consensus state. Driven exclusively from the pinned
+    /// `IoLoop` thread via `state.handle(now, event)`; off-thread closures
+    /// never touch it.
     pub state: NodeStateMachine,
 
     /// BLS signing key for votes and proposals. Shared with

@@ -94,24 +94,12 @@ impl std::fmt::Debug for NodeStateMachine {
 impl NodeStateMachine {
     /// Create a new node state machine.
     ///
-    /// # Arguments
-    ///
-    /// * `topology` - Network topology
-    /// * `bft_config` - BFT configuration
-    /// * `recovered` - State recovered from storage. Use `RecoveredState::default()` for fresh start.
-    /// * `mempool_config` - Mempool configuration
-    /// * `provision_config` - Provision coordinator configuration
-    /// * `provision_store` - Shared provision store
-    /// * `tx_store` - Shared mempool body store, scoped per shard so
-    ///   same-shard vnodes admit into one canonical map.
-    /// * `exec_cert_store` - Shared local-shard execution-certificate
-    ///   store, scoped per shard for the same reason.
-    /// * `finalized_wave_store` - Shared finalized-wave store, scoped
-    ///   per shard so the sync-inventory bloom and elided-block
-    ///   rehydration read one canonical map.
+    /// `provision_store`, `tx_store`, `exec_cert_store`, and
+    /// `finalized_wave_store` are scoped per shard so same-shard vnodes
+    /// converge on one canonical store. Use `RecoveredState::default()`
+    /// for a fresh start.
     #[must_use]
-    #[allow(clippy::too_many_arguments)] // per-shard-shared stores threaded explicitly so
-    // same-shard vnodes converge on one canonical store
+    #[allow(clippy::too_many_arguments)] // per-shard-shared stores threaded explicitly
     pub fn new(
         topology: TopologyCoordinator,
         bft_config: &BftConfig,

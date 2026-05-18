@@ -103,9 +103,8 @@ impl WaveCertificate {
     }
 }
 
-// Manual `Decode` overrides the derive purely to enforce the
-// exactly-one-local-EC invariant at the wire boundary; encode / categorize
-// / describe are derived against the inner field.
+// Manual `Decode` enforces the exactly-one-local-EC invariant at the
+// wire boundary.
 impl<D: Decoder<NoCustomValueKind>> Decode<NoCustomValueKind, D> for WaveCertificate {
     fn decode_body_with_value_kind(
         decoder: &mut D,

@@ -263,9 +263,9 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
             return vec![];
         }
 
-        // Group ready ids by `(preferred, origin)`. Different origins differ
-        // in network class, so two ids with the same shard+preferred but
-        // different classes issue as separate `Send`s.
+        // Group ready ids by `(shard, preferred, class)`. Two ids with the
+        // same shard+preferred but different classes issue as separate
+        // `Send`s.
         let mut groups: HashMap<GroupKey, Vec<Id>> = HashMap::new();
         let mut taken = 0usize;
         for (id, entry) in &self.pending {
@@ -375,9 +375,7 @@ mod tests {
         let FetchOutput::Send { ids, .. } = &out[0];
         let chunk_ids = ids.clone();
 
-        // The new contract: handle(Failed) returns the re-dispatch Sends
-        // directly. The 2-call pattern (Failed then Tick) the old contract
-        // required is gone — input handlers spawn pending fetches inline.
+        // handle(Failed) re-dispatches inline — no separate Tick needed.
         let retry_out = p.handle(FetchInput::Failed { ids: chunk_ids });
         assert_eq!(p.in_flight_count(), 2);
         assert_eq!(retry_out.len(), 1);

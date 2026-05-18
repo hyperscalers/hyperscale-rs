@@ -8,14 +8,10 @@
 //!   (gossip, sync, fetch results, BLS-verified headers, protocol
 //!   events) lives here.
 //! - [`ShardEvent::Process`] carries a [`ProcessScopedInput`] with no
-//!   shard tag — currently `FetchTick` and `SubmitTransaction`, both
-//!   of which fan out across every hosted shard.
+//!   shard tag — inputs that fan out across every hosted shard.
 //!
-//! The type-level partition replaces the previous `Option<ShardGroupId>`
-//! envelope: shard-scoped inputs always carry a shard, process-scoped
-//! inputs never need one, and the I/O loop's `step()` dispatch is an
-//! exhaustive match instead of a runtime panic if the shard tag is
-//! missing.
+//! The typed sum lets `step()` dispatch via exhaustive match without a
+//! runtime shard-presence check.
 
 use std::sync::Arc;
 
@@ -321,11 +317,7 @@ impl ProcessScopedInput {
 /// dispatch it.
 ///
 /// The shard variant carries the hosted-shard tag inline; the process
-/// variant has no tag because it isn't anchored to one shard. Earlier
-/// revisions modelled this as `{ shard: Option<ShardGroupId>, input:
-/// NodeInput }` and asserted at runtime that shard-scoped inputs
-/// carried a `Some(_)` — the typed sum lifts that assertion to the
-/// type level.
+/// variant has no tag because it isn't anchored to one shard.
 #[derive(Debug, Clone)]
 pub enum ShardEvent {
     /// Routed to the hosted shard identified by [`ShardGroupId`]. Fans

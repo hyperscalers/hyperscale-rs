@@ -122,9 +122,8 @@ pub enum AccumulateDecision {
 }
 
 pub struct BlockCommitCoordinator<S: ChainWriter> {
-    /// Shard this coordinator persists for. Stamped onto
-    /// `ProtocolEvent::BlockPersisted` so the `IoLoop` routes the
-    /// post-write event to the correct `ShardIo`.
+    /// Shard this coordinator persists for. Stamped onto emitted
+    /// `BlockPersisted` events.
     shard: ShardGroupId,
 
     /// Prepared commit cache shared with delegated dispatch closures.
@@ -209,29 +208,14 @@ where
     }
 
     /// Prepare a [`Action::CommitBlockByQcOnly`] block for the standard
-    /// commit pipeline.
-    ///
-    /// Computes the JMT root inline (no `commit_lock` — only reads),
-    /// verifies it matches the canonical state root, inserts the JMT
-    /// snapshot into `pending_chain` so child blocks'
-    /// `VerifyStateRoot` can resolve parent nodes through the overlay,
-    /// then caches the prepared commit for the next flush.
-    ///
-    /// Returns `false` if the block is already persisted (caller skips
-    /// the rest of the commit pipeline). Returns `true` otherwise —
-    /// caller should proceed to [`accumulate`](Self::accumulate).
-    ///
-    /// Hard-skips only on already-persisted; an already-prepared block
-    /// still proceeds (consensus path may have produced the prepared
-    /// commit, but if `BlockReadyToCommit` never fired the block needs
-    /// to flow through `accumulate` for its `BlockCommitted` event).
+    /// commit pipeline. Returns `false` if the block is already persisted
+    /// (caller skips the rest of the pipeline), `true` otherwise.
     ///
     /// # Panics
     ///
     /// Panics on local state divergence: a computed-vs-canonical state
     /// root mismatch means local parent state itself diverged from
-    /// canonical (JMT or commit-batch bug, or pre-existing corruption
-    /// in `StateCf`). Block-by-block sync can't repair this; operator
+    /// canonical. Block-by-block sync can't repair this; operator
     /// intervention (restore from snapshot or wipe-and-resync) is
     /// required.
     ///
@@ -263,10 +247,9 @@ where
             return false;
         }
 
-        // If the consensus path already produced the prepared commit
-        // (VerifyStateRoot/ExecuteTransactions), reuse it — recomputing
-        // JMT here can produce a transient root mismatch and trip the
-        // byzantine-detection assert below on a self-inflicted race.
+        // If the consensus path already produced the prepared commit, reuse it
+        // — recomputing JMT here can produce a transient root mismatch and trip
+        // the byzantine-detection assert below on a self-inflicted race.
         if self.has_prepared(&block_hash) {
             debug!(
                 height = height.inner(),
@@ -281,7 +264,6 @@ where
         let view = pending_chain.view_at(block.header().parent_block_hash());
         let pending_snapshots = view.pending_snapshots().to_vec();
 
-        // Inline JMT computation (no commit_lock — only reads).
         let finalized_waves: Vec<Arc<FinalizedWave>> = block.certificates().to_vec();
         let (computed_root, prepared) = view.prepare_block_commit(
             parent_state_root,
@@ -327,8 +309,6 @@ where
             );
         }
 
-        // Insert JMT snapshot into PendingChain so child blocks'
-        // VerifyStateRoot can find this block's tree nodes via the overlay.
         let jmt_snapshot = Arc::new(S::jmt_snapshot(&prepared).clone());
         let receipts: Vec<Arc<ConsensusReceipt>> = finalized_waves
             .iter()

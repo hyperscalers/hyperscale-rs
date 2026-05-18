@@ -28,8 +28,7 @@ pub struct BlockHeaderNotification {
 }
 
 impl BlockHeaderNotification {
-    /// Create a block header notification message. Accepts either a
-    /// freshly-built `BlockHeader` or an existing `Arc<BlockHeader>`.
+    /// Create a block header notification message.
     #[must_use]
     pub fn new(
         header: impl Into<Arc<BlockHeader>>,

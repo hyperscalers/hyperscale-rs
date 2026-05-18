@@ -16,11 +16,11 @@ use crate::{Action, ProtocolEvent};
 /// # Example
 ///
 /// ```ignore
-/// impl StateMachine for NodeStateMachine {
+/// impl StateMachine for MyStateMachine {
 ///     fn handle(&mut self, now: LocalTimestamp, event: ProtocolEvent) -> Vec<Action> {
 ///         self.now = now;
 ///         match event {
-///             ProtocolEvent::BlockVoteReceived { vote } => self.bft.on_block_vote(vote),
+///             ProtocolEvent::BlockVoteReceived { vote } => self.on_block_vote(vote),
 ///             // ... etc
 ///         }
 ///     }

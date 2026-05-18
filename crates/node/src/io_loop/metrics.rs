@@ -15,11 +15,9 @@
 //! The snapshot mirrors the three-layer architecture: per-shard
 //! infrastructure counts in [`ShardMetrics`] (sync / fetch state) and
 //! per-vnode consensus counts in [`VnodeMetrics`] (BFT / mempool state).
-//! The prometheus backend currently uses flat (unlabeled) gauges, so
+//! The prometheus backend uses flat (unlabeled) gauges, so
 //! [`record_metrics`] picks a representative shard + vnode via
-//! [`MetricsSnapshot::primary`] and emits its values. Once the backend
-//! grows `shard=` / `validator_id=` labels, the emitter can iterate the
-//! maps directly with no change to the snapshot shape.
+//! [`MetricsSnapshot::primary`] and emits its values.
 
 use std::collections::HashMap;
 
@@ -71,8 +69,7 @@ pub struct VnodeMetrics {
 ///
 /// Per-shard infrastructure metrics live in `shards`; per-vnode consensus
 /// metrics live in `vnodes`. `memory` is a flat readout populated from a
-/// representative shard + vnode (see [`Self::primary`]) until the
-/// prometheus backend supports per-shard / per-validator labels.
+/// representative shard + vnode (see [`Self::primary`]).
 pub struct MetricsSnapshot {
     /// Per-hosted-shard infrastructure metrics.
     pub shards: HashMap<ShardGroupId, ShardMetrics>,
@@ -100,9 +97,7 @@ impl MetricsSnapshot {
 /// queries for storage memory usage. Designed to run off the pinned
 /// thread via `spawn_blocking`.
 ///
-/// Today's backend uses flat gauges, so values come from
-/// [`MetricsSnapshot::primary`]. Per-shard / per-validator labels are a
-/// future evolution.
+/// Emits flat gauges from [`MetricsSnapshot::primary`].
 pub fn record_metrics<S: ChainWriter>(snapshot: MetricsSnapshot, storage: &S) {
     let Some((shard, vnode)) = snapshot.primary() else {
         return;
@@ -198,10 +193,9 @@ where
             }
         }
 
-        // Memory readouts: until the prometheus backend supports per-shard /
-        // per-validator labels, populate the flat struct from a primary
-        // shard + vnode. The iteration order matches the maps above so the
-        // "primary" picked here aligns with `MetricsSnapshot::primary`.
+        // Memory readouts come from a primary shard + vnode; iteration
+        // order matches the maps above so this aligns with
+        // `MetricsSnapshot::primary`.
         let primary_shard = self
             .hosted_shards()
             .next()

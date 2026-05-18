@@ -2,10 +2,10 @@
 //!
 //! One [`ShardIo`] per hosted shard. Same-shard `Vnode`s share their
 //! `ShardIo`; cross-shard `Vnode`s live independently. Shard-scoped
-//! state (storage today; fetch host, sync host, block-commit pipeline,
-//! request-serving caches, and batch accumulators in due course) lives
-//! here so that multi-vnode hosting captures the natural sharing
-//! structure without leaking state across `IoLoop`s.
+//! state (storage, fetch host, sync host, block-commit pipeline,
+//! request-serving caches, batch accumulators) lives here so that
+//! multi-vnode hosting captures the natural sharing structure without
+//! leaking state across `IoLoop`s.
 
 pub mod block_commit;
 pub mod caches;
