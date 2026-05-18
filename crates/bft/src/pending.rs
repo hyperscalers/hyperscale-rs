@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_core::{Action, FetchOrigin, FetchRequest};
+use hyperscale_core::{Action, FetchRequest};
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, FinalizedWave, LocalTimestamp,
     ProvisionHash, Provisions, RoutableTransaction, TopologySnapshot, TxHash, WaveId,
@@ -280,7 +280,7 @@ impl PendingBlocks {
                     ids: missing_txs,
                     shard: local_shard,
                     preferred: Some(proposer),
-                    origin: FetchOrigin::PendingBlock,
+                    class: None,
                 }));
             }
 
@@ -297,7 +297,7 @@ impl PendingBlocks {
                     ids: missing_provisions,
                     shard: local_shard,
                     preferred: Some(proposer),
-                    origin: FetchOrigin::PendingBlock,
+                    class: None,
                 }));
             }
 
@@ -314,7 +314,7 @@ impl PendingBlocks {
                     ids: missing_waves,
                     shard: local_shard,
                     preferred: Some(proposer),
-                    origin: FetchOrigin::PendingBlock,
+                    class: None,
                 }));
             }
         }

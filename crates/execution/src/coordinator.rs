@@ -40,7 +40,7 @@
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
-use hyperscale_core::{Action, FetchOrigin, FetchRequest, ProtocolEvent};
+use hyperscale_core::{Action, FetchRequest, ProtocolEvent};
 use hyperscale_types::{
     Attempt, Block, BlockHash, BlockHeader, BlockHeight, BloomFilter, CertifiedBlock,
     ExecutionCertificate, ExecutionVote, FinalizedWave, GlobalReceiptRoot, Hash, Provisions,
@@ -1154,7 +1154,7 @@ impl ExecutionCoordinator {
             actions.push(Action::Fetch(FetchRequest::ExecutionCerts {
                 wave_id,
                 preferred: None,
-                origin: FetchOrigin::CrossShard,
+                class: None,
             }));
         }
 

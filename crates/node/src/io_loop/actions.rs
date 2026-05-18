@@ -464,7 +464,7 @@ where
                 ids,
                 shard,
                 preferred,
-                origin,
+                class,
             } => {
                 self.drive_fetch::<TransactionBinding>(
                     local_shard,
@@ -472,7 +472,7 @@ where
                         ids,
                         shard,
                         preferred,
-                        origin,
+                        class,
                     },
                 );
             }
@@ -480,7 +480,7 @@ where
                 ids,
                 shard,
                 preferred,
-                origin,
+                class,
             } => {
                 self.drive_fetch::<LocalProvisionBinding>(
                     local_shard,
@@ -488,7 +488,7 @@ where
                         ids,
                         shard,
                         preferred,
-                        origin,
+                        class,
                     },
                 );
             }
@@ -496,7 +496,7 @@ where
                 ids,
                 shard,
                 preferred,
-                origin,
+                class,
             } => {
                 self.drive_fetch::<FinalizedWaveBinding>(
                     local_shard,
@@ -504,7 +504,7 @@ where
                         ids,
                         shard,
                         preferred,
-                        origin,
+                        class,
                     },
                 );
             }
@@ -512,7 +512,7 @@ where
                 source_shard,
                 block_height,
                 preferred,
-                origin,
+                class,
             } => {
                 self.drive_fetch::<ProvisionBinding>(
                     local_shard,
@@ -520,14 +520,14 @@ where
                         ids: vec![(source_shard, local_shard, block_height)],
                         shard: source_shard,
                         preferred,
-                        origin,
+                        class,
                     },
                 );
             }
             FetchRequest::ExecutionCerts {
                 wave_id,
                 preferred,
-                origin,
+                class,
             } => {
                 let source_shard = wave_id.shard_group_id();
                 self.drive_fetch::<ExecCertBinding>(
@@ -536,7 +536,7 @@ where
                         ids: vec![wave_id],
                         shard: source_shard,
                         preferred,
-                        origin,
+                        class,
                     },
                 );
             }
