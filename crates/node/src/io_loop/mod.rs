@@ -40,7 +40,7 @@ use hyperscale_storage::{PendingChain, Storage};
 use hyperscale_types::{LocalTimestamp, ShardGroupId, TopologySnapshot, TransactionStatus, TxHash};
 pub use metrics::{MetricsSnapshot, record_metrics};
 use quick_cache::sync::Cache as QuickCache;
-pub use status::NodeStatusSnapshot;
+pub use status::{NodeStatusSnapshot, ShardStatus, VnodeStatus};
 
 use crate::NodeStateMachine;
 use crate::batch_accumulator::BatchAccumulator;

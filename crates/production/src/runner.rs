@@ -1089,13 +1089,21 @@ fn wall_clock_local() -> LocalTimestamp {
 }
 
 /// Push a [`NodeStatusSnapshot`] into the shared RPC state objects.
+///
+/// Today's RPC contract surfaces one status per node; pick the
+/// representative shard/vnode pair. Multi-vnode RPC fan-out (Milestone 4)
+/// will iterate `snapshot.shards` and `snapshot.vnodes` directly.
 fn update_rpc_state(config: &PinnedLoopConfig, snapshot: &NodeStatusSnapshot) {
+    let Some((shard, vnode)) = snapshot.primary() else {
+        return;
+    };
+
     if let Some(ref rpc_status) = config.rpc_status {
         let current = rpc_status.load();
         rpc_status.store(Arc::new(NodeStatusState {
-            block_height: snapshot.committed_height.inner(),
-            view: snapshot.view,
-            state_root_hash: hex_encode(snapshot.state_root.as_bytes()),
+            block_height: vnode.committed_height.inner(),
+            view: vnode.view,
+            state_root_hash: hex_encode(vnode.state_root.as_bytes()),
             // Preserve fields set by other writers (runner sets connected_peers)
             validator_id: current.validator_id,
             shard: current.shard,
@@ -1107,26 +1115,26 @@ fn update_rpc_state(config: &PinnedLoopConfig, snapshot: &NodeStatusSnapshot) {
     if let Some(ref sync_status) = config.sync_status {
         let current = sync_status.load();
         sync_status.store(Arc::new(SyncStatus {
-            state: snapshot.block_sync.state.clone(),
-            current_height: snapshot.block_sync.current_height,
-            target_height: snapshot.block_sync.target_height,
-            blocks_behind: snapshot.block_sync.blocks_behind,
+            state: shard.block_sync.state.clone(),
+            current_height: shard.block_sync.current_height,
+            target_height: shard.block_sync.target_height,
+            blocks_behind: shard.block_sync.blocks_behind,
             // Preserve sync_peers set by runner's collect_metrics
             sync_peers: current.sync_peers,
-            pending_fetches: snapshot.block_sync.pending_fetches,
-            queued_heights: snapshot.block_sync.queued_heights,
+            pending_fetches: shard.block_sync.pending_fetches,
+            queued_heights: shard.block_sync.queued_heights,
         }));
     }
 
     if let Some(ref mempool_snapshot) = config.mempool_snapshot {
         mempool_snapshot.store(Arc::new(MempoolSnapshot {
-            pending_count: snapshot.mempool_pending,
-            in_flight_count: snapshot.mempool_in_flight,
-            total_count: snapshot.mempool_total,
-            accepting_rpc_transactions: snapshot.accepting_rpc_transactions,
-            at_pending_limit: snapshot.at_pending_limit,
-            remote_shard_in_flight: snapshot.remote_shard_in_flight.clone(),
-            remote_congestion_threshold: snapshot.remote_congestion_threshold,
+            pending_count: vnode.mempool_pending,
+            in_flight_count: vnode.mempool_in_flight,
+            total_count: vnode.mempool_total,
+            accepting_rpc_transactions: vnode.accepting_rpc_transactions,
+            at_pending_limit: vnode.at_pending_limit,
+            remote_shard_in_flight: vnode.remote_shard_in_flight.clone(),
+            remote_congestion_threshold: vnode.remote_congestion_threshold,
             updated_at: Some(Instant::now()),
         }));
     }
