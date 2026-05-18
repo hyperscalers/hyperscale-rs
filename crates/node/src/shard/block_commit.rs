@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crossbeam::channel::Sender;
-use hyperscale_core::{CommitSource, ProtocolEvent};
+use hyperscale_core::{CommitSource, PreparedBlock, ProtocolEvent};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_metrics::{record_block_committed, set_block_height};
 use hyperscale_storage::{ChainEntry, ChainWriter, PendingChain, Storage};
@@ -43,6 +43,48 @@ pub type NotifyHandles = (Arc<Block>, Arc<QuorumCertificate>);
 /// that produce prepared commits asynchronously on the consensus crypto pool.
 pub type PreparedCommitMap<S> =
     HashMap<BlockHash, (BlockHeight, <S as ChainWriter>::PreparedCommit)>;
+
+/// Build the `commit_prepared` closure passed into [`ActionContext`].
+///
+/// Captures the shard's `pending_chain` and `prepared_commits` Arcs
+/// once at dispatch time so the closure can be moved into the
+/// off-thread action handler without holding `&DispatchHandles`. The
+/// closure inserts the JMT snapshot into `pending_chain` (so child
+/// blocks' state-root verifications can resolve through the overlay)
+/// and stashes the prepared commit for the next flush.
+///
+/// [`ActionContext`]: hyperscale_core::ActionContext
+pub fn make_commit_prepared<S>(
+    pending_chain: Arc<PendingChain<S>>,
+    prepared_commits: Arc<Mutex<PreparedCommitMap<S>>>,
+) -> impl Fn(PreparedBlock<S::PreparedCommit>) + Send + Sync + 'static
+where
+    S: Storage,
+{
+    move |prep: PreparedBlock<S::PreparedCommit>| {
+        let PreparedBlock {
+            block_hash,
+            parent_block_hash,
+            block_height,
+            prepared,
+            receipts,
+        } = prep;
+        let jmt_snapshot = Arc::new(S::jmt_snapshot(&prepared).clone());
+        pending_chain.insert(
+            block_hash,
+            ChainEntry {
+                parent_block_hash,
+                height: block_height,
+                receipts,
+                jmt_snapshot,
+            },
+        );
+        prepared_commits
+            .lock()
+            .unwrap()
+            .insert(block_hash, (block_height, prepared));
+    }
+}
 
 /// A block commit waiting to be flushed to storage.
 ///
