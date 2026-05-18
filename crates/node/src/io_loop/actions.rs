@@ -92,14 +92,16 @@ where
 
             // ─── io_loop-internal effects ──────────────────────────────────
             Action::SetTimer { id, duration } => {
-                self.vnodes[vnode_idx]
-                    .pending_timer_ops
-                    .push(TimerOp::Set { id, duration });
+                self.vnodes[vnode_idx].pending_timer_ops.push(TimerOp::Set {
+                    shard,
+                    id,
+                    duration,
+                });
             }
             Action::CancelTimer { id } => {
                 self.vnodes[vnode_idx]
                     .pending_timer_ops
-                    .push(TimerOp::Cancel { id });
+                    .push(TimerOp::Cancel { shard, id });
             }
             Action::Continuation(pe) => self.handle_continuation(shard, pe),
             Action::RestoreCommittedState => self.handle_restore_committed_state(shard),
@@ -187,7 +189,7 @@ where
             self.process_remote_header_sync_outputs(shard, outputs);
         }
 
-        let _ = self.event_sender.send(NodeInput::Protocol(Box::new(pe)));
+        let _ = self.event_sender.send(NodeInput::protocol(shard, pe));
     }
 
     fn handle_restore_committed_state(&self, shard: ShardGroupId) {
@@ -195,9 +197,10 @@ where
         let height = storage.committed_height();
         let hash = storage.committed_hash();
         let qc = storage.latest_qc();
-        let _ = self.event_sender.send(NodeInput::Protocol(Box::new(
+        let _ = self.event_sender.send(NodeInput::protocol(
+            shard,
             ProtocolEvent::CommittedStateRestored { height, hash, qc },
-        )));
+        ));
     }
 
     fn handle_emit_transaction_status(

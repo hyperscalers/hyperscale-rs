@@ -6,9 +6,7 @@
 
 use std::sync::Arc;
 
-use hyperscale_core::{
-    Action, ActionContext, NodeInput, PreparedBlock, ProtocolEvent, VerificationKind,
-};
+use hyperscale_core::{Action, ActionContext, PreparedBlock, ProtocolEvent, VerificationKind};
 use hyperscale_engine::Engine;
 use hyperscale_metrics::record_signature_verification_latency;
 use hyperscale_network::Network;
@@ -589,13 +587,11 @@ where
                 total_voting_power,
             );
             record_signature_verification_latency("vote", start.elapsed().as_secs_f64());
-            (ctx.notify)(NodeInput::Protocol(Box::new(
-                ProtocolEvent::QuorumCertificateResult {
-                    block_hash: result.block_hash,
-                    qc: result.qc,
-                    verified_votes: result.verified_votes,
-                },
-            )));
+            ctx.notify_protocol(ProtocolEvent::QuorumCertificateResult {
+                block_hash: result.block_hash,
+                qc: result.qc,
+                verified_votes: result.verified_votes,
+            });
         }
 
         Action::VerifyQcSignature {
@@ -606,9 +602,7 @@ where
             let start = std::time::Instant::now();
             let valid = verify_qc_signature(&qc, &public_keys);
             record_signature_verification_latency("qc", start.elapsed().as_secs_f64());
-            (ctx.notify)(NodeInput::Protocol(Box::new(
-                ProtocolEvent::QcSignatureVerified { block_hash, valid },
-            )));
+            ctx.notify_protocol(ProtocolEvent::QcSignatureVerified { block_hash, valid });
         }
 
         Action::VerifyRemoteHeaderQc {
@@ -637,14 +631,12 @@ where
                 "remote_header_qc",
                 start.elapsed().as_secs_f64(),
             );
-            (ctx.notify)(NodeInput::Protocol(Box::new(
-                ProtocolEvent::RemoteHeaderQcVerified {
-                    shard,
-                    height,
-                    committed_header,
-                    valid,
-                },
-            )));
+            ctx.notify_protocol(ProtocolEvent::RemoteHeaderQcVerified {
+                shard,
+                height,
+                committed_header,
+                valid,
+            });
         }
 
         Action::VerifyTransactionRoot {
@@ -659,13 +651,11 @@ where
                 "transaction_root",
                 start.elapsed().as_secs_f64(),
             );
-            (ctx.notify)(NodeInput::Protocol(Box::new(
-                ProtocolEvent::BlockRootVerified {
-                    kind: VerificationKind::TransactionRoot,
-                    block_hash,
-                    valid,
-                },
-            )));
+            ctx.notify_protocol(ProtocolEvent::BlockRootVerified {
+                kind: VerificationKind::TransactionRoot,
+                block_hash,
+                valid,
+            });
         }
 
         Action::VerifyProvisionTxRoots {
@@ -680,13 +670,11 @@ where
                 "provision_tx_roots",
                 start.elapsed().as_secs_f64(),
             );
-            (ctx.notify)(NodeInput::Protocol(Box::new(
-                ProtocolEvent::BlockRootVerified {
-                    kind: VerificationKind::ProvisionTxRoots,
-                    block_hash,
-                    valid,
-                },
-            )));
+            ctx.notify_protocol(ProtocolEvent::BlockRootVerified {
+                kind: VerificationKind::ProvisionTxRoots,
+                block_hash,
+                valid,
+            });
         }
 
         Action::VerifyProvisionRoot {
@@ -698,13 +686,11 @@ where
             let raw_batch_hashes: Vec<Hash> = batch_hashes.iter().map(|h| h.into_raw()).collect();
             let valid = verify_provision_root(expected_root, &raw_batch_hashes);
             record_signature_verification_latency("provision_root", start.elapsed().as_secs_f64());
-            (ctx.notify)(NodeInput::Protocol(Box::new(
-                ProtocolEvent::BlockRootVerified {
-                    kind: VerificationKind::ProvisionRoot,
-                    block_hash,
-                    valid,
-                },
-            )));
+            ctx.notify_protocol(ProtocolEvent::BlockRootVerified {
+                kind: VerificationKind::ProvisionRoot,
+                block_hash,
+                valid,
+            });
         }
 
         Action::VerifyCertificateRoot {
@@ -718,13 +704,11 @@ where
                 "certificate_root",
                 start.elapsed().as_secs_f64(),
             );
-            (ctx.notify)(NodeInput::Protocol(Box::new(
-                ProtocolEvent::BlockRootVerified {
-                    kind: VerificationKind::CertificateRoot,
-                    block_hash,
-                    valid,
-                },
-            )));
+            ctx.notify_protocol(ProtocolEvent::BlockRootVerified {
+                kind: VerificationKind::CertificateRoot,
+                block_hash,
+                valid,
+            });
         }
 
         Action::VerifyStateRoot {
@@ -755,22 +739,18 @@ where
                 "local_receipt_root",
                 receipt_start.elapsed().as_secs_f64(),
             );
-            (ctx.notify)(NodeInput::Protocol(Box::new(
-                ProtocolEvent::BlockRootVerified {
-                    kind: VerificationKind::LocalReceiptRoot,
-                    block_hash,
-                    valid: receipt_root_valid,
-                },
-            )));
+            ctx.notify_protocol(ProtocolEvent::BlockRootVerified {
+                kind: VerificationKind::LocalReceiptRoot,
+                block_hash,
+                valid: receipt_root_valid,
+            });
 
             if !receipt_root_valid {
-                (ctx.notify)(NodeInput::Protocol(Box::new(
-                    ProtocolEvent::BlockRootVerified {
-                        kind: VerificationKind::StateRoot,
-                        block_hash,
-                        valid: false,
-                    },
-                )));
+                ctx.notify_protocol(ProtocolEvent::BlockRootVerified {
+                    kind: VerificationKind::StateRoot,
+                    block_hash,
+                    valid: false,
+                });
                 return;
             }
 
@@ -796,13 +776,11 @@ where
                     receipts: collect_finalized_receipts(&finalized_waves),
                 });
             }
-            (ctx.notify)(NodeInput::Protocol(Box::new(
-                ProtocolEvent::BlockRootVerified {
-                    kind: VerificationKind::StateRoot,
-                    block_hash,
-                    valid: result.valid,
-                },
-            )));
+            ctx.notify_protocol(ProtocolEvent::BlockRootVerified {
+                kind: VerificationKind::StateRoot,
+                block_hash,
+                valid: result.valid,
+            });
         }
 
         Action::BuildProposal {
@@ -854,16 +832,14 @@ where
                     receipts: collect_finalized_receipts(&finalized_waves),
                 });
             }
-            (ctx.notify)(NodeInput::Protocol(Box::new(
-                ProtocolEvent::ProposalBuilt {
-                    height,
-                    round,
-                    block: Arc::new(result.block),
-                    block_hash,
-                    finalized_waves,
-                    provisions,
-                },
-            )));
+            ctx.notify_protocol(ProtocolEvent::ProposalBuilt {
+                height,
+                round,
+                block: Arc::new(result.block),
+                block_hash,
+                finalized_waves,
+                provisions,
+            });
         }
 
         // ── Sign + broadcast actions ──────────────────────────────────────
@@ -906,9 +882,7 @@ where
             let gossip = BlockVoteNotification { vote: vote.clone() };
             ctx.network.notify(&next_proposers, &gossip);
             // Feed our own signed vote back for local VoteSet tracking.
-            (ctx.notify)(NodeInput::Protocol(Box::new(
-                ProtocolEvent::BlockVoteReceived { vote },
-            )));
+            ctx.notify_protocol(ProtocolEvent::BlockVoteReceived { vote });
         }
 
         Action::BroadcastCommittedBlockHeader { committed_header } => {

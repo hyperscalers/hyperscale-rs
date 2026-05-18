@@ -775,11 +775,12 @@ impl ProductionRunner {
             };
             let genesis_certified =
                 Arc::new(CertifiedBlock::new_unchecked(genesis_block, genesis_qc));
-            let genesis_commit_output = io_loop.step(NodeInput::Protocol(Box::new(
+            let genesis_commit_output = io_loop.step(NodeInput::protocol(
+                shard,
                 ProtocolEvent::BlockCommitted {
                     certified: genesis_certified,
                 },
-            )));
+            ));
 
             info!(
                 shard = ?shard,
@@ -1023,7 +1024,7 @@ struct PinnedLoopConfig {
 struct ProdTimerManager {
     tokio_handle: TokioHandle,
     timer_tx: Sender<NodeInput>,
-    active: HashMap<TimerId, JoinHandle<()>>,
+    active: HashMap<(ShardGroupId, TimerId), JoinHandle<()>>,
 }
 
 impl ProdTimerManager {
@@ -1037,20 +1038,25 @@ impl ProdTimerManager {
 
     fn process_op(&mut self, op: TimerOp) {
         match op {
-            TimerOp::Set { id, duration } => {
-                if let Some(handle) = self.active.remove(&id) {
+            TimerOp::Set {
+                shard,
+                id,
+                duration,
+            } => {
+                let key = (shard, id.clone());
+                if let Some(handle) = self.active.remove(&key) {
                     handle.abort();
                 }
                 let timer_tx = self.timer_tx.clone();
-                let timer_id = id.clone();
+                let timer_id = id;
                 let handle = self.tokio_handle.spawn(async move {
                     sleep(duration).await;
-                    let _ = timer_tx.send(timer_id.into_event());
+                    let _ = timer_tx.send(timer_id.into_event(shard));
                 });
-                self.active.insert(id, handle);
+                self.active.insert(key, handle);
             }
-            TimerOp::Cancel { id } => {
-                if let Some(handle) = self.active.remove(&id) {
+            TimerOp::Cancel { shard, id } => {
+                if let Some(handle) = self.active.remove(&(shard, id)) {
                     handle.abort();
                 }
             }

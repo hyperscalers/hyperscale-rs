@@ -76,7 +76,7 @@ pub struct SimulationRunner {
 
     /// Timer registry for cancellation support.
     /// Maps `(node, timer_id) -> event_key` for removal.
-    timers: HashMap<(NodeIndex, TimerId), EventKey>,
+    timers: HashMap<(NodeIndex, ShardGroupId, TimerId), EventKey>,
 
     /// Statistics.
     stats: SimulationStats,
@@ -607,10 +607,12 @@ impl SimulationRunner {
                     genesis_block.clone(),
                     genesis_qc,
                 ));
-                let genesis_commit_event =
-                    NodeInput::Protocol(Box::new(ProtocolEvent::BlockCommitted {
+                let genesis_commit_event = NodeInput::protocol(
+                    shard,
+                    ProtocolEvent::BlockCommitted {
                         certified: genesis_certified,
-                    }));
+                    },
+                );
                 self.schedule_event(host_index, self.now, genesis_commit_event);
             }
 
@@ -808,15 +810,19 @@ impl SimulationRunner {
     /// Process a [`TimerOp`] emitted by a node's state machine.
     fn process_timer_op(&mut self, node: NodeIndex, op: TimerOp) {
         match op {
-            TimerOp::Set { id, duration } => {
+            TimerOp::Set {
+                shard,
+                id,
+                duration,
+            } => {
                 let fire_time = self.now + duration;
-                let event = id.clone().into_event();
+                let event = id.clone().into_event(shard);
                 let key = self.schedule_event(node, fire_time, event);
-                self.timers.insert((node, id), key);
+                self.timers.insert((node, shard, id), key);
                 self.stats.timers_set += 1;
             }
-            TimerOp::Cancel { id } => {
-                if let Some(key) = self.timers.remove(&(node, id)) {
+            TimerOp::Cancel { shard, id } => {
+                if let Some(key) = self.timers.remove(&(node, shard, id)) {
                     self.event_queue.remove(&key);
                     self.stats.timers_cancelled += 1;
                 }

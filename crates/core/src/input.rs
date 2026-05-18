@@ -44,10 +44,24 @@ pub enum EventPriority {
 ///   into `ProtocolEvent`s.
 #[derive(Debug, Clone, strum::IntoStaticStr)]
 pub enum NodeInput {
-    /// Pass-through to state machine. `IoLoop` extracts the `ProtocolEvent` and
-    /// passes it to `state.handle()` directly. Boxed because `ProtocolEvent`
-    /// dwarfs every other variant and would inflate the event queue otherwise.
-    Protocol(Box<ProtocolEvent>),
+    /// Pass-through to state machine. `IoLoop` extracts the `ProtocolEvent`
+    /// and passes it to `state.handle()` directly on every vnode hosted in
+    /// `shard`. Boxed because `ProtocolEvent` dwarfs every other variant
+    /// and would inflate the event queue otherwise.
+    ///
+    /// `shard` is supplied at emission time so cross-shard hosting can
+    /// fan the event out to the right vnodes — the prior single-shard
+    /// design fell back to `vnodes[0].shard` and broke quietly when the
+    /// host carried vnodes across multiple shards. Off-thread emission
+    /// sites (BLS verify, sync rehydrate, fetch response callbacks)
+    /// capture the shard at their dispatch point.
+    Protocol {
+        /// Hosted shard this event applies to. Used by `IoLoop::step()`
+        /// to select which vnodes receive the event.
+        shard: ShardGroupId,
+        /// Boxed protocol event payload.
+        event: Box<ProtocolEvent>,
+    },
 
     /// Client submitted a transaction.
     SubmitTransaction {
@@ -210,7 +224,7 @@ impl NodeInput {
             // Priority is a scheduling concern, not a protocol concern.
             // Timers and network-received messages are classified explicitly;
             // everything else (callbacks, continuations, completions) defaults to Internal.
-            Self::Protocol(pe) => match pe.as_ref() {
+            Self::Protocol { event, .. } => match event.as_ref() {
                 ProtocolEvent::ViewChangeTimer | ProtocolEvent::CleanupTimer => {
                     EventPriority::Timer
                 }
@@ -274,15 +288,23 @@ impl NodeInput {
     #[must_use]
     pub fn type_name(&self) -> &'static str {
         match self {
-            Self::Protocol(pe) => pe.type_name(),
+            Self::Protocol { event, .. } => event.type_name(),
             other => other.into(),
         }
     }
 }
 
-impl From<ProtocolEvent> for NodeInput {
-    fn from(event: ProtocolEvent) -> Self {
-        Self::Protocol(Box::new(event))
+impl NodeInput {
+    /// Construct a `NodeInput::Protocol` for `shard` from `event`.
+    /// Convenience for the common case where the caller has both
+    /// `shard` and `event` in scope and doesn't want to spell out the
+    /// boxing + struct construction.
+    #[must_use]
+    pub fn protocol(shard: ShardGroupId, event: ProtocolEvent) -> Self {
+        Self::Protocol {
+            shard,
+            event: Box::new(event),
+        }
     }
 }
 

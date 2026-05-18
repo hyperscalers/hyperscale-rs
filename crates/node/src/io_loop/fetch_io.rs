@@ -38,6 +38,7 @@ where
     /// [`FetchHost`]: crate::shard::fetch::FetchHost
     pub(in crate::io_loop) fn process_fetch_outputs<B: FetchBinding>(
         &self,
+        local_shard: ShardGroupId,
         outputs: Vec<FetchOutput<B::Id>>,
     ) {
         for FetchOutput::Send {
@@ -51,6 +52,7 @@ where
                 for id in ids {
                     B::dispatch_chunk(
                         vec![id],
+                        local_shard,
                         shard,
                         preferred,
                         origin,
@@ -61,6 +63,7 @@ where
             } else {
                 B::dispatch_chunk(
                     ids,
+                    local_shard,
                     shard,
                     preferred,
                     origin,
@@ -99,7 +102,7 @@ where
             );
         }
         let outputs = B::fetch_mut(self.shard_fetches_mut(local_shard)).handle(input);
-        self.process_fetch_outputs::<B>(outputs);
+        self.process_fetch_outputs::<B>(local_shard, outputs);
     }
 
     /// Route an admission `ProtocolEvent` to whichever fetch bindings
@@ -180,13 +183,25 @@ where
             .shards
             .values_mut()
             .any(|sio| sio.fetches.has_any_pending() || sio.syncs.has_any_pending());
+        // FetchTick is process-global. The `shard` on `TimerOp` exists
+        // to key the runner's timer manager by `(TimerId, ShardGroupId)`;
+        // pick a stable sentinel from the hosted set so set/cancel pairs
+        // match. The firing path passes `shard` to `into_event` which
+        // ignores it for `FetchTick`.
+        let sentinel_shard = *self
+            .shards
+            .keys()
+            .next()
+            .expect("IoLoop hosts at least one shard");
         let op = if any_pending {
             TimerOp::Set {
+                shard: sentinel_shard,
                 id: TimerId::FetchTick,
                 duration: Self::FETCH_TICK_INTERVAL,
             }
         } else {
             TimerOp::Cancel {
+                shard: sentinel_shard,
                 id: TimerId::FetchTick,
             }
         };

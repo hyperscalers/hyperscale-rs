@@ -374,9 +374,10 @@ where
                         Arc::unwrap_or_clone(commit.block),
                         Arc::unwrap_or_clone(commit.qc),
                     ));
-                    let _ = event_tx.send(NodeInput::Protocol(Box::new(
+                    let _ = event_tx.send(NodeInput::protocol(
+                        shard,
                         ProtocolEvent::BlockCommitted { certified },
-                    )));
+                    ));
                 }
             }
 
@@ -386,12 +387,13 @@ where
             // calls flush to drain any backlog.
             in_flight.store(false, Ordering::Release);
 
-            let _ = event_tx.send(NodeInput::Protocol(Box::new(
+            let _ = event_tx.send(NodeInput::protocol(
+                shard,
                 ProtocolEvent::BlockPersisted {
                     shard,
                     height: max_persisted,
                 },
-            )));
+            ));
         });
     }
 }
@@ -552,8 +554,8 @@ mod tests {
 
     fn drain_protocol_events(rx: &Receiver<NodeInput>) -> Vec<ProtocolEvent> {
         let mut out = Vec::new();
-        while let Ok(NodeInput::Protocol(ev)) = rx.try_recv() {
-            out.push(*ev);
+        while let Ok(NodeInput::Protocol { event, .. }) = rx.try_recv() {
+            out.push(*event);
         }
         out
     }

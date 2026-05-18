@@ -89,12 +89,13 @@ where
                     "committed_header",
                 );
                 if valid {
-                    let _ = event_tx.send(NodeInput::Protocol(Box::new(
+                    let _ = event_tx.send(NodeInput::protocol(
+                        shard,
                         ProtocolEvent::RemoteHeaderReceived {
                             committed_header,
                             sender,
                         },
-                    )));
+                    ));
                 } else {
                     tracing::warn!(
                         sender = sender.inner(),

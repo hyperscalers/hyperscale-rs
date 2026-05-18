@@ -10,7 +10,7 @@ use std::hash::BuildHasher;
 use std::sync::Arc;
 use std::time::Instant;
 
-use hyperscale_core::{Action, ActionContext, NodeInput, ProtocolEvent, ProvisionsRequest};
+use hyperscale_core::{Action, ActionContext, ProtocolEvent, ProvisionsRequest};
 use hyperscale_engine::sharding::expand_nodes_with_owned_at_height;
 use hyperscale_engine::{Engine, fetch_state_entries};
 use hyperscale_jmt::TreeReader as JmtTreeReader;
@@ -207,13 +207,11 @@ where
                 "inclusion_proof",
                 merkle_start.elapsed().as_secs_f64(),
             );
-            (ctx.notify)(NodeInput::Protocol(Box::new(
-                ProtocolEvent::StateProvisionsVerified {
-                    provisions: Arc::new(provisions),
-                    committed_header: Some(committed_header),
-                    valid: all_valid,
-                },
-            )));
+            ctx.notify_protocol(ProtocolEvent::StateProvisionsVerified {
+                provisions: Arc::new(provisions),
+                committed_header: Some(committed_header),
+                valid: all_valid,
+            });
         }
         Action::FetchAndBroadcastProvisions {
             block_hash,
@@ -243,12 +241,10 @@ where
                 // the main thread draining it will miss the cache and
                 // either hit RocksDB regen (post-persist) or trigger a
                 // fetch retry (pre-persist) — recoverable both ways.
-                (ctx.notify)(NodeInput::Protocol(Box::new(
-                    ProtocolEvent::OutboundProvisionBroadcast {
-                        provisions: Arc::clone(&provisions_arc),
-                        target_shard: provisions_arc.target_shard(),
-                    },
-                )));
+                ctx.notify_protocol(ProtocolEvent::OutboundProvisionBroadcast {
+                    provisions: Arc::clone(&provisions_arc),
+                    target_shard: provisions_arc.target_shard(),
+                });
 
                 let msg = state_provisions_message(&provisions_arc);
                 let sig = ctx.signing_key.sign_v1(&msg);

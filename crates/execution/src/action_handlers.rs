@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use hyperscale_core::{Action, ActionContext, NodeInput, ProtocolEvent};
+use hyperscale_core::{Action, ActionContext, ProtocolEvent};
 use hyperscale_engine::Engine;
 use hyperscale_metrics::record_execution_latency;
 use hyperscale_network::Network;
@@ -241,12 +241,10 @@ where
         } => {
             let certificate =
                 aggregate_execution_certificate(&wave_id, global_receipt_root, &votes, &committee);
-            (ctx.notify)(NodeInput::Protocol(Box::new(
-                ProtocolEvent::ExecutionCertificateAggregated {
-                    wave_id,
-                    certificate: Arc::new(certificate),
-                },
-            )));
+            ctx.notify_protocol(ProtocolEvent::ExecutionCertificateAggregated {
+                wave_id,
+                certificate: Arc::new(certificate),
+            });
         }
         Action::VerifyAndAggregateExecutionVotes {
             wave_id,
@@ -254,13 +252,11 @@ where
             votes,
         } => {
             let verified_votes: Vec<_> = batch_verify_execution_votes(votes).collect();
-            (ctx.notify)(NodeInput::Protocol(Box::new(
-                ProtocolEvent::ExecutionVotesVerifiedAndAggregated {
-                    wave_id,
-                    block_hash,
-                    verified_votes,
-                },
-            )));
+            ctx.notify_protocol(ProtocolEvent::ExecutionVotesVerifiedAndAggregated {
+                wave_id,
+                block_hash,
+                verified_votes,
+            });
         }
         Action::VerifyExecutionCertificateSignature {
             certificate,
@@ -268,12 +264,10 @@ where
             ..
         } => {
             let valid = verify_execution_certificate_signature(&certificate, &public_keys);
-            (ctx.notify)(NodeInput::Protocol(Box::new(
-                ProtocolEvent::ExecutionCertificateSignatureVerified {
-                    certificate: Arc::new(certificate),
-                    valid,
-                },
-            )));
+            ctx.notify_protocol(ProtocolEvent::ExecutionCertificateSignatureVerified {
+                certificate: Arc::new(certificate),
+                valid,
+            });
         }
         Action::VerifyFinalizedWave {
             wave,
@@ -284,9 +278,7 @@ where
                 .iter()
                 .zip(ec_public_keys.iter())
                 .all(|(ec, keys)| verify_execution_certificate_signature(ec, keys));
-            (ctx.notify)(NodeInput::Protocol(Box::new(
-                ProtocolEvent::FinalizedWaveVerified { wave, valid },
-            )));
+            ctx.notify_protocol(ProtocolEvent::FinalizedWaveVerified { wave, valid });
         }
         Action::ExecuteTransactions {
             wave_id,
@@ -311,13 +303,11 @@ where
                 .map(|tx| (tx.outcome(), StoredReceipt::from(tx)))
                 .unzip();
             record_execution_latency(start.elapsed().as_secs_f64());
-            (ctx.notify)(NodeInput::Protocol(Box::new(
-                ProtocolEvent::ExecutionBatchCompleted {
-                    wave_id,
-                    results,
-                    tx_outcomes,
-                },
-            )));
+            ctx.notify_protocol(ProtocolEvent::ExecutionBatchCompleted {
+                wave_id,
+                results,
+                tx_outcomes,
+            });
         }
         Action::ExecuteCrossShardTransactions {
             wave_id,
@@ -348,13 +338,11 @@ where
                 })
                 .unzip();
             record_execution_latency(start.elapsed().as_secs_f64());
-            (ctx.notify)(NodeInput::Protocol(Box::new(
-                ProtocolEvent::ExecutionBatchCompleted {
-                    wave_id,
-                    results,
-                    tx_outcomes,
-                },
-            )));
+            ctx.notify_protocol(ProtocolEvent::ExecutionBatchCompleted {
+                wave_id,
+                results,
+                tx_outcomes,
+            });
         }
 
         // ── Sign + broadcast actions ──────────────────────────────────────
@@ -402,9 +390,7 @@ where
 
             // Feed own vote to state machine only if we are the leader.
             if leader == validator_id {
-                (ctx.notify)(NodeInput::Protocol(Box::new(
-                    ProtocolEvent::ExecutionVoteReceived { vote },
-                )));
+                ctx.notify_protocol(ProtocolEvent::ExecutionVoteReceived { vote });
             }
         }
 

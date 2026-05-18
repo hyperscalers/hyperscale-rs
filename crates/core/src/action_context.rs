@@ -14,7 +14,7 @@ use hyperscale_types::{
     BlockHash, BlockHeight, Bls12381G1PrivateKey, ConsensusReceipt, TopologySnapshot,
 };
 
-use crate::NodeInput;
+use crate::{NodeInput, ProtocolEvent};
 
 /// Context for executing delegated actions.
 ///
@@ -43,6 +43,20 @@ pub struct ActionContext<'a, S: Storage, E: Engine, N: Network> {
     /// `PendingChain` + `prepared_commits`. Only `BuildProposal` and
     /// `VerifyStateRoot` produce these.
     pub commit_prepared: &'a (dyn Fn(PreparedBlock<S::PreparedCommit>) + Send + Sync),
+}
+
+impl<S: Storage, E: Engine, N: Network> ActionContext<'_, S, E, N> {
+    /// Convenience wrapper around `notify` for the common case of
+    /// emitting a `ProtocolEvent`. Tags the event with the emitting
+    /// vnode's shard (read off `topology_snapshot.local_shard()`) so
+    /// cross-shard hosting routes the resulting `NodeInput::Protocol`
+    /// to the right hosted shard.
+    pub fn notify_protocol(&self, event: ProtocolEvent) {
+        (self.notify)(NodeInput::protocol(
+            self.topology_snapshot.local_shard(),
+            event,
+        ));
+    }
 }
 
 /// A successful prepare result, ready to insert into `PendingChain` and
