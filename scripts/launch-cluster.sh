@@ -23,6 +23,7 @@ set -e
 # Default configuration
 NUM_SHARDS=2                                    # Number of shards
 VALIDATORS_PER_SHARD=4                          # Minimum 4 required for BFT (3 validators can't tolerate any delays)
+VNODES_PER_HOST=1                               # Validators bundled into each host process. Must divide VALIDATORS_PER_SHARD.
 BASE_PORT=9000                                  # libp2p port
 BASE_RPC_PORT=8080                              # HTTP RPC port
 DATA_DIR="./cluster-data"                       # Data directory
@@ -55,6 +56,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --validators-per-shard|--validators)
             VALIDATORS_PER_SHARD="$2"
+            shift 2
+            ;;
+        --vnodes-per-host)
+            VNODES_PER_HOST="$2"
             shift 2
             ;;
         --clean)
@@ -119,6 +124,7 @@ while [[ $# -gt 0 ]]; do
             echo "Options:"
             echo "  --shards N               Number of shards (default: 2)"
             echo "  --validators-per-shard M Validators per shard (default: 4, minimum: 4)"
+            echo "  --vnodes-per-host K      Validators bundled into each host process (default: 1). Must divide validators-per-shard."
             echo "  --accounts-per-shard N   Spammer accounts per shard (default: 100)"
             echo "  --initial-balance N      Initial XRD balance per account (default: 1000000)"
             echo "  --smoke-timeout DURATION Smoke test timeout (default: 60s)"
@@ -166,9 +172,9 @@ apply_network_conditions() {
     local latency="${NETWORK_LATENCY_MS:-0}"
     local loss="${PACKET_LOSS_PERCENT:-0}"
 
-    # Calculate port ranges for validators (P2P only, not RPC)
+    # Calculate port ranges for host processes (P2P only, not RPC)
     local quic_port_start=$BASE_PORT
-    local quic_port_end=$((BASE_PORT + TOTAL_VALIDATORS - 1))
+    local quic_port_end=$((BASE_PORT + TOTAL_HOSTS - 1))
 
     echo "Applying network conditions (latency: ${latency}ms, packet loss: ${loss}%)..."
     echo "  Affecting P2P ports: QUIC ${quic_port_start}-${quic_port_end}"
@@ -250,9 +256,26 @@ if [ "$VALIDATORS_PER_SHARD" -lt 4 ]; then
     exit 1
 fi
 
+# Validate vnodes-per-host divides validators-per-shard. Initial multi-vnode
+# packing is same-shard only: K vnodes from the same shard land in one host.
+if [ "$VNODES_PER_HOST" -lt 1 ]; then
+    echo "ERROR: --vnodes-per-host must be >= 1."
+    exit 1
+fi
+if [ $((VALIDATORS_PER_SHARD % VNODES_PER_HOST)) -ne 0 ]; then
+    echo "ERROR: --vnodes-per-host ($VNODES_PER_HOST) must divide --validators-per-shard ($VALIDATORS_PER_SHARD)."
+    exit 1
+fi
+
+HOSTS_PER_SHARD=$((VALIDATORS_PER_SHARD / VNODES_PER_HOST))
+TOTAL_HOSTS=$((NUM_SHARDS * HOSTS_PER_SHARD))
+
 echo "=== Hyperscale Local Cluster ==="
 echo "Shards: $NUM_SHARDS"
 echo "Validators per shard: $VALIDATORS_PER_SHARD"
+echo "Vnodes per host: $VNODES_PER_HOST"
+echo "Hosts per shard: $HOSTS_PER_SHARD"
+echo "Total hosts: $TOTAL_HOSTS"
 echo "Total validators: $TOTAL_VALIDATORS"
 echo "Accounts per shard: $ACCOUNTS_PER_SHARD"
 echo "Initial balance: $INITIAL_BALANCE XRD"
@@ -299,15 +322,15 @@ if [ ! -f "$SPAMMER_BIN" ]; then
     exit 1
 fi
 
-# Generate keypairs and collect public keys
+# Generate keypairs and collect public keys. Keys live in a flat $DATA_DIR/keys
+# dir; each host's TOML references the per-validator paths from there.
 echo "Generating validator keypairs..."
 declare -a PUBLIC_KEYS
 declare -a KEY_FILES
+mkdir -p "$DATA_DIR/keys"
 
 for i in $(seq 0 $((TOTAL_VALIDATORS - 1))); do
-    KEY_DIR="$DATA_DIR/validator-$i"
-    mkdir -p "$KEY_DIR"
-    KEY_FILE="$KEY_DIR/signing.key"
+    KEY_FILE="$DATA_DIR/keys/v-$i.key"
     KEY_FILES[$i]="$KEY_FILE"
 
     # Generate a deterministic 32-byte seed from validator index
@@ -336,66 +359,84 @@ for shard in $(seq 0 $((NUM_SHARDS - 1))); do
 done
 echo "  Generated balances for $((NUM_SHARDS * ACCOUNTS_PER_SHARD)) accounts total"
 
-# Calculate bootstrap peer addresses
-# First validator of each shard will be bootstrap peers
+# Calculate bootstrap peer addresses. The first host of each shard
+# (host_idx = shard * HOSTS_PER_SHARD) advertises its QUIC port; all other
+# hosts dial those.
 BOOTSTRAP_PEERS=""
 for shard in $(seq 0 $((NUM_SHARDS - 1))); do
-    first_validator=$((shard * VALIDATORS_PER_SHARD))
-    quic_port=$((BASE_PORT + first_validator))
+    first_host_idx=$((shard * HOSTS_PER_SHARD))
+    quic_port=$((BASE_PORT + first_host_idx))
     if [ -n "$BOOTSTRAP_PEERS" ]; then
         BOOTSTRAP_PEERS="$BOOTSTRAP_PEERS,"
     fi
-    # We'll use localhost multiaddr format
     BOOTSTRAP_PEERS="$BOOTSTRAP_PEERS\"/ip4/127.0.0.1/udp/$quic_port/quic-v1\""
 done
 
-# Generate TOML configs for each validator
-echo "Generating config files..."
-for i in $(seq 0 $((TOTAL_VALIDATORS - 1))); do
-    shard=$((i / VALIDATORS_PER_SHARD))
-    p2p_port=$((BASE_PORT + i))
-    rpc_port=$((BASE_RPC_PORT + i))
-
-    CONFIG_FILE="$DATA_DIR/validator-$i/config.toml"
-    KEY_FILE="$DATA_DIR/validator-$i/signing.key"
-    NODE_DATA_DIR="$DATA_DIR/validator-$i/data"
-
-    mkdir -p "$NODE_DATA_DIR"
-
-    # Build genesis validators section - include ALL validators from ALL shards
-    # This is required so validators can verify cross-shard messages
-    GENESIS_VALIDATORS=""
-    for j in $(seq 0 $((TOTAL_VALIDATORS - 1))); do
-        if [ -n "$GENESIS_VALIDATORS" ]; then
-            GENESIS_VALIDATORS="$GENESIS_VALIDATORS
+# Build the [[genesis.validators]] section once — it's identical across hosts,
+# listing every validator across every shard so each host can verify cross-
+# shard messages.
+GENESIS_VALIDATORS=""
+for j in $(seq 0 $((TOTAL_VALIDATORS - 1))); do
+    if [ -n "$GENESIS_VALIDATORS" ]; then
+        GENESIS_VALIDATORS="$GENESIS_VALIDATORS
 "
-        fi
-        # Calculate which shard this validator belongs to
-        validator_shard=$((j / VALIDATORS_PER_SHARD))
-        GENESIS_VALIDATORS="$GENESIS_VALIDATORS[[genesis.validators]]
+    fi
+    validator_shard=$((j / VALIDATORS_PER_SHARD))
+    GENESIS_VALIDATORS="$GENESIS_VALIDATORS[[genesis.validators]]
 id = $j
 shard = $validator_shard
 public_key = \"${PUBLIC_KEYS[$j]}\"
 voting_power = 1"
-    done
+done
 
-    # Calculate per-validator port to avoid race conditions during startup
-    validator_quic_port=$((BASE_PORT + i))
+# Generate one TOML per host. With VNODES_PER_HOST=K, host h packs K same-shard
+# validators starting at validator index (shard * VALIDATORS_PER_SHARD + h_in_shard * K).
+echo "Generating config files..."
+for host_idx in $(seq 0 $((TOTAL_HOSTS - 1))); do
+    shard=$((host_idx / HOSTS_PER_SHARD))
+    h_in_shard=$((host_idx % HOSTS_PER_SHARD))
+    first_vnode=$((shard * VALIDATORS_PER_SHARD + h_in_shard * VNODES_PER_HOST))
+
+    quic_port=$((BASE_PORT + host_idx))
+    rpc_port=$((BASE_RPC_PORT + host_idx))
+
+    HOST_DIR="$DATA_DIR/host-$host_idx"
+    CONFIG_FILE="$HOST_DIR/config.toml"
+    NODE_DATA_DIR="$HOST_DIR/data"
+    mkdir -p "$NODE_DATA_DIR"
+
+    # Build [[vnode]] blocks for the K vnodes this host runs.
+    VNODE_BLOCKS=""
+    HOSTED_LIST=""
+    for k in $(seq 0 $((VNODES_PER_HOST - 1))); do
+        vnode_id=$((first_vnode + k))
+        if [ -n "$VNODE_BLOCKS" ]; then
+            VNODE_BLOCKS="$VNODE_BLOCKS
+"
+        fi
+        VNODE_BLOCKS="$VNODE_BLOCKS[[vnode]]
+validator_id = $vnode_id
+shard = $shard
+key_path = \"${KEY_FILES[$vnode_id]}\""
+        if [ -n "$HOSTED_LIST" ]; then
+            HOSTED_LIST="$HOSTED_LIST, "
+        fi
+        HOSTED_LIST="$HOSTED_LIST$vnode_id"
+    done
 
     cat > "$CONFIG_FILE" << EOF
 # Hyperscale Validator Configuration
 # Auto-generated for local cluster testing
+# Host $host_idx: shard $shard, vnodes [$HOSTED_LIST]
 
 [node]
-validator_id = $i
-shard = $shard
 num_shards = $NUM_SHARDS
-key_path = "$KEY_FILE"
 data_dir = "$NODE_DATA_DIR"
 
+$VNODE_BLOCKS
+
 [network]
-# Use specific ports per validator to avoid race conditions during parallel startup
-listen_addr = "/ip4/0.0.0.0/udp/$validator_quic_port/quic-v1"
+listen_addr = "/ip4/0.0.0.0/udp/$quic_port/quic-v1"
 version_interop_mode = "relaxed"
 bootstrap_peers = [$BOOTSTRAP_PEERS]
 upnp_enabled = false
@@ -426,42 +467,40 @@ listen_addr = "0.0.0.0:$rpc_port"
 enabled = $TRACING
 otlp_endpoint = "http://localhost:4317"
 service_name = "hyperscale-validator"
-log_file = "$DATA_DIR/validator-$i/output.log"
+log_file = "$HOST_DIR/output.log"
 
 $GENESIS_VALIDATORS
 
 ${SHARD_GENESIS_BALANCES[$shard]}
 EOF
 
-    echo "  Created config for validator $i (shard $shard, rpc port $rpc_port)"
+    echo "  Created config for host $host_idx (shard $shard, vnodes [$HOSTED_LIST], rpc port $rpc_port)"
 done
 
 # Apply network conditions before starting validators so they experience
 # realistic conditions from the first message exchange
 apply_network_conditions
 
-# Launch validators
+# Launch hosts
 echo ""
-echo "Launching validators..."
+echo "Launching hosts..."
 PID_FILE="$DATA_DIR/pids.txt"
 > "$PID_FILE"
-declare -a VALIDATOR_PIDS
+declare -a HOST_PIDS
 
-for i in $(seq 0 $((TOTAL_VALIDATORS - 1))); do
-    shard=$((i / VALIDATORS_PER_SHARD))
-    CONFIG_FILE="$DATA_DIR/validator-$i/config.toml"
-    LOG_FILE="$DATA_DIR/validator-$i/output.log"
+for host_idx in $(seq 0 $((TOTAL_HOSTS - 1))); do
+    shard=$((host_idx / HOSTS_PER_SHARD))
+    HOST_DIR="$DATA_DIR/host-$host_idx"
+    CONFIG_FILE="$HOST_DIR/config.toml"
+    LOG_FILE="$HOST_DIR/output.log"
 
-    echo "  Starting validator $i (shard $shard)..."
+    echo "  Starting host $host_idx (shard $shard)..."
 
-    # Build RUST_LOG based on log level
-    # Always suppress noisy dependencies, but let hyperscale crates use the specified level
-    # libp2p_gossipsub=error to suppress "duplicate message" warnings which are normal in gossip
     # Tracing output goes to log_file (configured in TOML) with ANSI disabled.
     # Stderr redirect captures panics/crash output only.
-    RUST_LOG="warn,hyperscale=$LOG_LEVEL,hyperscale_production=$LOG_LEVEL,libp2p_gossipsub=error" "$VALIDATOR_BIN" --config "$CONFIG_FILE" 2>> "$DATA_DIR/validator-$i/crash.log" &
+    RUST_LOG="warn,hyperscale=$LOG_LEVEL,hyperscale_production=$LOG_LEVEL,libp2p_gossipsub=error" "$VALIDATOR_BIN" --config "$CONFIG_FILE" 2>> "$HOST_DIR/crash.log" &
     PID=$!
-    VALIDATOR_PIDS[$i]=$PID
+    HOST_PIDS[$host_idx]=$PID
     echo "$PID" >> "$PID_FILE"
     echo "    PID: $PID, logs: $LOG_FILE"
 
@@ -469,26 +508,26 @@ for i in $(seq 0 $((TOTAL_VALIDATORS - 1))); do
     sleep 0.2
 done
 
-# Wait a moment for validators to either start or fail
+# Wait a moment for hosts to either start or fail
 sleep 1
 
-# Check if any validators died during startup
+# Check if any hosts died during startup
 FAILED=false
-for i in $(seq 0 $((TOTAL_VALIDATORS - 1))); do
-    PID=${VALIDATOR_PIDS[$i]}
+for host_idx in $(seq 0 $((TOTAL_HOSTS - 1))); do
+    PID=${HOST_PIDS[$host_idx]}
     if ! kill -0 "$PID" 2>/dev/null; then
         echo ""
-        echo "ERROR: Validator $i (PID $PID) failed to start!"
+        echo "ERROR: Host $host_idx (PID $PID) failed to start!"
         echo "Log output:"
-        cat "$DATA_DIR/validator-$i/output.log"
+        cat "$DATA_DIR/host-$host_idx/output.log" 2>/dev/null || cat "$DATA_DIR/host-$host_idx/crash.log" 2>/dev/null
         echo ""
         FAILED=true
     fi
 done
 
 if [ "$FAILED" = true ]; then
-    echo "One or more validators failed to start. Stopping cluster..."
-    for pid in "${VALIDATOR_PIDS[@]}"; do
+    echo "One or more hosts failed to start. Stopping cluster..."
+    for pid in "${HOST_PIDS[@]}"; do
         kill "$pid" 2>/dev/null || true
     done
     exit 1
@@ -497,11 +536,14 @@ fi
 echo ""
 echo "=== Cluster Started ==="
 echo ""
-echo "Validator endpoints:"
-for i in $(seq 0 $((TOTAL_VALIDATORS - 1))); do
-    shard=$((i / VALIDATORS_PER_SHARD))
-    rpc_port=$((BASE_RPC_PORT + i))
-    echo "  Validator $i (shard $shard): http://$NODE_HOSTNAME:$rpc_port"
+echo "Host endpoints:"
+for host_idx in $(seq 0 $((TOTAL_HOSTS - 1))); do
+    shard=$((host_idx / HOSTS_PER_SHARD))
+    h_in_shard=$((host_idx % HOSTS_PER_SHARD))
+    first_vnode=$((shard * VALIDATORS_PER_SHARD + h_in_shard * VNODES_PER_HOST))
+    last_vnode=$((first_vnode + VNODES_PER_HOST - 1))
+    rpc_port=$((BASE_RPC_PORT + host_idx))
+    echo "  Host $host_idx (shard $shard, vnodes $first_vnode..$last_vnode): http://$NODE_HOSTNAME:$rpc_port"
 done
 
 echo ""
@@ -509,14 +551,14 @@ echo "Useful commands:"
 echo "  Check health:  curl http://$NODE_HOSTNAME:$BASE_RPC_PORT/health"
 echo "  Get status:    curl http://$NODE_HOSTNAME:$BASE_RPC_PORT/api/v1/status"
 echo "  View metrics:  curl http://$NODE_HOSTNAME:$BASE_RPC_PORT/metrics"
-echo "  View logs:     tail -f $DATA_DIR/validator-0/output.log"
+echo "  View logs:     tail -f $DATA_DIR/host-0/output.log"
 echo "  Stop cluster:  ./scripts/stop-cluster.sh"
 echo ""
 
-# Build spammer endpoint list (all validators for load distribution)
+# Build spammer endpoint list (one entry per host for load distribution)
 SPAMMER_ENDPOINTS=""
-for i in $(seq 0 $((TOTAL_VALIDATORS - 1))); do
-    rpc_port=$((BASE_RPC_PORT + i))
+for host_idx in $(seq 0 $((TOTAL_HOSTS - 1))); do
+    rpc_port=$((BASE_RPC_PORT + host_idx))
     if [ -n "$SPAMMER_ENDPOINTS" ]; then
         SPAMMER_ENDPOINTS="$SPAMMER_ENDPOINTS,"
     fi
@@ -557,7 +599,7 @@ if [ $SMOKE_TEST_EXIT -eq 0 ]; then
 else
     echo ""
     echo "WARNING: Smoke test failed with exit code $SMOKE_TEST_EXIT"
-    echo "Check validator logs for details: tail -f $DATA_DIR/validator-*/output.log"
+    echo "Check host logs for details: tail -f $DATA_DIR/host-*/output.log"
 fi
 
 # Cleanup function to kill all child processes
@@ -606,17 +648,18 @@ if [ "$MONITORING" = true ] || [ "$TRACING" = true ]; then
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     MONITORING_DIR="$SCRIPT_DIR/monitoring"
 
-    # Generate prometheus.yml with correct number of targets and shard labels
-    echo "Generating Prometheus configuration for $TOTAL_VALIDATORS validators across $NUM_SHARDS shards..."
+    # Generate prometheus.yml with one target per host (multi-vnode hosts
+    # expose a single metrics port; per-vnode prometheus labels are deferred).
+    echo "Generating Prometheus configuration for $TOTAL_HOSTS hosts across $NUM_SHARDS shards..."
 
-    # Build static configs grouped by shard
+    # Build static configs grouped by shard. Each host in a shard contributes
+    # one scrape target. The shard label reports the host's primary shard.
     PROM_STATIC_CONFIGS=""
     for shard in $(seq 0 $((NUM_SHARDS - 1))); do
-        # Build targets for this shard
         SHARD_TARGETS=""
-        for v in $(seq 0 $((VALIDATORS_PER_SHARD - 1))); do
-            validator_idx=$((shard * VALIDATORS_PER_SHARD + v))
-            rpc_port=$((BASE_RPC_PORT + validator_idx))
+        for h in $(seq 0 $((HOSTS_PER_SHARD - 1))); do
+            host_idx=$((shard * HOSTS_PER_SHARD + h))
+            rpc_port=$((BASE_RPC_PORT + host_idx))
             if [ -n "$SHARD_TARGETS" ]; then
                 SHARD_TARGETS="$SHARD_TARGETS
           - 'host.docker.internal:$rpc_port'"
@@ -625,9 +668,8 @@ if [ "$MONITORING" = true ] || [ "$TRACING" = true ]; then
             fi
         done
 
-        # Add this shard's config block
         PROM_STATIC_CONFIGS="$PROM_STATIC_CONFIGS
-      # Shard $shard validators
+      # Shard $shard hosts
       - targets:
           $SHARD_TARGETS
         labels:
@@ -637,7 +679,8 @@ if [ "$MONITORING" = true ] || [ "$TRACING" = true ]; then
 
     cat > "$MONITORING_DIR/prometheus.yml" << EOF
 # Prometheus configuration for Hyperscale local cluster
-# $NUM_SHARDS shards x $VALIDATORS_PER_SHARD validators = $TOTAL_VALIDATORS total
+# $NUM_SHARDS shards x $HOSTS_PER_SHARD hosts/shard = $TOTAL_HOSTS host processes
+# ($VALIDATORS_PER_SHARD validators/shard, $VNODES_PER_HOST vnodes/host)
 
 global:
   scrape_interval: 5s

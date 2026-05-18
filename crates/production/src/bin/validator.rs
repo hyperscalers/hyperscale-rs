@@ -10,9 +10,6 @@
 //!
 //! # Override data directory
 //! hyperscale-validator --config validator.toml --data-dir /var/lib/hyperscale
-//!
-//! # Specify signing key path
-//! hyperscale-validator --config validator.toml --key /etc/hyperscale/validator.key
 //! ```
 //!
 //! # Configuration
@@ -21,9 +18,13 @@
 //!
 //! ```toml
 //! [node]
+//! num_shards = 1
+//! data_dir = "./data"
+//!
+//! [[vnode]]
 //! validator_id = 0
 //! shard = 0
-//! data_dir = "./data"
+//! key_path = "./keys/v0.key"
 //!
 //! [network]
 //! listen_addr = "/ip4/0.0.0.0/udp/9000/quic-v1"
@@ -38,6 +39,11 @@
 //! enabled = true
 //! listen_addr = "0.0.0.0:9090"
 //! ```
+//!
+//! A host can run multiple validators in one process by listing additional
+//! `[[vnode]]` blocks. Same-shard vnodes share storage, fetch host, and
+//! gossipsub subscriptions; different-shard vnodes share only the libp2p
+//! peer and dispatch pools.
 
 use std::fs;
 use std::net::SocketAddr;
@@ -96,11 +102,8 @@ struct Cli {
     #[arg(short, long)]
     config: PathBuf,
 
-    /// Path to validator signing key (overrides config)
-    #[arg(long)]
-    key: Option<PathBuf>,
-
-    /// Data directory for `RocksDB` (overrides config)
+    /// Data directory for `RocksDB` (overrides config). Per-shard
+    /// `RocksDB` instances are opened at `data_dir/shard-{N}/db`.
     #[arg(long)]
     data_dir: Option<PathBuf>,
 
@@ -136,8 +139,16 @@ struct Cli {
 /// Top-level validator configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ValidatorConfig {
-    /// Node identity configuration
+    /// Host-level identity configuration
     pub node: NodeConfig,
+
+    /// Hosted validators. One entry per validator this process runs. A
+    /// single-validator deployment has exactly one block; multi-validator
+    /// hosts list one block per identity. Same-shard entries share
+    /// storage and gossipsub subscriptions; different-shard entries
+    /// additionally provision a per-shard `ShardIo`.
+    #[serde(rename = "vnode", default)]
+    pub vnodes: Vec<VnodeEntry>,
 
     /// Network configuration
     #[serde(default)]
@@ -172,9 +183,23 @@ pub struct ValidatorConfig {
     pub provisions: ProvisionConfig,
 }
 
-/// Node identity configuration.
+/// Host-level identity configuration. Per-validator identity lives in
+/// [`VnodeEntry`].
 #[derive(Debug, Clone, Deserialize)]
 pub struct NodeConfig {
+    /// Number of shards in the network
+    #[serde(default = "default_num_shards")]
+    pub num_shards: u64,
+
+    /// Data directory for storage. Per-shard `RocksDB` instances are
+    /// opened at `data_dir/shard-{N}/db`.
+    #[serde(default = "default_data_dir")]
+    pub data_dir: PathBuf,
+}
+
+/// One hosted validator's identity inputs.
+#[derive(Debug, Clone, Deserialize)]
+pub struct VnodeEntry {
     /// Validator ID (index in the committee)
     pub validator_id: u64,
 
@@ -182,17 +207,8 @@ pub struct NodeConfig {
     #[serde(default)]
     pub shard: u64,
 
-    /// Number of shards in the network
-    #[serde(default = "default_num_shards")]
-    pub num_shards: u64,
-
-    /// Path to the signing key file
-    #[serde(default)]
-    pub key_path: Option<PathBuf>,
-
-    /// Data directory for storage
-    #[serde(default = "default_data_dir")]
-    pub data_dir: PathBuf,
+    /// Path to this validator's signing key file
+    pub key_path: PathBuf,
 }
 
 const fn default_num_shards() -> u64 {
@@ -530,10 +546,6 @@ impl ValidatorConfig {
 
     /// Apply CLI overrides to the configuration.
     fn apply_overrides(&mut self, cli: &Cli) {
-        if let Some(ref key_path) = cli.key {
-            self.node.key_path = Some(key_path.clone());
-        }
-
         if let Some(ref data_dir) = cli.data_dir {
             self.node.data_dir.clone_from(data_dir);
         }
@@ -617,17 +629,16 @@ fn load_or_generate_keypair(key_path: Option<&PathBuf>) -> Result<Bls12381G1Priv
 
 /// Build the topology from genesis configuration.
 fn build_topology(
-    config: &ValidatorConfig,
+    local_validator_id: ValidatorId,
+    local_shard: ShardGroupId,
+    num_shards: u64,
+    genesis: &GenesisConfig,
     local_keypair: &Bls12381G1PrivateKey,
 ) -> Result<TopologyCoordinator> {
     use std::collections::HashMap;
 
-    let local_validator_id = ValidatorId::new(config.node.validator_id);
-    let local_shard = ShardGroupId::new(config.node.shard);
-    let num_shards = config.node.num_shards;
-
     // Build validator set from genesis config
-    let validators: Vec<ValidatorInfo> = if config.genesis.validators.is_empty() {
+    let validators: Vec<ValidatorInfo> = if genesis.validators.is_empty() {
         // Single validator mode (development/testing)
         warn!("No validators in genesis config, running in single-validator mode");
         vec![ValidatorInfo {
@@ -636,12 +647,11 @@ fn build_topology(
             voting_power: VotePower::new(1),
         }]
     } else {
-        config
-            .genesis
+        genesis
             .validators
             .iter()
             .map(|v| {
-                let public_key = if v.id == config.node.validator_id {
+                let public_key = if ValidatorId::new(v.id) == local_validator_id {
                     // Use our own key for our validator ID
                     local_keypair.public_key()
                 } else {
@@ -675,7 +685,7 @@ fn build_topology(
     let validator_set = ValidatorSet::new(validators);
 
     // Check if validators have explicit shard assignments
-    let has_shard_assignments = config.genesis.validators.iter().any(|v| v.shard.is_some());
+    let has_shard_assignments = genesis.validators.iter().any(|v| v.shard.is_some());
 
     if has_shard_assignments {
         // Build shard committees from explicit shard assignments in config
@@ -683,7 +693,7 @@ fn build_topology(
         // about ALL validators across ALL shards for cross-shard message verification
         let mut shard_committees: HashMap<ShardGroupId, Vec<ValidatorId>> = HashMap::new();
 
-        for v in &config.genesis.validators {
+        for v in &genesis.validators {
             // Use explicit shard if provided, otherwise fall back to validator_id % num_shards
             let shard = ShardGroupId::new(v.shard.unwrap_or(v.id % num_shards));
             shard_committees
@@ -691,12 +701,6 @@ fn build_topology(
                 .or_default()
                 .push(ValidatorId::new(v.id));
         }
-
-        info!(
-            num_shards = num_shards,
-            total_validators = config.genesis.validators.len(),
-            "Building topology with explicit shard assignments"
-        );
 
         Ok(TopologyCoordinator::with_shard_committees(
             local_validator_id,
@@ -1047,6 +1051,10 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
         Basic(Option<WorkerGuard>),
     }
 
+    // Telemetry's `shard` resource attribute reports the primary (first-
+    // listed) vnode's shard. Per-vnode labels are an open follow-up.
+    let primary_shard_label = config.vnodes.first().map_or(0, |v| v.shard);
+
     let _log_guard = if config.telemetry.enabled {
         let telemetry_config = TelemetryConfig {
             service_name: config.telemetry.service_name.clone(),
@@ -1054,7 +1062,7 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
             sampling_ratio: 1.0,
             prometheus_enabled: false, // We handle metrics separately
             prometheus_port: 9090,
-            resource_attributes: vec![("shard".to_string(), config.node.shard.to_string())],
+            resource_attributes: vec![("shard".to_string(), primary_shard_label.to_string())],
             log_file: config.telemetry.log_file.clone(),
         };
         UnifiedGuard::Telemetry(init_telemetry(&telemetry_config)?)
@@ -1105,11 +1113,17 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
     info!("Hyperscale Validator starting...");
 
     info!(
-        validator_id = config.node.validator_id,
-        shard = config.node.shard,
+        hosted_vnodes = config.vnodes.len(),
         num_shards = config.node.num_shards,
-        "Node configuration loaded"
+        "Host configuration loaded"
     );
+    for v in &config.vnodes {
+        info!(
+            validator_id = v.validator_id,
+            shard = v.shard,
+            "Hosting vnode"
+        );
+    }
 
     // Clean data directory if requested via cli parameter
     if cli.clean {
@@ -1136,18 +1150,12 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
 
     setup_upnp(&config.network).await;
 
-    let signing_keypair = load_or_generate_keypair(config.node.key_path.as_ref())?;
-    info!(
-        public_key = %format_public_key(&signing_keypair.public_key()),
-        "Loaded signing keypair"
-    );
-
-    let topology = build_topology(&config, &signing_keypair)?;
-    info!(
-        committee_size = topology.snapshot().local_committee_size(),
-        quorum_threshold = topology.snapshot().local_quorum_threshold().inner(),
-        "Topology initialized"
-    );
+    if config.vnodes.is_empty() {
+        bail!(
+            "No [[vnode]] entries in configuration; at least one is required. \
+             Add a [[vnode]] block with validator_id, shard, and key_path."
+        );
+    }
 
     let thread_config = build_thread_pool_config(&config.threads);
     let bft_config = BftConfig::default();
@@ -1159,19 +1167,66 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
             .context("Failed to initialize thread pools")?,
     );
 
-    let db_path = config.node.data_dir.join("db");
-    let storage = RocksDbStorage::open_with_config(&db_path, rocksdb_config)
-        .with_context(|| format!("Failed to open database at {}", db_path.display()))?;
-    let storage = Arc::new(storage);
-    info!("Storage opened at {}", db_path.display());
+    // Open one RocksDB per unique hosted shard. Same-shard vnodes share
+    // the storage Arc; different-shard vnodes each provision their own.
+    let hosted_shards: std::collections::BTreeSet<u64> =
+        config.vnodes.iter().map(|v| v.shard).collect();
+    let mut storages: std::collections::HashMap<ShardGroupId, Arc<RocksDbStorage>> =
+        std::collections::HashMap::new();
+    for shard in &hosted_shards {
+        let db_path = config
+            .node
+            .data_dir
+            .join(format!("shard-{shard}"))
+            .join("db");
+        let storage = RocksDbStorage::open_with_config(&db_path, rocksdb_config.clone())
+            .with_context(|| format!("Failed to open database at {}", db_path.display()))?;
+        info!(shard = shard, path = %db_path.display(), "Storage opened");
+        storages.insert(ShardGroupId::new(*shard), Arc::new(storage));
+    }
+
+    // Build one VnodeConfig per [[vnode]] entry.
+    let mut vnode_configs: Vec<VnodeConfig> = Vec::with_capacity(config.vnodes.len());
+    for entry in &config.vnodes {
+        let keypair = load_or_generate_keypair(Some(&entry.key_path))?;
+        info!(
+            validator_id = entry.validator_id,
+            shard = entry.shard,
+            public_key = %format_public_key(&keypair.public_key()),
+            "Loaded vnode signing keypair"
+        );
+
+        let topology = build_topology(
+            ValidatorId::new(entry.validator_id),
+            ShardGroupId::new(entry.shard),
+            config.node.num_shards,
+            &config.genesis,
+            &keypair,
+        )?;
+        info!(
+            validator_id = entry.validator_id,
+            shard = entry.shard,
+            committee_size = topology.snapshot().local_committee_size(),
+            quorum_threshold = topology.snapshot().local_quorum_threshold().inner(),
+            "Topology initialized for vnode"
+        );
+
+        vnode_configs.push(VnodeConfig {
+            topology,
+            signing_key: Arc::new(keypair),
+        });
+    }
 
     // Shared RPC state objects used by both runner and RPC server. ArcSwap gives
-    // HTTP handlers lock-free reads.
+    // HTTP handlers lock-free reads. Multi-vnode hosts surface the *primary*
+    // (first-listed) vnode's identity; per-vnode RPC fan-out is a later
+    // deliverable.
+    let primary = &config.vnodes[0];
     let rpc_ready = Arc::new(AtomicBool::new(false));
     let rpc_sync_status = Arc::new(ArcSwap::new(Arc::new(SyncStatus::default())));
     let rpc_node_status = Arc::new(ArcSwap::new(Arc::new(NodeStatusState {
-        validator_id: config.node.validator_id,
-        shard: config.node.shard,
+        validator_id: primary.validator_id,
+        shard: primary.shard,
         num_shards: config.node.num_shards,
         ..Default::default()
     })));
@@ -1179,22 +1234,14 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
 
     // The runner is built before the RPC server because it owns the crossbeam
     // event channel the RPC server submits transactions through.
-    let local_shard = ShardGroupId::new(config.node.shard);
-    let mut runner_builder = ProductionRunner::builder(
-        vec![VnodeConfig {
-            topology,
-            signing_key: Arc::new(signing_keypair),
-        }],
-        bft_config,
-        std::collections::HashMap::from([(local_shard, storage)]),
-        network_config,
-    )
-    .dispatch(dispatch)
-    .rpc_status(rpc_node_status.clone())
-    .mempool_snapshot(rpc_mempool_snapshot.clone())
-    .sync_status(rpc_sync_status.clone())
-    .mempool_config(config.mempool.clone())
-    .provision_config(config.provisions);
+    let mut runner_builder =
+        ProductionRunner::builder(vnode_configs, bft_config, storages, network_config)
+            .dispatch(dispatch)
+            .rpc_status(rpc_node_status.clone())
+            .mempool_snapshot(rpc_mempool_snapshot.clone())
+            .sync_status(rpc_sync_status.clone())
+            .mempool_config(config.mempool.clone())
+            .provision_config(config.provisions);
 
     if !config.genesis.xrd_balances.is_empty() {
         let engine_genesis = build_engine_genesis_config(&config.genesis)
