@@ -23,7 +23,7 @@ use std::hash::Hash;
 use std::sync::Arc;
 
 use crossbeam::channel::Sender;
-use hyperscale_core::{NodeInput, ProtocolEvent};
+use hyperscale_core::ProtocolEvent;
 use hyperscale_network::{Network, ResponseVerdict};
 use hyperscale_types::network::request::{
     GetExecutionCertsRequest, GetFinalizedWavesRequest, GetLocalProvisionsRequest,
@@ -35,7 +35,7 @@ use hyperscale_types::{
 
 use super::Fetch;
 use super::host::FetchHost;
-use crate::io_loop::{ShardEvent, push_protocol_event, push_shard_input};
+use crate::io_loop::{ShardEvent, ShardScopedInput, push_protocol_event, push_shard_input};
 
 // ─── Type aliases used across the module tree ──────────────────────────
 
@@ -79,7 +79,7 @@ pub trait FetchBinding: 'static {
     ///
     /// `local_shard` is the hosted shard whose `FetchHost` produced this
     /// request — it's threaded into the response callback so the resulting
-    /// `NodeInput::Protocol` and `*FetchFailed` events route to the right
+    /// `ShardScopedInput::Protocol` and `*FetchFailed` events route to the right
     /// hosted shard under cross-shard hosting (distinct from `shard`,
     /// which selects the *target* committee).
     fn dispatch_chunk<N: Network>(
@@ -189,7 +189,7 @@ impl FetchBinding for TransactionBinding {
                         push_shard_input(
                             &es,
                             local_shard,
-                            NodeInput::TransactionsFetchFailed {
+                            ShardScopedInput::TransactionsFetchFailed {
                                 hashes: split.missing.clone(),
                             },
                         );
@@ -206,7 +206,7 @@ impl FetchBinding for TransactionBinding {
                     push_shard_input(
                         &es,
                         local_shard,
-                        NodeInput::TransactionsFetchFailed { hashes: hs },
+                        ShardScopedInput::TransactionsFetchFailed { hashes: hs },
                     );
                     ResponseVerdict::Accept
                 }
@@ -259,7 +259,7 @@ impl FetchBinding for LocalProvisionBinding {
                         push_shard_input(
                             &es,
                             local_shard,
-                            NodeInput::LocalProvisionsFetchFailed {
+                            ShardScopedInput::LocalProvisionsFetchFailed {
                                 hashes: split.missing,
                             },
                         );
@@ -275,7 +275,7 @@ impl FetchBinding for LocalProvisionBinding {
                     push_shard_input(
                         &es,
                         local_shard,
-                        NodeInput::LocalProvisionsFetchFailed { hashes: hs },
+                        ShardScopedInput::LocalProvisionsFetchFailed { hashes: hs },
                     );
                     ResponseVerdict::Accept
                 }
@@ -329,7 +329,7 @@ impl FetchBinding for FinalizedWaveBinding {
                         push_shard_input(
                             &es,
                             local_shard,
-                            NodeInput::FinalizedWavesFetchFailed { ids: split.missing },
+                            ShardScopedInput::FinalizedWavesFetchFailed { ids: split.missing },
                         );
                     }
                     // Reject responses with unsolicited waves (peer scoring;
@@ -344,7 +344,7 @@ impl FetchBinding for FinalizedWaveBinding {
                     push_shard_input(
                         &es,
                         local_shard,
-                        NodeInput::FinalizedWavesFetchFailed { ids: requested_ids },
+                        ShardScopedInput::FinalizedWavesFetchFailed { ids: requested_ids },
                     );
                     ResponseVerdict::Accept
                 }
@@ -400,7 +400,7 @@ impl FetchBinding for ExecCertBinding {
                         push_shard_input(
                             &es,
                             local_shard,
-                            NodeInput::ExecCertFetchFailed {
+                            ShardScopedInput::ExecCertFetchFailed {
                                 hashes: split.missing,
                             },
                         );
@@ -417,7 +417,7 @@ impl FetchBinding for ExecCertBinding {
                     push_shard_input(
                         &es,
                         local_shard,
-                        NodeInput::ExecCertFetchFailed { hashes: failed_ids },
+                        ShardScopedInput::ExecCertFetchFailed { hashes: failed_ids },
                     );
                     ResponseVerdict::Accept
                 }
@@ -476,7 +476,7 @@ impl FetchBinding for ProvisionBinding {
                     push_shard_input(
                         &es,
                         local_shard,
-                        NodeInput::ProvisionsFetchFailed {
+                        ShardScopedInput::ProvisionsFetchFailed {
                             source_shard,
                             block_height,
                         },

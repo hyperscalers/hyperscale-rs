@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use hyperscale_core::{NodeInput, ProtocolEvent};
+use hyperscale_core::ProtocolEvent;
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_engine::Engine;
 use hyperscale_network::Network;
@@ -26,7 +26,7 @@ use hyperscale_types::network::gossip::TransactionGossip;
 use hyperscale_types::{RoutableTransaction, ShardGroupId, TxHash, shard_for_node};
 
 use crate::batch_accumulator::BatchAccumulator;
-use crate::io_loop::{IoLoop, push_shard_input};
+use crate::io_loop::{IoLoop, ShardScopedInput, push_shard_input};
 
 impl<S, N, D, E> IoLoop<S, N, D, E>
 where
@@ -240,7 +240,7 @@ where
                     push_shard_input(
                         &event_tx,
                         local_shard,
-                        NodeInput::TransactionValidated { tx },
+                        ShardScopedInput::TransactionValidated { tx },
                     );
                 } else {
                     failed_hashes.push(tx.hash());
@@ -250,7 +250,7 @@ where
                 push_shard_input(
                     &event_tx,
                     local_shard,
-                    NodeInput::TransactionValidationsFailed {
+                    ShardScopedInput::TransactionValidationsFailed {
                         hashes: failed_hashes,
                     },
                 );

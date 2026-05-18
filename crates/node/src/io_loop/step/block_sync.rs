@@ -18,8 +18,10 @@
 
 use std::sync::Arc;
 
-use hyperscale_core::{FetchFailureKind, NodeInput, ProtocolEvent};
+use hyperscale_core::ProtocolEvent;
 use hyperscale_network::RequestError;
+
+use crate::io_loop::{FetchFailureKind, ShardScopedInput};
 
 /// Classify a transport-level request error for the sync FSM. `Exhausted`
 /// already absorbed retries against rotated peers — re-queue immediately;
@@ -85,7 +87,7 @@ where
     /// local caches, then dispatch structural validation off-thread on
     /// `ConsensusCrypto`. On rehydration miss, mark the height for full
     /// refetch and re-queue. The verdict returns as
-    /// `NodeInput::SyncBlockValidated` / `SyncBlockValidationFailed` —
+    /// `ShardScopedInput::SyncBlockValidated` / `SyncBlockValidationFailed` —
     /// see `IoLoop::event_sender` for the off-thread → pinned-thread
     /// routing convention.
     pub(in crate::io_loop) fn handle_block_sync_response_received(
@@ -129,11 +131,11 @@ where
         let local_shard = shard;
         self.dispatch.spawn(DispatchPool::ConsensusCrypto, move || {
             let input = match validate_synced_block(height, &cert) {
-                Ok(()) => NodeInput::SyncBlockValidated {
+                Ok(()) => ShardScopedInput::SyncBlockValidated {
                     height,
                     certified: Box::new(cert),
                 },
-                Err(reason) => NodeInput::SyncBlockValidationFailed { height, reason },
+                Err(reason) => ShardScopedInput::SyncBlockValidationFailed { height, reason },
             };
             push_shard_input(&event_tx, local_shard, input);
         });
@@ -248,7 +250,7 @@ where
                         push_shard_input(
                             &es,
                             local_shard,
-                            NodeInput::BlockSyncResponseReceived { height, block },
+                            ShardScopedInput::BlockSyncResponseReceived { height, block },
                         );
                     }
                     Err(err) => {
@@ -256,7 +258,7 @@ where
                         push_shard_input(
                             &es,
                             local_shard,
-                            NodeInput::BlockSyncFetchFailed { height, kind },
+                            ShardScopedInput::BlockSyncFetchFailed { height, kind },
                         );
                     }
                 }

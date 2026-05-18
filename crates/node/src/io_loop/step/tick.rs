@@ -1,6 +1,6 @@
 //! Periodic fetch-tick step handler.
 //!
-//! `NodeInput::FetchTick` fires on the periodic `FetchTick` timer. It
+//! `ProcessScopedInput::FetchTick` fires on the periodic `FetchTick` timer. It
 //! advances every fetch protocol's idle clock so retries / chunk emission
 //! progresses without waiting for an admission event. Pending entries
 //! are drained by `drive_fetch_admission` on canonical admission events

@@ -253,7 +253,7 @@ impl ScopeState {
     }
 }
 
-pub use hyperscale_core::FetchFailureKind;
+pub use crate::io_loop::FetchFailureKind;
 
 /// Inputs to the generic sync state machine.
 #[derive(Debug)]

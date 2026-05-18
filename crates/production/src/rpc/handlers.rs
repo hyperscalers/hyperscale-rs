@@ -26,13 +26,12 @@ use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
 use axum::response::IntoResponse;
 use hex::{decode as hex_decode, encode as hex_encode};
-use hyperscale_core::NodeInput;
 use hyperscale_metrics::{
     record_transaction_rejected, record_tx_ingress_rejected_pending_limit,
     record_tx_ingress_rejected_syncing,
 };
 use hyperscale_metrics_prometheus::encode_metrics;
-use hyperscale_node::io_loop::ShardEvent;
+use hyperscale_node::io_loop::{ProcessScopedInput, ShardEvent};
 use hyperscale_types::{
     Hash, InFlightCount, RoutableTransaction, TransactionDecision, TransactionStatus, TxHash,
 };
@@ -179,7 +178,7 @@ pub async fn submit_transaction_handler(
     // 3. Dispatch to mempool after validation
     if state
         .tx_submission_tx
-        .send(ShardEvent::process(NodeInput::SubmitTransaction {
+        .send(ShardEvent::process(ProcessScopedInput::SubmitTransaction {
             tx: tx_arc,
         }))
         .is_err()

@@ -4,7 +4,7 @@
 //! `Action::CancelTimer { id }`. The runner translates these into its
 //! native scheduling primitive (tokio sleep in production, deterministic
 //! event queue in simulation) and converts the firing back into a
-//! `NodeInput`. That conversion lives in the node crate next to the
+//! `ShardEvent`. That conversion lives in the node crate next to the
 //! transport-layer `TimerOp` buffer it feeds.
 
 /// Timer identification for scheduled events.

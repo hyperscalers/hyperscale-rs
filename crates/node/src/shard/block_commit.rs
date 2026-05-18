@@ -597,7 +597,6 @@ mod tests {
     use std::sync::atomic::AtomicU64;
 
     use crossbeam::channel::{Receiver, unbounded};
-    use hyperscale_core::NodeInput;
     use hyperscale_dispatch_sync::SyncDispatch;
     use hyperscale_storage::tree::CollectedWrites;
     use hyperscale_storage::{BaseReadCache, JmtSnapshot};
@@ -607,6 +606,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::io_loop::ShardScopedInput;
 
     /// Mock prepared-commit handle. Carries an empty `JmtSnapshot` (the
     /// coordinator only inspects it via `jmt_snapshot()` from action
@@ -749,11 +749,7 @@ mod tests {
 
     fn drain_protocol_events(rx: &Receiver<ShardEvent>) -> Vec<ProtocolEvent> {
         let mut out = Vec::new();
-        while let Ok(ShardEvent {
-            input: NodeInput::Protocol(event),
-            ..
-        }) = rx.try_recv()
-        {
+        while let Ok(ShardEvent::Shard(_, ShardScopedInput::Protocol(event))) = rx.try_recv() {
             out.push(*event);
         }
         out

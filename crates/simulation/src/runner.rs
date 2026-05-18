@@ -766,7 +766,7 @@ impl SimulationRunner {
                 );
 
                 self.stats.events_processed += 1;
-                self.stats.events_by_priority[event.input.priority() as usize] += 1;
+                self.stats.events_by_priority[event.priority() as usize] += 1;
 
                 self.io_loops[node_index as usize].set_time(LocalTimestamp::from_millis(
                     u64::try_from(self.now.as_millis()).unwrap_or(u64::MAX),

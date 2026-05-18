@@ -9,9 +9,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_core::NodeInput;
 use hyperscale_network_memory::NetworkConfig;
-use hyperscale_node::io_loop::ShardEvent;
+use hyperscale_node::io_loop::{ProcessScopedInput, ShardEvent};
 use hyperscale_simulation::SimulationRunner;
 use hyperscale_types::test_utils::test_validity_range;
 use hyperscale_types::{
@@ -158,12 +157,12 @@ fn test_cycle_detection_aborts_loser() {
     runner.schedule_initial_event(
         0,
         Duration::ZERO,
-        ShardEvent::process(NodeInput::SubmitTransaction { tx: Arc::new(tx_a) }),
+        ShardEvent::process(ProcessScopedInput::SubmitTransaction { tx: Arc::new(tx_a) }),
     );
     runner.schedule_initial_event(
         3,
         Duration::from_millis(5),
-        ShardEvent::process(NodeInput::SubmitTransaction { tx: Arc::new(tx_b) }),
+        ShardEvent::process(ProcessScopedInput::SubmitTransaction { tx: Arc::new(tx_b) }),
     );
 
     // Poll until both reach terminal state.
@@ -245,7 +244,7 @@ fn test_no_cycle_completes_normally() {
     runner.schedule_initial_event(
         0,
         Duration::ZERO,
-        ShardEvent::process(NodeInput::SubmitTransaction { tx: Arc::new(tx) }),
+        ShardEvent::process(ProcessScopedInput::SubmitTransaction { tx: Arc::new(tx) }),
     );
 
     let final_status = poll_until_terminal(&mut runner, hash, 0, 200, Duration::from_millis(100));
@@ -277,7 +276,7 @@ fn test_timeout_abort() {
     runner.schedule_initial_event(
         0,
         Duration::ZERO,
-        ShardEvent::process(NodeInput::SubmitTransaction { tx: Arc::new(tx) }),
+        ShardEvent::process(ProcessScopedInput::SubmitTransaction { tx: Arc::new(tx) }),
     );
 
     // Run for enough time to trigger timeout (timeout is ~50 blocks, blocks ~1s)
@@ -314,12 +313,12 @@ fn test_livelock_resolves_promptly() {
     runner.schedule_initial_event(
         0,
         Duration::ZERO,
-        ShardEvent::process(NodeInput::SubmitTransaction { tx: Arc::new(tx_a) }),
+        ShardEvent::process(ProcessScopedInput::SubmitTransaction { tx: Arc::new(tx_a) }),
     );
     runner.schedule_initial_event(
         3,
         Duration::from_millis(5),
-        ShardEvent::process(NodeInput::SubmitTransaction { tx: Arc::new(tx_b) }),
+        ShardEvent::process(ProcessScopedInput::SubmitTransaction { tx: Arc::new(tx_b) }),
     );
 
     // Conflict detection short-circuits the wave timeout. Resolution should

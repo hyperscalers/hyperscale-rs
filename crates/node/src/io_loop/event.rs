@@ -1,14 +1,30 @@
-//! Event types for the deterministic state machine.
+//! Inputs to the I/O loop, partitioned by routing scope.
+//!
+//! [`ShardEvent`] is the envelope the runner pushes into the event
+//! channel. It is a typed sum over the two routing scopes:
+//!
+//! - [`ShardEvent::Shard`] carries a [`ShardScopedInput`] tagged with
+//!   the hosted-shard id it routes to. Every shard-coherent input
+//!   (gossip, sync, fetch results, BLS-verified headers, protocol
+//!   events) lives here.
+//! - [`ShardEvent::Process`] carries a [`ProcessScopedInput`] with no
+//!   shard tag — currently `FetchTick` and `SubmitTransaction`, both
+//!   of which fan out across every hosted shard.
+//!
+//! The type-level partition replaces the previous `Option<ShardGroupId>`
+//! envelope: shard-scoped inputs always carry a shard, process-scoped
+//! inputs never need one, and the I/O loop's `step()` dispatch is an
+//! exhaustive match instead of a runtime panic if the shard tag is
+//! missing.
 
 use std::sync::Arc;
 
+use hyperscale_core::ProtocolEvent;
 use hyperscale_types::{
     BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, CertifiedBlock, CommittedBlockHeader,
     ElidedCertifiedBlock, HeaderFetchCount, ProvisionHash, RoutableTransaction, ShardGroupId,
     TxHash, ValidatorId, WaveId,
 };
-
-use crate::ProtocolEvent;
 
 /// Priority levels for event ordering within the same timestamp.
 ///
@@ -34,32 +50,43 @@ pub enum EventPriority {
     Client = 3,
 }
 
-/// All possible inputs a node can receive.
+/// Why a sync fetch failed, picked by the I/O glue when translating a
+/// network-layer `RequestError` into a [`ShardScopedInput::BlockSyncFetchFailed`]
+/// or [`ShardScopedInput::RemoteHeadersFetchFailed`].
 ///
-/// `NodeInput` is the top-level input type for `IoLoop`. It contains:
-/// - `Protocol(ProtocolEvent)`: pass-through events that `IoLoop` extracts and
-///   passes to the state machine's `handle()` method directly.
-/// - `NodeInput`-specific variants: events that `IoLoop` handles internally
-///   (sync, fetch, validation pipeline) before potentially converting them
-///   into `ProtocolEvent`s.
+/// The sync FSM uses this to decide whether to apply exponential deferral.
+/// `Exhausted` only arrives after the request manager has already retried
+/// against rotated peers — the network layer absorbed seconds of waiting,
+/// so the FSM re-queues immediately. Other kinds reflect transport
+/// conditions where a brief deferral is appropriate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchFailureKind {
+    /// Request manager retried against rotated peers and gave up. The
+    /// network layer already absorbed the wait — re-queue immediately.
+    Exhausted,
+    /// No peers available to send to (empty topology committee). Defer
+    /// with backoff so we don't spin until the committee populates.
+    NoPeers,
+    /// Transport-level error (connection issue, network shutdown). Rare;
+    /// defer with backoff.
+    Transport,
+}
+
+/// Inputs whose dispatch is anchored to a specific hosted shard.
 ///
-/// Shard routing is carried by the transport-layer envelope (see
-/// `hyperscale_node::io_loop::ShardEvent`), not by the variants
-/// themselves. Process-scoped variants (`FetchTick`, `SubmitTransaction`)
-/// have no shard in the envelope; everything else does.
+/// Every variant either targets the consensus of one shard (the
+/// `Protocol(_)` passthrough, gossip arrivals, sync callbacks) or is
+/// a tracking-set fixup for that shard's pipeline (`*FetchFailed`,
+/// `TransactionValidated`, …). The [`ShardEvent::Shard`] envelope
+/// carries the routing tag alongside; downstream callbacks capture
+/// the shard at dispatch time and stamp every result.
 #[derive(Debug, Clone, strum::IntoStaticStr)]
-pub enum NodeInput {
+pub enum ShardScopedInput {
     /// Pass-through to state machine. `IoLoop` extracts the `ProtocolEvent`
     /// and feeds it to every vnode hosted in the envelope's shard. Boxed
     /// because `ProtocolEvent` dwarfs every other variant and would inflate
     /// the event queue otherwise.
     Protocol(Box<ProtocolEvent>),
-
-    /// Client submitted a transaction.
-    SubmitTransaction {
-        /// Transaction submitted by the local client; will be validated then gossiped.
-        tx: Arc<RoutableTransaction>,
-    },
 
     /// Raw gossip-delivered transaction. `IoLoop` queues it for async
     /// validation; the validated form is surfaced as
@@ -135,9 +162,6 @@ pub enum NodeInput {
         kind: FetchFailureKind,
     },
 
-    /// Periodic tick for the fetch protocol to retry pending operations.
-    FetchTick,
-
     /// A transaction fetch request failed (network error or peer returned None).
     TransactionsFetchFailed {
         /// Transaction hashes that failed to fetch.
@@ -207,23 +231,16 @@ pub enum NodeInput {
     },
 }
 
-impl NodeInput {
-    /// Get the priority for this input type.
-    ///
-    /// Events at the same timestamp are processed in priority order,
-    /// ensuring causality is preserved.
+impl ShardScopedInput {
+    /// Priority for ordering events at the same simulation timestamp.
     #[must_use]
     #[allow(clippy::match_same_arms)] // explicit per-variant arms document intent
     pub fn priority(&self) -> EventPriority {
         match self {
-            // Priority is a scheduling concern, not a protocol concern.
-            // Timers and network-received messages are classified explicitly;
-            // everything else (callbacks, continuations, completions) defaults to Internal.
             Self::Protocol(event) => match event.as_ref() {
                 ProtocolEvent::ViewChangeTimer | ProtocolEvent::CleanupTimer => {
                     EventPriority::Timer
                 }
-
                 ProtocolEvent::BlockHeaderReceived { .. }
                 | ProtocolEvent::RemoteHeaderReceived { .. }
                 | ProtocolEvent::BlockVoteReceived { .. }
@@ -231,55 +248,32 @@ impl NodeInput {
                 | ProtocolEvent::ExecutionCertificatesReceived { .. }
                 | ProtocolEvent::FinalizedWavesReceived { .. }
                 | ProtocolEvent::TransactionsReceived { .. } => EventPriority::Network,
-
-                // Fetch delivery events are processed callbacks from the fetch
-                // protocol, not raw network messages. They fall through to
-                // Internal.
+                // Fetch delivery events are processed callbacks from the
+                // fetch protocol, not raw network messages. They fall
+                // through to Internal.
                 _ => EventPriority::Internal,
             },
-            Self::SubmitTransaction { .. } => EventPriority::Client,
             Self::TransactionGossipReceived { .. } => EventPriority::Network,
-            Self::BlockSyncResponseReceived { .. } => EventPriority::Internal,
-            Self::BlockSyncFetchFailed { .. } => EventPriority::Internal,
-            Self::SyncBlockValidated { .. } => EventPriority::Internal,
-            Self::SyncBlockValidationFailed { .. } => EventPriority::Internal,
-            Self::RemoteHeadersResponseReceived { .. } => EventPriority::Internal,
-            Self::RemoteHeadersFetchFailed { .. } => EventPriority::Internal,
-            Self::FetchTick => EventPriority::Timer,
-            Self::TransactionsFetchFailed { .. } => EventPriority::Internal,
-            Self::TransactionValidated { .. } => EventPriority::Internal,
-            Self::TransactionValidationsFailed { .. } => EventPriority::Internal,
             Self::CommittedBlockGossipReceived { .. } => EventPriority::Network,
-            Self::ProvisionsFetchFailed { .. } => EventPriority::Internal,
-            Self::ExecCertFetchFailed { .. } => EventPriority::Internal,
-            Self::LocalProvisionsFetchFailed { .. } => EventPriority::Internal,
-            Self::FinalizedWavesFetchFailed { .. } => EventPriority::Internal,
+            Self::BlockSyncResponseReceived { .. }
+            | Self::BlockSyncFetchFailed { .. }
+            | Self::SyncBlockValidated { .. }
+            | Self::SyncBlockValidationFailed { .. }
+            | Self::RemoteHeadersResponseReceived { .. }
+            | Self::RemoteHeadersFetchFailed { .. }
+            | Self::TransactionsFetchFailed { .. }
+            | Self::TransactionValidated { .. }
+            | Self::TransactionValidationsFailed { .. }
+            | Self::ProvisionsFetchFailed { .. }
+            | Self::ExecCertFetchFailed { .. }
+            | Self::LocalProvisionsFetchFailed { .. }
+            | Self::FinalizedWavesFetchFailed { .. } => EventPriority::Internal,
         }
     }
 
-    /// Check if this is an internal event (consequence of prior processing).
-    #[must_use]
-    pub fn is_internal(&self) -> bool {
-        self.priority() == EventPriority::Internal
-    }
-
-    /// Check if this is a network event (from another node).
-    #[must_use]
-    pub fn is_network(&self) -> bool {
-        self.priority() == EventPriority::Network
-    }
-
-    /// Check if this is a client event (from a user).
-    #[must_use]
-    pub fn is_client(&self) -> bool {
-        self.priority() == EventPriority::Client
-    }
-
-    /// Get the event type name for telemetry.
-    ///
-    /// Variant names come from the `IntoStaticStr` derive; `Protocol` delegates
-    /// to the inner `ProtocolEvent::type_name` so protocol telemetry is
-    /// attributable per inner variant.
+    /// Telemetry label. Variant names come from the `IntoStaticStr`
+    /// derive; `Protocol` delegates to the inner `ProtocolEvent::type_name`
+    /// so protocol telemetry is attributable per inner variant.
     #[must_use]
     pub fn type_name(&self) -> &'static str {
         match self {
@@ -289,24 +283,93 @@ impl NodeInput {
     }
 }
 
-/// Why a sync fetch failed, picked by the I/O glue when translating a
-/// network-layer `RequestError` into a [`NodeInput::BlockSyncFetchFailed`]
-/// or [`NodeInput::RemoteHeadersFetchFailed`].
+/// Inputs that aren't anchored to a particular hosted shard.
 ///
-/// The sync FSM uses this to decide whether to apply exponential deferral.
-/// `Exhausted` only arrives after the request manager has already retried
-/// against rotated peers — the network layer absorbed seconds of waiting,
-/// so the FSM re-queues immediately. Other kinds reflect transport
-/// conditions where a brief deferral is appropriate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FetchFailureKind {
-    /// Request manager retried against rotated peers and gave up. The
-    /// network layer already absorbed the wait — re-queue immediately.
-    Exhausted,
-    /// No peers available to send to (empty topology committee). Defer
-    /// with backoff so we don't spin until the committee populates.
-    NoPeers,
-    /// Transport-level error (connection issue, network shutdown). Rare;
-    /// defer with backoff.
-    Transport,
+/// Fan out across every hosted shard the runner deems relevant — e.g.
+/// `SubmitTransaction` admits to every hosted shard the tx touches;
+/// `FetchTick` ticks every shard's fetch host.
+#[derive(Debug, Clone, strum::IntoStaticStr)]
+pub enum ProcessScopedInput {
+    /// Client submitted a transaction.
+    SubmitTransaction {
+        /// Transaction submitted by the local client; will be validated then gossiped.
+        tx: Arc<RoutableTransaction>,
+    },
+
+    /// Periodic tick for the fetch protocol to retry pending operations.
+    FetchTick,
+}
+
+impl ProcessScopedInput {
+    /// Priority for ordering events at the same simulation timestamp.
+    #[must_use]
+    pub const fn priority(&self) -> EventPriority {
+        match self {
+            Self::SubmitTransaction { .. } => EventPriority::Client,
+            Self::FetchTick => EventPriority::Timer,
+        }
+    }
+
+    /// Telemetry label.
+    #[must_use]
+    pub fn type_name(&self) -> &'static str {
+        self.into()
+    }
+}
+
+/// An input plus the routing scope the I/O loop's `step()` uses to
+/// dispatch it.
+///
+/// The shard variant carries the hosted-shard tag inline; the process
+/// variant has no tag because it isn't anchored to one shard. Earlier
+/// revisions modelled this as `{ shard: Option<ShardGroupId>, input:
+/// NodeInput }` and asserted at runtime that shard-scoped inputs
+/// carried a `Some(_)` — the typed sum lifts that assertion to the
+/// type level.
+#[derive(Debug, Clone)]
+pub enum ShardEvent {
+    /// Routed to the hosted shard identified by [`ShardGroupId`]. Fans
+    /// to every vnode in that shard for state-machine events; handled
+    /// once for shard-scoped pipeline fixups.
+    Shard(ShardGroupId, ShardScopedInput),
+    /// Process-scoped — not anchored to a single shard.
+    Process(ProcessScopedInput),
+}
+
+impl ShardEvent {
+    /// Construct a shard-scoped envelope.
+    #[must_use]
+    pub const fn shard(shard: ShardGroupId, input: ShardScopedInput) -> Self {
+        Self::Shard(shard, input)
+    }
+
+    /// Construct a process-scoped envelope.
+    #[must_use]
+    pub const fn process(input: ProcessScopedInput) -> Self {
+        Self::Process(input)
+    }
+
+    /// Construct a shard-scoped `Protocol` envelope for `event`.
+    #[must_use]
+    pub fn protocol(shard: ShardGroupId, event: ProtocolEvent) -> Self {
+        Self::Shard(shard, ShardScopedInput::Protocol(Box::new(event)))
+    }
+
+    /// Priority for ordering events at the same simulation timestamp.
+    #[must_use]
+    pub fn priority(&self) -> EventPriority {
+        match self {
+            Self::Shard(_, input) => input.priority(),
+            Self::Process(input) => input.priority(),
+        }
+    }
+
+    /// Telemetry label.
+    #[must_use]
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Self::Shard(_, input) => input.type_name(),
+            Self::Process(input) => input.type_name(),
+        }
+    }
 }

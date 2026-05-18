@@ -15,7 +15,7 @@ use crate::status::SyncStatus;
 
 /// Type alias for the transaction submission channel.
 ///
-/// RPC handlers wrap `NodeInput::SubmitTransaction` in a process-scoped
+/// RPC handlers wrap `ProcessScopedInput::SubmitTransaction` in a process-scoped
 /// [`ShardEvent`] before sending; the `IoLoop`'s event loop unwraps it
 /// and dispatches across every hosted shard the tx touches.
 pub type TxSubmissionSender = Sender<ShardEvent>;

@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use hyperscale_core::{NodeInput, ProtocolEvent};
+use hyperscale_core::ProtocolEvent;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::Engine;
 use hyperscale_metrics::record_fetch_response_sent;
@@ -23,7 +23,7 @@ use hyperscale_types::network::response::{
 use hyperscale_types::{ExecutionCertificate, FinalizedWave, ShardGroupId, WaveId};
 use tracing::warn;
 
-use super::{IoLoop, push_protocol_event, push_shard_input};
+use super::{IoLoop, ShardScopedInput, push_protocol_event, push_shard_input};
 use crate::shard::verify::{resolve_sender_key, verify_bls_with_metrics, verify_sender_signature};
 
 impl<S, N, D, E> IoLoop<S, N, D, E>
@@ -384,7 +384,7 @@ where
         let hosted_shards: std::sync::Arc<HashSet<ShardGroupId>> =
             std::sync::Arc::new(self.hosted_shards().collect());
 
-        // ── transaction.gossip → NodeInput::TransactionGossipReceived ─
+        // ── transaction.gossip → ShardScopedInput::TransactionGossipReceived ─
         // The step() handler dedups against tx_store / tombstones and
         // enqueues for batched async validation.
 
@@ -412,14 +412,14 @@ where
                     push_shard_input(
                         &tx,
                         local_shard,
-                        NodeInput::TransactionGossipReceived { tx: transaction },
+                        ShardScopedInput::TransactionGossipReceived { tx: transaction },
                     );
                 }
                 GossipVerdict::Accept
             },
         );
 
-        // ── block.committed → pre-filter, then NodeInput::CommittedBlockGossipReceived ─
+        // ── block.committed → pre-filter, then ShardScopedInput::CommittedBlockGossipReceived ─
 
         let tx = self.event_sender.clone();
         let topology = self.topology_snapshot.clone();
@@ -461,7 +461,7 @@ where
                         push_shard_input(
                             &tx,
                             *local_shard,
-                            NodeInput::CommittedBlockGossipReceived {
+                            ShardScopedInput::CommittedBlockGossipReceived {
                                 committed_header: gossip.committed_header.clone(),
                                 sender,
                                 public_key,

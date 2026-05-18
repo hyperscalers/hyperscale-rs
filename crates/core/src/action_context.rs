@@ -14,7 +14,7 @@ use hyperscale_types::{
     BlockHash, BlockHeight, Bls12381G1PrivateKey, ConsensusReceipt, TopologySnapshot,
 };
 
-use crate::{NodeInput, ProtocolEvent};
+use crate::ProtocolEvent;
 
 /// Context for executing delegated actions.
 ///
@@ -36,9 +36,11 @@ pub struct ActionContext<'a, S: Storage, E: Engine, N: Network> {
     /// Local validator's BLS signing key. Used by handlers that sign
     /// votes/headers before broadcast.
     pub signing_key: &'a Arc<Bls12381G1PrivateKey>,
-    /// Send a `NodeInput` (typically a `ProtocolEvent`) back to the state
-    /// machine. The single sink for delegated-action outcomes.
-    pub notify: &'a (dyn Fn(NodeInput) + Send + Sync),
+    /// Send a [`ProtocolEvent`] back to the state machine. The single
+    /// sink for delegated-action outcomes — the dispatch wrapper at
+    /// the I/O loop boundary stamps the emitting vnode's shard and
+    /// re-enters the next `step()`.
+    pub notify: &'a (dyn Fn(ProtocolEvent) + Send + Sync),
     /// Hand a freshly prepared block to the `io_loop` for insertion into
     /// `PendingChain` + `prepared_commits`. Only `BuildProposal` and
     /// `VerifyStateRoot` produce these.
@@ -46,13 +48,12 @@ pub struct ActionContext<'a, S: Storage, E: Engine, N: Network> {
 }
 
 impl<S: Storage, E: Engine, N: Network> ActionContext<'_, S, E, N> {
-    /// Convenience wrapper around `notify` for the common case of
-    /// emitting a `ProtocolEvent`. The transport-layer envelope
-    /// (installed by the dispatch wrapper that captured the emitting
-    /// vnode's shard) routes the resulting `NodeInput::Protocol` back to
-    /// the right hosted shard.
+    /// Convenience wrapper around `notify`. Preserved for symmetry with
+    /// the action-handler crates' call sites, which call
+    /// `ctx.notify_protocol(event)` rather than reaching for the raw
+    /// `notify` callback.
     pub fn notify_protocol(&self, event: ProtocolEvent) {
-        (self.notify)(NodeInput::Protocol(Box::new(event)));
+        (self.notify)(event);
     }
 }
 

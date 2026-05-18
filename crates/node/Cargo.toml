@@ -21,6 +21,7 @@ hyperscale-types.workspace = true
 arc-swap.workspace = true
 crossbeam.workspace = true
 quick_cache.workspace = true
+strum.workspace = true
 tracing.workspace = true
 serde.workspace = true
 

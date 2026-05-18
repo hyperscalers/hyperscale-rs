@@ -655,7 +655,7 @@ pub enum Action {
     // ═══════════════════════════════════════════════════════════════════════
     // Runner I/O Requests
     // These request the runner to perform network I/O. Sync responses
-    // arrive as `NodeInput::BlockSyncResponseReceived`; fetch protocol
+    // arrive as `ShardScopedInput::BlockSyncResponseReceived`; fetch protocol
     // responses arrive as `ProtocolEvent::*Received` variants.
     // ═══════════════════════════════════════════════════════════════════════
     /// Request the runner to start syncing to a target height.

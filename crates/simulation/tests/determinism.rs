@@ -1153,7 +1153,7 @@ fn test_consensus_throughput() {
 /// 3. Verify transactions appear in committed blocks
 #[test]
 fn test_mempool_to_block_integration() {
-    use hyperscale_core::NodeInput;
+    use hyperscale_node::io_loop::ProcessScopedInput;
     use hyperscale_types::test_utils::test_transaction;
 
     let config = test_network_config();
@@ -1175,17 +1175,17 @@ fn test_mempool_to_block_integration() {
     runner.schedule_initial_event(
         0,
         Duration::from_millis(50),
-        ShardEvent::process(NodeInput::SubmitTransaction { tx: Arc::new(tx1) }),
+        ShardEvent::process(ProcessScopedInput::SubmitTransaction { tx: Arc::new(tx1) }),
     );
     runner.schedule_initial_event(
         0,
         Duration::from_millis(51),
-        ShardEvent::process(NodeInput::SubmitTransaction { tx: Arc::new(tx2) }),
+        ShardEvent::process(ProcessScopedInput::SubmitTransaction { tx: Arc::new(tx2) }),
     );
     runner.schedule_initial_event(
         0,
         Duration::from_millis(52),
-        ShardEvent::process(NodeInput::SubmitTransaction { tx: Arc::new(tx3) }),
+        ShardEvent::process(ProcessScopedInput::SubmitTransaction { tx: Arc::new(tx3) }),
     );
 
     // Run past transaction submission (50-52ms) but before dwell time expires
@@ -1254,7 +1254,7 @@ fn test_mempool_to_block_integration() {
 /// 5. Execution runs and creates certificates
 #[test]
 fn test_execution_flow() {
-    use hyperscale_core::NodeInput;
+    use hyperscale_node::io_loop::ProcessScopedInput;
     use hyperscale_types::test_utils::test_transaction;
 
     let config = test_network_config();
@@ -1269,7 +1269,7 @@ fn test_execution_flow() {
     runner.schedule_initial_event(
         0,
         Duration::from_millis(50),
-        ShardEvent::process(NodeInput::SubmitTransaction { tx: Arc::new(tx) }),
+        ShardEvent::process(ProcessScopedInput::SubmitTransaction { tx: Arc::new(tx) }),
     );
 
     // Single tx happy path: a couple of blocks is enough to drive the full
@@ -1305,7 +1305,7 @@ fn test_execution_flow() {
 /// it eventually appears in other validators' mempools via gossip.
 #[test]
 fn test_transaction_gossip() {
-    use hyperscale_core::NodeInput;
+    use hyperscale_node::io_loop::ProcessScopedInput;
     use hyperscale_types::test_utils::test_transaction;
 
     let config = test_network_config();
@@ -1320,7 +1320,7 @@ fn test_transaction_gossip() {
     runner.schedule_initial_event(
         0,
         Duration::from_millis(10),
-        ShardEvent::process(NodeInput::SubmitTransaction { tx: Arc::new(tx) }),
+        ShardEvent::process(ProcessScopedInput::SubmitTransaction { tx: Arc::new(tx) }),
     );
 
     // Run briefly - transaction should be in node 0's mempool

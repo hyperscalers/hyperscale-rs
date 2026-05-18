@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use hyperscale_core::{FetchFailureKind, NodeInput, ProtocolEvent};
+use hyperscale_core::ProtocolEvent;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::Engine;
 use hyperscale_metrics::{
@@ -23,7 +23,7 @@ use hyperscale_types::{
 };
 
 use crate::io_loop::step::block_sync::classify_fetch_error;
-use crate::io_loop::{IoLoop, push_shard_input};
+use crate::io_loop::{FetchFailureKind, IoLoop, ShardScopedInput, push_shard_input};
 use crate::shard::sync::SyncOutput;
 use crate::shard::sync::remote_header::{RemoteHeaderSyncInput, RemoteHeaderSyncOutput};
 
@@ -184,7 +184,7 @@ where
                                     push_shard_input(
                                         &es,
                                         local_shard,
-                                        NodeInput::RemoteHeadersResponseReceived {
+                                        ShardScopedInput::RemoteHeadersResponseReceived {
                                             source_shard,
                                             from_height,
                                             count: typed_count,
@@ -198,7 +198,7 @@ where
                                     push_shard_input(
                                         &es,
                                         local_shard,
-                                        NodeInput::RemoteHeadersFetchFailed {
+                                        ShardScopedInput::RemoteHeadersFetchFailed {
                                             source_shard,
                                             from_height,
                                             count: typed_count,

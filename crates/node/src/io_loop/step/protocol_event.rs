@@ -1,6 +1,6 @@
 //! Protocol-event passthrough step handlers.
 //!
-//! `NodeInput::Protocol(_)` is the channel for state-machine events that
+//! `ShardScopedInput::Protocol(_)` is the channel for state-machine events that
 //! re-enter `IoLoop` via `dispatch_event` (continuation-style). Most are pure
 //! passthrough — feed the variant straight into the state machine. The
 //! one exception is `BlockPersisted`, which carries IoLoop-side commit

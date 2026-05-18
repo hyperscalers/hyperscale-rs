@@ -4,8 +4,7 @@ use std::sync::Arc;
 
 use hyperscale_bft::action_handlers::handle_action as handle_bft_action;
 use hyperscale_core::{
-    Action, ActionContext, ActionOwner, CommitSource, FetchAbandon, FetchRequest, NodeInput,
-    ProtocolEvent,
+    Action, ActionContext, ActionOwner, CommitSource, FetchAbandon, FetchRequest, ProtocolEvent,
 };
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::Engine;
@@ -20,7 +19,7 @@ use hyperscale_types::{
 };
 use tracing::{debug, trace, warn};
 
-use super::{IoLoop, TimerOp, push_protocol_event, push_shard_input};
+use super::{IoLoop, TimerOp, push_protocol_event};
 use crate::shard::block_commit::{AccumulateDecision, PendingCommit, make_commit_prepared};
 use crate::shard::fetch::FetchInput;
 use crate::shard::fetch::binding::{
@@ -491,11 +490,11 @@ where
                 .per_shard
                 .get(&shard)
                 .expect("hosted shard derived from vnode");
-            // Action handlers emit raw `NodeInput`s; wrap each with the
-            // dispatching vnode's shard so the receiver routes back to the
-            // right `ShardGroup`.
-            let notify = move |event: NodeInput| {
-                push_shard_input(&event_tx, shard, event);
+            // Action handlers emit `ProtocolEvent`s; stamp each with the
+            // dispatching vnode's shard so the receiver routes back to
+            // the right `ShardGroup`.
+            let notify = move |event: ProtocolEvent| {
+                push_protocol_event(&event_tx, shard, event);
             };
             let commit_prepared = make_commit_prepared(
                 Arc::clone(&shard_handles.pending_chain),

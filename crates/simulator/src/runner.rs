@@ -8,10 +8,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use hyperscale_core::NodeInput;
 use hyperscale_mempool::LockContentionStats;
 use hyperscale_network_memory::{BandwidthReport, NodeIndex};
-use hyperscale_node::io_loop::ShardEvent;
+use hyperscale_node::io_loop::{ProcessScopedInput, ShardEvent};
 use hyperscale_simulation::SimulationRunner;
 use hyperscale_spammer::validity::{ValidityClock, range_starting_at};
 use hyperscale_spammer::{
@@ -254,7 +253,7 @@ impl Simulator {
                     self.runner.schedule_initial_event(
                         node_idx,
                         Duration::ZERO,
-                        ShardEvent::process(NodeInput::SubmitTransaction {
+                        ShardEvent::process(ProcessScopedInput::SubmitTransaction {
                             tx: Arc::clone(&tx),
                         }),
                     );
@@ -348,7 +347,7 @@ impl Simulator {
                     self.runner.schedule_initial_event(
                         node_idx,
                         Duration::ZERO,
-                        ShardEvent::process(NodeInput::SubmitTransaction {
+                        ShardEvent::process(ProcessScopedInput::SubmitTransaction {
                             tx: Arc::clone(&tx),
                         }),
                     );
