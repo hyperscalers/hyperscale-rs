@@ -33,7 +33,7 @@ mod state;
 mod vnode;
 
 pub use config::NodeConfig;
-pub use io_loop::{NodeStatusSnapshot, SharedTopologySnapshot, TimerOp};
+pub use io_loop::{NodeStatusSnapshot, SharedTopologySnapshot, TimerOp, timer_event};
 pub use shard::ShardIo;
 pub use shard::sync::block::BlockSyncStateKind;
 pub use state::NodeStateMachine;

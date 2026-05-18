@@ -22,7 +22,7 @@ use hyperscale_network_memory::{
     SimNetworkAdapter, SimulatedNetwork,
 };
 use hyperscale_node::io_loop::{IoLoop, StepOutput};
-use hyperscale_node::{NodeConfig, NodeStateMachine, TimerOp, VnodeInit};
+use hyperscale_node::{NodeConfig, NodeStateMachine, TimerOp, VnodeInit, timer_event};
 use hyperscale_provisions::{ProvisionConfig, ProvisionStore};
 use hyperscale_storage::{ChainReader, RecoveredState};
 use hyperscale_storage_memory::SimStorage;
@@ -864,7 +864,7 @@ impl SimulationRunner {
                 duration,
             } => {
                 let fire_time = self.now + duration;
-                let event = id.clone().into_event(shard);
+                let event = timer_event(&id, shard);
                 let key = self.schedule_event(node, fire_time, event);
                 self.timers.insert((node, shard, id), key);
                 self.stats.timers_set += 1;
