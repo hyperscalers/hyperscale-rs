@@ -172,6 +172,11 @@ pub enum NodeInput {
     /// resolves `submitted_locally` from its `locally_submitted` set
     /// before forwarding as `ProtocolEvent::TransactionValidated`.
     TransactionValidated {
+        /// Hosted shard whose `ShardIo` owns the validation tracking
+        /// sets for this batch. Captured at `flush_validation_batch`
+        /// dispatch so the result routes to the right hosted shard
+        /// under cross-shard hosting.
+        local_shard: ShardGroupId,
         /// Validated transaction ready for the mempool.
         tx: Arc<RoutableTransaction>,
     },
@@ -179,6 +184,8 @@ pub enum NodeInput {
     /// Transactions that failed validation — sent back so the `IoLoop` can
     /// remove their hashes from `pending_validation` and `locally_submitted`.
     TransactionValidationsFailed {
+        /// Hosted shard whose tracking sets to clean up.
+        local_shard: ShardGroupId,
         /// Hashes of transactions that failed validation.
         hashes: Vec<TxHash>,
     },
