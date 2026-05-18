@@ -1,15 +1,10 @@
 //! Multi-vnode cross-shard hosting smoke tests.
 //!
-//! Exercises the path where a single `IoLoop` hosts vnodes in *different*
-//! shards — the Phase 2c proving test. Mirrors the same-shard variant in
-//! `multi_vnode_tests.rs`, but uses [`HostingMode::CrossShard`] so each
-//! host carries one validator from every shard.
-//!
-//! Validates that the full Phase 2c threading work composes end-to-end:
-//! `local_shard` plumbing through every `NodeInput` variant, gossip
-//! handler shard routing, sync/fetch callbacks tagged correctly,
-//! per-shard timer keying, and shared per-shard stores all working
-//! together under multi-shard hosting.
+//! A single `IoLoop` hosting vnodes in *different* shards: gossip shard
+//! routing, fetch-callback tagging, per-shard timer keying, and shared
+//! per-shard stores composing end-to-end. Mirrors the same-shard variant
+//! in `multi_vnode_tests.rs`, but uses [`HostingMode::CrossShard`] so
+//! each host carries one validator from every shard.
 
 use std::time::Duration;
 

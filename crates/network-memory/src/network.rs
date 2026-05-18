@@ -58,8 +58,7 @@ pub enum HostingMode {
     /// Each host hosts `vnodes_per_host` consecutive validators from
     /// the **same** shard. Host count = `num_shards * validators_per_shard
     /// / vnodes_per_host`. `vnodes_per_host` must divide
-    /// `validators_per_shard`. This is the default and covers all
-    /// pre-Phase-2c testing.
+    /// `validators_per_shard`. This is the default.
     SameShardBundled,
     /// Each host hosts **one validator from every shard** —
     /// `vnodes_per_host` becomes `num_shards` implicitly. Host count

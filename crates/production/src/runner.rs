@@ -390,9 +390,7 @@ impl ProductionRunnerBuilder {
         let (xb_shutdown_tx, xb_shutdown_rx) = unbounded();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
-        // Recovery state is read from the primary shard's storage; this
-        // matches the prior single-shard semantics. Real multi-shard
-        // hosting needs per-shard recovery state — a Phase 2c follow-up.
+        // Recovery state is read from the primary shard's storage.
         let recovered = primary_storage.load_recovered_state();
         let provision_store = Arc::new(ProvisionStore::new());
 
@@ -490,9 +488,7 @@ impl ProductionRunnerBuilder {
             tx_validator,
         );
 
-        // The status RPC surface assumes a single primary cache; surface
-        // the primary shard's status cache. Multi-shard hosting will
-        // need a per-shard RPC tier — Phase 2c.
+        // The status RPC surface exposes the primary shard's cache.
         let tx_status_caches = io_loop.tx_status_caches();
         let tx_status_cache = Arc::clone(
             tx_status_caches
@@ -573,7 +569,7 @@ pub struct ProductionRunner {
     storages: HashMap<ShardGroupId, Arc<RocksDbStorage>>,
     /// Primary storage handle (`storages[primary_shard]`) used by
     /// single-storage code paths (genesis bookkeeping, JMT GC, storage
-    /// memory metrics) until those become per-shard.
+    /// memory metrics).
     primary_storage: Arc<RocksDbStorage>,
     /// Thread pool dispatch.
     dispatch: Arc<PooledDispatch>,
@@ -699,10 +695,8 @@ impl ProductionRunner {
         let mut timer_ops = Vec::new();
         let local_shards: Vec<ShardGroupId> = io_loop.hosted_shards().collect();
         let topology = Arc::clone(&self.topology_snapshot);
-        // Shared genesis config across hosted shards. Real multi-shard
-        // deployments will likely want per-shard genesis configs; the
-        // current `GenesisConfig::production` default is shared, so a
-        // single `take()` is fine.
+        // `GenesisConfig::production` is shared across hosted shards, so one
+        // `take()` covers every shard.
         let mut shared_genesis_config: Option<GenesisConfig> = self.genesis_config.take();
         for shard in local_shards {
             let height = io_loop.shard_io(shard).storage.committed_height();
@@ -1008,8 +1002,7 @@ struct PinnedLoopConfig {
     sync_status: Option<Arc<ArcSwap<SyncStatus>>>,
     mempool_snapshot: Option<Arc<ArcSwap<MempoolSnapshot>>>,
     /// Primary `RocksDbStorage` used by the pinned loop's periodic
-    /// metrics dispatch and JMT GC. Currently a single handle until
-    /// per-shard metrics / GC fanout lands.
+    /// metrics dispatch and JMT GC.
     primary_storage: Arc<RocksDbStorage>,
 }
 
@@ -1090,9 +1083,7 @@ fn wall_clock_local() -> LocalTimestamp {
 
 /// Push a [`NodeStatusSnapshot`] into the shared RPC state objects.
 ///
-/// Today's RPC contract surfaces one status per node; pick the
-/// representative shard/vnode pair. Multi-vnode RPC fan-out (Milestone 4)
-/// will iterate `snapshot.shards` and `snapshot.vnodes` directly.
+/// Surfaces one status per node via [`NodeStatusSnapshot::primary`].
 fn update_rpc_state(config: &PinnedLoopConfig, snapshot: &NodeStatusSnapshot) {
     let Some((shard, vnode)) = snapshot.primary() else {
         return;

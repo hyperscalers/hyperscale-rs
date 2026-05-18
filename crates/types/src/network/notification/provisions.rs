@@ -25,10 +25,7 @@ pub struct ProvisionsNotification {
 }
 
 impl ProvisionsNotification {
-    /// Create a new signed provisions notification. Accepts either a
-    /// freshly-built `Provisions` or an existing `Arc<Provisions>` —
-    /// pass the `Arc` directly when the producer already holds one to
-    /// avoid an extra clone.
+    /// Create a new signed provisions notification.
     #[must_use]
     pub fn new(
         provisions: impl Into<Arc<Provisions>>,

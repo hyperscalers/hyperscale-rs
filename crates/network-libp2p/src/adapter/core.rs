@@ -82,12 +82,10 @@ impl Libp2pAdapter {
     /// * `config` - Network configuration
     /// * `keypair` - Ed25519 keypair for libp2p transport encryption
     /// * `vnodes` - One `(validator_id, signing_key)` per hosted vnode.
-    ///   The bind service attests as every entry on each handshake. Must
-    ///   be non-empty.
+    ///   The bind service attests as every entry on each handshake.
     /// * `local_shards` - Shards hosted by this peer. The adapter
     ///   registers one inbound request accept loop per shard and
     ///   subscribes to per-shard gossipsub topics for the union.
-    ///   Must be non-empty.
     /// * `registry` - Shared handler registry for per-type message dispatch
     /// * `validator_keys` - Initial validator key map for bind verification
     ///

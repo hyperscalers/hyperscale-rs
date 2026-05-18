@@ -202,8 +202,7 @@ impl Network for Libp2pNetwork {
         // Split into local + remote. Local recipients (our own hosted
         // vnodes) never get a `validator_peers` entry from the bind
         // handshake, so without this branch they'd be silently dropped.
-        // A single typed dispatch reaches every same-shard vnode through
-        // the handler's `feed_event_to_shard_vnodes` fan-out.
+        // A single typed dispatch reaches every same-shard vnode.
         let self_ids: HashSet<ValidatorId> =
             self.adapter.local_validator_ids().iter().copied().collect();
         let has_local = recipients.iter().any(|v| self_ids.contains(v));

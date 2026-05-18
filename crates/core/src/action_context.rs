@@ -48,10 +48,7 @@ pub struct ActionContext<'a, S: Storage, E: Engine, N: Network> {
 }
 
 impl<S: Storage, E: Engine, N: Network> ActionContext<'_, S, E, N> {
-    /// Convenience wrapper around `notify`. Preserved for symmetry with
-    /// the action-handler crates' call sites, which call
-    /// `ctx.notify_protocol(event)` rather than reaching for the raw
-    /// `notify` callback.
+    /// Invoke `notify`; common spelling at action-handler call sites.
     pub fn notify_protocol(&self, event: ProtocolEvent) {
         (self.notify)(event);
     }

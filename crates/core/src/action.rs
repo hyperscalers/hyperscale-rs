@@ -186,23 +186,11 @@ pub enum Action {
     /// recipients but not the only one.
     ///
     /// The carried event MUST therefore be *shard-coherent* — meaningful
-    /// to every same-shard vnode, not just the emitter. All current
-    /// emissions satisfy this by construction:
-    ///
-    /// - `BlockReadyToCommit` — QC-driven commit-readiness, deterministic
-    ///   per shard.
-    /// - `FinalizedWavesAdmitted` — shard-level admission of finalized
-    ///   waves.
-    /// - `OutboundEcObserved` — observing one of our own shard's ECs,
-    ///   identical readout per same-shard vnode by determinism.
-    /// - `ProvisionsAdmitted` — shard-level provision admission.
-    /// - `RemoteHeaderAdmitted` — shard-level remote-header admission.
-    /// - `TransactionsAdmitted` — shard-deterministic mempool admission.
-    ///
-    /// Any new continuation variant that is genuinely per-vnode (state
-    /// only the emitter should react to) needs a different transport
-    /// — emitting it via `Continuation` would silently apply it to the
-    /// vnode's same-shard peers.
+    /// to every same-shard vnode, not just the emitter. Any new
+    /// continuation variant that is genuinely per-vnode (state only the
+    /// emitter should react to) needs a different transport — emitting
+    /// it via `Continuation` would silently apply it to the vnode's
+    /// same-shard peers.
     Continuation(ProtocolEvent),
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -748,17 +736,9 @@ impl Action {
     }
 
     /// Which coordinator crate owns this action's delegated work.
-    ///
-    /// Used by the I/O loop's delegated dispatch to route the action to
-    /// the right `handle_action` entry point without re-enumerating the
-    /// variants at the call site. Local-owned variants (timers, commits,
-    /// fetch driving, status emission) are handled inline by the I/O
-    /// loop and never reach delegated dispatch.
     #[must_use]
     pub const fn owner(&self) -> ActionOwner {
         match self {
-            // BFT consensus: QC build/verify, block roots, proposal,
-            // sign-and-broadcast header/vote/committed-header.
             Self::VerifyAndBuildQuorumCertificate { .. }
             | Self::VerifyQcSignature { .. }
             | Self::VerifyRemoteHeaderQc { .. }
@@ -772,8 +752,6 @@ impl Action {
             | Self::SignAndBroadcastBlockVote { .. }
             | Self::BroadcastCommittedBlockHeader { .. } => ActionOwner::Bft,
 
-            // Execution: wave/EC aggregation + verification, transaction
-            // execution, sign-and-broadcast exec vote/cert.
             Self::AggregateExecutionCertificate { .. }
             | Self::VerifyAndAggregateExecutionVotes { .. }
             | Self::VerifyExecutionCertificateSignature { .. }
@@ -783,37 +761,26 @@ impl Action {
             | Self::SignAndSendExecutionVote { .. }
             | Self::BroadcastExecutionCertificate { .. } => ActionOwner::Execution,
 
-            // Provisions: state-provision verify, outbound provision
-            // fetch + broadcast.
             Self::VerifyProvisions { .. } | Self::FetchAndBroadcastProvisions { .. } => {
                 ActionOwner::Provisions
             }
 
-            // Inline / I/O-loop-internal effects.
             _ => ActionOwner::Local,
         }
     }
 }
 
 /// Which coordinator crate owns an [`Action`]'s delegated work.
-///
-/// Used by [`Action::owner`] so the I/O loop's delegated dispatch can
-/// route to a coordinator crate's `handle_action` entry point without
-/// re-enumerating variants. [`Local`](Self::Local) variants are handled
-/// inline by the I/O loop and never delegated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ActionOwner {
-    /// BFT consensus actions (QC build / verify, proposal, header
-    /// and vote sign-and-broadcast). Routed to
-    /// `hyperscale_bft::action_handlers::handle_action`.
+    /// BFT consensus actions: QC build / verify, proposal, header
+    /// and vote sign-and-broadcast.
     Bft,
-    /// Execution-coordinator actions (wave / EC aggregation,
-    /// transaction execution, exec vote / cert sign-and-broadcast).
-    /// Routed to `hyperscale_execution::action_handlers::handle_action`.
+    /// Execution-coordinator actions: wave / EC aggregation,
+    /// transaction execution, exec vote / cert sign-and-broadcast.
     Execution,
-    /// Provision-coordinator actions (state-provision verification,
-    /// outbound provision fetch + broadcast). Routed to
-    /// `hyperscale_provisions::action_handlers::handle_action`.
+    /// Provision-coordinator actions: state-provision verification,
+    /// outbound provision fetch + broadcast.
     Provisions,
     /// I/O-loop-internal effects (timers, commits, status emission,
     /// fetch driving, topology plumbing). Not delegated to a worker

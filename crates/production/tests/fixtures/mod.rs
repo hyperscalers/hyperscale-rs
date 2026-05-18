@@ -181,10 +181,7 @@ impl TestFixtures {
         (start..end).collect()
     }
 
-    /// Get the BLS signing key for a validator, wrapped in `Arc` for the
-    /// validator-bind service. Identical to [`Self::signing_key`] now that
-    /// `signing_key` returns `Arc`; kept as a name-at-callsite signal that
-    /// the bind tests use the key purely as a bind credential.
+    /// Alias of [`Self::signing_key`] reserved for bind-test call sites.
     pub fn bind_signing_key(&self, index: u32) -> Arc<Bls12381G1PrivateKey> {
         self.signing_key(index)
     }

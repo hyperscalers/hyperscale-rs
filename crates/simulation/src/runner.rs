@@ -890,7 +890,6 @@ impl SimulationRunner {
     // Helpers
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Schedule a [`NodeInput`] event for delivery at the given time.
     fn schedule_event(&mut self, node: NodeIndex, time: Duration, event: ShardEvent) -> EventKey {
         self.sequence += 1;
         let key = EventKey::new(time, &event, node, self.sequence);

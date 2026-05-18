@@ -58,8 +58,7 @@ pub struct SharedCaches {
     /// [`ExecutionCoordinator`]: hyperscale_execution::ExecutionCoordinator
     pub exec_cert_store: Arc<ExecCertStore>,
     /// Per-shard finalized-wave store, shared with every same-shard
-    /// `ExecutionCoordinator`. Read by sync-inventory bloom and
-    /// elided-block rehydration.
+    /// `ExecutionCoordinator`.
     pub finalized_wave_store: Arc<FinalizedWaveStore>,
 }
 

@@ -58,11 +58,9 @@ pub struct VnodeStatus {
 ///
 /// Mirrors the three-layer architecture: per-shard surface in `shards`,
 /// per-vnode surface in `vnodes`. Process-level readouts (libp2p peers,
-/// channel depths, pool queues) are not currently included — those are
-/// collected by the runner directly.
+/// channel depths, pool queues) are collected by the runner directly.
 ///
-/// External RPC consumers that today expose a single status per node
-/// (the bulk of them) pick a representative entry via [`Self::primary`].
+/// Flat-shape RPC consumers pick a representative entry via [`Self::primary`].
 #[derive(Debug, Clone)]
 pub struct NodeStatusSnapshot {
     /// Per-hosted-shard readouts.
@@ -81,9 +79,7 @@ impl NodeStatusSnapshot {
     /// the order vnodes were registered.
     #[must_use]
     pub fn primary(&self) -> Option<(&ShardStatus, &VnodeStatus)> {
-        // HashMap iteration is unordered, but for V=1 (the common case)
-        // there's only one entry so order doesn't matter. Multi-vnode
-        // operator UX (Milestone 4) will expose a richer surface.
+        // HashMap iteration is unordered; for V=1 there's only one entry.
         let shard = self.shards.values().next()?;
         let vnode = self.vnodes.values().next()?;
         Some((shard, vnode))

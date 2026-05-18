@@ -378,9 +378,7 @@ where
     pub(super) fn register_gossip_handlers(&self) {
         use hyperscale_network::{GossipVerdict, TopicScope};
 
-        // Hosted-shard set snapshotted once for both gossip handlers'
-        // closures. Snapshotted at registration time; dynamic vnode
-        // addition will need to refresh this when a new shard joins.
+        // Hosted-shard set snapshotted once for both gossip handlers' closures.
         let hosted_shards: std::sync::Arc<HashSet<ShardGroupId>> =
             std::sync::Arc::new(self.hosted_shards().collect());
 
@@ -440,9 +438,8 @@ where
                     let header_shard = gossip.committed_header.header().shard_group_id();
                     let topo = topology.load();
 
-                    // Own-shard headers are valid but not needed — accept
-                    // to forward. We're only interested in remote shards'
-                    // headers.
+                    // Own-shard headers: accept to forward, but don't route
+                    // into our pipeline.
                     if hosted_shards_for_hdr.contains(&header_shard) {
                         return GossipVerdict::Accept;
                     }
@@ -478,10 +475,7 @@ where
     /// to known committee members.
     #[allow(clippy::too_many_lines)] // single registration table; one closure per notification type
     pub(super) fn register_notification_handlers(&self) {
-        // Hosted-shard set snapshotted at registration. Dynamic vnode
-        // addition will need to refresh this when a new shard joins;
-        // today registration runs once at startup after every initial
-        // vnode is in place.
+        // Hosted-shard set snapshotted at registration.
         let hosted_shards: std::sync::Arc<HashSet<ShardGroupId>> =
             std::sync::Arc::new(self.hosted_shards().collect());
 
