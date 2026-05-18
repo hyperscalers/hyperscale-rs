@@ -18,8 +18,8 @@ use hyperscale_engine::{
 use hyperscale_execution::{ExecCertStore, FinalizedWaveStore};
 use hyperscale_mempool::{MempoolConfig, TxStore};
 use hyperscale_network_memory::{
-    BandwidthReport, NetworkConfig, NetworkTrafficAnalyzer, NodeIndex, SimNetworkAdapter,
-    SimulatedNetwork,
+    BandwidthReport, HostingMode, NetworkConfig, NetworkTrafficAnalyzer, NodeIndex,
+    SimNetworkAdapter, SimulatedNetwork,
 };
 use hyperscale_node::io_loop::{IoLoop, StepOutput};
 use hyperscale_node::{NodeConfig, NodeStateMachine, TimerOp, VnodeInit};
@@ -43,6 +43,11 @@ use crate::event_queue::EventKey;
 
 /// Type alias for the simulation's concrete `IoLoop`.
 type SimIoLoop = IoLoop<SimStorage, SimNetworkAdapter, SyncDispatch, SimulationEngine>;
+
+/// Per-(host, shard) shared store bundle — `TxStore`, `ExecCertStore`,
+/// and `FinalizedWaveStore` cloned into every same-shard vnode on the
+/// host so the per-shard coordinators converge on one canonical view.
+type ShardStoreBundle = (Arc<TxStore>, Arc<ExecCertStore>, Arc<FinalizedWaveStore>);
 
 /// Deterministic simulation runner.
 ///
@@ -189,47 +194,62 @@ impl SimulationRunner {
             shard_committees.insert(shard, committee);
         }
 
-        // Create IoLoop for each validator
+        // Build the host→validators layout based on the hosting mode.
+        // Each host carries a list of (validator_idx, shard) tuples.
         let vnodes_per_host = network_config.vnodes_per_host;
         assert!(vnodes_per_host >= 1, "vnodes_per_host must be at least 1");
-        assert_eq!(
-            network_config.validators_per_shard % vnodes_per_host,
-            0,
-            "vnodes_per_host must divide validators_per_shard"
-        );
-        let hosts_per_shard = network_config.validators_per_shard / vnodes_per_host;
-        let num_hosts = (network_config.num_shards * hosts_per_shard) as usize;
+        let host_layout = build_host_layout(network_config);
+        let num_hosts = host_layout.len();
         let mut io_loops = Vec::with_capacity(num_hosts);
         let mut event_rxs = Vec::with_capacity(num_hosts);
 
-        for shard_id in 0..network_config.num_shards {
-            let shard = ShardGroupId::new(u64::from(shard_id));
+        // One execution cache per shard, shared across every same-shard
+        // vnode regardless of host. Determinism guarantees same-shard
+        // vnodes execute identical txs; the cache short-circuits the
+        // recomputation.
+        let shard_caches: HashMap<ShardGroupId, SimExecutionCache> = (0..network_config.num_shards)
+            .map(|s| {
+                (
+                    ShardGroupId::new(u64::from(s)),
+                    SimExecutionCache::default(),
+                )
+            })
+            .collect();
 
-            // Shared execution cache for all validators in this shard.
-            // Identical transactions against identical state produce identical
-            // results — only the first validator computes; others get the cache.
-            let shard_cache: SimExecutionCache = Arc::default();
+        for (host_index, host_vnodes) in host_layout.iter().enumerate() {
+            // Group this host's vnodes by shard. For cross-shard
+            // hosting each group has one vnode; for same-shard hosting
+            // there's one group per host with `vnodes_per_host` entries.
+            let mut by_shard: BTreeMap<ShardGroupId, Vec<u32>> = BTreeMap::new();
+            for &(validator_idx, shard) in host_vnodes {
+                by_shard.entry(shard).or_default().push(validator_idx);
+            }
 
-            for h in 0..hosts_per_shard {
-                let host_index = shard_id * hosts_per_shard + h;
-                let first_validator = host_index * vnodes_per_host;
+            // Build per-(host, shard) store bundles. Vnodes in the same
+            // shard on the same host share the bundle.
+            let mut shard_stores: HashMap<ShardGroupId, ShardStoreBundle> = HashMap::new();
+            for shard in by_shard.keys() {
+                shard_stores.insert(
+                    *shard,
+                    (
+                        Arc::new(TxStore::new()),
+                        Arc::new(ExecCertStore::new()),
+                        Arc::new(FinalizedWaveStore::new()),
+                    ),
+                );
+            }
 
-                // One `TxStore` + `ExecCertStore` + `FinalizedWaveStore`
-                // per host's shard, shared across every same-shard vnode
-                // on this host.
-                let host_tx_store = Arc::new(TxStore::new());
-                let host_exec_cert_store = Arc::new(ExecCertStore::new());
-                let host_finalized_wave_store = Arc::new(FinalizedWaveStore::new());
-
-                let mut vnode_inits: Vec<VnodeInit> = Vec::with_capacity(vnodes_per_host as usize);
-                let mut topology_arc_for_io_loop = None;
-                for v in 0..vnodes_per_host {
-                    let validator_idx = first_validator + v;
+            let mut vnode_inits: Vec<VnodeInit> = Vec::with_capacity(host_vnodes.len());
+            let mut topology_arc_for_io_loop = None;
+            for (shard, validator_idxs) in &by_shard {
+                let (tx_store, exec_cert_store, fw_store) =
+                    shard_stores.get(shard).expect("shard bundle just inserted");
+                for &validator_idx in validator_idxs {
                     let validator_id = ValidatorId::new(u64::from(validator_idx));
 
                     let topology_state = TopologyCoordinator::with_shard_committees(
                         validator_id,
-                        shard,
+                        *shard,
                         u64::from(network_config.num_shards),
                         &global_validator_set,
                         shard_committees.clone(),
@@ -241,11 +261,12 @@ impl SimulationRunner {
                     );
 
                     // First vnode's topology drives the `IoLoop`'s
-                    // shared snapshot. Same-shard vnodes have
-                    // equivalent shard membership, so all are valid;
-                    // off-thread handlers only read shard-level info
-                    // from this snapshot, not local_validator_id.
-                    if v == 0 {
+                    // shared snapshot. Off-thread handlers only read
+                    // shard-level info from this snapshot, not the
+                    // validator id, so picking the first arbitrarily
+                    // works across both same-shard and cross-shard
+                    // hosting.
+                    if topology_arc_for_io_loop.is_none() {
                         topology_arc_for_io_loop = Some(Arc::new(ArcSwap::from(Arc::clone(
                             topology_state.snapshot(),
                         ))));
@@ -259,41 +280,50 @@ impl SimulationRunner {
                         MempoolConfig::default(),
                         ProvisionConfig::default(),
                         Arc::new(ProvisionStore::new()),
-                        Arc::clone(&host_tx_store),
-                        Arc::clone(&host_exec_cert_store),
-                        Arc::clone(&host_finalized_wave_store),
+                        Arc::clone(tx_store),
+                        Arc::clone(exec_cert_store),
+                        Arc::clone(fw_store),
                     );
 
                     vnode_inits.push(VnodeInit { state, signing_key });
                 }
-
-                let (event_tx, event_rx) = unbounded();
-
-                let network_def = NetworkDefinition::simulator();
-                let tx_validator = Arc::new(TransactionValidation::permissive(network_def.clone()));
-
-                let sim_engine =
-                    SimulationEngine::new(RadixExecutor::new(network_def), shard_cache.clone());
-
-                // Simulator hosts always carry one shard per host
-                // (same-shard hosting only); construct a single-entry
-                // storage map keyed by that shard.
-                let storages = HashMap::from([(shard, SimStorage::new())]);
-                let io_loop = IoLoop::new(
-                    vnode_inits,
-                    storages,
-                    sim_engine,
-                    network.create_adapter(host_index),
-                    SyncDispatch,
-                    event_tx,
-                    topology_arc_for_io_loop.expect("at least one vnode per host"),
-                    NodeConfig::default(),
-                    tx_validator,
-                );
-
-                io_loops.push(io_loop);
-                event_rxs.push(event_rx);
             }
+
+            let (event_tx, event_rx) = unbounded();
+
+            let network_def = NetworkDefinition::simulator();
+            let tx_validator = Arc::new(TransactionValidation::permissive(network_def.clone()));
+
+            // Cross-shard hosts execute against multiple shards' caches;
+            // pick the first hosted shard's cache as the engine's cache
+            // (deterministic processing means the result is the same
+            // across shards for any given tx the engine sees).
+            let primary_shard = *by_shard
+                .keys()
+                .next()
+                .expect("host carries at least one vnode");
+            let shard_cache = shard_caches[&primary_shard].clone();
+            let sim_engine = SimulationEngine::new(RadixExecutor::new(network_def), shard_cache);
+
+            // One `SimStorage` per hosted shard on this host.
+            let storages: HashMap<ShardGroupId, SimStorage> =
+                by_shard.keys().map(|s| (*s, SimStorage::new())).collect();
+            let io_loop = IoLoop::new(
+                vnode_inits,
+                storages,
+                sim_engine,
+                network.create_adapter(
+                    NodeIndex::try_from(host_index).expect("host_index fits NodeIndex"),
+                ),
+                SyncDispatch,
+                event_tx,
+                topology_arc_for_io_loop.expect("host carries at least one vnode"),
+                NodeConfig::default(),
+                tx_validator,
+            );
+
+            io_loops.push(io_loop);
+            event_rxs.push(event_rx);
         }
 
         info!(
@@ -400,14 +430,20 @@ impl SimulationRunner {
     }
 
     /// Get a reference to a specific validator's state machine,
-    /// regardless of which host bundles it.
+    /// regardless of which host bundles it. Works for both same-shard
+    /// and cross-shard hosting — walks every host's vnodes looking
+    /// for a matching `validator_id`.
     #[must_use]
     pub fn vnode_state(&self, validator_id: ValidatorId) -> Option<&NodeStateMachine> {
-        let vnodes_per_host = u64::from(self.network.config().vnodes_per_host);
-        let host_index = NodeIndex::try_from(validator_id.inner() / vnodes_per_host).ok()?;
-        let vnode_idx = usize::try_from(validator_id.inner() % vnodes_per_host).ok()?;
-        let io_loop = self.io_loops.get(host_index as usize)?;
-        (vnode_idx < io_loop.vnodes_len()).then(|| io_loop.vnode_state(vnode_idx))
+        let host_index = self.network.validator_to_node(validator_id) as usize;
+        let io_loop = self.io_loops.get(host_index)?;
+        for v in 0..io_loop.vnodes_len() {
+            let state = io_loop.vnode_state(v);
+            if state.topology().local_validator_id() == validator_id {
+                return Some(state);
+            }
+        }
+        None
     }
 
     /// Get a reference to the network.
@@ -526,7 +562,8 @@ impl SimulationRunner {
 
     /// Apply a prepared engine genesis snapshot to every node selected by
     /// `select`. Inbound handler registration happens once for all nodes in
-    /// [`Self::finalize_genesis`].
+    /// [`Self::finalize_genesis`]. Cross-shard hosts install genesis
+    /// against every hosted shard's storage.
     fn install_engine_genesis(
         &mut self,
         config: &GenesisConfig,
@@ -536,30 +573,45 @@ impl SimulationRunner {
             if self.genesis_executed[node_idx] || !select(node_idx) {
                 continue;
             }
-            let shard = self.io_loops[node_idx]
-                .vnode_state(0)
-                .topology()
-                .local_shard();
-            self.io_loops[node_idx].install_engine_genesis(shard, config);
+            let hosted: Vec<ShardGroupId> = self.io_loops[node_idx].hosted_shards().collect();
+            for shard in hosted {
+                self.io_loops[node_idx].install_engine_genesis(shard, config);
+            }
             self.genesis_executed[node_idx] = true;
         }
     }
 
     /// Initialize state-machine genesis on all nodes and register inbound
     /// network handlers. Called after engine genesis on every node.
+    ///
+    /// For each shard, locate every host that serves it (across both
+    /// same-shard and cross-shard hosting layouts), initialize that
+    /// shard's genesis block on those hosts, and schedule the
+    /// `BlockCommitted` event.
     fn finalize_genesis(&mut self) {
         use hyperscale_storage::SubstateStore;
         use hyperscale_types::Block;
 
         let num_shards = self.network.config().num_shards;
-        let hosts_per_shard =
-            self.network.config().validators_per_shard / self.network.config().vnodes_per_host;
-        let vnodes_per_host = self.network.config().vnodes_per_host;
 
         for shard_id in 0..num_shards {
-            let host_start = shard_id * hosts_per_shard;
             let shard = ShardGroupId::new(u64::from(shard_id));
-            let first_node_storage = self.io_loops[host_start as usize].shard_storage(shard);
+
+            // Hosts that carry at least one vnode in this shard.
+            let num_hosts =
+                NodeIndex::try_from(self.io_loops.len()).expect("host count fits NodeIndex");
+            let hosts_for_shard: Vec<NodeIndex> = (0..num_hosts)
+                .filter(|&h| {
+                    self.io_loops[h as usize]
+                        .hosted_shards()
+                        .any(|s| s == shard)
+                })
+                .collect();
+
+            let first_host = *hosts_for_shard
+                .first()
+                .expect("every shard must have at least one host");
+            let first_node_storage = self.io_loops[first_host as usize].shard_storage(shard);
             let genesis_jmt_root = first_node_storage.state_root();
 
             info!(
@@ -568,24 +620,22 @@ impl SimulationRunner {
                 "JMT state after genesis bootstrap"
             );
 
-            let proposer =
-                ValidatorId::new(u64::from(shard_id * hosts_per_shard * vnodes_per_host));
-            let genesis_block = Block::genesis(
-                ShardGroupId::new(u64::from(shard_id)),
-                proposer,
-                genesis_jmt_root,
-            );
+            // Proposer = first validator in the shard's committee
+            // (shard_id * validators_per_shard).
+            let proposer = ValidatorId::new(u64::from(
+                shard_id * self.network.config().validators_per_shard,
+            ));
+            let genesis_block = Block::genesis(shard, proposer, genesis_jmt_root);
 
-            let host_end = host_start + hosts_per_shard;
-            for host_index in host_start..host_end {
-                let i = host_index as usize;
+            for host_index in &hosts_for_shard {
+                let i = *host_index as usize;
                 self.io_loops[i].initialize_all_vnodes_genesis(&genesis_block);
                 self.io_loops[i].flush_all_batches();
 
                 // Drain outputs from genesis initialization (timer sets, etc.)
                 let output = self.io_loops[i].drain_pending_output();
-                self.drain_node_io(host_index);
-                self.process_step_output(host_index, output);
+                self.drain_node_io(*host_index);
+                self.process_step_output(*host_index, output);
 
                 // Sync state machine with actual JMT state after genesis bootstrap.
                 // Pair the genesis block with a zeroed QC whose `block_hash` matches
@@ -613,14 +663,13 @@ impl SimulationRunner {
                         certified: genesis_certified,
                     },
                 );
-                self.schedule_event(host_index, self.now, genesis_commit_event);
+                self.schedule_event(*host_index, self.now, genesis_commit_event);
             }
 
             info!(
                 shard = shard_id,
                 genesis_hash = ?genesis_block.hash(),
-                hosts = hosts_per_shard,
-                vnodes_per_host,
+                hosts = hosts_for_shard.len(),
                 "Initialized genesis for shard"
             );
         }
@@ -840,5 +889,56 @@ impl SimulationRunner {
         let key = EventKey::new(time, &event, node, self.sequence);
         self.event_queue.insert(key, event);
         key
+    }
+}
+
+/// Compute the host→validators layout for a simulation network.
+///
+/// Returns one entry per host, each a list of `(validator_idx, shard)`
+/// tuples the host carries. The shape depends on `config.hosting_mode`:
+///
+/// - [`HostingMode::SameShardBundled`]: hosts are
+///   `num_shards * validators_per_shard / vnodes_per_host`. Host `h`
+///   in shard `s` carries `vnodes_per_host` consecutive validators
+///   starting at `h * vnodes_per_host` within that shard.
+/// - [`HostingMode::CrossShard`]: hosts are `validators_per_shard`.
+///   Host `h` carries one validator from every shard — specifically
+///   `{s * validators_per_shard + h : s in 0..num_shards}`.
+fn build_host_layout(config: &NetworkConfig) -> Vec<Vec<(u32, ShardGroupId)>> {
+    match config.hosting_mode {
+        HostingMode::SameShardBundled => {
+            assert_eq!(
+                config.validators_per_shard % config.vnodes_per_host,
+                0,
+                "vnodes_per_host must divide validators_per_shard"
+            );
+            let hosts_per_shard = config.validators_per_shard / config.vnodes_per_host;
+            let mut layout = Vec::with_capacity((config.num_shards * hosts_per_shard) as usize);
+            for shard_id in 0..config.num_shards {
+                let shard = ShardGroupId::new(u64::from(shard_id));
+                for h in 0..hosts_per_shard {
+                    let host_first_validator =
+                        shard_id * config.validators_per_shard + h * config.vnodes_per_host;
+                    let host_vnodes: Vec<(u32, ShardGroupId)> = (0..config.vnodes_per_host)
+                        .map(|v| (host_first_validator + v, shard))
+                        .collect();
+                    layout.push(host_vnodes);
+                }
+            }
+            layout
+        }
+        HostingMode::CrossShard => {
+            let mut layout = Vec::with_capacity(config.validators_per_shard as usize);
+            for h in 0..config.validators_per_shard {
+                let host_vnodes: Vec<(u32, ShardGroupId)> = (0..config.num_shards)
+                    .map(|s| {
+                        let validator_idx = s * config.validators_per_shard + h;
+                        (validator_idx, ShardGroupId::new(u64::from(s)))
+                    })
+                    .collect();
+                layout.push(host_vnodes);
+            }
+            layout
+        }
     }
 }
