@@ -596,11 +596,14 @@ where
             NodeInput::TransactionGossipReceived { local_shard, tx } => {
                 self.handle_gossip_received_tx_for_validation(local_shard, tx);
             }
-            NodeInput::TransactionValidated { tx } => {
-                self.handle_transaction_validated(primary_shard, tx);
+            NodeInput::TransactionValidated { local_shard, tx } => {
+                self.handle_transaction_validated(local_shard, tx);
             }
-            NodeInput::TransactionValidationsFailed { hashes } => {
-                self.handle_transaction_validations_failed(primary_shard, &hashes);
+            NodeInput::TransactionValidationsFailed {
+                local_shard,
+                hashes,
+            } => {
+                self.handle_transaction_validations_failed(local_shard, &hashes);
             }
             NodeInput::Protocol { shard, event } => match *event {
                 ProtocolEvent::BlockPersisted {

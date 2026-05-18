@@ -204,6 +204,7 @@ where
 
         let validator = self.tx_validator.clone();
         let event_tx = self.event_sender.clone();
+        let local_shard = shard;
         self.dispatch.spawn(DispatchPool::TxValidation, move || {
             let results: Vec<bool> = batch
                 .iter()
@@ -213,13 +214,14 @@ where
             let mut failed_hashes = Vec::new();
             for (tx, valid) in batch.into_iter().zip(results) {
                 if valid {
-                    let _ = event_tx.send(NodeInput::TransactionValidated { tx });
+                    let _ = event_tx.send(NodeInput::TransactionValidated { local_shard, tx });
                 } else {
                     failed_hashes.push(tx.hash());
                 }
             }
             if !failed_hashes.is_empty() {
                 let _ = event_tx.send(NodeInput::TransactionValidationsFailed {
+                    local_shard,
                     hashes: failed_hashes,
                 });
             }
