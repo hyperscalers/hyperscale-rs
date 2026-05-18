@@ -13,12 +13,12 @@ use hyperscale_execution::action_handlers::handle_action as handle_execution_act
 use hyperscale_metrics::record_transaction_finalized;
 use hyperscale_network::Network;
 use hyperscale_provisions::action_handlers::handle_action as handle_provisions_action;
-use hyperscale_storage::{ChainEntry, ChainWriter, Storage};
+use hyperscale_storage::{ChainEntry, Storage};
 use hyperscale_types::{
-    Block, BlockHeight, CertifiedBlock, ConsensusReceipt, FinalizedWave, QuorumCertificate,
-    ShardGroupId, StateRoot, TopologySnapshot, TransactionStatus, TxHash,
+    Block, BlockHeight, CertifiedBlock, QuorumCertificate, ShardGroupId, StateRoot,
+    TopologySnapshot, TransactionStatus, TxHash,
 };
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, trace, warn};
 
 use super::{IoLoop, TimerOp, push_protocol_event, push_shard_input};
 use crate::shard::block_commit::{AccumulateDecision, PendingCommit};
@@ -121,7 +121,7 @@ where
                 parent_block_height,
                 source,
             } => {
-                self.handle_commit_block_by_qc_only(
+                self.accept_qc_only_commit(
                     shard,
                     block,
                     qc,
@@ -257,21 +257,13 @@ where
         );
     }
 
-    // ─── Action Handler Groups ──────────────────────────────────────────
-
-    /// Handler for [`Action::CommitBlockByQcOnly`].
+    /// Bridge an [`Action::CommitBlockByQcOnly`] to the standard commit
+    /// pipeline: ask [`BlockCommitCoordinator::prepare_qc_only_commit`]
+    /// to compute / reuse the prepared commit and decide whether to
+    /// enqueue, then call [`Self::accept_block_commit`] when it says so.
     ///
-    /// Computes the prepared commit inline (unless the consensus path already
-    /// produced one), inserts the resulting JMT snapshot into `PendingChain`
-    /// so child blocks' `VerifyStateRoot` can resolve parent nodes through the
-    /// overlay, then feeds the block into the standard commit pipeline.
-    ///
-    /// The inline-computed `PreparedCommit`'s `base_root` may be stale by
-    /// flush time (other blocks committed in between). `commit_prepared_blocks`
-    /// handles that via its fallback path — skip if already committed, else
-    /// recompute.
-    #[allow(clippy::too_many_arguments)] // unpacks Action::CommitBlockByQcOnly
-    fn handle_commit_block_by_qc_only(
+    /// [`BlockCommitCoordinator::prepare_qc_only_commit`]: crate::shard::block_commit::BlockCommitCoordinator::prepare_qc_only_commit
+    fn accept_qc_only_commit(
         &mut self,
         shard: ShardGroupId,
         block: Block,
@@ -280,129 +272,25 @@ where
         parent_block_height: BlockHeight,
         source: CommitSource,
     ) {
-        let block_hash = block.hash();
-        let height = block.height();
-
-        // Hard skip only if already persisted (consensus path got all the
-        // way through). We must still enqueue blocks whose prepared commit
-        // was populated by the consensus path but that never had
-        // `BlockReadyToCommit` fire — e.g. a self-proposed block whose
-        // child arrived via sync rather than consensus, so the 2-chain
-        // commit rule never triggered. Dropping the block here leaves its
-        // prepared commit orphaned in the cache, and the next block to
-        // reach flush trips the strict ordering assert in
-        // `commit_block_inner` because its parent was never applied.
-        if height <= self.shard_io(shard).block_commit.persisted_height() {
-            return;
-        }
-
-        // If the consensus path already produced the prepared commit
-        // (VerifyStateRoot/ExecuteTransactions), reuse it — recomputing JMT
-        // here can produce a transient root mismatch and trip the
-        // byzantine-detection assert below on a self-inflicted race.
-        if self.shard_io(shard).block_commit.has_prepared(&block_hash) {
-            debug!(
-                height = height.inner(),
-                ?block_hash,
-                "Reusing prepared commit from consensus path"
-            );
-        } else {
-            // Build view anchored at parent — includes prior synced blocks'
-            // JMT snapshots so chained verification can find parent nodes.
-            let view = self
-                .shard_io(shard)
-                .pending_chain
-                .view_at(block.header().parent_block_hash());
-            let pending_snapshots = view.pending_snapshots().to_vec();
-
-            // Inline JMT computation (no commit_lock — only reads).
-            let finalized_waves: Vec<Arc<FinalizedWave>> = block.certificates().to_vec();
-            let (computed_root, prepared) = view.prepare_block_commit(
-                parent_state_root,
-                parent_block_height,
-                &finalized_waves,
-                height,
-                &pending_snapshots,
-                // `None` → the view drains its own base-read cache internally.
-                None,
-            );
-
-            // The sync-block ingress validator rejects peer-shipped
-            // divergent receipts before BFT sees the block, and
-            // `WaveState`'s divergence detector keeps locally-produced
-            // bad receipts out of `finalized`. A mismatch here means our
-            // local parent state itself diverged from canonical — a JMT
-            // or commit-batch bug, or pre-existing corruption in
-            // `StateCf`. Block-by-block sync can't repair this; the
-            // operator must restore from a state snapshot or
-            // wipe-and-resync from genesis.
-            if computed_root != block.header().state_root() {
-                error!(
-                    height = height.inner(),
-                    ?block_hash,
-                    expected_root = ?block.header().state_root(),
-                    computed_root = ?computed_root,
-                    ?parent_state_root,
-                    parent_block_height = parent_block_height.inner(),
-                    ?source,
-                    "Local state divergence detected on synced block apply — \
-                     parent state does not produce the canonical state root. \
-                     Rebuild required: restore from state snapshot or \
-                     resync from genesis."
-                );
-                panic!(
-                    "Local state divergence at height {}: parent state root \
-                     {parent_state_root:?} does not produce canonical state \
-                     root {expected:?} (computed {computed:?}). Operator \
-                     intervention required.",
-                    height.inner(),
-                    expected = block.header().state_root(),
-                    computed = computed_root,
-                );
-            }
-
-            // Insert JMT snapshot into PendingChain so child blocks'
-            // VerifyStateRoot can find this block's tree nodes via the overlay.
-            let jmt_snapshot = Arc::new(S::jmt_snapshot(&prepared).clone());
-            let receipts: Vec<Arc<ConsensusReceipt>> = finalized_waves
-                .iter()
-                .flat_map(|fw| fw.consensus_receipts())
-                .collect();
-            self.shard_io(shard).pending_chain.insert(
-                block_hash,
-                ChainEntry {
-                    parent_block_hash: block.header().parent_block_hash(),
-                    height,
-                    receipts,
-                    jmt_snapshot,
+        let io = self.shard_io(shard);
+        let should_enqueue = io.block_commit.prepare_qc_only_commit(
+            &io.pending_chain,
+            &block,
+            parent_state_root,
+            parent_block_height,
+            source,
+        );
+        if should_enqueue {
+            self.accept_block_commit(
+                shard,
+                PendingCommit {
+                    block: Arc::new(block),
+                    qc: Arc::new(qc),
+                    source,
+                    committed_notified: false,
                 },
             );
-
-            self.shard_io_mut(shard)
-                .block_commit
-                .insert_prepared(block_hash, height, prepared);
-
-            debug!(
-                height = height.inner(),
-                ?block_hash,
-                "Synced block prepared, queued for persist"
-            );
         }
-
-        // Feed into the standard commit pipeline — accept_block_commit
-        // fires BlockCommitted immediately, flush_block_commits batches the
-        // RocksDB write with a single fsync. The coordinator dedups by
-        // block_hash so double-emission (consensus + sync both reaching
-        // commit) is safe.
-        self.accept_block_commit(
-            shard,
-            PendingCommit {
-                block: Arc::new(block),
-                qc: Arc::new(qc),
-                source,
-                committed_notified: false,
-            },
-        );
     }
 
     /// Hand a commit to the [`BlockCommitCoordinator`] and act on its

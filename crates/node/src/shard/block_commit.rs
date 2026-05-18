@@ -23,10 +23,12 @@ use crossbeam::channel::Sender;
 use hyperscale_core::{CommitSource, ProtocolEvent};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_metrics::{record_block_committed, set_block_height};
-use hyperscale_storage::ChainWriter;
+use hyperscale_storage::{ChainEntry, ChainWriter, PendingChain, Storage};
 use hyperscale_types::{
-    Block, BlockHash, BlockHeight, CertifiedBlock, LocalTimestamp, QuorumCertificate, ShardGroupId,
+    Block, BlockHash, BlockHeight, CertifiedBlock, ConsensusReceipt, FinalizedWave, LocalTimestamp,
+    QuorumCertificate, ShardGroupId, StateRoot,
 };
+use tracing::{debug, error};
 
 use crate::io_loop::{ShardEvent, push_protocol_event};
 
@@ -162,6 +164,153 @@ where
             .lock()
             .unwrap()
             .insert(block_hash, (height, prepared));
+    }
+
+    /// Prepare a [`Action::CommitBlockByQcOnly`] block for the standard
+    /// commit pipeline.
+    ///
+    /// Computes the JMT root inline (no `commit_lock` — only reads),
+    /// verifies it matches the canonical state root, inserts the JMT
+    /// snapshot into `pending_chain` so child blocks'
+    /// `VerifyStateRoot` can resolve parent nodes through the overlay,
+    /// then caches the prepared commit for the next flush.
+    ///
+    /// Returns `false` if the block is already persisted (caller skips
+    /// the rest of the commit pipeline). Returns `true` otherwise —
+    /// caller should proceed to [`accumulate`](Self::accumulate).
+    ///
+    /// Hard-skips only on already-persisted; an already-prepared block
+    /// still proceeds (consensus path may have produced the prepared
+    /// commit, but if `BlockReadyToCommit` never fired the block needs
+    /// to flow through `accumulate` for its `BlockCommitted` event).
+    ///
+    /// # Panics
+    ///
+    /// Panics on local state divergence: a computed-vs-canonical state
+    /// root mismatch means local parent state itself diverged from
+    /// canonical (JMT or commit-batch bug, or pre-existing corruption
+    /// in `StateCf`). Block-by-block sync can't repair this; operator
+    /// intervention (restore from snapshot or wipe-and-resync) is
+    /// required.
+    ///
+    /// [`Action::CommitBlockByQcOnly`]: hyperscale_core::Action::CommitBlockByQcOnly
+    pub fn prepare_qc_only_commit(
+        &self,
+        pending_chain: &Arc<PendingChain<S>>,
+        block: &Block,
+        parent_state_root: StateRoot,
+        parent_block_height: BlockHeight,
+        source: CommitSource,
+    ) -> bool
+    where
+        S: Storage,
+    {
+        let block_hash = block.hash();
+        let height = block.height();
+
+        // Hard skip only if already persisted (consensus path got all
+        // the way through). We must still enqueue blocks whose prepared
+        // commit was populated by the consensus path but that never
+        // had `BlockReadyToCommit` fire — e.g. a self-proposed block
+        // whose child arrived via sync rather than consensus, so the
+        // 2-chain commit rule never triggered. Dropping the block here
+        // leaves its prepared commit orphaned in the cache, and the
+        // next block to reach flush trips the strict ordering assert
+        // in `commit_block_inner` because its parent was never applied.
+        if height <= self.persisted_height {
+            return false;
+        }
+
+        // If the consensus path already produced the prepared commit
+        // (VerifyStateRoot/ExecuteTransactions), reuse it — recomputing
+        // JMT here can produce a transient root mismatch and trip the
+        // byzantine-detection assert below on a self-inflicted race.
+        if self.has_prepared(&block_hash) {
+            debug!(
+                height = height.inner(),
+                ?block_hash,
+                "Reusing prepared commit from consensus path"
+            );
+            return true;
+        }
+
+        // Build view anchored at parent — includes prior synced blocks'
+        // JMT snapshots so chained verification can find parent nodes.
+        let view = pending_chain.view_at(block.header().parent_block_hash());
+        let pending_snapshots = view.pending_snapshots().to_vec();
+
+        // Inline JMT computation (no commit_lock — only reads).
+        let finalized_waves: Vec<Arc<FinalizedWave>> = block.certificates().to_vec();
+        let (computed_root, prepared) = view.prepare_block_commit(
+            parent_state_root,
+            parent_block_height,
+            &finalized_waves,
+            height,
+            &pending_snapshots,
+            // `None` → the view drains its own base-read cache internally.
+            None,
+        );
+
+        // The sync-block ingress validator rejects peer-shipped
+        // divergent receipts before BFT sees the block, and
+        // `WaveState`'s divergence detector keeps locally-produced
+        // bad receipts out of `finalized`. A mismatch here means our
+        // local parent state itself diverged from canonical — a JMT
+        // or commit-batch bug, or pre-existing corruption in
+        // `StateCf`. Block-by-block sync can't repair this; the
+        // operator must restore from a state snapshot or
+        // wipe-and-resync from genesis.
+        if computed_root != block.header().state_root() {
+            error!(
+                height = height.inner(),
+                ?block_hash,
+                expected_root = ?block.header().state_root(),
+                computed_root = ?computed_root,
+                ?parent_state_root,
+                parent_block_height = parent_block_height.inner(),
+                ?source,
+                "Local state divergence detected on synced block apply — \
+                 parent state does not produce the canonical state root. \
+                 Rebuild required: restore from state snapshot or \
+                 resync from genesis."
+            );
+            panic!(
+                "Local state divergence at height {}: parent state root \
+                 {parent_state_root:?} does not produce canonical state \
+                 root {expected:?} (computed {computed:?}). Operator \
+                 intervention required.",
+                height.inner(),
+                expected = block.header().state_root(),
+                computed = computed_root,
+            );
+        }
+
+        // Insert JMT snapshot into PendingChain so child blocks'
+        // VerifyStateRoot can find this block's tree nodes via the overlay.
+        let jmt_snapshot = Arc::new(S::jmt_snapshot(&prepared).clone());
+        let receipts: Vec<Arc<ConsensusReceipt>> = finalized_waves
+            .iter()
+            .flat_map(|fw| fw.consensus_receipts())
+            .collect();
+        pending_chain.insert(
+            block_hash,
+            ChainEntry {
+                parent_block_hash: block.header().parent_block_hash(),
+                height,
+                receipts,
+                jmt_snapshot,
+            },
+        );
+
+        self.insert_prepared(block_hash, height, prepared);
+
+        debug!(
+            height = height.inner(),
+            ?block_hash,
+            "Synced block prepared, queued for persist"
+        );
+
+        true
     }
 
     pub const fn pending_len(&self) -> usize {
