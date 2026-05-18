@@ -378,13 +378,18 @@ where
     pub(super) fn register_gossip_handlers(&self) {
         use hyperscale_network::{GossipVerdict, TopicScope};
 
+        // Hosted-shard set snapshotted once for both gossip handlers'
+        // closures. Snapshotted at registration time; dynamic vnode
+        // addition will need to refresh this when a new shard joins.
+        let hosted_shards: std::sync::Arc<HashSet<ShardGroupId>> =
+            std::sync::Arc::new(self.hosted_shards().collect());
+
         // ── transaction.gossip → NodeInput::TransactionGossipReceived ─
         // The step() handler dedups against tx_store / tombstones and
         // enqueues for batched async validation.
 
         let tx = self.event_sender.clone();
-        let hosted_shards_for_tx =
-            std::sync::Arc::new(self.hosted_shards().collect::<HashSet<_>>());
+        let hosted_shards_for_tx = std::sync::Arc::clone(&hosted_shards);
         self.network.register_gossip_handler::<TransactionGossip>(
             TopicScope::Shard,
             move |gossip: TransactionGossip, shard: Option<ShardGroupId>| -> GossipVerdict {
@@ -418,8 +423,7 @@ where
 
         let tx = self.event_sender.clone();
         let topology = self.topology_snapshot.clone();
-        let hosted_shards_for_hdr =
-            std::sync::Arc::new(self.hosted_shards().collect::<HashSet<_>>());
+        let hosted_shards_for_hdr = std::sync::Arc::clone(&hosted_shards);
         self.network
             .register_gossip_handler::<CommittedBlockHeaderGossip>(
                 TopicScope::Global,
@@ -474,10 +478,10 @@ where
     /// to known committee members.
     #[allow(clippy::too_many_lines)] // single registration table; one closure per notification type
     pub(super) fn register_notification_handlers(&self) {
-        // Hosted-shard set snapshotted at registration. Phase 5's
-        // `add_vnode` will need to refresh this when a new shard is
-        // hosted at runtime; today registration runs once at startup
-        // after every initial vnode is in place.
+        // Hosted-shard set snapshotted at registration. Dynamic vnode
+        // addition will need to refresh this when a new shard joins;
+        // today registration runs once at startup after every initial
+        // vnode is in place.
         let hosted_shards: std::sync::Arc<HashSet<ShardGroupId>> =
             std::sync::Arc::new(self.hosted_shards().collect());
 
