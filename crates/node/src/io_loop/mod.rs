@@ -312,6 +312,7 @@ where
                 Arc::clone(rep.state.provisions().store()),
                 Arc::clone(rep.state.mempool().tx_store()),
                 Arc::clone(rep.state.execution().exec_cert_store()),
+                Arc::clone(rep.state.execution().finalized_wave_store()),
             );
             let storage = storages
                 .remove(shard)

@@ -253,34 +253,32 @@ where
         );
     }
 
-    /// Snapshot local mempool / finalized-wave cache / provision store
-    /// into an [`Inventory`] so the responder can elide bodies the
-    /// requester already has.
+    /// Snapshot local mempool / finalized-wave / provision store into
+    /// an [`Inventory`] so the responder can elide bodies the requester
+    /// already has. Every read is scoped to `shard`'s `SharedCaches`,
+    /// so cross-shard hosting picks the right view automatically.
     fn build_sync_inventory(&self, shard: ShardGroupId) -> Inventory {
+        let caches = self.shard_caches(shard);
         Inventory {
-            tx_have: self.shard_caches(shard).tx_store.tx_bloom_snapshot(),
-            cert_have: self.vnodes[0].state.execution().cert_bloom_snapshot(),
-            provision_have: self
-                .shard_caches(shard)
-                .provision_store
-                .provision_bloom_snapshot(),
+            tx_have: caches.tx_store.tx_bloom_snapshot(),
+            cert_have: caches.finalized_wave_store.cert_bloom_snapshot(),
+            provision_have: caches.provision_store.provision_bloom_snapshot(),
         }
     }
 
     /// Rehydrate an elided sync response into a full `CertifiedBlock`.
+    /// Every body lookup hits `shard`'s `SharedCaches` so cross-shard
+    /// hosting rehydrates against the right shard's data.
     fn rehydrate_elided_block(
         &self,
         shard: ShardGroupId,
         elided: &ElidedCertifiedBlock,
     ) -> Result<CertifiedBlock, RehydrateError> {
-        let state = &self.vnodes[0].state;
-        let mempool = state.mempool();
-        let execution = state.execution();
-        let provision_store = &self.shard_caches(shard).provision_store;
+        let caches = self.shard_caches(shard);
         elided.try_rehydrate(
-            |h| mempool.get_transaction(h),
-            |id| execution.get_finalized_wave(id),
-            |h| provision_store.get(*h),
+            |h| caches.tx_store.get(h),
+            |id| caches.finalized_wave_store.get(id),
+            |h| caches.provision_store.get(*h),
         )
     }
 

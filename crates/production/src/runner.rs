@@ -53,7 +53,7 @@ use hyperscale_core::{NodeInput, ProtocolEvent, TimerId};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_dispatch_pooled::{PooledDispatch, ThreadPoolConfig};
 use hyperscale_engine::{GenesisConfig, NetworkDefinition, RadixExecutor, TransactionValidation};
-use hyperscale_execution::ExecCertStore;
+use hyperscale_execution::{ExecCertStore, FinalizedWaveStore};
 use hyperscale_mempool::{MempoolConfig, TxStore};
 use hyperscale_metrics::{
     ChannelDepths, set_channel_depths, set_libp2p_peers, set_pool_queue_depths,
@@ -394,11 +394,12 @@ impl ProductionRunnerBuilder {
         let recovered = primary_storage.load_recovered_state();
         let provision_store = Arc::new(ProvisionStore::new());
 
-        // One `TxStore` + `ExecCertStore` per hosted shard, shared across
-        // every same-shard vnode and into the `IoLoop`'s `SharedCaches`.
-        // Determinism guarantees same-shard vnodes admit identical sets,
-        // but co-owning the store makes the canonical view explicit and
-        // gives the request handler one place to read.
+        // One `TxStore` + `ExecCertStore` + `FinalizedWaveStore` per
+        // hosted shard, shared across every same-shard vnode and into the
+        // `IoLoop`'s `SharedCaches`. Determinism guarantees same-shard
+        // vnodes admit identical sets, but co-owning the stores makes the
+        // canonical view explicit and gives the request/sync handlers one
+        // place to read.
         let tx_stores: HashMap<ShardGroupId, Arc<TxStore>> = local_shards
             .iter()
             .map(|s| (*s, Arc::new(TxStore::new())))
@@ -406,6 +407,10 @@ impl ProductionRunnerBuilder {
         let exec_cert_stores: HashMap<ShardGroupId, Arc<ExecCertStore>> = local_shards
             .iter()
             .map(|s| (*s, Arc::new(ExecCertStore::new())))
+            .collect();
+        let finalized_wave_stores: HashMap<ShardGroupId, Arc<FinalizedWaveStore>> = local_shards
+            .iter()
+            .map(|s| (*s, Arc::new(FinalizedWaveStore::new())))
             .collect();
 
         let vnode_inits: Vec<VnodeInit> = vnode_configs
@@ -427,6 +432,11 @@ impl ProductionRunnerBuilder {
                         .get(&shard)
                         .expect("hosted shard derived from vnodes"),
                 );
+                let finalized_wave_store = Arc::clone(
+                    finalized_wave_stores
+                        .get(&shard)
+                        .expect("hosted shard derived from vnodes"),
+                );
                 let state = NodeStateMachine::new(
                     node_index,
                     cfg.topology,
@@ -437,6 +447,7 @@ impl ProductionRunnerBuilder {
                     Arc::clone(&provision_store),
                     tx_store,
                     exec_cert_store,
+                    finalized_wave_store,
                 );
                 VnodeInit {
                     state,
