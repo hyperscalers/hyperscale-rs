@@ -115,14 +115,8 @@ where
             .map(|node_id| shard_for_node(node_id, num_shards))
             .collect();
 
-        // Gossip from an arbitrary hosted shard — the batch accumulator
-        // choice doesn't affect what goes on the wire.
-        let gossip_from = self
-            .hosted_shards()
-            .next()
-            .expect("IoLoop hosts at least one shard");
         for dst in &touched_shards {
-            self.enqueue_tx_for_gossip(gossip_from, *dst, Arc::clone(tx));
+            self.enqueue_tx_for_gossip(*dst, Arc::clone(tx));
         }
 
         // Admit locally on every hosted shard the tx touches.
@@ -145,12 +139,11 @@ where
         }
     }
 
-    /// Append a tx to the destination shard's outbound gossip accumulator
-    /// on `local_shard`, flushing immediately if the count cap is hit.
+    /// Append a tx to the destination shard's outbound gossip
+    /// accumulator, flushing immediately if the count cap is hit.
     /// Time-based flushes happen via [`IoLoop::flush_expired_batches`].
     pub(in crate::io_loop) fn enqueue_tx_for_gossip(
         &mut self,
-        local_shard: ShardGroupId,
         dst: ShardGroupId,
         tx: Arc<RoutableTransaction>,
     ) {
@@ -158,28 +151,19 @@ where
         let max = self.tx_gossip_max;
         let window = self.tx_gossip_window;
         let batch = self
-            .shard_io_mut(local_shard)
             .tx_gossip_batches
             .entry(dst)
             .or_insert_with(|| BatchAccumulator::new(max, window));
         if batch.push(tx, now) {
-            self.flush_tx_gossip_batch(local_shard, dst);
+            self.flush_tx_gossip_batch(dst);
         }
     }
 
-    /// Drain `local_shard`'s outbound gossip accumulator for destination
-    /// shard `dst` and publish it as a single `TransactionGossip` batch.
+    /// Drain the outbound gossip accumulator for destination shard
+    /// `dst` and publish it as a single `TransactionGossip` batch.
     /// No-op if empty.
-    pub(in crate::io_loop) fn flush_tx_gossip_batch(
-        &mut self,
-        local_shard: ShardGroupId,
-        dst: ShardGroupId,
-    ) {
-        let Some(batch) = self
-            .shard_io_mut(local_shard)
-            .tx_gossip_batches
-            .get_mut(&dst)
-        else {
+    pub(in crate::io_loop) fn flush_tx_gossip_batch(&mut self, dst: ShardGroupId) {
+        let Some(batch) = self.tx_gossip_batches.get_mut(&dst) else {
             return;
         };
         let txs = batch.take();

@@ -27,7 +27,7 @@ mod network_handlers;
 mod status;
 mod step;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -41,7 +41,9 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{Engine, RadixExecutor, TransactionValidation};
 use hyperscale_network::Network;
 use hyperscale_storage::{PendingChain, Storage};
-use hyperscale_types::{LocalTimestamp, ShardGroupId, TopologySnapshot, TransactionStatus, TxHash};
+use hyperscale_types::{
+    LocalTimestamp, RoutableTransaction, ShardGroupId, TopologySnapshot, TransactionStatus, TxHash,
+};
 pub use metrics::{MetricsSnapshot, ShardMetrics, VnodeMetrics, record_metrics};
 use quick_cache::sync::Cache as QuickCache;
 pub use status::{NodeStatusSnapshot, ShardStatus, VnodeStatus};
@@ -321,9 +323,18 @@ where
     /// the runner's metrics; reset at the top of [`Self::step`].
     actions_generated: usize,
 
+    /// Per-destination-shard outbound `TransactionGossip` accumulators.
+    /// Locally-submitted transactions are appended to one accumulator
+    /// per shard the tx touches (declared reads ∪ writes); each fills
+    /// until its count cap or time window expires, then flushes as a
+    /// single batched gossip message. Host-level rather than per-shard
+    /// because the wire shape (`TransactionGossip`) carries no source
+    /// identity — the source `ShardIo` choice was always arbitrary.
+    tx_gossip_batches: BTreeMap<ShardGroupId, BatchAccumulator<Arc<RoutableTransaction>>>,
+
     /// Size cap for new tx-gossip accumulators. Consulted lazily by
-    /// `enqueue_tx_for_gossip` when it inserts a new per-destination-shard
-    /// accumulator into a `ShardIo`'s `tx_gossip_batches`.
+    /// `enqueue_tx_for_gossip` when it inserts a new per-destination
+    /// accumulator into `tx_gossip_batches`.
     tx_gossip_max: usize,
 
     /// Time window for new tx-gossip accumulators. Same role as
@@ -454,7 +465,6 @@ where
                             b.committed_header_max,
                             b.committed_header_window,
                         ),
-                        tx_gossip_batches: std::collections::BTreeMap::new(),
                     },
                     vnodes,
                 },
@@ -480,6 +490,7 @@ where
             pending_timer_ops: Vec::new(),
             emitted_statuses: Vec::new(),
             actions_generated: 0,
+            tx_gossip_batches: BTreeMap::new(),
             tx_gossip_max: b.tx_gossip_max,
             tx_gossip_window: b.tx_gossip_window,
             now: LocalTimestamp::ZERO,
@@ -840,15 +851,14 @@ where
             if self.shard_io(shard).committed_header_batch.is_expired(now) {
                 self.flush_committed_header_verifications(shard);
             }
-            let expired_dst_shards: Vec<ShardGroupId> = self
-                .shard_io(shard)
-                .tx_gossip_batches
-                .iter()
-                .filter_map(|(dst, batch)| batch.is_expired(now).then_some(*dst))
-                .collect();
-            for dst in expired_dst_shards {
-                self.flush_tx_gossip_batch(shard, dst);
-            }
+        }
+        let expired_dst_shards: Vec<ShardGroupId> = self
+            .tx_gossip_batches
+            .iter()
+            .filter_map(|(dst, batch)| batch.is_expired(now).then_some(*dst))
+            .collect();
+        for dst in expired_dst_shards {
+            self.flush_tx_gossip_batch(dst);
         }
     }
 
@@ -857,20 +867,18 @@ where
     /// Used by the production `run()` loop for `recv_timeout()` and by the
     /// simulation harness to know when to schedule a flush.
     pub fn nearest_batch_deadline(&self) -> Option<LocalTimestamp> {
-        self.shards
+        let per_shard_deadlines = self.shards.values().flat_map(|g| {
+            [
+                g.io.validation_batch.deadline(),
+                g.io.committed_header_batch.deadline(),
+            ]
+        });
+        let tx_gossip_deadlines = self
+            .tx_gossip_batches
             .values()
-            .flat_map(|g| {
-                let tx_gossip_min =
-                    g.io.tx_gossip_batches
-                        .values()
-                        .filter_map(BatchAccumulator::deadline)
-                        .min();
-                [
-                    g.io.validation_batch.deadline(),
-                    g.io.committed_header_batch.deadline(),
-                    tx_gossip_min,
-                ]
-            })
+            .map(BatchAccumulator::deadline);
+        per_shard_deadlines
+            .chain(tx_gossip_deadlines)
             .flatten()
             .min()
     }
@@ -885,15 +893,10 @@ where
             self.flush_block_commits(*shard);
             self.flush_validation_batch(*shard);
             self.flush_committed_header_verifications(*shard);
-            let dst_shards: Vec<ShardGroupId> = self
-                .shard_io(*shard)
-                .tx_gossip_batches
-                .keys()
-                .copied()
-                .collect();
-            for dst in dst_shards {
-                self.flush_tx_gossip_batch(*shard, dst);
-            }
+        }
+        let dst_shards: Vec<ShardGroupId> = self.tx_gossip_batches.keys().copied().collect();
+        for dst in dst_shards {
+            self.flush_tx_gossip_batch(dst);
         }
     }
 }

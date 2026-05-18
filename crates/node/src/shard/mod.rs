@@ -14,13 +14,13 @@ pub mod phase_times;
 pub mod sync;
 pub mod verify;
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use hyperscale_storage::{PendingChain, Storage};
 use hyperscale_types::{
-    Bls12381G1PublicKey, Bls12381G2Signature, CommittedBlockHeader, RoutableTransaction,
-    ShardGroupId, TxHash, ValidatorId,
+    Bls12381G1PublicKey, Bls12381G2Signature, CommittedBlockHeader, RoutableTransaction, TxHash,
+    ValidatorId,
 };
 
 use crate::batch_accumulator::BatchAccumulator;
@@ -92,12 +92,4 @@ pub struct ShardIo<S: Storage> {
     /// Pending remote-committed-header gossip awaiting batched BLS
     /// sender-signature verification on the crypto pool.
     pub committed_header_batch: BatchAccumulator<CommittedHeaderVerificationItem>,
-
-    /// Per-destination-shard outbound `TransactionGossip` accumulators.
-    /// Locally-submitted transactions are appended to one accumulator
-    /// per shard the tx touches (declared reads ∪ writes); each fills
-    /// until its count cap or time window expires, then flushes as a
-    /// single batched gossip message. New accumulators are sized from
-    /// the `IoLoop`'s tx-gossip batch config.
-    pub tx_gossip_batches: BTreeMap<ShardGroupId, BatchAccumulator<Arc<RoutableTransaction>>>,
 }
