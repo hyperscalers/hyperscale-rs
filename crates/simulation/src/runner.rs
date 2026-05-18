@@ -386,13 +386,12 @@ impl SimulationRunner {
     // Accessors
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Get a reference to a node's storage. Simulator hosts always
-    /// carry one shard per host, so we resolve through the host's
-    /// state machine.
+    /// Get a reference to a node's storage. Returns the storage for the
+    /// host's first hosted shard.
     #[must_use]
     pub fn node_storage(&self, node: NodeIndex) -> Option<&SimStorage> {
         let io_loop = self.io_loops.get(node as usize)?;
-        let shard = io_loop.vnode_state(0).topology().local_shard();
+        let shard = io_loop.hosted_shards().next()?;
         Some(io_loop.shard_storage(shard))
     }
 
@@ -423,9 +422,9 @@ impl SimulationRunner {
     /// [`Self::vnode_state`] to pick a specific validator.
     #[must_use]
     pub fn node(&self, index: NodeIndex) -> Option<&NodeStateMachine> {
-        self.io_loops
-            .get(index as usize)
-            .map(|nl| nl.vnode_state(0))
+        let io_loop = self.io_loops.get(index as usize)?;
+        let shard = io_loop.hosted_shards().next()?;
+        Some(io_loop.vnode_state(shard, 0))
     }
 
     /// Get a reference to a specific validator's state machine,
@@ -436,10 +435,12 @@ impl SimulationRunner {
     pub fn vnode_state(&self, validator_id: ValidatorId) -> Option<&NodeStateMachine> {
         let host_index = self.network.validator_to_node(validator_id) as usize;
         let io_loop = self.io_loops.get(host_index)?;
-        for v in 0..io_loop.vnodes_len() {
-            let state = io_loop.vnode_state(v);
-            if state.topology().local_validator_id() == validator_id {
-                return Some(state);
+        for shard in io_loop.hosted_shards() {
+            for v in 0..io_loop.vnodes_len(shard) {
+                let state = io_loop.vnode_state(shard, v);
+                if state.topology().local_validator_id() == validator_id {
+                    return Some(state);
+                }
             }
         }
         None
@@ -460,7 +461,9 @@ impl SimulationRunner {
     #[must_use]
     pub fn committed_block_count(&self, node: NodeIndex) -> usize {
         self.io_loops.get(node as usize).map_or(0, |nl| {
-            let shard = nl.vnode_state(0).topology().local_shard();
+            let Some(shard) = nl.hosted_shards().next() else {
+                return 0;
+            };
             let s = nl.shard_storage(shard);
             let committed = s.committed_height();
             if committed == BlockHeight::GENESIS {
@@ -475,8 +478,9 @@ impl SimulationRunner {
     #[must_use]
     pub fn has_committed_block(&self, node: NodeIndex, height: BlockHeight) -> bool {
         self.io_loops.get(node as usize).is_some_and(|nl| {
-            let shard = nl.vnode_state(0).topology().local_shard();
-            nl.shard_storage(shard).get_block(height).is_some()
+            nl.hosted_shards()
+                .next()
+                .is_some_and(|shard| nl.shard_storage(shard).get_block(height).is_some())
         })
     }
 

@@ -182,7 +182,7 @@ where
         let any_pending = self
             .shards
             .values_mut()
-            .any(|sio| sio.fetches.has_any_pending() || sio.syncs.has_any_pending());
+            .any(|g| g.io.fetches.has_any_pending() || g.io.syncs.has_any_pending());
         // FetchTick is process-global. The `shard` on `TimerOp` exists
         // to key the runner's timer manager by `(TimerId, ShardGroupId)`;
         // pick a stable sentinel from the hosted set so set/cancel pairs

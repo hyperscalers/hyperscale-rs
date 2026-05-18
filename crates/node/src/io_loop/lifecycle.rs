@@ -31,14 +31,11 @@ where
 {
     /// Process actions emitted by a single vnode's genesis init.
     ///
-    /// Called by runners that drive `NodeStateMachine::initialize_genesis`
-    /// directly on `vnodes[vnode_idx].state`. Most callers prefer
-    /// [`Self::initialize_all_vnodes_genesis`] which does both steps
-    /// for every hosted vnode.
-    pub fn handle_actions(&mut self, vnode_idx: usize, actions: Vec<Action>) {
-        let shard = self.vnodes[vnode_idx].shard;
+    /// Called by [`Self::initialize_all_vnodes_genesis`] for every vnode
+    /// in the shard whose genesis block was just installed.
+    pub fn handle_actions(&mut self, shard: ShardGroupId, vnode_idx: usize, actions: Vec<Action>) {
         for action in actions {
-            self.process_action(vnode_idx, action);
+            self.process_action(shard, vnode_idx, action);
         }
         self.flush_block_commits(shard);
     }
@@ -48,18 +45,16 @@ where
     ///
     /// Callers hosting vnodes across multiple shards drive this once per
     /// shard with the shard-appropriate genesis block; this method
-    /// initializes the vnodes whose `local_shard()` matches
-    /// `genesis_block`'s shard, leaving the others untouched.
+    /// initializes the vnodes in `genesis_block`'s shard, leaving the
+    /// others untouched.
     pub fn initialize_all_vnodes_genesis(&mut self, genesis_block: &Block) {
-        let target_shard = genesis_block.header().shard_group_id();
-        for vnode_idx in 0..self.vnodes_len() {
-            if self.vnodes[vnode_idx].shard != target_shard {
-                continue;
-            }
+        let shard = genesis_block.header().shard_group_id();
+        let count = self.vnodes_len(shard);
+        for vnode_idx in 0..count {
             let actions = self
-                .vnode_state_mut(vnode_idx)
+                .vnode_state_mut(shard, vnode_idx)
                 .initialize_genesis(genesis_block);
-            self.handle_actions(vnode_idx, actions);
+            self.handle_actions(shard, vnode_idx, actions);
         }
     }
 

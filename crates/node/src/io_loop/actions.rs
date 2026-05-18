@@ -37,10 +37,11 @@ where
 {
     // ─── Action Processing ──────────────────────────────────────────────
 
-    /// Process a single action emitted by `vnode_idx`'s state machine.
+    /// Process a single action emitted by the vnode at `(shard, vnode_idx)`'s
+    /// state machine.
     ///
-    /// `vnode_idx` identifies the vnode that produced the action so
-    /// dispatched off-thread work can sign with the right validator's
+    /// `(shard, vnode_idx)` identifies the vnode that produced the action
+    /// so dispatched off-thread work can sign with the right validator's
     /// key.
     ///
     /// Two categories of arm:
@@ -50,8 +51,7 @@ where
     ///   `io_loop` machinery (timers, caches consumed by `io_loop`-side
     ///   serving, RPC observability, block commit pipeline, topology
     ///   plumbing).
-    pub(super) fn process_action(&mut self, vnode_idx: usize, action: Action) {
-        let shard = self.vnodes[vnode_idx].shard;
+    pub(super) fn process_action(&mut self, shard: ShardGroupId, vnode_idx: usize, action: Action) {
         match action {
             // ─── Coordinator policy: delegated to worker pools ─────────────
             Action::AggregateExecutionCertificate { .. }
@@ -76,7 +76,7 @@ where
             | Action::BroadcastCommittedBlockHeader { .. }
             | Action::SignAndSendExecutionVote { .. }
             | Action::BroadcastExecutionCertificate { .. } => {
-                self.dispatch_delegated_action(vnode_idx, action);
+                self.dispatch_delegated_action(shard, vnode_idx, action);
             }
 
             // ─── Sync / fetch protocol drive ───────────────────────────────
@@ -92,14 +92,16 @@ where
 
             // ─── io_loop-internal effects ──────────────────────────────────
             Action::SetTimer { id, duration } => {
-                self.vnodes[vnode_idx].pending_timer_ops.push(TimerOp::Set {
-                    shard,
-                    id,
-                    duration,
-                });
+                self.vnode_mut(shard, vnode_idx)
+                    .pending_timer_ops
+                    .push(TimerOp::Set {
+                        shard,
+                        id,
+                        duration,
+                    });
             }
             Action::CancelTimer { id } => {
-                self.vnodes[vnode_idx]
+                self.vnode_mut(shard, vnode_idx)
                     .pending_timer_ops
                     .push(TimerOp::Cancel { shard, id });
             }
@@ -139,8 +141,8 @@ where
                 submitted_locally,
             } => {
                 self.handle_emit_transaction_status(
-                    vnode_idx,
                     shard,
+                    vnode_idx,
                     tx_hash,
                     status,
                     cross_shard,
@@ -205,8 +207,8 @@ where
 
     fn handle_emit_transaction_status(
         &mut self,
-        vnode_idx: usize,
         shard: ShardGroupId,
+        vnode_idx: usize,
         tx_hash: TxHash,
         status: TransactionStatus,
         cross_shard: bool,
@@ -241,7 +243,7 @@ where
         self.shard_caches(shard)
             .tx_status
             .insert(tx_hash, status.clone());
-        self.vnodes[vnode_idx]
+        self.vnode_mut(shard, vnode_idx)
             .emitted_statuses
             .push((tx_hash, status));
     }
@@ -588,18 +590,18 @@ where
     /// `event_sender` channel and are processed on a future `step()` call.
     /// With `SyncDispatch` (simulation), `spawn_*` runs inline so events
     /// enter the channel immediately and are drained by the harness.
-    fn dispatch_delegated_action(&self, vnode_idx: usize, action: Action) {
+    fn dispatch_delegated_action(&self, shard: ShardGroupId, vnode_idx: usize, action: Action) {
         let pool = action
             .dispatch_pool()
             .expect("dispatch_delegated_action called for delegated actions only");
 
         let handles = Arc::clone(&self.dispatch_handles);
-        let shard = self.vnodes[vnode_idx].shard;
+        let vnode = self.vnode(shard, vnode_idx);
         // Per-vnode snapshot so the handler's `local_validator_id`
         // matches the signing key used.
-        let topology_snapshot = Arc::clone(self.vnodes[vnode_idx].state.topology_arc());
+        let topology_snapshot = Arc::clone(vnode.state.topology_arc());
         let event_tx = self.event_sender.clone();
-        let signing_key = Arc::clone(&self.vnodes[vnode_idx].signing_key);
+        let signing_key = Arc::clone(&vnode.signing_key);
 
         self.dispatch.spawn(pool, move || {
             let notify = move |event: NodeInput| {

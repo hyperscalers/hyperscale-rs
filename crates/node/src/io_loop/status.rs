@@ -47,9 +47,20 @@ where
     E: Engine,
 {
     /// Capture a snapshot of node state for external status APIs.
+    ///
+    /// # Panics
+    /// Panics if no shards are hosted — the [`IoLoop`] constructor
+    /// rejects an empty vnode list, so this never fires in practice.
     #[must_use]
     pub fn status_snapshot(&self) -> NodeStatusSnapshot {
-        let state = &self.vnodes[0].state;
+        // Per-shard status aggregation is a follow-up; surface the first
+        // hosted shard's first vnode for now since the RPC contract
+        // assumes one block-sync stream per node.
+        let primary_shard = self
+            .hosted_shards()
+            .next()
+            .expect("IoLoop hosts at least one shard");
+        let state = &self.vnode(primary_shard, 0).state;
         let state_root = state.last_committed_jmt_root();
         let mempool = state.mempool();
         let contention = mempool.lock_contention_stats();
@@ -63,11 +74,6 @@ where
             contention.pending_count as usize,
             contention.in_flight_count as usize,
         );
-
-        // Per-shard status aggregation is a follow-up; surface the
-        // primary (`vnodes[0]`) shard's block-sync state for now since
-        // the RPC contract assumes one block-sync stream per node.
-        let primary_shard = self.vnodes[0].shard;
         NodeStatusSnapshot {
             committed_height: state.bft().committed_height(),
             view: state.bft().view().inner(),

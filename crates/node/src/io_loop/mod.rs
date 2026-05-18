@@ -155,6 +155,26 @@ pub struct StepOutput {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// ShardGroup — per-shard I/O state plus the vnodes that share it
+// ═══════════════════════════════════════════════════════════════════════
+
+/// One hosted shard: its [`ShardIo`] plus every [`Vnode`] that participates
+/// in this shard's consensus.
+///
+/// Same-shard vnodes share the [`ShardIo`] (one storage, one fetch host,
+/// one mempool body store, etc.); cross-shard vnodes live in different
+/// `ShardGroup`s. A vnode's shard is implied by which group it lives in —
+/// the `Vnode` itself carries no `shard` field.
+pub struct ShardGroup<S: Storage> {
+    /// Per-shard I/O state shared by every vnode in `vnodes`.
+    pub io: ShardIo<S>,
+    /// Vnodes participating in this shard's consensus. Driven in order
+    /// during each `step()` iteration; same-shard vnodes see identical
+    /// inbound events and produce per-validator votes.
+    pub vnodes: Vec<Vnode>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // IoLoop
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -170,22 +190,15 @@ where
     S: Storage,
     D: Dispatch,
 {
-    /// Per-validator bundles. Each [`Vnode`] holds a `NodeStateMachine`,
-    /// signing key, and per-step scratch buffers. Two or more vnodes
-    /// in the same shard share a single [`ShardIo`] and consume the
-    /// same inbound events; cross-shard vnodes live independently and
-    /// each route to their own [`ShardIo`] via `vnode.shard`.
+    /// Per-shard groups, each owning that shard's [`ShardIo`] plus the
+    /// [`Vnode`]s participating in its consensus. One entry per shard
+    /// this host carries.
     ///
-    /// State machines are driven exclusively from the pinned thread
-    /// via `vnodes[i].state.handle()`. All `ProtocolEvent` ingestion
-    /// and `Action` emission happen here; off-thread closures never
-    /// touch them.
-    vnodes: Vec<Vnode>,
-
-    /// Per-shard I/O state, keyed by shard id. One entry per shard this
-    /// host carries vnodes for. Per-shard helpers (`shard_io`,
-    /// `shard_storage`, etc.) look up against this map.
-    shards: HashMap<ShardGroupId, ShardIo<S>>,
+    /// State machines are driven exclusively from the pinned thread via
+    /// `shards[shard].vnodes[i].state.handle()`. All `ProtocolEvent`
+    /// ingestion and `Action` emission happen here; off-thread closures
+    /// never touch them.
+    shards: HashMap<ShardGroupId, ShardGroup<S>>,
 
     /// Transaction executor. Cloned (cheaply) into the block-commit
     /// closure on each drain — `Engine` requires `Clone`, so this is
@@ -320,20 +333,31 @@ where
         let b = &config.batch;
         let network = Arc::new(network);
 
-        // Build one `ShardIo` + matching dispatch handles per hosted
-        // shard. The representative vnode for each shard supplies the
-        // initial-persisted height and the inbound-serving caches —
-        // same-shard vnodes admit identical transactions and provisions
-        // by determinism, so any same-shard vnode's stores are
-        // consistent (each shard's vnodes still hold their own copies
-        // inside their state machines).
-        let mut shards: HashMap<ShardGroupId, ShardIo<S>> = HashMap::new();
+        // Build one `ShardGroup` per hosted shard, owning both the
+        // shard's `ShardIo` and the vnodes participating in it. The
+        // representative vnode for each shard supplies the initial-
+        // persisted height and the inbound-serving caches — same-shard
+        // vnodes admit identical transactions and provisions by
+        // determinism, so any same-shard vnode's stores are consistent
+        // (each shard's vnodes still hold their own copies inside their
+        // state machines).
+        let mut shards: HashMap<ShardGroupId, ShardGroup<S>> = HashMap::new();
         let mut per_shard_dispatch: HashMap<ShardGroupId, ShardDispatchHandles<S>> = HashMap::new();
+
+        // Group incoming `VnodeInit`s by their declared local shard, so
+        // we can construct each `ShardGroup` with its full `Vec<Vnode>`
+        // in one pass.
+        let mut by_shard: HashMap<ShardGroupId, Vec<VnodeInit>> = HashMap::new();
+        for init in vnodes {
+            let shard = init.state.topology().local_shard();
+            by_shard.entry(shard).or_default().push(init);
+        }
+
         for shard in &hosted_shards {
-            let rep = vnodes
-                .iter()
-                .find(|v| v.state.topology().local_shard() == *shard)
+            let inits = by_shard
+                .remove(shard)
                 .expect("hosted shard derived from vnodes — at least one vnode exists for it");
+            let rep = inits.first().expect("group non-empty by construction");
             let initial_persisted_height = rep.state.bft().committed_height();
             let caches = SharedCaches::new(
                 Arc::clone(rep.state.provisions().store()),
@@ -354,26 +378,40 @@ where
                     prepared_commits: block_commit.prepared_commits_handle(),
                 },
             );
+            let vnodes: Vec<Vnode> = inits
+                .into_iter()
+                .map(|init| Vnode {
+                    validator_id: init.state.topology().local_validator_id(),
+                    state: init.state,
+                    signing_key: init.signing_key,
+                    emitted_statuses: Vec::new(),
+                    actions_generated: 0,
+                    pending_timer_ops: Vec::new(),
+                })
+                .collect();
             shards.insert(
                 *shard,
-                ShardIo {
-                    storage,
-                    pending_chain,
-                    block_commit,
-                    caches,
-                    fetches: FetchHost::new(&config),
-                    syncs: SyncHost::new(&config),
-                    pending_validation: HashSet::new(),
-                    locally_submitted: HashSet::new(),
-                    validation_batch: BatchAccumulator::new(
-                        b.tx_validation_max,
-                        b.tx_validation_window,
-                    ),
-                    committed_header_batch: BatchAccumulator::new(
-                        b.committed_header_max,
-                        b.committed_header_window,
-                    ),
-                    tx_gossip_batches: std::collections::BTreeMap::new(),
+                ShardGroup {
+                    io: ShardIo {
+                        storage,
+                        pending_chain,
+                        block_commit,
+                        caches,
+                        fetches: FetchHost::new(&config),
+                        syncs: SyncHost::new(&config),
+                        pending_validation: HashSet::new(),
+                        locally_submitted: HashSet::new(),
+                        validation_batch: BatchAccumulator::new(
+                            b.tx_validation_max,
+                            b.tx_validation_window,
+                        ),
+                        committed_header_batch: BatchAccumulator::new(
+                            b.committed_header_max,
+                            b.committed_header_window,
+                        ),
+                        tx_gossip_batches: std::collections::BTreeMap::new(),
+                    },
+                    vnodes,
                 },
             );
         }
@@ -383,20 +421,7 @@ where
             network: Arc::clone(&network),
             per_shard: per_shard_dispatch,
         });
-        let vnodes: Vec<Vnode> = vnodes
-            .into_iter()
-            .map(|init| Vnode {
-                validator_id: init.state.topology().local_validator_id(),
-                shard: init.state.topology().local_shard(),
-                state: init.state,
-                signing_key: init.signing_key,
-                emitted_statuses: Vec::new(),
-                actions_generated: 0,
-                pending_timer_ops: Vec::new(),
-            })
-            .collect();
         Self {
-            vnodes,
             shards,
             executor,
             network,
@@ -436,49 +461,77 @@ where
 
     // ─── Accessors ──────────────────────────────────────────────────────
 
-    /// Number of vnodes hosted by this `IoLoop`.
+    /// Number of vnodes hosted in `shard`, or `0` if `shard` isn't hosted.
     #[must_use]
-    pub const fn vnodes_len(&self) -> usize {
-        self.vnodes.len()
+    pub fn vnodes_len(&self, shard: ShardGroupId) -> usize {
+        self.shards.get(&shard).map_or(0, |g| g.vnodes.len())
     }
 
-    /// Access the state machine of the vnode at `vnode_idx`.
+    /// Access the state machine of the vnode at index `vnode_idx` within
+    /// `shard`'s group.
     ///
     /// # Panics
-    /// Panics if `vnode_idx >= vnodes_len()`.
-    pub fn vnode_state(&self, vnode_idx: usize) -> &NodeStateMachine {
-        &self.vnodes[vnode_idx].state
+    /// Panics if `shard` isn't hosted or `vnode_idx` is out of range.
+    pub fn vnode_state(&self, shard: ShardGroupId, vnode_idx: usize) -> &NodeStateMachine {
+        &self.shard_group(shard).vnodes[vnode_idx].state
     }
 
-    /// Mutably access the state machine of the vnode at `vnode_idx`.
+    /// Mutably access the state machine of the vnode at index `vnode_idx`
+    /// within `shard`'s group.
     ///
     /// # Panics
-    /// Panics if `vnode_idx >= vnodes_len()`.
-    pub fn vnode_state_mut(&mut self, vnode_idx: usize) -> &mut NodeStateMachine {
-        &mut self.vnodes[vnode_idx].state
+    /// Panics if `shard` isn't hosted or `vnode_idx` is out of range.
+    pub fn vnode_state_mut(
+        &mut self,
+        shard: ShardGroupId,
+        vnode_idx: usize,
+    ) -> &mut NodeStateMachine {
+        &mut self.shard_group_mut(shard).vnodes[vnode_idx].state
     }
 
-    /// Hosted shards (one entry per `ShardIo`). Used by call sites that
-    /// fan out across every shard this host carries — batch flushes,
+    /// Hosted shards (one entry per `ShardGroup`). Used by call sites
+    /// that fan out across every shard this host carries — batch flushes,
     /// fetch ticks, metrics aggregation.
     pub fn hosted_shards(&self) -> impl Iterator<Item = ShardGroupId> + '_ {
         self.shards.keys().copied()
+    }
+
+    /// Internal: per-shard group (io + vnodes). Most callers prefer the
+    /// narrower `shard_io` / `vnode` helpers; reach for this when you
+    /// need both halves in the same borrow.
+    pub(super) fn shard_group(&self, shard: ShardGroupId) -> &ShardGroup<S> {
+        self.shards
+            .get(&shard)
+            .unwrap_or_else(|| panic!("shard {shard:?} not hosted by this IoLoop"))
+    }
+
+    /// Internal: mutable per-shard group.
+    pub(super) fn shard_group_mut(&mut self, shard: ShardGroupId) -> &mut ShardGroup<S> {
+        self.shards
+            .get_mut(&shard)
+            .unwrap_or_else(|| panic!("shard {shard:?} not hosted by this IoLoop"))
+    }
+
+    /// Internal: immutable per-shard vnode by index.
+    pub(super) fn vnode(&self, shard: ShardGroupId, vnode_idx: usize) -> &Vnode {
+        &self.shard_group(shard).vnodes[vnode_idx]
+    }
+
+    /// Internal: mutable per-shard vnode by index.
+    pub(super) fn vnode_mut(&mut self, shard: ShardGroupId, vnode_idx: usize) -> &mut Vnode {
+        &mut self.shard_group_mut(shard).vnodes[vnode_idx]
     }
 
     /// Internal: shared `ShardIo` for `shard`. Call sites that touch
     /// several fields of one shard prefer this over the per-field
     /// helpers below.
     pub(super) fn shard_io(&self, shard: ShardGroupId) -> &ShardIo<S> {
-        self.shards
-            .get(&shard)
-            .unwrap_or_else(|| panic!("shard {shard:?} not hosted by this IoLoop"))
+        &self.shard_group(shard).io
     }
 
     /// Internal: mutable `ShardIo` for `shard`.
     pub(super) fn shard_io_mut(&mut self, shard: ShardGroupId) -> &mut ShardIo<S> {
-        self.shards
-            .get_mut(&shard)
-            .unwrap_or_else(|| panic!("shard {shard:?} not hosted by this IoLoop"))
+        &mut self.shard_group_mut(shard).io
     }
 
     /// Shard storage as `&Arc<S>` for sites that need to `Arc::clone`
@@ -551,7 +604,7 @@ where
     pub fn tx_status(&self, hash: &TxHash) -> Option<TransactionStatus> {
         self.shards
             .values()
-            .find_map(|sio| sio.caches.tx_status.get(hash))
+            .find_map(|group| group.io.caches.tx_status.get(hash))
     }
 
     /// Per-shard transaction status caches.
@@ -565,7 +618,7 @@ where
     ) -> HashMap<ShardGroupId, Arc<QuickCache<TxHash, TransactionStatus>>> {
         self.shards
             .iter()
-            .map(|(shard, sio)| (*shard, Arc::clone(&sio.caches.tx_status)))
+            .map(|(shard, group)| (*shard, Arc::clone(&group.io.caches.tx_status)))
             .collect()
     }
 
@@ -587,10 +640,12 @@ where
     ///    production receives these via its crossbeam channel receivers)
     #[allow(clippy::too_many_lines)] // single dispatch over NodeInput; one arm per event variant
     pub fn step(&mut self, event: NodeInput) -> StepOutput {
-        for vnode in &mut self.vnodes {
-            vnode.emitted_statuses.clear();
-            vnode.actions_generated = 0;
-            vnode.pending_timer_ops.clear();
+        for group in self.shards.values_mut() {
+            for vnode in &mut group.vnodes {
+                vnode.emitted_statuses.clear();
+                vnode.actions_generated = 0;
+                vnode.pending_timer_ops.clear();
+            }
         }
         self.pending_timer_ops.clear();
 
@@ -769,10 +824,12 @@ where
         let mut emitted_statuses = Vec::new();
         let mut timer_ops = std::mem::take(&mut self.pending_timer_ops);
         let mut actions_generated = 0usize;
-        for vnode in &mut self.vnodes {
-            emitted_statuses.append(&mut vnode.emitted_statuses);
-            timer_ops.append(&mut vnode.pending_timer_ops);
-            actions_generated += vnode.actions_generated;
+        for group in self.shards.values_mut() {
+            for vnode in &mut group.vnodes {
+                emitted_statuses.append(&mut vnode.emitted_statuses);
+                timer_ops.append(&mut vnode.pending_timer_ops);
+                actions_generated += vnode.actions_generated;
+            }
         }
         StepOutput {
             emitted_statuses,
@@ -789,10 +846,12 @@ where
     /// action with the originating vnode's signing context. The
     /// vnode's clock is synced with the `IoLoop`'s cached `now` here so
     /// `set_time` itself can stay O(1).
-    fn feed_event(&mut self, vnode_idx: usize, event: ProtocolEvent) {
-        self.vnodes[vnode_idx].state.set_time(self.now);
-        let actions = self.vnodes[vnode_idx].state.handle(event);
-        self.process_actions(vnode_idx, actions);
+    fn feed_event(&mut self, shard: ShardGroupId, vnode_idx: usize, event: ProtocolEvent) {
+        let now = self.now;
+        let state = &mut self.vnode_mut(shard, vnode_idx).state;
+        state.set_time(now);
+        let actions = state.handle(event);
+        self.process_actions(shard, vnode_idx, actions);
     }
 
     /// Fan a shard-scoped protocol event out to every hosted vnode in
@@ -801,28 +860,25 @@ where
     /// Use this for events that mean "something happened in shard S"
     /// (block persisted, sync block validated, remote header received,
     /// etc.) — every same-shard vnode independently applies the event
-    /// and produces its own signed actions, while vnodes in other
-    /// shards correctly ignore it. Per-vnode events (where only the
-    /// emitting vnode should react) should call [`Self::feed_event`]
-    /// directly with the originating index.
+    /// and produces its own signed actions. No-op when `shard` isn't
+    /// hosted. Per-vnode events (where only the emitting vnode should
+    /// react) should call [`Self::feed_event`] directly with the
+    /// originating index.
     fn feed_event_to_shard_vnodes(&mut self, shard: ShardGroupId, event: ProtocolEvent) {
-        // Collect indices up front so we can `&mut self` through
-        // `feed_event` without holding a borrow of `vnodes`.
-        let targets: Vec<usize> = self
-            .vnodes
-            .iter()
-            .enumerate()
-            .filter_map(|(i, v)| (v.shard == shard).then_some(i))
-            .collect();
+        let Some(group) = self.shards.get(&shard) else {
+            return;
+        };
+        let count = group.vnodes.len();
+        if count == 0 {
+            return;
+        }
         // Clone for every recipient except the last; move into the last
         // so we don't pay a final clone whose result is immediately
         // dropped.
-        if let Some((&last, rest)) = targets.split_last() {
-            for &vnode_idx in rest {
-                self.feed_event(vnode_idx, event.clone());
-            }
-            self.feed_event(last, event);
+        for vnode_idx in 0..count - 1 {
+            self.feed_event(shard, vnode_idx, event.clone());
         }
+        self.feed_event(shard, count - 1, event);
     }
 
     /// Dispatch a `Vec<Action>` produced by a direct state-machine
@@ -830,11 +886,10 @@ where
     /// — bumps `actions_generated`, dispatches each action, and
     /// flushes pending block commits. The flush is the load-bearing
     /// part: it's easy to forget when copy-pasting the loop inline.
-    fn process_actions(&mut self, vnode_idx: usize, actions: Vec<Action>) {
-        let shard = self.vnodes[vnode_idx].shard;
-        self.vnodes[vnode_idx].actions_generated += actions.len();
+    fn process_actions(&mut self, shard: ShardGroupId, vnode_idx: usize, actions: Vec<Action>) {
+        self.vnode_mut(shard, vnode_idx).actions_generated += actions.len();
         for action in actions {
-            self.process_action(vnode_idx, action);
+            self.process_action(shard, vnode_idx, action);
         }
         self.flush_block_commits(shard);
     }
@@ -874,15 +929,15 @@ where
     pub fn nearest_batch_deadline(&self) -> Option<LocalTimestamp> {
         self.shards
             .values()
-            .flat_map(|sio| {
-                let tx_gossip_min = sio
-                    .tx_gossip_batches
-                    .values()
-                    .filter_map(BatchAccumulator::deadline)
-                    .min();
+            .flat_map(|g| {
+                let tx_gossip_min =
+                    g.io.tx_gossip_batches
+                        .values()
+                        .filter_map(BatchAccumulator::deadline)
+                        .min();
                 [
-                    sio.validation_batch.deadline(),
-                    sio.committed_header_batch.deadline(),
+                    g.io.validation_batch.deadline(),
+                    g.io.committed_header_batch.deadline(),
                     tx_gossip_min,
                 ]
             })

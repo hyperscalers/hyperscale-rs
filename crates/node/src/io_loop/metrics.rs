@@ -108,14 +108,17 @@ where
     #[must_use]
     #[allow(clippy::too_many_lines)] // single aggregation snapshot; cheap reads stitched together
     pub fn metrics_snapshot(&self) -> MetricsSnapshot {
-        let state = &self.vnodes[0].state;
+        // Per-shard prometheus aggregation is a follow-up; the metrics
+        // backend uses flat gauges, so read the first hosted shard's
+        // first vnode as a representative snapshot.
+        let primary_shard = self
+            .hosted_shards()
+            .next()
+            .expect("IoLoop hosts at least one shard");
+        let state = &self.vnode(primary_shard, 0).state;
         let bft_stats = state.bft().stats();
         let mempool = state.mempool();
         let contention = mempool.lock_contention_stats();
-        // Per-shard prometheus aggregation is a follow-up; the metrics
-        // backend uses flat gauges, so read the primary (`vnodes[0]`)
-        // shard's hosts as a representative snapshot.
-        let primary_shard = self.vnodes[0].shard;
         let fetches = self.shard_fetches(primary_shard).metrics();
         let syncs = self.shard_syncs(primary_shard).metrics();
         let block_sync_status = &syncs.block_sync_status;

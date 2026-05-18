@@ -1,19 +1,20 @@
 //! Per-validator bundle hosted by the `IoLoop`.
 //!
-//! One [`Vnode`] per validator identity. The `IoLoop` owns `Vec<Vnode>`
-//! and drives each vnode's state machine in turn. Same-shard vnodes
-//! share their `ShardIo` (see `crates/node/src/shard/`); cross-shard
-//! vnodes live independently.
+//! One [`Vnode`] per validator identity, owned by a [`ShardGroup`] in
+//! the `IoLoop`'s `shards` map. Same-shard vnodes share the enclosing
+//! `ShardGroup`'s `ShardIo`; cross-shard vnodes live in different
+//! groups. The vnode's shard is implied by which group it lives in —
+//! no denormalized field.
 //!
 //! Per-step scratch (emitted statuses, action counter, timer ops)
 //! lives on the `Vnode` so each step's outputs are bound to a specific
 //! validator.
+//!
+//! [`ShardGroup`]: crate::io_loop::ShardGroup
 
 use std::sync::Arc;
 
-use hyperscale_types::{
-    Bls12381G1PrivateKey, ShardGroupId, TransactionStatus, TxHash, ValidatorId,
-};
+use hyperscale_types::{Bls12381G1PrivateKey, TransactionStatus, TxHash, ValidatorId};
 
 use crate::NodeStateMachine;
 use crate::io_loop::TimerOp;
@@ -24,7 +25,7 @@ use crate::io_loop::TimerOp;
 pub struct VnodeInit {
     /// Per-validator state machine, already populated with its
     /// `TopologyCoordinator` (the constructor reads `validator_id`
-    /// and `shard` from there).
+    /// and `local_shard` from there).
     pub state: NodeStateMachine,
     /// BLS signing key for this validator's votes and proposals.
     /// Shared with the validator-bind service (production) by `Arc`
@@ -37,9 +38,6 @@ pub struct VnodeInit {
 pub struct Vnode {
     /// This validator's network identity.
     pub validator_id: ValidatorId,
-
-    /// The shard this validator is currently a member of.
-    pub shard: ShardGroupId,
 
     /// Per-validator state machine.
     pub state: NodeStateMachine,
