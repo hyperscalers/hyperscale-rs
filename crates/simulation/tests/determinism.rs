@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_core::{NodeInput, ProtocolEvent};
-use hyperscale_network_memory::NetworkConfig;
+use hyperscale_network_memory::{HostingMode, NetworkConfig};
 use hyperscale_simulation::SimulationRunner;
 use hyperscale_types::{
     BlockHeight, LocalTimestamp, QuorumCertificate, Round, ShardGroupId, TransactionStatus,
@@ -1930,6 +1930,7 @@ fn test_packet_loss_application() {
         jitter_fraction: 0.1,
         packet_loss_rate: 0.10, // 10% packet loss
         vnodes_per_host: 1,
+        hosting_mode: HostingMode::SameShardBundled,
     };
 
     let mut runner = SimulationRunner::new(&config, 42);
@@ -1987,6 +1988,7 @@ fn test_packet_loss_determinism() {
         jitter_fraction: 0.1,
         packet_loss_rate: 0.2, // 20% packet loss for more variation
         vnodes_per_host: 1,
+        hosting_mode: HostingMode::SameShardBundled,
     };
 
     let seed = 12345u64;

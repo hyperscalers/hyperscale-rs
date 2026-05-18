@@ -8,7 +8,7 @@
 
 use std::time::Duration;
 
-use hyperscale_network_memory::NetworkConfig;
+use hyperscale_network_memory::{HostingMode, NetworkConfig};
 use hyperscale_simulation::SimulationRunner;
 use hyperscale_types::{BlockHeight, ValidatorId};
 use tracing_test::traced_test;
@@ -23,6 +23,7 @@ fn test_v2_same_shard_hosting_makes_progress() {
         num_shards: 1,
         validators_per_shard: 4,
         vnodes_per_host: 2,
+        hosting_mode: HostingMode::SameShardBundled,
         intra_shard_latency: Duration::from_millis(50),
         cross_shard_latency: Duration::from_millis(50),
         jitter_fraction: 0.1,

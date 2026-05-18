@@ -50,6 +50,26 @@ use crate::sim_network::{
 };
 use crate::traffic::NetworkTrafficAnalyzer;
 
+/// How simulated validators are bundled into hosts (`IoLoop` instances).
+///
+/// See [`NetworkConfig::hosting_mode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostingMode {
+    /// Each host hosts `vnodes_per_host` consecutive validators from
+    /// the **same** shard. Host count = `num_shards * validators_per_shard
+    /// / vnodes_per_host`. `vnodes_per_host` must divide
+    /// `validators_per_shard`. This is the default and covers all
+    /// pre-Phase-2c testing.
+    SameShardBundled,
+    /// Each host hosts **one validator from every shard** —
+    /// `vnodes_per_host` becomes `num_shards` implicitly. Host count
+    /// equals `validators_per_shard`. Validator id layout: shard `s`
+    /// owns ids `[s * validators_per_shard, (s+1) * validators_per_shard)`;
+    /// host `h` carries `{V_h, V_{h+VPS}, V_{h+2*VPS}, ...}` — one
+    /// per shard. Used to exercise cross-shard hosting end-to-end.
+    CrossShard,
+}
+
 /// Configuration for simulated network.
 #[derive(Debug, Clone)]
 pub struct NetworkConfig {
@@ -68,8 +88,12 @@ pub struct NetworkConfig {
     /// Number of consecutive validators bundled into each simulated
     /// host (i.e. each `IoLoop`). Default `1` means one validator per
     /// host. With `> 1`, validators `[k*N .. (k+1)*N)` share host
-    /// index `k`. Must divide `validators_per_shard`.
+    /// index `k`. Must divide `validators_per_shard`. Ignored when
+    /// `hosting_mode == HostingMode::CrossShard` (the cross-shard mode
+    /// fixes bundling at one vnode per shard per host).
     pub vnodes_per_host: u32,
+    /// How validators are bundled into hosts. See [`HostingMode`].
+    pub hosting_mode: HostingMode,
 }
 
 impl Default for NetworkConfig {
@@ -82,6 +106,7 @@ impl Default for NetworkConfig {
             num_shards: 2,
             packet_loss_rate: 0.0,
             vnodes_per_host: 1,
+            hosting_mode: HostingMode::SameShardBundled,
         }
     }
 }
@@ -308,13 +333,23 @@ impl SimulatedNetwork {
             config.vnodes_per_host >= 1,
             "vnodes_per_host must be at least 1"
         );
-        assert_eq!(
-            config.validators_per_shard % config.vnodes_per_host,
-            0,
-            "vnodes_per_host must divide validators_per_shard"
-        );
-        let total_validators = (config.num_shards * config.validators_per_shard) as usize;
-        let num_hosts = total_validators / config.vnodes_per_host as usize;
+        let num_hosts = match config.hosting_mode {
+            HostingMode::SameShardBundled => {
+                assert_eq!(
+                    config.validators_per_shard % config.vnodes_per_host,
+                    0,
+                    "vnodes_per_host must divide validators_per_shard"
+                );
+                let total_validators = (config.num_shards * config.validators_per_shard) as usize;
+                total_validators / config.vnodes_per_host as usize
+            }
+            HostingMode::CrossShard => {
+                // One host per validator slot per shard; each host hosts
+                // one validator from every shard, so num_hosts =
+                // validators_per_shard.
+                config.validators_per_shard as usize
+            }
+        };
         let registries = (0..num_hosts)
             .map(|_| Arc::new(HandlerRegistry::new()))
             .collect();
@@ -335,10 +370,23 @@ impl SimulatedNetwork {
     }
 
     /// Translate a `ValidatorId` to its hosting `NodeIndex` under the
-    /// current `vnodes_per_host` bundling.
+    /// current hosting mode.
+    ///
+    /// - [`HostingMode::SameShardBundled`]: consecutive validators
+    ///   share a host. `validator_id / vnodes_per_host`.
+    /// - [`HostingMode::CrossShard`]: shard `s` owns ids
+    ///   `[s * VPS, (s+1) * VPS)`; host `h` carries validator `s * VPS + h`
+    ///   for every `s`. So `validator_id % validators_per_shard`.
     #[must_use]
     pub fn validator_to_node(&self, validator: ValidatorId) -> NodeIndex {
-        (validator.inner() / u64::from(self.config.vnodes_per_host)) as NodeIndex
+        match self.config.hosting_mode {
+            HostingMode::SameShardBundled => {
+                (validator.inner() / u64::from(self.config.vnodes_per_host)) as NodeIndex
+            }
+            HostingMode::CrossShard => {
+                (validator.inner() % u64::from(self.config.validators_per_shard)) as NodeIndex
+            }
+        }
     }
 
     /// Builder for installing or removing per-message-type fault rules.
@@ -497,38 +545,71 @@ impl SimulatedNetwork {
         Duration::from_secs_f64(latency_secs)
     }
 
-    /// Get the shard for a host (`IoLoop`) index. Same-shard
-    /// `vnodes_per_host` validators bundle into one host.
+    /// Get a representative shard for a host (`IoLoop`) index. Used by
+    /// the latency model to pick `intra_shard_latency` vs
+    /// `cross_shard_latency` for inter-host messages.
+    ///
+    /// - [`HostingMode::SameShardBundled`]: each host is in exactly one
+    ///   shard; that's the answer.
+    /// - [`HostingMode::CrossShard`]: each host serves every shard.
+    ///   Returns shard 0 by convention; the latency model collapses
+    ///   "all hosts share every shard" to intra-shard for all
+    ///   inter-host gossip.
     #[must_use]
     pub fn shard_for_node(&self, node: NodeIndex) -> ShardGroupId {
-        let hosts_per_shard = self.config.validators_per_shard / self.config.vnodes_per_host;
-        ShardGroupId::new(u64::from(node / hosts_per_shard))
+        match self.config.hosting_mode {
+            HostingMode::SameShardBundled => {
+                let hosts_per_shard =
+                    self.config.validators_per_shard / self.config.vnodes_per_host;
+                ShardGroupId::new(u64::from(node / hosts_per_shard))
+            }
+            HostingMode::CrossShard => ShardGroupId::new(0),
+        }
     }
 
     /// Get all hosts (`IoLoop` indices) that have at least one
     /// validator in `shard`.
+    ///
+    /// - [`HostingMode::SameShardBundled`]: hosts mapped to `shard`.
+    /// - [`HostingMode::CrossShard`]: every host serves every shard, so
+    ///   returns all hosts.
     #[must_use]
     pub fn peers_in_shard(&self, shard: ShardGroupId) -> Vec<NodeIndex> {
-        let hosts_per_shard = self.config.validators_per_shard / self.config.vnodes_per_host;
-        let start = (shard.inner() as u32) * hosts_per_shard;
-        let end = start + hosts_per_shard;
-        (start..end).collect()
+        match self.config.hosting_mode {
+            HostingMode::SameShardBundled => {
+                let hosts_per_shard =
+                    self.config.validators_per_shard / self.config.vnodes_per_host;
+                let start = (shard.inner() as u32) * hosts_per_shard;
+                let end = start + hosts_per_shard;
+                (start..end).collect()
+            }
+            HostingMode::CrossShard => (0..self.config.validators_per_shard).collect(),
+        }
     }
 
     /// Get all hosts in the network.
     #[must_use]
     pub fn all_nodes(&self) -> Vec<NodeIndex> {
-        let total =
-            self.config.num_shards * self.config.validators_per_shard / self.config.vnodes_per_host;
+        let total = match self.config.hosting_mode {
+            HostingMode::SameShardBundled => {
+                self.config.num_shards * self.config.validators_per_shard
+                    / self.config.vnodes_per_host
+            }
+            HostingMode::CrossShard => self.config.validators_per_shard,
+        };
         (0..total).collect()
     }
 
-    /// Get the total number of hosts (`IoLoop`s). With
-    /// `vnodes_per_host > 1` this is less than the validator count.
+    /// Get the total number of hosts (`IoLoop`s).
     #[must_use]
     pub const fn total_nodes(&self) -> usize {
-        (self.config.num_shards * self.config.validators_per_shard / self.config.vnodes_per_host)
-            as usize
+        match self.config.hosting_mode {
+            HostingMode::SameShardBundled => {
+                (self.config.num_shards * self.config.validators_per_shard
+                    / self.config.vnodes_per_host) as usize
+            }
+            HostingMode::CrossShard => self.config.validators_per_shard as usize,
+        }
     }
 
     /// Get network configuration.
