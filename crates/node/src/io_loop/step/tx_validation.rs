@@ -94,37 +94,55 @@ where
         }
     }
 
-    /// Locally-submitted transaction (RPC/sim): enqueue into the per-shard
-    /// outbound gossip accumulators (reads ∪ writes) and queue for
-    /// validation if not already in flight or cached.
-    pub(in crate::io_loop) fn handle_submit_transaction(
-        &mut self,
-        shard: ShardGroupId,
-        tx: Arc<RoutableTransaction>,
-    ) {
+    /// Locally-submitted transaction (RPC/sim): enqueue into outbound
+    /// gossip accumulators for every shard the tx touches, and admit
+    /// locally on every hosted shard the tx touches.
+    ///
+    /// For same-shard hosting the touched-and-hosted set has 0 or 1
+    /// element and this matches the prior behaviour. For cross-shard
+    /// hosting the tx may admit on multiple hosted shards (e.g. a tx
+    /// reading shard A and writing shard B on a host that carries
+    /// vnodes in both). Gossip uses the first hosted shard as the
+    /// "from" for batching — gossipsub dedup handles any incidental
+    /// duplication on the wire.
+    pub(in crate::io_loop) fn handle_submit_transaction(&mut self, tx: &Arc<RoutableTransaction>) {
         let tx_hash = tx.hash();
 
         let num_shards = self.topology_snapshot.load().num_shards();
-        let dst_shards: std::collections::BTreeSet<ShardGroupId> = tx
+        let touched_shards: std::collections::BTreeSet<ShardGroupId> = tx
             .declared_reads()
             .iter()
             .chain(tx.declared_writes().iter())
             .map(|node_id| shard_for_node(node_id, num_shards))
             .collect();
-        for dst in dst_shards {
-            self.enqueue_tx_for_gossip(shard, dst, Arc::clone(&tx));
+
+        // Gossip from an arbitrary hosted shard — the batch accumulator
+        // choice doesn't affect what goes on the wire.
+        let gossip_from = self
+            .hosted_shards()
+            .next()
+            .expect("IoLoop hosts at least one shard");
+        for dst in &touched_shards {
+            self.enqueue_tx_for_gossip(gossip_from, *dst, Arc::clone(tx));
         }
 
-        if !self
-            .shard_io_mut(shard)
-            .pending_validation
-            .contains(&tx_hash)
-            && !self.shard_caches(shard).tx_store.contains(&tx_hash)
-        {
-            // Paired with validation: only queued txs are removed on completion.
-            self.shard_io_mut(shard).locally_submitted.insert(tx_hash);
-            self.shard_io_mut(shard).pending_validation.insert(tx_hash);
-            self.queue_validation(shard, tx);
+        // Admit locally on every hosted shard the tx touches.
+        let hosted_touched: Vec<ShardGroupId> = self
+            .hosted_shards()
+            .filter(|s| touched_shards.contains(s))
+            .collect();
+        for shard in hosted_touched {
+            if !self
+                .shard_io_mut(shard)
+                .pending_validation
+                .contains(&tx_hash)
+                && !self.shard_caches(shard).tx_store.contains(&tx_hash)
+            {
+                // Paired with validation: only queued txs are removed on completion.
+                self.shard_io_mut(shard).locally_submitted.insert(tx_hash);
+                self.shard_io_mut(shard).pending_validation.insert(tx_hash);
+                self.queue_validation(shard, Arc::clone(tx));
+            }
         }
     }
 

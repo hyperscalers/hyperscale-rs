@@ -579,18 +579,6 @@ where
         }
         self.pending_timer_ops.clear();
 
-        // Inbound-callback events (`*FetchFailed`, sync responses,
-        // validation results, gossip arrivals) don't yet carry the
-        // local shard that originated the fetch / subscription. For
-        // single-shard hosting that's a non-issue — there's exactly
-        // one — and we route every such event to the first-hosted
-        // shard's `ShardIo`. Cross-shard hosting that actually
-        // exercises these paths must thread `local_shard` through the
-        // corresponding `NodeInput` variants and their dispatch sites;
-        // the smoke test for V=2 cross-shard construction below does
-        // not drive consensus, so this fallback is safe there.
-        let primary_shard = self.vnodes[0].shard;
-
         match event {
             // ── Transaction validation pipeline ────────────────────────
             NodeInput::TransactionGossipReceived { local_shard, tx } => {
@@ -620,7 +608,7 @@ where
                 other => self.handle_protocol_passthrough(shard, other),
             },
             NodeInput::SubmitTransaction { tx } => {
-                self.handle_submit_transaction(primary_shard, tx);
+                self.handle_submit_transaction(&tx);
             }
 
             // ── Sync protocol ──────────────────────────────────────────
