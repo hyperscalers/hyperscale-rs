@@ -59,8 +59,7 @@ pub struct SharedCaches {
     pub exec_cert_store: Arc<ExecCertStore>,
     /// Per-shard finalized-wave store, shared with every same-shard
     /// `ExecutionCoordinator`. Read by sync-inventory bloom and
-    /// elided-block rehydration so neither has to reach through
-    /// `vnodes[0].state` for shard-scoped data.
+    /// elided-block rehydration.
     pub finalized_wave_store: Arc<FinalizedWaveStore>,
 }
 

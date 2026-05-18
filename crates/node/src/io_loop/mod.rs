@@ -496,10 +496,7 @@ where
         self.now = now;
     }
 
-    /// Current cached wall-clock time. Reads from the `IoLoop`'s own
-    /// cache rather than reaching through `vnodes[0].state.now()` — the
-    /// state machines hold a copy only to make their internal
-    /// timing logic observable through the `StateMachine` trait.
+    /// Current cached wall-clock time.
     pub(super) const fn now(&self) -> LocalTimestamp {
         self.now
     }
