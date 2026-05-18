@@ -38,7 +38,7 @@ use hyperscale_engine::{Engine, RadixExecutor, TransactionValidation};
 use hyperscale_network::Network;
 use hyperscale_storage::{PendingChain, Storage};
 use hyperscale_types::{LocalTimestamp, ShardGroupId, TopologySnapshot, TransactionStatus, TxHash};
-pub use metrics::{MetricsSnapshot, record_metrics};
+pub use metrics::{MetricsSnapshot, ShardMetrics, VnodeMetrics, record_metrics};
 use quick_cache::sync::Cache as QuickCache;
 pub use status::{NodeStatusSnapshot, ShardStatus, VnodeStatus};
 

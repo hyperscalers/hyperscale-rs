@@ -9,6 +9,19 @@
 //!    prometheus `set_*` calls plus the `RocksDB` property queries that
 //!    feed memory metrics. Designed to run off-thread via `spawn_blocking`
 //!    so the I/O loop never blocks on compaction-pressured `RocksDB` reads.
+//!
+//! # Layered snapshot
+//!
+//! The snapshot mirrors the three-layer architecture: per-shard
+//! infrastructure counts in [`ShardMetrics`] (sync / fetch state) and
+//! per-vnode consensus counts in [`VnodeMetrics`] (BFT / mempool state).
+//! The prometheus backend currently uses flat (unlabeled) gauges, so
+//! [`record_metrics`] picks a representative shard + vnode via
+//! [`MetricsSnapshot::primary`] and emits its values. Once the backend
+//! grows `shard=` / `validator_id=` labels, the emitter can iterate the
+//! maps directly with no change to the snapshot shape.
+
+use std::collections::HashMap;
 
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::Engine;
@@ -19,18 +32,32 @@ use hyperscale_metrics::{
 };
 use hyperscale_network::Network;
 use hyperscale_storage::{ChainWriter, Storage};
+use hyperscale_types::{ShardGroupId, ValidatorId};
 
 use crate::io_loop::IoLoop;
 
-/// Lightweight snapshot of `io_loop` state for metrics recording.
-///
-/// All fields are plain integers collected via `.len()` calls on the pinned
-/// thread. The expensive work (`RocksDB` property queries, prometheus recording)
-/// happens off-thread via [`record_metrics`].
-// Field names match the metric/gauge they feed; per-field doc comments would
-// just restate the name.
-#[allow(missing_docs)]
-pub struct MetricsSnapshot {
+/// Per-shard infrastructure counts.
+#[allow(missing_docs)] // fields are flat readouts; names are the documentation
+pub struct ShardMetrics {
+    /// Block-sync FSM lag.
+    pub blocks_behind: u64,
+    pub is_syncing: bool,
+    pub block_sync_round_in_flight: usize,
+    /// Sum across every remote-header sync scope.
+    pub remote_header_blocks_behind: u64,
+    pub remote_header_is_syncing: bool,
+    pub remote_header_round_in_flight: usize,
+    /// Per-payload fetch in-flight counts.
+    pub fetch_transaction: usize,
+    pub fetch_provision: usize,
+    pub fetch_local_provision: usize,
+    pub fetch_exec_cert: usize,
+    pub fetch_finalized_wave: usize,
+}
+
+/// Per-vnode consensus counts.
+#[allow(missing_docs)] // fields are flat readouts; names are the documentation
+pub struct VnodeMetrics {
     pub bft_round: u64,
     pub view_changes: u64,
     pub view_syncs: u64,
@@ -38,48 +65,67 @@ pub struct MetricsSnapshot {
     pub contention_ratio: f64,
     pub in_flight: usize,
     pub backpressure_active: bool,
-    pub blocks_behind: u64,
-    pub is_syncing: bool,
-    /// In-flight range fetches for block-sync.
-    pub block_sync_round_in_flight: usize,
-    /// Sum of `blocks_behind` across every remote-header sync scope.
-    pub remote_header_blocks_behind: u64,
-    /// Any remote-header sync scope is below target.
-    pub remote_header_is_syncing: bool,
-    /// In-flight range fetches across all remote-header sync scopes.
-    pub remote_header_round_in_flight: usize,
-    pub fetch_transaction: usize,
-    pub fetch_provision: usize,
-    pub fetch_local_provision: usize,
-    pub fetch_exec_cert: usize,
-    pub fetch_finalized_wave: usize,
+}
+
+/// Composite metrics snapshot.
+///
+/// Per-shard infrastructure metrics live in `shards`; per-vnode consensus
+/// metrics live in `vnodes`. `memory` is a flat readout populated from a
+/// representative shard + vnode (see [`Self::primary`]) until the
+/// prometheus backend supports per-shard / per-validator labels.
+pub struct MetricsSnapshot {
+    /// Per-hosted-shard infrastructure metrics.
+    pub shards: HashMap<ShardGroupId, ShardMetrics>,
+    /// Per-hosted-vnode consensus metrics.
+    pub vnodes: HashMap<ValidatorId, VnodeMetrics>,
+    /// Flat memory readouts, assembled from primary shard + primary vnode.
     pub memory: MemoryMetrics,
+}
+
+impl MetricsSnapshot {
+    /// Pick a representative `(ShardMetrics, VnodeMetrics)` pair for
+    /// the flat prometheus emitter. Returns `None` if there's nothing
+    /// hosted (shouldn't happen for a running `IoLoop`).
+    #[must_use]
+    pub fn primary(&self) -> Option<(&ShardMetrics, &VnodeMetrics)> {
+        let shard = self.shards.values().next()?;
+        let vnode = self.vnodes.values().next()?;
+        Some((shard, vnode))
+    }
 }
 
 /// Record a [`MetricsSnapshot`] to the metrics backend.
 ///
-/// This performs the prometheus `set_*` calls (76 label lookups) plus
-/// the `RocksDB` property queries for storage memory usage. Designed to
-/// run off the pinned thread via `spawn_blocking`.
+/// This performs the prometheus `set_*` calls plus the `RocksDB` property
+/// queries for storage memory usage. Designed to run off the pinned
+/// thread via `spawn_blocking`.
+///
+/// Today's backend uses flat gauges, so values come from
+/// [`MetricsSnapshot::primary`]. Per-shard / per-validator labels are a
+/// future evolution.
 pub fn record_metrics<S: ChainWriter>(snapshot: MetricsSnapshot, storage: &S) {
-    set_bft_round(snapshot.bft_round);
-    set_view_changes(snapshot.view_changes);
-    set_view_syncs(snapshot.view_syncs);
-    set_mempool_size(snapshot.mempool_size);
-    set_lock_contention(snapshot.contention_ratio);
-    set_in_flight(snapshot.in_flight);
-    set_backpressure_active(snapshot.backpressure_active);
-    set_sync_blocks_behind("block", snapshot.blocks_behind);
-    set_sync_in_progress("block", snapshot.is_syncing);
-    set_sync_round_in_flight("block", snapshot.block_sync_round_in_flight);
-    set_sync_blocks_behind("remote_header", snapshot.remote_header_blocks_behind);
-    set_sync_in_progress("remote_header", snapshot.remote_header_is_syncing);
-    set_sync_round_in_flight("remote_header", snapshot.remote_header_round_in_flight);
-    set_fetch_in_flight("transaction", snapshot.fetch_transaction);
-    set_fetch_in_flight("provision", snapshot.fetch_provision);
-    set_fetch_in_flight("local_provision", snapshot.fetch_local_provision);
-    set_fetch_in_flight("exec_cert", snapshot.fetch_exec_cert);
-    set_fetch_in_flight("finalized_wave", snapshot.fetch_finalized_wave);
+    let Some((shard, vnode)) = snapshot.primary() else {
+        return;
+    };
+
+    set_bft_round(vnode.bft_round);
+    set_view_changes(vnode.view_changes);
+    set_view_syncs(vnode.view_syncs);
+    set_mempool_size(vnode.mempool_size);
+    set_lock_contention(vnode.contention_ratio);
+    set_in_flight(vnode.in_flight);
+    set_backpressure_active(vnode.backpressure_active);
+    set_sync_blocks_behind("block", shard.blocks_behind);
+    set_sync_in_progress("block", shard.is_syncing);
+    set_sync_round_in_flight("block", shard.block_sync_round_in_flight);
+    set_sync_blocks_behind("remote_header", shard.remote_header_blocks_behind);
+    set_sync_in_progress("remote_header", shard.remote_header_is_syncing);
+    set_sync_round_in_flight("remote_header", shard.remote_header_round_in_flight);
+    set_fetch_in_flight("transaction", shard.fetch_transaction);
+    set_fetch_in_flight("provision", shard.fetch_provision);
+    set_fetch_in_flight("local_provision", shard.fetch_local_provision);
+    set_fetch_in_flight("exec_cert", shard.fetch_exec_cert);
+    set_fetch_in_flight("finalized_wave", shard.fetch_finalized_wave);
 
     // RocksDB property queries — potentially slow under compaction pressure.
     let (rocksdb_bc, rocksdb_mt) = storage.memory_usage_bytes();
@@ -108,134 +154,151 @@ where
     #[must_use]
     #[allow(clippy::too_many_lines)] // single aggregation snapshot; cheap reads stitched together
     pub fn metrics_snapshot(&self) -> MetricsSnapshot {
-        // Per-shard prometheus aggregation is a follow-up; the metrics
-        // backend uses flat gauges, so read the first hosted shard's
-        // first vnode as a representative snapshot.
+        let mut shards = HashMap::new();
+        let mut vnodes = HashMap::new();
+
+        for shard in self.hosted_shards() {
+            let fetches = self.shard_fetches(shard).metrics();
+            let syncs = self.shard_syncs(shard);
+            shards.insert(
+                shard,
+                ShardMetrics {
+                    blocks_behind: syncs.block.blocks_behind(),
+                    is_syncing: syncs.block.is_syncing(),
+                    block_sync_round_in_flight: syncs.block.in_flight_ranges(),
+                    remote_header_blocks_behind: syncs.remote_header.total_blocks_behind(),
+                    remote_header_is_syncing: syncs.remote_header.is_syncing(),
+                    remote_header_round_in_flight: syncs.remote_header.in_flight_ranges(),
+                    fetch_transaction: fetches.transaction_in_flight,
+                    fetch_provision: fetches.provision_in_flight,
+                    fetch_local_provision: fetches.local_provision_in_flight,
+                    fetch_exec_cert: fetches.exec_cert_in_flight,
+                    fetch_finalized_wave: fetches.finalized_wave_in_flight,
+                },
+            );
+
+            for vnode_idx in 0..self.vnodes_len(shard) {
+                let vnode = self.vnode(shard, vnode_idx);
+                let state = &vnode.state;
+                let bft_stats = state.bft().stats();
+                let mempool = state.mempool();
+                let contention = mempool.lock_contention_stats();
+                vnodes.insert(
+                    vnode.validator_id,
+                    VnodeMetrics {
+                        bft_round: bft_stats.current_round,
+                        view_changes: bft_stats.view_changes,
+                        view_syncs: bft_stats.view_syncs,
+                        mempool_size: mempool.len(),
+                        contention_ratio: contention.contention_ratio(),
+                        in_flight: mempool.in_flight(),
+                        backpressure_active: mempool.at_in_flight_limit(),
+                    },
+                );
+            }
+        }
+
+        // Memory readouts: until the prometheus backend supports per-shard /
+        // per-validator labels, populate the flat struct from a primary
+        // shard + vnode. The iteration order matches the maps above so the
+        // "primary" picked here aligns with `MetricsSnapshot::primary`.
         let primary_shard = self
             .hosted_shards()
             .next()
             .expect("IoLoop hosts at least one shard");
-        let state = &self.vnode(primary_shard, 0).state;
-        let bft_stats = state.bft().stats();
-        let mempool = state.mempool();
-        let contention = mempool.lock_contention_stats();
+        let primary_vnode = &self.vnode(primary_shard, 0).state;
+        let bft_mem = primary_vnode.bft().memory_stats();
+        let exec_mem = primary_vnode.execution().memory_stats();
+        let mempool_mem = primary_vnode.mempool().memory_stats();
+        let prov_mem = primary_vnode.provisions().memory_stats();
+        let rh_mem = primary_vnode.remote_headers().memory_stats();
         let fetches = self.shard_fetches(primary_shard).metrics();
-        let syncs = self.shard_syncs(primary_shard).metrics();
-        let block_sync_status = &syncs.block_sync_status;
+        let block_sync_status = self.shard_syncs(primary_shard).block.block_sync_status();
 
-        let bft_mem = state.bft().memory_stats();
-        let exec_mem = state.execution().memory_stats();
-        let mempool_mem = state.mempool().memory_stats();
-        let prov_mem = state.provisions().memory_stats();
-        let rh_mem = state.remote_headers().memory_stats();
-
-        MetricsSnapshot {
-            bft_round: bft_stats.current_round,
-            view_changes: bft_stats.view_changes,
-            view_syncs: bft_stats.view_syncs,
-            mempool_size: mempool.len(),
-            contention_ratio: contention.contention_ratio(),
-            in_flight: mempool.in_flight(),
-            backpressure_active: mempool.at_in_flight_limit(),
-            blocks_behind: self.shard_syncs(primary_shard).block.blocks_behind(),
-            is_syncing: self.shard_syncs(primary_shard).block.is_syncing(),
-            block_sync_round_in_flight: self.shard_syncs(primary_shard).block.in_flight_ranges(),
-            remote_header_blocks_behind: self
-                .shard_syncs(primary_shard)
-                .remote_header
-                .total_blocks_behind(),
-            remote_header_is_syncing: self.shard_syncs(primary_shard).remote_header.is_syncing(),
-            remote_header_round_in_flight: self
+        let memory = MemoryMetrics {
+            // BFT
+            bft_pending_blocks: bft_mem.pending_blocks,
+            bft_vote_sets: bft_mem.vote_sets,
+            bft_pending_commits: bft_mem.pending_commits,
+            bft_pending_commits_awaiting_data: bft_mem.pending_commits_awaiting_data,
+            bft_voted_heights: bft_mem.voted_heights,
+            bft_received_votes_by_height: bft_mem.received_votes_by_height,
+            bft_committed_tx_lookup: bft_mem.committed_tx_lookup,
+            bft_committed_cert_lookup: bft_mem.committed_cert_lookup,
+            bft_committed_provision_lookup: bft_mem.committed_provision_lookup,
+            bft_pending_qc_verifications: bft_mem.pending_qc_verifications,
+            bft_verified_qcs: bft_mem.verified_qcs,
+            bft_pending_state_root_verifications: bft_mem.pending_state_root_verifications,
+            bft_buffered_synced_blocks: bft_mem.buffered_synced_blocks,
+            bft_pending_synced_block_verifications: bft_mem.pending_synced_block_verifications,
+            // Execution
+            exec_cache_entries: exec_mem.wave_execution_receipts,
+            exec_finalized_wave_certificates: exec_mem.finalized_wave_certificates,
+            exec_waves: exec_mem.waves,
+            exec_vote_trackers: exec_mem.vote_trackers,
+            exec_early_votes: exec_mem.early_votes,
+            exec_expected_exec_certs: exec_mem.expected_exec_certs,
+            exec_verified_provisions: exec_mem.verified_provisions,
+            exec_required_provision_shards: exec_mem.required_provision_shards,
+            exec_received_provision_shards: exec_mem.received_provision_shards,
+            exec_waves_with_ec: exec_mem.waves_with_ec,
+            exec_pending_vote_retries: exec_mem.pending_vote_retries,
+            exec_wave_assignments: exec_mem.wave_assignments,
+            exec_early_wave_attestations: exec_mem.early_wave_attestations,
+            exec_pending_routing: exec_mem.pending_routing,
+            exec_fulfilled_exec_certs: exec_mem.fulfilled_exec_certs,
+            exec_outbound_certs: exec_mem.outbound_certs,
+            // Mempool
+            mempool_pool: mempool_mem.pool,
+            mempool_ready: mempool_mem.ready,
+            mempool_tombstones: mempool_mem.tombstones,
+            mempool_locked_nodes: mempool_mem.locked_nodes,
+            mempool_deferred_by_nodes: mempool_mem.deferred_by_nodes,
+            mempool_txs_deferred_by_node: mempool_mem.txs_deferred_by_node,
+            mempool_ready_txs_by_node: mempool_mem.ready_txs_by_node,
+            // Remote Headers
+            rh_pending_headers: rh_mem.pending_headers,
+            rh_verified_headers: rh_mem.verified_headers,
+            rh_expected_headers: rh_mem.expected_headers,
+            // Provision
+            prov_verified_remote_headers: prov_mem.verified_remote_headers,
+            prov_pending_provisions: prov_mem.pending_provisions,
+            prov_verified_provisions: prov_mem.verified_provisions,
+            prov_expected_provisions: prov_mem.expected_provisions,
+            prov_provisions_by_hash: prov_mem.provisions_by_hash,
+            prov_queued_provisions: prov_mem.queued_provisions,
+            // Node (io_loop, per-shard)
+            node_tx_store: self.shard_caches(primary_shard).tx_store.len(),
+            node_tx_status_cache: self.shard_caches(primary_shard).tx_status.len(),
+            node_finalized_wave_cache: self.shard_caches(primary_shard).finalized_wave.len(),
+            node_provision_cache: self.shard_caches(primary_shard).provision_store.len(),
+            node_exec_cert_cache: self.shard_caches(primary_shard).exec_cert_store.len(),
+            node_prepared_commits: self.shard_block_commit(primary_shard).prepared_len(),
+            node_pending_validation: self.shard_io(primary_shard).pending_validation.len(),
+            node_locally_submitted: self.shard_io(primary_shard).locally_submitted.len(),
+            node_pending_block_commits: self.shard_block_commit(primary_shard).pending_len(),
+            node_validation_batch: self.shard_io(primary_shard).validation_batch.len(),
+            node_committed_header_batch: self.shard_io(primary_shard).committed_header_batch.len(),
+            node_block_sync_queued_heights: block_sync_status.queued_heights,
+            node_block_sync_in_flight_fetches: block_sync_status.pending_fetches,
+            node_tx_fetch_blocks: fetches.transaction_pending,
+            node_local_provision_fetch_pending: fetches.local_provision_pending,
+            node_finalized_wave_fetch_pending: fetches.finalized_wave_pending,
+            node_provision_fetch_pending: fetches.provision_pending,
+            node_exec_cert_fetch_pending: fetches.exec_cert_pending,
+            node_remote_header_fetch_pending: self
                 .shard_syncs(primary_shard)
                 .remote_header
                 .in_flight_ranges(),
-            fetch_transaction: fetches.transaction_in_flight,
-            fetch_provision: fetches.provision_in_flight,
-            fetch_local_provision: fetches.local_provision_in_flight,
-            fetch_exec_cert: fetches.exec_cert_in_flight,
-            fetch_finalized_wave: fetches.finalized_wave_in_flight,
-            memory: MemoryMetrics {
-                // BFT
-                bft_pending_blocks: bft_mem.pending_blocks,
-                bft_vote_sets: bft_mem.vote_sets,
-                bft_pending_commits: bft_mem.pending_commits,
-                bft_pending_commits_awaiting_data: bft_mem.pending_commits_awaiting_data,
-                bft_voted_heights: bft_mem.voted_heights,
-                bft_received_votes_by_height: bft_mem.received_votes_by_height,
-                bft_committed_tx_lookup: bft_mem.committed_tx_lookup,
-                bft_committed_cert_lookup: bft_mem.committed_cert_lookup,
-                bft_committed_provision_lookup: bft_mem.committed_provision_lookup,
-                bft_pending_qc_verifications: bft_mem.pending_qc_verifications,
-                bft_verified_qcs: bft_mem.verified_qcs,
-                bft_pending_state_root_verifications: bft_mem.pending_state_root_verifications,
-                bft_buffered_synced_blocks: bft_mem.buffered_synced_blocks,
-                bft_pending_synced_block_verifications: bft_mem.pending_synced_block_verifications,
-                // Execution
-                exec_cache_entries: exec_mem.wave_execution_receipts,
-                exec_finalized_wave_certificates: exec_mem.finalized_wave_certificates,
-                exec_waves: exec_mem.waves,
-                exec_vote_trackers: exec_mem.vote_trackers,
-                exec_early_votes: exec_mem.early_votes,
-                exec_expected_exec_certs: exec_mem.expected_exec_certs,
-                exec_verified_provisions: exec_mem.verified_provisions,
-                exec_required_provision_shards: exec_mem.required_provision_shards,
-                exec_received_provision_shards: exec_mem.received_provision_shards,
-                exec_waves_with_ec: exec_mem.waves_with_ec,
-                exec_pending_vote_retries: exec_mem.pending_vote_retries,
-                exec_wave_assignments: exec_mem.wave_assignments,
-                exec_early_wave_attestations: exec_mem.early_wave_attestations,
-                exec_pending_routing: exec_mem.pending_routing,
-                exec_fulfilled_exec_certs: exec_mem.fulfilled_exec_certs,
-                exec_outbound_certs: exec_mem.outbound_certs,
-                // Mempool
-                mempool_pool: mempool_mem.pool,
-                mempool_ready: mempool_mem.ready,
-                mempool_tombstones: mempool_mem.tombstones,
-                mempool_locked_nodes: mempool_mem.locked_nodes,
-                mempool_deferred_by_nodes: mempool_mem.deferred_by_nodes,
-                mempool_txs_deferred_by_node: mempool_mem.txs_deferred_by_node,
-                mempool_ready_txs_by_node: mempool_mem.ready_txs_by_node,
-                // Remote Headers
-                rh_pending_headers: rh_mem.pending_headers,
-                rh_verified_headers: rh_mem.verified_headers,
-                rh_expected_headers: rh_mem.expected_headers,
-                // Provision
-                prov_verified_remote_headers: prov_mem.verified_remote_headers,
-                prov_pending_provisions: prov_mem.pending_provisions,
-                prov_verified_provisions: prov_mem.verified_provisions,
-                prov_expected_provisions: prov_mem.expected_provisions,
-                prov_provisions_by_hash: prov_mem.provisions_by_hash,
-                prov_queued_provisions: prov_mem.queued_provisions,
-                // Node (io_loop)
-                node_tx_store: self.shard_caches(primary_shard).tx_store.len(),
-                node_tx_status_cache: self.shard_caches(primary_shard).tx_status.len(),
-                node_finalized_wave_cache: self.shard_caches(primary_shard).finalized_wave.len(),
-                node_provision_cache: self.shard_caches(primary_shard).provision_store.len(),
-                node_exec_cert_cache: self.shard_caches(primary_shard).exec_cert_store.len(),
-                node_prepared_commits: self.shard_block_commit(primary_shard).prepared_len(),
-                node_pending_validation: self.shard_io(primary_shard).pending_validation.len(),
-                node_locally_submitted: self.shard_io(primary_shard).locally_submitted.len(),
-                node_pending_block_commits: self.shard_block_commit(primary_shard).pending_len(),
-                node_validation_batch: self.shard_io(primary_shard).validation_batch.len(),
-                node_committed_header_batch: self
-                    .shard_io(primary_shard)
-                    .committed_header_batch
-                    .len(),
-                node_block_sync_queued_heights: block_sync_status.queued_heights,
-                node_block_sync_in_flight_fetches: block_sync_status.pending_fetches,
-                node_tx_fetch_blocks: fetches.transaction_pending,
-                node_local_provision_fetch_pending: fetches.local_provision_pending,
-                node_finalized_wave_fetch_pending: fetches.finalized_wave_pending,
-                node_provision_fetch_pending: fetches.provision_pending,
-                node_exec_cert_fetch_pending: fetches.exec_cert_pending,
-                node_remote_header_fetch_pending: self
-                    .shard_syncs(primary_shard)
-                    .remote_header
-                    .in_flight_ranges(),
-                // Storage — filled in by record_metrics off-thread.
-                rocksdb_block_cache_usage_bytes: 0,
-                rocksdb_memtable_usage_bytes: 0,
-            },
+            // Storage — filled in by record_metrics off-thread.
+            rocksdb_block_cache_usage_bytes: 0,
+            rocksdb_memtable_usage_bytes: 0,
+        };
+
+        MetricsSnapshot {
+            shards,
+            vnodes,
+            memory,
         }
     }
 }
