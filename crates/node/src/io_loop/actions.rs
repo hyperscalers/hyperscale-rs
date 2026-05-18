@@ -92,18 +92,14 @@ where
 
             // ─── io_loop-internal effects ──────────────────────────────────
             Action::SetTimer { id, duration } => {
-                self.vnode_mut(shard, vnode_idx)
-                    .pending_timer_ops
-                    .push(TimerOp::Set {
-                        shard,
-                        id,
-                        duration,
-                    });
+                self.pending_timer_ops.push(TimerOp::Set {
+                    shard,
+                    id,
+                    duration,
+                });
             }
             Action::CancelTimer { id } => {
-                self.vnode_mut(shard, vnode_idx)
-                    .pending_timer_ops
-                    .push(TimerOp::Cancel { shard, id });
+                self.pending_timer_ops.push(TimerOp::Cancel { shard, id });
             }
             Action::Continuation(pe) => self.handle_continuation(shard, pe),
             Action::RestoreCommittedState => self.handle_restore_committed_state(shard),
@@ -142,7 +138,6 @@ where
             } => {
                 self.handle_emit_transaction_status(
                     shard,
-                    vnode_idx,
                     tx_hash,
                     status,
                     cross_shard,
@@ -208,7 +203,6 @@ where
     fn handle_emit_transaction_status(
         &mut self,
         shard: ShardGroupId,
-        vnode_idx: usize,
         tx_hash: TxHash,
         status: TransactionStatus,
         cross_shard: bool,
@@ -243,9 +237,7 @@ where
         self.shard_caches(shard)
             .tx_status
             .insert(tx_hash, status.clone());
-        self.vnode_mut(shard, vnode_idx)
-            .emitted_statuses
-            .push((tx_hash, status));
+        self.emitted_statuses.push((tx_hash, status));
     }
 
     fn handle_topology_changed(&self, topology: &Arc<TopologySnapshot>) {
@@ -430,10 +422,7 @@ where
                         Arc::unwrap_or_clone(block),
                         Arc::unwrap_or_clone(qc),
                     ));
-                    self.feed_event_to_shard_vnodes(
-                        shard,
-                        ProtocolEvent::BlockCommitted { certified },
-                    );
+                    self.dispatch_event(shard, ProtocolEvent::BlockCommitted { certified });
                 }
             }
         }

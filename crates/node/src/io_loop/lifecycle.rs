@@ -4,8 +4,9 @@
 //! These methods run at well-defined points in the host's life, not
 //! on every event. The run-loop methods live in [`super`].
 //!
-//! - [`IoLoop::handle_actions`] drains the action vec returned by
-//!   `NodeStateMachine::initialize_genesis` (initial timer sets, etc.).
+//! - [`IoLoop::initialize_all_vnodes_genesis`] feeds the supplied
+//!   genesis block into every vnode of its shard and drains the
+//!   resulting actions via the common [`IoLoop::drain_actions`] path.
 //! - [`IoLoop::install_engine_genesis`] commits the genesis substates +
 //!   computes the genesis state root. Only runs on a fresh node.
 //! - [`IoLoop::register_inbound_handlers`] wires the request / gossip /
@@ -13,7 +14,6 @@
 //!   before the I/O loop starts processing events; reached by both
 //!   genesis and resume paths.
 
-use hyperscale_core::Action;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{Engine, GenesisConfig, prepared_genesis};
 use hyperscale_network::Network;
@@ -29,17 +29,6 @@ where
     D: Dispatch,
     E: Engine,
 {
-    /// Process actions emitted by a single vnode's genesis init.
-    ///
-    /// Called by [`Self::initialize_all_vnodes_genesis`] for every vnode
-    /// in the shard whose genesis block was just installed.
-    pub fn handle_actions(&mut self, shard: ShardGroupId, vnode_idx: usize, actions: Vec<Action>) {
-        for action in actions {
-            self.process_action(shard, vnode_idx, action);
-        }
-        self.flush_block_commits(shard);
-    }
-
     /// Initialize every hosted vnode's state machine with `genesis_block`
     /// and dispatch the resulting actions per-vnode.
     ///
@@ -54,7 +43,7 @@ where
             let actions = self
                 .vnode_state_mut(shard, vnode_idx)
                 .initialize_genesis(genesis_block);
-            self.handle_actions(shard, vnode_idx, actions);
+            self.drain_actions(shard, vnode_idx, actions);
         }
     }
 

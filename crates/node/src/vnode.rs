@@ -7,17 +7,17 @@
 //! no denormalized field.
 //!
 //! Per-step scratch (emitted statuses, action counter, timer ops)
-//! lives on the `Vnode` so each step's outputs are bound to a specific
-//! validator.
+//! lives on the `IoLoop`, not here — those buffers are step-local
+//! and carry the emitting vnode's `(shard, idx)` via the existing
+//! action-dispatch threading.
 //!
 //! [`ShardGroup`]: crate::io_loop::ShardGroup
 
 use std::sync::Arc;
 
-use hyperscale_types::{Bls12381G1PrivateKey, TransactionStatus, TxHash, ValidatorId};
+use hyperscale_types::{Bls12381G1PrivateKey, ValidatorId};
 
 use crate::NodeStateMachine;
-use crate::io_loop::TimerOp;
 
 /// Caller-supplied bundle for constructing one [`Vnode`]. The
 /// `IoLoop` constructor wraps each entry into a full [`Vnode`] and
@@ -46,22 +46,4 @@ pub struct Vnode {
     /// `DispatchHandles` via `Arc` so delegated handlers running on
     /// thread pools can sign without re-entering the pinned thread.
     pub signing_key: Arc<Bls12381G1PrivateKey>,
-
-    /// Per-step buffer of `(tx_hash, status)` pairs emitted via
-    /// `Action::EmitTransactionStatus`. Drained into `StepOutput` at
-    /// the end of each `step()` for the runner to forward to RPC
-    /// subscribers.
-    pub emitted_statuses: Vec<(TxHash, TransactionStatus)>,
-
-    /// Per-step counter of actions produced by the state machine.
-    /// Drained into `StepOutput` for the runner's metrics; reset by
-    /// `step()` (and cleared mid-step by handlers that synthesize
-    /// follow-up events).
-    pub actions_generated: usize,
-
-    /// Per-step buffer of timer set/cancel operations. The runner is
-    /// responsible for translating these into actual timer-driver
-    /// calls since timer firing is inherently runner-specific
-    /// (wall-clock in production, logical-clock in simulation).
-    pub pending_timer_ops: Vec<TimerOp>,
 }

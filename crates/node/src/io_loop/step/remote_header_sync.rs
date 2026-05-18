@@ -104,7 +104,7 @@ where
             delivered_heights.push(h);
             // The `sender` field carries no meaning for fetched headers —
             // a sentinel value avoids confusion with real validator ids.
-            self.feed_event_to_shard_vnodes(
+            self.dispatch_event(
                 local_shard,
                 ProtocolEvent::RemoteHeaderReceived {
                     committed_header: Arc::new(header),
@@ -218,7 +218,7 @@ where
                         height = height.inner(),
                         "remote-header sync caught up"
                     );
-                    self.feed_event_to_shard_vnodes(
+                    self.dispatch_event(
                         local_shard,
                         ProtocolEvent::RemoteHeaderSyncComplete {
                             source_shard,
