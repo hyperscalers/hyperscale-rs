@@ -73,8 +73,15 @@ pub trait FetchBinding: 'static {
     /// down to `Network::request` as the per-call class override. For
     /// [`PER_ID`](Self::PER_ID) bindings the dispatcher pre-splits into
     /// single-element chunks before calling this.
+    ///
+    /// `local_shard` is the hosted shard whose `FetchHost` produced this
+    /// request — it's threaded into the response callback so the resulting
+    /// `NodeInput::Protocol` and `*FetchFailed` events route to the right
+    /// hosted shard under cross-shard hosting (distinct from `shard`,
+    /// which selects the *target* committee).
     fn dispatch_chunk<N: Network>(
         ids: Vec<Self::Id>,
+        local_shard: ShardGroupId,
         shard: ShardGroupId,
         preferred: Option<ValidatorId>,
         origin: FetchOrigin,
@@ -149,6 +156,7 @@ impl FetchBinding for TransactionBinding {
 
     fn dispatch_chunk<N: Network>(
         ids: Vec<TxHash>,
+        local_shard: ShardGroupId,
         shard: ShardGroupId,
         preferred: Option<ValidatorId>,
         origin: FetchOrigin,
@@ -166,11 +174,12 @@ impl FetchBinding for TransactionBinding {
                 if let Ok(resp) = result {
                     let split = partition_solicited(resp.into_transactions(), &hs, |tx| tx.hash());
                     if !split.kept.is_empty() {
-                        let _ = es.send(NodeInput::Protocol(Box::new(
+                        let _ = es.send(NodeInput::protocol(
+                            local_shard,
                             ProtocolEvent::TransactionsReceived {
                                 transactions: split.kept,
                             },
-                        )));
+                        ));
                     }
                     if !split.missing.is_empty() {
                         let _ = es.send(NodeInput::TransactionsFetchFailed {
@@ -208,6 +217,7 @@ impl FetchBinding for LocalProvisionBinding {
 
     fn dispatch_chunk<N: Network>(
         ids: Vec<ProvisionHash>,
+        local_shard: ShardGroupId,
         shard: ShardGroupId,
         preferred: Option<ValidatorId>,
         origin: FetchOrigin,
@@ -226,9 +236,10 @@ impl FetchBinding for LocalProvisionBinding {
                     let split =
                         partition_solicited(resp.provisions.into_inner(), &hs, |p| p.hash());
                     for provisions in split.kept {
-                        let _ = es.send(NodeInput::Protocol(Box::new(
+                        let _ = es.send(NodeInput::protocol(
+                            local_shard,
                             ProtocolEvent::ProvisionsReceived { provisions },
-                        )));
+                        ));
                     }
                     let had_misses = !split.missing.is_empty();
                     if had_misses {
@@ -266,6 +277,7 @@ impl FetchBinding for FinalizedWaveBinding {
 
     fn dispatch_chunk<N: Network>(
         ids: Vec<WaveId>,
+        local_shard: ShardGroupId,
         shard: ShardGroupId,
         preferred: Option<ValidatorId>,
         origin: FetchOrigin,
@@ -285,9 +297,10 @@ impl FetchBinding for FinalizedWaveBinding {
                         w.wave_id().clone()
                     });
                     if !split.kept.is_empty() {
-                        let _ = es.send(NodeInput::Protocol(Box::new(
+                        let _ = es.send(NodeInput::protocol(
+                            local_shard,
                             ProtocolEvent::FinalizedWavesReceived { waves: split.kept },
-                        )));
+                        ));
                     }
                     let had_misses = !split.missing.is_empty();
                     if had_misses {
@@ -325,6 +338,7 @@ impl FetchBinding for ExecCertBinding {
 
     fn dispatch_chunk<N: Network>(
         ids: Vec<WaveId>,
+        local_shard: ShardGroupId,
         shard: ShardGroupId,
         preferred: Option<ValidatorId>,
         origin: FetchOrigin,
@@ -347,9 +361,10 @@ impl FetchBinding for ExecCertBinding {
                         // Refcount is 1 right after decode, so each unwrap moves.
                         let certificates =
                             split.kept.into_iter().map(Arc::unwrap_or_clone).collect();
-                        let _ = es.send(NodeInput::Protocol(Box::new(
+                        let _ = es.send(NodeInput::protocol(
+                            local_shard,
                             ProtocolEvent::ExecutionCertificatesReceived { certificates },
-                        )));
+                        ));
                     }
                     if had_misses {
                         let _ = es.send(NodeInput::ExecCertFetchFailed {
@@ -391,6 +406,7 @@ impl FetchBinding for ProvisionBinding {
 
     fn dispatch_chunk<N: Network>(
         ids: Vec<(ShardGroupId, ShardGroupId, BlockHeight)>,
+        local_shard: ShardGroupId,
         shard: ShardGroupId,
         preferred: Option<ValidatorId>,
         origin: FetchOrigin,
@@ -462,9 +478,10 @@ impl FetchBinding for ProvisionBinding {
                     });
                     return ResponseVerdict::Reject;
                 }
-                let _ = es.send(NodeInput::Protocol(Box::new(
+                let _ = es.send(NodeInput::protocol(
+                    local_shard,
                     ProtocolEvent::ProvisionsReceived { provisions },
-                )));
+                ));
                 ResponseVerdict::Accept
             }),
         );

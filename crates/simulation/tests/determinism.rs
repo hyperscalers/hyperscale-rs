@@ -10,7 +10,9 @@ use std::time::Duration;
 use hyperscale_core::{NodeInput, ProtocolEvent};
 use hyperscale_network_memory::NetworkConfig;
 use hyperscale_simulation::SimulationRunner;
-use hyperscale_types::{BlockHeight, LocalTimestamp, QuorumCertificate, Round, TransactionStatus};
+use hyperscale_types::{
+    BlockHeight, LocalTimestamp, QuorumCertificate, Round, ShardGroupId, TransactionStatus,
+};
 use tracing_test::traced_test;
 
 /// Create a basic network configuration for testing.
@@ -50,7 +52,7 @@ fn test_schedule_initial_events() {
         runner.schedule_initial_event(
             node,
             Duration::from_millis(100),
-            NodeInput::Protocol(Box::new(ProtocolEvent::CleanupTimer)),
+            NodeInput::protocol(ShardGroupId::new(0), ProtocolEvent::CleanupTimer),
         );
     }
 
@@ -77,7 +79,7 @@ fn test_determinism_same_seed() {
         runner1.schedule_initial_event(
             node,
             Duration::from_millis(100),
-            NodeInput::Protocol(Box::new(ProtocolEvent::CleanupTimer)),
+            NodeInput::protocol(ShardGroupId::new(0), ProtocolEvent::CleanupTimer),
         );
     }
     runner1.run_until(Duration::from_secs(1));
@@ -89,7 +91,7 @@ fn test_determinism_same_seed() {
         runner2.schedule_initial_event(
             node,
             Duration::from_millis(100),
-            NodeInput::Protocol(Box::new(ProtocolEvent::CleanupTimer)),
+            NodeInput::protocol(ShardGroupId::new(0), ProtocolEvent::CleanupTimer),
         );
     }
     runner2.run_until(Duration::from_secs(1));
@@ -125,7 +127,7 @@ fn test_different_seeds_diverge() {
         runner1.schedule_initial_event(
             node,
             Duration::from_millis(100),
-            NodeInput::Protocol(Box::new(ProtocolEvent::CleanupTimer)),
+            NodeInput::protocol(ShardGroupId::new(0), ProtocolEvent::CleanupTimer),
         );
     }
     runner1.run_until(Duration::from_secs(1));
@@ -136,7 +138,7 @@ fn test_different_seeds_diverge() {
         runner2.schedule_initial_event(
             node,
             Duration::from_millis(100),
-            NodeInput::Protocol(Box::new(ProtocolEvent::CleanupTimer)),
+            NodeInput::protocol(ShardGroupId::new(0), ProtocolEvent::CleanupTimer),
         );
     }
     runner2.run_until(Duration::from_secs(1));
@@ -173,7 +175,7 @@ fn test_multi_shard_simulation() {
         runner.schedule_initial_event(
             node,
             Duration::from_millis(100),
-            NodeInput::Protocol(Box::new(ProtocolEvent::CleanupTimer)),
+            NodeInput::protocol(ShardGroupId::new(0), ProtocolEvent::CleanupTimer),
         );
     }
 
@@ -200,7 +202,7 @@ fn test_round_advancement_via_view_change_timer() {
         runner.schedule_initial_event(
             node,
             Duration::from_millis(100),
-            NodeInput::Protocol(Box::new(ProtocolEvent::CleanupTimer)),
+            NodeInput::protocol(ShardGroupId::new(0), ProtocolEvent::CleanupTimer),
         );
     }
 
@@ -253,7 +255,7 @@ fn test_extended_simulation_determinism() {
         runner1.schedule_initial_event(
             node,
             Duration::from_millis(100),
-            NodeInput::Protocol(Box::new(ProtocolEvent::CleanupTimer)),
+            NodeInput::protocol(ShardGroupId::new(0), ProtocolEvent::CleanupTimer),
         );
     }
     runner1.run_until(Duration::from_secs(5));
@@ -265,7 +267,7 @@ fn test_extended_simulation_determinism() {
         runner2.schedule_initial_event(
             node,
             Duration::from_millis(100),
-            NodeInput::Protocol(Box::new(ProtocolEvent::CleanupTimer)),
+            NodeInput::protocol(ShardGroupId::new(0), ProtocolEvent::CleanupTimer),
         );
     }
     runner2.run_until(Duration::from_secs(5));

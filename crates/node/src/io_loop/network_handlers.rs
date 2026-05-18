@@ -18,7 +18,7 @@ use hyperscale_types::network::response::{
     GetExecutionCertsResponse, GetFinalizedWavesResponse, GetLocalProvisionsResponse,
     GetProvisionResponse,
 };
-use hyperscale_types::{ExecutionCertificate, FinalizedWave, WaveId};
+use hyperscale_types::{ExecutionCertificate, FinalizedWave, ShardGroupId, WaveId};
 use tracing::warn;
 
 use super::IoLoop;
@@ -429,15 +429,37 @@ where
     /// to known committee members.
     #[allow(clippy::too_many_lines)] // single registration table; one closure per notification type
     pub(super) fn register_notification_handlers(&self) {
+        // Hosted-shard set snapshotted at registration. Phase 5's
+        // `add_vnode` will need to refresh this when a new shard is
+        // hosted at runtime; today registration runs once at startup
+        // after every initial vnode is in place.
+        let hosted_shards: std::sync::Arc<std::collections::HashSet<ShardGroupId>> =
+            std::sync::Arc::new(self.hosted_shards().collect());
+
         // ── block.vote → ProtocolEvent::BlockVoteReceived ────────────
+        //
+        // `BlockVote.shard_group_id()` is the shard whose consensus the
+        // vote is for; with cross-shard hosting that selects which of
+        // this host's vnodes the event fans out to. Drop early if the
+        // vote targets a shard we don't host.
 
         let tx = self.event_sender.clone();
+        let shards = std::sync::Arc::clone(&hosted_shards);
         self.network
             .register_notification_handler::<BlockVoteNotification>(
                 move |gossip: BlockVoteNotification| {
-                    let _ = tx.send(NodeInput::Protocol(Box::new(
+                    let shard = gossip.vote.shard_group_id();
+                    if !shards.contains(&shard) {
+                        warn!(
+                            target_shard = shard.inner(),
+                            "Dropping block vote: shard not hosted"
+                        );
+                        return;
+                    }
+                    let _ = tx.send(NodeInput::protocol(
+                        shard,
                         ProtocolEvent::BlockVoteReceived { vote: gossip.vote },
-                    )));
+                    ));
                 },
             );
 
@@ -445,9 +467,18 @@ where
 
         let tx = self.event_sender.clone();
         let topology = self.topology_snapshot.clone();
+        let shards = std::sync::Arc::clone(&hosted_shards);
         self.network
             .register_notification_handler::<BlockHeaderNotification>(
                 move |gossip: BlockHeaderNotification| {
+                    let shard = gossip.header.shard_group_id();
+                    if !shards.contains(&shard) {
+                        warn!(
+                            target_shard = shard.inner(),
+                            "Dropping block header: shard not hosted"
+                        );
+                        return;
+                    }
                     let topo = topology.load();
                     let proposer = gossip.header.proposer();
                     let Some(public_key) = topo.public_key(proposer) else {
@@ -473,9 +504,10 @@ where
                         return;
                     }
                     let (header, manifest, _sig) = gossip.into_parts();
-                    let _ = tx.send(NodeInput::Protocol(Box::new(
+                    let _ = tx.send(NodeInput::protocol(
+                        shard,
                         ProtocolEvent::BlockHeaderReceived { header, manifest },
-                    )));
+                    ));
                 },
             );
 
@@ -483,23 +515,23 @@ where
 
         let tx = self.event_sender.clone();
         let topology = self.topology_snapshot.clone();
+        let shards = std::sync::Arc::clone(&hosted_shards);
         self.network
             .register_notification_handler::<ProvisionsNotification>(
                 move |notification: ProvisionsNotification| {
-                    let topo = topology.load();
-
-                    // Drop provisions not destined for our shard before paying
-                    // the BLS verification cost. Catches misroutes and spam early.
-                    if notification.provisions.target_shard() != topo.local_shard() {
+                    let target_shard = notification.provisions.target_shard();
+                    // Drop provisions not destined for any hosted shard before
+                    // paying the BLS verification cost.
+                    if !shards.contains(&target_shard) {
                         warn!(
                             source_shard = notification.provisions.source_shard().inner(),
-                            target_shard = notification.provisions.target_shard().inner(),
-                            local_shard = topo.local_shard().inner(),
-                            "Dropping provisions notification: target_shard mismatch"
+                            target_shard = target_shard.inner(),
+                            "Dropping provisions notification: target_shard not hosted"
                         );
                         return;
                     }
 
+                    let topo = topology.load();
                     let sender = notification.sender;
                     let source_shard = notification.provisions.source_shard();
                     let msg = notification.signing_message();
@@ -515,11 +547,12 @@ where
                         return;
                     }
 
-                    let _ = tx.send(NodeInput::Protocol(Box::new(
+                    let _ = tx.send(NodeInput::protocol(
+                        target_shard,
                         ProtocolEvent::ProvisionsReceived {
                             provisions: notification.provisions,
                         },
-                    )));
+                    ));
                 },
             );
 
@@ -527,6 +560,7 @@ where
 
         let tx = self.event_sender.clone();
         let topology = self.topology_snapshot.clone();
+        let shards = std::sync::Arc::clone(&hosted_shards);
         self.network
             .register_notification_handler::<ExecutionVotesNotification>(
                 move |batch: ExecutionVotesNotification| {
@@ -534,14 +568,26 @@ where
                         return;
                     }
 
+                    // Votes in a batch all carry the same shard (sender's
+                    // local shard) by construction. Use the first vote's
+                    // shard to identify the target hosted shard and gate
+                    // before paying the BLS verification cost.
+                    let target_shard = batch.votes[0].shard_group_id();
+                    if !shards.contains(&target_shard) {
+                        warn!(
+                            target_shard = target_shard.inner(),
+                            "Dropping execution vote batch: shard not hosted"
+                        );
+                        return;
+                    }
+
                     let topo = topology.load();
-                    let local_shard = topo.local_shard();
                     let sender = batch.sender;
-                    let msg = batch.signing_message(local_shard);
+                    let msg = batch.signing_message(target_shard);
                     if !verify_sender_signature(
                         &topo,
                         sender,
-                        local_shard,
+                        target_shard,
                         &msg,
                         &batch.sender_signature,
                         "exec_vote_batch",
@@ -551,17 +597,26 @@ where
                     }
 
                     for vote in batch.into_votes() {
-                        let _ = tx.send(NodeInput::Protocol(Box::new(
+                        let _ = tx.send(NodeInput::protocol(
+                            target_shard,
                             ProtocolEvent::ExecutionVoteReceived { vote },
-                        )));
+                        ));
                     }
                 },
             );
 
         // ── execution.cert.batch → verify sender sig, then ProtocolEvent::ExecutionCertificatesReceived ─
+        //
+        // The cert's `shard_group_id` is the *source* shard (sender's
+        // shard). With cross-shard hosting we may consume an EC for any
+        // of our hosted shards as the destination, so the relevant
+        // "target hosted shard" is determined later by the state machine.
+        // For routing purposes we forward to every hosted shard so
+        // each receiving coordinator can decide whether the cert is for it.
 
         let tx = self.event_sender.clone();
         let topology = self.topology_snapshot.clone();
+        let shards = std::sync::Arc::clone(&hosted_shards);
         self.network
             .register_notification_handler::<ExecutionCertificatesNotification>(
                 move |batch: ExecutionCertificatesNotification| {
@@ -597,11 +652,19 @@ where
                         return;
                     }
 
-                    let _ = tx.send(NodeInput::Protocol(Box::new(
-                        ProtocolEvent::ExecutionCertificatesReceived {
-                            certificates: batch.into_certificates(),
-                        },
-                    )));
+                    let certificates = batch.into_certificates();
+                    // Fan out across every hosted shard — the destination
+                    // shard for a cert isn't known here without inspecting
+                    // expected-cert sets, so each hosted shard decides
+                    // whether to admit (no-op if unexpected).
+                    for hosted_shard in shards.iter() {
+                        let _ = tx.send(NodeInput::protocol(
+                            *hosted_shard,
+                            ProtocolEvent::ExecutionCertificatesReceived {
+                                certificates: certificates.clone(),
+                            },
+                        ));
+                    }
                 },
             );
     }

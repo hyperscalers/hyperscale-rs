@@ -93,10 +93,20 @@ pub(super) struct ShardDispatchHandles<S: Storage> {
 // ═══════════════════════════════════════════════════════════════════════
 
 /// A timer operation buffered by `IoLoop` for the runner to process.
+///
+/// `shard` is the hosted shard that owns the timer. Shard-scoped timers
+/// (`ViewChange`, `Cleanup`) use it for both keying (so cross-shard
+/// hosting doesn't collide `ViewChange` handles) and event routing
+/// (`TimerId::into_event(shard)` produces a `NodeInput::Protocol` for
+/// the right shard). Process-scoped timers (`FetchTick`) push with a
+/// sentinel — the `IoLoop` holds the canonical `FetchTick` op on its own
+/// buffer and the firing path ignores `shard`.
 #[derive(Debug, Clone)]
 pub enum TimerOp {
     /// Set a timer to fire after `duration`.
     Set {
+        /// Hosted shard that owns this timer.
+        shard: ShardGroupId,
         /// Logical timer identifier (state-machine-side).
         id: TimerId,
         /// How long until the timer should fire.
@@ -104,6 +114,8 @@ pub enum TimerOp {
     },
     /// Cancel a previously set timer.
     Cancel {
+        /// Hosted shard that owns this timer.
+        shard: ShardGroupId,
         /// Logical timer identifier to cancel.
         id: TimerId,
     },
@@ -590,11 +602,19 @@ where
             NodeInput::TransactionValidationsFailed { hashes } => {
                 self.handle_transaction_validations_failed(primary_shard, &hashes);
             }
-            NodeInput::Protocol(pe) => match *pe {
-                ProtocolEvent::BlockPersisted { shard, height } => {
-                    self.handle_block_persisted(shard, height);
+            NodeInput::Protocol { shard, event } => match *event {
+                ProtocolEvent::BlockPersisted {
+                    shard: persisted_shard,
+                    height,
+                } => {
+                    // `BlockPersisted` carries its own shard on the event
+                    // (it's emitted by storage drain, not by a vnode) — use
+                    // it directly so the commit-pipeline plumbing works
+                    // even if the carrier `NodeInput::Protocol.shard`
+                    // disagrees (shouldn't, but defensive).
+                    self.handle_block_persisted(persisted_shard, height);
                 }
-                other => self.handle_protocol_passthrough(primary_shard, other),
+                other => self.handle_protocol_passthrough(shard, other),
             },
             NodeInput::SubmitTransaction { tx } => {
                 self.handle_submit_transaction(primary_shard, tx);
