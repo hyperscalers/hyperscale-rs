@@ -243,11 +243,13 @@ impl Network for Libp2pNetwork {
         self.registry.register_notification(handler);
     }
 
-    fn register_request_handler<R: Request>(
+    fn register_request_handler<R: Request + Send + 'static>(
         &self,
         shard: ShardGroupId,
         handler: impl RequestHandler<R>,
-    ) {
+    ) where
+        R::Response: Send + 'static,
+    {
         // Registry owns SBOR decode/encode — just forward.
         self.registry.register_request(shard, handler);
     }
@@ -260,6 +262,39 @@ impl Network for Libp2pNetwork {
         class_override: Option<MessageClass>,
         on_response: Box<dyn FnOnce(Result<R::Response, RequestError>) -> ResponseVerdict + Send>,
     ) {
+        // Local-serve fast path: if `shard` is hosted on-process and a
+        // request handler is registered for it, dispatch to the typed
+        // handler directly. Skips libp2p, skips SBOR round-trip on both
+        // request and response — `Arc`-shared payloads stay shared
+        // instead of being deep-copied through bytes. Cross-shard
+        // hosting can answer peers it could not otherwise reach (e.g.
+        // when it's the only member of `shard`'s committee on this
+        // host).
+        if self.local_shards.contains(&shard) {
+            let registry = Arc::clone(&self.registry);
+            // Run off the pinned thread — request handlers may take
+            // locks or block on condvars (the provision-dedup handler
+            // is the canonical example).
+            self.tokio_handle.spawn(async move {
+                if let Some(response) = registry.local_dispatch_request::<R>(shard, request) {
+                    let _ = on_response(Ok(response));
+                } else {
+                    // Shouldn't happen: we host the shard but no handler is
+                    // registered. Treat as the same error class the wire
+                    // path would surface.
+                    warn!(
+                        request_type = R::message_type_id(),
+                        shard = shard.inner(),
+                        "Local-serve: no handler registered for hosted shard"
+                    );
+                    let _ = on_response(Err(RequestError::NoPeers));
+                }
+            });
+            return;
+        }
+
+        let type_id = R::message_type_id();
+
         // Resolve `shard` → committee → libp2p PeerIds via the topology
         // snapshot and the adapter's validator-bind registry. Filter out
         // every validator-id this host carries — we never round-trip a
@@ -278,7 +313,7 @@ impl Network for Libp2pNetwork {
             let count = self.peer_unreachable_count.fetch_add(1, Ordering::Relaxed);
             if count == 0 {
                 info!(
-                    request_type = R::message_type_id(),
+                    request_type = type_id,
                     shard = shard.inner(),
                     committee_size = committee.len(),
                     "No validator-to-peer mappings resolved yet \
@@ -286,7 +321,7 @@ impl Network for Libp2pNetwork {
                 );
             } else if count.is_multiple_of(100) {
                 warn!(
-                    request_type = R::message_type_id(),
+                    request_type = type_id,
                     shard = shard.inner(),
                     total_unreachable = count,
                     "PeerUnreachable errors continue (validator-bind still in progress)"
@@ -303,7 +338,9 @@ impl Network for Libp2pNetwork {
         let preferred_libp2p = preferred_peer.and_then(|v| self.validator_peer_id(v));
         let class = class_override.unwrap_or_else(R::class);
 
-        // SBOR-encode the request
+        // SBOR-encode for the wire — the local-serve fast path above
+        // never reaches here, so the encode cost is only paid when we
+        // actually go out to a peer.
         let request_bytes = match basic_encode(&request) {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -314,7 +351,6 @@ impl Network for Libp2pNetwork {
         };
 
         // Pass type_id + SBOR bytes separately — the transport writes the typed frame.
-        let type_id = R::message_type_id();
         let description = format!("{}({}B)", type_id, request_bytes.len());
         let rm = self.request_manager.clone();
 

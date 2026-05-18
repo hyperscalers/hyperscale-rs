@@ -49,6 +49,22 @@ pub trait LocalNotificationDispatcher: Send + Sync {
     fn dispatch(&self, msg: &dyn Any);
 }
 
+/// Counterpart to [`LocalGossipDispatcher`] for request-response.
+///
+/// Takes ownership of the typed request (so callers don't have to
+/// clone) and returns the typed response as `Box<dyn Any + Send>` for
+/// the caller to downcast back. Skipping SBOR keeps `Arc`-shared
+/// payloads (transactions, finalized waves, execution certificates)
+/// reference-counted instead of deep-copied through bytes.
+pub trait LocalRequestDispatcher: Send + Sync {
+    /// Dispatch a boxed-Any request to the typed handler. The dispatcher
+    /// downcasts `req` to the registered request type, calls the handler,
+    /// and boxes the response. Panics if the downcast fails — a wrong
+    /// type means the caller looked up a `(TypeId, shard)` slot for one
+    /// `R` and then tried to dispatch a different `R`.
+    fn dispatch(&self, req: Box<dyn Any + Send>) -> Box<dyn Any + Send>;
+}
+
 struct TypedGossipDispatcher<M, H> {
     handler: Arc<H>,
     _phantom: PhantomData<fn() -> M>,
@@ -85,6 +101,26 @@ where
     }
 }
 
+struct TypedRequestDispatcher<R, H> {
+    handler: Arc<H>,
+    _phantom: PhantomData<fn() -> R>,
+}
+
+impl<R, H> LocalRequestDispatcher for TypedRequestDispatcher<R, H>
+where
+    R: Request + Send + 'static,
+    R::Response: Send + 'static,
+    H: RequestHandler<R>,
+{
+    fn dispatch(&self, req: Box<dyn Any + Send>) -> Box<dyn Any + Send> {
+        let typed = req
+            .downcast::<R>()
+            .expect("local request dispatch type mismatch");
+        let response = self.handler.handle_request(*typed);
+        Box::new(response)
+    }
+}
+
 /// Registry of per-message-type handlers.
 ///
 /// Shared between the `Network` impl (which registers handlers) and
@@ -107,6 +143,11 @@ pub struct HandlerRegistry {
     local_gossip: RwLock<HashMap<TypeId, Arc<dyn LocalGossipDispatcher>>>,
     /// Typed notification dispatchers (same role as `local_gossip`).
     local_notification: RwLock<HashMap<TypeId, Arc<dyn LocalNotificationDispatcher>>>,
+    /// Typed request dispatchers keyed by `(TypeId, ShardGroupId)` for
+    /// in-process request serving. Used when a host carries a vnode in
+    /// the target shard — bypasses libp2p and preserves `Arc`-shared
+    /// payloads on the response.
+    local_request: RwLock<HashMap<(TypeId, ShardGroupId), Arc<dyn LocalRequestDispatcher>>>,
 }
 
 impl HandlerRegistry {
@@ -119,6 +160,7 @@ impl HandlerRegistry {
             notification: RwLock::new(HashMap::new()),
             local_gossip: RwLock::new(HashMap::new()),
             local_notification: RwLock::new(HashMap::new()),
+            local_request: RwLock::new(HashMap::new()),
         }
     }
 
@@ -187,11 +229,16 @@ impl HandlerRegistry {
     /// Panics if a handler is already registered for `(type_id, shard)`.
     /// All registrations happen once at init; a duplicate is a programmer
     /// error.
-    pub fn register_request<R: Request>(
+    pub fn register_request<R: Request + Send + 'static>(
         &self,
         shard: ShardGroupId,
         handler: impl RequestHandler<R>,
-    ) {
+    ) where
+        R::Response: Send + 'static,
+    {
+        let handler = Arc::new(handler);
+
+        let bytes_handler = Arc::clone(&handler);
         let raw: Arc<RawRequestHandler> = Arc::new(move |payload: &[u8]| -> Vec<u8> {
             let req = match basic_decode::<R>(payload) {
                 Ok(r) => r,
@@ -204,7 +251,7 @@ impl HandlerRegistry {
                     return vec![];
                 }
             };
-            let response = handler.handle_request(req);
+            let response = bytes_handler.handle_request(req);
             match basic_encode(&response) {
                 Ok(bytes) => bytes,
                 Err(e) => {
@@ -228,6 +275,15 @@ impl HandlerRegistry {
             "duplicate request handler registration for ({}, {shard:?})",
             R::message_type_id(),
         );
+
+        let typed: Arc<dyn LocalRequestDispatcher> = Arc::new(TypedRequestDispatcher::<R, _> {
+            handler,
+            _phantom: PhantomData,
+        });
+        self.local_request
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert((TypeId::of::<R>(), shard), typed);
     }
 
     /// Register a typed notification handler for a message type.
@@ -390,6 +446,40 @@ impl HandlerRegistry {
                 d.dispatch(msg as &dyn Any);
                 true
             })
+    }
+
+    /// Dispatch a typed request to its in-process handler, skipping SBOR
+    /// encode/decode. Returns `None` if no handler is registered for
+    /// `(R, shard)`. Used by network backends to serve requests for
+    /// shards the host carries on-process — `Arc`-shared payloads on the
+    /// response (transactions, finalized waves, execution certificates)
+    /// flow through reference-counted instead of being deep-copied
+    /// through SBOR bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the registered dispatcher returns a response that
+    /// doesn't downcast to `R::Response`. The registry slot is keyed by
+    /// `(TypeId::of::<R>(), shard)`, so this only fires on a programmer
+    /// error in registration — not on a runtime input.
+    pub fn local_dispatch_request<R>(&self, shard: ShardGroupId, req: R) -> Option<R::Response>
+    where
+        R: Request + Send + 'static,
+        R::Response: Send + 'static,
+    {
+        let dispatcher = self
+            .local_request
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&(TypeId::of::<R>(), shard))
+            .cloned()?;
+        let boxed: Box<dyn Any + Send> = Box::new(req);
+        let resp = dispatcher.dispatch(boxed);
+        Some(
+            *resp
+                .downcast::<R::Response>()
+                .expect("local request response type mismatch"),
+        )
     }
 }
 

@@ -217,11 +217,13 @@ impl Network for SimNetworkAdapter {
         self.registry.register_notification(handler);
     }
 
-    fn register_request_handler<R: Request>(
+    fn register_request_handler<R: Request + Send + 'static>(
         &self,
         shard: ShardGroupId,
         handler: impl RequestHandler<R>,
-    ) {
+    ) where
+        R::Response: Send + 'static,
+    {
         // Registry owns SBOR decode/encode — just forward.
         self.registry.register_request(shard, handler);
     }

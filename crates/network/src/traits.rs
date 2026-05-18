@@ -191,11 +191,16 @@ pub trait Network: Send + Sync + 'static {
     /// Called during node initialization — once per `(type, hosted shard)` pair.
     /// A multi-shard host registers one handler per hosted shard so each
     /// closure can capture its own `ShardIo`'s storage.
-    fn register_request_handler<R: Request>(
+    ///
+    /// `R: Send` and `R::Response: Send` are required so the registry can
+    /// also install a typed local-dispatch path — same-host requests
+    /// bypass libp2p and preserve `Arc`-shared payloads on the response.
+    fn register_request_handler<R: Request + Send + 'static>(
         &self,
         shard: ShardGroupId,
         handler: impl RequestHandler<R>,
-    );
+    ) where
+        R::Response: Send + 'static;
 
     // ── Unicast notifications ──
 
