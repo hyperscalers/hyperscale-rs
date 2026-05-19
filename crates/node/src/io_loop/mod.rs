@@ -215,7 +215,6 @@ where
     /// network adapter, dispatch pool, tx validator, topology snapshot,
     /// dispatch handles, event sender. Cloned `Arc` so off-thread
     /// closures spawned from this loop's handlers can capture it cheaply.
-    #[allow(dead_code)] // read once per-shard handlers migrate to `impl ShardLoop`
     pub(crate) process: Arc<ProcessIo<S, N, D, E>>,
     /// Per-shard I/O state shared by every vnode in `vnodes`.
     pub io: ShardIo<S>,
@@ -240,20 +239,26 @@ where
     /// during the step. Drained into [`StepOutput`] for the runner's
     /// metrics; reset at step entry.
     pub actions_generated: usize,
+    /// Per-destination-shard outbound `TransactionGossip` accumulators.
+    /// This shard acts as the "source" — locally-submitted or validated
+    /// transactions are appended here keyed by destination, each batch
+    /// fills until its count cap or time window expires, then flushes
+    /// as a single batched gossip message published to the destination
+    /// shard's topic.
+    pub outbound_gossip_batches: BTreeMap<ShardGroupId, BatchAccumulator<Arc<RoutableTransaction>>>,
+    /// Size cap for new tx-gossip accumulators.
+    pub tx_gossip_max: usize,
+    /// Time window for new tx-gossip accumulators.
+    pub tx_gossip_window: Duration,
 }
 
-#[allow(dead_code)] // read once per-shard handlers migrate to `impl ShardLoop`
 impl<S, N, D, E> ShardLoop<S, N, D, E>
 where
     S: Storage,
+    N: Network,
     D: Dispatch,
     E: Engine,
 {
-    /// Cached wall-clock time for this shard.
-    pub(crate) const fn now(&self) -> LocalTimestamp {
-        self.now
-    }
-
     /// Access the vnode at `vnode_idx` within this shard's group.
     ///
     /// # Panics
@@ -268,6 +273,135 @@ where
     /// Panics if `vnode_idx` is out of range.
     pub(crate) fn vnode_mut(&mut self, vnode_idx: usize) -> &mut Vnode {
         &mut self.vnodes[vnode_idx]
+    }
+
+    /// Dispatch a [`ShardScopedInput`] to its handler. Does NOT clear or
+    /// drain per-step scratch — the caller (typically [`IoLoop::step`])
+    /// manages the scratch lifecycle so cross-shard `update_fetch_tick_timer`
+    /// pushes aggregate cleanly.
+    pub(crate) fn step(&mut self, input: ShardScopedInput) {
+        match input {
+            // ── Transaction validation pipeline ────────────────────────
+            ShardScopedInput::TransactionGossipReceived { tx } => {
+                self.handle_gossip_received_tx_for_validation(tx);
+            }
+            ShardScopedInput::TransactionValidated { tx } => {
+                self.handle_transaction_validated(tx);
+            }
+            ShardScopedInput::TransactionValidationsFailed { hashes } => {
+                self.handle_transaction_validations_failed(&hashes);
+            }
+            ShardScopedInput::Protocol(event) => match *event {
+                ProtocolEvent::BlockPersisted { height } => self.handle_block_persisted(height),
+                other => self.handle_protocol_passthrough(other),
+            },
+
+            // ── Sync protocol ──────────────────────────────────────────
+            ShardScopedInput::BlockSyncResponseReceived { height, block } => {
+                self.handle_block_sync_response_received(height, block);
+            }
+            ShardScopedInput::BlockSyncFetchFailed { height, kind } => {
+                self.handle_block_sync_fetch_failed(height, kind);
+            }
+            ShardScopedInput::SyncBlockValidated { height, certified } => {
+                self.handle_sync_block_validated(height, *certified);
+            }
+            ShardScopedInput::SyncBlockValidationFailed { height, reason } => {
+                self.handle_sync_block_validation_failed(height, reason);
+            }
+            ShardScopedInput::RemoteHeadersResponseReceived {
+                source_shard,
+                from_height,
+                count,
+                headers,
+            } => {
+                self.handle_remote_headers_response_received(
+                    source_shard,
+                    from_height,
+                    count,
+                    headers,
+                );
+            }
+            ShardScopedInput::RemoteHeadersFetchFailed {
+                source_shard,
+                from_height,
+                count,
+                kind,
+            } => {
+                self.handle_remote_headers_fetch_failed(source_shard, from_height, count, kind);
+            }
+
+            // ── Fetch protocol ─────────────────────────────────────────
+            ShardScopedInput::TransactionsFetchFailed { hashes } => {
+                self.drive_fetch::<TransactionBinding>(FetchInput::Failed { ids: hashes });
+            }
+            ShardScopedInput::ProvisionsFetchFailed {
+                source_shard,
+                block_height,
+            } => {
+                let local_shard = self.shard;
+                self.drive_fetch::<ProvisionBinding>(FetchInput::Failed {
+                    ids: vec![(source_shard, local_shard, block_height)],
+                });
+            }
+            ShardScopedInput::ExecCertFetchFailed { hashes } => {
+                self.drive_fetch::<ExecCertBinding>(FetchInput::Failed { ids: hashes });
+            }
+            ShardScopedInput::LocalProvisionsFetchFailed { hashes } => {
+                self.drive_fetch::<LocalProvisionBinding>(FetchInput::Failed { ids: hashes });
+            }
+            ShardScopedInput::FinalizedWavesFetchFailed { ids } => {
+                self.drive_fetch::<FinalizedWaveBinding>(FetchInput::Failed { ids });
+            }
+
+            // ── Committed header (gossip → BLS verify → state machine) ──
+            ShardScopedInput::CommittedBlockGossipReceived {
+                committed_header,
+                sender,
+                public_key,
+                sender_signature,
+            } => self.handle_committed_block_gossip_received(
+                committed_header,
+                sender,
+                public_key,
+                sender_signature,
+            ),
+        }
+    }
+
+    /// Fan a shard-scoped protocol event out to every hosted vnode in
+    /// this shard and dispatch each vnode's resulting actions.
+    ///
+    /// Every same-shard vnode independently applies the event at the
+    /// shard's cached `now` and produces its own signed actions.
+    pub(crate) fn dispatch_event(&mut self, event: ProtocolEvent) {
+        let count = self.vnodes.len();
+        if count == 0 {
+            return;
+        }
+        let now = self.now;
+        // Clone for every recipient except the last; move into the last
+        // so we don't pay a final clone whose result is immediately
+        // dropped.
+        for vnode_idx in 0..count - 1 {
+            let ev = event.clone();
+            let actions = self.vnode_mut(vnode_idx).state.handle(now, ev);
+            self.drain_actions(vnode_idx, actions);
+        }
+        let actions = self.vnode_mut(count - 1).state.handle(now, event);
+        self.drain_actions(count - 1, actions);
+    }
+
+    /// Dispatch a `Vec<Action>` produced by a vnode's state machine.
+    /// Bumps the step's action counter, processes each action with the
+    /// emitting vnode's signing context, and flushes pending block
+    /// commits at the tail.
+    pub(crate) fn drain_actions(&mut self, vnode_idx: usize, actions: Vec<Action>) {
+        self.actions_generated += actions.len();
+        for action in actions {
+            self.process_action(vnode_idx, action);
+        }
+        self.flush_block_commits();
     }
 }
 
@@ -308,27 +442,9 @@ where
     /// hands it `Arc::clone(&self.process)`.
     pub(crate) process: Arc<ProcessIo<S, N, D, E>>,
 
-    /// Per-destination-shard outbound `TransactionGossip` accumulators.
-    /// Locally-submitted transactions are appended to one accumulator
-    /// per shard the tx touches (declared reads ∪ writes); each fills
-    /// until its count cap or time window expires, then flushes as a
-    /// single batched gossip message. Host-level rather than per-shard
-    /// because the wire shape (`TransactionGossip`) carries no source
-    /// identity — the source `ShardIo` choice was always arbitrary.
-    tx_gossip_batches: BTreeMap<ShardGroupId, BatchAccumulator<Arc<RoutableTransaction>>>,
-
-    /// Size cap for new tx-gossip accumulators. Consulted lazily by
-    /// `enqueue_tx_for_gossip` when it inserts a new per-destination
-    /// accumulator into `tx_gossip_batches`.
-    tx_gossip_max: usize,
-
-    /// Time window for new tx-gossip accumulators. Same role as
-    /// `tx_gossip_max`.
-    tx_gossip_window: Duration,
-
-    /// Process-wide wall-clock cache. Pushed lazily into a vnode's state
-    /// machine right before `state.handle()` so each handle observes the
-    /// runner's most recent `set_time`.
+    /// Process-wide wall-clock cache. Pushed into every hosted shard's
+    /// own `now` via [`Self::set_time`] so off-thread handlers can read
+    /// a consistent stamp without coordinating with this top-level cache.
     now: LocalTimestamp,
 }
 
@@ -473,6 +589,8 @@ where
         ));
 
         // Second pass: assemble ShardLoops with cloned Arc<ProcessIo>.
+        let tx_gossip_max = b.tx_gossip_max;
+        let tx_gossip_window = b.tx_gossip_window;
         let shards: HashMap<ShardGroupId, ShardLoop<S, N, D, E>> = shard_builds
             .into_iter()
             .map(|(shard, (io, vnodes))| {
@@ -485,6 +603,9 @@ where
                     pending_timer_ops: Vec::new(),
                     emitted_statuses: Vec::new(),
                     actions_generated: 0,
+                    outbound_gossip_batches: BTreeMap::new(),
+                    tx_gossip_max,
+                    tx_gossip_window,
                 };
                 (shard, shard_loop)
             })
@@ -494,9 +615,6 @@ where
             shards,
             executor,
             process,
-            tx_gossip_batches: BTreeMap::new(),
-            tx_gossip_max: b.tx_gossip_max,
-            tx_gossip_window: b.tx_gossip_window,
             now: LocalTimestamp::ZERO,
         }
     }
@@ -514,11 +632,6 @@ where
         for sl in self.shards.values_mut() {
             sl.now = now;
         }
-    }
-
-    /// Current cached wall-clock time.
-    pub(super) const fn now(&self) -> LocalTimestamp {
-        self.now
     }
 
     // ─── Accessors ──────────────────────────────────────────────────────
@@ -577,11 +690,6 @@ where
     /// Internal: immutable per-shard vnode by index.
     pub(super) fn vnode(&self, shard: ShardGroupId, vnode_idx: usize) -> &Vnode {
         &self.shard_loop(shard).vnodes[vnode_idx]
-    }
-
-    /// Internal: mutable per-shard vnode by index.
-    pub(super) fn vnode_mut(&mut self, shard: ShardGroupId, vnode_idx: usize) -> &mut Vnode {
-        &mut self.shard_loop_mut(shard).vnodes[vnode_idx]
     }
 
     /// Shared `ShardIo` for `shard`. The single per-shard accessor;
@@ -658,7 +766,13 @@ where
         }
 
         match event {
-            ShardEvent::Shard(shard, input) => self.step_shard_input(shard, input),
+            ShardEvent::Shard(shard, input) => {
+                // Silently drop events for shards we don't host — matches the
+                // original `dispatch_event`'s `count == 0 { return }` guard.
+                if let Some(sl) = self.shards.get_mut(&shard) {
+                    sl.step(input);
+                }
+            }
             ShardEvent::Process(input) => self.step_process_input(input),
         }
 
@@ -670,114 +784,6 @@ where
         self.update_fetch_tick_timer();
 
         self.drain_pending_output()
-    }
-
-    /// Dispatch a shard-scoped input. Companion to [`Self::step`]; one
-    /// arm per [`ShardScopedInput`] variant.
-    #[allow(clippy::too_many_lines)] // single dispatch over ShardScopedInput; one arm per variant
-    fn step_shard_input(&mut self, shard: ShardGroupId, input: ShardScopedInput) {
-        match input {
-            // ── Transaction validation pipeline ────────────────────────
-            ShardScopedInput::TransactionGossipReceived { tx } => {
-                self.handle_gossip_received_tx_for_validation(shard, tx);
-            }
-            ShardScopedInput::TransactionValidated { tx } => {
-                self.handle_transaction_validated(shard, tx);
-            }
-            ShardScopedInput::TransactionValidationsFailed { hashes } => {
-                self.handle_transaction_validations_failed(shard, &hashes);
-            }
-            ShardScopedInput::Protocol(event) => match *event {
-                ProtocolEvent::BlockPersisted { height } => {
-                    self.handle_block_persisted(shard, height);
-                }
-                other => self.handle_protocol_passthrough(shard, other),
-            },
-
-            // ── Sync protocol ──────────────────────────────────────────
-            ShardScopedInput::BlockSyncResponseReceived { height, block } => {
-                self.handle_block_sync_response_received(shard, height, block);
-            }
-            ShardScopedInput::BlockSyncFetchFailed { height, kind } => {
-                self.handle_block_sync_fetch_failed(shard, height, kind);
-            }
-            ShardScopedInput::SyncBlockValidated { height, certified } => {
-                self.handle_sync_block_validated(shard, height, *certified);
-            }
-            ShardScopedInput::SyncBlockValidationFailed { height, reason } => {
-                self.handle_sync_block_validation_failed(shard, height, reason);
-            }
-            ShardScopedInput::RemoteHeadersResponseReceived {
-                source_shard,
-                from_height,
-                count,
-                headers,
-            } => {
-                self.handle_remote_headers_response_received(
-                    shard,
-                    source_shard,
-                    from_height,
-                    count,
-                    headers,
-                );
-            }
-            ShardScopedInput::RemoteHeadersFetchFailed {
-                source_shard,
-                from_height,
-                count,
-                kind,
-            } => {
-                self.handle_remote_headers_fetch_failed(
-                    shard,
-                    source_shard,
-                    from_height,
-                    count,
-                    kind,
-                );
-            }
-
-            // ── Fetch protocol ─────────────────────────────────────────
-            ShardScopedInput::TransactionsFetchFailed { hashes } => {
-                self.drive_fetch::<TransactionBinding>(shard, FetchInput::Failed { ids: hashes });
-            }
-            ShardScopedInput::ProvisionsFetchFailed {
-                source_shard,
-                block_height,
-            } => {
-                self.drive_fetch::<ProvisionBinding>(
-                    shard,
-                    FetchInput::Failed {
-                        ids: vec![(source_shard, shard, block_height)],
-                    },
-                );
-            }
-            ShardScopedInput::ExecCertFetchFailed { hashes } => {
-                self.drive_fetch::<ExecCertBinding>(shard, FetchInput::Failed { ids: hashes });
-            }
-            ShardScopedInput::LocalProvisionsFetchFailed { hashes } => {
-                self.drive_fetch::<LocalProvisionBinding>(
-                    shard,
-                    FetchInput::Failed { ids: hashes },
-                );
-            }
-            ShardScopedInput::FinalizedWavesFetchFailed { ids } => {
-                self.drive_fetch::<FinalizedWaveBinding>(shard, FetchInput::Failed { ids });
-            }
-
-            // ── Committed header (gossip → BLS verify → state machine) ──
-            ShardScopedInput::CommittedBlockGossipReceived {
-                committed_header,
-                sender,
-                public_key,
-                sender_signature,
-            } => self.handle_committed_block_gossip_received(
-                shard,
-                committed_header,
-                sender,
-                public_key,
-                sender_signature,
-            ),
-        }
     }
 
     /// Dispatch a process-scoped input. Companion to [`Self::step`];
@@ -811,47 +817,6 @@ where
         out
     }
 
-    /// Fan a shard-scoped protocol event out to every hosted vnode in
-    /// `shard` and dispatch each vnode's resulting actions.
-    ///
-    /// Every same-shard vnode independently applies the event at the
-    /// `IoLoop`'s cached `now` and produces its own signed actions.
-    /// No-op when `shard` isn't hosted.
-    pub(super) fn dispatch_event(&mut self, shard: ShardGroupId, event: ProtocolEvent) {
-        let count = self.shards.get(&shard).map_or(0, |g| g.vnodes.len());
-        if count == 0 {
-            return;
-        }
-        let now = self.now;
-        // Clone for every recipient except the last; move into the last
-        // so we don't pay a final clone whose result is immediately
-        // dropped.
-        for vnode_idx in 0..count - 1 {
-            let ev = event.clone();
-            let actions = self.vnode_mut(shard, vnode_idx).state.handle(now, ev);
-            self.drain_actions(shard, vnode_idx, actions);
-        }
-        let actions = self.vnode_mut(shard, count - 1).state.handle(now, event);
-        self.drain_actions(shard, count - 1, actions);
-    }
-
-    /// Dispatch a `Vec<Action>` produced by a vnode's state machine.
-    /// Bumps the step's action counter, processes each action with the
-    /// emitting vnode's signing context, and flushes pending block
-    /// commits at the tail.
-    pub(super) fn drain_actions(
-        &mut self,
-        shard: ShardGroupId,
-        vnode_idx: usize,
-        actions: Vec<Action>,
-    ) {
-        self.shard_loop_mut(shard).actions_generated += actions.len();
-        for action in actions {
-            self.process_action(shard, vnode_idx, action);
-        }
-        self.flush_block_commits(shard);
-    }
-
     /// Flush any batch accumulators whose deadlines have expired across
     /// every hosted shard.
     ///
@@ -861,21 +826,23 @@ where
     pub fn flush_expired_batches(&mut self, now: LocalTimestamp) {
         let hosted: Vec<ShardGroupId> = self.hosted_shards().collect();
         for shard in hosted {
-            let sio = self.shard_io(shard);
-            if sio.validation_batch.is_expired(now) {
-                self.flush_validation_batch(shard);
+            let sl = self.shard_loop_mut(shard);
+            if sl.io.validation_batch.is_expired(now) {
+                sl.flush_validation_batch();
             }
-            if self.shard_io(shard).committed_header_batch.is_expired(now) {
-                self.flush_committed_header_verifications(shard);
+            let sl = self.shard_loop_mut(shard);
+            if sl.io.committed_header_batch.is_expired(now) {
+                sl.flush_committed_header_verifications();
             }
-        }
-        let expired_dst_shards: Vec<ShardGroupId> = self
-            .tx_gossip_batches
-            .iter()
-            .filter_map(|(dst, batch)| batch.is_expired(now).then_some(*dst))
-            .collect();
-        for dst in expired_dst_shards {
-            self.flush_tx_gossip_batch(dst);
+            let sl = self.shard_loop_mut(shard);
+            let expired_dsts: Vec<ShardGroupId> = sl
+                .outbound_gossip_batches
+                .iter()
+                .filter_map(|(dst, batch)| batch.is_expired(now).then_some(*dst))
+                .collect();
+            for dst in expired_dsts {
+                self.shard_loop_mut(shard).flush_tx_gossip_batch(dst);
+            }
         }
     }
 
@@ -884,18 +851,20 @@ where
     /// Used by the production `run()` loop for `recv_timeout()` and by the
     /// simulation harness to know when to schedule a flush.
     pub fn nearest_batch_deadline(&self) -> Option<LocalTimestamp> {
-        let per_shard_deadlines = self.shards.values().flat_map(|g| {
-            [
-                g.io.validation_batch.deadline(),
-                g.io.committed_header_batch.deadline(),
-            ]
-        });
-        let tx_gossip_deadlines = self
-            .tx_gossip_batches
+        self.shards
             .values()
-            .map(BatchAccumulator::deadline);
-        per_shard_deadlines
-            .chain(tx_gossip_deadlines)
+            .flat_map(|sl| {
+                [
+                    sl.io.validation_batch.deadline(),
+                    sl.io.committed_header_batch.deadline(),
+                ]
+                .into_iter()
+                .chain(
+                    sl.outbound_gossip_batches
+                        .values()
+                        .map(BatchAccumulator::deadline),
+                )
+            })
             .flatten()
             .min()
     }
@@ -907,13 +876,14 @@ where
     pub fn flush_all_batches(&mut self) {
         let hosted: Vec<ShardGroupId> = self.hosted_shards().collect();
         for shard in &hosted {
-            self.flush_block_commits(*shard);
-            self.flush_validation_batch(*shard);
-            self.flush_committed_header_verifications(*shard);
-        }
-        let dst_shards: Vec<ShardGroupId> = self.tx_gossip_batches.keys().copied().collect();
-        for dst in dst_shards {
-            self.flush_tx_gossip_batch(dst);
+            let sl = self.shard_loop_mut(*shard);
+            sl.flush_block_commits();
+            sl.flush_validation_batch();
+            sl.flush_committed_header_verifications();
+            let dsts: Vec<ShardGroupId> = sl.outbound_gossip_batches.keys().copied().collect();
+            for dst in dsts {
+                self.shard_loop_mut(*shard).flush_tx_gossip_batch(dst);
+            }
         }
     }
 }

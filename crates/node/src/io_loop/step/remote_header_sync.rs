@@ -23,11 +23,11 @@ use hyperscale_types::{
 };
 
 use crate::io_loop::step::block_sync::classify_fetch_error;
-use crate::io_loop::{FetchFailureKind, IoLoop, ShardScopedInput, push_shard_input};
+use crate::io_loop::{FetchFailureKind, ShardLoop, ShardScopedInput, push_shard_input};
 use crate::shard_io::sync::SyncOutput;
 use crate::shard_io::sync::remote_header::{RemoteHeaderSyncInput, RemoteHeaderSyncOutput};
 
-impl<S, N, D, E> IoLoop<S, N, D, E>
+impl<S, N, D, E> ShardLoop<S, N, D, E>
 where
     S: Storage,
     N: Network,
@@ -36,22 +36,23 @@ where
 {
     // ─── Action dispatch ────────────────────────────────────────────────
 
-    /// Handle `Action::StartRemoteHeaderSync`: feed `local_shard`'s FSM
-    /// and dispatch any range fetches it emits. `source_shard` is the
-    /// remote shard whose committed headers we're catching up on.
+    /// Handle `Action::StartRemoteHeaderSync`: feed this shard's FSM and
+    /// dispatch any range fetches it emits. `source_shard` is the remote
+    /// shard whose committed headers we're catching up on.
     pub(in crate::io_loop) fn process_start_remote_header_sync(
         &mut self,
-        local_shard: ShardGroupId,
         source_shard: ShardGroupId,
         target: BlockHeight,
     ) {
-        let outputs = self.shard_io_mut(local_shard).syncs.remote_header.handle(
-            RemoteHeaderSyncInput::StartSync {
+        let outputs = self
+            .io
+            .syncs
+            .remote_header
+            .handle(RemoteHeaderSyncInput::StartSync {
                 scope: source_shard,
                 target,
-            },
-        );
-        self.process_remote_header_sync_outputs(local_shard, outputs);
+            });
+        self.process_remote_header_sync_outputs(outputs);
     }
 
     // ─── step() handlers ────────────────────────────────────────────────
@@ -63,7 +64,6 @@ where
     /// it can defer the short-capped tail.
     pub(in crate::io_loop) fn handle_remote_headers_response_received(
         &mut self,
-        local_shard: ShardGroupId,
         source_shard: ShardGroupId,
         from_height: BlockHeight,
         count: HeaderFetchCount,
@@ -103,46 +103,46 @@ where
             delivered_heights.push(h);
             // The `sender` field carries no meaning for fetched headers —
             // a sentinel value avoids confusion with real validator ids.
-            self.dispatch_event(
-                local_shard,
-                ProtocolEvent::RemoteHeaderReceived {
-                    committed_header: Arc::new(header),
-                    sender: ValidatorId::new(u64::MAX),
-                },
-            );
+            self.dispatch_event(ProtocolEvent::RemoteHeaderReceived {
+                committed_header: Arc::new(header),
+                sender: ValidatorId::new(u64::MAX),
+            });
         }
 
-        let outputs = self.shard_io_mut(local_shard).syncs.remote_header.handle(
-            RemoteHeaderSyncInput::FetchSucceeded {
+        let outputs = self
+            .io
+            .syncs
+            .remote_header
+            .handle(RemoteHeaderSyncInput::FetchSucceeded {
                 scope: source_shard,
                 from: from_height,
                 count: count.inner(),
                 delivered_heights,
                 now: std::time::Instant::now(),
-            },
-        );
-        self.process_remote_header_sync_outputs(local_shard, outputs);
+            });
+        self.process_remote_header_sync_outputs(outputs);
     }
 
     /// Network callback: a range fetch failed.
     pub(in crate::io_loop) fn handle_remote_headers_fetch_failed(
         &mut self,
-        local_shard: ShardGroupId,
         source_shard: ShardGroupId,
         from_height: BlockHeight,
         count: HeaderFetchCount,
         kind: FetchFailureKind,
     ) {
-        let outputs = self.shard_io_mut(local_shard).syncs.remote_header.handle(
-            RemoteHeaderSyncInput::FetchFailed {
+        let outputs = self
+            .io
+            .syncs
+            .remote_header
+            .handle(RemoteHeaderSyncInput::FetchFailed {
                 scope: source_shard,
                 from: from_height,
                 count: count.inner(),
                 kind,
                 now: std::time::Instant::now(),
-            },
-        );
-        self.process_remote_header_sync_outputs(local_shard, outputs);
+            });
+        self.process_remote_header_sync_outputs(outputs);
     }
 
     // ─── Output processing ──────────────────────────────────────────────
@@ -151,9 +151,9 @@ where
     /// `RemoteHeaderSyncComplete` event.
     pub(in crate::io_loop) fn process_remote_header_sync_outputs(
         &mut self,
-        local_shard: ShardGroupId,
         outputs: Vec<RemoteHeaderSyncOutput>,
     ) {
+        let local_shard = self.shard;
         for output in outputs {
             match output {
                 SyncOutput::Fetch {
@@ -217,13 +217,10 @@ where
                         height = height.inner(),
                         "remote-header sync caught up"
                     );
-                    self.dispatch_event(
-                        local_shard,
-                        ProtocolEvent::RemoteHeaderSyncComplete {
-                            source_shard,
-                            height,
-                        },
-                    );
+                    self.dispatch_event(ProtocolEvent::RemoteHeaderSyncComplete {
+                        source_shard,
+                        height,
+                    });
                 }
             }
         }
