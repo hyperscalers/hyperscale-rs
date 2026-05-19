@@ -10,11 +10,11 @@ use hyperscale_storage::Storage;
 use hyperscale_types::ShardGroupId;
 
 use super::{IoLoop, TimerOp};
-use crate::shard::fetch::binding::{
+use crate::shard_io::fetch::binding::{
     ExecCertBinding, FetchBinding, FinalizedWaveBinding, LocalProvisionBinding, ProvisionBinding,
     TransactionBinding,
 };
-use crate::shard::fetch::{FetchInput, FetchOutput};
+use crate::shard_io::fetch::{FetchInput, FetchOutput};
 
 impl<S, N, D, E> IoLoop<S, N, D, E>
 where
@@ -35,7 +35,7 @@ where
     /// outputs — it's threaded through to per-binding callbacks so the
     /// response can be routed back to the right hosted shard.
     ///
-    /// [`FetchHost`]: crate::shard::fetch::FetchHost
+    /// [`FetchHost`]: crate::shard_io::fetch::FetchHost
     pub(in crate::io_loop) fn process_fetch_outputs<B: FetchBinding>(
         &self,
         local_shard: ShardGroupId,

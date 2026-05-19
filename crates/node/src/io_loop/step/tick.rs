@@ -14,8 +14,8 @@ use hyperscale_storage::Storage;
 use hyperscale_types::ShardGroupId;
 
 use crate::io_loop::IoLoop;
-use crate::shard::fetch::FetchInput;
-use crate::shard::fetch::binding::{
+use crate::shard_io::fetch::FetchInput;
+use crate::shard_io::fetch::binding::{
     ExecCertBinding, FinalizedWaveBinding, LocalProvisionBinding, ProvisionBinding,
     TransactionBinding,
 };

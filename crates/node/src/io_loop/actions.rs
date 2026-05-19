@@ -20,13 +20,13 @@ use hyperscale_types::{
 use tracing::{debug, trace, warn};
 
 use super::{IoLoop, TimerOp, push_protocol_event};
-use crate::shard::block_commit::{AccumulateDecision, PendingCommit, make_commit_prepared};
-use crate::shard::fetch::FetchInput;
-use crate::shard::fetch::binding::{
+use crate::shard_io::block_commit::{AccumulateDecision, PendingCommit, make_commit_prepared};
+use crate::shard_io::fetch::FetchInput;
+use crate::shard_io::fetch::binding::{
     ExecCertBinding, FinalizedWaveBinding, LocalProvisionBinding, ProvisionBinding,
     TransactionBinding,
 };
-use crate::shard::sync::block::BlockSyncInput;
+use crate::shard_io::sync::block::BlockSyncInput;
 impl<S, N, D, E> IoLoop<S, N, D, E>
 where
     S: Storage,
@@ -261,7 +261,7 @@ where
     /// to compute / reuse the prepared commit and decide whether to
     /// enqueue, then call [`Self::accept_block_commit`] when it says so.
     ///
-    /// [`BlockCommitCoordinator::prepare_qc_only_commit`]: crate::shard::block_commit::BlockCommitCoordinator::prepare_qc_only_commit
+    /// [`BlockCommitCoordinator::prepare_qc_only_commit`]: crate::shard_io::block_commit::BlockCommitCoordinator::prepare_qc_only_commit
     fn accept_qc_only_commit(
         &mut self,
         shard: ShardGroupId,
@@ -296,7 +296,7 @@ where
     /// decision: feed the sync protocol with the new committed height and,
     /// unless persistence backpressure is active, fire `BlockCommitted`.
     ///
-    /// [`BlockCommitCoordinator`]: crate::shard::block_commit::BlockCommitCoordinator
+    /// [`BlockCommitCoordinator`]: crate::shard_io::block_commit::BlockCommitCoordinator
     fn accept_block_commit(&mut self, shard: ShardGroupId, commit: PendingCommit) {
         let now = self.now();
         let decision = self
@@ -341,7 +341,7 @@ where
     /// it only adds the ids to the pending set; chunks fan out under
     /// the per-tick cap. The tick timer is refreshed once at the end.
     ///
-    /// [`FetchHost`]: crate::shard::fetch::FetchHost
+    /// [`FetchHost`]: crate::shard_io::fetch::FetchHost
     fn process_fetch_request(&mut self, local_shard: ShardGroupId, req: FetchRequest) {
         match req {
             FetchRequest::Transactions {
@@ -441,7 +441,7 @@ where
     /// separately from genuine admissions. Refreshes the tick timer
     /// once at the end (the pending set may now be empty).
     ///
-    /// [`FetchHost`]: crate::shard::fetch::FetchHost
+    /// [`FetchHost`]: crate::shard_io::fetch::FetchHost
     #[allow(clippy::needless_pass_by_value)] // mirrors process_fetch_request; future variants carry Vec ids
     fn process_fetch_abandon(&mut self, local_shard: ShardGroupId, req: FetchAbandon) {
         match req {

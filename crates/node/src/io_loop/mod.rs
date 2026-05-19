@@ -51,16 +51,16 @@ pub use status::{NodeStatusSnapshot, ShardStatus, VnodeStatus};
 use crate::NodeStateMachine;
 use crate::batch_accumulator::BatchAccumulator;
 use crate::config::NodeConfig;
-use crate::shard::ShardIo;
-use crate::shard::block_commit::{BlockCommitCoordinator, PreparedCommitMap};
-use crate::shard::caches::SharedCaches;
-use crate::shard::fetch::binding::{
+use crate::shard_io::ShardIo;
+use crate::shard_io::block_commit::{BlockCommitCoordinator, PreparedCommitMap};
+use crate::shard_io::caches::SharedCaches;
+use crate::shard_io::fetch::binding::{
     ExecCertBinding, FinalizedWaveBinding, LocalProvisionBinding, ProvisionBinding,
     TransactionBinding,
 };
-use crate::shard::fetch::{FetchHost, FetchInput};
-use crate::shard::phase_times::TxPhaseTimesCache;
-use crate::shard::sync::SyncHost;
+use crate::shard_io::fetch::{FetchHost, FetchInput};
+use crate::shard_io::phase_times::TxPhaseTimesCache;
+use crate::shard_io::sync::SyncHost;
 use crate::vnode::{Vnode, VnodeInit};
 
 /// Lock-free shared topology snapshot for handler closures and dispatch.

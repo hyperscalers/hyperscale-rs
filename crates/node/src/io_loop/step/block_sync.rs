@@ -53,8 +53,8 @@ use hyperscale_types::{
 };
 
 use crate::io_loop::{IoLoop, push_shard_input};
-use crate::shard::sync::SyncOutput;
-use crate::shard::sync::block::{BlockSyncInput, BlockSyncOutput};
+use crate::shard_io::sync::SyncOutput;
+use crate::shard_io::sync::block::{BlockSyncInput, BlockSyncOutput};
 
 impl<S, N, D, E> IoLoop<S, N, D, E>
 where

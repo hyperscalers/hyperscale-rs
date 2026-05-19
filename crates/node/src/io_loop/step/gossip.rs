@@ -26,8 +26,8 @@ use hyperscale_types::{
 };
 
 use crate::io_loop::{IoLoop, push_protocol_event};
-use crate::shard::CommittedHeaderVerificationItem;
-use crate::shard::verify::verify_bls_with_metrics;
+use crate::shard_io::CommittedHeaderVerificationItem;
+use crate::shard_io::verify::verify_bls_with_metrics;
 
 impl<S, N, D, E> IoLoop<S, N, D, E>
 where

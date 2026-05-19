@@ -20,7 +20,7 @@ use hyperscale_types::{
 };
 
 use crate::io_loop::IoLoop;
-use crate::shard::sync::block::BlockSyncStatus;
+use crate::shard_io::sync::block::BlockSyncStatus;
 
 /// Per-shard status readout.
 #[derive(Debug, Clone)]

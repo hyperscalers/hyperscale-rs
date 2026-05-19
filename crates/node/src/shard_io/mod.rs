@@ -24,10 +24,10 @@ use hyperscale_types::{
 };
 
 use crate::batch_accumulator::BatchAccumulator;
-use crate::shard::block_commit::BlockCommitCoordinator;
-pub use crate::shard::caches::SharedCaches;
-use crate::shard::fetch::FetchHost;
-use crate::shard::sync::SyncHost;
+use crate::shard_io::block_commit::BlockCommitCoordinator;
+pub use crate::shard_io::caches::SharedCaches;
+use crate::shard_io::fetch::FetchHost;
+use crate::shard_io::sync::SyncHost;
 
 /// A committed header pending sender-signature verification, queued in
 /// `ShardIo::committed_header_batch` and drained on the crypto pool.

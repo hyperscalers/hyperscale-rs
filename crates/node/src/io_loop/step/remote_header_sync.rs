@@ -24,8 +24,8 @@ use hyperscale_types::{
 
 use crate::io_loop::step::block_sync::classify_fetch_error;
 use crate::io_loop::{FetchFailureKind, IoLoop, ShardScopedInput, push_shard_input};
-use crate::shard::sync::SyncOutput;
-use crate::shard::sync::remote_header::{RemoteHeaderSyncInput, RemoteHeaderSyncOutput};
+use crate::shard_io::sync::SyncOutput;
+use crate::shard_io::sync::remote_header::{RemoteHeaderSyncInput, RemoteHeaderSyncOutput};
 
 impl<S, N, D, E> IoLoop<S, N, D, E>
 where

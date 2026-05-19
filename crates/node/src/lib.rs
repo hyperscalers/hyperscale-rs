@@ -21,20 +21,20 @@
 //! # Provision DA fallback
 //!
 //! Cross-shard provisions are gossiped optimistically; if a target shard
-//! misses the broadcast, [`shard::fetch::provision_serve`] answers
+//! misses the broadcast, [`shard_io::fetch::provision_serve`] answers
 //! `provision.request` from `RocksDB` and the historical JMT. Reads are
 //! bounded by `jmt_history_length` (256 blocks by default).
 
 mod batch_accumulator;
 mod config;
 pub mod io_loop;
-mod shard;
+mod shard_io;
 mod state;
 mod vnode;
 
 pub use config::NodeConfig;
 pub use io_loop::{NodeStatusSnapshot, SharedTopologySnapshot, TimerOp, timer_event};
-pub use shard::ShardIo;
-pub use shard::sync::block::BlockSyncStateKind;
+pub use shard_io::ShardIo;
+pub use shard_io::sync::block::BlockSyncStateKind;
 pub use state::NodeStateMachine;
 pub use vnode::{Vnode, VnodeInit};

@@ -24,7 +24,9 @@ use hyperscale_types::{ExecutionCertificate, FinalizedWave, ShardGroupId, WaveId
 use tracing::warn;
 
 use super::{IoLoop, ShardScopedInput, push_protocol_event, push_shard_input};
-use crate::shard::verify::{resolve_sender_key, verify_bls_with_metrics, verify_sender_signature};
+use crate::shard_io::verify::{
+    resolve_sender_key, verify_bls_with_metrics, verify_sender_signature,
+};
 
 impl<S, N, D, E> IoLoop<S, N, D, E>
 where
@@ -46,10 +48,10 @@ where
             GetBlockRequest, GetProvisionsRequest, GetRemoteHeadersRequest, GetTransactionsRequest,
         };
 
-        use crate::shard::fetch::provision_serve::serve_provision_request;
-        use crate::shard::fetch::transaction_serve::serve_transaction_request;
-        use crate::shard::sync::block_serve::serve_block_request;
-        use crate::shard::sync::remote_header_serve::serve_remote_headers_request;
+        use crate::shard_io::fetch::provision_serve::serve_provision_request;
+        use crate::shard_io::fetch::transaction_serve::serve_transaction_request;
+        use crate::shard_io::sync::block_serve::serve_block_request;
+        use crate::shard_io::sync::remote_header_serve::serve_remote_headers_request;
 
         type ProvisionResponse = GetProvisionResponse;
         type ProvisionWaiter = Arc<(
