@@ -503,8 +503,8 @@ impl SimulationRunner {
     /// Schedule an initial event (e.g., to start the simulation).
     /// Schedule an event for initial delivery. The event must be wrapped
     /// in the appropriate [`ShardEvent`] envelope: shard-scoped variants
-    /// via [`ShardEvent::shard`] / [`ShardEvent::protocol`], process-scoped
-    /// variants (`SubmitTransaction`, `FetchTick`) via [`ShardEvent::process`].
+    /// via [`ShardEvent::shard`] / [`ShardEvent::protocol`],
+    /// `SubmitTransaction` via [`ShardEvent::process`].
     pub fn schedule_initial_event(&mut self, node: NodeIndex, delay: Duration, event: ShardEvent) {
         let time = self.now + delay;
         self.schedule_event(node, time, event);

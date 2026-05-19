@@ -37,6 +37,13 @@ use crate::shard_loop::{
 };
 use crate::vnode::{Vnode, VnodeInit};
 
+/// Output of [`NodeHost::into_parts`]: shared process-scoped resources
+/// plus the per-shard drivers, keyed by hosted shard id.
+pub type NodeHostParts<S, N, D, E> = (
+    Arc<ProcessIo<S, N, D, E>>,
+    HashMap<ShardGroupId, ShardLoop<S, N, D, E>>,
+);
+
 /// Top-level node composition: process-scoped resources plus one
 /// [`ShardLoop`] per hosted shard.
 ///
@@ -246,6 +253,17 @@ where
         }
     }
 
+    /// Consume the host and yield its constituent parts: the shared
+    /// process-scoped resources and one [`ShardLoop`] per hosted shard.
+    ///
+    /// The production runner uses this to move each `ShardLoop` onto its
+    /// own pinned thread while keeping the `Arc<ProcessIo>` shared across
+    /// them. Simulation never calls this — sim drives the whole host
+    /// single-threaded via [`Self::step`].
+    pub fn into_parts(self) -> NodeHostParts<S, N, D, E> {
+        (self.process, self.shards)
+    }
+
     // ─── Time ────────────────────────────────────────────────────────────
 
     /// Set the cached process-wide wall-clock time, propagated into every
@@ -391,13 +409,6 @@ where
             ShardEvent::Process(input) => self.step_process_input(input),
         }
 
-        // Refresh the `FetchTick` timer once, after the event has fully
-        // settled. Cheaper than the previous "call inline from every fetch
-        // state change" pattern, and produces the same final timer state
-        // because the runner applies timer ops sequentially — only the
-        // last Set/Cancel for a (TimerId, shard) pair lands.
-        self.update_fetch_tick_timer();
-
         self.drain_pending_output()
     }
 
@@ -408,7 +419,6 @@ where
             ProcessScopedInput::SubmitTransaction { tx } => {
                 self.handle_submit_transaction(&tx);
             }
-            ProcessScopedInput::FetchTick => self.handle_fetch_tick(),
         }
     }
 

@@ -1,26 +1,26 @@
 //! Periodic fetch-tick step handler.
 //!
-//! `ProcessScopedInput::FetchTick` fires on the periodic `FetchTick` timer. It
-//! advances every fetch protocol's idle clock so retries / chunk emission
-//! progresses without waiting for an admission event. Pending entries
-//! are drained by `drive_fetch_admission` on canonical admission events
-//! and by explicit `Action::AbandonFetch` actions emitted from the
-//! originating coordinator at every expected-set drop site.
+//! `ShardScopedInput::FetchTick` fires on the periodic `FetchTick` timer
+//! this shard schedules for itself. It advances every fetch protocol's
+//! idle clock so retries / chunk emission progresses without waiting for
+//! an admission event. Pending entries are drained by
+//! `drive_fetch_admission` on canonical admission events and by explicit
+//! `Action::AbandonFetch` actions emitted from the originating coordinator
+//! at every expected-set drop site.
 
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::Engine;
 use hyperscale_network::Network;
 use hyperscale_storage::Storage;
-use hyperscale_types::ShardGroupId;
 
-use crate::host::NodeHost;
 use crate::shard_io::fetch::FetchInput;
 use crate::shard_io::fetch::binding::{
     ExecCertBinding, FinalizedWaveBinding, LocalProvisionBinding, ProvisionBinding,
     TransactionBinding,
 };
+use crate::shard_loop::ShardLoop;
 
-impl<S, N, D, E> NodeHost<S, N, D, E>
+impl<S, N, D, E> ShardLoop<S, N, D, E>
 where
     S: Storage,
     N: Network,
@@ -29,22 +29,16 @@ where
 {
     pub(crate) fn handle_fetch_tick(&mut self) {
         let now = std::time::Instant::now();
-        let hosted: Vec<ShardGroupId> = self.hosted_shards().collect();
-        for shard in hosted {
-            let sl = self.shard_loop_mut(shard);
-            let outputs = sl.io.syncs.block_tick(now);
-            sl.process_block_sync_outputs(outputs);
+        let outputs = self.io.syncs.block_tick(now);
+        self.process_block_sync_outputs(outputs);
 
-            let sl = self.shard_loop_mut(shard);
-            let outputs = sl.io.syncs.remote_header_tick(now);
-            sl.process_remote_header_sync_outputs(outputs);
+        let outputs = self.io.syncs.remote_header_tick(now);
+        self.process_remote_header_sync_outputs(outputs);
 
-            let sl = self.shard_loop_mut(shard);
-            sl.drive_fetch::<TransactionBinding>(FetchInput::Tick);
-            sl.drive_fetch::<LocalProvisionBinding>(FetchInput::Tick);
-            sl.drive_fetch::<FinalizedWaveBinding>(FetchInput::Tick);
-            sl.drive_fetch::<ProvisionBinding>(FetchInput::Tick);
-            sl.drive_fetch::<ExecCertBinding>(FetchInput::Tick);
-        }
+        self.drive_fetch::<TransactionBinding>(FetchInput::Tick);
+        self.drive_fetch::<LocalProvisionBinding>(FetchInput::Tick);
+        self.drive_fetch::<FinalizedWaveBinding>(FetchInput::Tick);
+        self.drive_fetch::<ProvisionBinding>(FetchInput::Tick);
+        self.drive_fetch::<ExecCertBinding>(FetchInput::Tick);
     }
 }

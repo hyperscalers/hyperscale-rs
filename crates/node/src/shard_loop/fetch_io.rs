@@ -7,10 +7,8 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::Engine;
 use hyperscale_network::Network;
 use hyperscale_storage::Storage;
-use hyperscale_types::ShardGroupId;
 
 use super::{ShardLoop, TimerOp};
-use crate::host::NodeHost;
 use crate::shard_io::fetch::binding::{
     ExecCertBinding, FetchBinding, FinalizedWaveBinding, LocalProvisionBinding, ProvisionBinding,
     TransactionBinding,
@@ -147,7 +145,7 @@ where
     }
 }
 
-impl<S, N, D, E> NodeHost<S, N, D, E>
+impl<S, N, D, E> ShardLoop<S, N, D, E>
 where
     S: Storage,
     N: Network,
@@ -157,40 +155,24 @@ where
     /// Interval for the periodic fetch tick timer.
     pub(in crate::shard_loop) const FETCH_TICK_INTERVAL: Duration = Duration::from_millis(200);
 
-    /// Refresh the global `FetchTick` timer based on whether any hosted
-    /// shard has pending fetches or in-progress sync. The timer is
-    /// process-scoped — it fires once and the tick handler fans out
-    /// across every hosted shard — so the Set/Cancel decision must look
-    /// at the union, not a single shard.
+    /// Refresh this shard's `FetchTick` timer based on whether its own
+    /// fetch host or sync host has any pending work. Each shard manages
+    /// its own ticker — a shard with idle fetches stops paying for the
+    /// 200ms wake-up while busier shards keep ticking.
     pub(crate) fn update_fetch_tick_timer(&mut self) {
-        let any_pending = self
-            .shards
-            .values_mut()
-            .any(|g| g.io.fetches.has_any_pending() || g.io.syncs.has_any_pending());
-        // FetchTick is process-global. The `shard` on `TimerOp` exists
-        // to key the runner's timer manager by `(TimerId, ShardGroupId)`;
-        // pick a stable sentinel from the hosted set so set/cancel pairs
-        // match. The firing path passes `shard` to `timer_event` which
-        // ignores it for `FetchTick`.
-        let sentinel_shard: ShardGroupId = *self
-            .shards
-            .keys()
-            .next()
-            .expect("NodeHost hosts at least one shard");
+        let any_pending = self.io.fetches.has_any_pending() || self.io.syncs.has_any_pending();
         let op = if any_pending {
             TimerOp::Set {
-                shard: sentinel_shard,
+                shard: self.shard,
                 id: TimerId::FetchTick,
                 duration: Self::FETCH_TICK_INTERVAL,
             }
         } else {
             TimerOp::Cancel {
-                shard: sentinel_shard,
+                shard: self.shard,
                 id: TimerId::FetchTick,
             }
         };
-        self.shard_loop_mut(sentinel_shard)
-            .pending_timer_ops
-            .push(op);
+        self.pending_timer_ops.push(op);
     }
 }

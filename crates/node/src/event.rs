@@ -84,6 +84,16 @@ pub enum ShardScopedInput {
     /// the event queue otherwise.
     Protocol(Box<ProtocolEvent>),
 
+    /// Periodic tick for this shard's fetch / sync hosts to retry
+    /// pending operations. Scheduled by the shard's own
+    /// `update_fetch_tick_timer` via [`TimerOp::Set`] / [`TimerOp::Cancel`]
+    /// on `TimerId::FetchTick`; the runner's timer driver fires the timer
+    /// into this shard's input channel.
+    ///
+    /// [`TimerOp::Set`]: crate::shard_loop::TimerOp::Set
+    /// [`TimerOp::Cancel`]: crate::shard_loop::TimerOp::Cancel
+    FetchTick,
+
     /// Raw gossip-delivered transaction. `NodeHost` queues it for async
     /// validation; the validated form is surfaced as
     /// `ProtocolEvent::TransactionValidated`.
@@ -279,6 +289,7 @@ impl ShardScopedInput {
             Self::AdmitTransaction { .. } | Self::AdmitAndGossipTransaction { .. } => {
                 EventPriority::Client
             }
+            Self::FetchTick => EventPriority::Timer,
             Self::BlockSyncResponseReceived { .. }
             | Self::BlockSyncFetchFailed { .. }
             | Self::SyncBlockValidated { .. }
@@ -309,9 +320,8 @@ impl ShardScopedInput {
 
 /// Inputs that aren't anchored to a particular hosted shard.
 ///
-/// Fan out across every hosted shard the runner deems relevant — e.g.
-/// `SubmitTransaction` admits to every hosted shard the tx touches;
-/// `FetchTick` ticks every shard's fetch host.
+/// `SubmitTransaction` is the only entry — the runner fans it across
+/// every hosted shard the transaction touches.
 #[derive(Debug, Clone, strum::IntoStaticStr)]
 pub enum ProcessScopedInput {
     /// Client submitted a transaction.
@@ -319,9 +329,6 @@ pub enum ProcessScopedInput {
         /// Transaction submitted by the local client; will be validated then gossiped.
         tx: Arc<RoutableTransaction>,
     },
-
-    /// Periodic tick for the fetch protocol to retry pending operations.
-    FetchTick,
 }
 
 impl ProcessScopedInput {
@@ -330,7 +337,6 @@ impl ProcessScopedInput {
     pub const fn priority(&self) -> EventPriority {
         match self {
             Self::SubmitTransaction { .. } => EventPriority::Client,
-            Self::FetchTick => EventPriority::Timer,
         }
     }
 

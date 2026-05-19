@@ -89,13 +89,10 @@ pub(crate) struct ShardDispatchHandles<S: Storage> {
 
 /// A timer operation buffered by `ShardLoop` for the runner to process.
 ///
-/// `shard` is the hosted shard that owns the timer. Shard-scoped timers
-/// (`ViewChange`, `Cleanup`) use it for both keying (so cross-shard
-/// hosting doesn't collide `ViewChange` handles) and event routing
-/// ([`timer_event`] produces a `ShardScopedInput::Protocol` for the right
-/// shard). Process-scoped timers (`FetchTick`) push with a sentinel —
-/// the firing path passes `shard` to [`timer_event`] which ignores it
-/// for `FetchTick`.
+/// `shard` is the hosted shard that owns the timer. Every timer is
+/// shard-scoped — the runner's timer driver keys handles by
+/// `(TimerId, ShardGroupId)`, and the firing path produces a
+/// [`ShardScopedInput`] envelope targeting that shard.
 #[derive(Debug, Clone)]
 pub enum TimerOp {
     /// Set a timer to fire after `duration`.
@@ -117,17 +114,14 @@ pub enum TimerOp {
 }
 
 /// Translate a fired [`TimerId`] back into the [`ShardEvent`] the runner
-/// pushes onto its event channel.
-///
-/// Shard-scoped timers tag the envelope with `shard` so the resulting
-/// `ShardScopedInput::Protocol` routes to the right hosted shard;
-/// `FetchTick` is process-scoped.
+/// pushes onto its event channel. Every variant produces a
+/// [`ShardEvent::Shard`] envelope tagged with the owning shard.
 #[must_use]
 pub fn timer_event(id: &TimerId, shard: ShardGroupId) -> ShardEvent {
     match id {
         TimerId::ViewChange => ShardEvent::protocol(shard, ProtocolEvent::ViewChangeTimer),
         TimerId::Cleanup => ShardEvent::protocol(shard, ProtocolEvent::CleanupTimer),
-        TimerId::FetchTick => ShardEvent::process(ProcessScopedInput::FetchTick),
+        TimerId::FetchTick => ShardEvent::shard(shard, ShardScopedInput::FetchTick),
     }
 }
 
@@ -278,11 +272,18 @@ where
 
     /// Dispatch a [`ShardScopedInput`] to its handler. Does NOT clear or
     /// drain per-step scratch — the caller (typically [`NodeHost::step`])
-    /// manages the scratch lifecycle so cross-shard
-    /// `update_fetch_tick_timer` pushes aggregate cleanly.
+    /// manages the scratch lifecycle. Refreshes this shard's `FetchTick`
+    /// timer once the input has fully settled so the runner sees the
+    /// final Set/Cancel for `(TimerId::FetchTick, self.shard)` in the
+    /// emitted timer ops.
     ///
     /// [`NodeHost::step`]: crate::host::NodeHost::step
     pub(crate) fn step(&mut self, input: ShardScopedInput) {
+        self.dispatch_input(input);
+        self.update_fetch_tick_timer();
+    }
+
+    fn dispatch_input(&mut self, input: ShardScopedInput) {
         match input {
             // ── Transaction validation pipeline ────────────────────────
             ShardScopedInput::TransactionGossipReceived { tx } => {
@@ -375,6 +376,9 @@ where
                 public_key,
                 sender_signature,
             ),
+
+            // ── Periodic fetch / sync tick ─────────────────────────────
+            ShardScopedInput::FetchTick => self.handle_fetch_tick(),
         }
     }
 
