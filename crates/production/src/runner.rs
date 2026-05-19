@@ -1,44 +1,23 @@
-//! Production runner implementation.
+//! Production runner: one pinned `std::thread` per hosted shard plus
+//! the shared tokio runtime.
 //!
-//! # Architecture
+//! Each shard's thread owns its own [`ShardLoop`], its own
+//! `ProdTimerManager`, and a (timer, callback, shutdown) channel triple
+//! drained in priority order (`timer_rx > callback_rx`). Process-scoped
+//! resources (`Arc<ProcessIo>`: network adapter, dispatch pool, tx
+//! validator, topology snapshot) are cloned across every shard thread.
 //!
-//! The production runner uses a **pinned thread** architecture:
+//! The tokio runtime handles libp2p, the RPC server (which invokes the
+//! [`TxSubmissionSender`] closure synchronously), the per-shard
+//! `ProdTimerManager`s' `sleep` tasks, and the per-host metrics + GC
+//! tick. Inbound libp2p events and dispatch callbacks land on the
+//! addressed shard's callback channel; RPC submissions fan out via
+//! [`ProcessIo::compute_submit_fanout`] into the relevant shards'
+//! callback channels.
 //!
-//! ```text
-//!  ┌──────────────────────────────────────────────────────────────────────┐
-//!  │  Core 0 (pinned std::thread)                                         │
-//!  │  ┌────────────────────────────────────────────────────────────────┐  │
-//!  │  │  IoLoop<SharedStorage, Libp2pNetwork, PooledDispatch>          │  │
-//!  │  │    - State machine event processing                            │  │
-//!  │  │    - Storage I/O (RocksDB)                                     │  │
-//!  │  │    - Action handling (timers, broadcasts, crypto dispatch)     │  │
-//!  │  │    - Transaction validation batching via Dispatch              │  │
-//!  │  │    - RPC SubmitTransaction handling (gossip + validate)        │  │
-//!  │  │    - Batched message sending, batched crypto verification      │  │
-//!  │  └────────────────────────────────────────────────────────────────┘  │
-//!  │       ↑ crossbeam channels (all events) ↑                            │
-//!  └──────────────────────────────────────────────────────────────────────┘
-//!
-//!  ┌──────────────────────────────────────────────────────────────────────┐
-//!  │  Tokio runtime (multi-threaded)                                      │
-//!  │                                                                      │
-//!  │  Background tasks:                                                   │
-//!  │    - Libp2p adapter (gossipsub, streams) → crossbeam directly        │
-//!  │    - InboundRouter (peer fetch requests)                             │
-//!  │    - RPC server (sends Event::SubmitTransaction → crossbeam)         │
-//!  │    - ProdTimerManager (tokio sleep → crossbeam timer events)         │
-//!  │    - Metrics collection loop                                         │
-//!  └──────────────────────────────────────────────────────────────────────┘
-//! ```
-//!
-//! ## Channel topology
-//!
-//! ```text
-//! Libp2p adapter ──crossbeam──→ pinned thread (IoLoop)
-//! RPC server     ──crossbeam──→ pinned thread (Event::SubmitTransaction)
-//! Dispatch       ──crossbeam──→ pinned thread (crypto/validation callbacks)
-//! ProdTimerManager ──crossbeam──→ pinned thread (timer events)
-//! ```
+//! [`ShardLoop`]: hyperscale_node::shard_loop::ShardLoop
+//! [`TxSubmissionSender`]: crate::rpc::TxSubmissionSender
+//! [`ProcessIo::compute_submit_fanout`]: hyperscale_node::process_io::ProcessIo::compute_submit_fanout
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -146,7 +125,7 @@ impl Drop for ShutdownHandle {
 ///
 /// A [`ProductionRunner`] hosts a `Vec<VnodeConfig>`. Same-shard hosting
 /// (V > 1 with every entry mapped to the same `local_shard()`) collapses
-/// onto one `IoLoop`, one libp2p peer, and one `ShardIo`, with per-vnode
+/// onto one `NodeHost`, one libp2p peer, and one `ShardIo`, with per-vnode
 /// signing keys and per-vnode `NodeStateMachine`s.
 pub struct VnodeConfig {
     /// Per-validator topology view. Provides this vnode's `validator_id`,
@@ -303,8 +282,8 @@ impl ProductionRunnerBuilder {
 
     /// Build the production runner.
     ///
-    /// Creates all channels, the `IoLoop`, networking adapters, and supporting
-    /// infrastructure. The `IoLoop` is held in an `Option` so it can be moved
+    /// Creates all channels, the `NodeHost`, networking adapters, and supporting
+    /// infrastructure. The `NodeHost` is held in an `Option` so it can be moved
     /// to the pinned thread when `run()` is called.
     ///
     /// Must be called from within a tokio runtime context — the libp2p adapter
@@ -416,7 +395,7 @@ impl ProductionRunnerBuilder {
 
         // One `ProvisionStore` + `TxStore` + `ExecCertStore` +
         // `FinalizedWaveStore` per hosted shard, shared across every same-
-        // shard vnode and into the `IoLoop`'s `SharedCaches`. Determinism
+        // shard vnode and into the `NodeHost`'s `SharedCaches`. Determinism
         // guarantees same-shard vnodes admit identical sets, but co-owning
         // the stores makes the canonical view explicit and gives the
         // request/sync handlers one place to read. Per-shard scoping
@@ -485,8 +464,9 @@ impl ProductionRunnerBuilder {
             .collect();
 
         // Wrap each per-shard `RocksDbStorage` in a `SharedStorage` for
-        // the io-loop's `HashMap<ShardGroupId, S>` argument; the runner
-        // keeps the bare `Arc<RocksDbStorage>`s alive for GC + metrics.
+        // `NodeHost::new`'s `HashMap<ShardGroupId, S>` argument; the
+        // runner keeps the bare `Arc<RocksDbStorage>`s alive for GC +
+        // metrics.
         let shared_storages: HashMap<ShardGroupId, SharedStorage> = storages
             .iter()
             .map(|(shard, st)| (*shard, SharedStorage::new(Arc::clone(st))))
@@ -518,7 +498,7 @@ impl ProductionRunnerBuilder {
             .iter()
             .map(|(s, tx)| (*s, tx.clone()))
             .collect();
-        let io_loop = NodeHost::new(
+        let host = NodeHost::new(
             vnode_inits,
             shared_storages,
             executor,
@@ -534,10 +514,10 @@ impl ProductionRunnerBuilder {
         // tx that lands on any of them shows up — cross-shard packed has
         // a vnode in every shard, and a single primary entry would hide
         // half the txs.
-        let tx_status_caches = io_loop.tx_status_caches();
+        let tx_status_caches = host.tx_status_caches();
 
         Ok(ProductionRunner {
-            io_loop: Some(io_loop),
+            host: Some(host),
             shard_channels: Some(shard_channels),
             shard_callback_txs,
             shard_shutdown_txs,
@@ -561,17 +541,20 @@ impl ProductionRunnerBuilder {
 // ProductionRunner
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Production runner with `IoLoop` on a pinned thread.
+/// Production runner: one pinned `std::thread` per hosted shard plus
+/// the shared tokio runtime.
 ///
-/// The state machine (`IoLoop`) runs on a dedicated thread pinned to core 0.
-/// All state machine processing, storage I/O, action handling, and gossip cert
-/// verification happen on that thread. The tokio runtime handles async I/O
-/// routing, RPC transaction handling, sync/fetch management, and metrics.
+/// Each shard's thread owns its own [`ShardLoop`] driving that shard's
+/// state machine, storage I/O, and dispatch fan-out. The tokio runtime
+/// handles async I/O routing, RPC transaction submission, sync/fetch
+/// management, and the per-host metrics + GC tick.
+///
+/// [`ShardLoop`]: hyperscale_node::shard_loop::ShardLoop
 pub struct ProductionRunner {
     /// The composed [`NodeHost`], wrapped in `Option` because it's
     /// decomposed via `into_parts()` and moved onto the per-shard
     /// threads at `run()` time. `None` thereafter.
-    io_loop: Option<ProdIoLoop>,
+    host: Option<ProdHost>,
 
     /// Per-shard receivers (timer + callback + shutdown), built at
     /// construction and consumed when `run()` spawns the shard threads.
@@ -616,7 +599,7 @@ pub struct ProductionRunner {
     /// Optional genesis configuration for initial state.
     genesis_config: Option<GenesisConfig>,
 
-    /// Per-shard transaction status caches, shared from `IoLoop` for
+    /// Per-shard transaction status caches, shared from `NodeHost` for
     /// lock-free RPC queries. One entry per hosted shard; the RPC
     /// handler probes every entry on a status lookup since a tx may
     /// have landed on any of the hosted shards.
@@ -655,10 +638,10 @@ impl ProductionRunner {
         &self.network
     }
 
-    /// Get the per-shard transaction status caches shared from `IoLoop`.
+    /// Get the per-shard transaction status caches shared from `NodeHost`.
     ///
     /// One `Arc<QuickCache>` per hosted shard, same instances used by
-    /// `IoLoop` on the pinned thread. Passed directly to the RPC server,
+    /// `NodeHost` on the pinned thread. Passed directly to the RPC server,
     /// which probes every entry on a status lookup since a tx may have
     /// landed on any of the hosted shards.
     #[must_use]
@@ -684,15 +667,15 @@ impl ProductionRunner {
     /// [`ProcessIo::compute_submit_fanout`]: hyperscale_node::process_io::ProcessIo::compute_submit_fanout
     /// # Panics
     ///
-    /// Panics if `run()` has already consumed the io-loop. The closure
+    /// Panics if `run()` has already consumed the host. The closure
     /// captures the `Arc<ProcessIo>` at call time, so build it before
     /// taking the loop.
     #[must_use]
     pub fn tx_submission_sender(&self) -> TxSubmissionSender {
         let process = Arc::clone(
-            self.io_loop
+            self.host
                 .as_ref()
-                .expect("io_loop must exist for tx_submission_sender")
+                .expect("host must exist for tx_submission_sender")
                 .process(),
         );
         Arc::new(move |routable: Arc<RoutableTransaction>| process.submit_transaction(&routable))
@@ -717,19 +700,16 @@ impl ProductionRunner {
     /// Checks if we have any committed blocks. If not, creates a genesis block
     /// and initializes the state machine (which sets up the initial proposal timer).
     ///
-    /// This MUST be called before the `IoLoop` is moved to the pinned thread,
-    /// since it needs mutable access to the `IoLoop`.
+    /// This MUST be called before the `NodeHost` is moved to the pinned thread,
+    /// since it needs mutable access to the `NodeHost`.
     fn maybe_initialize_genesis(&mut self) -> Vec<TimerOp> {
-        let io_loop = self
-            .io_loop
-            .as_mut()
-            .expect("io_loop must exist for genesis");
+        let host = self.host.as_mut().expect("host must exist for genesis");
 
         // Multi-shard genesis: run the genesis ceremony for every
         // hosted shard. Each shard has its own RocksDB store, its own
         // committed height, and its own genesis block.
         let mut timer_ops = Vec::new();
-        let local_shards: Vec<ShardGroupId> = io_loop.hosted_shards().collect();
+        let local_shards: Vec<ShardGroupId> = host.hosted_shards().collect();
         let topology = Arc::clone(&self.topology_snapshot);
         // The host's `GenesisConfig` enumerates every account across every
         // hosted shard. Each shard's storage only gets the accounts whose
@@ -739,7 +719,7 @@ impl ProductionRunner {
         let shared_genesis_config = self.genesis_config.take();
         let num_shards = self.topology_snapshot.load().num_shards();
         for shard in local_shards {
-            let height = io_loop.shard_io(shard).storage.committed_height();
+            let height = host.shard_io(shard).storage.committed_height();
             if height > BlockHeight::GENESIS {
                 info!(
                     shard = ?shard,
@@ -759,7 +739,7 @@ impl ProductionRunner {
                 xrd_balances = genesis_config.xrd_balances.len(),
                 "Running genesis"
             );
-            let genesis_jmt_root = io_loop.install_engine_genesis(shard, &genesis_config);
+            let genesis_jmt_root = host.install_engine_genesis(shard, &genesis_config);
 
             info!(
                 shard = ?shard,
@@ -784,10 +764,10 @@ impl ProductionRunner {
                 "Created genesis block"
             );
 
-            io_loop.initialize_shard_genesis(&genesis_block);
-            io_loop.flush_all_batches();
+            host.initialize_shard_genesis(&genesis_block);
+            host.flush_all_batches();
 
-            let genesis_output = io_loop.drain_pending_output();
+            let genesis_output = host.drain_pending_output();
             timer_ops.extend(genesis_output.timer_ops);
 
             // Sync the state machine with the JMT state genesis just
@@ -807,7 +787,7 @@ impl ProductionRunner {
             };
             let genesis_certified =
                 Arc::new(CertifiedBlock::new_unchecked(genesis_block, genesis_qc));
-            let genesis_commit_output = io_loop.step(ShardEvent::protocol(
+            let genesis_commit_output = host.step(ShardEvent::protocol(
                 shard,
                 ProtocolEvent::BlockCommitted {
                     certified: genesis_certified,
@@ -822,10 +802,10 @@ impl ProductionRunner {
             );
 
             timer_ops.extend(genesis_commit_output.timer_ops);
-            io_loop.flush_all_batches();
+            host.flush_all_batches();
         }
 
-        io_loop.register_inbound_handlers();
+        host.register_inbound_handlers();
         timer_ops
     }
 
@@ -835,9 +815,9 @@ impl ProductionRunner {
 
     /// Run the production node.
     ///
-    /// 1. Initializes genesis via `IoLoop` (before spawning pinned thread)
-    /// 2. Extracts the `IoLoop` and channel receivers for the pinned thread
-    /// 3. Spawns the pinned thread running the `IoLoop` event loop
+    /// 1. Initializes genesis via `NodeHost` (before spawning pinned thread)
+    /// 2. Extracts the `NodeHost` and channel receivers for the pinned thread
+    /// 3. Spawns the pinned thread running the `NodeHost` event loop
     /// 4. Runs a minimal loop for metrics collection and shutdown handling
     /// 5. On shutdown, signals the pinned thread and joins it
     ///
@@ -848,7 +828,7 @@ impl ProductionRunner {
     ///
     /// # Panics
     ///
-    /// Panics if `run` is called twice on the same runner (the `IoLoop` and
+    /// Panics if `run` is called twice on the same runner (the `NodeHost` and
     /// channel receivers have already been moved to the pinned thread).
     pub async fn run(mut self) -> Result<(), RunnerError> {
         let config = self.dispatch.config();
@@ -864,11 +844,11 @@ impl ProductionRunner {
         let initial_timer_ops = self.maybe_initialize_genesis();
 
         // ── 2. Decompose NodeHost into Arc<ProcessIo> + per-shard ShardLoops.
-        let io_loop = self
-            .io_loop
+        let host = self
+            .host
             .take()
-            .expect("io_loop already taken (run called twice?)");
-        let (_process, shards) = io_loop.into_parts();
+            .expect("host already taken (run called twice?)");
+        let (_process, shards) = host.into_parts();
 
         let mut shard_channels = self
             .shard_channels
@@ -1077,8 +1057,8 @@ fn build_network_stack(args: NetworkBuildArgs) -> Result<NetworkStack, RunnerErr
     })
 }
 
-/// Concrete `IoLoop` type for the production runner.
-type ProdIoLoop = NodeHost<SharedStorage, Libp2pNetwork, PooledDispatch>;
+/// Concrete `NodeHost` type for the production runner.
+type ProdHost = NodeHost<SharedStorage, Libp2pNetwork, PooledDispatch>;
 
 /// Concrete `ShardLoop` type for the production runner.
 type ProdShardLoop = ShardLoop<SharedStorage, Libp2pNetwork, PooledDispatch, RadixExecutor>;
@@ -1179,7 +1159,7 @@ fn shard_for_address(address: &ComponentAddress, num_shards: u64) -> ShardGroupI
     shard_for_node(&det_node_id, num_shards)
 }
 
-/// Mint the `io_loop`'s monotonic local clock as a `LocalTimestamp` (ms since
+/// Mint the `host`'s monotonic local clock as a `LocalTimestamp` (ms since
 /// UNIX epoch). Used to set the state machine's clock before each step.
 /// Same epoch as `WeightedTimestamp` so the proposer-skew comparison works
 /// without unit conversion. NTP back-steps are absorbed by saturating
