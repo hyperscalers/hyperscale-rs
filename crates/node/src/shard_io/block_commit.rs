@@ -30,7 +30,7 @@ use hyperscale_types::{
 };
 use tracing::{debug, error};
 
-use crate::io_loop::{ShardEvent, push_protocol_event};
+use crate::shard_loop::{ShardEvent, push_protocol_event};
 
 /// Block + QC pair handed back to the `io_loop` to build a [`CertifiedBlock`]
 /// for immediate `BlockCommitted` delivery. Cloned `Arc` handles to the
@@ -422,7 +422,7 @@ where
     /// `spawn()` calls.
     ///
     /// Deferred `BlockCommitted` and `BlockPersisted` events return to
-    /// the pinned thread via `event_tx`; see `IoLoop::event_sender`
+    /// the pinned thread via `event_tx`; see `NodeHost::event_sender`
     /// for the off-thread → pinned-thread routing convention.
     #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
     pub fn flush<D: Dispatch>(
@@ -590,7 +590,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::io_loop::ShardScopedInput;
+    use crate::shard_loop::ShardScopedInput;
 
     /// Mock prepared-commit handle. Carries an empty `JmtSnapshot` (the
     /// coordinator only inspects it via `jmt_snapshot()` from action

@@ -4,7 +4,7 @@
 //! scope (`Scope = ShardGroupId`) and no payload-private state
 //! (`State = ()`).
 //!
-//! The `IoLoop` remote-header-sync handlers own request dispatch, response
+//! The `NodeHost` remote-header-sync handlers own request dispatch, response
 //! decoding, and forward delivered headers through the existing
 //! `RemoteHeaderReceived` path.
 

@@ -25,9 +25,9 @@ use hyperscale_types::{
     committed_block_header_message,
 };
 
-use crate::io_loop::{ShardLoop, push_protocol_event};
 use crate::shard_io::CommittedHeaderVerificationItem;
 use crate::shard_io::verify::verify_bls_with_metrics;
+use crate::shard_loop::{ShardLoop, push_protocol_event};
 
 impl<S, N, D, E> ShardLoop<S, N, D, E>
 where
@@ -39,7 +39,7 @@ where
     /// Inbound handler closure already verified sender's committee
     /// membership and resolved the public key. Queue for batched BLS
     /// verification; fires `flush_committed_header_verifications` when full.
-    pub(in crate::io_loop) fn handle_committed_block_gossip_received(
+    pub(in crate::shard_loop) fn handle_committed_block_gossip_received(
         &mut self,
         committed_header: Arc<CommittedBlockHeader>,
         sender: ValidatorId,
@@ -60,7 +60,7 @@ where
     /// BLS signature. Valid headers are emitted directly as
     /// `ProtocolEvent::RemoteHeaderReceived` for state-machine ingestion;
     /// invalid items are warn-dropped (byzantine peer; no cleanup needed).
-    pub(in crate::io_loop) fn flush_committed_header_verifications(&mut self) {
+    pub(crate) fn flush_committed_header_verifications(&mut self) {
         let items = self.io.committed_header_batch.take();
         if items.is_empty() {
             return;

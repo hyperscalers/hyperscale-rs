@@ -31,7 +31,7 @@ use hyperscale_metrics::{
     record_tx_ingress_rejected_syncing,
 };
 use hyperscale_metrics_prometheus::encode_metrics;
-use hyperscale_node::io_loop::{ProcessScopedInput, ShardEvent};
+use hyperscale_node::shard_loop::{ProcessScopedInput, ShardEvent};
 use hyperscale_types::{
     Hash, InFlightCount, RoutableTransaction, TransactionDecision, TransactionStatus, TxHash,
 };

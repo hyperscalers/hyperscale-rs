@@ -1,7 +1,7 @@
 //! Bundle of per-payload fetch state machines owned by the I/O loop.
 //!
 //! [`FetchHost`] holds one [`Fetch`](super::Fetch) per payload binding plus
-//! metric readouts. Lifting these out of `IoLoop` makes "what fetches the I/O
+//! metric readouts. Lifting these out of `NodeHost` makes "what fetches the I/O
 //! loop is orchestrating" explicit and isolates per-payload state from
 //! sync state.
 

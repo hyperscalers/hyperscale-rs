@@ -14,7 +14,7 @@ use hyperscale_network::Network;
 use hyperscale_storage::Storage;
 use hyperscale_types::BlockHeight;
 
-use crate::io_loop::ShardLoop;
+use crate::shard_loop::ShardLoop;
 
 impl<S, N, D, E> ShardLoop<S, N, D, E>
 where
@@ -26,7 +26,7 @@ where
     /// Update the commit pipeline before forwarding `BlockPersisted` to the
     /// state machine: the persisted height advances `block_commit`'s gate
     /// and `pending_chain`'s pruning watermark.
-    pub(in crate::io_loop) fn handle_block_persisted(&mut self, height: BlockHeight) {
+    pub(in crate::shard_loop) fn handle_block_persisted(&mut self, height: BlockHeight) {
         self.io.block_commit.mark_persisted(height);
         // Drop pending state for blocks now persisted to RocksDB.
         self.io.pending_chain.prune(height);
@@ -36,7 +36,7 @@ where
     /// Default `Protocol(_)` passthrough — fan the event across fetch-binding
     /// drain hooks (so e.g. `TransactionsReceived` clears in-flight tracking)
     /// and feed the variant into the state machine.
-    pub(in crate::io_loop) fn handle_protocol_passthrough(&mut self, event: ProtocolEvent) {
+    pub(in crate::shard_loop) fn handle_protocol_passthrough(&mut self, event: ProtocolEvent) {
         self.drive_fetch_admission(&event);
         self.dispatch_event(event);
     }

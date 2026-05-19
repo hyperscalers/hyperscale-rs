@@ -24,12 +24,13 @@ use hyperscale_types::{ExecutionCertificate, FinalizedWave, ShardGroupId, WaveId
 use tracing::warn;
 
 use crate::event::ShardScopedInput;
-use crate::io_loop::{IoLoop, push_protocol_event, push_shard_input};
+use crate::host::NodeHost;
 use crate::shard_io::verify::{
     resolve_sender_key, verify_bls_with_metrics, verify_sender_signature,
 };
+use crate::shard_loop::{push_protocol_event, push_shard_input};
 
-impl<S, N, D, E> IoLoop<S, N, D, E>
+impl<S, N, D, E> NodeHost<S, N, D, E>
 where
     S: Storage,
     N: Network,

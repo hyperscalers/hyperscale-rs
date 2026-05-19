@@ -64,10 +64,10 @@ use hyperscale_network_libp2p::{
     Libp2pAdapter, Libp2pConfig, Libp2pNetwork, NetworkError, RequestManager, RequestManagerConfig,
     RequestStreamPool, generate_random_keypair,
 };
-use hyperscale_node::io_loop::{
-    IoLoop, NodeStatusSnapshot, ShardEvent, TimerOp, record_metrics, timer_event,
+use hyperscale_node::shard_loop::{
+    NodeStatusSnapshot, ShardEvent, TimerOp, record_metrics, timer_event,
 };
-use hyperscale_node::{NodeConfig, NodeStateMachine, SharedTopologySnapshot, VnodeInit};
+use hyperscale_node::{NodeConfig, NodeHost, NodeStateMachine, SharedTopologySnapshot, VnodeInit};
 use hyperscale_provisions::{ProvisionConfig, ProvisionStore};
 use hyperscale_storage::ChainReader;
 use hyperscale_storage_rocksdb::{RocksDbStorage, SharedStorage};
@@ -490,7 +490,7 @@ impl ProductionRunnerBuilder {
 
         let executor = RadixExecutor::new(network_definition);
 
-        let io_loop = IoLoop::new(
+        let io_loop = NodeHost::new(
             vnode_inits,
             shared_storages,
             executor,
@@ -1014,7 +1014,7 @@ fn build_network_stack(args: NetworkBuildArgs) -> Result<NetworkStack, RunnerErr
 }
 
 /// Concrete `IoLoop` type for the production runner.
-type ProdIoLoop = IoLoop<SharedStorage, Libp2pNetwork, PooledDispatch>;
+type ProdIoLoop = NodeHost<SharedStorage, Libp2pNetwork, PooledDispatch>;
 
 /// Configuration for the pinned event loop.
 struct PinnedLoopConfig {

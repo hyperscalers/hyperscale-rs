@@ -9,7 +9,8 @@ use hyperscale_network::Network;
 use hyperscale_storage::Storage;
 use hyperscale_types::ShardGroupId;
 
-use super::{IoLoop, ShardLoop, TimerOp};
+use super::{ShardLoop, TimerOp};
+use crate::host::NodeHost;
 use crate::shard_io::fetch::binding::{
     ExecCertBinding, FetchBinding, FinalizedWaveBinding, LocalProvisionBinding, ProvisionBinding,
     TransactionBinding,
@@ -31,7 +32,7 @@ where
     /// response can be routed back to this shard.
     ///
     /// [`FetchHost`]: crate::shard_io::fetch::FetchHost
-    pub(in crate::io_loop) fn process_fetch_outputs<B: FetchBinding>(
+    pub(in crate::shard_loop) fn process_fetch_outputs<B: FetchBinding>(
         &self,
         outputs: Vec<FetchOutput<B::Id>>,
     ) {
@@ -74,7 +75,7 @@ where
     /// `spawn_pending_fetches` so freed slots are filled in the same
     /// event-loop turn — this wrapper just routes the FSM-emitted Sends
     /// to the network.
-    pub(in crate::io_loop) fn drive_fetch<B: FetchBinding>(&mut self, input: FetchInput<B::Id>) {
+    pub(in crate::shard_loop) fn drive_fetch<B: FetchBinding>(&mut self, input: FetchInput<B::Id>) {
         if let FetchInput::Request {
             ids,
             shard,
@@ -101,7 +102,7 @@ where
     /// through `drive_fetch` so the freed slots' `spawn_pending_fetches`
     /// outputs reach the network in the same event-loop turn instead
     /// of being silently dropped.
-    pub(in crate::io_loop) fn drive_fetch_admission(&mut self, event: &ProtocolEvent) {
+    pub(in crate::shard_loop) fn drive_fetch_admission(&mut self, event: &ProtocolEvent) {
         match event {
             // Drain on TransactionsReceived to catch every delivered hash —
             // duplicates / tombstoned / validity-expired txs don't surface
@@ -146,7 +147,7 @@ where
     }
 }
 
-impl<S, N, D, E> IoLoop<S, N, D, E>
+impl<S, N, D, E> NodeHost<S, N, D, E>
 where
     S: Storage,
     N: Network,
@@ -154,14 +155,14 @@ where
     E: Engine,
 {
     /// Interval for the periodic fetch tick timer.
-    pub(in crate::io_loop) const FETCH_TICK_INTERVAL: Duration = Duration::from_millis(200);
+    pub(in crate::shard_loop) const FETCH_TICK_INTERVAL: Duration = Duration::from_millis(200);
 
     /// Refresh the global `FetchTick` timer based on whether any hosted
     /// shard has pending fetches or in-progress sync. The timer is
     /// process-scoped — it fires once and the tick handler fans out
     /// across every hosted shard — so the Set/Cancel decision must look
     /// at the union, not a single shard.
-    pub(in crate::io_loop) fn update_fetch_tick_timer(&mut self) {
+    pub(crate) fn update_fetch_tick_timer(&mut self) {
         let any_pending = self
             .shards
             .values_mut()
@@ -175,7 +176,7 @@ where
             .shards
             .keys()
             .next()
-            .expect("IoLoop hosts at least one shard");
+            .expect("NodeHost hosts at least one shard");
         let op = if any_pending {
             TimerOp::Set {
                 shard: sentinel_shard,

@@ -2,7 +2,7 @@
 //!
 //! Splits the per-tick metrics work into two phases:
 //!
-//! 1. [`IoLoop::metrics_snapshot`] runs on the pinned thread and reads
+//! 1. [`NodeHost::metrics_snapshot`] runs on the pinned thread and reads
 //!    `.len()` / `.stats()` from every subsystem. No locks (beyond cheap
 //!    cache `len()`s), no I/O, no prometheus calls.
 //! 2. [`record_metrics`] takes the snapshot and dispatches the actual
@@ -32,7 +32,7 @@ use hyperscale_network::Network;
 use hyperscale_storage::{ChainWriter, Storage};
 use hyperscale_types::{ShardGroupId, ValidatorId};
 
-use crate::io_loop::IoLoop;
+use crate::host::NodeHost;
 
 /// Per-shard infrastructure counts.
 #[allow(missing_docs)] // fields are flat readouts; names are the documentation
@@ -87,7 +87,7 @@ impl MetricsSnapshot {
     /// Pick a representative `(ShardMetrics, VnodeMetrics)` pair for
     /// the memory readouts and any flat gauge that's still process-wide.
     /// Returns `None` if there's nothing hosted (shouldn't happen for a
-    /// running `IoLoop`).
+    /// running `NodeHost`).
     #[must_use]
     pub fn primary(&self) -> Option<(&ShardMetrics, &VnodeMetrics)> {
         let shard = self.shards.values().next()?;
@@ -138,7 +138,7 @@ pub fn record_metrics<S: ChainWriter>(snapshot: MetricsSnapshot, storage: &S) {
     set_memory_metrics(&memory);
 }
 
-impl<S, N, D, E> IoLoop<S, N, D, E>
+impl<S, N, D, E> NodeHost<S, N, D, E>
 where
     S: Storage,
     N: Network,
@@ -208,7 +208,7 @@ where
         let primary_shard = self
             .hosted_shards()
             .next()
-            .expect("IoLoop hosts at least one shard");
+            .expect("NodeHost hosts at least one shard");
         let primary_vnode = &self.vnode(primary_shard, 0).state;
         let bft_mem = primary_vnode.bft().memory_stats();
         let exec_mem = primary_vnode.execution().memory_stats();

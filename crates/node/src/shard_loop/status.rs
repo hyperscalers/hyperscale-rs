@@ -1,6 +1,6 @@
 //! Periodic node-status snapshot for external APIs.
 //!
-//! [`IoLoop::status_snapshot`] is consumed by the production runner's RPC
+//! [`NodeHost::status_snapshot`] is consumed by the production runner's RPC
 //! layer to surface health/liveness over a status endpoint. Cheap to call
 //! — pure reads from the state machine.
 //!
@@ -19,7 +19,7 @@ use hyperscale_types::{
     BlockHeight, InFlightCount, MAX_TX_IN_FLIGHT, ShardGroupId, StateRoot, ValidatorId,
 };
 
-use crate::io_loop::IoLoop;
+use crate::host::NodeHost;
 use crate::shard_io::sync::block::BlockSyncStatus;
 
 /// Per-shard status readout.
@@ -73,7 +73,7 @@ pub struct NodeStatusSnapshot {
 impl NodeStatusSnapshot {
     /// Pick a single `(ShardStatus, VnodeStatus)` pair to surface to
     /// flat-shape RPC clients. Returns `None` if the host has no shards
-    /// or no vnodes (shouldn't happen for a running `IoLoop`).
+    /// or no vnodes (shouldn't happen for a running `NodeHost`).
     ///
     /// Selection is "first hosted shard, first vnode in that shard" —
     /// stable across calls because the underlying maps are populated in
@@ -87,7 +87,7 @@ impl NodeStatusSnapshot {
     }
 }
 
-impl<S, N, D, E> IoLoop<S, N, D, E>
+impl<S, N, D, E> NodeHost<S, N, D, E>
 where
     S: Storage,
     N: Network,

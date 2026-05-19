@@ -264,7 +264,7 @@ impl ScopeState {
     }
 }
 
-pub use crate::io_loop::FetchFailureKind;
+pub use crate::shard_loop::FetchFailureKind;
 
 /// Inputs to the generic sync state machine.
 #[derive(Debug)]

@@ -22,10 +22,10 @@ use hyperscale_types::{
     BlockHeight, CommittedBlockHeader, HeaderFetchCount, ShardGroupId, ValidatorId,
 };
 
-use crate::io_loop::step::block_sync::classify_fetch_error;
-use crate::io_loop::{FetchFailureKind, ShardLoop, ShardScopedInput, push_shard_input};
 use crate::shard_io::sync::SyncOutput;
 use crate::shard_io::sync::remote_header::{RemoteHeaderSyncInput, RemoteHeaderSyncOutput};
+use crate::shard_loop::step::block_sync::classify_fetch_error;
+use crate::shard_loop::{FetchFailureKind, ShardLoop, ShardScopedInput, push_shard_input};
 
 impl<S, N, D, E> ShardLoop<S, N, D, E>
 where
@@ -39,7 +39,7 @@ where
     /// Handle `Action::StartRemoteHeaderSync`: feed this shard's FSM and
     /// dispatch any range fetches it emits. `source_shard` is the remote
     /// shard whose committed headers we're catching up on.
-    pub(in crate::io_loop) fn process_start_remote_header_sync(
+    pub(in crate::shard_loop) fn process_start_remote_header_sync(
         &mut self,
         source_shard: ShardGroupId,
         target: BlockHeight,
@@ -62,7 +62,7 @@ where
     /// path gossip-arrived headers take, so QC verification + admission
     /// stay unchanged. The FSM is told which heights actually arrived so
     /// it can defer the short-capped tail.
-    pub(in crate::io_loop) fn handle_remote_headers_response_received(
+    pub(in crate::shard_loop) fn handle_remote_headers_response_received(
         &mut self,
         source_shard: ShardGroupId,
         from_height: BlockHeight,
@@ -124,7 +124,7 @@ where
     }
 
     /// Network callback: a range fetch failed.
-    pub(in crate::io_loop) fn handle_remote_headers_fetch_failed(
+    pub(in crate::shard_loop) fn handle_remote_headers_fetch_failed(
         &mut self,
         source_shard: ShardGroupId,
         from_height: BlockHeight,
@@ -149,7 +149,7 @@ where
 
     /// Route FSM outputs: `Fetch` → network request, `Complete` →
     /// `RemoteHeaderSyncComplete` event.
-    pub(in crate::io_loop) fn process_remote_header_sync_outputs(
+    pub(in crate::shard_loop) fn process_remote_header_sync_outputs(
         &mut self,
         outputs: Vec<RemoteHeaderSyncOutput>,
     ) {

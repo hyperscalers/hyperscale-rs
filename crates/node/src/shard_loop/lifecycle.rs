@@ -4,12 +4,12 @@
 //! These methods run at well-defined points in the host's life, not
 //! on every event. The run-loop methods live in [`super`].
 //!
-//! - [`IoLoop::initialize_shard_genesis`] feeds the supplied genesis
+//! - [`NodeHost::initialize_shard_genesis`] feeds the supplied genesis
 //!   block into every vnode of its shard and drains the resulting
-//!   actions via the common [`IoLoop::drain_actions`] path.
-//! - [`IoLoop::install_engine_genesis`] commits the genesis substates +
+//!   actions via the common [`NodeHost::drain_actions`] path.
+//! - [`NodeHost::install_engine_genesis`] commits the genesis substates +
 //!   computes the genesis state root. Only runs on a fresh node.
-//! - [`IoLoop::register_inbound_handlers`] wires the request / gossip /
+//! - [`NodeHost::register_inbound_handlers`] wires the request / gossip /
 //!   notification handler closures into the network adapter. Required
 //!   before the I/O loop starts processing events; reached by both
 //!   genesis and resume paths.
@@ -20,9 +20,9 @@ use hyperscale_network::Network;
 use hyperscale_storage::{GenesisCommit, Storage};
 use hyperscale_types::{Block, ShardGroupId, StateRoot};
 
-use crate::io_loop::IoLoop;
+use crate::host::NodeHost;
 
-impl<S, N, D, E> IoLoop<S, N, D, E>
+impl<S, N, D, E> NodeHost<S, N, D, E>
 where
     S: Storage,
     N: Network,
@@ -68,7 +68,7 @@ where
 
     /// Register inbound network handlers (requests, gossip, notifications).
     ///
-    /// Must be called once per node before the `IoLoop` starts processing
+    /// Must be called once per node before the `NodeHost` starts processing
     /// events. Both genesis and resume paths reach this — registration is
     /// not coupled to whether genesis ran.
     pub fn register_inbound_handlers(&mut self) {

@@ -24,7 +24,8 @@ use hyperscale_types::network::gossip::TransactionGossip;
 use hyperscale_types::{RoutableTransaction, ShardGroupId, TxHash, shard_for_node};
 
 use crate::batch_accumulator::BatchAccumulator;
-use crate::io_loop::{IoLoop, ShardLoop, ShardScopedInput, push_shard_input};
+use crate::host::NodeHost;
+use crate::shard_loop::{ShardLoop, ShardScopedInput, push_shard_input};
 
 impl<S, N, D, E> ShardLoop<S, N, D, E>
 where
@@ -43,7 +44,7 @@ where
     ///
     /// [`TxStore`]: hyperscale_mempool::TxStore
     /// [`MempoolCoordinator::on_transaction_gossip`]: hyperscale_mempool::MempoolCoordinator
-    pub(in crate::io_loop) fn handle_transaction_validated(
+    pub(in crate::shard_loop) fn handle_transaction_validated(
         &mut self,
         tx: Arc<RoutableTransaction>,
     ) {
@@ -58,7 +59,10 @@ where
 
     /// Validation failed — drop tracking entries so the tx can be
     /// re-validated if it shows up again.
-    pub(in crate::io_loop) fn handle_transaction_validations_failed(&mut self, hashes: &[TxHash]) {
+    pub(in crate::shard_loop) fn handle_transaction_validations_failed(
+        &mut self,
+        hashes: &[TxHash],
+    ) {
         for hash in hashes {
             self.io.pending_validation.remove(hash);
             self.io.locally_submitted.remove(hash);
@@ -68,7 +72,7 @@ where
     /// Intercept a gossip-received transaction before it reaches the state
     /// machine: queue for batched async validation if we don't already
     /// have it cached and it isn't tombstoned by mempool.
-    pub(in crate::io_loop) fn handle_gossip_received_tx_for_validation(
+    pub(in crate::shard_loop) fn handle_gossip_received_tx_for_validation(
         &mut self,
         tx: Arc<RoutableTransaction>,
     ) {
@@ -88,10 +92,10 @@ where
     /// Append a tx to the destination shard's outbound gossip
     /// accumulator on this shard, flushing immediately if the count cap
     /// is hit. Time-based flushes happen via
-    /// [`IoLoop::flush_expired_batches`]. The accumulator lives on the
+    /// [`NodeHost::flush_expired_batches`]. The accumulator lives on the
     /// "source" `ShardLoop` (this one) — when the gossip flushes it
     /// publishes to the destination shard's topic.
-    pub(in crate::io_loop) fn enqueue_tx_for_gossip(
+    pub(in crate::shard_loop) fn enqueue_tx_for_gossip(
         &mut self,
         dst: ShardGroupId,
         tx: Arc<RoutableTransaction>,
@@ -111,7 +115,7 @@ where
     /// Drain this shard's outbound gossip accumulator for destination
     /// shard `dst` and publish it as a single `TransactionGossip` batch.
     /// No-op if empty.
-    pub(in crate::io_loop) fn flush_tx_gossip_batch(&mut self, dst: ShardGroupId) {
+    pub(crate) fn flush_tx_gossip_batch(&mut self, dst: ShardGroupId) {
         let Some(batch) = self.outbound_gossip_batches.get_mut(&dst) else {
             return;
         };
@@ -126,7 +130,7 @@ where
     // ─── Validation batching ────────────────────────────────────────────
 
     /// Queue a transaction for batch validation on this shard.
-    pub(in crate::io_loop) fn queue_validation(&mut self, tx: Arc<RoutableTransaction>) {
+    pub(in crate::shard_loop) fn queue_validation(&mut self, tx: Arc<RoutableTransaction>) {
         let now = self.now;
         if self.io.validation_batch.push(tx, now) {
             self.flush_validation_batch();
@@ -140,7 +144,7 @@ where
     /// through the event channel; failures land as
     /// `TransactionValidationsFailed` so the shard can clean up
     /// `pending_validation` / `locally_submitted`.
-    pub(in crate::io_loop) fn flush_validation_batch(&mut self) {
+    pub(crate) fn flush_validation_batch(&mut self) {
         let batch = self.io.validation_batch.take();
         if batch.is_empty() {
             return;
@@ -182,7 +186,7 @@ where
     }
 }
 
-impl<S, N, D, E> IoLoop<S, N, D, E>
+impl<S, N, D, E> NodeHost<S, N, D, E>
 where
     S: Storage,
     N: Network,
@@ -197,7 +201,7 @@ where
     /// and writing shard B on a host that carries vnodes in both).
     /// Gossip uses the first hosted shard as the "from" for batching —
     /// gossipsub dedup handles any incidental duplication on the wire.
-    pub(in crate::io_loop) fn handle_submit_transaction(&mut self, tx: &Arc<RoutableTransaction>) {
+    pub(crate) fn handle_submit_transaction(&mut self, tx: &Arc<RoutableTransaction>) {
         let tx_hash = tx.hash();
 
         let num_shards = self.process.topology_snapshot.load().num_shards();

@@ -18,7 +18,7 @@ use hyperscale_engine::{Engine, TransactionValidation};
 use hyperscale_storage::Storage;
 
 use crate::event::ShardEvent;
-use crate::io_loop::{DispatchHandles, SharedTopologySnapshot};
+use crate::shard_loop::{DispatchHandles, SharedTopologySnapshot};
 
 /// Process-scoped resources shared across every hosted shard.
 ///
