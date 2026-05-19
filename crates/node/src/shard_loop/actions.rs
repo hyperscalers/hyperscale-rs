@@ -170,6 +170,10 @@ where
                     .caches
                     .finalized_wave
                     .insert(wave.wave_id().clone(), Arc::clone(wave));
+                self.process
+                    .dispatch_handles
+                    .execution_cache
+                    .on_finalized_wave(self.shard, wave.tx_hashes());
             }
         }
 
@@ -287,10 +291,15 @@ where
                     .handle(BlockSyncInput::Admitted { scope: (), height });
                 self.process_block_sync_outputs(outputs);
                 if let Some((block, qc)) = notify_now {
+                    let weighted_ts = qc.weighted_timestamp();
                     let certified = Arc::new(CertifiedBlock::new_unchecked(
                         Arc::unwrap_or_clone(block),
                         Arc::unwrap_or_clone(qc),
                     ));
+                    self.process
+                        .dispatch_handles
+                        .execution_cache
+                        .on_block_committed(weighted_ts);
                     self.dispatch_event(ProtocolEvent::BlockCommitted { certified });
                 }
             }

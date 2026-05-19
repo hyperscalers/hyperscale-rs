@@ -37,11 +37,6 @@ use crate::shard_loop::{
 };
 use crate::vnode::{Vnode, VnodeInit};
 
-/// Capacity for the per-process execution cache. Sized well above the
-/// expected in-flight tx working set; entries beyond the cap are
-/// evicted in insertion order.
-const EXECUTION_CACHE_CAPACITY: usize = 4096;
-
 /// Output of [`NodeHost::into_parts`]: shared process-scoped resources
 /// plus the per-shard drivers, keyed by hosted shard id.
 pub type NodeHostParts<S, N, D, E> = (
@@ -202,7 +197,7 @@ where
             shard_builds.insert(*shard, (io, vnodes));
         }
 
-        let execution_cache = Arc::new(ProcessExecutionCache::new(EXECUTION_CACHE_CAPACITY));
+        let execution_cache = Arc::new(ProcessExecutionCache::new(hosted_shards.clone()));
         let dispatch_handles = Arc::new(DispatchHandles {
             executor: executor.clone(),
             network: Arc::clone(&network),
