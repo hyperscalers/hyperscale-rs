@@ -297,7 +297,7 @@ where
         }
     }
 
-    pub(super) fn flush_block_commits(&mut self) {
+    pub(crate) fn flush_block_commits(&mut self) {
         let event_sender = self.process.event_sender.clone();
         let dispatch = self.process.dispatch.clone();
         let io = &mut self.io;
@@ -312,7 +312,7 @@ where
     /// as a `shard` / `source_shard` field. `Request` never emits `Send`s
     /// on its own — it only adds the ids to the pending set; chunks fan
     /// out under the per-tick cap. The tick timer is refreshed once at
-    /// the end of `IoLoop::step`.
+    /// the end of `NodeHost::step`.
     ///
     /// [`FetchHost`]: crate::shard_io::fetch::FetchHost
     fn process_fetch_request(&mut self, req: FetchRequest) {
@@ -479,7 +479,7 @@ where
     /// and shard committees off the snapshot). Idempotent across hosted
     /// shards — every same-shard vnode's `Action::TopologyChanged` lands
     /// here, but the final stored value is identical.
-    pub(in crate::io_loop) fn handle_topology_changed(&self, topology: &Arc<TopologySnapshot>) {
+    pub(in crate::shard_loop) fn handle_topology_changed(&self, topology: &Arc<TopologySnapshot>) {
         self.process.topology_snapshot.store(Arc::clone(topology));
 
         // Network impl reads validator keys + shard committees off the

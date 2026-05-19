@@ -1,17 +1,17 @@
-//! Per-validator bundle hosted by the `IoLoop`.
+//! Per-validator bundle hosted by the `NodeHost`.
 //!
 //! One [`Vnode`] per validator identity, owned by a [`ShardLoop`] in
-//! the `IoLoop`'s `shards` map. Same-shard vnodes share the enclosing
+//! the `NodeHost`'s `shards` map. Same-shard vnodes share the enclosing
 //! `ShardLoop`'s `ShardIo`; cross-shard vnodes live in different
 //! groups. The vnode's shard is implied by which group it lives in —
 //! no denormalized field.
 //!
 //! Per-step scratch (emitted statuses, action counter, timer ops)
-//! lives on the `IoLoop`, not here — those buffers are step-local
+//! lives on the `NodeHost`, not here — those buffers are step-local
 //! and carry the emitting vnode's `(shard, idx)` via the existing
 //! action-dispatch threading.
 //!
-//! [`ShardLoop`]: crate::io_loop::ShardLoop
+//! [`ShardLoop`]: crate::shard_loop::ShardLoop
 
 use std::sync::Arc;
 
@@ -20,7 +20,7 @@ use hyperscale_types::{Bls12381G1PrivateKey, ValidatorId};
 use crate::NodeStateMachine;
 
 /// Caller-supplied bundle for constructing one [`Vnode`]. The
-/// `IoLoop` constructor wraps each entry into a full [`Vnode`] and
+/// `NodeHost` constructor wraps each entry into a full [`Vnode`] and
 /// shares one `ShardIo` across same-shard entries.
 pub struct VnodeInit {
     /// Per-validator state machine, already populated with its
@@ -34,7 +34,7 @@ pub struct VnodeInit {
     pub signing_key: Arc<Bls12381G1PrivateKey>,
 }
 
-/// Per-validator bundle hosted by the `IoLoop`.
+/// Per-validator bundle hosted by the `NodeHost`.
 pub struct Vnode {
     /// Identity this vnode votes as. Stable for the vnode's lifetime;
     /// keys the network adapter's bind handshake and the per-vnode
@@ -42,7 +42,7 @@ pub struct Vnode {
     pub validator_id: ValidatorId,
 
     /// Per-validator consensus state. Driven exclusively from the pinned
-    /// `IoLoop` thread via `state.handle(now, event)`; off-thread closures
+    /// `NodeHost` thread via `state.handle(now, event)`; off-thread closures
     /// never touch it.
     pub state: NodeStateMachine,
 

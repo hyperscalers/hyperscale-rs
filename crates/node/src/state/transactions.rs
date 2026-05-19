@@ -7,7 +7,7 @@
 //! - `TransactionsAdmitted` — mempool emits this after admission; BFT's
 //!   pending-block subscriber consumes it and we latch a proposal-retry.
 //!
-//! Raw gossip arrivals enter `IoLoop` as `ShardScopedInput::TransactionGossipReceived`
+//! Raw gossip arrivals enter `NodeHost` as `ShardScopedInput::TransactionGossipReceived`
 //! and never reach the state machine; the validated form does.
 
 use std::sync::Arc;

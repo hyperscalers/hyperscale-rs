@@ -4,7 +4,7 @@ use std::cmp::Ordering;
 use std::time::Duration;
 
 use hyperscale_network_memory::NodeIndex;
-use hyperscale_node::io_loop::{EventPriority, ShardEvent};
+use hyperscale_node::shard_loop::{EventPriority, ShardEvent};
 
 /// Key for ordering events in the queue.
 ///

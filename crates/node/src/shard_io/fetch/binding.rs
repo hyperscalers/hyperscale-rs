@@ -13,7 +13,7 @@
 //! `Fetch::handle(FetchInput::Admitted { .. })` on the right binding
 //! when each canonical admission event fires.
 //!
-//! `IoLoop` invokes the trait methods through generic helpers
+//! `NodeHost` invokes the trait methods through generic helpers
 //! (`process_fetch_outputs`, `dispatch_fetch_request`), so adding a new
 //! payload means writing one impl block here — not editing three parallel
 //! files.
@@ -35,7 +35,7 @@ use hyperscale_types::{
 
 use super::Fetch;
 use super::host::FetchHost;
-use crate::io_loop::{ShardEvent, ShardScopedInput, push_protocol_event, push_shard_input};
+use crate::shard_loop::{ShardEvent, ShardScopedInput, push_protocol_event, push_shard_input};
 
 // ─── Type aliases used across the module tree ──────────────────────────
 

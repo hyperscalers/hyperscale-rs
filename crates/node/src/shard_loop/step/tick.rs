@@ -13,21 +13,21 @@ use hyperscale_network::Network;
 use hyperscale_storage::Storage;
 use hyperscale_types::ShardGroupId;
 
-use crate::io_loop::IoLoop;
+use crate::host::NodeHost;
 use crate::shard_io::fetch::FetchInput;
 use crate::shard_io::fetch::binding::{
     ExecCertBinding, FinalizedWaveBinding, LocalProvisionBinding, ProvisionBinding,
     TransactionBinding,
 };
 
-impl<S, N, D, E> IoLoop<S, N, D, E>
+impl<S, N, D, E> NodeHost<S, N, D, E>
 where
     S: Storage,
     N: Network,
     D: Dispatch,
     E: Engine,
 {
-    pub(in crate::io_loop) fn handle_fetch_tick(&mut self) {
+    pub(crate) fn handle_fetch_tick(&mut self) {
         let now = std::time::Instant::now();
         let hosted: Vec<ShardGroupId> = self.hosted_shards().collect();
         for shard in hosted {

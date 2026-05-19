@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use hyperscale_core::ProtocolEvent;
 use hyperscale_network_memory::{HostingMode, NetworkConfig};
-use hyperscale_node::io_loop::ShardEvent;
+use hyperscale_node::shard_loop::ShardEvent;
 use hyperscale_simulation::SimulationRunner;
 use hyperscale_types::{
     BlockHeight, LocalTimestamp, QuorumCertificate, Round, ShardGroupId, TransactionStatus,
@@ -1153,7 +1153,7 @@ fn test_consensus_throughput() {
 /// 3. Verify transactions appear in committed blocks
 #[test]
 fn test_mempool_to_block_integration() {
-    use hyperscale_node::io_loop::ProcessScopedInput;
+    use hyperscale_node::shard_loop::ProcessScopedInput;
     use hyperscale_types::test_utils::test_transaction;
 
     let config = test_network_config();
@@ -1254,7 +1254,7 @@ fn test_mempool_to_block_integration() {
 /// 5. Execution runs and creates certificates
 #[test]
 fn test_execution_flow() {
-    use hyperscale_node::io_loop::ProcessScopedInput;
+    use hyperscale_node::shard_loop::ProcessScopedInput;
     use hyperscale_types::test_utils::test_transaction;
 
     let config = test_network_config();
@@ -1305,7 +1305,7 @@ fn test_execution_flow() {
 /// it eventually appears in other validators' mempools via gossip.
 #[test]
 fn test_transaction_gossip() {
-    use hyperscale_node::io_loop::ProcessScopedInput;
+    use hyperscale_node::shard_loop::ProcessScopedInput;
     use hyperscale_types::test_utils::test_transaction;
 
     let config = test_network_config();

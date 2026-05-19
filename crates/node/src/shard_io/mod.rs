@@ -1,11 +1,11 @@
-//! Per-shard I/O state hosted by the `IoLoop`.
+//! Per-shard I/O state hosted by the `NodeHost`.
 //!
 //! One [`ShardIo`] per hosted shard. Same-shard `Vnode`s share their
 //! `ShardIo`; cross-shard `Vnode`s live independently. Shard-scoped
 //! state (storage, fetch host, sync host, block-commit pipeline,
 //! request-serving caches, batch accumulators) lives here so that
 //! multi-vnode hosting captures the natural sharing structure without
-//! leaking state across `IoLoop`s.
+//! leaking state across `NodeHost`s.
 
 pub mod block_commit;
 pub mod caches;
@@ -39,7 +39,7 @@ pub type CommittedHeaderVerificationItem = (
     Bls12381G2Signature,
 );
 
-/// Per-shard I/O state hosted by the `IoLoop`.
+/// Per-shard I/O state hosted by the `NodeHost`.
 pub struct ShardIo<S: Storage> {
     /// Persistent block / receipt / JMT store for this shard. `Arc` so
     /// delegated closures (block-commit, fetch-serve, sync) can read

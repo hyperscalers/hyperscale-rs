@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_network_memory::NetworkConfig;
-use hyperscale_node::io_loop::{ProcessScopedInput, ShardEvent};
+use hyperscale_node::shard_loop::{ProcessScopedInput, ShardEvent};
 use hyperscale_simulation::SimulationRunner;
 use hyperscale_types::test_utils::test_validity_range;
 use hyperscale_types::{

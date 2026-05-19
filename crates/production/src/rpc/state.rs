@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use crossbeam::channel::Sender;
-use hyperscale_node::io_loop::ShardEvent;
+use hyperscale_node::shard_loop::ShardEvent;
 use hyperscale_types::{InFlightCount, ShardGroupId, TransactionStatus, TxHash};
 use quick_cache::sync::Cache as QuickCache;
 use serde::{Deserialize, Serialize};

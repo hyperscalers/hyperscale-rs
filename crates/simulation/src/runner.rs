@@ -21,8 +21,8 @@ use hyperscale_network_memory::{
     BandwidthReport, HostingMode, NetworkConfig, NetworkTrafficAnalyzer, NodeIndex,
     SimNetworkAdapter, SimulatedNetwork,
 };
-use hyperscale_node::io_loop::{IoLoop, ShardEvent, StepOutput};
-use hyperscale_node::{NodeConfig, NodeStateMachine, TimerOp, VnodeInit, timer_event};
+use hyperscale_node::shard_loop::{ShardEvent, StepOutput};
+use hyperscale_node::{NodeConfig, NodeHost, NodeStateMachine, TimerOp, VnodeInit, timer_event};
 use hyperscale_provisions::{ProvisionConfig, ProvisionStore};
 use hyperscale_storage::{ChainReader, RecoveredState};
 use hyperscale_storage_memory::SimStorage;
@@ -42,7 +42,7 @@ use tracing::{debug, info, trace};
 use crate::event_queue::EventKey;
 
 /// Type alias for the simulation's concrete `IoLoop`.
-type SimIoLoop = IoLoop<SimStorage, SimNetworkAdapter, SyncDispatch, SimulationEngine>;
+type SimIoLoop = NodeHost<SimStorage, SimNetworkAdapter, SyncDispatch, SimulationEngine>;
 
 /// Per-(host, shard) shared store bundle — `ProvisionStore`, `TxStore`,
 /// `ExecCertStore`, and `FinalizedWaveStore` cloned into every same-shard
@@ -318,7 +318,7 @@ impl SimulationRunner {
             // One `SimStorage` per hosted shard on this host.
             let storages: HashMap<ShardGroupId, SimStorage> =
                 by_shard.keys().map(|s| (*s, SimStorage::new())).collect();
-            let io_loop = IoLoop::new(
+            let io_loop = NodeHost::new(
                 vnode_inits,
                 storages,
                 sim_engine,

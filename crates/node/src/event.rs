@@ -78,13 +78,13 @@ pub enum FetchFailureKind {
 /// the shard at dispatch time and stamp every result.
 #[derive(Debug, Clone, strum::IntoStaticStr)]
 pub enum ShardScopedInput {
-    /// Pass-through to state machine. `IoLoop` extracts the `ProtocolEvent`
+    /// Pass-through to state machine. `NodeHost` extracts the `ProtocolEvent`
     /// and feeds it to every vnode hosted in the envelope's shard. Boxed
     /// because `ProtocolEvent` dwarfs every other variant and would inflate
     /// the event queue otherwise.
     Protocol(Box<ProtocolEvent>),
 
-    /// Raw gossip-delivered transaction. `IoLoop` queues it for async
+    /// Raw gossip-delivered transaction. `NodeHost` queues it for async
     /// validation; the validated form is surfaced as
     /// `ProtocolEvent::TransactionValidated`.
     TransactionGossipReceived {
@@ -93,7 +93,7 @@ pub enum ShardScopedInput {
     },
 
     /// Sync block response received from network callback. Carries the
-    /// elided wire shape; the `IoLoop` rehydrates to a full `CertifiedBlock`
+    /// elided wire shape; the `NodeHost` rehydrates to a full `CertifiedBlock`
     /// by looking up omitted bodies in the local mempool / cert cache /
     /// provision store before handing off to the sync state machine.
     BlockSyncResponseReceived {
@@ -113,7 +113,7 @@ pub enum ShardScopedInput {
     },
 
     /// Sync block passed structural validation off-thread (Merkle roots,
-    /// QC binding, per-wave shape). The pinned-thread `IoLoop` re-enters
+    /// QC binding, per-wave shape). The pinned-thread `NodeHost` re-enters
     /// the post-validation delivery path on receipt.
     SyncBlockValidated {
         /// Height of the validated block.
@@ -176,7 +176,7 @@ pub enum ShardScopedInput {
         ids: Vec<WaveId>,
     },
 
-    /// Transaction validated by the validation pipeline. The `IoLoop`
+    /// Transaction validated by the validation pipeline. The `NodeHost`
     /// resolves `submitted_locally` from its `locally_submitted` set
     /// before forwarding as `ProtocolEvent::TransactionValidated`.
     TransactionValidated {
@@ -184,7 +184,7 @@ pub enum ShardScopedInput {
         tx: Arc<RoutableTransaction>,
     },
 
-    /// Transactions that failed validation — sent back so the `IoLoop` can
+    /// Transactions that failed validation — sent back so the `NodeHost` can
     /// remove their hashes from `pending_validation` and `locally_submitted`.
     TransactionValidationsFailed {
         /// Hashes of transactions that failed validation.

@@ -1,11 +1,11 @@
-//! Consolidated configuration for `IoLoop`.
+//! Consolidated configuration for `NodeHost`.
 
 use std::time::Duration;
 
 use crate::shard_io::fetch::FetchConfig;
 use crate::shard_io::sync::block::BlockSyncConfig;
 
-/// Configuration for [`IoLoop`](crate::io_loop::IoLoop).
+/// Configuration for [`NodeHost`](crate::host::NodeHost).
 ///
 /// Bundles all sub-component configs so runners can pass a single value.
 #[derive(Debug, Default, Clone)]

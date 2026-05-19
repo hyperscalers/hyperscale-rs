@@ -21,13 +21,13 @@ use std::sync::Arc;
 use hyperscale_core::ProtocolEvent;
 use hyperscale_network::RequestError;
 
-use crate::io_loop::{FetchFailureKind, ShardScopedInput};
+use crate::shard_loop::{FetchFailureKind, ShardScopedInput};
 
 /// Classify a transport-level request error for the sync FSM. `Exhausted`
 /// already absorbed retries against rotated peers — re-queue immediately;
 /// other variants reflect transport conditions where a brief deferral is
 /// appropriate.
-pub(in crate::io_loop) const fn classify_fetch_error(err: &RequestError) -> FetchFailureKind {
+pub(in crate::shard_loop) const fn classify_fetch_error(err: &RequestError) -> FetchFailureKind {
     match err {
         RequestError::Exhausted { .. } => FetchFailureKind::Exhausted,
         RequestError::NoPeers => FetchFailureKind::NoPeers,
@@ -52,9 +52,9 @@ use hyperscale_types::{
     compute_transaction_root,
 };
 
-use crate::io_loop::{ShardLoop, push_shard_input};
 use crate::shard_io::sync::SyncOutput;
 use crate::shard_io::sync::block::{BlockSyncInput, BlockSyncOutput};
+use crate::shard_loop::{ShardLoop, push_shard_input};
 
 impl<S, N, D, E> ShardLoop<S, N, D, E>
 where
@@ -67,7 +67,7 @@ where
 
     /// Handle `Action::StartBlockSync`: feed this shard's FSM and dispatch
     /// any fetches it emits.
-    pub(in crate::io_loop) fn process_start_block_sync(&mut self, target: BlockHeight) {
+    pub(in crate::shard_loop) fn process_start_block_sync(&mut self, target: BlockHeight) {
         let outputs = self
             .io
             .syncs
@@ -83,7 +83,7 @@ where
     /// `ConsensusCrypto`. On rehydration miss, mark the height for full
     /// refetch and re-queue. The verdict returns as
     /// `ShardScopedInput::SyncBlockValidated` / `SyncBlockValidationFailed`.
-    pub(in crate::io_loop) fn handle_block_sync_response_received(
+    pub(in crate::shard_loop) fn handle_block_sync_response_received(
         &mut self,
         height: BlockHeight,
         block: Option<Box<ElidedCertifiedBlock>>,
@@ -133,7 +133,7 @@ where
     }
 
     /// Handle a sync block fetch failure (network error / not-found).
-    pub(in crate::io_loop) fn handle_block_sync_fetch_failed(
+    pub(in crate::shard_loop) fn handle_block_sync_fetch_failed(
         &mut self,
         height: BlockHeight,
         kind: FetchFailureKind,
@@ -144,7 +144,7 @@ where
 
     /// Resume the post-validation delivery path after off-thread
     /// structural validation succeeded.
-    pub(in crate::io_loop) fn handle_sync_block_validated(
+    pub(in crate::shard_loop) fn handle_sync_block_validated(
         &mut self,
         height: BlockHeight,
         certified: CertifiedBlock,
@@ -154,7 +154,7 @@ where
 
     /// Resume the failure path after off-thread structural validation
     /// rejected the response.
-    pub(in crate::io_loop) fn handle_sync_block_validation_failed(
+    pub(in crate::shard_loop) fn handle_sync_block_validation_failed(
         &mut self,
         height: BlockHeight,
         reason: &'static str,
@@ -171,7 +171,10 @@ where
 
     /// Process FSM outputs: `Fetch` → network request, `Complete` →
     /// fed into the state machine as `BlockSyncComplete`.
-    pub(in crate::io_loop) fn process_block_sync_outputs(&mut self, outputs: Vec<BlockSyncOutput>) {
+    pub(in crate::shard_loop) fn process_block_sync_outputs(
+        &mut self,
+        outputs: Vec<BlockSyncOutput>,
+    ) {
         // Snapshot the sync inventory once per batch so every Fetch in
         // this tick shares a consistent view of mempool / cert-cache /
         // provision-store membership. Built lazily.

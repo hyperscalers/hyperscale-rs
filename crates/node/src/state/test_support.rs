@@ -9,7 +9,7 @@
 //!   `&BftCoordinator` / `&MempoolCoordinator` / etc. accessors).
 //!
 //! No mocks, no dispatch-table tracing — assertions ride on the same
-//! contract `IoLoop` consumes in production.
+//! contract `NodeHost` consumes in production.
 
 use std::sync::Arc;
 

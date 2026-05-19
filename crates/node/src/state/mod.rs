@@ -8,7 +8,7 @@
 //!
 //! All consensus-critical mutation flows through this state machine.
 //! Asynchronous concerns (network I/O, thread-pool dispatch, timer
-//! scheduling) live on [`IoLoop`](crate::io_loop), which feeds events
+//! scheduling) live on [`NodeHost`](crate::io_loop), which feeds events
 //! in and dispatches emitted [`Action`]s.
 //!
 //! Submodules route inputs to the appropriate coordinator: [`bft`] for
@@ -49,9 +49,9 @@ use tracing::instrument;
 /// machine. View changes are handled implicitly via local round advancement
 /// in `BftCoordinator` (HotStuff-2 style).
 ///
-/// The block-sync state machine itself lives on `IoLoop` (in
+/// The block-sync state machine itself lives on `NodeHost` (in
 /// `shard_io::sync::block`); when a synced block is ready to apply,
-/// `IoLoop` fires a `BlockSyncReadyToApply` event into this state machine,
+/// `NodeHost` fires a `BlockSyncReadyToApply` event into this state machine,
 /// which routes it to BFT.
 pub struct NodeStateMachine {
     /// Network topology — passed by reference to subsystem methods.
