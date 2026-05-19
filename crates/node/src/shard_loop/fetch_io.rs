@@ -4,7 +4,6 @@ use std::time::Duration;
 
 use hyperscale_core::{ProtocolEvent, TimerId};
 use hyperscale_dispatch::Dispatch;
-use hyperscale_engine::Engine;
 use hyperscale_network::Network;
 use hyperscale_storage::Storage;
 
@@ -15,12 +14,11 @@ use crate::shard_io::fetch::binding::{
 };
 use crate::shard_io::fetch::{FetchInput, FetchOutput};
 
-impl<S, N, D, E> ShardLoop<S, N, D, E>
+impl<S, N, D> ShardLoop<S, N, D>
 where
     S: Storage,
     N: Network,
     D: Dispatch,
-    E: Engine,
 {
     /// Dispatch outputs from a [`FetchBinding`]'s state machine on this
     /// shard: emit one network request per chunk (or per id, for `PER_ID`
@@ -145,12 +143,11 @@ where
     }
 }
 
-impl<S, N, D, E> ShardLoop<S, N, D, E>
+impl<S, N, D> ShardLoop<S, N, D>
 where
     S: Storage,
     N: Network,
     D: Dispatch,
-    E: Engine,
 {
     /// Interval for the periodic fetch tick timer.
     pub(in crate::shard_loop) const FETCH_TICK_INTERVAL: Duration = Duration::from_millis(200);

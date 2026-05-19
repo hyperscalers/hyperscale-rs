@@ -22,7 +22,6 @@
 use std::collections::HashMap;
 
 use hyperscale_dispatch::Dispatch;
-use hyperscale_engine::Engine;
 use hyperscale_metrics::{
     MemoryMetrics, set_backpressure_active, set_bft_round, set_fetch_in_flight, set_in_flight,
     set_lock_contention, set_memory_metrics, set_mempool_size, set_sync_blocks_behind,
@@ -141,12 +140,11 @@ pub fn record_metrics(
     set_memory_metrics(&memory);
 }
 
-impl<S, N, D, E> super::ShardLoop<S, N, D, E>
+impl<S, N, D> super::ShardLoop<S, N, D>
 where
     S: Storage,
     N: Network,
     D: Dispatch,
-    E: Engine,
 {
     /// Emit this shard's per-shard and per-vnode prometheus gauges.
     /// Called from the shard's pinned thread on the metrics tick.
@@ -190,12 +188,11 @@ where
     }
 }
 
-impl<S, N, D, E> NodeHost<S, N, D, E>
+impl<S, N, D> NodeHost<S, N, D>
 where
     S: Storage,
     N: Network,
     D: Dispatch,
-    E: Engine,
 {
     /// Capture a lightweight metrics snapshot from state-machine internals.
     ///

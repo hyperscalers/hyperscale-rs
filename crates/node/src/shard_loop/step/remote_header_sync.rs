@@ -10,7 +10,6 @@ use std::sync::Arc;
 
 use hyperscale_core::ProtocolEvent;
 use hyperscale_dispatch::Dispatch;
-use hyperscale_engine::Engine;
 use hyperscale_metrics::{
     record_sync_round_completed, record_sync_round_retried, record_sync_round_started,
 };
@@ -27,12 +26,11 @@ use crate::shard_io::sync::remote_header::{RemoteHeaderSyncInput, RemoteHeaderSy
 use crate::shard_loop::step::block_sync::classify_fetch_error;
 use crate::shard_loop::{FetchFailureKind, ShardLoop, ShardScopedInput, push_shard_input};
 
-impl<S, N, D, E> ShardLoop<S, N, D, E>
+impl<S, N, D> ShardLoop<S, N, D>
 where
     S: Storage,
     N: Network,
     D: Dispatch,
-    E: Engine,
 {
     // ─── Action dispatch ────────────────────────────────────────────────
 

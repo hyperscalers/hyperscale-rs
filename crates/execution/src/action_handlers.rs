@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use hyperscale_core::{Action, ActionContext, ProtocolEvent};
-use hyperscale_engine::{Engine, project_to_shard};
+use hyperscale_engine::project_to_shard;
 use hyperscale_metrics::record_execution_latency;
 use hyperscale_network::Network;
 use hyperscale_storage::{Storage, SubstateStore, SubstateView};
@@ -238,13 +238,11 @@ fn participating_shards(
 /// # Panics
 ///
 /// Panics if the dispatcher routes a variant owned by another crate, or if
-/// the [`hyperscale_engine::Engine`] breaks its "one result per input
-/// transaction" contract.
+/// the executor breaks its "one result per input transaction" contract.
 #[allow(clippy::too_many_lines)] // single dispatch over execution-owned Action variants
-pub fn handle_action<S, E, N>(action: Action, ctx: &ActionContext<'_, S, E, N>)
+pub fn handle_action<S, N>(action: Action, ctx: &ActionContext<'_, S, N>)
 where
     S: Storage,
-    E: Engine,
     N: Network,
 {
     match action {

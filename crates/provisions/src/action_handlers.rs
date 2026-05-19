@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use hyperscale_core::{Action, ActionContext, ProtocolEvent, ProvisionsRequest};
+use hyperscale_engine::fetch_state_entries;
 use hyperscale_engine::sharding::expand_nodes_with_owned_at_height;
-use hyperscale_engine::{Engine, fetch_state_entries};
 use hyperscale_jmt::TreeReader as JmtTreeReader;
 use hyperscale_metrics::record_signature_verification_latency;
 use hyperscale_network::Network;
@@ -166,10 +166,9 @@ where
 ///
 /// Outcomes flow through `ctx.notify`. Variants owned by other coordinator
 /// crates hit `unreachable!()` — node's dispatcher routes by variant prefix.
-pub fn handle_action<S, E, N>(action: Action, ctx: &ActionContext<'_, S, E, N>)
+pub fn handle_action<S, N>(action: Action, ctx: &ActionContext<'_, S, N>)
 where
     S: Storage,
-    E: Engine,
     N: Network,
 {
     match action {

@@ -14,19 +14,18 @@
 //!   and resume paths.
 
 use hyperscale_dispatch::Dispatch;
-use hyperscale_engine::{Engine, GenesisConfig, prepared_genesis};
+use hyperscale_engine::{GenesisConfig, prepared_genesis};
 use hyperscale_network::Network;
 use hyperscale_storage::{GenesisCommit, Storage};
 use hyperscale_types::{Block, ShardGroupId, StateRoot};
 
 use crate::host::NodeHost;
 
-impl<S, N, D, E> NodeHost<S, N, D, E>
+impl<S, N, D> NodeHost<S, N, D>
 where
     S: Storage,
     N: Network,
     D: Dispatch,
-    E: Engine,
 {
     /// Initialize every vnode in `genesis_block`'s shard with the
     /// supplied genesis block, dispatching the resulting actions
@@ -61,7 +60,7 @@ where
     where
         S: GenesisCommit,
     {
-        let merged = prepared_genesis(self.executor.network(), config);
+        let merged = prepared_genesis(self.process.dispatch_handles.executor.network(), config);
         self.shard_io(shard).storage.install_genesis(&merged)
     }
 

@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use crossbeam::channel::Sender;
 use hyperscale_dispatch::Dispatch;
-use hyperscale_engine::{Engine, ProcessExecutionCache, RadixExecutor, TransactionValidation};
+use hyperscale_engine::{ProcessExecutionCache, RadixExecutor, TransactionValidation};
 use hyperscale_network::Network;
 use hyperscale_storage::{PendingChain, Storage};
 use hyperscale_types::{LocalTimestamp, ShardGroupId, TransactionStatus, TxHash};
@@ -39,9 +39,9 @@ use crate::vnode::{Vnode, VnodeInit};
 
 /// Output of [`NodeHost::into_parts`]: shared process-scoped resources
 /// plus the per-shard drivers, keyed by hosted shard id.
-pub type NodeHostParts<S, N, D, E> = (
-    Arc<ProcessIo<S, N, D, E>>,
-    HashMap<ShardGroupId, ShardLoop<S, N, D, E>>,
+pub type NodeHostParts<S, N, D> = (
+    Arc<ProcessIo<S, N, D>>,
+    HashMap<ShardGroupId, ShardLoop<S, N, D>>,
 );
 
 /// Top-level node composition: process-scoped resources plus one
@@ -51,8 +51,7 @@ pub type NodeHostParts<S, N, D, E> = (
 /// - `S`: Storage (umbrella bound — see [`Storage`])
 /// - `N`: Network (message sending)
 /// - `D`: Dispatch (thread pool work scheduling)
-/// - `E`: Engine (transaction execution — defaults to `RadixExecutor`)
-pub struct NodeHost<S, N, D, E: Engine = RadixExecutor>
+pub struct NodeHost<S, N, D>
 where
     S: Storage,
     D: Dispatch,
@@ -60,18 +59,13 @@ where
     /// One [`ShardLoop`] per hosted shard. State machines are driven
     /// exclusively through these — all `ProtocolEvent` ingestion and
     /// `Action` emission happen via per-shard `step()` dispatch.
-    pub(crate) shards: HashMap<ShardGroupId, ShardLoop<S, N, D, E>>,
-
-    /// Transaction executor. Cloned (cheaply) into the block-commit
-    /// closure on each drain — `Engine` requires `Clone`, so this is
-    /// held by value rather than behind an `Arc`.
-    pub(crate) executor: E,
+    pub(crate) shards: HashMap<ShardGroupId, ShardLoop<S, N, D>>,
 
     /// Process-scoped shared resources: network adapter, dispatch pool,
     /// tx validator, topology snapshot, dispatch handles, event sender.
     /// Cloned `Arc::clone(&self.process)` is handed to every hosted
     /// `ShardLoop` so off-thread closures can capture it cheaply.
-    pub(crate) process: Arc<ProcessIo<S, N, D, E>>,
+    pub(crate) process: Arc<ProcessIo<S, N, D>>,
 
     /// Process-wide wall-clock cache. Pushed into every hosted shard's
     /// own `now` via [`Self::set_time`] so off-thread handlers can read
@@ -79,12 +73,11 @@ where
     now: LocalTimestamp,
 }
 
-impl<S, N, D, E> NodeHost<S, N, D, E>
+impl<S, N, D> NodeHost<S, N, D>
 where
     S: Storage,
     N: Network,
     D: Dispatch,
-    E: Engine,
 {
     /// Create a new `NodeHost` hosting one or more `Vnode`s, possibly
     /// across multiple shards.
@@ -108,7 +101,7 @@ where
     pub fn new(
         vnodes: Vec<VnodeInit>,
         mut storages: HashMap<ShardGroupId, S>,
-        executor: E,
+        executor: RadixExecutor,
         network: N,
         dispatch: D,
         shard_event_senders: HashMap<ShardGroupId, Sender<ShardEvent>>,
@@ -199,7 +192,7 @@ where
 
         let execution_cache = Arc::new(ProcessExecutionCache::new(hosted_shards.clone()));
         let dispatch_handles = Arc::new(DispatchHandles {
-            executor: executor.clone(),
+            executor,
             network: Arc::clone(&network),
             execution_cache,
             per_shard: per_shard_dispatch,
@@ -227,7 +220,7 @@ where
         // Second pass: assemble ShardLoops with cloned Arc<ProcessIo>.
         let tx_gossip_max = b.tx_gossip_max;
         let tx_gossip_window = b.tx_gossip_window;
-        let shards: HashMap<ShardGroupId, ShardLoop<S, N, D, E>> = shard_builds
+        let shards: HashMap<ShardGroupId, ShardLoop<S, N, D>> = shard_builds
             .into_iter()
             .map(|(shard, (io, vnodes))| {
                 let shard_loop = ShardLoop {
@@ -249,7 +242,6 @@ where
 
         Self {
             shards,
-            executor,
             process,
             now: LocalTimestamp::ZERO,
         }
@@ -262,7 +254,8 @@ where
     /// own pinned thread while keeping the `Arc<ProcessIo>` shared across
     /// them. Simulation never calls this — sim drives the whole host
     /// single-threaded via [`Self::step`].
-    pub fn into_parts(self) -> NodeHostParts<S, N, D, E> {
+    #[must_use]
+    pub fn into_parts(self) -> NodeHostParts<S, N, D> {
         (self.process, self.shards)
     }
 
@@ -270,7 +263,8 @@ where
     /// the returned handle for RPC submission closures and other
     /// off-thread consumers that need lock-free topology / sender access
     /// without consuming the host.
-    pub const fn process(&self) -> &Arc<ProcessIo<S, N, D, E>> {
+    #[must_use]
+    pub const fn process(&self) -> &Arc<ProcessIo<S, N, D>> {
         &self.process
     }
 
@@ -299,6 +293,7 @@ where
     ///
     /// # Panics
     /// Panics if `shard` isn't hosted or `vnode_idx` is out of range.
+    #[must_use]
     pub fn vnode_state(&self, shard: ShardGroupId, vnode_idx: usize) -> &NodeStateMachine {
         &self.shard_loop(shard).vnodes[vnode_idx].state
     }
@@ -324,14 +319,14 @@ where
     }
 
     /// Internal: per-shard loop (process handle + io + vnodes + scratch).
-    pub(crate) fn shard_loop(&self, shard: ShardGroupId) -> &ShardLoop<S, N, D, E> {
+    pub(crate) fn shard_loop(&self, shard: ShardGroupId) -> &ShardLoop<S, N, D> {
         self.shards
             .get(&shard)
             .unwrap_or_else(|| panic!("shard {shard:?} not hosted by this NodeHost"))
     }
 
     /// Internal: mutable per-shard loop.
-    pub(crate) fn shard_loop_mut(&mut self, shard: ShardGroupId) -> &mut ShardLoop<S, N, D, E> {
+    pub(crate) fn shard_loop_mut(&mut self, shard: ShardGroupId) -> &mut ShardLoop<S, N, D> {
         self.shards
             .get_mut(&shard)
             .unwrap_or_else(|| panic!("shard {shard:?} not hosted by this NodeHost"))
@@ -345,11 +340,13 @@ where
     /// Shared `ShardIo` for `shard`. The single per-shard accessor;
     /// fields like `storage`, `caches`, `fetches`, `syncs`, `block_commit`,
     /// `pending_chain` are read directly off the returned reference.
+    #[must_use]
     pub fn shard_io(&self, shard: ShardGroupId) -> &ShardIo<S> {
         &self.shard_loop(shard).io
     }
 
     /// Access the network.
+    #[must_use]
     pub fn network(&self) -> &N {
         &self.process.network
     }
@@ -361,6 +358,7 @@ where
     /// hash, if any status has been emitted on any hosted shard. Unlike the
     /// per-step `StepOutput::emitted_statuses`, this cache persists across
     /// steps and survives mempool eviction.
+    #[must_use]
     pub fn tx_status(&self, hash: &TxHash) -> Option<TransactionStatus> {
         self.shards
             .values()
@@ -373,6 +371,7 @@ where
     /// handlers) can share lock-free reads across threads. RPC layers
     /// typically hold the full set so a single-hash lookup can fan out
     /// across every hosted shard without re-entering the pinned thread.
+    #[must_use]
     pub fn tx_status_caches(
         &self,
     ) -> HashMap<ShardGroupId, Arc<QuickCache<TxHash, TransactionStatus>>> {

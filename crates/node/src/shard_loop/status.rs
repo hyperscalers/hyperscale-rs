@@ -12,7 +12,6 @@
 use std::collections::HashMap;
 
 use hyperscale_dispatch::Dispatch;
-use hyperscale_engine::Engine;
 use hyperscale_network::Network;
 use hyperscale_storage::Storage;
 use hyperscale_types::{
@@ -87,12 +86,11 @@ impl NodeStatusSnapshot {
     }
 }
 
-impl<S, N, D, E> NodeHost<S, N, D, E>
+impl<S, N, D> NodeHost<S, N, D>
 where
     S: Storage,
     N: Network,
     D: Dispatch,
-    E: Engine,
 {
     /// Capture a snapshot of node state for external status APIs.
     #[must_use]

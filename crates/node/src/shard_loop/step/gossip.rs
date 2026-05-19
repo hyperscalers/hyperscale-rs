@@ -17,7 +17,6 @@ use std::sync::Arc;
 
 use hyperscale_core::ProtocolEvent;
 use hyperscale_dispatch::{Dispatch, DispatchPool};
-use hyperscale_engine::Engine;
 use hyperscale_network::Network;
 use hyperscale_storage::Storage;
 use hyperscale_types::{
@@ -29,12 +28,11 @@ use crate::shard_io::CommittedHeaderVerificationItem;
 use crate::shard_io::verify::verify_bls_with_metrics;
 use crate::shard_loop::{ShardLoop, push_protocol_event};
 
-impl<S, N, D, E> ShardLoop<S, N, D, E>
+impl<S, N, D> ShardLoop<S, N, D>
 where
     S: Storage,
     N: Network,
     D: Dispatch,
-    E: Engine,
 {
     /// Inbound handler closure already verified sender's committee
     /// membership and resolved the public key. Queue for batched BLS
