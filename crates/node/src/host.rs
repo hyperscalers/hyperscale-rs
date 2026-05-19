@@ -310,14 +310,6 @@ where
         &self.shard_loop(shard).io
     }
 
-    /// Mutable `ShardIo` for `shard`. Use over multiple `_mut` calls
-    /// when the borrow needs to span field-level reads and mutations
-    /// (e.g. block-commit flush reading `&storage` while mutating
-    /// `&mut block_commit`).
-    pub(crate) fn shard_io_mut(&mut self, shard: ShardGroupId) -> &mut ShardIo<S> {
-        &mut self.shard_loop_mut(shard).io
-    }
-
     /// Access the network.
     pub fn network(&self) -> &N {
         &self.process.network
