@@ -25,7 +25,8 @@ use prometheus::{
 #[allow(missing_docs)]
 pub struct Metrics {
     // === Consensus ===
-    pub blocks_committed: Counter,
+    /// Per-shard count of blocks committed.
+    pub blocks_committed: CounterVec,
     pub block_commit_latency: HistogramVec,
     /// Per-shard chain height. Each hosted shard maintains its own height.
     pub block_height: GaugeVec,
@@ -181,9 +182,10 @@ impl Metrics {
             build_info,
 
             // Consensus
-            blocks_committed: register_counter!(
+            blocks_committed: register_counter_vec!(
                 "hyperscale_blocks_committed_total",
-                "Total number of blocks committed"
+                "Total number of blocks committed, per shard",
+                &["shard"]
             )
             .unwrap(),
 
@@ -816,15 +818,17 @@ impl MetricsRecorder for PrometheusRecorder {
 
     // ── Consensus ────────────────────────────────────────────────────
 
-    fn record_block_committed(&self, _height: u64, commit_latency_secs: f64, source: &str) {
-        self.metrics.blocks_committed.inc();
+    fn record_block_committed(&self, shard: u64, commit_latency_secs: f64, source: &str) {
+        self.metrics
+            .blocks_committed
+            .with_label_values(&[&shard.to_string()])
+            .inc();
         self.metrics
             .block_commit_latency
             .with_label_values(&[source])
             .observe(commit_latency_secs);
         // `block_height` is set via the explicit per-shard `set_block_height`
-        // setter at the same call site; not stamped here because we lack the
-        // shard label.
+        // setter at the same call site.
     }
 
     fn record_transaction_finalized(&self, latency_secs: f64, cross_shard: bool) {

@@ -9,7 +9,7 @@
 //! Callers record metrics via free functions:
 //! ```ignore
 //! hyperscale_metrics::record_storage_read(latency_secs);
-//! hyperscale_metrics::record_block_committed(height, latency_secs);
+//! hyperscale_metrics::record_block_committed(shard, latency_secs, "qc");
 //! ```
 //!
 //! At startup, install a backend:
@@ -240,8 +240,8 @@ pub trait MetricsRecorder: Send + Sync + 'static {
 
     // ── Consensus ────────────────────────────────────────────────────
 
-    /// Record a block committed.
-    fn record_block_committed(&self, height: u64, commit_latency_secs: f64, source: &str) {}
+    /// Record a block committed on `shard`.
+    fn record_block_committed(&self, shard: u64, commit_latency_secs: f64, source: &str) {}
 
     /// Record a transaction finalized.
     fn record_transaction_finalized(&self, latency_secs: f64, cross_shard: bool) {}
@@ -595,10 +595,10 @@ pub fn record_transactions_persisted(count: usize) {
 
 // ── Consensus ────────────────────────────────────────────────────────
 
-/// Record a block committed.
+/// Record a block committed on `shard`.
 #[inline]
-pub fn record_block_committed(height: u64, commit_latency_secs: f64, source: &str) {
-    recorder().record_block_committed(height, commit_latency_secs, source);
+pub fn record_block_committed(shard: u64, commit_latency_secs: f64, source: &str) {
+    recorder().record_block_committed(shard, commit_latency_secs, source);
 }
 
 /// Record a transaction finalized.

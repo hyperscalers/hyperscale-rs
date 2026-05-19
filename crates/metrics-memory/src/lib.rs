@@ -170,10 +170,9 @@ impl MetricsRecorder for MemoryRecorder {
 
     // ── Consensus ────────────────────────────────────────────────────
 
-    fn record_block_committed(&self, height: u64, commit_latency_secs: f64, source: &str) {
-        self.inc("blocks_committed", None, 1);
+    fn record_block_committed(&self, shard: u64, commit_latency_secs: f64, source: &str) {
+        self.inc("blocks_committed", Some(&shard.to_string()), 1);
         self.observe("block_commit_latency", Some(source), commit_latency_secs);
-        self.set("block_height", None, height as f64);
     }
 
     fn record_transaction_finalized(&self, latency_secs: f64, cross_shard: bool) {
@@ -404,8 +403,8 @@ mod tests {
     #[test]
     fn block_committed_updates_counter_and_histogram() {
         let r = MemoryRecorder::new();
-        r.record_block_committed(42, 0.05, "qc");
-        assert_eq!(r.counter("blocks_committed", None), 1);
+        r.record_block_committed(0, 0.05, "qc");
+        assert_eq!(r.counter("blocks_committed", Some("0")), 1);
         assert_eq!(r.histogram_count("block_commit_latency", Some("qc")), 1);
     }
 
