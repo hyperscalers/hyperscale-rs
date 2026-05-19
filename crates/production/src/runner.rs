@@ -69,7 +69,7 @@ use hyperscale_node::shard_loop::{
 };
 use hyperscale_node::{NodeConfig, NodeHost, NodeStateMachine, SharedTopologySnapshot, VnodeInit};
 use hyperscale_provisions::{ProvisionConfig, ProvisionStore};
-use hyperscale_storage::ChainReader;
+use hyperscale_storage::{ChainReader, ChainWriter};
 use hyperscale_storage_rocksdb::{RocksDbStorage, SharedStorage};
 use hyperscale_topology::TopologyCoordinator;
 use hyperscale_types::{
@@ -527,7 +527,6 @@ impl ProductionRunnerBuilder {
             network: adapter,
             topology_snapshot: topology,
             storages,
-            primary_storage,
             dispatch,
             rpc_status: self.rpc_status,
             mempool_snapshot: self.mempool_snapshot,
@@ -582,13 +581,11 @@ pub struct ProductionRunner {
     /// Network topology snapshot (lock-free `ArcSwap`, updated on topology changes).
     topology_snapshot: SharedTopologySnapshot,
     /// One `RocksDB` storage per hosted shard. The runner keeps these
-    /// alive for periodic JMT GC and storage-memory metrics.
+    /// alive across `run()` startup and clones them into the pinned
+    /// loop's [`PinnedLoopConfig::storages`] for per-shard JMT GC and
+    /// storage-memory metrics.
     #[allow(dead_code)]
     storages: HashMap<ShardGroupId, Arc<RocksDbStorage>>,
-    /// Primary storage handle (`storages[primary_shard]`) used by
-    /// single-storage code paths (genesis bookkeeping, JMT GC, storage
-    /// memory metrics).
-    primary_storage: Arc<RocksDbStorage>,
     /// Thread pool dispatch.
     dispatch: Arc<PooledDispatch>,
     /// Primary shard for status / RPC / single-storage operations.
@@ -880,7 +877,11 @@ impl ProductionRunner {
             rpc_status: self.rpc_status.clone(),
             sync_status: self.sync_status.clone(),
             mempool_snapshot: self.mempool_snapshot.clone(),
-            primary_storage: Arc::clone(&self.primary_storage),
+            storages: self
+                .storages
+                .iter()
+                .map(|(s, st)| (*s, Arc::clone(st)))
+                .collect(),
         };
 
         // ── 3. Spawn pinned thread ───────────────────────────────────────
@@ -1034,9 +1035,11 @@ struct PinnedLoopConfig {
     rpc_status: Option<Arc<ArcSwap<NodeStatusState>>>,
     sync_status: Option<Arc<ArcSwap<SyncStatus>>>,
     mempool_snapshot: Option<Arc<ArcSwap<MempoolSnapshot>>>,
-    /// Primary `RocksDbStorage` used by the pinned loop's periodic
-    /// metrics dispatch and JMT GC.
-    primary_storage: Arc<RocksDbStorage>,
+    /// One `RocksDbStorage` per hosted shard. The pinned loop sweeps
+    /// every entry on its periodic JMT GC + RocksDB-memory tick, so a
+    /// non-primary shard's storage doesn't fall out of GC just because
+    /// it isn't the metrics-aggregation representative.
+    storages: HashMap<ShardGroupId, Arc<RocksDbStorage>>,
 }
 
 /// Manages tokio-based timers for the production pinned event loop.
@@ -1301,9 +1304,15 @@ fn run_pinned_loop(mut io_loop: ProdIoLoop, mut config: PinnedLoopConfig) {
                 tx_request: 0,
                 cert_request: 0,
             };
-            let storage = Arc::clone(&config.primary_storage);
+            let storages: Vec<Arc<RocksDbStorage>> =
+                config.storages.values().map(Arc::clone).collect();
             config.tokio_handle.spawn_blocking(move || {
-                record_metrics(snapshot, &*storage);
+                let (block_cache_bytes, memtable_bytes) =
+                    storages.iter().fold((0u64, 0u64), |(bc, mt), st| {
+                        let (b, m) = st.memory_usage_bytes();
+                        (bc.saturating_add(b), mt.saturating_add(m))
+                    });
+                record_metrics(snapshot, block_cache_bytes, memtable_bytes);
                 set_channel_depths(&channel_depths);
             });
 
@@ -1316,24 +1325,38 @@ fn run_pinned_loop(mut io_loop: ProdIoLoop, mut config: PinnedLoopConfig) {
             && last_gc.elapsed() >= GC_INTERVAL
         {
             last_gc = Instant::now();
-            gc_in_flight.store(true, std::sync::atomic::Ordering::Relaxed);
-            let storage = Arc::clone(&config.primary_storage);
-            let gc_flag = gc_in_flight.clone();
-            config.tokio_handle.spawn_blocking(move || {
-                let deleted = storage.run_jmt_gc();
-                if deleted > 0 {
-                    debug!(deleted, "JMT garbage collection completed");
-                }
-                let history_deleted = storage.run_state_history_gc();
-                if history_deleted > 0 {
-                    debug!(history_deleted, "State-history GC completed");
-                }
-                gc_flag.store(false, std::sync::atomic::Ordering::Relaxed);
-            });
+            schedule_jmt_gc(&config, &gc_in_flight);
         }
     }
 
     info!("Pinned event loop exiting");
+}
+
+/// Dispatch per-shard JMT GC plus state-history GC off the pinned
+/// thread. Every hosted shard's storage is swept in turn; the
+/// `in_flight` flag serializes runs so a slow disk can't stack
+/// concurrent passes.
+fn schedule_jmt_gc(config: &PinnedLoopConfig, in_flight: &Arc<std::sync::atomic::AtomicBool>) {
+    in_flight.store(true, std::sync::atomic::Ordering::Relaxed);
+    let storages: Vec<(ShardGroupId, Arc<RocksDbStorage>)> = config
+        .storages
+        .iter()
+        .map(|(s, st)| (*s, Arc::clone(st)))
+        .collect();
+    let gc_flag = Arc::clone(in_flight);
+    config.tokio_handle.spawn_blocking(move || {
+        for (shard, storage) in storages {
+            let deleted = storage.run_jmt_gc();
+            if deleted > 0 {
+                debug!(shard = ?shard, deleted, "JMT garbage collection completed");
+            }
+            let history_deleted = storage.run_state_history_gc();
+            if history_deleted > 0 {
+                debug!(shard = ?shard, history_deleted, "State-history GC completed");
+            }
+        }
+        gc_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+    });
 }
 
 /// Spawn the `IoLoop` on a dedicated thread pinned to core 0.
