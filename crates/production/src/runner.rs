@@ -346,14 +346,16 @@ impl ProductionRunnerBuilder {
                 "ProductionRunnerBuilder: missing storage for hosted shard {shard:?}"
             );
         }
-        // The runner needs a single representative shard for status,
-        // metrics, and genesis bookkeeping until those become per-shard
-        // surfaces.
-        let primary_shard = vnode_configs[0].topology.snapshot().local_shard();
-        let primary_storage = Arc::clone(
+        // Recovery still reads from a single shard's storage until the
+        // state-machine recovery path becomes per-shard. Pick the first
+        // hosted shard arbitrarily — every hosted storage carries the
+        // same `RecoveredState` shape, and a multi-shard recovery
+        // rewire is out of scope here.
+        let recovery_shard = vnode_configs[0].topology.snapshot().local_shard();
+        let recovery_storage = Arc::clone(
             storages
-                .get(&primary_shard)
-                .expect("primary shard checked above"),
+                .get(&recovery_shard)
+                .expect("hosted shard derived from vnodes"),
         );
 
         // The shared snapshot drives off-thread handlers that read
@@ -391,8 +393,7 @@ impl ProductionRunnerBuilder {
         let (xb_shutdown_tx, xb_shutdown_rx) = unbounded();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
-        // Recovery state is read from the primary shard's storage.
-        let recovered = primary_storage.load_recovered_state();
+        let recovered = recovery_storage.load_recovered_state();
 
         // One `ProvisionStore` + `TxStore` + `ExecCertStore` +
         // `FinalizedWaveStore` per hosted shard, shared across every same-
@@ -532,7 +533,6 @@ impl ProductionRunnerBuilder {
             mempool_snapshot: self.mempool_snapshot,
             sync_status: self.sync_status,
             genesis_config: self.genesis_config,
-            primary_shard,
             local_shards,
             tx_status_caches,
             shutdown_rx: Some(shutdown_rx),
@@ -588,8 +588,6 @@ pub struct ProductionRunner {
     storages: HashMap<ShardGroupId, Arc<RocksDbStorage>>,
     /// Thread pool dispatch.
     dispatch: Arc<PooledDispatch>,
-    /// Primary shard for status / RPC / single-storage operations.
-    primary_shard: ShardGroupId,
     /// Every shard this runner hosts vnodes for.
     #[allow(dead_code)]
     local_shards: HashSet<ShardGroupId>,
@@ -641,14 +639,6 @@ impl ProductionRunner {
     #[must_use]
     pub const fn network(&self) -> &Arc<Libp2pAdapter> {
         &self.network
-    }
-
-    /// Get the runner's primary shard ID — the shard whose status,
-    /// metrics, and genesis bookkeeping the runner surfaces to its
-    /// callers.
-    #[must_use]
-    pub const fn primary_shard(&self) -> ShardGroupId {
-        self.primary_shard
     }
 
     /// Get the per-shard transaction status caches shared from `IoLoop`.
