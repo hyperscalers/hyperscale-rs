@@ -575,14 +575,23 @@ mod tests {
     async fn test_sync_status_endpoint() {
         use hyperscale_node::BlockSyncStateKind;
 
+        use crate::status::ShardSyncState;
+
+        let mut shards = std::collections::HashMap::new();
+        shards.insert(
+            0u64,
+            ShardSyncState {
+                state: BlockSyncStateKind::Syncing,
+                current_height: 100,
+                target_height: Some(200),
+                blocks_behind: 100,
+                pending_fetches: 2,
+                queued_heights: 98,
+            },
+        );
         let sync_status = Arc::new(ArcSwap::new(Arc::new(SyncStatus {
-            state: BlockSyncStateKind::Syncing,
-            current_height: 100,
-            target_height: Some(200),
-            blocks_behind: 100,
+            shards,
             sync_peers: 3,
-            pending_fetches: 2,
-            queued_heights: 98,
         })));
 
         let status_clone = sync_status.clone();
@@ -603,10 +612,11 @@ mod tests {
         let body = to_bytes(response.into_body(), 1024).await.unwrap();
         let json: Value = from_slice(&body).unwrap();
 
-        assert_eq!(json["state"], "syncing");
-        assert_eq!(json["current_height"], 100);
-        assert_eq!(json["target_height"], 200);
-        assert_eq!(json["blocks_behind"], 100);
         assert_eq!(json["sync_peers"], 3);
+        let entry = &json["shards"]["0"];
+        assert_eq!(entry["state"], "syncing");
+        assert_eq!(entry["current_height"], 100);
+        assert_eq!(entry["target_height"], 200);
+        assert_eq!(entry["blocks_behind"], 100);
     }
 }
