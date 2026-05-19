@@ -56,8 +56,8 @@ where
                         shard,
                         preferred,
                         class,
-                        &*self.network,
-                        &self.event_sender,
+                        &*self.process.network,
+                        &self.process.event_sender,
                     );
                 }
             } else {
@@ -67,8 +67,8 @@ where
                     shard,
                     preferred,
                     class,
-                    &*self.network,
-                    &self.event_sender,
+                    &*self.process.network,
+                    &self.process.event_sender,
                 );
             }
         }

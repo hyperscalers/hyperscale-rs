@@ -27,7 +27,9 @@
 
 mod batch_accumulator;
 mod config;
+pub mod event;
 pub mod io_loop;
+mod process_io;
 mod shard_io;
 mod state;
 mod vnode;

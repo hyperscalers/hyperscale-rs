@@ -164,7 +164,7 @@ where
                     from: from_height,
                     count,
                 } => {
-                    let es = self.event_sender.clone();
+                    let es = self.process.event_sender.clone();
                     let typed_count = HeaderFetchCount::new(count);
                     let request = GetRemoteHeadersRequest {
                         source_shard,
@@ -172,7 +172,7 @@ where
                         count: typed_count,
                     };
                     record_sync_round_started("remote_header");
-                    self.network.request(
+                    self.process.network.request(
                         source_shard,
                         None,
                         request,

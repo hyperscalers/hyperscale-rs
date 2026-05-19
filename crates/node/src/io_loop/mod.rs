@@ -19,11 +19,9 @@
 //! production (wall clock) and simulation (logical clock) use the same paths.
 
 mod actions;
-mod event;
 mod fetch_io;
 mod lifecycle;
 mod metrics;
-mod network_handlers;
 mod status;
 mod step;
 
@@ -33,9 +31,6 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use crossbeam::channel::Sender;
-pub use event::{
-    EventPriority, FetchFailureKind, ProcessScopedInput, ShardEvent, ShardScopedInput,
-};
 use hyperscale_core::{Action, ProtocolEvent, StateMachine, TimerId};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{Engine, RadixExecutor, TransactionValidation};
@@ -51,6 +46,10 @@ pub use status::{NodeStatusSnapshot, ShardStatus, VnodeStatus};
 use crate::NodeStateMachine;
 use crate::batch_accumulator::BatchAccumulator;
 use crate::config::NodeConfig;
+pub use crate::event::{
+    EventPriority, FetchFailureKind, ProcessScopedInput, ShardEvent, ShardScopedInput,
+};
+use crate::process_io::ProcessIo;
 use crate::shard_io::ShardIo;
 use crate::shard_io::block_commit::{BlockCommitCoordinator, PreparedCommitMap};
 use crate::shard_io::caches::SharedCaches;
@@ -242,58 +241,11 @@ where
     /// held by value rather than behind an `Arc`.
     executor: E,
 
-    /// Network sender plus the registry of inbound gossip / request
-    /// handlers installed at `init` time. `Arc` so handler closures
-    /// and dispatch jobs can broadcast / reply without re-entering
-    /// the pinned thread.
-    network: Arc<N>,
-
-    /// Thread-pool scheduler for off-thread work (crypto verify,
-    /// tx validation, block-commit persistence, fetch-serve). Each
-    /// `dispatch.spawn` site routes results back via `event_sender`.
-    dispatch: D,
-
-    /// Channel back to the pinned-thread event loop.
-    ///
-    /// Off-thread work spawned via `dispatch.spawn(pool, ...)` returns
-    /// results here as [`ShardEvent`] envelopes (a `NodeInput` plus its
-    /// hosted-shard tag), which the next pinned-thread `step()`
-    /// iteration drains. Two routing rules for the payload:
-    ///
-    /// - **State-machine consumers** (BFT / execution / mempool — anything
-    ///   driven by `state.handle()`) ride
-    ///   `ShardScopedInput::Protocol(ProtocolEvent::*)`. Examples: gossip BLS
-    ///   verification emits `RemoteHeaderReceived`; block-commit drain
-    ///   emits `BlockCommitted` / `BlockPersisted`.
-    /// - **`IoLoop`-only consumers** (validation pipeline, sync
-    ///   delivery, fetch retry — anything handled in `step()` directly
-    ///   without entering the state machine) ride a dedicated top-level
-    ///   `NodeInput` variant. Examples: `TransactionValidated`,
-    ///   `SyncBlockValidated`, `*FetchFailed`.
-    ///
-    /// Failure handling is pattern-specific and intentional: drop on
-    /// byzantine input (gossip), emit a typed failure variant when the
-    /// `IoLoop` has cleanup to do (`TransactionValidationsFailed`,
-    /// `SyncBlockValidationFailed`), abort on storage faults
-    /// (block-commit). Sends go through [`push_shard_input`] /
-    /// [`push_protocol_event`] so the "drop on shutdown" convention
-    /// has one named home.
-    event_sender: Sender<ShardEvent>,
-
-    /// Lock-free topology snapshot shared with network handler closures
-    /// and delegated dispatch jobs. The pinned thread is the sole writer
-    /// (via `Action::TopologyChanged`); all other readers `.load()` for
-    /// an atomic snapshot. The state machine owns its own copy — this
-    /// field exists for off-thread consumers that can't reach into it.
-    topology_snapshot: SharedTopologySnapshot,
-
-    /// See [`DispatchHandles`]. Cloned once per delegated-action dispatch.
-    dispatch_handles: Arc<DispatchHandles<S, N, E>>,
-
-    /// Stateless transaction validator (signature + format + EC checks).
-    /// `Arc` so it can be cloned into the `tx_validation` pool closure
-    /// on each batch flush.
-    tx_validator: Arc<TransactionValidation>,
+    /// Process-scoped shared resources: network adapter, dispatch pool,
+    /// tx validator, topology snapshot, dispatch handles, event sender.
+    /// Phase 2 carves a per-shard `ShardLoop` driver out of `IoLoop` and
+    /// hands it `Arc::clone(&self.process)`.
+    pub(crate) process: Arc<ProcessIo<S, N, D, E>>,
 
     /// Last time a "transaction finalization exceeded 10s" warning was emitted.
     /// Rate-limited to avoid flooding logs during cross-shard latency spikes.
@@ -476,15 +428,18 @@ where
             network: Arc::clone(&network),
             per_shard: per_shard_dispatch,
         });
-        Self {
-            shards,
-            executor,
+        let process = Arc::new(ProcessIo::new(
             network,
             dispatch,
             event_sender,
             topology_snapshot,
             dispatch_handles,
             tx_validator,
+        ));
+        Self {
+            shards,
+            executor,
+            process,
             last_slow_tx_warn: LocalTimestamp::ZERO,
             tx_phase_times: TxPhaseTimesCache::default(),
             pending_timer_ops: Vec::new(),
@@ -594,7 +549,7 @@ where
 
     /// Access the network.
     pub fn network(&self) -> &N {
-        &self.network
+        &self.process.network
     }
 
     /// Look up the latest emitted status for a transaction across every
