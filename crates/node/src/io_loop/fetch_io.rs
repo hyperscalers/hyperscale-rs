@@ -205,6 +205,8 @@ where
                 id: TimerId::FetchTick,
             }
         };
-        self.pending_timer_ops.push(op);
+        self.shard_loop_mut(sentinel_shard)
+            .pending_timer_ops
+            .push(op);
     }
 }

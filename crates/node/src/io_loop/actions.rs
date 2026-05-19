@@ -50,6 +50,7 @@ where
     ///   `io_loop` machinery (timers, caches consumed by `io_loop`-side
     ///   serving, RPC observability, block commit pipeline, topology
     ///   plumbing).
+    #[allow(clippy::too_many_lines)] // single dispatch over Action variants; one arm per variant
     pub(super) fn process_action(&mut self, shard: ShardGroupId, vnode_idx: usize, action: Action) {
         match action {
             // ─── Coordinator policy: delegated to worker pools ─────────────
@@ -91,14 +92,18 @@ where
 
             // ─── io_loop-internal effects ──────────────────────────────────
             Action::SetTimer { id, duration } => {
-                self.pending_timer_ops.push(TimerOp::Set {
-                    shard,
-                    id,
-                    duration,
-                });
+                self.shard_loop_mut(shard)
+                    .pending_timer_ops
+                    .push(TimerOp::Set {
+                        shard,
+                        id,
+                        duration,
+                    });
             }
             Action::CancelTimer { id } => {
-                self.pending_timer_ops.push(TimerOp::Cancel { shard, id });
+                self.shard_loop_mut(shard)
+                    .pending_timer_ops
+                    .push(TimerOp::Cancel { shard, id });
             }
             Action::Continuation(pe) => self.handle_continuation(shard, pe),
             Action::RestoreCommittedState => self.handle_restore_committed_state(shard),
@@ -244,7 +249,9 @@ where
             .caches
             .tx_status
             .insert(tx_hash, status.clone());
-        self.emitted_statuses.push((tx_hash, status));
+        self.shard_loop_mut(shard)
+            .emitted_statuses
+            .push((tx_hash, status));
     }
 
     fn handle_topology_changed(&self, topology: &Arc<TopologySnapshot>) {

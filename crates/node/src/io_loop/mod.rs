@@ -212,6 +212,18 @@ pub struct ShardLoop<S: Storage> {
     /// during each `step()` iteration; same-shard vnodes see identical
     /// inbound events and produce per-validator votes.
     pub vnodes: Vec<Vnode>,
+    /// Per-step scratch: timer set/cancel operations emitted during the
+    /// step. Cleared at step entry; drained into the returned
+    /// [`StepOutput`] for the runner to translate into timer-driver
+    /// calls.
+    pub pending_timer_ops: Vec<TimerOp>,
+    /// Per-step scratch: `(tx_hash, status)` pairs emitted via
+    /// `Action::EmitTransactionStatus`. Drained into [`StepOutput`].
+    pub emitted_statuses: Vec<(TxHash, TransactionStatus)>,
+    /// Per-step scratch: count of actions this shard's vnodes produced
+    /// during the step. Drained into [`StepOutput`] for the runner's
+    /// metrics; reset at step entry.
+    pub actions_generated: usize,
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -250,25 +262,6 @@ where
     /// Phase 2 carves a per-shard `ShardLoop` driver out of `IoLoop` and
     /// hands it `Arc::clone(&self.process)`.
     pub(crate) process: Arc<ProcessIo<S, N, D, E>>,
-
-    /// Per-step scratch: timer set/cancel operations emitted during the
-    /// step. Both shard-scoped timers (`ViewChange`, `Cleanup` — pushed
-    /// from `Action::SetTimer` / `CancelTimer` arms) and process-scoped
-    /// timers (`FetchTick` — pushed from the fetch tick refresh) land
-    /// here. Cleared at the top of [`Self::step`]; drained into the
-    /// returned [`StepOutput`] for the runner to translate into actual
-    /// timer-driver calls.
-    pending_timer_ops: Vec<TimerOp>,
-
-    /// Per-step scratch: `(tx_hash, status)` pairs emitted via
-    /// `Action::EmitTransactionStatus`. Drained into [`StepOutput`] for
-    /// the runner to forward to RPC subscribers.
-    emitted_statuses: Vec<(TxHash, TransactionStatus)>,
-
-    /// Per-step scratch: count of actions produced by every vnode's
-    /// state machine during the step. Drained into [`StepOutput`] for
-    /// the runner's metrics; reset at the top of [`Self::step`].
-    actions_generated: usize,
 
     /// Per-destination-shard outbound `TransactionGossip` accumulators.
     /// Locally-submitted transactions are appended to one accumulator
@@ -396,6 +389,9 @@ where
                 *shard,
                 ShardLoop {
                     shard: *shard,
+                    pending_timer_ops: Vec::new(),
+                    emitted_statuses: Vec::new(),
+                    actions_generated: 0,
                     io: ShardIo {
                         storage,
                         pending_chain,
@@ -438,9 +434,6 @@ where
             shards,
             executor,
             process,
-            pending_timer_ops: Vec::new(),
-            emitted_statuses: Vec::new(),
-            actions_generated: 0,
             tx_gossip_batches: BTreeMap::new(),
             tx_gossip_max: b.tx_gossip_max,
             tx_gossip_window: b.tx_gossip_window,
@@ -595,9 +588,11 @@ where
     ///
     #[allow(clippy::too_many_lines)] // single dispatch over ShardEvent; one arm per variant
     pub fn step(&mut self, event: ShardEvent) -> StepOutput {
-        self.pending_timer_ops.clear();
-        self.emitted_statuses.clear();
-        self.actions_generated = 0;
+        for sl in self.shards.values_mut() {
+            sl.pending_timer_ops.clear();
+            sl.emitted_statuses.clear();
+            sl.actions_generated = 0;
+        }
 
         match event {
             ShardEvent::Shard(shard, input) => self.step_shard_input(shard, input),
@@ -738,11 +733,17 @@ where
     /// by directly-dispatched action vecs (genesis init, sync-output
     /// continuations).
     pub fn drain_pending_output(&mut self) -> StepOutput {
-        StepOutput {
-            emitted_statuses: std::mem::take(&mut self.emitted_statuses),
-            actions_generated: std::mem::replace(&mut self.actions_generated, 0),
-            timer_ops: std::mem::take(&mut self.pending_timer_ops),
+        let mut out = StepOutput {
+            emitted_statuses: Vec::new(),
+            actions_generated: 0,
+            timer_ops: Vec::new(),
+        };
+        for sl in self.shards.values_mut() {
+            out.emitted_statuses.append(&mut sl.emitted_statuses);
+            out.actions_generated += std::mem::replace(&mut sl.actions_generated, 0);
+            out.timer_ops.append(&mut sl.pending_timer_ops);
         }
+        out
     }
 
     /// Fan a shard-scoped protocol event out to every hosted vnode in
@@ -779,7 +780,7 @@ where
         vnode_idx: usize,
         actions: Vec<Action>,
     ) {
-        self.actions_generated += actions.len();
+        self.shard_loop_mut(shard).actions_generated += actions.len();
         for action in actions {
             self.process_action(shard, vnode_idx, action);
         }
