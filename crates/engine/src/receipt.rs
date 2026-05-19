@@ -7,6 +7,8 @@
 //! summary, log messages, error string). Shard-filtering of writes
 //! happens here too, via [`crate::sharding`].
 
+use std::collections::HashSet;
+
 use hyperscale_types::{
     ApplicationEvent, ConsensusReceipt, EventData, EventRoot, ExecutionMetadata, FeeSummary,
     GlobalReceipt, Hash, LogLevel, NodeId, RoutableTransaction, ShardGroupId, compute_merkle_root,
@@ -22,6 +24,7 @@ use radix_substate_store_interface::interface::{
 use crate::output::ExecutedTx;
 use crate::sharding::{
     compute_writes_root, filter_updates_for_global_receipt, filter_updates_for_shard,
+    resolve_owned_nodes,
 };
 
 /// Extract `DatabaseUpdates` from a transaction receipt.
@@ -81,14 +84,16 @@ pub fn build_executed_tx<S: SubstateDatabase>(
     // declared-only/system-filtered for the global `writes_root` the
     // EC commits to.
     let raw_updates = extract_database_updates(receipt);
+    let declared_set: HashSet<NodeId> = declared_nodes.iter().copied().collect();
+    let ownership = resolve_owned_nodes(storage, &declared_nodes);
     let database_updates = filter_updates_for_shard(
         &raw_updates,
         local_shard,
         num_shards,
-        storage,
-        &declared_nodes,
+        &declared_set,
+        &ownership,
     );
-    let global_updates = filter_updates_for_global_receipt(&raw_updates, storage, &declared_nodes);
+    let global_updates = filter_updates_for_global_receipt(&raw_updates, &declared_set, &ownership);
     let writes_root = compute_writes_root(&global_updates);
 
     let event_hashes: Vec<Hash> = application_events
