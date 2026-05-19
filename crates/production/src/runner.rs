@@ -45,9 +45,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
-use core_affinity::{get_core_ids, set_for_current};
 use crossbeam::channel::{Receiver, Sender, unbounded};
-use hex::encode as hex_encode;
 use hyperscale_bft::BftConfig;
 use hyperscale_core::{ProtocolEvent, TimerId};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
@@ -55,21 +53,17 @@ use hyperscale_dispatch_pooled::{PooledDispatch, ThreadPoolConfig};
 use hyperscale_engine::{GenesisConfig, NetworkDefinition, RadixExecutor, TransactionValidation};
 use hyperscale_execution::{ExecCertStore, FinalizedWaveStore};
 use hyperscale_mempool::{MempoolConfig, TxStore};
-use hyperscale_metrics::{
-    ChannelDepths, set_channel_depths, set_libp2p_peers, set_pool_queue_depths,
-};
+use hyperscale_metrics::{set_libp2p_peers, set_pool_queue_depths};
 use hyperscale_metrics_prometheus::install;
 use hyperscale_network::{HandlerRegistry, ValidatorKeyMap};
 use hyperscale_network_libp2p::{
     Libp2pAdapter, Libp2pConfig, Libp2pNetwork, NetworkError, RequestManager, RequestManagerConfig,
     RequestStreamPool, generate_random_keypair,
 };
-use hyperscale_node::shard_loop::{
-    NodeStatusSnapshot, ShardEvent, TimerOp, record_metrics, timer_event,
-};
+use hyperscale_node::shard_loop::{ShardEvent, ShardLoop, TimerOp, timer_event};
 use hyperscale_node::{NodeConfig, NodeHost, NodeStateMachine, SharedTopologySnapshot, VnodeInit};
 use hyperscale_provisions::{ProvisionConfig, ProvisionStore};
-use hyperscale_storage::{ChainReader, ChainWriter};
+use hyperscale_storage::ChainReader;
 use hyperscale_storage_rocksdb::{RocksDbStorage, SharedStorage};
 use hyperscale_topology::TopologyCoordinator;
 use hyperscale_types::{
@@ -87,9 +81,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval, sleep};
 use tracing::{debug, info, warn};
 
-use crate::rpc::{
-    MempoolSnapshot, NodeStatusState, TxSubmissionSender, VnodeMempoolStats, VnodeStatusEntry,
-};
+use crate::rpc::{MempoolSnapshot, NodeStatusState, TxSubmissionSender};
 use crate::status::SyncStatus;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -390,9 +382,30 @@ impl ProductionRunnerBuilder {
             })
             .collect();
 
-        let (xb_timer_tx, xb_timer_rx) = unbounded();
-        let (xb_callback_tx, xb_callback_rx) = unbounded();
-        let (xb_shutdown_tx, xb_shutdown_rx) = unbounded();
+        // Build one (timer / callback / shutdown) channel triple per
+        // hosted shard up front so the per-shard event senders inside
+        // `ProcessIo` can point at each shard's own callback channel.
+        // `ShardChannels` carries the receivers; the runner keeps a clone
+        // of each shutdown sender for fanout at termination.
+        let mut shard_channels: HashMap<ShardGroupId, ShardChannels> = HashMap::new();
+        let mut shard_callback_txs: HashMap<ShardGroupId, Sender<ShardEvent>> = HashMap::new();
+        let mut shard_shutdown_txs: HashMap<ShardGroupId, Sender<()>> = HashMap::new();
+        for shard in &local_shards {
+            let (timer_tx, timer_rx) = unbounded();
+            let (callback_tx, callback_rx) = unbounded();
+            let (shutdown_tx, shutdown_rx) = unbounded();
+            shard_callback_txs.insert(*shard, callback_tx);
+            shard_shutdown_txs.insert(*shard, shutdown_tx);
+            shard_channels.insert(
+                *shard,
+                ShardChannels {
+                    timer_tx,
+                    timer_rx,
+                    callback_rx,
+                    shutdown_rx,
+                },
+            );
+        }
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
         let recovered = recovery_storage.load_recovered_state();
@@ -493,11 +506,13 @@ impl ProductionRunnerBuilder {
 
         let executor = RadixExecutor::new(network_definition);
 
-        // One entry per hosted shard, all cloned from the same callback
-        // sender — the pinned loop drains them through `xb_callback_rx`.
-        let shard_event_senders: HashMap<ShardGroupId, Sender<ShardEvent>> = local_shards
+        // Each shard's `shard_event_senders` entry points at that
+        // shard's own pinned-thread callback channel — callbacks,
+        // network handlers, and RPC fanout for that shard land on its
+        // thread directly.
+        let shard_event_senders: HashMap<ShardGroupId, Sender<ShardEvent>> = shard_callback_txs
             .iter()
-            .map(|s| (*s, xb_callback_tx.clone()))
+            .map(|(s, tx)| (*s, tx.clone()))
             .collect();
         let io_loop = NodeHost::new(
             vnode_inits,
@@ -519,12 +534,9 @@ impl ProductionRunnerBuilder {
 
         Ok(ProductionRunner {
             io_loop: Some(io_loop),
-            xb_timer_tx,
-            xb_callback_tx,
-            xb_shutdown_tx,
-            xb_timer_rx: Some(xb_timer_rx),
-            xb_callback_rx: Some(xb_callback_rx),
-            xb_shutdown_rx: Some(xb_shutdown_rx),
+            shard_channels: Some(shard_channels),
+            shard_callback_txs,
+            shard_shutdown_txs,
             network: adapter,
             topology_snapshot: topology,
             storages,
@@ -552,25 +564,24 @@ impl ProductionRunnerBuilder {
 /// verification happen on that thread. The tokio runtime handles async I/O
 /// routing, RPC transaction handling, sync/fetch management, and metrics.
 pub struct ProductionRunner {
-    /// The `IoLoop`, wrapped in `Option` because it's moved to the pinned thread.
-    /// `None` after `run()` extracts it.
+    /// The composed [`NodeHost`], wrapped in `Option` because it's
+    /// decomposed via `into_parts()` and moved onto the per-shard
+    /// threads at `run()` time. `None` thereafter.
     io_loop: Option<ProdIoLoop>,
 
-    /// Timer events to pinned thread (for external timer injection if needed).
-    #[allow(dead_code)]
-    xb_timer_tx: Sender<ShardEvent>,
-    /// Kept alive solely to prevent the crossbeam callback channel from closing.
-    #[allow(dead_code)]
-    xb_callback_tx: Sender<ShardEvent>,
-    /// Shutdown signal to pinned thread.
-    xb_shutdown_tx: Sender<()>,
+    /// Per-shard receivers (timer + callback + shutdown), built at
+    /// construction and consumed when `run()` spawns the shard threads.
+    shard_channels: Option<HashMap<ShardGroupId, ShardChannels>>,
 
-    /// Timer receiver (moved to `PinnedLoopConfig`).
-    xb_timer_rx: Option<Receiver<ShardEvent>>,
-    /// Callback receiver (moved to `PinnedLoopConfig`).
-    xb_callback_rx: Option<Receiver<ShardEvent>>,
-    /// Shutdown receiver (moved to `PinnedLoopConfig`).
-    xb_shutdown_rx: Option<Receiver<()>>,
+    /// Per-shard callback senders, kept alive on the runner so the
+    /// channels survive until shutdown. The same `Sender` clones live
+    /// inside [`ProcessIo::shard_event_senders`] for off-thread callers.
+    #[allow(dead_code)]
+    shard_callback_txs: HashMap<ShardGroupId, Sender<ShardEvent>>,
+
+    /// Per-shard shutdown signals. `shutdown()` fans these to every
+    /// shard thread in parallel.
+    shard_shutdown_txs: HashMap<ShardGroupId, Sender<()>>,
 
     /// Libp2p network adapter (shared with `InboundRouter`, `RequestManager`).
     network: Arc<Libp2pAdapter>,
@@ -590,7 +601,10 @@ pub struct ProductionRunner {
 
     /// Shared RPC `NodeStatusState` updated by the metrics tick.
     rpc_status: Option<Arc<ArcSwap<NodeStatusState>>>,
-    /// Shared mempool snapshot updated by the metrics tick.
+    /// Shared mempool snapshot handle. Read by the RPC submission
+    /// backpressure check; per-shard write path lives outside the
+    /// runner's tokio loop.
+    #[allow(dead_code)]
     mempool_snapshot: Option<Arc<ArcSwap<MempoolSnapshot>>>,
     /// Shared sync status updated by the metrics tick.
     sync_status: Option<Arc<ArcSwap<SyncStatus>>>,
@@ -839,47 +853,57 @@ impl ProductionRunner {
             crypto_threads = config.crypto_threads,
             execution_threads = config.execution_threads,
             pin_cores = config.pin_cores,
-            "Starting production runner (IoLoop architecture)"
+            "Starting production runner (per-shard thread architecture)"
         );
 
-        // ── 1. Initialize genesis before spawning pinned thread ──────────
+        // ── 1. Initialize genesis while NodeHost still owns the ShardLoops.
         let initial_timer_ops = self.maybe_initialize_genesis();
 
-        // ── 2. Extract IoLoop and channel receivers for pinned thread ───
+        // ── 2. Decompose NodeHost into Arc<ProcessIo> + per-shard ShardLoops.
         let io_loop = self
             .io_loop
             .take()
             .expect("io_loop already taken (run called twice?)");
+        let (_process, shards) = io_loop.into_parts();
 
-        let pinned_config = PinnedLoopConfig {
-            timer_tx: self.xb_timer_tx.clone(),
-            timer_rx: self.xb_timer_rx.take().expect("timer_rx already taken"),
-            callback_rx: self
-                .xb_callback_rx
-                .take()
-                .expect("callback_rx already taken"),
-            shutdown_rx: self
-                .xb_shutdown_rx
-                .take()
-                .expect("shutdown_rx already taken"),
-            tokio_handle: TokioHandle::current(),
-            initial_timer_ops,
-            rpc_status: self.rpc_status.clone(),
-            sync_status: self.sync_status.clone(),
-            mempool_snapshot: self.mempool_snapshot.clone(),
-            storages: self
-                .storages
-                .iter()
-                .map(|(s, st)| (*s, Arc::clone(st)))
-                .collect(),
-        };
+        let mut shard_channels = self
+            .shard_channels
+            .take()
+            .expect("shard_channels already taken");
 
-        // ── 3. Spawn pinned thread ───────────────────────────────────────
-        let loop_handle = spawn_pinned_loop(io_loop, pinned_config);
+        // Split genesis-emitted timer ops by shard.
+        let mut timer_ops_by_shard: HashMap<ShardGroupId, Vec<TimerOp>> = HashMap::new();
+        for op in initial_timer_ops {
+            let shard = match &op {
+                TimerOp::Set { shard, .. } | TimerOp::Cancel { shard, .. } => *shard,
+            };
+            timer_ops_by_shard.entry(shard).or_default().push(op);
+        }
 
-        // ── 4. Metrics + shutdown loop ───────────────────────────────────
+        // ── 3. Spawn one pinned thread per hosted shard.
+        let tokio_handle = TokioHandle::current();
+        let mut shard_threads: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(shards.len());
+        for (shard, shard_loop) in shards {
+            let channels = shard_channels
+                .remove(&shard)
+                .expect("channels allocated for every hosted shard");
+            let initial_timer_ops = timer_ops_by_shard.remove(&shard).unwrap_or_default();
+            let cfg = ShardLoopConfig {
+                timer_tx: channels.timer_tx,
+                timer_rx: channels.timer_rx,
+                callback_rx: channels.callback_rx,
+                shutdown_rx: channels.shutdown_rx,
+                tokio_handle: tokio_handle.clone(),
+                initial_timer_ops,
+            };
+            shard_threads.push(spawn_shard_loop(shard_loop, cfg));
+        }
+
+        // ── 4. Metrics + maintenance + shutdown loop.
         let mut metrics_tick = interval(Duration::from_secs(1));
         metrics_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut last_gc = Instant::now();
+        let gc_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut shutdown_rx = self.shutdown_rx.take().expect("shutdown_rx already taken");
 
         loop {
@@ -891,17 +915,27 @@ impl ProductionRunner {
                 }
                 _ = metrics_tick.tick() => {
                     self.collect_metrics();
+                    if !gc_in_flight.load(std::sync::atomic::Ordering::Relaxed)
+                        && last_gc.elapsed() >= GC_INTERVAL
+                    {
+                        last_gc = Instant::now();
+                        self.schedule_jmt_gc(&gc_in_flight);
+                    }
                 }
             }
         }
 
-        // ── 6. Shutdown pinned thread ────────────────────────────────────
-        info!("Sending shutdown to pinned thread");
-        let _ = self.xb_shutdown_tx.send(());
-
-        // Wait for the pinned thread to exit.
-        if let Err(e) = loop_handle.join() {
-            warn!("Pinned thread panicked: {:?}", e);
+        // ── 5. Fan shutdown to every shard thread in parallel.
+        info!("Sending shutdown to shard threads");
+        for (shard, tx) in &self.shard_shutdown_txs {
+            if tx.send(()).is_err() {
+                debug!(shard = ?shard, "Shard already exited");
+            }
+        }
+        for handle in shard_threads {
+            if let Err(e) = handle.join() {
+                warn!("Shard thread panicked: {:?}", e);
+            }
         }
 
         info!("Production runner stopped");
@@ -948,6 +982,32 @@ impl ProductionRunner {
                 sync_status.store(Arc::new(updated));
             }
         }
+    }
+
+    /// Dispatch per-shard JMT + state-history GC off the tokio runtime.
+    /// `in_flight` serializes runs so a slow disk can't stack concurrent
+    /// passes on top of each other.
+    fn schedule_jmt_gc(&self, in_flight: &Arc<std::sync::atomic::AtomicBool>) {
+        in_flight.store(true, std::sync::atomic::Ordering::Relaxed);
+        let storages: Vec<(ShardGroupId, Arc<RocksDbStorage>)> = self
+            .storages
+            .iter()
+            .map(|(s, st)| (*s, Arc::clone(st)))
+            .collect();
+        let gc_flag = Arc::clone(in_flight);
+        TokioHandle::current().spawn_blocking(move || {
+            for (shard, storage) in storages {
+                let deleted = storage.run_jmt_gc();
+                if deleted > 0 {
+                    debug!(shard = ?shard, deleted, "JMT garbage collection completed");
+                }
+                let history_deleted = storage.run_state_history_gc();
+                if history_deleted > 0 {
+                    debug!(shard = ?shard, history_deleted, "State-history GC completed");
+                }
+            }
+            gc_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+        });
     }
 }
 
@@ -1013,25 +1073,20 @@ fn build_network_stack(args: NetworkBuildArgs) -> Result<NetworkStack, RunnerErr
 /// Concrete `IoLoop` type for the production runner.
 type ProdIoLoop = NodeHost<SharedStorage, Libp2pNetwork, PooledDispatch>;
 
-/// Configuration for the pinned event loop.
-struct PinnedLoopConfig {
+/// Concrete `ShardLoop` type for the production runner.
+type ProdShardLoop = ShardLoop<SharedStorage, Libp2pNetwork, PooledDispatch, RadixExecutor>;
+
+/// Per-shard receivers driving a single shard's pinned thread. Built
+/// during construction and consumed when [`ProductionRunner::run`]
+/// hands the bundle to [`run_shard_loop`].
+struct ShardChannels {
     timer_tx: Sender<ShardEvent>,
     timer_rx: Receiver<ShardEvent>,
     callback_rx: Receiver<ShardEvent>,
     shutdown_rx: Receiver<()>,
-    tokio_handle: TokioHandle,
-    initial_timer_ops: Vec<TimerOp>,
-    rpc_status: Option<Arc<ArcSwap<NodeStatusState>>>,
-    sync_status: Option<Arc<ArcSwap<SyncStatus>>>,
-    mempool_snapshot: Option<Arc<ArcSwap<MempoolSnapshot>>>,
-    /// One `RocksDbStorage` per hosted shard. The pinned loop sweeps
-    /// every entry on its periodic JMT GC + RocksDB-memory tick, so a
-    /// non-primary shard's storage doesn't fall out of GC just because
-    /// it isn't the metrics-aggregation representative.
-    storages: HashMap<ShardGroupId, Arc<RocksDbStorage>>,
 }
 
-/// Manages tokio-based timers for the production pinned event loop.
+/// Manages tokio-based timers for one shard's pinned event loop.
 ///
 /// Spawns async sleep tasks via the tokio handle that fire timer events
 /// into the crossbeam timer channel.
@@ -1086,7 +1141,6 @@ impl Drop for ProdTimerManager {
     }
 }
 
-const METRICS_INTERVAL: Duration = Duration::from_secs(1);
 const GC_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -1133,111 +1187,43 @@ fn wall_clock_local() -> LocalTimestamp {
     LocalTimestamp::from_millis(ms)
 }
 
-/// Push a [`NodeStatusSnapshot`] into the shared RPC state objects.
-///
-/// `node_status` carries one [`VnodeStatusEntry`] per hosted vnode (sorted
-/// by `validator_id` for stable output). `sync_status` and `mempool_snapshot`
-/// stay primary-driven for now — `/sync` and `/mempool` plus the
-/// submission-time backpressure check are still single-readout surfaces.
-fn update_rpc_state(config: &PinnedLoopConfig, snapshot: &NodeStatusSnapshot) {
-    if let Some(ref rpc_status) = config.rpc_status {
-        let current = rpc_status.load();
-        let mut vnodes: Vec<VnodeStatusEntry> = snapshot
-            .vnodes
-            .iter()
-            .map(|(vid, v)| VnodeStatusEntry {
-                validator_id: vid.inner(),
-                shard: v.shard.inner(),
-                block_height: v.committed_height.inner(),
-                view: v.view,
-                state_root_hash: hex_encode(v.state_root.as_bytes()),
-                mempool: VnodeMempoolStats {
-                    pending_count: v.mempool_pending,
-                    in_flight_count: v.mempool_in_flight,
-                    total_count: v.mempool_total,
-                },
-            })
-            .collect();
-        vnodes.sort_by_key(|v| v.validator_id);
-        rpc_status.store(Arc::new(NodeStatusState {
-            num_shards: current.num_shards,
-            // Preserve connected_peers — written by collect_metrics.
-            connected_peers: current.connected_peers,
-            vnodes,
-        }));
-    }
-
-    let Some((shard, vnode)) = snapshot.primary() else {
-        return;
-    };
-
-    if let Some(ref sync_status) = config.sync_status {
-        let current = sync_status.load();
-        sync_status.store(Arc::new(SyncStatus {
-            state: shard.block_sync.state.clone(),
-            current_height: shard.block_sync.current_height,
-            target_height: shard.block_sync.target_height,
-            blocks_behind: shard.block_sync.blocks_behind,
-            // Preserve sync_peers set by runner's collect_metrics
-            sync_peers: current.sync_peers,
-            pending_fetches: shard.block_sync.pending_fetches,
-            queued_heights: shard.block_sync.queued_heights,
-        }));
-    }
-
-    if let Some(ref mempool_snapshot) = config.mempool_snapshot {
-        mempool_snapshot.store(Arc::new(MempoolSnapshot {
-            pending_count: vnode.mempool_pending,
-            in_flight_count: vnode.mempool_in_flight,
-            total_count: vnode.mempool_total,
-            accepting_rpc_transactions: vnode.accepting_rpc_transactions,
-            at_pending_limit: vnode.at_pending_limit,
-            remote_shard_in_flight: vnode.remote_shard_in_flight.clone(),
-            remote_congestion_threshold: vnode.remote_congestion_threshold,
-            updated_at: Some(Instant::now()),
-        }));
-    }
+/// Per-shard pinned-thread configuration.
+struct ShardLoopConfig {
+    timer_tx: Sender<ShardEvent>,
+    timer_rx: Receiver<ShardEvent>,
+    callback_rx: Receiver<ShardEvent>,
+    shutdown_rx: Receiver<()>,
+    tokio_handle: TokioHandle,
+    initial_timer_ops: Vec<TimerOp>,
 }
 
-/// Run the `IoLoop` on a pinned thread. Blocks until shutdown.
+/// Drive one shard's [`ShardLoop`] on its pinned thread. Blocks until
+/// the shard's shutdown signal fires.
 ///
-/// Drains the three crossbeam channels via `try_recv` in priority order
-/// (`timer_rx` > `callback_rx` > `consensus_rx`). When all are empty,
-/// blocks on `crossbeam::select!` with a timeout derived from the nearest
-/// batch deadline. Block commit and other I/O work is dispatched by
-/// `IoLoop` via `Dispatch::spawn(Io, ..)`; this loop only drives event
-/// flow.
-fn run_pinned_loop(mut io_loop: ProdIoLoop, mut config: PinnedLoopConfig) {
-    info!("Pinned event loop starting");
+/// Priority cascade: `timer_rx` (scheduled view-change / cleanup /
+/// fetch tick fires) before `callback_rx` (off-thread results, inbound
+/// network deliveries, RPC fanout). When both are empty the cascade
+/// blocks on `select!` with a timeout drawn from the shard's nearest
+/// batch deadline so the shard wakes precisely when its earliest
+/// expiring batch is due.
+fn run_shard_loop(mut shard_loop: ProdShardLoop, mut config: ShardLoopConfig) {
+    let shard = shard_loop.shard;
+    info!(shard = ?shard, "Shard event loop starting");
 
     let mut timer_mgr = ProdTimerManager::new(config.tokio_handle.clone(), config.timer_tx.clone());
-
-    // Process timer ops from genesis initialization (e.g. ViewChange timer).
     for op in std::mem::take(&mut config.initial_timer_ops) {
         timer_mgr.process_op(op);
     }
 
-    let mut last_metrics = Instant::now();
-    let mut last_gc = Instant::now();
-    let gc_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
     loop {
-        // ── Shutdown check ──
         if config.shutdown_rx.try_recv().is_ok() {
-            info!("Pinned event loop received shutdown signal");
+            info!(shard = ?shard, "Shard event loop received shutdown signal");
             break;
         }
 
-        // ── Set wall-clock time ──
         let now = wall_clock_local();
-        io_loop.set_time(now);
+        shard_loop.set_time(now);
 
-        // ── Priority try_recv cascade ──
-        //
-        // Two channels: `timer_rx` carries scheduled timer fires; everything
-        // else (callbacks, network handlers, RPC fanout) lands on
-        // `callback_rx`. Timer preference matters for liveness — view-change
-        // and cleanup must not queue behind a busy callback channel.
         let event = 'recv: {
             if let Ok(e) = config.timer_rx.try_recv() {
                 break 'recv Some(e);
@@ -1246,14 +1232,13 @@ fn run_pinned_loop(mut io_loop: ProdIoLoop, mut config: PinnedLoopConfig) {
                 break 'recv Some(e);
             }
 
-            // Nothing ready — block with timeout from nearest batch deadline
-            let timeout = io_loop
+            let timeout = shard_loop
                 .nearest_batch_deadline()
                 .map_or(DEFAULT_TIMEOUT, |deadline| deadline.saturating_sub(now));
 
             crossbeam::channel::select! {
                 recv(config.shutdown_rx) -> _ => {
-                    info!("Pinned event loop received shutdown signal (select)");
+                    info!(shard = ?shard, "Shard event loop received shutdown signal (select)");
                     return;
                 }
                 recv(config.timer_rx) -> e => e.ok(),
@@ -1262,110 +1247,41 @@ fn run_pinned_loop(mut io_loop: ProdIoLoop, mut config: PinnedLoopConfig) {
             }
         };
 
-        // ── Process event ──
         if let Some(event) = event {
-            let output = io_loop.step(event);
-
-            // Process timer operations from this step. Block commit and
-            // other I/O are dispatched by io_loop itself via
-            // `Dispatch::spawn(Io, ..)` — they do not surface here.
+            let input = match event {
+                ShardEvent::Shard(s, input) if s == shard => input,
+                ShardEvent::Shard(other, _) => {
+                    warn!(received_shard = ?other, this_shard = ?shard, "Dropping cross-shard event");
+                    continue;
+                }
+                ShardEvent::Process(_) => {
+                    warn!(shard = ?shard, "Dropping process-scoped event on shard channel");
+                    continue;
+                }
+            };
+            let output = shard_loop.run_step(input);
             for op in output.timer_ops {
                 timer_mgr.process_op(op);
             }
         }
 
-        // ── Flush expired batches ──
-        io_loop.flush_expired_batches(wall_clock_local());
-
-        // ── Periodic metrics + RPC status snapshot ──
-        if last_metrics.elapsed() >= METRICS_INTERVAL {
-            last_metrics = Instant::now();
-
-            // Capture cheap snapshot on pinned thread, dispatch expensive
-            // recording (RocksDB queries + prometheus calls) off-thread.
-            let snapshot = io_loop.metrics_snapshot();
-            let channel_depths = ChannelDepths {
-                callback: config.callback_rx.len(),
-                consensus: 0,
-                validated_tx: 0,
-                rpc_tx: 0,
-                status: 0,
-                sync_request: 0,
-                tx_request: 0,
-                cert_request: 0,
-            };
-            let storages: Vec<Arc<RocksDbStorage>> =
-                config.storages.values().map(Arc::clone).collect();
-            config.tokio_handle.spawn_blocking(move || {
-                let (block_cache_bytes, memtable_bytes) =
-                    storages.iter().fold((0u64, 0u64), |(bc, mt), st| {
-                        let (b, m) = st.memory_usage_bytes();
-                        (bc.saturating_add(b), mt.saturating_add(m))
-                    });
-                record_metrics(snapshot, block_cache_bytes, memtable_bytes);
-                set_channel_depths(&channel_depths);
-            });
-
-            // Push status snapshot to shared RPC state.
-            update_rpc_state(&config, &io_loop.status_snapshot());
-        }
-
-        // ── Periodic JMT GC (off main thread) ──
-        if !gc_in_flight.load(std::sync::atomic::Ordering::Relaxed)
-            && last_gc.elapsed() >= GC_INTERVAL
-        {
-            last_gc = Instant::now();
-            schedule_jmt_gc(&config, &gc_in_flight);
-        }
+        shard_loop.flush_expired_batches(wall_clock_local());
     }
 
-    info!("Pinned event loop exiting");
+    info!(shard = ?shard, "Shard event loop exiting");
 }
 
-/// Dispatch per-shard JMT GC plus state-history GC off the pinned
-/// thread. Every hosted shard's storage is swept in turn; the
-/// `in_flight` flag serializes runs so a slow disk can't stack
-/// concurrent passes.
-fn schedule_jmt_gc(config: &PinnedLoopConfig, in_flight: &Arc<std::sync::atomic::AtomicBool>) {
-    in_flight.store(true, std::sync::atomic::Ordering::Relaxed);
-    let storages: Vec<(ShardGroupId, Arc<RocksDbStorage>)> = config
-        .storages
-        .iter()
-        .map(|(s, st)| (*s, Arc::clone(st)))
-        .collect();
-    let gc_flag = Arc::clone(in_flight);
-    config.tokio_handle.spawn_blocking(move || {
-        for (shard, storage) in storages {
-            let deleted = storage.run_jmt_gc();
-            if deleted > 0 {
-                debug!(shard = ?shard, deleted, "JMT garbage collection completed");
-            }
-            let history_deleted = storage.run_state_history_gc();
-            if history_deleted > 0 {
-                debug!(shard = ?shard, history_deleted, "State-history GC completed");
-            }
-        }
-        gc_flag.store(false, std::sync::atomic::Ordering::Relaxed);
-    });
-}
-
-/// Spawn the `IoLoop` on a dedicated thread pinned to core 0.
-fn spawn_pinned_loop(io_loop: ProdIoLoop, config: PinnedLoopConfig) -> std::thread::JoinHandle<()> {
+/// Spawn one shard's pinned thread. Core pinning is deliberately
+/// dropped — modern Linux CFS keeps long-lived CPU-bound threads
+/// cache-warm without explicit affinity, and the per-shard model
+/// already isolates each shard's scheduling from the others.
+fn spawn_shard_loop(
+    shard_loop: ProdShardLoop,
+    config: ShardLoopConfig,
+) -> std::thread::JoinHandle<()> {
+    let shard = shard_loop.shard;
     std::thread::Builder::new()
-        .name("io-loop".to_string())
-        .spawn(move || {
-            // Try to pin to core 0
-            if let Some(core_ids) = get_core_ids()
-                && let Some(&core_id) = core_ids.first()
-            {
-                if set_for_current(core_id) {
-                    info!(?core_id, "Pinned io-loop thread to core");
-                } else {
-                    warn!("Failed to pin io-loop thread to core 0");
-                }
-            }
-
-            run_pinned_loop(io_loop, config);
-        })
-        .expect("failed to spawn io-loop thread")
+        .name(format!("shard-loop-{}", shard.inner()))
+        .spawn(move || run_shard_loop(shard_loop, config))
+        .expect("failed to spawn shard-loop thread")
 }
