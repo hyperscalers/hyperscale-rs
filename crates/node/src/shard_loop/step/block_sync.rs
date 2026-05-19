@@ -38,7 +38,6 @@ pub(in crate::shard_loop) const fn classify_fetch_error(err: &RequestError) -> F
     }
 }
 use hyperscale_dispatch::{Dispatch, DispatchPool};
-use hyperscale_engine::Engine;
 use hyperscale_metrics::{
     record_sync_block_filtered, record_sync_response_error, record_sync_round_completed,
     record_sync_round_retried, record_sync_round_started,
@@ -56,12 +55,11 @@ use crate::shard_io::sync::SyncOutput;
 use crate::shard_io::sync::block::{BlockSyncInput, BlockSyncOutput};
 use crate::shard_loop::{ShardLoop, push_shard_input};
 
-impl<S, N, D, E> ShardLoop<S, N, D, E>
+impl<S, N, D> ShardLoop<S, N, D>
 where
     S: Storage,
     N: Network,
     D: Dispatch,
-    E: Engine,
 {
     // ─── Action dispatch ────────────────────────────────────────────────
 

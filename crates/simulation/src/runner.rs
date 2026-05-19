@@ -12,9 +12,7 @@ use crossbeam::channel::{Receiver, Sender, unbounded};
 use hyperscale_bft::BftConfig;
 use hyperscale_core::{ProtocolEvent, TimerId};
 use hyperscale_dispatch_sync::SyncDispatch;
-use hyperscale_engine::{
-    GenesisConfig, RadixExecutor, SimExecutionCache, SimulationEngine, TransactionValidation,
-};
+use hyperscale_engine::{GenesisConfig, RadixExecutor, TransactionValidation};
 use hyperscale_execution::{ExecCertStore, FinalizedWaveStore};
 use hyperscale_mempool::{MempoolConfig, TxStore};
 use hyperscale_network_memory::{
@@ -42,7 +40,7 @@ use tracing::{debug, info, trace};
 use crate::event_queue::EventKey;
 
 /// Type alias for the simulation's concrete `NodeHost`.
-type SimHost = NodeHost<SimStorage, SimNetworkAdapter, SyncDispatch, SimulationEngine>;
+type SimHost = NodeHost<SimStorage, SimNetworkAdapter, SyncDispatch>;
 
 /// Per-(host, shard) shared store bundle — `ProvisionStore`, `TxStore`,
 /// `ExecCertStore`, and `FinalizedWaveStore` cloned into every same-shard
@@ -209,19 +207,6 @@ impl SimulationRunner {
         let mut hosts = Vec::with_capacity(num_hosts);
         let mut event_rxs = Vec::with_capacity(num_hosts);
 
-        // One execution cache per shard, shared across every same-shard
-        // vnode regardless of host. Determinism guarantees same-shard
-        // vnodes execute identical txs; the cache short-circuits the
-        // recomputation.
-        let shard_caches: HashMap<ShardGroupId, SimExecutionCache> = (0..network_config.num_shards)
-            .map(|s| {
-                (
-                    ShardGroupId::new(u64::from(s)),
-                    SimExecutionCache::default(),
-                )
-            })
-            .collect();
-
         for (host_index, host_vnodes) in host_layout.iter().enumerate() {
             // Group this host's vnodes by shard. For cross-shard
             // hosting each group has one vnode; for same-shard hosting
@@ -303,17 +288,7 @@ impl SimulationRunner {
 
             let network_def = NetworkDefinition::simulator();
             let tx_validator = Arc::new(TransactionValidation::permissive(network_def.clone()));
-
-            // Cross-shard hosts execute against multiple shards' caches;
-            // pick the first hosted shard's cache as the engine's cache
-            // (deterministic processing means the result is the same
-            // across shards for any given tx the engine sees).
-            let primary_shard = *by_shard
-                .keys()
-                .next()
-                .expect("host carries at least one vnode");
-            let shard_cache = shard_caches[&primary_shard].clone();
-            let sim_engine = SimulationEngine::new(RadixExecutor::new(network_def), shard_cache);
+            let executor = RadixExecutor::new(network_def);
 
             // One `SimStorage` per hosted shard on this host.
             let storages: HashMap<ShardGroupId, SimStorage> =
@@ -326,7 +301,7 @@ impl SimulationRunner {
             let host = NodeHost::new(
                 vnode_inits,
                 storages,
-                sim_engine,
+                executor,
                 network.create_adapter(
                     NodeIndex::try_from(host_index).expect("host_index fits NodeIndex"),
                 ),

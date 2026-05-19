@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use crossbeam::channel::Sender;
 use hyperscale_dispatch::Dispatch;
-use hyperscale_engine::{Engine, TransactionValidation};
+use hyperscale_engine::TransactionValidation;
 use hyperscale_storage::Storage;
 use hyperscale_types::{RoutableTransaction, ShardGroupId, shard_for_node};
 
@@ -28,11 +28,10 @@ use crate::shard_loop::{DispatchHandles, SharedTopologySnapshot};
 /// first; pass the resulting sender map here, keep the receivers for
 /// the runner / harness. Wrap the constructed `ProcessIo` in `Arc` for
 /// sharing.
-pub struct ProcessIo<S, N, D, E>
+pub struct ProcessIo<S, N, D>
 where
     S: Storage,
     D: Dispatch,
-    E: Engine,
 {
     /// Network sender plus the registry of inbound gossip / request
     /// handlers installed at `init` time. `Arc` so handler closures
@@ -62,7 +61,7 @@ where
     pub(crate) topology_snapshot: SharedTopologySnapshot,
 
     /// See [`DispatchHandles`]. Cloned once per delegated-action dispatch.
-    pub(crate) dispatch_handles: Arc<DispatchHandles<S, N, E>>,
+    pub(crate) dispatch_handles: Arc<DispatchHandles<S, N>>,
 
     /// Stateless transaction validator (signature + format + EC checks).
     /// `Arc` so it can be cloned into the `tx_validation` pool closure
@@ -70,11 +69,10 @@ where
     pub(crate) tx_validator: Arc<TransactionValidation>,
 }
 
-impl<S, N, D, E> ProcessIo<S, N, D, E>
+impl<S, N, D> ProcessIo<S, N, D>
 where
     S: Storage,
     D: Dispatch,
-    E: Engine,
 {
     /// Construct a `ProcessIo` from its shared resources. Callers wrap
     /// the result in `Arc` and share with every `ShardLoop` plus
@@ -84,7 +82,7 @@ where
         dispatch: D,
         shard_event_senders: HashMap<ShardGroupId, Sender<ShardEvent>>,
         topology_snapshot: SharedTopologySnapshot,
-        dispatch_handles: Arc<DispatchHandles<S, N, E>>,
+        dispatch_handles: Arc<DispatchHandles<S, N>>,
         tx_validator: Arc<TransactionValidation>,
     ) -> Self {
         Self {

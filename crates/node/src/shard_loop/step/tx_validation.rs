@@ -17,7 +17,6 @@ use std::sync::Arc;
 
 use hyperscale_core::ProtocolEvent;
 use hyperscale_dispatch::{Dispatch, DispatchPool};
-use hyperscale_engine::Engine;
 use hyperscale_network::Network;
 use hyperscale_storage::Storage;
 use hyperscale_types::network::gossip::TransactionGossip;
@@ -28,12 +27,11 @@ use crate::host::NodeHost;
 use crate::process_io::SubmitFanout;
 use crate::shard_loop::{ShardLoop, ShardScopedInput, push_shard_input};
 
-impl<S, N, D, E> ShardLoop<S, N, D, E>
+impl<S, N, D> ShardLoop<S, N, D>
 where
     S: Storage,
     N: Network,
     D: Dispatch,
-    E: Engine,
 {
     // ─── step() handlers ────────────────────────────────────────────────
 
@@ -245,12 +243,11 @@ where
     }
 }
 
-impl<S, N, D, E> NodeHost<S, N, D, E>
+impl<S, N, D> NodeHost<S, N, D>
 where
     S: Storage,
     N: Network,
     D: Dispatch,
-    E: Engine,
 {
     /// Locally-submitted transaction (sim): compute the routing decision
     /// via [`ProcessIo::compute_submit_fanout`] and apply it synchronously

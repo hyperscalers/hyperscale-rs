@@ -7,7 +7,6 @@ use hyperscale_core::{
     Action, ActionContext, ActionOwner, CommitSource, FetchAbandon, FetchRequest, ProtocolEvent,
 };
 use hyperscale_dispatch::Dispatch;
-use hyperscale_engine::Engine;
 use hyperscale_execution::action_handlers::handle_action as handle_execution_action;
 use hyperscale_metrics::record_transaction_finalized;
 use hyperscale_network::Network;
@@ -28,12 +27,11 @@ use crate::shard_io::fetch::binding::{
 };
 use crate::shard_io::sync::block::BlockSyncInput;
 
-impl<S, N, D, E> ShardLoop<S, N, D, E>
+impl<S, N, D> ShardLoop<S, N, D>
 where
     S: Storage,
     N: Network,
     D: Dispatch,
-    E: Engine,
 {
     // ─── Action Processing ──────────────────────────────────────────────
 

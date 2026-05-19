@@ -29,7 +29,7 @@ use arc_swap::ArcSwap;
 use crossbeam::channel::Sender;
 use hyperscale_core::{Action, ProtocolEvent, StateMachine, TimerId};
 use hyperscale_dispatch::Dispatch;
-use hyperscale_engine::{Engine, ProcessExecutionCache};
+use hyperscale_engine::{ProcessExecutionCache, RadixExecutor};
 use hyperscale_network::Network;
 use hyperscale_storage::{PendingChain, Storage};
 use hyperscale_types::{
@@ -71,8 +71,8 @@ pub type SharedTopologySnapshot = Arc<ArcSwap<TopologySnapshot>>;
 /// Shard-scoped handles (`pending_chain`, `prepared_commits`) live in
 /// `per_shard`, keyed by the hosted shard id. Delegated handlers select
 /// the right entry from the emitting vnode's shard.
-pub(crate) struct DispatchHandles<S: Storage, N, E: Engine> {
-    pub(crate) executor: E,
+pub(crate) struct DispatchHandles<S: Storage, N> {
+    pub(crate) executor: RadixExecutor,
     pub(crate) network: Arc<N>,
     pub(crate) execution_cache: Arc<ProcessExecutionCache>,
     pub(crate) per_shard: HashMap<ShardGroupId, ShardDispatchHandles<S>>,
@@ -189,11 +189,10 @@ pub struct StepOutput {
 /// one mempool body store, etc.); cross-shard vnodes live in different
 /// `ShardLoop`s. [`Self::step`] dispatches one [`ShardScopedInput`] to its
 /// handler.
-pub struct ShardLoop<S, N, D, E>
+pub struct ShardLoop<S, N, D>
 where
     S: Storage,
     D: Dispatch,
-    E: Engine,
 {
     /// Shard this loop drives. Mirrors the key in `NodeHost::shards`;
     /// held inline so methods on `ShardLoop` can self-identify without a
@@ -203,7 +202,7 @@ where
     /// network adapter, dispatch pool, tx validator, topology snapshot,
     /// dispatch handles, event sender. Cloned `Arc` so off-thread
     /// closures spawned from this loop's handlers can capture it cheaply.
-    pub(crate) process: Arc<ProcessIo<S, N, D, E>>,
+    pub(crate) process: Arc<ProcessIo<S, N, D>>,
     /// Per-shard I/O state shared by every vnode in `vnodes`.
     pub io: ShardIo<S>,
     /// Vnodes participating in this shard's consensus. Driven in order
@@ -240,12 +239,11 @@ where
     pub tx_gossip_window: Duration,
 }
 
-impl<S, N, D, E> ShardLoop<S, N, D, E>
+impl<S, N, D> ShardLoop<S, N, D>
 where
     S: Storage,
     N: Network,
     D: Dispatch,
-    E: Engine,
 {
     /// Sender for this shard's own event channel — the destination for
     /// every callback this loop spawns (block-commit completions, fetch

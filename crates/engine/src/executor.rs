@@ -1,6 +1,12 @@
 //! Synchronous Radix Engine executor.
 //!
-//! [`RadixExecutor`] is the production implementation of [`Engine`].
+//! [`RadixExecutor`] runs transactions against a caller-supplied
+//! snapshot and returns the shard-invariant [`CachedVmOutput`]. The
+//! caller projects it into a per-shard [`ExecutedTx`] via
+//! [`project_to_shard`](crate::project_to_shard) and typically
+//! memoises the intermediate in
+//! [`ProcessExecutionCache`](crate::ProcessExecutionCache).
+//!
 //! Storage is NOT owned by the executor — the runner provides it as a
 //! method argument so the same executor can serve multiple snapshots
 //! and so the runner can hoist a single snapshot across an entire
@@ -14,7 +20,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use hyperscale_storage::{SubstateDatabase, SubstateStore};
-use hyperscale_types::{BlockHeight, NodeId, RoutableTransaction, ShardGroupId, SubstateEntry};
+use hyperscale_types::{BlockHeight, NodeId, RoutableTransaction, SubstateEntry};
 use radix_common::network::NetworkDefinition;
 use radix_common::types::NodeId as RadixNodeId;
 use radix_engine::transaction::{ExecutionConfig, execute_transaction};
@@ -23,10 +29,8 @@ use radix_transactions::validation::TransactionValidator;
 use tracing::field::Empty;
 use tracing::{Level, Span, instrument};
 
-use crate::engine::Engine;
-use crate::output::{ExecutedTx, ExecutionOutput};
 use crate::provisioned_snapshot::ProvisionedSnapshot;
-use crate::receipt::{CachedVmOutput, build_executed_tx, compute_vm_output};
+use crate::receipt::{CachedVmOutput, compute_vm_output};
 
 /// Fetch state entries for the given nodes from storage at a specific block height.
 ///
@@ -84,24 +88,6 @@ struct ExecutorCaches {
 /// Storage is NOT owned by the executor; the runner passes it to each
 /// method. State machines stay pure; I/O is delegated to runners.
 ///
-/// # Usage
-///
-/// ```ignore
-/// // Runner owns storage.
-/// let storage = Arc::new(SimStorage::new());
-///
-/// // Create executor (no storage parameter).
-/// let executor = RadixExecutor::new(network);
-///
-/// // Bootstrap genesis: build (or reuse the cached) merged updates,
-/// // then install them on per-node storage.
-/// let merged = hyperscale_engine::prepared_genesis(executor.network(), &config);
-/// storage.install_genesis(&merged);
-///
-/// // Execute a batch.
-/// let output = executor.execute_single_shard(&storage, &transactions, shard, num_shards)?;
-/// ```
-///
 /// # Cloning
 ///
 /// Cloning is cheap — only the [`Arc`] around [`ExecutorCaches`] is bumped.
@@ -135,144 +121,18 @@ impl RadixExecutor {
         &self.network
     }
 
-    /// Execute one transaction against a pre-taken snapshot.
-    ///
-    /// Validation failure produces an [`ExecutedTx::failure`] for that
-    /// tx alone — peers in the batch are unaffected.
-    fn execute_one<D: SubstateDatabase>(
-        &self,
-        snapshot: &D,
-        tx: &RoutableTransaction,
-        local_shard: ShardGroupId,
-        num_shards: u64,
-    ) -> ExecutedTx {
-        // Get-or-validate is cached on RoutableTransaction; avoids
-        // re-checking signatures already checked at RPC ingress.
-        let Some(validated) = tx.get_or_validate(&self.caches.validator) else {
-            return ExecutedTx::failure_with_log(tx.hash(), "Validation failed");
-        };
-        let executable = validated.clone().create_executable();
-
-        let receipt = execute_transaction(
-            snapshot,
-            &self.caches.vm_modules,
-            &self.caches.exec_config,
-            &executable,
-        );
-
-        // Same snapshot for receipt filtering — using shared storage
-        // would race with concurrent cert commits, producing different
-        // filtered DatabaseUpdates and receipt_hash divergence across
-        // validators.
-        build_executed_tx(snapshot, tx, &receipt, local_shard, num_shards)
-    }
-}
-
-impl Clone for RadixExecutor {
-    fn clone(&self) -> Self {
-        Self {
-            network: self.network.clone(),
-            caches: Arc::clone(&self.caches),
-        }
-    }
-}
-
-impl Engine for RadixExecutor {
-    /// Each transaction is executed against `snapshot`. Caller hoists
-    /// one snapshot across the batch — state doesn't change during
-    /// execution (commits serialize elsewhere), so reusing a snapshot
-    /// is correct and avoids per-tx `storage.snapshot()` +
-    /// `read_jmt_metadata` overhead.
-    ///
-    /// Returns the per-tx [`ExecutedTx`] list. **Does NOT commit** —
-    /// `DatabaseUpdates` from execution are cached by the state
-    /// machine and applied when the `WaveCertificate` is included in
-    /// a committed block.
-    #[instrument(level = Level::DEBUG, skip_all, fields(
-        tx_count = transactions.len(),
-        latency_us = Empty,
-    ))]
-    fn execute_single_shard<D: SubstateDatabase>(
-        &self,
-        snapshot: &D,
-        transactions: &[Arc<RoutableTransaction>],
-        local_shard: ShardGroupId,
-        num_shards: u64,
-    ) -> ExecutionOutput {
-        let start = Instant::now();
-        let mut results = Vec::with_capacity(transactions.len());
-
-        for tx in transactions {
-            results.push(self.execute_one(snapshot, tx, local_shard, num_shards));
-        }
-
-        Span::current().record(
-            "latency_us",
-            u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX),
-        );
-        ExecutionOutput::new(results)
-    }
-
-    /// Layers `provisions` on top of `snapshot` via [`ProvisionedSnapshot`]
-    /// and executes against the merged view. Provisions carry pre-computed
-    /// storage keys from the sending shard for O(log n) lookups without
-    /// expensive hash work.
-    ///
-    /// Same READ-ONLY contract as `execute_single_shard`.
-    #[instrument(level = Level::DEBUG, skip_all, fields(
-        tx_count = transactions.len(),
-        provision_count = provisions.len(),
-        latency_us = Empty,
-    ))]
-    fn execute_cross_shard<D: SubstateDatabase>(
-        &self,
-        snapshot: &D,
-        transactions: &[Arc<RoutableTransaction>],
-        provisions: &[Arc<Vec<SubstateEntry>>],
-        local_shard: ShardGroupId,
-        num_shards: u64,
-    ) -> ExecutionOutput {
-        let start = Instant::now();
-        let mut results = Vec::with_capacity(transactions.len());
-
-        let entry_slices: Vec<&[SubstateEntry]> = provisions.iter().map(|p| p.as_slice()).collect();
-        let provisioned = ProvisionedSnapshot::from_provisions(snapshot, &entry_slices);
-
-        for tx in transactions {
-            let Some(validated) = tx.get_or_validate(&self.caches.validator) else {
-                results.push(ExecutedTx::failure_with_log(tx.hash(), "Validation failed"));
-                continue;
-            };
-            let executable = validated.clone().create_executable();
-            let receipt = provisioned.execute(
-                &executable,
-                &self.caches.vm_modules,
-                &self.caches.exec_config,
-            );
-
-            // Same snapshot for receipt filtering — `resolve_owned_nodes`
-            // must see the same ownership state as the execution.
-            results.push(build_executed_tx(
-                snapshot,
-                tx,
-                &receipt,
-                local_shard,
-                num_shards,
-            ));
-        }
-
-        Span::current().record(
-            "latency_us",
-            u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX),
-        );
-        ExecutionOutput::new(results)
-    }
-
-    fn compute_vm_output_single_shard<D: SubstateDatabase>(
+    /// Run the VM for a single-shard transaction and return the
+    /// [`CachedVmOutput`] — the shard-invariant projection of the
+    /// receipt. Caller pairs this with
+    /// [`crate::project_to_shard`] to produce an [`ExecutedTx`] for
+    /// each participating shard.
+    #[instrument(level = Level::DEBUG, skip_all, fields(latency_us = Empty))]
+    pub fn compute_vm_output_single_shard<D: SubstateDatabase>(
         &self,
         snapshot: &D,
         tx: &RoutableTransaction,
     ) -> CachedVmOutput {
+        let start = Instant::now();
         let Some(validated) = tx.get_or_validate(&self.caches.validator) else {
             return CachedVmOutput::validation_failed(tx.hash());
         };
@@ -283,15 +143,29 @@ impl Engine for RadixExecutor {
             &self.caches.exec_config,
             &executable,
         );
-        compute_vm_output(snapshot, tx, &receipt)
+        let output = compute_vm_output(snapshot, tx, &receipt);
+        Span::current().record(
+            "latency_us",
+            u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX),
+        );
+        output
     }
 
-    fn compute_vm_output_cross_shard<D: SubstateDatabase>(
+    /// Layers `provisions` on top of `snapshot` via [`ProvisionedSnapshot`]
+    /// and executes against the merged view. Provisions carry pre-computed
+    /// storage keys from the sending shard for O(log n) lookups without
+    /// expensive hash work.
+    #[instrument(level = Level::DEBUG, skip_all, fields(
+        provision_count = provisions.len(),
+        latency_us = Empty,
+    ))]
+    pub fn compute_vm_output_cross_shard<D: SubstateDatabase>(
         &self,
         snapshot: &D,
         tx: &RoutableTransaction,
         provisions: &[Arc<Vec<SubstateEntry>>],
     ) -> CachedVmOutput {
+        let start = Instant::now();
         let Some(validated) = tx.get_or_validate(&self.caches.validator) else {
             return CachedVmOutput::validation_failed(tx.hash());
         };
@@ -303,10 +177,20 @@ impl Engine for RadixExecutor {
             &self.caches.vm_modules,
             &self.caches.exec_config,
         );
-        compute_vm_output(&provisioned, tx, &receipt)
+        let output = compute_vm_output(&provisioned, tx, &receipt);
+        Span::current().record(
+            "latency_us",
+            u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX),
+        );
+        output
     }
+}
 
-    fn network(&self) -> &NetworkDefinition {
-        Self::network(self)
+impl Clone for RadixExecutor {
+    fn clone(&self) -> Self {
+        Self {
+            network: self.network.clone(),
+            caches: Arc::clone(&self.caches),
+        }
     }
 }

@@ -9,19 +9,17 @@
 
 use hyperscale_core::ProtocolEvent;
 use hyperscale_dispatch::Dispatch;
-use hyperscale_engine::Engine;
 use hyperscale_network::Network;
 use hyperscale_storage::Storage;
 use hyperscale_types::BlockHeight;
 
 use crate::shard_loop::ShardLoop;
 
-impl<S, N, D, E> ShardLoop<S, N, D, E>
+impl<S, N, D> ShardLoop<S, N, D>
 where
     S: Storage,
     N: Network,
     D: Dispatch,
-    E: Engine,
 {
     /// Update the commit pipeline before forwarding `BlockPersisted` to the
     /// state machine: the persisted height advances `block_commit`'s gate

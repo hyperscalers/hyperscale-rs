@@ -2,7 +2,6 @@
 
 use hyperscale_core::ProtocolEvent;
 use hyperscale_dispatch::Dispatch;
-use hyperscale_engine::Engine;
 use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_network::Network;
 use hyperscale_storage::Storage;
@@ -28,12 +27,11 @@ use crate::shard_io::verify::{
 };
 use crate::shard_loop::{push_protocol_event, push_shard_input};
 
-impl<S, N, D, E> NodeHost<S, N, D, E>
+impl<S, N, D> NodeHost<S, N, D>
 where
     S: Storage,
     N: Network,
     D: Dispatch,
-    E: Engine,
 {
     /// Register per-type request handlers with the network.
     ///

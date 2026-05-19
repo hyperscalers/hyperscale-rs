@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use hyperscale_engine::{Engine, ProcessExecutionCache};
+use hyperscale_engine::{ProcessExecutionCache, RadixExecutor};
 use hyperscale_network::Network;
 use hyperscale_storage::{PendingChain, Storage};
 use hyperscale_types::{
@@ -23,8 +23,8 @@ use crate::ProtocolEvent;
 /// block lives on the `Action` variant itself, so the dispatcher doesn't
 /// need to know which actions read state at which anchor.
 #[allow(missing_docs)] // bag of references; field names match the borrowed types
-pub struct ActionContext<'a, S: Storage, E: Engine, N: Network> {
-    pub executor: &'a E,
+pub struct ActionContext<'a, S: Storage, N: Network> {
+    pub executor: &'a RadixExecutor,
     pub topology_snapshot: &'a TopologySnapshot,
     /// Chain-state lookup. Handlers that read state call
     /// `pending_chain.view_at(block_hash)` to build an anchored view.
@@ -52,7 +52,7 @@ pub struct ActionContext<'a, S: Storage, E: Engine, N: Network> {
     pub commit_prepared: &'a (dyn Fn(PreparedBlock<S::PreparedCommit>) + Send + Sync),
 }
 
-impl<S: Storage, E: Engine, N: Network> ActionContext<'_, S, E, N> {
+impl<S: Storage, N: Network> ActionContext<'_, S, N> {
     /// Invoke `notify`; common spelling at action-handler call sites.
     pub fn notify_protocol(&self, event: ProtocolEvent) {
         (self.notify)(event);

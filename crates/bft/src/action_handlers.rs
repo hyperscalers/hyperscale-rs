@@ -7,7 +7,6 @@
 use std::sync::Arc;
 
 use hyperscale_core::{Action, ActionContext, PreparedBlock, ProtocolEvent, VerificationKind};
-use hyperscale_engine::Engine;
 use hyperscale_metrics::record_signature_verification_latency;
 use hyperscale_network::Network;
 use hyperscale_storage::{ChainWriter, JmtSnapshot, Storage, SubstateStore};
@@ -556,10 +555,9 @@ fn collect_finalized_receipts(waves: &[Arc<FinalizedWave>]) -> Vec<Arc<Consensus
 /// owned by other coordinator crates hit `unreachable!()` — the caller
 /// (node's dispatcher) routes by variant prefix.
 #[allow(clippy::too_many_lines)] // single dispatch over BFT-owned Action variants
-pub fn handle_action<S, E, N>(action: Action, ctx: &ActionContext<'_, S, E, N>)
+pub fn handle_action<S, N>(action: Action, ctx: &ActionContext<'_, S, N>)
 where
     S: Storage,
-    E: Engine,
     N: Network,
 {
     match action {

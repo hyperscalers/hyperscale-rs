@@ -1060,7 +1060,7 @@ fn build_network_stack(args: NetworkBuildArgs) -> Result<NetworkStack, RunnerErr
 type ProdHost = NodeHost<SharedStorage, Libp2pNetwork, PooledDispatch>;
 
 /// Concrete `ShardLoop` type for the production runner.
-type ProdShardLoop = ShardLoop<SharedStorage, Libp2pNetwork, PooledDispatch, RadixExecutor>;
+type ProdShardLoop = ShardLoop<SharedStorage, Libp2pNetwork, PooledDispatch>;
 
 /// Per-shard receivers driving a single shard's pinned thread. Built
 /// during construction and consumed when [`ProductionRunner::run`]
