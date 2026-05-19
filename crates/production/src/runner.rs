@@ -1141,6 +1141,7 @@ impl Drop for ProdTimerManager {
     }
 }
 
+const METRICS_INTERVAL: Duration = Duration::from_secs(1);
 const GC_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -1215,6 +1216,8 @@ fn run_shard_loop(mut shard_loop: ProdShardLoop, mut config: ShardLoopConfig) {
         timer_mgr.process_op(op);
     }
 
+    let mut last_metrics = Instant::now();
+
     loop {
         if config.shutdown_rx.try_recv().is_ok() {
             info!(shard = ?shard, "Shard event loop received shutdown signal");
@@ -1266,6 +1269,14 @@ fn run_shard_loop(mut shard_loop: ProdShardLoop, mut config: ShardLoopConfig) {
         }
 
         shard_loop.flush_expired_batches(wall_clock_local());
+
+        // Per-shard prometheus emission. Process-wide memory + RocksDB
+        // gauges are emitted from the runner's tokio tick after summing
+        // across shards.
+        if last_metrics.elapsed() >= METRICS_INTERVAL {
+            last_metrics = Instant::now();
+            shard_loop.record_prometheus();
+        }
     }
 
     info!(shard = ?shard, "Shard event loop exiting");

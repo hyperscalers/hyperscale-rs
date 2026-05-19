@@ -141,6 +141,55 @@ pub fn record_metrics(
     set_memory_metrics(&memory);
 }
 
+impl<S, N, D, E> super::ShardLoop<S, N, D, E>
+where
+    S: Storage,
+    N: Network,
+    D: Dispatch,
+    E: Engine,
+{
+    /// Emit this shard's per-shard and per-vnode prometheus gauges.
+    /// Called from the shard's pinned thread on the metrics tick.
+    /// Process-wide gauges (memory, `RocksDB`) are emitted separately
+    /// by the runner after aggregating per-shard contributions.
+    pub fn record_prometheus(&self) {
+        let s = self.shard.inner();
+        let fetches = self.io.fetches.metrics();
+        let syncs = &self.io.syncs;
+
+        set_sync_blocks_behind("block", s, syncs.block.blocks_behind());
+        set_sync_in_progress("block", s, syncs.block.is_syncing());
+        set_sync_round_in_flight("block", s, syncs.block.in_flight_ranges());
+        set_sync_blocks_behind(
+            "remote_header",
+            s,
+            syncs.remote_header.total_blocks_behind(),
+        );
+        set_sync_in_progress("remote_header", s, syncs.remote_header.is_syncing());
+        set_sync_round_in_flight("remote_header", s, syncs.remote_header.in_flight_ranges());
+        set_fetch_in_flight("transaction", s, fetches.transaction_in_flight);
+        set_fetch_in_flight("provision", s, fetches.provision_in_flight);
+        set_fetch_in_flight("local_provision", s, fetches.local_provision_in_flight);
+        set_fetch_in_flight("exec_cert", s, fetches.exec_cert_in_flight);
+        set_fetch_in_flight("finalized_wave", s, fetches.finalized_wave_in_flight);
+
+        for vnode in &self.vnodes {
+            let v = vnode.validator_id.inner();
+            let state = &vnode.state;
+            let bft_stats = state.bft().stats();
+            let mempool = state.mempool();
+            let contention = mempool.lock_contention_stats();
+            set_bft_round(s, v, bft_stats.current_round);
+            set_view_changes(s, v, bft_stats.view_changes);
+            set_view_syncs(s, v, bft_stats.view_syncs);
+            set_mempool_size(s, v, mempool.len());
+            set_lock_contention(s, v, contention.contention_ratio());
+            set_in_flight(s, v, mempool.in_flight());
+            set_backpressure_active(s, v, mempool.at_in_flight_limit());
+        }
+    }
+}
+
 impl<S, N, D, E> NodeHost<S, N, D, E>
 where
     S: Storage,
