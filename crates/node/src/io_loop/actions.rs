@@ -19,7 +19,7 @@ use hyperscale_types::{
 };
 use tracing::{debug, trace, warn};
 
-use super::{IoLoop, TimerOp, push_protocol_event};
+use super::{IoLoop, ShardLoop, TimerOp, push_protocol_event};
 use crate::shard_io::block_commit::{AccumulateDecision, PendingCommit, make_commit_prepared};
 use crate::shard_io::fetch::FetchInput;
 use crate::shard_io::fetch::binding::{
@@ -155,7 +155,8 @@ where
                     .record_ec_created(&tx_hashes, now);
             }
             Action::TopologyChanged { topology_snapshot } => {
-                self.handle_topology_changed(&topology_snapshot);
+                self.shard_loop(shard)
+                    .handle_topology_changed(&topology_snapshot);
             }
         }
     }
@@ -252,20 +253,6 @@ where
         self.shard_loop_mut(shard)
             .emitted_statuses
             .push((tx_hash, status));
-    }
-
-    fn handle_topology_changed(&self, topology: &Arc<TopologySnapshot>) {
-        self.process.topology_snapshot.store(Arc::clone(topology));
-
-        // Network impl reads validator keys + shard committees off the
-        // snapshot it gets here — no separate keymap push.
-        self.process.network.update_topology(Arc::clone(topology));
-
-        tracing::info!(
-            local_shard = topology.local_shard().inner(),
-            committee_size = topology.committee_for_shard(topology.local_shard()).len(),
-            "Network topology updated"
-        );
     }
 
     /// Bridge an [`Action::CommitBlockByQcOnly`] to the standard commit
@@ -527,5 +514,33 @@ where
                 ),
             }
         });
+    }
+}
+
+impl<S, N, D, E> ShardLoop<S, N, D, E>
+where
+    S: Storage,
+    N: Network,
+    D: Dispatch,
+    E: Engine,
+{
+    /// Adopt a fresh topology snapshot: publish it through the lock-free
+    /// `ArcSwap` so off-thread closures pick it up on their next `.load()`,
+    /// and push it to the network adapter (which keys validator pubkeys
+    /// and shard committees off the snapshot). Idempotent across hosted
+    /// shards — every same-shard vnode's `Action::TopologyChanged` lands
+    /// here, but the final stored value is identical.
+    pub(in crate::io_loop) fn handle_topology_changed(&self, topology: &Arc<TopologySnapshot>) {
+        self.process.topology_snapshot.store(Arc::clone(topology));
+
+        // Network impl reads validator keys + shard committees off the
+        // snapshot it gets here — no separate keymap push.
+        self.process.network.update_topology(Arc::clone(topology));
+
+        tracing::info!(
+            local_shard = topology.local_shard().inner(),
+            committee_size = topology.committee_for_shard(topology.local_shard()).len(),
+            "Network topology updated"
+        );
     }
 }
