@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use crossbeam::channel::{Receiver, unbounded};
+use crossbeam::channel::{Receiver, Sender, unbounded};
 use hyperscale_bft::BftConfig;
 use hyperscale_core::{ProtocolEvent, TimerId};
 use hyperscale_dispatch_sync::SyncDispatch;
@@ -318,6 +318,11 @@ impl SimulationRunner {
             // One `SimStorage` per hosted shard on this host.
             let storages: HashMap<ShardGroupId, SimStorage> =
                 by_shard.keys().map(|s| (*s, SimStorage::new())).collect();
+            // Single receiver per host: every hosted shard's sender is a
+            // clone of the same `event_tx`, and the harness drains all
+            // shards through `event_rx` deterministically.
+            let shard_event_senders: HashMap<ShardGroupId, Sender<ShardEvent>> =
+                by_shard.keys().map(|s| (*s, event_tx.clone())).collect();
             let io_loop = NodeHost::new(
                 vnode_inits,
                 storages,
@@ -326,7 +331,7 @@ impl SimulationRunner {
                     NodeIndex::try_from(host_index).expect("host_index fits NodeIndex"),
                 ),
                 SyncDispatch,
-                event_tx,
+                shard_event_senders,
                 topology_arc_for_io_loop.expect("host carries at least one vnode"),
                 NodeConfig::default(),
                 tx_validator,

@@ -104,7 +104,7 @@ where
         executor: E,
         network: N,
         dispatch: D,
-        event_sender: Sender<ShardEvent>,
+        shard_event_senders: HashMap<ShardGroupId, Sender<ShardEvent>>,
         topology_snapshot: SharedTopologySnapshot,
         config: NodeConfig,
         tx_validator: Arc<TransactionValidation>,
@@ -195,10 +195,21 @@ where
             network: Arc::clone(&network),
             per_shard: per_shard_dispatch,
         });
+        assert_eq!(
+            shard_event_senders.len(),
+            hosted_shards.len(),
+            "shard_event_senders must have one entry per hosted shard"
+        );
+        for shard in &hosted_shards {
+            assert!(
+                shard_event_senders.contains_key(shard),
+                "shard_event_senders missing entry for hosted shard {shard:?}"
+            );
+        }
         let process = Arc::new(ProcessIo::new(
             network,
             dispatch,
-            event_sender,
+            shard_event_senders,
             topology_snapshot,
             dispatch_handles,
             tx_validator,

@@ -184,7 +184,7 @@ where
         }
 
         let validator = self.process.tx_validator.clone();
-        let event_tx = self.process.event_sender.clone();
+        let event_tx = self.event_sender().clone();
         let local_shard = self.shard;
         self.process
             .dispatch

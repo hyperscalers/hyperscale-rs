@@ -252,6 +252,14 @@ where
     D: Dispatch,
     E: Engine,
 {
+    /// Sender for this shard's own event channel — the destination for
+    /// every callback this loop spawns (block-commit completions, fetch
+    /// results, BLS-verify outcomes) and every protocol event it pushes
+    /// back to itself.
+    pub(crate) fn event_sender(&self) -> &Sender<ShardEvent> {
+        self.process.shard_sender(self.shard)
+    }
+
     /// Access the vnode at `vnode_idx` within this shard's group.
     ///
     /// # Panics
