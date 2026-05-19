@@ -108,14 +108,17 @@ where
     }
 
     /// Compute the cross-shard admission plan for a locally-submitted
-    /// transaction. The first hosted touched shard becomes the gossip
-    /// source — it receives the full `touched_shards` list so it can
-    /// enqueue outbound gossip for each destination (hosted or not).
-    /// Other hosted touched shards only admit.
+    /// transaction.
     ///
-    /// If no hosted shard is touched, the gossip still goes out via
-    /// some hosted shard (any shard's `outbound_gossip_batches` works —
-    /// the wire shape carries no source identity).
+    /// If any hosted shard is in the tx's touched set, the first such
+    /// shard becomes the [`SubmitFanout::Admit`] source — it admits,
+    /// takes `locally_submitted` ownership, and enqueues outbound
+    /// gossip for every destination (hosted or not). Remaining hosted
+    /// touched shards admit only (passive co-hosts).
+    ///
+    /// If no hosted shard is touched, returns
+    /// [`SubmitFanout::GossipOnly`] — gossip still goes out via some
+    /// hosted shard, but no shard admits or takes ownership.
     pub(crate) fn compute_submit_fanout(&self, tx: &RoutableTransaction) -> SubmitFanout {
         let num_shards = self.topology_snapshot.load().num_shards();
         let touched_shards: Vec<ShardGroupId> = tx
@@ -132,24 +135,32 @@ where
             .keys()
             .copied()
             .filter(|s| touched_shards.contains(s));
-        let source_shard = hosted_touched
-            .next()
-            .or_else(|| self.shard_event_senders.keys().copied().next());
-        let other_hosted: Vec<ShardGroupId> = hosted_touched.collect();
 
-        SubmitFanout {
-            touched_shards,
-            source_shard,
-            other_hosted,
+        if let Some(source) = hosted_touched.next() {
+            SubmitFanout::Admit {
+                source,
+                passive: hosted_touched.collect(),
+                touched_shards,
+            }
+        } else {
+            // `NodeHost::new` asserts at least one hosted shard, so
+            // there is always a host available to flush gossip.
+            let host = self
+                .shard_event_senders
+                .keys()
+                .copied()
+                .next()
+                .expect("ProcessIo hosts at least one shard");
+            SubmitFanout::GossipOnly {
+                host,
+                touched_shards,
+            }
         }
     }
 
-    /// Fan a locally-submitted transaction out to every touched hosted
-    /// shard via [`Self::shard_event_senders`]. The first hosted touched
-    /// shard receives [`ShardScopedInput::AdmitAndGossipTransaction`]
-    /// (admit + enqueue outbound gossip for every destination); other
-    /// hosted touched shards receive
-    /// [`ShardScopedInput::AdmitTransaction`] (admit only).
+    /// Fan a locally-submitted transaction out via
+    /// [`Self::shard_event_senders`] according to
+    /// [`Self::compute_submit_fanout`].
     ///
     /// Returns `true` if every send succeeded; `false` only on shutdown
     /// (a closed channel). Used by the production RPC submission
@@ -159,25 +170,46 @@ where
     pub fn submit_transaction(&self, tx: &Arc<RoutableTransaction>) -> bool {
         let fanout = self.compute_submit_fanout(tx);
         let mut ok = true;
-        if let Some(source) = fanout.source_shard {
-            let env = ShardEvent::shard(
+        match fanout {
+            SubmitFanout::Admit {
                 source,
-                ShardScopedInput::AdmitAndGossipTransaction {
-                    tx: Arc::clone(tx),
-                    touched_shards: fanout.touched_shards,
-                },
-            );
-            if self.shard_sender(source).send(env).is_err() {
-                ok = false;
+                passive,
+                touched_shards,
+            } => {
+                let env = ShardEvent::shard(
+                    source,
+                    ShardScopedInput::AdmitAndGossipTransaction {
+                        tx: Arc::clone(tx),
+                        touched_shards,
+                    },
+                );
+                if self.shard_sender(source).send(env).is_err() {
+                    ok = false;
+                }
+                for shard in passive {
+                    let env = ShardEvent::shard(
+                        shard,
+                        ShardScopedInput::AdmitTransaction { tx: Arc::clone(tx) },
+                    );
+                    if self.shard_sender(shard).send(env).is_err() {
+                        ok = false;
+                    }
+                }
             }
-        }
-        for shard in fanout.other_hosted {
-            let env = ShardEvent::shard(
-                shard,
-                ShardScopedInput::AdmitTransaction { tx: Arc::clone(tx) },
-            );
-            if self.shard_sender(shard).send(env).is_err() {
-                ok = false;
+            SubmitFanout::GossipOnly {
+                host,
+                touched_shards,
+            } => {
+                let env = ShardEvent::shard(
+                    host,
+                    ShardScopedInput::GossipTransaction {
+                        tx: Arc::clone(tx),
+                        touched_shards,
+                    },
+                );
+                if self.shard_sender(host).send(env).is_err() {
+                    ok = false;
+                }
             }
         }
         ok
@@ -187,18 +219,28 @@ where
 /// Routing decision for a locally-submitted transaction. Returned by
 /// [`ProcessIo::compute_submit_fanout`]; consumed by `NodeHost` (sim)
 /// or the production routing thread.
-pub struct SubmitFanout {
-    /// Every shard the tx touches (declared reads ∪ writes). Used as
-    /// the `touched_shards` payload of
-    /// [`ShardScopedInput::AdmitAndGossipTransaction`] so the source
-    /// shard knows where to send outbound gossip.
-    ///
-    /// [`ShardScopedInput::AdmitAndGossipTransaction`]: crate::event::ShardScopedInput::AdmitAndGossipTransaction
-    pub touched_shards: Vec<ShardGroupId>,
-    /// Hosted shard chosen as the gossip source, or `None` if the
-    /// node hosts no shards at all (impossible by construction —
-    /// `NodeHost::new` asserts at least one hosted shard).
-    pub source_shard: Option<ShardGroupId>,
-    /// Hosted touched shards other than the source — admit-only.
-    pub other_hosted: Vec<ShardGroupId>,
+pub enum SubmitFanout {
+    /// At least one hosted shard is in the tx's touched set. `source`
+    /// admits, takes `locally_submitted` ownership, and gossips out;
+    /// `passive` admit only.
+    Admit {
+        /// First hosted touched shard — source of outbound gossip and
+        /// sole owner of the `locally_submitted` flag for this tx.
+        source: ShardGroupId,
+        /// Hosted touched shards other than the source — admit-only.
+        passive: Vec<ShardGroupId>,
+        /// Every shard the tx touches (declared reads ∪ writes).
+        /// Carried to the source so it can enqueue outbound gossip
+        /// for each destination.
+        touched_shards: Vec<ShardGroupId>,
+    },
+    /// No hosted shard is touched by this tx. Pick any hosted shard to
+    /// flush outbound gossip; no admission, no `locally_submitted`
+    /// entry.
+    GossipOnly {
+        /// Arbitrary hosted shard chosen to enqueue outbound gossip.
+        host: ShardGroupId,
+        /// Every shard the tx touches (declared reads ∪ writes).
+        touched_shards: Vec<ShardGroupId>,
+    },
 }

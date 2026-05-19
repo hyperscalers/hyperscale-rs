@@ -102,28 +102,41 @@ pub enum ShardScopedInput {
         tx: Arc<RoutableTransaction>,
     },
 
-    /// Locally-submitted tx delivered to one of this node's hosted shards
-    /// that touches it. Admits to the shard's validation pipeline if not
-    /// already pending / cached; does NOT enqueue outbound gossip. Emitted
-    /// by `NodeHost::handle_submit_transaction` for every hosted touched
-    /// shard except the designated source.
+    /// Locally-submitted tx delivered to a passive co-host: a hosted
+    /// shard that touches the tx but isn't the source. Admits to the
+    /// shard's validation pipeline if not already pending / cached;
+    /// does NOT enqueue outbound gossip and does NOT mark
+    /// `locally_submitted` — that's the source shard's role.
     AdmitTransaction {
         /// The locally-submitted transaction.
         tx: Arc<RoutableTransaction>,
     },
 
     /// Locally-submitted tx delivered to the source shard (first hosted
-    /// touched shard). Admits to the shard's validation pipeline AND
-    /// enqueues outbound gossip for every destination in `touched_shards`.
-    /// The source shard's `outbound_gossip_batches` accumulates one batch
-    /// per destination shard — `touched_shards` may include destinations
-    /// this node doesn't host.
+    /// touched shard). Admits to the shard's validation pipeline, marks
+    /// the tx as `locally_submitted` so finalization metrics fire once
+    /// per node, AND enqueues outbound gossip for every destination in
+    /// `touched_shards`. The source shard's `outbound_gossip_batches`
+    /// accumulates one batch per destination shard — `touched_shards`
+    /// may include destinations this node doesn't host.
     AdmitAndGossipTransaction {
         /// The locally-submitted transaction.
         tx: Arc<RoutableTransaction>,
         /// Every shard the tx touches (declared reads ∪ writes). Gossip
         /// goes to each — even non-hosted ones — over the destination
         /// shard's topic.
+        touched_shards: Vec<ShardGroupId>,
+    },
+
+    /// Locally-submitted tx whose touched shards are all non-hosted on
+    /// this node. The receiving shard flushes outbound gossip for every
+    /// destination in `touched_shards` but performs no admission and
+    /// takes no `locally_submitted` ownership.
+    GossipTransaction {
+        /// The locally-submitted transaction.
+        tx: Arc<RoutableTransaction>,
+        /// Every shard the tx touches (declared reads ∪ writes). Gossip
+        /// goes to each over the destination shard's topic.
         touched_shards: Vec<ShardGroupId>,
     },
 
@@ -286,9 +299,9 @@ impl ShardScopedInput {
             },
             Self::TransactionGossipReceived { .. } => EventPriority::Network,
             Self::CommittedBlockGossipReceived { .. } => EventPriority::Network,
-            Self::AdmitTransaction { .. } | Self::AdmitAndGossipTransaction { .. } => {
-                EventPriority::Client
-            }
+            Self::AdmitTransaction { .. }
+            | Self::AdmitAndGossipTransaction { .. }
+            | Self::GossipTransaction { .. } => EventPriority::Client,
             Self::FetchTick => EventPriority::Timer,
             Self::BlockSyncResponseReceived { .. }
             | Self::BlockSyncFetchFailed { .. }

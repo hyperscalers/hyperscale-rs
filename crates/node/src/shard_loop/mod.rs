@@ -295,6 +295,9 @@ where
             ShardScopedInput::AdmitAndGossipTransaction { tx, touched_shards } => {
                 self.handle_admit_and_gossip_transaction(tx, &touched_shards);
             }
+            ShardScopedInput::GossipTransaction { tx, touched_shards } => {
+                self.handle_gossip_transaction(&tx, &touched_shards);
+            }
             ShardScopedInput::TransactionValidated { tx } => {
                 self.handle_transaction_validated(tx);
             }

@@ -79,11 +79,18 @@ pub struct ShardIo<S: Storage> {
     /// `TransactionValidationsFailed` handlers.
     pub pending_validation: HashSet<TxHash>,
 
-    /// Subset of `pending_validation` that originated from a local
-    /// RPC / sim submission rather than gossip. Carried through
-    /// validation so the resulting `TransactionValidated` event can
-    /// flag `submitted_locally = true` for mempool admission
-    /// accounting.
+    /// Subset of `pending_validation` for which this shard is the
+    /// designated source for a locally-submitted tx — i.e. it received
+    /// `AdmitAndGossipTransaction`. Carried through validation so the
+    /// resulting `TransactionValidated` event flags
+    /// `submitted_locally = true` for mempool admission accounting.
+    ///
+    /// At most one hosted shard per node enters a given tx hash here,
+    /// so the finalization metric fires exactly once per node per
+    /// locally-submitted tx even when multiple co-hosted shards touch
+    /// it. Passive co-hosts admit via `AdmitTransaction` without
+    /// inserting; gossip-only hosts via `GossipTransaction` don't
+    /// admit at all.
     pub locally_submitted: HashSet<TxHash>,
 
     /// Pending transactions awaiting batched signature / format /

@@ -25,6 +25,7 @@ use hyperscale_types::{RoutableTransaction, ShardGroupId, TxHash};
 
 use crate::batch_accumulator::BatchAccumulator;
 use crate::host::NodeHost;
+use crate::process_io::SubmitFanout;
 use crate::shard_loop::{ShardLoop, ShardScopedInput, push_shard_input};
 
 impl<S, N, D, E> ShardLoop<S, N, D, E>
@@ -69,18 +70,19 @@ where
         }
     }
 
-    /// Locally-submitted tx delivered to this shard. Admit to the
-    /// validation pipeline (marking `locally_submitted` so the resulting
-    /// `ProtocolEvent::TransactionValidated` carries the submitted-locally
-    /// flag) if not already pending or cached. Does NOT enqueue outbound
-    /// gossip — that's the source shard's job via
-    /// [`Self::handle_admit_and_gossip_transaction`].
+    /// Passive co-host admission of a locally-submitted tx: admit to
+    /// the validation pipeline if not already pending or cached. Does
+    /// NOT mark `locally_submitted` and does NOT enqueue outbound
+    /// gossip — both of those are the source shard's role via
+    /// [`Self::handle_admit_and_gossip_transaction`]. Co-locating
+    /// `locally_submitted` on a single shard per node keeps the
+    /// finalization metric from double-counting txs whose touched set
+    /// spans multiple hosted shards.
     pub(in crate::shard_loop) fn handle_admit_transaction(&mut self, tx: Arc<RoutableTransaction>) {
         let tx_hash = tx.hash();
         if !self.io.pending_validation.contains(&tx_hash)
             && !self.io.caches.tx_store.contains(&tx_hash)
         {
-            self.io.locally_submitted.insert(tx_hash);
             self.io.pending_validation.insert(tx_hash);
             self.queue_validation(tx);
         }
@@ -88,7 +90,9 @@ where
 
     /// Source-shard handling for a locally-submitted tx: enqueue
     /// outbound gossip for every destination in `touched_shards`, then
-    /// admit locally. The source shard owns the
+    /// admit locally and mark `locally_submitted` so the resulting
+    /// `ProtocolEvent::TransactionValidated` carries the
+    /// submitted-locally flag. The source shard owns the
     /// `outbound_gossip_batches` map; one batch per destination shard
     /// (hosted or not) gets the tx appended.
     pub(in crate::shard_loop) fn handle_admit_and_gossip_transaction(
@@ -99,7 +103,29 @@ where
         for dst in touched_shards {
             self.enqueue_tx_for_gossip(*dst, Arc::clone(&tx));
         }
-        self.handle_admit_transaction(tx);
+        let tx_hash = tx.hash();
+        if !self.io.pending_validation.contains(&tx_hash)
+            && !self.io.caches.tx_store.contains(&tx_hash)
+        {
+            self.io.locally_submitted.insert(tx_hash);
+            self.io.pending_validation.insert(tx_hash);
+            self.queue_validation(tx);
+        }
+    }
+
+    /// Gossip-only handling for a locally-submitted tx whose touched
+    /// shards are all non-hosted on this node: enqueue outbound gossip
+    /// for every destination. No admission, no validation, no
+    /// `locally_submitted` entry — this shard isn't part of the tx's
+    /// touched set and won't see it in mempool.
+    pub(in crate::shard_loop) fn handle_gossip_transaction(
+        &mut self,
+        tx: &Arc<RoutableTransaction>,
+        touched_shards: &[ShardGroupId],
+    ) {
+        for dst in touched_shards {
+            self.enqueue_tx_for_gossip(*dst, Arc::clone(tx));
+        }
     }
 
     /// Intercept a gossip-received transaction before it reaches the state
@@ -228,7 +254,7 @@ where
 {
     /// Locally-submitted transaction (sim): compute the routing decision
     /// via [`ProcessIo::compute_submit_fanout`] and apply it synchronously
-    /// — each touched hosted shard's `step()` runs in this call frame.
+    /// — each affected hosted shard's `step()` runs in this call frame.
     ///
     /// Production's RPC ingestion thread reuses
     /// [`ProcessIo::compute_submit_fanout`] but applies the decision via
@@ -237,18 +263,32 @@ where
     ///
     /// [`ProcessIo::compute_submit_fanout`]: crate::process_io::ProcessIo::compute_submit_fanout
     pub(crate) fn handle_submit_transaction(&mut self, tx: &Arc<RoutableTransaction>) {
-        let fanout = self.process.compute_submit_fanout(tx);
-
-        if let Some(source) = fanout.source_shard {
-            self.shard_loop_mut(source)
-                .step(ShardScopedInput::AdmitAndGossipTransaction {
-                    tx: Arc::clone(tx),
-                    touched_shards: fanout.touched_shards,
-                });
-        }
-        for shard in fanout.other_hosted {
-            self.shard_loop_mut(shard)
-                .step(ShardScopedInput::AdmitTransaction { tx: Arc::clone(tx) });
+        match self.process.compute_submit_fanout(tx) {
+            SubmitFanout::Admit {
+                source,
+                passive,
+                touched_shards,
+            } => {
+                self.shard_loop_mut(source)
+                    .step(ShardScopedInput::AdmitAndGossipTransaction {
+                        tx: Arc::clone(tx),
+                        touched_shards,
+                    });
+                for shard in passive {
+                    self.shard_loop_mut(shard)
+                        .step(ShardScopedInput::AdmitTransaction { tx: Arc::clone(tx) });
+                }
+            }
+            SubmitFanout::GossipOnly {
+                host,
+                touched_shards,
+            } => {
+                self.shard_loop_mut(host)
+                    .step(ShardScopedInput::GossipTransaction {
+                        tx: Arc::clone(tx),
+                        touched_shards,
+                    });
+            }
         }
     }
 }

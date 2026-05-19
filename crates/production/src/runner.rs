@@ -658,9 +658,10 @@ impl ProductionRunner {
     /// senders; each invocation reads the lock-free topology snapshot,
     /// computes the touched-shard fanout via
     /// [`ProcessIo::compute_submit_fanout`], and pushes the resulting
-    /// `AdmitTransaction` / `AdmitAndGossipTransaction` envelopes onto
-    /// the relevant per-shard channels. Returns `true` on success,
-    /// `false` only when every per-shard channel is closed (shutdown).
+    /// `AdmitTransaction` / `AdmitAndGossipTransaction` /
+    /// `GossipTransaction` envelopes onto the relevant per-shard
+    /// channels. Returns `true` on success, `false` only when every
+    /// per-shard channel is closed (shutdown).
     ///
     /// [`ProcessIo::compute_submit_fanout`]: hyperscale_node::process_io::ProcessIo::compute_submit_fanout
     /// # Panics
