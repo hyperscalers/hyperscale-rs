@@ -14,12 +14,12 @@ use hyperscale_network::Network;
 use hyperscale_provisions::action_handlers::handle_action as handle_provisions_action;
 use hyperscale_storage::Storage;
 use hyperscale_types::{
-    Block, BlockHeight, CertifiedBlock, QuorumCertificate, ShardGroupId, StateRoot,
-    TopologySnapshot, TransactionStatus, TxHash,
+    Block, BlockHeight, CertifiedBlock, QuorumCertificate, StateRoot, TopologySnapshot,
+    TransactionStatus, TxHash,
 };
 use tracing::{debug, trace, warn};
 
-use super::{IoLoop, ShardLoop, TimerOp, push_protocol_event};
+use super::{ShardLoop, TimerOp, push_protocol_event};
 use crate::shard_io::block_commit::{AccumulateDecision, PendingCommit, make_commit_prepared};
 use crate::shard_io::fetch::FetchInput;
 use crate::shard_io::fetch::binding::{
@@ -27,7 +27,8 @@ use crate::shard_io::fetch::binding::{
     TransactionBinding,
 };
 use crate::shard_io::sync::block::BlockSyncInput;
-impl<S, N, D, E> IoLoop<S, N, D, E>
+
+impl<S, N, D, E> ShardLoop<S, N, D, E>
 where
     S: Storage,
     N: Network,
@@ -36,22 +37,21 @@ where
 {
     // ─── Action Processing ──────────────────────────────────────────────
 
-    /// Process a single action emitted by the vnode at `(shard, vnode_idx)`'s
+    /// Process a single action emitted by the vnode at `vnode_idx`'s
     /// state machine.
     ///
-    /// `(shard, vnode_idx)` identifies the vnode that produced the action
-    /// so dispatched off-thread work can sign with the right validator's
+    /// `vnode_idx` identifies the vnode that produced the action so
+    /// dispatched off-thread work can sign with the right validator's
     /// key.
     ///
     /// Two categories of arm:
     /// - **Coordinator policy** — delegated to coordinator crates via
     ///   `dispatch_delegated_action`. Crypto, execution, broadcasts.
-    /// - **`io_loop`-internal effects** — handled inline because the work IS
-    ///   `io_loop` machinery (timers, caches consumed by `io_loop`-side
-    ///   serving, RPC observability, block commit pipeline, topology
-    ///   plumbing).
+    /// - **`ShardLoop`-internal effects** — handled inline because the
+    ///   work IS `ShardLoop` machinery (timers, caches consumed by serving,
+    ///   RPC observability, block commit pipeline, topology plumbing).
     #[allow(clippy::too_many_lines)] // single dispatch over Action variants; one arm per variant
-    pub(super) fn process_action(&mut self, shard: ShardGroupId, vnode_idx: usize, action: Action) {
+    pub(super) fn process_action(&mut self, vnode_idx: usize, action: Action) {
         match action {
             // ─── Coordinator policy: delegated to worker pools ─────────────
             Action::AggregateExecutionCertificate { .. }
@@ -76,47 +76,42 @@ where
             | Action::BroadcastCommittedBlockHeader { .. }
             | Action::SignAndSendExecutionVote { .. }
             | Action::BroadcastExecutionCertificate { .. } => {
-                self.dispatch_delegated_action(shard, vnode_idx, action);
+                self.dispatch_delegated_action(vnode_idx, action);
             }
 
             // ─── Sync / fetch protocol drive ───────────────────────────────
             Action::StartBlockSync { target } => {
-                self.process_start_block_sync(shard, target);
+                self.process_start_block_sync(target);
             }
             Action::StartRemoteHeaderSync {
                 source_shard,
                 target,
-            } => self.process_start_remote_header_sync(shard, source_shard, target),
-            Action::Fetch(req) => self.process_fetch_request(shard, req),
-            Action::AbandonFetch(req) => self.process_fetch_abandon(shard, req),
+            } => self.process_start_remote_header_sync(source_shard, target),
+            Action::Fetch(req) => self.process_fetch_request(req),
+            Action::AbandonFetch(req) => self.process_fetch_abandon(req),
 
-            // ─── io_loop-internal effects ──────────────────────────────────
+            // ─── ShardLoop-internal effects ────────────────────────────────
             Action::SetTimer { id, duration } => {
-                self.shard_loop_mut(shard)
-                    .pending_timer_ops
-                    .push(TimerOp::Set {
-                        shard,
-                        id,
-                        duration,
-                    });
+                let shard = self.shard;
+                self.pending_timer_ops.push(TimerOp::Set {
+                    shard,
+                    id,
+                    duration,
+                });
             }
             Action::CancelTimer { id } => {
-                self.shard_loop_mut(shard)
-                    .pending_timer_ops
-                    .push(TimerOp::Cancel { shard, id });
+                let shard = self.shard;
+                self.pending_timer_ops.push(TimerOp::Cancel { shard, id });
             }
-            Action::Continuation(pe) => self.handle_continuation(shard, pe),
-            Action::RestoreCommittedState => self.handle_restore_committed_state(shard),
+            Action::Continuation(pe) => self.handle_continuation(pe),
+            Action::RestoreCommittedState => self.handle_restore_committed_state(),
             Action::CommitBlock { block, qc, source } => {
-                self.accept_block_commit(
-                    shard,
-                    PendingCommit {
-                        block: Arc::new(block),
-                        qc: Arc::new(qc),
-                        source,
-                        committed_notified: false, // set by accumulate
-                    },
-                );
+                self.accept_block_commit(PendingCommit {
+                    block: Arc::new(block),
+                    qc: Arc::new(qc),
+                    source,
+                    committed_notified: false, // set by accumulate
+                });
             }
             Action::CommitBlockByQcOnly {
                 block,
@@ -126,7 +121,6 @@ where
                 source,
             } => {
                 self.accept_qc_only_commit(
-                    shard,
                     block,
                     qc,
                     parent_state_root,
@@ -141,7 +135,6 @@ where
                 submitted_locally,
             } => {
                 self.handle_emit_transaction_status(
-                    shard,
                     tx_hash,
                     status,
                     cross_shard,
@@ -149,34 +142,31 @@ where
                 );
             }
             Action::RecordTxEcCreated { tx_hashes } => {
-                let now = self.now();
-                self.shard_io_mut(shard)
-                    .tx_phase_times
-                    .record_ec_created(&tx_hashes, now);
+                let now = self.now;
+                self.io.tx_phase_times.record_ec_created(&tx_hashes, now);
             }
             Action::TopologyChanged { topology_snapshot } => {
-                self.shard_loop(shard)
-                    .handle_topology_changed(&topology_snapshot);
+                self.handle_topology_changed(&topology_snapshot);
             }
         }
     }
 
-    // ─── io_loop-internal effect handlers ────────────────────────────────
+    // ─── ShardLoop-internal effect handlers ──────────────────────────────
     //
     // These arms are handled inline (not delegated) because the work IS
-    // `io_loop` state — caches consumed by `io_loop`-side serving, RPC
-    // observability, topology plumbing. Migrating them to coordinator
-    // crates would force a typed cache reference onto `ActionContext` per
-    // arm, with no architectural payoff.
+    // `ShardLoop` state — caches consumed by serving, RPC observability,
+    // topology plumbing. Migrating them to coordinator crates would force
+    // a typed cache reference onto `ActionContext` per arm, with no
+    // architectural payoff.
 
-    fn handle_continuation(&mut self, shard: ShardGroupId, pe: ProtocolEvent) {
-        self.drive_fetch_admission(shard, &pe);
+    fn handle_continuation(&mut self, pe: ProtocolEvent) {
+        self.drive_fetch_admission(&pe);
 
-        // Serving-cache insertion is io_loop's own state, not an
+        // Serving-cache insertion is `ShardLoop`'s own state, not an
         // instance concern — keep it here.
         if let ProtocolEvent::FinalizedWavesAdmitted { waves } = &pe {
             for wave in waves {
-                self.shard_io(shard)
+                self.io
                     .caches
                     .finalized_wave
                     .insert(wave.wave_id().clone(), Arc::clone(wave));
@@ -187,42 +177,38 @@ where
         // advance per-shard `committed` and emit `SyncComplete` once the
         // chain catches up. Drives any newly-emitted range fetches inline.
         if let ProtocolEvent::RemoteHeaderAdmitted { committed_header } = &pe {
-            let outputs = self.shard_io_mut(shard).syncs.on_remote_header_admitted(
+            let outputs = self.io.syncs.on_remote_header_admitted(
                 committed_header.shard_group_id(),
                 committed_header.header().height(),
             );
-            self.process_remote_header_sync_outputs(shard, outputs);
+            self.process_remote_header_sync_outputs(outputs);
         }
 
-        push_protocol_event(&self.process.event_sender, shard, pe);
+        push_protocol_event(&self.process.event_sender, self.shard, pe);
     }
 
-    fn handle_restore_committed_state(&self, shard: ShardGroupId) {
-        let storage = &self.shard_io(shard).storage;
+    fn handle_restore_committed_state(&self) {
+        let storage = &self.io.storage;
         let height = storage.committed_height();
         let hash = storage.committed_hash();
         let qc = storage.latest_qc();
         push_protocol_event(
             &self.process.event_sender,
-            shard,
+            self.shard,
             ProtocolEvent::CommittedStateRestored { height, hash, qc },
         );
     }
 
     fn handle_emit_transaction_status(
         &mut self,
-        shard: ShardGroupId,
         tx_hash: TxHash,
         status: TransactionStatus,
         cross_shard: bool,
         submitted_locally: bool,
     ) {
         trace!(?tx_hash, ?status, "Transaction status");
-        let now = self.now();
-        let terminal_phases = self
-            .shard_io_mut(shard)
-            .tx_phase_times
-            .observe_status(tx_hash, &status, now);
+        let now = self.now;
+        let terminal_phases = self.io.tx_phase_times.observe_status(tx_hash, &status, now);
         if status.is_final()
             && submitted_locally
             && let Some(phases) = terminal_phases
@@ -231,9 +217,9 @@ where
             if latency_secs > 10.0 {
                 // Rate-limit slow tx warnings to avoid log floods during
                 // cross-shard latency spikes.
-                let since_last_warn = now.saturating_sub(self.shard_io(shard).last_slow_tx_warn);
+                let since_last_warn = now.saturating_sub(self.io.last_slow_tx_warn);
                 if since_last_warn >= std::time::Duration::from_secs(30) {
-                    self.shard_io_mut(shard).last_slow_tx_warn = now;
+                    self.io.last_slow_tx_warn = now;
                     let phases_display = phases.display_at(now);
                     warn!(
                         ?tx_hash,
@@ -246,13 +232,8 @@ where
             }
             record_transaction_finalized(latency_secs, cross_shard);
         }
-        self.shard_io(shard)
-            .caches
-            .tx_status
-            .insert(tx_hash, status.clone());
-        self.shard_loop_mut(shard)
-            .emitted_statuses
-            .push((tx_hash, status));
+        self.io.caches.tx_status.insert(tx_hash, status.clone());
+        self.emitted_statuses.push((tx_hash, status));
     }
 
     /// Bridge an [`Action::CommitBlockByQcOnly`] to the standard commit
@@ -263,14 +244,13 @@ where
     /// [`BlockCommitCoordinator::prepare_qc_only_commit`]: crate::shard_io::block_commit::BlockCommitCoordinator::prepare_qc_only_commit
     fn accept_qc_only_commit(
         &mut self,
-        shard: ShardGroupId,
         block: Block,
         qc: QuorumCertificate,
         parent_state_root: StateRoot,
         parent_block_height: BlockHeight,
         source: CommitSource,
     ) {
-        let io = self.shard_io(shard);
+        let io = &self.io;
         let should_enqueue = io.block_commit.prepare_qc_only_commit(
             &io.pending_chain,
             &block,
@@ -279,15 +259,12 @@ where
             source,
         );
         if should_enqueue {
-            self.accept_block_commit(
-                shard,
-                PendingCommit {
-                    block: Arc::new(block),
-                    qc: Arc::new(qc),
-                    source,
-                    committed_notified: false,
-                },
-            );
+            self.accept_block_commit(PendingCommit {
+                block: Arc::new(block),
+                qc: Arc::new(qc),
+                source,
+                committed_notified: false,
+            });
         }
     }
 
@@ -296,52 +273,49 @@ where
     /// unless persistence backpressure is active, fire `BlockCommitted`.
     ///
     /// [`BlockCommitCoordinator`]: crate::shard_io::block_commit::BlockCommitCoordinator
-    fn accept_block_commit(&mut self, shard: ShardGroupId, commit: PendingCommit) {
-        let now = self.now();
-        let decision = self
-            .shard_io_mut(shard)
-            .block_commit
-            .accumulate(commit, now);
+    fn accept_block_commit(&mut self, commit: PendingCommit) {
+        let now = self.now;
+        let decision = self.io.block_commit.accumulate(commit, now);
         match decision {
             AccumulateDecision::Skip => {}
             AccumulateDecision::Accepted { height, notify_now } => {
                 debug!(height = height.inner(), "Block committed");
                 let outputs = self
-                    .shard_io_mut(shard)
+                    .io
                     .syncs
                     .block
                     .handle(BlockSyncInput::Admitted { scope: (), height });
-                self.process_block_sync_outputs(shard, outputs);
+                self.process_block_sync_outputs(outputs);
                 if let Some((block, qc)) = notify_now {
                     let certified = Arc::new(CertifiedBlock::new_unchecked(
                         Arc::unwrap_or_clone(block),
                         Arc::unwrap_or_clone(qc),
                     ));
-                    self.dispatch_event(shard, ProtocolEvent::BlockCommitted { certified });
+                    self.dispatch_event(ProtocolEvent::BlockCommitted { certified });
                 }
             }
         }
     }
 
-    pub(super) fn flush_block_commits(&mut self, shard: ShardGroupId) {
+    pub(super) fn flush_block_commits(&mut self) {
         let event_sender = self.process.event_sender.clone();
         let dispatch = self.process.dispatch.clone();
-        let io = self.shard_io_mut(shard);
+        let io = &mut self.io;
         io.block_commit.flush(&io.storage, &event_sender, &dispatch);
     }
 
     /// Dispatch a typed fetch request to the corresponding binding.
     ///
-    /// `local_shard` identifies which hosted shard's [`FetchHost`] owns
-    /// the request — it's the shard of the emitting vnode, not the
-    /// routing target. The routing target (where to send the request)
-    /// lives on the [`FetchRequest`] variant itself as a `shard` /
-    /// `source_shard` field. `Request` never emits `Send`s on its own —
-    /// it only adds the ids to the pending set; chunks fan out under
-    /// the per-tick cap. The tick timer is refreshed once at the end.
+    /// This shard's [`FetchHost`] owns the request — the shard of the
+    /// emitting vnode, not the routing target. The routing target (where
+    /// to send the request) lives on the [`FetchRequest`] variant itself
+    /// as a `shard` / `source_shard` field. `Request` never emits `Send`s
+    /// on its own — it only adds the ids to the pending set; chunks fan
+    /// out under the per-tick cap. The tick timer is refreshed once at
+    /// the end of `IoLoop::step`.
     ///
     /// [`FetchHost`]: crate::shard_io::fetch::FetchHost
-    fn process_fetch_request(&mut self, local_shard: ShardGroupId, req: FetchRequest) {
+    fn process_fetch_request(&mut self, req: FetchRequest) {
         match req {
             FetchRequest::Transactions {
                 ids,
@@ -349,15 +323,12 @@ where
                 preferred,
                 class,
             } => {
-                self.drive_fetch::<TransactionBinding>(
-                    local_shard,
-                    FetchInput::Request {
-                        ids,
-                        shard,
-                        preferred,
-                        class,
-                    },
-                );
+                self.drive_fetch::<TransactionBinding>(FetchInput::Request {
+                    ids,
+                    shard,
+                    preferred,
+                    class,
+                });
             }
             FetchRequest::LocalProvisions {
                 ids,
@@ -365,15 +336,12 @@ where
                 preferred,
                 class,
             } => {
-                self.drive_fetch::<LocalProvisionBinding>(
-                    local_shard,
-                    FetchInput::Request {
-                        ids,
-                        shard,
-                        preferred,
-                        class,
-                    },
-                );
+                self.drive_fetch::<LocalProvisionBinding>(FetchInput::Request {
+                    ids,
+                    shard,
+                    preferred,
+                    class,
+                });
             }
             FetchRequest::FinalizedWaves {
                 ids,
@@ -381,15 +349,12 @@ where
                 preferred,
                 class,
             } => {
-                self.drive_fetch::<FinalizedWaveBinding>(
-                    local_shard,
-                    FetchInput::Request {
-                        ids,
-                        shard,
-                        preferred,
-                        class,
-                    },
-                );
+                self.drive_fetch::<FinalizedWaveBinding>(FetchInput::Request {
+                    ids,
+                    shard,
+                    preferred,
+                    class,
+                });
             }
             FetchRequest::RemoteProvisions {
                 source_shard,
@@ -397,15 +362,13 @@ where
                 preferred,
                 class,
             } => {
-                self.drive_fetch::<ProvisionBinding>(
-                    local_shard,
-                    FetchInput::Request {
-                        ids: vec![(source_shard, local_shard, block_height)],
-                        shard: source_shard,
-                        preferred,
-                        class,
-                    },
-                );
+                let local_shard = self.shard;
+                self.drive_fetch::<ProvisionBinding>(FetchInput::Request {
+                    ids: vec![(source_shard, local_shard, block_height)],
+                    shard: source_shard,
+                    preferred,
+                    class,
+                });
             }
             FetchRequest::ExecutionCerts {
                 wave_id,
@@ -413,48 +376,41 @@ where
                 class,
             } => {
                 let source_shard = wave_id.shard_group_id();
-                self.drive_fetch::<ExecCertBinding>(
-                    local_shard,
-                    FetchInput::Request {
-                        ids: vec![wave_id],
-                        shard: source_shard,
-                        preferred,
-                        class,
-                    },
-                );
+                self.drive_fetch::<ExecCertBinding>(FetchInput::Request {
+                    ids: vec![wave_id],
+                    shard: source_shard,
+                    preferred,
+                    class,
+                });
             }
         }
     }
 
     /// Dispatch a typed fetch-abandon to the corresponding binding.
     ///
-    /// `local_shard` selects which hosted shard's [`FetchHost`] to
-    /// notify — the abandoning vnode's shard, not the routing target
-    /// of the original request. Symmetric to
-    /// [`Self::process_fetch_request`] — translates the variant payload
+    /// This shard's [`FetchHost`] is notified — the abandoning vnode's
+    /// shard, not the routing target of the original request. Symmetric
+    /// to [`Self::process_fetch_request`] — translates the variant payload
     /// into ids and feeds them through `FetchInput::Abandoned`, which
     /// removes them from the binding's pending set and increments
     /// `record_fetch_abandoned` so the cancellation is observable
-    /// separately from genuine admissions. Refreshes the tick timer
-    /// once at the end (the pending set may now be empty).
+    /// separately from genuine admissions.
     ///
     /// [`FetchHost`]: crate::shard_io::fetch::FetchHost
     #[allow(clippy::needless_pass_by_value)] // mirrors process_fetch_request; future variants carry Vec ids
-    fn process_fetch_abandon(&mut self, local_shard: ShardGroupId, req: FetchAbandon) {
+    fn process_fetch_abandon(&mut self, req: FetchAbandon) {
         match req {
             FetchAbandon::Transactions { ids } => {
-                self.drive_fetch::<TransactionBinding>(local_shard, FetchInput::Abandoned { ids });
+                self.drive_fetch::<TransactionBinding>(FetchInput::Abandoned { ids });
             }
             FetchAbandon::RemoteProvisions {
                 source_shard,
                 block_height,
             } => {
-                self.drive_fetch::<ProvisionBinding>(
-                    local_shard,
-                    FetchInput::Abandoned {
-                        ids: vec![(source_shard, local_shard, block_height)],
-                    },
-                );
+                let local_shard = self.shard;
+                self.drive_fetch::<ProvisionBinding>(FetchInput::Abandoned {
+                    ids: vec![(source_shard, local_shard, block_height)],
+                });
             }
         }
     }
@@ -467,13 +423,14 @@ where
     /// `event_sender` channel and are processed on a future `step()` call.
     /// With `SyncDispatch` (simulation), `spawn_*` runs inline so events
     /// enter the channel immediately and are drained by the harness.
-    fn dispatch_delegated_action(&self, shard: ShardGroupId, vnode_idx: usize, action: Action) {
+    fn dispatch_delegated_action(&self, vnode_idx: usize, action: Action) {
         let pool = action
             .dispatch_pool()
             .expect("dispatch_delegated_action called for delegated actions only");
 
+        let shard = self.shard;
         let handles = Arc::clone(&self.process.dispatch_handles);
-        let vnode = self.vnode(shard, vnode_idx);
+        let vnode = self.vnode(vnode_idx);
         // Per-vnode snapshot so the handler's `local_validator_id`
         // matches the signing key used.
         let topology_snapshot = Arc::clone(vnode.state.topology_arc());
@@ -515,15 +472,7 @@ where
             }
         });
     }
-}
 
-impl<S, N, D, E> ShardLoop<S, N, D, E>
-where
-    S: Storage,
-    N: Network,
-    D: Dispatch,
-    E: Engine,
-{
     /// Adopt a fresh topology snapshot: publish it through the lock-free
     /// `ArcSwap` so off-thread closures pick it up on their next `.load()`,
     /// and push it to the network adapter (which keys validator pubkeys

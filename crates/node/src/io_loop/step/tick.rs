@@ -31,17 +31,20 @@ where
         let now = std::time::Instant::now();
         let hosted: Vec<ShardGroupId> = self.hosted_shards().collect();
         for shard in hosted {
-            let outputs = self.shard_io_mut(shard).syncs.block_tick(now);
-            self.process_block_sync_outputs(shard, outputs);
+            let sl = self.shard_loop_mut(shard);
+            let outputs = sl.io.syncs.block_tick(now);
+            sl.process_block_sync_outputs(outputs);
 
-            let outputs = self.shard_io_mut(shard).syncs.remote_header_tick(now);
-            self.process_remote_header_sync_outputs(shard, outputs);
+            let sl = self.shard_loop_mut(shard);
+            let outputs = sl.io.syncs.remote_header_tick(now);
+            sl.process_remote_header_sync_outputs(outputs);
 
-            self.drive_fetch::<TransactionBinding>(shard, FetchInput::Tick);
-            self.drive_fetch::<LocalProvisionBinding>(shard, FetchInput::Tick);
-            self.drive_fetch::<FinalizedWaveBinding>(shard, FetchInput::Tick);
-            self.drive_fetch::<ProvisionBinding>(shard, FetchInput::Tick);
-            self.drive_fetch::<ExecCertBinding>(shard, FetchInput::Tick);
+            let sl = self.shard_loop_mut(shard);
+            sl.drive_fetch::<TransactionBinding>(FetchInput::Tick);
+            sl.drive_fetch::<LocalProvisionBinding>(FetchInput::Tick);
+            sl.drive_fetch::<FinalizedWaveBinding>(FetchInput::Tick);
+            sl.drive_fetch::<ProvisionBinding>(FetchInput::Tick);
+            sl.drive_fetch::<ExecCertBinding>(FetchInput::Tick);
         }
     }
 }

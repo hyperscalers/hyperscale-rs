@@ -41,7 +41,7 @@ where
             let actions = self
                 .vnode_state_mut(shard, vnode_idx)
                 .initialize_genesis(genesis_block);
-            self.drain_actions(shard, vnode_idx, actions);
+            self.shard_loop_mut(shard).drain_actions(vnode_idx, actions);
         }
     }
 

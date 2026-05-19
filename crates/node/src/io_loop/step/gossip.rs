@@ -21,15 +21,15 @@ use hyperscale_engine::Engine;
 use hyperscale_network::Network;
 use hyperscale_storage::Storage;
 use hyperscale_types::{
-    Bls12381G1PublicKey, Bls12381G2Signature, CommittedBlockHeader, ShardGroupId, ValidatorId,
+    Bls12381G1PublicKey, Bls12381G2Signature, CommittedBlockHeader, ValidatorId,
     committed_block_header_message,
 };
 
-use crate::io_loop::{IoLoop, push_protocol_event};
+use crate::io_loop::{ShardLoop, push_protocol_event};
 use crate::shard_io::CommittedHeaderVerificationItem;
 use crate::shard_io::verify::verify_bls_with_metrics;
 
-impl<S, N, D, E> IoLoop<S, N, D, E>
+impl<S, N, D, E> ShardLoop<S, N, D, E>
 where
     S: Storage,
     N: Network,
@@ -41,7 +41,6 @@ where
     /// verification; fires `flush_committed_header_verifications` when full.
     pub(in crate::io_loop) fn handle_committed_block_gossip_received(
         &mut self,
-        shard: ShardGroupId,
         committed_header: Arc<CommittedBlockHeader>,
         sender: ValidatorId,
         public_key: Bls12381G1PublicKey,
@@ -49,31 +48,25 @@ where
     ) {
         let item: CommittedHeaderVerificationItem =
             (committed_header, sender, public_key, sender_signature);
-        let now = self.now();
-        if self
-            .shard_io_mut(shard)
-            .committed_header_batch
-            .push(item, now)
-        {
-            self.flush_committed_header_verifications(shard);
+        let now = self.now;
+        if self.io.committed_header_batch.push(item, now) {
+            self.flush_committed_header_verifications();
         }
     }
 
-    /// Flush accumulated committed-header sender-signature verifications
-    /// for `shard`.
+    /// Flush accumulated committed-header sender-signature verifications.
     ///
     /// Spawns one closure on the crypto pool that verifies each sender's
     /// BLS signature. Valid headers are emitted directly as
     /// `ProtocolEvent::RemoteHeaderReceived` for state-machine ingestion;
-    /// invalid items are warn-dropped (byzantine peer; no `IoLoop`
-    /// cleanup needed). See `IoLoop::event_sender` for the off-thread
-    /// → pinned-thread routing convention.
-    pub(in crate::io_loop) fn flush_committed_header_verifications(&mut self, shard: ShardGroupId) {
-        let items = self.shard_io_mut(shard).committed_header_batch.take();
+    /// invalid items are warn-dropped (byzantine peer; no cleanup needed).
+    pub(in crate::io_loop) fn flush_committed_header_verifications(&mut self) {
+        let items = self.io.committed_header_batch.take();
         if items.is_empty() {
             return;
         }
 
+        let shard = self.shard;
         let event_tx = self.process.event_sender.clone();
         self.process.dispatch.spawn(DispatchPool::Crypto, move || {
             for (committed_header, sender, public_key, sender_signature) in items {
