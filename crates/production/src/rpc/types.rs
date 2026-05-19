@@ -1,5 +1,7 @@
 //! Request and response types for the RPC API.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 pub use super::state::VnodeStatusEntry;
@@ -55,8 +57,22 @@ pub struct NodeStatusResponse {
 }
 
 /// Response for `/api/v1/sync` endpoint.
+///
+/// Each hosted shard runs its own block-sync FSM, so the response is
+/// keyed by shard id. `sync_peers` is process-level (one libp2p
+/// adapter across hosted shards) and lives at the top level.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncStatusResponse {
+    /// Per-hosted-shard sync status, keyed by shard id.
+    pub shards: HashMap<u64, ShardSyncStatus>,
+    /// Number of connected peers capable of sync.
+    pub sync_peers: usize,
+}
+
+/// One hosted shard's view of its block-sync FSM, embedded in
+/// [`SyncStatusResponse::shards`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardSyncStatus {
     /// Current sync state.
     pub state: String,
     /// Current block height.
@@ -65,8 +81,6 @@ pub struct SyncStatusResponse {
     pub target_height: Option<u64>,
     /// Number of blocks behind.
     pub blocks_behind: u64,
-    /// Number of sync peers.
-    pub sync_peers: usize,
     /// Number of pending block fetches.
     pub pending_fetches: usize,
     /// Number of heights queued for fetch.
@@ -115,21 +129,6 @@ pub struct TransactionStatusResponse {
     /// Error message if status lookup failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Mempool
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Response for `GET /api/v1/mempool`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MempoolStatusResponse {
-    /// Number of pending transactions (waiting to be included in a block).
-    pub pending_count: usize,
-    /// Number of transactions holding state locks (Committed status).
-    pub in_flight_count: usize,
-    /// Total transactions in mempool.
-    pub total_count: usize,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

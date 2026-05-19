@@ -73,9 +73,22 @@ impl RpcState {
 
 /// Snapshot of mempool state for RPC queries.
 ///
-/// Updated periodically by the runner from the mempool state.
-#[derive(Debug, Clone)]
+/// One [`VnodeMempoolSnapshot`] per hosted vnode, keyed by validator
+/// id. Each vnode owns its own [`hyperscale_mempool::MempoolCoordinator`];
+/// same-shard vnodes converge by determinism but their instantaneous
+/// counts diverge, so the backpressure check must inspect every entry
+/// individually (not pick a shard-level "representative"). Used only
+/// by RPC submission backpressure — per-vnode counts shown to clients
+/// live in [`NodeStatusState::vnodes`].
+#[derive(Debug, Clone, Default)]
 pub struct MempoolSnapshot {
+    /// Per-hosted-vnode mempool readouts, keyed by validator id.
+    pub vnodes: HashMap<u64, VnodeMempoolSnapshot>,
+}
+
+/// One hosted vnode's mempool readout.
+#[derive(Debug, Clone)]
+pub struct VnodeMempoolSnapshot {
     /// Number of pending transactions (waiting to be included in a block).
     pub pending_count: usize,
     /// Number of transactions holding state locks (Committed status).
@@ -88,17 +101,11 @@ pub struct MempoolSnapshot {
     ///
     /// When `false`, the cross-shard hard limit has been reached and new RPC
     /// submissions should be rejected with a backpressure response.
-    ///
-    /// Defaults to `true` so that transactions can be accepted before the first
-    /// snapshot update from the runner.
     pub accepting_rpc_transactions: bool,
     /// Whether the pending transaction limit has been reached.
     ///
     /// When `true`, the pending transaction count exceeds the configured limit
     /// and new RPC submissions should be rejected with a backpressure response.
-    ///
-    /// Defaults to `false` so transactions can be accepted before the first
-    /// snapshot update from the runner.
     pub at_pending_limit: bool,
     /// Per-remote-shard in-flight counts from latest verified block headers.
     /// Used for cross-shard backpressure: reject transactions targeting congested shards.
@@ -108,15 +115,15 @@ pub struct MempoolSnapshot {
     pub remote_congestion_threshold: InFlightCount,
 }
 
-impl Default for MempoolSnapshot {
+impl Default for VnodeMempoolSnapshot {
     fn default() -> Self {
         Self {
             pending_count: 0,
             in_flight_count: 0,
             total_count: 0,
             updated_at: None,
-            accepting_rpc_transactions: true, // Default to accepting until we know otherwise
-            at_pending_limit: false,          // Default to not at limit until we know otherwise
+            accepting_rpc_transactions: true,
+            at_pending_limit: false,
             remote_shard_in_flight: HashMap::new(),
             remote_congestion_threshold: InFlightCount::ZERO,
         }

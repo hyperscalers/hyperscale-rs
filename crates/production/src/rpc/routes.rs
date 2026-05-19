@@ -4,8 +4,8 @@ use axum::Router;
 use axum::routing::{get, post};
 
 use super::handlers::{
-    get_transaction_handler, health_handler, mempool_handler, metrics_handler, ready_handler,
-    status_handler, submit_transaction_handler, sync_handler,
+    get_transaction_handler, health_handler, metrics_handler, ready_handler, status_handler,
+    submit_transaction_handler, sync_handler,
 };
 use super::state::RpcState;
 
@@ -31,8 +31,6 @@ fn api_v1_routes() -> Router<RpcState> {
         // Transaction endpoints
         .route("/transactions", post(submit_transaction_handler))
         .route("/transactions/{hash}", get(get_transaction_handler))
-        // Mempool endpoint
-        .route("/mempool", get(mempool_handler))
 }
 
 #[cfg(test)]

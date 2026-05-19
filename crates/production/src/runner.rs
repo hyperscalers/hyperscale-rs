@@ -46,6 +46,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
 use crossbeam::channel::{Receiver, Sender, unbounded};
+use hex::encode as hex_encode;
 use hyperscale_bft::BftConfig;
 use hyperscale_core::{ProtocolEvent, TimerId};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
@@ -67,9 +68,9 @@ use hyperscale_storage::ChainReader;
 use hyperscale_storage_rocksdb::{RocksDbStorage, SharedStorage};
 use hyperscale_topology::TopologyCoordinator;
 use hyperscale_types::{
-    Block, BlockHeight, Bls12381G1PrivateKey, CertifiedBlock, LocalTimestamp, NodeId,
-    QuorumCertificate, RoutableTransaction, ShardGroupId, TransactionStatus, TxHash, ValidatorId,
-    shard_for_node,
+    Block, BlockHeight, Bls12381G1PrivateKey, CertifiedBlock, InFlightCount, LocalTimestamp,
+    MAX_TX_IN_FLIGHT, NodeId, QuorumCertificate, RoutableTransaction, ShardGroupId,
+    TransactionStatus, TxHash, ValidatorId, shard_for_node,
 };
 use libp2p::identity::Keypair;
 use quick_cache::sync::Cache as QuickCache;
@@ -81,8 +82,11 @@ use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval, sleep};
 use tracing::{debug, info, warn};
 
-use crate::rpc::{MempoolSnapshot, NodeStatusState, TxSubmissionSender};
-use crate::status::SyncStatus;
+use crate::rpc::state::VnodeMempoolSnapshot;
+use crate::rpc::{
+    MempoolSnapshot, NodeStatusState, TxSubmissionSender, VnodeMempoolStats, VnodeStatusEntry,
+};
+use crate::status::{ShardSyncState, SyncStatus};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // RunnerError
@@ -895,6 +899,9 @@ impl ProductionRunner {
                 shutdown_rx: channels.shutdown_rx,
                 tokio_handle: tokio_handle.clone(),
                 initial_timer_ops,
+                rpc_status: self.rpc_status.clone(),
+                sync_status: self.sync_status.clone(),
+                mempool_snapshot: self.mempool_snapshot.clone(),
             };
             shard_threads.push(spawn_shard_loop(shard_loop, cfg));
         }
@@ -1196,6 +1203,18 @@ struct ShardLoopConfig {
     shutdown_rx: Receiver<()>,
     tokio_handle: TokioHandle,
     initial_timer_ops: Vec<TimerOp>,
+    /// Shared RPC `vnodes` list. Each shard's thread writes its own
+    /// vnodes' entries via `retain != self.shard` + push on the metrics
+    /// tick; concurrent shards racing on the same `ArcSwap` lose at most
+    /// one second of staleness on their slot.
+    rpc_status: Option<Arc<ArcSwap<NodeStatusState>>>,
+    /// Shared sync status. Each shard's thread inserts its slot
+    /// (keyed by shard id) on the metrics tick.
+    sync_status: Option<Arc<ArcSwap<SyncStatus>>>,
+    /// Shared mempool snapshot. Each shard's thread inserts its slot
+    /// from the first hosted vnode (same-shard vnodes share the
+    /// mempool, so any one gives the canonical view).
+    mempool_snapshot: Option<Arc<ArcSwap<MempoolSnapshot>>>,
 }
 
 /// Drive one shard's [`ShardLoop`] on its pinned thread. Blocks until
@@ -1270,16 +1289,112 @@ fn run_shard_loop(mut shard_loop: ProdShardLoop, mut config: ShardLoopConfig) {
 
         shard_loop.flush_expired_batches(wall_clock_local());
 
-        // Per-shard prometheus emission. Process-wide memory + RocksDB
-        // gauges are emitted from the runner's tokio tick after summing
-        // across shards.
+        // Per-shard prometheus emission + RPC status writes. Process-wide
+        // memory + RocksDB gauges are emitted from the runner's tokio
+        // tick after summing across shards.
         if last_metrics.elapsed() >= METRICS_INTERVAL {
             last_metrics = Instant::now();
             shard_loop.record_prometheus();
+            update_shard_rpc_state(&shard_loop, &config);
         }
     }
 
     info!(shard = ?shard, "Shard event loop exiting");
+}
+
+/// Write this shard's contribution into the shared RPC state. Each slot
+/// is keyed by `shard_id.inner()` so concurrent shard threads touching
+/// the same `ArcSwap` only race on the map metadata — losing a single
+/// 1-second cycle when two shards interleave their load-modify-store,
+/// not the values themselves.
+fn update_shard_rpc_state(shard_loop: &ProdShardLoop, config: &ShardLoopConfig) {
+    let shard_key = shard_loop.shard.inner();
+
+    // ── /status: per-vnode entries ─────────────────────────────────
+    if let Some(ref rpc_status) = config.rpc_status {
+        let current = rpc_status.load();
+        let mut updated = (**current).clone();
+        updated.vnodes.retain(|v| v.shard != shard_key);
+        for vnode in &shard_loop.vnodes {
+            let state = &vnode.state;
+            let mempool = state.mempool();
+            let contention = mempool.lock_contention_stats();
+            #[allow(clippy::cast_possible_truncation)] // pool sizes fit usize
+            let (pending, in_flight) = (
+                contention.pending_count as usize,
+                contention.in_flight_count as usize,
+            );
+            updated.vnodes.push(VnodeStatusEntry {
+                validator_id: vnode.validator_id.inner(),
+                shard: shard_key,
+                block_height: state.bft().committed_height().inner(),
+                view: state.bft().view().inner(),
+                state_root_hash: hex_encode(state.last_committed_jmt_root().as_bytes()),
+                mempool: VnodeMempoolStats {
+                    pending_count: pending,
+                    in_flight_count: in_flight,
+                    total_count: mempool.len(),
+                },
+            });
+        }
+        updated.vnodes.sort_by_key(|v| (v.shard, v.validator_id));
+        rpc_status.store(Arc::new(updated));
+    }
+
+    // ── /sync: per-shard block-sync state ──────────────────────────
+    if let Some(ref sync_status) = config.sync_status {
+        let block_sync = shard_loop.io.syncs.block.block_sync_status();
+        let current = sync_status.load();
+        let mut updated = (**current).clone();
+        updated.shards.insert(
+            shard_key,
+            ShardSyncState {
+                state: block_sync.state.clone(),
+                current_height: block_sync.current_height,
+                target_height: block_sync.target_height,
+                blocks_behind: block_sync.blocks_behind,
+                pending_fetches: block_sync.pending_fetches,
+                queued_heights: block_sync.queued_heights,
+            },
+        );
+        sync_status.store(Arc::new(updated));
+    }
+
+    // ── Mempool: per-vnode snapshots feeding RPC submission backpressure.
+    // Each vnode owns its own `MempoolCoordinator`; same-shard vnodes
+    // converge by determinism but their instantaneous counts can
+    // differ, so the backpressure check iterates every entry rather
+    // than picking a per-shard representative.
+    if let Some(ref mempool_snapshot) = config.mempool_snapshot {
+        #[allow(clippy::cast_possible_truncation)] // pool size derived from a fixed const
+        let remote_congestion_threshold = InFlightCount::new((MAX_TX_IN_FLIGHT * 4 / 5) as u32);
+        let current = mempool_snapshot.load();
+        let mut updated = (**current).clone();
+        for vnode in &shard_loop.vnodes {
+            let state = &vnode.state;
+            let mempool = state.mempool();
+            let contention = mempool.lock_contention_stats();
+            #[allow(clippy::cast_possible_truncation)]
+            let (pending, in_flight) = (
+                contention.pending_count as usize,
+                contention.in_flight_count as usize,
+            );
+            updated.vnodes.insert(
+                vnode.validator_id.inner(),
+                VnodeMempoolSnapshot {
+                    pending_count: pending,
+                    in_flight_count: in_flight,
+                    total_count: mempool.len(),
+                    updated_at: Some(Instant::now()),
+                    accepting_rpc_transactions: !mempool.at_in_flight_limit(),
+                    at_pending_limit: mempool.at_pending_limit(),
+                    remote_shard_in_flight: state.remote_headers().remote_shard_in_flight(),
+                    remote_congestion_threshold,
+                },
+            );
+        }
+        mempool_snapshot.store(Arc::new(updated));
+    }
 }
 
 /// Spawn one shard's pinned thread. Core pinning is deliberately
