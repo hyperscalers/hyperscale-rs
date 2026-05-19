@@ -497,7 +497,7 @@ where
                 .expect("hosted shard derived from vnode");
             // Action handlers emit `ProtocolEvent`s; stamp each with the
             // dispatching vnode's shard so the receiver routes back to
-            // the right `ShardGroup`.
+            // the right `ShardLoop`.
             let notify = move |event: ProtocolEvent| {
                 push_protocol_event(&event_tx, shard, event);
             };

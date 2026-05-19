@@ -1,8 +1,8 @@
 //! Per-validator bundle hosted by the `IoLoop`.
 //!
-//! One [`Vnode`] per validator identity, owned by a [`ShardGroup`] in
+//! One [`Vnode`] per validator identity, owned by a [`ShardLoop`] in
 //! the `IoLoop`'s `shards` map. Same-shard vnodes share the enclosing
-//! `ShardGroup`'s `ShardIo`; cross-shard vnodes live in different
+//! `ShardLoop`'s `ShardIo`; cross-shard vnodes live in different
 //! groups. The vnode's shard is implied by which group it lives in —
 //! no denormalized field.
 //!
@@ -11,7 +11,7 @@
 //! and carry the emitting vnode's `(shard, idx)` via the existing
 //! action-dispatch threading.
 //!
-//! [`ShardGroup`]: crate::io_loop::ShardGroup
+//! [`ShardLoop`]: crate::io_loop::ShardLoop
 
 use std::sync::Arc;
 

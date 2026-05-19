@@ -191,7 +191,7 @@ pub struct StepOutput {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// ShardGroup — per-shard I/O state plus the vnodes that share it
+// ShardLoop — per-shard I/O state plus the vnodes that share it
 // ═══════════════════════════════════════════════════════════════════════
 
 /// One hosted shard: its [`ShardIo`] plus every [`Vnode`] that participates
@@ -199,9 +199,13 @@ pub struct StepOutput {
 ///
 /// Same-shard vnodes share the [`ShardIo`] (one storage, one fetch host,
 /// one mempool body store, etc.); cross-shard vnodes live in different
-/// `ShardGroup`s. A vnode's shard is implied by which group it lives in —
-/// the `Vnode` itself carries no `shard` field.
-pub struct ShardGroup<S: Storage> {
+/// `ShardLoop`s. Subsequent phases migrate per-shard step handlers from
+/// `impl IoLoop` to `impl ShardLoop` and add the `step()` entry point.
+pub struct ShardLoop<S: Storage> {
+    /// Shard this loop drives. Mirrors the key in `IoLoop::shards`; held
+    /// inline so methods on `ShardLoop` can self-identify without a
+    /// parent-map lookup.
+    pub shard: ShardGroupId,
     /// Per-shard I/O state shared by every vnode in `vnodes`.
     pub io: ShardIo<S>,
     /// Vnodes participating in this shard's consensus. Driven in order
@@ -234,7 +238,7 @@ where
     /// `shards[shard].vnodes[i].state.handle()`. All `ProtocolEvent`
     /// ingestion and `Action` emission happen here; off-thread closures
     /// never touch them.
-    shards: HashMap<ShardGroupId, ShardGroup<S>>,
+    shards: HashMap<ShardGroupId, ShardLoop<S>>,
 
     /// Transaction executor. Cloned (cheaply) into the block-commit
     /// closure on each drain — `Engine` requires `Clone`, so this is
@@ -335,7 +339,7 @@ where
         let b = &config.batch;
         let network = Arc::new(network);
 
-        // Build one `ShardGroup` per hosted shard, owning both the
+        // Build one `ShardLoop` per hosted shard, owning both the
         // shard's `ShardIo` and the vnodes participating in it. The
         // representative vnode for each shard supplies the initial-
         // persisted height and the inbound-serving caches — same-shard
@@ -343,11 +347,11 @@ where
         // determinism, so any same-shard vnode's stores are consistent
         // (each shard's vnodes still hold their own copies inside their
         // state machines).
-        let mut shards: HashMap<ShardGroupId, ShardGroup<S>> = HashMap::new();
+        let mut shards: HashMap<ShardGroupId, ShardLoop<S>> = HashMap::new();
         let mut per_shard_dispatch: HashMap<ShardGroupId, ShardDispatchHandles<S>> = HashMap::new();
 
         // Group incoming `VnodeInit`s by their declared local shard, so
-        // we can construct each `ShardGroup` with its full `Vec<Vnode>`
+        // we can construct each `ShardLoop` with its full `Vec<Vnode>`
         // in one pass.
         let mut by_shard: HashMap<ShardGroupId, Vec<VnodeInit>> = HashMap::new();
         for init in vnodes {
@@ -390,7 +394,8 @@ where
                 .collect();
             shards.insert(
                 *shard,
-                ShardGroup {
+                ShardLoop {
+                    shard: *shard,
                     io: ShardIo {
                         storage,
                         pending_chain,
@@ -474,7 +479,7 @@ where
     /// # Panics
     /// Panics if `shard` isn't hosted or `vnode_idx` is out of range.
     pub fn vnode_state(&self, shard: ShardGroupId, vnode_idx: usize) -> &NodeStateMachine {
-        &self.shard_group(shard).vnodes[vnode_idx].state
+        &self.shard_loop(shard).vnodes[vnode_idx].state
     }
 
     /// Mutably access the state machine of the vnode at index `vnode_idx`
@@ -487,10 +492,10 @@ where
         shard: ShardGroupId,
         vnode_idx: usize,
     ) -> &mut NodeStateMachine {
-        &mut self.shard_group_mut(shard).vnodes[vnode_idx].state
+        &mut self.shard_loop_mut(shard).vnodes[vnode_idx].state
     }
 
-    /// Hosted shards (one entry per `ShardGroup`). Used by call sites
+    /// Hosted shards (one entry per `ShardLoop`). Used by call sites
     /// that fan out across every shard this host carries — batch flushes,
     /// fetch ticks, metrics aggregation.
     pub fn hosted_shards(&self) -> impl Iterator<Item = ShardGroupId> + '_ {
@@ -500,14 +505,14 @@ where
     /// Internal: per-shard group (io + vnodes). Most callers prefer the
     /// narrower `shard_io` / `vnode` helpers; reach for this when you
     /// need both halves in the same borrow.
-    pub(super) fn shard_group(&self, shard: ShardGroupId) -> &ShardGroup<S> {
+    pub(super) fn shard_loop(&self, shard: ShardGroupId) -> &ShardLoop<S> {
         self.shards
             .get(&shard)
             .unwrap_or_else(|| panic!("shard {shard:?} not hosted by this IoLoop"))
     }
 
     /// Internal: mutable per-shard group.
-    pub(super) fn shard_group_mut(&mut self, shard: ShardGroupId) -> &mut ShardGroup<S> {
+    pub(super) fn shard_loop_mut(&mut self, shard: ShardGroupId) -> &mut ShardLoop<S> {
         self.shards
             .get_mut(&shard)
             .unwrap_or_else(|| panic!("shard {shard:?} not hosted by this IoLoop"))
@@ -515,19 +520,19 @@ where
 
     /// Internal: immutable per-shard vnode by index.
     pub(super) fn vnode(&self, shard: ShardGroupId, vnode_idx: usize) -> &Vnode {
-        &self.shard_group(shard).vnodes[vnode_idx]
+        &self.shard_loop(shard).vnodes[vnode_idx]
     }
 
     /// Internal: mutable per-shard vnode by index.
     pub(super) fn vnode_mut(&mut self, shard: ShardGroupId, vnode_idx: usize) -> &mut Vnode {
-        &mut self.shard_group_mut(shard).vnodes[vnode_idx]
+        &mut self.shard_loop_mut(shard).vnodes[vnode_idx]
     }
 
     /// Shared `ShardIo` for `shard`. The single per-shard accessor;
     /// fields like `storage`, `caches`, `fetches`, `syncs`, `block_commit`,
     /// `pending_chain` are read directly off the returned reference.
     pub fn shard_io(&self, shard: ShardGroupId) -> &ShardIo<S> {
-        &self.shard_group(shard).io
+        &self.shard_loop(shard).io
     }
 
     /// Mutable `ShardIo` for `shard`. Use over multiple `_mut` calls
@@ -535,7 +540,7 @@ where
     /// (e.g. block-commit flush reading `&storage` while mutating
     /// `&mut block_commit`).
     pub(super) fn shard_io_mut(&mut self, shard: ShardGroupId) -> &mut ShardIo<S> {
-        &mut self.shard_group_mut(shard).io
+        &mut self.shard_loop_mut(shard).io
     }
 
     /// Access the network.
