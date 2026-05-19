@@ -186,7 +186,7 @@ where
             self.process_remote_header_sync_outputs(shard, outputs);
         }
 
-        push_protocol_event(&self.event_sender, shard, pe);
+        push_protocol_event(&self.process.event_sender, shard, pe);
     }
 
     fn handle_restore_committed_state(&self, shard: ShardGroupId) {
@@ -195,7 +195,7 @@ where
         let hash = storage.committed_hash();
         let qc = storage.latest_qc();
         push_protocol_event(
-            &self.event_sender,
+            &self.process.event_sender,
             shard,
             ProtocolEvent::CommittedStateRestored { height, hash, qc },
         );
@@ -243,11 +243,11 @@ where
     }
 
     fn handle_topology_changed(&self, topology: &Arc<TopologySnapshot>) {
-        self.topology_snapshot.store(Arc::clone(topology));
+        self.process.topology_snapshot.store(Arc::clone(topology));
 
         // Network impl reads validator keys + shard committees off the
         // snapshot it gets here — no separate keymap push.
-        self.network.update_topology(Arc::clone(topology));
+        self.process.network.update_topology(Arc::clone(topology));
 
         tracing::info!(
             local_shard = topology.local_shard().inner(),
@@ -325,8 +325,8 @@ where
     }
 
     pub(super) fn flush_block_commits(&mut self, shard: ShardGroupId) {
-        let event_sender = self.event_sender.clone();
-        let dispatch = self.dispatch.clone();
+        let event_sender = self.process.event_sender.clone();
+        let dispatch = self.process.dispatch.clone();
         let io = self.shard_io_mut(shard);
         io.block_commit.flush(&io.storage, &event_sender, &dispatch);
     }
@@ -477,15 +477,15 @@ where
             .dispatch_pool()
             .expect("dispatch_delegated_action called for delegated actions only");
 
-        let handles = Arc::clone(&self.dispatch_handles);
+        let handles = Arc::clone(&self.process.dispatch_handles);
         let vnode = self.vnode(shard, vnode_idx);
         // Per-vnode snapshot so the handler's `local_validator_id`
         // matches the signing key used.
         let topology_snapshot = Arc::clone(vnode.state.topology_arc());
-        let event_tx = self.event_sender.clone();
+        let event_tx = self.process.event_sender.clone();
         let signing_key = Arc::clone(&vnode.signing_key);
 
-        self.dispatch.spawn(pool, move || {
+        self.process.dispatch.spawn(pool, move || {
             let shard_handles = handles
                 .per_shard
                 .get(&shard)

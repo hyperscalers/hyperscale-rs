@@ -23,7 +23,8 @@ use hyperscale_types::network::response::{
 use hyperscale_types::{ExecutionCertificate, FinalizedWave, ShardGroupId, WaveId};
 use tracing::warn;
 
-use super::{IoLoop, ShardScopedInput, push_protocol_event, push_shard_input};
+use crate::event::ShardScopedInput;
+use crate::io_loop::{IoLoop, push_protocol_event, push_shard_input};
 use crate::shard_io::verify::{
     resolve_sender_key, verify_bls_with_metrics, verify_sender_signature,
 };
@@ -40,7 +41,7 @@ where
     /// Each handler is a closure that captures shared state and delegates to
     /// the serving function in the corresponding protocol module.
     #[allow(clippy::too_many_lines)] // single registration table; one closure per request type
-    pub(super) fn register_request_handler(&self) {
+    pub(crate) fn register_request_handler(&self) {
         use std::collections::HashMap;
         use std::sync::Arc;
 
@@ -110,7 +111,8 @@ where
 
             let storage = Arc::clone(&self.shard_io(shard).storage);
             let provision_store = Arc::clone(&self.shard_io(shard).caches.provision_store);
-            self.network
+            self.process
+                .network
                 .register_request_handler::<GetBlockRequest>(shard, move |req| {
                     serve_block_request(&*storage, &provision_store, &req)
                 });
@@ -119,7 +121,8 @@ where
 
             let storage = Arc::clone(&self.shard_io(shard).storage);
             let tx_store = Arc::clone(&self.shard_io(shard).caches.tx_store);
-            self.network
+            self.process
+                .network
                 .register_request_handler::<GetTransactionsRequest>(shard, move |req| {
                     serve_transaction_request(&*storage, &tx_store, &req)
                 });
@@ -133,7 +136,7 @@ where
             // thrashing.
 
             let storage = Arc::clone(&self.shard_io(shard).storage);
-            let num_shards = self.topology_snapshot.load().num_shards();
+            let num_shards = self.process.topology_snapshot.load().num_shards();
             let outbound_cache = Arc::clone(&self.shard_io(shard).caches.provision_store);
 
             let dedup: Arc<std::sync::Mutex<ProvisionsRequestDedup>> =
@@ -142,7 +145,8 @@ where
                     in_flight: HashMap::new(),
                 }));
 
-            self.network
+            self.process
+                .network
                 .register_request_handler::<GetProvisionsRequest>(
                     shard,
                     move |req: GetProvisionsRequest| {
@@ -267,7 +271,8 @@ where
             // ── local_provision.request → provision cache lookup ─────────
 
             let provision_store = Arc::clone(&self.shard_io(shard).caches.provision_store);
-            self.network
+            self.process
+                .network
                 .register_request_handler::<GetLocalProvisionsRequest>(
                     shard,
                     move |req: GetLocalProvisionsRequest| {
@@ -286,7 +291,8 @@ where
 
             let fw_cache = Arc::clone(&self.shard_io(shard).caches.finalized_wave);
             let fw_storage = Arc::clone(&self.shard_io(shard).storage);
-            self.network
+            self.process
+                .network
                 .register_request_handler::<GetFinalizedWavesRequest>(
                     shard,
                     move |req: GetFinalizedWavesRequest| {
@@ -324,7 +330,8 @@ where
 
             let exec_cert_store = Arc::clone(&self.shard_io(shard).caches.exec_cert_store);
             let storage = Arc::clone(&self.shard_io(shard).storage);
-            self.network
+            self.process
+                .network
                 .register_request_handler::<GetExecutionCertsRequest>(
                     shard,
                     move |req: GetExecutionCertsRequest| {
@@ -362,7 +369,8 @@ where
             // ── remote_header.request → range header sync ───────────────────
 
             let storage = Arc::clone(&self.shard_io(shard).storage);
-            self.network
+            self.process
+                .network
                 .register_request_handler::<GetRemoteHeadersRequest>(shard, move |req| {
                     serve_remote_headers_request(&*storage, shard, &req)
                 });
@@ -376,24 +384,26 @@ where
     /// the network framework computes the per-vnode fan-out from each
     /// type's [`GossipMessage::SCOPE`] and [`GossipMessage::source_shard`].
     /// Closures here just translate into `ShardScopedInput`.
-    pub(super) fn register_gossip_handlers(&self) {
+    pub(crate) fn register_gossip_handlers(&self) {
         use hyperscale_network::GossipVerdict;
 
         // ── transaction.gossip → ShardScopedInput::TransactionGossipReceived ─
 
-        let tx = self.event_sender.clone();
-        self.network.register_gossip_handler::<TransactionGossip>(
-            move |gossip: TransactionGossip, shard: ShardGroupId| -> GossipVerdict {
-                for transaction in gossip.transactions.into_inner() {
-                    push_shard_input(
-                        &tx,
-                        shard,
-                        ShardScopedInput::TransactionGossipReceived { tx: transaction },
-                    );
-                }
-                GossipVerdict::Accept
-            },
-        );
+        let tx = self.process.event_sender.clone();
+        self.process
+            .network
+            .register_gossip_handler::<TransactionGossip>(
+                move |gossip: TransactionGossip, shard: ShardGroupId| -> GossipVerdict {
+                    for transaction in gossip.transactions.into_inner() {
+                        push_shard_input(
+                            &tx,
+                            shard,
+                            ShardScopedInput::TransactionGossipReceived { tx: transaction },
+                        );
+                    }
+                    GossipVerdict::Accept
+                },
+            );
 
         // ── block.committed → ShardScopedInput::CommittedBlockGossipReceived ─
         //
@@ -401,9 +411,10 @@ where
         // so `target_shard` here is a hosted shard that needs this
         // header for cross-shard provisioning bookkeeping.
 
-        let tx = self.event_sender.clone();
-        let topology = self.topology_snapshot.clone();
-        self.network
+        let tx = self.process.event_sender.clone();
+        let topology = self.process.topology_snapshot.clone();
+        self.process
+            .network
             .register_gossip_handler::<CommittedBlockHeaderGossip>(
                 move |gossip: CommittedBlockHeaderGossip,
                       target_shard: ShardGroupId|
@@ -436,7 +447,7 @@ where
     /// Register notification handlers for protocol messages sent via unicast
     /// to known committee members.
     #[allow(clippy::too_many_lines)] // single registration table; one closure per notification type
-    pub(super) fn register_notification_handlers(&self) {
+    pub(crate) fn register_notification_handlers(&self) {
         // Hosted-shard set snapshotted at registration.
         let hosted_shards: std::sync::Arc<HashSet<ShardGroupId>> =
             std::sync::Arc::new(self.hosted_shards().collect());
@@ -448,9 +459,10 @@ where
         // this host's vnodes the event fans out to. Drop early if the
         // vote targets a shard we don't host.
 
-        let tx = self.event_sender.clone();
+        let tx = self.process.event_sender.clone();
         let shards = std::sync::Arc::clone(&hosted_shards);
-        self.network
+        self.process
+            .network
             .register_notification_handler::<BlockVoteNotification>(
                 move |gossip: BlockVoteNotification| {
                     let shard = gossip.vote.shard_group_id();
@@ -471,10 +483,11 @@ where
 
         // ── block.header → verify proposer sig, then ProtocolEvent::BlockHeaderReceived ─
 
-        let tx = self.event_sender.clone();
-        let topology = self.topology_snapshot.clone();
+        let tx = self.process.event_sender.clone();
+        let topology = self.process.topology_snapshot.clone();
         let shards = std::sync::Arc::clone(&hosted_shards);
-        self.network
+        self.process
+            .network
             .register_notification_handler::<BlockHeaderNotification>(
                 move |gossip: BlockHeaderNotification| {
                     let shard = gossip.header.shard_group_id();
@@ -520,10 +533,11 @@ where
 
         // ── provisions.broadcast → verify sender sig, then ProtocolEvent::ProvisionsReceived ─
 
-        let tx = self.event_sender.clone();
-        let topology = self.topology_snapshot.clone();
+        let tx = self.process.event_sender.clone();
+        let topology = self.process.topology_snapshot.clone();
         let shards = std::sync::Arc::clone(&hosted_shards);
-        self.network
+        self.process
+            .network
             .register_notification_handler::<ProvisionsNotification>(
                 move |notification: ProvisionsNotification| {
                     let target_shard = notification.provisions.target_shard();
@@ -566,10 +580,11 @@ where
 
         // ── execution.vote.batch → verify sender sig, then ProtocolEvent::ExecutionVoteReceived ─
 
-        let tx = self.event_sender.clone();
-        let topology = self.topology_snapshot.clone();
+        let tx = self.process.event_sender.clone();
+        let topology = self.process.topology_snapshot.clone();
         let shards = std::sync::Arc::clone(&hosted_shards);
-        self.network
+        self.process
+            .network
             .register_notification_handler::<ExecutionVotesNotification>(
                 move |batch: ExecutionVotesNotification| {
                     if batch.votes.is_empty() {
@@ -623,10 +638,11 @@ where
         // For routing purposes we forward to every hosted shard so
         // each receiving coordinator can decide whether the cert is for it.
 
-        let tx = self.event_sender.clone();
-        let topology = self.topology_snapshot.clone();
+        let tx = self.process.event_sender.clone();
+        let topology = self.process.topology_snapshot.clone();
         let shards = std::sync::Arc::clone(&hosted_shards);
-        self.network
+        self.process
+            .network
             .register_notification_handler::<ExecutionCertificatesNotification>(
                 move |batch: ExecutionCertificatesNotification| {
                     if batch.certificates.is_empty() {

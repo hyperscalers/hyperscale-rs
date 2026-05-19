@@ -127,18 +127,20 @@ where
         // `local_receipt_root` Merkle is the heavy step (SBOR-encode of
         // every receipt's `database_updates`); off-loading keeps the
         // pinned thread responsive during catch-up.
-        let event_tx = self.event_sender.clone();
+        let event_tx = self.process.event_sender.clone();
         let local_shard = shard;
-        self.dispatch.spawn(DispatchPool::ConsensusCrypto, move || {
-            let input = match validate_synced_block(height, &cert) {
-                Ok(()) => ShardScopedInput::SyncBlockValidated {
-                    height,
-                    certified: Box::new(cert),
-                },
-                Err(reason) => ShardScopedInput::SyncBlockValidationFailed { height, reason },
-            };
-            push_shard_input(&event_tx, local_shard, input);
-        });
+        self.process
+            .dispatch
+            .spawn(DispatchPool::ConsensusCrypto, move || {
+                let input = match validate_synced_block(height, &cert) {
+                    Ok(()) => ShardScopedInput::SyncBlockValidated {
+                        height,
+                        certified: Box::new(cert),
+                    },
+                    Err(reason) => ShardScopedInput::SyncBlockValidationFailed { height, reason },
+                };
+                push_shard_input(&event_tx, local_shard, input);
+            });
     }
 
     /// Handle a sync block fetch failure (network error / not-found).
@@ -235,10 +237,10 @@ where
                 .get_or_insert_with(|| self.build_sync_inventory(shard))
                 .clone()
         };
-        let es = self.event_sender.clone();
+        let es = self.process.event_sender.clone();
         let local_shard = shard;
         record_sync_round_started("block");
-        self.network.request(
+        self.process.network.request(
             shard,
             None,
             GetBlockRequest::new(height, target_height).with_inventory(inventory),

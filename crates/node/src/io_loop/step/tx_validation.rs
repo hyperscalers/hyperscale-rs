@@ -107,7 +107,7 @@ where
     pub(in crate::io_loop) fn handle_submit_transaction(&mut self, tx: &Arc<RoutableTransaction>) {
         let tx_hash = tx.hash();
 
-        let num_shards = self.topology_snapshot.load().num_shards();
+        let num_shards = self.process.topology_snapshot.load().num_shards();
         let touched_shards: std::collections::BTreeSet<ShardGroupId> = tx
             .declared_reads()
             .iter()
@@ -171,7 +171,7 @@ where
             return;
         }
         let gossip = TransactionGossip::new(txs);
-        self.network.broadcast_to_shard(dst, &gossip);
+        self.process.network.broadcast_to_shard(dst, &gossip);
     }
 
     // ─── Validation batching ────────────────────────────────────────────
@@ -203,36 +203,38 @@ where
             return;
         }
 
-        let validator = self.tx_validator.clone();
-        let event_tx = self.event_sender.clone();
+        let validator = self.process.tx_validator.clone();
+        let event_tx = self.process.event_sender.clone();
         let local_shard = shard;
-        self.dispatch.spawn(DispatchPool::TxValidation, move || {
-            let results: Vec<bool> = batch
-                .iter()
-                .map(|tx| validator.validate_transaction(tx).is_ok())
-                .collect();
+        self.process
+            .dispatch
+            .spawn(DispatchPool::TxValidation, move || {
+                let results: Vec<bool> = batch
+                    .iter()
+                    .map(|tx| validator.validate_transaction(tx).is_ok())
+                    .collect();
 
-            let mut failed_hashes = Vec::new();
-            for (tx, valid) in batch.into_iter().zip(results) {
-                if valid {
+                let mut failed_hashes = Vec::new();
+                for (tx, valid) in batch.into_iter().zip(results) {
+                    if valid {
+                        push_shard_input(
+                            &event_tx,
+                            local_shard,
+                            ShardScopedInput::TransactionValidated { tx },
+                        );
+                    } else {
+                        failed_hashes.push(tx.hash());
+                    }
+                }
+                if !failed_hashes.is_empty() {
                     push_shard_input(
                         &event_tx,
                         local_shard,
-                        ShardScopedInput::TransactionValidated { tx },
+                        ShardScopedInput::TransactionValidationsFailed {
+                            hashes: failed_hashes,
+                        },
                     );
-                } else {
-                    failed_hashes.push(tx.hash());
                 }
-            }
-            if !failed_hashes.is_empty() {
-                push_shard_input(
-                    &event_tx,
-                    local_shard,
-                    ShardScopedInput::TransactionValidationsFailed {
-                        hashes: failed_hashes,
-                    },
-                );
-            }
-        });
+            });
     }
 }
