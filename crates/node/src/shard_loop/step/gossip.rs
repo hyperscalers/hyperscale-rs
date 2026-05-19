@@ -67,7 +67,7 @@ where
         }
 
         let shard = self.shard;
-        let event_tx = self.process.event_sender.clone();
+        let event_tx = self.event_sender().clone();
         self.process.dispatch.spawn(DispatchPool::Crypto, move || {
             for (committed_header, sender, public_key, sender_signature) in items {
                 let msg = committed_block_header_message(

@@ -116,7 +116,7 @@ where
         // `local_receipt_root` Merkle is the heavy step (SBOR-encode of
         // every receipt's `database_updates`); off-loading keeps the
         // pinned thread responsive during catch-up.
-        let event_tx = self.process.event_sender.clone();
+        let event_tx = self.event_sender().clone();
         let local_shard = self.shard;
         self.process
             .dispatch
@@ -216,7 +216,7 @@ where
                 .get_or_insert_with(|| self.build_sync_inventory())
                 .clone()
         };
-        let es = self.process.event_sender.clone();
+        let es = self.event_sender().clone();
         let local_shard = self.shard;
         record_sync_round_started("block");
         self.process.network.request(

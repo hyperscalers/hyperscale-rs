@@ -53,7 +53,7 @@ where
                         preferred,
                         class,
                         &*self.process.network,
-                        &self.process.event_sender,
+                        self.event_sender(),
                     );
                 }
             } else {
@@ -64,7 +64,7 @@ where
                     preferred,
                     class,
                     &*self.process.network,
-                    &self.process.event_sender,
+                    self.event_sender(),
                 );
             }
         }

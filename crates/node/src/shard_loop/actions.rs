@@ -184,7 +184,7 @@ where
             self.process_remote_header_sync_outputs(outputs);
         }
 
-        push_protocol_event(&self.process.event_sender, self.shard, pe);
+        push_protocol_event(self.event_sender(), self.shard, pe);
     }
 
     fn handle_restore_committed_state(&self) {
@@ -193,7 +193,7 @@ where
         let hash = storage.committed_hash();
         let qc = storage.latest_qc();
         push_protocol_event(
-            &self.process.event_sender,
+            self.event_sender(),
             self.shard,
             ProtocolEvent::CommittedStateRestored { height, hash, qc },
         );
@@ -298,7 +298,7 @@ where
     }
 
     pub(crate) fn flush_block_commits(&mut self) {
-        let event_sender = self.process.event_sender.clone();
+        let event_sender = self.event_sender().clone();
         let dispatch = self.process.dispatch.clone();
         let io = &mut self.io;
         io.block_commit.flush(&io.storage, &event_sender, &dispatch);
@@ -419,10 +419,10 @@ where
 
     /// Dispatch a delegated action to the appropriate thread pool.
     ///
-    /// Spawns the work as a fire-and-forget closure. Results return via the
-    /// `event_sender` channel and are processed on a future `step()` call.
-    /// With `SyncDispatch` (simulation), `spawn_*` runs inline so events
-    /// enter the channel immediately and are drained by the harness.
+    /// Spawns the work as a fire-and-forget closure. Results return via
+    /// this shard's event channel and are processed on a future `step()`
+    /// call. With `SyncDispatch` (simulation), `spawn_*` runs inline so
+    /// events enter the channel immediately and are drained by the harness.
     fn dispatch_delegated_action(&self, vnode_idx: usize, action: Action) {
         let pool = action
             .dispatch_pool()
@@ -434,7 +434,7 @@ where
         // Per-vnode snapshot so the handler's `local_validator_id`
         // matches the signing key used.
         let topology_snapshot = Arc::clone(vnode.state.topology_arc());
-        let event_tx = self.process.event_sender.clone();
+        let event_tx = self.event_sender().clone();
         let signing_key = Arc::clone(&vnode.signing_key);
 
         self.process.dispatch.spawn(pool, move || {

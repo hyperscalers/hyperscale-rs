@@ -10,21 +10,24 @@
 
 mod network_handlers;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crossbeam::channel::Sender;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{Engine, TransactionValidation};
 use hyperscale_storage::Storage;
+use hyperscale_types::ShardGroupId;
 
 use crate::event::ShardEvent;
 use crate::shard_loop::{DispatchHandles, SharedTopologySnapshot};
 
 /// Process-scoped resources shared across every hosted shard.
 ///
-/// Construction order: build the event-channel pair first; pass the
-/// `Sender` here, keep the `Receiver` for the runner / harness. Wrap the
-/// constructed `ProcessIo` in `Arc` for sharing.
+/// Construction order: build one event-channel pair per hosted shard
+/// first; pass the resulting sender map here, keep the receivers for
+/// the runner / harness. Wrap the constructed `ProcessIo` in `Arc` for
+/// sharing.
 pub struct ProcessIo<S, N, D, E>
 where
     S: Storage,
@@ -39,20 +42,18 @@ where
 
     /// Thread-pool scheduler for off-thread work (crypto verify,
     /// tx validation, block-commit persistence, fetch-serve). Each
-    /// `dispatch.spawn` site routes results back via `event_sender`.
+    /// `dispatch.spawn` site routes results back via the emitting
+    /// shard's entry in [`Self::shard_event_senders`].
     pub(crate) dispatch: D,
 
-    /// Channel back to the pinned-thread event loop.
+    /// Per-shard channels back to each shard's driver.
     ///
     /// Off-thread work spawned via `dispatch.spawn(pool, ...)` returns
     /// results here as [`ShardEvent`] envelopes (a `NodeInput` plus its
-    /// hosted-shard tag), which the next pinned-thread `step()`
-    /// iteration drains.
-    ///
-    /// Phase 3 will replace this with a per-shard
-    /// `HashMap<ShardGroupId, Sender<ShardEvent>>` so each shard's
-    /// pinned thread receives only its own events.
-    pub(crate) event_sender: Sender<ShardEvent>,
+    /// hosted-shard tag), routed to the shard's sender so the right
+    /// driver picks them up on its next iteration. Inbound network
+    /// handlers route by the shard tag inside the decoded payload.
+    pub(crate) shard_event_senders: HashMap<ShardGroupId, Sender<ShardEvent>>,
 
     /// Lock-free topology snapshot shared with network handler closures
     /// and delegated dispatch jobs. The pinned thread is the sole writer
@@ -81,7 +82,7 @@ where
     pub(crate) const fn new(
         network: Arc<N>,
         dispatch: D,
-        event_sender: Sender<ShardEvent>,
+        shard_event_senders: HashMap<ShardGroupId, Sender<ShardEvent>>,
         topology_snapshot: SharedTopologySnapshot,
         dispatch_handles: Arc<DispatchHandles<S, N, E>>,
         tx_validator: Arc<TransactionValidation>,
@@ -89,10 +90,20 @@ where
         Self {
             network,
             dispatch,
-            event_sender,
+            shard_event_senders,
             topology_snapshot,
             dispatch_handles,
             tx_validator,
         }
+    }
+
+    /// Sender for `shard`'s event channel.
+    ///
+    /// # Panics
+    /// Panics if `shard` isn't hosted by this `ProcessIo`.
+    pub(crate) fn shard_sender(&self, shard: ShardGroupId) -> &Sender<ShardEvent> {
+        self.shard_event_senders
+            .get(&shard)
+            .unwrap_or_else(|| panic!("shard {shard:?} not hosted by this ProcessIo"))
     }
 }

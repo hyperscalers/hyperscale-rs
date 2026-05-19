@@ -490,13 +490,19 @@ impl ProductionRunnerBuilder {
 
         let executor = RadixExecutor::new(network_definition);
 
+        // One entry per hosted shard, all cloned from the same callback
+        // sender — the pinned loop drains them through `xb_callback_rx`.
+        let shard_event_senders: HashMap<ShardGroupId, Sender<ShardEvent>> = local_shards
+            .iter()
+            .map(|s| (*s, xb_callback_tx.clone()))
+            .collect();
         let io_loop = NodeHost::new(
             vnode_inits,
             shared_storages,
             executor,
             libp2p_network,
             (*dispatch).clone(),
-            xb_callback_tx.clone(),
+            shard_event_senders,
             topology.clone(),
             NodeConfig::default(),
             tx_validator,
