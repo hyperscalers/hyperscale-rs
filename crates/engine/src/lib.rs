@@ -50,5 +50,6 @@ pub use genesis_cache::prepared_genesis;
 pub use output::{ExecutedTx, ExecutionOutput};
 // Re-export Radix types needed by engine callers (not storage-related).
 pub use radix_common::network::NetworkDefinition;
+pub use receipt::{CachedVmOutput, compute_vm_output, project_to_shard};
 pub use simulation::{SimExecutionCache, SimulationEngine};
 pub use validation::TransactionValidation;

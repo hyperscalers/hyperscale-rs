@@ -1,17 +1,23 @@
 //! Convert Radix Engine [`TransactionReceipt`]s into our
 //! [`ConsensusReceipt`] / [`ExecutionMetadata`] / [`DatabaseUpdates`] shapes.
 //!
-//! Everything here is pure post-processing: take a `TransactionReceipt`
-//! produced by `execute_transaction` and project out the pieces the
-//! state machine needs (database updates, application events, fee
-//! summary, log messages, error string). Shard-filtering of writes
-//! happens here too, via [`crate::sharding`].
+//! Receipt projection runs in two stages:
+//!
+//! - [`compute_vm_output`] turns a VM receipt into a [`CachedVmOutput`]
+//!   — every field is shard-invariant for a given `(tx, receipt)`. This
+//!   is the cacheable stage.
+//! - [`project_to_shard`] consumes the cached output and a target shard
+//!   to produce the final [`ExecutedTx`]. Only the `database_updates`
+//!   slice is shard-specific.
+//!
+//! [`build_executed_tx`] composes the two for callers that don't cache.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use hyperscale_types::{
     ApplicationEvent, ConsensusReceipt, EventData, EventRoot, ExecutionMetadata, FeeSummary,
-    GlobalReceipt, Hash, LogLevel, NodeId, RoutableTransaction, ShardGroupId, compute_merkle_root,
+    GlobalReceipt, GlobalReceiptHash, Hash, LogLevel, NodeId, RoutableTransaction, ShardGroupId,
+    TxHash, compute_merkle_root,
 };
 use radix_engine::transaction::{
     CommitResult, TransactionOutcome, TransactionReceipt, TransactionResult,
@@ -37,33 +43,66 @@ pub fn extract_database_updates(receipt: &TransactionReceipt) -> DatabaseUpdates
     }
 }
 
-/// Build an [`ExecutedTx`] from a Radix Engine receipt.
+/// Shard-invariant projection of a Radix Engine receipt.
 ///
-/// Encapsulates the receipt → executed-tx pipeline: shard-filter local
-/// writes, build execution metadata, compute the global `writes_root`
-/// from declared-only updates, and assemble the final canonical
-/// `receipt_hash`.
+/// Carries everything needed to assemble an [`ExecutedTx`] for any
+/// participating shard. The transaction's effective state is canonical
+/// across participating shards by way of provisioning, so every field
+/// here is identical on every shard that executes the same
+/// `(tx, receipt)`. Per-shard `database_updates` is *not* cached — it's
+/// re-derived per call from `body.raw_updates` via [`project_to_shard`].
+pub struct CachedVmOutput {
+    metadata: ExecutionMetadata,
+    body: CachedVmOutputBody,
+}
+
+#[allow(clippy::large_enum_variant)] // Succeeded is the common case; boxing penalises every hit
+enum CachedVmOutputBody {
+    /// VM rejected, aborted, or committed a `Failure` outcome.
+    Failed,
+    /// VM committed a `Success` outcome.
+    Succeeded {
+        raw_updates: DatabaseUpdates,
+        declared_set: HashSet<NodeId>,
+        ownership: HashMap<NodeId, NodeId>,
+        application_events: Vec<ApplicationEvent>,
+        receipt_hash: GlobalReceiptHash,
+    },
+}
+
+/// Project a Radix Engine receipt into a [`CachedVmOutput`].
 ///
-/// Takes [`SubstateDatabase`] (not [`SubstateStore`]) so callers can
-/// pass an execution snapshot. Using the same snapshot as execution
-/// keeps `resolve_owned_nodes` consistent with execution-time
-/// ownership state — using shared storage would race with concurrent
-/// cert commits and cause `receipt_hash` divergence across validators.
-pub fn build_executed_tx<S: SubstateDatabase>(
+/// `storage` must match the view execution ran against — the local
+/// snapshot for single-shard transactions, the provisioned merged view
+/// for cross-shard. `resolve_owned_nodes` walks this view, so anything
+/// narrower yields a partial ownership map and a shard-divergent
+/// `writes_root`; anything wider races with concurrent cert commits.
+pub fn compute_vm_output<S: SubstateDatabase>(
     storage: &S,
     tx: &RoutableTransaction,
     receipt: &TransactionReceipt,
-    local_shard: ShardGroupId,
-    num_shards: u64,
-) -> ExecutedTx {
-    let metadata = build_execution_metadata(receipt);
-
+) -> CachedVmOutput {
     let TransactionResult::Commit(commit) = &receipt.result else {
-        let error = format!("{:?}", receipt.result);
-        return ExecutedTx::failure_with_log(tx.hash(), &error);
+        tracing::warn!(
+            tx_hash = ?tx.hash(),
+            error = %format_args!("{:?}", receipt.result),
+            "transaction execution failed"
+        );
+        return CachedVmOutput {
+            metadata: ExecutionMetadata::empty(),
+            body: CachedVmOutputBody::Failed,
+        };
     };
 
-    let success = matches!(commit.outcome, TransactionOutcome::Success(_));
+    let metadata = build_execution_metadata(receipt);
+
+    if !matches!(commit.outcome, TransactionOutcome::Success(_)) {
+        // Failed receipts carry no consensus payload; metadata still flows.
+        return CachedVmOutput {
+            metadata,
+            body: CachedVmOutputBody::Failed,
+        };
+    }
 
     let declared_nodes: Vec<NodeId> = tx
         .declared_reads()
@@ -71,28 +110,11 @@ pub fn build_executed_tx<S: SubstateDatabase>(
         .chain(tx.declared_writes().iter())
         .copied()
         .collect();
-
-    if !success {
-        // Failed receipts carry no consensus payload; metadata still flows.
-        return ExecutedTx::new(tx.hash(), ConsensusReceipt::Failed, metadata);
-    }
-
-    let application_events = extract_application_events(commit);
-
-    // Walk the commit once. Two views of the same updates feed the
-    // success path: shard-filtered for the local consensus payload,
-    // declared-only/system-filtered for the global `writes_root` the
-    // EC commits to.
-    let raw_updates = extract_database_updates(receipt);
     let declared_set: HashSet<NodeId> = declared_nodes.iter().copied().collect();
     let ownership = resolve_owned_nodes(storage, &declared_nodes);
-    let database_updates = filter_updates_for_shard(
-        &raw_updates,
-        local_shard,
-        num_shards,
-        &declared_set,
-        &ownership,
-    );
+
+    let application_events = extract_application_events(commit);
+    let raw_updates = extract_database_updates(receipt);
     let global_updates = filter_updates_for_global_receipt(&raw_updates, &declared_set, &ownership);
     let writes_root = compute_writes_root(&global_updates);
 
@@ -103,12 +125,71 @@ pub fn build_executed_tx<S: SubstateDatabase>(
     let event_root = EventRoot::from_raw(compute_merkle_root(&event_hashes));
     let receipt_hash = GlobalReceipt::new(true, event_root, writes_root).receipt_hash();
 
-    let consensus = ConsensusReceipt::Succeeded {
-        receipt_hash,
-        database_updates,
-        application_events,
-    };
-    ExecutedTx::new(tx.hash(), consensus, metadata)
+    CachedVmOutput {
+        metadata,
+        body: CachedVmOutputBody::Succeeded {
+            raw_updates,
+            declared_set,
+            ownership,
+            application_events,
+            receipt_hash,
+        },
+    }
+}
+
+/// Build an [`ExecutedTx`] for `local_shard` from a [`CachedVmOutput`].
+///
+/// Runs the cheap per-shard step: `filter_updates_for_shard` over the
+/// cached `raw_updates` + `ownership` + `declared_set`, then assembles
+/// the `ExecutedTx`. Safe to call repeatedly with different `local_shard`
+/// values against the same cached output.
+#[must_use]
+pub fn project_to_shard(
+    cached: &CachedVmOutput,
+    tx_hash: TxHash,
+    local_shard: ShardGroupId,
+    num_shards: u64,
+) -> ExecutedTx {
+    match &cached.body {
+        CachedVmOutputBody::Failed => {
+            ExecutedTx::new(tx_hash, ConsensusReceipt::Failed, cached.metadata.clone())
+        }
+        CachedVmOutputBody::Succeeded {
+            raw_updates,
+            declared_set,
+            ownership,
+            application_events,
+            receipt_hash,
+        } => {
+            let database_updates = filter_updates_for_shard(
+                raw_updates,
+                local_shard,
+                num_shards,
+                declared_set,
+                ownership,
+            );
+            let consensus = ConsensusReceipt::Succeeded {
+                receipt_hash: *receipt_hash,
+                database_updates,
+                application_events: application_events.clone(),
+            };
+            ExecutedTx::new(tx_hash, consensus, cached.metadata.clone())
+        }
+    }
+}
+
+/// Build an [`ExecutedTx`] from a Radix Engine receipt — compose
+/// [`compute_vm_output`] + [`project_to_shard`] for callers that don't
+/// cache the intermediate.
+pub fn build_executed_tx<S: SubstateDatabase>(
+    storage: &S,
+    tx: &RoutableTransaction,
+    receipt: &TransactionReceipt,
+    local_shard: ShardGroupId,
+    num_shards: u64,
+) -> ExecutedTx {
+    let cached = compute_vm_output(storage, tx, receipt);
+    project_to_shard(&cached, tx.hash(), local_shard, num_shards)
 }
 
 /// Build `ExecutionMetadata` from a Radix Engine receipt.
