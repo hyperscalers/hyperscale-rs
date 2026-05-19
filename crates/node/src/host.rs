@@ -264,6 +264,14 @@ where
         (self.process, self.shards)
     }
 
+    /// Borrow the shared process-scoped resources. Callers `Arc::clone`
+    /// the returned handle for RPC submission closures and other
+    /// off-thread consumers that need lock-free topology / sender access
+    /// without consuming the host.
+    pub const fn process(&self) -> &Arc<ProcessIo<S, N, D, E>> {
+        &self.process
+    }
+
     // ─── Time ────────────────────────────────────────────────────────────
 
     /// Set the cached process-wide wall-clock time, propagated into every

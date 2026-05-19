@@ -33,7 +33,7 @@ mod batch_accumulator;
 mod config;
 pub mod event;
 pub mod host;
-mod process_io;
+pub mod process_io;
 mod shard_io;
 pub mod shard_loop;
 mod state;

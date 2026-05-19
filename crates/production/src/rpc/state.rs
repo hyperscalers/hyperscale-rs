@@ -6,20 +6,23 @@ use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
-use crossbeam::channel::Sender;
-use hyperscale_node::shard_loop::ShardEvent;
-use hyperscale_types::{InFlightCount, ShardGroupId, TransactionStatus, TxHash};
+use hyperscale_types::{
+    InFlightCount, RoutableTransaction, ShardGroupId, TransactionStatus, TxHash,
+};
 use quick_cache::sync::Cache as QuickCache;
 use serde::{Deserialize, Serialize};
 
 use crate::status::SyncStatus;
 
-/// Type alias for the transaction submission channel.
+/// Submit a locally-issued transaction to the runner.
 ///
-/// RPC handlers wrap `ProcessScopedInput::SubmitTransaction` in a process-scoped
-/// [`ShardEvent`] before sending; the `IoLoop`'s event loop unwraps it
-/// and dispatches across every hosted shard the tx touches.
-pub type TxSubmissionSender = Sender<ShardEvent>;
+/// Returns `true` if the runner accepted the tx; `false` only when the
+/// runner is shutting down (every per-shard channel send failed). The
+/// closure is shared (`Fn`) and called concurrently from tokio worker
+/// threads — internally it computes the touched-shard fanout from a
+/// lock-free topology snapshot and pushes admit/admit-and-gossip
+/// envelopes onto the relevant per-shard event channels.
+pub type TxSubmissionSender = Arc<dyn Fn(Arc<RoutableTransaction>) -> bool + Send + Sync + 'static>;
 
 /// Shared state for RPC handlers.
 #[derive(Clone)]

@@ -233,8 +233,6 @@ impl RpcServer {
 
 #[cfg(test)]
 mod tests {
-    use crossbeam::channel::unbounded;
-
     use super::*;
 
     #[test]
@@ -247,7 +245,7 @@ mod tests {
     #[tokio::test]
     async fn test_server_creation() {
         let config = RpcServerConfig::default();
-        let (tx_submission_tx, _rx) = unbounded();
+        let tx_submission_tx: TxSubmissionSender = Arc::new(|_tx| true);
         let tx_status_caches =
             std::iter::once((ShardGroupId::new(0), Arc::new(QuickCache::new(1000)))).collect();
         let server = RpcServer::new(config, tx_submission_tx, tx_status_caches);

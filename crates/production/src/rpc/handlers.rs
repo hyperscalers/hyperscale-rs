@@ -31,7 +31,6 @@ use hyperscale_metrics::{
     record_tx_ingress_rejected_syncing,
 };
 use hyperscale_metrics_prometheus::encode_metrics;
-use hyperscale_node::shard_loop::{ProcessScopedInput, ShardEvent};
 use hyperscale_types::{
     Hash, InFlightCount, RoutableTransaction, TransactionDecision, TransactionStatus, TxHash,
 };
@@ -161,18 +160,11 @@ pub async fn submit_transaction_handler(
     let hash = hex_encode(transaction.hash().as_bytes());
     let tx_arc = Arc::new(transaction);
 
-    // Submit directly to IoLoop via crossbeam channel.
-    // IoLoop will:
-    // 1. Gossip to all relevant shards
-    // 2. Queue for batch validation (via Dispatch)
-    // 3. Dispatch to mempool after validation
-    if state
-        .tx_submission_tx
-        .send(ShardEvent::process(ProcessScopedInput::SubmitTransaction {
-            tx: tx_arc,
-        }))
-        .is_err()
-    {
+    // Compute the touched-shard fanout on this tokio worker and push
+    // admit envelopes directly onto each touched shard's event channel.
+    // The closure captures `Arc<ProcessIo>` (for the lock-free topology
+    // read) plus the per-shard senders.
+    if !(state.tx_submission_tx)(tx_arc) {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(SubmitTransactionResponse {
@@ -399,7 +391,6 @@ mod tests {
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
     use axum::routing::{get, post};
-    use crossbeam::channel::unbounded;
     use hyperscale_node::BlockSyncStateKind;
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{BlockHeight, ShardGroupId, TransactionDecision};
@@ -408,12 +399,13 @@ mod tests {
     use serde_json::{from_slice, to_string};
     use tower::ServiceExt;
 
+    use super::super::state::TxSubmissionSender;
     use super::*;
     use crate::rpc::state::{MempoolSnapshot, NodeStatusState};
     use crate::status::SyncStatus;
 
     fn create_test_state() -> RpcState {
-        let (tx_submission_tx, _rx) = unbounded();
+        let tx_submission_tx: TxSubmissionSender = Arc::new(|_tx| true);
         RpcState {
             ready: Arc::new(AtomicBool::new(false)),
             sync_status: Arc::new(ArcSwap::new(Arc::new(SyncStatus::default()))),
@@ -685,7 +677,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_submit_rejected_when_syncing() {
-        let (tx_submission_tx, _rx) = unbounded();
+        let tx_submission_tx: TxSubmissionSender = Arc::new(|_tx| true);
 
         // Create state with node that is 20 blocks behind (threshold is 10)
         let sync_status = SyncStatus {
@@ -747,7 +739,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_submit_accepted_when_caught_up() {
-        let (tx_submission_tx, _rx) = unbounded();
+        let tx_submission_tx: TxSubmissionSender = Arc::new(|_tx| true);
 
         // Create state with node that is only 5 blocks behind (under threshold of 10)
         let sync_status = SyncStatus {

@@ -19,7 +19,7 @@ use hyperscale_engine::{Engine, TransactionValidation};
 use hyperscale_storage::Storage;
 use hyperscale_types::{RoutableTransaction, ShardGroupId, shard_for_node};
 
-use crate::event::ShardEvent;
+use crate::event::{ShardEvent, ShardScopedInput};
 use crate::shard_loop::{DispatchHandles, SharedTopologySnapshot};
 
 /// Process-scoped resources shared across every hosted shard.
@@ -142,6 +142,45 @@ where
             source_shard,
             other_hosted,
         }
+    }
+
+    /// Fan a locally-submitted transaction out to every touched hosted
+    /// shard via [`Self::shard_event_senders`]. The first hosted touched
+    /// shard receives [`ShardScopedInput::AdmitAndGossipTransaction`]
+    /// (admit + enqueue outbound gossip for every destination); other
+    /// hosted touched shards receive
+    /// [`ShardScopedInput::AdmitTransaction`] (admit only).
+    ///
+    /// Returns `true` if every send succeeded; `false` only on shutdown
+    /// (a closed channel). Used by the production RPC submission
+    /// closure — callers on tokio worker threads can invoke this
+    /// concurrently because `compute_submit_fanout` only reads the
+    /// lock-free topology snapshot and the immutable sender map.
+    pub fn submit_transaction(&self, tx: &Arc<RoutableTransaction>) -> bool {
+        let fanout = self.compute_submit_fanout(tx);
+        let mut ok = true;
+        if let Some(source) = fanout.source_shard {
+            let env = ShardEvent::shard(
+                source,
+                ShardScopedInput::AdmitAndGossipTransaction {
+                    tx: Arc::clone(tx),
+                    touched_shards: fanout.touched_shards,
+                },
+            );
+            if self.shard_sender(source).send(env).is_err() {
+                ok = false;
+            }
+        }
+        for shard in fanout.other_hosted {
+            let env = ShardEvent::shard(
+                shard,
+                ShardScopedInput::AdmitTransaction { tx: Arc::clone(tx) },
+            );
+            if self.shard_sender(shard).send(env).is_err() {
+                ok = false;
+            }
+        }
+        ok
     }
 }
 
