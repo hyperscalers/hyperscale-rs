@@ -197,9 +197,10 @@ pub fn select_transactions(
 }
 
 /// Select finalized waves for inclusion: drop those already in the QC
-/// chain, sort by kickoff height (tie-breaking by wave hash for canonical
-/// manifest order), and cap the total finalized-tx count at the
-/// `max_finalized_txs` limit. Returns `(waves, total_tx_count)`.
+/// chain or committed within the retention window, sort by kickoff height
+/// (tie-breaking by wave hash for canonical manifest order), and cap the
+/// total finalized-tx count at the `max_finalized_txs` limit. Returns
+/// `(waves, total_tx_count)`.
 ///
 /// Canonical order matters: verifiers flatten receipts into JMT `work_items`
 /// in manifest order, and the `BTreeMap` collapse there is last-writer-wins,
@@ -207,11 +208,14 @@ pub fn select_transactions(
 pub fn select_finalized_waves(
     finalized_waves: Vec<Arc<FinalizedWave>>,
     qc_chain_cert_ids: &HashSet<WaveId>,
+    dedup_index: &CommitDedupIndex,
     max_finalized_txs: usize,
 ) -> (Vec<Arc<FinalizedWave>>, usize) {
     let mut candidate_waves: Vec<_> = finalized_waves
         .into_iter()
-        .filter(|fw| !qc_chain_cert_ids.contains(fw.wave_id()))
+        .filter(|fw| {
+            !qc_chain_cert_ids.contains(fw.wave_id()) && !dedup_index.contains_cert(fw.wave_id())
+        })
         .collect();
     candidate_waves.sort_by_key(|fw| (fw.wave_id().block_height(), fw.wave_id().clone()));
 
@@ -232,19 +236,23 @@ pub fn select_finalized_waves(
 }
 
 /// Select provisions for inclusion: drop those already in the QC
-/// chain, then take from the FIFO queue until the running tx-count total
-/// would exceed `max_provision_txs`. Oldest batches go first so the queue
-/// drains monotonically; unselected batches remain queued for the next
-/// proposal.
+/// chain or committed within the retention window, then take from the FIFO
+/// queue until the running tx-count total would exceed `max_provision_txs`.
+/// Oldest batches go first so the queue drains monotonically; unselected
+/// batches remain queued for the next proposal.
 pub fn select_provisions(
     provisions: Vec<Arc<Provisions>>,
     qc_chain_provision_hashes: &HashSet<ProvisionHash>,
+    dedup_index: &CommitDedupIndex,
     max_provision_txs: usize,
 ) -> Vec<Arc<Provisions>> {
     let mut running_tx_count = 0usize;
     provisions
         .into_iter()
-        .filter(|b| !qc_chain_provision_hashes.contains(&b.hash()))
+        .filter(|b| {
+            let h = b.hash();
+            !qc_chain_provision_hashes.contains(&h) && !dedup_index.contains_provision(&h)
+        })
         .take_while(|b| {
             let new_total = running_tx_count.saturating_add(b.transactions().len());
             if new_total <= max_provision_txs {

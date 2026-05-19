@@ -718,10 +718,15 @@ impl BftCoordinator {
         let (finalized_waves, finalized_tx_count) = select_finalized_waves(
             finalized_waves,
             &qc_chain_cert_hashes,
+            &self.dedup_index,
             MAX_FINALIZED_TX_PER_BLOCK,
         );
-        let provisions =
-            select_provisions(provisions, &qc_chain_provision_hashes, MAX_TXS_PER_BLOCK);
+        let provisions = select_provisions(
+            provisions,
+            &qc_chain_provision_hashes,
+            &self.dedup_index,
+            MAX_TXS_PER_BLOCK,
+        );
 
         self.build_and_dispatch_proposal(
             topology_snapshot,
