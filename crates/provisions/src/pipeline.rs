@@ -3,10 +3,14 @@
 //! Owns the lifecycle from raw provisions arrival through to verified
 //! storage:
 //!
-//! - **Pending**: provisions buffered while their paired remote header is
-//!   still in flight, keyed by `(source_shard, block_height)`.
-//! - **Verified**: provisions that have passed merkle proof verification,
-//!   stored whole and indexed by the same key.
+//! - **Pending**: provisions buffered while their paired remote header
+//!   is still in flight, keyed by `(source_shard, block_height)` — the
+//!   join point with the header is `(shard, height)`, the only identity
+//!   known before merkle-proof verification produces a content hash.
+//! - **Verified**: provisions that have passed merkle proof
+//!   verification, keyed by [`ProvisionHash`] so distinct batches at
+//!   the same source `(shard, height)` (different proposal rounds,
+//!   only one of which ultimately commits) each get their own slot.
 //! - **Store**: shared content-addressed map serving both this pipeline's
 //!   inbound writes and the io-loop's `local_provision.request` handler.
 //!
@@ -17,7 +21,7 @@
 //! No topology, no time source. Inputs are `WeightedTimestamp` and the
 //! coordinator decides when to call each method.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use hyperscale_types::{BlockHeight, ProvisionHash, Provisions, ShardGroupId, WeightedTimestamp};
@@ -45,9 +49,23 @@ struct PendingProvision {
 }
 
 /// Pending → verified → store lifecycle for inbound provisions.
+///
+/// `pending` is keyed by `(source_shard, source_block_height)` because
+/// that's the join point with the verified remote header — the only
+/// identifier known before merkle-proof verification produces a
+/// content hash.
+///
+/// `verified` is keyed by [`ProvisionHash`] because a single source
+/// `(shard, height)` can produce **multiple** distinct provisions
+/// batches across proposal rounds — each round attempts its own tx
+/// selection at the same height, only one eventually commits, but
+/// validators see and verify every round's batch in flight. Keying
+/// `verified` by `(shard, height)` would collapse them onto a single
+/// slot and let the `has_verified` short-circuit drop the
+/// actually-committed batch when a fetch later retrieves it.
 pub struct ProvisionPipeline {
     pending: HashMap<Key, Vec<PendingProvision>>,
-    verified: BTreeMap<Key, VerifiedProvision>,
+    verified: HashMap<ProvisionHash, VerifiedProvision>,
     store: Arc<ProvisionStore>,
 }
 
@@ -55,14 +73,16 @@ impl ProvisionPipeline {
     pub(crate) fn new(store: Arc<ProvisionStore>) -> Self {
         Self {
             pending: HashMap::new(),
-            verified: BTreeMap::new(),
+            verified: HashMap::new(),
             store,
         }
     }
 
-    /// Have verified provisions already been recorded for this key?
-    pub(crate) fn has_verified(&self, key: Key) -> bool {
-        self.verified.contains_key(&key)
+    /// Have these specific verified provisions been recorded already?
+    /// Keyed by content hash so a later proposal round at the same
+    /// `(shard, height)` is not falsely treated as a duplicate.
+    pub(crate) fn has_verified(&self, hash: &ProvisionHash) -> bool {
+        self.verified.contains_key(hash)
     }
 
     /// Buffer provisions awaiting their paired remote header.
@@ -96,9 +116,9 @@ impl ProvisionPipeline {
         provisions: Arc<Provisions>,
         source_block_ts: WeightedTimestamp,
     ) -> Arc<Provisions> {
-        let key = (provisions.source_shard(), provisions.block_height());
+        let hash = provisions.hash();
         self.verified.insert(
-            key,
+            hash,
             VerifiedProvision {
                 provisions: Arc::clone(&provisions),
                 source_block_ts,
@@ -109,16 +129,23 @@ impl ProvisionPipeline {
     }
 
     /// Drop verified and pending entries whose deadline has passed `now`.
-    /// Returns the keys evicted from `verified` so the coordinator can
-    /// prune the matching header buffer entries.
+    /// Returns the `(source_shard, source_block_height)` keys whose
+    /// verified entries evicted so the coordinator can prune matching
+    /// header buffer entries. Multiple distinct hashes may share the
+    /// same `(shard, height)`; each evicted entry contributes its key
+    /// independently — duplicates in the returned vec are harmless
+    /// because `headers.remove` is idempotent.
     pub(crate) fn drop_past_deadline(&mut self, now: WeightedTimestamp) -> Vec<Key> {
         let mut evicted_keys = Vec::new();
         let store = &self.store;
-        self.verified.retain(|key, entry| {
+        self.verified.retain(|hash, entry| {
             let alive = entry.provisions.deadline(entry.source_block_ts) > now;
             if !alive {
-                store.evict(std::iter::once(entry.provisions.hash()));
-                evicted_keys.push(*key);
+                store.evict(std::iter::once(*hash));
+                evicted_keys.push((
+                    entry.provisions.source_shard(),
+                    entry.provisions.block_height(),
+                ));
             }
             alive
         });
@@ -181,7 +208,8 @@ mod tests {
         let pl = ProvisionPipeline::new(Arc::new(ProvisionStore::new()));
         assert_eq!(pl.pending_len(), 0);
         assert_eq!(pl.verified_len(), 0);
-        assert!(!pl.has_verified((ShardGroupId::new(1), BlockHeight::new(1))));
+        let hash = make_provisions(99, ShardGroupId::new(1), BlockHeight::new(1)).hash();
+        assert!(!pl.has_verified(&hash));
     }
 
     #[test]
@@ -220,9 +248,36 @@ mod tests {
         let provisions = make_provisions(1, ShardGroupId::new(1), BlockHeight::new(10));
         let hash = provisions.hash();
         let arc = pl.insert_verified(Arc::new(provisions), ts(1_000));
-        assert!(pl.has_verified((ShardGroupId::new(1), BlockHeight::new(10))));
+        assert!(pl.has_verified(&hash));
         assert!(store.get(hash).is_some());
         assert_eq!(arc.source_shard(), ShardGroupId::new(1));
+    }
+
+    #[test]
+    fn multiple_hashes_per_shard_height_coexist() {
+        // Regression: re-keying `verified` by content hash means two
+        // batches with the same `(source_shard, source_block_height)` —
+        // e.g. different proposal rounds at the same source height —
+        // can both register without one displacing the other. Keying
+        // by `(shard, height)` would lose the first batch on the
+        // second insert.
+        let store = Arc::new(ProvisionStore::new());
+        let mut pl = ProvisionPipeline::new(Arc::clone(&store));
+        let shard = ShardGroupId::new(1);
+        let height = BlockHeight::new(10);
+
+        let p_a = make_provisions(1, shard, height);
+        let p_b = make_provisions(2, shard, height);
+        let hash_a = p_a.hash();
+        let hash_b = p_b.hash();
+        assert_ne!(hash_a, hash_b);
+
+        pl.insert_verified(Arc::new(p_a), ts(1_000));
+        pl.insert_verified(Arc::new(p_b), ts(1_000));
+
+        assert!(pl.has_verified(&hash_a));
+        assert!(pl.has_verified(&hash_b));
+        assert_eq!(pl.verified_len(), 2);
     }
 
     #[test]
@@ -232,6 +287,7 @@ mod tests {
 
         let key_v = (ShardGroupId::new(1), BlockHeight::new(10));
         let provisions_v = make_provisions(1, ShardGroupId::new(1), BlockHeight::new(10));
+        let hash_v = provisions_v.hash();
         let source_ts = ts(1_000);
         let live_after = provisions_v.deadline(source_ts);
         pl.insert_verified(Arc::new(provisions_v), source_ts);
@@ -245,13 +301,13 @@ mod tests {
         // Just before deadline: nothing evicted.
         let evicted = pl.drop_past_deadline(ts(live_after.as_millis().saturating_sub(1)));
         assert!(evicted.is_empty());
-        assert!(pl.has_verified(key_v));
+        assert!(pl.has_verified(&hash_v));
         assert_eq!(pl.pending_len(), 1);
 
         // Past deadline: verified evicted, pending evicted.
         let evicted = pl.drop_past_deadline(ts(live_after.as_millis() + 1));
         assert_eq!(evicted, vec![key_v]);
-        assert!(!pl.has_verified(key_v));
+        assert!(!pl.has_verified(&hash_v));
         assert_eq!(pl.pending_len(), 0);
     }
 }

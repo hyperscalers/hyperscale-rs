@@ -467,9 +467,12 @@ impl ProvisionCoordinator {
 
         let key = (source_shard, block_height);
 
-        // Skip if this key was already verified (duplicate gossip/fetch) —
-        // avoids re-dispatching verification work for stale duplicates.
-        if self.pipeline.has_verified(key) {
+        // Skip if this specific batch is already verified (duplicate
+        // gossip / fetch arrival) — avoids re-dispatching verification
+        // work for content we've already processed. Keyed by content
+        // hash so a different proposal round at the same
+        // `(shard, height)` is treated as a fresh batch, not a dup.
+        if self.pipeline.has_verified(&provisions.hash()) {
             return vec![];
         }
 
