@@ -95,10 +95,6 @@ pub struct ThreadPoolConfig {
     /// Starting core index for execution pool (if pinning enabled).
     pub execution_core_start: Option<usize>,
 
-    /// Core index for the state machine thread (if pinning enabled).
-    /// The state machine always runs on a single thread.
-    pub state_machine_core: Option<usize>,
-
     /// Stack size for crypto threads (bytes). Default: 2MB.
     pub crypto_stack_size: usize,
 
@@ -125,7 +121,6 @@ impl ThreadPoolConfig {
             consensus_crypto_core_start: None,
             crypto_core_start: None,
             execution_core_start: None,
-            state_machine_core: None,
             crypto_stack_size: 2 * 1024 * 1024,
             execution_stack_size: 8 * 1024 * 1024,
         }
@@ -172,13 +167,12 @@ impl ThreadPoolConfig {
             ));
         }
 
-        // If pinning is enabled, check that core assignments don't overlap
+        // If pinning is enabled, check that the dispatch-pool thread counts
+        // don't oversubscribe the available cores.
         if self.pin_cores {
             let available = std::thread::available_parallelism().map_or(4, NonZeroUsize::get);
 
-            // +1 for the state machine thread
-            let total_needed = 1
-                + self.consensus_crypto_threads
+            let total_needed = self.consensus_crypto_threads
                 + self.crypto_threads
                 + self.tx_validation_threads
                 + self.execution_threads;
@@ -241,14 +235,6 @@ impl ThreadPoolConfigBuilder {
     #[must_use]
     pub const fn pin_cores(mut self, enabled: bool) -> Self {
         self.config.pin_cores = enabled;
-        self
-    }
-
-    /// Set the core for the state machine thread.
-    #[must_use]
-    pub const fn state_machine_core(mut self, core: usize) -> Self {
-        self.config.state_machine_core = Some(core);
-        self.config.pin_cores = true;
         self
     }
 
@@ -604,14 +590,12 @@ mod tests {
         let config = ThreadPoolConfig::builder()
             .crypto_threads(2)
             .execution_threads(4)
-            .state_machine_core(0)
             .consensus_crypto_core_start(1)
             .crypto_core_start(3)
             .execution_core_start(5)
             .build_unchecked();
 
         assert!(config.pin_cores);
-        assert_eq!(config.state_machine_core, Some(0));
         assert_eq!(config.consensus_crypto_core_start, Some(1));
         assert_eq!(config.crypto_core_start, Some(3));
         assert_eq!(config.execution_core_start, Some(5));

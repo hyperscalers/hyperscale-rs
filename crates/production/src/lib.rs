@@ -57,7 +57,6 @@
 //!     .execution_threads(8)
 //!     .tx_validation_threads(2)
 //!     .pin_cores(true)
-//!     .state_machine_core(0)    // Pin state machine to core 0
 //!     .crypto_core_start(3)     // Crypto pool on cores 3-6
 //!     .execution_core_start(7)  // Execution pool on cores 7-14
 //!     .build()
