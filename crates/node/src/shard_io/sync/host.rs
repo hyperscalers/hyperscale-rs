@@ -1,10 +1,13 @@
-//! Bundle of sync state machines owned by the I/O loop.
+//! Per-shard sync state machines.
 //!
 //! [`SyncHost`] holds the block-sync and remote-header-sync state
-//! machines plus the IoLoop-side glue methods (periodic ticks, admission
-//! notification, status readouts). Lifting these out of `NodeHost` makes
-//! "what sync state machines the I/O loop drives" explicit and isolates
-//! sync state from per-payload fetch state.
+//! machines plus their glue methods (periodic ticks, admission
+//! notification, status readouts) for one shard. Keeping these here,
+//! rather than on [`ShardLoop`], names "what sync state machines this
+//! shard drives" as one bundle and isolates sync state from
+//! per-payload fetch state.
+//!
+//! [`ShardLoop`]: crate::shard_loop::ShardLoop
 
 use std::time::Instant;
 

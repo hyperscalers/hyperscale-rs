@@ -1,5 +1,4 @@
-//! Lifecycle helpers for the I/O loop — bring-up and (eventually)
-//! tear-down.
+//! Host bring-up: genesis bootstrap and inbound handler registration.
 //!
 //! These methods run at well-defined points in the host's life, not
 //! on every event. The run-loop methods live in [`super`].
@@ -11,8 +10,8 @@
 //!   computes the genesis state root. Only runs on a fresh node.
 //! - [`NodeHost::register_inbound_handlers`] wires the request / gossip /
 //!   notification handler closures into the network adapter. Required
-//!   before the I/O loop starts processing events; reached by both
-//!   genesis and resume paths.
+//!   before the host starts processing events; reached by both genesis
+//!   and resume paths.
 
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{Engine, GenesisConfig, prepared_genesis};

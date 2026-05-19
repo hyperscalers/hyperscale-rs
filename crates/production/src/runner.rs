@@ -324,11 +324,9 @@ impl ProductionRunnerBuilder {
                 "ProductionRunnerBuilder: missing storage for hosted shard {shard:?}"
             );
         }
-        // Recovery still reads from a single shard's storage until the
-        // state-machine recovery path becomes per-shard. Pick the first
-        // hosted shard arbitrarily — every hosted storage carries the
-        // same `RecoveredState` shape, and a multi-shard recovery
-        // rewire is out of scope here.
+        // Recovery reads from a single shard's storage. Pick the first
+        // hosted shard arbitrarily — every hosted storage exposes the
+        // same `RecoveredState` shape.
         let recovery_shard = vnode_configs[0].topology.snapshot().local_shard();
         let recovery_storage = Arc::clone(
             storages
@@ -1377,10 +1375,10 @@ fn update_shard_rpc_state(shard_loop: &ProdShardLoop, config: &ShardLoopConfig) 
     }
 }
 
-/// Spawn one shard's pinned thread. Core pinning is deliberately
-/// dropped — modern Linux CFS keeps long-lived CPU-bound threads
-/// cache-warm without explicit affinity, and the per-shard model
-/// already isolates each shard's scheduling from the others.
+/// Spawn one shard's pinned thread. No core affinity — modern Linux
+/// CFS keeps long-lived CPU-bound threads cache-warm without explicit
+/// pinning, and the per-shard model already isolates each shard's
+/// scheduling from the others.
 fn spawn_shard_loop(
     shard_loop: ProdShardLoop,
     config: ShardLoopConfig,

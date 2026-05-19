@@ -3,8 +3,8 @@
 //! `ProcessIo` holds the resources that are logically one per node (network
 //! adapter, dispatch pool, tx validator, topology snapshot, dispatch
 //! handles). It owns no event loop and has no per-step scratch — that's
-//! [`ShardLoop`]'s job (phase 2). Wrapped in `Arc` so off-thread closures
-//! and per-shard drivers can share the same handle.
+//! [`ShardLoop`]'s job. Wrapped in `Arc` so off-thread closures and
+//! per-shard drivers can share the same handle.
 //!
 //! [`ShardLoop`]: crate::shard_loop::ShardLoop
 

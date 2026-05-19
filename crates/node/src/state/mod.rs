@@ -8,8 +8,8 @@
 //!
 //! All consensus-critical mutation flows through this state machine.
 //! Asynchronous concerns (network I/O, thread-pool dispatch, timer
-//! scheduling) live on [`NodeHost`](crate::io_loop), which feeds events
-//! in and dispatches emitted [`Action`]s.
+//! scheduling) live on [`NodeHost`](crate::host::NodeHost), which feeds
+//! events in and dispatches emitted [`Action`]s.
 //!
 //! Submodules route inputs to the appropriate coordinator: [`bft`] for
 //! BFT events, [`execution`] for wave/EC events, [`mempool`] /

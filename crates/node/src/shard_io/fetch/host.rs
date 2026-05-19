@@ -1,9 +1,11 @@
-//! Bundle of per-payload fetch state machines owned by the I/O loop.
+//! Per-shard per-payload fetch state machines.
 //!
 //! [`FetchHost`] holds one [`Fetch`](super::Fetch) per payload binding plus
-//! metric readouts. Lifting these out of `NodeHost` makes "what fetches the I/O
-//! loop is orchestrating" explicit and isolates per-payload state from
-//! sync state.
+//! metric readouts for one shard. Keeping these here, rather than on
+//! [`ShardLoop`], names "what fetches this shard is orchestrating" as
+//! one bundle and isolates per-payload state from sync state.
+//!
+//! [`ShardLoop`]: crate::shard_loop::ShardLoop
 
 use super::FetchConfig;
 use super::binding::{

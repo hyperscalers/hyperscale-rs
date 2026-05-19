@@ -408,8 +408,7 @@ where
 
         match event {
             ShardEvent::Shard(shard, input) => {
-                // Silently drop events for shards we don't host — matches the
-                // original `dispatch_event`'s `count == 0 { return }` guard.
+                // Silently drop events whose shard isn't hosted by this host.
                 if let Some(sl) = self.shards.get_mut(&shard) {
                     sl.step(input);
                 }
