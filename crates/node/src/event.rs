@@ -92,6 +92,31 @@ pub enum ShardScopedInput {
         tx: Arc<RoutableTransaction>,
     },
 
+    /// Locally-submitted tx delivered to one of this node's hosted shards
+    /// that touches it. Admits to the shard's validation pipeline if not
+    /// already pending / cached; does NOT enqueue outbound gossip. Emitted
+    /// by `NodeHost::handle_submit_transaction` for every hosted touched
+    /// shard except the designated source.
+    AdmitTransaction {
+        /// The locally-submitted transaction.
+        tx: Arc<RoutableTransaction>,
+    },
+
+    /// Locally-submitted tx delivered to the source shard (first hosted
+    /// touched shard). Admits to the shard's validation pipeline AND
+    /// enqueues outbound gossip for every destination in `touched_shards`.
+    /// The source shard's `outbound_gossip_batches` accumulates one batch
+    /// per destination shard — `touched_shards` may include destinations
+    /// this node doesn't host.
+    AdmitAndGossipTransaction {
+        /// The locally-submitted transaction.
+        tx: Arc<RoutableTransaction>,
+        /// Every shard the tx touches (declared reads ∪ writes). Gossip
+        /// goes to each — even non-hosted ones — over the destination
+        /// shard's topic.
+        touched_shards: Vec<ShardGroupId>,
+    },
+
     /// Sync block response received from network callback. Carries the
     /// elided wire shape; the `NodeHost` rehydrates to a full `CertifiedBlock`
     /// by looking up omitted bodies in the local mempool / cert cache /
@@ -251,6 +276,9 @@ impl ShardScopedInput {
             },
             Self::TransactionGossipReceived { .. } => EventPriority::Network,
             Self::CommittedBlockGossipReceived { .. } => EventPriority::Network,
+            Self::AdmitTransaction { .. } | Self::AdmitAndGossipTransaction { .. } => {
+                EventPriority::Client
+            }
             Self::BlockSyncResponseReceived { .. }
             | Self::BlockSyncFetchFailed { .. }
             | Self::SyncBlockValidated { .. }
