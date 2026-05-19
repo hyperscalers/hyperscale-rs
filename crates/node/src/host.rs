@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use crossbeam::channel::Sender;
 use hyperscale_dispatch::Dispatch;
-use hyperscale_engine::{Engine, RadixExecutor, TransactionValidation};
+use hyperscale_engine::{Engine, ProcessExecutionCache, RadixExecutor, TransactionValidation};
 use hyperscale_network::Network;
 use hyperscale_storage::{PendingChain, Storage};
 use hyperscale_types::{LocalTimestamp, ShardGroupId, TransactionStatus, TxHash};
@@ -36,6 +36,11 @@ use crate::shard_loop::{
     SharedTopologySnapshot, StepOutput,
 };
 use crate::vnode::{Vnode, VnodeInit};
+
+/// Capacity for the per-process execution cache. Sized well above the
+/// expected in-flight tx working set; entries beyond the cap are
+/// evicted in insertion order.
+const EXECUTION_CACHE_CAPACITY: usize = 4096;
 
 /// Output of [`NodeHost::into_parts`]: shared process-scoped resources
 /// plus the per-shard drivers, keyed by hosted shard id.
@@ -197,9 +202,11 @@ where
             shard_builds.insert(*shard, (io, vnodes));
         }
 
+        let execution_cache = Arc::new(ProcessExecutionCache::new(EXECUTION_CACHE_CAPACITY));
         let dispatch_handles = Arc::new(DispatchHandles {
             executor: executor.clone(),
             network: Arc::clone(&network),
+            execution_cache,
             per_shard: per_shard_dispatch,
         });
         assert_eq!(

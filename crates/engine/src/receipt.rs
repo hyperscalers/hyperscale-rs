@@ -70,6 +70,36 @@ enum CachedVmOutputBody {
     },
 }
 
+impl CachedVmOutput {
+    /// Synthesize the failure output for a transaction that didn't
+    /// reach the VM (validation rejected the signature, etc.). Logs
+    /// once at construction so subsequent cache hits stay silent.
+    #[must_use]
+    pub fn validation_failed(tx_hash: TxHash) -> Self {
+        tracing::warn!(
+            ?tx_hash,
+            error = "Validation failed",
+            "transaction execution failed"
+        );
+        Self {
+            metadata: ExecutionMetadata::empty(),
+            body: CachedVmOutputBody::Failed,
+        }
+    }
+}
+
+#[cfg(test)]
+impl CachedVmOutput {
+    /// Build a `Failed` output for cache-mechanics tests. The body
+    /// content doesn't matter for cache-identity assertions.
+    pub(crate) fn failed_for_tests() -> Self {
+        Self {
+            metadata: ExecutionMetadata::empty(),
+            body: CachedVmOutputBody::Failed,
+        }
+    }
+}
+
 /// Project a Radix Engine receipt into a [`CachedVmOutput`].
 ///
 /// `storage` must match the view execution ran against — the local

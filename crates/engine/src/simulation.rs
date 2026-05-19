@@ -15,6 +15,7 @@ use radix_common::network::NetworkDefinition;
 use crate::RadixExecutor;
 use crate::engine::Engine;
 use crate::output::{ExecutedTx, ExecutionOutput};
+use crate::receipt::CachedVmOutput;
 
 /// Shared execution cache — one per shard group in simulation.
 ///
@@ -114,6 +115,24 @@ impl Engine for SimulationEngine {
             }));
         }
         ExecutionOutput::new(results)
+    }
+
+    fn compute_vm_output_single_shard<D: SubstateDatabase>(
+        &self,
+        snapshot: &D,
+        tx: &RoutableTransaction,
+    ) -> CachedVmOutput {
+        self.inner.compute_vm_output_single_shard(snapshot, tx)
+    }
+
+    fn compute_vm_output_cross_shard<D: SubstateDatabase>(
+        &self,
+        snapshot: &D,
+        tx: &RoutableTransaction,
+        provisions: &[Arc<Vec<SubstateEntry>>],
+    ) -> CachedVmOutput {
+        self.inner
+            .compute_vm_output_cross_shard(snapshot, tx, provisions)
     }
 
     fn network(&self) -> &NetworkDefinition {

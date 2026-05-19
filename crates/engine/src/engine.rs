@@ -19,6 +19,7 @@ use hyperscale_types::{RoutableTransaction, ShardGroupId, SubstateEntry};
 use radix_common::network::NetworkDefinition;
 
 use crate::output::ExecutionOutput;
+use crate::receipt::CachedVmOutput;
 
 /// Trait abstracting transaction execution.
 ///
@@ -62,6 +63,28 @@ pub trait Engine: Clone + Send + Sync + 'static {
         local_shard: ShardGroupId,
         num_shards: u64,
     ) -> ExecutionOutput;
+
+    /// Run the VM for a single-shard transaction and return the
+    /// [`CachedVmOutput`] — the shard-invariant projection of the
+    /// receipt, suitable for storing in a process-scope execution
+    /// cache. The caller projects per shard via
+    /// [`crate::project_to_shard`].
+    fn compute_vm_output_single_shard<D: SubstateDatabase>(
+        &self,
+        snapshot: &D,
+        tx: &RoutableTransaction,
+    ) -> CachedVmOutput;
+
+    /// Cross-shard counterpart of
+    /// [`compute_vm_output_single_shard`](Self::compute_vm_output_single_shard):
+    /// builds the provisioned snapshot, runs the VM, projects to
+    /// [`CachedVmOutput`].
+    fn compute_vm_output_cross_shard<D: SubstateDatabase>(
+        &self,
+        snapshot: &D,
+        tx: &RoutableTransaction,
+        provisions: &[Arc<Vec<SubstateEntry>>],
+    ) -> CachedVmOutput;
 
     /// Reference to the network definition this engine runs against.
     fn network(&self) -> &NetworkDefinition;

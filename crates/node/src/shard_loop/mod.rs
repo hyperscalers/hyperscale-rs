@@ -29,7 +29,7 @@ use arc_swap::ArcSwap;
 use crossbeam::channel::Sender;
 use hyperscale_core::{Action, ProtocolEvent, StateMachine, TimerId};
 use hyperscale_dispatch::Dispatch;
-use hyperscale_engine::Engine;
+use hyperscale_engine::{Engine, ProcessExecutionCache};
 use hyperscale_network::Network;
 use hyperscale_storage::{PendingChain, Storage};
 use hyperscale_types::{
@@ -74,6 +74,7 @@ pub type SharedTopologySnapshot = Arc<ArcSwap<TopologySnapshot>>;
 pub(crate) struct DispatchHandles<S: Storage, N, E: Engine> {
     pub(crate) executor: E,
     pub(crate) network: Arc<N>,
+    pub(crate) execution_cache: Arc<ProcessExecutionCache>,
     pub(crate) per_shard: HashMap<ShardGroupId, ShardDispatchHandles<S>>,
 }
 

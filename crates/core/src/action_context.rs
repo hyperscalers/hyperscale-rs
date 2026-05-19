@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use hyperscale_engine::Engine;
+use hyperscale_engine::{Engine, ProcessExecutionCache};
 use hyperscale_network::Network;
 use hyperscale_storage::{PendingChain, Storage};
 use hyperscale_types::{
@@ -29,6 +29,11 @@ pub struct ActionContext<'a, S: Storage, E: Engine, N: Network> {
     /// Chain-state lookup. Handlers that read state call
     /// `pending_chain.view_at(block_hash)` to build an anchored view.
     pub pending_chain: &'a Arc<PendingChain<S>>,
+    /// Process-scope cache of shard-invariant execution outputs.
+    /// Execute handlers consult this before dispatching to `executor`;
+    /// hits skip the Radix VM call and only run the per-shard
+    /// projection step.
+    pub execution_cache: &'a Arc<ProcessExecutionCache>,
     /// Network handle for broadcast/notify/request actions. The local
     /// validator's identity and shard are read from `topology` (see
     /// [`TopologySnapshot::local_validator_id`] / [`TopologySnapshot::local_shard`]).

@@ -456,6 +456,7 @@ where
                 executor: &handles.executor,
                 topology_snapshot: &topology_snapshot,
                 pending_chain: &shard_handles.pending_chain,
+                execution_cache: &handles.execution_cache,
                 network: &handles.network,
                 signing_key: &signing_key,
                 notify: &notify,

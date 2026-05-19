@@ -26,7 +26,7 @@ use tracing::{Level, Span, instrument};
 use crate::engine::Engine;
 use crate::output::{ExecutedTx, ExecutionOutput};
 use crate::provisioned_snapshot::ProvisionedSnapshot;
-use crate::receipt::build_executed_tx;
+use crate::receipt::{CachedVmOutput, build_executed_tx, compute_vm_output};
 
 /// Fetch state entries for the given nodes from storage at a specific block height.
 ///
@@ -266,6 +266,44 @@ impl Engine for RadixExecutor {
             u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX),
         );
         ExecutionOutput::new(results)
+    }
+
+    fn compute_vm_output_single_shard<D: SubstateDatabase>(
+        &self,
+        snapshot: &D,
+        tx: &RoutableTransaction,
+    ) -> CachedVmOutput {
+        let Some(validated) = tx.get_or_validate(&self.caches.validator) else {
+            return CachedVmOutput::validation_failed(tx.hash());
+        };
+        let executable = validated.clone().create_executable();
+        let receipt = execute_transaction(
+            snapshot,
+            &self.caches.vm_modules,
+            &self.caches.exec_config,
+            &executable,
+        );
+        compute_vm_output(snapshot, tx, &receipt)
+    }
+
+    fn compute_vm_output_cross_shard<D: SubstateDatabase>(
+        &self,
+        snapshot: &D,
+        tx: &RoutableTransaction,
+        provisions: &[Arc<Vec<SubstateEntry>>],
+    ) -> CachedVmOutput {
+        let Some(validated) = tx.get_or_validate(&self.caches.validator) else {
+            return CachedVmOutput::validation_failed(tx.hash());
+        };
+        let executable = validated.clone().create_executable();
+        let entry_slices: Vec<&[SubstateEntry]> = provisions.iter().map(|p| p.as_slice()).collect();
+        let provisioned = ProvisionedSnapshot::from_provisions(snapshot, &entry_slices);
+        let receipt = provisioned.execute(
+            &executable,
+            &self.caches.vm_modules,
+            &self.caches.exec_config,
+        );
+        compute_vm_output(&provisioned, tx, &receipt)
     }
 
     fn network(&self) -> &NetworkDefinition {

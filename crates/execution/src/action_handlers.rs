@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use hyperscale_core::{Action, ActionContext, ProtocolEvent};
-use hyperscale_engine::Engine;
+use hyperscale_engine::{Engine, project_to_shard};
 use hyperscale_metrics::record_execution_latency;
 use hyperscale_network::Network;
 use hyperscale_storage::{Storage, SubstateStore, SubstateView};
@@ -291,16 +291,16 @@ where
             let num_shards = ctx.topology_snapshot.num_shards();
             let view = ctx.pending_chain.view_at(block_hash);
             let view_snap = <SubstateView<_> as SubstateStore>::snapshot(&*view);
-            let output = ctx.executor.execute_single_shard(
-                &view_snap,
-                transactions.as_slice(),
-                local_shard,
-                num_shards,
-            );
-            let (tx_outcomes, results): (Vec<_>, Vec<_>) = output
-                .results
-                .into_iter()
-                .map(|tx| (tx.outcome(), StoredReceipt::from(tx)))
+            let (tx_outcomes, results): (Vec<_>, Vec<_>) = transactions
+                .iter()
+                .map(|tx| {
+                    let tx_hash = tx.hash();
+                    let cached = ctx.execution_cache.get_or_compute(tx_hash, || {
+                        ctx.executor.compute_vm_output_single_shard(&view_snap, tx)
+                    });
+                    let executed = project_to_shard(&cached, tx_hash, local_shard, num_shards);
+                    (executed.outcome(), StoredReceipt::from(executed))
+                })
                 .unzip();
             record_execution_latency(start.elapsed().as_secs_f64());
             ctx.notify_protocol(ProtocolEvent::ExecutionBatchCompleted {
@@ -322,19 +322,16 @@ where
             let (tx_outcomes, results): (Vec<_>, Vec<_>) = requests
                 .iter()
                 .map(|req| {
-                    let mut output = ctx.executor.execute_cross_shard(
-                        &view_snap,
-                        std::slice::from_ref(&req.transaction),
-                        &req.provisions,
-                        local_shard,
-                        num_shards,
-                    );
-                    // Engine contract: one result per input tx; we pass one in.
-                    let tx = output
-                        .results
-                        .pop()
-                        .expect("execute_cross_shard returned no result for single-tx input");
-                    (tx.outcome(), StoredReceipt::from(tx))
+                    let tx_hash = req.transaction.hash();
+                    let cached = ctx.execution_cache.get_or_compute(tx_hash, || {
+                        ctx.executor.compute_vm_output_cross_shard(
+                            &view_snap,
+                            &req.transaction,
+                            &req.provisions,
+                        )
+                    });
+                    let executed = project_to_shard(&cached, tx_hash, local_shard, num_shards);
+                    (executed.outcome(), StoredReceipt::from(executed))
                 })
                 .unzip();
             record_execution_latency(start.elapsed().as_secs_f64());

@@ -10,6 +10,7 @@ hyperscale-types.workspace = true
 
 # External dependencies
 dashmap.workspace = true
+indexmap.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 

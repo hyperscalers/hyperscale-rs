@@ -30,6 +30,7 @@
 
 #![warn(missing_docs)]
 
+mod cache;
 mod engine;
 mod executor;
 mod genesis;
@@ -43,6 +44,7 @@ mod validation;
 /// Shard assignment and write filtering for Radix Engine `DatabaseUpdates`.
 pub mod sharding;
 
+pub use cache::ProcessExecutionCache;
 pub use engine::Engine;
 pub use executor::{RadixExecutor, fetch_state_entries};
 pub use genesis::GenesisConfig;
