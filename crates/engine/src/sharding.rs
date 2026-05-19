@@ -65,6 +65,7 @@
 //! producing different DatabaseUpdates and divergent state roots.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::BuildHasher;
 
 use hyperscale_storage::{
     DatabaseUpdates, DbPartitionKey, PartitionDatabaseUpdates, SubstateDatabase, SubstateStore,
@@ -108,7 +109,7 @@ const SBOR_OWN_TAG: u8 = 0x90;
 /// This is the "walk down" from accounts to vaults. It's necessary because
 /// vaults have no back-pointer to their owning account — `outer_object` points
 /// to the resource manager, not the account.
-fn resolve_owned_nodes<S: SubstateDatabase>(
+pub fn resolve_owned_nodes<S: SubstateDatabase>(
     storage: &S,
     declared_nodes: &[NodeId],
 ) -> HashMap<NodeId, NodeId> {
@@ -208,19 +209,18 @@ fn resolve_owned_nodes_at_height<S: SubstateStore>(
 /// 2. Belong to a declared account (directly or as an owned internal node)
 /// 3. Are assigned to `local_shard` based on the owning account's hash
 ///
-/// The `declared_nodes` parameter contains account `NodeId`s from the transaction
-/// manifest's declared reads/writes. The function scans their substates to
-/// discover owned vaults, then filters accordingly.
-pub fn filter_updates_for_shard<S: SubstateDatabase>(
+/// `declared_set` carries the transaction's declared reads/writes; `ownership`
+/// maps each internal node discovered under those accounts to its owner. Both
+/// are produced once per build via [`resolve_owned_nodes`] and shared with
+/// [`filter_updates_for_global_receipt`].
+#[must_use]
+pub fn filter_updates_for_shard<H1: BuildHasher, H2: BuildHasher>(
     updates: &DatabaseUpdates,
     local_shard: ShardGroupId,
     num_shards: u64,
-    storage: &S,
-    declared_nodes: &[NodeId],
+    declared_set: &HashSet<NodeId, H1>,
+    ownership: &HashMap<NodeId, NodeId, H2>,
 ) -> DatabaseUpdates {
-    let declared_set: HashSet<NodeId> = declared_nodes.iter().copied().collect();
-    let ownership = resolve_owned_nodes(storage, declared_nodes);
-
     let mut filtered = DatabaseUpdates::default();
 
     for (db_node_key, node_updates) in &updates.node_updates {
@@ -278,14 +278,15 @@ pub fn filter_updates_for_shard<S: SubstateDatabase>(
 /// 1. Drop system entities (`ConsensusManager`, `TransactionTracker`, Validator)
 /// 2. Drop undeclared writes (not in `declared_reads`/`declared_writes` or their owned vaults)
 /// 3. (Omitted: no shard filtering — keep writes for all shards.)
-pub fn filter_updates_for_global_receipt<S: SubstateDatabase>(
+///
+/// Shares `declared_set` and `ownership` with [`filter_updates_for_shard`];
+/// see that function's docs for how the inputs are produced.
+#[must_use]
+pub fn filter_updates_for_global_receipt<H1: BuildHasher, H2: BuildHasher>(
     updates: &DatabaseUpdates,
-    storage: &S,
-    declared_nodes: &[NodeId],
+    declared_set: &HashSet<NodeId, H1>,
+    ownership: &HashMap<NodeId, NodeId, H2>,
 ) -> DatabaseUpdates {
-    let declared_set: HashSet<NodeId> = declared_nodes.iter().copied().collect();
-    let ownership = resolve_owned_nodes(storage, declared_nodes);
-
     let mut filtered = DatabaseUpdates::default();
 
     for (db_node_key, node_updates) in &updates.node_updates {
@@ -481,6 +482,17 @@ mod tests {
             a.node_updates.insert(k, v);
         }
         a
+    }
+
+    /// Build the `(declared_set, ownership)` pair the filters require,
+    /// matching what `build_executed_tx` does at the real call site.
+    fn filter_inputs<S: SubstateDatabase>(
+        storage: &S,
+        declared: &[NodeId],
+    ) -> (HashSet<NodeId>, HashMap<NodeId, NodeId>) {
+        let set = declared.iter().copied().collect();
+        let ownership = resolve_owned_nodes(storage, declared);
+        (set, ownership)
     }
 
     // ── MockDb: SubstateDatabase backed by an in-memory map ─────────────────
@@ -717,7 +729,8 @@ mod tests {
             make_set_update(consensus, 64, vec![0], vec![1]),
         );
         let local = shard_for_node(&account, 4);
-        let filtered = filter_updates_for_shard(&updates, local, 4, &MockDb::default(), &[account]);
+        let (set, own) = filter_inputs(&MockDb::default(), &[account]);
+        let filtered = filter_updates_for_shard(&updates, local, 4, &set, &own);
         assert_eq!(filtered.node_updates.len(), 1);
         let only = filtered.node_updates.keys().next().unwrap();
         assert_eq!(db_node_key_to_node_id(only), Some(account));
@@ -733,7 +746,8 @@ mod tests {
             make_set_update(stranger, 64, vec![0], vec![1]),
         );
         let local = shard_for_node(&account, 1);
-        let filtered = filter_updates_for_shard(&updates, local, 1, &MockDb::default(), &[account]);
+        let (set, own) = filter_inputs(&MockDb::default(), &[account]);
+        let filtered = filter_updates_for_shard(&updates, local, 1, &set, &own);
         assert_eq!(filtered.node_updates.len(), 1);
     }
 
@@ -746,7 +760,8 @@ mod tests {
             make_set_update(a, 64, vec![0], vec![1]),
             make_set_update(b, 64, vec![0], vec![1]),
         );
-        let filtered = filter_updates_for_shard(&updates, local, 4, &MockDb::default(), &[a, b]);
+        let (set, own) = filter_inputs(&MockDb::default(), &[a, b]);
+        let filtered = filter_updates_for_shard(&updates, local, 4, &set, &own);
         assert_eq!(filtered.node_updates.len(), 1);
         let only = filtered.node_updates.keys().next().unwrap();
         assert_eq!(db_node_key_to_node_id(only), Some(a));
@@ -763,7 +778,8 @@ mod tests {
             make_set_update(vault, 0, vec![0], vec![1]),
         );
         let local = shard_for_node(&account, 1);
-        let filtered = filter_updates_for_shard(&updates, local, 1, &db, &[account]);
+        let (set, own) = filter_inputs(&db, &[account]);
+        let filtered = filter_updates_for_shard(&updates, local, 1, &set, &own);
         assert_eq!(filtered.node_updates.len(), 2);
     }
 
@@ -785,12 +801,12 @@ mod tests {
         let mut db = MockDb::default();
         db.insert(&account, 64, vec![0], own_bytes(&vault));
         let updates = make_set_update(vault, 0, vec![0], vec![1]);
+        let (set, own) = filter_inputs(&db, &[account]);
         // Filter at owner's shard — vault must be kept.
-        let kept = filter_updates_for_shard(&updates, owner_shard, 4, &db, &[account]);
+        let kept = filter_updates_for_shard(&updates, owner_shard, 4, &set, &own);
         assert_eq!(kept.node_updates.len(), 1);
         // Filter at the vault's "natural" shard — must drop.
-        let dropped =
-            filter_updates_for_shard(&updates, shard_for_node(&vault, 4), 4, &db, &[account]);
+        let dropped = filter_updates_for_shard(&updates, shard_for_node(&vault, 4), 4, &set, &own);
         assert!(dropped.node_updates.is_empty());
     }
 
@@ -804,7 +820,8 @@ mod tests {
             make_set_update(a, 64, vec![0], vec![1]),
             make_set_update(b, 64, vec![0], vec![1]),
         );
-        let filtered = filter_updates_for_global_receipt(&updates, &MockDb::default(), &[a, b]);
+        let (set, own) = filter_inputs(&MockDb::default(), &[a, b]);
+        let filtered = filter_updates_for_global_receipt(&updates, &set, &own);
         assert_eq!(filtered.node_updates.len(), 2);
     }
 
@@ -820,7 +837,8 @@ mod tests {
             ),
             make_set_update(consensus, 64, vec![0], vec![1]),
         );
-        let filtered = filter_updates_for_global_receipt(&updates, &MockDb::default(), &[account]);
+        let (set, own) = filter_inputs(&MockDb::default(), &[account]);
+        let filtered = filter_updates_for_global_receipt(&updates, &set, &own);
         assert_eq!(filtered.node_updates.len(), 1);
         let only = filtered.node_updates.keys().next().unwrap();
         assert_eq!(db_node_key_to_node_id(only), Some(account));
@@ -836,7 +854,8 @@ mod tests {
             make_set_update(account, 64, vec![0], vec![1]),
             make_set_update(vault, 0, vec![0], vec![1]),
         );
-        let filtered = filter_updates_for_global_receipt(&updates, &db, &[account]);
+        let (set, own) = filter_inputs(&db, &[account]);
+        let filtered = filter_updates_for_global_receipt(&updates, &set, &own);
         assert_eq!(filtered.node_updates.len(), 2);
     }
 
