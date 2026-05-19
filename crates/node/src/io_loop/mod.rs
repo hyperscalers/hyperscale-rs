@@ -599,6 +599,13 @@ where
             ShardEvent::Process(input) => self.step_process_input(input),
         }
 
+        // Refresh the `FetchTick` timer once, after the event has fully
+        // settled. Cheaper than the previous "call inline from every fetch
+        // state change" pattern, and produces the same final timer state
+        // because the runner applies timer ops sequentially — only the
+        // last Set/Cancel for a (TimerId, shard) pair lands.
+        self.update_fetch_tick_timer();
+
         self.drain_pending_output()
     }
 
@@ -669,7 +676,6 @@ where
             // ── Fetch protocol ─────────────────────────────────────────
             ShardScopedInput::TransactionsFetchFailed { hashes } => {
                 self.drive_fetch::<TransactionBinding>(shard, FetchInput::Failed { ids: hashes });
-                self.update_fetch_tick_timer();
             }
             ShardScopedInput::ProvisionsFetchFailed {
                 source_shard,
@@ -681,22 +687,18 @@ where
                         ids: vec![(source_shard, shard, block_height)],
                     },
                 );
-                self.update_fetch_tick_timer();
             }
             ShardScopedInput::ExecCertFetchFailed { hashes } => {
                 self.drive_fetch::<ExecCertBinding>(shard, FetchInput::Failed { ids: hashes });
-                self.update_fetch_tick_timer();
             }
             ShardScopedInput::LocalProvisionsFetchFailed { hashes } => {
                 self.drive_fetch::<LocalProvisionBinding>(
                     shard,
                     FetchInput::Failed { ids: hashes },
                 );
-                self.update_fetch_tick_timer();
             }
             ShardScopedInput::FinalizedWavesFetchFailed { ids } => {
                 self.drive_fetch::<FinalizedWaveBinding>(shard, FetchInput::Failed { ids });
-                self.update_fetch_tick_timer();
             }
 
             // ── Committed header (gossip → BLS verify → state machine) ──
