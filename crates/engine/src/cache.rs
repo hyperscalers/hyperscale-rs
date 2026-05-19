@@ -32,7 +32,36 @@ use indexmap::IndexMap;
 
 use crate::receipt::CachedVmOutput;
 
-type Slot = Arc<OnceLock<Arc<CachedVmOutput>>>;
+/// Shared slot returned by [`ProcessExecutionCache::try_acquire`].
+///
+/// Callers `set` their result if they got [`SlotStatus::Claimed`], or
+/// peek / wait on another worker's result if they got
+/// [`SlotStatus::Pending`].
+pub type CachedSlot = Arc<OnceLock<Arc<CachedVmOutput>>>;
+
+type Slot = CachedSlot;
+
+/// Outcome of [`ProcessExecutionCache::try_acquire`].
+///
+/// Lets a batch-level scheduler distinguish "value is ready", "I just
+/// reserved this slot — I must fill it", and "another worker reserved
+/// it — I should come back later". The `Completed` case never appears
+/// for a slot the caller is currently filling; `Claimed` and `Pending`
+/// both carry the same [`CachedSlot`] so callers can drive it via the
+/// underlying `OnceLock`.
+pub enum SlotStatus {
+    /// Value already cached.
+    Completed(Arc<CachedVmOutput>),
+    /// Slot freshly reserved for the caller. The caller is the unique
+    /// owner of the right to fill it via `slot.set(...)`.
+    Claimed(CachedSlot),
+    /// Another worker has already reserved this slot. Callers either
+    /// `slot.get()` to peek non-blockingly or
+    /// `slot.get_or_init(|| ...)` to block (the fallback closure runs
+    /// only if the original owner abandoned the slot without setting
+    /// a value).
+    Pending(CachedSlot),
+}
 
 struct Entry {
     value: Slot,
@@ -136,6 +165,46 @@ impl ProcessExecutionCache {
                 .clone()
         };
         Arc::clone(slot.get_or_init(|| Arc::new(compute())))
+    }
+
+    /// Non-blocking variant of [`Self::get_or_compute`].
+    ///
+    /// Returns a [`SlotStatus`] the caller can react to: cache hit,
+    /// slot freshly claimed, or slot already in flight on another
+    /// worker. The intended consumer is a batch handler that wants to
+    /// defer in-flight slots, work on other transactions first, and
+    /// only block when nothing else is left.
+    pub fn try_acquire(
+        &self,
+        tx_hash: TxHash,
+        participating: impl IntoIterator<Item = ShardGroupId>,
+    ) -> SlotStatus {
+        let mut guard = lock(&self.inner);
+        if let Some(entry) = guard.entries.get(&tx_hash) {
+            let slot = Arc::clone(&entry.value);
+            drop(guard);
+            return slot.get().map_or_else(
+                || SlotStatus::Pending(Arc::clone(&slot)),
+                |v| SlotStatus::Completed(Arc::clone(v)),
+            );
+        }
+
+        let now = guard.now;
+        let pending_shards: HashSet<ShardGroupId> = participating
+            .into_iter()
+            .filter(|s| self.hosted_shards.contains(s))
+            .collect();
+        let slot = Arc::new(OnceLock::new());
+        guard.entries.insert(
+            tx_hash,
+            Entry {
+                value: Arc::clone(&slot),
+                pending_shards,
+                inserted_at_ts: now,
+            },
+        );
+        drop(guard);
+        SlotStatus::Claimed(slot)
     }
 
     /// Remove `shard` from each named tx's pending-shards set. Entries
@@ -326,6 +395,31 @@ mod tests {
         let far_future = early.plus(RETENTION_HORIZON).plus(Duration::from_secs(1));
         cache.on_block_committed(far_future);
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn try_acquire_returns_claimed_pending_completed_in_sequence() {
+        let cache = ProcessExecutionCache::new(hosted(&[0]));
+        let claimed = match cache.try_acquire(tx_hash(1), [shard(0)]) {
+            SlotStatus::Claimed(slot) => slot,
+            SlotStatus::Pending(_) => panic!("expected Claimed, got Pending"),
+            SlotStatus::Completed(_) => panic!("expected Claimed, got Completed"),
+        };
+
+        // Pre-fill: a second caller sees Pending.
+        let pending_status = cache.try_acquire(tx_hash(1), [shard(0)]);
+        assert!(matches!(pending_status, SlotStatus::Pending(_)));
+
+        // Fill: a third caller sees Completed.
+        let value = Arc::new(failed_compute());
+        let set_ok = claimed.set(Arc::clone(&value)).is_ok();
+        assert!(set_ok, "first set wins");
+        match cache.try_acquire(tx_hash(1), [shard(0)]) {
+            SlotStatus::Completed(v) => assert!(Arc::ptr_eq(&v, &value)),
+            SlotStatus::Claimed(_) | SlotStatus::Pending(_) => {
+                panic!("expected Completed, got non-completed status")
+            }
+        }
     }
 
     #[test]

@@ -12,7 +12,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use hyperscale_core::{Action, ActionContext, ProtocolEvent};
-use hyperscale_engine::project_to_shard;
+use hyperscale_engine::{
+    CachedSlot, CachedVmOutput, ProcessExecutionCache, SlotStatus, project_to_shard,
+};
 use hyperscale_metrics::record_execution_latency;
 use hyperscale_network::Network;
 use hyperscale_storage::{Storage, SubstateStore, SubstateView};
@@ -232,6 +234,64 @@ fn participating_shards(
         .map(move |n| shard_for_node(n, num_shards))
 }
 
+/// Two-pass cache acquisition for a batch of transactions.
+///
+/// First pass: try each slot non-blockingly. Hits land in `results`,
+/// claimed slots run `compute` and set the slot inline, pending slots
+/// get deferred. Retry pass: harvest any deferred slot that has since
+/// completed; if a full pass yields nothing, block on one remaining
+/// slot to advance — every remaining entry is in-flight on another
+/// worker and there's no useful work for this thread to find on its
+/// own. Output position matches input position regardless of completion
+/// order.
+fn batch_compute_cached(
+    cache: &ProcessExecutionCache,
+    txs: &[Arc<RoutableTransaction>],
+    num_shards: u64,
+    compute: impl Fn(usize) -> CachedVmOutput,
+) -> Vec<Arc<CachedVmOutput>> {
+    let n = txs.len();
+    let mut results: Vec<Option<Arc<CachedVmOutput>>> = (0..n).map(|_| None).collect();
+    let mut pending: Vec<(usize, CachedSlot)> = Vec::new();
+
+    for (i, tx) in txs.iter().enumerate() {
+        let tx_hash = tx.hash();
+        match cache.try_acquire(tx_hash, participating_shards(tx, num_shards)) {
+            SlotStatus::Completed(v) => results[i] = Some(v),
+            SlotStatus::Claimed(slot) => {
+                let value = Arc::new(compute(i));
+                let _ = slot.set(Arc::clone(&value));
+                results[i] = Some(value);
+            }
+            SlotStatus::Pending(slot) => pending.push((i, slot)),
+        }
+    }
+
+    while !pending.is_empty() {
+        let mut still_pending: Vec<(usize, CachedSlot)> = Vec::with_capacity(pending.len());
+        let mut harvested = false;
+        for (i, slot) in std::mem::take(&mut pending) {
+            if let Some(v) = slot.get() {
+                results[i] = Some(Arc::clone(v));
+                harvested = true;
+            } else {
+                still_pending.push((i, slot));
+            }
+        }
+        if !harvested && !still_pending.is_empty() {
+            // No progress and every remaining slot is in-flight elsewhere;
+            // block on one. The closure runs only if the original claimant
+            // abandoned the slot without setting a value.
+            let (i, slot) = still_pending.swap_remove(0);
+            let value = slot.get_or_init(|| Arc::new(compute(i)));
+            results[i] = Some(Arc::clone(value));
+        }
+        pending = still_pending;
+    }
+
+    results.into_iter().map(Option::unwrap).collect()
+}
+
 /// Outcomes flow through `ctx.notify`. Variants owned by other coordinator
 /// crates hit `unreachable!()` — node's dispatcher routes by variant prefix.
 ///
@@ -304,16 +364,20 @@ where
             let num_shards = ctx.topology_snapshot.num_shards();
             let view = ctx.pending_chain.view_at(block_hash);
             let view_snap = <SubstateView<_> as SubstateStore>::snapshot(&*view);
+            let cached = batch_compute_cached(
+                ctx.execution_cache.as_ref(),
+                transactions.as_slice(),
+                num_shards,
+                |i| {
+                    ctx.executor
+                        .compute_vm_output_single_shard(&view_snap, &transactions[i])
+                },
+            );
             let (tx_outcomes, results): (Vec<_>, Vec<_>) = transactions
                 .iter()
-                .map(|tx| {
-                    let tx_hash = tx.hash();
-                    let cached = ctx.execution_cache.get_or_compute(
-                        tx_hash,
-                        participating_shards(tx, num_shards),
-                        || ctx.executor.compute_vm_output_single_shard(&view_snap, tx),
-                    );
-                    let executed = project_to_shard(&cached, tx_hash, local_shard, num_shards);
+                .zip(cached)
+                .map(|(tx, cached)| {
+                    let executed = project_to_shard(&cached, tx.hash(), local_shard, num_shards);
                     (executed.outcome(), StoredReceipt::from(executed))
                 })
                 .unzip();
@@ -334,21 +398,23 @@ where
             let num_shards = ctx.topology_snapshot.num_shards();
             let view = ctx.pending_chain.view_at(block_hash);
             let view_snap = <SubstateView<_> as SubstateStore>::snapshot(&*view);
+            let txs: Vec<Arc<RoutableTransaction>> = requests
+                .iter()
+                .map(|r| Arc::clone(&r.transaction))
+                .collect();
+            let cached =
+                batch_compute_cached(ctx.execution_cache.as_ref(), &txs, num_shards, |i| {
+                    ctx.executor.compute_vm_output_cross_shard(
+                        &view_snap,
+                        &requests[i].transaction,
+                        &requests[i].provisions,
+                    )
+                });
             let (tx_outcomes, results): (Vec<_>, Vec<_>) = requests
                 .iter()
-                .map(|req| {
+                .zip(cached)
+                .map(|(req, cached)| {
                     let tx_hash = req.transaction.hash();
-                    let cached = ctx.execution_cache.get_or_compute(
-                        tx_hash,
-                        participating_shards(&req.transaction, num_shards),
-                        || {
-                            ctx.executor.compute_vm_output_cross_shard(
-                                &view_snap,
-                                &req.transaction,
-                                &req.provisions,
-                            )
-                        },
-                    );
                     let executed = project_to_shard(&cached, tx_hash, local_shard, num_shards);
                     (executed.outcome(), StoredReceipt::from(executed))
                 })

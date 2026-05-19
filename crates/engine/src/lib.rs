@@ -26,7 +26,7 @@ mod validation;
 /// Shard assignment and write filtering for Radix Engine `DatabaseUpdates`.
 pub mod sharding;
 
-pub use cache::ProcessExecutionCache;
+pub use cache::{CachedSlot, ProcessExecutionCache, SlotStatus};
 pub use executor::{RadixExecutor, fetch_state_entries};
 pub use genesis::GenesisConfig;
 pub use genesis_cache::prepared_genesis;
