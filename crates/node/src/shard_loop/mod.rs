@@ -416,4 +416,83 @@ where
         }
         self.flush_block_commits();
     }
+
+    /// Set this shard's cached wall-clock time. Production calls this
+    /// from the shard's pinned thread; sim drives every hosted shard's
+    /// time via [`NodeHost::set_time`].
+    ///
+    /// [`NodeHost::set_time`]: crate::host::NodeHost::set_time
+    pub const fn set_time(&mut self, now: LocalTimestamp) {
+        self.now = now;
+    }
+
+    /// Process one [`ShardScopedInput`] end-to-end: clear per-step
+    /// scratch, dispatch the input (which also refreshes this shard's
+    /// `FetchTick` timer), then drain accumulated outputs.
+    ///
+    /// Production's per-shard pinned thread calls this; sim still goes
+    /// through [`NodeHost::step`] for the global event queue.
+    ///
+    /// [`NodeHost::step`]: crate::host::NodeHost::step
+    pub fn run_step(&mut self, input: ShardScopedInput) -> StepOutput {
+        self.pending_timer_ops.clear();
+        self.emitted_statuses.clear();
+        self.actions_generated = 0;
+        self.step(input);
+        StepOutput {
+            emitted_statuses: std::mem::take(&mut self.emitted_statuses),
+            actions_generated: std::mem::replace(&mut self.actions_generated, 0),
+            timer_ops: std::mem::take(&mut self.pending_timer_ops),
+        }
+    }
+
+    /// Flush this shard's batch accumulators whose deadlines have
+    /// expired at `now`.
+    pub fn flush_expired_batches(&mut self, now: LocalTimestamp) {
+        if self.io.validation_batch.is_expired(now) {
+            self.flush_validation_batch();
+        }
+        if self.io.committed_header_batch.is_expired(now) {
+            self.flush_committed_header_verifications();
+        }
+        let expired_dsts: Vec<ShardGroupId> = self
+            .outbound_gossip_batches
+            .iter()
+            .filter_map(|(dst, batch)| batch.is_expired(now).then_some(*dst))
+            .collect();
+        for dst in expired_dsts {
+            self.flush_tx_gossip_batch(dst);
+        }
+    }
+
+    /// Flush every pending batch on this shard regardless of deadline.
+    /// Used at shutdown and by the sim harness between events.
+    pub fn flush_all_batches(&mut self) {
+        self.flush_block_commits();
+        self.flush_validation_batch();
+        self.flush_committed_header_verifications();
+        let dsts: Vec<ShardGroupId> = self.outbound_gossip_batches.keys().copied().collect();
+        for dst in dsts {
+            self.flush_tx_gossip_batch(dst);
+        }
+    }
+
+    /// Nearest batch deadline on this shard, if any — the production
+    /// loop uses it to bound `recv_timeout` so the per-shard wake-up
+    /// fires when its earliest batch expires.
+    #[must_use]
+    pub fn nearest_batch_deadline(&self) -> Option<LocalTimestamp> {
+        [
+            self.io.validation_batch.deadline(),
+            self.io.committed_header_batch.deadline(),
+        ]
+        .into_iter()
+        .chain(
+            self.outbound_gossip_batches
+                .values()
+                .map(BatchAccumulator::deadline),
+        )
+        .flatten()
+        .min()
+    }
 }

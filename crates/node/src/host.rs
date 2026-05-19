@@ -272,7 +272,7 @@ where
     pub fn set_time(&mut self, now: LocalTimestamp) {
         self.now = now;
         for sl in self.shards.values_mut() {
-            sl.now = now;
+            sl.set_time(now);
         }
     }
 
@@ -449,25 +449,8 @@ where
     /// the loop calls this with wall-clock time. In simulation, the harness
     /// calls it with logical time.
     pub fn flush_expired_batches(&mut self, now: LocalTimestamp) {
-        let hosted: Vec<ShardGroupId> = self.hosted_shards().collect();
-        for shard in hosted {
-            let sl = self.shard_loop_mut(shard);
-            if sl.io.validation_batch.is_expired(now) {
-                sl.flush_validation_batch();
-            }
-            let sl = self.shard_loop_mut(shard);
-            if sl.io.committed_header_batch.is_expired(now) {
-                sl.flush_committed_header_verifications();
-            }
-            let sl = self.shard_loop_mut(shard);
-            let expired_dsts: Vec<ShardGroupId> = sl
-                .outbound_gossip_batches
-                .iter()
-                .filter_map(|(dst, batch)| batch.is_expired(now).then_some(*dst))
-                .collect();
-            for dst in expired_dsts {
-                self.shard_loop_mut(shard).flush_tx_gossip_batch(dst);
-            }
+        for sl in self.shards.values_mut() {
+            sl.flush_expired_batches(now);
         }
     }
 
@@ -478,19 +461,7 @@ where
     pub fn nearest_batch_deadline(&self) -> Option<LocalTimestamp> {
         self.shards
             .values()
-            .flat_map(|sl| {
-                [
-                    sl.io.validation_batch.deadline(),
-                    sl.io.committed_header_batch.deadline(),
-                ]
-                .into_iter()
-                .chain(
-                    sl.outbound_gossip_batches
-                        .values()
-                        .map(BatchAccumulator::deadline),
-                )
-            })
-            .flatten()
+            .filter_map(ShardLoop::nearest_batch_deadline)
             .min()
     }
 
@@ -499,16 +470,8 @@ where
     ///
     /// Called during shutdown or when immediate delivery is needed.
     pub fn flush_all_batches(&mut self) {
-        let hosted: Vec<ShardGroupId> = self.hosted_shards().collect();
-        for shard in &hosted {
-            let sl = self.shard_loop_mut(*shard);
-            sl.flush_block_commits();
-            sl.flush_validation_batch();
-            sl.flush_committed_header_verifications();
-            let dsts: Vec<ShardGroupId> = sl.outbound_gossip_batches.keys().copied().collect();
-            for dst in dsts {
-                self.shard_loop_mut(*shard).flush_tx_gossip_batch(dst);
-            }
+        for sl in self.shards.values_mut() {
+            sl.flush_all_batches();
         }
     }
 }
