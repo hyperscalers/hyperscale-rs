@@ -21,10 +21,10 @@ use hyperscale_types::network::notification::{
 };
 use hyperscale_types::{
     Bls12381G1PublicKey, Bls12381G2Signature, ExecutionCertificate, ExecutionVote,
-    GlobalReceiptRoot, SignerBitfield, StoredReceipt, ValidatorId, VotePower, WaveId,
-    WeightedTimestamp, batch_verify_bls_same_message, compute_global_receipt_root,
-    exec_cert_batch_message, exec_vote_batch_message, exec_vote_message, verify_bls12381_v1,
-    zero_bls_signature,
+    GlobalReceiptRoot, RoutableTransaction, ShardGroupId, SignerBitfield, StoredReceipt,
+    ValidatorId, VotePower, WaveId, WeightedTimestamp, batch_verify_bls_same_message,
+    compute_global_receipt_root, exec_cert_batch_message, exec_vote_batch_message,
+    exec_vote_message, shard_for_node, verify_bls12381_v1, zero_bls_signature,
 };
 
 // ============================================================================
@@ -217,6 +217,21 @@ pub fn verify_execution_certificate_signature(
 
 /// Handle the execution-owned delegated [`Action`] variants.
 ///
+/// Shards this transaction reads or writes, routed via `shard_for_node`.
+///
+/// Drives the execution cache's per-entry pending-shards set: the cache
+/// narrows this to the host's hosted shards and decrements per-shard as
+/// finalised waves arrive.
+fn participating_shards(
+    tx: &RoutableTransaction,
+    num_shards: u64,
+) -> impl Iterator<Item = ShardGroupId> + '_ {
+    tx.declared_reads()
+        .iter()
+        .chain(tx.declared_writes().iter())
+        .map(move |n| shard_for_node(n, num_shards))
+}
+
 /// Outcomes flow through `ctx.notify`. Variants owned by other coordinator
 /// crates hit `unreachable!()` — node's dispatcher routes by variant prefix.
 ///
@@ -295,9 +310,11 @@ where
                 .iter()
                 .map(|tx| {
                     let tx_hash = tx.hash();
-                    let cached = ctx.execution_cache.get_or_compute(tx_hash, || {
-                        ctx.executor.compute_vm_output_single_shard(&view_snap, tx)
-                    });
+                    let cached = ctx.execution_cache.get_or_compute(
+                        tx_hash,
+                        participating_shards(tx, num_shards),
+                        || ctx.executor.compute_vm_output_single_shard(&view_snap, tx),
+                    );
                     let executed = project_to_shard(&cached, tx_hash, local_shard, num_shards);
                     (executed.outcome(), StoredReceipt::from(executed))
                 })
@@ -323,13 +340,17 @@ where
                 .iter()
                 .map(|req| {
                     let tx_hash = req.transaction.hash();
-                    let cached = ctx.execution_cache.get_or_compute(tx_hash, || {
-                        ctx.executor.compute_vm_output_cross_shard(
-                            &view_snap,
-                            &req.transaction,
-                            &req.provisions,
-                        )
-                    });
+                    let cached = ctx.execution_cache.get_or_compute(
+                        tx_hash,
+                        participating_shards(&req.transaction, num_shards),
+                        || {
+                            ctx.executor.compute_vm_output_cross_shard(
+                                &view_snap,
+                                &req.transaction,
+                                &req.provisions,
+                            )
+                        },
+                    );
                     let executed = project_to_shard(&cached, tx_hash, local_shard, num_shards);
                     (executed.outcome(), StoredReceipt::from(executed))
                 })
