@@ -1,9 +1,12 @@
 //! Inbound block-sync request handling.
 //!
 //! Serves `GetBlockRequest`s from peers catching up via the sync protocol.
-//! Reads the block from storage and decides whether to attach in-memory
-//! provisions (when the block is still inside the wave-execution window)
-//! or serve the persisted `Sealed` shape.
+//! Reads the block from storage and either attaches in-memory provisions
+//! (when the block is still inside the wave-execution window) or serves
+//! the persisted `Sealed` shape. Inside the live window, a local cache
+//! miss is reported as `not_found` so the requester rotates to a peer
+//! that has the provisions — preserving the invariant that `Block::Sealed`
+//! means the cross-shard window has passed.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,17 +32,21 @@ const LIVE_WINDOW: Duration = Duration::from_secs(WAVE_TIMEOUT.as_secs() + SERVE
 /// Storage always returns `Block::Sealed` — the persisted shape carries no
 /// provisions. Whether the requester needs `Block::Live` is a function of
 /// the block's own age: if its waves could still be open for execution
-/// voting (`block_ts + WAVE_TIMEOUT + margin > tip_ts`), provisions are
-/// attached from the local cache. Otherwise the `Sealed` block is served.
+/// voting (`block_ts + WAVE_TIMEOUT + margin > tip_ts`), provisions must
+/// be attached from the local cache. Otherwise the `Sealed` block is
+/// served.
 ///
 /// The wave-window check is based on the BFT-authenticated
 /// `weighted_timestamp` of the committing QC and the serving peer's own
 /// latest QC timestamp — both quantities are deterministic and don't
 /// depend on the requester's view.
 ///
-/// On cache miss inside the live window the block is still served as
-/// `Sealed`; the requester fetches missing provisions through the cross-shard
-/// provision fetch instead of round-robining peers.
+/// Inside the live window, a local cache miss returns `not_found`. The
+/// invariant downstream commit hooks rely on — `Block::Sealed` means the
+/// cross-shard window has passed and no provision hashes need to be
+/// enumerated — is preserved by refusing rather than silently downgrading
+/// the response. The requester rotates to another peer who has the
+/// provisions cached.
 pub fn serve_block_request(
     storage: &impl ChainReader,
     provision_store: &ProvisionStore,
@@ -74,22 +81,18 @@ pub fn serve_block_request(
         .map(|h| provision_store.get(*h))
         .collect();
 
-    if let Some(provisions) = resolved {
-        GetBlockResponse::found(ElidedCertifiedBlock::elide(
-            &block.into_live(Arc::new(provisions.into())),
-            qc,
-            &req.inventory,
-        ))
-    } else {
-        // Cache miss inside the live window. Serve Sealed and let the
-        // requester pull provisions via the fetch protocol — avoids
-        // the peer-rotation retry storm the old `not_found` path caused
-        // when provisions had aged out everywhere.
+    let Some(provisions) = resolved else {
         trace!(
             height = req.height.inner(),
-            "Cache miss for provisions inside live window — serving sealed"
+            "Cache miss for provisions inside live window — returning not_found so requester rotates"
         );
         record_sync_response_error("block", "provision_cache_miss");
-        GetBlockResponse::found(ElidedCertifiedBlock::elide(&block, qc, &req.inventory))
-    }
+        return GetBlockResponse::not_found();
+    };
+
+    GetBlockResponse::found(ElidedCertifiedBlock::elide(
+        &block.into_live(Arc::new(provisions.into())),
+        qc,
+        &req.inventory,
+    ))
 }
