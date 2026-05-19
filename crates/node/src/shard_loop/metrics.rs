@@ -29,7 +29,7 @@ use hyperscale_metrics::{
     set_sync_in_progress, set_sync_round_in_flight, set_view_changes, set_view_syncs,
 };
 use hyperscale_network::Network;
-use hyperscale_storage::{ChainWriter, Storage};
+use hyperscale_storage::Storage;
 use hyperscale_types::{ShardGroupId, ValidatorId};
 
 use crate::host::NodeHost;
@@ -99,10 +99,15 @@ impl MetricsSnapshot {
 /// Record a [`MetricsSnapshot`] to the metrics backend.
 ///
 /// Iterates the per-shard and per-vnode maps and emits one labeled gauge
-/// per entry. Process-wide readouts (memory, `RocksDB` properties) come
-/// from the primary shard/vnode. Designed to run off the pinned thread
-/// via `spawn_blocking`.
-pub fn record_metrics<S: ChainWriter>(snapshot: MetricsSnapshot, storage: &S) {
+/// per entry. Process-wide `RocksDB` readouts (block-cache, memtable
+/// bytes) come from `rocksdb_block_cache_bytes` / `rocksdb_memtable_bytes`,
+/// summed across hosted shards by the caller. Designed to run off the
+/// pinned thread via `spawn_blocking`.
+pub fn record_metrics(
+    snapshot: MetricsSnapshot,
+    rocksdb_block_cache_bytes: u64,
+    rocksdb_memtable_bytes: u64,
+) {
     for (shard_id, shard) in &snapshot.shards {
         let s = shard_id.inner();
         set_sync_blocks_behind("block", s, shard.blocks_behind);
@@ -130,11 +135,9 @@ pub fn record_metrics<S: ChainWriter>(snapshot: MetricsSnapshot, storage: &S) {
         set_backpressure_active(s, v, vnode.backpressure_active);
     }
 
-    // RocksDB property queries — potentially slow under compaction pressure.
-    let (rocksdb_bc, rocksdb_mt) = storage.memory_usage_bytes();
     let mut memory = snapshot.memory;
-    memory.rocksdb_block_cache_usage_bytes = rocksdb_bc;
-    memory.rocksdb_memtable_usage_bytes = rocksdb_mt;
+    memory.rocksdb_block_cache_usage_bytes = rocksdb_block_cache_bytes;
+    memory.rocksdb_memtable_usage_bytes = rocksdb_memtable_bytes;
     set_memory_metrics(&memory);
 }
 
