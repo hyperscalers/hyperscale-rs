@@ -45,6 +45,7 @@ mod tests {
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
     use crossbeam::channel::unbounded;
+    use hyperscale_types::ShardGroupId;
     use quick_cache::sync::Cache;
     use serde_json::from_slice;
     use tower::ServiceExt;
@@ -78,7 +79,8 @@ mod tests {
             }))),
             tx_submission_tx,
             start_time: Instant::now(),
-            tx_status_cache: Arc::new(Cache::new(1000)),
+            tx_status_caches: std::iter::once((ShardGroupId::new(0), Arc::new(Cache::new(1000))))
+                .collect(),
             mempool_snapshot: Arc::new(ArcSwap::new(Arc::new(MempoolSnapshot::default()))),
             sync_backpressure_threshold: Some(10),
         }

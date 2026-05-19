@@ -489,13 +489,11 @@ impl ProductionRunnerBuilder {
             tx_validator,
         );
 
-        // The status RPC surface exposes the primary shard's cache.
+        // The status RPC surface probes every hosted shard's cache so a
+        // tx that lands on any of them shows up — cross-shard packed has
+        // a vnode in every shard, and a single primary entry would hide
+        // half the txs.
         let tx_status_caches = io_loop.tx_status_caches();
-        let tx_status_cache = Arc::clone(
-            tx_status_caches
-                .get(&primary_shard)
-                .expect("primary shard hosted by IoLoop"),
-        );
 
         Ok(ProductionRunner {
             io_loop: Some(io_loop),
@@ -518,7 +516,7 @@ impl ProductionRunnerBuilder {
             genesis_config: self.genesis_config,
             primary_shard,
             local_shards,
-            tx_status_cache,
+            tx_status_caches,
             shutdown_rx: Some(shutdown_rx),
             shutdown_tx: Some(shutdown_tx),
         })
@@ -590,8 +588,11 @@ pub struct ProductionRunner {
     /// Optional genesis configuration for initial state.
     genesis_config: Option<GenesisConfig>,
 
-    /// Transaction status cache, shared from `IoLoop` for lock-free RPC queries.
-    tx_status_cache: Arc<QuickCache<TxHash, TransactionStatus>>,
+    /// Per-shard transaction status caches, shared from `IoLoop` for
+    /// lock-free RPC queries. One entry per hosted shard; the RPC
+    /// handler probes every entry on a status lookup since a tx may
+    /// have landed on any of the hosted shards.
+    tx_status_caches: HashMap<ShardGroupId, Arc<QuickCache<TxHash, TransactionStatus>>>,
 
     /// Shutdown signal receiver (external shutdown request).
     shutdown_rx: Option<oneshot::Receiver<()>>,
@@ -634,14 +635,20 @@ impl ProductionRunner {
         self.primary_shard
     }
 
-    /// Get the transaction status cache shared from `IoLoop`.
+    /// Get the per-shard transaction status caches shared from `IoLoop`.
     ///
-    /// This `Arc<QuickCache>` is the same instance used by `IoLoop` on the
-    /// pinned thread. It can be passed directly to the RPC server for
-    /// lock-free status queries.
+    /// One `Arc<QuickCache>` per hosted shard, same instances used by
+    /// `IoLoop` on the pinned thread. Passed directly to the RPC server,
+    /// which probes every entry on a status lookup since a tx may have
+    /// landed on any of the hosted shards.
     #[must_use]
-    pub fn tx_status_cache(&self) -> Arc<QuickCache<TxHash, TransactionStatus>> {
-        Arc::clone(&self.tx_status_cache)
+    pub fn tx_status_caches(
+        &self,
+    ) -> HashMap<ShardGroupId, Arc<QuickCache<TxHash, TransactionStatus>>> {
+        self.tx_status_caches
+            .iter()
+            .map(|(s, c)| (*s, Arc::clone(c)))
+            .collect()
     }
 
     /// Get a crossbeam sender for submitting consensus events.

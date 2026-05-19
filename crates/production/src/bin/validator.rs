@@ -1252,7 +1252,7 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
     // RPC-submitted transactions flow through this channel: gossip to all
     // relevant shards, validate via the shared batcher, dispatch to mempool.
     let tx_submission_sender = runner.tx_submission_sender();
-    let rpc_tx_status_cache = runner.tx_status_cache();
+    let rpc_tx_status_caches = runner.tx_status_caches();
 
     let rpc_handle = if config.metrics.enabled {
         let rpc_config = RpcServerConfig {
@@ -1272,7 +1272,7 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
             rpc_sync_status,
             rpc_node_status.clone(),
             tx_submission_sender,
-            rpc_tx_status_cache,
+            rpc_tx_status_caches,
             rpc_mempool_snapshot,
         );
         let handle = rpc_server

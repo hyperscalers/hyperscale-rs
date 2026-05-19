@@ -40,11 +40,15 @@ pub struct RpcState {
     pub tx_submission_tx: TxSubmissionSender,
     /// Server start time for uptime calculation.
     pub start_time: Instant,
-    /// Transaction status cache for querying transaction state.
+    /// Per-shard transaction status caches for querying transaction state.
     ///
-    /// Shared directly from `IoLoop`'s internal `QuickCache` — writes happen on
-    /// the pinned thread, reads happen here on the RPC thread, no locking needed.
-    pub tx_status_cache: Arc<QuickCache<TxHash, TransactionStatus>>,
+    /// One entry per hosted shard, shared directly from `IoLoop`'s
+    /// internal `QuickCache` instances — writes happen on the pinned
+    /// thread, reads happen here on the RPC thread, no locking needed.
+    /// Status lookup probes every entry: a tx may have landed on any
+    /// hosted shard, and under cross-shard packed a single primary
+    /// entry would hide half the txs.
+    pub tx_status_caches: HashMap<ShardGroupId, Arc<QuickCache<TxHash, TransactionStatus>>>,
     /// Mempool snapshot for querying mempool stats.
     pub mempool_snapshot: Arc<ArcSwap<MempoolSnapshot>>,
     /// Number of blocks behind before rejecting transaction submissions.
@@ -52,6 +56,16 @@ pub struct RpcState {
     /// When set and the node is this many blocks behind, new transaction
     /// submissions are rejected to allow the node to catch up.
     pub sync_backpressure_threshold: Option<u64>,
+}
+
+impl RpcState {
+    /// Look up `hash` in every hosted shard's status cache. Returns the
+    /// first match. A given tx hash lives in at most one shard's cache,
+    /// so iteration order doesn't matter.
+    #[must_use]
+    pub fn lookup_tx_status(&self, hash: &TxHash) -> Option<TransactionStatus> {
+        self.tx_status_caches.values().find_map(|c| c.get(hash))
+    }
 }
 
 /// Snapshot of mempool state for RPC queries.

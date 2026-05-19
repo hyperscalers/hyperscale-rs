@@ -1,5 +1,6 @@
 //! RPC server implementation.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -7,7 +8,7 @@ use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use axum::serve;
-use hyperscale_types::{TransactionStatus, TxHash};
+use hyperscale_types::{ShardGroupId, TransactionStatus, TxHash};
 use quick_cache::sync::Cache as QuickCache;
 use thiserror::Error;
 use tokio::net::TcpListener;
@@ -64,8 +65,9 @@ pub struct RpcServerHandle {
     sync_status: Arc<ArcSwap<SyncStatus>>,
     /// Node status provider for updates.
     node_status: Arc<ArcSwap<NodeStatusState>>,
-    /// Transaction status cache (shared from `IoLoop`'s `QuickCache`).
-    tx_status_cache: Arc<QuickCache<TxHash, TransactionStatus>>,
+    /// Per-shard transaction status caches (shared from `IoLoop`'s
+    /// `QuickCache` instances, one per hosted shard).
+    tx_status_caches: HashMap<ShardGroupId, Arc<QuickCache<TxHash, TransactionStatus>>>,
     /// Mempool snapshot for updates.
     mempool_snapshot: Arc<ArcSwap<MempoolSnapshot>>,
 }
@@ -88,10 +90,12 @@ impl RpcServerHandle {
         &self.node_status
     }
 
-    /// Get a reference to the transaction status cache.
+    /// Get a reference to the per-shard transaction status caches.
     #[must_use]
-    pub const fn tx_status_cache(&self) -> &Arc<QuickCache<TxHash, TransactionStatus>> {
-        &self.tx_status_cache
+    pub const fn tx_status_caches(
+        &self,
+    ) -> &HashMap<ShardGroupId, Arc<QuickCache<TxHash, TransactionStatus>>> {
+        &self.tx_status_caches
     }
 
     /// Get a reference to the mempool snapshot for updates.
@@ -128,12 +132,12 @@ impl RpcServer {
     ///
     /// * `config` - Server configuration
     /// * `tx_submission_tx` - Crossbeam channel to submit transactions directly to `IoLoop`
-    /// * `tx_status_cache` - Transaction status cache shared from `IoLoop`
+    /// * `tx_status_caches` - Per-shard transaction status caches shared from `IoLoop`
     #[must_use]
     pub fn new(
         config: RpcServerConfig,
         tx_submission_tx: TxSubmissionSender,
-        tx_status_cache: Arc<QuickCache<TxHash, TransactionStatus>>,
+        tx_status_caches: HashMap<ShardGroupId, Arc<QuickCache<TxHash, TransactionStatus>>>,
     ) -> Self {
         let sync_backpressure_threshold = config.sync_backpressure_threshold;
         let state = RpcState {
@@ -142,7 +146,7 @@ impl RpcServer {
             node_status: Arc::new(ArcSwap::new(Arc::new(NodeStatusState::default()))),
             tx_submission_tx,
             start_time: Instant::now(),
-            tx_status_cache,
+            tx_status_caches,
             mempool_snapshot: Arc::new(ArcSwap::new(Arc::new(MempoolSnapshot::default()))),
             sync_backpressure_threshold,
         };
@@ -161,7 +165,7 @@ impl RpcServer {
         sync_status: Arc<ArcSwap<SyncStatus>>,
         node_status: Arc<ArcSwap<NodeStatusState>>,
         tx_submission_tx: TxSubmissionSender,
-        tx_status_cache: Arc<QuickCache<TxHash, TransactionStatus>>,
+        tx_status_caches: HashMap<ShardGroupId, Arc<QuickCache<TxHash, TransactionStatus>>>,
         mempool_snapshot: Arc<ArcSwap<MempoolSnapshot>>,
     ) -> Self {
         let sync_backpressure_threshold = config.sync_backpressure_threshold;
@@ -171,7 +175,7 @@ impl RpcServer {
             node_status,
             tx_submission_tx,
             start_time: Instant::now(),
-            tx_status_cache,
+            tx_status_caches,
             mempool_snapshot,
             sync_backpressure_threshold,
         };
@@ -190,7 +194,7 @@ impl RpcServer {
         let ready_flag = self.state.ready.clone();
         let sync_status = self.state.sync_status.clone();
         let node_status = self.state.node_status.clone();
-        let tx_status_cache = self.state.tx_status_cache.clone();
+        let tx_status_caches = self.state.tx_status_caches.clone();
         let mempool_snapshot = self.state.mempool_snapshot.clone();
 
         let router = create_router(self.state);
@@ -209,7 +213,7 @@ impl RpcServer {
             ready_flag,
             sync_status,
             node_status,
-            tx_status_cache,
+            tx_status_caches,
             mempool_snapshot,
         })
     }
@@ -244,8 +248,9 @@ mod tests {
     async fn test_server_creation() {
         let config = RpcServerConfig::default();
         let (tx_submission_tx, _rx) = unbounded();
-        let tx_status_cache = Arc::new(QuickCache::new(1000));
-        let server = RpcServer::new(config, tx_submission_tx, tx_status_cache);
+        let tx_status_caches =
+            std::iter::once((ShardGroupId::new(0), Arc::new(QuickCache::new(1000)))).collect();
+        let server = RpcServer::new(config, tx_submission_tx, tx_status_caches);
 
         // Server should be created successfully
         assert!(!server.state.ready.load(Ordering::SeqCst));
