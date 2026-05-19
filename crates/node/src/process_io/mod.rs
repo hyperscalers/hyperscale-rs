@@ -10,14 +10,14 @@
 
 mod network_handlers;
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use crossbeam::channel::Sender;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{Engine, TransactionValidation};
 use hyperscale_storage::Storage;
-use hyperscale_types::ShardGroupId;
+use hyperscale_types::{RoutableTransaction, ShardGroupId, shard_for_node};
 
 use crate::event::ShardEvent;
 use crate::shard_loop::{DispatchHandles, SharedTopologySnapshot};
@@ -106,4 +106,60 @@ where
             .get(&shard)
             .unwrap_or_else(|| panic!("shard {shard:?} not hosted by this ProcessIo"))
     }
+
+    /// Compute the cross-shard admission plan for a locally-submitted
+    /// transaction. The first hosted touched shard becomes the gossip
+    /// source — it receives the full `touched_shards` list so it can
+    /// enqueue outbound gossip for each destination (hosted or not).
+    /// Other hosted touched shards only admit.
+    ///
+    /// If no hosted shard is touched, the gossip still goes out via
+    /// some hosted shard (any shard's `outbound_gossip_batches` works —
+    /// the wire shape carries no source identity).
+    pub(crate) fn compute_submit_fanout(&self, tx: &RoutableTransaction) -> SubmitFanout {
+        let num_shards = self.topology_snapshot.load().num_shards();
+        let touched_shards: Vec<ShardGroupId> = tx
+            .declared_reads()
+            .iter()
+            .chain(tx.declared_writes().iter())
+            .map(|node_id| shard_for_node(node_id, num_shards))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+
+        let mut hosted_touched = self
+            .shard_event_senders
+            .keys()
+            .copied()
+            .filter(|s| touched_shards.contains(s));
+        let source_shard = hosted_touched
+            .next()
+            .or_else(|| self.shard_event_senders.keys().copied().next());
+        let other_hosted: Vec<ShardGroupId> = hosted_touched.collect();
+
+        SubmitFanout {
+            touched_shards,
+            source_shard,
+            other_hosted,
+        }
+    }
+}
+
+/// Routing decision for a locally-submitted transaction. Returned by
+/// [`ProcessIo::compute_submit_fanout`]; consumed by `NodeHost` (sim)
+/// or the production routing thread.
+pub struct SubmitFanout {
+    /// Every shard the tx touches (declared reads ∪ writes). Used as
+    /// the `touched_shards` payload of
+    /// [`ShardScopedInput::AdmitAndGossipTransaction`] so the source
+    /// shard knows where to send outbound gossip.
+    ///
+    /// [`ShardScopedInput::AdmitAndGossipTransaction`]: crate::event::ShardScopedInput::AdmitAndGossipTransaction
+    pub touched_shards: Vec<ShardGroupId>,
+    /// Hosted shard chosen as the gossip source, or `None` if the
+    /// node hosts no shards at all (impossible by construction —
+    /// `NodeHost::new` asserts at least one hosted shard).
+    pub source_shard: Option<ShardGroupId>,
+    /// Hosted touched shards other than the source — admit-only.
+    pub other_hosted: Vec<ShardGroupId>,
 }

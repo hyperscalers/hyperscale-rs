@@ -21,7 +21,7 @@ use hyperscale_engine::Engine;
 use hyperscale_network::Network;
 use hyperscale_storage::Storage;
 use hyperscale_types::network::gossip::TransactionGossip;
-use hyperscale_types::{RoutableTransaction, ShardGroupId, TxHash, shard_for_node};
+use hyperscale_types::{RoutableTransaction, ShardGroupId, TxHash};
 
 use crate::batch_accumulator::BatchAccumulator;
 use crate::host::NodeHost;
@@ -226,43 +226,27 @@ where
     D: Dispatch,
     E: Engine,
 {
-    /// Locally-submitted transaction (RPC/sim): compute the set of shards
-    /// the tx touches, then route admission to each hosted touched shard
-    /// via `ShardLoop::step()`. The first hosted touched shard becomes
-    /// the gossip source — it receives an
-    /// [`ShardScopedInput::AdmitAndGossipTransaction`] carrying the
-    /// full `touched_shards` list so it can enqueue outbound gossip to
-    /// each destination (hosted or not). Other hosted touched shards
-    /// receive [`ShardScopedInput::AdmitTransaction`] (admit only).
+    /// Locally-submitted transaction (sim): compute the routing decision
+    /// via [`ProcessIo::compute_submit_fanout`] and apply it synchronously
+    /// — each touched hosted shard's `step()` runs in this call frame.
     ///
-    /// If no hosted shard touches this tx, gossip still goes out via
-    /// the first hosted shard (any shard's `outbound_gossip_batches`
-    /// works — the wire shape carries no source identity).
+    /// Production's RPC ingestion thread reuses
+    /// [`ProcessIo::compute_submit_fanout`] but applies the decision via
+    /// `process.shard_event_senders` so cross-thread fan-out doesn't
+    /// require a `&mut NodeHost`.
+    ///
+    /// [`ProcessIo::compute_submit_fanout`]: crate::process_io::ProcessIo::compute_submit_fanout
     pub(crate) fn handle_submit_transaction(&mut self, tx: &Arc<RoutableTransaction>) {
-        let num_shards = self.process.topology_snapshot.load().num_shards();
-        let touched_shards: Vec<ShardGroupId> = tx
-            .declared_reads()
-            .iter()
-            .chain(tx.declared_writes().iter())
-            .map(|node_id| shard_for_node(node_id, num_shards))
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect();
+        let fanout = self.process.compute_submit_fanout(tx);
 
-        let mut hosted_touched = self.hosted_shards().filter(|s| touched_shards.contains(s));
-        let source_shard = hosted_touched
-            .next()
-            .or_else(|| self.hosted_shards().next());
-        let other_hosted: Vec<ShardGroupId> = hosted_touched.collect();
-
-        if let Some(source) = source_shard {
+        if let Some(source) = fanout.source_shard {
             self.shard_loop_mut(source)
                 .step(ShardScopedInput::AdmitAndGossipTransaction {
                     tx: Arc::clone(tx),
-                    touched_shards,
+                    touched_shards: fanout.touched_shards,
                 });
         }
-        for shard in other_hosted {
+        for shard in fanout.other_hosted {
             self.shard_loop_mut(shard)
                 .step(ShardScopedInput::AdmitTransaction { tx: Arc::clone(tx) });
         }
