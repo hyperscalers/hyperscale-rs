@@ -21,6 +21,7 @@ use hyperscale_types::{
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
+use crate::committed_tombstones::CommittedProvisionTombstones;
 use crate::expected::{ExpectedProvisionTracker, TimeoutEffect};
 use crate::pipeline::ProvisionPipeline;
 use crate::queue::QueuedProvisionBuffer;
@@ -107,13 +108,23 @@ pub struct ProvisionCoordinator {
     expected: ExpectedProvisionTracker,
 
     // ═══════════════════════════════════════════════════════════════════
-    // Proposal Queue + Tombstones
+    // Proposal Queue
     // ═══════════════════════════════════════════════════════════════════
     /// Verified provisions eligible for inclusion in the next block
     /// proposal, gated by a configured dwell window so peers have time to
-    /// receive the same provisions via gossip. Tombstones for committed
-    /// provisions gate duplicate gossip after commit.
+    /// receive the same provisions via gossip.
     queue: QueuedProvisionBuffer,
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Committed-Provision Tombstones
+    // ═══════════════════════════════════════════════════════════════════
+    /// Content-hash tombstones for batches already committed locally.
+    /// Mirrors the BFT-side `CommitDedupIndex::provision_retention`
+    /// window so a late re-arrival can't slip past the
+    /// `(source_shard, block_height)`-keyed pipeline guards and
+    /// re-enter the proposer queue (which would then propose a batch
+    /// the validator side rejects, causing view changes).
+    committed_tombstones: CommittedProvisionTombstones,
 }
 
 impl std::fmt::Debug for ProvisionCoordinator {
@@ -158,6 +169,7 @@ impl ProvisionCoordinator {
             pipeline: ProvisionPipeline::new(store),
             expected: ExpectedProvisionTracker::new(),
             queue,
+            committed_tombstones: CommittedProvisionTombstones::new(),
         }
     }
 
@@ -182,10 +194,14 @@ impl ProvisionCoordinator {
     ///    reads `local_ts`.
     /// 2. `queue.on_block_committed` drops committed provisions from the
     ///    proposer queue so we don't re-include them next round.
-    /// 3. Orphan cleanup evicts expectations whose fallback never resolved
+    /// 3. `committed_tombstones.register` mirrors the BFT
+    ///    `CommitDedupIndex` window so a late re-arrival can't slip past
+    ///    `pipeline.verified` (which evicts at `source_block_ts +
+    ///    RETENTION_HORIZON`) and re-enter the queue.
+    /// 4. Orphan cleanup evicts expectations whose fallback never resolved
     ///    and prunes their matching headers.
-    /// 4. `drop_past_deadline` sweeps verified entries past their deadline.
-    /// 5. Timeout sweep emits fallback fetches for late expectations.
+    /// 5. `drop_past_deadline` sweeps verified entries past their deadline.
+    /// 6. Timeout sweep emits fallback fetches for late expectations.
     pub fn on_block_committed(&mut self, certified: &CertifiedBlock) -> Vec<Action> {
         let mut actions: Vec<Action> = Vec::new();
         let block = certified.block();
@@ -194,14 +210,18 @@ impl ProvisionCoordinator {
         let local_ts = self.expected.local_ts();
 
         // Drop provisions committed in this block from the proposer queue
-        // so we don't re-include the same provisions in the next proposal.
-        // Re-admission of already-committed batches is rejected upstream by
-        // BFT validation (`validate_no_duplicate_provisions`) and at receipt
-        // by the `deadline <= local_ts` check, so no separate tombstone is
-        // needed here.
+        // so we don't re-include the same provisions in the next proposal,
+        // and tombstone them so a late re-arrival (gossip retransmit,
+        // fetch fall-through, range-sync delivery) is dropped at receipt
+        // rather than re-entering the queue and forcing a view change at
+        // the BFT validation gate.
         let committed: std::collections::HashSet<ProvisionHash> =
             block.provisions().iter().map(|p| p.hash()).collect();
         self.queue.on_block_committed(&committed);
+        for batch in block.provisions() {
+            self.committed_tombstones.register(batch.hash(), new_ts);
+        }
+        self.committed_tombstones.prune(new_ts);
 
         // Single retention cutoff for the orphan sweep — `local_ts -
         // RETENTION_HORIZON` is the conservative point past which any
@@ -357,6 +377,14 @@ impl ProvisionCoordinator {
             let local_ts = self.expected.local_ts();
             let source_block_ts = committed_header.qc().weighted_timestamp();
             for provisions in drained {
+                if self.committed_tombstones.contains(&provisions.hash()) {
+                    debug!(
+                        shard = shard.inner(),
+                        height = height.inner(),
+                        "Dropping drained provisions: already committed"
+                    );
+                    continue;
+                }
                 if provisions.deadline(source_block_ts) <= local_ts {
                     debug!(
                         shard = shard.inner(),
@@ -426,12 +454,21 @@ impl ProvisionCoordinator {
             return vec![];
         }
 
+        // Drop re-arrivals of already-committed batches. Mirrors the
+        // BFT `CommitDedupIndex` window so a late delivery (gossip
+        // retransmit, fetch fall-through, range-sync) can't slip past
+        // the `(source_shard, block_height)`-keyed pipeline guards
+        // after they've evicted at `source_block_ts + RETENTION_HORIZON`
+        // — the BFT window runs to `local_committed_ts +
+        // RETENTION_HORIZON`, which is strictly later.
+        if self.committed_tombstones.contains(&provisions.hash()) {
+            return vec![];
+        }
+
         let key = (source_shard, block_height);
 
         // Skip if this key was already verified (duplicate gossip/fetch) —
         // avoids re-dispatching verification work for stale duplicates.
-        // Re-admission of already-committed batches is rejected upstream
-        // by BFT validation and at the deadline check below.
         if self.pipeline.has_verified(key) {
             return vec![];
         }
@@ -1575,6 +1612,203 @@ mod tests {
         // `ProvisionsAdmitted` interception drives any in-flight fetch
         // admission downstream.
         assert_eq!(coordinator.expected.len(), 0);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Committed-provision tombstone (re-admission protection)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Build a `CertifiedBlock` at `height` carrying a single provisions
+    /// batch — needed to exercise `on_block_committed`'s tombstone path
+    /// which reads `block.provisions()`.
+    fn make_block_with_provisions(
+        height: BlockHeight,
+        provisions: Arc<Provisions>,
+    ) -> CertifiedBlock {
+        let header = BlockHeader::new(
+            ShardGroupId::new(0),
+            height,
+            BlockHash::from_raw(Hash::from_bytes(&[0u8; 32])),
+            QuorumCertificate::genesis(ShardGroupId::new(0)),
+            ValidatorId::new(0),
+            ProposerTimestamp::ZERO,
+            Round::INITIAL,
+            false,
+            StateRoot::ZERO,
+            TransactionRoot::ZERO,
+            CertificateRoot::ZERO,
+            LocalReceiptRoot::ZERO,
+            ProvisionsRoot::ZERO,
+            Vec::new(),
+            std::collections::BTreeMap::new(),
+            InFlightCount::ZERO,
+        );
+        let block = Block::Live {
+            header,
+            transactions: Arc::new(BoundedVec::new()),
+            certificates: Arc::new(BoundedVec::new()),
+            provisions: Arc::new(BoundedVec::from(vec![provisions])),
+        };
+        let qc = QuorumCertificate::new(
+            block.hash(),
+            ShardGroupId::new(0),
+            BlockHeight::new(0),
+            BlockHash::ZERO,
+            Round::INITIAL,
+            SignerBitfield::empty(),
+            zero_bls_signature(),
+            WeightedTimestamp::from_millis(height.inner() * TEST_BLOCK_INTERVAL_MS),
+        );
+        CertifiedBlock::new_unchecked(block, qc)
+    }
+
+    /// Regression: under cross-shard packed hosting, the local-serve
+    /// fall-through in `Network::request` re-routes a fetch through a
+    /// peer when the co-located vnode's local store has aged out the
+    /// requested batch. Without the tombstone, that wire arrival lands
+    /// in `on_state_provisions_received` past `pipeline.verified`'s
+    /// `source_block_ts + RETENTION_HORIZON` eviction, sails through the
+    /// `has_verified` guard, re-enters the proposer queue, and the next
+    /// proposal includes a batch the BFT
+    /// `validate_no_duplicate_provisions` window still rejects —
+    /// triggering a view-change loop.
+    #[test]
+    fn test_committed_tombstone_drops_re_arrival_after_pipeline_eviction() {
+        let topology = make_test_topology(ShardGroupId::new(0));
+        let mut coordinator = ProvisionCoordinator::new();
+
+        // Prime the local clock so the expected-provision entry stamps a
+        // real baseline rather than the zero sentinel.
+        coordinator.on_block_committed(&make_block(BlockHeight::new(1)));
+
+        let source_shard = ShardGroupId::new(1);
+        let source_height = BlockHeight::new(10);
+        let tx_hash = TxHash::from_raw(Hash::from_bytes(b"tx1"));
+        let provisions =
+            make_provisions(tx_hash, source_shard, ShardGroupId::new(0), source_height);
+        let provisions_hash = provisions.hash();
+
+        // Header arrives — its QC carries ts=0 (`make_committed_header_*`
+        // hard-codes `WeightedTimestamp::ZERO`), so `pipeline.verified`
+        // evicts at `local_ts > 0 + RETENTION_HORIZON`.
+        let header = make_committed_header_committing(
+            source_shard,
+            source_height,
+            ShardGroupId::new(0),
+            &[tx_hash],
+        );
+        coordinator.on_verified_remote_header(&topology, &header);
+
+        // First arrival → queued.
+        coordinator.on_state_provisions_received(&topology, provisions.clone());
+        coordinator.on_state_provisions_verified(
+            Arc::new(provisions.clone()),
+            Some(&header),
+            true,
+            LocalTimestamp::ZERO,
+        );
+        assert_eq!(coordinator.queue.queue_len(), 1);
+
+        // Walk forward many blocks before committing the batch, so the
+        // local-commit-ts anchor for the tombstone sits well after the
+        // source-block-ts anchor for `pipeline.verified`. Without this
+        // gap the two evict at near-identical local-ts values and the
+        // race window the tombstone closes wouldn't be observable in a
+        // unit test.
+        for h in 2..=100 {
+            coordinator.on_block_committed(&make_block(BlockHeight::new(h)));
+        }
+
+        // Commit a block containing this batch at h=101 — queue drains,
+        // tombstone registers anchored on this block's commit ts
+        // (~50_500ms with TEST_BLOCK_INTERVAL_MS=500).
+        let commit_h = BlockHeight::new(101);
+        let committing_block = make_block_with_provisions(commit_h, Arc::new(provisions.clone()));
+        coordinator.on_block_committed(&committing_block);
+        assert_eq!(coordinator.queue.queue_len(), 0);
+        assert!(coordinator.committed_tombstones.contains(&provisions_hash));
+
+        // Walk to a height where `pipeline.verified` (deadline = 0 +
+        // RETENTION_HORIZON) has evicted but the tombstone (deadline =
+        // commit_ts + RETENTION_HORIZON) is still live. Pick the
+        // midpoint: `RETENTION_HORIZON_blocks + commit_h/2`.
+        let retention_blocks = u64::try_from(RETENTION_HORIZON.as_millis()).unwrap_or(u64::MAX)
+            / TEST_BLOCK_INTERVAL_MS;
+        let mid_h = retention_blocks + commit_h.inner() / 2;
+        for h in 102..=mid_h {
+            coordinator.on_block_committed(&make_block(BlockHeight::new(h)));
+        }
+        assert_eq!(
+            coordinator.pipeline.verified_len(),
+            0,
+            "pipeline.verified should have evicted by now"
+        );
+        assert!(
+            coordinator.committed_tombstones.contains(&provisions_hash),
+            "tombstone should outlive pipeline.verified eviction"
+        );
+
+        // Late re-arrival (e.g. fetch fall-through, gossip retransmit).
+        // The tombstone must drop it before it reaches the verify path
+        // and re-enters the queue.
+        let actions = coordinator.on_state_provisions_received(&topology, provisions);
+        assert!(actions.is_empty(), "re-arrival should be dropped silently");
+        assert_eq!(
+            coordinator.queue.queue_len(),
+            0,
+            "re-arrival must not re-enter the proposer queue"
+        );
+    }
+
+    #[test]
+    fn test_committed_tombstone_drops_pending_drain_re_arrival() {
+        // Variant: provisions arrive twice while header is missing
+        // (buffered as pending). After the first pair commits, a later
+        // header re-arrival drains pending — the drain path must check
+        // the tombstone too.
+        let topology = make_test_topology(ShardGroupId::new(0));
+        let mut coordinator = ProvisionCoordinator::new();
+
+        coordinator.on_block_committed(&make_block(BlockHeight::new(1)));
+
+        let source_shard = ShardGroupId::new(1);
+        let source_height = BlockHeight::new(10);
+        let tx_hash = TxHash::from_raw(Hash::from_bytes(b"tx1"));
+        let provisions =
+            make_provisions(tx_hash, source_shard, ShardGroupId::new(0), source_height);
+        let provisions_hash = provisions.hash();
+
+        let header = make_committed_header_committing(
+            source_shard,
+            source_height,
+            ShardGroupId::new(0),
+            &[tx_hash],
+        );
+
+        // First lifecycle: header, receive, verify, commit.
+        coordinator.on_verified_remote_header(&topology, &header);
+        coordinator.on_state_provisions_received(&topology, provisions.clone());
+        coordinator.on_state_provisions_verified(
+            Arc::new(provisions.clone()),
+            Some(&header),
+            true,
+            LocalTimestamp::ZERO,
+        );
+        let committing_block =
+            make_block_with_provisions(BlockHeight::new(2), Arc::new(provisions.clone()));
+        coordinator.on_block_committed(&committing_block);
+        assert!(coordinator.committed_tombstones.contains(&provisions_hash));
+
+        // Second lifecycle: provisions re-arrive before any header (so
+        // they buffer as pending). Then header re-arrives (e.g. via a
+        // sync replay) and the drain path inspects each buffered entry.
+        coordinator.on_state_provisions_received(&topology, provisions);
+        let actions = coordinator.on_verified_remote_header(&topology, &header);
+        assert!(
+            actions.is_empty(),
+            "drained pending should be dropped by tombstone — no verify action"
+        );
+        assert_eq!(coordinator.queue.queue_len(), 0);
     }
 
     #[test]

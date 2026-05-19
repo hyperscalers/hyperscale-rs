@@ -16,6 +16,7 @@
 //!    downstream transaction execution.
 
 pub mod action_handlers;
+mod committed_tombstones;
 mod coordinator;
 mod expected;
 mod outbound;
