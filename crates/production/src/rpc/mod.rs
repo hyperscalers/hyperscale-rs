@@ -36,5 +36,8 @@ pub(crate) mod state;
 mod types;
 
 pub use server::{RpcServer, RpcServerConfig, RpcServerHandle};
-pub use state::{MempoolSnapshot, NodeStatusState, RpcState, VnodeMempoolStats, VnodeStatusEntry};
+pub use state::{
+    MempoolSnapshot, NodeStatusState, RpcState, TxSubmissionSender, VnodeMempoolStats,
+    VnodeStatusEntry,
+};
 pub use types::*;

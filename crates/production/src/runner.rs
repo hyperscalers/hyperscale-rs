@@ -74,7 +74,8 @@ use hyperscale_storage_rocksdb::{RocksDbStorage, SharedStorage};
 use hyperscale_topology::TopologyCoordinator;
 use hyperscale_types::{
     Block, BlockHeight, Bls12381G1PrivateKey, CertifiedBlock, LocalTimestamp, NodeId,
-    QuorumCertificate, ShardGroupId, TransactionStatus, TxHash, ValidatorId, shard_for_node,
+    QuorumCertificate, RoutableTransaction, ShardGroupId, TransactionStatus, TxHash, ValidatorId,
+    shard_for_node,
 };
 use libp2p::identity::Keypair;
 use quick_cache::sync::Cache as QuickCache;
@@ -86,7 +87,9 @@ use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval, sleep};
 use tracing::{debug, info, warn};
 
-use crate::rpc::{MempoolSnapshot, NodeStatusState, VnodeMempoolStats, VnodeStatusEntry};
+use crate::rpc::{
+    MempoolSnapshot, NodeStatusState, TxSubmissionSender, VnodeMempoolStats, VnodeStatusEntry,
+};
 use crate::status::SyncStatus;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -389,7 +392,6 @@ impl ProductionRunnerBuilder {
 
         let (xb_timer_tx, xb_timer_rx) = unbounded();
         let (xb_callback_tx, xb_callback_rx) = unbounded();
-        let (xb_consensus_tx, xb_consensus_rx) = unbounded();
         let (xb_shutdown_tx, xb_shutdown_rx) = unbounded();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
@@ -518,12 +520,10 @@ impl ProductionRunnerBuilder {
         Ok(ProductionRunner {
             io_loop: Some(io_loop),
             xb_timer_tx,
-            xb_consensus_tx,
             xb_callback_tx,
             xb_shutdown_tx,
             xb_timer_rx: Some(xb_timer_rx),
             xb_callback_rx: Some(xb_callback_rx),
-            xb_consensus_rx: Some(xb_consensus_rx),
             xb_shutdown_rx: Some(xb_shutdown_rx),
             network: adapter,
             topology_snapshot: topology,
@@ -559,8 +559,6 @@ pub struct ProductionRunner {
     /// Timer events to pinned thread (for external timer injection if needed).
     #[allow(dead_code)]
     xb_timer_tx: Sender<ShardEvent>,
-    /// Consensus events to pinned thread (from libp2p adapter routing).
-    xb_consensus_tx: Sender<ShardEvent>,
     /// Kept alive solely to prevent the crossbeam callback channel from closing.
     #[allow(dead_code)]
     xb_callback_tx: Sender<ShardEvent>,
@@ -571,8 +569,6 @@ pub struct ProductionRunner {
     xb_timer_rx: Option<Receiver<ShardEvent>>,
     /// Callback receiver (moved to `PinnedLoopConfig`).
     xb_callback_rx: Option<Receiver<ShardEvent>>,
-    /// Consensus receiver (moved to `PinnedLoopConfig`).
-    xb_consensus_rx: Option<Receiver<ShardEvent>>,
     /// Shutdown receiver (moved to `PinnedLoopConfig`).
     xb_shutdown_rx: Option<Receiver<()>>,
 
@@ -657,23 +653,31 @@ impl ProductionRunner {
             .collect()
     }
 
-    /// Get a crossbeam sender for submitting consensus events.
+    /// Build a transaction-submission closure for RPC handlers.
     ///
-    /// Events sent through this sender are forwarded to the pinned `IoLoop`
-    /// thread via the crossbeam consensus channel.
-    #[must_use]
-    pub fn event_sender(&self) -> Sender<ShardEvent> {
-        self.xb_consensus_tx.clone()
-    }
-
-    /// Get a sender for RPC transaction submissions.
+    /// The closure captures `Arc<ProcessIo>` plus the per-shard event
+    /// senders; each invocation reads the lock-free topology snapshot,
+    /// computes the touched-shard fanout via
+    /// [`ProcessIo::compute_submit_fanout`], and pushes the resulting
+    /// `AdmitTransaction` / `AdmitAndGossipTransaction` envelopes onto
+    /// the relevant per-shard channels. Returns `true` on success,
+    /// `false` only when every per-shard channel is closed (shutdown).
     ///
-    /// Returns a crossbeam channel sender that feeds directly into the `IoLoop`.
-    /// RPC handlers wrap transactions in `Event::SubmitTransaction` before sending.
-    /// `IoLoop` handles gossip, validation, and mempool dispatch.
+    /// [`ProcessIo::compute_submit_fanout`]: hyperscale_node::process_io::ProcessIo::compute_submit_fanout
+    /// # Panics
+    ///
+    /// Panics if `run()` has already consumed the io-loop. The closure
+    /// captures the `Arc<ProcessIo>` at call time, so build it before
+    /// taking the loop.
     #[must_use]
-    pub fn tx_submission_sender(&self) -> Sender<ShardEvent> {
-        self.xb_consensus_tx.clone()
+    pub fn tx_submission_sender(&self) -> TxSubmissionSender {
+        let process = Arc::clone(
+            self.io_loop
+                .as_ref()
+                .expect("io_loop must exist for tx_submission_sender")
+                .process(),
+        );
+        Arc::new(move |routable: Arc<RoutableTransaction>| process.submit_transaction(&routable))
     }
 
     /// Take the shutdown handle.
@@ -854,10 +858,6 @@ impl ProductionRunner {
                 .xb_callback_rx
                 .take()
                 .expect("callback_rx already taken"),
-            consensus_rx: self
-                .xb_consensus_rx
-                .take()
-                .expect("consensus_rx already taken"),
             shutdown_rx: self
                 .xb_shutdown_rx
                 .take()
@@ -1018,7 +1018,6 @@ struct PinnedLoopConfig {
     timer_tx: Sender<ShardEvent>,
     timer_rx: Receiver<ShardEvent>,
     callback_rx: Receiver<ShardEvent>,
-    consensus_rx: Receiver<ShardEvent>,
     shutdown_rx: Receiver<()>,
     tokio_handle: TokioHandle,
     initial_timer_ops: Vec<TimerOp>,
@@ -1234,14 +1233,16 @@ fn run_pinned_loop(mut io_loop: ProdIoLoop, mut config: PinnedLoopConfig) {
         io_loop.set_time(now);
 
         // ── Priority try_recv cascade ──
+        //
+        // Two channels: `timer_rx` carries scheduled timer fires; everything
+        // else (callbacks, network handlers, RPC fanout) lands on
+        // `callback_rx`. Timer preference matters for liveness — view-change
+        // and cleanup must not queue behind a busy callback channel.
         let event = 'recv: {
             if let Ok(e) = config.timer_rx.try_recv() {
                 break 'recv Some(e);
             }
             if let Ok(e) = config.callback_rx.try_recv() {
-                break 'recv Some(e);
-            }
-            if let Ok(e) = config.consensus_rx.try_recv() {
                 break 'recv Some(e);
             }
 
@@ -1257,7 +1258,6 @@ fn run_pinned_loop(mut io_loop: ProdIoLoop, mut config: PinnedLoopConfig) {
                 }
                 recv(config.timer_rx) -> e => e.ok(),
                 recv(config.callback_rx) -> e => e.ok(),
-                recv(config.consensus_rx) -> e => e.ok(),
                 default(timeout) => None,
             }
         };
@@ -1286,7 +1286,7 @@ fn run_pinned_loop(mut io_loop: ProdIoLoop, mut config: PinnedLoopConfig) {
             let snapshot = io_loop.metrics_snapshot();
             let channel_depths = ChannelDepths {
                 callback: config.callback_rx.len(),
-                consensus: config.consensus_rx.len(),
+                consensus: 0,
                 validated_tx: 0,
                 rpc_tx: 0,
                 status: 0,

@@ -44,20 +44,20 @@ mod tests {
     use arc_swap::ArcSwap;
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
-    use crossbeam::channel::unbounded;
     use hyperscale_types::ShardGroupId;
     use quick_cache::sync::Cache;
     use serde_json::from_slice;
     use tower::ServiceExt;
 
     use super::*;
+    use crate::rpc::state::TxSubmissionSender;
     use crate::rpc::{
         MempoolSnapshot, NodeStatusResponse, NodeStatusState, VnodeMempoolStats, VnodeStatusEntry,
     };
     use crate::status::SyncStatus;
 
     fn create_test_state() -> RpcState {
-        let (tx_submission_tx, _rx) = unbounded();
+        let tx_submission_tx: TxSubmissionSender = Arc::new(|_tx| true);
         RpcState {
             ready: Arc::new(AtomicBool::new(true)),
             sync_status: Arc::new(ArcSwap::new(Arc::new(SyncStatus::default()))),
