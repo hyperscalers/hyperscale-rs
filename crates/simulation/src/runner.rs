@@ -1,6 +1,6 @@
 //! Deterministic simulation runner.
 //!
-//! Uses [`IoLoop`] to process all actions per-node, with the simulation harness
+//! Uses [`NodeHost`] to process all actions per-node, with the simulation harness
 //! controlling event scheduling, network delivery, and time.
 
 use std::collections::{BTreeMap, HashMap};
@@ -41,8 +41,8 @@ use tracing::{debug, info, trace};
 
 use crate::event_queue::EventKey;
 
-/// Type alias for the simulation's concrete `IoLoop`.
-type SimIoLoop = NodeHost<SimStorage, SimNetworkAdapter, SyncDispatch, SimulationEngine>;
+/// Type alias for the simulation's concrete `NodeHost`.
+type SimHost = NodeHost<SimStorage, SimNetworkAdapter, SyncDispatch, SimulationEngine>;
 
 /// Per-(host, shard) shared store bundle — `ProvisionStore`, `TxStore`,
 /// `ExecCertStore`, and `FinalizedWaveStore` cloned into every same-shard
@@ -57,17 +57,17 @@ type ShardStoreBundle = (
 
 /// Deterministic simulation runner.
 ///
-/// Processes events in deterministic order using [`IoLoop`] for action handling.
+/// Processes events in deterministic order using [`NodeHost`] for action handling.
 /// Given the same seed, produces identical results every run.
 ///
-/// Each node has its own independent storage and executor inside its `IoLoop`.
+/// Each node has its own independent storage and executor inside its `NodeHost`.
 /// The harness controls the event queue, network delivery (latency, partitions,
 /// packet loss), and time advancement.
 pub struct SimulationRunner {
-    /// Per-node `IoLoop` instances. Index corresponds to `NodeIndex`.
-    io_loops: Vec<SimIoLoop>,
+    /// Per-node `NodeHost` instances. Index corresponds to `NodeIndex`.
+    hosts: Vec<SimHost>,
 
-    /// Per-node event receivers (from crossbeam channels passed to `IoLoop`).
+    /// Per-node event receivers (from crossbeam channels passed to `NodeHost`).
     event_rxs: Vec<Receiver<ShardEvent>>,
 
     /// Global event queue, ordered deterministically.
@@ -157,7 +157,7 @@ impl SimulationRunner {
     /// Panics if generated key bytes round-trip fails (unreachable; the keypair
     /// constructor produces canonical bytes).
     #[must_use]
-    #[allow(clippy::too_many_lines)] // straight-line construction of per-shard io_loops
+    #[allow(clippy::too_many_lines)] // straight-line construction of per-shard hosts
     pub fn new(network_config: &NetworkConfig, seed: u64) -> Self {
         let network = SimulatedNetwork::new(network_config.clone());
         let rng = ChaCha8Rng::seed_from_u64(seed);
@@ -206,7 +206,7 @@ impl SimulationRunner {
         assert!(vnodes_per_host >= 1, "vnodes_per_host must be at least 1");
         let host_layout = build_host_layout(network_config);
         let num_hosts = host_layout.len();
-        let mut io_loops = Vec::with_capacity(num_hosts);
+        let mut hosts = Vec::with_capacity(num_hosts);
         let mut event_rxs = Vec::with_capacity(num_hosts);
 
         // One execution cache per shard, shared across every same-shard
@@ -251,7 +251,7 @@ impl SimulationRunner {
             }
 
             let mut vnode_inits: Vec<VnodeInit> = Vec::with_capacity(host_vnodes.len());
-            let mut topology_arc_for_io_loop = None;
+            let mut topology_arc_for_host = None;
             for (shard, validator_idxs) in &by_shard {
                 let (provision_store, tx_store, exec_cert_store, fw_store) =
                     shard_stores.get(shard).expect("shard bundle just inserted");
@@ -271,14 +271,14 @@ impl SimulationRunner {
                         Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes"),
                     );
 
-                    // First vnode's topology drives the `IoLoop`'s
+                    // First vnode's topology drives the `NodeHost`'s
                     // shared snapshot. Off-thread handlers only read
                     // shard-level info from this snapshot, not the
                     // validator id, so picking the first arbitrarily
                     // works across both same-shard and cross-shard
                     // hosting.
-                    if topology_arc_for_io_loop.is_none() {
-                        topology_arc_for_io_loop = Some(Arc::new(ArcSwap::from(Arc::clone(
+                    if topology_arc_for_host.is_none() {
+                        topology_arc_for_host = Some(Arc::new(ArcSwap::from(Arc::clone(
                             topology_state.snapshot(),
                         ))));
                     }
@@ -323,7 +323,7 @@ impl SimulationRunner {
             // shards through `event_rx` deterministically.
             let shard_event_senders: HashMap<ShardGroupId, Sender<ShardEvent>> =
                 by_shard.keys().map(|s| (*s, event_tx.clone())).collect();
-            let io_loop = NodeHost::new(
+            let host = NodeHost::new(
                 vnode_inits,
                 storages,
                 sim_engine,
@@ -332,17 +332,17 @@ impl SimulationRunner {
                 ),
                 SyncDispatch,
                 shard_event_senders,
-                topology_arc_for_io_loop.expect("host carries at least one vnode"),
+                topology_arc_for_host.expect("host carries at least one vnode"),
                 NodeConfig::default(),
                 tx_validator,
             );
 
-            io_loops.push(io_loop);
+            hosts.push(host);
             event_rxs.push(event_rx);
         }
 
         info!(
-            num_nodes = io_loops.len(),
+            num_nodes = hosts.len(),
             num_shards = network_config.num_shards,
             validators_per_shard = network_config.validators_per_shard,
             seed,
@@ -350,7 +350,7 @@ impl SimulationRunner {
         );
 
         Self {
-            io_loops,
+            hosts,
             event_rxs,
             event_queue: BTreeMap::new(),
             sequence: 0,
@@ -406,15 +406,15 @@ impl SimulationRunner {
     /// host's first hosted shard.
     #[must_use]
     pub fn node_storage(&self, node: NodeIndex) -> Option<&SimStorage> {
-        let io_loop = self.io_loops.get(node as usize)?;
-        let shard = io_loop.hosted_shards().next()?;
-        Some(&io_loop.shard_io(shard).storage)
+        let host = self.hosts.get(node as usize)?;
+        let shard = host.hosted_shards().next()?;
+        Some(&host.shard_io(shard).storage)
     }
 
     /// Get the last emitted transaction status for a node.
     #[must_use]
     pub fn tx_status(&self, node: NodeIndex, tx_hash: &TxHash) -> Option<TransactionStatus> {
-        self.io_loops
+        self.hosts
             .get(node as usize)
             .and_then(|nl| nl.tx_status(tx_hash))
     }
@@ -438,9 +438,9 @@ impl SimulationRunner {
     /// [`Self::vnode_state`] to pick a specific validator.
     #[must_use]
     pub fn node(&self, index: NodeIndex) -> Option<&NodeStateMachine> {
-        let io_loop = self.io_loops.get(index as usize)?;
-        let shard = io_loop.hosted_shards().next()?;
-        Some(io_loop.vnode_state(shard, 0))
+        let host = self.hosts.get(index as usize)?;
+        let shard = host.hosted_shards().next()?;
+        Some(host.vnode_state(shard, 0))
     }
 
     /// Get a reference to a specific validator's state machine,
@@ -450,10 +450,10 @@ impl SimulationRunner {
     #[must_use]
     pub fn vnode_state(&self, validator_id: ValidatorId) -> Option<&NodeStateMachine> {
         let host_index = self.network.validator_to_node(validator_id) as usize;
-        let io_loop = self.io_loops.get(host_index)?;
-        for shard in io_loop.hosted_shards() {
-            for v in 0..io_loop.vnodes_len(shard) {
-                let state = io_loop.vnode_state(shard, v);
+        let host = self.hosts.get(host_index)?;
+        for shard in host.hosted_shards() {
+            for v in 0..host.vnodes_len(shard) {
+                let state = host.vnode_state(shard, v);
                 if state.topology().local_validator_id() == validator_id {
                     return Some(state);
                 }
@@ -476,7 +476,7 @@ impl SimulationRunner {
     /// Get the number of committed blocks stored for a specific node.
     #[must_use]
     pub fn committed_block_count(&self, node: NodeIndex) -> usize {
-        self.io_loops.get(node as usize).map_or(0, |nl| {
+        self.hosts.get(node as usize).map_or(0, |nl| {
             let Some(shard) = nl.hosted_shards().next() else {
                 return 0;
             };
@@ -493,7 +493,7 @@ impl SimulationRunner {
     /// Check if a specific block is stored for a node.
     #[must_use]
     pub fn has_committed_block(&self, node: NodeIndex, height: BlockHeight) -> bool {
-        self.io_loops.get(node as usize).is_some_and(|nl| {
+        self.hosts.get(node as usize).is_some_and(|nl| {
             nl.hosted_shards()
                 .next()
                 .is_some_and(|shard| nl.shard_io(shard).storage.get_block(height).is_some())
@@ -518,7 +518,7 @@ impl SimulationRunner {
     pub fn initialize_genesis(&mut self) {
         self.install_engine_genesis(&GenesisConfig::test_default(), |_| true);
         info!(
-            num_nodes = self.io_loops.len(),
+            num_nodes = self.hosts.len(),
             "Radix Engine genesis complete on all nodes"
         );
         self.finalize_genesis();
@@ -575,7 +575,7 @@ impl SimulationRunner {
         }
 
         info!(
-            num_nodes = self.io_loops.len(),
+            num_nodes = self.hosts.len(),
             num_funded_accounts = balances.len(),
             "Radix Engine genesis complete with funded accounts"
         );
@@ -592,13 +592,13 @@ impl SimulationRunner {
         config: &GenesisConfig,
         mut select: impl FnMut(usize) -> bool,
     ) {
-        for node_idx in 0..self.io_loops.len() {
+        for node_idx in 0..self.hosts.len() {
             if self.genesis_executed[node_idx] || !select(node_idx) {
                 continue;
             }
-            let hosted: Vec<ShardGroupId> = self.io_loops[node_idx].hosted_shards().collect();
+            let hosted: Vec<ShardGroupId> = self.hosts[node_idx].hosted_shards().collect();
             for shard in hosted {
-                self.io_loops[node_idx].install_engine_genesis(shard, config);
+                self.hosts[node_idx].install_engine_genesis(shard, config);
             }
             self.genesis_executed[node_idx] = true;
         }
@@ -622,19 +622,15 @@ impl SimulationRunner {
 
             // Hosts that carry at least one vnode in this shard.
             let num_hosts =
-                NodeIndex::try_from(self.io_loops.len()).expect("host count fits NodeIndex");
+                NodeIndex::try_from(self.hosts.len()).expect("host count fits NodeIndex");
             let hosts_for_shard: Vec<NodeIndex> = (0..num_hosts)
-                .filter(|&h| {
-                    self.io_loops[h as usize]
-                        .hosted_shards()
-                        .any(|s| s == shard)
-                })
+                .filter(|&h| self.hosts[h as usize].hosted_shards().any(|s| s == shard))
                 .collect();
 
             let first_host = *hosts_for_shard
                 .first()
                 .expect("every shard must have at least one host");
-            let first_node_storage = &self.io_loops[first_host as usize].shard_io(shard).storage;
+            let first_node_storage = &self.hosts[first_host as usize].shard_io(shard).storage;
             let genesis_jmt_root = first_node_storage.state_root();
 
             info!(
@@ -652,11 +648,11 @@ impl SimulationRunner {
 
             for host_index in &hosts_for_shard {
                 let i = *host_index as usize;
-                self.io_loops[i].initialize_shard_genesis(&genesis_block);
-                self.io_loops[i].flush_all_batches();
+                self.hosts[i].initialize_shard_genesis(&genesis_block);
+                self.hosts[i].flush_all_batches();
 
                 // Drain outputs from genesis initialization (timer sets, etc.)
-                let output = self.io_loops[i].drain_pending_output();
+                let output = self.hosts[i].drain_pending_output();
                 self.drain_node_io(*host_index);
                 self.process_step_output(*host_index, output);
 
@@ -698,8 +694,8 @@ impl SimulationRunner {
         }
 
         // Wire each node into the in-memory network now that genesis is settled.
-        for io_loop in &mut self.io_loops {
-            io_loop.register_inbound_handlers();
+        for host in &mut self.hosts {
+            host.register_inbound_handlers();
         }
     }
 
@@ -759,7 +755,7 @@ impl SimulationRunner {
 
             if gossip_delivered + notif_delivered + response_delivered > 0 {
                 // Drain events that handlers pushed into channels.
-                for node_idx in 0..u32::try_from(self.io_loops.len()).unwrap_or(u32::MAX) {
+                for node_idx in 0..u32::try_from(self.hosts.len()).unwrap_or(u32::MAX) {
                     while let Ok(event) = self.event_rxs[node_idx as usize].try_recv() {
                         self.schedule_event(node_idx, self.now, event);
                     }
@@ -784,11 +780,11 @@ impl SimulationRunner {
                 self.stats.events_processed += 1;
                 self.stats.events_by_priority[event.priority() as usize] += 1;
 
-                self.io_loops[node_index as usize].set_time(LocalTimestamp::from_millis(
+                self.hosts[node_index as usize].set_time(LocalTimestamp::from_millis(
                     u64::try_from(self.now.as_millis()).unwrap_or(u64::MAX),
                 ));
-                let output = self.io_loops[node_index as usize].step(event);
-                self.io_loops[node_index as usize].flush_all_batches();
+                let output = self.hosts[node_index as usize].step(event);
+                self.hosts[node_index as usize].flush_all_batches();
 
                 self.drain_node_io(node_index);
                 self.process_step_output(node_index, output);
@@ -814,14 +810,14 @@ impl SimulationRunner {
     /// Drain network outbox, pending requests, pending notifications, and
     /// buffered events from a node.
     ///
-    /// Converts IoLoop-internal outputs into harness-level operations:
+    /// Converts host-internal outputs into harness-level operations:
     /// - Outbox entries → gossip latency queue
     /// - Pending requests → handler invoked, response callback deferred
     /// - Pending notifications → notification latency queue
-    /// - Buffered events (from error callbacks, `IoLoop` step) → event queue
+    /// - Buffered events (from error callbacks, `NodeHost` step) → event queue
     fn drain_node_io(&mut self, node: NodeIndex) {
         let i = node as usize;
-        let outbox = self.io_loops[i].network().drain_outbox();
+        let outbox = self.hosts[i].network().drain_outbox();
 
         for entry in outbox {
             let stats = self
@@ -836,7 +832,7 @@ impl SimulationRunner {
         // Accept pending requests: handler invoked now, response callback
         // deferred with round-trip latency. Error callbacks fire immediately
         // and push events into channels, so drain must happen after this.
-        let pending_requests = self.io_loops[i].network().drain_pending_requests();
+        let pending_requests = self.hosts[i].network().drain_pending_requests();
         if !pending_requests.is_empty() {
             let stats =
                 self.network
@@ -847,7 +843,7 @@ impl SimulationRunner {
         }
 
         // Accept pending notifications: queued for deferred delivery with latency.
-        let pending_notifications = self.io_loops[i].network().drain_pending_notifications();
+        let pending_notifications = self.hosts[i].network().drain_pending_notifications();
         if !pending_notifications.is_empty() {
             let stats = self.network.accept_notifications(
                 node,
@@ -861,7 +857,7 @@ impl SimulationRunner {
         }
 
         // Drain buffered events (from error callbacks in accept_requests,
-        // plus any events the IoLoop step itself pushed).
+        // plus any events the host's step itself pushed).
         while let Ok(event) = self.event_rxs[i].try_recv() {
             self.schedule_event(node, self.now, event);
         }
