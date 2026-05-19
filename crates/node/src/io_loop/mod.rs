@@ -247,15 +247,6 @@ where
     /// hands it `Arc::clone(&self.process)`.
     pub(crate) process: Arc<ProcessIo<S, N, D, E>>,
 
-    /// Last time a "transaction finalization exceeded 10s" warning was emitted.
-    /// Rate-limited to avoid flooding logs during cross-shard latency spikes.
-    last_slow_tx_warn: LocalTimestamp,
-
-    /// Per-tx phase-time stamps for the slow-tx finalization log. Populated
-    /// from `EmitTransactionStatus` and `RecordTxEcCreated` actions; entries
-    /// are dropped on terminal status.
-    tx_phase_times: TxPhaseTimesCache,
-
     /// Per-step scratch: timer set/cancel operations emitted during the
     /// step. Both shard-scoped timers (`ViewChange`, `Cleanup` — pushed
     /// from `Action::SetTimer` / `CancelTimer` arms) and process-scoped
@@ -417,6 +408,8 @@ where
                             b.committed_header_max,
                             b.committed_header_window,
                         ),
+                        tx_phase_times: TxPhaseTimesCache::default(),
+                        last_slow_tx_warn: LocalTimestamp::ZERO,
                     },
                     vnodes,
                 },
@@ -440,8 +433,6 @@ where
             shards,
             executor,
             process,
-            last_slow_tx_warn: LocalTimestamp::ZERO,
-            tx_phase_times: TxPhaseTimesCache::default(),
             pending_timer_ops: Vec::new(),
             emitted_statuses: Vec::new(),
             actions_generated: 0,

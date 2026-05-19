@@ -19,14 +19,15 @@ use std::sync::Arc;
 
 use hyperscale_storage::{PendingChain, Storage};
 use hyperscale_types::{
-    Bls12381G1PublicKey, Bls12381G2Signature, CommittedBlockHeader, RoutableTransaction, TxHash,
-    ValidatorId,
+    Bls12381G1PublicKey, Bls12381G2Signature, CommittedBlockHeader, LocalTimestamp,
+    RoutableTransaction, TxHash, ValidatorId,
 };
 
 use crate::batch_accumulator::BatchAccumulator;
 use crate::shard_io::block_commit::BlockCommitCoordinator;
 pub use crate::shard_io::caches::SharedCaches;
 use crate::shard_io::fetch::FetchHost;
+use crate::shard_io::phase_times::TxPhaseTimesCache;
 use crate::shard_io::sync::SyncHost;
 
 /// A committed header pending sender-signature verification, queued in
@@ -92,4 +93,17 @@ pub struct ShardIo<S: Storage> {
     /// Pending remote-committed-header gossip awaiting batched BLS
     /// sender-signature verification on the crypto pool.
     pub committed_header_batch: BatchAccumulator<CommittedHeaderVerificationItem>,
+
+    /// Per-tx phase-time stamps for the slow-tx finalization log.
+    /// Populated from `EmitTransactionStatus` and `RecordTxEcCreated`
+    /// actions emitted by this shard's vnodes; entries are dropped on
+    /// terminal status. Per-shard so each hosted shard logs its own
+    /// locally-submitted finalization latencies independently.
+    pub tx_phase_times: TxPhaseTimesCache,
+
+    /// Last time this shard emitted a "transaction finalization exceeded
+    /// 10s" warning. Rate-limited to avoid log floods during cross-shard
+    /// latency spikes; per-shard so co-hosted shards don't suppress
+    /// each other's warnings.
+    pub last_slow_tx_warn: LocalTimestamp,
 }
