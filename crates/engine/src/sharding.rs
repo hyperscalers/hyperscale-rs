@@ -957,4 +957,94 @@ mod tests {
             .expect("present");
         assert_eq!(expanded, vec![account]);
     }
+
+    // ── Cross-shard merged-view invariance ───────────────────────────────────
+    //
+    // `compute_vm_output` advertises shard-invariance: the same `(tx, vm_receipt)`
+    // must produce a byte-equal `CachedVmOutput` regardless of which shard
+    // constructed the merged view. That guarantee propagates down to
+    // `writes_root` (and therefore `GlobalReceiptHash`), which is the
+    // proper consensus surface.
+    //
+    // The walking ownership resolver runs at this layer, so the contract is
+    // statable here without dragging in a real VM receipt: equivalent merged
+    // views must produce equivalent `(ownership, global_updates, writes_root)`.
+    //
+    // This test pins the contract. It fails when cross-shard provisions
+    // ship only the partitions a tx reads — a declared account's `Own(_)`
+    // refs in unshipped partitions are visible to the side that holds the
+    // account locally and invisible to the side that sees it via
+    // provisions. The downstream `writes_root` then drifts between
+    // validators on different co-hosted shards.
+
+    #[test]
+    #[ignore = "demonstrates bug; un-ignore once provisions carry authoritative ownership"]
+    fn writes_root_is_shard_invariant_across_equivalent_merged_views() {
+        use hyperscale_storage::keys;
+        use hyperscale_types::SubstateEntry;
+
+        use crate::provisioned_snapshot::ProvisionedSnapshot;
+
+        // Cross-shard tx declares one account; that account owns two
+        // vaults via `Own(_)` refs in two different partitions.
+        let a_0 = account_id(1);
+        let v_main = fungible_vault_id(2); // referenced from partition 64
+        let v_meta = nonfungible_vault_id(3); // referenced from partition 0
+
+        // Shard 0 holds A_0 locally with the full substate set.
+        let mut shard_0_local = MockDb::default();
+        shard_0_local.insert(&a_0, 0, vec![0], own_bytes(&v_meta));
+        shard_0_local.insert(&a_0, 64, vec![0], own_bytes(&v_main));
+
+        // Shard 1 doesn't hold A_0; it sees A_0 only through provisions.
+        let shard_1_local = MockDb::default();
+
+        // Shard 0 ships only the partition the tx declared a read
+        // against — the minimal-shipping case. Partition 0's `Own(v_meta)`
+        // never crosses the wire.
+        let a_0_db_node_key = node_entity_key(&a_0);
+        let partition_shipped = DbPartitionKey {
+            node_key: a_0_db_node_key,
+            partition_num: 64,
+        };
+        let shard_0_provisions = vec![SubstateEntry::new(
+            keys::to_storage_key(&partition_shipped, &DbSortKey(vec![0])),
+            Some(own_bytes(&v_main)),
+        )];
+
+        // Build the same merged-view shape both validators use at
+        // execution time.
+        let view_from_shard_0 = ProvisionedSnapshot::from_provisions(&shard_0_local, &[]);
+        let view_from_shard_1 =
+            ProvisionedSnapshot::from_provisions(&shard_1_local, &[shard_0_provisions.as_slice()]);
+
+        let ownership_0 = resolve_owned_nodes(&view_from_shard_0, &[a_0]);
+        let ownership_1 = resolve_owned_nodes(&view_from_shard_1, &[a_0]);
+
+        // Same VM-produced raw writes on both sides — what the VM would
+        // have emitted given identical inputs.
+        let raw_updates = merge(
+            merge(
+                make_set_update(a_0, 64, vec![0], vec![1]),
+                make_set_update(v_main, 0, vec![0], vec![1]),
+            ),
+            make_set_update(v_meta, 0, vec![0], vec![1]),
+        );
+
+        let declared_set: HashSet<NodeId> = [a_0].into_iter().collect();
+        let global_0 = filter_updates_for_global_receipt(&raw_updates, &declared_set, &ownership_0);
+        let global_1 = filter_updates_for_global_receipt(&raw_updates, &declared_set, &ownership_1);
+
+        let writes_root_0 = compute_writes_root(&global_0);
+        let writes_root_1 = compute_writes_root(&global_1);
+
+        assert_eq!(
+            writes_root_0, writes_root_1,
+            "writes_root must be shard-invariant; ownership maps differed: \
+             shard-0={ownership_0:?}, shard-1={ownership_1:?}. The \
+             GlobalReceiptHash baked from these will diverge between \
+             validators on different co-hosted shards, causing the \
+             dissenter to reject the wave's EC at admission.",
+        );
+    }
 }
