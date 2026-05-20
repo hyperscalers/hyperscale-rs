@@ -106,12 +106,12 @@ where
         for shard in self.hosted_shards() {
             // ── block.request → sync protocol ────────────────────────────
 
-            let storage = Arc::clone(&self.shard_io(shard).storage);
+            let pending_chain = Arc::clone(&self.shard_io(shard).pending_chain);
             let provision_store = Arc::clone(&self.shard_io(shard).caches.provision_store);
             self.process
                 .network
                 .register_request_handler::<GetBlockRequest>(shard, move |req| {
-                    serve_block_request(&*storage, &provision_store, &req)
+                    serve_block_request(&pending_chain, &provision_store, &req)
                 });
 
             // ── transaction.request → fetch protocol ─────────────────────
