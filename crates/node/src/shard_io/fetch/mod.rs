@@ -22,6 +22,8 @@ use hyperscale_types::{MessageClass, ShardGroupId, ValidatorId};
 use tracing::{debug, trace};
 
 pub mod binding;
+pub mod exec_cert_serve;
+pub mod finalized_wave_serve;
 pub mod host;
 pub mod provision_serve;
 pub mod transaction_serve;

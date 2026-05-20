@@ -5,6 +5,7 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_network::Network;
 use hyperscale_storage::Storage;
+use hyperscale_types::ShardGroupId;
 use hyperscale_types::network::gossip::{CommittedBlockHeaderGossip, TransactionGossip};
 use hyperscale_types::network::notification::{
     BlockHeaderNotification, BlockVoteNotification, ExecutionCertificatesNotification,
@@ -13,11 +14,7 @@ use hyperscale_types::network::notification::{
 use hyperscale_types::network::request::{
     GetExecutionCertsRequest, GetFinalizedWavesRequest, GetLocalProvisionsRequest,
 };
-use hyperscale_types::network::response::{
-    GetExecutionCertsResponse, GetFinalizedWavesResponse, GetLocalProvisionsResponse,
-    GetProvisionResponse,
-};
-use hyperscale_types::{ExecutionCertificate, FinalizedWave, ShardGroupId, WaveId};
+use hyperscale_types::network::response::{GetLocalProvisionsResponse, GetProvisionResponse};
 use tracing::warn;
 
 use crate::event::ShardScopedInput;
@@ -46,6 +43,8 @@ where
             GetBlockRequest, GetProvisionsRequest, GetRemoteHeadersRequest, GetTransactionsRequest,
         };
 
+        use crate::shard_io::fetch::exec_cert_serve::serve_execution_certs_request;
+        use crate::shard_io::fetch::finalized_wave_serve::serve_finalized_waves_request;
         use crate::shard_io::fetch::provision_serve::serve_provision_request;
         use crate::shard_io::fetch::transaction_serve::serve_transaction_request;
         use crate::shard_io::sync::block_serve::serve_block_request;
@@ -116,12 +115,12 @@ where
 
             // ── transaction.request → fetch protocol ─────────────────────
 
-            let storage = Arc::clone(&self.shard_io(shard).storage);
+            let pending_chain = Arc::clone(&self.shard_io(shard).pending_chain);
             let tx_store = Arc::clone(&self.shard_io(shard).caches.tx_store);
             self.process
                 .network
                 .register_request_handler::<GetTransactionsRequest>(shard, move |req| {
-                    serve_transaction_request(&*storage, &tx_store, &req)
+                    serve_transaction_request(&pending_chain, &tx_store, &req)
                 });
 
             // ── provision.request → serve from local store ───────────────
@@ -285,84 +284,25 @@ where
                     },
                 );
 
-            // ── finalized_wave.request → cache lookup + storage fallback ─────
+            // ── finalized_wave.request → cache lookup + pending_chain fallback ─
 
             let fw_cache = Arc::clone(&self.shard_io(shard).caches.finalized_wave);
-            let fw_storage = Arc::clone(&self.shard_io(shard).storage);
+            let pending_chain = Arc::clone(&self.shard_io(shard).pending_chain);
             self.process
                 .network
-                .register_request_handler::<GetFinalizedWavesRequest>(
-                    shard,
-                    move |req: GetFinalizedWavesRequest| {
-                        let mut waves: Vec<Arc<FinalizedWave>> = Vec::new();
-                        let mut missing: Vec<WaveId> = Vec::new();
-                        for id in &req.wave_ids {
-                            if let Some(fw) = fw_cache.get(id) {
-                                waves.push(fw);
-                            } else {
-                                missing.push(id.clone());
-                            }
-                        }
-
-                        // Storage fallback: rebuild any missing FinalizedWave
-                        // from the persisted WaveCertificate plus per-tx
-                        // consensus receipts. The cache is bounded (LRU); peers
-                        // requesting waves past the window must still get a
-                        // complete answer from durable storage.
-                        if !missing.is_empty() {
-                            let certs = fw_storage.get_certificates_batch(&missing);
-                            for cert in certs {
-                                if let Some(fw) = FinalizedWave::reconstruct(Arc::new(cert), |h| {
-                                    fw_storage.get_consensus_receipt(h)
-                                }) {
-                                    waves.push(Arc::new(fw));
-                                }
-                            }
-                        }
-
-                        GetFinalizedWavesResponse::new(waves)
-                    },
-                );
+                .register_request_handler::<GetFinalizedWavesRequest>(shard, move |req| {
+                    serve_finalized_waves_request(&pending_chain, &fw_cache, &req)
+                });
 
             // ── execution_cert.request → cert store lookup ────────────────
 
             let exec_cert_store = Arc::clone(&self.shard_io(shard).caches.exec_cert_store);
-            let storage = Arc::clone(&self.shard_io(shard).storage);
+            let pending_chain = Arc::clone(&self.shard_io(shard).pending_chain);
             self.process
                 .network
-                .register_request_handler::<GetExecutionCertsRequest>(
-                    shard,
-                    move |req: GetExecutionCertsRequest| {
-                        // Hot path: in-memory cache (entries live here between EC
-                        // aggregation and the wave's containing block committing).
-                        let mut certs: Vec<Arc<ExecutionCertificate>> = Vec::new();
-                        let mut missing: Vec<WaveId> = Vec::new();
-                        for wave_id in &req.wave_ids {
-                            match exec_cert_store.get(wave_id) {
-                                Some(cert) => certs.push(cert),
-                                None => missing.push(wave_id.clone()),
-                            }
-                        }
-
-                        // Cold path: durable storage point lookup per missing
-                        // wave_id. Cache eviction happens at wave-cert commit, at
-                        // which point storage is the authoritative source.
-                        if !missing.is_empty() {
-                            for cert in storage.get_execution_certificates_batch(&missing) {
-                                certs.push(Arc::new(cert));
-                            }
-                        }
-
-                        if certs.is_empty() {
-                            GetExecutionCertsResponse { certificates: None }
-                        } else {
-                            record_fetch_response_sent("exec_cert", certs.len());
-                            GetExecutionCertsResponse {
-                                certificates: Some(certs),
-                            }
-                        }
-                    },
-                );
+                .register_request_handler::<GetExecutionCertsRequest>(shard, move |req| {
+                    serve_execution_certs_request(&pending_chain, &exec_cert_store, &req)
+                });
 
             // ── remote_header.request → range header sync ───────────────────
 

@@ -11,7 +11,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use hyperscale_jmt::{Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_types::{
     Block, BlockHash, BlockHeight, CertifiedBlock, CommittedBlockHeader, ConsensusReceipt,
-    FinalizedWave, MerkleInclusionProof, NodeId, QuorumCertificate, RoutableTransaction, StateRoot,
+    ExecutionCertificate, FinalizedWave, MerkleInclusionProof, NodeId, QuorumCertificate,
+    RoutableTransaction, StateRoot, TxHash, WaveCertificate, WaveId,
 };
 use radix_common::prelude::DatabaseUpdate;
 use radix_substate_store_interface::interface::SubstateDatabase;
@@ -224,6 +225,33 @@ where
             .map(|(_, qc)| qc.clone());
         drop(entries);
         pending_qc.or_else(|| self.base.latest_qc())
+    }
+
+    /// Batched transaction read by hash. The pending window is covered by
+    /// the mempool's `TxStore` (tombstone retention outlives JMT
+    /// persistence lag by orders of magnitude), so this method is a
+    /// thin pass-through to base storage; keeping it on `PendingChain`
+    /// preserves the "no raw `&S` in serve handlers" invariant.
+    pub fn transactions_batch(&self, hashes: &[TxHash]) -> Vec<RoutableTransaction> {
+        self.base.get_transactions_batch(hashes)
+    }
+
+    /// Batched wave-certificate read by id. Pass-through to base storage —
+    /// pending entries don't carry `WaveCertificate`s, only the receipts
+    /// that contribute to them.
+    pub fn certificates_batch(&self, ids: &[WaveId]) -> Vec<WaveCertificate> {
+        self.base.get_certificates_batch(ids)
+    }
+
+    /// Consensus receipt by tx hash. Pass-through to base storage.
+    pub fn consensus_receipt(&self, tx_hash: &TxHash) -> Option<Arc<ConsensusReceipt>> {
+        self.base.get_consensus_receipt(tx_hash)
+    }
+
+    /// Batched execution-certificate read by `WaveId`. Pass-through to
+    /// base storage.
+    pub fn execution_certificates_batch(&self, ids: &[WaveId]) -> Vec<ExecutionCertificate> {
+        self.base.get_execution_certificates_batch(ids)
     }
 
     /// Look up the pending entry at `height` that has a `certified_block`

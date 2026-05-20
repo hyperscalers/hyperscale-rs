@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use hyperscale_mempool::TxStore;
 use hyperscale_metrics::record_fetch_response_sent;
-use hyperscale_storage::ChainReader;
+use hyperscale_storage::{PendingChain, Storage};
 use hyperscale_types::network::request::GetTransactionsRequest;
 use hyperscale_types::network::response::GetTransactionsResponse;
 use tracing::{debug, trace};
@@ -15,10 +15,10 @@ const MAX_ITEMS_PER_RESPONSE: usize = 500;
 /// Serve an inbound transaction fetch request.
 ///
 /// Two tiers: the shared [`TxStore`] (transactions we admitted to our own
-/// mempool, retained until their tombstone window elapses) and storage
-/// (committed transactions). We deliberately do *not* serve transactions
-/// we never admitted — if we didn't vouch for it, we're not the right
-/// source.
+/// mempool, retained until their tombstone window elapses) and chain
+/// storage via [`PendingChain`] (committed transactions). We deliberately
+/// do *not* serve transactions we never admitted — if we didn't vouch for
+/// it, we're not the right source.
 ///
 /// Intentionally caller-agnostic: the function takes no requester identity
 /// and no shard scope. Any peer that knows the tx hash can fetch the body,
@@ -27,8 +27,8 @@ const MAX_ITEMS_PER_RESPONSE: usize = 500;
 /// shard, that shard's mempool fetches by hash from the source committee
 /// and this handler answers without distinction. Don't add a peer / shard
 /// check here without redesigning the cross-shard DA path.
-pub fn serve_transaction_request(
-    storage: &impl ChainReader,
+pub fn serve_transaction_request<S: Storage>(
+    pending_chain: &PendingChain<S>,
     tx_store: &TxStore,
     req: &GetTransactionsRequest,
 ) -> GetTransactionsResponse {
@@ -55,8 +55,8 @@ pub fn serve_transaction_request(
     }
     if !missing.is_empty() {
         found.extend(
-            storage
-                .get_transactions_batch(&missing)
+            pending_chain
+                .transactions_batch(&missing)
                 .into_iter()
                 .map(Arc::new),
         );
