@@ -365,11 +365,11 @@ where
 
             // ── remote_header.request → range header sync ───────────────────
 
-            let storage = Arc::clone(&self.shard_io(shard).storage);
+            let pending_chain = Arc::clone(&self.shard_io(shard).pending_chain);
             self.process
                 .network
                 .register_request_handler::<GetRemoteHeadersRequest>(shard, move |req| {
-                    serve_remote_headers_request(&*storage, shard, &req)
+                    serve_remote_headers_request(&pending_chain, shard, &req)
                 });
         } // end for shard in hosted_shards
     }

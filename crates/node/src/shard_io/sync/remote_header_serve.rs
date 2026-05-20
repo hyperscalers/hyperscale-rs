@@ -7,7 +7,7 @@
 //! short-caps on the first missing height rather than failing.
 
 use hyperscale_metrics::record_fetch_response_sent;
-use hyperscale_storage::ChainReader;
+use hyperscale_storage::{PendingChain, Storage};
 use hyperscale_types::network::request::{GetRemoteHeadersRequest, MAX_REMOTE_HEADERS_PER_REQUEST};
 use hyperscale_types::network::response::GetRemoteHeadersResponse;
 use hyperscale_types::{BlockHeight, ShardGroupId};
@@ -20,13 +20,18 @@ use hyperscale_types::{BlockHeight, ShardGroupId};
 /// missing height so the response is always a contiguous prefix of the
 /// requested range.
 ///
+/// Headers are read through [`PendingChain`] so heights that are
+/// BFT-committed but not yet JMT-persisted are reachable too — without
+/// that, a peer racing the local persistence drain would see a `not_found`
+/// gap and rotate, stretching sync.
+///
 /// Requests for a shard other than `local_shard` get an empty response.
 /// Without this gate a shard A node would serve its own committed headers
 /// in response to a request for shard B headers; the requester filters
 /// only by height and would buffer them under the wrong shard scope,
 /// stalling sync until rotation.
-pub fn serve_remote_headers_request(
-    storage: &impl ChainReader,
+pub fn serve_remote_headers_request<S: Storage>(
+    pending_chain: &PendingChain<S>,
     local_shard: ShardGroupId,
     req: &GetRemoteHeadersRequest,
 ) -> GetRemoteHeadersResponse {
@@ -41,10 +46,10 @@ pub fn serve_remote_headers_request(
 
     for offset in 0..bounded_count.inner() {
         let height = BlockHeight::new(req.from_height.inner().saturating_add(offset));
-        let Some(header) = storage.get_committed_header(height) else {
+        let Some(header) = pending_chain.committed_header(height) else {
             break;
         };
-        headers.push(header);
+        headers.push((*header).clone());
     }
 
     if !headers.is_empty() {
