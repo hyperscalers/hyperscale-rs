@@ -156,7 +156,7 @@ impl RadixExecutor {
             .copied()
             .collect();
         let ownership = resolve_owned_nodes(snapshot, &declared_nodes);
-        let output = compute_vm_output(tx, &receipt, ownership);
+        let output = compute_vm_output(tx, &receipt, &ownership);
         Span::current().record(
             "latency_us",
             u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX),
@@ -169,22 +169,25 @@ impl RadixExecutor {
     /// storage keys from the sending shard for O(log n) lookups without
     /// expensive hash work.
     ///
-    /// `ownership` is the authoritative `vault → owning_account` map for
-    /// this transaction's declared accounts, merged from each source
-    /// shard's `ProvisionEntry::owned_nodes`. Unlike a walk of the merged
-    /// view, this map sees every owned vault regardless of which
-    /// partitions the source shipped — preserving the cache's
-    /// shard-invariance guarantee.
+    /// `ownership` is the per-vnode merged `vault → owning_account` map
+    /// the caller built via
+    /// [`crate::sharding::build_cross_shard_ownership`] (provisions for
+    /// remote-shard owners, local-snapshot resolve for local-shard owners).
+    /// It is consumed here ONLY for `receipt_hash` (computed inside
+    /// [`compute_vm_output`]); the returned [`CachedVmOutput`] does not
+    /// store it, so callers re-pass their own ownership to
+    /// [`crate::project_to_shard`].
     #[instrument(level = Level::DEBUG, skip_all, fields(
         provision_count = provisions.len(),
         latency_us = Empty,
     ))]
+    #[allow(clippy::implicit_hasher)]
     pub fn compute_vm_output_cross_shard<D: SubstateDatabase>(
         &self,
         snapshot: &D,
         tx: &RoutableTransaction,
         provisions: &[Arc<Vec<SubstateEntry>>],
-        ownership: HashMap<NodeId, NodeId>,
+        ownership: &HashMap<NodeId, NodeId>,
     ) -> CachedVmOutput {
         let start = Instant::now();
         let Some(validated) = tx.get_or_validate(&self.caches.validator) else {

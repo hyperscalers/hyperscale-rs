@@ -13,8 +13,8 @@ use std::sync::Arc;
 
 use hyperscale_core::{Action, ActionContext, ProtocolEvent};
 use hyperscale_engine::{
-    CachedSlot, CachedVmOutput, ProcessExecutionCache, SlotStatus, project_to_shard,
-    resolve_owned_nodes,
+    CachedSlot, CachedVmOutput, ProcessExecutionCache, SlotStatus, build_cross_shard_ownership,
+    project_to_shard, resolve_owned_nodes,
 };
 use hyperscale_metrics::record_execution_latency;
 use hyperscale_network::Network;
@@ -378,7 +378,19 @@ where
                 .iter()
                 .zip(cached)
                 .map(|(tx, cached)| {
-                    let executed = project_to_shard(&cached, tx.hash(), local_shard, num_shards);
+                    // Single-shard ownership is purely local: every declared
+                    // account lives on this shard. Computed per-call rather
+                    // than cached so the cache stays shard-invariant (matches
+                    // the cross-shard path).
+                    let declared: Vec<NodeId> = tx
+                        .declared_reads()
+                        .iter()
+                        .chain(tx.declared_writes().iter())
+                        .copied()
+                        .collect();
+                    let ownership = resolve_owned_nodes(&view_snap, &declared);
+                    let executed =
+                        project_to_shard(&cached, tx.hash(), local_shard, num_shards, &ownership);
                     (executed.outcome(), StoredReceipt::from(executed))
                 })
                 .unzip();
@@ -403,14 +415,16 @@ where
                 .iter()
                 .map(|r| Arc::clone(&r.transaction))
                 .collect();
-            let cached =
-                batch_compute_cached(ctx.execution_cache.as_ref(), &txs, num_shards, |i| {
-                    let req = &requests[i];
-                    // Provisions only carry ownership for accounts owned by remote
-                    // shards. Local-shard ownership must be resolved from the local
-                    // snapshot and merged in; without it, vaults owned by local
-                    // accounts go unattributed and the cached output diverges across
-                    // shards. Provisions win conflicts — they're BFT-attested.
+
+            // Build the per-vnode merged ownership map once per request, then
+            // thread the same map through the executor (for `receipt_hash`)
+            // and `project_to_shard` (for the shard filter). The map is not
+            // cached: cross-shard packed vnodes share a process cache but see
+            // different remote provisions, so caching one vnode's map under
+            // `tx_hash` would corrupt the shard filter on the other.
+            let ownerships: Vec<HashMap<NodeId, NodeId>> = requests
+                .iter()
+                .map(|req| {
                     let declared: Vec<NodeId> = req
                         .transaction
                         .declared_reads()
@@ -418,23 +432,34 @@ where
                         .chain(req.transaction.declared_writes().iter())
                         .copied()
                         .collect();
-                    let mut ownership = req.ownership.clone();
-                    for (vault, owner) in resolve_owned_nodes(&view_snap, &declared) {
-                        ownership.entry(vault).or_insert(owner);
-                    }
+                    build_cross_shard_ownership(
+                        &view_snap,
+                        &declared,
+                        &req.ownership,
+                        local_shard,
+                        num_shards,
+                    )
+                })
+                .collect();
+
+            let cached =
+                batch_compute_cached(ctx.execution_cache.as_ref(), &txs, num_shards, |i| {
+                    let req = &requests[i];
                     ctx.executor.compute_vm_output_cross_shard(
                         &view_snap,
                         &req.transaction,
                         &req.provisions,
-                        ownership,
+                        &ownerships[i],
                     )
                 });
             let (tx_outcomes, results): (Vec<_>, Vec<_>) = requests
                 .iter()
                 .zip(cached)
-                .map(|(req, cached)| {
+                .zip(ownerships.iter())
+                .map(|((req, cached), ownership)| {
                     let tx_hash = req.transaction.hash();
-                    let executed = project_to_shard(&cached, tx_hash, local_shard, num_shards);
+                    let executed =
+                        project_to_shard(&cached, tx_hash, local_shard, num_shards, ownership);
                     (executed.outcome(), StoredReceipt::from(executed))
                 })
                 .unzip();

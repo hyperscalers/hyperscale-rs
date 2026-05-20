@@ -34,5 +34,5 @@ pub use output::ExecutedTx;
 // Re-export Radix types needed by engine callers (not storage-related).
 pub use radix_common::network::NetworkDefinition;
 pub use receipt::{CachedVmOutput, build_executed_tx, compute_vm_output, project_to_shard};
-pub use sharding::resolve_owned_nodes;
+pub use sharding::{build_cross_shard_ownership, resolve_owned_nodes};
 pub use validation::TransactionValidation;

@@ -58,11 +58,14 @@ pub struct CachedVmOutput {
 enum CachedVmOutputBody {
     /// VM rejected, aborted, or committed a `Failure` outcome.
     Failed,
-    /// VM committed a `Success` outcome.
+    /// VM committed a `Success` outcome. The `ownership` map is deliberately
+    /// not held here — it's per-vnode (mix of the caller's local snapshot and
+    /// provisions ownership) and would diverge across cross-shard packed
+    /// vnodes that share the cache. Callers pass their own map into
+    /// [`project_to_shard`] to derive the shard-filtered `database_updates`.
     Succeeded {
         raw_updates: DatabaseUpdates,
         declared_set: HashSet<NodeId>,
-        ownership: HashMap<NodeId, NodeId>,
         application_events: Vec<ApplicationEvent>,
         receipt_hash: GlobalReceiptHash,
     },
@@ -101,22 +104,18 @@ impl CachedVmOutput {
 /// Project a Radix Engine receipt into a [`CachedVmOutput`].
 ///
 /// `ownership` is the authoritative `vault → owning_account` map for this
-/// transaction's declared accounts. Callers source it deterministically:
-/// for single-shard execution, by walking the local snapshot (which has
-/// the declared accounts in full); for cross-shard execution, by merging
-/// the per-source-shard ownership maps shipped on each provision
-/// (`ProvisionEntry::owned_nodes`).
+/// transaction's declared accounts, consumed here for `receipt_hash` (via
+/// the shard-invariant `writes_root`). It is not stored on the returned
+/// output; callers pass their own ownership map to [`project_to_shard`].
 ///
-/// Doing the resolution outside `compute_vm_output` keeps this function
-/// independent of the storage view's coverage — every validator with
-/// identical `(tx, receipt, ownership)` inputs produces a byte-equal
-/// `CachedVmOutput`, which is what the shared `ProcessExecutionCache`
-/// relies on.
-#[allow(clippy::implicit_hasher)] // ownership is stored in CachedVmOutput, which fixes the hasher
+/// Source the map deterministically: [`crate::sharding::resolve_owned_nodes`]
+/// over the local snapshot for single-shard execution, or
+/// [`crate::sharding::build_cross_shard_ownership`] for cross-shard.
+#[allow(clippy::implicit_hasher)]
 pub fn compute_vm_output(
     tx: &RoutableTransaction,
     receipt: &TransactionReceipt,
-    ownership: HashMap<NodeId, NodeId>,
+    ownership: &HashMap<NodeId, NodeId>,
 ) -> CachedVmOutput {
     let TransactionResult::Commit(commit) = &receipt.result else {
         tracing::warn!(
@@ -149,7 +148,7 @@ pub fn compute_vm_output(
 
     let application_events = extract_application_events(commit);
     let raw_updates = extract_database_updates(receipt);
-    let global_updates = filter_updates_for_global_receipt(&raw_updates, &declared_set, &ownership);
+    let global_updates = filter_updates_for_global_receipt(&raw_updates, &declared_set, ownership);
     let writes_root = compute_writes_root(&global_updates);
 
     let event_hashes: Vec<Hash> = application_events
@@ -164,7 +163,6 @@ pub fn compute_vm_output(
         body: CachedVmOutputBody::Succeeded {
             raw_updates,
             declared_set,
-            ownership,
             application_events,
             receipt_hash,
         },
@@ -173,16 +171,21 @@ pub fn compute_vm_output(
 
 /// Build an [`ExecutedTx`] for `local_shard` from a [`CachedVmOutput`].
 ///
-/// Runs the cheap per-shard step: `filter_updates_for_shard` over the
-/// cached `raw_updates` + `ownership` + `declared_set`, then assembles
-/// the `ExecutedTx`. Safe to call repeatedly with different `local_shard`
-/// values against the same cached output.
+/// Runs the per-shard step: `filter_updates_for_shard` over the cached
+/// `raw_updates` + `declared_set` and the caller-supplied `ownership`,
+/// then assembles the `ExecutedTx`. The filter output is sorted before
+/// hashing so `ConsensusReceipt::local_receipt_hash` is order-stable.
+///
+/// `ownership` is per-vnode and not held in the cache — see
+/// [`crate::sharding::build_cross_shard_ownership`].
+#[allow(clippy::implicit_hasher)]
 #[must_use]
 pub fn project_to_shard(
     cached: &CachedVmOutput,
     tx_hash: TxHash,
     local_shard: ShardGroupId,
     num_shards: u64,
+    ownership: &HashMap<NodeId, NodeId>,
 ) -> ExecutedTx {
     match &cached.body {
         CachedVmOutputBody::Failed => {
@@ -191,7 +194,6 @@ pub fn project_to_shard(
         CachedVmOutputBody::Succeeded {
             raw_updates,
             declared_set,
-            ownership,
             application_events,
             receipt_hash,
         } => {
@@ -203,11 +205,8 @@ pub fn project_to_shard(
                 ownership,
             );
             // Canonicalise key order so `ConsensusReceipt::local_receipt_hash`
-            // (which SBOR-encodes the IndexMap directly) is identical across
-            // validators. `raw_updates` order depends on which vnode won the
-            // `ProcessExecutionCache` claim — without this sort, same-shard
-            // validators that race differently produce divergent local receipt
-            // hashes even though `writes_root` (which sorts) agrees.
+            // (which SBOR-encodes the IndexMap directly) is order-stable
+            // across validators regardless of `raw_updates` insertion order.
             sort_database_updates(&mut database_updates);
             let consensus = ConsensusReceipt::Succeeded {
                 receipt_hash: *receipt_hash,
@@ -224,16 +223,16 @@ pub fn project_to_shard(
 /// cache the intermediate.
 ///
 /// See [`compute_vm_output`] for how to source `ownership`.
-#[allow(clippy::implicit_hasher)] // forwards ownership into compute_vm_output's fixed-hasher store
+#[allow(clippy::implicit_hasher)]
 pub fn build_executed_tx(
     tx: &RoutableTransaction,
     receipt: &TransactionReceipt,
-    ownership: HashMap<NodeId, NodeId>,
+    ownership: &HashMap<NodeId, NodeId>,
     local_shard: ShardGroupId,
     num_shards: u64,
 ) -> ExecutedTx {
     let cached = compute_vm_output(tx, receipt, ownership);
-    project_to_shard(&cached, tx.hash(), local_shard, num_shards)
+    project_to_shard(&cached, tx.hash(), local_shard, num_shards, ownership)
 }
 
 /// Build `ExecutionMetadata` from a Radix Engine receipt.

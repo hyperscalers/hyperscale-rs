@@ -138,6 +138,66 @@ pub fn resolve_owned_nodes<S: SubstateDatabase>(
     ownership
 }
 
+/// Build the per-vnode merged `vault → owning_account` map for a
+/// cross-shard transaction.
+///
+/// Each entry is sourced from the shard whose account owns the vault:
+/// provisions for remote-shard owners (the source shard's BFT-attested
+/// map) and a local-snapshot walk for local-shard owners.
+///
+/// Healthy state produces disjoint contributions. If a vault appears in
+/// both with different owners — typically an orphaned `Own(_)` reference
+/// upstream — local-resolve overrides the provision (the local snapshot
+/// is the strongest authority for local-shard vaults) and a warning is
+/// emitted so the inconsistency is visible.
+///
+/// Deterministic across same-shard validators: identical declared set +
+/// identical local state + identical BFT-attested provisions ⇒ identical
+/// merged map. Not cached — cross-shard packed vnodes that share a
+/// [`crate::ProcessExecutionCache`] entry see different remote provisions,
+/// so callers must invoke this per call before [`crate::project_to_shard`].
+#[allow(clippy::implicit_hasher)]
+#[must_use]
+pub fn build_cross_shard_ownership<S: SubstateDatabase>(
+    snapshot: &S,
+    declared: &[NodeId],
+    provisions_ownership: &HashMap<NodeId, NodeId>,
+    local_shard: ShardGroupId,
+    num_shards: u64,
+) -> HashMap<NodeId, NodeId> {
+    let mut merged: HashMap<NodeId, NodeId> = HashMap::new();
+    for (vault, owner) in provisions_ownership {
+        if shard_for_node(owner, num_shards) != local_shard {
+            merged.insert(*vault, *owner);
+        }
+    }
+    let local_declared: Vec<NodeId> = declared
+        .iter()
+        .filter(|n| shard_for_node(n, num_shards) == local_shard)
+        .copied()
+        .collect();
+    if local_declared.is_empty() {
+        return merged;
+    }
+    let local_ownership = resolve_owned_nodes(snapshot, &local_declared);
+    for (vault, owner) in local_ownership {
+        if shard_for_node(&owner, num_shards) != local_shard {
+            continue;
+        }
+        if let Some(existing) = merged.insert(vault, owner) {
+            tracing::warn!(
+                ?vault,
+                remote_owner = ?existing,
+                local_owner = ?owner,
+                "Cross-shard ownership conflict — local-resolve overrides provision. \
+                 Vault appears in both source-shard provision and local snapshot under \
+                 different accounts (likely an orphaned `Own(_)` reference upstream)."
+            );
+        }
+    }
+    merged
+}
+
 /// Scan raw SBOR bytes for `Own(NodeId)` references to internal entities.
 ///
 /// SBOR encodes `Own` as: `[0x90, <30 bytes NodeId>]`.
