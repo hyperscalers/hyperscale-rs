@@ -1,7 +1,14 @@
-//! Centralized remote block header coordination for cross-shard verification.
+//! Centralized **receive-side** remote block header coordination for
+//! cross-shard verification.
 //!
-//! This crate owns the full lifecycle of remote committed block headers:
+//! This crate owns the lifecycle of remote committed block headers as
+//! they arrive at this node from peer shards:
 //! receive → verify → store → notify → timeout → fallback request.
+//! It is the consumer-side staging area; the responder-side serve path
+//! (answering peers' `GetRemoteHeadersRequest`s for headers from this
+//! node's own committed chain) lives in `crates/node` and reads through
+//! `PendingChain::committed_header` — those are plain local-chain reads,
+//! not remote headers.
 //!
 //! ## Why a dedicated crate?
 //!
