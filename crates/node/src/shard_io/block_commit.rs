@@ -77,6 +77,7 @@ where
                 height: block_height,
                 receipts,
                 jmt_snapshot,
+                certified_block: None,
             },
         );
         prepared_commits
@@ -113,11 +114,15 @@ pub enum AccumulateDecision {
     Accepted {
         /// Height of the accepted block (used to advance the sync protocol).
         height: BlockHeight,
-        /// If `Some`, the `io_loop` should fire `BlockCommitted` immediately
-        /// with these handles. If `None`, persistence backpressure is active
-        /// and the flush closure will fire the event after the disk write
-        /// completes.
-        notify_now: Option<NotifyHandles>,
+        /// Block + QC for the accepted commit. The caller attaches the
+        /// pair to `PendingChain` so the BFT-committed-but-not-persisted
+        /// window is readable by fetch handlers, then — if `notify_now`
+        /// — uses the same handles to fire `BlockCommitted`.
+        handles: NotifyHandles,
+        /// True if the `io_loop` should fire `BlockCommitted` immediately.
+        /// False under persistence backpressure: the flush closure fires
+        /// the event after the disk write completes instead.
+        notify_now: bool,
     },
 }
 
@@ -321,6 +326,7 @@ where
                 height,
                 receipts,
                 jmt_snapshot,
+                certified_block: None,
             },
         );
 
@@ -390,24 +396,26 @@ where
         // too far behind (backpressure). When deferred, flush sends
         // BlockCommitted after the disk write instead.
         let persistence_lag = height.inner().saturating_sub(self.persisted_height.inner());
-        let notify_now_decision = persistence_lag <= Self::MAX_PERSISTENCE_LAG;
+        let notify_now = persistence_lag <= Self::MAX_PERSISTENCE_LAG;
 
-        let notify_now = if notify_now_decision {
-            Some((Arc::clone(&commit.block), Arc::clone(&commit.qc)))
-        } else {
+        if !notify_now {
             tracing::debug!(
                 height = height.inner(),
                 persisted = self.persisted_height.inner(),
                 lag = persistence_lag,
                 "Deferring BlockCommitted — persistence backpressure"
             );
-            None
-        };
+        }
 
-        commit.committed_notified = notify_now_decision;
+        let handles = (Arc::clone(&commit.block), Arc::clone(&commit.qc));
+        commit.committed_notified = notify_now;
         self.pending.push(commit);
 
-        AccumulateDecision::Accepted { height, notify_now }
+        AccumulateDecision::Accepted {
+            height,
+            handles,
+            notify_now,
+        }
     }
 
     /// Drain pending commits into a single async task on the I/O pool.
@@ -812,7 +820,8 @@ mod tests {
             match coord.accumulate(commit, now()) {
                 AccumulateDecision::Accepted {
                     height,
-                    notify_now: Some(_),
+                    notify_now: true,
+                    ..
                 } => assert_eq!(height, BlockHeight::new(h)),
                 _ => panic!("expected immediate notify at height {h}"),
             }
@@ -834,7 +843,7 @@ mod tests {
         );
         match coord.accumulate(commit, now()) {
             AccumulateDecision::Accepted {
-                notify_now: None, ..
+                notify_now: false, ..
             } => {}
             _ => panic!("expected deferred notify"),
         }
