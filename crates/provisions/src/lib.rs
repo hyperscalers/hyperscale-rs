@@ -16,6 +16,7 @@
 //!    downstream transaction execution.
 
 pub mod action_handlers;
+mod build;
 mod committed_tombstones;
 mod coordinator;
 mod expected;
@@ -26,6 +27,7 @@ mod store;
 mod verification;
 mod verified_headers;
 
+pub use build::build_provisions;
 pub use coordinator::{ProvisionConfig, ProvisionCoordinator, ProvisionMemoryStats};
 pub use outbound::{OutboundMemoryStats, OutboundProvisionTracker};
 pub use store::ProvisionStore;

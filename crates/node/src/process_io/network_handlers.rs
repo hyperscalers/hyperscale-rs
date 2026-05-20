@@ -132,7 +132,7 @@ where
             // and under load 40+ redundant generations per height cause CPU
             // thrashing.
 
-            let storage = Arc::clone(&self.shard_io(shard).storage);
+            let pending_chain = Arc::clone(&self.shard_io(shard).pending_chain);
             let num_shards = self.process.topology_snapshot.load().num_shards();
             let outbound_cache = Arc::clone(&self.shard_io(shard).caches.provision_store);
 
@@ -244,7 +244,8 @@ where
                             cache_key,
                         };
 
-                        let response = serve_provision_request(&*storage, shard, num_shards, &req);
+                        let response =
+                            serve_provision_request(&pending_chain, shard, num_shards, &req);
                         if let Some(p) = &response.provisions {
                             record_fetch_response_sent("provision", p.transactions().len());
                         }

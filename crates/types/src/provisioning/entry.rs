@@ -40,14 +40,26 @@ pub struct ProvisionEntry {
 }
 
 impl ProvisionEntry {
-    /// Build a `ProvisionEntry` from raw `Vec`s — wraps each in its bounded type.
+    /// Build a `ProvisionEntry` from raw `Vec`s — wraps each in its bounded
+    /// type and canonicalises all three fields on construction.
+    ///
+    /// `target_nodes` is sorted + deduped, `owned_nodes` is sorted by key,
+    /// and `entries` is sorted by `storage_key`. Both transports (gossip
+    /// emit and fetch serve) construct entries from the same logical
+    /// inputs but through different iteration paths; canonicalising here
+    /// rather than at each call site means a future field-ordering leak
+    /// can't slip past one caller.
     #[must_use]
     pub fn new(
         tx_hash: TxHash,
-        entries: Vec<SubstateEntry>,
-        target_nodes: Vec<NodeId>,
-        owned_nodes: Vec<(NodeId, NodeId)>,
+        mut entries: Vec<SubstateEntry>,
+        mut target_nodes: Vec<NodeId>,
+        mut owned_nodes: Vec<(NodeId, NodeId)>,
     ) -> Self {
+        target_nodes.sort();
+        target_nodes.dedup();
+        owned_nodes.sort_by_key(|(k, _)| *k);
+        entries.sort_by(|a, b| a.storage_key.cmp(&b.storage_key));
         Self {
             tx_hash,
             entries: entries.into(),

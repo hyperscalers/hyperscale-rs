@@ -1,9 +1,10 @@
 //! Pure provision functions invoked from the node's delegated-action dispatcher.
 //!
 //! These functions implement the source-side work for `FetchAndBroadcastProvisions`:
-//! reading state entries at a committed block height (via the JMT history) and
-//! grouping them by target shard with merkle inclusion proofs. They are kept
-//! free of node/runner concerns so the dispatcher only handles event plumbing.
+//! looping over target shards and calling [`build_provisions`] for each so
+//! that gossip emit and fetch serve share one assembly path.
+//!
+//! [`build_provisions`]: crate::build::build_provisions
 
 use std::collections::HashMap;
 use std::hash::BuildHasher;
@@ -11,8 +12,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use hyperscale_core::{Action, ActionContext, ProtocolEvent, ProvisionsRequest};
-use hyperscale_engine::fetch_state_entries;
-use hyperscale_engine::sharding::expand_nodes_with_owned_at_height;
 use hyperscale_jmt::TreeReader as JmtTreeReader;
 use hyperscale_metrics::record_signature_verification_latency;
 use hyperscale_network::Network;
@@ -20,32 +19,21 @@ use hyperscale_storage::tree::proofs::verify_proof;
 use hyperscale_storage::{Storage, SubstateStore, SubstateView, VersionedStore};
 use hyperscale_types::network::notification::ProvisionsNotification;
 use hyperscale_types::{
-    BlockHeight, NodeId, ProvisionEntry, Provisions, ShardGroupId, SubstateEntry, TxHash,
-    ValidatorId, state_provisions_message,
+    BlockHeight, Provisions, ShardGroupId, ValidatorId, state_provisions_message,
 };
 use tracing::warn;
 
-/// Per-tx fetched entries:
-/// (`tx_hash`, `target_shards_with_nodes`, `state_entries`, `owned_nodes`).
-///
-/// `owned_nodes` is the source-side authoritative `vault → owner` map for
-/// this tx's declared accounts on this shard. Shipped to receivers so
-/// cross-shard execution doesn't have to rediscover ownership by walking
-/// a possibly-incomplete merged view.
-type FetchedProvisionEntry = (
-    TxHash,
-    Vec<(ShardGroupId, Vec<NodeId>)>,
-    Arc<Vec<SubstateEntry>>,
-    Vec<(NodeId, NodeId)>,
-);
+use crate::build::build_provisions;
 
 /// One outbound provision batch destined for a single target shard.
-pub type ProvisionBatch = (Provisions, Vec<ValidatorId>);
+pub type ProvisionBatch = (Arc<Provisions>, Vec<ValidatorId>);
 
-/// Fetch state entries and assemble per-shard provision batches with merkle proofs.
+/// Build per-target-shard provision batches for the cross-shard broadcast.
 ///
-/// Returns an empty `Vec` when no entries could be fetched (e.g. JMT version
-/// unavailable for `block_height`); callers still emit an
+/// Loops over the recipient map (sorted by shard id for deterministic
+/// ordering) and delegates each target to [`build_provisions`]. Shards
+/// whose build returns `None` (JMT version unavailable) or has no
+/// matching transactions are silently skipped — callers still emit an
 /// `OutboundProvisionBroadcast` event so the state machine can mark the
 /// action complete.
 pub fn fetch_and_broadcast_provision<S, H>(
@@ -59,121 +47,20 @@ where
     S: SubstateStore + VersionedStore + JmtTreeReader + Sync,
     H: BuildHasher,
 {
-    let per_tx = fetch_entries_for_requests(view, requests, source_shard, block_height);
-    if per_tx.is_empty() {
-        warn!(
-            source_shard = source_shard.inner(),
-            block_height = block_height.inner(),
-            request_count = requests.len(),
-            "All fetch_state_entries failed — no provisions to broadcast"
-        );
-        return Vec::new();
-    }
-    build_provision_groups(view, per_tx, source_shard, block_height, shard_recipients)
-}
+    let mut sorted_recipients: Vec<_> = shard_recipients.iter().collect();
+    sorted_recipients.sort_by_key(|(shard, _)| **shard);
 
-/// Fetch state entries for each provision request at the committed block height.
-///
-/// Expands declared account `NodeId`s to include their owned vaults before
-/// fetching. The remote shard needs vault substates (balances) to execute
-/// transfers, not just the account's own substates.
-fn fetch_entries_for_requests<S>(
-    view: &SubstateView<S>,
-    requests: &[ProvisionsRequest],
-    source_shard: ShardGroupId,
-    block_height: BlockHeight,
-) -> Vec<FetchedProvisionEntry>
-where
-    S: SubstateStore + VersionedStore,
-{
-    let mut per_tx = Vec::with_capacity(requests.len());
-    for req in requests {
-        // Must use historical reads — current state may have new vaults that don't
-        // exist at block_height, causing the merkle proof to fail on the remote shard.
-        let Some((expanded_nodes, ownership)) =
-            expand_nodes_with_owned_at_height(view, &req.local_nodes, block_height)
+    let mut batches = Vec::with_capacity(sorted_recipients.len());
+    for (target_shard, recipients) in sorted_recipients {
+        let Some(provisions) =
+            build_provisions(view, source_shard, *target_shard, block_height, requests)
         else {
-            warn!(
-                source_shard = source_shard.inner(),
-                block_height = block_height.inner(),
-                tx_hash = %req.tx_hash,
-                "expand_nodes_with_owned_at_height: JMT version unavailable"
-            );
             continue;
         };
-        let Some(entries) = fetch_state_entries(view, &expanded_nodes, block_height) else {
-            warn!(
-                source_shard = source_shard.inner(),
-                block_height = block_height.inner(),
-                tx_hash = %req.tx_hash,
-                node_count = expanded_nodes.len(),
-                "fetch_state_entries returned None — JMT version unavailable"
-            );
+        if provisions.transactions().is_empty() {
             continue;
-        };
-        // Canonicalise the ownership map by key for deterministic wire encoding.
-        let mut owned_nodes: Vec<(NodeId, NodeId)> = ownership.into_iter().collect();
-        owned_nodes.sort_by_key(|(k, _)| *k);
-        per_tx.push((
-            req.tx_hash,
-            req.target_nodes.clone(),
-            Arc::new(entries),
-            owned_nodes,
-        ));
-    }
-    per_tx
-}
-
-/// Group fetched entries by target shard and generate one merkle proof per shard.
-fn build_provision_groups<S, H>(
-    view: &SubstateView<S>,
-    per_tx: Vec<FetchedProvisionEntry>,
-    source_shard: ShardGroupId,
-    block_height: BlockHeight,
-    shard_recipients: &HashMap<ShardGroupId, Vec<ValidatorId>, H>,
-) -> Vec<ProvisionBatch>
-where
-    S: SubstateStore + VersionedStore + JmtTreeReader + Sync,
-    H: BuildHasher,
-{
-    let mut shard_entries: HashMap<ShardGroupId, Vec<ProvisionEntry>> = HashMap::new();
-    for (tx_hash, targets, entries, owned_nodes) in per_tx {
-        for (target_shard, target_nodes) in targets {
-            shard_entries
-                .entry(target_shard)
-                .or_default()
-                .push(ProvisionEntry::new(
-                    tx_hash,
-                    (*entries).clone(),
-                    target_nodes,
-                    owned_nodes.clone(),
-                ));
         }
-    }
-
-    let mut sorted_shard_entries: Vec<_> = shard_entries.into_iter().collect();
-    sorted_shard_entries.sort_by_key(|(shard, _)| *shard);
-    let mut batches = Vec::with_capacity(sorted_shard_entries.len());
-    for (shard, transactions) in sorted_shard_entries {
-        let shard_keys: Vec<Vec<u8>> = transactions
-            .iter()
-            .flat_map(|te| te.entries.iter().map(|e| e.storage_key.0.clone()))
-            .collect();
-
-        let Some(proof) = view.generate_merkle_proofs_overlay(&shard_keys, block_height) else {
-            warn!(
-                source_shard = source_shard.inner(),
-                block_height = block_height.inner(),
-                target_shard = shard.inner(),
-                key_count = shard_keys.len(),
-                "generate_merkle_proofs returned None — JMT version unavailable"
-            );
-            continue;
-        };
-
-        let recipients = shard_recipients.get(&shard).cloned().unwrap_or_default();
-        let provisions = Provisions::new(source_shard, shard, block_height, proof, transactions);
-        batches.push((provisions, recipients));
+        batches.push((provisions, recipients.clone()));
     }
     batches
 }
@@ -245,11 +132,6 @@ where
             );
             let validator_id = ctx.topology_snapshot.local_validator_id();
             for (provisions, recipients) in batches {
-                if provisions.transactions().is_empty() {
-                    continue;
-                }
-                let provisions_arc = Arc::new(provisions);
-
                 // Register with the outbound tracker (populates the
                 // serving cache) on the main thread. A peer's
                 // provision.request that arrives between this notify and
@@ -257,14 +139,14 @@ where
                 // either hit RocksDB regen (post-persist) or trigger a
                 // fetch retry (pre-persist) — recoverable both ways.
                 ctx.notify_protocol(ProtocolEvent::OutboundProvisionBroadcast {
-                    provisions: Arc::clone(&provisions_arc),
-                    target_shard: provisions_arc.target_shard(),
+                    provisions: Arc::clone(&provisions),
+                    target_shard: provisions.target_shard(),
                 });
 
-                let msg = state_provisions_message(&provisions_arc);
+                let msg = state_provisions_message(&provisions);
                 let sig = ctx.signing_key.sign_v1(&msg);
                 let notification =
-                    ProvisionsNotification::new(Arc::clone(&provisions_arc), validator_id, sig);
+                    ProvisionsNotification::new(Arc::clone(&provisions), validator_id, sig);
                 ctx.network.notify(&recipients, &notification);
             }
         }
