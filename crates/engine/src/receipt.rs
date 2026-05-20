@@ -28,6 +28,7 @@ use radix_substate_store_interface::interface::{CreateDatabaseUpdates, DatabaseU
 use crate::output::ExecutedTx;
 use crate::sharding::{
     compute_writes_root, filter_updates_for_global_receipt, filter_updates_for_shard,
+    sort_database_updates,
 };
 
 /// Extract `DatabaseUpdates` from a transaction receipt.
@@ -194,13 +195,20 @@ pub fn project_to_shard(
             application_events,
             receipt_hash,
         } => {
-            let database_updates = filter_updates_for_shard(
+            let mut database_updates = filter_updates_for_shard(
                 raw_updates,
                 local_shard,
                 num_shards,
                 declared_set,
                 ownership,
             );
+            // Canonicalise key order so `ConsensusReceipt::local_receipt_hash`
+            // (which SBOR-encodes the IndexMap directly) is identical across
+            // validators. `raw_updates` order depends on which vnode won the
+            // `ProcessExecutionCache` claim — without this sort, same-shard
+            // validators that race differently produce divergent local receipt
+            // hashes even though `writes_root` (which sorts) agrees.
+            sort_database_updates(&mut database_updates);
             let consensus = ConsensusReceipt::Succeeded {
                 receipt_hash: *receipt_hash,
                 database_updates,

@@ -350,7 +350,7 @@ pub fn compute_writes_root(updates: &DatabaseUpdates) -> WritesRoot {
 }
 
 /// Sort every `IndexMap` inside `updates` by key, in-place.
-fn sort_database_updates(updates: &mut DatabaseUpdates) {
+pub(crate) fn sort_database_updates(updates: &mut DatabaseUpdates) {
     updates.node_updates.sort_keys();
     for node_updates in updates.node_updates.values_mut() {
         node_updates.partition_updates.sort_keys();
