@@ -152,6 +152,16 @@ where
 
     /// Resume the failure path after off-thread structural validation
     /// rejected the response.
+    ///
+    /// Root-mismatch reasons inspect body components that ride inside
+    /// elidable wave/tx/provision blobs. When rehydration filled those
+    /// from a poisoned local cache (e.g. a `FinalizedWave` holding
+    /// locally-divergent receipts under a canonical wave id), every
+    /// rehydrated retry would reject the same bytes. Mark the height for
+    /// force-full so the next attempt asks for a non-elided body and
+    /// bypasses the cache, then re-queue immediately like the rehydration
+    /// miss path. Header / QC identity mismatches inspect non-elidable
+    /// fields and are genuine peer-content issues — keep the backoff.
     pub(in crate::shard_loop) fn handle_sync_block_validation_failed(
         &mut self,
         height: BlockHeight,
@@ -159,10 +169,12 @@ where
     ) {
         tracing::warn!(height = height.inner(), reason, "Sync: rejecting response");
         record_sync_block_filtered("block", reason);
-        // Validation failure is a peer-content issue, not a transport
-        // exhaustion — apply the standard backoff so we don't spin if a
-        // peer keeps shipping malformed responses.
-        self.feed_block_sync_fetch_failed(height, FetchFailureKind::Transport);
+        if cache_sensitive_validation_failure(reason) {
+            self.io.syncs.block.mark_force_full_refetch(height);
+            self.feed_block_sync_fetch_failed(height, FetchFailureKind::Exhausted);
+        } else {
+            self.feed_block_sync_fetch_failed(height, FetchFailureKind::Transport);
+        }
     }
 
     // ─── Sync output processing + helpers ───────────────────────────────
@@ -304,6 +316,23 @@ where
         });
         self.process_block_sync_outputs(outputs);
     }
+}
+
+/// True for [`validate_synced_block`] failure reasons whose bytes can
+/// originate in local rehydration caches (transaction store, finalized
+/// wave store, provision store). A repeat from the same cache would
+/// reject identically; force-full bypasses elision on the next attempt.
+/// Header / QC identity mismatches (`height_mismatch`, `qc_hash_mismatch`,
+/// `qc_height_mismatch`) inspect non-elidable fields and are excluded.
+fn cache_sensitive_validation_failure(reason: &str) -> bool {
+    matches!(
+        reason,
+        "transaction_root_mismatch"
+            | "certificate_root_mismatch"
+            | "receipts_vs_ec_mismatch"
+            | "local_receipt_root_mismatch"
+            | "provision_root_mismatch"
+    )
 }
 
 /// Structural validation for a rehydrated synced block.
@@ -728,6 +757,35 @@ mod tests {
             validate_synced_block(HEIGHT, &certified).unwrap_err(),
             "local_receipt_root_mismatch"
         );
+    }
+
+    #[test]
+    fn cache_sensitive_classification_matches_validate_synced_block_reasons() {
+        // The classifier gates `mark_force_full_refetch` after a rehydrated
+        // response fails `validate_synced_block`. Each cache-sensitive
+        // reason inspects bytes that ride inside elidable bodies
+        // (transactions, finalized waves, provisions). Each non-sensitive
+        // reason inspects non-elidable header / QC identity fields. If a
+        // new failure reason is added to `validate_synced_block`, decide
+        // which bucket it belongs in and add it here.
+        for reason in [
+            "transaction_root_mismatch",
+            "certificate_root_mismatch",
+            "receipts_vs_ec_mismatch",
+            "local_receipt_root_mismatch",
+            "provision_root_mismatch",
+        ] {
+            assert!(
+                cache_sensitive_validation_failure(reason),
+                "{reason} should be classified as cache-sensitive"
+            );
+        }
+        for reason in ["height_mismatch", "qc_hash_mismatch", "qc_height_mismatch"] {
+            assert!(
+                !cache_sensitive_validation_failure(reason),
+                "{reason} should not be classified as cache-sensitive"
+            );
+        }
     }
 
     #[test]
