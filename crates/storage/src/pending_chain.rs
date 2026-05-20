@@ -532,12 +532,17 @@ impl<S: SubstateStore + VersionedStore> SubstateStore for SubstateView<S> {
             }
         }
 
-        Some(
-            substates
-                .into_iter()
-                .map(|((p, sk), v)| (p, sk, v))
-                .collect(),
-        )
+        // Sort to match the base path's order — `list_raw_values_for_node`
+        // returns entries sorted by `(partition, sort_key)`, so gossip
+        // emission off the overlay must do the same or a later fetch-serve
+        // over the persisted base produces a different `entries` Vec for
+        // the same logical provision.
+        let mut out: Vec<(u8, DbSortKey, Vec<u8>)> = substates
+            .into_iter()
+            .map(|((p, sk), v)| (p, sk, v))
+            .collect();
+        out.sort_by(|(p1, sk1, _), (p2, sk2, _)| p1.cmp(p2).then_with(|| sk1.cmp(sk2)));
+        Some(out)
     }
 
     fn generate_merkle_proofs(
