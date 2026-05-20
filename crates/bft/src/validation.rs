@@ -681,7 +681,7 @@ mod tests {
             ShardGroupId::new(1),
             BlockHeight::new(u64::from(seed)),
             MerkleInclusionProof::dummy(),
-            vec![ProvisionEntry::new(tx_hash, vec![], vec![])],
+            vec![ProvisionEntry::new(tx_hash, vec![], vec![], vec![])],
         ))
     }
 

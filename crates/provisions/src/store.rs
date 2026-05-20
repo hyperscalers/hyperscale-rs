@@ -164,6 +164,7 @@ mod tests {
                 TxHash::from_raw(Hash::from_bytes(&[tx_seed])),
                 vec![],
                 vec![],
+                vec![],
             )],
         ))
     }

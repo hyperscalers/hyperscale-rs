@@ -274,7 +274,7 @@ mod tests {
     ) -> Arc<Provisions> {
         let transactions: Vec<ProvisionEntry> = tx_hashes
             .into_iter()
-            .map(|tx_hash| ProvisionEntry::new(tx_hash, vec![], vec![]))
+            .map(|tx_hash| ProvisionEntry::new(tx_hash, vec![], vec![], vec![]))
             .collect();
         Arc::new(Provisions::new(
             source,

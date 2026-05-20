@@ -362,6 +362,7 @@ mod tests {
                         hash,
                         source_nodes.into_iter().map(make_entry).collect(),
                         target_nodes,
+                        vec![],
                     )
                 })
                 .collect(),

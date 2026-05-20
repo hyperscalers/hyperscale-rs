@@ -5,7 +5,8 @@ use std::collections::HashSet;
 use sbor::prelude::*;
 
 use crate::{
-    BoundedVec, MAX_DECLARED_NODES_PER_TX, MAX_STATE_ENTRIES_PER_TX, NodeId, SubstateEntry, TxHash,
+    BoundedVec, MAX_DECLARED_NODES_PER_TX, MAX_OWNED_NODES_PER_TX, MAX_STATE_ENTRIES_PER_TX,
+    NodeId, SubstateEntry, TxHash,
 };
 
 /// Per-transaction state entries within a provision.
@@ -26,16 +27,32 @@ pub struct ProvisionEntry {
     /// overlap in both directions (source nodes vs local needs, AND target
     /// nodes vs local owns).
     pub target_nodes: BoundedVec<NodeId, MAX_DECLARED_NODES_PER_TX>,
+
+    /// Authoritative `(internal_node, owning_account)` pairs the source
+    /// shard resolved for this transaction's declared accounts at
+    /// `block_height`.
+    ///
+    /// Receivers consume this directly during cross-shard execution
+    /// instead of rediscovering ownership by walking a possibly-partial
+    /// merged view. Encoded in canonical key order so two source nodes
+    /// resolving the same accounts produce byte-equal payloads.
+    pub owned_nodes: BoundedVec<(NodeId, NodeId), MAX_OWNED_NODES_PER_TX>,
 }
 
 impl ProvisionEntry {
     /// Build a `ProvisionEntry` from raw `Vec`s — wraps each in its bounded type.
     #[must_use]
-    pub fn new(tx_hash: TxHash, entries: Vec<SubstateEntry>, target_nodes: Vec<NodeId>) -> Self {
+    pub fn new(
+        tx_hash: TxHash,
+        entries: Vec<SubstateEntry>,
+        target_nodes: Vec<NodeId>,
+        owned_nodes: Vec<(NodeId, NodeId)>,
+    ) -> Self {
         Self {
             tx_hash,
             entries: entries.into(),
             target_nodes: target_nodes.into(),
+            owned_nodes: owned_nodes.into(),
         }
     }
 
@@ -69,6 +86,7 @@ mod tests {
             TxHash::from_raw(Hash::from_bytes(b"tx")),
             vec![sample_entry(1), sample_entry(2)],
             vec![NodeId([3u8; 30]), NodeId([4u8; 30])],
+            vec![(NodeId([5u8; 30]), NodeId([3u8; 30]))],
         );
         let bytes = basic_encode(&entry).unwrap();
         let decoded: ProvisionEntry = basic_decode(&bytes).unwrap();
@@ -82,7 +100,7 @@ mod tests {
         enc.write_payload_prefix(BASIC_SBOR_V1_PAYLOAD_PREFIX)
             .unwrap();
         enc.write_value_kind(ValueKind::Tuple).unwrap();
-        enc.write_size(3).unwrap();
+        enc.write_size(4).unwrap();
         enc.encode(&TxHash::from_raw(Hash::from_bytes(b"tx")))
             .unwrap();
         enc.write_value_kind(ValueKind::Array).unwrap();
@@ -105,7 +123,7 @@ mod tests {
         enc.write_payload_prefix(BASIC_SBOR_V1_PAYLOAD_PREFIX)
             .unwrap();
         enc.write_value_kind(ValueKind::Tuple).unwrap();
-        enc.write_size(3).unwrap();
+        enc.write_size(4).unwrap();
         enc.encode(&TxHash::from_raw(Hash::from_bytes(b"tx")))
             .unwrap();
         enc.encode(&Vec::<SubstateEntry>::new()).unwrap();
@@ -119,6 +137,32 @@ mod tests {
                 expected: MAX_DECLARED_NODES_PER_TX,
                 actual,
             } if actual == MAX_DECLARED_NODES_PER_TX + 1
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_oversized_owned_nodes() {
+        let mut buf = Vec::with_capacity(64);
+        let mut enc = VecEncoder::<NoCustomValueKind>::new(&mut buf, BASIC_SBOR_V1_MAX_DEPTH);
+        enc.write_payload_prefix(BASIC_SBOR_V1_PAYLOAD_PREFIX)
+            .unwrap();
+        enc.write_value_kind(ValueKind::Tuple).unwrap();
+        enc.write_size(4).unwrap();
+        enc.encode(&TxHash::from_raw(Hash::from_bytes(b"tx")))
+            .unwrap();
+        enc.encode(&Vec::<SubstateEntry>::new()).unwrap();
+        enc.encode(&Vec::<NodeId>::new()).unwrap();
+        enc.write_value_kind(ValueKind::Array).unwrap();
+        enc.write_value_kind(<(NodeId, NodeId)>::value_kind())
+            .unwrap();
+        enc.write_size(MAX_OWNED_NODES_PER_TX + 1).unwrap();
+        let err = basic_decode::<ProvisionEntry>(&buf).unwrap_err();
+        assert!(matches!(
+            err,
+            DecodeError::UnexpectedSize {
+                expected: MAX_OWNED_NODES_PER_TX,
+                actual,
+            } if actual == MAX_OWNED_NODES_PER_TX + 1
         ));
     }
 }

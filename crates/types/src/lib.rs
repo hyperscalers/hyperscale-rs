@@ -74,8 +74,8 @@ pub use primitives::merkle::{
 pub use primitives::signer_bitfield::SignerBitfield;
 pub use provisioning::entry::ProvisionEntry;
 pub use provisioning::limits::{
-    MAX_MERKLE_PROOF_LEN, MAX_STATE_ENTRIES_PER_TX, MAX_STATE_ENTRY_KEY_LEN,
-    MAX_STATE_ENTRY_VALUE_LEN,
+    MAX_MERKLE_PROOF_LEN, MAX_OWNED_NODES_PER_TX, MAX_STATE_ENTRIES_PER_TX,
+    MAX_STATE_ENTRY_KEY_LEN, MAX_STATE_ENTRY_VALUE_LEN,
 };
 pub use provisioning::proof::MerkleInclusionProof;
 pub use provisioning::provisions::Provisions;

@@ -153,18 +153,25 @@ fn extract_owned_node_ids(value: &[u8], owner: NodeId, ownership: &mut HashMap<N
 }
 
 /// Expand declared `NodeId`s to include owned internal nodes (vaults) at a
-/// specific block height.
+/// specific block height, returning both the expanded list and the
+/// `vault → owner` map that produced it.
 ///
 /// Reads substates via JMT historical traversal. This is critical for provision
 /// generation:
 /// the expanded node list must match the state at the committed block height,
 /// not the current tip, otherwise the merkle proof will cover keys that don't
 /// exist at the proof's version and verification will fail on the remote shard.
+///
+/// The returned ownership map is what the source shard authoritatively knows
+/// about its own declared accounts. It is shipped alongside the substate
+/// entries so the receiver doesn't have to rediscover ownership by walking
+/// a partial view (which would diverge whenever the source shipped only a
+/// subset of the account's partitions).
 pub fn expand_nodes_with_owned_at_height<S: SubstateStore>(
     storage: &S,
     nodes: &[NodeId],
     block_height: BlockHeight,
-) -> Option<Vec<NodeId>> {
+) -> Option<(Vec<NodeId>, HashMap<NodeId, NodeId>)> {
     let ownership = resolve_owned_nodes_at_height(storage, nodes, block_height)?;
     let mut expanded: Vec<NodeId> = nodes.to_vec();
     for internal_id in ownership.keys() {
@@ -174,14 +181,14 @@ pub fn expand_nodes_with_owned_at_height<S: SubstateStore>(
     }
     expanded.sort();
     expanded.dedup();
-    Some(expanded)
+    Some((expanded, ownership))
 }
 
 /// Historical version of [`resolve_owned_nodes`].
 ///
 /// Reads substates at `block_height` using `list_substates_for_node_at_height`.
 /// Returns `None` if the version is unavailable (GC'd or not yet committed).
-fn resolve_owned_nodes_at_height<S: SubstateStore>(
+pub fn resolve_owned_nodes_at_height<S: SubstateStore>(
     storage: &S,
     declared_nodes: &[NodeId],
     block_height: BlockHeight,
@@ -942,20 +949,23 @@ mod tests {
         );
 
         // Pass `vault` in declared list too — must not duplicate after dedup.
-        let expanded =
+        let (expanded, ownership) =
             expand_nodes_with_owned_at_height(&store, &[account, vault], height).expect("present");
         let mut expected = vec![account, vault];
         expected.sort();
         assert_eq!(expanded, expected);
+        assert_eq!(ownership.get(&vault), Some(&account));
     }
 
     #[test]
     fn expand_at_height_returns_declared_when_no_ownership() {
         let account = account_id(1);
         let store = MockStore::default(); // no substates at any height
-        let expanded = expand_nodes_with_owned_at_height(&store, &[account], BlockHeight::new(5))
-            .expect("present");
+        let (expanded, ownership) =
+            expand_nodes_with_owned_at_height(&store, &[account], BlockHeight::new(5))
+                .expect("present");
         assert_eq!(expanded, vec![account]);
+        assert!(ownership.is_empty());
     }
 
     // ── Cross-shard merged-view invariance ───────────────────────────────────
@@ -1031,7 +1041,7 @@ mod tests {
             make_set_update(v_meta, 0, vec![0], vec![1]),
         );
 
-        let declared_set: HashSet<NodeId> = [a_0].into_iter().collect();
+        let declared_set: HashSet<NodeId> = std::iter::once(a_0).collect();
         let global_0 = filter_updates_for_global_receipt(&raw_updates, &declared_set, &ownership_0);
         let global_1 = filter_updates_for_global_receipt(&raw_updates, &declared_set, &ownership_1);
 

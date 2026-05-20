@@ -37,3 +37,12 @@ pub const MAX_MERKLE_PROOF_LEN: usize = 4 * 1024 * 1024;
 /// headroom for any realistic Radix tx and rejects obviously oversized
 /// arrivals before allocation.
 pub const MAX_STATE_ENTRIES_PER_TX: usize = 16_384;
+
+/// Cap on `ProvisionEntry.owned_nodes` length at decode time.
+///
+/// One entry per `(internal_node, owning_account)` pair the source shard
+/// authoritatively resolved. Bounded by the number of internal nodes a
+/// tx's declared accounts can own — comfortably under
+/// [`MAX_STATE_ENTRIES_PER_TX`](MAX_STATE_ENTRIES_PER_TX), reused here for
+/// simplicity.
+pub const MAX_OWNED_NODES_PER_TX: usize = MAX_STATE_ENTRIES_PER_TX;

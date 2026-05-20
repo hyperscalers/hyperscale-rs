@@ -25,11 +25,18 @@ use hyperscale_types::{
 };
 use tracing::warn;
 
-/// Per-tx fetched entries: (`tx_hash`, `target_shards_with_nodes`, `state_entries`).
+/// Per-tx fetched entries:
+/// (`tx_hash`, `target_shards_with_nodes`, `state_entries`, `owned_nodes`).
+///
+/// `owned_nodes` is the source-side authoritative `vault → owner` map for
+/// this tx's declared accounts on this shard. Shipped to receivers so
+/// cross-shard execution doesn't have to rediscover ownership by walking
+/// a possibly-incomplete merged view.
 type FetchedProvisionEntry = (
     TxHash,
     Vec<(ShardGroupId, Vec<NodeId>)>,
     Arc<Vec<SubstateEntry>>,
+    Vec<(NodeId, NodeId)>,
 );
 
 /// One outbound provision batch destined for a single target shard.
@@ -83,7 +90,7 @@ where
     for req in requests {
         // Must use historical reads — current state may have new vaults that don't
         // exist at block_height, causing the merkle proof to fail on the remote shard.
-        let Some(expanded_nodes) =
+        let Some((expanded_nodes, ownership)) =
             expand_nodes_with_owned_at_height(view, &req.local_nodes, block_height)
         else {
             warn!(
@@ -104,7 +111,15 @@ where
             );
             continue;
         };
-        per_tx.push((req.tx_hash, req.target_nodes.clone(), Arc::new(entries)));
+        // Canonicalise the ownership map by key for deterministic wire encoding.
+        let mut owned_nodes: Vec<(NodeId, NodeId)> = ownership.into_iter().collect();
+        owned_nodes.sort_by_key(|(k, _)| *k);
+        per_tx.push((
+            req.tx_hash,
+            req.target_nodes.clone(),
+            Arc::new(entries),
+            owned_nodes,
+        ));
     }
     per_tx
 }
@@ -122,7 +137,7 @@ where
     H: BuildHasher,
 {
     let mut shard_entries: HashMap<ShardGroupId, Vec<ProvisionEntry>> = HashMap::new();
-    for (tx_hash, targets, entries) in per_tx {
+    for (tx_hash, targets, entries, owned_nodes) in per_tx {
         for (target_shard, target_nodes) in targets {
             shard_entries
                 .entry(target_shard)
@@ -131,6 +146,7 @@ where
                     tx_hash,
                     (*entries).clone(),
                     target_nodes,
+                    owned_nodes.clone(),
                 ));
         }
     }

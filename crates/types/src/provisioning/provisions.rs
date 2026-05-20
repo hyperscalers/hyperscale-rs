@@ -286,6 +286,7 @@ mod tests {
             TxHash::from_raw(Hash::from_bytes(b"tx")),
             vec![test_entry(1), test_entry(2)],
             vec![],
+            vec![],
         );
         let nodes = tx.node_ids();
         assert_eq!(nodes.len(), 2);
@@ -303,6 +304,7 @@ mod tests {
             vec![ProvisionEntry::new(
                 TxHash::from_raw(Hash::from_bytes(b"tx1")),
                 vec![test_entry(1)],
+                vec![],
                 vec![],
             )],
         );
@@ -325,10 +327,12 @@ mod tests {
                     TxHash::from_raw(Hash::from_bytes(b"tx1")),
                     vec![entry.clone()],
                     vec![],
+                    vec![],
                 ),
                 ProvisionEntry::new(
                     TxHash::from_raw(Hash::from_bytes(b"tx2")),
                     vec![entry, test_entry(2)],
+                    vec![],
                     vec![],
                 ),
             ],
