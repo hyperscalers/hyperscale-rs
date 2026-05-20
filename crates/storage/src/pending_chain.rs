@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use hyperscale_jmt::{Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_types::{
-    Block, BlockHash, BlockHeight, ConsensusReceipt, FinalizedWave, MerkleInclusionProof, NodeId,
-    QuorumCertificate, StateRoot,
+    Block, BlockHash, BlockHeight, CertifiedBlock, CommittedBlockHeader, ConsensusReceipt,
+    FinalizedWave, MerkleInclusionProof, NodeId, QuorumCertificate, RoutableTransaction, StateRoot,
 };
 use radix_common::prelude::DatabaseUpdate;
 use radix_substate_store_interface::interface::SubstateDatabase;
@@ -44,6 +44,13 @@ pub struct ChainEntry {
     pub receipts: Vec<Arc<ConsensusReceipt>>,
     /// JMT snapshot from this block's speculative state-root computation.
     pub jmt_snapshot: Arc<JmtSnapshot>,
+    /// BFT-committed block paired with its QC. `None` until the entry's
+    /// block reaches the commit pipeline — JMT preparation happens before
+    /// the QC arrives. Attached by
+    /// [`PendingChain::attach_certified_block`] from
+    /// `BlockCommitCoordinator::accumulate`, making the block visible to
+    /// fetch handlers throughout the BFT-committed / JMT-persisted window.
+    pub certified_block: Option<Arc<CertifiedBlock>>,
 }
 
 /// Append-only index of pending block state, shared between the `io_loop`
@@ -120,6 +127,74 @@ where
             },
             |h| self.view_at(h),
         )
+    }
+
+    /// Attach the [`CertifiedBlock`] to the entry inserted earlier at
+    /// JMT-prep time, making the block readable through
+    /// [`Self::certified_block`] / [`Self::committed_header`] /
+    /// [`Self::transactions_for_block`] while persistence is still
+    /// catching up.
+    ///
+    /// Idempotent: a no-op if no entry exists for `block_hash` (the entry
+    /// was pruned, or sync raced ahead of prepare). Callers don't need to
+    /// special-case skipped commits.
+    pub fn attach_certified_block(&self, block_hash: BlockHash, certified: Arc<CertifiedBlock>) {
+        if let Some(entry) = write_or_recover(&self.entries).get_mut(&block_hash) {
+            entry.certified_block = Some(certified);
+        }
+    }
+
+    /// BFT-committed block at `height`. Returns `Some` for any height
+    /// `<= committed_height`, regardless of whether JMT persistence has
+    /// caught up: the pending entry serves the unpersisted window, then
+    /// the base store takes over.
+    ///
+    /// Forks may produce multiple pending entries at the same height;
+    /// only the entry whose block won certification ever gets a
+    /// `certified_block`, so iteration here is unambiguous.
+    pub fn certified_block(&self, height: BlockHeight) -> Option<Arc<CertifiedBlock>> {
+        let pending = self.pending_certified_at(height);
+        if pending.is_some() {
+            return pending;
+        }
+        self.base.get_block(height).map(Arc::new)
+    }
+
+    /// Committed header at `height`. Header-only view of
+    /// [`Self::certified_block`] — pending entry first, base store fallback.
+    pub fn committed_header(&self, height: BlockHeight) -> Option<Arc<CommittedBlockHeader>> {
+        if let Some(certified) = self.pending_certified_at(height) {
+            return Some(Arc::new(CommittedBlockHeader::new(
+                certified.block().header().clone(),
+                certified.qc().clone(),
+            )));
+        }
+        self.base.get_committed_header(height).map(Arc::new)
+    }
+
+    /// Transactions in the block at `height`. Pending entry first, base
+    /// store fallback. Each tx is `Arc`-cloned from the pending block —
+    /// callers receive shared refcounts, not deep copies.
+    pub fn transactions_for_block(
+        &self,
+        height: BlockHeight,
+    ) -> Option<Vec<Arc<RoutableTransaction>>> {
+        if let Some(certified) = self.pending_certified_at(height) {
+            return Some(certified.block().transactions().iter().cloned().collect());
+        }
+        let certified = self.base.get_block(height)?;
+        Some(certified.block().transactions().iter().cloned().collect())
+    }
+
+    /// Look up the pending entry at `height` that has a `certified_block`
+    /// attached. Scoped so the read lock drops before the result is used —
+    /// holding it across the caller's match arms would chain the lock
+    /// lifetime to base-storage reads on the fall-through path.
+    fn pending_certified_at(&self, height: BlockHeight) -> Option<Arc<CertifiedBlock>> {
+        read_or_recover(&self.entries)
+            .values()
+            .find(|e| e.height == height)
+            .and_then(|e| e.certified_block.clone())
     }
 
     /// Walk `parent_block_hash` back through ancestors and flatten the chain
@@ -662,9 +737,19 @@ mod tests {
     use crate::BlockForSync;
 
     /// Minimal stub implementing every trait `PendingChain<S>` requires.
-    /// Returns no data — tests only exercise the overlay and chain-walk
-    /// behavior, not the base storage.
-    struct StubStore;
+    /// Returns no data by default; tests that need persisted fall-through
+    /// for the chain-reader methods inject blocks via `with_block`.
+    #[derive(Default)]
+    struct StubStore {
+        blocks: HashMap<BlockHeight, CertifiedBlock>,
+    }
+
+    impl StubStore {
+        fn with_block(mut self, certified: CertifiedBlock) -> Self {
+            self.blocks.insert(certified.height(), certified);
+            self
+        }
+    }
 
     impl SubstateDatabase for StubStore {
         fn get_raw_substate_by_db_key(
@@ -745,11 +830,13 @@ mod tests {
     }
 
     impl ChainReader for StubStore {
-        fn get_block(&self, _height: BlockHeight) -> Option<CertifiedBlock> {
-            None
+        fn get_block(&self, height: BlockHeight) -> Option<CertifiedBlock> {
+            self.blocks.get(&height).cloned()
         }
-        fn get_committed_header(&self, _height: BlockHeight) -> Option<CommittedBlockHeader> {
-            None
+        fn get_committed_header(&self, height: BlockHeight) -> Option<CommittedBlockHeader> {
+            self.blocks
+                .get(&height)
+                .map(|c| CommittedBlockHeader::new(c.block().header().clone(), c.qc().clone()))
         }
         fn committed_height(&self) -> BlockHeight {
             BlockHeight::new(0)
@@ -828,6 +915,7 @@ mod tests {
             height,
             receipts: vec![make_receipt(updates)],
             jmt_snapshot: empty_snapshot(),
+            certified_block: None,
         }
     }
 
@@ -836,7 +924,15 @@ mod tests {
     }
 
     fn empty_chain() -> Arc<PendingChain<StubStore>> {
-        Arc::new(PendingChain::new(Arc::new(StubStore)))
+        Arc::new(PendingChain::new(Arc::new(StubStore::default())))
+    }
+
+    fn chain_with_persisted(blocks: Vec<CertifiedBlock>) -> Arc<PendingChain<StubStore>> {
+        let mut stub = StubStore::default();
+        for b in blocks {
+            stub = stub.with_block(b);
+        }
+        Arc::new(PendingChain::new(Arc::new(stub)))
     }
 
     #[test]
@@ -956,5 +1052,104 @@ mod tests {
             view.get_raw_substate_by_db_key(&pk, &DbSortKey(vec![1])),
             None,
         );
+    }
+
+    // ── chain reader accessors ────────────────────────────────────────
+
+    use crate::test_helpers::{make_test_block, make_test_qc};
+
+    fn make_certified(height: BlockHeight) -> Arc<CertifiedBlock> {
+        let block = make_test_block(height);
+        let qc = make_test_qc(&block);
+        Arc::new(CertifiedBlock::new_unchecked(block, qc))
+    }
+
+    fn insert_pending(
+        chain: &PendingChain<StubStore>,
+        height: BlockHeight,
+        attach: bool,
+    ) -> Arc<CertifiedBlock> {
+        let certified = make_certified(height);
+        let block_hash = certified.block().hash();
+        chain.insert(
+            block_hash,
+            ChainEntry {
+                parent_block_hash: BlockHash::ZERO,
+                height,
+                receipts: Vec::new(),
+                jmt_snapshot: empty_snapshot(),
+                certified_block: None,
+            },
+        );
+        if attach {
+            chain.attach_certified_block(block_hash, Arc::clone(&certified));
+        }
+        certified
+    }
+
+    #[test]
+    fn certified_block_returns_pending_after_attach() {
+        let chain = empty_chain();
+        let certified = insert_pending(&chain, BlockHeight::new(5), true);
+        let got = chain
+            .certified_block(BlockHeight::new(5))
+            .expect("should find pending block at h=5");
+        assert_eq!(got.block().hash(), certified.block().hash());
+    }
+
+    #[test]
+    fn certified_block_returns_none_before_attach() {
+        // Entry inserted at JMT-prep time but accumulate has not run —
+        // block is not BFT-committed yet, so it must not be visible.
+        let chain = empty_chain();
+        let _ = insert_pending(&chain, BlockHeight::new(5), false);
+        assert!(chain.certified_block(BlockHeight::new(5)).is_none());
+    }
+
+    #[test]
+    fn certified_block_falls_through_to_storage_for_persisted_heights() {
+        let persisted = make_certified(BlockHeight::new(3));
+        let chain = chain_with_persisted(vec![(*persisted).clone()]);
+        let got = chain
+            .certified_block(BlockHeight::new(3))
+            .expect("should fall through to persisted storage");
+        assert_eq!(got.block().hash(), persisted.block().hash());
+    }
+
+    #[test]
+    fn certified_block_returns_none_for_unknown_height() {
+        let chain = empty_chain();
+        assert!(chain.certified_block(BlockHeight::new(99)).is_none());
+    }
+
+    #[test]
+    fn committed_header_pending_persisted_and_missing() {
+        let persisted = make_certified(BlockHeight::new(2));
+        let chain = chain_with_persisted(vec![(*persisted).clone()]);
+        let pending = insert_pending(&chain, BlockHeight::new(7), true);
+
+        let p = chain
+            .committed_header(BlockHeight::new(7))
+            .expect("pending header");
+        assert_eq!(p.block_hash(), pending.block().hash());
+
+        let s = chain
+            .committed_header(BlockHeight::new(2))
+            .expect("persisted header");
+        assert_eq!(s.block_hash(), persisted.block().hash());
+
+        assert!(chain.committed_header(BlockHeight::new(42)).is_none());
+    }
+
+    #[test]
+    fn transactions_for_block_pending_persisted_and_missing() {
+        let persisted = make_certified(BlockHeight::new(4));
+        let chain = chain_with_persisted(vec![(*persisted).clone()]);
+        let _ = insert_pending(&chain, BlockHeight::new(9), true);
+
+        // `make_test_block` produces an empty tx list — assert presence, not contents.
+        assert!(chain.transactions_for_block(BlockHeight::new(9)).is_some());
+        assert!(chain.transactions_for_block(BlockHeight::new(4)).is_some());
+        assert!(chain.transactions_for_block(BlockHeight::new(99)).is_none());
     }
 }

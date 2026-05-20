@@ -280,7 +280,11 @@ where
         let decision = self.io.block_commit.accumulate(commit, now);
         match decision {
             AccumulateDecision::Skip => {}
-            AccumulateDecision::Accepted { height, notify_now } => {
+            AccumulateDecision::Accepted {
+                height,
+                handles: (block, qc),
+                notify_now,
+            } => {
                 debug!(height = height.inner(), "Block committed");
                 let outputs = self
                     .io
@@ -288,12 +292,17 @@ where
                     .block
                     .handle(BlockSyncInput::Admitted { scope: (), height });
                 self.process_block_sync_outputs(outputs);
-                if let Some((block, qc)) = notify_now {
-                    let weighted_ts = qc.weighted_timestamp();
-                    let certified = Arc::new(CertifiedBlock::new_unchecked(
-                        Arc::unwrap_or_clone(block),
-                        Arc::unwrap_or_clone(qc),
-                    ));
+
+                let weighted_ts = qc.weighted_timestamp();
+                let block_hash = block.hash();
+                let certified = Arc::new(CertifiedBlock::new_unchecked(
+                    Arc::unwrap_or_clone(block),
+                    Arc::unwrap_or_clone(qc),
+                ));
+                self.io
+                    .pending_chain
+                    .attach_certified_block(block_hash, Arc::clone(&certified));
+                if notify_now {
                     self.process
                         .dispatch_handles
                         .execution_cache
