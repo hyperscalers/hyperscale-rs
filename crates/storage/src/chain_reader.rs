@@ -56,11 +56,21 @@ pub trait ChainReader: Send + Sync + 'static {
     /// Get the latest quorum certificate.
     fn latest_qc(&self) -> Option<QuorumCertificate>;
 
-    /// Get a complete block for serving sync requests.
+    /// Get a complete block for serving sync requests from persisted
+    /// storage.
     ///
     /// Returns `Some(BlockForSync)` only if the full block is available
     /// with all transactions and certificates. Returns `None` if any
-    /// data is missing.
+    /// data is missing — including heights that are BFT-committed but
+    /// not yet persisted, which on its own would cause the persistence-race
+    /// livelock under cross-shard load.
+    ///
+    /// Network serve handlers should not call this directly. Use
+    /// [`PendingChain::block_for_sync`] instead — it spans the
+    /// BFT-committed / JMT-persisted window before falling through to this
+    /// method on the base store.
+    ///
+    /// [`PendingChain::block_for_sync`]: crate::PendingChain::block_for_sync
     fn get_block_for_sync(&self, height: BlockHeight) -> Option<BlockForSync>;
 
     /// Get multiple transactions by hash (batch read).

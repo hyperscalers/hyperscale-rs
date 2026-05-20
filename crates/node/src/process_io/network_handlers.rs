@@ -101,7 +101,10 @@ where
         const MAX_WAITERS_PER_KEY: usize = 64;
 
         // One set of request handlers per hosted shard — each handler
-        // closure captures that shard's storage and caches.
+        // closure captures that shard's `PendingChain` and per-protocol
+        // caches. No raw `&S` flows into a serve function: every chain
+        // read goes through `PendingChain` so the BFT-committed /
+        // JMT-persisted window is reachable from one place.
         for shard in self.hosted_shards() {
             // ── block.request → sync protocol ────────────────────────────
 
