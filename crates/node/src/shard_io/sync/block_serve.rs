@@ -1,18 +1,19 @@
 //! Inbound block-sync request handling.
 //!
 //! Serves `GetBlockRequest`s from peers catching up via the sync protocol.
-//! Reads the block from storage and either attaches in-memory provisions
-//! (while the block's hashes are still load-bearing for dedup) or serves
-//! the persisted `Sealed` shape. Inside the dedup horizon, a local cache
-//! miss is reported as `not_found` so the requester rotates to a peer
-//! that has the provisions — preserving the invariant that `Block::Sealed`
-//! means the dedup horizon has passed.
+//! Reads the block through `PendingChain` so BFT-committed-but-unpersisted
+//! heights are served from memory — those blocks are already in their
+//! `Block::Live` shape with provisions inline, so no cache lookup is
+//! needed. Persisted blocks come back `Block::Sealed`; if the dedup
+//! horizon still binds, we re-attach provisions from the local cache, and
+//! a miss is reported as `not_found` so the requester rotates to a peer
+//! that has them.
 
 use std::sync::Arc;
 
 use hyperscale_metrics::record_sync_response_error;
 use hyperscale_provisions::ProvisionStore;
-use hyperscale_storage::{BlockForSync, ChainReader};
+use hyperscale_storage::{BlockForSync, PendingChain, Storage};
 use hyperscale_types::network::request::GetBlockRequest;
 use hyperscale_types::network::response::GetBlockResponse;
 use hyperscale_types::{ElidedCertifiedBlock, Provisions, RETENTION_HORIZON};
@@ -20,27 +21,27 @@ use tracing::trace;
 
 /// Serve an inbound block sync request.
 ///
-/// Storage always returns `Block::Sealed` — the persisted shape carries no
-/// provisions. Whether the requester needs `Block::Live` is a function of
-/// the block's own age against the dedup horizon: until
-/// `block_ts + RETENTION_HORIZON` passes, every honest validator still
-/// keeps the block's provision hashes in its `CommitDedupIndex`, so a
-/// peer that commits this block via sync must learn those hashes too.
-/// Past the horizon, the dedup entries are gone everywhere and the
-/// `Sealed` block is safe to serve.
+/// Whether the requester needs `Block::Live` is a function of the block's
+/// own age against the dedup horizon: until `block_ts + RETENTION_HORIZON`
+/// passes, every honest validator still keeps the block's provision hashes
+/// in its `CommitDedupIndex`, so a peer that commits this block via sync
+/// must learn those hashes too. Past the horizon, the dedup entries are
+/// gone everywhere and the `Sealed` block is safe to serve.
 ///
 /// The horizon check is based on the BFT-authenticated
 /// `weighted_timestamp` of the committing QC and the serving peer's own
 /// latest QC timestamp — both quantities are deterministic and don't
 /// depend on the requester's view.
 ///
-/// Inside the horizon, a local cache miss returns `not_found`. The
-/// invariant downstream commit hooks rely on — `Block::Sealed` means no
-/// provision hashes remain load-bearing for dedup — is preserved by
-/// refusing rather than silently downgrading the response. The requester
-/// rotates to another peer who has the provisions cached.
-pub fn serve_block_request(
-    storage: &impl ChainReader,
+/// Inside the horizon for a `Sealed` block, a local cache miss returns
+/// `not_found`. The invariant downstream commit hooks rely on —
+/// `Block::Sealed` means no provision hashes remain load-bearing for
+/// dedup — is preserved by refusing rather than silently downgrading the
+/// response. The requester rotates to another peer who has the provisions
+/// cached. Pending-window blocks never hit this path because their
+/// provisions are inline.
+pub fn serve_block_request<S: Storage>(
+    pending_chain: &PendingChain<S>,
     provision_store: &ProvisionStore,
     req: &GetBlockRequest,
 ) -> GetBlockResponse {
@@ -53,18 +54,25 @@ pub fn serve_block_request(
         block,
         qc,
         provision_hashes,
-    }) = storage.get_block_for_sync(req.height)
+    }) = pending_chain.block_for_sync(req.height)
     else {
         return GetBlockResponse::not_found();
     };
 
     let block_ts = qc.weighted_timestamp();
-    let tip_ts = storage
+    let tip_ts = pending_chain
         .latest_qc()
         .map_or(block_ts, |q| q.weighted_timestamp());
     let inside_dedup_horizon = tip_ts.elapsed_since(block_ts) < RETENTION_HORIZON;
 
     if !inside_dedup_horizon || provision_hashes.is_empty() {
+        return GetBlockResponse::found(ElidedCertifiedBlock::elide(&block, qc, &req.inventory));
+    }
+
+    // Pending-window blocks are already Live with provisions inline; no
+    // cache round-trip needed. Persisted blocks come back Sealed and need
+    // the upgrade.
+    if block.is_live() {
         return GetBlockResponse::found(ElidedCertifiedBlock::elide(&block, qc, &req.inventory));
     }
 
