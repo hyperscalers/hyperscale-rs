@@ -53,4 +53,15 @@ pub enum FetchAbandon {
         /// Wave ids whose in-flight fetch should be cancelled.
         ids: Vec<WaveId>,
     },
+    /// Cross-shard execution-certificate fetch keyed by [`WaveId`]. Emitted
+    /// when an EC's admission path silently drops the cert (unresolvable
+    /// committee keys, invalid BLS signature, sub-quorum signers). Multiple
+    /// aggregations can arrive per `wave_id`; if a later valid aggregation
+    /// admits successfully, the abandon is a no-op on the FSM, while the
+    /// failure-only case correctly releases the slot for cleanup-timer
+    /// to re-fetch.
+    ExecutionCerts {
+        /// Wave ids whose in-flight EC fetch should be cancelled.
+        ids: Vec<WaveId>,
+    },
 }

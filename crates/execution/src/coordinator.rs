@@ -1007,7 +1007,9 @@ impl ExecutionCoordinator {
             // Verification will never complete; release the in-flight slot
             // so a subsequent arrival isn't permanently shadowed.
             self.pending_ec_verifications.remove(&wire_hash);
-            return vec![];
+            return vec![Action::AbandonFetch(FetchAbandon::ExecutionCerts {
+                ids: vec![cert.wave_id().clone()],
+            })];
         };
 
         vec![Action::VerifyExecutionCertificateSignature {
@@ -1042,7 +1044,9 @@ impl ExecutionCoordinator {
                 wave = %certificate.wave_id(),
                 "Invalid execution certificate signature"
             );
-            return vec![];
+            return vec![Action::AbandonFetch(FetchAbandon::ExecutionCerts {
+                ids: vec![certificate.wave_id().clone()],
+            })];
         }
 
         // A single Byzantine signer can produce a cryptographically valid
@@ -1054,7 +1058,9 @@ impl ExecutionCoordinator {
                 wave = %certificate.wave_id(),
                 "Discarding sub-quorum execution certificate"
             );
-            return vec![];
+            return vec![Action::AbandonFetch(FetchAbandon::ExecutionCerts {
+                ids: vec![certificate.wave_id().clone()],
+            })];
         }
 
         let shard = certificate.shard_group_id();
@@ -2269,7 +2275,9 @@ mod tests {
         // A single Byzantine signer can produce a BLS-valid EC. Without a
         // quorum-power gate, that sub-quorum EC would clear the expected-
         // cert tombstone, populate the local-shard fallback-serving cache,
-        // and feed wave attestation.
+        // and feed wave attestation. The rejection now also emits an
+        // `AbandonFetch::ExecutionCerts` so any pinned EC fetch on this
+        // wave_id releases its FSM slot.
         let topo = make_test_topology();
         let mut state = make_test_state();
         state.committed_height = BlockHeight::new(10);
@@ -2289,14 +2297,73 @@ mod tests {
 
         let actions = state.on_certificate_verified(&topo, cert, true);
         assert!(
-            actions.is_empty(),
-            "sub-quorum EC must produce no Continuation"
+            !actions.iter().any(|a| matches!(
+                a,
+                Action::Continuation(ProtocolEvent::ExecutionCertificateAdmitted { .. })
+            )),
+            "sub-quorum EC must produce no admission continuation"
+        );
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::AbandonFetch(FetchAbandon::ExecutionCerts { ids }) if ids == &vec![wave_id.clone()]
+            )),
+            "sub-quorum drop must emit AbandonFetch::ExecutionCerts, got: {actions:?}"
         );
         assert!(
             state.exec_certs.get(&wave_id).is_none(),
             "sub-quorum EC must not enter the local-shard serving cache"
         );
     }
+
+    #[test]
+    fn on_certificate_verified_invalid_sig_abandons_fetch() {
+        // BLS signature verification returns `valid=false`. The cert is
+        // dropped without admission, and the FSM is told to release the
+        // in-flight slot.
+        let topo = make_test_topology();
+        let mut state = make_test_state();
+
+        let wave_id = WaveId::new(ShardGroupId::new(0), BlockHeight::new(1), BTreeSet::new());
+        let mut signers = SignerBitfield::new(4);
+        signers.set(0);
+        signers.set(1);
+        signers.set(2);
+        let cert = Arc::new(ExecutionCertificate::new(
+            wave_id.clone(),
+            WeightedTimestamp::ZERO,
+            GlobalReceiptRoot::ZERO,
+            vec![],
+            zero_bls_signature(),
+            signers,
+        ));
+
+        let actions = state.on_certificate_verified(&topo, cert, false);
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::AbandonFetch(FetchAbandon::ExecutionCerts { ids }) if ids == &vec![wave_id.clone()]
+            )),
+            "invalid-sig drop must emit AbandonFetch::ExecutionCerts, got: {actions:?}"
+        );
+        assert!(
+            !actions.iter().any(|a| matches!(
+                a,
+                Action::Continuation(ProtocolEvent::ExecutionCertificateAdmitted { .. })
+            )),
+            "invalid-sig must not emit admission continuation"
+        );
+    }
+
+    // Note: the committee-keys-fail branch of `on_wave_certificate` is
+    // structurally covered (emits the abandon when
+    // `committee_public_keys_for_shard` returns `None`) but is not
+    // exercised by a unit test here — `None` only fires when a known
+    // committee member is missing a public key in the topology, a
+    // corruption condition the public test fixtures can't easily
+    // construct. Realistic failures (unknown shard with empty committee)
+    // dispatch with an empty key set and fall through to the invalid-sig
+    // branch, which is covered above.
 
     #[test]
     fn test_leader_broadcasts_ec_locally() {

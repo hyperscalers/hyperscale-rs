@@ -434,6 +434,9 @@ where
             FetchAbandon::FinalizedWaves { ids } => {
                 self.drive_fetch::<FinalizedWaveBinding>(FetchInput::Abandoned { ids });
             }
+            FetchAbandon::ExecutionCerts { ids } => {
+                self.drive_fetch::<ExecCertBinding>(FetchInput::Abandoned { ids });
+            }
         }
     }
 
