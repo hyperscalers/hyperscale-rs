@@ -31,3 +31,4 @@ pub use build::build_provisions;
 pub use coordinator::{ProvisionConfig, ProvisionCoordinator, ProvisionMemoryStats};
 pub use outbound::{OutboundMemoryStats, OutboundProvisionTracker};
 pub use store::ProvisionStore;
+pub use verified_headers::VerifiedHeaderBuffer;

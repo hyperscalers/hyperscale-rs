@@ -213,7 +213,7 @@ fn on_verified_remote_header_targeting_local_shard_registers_expectation() {
     let stored = coord
         .get_remote_header(remote, BlockHeight::new(5))
         .expect("present");
-    assert!(Arc::ptr_eq(stored, &header));
+    assert!(Arc::ptr_eq(&stored, &header));
 }
 
 #[test]

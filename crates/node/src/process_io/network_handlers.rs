@@ -14,7 +14,9 @@ use hyperscale_types::network::notification::{
 use hyperscale_types::network::request::{
     GetExecutionCertsRequest, GetFinalizedWavesRequest, GetLocalProvisionsRequest,
 };
-use hyperscale_types::network::response::{GetLocalProvisionsResponse, GetProvisionResponse};
+use hyperscale_types::network::response::{
+    GetLocalProvisionsResponse, GetProvisionResponse, LocalProvisionEntry,
+};
 use tracing::warn;
 
 use crate::event::ShardScopedInput;
@@ -271,19 +273,33 @@ where
             // ── local_provision.request → provision cache lookup ─────────
 
             let provision_store = Arc::clone(&self.shard_io(shard).caches.provision_store);
+            let verified_headers = Arc::clone(&self.shard_io(shard).caches.verified_headers);
             self.process
                 .network
                 .register_request_handler::<GetLocalProvisionsRequest>(
                     shard,
                     move |req: GetLocalProvisionsRequest| {
-                        let mut provisions = Vec::with_capacity(req.batch_hashes.len());
+                        // Bundle the matching source header alongside each
+                        // returned blob so the requester can verify and admit
+                        // without first racing the remote-header pipeline.
+                        // Both lookups read the same maps the coordinator
+                        // writes through, so a present blob implies the
+                        // header was admitted at some point; `None` means
+                        // it's since been GC'd (retention sweep) and the
+                        // requester falls back to the buffered path.
+                        let mut entries = Vec::with_capacity(req.batch_hashes.len());
                         for h in &req.batch_hashes {
-                            if let Some(b) = provision_store.get(*h) {
-                                provisions.push(b);
+                            if let Some(provisions) = provision_store.get(*h) {
+                                let source_header = verified_headers
+                                    .get((provisions.source_shard(), provisions.block_height()));
+                                entries.push(LocalProvisionEntry {
+                                    provisions,
+                                    source_header,
+                                });
                             }
                         }
 
-                        GetLocalProvisionsResponse::new(provisions)
+                        GetLocalProvisionsResponse::new(entries)
                     },
                 );
 

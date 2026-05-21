@@ -15,44 +15,61 @@
 //! Eviction triggers from the coordinator: deadline sweep on the paired
 //! provisions, expectation cleared on verification, or orphan cutoff in
 //! `on_block_committed`.
+//!
+//! Backed by [`papaya::HashMap`] so the network worker can read entries
+//! wait-free for the `local_provision.request` serve path while the
+//! single state-machine writer mutates through `&self`.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use hyperscale_types::{BlockHeight, CommittedBlockHeader, ShardGroupId};
+use papaya::HashMap;
 
 type Key = (ShardGroupId, BlockHeight);
 
-/// Map of `(shard, height) → verified remote header`.
+/// Map of `(shard, height) → verified remote header`. Concurrent-safe so
+/// it can be `Arc`-shared between the provisions coordinator (writer) and
+/// inbound request handlers (readers).
 #[derive(Debug, Default)]
 pub struct VerifiedHeaderBuffer {
     headers: HashMap<Key, Arc<CommittedBlockHeader>>,
 }
 
 impl VerifiedHeaderBuffer {
-    pub(crate) fn new() -> Self {
+    /// Create an empty buffer.
+    #[must_use]
+    pub fn new() -> Self {
         Self {
             headers: HashMap::new(),
         }
     }
 
     /// Insert a verified header. Overwrites any previous entry for the same key.
-    pub(crate) fn insert(&mut self, key: Key, header: Arc<CommittedBlockHeader>) {
-        self.headers.insert(key, header);
+    pub fn insert(&self, key: Key, header: Arc<CommittedBlockHeader>) {
+        self.headers.pin().insert(key, header);
     }
 
     /// Look up a verified header by key.
-    pub(crate) fn get(&self, key: Key) -> Option<&Arc<CommittedBlockHeader>> {
-        self.headers.get(&key)
+    #[must_use]
+    pub fn get(&self, key: Key) -> Option<Arc<CommittedBlockHeader>> {
+        self.headers.pin().get(&key).cloned()
     }
 
     /// Remove and return a verified header.
-    pub(crate) fn remove(&mut self, key: Key) -> Option<Arc<CommittedBlockHeader>> {
-        self.headers.remove(&key)
+    pub fn remove(&self, key: Key) -> Option<Arc<CommittedBlockHeader>> {
+        self.headers.pin().remove(&key).cloned()
     }
 
-    pub(crate) fn len(&self) -> usize {
+    /// Current number of stored headers.
+    #[must_use]
+    pub fn len(&self) -> usize {
         self.headers.len()
+    }
+
+    /// True when no headers are stored.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.headers.is_empty()
     }
 }
 
@@ -111,18 +128,18 @@ mod tests {
 
     #[test]
     fn insert_and_get_round_trip() {
-        let mut buf = VerifiedHeaderBuffer::new();
+        let buf = VerifiedHeaderBuffer::new();
         let key = (ShardGroupId::new(1), BlockHeight::new(10));
         let header = make_header(ShardGroupId::new(1), BlockHeight::new(10));
         buf.insert(key, Arc::clone(&header));
         assert_eq!(buf.len(), 1);
         let stored = buf.get(key).expect("present");
-        assert!(Arc::ptr_eq(stored, &header));
+        assert!(Arc::ptr_eq(&stored, &header));
     }
 
     #[test]
     fn insert_overwrites_existing_key() {
-        let mut buf = VerifiedHeaderBuffer::new();
+        let buf = VerifiedHeaderBuffer::new();
         let key = (ShardGroupId::new(1), BlockHeight::new(10));
         buf.insert(key, make_header(ShardGroupId::new(1), BlockHeight::new(10)));
         buf.insert(key, make_header(ShardGroupId::new(1), BlockHeight::new(10)));
@@ -131,7 +148,7 @@ mod tests {
 
     #[test]
     fn remove_returns_stored_header_and_drops_entry() {
-        let mut buf = VerifiedHeaderBuffer::new();
+        let buf = VerifiedHeaderBuffer::new();
         let key = (ShardGroupId::new(1), BlockHeight::new(10));
         buf.insert(key, make_header(ShardGroupId::new(1), BlockHeight::new(10)));
         assert!(buf.remove(key).is_some());

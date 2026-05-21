@@ -89,7 +89,7 @@ pub struct ProvisionCoordinator {
     /// passed QC verification by the `RemoteHeaderCoordinator`; this buffer
     /// is the join point for matching provisions against their source
     /// state root.
-    headers: VerifiedHeaderBuffer,
+    headers: Arc<VerifiedHeaderBuffer>,
 
     // ═══════════════════════════════════════════════════════════════════
     // Provision Verification Pipeline
@@ -165,12 +165,20 @@ impl ProvisionCoordinator {
     pub fn with_config_and_store(config: ProvisionConfig, store: Arc<ProvisionStore>) -> Self {
         let queue = QueuedProvisionBuffer::new(config.min_dwell_time);
         Self {
-            headers: VerifiedHeaderBuffer::new(),
+            headers: Arc::new(VerifiedHeaderBuffer::new()),
             pipeline: ProvisionPipeline::new(store),
             expected: ExpectedProvisionTracker::new(),
             queue,
             committed_tombstones: CommittedProvisionTombstones::new(),
         }
+    }
+
+    /// Shared verified-header buffer — same `Arc` the io-loop request
+    /// handler reads from to bundle the matching source header into each
+    /// `local_provision.request` response.
+    #[must_use]
+    pub const fn verified_headers(&self) -> &Arc<VerifiedHeaderBuffer> {
+        &self.headers
     }
 
     /// Get provision coordinator memory statistics for monitoring collection sizes.
@@ -492,7 +500,7 @@ impl ProvisionCoordinator {
         }
 
         // Look for matching verified remote header (pre-verified by RemoteHeaderCoordinator).
-        if let Some(verified_header) = self.headers.get(key).cloned() {
+        if let Some(verified_header) = self.headers.get(key) {
             // Reject if the source block has aged past `RETENTION_HORIZON` —
             // every tx in it has expired and no shard can still need this data.
             let deadline = provisions.deadline(verified_header.qc().weighted_timestamp());
@@ -651,7 +659,7 @@ impl ProvisionCoordinator {
         &self,
         shard: ShardGroupId,
         height: BlockHeight,
-    ) -> Option<&Arc<CommittedBlockHeader>> {
+    ) -> Option<Arc<CommittedBlockHeader>> {
         self.headers.get((shard, height))
     }
 

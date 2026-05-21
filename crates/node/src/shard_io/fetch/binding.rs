@@ -245,13 +245,30 @@ impl FetchBinding for LocalProvisionBinding {
             class,
             Box::new(move |result| {
                 if let Ok(resp) = result {
-                    let split =
-                        partition_solicited(resp.provisions.into_inner(), &hs, |p| p.hash());
-                    for provisions in split.kept {
+                    let split = partition_solicited(resp.entries.into_inner(), &hs, |entry| {
+                        entry.provisions.hash()
+                    });
+                    // Push the bundled source header BEFORE the provisions
+                    // so the verification pipeline has a chance to admit it
+                    // first. The header is QC-self-authenticating; sender is
+                    // the fetched-header sentinel (no peer attestation).
+                    for entry in split.kept {
+                        if let Some(committed_header) = entry.source_header {
+                            push_protocol_event(
+                                &es,
+                                local_shard,
+                                ProtocolEvent::RemoteHeaderReceived {
+                                    committed_header,
+                                    sender: ValidatorId::new(u64::MAX),
+                                },
+                            );
+                        }
                         push_protocol_event(
                             &es,
                             local_shard,
-                            ProtocolEvent::ProvisionsReceived { provisions },
+                            ProtocolEvent::ProvisionsReceived {
+                                provisions: entry.provisions,
+                            },
                         );
                     }
                     let had_misses = !split.missing.is_empty();
