@@ -49,12 +49,14 @@ use crate::request_manager::peer_health::FailureKind;
 
 /// Production network adapter implementing the Network trait.
 ///
-/// Wraps `Arc<Libp2pAdapter>` and SBOR-encodes + LZ4-compresses messages before
-/// publishing via the adapter's priority channels. The `publish()` call
-/// is sync-safe (non-blocking channel send), so this works from the
-/// pinned state machine thread without a tokio runtime context.
+/// Wraps `Arc<Libp2pAdapter>` and a `RequestManager`. The broadcast path
+/// clones the message and offloads SBOR encode, LZ4 compress, and the
+/// adapter publish call to the tokio blocking pool via
+/// [`Self::spawn_publish`]; the shard pinned thread returns from
+/// `broadcast_*` after only the local-dispatch tee and a cheap clone.
+/// The adapter's `publish` itself is a crossbeam send so the blocking
+/// task never waits on libp2p.
 ///
-/// Also owns a `RequestManager` for request-response operations.
 /// The generic `request<R>()` method SBOR-encodes the request, dispatches
 /// to the `RequestManager`, and SBOR-decodes the response.
 pub struct Libp2pNetwork {
@@ -120,6 +122,26 @@ impl Libp2pNetwork {
     fn validator_peer_id(&self, validator: ValidatorId) -> Option<PeerId> {
         self.adapter.peer_for_validator(validator)
     }
+
+    /// Encode + compress `message` and hand the resulting bytes to the
+    /// adapter's publish channel on the tokio blocking pool.
+    ///
+    /// SBOR encode for a max-size tx-gossip batch is tens of µs and LZ4
+    /// compress at ~500 MB/s is another tens of µs — small individually
+    /// but enough to be worth keeping off the shard pinned thread, where
+    /// every µs spent here is a µs not spent making consensus progress.
+    /// The adapter's `publish` itself is a crossbeam send (non-blocking),
+    /// so a saturated tokio blocking pool only delays the encode, not
+    /// the swarm event loop.
+    fn spawn_publish<M: GossipMessage + 'static>(&self, topic: Topic, message: M) {
+        let adapter = Arc::clone(&self.adapter);
+        self.tokio_handle.spawn_blocking(move || {
+            let data = compress(&basic_encode(&message).expect("SBOR encode failed"));
+            if let Err(e) = adapter.publish(&topic, data, M::class()) {
+                warn!(topic = %topic, error = ?e, "Libp2pNetwork: publish failed");
+            }
+        });
+    }
 }
 
 impl Network for Libp2pNetwork {
@@ -147,12 +169,15 @@ impl Network for Libp2pNetwork {
         // shard — gossipsub never loops the publication back to the
         // publisher, so colocated vnodes would otherwise miss it. The
         // registry computes the per-vnode fan-out from `hosted_shards`.
+        // Cheap: the registry pushes a `ShardEvent` onto an unbounded
+        // channel; the encode/decode is skipped on the local path.
         let _ = self.registry.local_dispatch_gossip(message, Some(shard));
-        let topic = Topic::shard(M::message_type_id(), shard);
-        let data = compress(&basic_encode(message).expect("SBOR encode failed"));
-        if let Err(e) = self.adapter.publish(&topic, data, M::class()) {
-            warn!(error = ?e, "Libp2pNetwork: broadcast_to_shard failed");
-        }
+
+        // Hand the SBOR encode + LZ4 compress off the caller's thread.
+        // The hottest caller is `flush_tx_gossip_batch` on the shard
+        // pinned thread; a max-size batch is hundreds of µs of CPU we
+        // shouldn't be charging to consensus progress.
+        self.spawn_publish(Topic::shard(M::message_type_id(), shard), message.clone());
     }
 
     fn broadcast_global<M: GossipMessage + 'static>(&self, message: &M) {
@@ -166,11 +191,7 @@ impl Network for Libp2pNetwork {
         // self-publishes back, so colocated cross-shard vnodes would
         // miss this without the local tee.
         let _ = self.registry.local_dispatch_gossip(message, None);
-        let topic = Topic::global(M::message_type_id());
-        let data = compress(&basic_encode(message).expect("SBOR encode failed"));
-        if let Err(e) = self.adapter.publish(&topic, data, M::class()) {
-            warn!(error = ?e, "Libp2pNetwork: broadcast_global failed");
-        }
+        self.spawn_publish(Topic::global(M::message_type_id()), message.clone());
     }
 
     fn register_gossip_handler<M: GossipMessage + 'static>(&self, handler: impl GossipHandler<M>) {
