@@ -5,6 +5,7 @@ edition.workspace = true
 description = "Shared network protocol logic: Network trait, compression, topics, handler registry"
 
 [dependencies]
+arc-swap.workspace = true
 hyperscale-types.workspace = true
 lz4_flex = "0.13.0"
 quick_cache.workspace = true

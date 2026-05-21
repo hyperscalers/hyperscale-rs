@@ -11,13 +11,16 @@
 //! created by the typed registration methods in this module.
 //!
 //! All registrations happen at init (before any messages arrive), so
-//! the read-heavy `RwLock` pattern is ideal.
+//! the read path is lock-free: each map is an `ArcSwap<HashMap<_, _>>`
+//! that `register_*` clones-modifies-stores under the implicit init
+//! serialization, and `get_*` resolves with a single atomic load.
 
 use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use hyperscale_types::{GossipMessage, NetworkMessage, Request, ShardGroupId, TopicScope};
 use quick_cache::sync::Cache as QuickCache;
 use sbor::{basic_decode, basic_encode};
@@ -34,6 +37,22 @@ pub type RawNotificationHandler = dyn Fn(Vec<u8>) + Send + Sync;
 
 /// Type-erased request handler: receives SBOR request bytes, returns SBOR response bytes.
 pub type RawRequestHandler = dyn Fn(&[u8]) -> Vec<u8> + Send + Sync;
+
+/// Insert into an [`ArcSwap`]-backed map by cloning the current snapshot,
+/// inserting, and publishing the new map. All registrations happen
+/// serially at init, so the load → clone → store sequence is safe
+/// without a CAS retry; callers assert any prior-value invariant they
+/// want at the call site.
+fn arcswap_insert<K, V>(target: &ArcSwap<HashMap<K, V>>, key: K, value: V) -> Option<V>
+where
+    K: std::hash::Hash + Eq + Clone,
+    V: Clone,
+{
+    let mut new = (**target.load()).clone();
+    let prior = new.insert(key, value);
+    target.store(Arc::new(new));
+    prior
+}
 
 /// Dispatch a typed gossip message into its handler without SBOR
 /// encode/decode. Used by network backends to deliver locally-published
@@ -218,19 +237,19 @@ pub struct HandlerRegistry {
     /// Shards hosted by the owning process. Drives the per-vnode
     /// fan-out inside [`TypedGossipDispatcher`].
     hosted_shards: Arc<HashSet<ShardGroupId>>,
-    gossip: RwLock<HashMap<&'static str, Arc<RawGossipHandler>>>,
-    request: RwLock<HashMap<(&'static str, ShardGroupId), Arc<RawRequestHandler>>>,
-    notification: RwLock<HashMap<&'static str, Arc<RawNotificationHandler>>>,
+    gossip: ArcSwap<HashMap<&'static str, Arc<RawGossipHandler>>>,
+    request: ArcSwap<HashMap<(&'static str, ShardGroupId), Arc<RawRequestHandler>>>,
+    notification: ArcSwap<HashMap<&'static str, Arc<RawNotificationHandler>>>,
     /// Typed gossip dispatchers keyed by message `TypeId` for
     /// zero-encode local delivery to colocated subscribers.
-    local_gossip: RwLock<HashMap<TypeId, Arc<dyn LocalGossipDispatcher>>>,
+    local_gossip: ArcSwap<HashMap<TypeId, Arc<dyn LocalGossipDispatcher>>>,
     /// Typed notification dispatchers (same role as `local_gossip`).
-    local_notification: RwLock<HashMap<TypeId, Arc<dyn LocalNotificationDispatcher>>>,
+    local_notification: ArcSwap<HashMap<TypeId, Arc<dyn LocalNotificationDispatcher>>>,
     /// Typed request dispatchers keyed by `(TypeId, ShardGroupId)` for
     /// in-process request serving. Used when a host carries a vnode in
     /// the target shard — bypasses libp2p and preserves `Arc`-shared
     /// payloads on the response.
-    local_request: RwLock<HashMap<(TypeId, ShardGroupId), Arc<dyn LocalRequestDispatcher>>>,
+    local_request: ArcSwap<HashMap<(TypeId, ShardGroupId), Arc<dyn LocalRequestDispatcher>>>,
 }
 
 impl HandlerRegistry {
@@ -239,12 +258,12 @@ impl HandlerRegistry {
     pub fn new(hosted_shards: Arc<HashSet<ShardGroupId>>) -> Self {
         Self {
             hosted_shards,
-            gossip: RwLock::new(HashMap::new()),
-            request: RwLock::new(HashMap::new()),
-            notification: RwLock::new(HashMap::new()),
-            local_gossip: RwLock::new(HashMap::new()),
-            local_notification: RwLock::new(HashMap::new()),
-            local_request: RwLock::new(HashMap::new()),
+            gossip: ArcSwap::from_pointee(HashMap::new()),
+            request: ArcSwap::from_pointee(HashMap::new()),
+            notification: ArcSwap::from_pointee(HashMap::new()),
+            local_gossip: ArcSwap::from_pointee(HashMap::new()),
+            local_notification: ArcSwap::from_pointee(HashMap::new()),
+            local_request: ArcSwap::from_pointee(HashMap::new()),
         }
     }
 
@@ -304,11 +323,7 @@ impl HandlerRegistry {
                     }
                 }
             });
-        let prior = self
-            .gossip
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(M::message_type_id(), raw);
+        let prior = arcswap_insert(&self.gossip, M::message_type_id(), raw);
         assert!(
             prior.is_none(),
             "duplicate gossip handler registration for {}",
@@ -316,10 +331,7 @@ impl HandlerRegistry {
         );
 
         let typed: Arc<dyn LocalGossipDispatcher> = dispatcher;
-        self.local_gossip
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(TypeId::of::<M>(), typed);
+        arcswap_insert(&self.local_gossip, TypeId::of::<M>(), typed);
     }
 
     /// Register a typed request handler for a message type on `shard`.
@@ -372,11 +384,7 @@ impl HandlerRegistry {
             }
         });
 
-        let prior = self
-            .request
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert((R::message_type_id(), shard), raw);
+        let prior = arcswap_insert(&self.request, (R::message_type_id(), shard), raw);
         assert!(
             prior.is_none(),
             "duplicate request handler registration for ({}, {shard:?})",
@@ -387,10 +395,7 @@ impl HandlerRegistry {
             handler,
             _phantom: PhantomData,
         });
-        self.local_request
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert((TypeId::of::<R>(), shard), typed);
+        arcswap_insert(&self.local_request, (TypeId::of::<R>(), shard), typed);
     }
 
     /// Register a typed notification handler for a message type.
@@ -420,11 +425,7 @@ impl HandlerRegistry {
                     );
                 }
             });
-        let prior = self
-            .notification
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(M::message_type_id(), raw);
+        let prior = arcswap_insert(&self.notification, M::message_type_id(), raw);
         assert!(
             prior.is_none(),
             "duplicate notification handler registration for {}",
@@ -436,10 +437,7 @@ impl HandlerRegistry {
                 handler,
                 _phantom: PhantomData,
             });
-        self.local_notification
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(TypeId::of::<M>(), typed);
+        arcswap_insert(&self.local_notification, TypeId::of::<M>(), typed);
     }
 
     // ── Raw registration (used by infrastructure tests) ──
@@ -449,10 +447,7 @@ impl HandlerRegistry {
     /// Prefer [`register_gossip`](Self::register_gossip) for production code.
     /// This is useful for infrastructure tests that work with raw bytes.
     pub fn register_raw_gossip(&self, type_id: &'static str, handler: Arc<RawGossipHandler>) {
-        self.gossip
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(type_id, handler);
+        arcswap_insert(&self.gossip, type_id, handler);
     }
 
     /// Register a raw request handler for `(type_id, shard)`.
@@ -465,10 +460,7 @@ impl HandlerRegistry {
         shard: ShardGroupId,
         handler: Arc<RawRequestHandler>,
     ) {
-        self.request
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert((type_id, shard), handler);
+        arcswap_insert(&self.request, (type_id, shard), handler);
     }
 
     /// Register a raw notification handler by `type_id` string.
@@ -480,10 +472,7 @@ impl HandlerRegistry {
         type_id: &'static str,
         handler: Arc<RawNotificationHandler>,
     ) {
-        self.notification
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(type_id, handler);
+        arcswap_insert(&self.notification, type_id, handler);
     }
 
     // ── Transport-layer dispatch (used by inbound router / sim harness) ──
@@ -491,11 +480,7 @@ impl HandlerRegistry {
     /// Look up the gossip handler for a message type.
     #[must_use]
     pub fn get_gossip(&self, message_type_id: &str) -> Option<Arc<RawGossipHandler>> {
-        self.gossip
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(message_type_id)
-            .cloned()
+        self.gossip.load().get(message_type_id).cloned()
     }
 
     /// Look up the request handler for `(type_id, shard)`.
@@ -505,21 +490,13 @@ impl HandlerRegistry {
         message_type_id: &str,
         shard: ShardGroupId,
     ) -> Option<Arc<RawRequestHandler>> {
-        self.request
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&(message_type_id, shard))
-            .cloned()
+        self.request.load().get(&(message_type_id, shard)).cloned()
     }
 
     /// Look up the notification handler for a message type.
     #[must_use]
     pub fn get_notification(&self, message_type_id: &str) -> Option<Arc<RawNotificationHandler>> {
-        self.notification
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(message_type_id)
-            .cloned()
+        self.notification.load().get(message_type_id).cloned()
     }
 
     /// Dispatch a typed gossip message into its in-process handler,
@@ -539,8 +516,7 @@ impl HandlerRegistry {
         M: NetworkMessage + 'static,
     {
         self.local_gossip
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
+            .load()
             .get(&TypeId::of::<M>())
             .map(|d| d.dispatch(msg as &dyn Any, shard))
     }
@@ -553,8 +529,7 @@ impl HandlerRegistry {
         M: NetworkMessage + 'static,
     {
         self.local_notification
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
+            .load()
             .get(&TypeId::of::<M>())
             .is_some_and(|d| {
                 d.dispatch(msg as &dyn Any);
@@ -583,8 +558,7 @@ impl HandlerRegistry {
     {
         let dispatcher = self
             .local_request
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
+            .load()
             .get(&(TypeId::of::<R>(), shard))
             .cloned()?;
         let boxed: Box<dyn Any + Send> = Box::new(req);
