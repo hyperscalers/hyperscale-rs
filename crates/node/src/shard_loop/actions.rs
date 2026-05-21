@@ -6,7 +6,7 @@ use hyperscale_bft::action_handlers::handle_action as handle_bft_action;
 use hyperscale_core::{
     Action, ActionContext, ActionOwner, CommitSource, FetchAbandon, FetchRequest, ProtocolEvent,
 };
-use hyperscale_dispatch::Dispatch;
+use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_execution::action_handlers::handle_action as handle_execution_action;
 use hyperscale_metrics::record_transaction_finalized;
 use hyperscale_network::Network;
@@ -16,10 +16,13 @@ use hyperscale_types::{
     Block, BlockHeight, CertifiedBlock, QuorumCertificate, StateRoot, TopologySnapshot,
     TransactionStatus, TxHash,
 };
-use tracing::{debug, trace, warn};
+use tracing::{debug, error, trace, warn};
 
-use super::{ShardLoop, TimerOp, push_protocol_event};
-use crate::shard_io::block_commit::{AccumulateDecision, PendingCommit, make_commit_prepared};
+use super::{ShardLoop, ShardScopedInput, TimerOp, push_protocol_event, push_shard_input};
+use crate::shard_io::block_commit::{
+    AccumulateDecision, PendingCommit, QcOnlyDecision, QcOnlyDivergence, QcOnlyKind, QcOnlyPending,
+    make_commit_prepared, run_qc_only_prep,
+};
 use crate::shard_io::fetch::FetchInput;
 use crate::shard_io::fetch::binding::{
     ExecCertBinding, FinalizedWaveBinding, LocalProvisionBinding, ProvisionBinding,
@@ -239,11 +242,18 @@ where
     }
 
     /// Bridge an [`Action::CommitBlockByQcOnly`] to the standard commit
-    /// pipeline: ask [`BlockCommitCoordinator::prepare_qc_only_commit`]
-    /// to compute / reuse the prepared commit and decide whether to
-    /// enqueue, then call [`Self::accept_block_commit`] when it says so.
+    /// pipeline. Skips the work entirely when the block is already
+    /// persisted; otherwise builds a [`QcOnlyPending`] tagged with
+    /// whether the prep is needed (no cached `PreparedCommit`) or can
+    /// reuse the consensus path's cached entry, and submits it to the
+    /// single-slot FIFO.
     ///
-    /// [`BlockCommitCoordinator::prepare_qc_only_commit`]: crate::shard_io::block_commit::BlockCommitCoordinator::prepare_qc_only_commit
+    /// The FIFO is the safety property — even `AlreadyPrepared` commits
+    /// must wait behind any in-flight `NeedsPrep` for an earlier
+    /// height, because the flush pipeline asserts strict height
+    /// contiguity at JMT commit time. `try_apply_verified_synced_blocks`
+    /// can emit a burst of these for consecutive heights in a single
+    /// shard step.
     fn accept_qc_only_commit(
         &mut self,
         block: Block,
@@ -252,21 +262,118 @@ where
         parent_block_height: BlockHeight,
         source: CommitSource,
     ) {
-        let io = &self.io;
-        let should_enqueue = io.block_commit.prepare_qc_only_commit(
-            &io.pending_chain,
-            &block,
+        let block_hash = block.hash();
+        let height = block.height();
+
+        let kind = match self.io.block_commit.decide_qc_only(&block_hash, height) {
+            QcOnlyDecision::Skip => return,
+            QcOnlyDecision::AlreadyPrepared => {
+                debug!(
+                    height = height.inner(),
+                    ?block_hash,
+                    "Reusing prepared commit from consensus path"
+                );
+                QcOnlyKind::AlreadyPrepared
+            }
+            QcOnlyDecision::NeedsPrep => QcOnlyKind::NeedsPrep,
+        };
+
+        let pending = QcOnlyPending {
+            block: Arc::new(block),
+            qc: Arc::new(qc),
             parent_state_root,
             parent_block_height,
             source,
-        );
-        if should_enqueue {
-            self.accept_block_commit(PendingCommit {
-                block: Arc::new(block),
-                qc: Arc::new(qc),
-                source,
-                committed_notified: false,
+            kind,
+        };
+        if let Some(to_process) = self.io.block_commit.try_acquire_qc_only_slot(pending) {
+            self.process_qc_only(to_process);
+        }
+        // else: queued; `release_qc_only_slot` hands it back when the
+        // in-flight prep callback returns.
+    }
+
+    /// Drive the queue head: dispatch the JMT prep to the pool for
+    /// `NeedsPrep` entries, or accept the commit inline for
+    /// `AlreadyPrepared` entries. Already-prepared heads chain
+    /// straight to the next queued entry without a pool round-trip,
+    /// since the prepared commit is already in the cache.
+    fn process_qc_only(&mut self, mut pending: QcOnlyPending) {
+        loop {
+            match pending.kind {
+                QcOnlyKind::NeedsPrep => {
+                    self.dispatch_qc_only_prep(pending);
+                    return;
+                }
+                QcOnlyKind::AlreadyPrepared => {
+                    self.accept_block_commit(PendingCommit {
+                        block: pending.block,
+                        qc: pending.qc,
+                        source: pending.source,
+                        committed_notified: false,
+                    });
+                    match self.io.block_commit.release_qc_only_slot() {
+                        Some(next) => pending = next,
+                        None => return,
+                    }
+                }
+            }
+        }
+    }
+
+    /// Spawn the JMT-prep closure on the consensus-crypto pool. The
+    /// closure pushes a [`ShardScopedInput::QcOnlyCommitPrepared`] back
+    /// on success or a [`ShardScopedInput::QcOnlyCommitDiverged`] on
+    /// state-root mismatch; either way the slot is released on the
+    /// shard thread (not the worker) so the queue + flag stay
+    /// single-threaded.
+    fn dispatch_qc_only_prep(&self, pending: QcOnlyPending) {
+        let pending_chain = Arc::clone(&self.io.pending_chain);
+        let prepared_commits = self.io.block_commit.prepared_commits_handle();
+        let event_tx = self.event_sender().clone();
+        let shard = self.shard;
+
+        self.process
+            .dispatch
+            .spawn(DispatchPool::ConsensusCrypto, move || {
+                let result = run_qc_only_prep(&pending_chain, &prepared_commits, &pending);
+                let QcOnlyPending {
+                    block, qc, source, ..
+                } = pending;
+                match result {
+                    Ok(()) => push_shard_input(
+                        &event_tx,
+                        shard,
+                        ShardScopedInput::QcOnlyCommitPrepared { block, qc, source },
+                    ),
+                    Err(div) => push_shard_input(
+                        &event_tx,
+                        shard,
+                        ShardScopedInput::QcOnlyCommitDiverged(div),
+                    ),
+                }
             });
+    }
+
+    /// Callback for a successful off-thread JMT prep. Runs the standard
+    /// commit pipeline for the just-prepared block, then releases the
+    /// QC-only slot and drives the next queued entry — going back
+    /// through [`Self::process_qc_only`] so an `AlreadyPrepared` next
+    /// head accepts inline rather than triggering another pool round-trip.
+    pub(in crate::shard_loop) fn handle_qc_only_commit_prepared(
+        &mut self,
+        block: Arc<Block>,
+        qc: Arc<QuorumCertificate>,
+        source: CommitSource,
+    ) {
+        self.accept_block_commit(PendingCommit {
+            block,
+            qc,
+            source,
+            committed_notified: false,
+        });
+        if let Some(next) = self.io.block_commit.release_qc_only_slot() {
+            self.process_qc_only(next);
         }
     }
 
@@ -518,4 +625,42 @@ where
             "Network topology updated"
         );
     }
+}
+
+/// Surface a state-root divergence reported by an off-thread QC-only
+/// prep as an operator-fatal panic on the shard pinned thread.
+///
+/// Rayon's worker pool catches and discards task panics, so the
+/// consensus-crypto worker reports a divergence by pushing
+/// [`ShardScopedInput::QcOnlyCommitDiverged`] back to the shard
+/// instead of panicking in place; this handler panics on receipt so
+/// the operator-visible failure mode (shard thread exits with a
+/// "local state divergence" message) is the same regardless of where
+/// the JMT recomputation ran. The diagnostic is fully self-contained
+/// on [`QcOnlyDivergence`], so this is a free function rather than a
+/// method on `ShardLoop`.
+pub(in crate::shard_loop) fn handle_qc_only_commit_diverged(div: &QcOnlyDivergence) {
+    error!(
+        height = div.block_height.inner(),
+        block_hash = ?div.block_hash,
+        expected_root = ?div.expected_root,
+        computed_root = ?div.computed_root,
+        parent_state_root = ?div.parent_state_root,
+        parent_block_height = div.parent_block_height.inner(),
+        source = ?div.source,
+        "Local state divergence detected on synced block apply — \
+         parent state does not produce the canonical state root. \
+         Rebuild required: restore from state snapshot or \
+         resync from genesis."
+    );
+    panic!(
+        "Local state divergence at height {}: parent state root \
+         {parent_state_root:?} does not produce canonical state \
+         root {expected_root:?} (computed {computed_root:?}). Operator \
+         intervention required.",
+        div.block_height.inner(),
+        parent_state_root = div.parent_state_root,
+        expected_root = div.expected_root,
+        computed_root = div.computed_root,
+    );
 }

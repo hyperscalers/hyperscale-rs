@@ -15,12 +15,14 @@
 
 use std::sync::Arc;
 
-use hyperscale_core::ProtocolEvent;
+use hyperscale_core::{CommitSource, ProtocolEvent};
 use hyperscale_types::{
-    BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, CertifiedBlock, CommittedBlockHeader,
-    ElidedCertifiedBlock, HeaderFetchCount, ProvisionHash, RoutableTransaction, ShardGroupId,
-    TxHash, ValidatorId, WaveId,
+    Block, BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, CertifiedBlock,
+    CommittedBlockHeader, ElidedCertifiedBlock, HeaderFetchCount, ProvisionHash, QuorumCertificate,
+    RoutableTransaction, ShardGroupId, TxHash, ValidatorId, WaveId,
 };
+
+use crate::shard_io::block_commit::QcOnlyDivergence;
 
 /// Priority levels for event ordering within the same timestamp.
 ///
@@ -273,6 +275,35 @@ pub enum ShardScopedInput {
         /// Wave ids that weren't returned.
         hashes: Vec<WaveId>,
     },
+
+    /// JMT prep for a QC-only commit completed off-thread; the block's
+    /// `PreparedCommit` and `PendingChain` entry have been inserted by
+    /// the worker, so the shard can hand the commit straight into the
+    /// standard accumulate / flush pipeline.
+    ///
+    /// One in-flight prep at a time per shard — see
+    /// `BlockCommitCoordinator::try_acquire_qc_only_slot`. On receipt
+    /// the shard runs `accept_block_commit` for the just-prepared
+    /// entry, then dispatches the next queued entry if any.
+    QcOnlyCommitPrepared {
+        /// The committed block, already wrapped for the commit pipeline.
+        block: Arc<Block>,
+        /// QC certifying `block`.
+        qc: Arc<QuorumCertificate>,
+        /// How this node learned the certifying QC. Threaded through to
+        /// `accept_block_commit` for metrics labelling.
+        source: CommitSource,
+    },
+
+    /// JMT prep for a QC-only commit computed a state root that doesn't
+    /// match the QC-attested root. Operator-fatal: the local parent
+    /// state diverged from canonical and block-by-block recovery can't
+    /// repair it. The shard logs the diagnostic and panics on the
+    /// pinned thread — rayon workers swallow panics by default, so the
+    /// worker reports the divergence through this input rather than
+    /// panicking itself. Boxed because the variant is rare and would
+    /// otherwise inflate every other `ShardEvent` in the queue.
+    QcOnlyCommitDiverged(Box<QcOnlyDivergence>),
 }
 
 impl ShardScopedInput {
@@ -315,7 +346,9 @@ impl ShardScopedInput {
             | Self::ProvisionsFetchFailed { .. }
             | Self::ExecCertFetchFailed { .. }
             | Self::LocalProvisionsFetchFailed { .. }
-            | Self::FinalizedWavesFetchFailed { .. } => EventPriority::Internal,
+            | Self::FinalizedWavesFetchFailed { .. }
+            | Self::QcOnlyCommitPrepared { .. }
+            | Self::QcOnlyCommitDiverged { .. } => EventPriority::Internal,
         }
     }
 

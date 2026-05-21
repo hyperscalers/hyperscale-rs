@@ -15,6 +15,7 @@
 //! [`NodeHost`]: crate::host::NodeHost
 
 mod actions;
+use actions::handle_qc_only_commit_diverged;
 mod fetch_io;
 mod lifecycle;
 mod metrics;
@@ -381,6 +382,14 @@ where
 
             // ── Periodic fetch / sync tick ─────────────────────────────
             ShardScopedInput::FetchTick => self.handle_fetch_tick(),
+
+            // ── QC-only commit prep callbacks ──────────────────────────
+            ShardScopedInput::QcOnlyCommitPrepared { block, qc, source } => {
+                self.handle_qc_only_commit_prepared(block, qc, source);
+            }
+            ShardScopedInput::QcOnlyCommitDiverged(div) => {
+                handle_qc_only_commit_diverged(&div);
+            }
         }
     }
 

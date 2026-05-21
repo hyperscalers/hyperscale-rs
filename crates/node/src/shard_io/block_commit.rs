@@ -15,7 +15,7 @@
 //! drives that based on the [`AccumulateDecision`] returned from
 //! [`BlockCommitCoordinator::accumulate`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -28,7 +28,7 @@ use hyperscale_types::{
     Block, BlockHash, BlockHeight, CertifiedBlock, ConsensusReceipt, FinalizedWave, LocalTimestamp,
     QuorumCertificate, ShardGroupId, StateRoot,
 };
-use tracing::{debug, error};
+use tracing::debug;
 
 use crate::shard_loop::{ShardEvent, push_protocol_event};
 
@@ -43,6 +43,183 @@ pub type NotifyHandles = (Arc<Block>, Arc<QuorumCertificate>);
 /// that produce prepared commits asynchronously on the consensus crypto pool.
 pub type PreparedCommitMap<S> =
     HashMap<BlockHash, (BlockHeight, <S as ChainWriter>::PreparedCommit)>;
+
+/// Whether a queued QC-only commit needs JMT recomputation or can
+/// reuse a `PreparedCommit` already in the cache. Set when the shard
+/// enqueues the commit via [`BlockCommitCoordinator::decide_qc_only`].
+#[derive(Debug)]
+pub enum QcOnlyKind {
+    /// `prepared_commits` already holds an entry for this block (the
+    /// consensus path produced it via `VerifyStateRoot`). The queue
+    /// head handler runs `accept_block_commit` directly — no pool
+    /// dispatch needed.
+    AlreadyPrepared,
+    /// No cached `PreparedCommit`; the queue head handler dispatches
+    /// [`run_qc_only_prep`] to the consensus-crypto pool.
+    NeedsPrep,
+}
+
+/// A QC-only commit waiting on the single in-flight slot. Every
+/// `Action::CommitBlockByQcOnly` other than the already-persisted skip
+/// path enters the FIFO so commits drain in arrival order — the
+/// flush pipeline asserts strict height contiguity and any reordering
+/// (sync-burst sibling preps racing each other, an already-prepared
+/// child overtaking a queued parent) trips that assertion.
+pub struct QcOnlyPending {
+    /// Block being committed.
+    pub block: Arc<Block>,
+    /// QC certifying `block`.
+    pub qc: Arc<QuorumCertificate>,
+    /// Parent's state root (base for the JMT recomputation). Unused
+    /// when `kind == AlreadyPrepared`.
+    pub parent_state_root: StateRoot,
+    /// Parent's height (JMT parent version). Unused when
+    /// `kind == AlreadyPrepared`.
+    pub parent_block_height: BlockHeight,
+    /// How this node learned the certifying QC.
+    pub source: CommitSource,
+    /// Whether this entry needs the pool to run JMT prep or can
+    /// reuse a cached `PreparedCommit`.
+    pub kind: QcOnlyKind,
+}
+
+/// Outcome of [`BlockCommitCoordinator::decide_qc_only`]. The shard runs
+/// these branches on the pinned thread before deciding whether to claim
+/// the in-flight JMT-prep slot.
+#[derive(Debug)]
+pub enum QcOnlyDecision {
+    /// Block height is at or below the persisted tip — already on disk,
+    /// nothing to do.
+    Skip,
+    /// A consensus-path `VerifyStateRoot` already cached the
+    /// `PreparedCommit` for this block; skip JMT recomputation and
+    /// enqueue straight into the standard commit pipeline.
+    AlreadyPrepared,
+    /// No cached prep — the shard should claim the QC-only slot and
+    /// dispatch [`run_qc_only_prep`] to the consensus-crypto pool.
+    NeedsPrep,
+}
+
+/// Diagnostic carried back to the shard when [`run_qc_only_prep`]
+/// detects a computed-vs-canonical state-root mismatch. The shard
+/// translates this into a
+/// [`crate::event::ShardScopedInput::QcOnlyCommitDiverged`] and panics
+/// on the pinned thread — the divergence is operator-fatal (the local
+/// parent state diverged from canonical) and block-by-block recovery
+/// cannot repair it.
+#[derive(Debug, Clone)]
+pub struct QcOnlyDivergence {
+    /// Height being committed.
+    pub block_height: BlockHeight,
+    /// Hash of the committing block.
+    pub block_hash: BlockHash,
+    /// Parent's state root the prep ran against.
+    pub parent_state_root: StateRoot,
+    /// Parent's height the prep ran against.
+    pub parent_block_height: BlockHeight,
+    /// State root the block's header claimed.
+    pub expected_root: StateRoot,
+    /// State root our local prep produced.
+    pub computed_root: StateRoot,
+    /// How this node learned the certifying QC.
+    pub source: CommitSource,
+}
+
+/// Run the JMT prep for a QC-only commit on the calling thread. Intended
+/// for the closure dispatched by the shard to the consensus-crypto
+/// pool — the caller pre-resolves the fast-path skips via
+/// [`BlockCommitCoordinator::decide_qc_only`] and only invokes this for
+/// blocks that need actual recomputation.
+///
+/// On success the prepared commit is inserted into `prepared_commits`
+/// and the JMT snapshot + receipts go into `pending_chain` so the next
+/// child block can see them. On state-root mismatch the function
+/// returns the diagnostic without mutating either store; the shard
+/// translates it into a `QcOnlyCommitDiverged` callback and panics.
+///
+/// # Errors
+///
+/// Returns [`QcOnlyDivergence`] when the computed state root doesn't
+/// match the block header's `state_root` — operator-fatal as documented
+/// on [`QcOnlyDivergence`].
+pub fn run_qc_only_prep<S>(
+    pending_chain: &Arc<PendingChain<S>>,
+    prepared_commits: &Arc<Mutex<PreparedCommitMap<S>>>,
+    pending: &QcOnlyPending,
+) -> Result<(), Box<QcOnlyDivergence>>
+where
+    S: Storage,
+{
+    let block_hash = pending.block.hash();
+    let height = pending.block.height();
+
+    // Build view anchored at parent — includes prior synced blocks'
+    // JMT snapshots so chained verification can find parent nodes.
+    let view = pending_chain.view_at(
+        pending.block.header().parent_block_hash(),
+        pending.parent_block_height,
+    );
+    let pending_snapshots = view.pending_snapshots().to_vec();
+
+    let finalized_waves: Vec<Arc<FinalizedWave>> = pending.block.certificates().to_vec();
+    let (computed_root, prepared) = view.prepare_block_commit(
+        pending.parent_state_root,
+        pending.parent_block_height,
+        &finalized_waves,
+        height,
+        &pending_snapshots,
+        // `None` → the view drains its own base-read cache internally.
+        None,
+    );
+
+    // The sync-block ingress validator rejects peer-shipped divergent
+    // receipts before BFT sees the block, and `WaveState`'s divergence
+    // detector keeps locally-produced bad receipts out of `finalized`.
+    // A mismatch here means our local parent state itself diverged from
+    // canonical — a JMT or commit-batch bug, or pre-existing corruption
+    // in `StateCf`. Block-by-block sync can't repair this; the operator
+    // must restore from a state snapshot or wipe-and-resync from genesis.
+    let expected_root = pending.block.header().state_root();
+    if computed_root != expected_root {
+        return Err(Box::new(QcOnlyDivergence {
+            block_height: height,
+            block_hash,
+            parent_state_root: pending.parent_state_root,
+            parent_block_height: pending.parent_block_height,
+            expected_root,
+            computed_root,
+            source: pending.source,
+        }));
+    }
+
+    let jmt_snapshot = Arc::new(S::jmt_snapshot(&prepared).clone());
+    let receipts: Vec<Arc<ConsensusReceipt>> = finalized_waves
+        .iter()
+        .flat_map(|fw| fw.consensus_receipts())
+        .collect();
+    pending_chain.insert(
+        block_hash,
+        ChainEntry {
+            parent_block_hash: pending.block.header().parent_block_hash(),
+            height,
+            receipts,
+            jmt_snapshot,
+            certified_block: None,
+        },
+    );
+    prepared_commits
+        .lock()
+        .unwrap()
+        .insert(block_hash, (height, prepared));
+
+    debug!(
+        height = height.inner(),
+        ?block_hash,
+        "Synced block prepared, queued for persist"
+    );
+
+    Ok(())
+}
 
 /// Build the `commit_prepared` closure passed into [`ActionContext`].
 ///
@@ -153,6 +330,20 @@ pub struct BlockCommitCoordinator<S: ChainWriter> {
     /// clears the flag before sending its final event so the resulting
     /// `feed_event` → `flush` drains any backlog.
     commit_in_flight: Arc<AtomicBool>,
+
+    /// Pending QC-only commits waiting for the in-flight JMT-prep slot.
+    /// Drained head-first; siblings stay in arrival order so child blocks
+    /// reach JMT prep only after their parent has populated
+    /// `pending_chain`. Sync bursts can stack several here in one shard
+    /// step (see `try_apply_verified_synced_blocks`).
+    qc_only_queue: VecDeque<QcOnlyPending>,
+
+    /// `true` while one QC-only JMT prep is being computed on the
+    /// consensus-crypto pool. The pool task clears this state through
+    /// `release_qc_only_slot` on the shard thread once
+    /// `QcOnlyCommitPrepared` / `QcOnlyCommitDiverged` arrives, which
+    /// also pops the next queue entry if any.
+    qc_only_in_flight: bool,
 }
 
 impl<S> BlockCommitCoordinator<S>
@@ -170,6 +361,44 @@ where
             pending: Vec::new(),
             persisted_height: initial_persisted_height,
             commit_in_flight: Arc::new(AtomicBool::new(false)),
+            qc_only_queue: VecDeque::new(),
+            qc_only_in_flight: false,
+        }
+    }
+
+    /// Try to claim the single-in-flight QC-only JMT-prep slot for `pending`.
+    /// Returns `Some` if the caller should immediately dispatch the returned
+    /// commit to the consensus-crypto pool; `None` if a prep is already
+    /// running and `pending` has been queued behind it.
+    ///
+    /// The slot is released later by [`Self::release_qc_only_slot`] when
+    /// the worker's `QcOnlyCommitPrepared` / `QcOnlyCommitDiverged`
+    /// callback returns to the shard.
+    pub fn try_acquire_qc_only_slot(&mut self, pending: QcOnlyPending) -> Option<QcOnlyPending> {
+        if self.qc_only_in_flight {
+            self.qc_only_queue.push_back(pending);
+            None
+        } else {
+            self.qc_only_in_flight = true;
+            Some(pending)
+        }
+    }
+
+    /// Release the in-flight QC-only slot once a callback returns. If a
+    /// queued commit is waiting, returns it for immediate dispatch and
+    /// keeps the slot marked in-flight; otherwise clears the flag.
+    pub fn release_qc_only_slot(&mut self) -> Option<QcOnlyPending> {
+        debug_assert!(
+            self.qc_only_in_flight,
+            "release_qc_only_slot called without a prep in flight",
+        );
+        if let Some(next) = self.qc_only_queue.pop_front() {
+            // Slot stays in-flight — caller dispatches `next` straight
+            // into the pool.
+            Some(next)
+        } else {
+            self.qc_only_in_flight = false;
+            None
         }
     }
 
@@ -212,33 +441,12 @@ where
             .insert(block_hash, (height, prepared));
     }
 
-    /// Prepare a [`Action::CommitBlockByQcOnly`] block for the standard
-    /// commit pipeline. Returns `false` if the block is already persisted
-    /// (caller skips the rest of the pipeline), `true` otherwise.
-    ///
-    /// # Panics
-    ///
-    /// Panics on local state divergence: a computed-vs-canonical state
-    /// root mismatch means local parent state itself diverged from
-    /// canonical. Block-by-block sync can't repair this; operator
-    /// intervention (restore from snapshot or wipe-and-resync) is
-    /// required.
+    /// Decide what to do with a [`Action::CommitBlockByQcOnly`] arrival
+    /// without touching the JMT. Cheap fast-paths the shard thread can
+    /// run inline before deciding whether to dispatch the heavy prep.
     ///
     /// [`Action::CommitBlockByQcOnly`]: hyperscale_core::Action::CommitBlockByQcOnly
-    pub fn prepare_qc_only_commit(
-        &self,
-        pending_chain: &Arc<PendingChain<S>>,
-        block: &Block,
-        parent_state_root: StateRoot,
-        parent_block_height: BlockHeight,
-        source: CommitSource,
-    ) -> bool
-    where
-        S: Storage,
-    {
-        let block_hash = block.hash();
-        let height = block.height();
-
+    pub fn decide_qc_only(&self, block_hash: &BlockHash, height: BlockHeight) -> QcOnlyDecision {
         // Hard skip only if already persisted (consensus path got all
         // the way through). We must still enqueue blocks whose prepared
         // commit was populated by the consensus path but that never
@@ -249,96 +457,17 @@ where
         // next block to reach flush trips the strict ordering assert
         // in `commit_block_inner` because its parent was never applied.
         if height <= self.persisted_height {
-            return false;
+            return QcOnlyDecision::Skip;
         }
 
         // If the consensus path already produced the prepared commit, reuse it
         // — recomputing JMT here can produce a transient root mismatch and trip
-        // the byzantine-detection assert below on a self-inflicted race.
-        if self.has_prepared(&block_hash) {
-            debug!(
-                height = height.inner(),
-                ?block_hash,
-                "Reusing prepared commit from consensus path"
-            );
-            return true;
+        // the byzantine-detection assert in `run_qc_only_prep` on a self-inflicted race.
+        if self.has_prepared(block_hash) {
+            return QcOnlyDecision::AlreadyPrepared;
         }
 
-        // Build view anchored at parent — includes prior synced blocks'
-        // JMT snapshots so chained verification can find parent nodes.
-        let view = pending_chain.view_at(block.header().parent_block_hash(), parent_block_height);
-        let pending_snapshots = view.pending_snapshots().to_vec();
-
-        let finalized_waves: Vec<Arc<FinalizedWave>> = block.certificates().to_vec();
-        let (computed_root, prepared) = view.prepare_block_commit(
-            parent_state_root,
-            parent_block_height,
-            &finalized_waves,
-            height,
-            &pending_snapshots,
-            // `None` → the view drains its own base-read cache internally.
-            None,
-        );
-
-        // The sync-block ingress validator rejects peer-shipped
-        // divergent receipts before BFT sees the block, and
-        // `WaveState`'s divergence detector keeps locally-produced
-        // bad receipts out of `finalized`. A mismatch here means our
-        // local parent state itself diverged from canonical — a JMT
-        // or commit-batch bug, or pre-existing corruption in
-        // `StateCf`. Block-by-block sync can't repair this; the
-        // operator must restore from a state snapshot or
-        // wipe-and-resync from genesis.
-        if computed_root != block.header().state_root() {
-            error!(
-                height = height.inner(),
-                ?block_hash,
-                expected_root = ?block.header().state_root(),
-                computed_root = ?computed_root,
-                ?parent_state_root,
-                parent_block_height = parent_block_height.inner(),
-                ?source,
-                "Local state divergence detected on synced block apply — \
-                 parent state does not produce the canonical state root. \
-                 Rebuild required: restore from state snapshot or \
-                 resync from genesis."
-            );
-            panic!(
-                "Local state divergence at height {}: parent state root \
-                 {parent_state_root:?} does not produce canonical state \
-                 root {expected:?} (computed {computed:?}). Operator \
-                 intervention required.",
-                height.inner(),
-                expected = block.header().state_root(),
-                computed = computed_root,
-            );
-        }
-
-        let jmt_snapshot = Arc::new(S::jmt_snapshot(&prepared).clone());
-        let receipts: Vec<Arc<ConsensusReceipt>> = finalized_waves
-            .iter()
-            .flat_map(|fw| fw.consensus_receipts())
-            .collect();
-        pending_chain.insert(
-            block_hash,
-            ChainEntry {
-                parent_block_hash: block.header().parent_block_hash(),
-                height,
-                receipts,
-                jmt_snapshot,
-                certified_block: None,
-            },
-        );
-
-        self.insert_prepared(block_hash, height, prepared);
-
-        debug!(
-            height = height.inner(),
-            ?block_hash,
-            "Synced block prepared, queued for persist"
-        );
-
-        true
+        QcOnlyDecision::NeedsPrep
     }
 
     pub const fn pending_len(&self) -> usize {
