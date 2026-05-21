@@ -14,6 +14,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
+use std::time::Instant;
 
 use hyperscale_metrics::{
     record_fetch_abandoned, record_fetch_completed, record_fetch_retried, record_fetch_started,
@@ -121,6 +122,13 @@ struct Entry {
     preferred: Option<ValidatorId>,
     class: Option<MessageClass>,
     in_flight: bool,
+    /// When the entry most recently transitioned to `in_flight=true`.
+    /// `None` while the entry is awaiting dispatch. Wall-clock-derived
+    /// (`Instant`) because this is observability-only: an alert on
+    /// `oldest_in_flight_age_ms` fires when admission stops happening,
+    /// catching novel pin scenarios the existing per-drop notifications
+    /// haven't been wired for yet.
+    dispatched_at: Option<Instant>,
 }
 
 /// Why an id is being removed from the pending set — drives which counter
@@ -194,6 +202,19 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
         self.pending.len()
     }
 
+    /// Age in milliseconds of the longest-running in-flight entry, or
+    /// `0` if nothing is in flight. Surfaced through `FetchHost::metrics`
+    /// so an alert on `> N` catches admission paths that silently dropped
+    /// without notifying the FSM — the symptom that motivated the
+    /// provision-fetch robustness work in the first place.
+    #[must_use]
+    pub fn oldest_in_flight_age_ms(&self) -> u64 {
+        let oldest = self.pending.values().filter_map(|e| e.dispatched_at).min();
+        oldest.map_or(0, |t| {
+            u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
+        })
+    }
+
     fn handle_request(
         &mut self,
         ids: Vec<Id>,
@@ -213,6 +234,7 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
                     preferred,
                     class,
                     in_flight: false,
+                    dispatched_at: None,
                 }
             });
         }
@@ -232,6 +254,7 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
                 && entry.in_flight
             {
                 entry.in_flight = false;
+                entry.dispatched_at = None;
                 released += 1;
             }
         }
@@ -305,9 +328,11 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
                 if chunks_emitted >= self.config.parallel_chunks_per_tick {
                     break 'outer;
                 }
+                let dispatched_at = Instant::now();
                 for id in chunk {
                     if let Some(entry) = self.pending.get_mut(id) {
                         entry.in_flight = true;
+                        entry.dispatched_at = Some(dispatched_at);
                     }
                 }
                 outputs.push(FetchOutput::Send {

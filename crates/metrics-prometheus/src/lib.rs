@@ -115,6 +115,7 @@ pub struct Metrics {
     pub fetch_items_sent: CounterVec,
     pub fetch_latency: HistogramVec,
     pub fetch_in_flight: GaugeVec,
+    pub fetch_oldest_in_flight_age_ms: GaugeVec,
 
     // === Aborted Transactions ===
     pub transactions_aborted: Counter,
@@ -578,6 +579,13 @@ impl Metrics {
             fetch_in_flight: register_gauge_vec!(
                 "hyperscale_fetch_in_flight",
                 "Number of fetch requests currently in flight, per (kind, shard)",
+                &["kind", "shard"]
+            )
+            .unwrap(),
+
+            fetch_oldest_in_flight_age_ms: register_gauge_vec!(
+                "hyperscale_fetch_oldest_in_flight_age_ms",
+                "Age in ms of the longest-running in-flight fetch entry, per (kind, shard); 0 when no entry is in flight. Alert on rising past tens of seconds — admission silently dropped a response.",
                 &["kind", "shard"]
             )
             .unwrap(),
@@ -1166,6 +1174,13 @@ impl MetricsRecorder for PrometheusRecorder {
             .fetch_in_flight
             .with_label_values(&[kind, &shard.to_string()])
             .set(count as f64);
+    }
+
+    fn set_fetch_oldest_in_flight_age_ms(&self, kind: &str, shard: u64, age_ms: u64) {
+        self.metrics
+            .fetch_oldest_in_flight_age_ms
+            .with_label_values(&[kind, &shard.to_string()])
+            .set(age_ms as f64);
     }
 
     fn record_fetch_response_sent(&self, kind: &str, count: usize) {

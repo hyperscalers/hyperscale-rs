@@ -432,6 +432,10 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// Set the fetch in-flight gauge (per kind).
     fn set_fetch_in_flight(&self, kind: &str, shard: u64, count: usize) {}
 
+    /// Set the age (in ms) of the longest-running in-flight fetch entry
+    /// (per kind, per shard). Zero when nothing is in flight.
+    fn set_fetch_oldest_in_flight_age_ms(&self, kind: &str, shard: u64, age_ms: u64) {}
+
     /// Record items sent in response to a fetch request.
     fn record_fetch_response_sent(&self, kind: &str, count: usize) {}
 
@@ -894,6 +898,13 @@ pub fn record_fetch_latency(kind: &str, latency_secs: f64) {
 #[inline]
 pub fn set_fetch_in_flight(kind: &str, shard: u64, count: usize) {
     recorder().set_fetch_in_flight(kind, shard, count);
+}
+
+/// Set the age (in ms) of the longest-running in-flight fetch entry
+/// (per kind, per shard).
+#[inline]
+pub fn set_fetch_oldest_in_flight_age_ms(kind: &str, shard: u64, age_ms: u64) {
+    recorder().set_fetch_oldest_in_flight_age_ms(kind, shard, age_ms);
 }
 
 /// Record items sent in response to a fetch request.

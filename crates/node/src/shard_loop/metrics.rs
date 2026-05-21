@@ -23,9 +23,10 @@ use std::collections::HashMap;
 
 use hyperscale_dispatch::Dispatch;
 use hyperscale_metrics::{
-    MemoryMetrics, set_backpressure_active, set_bft_round, set_fetch_in_flight, set_in_flight,
-    set_lock_contention, set_memory_metrics, set_mempool_size, set_sync_blocks_behind,
-    set_sync_in_progress, set_sync_round_in_flight, set_view_changes, set_view_syncs,
+    MemoryMetrics, set_backpressure_active, set_bft_round, set_fetch_in_flight,
+    set_fetch_oldest_in_flight_age_ms, set_in_flight, set_lock_contention, set_memory_metrics,
+    set_mempool_size, set_sync_blocks_behind, set_sync_in_progress, set_sync_round_in_flight,
+    set_view_changes, set_view_syncs,
 };
 use hyperscale_network::Network;
 use hyperscale_storage::Storage;
@@ -170,6 +171,31 @@ where
         set_fetch_in_flight("local_provision", s, fetches.local_provision_in_flight);
         set_fetch_in_flight("exec_cert", s, fetches.exec_cert_in_flight);
         set_fetch_in_flight("finalized_wave", s, fetches.finalized_wave_in_flight);
+        set_fetch_oldest_in_flight_age_ms(
+            "transaction",
+            s,
+            fetches.transaction_oldest_in_flight_age_ms,
+        );
+        set_fetch_oldest_in_flight_age_ms(
+            "provision",
+            s,
+            fetches.provision_oldest_in_flight_age_ms,
+        );
+        set_fetch_oldest_in_flight_age_ms(
+            "local_provision",
+            s,
+            fetches.local_provision_oldest_in_flight_age_ms,
+        );
+        set_fetch_oldest_in_flight_age_ms(
+            "exec_cert",
+            s,
+            fetches.exec_cert_oldest_in_flight_age_ms,
+        );
+        set_fetch_oldest_in_flight_age_ms(
+            "finalized_wave",
+            s,
+            fetches.finalized_wave_oldest_in_flight_age_ms,
+        );
 
         for vnode in &self.vnodes {
             let v = vnode.validator_id.inner();
