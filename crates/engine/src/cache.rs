@@ -28,6 +28,8 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
+use dashmap::DashMap;
+use dashmap::mapref::entry::Entry as DashEntry;
 use hyperscale_types::{RETENTION_HORIZON, ShardGroupId, TxHash, WeightedTimestamp};
 
 use crate::receipt::CachedVmOutput;
@@ -73,8 +75,11 @@ struct Entry {
     inserted_at_ts: WeightedTimestamp,
 }
 
-struct Inner {
-    entries: BTreeMap<TxHash, Entry>,
+/// Cold-path bookkeeping: the inserted-timestamp index and the cache's
+/// view of "now". Locked only on new-entry insert and on block-commit
+/// sweep; the hot `try_acquire` / `on_finalized_wave` paths touch
+/// `entries` (the [`DashMap`]) without going through here.
+struct Timeline {
     /// Inserted-timestamp secondary index. Each tx hash is pushed onto
     /// `by_ts[entry.inserted_at_ts]` at insertion so the retention sweep
     /// can drop expired entries in `O(k_expired · log N)` by popping the
@@ -93,7 +98,7 @@ struct Inner {
     now: WeightedTimestamp,
 }
 
-/// Lock the inner map, recovering from poisoning. The cache is
+/// Lock the timeline mutex, recovering from poisoning. The cache is
 /// best-effort metadata; a poisoned mutex from a panicked handler
 /// elsewhere doesn't justify tearing the process down.
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -101,12 +106,20 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// Process-scope cache keyed by [`TxHash`].
+///
+/// Primary map (`entries`) is a [`DashMap`] so concurrent
+/// `try_acquire` calls from the execution pool only contend on keys
+/// that hash to the same shard. The retention index (`timeline`) sits
+/// behind a small mutex — it's only touched once per new-entry insert
+/// and once per block commit, so its contention is bounded by block
+/// rate rather than dispatched-tx rate.
 pub struct ProcessExecutionCache {
     /// Shards this process hosts. Used to narrow each tx's participating
     /// shard set down to the slice this cache can actually observe
     /// finalising via [`Self::on_finalized_wave`].
     hosted_shards: HashSet<ShardGroupId>,
-    inner: Mutex<Inner>,
+    entries: DashMap<TxHash, Entry>,
+    timeline: Mutex<Timeline>,
 }
 
 impl ProcessExecutionCache {
@@ -115,11 +128,11 @@ impl ProcessExecutionCache {
     /// [`Self::on_finalized_wave`]; the retention sweep cleans up
     /// anything missed.
     #[must_use]
-    pub const fn new(hosted_shards: HashSet<ShardGroupId>) -> Self {
+    pub fn new(hosted_shards: HashSet<ShardGroupId>) -> Self {
         Self {
             hosted_shards,
-            inner: Mutex::new(Inner {
-                entries: BTreeMap::new(),
+            entries: DashMap::new(),
+            timeline: Mutex::new(Timeline {
                 by_ts: BTreeMap::new(),
                 now: WeightedTimestamp::ZERO,
             }),
@@ -143,33 +156,58 @@ impl ProcessExecutionCache {
         tx_hash: TxHash,
         participating: impl IntoIterator<Item = ShardGroupId>,
     ) -> SlotStatus {
-        let mut guard = lock(&self.inner);
-        if let Some(entry) = guard.entries.get(&tx_hash) {
-            let slot = Arc::clone(&entry.value);
-            drop(guard);
+        // Fast path: lookup without taking any write lock. The slot is
+        // an `Arc<OnceLock<_>>` so we can release the per-key shard
+        // guard before peeking at the slot's state.
+        if let Some(entry_ref) = self.entries.get(&tx_hash) {
+            let slot = Arc::clone(&entry_ref.value);
+            drop(entry_ref);
             return slot.get().map_or_else(
                 || SlotStatus::Pending(Arc::clone(&slot)),
                 |v| SlotStatus::Completed(Arc::clone(v)),
             );
         }
 
-        let now = guard.now;
-        let pending_shards: HashSet<ShardGroupId> = participating
-            .into_iter()
-            .filter(|s| self.hosted_shards.contains(s))
-            .collect();
-        let slot = Arc::new(OnceLock::new());
-        guard.entries.insert(
-            tx_hash,
-            Entry {
-                value: Arc::clone(&slot),
-                pending_shards,
-                inserted_at_ts: now,
-            },
-        );
-        guard.by_ts.entry(now).or_default().push(tx_hash);
-        drop(guard);
-        SlotStatus::Claimed(slot)
+        // Slow path: race to claim the slot. `entry()` takes the
+        // per-key shard's write lock for the duration of the match —
+        // racing callers either see the winner's slot under
+        // `Occupied`, or one of them lands the `Vacant` insert.
+        match self.entries.entry(tx_hash) {
+            DashEntry::Occupied(occ) => {
+                let slot = Arc::clone(&occ.get().value);
+                drop(occ);
+                slot.get().map_or_else(
+                    || SlotStatus::Pending(Arc::clone(&slot)),
+                    |v| SlotStatus::Completed(Arc::clone(v)),
+                )
+            }
+            DashEntry::Vacant(vac) => {
+                let pending_shards: HashSet<ShardGroupId> = participating
+                    .into_iter()
+                    .filter(|s| self.hosted_shards.contains(s))
+                    .collect();
+                // Stamp `inserted_at_ts` from the same `now` snapshot
+                // that publishes the tx hash into `by_ts`, so the
+                // retention sweep's equality check can match the
+                // entry to its bucket. Nesting the timeline lock
+                // inside the per-key shard lock is one-way — the
+                // sweep releases the timeline lock before it touches
+                // `entries`, so this ordering doesn't deadlock.
+                let slot = Arc::new(OnceLock::new());
+                let now = {
+                    let mut tl = lock(&self.timeline);
+                    let now = tl.now;
+                    tl.by_ts.entry(now).or_default().push(tx_hash);
+                    now
+                };
+                vac.insert(Entry {
+                    value: Arc::clone(&slot),
+                    pending_shards,
+                    inserted_at_ts: now,
+                });
+                SlotStatus::Claimed(slot)
+            }
+        }
     }
 
     /// Remove `shard` from each named tx's pending-shards set. Entries
@@ -184,14 +222,24 @@ impl ProcessExecutionCache {
         shard: ShardGroupId,
         tx_hashes: impl IntoIterator<Item = TxHash>,
     ) {
-        let mut guard = lock(&self.inner);
         for tx_hash in tx_hashes {
-            let Some(entry) = guard.entries.get_mut(&tx_hash) else {
-                continue;
+            // Decrement under the per-key shard guard, then release
+            // it before calling `remove_if` — re-entering the same
+            // shard while holding its guard would deadlock.
+            let now_empty = {
+                let Some(mut entry) = self.entries.get_mut(&tx_hash) else {
+                    continue;
+                };
+                entry.pending_shards.remove(&shard);
+                entry.pending_shards.is_empty()
             };
-            entry.pending_shards.remove(&shard);
-            if entry.pending_shards.is_empty() {
-                guard.entries.remove(&tx_hash);
+            if now_empty {
+                // Re-check under the per-key guard: a concurrent
+                // `try_acquire` after our decrement may have inserted
+                // a fresh entry with non-empty `pending_shards`, and
+                // we mustn't evict that.
+                self.entries
+                    .remove_if(&tx_hash, |_, e| e.pending_shards.is_empty());
             }
         }
     }
@@ -207,28 +255,38 @@ impl ProcessExecutionCache {
     /// fresher timestamp is left alone (the equality check guards
     /// against evicting live entries via a stale index pointer).
     pub fn on_block_committed(&self, now: WeightedTimestamp) {
-        // Lock held across the sweep on purpose — the index and the
-        // primary map are consulted together for every expired bucket.
-        #[allow(clippy::significant_drop_tightening)]
-        let mut guard = lock(&self.inner);
-        if now > guard.now {
-            guard.now = now;
-        }
-        let cutoff = now.minus(RETENTION_HORIZON);
-        let expired_ts: Vec<WeightedTimestamp> =
-            guard.by_ts.range(..=cutoff).map(|(ts, _)| *ts).collect();
-        for ts in expired_ts {
-            let Some(popped) = guard.by_ts.remove(&ts) else {
-                continue;
-            };
-            for tx_hash in popped {
-                let still_at_ts = guard
-                    .entries
-                    .get(&tx_hash)
-                    .is_some_and(|e| e.inserted_at_ts == ts);
-                if still_at_ts {
-                    guard.entries.remove(&tx_hash);
+        // Gather expired buckets under the timeline lock, then release
+        // it before touching `entries`. `try_acquire`'s vacant arm
+        // takes a per-key shard lock and nests the timeline lock
+        // inside; if the sweep held the timeline lock while waiting on
+        // a shard lock, that nesting would deadlock.
+        #[allow(clippy::significant_drop_tightening)] // tl is reused below collect()
+        let expired: Vec<(WeightedTimestamp, Vec<TxHash>)> = {
+            let mut tl = lock(&self.timeline);
+            if now > tl.now {
+                tl.now = now;
+            }
+            let cutoff = now.minus(RETENTION_HORIZON);
+            let expired_ts: Vec<WeightedTimestamp> =
+                tl.by_ts.range(..=cutoff).map(|(ts, _)| *ts).collect();
+            let mut out = Vec::with_capacity(expired_ts.len());
+            for ts in expired_ts {
+                if let Some(popped) = tl.by_ts.remove(&ts) {
+                    out.push((ts, popped));
                 }
+            }
+            out
+        };
+
+        for (ts, popped) in expired {
+            for tx_hash in popped {
+                // `remove_if` does the `inserted_at_ts == ts` check
+                // under the per-key shard guard, so a concurrent
+                // re-insert under a fresher timestamp survives the
+                // sweep — same invariant the previous mutex-held
+                // `get` + `remove` pair preserved.
+                self.entries
+                    .remove_if(&tx_hash, |_, e| e.inserted_at_ts == ts);
             }
         }
     }
@@ -236,13 +294,13 @@ impl ProcessExecutionCache {
     /// Current entry count, including in-flight (uninitialised) slots.
     #[must_use]
     pub fn len(&self) -> usize {
-        lock(&self.inner).entries.len()
+        self.entries.len()
     }
 
     /// Whether the cache holds no entries.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        lock(&self.inner).entries.is_empty()
+        self.entries.is_empty()
     }
 }
 
