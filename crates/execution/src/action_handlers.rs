@@ -423,8 +423,11 @@ where
             // and `project_to_shard` (for the shard filter). The map is not
             // cached: cross-shard packed vnodes share a process cache but see
             // different remote provisions, so caching one vnode's map under
-            // `tx_hash` would corrupt the shard filter on the other.
-            let ownerships: Vec<HashMap<NodeId, NodeId>> = requests
+            // `tx_hash` would corrupt the shard filter on the other. `Err`
+            // means the transaction touches a vault claimed by accounts on
+            // both shards — fast-abort below so every committee produces the
+            // same `Failed` outcome instead of executing a divergent VM view.
+            let ownerships: Vec<Result<HashMap<NodeId, NodeId>, Vec<NodeId>>> = requests
                 .iter()
                 .map(|req| {
                     let declared: Vec<NodeId> = req
@@ -447,19 +450,26 @@ where
             let cached =
                 batch_compute_cached(ctx.execution_cache.as_ref(), &txs, num_shards, |i| {
                     let req = &requests[i];
-                    ctx.executor.compute_vm_output_cross_shard(
-                        &view_snap,
-                        &req.transaction,
-                        &req.provisions,
-                        &ownerships[i],
+                    ownerships[i].as_ref().map_or_else(
+                        |_| CachedVmOutput::ownership_conflict_aborted(req.transaction.hash()),
+                        |ownership| {
+                            ctx.executor.compute_vm_output_cross_shard(
+                                &view_snap,
+                                &req.transaction,
+                                &req.provisions,
+                                ownership,
+                            )
+                        },
                     )
                 });
+            let empty_ownership: HashMap<NodeId, NodeId> = HashMap::new();
             let (tx_outcomes, results): (Vec<_>, Vec<_>) = requests
                 .iter()
                 .zip(cached)
                 .zip(ownerships.iter())
                 .map(|((req, cached), ownership)| {
                     let tx_hash = req.transaction.hash();
+                    let ownership = ownership.as_ref().unwrap_or(&empty_ownership);
                     let executed =
                         project_to_shard(&cached, tx_hash, local_shard, num_shards, ownership);
                     (executed.outcome(), StoredReceipt::from(executed))

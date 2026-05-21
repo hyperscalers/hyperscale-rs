@@ -64,6 +64,7 @@
 //! that execute at different committed heights see different vault balances,
 //! producing different DatabaseUpdates and divergent state roots.
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasher;
 
@@ -143,28 +144,43 @@ pub fn resolve_owned_nodes<S: SubstateDatabase>(
 ///
 /// Each entry is sourced from the shard whose account owns the vault:
 /// provisions for remote-shard owners (the source shard's BFT-attested
-/// map) and a local-snapshot walk for local-shard owners.
+/// map) and a local-snapshot walk for local-shard owners. Healthy state
+/// produces disjoint contributions.
 ///
-/// Healthy state produces disjoint contributions. If a vault appears in
-/// both with different owners — typically an orphaned `Own(_)` reference
-/// upstream — local-resolve overrides the provision (the local snapshot
-/// is the strongest authority for local-shard vaults) and a warning is
-/// emitted so the inconsistency is visible.
+/// Returns `Err(conflicts)` if the same vault is claimed by accounts on
+/// both shards. The Radix Engine is not shard-aware yet: every shard's
+/// genesis runs the same VM initialization with the same RNG-derived
+/// IDs, so two genesis accounts (one per shard) can end up holding
+/// `Own(_)` references to the same internal vault. Even with a
+/// deterministic ownership tiebreaker the VM would still see divergent
+/// substates for the colliding vault (each shard's
+/// [`crate::provisioned_snapshot::ProvisionedSnapshot`] overlays the
+/// other shard's provision on top of its own local state with
+/// "provisions win" precedence), so the global receipt root would split
+/// across the two committees. Callers must abort the transaction on
+/// `Err` — a deterministic outcome both shards can produce locally —
+/// rather than attempting to execute it.
 ///
 /// Deterministic across same-shard validators: identical declared set +
 /// identical local state + identical BFT-attested provisions ⇒ identical
-/// merged map. Not cached — cross-shard packed vnodes that share a
-/// [`crate::ProcessExecutionCache`] entry see different remote provisions,
-/// so callers must invoke this per call before [`crate::project_to_shard`].
+/// merged map (or identical conflict set). Not cached — cross-shard
+/// packed vnodes that share a [`crate::ProcessExecutionCache`] entry see
+/// different remote provisions, so callers must invoke this per call
+/// before [`crate::project_to_shard`].
+///
+/// # Errors
+///
+/// Returns the sorted list of conflicting vault `NodeId`s — same vault
+/// owned by accounts on both shards — so the caller can attribute the
+/// abort in logs.
 #[allow(clippy::implicit_hasher)]
-#[must_use]
 pub fn build_cross_shard_ownership<S: SubstateDatabase>(
     snapshot: &S,
     declared: &[NodeId],
     provisions_ownership: &HashMap<NodeId, NodeId>,
     local_shard: ShardGroupId,
     num_shards: u64,
-) -> HashMap<NodeId, NodeId> {
+) -> Result<HashMap<NodeId, NodeId>, Vec<NodeId>> {
     let mut merged: HashMap<NodeId, NodeId> = HashMap::new();
     for (vault, owner) in provisions_ownership {
         if shard_for_node(owner, num_shards) != local_shard {
@@ -177,25 +193,38 @@ pub fn build_cross_shard_ownership<S: SubstateDatabase>(
         .copied()
         .collect();
     if local_declared.is_empty() {
-        return merged;
+        return Ok(merged);
     }
     let local_ownership = resolve_owned_nodes(snapshot, &local_declared);
-    for (vault, owner) in local_ownership {
-        if shard_for_node(&owner, num_shards) != local_shard {
+    let mut conflicts: Vec<NodeId> = Vec::new();
+    for (vault, local_owner) in local_ownership {
+        if shard_for_node(&local_owner, num_shards) != local_shard {
             continue;
         }
-        if let Some(existing) = merged.insert(vault, owner) {
-            tracing::warn!(
-                ?vault,
-                remote_owner = ?existing,
-                local_owner = ?owner,
-                "Cross-shard ownership conflict — local-resolve overrides provision. \
-                 Vault appears in both source-shard provision and local snapshot under \
-                 different accounts (likely an orphaned `Own(_)` reference upstream)."
-            );
+        match merged.entry(vault) {
+            Entry::Vacant(slot) => {
+                slot.insert(local_owner);
+            }
+            Entry::Occupied(slot) => {
+                let remote_owner = *slot.get();
+                tracing::warn!(
+                    ?vault,
+                    ?remote_owner,
+                    ?local_owner,
+                    "Cross-shard ownership conflict — aborting transaction. \
+                     Vault claimed by accounts on both shards (pre-sharding-aware \
+                     Radix Engine genesis can produce colliding internal vault NodeIds)."
+                );
+                conflicts.push(vault);
+            }
         }
     }
-    merged
+    if conflicts.is_empty() {
+        Ok(merged)
+    } else {
+        conflicts.sort();
+        Err(conflicts)
+    }
 }
 
 /// Scan raw SBOR bytes for `Own(NodeId)` references to internal entities.
@@ -783,6 +812,81 @@ mod tests {
         db.insert(&account, 200, vec![0], own_bytes(&vault));
         let ownership = resolve_owned_nodes(&db, &[account]);
         assert_eq!(ownership.get(&vault), Some(&account));
+    }
+
+    // ── build_cross_shard_ownership ──────────────────────────────────────────
+
+    #[test]
+    fn cross_shard_ownership_merges_disjoint_contributions() {
+        let local = account_id(1);
+        let remote = pick_other_shard_seed(local, 2);
+        let local_vault = fungible_vault_id(10);
+        let remote_vault = fungible_vault_id(20);
+        let local_shard = shard_for_node(&local, 2);
+
+        let mut db = MockDb::default();
+        db.insert(&local, 64, vec![0], own_bytes(&local_vault));
+
+        let mut provisions = HashMap::new();
+        provisions.insert(remote_vault, remote);
+
+        let merged =
+            build_cross_shard_ownership(&db, &[local, remote], &provisions, local_shard, 2)
+                .expect("disjoint inputs should not conflict");
+
+        assert_eq!(merged.get(&local_vault), Some(&local));
+        assert_eq!(merged.get(&remote_vault), Some(&remote));
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn cross_shard_ownership_conflict_returns_err() {
+        // Genesis vault-NodeId collision: the same internal vault is claimed
+        // by accounts on both shards. Both shards see the conflict from
+        // opposite perspectives (local-walk on one side, provision on the
+        // other), so each independently returns Err — the caller fast-aborts
+        // the transaction, producing a deterministic outcome across shards.
+        let a = account_id(1);
+        let b = pick_other_shard_seed(a, 2);
+        let shared_vault = fungible_vault_id(99);
+
+        // Run on shard(a): local owner is a, provisions claim b.
+        let shard_a = shard_for_node(&a, 2);
+        let mut db_a = MockDb::default();
+        db_a.insert(&a, 64, vec![0], own_bytes(&shared_vault));
+        let mut prov_a = HashMap::new();
+        prov_a.insert(shared_vault, b);
+        let err_a = build_cross_shard_ownership(&db_a, &[a, b], &prov_a, shard_a, 2)
+            .expect_err("collision should produce Err");
+
+        // Run on shard(b): local owner is b, provisions claim a.
+        let shard_b = shard_for_node(&b, 2);
+        let mut db_b = MockDb::default();
+        db_b.insert(&b, 64, vec![0], own_bytes(&shared_vault));
+        let mut prov_b = HashMap::new();
+        prov_b.insert(shared_vault, a);
+        let err_b = build_cross_shard_ownership(&db_b, &[a, b], &prov_b, shard_b, 2)
+            .expect_err("collision should produce Err");
+
+        assert_eq!(err_a, vec![shared_vault]);
+        assert_eq!(err_b, vec![shared_vault]);
+    }
+
+    #[test]
+    fn cross_shard_ownership_ignores_provisions_for_local_owners() {
+        // A provision entry pointing at a local-shard owner is dropped — the
+        // local walk is authoritative for local-shard vaults.
+        let local = account_id(1);
+        let local_shard = shard_for_node(&local, 2);
+        let vault = fungible_vault_id(5);
+
+        let mut provisions = HashMap::new();
+        provisions.insert(vault, local);
+
+        let merged =
+            build_cross_shard_ownership(&MockDb::default(), &[local], &provisions, local_shard, 2)
+                .expect("provision entries for local owners are dropped, not conflicts");
+        assert!(merged.is_empty());
     }
 
     // ── filter_updates_for_shard ─────────────────────────────────────────────

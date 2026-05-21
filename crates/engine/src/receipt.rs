@@ -87,6 +87,26 @@ impl CachedVmOutput {
             body: CachedVmOutputBody::Failed,
         }
     }
+
+    /// Synthesize the failure output for a cross-shard transaction we
+    /// refused to run because
+    /// [`crate::sharding::build_cross_shard_ownership`] flagged an
+    /// internal vault that both shards' accounts claim to own. Every
+    /// validator on every shard reaches the same conclusion from the
+    /// same inputs, so the resulting [`ConsensusReceipt::Failed`] is
+    /// shard-invariant and the wave's `global_receipt_root` agrees
+    /// across committees by construction.
+    #[must_use]
+    pub fn ownership_conflict_aborted(tx_hash: TxHash) -> Self {
+        tracing::warn!(
+            ?tx_hash,
+            "Aborting transaction — cross-shard ownership conflict"
+        );
+        Self {
+            metadata: ExecutionMetadata::empty(),
+            body: CachedVmOutputBody::Failed,
+        }
+    }
 }
 
 #[cfg(test)]
