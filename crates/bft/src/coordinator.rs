@@ -12,7 +12,7 @@
 //! This provides a strong DA guarantee: if a QC forms, at least 2f+1 validators have
 //! the complete block data, making it recoverable from any honest validator in that set.
 
-use hyperscale_core::{Action, CommitSource, ProtocolEvent, TimerId};
+use hyperscale_core::{Action, CommitSource, FetchAbandon, ProtocolEvent, TimerId};
 use hyperscale_types::{
     BlockHash, LocalTimestamp, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROGRESS_WAIT, MAX_TXS_PER_BLOCK,
     ProposerTimestamp, ProvisionHash, ShardGroupId, WaveId, WeightedTimestamp,
@@ -583,7 +583,9 @@ impl BftCoordinator {
 
         // Clean up any votes for heights at or below the committed height.
         // This handles the case where we loaded votes from storage that are now stale.
-        self.cleanup_old_state(height);
+        // The recovery sweep runs before any fetches are issued, so any
+        // returned abandon would target ids the FSM has never seen — drop it.
+        let _ = self.cleanup_old_state(height);
 
         // Record recovery time as initial leader activity so that the view
         // change timeout counts from startup rather than being disabled.
@@ -1644,9 +1646,9 @@ impl BftCoordinator {
                 height = header.height().inner(),
                 "QC signature verification FAILED - potential Byzantine attack! Rejecting block."
             );
-            // Remove the pending block since we can't trust it
-            self.remove_pending_block(block_hash);
-            return vec![];
+            // Remove the pending block since we can't trust it; surface any
+            // orphaned local-DA fetches so the FSM releases their slots.
+            return self.remove_pending_block(block_hash).into_iter().collect();
         }
 
         debug!(
@@ -1708,8 +1710,7 @@ impl BftCoordinator {
                 ?kind,
                 "Block root verification FAILED"
             );
-            self.remove_pending_block(block_hash);
-            return vec![];
+            return self.remove_pending_block(block_hash).into_iter().collect();
         }
 
         let Some(pending_block) = self.pending_blocks.get(block_hash) else {
@@ -2180,13 +2181,14 @@ impl BftCoordinator {
     /// Common bookkeeping for committing a block (shared between consensus and
     /// sync paths). Updates `committed_height`/`hash`, registers committed
     /// artifacts in the dedup index, resets backoff tracking, and cleans up
-    /// old state.
+    /// old state. Returns the abandon-fetch action from the post-commit
+    /// sweep when there are orphaned pending-block fetches to cancel.
     fn record_block_committed(
         &mut self,
         block: &Block,
         block_hash: BlockHash,
         commit_ts: WeightedTimestamp,
-    ) {
+    ) -> Option<Action> {
         let height = block.height();
 
         self.committed_height = height;
@@ -2213,7 +2215,7 @@ impl BftCoordinator {
         // Reset backoff tracking — new height means fresh round counting.
         self.view_change.reset_for_height_advance();
 
-        self.cleanup_old_state(height);
+        self.cleanup_old_state(height)
     }
 
     /// Drive the commit chain: commit the given block, then any buffered
@@ -2315,7 +2317,11 @@ impl BftCoordinator {
         let parent_state_root = self.committed_state_root;
         let parent_block_height = self.committed_height;
 
-        self.record_block_committed(&block, block_hash, qc.weighted_timestamp());
+        if let Some(abandon) =
+            self.record_block_committed(&block, block_hash, qc.weighted_timestamp())
+        {
+            actions.push(abandon);
+        }
         self.record_leader_activity();
 
         actions.push(if state_root_verified {
@@ -2860,9 +2866,11 @@ impl BftCoordinator {
     }
 
     /// Clean up old state after commit. Drops pending-block, vote, and
-    /// commit-tracking entries at or below `committed_height`.
-    fn cleanup_old_state(&mut self, committed_height: BlockHeight) {
-        self.pending_blocks.prune_committed(committed_height);
+    /// commit-tracking entries at or below `committed_height`. Returns an
+    /// optional `AbandonFetch` carrying the orphaned local-provision fetch
+    /// ids from the dropped pending blocks so the FSM releases their slots.
+    fn cleanup_old_state(&mut self, committed_height: BlockHeight) -> Option<Action> {
+        let orphaned = self.pending_blocks.prune_committed(committed_height);
 
         self.votes.cleanup_committed(committed_height);
         self.commits.cleanup_committed(committed_height);
@@ -2879,6 +2887,9 @@ impl BftCoordinator {
         self.block_sync.cleanup(committed_height);
         self.verification
             .cleanup(&self.pending_blocks, committed_height);
+
+        (!orphaned.is_empty())
+            .then(|| Action::AbandonFetch(FetchAbandon::LocalProvisions { hashes: orphaned }))
     }
 
     /// Check pending blocks and emit fetch requests for those that have been
@@ -2984,8 +2995,15 @@ impl BftCoordinator {
     /// here so future bookkeeping (metrics, indices, etc.) has one place to
     /// hook. Bulk pruning at commit time uses `cleanup_old_state` which
     /// retains in-place.
-    fn remove_pending_block(&mut self, block_hash: BlockHash) -> Option<PendingBlock> {
-        self.pending_blocks.remove(block_hash)
+    ///
+    /// Returns an `AbandonFetch` for the dropped block's outstanding
+    /// missing-provision fetches when there were any — without this the
+    /// FSM's `in_flight` entries pinned for this block would linger past
+    /// the block's lifetime, eating slots in the `max_in_flight` cap.
+    fn remove_pending_block(&mut self, block_hash: BlockHash) -> Option<Action> {
+        let pending = self.pending_blocks.remove(block_hash)?;
+        let hashes = pending.missing_provisions();
+        (!hashes.is_empty()).then(|| Action::AbandonFetch(FetchAbandon::LocalProvisions { hashes }))
     }
 
     /// Get the committed block hash.

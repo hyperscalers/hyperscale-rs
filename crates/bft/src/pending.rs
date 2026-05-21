@@ -56,10 +56,20 @@ impl PendingBlocks {
     }
 
     /// Drop pending blocks whose header height is at or below
-    /// `committed_height`.
-    pub fn prune_committed(&mut self, committed_height: BlockHeight) {
-        self.0
-            .retain(|_, pending| pending.header().height() > committed_height);
+    /// `committed_height`. Returns the union of their outstanding
+    /// missing-provision hashes — any in-flight local-DA fetch on those
+    /// hashes is now orphaned and the caller is responsible for emitting
+    /// `AbandonFetch::LocalProvisions` so the FSM releases its slots.
+    pub fn prune_committed(&mut self, committed_height: BlockHeight) -> Vec<ProvisionHash> {
+        let mut orphaned = Vec::new();
+        self.0.retain(|_, pending| {
+            if pending.header().height() > committed_height {
+                return true;
+            }
+            orphaned.extend(pending.missing_provision_hashes.iter().copied());
+            false
+        });
+        orphaned
     }
 
     /// Header for the pending block at `block_hash`, if present.
@@ -797,5 +807,49 @@ mod tests {
         let pending =
             PendingBlock::from_complete_block(&block, vec![fw], vec![], LocalTimestamp::ZERO);
         assert!(pending.is_complete());
+    }
+
+    #[test]
+    fn prune_committed_surfaces_orphaned_provision_hashes() {
+        // Two pending blocks: one at the committed height with outstanding
+        // provisions (will be pruned), one above (will be kept). The pruned
+        // block's missing-provision ids must come back out so the caller
+        // can cancel any pinned local-DA fetches.
+        let mut pending_blocks = PendingBlocks::new();
+        let prov_a = ProvisionHash::from_raw(Hash::from_bytes(b"prov_a"));
+        let prov_b = ProvisionHash::from_raw(Hash::from_bytes(b"prov_b"));
+
+        let stale = PendingBlock::from_manifest(
+            make_header(BlockHeight::new(5)),
+            BlockManifest::new(vec![], vec![], vec![prov_a, prov_b]),
+            LocalTimestamp::ZERO,
+        );
+        let live = PendingBlock::from_manifest(
+            make_header(BlockHeight::new(10)),
+            BlockManifest::default(),
+            LocalTimestamp::ZERO,
+        );
+        pending_blocks.insert(stale);
+        pending_blocks.insert(live);
+
+        let orphaned = pending_blocks.prune_committed(BlockHeight::new(5));
+        let orphaned_set: HashSet<_> = orphaned.into_iter().collect();
+        assert_eq!(orphaned_set, HashSet::from([prov_a, prov_b]));
+        assert_eq!(pending_blocks.len(), 1, "live block must remain");
+    }
+
+    #[test]
+    fn prune_committed_yields_no_hashes_when_dropped_block_was_complete() {
+        let mut pending_blocks = PendingBlocks::new();
+        let complete = PendingBlock::from_manifest(
+            make_header(BlockHeight::new(5)),
+            BlockManifest::default(),
+            LocalTimestamp::ZERO,
+        );
+        pending_blocks.insert(complete);
+
+        let orphaned = pending_blocks.prune_committed(BlockHeight::new(5));
+        assert!(orphaned.is_empty());
+        assert_eq!(pending_blocks.len(), 0);
     }
 }
