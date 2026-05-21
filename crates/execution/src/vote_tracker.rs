@@ -64,6 +64,16 @@ pub struct VoteTracker {
     /// Validators we've already seen votes from at each `vote_anchor_ts` (dedup).
     /// Key is (`validator_id`, `vote_anchor_ts`).
     seen: HashSet<(ValidatorId, WeightedTimestamp)>,
+    /// Validators whose vote has already been counted toward the verified
+    /// power tally. Required because own votes bypass [`Self::buffer_unverified_vote`]
+    /// (and therefore [`Self::seen`]) via the `handle_verified_vote` path,
+    /// and leader-rotation retries that land on `self` re-feed the same own
+    /// vote each time. Without this guard, [`Self::power_by_key`] inflates
+    /// past the unique-signer count and [`Self::check_quorum`] fires on
+    /// fewer-than-quorum distinct validators, producing an aggregated EC
+    /// whose signer bitfield reflects the deduped signer set and is rejected
+    /// as sub-quorum by peers.
+    verified_seen: HashSet<(ValidatorId, WeightedTimestamp)>,
     /// Whether a verification batch is currently in flight.
     pending_verification: bool,
 }
@@ -81,6 +91,7 @@ impl VoteTracker {
             unverified_votes: Vec::new(),
             unverified_power: VotePower::ZERO,
             seen: HashSet::new(),
+            verified_seen: HashSet::new(),
             pending_verification: false,
         }
     }
@@ -168,7 +179,15 @@ impl VoteTracker {
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Add a verified vote and its voting power.
+    ///
+    /// Idempotent per `(validator, vote_anchor_ts)`: redundant calls (e.g.
+    /// own-vote re-feeds from leader-rotation retries that land on `self`)
+    /// are dropped so [`Self::power_by_key`] only counts unique signers.
     pub fn add_verified_vote(&mut self, vote: ExecutionVote, power: VotePower) {
+        let dedup_key = (vote.validator(), vote.vote_anchor_ts());
+        if !self.verified_seen.insert(dedup_key) {
+            return;
+        }
         let key = (vote.global_receipt_root(), vote.vote_anchor_ts());
         self.votes_by_key.entry(key).or_default().push(vote);
         *self.power_by_key.entry(key).or_insert(VotePower::ZERO) += power;
@@ -377,6 +396,26 @@ mod tests {
 
         assert!(tracker.buffer_unverified_vote(make_vote(0, root), pk, VotePower::new(1)));
         assert!(!tracker.buffer_unverified_vote(make_vote(0, root), pk, VotePower::new(1)));
+    }
+
+    #[test]
+    fn duplicate_verified_vote_does_not_inflate_power() {
+        // Own votes bypass `buffer_unverified_vote` and arrive directly at
+        // `add_verified_vote`. Leader-rotation retries that land on `self`
+        // re-feed the same own vote; the tally must count it once.
+        let root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root"));
+        let mut tracker = VoteTracker::new(
+            WaveId::new(ShardGroupId::new(0), BlockHeight::new(0), BTreeSet::new()),
+            BlockHash::from_raw(Hash::from_bytes(b"block")),
+            VotePower::new(3),
+        );
+
+        tracker.add_verified_vote(make_vote(0, root), VotePower::new(1));
+        tracker.add_verified_vote(make_vote(0, root), VotePower::new(1));
+        tracker.add_verified_vote(make_vote(0, root), VotePower::new(1));
+
+        assert_eq!(tracker.total_verified_power(), VotePower::new(1));
+        assert!(tracker.check_quorum().is_none());
     }
 
     #[test]
