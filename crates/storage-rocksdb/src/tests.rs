@@ -366,6 +366,7 @@ fn push_wave(block: &mut Block, fw: Arc<FinalizedWave>) {
             header: block.header().clone(),
             transactions: Arc::new(BoundedVec::new()),
             certificates: Arc::new(BoundedVec::new()),
+            provision_hashes: Arc::new(BoundedVec::new()),
         },
     );
     *block = match taken {
@@ -388,6 +389,7 @@ fn push_wave(block: &mut Block, fw: Arc<FinalizedWave>) {
             header,
             transactions,
             certificates,
+            provision_hashes,
         } => {
             let mut certificates = (*certificates).clone();
             certificates.push(fw);
@@ -395,6 +397,7 @@ fn push_wave(block: &mut Block, fw: Arc<FinalizedWave>) {
                 header,
                 transactions,
                 certificates: Arc::new(certificates),
+                provision_hashes,
             }
         }
     };
@@ -422,6 +425,7 @@ fn attach_receipts(block: &mut Block, receipts: Vec<StoredReceipt>) {
             header: block.header().clone(),
             transactions: Arc::new(BoundedVec::new()),
             certificates: Arc::new(BoundedVec::new()),
+            provision_hashes: Arc::new(BoundedVec::new()),
         },
     );
     *block = match taken {
@@ -444,6 +448,7 @@ fn attach_receipts(block: &mut Block, receipts: Vec<StoredReceipt>) {
             header,
             transactions,
             certificates,
+            provision_hashes,
         } => {
             let mut certificates = (*certificates).clone();
             certificates.push(new_fw);
@@ -451,6 +456,7 @@ fn attach_receipts(block: &mut Block, receipts: Vec<StoredReceipt>) {
                 header,
                 transactions,
                 certificates: Arc::new(certificates),
+                provision_hashes,
             }
         }
     };
@@ -555,11 +561,13 @@ fn test_commit_block_stores_certificates() {
         Block::Sealed {
             header,
             transactions,
+            provision_hashes,
             ..
         } => Block::Sealed {
             header,
             transactions,
             certificates: Arc::new(vec![Arc::new(FinalizedWave::new(cert, vec![]))].into()),
+            provision_hashes,
         },
     };
     let qc = make_test_qc(&block);

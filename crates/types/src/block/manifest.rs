@@ -86,7 +86,7 @@ impl BlockManifest {
             .iter()
             .map(|c| c.wave_id().clone())
             .collect();
-        let provision_hashes: Vec<_> = block.provisions().iter().map(|p| p.hash()).collect();
+        let provision_hashes = block.provision_hashes();
         Self::new(tx_hashes, cert_ids, provision_hashes)
     }
 }

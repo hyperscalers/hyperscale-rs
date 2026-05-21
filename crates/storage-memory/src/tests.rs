@@ -144,6 +144,7 @@ fn commit_with(
                 header,
                 transactions,
                 certificates,
+                provision_hashes,
             } => {
                 let mut certificates = (*certificates).clone();
                 certificates.push(new_fw);
@@ -151,6 +152,7 @@ fn commit_with(
                     header,
                     transactions,
                     certificates: Arc::new(certificates),
+                    provision_hashes,
                 }
             }
         }
@@ -402,11 +404,13 @@ fn test_transactions_batch_with_indexed_block() {
         Block::Sealed {
             header,
             certificates,
+            provision_hashes,
             ..
         } => Block::Sealed {
             header,
             transactions: Arc::new(vec![tx].into()),
             certificates,
+            provision_hashes,
         },
     };
 

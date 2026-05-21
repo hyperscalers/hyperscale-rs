@@ -213,7 +213,7 @@ where
         if let Some(certified) = self.pending_certified_at(height) {
             let block = certified.block().clone();
             let qc = certified.qc().clone();
-            let provision_hashes = block.provisions().iter().map(|p| p.hash()).collect();
+            let provision_hashes = block.provision_hashes();
             return Some(BlockForSync {
                 block,
                 qc,

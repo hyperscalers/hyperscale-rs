@@ -220,13 +220,15 @@ impl RocksDbStorage {
         };
 
         // 5. Reconstruct as `Sealed` — the on-disk shape never carries
-        // provisions. Sync-serving glue re-attaches them from the
+        // provision bodies, but the manifest's provision-hash list rides
+        // along so sync-serving glue can re-attach bodies from the
         // in-memory cache when a requester is still within the
         // execution window.
         let block = Block::Sealed {
             header,
             transactions: Arc::new(transactions.into()),
             certificates: Arc::new(certificates.into()),
+            provision_hashes: Arc::new(manifest.provision_hashes().clone()),
         };
 
         let elapsed = start.elapsed().as_secs_f64();
@@ -348,15 +350,18 @@ impl RocksDbStorage {
         };
 
         // 5. Full block available - reconstruct as `Sealed`: on-disk form
-        // carries no provisions by design. The sync-serving glue above
-        // optionally upgrades to `Live` by attaching provisions from the
-        // in-memory cache when the requester needs them.
+        // carries no provision bodies, but the manifest's hash list rides
+        // along on `Block::Sealed.provision_hashes` so sync-serving glue
+        // can attach bodies from the in-memory cache when the requester
+        // needs them.
+        let provision_hashes_bounded = manifest.provision_hashes().clone();
         let block = Block::Sealed {
             header,
             transactions: Arc::new(transactions.into()),
             certificates: Arc::new(certificates.into()),
+            provision_hashes: Arc::new(provision_hashes_bounded.clone()),
         };
-        let provision_hashes = manifest.provision_hashes().clone().into_inner();
+        let provision_hashes = provision_hashes_bounded.into_inner();
 
         let elapsed = start.elapsed().as_secs_f64();
         record_storage_read(elapsed);

@@ -16,8 +16,8 @@ use hyperscale_provisions::ProvisionStore;
 use hyperscale_storage::{BlockForSync, PendingChain, Storage};
 use hyperscale_types::network::request::GetBlockRequest;
 use hyperscale_types::network::response::GetBlockResponse;
-use hyperscale_types::{ElidedCertifiedBlock, Provisions, RETENTION_HORIZON};
-use tracing::trace;
+use hyperscale_types::{ElidedCertifiedBlock, ProvisionHash, Provisions, RETENTION_HORIZON};
+use tracing::{trace, warn};
 
 /// Serve an inbound block sync request.
 ///
@@ -76,19 +76,32 @@ pub fn serve_block_request<S: Storage>(
         return GetBlockResponse::found(ElidedCertifiedBlock::elide(&block, qc, &req.inventory));
     }
 
-    let resolved: Option<Vec<Arc<Provisions>>> = provision_hashes
+    let resolved: Vec<(ProvisionHash, Option<Arc<Provisions>>)> = provision_hashes
         .iter()
-        .map(|h| provision_store.get(*h))
+        .map(|h| (*h, provision_store.get(*h)))
         .collect();
 
-    let Some(provisions) = resolved else {
-        trace!(
+    let missing: Vec<ProvisionHash> = resolved
+        .iter()
+        .filter_map(|(h, p)| p.is_none().then_some(*h))
+        .collect();
+
+    if !missing.is_empty() {
+        warn!(
             height = req.height.inner(),
+            requested = provision_hashes.len(),
+            missing_count = missing.len(),
+            missing = ?missing,
             "Cache miss for provisions inside dedup horizon — returning not_found so requester rotates"
         );
         record_sync_response_error("block", "provision_cache_miss");
         return GetBlockResponse::not_found();
-    };
+    }
+
+    let provisions: Vec<Arc<Provisions>> = resolved
+        .into_iter()
+        .map(|(_, p)| p.expect("missing entries handled above"))
+        .collect();
 
     GetBlockResponse::found(ElidedCertifiedBlock::elide(
         &block.into_live(Arc::new(provisions.into())),

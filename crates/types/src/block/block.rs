@@ -6,8 +6,8 @@ use sbor::prelude::*;
 
 use crate::{
     BlockHash, BlockHeader, BlockHeight, BoundedVec, FinalizedWave, MAX_FINALIZED_TX_PER_BLOCK,
-    MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, Provisions, RoutableTransaction, ShardGroupId,
-    StateRoot, TxHash, ValidatorId,
+    MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash, Provisions, RoutableTransaction,
+    ShardGroupId, StateRoot, TxHash, ValidatorId,
 };
 
 /// Shared transaction list — wrapped in `Arc` so root-verification actions
@@ -19,6 +19,11 @@ pub type SharedCertificates = Arc<BoundedVec<Arc<FinalizedWave>, MAX_FINALIZED_T
 
 /// Shared provision list — same rationale as [`SharedTransactions`].
 pub type SharedProvisions = Arc<BoundedVec<Arc<Provisions>, MAX_PROVISIONS_PER_BLOCK>>;
+
+/// Shared provision-hash list — carried on `Block::Sealed` so that
+/// sync-serving glue can re-attach provision bodies even after the
+/// payload has been dropped. Same `Arc` rationale as [`SharedTransactions`].
+pub type SharedProvisionHashes = Arc<BoundedVec<ProvisionHash, MAX_PROVISIONS_PER_BLOCK>>;
 
 /// Complete block with header and transaction data.
 ///
@@ -49,7 +54,10 @@ pub enum Block {
         /// Provisions needed to execute cross-shard waves locally.
         provisions: SharedProvisions,
     },
-    /// Block past its execution window — provisions dropped.
+    /// Block past its execution window — provision bodies dropped, but
+    /// the original `ProvisionHash` list is retained so sync-serving glue
+    /// can still identify which bodies the block consumed and re-attach
+    /// them from the in-memory cache when promoting back to `Live`.
     #[sbor(discriminator(BLOCK_VARIANT_SEALED))]
     Sealed {
         /// Block header (contains all merkle roots).
@@ -58,6 +66,9 @@ pub enum Block {
         transactions: SharedTransactions,
         /// Wave certificates finalized in this block.
         certificates: SharedCertificates,
+        /// Content hashes of the provisions the block consumed while
+        /// `Live`. Empty iff the block consumed no provisions.
+        provision_hashes: SharedProvisionHashes,
     },
 }
 
@@ -150,16 +161,31 @@ impl Block {
         }
     }
 
+    /// Content hashes of the block's provisions, regardless of variant.
+    /// Computed inline from `provisions` on `Live`; read from the carried
+    /// list on `Sealed`. The two paths agree on the same block by
+    /// construction: `into_sealed` derives the `Sealed` list by hashing
+    /// the `Live` provisions before dropping the bodies.
+    #[must_use]
+    pub fn provision_hashes(&self) -> Vec<ProvisionHash> {
+        match self {
+            Self::Live { provisions, .. } => provisions.iter().map(|p| p.hash()).collect(),
+            Self::Sealed {
+                provision_hashes, ..
+            } => provision_hashes.iter().copied().collect(),
+        }
+    }
+
     /// True if this block is still in its `Live` variant.
     #[must_use]
     pub const fn is_live(&self) -> bool {
         matches!(self, Self::Live { .. })
     }
 
-    /// Convert to `Sealed` by dropping provisions. Identity on an already-
-    /// sealed block. This is the canonical persisted shape; sync-serving
-    /// glue re-attaches provisions (via `into_live`) when the requester
-    /// needs them.
+    /// Convert to `Sealed` by dropping provision bodies and retaining only
+    /// their hashes. Identity on an already-sealed block. This is the
+    /// canonical persisted shape; sync-serving glue re-attaches provision
+    /// bodies (via `into_live`) when the requester needs them.
     #[must_use]
     pub fn into_sealed(self) -> Self {
         match self {
@@ -167,12 +193,16 @@ impl Block {
                 header,
                 transactions,
                 certificates,
-                ..
-            } => Self::Sealed {
-                header,
-                transactions,
-                certificates,
-            },
+                provisions,
+            } => {
+                let hashes: Vec<ProvisionHash> = provisions.iter().map(|p| p.hash()).collect();
+                Self::Sealed {
+                    header,
+                    transactions,
+                    certificates,
+                    provision_hashes: Arc::new(hashes.into()),
+                }
+            }
             sealed @ Self::Sealed { .. } => sealed,
         }
     }
@@ -192,6 +222,7 @@ impl Block {
                 header,
                 transactions,
                 certificates,
+                ..
             } => Self::Live {
                 header,
                 transactions,

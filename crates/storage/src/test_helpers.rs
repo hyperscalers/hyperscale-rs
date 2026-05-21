@@ -248,6 +248,7 @@ fn make_test_block_with_ecs(height: BlockHeight, ecs: Vec<Arc<ExecutionCertifica
             header,
             transactions,
             certificates,
+            provision_hashes,
         } => {
             let mut certificates = (*certificates).clone();
             certificates.push(new_fw);
@@ -255,6 +256,7 @@ fn make_test_block_with_ecs(height: BlockHeight, ecs: Vec<Arc<ExecutionCertifica
                 header,
                 transactions,
                 certificates: Arc::new(certificates),
+                provision_hashes,
             }
         }
     }

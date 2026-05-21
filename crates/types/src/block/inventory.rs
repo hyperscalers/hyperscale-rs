@@ -89,8 +89,24 @@ pub struct ElidedCertifiedBlock {
     qc: QuorumCertificate,
     transactions: BoundedVec<(TxHash, Option<Arc<RoutableTransaction>>), MAX_TXS_PER_BLOCK>,
     certificates: BoundedVec<(WaveId, Option<Arc<FinalizedWave>>), MAX_FINALIZED_TX_PER_BLOCK>,
-    provisions:
-        Option<BoundedVec<(ProvisionHash, Option<Arc<Provisions>>), MAX_PROVISIONS_PER_BLOCK>>,
+    provisions: ElidedProvisions,
+}
+
+/// Variant-discriminated provisions payload for [`ElidedCertifiedBlock`].
+///
+/// `Live` mirrors a [`Block::Live`] with per-provision bodies optionally
+/// elided per the requester's inventory. `Sealed` mirrors a
+/// [`Block::Sealed`] and carries only the content hashes — the requester
+/// re-attaches bodies from its own provision cache if it needs to upgrade
+/// the block back to `Live`. Carrying hashes (rather than `None`) lets the
+/// receiver in turn serve the same block as `Live` to downstream peers
+/// without losing the hash list across each sync hop.
+#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
+pub enum ElidedProvisions {
+    /// Block was `Live` at serve time.
+    Live(BoundedVec<(ProvisionHash, Option<Arc<Provisions>>), MAX_PROVISIONS_PER_BLOCK>),
+    /// Block was `Sealed` at serve time; hashes only.
+    Sealed(BoundedVec<ProvisionHash, MAX_PROVISIONS_PER_BLOCK>),
 }
 
 impl ElidedCertifiedBlock {
@@ -126,15 +142,12 @@ impl ElidedCertifiedBlock {
         &self.certificates
     }
 
-    /// Per-provision `(hash, optional body)` pairs. `None` overall preserves the
-    /// `Block::Sealed` shape; `Some(_)` preserves `Block::Live`.
+    /// Provisions payload. The variant tells the receiver whether the
+    /// block was `Live` (per-provision bodies, optionally elided) or
+    /// `Sealed` (hash-only).
     #[must_use]
-    #[allow(clippy::type_complexity)] // mirrors the field's natural shape
-    pub const fn provisions(
-        &self,
-    ) -> Option<&BoundedVec<(ProvisionHash, Option<Arc<Provisions>>), MAX_PROVISIONS_PER_BLOCK>>
-    {
-        self.provisions.as_ref()
+    pub const fn provisions(&self) -> &ElidedProvisions {
+        &self.provisions
     }
     /// Build an elided response from a full block + QC + the requester's
     /// inventory. Bodies whose hashes appear in the inventory filters are
@@ -191,9 +204,9 @@ impl ElidedCertifiedBlock {
                     (hash, body)
                 })
                 .collect();
-            Some(entries.into())
+            ElidedProvisions::Live(entries.into())
         } else {
-            None
+            ElidedProvisions::Sealed(block.provision_hashes().into())
         };
 
         Self {
@@ -267,20 +280,23 @@ impl ElidedCertifiedBlock {
             }
         }
 
-        let provs = self.provisions.as_ref().map(|entries| {
-            let mut out = Vec::with_capacity(entries.len());
-            for (hash, body) in entries.iter() {
-                if let Some(p) = body {
-                    out.push(Some(Arc::clone(p)));
-                } else if let Some(resolved) = provision_lookup(hash) {
-                    out.push(Some(resolved));
-                } else {
-                    out.push(None);
-                    miss.missing_provision.push(*hash);
+        let live_provs = match &self.provisions {
+            ElidedProvisions::Live(entries) => {
+                let mut out = Vec::with_capacity(entries.len());
+                for (hash, body) in entries.iter() {
+                    if let Some(p) = body {
+                        out.push(Some(Arc::clone(p)));
+                    } else if let Some(resolved) = provision_lookup(hash) {
+                        out.push(Some(resolved));
+                    } else {
+                        out.push(None);
+                        miss.missing_provision.push(*hash);
+                    }
                 }
+                Some(out)
             }
-            out
-        });
+            ElidedProvisions::Sealed(_) => None,
+        };
 
         if !miss.is_empty() {
             return Err(RehydrateError::Missing(miss));
@@ -290,8 +306,8 @@ impl ElidedCertifiedBlock {
         let certs: Vec<Arc<FinalizedWave>> = certs.into_iter().map(Option::unwrap).collect();
         let txs = Arc::new(txs.into());
         let certs = Arc::new(certs.into());
-        let block = match provs {
-            Some(entries) => {
+        let block = match (live_provs, &self.provisions) {
+            (Some(entries), _) => {
                 let provisions: Vec<Arc<Provisions>> =
                     entries.into_iter().map(Option::unwrap).collect();
                 Block::Live {
@@ -301,11 +317,15 @@ impl ElidedCertifiedBlock {
                     provisions: Arc::new(provisions.into()),
                 }
             }
-            None => Block::Sealed {
+            (None, ElidedProvisions::Sealed(hashes)) => Block::Sealed {
                 header: self.header.clone(),
                 transactions: txs,
                 certificates: certs,
+                provision_hashes: Arc::new(hashes.clone()),
             },
+            (None, ElidedProvisions::Live(_)) => {
+                unreachable!("live_provs is Some when provisions is Live")
+            }
         };
         Ok(CertifiedBlock::new_unchecked(block, self.qc.clone()))
     }
@@ -658,9 +678,9 @@ mod tests {
                 .unwrap();
             enc.encode(&Vec::<(WaveId, Option<Arc<FinalizedWave>>)>::new())
                 .unwrap();
-            // Some(oversized) provisions.
+            // ElidedProvisions::Live(oversized) — discriminator 0, one field.
             enc.write_value_kind(ValueKind::Enum).unwrap();
-            enc.write_discriminator(1).unwrap();
+            enc.write_discriminator(0).unwrap();
             enc.write_size(1).unwrap();
             enc.write_value_kind(ValueKind::Array).unwrap();
             enc.write_value_kind(ValueKind::Tuple).unwrap();
