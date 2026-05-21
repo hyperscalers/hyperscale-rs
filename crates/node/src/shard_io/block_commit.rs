@@ -266,7 +266,7 @@ where
 
         // Build view anchored at parent — includes prior synced blocks'
         // JMT snapshots so chained verification can find parent nodes.
-        let view = pending_chain.view_at(block.header().parent_block_hash());
+        let view = pending_chain.view_at(block.header().parent_block_hash(), parent_block_height);
         let pending_snapshots = view.pending_snapshots().to_vec();
 
         let finalized_waves: Vec<Arc<FinalizedWave>> = block.certificates().to_vec();

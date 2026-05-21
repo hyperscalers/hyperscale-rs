@@ -122,7 +122,7 @@ where
             block_height,
             shard_recipients,
         } => {
-            let view = ctx.pending_chain.view_at(block_hash);
+            let view = ctx.pending_chain.view_at(block_hash, block_height);
             let batches = fetch_and_broadcast_provision(
                 &view,
                 source_shard,

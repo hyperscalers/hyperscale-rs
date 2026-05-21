@@ -519,8 +519,14 @@ pub enum Action {
         /// `remote_shards = {}`; they dispatch immediately at `on_block_committed`.
         wave_id: WaveId,
         /// The committed block whose transactions are being executed.
-        /// Anchors state reads via `PendingChain::view_at`.
+        /// Paired with `block_height` to anchor state reads via
+        /// `PendingChain::view_at` at the block's historical version
+        /// regardless of persistence-progress drift.
         block_hash: BlockHash,
+        /// Height of `block_hash`. Threaded so reads anchor to the block's
+        /// own version even after the entry has been pruned from
+        /// [`PendingChain`].
+        block_height: BlockHeight,
         /// Transactions to execute (all members of the wave).
         transactions: Vec<Arc<RoutableTransaction>>,
         /// State root to anchor reads against.
@@ -538,9 +544,14 @@ pub enum Action {
         wave_id: WaveId,
         /// The committed block whose processing kicked off this execution
         /// (either the block carrying the txs, or the block whose committed
-        /// provisions unblocked them). Anchors state reads via
-        /// `PendingChain::view_at`.
+        /// provisions unblocked them). Paired with `block_height` to anchor
+        /// state reads via `PendingChain::view_at` at the block's historical
+        /// version regardless of persistence-progress drift.
         block_hash: BlockHash,
+        /// Height of `block_hash`. Threaded so reads anchor to the block's
+        /// own version even after the entry has been pruned from
+        /// [`PendingChain`].
+        block_height: BlockHeight,
         /// The cross-shard execution requests to process (one per tx in the wave).
         requests: Vec<CrossShardExecutionRequest>,
     },

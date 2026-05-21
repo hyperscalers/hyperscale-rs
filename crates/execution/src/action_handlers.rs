@@ -357,13 +357,14 @@ where
         Action::ExecuteTransactions {
             wave_id,
             block_hash,
+            block_height,
             transactions,
             state_root: _,
         } => {
             let start = std::time::Instant::now();
             let local_shard = ctx.topology_snapshot.local_shard();
             let num_shards = ctx.topology_snapshot.num_shards();
-            let view = ctx.pending_chain.view_at(block_hash);
+            let view = ctx.pending_chain.view_at(block_hash, block_height);
             let view_snap = <SubstateView<_> as SubstateStore>::snapshot(&*view);
             let cached = batch_compute_cached(
                 ctx.execution_cache.as_ref(),
@@ -404,12 +405,13 @@ where
         Action::ExecuteCrossShardTransactions {
             wave_id,
             block_hash,
+            block_height,
             requests,
         } => {
             let start = std::time::Instant::now();
             let local_shard = ctx.topology_snapshot.local_shard();
             let num_shards = ctx.topology_snapshot.num_shards();
-            let view = ctx.pending_chain.view_at(block_hash);
+            let view = ctx.pending_chain.view_at(block_hash, block_height);
             let view_snap = <SubstateView<_> as SubstateStore>::snapshot(&*view);
             let txs: Vec<Arc<RoutableTransaction>> = requests
                 .iter()

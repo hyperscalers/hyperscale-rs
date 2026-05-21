@@ -304,6 +304,7 @@ impl WaveState {
             return Some(Action::ExecuteTransactions {
                 wave_id: self.wave_id.clone(),
                 block_hash: self.block_hash,
+                block_height: self.block_height(),
                 transactions,
                 state_root: StateRoot::ZERO,
             });
@@ -332,6 +333,7 @@ impl WaveState {
         Some(Action::ExecuteCrossShardTransactions {
             wave_id: self.wave_id.clone(),
             block_hash: self.block_hash,
+            block_height: self.block_height(),
             requests,
         })
     }

@@ -753,7 +753,9 @@ where
             }
 
             let start = std::time::Instant::now();
-            let view = ctx.pending_chain.view_at(parent_block_hash);
+            let view = ctx
+                .pending_chain
+                .view_at(parent_block_hash, parent_block_height);
             let pending_snapshots = view.pending_snapshots().to_vec();
             let result = verify_state_root(
                 &*view,
@@ -798,7 +800,9 @@ where
             parent_in_flight,
             finalized_tx_count,
         } => {
-            let view = ctx.pending_chain.view_at(parent_block_hash);
+            let view = ctx
+                .pending_chain
+                .view_at(parent_block_hash, parent_block_height);
             let pending_snapshots = view.pending_snapshots().to_vec();
             let result = build_proposal(
                 &*view,

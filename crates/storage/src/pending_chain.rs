@@ -104,13 +104,25 @@ where
         read_or_recover(&self.entries).is_empty()
     }
 
-    /// Build a view anchored at `parent_block_hash`.
+    /// Build a view anchored at `(parent_block_hash, parent_height)`.
     ///
     /// The view sees state through `parent_block_hash` and all of its committed
     /// ancestors back to the persisted tip. Orphaned blocks not on this
     /// chain are invisible.
-    pub fn view_at(self: &Arc<Self>, parent_block_hash: BlockHash) -> Arc<SubstateView<S>> {
-        Arc::new(self.build_view(parent_block_hash))
+    ///
+    /// `parent_height` is the explicit anchor height of `parent_block_hash`.
+    /// Callers always supply both — the height is required to anchor base-storage
+    /// reads at the block's own historical version even after the block has been
+    /// pruned from the pending index (e.g. because it was persisted). Without
+    /// an explicit height the fallback would read at `base.jmt_height()`, which
+    /// drifts per-validator with persistence progress and silently leaks
+    /// post-anchor writes into cross-shard execution.
+    pub fn view_at(
+        self: &Arc<Self>,
+        parent_block_hash: BlockHash,
+        parent_height: BlockHeight,
+    ) -> Arc<SubstateView<S>> {
+        Arc::new(self.build_view(parent_block_hash, parent_height))
     }
 
     /// Build a view anchored at the latest committed block.
@@ -126,7 +138,7 @@ where
                     self.base.jmt_height(),
                 ))
             },
-            |h| self.view_at(h),
+            |h| self.view_at(h, self.base.committed_height()),
         )
     }
 
@@ -271,7 +283,11 @@ where
     ///
     /// Holds the read lock for the duration of the walk; no per-entry
     /// clones.
-    fn build_view(&self, parent_block_hash: BlockHash) -> SubstateView<S> {
+    fn build_view(
+        &self,
+        parent_block_hash: BlockHash,
+        parent_height: BlockHeight,
+    ) -> SubstateView<S> {
         let entries = read_or_recover(&self.entries);
         let mut chain: Vec<&ChainEntry> = Vec::new();
         let mut cursor = parent_block_hash;
@@ -281,12 +297,21 @@ where
         }
         // Walk produces deepest-first; flip to commit order.
         chain.reverse();
-        // Anchor height = chain tip if any pending entries were found,
-        // otherwise the base's committed tip (parent already persisted).
-        let anchor_height = chain
-            .last()
-            .map_or_else(|| self.base.jmt_height(), |e| e.height);
-        SubstateView::from_chain(Arc::clone(&self.base), &chain, anchor_height)
+        // Anchor at the caller-supplied height — the block's own historical
+        // version. If the walk found pending entries, the chain tip's height
+        // must match (we panic on mismatch — caller bug, would silently
+        // diverge state otherwise). If the chain is empty the block has
+        // already been persisted out of pending, and the caller's height is
+        // the only correct anchor.
+        if let Some(tip) = chain.last() {
+            assert_eq!(
+                tip.height, parent_height,
+                "view_at(parent_block_hash={parent_block_hash:?}, parent_height={parent_height}) \
+                 but pending entry at that hash has height {} — caller bug",
+                tip.height,
+            );
+        }
+        SubstateView::from_chain(Arc::clone(&self.base), &chain, parent_height)
     }
 }
 
@@ -794,6 +819,8 @@ impl<S: ChainWriter> ChainWriter for SubstateView<S> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::PoisonError;
+
     use hyperscale_types::{
         CertifiedBlock, CommittedBlockHeader, ExecutionCertificate, GlobalReceiptHash, Hash,
         RoutableTransaction, TxHash, WaveCertificate, WaveId,
@@ -810,6 +837,10 @@ mod tests {
     #[derive(Default)]
     struct StubStore {
         blocks: HashMap<BlockHeight, CertifiedBlock>,
+        /// Heights observed via [`VersionedStore::snapshot_at`]. Tests use
+        /// this to assert that `view_at(hash, height)` anchors base reads
+        /// at the supplied height rather than the live JMT tip.
+        recorded_snapshot_at: Mutex<Vec<BlockHeight>>,
     }
 
     impl StubStore {
@@ -883,7 +914,11 @@ mod tests {
     }
 
     impl VersionedStore for StubStore {
-        fn snapshot_at(&self, _height: BlockHeight) -> Self::Snapshot<'_> {
+        fn snapshot_at(&self, height: BlockHeight) -> Self::Snapshot<'_> {
+            self.recorded_snapshot_at
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(height);
             StubSnapshot
         }
     }
@@ -1059,7 +1094,7 @@ mod tests {
             ),
         );
 
-        let view = chain.view_at(h2);
+        let view = chain.view_at(h2, BlockHeight::new(2));
         // h2's parent chain: h2 → h1 → ZERO. Should see both writes.
         assert_eq!(
             view.get_raw_substate_by_db_key(&pk, &DbSortKey(vec![1])),
@@ -1101,11 +1136,76 @@ mod tests {
         );
 
         // View anchored at h1: should see h1's value, not the orphan's.
-        let view = chain.view_at(h1);
+        let view = chain.view_at(h1, BlockHeight::new(1));
         assert_eq!(
             view.get_raw_substate_by_db_key(&pk, &DbSortKey(vec![1])),
             Some(vec![10]),
         );
+    }
+
+    #[test]
+    fn view_at_anchors_at_supplied_height_after_block_pruned() {
+        // Persistence-race regression: a block that's been pruned from
+        // pending entries (because it was persisted) must still anchor
+        // its snapshot reads at its own historical version, not at the
+        // base's current `jmt_height()`. Pre-fix, the fallback in
+        // `build_view` used `base.jmt_height()` whenever the walk produced
+        // no pending entries — silently drifting to whatever each
+        // validator had persisted, with cross-validator divergence the
+        // result.
+        let chain = empty_chain();
+        let h1 = bh(b"h1");
+        let target_height = BlockHeight::new(5);
+
+        chain.insert(
+            h1,
+            entry_at(BlockHash::ZERO, target_height, DatabaseUpdates::default()),
+        );
+        // Simulate persistence: prune the pending entry while leaving the
+        // base store at its default `jmt_height = GENESIS`. The two
+        // values differ — a pre-fix `view_at(h1)` would anchor at
+        // GENESIS, not 5.
+        chain.prune(target_height);
+        assert!(read_or_recover(&chain.entries).is_empty());
+
+        let view = chain.view_at(h1, target_height);
+        assert!(view.pending_snapshots().is_empty());
+
+        // Derive a snapshot — `SubstateStore::snapshot` calls
+        // `base.snapshot_at(view.anchor_height)`. The stub records each
+        // height observed there.
+        let _snapshot = <SubstateView<_> as SubstateStore>::snapshot(&*view);
+        let recorded: Vec<BlockHeight> = chain
+            .base
+            .recorded_snapshot_at
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        assert_eq!(
+            recorded,
+            vec![target_height],
+            "snapshot must be anchored at the supplied parent_height, not base.jmt_height()",
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "caller bug")]
+    fn view_at_panics_on_height_mismatch_with_pending_entry() {
+        // The chain-present branch asserts that the supplied `parent_height`
+        // matches the pending entry's recorded height. Drift between hash
+        // and height would silently produce a divergent snapshot, so we
+        // turn it into a hard panic rather than a latent corruption.
+        let chain = empty_chain();
+        let h1 = bh(b"h1");
+        chain.insert(
+            h1,
+            entry_at(
+                BlockHash::ZERO,
+                BlockHeight::new(5),
+                DatabaseUpdates::default(),
+            ),
+        );
+        let _view = chain.view_at(h1, BlockHeight::new(7));
     }
 
     #[test]
