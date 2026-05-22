@@ -1,6 +1,6 @@
 //! Expected-provisions tracker + fallback-fetch typed effects.
 //!
-//! Anchors all liveness-driven decisions on the BFT-authenticated
+//! Anchors all liveness-driven decisions on the shard consensus-authenticated
 //! `weighted_timestamp` of locally committed blocks, not local wall-clock.
 //! Two distinct triggers fire fallback fetches:
 //!
@@ -29,7 +29,7 @@ use tracing::warn;
 /// How long to wait before falling back to peer-fetch for missing
 /// provisions. Proposers include provisions inline in `Block::Live` during
 /// assembly, so this timeout only triggers when gossip dropped them — in
-/// which case we fetch from a shard peer. Measured against the BFT-
+/// which case we fetch from a shard peer. Measured against the shard consensus-
 /// authenticated `weighted_timestamp_ms` of locally committed blocks.
 const PROVISION_FALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
 

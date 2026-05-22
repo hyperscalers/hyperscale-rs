@@ -1,19 +1,19 @@
 //! Committed-provision tombstones anchored on `local_committed_ts`.
 //!
-//! Mirrors the BFT-side
+//! Mirrors the shard-side
 //! [`CommitDedupIndex::provision_retention`](hyperscale_shard::commit_dedup)
 //! window so a late re-arrival of an already-committed batch — gossip
 //! retransmit, fetch fall-through, range-sync delivery — is dropped at
 //! receipt instead of slipping past the pipeline guards and re-entering
 //! the proposer queue. Without this tombstone, `pipeline.verified` and
 //! the receipt deadline check both clear at `source_block_ts +
-//! RETENTION_HORIZON`, leaving a window where the BFT validator still
+//! RETENTION_HORIZON`, leaving a window where the shard consensus validator still
 //! rejects re-inclusion but nothing stops the local proposer from
 //! re-including.
 //!
-//! Keyed by [`ProvisionHash`] (matching the BFT index's keying) and
+//! Keyed by [`ProvisionHash`] (matching the shard dedup index's keying) and
 //! pruned on every commit by the same `local_committed_ts +
-//! RETENTION_HORIZON` deadline the BFT index uses.
+//! RETENTION_HORIZON` deadline the shard dedup index uses.
 
 use std::collections::HashMap;
 

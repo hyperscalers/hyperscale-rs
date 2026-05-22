@@ -181,7 +181,7 @@ impl Display for BlockHeight {
     }
 }
 
-/// BFT round / view number.
+/// shard round / view number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, BasicSbor)]
 #[sbor(transparent)]
 pub struct Round(u64);

@@ -17,7 +17,7 @@ use tracing_test::traced_test;
 /// carries one validator from shard 0 and one from shard 1. Validators
 /// `V0`,`V1` are in shard 0; `V2`,`V3` are in shard 1; host 0 hosts
 /// `{V0, V2}`, host 1 hosts `{V1, V3}`. Runs a short consensus burst
-/// and asserts every validator's BFT committed beyond genesis.
+/// and asserts every validator's shard committed beyond genesis.
 #[traced_test]
 #[test]
 fn test_v2_cross_shard_hosting_makes_progress() {

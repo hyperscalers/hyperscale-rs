@@ -1,4 +1,4 @@
-//! Pure BFT algorithm functions shared between production and simulation runners.
+//! Pure shard consensus algorithm functions shared between production and simulation runners.
 //!
 //! These functions contain the core cryptographic verification and consensus
 //! algorithms, separated from dispatch (thread pool vs inline) and result
@@ -262,7 +262,7 @@ pub fn verify_provision_root(expected_root: ProvisionsRoot, batch_hashes: &[Hash
 /// 1. The merkle root of `transactions` matches `expected_root`.
 /// 2. Every tx's `validity_range` is well-formed against `validity_anchor`
 ///    AND contains it. `validity_anchor` is the parent QC's
-///    `weighted_timestamp` — the BFT-authenticated clock every honest
+///    `weighted_timestamp` — the shard consensus-authenticated clock every honest
 ///    validator agrees on for this block. The check is the same expression
 ///    the proposer applied during selection, so an honest cluster never
 ///    sees this fail; a malicious proposer that included an expired tx
@@ -548,13 +548,13 @@ fn collect_finalized_receipts(waves: &[Arc<FinalizedWave>]) -> Vec<Arc<Consensus
         .collect()
 }
 
-/// Handle the BFT-owned delegated [`Action`] variants.
+/// Handle the shard-owned delegated [`Action`] variants.
 ///
 /// Outcomes flow through `ctx.notify` (state-machine inputs) and
 /// `ctx.commit_prepared` (prepared blocks for the `io_loop`'s chain). Variants
 /// owned by other coordinator crates hit `unreachable!()` — the caller
 /// (node's dispatcher) routes by variant prefix.
-#[allow(clippy::too_many_lines)] // single dispatch over BFT-owned Action variants
+#[allow(clippy::too_many_lines)] // single dispatch over shard-owned Action variants
 pub fn handle_action<S, N>(action: Action, ctx: &ActionContext<'_, S, N>)
 where
     S: Storage,
@@ -902,7 +902,7 @@ where
             ctx.network.broadcast_global(&gossip);
         }
 
-        _ => unreachable!("hyperscale_shard::handle_action called with non-BFT action"),
+        _ => unreachable!("hyperscale_shard::handle_action called with non-shard action"),
     }
 }
 

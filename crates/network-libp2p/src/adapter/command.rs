@@ -87,7 +87,7 @@ pub(super) type ClassReceivers = (
 /// their volume is bounded by protocol cardinality.
 #[derive(Clone, Debug)]
 pub(super) struct ClassCommandChannels {
-    /// Consensus class — BFT round-blocking traffic.
+    /// Consensus class — shard round-blocking traffic.
     /// Never dropped, processed immediately.
     consensus: mpsc::UnboundedSender<SwarmCommand>,
 

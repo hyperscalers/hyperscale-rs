@@ -52,7 +52,7 @@ struct OutboundCertEntry {
     /// Hard deadline past which the EC is provably useless: every tx in the
     /// wave has expired and terminated. Computed via
     /// `ExecutionCertificate::deadline()` from the wave's
-    /// `vote_anchor_ts` — the BFT-authenticated wave commit time.
+    /// `vote_anchor_ts` — the shard consensus-authenticated wave commit time.
     deadline: WeightedTimestamp,
     last_sent_at: WeightedTimestamp,
     rebroadcast_count: u32,

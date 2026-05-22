@@ -2,7 +2,7 @@
 //!
 //! This crate is the integration point. It owns two concerns:
 //!
-//! - [`NodeStateMachine`] composes the per-domain coordinators (BFT,
+//! - [`NodeStateMachine`] composes the per-domain coordinators (shard consensus,
 //!   execution, mempool, provisions, remote-headers, topology) into a
 //!   single deterministic state machine over `ProtocolEvent` inputs
 //!   and `Action` outputs.

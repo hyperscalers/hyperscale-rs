@@ -77,7 +77,7 @@ pub struct BlockSyncManager {
     /// "I'm spinning while the chain is stuck somewhere I can't see."
     last_qc_height_seen: BlockHeight,
 
-    /// Snapshot of the BFT view-change counter at the moment
+    /// Snapshot of the view-change counter at the moment
     /// `last_qc_height_seen` last advanced. The delta against the current
     /// counter is "view changes spun without a QC advance" — the partial-
     /// isolation signal we want to catch with sync.

@@ -12,7 +12,7 @@
 //! events in and dispatches emitted [`Action`]s.
 //!
 //! Submodules route inputs to the appropriate coordinator: [`shard`] for
-//! BFT events, [`execution`] for wave/EC events, [`mempool`] /
+//! shard consensus events, [`execution`] for wave/EC events, [`mempool`] /
 //! [`transactions`] for tx ingress, [`provisions`] for cross-shard state,
 //! [`proposal`] for proposer-side construction, [`sync`] for catch-up,
 //! and [`timers`] for timeout dispatch.
@@ -45,14 +45,14 @@ use tracing::instrument;
 
 /// Combined node state machine.
 ///
-/// Composes BFT, execution, mempool, and provisions into a single state
+/// Composes shard consensus, execution, mempool, and provisions into a single state
 /// machine. View changes are handled implicitly via local round advancement
 /// in `ShardCoordinator` (HotStuff-2 style).
 ///
 /// The block-sync state machine itself lives on `NodeHost` (in
 /// `shard_io::sync::block`); when a synced block is ready to apply,
 /// `NodeHost` fires a `BlockSyncReadyToApply` event into this state machine,
-/// which routes it to BFT.
+/// which routes it to shard consensus.
 pub struct NodeStateMachine {
     /// Network topology — passed by reference to subsystem methods.
     topology_coordinator: TopologyCoordinator,
@@ -195,7 +195,7 @@ impl NodeStateMachine {
         &self.remote_headers_coordinator
     }
 
-    /// Get the last committed JMT root hash (delegated to BFT's verification pipeline).
+    /// Get the last committed JMT root hash (delegated to shard consensus's verification pipeline).
     #[must_use]
     pub const fn last_committed_jmt_root(&self) -> StateRoot {
         self.shard_coordinator.jmt_root()
@@ -225,7 +225,7 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::CleanupTimer => self.on_cleanup_timer(),
             ProtocolEvent::ViewChangeTimer => self.on_view_change_timer(),
 
-            // ── BFT Consensus ────────────────────────────────────────────
+            // ── Shard Consensus ────────────────────────────────────────────
             evt @ (ProtocolEvent::BlockHeaderReceived { .. }
             | ProtocolEvent::QuorumCertificateFormed { .. }
             | ProtocolEvent::RemoteHeaderReceived { .. }
@@ -290,7 +290,7 @@ impl StateMachine for NodeStateMachine {
         }
 
         // If any emitter latched a proposal-retry during this dispatch (or
-        // BFT's verification path unblocked a deferred proposal), re-enter
+        // the shard coordinator's verification path unblocked a deferred proposal), re-enter
         // `try_propose` once with fresh transaction selection — avoids
         // stale txs from the original deferral.
         if self.shard_coordinator.take_ready_proposal() {

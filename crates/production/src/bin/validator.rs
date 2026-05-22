@@ -93,7 +93,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 /// Hyperscale Validator Node
 ///
-/// Runs a production validator participating in BFT consensus.
+/// Runs a production validator participating in shard consensus.
 #[derive(Parser, Debug)]
 #[command(name = "hyperscale-validator")]
 #[command(version, about, long_about = None)]

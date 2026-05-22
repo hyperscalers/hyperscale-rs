@@ -1,4 +1,4 @@
-//! BFT block vote.
+//! Shard consensus block vote.
 
 use sbor::prelude::*;
 
@@ -7,7 +7,7 @@ use crate::{
     ShardGroupId, ValidatorId, block_vote_message,
 };
 
-/// Block vote for BFT consensus.
+/// Block vote for shard consensus.
 #[derive(Debug, Clone, PartialEq, Eq, sbor::prelude::BasicSbor)]
 pub struct BlockVote {
     block_hash: BlockHash,

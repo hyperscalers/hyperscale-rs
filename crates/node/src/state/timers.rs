@@ -1,9 +1,9 @@
 //! Timer-driven dispatch arms.
 //!
 //! Two `ProtocolEvent` variants drive the periodic timers: `CleanupTimer`
-//! (mempool / BFT housekeeping) and `ViewChangeTimer` (leader liveness).
-//! Proposal-retry-on-new-content uses the post-dispatch latch on BFT, not
-//! a timer.
+//! (mempool / shard consensus housekeeping) and `ViewChangeTimer` (leader liveness).
+//! Proposal-retry-on-new-content uses the post-dispatch latch on the shard
+//! coordinator, not a timer.
 
 use hyperscale_core::{Action, TimerId};
 use tracing::instrument;
@@ -73,7 +73,7 @@ mod tests {
 
     /// `CleanupTimer` is the only thing keeping its own loop alive — it
     /// must reschedule itself before doing anything else, so a missed
-    /// reschedule silently halts mempool / BFT housekeeping.
+    /// reschedule silently halts mempool / shard consensus housekeeping.
     #[test]
     fn cleanup_timer_reschedules_itself() {
         let TestNode { mut node, .. } = TestNode::new();
@@ -92,7 +92,7 @@ mod tests {
         );
     }
 
-    /// `ViewChangeTimer` reschedules itself with the BFT coordinator's
+    /// `ViewChangeTimer` reschedules itself with the shard coordinator's
     /// reported remaining timeout when no view change is needed yet.
     /// On a freshly-built node, `check_round_timeout` returns `None`, so
     /// we exercise the reschedule branch.

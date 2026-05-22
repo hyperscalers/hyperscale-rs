@@ -1,7 +1,7 @@
 //! Async event loop processing swarm events and class-ordered commands.
 //!
 //! Commands are processed in class order, most-urgent first:
-//! 1. Consensus (BFT round-blocking)
+//! 1. Consensus (shard round-blocking)
 //! 2. `BlockCompletion` (current-proposal DA gap closure)
 //! 3. `CrossShardProgress` (execution & finalization coordination)
 //! 4. Recovery (catch-up traffic)
@@ -167,7 +167,7 @@ pub(super) async fn run(
             // command we drain every more-urgent channel to maintain strict
             // priority.
 
-            // Consensus — BFT round-blocking traffic.
+            // Consensus — shard round-blocking traffic.
             Some(cmd) = consensus_rx.recv() => {
                 handle_command(&mut swarm, cmd);
                 drain_channel(&mut swarm, &mut consensus_rx);

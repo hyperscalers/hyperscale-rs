@@ -7,7 +7,7 @@
 //!   `RETENTION_HORIZON`) — durations after which a wave aborts or a piece
 //!   of derived state becomes safe to drop on every node simultaneously.
 //!   Most downstream invariants derive from `WAVE_TIMEOUT`.
-//! - **BFT liveness timers** (`VIEW_CHANGE_TIMEOUT*`, `MAX_PROGRESS_WAIT`) —
+//! - **shard consensus liveness timers** (`VIEW_CHANGE_TIMEOUT*`, `MAX_PROGRESS_WAIT`) —
 //!   round-timer cadences and the absolute ceiling on view-change
 //!   suppression while a proposal is in flight. Validators that disagree on
 //!   these values either time out asymmetrically (degraded liveness) or
@@ -29,7 +29,7 @@ use crate::MAX_VALIDITY_RANGE;
 /// Sized at 3× `VOTE_RETRY_TIMEOUT` (8s) so at least two vote retries can
 /// fire against rotated wave leaders before the timeout-abort path takes over.
 ///
-/// Deterministic — measured against the BFT-authenticated
+/// Deterministic — measured against the shard consensus-authenticated
 /// `weighted_timestamp_ms` of the committing QC, so every validator derives
 /// the same abort anchor.
 pub const WAVE_TIMEOUT: Duration = Duration::from_secs(24);
@@ -38,7 +38,7 @@ pub const WAVE_TIMEOUT: Duration = Duration::from_secs(24);
 ///
 /// Shared by `hyperscale-shard` (deferral-proof verification) and
 /// `hyperscale-remote-headers` (provision/exec-cert verification). Measured
-/// against the BFT-authenticated `weighted_timestamp_ms` on the tip vs the
+/// against the shard consensus-authenticated `weighted_timestamp_ms` on the tip vs the
 /// stored header. Sized generously above `WAVE_TIMEOUT` so late-arriving
 /// proofs still find a header to verify against.
 pub const REMOTE_HEADER_RETENTION: Duration = Duration::from_secs(30);

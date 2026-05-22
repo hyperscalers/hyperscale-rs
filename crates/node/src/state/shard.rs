@@ -1,12 +1,12 @@
-//! BFT consensus dispatch arms and the multi-coordinator orchestrators that
+//! Shard consensus dispatch arms and the multi-coordinator orchestrators that
 //! sit alongside them.
 //!
 //! Routing arms forward to `ShardCoordinator`. The orchestrators that span
 //! multiple coordinators live here too because each is fundamentally a
-//! BFT-flow response — the coordinators that get notified are the
+//! shard-consensus-flow response — the coordinators that get notified are the
 //! downstream subscribers:
 //!
-//! - `on_block_header_received` validates in-flight before BFT ingest;
+//! - `on_block_header_received` validates in-flight before shard ingest;
 //! - `on_qc_formed` gathers proposal inputs to feed `shard.on_qc_formed`;
 //! - `on_block_committed` fans out to mempool, remote-headers, provisions,
 //!   outbound-provisions, and execution in commit order;
@@ -20,7 +20,7 @@
 //!
 //! Dedup-index registration is owned by
 //! [`crate::coordinator::ShardCoordinator::record_block_committed`] (in the
-//! `shard` crate) and runs synchronously when BFT internally commits the
+//! `shard` crate) and runs synchronously when the shard coordinator internally commits the
 //! block — earlier than this fanout. So mempool's tombstone-retention pass
 //! in step 2 already sees the up-to-date `tx_retention` map.
 //!
@@ -33,7 +33,7 @@
 //!    any path that may emit child verifications.
 //! 2. `mempool.on_block_committed` — Pending → Committed → Completed
 //!    transitions for `block.transactions` and `block.certificates`.
-//!    Reads BFT's `dedup_index.tx_retention` (populated synchronously in
+//!    Reads the shard coordinator's `dedup_index.tx_retention` (populated synchronously in
 //!    `record_block_committed`) for tombstone retention bounds.
 //! 3. `remote_headers.on_block_committed` — liveness updates and
 //!    cross-shard timeout scheduling. Independent of the local coordinators
@@ -44,7 +44,7 @@
 //!    remote-headers; sequenced before execution because execution may
 //!    consume provisions queued here on the next proposal attempt.
 //! 5. `outbound_provisions.on_block_committed(qc.weighted_timestamp())` —
-//!    deterministic eviction sweep. Uses the BFT-authenticated weighted
+//!    deterministic eviction sweep. Uses the shard consensus-authenticated weighted
 //!    timestamp from the QC so every validator evicts identically. Must
 //!    follow earlier steps because eviction reads the now-up-to-date
 //!    provisions state.
@@ -69,8 +69,8 @@ use hyperscale_types::{
 use super::NodeStateMachine;
 
 impl NodeStateMachine {
-    /// Dispatch a BFT-category `ProtocolEvent`.
-    #[allow(clippy::too_many_lines)] // single dispatch, one arm per BFT variant
+    /// Dispatch a shard-category `ProtocolEvent`.
+    #[allow(clippy::too_many_lines)] // single dispatch, one arm per shard variant
     pub(super) fn handle_shard(&mut self, event: ProtocolEvent) -> Vec<Action> {
         match event {
             ProtocolEvent::BlockHeaderReceived { header, manifest } => {
@@ -134,7 +134,7 @@ impl NodeStateMachine {
                     valid,
                 ),
             ProtocolEvent::RemoteHeaderAdmitted { committed_header } => {
-                // Fan out the verified header to downstream consumers. BFT
+                // Fan out the verified header to downstream consumers. Shard consensus
                 // already received the header in `RemoteHeaderQcVerified`
                 // (early insertion for deferral proof validation).
                 let topology = self.topology_coordinator.snapshot();
@@ -187,7 +187,7 @@ impl NodeStateMachine {
                 let mut actions = self
                     .shard_coordinator
                     .on_block_persisted(self.topology_coordinator.snapshot(), height);
-                // If BFT just resumed from sync, reschedule the cleanup timer.
+                // If shard consensus just resumed from sync, reschedule the cleanup timer.
                 if !actions.is_empty() {
                     actions.push(Action::SetTimer {
                         id: TimerId::Cleanup,
@@ -199,11 +199,11 @@ impl NodeStateMachine {
             ProtocolEvent::FinalizedWavesAdmitted { waves } => self
                 .shard_coordinator
                 .on_finalized_waves_admitted(self.topology_coordinator.snapshot(), &waves),
-            _ => unreachable!("non-BFT event routed to handle_shard"),
+            _ => unreachable!("non-shard event routed to handle_shard"),
         }
     }
 
-    /// Validate in-flight before letting BFT ingest a received header.
+    /// Validate in-flight before letting shard ingest a received header.
     fn on_block_header_received(
         &mut self,
         header: &BlockHeader,
@@ -318,7 +318,7 @@ impl NodeStateMachine {
         // inline, `Sealed` has none (empty slice).
         actions.extend(self.provisions_coordinator.on_block_committed(certified));
 
-        // Outbound provision safety sweep — runs on the BFT-authenticated
+        // Outbound provision safety sweep — runs on the shard consensus-authenticated
         // weighted timestamp so every validator evicts deterministically.
         self.outbound_provisions
             .on_block_committed(certified.qc().weighted_timestamp());
@@ -489,7 +489,7 @@ mod tests {
 
     /// Counterpart: a non-leader still latches the retry, but the
     /// post-dispatch `try_propose` returns empty (the leader check
-    /// short-circuits inside BFT). The latch fires regardless — the
+    /// short-circuits inside shard consensus). The latch fires regardless — the
     /// guard is at the proposer level, not the latch level.
     #[test]
     fn transactions_admitted_does_not_emit_proposal_on_non_leader() {
@@ -517,7 +517,7 @@ mod tests {
         );
     }
 
-    /// `BlockPersisted` only re-arms the cleanup timer when BFT signals
+    /// `BlockPersisted` only re-arms the cleanup timer when shard consensus signals
     /// it just exited sync mode (non-empty action list). On a steady-
     /// state node, the post-persist call is a no-op and no `SetTimer`
     /// must be appended.
@@ -635,7 +635,7 @@ mod tests {
     }
 
     /// Counterpart to the gate-fires test: when the manifest fits inside
-    /// the in-flight cap, the orchestrator must let BFT ingest the header
+    /// the in-flight cap, the orchestrator must let shard ingest the header
     /// and the pending-block count must reflect it. Catches the
     /// regression where the gate over-fires (e.g. flipped predicate,
     /// off-by-one bound) — symptom would be the same as the network
@@ -649,7 +649,7 @@ mod tests {
         let manifest = BlockManifest::new(vec![TxHash::ZERO], vec![], vec![]);
 
         // proposer_for(h=1, r=0) = committee[(1+0) % 4] = ValidatorId::new(1).
-        // BFT's header validation rejects on proposer mismatch, so the
+        // the shard coordinator's header validation rejects on proposer mismatch, so the
         // header must name the actual round-0 height-1 leader to reach
         // the pending-blocks insert.
         let header = make_live_block(
@@ -674,7 +674,7 @@ mod tests {
         let (pending_blocks, _) = node.shard_coordinator().pending_block_counts();
         assert_eq!(
             pending_blocks, 1,
-            "header within cap must reach BFT exactly once — pending_blocks should be 1",
+            "header within cap must reach shard consensus exactly once — pending_blocks should be 1",
         );
     }
 

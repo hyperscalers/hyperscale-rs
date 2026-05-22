@@ -1,11 +1,11 @@
-//! BFT consensus state machine.
+//! Shard consensus state machine (HotStuff-2).
 //!
-//! This crate provides a synchronous BFT consensus implementation
+//! This crate provides a synchronous shard consensus implementation
 //! that can be used for both simulation and production.
 //!
 //! # Architecture
 //!
-//! The BFT state machine processes events synchronously:
+//! The shard consensus state machine processes events synchronously:
 //!
 //! - new-content latch → Build and broadcast block if we're the proposer
 //! - `Event::BlockHeaderReceived` → Validate header, assemble block, vote

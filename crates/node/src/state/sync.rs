@@ -1,7 +1,7 @@
 //! Sync-flow dispatch arms.
 //!
 //! When `BlockSyncComplete` fires we fan out across all three
-//! coordinators in one pass: BFT exits sync mode and re-issues any
+//! coordinators in one pass: shard consensus exits sync mode and re-issues any
 //! pending block fetches it had suppressed; remote-headers and
 //! provisions flush their expected sets so we can immediately
 //! participate in execution for blocks within the `WAVE_TIMEOUT` window.
@@ -20,7 +20,7 @@ impl NodeStateMachine {
                     std::sync::Arc::unwrap_or_clone(certified),
                 )
             }
-            // BlockSync finished fetching: exit BFT sync mode + flush
+            // BlockSync finished fetching: exit shard consensus sync mode + flush
             // expected provisions + flush expected headers, all in one
             // pass.
             ProtocolEvent::BlockSyncComplete { .. } => {
@@ -62,7 +62,7 @@ mod tests {
     use super::super::test_support::TestNode;
     use crate::assert_emits;
 
-    /// `BlockSyncComplete` fans out to BFT, remote-headers, and
+    /// `BlockSyncComplete` fans out to shard consensus, remote-headers, and
     /// provisions in one pass. The provisions flush is the most
     /// directly observable: when a verified remote header has seeded
     /// `expected_provisions`, the flush surfaces an
@@ -132,7 +132,7 @@ mod tests {
     }
 
     /// `CommittedStateRestored` is the boot-time hand-off from `RocksDB`
-    /// to the in-memory BFT state. The orchestrator routes it to
+    /// to the in-memory shard consensus state. The orchestrator routes it to
     /// `shard.on_committed_state_restored`, which restores
     /// `committed_height` so subsequent header validation and pending-
     /// block routing accept blocks at the correct tip. A regression

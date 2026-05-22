@@ -10,7 +10,7 @@
 //!
 //! | Tag | Purpose |
 //! |-----|---------|
-//! | `BLOCK_VOTE` | BFT block votes |
+//! | `BLOCK_VOTE` | shard consensus block votes |
 //! | `EXEC_VOTE` | Execution votes |
 //! | `COMMITTED_BLOCK_HEADER` | Committed block header gossip |
 //! | `BLOCK_HEADER` | Block header proposal gossip |
@@ -29,7 +29,7 @@ use crate::{
     Round, ShardGroupId, WaveId, WeightedTimestamp,
 };
 
-/// Domain tag for BFT block votes.
+/// Domain tag for shard consensus block votes.
 ///
 /// Format: `BLOCK_VOTE` || `shard_group_id` || height || round || `block_hash`
 pub const DOMAIN_BLOCK_VOTE: &[u8] = b"BLOCK_VOTE";
@@ -87,7 +87,7 @@ pub fn committed_block_header_message(
 /// Format: `BLOCK_HEADER` || `shard_group_id` || height || round || `block_hash`
 ///
 /// Signed by the proposer when broadcasting block header proposals.
-/// Verified by receivers before admitting the proposal into BFT.
+/// Verified by receivers before admitting the proposal into shard consensus.
 /// Distinct from `DOMAIN_BLOCK_VOTE` to prevent cross-protocol replay.
 pub const DOMAIN_BLOCK_HEADER: &[u8] = b"BLOCK_HEADER";
 
@@ -95,7 +95,7 @@ pub const DOMAIN_BLOCK_HEADER: &[u8] = b"BLOCK_HEADER";
 ///
 /// This is used for:
 /// - Proposer signature on `BlockHeaderNotification` (authenticated proposals)
-/// - Verification before admitting proposals to the BFT state machine
+/// - Verification before admitting proposals to the shard consensus state machine
 #[must_use]
 pub fn block_header_message(
     shard_group: ShardGroupId,

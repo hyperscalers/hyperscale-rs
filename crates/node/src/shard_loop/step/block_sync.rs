@@ -1,7 +1,7 @@
 //! Block-sync I/O glue.
 //!
 //! Bridges `Sync<BlockSyncBinding>`'s scheduling decisions to the network
-//! and BFT. This is where payload-specific concerns live:
+//! and shard consensus. This is where payload-specific concerns live:
 //!
 //! - building `GetBlockRequest`s with the right inventory bloom + force-full
 //!   override
@@ -9,7 +9,7 @@
 //! - structurally validating the rehydrated block (off-thread on
 //!   `ConsensusCrypto`): height + QC binding + every Merkle root the
 //!   header commits to, plus per-wave receipt-vs-EC shape
-//! - delivering valid blocks to BFT via `ProtocolEvent::BlockSyncReadyToApply`
+//! - delivering valid blocks to shard consensus via `ProtocolEvent::BlockSyncReadyToApply`
 //! - feeding scheduling events back to the FSM
 //!
 //! The FSM itself owns nothing about a `CertifiedBlock`'s shape — it just
@@ -285,13 +285,13 @@ where
         )
     }
 
-    /// Hand a validated synced block to BFT and advance the sync FSM.
+    /// Hand a validated synced block to shard consensus and advance the sync FSM.
     /// Structural validation runs off-thread; this is the
     /// post-verdict pinned-thread continuation.
     fn deliver_validated_sync_block(&mut self, height: BlockHeight, certified: CertifiedBlock) {
         record_sync_round_completed("block");
 
-        // Hand the block off to BFT; tell the FSM the height was delivered.
+        // Hand the block off to shard consensus; tell the FSM the height was delivered.
         let certified = Arc::new(certified);
         self.dispatch_event(ProtocolEvent::BlockSyncReadyToApply { certified });
         let outputs = self.io.syncs.block.handle(BlockSyncInput::FetchSucceeded {

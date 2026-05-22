@@ -13,7 +13,7 @@ use crate::config::Libp2pConfig;
 
 /// Apply consensus-optimized QUIC settings to a config.
 fn apply_quic_tuning(quic_config: &mut QuicConfig, app_config: &Libp2pConfig) {
-    // QUIC configuration optimized for BFT consensus workloads:
+    // QUIC configuration optimized for shard consensus workloads:
     // - High stream concurrency for parallel sync and cross-shard coordination
     // - Large flow control windows for block transfers
     // - Fast handshake timeout to match our stream timeout ceiling

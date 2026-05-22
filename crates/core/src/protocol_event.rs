@@ -85,7 +85,7 @@ pub enum ProtocolEvent {
     CleanupTimer,
 
     // ═══════════════════════════════════════════════════════════════════════
-    // BFT Consensus
+    // Shard Consensus
     // ═══════════════════════════════════════════════════════════════════════
     /// Received a block header from another node.
     BlockHeaderReceived {
@@ -187,7 +187,7 @@ pub enum ProtocolEvent {
     /// A remote committed block header has been fully verified (QC + structural checks).
     ///
     /// Emitted by `RemoteHeaderCoordinator` as a continuation after QC verification.
-    /// Downstream consumers (BFT, Provision, Execution) use this as their single
+    /// Downstream consumers (shard consensus, Provision, Execution) use this as their single
     /// source of verified remote headers.
     RemoteHeaderAdmitted {
         /// The fully-verified committed header.
@@ -255,7 +255,7 @@ pub enum ProtocolEvent {
 
     /// A provisions has been verified — ready for downstream consumption.
     ///
-    /// `source_block_ts` is the BFT-authenticated weighted timestamp of the
+    /// `source_block_ts` is the shard consensus-authenticated weighted timestamp of the
     /// source shard's committing QC. Downstream consumers (notably the
     /// io-loop provision cache) anchor retention on this so eviction is
     /// deterministic across validators.

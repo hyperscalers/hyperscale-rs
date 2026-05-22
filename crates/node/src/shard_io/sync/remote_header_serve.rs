@@ -21,7 +21,7 @@ use hyperscale_types::{BlockHeight, ShardGroupId};
 /// requested range.
 ///
 /// Headers are read through [`PendingChain`] so heights that are
-/// BFT-committed but not yet JMT-persisted are reachable too — without
+/// shard-committed but not yet JMT-persisted are reachable too — without
 /// that, a peer racing the local persistence drain would see a `not_found`
 /// gap and rotate, stretching sync.
 ///

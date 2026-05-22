@@ -15,7 +15,7 @@
 //! `MAX_VALIDITY_RANGE` because admission requires
 //! `end_timestamp_exclusive <= anchor + MAX_VALIDITY_RANGE`.
 //!
-//! Anchored on the BFT-authenticated weighted timestamp of the last committed
+//! Anchored on the shard consensus-authenticated weighted timestamp of the last committed
 //! block, so behavior is deterministic across validators regardless of block
 //! cadence.
 

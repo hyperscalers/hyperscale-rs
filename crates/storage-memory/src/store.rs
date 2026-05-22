@@ -73,7 +73,7 @@ impl VersionedStore for SimStorage {
             height.inner() >= floor,
             "snapshot_at({height}) below retention floor {floor} \
              (current_version={current_version}, jmt_history_length={}) — \
-             BFT/DA invariant broken; caller must anchor within retention",
+             Shard consensus + DA invariant broken; caller must anchor within retention",
             self.jmt_history_length,
         );
         // Clone state + state-history for snapshot isolation. Memory

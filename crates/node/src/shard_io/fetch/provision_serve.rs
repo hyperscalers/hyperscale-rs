@@ -13,7 +13,7 @@ use tracing::warn;
 /// Serve an inbound provision request from a target shard needing our state.
 ///
 /// Reads the source block through [`PendingChain`] so heights still inside
-/// the BFT-committed / JMT-persisted window are reachable; reconstructs
+/// the shard-committed / JMT-persisted window are reachable; reconstructs
 /// per-tx [`ProvisionsRequest`]s from the block's declared reads + writes;
 /// then hands them to [`build_provisions`], which is the same function the
 /// gossip emit path runs. Receivers therefore absorb byte-identical

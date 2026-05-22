@@ -20,7 +20,7 @@
 //! Messages are classified by what stalls if delivery is delayed, into five
 //! tiers from most to least urgent:
 //!
-//! 1. **Consensus** — BFT round-blocking messages whose loss can only be
+//! 1. **Consensus** — shard round-blocking messages whose loss can only be
 //!    recovered by a view-change timeout (`BlockHeader`, `BlockVote`).
 //!
 //! 2. **`BlockCompletion`** — DA gap-closure for the *current* proposal. Delay
@@ -60,7 +60,7 @@ pub mod response;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, BasicSbor)]
 #[repr(u8)]
 pub enum MessageClass {
-    /// BFT round-blocking; loss only recovered by view-change timeout.
+    /// shard round-blocking; loss only recovered by view-change timeout.
     ///
     /// Includes:
     /// - `BlockHeaderNotification` — proposer → committee

@@ -42,7 +42,7 @@ impl CertifiedBlock {
     /// Construct after verifying the structural pairing invariant.
     ///
     /// Does not verify the QC's cryptographic signature — that's the
-    /// responsibility of the sync / BFT verification pipelines.
+    /// responsibility of the sync / shard consensus verification pipelines.
     ///
     /// # Errors
     ///

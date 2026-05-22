@@ -34,7 +34,7 @@ pub struct PendingQcVerification {
 
 /// State root verification that is ready to dispatch (JMT is at the correct root).
 ///
-/// The `NodeStateMachine` drains these after each BFT call and emits
+/// The `NodeStateMachine` drains these after each shard consensus call and emits
 /// `VerifyStateRoot` actions. `parent_state_root` and `finalized_waves` are
 /// resolved at drain time from the current chain/pending-block state, not
 /// captured at `initiate_state_root_verification` time — capturing at initiate

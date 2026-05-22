@@ -57,7 +57,7 @@ pub struct ProvisionsRequest {
 #[derive(Debug, Clone, strum::IntoStaticStr)]
 pub enum Action {
     // ═══════════════════════════════════════════════════════════════════════
-    // Network: BFT
+    // Network: shard consensus
     // ═══════════════════════════════════════════════════════════════════════
     /// Sign and broadcast a block header (proposal) to the local shard.
     ///
@@ -314,7 +314,7 @@ pub enum Action {
 
     /// Verify a Quorum Certificate's aggregated BLS signature.
     ///
-    /// This is CRITICAL for BFT safety: we must verify that the QC's aggregated signature
+    /// This is CRITICAL for shard consensus safety: we must verify that the QC's aggregated signature
     /// was actually produced by the claimed signers. Without this check, a Byzantine proposer
     /// could include a fake QC with invalid signatures.
     ///
@@ -411,7 +411,7 @@ pub enum Action {
         expected_root: TransactionRoot,
         /// Transactions in the block.
         transactions: SharedTransactions,
-        /// Parent QC's `weighted_timestamp` — the BFT-authenticated clock
+        /// Parent QC's `weighted_timestamp` — the shard consensus-authenticated clock
         /// every honest validator agrees on for this block. The validity
         /// check is `start_inclusive <= anchor < end_exclusive`. The
         /// one-block lag (this block's own QC may carry a slightly later
@@ -767,7 +767,7 @@ impl Action {
             | Self::BuildProposal { .. }
             | Self::BroadcastBlockHeader { .. }
             | Self::SignAndBroadcastBlockVote { .. }
-            | Self::BroadcastCommittedBlockHeader { .. } => ActionOwner::Bft,
+            | Self::BroadcastCommittedBlockHeader { .. } => ActionOwner::Shard,
 
             Self::AggregateExecutionCertificate { .. }
             | Self::VerifyAndAggregateExecutionVotes { .. }
@@ -790,9 +790,9 @@ impl Action {
 /// Which coordinator crate owns an [`Action`]'s delegated work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ActionOwner {
-    /// BFT consensus actions: QC build / verify, proposal, header
+    /// Shard consensus actions: QC build / verify, proposal, header
     /// and vote sign-and-broadcast.
-    Bft,
+    Shard,
     /// Execution-coordinator actions: wave / EC aggregation,
     /// transaction execution, exec vote / cert sign-and-broadcast.
     Execution,

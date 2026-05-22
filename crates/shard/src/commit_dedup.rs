@@ -1,6 +1,6 @@
 //! Deduplication index for committed artifacts referenced by block contents.
 //!
-//! The BFT layer enforces a single contract: every committed artifact (tx,
+//! The shard consensus layer enforces a single contract: every committed artifact (tx,
 //! cert, provision) appears in the chain exactly once. This index is the
 //! mechanism — proposers consult it to filter candidates, validators
 //! consult it to reject duplicate inclusions.
@@ -20,7 +20,7 @@
 //! Pruned when `committed_ts >= deadline`. Past expiry, independent rules
 //! reject re-inclusion, so the entry is no longer correctness-bearing.
 //!
-//! Registration is synchronous with BFT commit (called from
+//! Registration is synchronous with shard commit (called from
 //! [`crate::coordinator::ShardCoordinator::record_block_committed`]) so the
 //! just-committed block's contents are visible to any subsequent
 //! `try_propose` in the same tick — closing the on-qc-formed re-inclusion

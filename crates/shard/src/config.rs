@@ -1,4 +1,4 @@
-//! BFT configuration.
+//! shard consensus configuration.
 //!
 //! Operator-tunable knobs only. Protocol-invariant timing constants (view-change
 //! cadence, proposer-timestamp admission bounds, stall-attack ceiling) live in
@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-/// Local-only operational tuning for the BFT runtime.
+/// Local-only operational tuning for the shard consensus runtime.
 #[derive(Debug, Clone)]
 pub struct ShardConsensusConfig {
     /// Timeout before fetching missing transactions from peers.
@@ -42,7 +42,7 @@ impl Default for ShardConsensusConfig {
 }
 
 impl ShardConsensusConfig {
-    /// Create a new BFT configuration with default values.
+    /// Create a new shard consensus configuration with default values.
     #[must_use]
     pub fn new() -> Self {
         Self::default()

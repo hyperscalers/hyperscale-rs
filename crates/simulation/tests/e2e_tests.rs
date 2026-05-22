@@ -96,7 +96,7 @@ const fn simulator_network() -> NetworkDefinition {
 ///
 /// Flow:
 /// ```text
-/// submit_transaction() → Mempool → BFT orders → Block committed → Execution → Executed
+/// submit_transaction() → Mempool → shard consensus orders → Block committed → Execution → Executed
 /// ```
 #[traced_test]
 #[test]
@@ -557,7 +557,7 @@ fn test_e2e_multi_shard_consensus() {
 ///
 /// Flow:
 /// ```text
-/// submit_transaction() → Mempool → BFT orders → Block committed
+/// submit_transaction() → Mempool → shard consensus orders → Block committed
 ///                                            ↓
 ///                                    Execution Coordinator
 ///                                            ↓
@@ -991,7 +991,7 @@ fn test_e2e_transaction_throughput() {
 
 /// Test that transactions complete when one validator is isolated.
 ///
-/// With 4 validators and quorum=3, isolating one validator still allows BFT
+/// With 4 validators and quorum=3, isolating one validator still allows shard consensus
 /// progress. If the isolated node is the wave leader for a wave, the vote
 /// retry rotation mechanism should recover: non-leaders timeout, re-send
 /// to a rotated leader, and the EC is formed by the fallback leader.

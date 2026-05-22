@@ -52,7 +52,7 @@ gossipsub_heartbeat_ms = 100
 # ═══════════════════════════════════════════════════════════════════════════════
 
 [threads]
-# Consensus pool: liveness-critical work (block votes, QC verification,
+# Shard consensus pool: liveness-critical work (block votes, QC verification,
 # state root, proposal building). Kept small and dedicated so a long
 # execution batch can't queue ahead of consensus traffic. (0 = auto.)
 consensus_threads = 0

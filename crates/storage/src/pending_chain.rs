@@ -45,12 +45,12 @@ pub struct ChainEntry {
     pub receipts: Vec<Arc<ConsensusReceipt>>,
     /// JMT snapshot from this block's speculative state-root computation.
     pub jmt_snapshot: Arc<JmtSnapshot>,
-    /// BFT-committed block paired with its QC. `None` until the entry's
+    /// shard-committed block paired with its QC. `None` until the entry's
     /// block reaches the commit pipeline — JMT preparation happens before
     /// the QC arrives. Attached by
     /// [`PendingChain::attach_certified_block`] from
     /// `BlockCommitCoordinator::accumulate`, making the block visible to
-    /// fetch handlers throughout the BFT-committed / JMT-persisted window.
+    /// fetch handlers throughout the shard-committed / JMT-persisted window.
     pub certified_block: Option<Arc<CertifiedBlock>>,
 }
 
@@ -157,7 +157,7 @@ where
         }
     }
 
-    /// BFT-committed block at `height`. Returns `Some` for any height
+    /// shard-committed block at `height`. Returns `Some` for any height
     /// `<= committed_height`, regardless of whether JMT persistence has
     /// caught up: the pending entry serves the unpersisted window, then
     /// the base store takes over.
@@ -224,7 +224,7 @@ where
     }
 
     /// Most recent QC observed by this chain. Pending entries shadow the
-    /// persisted tip — the QC certifying the highest BFT-committed block
+    /// persisted tip — the QC certifying the highest shard-committed block
     /// is the highest-height pending entry's, then the base store's
     /// `latest_qc`. Used by sync-serving handlers to compute the dedup
     /// horizon without needing raw `&S`.
@@ -1268,7 +1268,7 @@ mod tests {
     #[test]
     fn certified_block_returns_none_before_attach() {
         // Entry inserted at JMT-prep time but accumulate has not run —
-        // block is not BFT-committed yet, so it must not be visible.
+        // block is not shard-committed yet, so it must not be visible.
         let chain = empty_chain();
         let _ = insert_pending(&chain, BlockHeight::new(5), false);
         assert!(chain.certified_block(BlockHeight::new(5)).is_none());

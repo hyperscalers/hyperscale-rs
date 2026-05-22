@@ -38,7 +38,7 @@ pub struct VoteKeeper {
     vote_sets: HashMap<BlockHash, VoteSet>,
 
     /// Own-vote locking: tracks which block hash we voted for at each height.
-    /// Critical for BFT safety — prevents voting for conflicting blocks at the
+    /// Critical for shard consensus safety — prevents voting for conflicting blocks at the
     /// same height and round. The lock may be released across rounds on
     /// timeout or when a QC proves the lock is irrelevant.
     ///

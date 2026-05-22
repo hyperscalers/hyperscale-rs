@@ -248,7 +248,7 @@ pub fn make_live_block(
 /// Pair a block with a minimal valid `QuorumCertificate` so it satisfies
 /// the `CertifiedBlock` pairing invariant.
 ///
-/// `weighted_timestamp_ms` stamps the BFT-authenticated time anchor; pass
+/// `weighted_timestamp_ms` stamps the shard consensus-authenticated time anchor; pass
 /// `0` when retention-window behavior doesn't matter.
 #[must_use]
 pub fn certify(block: Block, weighted_timestamp_ms: u64) -> CertifiedBlock {

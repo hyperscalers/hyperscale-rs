@@ -144,7 +144,7 @@ fn test_different_seeds_diverge() {
     }
     runner2.run_until(Duration::from_secs(1));
 
-    // Note: The stats might actually be the same since the BFT logic is deterministic
+    // Note: The stats might actually be the same since the shard consensus logic is deterministic
     // given the initial state. The difference would show in timing/ordering of network
     // messages due to different latency samples.
     // For now, just verify both complete successfully
@@ -518,7 +518,7 @@ fn test_view_change_complete_flow() {
     runner.initialize_genesis();
 
     // After genesis, all validators should be at height 0 committed, working on height 1
-    // BFT state tracks round via view() (HotStuff-2 style implicit view changes)
+    // shard consensus state tracks round via view() (HotStuff-2 style implicit view changes)
     for node_idx in 0..4u32 {
         let node = runner.node(node_idx).expect("Node should exist");
         assert_eq!(
@@ -559,7 +559,7 @@ fn test_view_change_complete_flow() {
             nodes_with_round_change += 1;
         }
         println!(
-            "Node {}: BFT view/round={}, committed_height={}",
+            "Node {}: shard view/round={}, committed_height={}",
             node_idx,
             round,
             node.shard_coordinator().committed_height()
@@ -630,7 +630,7 @@ fn test_view_change_quorum_after_commit() {
     println!("  Events processed: {}", stats.events_processed);
     println!("  Messages sent: {}", stats.messages_sent);
 
-    // Check BFT state (round is tracked via view() in HotStuff-2 style)
+    // Check shard consensus state (round is tracked via view() in HotStuff-2 style)
     for node_idx in 0..4u32 {
         let node = runner.node(node_idx).expect("Node should exist");
         println!(
@@ -740,7 +740,7 @@ fn test_round_reset_on_commit() {
     // Run for short time - if blocks commit, round timeout resets
     runner.run_until(Duration::from_secs(3));
 
-    // Check committed heights and BFT state
+    // Check committed heights and shard consensus state
     // With HotStuff-2 style, round is tracked in ShardCoordinator via view()
     for node_idx in 0..4u32 {
         let node = runner.node(node_idx).expect("Node should exist");
@@ -907,15 +907,15 @@ fn test_round_determinism() {
     // Views/rounds and heights should match exactly
     assert_eq!(
         views1, views2,
-        "BFT views/rounds should be identical across runs"
+        "shard views/rounds should be identical across runs"
     );
     assert_eq!(
         heights1, heights2,
         "Committed heights should be identical across runs"
     );
 
-    println!("BFT views/rounds (run1): {views1:?}");
-    println!("BFT views/rounds (run2): {views2:?}");
+    println!("shard views/rounds (run1): {views1:?}");
+    println!("shard views/rounds (run2): {views2:?}");
     println!("Committed heights (run1): {heights1:?}");
     println!("Committed heights (run2): {heights2:?}");
 }
@@ -1193,7 +1193,7 @@ fn test_consensus_throughput() {
 
 /// Test that transactions submitted to mempool are included in blocks.
 ///
-/// This verifies the mempool→BFT integration:
+/// This verifies the mempool→shard consensus integration:
 /// 1. Submit transactions to the mempool
 /// 2. Run consensus
 /// 3. Verify transactions appear in committed blocks
@@ -1860,10 +1860,10 @@ fn test_partition_recovery_hotstuff2() {
         .committed_height();
     println!("Height during partition: {height_during}");
 
-    // Debug: check BFT state (HotStuff-2 style - round tracked via view())
+    // Debug: check shard consensus state (HotStuff-2 style - round tracked via view())
     let shard = runner.node(0).unwrap().shard_coordinator();
     println!(
-        "BFT state: committed_height={}, view/round={}",
+        "shard consensus state: committed_height={}, view/round={}",
         shard.committed_height(),
         shard.view()
     );
@@ -1899,7 +1899,7 @@ fn test_partition_recovery_hotstuff2() {
     );
 
     // Check heights on all nodes after
-    println!("Node heights/BFT state after:");
+    println!("Node heights/shard consensus state after:");
     for i in 0..4u32 {
         let node = runner.node(i).unwrap();
         let h = node.shard_coordinator().committed_height();
@@ -1945,7 +1945,7 @@ fn test_partition_recovery_hotstuff2() {
     // Recovery from partition requires receiving proposals/votes from other nodes.
     // This test verifies that:
     // 1. The system doesn't crash or deadlock
-    // 2. All nodes have valid BFT state
+    // 2. All nodes have valid shard consensus state
     // 3. Round advancement is happening (view > 0 indicates timeout handling)
 
     // All nodes should have advanced rounds during the timeout period
@@ -1986,7 +1986,7 @@ fn test_partition_recovery_hotstuff2() {
 /// Test behavior during network partition.
 ///
 /// With a 2-2 partition (nodes 0,1 vs 2,3), neither side can reach quorum
-/// (need 3/4 = 75% for BFT). This test verifies:
+/// (need 3/4 = 75% for shard consensus). This test verifies:
 /// 1. Progress halts during partition (expected behavior)
 /// 2. Messages are being dropped as expected
 #[traced_test]
@@ -2045,7 +2045,7 @@ fn test_consensus_during_partition() {
 
 /// Test that packet loss is applied correctly.
 ///
-/// Note: The current BFT implementation doesn't have message retransmission,
+/// Note: The current shard consensus implementation doesn't have message retransmission,
 /// so packet loss can significantly impact consensus throughput. Lost votes
 /// prevent QC formation until the next proposal.
 ///

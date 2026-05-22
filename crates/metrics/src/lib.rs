@@ -33,7 +33,7 @@ use std::sync::{Arc, OnceLock};
 pub struct ChannelDepths {
     /// Callback channel (crypto/execution results).
     pub callback: usize,
-    /// Consensus channel (BFT network messages).
+    /// Consensus channel (shard consensus network messages).
     pub consensus: usize,
     /// Validated transactions channel.
     pub validated_tx: usize,
@@ -55,7 +55,7 @@ pub struct ChannelDepths {
 /// unless the field name explicitly says `_bytes`.
 #[derive(Debug, Default, Clone)]
 pub struct MemoryMetrics {
-    // ── BFT ──
+    // ── Shard consensus ──
     /// Blocks being assembled from headers + transactions.
     pub shard_pending_blocks: usize,
     /// Vote sets per block (unverified + verified votes).
@@ -249,7 +249,7 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// Set the current block height gauge for a shard.
     fn set_block_height(&self, shard: u64, height: u64) {}
 
-    /// Set the current BFT round gauge for one hosted vnode.
+    /// Set the current shard round gauge for one hosted vnode.
     fn set_shard_round(&self, shard: u64, validator_id: u64, round: u64) {}
 
     /// Set the view changes gauge (self-originated round advances) for one vnode.
@@ -610,7 +610,7 @@ pub fn set_block_height(shard: u64, height: u64) {
     recorder().set_block_height(shard, height);
 }
 
-/// Set the current BFT round gauge for one hosted vnode.
+/// Set the current shard round gauge for one hosted vnode.
 #[inline]
 pub fn set_shard_round(shard: u64, validator_id: u64, round: u64) {
     recorder().set_shard_round(shard, validator_id, round);

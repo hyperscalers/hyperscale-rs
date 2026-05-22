@@ -7,7 +7,7 @@
 //!   on every QC. Safe to anchor consensus deadlines on; all validators derive
 //!   the same value for a given committed block.
 //! - [`ProposerTimestamp`] — the proposer's local wall-clock embedded in a
-//!   block header at proposal time. Not authenticated; used only for BFT
+//!   block header at proposal time. Not authenticated; used only for shard consensus
 //!   liveness bounds (rushed/stale header rejection) and local-only latency
 //!   metrics. Must never feed a deterministic timeout — that's what
 //!   `WeightedTimestamp` is for.
@@ -103,7 +103,7 @@ impl Display for WeightedTimestamp {
 /// [`WeightedTimestamp`] for that.
 ///
 /// Legitimate uses:
-/// - BFT liveness bounds in `on_block_header` (reject rushed/stale proposals
+/// - shard consensus liveness bounds in `on_block_header` (reject rushed/stale proposals
 ///   against the local validator's own clock).
 /// - Local-only latency metrics (no divergence consequence).
 /// - Input to stake-weighted aggregation when forming a QC.
@@ -162,7 +162,7 @@ impl Display for ProposerTimestamp {
 /// against NTP steps.
 ///
 /// Deliberately has no `BasicSbor` derive and no `From`/`Into` to/from
-/// the BFT-authenticated timestamp types. Cross-clock comparisons require
+/// the shard consensus-authenticated timestamp types. Cross-clock comparisons require
 /// an explicit method, so the question "which clock am I anchoring on?"
 /// surfaces at every boundary instead of being lost to coercion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]

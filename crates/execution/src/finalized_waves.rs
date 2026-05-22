@@ -121,7 +121,7 @@ impl FinalizedWaveStore {
 
     /// Flatten every tracked wave's tx hashes into a single set.
     ///
-    /// The node passes this to BFT for conflict filtering — a transaction
+    /// The node passes this to shard consensus for conflict filtering — a transaction
     /// whose wave is already finalized should not be re-proposed.
     #[must_use]
     pub fn all_tx_hashes(&self) -> HashSet<TxHash> {

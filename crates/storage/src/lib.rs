@@ -53,7 +53,7 @@ pub use writes::{merge_database_updates, merge_into, merge_updates_from_receipts
 ///
 /// Use this only at sites that *thread* storage generically — i.e. the
 /// `IoLoop<S>` impls and entry points that must satisfy every capability
-/// `IoLoop` ultimately needs. For narrower scopes (block commit, BFT
+/// `IoLoop` ultimately needs. For narrower scopes (block commit, shard consensus
 /// proposal building, provision handlers), bound on the specific traits
 /// directly so the signature reflects what the function actually touches.
 pub trait Storage:

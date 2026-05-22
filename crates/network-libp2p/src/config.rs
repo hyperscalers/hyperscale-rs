@@ -50,7 +50,7 @@ pub struct Libp2pConfig {
     /// Idle connection timeout.
     ///
     /// Connections are closed after this duration of inactivity. Reduced from 60s
-    /// to enable faster dead peer detection - important for BFT consensus where
+    /// to enable faster dead peer detection - important for shard consensus where
     /// view change timeout is 3-30s and we need quick peer rotation on failure.
     ///
     /// Default: 30 seconds

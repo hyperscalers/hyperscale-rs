@@ -1,4 +1,4 @@
-//! Pure topology-derived helpers used by the BFT coordinator.
+//! Pure topology-derived helpers used by the shard coordinator.
 //!
 //! Everything here is a free function over `TopologySnapshot` — no mutable
 //! state, no async, no dependency on coordinator internals. Moved out of

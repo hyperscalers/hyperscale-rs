@@ -105,7 +105,7 @@ where
         // One set of request handlers per hosted shard — each handler
         // closure captures that shard's `PendingChain` and per-protocol
         // caches. No raw `&S` flows into a serve function: every chain
-        // read goes through `PendingChain` so the BFT-committed /
+        // read goes through `PendingChain` so the shard-committed /
         // JMT-persisted window is reachable from one place.
         for shard in self.hosted_shards() {
             // ── block.request → sync protocol ────────────────────────────

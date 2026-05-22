@@ -148,7 +148,7 @@ impl BlockHeader {
 
     /// Proposer's local wall-clock when this block was proposed.
     ///
-    /// **Not** BFT-authenticated. Used only for BFT liveness bounds (rejecting
+    /// **Not** BFT-authenticated. Used only for shard consensus liveness bounds (rejecting
     /// rushed/stale proposals against the local validator's clock) and local
     /// latency metrics. Never anchor a deterministic timeout on this — use
     /// `qc.weighted_timestamp` / `ts_ms` fields derived from it instead.
@@ -213,7 +213,7 @@ impl BlockHeader {
     /// Merkle root of provisions included in this block.
     ///
     /// Commits to which remote-shard provisions are available at this height.
-    /// Validators who voted for the BFT proposal have this data locally.
+    /// Validators who voted for the shard consensus proposal have this data locally.
     /// `ProvisionsRoot::ZERO` when no provisions are included (single-shard or empty block).
     #[must_use]
     pub const fn provision_root(&self) -> ProvisionsRoot {
@@ -261,7 +261,7 @@ impl BlockHeader {
     /// `CommittedBlockHeaderGossip` so RPC nodes can reject transactions targeting
     /// congested remote shards.
     ///
-    /// BFT-verified within tolerance (validators may differ slightly due to
+    /// shard-verified within tolerance (validators may differ slightly due to
     /// execution timing). Zero for genesis; fallback and sync blocks carry
     /// the parent's in-flight count forward unchanged (no txs admitted, none
     /// finalized).

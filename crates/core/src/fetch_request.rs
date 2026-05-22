@@ -28,14 +28,14 @@ use hyperscale_types::{
 /// - `shard` — committee whose members will serve the request. Local for
 ///   intra-shard fetches; source shard for cross-shard DA fetches.
 /// - `preferred` — canonical-source hint passed straight to
-///   `Network::request`. `Some(proposer)` on BFT-path fetches where one
+///   `Network::request`. `Some(proposer)` on shard-path fetches where one
 ///   peer is authoritative; `None` on catch-up / DA paths that fan out.
 /// - `class` — overrides the wire type's static `NetworkMessage::class()`.
 ///   `None` keeps the default; `Some` demotes to a less-urgent class
 ///   (typically `Recovery`) for catch-up / best-effort traffic.
 #[derive(Debug, Clone)]
 pub enum FetchRequest {
-    /// Transaction bodies by `TxHash` — BFT-path fetches against the
+    /// Transaction bodies by `TxHash` — shard-path fetches against the
     /// local shard's committee.
     Transactions {
         /// Transaction hashes to fetch.

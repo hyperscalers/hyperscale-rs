@@ -597,7 +597,7 @@ where
                 par,
             };
             match action.owner() {
-                ActionOwner::Bft => handle_shard_action(action, &ctx),
+                ActionOwner::Shard => handle_shard_action(action, &ctx),
                 ActionOwner::Execution => handle_execution_action(action, &ctx),
                 ActionOwner::Provisions => handle_provisions_action(action, &ctx),
                 ActionOwner::Local => unreachable!(

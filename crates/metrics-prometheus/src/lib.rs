@@ -30,7 +30,7 @@ pub struct Metrics {
     pub block_commit_latency: HistogramVec,
     /// Per-shard chain height. Each hosted shard maintains its own height.
     pub block_height: GaugeVec,
-    /// Per-vnode current BFT round.
+    /// Per-vnode current shard round.
     pub round: GaugeVec,
     /// Per-vnode self-originated view changes (leader-activity timer fired).
     pub view_changes: GaugeVec,
@@ -205,7 +205,7 @@ impl Metrics {
 
             round: register_gauge_vec!(
                 "hyperscale_round",
-                "Current BFT round within current height, per (shard, validator_id)",
+                "Current shard round within current height, per (shard, validator_id)",
                 &["shard", "validator_id"]
             )
             .unwrap(),
@@ -326,7 +326,7 @@ impl Metrics {
 
             consensus_channel_depth: register_gauge!(
                 "hyperscale_consensus_channel_depth",
-                "Depth of consensus channel (BFT network messages)"
+                "Depth of consensus channel (shard consensus network messages)"
             )
             .unwrap(),
 
@@ -620,7 +620,7 @@ impl Metrics {
             // Memory
             memory_shard: register_gauge_vec!(
                 "hyperscale_memory_shard_collections",
-                "BFT state machine collection sizes (entry count)",
+                "shard consensus state machine collection sizes (entry count)",
                 &["collection"]
             )
             .unwrap(),
@@ -1210,7 +1210,7 @@ impl MetricsRecorder for PrometheusRecorder {
 
     #[allow(clippy::too_many_lines)] // flat dispatch over every memory-metrics field
     fn set_memory_metrics(&self, m: &MemoryMetrics) {
-        // BFT
+        // Shard consensus
         self.metrics
             .memory_shard
             .with_label_values(&["pending_blocks"])

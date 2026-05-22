@@ -31,7 +31,7 @@
 //!
 //! - [`EARLY_VOTE_RETENTION`]: how long to hold votes whose block has never
 //!   committed locally. Cleanup at commit time drops older entries since
-//!   failure to commit past this window signals BFT is broken.
+//!   failure to commit past this window signals shard consensus is broken.
 //! - Buffered ECs evict at the EC's own
 //!   [`ExecutionCertificate::deadline`] — `vote_anchor_ts +
 //!   RETENTION_HORIZON`. Past that point every tx the EC could mention

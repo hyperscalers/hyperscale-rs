@@ -1,4 +1,4 @@
-//! Block-proposal helpers used by the BFT-driven dispatch arms.
+//! Block-proposal helpers used by the shard consensus-driven dispatch arms.
 //!
 //! Both the post-dispatch proposal-retry hook and the QC-formed path build
 //! proposals from the same triple — ready txs from mempool, finalized waves
@@ -29,7 +29,7 @@ impl NodeStateMachine {
         pending_certs: usize,
     ) -> ProposalInputs {
         // Request extra transactions from the mempool to compensate for QC-chain
-        // duplicates that will be filtered by BFT during proposal building.
+        // duplicates that will be filtered by shard consensus during proposal building.
         let max_txs = MAX_TXS_PER_BLOCK
             + self
                 .shard_coordinator

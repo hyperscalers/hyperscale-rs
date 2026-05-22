@@ -168,7 +168,7 @@ pub enum ShardScopedInput {
     SyncBlockValidated {
         /// Height of the validated block.
         height: BlockHeight,
-        /// Rehydrated, structurally-valid certified block ready for BFT.
+        /// Rehydrated, structurally-valid certified block ready for shard consensus.
         certified: Box<CertifiedBlock>,
     },
 

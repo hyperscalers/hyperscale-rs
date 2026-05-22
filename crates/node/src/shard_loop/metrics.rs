@@ -14,7 +14,7 @@
 //!
 //! The snapshot mirrors the three-layer architecture: per-shard
 //! infrastructure counts in [`ShardMetrics`] (sync / fetch state) and
-//! per-vnode consensus counts in [`VnodeMetrics`] (BFT / mempool state).
+//! per-vnode consensus counts in [`VnodeMetrics`] (shard consensus / mempool state).
 //! The prometheus backend uses flat (unlabeled) gauges, so
 //! [`record_metrics`] picks a representative shard + vnode via
 //! [`MetricsSnapshot::primary`] and emits its values.
@@ -294,7 +294,7 @@ where
         let block_sync_status = self.shard_io(primary_shard).syncs.block.block_sync_status();
 
         let memory = MemoryMetrics {
-            // BFT
+            // Shard consensus
             shard_pending_blocks: shard_mem.pending_blocks,
             shard_vote_sets: shard_mem.vote_sets,
             shard_pending_commits: shard_mem.pending_commits,

@@ -2,7 +2,7 @@
 //!
 //! Hard caps applied at header admission on the proposer's local-clock
 //! timestamp, measured against the receiving validator's own clock.
-//! Reject obviously rushed or stale headers before they enter the BFT
+//! Reject obviously rushed or stale headers before they enter the shard consensus
 //! state machine.
 //!
 //! These are protocol invariants, not operator-tunable config: every

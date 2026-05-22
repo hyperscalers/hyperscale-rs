@@ -12,7 +12,7 @@
 //!
 //! ## Why a dedicated crate?
 //!
-//! Remote headers are consumed by BFT (deferral merkle proofs), Provision
+//! Remote headers are consumed by shard consensus (deferral merkle proofs), Provision
 //! (state root verification), and Execution (expected cert tracking).
 //! `RemoteHeaderCoordinator` is the single source of truth — it verifies,
 //! stores, and prunes headers once, then emits `RemoteHeaderAdmitted`
@@ -24,7 +24,7 @@
 //! 2. Coordinator stores header as pending, emits `Action::VerifyRemoteHeaderQc`
 //! 3. Async QC verification completes → `RemoteHeaderQcVerified` event
 //! 4. Coordinator promotes to verified, emits `Action::Continuation(RemoteHeaderAdmitted)`
-//! 5. BFT, Provision, Execution consume the verified header
+//! 5. shard consensus, Provision, Execution consume the verified header
 //!
 //! ## Fallback
 //!

@@ -34,7 +34,7 @@ pub struct BlockForSync {
 /// and chain metadata across different storage backends.
 ///
 /// Block and certificate writes happen atomically via `ChainWriter`.
-/// Vote persistence is not needed — in-memory tracking in BFT state
+/// Vote persistence is not needed — in-memory tracking in shard consensus state
 /// is sufficient (nodes sync past voted heights on restart).
 pub trait ChainReader: Send + Sync + 'static {
     /// Get a committed block by height.
@@ -61,13 +61,13 @@ pub trait ChainReader: Send + Sync + 'static {
     ///
     /// Returns `Some(BlockForSync)` only if the full block is available
     /// with all transactions and certificates. Returns `None` if any
-    /// data is missing — including heights that are BFT-committed but
+    /// data is missing — including heights that are shard-committed but
     /// not yet persisted, which on its own would cause the persistence-race
     /// livelock under cross-shard load.
     ///
     /// Network serve handlers should not call this directly. Use
     /// [`PendingChain::block_for_sync`] instead — it spans the
-    /// BFT-committed / JMT-persisted window before falling through to this
+    /// shard-committed / JMT-persisted window before falling through to this
     /// method on the base store.
     ///
     /// [`PendingChain::block_for_sync`]: crate::PendingChain::block_for_sync

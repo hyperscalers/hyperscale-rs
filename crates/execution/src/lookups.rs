@@ -41,7 +41,7 @@ pub fn peers_excluding_self(topology: &TopologySnapshot, shard: ShardGroupId) ->
 }
 
 /// True if `ec.signers()` represents at least 2f+1 of the voting power on
-/// `ec.shard_group_id()`. Mirrors `qc_has_local_quorum_power` (in the BFT
+/// `ec.shard_group_id()`. Mirrors `qc_has_local_quorum_power` (in the shard consensus
 /// crate) but resolves committee + voting power for the EC's own shard,
 /// since cross-shard ECs are signed by remote committees.
 #[must_use]

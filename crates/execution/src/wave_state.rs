@@ -494,7 +494,7 @@ impl WaveState {
 
     // ── Vote emission ───────────────────────────────────────────────────
 
-    /// Vote anchor timestamp — the BFT-authenticated weighted timestamp (ms)
+    /// Vote anchor timestamp — the shard consensus-authenticated weighted timestamp (ms)
     /// at which this wave's outcome is fixed.
     /// - Fully provisioned: `all_provisioned_at` (max provisioning ts
     ///   across txs in the wave).

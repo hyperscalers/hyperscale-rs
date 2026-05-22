@@ -119,7 +119,7 @@ pub struct ProvisionCoordinator {
     // Committed-Provision Tombstones
     // ═══════════════════════════════════════════════════════════════════
     /// Content-hash tombstones for batches already committed locally.
-    /// Mirrors the BFT-side `CommitDedupIndex::provision_retention`
+    /// Mirrors the shard-side `CommitDedupIndex::provision_retention`
     /// window so a late re-arrival can't slip past the
     /// `(source_shard, block_height)`-keyed pipeline guards and
     /// re-enter the proposer queue (which would then propose a batch
@@ -202,7 +202,7 @@ impl ProvisionCoordinator {
     ///    reads `local_ts`.
     /// 2. `queue.on_block_committed` drops committed provisions from the
     ///    proposer queue so we don't re-include them next round.
-    /// 3. `committed_tombstones.register` mirrors the BFT
+    /// 3. `committed_tombstones.register` mirrors the shard consensus
     ///    `CommitDedupIndex` window so a late re-arrival can't slip past
     ///    `pipeline.verified` (which evicts at `source_block_ts +
     ///    RETENTION_HORIZON`) and re-enter the queue.
@@ -222,7 +222,7 @@ impl ProvisionCoordinator {
         // and tombstone them so a late re-arrival (gossip retransmit,
         // fetch fall-through, range-sync delivery) is dropped at receipt
         // rather than re-entering the queue and forcing a view change at
-        // the BFT validation gate. Sourced from the block's manifest so a
+        // the shard validation gate. Sourced from the block's manifest so a
         // `Block::Sealed` reaching this path still enumerates its hashes
         // via the manifest's `provision_hashes`.
         let manifest = BlockManifest::from_block(block);
@@ -478,11 +478,11 @@ impl ProvisionCoordinator {
         }
 
         // Drop re-arrivals of already-committed batches. Mirrors the
-        // BFT `CommitDedupIndex` window so a late delivery (gossip
+        // window of `CommitDedupIndex` in the shard coordinator so a late delivery (gossip
         // retransmit, fetch fall-through, range-sync) can't slip past
         // the `(source_shard, block_height)`-keyed pipeline guards
         // after they've evicted at `source_block_ts + RETENTION_HORIZON`
-        // — the BFT window runs to `local_committed_ts +
+        // — the shard commit window runs to `local_committed_ts +
         // RETENTION_HORIZON`, which is strictly later.
         if self.committed_tombstones.contains(&provisions.hash()) {
             return vec![];
@@ -544,7 +544,7 @@ impl ProvisionCoordinator {
         let source_shard = provisions.source_shard();
 
         // Clear the expectation tracker so the in-flight fallback fetch
-        // (if any) is drained — once one batch verifies the BFT
+        // (if any) is drained — once one batch verifies the shard consensus
         // expectation is satisfied. The `ProvisionsAdmitted` continuation
         // emitted below drives that drain via `FetchInput::Admitted` in
         // `drive_fetch_admission`. Explicit `AbandonFetch` is reserved
@@ -588,7 +588,7 @@ impl ProvisionCoordinator {
         // The verify path is async: the action was dispatched at receipt,
         // before the same batch may have been committed in another block.
         // Re-enqueueing a tombstoned batch lets the proposer re-include it,
-        // and peers reject the proposal at the BFT dedup gate ("already
+        // and peers reject the proposal at the shard dedup gate ("already
         // committed within its retention window"), forcing a view change.
         // The receipt-side tombstone check (`on_state_provisions_received`)
         // only catches arrivals that haven't started verifying yet — this
@@ -1717,7 +1717,7 @@ mod tests {
     /// in `on_state_provisions_received` past `pipeline.verified`'s
     /// `source_block_ts + RETENTION_HORIZON` eviction, sails through the
     /// `has_verified` guard, re-enters the proposer queue, and the next
-    /// proposal includes a batch the BFT
+    /// proposal includes a batch the shard consensus
     /// `validate_no_duplicate_provisions` window still rejects —
     /// triggering a view-change loop.
     #[test]

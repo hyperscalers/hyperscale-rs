@@ -38,7 +38,7 @@
 //! actually-delivered heights) or `SyncInput::FetchFailed` (entire range
 //! deferred).
 //!
-//! Deliveries are surfaced by the binding to its consumer (BFT, the
+//! Deliveries are surfaced by the binding to its consumer (shard consensus, the
 //! remote-header coordinator, …). The generic only learns that a height
 //! has been admitted when the consumer feeds back
 //! [`SyncInput::Admitted`].

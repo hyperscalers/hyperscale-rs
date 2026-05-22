@@ -1,6 +1,6 @@
-//! BFT consensus state machine.
+//! Shard consensus state machine (HotStuff-2).
 //!
-//! This module implements the BFT consensus state machine
+//! This module implements the shard consensus state machine
 //! as a synchronous, event-driven model.
 //!
 //! # Data Availability Guarantee
@@ -18,7 +18,7 @@ use hyperscale_types::{
     ProposerTimestamp, ProvisionHash, ShardGroupId, WaveId, WeightedTimestamp,
 };
 
-/// BFT statistics for monitoring.
+/// Shard consensus statistics for monitoring.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ShardStats {
     /// Total number of view changes (round advances due to local
@@ -36,7 +36,7 @@ pub struct ShardStats {
     pub committed_height: BlockHeight,
 }
 
-/// BFT memory statistics for monitoring collection sizes.
+/// Shard consensus memory statistics for monitoring collection sizes.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ShardMemoryStats {
     /// Pending blocks awaiting transaction / wave / provision arrival.
@@ -105,10 +105,10 @@ use crate::verification::{InFlightCheck, ReadyStateRootVerification, Verificatio
 use crate::view_change::ViewChangeController;
 use crate::vote_keeper::{LockDecision, VoteKeeper};
 
-/// BFT consensus state machine.
+/// Shard consensus state machine (HotStuff-2).
 ///
 /// Handles block proposal, voting, QC formation, commitment, and view changes.
-/// This is a synchronous implementation of BFT consensus.
+/// This is a synchronous implementation of shard consensus.
 ///
 /// # State Machine Flow
 ///
@@ -170,7 +170,7 @@ pub struct ShardCoordinator {
     proposal: ProposalTracker,
 
     /// Dedup cache for committed transaction and certificate hashes.
-    /// Bridges synchronous BFT commits to async mempool processing, and
+    /// Bridges synchronous shard commits to async mempool processing, and
     /// provides a bounded retention window for historical dedup.
     dedup_index: CommitDedupIndex,
 
@@ -201,11 +201,11 @@ impl std::fmt::Debug for ShardCoordinator {
 }
 
 impl ShardCoordinator {
-    /// Create a new BFT state machine.
+    /// Create a new shard consensus state machine.
     ///
     /// # Arguments
     ///
-    /// * `config` - BFT configuration
+    /// * `config` - Shard consensus configuration
     /// * `recovered` - State recovered from storage. Use `RecoveredState::default()` for fresh start.
     #[must_use]
     pub fn new(config: ShardConsensusConfig, recovered: RecoveredState) -> Self {
@@ -366,7 +366,7 @@ impl ShardCoordinator {
     /// since fetching was suppressed during sync.
     ///
     /// `NodeStateMachine` flushes expected remote headers and provisions in
-    /// the same `BlockSyncComplete` arm, so this returns only BFT-local
+    /// the same `BlockSyncComplete` arm, so this returns only shard-local
     /// resume actions.
     pub fn on_block_sync_complete(&mut self, topology_snapshot: &TopologySnapshot) -> Vec<Action> {
         info!(
@@ -1259,7 +1259,7 @@ impl ShardCoordinator {
         let round = header.round();
 
         // For non-genesis QC, delegate signature verification before voting.
-        // This is CRITICAL for BFT safety - prevents Byzantine proposers from
+        // This is CRITICAL for shard consensus safety - prevents Byzantine proposers from
         // including fake QCs with invalid signatures.
         if !header.parent_qc().is_genesis() {
             // Check if we've already verified this exact QC. The cache hit
@@ -2749,7 +2749,7 @@ impl ShardCoordinator {
     /// Every gossip arrival, fetch response, RPC submit, and locally produced
     /// tx funnels through `MempoolCoordinator` first; the resulting
     /// `Continuation(ProtocolEvent::TransactionsAdmitted { txs })` event
-    /// reaches BFT here. Walks pending blocks, populates each one's
+    /// reaches shard consensus here. Walks pending blocks, populates each one's
     /// `received_transactions` cache for hashes it was waiting on, and
     /// emits any unblocked vote / commit-resume actions via the shared
     /// machinery on [`PendingBlocks`].
@@ -2970,7 +2970,7 @@ impl ShardCoordinator {
     }
 
     /// Drain the proposal-retry latch. Returns `true` once if any emitter
-    /// queued a retry during the current dispatch (or BFT's internal
+    /// queued a retry during the current dispatch (or the shard coordinator's internal
     /// verification path unblocked a deferred proposal).
     pub fn take_ready_proposal(&mut self) -> bool {
         let ready = self.verification.take_ready_proposal();
@@ -3024,7 +3024,7 @@ impl ShardCoordinator {
         self.view_change.view
     }
 
-    /// Get BFT statistics for monitoring.
+    /// Get shard consensus statistics for monitoring.
     #[must_use]
     pub const fn stats(&self) -> ShardStats {
         ShardStats {
@@ -3035,7 +3035,7 @@ impl ShardCoordinator {
         }
     }
 
-    /// Get BFT memory statistics for monitoring collection sizes.
+    /// Get shard consensus memory statistics for monitoring collection sizes.
     #[must_use]
     pub fn memory_stats(&self) -> ShardMemoryStats {
         ShardMemoryStats {
@@ -3109,7 +3109,7 @@ impl ShardCoordinator {
             .collect_ancestor_hashes(parent_block_hash)
     }
 
-    /// Get the BFT configuration.
+    /// Get the shard consensus configuration.
     #[must_use]
     pub const fn config(&self) -> &ShardConsensusConfig {
         &self.config
@@ -4231,7 +4231,7 @@ mod tests {
 
     #[test]
     fn test_on_block_ready_to_commit_rejects_mismatched_qc() {
-        // Defense in depth at the BFT entry point: a `(block_hash, qc)` pair
+        // Defense in depth at the shard consensus entry point: a `(block_hash, qc)` pair
         // where `qc.block_hash() != block_hash` would land at
         // `CertifiedBlock::new_unchecked` downstream and panic the shard
         // loop. Reject early and let the next QC / sync re-drive the commit.

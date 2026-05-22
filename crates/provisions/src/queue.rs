@@ -5,7 +5,7 @@
 //! local proposer includes them.
 //!
 //! Re-admission of already-committed provisions is rejected upstream by
-//! BFT (`validate_no_duplicate_provisions`) and at receipt
+//! shard consensus (`validate_no_duplicate_provisions`) and at receipt
 //! (`deadline <= local_ts`); the queue itself only owns the
 //! candidate-set bookkeeping. All eviction triggers come from the
 //! coordinator's `on_block_committed` and `drop_past_deadline`. Pure

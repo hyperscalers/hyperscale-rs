@@ -506,7 +506,7 @@ impl ExecutionCoordinator {
     /// This is the SINGLE path to execution voting. Call after conflicts
     /// have been processed so wave state is deterministic at this height.
     /// Each vote is sent to the wave leader (unicast). The `vote_anchor_ts`
-    /// is the BFT-authenticated weighted timestamp determined by the wave
+    /// is the shard consensus-authenticated weighted timestamp determined by the wave
     /// (either `all_provisioned_at`, or `wave_start_ts + WAVE_TIMEOUT`
     /// for timeout-abort).
     pub fn emit_vote_actions(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
@@ -1557,7 +1557,7 @@ impl ExecutionCoordinator {
         self.finalized
             .insert(wave_id.clone(), Arc::clone(&finalized_arc));
 
-        // Single admission event covers both the BFT subscriber and the
+        // Single admission event covers both the shard consensus subscriber and the
         // io_loop serving cache (via the Continuation interception arm).
         // The state machine latches a proposal-retry on this event.
         vec![Action::Continuation(
@@ -1763,7 +1763,7 @@ impl ExecutionCoordinator {
         // - Wave resolved (EC formed) → votes no longer needed
         // - Leader replayed them (VoteTracker exists) → already consumed
         // - No wave and older than `EARLY_VOTE_RETENTION` → block never
-        //   committed, BFT broken
+        //   committed, shard consensus broken
         //
         // Non-leaders with a wave but no VoteTracker KEEP early votes. They
         // may become fallback leaders via rotation and need to replay them
@@ -1806,7 +1806,7 @@ impl ExecutionCoordinator {
 
     /// Returns the set of all finalized transaction hashes.
     ///
-    /// Used by the node orchestrator to pass to BFT for conflict filtering.
+    /// Used by the node orchestrator to pass to shard consensus for conflict filtering.
     #[must_use]
     pub fn finalized_tx_hashes(&self) -> HashSet<TxHash> {
         self.finalized.all_tx_hashes()

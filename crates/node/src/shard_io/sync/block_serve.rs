@@ -1,7 +1,7 @@
 //! Inbound block-sync request handling.
 //!
 //! Serves `GetBlockRequest`s from peers catching up via the sync protocol.
-//! Reads the block through `PendingChain` so BFT-committed-but-unpersisted
+//! Reads the block through `PendingChain` so shard-committed-but-unpersisted
 //! heights are served from memory — those blocks are already in their
 //! `Block::Live` shape with provisions inline, so no cache lookup is
 //! needed. Persisted blocks come back `Block::Sealed`; if the dedup
@@ -28,7 +28,7 @@ use tracing::{trace, warn};
 /// must learn those hashes too. Past the horizon, the dedup entries are
 /// gone everywhere and the `Sealed` block is safe to serve.
 ///
-/// The horizon check is based on the BFT-authenticated
+/// The horizon check is based on the shard consensus-authenticated
 /// `weighted_timestamp` of the committing QC and the serving peer's own
 /// latest QC timestamp — both quantities are deterministic and don't
 /// depend on the requester's view.

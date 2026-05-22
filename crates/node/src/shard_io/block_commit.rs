@@ -173,7 +173,7 @@ where
     );
 
     // The sync-block ingress validator rejects peer-shipped divergent
-    // receipts before BFT sees the block, and `WaveState`'s divergence
+    // receipts before shard consensus sees the block; and `WaveState`'s divergence
     // detector keeps locally-produced bad receipts out of `finalized`.
     // A mismatch here means our local parent state itself diverged from
     // canonical — a JMT or commit-batch bug, or pre-existing corruption
@@ -292,7 +292,7 @@ pub enum AccumulateDecision {
         /// Height of the accepted block (used to advance the sync protocol).
         height: BlockHeight,
         /// Block + QC for the accepted commit. The caller attaches the
-        /// pair to `PendingChain` so the BFT-committed-but-not-persisted
+        /// pair to `PendingChain` so the shard-committed-but-not-persisted
         /// window is readable by fetch handlers, then — if `notify_now`
         /// — uses the same handles to fire `BlockCommitted`.
         handles: NotifyHandles,

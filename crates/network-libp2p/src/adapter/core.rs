@@ -223,7 +223,7 @@ impl Libp2pAdapter {
             mpsc::unbounded_channel::<super::gossipsub::ValidationReport>();
 
         // Class-tiered command channels — commands are routed by message class.
-        // Consensus (BFT round-blocking) is drained before Recovery (sync) and Bulk.
+        // Consensus (shard round-blocking) is drained before Recovery (sync) and Bulk.
         let (
             priority_channels,
             (consensus_rx, block_completion_rx, cross_shard_progress_rx, recovery_rx, bulk_rx),
@@ -334,7 +334,7 @@ impl Libp2pAdapter {
     /// Publish pre-encoded data to a topic with a given class.
     ///
     /// Messages are routed to the appropriate class channel based on the
-    /// provided [`MessageClass`]. Consensus messages (BFT round-blocking) are
+    /// provided [`MessageClass`]. Consensus messages (shard round-blocking) are
     /// processed before Recovery messages (sync) and Bulk (tx gossip).
     ///
     /// Callers are responsible for SBOR-encoding and compressing the message

@@ -88,7 +88,7 @@ impl ProvisioningTracker {
         }
     }
 
-    /// Update the BFT-attested local-commit clock used for deadline
+    /// Update the shard consensus-attested local-commit clock used for deadline
     /// stamping. Called once per `on_block_committed`. Monotone — out-of-order
     /// or stale calls are ignored.
     pub fn advance_clock(&mut self, now: WeightedTimestamp) {

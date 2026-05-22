@@ -3,7 +3,7 @@
 //! This module is the single source of truth for remote committed block headers.
 //! It receives raw headers from gossip (or sync-driven fetch), dispatches QC
 //! verification, stores verified headers, and emits `RemoteHeaderAdmitted`
-//! continuations for downstream consumers (BFT, Provision, Execution).
+//! continuations for downstream consumers (shard consensus, Provision, Execution).
 //!
 //! It also tracks per-shard liveness and emits
 //! `Action::StartRemoteHeaderSync` when a remote shard hasn't sent headers
@@ -23,7 +23,7 @@ use hyperscale_types::{
 use tracing::{debug, info, trace, warn};
 
 /// How long to wait before raising the per-shard sync target for a remote
-/// shard. Measured against the BFT-authenticated `weighted_timestamp_ms`
+/// shard. Measured against the shard consensus-authenticated `weighted_timestamp_ms`
 /// of our local committed blocks, so the threshold is independent of
 /// local block production rate.
 ///
@@ -80,7 +80,7 @@ struct ExpectedHeader {
 /// - Track per-shard liveness and emit fallback requests on timeout
 ///
 /// Downstream consumers:
-/// - **BFT**: Uses verified `transaction_root` for deferral merkle proofs
+/// - **Shard consensus**: Uses verified `transaction_root` for deferral merkle proofs
 /// - **Provision**: Uses verified `state_root` for merkle proof verification;
 ///   `waves` field to register expected provisions
 /// - **Execution**: Uses `waves` field to register expected execution certs
@@ -437,7 +437,7 @@ impl RemoteHeaderCoordinator {
 
     /// Get a verified remote header by (shard, height).
     ///
-    /// Used by BFT for deferral merkle proof validation and by Provision
+    /// Used by shard consensus for deferral merkle proof validation and by Provision
     /// for state root verification.
     #[must_use]
     pub fn get_verified(

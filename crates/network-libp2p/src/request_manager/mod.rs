@@ -97,7 +97,7 @@ pub enum RequestError {
 ///
 /// `Recovery` and `Bulk` are the sheddable classes; all others get tight
 /// retries with shorter backoff to absorb packet loss without falling
-/// behind on the BFT or cross-shard hot paths.
+/// behind on the shard consensus or cross-shard hot paths.
 #[must_use]
 pub const fn uses_relaxed_retry(class: MessageClass) -> bool {
     matches!(class, MessageClass::Recovery | MessageClass::Bulk)
@@ -107,7 +107,7 @@ pub const fn uses_relaxed_retry(class: MessageClass) -> bool {
 ///
 /// `CrossShardProgress` traffic (provisions / EC fallback fetches) is
 /// bounded by `config.cross_shard_max_concurrent` so a cross-shard fetch
-/// storm during topology churn cannot starve the BFT hot path
+/// storm during topology churn cannot starve the shard consensus hot path
 /// (`Consensus`, `BlockCompletion`).
 #[must_use]
 pub const fn is_cross_shard(class: MessageClass) -> bool {
@@ -182,7 +182,7 @@ pub struct RequestManagerConfig {
     /// Cap on concurrent in-flight requests in the `CrossShardProgress`
     /// class. Counted as a subset of `max_concurrent` — prevents a
     /// cross-shard fetch storm (provisions / EC fallback during topology
-    /// churn) from filling the global pool and starving the BFT hot path
+    /// churn) from filling the global pool and starving the shard consensus hot path
     /// (`Consensus`, `BlockCompletion`). The hot path is therefore
     /// guaranteed `max_concurrent - cross_shard_max_concurrent -
     /// sheddable_max_concurrent` slots regardless of cross-shard or
@@ -205,7 +205,7 @@ impl Default for RequestManagerConfig {
             // bursts without blocking pending-block or cross-shard fetches.
             sheddable_max_concurrent: 32,
             // 48/128 paired with sheddable_max=32 reserves
-            // 48 = 128 - 48 - 32 slots for the BFT hot path. Sized so a
+            // 48 = 128 - 48 - 32 slots for the shard consensus hot path. Sized so a
             // burst of cross-shard fallback fetches can run in parallel
             // rather than serialising on a tight cap.
             cross_shard_max_concurrent: 48,
@@ -237,7 +237,7 @@ pub struct RequestManager {
     sheddable_in_flight: AtomicUsize,
     /// Subset of `in_flight` whose class is `CrossShardProgress`. Capped
     /// independently by `config.cross_shard_max_concurrent` so cross-shard
-    /// fetch storms can't starve the BFT hot path.
+    /// fetch storms can't starve the shard consensus hot path.
     cross_shard_in_flight: AtomicUsize,
     /// Per-class in-flight counters used to drive the
     /// `request_slots_in_flight{class}` gauge. Indexed by class

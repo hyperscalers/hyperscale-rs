@@ -1,4 +1,4 @@
-//! Quorum certificate for BFT consensus.
+//! Quorum certificate for shard consensus.
 
 use sbor::prelude::*;
 
