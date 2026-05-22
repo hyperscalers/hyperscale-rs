@@ -116,7 +116,7 @@ fn test_e2e_single_shard_transaction() {
     for node_idx in 0..4u32 {
         let node = runner.node(node_idx).expect("Node should exist");
         assert_eq!(
-            node.bft().committed_height(),
+            node.shard_coordinator().committed_height(),
             BlockHeight::new(0),
             "Node {node_idx} should be at genesis height"
         );
@@ -161,12 +161,12 @@ fn test_e2e_single_shard_transaction() {
     let mut any_committed = false;
     for node_idx in 0..4u32 {
         let node = runner.node(node_idx).expect("Node should exist");
-        if node.bft().committed_height() > BlockHeight::GENESIS {
+        if node.shard_coordinator().committed_height() > BlockHeight::GENESIS {
             any_committed = true;
             println!(
                 "Node {} committed height: {}",
                 node_idx,
-                node.bft().committed_height()
+                node.shard_coordinator().committed_height()
             );
         }
     }
@@ -176,7 +176,7 @@ fn test_e2e_single_shard_transaction() {
     // Check mempool status on node 0
     // Note: By this point (2s of consensus), the transaction may already be completed and evicted!
     let node0 = runner.node(0).expect("Node 0 should exist");
-    let initial_status = node0.mempool().status(&tx_hash);
+    let initial_status = node0.mempool_coordinator().status(&tx_hash);
     println!("Transaction status after initial consensus: {initial_status:?}");
 
     // If status is None, the transaction completed and was evicted from mempool.
@@ -186,14 +186,20 @@ fn test_e2e_single_shard_transaction() {
         // Transaction was evicted - check if it was executed.
         // Note: is_finalized checks finalized_certificates which are also cleaned up
         // after the TC is committed in a block. Use is_tombstoned as a fallback.
-        let is_executed =
-            node0.execution().is_finalized(tx_hash) || node0.mempool().is_tombstoned(&tx_hash);
+        let is_executed = node0.execution_coordinator().is_finalized(tx_hash)
+            || node0.mempool_coordinator().is_tombstoned(&tx_hash);
         if is_executed {
             println!("✓ Transaction already completed and evicted after initial consensus!\n");
 
             // Print final state
             let max_height: BlockHeight = (0..4)
-                .map(|i| runner.node(i).unwrap().bft().committed_height())
+                .map(|i| {
+                    runner
+                        .node(i)
+                        .unwrap()
+                        .shard_coordinator()
+                        .committed_height()
+                })
                 .max()
                 .unwrap();
 
@@ -212,7 +218,13 @@ fn test_e2e_single_shard_transaction() {
 
         // Print final state
         let max_height: BlockHeight = (0..4)
-            .map(|i| runner.node(i).unwrap().bft().committed_height())
+            .map(|i| {
+                runner
+                    .node(i)
+                    .unwrap()
+                    .shard_coordinator()
+                    .committed_height()
+            })
             .max()
             .unwrap();
 
@@ -249,13 +261,13 @@ fn test_e2e_single_shard_transaction() {
         // Check mempool status
         // Transaction progresses: Pending -> Committed -> Executed -> Completed -> evicted
         // Once evicted, status() returns None but is_tombstoned() returns true.
-        if let Some(status) = node0.mempool().status(&tx_hash) {
+        if let Some(status) = node0.mempool_coordinator().status(&tx_hash) {
             if !committed && status.holds_state_lock() {
                 let elapsed = runner.now().checked_sub(start_time).unwrap();
                 println!("  ✓ Transaction committed to block (iteration {iteration}, {elapsed:?})");
                 committed = true;
             }
-        } else if node0.mempool().is_tombstoned(&tx_hash) {
+        } else if node0.mempool_coordinator().is_tombstoned(&tx_hash) {
             // Transaction was fully processed and evicted from the mempool.
             // Both finalized_certificates and mempool entry are cleaned up at this point,
             // but the tombstone confirms the transaction reached a terminal state.
@@ -276,7 +288,7 @@ fn test_e2e_single_shard_transaction() {
         }
 
         // Check execution status
-        if node0.execution().is_finalized(tx_hash) && !executed {
+        if node0.execution_coordinator().is_finalized(tx_hash) && !executed {
             let elapsed = runner.now().checked_sub(start_time).unwrap();
             println!("  ✓ Transaction executed (iteration {iteration}, {elapsed:?})");
             executed = true;
@@ -290,7 +302,7 @@ fn test_e2e_single_shard_transaction() {
         // Progress report
         if (iteration + 1) % 20 == 0 {
             let elapsed = runner.now().checked_sub(start_time).unwrap();
-            let height = node0.bft().committed_height();
+            let height = node0.shard_coordinator().committed_height();
             println!(
                 "  Iteration {}: elapsed={:?}, height={}, committed={}, executed={}",
                 iteration + 1,
@@ -316,18 +328,18 @@ fn test_e2e_single_shard_transaction() {
     let mut max_height = BlockHeight::GENESIS;
     for node_idx in 0..4u32 {
         let node = runner.node(node_idx).expect("Node should exist");
-        let height = node.bft().committed_height();
+        let height = node.shard_coordinator().committed_height();
         max_height = max_height.max(height);
 
         // Check transaction status on each node
-        let mempool_status = node.mempool().status(&tx_hash);
-        let is_executed = node.execution().is_finalized(tx_hash);
+        let mempool_status = node.mempool_coordinator().status(&tx_hash);
+        let is_executed = node.execution_coordinator().is_finalized(tx_hash);
 
         println!(
             "Node {}: height={}, view={}, tx_status={:?}, executed={}",
             node_idx,
             height,
-            node.bft().view(),
+            node.shard_coordinator().view(),
             mempool_status,
             is_executed
         );
@@ -393,7 +405,13 @@ fn test_e2e_single_shard_determinism() {
 
     let stats1 = runner1.stats().clone();
     let heights1: Vec<BlockHeight> = (0..4)
-        .map(|i| runner1.node(i).unwrap().bft().committed_height())
+        .map(|i| {
+            runner1
+                .node(i)
+                .unwrap()
+                .shard_coordinator()
+                .committed_height()
+        })
         .collect();
 
     // Second run with same seed
@@ -410,7 +428,13 @@ fn test_e2e_single_shard_determinism() {
 
     let stats2 = runner2.stats().clone();
     let heights2: Vec<BlockHeight> = (0..4)
-        .map(|i| runner2.node(i).unwrap().bft().committed_height())
+        .map(|i| {
+            runner2
+                .node(i)
+                .unwrap()
+                .shard_coordinator()
+                .committed_height()
+        })
         .collect();
 
     // Verify identical results
@@ -467,7 +491,7 @@ fn test_e2e_multi_shard_consensus() {
             "Node {} (Shard {}): committed_height={}",
             node_idx,
             shard,
-            node.bft().committed_height()
+            node.shard_coordinator().committed_height()
         );
     }
 
@@ -478,10 +502,22 @@ fn test_e2e_multi_shard_consensus() {
 
     // Check each shard's progress
     let shard0_heights: Vec<BlockHeight> = (0..3)
-        .map(|i| runner.node(i).unwrap().bft().committed_height())
+        .map(|i| {
+            runner
+                .node(i)
+                .unwrap()
+                .shard_coordinator()
+                .committed_height()
+        })
         .collect();
     let shard1_heights: Vec<BlockHeight> = (3..6)
-        .map(|i| runner.node(i).unwrap().bft().committed_height())
+        .map(|i| {
+            runner
+                .node(i)
+                .unwrap()
+                .shard_coordinator()
+                .committed_height()
+        })
         .collect();
 
     println!("Shard 0 heights: {shard0_heights:?}");
@@ -630,7 +666,7 @@ fn test_e2e_cross_shard_transaction() {
 
         // Check mempool status
         // Transaction progresses: Pending -> Committed -> (Completed|Rejected)
-        if let Some(status) = node0.mempool().status(&tx_hash) {
+        if let Some(status) = node0.mempool_coordinator().status(&tx_hash) {
             // If it's in the mempool at all (any status), it entered the mempool
             if !in_mempool {
                 println!("  ✓ Transaction in mempool ({status:?})");
@@ -652,14 +688,14 @@ fn test_e2e_cross_shard_transaction() {
         }
 
         // Check execution status
-        if !executed && node0.execution().is_finalized(tx_hash) {
+        if !executed && node0.execution_coordinator().is_finalized(tx_hash) {
             let elapsed = runner.now().checked_sub(start_time).unwrap();
             println!("  ✓ Transaction executed (iteration {iteration}, {elapsed:?})");
             executed = true;
         }
 
         // Check finalization status (for cross-shard, this means certificate created)
-        if !finalized && node0.execution().is_finalized(tx_hash) {
+        if !finalized && node0.execution_coordinator().is_finalized(tx_hash) {
             let elapsed = runner.now().checked_sub(start_time).unwrap();
             println!(
                 "  ✓ Transaction finalized with certificate (iteration {iteration}, {elapsed:?})"
@@ -697,12 +733,12 @@ fn test_e2e_cross_shard_transaction() {
     println!("\nShard 0 validators:");
     for i in 0..3 {
         let node = runner.node(i).unwrap();
-        let tx_state = node.mempool().status(&tx_hash);
-        let is_final = node.execution().is_finalized(tx_hash);
+        let tx_state = node.mempool_coordinator().status(&tx_hash);
+        let is_final = node.execution_coordinator().is_finalized(tx_hash);
         println!(
             "  Node {}: height={}, tx_status={:?}, finalized={}",
             i,
-            node.bft().committed_height(),
+            node.shard_coordinator().committed_height(),
             tx_state,
             is_final
         );
@@ -711,12 +747,12 @@ fn test_e2e_cross_shard_transaction() {
     println!("\nShard 1 validators:");
     for i in 3..6 {
         let node = runner.node(i).unwrap();
-        let tx_state = node.mempool().status(&tx_hash);
-        let is_final = node.execution().is_finalized(tx_hash);
+        let tx_state = node.mempool_coordinator().status(&tx_hash);
+        let is_final = node.execution_coordinator().is_finalized(tx_hash);
         println!(
             "  Node {}: height={}, tx_status={:?}, finalized={}",
             i,
-            node.bft().committed_height(),
+            node.shard_coordinator().committed_height(),
             tx_state,
             is_final
         );
@@ -724,11 +760,23 @@ fn test_e2e_cross_shard_transaction() {
 
     // Verify both shards made progress
     let shard0_max: BlockHeight = (0..3)
-        .map(|i| runner.node(i).unwrap().bft().committed_height())
+        .map(|i| {
+            runner
+                .node(i)
+                .unwrap()
+                .shard_coordinator()
+                .committed_height()
+        })
         .max()
         .unwrap();
     let shard1_max: BlockHeight = (3..6)
-        .map(|i| runner.node(i).unwrap().bft().committed_height())
+        .map(|i| {
+            runner
+                .node(i)
+                .unwrap()
+                .shard_coordinator()
+                .committed_height()
+        })
         .max()
         .unwrap();
 
@@ -800,7 +848,13 @@ fn test_e2e_cross_shard_determinism() {
 
     let stats1 = runner1.stats().clone();
     let heights1: Vec<BlockHeight> = (0..6)
-        .map(|i| runner1.node(i).unwrap().bft().committed_height())
+        .map(|i| {
+            runner1
+                .node(i)
+                .unwrap()
+                .shard_coordinator()
+                .committed_height()
+        })
         .collect();
 
     // Second run with same seed
@@ -817,7 +871,13 @@ fn test_e2e_cross_shard_determinism() {
 
     let stats2 = runner2.stats().clone();
     let heights2: Vec<BlockHeight> = (0..6)
-        .map(|i| runner2.node(i).unwrap().bft().committed_height())
+        .map(|i| {
+            runner2
+                .node(i)
+                .unwrap()
+                .shard_coordinator()
+                .committed_height()
+        })
         .collect();
 
     // Verify identical results
@@ -893,7 +953,13 @@ fn test_e2e_transaction_throughput() {
 
     // Get final state
     let max_height: BlockHeight = (0..4)
-        .map(|i| runner.node(i).unwrap().bft().committed_height())
+        .map(|i| {
+            runner
+                .node(i)
+                .unwrap()
+                .shard_coordinator()
+                .committed_height()
+        })
         .max()
         .unwrap();
 
@@ -983,7 +1049,11 @@ fn test_wave_leader_failure_recovers_via_rotation() {
         let mut reached_terminal = false;
         for _ in 0..600 {
             runner.run_until(runner.now() + Duration::from_millis(100));
-            let status = runner.node(submit_node).unwrap().mempool().status(&tx_hash);
+            let status = runner
+                .node(submit_node)
+                .unwrap()
+                .mempool_coordinator()
+                .status(&tx_hash);
             match &status {
                 Some(s) if s.is_final() => {
                     println!("Transaction reached terminal state: {s:?}");
@@ -1001,14 +1071,24 @@ fn test_wave_leader_failure_recovers_via_rotation() {
         }
 
         let max_height: BlockHeight = (0..4)
-            .map(|i| runner.node(i).unwrap().bft().committed_height())
+            .map(|i| {
+                runner
+                    .node(i)
+                    .unwrap()
+                    .shard_coordinator()
+                    .committed_height()
+            })
             .max()
             .unwrap();
         println!(
             "Max committed height: {}, isolated node {} height: {}",
             max_height,
             isolated_node,
-            runner.node(isolated_node).unwrap().bft().committed_height()
+            runner
+                .node(isolated_node)
+                .unwrap()
+                .shard_coordinator()
+                .committed_height()
         );
 
         assert!(

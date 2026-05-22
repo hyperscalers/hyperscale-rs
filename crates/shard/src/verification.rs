@@ -1,7 +1,7 @@
 //! Async verification pipeline for block voting.
 //!
 //! Tracks QC signature, state root, transaction root, and receipt root
-//! verifications. `BftCoordinator` delegates verification bookkeeping here while
+//! verifications. `ShardCoordinator` delegates verification bookkeeping here while
 //! retaining control-flow decisions (voting, block rejection).
 //!
 //! Pure pre-vote validation helpers (header structure, timestamp bounds,
@@ -97,8 +97,8 @@ pub struct PendingStateRootVerification {
 
 /// Tracks all async verification state for block voting.
 ///
-/// `BftCoordinator` owns this as a field and delegates verification bookkeeping
-/// to it. Control-flow decisions (vote, reject block) remain in `BftCoordinator`.
+/// `ShardCoordinator` owns this as a field and delegates verification bookkeeping
+/// to it. Control-flow decisions (vote, reject block) remain in `ShardCoordinator`.
 pub struct VerificationPipeline {
     // === QC signature verification ===
     /// Block headers pending QC signature verification.
@@ -1046,7 +1046,7 @@ impl VerificationPipeline {
 
     /// Remove verification state for blocks no longer in `pending_blocks`.
     ///
-    /// Called by `BftCoordinator::cleanup_old_state()` after it has cleaned up
+    /// Called by `ShardCoordinator::cleanup_old_state()` after it has cleaned up
     /// `pending_blocks`. We use the surviving `pending_blocks` set to determine
     /// which verification state to keep.
     ///

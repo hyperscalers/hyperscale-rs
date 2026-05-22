@@ -522,12 +522,12 @@ fn test_view_change_complete_flow() {
     for node_idx in 0..4u32 {
         let node = runner.node(node_idx).expect("Node should exist");
         assert_eq!(
-            node.bft().committed_height(),
+            node.shard_coordinator().committed_height(),
             BlockHeight::new(0),
             "Node {node_idx} should be at height 0"
         );
         assert_eq!(
-            node.bft().view(),
+            node.shard_coordinator().view(),
             Round::new(0),
             "Node {node_idx} should be at round 0"
         );
@@ -540,7 +540,7 @@ fn test_view_change_complete_flow() {
     for node_idx in 0..4u32 {
         let node = runner.node(node_idx).expect("Node should exist");
         assert_eq!(
-            node.bft().view(),
+            node.shard_coordinator().view(),
             Round::new(0),
             "Node {node_idx} should still be at round 0 after 1 second"
         );
@@ -554,7 +554,7 @@ fn test_view_change_complete_flow() {
     let mut nodes_with_round_change = 0;
     for node_idx in 0..4u32 {
         let node = runner.node(node_idx).expect("Node should exist");
-        let round = node.bft().view();
+        let round = node.shard_coordinator().view();
         if round > Round::new(0) {
             nodes_with_round_change += 1;
         }
@@ -562,7 +562,7 @@ fn test_view_change_complete_flow() {
             "Node {}: BFT view/round={}, committed_height={}",
             node_idx,
             round,
-            node.bft().committed_height()
+            node.shard_coordinator().committed_height()
         );
     }
 
@@ -608,12 +608,12 @@ fn test_view_change_quorum_after_commit() {
     let mut any_committed = false;
     for node_idx in 0..4u32 {
         let node = runner.node(node_idx).expect("Node should exist");
-        if node.bft().committed_height() > BlockHeight::GENESIS {
+        if node.shard_coordinator().committed_height() > BlockHeight::GENESIS {
             any_committed = true;
             println!(
                 "Node {} has committed height {}",
                 node_idx,
-                node.bft().committed_height()
+                node.shard_coordinator().committed_height()
             );
         }
     }
@@ -634,10 +634,10 @@ fn test_view_change_quorum_after_commit() {
     for node_idx in 0..4u32 {
         let node = runner.node(node_idx).expect("Node should exist");
         println!(
-            "Node {}: committed_height={}, bft_view/round={}",
+            "Node {}: committed_height={}, shard_view/round={}",
             node_idx,
-            node.bft().committed_height(),
-            node.bft().view()
+            node.shard_coordinator().committed_height(),
+            node.shard_coordinator().view()
         );
     }
 }
@@ -692,7 +692,7 @@ fn test_proposer_rotation_after_view_change() {
 
     // Get initial view for all nodes
     let initial_views: Vec<Round> = (0..4u32)
-        .map(|i| runner.node(i).unwrap().bft().view())
+        .map(|i| runner.node(i).unwrap().shard_coordinator().view())
         .collect();
 
     println!("Initial views: {initial_views:?}");
@@ -702,7 +702,7 @@ fn test_proposer_rotation_after_view_change() {
 
     // Get final views
     let final_views: Vec<Round> = (0..4u32)
-        .map(|i| runner.node(i).unwrap().bft().view())
+        .map(|i| runner.node(i).unwrap().shard_coordinator().view())
         .collect();
 
     println!("Final views after 15 seconds: {final_views:?}");
@@ -741,11 +741,11 @@ fn test_round_reset_on_commit() {
     runner.run_until(Duration::from_secs(3));
 
     // Check committed heights and BFT state
-    // With HotStuff-2 style, round is tracked in BftCoordinator via view()
+    // With HotStuff-2 style, round is tracked in ShardCoordinator via view()
     for node_idx in 0..4u32 {
         let node = runner.node(node_idx).expect("Node should exist");
-        let committed = node.bft().committed_height();
-        let round = node.bft().view();
+        let committed = node.shard_coordinator().committed_height();
+        let round = node.shard_coordinator().view();
 
         println!("Node {node_idx}: committed={committed}, round/view={round}");
 
@@ -781,9 +781,9 @@ fn test_block_commit_diagnostic() {
         println!(
             "Node {}: committed_height={}, view={}, has_qc={}",
             node_idx,
-            node.bft().committed_height(),
-            node.bft().view(),
-            node.bft().latest_qc().is_some()
+            node.shard_coordinator().committed_height(),
+            node.shard_coordinator().view(),
+            node.shard_coordinator().latest_qc().is_some()
         );
     }
 
@@ -801,9 +801,9 @@ fn test_block_commit_diagnostic() {
         println!(
             "Node {}: committed_height={}, view={}, has_qc={}",
             node_idx,
-            node.bft().committed_height(),
-            node.bft().view(),
-            node.bft().latest_qc().is_some()
+            node.shard_coordinator().committed_height(),
+            node.shard_coordinator().view(),
+            node.shard_coordinator().latest_qc().is_some()
         );
     }
 
@@ -817,12 +817,15 @@ fn test_block_commit_diagnostic() {
 
     for node_idx in 0..4u32 {
         let node = runner.node(node_idx).expect("Node should exist");
-        let qc_height = node.bft().latest_qc().map(|qc| qc.height().inner());
+        let qc_height = node
+            .shard_coordinator()
+            .latest_qc()
+            .map(|qc| qc.height().inner());
         println!(
             "Node {}: committed_height={}, view={}, latest_qc_height={:?}",
             node_idx,
-            node.bft().committed_height(),
-            node.bft().view(),
+            node.shard_coordinator().committed_height(),
+            node.shard_coordinator().view(),
             qc_height
         );
     }
@@ -841,12 +844,15 @@ fn test_block_commit_diagnostic() {
 
     for node_idx in 0..4u32 {
         let node = runner.node(node_idx).expect("Node should exist");
-        let qc_height = node.bft().latest_qc().map(|qc| qc.height().inner());
+        let qc_height = node
+            .shard_coordinator()
+            .latest_qc()
+            .map(|qc| qc.height().inner());
         println!(
             "Node {}: committed_height={}, view={}, latest_qc_height={:?}",
             node_idx,
-            node.bft().committed_height(),
-            node.bft().view(),
+            node.shard_coordinator().committed_height(),
+            node.shard_coordinator().view(),
             qc_height
         );
     }
@@ -856,7 +862,7 @@ fn test_block_commit_diagnostic() {
 ///
 /// Runs the same simulation twice and verifies that the
 /// round numbers match exactly at every node.
-/// With HotStuff-2 style, round is tracked in `BftCoordinator` via `view()`.
+/// With HotStuff-2 style, round is tracked in `ShardCoordinator` via `view()`.
 #[test]
 fn test_round_determinism() {
     let config = test_network_config();
@@ -868,10 +874,16 @@ fn test_round_determinism() {
     runner1.run_until(Duration::from_secs(12));
 
     let views1: Vec<Round> = (0..4u32)
-        .map(|i| runner1.node(i).unwrap().bft().view())
+        .map(|i| runner1.node(i).unwrap().shard_coordinator().view())
         .collect();
     let heights1: Vec<BlockHeight> = (0..4u32)
-        .map(|i| runner1.node(i).unwrap().bft().committed_height())
+        .map(|i| {
+            runner1
+                .node(i)
+                .unwrap()
+                .shard_coordinator()
+                .committed_height()
+        })
         .collect();
 
     // Second run with same seed
@@ -880,10 +892,16 @@ fn test_round_determinism() {
     runner2.run_until(Duration::from_secs(12));
 
     let views2: Vec<Round> = (0..4u32)
-        .map(|i| runner2.node(i).unwrap().bft().view())
+        .map(|i| runner2.node(i).unwrap().shard_coordinator().view())
         .collect();
     let heights2: Vec<BlockHeight> = (0..4u32)
-        .map(|i| runner2.node(i).unwrap().bft().committed_height())
+        .map(|i| {
+            runner2
+                .node(i)
+                .unwrap()
+                .shard_coordinator()
+                .committed_height()
+        })
         .collect();
 
     // Views/rounds and heights should match exactly
@@ -924,7 +942,13 @@ fn test_block_commit_verification() {
 
     // Get committed heights for all nodes
     let committed_heights: Vec<BlockHeight> = (0..4u32)
-        .map(|i| runner.node(i).unwrap().bft().committed_height())
+        .map(|i| {
+            runner
+                .node(i)
+                .unwrap()
+                .shard_coordinator()
+                .committed_height()
+        })
         .collect();
 
     println!("Committed heights: {committed_heights:?}");
@@ -950,7 +974,7 @@ fn test_block_commit_verification() {
             runner
                 .node(i)
                 .unwrap()
-                .bft()
+                .shard_coordinator()
                 .latest_qc()
                 .map_or(BlockHeight::GENESIS, QuorumCertificate::height)
         })
@@ -991,14 +1015,20 @@ fn test_block_commit_determinism() {
     runner1.run_until(Duration::from_secs(2));
 
     let heights1: Vec<BlockHeight> = (0..4u32)
-        .map(|i| runner1.node(i).unwrap().bft().committed_height())
+        .map(|i| {
+            runner1
+                .node(i)
+                .unwrap()
+                .shard_coordinator()
+                .committed_height()
+        })
         .collect();
     let qc_heights1: Vec<Option<u64>> = (0..4u32)
         .map(|i| {
             runner1
                 .node(i)
                 .unwrap()
-                .bft()
+                .shard_coordinator()
                 .latest_qc()
                 .map(|qc| qc.height().inner())
         })
@@ -1011,14 +1041,20 @@ fn test_block_commit_determinism() {
     runner2.run_until(Duration::from_secs(2));
 
     let heights2: Vec<BlockHeight> = (0..4u32)
-        .map(|i| runner2.node(i).unwrap().bft().committed_height())
+        .map(|i| {
+            runner2
+                .node(i)
+                .unwrap()
+                .shard_coordinator()
+                .committed_height()
+        })
         .collect();
     let qc_heights2: Vec<Option<u64>> = (0..4u32)
         .map(|i| {
             runner2
                 .node(i)
                 .unwrap()
-                .bft()
+                .shard_coordinator()
                 .latest_qc()
                 .map(|qc| qc.height().inner())
         })
@@ -1062,7 +1098,7 @@ fn test_sequential_commit() {
 
         for node_idx in 0..4u32 {
             let node = runner.node(node_idx).expect("Node should exist");
-            let current_committed = node.bft().committed_height();
+            let current_committed = node.shard_coordinator().committed_height();
 
             // Committed height should never go backwards
             // Note: We're checking a snapshot, not continuous monitoring
@@ -1075,7 +1111,13 @@ fn test_sequential_commit() {
     // With targeted voting, nodes may differ by at most 1 committed height
     // at any snapshot (the last proposer learns about its QC via the next header).
     let final_heights: Vec<BlockHeight> = (0..4u32)
-        .map(|i| runner.node(i).unwrap().bft().committed_height())
+        .map(|i| {
+            runner
+                .node(i)
+                .unwrap()
+                .shard_coordinator()
+                .committed_height()
+        })
         .collect();
 
     let max_h = *final_heights.iter().max().unwrap();
@@ -1111,7 +1153,11 @@ fn test_consensus_throughput() {
     // Run for 10 seconds
     runner.run_until(Duration::from_secs(10));
 
-    let committed_height = runner.node(0).unwrap().bft().committed_height();
+    let committed_height = runner
+        .node(0)
+        .unwrap()
+        .shard_coordinator()
+        .committed_height();
     let stats = runner.stats();
 
     #[allow(clippy::cast_precision_loss)] // headline throughput metric for human-readable output
@@ -1194,21 +1240,21 @@ fn test_mempool_to_block_integration() {
     // Check that transactions are in node 0's mempool
     let node0 = runner.node(0).expect("Node 0 should exist");
     assert!(
-        node0.mempool().has_transaction(&tx1_hash),
+        node0.mempool_coordinator().has_transaction(&tx1_hash),
         "Transaction 1 should be in mempool"
     );
     assert!(
-        node0.mempool().has_transaction(&tx2_hash),
+        node0.mempool_coordinator().has_transaction(&tx2_hash),
         "Transaction 2 should be in mempool"
     );
     assert!(
-        node0.mempool().has_transaction(&tx3_hash),
+        node0.mempool_coordinator().has_transaction(&tx3_hash),
         "Transaction 3 should be in mempool"
     );
 
     // Transactions submitted at ~50ms with 150ms min dwell time are not yet ready
     let ready_count = node0
-        .mempool()
+        .mempool_coordinator()
         .ready_transactions(100, 0, 0, LocalTimestamp::ZERO)
         .len();
     assert_eq!(
@@ -1217,21 +1263,28 @@ fn test_mempool_to_block_integration() {
     );
 
     println!("Mempool state before dwell time elapses:");
-    println!("  Total transactions: {}", node0.mempool().len());
+    println!(
+        "  Total transactions: {}",
+        node0.mempool_coordinator().len()
+    );
     println!("  Ready transactions: {ready_count}");
 
     // One second is enough to commit a block past the dwell-time barrier.
     runner.run_until(Duration::from_secs(1));
 
-    let committed_height = runner.node(0).unwrap().bft().committed_height();
+    let committed_height = runner
+        .node(0)
+        .unwrap()
+        .shard_coordinator()
+        .committed_height();
     println!("\nAfter 2 seconds:");
     println!("  Committed height: {committed_height}");
 
     // Transactions should now be marked as committed in the mempool
     let node0 = runner.node(0).expect("Node 0 should exist");
-    let status1 = node0.mempool().status(&tx1_hash);
-    let status2 = node0.mempool().status(&tx2_hash);
-    let status3 = node0.mempool().status(&tx3_hash);
+    let status1 = node0.mempool_coordinator().status(&tx1_hash);
+    let status2 = node0.mempool_coordinator().status(&tx2_hash);
+    let status3 = node0.mempool_coordinator().status(&tx3_hash);
 
     println!("  Transaction 1 status: {status1:?}");
     println!("  Transaction 2 status: {status2:?}");
@@ -1281,7 +1334,10 @@ fn test_execution_flow() {
     // Check transaction completed the full execution flow using the status cache.
     // The cache captures all emitted statuses, even after eviction from mempool.
     let status = runner.tx_status(0, &tx_hash);
-    println!("  Committed height: {}", node0.bft().committed_height());
+    println!(
+        "  Committed height: {}",
+        node0.shard_coordinator().committed_height()
+    );
     println!("  Tx status: {status:?}");
 
     // Transaction should reach Completed state (certificate committed in block).
@@ -1294,7 +1350,7 @@ fn test_execution_flow() {
 
     // Verify blocks were committed (transaction was processed)
     assert!(
-        node0.bft().committed_height() > BlockHeight::GENESIS,
+        node0.shard_coordinator().committed_height() > BlockHeight::GENESIS,
         "Should have committed blocks"
     );
 }
@@ -1326,7 +1382,11 @@ fn test_transaction_gossip() {
     // Run briefly - transaction should be in node 0's mempool
     runner.run_until(Duration::from_millis(20));
 
-    let node0_has_tx = runner.node(0).unwrap().mempool().has_transaction(&tx_hash);
+    let node0_has_tx = runner
+        .node(0)
+        .unwrap()
+        .mempool_coordinator()
+        .has_transaction(&tx_hash);
     assert!(node0_has_tx, "Node 0 should have the transaction");
 
     // Note: Transaction gossip requires the mempool to emit BroadcastToShard actions
@@ -1344,7 +1404,7 @@ fn test_transaction_gossip() {
         let has_tx = runner
             .node(node_idx)
             .unwrap()
-            .mempool()
+            .mempool_coordinator()
             .has_transaction(&tx_hash);
         println!("Node {node_idx} has transaction: {has_tx}");
     }
@@ -1384,12 +1444,12 @@ fn test_multi_shard_initialization() {
     for node_idx in 0..4u32 {
         let node = runner.node(node_idx).expect("Node should exist");
         assert_eq!(
-            node.shard().inner(),
+            node.shard_id().inner(),
             0,
             "Node {node_idx} should be in shard 0"
         );
         assert_eq!(
-            node.bft().committed_height(),
+            node.shard_coordinator().committed_height(),
             BlockHeight::new(0),
             "Node {node_idx} should be at genesis"
         );
@@ -1399,12 +1459,12 @@ fn test_multi_shard_initialization() {
     for node_idx in 4..8u32 {
         let node = runner.node(node_idx).expect("Node should exist");
         assert_eq!(
-            node.shard().inner(),
+            node.shard_id().inner(),
             1,
             "Node {node_idx} should be in shard 1"
         );
         assert_eq!(
-            node.bft().committed_height(),
+            node.shard_coordinator().committed_height(),
             BlockHeight::new(0),
             "Node {node_idx} should be at genesis"
         );
@@ -1428,12 +1488,20 @@ fn test_multi_shard_consensus_progress() {
     let mut shard1_heights: Vec<BlockHeight> = Vec::new();
 
     for node_idx in 0..4u32 {
-        let height = runner.node(node_idx).unwrap().bft().committed_height();
+        let height = runner
+            .node(node_idx)
+            .unwrap()
+            .shard_coordinator()
+            .committed_height();
         shard0_heights.push(height);
     }
 
     for node_idx in 4..8u32 {
-        let height = runner.node(node_idx).unwrap().bft().committed_height();
+        let height = runner
+            .node(node_idx)
+            .unwrap()
+            .shard_coordinator()
+            .committed_height();
         shard1_heights.push(height);
     }
 
@@ -1609,7 +1677,13 @@ fn test_multi_shard_determinism() {
     runner1.run_until(Duration::from_secs(3));
 
     let heights1: Vec<BlockHeight> = (0..8u32)
-        .map(|i| runner1.node(i).unwrap().bft().committed_height())
+        .map(|i| {
+            runner1
+                .node(i)
+                .unwrap()
+                .shard_coordinator()
+                .committed_height()
+        })
         .collect();
     let stats1 = runner1.stats().clone();
 
@@ -1619,7 +1693,13 @@ fn test_multi_shard_determinism() {
     runner2.run_until(Duration::from_secs(3));
 
     let heights2: Vec<BlockHeight> = (0..8u32)
-        .map(|i| runner2.node(i).unwrap().bft().committed_height())
+        .map(|i| {
+            runner2
+                .node(i)
+                .unwrap()
+                .shard_coordinator()
+                .committed_height()
+        })
         .collect();
     let stats2 = runner2.stats().clone();
 
@@ -1660,7 +1740,11 @@ fn test_consensus_with_isolated_node() {
 
     // Run normally for 1 second to establish baseline
     runner.run_until(Duration::from_secs(1));
-    let height_before = runner.node(0).unwrap().bft().committed_height();
+    let height_before = runner
+        .node(0)
+        .unwrap()
+        .shard_coordinator()
+        .committed_height();
     println!("Height before isolation: {height_before}");
 
     // Isolate node 0 (it can neither send nor receive)
@@ -1673,14 +1757,30 @@ fn test_consensus_with_isolated_node() {
     runner.run_until(Duration::from_secs(6));
 
     // Check that non-isolated nodes made progress
-    let height_node1 = runner.node(1).unwrap().bft().committed_height();
-    let height_node2 = runner.node(2).unwrap().bft().committed_height();
-    let height_node3 = runner.node(3).unwrap().bft().committed_height();
+    let height_node1 = runner
+        .node(1)
+        .unwrap()
+        .shard_coordinator()
+        .committed_height();
+    let height_node2 = runner
+        .node(2)
+        .unwrap()
+        .shard_coordinator()
+        .committed_height();
+    let height_node3 = runner
+        .node(3)
+        .unwrap()
+        .shard_coordinator()
+        .committed_height();
 
     println!("Heights after isolation:");
     println!(
         "  Node 0 (isolated): {}",
-        runner.node(0).unwrap().bft().committed_height()
+        runner
+            .node(0)
+            .unwrap()
+            .shard_coordinator()
+            .committed_height()
     );
     println!("  Node 1: {height_node1}");
     println!("  Node 2: {height_node2}");
@@ -1731,6 +1831,7 @@ fn test_consensus_with_isolated_node() {
 /// during partition recovery. Full recovery may require additional sync mechanisms.
 #[traced_test]
 #[test]
+#[allow(clippy::too_many_lines)] // assertion-heavy partition-recovery scenario
 fn test_partition_recovery_hotstuff2() {
     let config = test_network_config();
     let mut runner = SimulationRunner::new(&config, 42);
@@ -1739,7 +1840,11 @@ fn test_partition_recovery_hotstuff2() {
 
     // Run normally for 1 second
     runner.run_until(Duration::from_secs(1));
-    let height_before = runner.node(0).unwrap().bft().committed_height();
+    let height_before = runner
+        .node(0)
+        .unwrap()
+        .shard_coordinator()
+        .committed_height();
     println!("Height before partition: {height_before}");
 
     // Create a partition: nodes 0,1 can't talk to nodes 2,3
@@ -1748,15 +1853,19 @@ fn test_partition_recovery_hotstuff2() {
 
     // Run during partition (1 second) - progress should halt (can't form QC with 2/4)
     runner.run_until(Duration::from_secs(2));
-    let height_during = runner.node(0).unwrap().bft().committed_height();
+    let height_during = runner
+        .node(0)
+        .unwrap()
+        .shard_coordinator()
+        .committed_height();
     println!("Height during partition: {height_during}");
 
     // Debug: check BFT state (HotStuff-2 style - round tracked via view())
-    let bft = runner.node(0).unwrap().bft();
+    let shard = runner.node(0).unwrap().shard_coordinator();
     println!(
         "BFT state: committed_height={}, view/round={}",
-        bft.committed_height(),
-        bft.view()
+        shard.committed_height(),
+        shard.view()
     );
 
     // Heal the partition
@@ -1766,15 +1875,23 @@ fn test_partition_recovery_hotstuff2() {
     // Check heights on all nodes before continuing
     println!("Node heights before continuing:");
     for i in 0..4u32 {
-        let h = runner.node(i).unwrap().bft().committed_height();
-        let v = runner.node(i).unwrap().bft().view();
+        let h = runner
+            .node(i)
+            .unwrap()
+            .shard_coordinator()
+            .committed_height();
+        let v = runner.node(i).unwrap().shard_coordinator().view();
         println!("  Node {i}: height={h}, view={v}");
     }
 
     // Run for longer to allow round advancement and recovery
     // Round advancement timeout is 5 seconds by default
     runner.run_until(Duration::from_secs(12));
-    let height_after = runner.node(0).unwrap().bft().committed_height();
+    let height_after = runner
+        .node(0)
+        .unwrap()
+        .shard_coordinator()
+        .committed_height();
     println!(
         "Height after heal: {} (sim time {:?})",
         height_after,
@@ -1785,9 +1902,9 @@ fn test_partition_recovery_hotstuff2() {
     println!("Node heights/BFT state after:");
     for i in 0..4u32 {
         let node = runner.node(i).unwrap();
-        let h = node.bft().committed_height();
-        let v = node.bft().view();
-        println!("  Node {i}: bft(height={h}, view/round={v})");
+        let h = node.shard_coordinator().committed_height();
+        let v = node.shard_coordinator().view();
+        println!("  Node {i}: shard(height={h}, view/round={v})");
     }
 
     let stats = runner.stats();
@@ -1806,7 +1923,13 @@ fn test_partition_recovery_hotstuff2() {
 
     // Collect heights after partition heals
     let post_heal_heights: Vec<BlockHeight> = (0..4u32)
-        .map(|i| runner.node(i).unwrap().bft().committed_height())
+        .map(|i| {
+            runner
+                .node(i)
+                .unwrap()
+                .shard_coordinator()
+                .committed_height()
+        })
         .collect();
 
     // Verify partition state
@@ -1827,7 +1950,7 @@ fn test_partition_recovery_hotstuff2() {
 
     // All nodes should have advanced rounds during the timeout period
     let all_views: Vec<Round> = (0..4u32)
-        .map(|i| runner.node(i).unwrap().bft().view())
+        .map(|i| runner.node(i).unwrap().shard_coordinator().view())
         .collect();
     println!("Final views: {all_views:?}");
 
@@ -1876,7 +1999,11 @@ fn test_consensus_during_partition() {
 
     // Run normally for 1 second
     runner.run_until(Duration::from_secs(1));
-    let height_before = runner.node(0).unwrap().bft().committed_height();
+    let height_before = runner
+        .node(0)
+        .unwrap()
+        .shard_coordinator()
+        .committed_height();
     println!("Height before partition: {height_before}");
 
     // Create a partition: nodes 0,1 can't talk to nodes 2,3
@@ -1885,7 +2012,11 @@ fn test_consensus_during_partition() {
 
     // Run during partition - neither side should make progress (need 3/4 for quorum)
     runner.run_until(Duration::from_secs(2));
-    let height_during_partition = runner.node(0).unwrap().bft().committed_height();
+    let height_during_partition = runner
+        .node(0)
+        .unwrap()
+        .shard_coordinator()
+        .committed_height();
     println!(
         "Height during partition: {height_during_partition} (expected ~{height_before} due to no quorum)"
     );
@@ -1941,7 +2072,13 @@ fn test_packet_loss_application() {
     runner.run_until(Duration::from_secs(3));
 
     let heights: Vec<BlockHeight> = (0..4u32)
-        .map(|i| runner.node(i).unwrap().bft().committed_height())
+        .map(|i| {
+            runner
+                .node(i)
+                .unwrap()
+                .shard_coordinator()
+                .committed_height()
+        })
         .collect();
 
     println!("Heights with 10% packet loss: {heights:?}");
@@ -2000,7 +2137,13 @@ fn test_packet_loss_determinism() {
     runner1.run_until(Duration::from_secs(3));
     let stats1 = runner1.stats().clone();
     let heights1: Vec<BlockHeight> = (0..4u32)
-        .map(|i| runner1.node(i).unwrap().bft().committed_height())
+        .map(|i| {
+            runner1
+                .node(i)
+                .unwrap()
+                .shard_coordinator()
+                .committed_height()
+        })
         .collect();
 
     // Run 2
@@ -2009,7 +2152,13 @@ fn test_packet_loss_determinism() {
     runner2.run_until(Duration::from_secs(3));
     let stats2 = runner2.stats().clone();
     let heights2: Vec<BlockHeight> = (0..4u32)
-        .map(|i| runner2.node(i).unwrap().bft().committed_height())
+        .map(|i| {
+            runner2
+                .node(i)
+                .unwrap()
+                .shard_coordinator()
+                .committed_height()
+        })
         .collect();
 
     // Should be identical
@@ -2050,7 +2199,13 @@ fn test_sync_triggers_when_behind() {
 
     // Check all nodes have made progress
     let heights: Vec<BlockHeight> = (0..4u32)
-        .map(|i| runner.node(i).unwrap().bft().committed_height())
+        .map(|i| {
+            runner
+                .node(i)
+                .unwrap()
+                .shard_coordinator()
+                .committed_height()
+        })
         .collect();
 
     println!("Initial heights: {heights:?}");
@@ -2090,7 +2245,13 @@ fn test_sync_detection_threshold() {
 
     // All nodes should be at the same height during normal operation
     let heights: Vec<BlockHeight> = (0..4u32)
-        .map(|i| runner.node(i).unwrap().bft().committed_height())
+        .map(|i| {
+            runner
+                .node(i)
+                .unwrap()
+                .shard_coordinator()
+                .committed_height()
+        })
         .collect();
 
     let max_height = *heights.iter().max().unwrap();
@@ -2121,7 +2282,11 @@ fn test_committed_blocks_stored_for_sync() {
     runner.run_until(Duration::from_secs(8));
 
     // Check that node 0 has committed blocks
-    let height = runner.node(0).unwrap().bft().committed_height();
+    let height = runner
+        .node(0)
+        .unwrap()
+        .shard_coordinator()
+        .committed_height();
     assert!(
         height >= BlockHeight::new(5),
         "Should have committed at least 5 blocks"
@@ -2145,7 +2310,7 @@ fn test_sync_state_isolation() {
     for i in 0..4u32 {
         let node = runner.node(i).unwrap();
         assert_eq!(
-            node.bft().committed_height(),
+            node.shard_coordinator().committed_height(),
             BlockHeight::new(0),
             "Fresh node {i} should be at height 0"
         );
@@ -2177,7 +2342,11 @@ fn test_isolated_node_divergence() {
     // Run normally first
     runner.run_until(Duration::from_secs(1));
 
-    let initial_height = runner.node(0).unwrap().bft().committed_height();
+    let initial_height = runner
+        .node(0)
+        .unwrap()
+        .shard_coordinator()
+        .committed_height();
     println!("Initial height: {initial_height}");
 
     // Isolate node 3 - it can't receive from anyone
@@ -2190,7 +2359,13 @@ fn test_isolated_node_divergence() {
 
     // Check heights
     let heights_during: Vec<BlockHeight> = (0..4u32)
-        .map(|i| runner.node(i).unwrap().bft().committed_height())
+        .map(|i| {
+            runner
+                .node(i)
+                .unwrap()
+                .shard_coordinator()
+                .committed_height()
+        })
         .collect();
     println!("Heights during isolation: {heights_during:?}");
 
@@ -2228,7 +2403,11 @@ fn test_isolated_node_divergence() {
     println!("Heights before recovery:");
     for i in 0..4u32 {
         let node = runner.node(i).unwrap();
-        println!("  Node {}: height={}", i, node.bft().committed_height());
+        println!(
+            "  Node {}: height={}",
+            i,
+            node.shard_coordinator().committed_height()
+        );
     }
 
     // Run to allow recovery attempts - give more time for sync
@@ -2238,12 +2417,22 @@ fn test_isolated_node_divergence() {
     println!("Heights after recovery:");
     for i in 0..4u32 {
         let node = runner.node(i).unwrap();
-        println!("  Node {}: height={}", i, node.bft().committed_height());
+        println!(
+            "  Node {}: height={}",
+            i,
+            node.shard_coordinator().committed_height()
+        );
     }
 
     // Check final heights
     let final_heights: Vec<BlockHeight> = (0..4u32)
-        .map(|i| runner.node(i).unwrap().bft().committed_height())
+        .map(|i| {
+            runner
+                .node(i)
+                .unwrap()
+                .shard_coordinator()
+                .committed_height()
+        })
         .collect();
     println!("Final heights: {final_heights:?}");
 

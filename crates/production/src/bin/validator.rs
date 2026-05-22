@@ -56,7 +56,6 @@ use anyhow::{Context, Result, bail};
 use arc_swap::ArcSwap;
 use clap::Parser;
 use hex::{decode as hex_decode, encode as hex_encode};
-use hyperscale_bft::BftConfig;
 use hyperscale_dispatch_pooled::{PooledDispatch, ThreadPoolConfig};
 use hyperscale_engine::GenesisConfig as EngineGenesisConfig;
 use hyperscale_mempool::MempoolConfig;
@@ -66,6 +65,7 @@ use hyperscale_production::{
     ProductionRunner, SyncStatus, TelemetryConfig, TelemetryGuard, VnodeConfig, init_telemetry,
 };
 use hyperscale_provisions::ProvisionConfig;
+use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage_rocksdb::{
     CompressionType as RocksCompressionType, RocksDbConfig, RocksDbStorage,
 };
@@ -1120,7 +1120,7 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
     }
 
     let thread_config = build_thread_pool_config(&config.threads);
-    let bft_config = BftConfig::default();
+    let shard_config = ShardConsensusConfig::default();
     let network_config = build_network_config(&config.network)?;
     let rocksdb_config = build_rocksdb_config(&config.storage);
 
@@ -1193,7 +1193,7 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
     // The runner is built before the RPC server because it owns the crossbeam
     // event channel the RPC server submits transactions through.
     let mut runner_builder =
-        ProductionRunner::builder(vnode_configs, bft_config, storages, network_config)
+        ProductionRunner::builder(vnode_configs, shard_config, storages, network_config)
             .dispatch(dispatch)
             .rpc_status(rpc_node_status.clone())
             .mempool_snapshot(rpc_mempool_snapshot.clone())

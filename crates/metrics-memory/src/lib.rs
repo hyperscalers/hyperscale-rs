@@ -184,9 +184,9 @@ impl MetricsRecorder for MemoryRecorder {
         self.set("block_height", Some(&shard.to_string()), height as f64);
     }
 
-    fn set_bft_round(&self, shard: u64, validator_id: u64, round: u64) {
+    fn set_shard_round(&self, shard: u64, validator_id: u64, round: u64) {
         self.set(
-            "bft_round",
+            "shard_round",
             Some(&format!("{shard}:{validator_id}")),
             round as f64,
         );

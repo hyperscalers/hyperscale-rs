@@ -14,10 +14,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fixtures::TestFixtures;
-use hyperscale_bft::BftConfig;
 use hyperscale_network::{HandlerRegistry, ValidatorKeyMap};
 use hyperscale_network_libp2p::{Libp2pAdapter, Libp2pConfig};
 use hyperscale_production::{ProductionRunner, VnodeConfig};
+use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage_rocksdb::RocksDbStorage;
 use hyperscale_types::{Bls12381G1PrivateKey, ShardGroupId, ValidatorId, generate_bls_keypair};
 use libp2p::identity::Keypair;
@@ -465,7 +465,7 @@ async fn test_production_runner_with_network() {
             topology: fixtures.topology(0),
             signing_key: fixtures.signing_key(0),
         }],
-        BftConfig::default(),
+        ShardConsensusConfig::default(),
         HashMap::from([(ShardGroupId::new(0), storage)]),
         network_config,
     )
@@ -527,7 +527,7 @@ async fn test_graceful_shutdown() {
             topology: fixtures.topology(0),
             signing_key: fixtures.signing_key(0),
         }],
-        BftConfig::default(),
+        ShardConsensusConfig::default(),
         HashMap::from([(ShardGroupId::new(0), storage)]),
         network_config,
     )
@@ -600,7 +600,7 @@ async fn test_v2_same_shard_production_runner_binds_all_vnodes() {
     ];
     let mut runner0 = ProductionRunner::builder(
         host0_vnodes,
-        BftConfig::default(),
+        ShardConsensusConfig::default(),
         HashMap::from([(ShardGroupId::new(0), storage0)]),
         network_config0,
     )
@@ -637,7 +637,7 @@ async fn test_v2_same_shard_production_runner_binds_all_vnodes() {
     ];
     let mut runner1 = ProductionRunner::builder(
         host1_vnodes,
-        BftConfig::default(),
+        ShardConsensusConfig::default(),
         HashMap::from([(ShardGroupId::new(0), storage1)]),
         network_config1,
     )
@@ -746,7 +746,7 @@ async fn test_v2_different_shard_production_runner_binds_all_vnodes() {
     ];
     let mut runner0 = ProductionRunner::builder(
         host0_vnodes,
-        BftConfig::default(),
+        ShardConsensusConfig::default(),
         HashMap::from([
             (ShardGroupId::new(0), host0_s0),
             (ShardGroupId::new(1), host0_s1),
@@ -786,7 +786,7 @@ async fn test_v2_different_shard_production_runner_binds_all_vnodes() {
     ];
     let mut runner1 = ProductionRunner::builder(
         host1_vnodes,
-        BftConfig::default(),
+        ShardConsensusConfig::default(),
         HashMap::from([
             (ShardGroupId::new(0), host1_s0),
             (ShardGroupId::new(1), host1_s1),

@@ -902,7 +902,7 @@ where
             ctx.network.broadcast_global(&gossip);
         }
 
-        _ => unreachable!("hyperscale_bft::handle_action called with non-BFT action"),
+        _ => unreachable!("hyperscale_shard::handle_action called with non-BFT action"),
     }
 }
 

@@ -139,7 +139,11 @@ where
         // Tombstones are identical across same-shard vnodes (deterministic
         // mempool processing) — peek at vnode 0's set as representative.
         if !self.io.caches.tx_store.contains(&tx_hash)
-            && !self.vnode(0).state.mempool().is_tombstoned(&tx_hash)
+            && !self
+                .vnode(0)
+                .state
+                .mempool_coordinator()
+                .is_tombstoned(&tx_hash)
         {
             self.io.pending_validation.insert(tx_hash);
             self.queue_validation(tx);

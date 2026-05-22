@@ -5048,7 +5048,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "BFT subsystem memory usage by collection",
+      "description": "Shard consensus subsystem memory usage by collection",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -5126,12 +5126,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "avg by (collection) (hyperscale_memory_bft_collections)",
+          "expr": "avg by (collection) (hyperscale_memory_shard_collections)",
           "legendFormat": "{{collection}}",
           "refId": "A"
         }
       ],
-      "title": "BFT Memory (avg)",
+      "title": "Shard Consensus Memory (avg)",
       "type": "timeseries"
     },
     {

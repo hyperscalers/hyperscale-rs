@@ -9,7 +9,6 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use crossbeam::channel::{Receiver, Sender, unbounded};
-use hyperscale_bft::BftConfig;
 use hyperscale_core::{ProtocolEvent, TimerId};
 use hyperscale_dispatch_sync::SyncDispatch;
 use hyperscale_engine::{GenesisConfig, RadixExecutor, TransactionValidation};
@@ -22,6 +21,7 @@ use hyperscale_network_memory::{
 use hyperscale_node::shard_loop::{ShardEvent, StepOutput};
 use hyperscale_node::{NodeConfig, NodeHost, NodeStateMachine, TimerOp, VnodeInit, timer_event};
 use hyperscale_provisions::{ProvisionConfig, ProvisionStore};
+use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{ChainReader, RecoveredState};
 use hyperscale_storage_memory::SimStorage;
 use hyperscale_topology::TopologyCoordinator;
@@ -270,7 +270,7 @@ impl SimulationRunner {
 
                     let state = NodeStateMachine::new(
                         topology_state,
-                        &BftConfig::default(),
+                        &ShardConsensusConfig::default(),
                         RecoveredState::default(),
                         MempoolConfig::default(),
                         ProvisionConfig::default(),

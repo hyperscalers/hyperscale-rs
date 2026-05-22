@@ -1,7 +1,7 @@
 //! Sync coordination for catching up to the network.
 //!
 //! Manages the sync state flag, synced block buffering, and pending
-//! synced block QC verifications. `BftCoordinator` owns this as a field and
+//! synced block QC verifications. `ShardCoordinator` owns this as a field and
 //! delegates sync-specific bookkeeping here.
 
 use std::collections::{BTreeMap, HashMap};
@@ -54,9 +54,9 @@ pub struct PendingSyncedBlockVerification {
 
 /// Sync block coordination state.
 ///
-/// `BftCoordinator` owns this as a field and delegates sync-specific bookkeeping
+/// `ShardCoordinator` owns this as a field and delegates sync-specific bookkeeping
 /// to it. Core protocol state changes (`committed_height`, `latest_qc`) remain
-/// on `BftCoordinator`.
+/// on `ShardCoordinator`.
 pub struct BlockSyncManager {
     /// Whether we are currently syncing (catching up to the network).
     syncing: bool,
@@ -603,7 +603,7 @@ impl BlockSyncManager {
     /// - Block present with a pending commit but the gap exceeds 10 → the
     ///   commit flow is stalled (block hashes may have diverged after a
     ///   prior sync); sync to recover.
-    #[allow(clippy::too_many_arguments)] // `BftCoordinator` owns each input; bundling them just adds a struct without consolidating ownership
+    #[allow(clippy::too_many_arguments)] // `ShardCoordinator` owns each input; bundling them just adds a struct without consolidating ownership
     pub fn health_check(
         &mut self,
         topology: &TopologySnapshot,

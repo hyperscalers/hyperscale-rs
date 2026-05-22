@@ -114,7 +114,7 @@ where
             for vnode_idx in 0..self.vnodes_len(shard) {
                 let vnode = self.vnode(shard, vnode_idx);
                 let state = &vnode.state;
-                let mempool = state.mempool();
+                let mempool = state.mempool_coordinator();
                 let contention = mempool.lock_contention_stats();
                 #[allow(clippy::cast_possible_truncation)]
                 let (pending, in_flight) = (
@@ -125,15 +125,17 @@ where
                     vnode.validator_id,
                     VnodeStatus {
                         shard,
-                        committed_height: state.bft().committed_height(),
-                        view: state.bft().view().inner(),
+                        committed_height: state.shard_coordinator().committed_height(),
+                        view: state.shard_coordinator().view().inner(),
                         state_root: state.last_committed_jmt_root(),
                         mempool_pending: pending,
                         mempool_in_flight: in_flight,
                         mempool_total: mempool.len(),
                         accepting_rpc_transactions: !mempool.at_in_flight_limit(),
                         at_pending_limit: mempool.at_pending_limit(),
-                        remote_shard_in_flight: state.remote_headers().remote_shard_in_flight(),
+                        remote_shard_in_flight: state
+                            .remote_headers_coordinator()
+                            .remote_shard_in_flight(),
                         remote_congestion_threshold,
                     },
                 );

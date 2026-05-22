@@ -6,7 +6,7 @@
 //! # Data Availability Guarantee
 //!
 //! Validators only vote for blocks after receiving ALL transaction and certificate
-//! data. This is enforced in [`BftCoordinator::on_block_header`] which checks `is_complete()`
+//! data. This is enforced in [`ShardCoordinator::on_block_header`] which checks `is_complete()`
 //! before voting. Incomplete blocks wait for data via gossip or fetch.
 //!
 //! This provides a strong DA guarantee: if a QC forms, at least 2f+1 validators have
@@ -20,7 +20,7 @@ use hyperscale_types::{
 
 /// BFT statistics for monitoring.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct BftStats {
+pub struct ShardStats {
     /// Total number of view changes (round advances due to local
     /// leader-activity timeout — i.e. *we* timed out).
     pub view_changes: u64,
@@ -38,7 +38,7 @@ pub struct BftStats {
 
 /// BFT memory statistics for monitoring collection sizes.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct BftMemoryStats {
+pub struct ShardMemoryStats {
     /// Pending blocks awaiting transaction / wave / provision arrival.
     pub pending_blocks: usize,
     /// Per-block vote sets aggregating received votes.
@@ -92,7 +92,7 @@ use crate::block_sync::{
 use crate::chain_view::ChainView;
 use crate::commit_dedup::CommitDedupIndex;
 use crate::commit_pipeline::CommitPipeline;
-use crate::config::BftConfig;
+use crate::config::ShardConsensusConfig;
 use crate::deferred_qc::DeferredQc;
 use crate::lookups::{committee_public_keys, vote_recipients};
 use crate::pending::{PendingBlock, PendingBlocks};
@@ -117,7 +117,7 @@ use crate::vote_keeper::{LockDecision, VoteKeeper};
 /// 3. **Block Vote Received** → Collect votes, form QC when quorum reached
 /// 4. **QC Formed** → Update chain state, commit if ready (two-chain rule)
 /// 5. **View Change Timer** → Initiate view change if no progress
-pub struct BftCoordinator {
+pub struct ShardCoordinator {
     // ═══════════════════════════════════════════════════════════════════════════
     // Chain State
     // ═══════════════════════════════════════════════════════════════════════════
@@ -177,7 +177,7 @@ pub struct BftCoordinator {
     // ═══════════════════════════════════════════════════════════════════════════
     // Configuration
     // ═══════════════════════════════════════════════════════════════════════════
-    config: BftConfig,
+    config: ShardConsensusConfig,
 
     // ═══════════════════════════════════════════════════════════════════════════
     // Time
@@ -189,9 +189,9 @@ pub struct BftCoordinator {
     now: LocalTimestamp,
 }
 
-impl std::fmt::Debug for BftCoordinator {
+impl std::fmt::Debug for ShardCoordinator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BftCoordinator")
+        f.debug_struct("ShardCoordinator")
             .field("view", &self.view_change.view)
             .field("committed_height", &self.committed_height)
             .field("pending_blocks", &self.pending_blocks.len())
@@ -200,7 +200,7 @@ impl std::fmt::Debug for BftCoordinator {
     }
 }
 
-impl BftCoordinator {
+impl ShardCoordinator {
     /// Create a new BFT state machine.
     ///
     /// # Arguments
@@ -208,7 +208,7 @@ impl BftCoordinator {
     /// * `config` - BFT configuration
     /// * `recovered` - State recovered from storage. Use `RecoveredState::default()` for fresh start.
     #[must_use]
-    pub fn new(config: BftConfig, recovered: RecoveredState) -> Self {
+    pub fn new(config: ShardConsensusConfig, recovered: RecoveredState) -> Self {
         Self {
             view_change: ViewChangeController::new(),
             committed_height: recovered.committed_height,
@@ -3026,8 +3026,8 @@ impl BftCoordinator {
 
     /// Get BFT statistics for monitoring.
     #[must_use]
-    pub const fn stats(&self) -> BftStats {
-        BftStats {
+    pub const fn stats(&self) -> ShardStats {
+        ShardStats {
             view_changes: self.view_change.view_changes,
             view_syncs: self.view_change.view_syncs,
             current_round: self.view_change.view.inner(),
@@ -3037,8 +3037,8 @@ impl BftCoordinator {
 
     /// Get BFT memory statistics for monitoring collection sizes.
     #[must_use]
-    pub fn memory_stats(&self) -> BftMemoryStats {
-        BftMemoryStats {
+    pub fn memory_stats(&self) -> ShardMemoryStats {
+        ShardMemoryStats {
             pending_blocks: self.pending_blocks.len(),
             vote_sets: self.votes.vote_sets_len(),
             pending_commits: self.commits.out_of_order_len(),
@@ -3111,7 +3111,7 @@ impl BftCoordinator {
 
     /// Get the BFT configuration.
     #[must_use]
-    pub const fn config(&self) -> &BftConfig {
+    pub const fn config(&self) -> &ShardConsensusConfig {
         &self.config
     }
 
@@ -3187,7 +3187,7 @@ mod tests {
     use super::*;
     use crate::validation::validate_no_duplicate_transactions;
 
-    fn install_complete_block(state: &mut BftCoordinator, block: &Block) {
+    fn install_complete_block(state: &mut ShardCoordinator, block: &Block) {
         let mut pending =
             PendingBlock::from_complete_block(block, vec![], vec![], LocalTimestamp::ZERO);
         pending
@@ -3196,18 +3196,18 @@ mod tests {
         state.pending_blocks.insert(pending);
     }
 
-    fn make_test_state() -> (BftCoordinator, TopologySnapshot) {
+    fn make_test_state() -> (ShardCoordinator, TopologySnapshot) {
         make_test_state_with_validators(4)
     }
 
-    fn make_test_state_with_validators(n: usize) -> (BftCoordinator, TopologySnapshot) {
-        make_test_state_with_config(n, BftConfig::default())
+    fn make_test_state_with_validators(n: usize) -> (ShardCoordinator, TopologySnapshot) {
+        make_test_state_with_config(n, ShardConsensusConfig::default())
     }
 
     fn make_test_state_with_config(
         n: usize,
-        config: BftConfig,
-    ) -> (BftCoordinator, TopologySnapshot) {
+        config: ShardConsensusConfig,
+    ) -> (ShardCoordinator, TopologySnapshot) {
         let keys: Vec<Bls12381G1PrivateKey> = (0..n).map(|_| generate_bls_keypair()).collect();
 
         let validators: Vec<ValidatorInfo> = keys
@@ -3222,7 +3222,7 @@ mod tests {
         let validator_set = ValidatorSet::new(validators);
         let topology = TopologySnapshot::new(ValidatorId::new(0), 1, validator_set);
 
-        let state = BftCoordinator::new(config, RecoveredState::default());
+        let state = ShardCoordinator::new(config, RecoveredState::default());
         (state, topology)
     }
 
@@ -3773,18 +3773,22 @@ mod tests {
     /// committee index 0. For tests that need a different local index, call
     /// [`make_multi_validator_state_at`]. For tests that need to sign votes
     /// themselves, call [`make_multi_validator_state_with_keys`].
-    fn make_multi_validator_state() -> (BftCoordinator, TopologySnapshot) {
+    fn make_multi_validator_state() -> (ShardCoordinator, TopologySnapshot) {
         make_multi_validator_state_at(0)
     }
 
-    fn make_multi_validator_state_at(local_idx: u32) -> (BftCoordinator, TopologySnapshot) {
+    fn make_multi_validator_state_at(local_idx: u32) -> (ShardCoordinator, TopologySnapshot) {
         let (state, topology, _keys) = make_multi_validator_state_with_keys(local_idx);
         (state, topology)
     }
 
     fn make_multi_validator_state_with_keys(
         local_idx: u32,
-    ) -> (BftCoordinator, TopologySnapshot, Vec<Bls12381G1PrivateKey>) {
+    ) -> (
+        ShardCoordinator,
+        TopologySnapshot,
+        Vec<Bls12381G1PrivateKey>,
+    ) {
         let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
         let validators: Vec<ValidatorInfo> = keys
             .iter()
@@ -3798,13 +3802,14 @@ mod tests {
         let validator_set = ValidatorSet::new(validators);
         let topology =
             TopologySnapshot::new(ValidatorId::new(u64::from(local_idx)), 1, validator_set);
-        let state = BftCoordinator::new(BftConfig::default(), RecoveredState::default());
+        let state =
+            ShardCoordinator::new(ShardConsensusConfig::default(), RecoveredState::default());
         (state, topology, keys)
     }
 
     /// The vote-lock invariant: after `try_vote_on_block` returns a non-empty
     /// action set, `voted_heights[height]` is populated.
-    fn voted_block_at(state: &BftCoordinator, height: BlockHeight) -> BlockHash {
+    fn voted_block_at(state: &ShardCoordinator, height: BlockHeight) -> BlockHash {
         state
             .votes
             .locked_block(height)
@@ -4008,7 +4013,7 @@ mod tests {
         state.set_time(LocalTimestamp::from_millis(100_000));
         let height = BlockHeight::new(1);
 
-        let vote_and_advance = |state: &mut BftCoordinator, block: &[u8], round: Round| {
+        let vote_and_advance = |state: &mut ShardCoordinator, block: &[u8], round: Round| {
             state.votes.record_own_vote(
                 height,
                 BlockHash::from_raw(Hash::from_bytes(block)),

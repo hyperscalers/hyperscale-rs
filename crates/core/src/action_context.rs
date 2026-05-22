@@ -1,6 +1,6 @@
 //! Shared context for executing delegated actions.
 //!
-//! Coordinator crates (`hyperscale_bft`, `hyperscale_execution`, etc.) accept
+//! Coordinator crates (`hyperscale_shard`, `hyperscale_execution`, etc.) accept
 //! [`ActionContext`] when handling [`crate::Action`] variants, so they can read
 //! storage/topology/engine state without depending on the node crate. Outcomes
 //! flow back via the `notify` and `commit_prepared` callbacks.

@@ -26,7 +26,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use arc_swap::ArcSwap;
 use crossbeam::channel::{Receiver, Sender, unbounded};
 use hex::encode as hex_encode;
-use hyperscale_bft::BftConfig;
 use hyperscale_core::{ProtocolEvent, TimerId};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_dispatch_pooled::{PooledDispatch, ThreadPoolConfig};
@@ -43,6 +42,7 @@ use hyperscale_network_libp2p::{
 use hyperscale_node::shard_loop::{ShardEvent, ShardLoop, TimerOp, timer_event};
 use hyperscale_node::{NodeConfig, NodeHost, NodeStateMachine, SharedTopologySnapshot, VnodeInit};
 use hyperscale_provisions::{ProvisionConfig, ProvisionStore};
+use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::ChainReader;
 use hyperscale_storage_rocksdb::{RocksDbStorage, SharedStorage};
 use hyperscale_topology::TopologyCoordinator;
@@ -153,7 +153,7 @@ pub struct VnodeConfig {
 /// - `vnodes` - One [`VnodeConfig`] per hosted validator. Vnodes may
 ///   target different shards; the host derives its `local_shards` set
 ///   from the supplied vnodes.
-/// - `bft_config` - Consensus configuration parameters
+/// - `shard_config` - Consensus configuration parameters
 /// - `storages` - One `RocksDB` storage per hosted shard. Every shard
 ///   referenced by a vnode must have a matching entry.
 /// - `network` - libp2p configuration for peer-to-peer communication
@@ -163,7 +163,7 @@ pub struct VnodeConfig {
 /// - `channel_capacity` - Event channel capacity (defaults to 10,000)
 pub struct ProductionRunnerBuilder {
     vnodes: Vec<VnodeConfig>,
-    bft_config: BftConfig,
+    shard_config: ShardConsensusConfig,
     storages: HashMap<ShardGroupId, Arc<RocksDbStorage>>,
     network_config: Libp2pConfig,
     dispatch: Option<Arc<PooledDispatch>>,
@@ -192,7 +192,7 @@ impl ProductionRunnerBuilder {
     #[must_use]
     pub fn new(
         vnodes: Vec<VnodeConfig>,
-        bft_config: BftConfig,
+        shard_config: ShardConsensusConfig,
         storages: HashMap<ShardGroupId, Arc<RocksDbStorage>>,
         network_config: Libp2pConfig,
     ) -> Self {
@@ -202,7 +202,7 @@ impl ProductionRunnerBuilder {
         );
         Self {
             vnodes,
-            bft_config,
+            shard_config,
             storages,
             network_config,
             dispatch: None,
@@ -299,7 +299,7 @@ impl ProductionRunnerBuilder {
         install();
 
         let vnode_configs = self.vnodes;
-        let bft_config = self.bft_config;
+        let shard_config = self.shard_config;
         let storages = self.storages;
         let network_config = self.network_config;
         let dispatch = match self.dispatch {
@@ -445,7 +445,7 @@ impl ProductionRunnerBuilder {
                 );
                 let state = NodeStateMachine::new(
                     cfg.topology,
-                    &bft_config,
+                    &shard_config,
                     recovered.clone(),
                     self.mempool_config.clone(),
                     self.provision_config,
@@ -617,11 +617,11 @@ impl ProductionRunner {
     #[must_use]
     pub fn builder(
         vnodes: Vec<VnodeConfig>,
-        bft_config: BftConfig,
+        shard_config: ShardConsensusConfig,
         storages: HashMap<ShardGroupId, Arc<RocksDbStorage>>,
         network_config: Libp2pConfig,
     ) -> ProductionRunnerBuilder {
-        ProductionRunnerBuilder::new(vnodes, bft_config, storages, network_config)
+        ProductionRunnerBuilder::new(vnodes, shard_config, storages, network_config)
     }
 
     /// Get a reference to the dispatch implementation.
@@ -1181,7 +1181,7 @@ struct ShardLoopConfig {
     tokio_handle: TokioHandle,
     initial_timer_ops: Vec<TimerOp>,
     /// Shared RPC `vnodes` list. Each shard's thread writes its own
-    /// vnodes' entries via `retain != self.shard` + push on the metrics
+    /// vnodes' entries via `retain != self.shard_coordinator` + push on the metrics
     /// tick; concurrent shards racing on the same `ArcSwap` lose at most
     /// one second of staleness on their slot.
     rpc_status: Option<Arc<ArcSwap<NodeStatusState>>>,
@@ -1294,7 +1294,7 @@ fn update_shard_rpc_state(shard_loop: &ProdShardLoop, config: &ShardLoopConfig) 
         updated.vnodes.retain(|v| v.shard != shard_key);
         for vnode in &shard_loop.vnodes {
             let state = &vnode.state;
-            let mempool = state.mempool();
+            let mempool = state.mempool_coordinator();
             let contention = mempool.lock_contention_stats();
             #[allow(clippy::cast_possible_truncation)] // pool sizes fit usize
             let (pending, in_flight) = (
@@ -1304,8 +1304,8 @@ fn update_shard_rpc_state(shard_loop: &ProdShardLoop, config: &ShardLoopConfig) 
             updated.vnodes.push(VnodeStatusEntry {
                 validator_id: vnode.validator_id.inner(),
                 shard: shard_key,
-                block_height: state.bft().committed_height().inner(),
-                view: state.bft().view().inner(),
+                block_height: state.shard_coordinator().committed_height().inner(),
+                view: state.shard_coordinator().view().inner(),
                 state_root_hash: hex_encode(state.last_committed_jmt_root().as_bytes()),
                 mempool: VnodeMempoolStats {
                     pending_count: pending,
@@ -1349,7 +1349,7 @@ fn update_shard_rpc_state(shard_loop: &ProdShardLoop, config: &ShardLoopConfig) 
         let mut updated = (**current).clone();
         for vnode in &shard_loop.vnodes {
             let state = &vnode.state;
-            let mempool = state.mempool();
+            let mempool = state.mempool_coordinator();
             let contention = mempool.lock_contention_stats();
             #[allow(clippy::cast_possible_truncation)]
             let (pending, in_flight) = (
@@ -1365,7 +1365,9 @@ fn update_shard_rpc_state(shard_loop: &ProdShardLoop, config: &ShardLoopConfig) 
                     updated_at: Some(Instant::now()),
                     accepting_rpc_transactions: !mempool.at_in_flight_limit(),
                     at_pending_limit: mempool.at_pending_limit(),
-                    remote_shard_in_flight: state.remote_headers().remote_shard_in_flight(),
+                    remote_shard_in_flight: state
+                        .remote_headers_coordinator()
+                        .remote_shard_in_flight(),
                     remote_congestion_threshold,
                 },
             );

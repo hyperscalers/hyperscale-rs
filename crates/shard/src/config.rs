@@ -8,7 +8,7 @@ use std::time::Duration;
 
 /// Local-only operational tuning for the BFT runtime.
 #[derive(Debug, Clone)]
-pub struct BftConfig {
+pub struct ShardConsensusConfig {
     /// Timeout before fetching missing transactions from peers.
     /// If a pending block is still incomplete after this duration, request
     /// the missing transactions directly from the proposer or a peer.
@@ -30,7 +30,7 @@ pub struct BftConfig {
     pub max_parallel_sync_verifications: usize,
 }
 
-impl Default for BftConfig {
+impl Default for ShardConsensusConfig {
     fn default() -> Self {
         Self {
             transaction_fetch_timeout: Duration::from_millis(150),
@@ -41,7 +41,7 @@ impl Default for BftConfig {
     }
 }
 
-impl BftConfig {
+impl ShardConsensusConfig {
     /// Create a new BFT configuration with default values.
     #[must_use]
     pub fn new() -> Self {

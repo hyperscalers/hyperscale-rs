@@ -18,7 +18,7 @@ use crate::{Block, BlockHash, BlockHeight, QuorumCertificate};
 /// peer can ship a synced block paired with a forged "genesis QC"
 /// (`qc.block_hash == ZERO`, `qc.height == 0`) for an arbitrary block height,
 /// bypassing every gate keyed on `qc.is_genesis()` (e.g. the synced-block
-/// quorum-power gate in `bft::coordinator`).
+/// quorum-power gate in `shard::coordinator`).
 ///
 /// Note this is *not* the same as the `parent_qc` stored inside a block's
 /// header — that QC certifies the *parent* block. The QC on a `CertifiedBlock`

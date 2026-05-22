@@ -114,14 +114,22 @@ fn poll_until_terminal(
 ) -> Option<TransactionStatus> {
     for _ in 0..max_iterations {
         runner.run_until(runner.now() + step);
-        let status = runner.node(node_index).unwrap().mempool().status(&tx_hash);
+        let status = runner
+            .node(node_index)
+            .unwrap()
+            .mempool_coordinator()
+            .status(&tx_hash);
         match &status {
             Some(s) if s.is_final() => return status,
             None => return None, // evicted (terminal)
             _ => {}
         }
     }
-    runner.node(node_index).unwrap().mempool().status(&tx_hash)
+    runner
+        .node(node_index)
+        .unwrap()
+        .mempool_coordinator()
+        .status(&tx_hash)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -177,7 +185,12 @@ fn test_cycle_detection_aborts_loser() {
 
         if !a_done {
             // TX A committed on shard 0 (node 0)
-            match runner.node(0).unwrap().mempool().status(&hash_a) {
+            match runner
+                .node(0)
+                .unwrap()
+                .mempool_coordinator()
+                .status(&hash_a)
+            {
                 Some(s) if s.is_final() => a_done = true,
                 None => a_done = true,
                 _ => {}
@@ -185,7 +198,12 @@ fn test_cycle_detection_aborts_loser() {
         }
         if !b_done {
             // TX B committed on shard 1 (node 3)
-            match runner.node(3).unwrap().mempool().status(&hash_b) {
+            match runner
+                .node(3)
+                .unwrap()
+                .mempool_coordinator()
+                .status(&hash_b)
+            {
                 Some(s) if s.is_final() => b_done = true,
                 None => b_done = true,
                 _ => {}
@@ -198,10 +216,10 @@ fn test_cycle_detection_aborts_loser() {
 
     let n0 = runner.node(0).unwrap();
     let n3 = runner.node(3).unwrap();
-    let status_a = n0.mempool().status(&hash_a);
-    let status_b = n3.mempool().status(&hash_b);
-    let h0 = n0.bft().committed_height();
-    let h1 = n3.bft().committed_height();
+    let status_a = n0.mempool_coordinator().status(&hash_a);
+    let status_b = n3.mempool_coordinator().status(&hash_b);
+    let h0 = n0.shard_coordinator().committed_height();
+    let h1 = n3.shard_coordinator().committed_height();
     assert!(
         a_done,
         "TX A should reach terminal state on shard 0, got {status_a:?} at h={h0}",
@@ -213,11 +231,21 @@ fn test_cycle_detection_aborts_loser() {
 
     // Both transactions should be evicted from their home shards
     assert!(
-        runner.node(0).unwrap().mempool().status(&hash_a).is_none(),
+        runner
+            .node(0)
+            .unwrap()
+            .mempool_coordinator()
+            .status(&hash_a)
+            .is_none(),
         "TX A should be evicted from shard 0 mempool"
     );
     assert!(
-        runner.node(3).unwrap().mempool().status(&hash_b).is_none(),
+        runner
+            .node(3)
+            .unwrap()
+            .mempool_coordinator()
+            .status(&hash_b)
+            .is_none(),
         "TX B should be evicted from shard 1 mempool"
     );
 }
@@ -334,14 +362,14 @@ fn test_livelock_resolves_promptly() {
         let node = runner.node(0).unwrap();
 
         if !a_done {
-            match node.mempool().status(&hash_a) {
+            match node.mempool_coordinator().status(&hash_a) {
                 Some(s) if s.is_final() => a_done = true,
                 None => a_done = true,
                 _ => {}
             }
         }
         if !b_done {
-            match node.mempool().status(&hash_b) {
+            match node.mempool_coordinator().status(&hash_b) {
                 Some(s) if s.is_final() => b_done = true,
                 None => b_done = true,
                 _ => {}

@@ -6,17 +6,17 @@
 //! - the returned `Vec<Action>` (the state machine's only externally
 //!   observable output), and
 //! - mutations on the real coordinators (queryable via the existing
-//!   `&BftCoordinator` / `&MempoolCoordinator` / etc. accessors).
+//!   `&ShardCoordinator` / `&MempoolCoordinator` / etc. accessors).
 //!
 //! No mocks, no dispatch-table tracing — assertions ride on the same
 //! contract `NodeHost` consumes in production.
 
 use std::sync::Arc;
 
-use hyperscale_bft::BftConfig;
 use hyperscale_execution::{ExecCertStore, FinalizedWaveStore};
 use hyperscale_mempool::{MempoolConfig, TxStore};
 use hyperscale_provisions::{ProvisionConfig, ProvisionStore};
+use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::RecoveredState;
 use hyperscale_test_helpers::TestCommittee;
 use hyperscale_topology::TopologyCoordinator;
@@ -80,7 +80,7 @@ impl TestNodeBuilder {
 
         let node = NodeStateMachine::new(
             topology,
-            &BftConfig::default(),
+            &ShardConsensusConfig::default(),
             RecoveredState::default(),
             MempoolConfig::default(),
             ProvisionConfig::default(),

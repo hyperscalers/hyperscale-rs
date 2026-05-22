@@ -30,9 +30,9 @@ impl NodeStateMachine {
             }
             ProtocolEvent::TransactionsAdmitted { txs } => {
                 let actions = self
-                    .bft
-                    .on_transactions_admitted(self.topology.snapshot(), &txs);
-                self.bft.queue_ready_proposal();
+                    .shard_coordinator
+                    .on_transactions_admitted(self.topology_coordinator.snapshot(), &txs);
+                self.shard_coordinator.queue_ready_proposal();
                 actions
             }
             _ => unreachable!("non-transaction event routed to handle_transaction"),
@@ -48,12 +48,16 @@ impl NodeStateMachine {
         tx: Arc<RoutableTransaction>,
         submitted_locally: bool,
     ) -> Vec<Action> {
-        if !self.topology.snapshot().involves_local_shard(&tx) {
+        if !self
+            .topology_coordinator
+            .snapshot()
+            .involves_local_shard(&tx)
+        {
             return vec![];
         }
 
-        self.mempool.on_transaction_gossip(
-            self.topology.snapshot(),
+        self.mempool_coordinator.on_transaction_gossip(
+            self.topology_coordinator.snapshot(),
             tx,
             submitted_locally,
             self.now,
@@ -68,8 +72,11 @@ impl NodeStateMachine {
         if txs.is_empty() {
             return vec![];
         }
-        self.mempool
-            .on_fetched_transactions(self.topology.snapshot(), txs, self.now)
+        self.mempool_coordinator.on_fetched_transactions(
+            self.topology_coordinator.snapshot(),
+            txs,
+            self.now,
+        )
     }
 }
 
@@ -107,7 +114,7 @@ mod tests {
 
         assert!(actions.is_empty());
         assert_eq!(
-            node.mempool.len(),
+            node.mempool_coordinator.len(),
             0,
             "non-local tx must not enter the mempool",
         );
@@ -130,7 +137,7 @@ mod tests {
         );
 
         assert_eq!(
-            node.mempool.len(),
+            node.mempool_coordinator.len(),
             1,
             "local-shard tx must be admitted to the mempool",
         );
@@ -158,7 +165,7 @@ mod tests {
         );
 
         assert_eq!(
-            node.mempool.len(),
+            node.mempool_coordinator.len(),
             2,
             "fetched txs must be admitted via the fetch path",
         );

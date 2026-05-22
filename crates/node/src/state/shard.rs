@@ -1,13 +1,13 @@
 //! BFT consensus dispatch arms and the multi-coordinator orchestrators that
 //! sit alongside them.
 //!
-//! Routing arms forward to `BftCoordinator`. The orchestrators that span
+//! Routing arms forward to `ShardCoordinator`. The orchestrators that span
 //! multiple coordinators live here too because each is fundamentally a
 //! BFT-flow response — the coordinators that get notified are the
 //! downstream subscribers:
 //!
 //! - `on_block_header_received` validates in-flight before BFT ingest;
-//! - `on_qc_formed` gathers proposal inputs to feed `bft.on_qc_formed`;
+//! - `on_qc_formed` gathers proposal inputs to feed `shard.on_qc_formed`;
 //! - `on_block_committed` fans out to mempool, remote-headers, provisions,
 //!   outbound-provisions, and execution in commit order;
 //! - `RemoteHeaderAdmitted` fans verified headers to execution + provisions.
@@ -19,14 +19,14 @@
 //! are not enforced by the type system.
 //!
 //! Dedup-index registration is owned by
-//! [`crate::coordinator::BftCoordinator::record_block_committed`] (in the
-//! `bft` crate) and runs synchronously when BFT internally commits the
+//! [`crate::coordinator::ShardCoordinator::record_block_committed`] (in the
+//! `shard` crate) and runs synchronously when BFT internally commits the
 //! block — earlier than this fanout. So mempool's tombstone-retention pass
 //! in step 2 already sees the up-to-date `tx_retention` map.
 //!
 //! The order is, with the dependency edge that motivates each step:
 //!
-//! 1. `bft.on_block_committed_verification` — marks the block's JMT
+//! 1. `shard.on_block_committed_verification` — marks the block's JMT
 //!    snapshot as a usable parent in `PendingChain`. Child state-root
 //!    verifications in subsequent dispatches need this; if any are pending
 //!    against this block as their parent, they unblock here. Must precede
@@ -56,7 +56,7 @@
 //!    state matters.
 //!
 //! Finally, the function latches a proposal-retry via
-//! `bft.queue_ready_proposal()` — in-flight counts changed, so the next
+//! `shard.queue_ready_proposal()` — in-flight counts changed, so the next
 //! proposer needs to re-evaluate. The post-dispatch drain in `mod.rs::handle`
 //! invokes `try_event_driven_proposal` once.
 
@@ -71,7 +71,7 @@ use super::NodeStateMachine;
 impl NodeStateMachine {
     /// Dispatch a BFT-category `ProtocolEvent`.
     #[allow(clippy::too_many_lines)] // single dispatch, one arm per BFT variant
-    pub(super) fn handle_bft(&mut self, event: ProtocolEvent) -> Vec<Action> {
+    pub(super) fn handle_shard(&mut self, event: ProtocolEvent) -> Vec<Action> {
         match event {
             ProtocolEvent::BlockHeaderReceived { header, manifest } => {
                 self.on_block_header_received(&header, manifest)
@@ -86,67 +86,80 @@ impl NodeStateMachine {
                 // Route through the centralized remote header coordinator.
                 // Structural pre-checks happen there; downstream consumers
                 // receive headers via `RemoteHeaderAdmitted`.
-                let topology = self.topology.snapshot();
-                self.remote_headers
-                    .on_remote_header_received(topology, committed_header, sender)
+                let topology = self.topology_coordinator.snapshot();
+                self.remote_headers_coordinator.on_remote_header_received(
+                    topology,
+                    committed_header,
+                    sender,
+                )
             }
-            ProtocolEvent::BlockVoteReceived { vote } => {
-                self.bft.on_block_vote(self.topology.snapshot(), vote)
-            }
+            ProtocolEvent::BlockVoteReceived { vote } => self
+                .shard_coordinator
+                .on_block_vote(self.topology_coordinator.snapshot(), vote),
             ProtocolEvent::BlockReadyToCommit {
                 block_hash,
                 qc,
                 source,
-            } => {
-                self.bft
-                    .on_block_ready_to_commit(self.topology.snapshot(), block_hash, qc, source)
-            }
+            } => self.shard_coordinator.on_block_ready_to_commit(
+                self.topology_coordinator.snapshot(),
+                block_hash,
+                qc,
+                source,
+            ),
             ProtocolEvent::QuorumCertificateResult {
                 block_hash,
                 qc,
                 verified_votes,
-            } => self
-                .bft
-                .on_qc_result(self.topology.snapshot(), block_hash, qc, verified_votes),
+            } => self.shard_coordinator.on_qc_result(
+                self.topology_coordinator.snapshot(),
+                block_hash,
+                qc,
+                verified_votes,
+            ),
             ProtocolEvent::QcSignatureVerified { block_hash, valid } => self
-                .bft
-                .on_qc_signature_verified(self.topology.snapshot(), block_hash, valid),
+                .shard_coordinator
+                .on_qc_signature_verified(self.topology_coordinator.snapshot(), block_hash, valid),
             ProtocolEvent::RemoteHeaderQcVerified {
                 shard,
                 height,
                 committed_header,
                 valid,
-            } => self.remote_headers.on_remote_header_qc_verified(
-                self.topology.snapshot(),
-                shard,
-                height,
-                committed_header,
-                valid,
-            ),
+            } => self
+                .remote_headers_coordinator
+                .on_remote_header_qc_verified(
+                    self.topology_coordinator.snapshot(),
+                    shard,
+                    height,
+                    committed_header,
+                    valid,
+                ),
             ProtocolEvent::RemoteHeaderAdmitted { committed_header } => {
                 // Fan out the verified header to downstream consumers. BFT
                 // already received the header in `RemoteHeaderQcVerified`
                 // (early insertion for deferral proof validation).
-                let topology = self.topology.snapshot();
+                let topology = self.topology_coordinator.snapshot();
                 let shard = committed_header.shard_group_id();
 
-                self.execution.on_verified_remote_header(
+                self.execution_coordinator.on_verified_remote_header(
                     topology,
                     shard,
                     committed_header.header().height(),
                     committed_header.header().waves(),
                 );
 
-                self.provisions
+                self.provisions_coordinator
                     .on_verified_remote_header(topology, &committed_header)
             }
             ProtocolEvent::BlockRootVerified {
                 kind,
                 block_hash,
                 valid,
-            } => self
-                .bft
-                .on_block_root_verified(self.topology.snapshot(), kind, block_hash, valid),
+            } => self.shard_coordinator.on_block_root_verified(
+                self.topology_coordinator.snapshot(),
+                kind,
+                block_hash,
+                valid,
+            ),
             ProtocolEvent::ProposalBuilt {
                 height,
                 round,
@@ -154,8 +167,8 @@ impl NodeStateMachine {
                 block_hash,
                 finalized_waves,
                 provisions,
-            } => self.bft.on_proposal_built(
-                self.topology.snapshot(),
+            } => self.shard_coordinator.on_proposal_built(
+                self.topology_coordinator.snapshot(),
                 height,
                 round,
                 &block,
@@ -172,21 +185,21 @@ impl NodeStateMachine {
             // persisted parents unblock here) and for auto-resume-from-sync.
             ProtocolEvent::BlockPersisted { height, .. } => {
                 let mut actions = self
-                    .bft
-                    .on_block_persisted(self.topology.snapshot(), height);
+                    .shard_coordinator
+                    .on_block_persisted(self.topology_coordinator.snapshot(), height);
                 // If BFT just resumed from sync, reschedule the cleanup timer.
                 if !actions.is_empty() {
                     actions.push(Action::SetTimer {
                         id: TimerId::Cleanup,
-                        duration: self.bft.config().cleanup_interval,
+                        duration: self.shard_coordinator.config().cleanup_interval,
                     });
                 }
                 actions
             }
             ProtocolEvent::FinalizedWavesAdmitted { waves } => self
-                .bft
-                .on_finalized_waves_admitted(self.topology.snapshot(), &waves),
-            _ => unreachable!("non-BFT event routed to handle_bft"),
+                .shard_coordinator
+                .on_finalized_waves_admitted(self.topology_coordinator.snapshot(), &waves),
+            _ => unreachable!("non-BFT event routed to handle_shard"),
         }
     }
 
@@ -224,12 +237,12 @@ impl NodeStateMachine {
         // height. For blocks further ahead, validators at different heights
         // see different in_flight() counts — checking would split votes and
         // trigger view changes.
-        let committed_height = self.bft.committed_height();
+        let committed_height = self.shard_coordinator.committed_height();
         let is_next_block = header.height() == committed_height + 1;
 
         if is_next_block
             && self
-                .mempool
+                .mempool_coordinator
                 .would_exceed_in_flight(total_tx_count, manifest.cert_ids().len())
         {
             tracing::warn!(
@@ -240,13 +253,13 @@ impl NodeStateMachine {
             return vec![];
         }
 
-        self.bft.on_block_header(
-            self.topology.snapshot(),
+        self.shard_coordinator.on_block_header(
+            self.topology_coordinator.snapshot(),
             header,
             manifest,
-            |h| self.mempool.get_transaction(h),
-            |id| self.execution.get_finalized_wave(id),
-            |h| self.provisions.get_provisions_by_hash(*h),
+            |h| self.mempool_coordinator.get_transaction(h),
+            |id| self.execution_coordinator.get_finalized_wave(id),
+            |h| self.provisions_coordinator.get_provisions_by_hash(*h),
         )
     }
 
@@ -257,11 +270,12 @@ impl NodeStateMachine {
         // event won't be processed until after we select transactions, so
         // we preemptively account for txs that will INCREASE in-flight (new
         // commits) and certificates that will DECREASE it (completions).
-        let (pending_tx_count, pending_cert_count) = self.bft.pending_commit_counts(qc);
+        let (pending_tx_count, pending_cert_count) =
+            self.shard_coordinator.pending_commit_counts(qc);
         let inputs = self.gather_proposal_inputs(pending_tx_count, pending_cert_count);
 
-        self.bft.on_qc_formed(
-            self.topology.snapshot(),
+        self.shard_coordinator.on_qc_formed(
+            self.topology_coordinator.snapshot(),
             block_hash,
             qc,
             &inputs.ready_txs,
@@ -281,27 +295,28 @@ impl NodeStateMachine {
         // `VerifyStateRoot` or by the inline `CommitBlockByQcOnly`
         // computation), so children verify against it without waiting on
         // RocksDB persistence.
-        self.bft.on_block_committed_verification(block_hash);
+        self.shard_coordinator
+            .on_block_committed_verification(block_hash);
 
         // Mempool: marks Pending → Committed for `block.transactions`, then
         // drives each tx in `block.certificates` to its terminal state
         // (Completed + tombstone). Same behavior for consensus and sync
         // commit paths.
         actions.extend(
-            self.mempool
-                .on_block_committed(self.topology.snapshot(), certified),
+            self.mempool_coordinator
+                .on_block_committed(self.topology_coordinator.snapshot(), certified),
         );
 
         // Remote header coordinator: update liveness and check for timeouts.
         actions.extend(
-            self.remote_headers
-                .on_block_committed(self.topology.snapshot(), certified),
+            self.remote_headers_coordinator
+                .on_block_committed(self.topology_coordinator.snapshot(), certified),
         );
 
         // Provisions coordinator: prune + schedule fallback timeouts. Reads
         // provision hashes directly off the block — `Live` carries them
         // inline, `Sealed` has none (empty slice).
-        actions.extend(self.provisions.on_block_committed(certified));
+        actions.extend(self.provisions_coordinator.on_block_committed(certified));
 
         // Outbound provision safety sweep — runs on the BFT-authenticated
         // weighted timestamp so every validator evicts deterministically.
@@ -312,7 +327,7 @@ impl NodeStateMachine {
 
         // In-flight counts changed — latch a proposal attempt so the next
         // proposer can include newly ready transactions.
-        self.bft.queue_ready_proposal();
+        self.shard_coordinator.queue_ready_proposal();
 
         actions
     }
@@ -328,12 +343,12 @@ impl NodeStateMachine {
         // in this block. Per-tx terminal state for the mempool is already
         // handled separately by `on_block_committed` reading
         // `block.certificates`.
-        self.execution
+        self.execution_coordinator
             .cleanup_committed_waves(certified.block().certificates());
 
         actions.extend(
-            self.execution
-                .on_block_committed(self.topology.snapshot(), certified),
+            self.execution_coordinator
+                .on_block_committed(self.topology_coordinator.snapshot(), certified),
         );
 
         // Round voting: scan all incomplete waves and emit votes for
@@ -341,7 +356,10 @@ impl NodeStateMachine {
         // have already been processed above (with override semantics), so
         // the accumulator state is deterministic at this height. All
         // validators at this height produce the same votes.
-        actions.extend(self.execution.emit_vote_actions(self.topology.snapshot()));
+        actions.extend(
+            self.execution_coordinator
+                .emit_vote_actions(self.topology_coordinator.snapshot()),
+        );
 
         actions
     }
@@ -411,8 +429,11 @@ mod tests {
             QuorumCertificate::genesis(ShardGroupId::new(0)),
         ));
 
-        let pre_exec = node.execution.memory_stats().expected_exec_certs;
-        let pre_prov = node.provisions.verified_remote_header_count();
+        let pre_exec = node
+            .execution_coordinator
+            .memory_stats()
+            .expected_exec_certs;
+        let pre_prov = node.provisions_coordinator.verified_remote_header_count();
 
         let _ = node.handle(
             LocalTimestamp::ZERO,
@@ -420,19 +441,21 @@ mod tests {
         );
 
         assert_eq!(
-            node.execution.memory_stats().expected_exec_certs,
+            node.execution_coordinator
+                .memory_stats()
+                .expected_exec_certs,
             pre_exec + 1,
             "execution must register the wave from the verified header as an expected EC",
         );
         assert_eq!(
-            node.provisions.verified_remote_header_count(),
+            node.provisions_coordinator.verified_remote_header_count(),
             pre_prov + 1,
             "provisions must record the verified remote header",
         );
     }
 
     /// `TransactionsAdmitted` latches a proposal-retry via
-    /// `bft.queue_ready_proposal()`; the post-dispatch hook in
+    /// `shard.queue_ready_proposal()`; the post-dispatch hook in
     /// `mod.rs::handle` calls `try_event_driven_proposal()` when the
     /// latch fires. End-to-end: when the local validator is the
     /// round-0 proposer for height 1, this chain must surface a
@@ -648,7 +671,7 @@ mod tests {
             },
         );
 
-        let (pending_blocks, _) = node.bft().pending_block_counts();
+        let (pending_blocks, _) = node.shard_coordinator().pending_block_counts();
         assert_eq!(
             pending_blocks, 1,
             "header within cap must reach BFT exactly once — pending_blocks should be 1",
@@ -656,7 +679,7 @@ mod tests {
     }
 
     /// Step 2 of the `on_block_committed` orchestration ordering
-    /// ([bft.rs module head]) hands the certified block to
+    /// ([shard.rs module head]) hands the certified block to
     /// `mempool.on_block_committed`, which flips every entry in
     /// `block.transactions()` from `Pending` to `Committed(height)`.
     /// The edges of that ordering are not enforced by the type system —
@@ -679,7 +702,7 @@ mod tests {
             },
         );
         assert_eq!(
-            node.mempool().status(&tx_hash),
+            node.mempool_coordinator().status(&tx_hash),
             Some(TransactionStatus::Pending),
             "tx must be admitted as Pending before commit",
         );
@@ -699,7 +722,7 @@ mod tests {
         );
 
         assert_eq!(
-            node.mempool().status(&tx_hash),
+            node.mempool_coordinator().status(&tx_hash),
             Some(TransactionStatus::Committed(BlockHeight::new(1))),
             "on_block_committed must flip the included tx from Pending to Committed(1)",
         );

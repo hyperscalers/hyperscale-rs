@@ -21,7 +21,7 @@
 //! reject re-inclusion, so the entry is no longer correctness-bearing.
 //!
 //! Registration is synchronous with BFT commit (called from
-//! [`crate::coordinator::BftCoordinator::record_block_committed`]) so the
+//! [`crate::coordinator::ShardCoordinator::record_block_committed`]) so the
 //! just-committed block's contents are visible to any subsequent
 //! `try_propose` in the same tick — closing the on-qc-formed re-inclusion
 //! race without a separate bridge buffer.

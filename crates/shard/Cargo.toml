@@ -1,8 +1,8 @@
 [package]
-name = "hyperscale-bft"
+name = "hyperscale-shard"
 version.workspace = true
 edition.workspace = true
-description = "BFT consensus state machine"
+description = "Shard consensus state machine (HotStuff-2)"
 
 [dependencies]
 hyperscale-core.workspace = true

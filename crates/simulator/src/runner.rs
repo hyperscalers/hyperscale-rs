@@ -511,7 +511,7 @@ impl Simulator {
         for shard_idx in 0..self.config.num_shards {
             let node_idx = shard_idx * self.config.validators_per_shard;
             if let Some(node) = self.runner.node(node_idx) {
-                let stats = node.mempool().lock_contention_stats();
+                let stats = node.mempool_coordinator().lock_contention_stats();
                 total.locked_nodes += stats.locked_nodes;
                 total.pending_count += stats.pending_count;
                 total.pending_deferred += stats.pending_deferred;

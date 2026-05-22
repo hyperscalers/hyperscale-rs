@@ -129,7 +129,7 @@ pub struct Metrics {
     pub transactions_rejected: CounterVec,
 
     // === Memory ===
-    pub memory_bft: GaugeVec,
+    pub memory_shard: GaugeVec,
     pub memory_exec: GaugeVec,
     pub memory_mempool: GaugeVec,
     pub memory_remote_headers: GaugeVec,
@@ -618,8 +618,8 @@ impl Metrics {
             .unwrap(),
 
             // Memory
-            memory_bft: register_gauge_vec!(
-                "hyperscale_memory_bft_collections",
+            memory_shard: register_gauge_vec!(
+                "hyperscale_memory_shard_collections",
                 "BFT state machine collection sizes (entry count)",
                 &["collection"]
             )
@@ -840,7 +840,7 @@ impl MetricsRecorder for PrometheusRecorder {
             .set(height as f64);
     }
 
-    fn set_bft_round(&self, shard: u64, validator_id: u64, round: u64) {
+    fn set_shard_round(&self, shard: u64, validator_id: u64, round: u64) {
         self.metrics
             .round
             .with_label_values(&[&shard.to_string(), &validator_id.to_string()])
@@ -1212,61 +1212,61 @@ impl MetricsRecorder for PrometheusRecorder {
     fn set_memory_metrics(&self, m: &MemoryMetrics) {
         // BFT
         self.metrics
-            .memory_bft
+            .memory_shard
             .with_label_values(&["pending_blocks"])
-            .set(m.bft_pending_blocks as f64);
+            .set(m.shard_pending_blocks as f64);
         self.metrics
-            .memory_bft
+            .memory_shard
             .with_label_values(&["vote_sets"])
-            .set(m.bft_vote_sets as f64);
+            .set(m.shard_vote_sets as f64);
         self.metrics
-            .memory_bft
+            .memory_shard
             .with_label_values(&["pending_commits"])
-            .set(m.bft_pending_commits as f64);
+            .set(m.shard_pending_commits as f64);
         self.metrics
-            .memory_bft
+            .memory_shard
             .with_label_values(&["pending_commits_awaiting_data"])
-            .set(m.bft_pending_commits_awaiting_data as f64);
+            .set(m.shard_pending_commits_awaiting_data as f64);
         self.metrics
-            .memory_bft
+            .memory_shard
             .with_label_values(&["voted_heights"])
-            .set(m.bft_voted_heights as f64);
+            .set(m.shard_voted_heights as f64);
         self.metrics
-            .memory_bft
+            .memory_shard
             .with_label_values(&["received_votes_by_height"])
-            .set(m.bft_received_votes_by_height as f64);
+            .set(m.shard_received_votes_by_height as f64);
         self.metrics
-            .memory_bft
+            .memory_shard
             .with_label_values(&["committed_tx_lookup"])
-            .set(m.bft_committed_tx_lookup as f64);
+            .set(m.shard_committed_tx_lookup as f64);
         self.metrics
-            .memory_bft
+            .memory_shard
             .with_label_values(&["committed_cert_lookup"])
-            .set(m.bft_committed_cert_lookup as f64);
+            .set(m.shard_committed_cert_lookup as f64);
         self.metrics
-            .memory_bft
+            .memory_shard
             .with_label_values(&["committed_provision_lookup"])
-            .set(m.bft_committed_provision_lookup as f64);
+            .set(m.shard_committed_provision_lookup as f64);
         self.metrics
-            .memory_bft
+            .memory_shard
             .with_label_values(&["pending_qc_verifications"])
-            .set(m.bft_pending_qc_verifications as f64);
+            .set(m.shard_pending_qc_verifications as f64);
         self.metrics
-            .memory_bft
+            .memory_shard
             .with_label_values(&["verified_qcs"])
-            .set(m.bft_verified_qcs as f64);
+            .set(m.shard_verified_qcs as f64);
         self.metrics
-            .memory_bft
+            .memory_shard
             .with_label_values(&["pending_state_root_verifications"])
-            .set(m.bft_pending_state_root_verifications as f64);
+            .set(m.shard_pending_state_root_verifications as f64);
         self.metrics
-            .memory_bft
+            .memory_shard
             .with_label_values(&["buffered_synced_blocks"])
-            .set(m.bft_buffered_synced_blocks as f64);
+            .set(m.shard_buffered_synced_blocks as f64);
         self.metrics
-            .memory_bft
+            .memory_shard
             .with_label_values(&["pending_synced_block_verifications"])
-            .set(m.bft_pending_synced_block_verifications as f64);
+            .set(m.shard_pending_synced_block_verifications as f64);
 
         // Execution
         self.metrics

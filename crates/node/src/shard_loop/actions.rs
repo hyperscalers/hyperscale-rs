@@ -2,7 +2,6 @@
 
 use std::sync::Arc;
 
-use hyperscale_bft::action_handlers::handle_action as handle_bft_action;
 use hyperscale_core::{
     Action, ActionContext, ActionOwner, CommitSource, FetchAbandon, FetchRequest, ProtocolEvent,
 };
@@ -11,6 +10,7 @@ use hyperscale_execution::action_handlers::handle_action as handle_execution_act
 use hyperscale_metrics::record_transaction_finalized;
 use hyperscale_network::Network;
 use hyperscale_provisions::action_handlers::handle_action as handle_provisions_action;
+use hyperscale_shard::action_handlers::handle_action as handle_shard_action;
 use hyperscale_storage::Storage;
 use hyperscale_types::{
     Block, BlockHeight, CertifiedBlock, QuorumCertificate, StateRoot, TopologySnapshot,
@@ -597,7 +597,7 @@ where
                 par,
             };
             match action.owner() {
-                ActionOwner::Bft => handle_bft_action(action, &ctx),
+                ActionOwner::Bft => handle_shard_action(action, &ctx),
                 ActionOwner::Execution => handle_execution_action(action, &ctx),
                 ActionOwner::Provisions => handle_provisions_action(action, &ctx),
                 ActionOwner::Local => unreachable!(

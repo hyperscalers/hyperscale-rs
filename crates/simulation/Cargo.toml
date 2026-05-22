@@ -6,7 +6,7 @@ description = "Simulation runner"
 
 [dependencies]
 hyperscale-core.workspace = true
-hyperscale-bft.workspace = true
+hyperscale-shard.workspace = true
 hyperscale-engine.workspace = true
 hyperscale-execution.workspace = true
 hyperscale-mempool.workspace = true

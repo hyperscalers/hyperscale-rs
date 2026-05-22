@@ -8,7 +8,7 @@
 //!
 //! The view is **strictly a borrow**: no state is owned here, no lifecycle,
 //! no mutations. It's a lens, not a sub-machine. The underlying fields live
-//! on `BftCoordinator` / `PendingBlock` just as before.
+//! on `ShardCoordinator` / `PendingBlock` just as before.
 
 use std::collections::HashSet;
 
@@ -123,7 +123,7 @@ impl<'a> ChainView<'a> {
     /// is covered separately by
     /// [`CommitDedupIndex`](crate::commit_dedup::CommitDedupIndex)'s
     /// `contains_*` queries, populated synchronously inside
-    /// [`crate::coordinator::BftCoordinator::record_block_committed`].
+    /// [`crate::coordinator::ShardCoordinator::record_block_committed`].
     pub fn collect_ancestor_hashes(
         &self,
         parent_block_hash: BlockHash,

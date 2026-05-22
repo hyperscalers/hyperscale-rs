@@ -393,7 +393,7 @@ pub enum ProtocolEvent {
     ///
     /// - `io_loop` intercepts the matching `Continuation` arm and drains the
     ///   finalized-wave fetch protocol's in-flight tracking.
-    /// - state.rs forwards the event to `bft.on_finalized_waves_admitted`,
+    /// - state.rs forwards the event to `shard.on_finalized_waves_admitted`,
     ///   which validates each wave's receipts against its EC and populates
     ///   any pending block waiting on its hash.
     FinalizedWavesAdmitted {
@@ -434,7 +434,7 @@ pub enum ProtocolEvent {
     ///
     /// - `io_loop` intercepts the matching `Continuation` arm and drains the
     ///   transaction-fetch protocol's in-flight tracking.
-    /// - state.rs forwards the event to `bft.on_transactions_admitted`, which
+    /// - state.rs forwards the event to `shard.on_transactions_admitted`, which
     ///   populates any pending block waiting on these hashes.
     ///
     /// Same shape as `RemoteHeaderAdmitted` / `ProvisionsAdmitted` —
@@ -467,7 +467,7 @@ pub enum ProtocolEvent {
     },
 
     /// The `io_loop`'s [`BlockSync`] state machine has finished fetching all
-    /// blocks up to the sync target. `BftCoordinator` should exit sync mode
+    /// blocks up to the sync target. `ShardCoordinator` should exit sync mode
     /// so it can re-enter if still behind, or resume normal consensus.
     ///
     /// [`BlockSync`]: ../../node/io_loop/sync/block/type.BlockSync.html

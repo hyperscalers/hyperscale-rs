@@ -1,7 +1,7 @@
 //! Composite node state machine.
 //!
 //! [`NodeStateMachine`] composes the per-domain coordinators —
-//! [`BftCoordinator`], [`ExecutionCoordinator`], [`MempoolCoordinator`],
+//! [`ShardCoordinator`], [`ExecutionCoordinator`], [`MempoolCoordinator`],
 //! [`ProvisionCoordinator`], [`RemoteHeaderCoordinator`], and
 //! [`TopologyCoordinator`] — into a single deterministic
 //! [`StateMachine`] over [`ProtocolEvent`] inputs and [`Action`] outputs.
@@ -11,16 +11,16 @@
 //! scheduling) live on [`NodeHost`](crate::host::NodeHost), which feeds
 //! events in and dispatches emitted [`Action`]s.
 //!
-//! Submodules route inputs to the appropriate coordinator: [`bft`] for
+//! Submodules route inputs to the appropriate coordinator: [`shard`] for
 //! BFT events, [`execution`] for wave/EC events, [`mempool`] /
 //! [`transactions`] for tx ingress, [`provisions`] for cross-shard state,
 //! [`proposal`] for proposer-side construction, [`sync`] for catch-up,
 //! and [`timers`] for timeout dispatch.
 
-mod bft;
 mod execution;
 mod proposal;
 mod provisions;
+mod shard;
 mod sync;
 mod timers;
 mod transactions;
@@ -30,7 +30,6 @@ mod test_support;
 
 use std::sync::Arc;
 
-use hyperscale_bft::{BftConfig, BftCoordinator};
 use hyperscale_core::{Action, ProtocolEvent, StateMachine};
 use hyperscale_execution::{ExecCertStore, ExecutionCoordinator, FinalizedWaveStore};
 use hyperscale_mempool::{MempoolConfig, MempoolCoordinator, TxStore};
@@ -38,6 +37,7 @@ use hyperscale_provisions::{
     OutboundProvisionTracker, ProvisionConfig, ProvisionCoordinator, ProvisionStore,
 };
 use hyperscale_remote_headers::RemoteHeaderCoordinator;
+use hyperscale_shard::{ShardConsensusConfig, ShardCoordinator};
 use hyperscale_storage::RecoveredState;
 use hyperscale_topology::TopologyCoordinator;
 use hyperscale_types::{Block, LocalTimestamp, ShardGroupId, StateRoot, TopologySnapshot};
@@ -47,7 +47,7 @@ use tracing::instrument;
 ///
 /// Composes BFT, execution, mempool, and provisions into a single state
 /// machine. View changes are handled implicitly via local round advancement
-/// in `BftCoordinator` (HotStuff-2 style).
+/// in `ShardCoordinator` (HotStuff-2 style).
 ///
 /// The block-sync state machine itself lives on `NodeHost` (in
 /// `shard_io::sync::block`); when a synced block is ready to apply,
@@ -55,26 +55,26 @@ use tracing::instrument;
 /// which routes it to BFT.
 pub struct NodeStateMachine {
     /// Network topology — passed by reference to subsystem methods.
-    topology: TopologyCoordinator,
+    topology_coordinator: TopologyCoordinator,
 
-    /// BFT consensus state (includes implicit round advancement).
-    bft: BftCoordinator,
+    /// Shard consensus state (includes implicit round advancement).
+    shard_coordinator: ShardCoordinator,
 
     /// Execution state.
-    execution: ExecutionCoordinator,
+    execution_coordinator: ExecutionCoordinator,
 
     /// Mempool state.
-    mempool: MempoolCoordinator,
+    mempool_coordinator: MempoolCoordinator,
 
     /// Provision coordination for cross-shard transactions.
-    provisions: ProvisionCoordinator,
+    provisions_coordinator: ProvisionCoordinator,
 
     /// Retains outbound provisions until the target shard's
     /// execution certificates ACK every transaction they contain.
     outbound_provisions: OutboundProvisionTracker,
 
     /// Remote block header coordination (single source of truth).
-    remote_headers: RemoteHeaderCoordinator,
+    remote_headers_coordinator: RemoteHeaderCoordinator,
 
     /// Current time.
     now: LocalTimestamp,
@@ -83,9 +83,15 @@ pub struct NodeStateMachine {
 impl std::fmt::Debug for NodeStateMachine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NodeStateMachine")
-            .field("validator", &self.topology.snapshot().local_validator_id())
-            .field("shard", &self.topology.snapshot().local_shard())
-            .field("bft", &self.bft)
+            .field(
+                "validator",
+                &self.topology_coordinator.snapshot().local_validator_id(),
+            )
+            .field(
+                "shard_id",
+                &self.topology_coordinator.snapshot().local_shard(),
+            )
+            .field("shard_coordinator", &self.shard_coordinator)
             .field("now", &self.now)
             .finish_non_exhaustive()
     }
@@ -101,8 +107,8 @@ impl NodeStateMachine {
     #[must_use]
     #[allow(clippy::too_many_arguments)] // per-shard-shared stores threaded explicitly
     pub fn new(
-        topology: TopologyCoordinator,
-        bft_config: &BftConfig,
+        topology_coordinator: TopologyCoordinator,
+        shard_config: &ShardConsensusConfig,
         recovered: RecoveredState,
         mempool_config: MempoolConfig,
         provision_config: ProvisionConfig,
@@ -112,19 +118,19 @@ impl NodeStateMachine {
         finalized_wave_store: Arc<FinalizedWaveStore>,
     ) -> Self {
         Self {
-            bft: BftCoordinator::new(bft_config.clone(), recovered),
-            execution: ExecutionCoordinator::with_shared_stores(
+            shard_coordinator: ShardCoordinator::new(shard_config.clone(), recovered),
+            execution_coordinator: ExecutionCoordinator::with_shared_stores(
                 exec_cert_store,
                 finalized_wave_store,
             ),
-            mempool: MempoolCoordinator::with_tx_store(mempool_config, tx_store),
-            provisions: ProvisionCoordinator::with_config_and_store(
+            mempool_coordinator: MempoolCoordinator::with_tx_store(mempool_config, tx_store),
+            provisions_coordinator: ProvisionCoordinator::with_config_and_store(
                 provision_config,
                 Arc::clone(&provision_store),
             ),
             outbound_provisions: OutboundProvisionTracker::new(provision_store),
-            remote_headers: RemoteHeaderCoordinator::new(),
-            topology,
+            remote_headers_coordinator: RemoteHeaderCoordinator::new(),
+            topology_coordinator,
             now: LocalTimestamp::ZERO,
         }
     }
@@ -133,14 +139,14 @@ impl NodeStateMachine {
 
     /// Get this node's shard.
     #[must_use]
-    pub fn shard(&self) -> ShardGroupId {
-        self.topology.snapshot().local_shard()
+    pub fn shard_id(&self) -> ShardGroupId {
+        self.topology_coordinator.snapshot().local_shard()
     }
 
     /// Get the current topology snapshot.
     #[must_use]
     pub fn topology(&self) -> &TopologySnapshot {
-        self.topology.snapshot()
+        self.topology_coordinator.snapshot()
     }
 
     /// Get the current topology snapshot as an `Arc`, for sites that
@@ -150,31 +156,31 @@ impl NodeStateMachine {
     /// handler reads.
     #[must_use]
     pub const fn topology_arc(&self) -> &Arc<TopologySnapshot> {
-        self.topology.snapshot()
+        self.topology_coordinator.snapshot()
     }
 
-    /// Get a reference to the mempool state.
+    /// Get a reference to the mempool coordinator.
     #[must_use]
-    pub const fn mempool(&self) -> &MempoolCoordinator {
-        &self.mempool
+    pub const fn mempool_coordinator(&self) -> &MempoolCoordinator {
+        &self.mempool_coordinator
     }
 
-    /// Get a reference to the BFT state.
+    /// Get a reference to the shard consensus coordinator.
     #[must_use]
-    pub const fn bft(&self) -> &BftCoordinator {
-        &self.bft
+    pub const fn shard_coordinator(&self) -> &ShardCoordinator {
+        &self.shard_coordinator
     }
 
-    /// Get a reference to the execution state.
+    /// Get a reference to the execution coordinator.
     #[must_use]
-    pub const fn execution(&self) -> &ExecutionCoordinator {
-        &self.execution
+    pub const fn execution_coordinator(&self) -> &ExecutionCoordinator {
+        &self.execution_coordinator
     }
 
     /// Get a reference to the provision coordinator.
     #[must_use]
-    pub const fn provisions(&self) -> &ProvisionCoordinator {
-        &self.provisions
+    pub const fn provisions_coordinator(&self) -> &ProvisionCoordinator {
+        &self.provisions_coordinator
     }
 
     /// Get a reference to the outbound provision tracker.
@@ -185,35 +191,35 @@ impl NodeStateMachine {
 
     /// Get a reference to the remote header coordinator.
     #[must_use]
-    pub const fn remote_headers(&self) -> &RemoteHeaderCoordinator {
-        &self.remote_headers
+    pub const fn remote_headers_coordinator(&self) -> &RemoteHeaderCoordinator {
+        &self.remote_headers_coordinator
     }
 
     /// Get the last committed JMT root hash (delegated to BFT's verification pipeline).
     #[must_use]
     pub const fn last_committed_jmt_root(&self) -> StateRoot {
-        self.bft.jmt_root()
+        self.shard_coordinator.jmt_root()
     }
 
     /// Initialize the node with a genesis block.
     ///
     /// Returns actions to be processed (e.g., initial timers).
     pub fn initialize_genesis(&mut self, genesis: &Block) -> Vec<Action> {
-        self.bft
-            .initialize_genesis(self.topology.snapshot(), genesis)
+        self.shard_coordinator
+            .initialize_genesis(self.topology_coordinator.snapshot(), genesis)
     }
 }
 
 impl StateMachine for NodeStateMachine {
     #[instrument(skip(self), fields(
-        validator = self.topology.snapshot().local_validator_id().inner(),
-        shard = self.topology.snapshot().local_shard().inner(),
+        validator = self.topology_coordinator.snapshot().local_validator_id().inner(),
+        shard = self.topology_coordinator.snapshot().local_shard().inner(),
         event = %event.type_name(),
-        height = self.bft.committed_height().inner(),
+        height = self.shard_coordinator.committed_height().inner(),
     ))]
     fn handle(&mut self, now: LocalTimestamp, event: ProtocolEvent) -> Vec<Action> {
         self.now = now;
-        self.bft.set_time(now);
+        self.shard_coordinator.set_time(now);
         let mut actions = match event {
             // ── Timers ───────────────────────────────────────────────────
             ProtocolEvent::CleanupTimer => self.on_cleanup_timer(),
@@ -233,7 +239,7 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::ProposalBuilt { .. }
             | ProtocolEvent::BlockCommitted { .. }
             | ProtocolEvent::BlockPersisted { .. }
-            | ProtocolEvent::FinalizedWavesAdmitted { .. }) => self.handle_bft(evt),
+            | ProtocolEvent::FinalizedWavesAdmitted { .. }) => self.handle_shard(evt),
 
             // ── Provisions ───────────────────────────────────────────────
             evt @ (ProtocolEvent::ProvisionsReceived { .. }
@@ -266,8 +272,11 @@ impl StateMachine for NodeStateMachine {
         };
 
         // Drain any state root verifications that became ready during this event.
-        let local_shard = self.topology.snapshot().local_shard();
-        for ready in self.bft.drain_ready_state_root_verifications(local_shard) {
+        let local_shard = self.topology_coordinator.snapshot().local_shard();
+        for ready in self
+            .shard_coordinator
+            .drain_ready_state_root_verifications(local_shard)
+        {
             actions.push(Action::VerifyStateRoot {
                 block_hash: ready.block_hash,
                 parent_block_hash: ready.parent_block_hash,
@@ -284,7 +293,7 @@ impl StateMachine for NodeStateMachine {
         // BFT's verification path unblocked a deferred proposal), re-enter
         // `try_propose` once with fresh transaction selection — avoids
         // stale txs from the original deferral.
-        if self.bft.take_ready_proposal() {
+        if self.shard_coordinator.take_ready_proposal() {
             actions.extend(self.try_event_driven_proposal());
         }
 

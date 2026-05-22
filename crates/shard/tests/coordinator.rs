@@ -1,26 +1,28 @@
-//! Public-API contract tests for `BftCoordinator`.
+//! Public-API contract tests for `ShardCoordinator`.
 //!
-//! These tests see only the crate's public surface (`use hyperscale_bft::...`),
+//! These tests see only the crate's public surface (`use hyperscale_shard::...`),
 //! so any regression in the documented API is caught here rather than by
 //! inline tests that can reach into private fields.
 
-use hyperscale_bft::{BftConfig, BftCoordinator, BftMemoryStats, BftStats};
+use hyperscale_shard::{ShardConsensusConfig, ShardCoordinator, ShardMemoryStats, ShardStats};
 use hyperscale_storage::RecoveredState;
 use hyperscale_test_helpers::TestCommittee;
 use hyperscale_types::{BlockHeight, LocalTimestamp, Round, TopologySnapshot, VIEW_CHANGE_TIMEOUT};
 
-fn fresh_coordinator(config: BftConfig) -> BftCoordinator {
-    BftCoordinator::new(config, RecoveredState::default())
+fn fresh_coordinator(config: ShardConsensusConfig) -> ShardCoordinator {
+    ShardCoordinator::new(config, RecoveredState::default())
 }
 
-fn fresh_coordinator_with_topology(config: BftConfig) -> (BftCoordinator, TopologySnapshot) {
+fn fresh_coordinator_with_topology(
+    config: ShardConsensusConfig,
+) -> (ShardCoordinator, TopologySnapshot) {
     let topology = TestCommittee::new(4, 42).topology_snapshot(0, 1);
     (fresh_coordinator(config), topology)
 }
 
 #[test]
 fn fresh_coordinator_reports_genesis_chain_state() {
-    let coordinator = fresh_coordinator(BftConfig::default());
+    let coordinator = fresh_coordinator(ShardConsensusConfig::default());
 
     assert_eq!(coordinator.committed_height(), BlockHeight::GENESIS);
     assert!(coordinator.latest_qc().is_none());
@@ -30,7 +32,7 @@ fn fresh_coordinator_reports_genesis_chain_state() {
 
 #[test]
 fn current_view_change_timeout_at_initial_round_is_protocol_base() {
-    let coordinator = fresh_coordinator(BftConfig::default());
+    let coordinator = fresh_coordinator(ShardConsensusConfig::default());
 
     assert_eq!(
         coordinator.current_view_change_timeout(),
@@ -40,8 +42,8 @@ fn current_view_change_timeout_at_initial_round_is_protocol_base() {
 
 #[test]
 fn memory_stats_reports_all_zeros_for_fresh_coordinator() {
-    let coordinator = fresh_coordinator(BftConfig::default());
-    let BftMemoryStats {
+    let coordinator = fresh_coordinator(ShardConsensusConfig::default());
+    let ShardMemoryStats {
         pending_blocks,
         vote_sets,
         pending_commits,
@@ -76,8 +78,8 @@ fn memory_stats_reports_all_zeros_for_fresh_coordinator() {
 
 #[test]
 fn stats_reports_initial_defaults() {
-    let coordinator = fresh_coordinator(BftConfig::default());
-    let BftStats {
+    let coordinator = fresh_coordinator(ShardConsensusConfig::default());
+    let ShardStats {
         view_changes,
         view_syncs,
         current_round,
@@ -99,7 +101,8 @@ fn is_current_proposer_matches_topology() {
     // with `topology.should_propose(height, round)` for that validator.
     for local_idx in 0_u32..4 {
         let topology = committee.topology_snapshot(local_idx as usize, 1);
-        let coordinator = BftCoordinator::new(BftConfig::default(), RecoveredState::default());
+        let coordinator =
+            ShardCoordinator::new(ShardConsensusConfig::default(), RecoveredState::default());
         // Fresh coordinator: latest_qc is None → next height = committed_height + 1 = 1.
         // view = Round::INITIAL = Round::new(0).
         let expected = topology.should_propose(BlockHeight::new(1), Round::INITIAL);
@@ -120,7 +123,8 @@ fn will_propose_next_is_true_for_exactly_one_validator_in_fresh_committee() {
     let mut proposers = 0usize;
     for local_idx in 0_u32..4 {
         let topology = committee.topology_snapshot(local_idx as usize, 1);
-        let coordinator = BftCoordinator::new(BftConfig::default(), RecoveredState::default());
+        let coordinator =
+            ShardCoordinator::new(ShardConsensusConfig::default(), RecoveredState::default());
         if coordinator.will_propose_next(&topology) {
             proposers += 1;
         }
@@ -133,7 +137,7 @@ fn will_propose_next_is_true_for_exactly_one_validator_in_fresh_committee() {
 
 #[test]
 fn proposal_parent_block_hash_falls_back_to_committed_hash_without_qc() {
-    let coordinator = fresh_coordinator(BftConfig::default());
+    let coordinator = fresh_coordinator(ShardConsensusConfig::default());
 
     assert!(coordinator.latest_qc().is_none());
     assert_eq!(
@@ -144,7 +148,8 @@ fn proposal_parent_block_hash_falls_back_to_committed_hash_without_qc() {
 
 #[test]
 fn on_block_persisted_returns_no_actions_when_not_syncing() {
-    let (mut coordinator, topology) = fresh_coordinator_with_topology(BftConfig::default());
+    let (mut coordinator, topology) =
+        fresh_coordinator_with_topology(ShardConsensusConfig::default());
 
     let actions = coordinator.on_block_persisted(&topology, BlockHeight::new(1));
     assert!(actions.is_empty());
@@ -153,7 +158,8 @@ fn on_block_persisted_returns_no_actions_when_not_syncing() {
 
 #[test]
 fn check_round_timeout_does_not_fire_without_recorded_activity() {
-    let (mut coordinator, topology) = fresh_coordinator_with_topology(BftConfig::default());
+    let (mut coordinator, topology) =
+        fresh_coordinator_with_topology(ShardConsensusConfig::default());
 
     // A fresh coordinator has no leader-activity timestamp; `check_round_timeout`
     // must not fire a view change because there's no baseline to time-out

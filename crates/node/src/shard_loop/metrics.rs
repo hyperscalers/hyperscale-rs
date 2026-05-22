@@ -23,10 +23,10 @@ use std::collections::HashMap;
 
 use hyperscale_dispatch::Dispatch;
 use hyperscale_metrics::{
-    MemoryMetrics, set_backpressure_active, set_bft_round, set_fetch_in_flight,
-    set_fetch_oldest_in_flight_age_ms, set_in_flight, set_lock_contention, set_memory_metrics,
-    set_mempool_size, set_sync_blocks_behind, set_sync_in_progress, set_sync_round_in_flight,
-    set_view_changes, set_view_syncs,
+    MemoryMetrics, set_backpressure_active, set_fetch_in_flight, set_fetch_oldest_in_flight_age_ms,
+    set_in_flight, set_lock_contention, set_memory_metrics, set_mempool_size, set_shard_round,
+    set_sync_blocks_behind, set_sync_in_progress, set_sync_round_in_flight, set_view_changes,
+    set_view_syncs,
 };
 use hyperscale_network::Network;
 use hyperscale_storage::Storage;
@@ -60,7 +60,7 @@ pub struct VnodeMetrics {
     /// counts so [`record_metrics`] can label the per-vnode gauges with
     /// both `shard` and `validator_id`.
     pub shard: ShardGroupId,
-    pub bft_round: u64,
+    pub shard_round: u64,
     pub view_changes: u64,
     pub view_syncs: u64,
     pub mempool_size: usize,
@@ -126,7 +126,7 @@ pub fn record_metrics(
     for (validator_id, vnode) in &snapshot.vnodes {
         let s = vnode.shard.inner();
         let v = validator_id.inner();
-        set_bft_round(s, v, vnode.bft_round);
+        set_shard_round(s, v, vnode.shard_round);
         set_view_changes(s, v, vnode.view_changes);
         set_view_syncs(s, v, vnode.view_syncs);
         set_mempool_size(s, v, vnode.mempool_size);
@@ -200,12 +200,12 @@ where
         for vnode in &self.vnodes {
             let v = vnode.validator_id.inner();
             let state = &vnode.state;
-            let bft_stats = state.bft().stats();
-            let mempool = state.mempool();
+            let shard_stats = state.shard_coordinator().stats();
+            let mempool = state.mempool_coordinator();
             let contention = mempool.lock_contention_stats();
-            set_bft_round(s, v, bft_stats.current_round);
-            set_view_changes(s, v, bft_stats.view_changes);
-            set_view_syncs(s, v, bft_stats.view_syncs);
+            set_shard_round(s, v, shard_stats.current_round);
+            set_view_changes(s, v, shard_stats.view_changes);
+            set_view_syncs(s, v, shard_stats.view_syncs);
             set_mempool_size(s, v, mempool.len());
             set_lock_contention(s, v, contention.contention_ratio());
             set_in_flight(s, v, mempool.in_flight());
@@ -258,16 +258,16 @@ where
             for vnode_idx in 0..self.vnodes_len(shard) {
                 let vnode = self.vnode(shard, vnode_idx);
                 let state = &vnode.state;
-                let bft_stats = state.bft().stats();
-                let mempool = state.mempool();
+                let shard_stats = state.shard_coordinator().stats();
+                let mempool = state.mempool_coordinator();
                 let contention = mempool.lock_contention_stats();
                 vnodes.insert(
                     vnode.validator_id,
                     VnodeMetrics {
                         shard,
-                        bft_round: bft_stats.current_round,
-                        view_changes: bft_stats.view_changes,
-                        view_syncs: bft_stats.view_syncs,
+                        shard_round: shard_stats.current_round,
+                        view_changes: shard_stats.view_changes,
+                        view_syncs: shard_stats.view_syncs,
                         mempool_size: mempool.len(),
                         contention_ratio: contention.contention_ratio(),
                         in_flight: mempool.in_flight(),
@@ -285,30 +285,30 @@ where
             .next()
             .expect("NodeHost hosts at least one shard");
         let primary_vnode = &self.vnode(primary_shard, 0).state;
-        let bft_mem = primary_vnode.bft().memory_stats();
-        let exec_mem = primary_vnode.execution().memory_stats();
-        let mempool_mem = primary_vnode.mempool().memory_stats();
-        let prov_mem = primary_vnode.provisions().memory_stats();
-        let rh_mem = primary_vnode.remote_headers().memory_stats();
+        let shard_mem = primary_vnode.shard_coordinator().memory_stats();
+        let exec_mem = primary_vnode.execution_coordinator().memory_stats();
+        let mempool_mem = primary_vnode.mempool_coordinator().memory_stats();
+        let prov_mem = primary_vnode.provisions_coordinator().memory_stats();
+        let rh_mem = primary_vnode.remote_headers_coordinator().memory_stats();
         let fetches = self.shard_io(primary_shard).fetches.metrics();
         let block_sync_status = self.shard_io(primary_shard).syncs.block.block_sync_status();
 
         let memory = MemoryMetrics {
             // BFT
-            bft_pending_blocks: bft_mem.pending_blocks,
-            bft_vote_sets: bft_mem.vote_sets,
-            bft_pending_commits: bft_mem.pending_commits,
-            bft_pending_commits_awaiting_data: bft_mem.pending_commits_awaiting_data,
-            bft_voted_heights: bft_mem.voted_heights,
-            bft_received_votes_by_height: bft_mem.received_votes_by_height,
-            bft_committed_tx_lookup: bft_mem.committed_tx_lookup,
-            bft_committed_cert_lookup: bft_mem.committed_cert_lookup,
-            bft_committed_provision_lookup: bft_mem.committed_provision_lookup,
-            bft_pending_qc_verifications: bft_mem.pending_qc_verifications,
-            bft_verified_qcs: bft_mem.verified_qcs,
-            bft_pending_state_root_verifications: bft_mem.pending_state_root_verifications,
-            bft_buffered_synced_blocks: bft_mem.buffered_synced_blocks,
-            bft_pending_synced_block_verifications: bft_mem.pending_synced_block_verifications,
+            shard_pending_blocks: shard_mem.pending_blocks,
+            shard_vote_sets: shard_mem.vote_sets,
+            shard_pending_commits: shard_mem.pending_commits,
+            shard_pending_commits_awaiting_data: shard_mem.pending_commits_awaiting_data,
+            shard_voted_heights: shard_mem.voted_heights,
+            shard_received_votes_by_height: shard_mem.received_votes_by_height,
+            shard_committed_tx_lookup: shard_mem.committed_tx_lookup,
+            shard_committed_cert_lookup: shard_mem.committed_cert_lookup,
+            shard_committed_provision_lookup: shard_mem.committed_provision_lookup,
+            shard_pending_qc_verifications: shard_mem.pending_qc_verifications,
+            shard_verified_qcs: shard_mem.verified_qcs,
+            shard_pending_state_root_verifications: shard_mem.pending_state_root_verifications,
+            shard_buffered_synced_blocks: shard_mem.buffered_synced_blocks,
+            shard_pending_synced_block_verifications: shard_mem.pending_synced_block_verifications,
             // Execution
             exec_cache_entries: exec_mem.wave_execution_receipts,
             exec_finalized_wave_certificates: exec_mem.finalized_wave_certificates,

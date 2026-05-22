@@ -32,13 +32,16 @@ impl NodeStateMachine {
         // duplicates that will be filtered by BFT during proposal building.
         let max_txs = MAX_TXS_PER_BLOCK
             + self
-                .bft
-                .dedup_overhead(self.topology.snapshot().local_shard());
-        let ready_txs =
-            self.mempool
-                .ready_transactions(max_txs, pending_txs, pending_certs, self.now);
-        let finalized_waves = self.execution.get_finalized_waves();
-        let provisions = self.provisions.queued_provisions(self.now);
+                .shard_coordinator
+                .dedup_overhead(self.topology_coordinator.snapshot().local_shard());
+        let ready_txs = self.mempool_coordinator.ready_transactions(
+            max_txs,
+            pending_txs,
+            pending_certs,
+            self.now,
+        );
+        let finalized_waves = self.execution_coordinator.get_finalized_waves();
+        let provisions = self.provisions_coordinator.queued_provisions(self.now);
 
         ProposalInputs {
             ready_txs,
@@ -50,11 +53,11 @@ impl NodeStateMachine {
     /// Shared proposal logic for the post-dispatch retry hook and the
     /// QC-formed path.
     pub(super) fn try_event_driven_proposal(&mut self) -> Vec<Action> {
-        let (pending_txs, pending_certs) = self.bft.pending_block_counts();
+        let (pending_txs, pending_certs) = self.shard_coordinator.pending_block_counts();
         let inputs = self.gather_proposal_inputs(pending_txs, pending_certs);
 
-        self.bft.try_propose(
-            self.topology.snapshot(),
+        self.shard_coordinator.try_propose(
+            self.topology_coordinator.snapshot(),
             &inputs.ready_txs,
             inputs.finalized_waves,
             inputs.provisions,

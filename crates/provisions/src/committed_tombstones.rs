@@ -1,7 +1,7 @@
 //! Committed-provision tombstones anchored on `local_committed_ts`.
 //!
 //! Mirrors the BFT-side
-//! [`CommitDedupIndex::provision_retention`](hyperscale_bft::commit_dedup)
+//! [`CommitDedupIndex::provision_retention`](hyperscale_shard::commit_dedup)
 //! window so a late re-arrival of an already-committed batch — gossip
 //! retransmit, fetch fall-through, range-sync delivery — is dropped at
 //! receipt instead of slipping past the pipeline guards and re-entering

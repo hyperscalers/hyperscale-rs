@@ -127,7 +127,8 @@ fn build_transfer_tx(signer_seed: u8, recipient_seed: u8) -> RoutableTransaction
 /// distinction matters.
 fn tx_reached_terminal_state(runner: &SimulationRunner, node_idx: u32, tx_hash: TxHash) -> bool {
     let node = runner.node(node_idx).expect("node exists");
-    node.execution().is_finalized(tx_hash) || node.mempool().is_tombstoned(&tx_hash)
+    node.execution_coordinator().is_finalized(tx_hash)
+        || node.mempool_coordinator().is_tombstoned(&tx_hash)
 }
 
 #[traced_test]
@@ -186,7 +187,13 @@ fn transaction_fetch_fallback_when_gossip_dropped() {
         }
 
         let max_height = (0..4)
-            .map(|i| runner.node(i).unwrap().bft().committed_height())
+            .map(|i| {
+                runner
+                    .node(i)
+                    .unwrap()
+                    .shard_coordinator()
+                    .committed_height()
+            })
             .max()
             .unwrap();
         assert!(

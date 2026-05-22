@@ -74,6 +74,6 @@ mod view_change;
 mod vote_keeper;
 mod vote_set;
 
-pub use config::BftConfig;
-pub use coordinator::{BftCoordinator, BftMemoryStats, BftStats};
+pub use config::ShardConsensusConfig;
+pub use coordinator::{ShardCoordinator, ShardMemoryStats, ShardStats};
 pub use verification::ReadyStateRootVerification;

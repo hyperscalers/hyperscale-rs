@@ -15,8 +15,8 @@ impl NodeStateMachine {
     pub(super) fn handle_sync(&mut self, event: ProtocolEvent) -> Vec<Action> {
         match event {
             ProtocolEvent::BlockSyncReadyToApply { certified } => {
-                self.bft.on_sync_block_ready_to_apply(
-                    self.topology.snapshot(),
+                self.shard_coordinator.on_sync_block_ready_to_apply(
+                    self.topology_coordinator.snapshot(),
                     std::sync::Arc::unwrap_or_clone(certified),
                 )
             }
@@ -24,15 +24,20 @@ impl NodeStateMachine {
             // expected provisions + flush expected headers, all in one
             // pass.
             ProtocolEvent::BlockSyncComplete { .. } => {
-                let topo = self.topology.snapshot();
-                let mut actions = self.bft.on_block_sync_complete(topo);
-                actions.extend(self.remote_headers.flush_expected_headers(topo));
-                actions.extend(self.provisions.flush_expected_provisions());
+                let topo = self.topology_coordinator.snapshot();
+                let mut actions = self.shard_coordinator.on_block_sync_complete(topo);
+                actions.extend(self.remote_headers_coordinator.flush_expected_headers(topo));
+                actions.extend(self.provisions_coordinator.flush_expected_provisions());
                 actions
             }
-            ProtocolEvent::CommittedStateRestored { height, hash, qc } => self
-                .bft
-                .on_committed_state_restored(self.topology.snapshot(), height, hash, qc),
+            ProtocolEvent::CommittedStateRestored { height, hash, qc } => {
+                self.shard_coordinator.on_committed_state_restored(
+                    self.topology_coordinator.snapshot(),
+                    height,
+                    hash,
+                    qc,
+                )
+            }
             // Acknowledged but unused for now. Commit 4 wires
             // `RemoteHeaderCoordinator` to clear its per-shard "syncing"
             // flag here.
@@ -128,17 +133,17 @@ mod tests {
 
     /// `CommittedStateRestored` is the boot-time hand-off from `RocksDB`
     /// to the in-memory BFT state. The orchestrator routes it to
-    /// `bft.on_committed_state_restored`, which restores
+    /// `shard.on_committed_state_restored`, which restores
     /// `committed_height` so subsequent header validation and pending-
     /// block routing accept blocks at the correct tip. A regression
     /// that drops the routing leaves a freshly-booted node convinced
     /// it's still at genesis — silent until the first real header
     /// arrives and gets rejected as "below committed height".
     #[test]
-    fn committed_state_restored_advances_bft_committed_height() {
+    fn committed_state_restored_advances_shard_committed_height() {
         let TestNode { mut node, .. } = TestNode::new();
         assert_eq!(
-            node.bft().committed_height(),
+            node.shard_coordinator().committed_height(),
             BlockHeight::new(0),
             "fresh node must start at genesis",
         );
@@ -154,7 +159,7 @@ mod tests {
         );
 
         assert_eq!(
-            node.bft().committed_height(),
+            node.shard_coordinator().committed_height(),
             restored_height,
             "committed height must reflect the restored value",
         );

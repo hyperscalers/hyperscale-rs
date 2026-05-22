@@ -16,7 +16,6 @@ Rust implementation of Hyperscale consensus protocol.
 
 | Crate | Purpose |
 |-------|---------|
-| [`bft`](crates/bft) | BFT consensus: block proposal, voting, QC formation, view changes |
 | [`core`](crates/core) | The `StateMachine` and `SubStateMachine` traits that everything implements |
 | [`dispatch`](crates/dispatch) | Abstract trait for scheduling CPU-intensive work across priority-isolated pools |
 | [`dispatch-pooled`](crates/dispatch-pooled) | Production dispatch using rayon thread pools with core allocation and pinning |
@@ -35,6 +34,7 @@ Rust implementation of Hyperscale consensus protocol.
 | [`production`](crates/production) | Production runner: async event loop, RPC server, telemetry |
 | [`provisions`](crates/provisions) | Centralized provision coordination for cross-shard transactions |
 | [`remote-headers`](crates/remote-headers) | Centralized remote block header coordination for cross-shard verification |
+| [`shard`](crates/shard) | Shard consensus (HotStuff-2): block proposal, voting, QC formation, view changes |
 | [`simulation`](crates/simulation) | Deterministic simulation runner with event queue and multi-node orchestration |
 | [`simulator`](crates/simulator) | CLI tool for running simulations with metrics |
 | [`spammer`](crates/spammer) | Transaction spammer CLI and library for load testing |

@@ -57,33 +57,33 @@ pub struct ChannelDepths {
 pub struct MemoryMetrics {
     // ── BFT ──
     /// Blocks being assembled from headers + transactions.
-    pub bft_pending_blocks: usize,
+    pub shard_pending_blocks: usize,
     /// Vote sets per block (unverified + verified votes).
-    pub bft_vote_sets: usize,
+    pub shard_vote_sets: usize,
     /// Out-of-order commits buffered.
-    pub bft_pending_commits: usize,
+    pub shard_pending_commits: usize,
     /// Commits waiting for block data (header/txs).
-    pub bft_pending_commits_awaiting_data: usize,
+    pub shard_pending_commits_awaiting_data: usize,
     /// Heights we have voted on (equivocation guard).
-    pub bft_voted_heights: usize,
+    pub shard_voted_heights: usize,
     /// Votes received per (height, validator) pair.
-    pub bft_received_votes_by_height: usize,
+    pub shard_received_votes_by_height: usize,
     /// Committed transaction hash lookup.
-    pub bft_committed_tx_lookup: usize,
+    pub shard_committed_tx_lookup: usize,
     /// Committed wave certificate lookup.
-    pub bft_committed_cert_lookup: usize,
+    pub shard_committed_cert_lookup: usize,
     /// Committed provision batch lookup.
-    pub bft_committed_provision_lookup: usize,
+    pub shard_committed_provision_lookup: usize,
     /// Block headers pending QC verification.
-    pub bft_pending_qc_verifications: usize,
+    pub shard_pending_qc_verifications: usize,
     /// Cache of verified QC signatures.
-    pub bft_verified_qcs: usize,
+    pub shard_verified_qcs: usize,
     /// Blocks waiting for JMT to reach parent state.
-    pub bft_pending_state_root_verifications: usize,
+    pub shard_pending_state_root_verifications: usize,
     /// Out-of-order synced blocks.
-    pub bft_buffered_synced_blocks: usize,
+    pub shard_buffered_synced_blocks: usize,
     /// Synced blocks pending QC verification.
-    pub bft_pending_synced_block_verifications: usize,
+    pub shard_pending_synced_block_verifications: usize,
 
     // ── Execution ──
     /// In-memory write sets per transaction.
@@ -250,7 +250,7 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     fn set_block_height(&self, shard: u64, height: u64) {}
 
     /// Set the current BFT round gauge for one hosted vnode.
-    fn set_bft_round(&self, shard: u64, validator_id: u64, round: u64) {}
+    fn set_shard_round(&self, shard: u64, validator_id: u64, round: u64) {}
 
     /// Set the view changes gauge (self-originated round advances) for one vnode.
     fn set_view_changes(&self, shard: u64, validator_id: u64, count: u64) {}
@@ -612,8 +612,8 @@ pub fn set_block_height(shard: u64, height: u64) {
 
 /// Set the current BFT round gauge for one hosted vnode.
 #[inline]
-pub fn set_bft_round(shard: u64, validator_id: u64, round: u64) {
-    recorder().set_bft_round(shard, validator_id, round);
+pub fn set_shard_round(shard: u64, validator_id: u64, round: u64) {
+    recorder().set_shard_round(shard, validator_id, round);
 }
 
 /// Set the view changes gauge for one hosted vnode.

@@ -192,7 +192,7 @@ impl LivelockAnalyzer {
                 u32::try_from(shard_idx).unwrap_or(u32::MAX) * validators_per_shard;
 
             if let Some(node) = runner.node(first_node_idx) {
-                let incomplete = node.mempool().incomplete_transactions();
+                let incomplete = node.mempool_coordinator().incomplete_transactions();
 
                 for (hash, status, tx) in incomplete {
                     // Avoid duplicates (same transaction may appear on multiple shards)

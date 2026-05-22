@@ -115,10 +115,10 @@ fn test_single_shard_unaffected_by_backpressure() {
 
     // Verify transaction was processed
     let node = runner.node(0).unwrap();
-    let status = node.mempool().status(&tx_hash);
+    let status = node.mempool_coordinator().status(&tx_hash);
 
     // Check backpressure state - now driven by mempool's in_flight count
-    let mempool = node.mempool();
+    let mempool = node.mempool_coordinator();
     let in_flight = mempool.in_flight();
     let at_limit = mempool.at_in_flight_limit();
 
@@ -179,7 +179,7 @@ fn test_provision_coordinator_tracking() {
 
     // Check backpressure state - driven by mempool
     let node = runner.node(0).unwrap();
-    let mempool = node.mempool();
+    let mempool = node.mempool_coordinator();
 
     let in_flight = mempool.in_flight();
     let at_limit = mempool.at_in_flight_limit();
@@ -237,7 +237,7 @@ fn test_mempool_backpressure_integration() {
 
     // Check backpressure state via mempool
     let node = runner.node(0).unwrap();
-    let mempool = node.mempool();
+    let mempool = node.mempool_coordinator();
 
     let mempool_size = mempool.len();
     let in_flight = mempool.in_flight();
@@ -265,7 +265,7 @@ fn test_provision_lifecycle_tracking() {
     for node_idx in 0..6u32 {
         // 2 shards × 3 validators
         let node = runner.node(node_idx).unwrap();
-        let mempool = node.mempool();
+        let mempool = node.mempool_coordinator();
 
         let in_flight = mempool.in_flight();
         let at_limit = mempool.at_in_flight_limit();
@@ -296,7 +296,7 @@ fn test_provision_metrics_accessible() {
 
     // Verify we can access the metrics-relevant data
     let node = runner.node(0).unwrap();
-    let mempool = node.mempool();
+    let mempool = node.mempool_coordinator();
 
     // These are the methods used by production metrics
     let in_flight = mempool.in_flight();
@@ -326,7 +326,7 @@ fn test_provisions_pending_verification() {
     runner.run_until(Duration::from_millis(200));
 
     let node = runner.node(0).unwrap();
-    let mempool = node.mempool();
+    let mempool = node.mempool_coordinator();
 
     // The mempool should be in a valid state
     let in_flight = mempool.in_flight();
@@ -376,8 +376,8 @@ fn test_completed_tx_cleanup() {
 
     // Check final state
     let node = runner.node(0).unwrap();
-    let status = node.mempool().status(&tx_hash);
-    let in_flight = node.mempool().in_flight();
+    let status = node.mempool_coordinator().status(&tx_hash);
+    let in_flight = node.mempool_coordinator().in_flight();
 
     println!("Final state: status={status:?}, in_flight={in_flight}");
 
@@ -405,7 +405,7 @@ fn test_multi_node_provision_consistency() {
     let mut all_consistent = true;
     for node_idx in 0..6u32 {
         let node = runner.node(node_idx).unwrap();
-        let at_limit = node.mempool().at_in_flight_limit();
+        let at_limit = node.mempool_coordinator().at_in_flight_limit();
         if at_limit {
             println!("Node {node_idx} unexpectedly at backpressure limit");
             all_consistent = false;

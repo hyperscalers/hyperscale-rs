@@ -39,7 +39,7 @@ fn test_v2_same_shard_hosting_makes_progress() {
             runner
                 .vnode_state(ValidatorId::new(i))
                 .expect("validator should be hosted")
-                .bft()
+                .shard_coordinator()
                 .committed_height()
         })
         .collect();

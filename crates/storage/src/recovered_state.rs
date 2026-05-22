@@ -6,7 +6,7 @@ use hyperscale_types::{BlockHash, BlockHeight, QuorumCertificate, StateRoot};
 /// State recovered from storage on startup.
 ///
 /// Constructed by storage backends (e.g. `RocksDbStorage::load_recovered_state`)
-/// and passed to `BftCoordinator::new()` to restore consensus state after a
+/// and passed to `ShardCoordinator::new()` to restore consensus state after a
 /// crash/restart. For a fresh start, use `RecoveredState::default()`.
 #[derive(Debug, Clone, Default)]
 pub struct RecoveredState {

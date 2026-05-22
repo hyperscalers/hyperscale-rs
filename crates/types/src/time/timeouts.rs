@@ -36,7 +36,7 @@ pub const WAVE_TIMEOUT: Duration = Duration::from_secs(24);
 
 /// How long to retain remote block headers below each shard's tip.
 ///
-/// Shared by `hyperscale-bft` (deferral-proof verification) and
+/// Shared by `hyperscale-shard` (deferral-proof verification) and
 /// `hyperscale-remote-headers` (provision/exec-cert verification). Measured
 /// against the BFT-authenticated `weighted_timestamp_ms` on the tip vs the
 /// stored header. Sized generously above `WAVE_TIMEOUT` so late-arriving

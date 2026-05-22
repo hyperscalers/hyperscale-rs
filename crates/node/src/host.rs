@@ -139,13 +139,13 @@ where
                 .remove(shard)
                 .expect("hosted shard derived from vnodes — at least one vnode exists for it");
             let rep = inits.first().expect("group non-empty by construction");
-            let initial_persisted_height = rep.state.bft().committed_height();
+            let initial_persisted_height = rep.state.shard_coordinator().committed_height();
             let caches = SharedCaches::new(
-                Arc::clone(rep.state.provisions().store()),
-                Arc::clone(rep.state.provisions().verified_headers()),
-                Arc::clone(rep.state.mempool().tx_store()),
-                Arc::clone(rep.state.execution().exec_cert_store()),
-                Arc::clone(rep.state.execution().finalized_wave_store()),
+                Arc::clone(rep.state.provisions_coordinator().store()),
+                Arc::clone(rep.state.provisions_coordinator().verified_headers()),
+                Arc::clone(rep.state.mempool_coordinator().tx_store()),
+                Arc::clone(rep.state.execution_coordinator().exec_cert_store()),
+                Arc::clone(rep.state.execution_coordinator().finalized_wave_store()),
             );
             let storage = storages
                 .remove(shard)

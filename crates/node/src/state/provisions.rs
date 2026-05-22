@@ -13,8 +13,8 @@ impl NodeStateMachine {
     pub(super) fn handle_provisions(&mut self, event: ProtocolEvent) -> Vec<Action> {
         match event {
             ProtocolEvent::ProvisionsReceived { provisions } => {
-                self.provisions.on_state_provisions_received(
-                    self.topology.snapshot(),
+                self.provisions_coordinator.on_state_provisions_received(
+                    self.topology_coordinator.snapshot(),
                     std::sync::Arc::unwrap_or_clone(provisions),
                 )
             }
@@ -22,7 +22,7 @@ impl NodeStateMachine {
                 provisions,
                 committed_header,
                 valid,
-            } => self.provisions.on_state_provisions_verified(
+            } => self.provisions_coordinator.on_state_provisions_verified(
                 provisions,
                 committed_header.as_ref(),
                 valid,
@@ -30,9 +30,9 @@ impl NodeStateMachine {
             ),
             ProtocolEvent::ProvisionsAdmitted { provisions, .. } => {
                 let actions = self
-                    .bft
-                    .on_provisions_admitted(self.topology.snapshot(), &[provisions]);
-                self.bft.queue_ready_proposal();
+                    .shard_coordinator
+                    .on_provisions_admitted(self.topology_coordinator.snapshot(), &[provisions]);
+                self.shard_coordinator.queue_ready_proposal();
                 actions
             }
             ProtocolEvent::OutboundProvisionBroadcast {
