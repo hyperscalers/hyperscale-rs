@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use hyperscale_core::{Action, ActionContext, ProtocolEvent};
+use hyperscale_core::{Action, ActionContext, Parallelism, ProtocolEvent};
 use hyperscale_engine::{
     CachedSlot, CachedVmOutput, ProcessExecutionCache, SlotStatus, build_cross_shard_ownership,
     project_to_shard, resolve_owned_nodes,
@@ -235,62 +235,54 @@ fn participating_shards(
         .map(move |n| shard_for_node(n, num_shards))
 }
 
-/// Two-pass cache acquisition for a batch of transactions.
+/// Plan derived for each position in a batch by classifying its
+/// `ProcessExecutionCache` slot up-front. `Done` skips work; `Claimed`
+/// runs `compute` and fills the slot; `Pending` blocks on another
+/// worker's slot via `get_or_init` (the closure only fires if the
+/// claimant abandoned the slot without setting a value).
+enum Plan {
+    Done(Arc<CachedVmOutput>),
+    Claimed(CachedSlot),
+    Pending(CachedSlot),
+}
+
+/// Two-phase cache acquisition for a batch of transactions.
 ///
-/// First pass: try each slot non-blockingly. Hits land in `results`,
-/// claimed slots run `compute` and set the slot inline, pending slots
-/// get deferred. Retry pass: harvest any deferred slot that has since
-/// completed; if a full pass yields nothing, block on one remaining
-/// slot to advance — every remaining entry is in-flight on another
-/// worker and there's no useful work for this thread to find on its
-/// own. Output position matches input position regardless of completion
-/// order.
+/// Phase 1 classifies every position sequentially via `try_acquire` —
+/// cheap `DashMap` lookups that publish all Claimed slots to other
+/// concurrent batches before any compute starts. Phase 2 fans out via
+/// `par.map`: `Done` returns the cached value, `Claimed` runs `compute`
+/// and fills the slot, `Pending` blocks via `OnceLock::get_or_init`
+/// (each blocked worker waits only on its own slot, so the wait
+/// parallelises across the pool).
 fn batch_compute_cached(
+    par: Parallelism,
     cache: &ProcessExecutionCache,
     txs: &[Arc<RoutableTransaction>],
     num_shards: u64,
-    compute: impl Fn(usize) -> CachedVmOutput,
+    compute: impl Fn(usize) -> CachedVmOutput + Send + Sync,
 ) -> Vec<Arc<CachedVmOutput>> {
-    let n = txs.len();
-    let mut results: Vec<Option<Arc<CachedVmOutput>>> = (0..n).map(|_| None).collect();
-    let mut pending: Vec<(usize, CachedSlot)> = Vec::new();
+    let plans: Vec<(usize, Plan)> = txs
+        .iter()
+        .enumerate()
+        .map(
+            |(i, tx)| match cache.try_acquire(tx.hash(), participating_shards(tx, num_shards)) {
+                SlotStatus::Completed(v) => (i, Plan::Done(v)),
+                SlotStatus::Claimed(slot) => (i, Plan::Claimed(slot)),
+                SlotStatus::Pending(slot) => (i, Plan::Pending(slot)),
+            },
+        )
+        .collect();
 
-    for (i, tx) in txs.iter().enumerate() {
-        let tx_hash = tx.hash();
-        match cache.try_acquire(tx_hash, participating_shards(tx, num_shards)) {
-            SlotStatus::Completed(v) => results[i] = Some(v),
-            SlotStatus::Claimed(slot) => {
-                let value = Arc::new(compute(i));
-                let _ = slot.set(Arc::clone(&value));
-                results[i] = Some(value);
-            }
-            SlotStatus::Pending(slot) => pending.push((i, slot)),
+    par.map(plans, |(i, plan)| match plan {
+        Plan::Done(v) => v,
+        Plan::Claimed(slot) => {
+            let value = Arc::new(compute(i));
+            let _ = slot.set(Arc::clone(&value));
+            value
         }
-    }
-
-    while !pending.is_empty() {
-        let mut still_pending: Vec<(usize, CachedSlot)> = Vec::with_capacity(pending.len());
-        let mut harvested = false;
-        for (i, slot) in std::mem::take(&mut pending) {
-            if let Some(v) = slot.get() {
-                results[i] = Some(Arc::clone(v));
-                harvested = true;
-            } else {
-                still_pending.push((i, slot));
-            }
-        }
-        if !harvested && !still_pending.is_empty() {
-            // No progress and every remaining slot is in-flight elsewhere;
-            // block on one. The closure runs only if the original claimant
-            // abandoned the slot without setting a value.
-            let (i, slot) = still_pending.swap_remove(0);
-            let value = slot.get_or_init(|| Arc::new(compute(i)));
-            results[i] = Some(Arc::clone(value));
-        }
-        pending = still_pending;
-    }
-
-    results.into_iter().map(Option::unwrap).collect()
+        Plan::Pending(slot) => Arc::clone(slot.get_or_init(|| Arc::new(compute(i)))),
+    })
 }
 
 /// Outcomes flow through `ctx.notify`. Variants owned by other coordinator
@@ -367,6 +359,7 @@ where
             let view = ctx.pending_chain.view_at(block_hash, block_height);
             let view_snap = <SubstateView<_> as SubstateStore>::snapshot(&*view);
             let cached = batch_compute_cached(
+                ctx.par,
                 ctx.execution_cache.as_ref(),
                 transactions.as_slice(),
                 num_shards,
@@ -447,8 +440,12 @@ where
                 })
                 .collect();
 
-            let cached =
-                batch_compute_cached(ctx.execution_cache.as_ref(), &txs, num_shards, |i| {
+            let cached = batch_compute_cached(
+                ctx.par,
+                ctx.execution_cache.as_ref(),
+                &txs,
+                num_shards,
+                |i| {
                     let req = &requests[i];
                     ownerships[i].as_ref().map_or_else(
                         |_| CachedVmOutput::ownership_conflict_aborted(req.transaction.hash()),
@@ -461,7 +458,8 @@ where
                             )
                         },
                     )
-                });
+                },
+            );
             let empty_ownership: HashMap<NodeId, NodeId> = HashMap::new();
             let (tx_outcomes, results): (Vec<_>, Vec<_>) = requests
                 .iter()

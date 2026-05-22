@@ -43,6 +43,7 @@ pub use action::{Action, ActionOwner, CrossShardExecutionRequest, ProvisionsRequ
 pub use action_context::{ActionContext, PreparedBlock};
 pub use fetch_abandon::FetchAbandon;
 pub use fetch_request::FetchRequest;
+pub use hyperscale_dispatch::Parallelism;
 pub use protocol_event::{CommitSource, ProtocolEvent, VerificationKind};
 pub use timer::TimerId;
 pub use traits::StateMachine;

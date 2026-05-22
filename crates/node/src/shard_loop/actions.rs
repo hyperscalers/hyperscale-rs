@@ -568,6 +568,7 @@ where
         let topology_snapshot = Arc::clone(vnode.state.topology_arc());
         let event_tx = self.event_sender().clone();
         let signing_key = Arc::clone(&vnode.signing_key);
+        let par = self.process.dispatch.parallelism();
 
         self.process.dispatch.spawn(pool, move || {
             let shard_handles = handles
@@ -593,6 +594,7 @@ where
                 signing_key: &signing_key,
                 notify: &notify,
                 commit_prepared: &commit_prepared,
+                par,
             };
             match action.owner() {
                 ActionOwner::Bft => handle_bft_action(action, &ctx),

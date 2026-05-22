@@ -3,7 +3,7 @@
 //! [`SyncDispatch`] runs all closures inline on the calling thread,
 //! ensuring deterministic execution order. Queue depths are always 0.
 
-use hyperscale_dispatch::{Dispatch, DispatchPool};
+use hyperscale_dispatch::{Dispatch, DispatchPool, Parallelism};
 
 /// Synchronous dispatch that runs closures inline.
 ///
@@ -27,6 +27,10 @@ impl Dispatch for SyncDispatch {
 
     fn queue_depth(&self, _pool: DispatchPool) -> usize {
         0
+    }
+
+    fn parallelism(&self) -> Parallelism {
+        Parallelism::Sequential
     }
 }
 

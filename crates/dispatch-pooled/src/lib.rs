@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use core_affinity::{get_core_ids, set_for_current};
-use hyperscale_dispatch::{Dispatch, DispatchPool};
+use hyperscale_dispatch::{Dispatch, DispatchPool, Parallelism};
 use hyperscale_metrics::record_pool_task_completed;
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use thiserror::Error;
@@ -529,6 +529,10 @@ impl Dispatch for PooledDispatch {
 
     fn queue_depth(&self, pool: DispatchPool) -> usize {
         self.pending_counter(pool).load(Ordering::Relaxed)
+    }
+
+    fn parallelism(&self) -> Parallelism {
+        Parallelism::Rayon
     }
 }
 

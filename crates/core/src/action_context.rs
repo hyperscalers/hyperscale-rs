@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use hyperscale_dispatch::Parallelism;
 use hyperscale_engine::{ProcessExecutionCache, RadixExecutor};
 use hyperscale_network::Network;
 use hyperscale_storage::{PendingChain, Storage};
@@ -50,6 +51,12 @@ pub struct ActionContext<'a, S: Storage, N: Network> {
     /// `PendingChain` + `prepared_commits`. Only `BuildProposal` and
     /// `VerifyStateRoot` produce these.
     pub commit_prepared: &'a (dyn Fn(PreparedBlock<S::PreparedCommit>) + Send + Sync),
+    /// Parallelism strategy for in-handler batch fan-out. Sourced from
+    /// the dispatch backend at spawn time so handlers running on
+    /// `PooledDispatch` use rayon `par_iter` (work-stealing across the
+    /// current pool's workers) and handlers running on `SyncDispatch`
+    /// iterate sequentially for deterministic simulation.
+    pub par: Parallelism,
 }
 
 impl<S: Storage, N: Network> ActionContext<'_, S, N> {

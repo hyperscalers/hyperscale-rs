@@ -5,6 +5,7 @@ edition.workspace = true
 description = "Dispatch trait for work scheduling across priority-isolated pools"
 
 [dependencies]
+rayon.workspace = true
 
 [lints]
 workspace = true

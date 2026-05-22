@@ -42,6 +42,46 @@ pub enum DispatchPool {
     Io,
 }
 
+/// Parallelism strategy advertised by a [`Dispatch`] backend.
+///
+/// Threaded through to delegated-action handlers (via `ActionContext`)
+/// so they can fan a batch of independent work out across the dispatched
+/// pool's workers in production, while still iterating sequentially under
+/// the deterministic simulation runner.
+///
+/// [`Parallelism::map`] is the typical entry point: a parallel-map
+/// equivalent to `items.into_par_iter().map(f).collect()` in production
+/// and the plain sequential `items.into_iter()...` in simulation. Both
+/// preserve input order in the returned `Vec`.
+#[derive(Copy, Clone, Debug)]
+pub enum Parallelism {
+    /// Rayon `par_iter` on the current pool. When called from inside a
+    /// closure already running on a rayon pool (the standard case for
+    /// delegated-action handlers), work-stealing fans out across that
+    /// pool's workers.
+    Rayon,
+    /// Sequential `iter`, deterministic, runs on the caller's thread.
+    /// Used by the simulation runner so thread-local state (metrics
+    /// recorders, fault-test ordering) stays intact.
+    Sequential,
+}
+
+impl Parallelism {
+    /// Map `items` to `Vec<R>` using this strategy.
+    pub fn map<T, R, F>(self, items: Vec<T>, f: F) -> Vec<R>
+    where
+        T: Send,
+        R: Send,
+        F: Fn(T) -> R + Send + Sync,
+    {
+        use rayon::prelude::*;
+        match self {
+            Self::Rayon => items.into_par_iter().map(f).collect(),
+            Self::Sequential => items.into_iter().map(f).collect(),
+        }
+    }
+}
+
 /// Trait for dispatching CPU-intensive work to priority-isolated pools.
 ///
 /// Implementations schedule fire-and-forget closures on appropriate pools.
@@ -52,4 +92,9 @@ pub trait Dispatch: Send + Sync + Clone + 'static {
 
     /// Current queue depth for the given pool.
     fn queue_depth(&self, pool: DispatchPool) -> usize;
+
+    /// Parallelism strategy this backend uses for in-handler fan-out.
+    /// Production runners return [`Parallelism::Rayon`]; the simulation
+    /// runner returns [`Parallelism::Sequential`].
+    fn parallelism(&self) -> Parallelism;
 }
