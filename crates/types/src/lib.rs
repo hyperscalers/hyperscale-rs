@@ -23,12 +23,14 @@ mod signing;
 mod time;
 
 // Consensus types
+mod beacon;
 mod receipt;
 mod shard;
 mod topology;
 mod transaction;
 mod wave;
 
+pub use beacon::BeaconBlockHeader;
 pub use crypto::batch_verify::{
     batch_verify_bls_different_messages, batch_verify_bls_different_messages_all_or_nothing,
     batch_verify_bls_same_message, batch_verify_ed25519,
@@ -45,13 +47,14 @@ pub use network::{GossipMessage, MessageClass, NetworkMessage, Request, TopicSco
 pub use primitives::bloom::{BloomFilter, BloomKey, DEFAULT_FPR, MAX_BITS};
 pub use primitives::hash::{Hash, TypedHash};
 pub use primitives::hash_kinds::{
-    BlockHash, CertificateRoot, EventRoot, GlobalReceiptHash, GlobalReceiptRoot, LocalReceiptRoot,
-    ProvisionHash, ProvisionTxRoot, ProvisionsRoot, StateRoot, TransactionRoot, TxHash,
-    WaveReceiptHash, WritesRoot,
+    BeaconBlockHash, BeaconProposalsRoot, BeaconStateRoot, BlockHash, CertificateRoot, EventRoot,
+    GlobalReceiptHash, GlobalReceiptRoot, LocalReceiptRoot, ProvisionHash, ProvisionTxRoot,
+    ProvisionsRoot, RecoveryCertHash, StateRoot, TransactionRoot, TxHash, WaveReceiptHash,
+    WritesRoot,
 };
 pub use primitives::identifiers::{
-    Attempt, BlockHeight, HeaderFetchCount, InFlightCount, NodeId, PartitionNumber, Round,
-    ShardGroupId, ValidatorId, VotePower,
+    Attempt, BlockHeight, Epoch, HeaderFetchCount, InFlightCount, NodeId, PartitionNumber, Round,
+    ShardGroupId, Slot, ValidatorId, VotePower,
 };
 pub use primitives::merkle::{
     compute_merkle_root, compute_merkle_root_with_proof, verify_merkle_inclusion,

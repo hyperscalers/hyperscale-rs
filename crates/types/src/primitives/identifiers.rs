@@ -181,6 +181,153 @@ impl Display for BlockHeight {
     }
 }
 
+/// Beacon-chain slot number.
+///
+/// Strictly sequential across the beacon chain (genesis = 0). One slot →
+/// one `BeaconBlockHeader` once the slot's committee finalizes; missed
+/// slots produce no header. Distinct from `BlockHeight` (which counts
+/// shard blocks) and from `Round` (which counts within-slot attempts at
+/// the shard layer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, BasicSbor)]
+#[sbor(transparent)]
+pub struct Slot(u64);
+
+impl Slot {
+    /// Genesis slot.
+    pub const GENESIS: Self = Self(0);
+
+    /// Construct a slot from a raw `u64`.
+    ///
+    /// Most call sites should use [`Slot::next`] or arithmetic operators
+    /// instead — this constructor is the escape hatch for boundaries
+    /// (storage decode, wire decode, tests) where the slot genuinely
+    /// originates as a raw integer.
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Inner `u64`. Use sparingly — at boundaries (display, storage encode,
+    /// hashing, distance arithmetic that the operator overloads don't cover)
+    /// only.
+    #[must_use]
+    pub const fn inner(self) -> u64 {
+        self.0
+    }
+
+    /// Get the next slot.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        Self(self.0 + 1)
+    }
+
+    /// Get the previous slot (returns None if at genesis).
+    #[must_use]
+    pub const fn prev(self) -> Option<Self> {
+        if self.0 > 0 {
+            Some(Self(self.0 - 1))
+        } else {
+            None
+        }
+    }
+
+    /// Saturating subtraction by a raw offset.
+    #[must_use]
+    pub const fn saturating_sub(self, rhs: u64) -> Self {
+        Self(self.0.saturating_sub(rhs))
+    }
+
+    /// Little-endian byte representation of the inner value.
+    #[must_use]
+    pub const fn to_le_bytes(self) -> [u8; 8] {
+        self.0.to_le_bytes()
+    }
+}
+
+impl Add<u64> for Slot {
+    type Output = Self;
+    fn add(self, rhs: u64) -> Self {
+        Self(self.0.checked_add(rhs).expect("Slot + u64 overflowed"))
+    }
+}
+
+impl Sub<u64> for Slot {
+    type Output = Self;
+    fn sub(self, rhs: u64) -> Self {
+        Self(self.0.checked_sub(rhs).expect("Slot - u64 underflowed"))
+    }
+}
+
+impl Sub<Self> for Slot {
+    type Output = u64;
+    fn sub(self, rhs: Self) -> u64 {
+        self.0
+            .checked_sub(rhs.0)
+            .expect("Slot distance underflowed (lhs < rhs)")
+    }
+}
+
+impl AddAssign<u64> for Slot {
+    fn add_assign(&mut self, rhs: u64) {
+        self.0 = self.0.checked_add(rhs).expect("Slot += u64 overflowed");
+    }
+}
+
+impl Display for Slot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Slot({})", self.0)
+    }
+}
+
+/// Beacon-chain epoch number.
+///
+/// Coarse grouping of slots; increments on epoch boundaries (committee
+/// resample, validator-set rotation). Stored on `BeaconState`; not
+/// generally on the wire except inside state-root proofs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, BasicSbor)]
+#[sbor(transparent)]
+pub struct Epoch(u64);
+
+impl Epoch {
+    /// Genesis epoch.
+    pub const GENESIS: Self = Self(0);
+
+    /// Construct an epoch from a raw `u64`.
+    ///
+    /// Most call sites should use [`Epoch::next`] instead — this
+    /// constructor is the escape hatch for boundaries (state decode,
+    /// tests) where the epoch genuinely originates as a raw integer.
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Inner `u64`. Use sparingly — at boundaries (display, structured
+    /// log fields, hashing) only.
+    #[must_use]
+    pub const fn inner(self) -> u64 {
+        self.0
+    }
+
+    /// Get the next epoch.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        Self(self.0 + 1)
+    }
+
+    /// Little-endian byte representation of the inner value.
+    #[must_use]
+    pub const fn to_le_bytes(self) -> [u8; 8] {
+        self.0.to_le_bytes()
+    }
+}
+
+impl Display for Epoch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Epoch({})", self.0)
+    }
+}
+
 /// shard round / view number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, BasicSbor)]
 #[sbor(transparent)]
