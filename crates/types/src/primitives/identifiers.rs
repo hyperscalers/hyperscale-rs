@@ -328,6 +328,53 @@ impl Display for Epoch {
     }
 }
 
+/// Beacon-chain recovery attempt counter.
+///
+/// Increments each time the recovery process restarts at a given anchor
+/// without producing a certificate (e.g., quorum not reached within the
+/// recovery timeout). Tagged into [`RecoveryRequest`](crate::RecoveryRequest)
+/// / [`RecoveryCertificate`](crate::RecoveryCertificate) signing messages
+/// so a stale round's signatures cannot be replayed under a later round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, BasicSbor)]
+#[sbor(transparent)]
+pub struct RecoveryRound(u32);
+
+impl RecoveryRound {
+    /// Initial recovery round.
+    pub const INITIAL: Self = Self(0);
+
+    /// Construct a recovery round from a raw `u32`.
+    #[must_use]
+    pub const fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    /// Inner `u32`. Use sparingly — at boundaries (display, structured
+    /// log fields) only.
+    #[must_use]
+    pub const fn inner(self) -> u32 {
+        self.0
+    }
+
+    /// Get the next recovery round.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        Self(self.0 + 1)
+    }
+
+    /// Little-endian byte representation of the inner value.
+    #[must_use]
+    pub const fn to_le_bytes(self) -> [u8; 4] {
+        self.0.to_le_bytes()
+    }
+}
+
+impl Display for RecoveryRound {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "RecoveryRound({})", self.0)
+    }
+}
+
 /// shard round / view number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, BasicSbor)]
 #[sbor(transparent)]

@@ -30,7 +30,7 @@ mod topology;
 mod transaction;
 mod wave;
 
-pub use beacon::BeaconBlockHeader;
+pub use beacon::{BeaconBlockHeader, RecoveryCertificate, RecoveryRequest, recovery_cert_hash};
 pub use crypto::batch_verify::{
     batch_verify_bls_different_messages, batch_verify_bls_different_messages_all_or_nothing,
     batch_verify_bls_same_message, batch_verify_ed25519,
@@ -53,8 +53,8 @@ pub use primitives::hash_kinds::{
     WritesRoot,
 };
 pub use primitives::identifiers::{
-    Attempt, BlockHeight, Epoch, HeaderFetchCount, InFlightCount, NodeId, PartitionNumber, Round,
-    ShardGroupId, Slot, ValidatorId, VotePower,
+    Attempt, BlockHeight, Epoch, HeaderFetchCount, InFlightCount, NodeId, PartitionNumber,
+    RecoveryRound, Round, ShardGroupId, Slot, ValidatorId, VotePower,
 };
 pub use primitives::merkle::{
     compute_merkle_root, compute_merkle_root_with_proof, verify_merkle_inclusion,
