@@ -3,7 +3,7 @@
 //! Hard caps applied at decode time on peer-supplied provision payloads.
 //! Bound the SBOR pre-allocation a single state entry or merkle proof
 //! can claim — independent of how many transactions a block carries
-//! (which is governed by [`crate::block::limits`]).
+//! (which is governed by [`crate::shard::limits`]).
 
 /// Cap on `SubstateEntry.storage_key` length at decode time.
 ///

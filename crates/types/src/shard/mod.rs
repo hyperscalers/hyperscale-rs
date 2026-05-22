@@ -1,13 +1,14 @@
-//! Block types for consensus.
+//! Shard consensus types.
 //!
-//! - [`header`]: [`BlockHeader`] (BFT-voted metadata).
+//! - [`header`]: [`BlockHeader`] (shard-voted metadata).
 //! - [`block`]: [`Block`] (the Live/Sealed enum).
 //! - [`manifest`]: hash-level [`BlockManifest`] and denormalized [`BlockMetadata`].
 //! - [`committed_header`]: [`CommittedBlockHeader`] cross-shard trust attestation.
 //! - [`certified`]: [`CertifiedBlock`] pairing of a block with its certifying QC.
-//! - [`vote`]: [`BlockVote`] BFT vote.
+//! - [`vote`]: [`BlockVote`] shard consensus vote.
 //! - [`roots`]: per-block merkle root helpers used by [`BlockHeader`] consumers.
 //! - [`limits`]: protocol-level caps on per-block payload sizes.
+//! - [`quorum_certificate`]: [`QuorumCertificate`] aggregating shard consensus votes.
 
 #[allow(clippy::module_inception)]
 mod block;
@@ -17,6 +18,7 @@ pub mod header;
 pub mod inventory;
 pub mod limits;
 pub mod manifest;
+pub mod quorum_certificate;
 pub mod roots;
 pub mod vote;
 

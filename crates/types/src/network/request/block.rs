@@ -3,9 +3,9 @@
 use sbor::prelude::BasicSbor;
 
 use crate::BlockHeight;
-use crate::block::inventory::Inventory;
 use crate::network::response::GetBlockResponse;
 use crate::network::{MessageClass, NetworkMessage, Request};
+use crate::shard::inventory::Inventory;
 
 /// Request to fetch a full Block by height during sync or catch-up.
 ///

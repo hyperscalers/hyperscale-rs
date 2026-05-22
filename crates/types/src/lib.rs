@@ -23,27 +23,12 @@ mod signing;
 mod time;
 
 // Consensus types
-mod block;
-mod quorum_certificate;
 mod receipt;
+mod shard;
 mod topology;
 mod transaction;
 mod wave;
 
-pub use block::certified::{CertifiedBlock, CertifiedBlockHashMismatch};
-pub use block::committed_header::CommittedBlockHeader;
-pub use block::header::BlockHeader;
-pub use block::inventory::{ElidedCertifiedBlock, Inventory, RehydrateError, RehydrationMiss};
-pub use block::limits::{
-    MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK, MAX_TX_IN_FLIGHT, MAX_TXS_PER_BLOCK,
-};
-pub use block::manifest::{BlockManifest, BlockMetadata};
-pub use block::roots::{
-    compute_certificate_root, compute_local_receipt_root, compute_provision_root,
-    compute_transaction_root,
-};
-pub use block::vote::BlockVote;
-pub use block::{Block, SharedCertificates, SharedProvisions, SharedTransactions};
 pub use crypto::batch_verify::{
     batch_verify_bls_different_messages, batch_verify_bls_different_messages_all_or_nothing,
     batch_verify_bls_same_message, batch_verify_ed25519,
@@ -80,7 +65,6 @@ pub use provisioning::limits::{
 pub use provisioning::proof::MerkleInclusionProof;
 pub use provisioning::provisions::Provisions;
 pub use provisioning::substate::SubstateEntry;
-pub use quorum_certificate::QuorumCertificate;
 // Re-export DatabaseUpdates from radix for cross-crate use (execution cache, block commit)
 pub use radix_substate_store_interface::interface::DatabaseUpdates;
 pub use receipt::consensus::{ConsensusReceipt, FAILED_RECEIPT_HASH};
@@ -90,6 +74,21 @@ pub use receipt::stored::StoredReceipt;
 pub use sbor_codec::{
     BoundedBTreeMap, BoundedBTreeSet, BoundedBytes, BoundedLengthError, BoundedString, BoundedVec,
 };
+pub use shard::certified::{CertifiedBlock, CertifiedBlockHashMismatch};
+pub use shard::committed_header::CommittedBlockHeader;
+pub use shard::header::BlockHeader;
+pub use shard::inventory::{ElidedCertifiedBlock, Inventory, RehydrateError, RehydrationMiss};
+pub use shard::limits::{
+    MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK, MAX_TX_IN_FLIGHT, MAX_TXS_PER_BLOCK,
+};
+pub use shard::manifest::{BlockManifest, BlockMetadata};
+pub use shard::quorum_certificate::QuorumCertificate;
+pub use shard::roots::{
+    compute_certificate_root, compute_local_receipt_root, compute_provision_root,
+    compute_transaction_root,
+};
+pub use shard::vote::BlockVote;
+pub use shard::{Block, SharedCertificates, SharedProvisions, SharedTransactions};
 pub use signing::{
     DOMAIN_BLOCK_HEADER, DOMAIN_BLOCK_VOTE, DOMAIN_COMMITTED_BLOCK_HEADER, DOMAIN_EXEC_CERT_BATCH,
     DOMAIN_EXEC_VOTE, DOMAIN_EXEC_VOTE_BATCH, DOMAIN_STATE_PROVISION_BATCH, DOMAIN_VALIDATOR_BIND,

@@ -3,7 +3,7 @@
 //! Hard caps applied at decode time on peer-supplied transaction
 //! payloads. Bound the SBOR `Vec<u8>` / `Vec<NodeId>` pre-allocation a
 //! single transaction can claim — independent of how many transactions
-//! a block carries (which is governed by [`crate::block::limits`]).
+//! a block carries (which is governed by [`crate::shard::limits`]).
 
 /// Cap on `RoutableTransaction.tx_bytes` length at decode time.
 ///

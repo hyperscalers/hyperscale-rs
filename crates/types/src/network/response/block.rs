@@ -2,8 +2,8 @@
 
 use sbor::prelude::BasicSbor;
 
-use crate::block::inventory::ElidedCertifiedBlock;
 use crate::network::{MessageClass, NetworkMessage};
+use crate::shard::inventory::ElidedCertifiedBlock;
 
 /// Response to a block fetch request.
 ///
