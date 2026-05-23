@@ -13,9 +13,8 @@
 //! and let proposer + verifier share them verbatim.
 
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeader, BlockHeight, BlockManifest,
-    ConsensusReceipt, Hash, ReadySignal, Round, ShardWitnessPayload, StoredReceipt,
-    TopologySnapshot, compute_merkle_root,
+    BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeight, ConsensusReceipt, Hash, ReadySignal,
+    Round, ShardWitnessPayload, StoredReceipt, TopologySnapshot, compute_merkle_root,
 };
 
 /// Per-shard append-only beacon-witness accumulator.
@@ -172,31 +171,48 @@ pub fn derive_leaves(
 
 /// Post-execution verifier for the block's beacon-witness commitment.
 ///
-/// Re-derives the new payloads from `(receipts, missed, ready_signals)`,
-/// applies them against a clone of `parent_accumulator`, and confirms
-/// both `header.beacon_witness_root()` and
-/// `header.beacon_witness_leaf_count()` agree.
+/// Re-derives the new payloads from the three canonical sources
+/// (`receipts`, the missed-round walk over `(parent_round, round)`,
+/// and `ready_signals`), applies them against `parent_witness_leaves`,
+/// and confirms the resulting accumulator `(root, leaf_count)` matches
+/// the header's claim. Logs a `warn!` diagnostic and returns `false`
+/// on mismatch; the caller treats `false` as block rejection.
 ///
-/// Called from
-/// [`crates/shard/src/action_handlers.rs`](crate::action_handlers)
-/// alongside the existing per-block verifiers
-/// (`verify_local_receipt_root`, `verify_state_root`). A `false`
-/// return aborts the post-execution validation step and rejects the
-/// block.
+/// Called by the `Action::VerifyBeaconWitnessRoot` handler in
+/// `crates/shard/src/action_handlers.rs` alongside the existing
+/// per-block verifiers (`verify_local_receipt_root`, `verify_state_root`).
 #[must_use]
+#[allow(clippy::too_many_arguments)] // unified inputs for the off-thread verifier
 pub fn derive_and_verify(
-    header: &BlockHeader,
-    manifest: &BlockManifest,
-    receipts: &[StoredReceipt],
-    parent_accumulator: &BeaconWitnessAccumulator,
+    expected_root: BeaconWitnessRoot,
+    expected_leaf_count: BeaconWitnessLeafCount,
+    parent_witness_leaves: Vec<Hash>,
     parent_round: Round,
+    height: BlockHeight,
+    round: Round,
+    receipts: &[StoredReceipt],
+    ready_signals: &[ReadySignal],
     topology: &TopologySnapshot,
 ) -> bool {
-    let missed =
-        missed_proposals_since_prev_commit(header.height(), parent_round, header.round(), topology);
-    let leaves = derive_leaves(receipts, missed, manifest.ready_signals().as_slice());
-    let (root, count) = parent_accumulator.preview_append(&leaves);
-    root == header.beacon_witness_root() && count == header.beacon_witness_leaf_count()
+    let missed = missed_proposals_since_prev_commit(height, parent_round, round, topology);
+    let new_leaves = derive_leaves(receipts, missed, ready_signals);
+    let parent_accumulator = BeaconWitnessAccumulator::from_leaves(parent_witness_leaves);
+    let (root, count) = parent_accumulator.preview_append(&new_leaves);
+    let valid = root == expected_root && count == expected_leaf_count;
+
+    if !valid {
+        tracing::warn!(
+            ?expected_root,
+            ?root,
+            expected_count = expected_leaf_count.inner(),
+            computed_count = count.inner(),
+            height = height.inner(),
+            round = round.inner(),
+            "Beacon-witness root verification FAILED"
+        );
+    }
+
+    valid
 }
 
 #[cfg(test)]
