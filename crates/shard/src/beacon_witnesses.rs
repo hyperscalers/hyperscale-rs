@@ -252,14 +252,10 @@ pub fn prospective_parent_witness_leaves(
 ///
 /// Re-derives the new payloads from the three canonical sources
 /// (`receipts`, the missed-round walk over `(parent_round, round)`,
-/// and `ready_signals`), applies them against `parent_witness_leaves`,
-/// and confirms the resulting accumulator `(root, leaf_count)` matches
-/// the header's claim. Logs a `warn!` diagnostic and returns `false`
-/// on mismatch; the caller treats `false` as block rejection.
-///
-/// Called by the `Action::VerifyBeaconWitnessRoot` handler in
-/// `crates/shard/src/action_handlers.rs` alongside the existing
-/// per-block verifiers (`verify_local_receipt_root`, `verify_state_root`).
+/// and `ready_signals`), appends them to `parent_witness_leaves`, and
+/// confirms the resulting `(root, leaf_count)` matches the header's
+/// claim. Logs a `warn!` diagnostic and returns `false` on mismatch;
+/// the caller treats `false` as block rejection.
 #[must_use]
 #[allow(clippy::too_many_arguments)] // unified inputs for the off-thread verifier
 pub fn derive_and_verify(
@@ -275,8 +271,14 @@ pub fn derive_and_verify(
 ) -> bool {
     let missed = missed_proposals_since_prev_commit(height, parent_round, round, topology);
     let new_leaves = derive_leaves(receipts, missed, ready_signals);
-    let parent_accumulator = BeaconWitnessAccumulator::from_leaves(parent_witness_leaves);
-    let (root, count) = parent_accumulator.preview_append(&new_leaves);
+
+    let mut leaves = parent_witness_leaves;
+    leaves.reserve(new_leaves.len());
+    for payload in &new_leaves {
+        leaves.push(payload.leaf_hash());
+    }
+    let root = BeaconWitnessRoot::from_raw(compute_merkle_root(&leaves));
+    let count = BeaconWitnessLeafCount::new(leaves.len() as u64);
     let valid = root == expected_root && count == expected_leaf_count;
 
     if !valid {
