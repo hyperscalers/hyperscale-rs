@@ -438,7 +438,7 @@ impl PendingBlock {
             .iter()
             .map(|c| c.wave_id().clone())
             .collect();
-        let manifest = BlockManifest::new(tx_hashes, cert_ids, provision_hashes);
+        let manifest = BlockManifest::new(tx_hashes, cert_ids, provision_hashes, vec![]);
         let mut received_provisions: BTreeMap<ProvisionHash, Arc<Provisions>> = BTreeMap::new();
         for p in provisions {
             received_provisions.insert(p.hash(), p);
@@ -700,7 +700,7 @@ mod tests {
 
         let pb = PendingBlock::from_manifest(
             header,
-            BlockManifest::new(vec![tx1, tx2], vec![], vec![]),
+            BlockManifest::new(vec![tx1, tx2], vec![], vec![], vec![]),
             LocalTimestamp::ZERO,
         );
 
@@ -729,7 +729,12 @@ mod tests {
 
         let pb = PendingBlock::from_manifest(
             header,
-            BlockManifest::new(vec![tx1], vec![wave1.clone(), wave2.clone()], vec![]),
+            BlockManifest::new(
+                vec![tx1],
+                vec![wave1.clone(), wave2.clone()],
+                vec![],
+                vec![],
+            ),
             LocalTimestamp::ZERO,
         );
 
@@ -747,7 +752,7 @@ mod tests {
 
         let mut pb = PendingBlock::from_manifest(
             header,
-            BlockManifest::new(vec![], vec![wave_id.clone()], vec![]),
+            BlockManifest::new(vec![], vec![wave_id.clone()], vec![], vec![]),
             LocalTimestamp::ZERO,
         );
 
@@ -774,7 +779,7 @@ mod tests {
 
         let mut pb = PendingBlock::from_manifest(
             header,
-            BlockManifest::new(vec![tx_hash], vec![wave_id.clone()], vec![]),
+            BlockManifest::new(vec![tx_hash], vec![wave_id.clone()], vec![], vec![]),
             LocalTimestamp::ZERO,
         );
 
@@ -825,7 +830,7 @@ mod tests {
 
         let stale = PendingBlock::from_manifest(
             make_header(BlockHeight::new(5)),
-            BlockManifest::new(vec![], vec![], vec![prov_a, prov_b]),
+            BlockManifest::new(vec![], vec![], vec![prov_a, prov_b], vec![]),
             LocalTimestamp::ZERO,
         );
         let live = PendingBlock::from_manifest(

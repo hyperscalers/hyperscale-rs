@@ -5,8 +5,8 @@ use sbor::prelude::*;
 
 use crate::{
     BeaconWitnessLeafCount, Block, BlockHash, BlockHeader, BlockHeight, BoundedVec,
-    MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
-    QuorumCertificate, TxHash, WaveId,
+    MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK, MAX_READY_SIGNALS_PER_BLOCK,
+    MAX_TXS_PER_BLOCK, ProvisionHash, QuorumCertificate, ReadySignal, TxHash, WaveId,
 };
 
 /// Hash-level description of a block's contents (transactions and certificates).
@@ -22,6 +22,7 @@ pub struct BlockManifest {
     tx_hashes: BoundedVec<TxHash, MAX_TXS_PER_BLOCK>,
     cert_ids: BoundedVec<WaveId, MAX_FINALIZED_TX_PER_BLOCK>,
     provision_hashes: BoundedVec<ProvisionHash, MAX_PROVISIONS_PER_BLOCK>,
+    ready_signals: BoundedVec<ReadySignal, MAX_READY_SIGNALS_PER_BLOCK>,
 }
 
 impl BlockManifest {
@@ -35,11 +36,13 @@ impl BlockManifest {
         tx_hashes: Vec<TxHash>,
         cert_ids: Vec<WaveId>,
         provision_hashes: Vec<ProvisionHash>,
+        ready_signals: Vec<ReadySignal>,
     ) -> Self {
         Self {
             tx_hashes: tx_hashes.into(),
             cert_ids: cert_ids.into(),
             provision_hashes: provision_hashes.into(),
+            ready_signals: ready_signals.into(),
         }
     }
 
@@ -61,6 +64,14 @@ impl BlockManifest {
     #[must_use]
     pub const fn provision_hashes(&self) -> &BoundedVec<ProvisionHash, MAX_PROVISIONS_PER_BLOCK> {
         &self.provision_hashes
+    }
+
+    /// Validator-emitted `ReadySignal`s the proposer included. The
+    /// shard's beacon-witness derivation projects one
+    /// `ShardWitnessPayload::Ready` per signal at block-assembly time.
+    #[must_use]
+    pub const fn ready_signals(&self) -> &BoundedVec<ReadySignal, MAX_READY_SIGNALS_PER_BLOCK> {
+        &self.ready_signals
     }
 
     /// Get total transaction count.
@@ -88,7 +99,7 @@ impl BlockManifest {
             .map(|c| c.wave_id().clone())
             .collect();
         let provision_hashes = block.provision_hashes();
-        Self::new(tx_hashes, cert_ids, provision_hashes)
+        Self::new(tx_hashes, cert_ids, provision_hashes, Vec::new())
     }
 }
 
@@ -208,7 +219,7 @@ mod tests {
             enc.write_payload_prefix(BASIC_SBOR_V1_PAYLOAD_PREFIX)
                 .unwrap();
             enc.write_value_kind(ValueKind::Tuple).unwrap();
-            enc.write_size(3).unwrap();
+            enc.write_size(4).unwrap();
             enc.write_value_kind(ValueKind::Array).unwrap();
             enc.write_value_kind(TxHash::value_kind()).unwrap();
             enc.write_size(MAX_TXS_PER_BLOCK + 1).unwrap();
@@ -229,7 +240,7 @@ mod tests {
             enc.write_payload_prefix(BASIC_SBOR_V1_PAYLOAD_PREFIX)
                 .unwrap();
             enc.write_value_kind(ValueKind::Tuple).unwrap();
-            enc.write_size(3).unwrap();
+            enc.write_size(4).unwrap();
             // Empty tx_hashes.
             enc.encode(&Vec::<TxHash>::new()).unwrap();
             // Oversized cert_ids.
@@ -254,7 +265,7 @@ mod tests {
             enc.write_payload_prefix(BASIC_SBOR_V1_PAYLOAD_PREFIX)
                 .unwrap();
             enc.write_value_kind(ValueKind::Tuple).unwrap();
-            enc.write_size(3).unwrap();
+            enc.write_size(4).unwrap();
             enc.encode(&Vec::<TxHash>::new()).unwrap();
             enc.encode(&Vec::<WaveId>::new()).unwrap();
             // Oversized provision_hashes.

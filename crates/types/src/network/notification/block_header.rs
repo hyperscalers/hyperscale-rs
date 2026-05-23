@@ -121,6 +121,7 @@ mod tests {
             ],
             vec![],
             vec![],
+            vec![],
         );
 
         let gossip = BlockHeaderNotification::new(header.clone(), manifest.clone(), zero_sig());
@@ -134,6 +135,7 @@ mod tests {
         let header = make_header(BlockHeight::new(5));
         let manifest = BlockManifest::new(
             vec![TxHash::from_raw(Hash::from_bytes(b"tx1"))],
+            vec![],
             vec![],
             vec![],
         );
@@ -152,7 +154,7 @@ mod tests {
 
         let gossip = BlockHeaderNotification::new(
             make_header(BlockHeight::new(1)),
-            BlockManifest::new(vec![tx1, tx2, tx3], vec![], vec![]),
+            BlockManifest::new(vec![tx1, tx2, tx3], vec![], vec![], vec![]),
             zero_sig(),
         );
 

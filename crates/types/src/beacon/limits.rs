@@ -81,3 +81,21 @@ pub const MAX_WITNESSES_PER_FETCH: usize = 128;
 /// emissions stay well below this in any realistic workload; the cap
 /// rejects obviously oversized arrivals.
 pub const MAX_BEACON_WITNESS_EVENTS_PER_TX: usize = 32;
+
+/// Cap on [`ReadySignal`](crate::ReadySignal) entries in a single
+/// [`BlockManifest`](crate::BlockManifest).
+///
+/// Bounds proposer-included signals per block at decode time. Steady-state
+/// emission rate is near zero — a validator only emits when their
+/// `OnShard { ready: false }` placement transitions; the cap covers burst
+/// scenarios (committee shuffle aftermath) with headroom.
+pub const MAX_READY_SIGNALS_PER_BLOCK: usize = 32;
+
+/// Maximum span of block heights a
+/// [`ReadySignal`](crate::ReadySignal)'s `[start, end]` window may cover.
+///
+/// Bounds replay surface: a signal validates only within its window, so a
+/// proposer that hoards a signal past the window can't include it after.
+/// Sized to a few minutes at the target shard block rate; validators
+/// re-emit if their original signal expires uncollected.
+pub const MAX_READY_WINDOW_BLOCKS: u64 = 1024;

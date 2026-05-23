@@ -10,9 +10,11 @@ mod block_vote;
 mod execution_certificates;
 mod execution_votes;
 mod provisions;
+mod ready_signal;
 
 pub use block_header::BlockHeaderNotification;
 pub use block_vote::BlockVoteNotification;
 pub use execution_certificates::ExecutionCertificatesNotification;
 pub use execution_votes::ExecutionVotesNotification;
 pub use provisions::ProvisionsNotification;
+pub use ready_signal::ReadySignalNotification;

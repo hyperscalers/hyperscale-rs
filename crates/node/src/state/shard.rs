@@ -649,7 +649,7 @@ mod tests {
         // single-tx manifest so the projection cleanly fits.
         let TestNode { mut node, .. } = TestNode::new();
 
-        let manifest = BlockManifest::new(vec![TxHash::ZERO], vec![], vec![]);
+        let manifest = BlockManifest::new(vec![TxHash::ZERO], vec![], vec![], vec![]);
 
         // proposer_for(h=1, r=0) = committee[(1+0) % 4] = ValidatorId::new(1).
         // the shard coordinator's header validation rejects on proposer mismatch, so the

@@ -33,13 +33,14 @@ mod wave;
 pub use beacon::{
     BeaconBlock, BeaconBlockHeader, BeaconProposal, BeaconWitness, BeaconWitnessEvent,
     EquivocationEvidence, MAX_ACCUSATIONS_PER_PROPOSAL, MAX_BEACON_WITNESS_EVENTS_PER_TX,
-    MAX_PREFIX_SIGS, MAX_SKIP_SIGS, MAX_VOTE_VECTOR_LEN, MAX_WITNESS_PROOF_DEPTH,
-    MAX_WITNESSES_PER_FETCH, MAX_WITNESSES_PER_PROPOSER, MscEmptyLowAccusation, MscSlotProposal,
-    PC_VALUE_ELEMENT_BYTES, PcCompactLenSigner, PcCompactVote, PcDivergingProof, PcQc1, PcQc2,
-    PcQc3, PcValueElement, PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation, PcVoteRound,
-    PcXpProof, RecoveryCertificate, RecoveryEquivocation, RecoveryRequest, ShardWitness,
-    ShardWitnessPayload, ShardWitnessProof, SpcCert, SpcEmptyLowEvidence, SpcEmptyViewMsg,
-    SpcHighTriple, SpcProposalObject, SpcSkipSig, Witness, recovery_cert_hash,
+    MAX_PREFIX_SIGS, MAX_READY_SIGNALS_PER_BLOCK, MAX_READY_WINDOW_BLOCKS, MAX_SKIP_SIGS,
+    MAX_VOTE_VECTOR_LEN, MAX_WITNESS_PROOF_DEPTH, MAX_WITNESSES_PER_FETCH,
+    MAX_WITNESSES_PER_PROPOSER, MscEmptyLowAccusation, MscSlotProposal, PC_VALUE_ELEMENT_BYTES,
+    PcCompactLenSigner, PcCompactVote, PcDivergingProof, PcQc1, PcQc2, PcQc3, PcValueElement,
+    PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation, PcVoteRound, PcXpProof, ReadySignal,
+    RecoveryCertificate, RecoveryEquivocation, RecoveryRequest, ShardWitness, ShardWitnessPayload,
+    ShardWitnessProof, SpcCert, SpcEmptyLowEvidence, SpcEmptyViewMsg, SpcHighTriple,
+    SpcProposalObject, SpcSkipSig, Witness, recovery_cert_hash,
 };
 pub use crypto::batch_verify::{
     batch_verify_bls_different_messages, batch_verify_bls_different_messages_all_or_nothing,
@@ -106,10 +107,10 @@ pub use shard::vote::BlockVote;
 pub use shard::{Block, SharedCertificates, SharedProvisions, SharedTransactions};
 pub use signing::{
     DOMAIN_BLOCK_HEADER, DOMAIN_BLOCK_VOTE, DOMAIN_COMMITTED_BLOCK_HEADER, DOMAIN_EXEC_CERT_BATCH,
-    DOMAIN_EXEC_VOTE, DOMAIN_EXEC_VOTE_BATCH, DOMAIN_STATE_PROVISION_BATCH, DOMAIN_VALIDATOR_BIND,
-    VALIDATOR_BIND_NONCE_LEN, block_header_message, block_vote_message,
+    DOMAIN_EXEC_VOTE, DOMAIN_EXEC_VOTE_BATCH, DOMAIN_READY_SIGNAL, DOMAIN_STATE_PROVISION_BATCH,
+    DOMAIN_VALIDATOR_BIND, VALIDATOR_BIND_NONCE_LEN, block_header_message, block_vote_message,
     committed_block_header_message, exec_cert_batch_message, exec_vote_batch_message,
-    exec_vote_message, state_provisions_message, validator_bind_message,
+    exec_vote_message, ready_signal_message, state_provisions_message, validator_bind_message,
 };
 pub use time::limits::{MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH};
 pub use time::range::{MAX_VALIDITY_RANGE, TimestampRange};
