@@ -4,8 +4,8 @@
 //! [`BeaconWitnessRoot`](hyperscale_types::BeaconWitnessRoot) commitment
 //! on each [`BlockHeader`](hyperscale_types::BlockHeader): the in-memory
 //! accumulator, the canonical leaf-derivation rule (receipts →
-//! `MissedProposal` → `Ready`), proof construction, and the
-//! post-execution verifier hook that downstream call sites delegate to.
+//! `MissedProposal` → `Ready`), and the post-execution verifier hook
+//! that downstream call sites delegate to.
 //!
 //! The module is intentionally storage-agnostic. Reads and writes
 //! against the `beacon_witnesses` column family land alongside the
@@ -16,8 +16,8 @@ use std::time::Duration;
 
 use hyperscale_types::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeader, BlockHeight, BlockManifest,
-    ConsensusReceipt, Hash, MAX_WITNESS_PROOF_DEPTH, ReadySignal, Round, ShardWitnessPayload,
-    StoredReceipt, TopologySnapshot, compute_merkle_root, compute_merkle_root_with_proof,
+    ConsensusReceipt, Hash, ReadySignal, Round, ShardWitnessPayload, StoredReceipt,
+    TopologySnapshot, compute_merkle_root,
 };
 
 /// Minimum dwell time before a [`ReadySignal`] is eligible to be
@@ -30,10 +30,12 @@ pub const MIN_READY_SIGNAL_DWELL: Duration = Duration::from_millis(150);
 
 /// Per-shard append-only beacon-witness accumulator.
 ///
-/// Holds the full leaf-hash history so [`Self::proof_for`] can produce
-/// inclusion proofs anchored at the current root without re-reading
-/// the source payloads. Pruning is the runtime layer's job — the
-/// accumulator only knows about leaves it currently retains.
+/// Holds the full leaf-hash history so [`Self::root`] and
+/// [`Self::preview_append`] can recompute roots without re-reading the
+/// source payloads, and so the coordinator can hand the leaves to the
+/// verification pipeline for prospective-root checks. Pruning is the
+/// runtime layer's job — the accumulator only knows about leaves it
+/// currently retains.
 #[derive(Debug, Clone, Default)]
 pub struct BeaconWitnessAccumulator {
     leaves: Vec<Hash>,
@@ -106,27 +108,6 @@ impl BeaconWitnessAccumulator {
         for payload in new_payloads {
             self.leaves.push(payload.leaf_hash());
         }
-    }
-
-    /// Inclusion proof for the leaf at `leaf_index` against the current
-    /// root. Returns `None` when `leaf_index` is out of range, when the
-    /// proof would exceed the wire-shipped sibling cap, or when the
-    /// accumulator is empty.
-    ///
-    /// The proof is shaped to ride inside a [`ShardWitness`] response
-    /// — the caller supplies the surrounding `(shard_id, committed_block_hash)`
-    /// context when assembling the responder reply.
-    #[must_use]
-    pub fn proof_for(&self, leaf_index: BeaconWitnessLeafCount) -> Option<(Hash, Vec<Hash>, u32)> {
-        let index = usize::try_from(leaf_index.inner()).ok()?;
-        if index >= self.leaves.len() {
-            return None;
-        }
-        let (root, siblings, idx) = compute_merkle_root_with_proof(&self.leaves, index);
-        if siblings.len() > MAX_WITNESS_PROOF_DEPTH {
-            return None;
-        }
-        Some((root, siblings, idx))
     }
 }
 
@@ -233,7 +214,7 @@ mod tests {
     use hyperscale_test_helpers::TestCommittee;
     use hyperscale_types::{
         BeaconWitnessRoot, Bls12381G2Signature, Stake, StakePoolId, TopologySnapshot, ValidatorId,
-        compute_merkle_root, verify_merkle_inclusion,
+        compute_merkle_root,
     };
 
     use super::*;
@@ -297,29 +278,6 @@ mod tests {
 
         assert_eq!(acc.root(), snapshot_root);
         assert_eq!(acc.leaf_count(), snapshot_count);
-    }
-
-    #[test]
-    fn proof_round_trips_for_every_leaf() {
-        let mut acc = BeaconWitnessAccumulator::new();
-        let payloads: Vec<ShardWitnessPayload> = (1u64..=7).map(deposit).collect();
-        acc.commit_append(&payloads);
-
-        let root = acc.root().into_raw();
-        for (idx, payload) in payloads.iter().enumerate() {
-            let (proof_root, siblings, leaf_index) = acc
-                .proof_for(BeaconWitnessLeafCount::new(idx as u64))
-                .expect("in range");
-            assert_eq!(proof_root, root);
-            let leaf = payload.leaf_hash();
-            assert!(verify_merkle_inclusion(root, leaf, &siblings, leaf_index));
-        }
-    }
-
-    #[test]
-    fn proof_for_out_of_range_returns_none() {
-        let acc = BeaconWitnessAccumulator::from_leaves(vec![Hash::ZERO]);
-        assert!(acc.proof_for(BeaconWitnessLeafCount::new(99)).is_none());
     }
 
     /// The all-zero `Hash::ZERO` is used as padding by the merkle
@@ -431,16 +389,5 @@ mod tests {
         acc.commit_append(std::slice::from_ref(&payload));
         let expected = compute_merkle_root(&[payload.leaf_hash()]);
         assert_eq!(acc.root().into_raw(), expected);
-    }
-
-    /// Proof sibling counts must stay within the wire-decode cap so
-    /// `ShardWitnessProof::siblings` always fits.
-    #[test]
-    fn proof_siblings_within_max_depth() {
-        let mut acc = BeaconWitnessAccumulator::new();
-        let payloads: Vec<ShardWitnessPayload> = (1u64..=8).map(deposit).collect();
-        acc.commit_append(&payloads);
-        let (_, siblings, _) = acc.proof_for(BeaconWitnessLeafCount::new(3)).unwrap();
-        assert!(siblings.len() <= MAX_WITNESS_PROOF_DEPTH);
     }
 }
