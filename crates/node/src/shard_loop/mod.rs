@@ -283,6 +283,7 @@ where
         self.update_fetch_tick_timer();
     }
 
+    #[allow(clippy::too_many_lines)] // single dispatch over ShardScopedInput variants
     fn dispatch_input(&mut self, input: ShardScopedInput) {
         match input {
             // ── Transaction validation pipeline ────────────────────────
@@ -384,8 +385,13 @@ where
             ShardScopedInput::FetchTick => self.handle_fetch_tick(),
 
             // ── QC-only commit prep callbacks ──────────────────────────
-            ShardScopedInput::QcOnlyCommitPrepared { block, qc, source } => {
-                self.handle_qc_only_commit_prepared(block, qc, source);
+            ShardScopedInput::QcOnlyCommitPrepared {
+                block,
+                qc,
+                source,
+                witness,
+            } => {
+                self.handle_qc_only_commit_prepared(block, qc, source, witness);
             }
             ShardScopedInput::QcOnlyCommitDiverged(div) => {
                 handle_qc_only_commit_diverged(&div);

@@ -38,7 +38,7 @@ mod writes;
 pub mod test_helpers;
 
 pub use chain_reader::{BlockForSync, ChainReader};
-pub use chain_writer::ChainWriter;
+pub use chain_writer::{BeaconWitnessCommit, ChainWriter, PreparedCommitBatchEntry};
 pub use genesis::GenesisCommit;
 use hyperscale_jmt::TreeReader;
 pub use overlay::{SubstateDbLookup, SubstateLookup};

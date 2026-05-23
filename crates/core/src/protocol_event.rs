@@ -64,6 +64,9 @@ pub enum VerificationKind {
     ProvisionRoot,
     /// Per-target-shard provision-tx merkle roots map.
     ProvisionTxRoots,
+    /// Merkle root over the per-shard beacon-witness accumulator after this
+    /// block's appended leaves.
+    BeaconWitnessRoot,
 }
 
 /// Events that the state machine processes.
@@ -524,6 +527,7 @@ impl ProtocolEvent {
                 VerificationKind::LocalReceiptRoot => "BlockRootVerified::LocalReceiptRoot",
                 VerificationKind::ProvisionRoot => "BlockRootVerified::ProvisionRoot",
                 VerificationKind::ProvisionTxRoots => "BlockRootVerified::ProvisionTxRoots",
+                VerificationKind::BeaconWitnessRoot => "BlockRootVerified::BeaconWitnessRoot",
             },
             other => other.into(),
         }

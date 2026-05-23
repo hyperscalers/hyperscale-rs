@@ -19,12 +19,15 @@ use std::time::Instant;
 
 use hyperscale_metrics::{record_storage_operation, record_storage_read};
 use hyperscale_types::{
-    Block, BlockHeight, BlockMetadata, CertifiedBlock, FinalizedWave, Hash, ProvisionHash,
-    QuorumCertificate, RoutableTransaction, TxHash, WaveCertificate, WaveId,
+    BeaconWitnessLeafCount, Block, BlockHeight, BlockMetadata, CertifiedBlock, FinalizedWave, Hash,
+    ProvisionHash, QuorumCertificate, RoutableTransaction, ShardGroupId, ShardWitnessPayload,
+    TxHash, WaveCertificate, WaveId,
 };
 use rocksdb::{ColumnFamily, WriteBatch};
 
-use crate::column_families::{BlocksCf, CertificatesCf, ConsensusReceiptsCf, TransactionsCf};
+use crate::column_families::{
+    BeaconWitnessesCf, BlocksCf, CertificatesCf, ConsensusReceiptsCf, TransactionsCf,
+};
 use crate::core::RocksDbStorage;
 use crate::metadata::{read_committed_hash, read_committed_height, read_committed_qc};
 use crate::typed_cf::{TypedCf, batch_put, batch_put_raw, get, multi_get};
@@ -108,11 +111,17 @@ impl RocksDbStorage {
     /// Panics if the block cannot be persisted. This is intentional: committed blocks
     /// are essential for crash recovery.
     /// Append block data to an existing `WriteBatch` (for atomic commit).
+    ///
+    /// `beacon_witness_leaf_count_at_block_end` is stamped into the
+    /// `BlockMetadata`. Callers that have a witness-leaf delta also call
+    /// [`Self::append_beacon_witnesses_to_batch`] against the same
+    /// `WriteBatch` so the leaves and the count land atomically.
     pub(crate) fn append_block_to_batch(
         &self,
         batch: &mut WriteBatch,
         block: &Block,
         qc: &QuorumCertificate,
+        beacon_witness_leaf_count_at_block_end: BeaconWitnessLeafCount,
     ) {
         // Resolve column-family handles once for the whole append loop.
         // Per-call `cf_put`/`cf_put_raw` would each invoke `self.cf()`,
@@ -123,7 +132,11 @@ impl RocksDbStorage {
         let transactions_cf = TransactionsCf::handle(&cf);
         let certificates_cf = CertificatesCf::handle(&cf);
 
-        let metadata = BlockMetadata::from_block(block, qc.clone());
+        let metadata = BlockMetadata::from_block_with_witness_count(
+            block,
+            qc.clone(),
+            beacon_witness_leaf_count_at_block_end,
+        );
         batch_put::<BlocksCf>(batch, blocks_cf, &block.height().inner(), &metadata);
         for tx in block.transactions().iter() {
             batch_put_raw::<TransactionsCf>(
@@ -140,6 +153,38 @@ impl RocksDbStorage {
                 certificates_cf,
                 fw.wave_id(),
                 fw.certificate().as_ref(),
+            );
+        }
+    }
+
+    /// Append per-block beacon-witness leaves into an existing
+    /// `WriteBatch`. Each leaf at position `i` lands at key
+    /// `(shard, starting_leaf_index + i)` in
+    /// [`BeaconWitnessesCf`](crate::column_families::BeaconWitnessesCf).
+    ///
+    /// No-op when `leaves` is empty. Called from `commit_prepared_blocks`
+    /// and `commit_block` so the witness writes commit in the same
+    /// atomic batch as the block + JMT.
+    pub(crate) fn append_beacon_witnesses_to_batch(
+        &self,
+        batch: &mut WriteBatch,
+        shard: ShardGroupId,
+        starting_leaf_index: BeaconWitnessLeafCount,
+        leaves: &[ShardWitnessPayload],
+    ) {
+        if leaves.is_empty() {
+            return;
+        }
+        let cf = self.cf();
+        let beacon_witnesses_cf = BeaconWitnessesCf::handle(&cf);
+        let start = starting_leaf_index.inner();
+        for (offset, payload) in leaves.iter().enumerate() {
+            let leaf_index = start + offset as u64;
+            batch_put::<BeaconWitnessesCf>(
+                batch,
+                beacon_witnesses_cf,
+                &(shard, leaf_index),
+                payload,
             );
         }
     }

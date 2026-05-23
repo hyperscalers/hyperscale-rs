@@ -13,9 +13,9 @@ use std::sync::Arc;
 
 use hyperscale_jmt::{Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_storage::{
-    BaseReadCache, BlockForSync, ChainReader, ChainWriter, DatabaseUpdates, DbPartitionKey,
-    DbSortKey, DbSubstateValue, GenesisCommit, JmtSnapshot, PartitionEntry, SubstateDatabase,
-    SubstateStore, VersionedStore,
+    BaseReadCache, BeaconWitnessCommit, BlockForSync, ChainReader, ChainWriter, DatabaseUpdates,
+    DbPartitionKey, DbSortKey, DbSubstateValue, GenesisCommit, JmtSnapshot, PartitionEntry,
+    PreparedCommitBatchEntry, SubstateDatabase, SubstateStore, VersionedStore,
 };
 use hyperscale_types::{
     Block, BlockHash, BlockHeight, CertifiedBlock, CommittedBlockHeader, ConsensusReceipt,
@@ -167,13 +167,18 @@ impl ChainWriter for SharedStorage {
 
     fn commit_prepared_blocks(
         &self,
-        blocks: Vec<(Self::PreparedCommit, Arc<Block>, Arc<QuorumCertificate>)>,
+        blocks: Vec<PreparedCommitBatchEntry<Self::PreparedCommit>>,
     ) -> Vec<StateRoot> {
         self.0.commit_prepared_blocks(blocks)
     }
 
-    fn commit_block(&self, block: &Arc<Block>, qc: &Arc<QuorumCertificate>) -> StateRoot {
-        self.0.commit_block(block, qc)
+    fn commit_block(
+        &self,
+        block: &Arc<Block>,
+        qc: &Arc<QuorumCertificate>,
+        witness: &BeaconWitnessCommit,
+    ) -> StateRoot {
+        self.0.commit_block(block, qc, witness)
     }
 
     fn memory_usage_bytes(&self) -> (u64, u64) {

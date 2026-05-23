@@ -21,8 +21,9 @@ use crate::keys::node_entity_key;
 use crate::lock_recover::{lock_or_recover, read_or_recover, write_or_recover};
 use crate::tree::proofs::generate_proof;
 use crate::{
-    BlockForSync, ChainReader, ChainWriter, DatabaseUpdates, DbPartitionKey, DbSortKey,
-    JmtSnapshot, PartitionDatabaseUpdates, SubstateStore, VersionedStore,
+    BeaconWitnessCommit, BlockForSync, ChainReader, ChainWriter, DatabaseUpdates, DbPartitionKey,
+    DbSortKey, JmtSnapshot, PartitionDatabaseUpdates, PreparedCommitBatchEntry, SubstateStore,
+    VersionedStore,
 };
 
 /// Cached base-storage reads observed through a [`SubstateView`].
@@ -799,13 +800,18 @@ impl<S: ChainWriter> ChainWriter for SubstateView<S> {
 
     fn commit_prepared_blocks(
         &self,
-        blocks: Vec<(Self::PreparedCommit, Arc<Block>, Arc<QuorumCertificate>)>,
+        blocks: Vec<PreparedCommitBatchEntry<Self::PreparedCommit>>,
     ) -> Vec<StateRoot> {
         (*self.base).commit_prepared_blocks(blocks)
     }
 
-    fn commit_block(&self, block: &Arc<Block>, qc: &Arc<QuorumCertificate>) -> StateRoot {
-        (*self.base).commit_block(block, qc)
+    fn commit_block(
+        &self,
+        block: &Arc<Block>,
+        qc: &Arc<QuorumCertificate>,
+        witness: &BeaconWitnessCommit,
+    ) -> StateRoot {
+        (*self.base).commit_block(block, qc, witness)
     }
 
     fn jmt_snapshot(prepared: &Self::PreparedCommit) -> &JmtSnapshot {

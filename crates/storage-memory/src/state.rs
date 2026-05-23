@@ -11,8 +11,8 @@ use hyperscale_storage::{
 };
 use hyperscale_types::{
     BlockHash, BlockHeight, CertifiedBlock, ConsensusReceipt, ExecutionCertificate,
-    ExecutionMetadata, QuorumCertificate, RoutableTransaction, StateRoot, StoredReceipt, TxHash,
-    WaveCertificate, WaveId,
+    ExecutionMetadata, QuorumCertificate, RoutableTransaction, ShardGroupId, ShardWitnessPayload,
+    StateRoot, StoredReceipt, TxHash, WaveCertificate, WaveId,
 };
 
 use crate::tree_store::SimTreeStore;
@@ -114,6 +114,10 @@ pub struct ConsensusState {
     pub execution_certs: HashMap<WaveId, ExecutionCertificate>,
     /// Index: `block_height` → `WaveId`s at that height.
     pub wave_certs_by_height: HashMap<BlockHeight, Vec<WaveId>>,
+    /// Beacon-witness leaves keyed by `(shard, leaf_index)`. Mirrors the
+    /// production `RocksDB` `beacon_witnesses` CF so simulation integration
+    /// tests can serve fetches and replay the accumulator on restart.
+    pub beacon_witnesses: BTreeMap<(ShardGroupId, u64), ShardWitnessPayload>,
 }
 
 /// Maximum number of blocks worth of receipts to retain in simulation storage.
@@ -133,6 +137,7 @@ impl ConsensusState {
             receipt_heights: HashMap::new(),
             execution_certs: HashMap::new(),
             wave_certs_by_height: HashMap::new(),
+            beacon_witnesses: BTreeMap::new(),
         }
     }
 

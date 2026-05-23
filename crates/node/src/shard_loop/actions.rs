@@ -11,7 +11,7 @@ use hyperscale_metrics::record_transaction_finalized;
 use hyperscale_network::Network;
 use hyperscale_provisions::action_handlers::handle_action as handle_provisions_action;
 use hyperscale_shard::action_handlers::handle_action as handle_shard_action;
-use hyperscale_storage::Storage;
+use hyperscale_storage::{BeaconWitnessCommit, Storage};
 use hyperscale_types::{
     Block, BlockHeight, CertifiedBlock, QuorumCertificate, StateRoot, TopologySnapshot,
     TransactionStatus, TxHash,
@@ -64,6 +64,7 @@ where
             | Action::VerifyQcSignature { .. }
             | Action::VerifyRemoteHeaderQc { .. }
             | Action::VerifyStateRoot { .. }
+            | Action::VerifyBeaconWitnessRoot { .. }
             | Action::VerifyTransactionRoot { .. }
             | Action::VerifyProvisionRoot { .. }
             | Action::VerifyCertificateRoot { .. }
@@ -106,12 +107,18 @@ where
             }
             Action::Continuation(pe) => self.handle_continuation(pe),
             Action::RestoreCommittedState => self.handle_restore_committed_state(),
-            Action::CommitBlock { block, qc, source } => {
+            Action::CommitBlock {
+                block,
+                qc,
+                source,
+                witness,
+            } => {
                 self.accept_block_commit(PendingCommit {
                     block: Arc::new(block),
                     qc: Arc::new(qc),
                     source,
                     committed_notified: false, // set by accumulate
+                    witness,
                 });
             }
             Action::CommitBlockByQcOnly {
@@ -120,6 +127,7 @@ where
                 parent_state_root,
                 parent_block_height,
                 source,
+                witness,
             } => {
                 self.accept_qc_only_commit(
                     block,
@@ -127,6 +135,7 @@ where
                     parent_state_root,
                     parent_block_height,
                     source,
+                    witness,
                 );
             }
             Action::EmitTransactionStatus {
@@ -261,6 +270,7 @@ where
         parent_state_root: StateRoot,
         parent_block_height: BlockHeight,
         source: CommitSource,
+        witness: BeaconWitnessCommit,
     ) {
         let block_hash = block.hash();
         let height = block.height();
@@ -285,6 +295,7 @@ where
             parent_block_height,
             source,
             kind,
+            witness,
         };
         if let Some(to_process) = self.io.block_commit.try_acquire_qc_only_slot(pending) {
             self.process_qc_only(to_process);
@@ -311,6 +322,7 @@ where
                         qc: pending.qc,
                         source: pending.source,
                         committed_notified: false,
+                        witness: pending.witness,
                     });
                     match self.io.block_commit.release_qc_only_slot() {
                         Some(next) => pending = next,
@@ -338,13 +350,22 @@ where
             .spawn(DispatchPool::Consensus, move || {
                 let result = run_qc_only_prep(&pending_chain, &prepared_commits, &pending);
                 let QcOnlyPending {
-                    block, qc, source, ..
+                    block,
+                    qc,
+                    source,
+                    witness,
+                    ..
                 } = pending;
                 match result {
                     Ok(()) => push_shard_input(
                         &event_tx,
                         shard,
-                        ShardScopedInput::QcOnlyCommitPrepared { block, qc, source },
+                        ShardScopedInput::QcOnlyCommitPrepared {
+                            block,
+                            qc,
+                            source,
+                            witness,
+                        },
                     ),
                     Err(div) => push_shard_input(
                         &event_tx,
@@ -365,12 +386,14 @@ where
         block: Arc<Block>,
         qc: Arc<QuorumCertificate>,
         source: CommitSource,
+        witness: BeaconWitnessCommit,
     ) {
         self.accept_block_commit(PendingCommit {
             block,
             qc,
             source,
             committed_notified: false,
+            witness,
         });
         if let Some(next) = self.io.block_commit.release_qc_only_slot() {
             self.process_qc_only(next);

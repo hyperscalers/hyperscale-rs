@@ -16,6 +16,7 @@
 use std::sync::Arc;
 
 use hyperscale_core::{CommitSource, ProtocolEvent};
+use hyperscale_storage::BeaconWitnessCommit;
 use hyperscale_types::{
     Block, BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, CertifiedBlock,
     CommittedBlockHeader, ElidedCertifiedBlock, HeaderFetchCount, ProvisionHash, QuorumCertificate,
@@ -293,6 +294,11 @@ pub enum ShardScopedInput {
         /// How this node learned the certifying QC. Threaded through to
         /// `accept_block_commit` for metrics labelling.
         source: CommitSource,
+        /// Beacon-witness leaves to fold into the eventual block-flush
+        /// `WriteBatch`. Originates from the `QcOnlyPending` entry the
+        /// shard handed the prep slot; rides back through this event so
+        /// the resulting `PendingCommit` can be persisted atomically.
+        witness: BeaconWitnessCommit,
     },
 
     /// JMT prep for a QC-only commit computed a state root that doesn't

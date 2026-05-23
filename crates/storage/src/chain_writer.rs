@@ -6,9 +6,65 @@
 
 use std::sync::Arc;
 
-use hyperscale_types::{Block, BlockHeight, FinalizedWave, QuorumCertificate, StateRoot};
+use hyperscale_types::{
+    BeaconWitnessLeafCount, Block, BlockHeight, FinalizedWave, QuorumCertificate, ShardGroupId,
+    ShardWitnessPayload, StateRoot,
+};
 
 use crate::{BaseReadCache, JmtSnapshot};
+
+/// Beacon-witness data committed alongside a block.
+///
+/// Threaded into the block-commit path so the storage backend can write
+/// the appended leaves into the per-shard `beacon_witnesses` column
+/// family in the **same `WriteBatch`** as the block, atomically
+/// stamping `BlockMetadata::beacon_witness_leaf_count_at_block_end` so
+/// post-restart recovery sees a self-consistent tip. Producer-side
+/// derivation lives in the shard coordinator
+/// ([`crate::beacon_witnesses::derive_leaves`](../../crates/shard/src/beacon_witnesses.rs));
+/// this struct is the persistence-side carrier.
+#[derive(Debug, Clone)]
+pub struct BeaconWitnessCommit {
+    /// Shard the leaves belong to. Used as the key prefix in the
+    /// `beacon_witnesses` CF.
+    pub shard: ShardGroupId,
+    /// Accumulator index of the first leaf in `leaves`. The leaf at
+    /// position `i` in `leaves` writes to key
+    /// `(shard, starting_leaf_index + i)`.
+    pub starting_leaf_index: BeaconWitnessLeafCount,
+    /// Witness payloads appended by this block. Encoded by the
+    /// `beacon_witnesses` CF's typed-CF accessor.
+    pub leaves: Vec<ShardWitnessPayload>,
+    /// Total accumulator leaves after this block — i.e.
+    /// `starting_leaf_index + leaves.len()`. Stamped into the block's
+    /// `BlockMetadata::beacon_witness_leaf_count_at_block_end` so the
+    /// fetch responder can map `block_hash` → `(first_leaf, last_leaf)`
+    /// without re-walking history.
+    pub leaf_count_at_block_end: BeaconWitnessLeafCount,
+}
+
+impl BeaconWitnessCommit {
+    /// Witness commit that appends nothing — produced by the sync path
+    /// when witness reconstruction lives elsewhere, by tests that
+    /// haven't wired the shard producer, and by genesis.
+    #[must_use]
+    pub const fn empty(shard: ShardGroupId, starting_leaf_index: BeaconWitnessLeafCount) -> Self {
+        Self {
+            shard,
+            starting_leaf_index,
+            leaves: Vec::new(),
+            leaf_count_at_block_end: starting_leaf_index,
+        }
+    }
+}
+
+/// One block's worth of inputs to [`ChainWriter::commit_prepared_blocks`].
+///
+/// Bundles the prepared-commit handle, the block + QC, and the
+/// beacon-witness leaves to fold into the same atomic write. Aliased
+/// because the inline tuple type trips the `clippy::type_complexity`
+/// lint when used in trait signatures.
+pub type PreparedCommitBatchEntry<P> = (P, Arc<Block>, Arc<QuorumCertificate>, BeaconWitnessCommit);
 
 /// Abstracts state commitment for both simulation and production storage.
 ///
@@ -74,22 +130,32 @@ pub trait ChainWriter: Send + Sync + 'static {
     ///
     /// Blocks must be in height-ascending order. Receipt writes are already
     /// included in each prepared handle — callers only need to supply data
-    /// that wasn't known at prepare time (block, QC).
-    /// Execution certificates are extracted from `block.certificates`.
+    /// that wasn't known at prepare time (block, QC, beacon-witness leaves).
+    /// Execution certificates are extracted from `block.certificates`. Each
+    /// block's [`BeaconWitnessCommit`] folds into the same atomic write so
+    /// the appended leaves, the stamped `leaf_count_at_block_end` on
+    /// `BlockMetadata`, and the rest of the per-block data commit together
+    /// or not at all.
     ///
     /// Returns the state root hash for each committed block, in the same order.
     fn commit_prepared_blocks(
         &self,
-        blocks: Vec<(Self::PreparedCommit, Arc<Block>, Arc<QuorumCertificate>)>,
+        blocks: Vec<PreparedCommitBatchEntry<Self::PreparedCommit>>,
     ) -> Vec<StateRoot>;
 
     /// Commit a block's state writes from scratch (no prepared handle).
     ///
     /// Extracts receipts and execution certificates from `block.certificates`,
-    /// merges `DatabaseUpdates` internally. Used when no `PreparedCommit` is
-    /// available (e.g., sync blocks, cache eviction, or proposer fast-path not
-    /// applicable).
-    fn commit_block(&self, block: &Arc<Block>, qc: &Arc<QuorumCertificate>) -> StateRoot;
+    /// merges `DatabaseUpdates` internally. The `witness` carries the
+    /// beacon-witness leaves to fold into the same atomic batch. Used when
+    /// no `PreparedCommit` is available (e.g., sync blocks, cache eviction,
+    /// or proposer fast-path not applicable).
+    fn commit_block(
+        &self,
+        block: &Arc<Block>,
+        qc: &Arc<QuorumCertificate>,
+        witness: &BeaconWitnessCommit,
+    ) -> StateRoot;
 
     /// Extract the JMT snapshot from a prepared commit.
     ///

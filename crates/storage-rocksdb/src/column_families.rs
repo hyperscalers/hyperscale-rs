@@ -136,9 +136,6 @@ pub struct CfHandles<'a> {
     consensus_receipts: &'a ColumnFamily,
     execution_metadata: &'a ColumnFamily,
     execution_certs: &'a ColumnFamily,
-    // Read by `BeaconWitnessesCf::handle`; the typed-CF accessor lands
-    // alongside the per-block accumulator wiring in a follow-up commit.
-    #[allow(dead_code)]
     beacon_witnesses: &'a ColumnFamily,
 }
 
@@ -349,15 +346,11 @@ impl TypedCf for ExecutionCertsCf {
     }
 }
 
-// Beacon witnesses. Reads/writes land with the per-block accumulator
-// wiring in a follow-up commit; the CF + codecs are declared here so
-// `ALL_COLUMN_FAMILIES` and `CfHandles::resolve` know about it from
-// the start.
+// Beacon witnesses.
 
 /// Key codec for the [`BeaconWitnessesCf`] CF: a `(shard, leaf_index)`
 /// pair encoded as two big-endian `u64`s. BE preserves lexicographic
 /// order so a per-shard scan returns leaves in monotonic index order.
-#[allow(dead_code)] // yet to be wired
 #[derive(Default)]
 pub struct BeaconWitnessKeyCodec;
 
@@ -377,7 +370,6 @@ impl DbCodec<(ShardGroupId, u64)> for BeaconWitnessKeyCodec {
     }
 }
 
-#[allow(dead_code)] // wired in a follow-up commit
 pub struct BeaconWitnessesCf;
 impl TypedCf for BeaconWitnessesCf {
     const NAME: &'static str = BEACON_WITNESSES_CF;

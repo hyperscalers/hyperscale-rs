@@ -15,8 +15,9 @@ use hyperscale_core::{Action, VerificationKind};
 #[cfg(test)]
 use hyperscale_types::{BeaconWitnessLeafCount, BeaconWitnessRoot};
 use hyperscale_types::{
-    Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, FinalizedWave, InFlightCount,
-    LocalReceiptRoot, ProvisionsRoot, QuorumCertificate, StateRoot, TopologySnapshot,
+    Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, FinalizedWave, Hash, InFlightCount,
+    LocalReceiptRoot, ProvisionsRoot, QuorumCertificate, ReadySignal, Round, StateRoot,
+    TopologySnapshot,
 };
 use tracing::{debug, trace, warn};
 
@@ -352,6 +353,7 @@ impl VerificationPipeline {
                 VerificationKind::ProvisionTxRoots,
                 !h.provision_tx_roots().is_empty(),
             )
+            && root_ok(VerificationKind::BeaconWitnessRoot, true)
             && self.verified_in_flight.contains(&block_hash)
     }
 
@@ -415,6 +417,8 @@ impl VerificationPipeline {
             "skipped(no_provision_targets)",
             !h.provision_tx_roots().is_empty(),
         );
+        let beacon_witness_root_status =
+            root_status(VerificationKind::BeaconWitnessRoot, "skipped", true);
 
         let in_flight_status = if self.verified_in_flight.contains(&block_hash) {
             "verified"
@@ -434,6 +438,7 @@ impl VerificationPipeline {
             local_receipt_root = local_receipt_root_status,
             provision_root = provision_root_status,
             provision_tx_root = provision_tx_root_status,
+            beacon_witness_root = beacon_witness_root_status,
             in_flight = in_flight_status,
             "View change — block verification was incomplete"
         );
@@ -700,6 +705,57 @@ impl VerificationPipeline {
             block_hash,
             expected: block.header().provision_tx_roots().0.clone(),
             transactions: block.transactions().clone(),
+            topology_snapshot: topology.clone(),
+        }]
+    }
+
+    /// Whether the block still needs its beacon-witness root verified
+    /// (not already verified, not in-flight). Beacon-witness verification
+    /// always runs — every block's header carries a witness root + leaf
+    /// count, even when the block contributes zero new leaves.
+    pub fn needs_beacon_witness_root_verification(&self, block_hash: BlockHash) -> bool {
+        self.needs_root(block_hash, VerificationKind::BeaconWitnessRoot, true)
+    }
+
+    /// Initiate beacon-witness root verification for a block.
+    ///
+    /// Pure CPU check that runs in parallel with the other per-root
+    /// verifiers. The caller supplies `parent_witness_leaves` (the
+    /// accumulator state the parent block left behind, walked through any
+    /// in-chain pending-block deltas), `parent_round` (from the parent
+    /// header), `ready_signals` (drained from the manifest), and
+    /// `finalized_waves` (for receipt-sourced witness events). The handler
+    /// re-derives the deterministic leaf list, applies it, and emits
+    /// `BlockRootVerified { kind: BeaconWitnessRoot, valid }`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn initiate_beacon_witness_root_verification(
+        &mut self,
+        block_hash: BlockHash,
+        block: &Block,
+        ready_signals: Vec<ReadySignal>,
+        parent_round: Round,
+        parent_witness_leaves: Vec<Hash>,
+        finalized_waves: Vec<Arc<FinalizedWave>>,
+        topology: &TopologySnapshot,
+    ) -> Vec<Action> {
+        let header = block.header();
+        debug!(
+            ?block_hash,
+            expected_leaf_count = header.beacon_witness_leaf_count().inner(),
+            parent_leaf_count = parent_witness_leaves.len(),
+            "Initiating beacon-witness root verification"
+        );
+        self.mark_root_in_flight(block_hash, VerificationKind::BeaconWitnessRoot);
+        vec![Action::VerifyBeaconWitnessRoot {
+            block_hash,
+            expected_root: header.beacon_witness_root(),
+            expected_leaf_count: header.beacon_witness_leaf_count(),
+            parent_witness_leaves,
+            parent_round,
+            height: header.height(),
+            round: header.round(),
+            ready_signals,
+            finalized_waves,
             topology_snapshot: topology.clone(),
         }]
     }

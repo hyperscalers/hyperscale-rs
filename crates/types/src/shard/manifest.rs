@@ -126,14 +126,30 @@ pub struct BlockMetadata {
 }
 
 impl BlockMetadata {
-    /// Create metadata from a full block and QC.
+    /// Create metadata from a full block and QC. The
+    /// `beacon_witness_leaf_count_at_block_end` field is left at
+    /// `ZERO`; callers that know the leaf count (the per-block commit
+    /// path) should use [`Self::from_block_with_witness_count`].
     #[must_use]
     pub fn from_block(block: &Block, qc: QuorumCertificate) -> Self {
+        Self::from_block_with_witness_count(block, qc, BeaconWitnessLeafCount::ZERO)
+    }
+
+    /// Create metadata stamped with `beacon_witness_leaf_count_at_block_end`.
+    /// Storage backends call this so the fetch responder can map
+    /// `committed_block_hash` to a `(first_leaf, last_leaf)` range without
+    /// re-walking history.
+    #[must_use]
+    pub fn from_block_with_witness_count(
+        block: &Block,
+        qc: QuorumCertificate,
+        beacon_witness_leaf_count_at_block_end: BeaconWitnessLeafCount,
+    ) -> Self {
         Self {
             header: block.header().clone(),
             manifest: BlockManifest::from_block(block),
             qc,
-            beacon_witness_leaf_count_at_block_end: BeaconWitnessLeafCount::ZERO,
+            beacon_witness_leaf_count_at_block_end,
         }
     }
 

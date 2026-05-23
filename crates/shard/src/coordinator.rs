@@ -14,9 +14,9 @@
 
 use hyperscale_core::{Action, CommitSource, FetchAbandon, ProtocolEvent, TimerId};
 use hyperscale_types::{
-    BlockHash, LocalTimestamp, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROGRESS_WAIT,
+    BlockHash, Hash, LocalTimestamp, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROGRESS_WAIT,
     MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProposerTimestamp, ProvisionHash, ReadySignal,
-    ShardGroupId, StoredReceipt, WaveId, WeightedTimestamp,
+    ShardGroupId, ShardWitnessPayload, StoredReceipt, WaveId, WeightedTimestamp,
 };
 
 /// Shard consensus statistics for monitoring.
@@ -78,7 +78,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_core::VerificationKind;
-use hyperscale_storage::RecoveredState;
+use hyperscale_storage::{BeaconWitnessCommit, RecoveredState};
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, CertifiedBlock,
     CommittedBlockHeader, FinalizedWave, Provisions, QuorumCertificate, Round, RoutableTransaction,
@@ -183,9 +183,11 @@ pub struct ShardCoordinator {
 
     /// Per-shard beacon-witness accumulator. Previewed at proposal time
     /// to fill the new block's `(beacon_witness_root, beacon_witness_leaf_count)`;
-    /// mutated on each committed block via [`Self::on_block_committed`].
-    /// On startup, reconstructed by replaying committed blocks (a
-    /// follow-up commit lands the recovery path).
+    /// mutated on each committed block via [`Self::record_block_committed`].
+    /// Seeded at startup from
+    /// [`RecoveredState::beacon_witness_leaf_hashes`](hyperscale_storage::RecoveredState),
+    /// which the storage backend loads from the persisted
+    /// `beacon_witnesses` CF.
     beacon_witness_accumulator: BeaconWitnessAccumulator,
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -242,7 +244,9 @@ impl ShardCoordinator {
             proposal: ProposalTracker::new(),
             dedup_index: CommitDedupIndex::new(),
             ready_signal_pool: ReadySignalPool::new(),
-            beacon_witness_accumulator: BeaconWitnessAccumulator::new(),
+            beacon_witness_accumulator: BeaconWitnessAccumulator::from_leaves(
+                recovered.beacon_witness_leaf_hashes,
+            ),
             config,
             now: LocalTimestamp::ZERO,
         }
@@ -254,6 +258,80 @@ impl ShardCoordinator {
     #[must_use]
     pub const fn jmt_root(&self) -> StateRoot {
         self.committed_state_root
+    }
+
+    /// Snapshot of the beacon-witness accumulator's leaf hashes at the
+    /// state the supplied parent block would leave behind.
+    ///
+    /// Walks from `parent_block_hash` back through the pending chain to
+    /// the committed tip, re-deriving each ancestor's witness-leaf delta
+    /// from its receipts + manifest's `ready_signals` + missed-round
+    /// scan, then prepends the committed accumulator's leaves. The
+    /// derivation is byte-identical to what the proposer ran, so the
+    /// returned vector is exactly the input the verifier must apply
+    /// the block's own new leaves to.
+    ///
+    /// Returns the committed accumulator's leaves unchanged when
+    /// `parent_block_hash` IS the committed tip, or when the walk
+    /// encounters a missing/unassembled ancestor (the verifier handler
+    /// will reject the block on the resulting root mismatch — same
+    /// failure mode as any other inconsistent input).
+    fn prospective_parent_witness_leaves(
+        &self,
+        parent_block_hash: BlockHash,
+        topology_snapshot: &TopologySnapshot,
+    ) -> Vec<Hash> {
+        let committed_leaves = self.beacon_witness_accumulator.leaves();
+        if parent_block_hash == self.committed_hash {
+            return committed_leaves.to_vec();
+        }
+        let mut chain_deltas: Vec<Vec<Hash>> = Vec::new();
+        let mut current = parent_block_hash;
+        while current != self.committed_hash {
+            let Some(pending) = self.pending_blocks.get(current) else {
+                trace!(
+                    block_hash = ?current,
+                    "Prospective witness-leaf walk: missing pending ancestor"
+                );
+                return committed_leaves.to_vec();
+            };
+            let Some(block) = pending.block() else {
+                trace!(
+                    block_hash = ?current,
+                    "Prospective witness-leaf walk: ancestor not assembled"
+                );
+                return committed_leaves.to_vec();
+            };
+            let header = block.header();
+            let receipts: Vec<StoredReceipt> = block
+                .certificates()
+                .iter()
+                .flat_map(|fw| fw.receipts().iter().cloned())
+                .collect();
+            let missed = beacon_witnesses::missed_proposals_since_prev_commit(
+                header.height(),
+                header.parent_qc().round(),
+                header.round(),
+                topology_snapshot,
+            );
+            let new_leaves = beacon_witnesses::derive_leaves(
+                &receipts,
+                missed,
+                pending.manifest().ready_signals().as_slice(),
+            );
+            chain_deltas.push(
+                new_leaves
+                    .iter()
+                    .map(ShardWitnessPayload::leaf_hash)
+                    .collect(),
+            );
+            current = header.parent_block_hash();
+        }
+        let mut leaves = committed_leaves.to_vec();
+        for delta in chain_deltas.iter().rev() {
+            leaves.extend_from_slice(delta);
+        }
+        leaves
     }
 
     /// Borrow-view of the node's knowledge of the chain. Short-lived; see
@@ -1437,12 +1515,40 @@ impl ShardCoordinator {
                 InFlightCheck::Abort => return vec![],
             };
 
-            let verification_actions = self.verification.initiate_block_verifications(
+            let mut verification_actions = self.verification.initiate_block_verifications(
                 topology_snapshot,
                 &self.pending_blocks,
                 block_hash,
                 block,
             );
+            if self
+                .verification
+                .needs_beacon_witness_root_verification(block_hash)
+            {
+                let parent_witness_leaves = self.prospective_parent_witness_leaves(
+                    block.header().parent_block_hash(),
+                    topology_snapshot,
+                );
+                let parent_round = block.header().parent_qc().round();
+                let ready_signals = self
+                    .pending_blocks
+                    .get(block_hash)
+                    .map_or_else(Vec::new, |pending| {
+                        pending.manifest().ready_signals().as_slice().to_vec()
+                    });
+                let finalized_waves = block.certificates().to_vec();
+                verification_actions.extend(
+                    self.verification.initiate_beacon_witness_root_verification(
+                        block_hash,
+                        block,
+                        ready_signals,
+                        parent_round,
+                        parent_witness_leaves,
+                        finalized_waves,
+                        topology_snapshot,
+                    ),
+                );
+            }
 
             // Wait for initiated verifications, or exit early when we're
             // running verifications only (skip_vote) or the block isn't
@@ -2273,7 +2379,7 @@ impl ShardCoordinator {
         block: &Block,
         block_hash: BlockHash,
         commit_ts: WeightedTimestamp,
-    ) -> Option<Action> {
+    ) -> (Option<Action>, BeaconWitnessCommit) {
         let height = block.height();
 
         self.committed_height = height;
@@ -2300,13 +2406,13 @@ impl ShardCoordinator {
         self.dedup_index
             .register_committed_provisions(manifest.provision_hashes(), commit_ts);
 
-        // Fold the block's beacon-witness leaves into the local
-        // accumulator. Derives from the same canonical sources the
-        // proposer used: receipts from finalized waves, missed-proposal
-        // events from the parent round, and ready signals from the
-        // committed manifest. Persistence to RocksDB lands in a
-        // follow-up commit alongside the fetch responder; pool eviction
-        // bounds memory by dropping signals past their window.
+        // Derive this block's beacon-witness leaves from the same three
+        // canonical sources the proposer used (receipts from finalized
+        // waves, missed-proposal walk over `(parent_round, round)`, and
+        // the manifest's `ready_signals`). The leaves are folded into
+        // the in-memory accumulator and packaged into a
+        // [`BeaconWitnessCommit`] so the io_loop can persist them in
+        // the same atomic `WriteBatch` as the block.
         let parent_round = block.header().parent_qc().round();
         let receipts: Vec<StoredReceipt> = block
             .certificates()
@@ -2321,13 +2427,21 @@ impl ShardCoordinator {
         );
         let new_leaves =
             beacon_witnesses::derive_leaves(&receipts, missed, manifest.ready_signals().as_slice());
+        let starting_leaf_index = self.beacon_witness_accumulator.leaf_count();
         self.beacon_witness_accumulator.commit_append(&new_leaves);
+        let leaf_count_at_block_end = self.beacon_witness_accumulator.leaf_count();
+        let witness = BeaconWitnessCommit {
+            shard: topology_snapshot.local_shard(),
+            starting_leaf_index,
+            leaves: new_leaves,
+            leaf_count_at_block_end,
+        };
         self.ready_signal_pool.evict_expired(height);
 
         // Reset backoff tracking — new height means fresh round counting.
         self.view_change.reset_for_height_advance();
 
-        self.cleanup_old_state(height)
+        (self.cleanup_old_state(height), witness)
     }
 
     /// Drive the commit chain: commit the given block, then any buffered
@@ -2429,13 +2543,14 @@ impl ShardCoordinator {
         let parent_state_root = self.committed_state_root;
         let parent_block_height = self.committed_height;
 
-        if let Some(abandon) = self.record_block_committed(
+        let (abandon, witness) = self.record_block_committed(
             topology_snapshot,
             &block,
             block_hash,
             qc.weighted_timestamp(),
-        ) {
-            actions.push(abandon);
+        );
+        if let Some(action) = abandon {
+            actions.push(action);
         }
         self.record_leader_activity();
 
@@ -2444,6 +2559,7 @@ impl ShardCoordinator {
                 block: block.clone(),
                 qc: qc.clone(),
                 source,
+                witness,
             }
         } else {
             Action::CommitBlockByQcOnly {
@@ -2452,6 +2568,7 @@ impl ShardCoordinator {
                 parent_state_root,
                 parent_block_height,
                 source,
+                witness,
             }
         });
 
@@ -2573,7 +2690,7 @@ impl ShardCoordinator {
 
         // Advance committed_height. The QC is the proof of commit — same
         // timing as the consensus path.
-        self.record_block_committed(
+        let (_, witness) = self.record_block_committed(
             topology_snapshot,
             &block,
             block_hash,
@@ -2610,6 +2727,7 @@ impl ShardCoordinator {
             parent_state_root,
             parent_block_height,
             source: CommitSource::Sync,
+            witness,
         }];
 
         // Admit the synced block's wave certs through the canonical pathway
@@ -3709,9 +3827,22 @@ mod tests {
                 .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. }))
         );
 
-        // State root completes — now we vote.
-        let after_roots =
+        // State root completes — beacon witness root still pending.
+        let after_state =
             state.on_block_root_verified(&topology, VerificationKind::StateRoot, block_hash, true);
+        assert!(
+            !after_state
+                .iter()
+                .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. }))
+        );
+
+        // Beacon witness root completes — now we vote.
+        let after_roots = state.on_block_root_verified(
+            &topology,
+            VerificationKind::BeaconWitnessRoot,
+            block_hash,
+            true,
+        );
         assert!(
             after_roots
                 .iter()

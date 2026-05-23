@@ -6,16 +6,21 @@ use hyperscale_storage::test_helpers::{
 };
 use hyperscale_storage::tree::{jmt_parent_height, put_at_version};
 use hyperscale_storage::{
-    ChainReader, ChainWriter, CommittableSubstateDatabase, DatabaseUpdate, DatabaseUpdates,
-    DbPartitionKey, DbSortKey, NodeDatabaseUpdates, PartitionDatabaseUpdates, SubstateDatabase,
-    SubstateStore, VersionedStore, keys, merge_database_updates, merge_into, test_helpers,
+    BeaconWitnessCommit, ChainReader, ChainWriter, CommittableSubstateDatabase, DatabaseUpdate,
+    DatabaseUpdates, DbPartitionKey, DbSortKey, NodeDatabaseUpdates, PartitionDatabaseUpdates,
+    SubstateDatabase, SubstateStore, VersionedStore, keys, merge_database_updates, merge_into,
+    test_helpers,
 };
 use hyperscale_types::test_utils::test_transaction;
 use hyperscale_types::{
-    Block, BlockHeight, ConsensusReceipt, FinalizedWave, GlobalReceiptHash, Hash, NodeId,
-    ProposerTimestamp, QuorumCertificate, ShardGroupId, StateRoot, StoredReceipt, TxHash,
-    WaveCertificate, WaveId,
+    BeaconWitnessLeafCount, Block, BlockHeight, ConsensusReceipt, FinalizedWave, GlobalReceiptHash,
+    Hash, NodeId, ProposerTimestamp, QuorumCertificate, ShardGroupId, StateRoot, StoredReceipt,
+    TxHash, WaveCertificate, WaveId,
 };
+
+fn no_witness() -> BeaconWitnessCommit {
+    BeaconWitnessCommit::empty(ShardGroupId::new(0), BeaconWitnessLeafCount::ZERO)
+}
 use indexmap::IndexMap;
 
 use crate::core::SimStorage;
@@ -158,7 +163,7 @@ fn commit_with(
             }
         }
     };
-    storage.commit_block(&Arc::new(block), &Arc::new(qc.clone()))
+    storage.commit_block(&Arc::new(block), &Arc::new(qc.clone()), &no_witness())
 }
 
 /// Helper: commit a block with empty updates and no ECs/receipts.
@@ -565,6 +570,7 @@ fn test_prepare_then_commit_fast_path() {
             prepared,
             Arc::new(block.clone()),
             Arc::new(qc.clone()),
+            no_witness(),
         )])
         .remove(0);
 
@@ -591,7 +597,12 @@ fn test_prepare_commit_state_root_matches() {
         None,
     );
     let result = storage
-        .commit_prepared_blocks(vec![(prepared, Arc::new(block), Arc::new(qc))])
+        .commit_prepared_blocks(vec![(
+            prepared,
+            Arc::new(block),
+            Arc::new(qc),
+            no_witness(),
+        )])
         .remove(0);
 
     assert_eq!(spec_root, result);

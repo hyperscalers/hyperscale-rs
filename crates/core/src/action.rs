@@ -5,10 +5,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_dispatch::DispatchPool;
+use hyperscale_storage::BeaconWitnessCommit;
 use hyperscale_types::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight,
     BlockManifest, BlockVote, Bls12381G1PublicKey, CertificateRoot, CommittedBlockHeader,
-    ExecutionCertificate, ExecutionVote, FinalizedWave, GlobalReceiptRoot, InFlightCount,
+    ExecutionCertificate, ExecutionVote, FinalizedWave, GlobalReceiptRoot, Hash, InFlightCount,
     LocalReceiptRoot, NodeId, ProposerTimestamp, ProvisionHash, ProvisionTxRoot, Provisions,
     ProvisionsRoot, QuorumCertificate, ReadySignal, Round, RoutableTransaction, ShardGroupId,
     SharedCertificates, SharedTransactions, StateRoot, SubstateEntry, TopologySnapshot,
@@ -394,6 +395,47 @@ pub enum Action {
         block_height: BlockHeight,
     },
 
+    /// Verify a block's beacon-witness root + leaf count.
+    ///
+    /// Re-derives the new witness leaves from the same three deterministic
+    /// sources the proposer used — receipts (via `finalized_waves`), the
+    /// missed-round walk over `(parent_round, round)` against
+    /// `topology_snapshot`, and the manifest's `ready_signals` — then
+    /// applies them against `parent_witness_leaves` (the accumulator state
+    /// the parent block left behind) and compares the resulting
+    /// `(root, leaf_count)` to the header's claim. A mismatch fails the
+    /// check; honest validators reject the block.
+    ///
+    /// Pure CPU; no JMT dependency. Runs in parallel with the other
+    /// per-root verifiers.
+    VerifyBeaconWitnessRoot {
+        /// Block whose beacon-witness root is being verified.
+        block_hash: BlockHash,
+        /// Expected accumulator root from the block header.
+        expected_root: BeaconWitnessRoot,
+        /// Expected accumulator leaf count from the block header.
+        expected_leaf_count: BeaconWitnessLeafCount,
+        /// Accumulator leaves at the parent block — the base the proposer
+        /// appended onto. Captured by the coordinator from its committed
+        /// accumulator plus any in-chain pending-block deltas.
+        parent_witness_leaves: Vec<Hash>,
+        /// Parent round; used with `round` to walk
+        /// `(parent_round + 1 .. round)` for the `MissedProposal` channel.
+        parent_round: Round,
+        /// Block height (anchors `MissedProposal`'s `proposer_for` lookup).
+        height: BlockHeight,
+        /// Block round; the upper bound of the missed-round walk.
+        round: Round,
+        /// Ready signals the proposer drained into the manifest.
+        ready_signals: Vec<ReadySignal>,
+        /// Finalized waves whose receipts contribute receipt-sourced
+        /// witness events.
+        finalized_waves: Vec<Arc<FinalizedWave>>,
+        /// Topology snapshot for `proposer_for` lookups in the
+        /// missed-round walk.
+        topology_snapshot: TopologySnapshot,
+    },
+
     /// Verify a block's transaction root and per-tx validity windows.
     ///
     /// Computes the merkle root from the block's transactions and compares
@@ -582,6 +624,11 @@ pub enum Action {
         qc: QuorumCertificate,
         /// How this node learned the certifying QC (aggregator vs header).
         source: CommitSource,
+        /// Beacon-witness leaves to persist alongside the block in the
+        /// same atomic write. Carries the appended payloads, their
+        /// accumulator-start index, and the resulting
+        /// `leaf_count_at_block_end` stamped into the block's metadata.
+        witness: BeaconWitnessCommit,
     },
 
     /// Commit a block trusted via QC only — no cached `PreparedCommit` exists
@@ -603,6 +650,9 @@ pub enum Action {
         parent_block_height: BlockHeight,
         /// How this node learned the certifying QC (aggregator vs header).
         source: CommitSource,
+        /// Beacon-witness leaves to persist alongside the block in the
+        /// same atomic write — see [`Self::CommitBlock`].
+        witness: BeaconWitnessCommit,
     },
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -743,6 +793,7 @@ impl Action {
             | Self::VerifyCertificateRoot { .. }
             | Self::VerifyProvisionTxRoots { .. }
             | Self::VerifyStateRoot { .. }
+            | Self::VerifyBeaconWitnessRoot { .. }
             | Self::BuildProposal { .. }
             | Self::BroadcastBlockHeader { .. }
             | Self::SignAndBroadcastBlockVote { .. }
@@ -777,6 +828,7 @@ impl Action {
             | Self::VerifyCertificateRoot { .. }
             | Self::VerifyProvisionTxRoots { .. }
             | Self::VerifyStateRoot { .. }
+            | Self::VerifyBeaconWitnessRoot { .. }
             | Self::BuildProposal { .. }
             | Self::BroadcastBlockHeader { .. }
             | Self::SignAndBroadcastBlockVote { .. }

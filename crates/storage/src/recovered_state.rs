@@ -1,7 +1,7 @@
 //! State recovered from storage on startup, used to restore the consensus
 //! state machine after a crash or restart.
 
-use hyperscale_types::{BlockHash, BlockHeight, QuorumCertificate, StateRoot};
+use hyperscale_types::{BlockHash, BlockHeight, Hash, QuorumCertificate, StateRoot};
 
 /// State recovered from storage on startup.
 ///
@@ -26,4 +26,13 @@ pub struct RecoveredState {
     ///
     /// If not provided (None), defaults to `StateRoot::ZERO` for fresh start.
     pub jmt_root: Option<StateRoot>,
+
+    /// Beacon-witness accumulator leaf hashes for the recovery shard, in
+    /// monotonic leaf-index order. Storage backends derive these from
+    /// the `beacon_witnesses` CF by hashing each retained payload, so
+    /// the shard coordinator can rebuild
+    /// [`BeaconWitnessAccumulator`](../../crates/shard/src/beacon_witnesses.rs)
+    /// to the on-disk count without re-deriving from receipts +
+    /// historical topology. Empty on a fresh start.
+    pub beacon_witness_leaf_hashes: Vec<Hash>,
 }

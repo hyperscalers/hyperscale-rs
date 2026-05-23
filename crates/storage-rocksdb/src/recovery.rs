@@ -2,9 +2,11 @@
 
 use hyperscale_metrics::record_storage_operation;
 use hyperscale_storage::{RecoveredState, SubstateStore};
-use hyperscale_types::{BlockHash, BlockHeight};
+use hyperscale_types::{BlockHash, BlockHeight, Hash, ShardWitnessPayload};
 
+use crate::column_families::BeaconWitnessesCf;
 use crate::core::RocksDbStorage;
+use crate::typed_cf::{TypedCf, iter_all};
 
 impl RocksDbStorage {
     /// Load recovered state from storage for crash recovery.
@@ -38,6 +40,8 @@ impl RocksDbStorage {
             );
         }
 
+        let beacon_witness_leaf_hashes = self.load_beacon_witness_leaf_hashes();
+
         let elapsed = start.elapsed().as_secs_f64();
         record_storage_operation("load_recovered_state", elapsed);
 
@@ -47,6 +51,7 @@ impl RocksDbStorage {
             has_latest_qc = latest_qc.is_some(),
             jmt_block_height = jmt_block_height.inner(),
             jmt_root = ?jmt_root,
+            beacon_witness_leaf_count = beacon_witness_leaf_hashes.len(),
             load_time_ms = elapsed * 1000.0,
             "Loaded recovered state from storage"
         );
@@ -56,6 +61,24 @@ impl RocksDbStorage {
             committed_hash: committed_hash.map(BlockHash::from_raw),
             latest_qc,
             jmt_root: jmt_root_opt,
+            beacon_witness_leaf_hashes,
         }
+    }
+
+    /// Read all retained beacon-witness leaves from the
+    /// [`BeaconWitnessesCf`](crate::column_families::BeaconWitnessesCf)
+    /// in key order and hash each payload through
+    /// [`ShardWitnessPayload::leaf_hash`]. The result feeds
+    /// [`BeaconWitnessAccumulator::from_leaves`](../../crates/shard/src/beacon_witnesses.rs)
+    /// at coordinator startup.
+    ///
+    /// Single-shard storage: the CF holds only the local shard's leaves.
+    /// Per-shard ordering is preserved because the key codec is BE.
+    fn load_beacon_witness_leaf_hashes(&self) -> Vec<Hash> {
+        let cf = self.cf();
+        let beacon_witnesses_cf = BeaconWitnessesCf::handle(&cf);
+        iter_all::<BeaconWitnessesCf>(&self.db, beacon_witnesses_cf)
+            .map(|(_key, payload): (_, ShardWitnessPayload)| payload.leaf_hash())
+            .collect()
     }
 }

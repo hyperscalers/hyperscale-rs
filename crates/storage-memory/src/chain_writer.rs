@@ -7,7 +7,8 @@ use hyperscale_storage::tree::{
     OverlayTreeReader, jmt_parent_height, noop_jmt_snapshot, put_at_version,
 };
 use hyperscale_storage::{
-    BaseReadCache, ChainWriter, DatabaseUpdates, JmtSnapshot, merge_updates_from_receipts,
+    BaseReadCache, BeaconWitnessCommit, ChainWriter, DatabaseUpdates, JmtSnapshot,
+    PreparedCommitBatchEntry, merge_updates_from_receipts,
 };
 use hyperscale_types::{
     Block, BlockHeight, CertifiedBlock, FinalizedWave, QuorumCertificate, StateRoot, StoredReceipt,
@@ -126,11 +127,12 @@ impl ChainWriter for SimStorage {
     #[allow(clippy::significant_drop_tightening)] // every locked op needs the lock
     fn commit_prepared_blocks(
         &self,
-        blocks: Vec<(Self::PreparedCommit, Arc<Block>, Arc<QuorumCertificate>)>,
+        blocks: Vec<PreparedCommitBatchEntry<Self::PreparedCommit>>,
     ) -> Vec<StateRoot> {
         blocks
             .into_iter()
-            .map(|(prepared, block, qc)| {
+            .map(|(prepared, block, qc, witness)| {
+                self.append_beacon_witnesses(&witness);
                 let block_height_u64 = prepared.snapshot.new_height.inner();
                 let result_root = prepared.snapshot.result_root;
 
@@ -181,14 +183,37 @@ impl ChainWriter for SimStorage {
             .collect()
     }
 
-    fn commit_block(&self, block: &Arc<Block>, qc: &Arc<QuorumCertificate>) -> StateRoot {
+    fn commit_block(
+        &self,
+        block: &Arc<Block>,
+        qc: &Arc<QuorumCertificate>,
+        witness: &BeaconWitnessCommit,
+    ) -> StateRoot {
         let receipts: Vec<StoredReceipt> = block
             .certificates()
             .iter()
             .flat_map(|fw| fw.receipts().iter().cloned())
             .collect();
         let merged_updates = merge_updates_from_receipts(&receipts);
+        self.append_beacon_witnesses(witness);
         self.commit_block_inner(&merged_updates, block, qc, &receipts)
+    }
+}
+
+impl SimStorage {
+    /// Append `witness.leaves` into the in-memory beacon-witness map.
+    /// Lives next to the commit paths so both prepared-commit and
+    /// from-scratch commits share one entry point.
+    fn append_beacon_witnesses(&self, witness: &BeaconWitnessCommit) {
+        if witness.leaves.is_empty() {
+            return;
+        }
+        let mut c = write_or_recover(&self.consensus);
+        let start = witness.starting_leaf_index.inner();
+        for (offset, payload) in witness.leaves.iter().enumerate() {
+            let key = (witness.shard, start + offset as u64);
+            c.beacon_witnesses.insert(key, payload.clone());
+        }
     }
 }
 

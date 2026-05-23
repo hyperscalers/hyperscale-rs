@@ -24,7 +24,7 @@ use radix_common::types::{NodeId as RadixNodeId, PartitionNumber};
 use radix_substate_store_interface::db_key_mapper::{DatabaseKeyMapper, SpreadPrefixKeyMapper};
 
 use crate::{
-    ChainReader, ChainWriter, DatabaseUpdates, DbSortKey, NodeDatabaseUpdates,
+    BeaconWitnessCommit, ChainReader, ChainWriter, DatabaseUpdates, DbSortKey, NodeDatabaseUpdates,
     PartitionDatabaseUpdates,
 };
 
@@ -267,11 +267,16 @@ fn make_test_block_with_ecs(height: BlockHeight, ecs: Vec<Arc<ExecutionCertifica
 
 /// Helper to commit empty blocks up to (but not including) the target height.
 fn commit_empty_blocks_up_to(storage: &(impl ChainReader + ChainWriter), target: BlockHeight) {
+    let witness = empty_witness();
     for h in 0..target.inner() {
         let b = make_test_block(BlockHeight::new(h));
         let q = make_test_qc(&b);
-        storage.commit_block(&Arc::new(b), &Arc::new(q));
+        storage.commit_block(&Arc::new(b), &Arc::new(q), &witness);
     }
+}
+
+const fn empty_witness() -> BeaconWitnessCommit {
+    BeaconWitnessCommit::empty(ShardGroupId::new(0), BeaconWitnessLeafCount::ZERO)
 }
 
 /// Shared EC roundtrip test: commit a block carrying an EC, then read it
@@ -290,7 +295,7 @@ pub fn test_ec_storage_roundtrip(storage: &(impl ChainReader + ChainWriter)) {
     commit_empty_blocks_up_to(storage, BlockHeight::new(10));
     let block = make_test_block_with_ecs(BlockHeight::new(10), vec![Arc::new(ec)]);
     let qc = make_test_qc(&block);
-    storage.commit_block(&Arc::new(block), &Arc::new(qc));
+    storage.commit_block(&Arc::new(block), &Arc::new(qc), &empty_witness());
 
     let direct = storage
         .get_execution_certificate(&wave_id)
@@ -316,16 +321,16 @@ pub fn test_ec_storage_batch(storage: &(impl ChainReader + ChainWriter)) {
         vec![Arc::new(ec1.clone()), Arc::new(ec2.clone())],
     );
     let qc10 = make_test_qc(&block10);
-    storage.commit_block(&Arc::new(block10), &Arc::new(qc10));
+    storage.commit_block(&Arc::new(block10), &Arc::new(qc10), &empty_witness());
 
     for h in 11..20 {
         let b = make_test_block(BlockHeight::new(h));
         let q = make_test_qc(&b);
-        storage.commit_block(&Arc::new(b), &Arc::new(q));
+        storage.commit_block(&Arc::new(b), &Arc::new(q), &empty_witness());
     }
     let block20 = make_test_block_with_ecs(BlockHeight::new(20), vec![Arc::new(ec3.clone())]);
     let qc20 = make_test_qc(&block20);
-    storage.commit_block(&Arc::new(block20), &Arc::new(qc20));
+    storage.commit_block(&Arc::new(block20), &Arc::new(qc20), &empty_witness());
 
     let known = [
         ec1.wave_id().clone(),

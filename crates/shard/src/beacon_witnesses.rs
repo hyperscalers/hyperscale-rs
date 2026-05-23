@@ -60,6 +60,14 @@ impl BeaconWitnessAccumulator {
         BeaconWitnessLeafCount::new(self.leaves.len() as u64)
     }
 
+    /// Borrow the full leaf-hash list. Used by the verifier path to
+    /// hand a snapshot to the off-thread CPU check without exposing the
+    /// internal `Vec` for mutation.
+    #[must_use]
+    pub fn leaves(&self) -> &[Hash] {
+        &self.leaves
+    }
+
     /// Current root.
     #[must_use]
     pub fn root(&self) -> BeaconWitnessRoot {

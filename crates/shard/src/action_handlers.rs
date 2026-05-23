@@ -353,6 +353,53 @@ pub fn verify_certificate_root(
     valid
 }
 
+/// Verify a block's beacon-witness root + leaf count.
+///
+/// Re-derives the new witness leaves from `(receipts, missed-round walk,
+/// ready_signals)`, applies them against the supplied
+/// `parent_witness_leaves`, and confirms the resulting accumulator
+/// `(root, leaf_count)` matches the header's claim. A `false` return
+/// aborts the post-execution validation step and rejects the block.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_beacon_witness_root(
+    expected_root: BeaconWitnessRoot,
+    expected_leaf_count: BeaconWitnessLeafCount,
+    parent_witness_leaves: Vec<Hash>,
+    parent_round: Round,
+    height: BlockHeight,
+    round: Round,
+    ready_signals: &[ReadySignal],
+    finalized_waves: &[Arc<FinalizedWave>],
+    topology: &TopologySnapshot,
+) -> bool {
+    use crate::beacon_witnesses::{
+        BeaconWitnessAccumulator, derive_leaves, missed_proposals_since_prev_commit,
+    };
+    let receipts: Vec<StoredReceipt> = finalized_waves
+        .iter()
+        .flat_map(|fw| fw.receipts().iter().cloned())
+        .collect();
+    let missed = missed_proposals_since_prev_commit(height, parent_round, round, topology);
+    let new_leaves = derive_leaves(&receipts, missed, ready_signals);
+    let parent_accumulator = BeaconWitnessAccumulator::from_leaves(parent_witness_leaves);
+    let (root, count) = parent_accumulator.preview_append(&new_leaves);
+    let valid = root == expected_root && count == expected_leaf_count;
+
+    if !valid {
+        tracing::warn!(
+            ?expected_root,
+            ?root,
+            expected_count = expected_leaf_count.inner(),
+            computed_count = count.inner(),
+            height = height.inner(),
+            round = round.inner(),
+            "Beacon-witness root verification FAILED"
+        );
+    }
+
+    valid
+}
+
 /// Verify a block's local receipt root against its stored receipts.
 ///
 /// Pure computation over the receipts' `local_receipt_hash()` values.
@@ -729,6 +776,41 @@ where
             );
             ctx.notify_protocol(ProtocolEvent::BlockRootVerified {
                 kind: VerificationKind::CertificateRoot,
+                block_hash,
+                valid,
+            });
+        }
+
+        Action::VerifyBeaconWitnessRoot {
+            block_hash,
+            expected_root,
+            expected_leaf_count,
+            parent_witness_leaves,
+            parent_round,
+            height,
+            round,
+            ready_signals,
+            finalized_waves,
+            topology_snapshot,
+        } => {
+            let start = std::time::Instant::now();
+            let valid = verify_beacon_witness_root(
+                expected_root,
+                expected_leaf_count,
+                parent_witness_leaves,
+                parent_round,
+                height,
+                round,
+                &ready_signals,
+                &finalized_waves,
+                &topology_snapshot,
+            );
+            record_signature_verification_latency(
+                "beacon_witness_root",
+                start.elapsed().as_secs_f64(),
+            );
+            ctx.notify_protocol(ProtocolEvent::BlockRootVerified {
+                kind: VerificationKind::BeaconWitnessRoot,
                 block_hash,
                 valid,
             });

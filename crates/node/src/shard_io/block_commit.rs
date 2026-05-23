@@ -23,7 +23,11 @@ use crossbeam::channel::Sender;
 use hyperscale_core::{CommitSource, PreparedBlock, ProtocolEvent};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_metrics::{record_block_committed, set_block_height};
-use hyperscale_storage::{ChainEntry, ChainWriter, PendingChain, Storage};
+use hyperscale_storage::{
+    BeaconWitnessCommit, ChainEntry, ChainWriter, PendingChain, PreparedCommitBatchEntry, Storage,
+};
+#[cfg(test)]
+use hyperscale_types::BeaconWitnessLeafCount;
 use hyperscale_types::{
     Block, BlockHash, BlockHeight, CertifiedBlock, ConsensusReceipt, FinalizedWave, LocalTimestamp,
     QuorumCertificate, ShardGroupId, StateRoot,
@@ -81,6 +85,11 @@ pub struct QcOnlyPending {
     /// Whether this entry needs the pool to run JMT prep or can
     /// reuse a cached `PreparedCommit`.
     pub kind: QcOnlyKind,
+    /// Beacon-witness leaves to fold into the eventual block commit;
+    /// the coordinator carries them across the JMT-prep slot so the
+    /// `PendingCommit` queued for `flush` has the same data the
+    /// original `Action::CommitBlockByQcOnly` supplied.
+    pub witness: BeaconWitnessCommit,
 }
 
 /// Outcome of [`BlockCommitCoordinator::decide_qc_only`]. The shard runs
@@ -281,6 +290,10 @@ pub struct PendingCommit {
     /// flush closure uses this to decide whether to send `BlockCommitted`
     /// after persistence.
     pub committed_notified: bool,
+    /// Beacon-witness leaves to persist atomically with the block.
+    /// Sourced from the `Action::CommitBlock` / `Action::CommitBlockByQcOnly`
+    /// payload the shard coordinator emits at commit time.
+    pub witness: BeaconWitnessCommit,
 }
 
 /// Outcome of accumulating a single commit.
@@ -657,7 +670,7 @@ where
         self.commit_in_flight.store(true, Ordering::Release);
 
         dispatch.spawn(DispatchPool::Io, move || {
-            let mut batch: Vec<(S::PreparedCommit, Arc<Block>, Arc<QuorumCertificate>)> =
+            let mut batch: Vec<PreparedCommitBatchEntry<S::PreparedCommit>> =
                 Vec::with_capacity(commits.len());
 
             let heights: Vec<BlockHeight> = commits.iter().map(|c| c.block.height()).collect();
@@ -668,7 +681,12 @@ where
 
             for (i, prepared) in prepared_map.into_iter().enumerate() {
                 let commit = commit_slots[i].as_ref().unwrap();
-                batch.push((prepared, Arc::clone(&commit.block), Arc::clone(&commit.qc)));
+                batch.push((
+                    prepared,
+                    Arc::clone(&commit.block),
+                    Arc::clone(&commit.qc),
+                    commit.witness.clone(),
+                ));
             }
 
             let _roots = storage.commit_prepared_blocks(batch);
@@ -788,18 +806,23 @@ mod tests {
         #[allow(clippy::significant_drop_tightening)] // batching the lock matches the production write path
         fn commit_prepared_blocks(
             &self,
-            blocks: Vec<(Self::PreparedCommit, Arc<Block>, Arc<QuorumCertificate>)>,
+            blocks: Vec<PreparedCommitBatchEntry<Self::PreparedCommit>>,
         ) -> Vec<StateRoot> {
             let mut committed = self.committed.lock().unwrap();
             let mut roots = Vec::with_capacity(blocks.len());
-            for (prepared, block, _qc) in blocks {
+            for (prepared, block, _qc, _witness) in blocks {
                 committed.push((block.height(), prepared.tag));
                 roots.push(StateRoot::ZERO);
             }
             roots
         }
 
-        fn commit_block(&self, _block: &Arc<Block>, _qc: &Arc<QuorumCertificate>) -> StateRoot {
+        fn commit_block(
+            &self,
+            _block: &Arc<Block>,
+            _qc: &Arc<QuorumCertificate>,
+            _witness: &BeaconWitnessCommit,
+        ) -> StateRoot {
             unreachable!("BlockCommitCoordinator does not call commit_block");
         }
     }
@@ -852,6 +875,7 @@ mod tests {
             qc: Arc::new(qc),
             source,
             committed_notified: false,
+            witness: BeaconWitnessCommit::empty(ShardGroupId::new(0), BeaconWitnessLeafCount::ZERO),
         };
         let prepared = MockPrepared {
             snapshot: empty_snapshot(height),

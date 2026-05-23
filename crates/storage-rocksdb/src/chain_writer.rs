@@ -6,7 +6,8 @@ use hyperscale_storage::tree::{
     OverlayTreeReader, jmt_parent_height, noop_jmt_snapshot, put_at_version,
 };
 use hyperscale_storage::{
-    BaseReadCache, ChainWriter, JmtSnapshot, merge_database_updates, merge_updates_from_receipts,
+    BaseReadCache, BeaconWitnessCommit, ChainWriter, JmtSnapshot, PreparedCommitBatchEntry,
+    merge_database_updates, merge_updates_from_receipts,
 };
 use hyperscale_types::{
     Block, BlockHeight, FinalizedWave, QuorumCertificate, StateRoot, StoredReceipt,
@@ -147,19 +148,31 @@ impl ChainWriter for RocksDbStorage {
 
     fn commit_prepared_blocks(
         &self,
-        blocks: Vec<(Self::PreparedCommit, Arc<Block>, Arc<QuorumCertificate>)>,
+        blocks: Vec<PreparedCommitBatchEntry<Self::PreparedCommit>>,
     ) -> Vec<StateRoot> {
         let total = blocks.len();
         let mut roots = Vec::with_capacity(total);
 
-        for (i, (prepared, block, qc)) in blocks.into_iter().enumerate() {
+        for (i, (prepared, block, qc, witness)) in blocks.into_iter().enumerate() {
             let result_root = prepared.jmt_snapshot.result_root;
 
             let mut write_batch = prepared.write_batch;
 
-            // Persist block data (header, transactions, certificates) atomically.
-            // Receipt writes are already in the write_batch from prepare time.
-            self.append_block_to_batch(&mut write_batch, &block, &qc);
+            // Persist block data (header, transactions, certificates) +
+            // beacon-witness leaves atomically. Receipt writes are
+            // already in the write_batch from prepare time.
+            self.append_block_to_batch(
+                &mut write_batch,
+                &block,
+                &qc,
+                witness.leaf_count_at_block_end,
+            );
+            self.append_beacon_witnesses_to_batch(
+                &mut write_batch,
+                witness.shard,
+                witness.starting_leaf_index,
+                &witness.leaves,
+            );
 
             append_block_certs_to_batch(self, &mut write_batch, &block);
 
@@ -204,8 +217,13 @@ impl ChainWriter for RocksDbStorage {
                         .flat_map(|fw| fw.receipts().iter().cloned())
                         .collect();
                     let merged_updates = merge_updates_from_receipts(&receipts);
-                    let root =
-                        self.commit_block_inner_locked(&merged_updates, &block, &qc, &receipts);
+                    let root = self.commit_block_inner_locked(
+                        &merged_updates,
+                        &block,
+                        &qc,
+                        &receipts,
+                        &witness,
+                    );
                     roots.push(root);
                 }
             }
@@ -214,7 +232,12 @@ impl ChainWriter for RocksDbStorage {
         roots
     }
 
-    fn commit_block(&self, block: &Arc<Block>, qc: &Arc<QuorumCertificate>) -> StateRoot {
+    fn commit_block(
+        &self,
+        block: &Arc<Block>,
+        qc: &Arc<QuorumCertificate>,
+        witness: &BeaconWitnessCommit,
+    ) -> StateRoot {
         let receipts: Vec<StoredReceipt> = block
             .certificates()
             .iter()
@@ -222,7 +245,7 @@ impl ChainWriter for RocksDbStorage {
             .collect();
         let merged_updates = merge_updates_from_receipts(&receipts);
         let _commit_guard = self.commit_lock.lock().unwrap();
-        self.commit_block_inner_locked(&merged_updates, block, qc, &receipts)
+        self.commit_block_inner_locked(&merged_updates, block, qc, &receipts, witness)
     }
 
     fn memory_usage_bytes(&self) -> (u64, u64) {
@@ -266,6 +289,7 @@ impl RocksDbStorage {
         block: &Arc<Block>,
         qc: &Arc<QuorumCertificate>,
         receipts: &[StoredReceipt],
+        witness: &BeaconWitnessCommit,
     ) -> StateRoot {
         let block_height = block.height().inner();
 
@@ -286,7 +310,13 @@ impl RocksDbStorage {
             /* base_reads */ None,
         );
 
-        self.append_block_to_batch(&mut batch, block, qc);
+        self.append_block_to_batch(&mut batch, block, qc, witness.leaf_count_at_block_end);
+        self.append_beacon_witnesses_to_batch(
+            &mut batch,
+            witness.shard,
+            witness.starting_leaf_index,
+            &witness.leaves,
+        );
 
         append_block_certs_to_batch(self, &mut batch, block);
 
