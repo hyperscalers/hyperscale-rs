@@ -19,6 +19,14 @@ use std::time::Duration;
 
 use hyperscale_types::{BlockHeight, LocalTimestamp, ReadySignal, ValidatorId};
 
+/// Minimum dwell time before a [`ReadySignal`] is eligible to be
+/// drained into a block.
+///
+/// Matches the mempool's `DEFAULT_MIN_DWELL_TIME` — admission and drain
+/// both honour this so a signal has had time to propagate to other
+/// committee members before it gets committed.
+pub const MIN_READY_SIGNAL_DWELL: Duration = Duration::from_millis(150);
+
 /// Locally-pooled `ReadySignal` paired with the time we received it.
 ///
 /// `received_at` drives the dwell-eligibility check (callers compare

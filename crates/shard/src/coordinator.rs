@@ -87,7 +87,7 @@ use hyperscale_types::{
 use tracing::field::Empty;
 use tracing::{debug, info, instrument, trace, warn};
 
-use crate::beacon_witnesses::{self, BeaconWitnessAccumulator, MIN_READY_SIGNAL_DWELL};
+use crate::beacon_witnesses::{self, BeaconWitnessAccumulator};
 use crate::block_sync::{
     BlockSyncHealthDecision, BlockSyncManager, BlockSyncVerificationResult, IngestOutcome,
 };
@@ -102,7 +102,7 @@ use crate::proposal::{
     ProposalKind, ProposalTracker, TakeResult, assemble_build_action, dispatch_or_defer,
     select_finalized_waves, select_provisions, select_transactions,
 };
-use crate::ready_signal_pool::ReadySignalPool;
+use crate::ready_signal_pool::{MIN_READY_SIGNAL_DWELL, ReadySignalPool};
 use crate::validation::{qc_has_local_quorum_power, validate_block_for_vote, validate_header};
 use crate::verification::{InFlightCheck, ReadyStateRootVerification, VerificationPipeline};
 use crate::view_change::ViewChangeController;

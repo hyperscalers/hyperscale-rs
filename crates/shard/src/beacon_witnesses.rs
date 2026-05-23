@@ -12,21 +12,11 @@
 //! per-block-flow wiring; this module's job is to define the rules
 //! and let proposer + verifier share them verbatim.
 
-use std::time::Duration;
-
 use hyperscale_types::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeader, BlockHeight, BlockManifest,
     ConsensusReceipt, Hash, ReadySignal, Round, ShardWitnessPayload, StoredReceipt,
     TopologySnapshot, compute_merkle_root,
 };
-
-/// Minimum dwell time before a [`ReadySignal`] is eligible to be
-/// drained into a block.
-///
-/// Matches the existing tx-dwell constant — the proposer's pool
-/// admission and drain both honour this so a signal has had time to
-/// propagate to other committee members before it gets committed.
-pub const MIN_READY_SIGNAL_DWELL: Duration = Duration::from_millis(150);
 
 /// Per-shard append-only beacon-witness accumulator.
 ///
