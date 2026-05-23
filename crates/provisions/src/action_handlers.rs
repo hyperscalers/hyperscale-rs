@@ -143,7 +143,7 @@ where
                     target_shard: provisions.target_shard(),
                 });
 
-                let msg = state_provisions_message(&provisions);
+                let msg = state_provisions_message(ctx.topology_snapshot.network(), &provisions);
                 let sig = ctx.signing_key.sign_v1(&msg);
                 let notification =
                     ProvisionsNotification::new(Arc::clone(&provisions), validator_id, sig);

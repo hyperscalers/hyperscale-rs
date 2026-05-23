@@ -41,8 +41,8 @@ use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use hyperscale_network::ValidatorKeyMap;
 use hyperscale_types::{
-    Bls12381G1PrivateKey, Bls12381G2Signature, VALIDATOR_BIND_NONCE_LEN, ValidatorId,
-    validator_bind_message, verify_bls12381_v1,
+    Bls12381G1PrivateKey, Bls12381G2Signature, NetworkDefinition, VALIDATOR_BIND_NONCE_LEN,
+    ValidatorId, validator_bind_message, verify_bls12381_v1,
 };
 use libp2p::{PeerId as Libp2pPeerId, Stream, StreamProtocol};
 use libp2p_stream::{Control, IncomingStreams};
@@ -218,6 +218,7 @@ fn fresh_nonce() -> [u8; VALIDATOR_BIND_NONCE_LEN] {
 /// `nonce` must be the one *we* generated and sent to the remote — verifying
 /// against a remote-supplied nonce defeats replay protection.
 fn verify_bind(
+    network: &NetworkDefinition,
     peer_id: &Libp2pPeerId,
     claimed_vid: ValidatorId,
     nonce: &[u8; VALIDATOR_BIND_NONCE_LEN],
@@ -228,7 +229,7 @@ fn verify_bind(
         .get(&claimed_vid)
         .ok_or(BindError::UnknownValidator(claimed_vid))?;
 
-    let message = validator_bind_message(&peer_id.to_bytes(), nonce);
+    let message = validator_bind_message(network, &peer_id.to_bytes(), nonce);
     if verify_bls12381_v1(&message, pubkey, signature) {
         Ok(())
     } else {
@@ -272,6 +273,8 @@ impl std::fmt::Display for BindError {
 /// field is `Clone`-cheap (`Arc` or `Copy`).
 #[derive(Clone)]
 struct BindContext {
+    /// Radix network identity, bound into every BLS-signed bind message.
+    network: NetworkDefinition,
     /// Per-vnode signing identities. One `(validator_id, signature)` pair
     /// is produced per entry on every bind exchange. Must be non-empty.
     local_vnodes: Arc<[LocalVnodeIdentity]>,
@@ -286,7 +289,8 @@ struct BindContext {
 impl BindContext {
     /// Sign over `peer_id || remote_nonce` once per hosted vnode.
     fn sign_all(&self, remote_nonce: &[u8; VALIDATOR_BIND_NONCE_LEN]) -> Attestations {
-        let message = validator_bind_message(&self.local_peer_id.to_bytes(), remote_nonce);
+        let message =
+            validator_bind_message(&self.network, &self.local_peer_id.to_bytes(), remote_nonce);
         self.local_vnodes
             .iter()
             .map(|(vid, key)| (*vid, key.sign_v1(&message)))
@@ -297,13 +301,14 @@ impl BindContext {
 /// Verify every `(vid, sig)` claim against the local-chosen nonce. All must
 /// verify — any failure rejects the whole bind.
 fn verify_all(
+    network: &NetworkDefinition,
     peer_id: &Libp2pPeerId,
     nonce: &[u8; VALIDATOR_BIND_NONCE_LEN],
     attestations: &[(ValidatorId, Bls12381G2Signature)],
     keys: &ValidatorKeyMap,
 ) -> Result<(), BindError> {
     for (vid, sig) in attestations {
-        verify_bind(peer_id, *vid, nonce, sig, keys)?;
+        verify_bind(network, peer_id, *vid, nonce, sig, keys)?;
     }
     Ok(())
 }
@@ -332,6 +337,7 @@ pub struct ValidatorBindHandle {
 /// 2. **Outbound**: opens bind streams to peers when triggered by the event loop.
 pub fn spawn_validator_bind_service(
     mut control: Control,
+    network: NetworkDefinition,
     validator_peers: Arc<DashMap<ValidatorId, Libp2pPeerId>>,
     local_vnodes: Vec<LocalVnodeIdentity>,
     local_peer_id: Libp2pPeerId,
@@ -350,6 +356,7 @@ pub fn spawn_validator_bind_service(
     let (bind_tx, bind_rx) = mpsc::unbounded_channel();
 
     let ctx = BindContext {
+        network,
         local_vnodes: Arc::from(local_vnodes),
         local_peer_id,
         validator_keys,
@@ -528,7 +535,13 @@ async fn handle_inbound(
         let remote_attestations = decode_final(&final_bytes).ok_or(BindError::InvalidMessage)?;
 
         let keys_guard = ctx.validator_keys.load();
-        verify_all(&peer_id, &our_nonce, &remote_attestations, &keys_guard)?;
+        verify_all(
+            &ctx.network,
+            &peer_id,
+            &our_nonce,
+            &remote_attestations,
+            &keys_guard,
+        )?;
 
         for (vid, _) in &remote_attestations {
             info!(
@@ -575,7 +588,13 @@ async fn handle_outbound(
             decode_response(&response_bytes).ok_or(BindError::InvalidMessage)?;
 
         let keys_guard = ctx.validator_keys.load();
-        verify_all(&peer_id, &our_nonce, &remote_attestations, &keys_guard)?;
+        verify_all(
+            &ctx.network,
+            &peer_id,
+            &our_nonce,
+            &remote_attestations,
+            &keys_guard,
+        )?;
 
         let our_attestations = ctx.sign_all(&remote_nonce);
         write_bind_frame_final(&mut stream, &encode_final(&our_attestations)).await?;
@@ -720,7 +739,11 @@ mod tests {
         let good_vid = ValidatorId::new(1);
         let bad_vid = ValidatorId::new(2);
 
-        let good_sig = keypair.sign_v1(&validator_bind_message(&peer_id.to_bytes(), &nonce));
+        let good_sig = keypair.sign_v1(&validator_bind_message(
+            &NetworkDefinition::simulator(),
+            &peer_id.to_bytes(),
+            &nonce,
+        ));
         let bad_sig = zero_bls_signature();
 
         let mut keys = ValidatorKeyMap::new();
@@ -729,7 +752,13 @@ mod tests {
 
         let attestations = vec![(good_vid, good_sig), (bad_vid, bad_sig)];
         assert!(matches!(
-            verify_all(&peer_id, &nonce, &attestations, &keys),
+            verify_all(
+                &NetworkDefinition::simulator(),
+                &peer_id,
+                &nonce,
+                &attestations,
+                &keys
+            ),
             Err(BindError::InvalidSignature(_))
         ));
     }
@@ -742,10 +771,24 @@ mod tests {
         let vid = ValidatorId::new(7);
         let nonce = [9u8; VALIDATOR_BIND_NONCE_LEN];
 
-        let sig = keypair.sign_v1(&validator_bind_message(&peer_id.to_bytes(), &nonce));
+        let sig = keypair.sign_v1(&validator_bind_message(
+            &NetworkDefinition::simulator(),
+            &peer_id.to_bytes(),
+            &nonce,
+        ));
 
         let keys = make_bind_keys(vid, pubkey);
-        assert!(verify_bind(&peer_id, vid, &nonce, &sig, &keys).is_ok());
+        assert!(
+            verify_bind(
+                &NetworkDefinition::simulator(),
+                &peer_id,
+                vid,
+                &nonce,
+                &sig,
+                &keys
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -762,13 +805,24 @@ mod tests {
         let nonce_b = [2u8; VALIDATOR_BIND_NONCE_LEN];
 
         // Sign over nonce_a — what the remote would have produced in session A.
-        let sig = keypair.sign_v1(&validator_bind_message(&peer_id.to_bytes(), &nonce_a));
+        let sig = keypair.sign_v1(&validator_bind_message(
+            &NetworkDefinition::simulator(),
+            &peer_id.to_bytes(),
+            &nonce_a,
+        ));
 
         // Verifier in session B challenged with nonce_b, so they verify the
         // replayed signature against nonce_b and reject.
         let keys = make_bind_keys(vid, pubkey);
         assert!(matches!(
-            verify_bind(&peer_id, vid, &nonce_b, &sig, &keys),
+            verify_bind(
+                &NetworkDefinition::simulator(),
+                &peer_id,
+                vid,
+                &nonce_b,
+                &sig,
+                &keys
+            ),
             Err(BindError::InvalidSignature(_))
         ));
     }
@@ -783,10 +837,24 @@ mod tests {
         let nonce = [3u8; VALIDATOR_BIND_NONCE_LEN];
 
         // Sign peer_a's id but try to verify as peer_b.
-        let sig = keypair.sign_v1(&validator_bind_message(&peer_a.to_bytes(), &nonce));
+        let sig = keypair.sign_v1(&validator_bind_message(
+            &NetworkDefinition::simulator(),
+            &peer_a.to_bytes(),
+            &nonce,
+        ));
 
         let keys = make_bind_keys(vid, pubkey);
-        assert!(verify_bind(&peer_b, vid, &nonce, &sig, &keys).is_err());
+        assert!(
+            verify_bind(
+                &NetworkDefinition::simulator(),
+                &peer_b,
+                vid,
+                &nonce,
+                &sig,
+                &keys
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -796,12 +864,23 @@ mod tests {
         let peer_id = Libp2pPeerId::random();
         let nonce = [4u8; VALIDATOR_BIND_NONCE_LEN];
 
-        let sig = keypair.sign_v1(&validator_bind_message(&peer_id.to_bytes(), &nonce));
+        let sig = keypair.sign_v1(&validator_bind_message(
+            &NetworkDefinition::simulator(),
+            &peer_id.to_bytes(),
+            &nonce,
+        ));
 
         // Key map has validator 7 but we claim to be validator 99.
         let keys = make_bind_keys(ValidatorId::new(7), pubkey);
         assert!(matches!(
-            verify_bind(&peer_id, ValidatorId::new(99), &nonce, &sig, &keys),
+            verify_bind(
+                &NetworkDefinition::simulator(),
+                &peer_id,
+                ValidatorId::new(99),
+                &nonce,
+                &sig,
+                &keys,
+            ),
             Err(BindError::UnknownValidator(_))
         ));
     }
@@ -815,11 +894,22 @@ mod tests {
         let nonce = [5u8; VALIDATOR_BIND_NONCE_LEN];
 
         // Sign with key_a but key map has key_b for this validator.
-        let sig = keypair_a.sign_v1(&validator_bind_message(&peer_id.to_bytes(), &nonce));
+        let sig = keypair_a.sign_v1(&validator_bind_message(
+            &NetworkDefinition::simulator(),
+            &peer_id.to_bytes(),
+            &nonce,
+        ));
 
         let keys = make_bind_keys(vid, keypair_b.public_key());
         assert!(matches!(
-            verify_bind(&peer_id, vid, &nonce, &sig, &keys),
+            verify_bind(
+                &NetworkDefinition::simulator(),
+                &peer_id,
+                vid,
+                &nonce,
+                &sig,
+                &keys
+            ),
             Err(BindError::InvalidSignature(_))
         ));
     }

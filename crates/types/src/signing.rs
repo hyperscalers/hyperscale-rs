@@ -25,18 +25,20 @@
 use blake3::Hasher;
 
 use crate::{
-    BlockHash, BlockHeight, ChainId, ExecutionCertificate, ExecutionVote, GlobalReceiptRoot,
-    Provisions, Round, ShardGroupId, ValidatorId, WaveId, WeightedTimestamp,
+    BlockHash, BlockHeight, ExecutionCertificate, ExecutionVote, GlobalReceiptRoot,
+    NetworkDefinition, Provisions, Round, ShardGroupId, ValidatorId, WaveId, WeightedTimestamp,
 };
 
 /// Domain tag for shard consensus block votes.
 ///
-/// Format: `BLOCK_VOTE` || `shard_group_id` || height || round || `block_hash`
+/// Format: `BLOCK_VOTE` || `network.id` || `shard_group_id` || height || round
+/// || `block_hash`
 pub const DOMAIN_BLOCK_VOTE: &[u8] = b"BLOCK_VOTE";
 
 /// Domain tag for committed block header gossip.
 ///
-/// Format: `COMMITTED_BLOCK_HEADER` || `shard_group_id` || height || `block_hash`
+/// Format: `COMMITTED_BLOCK_HEADER` || `network.id` || `shard_group_id` ||
+/// height || `block_hash`
 ///
 /// Signed by the sender (proposer) when broadcasting committed block headers
 /// globally. Verified by `IoLoop` before admitting to the state machine.
@@ -50,13 +52,15 @@ pub const DOMAIN_COMMITTED_BLOCK_HEADER: &[u8] = b"COMMITTED_BLOCK_HEADER";
 /// - View change `highest_qc` verification
 #[must_use]
 pub fn block_vote_message(
+    network: &NetworkDefinition,
     shard_group: ShardGroupId,
     height: BlockHeight,
     round: Round,
     block_hash: &BlockHash,
 ) -> Vec<u8> {
-    let mut message = Vec::with_capacity(80);
+    let mut message = Vec::with_capacity(81);
     message.extend_from_slice(DOMAIN_BLOCK_VOTE);
+    message.push(network.id);
     message.extend_from_slice(&shard_group.to_le_bytes());
     message.extend_from_slice(&height.to_le_bytes());
     message.extend_from_slice(&round.to_le_bytes());
@@ -70,12 +74,14 @@ pub fn block_vote_message(
 /// committed block headers before admitting them to the state machine.
 #[must_use]
 pub fn committed_block_header_message(
+    network: &NetworkDefinition,
     shard_group_id: ShardGroupId,
     height: BlockHeight,
     block_hash: &BlockHash,
 ) -> Vec<u8> {
-    let mut message = Vec::with_capacity(64);
+    let mut message = Vec::with_capacity(65);
     message.extend_from_slice(DOMAIN_COMMITTED_BLOCK_HEADER);
+    message.push(network.id);
     message.extend_from_slice(&shard_group_id.to_le_bytes());
     message.extend_from_slice(&height.to_le_bytes());
     message.extend_from_slice(block_hash.as_bytes());
@@ -84,7 +90,8 @@ pub fn committed_block_header_message(
 
 /// Domain tag for block header proposal gossip.
 ///
-/// Format: `BLOCK_HEADER` || `shard_group_id` || height || round || `block_hash`
+/// Format: `BLOCK_HEADER` || `network.id` || `shard_group_id` || height ||
+/// round || `block_hash`
 ///
 /// Signed by the proposer when broadcasting block header proposals.
 /// Verified by receivers before admitting the proposal into shard consensus.
@@ -98,13 +105,15 @@ pub const DOMAIN_BLOCK_HEADER: &[u8] = b"BLOCK_HEADER";
 /// - Verification before admitting proposals to the shard consensus state machine
 #[must_use]
 pub fn block_header_message(
+    network: &NetworkDefinition,
     shard_group: ShardGroupId,
     height: BlockHeight,
     round: Round,
     block_hash: &BlockHash,
 ) -> Vec<u8> {
-    let mut message = Vec::with_capacity(80);
+    let mut message = Vec::with_capacity(81);
     message.extend_from_slice(DOMAIN_BLOCK_HEADER);
+    message.push(network.id);
     message.extend_from_slice(&shard_group.to_le_bytes());
     message.extend_from_slice(&height.to_le_bytes());
     message.extend_from_slice(&round.to_le_bytes());
@@ -114,7 +123,8 @@ pub fn block_header_message(
 
 /// Domain tag for state provisions gossip.
 ///
-/// Format: `STATE_PROVISION_BATCH` || `source_shard` || `target_shard` || `block_height` || `H(tx_hashes)`
+/// Format: `STATE_PROVISION_BATCH` || `network.id` || `source_shard` ||
+/// `target_shard` || `block_height` || `H(tx_hashes)`
 ///
 /// Signed by the sender when broadcasting cross-shard state provisions.
 /// Verified by receivers to reject unauthenticated provision spam before
@@ -127,15 +137,16 @@ pub const DOMAIN_STATE_PROVISION_BATCH: &[u8] = b"STATE_PROVISION_BATCH";
 /// digest of the transaction hashes in the bundle. Cheap to reconstruct at
 /// verification while binding the signature to the specific bundle contents.
 #[must_use]
-pub fn state_provisions_message(provisions: &Provisions) -> Vec<u8> {
+pub fn state_provisions_message(network: &NetworkDefinition, provisions: &Provisions) -> Vec<u8> {
     let mut hasher = Hasher::new();
     for tx in provisions.transactions().iter() {
         hasher.update(tx.tx_hash.as_bytes());
     }
     let tx_digest = hasher.finalize();
 
-    let mut message = Vec::with_capacity(96);
+    let mut message = Vec::with_capacity(97);
     message.extend_from_slice(DOMAIN_STATE_PROVISION_BATCH);
+    message.push(network.id);
     message.extend_from_slice(&provisions.source_shard().to_le_bytes());
     message.extend_from_slice(&provisions.target_shard().to_le_bytes());
     message.extend_from_slice(&provisions.block_height().to_le_bytes());
@@ -145,7 +156,8 @@ pub fn state_provisions_message(provisions: &Provisions) -> Vec<u8> {
 
 /// Domain tag for validator-bind protocol.
 ///
-/// Format: `VALIDATOR_BIND` || `peer_id_bytes` || `nonce` (32 bytes)
+/// Format: `VALIDATOR_BIND` || `network.id` || `peer_id_bytes` || `nonce`
+/// (32 bytes)
 ///
 /// Signed by a validator's BLS key to cryptographically bind their
 /// consensus identity (`ValidatorId`) to their ephemeral libp2p `PeerId`.
@@ -167,12 +179,14 @@ pub const VALIDATOR_BIND_NONCE_LEN: usize = 32;
 /// that `PeerId` *for this specific session*.
 #[must_use]
 pub fn validator_bind_message(
+    network: &NetworkDefinition,
     peer_id_bytes: &[u8],
     nonce: &[u8; VALIDATOR_BIND_NONCE_LEN],
 ) -> Vec<u8> {
     let mut message =
-        Vec::with_capacity(DOMAIN_VALIDATOR_BIND.len() + peer_id_bytes.len() + nonce.len());
+        Vec::with_capacity(DOMAIN_VALIDATOR_BIND.len() + 1 + peer_id_bytes.len() + nonce.len());
     message.extend_from_slice(DOMAIN_VALIDATOR_BIND);
+    message.push(network.id);
     message.extend_from_slice(peer_id_bytes);
     message.extend_from_slice(nonce);
     message
@@ -180,7 +194,10 @@ pub fn validator_bind_message(
 
 /// Domain tag for execution votes.
 ///
-/// Format: `EXEC_VOTE` || `block_hash` || `block_height` || `wave_id_len` || `wave_id_shards`... || `shard_group` || `global_receipt_root` || `tx_count`
+/// Format: `EXEC_VOTE` || `network.id` || `vote_anchor_ts` || `wave_id_shard`
+/// || `wave_id_height` || `wave_id_remote_shards_len` ||
+/// `wave_id_remote_shards`... || `shard_group` || `global_receipt_root` ||
+/// `tx_count`
 ///
 /// Used for both individual `ExecutionVote` signatures and
 /// `ExecutionCertificate` aggregated signature verification.
@@ -188,12 +205,14 @@ pub const DOMAIN_EXEC_VOTE: &[u8] = b"EXEC_VOTE";
 
 /// Domain tag for execution vote batch gossip.
 ///
-/// Format: `EXEC_VOTE_BATCH` || `shard_group_id` || `H(global_receipt_roots)`
+/// Format: `EXEC_VOTE_BATCH` || `network.id` || `shard_group_id` ||
+/// `H(global_receipt_roots)`
 pub const DOMAIN_EXEC_VOTE_BATCH: &[u8] = b"EXEC_VOTE_BATCH";
 
 /// Domain tag for execution certificate batch gossip.
 ///
-/// Format: `EXEC_CERT_BATCH` || `shard_group_id` || `H(global_receipt_roots)`
+/// Format: `EXEC_CERT_BATCH` || `network.id` || `shard_group_id` ||
+/// `H(global_receipt_roots)`
 pub const DOMAIN_EXEC_CERT_BATCH: &[u8] = b"EXEC_CERT_BATCH";
 
 /// Build the signing message for an execution vote.
@@ -206,14 +225,16 @@ pub const DOMAIN_EXEC_CERT_BATCH: &[u8] = b"EXEC_CERT_BATCH";
 /// the message deterministic regardless of construction order.
 #[must_use]
 pub fn exec_vote_message(
+    network: &NetworkDefinition,
     vote_anchor_ts: WeightedTimestamp,
     wave_id: &WaveId,
     shard_group: ShardGroupId,
     global_receipt_root: &GlobalReceiptRoot,
     tx_count: u32,
 ) -> Vec<u8> {
-    let mut message = Vec::with_capacity(128);
+    let mut message = Vec::with_capacity(129);
     message.extend_from_slice(DOMAIN_EXEC_VOTE);
+    message.push(network.id);
     message.extend_from_slice(&vote_anchor_ts.as_millis().to_le_bytes());
     // WaveId is self-contained (shard + block_height + remote_shards),
     // so no separate block_hash needed in the signing message.
@@ -235,15 +256,20 @@ pub fn exec_vote_message(
 
 /// Build the signing message for an execution vote batch gossip.
 #[must_use]
-pub fn exec_vote_batch_message(shard_group: ShardGroupId, votes: &[ExecutionVote]) -> Vec<u8> {
+pub fn exec_vote_batch_message(
+    network: &NetworkDefinition,
+    shard_group: ShardGroupId,
+    votes: &[ExecutionVote],
+) -> Vec<u8> {
     let mut hasher = Hasher::new();
     for v in votes {
         hasher.update(v.global_receipt_root().as_raw().as_bytes());
     }
     let digest = hasher.finalize();
 
-    let mut message = Vec::with_capacity(64);
+    let mut message = Vec::with_capacity(65);
     message.extend_from_slice(DOMAIN_EXEC_VOTE_BATCH);
+    message.push(network.id);
     message.extend_from_slice(&shard_group.to_le_bytes());
     message.extend_from_slice(digest.as_bytes());
     message
@@ -252,6 +278,7 @@ pub fn exec_vote_batch_message(shard_group: ShardGroupId, votes: &[ExecutionVote
 /// Build the signing message for an execution certificate batch gossip.
 #[must_use]
 pub fn exec_cert_batch_message(
+    network: &NetworkDefinition,
     shard_group: ShardGroupId,
     certificates: &[ExecutionCertificate],
 ) -> Vec<u8> {
@@ -261,8 +288,9 @@ pub fn exec_cert_batch_message(
     }
     let digest = hasher.finalize();
 
-    let mut message = Vec::with_capacity(64);
+    let mut message = Vec::with_capacity(65);
     message.extend_from_slice(DOMAIN_EXEC_CERT_BATCH);
+    message.push(network.id);
     message.extend_from_slice(&shard_group.to_le_bytes());
     message.extend_from_slice(digest.as_bytes());
     message
@@ -270,8 +298,8 @@ pub fn exec_cert_batch_message(
 
 /// Domain tag for validator "ready on shard" signals.
 ///
-/// Format: `HYPERSCALE_READY_SIGNAL_v1` || `chain_id` || `validator_id` ||
-/// `height_window_start` || `height_window_end`.
+/// Format: `HYPERSCALE_READY_SIGNAL_v1` || `network.id` || `validator_id` ||
+/// `height_window_start` || `height_window_end`
 ///
 /// Signed by the validator and broadcast to their shard committee. The
 /// proposer includes valid dwell-eligible signals in the next block's
@@ -284,14 +312,14 @@ pub const DOMAIN_READY_SIGNAL: &[u8] = b"HYPERSCALE_READY_SIGNAL_v1";
 /// [`ReadySignal`](crate::ReadySignal).
 #[must_use]
 pub fn ready_signal_message(
-    chain_id: ChainId,
+    network: &NetworkDefinition,
     validator_id: ValidatorId,
     height_window_start: BlockHeight,
     height_window_end: BlockHeight,
 ) -> Vec<u8> {
-    let mut message = Vec::with_capacity(DOMAIN_READY_SIGNAL.len() + 8 + 8 + 8 + 8);
+    let mut message = Vec::with_capacity(DOMAIN_READY_SIGNAL.len() + 1 + 8 + 8 + 8);
     message.extend_from_slice(DOMAIN_READY_SIGNAL);
-    message.extend_from_slice(&chain_id.to_le_bytes());
+    message.push(network.id);
     message.extend_from_slice(&validator_id.to_le_bytes());
     message.extend_from_slice(&height_window_start.to_le_bytes());
     message.extend_from_slice(&height_window_end.to_le_bytes());
@@ -303,13 +331,17 @@ mod tests {
     use super::*;
     use crate::{Hash, TxHash};
 
+    fn net() -> NetworkDefinition {
+        NetworkDefinition::simulator()
+    }
+
     #[test]
     fn test_block_vote_message_deterministic() {
         let shard = ShardGroupId::new(1);
         let block = BlockHash::from_raw(Hash::from_bytes(b"test_block"));
 
-        let msg1 = block_vote_message(shard, BlockHeight::new(10), Round::INITIAL, &block);
-        let msg2 = block_vote_message(shard, BlockHeight::new(10), Round::INITIAL, &block);
+        let msg1 = block_vote_message(&net(), shard, BlockHeight::new(10), Round::INITIAL, &block);
+        let msg2 = block_vote_message(&net(), shard, BlockHeight::new(10), Round::INITIAL, &block);
 
         assert_eq!(msg1, msg2);
         assert!(msg1.starts_with(DOMAIN_BLOCK_VOTE));
@@ -320,8 +352,8 @@ mod tests {
         let shard = ShardGroupId::new(1);
         let block = BlockHash::from_raw(Hash::from_bytes(b"test_block"));
 
-        let msg1 = committed_block_header_message(shard, BlockHeight::new(10), &block);
-        let msg2 = committed_block_header_message(shard, BlockHeight::new(10), &block);
+        let msg1 = committed_block_header_message(&net(), shard, BlockHeight::new(10), &block);
+        let msg2 = committed_block_header_message(&net(), shard, BlockHeight::new(10), &block);
 
         assert_eq!(msg1, msg2);
         assert!(msg1.starts_with(DOMAIN_COMMITTED_BLOCK_HEADER));
@@ -332,8 +364,10 @@ mod tests {
         let shard = ShardGroupId::new(1);
         let block = BlockHash::from_raw(Hash::from_bytes(b"test_block"));
 
-        let msg1 = block_header_message(shard, BlockHeight::new(10), Round::INITIAL, &block);
-        let msg2 = block_header_message(shard, BlockHeight::new(10), Round::INITIAL, &block);
+        let msg1 =
+            block_header_message(&net(), shard, BlockHeight::new(10), Round::INITIAL, &block);
+        let msg2 =
+            block_header_message(&net(), shard, BlockHeight::new(10), Round::INITIAL, &block);
 
         assert_eq!(msg1, msg2);
         assert!(msg1.starts_with(DOMAIN_BLOCK_HEADER));
@@ -344,8 +378,10 @@ mod tests {
         let shard = ShardGroupId::new(1);
         let block = BlockHash::from_raw(Hash::from_bytes(b"test_block"));
 
-        let header_msg = block_header_message(shard, BlockHeight::new(10), Round::INITIAL, &block);
-        let vote_msg = block_vote_message(shard, BlockHeight::new(10), Round::INITIAL, &block);
+        let header_msg =
+            block_header_message(&net(), shard, BlockHeight::new(10), Round::INITIAL, &block);
+        let vote_msg =
+            block_vote_message(&net(), shard, BlockHeight::new(10), Round::INITIAL, &block);
 
         // Must differ due to different domain tags (prevents cross-protocol replay)
         assert_ne!(header_msg, vote_msg);
@@ -368,8 +404,8 @@ mod tests {
             )],
         );
 
-        let msg1 = state_provisions_message(&provisions);
-        let msg2 = state_provisions_message(&provisions);
+        let msg1 = state_provisions_message(&net(), &provisions);
+        let msg2 = state_provisions_message(&net(), &provisions);
 
         assert_eq!(msg1, msg2);
         assert!(msg1.starts_with(DOMAIN_STATE_PROVISION_BATCH));
@@ -380,8 +416,8 @@ mod tests {
         let peer_id = b"12D3KooWDummyPeerId000000000000000";
         let nonce = [7u8; VALIDATOR_BIND_NONCE_LEN];
 
-        let msg1 = validator_bind_message(peer_id, &nonce);
-        let msg2 = validator_bind_message(peer_id, &nonce);
+        let msg1 = validator_bind_message(&net(), peer_id, &nonce);
+        let msg2 = validator_bind_message(&net(), peer_id, &nonce);
 
         assert_eq!(msg1, msg2);
         assert!(msg1.starts_with(DOMAIN_VALIDATOR_BIND));
@@ -393,8 +429,8 @@ mod tests {
         let nonce_a = [1u8; VALIDATOR_BIND_NONCE_LEN];
         let nonce_b = [2u8; VALIDATOR_BIND_NONCE_LEN];
 
-        let msg_a = validator_bind_message(peer_id, &nonce_a);
-        let msg_b = validator_bind_message(peer_id, &nonce_b);
+        let msg_a = validator_bind_message(&net(), peer_id, &nonce_a);
+        let msg_b = validator_bind_message(&net(), peer_id, &nonce_b);
 
         // Different nonces must produce different messages — replay protection.
         assert_ne!(msg_a, msg_b);
@@ -405,8 +441,9 @@ mod tests {
         let bytes = b"some_bytes_here_for_testing_1234";
         let nonce = [0u8; VALIDATOR_BIND_NONCE_LEN];
 
-        let bind_msg = validator_bind_message(bytes, &nonce);
+        let bind_msg = validator_bind_message(&net(), bytes, &nonce);
         let block_msg = block_vote_message(
+            &net(),
             ShardGroupId::new(0),
             BlockHeight::GENESIS,
             Round::INITIAL,
@@ -418,39 +455,52 @@ mod tests {
 
     #[test]
     fn ready_signal_message_byte_layout_is_pinned() {
-        let chain_id = ChainId::new(0xDEAD_BEEF_CAFE_F00D);
+        let network = net();
         let validator = ValidatorId::new(0x0123_4567_89AB_CDEF);
         let start = BlockHeight::new(100);
         let end = BlockHeight::new(228);
 
-        let msg = ready_signal_message(chain_id, validator, start, end);
-        let mut expected = Vec::with_capacity(DOMAIN_READY_SIGNAL.len() + 32);
+        let msg = ready_signal_message(&network, validator, start, end);
+        let mut expected = Vec::with_capacity(DOMAIN_READY_SIGNAL.len() + 1 + 8 + 8 + 8);
         expected.extend_from_slice(DOMAIN_READY_SIGNAL);
-        expected.extend_from_slice(&chain_id.to_le_bytes());
+        expected.push(network.id);
         expected.extend_from_slice(&validator.to_le_bytes());
         expected.extend_from_slice(&start.to_le_bytes());
         expected.extend_from_slice(&end.to_le_bytes());
 
         assert_eq!(msg, expected);
-        assert_eq!(msg.len(), DOMAIN_READY_SIGNAL.len() + 8 + 8 + 8 + 8);
+        assert_eq!(msg.len(), DOMAIN_READY_SIGNAL.len() + 1 + 8 + 8 + 8);
     }
 
     #[test]
     fn ready_signal_message_differs_by_window() {
-        let chain_id = ChainId::new(1);
         let validator = ValidatorId::new(7);
-        let a = ready_signal_message(
-            chain_id,
-            validator,
-            BlockHeight::new(0),
-            BlockHeight::new(1),
-        );
-        let b = ready_signal_message(
-            chain_id,
-            validator,
-            BlockHeight::new(0),
-            BlockHeight::new(2),
-        );
+        let a = ready_signal_message(&net(), validator, BlockHeight::new(0), BlockHeight::new(1));
+        let b = ready_signal_message(&net(), validator, BlockHeight::new(0), BlockHeight::new(2));
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn block_vote_message_differs_across_networks() {
+        let shard = ShardGroupId::new(1);
+        let block = BlockHash::from_raw(Hash::from_bytes(b"test_block"));
+
+        let mainnet = block_vote_message(
+            &NetworkDefinition::mainnet(),
+            shard,
+            BlockHeight::new(10),
+            Round::INITIAL,
+            &block,
+        );
+        let stokenet = block_vote_message(
+            &NetworkDefinition::stokenet(),
+            shard,
+            BlockHeight::new(10),
+            Round::INITIAL,
+            &block,
+        );
+        // Cross-network replay protection: byte-identical inputs under
+        // different networks must produce different messages.
+        assert_ne!(mainnet, stokenet);
     }
 }

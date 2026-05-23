@@ -427,8 +427,8 @@ mod tests {
 
     use hyperscale_types::{
         Bls12381G1PrivateKey, CertificateRoot, Hash, InFlightCount, LocalReceiptRoot,
-        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, ShardGroupId, StateRoot,
-        TransactionRoot, ValidatorId, generate_bls_keypair,
+        NetworkDefinition, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, ShardGroupId,
+        StateRoot, TransactionRoot, ValidatorId, generate_bls_keypair,
     };
 
     use super::*;
@@ -467,6 +467,7 @@ mod tests {
         height: BlockHeight,
     ) -> BlockVote {
         BlockVote::new(
+            &NetworkDefinition::simulator(),
             block_hash,
             test_shard_group(),
             height,

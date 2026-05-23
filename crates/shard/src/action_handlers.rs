@@ -15,11 +15,11 @@ use hyperscale_types::network::notification::{BlockHeaderNotification, BlockVote
 use hyperscale_types::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight,
     BlockManifest, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, CertificateRoot,
-    ConsensusReceipt, FinalizedWave, Hash, InFlightCount, LocalReceiptRoot, ProposerTimestamp,
-    ProvisionHash, ProvisionTxRoot, Provisions, ProvisionsRoot, QuorumCertificate, ReadySignal,
-    Round, RoutableTransaction, ShardGroupId, SignerBitfield, StateRoot, StoredReceipt,
-    TopologySnapshot, TransactionRoot, ValidatorId, VotePower, WeightedTimestamp,
-    batch_verify_bls_same_message, block_header_message, block_vote_message,
+    ConsensusReceipt, FinalizedWave, Hash, InFlightCount, LocalReceiptRoot, NetworkDefinition,
+    ProposerTimestamp, ProvisionHash, ProvisionTxRoot, Provisions, ProvisionsRoot,
+    QuorumCertificate, ReadySignal, Round, RoutableTransaction, ShardGroupId, SignerBitfield,
+    StateRoot, StoredReceipt, TopologySnapshot, TransactionRoot, ValidatorId, VotePower,
+    WeightedTimestamp, batch_verify_bls_same_message, block_header_message, block_vote_message,
     committed_block_header_message, compute_certificate_root, compute_local_receipt_root,
     compute_provision_root, compute_provision_tx_roots, compute_transaction_root, compute_waves,
     verify_bls12381_v1,
@@ -51,6 +51,7 @@ pub struct QcVerificationResult {
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn verify_and_build_qc(
+    network: &NetworkDefinition,
     block_hash: BlockHash,
     shard_group_id: ShardGroupId,
     height: BlockHeight,
@@ -61,7 +62,7 @@ pub fn verify_and_build_qc(
     already_verified: Vec<(usize, BlockVote, VotePower)>,
     total_voting_power: VotePower,
 ) -> QcVerificationResult {
-    let signing_message = block_vote_message(shard_group_id, height, round, &block_hash);
+    let signing_message = block_vote_message(network, shard_group_id, height, round, &block_hash);
 
     let all_verified = verify_vote_batch(
         block_hash,
@@ -220,8 +221,12 @@ pub fn build_qc_from_verified(
 /// Filters public keys by the QC's signer bitfield, aggregates the filtered
 /// keys, and verifies the aggregated signature against the signing message.
 #[must_use]
-pub fn verify_qc_signature(qc: &QuorumCertificate, public_keys: &[Bls12381G1PublicKey]) -> bool {
-    let signing_message = qc.signing_message();
+pub fn verify_qc_signature(
+    network: &NetworkDefinition,
+    qc: &QuorumCertificate,
+    public_keys: &[Bls12381G1PublicKey],
+) -> bool {
+    let signing_message = qc.signing_message(network);
     // Get signer keys based on QC's signer bitfield
     let signer_keys: Vec<_> = public_keys
         .iter()
@@ -601,6 +606,7 @@ where
         } => {
             let start = std::time::Instant::now();
             let result = verify_and_build_qc(
+                ctx.topology_snapshot.network(),
                 block_hash,
                 shard_group_id,
                 height,
@@ -625,7 +631,7 @@ where
             block_hash,
         } => {
             let start = std::time::Instant::now();
-            let valid = verify_qc_signature(&qc, &public_keys);
+            let valid = verify_qc_signature(ctx.topology_snapshot.network(), &qc, &public_keys);
             record_signature_verification_latency("qc", start.elapsed().as_secs_f64());
             ctx.notify_protocol(ProtocolEvent::QcSignatureVerified { block_hash, valid });
         }
@@ -639,7 +645,11 @@ where
             height,
         } => {
             let start = std::time::Instant::now();
-            let qc_valid = verify_qc_signature(committed_header.qc(), &committee_public_keys);
+            let qc_valid = verify_qc_signature(
+                ctx.topology_snapshot.network(),
+                committed_header.qc(),
+                &committee_public_keys,
+            );
             let valid = if qc_valid {
                 let total_power: VotePower = committed_header
                     .qc()
@@ -921,6 +931,7 @@ where
         Action::BroadcastBlockHeader { header, manifest } => {
             let block_hash = header.hash();
             let msg = block_header_message(
+                ctx.topology_snapshot.network(),
                 header.shard_group_id(),
                 header.height(),
                 header.round(),
@@ -946,6 +957,7 @@ where
             next_proposers,
         } => {
             let vote = BlockVote::new(
+                ctx.topology_snapshot.network(),
                 block_hash,
                 ctx.topology_snapshot.local_shard(),
                 height,
@@ -962,6 +974,7 @@ where
 
         Action::BroadcastCommittedBlockHeader { committed_header } => {
             let msg = committed_block_header_message(
+                ctx.topology_snapshot.network(),
                 committed_header.header().shard_group_id(),
                 committed_header.header().height(),
                 &committed_header.header().hash(),
@@ -994,6 +1007,10 @@ mod tests {
         ShardGroupId::new(0)
     }
 
+    fn net() -> NetworkDefinition {
+        NetworkDefinition::simulator()
+    }
+
     fn make_vote(
         keys: &[Bls12381G1PrivateKey],
         voter_index: usize,
@@ -1003,6 +1020,7 @@ mod tests {
         timestamp_ms: u64,
     ) -> BlockVote {
         BlockVote::new(
+            &net(),
             block_hash,
             shard(),
             height,
@@ -1042,7 +1060,7 @@ mod tests {
         let block_hash = BlockHash::from_raw(Hash::from_bytes(b"b1"));
         let height = BlockHeight::new(1);
         let round = Round::INITIAL;
-        let msg = block_vote_message(shard(), height, round, &block_hash);
+        let msg = block_vote_message(&net(), shard(), height, round, &block_hash);
 
         let to_verify: Vec<_> = (0..3)
             .map(|i| {
@@ -1061,7 +1079,7 @@ mod tests {
         let block_hash = BlockHash::from_raw(Hash::from_bytes(b"b1"));
         let height = BlockHeight::new(1);
         let round = Round::INITIAL;
-        let msg = block_vote_message(shard(), height, round, &block_hash);
+        let msg = block_vote_message(&net(), shard(), height, round, &block_hash);
 
         // Vote 1's signature is replaced by a signature over a different block.
         let other_hash = BlockHash::from_raw(Hash::from_bytes(b"other"));
@@ -1150,7 +1168,7 @@ mod tests {
         .expect("build_qc should succeed");
 
         let pubs: Vec<_> = keys.iter().map(Bls12381G1PrivateKey::public_key).collect();
-        assert!(verify_qc_signature(&qc, &pubs));
+        assert!(verify_qc_signature(&net(), &qc, &pubs));
         assert_eq!(qc.block_hash(), block_hash);
         assert_eq!(qc.height(), height);
         assert_eq!(qc.parent_block_hash(), parent);
@@ -1330,6 +1348,7 @@ mod tests {
             .collect();
 
         let result = verify_and_build_qc(
+            &net(),
             block_hash,
             shard(),
             height,
@@ -1359,6 +1378,7 @@ mod tests {
             .collect();
 
         let result = verify_and_build_qc(
+            &net(),
             block_hash,
             shard(),
             height,
@@ -1416,7 +1436,7 @@ mod tests {
         );
 
         let pubs: Vec<_> = keys.iter().map(Bls12381G1PrivateKey::public_key).collect();
-        assert!(!verify_qc_signature(&qc, &pubs));
+        assert!(!verify_qc_signature(&net(), &qc, &pubs));
     }
 
     #[test]
@@ -1452,7 +1472,7 @@ mod tests {
             .iter()
             .map(Bls12381G1PrivateKey::public_key)
             .collect();
-        assert!(!verify_qc_signature(&qc, &wrong_pubs));
+        assert!(!verify_qc_signature(&net(), &qc, &wrong_pubs));
     }
 
     // ─── root verifiers ─────────────────────────────────────────────────

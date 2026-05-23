@@ -247,8 +247,8 @@ mod tests {
 
     use hyperscale_types::{
         BlockHash, BlockHeight, ExecutionOutcome, GlobalReceiptHash, GlobalReceiptRoot, Hash,
-        RETENTION_HORIZON, ShardGroupId, SignerBitfield, TxHash, TxOutcome, ValidatorId,
-        bls_keypair_from_seed, exec_vote_message, zero_bls_signature,
+        NetworkDefinition, RETENTION_HORIZON, ShardGroupId, SignerBitfield, TxHash, TxOutcome,
+        ValidatorId, bls_keypair_from_seed, exec_vote_message, zero_bls_signature,
     };
     use proptest::collection::vec as prop_vec;
 
@@ -299,6 +299,7 @@ mod tests {
         let tx_outcomes = vec![make_tx_outcome(TxHash::from_raw(Hash::from_bytes(b"tx")))];
         let global_receipt_root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root"));
         let msg = exec_vote_message(
+            &NetworkDefinition::simulator(),
             anchor_ts,
             &wave_id,
             wave_id.shard_group_id(),

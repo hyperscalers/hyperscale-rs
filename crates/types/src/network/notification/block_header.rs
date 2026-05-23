@@ -5,8 +5,8 @@ use std::sync::Arc;
 use sbor::prelude::BasicSbor;
 
 use crate::{
-    BlockHeader, BlockManifest, Bls12381G2Signature, MessageClass, NetworkMessage,
-    block_header_message,
+    BlockHeader, BlockManifest, Bls12381G2Signature, MessageClass, NetworkDefinition,
+    NetworkMessage, block_header_message,
 };
 
 /// Notifies committee members of a block proposal (header + manifest, not full block).
@@ -44,8 +44,9 @@ impl BlockHeaderNotification {
 
     /// Build the domain-separated signing message for this block header.
     #[must_use]
-    pub fn signing_message(&self) -> Vec<u8> {
+    pub fn signing_message(&self, network: &NetworkDefinition) -> Vec<u8> {
         block_header_message(
+            network,
             self.header.shard_group_id(),
             self.header.height(),
             self.header.round(),

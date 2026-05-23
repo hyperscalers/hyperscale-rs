@@ -479,6 +479,7 @@ impl ProductionRunnerBuilder {
             libp2p_network,
         } = build_network_stack(NetworkBuildArgs {
             network_config,
+            network: network_definition.clone(),
             ed25519_keypair,
             local_shards: local_shards.clone(),
             bind_vnodes,
@@ -1001,6 +1002,10 @@ impl ProductionRunner {
 
 struct NetworkBuildArgs {
     network_config: Libp2pConfig,
+    /// Radix network identity, bound into BLS-signed bind handshake
+    /// messages so a signature collected on one network can't validate
+    /// on another.
+    network: NetworkDefinition,
     ed25519_keypair: Keypair,
     /// Shards hosted by this host. Drives per-shard request stream
     /// protocols and gossipsub subscriptions on the adapter.
@@ -1024,6 +1029,7 @@ fn build_network_stack(args: NetworkBuildArgs) -> Result<NetworkStack, RunnerErr
 
     let adapter = Libp2pAdapter::new(
         args.network_config,
+        args.network,
         args.ed25519_keypair,
         args.bind_vnodes,
         args.local_shards,

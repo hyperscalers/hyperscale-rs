@@ -9,7 +9,7 @@ use dashmap::DashMap;
 use futures::FutureExt;
 use hyperscale_metrics::{record_libp2p_bandwidth, record_network_message_sent};
 use hyperscale_network::{HandlerRegistry, Topic, ValidatorKeyMap};
-use hyperscale_types::{MessageClass, ShardGroupId, ValidatorId};
+use hyperscale_types::{MessageClass, NetworkDefinition, ShardGroupId, ValidatorId};
 use libp2p::connection_limits::{Behaviour as ConnectionLimitsBehaviour, ConnectionLimits};
 use libp2p::gossipsub::{
     Behaviour as GossipsubBehaviour, ConfigBuilder as GossipsubConfigBuilder, MessageAuthenticity,
@@ -107,6 +107,7 @@ impl Libp2pAdapter {
     #[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
     pub fn new(
         config: Libp2pConfig,
+        network: NetworkDefinition,
         keypair: Keypair,
         vnodes: Vec<LocalVnodeIdentity>,
         local_shards: HashSet<ShardGroupId>,
@@ -238,6 +239,7 @@ impl Libp2pAdapter {
         // ValidatorId ↔ PeerId binding via BLS signatures.
         let bind_handle = spawn_validator_bind_service(
             stream_control.clone(),
+            network,
             validator_peers.clone(),
             vnodes,
             local_peer_id,

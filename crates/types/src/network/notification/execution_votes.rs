@@ -3,8 +3,8 @@
 use sbor::prelude::BasicSbor;
 
 use crate::{
-    Bls12381G2Signature, ExecutionVote, MessageClass, NetworkMessage, ShardGroupId, ValidatorId,
-    exec_vote_batch_message,
+    Bls12381G2Signature, ExecutionVote, MessageClass, NetworkDefinition, NetworkMessage,
+    ShardGroupId, ValidatorId, exec_vote_batch_message,
 };
 
 /// Batched execution votes within a shard.
@@ -38,8 +38,8 @@ impl ExecutionVotesNotification {
 
     /// Build the canonical signing message for this batch.
     #[must_use]
-    pub fn signing_message(&self, shard: ShardGroupId) -> Vec<u8> {
-        exec_vote_batch_message(shard, &self.votes)
+    pub fn signing_message(&self, network: &NetworkDefinition, shard: ShardGroupId) -> Vec<u8> {
+        exec_vote_batch_message(network, shard, &self.votes)
     }
 
     /// Get the votes.

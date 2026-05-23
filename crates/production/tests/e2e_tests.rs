@@ -19,7 +19,9 @@ use hyperscale_network_libp2p::{Libp2pAdapter, Libp2pConfig};
 use hyperscale_production::{ProductionRunner, VnodeConfig};
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage_rocksdb::RocksDbStorage;
-use hyperscale_types::{Bls12381G1PrivateKey, ShardGroupId, ValidatorId, generate_bls_keypair};
+use hyperscale_types::{
+    Bls12381G1PrivateKey, NetworkDefinition, ShardGroupId, ValidatorId, generate_bls_keypair,
+};
 use libp2p::identity::Keypair;
 use serial_test::serial;
 use tempfile::TempDir;
@@ -72,6 +74,7 @@ async fn test_network_adapter_starts() {
     let (bind_sig, topo) = test_bind_args(validator_id);
     let adapter = Libp2pAdapter::new(
         config,
+        NetworkDefinition::simulator(),
         keypair,
         vec![(validator_id, bind_sig)],
         HashSet::from([shard]),
@@ -106,6 +109,7 @@ async fn test_two_node_connection() {
     };
     let adapter1 = Libp2pAdapter::new(
         config1,
+        NetworkDefinition::simulator(),
         keypair1,
         vec![(ValidatorId::new(0), bind_sig1)],
         HashSet::from([ShardGroupId::new(0)]),
@@ -131,6 +135,7 @@ async fn test_two_node_connection() {
     };
     let adapter2 = Libp2pAdapter::new(
         config2,
+        NetworkDefinition::simulator(),
         keypair2,
         vec![(ValidatorId::new(1), bind_sig2)],
         HashSet::from([ShardGroupId::new(0)]),
@@ -181,6 +186,7 @@ async fn test_topic_subscription() {
     };
     let adapter = Libp2pAdapter::new(
         config,
+        NetworkDefinition::simulator(),
         keypair,
         vec![(ValidatorId::new(0), bind_sig)],
         HashSet::from([ShardGroupId::new(0)]),
@@ -218,6 +224,7 @@ async fn test_validator_bind_success() {
     };
     let adapter0 = Libp2pAdapter::new(
         config0,
+        NetworkDefinition::simulator(),
         keypair0,
         vec![(ValidatorId::new(0), bind_sig0)],
         HashSet::from([ShardGroupId::new(0)]),
@@ -241,6 +248,7 @@ async fn test_validator_bind_success() {
     };
     let adapter1 = Libp2pAdapter::new(
         config1,
+        NetworkDefinition::simulator(),
         keypair1,
         vec![(ValidatorId::new(1), bind_sig1)],
         HashSet::from([ShardGroupId::new(0)]),
@@ -293,6 +301,7 @@ async fn test_validator_bind_rejects_wrong_key() {
     };
     let adapter0 = Libp2pAdapter::new(
         config0,
+        NetworkDefinition::simulator(),
         keypair0,
         vec![(ValidatorId::new(0), bind_sig0)],
         HashSet::from([ShardGroupId::new(0)]),
@@ -318,6 +327,7 @@ async fn test_validator_bind_rejects_wrong_key() {
     };
     let adapter1 = Libp2pAdapter::new(
         config1,
+        NetworkDefinition::simulator(),
         keypair1,
         vec![(ValidatorId::new(1), wrong_signing_key)],
         HashSet::from([ShardGroupId::new(0)]),
@@ -370,6 +380,7 @@ async fn test_validator_bind_evicted_on_disconnect() {
     };
     let adapter0 = Libp2pAdapter::new(
         config0,
+        NetworkDefinition::simulator(),
         keypair0,
         vec![(ValidatorId::new(0), bind_sig0)],
         HashSet::from([ShardGroupId::new(0)]),
@@ -393,6 +404,7 @@ async fn test_validator_bind_evicted_on_disconnect() {
     };
     let adapter1 = Libp2pAdapter::new(
         config1,
+        NetworkDefinition::simulator(),
         keypair1,
         vec![(ValidatorId::new(1), bind_sig1)],
         HashSet::from([ShardGroupId::new(0)]),

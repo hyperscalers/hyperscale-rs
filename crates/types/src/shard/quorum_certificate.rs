@@ -3,8 +3,8 @@
 use sbor::prelude::*;
 
 use crate::{
-    BlockHash, BlockHeight, Bls12381G2Signature, Round, ShardGroupId, SignerBitfield,
-    WeightedTimestamp, block_vote_message, zero_bls_signature,
+    BlockHash, BlockHeight, Bls12381G2Signature, NetworkDefinition, Round, ShardGroupId,
+    SignerBitfield, WeightedTimestamp, block_vote_message, zero_bls_signature,
 };
 
 /// A quorum certificate proving 2f+1 validators voted for a block.
@@ -149,8 +149,9 @@ impl QuorumCertificate {
     /// Uses `DOMAIN_BLOCK_VOTE` tag for domain separation.
     /// This is the same message used for individual block vote verification.
     #[must_use]
-    pub fn signing_message(&self) -> Vec<u8> {
+    pub fn signing_message(&self, network: &NetworkDefinition) -> Vec<u8> {
         block_vote_message(
+            network,
             self.shard_group_id,
             self.height,
             self.round,

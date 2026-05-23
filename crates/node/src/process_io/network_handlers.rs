@@ -17,7 +17,7 @@ use hyperscale_types::network::request::{
 use hyperscale_types::network::response::{
     GetLocalProvisionsResponse, GetProvisionResponse, LocalProvisionEntry,
 };
-use hyperscale_types::{ChainId, ShardGroupId, ready_signal_message};
+use hyperscale_types::{ShardGroupId, ready_signal_message};
 use tracing::warn;
 
 use crate::event::ShardScopedInput;
@@ -488,7 +488,7 @@ where
                         );
                         return;
                     };
-                    let msg = gossip.signing_message();
+                    let msg = gossip.signing_message(topo.network());
                     if !verify_bls_with_metrics(
                         &msg,
                         &public_key,
@@ -535,7 +535,7 @@ where
                     let topo = topology.load();
                     let sender = notification.sender;
                     let source_shard = notification.provisions.source_shard();
-                    let msg = notification.signing_message();
+                    let msg = notification.signing_message(topo.network());
                     if !verify_sender_signature(
                         &topo,
                         sender,
@@ -585,7 +585,7 @@ where
 
                     let topo = topology.load();
                     let sender = batch.sender;
-                    let msg = batch.signing_message(target_shard);
+                    let msg = batch.signing_message(topo.network(), target_shard);
                     if !verify_sender_signature(
                         &topo,
                         sender,
@@ -642,7 +642,7 @@ where
                         return;
                     }
                     // Sender signed with source_shard (their local shard), not our local shard
-                    let msg = batch.signing_message(source_shard);
+                    let msg = batch.signing_message(topo.network(), source_shard);
                     if !verify_sender_signature(
                         &topo,
                         sender,
@@ -695,11 +695,8 @@ where
                         );
                         return;
                     };
-                    // TODO: thread the real chain_id through node config
-                    // once it lands. Until then a fixed `ChainId::new(0)`
-                    // matches the constant used at signing sites.
                     let msg = ready_signal_message(
-                        ChainId::new(0),
+                        topo.network(),
                         sender,
                         signal.height_window_start(),
                         signal.height_window_end(),

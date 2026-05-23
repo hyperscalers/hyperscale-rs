@@ -3,8 +3,8 @@
 use sbor::prelude::*;
 
 use crate::{
-    BlockHash, BlockHeight, Bls12381G1PrivateKey, Bls12381G2Signature, ProposerTimestamp, Round,
-    ShardGroupId, ValidatorId, block_vote_message,
+    BlockHash, BlockHeight, Bls12381G1PrivateKey, Bls12381G2Signature, NetworkDefinition,
+    ProposerTimestamp, Round, ShardGroupId, ValidatorId, block_vote_message,
 };
 
 /// Block vote for shard consensus.
@@ -22,7 +22,9 @@ pub struct BlockVote {
 impl BlockVote {
     /// Create a new block vote with domain-separated signing.
     #[must_use]
+    #[allow(clippy::too_many_arguments)] // mirrors the 7 stored fields plus the network identity
     pub fn new(
+        network: &NetworkDefinition,
         block_hash: BlockHash,
         shard_group_id: ShardGroupId,
         height: BlockHeight,
@@ -31,7 +33,7 @@ impl BlockVote {
         signing_key: &Bls12381G1PrivateKey,
         timestamp: ProposerTimestamp,
     ) -> Self {
-        let message = block_vote_message(shard_group_id, height, round, &block_hash);
+        let message = block_vote_message(network, shard_group_id, height, round, &block_hash);
         let signature = signing_key.sign_v1(&message);
         Self {
             block_hash,
@@ -139,8 +141,9 @@ impl BlockVote {
     /// Uses `DOMAIN_BLOCK_VOTE` tag for domain separation.
     /// This is the same message used for QC aggregated signature verification.
     #[must_use]
-    pub fn signing_message(&self) -> Vec<u8> {
+    pub fn signing_message(&self, network: &NetworkDefinition) -> Vec<u8> {
         block_vote_message(
+            network,
             self.shard_group_id,
             self.height,
             self.round,

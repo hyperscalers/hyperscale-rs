@@ -24,10 +24,11 @@ use hyperscale_types::network::notification::{
 };
 use hyperscale_types::{
     Bls12381G1PublicKey, Bls12381G2Signature, ExecutionCertificate, ExecutionVote,
-    GlobalReceiptRoot, NodeId, RoutableTransaction, ShardGroupId, SignerBitfield, StoredReceipt,
-    ValidatorId, VotePower, WaveId, WeightedTimestamp, batch_verify_bls_same_message,
-    compute_global_receipt_root, exec_cert_batch_message, exec_vote_batch_message,
-    exec_vote_message, shard_for_node, verify_bls12381_v1, zero_bls_signature,
+    GlobalReceiptRoot, NetworkDefinition, NodeId, RoutableTransaction, ShardGroupId,
+    SignerBitfield, StoredReceipt, ValidatorId, VotePower, WaveId, WeightedTimestamp,
+    batch_verify_bls_same_message, compute_global_receipt_root, exec_cert_batch_message,
+    exec_vote_batch_message, exec_vote_message, shard_for_node, verify_bls12381_v1,
+    zero_bls_signature,
 };
 
 // ============================================================================
@@ -129,6 +130,7 @@ pub fn aggregate_execution_certificate(
 ///
 /// Returns an iterator of `(vote, voting_power)` for verified votes.
 pub fn batch_verify_execution_votes(
+    network: &NetworkDefinition,
     votes: Vec<(ExecutionVote, Bls12381G1PublicKey, VotePower)>,
 ) -> impl Iterator<Item = (ExecutionVote, VotePower)> {
     let votes: Vec<_> = votes
@@ -145,6 +147,7 @@ pub fn batch_verify_execution_votes(
         HashMap::new();
     for (vote, pk, power) in votes {
         let msg = exec_vote_message(
+            network,
             vote.vote_anchor_ts(),
             vote.wave_id(),
             vote.shard_group_id(),
@@ -191,10 +194,12 @@ pub fn batch_verify_execution_votes(
 /// Verify an execution certificate's aggregated BLS signature.
 #[must_use]
 pub fn verify_execution_certificate_signature(
+    network: &NetworkDefinition,
     certificate: &ExecutionCertificate,
     public_keys: &[Bls12381G1PublicKey],
 ) -> bool {
     let msg = exec_vote_message(
+        network,
         certificate.vote_anchor_ts(),
         certificate.wave_id(),
         certificate.shard_group_id(),
@@ -317,7 +322,8 @@ where
             block_hash,
             votes,
         } => {
-            let verified_votes: Vec<_> = batch_verify_execution_votes(votes).collect();
+            let verified_votes: Vec<_> =
+                batch_verify_execution_votes(ctx.topology_snapshot.network(), votes).collect();
             ctx.notify_protocol(ProtocolEvent::ExecutionVotesVerifiedAndAggregated {
                 wave_id,
                 block_hash,
@@ -329,7 +335,11 @@ where
             public_keys,
             ..
         } => {
-            let valid = verify_execution_certificate_signature(&certificate, &public_keys);
+            let valid = verify_execution_certificate_signature(
+                ctx.topology_snapshot.network(),
+                &certificate,
+                &public_keys,
+            );
             ctx.notify_protocol(ProtocolEvent::ExecutionCertificateSignatureVerified {
                 certificate: Arc::new(certificate),
                 valid,
@@ -339,11 +349,12 @@ where
             wave,
             ec_public_keys,
         } => {
+            let network = ctx.topology_snapshot.network();
             let valid = wave
                 .execution_certificates()
                 .iter()
                 .zip(ec_public_keys.iter())
-                .all(|(ec, keys)| verify_execution_certificate_signature(ec, keys));
+                .all(|(ec, keys)| verify_execution_certificate_signature(network, ec, keys));
             ctx.notify_protocol(ProtocolEvent::FinalizedWaveVerified { wave, valid });
         }
         Action::ExecuteTransactions {
@@ -494,7 +505,9 @@ where
             let local_shard = ctx.topology_snapshot.local_shard();
             let validator_id = ctx.topology_snapshot.local_validator_id();
             let tx_count = u32::try_from(tx_outcomes.len()).unwrap_or(u32::MAX);
+            let network = ctx.topology_snapshot.network();
             let msg = exec_vote_message(
+                network,
                 vote_anchor_ts,
                 &wave_id,
                 local_shard,
@@ -517,7 +530,8 @@ where
 
             // Send vote to the wave leader (unicast).
             if leader != validator_id {
-                let batch_msg = exec_vote_batch_message(local_shard, std::slice::from_ref(&vote));
+                let batch_msg =
+                    exec_vote_batch_message(network, local_shard, std::slice::from_ref(&vote));
                 let batch_sig = ctx.signing_key.sign_v1(&batch_msg);
                 let batch =
                     ExecutionVotesNotification::new(vec![vote.clone()], validator_id, batch_sig);
@@ -536,7 +550,11 @@ where
             recipients,
         } => {
             let cert = Arc::unwrap_or_clone(certificate);
-            let msg = exec_cert_batch_message(cert.shard_group_id(), std::slice::from_ref(&cert));
+            let msg = exec_cert_batch_message(
+                ctx.topology_snapshot.network(),
+                cert.shard_group_id(),
+                std::slice::from_ref(&cert),
+            );
             let sig = ctx.signing_key.sign_v1(&msg);
             let batch = ExecutionCertificatesNotification::new(
                 vec![cert],
@@ -591,7 +609,14 @@ mod tests {
         tx_outcomes: Vec<TxOutcome>,
     ) -> ExecutionVote {
         let tx_count = u32::try_from(tx_outcomes.len()).unwrap_or(u32::MAX);
-        let msg = exec_vote_message(anchor, wid, shard(), &global_receipt_root, tx_count);
+        let msg = exec_vote_message(
+            &NetworkDefinition::simulator(),
+            anchor,
+            wid,
+            shard(),
+            &global_receipt_root,
+            tx_count,
+        );
         ExecutionVote::new(
             BlockHash::ZERO,
             BlockHeight::new(1),
@@ -727,7 +752,10 @@ mod tests {
             ),
         ];
 
-        assert_eq!(batch_verify_execution_votes(votes).count(), 2);
+        assert_eq!(
+            batch_verify_execution_votes(&NetworkDefinition::simulator(), votes).count(),
+            2
+        );
     }
 
     #[test]
@@ -794,14 +822,19 @@ mod tests {
             ),
         ];
 
-        let verified: Vec<_> = batch_verify_execution_votes(votes).collect();
+        let verified: Vec<_> =
+            batch_verify_execution_votes(&NetworkDefinition::simulator(), votes).collect();
         let validators: Vec<ValidatorId> = verified.iter().map(|(v, _)| v.validator()).collect();
         assert_eq!(validators, vec![ValidatorId::new(0), ValidatorId::new(2)]);
     }
 
     #[test]
     fn batch_verify_empty_input_returns_empty() {
-        assert!(batch_verify_execution_votes(Vec::new()).next().is_none());
+        assert!(
+            batch_verify_execution_votes(&NetworkDefinition::simulator(), Vec::new())
+                .next()
+                .is_none()
+        );
     }
 
     #[test]
@@ -853,7 +886,8 @@ mod tests {
             (honest, sk1.public_key(), VotePower::new(1)),
         ];
 
-        let verified: Vec<_> = batch_verify_execution_votes(votes).collect();
+        let verified: Vec<_> =
+            batch_verify_execution_votes(&NetworkDefinition::simulator(), votes).collect();
         let validators: Vec<ValidatorId> = verified.iter().map(|(v, _)| v.validator()).collect();
         assert_eq!(
             validators,
@@ -892,7 +926,11 @@ mod tests {
         let ec = aggregate_execution_certificate(&wid, root, &votes, &committee);
 
         let pubs: Vec<_> = sks.iter().map(Bls12381G1PrivateKey::public_key).collect();
-        assert!(verify_execution_certificate_signature(&ec, &pubs));
+        assert!(verify_execution_certificate_signature(
+            &NetworkDefinition::simulator(),
+            &ec,
+            &pubs
+        ));
     }
 
     #[test]
@@ -926,6 +964,10 @@ mod tests {
 
         // Provide the wrong public keys — signature must not verify.
         let wrong_pubs = vec![keypair(42).public_key(), keypair(43).public_key()];
-        assert!(!verify_execution_certificate_signature(&ec, &wrong_pubs));
+        assert!(!verify_execution_certificate_signature(
+            &NetworkDefinition::simulator(),
+            &ec,
+            &wrong_pubs
+        ));
     }
 }

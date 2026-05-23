@@ -5,7 +5,7 @@ use std::sync::Arc;
 use sbor::prelude::BasicSbor;
 
 use crate::{
-    Bls12381G2Signature, MessageClass, NetworkMessage, Provisions, ValidatorId,
+    Bls12381G2Signature, MessageClass, NetworkDefinition, NetworkMessage, Provisions, ValidatorId,
     state_provisions_message,
 };
 
@@ -41,8 +41,8 @@ impl ProvisionsNotification {
 
     /// Build the canonical signing message for this notification.
     #[must_use]
-    pub fn signing_message(&self) -> Vec<u8> {
-        state_provisions_message(&self.provisions)
+    pub fn signing_message(&self, network: &NetworkDefinition) -> Vec<u8> {
+        state_provisions_message(network, &self.provisions)
     }
 }
 
