@@ -2,6 +2,8 @@
 //!
 //! These messages are sent directly to a specific peer and expect a response.
 
+pub mod beacon;
+
 mod block;
 mod execution_cert;
 mod finalized_wave;

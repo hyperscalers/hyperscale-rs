@@ -60,3 +60,13 @@ pub const MAX_ACCUSATIONS_PER_PROPOSAL: usize = 256;
 /// shard-witness volume but cheap on the wire and safe against
 /// pathological inputs.
 pub const MAX_WITNESS_PROOF_DEPTH: usize = 64;
+
+/// Per-request cap on the number of shard witnesses a beacon validator
+/// pulls in one round-trip.
+///
+/// Bounds the `leaf_indices` request array and the matching `witnesses`
+/// response array at decode time. Sized at a moderate batch — beacon
+/// validators typically fetch a handful of witnesses per slot
+/// (committee turnover, jails); larger batches degrade to multiple
+/// round-trips rather than ballooning a single request.
+pub const MAX_WITNESSES_PER_FETCH: usize = 128;

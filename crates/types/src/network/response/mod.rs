@@ -2,6 +2,8 @@
 //!
 //! These messages are sent in reply to request messages.
 
+pub mod beacon;
+
 mod block;
 mod execution_cert;
 mod finalized_wave;

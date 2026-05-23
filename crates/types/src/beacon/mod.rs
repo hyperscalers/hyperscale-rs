@@ -31,7 +31,7 @@ pub use block::BeaconBlock;
 pub use header::BeaconBlockHeader;
 pub use limits::{
     MAX_ACCUSATIONS_PER_PROPOSAL, MAX_PREFIX_SIGS, MAX_SKIP_SIGS, MAX_VOTE_VECTOR_LEN,
-    MAX_WITNESS_PROOF_DEPTH, MAX_WITNESSES_PER_PROPOSER,
+    MAX_WITNESS_PROOF_DEPTH, MAX_WITNESSES_PER_FETCH, MAX_WITNESSES_PER_PROPOSER,
 };
 pub use msc::{MscEmptyLowAccusation, MscSlotProposal};
 pub use pc::{
