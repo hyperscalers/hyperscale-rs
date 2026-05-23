@@ -15,12 +15,12 @@ use hyperscale_core::{Action, VerificationKind};
 #[cfg(test)]
 use hyperscale_types::{BeaconWitnessLeafCount, BeaconWitnessRoot};
 use hyperscale_types::{
-    Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, FinalizedWave, Hash, InFlightCount,
-    LocalReceiptRoot, ProvisionsRoot, QuorumCertificate, ReadySignal, Round, StateRoot,
-    TopologySnapshot,
+    Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, FinalizedWave, InFlightCount,
+    LocalReceiptRoot, ProvisionsRoot, QuorumCertificate, StateRoot, TopologySnapshot,
 };
 use tracing::{debug, trace, warn};
 
+use crate::beacon_witnesses::{BeaconWitnessAccumulator, prospective_parent_witness_leaves};
 use crate::chain_view::ChainView;
 use crate::pending::{PendingBlock, PendingBlocks};
 
@@ -709,36 +709,38 @@ impl VerificationPipeline {
         }]
     }
 
-    /// Whether the block still needs its beacon-witness root verified
-    /// (not already verified, not in-flight). Beacon-witness verification
-    /// always runs — every block's header carries a witness root + leaf
-    /// count, even when the block contributes zero new leaves.
-    pub fn needs_beacon_witness_root_verification(&self, block_hash: BlockHash) -> bool {
-        self.needs_root(block_hash, VerificationKind::BeaconWitnessRoot, true)
-    }
-
     /// Initiate beacon-witness root verification for a block.
     ///
     /// Pure CPU check that runs in parallel with the other per-root
-    /// verifiers. The caller supplies `parent_witness_leaves` (the
-    /// accumulator state the parent block left behind, walked through any
-    /// in-chain pending-block deltas), `parent_round` (from the parent
-    /// header), `ready_signals` (drained from the manifest), and
-    /// `finalized_waves` (for receipt-sourced witness events). The handler
-    /// re-derives the deterministic leaf list, applies it, and emits
+    /// verifiers. Pulls the deterministic inputs (`parent_witness_leaves`
+    /// from the in-chain pending-block walk, `ready_signals` from the
+    /// pending block's manifest, `finalized_waves` from the block's
+    /// own certificates) so callers only thread the parts they own.
+    /// The handler re-derives the leaf list and emits
     /// `BlockRootVerified { kind: BeaconWitnessRoot, valid }`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn initiate_beacon_witness_root_verification(
+    fn initiate_beacon_witness_root_verification(
         &mut self,
         block_hash: BlockHash,
         block: &Block,
-        ready_signals: Vec<ReadySignal>,
-        parent_round: Round,
-        parent_witness_leaves: Vec<Hash>,
-        finalized_waves: Vec<Arc<FinalizedWave>>,
+        pending_blocks: &PendingBlocks,
+        accumulator: &BeaconWitnessAccumulator,
+        committed_hash: BlockHash,
         topology: &TopologySnapshot,
     ) -> Vec<Action> {
         let header = block.header();
+        let parent_witness_leaves = prospective_parent_witness_leaves(
+            accumulator,
+            committed_hash,
+            header.parent_block_hash(),
+            pending_blocks,
+            topology,
+        );
+        let ready_signals = pending_blocks
+            .get(block_hash)
+            .map_or_else(Vec::new, |pending| {
+                pending.manifest().ready_signals().as_slice().to_vec()
+            });
+        let finalized_waves = block.certificates().to_vec();
         debug!(
             ?block_hash,
             expected_leaf_count = header.beacon_witness_leaf_count().inner(),
@@ -751,7 +753,7 @@ impl VerificationPipeline {
             expected_root: header.beacon_witness_root(),
             expected_leaf_count: header.beacon_witness_leaf_count(),
             parent_witness_leaves,
-            parent_round,
+            parent_round: header.parent_qc().round(),
             height: header.height(),
             round: header.round(),
             ready_signals,
@@ -766,13 +768,21 @@ impl VerificationPipeline {
 
     /// Initiate every outstanding async verification for a candidate block in
     /// parallel: state root, transaction root, provision root, certificate
-    /// root, local receipt root, and per-target provision tx roots. Returns
-    /// the actions the caller should dispatch; state-root verification is
-    /// queued into the ready list and drained separately.
+    /// root, local receipt root, per-target provision tx roots, and
+    /// beacon-witness root. Returns the actions the caller should dispatch;
+    /// state-root verification is queued into the ready list and drained
+    /// separately.
+    ///
+    /// `accumulator` and `committed_hash` come from the shard coordinator
+    /// so the beacon-witness initiator can resolve `parent_witness_leaves`
+    /// by walking the pending chain — beacon-witness is the only root
+    /// verifier whose inputs span the in-flight chain prefix.
     pub(crate) fn initiate_block_verifications(
         &mut self,
         topology: &TopologySnapshot,
         pending_blocks: &PendingBlocks,
+        accumulator: &BeaconWitnessAccumulator,
+        committed_hash: BlockHash,
         block_hash: BlockHash,
         block: &Block,
     ) -> Vec<Action> {
@@ -820,6 +830,17 @@ impl VerificationPipeline {
         ) {
             actions
                 .extend(self.initiate_provision_tx_root_verification(block_hash, block, topology));
+        }
+
+        if self.needs_root(block_hash, VerificationKind::BeaconWitnessRoot, true) {
+            actions.extend(self.initiate_beacon_witness_root_verification(
+                block_hash,
+                block,
+                pending_blocks,
+                accumulator,
+                committed_hash,
+                topology,
+            ));
         }
 
         actions

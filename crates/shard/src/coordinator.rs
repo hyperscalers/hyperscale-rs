@@ -14,9 +14,9 @@
 
 use hyperscale_core::{Action, CommitSource, FetchAbandon, ProtocolEvent, TimerId};
 use hyperscale_types::{
-    BlockHash, Hash, LocalTimestamp, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROGRESS_WAIT,
+    BlockHash, LocalTimestamp, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROGRESS_WAIT,
     MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProposerTimestamp, ProvisionHash, ReadySignal,
-    ShardGroupId, ShardWitnessPayload, StoredReceipt, WaveId, WeightedTimestamp,
+    ShardGroupId, StoredReceipt, WaveId, WeightedTimestamp,
 };
 
 /// Shard consensus statistics for monitoring.
@@ -258,80 +258,6 @@ impl ShardCoordinator {
     #[must_use]
     pub const fn jmt_root(&self) -> StateRoot {
         self.committed_state_root
-    }
-
-    /// Snapshot of the beacon-witness accumulator's leaf hashes at the
-    /// state the supplied parent block would leave behind.
-    ///
-    /// Walks from `parent_block_hash` back through the pending chain to
-    /// the committed tip, re-deriving each ancestor's witness-leaf delta
-    /// from its receipts + manifest's `ready_signals` + missed-round
-    /// scan, then prepends the committed accumulator's leaves. The
-    /// derivation is byte-identical to what the proposer ran, so the
-    /// returned vector is exactly the input the verifier must apply
-    /// the block's own new leaves to.
-    ///
-    /// Returns the committed accumulator's leaves unchanged when
-    /// `parent_block_hash` IS the committed tip, or when the walk
-    /// encounters a missing/unassembled ancestor (the verifier handler
-    /// will reject the block on the resulting root mismatch — same
-    /// failure mode as any other inconsistent input).
-    fn prospective_parent_witness_leaves(
-        &self,
-        parent_block_hash: BlockHash,
-        topology_snapshot: &TopologySnapshot,
-    ) -> Vec<Hash> {
-        let committed_leaves = self.beacon_witness_accumulator.leaves();
-        if parent_block_hash == self.committed_hash {
-            return committed_leaves.to_vec();
-        }
-        let mut chain_deltas: Vec<Vec<Hash>> = Vec::new();
-        let mut current = parent_block_hash;
-        while current != self.committed_hash {
-            let Some(pending) = self.pending_blocks.get(current) else {
-                warn!(
-                    block_hash = ?current,
-                    "Prospective witness-leaf walk: missing pending ancestor"
-                );
-                return committed_leaves.to_vec();
-            };
-            let Some(block) = pending.block() else {
-                warn!(
-                    block_hash = ?current,
-                    "Prospective witness-leaf walk: ancestor not assembled"
-                );
-                return committed_leaves.to_vec();
-            };
-            let header = block.header();
-            let receipts: Vec<StoredReceipt> = block
-                .certificates()
-                .iter()
-                .flat_map(|fw| fw.receipts().iter().cloned())
-                .collect();
-            let missed = beacon_witnesses::missed_proposals_since_prev_commit(
-                header.height(),
-                header.parent_qc().round(),
-                header.round(),
-                topology_snapshot,
-            );
-            let new_leaves = beacon_witnesses::derive_leaves(
-                &receipts,
-                missed,
-                pending.manifest().ready_signals().as_slice(),
-            );
-            chain_deltas.push(
-                new_leaves
-                    .iter()
-                    .map(ShardWitnessPayload::leaf_hash)
-                    .collect(),
-            );
-            current = header.parent_block_hash();
-        }
-        let mut leaves = committed_leaves.to_vec();
-        for delta in chain_deltas.iter().rev() {
-            leaves.extend_from_slice(delta);
-        }
-        leaves
     }
 
     /// Borrow-view of the node's knowledge of the chain. Short-lived; see
@@ -1515,40 +1441,14 @@ impl ShardCoordinator {
                 InFlightCheck::Abort => return vec![],
             };
 
-            let mut verification_actions = self.verification.initiate_block_verifications(
+            let verification_actions = self.verification.initiate_block_verifications(
                 topology_snapshot,
                 &self.pending_blocks,
+                &self.beacon_witness_accumulator,
+                self.committed_hash,
                 block_hash,
                 block,
             );
-            if self
-                .verification
-                .needs_beacon_witness_root_verification(block_hash)
-            {
-                let parent_witness_leaves = self.prospective_parent_witness_leaves(
-                    block.header().parent_block_hash(),
-                    topology_snapshot,
-                );
-                let parent_round = block.header().parent_qc().round();
-                let ready_signals = self
-                    .pending_blocks
-                    .get(block_hash)
-                    .map_or_else(Vec::new, |pending| {
-                        pending.manifest().ready_signals().as_slice().to_vec()
-                    });
-                let finalized_waves = block.certificates().to_vec();
-                verification_actions.extend(
-                    self.verification.initiate_beacon_witness_root_verification(
-                        block_hash,
-                        block,
-                        ready_signals,
-                        parent_round,
-                        parent_witness_leaves,
-                        finalized_waves,
-                        topology_snapshot,
-                    ),
-                );
-            }
 
             // Wait for initiated verifications, or exit early when we're
             // running verifications only (skip_vote) or the block isn't

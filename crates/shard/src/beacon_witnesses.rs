@@ -13,9 +13,11 @@
 //! and let proposer + verifier share them verbatim.
 
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeight, ConsensusReceipt, Hash, ReadySignal,
-    Round, ShardWitnessPayload, StoredReceipt, TopologySnapshot, compute_merkle_root,
+    BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight, ConsensusReceipt, Hash,
+    ReadySignal, Round, ShardWitnessPayload, StoredReceipt, TopologySnapshot, compute_merkle_root,
 };
+
+use crate::pending::PendingBlocks;
 
 /// Per-shard append-only beacon-witness accumulator.
 ///
@@ -167,6 +169,83 @@ pub fn derive_leaves(
         });
     }
     out
+}
+
+/// Snapshot of the beacon-witness accumulator's leaf hashes at the
+/// state the supplied parent block would leave behind.
+///
+/// Walks from `parent_block_hash` back through the pending chain to
+/// the committed tip, re-deriving each ancestor's witness-leaf delta
+/// from its receipts + manifest's `ready_signals` + missed-round scan,
+/// then prepends the committed accumulator's leaves. The derivation is
+/// byte-identical to what the proposer ran, so the returned vector is
+/// exactly the input the verifier must apply the block's own new
+/// leaves to.
+///
+/// Returns the committed accumulator's leaves unchanged when
+/// `parent_block_hash` IS the committed tip, or when the walk
+/// encounters a missing/unassembled ancestor (the verifier handler
+/// will reject the block on the resulting root mismatch — same
+/// failure mode as any other inconsistent input).
+#[must_use]
+pub fn prospective_parent_witness_leaves(
+    accumulator: &BeaconWitnessAccumulator,
+    committed_hash: BlockHash,
+    parent_block_hash: BlockHash,
+    pending_blocks: &PendingBlocks,
+    topology: &TopologySnapshot,
+) -> Vec<Hash> {
+    let committed_leaves = accumulator.leaves();
+    if parent_block_hash == committed_hash {
+        return committed_leaves.to_vec();
+    }
+    let mut chain_deltas: Vec<Vec<Hash>> = Vec::new();
+    let mut current = parent_block_hash;
+    while current != committed_hash {
+        let Some(pending) = pending_blocks.get(current) else {
+            tracing::warn!(
+                block_hash = ?current,
+                "Prospective witness-leaf walk: missing pending ancestor"
+            );
+            return committed_leaves.to_vec();
+        };
+        let Some(block) = pending.block() else {
+            tracing::warn!(
+                block_hash = ?current,
+                "Prospective witness-leaf walk: ancestor not assembled"
+            );
+            return committed_leaves.to_vec();
+        };
+        let header = block.header();
+        let receipts: Vec<StoredReceipt> = block
+            .certificates()
+            .iter()
+            .flat_map(|fw| fw.receipts().iter().cloned())
+            .collect();
+        let missed = missed_proposals_since_prev_commit(
+            header.height(),
+            header.parent_qc().round(),
+            header.round(),
+            topology,
+        );
+        let new_leaves = derive_leaves(
+            &receipts,
+            missed,
+            pending.manifest().ready_signals().as_slice(),
+        );
+        chain_deltas.push(
+            new_leaves
+                .iter()
+                .map(ShardWitnessPayload::leaf_hash)
+                .collect(),
+        );
+        current = header.parent_block_hash();
+    }
+    let mut leaves = committed_leaves.to_vec();
+    for delta in chain_deltas.iter().rev() {
+        leaves.extend_from_slice(delta);
+    }
+    leaves
 }
 
 /// Post-execution verifier for the block's beacon-witness commitment.
