@@ -6,13 +6,14 @@ use std::time::Duration;
 
 use hyperscale_dispatch::DispatchPool;
 use hyperscale_types::{
-    Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PublicKey,
-    CertificateRoot, CommittedBlockHeader, ExecutionCertificate, ExecutionVote, FinalizedWave,
-    GlobalReceiptRoot, InFlightCount, LocalReceiptRoot, NodeId, ProposerTimestamp, ProvisionHash,
-    ProvisionTxRoot, Provisions, ProvisionsRoot, QuorumCertificate, Round, RoutableTransaction,
-    ShardGroupId, SharedCertificates, SharedTransactions, StateRoot, SubstateEntry,
-    TopologySnapshot, TransactionRoot, TransactionStatus, TxHash, TxOutcome, ValidatorId,
-    VotePower, WaveId, WeightedTimestamp,
+    BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight,
+    BlockManifest, BlockVote, Bls12381G1PublicKey, CertificateRoot, CommittedBlockHeader,
+    ExecutionCertificate, ExecutionVote, FinalizedWave, GlobalReceiptRoot, InFlightCount,
+    LocalReceiptRoot, NodeId, ProposerTimestamp, ProvisionHash, ProvisionTxRoot, Provisions,
+    ProvisionsRoot, QuorumCertificate, ReadySignal, Round, RoutableTransaction, ShardGroupId,
+    SharedCertificates, SharedTransactions, StateRoot, SubstateEntry, TopologySnapshot,
+    TransactionRoot, TransactionStatus, TxHash, TxOutcome, ValidatorId, VotePower, WaveId,
+    WeightedTimestamp,
 };
 
 use crate::{CommitSource, FetchAbandon, FetchRequest, ProtocolEvent, TimerId};
@@ -507,6 +508,18 @@ pub enum Action {
         parent_in_flight: InFlightCount,
         /// Number of transactions finalized by wave certificates in this block.
         finalized_tx_count: u32,
+        /// Dwell-eligible [`ReadySignal`]s drained from the proposer's pool
+        /// for inclusion in the block's manifest. Beacon's `Ready` witness
+        /// derives one entry per included signal at block-assembly time.
+        ready_signals: Vec<ReadySignal>,
+        /// Pre-derived beacon-witness accumulator root after this block's
+        /// witnesses are appended. The coordinator owns the accumulator
+        /// and computes both this and `beacon_witness_leaf_count` before
+        /// emitting the action.
+        beacon_witness_root: BeaconWitnessRoot,
+        /// Pre-derived total accumulator leaf count after this block's
+        /// witnesses are appended.
+        beacon_witness_leaf_count: BeaconWitnessLeafCount,
     },
 
     /// Execute every transaction in a single-shard wave.

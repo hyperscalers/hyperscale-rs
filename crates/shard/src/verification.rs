@@ -1315,7 +1315,7 @@ mod tests {
         vp.initiate_state_root_verification(block_hash, &block, BlockHeight::GENESIS);
 
         let mut pb =
-            PendingBlock::from_complete_block(&block, vec![], vec![], LocalTimestamp::ZERO);
+            PendingBlock::from_complete_block(&block, vec![], vec![], vec![], LocalTimestamp::ZERO);
         pb.construct_block()
             .expect("complete block constructs cleanly");
         let mut pending_with_block = PendingBlocks::new();

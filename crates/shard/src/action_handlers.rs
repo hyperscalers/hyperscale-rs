@@ -14,14 +14,15 @@ use hyperscale_types::network::gossip::CommittedBlockHeaderGossip;
 use hyperscale_types::network::notification::{BlockHeaderNotification, BlockVoteNotification};
 use hyperscale_types::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight,
-    BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, CertificateRoot, ConsensusReceipt,
-    FinalizedWave, Hash, InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionHash,
-    ProvisionTxRoot, Provisions, ProvisionsRoot, QuorumCertificate, Round, RoutableTransaction,
-    ShardGroupId, SignerBitfield, StateRoot, StoredReceipt, TopologySnapshot, TransactionRoot,
-    ValidatorId, VotePower, WeightedTimestamp, batch_verify_bls_same_message, block_header_message,
-    block_vote_message, committed_block_header_message, compute_certificate_root,
-    compute_local_receipt_root, compute_provision_root, compute_provision_tx_roots,
-    compute_transaction_root, compute_waves, verify_bls12381_v1,
+    BlockManifest, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, CertificateRoot,
+    ConsensusReceipt, FinalizedWave, Hash, InFlightCount, LocalReceiptRoot, ProposerTimestamp,
+    ProvisionHash, ProvisionTxRoot, Provisions, ProvisionsRoot, QuorumCertificate, ReadySignal,
+    Round, RoutableTransaction, ShardGroupId, SignerBitfield, StateRoot, StoredReceipt,
+    TopologySnapshot, TransactionRoot, ValidatorId, VotePower, WeightedTimestamp,
+    batch_verify_bls_same_message, block_header_message, block_vote_message,
+    committed_block_header_message, compute_certificate_root, compute_local_receipt_root,
+    compute_provision_root, compute_provision_tx_roots, compute_transaction_root, compute_waves,
+    verify_bls12381_v1,
 };
 
 /// Result of QC verification and assembly.
@@ -438,6 +439,12 @@ pub struct ProposalResult<P: Send> {
     pub block: Block,
     /// Hash of the constructed block, cached so callers don't recompute.
     pub block_hash: BlockHash,
+    /// Manifest carrying the proposer's drained `ready_signals` alongside
+    /// the standard tx/cert/provision hash lists. The downstream
+    /// gossip + pending-block pathway uses this; `BlockManifest::from_block`
+    /// alone can't recover `ready_signals` since the field isn't on
+    /// `Block`.
+    pub manifest: BlockManifest,
     /// JMT prepared-commit handle from the proposer's pre-commit, threaded
     /// to the commit pipeline so the proposer doesn't recompute on commit.
     pub prepared_commit: Option<P>,
@@ -472,6 +479,9 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
     provisions: Vec<Arc<Provisions>>,
     parent_in_flight: InFlightCount,
     finalized_tx_count: u32,
+    ready_signals: Vec<ReadySignal>,
+    beacon_witness_root: BeaconWitnessRoot,
+    beacon_witness_leaf_count: BeaconWitnessLeafCount,
     pending_snapshots: &[Arc<JmtSnapshot>],
 ) -> ProposalResult<S::PreparedCommit> {
     let (state_root, prepared) = storage.prepare_block_commit(
@@ -523,10 +533,8 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
         waves,
         provision_tx_roots,
         in_flight,
-        // TODO(beacon): supply the shard's beacon-witness accumulator root
-        // once the shard runtime computes it.
-        BeaconWitnessRoot::ZERO,
-        BeaconWitnessLeafCount::ZERO,
+        beacon_witness_root,
+        beacon_witness_leaf_count,
     );
 
     let block = Block::Live {
@@ -536,11 +544,24 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
         provisions: Arc::new(provisions.into()),
     };
 
+    // Manifest mirrors `BlockManifest::from_block` but carries the
+    // proposer's drained `ready_signals` — the manifest field can't be
+    // recovered from a `Block` alone, so the proposer threads it forward
+    // here for the downstream gossip + pending-block pathway.
+    let tx_hashes: Vec<_> = block.transactions().iter().map(|tx| tx.hash()).collect();
+    let cert_ids: Vec<_> = block
+        .certificates()
+        .iter()
+        .map(|c| c.wave_id().clone())
+        .collect();
+    let manifest = BlockManifest::new(tx_hashes, cert_ids, provision_hashes, ready_signals);
+
     let block_hash = block.hash();
 
     ProposalResult {
         block,
         block_hash,
+        manifest,
         prepared_commit: Some(prepared),
     }
 }
@@ -803,6 +824,9 @@ where
             provisions,
             parent_in_flight,
             finalized_tx_count,
+            ready_signals,
+            beacon_witness_root,
+            beacon_witness_leaf_count,
         } => {
             let view = ctx
                 .pending_chain
@@ -826,6 +850,9 @@ where
                 provisions.clone(),
                 parent_in_flight,
                 finalized_tx_count,
+                ready_signals,
+                beacon_witness_root,
+                beacon_witness_leaf_count,
                 &pending_snapshots,
             );
             let block_hash = result.block_hash;
@@ -843,6 +870,7 @@ where
                 round,
                 block: Arc::new(result.block),
                 block_hash,
+                manifest: result.manifest,
                 finalized_waves,
                 provisions,
             });

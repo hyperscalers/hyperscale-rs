@@ -14,8 +14,9 @@
 
 use hyperscale_core::{Action, CommitSource, FetchAbandon, ProtocolEvent, TimerId};
 use hyperscale_types::{
-    BlockHash, LocalTimestamp, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROGRESS_WAIT, MAX_TXS_PER_BLOCK,
-    ProposerTimestamp, ProvisionHash, ReadySignal, ShardGroupId, WaveId, WeightedTimestamp,
+    BlockHash, LocalTimestamp, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROGRESS_WAIT,
+    MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProposerTimestamp, ProvisionHash, ReadySignal,
+    ShardGroupId, StoredReceipt, WaveId, WeightedTimestamp,
 };
 
 /// Shard consensus statistics for monitoring.
@@ -86,6 +87,7 @@ use hyperscale_types::{
 use tracing::field::Empty;
 use tracing::{debug, info, instrument, trace, warn};
 
+use crate::beacon_witnesses::{self, BeaconWitnessAccumulator, MIN_READY_SIGNAL_DWELL};
 use crate::block_sync::{
     BlockSyncHealthDecision, BlockSyncManager, BlockSyncVerificationResult, IngestOutcome,
 };
@@ -176,9 +178,15 @@ pub struct ShardCoordinator {
     dedup_index: CommitDedupIndex,
 
     /// Validator "ready on shard" signals waiting for inclusion in the
-    /// next proposed block. Drained at proposal time; the wiring lands
-    /// alongside the proposer hook in a follow-up commit.
+    /// next proposed block. Drained at proposal time.
     ready_signal_pool: ReadySignalPool,
+
+    /// Per-shard beacon-witness accumulator. Previewed at proposal time
+    /// to fill the new block's `(beacon_witness_root, beacon_witness_leaf_count)`;
+    /// mutated on each committed block via [`Self::on_block_committed`].
+    /// On startup, reconstructed by replaying committed blocks (a
+    /// follow-up commit lands the recovery path).
+    beacon_witness_accumulator: BeaconWitnessAccumulator,
 
     // ═══════════════════════════════════════════════════════════════════════════
     // Configuration
@@ -234,6 +242,7 @@ impl ShardCoordinator {
             proposal: ProposalTracker::new(),
             dedup_index: CommitDedupIndex::new(),
             ready_signal_pool: ReadySignalPool::new(),
+            beacon_witness_accumulator: BeaconWitnessAccumulator::new(),
             config,
             now: LocalTimestamp::ZERO,
         }
@@ -831,6 +840,36 @@ impl ShardCoordinator {
         round: Round,
         kind: ProposalKind,
     ) -> Vec<Action> {
+        let parent_round = self
+            .chain_view(topology_snapshot.local_shard())
+            .proposal_parent()
+            .1
+            .round();
+        let receipts: Vec<StoredReceipt> = match &kind {
+            ProposalKind::Normal {
+                finalized_waves, ..
+            } => finalized_waves
+                .iter()
+                .flat_map(|fw| fw.receipts().iter().cloned())
+                .collect(),
+            ProposalKind::Fallback | ProposalKind::Sync => Vec::new(),
+        };
+        let missed = beacon_witnesses::missed_proposals_since_prev_commit(
+            height,
+            parent_round,
+            round,
+            topology_snapshot,
+        );
+        let ready_signals = self.ready_signal_pool.drain_eligible(
+            height,
+            self.now,
+            MIN_READY_SIGNAL_DWELL,
+            MAX_READY_SIGNALS_PER_BLOCK,
+        );
+        let new_leaves = beacon_witnesses::derive_leaves(&receipts, missed, &ready_signals);
+        let (beacon_witness_root, beacon_witness_leaf_count) =
+            self.beacon_witness_accumulator.preview_append(&new_leaves);
+
         let plan = assemble_build_action(
             topology_snapshot,
             &self.chain_view(topology_snapshot.local_shard()),
@@ -838,6 +877,9 @@ impl ShardCoordinator {
             round,
             self.now,
             kind,
+            ready_signals,
+            beacon_witness_root,
+            beacon_witness_leaf_count,
         );
 
         info!(
@@ -1778,7 +1820,7 @@ impl ShardCoordinator {
     /// Called when the runner completes `Action::BuildProposal`. The runner has
     /// computed the state root, built the complete block, and cached the `WriteBatch`
     /// for efficient commit later.
-    #[instrument(skip(self, block, finalized_waves), fields(height = %height.inner(), round = round.inner()))]
+    #[instrument(skip(self, block, manifest, finalized_waves), fields(height = %height.inner(), round = round.inner()))]
     #[allow(clippy::too_many_arguments)]
     pub fn on_proposal_built(
         &mut self,
@@ -1787,6 +1829,7 @@ impl ShardCoordinator {
         round: Round,
         block: &Block,
         block_hash: BlockHash,
+        manifest: &BlockManifest,
         finalized_waves: Vec<Arc<FinalizedWave>>,
         provisions: Vec<Arc<Provisions>>,
     ) -> Vec<Action> {
@@ -1815,8 +1858,18 @@ impl ShardCoordinator {
         let has_certificates = !block.certificates().is_empty();
 
         // Store our own block as pending (with all finalized waves + provisions).
-        let mut pending_block =
-            PendingBlock::from_complete_block(block, finalized_waves, provisions, self.now);
+        // The supplied `manifest` carries the proposer-drained
+        // `ready_signals`, which the block itself doesn't carry — thread
+        // them through `from_complete_block` so the pending entry's
+        // manifest mirrors the header the proposer broadcasts.
+        let ready_signals: Vec<ReadySignal> = manifest.ready_signals().iter().cloned().collect();
+        let mut pending_block = PendingBlock::from_complete_block(
+            block,
+            ready_signals,
+            finalized_waves,
+            provisions,
+            self.now,
+        );
 
         let total_tx_count = pending_block.transaction_count();
         info!(
@@ -2216,6 +2269,7 @@ impl ShardCoordinator {
     /// sweep when there are orphaned pending-block fetches to cancel.
     fn record_block_committed(
         &mut self,
+        topology_snapshot: &TopologySnapshot,
         block: &Block,
         block_hash: BlockHash,
         commit_ts: WeightedTimestamp,
@@ -2235,13 +2289,40 @@ impl ShardCoordinator {
         // the block's manifest rather than `block.provisions()` so a
         // `Block::Sealed` arriving via the sync path past the live serve
         // window still registers its hashes correctly.
-        let manifest = BlockManifest::from_block(block);
+        let manifest = self.pending_blocks.get(block_hash).map_or_else(
+            || BlockManifest::from_block(block),
+            |pending| pending.manifest().clone(),
+        );
         self.dedup_index
             .register_committed_txs(block.transactions());
         self.dedup_index
             .register_committed_certs(block.certificates());
         self.dedup_index
             .register_committed_provisions(manifest.provision_hashes(), commit_ts);
+
+        // Fold the block's beacon-witness leaves into the local
+        // accumulator. Derives from the same canonical sources the
+        // proposer used: receipts from finalized waves, missed-proposal
+        // events from the parent round, and ready signals from the
+        // committed manifest. Persistence to RocksDB lands in a
+        // follow-up commit alongside the fetch responder; pool eviction
+        // bounds memory by dropping signals past their window.
+        let parent_round = block.header().parent_qc().round();
+        let receipts: Vec<StoredReceipt> = block
+            .certificates()
+            .iter()
+            .flat_map(|fw| fw.receipts().iter().cloned())
+            .collect();
+        let missed = beacon_witnesses::missed_proposals_since_prev_commit(
+            height,
+            parent_round,
+            block.header().round(),
+            topology_snapshot,
+        );
+        let new_leaves =
+            beacon_witnesses::derive_leaves(&receipts, missed, manifest.ready_signals().as_slice());
+        self.beacon_witness_accumulator.commit_append(&new_leaves);
+        self.ready_signal_pool.evict_expired(height);
 
         // Reset backoff tracking — new height means fresh round counting.
         self.view_change.reset_for_height_advance();
@@ -2348,9 +2429,12 @@ impl ShardCoordinator {
         let parent_state_root = self.committed_state_root;
         let parent_block_height = self.committed_height;
 
-        if let Some(abandon) =
-            self.record_block_committed(&block, block_hash, qc.weighted_timestamp())
-        {
+        if let Some(abandon) = self.record_block_committed(
+            topology_snapshot,
+            &block,
+            block_hash,
+            qc.weighted_timestamp(),
+        ) {
             actions.push(abandon);
         }
         self.record_leader_activity();
@@ -2489,7 +2573,12 @@ impl ShardCoordinator {
 
         // Advance committed_height. The QC is the proof of commit — same
         // timing as the consensus path.
-        self.record_block_committed(&block, block_hash, qc.weighted_timestamp());
+        self.record_block_committed(
+            topology_snapshot,
+            &block,
+            block_hash,
+            qc.weighted_timestamp(),
+        );
 
         // Track sync progress for the loop iterator.
         self.block_sync.set_sync_applied_height(height);
@@ -3221,7 +3310,7 @@ mod tests {
 
     fn install_complete_block(state: &mut ShardCoordinator, block: &Block) {
         let mut pending =
-            PendingBlock::from_complete_block(block, vec![], vec![], LocalTimestamp::ZERO);
+            PendingBlock::from_complete_block(block, vec![], vec![], vec![], LocalTimestamp::ZERO);
         pending
             .construct_block()
             .expect("complete block constructs cleanly");

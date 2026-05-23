@@ -11,7 +11,7 @@ use hyperscale_core::{Action, FetchRequest};
 use hyperscale_types::{BeaconWitnessLeafCount, BeaconWitnessRoot};
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, FinalizedWave, LocalTimestamp,
-    ProvisionHash, Provisions, RoutableTransaction, TopologySnapshot, TxHash, WaveId,
+    ProvisionHash, Provisions, ReadySignal, RoutableTransaction, TopologySnapshot, TxHash, WaveId,
 };
 use tracing::{debug, warn};
 
@@ -423,8 +423,13 @@ impl PendingBlock {
     /// batches. Provision hashes are derived (and sorted) from the batches so the
     /// resulting `PendingBlock` is self-contained: both the manifest hashes and
     /// `received_provisions` are populated from the same source.
+    ///
+    /// `ready_signals` carries whatever the proposer drained from their
+    /// local pool — the manifest stores them alongside the derived
+    /// tx/cert/provision hashes.
     pub fn from_complete_block(
         block: &Block,
+        ready_signals: Vec<ReadySignal>,
         finalized_waves: Vec<Arc<FinalizedWave>>,
         provisions: Vec<Arc<Provisions>>,
         created_at: LocalTimestamp,
@@ -438,7 +443,7 @@ impl PendingBlock {
             .iter()
             .map(|c| c.wave_id().clone())
             .collect();
-        let manifest = BlockManifest::new(tx_hashes, cert_ids, provision_hashes, vec![]);
+        let manifest = BlockManifest::new(tx_hashes, cert_ids, provision_hashes, ready_signals);
         let mut received_provisions: BTreeMap<ProvisionHash, Arc<Provisions>> = BTreeMap::new();
         for p in provisions {
             received_provisions.insert(p.hash(), p);
@@ -813,8 +818,13 @@ mod tests {
             provisions: Arc::new(BoundedVec::new()),
         };
 
-        let pending =
-            PendingBlock::from_complete_block(&block, vec![fw], vec![], LocalTimestamp::ZERO);
+        let pending = PendingBlock::from_complete_block(
+            &block,
+            vec![],
+            vec![fw],
+            vec![],
+            LocalTimestamp::ZERO,
+        );
         assert!(pending.is_complete());
     }
 

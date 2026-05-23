@@ -232,6 +232,11 @@ pub enum ProtocolEvent {
         block: Arc<Block>,
         /// Hash of the constructed block, cached for callers.
         block_hash: BlockHash,
+        /// Manifest carrying the proposer's drained `ready_signals`
+        /// alongside the standard hash lists. Threaded back from
+        /// `build_proposal` because `BlockManifest::from_block` can't
+        /// recover `ready_signals` from a `Block` alone.
+        manifest: BlockManifest,
         /// Finalized waves included in the block (carry certs + receipts + ECs).
         finalized_waves: Vec<Arc<FinalizedWave>>,
         /// Provisions included in the block.

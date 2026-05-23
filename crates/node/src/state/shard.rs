@@ -168,6 +168,7 @@ impl NodeStateMachine {
                 round,
                 block,
                 block_hash,
+                manifest,
                 finalized_waves,
                 provisions,
             } => self.shard_coordinator.on_proposal_built(
@@ -176,6 +177,7 @@ impl NodeStateMachine {
                 round,
                 &block,
                 block_hash,
+                &manifest,
                 finalized_waves,
                 provisions,
             ),

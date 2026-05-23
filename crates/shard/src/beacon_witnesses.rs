@@ -12,14 +12,21 @@
 //! per-block-flow wiring; this module's job is to define the rules
 //! and let proposer + verifier share them verbatim.
 
-use std::sync::Arc;
+use std::time::Duration;
 
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeader, BlockHeight, BlockManifest, BoundedVec,
-    ConsensusReceipt, Hash, MAX_READY_SIGNALS_PER_BLOCK, MAX_WITNESS_PROOF_DEPTH, ReadySignal,
-    Round, ShardWitnessPayload, StoredReceipt, TopologySnapshot, compute_merkle_root,
-    compute_merkle_root_with_proof,
+    BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeader, BlockHeight, BlockManifest,
+    ConsensusReceipt, Hash, MAX_WITNESS_PROOF_DEPTH, ReadySignal, Round, ShardWitnessPayload,
+    StoredReceipt, TopologySnapshot, compute_merkle_root, compute_merkle_root_with_proof,
 };
+
+/// Minimum dwell time before a [`ReadySignal`] is eligible to be
+/// drained into a block.
+///
+/// Matches the existing tx-dwell constant — the proposer's pool
+/// admission and drain both honour this so a signal has had time to
+/// propagate to other committee members before it gets committed.
+pub const MIN_READY_SIGNAL_DWELL: Duration = Duration::from_millis(150);
 
 /// Per-shard append-only beacon-witness accumulator.
 ///
@@ -157,9 +164,9 @@ pub fn missed_proposals_since_prev_commit(
 /// 3. `Ready` witnesses in ascending `validator_id` order.
 #[must_use]
 pub fn derive_leaves(
-    receipts: &[Arc<StoredReceipt>],
+    receipts: &[StoredReceipt],
     missed: Vec<ShardWitnessPayload>,
-    ready_signals: &BoundedVec<ReadySignal, MAX_READY_SIGNALS_PER_BLOCK>,
+    ready_signals: &[ReadySignal],
 ) -> Vec<ShardWitnessPayload> {
     let mut out = Vec::new();
     for receipt in receipts {
@@ -201,14 +208,14 @@ pub fn derive_leaves(
 pub fn derive_and_verify(
     header: &BlockHeader,
     manifest: &BlockManifest,
-    receipts: &[Arc<StoredReceipt>],
+    receipts: &[StoredReceipt],
     parent_accumulator: &BeaconWitnessAccumulator,
     parent_round: Round,
     topology: &TopologySnapshot,
 ) -> bool {
     let missed =
         missed_proposals_since_prev_commit(header.height(), parent_round, header.round(), topology);
-    let leaves = derive_leaves(receipts, missed, manifest.ready_signals());
+    let leaves = derive_leaves(receipts, missed, manifest.ready_signals().as_slice());
     let (root, count) = parent_accumulator.preview_append(&leaves);
     root == header.beacon_witness_root() && count == header.beacon_witness_leaf_count()
 }
@@ -247,9 +254,8 @@ mod tests {
         )
     }
 
-    fn ready_signals(ids: &[u64]) -> BoundedVec<ReadySignal, MAX_READY_SIGNALS_PER_BLOCK> {
-        let vec: Vec<ReadySignal> = ids.iter().copied().map(ready_signal_for).collect();
-        vec.into()
+    fn ready_signals(ids: &[u64]) -> Vec<ReadySignal> {
+        ids.iter().copied().map(ready_signal_for).collect()
     }
 
     #[test]
@@ -368,7 +374,7 @@ mod tests {
             &topo,
         );
         let ready = ready_signals(&[3, 1, 2]);
-        let receipts: Vec<Arc<StoredReceipt>> = Vec::new();
+        let receipts: Vec<StoredReceipt> = Vec::new();
 
         let leaves = derive_leaves(&receipts, missed, &ready);
         // 1 MissedProposal + 3 Ready (sorted ascending by validator id)
@@ -395,7 +401,7 @@ mod tests {
             &topo,
         );
         let ready = ready_signals(&[7, 2]);
-        let receipts: Vec<Arc<StoredReceipt>> = Vec::new();
+        let receipts: Vec<StoredReceipt> = Vec::new();
 
         let a = derive_leaves(&receipts, missed.clone(), &ready);
         let b = derive_leaves(&receipts, missed, &ready);

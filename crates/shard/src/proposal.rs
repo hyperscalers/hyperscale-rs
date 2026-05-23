@@ -19,8 +19,9 @@ use std::sync::Arc;
 
 use hyperscale_core::Action;
 use hyperscale_types::{
-    BlockHash, BlockHeight, FinalizedWave, LocalTimestamp, ProposerTimestamp, ProvisionHash,
-    Provisions, Round, RoutableTransaction, TopologySnapshot, TxHash, WaveId, WeightedTimestamp,
+    BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight, FinalizedWave,
+    LocalTimestamp, ProposerTimestamp, ProvisionHash, Provisions, ReadySignal, Round,
+    RoutableTransaction, TopologySnapshot, TxHash, WaveId, WeightedTimestamp,
 };
 use tracing::debug;
 
@@ -294,6 +295,13 @@ pub struct BuildActionPlan {
 /// Pure with respect to the coordinator — reads only from the chain view
 /// and the supplied inputs, writes nothing. The caller applies the returned
 /// mutations (leader activity, tracker.start, dispatch-or-defer).
+///
+/// `ready_signals`, `beacon_witness_root`, and `beacon_witness_leaf_count`
+/// are pre-derived by the coordinator (which owns the
+/// `BeaconWitnessAccumulator` and `ReadySignalPool`) and threaded through
+/// the action so `build_proposal` doesn't need to know about the
+/// accumulator type.
+#[allow(clippy::too_many_arguments)] // assemble fans a coordinator-side bundle into the action
 pub fn assemble_build_action(
     topology: &TopologySnapshot,
     chain: &ChainView,
@@ -301,6 +309,9 @@ pub fn assemble_build_action(
     round: Round,
     now: LocalTimestamp,
     kind: ProposalKind,
+    ready_signals: Vec<ReadySignal>,
+    beacon_witness_root: BeaconWitnessRoot,
+    beacon_witness_leaf_count: BeaconWitnessLeafCount,
 ) -> BuildActionPlan {
     let (parent_block_hash, parent_qc) = chain.proposal_parent();
     let parent_block_height = parent_qc.height();
@@ -370,6 +381,9 @@ pub fn assemble_build_action(
         provisions,
         parent_in_flight,
         finalized_tx_count,
+        ready_signals,
+        beacon_witness_root,
+        beacon_witness_leaf_count,
     };
 
     BuildActionPlan {
