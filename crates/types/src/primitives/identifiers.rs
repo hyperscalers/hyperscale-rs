@@ -504,6 +504,53 @@ impl Display for LeafIndex {
     }
 }
 
+/// Strong Prefix Consensus view counter.
+///
+/// SPC drives one slot through a sequence of views. Each view runs an
+/// inner Prefix Consensus instance under a distinct domain context
+/// (`spc_ctx || view.to_le_bytes()`); a `(slot, view)` pair uniquely
+/// identifies the PC instance whose round-3 cert any embedded `PcQc3`
+/// belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, BasicSbor)]
+#[sbor(transparent)]
+pub struct SpcView(u32);
+
+impl SpcView {
+    /// Initial view (per the paper, the first SPC view is `1`).
+    pub const INITIAL: Self = Self(1);
+
+    /// Construct an SPC view from a raw `u32`.
+    #[must_use]
+    pub const fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    /// Inner `u32`. Use sparingly — at boundaries (display, BLS
+    /// signing-bytes construction, structured log fields) only.
+    #[must_use]
+    pub const fn inner(self) -> u32 {
+        self.0
+    }
+
+    /// Get the next view.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        Self(self.0 + 1)
+    }
+
+    /// Little-endian byte representation of the inner value.
+    #[must_use]
+    pub const fn to_le_bytes(self) -> [u8; 4] {
+        self.0.to_le_bytes()
+    }
+}
+
+impl Display for SpcView {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SpcView({})", self.0)
+    }
+}
+
 /// shard round / view number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, BasicSbor)]
 #[sbor(transparent)]

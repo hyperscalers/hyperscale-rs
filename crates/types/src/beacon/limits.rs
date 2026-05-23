@@ -32,3 +32,12 @@ pub const MAX_VOTE_VECTOR_LEN: usize = 1024;
 /// `v_in.len() + 1` (the empty-prefix slot through the full-length
 /// slot). Cap follows directly from [`MAX_VOTE_VECTOR_LEN`].
 pub const MAX_PREFIX_SIGS: usize = MAX_VOTE_VECTOR_LEN + 1;
+
+/// Cap on the `skip_sigs` vector inside an [`SpcCert::Indirect`](crate::SpcCert).
+///
+/// An indirect cert authorises view-entry via `f+1` empty-view
+/// attestations. `f+1 ≤ n`, and `n` is bounded by
+/// [`MAX_VALIDATORS`](crate::SignerBitfield) — sized identically here
+/// for the wire-decode bound. Consensus-layer validation pins the
+/// actual count against the committee size at the cert's slot.
+pub const MAX_SKIP_SIGS: usize = 4096;

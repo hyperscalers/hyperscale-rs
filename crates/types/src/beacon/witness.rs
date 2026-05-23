@@ -286,11 +286,11 @@ mod tests {
     }
 
     fn sample_pc_vote_equivocation() -> PcVoteEquivocation {
-        use crate::{Bls12381G2Signature, PcVector, PcVoteRound, Slot};
+        use crate::{Bls12381G2Signature, PcVector, PcVoteRound, Slot, SpcView};
         PcVoteEquivocation {
             validator: ValidatorId::new(5),
             slot: Slot::new(10),
-            view: 1,
+            view: SpcView::new(1),
             round: PcVoteRound::Vote1,
             value_a: PcVector::empty(),
             sig_a: Bls12381G2Signature([0xAA; 96]),

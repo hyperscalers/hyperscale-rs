@@ -16,7 +16,7 @@ use sbor::prelude::*;
 use crate::primitives::signer_bitfield::MAX_VALIDATORS;
 use crate::{
     Bls12381G2Signature, BoundedVec, MAX_PREFIX_SIGS, MAX_VOTE_VECTOR_LEN, SignerBitfield, Slot,
-    ValidatorId,
+    SpcView, ValidatorId,
 };
 
 // ── ValueElement and Vector ──────────────────────────────────────────────────
@@ -680,7 +680,7 @@ pub struct PcVoteEquivocation {
     /// Slot the inner Prefix Consensus instance belongs to.
     pub slot: Slot,
     /// SPC view at which the instance was running.
-    pub view: u32,
+    pub view: SpcView,
     /// Round of the inner Prefix Consensus at which the double-sign
     /// occurred — selects the BLS signing tag.
     pub round: PcVoteRound,
@@ -934,7 +934,7 @@ mod tests {
             let e = PcVoteEquivocation {
                 validator: ValidatorId::new(7),
                 slot: Slot::new(42),
-                view: 3,
+                view: SpcView::new(3),
                 round,
                 value_a: sample_vector(2),
                 sig_a: sample_sig(0x11),

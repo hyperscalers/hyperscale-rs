@@ -32,11 +32,13 @@ mod wave;
 
 pub use beacon::{
     BeaconBlock, BeaconBlockHeader, BeaconProposal, BeaconWitness, EquivocationEvidence,
-    JailReason, MAX_PREFIX_SIGS, MAX_VOTE_VECTOR_LEN, MAX_WITNESSES_PER_PROPOSER,
-    PC_VALUE_ELEMENT_BYTES, PcCompactLenSigner, PcCompactVote, PcDivergingProof, PcQc1, PcQc2,
-    PcQc3, PcValueElement, PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation, PcVoteRound,
-    PcXpProof, RecoveryCertificate, RecoveryEquivocation, RecoveryRequest, ShardWitness,
-    ShardWitnessPayload, ShardWitnessProof, Witness, recovery_cert_hash,
+    JailReason, MAX_PREFIX_SIGS, MAX_SKIP_SIGS, MAX_VOTE_VECTOR_LEN, MAX_WITNESSES_PER_PROPOSER,
+    MscEmptyLowAccusation, MscSlotProposal, PC_VALUE_ELEMENT_BYTES, PcCompactLenSigner,
+    PcCompactVote, PcDivergingProof, PcQc1, PcQc2, PcQc3, PcValueElement, PcVector, PcVote1,
+    PcVote2, PcVote3, PcVoteEquivocation, PcVoteRound, PcXpProof, RecoveryCertificate,
+    RecoveryEquivocation, RecoveryRequest, ShardWitness, ShardWitnessPayload, ShardWitnessProof,
+    SpcCert, SpcEmptyLowEvidence, SpcEmptyViewMsg, SpcHighTriple, SpcProposalObject, SpcSkipSig,
+    Witness, recovery_cert_hash,
 };
 pub use crypto::batch_verify::{
     batch_verify_bls_different_messages, batch_verify_bls_different_messages_all_or_nothing,
@@ -62,8 +64,8 @@ pub use primitives::hash_kinds::{
 };
 pub use primitives::identifiers::{
     Attempt, BlockHeight, ChainId, Epoch, HeaderFetchCount, InFlightCount, LeafIndex, NodeId,
-    PartitionNumber, RecoveryRound, Round, ShardGroupId, Slot, Stake, StakePoolId, ValidatorId,
-    VotePower,
+    PartitionNumber, RecoveryRound, Round, ShardGroupId, Slot, SpcView, Stake, StakePoolId,
+    ValidatorId, VotePower,
 };
 pub use primitives::merkle::{
     compute_merkle_root, compute_merkle_root_with_proof, verify_merkle_inclusion,
