@@ -24,6 +24,7 @@
 //! | `HYPERSCALE_PC_EMPTY_VIEW_v1` | SPC empty-view skip statement |
 //! | `HYPERSCALE_PC_VRF_v1` | Beacon VRF reveal (per-slot randomness contribution) |
 //! | `HYPERSCALE_BEACON_BLOCK_HEADER_v1` | Slot-committee sig over a beacon block header |
+//! | `HYPERSCALE_RECOVERY_REQUEST_v1` | Recovery request + aggregated recovery cert sig |
 //!
 //! # Usage
 //!
@@ -33,6 +34,7 @@
 
 mod beacon_block;
 mod beacon_pc;
+mod beacon_recovery;
 mod beacon_vrf;
 mod execution;
 mod provisions;
@@ -45,6 +47,7 @@ pub use beacon_pc::{
     DOMAIN_PC_EMPTY_VIEW, DOMAIN_PC_VOTE1, DOMAIN_PC_VOTE2, DOMAIN_PC_VOTE2_LENGTH,
     DOMAIN_PC_VOTE3, pc_context, pc_vote_signing_message, spc_context,
 };
+pub use beacon_recovery::{DOMAIN_RECOVERY_REQUEST, recovery_request_message};
 pub use beacon_vrf::{DOMAIN_PC_VRF, vrf_reveal_message};
 pub use execution::{
     DOMAIN_EXEC_CERT_BATCH, DOMAIN_EXEC_VOTE, DOMAIN_EXEC_VOTE_BATCH, exec_cert_batch_message,

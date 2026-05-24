@@ -110,11 +110,12 @@ pub use signing::{
     DOMAIN_COMMITTED_BLOCK_HEADER, DOMAIN_EXEC_CERT_BATCH, DOMAIN_EXEC_VOTE,
     DOMAIN_EXEC_VOTE_BATCH, DOMAIN_PC_EMPTY_VIEW, DOMAIN_PC_VOTE1, DOMAIN_PC_VOTE2,
     DOMAIN_PC_VOTE2_LENGTH, DOMAIN_PC_VOTE3, DOMAIN_PC_VRF, DOMAIN_READY_SIGNAL,
-    DOMAIN_STATE_PROVISION_BATCH, DOMAIN_VALIDATOR_BIND, VALIDATOR_BIND_NONCE_LEN,
-    beacon_block_header_message, block_header_message, block_vote_message,
-    committed_block_header_message, exec_cert_batch_message, exec_vote_batch_message,
-    exec_vote_message, pc_context, pc_vote_signing_message, ready_signal_message, spc_context,
-    state_provisions_message, validator_bind_message, vrf_reveal_message,
+    DOMAIN_RECOVERY_REQUEST, DOMAIN_STATE_PROVISION_BATCH, DOMAIN_VALIDATOR_BIND,
+    VALIDATOR_BIND_NONCE_LEN, beacon_block_header_message, block_header_message,
+    block_vote_message, committed_block_header_message, exec_cert_batch_message,
+    exec_vote_batch_message, exec_vote_message, pc_context, pc_vote_signing_message,
+    ready_signal_message, recovery_request_message, spc_context, state_provisions_message,
+    validator_bind_message, vrf_reveal_message,
 };
 pub use time::limits::{MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH};
 pub use time::range::{MAX_VALIDITY_RANGE, TimestampRange};
