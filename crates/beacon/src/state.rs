@@ -28,7 +28,10 @@ use hyperscale_types::{
     VrfOutput, vrf_verify,
 };
 
-use crate::constants::{JAIL_COOLDOWN_EPOCHS, MIN_STAKE_FLOOR, POOL_BUFFER_TARGET, SHARD_CAPACITY};
+use crate::constants::{
+    JAIL_COOLDOWN_EPOCHS, MIN_STAKE_FLOOR, MISSED_PROPOSAL_JAIL_THRESHOLD, POOL_BUFFER_TARGET,
+    SHARD_CAPACITY,
+};
 use crate::sampling::draw_from_pool;
 
 /// Domain tag for the beacon-randomness mixer. Binds the BLAKE3 input
@@ -711,26 +714,15 @@ fn filter_and_roll_randomness<'a>(
     }
     state.randomness = Randomness(*h.finalize().as_bytes());
 
-    // Cascade jail for rejected proposers currently `OnShard`. Removed
-    // from the shard committee; freed slot refills via `pool_draw`.
+    // Cascade jail for rejected proposers currently `OnShard`.
     let mut jailed = Vec::new();
+    let since_epoch = state.current_epoch;
     for party in &rejected_reveals {
         let prior_status = state.validators.get(party).map(|r| r.status);
         let Some(ValidatorStatus::OnShard { shard, .. }) = prior_status else {
             continue;
         };
-        state
-            .validators
-            .get_mut(party)
-            .expect("just matched on Some")
-            .status = ValidatorStatus::Jailed {
-            since_epoch: state.current_epoch,
-            reason: JailReason::Performance,
-        };
-        if let Some(committee) = state.shard_committees.get_mut(&shard) {
-            committee.members.retain(|v| v != party);
-        }
-        pool_draw(state, shard);
+        jail_for_performance(state, *party, shard, since_epoch);
         jailed.push(*party);
     }
 
@@ -739,6 +731,43 @@ fn filter_and_roll_randomness<'a>(
         rejected_reveals,
         jailed,
     }
+}
+
+/// Transition an `OnShard` `victim` to `Jailed { Performance,
+/// since_epoch }`, removing them from `shard`'s committee, drawing a
+/// refill from the global pool, and clearing any per-validator state
+/// scoped to their old `OnShard` placement (currently
+/// [`BeaconState::miss_counters`]).
+///
+/// Caller must have already established that the validator is
+/// currently `OnShard { shard, .. }` — that invariant is what makes
+/// the cascade meaningful (no shard committee membership to remove
+/// from otherwise, no freed slot to refill).
+///
+/// # Panics
+///
+/// Panics if `victim` is absent from `state.validators` — the caller
+/// has just read a `prior_status` for it, so absence here is a
+/// structural inconsistency.
+fn jail_for_performance(
+    state: &mut BeaconState,
+    victim: ValidatorId,
+    shard: ShardGroupId,
+    since_epoch: Epoch,
+) {
+    state
+        .validators
+        .get_mut(&victim)
+        .expect("caller has just read victim's status; record must be present")
+        .status = ValidatorStatus::Jailed {
+        since_epoch,
+        reason: JailReason::Performance,
+    };
+    if let Some(committee) = state.shard_committees.get_mut(&shard) {
+        committee.members.retain(|v| *v != victim);
+    }
+    pool_draw(state, shard);
+    state.miss_counters.remove(&victim);
 }
 
 // ─── witness ingestion ────────────────────────────────────────────────────
@@ -847,7 +876,7 @@ fn ingest_witnesses(
         if sw.proof.leaf_index.inner() != watermark.inner() + 1 {
             continue;
         }
-        match apply_shard_payload(state, &sw.payload) {
+        match apply_shard_payload(state, sw.proof.shard_id, &sw.payload) {
             Some(ShardEvent::Registered(id)) => outcome.registered.push(id),
             Some(ShardEvent::Deactivated(id)) => outcome.deactivated.push(id),
             Some(ShardEvent::Jailed(id)) => outcome.jailed.push(id),
@@ -870,9 +899,17 @@ fn ingest_witnesses(
 /// that change validator status return the corresponding
 /// [`ShardEvent`] for [`ingest_witnesses`] to route into
 /// [`WitnessOutcome`].
+///
+/// `source_shard` is the shard that emitted the witness (carried in
+/// the wrapping [`ShardWitnessProof`](hyperscale_types::ShardWitnessProof)).
+/// Most variants ignore it; `MissedProposal` uses it to scope the
+/// miss-counter increment to the witness's source committee — a
+/// `MissedProposal` from shard S only counts against validators
+/// currently `OnShard { shard: S, .. }`.
 #[allow(clippy::too_many_lines)] // single dispatch over ShardWitnessPayload variants
 fn apply_shard_payload(
     state: &mut BeaconState,
+    source_shard: ShardGroupId,
     payload: &ShardWitnessPayload,
 ) -> Option<ShardEvent> {
     match payload {
@@ -1034,8 +1071,35 @@ fn apply_shard_payload(
                 None
             }
         }
-        ShardWitnessPayload::MissedProposal { .. } => {
-            todo!("ShardWitnessPayload::MissedProposal not yet implemented")
+        ShardWitnessPayload::MissedProposal { proposer_id, .. } => {
+            // Shard-binding filter: only count the miss if the named
+            // proposer is currently on the *witness's source shard*.
+            // Misses from any other shard against this validator —
+            // including stale misses after rotation — are silently
+            // dropped. Bounds the threat surface to byzantine
+            // majorities on the validator's own shard, which already
+            // breaks safety locally.
+            let rec = state.validators.get(proposer_id)?;
+            let ValidatorStatus::OnShard {
+                shard: placement_shard,
+                ..
+            } = rec.status
+            else {
+                return None;
+            };
+            if placement_shard != source_shard {
+                return None;
+            }
+            let count = state.miss_counters.entry(*proposer_id).or_insert(0);
+            *count += 1;
+            if *count < MISSED_PROPOSAL_JAIL_THRESHOLD {
+                return None;
+            }
+            // Threshold crossed: jail under Performance and cascade.
+            // `jail_for_performance` clears `miss_counters[proposer]`
+            // as part of the OnShard transition cleanup.
+            jail_for_performance(state, *proposer_id, placement_shard, state.current_epoch);
+            Some(ShardEvent::Jailed(*proposer_id))
         }
     }
 }
@@ -1059,6 +1123,9 @@ fn deactivate_to_insufficient_stake(state: &mut BeaconState, victim_id: Validato
         }
         pool_draw(state, shard);
     }
+    // Miss counters are scoped to the validator's current `OnShard`
+    // placement; any transition out clears them.
+    state.miss_counters.remove(&victim_id);
 }
 
 #[cfg(test)]
@@ -2549,5 +2616,238 @@ mod tests {
             state.validators.get(&ValidatorId::new(5)).unwrap().status,
             ValidatorStatus::Pooled,
         );
+    }
+
+    // ─── MissedProposal ──────────────────────────────────────────────────
+
+    use hyperscale_types::{BlockHeight, Round};
+
+    fn missed_proposal_witness(
+        source_shard: u64,
+        leaf_index: u64,
+        proposer_id: ValidatorId,
+    ) -> Witness {
+        shard_witness(
+            source_shard,
+            leaf_index,
+            ShardWitnessPayload::MissedProposal {
+                proposer_id,
+                height: BlockHeight::GENESIS,
+                round: Round::INITIAL,
+            },
+        )
+    }
+
+    /// A `MissedProposal` from shard S against a validator currently
+    /// `OnShard { shard: S, .. }` increments their miss counter. Below
+    /// threshold, no jail effect.
+    #[test]
+    fn missed_proposal_increments_counter_for_on_shard_proposer() {
+        let mut state = single_pool_state(4);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        let target = ValidatorId::new(1);
+
+        let w = missed_proposal_witness(0, 1, target);
+        let committed = vec![(
+            ValidatorId::new(0),
+            vrf_proposal_with_witnesses(0, Slot::new(1), vec![w]),
+        )];
+        let effects = apply_slot(&mut state, &net(), Slot::new(1), &committed);
+
+        assert!(effects.jailed.is_empty());
+        assert_eq!(state.miss_counters.get(&target), Some(&1));
+        // Status unchanged — still OnShard.
+        assert!(matches!(
+            state.validators.get(&target).unwrap().status,
+            ValidatorStatus::OnShard { .. },
+        ));
+    }
+
+    /// A `MissedProposal` from shard B against a validator currently
+    /// on shard A is silently dropped — the witness's source shard
+    /// doesn't match the validator's placement.
+    #[test]
+    fn missed_proposal_from_wrong_shard_is_dropped() {
+        let mut state = single_pool_state(4);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        // Add shard 1 with one validator on it.
+        let target = ValidatorId::new(10);
+        let pool_id = StakePoolId::new(0);
+        state.pools.get_mut(&pool_id).unwrap().total_stake =
+            Stake::from_attos(5 * MIN_STAKE_FLOOR.attos());
+        state
+            .pools
+            .get_mut(&pool_id)
+            .unwrap()
+            .validators
+            .insert(target);
+        state.validators.insert(
+            target,
+            validator_record(
+                10,
+                0,
+                ValidatorStatus::OnShard {
+                    shard: ShardGroupId::new(1),
+                    ready: true,
+                    placed_at_epoch: Epoch::GENESIS,
+                },
+            ),
+        );
+        state.shard_committees.insert(
+            ShardGroupId::new(1),
+            ShardCommittee {
+                members: vec![target],
+            },
+        );
+
+        // Witness emitted by shard 0, targeting validator on shard 1.
+        let w = missed_proposal_witness(0, 1, target);
+        let committed = vec![(
+            ValidatorId::new(0),
+            vrf_proposal_with_witnesses(0, Slot::new(1), vec![w]),
+        )];
+        let effects = apply_slot(&mut state, &net(), Slot::new(1), &committed);
+
+        assert!(effects.jailed.is_empty());
+        assert!(!state.miss_counters.contains_key(&target));
+    }
+
+    /// A `MissedProposal` against a validator not currently `OnShard`
+    /// (`Pooled`, `Jailed`, `InsufficientStake`) is silently dropped.
+    #[test]
+    fn missed_proposal_against_non_on_shard_validator_is_dropped() {
+        let mut state = single_pool_state(4);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        let target = ValidatorId::new(10);
+        state
+            .validators
+            .insert(target, validator_record(10, 0, ValidatorStatus::Pooled));
+
+        let w = missed_proposal_witness(0, 1, target);
+        let committed = vec![(
+            ValidatorId::new(0),
+            vrf_proposal_with_witnesses(0, Slot::new(1), vec![w]),
+        )];
+        let effects = apply_slot(&mut state, &net(), Slot::new(1), &committed);
+
+        assert!(effects.jailed.is_empty());
+        assert!(!state.miss_counters.contains_key(&target));
+    }
+
+    /// One `MissedProposal` per witness — multiple in a single slot
+    /// against the same validator accumulate. Below threshold, no
+    /// jail.
+    #[test]
+    fn multiple_missed_proposals_in_one_slot_accumulate() {
+        let mut state = single_pool_state(4);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        let target = ValidatorId::new(1);
+
+        // Three distinct misses at leaf indices 1..3.
+        let ws: Vec<Witness> = (1u64..=3)
+            .map(|leaf| missed_proposal_witness(0, leaf, target))
+            .collect();
+        let committed = vec![(
+            ValidatorId::new(0),
+            vrf_proposal_with_witnesses(0, Slot::new(1), ws),
+        )];
+        let effects = apply_slot(&mut state, &net(), Slot::new(1), &committed);
+
+        assert!(effects.jailed.is_empty());
+        assert_eq!(state.miss_counters.get(&target), Some(&3));
+    }
+
+    /// Crossing `MISSED_PROPOSAL_JAIL_THRESHOLD` jails the validator
+    /// under `Performance`, cascades the committee removal +
+    /// `pool_draw` refill, and clears the miss counter.
+    #[test]
+    fn missed_proposal_at_threshold_jails_and_clears_counter() {
+        let mut state = single_pool_state(4);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        let pool_id = StakePoolId::new(0);
+        // Add a 5th validator in the pool to fuel the refill draw.
+        state.pools.get_mut(&pool_id).unwrap().total_stake =
+            Stake::from_attos(5 * MIN_STAKE_FLOOR.attos());
+        state
+            .pools
+            .get_mut(&pool_id)
+            .unwrap()
+            .validators
+            .insert(ValidatorId::new(4));
+        state.validators.insert(
+            ValidatorId::new(4),
+            validator_record(4, 0, ValidatorStatus::Pooled),
+        );
+
+        let target = ValidatorId::new(1);
+        // Pre-seed counter to threshold - 1 so a single witness
+        // crosses the boundary.
+        state
+            .miss_counters
+            .insert(target, MISSED_PROPOSAL_JAIL_THRESHOLD - 1);
+
+        let w = missed_proposal_witness(0, 1, target);
+        let committed = vec![(
+            ValidatorId::new(0),
+            vrf_proposal_with_witnesses(0, Slot::new(1), vec![w]),
+        )];
+        let effects = apply_slot(&mut state, &net(), Slot::new(1), &committed);
+
+        assert_eq!(effects.jailed, vec![target]);
+        // Jailed under Performance at current_epoch.
+        assert_eq!(
+            state.validators.get(&target).unwrap().status,
+            ValidatorStatus::Jailed {
+                since_epoch: Epoch::GENESIS,
+                reason: JailReason::Performance,
+            },
+        );
+        // Counter cleared.
+        assert!(!state.miss_counters.contains_key(&target));
+        // Shard committee refilled from pool.
+        let members = &state.shard_committees[&ShardGroupId::new(0)].members;
+        assert_eq!(members.len(), 4);
+        assert!(!members.contains(&target));
+        assert!(members.contains(&ValidatorId::new(4)));
+    }
+
+    /// VRF jail cascade also clears the miss counter — pinning the
+    /// "any out-of-OnShard transition clears `miss_counters`" contract.
+    #[test]
+    fn vrf_jail_cascade_clears_miss_counter() {
+        let mut state = single_pool_state(4);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        // Pre-seed a non-zero miss counter for validator 0.
+        state.miss_counters.insert(ValidatorId::new(0), 7);
+
+        let committed = vec![(ValidatorId::new(0), malformed_vrf_proposal(0, Slot::new(1)))];
+        apply_slot(&mut state, &net(), Slot::new(1), &committed);
+
+        // Validator 0 jailed via VRF; counter must be cleared.
+        assert!(!state.miss_counters.contains_key(&ValidatorId::new(0)));
+    }
+
+    /// `DeactivateValidator` cascade also clears the miss counter for
+    /// the deactivated `OnShard` validator.
+    #[test]
+    fn deactivate_cascade_clears_miss_counter() {
+        let mut state = single_pool_state(4);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        state.miss_counters.insert(ValidatorId::new(0), 5);
+
+        let w = shard_witness(
+            0,
+            1,
+            ShardWitnessPayload::DeactivateValidator {
+                validator_id: ValidatorId::new(0),
+            },
+        );
+        let committed = vec![(
+            ValidatorId::new(0),
+            vrf_proposal_with_witnesses(0, Slot::new(1), vec![w]),
+        )];
+        apply_slot(&mut state, &net(), Slot::new(1), &committed);
+
+        assert!(!state.miss_counters.contains_key(&ValidatorId::new(0)));
     }
 }
