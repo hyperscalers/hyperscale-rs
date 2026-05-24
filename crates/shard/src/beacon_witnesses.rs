@@ -309,7 +309,7 @@ mod tests {
     fn deposit(amount: u64) -> ShardWitnessPayload {
         ShardWitnessPayload::StakeDeposit {
             pool_id: pool_id(),
-            amount: Stake::new(amount),
+            amount: Stake::from_whole_tokens(amount),
         }
     }
 

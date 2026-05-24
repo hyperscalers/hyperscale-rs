@@ -315,7 +315,7 @@ mod tests {
         ShardWitness {
             payload: ShardWitnessPayload::StakeDeposit {
                 pool_id: StakePoolId::new(1),
-                amount: Stake::new(1_000_000),
+                amount: Stake::from_whole_tokens(1_000_000),
             },
             proof: ShardWitnessProof {
                 shard_id: ShardGroupId::new(0),
@@ -332,11 +332,11 @@ mod tests {
         let payloads = vec![
             ShardWitnessPayload::StakeDeposit {
                 pool_id: StakePoolId::new(1),
-                amount: Stake::new(100),
+                amount: Stake::from_whole_tokens(100),
             },
             ShardWitnessPayload::StakeWithdraw {
                 pool_id: StakePoolId::new(2),
-                amount: Stake::new(50),
+                amount: Stake::from_whole_tokens(50),
             },
             ShardWitnessPayload::RegisterValidator {
                 pool_id: StakePoolId::new(3),
@@ -387,11 +387,11 @@ mod tests {
         let events = vec![
             BeaconWitnessEvent::StakeDeposit {
                 pool_id: StakePoolId::new(1),
-                amount: Stake::new(100),
+                amount: Stake::from_whole_tokens(100),
             },
             BeaconWitnessEvent::StakeWithdraw {
                 pool_id: StakePoolId::new(2),
-                amount: Stake::new(50),
+                amount: Stake::from_whole_tokens(50),
             },
             BeaconWitnessEvent::RegisterValidator {
                 pool_id: StakePoolId::new(3),
@@ -419,21 +419,21 @@ mod tests {
             (
                 BeaconWitnessEvent::StakeDeposit {
                     pool_id: StakePoolId::new(1),
-                    amount: Stake::new(100),
+                    amount: Stake::from_whole_tokens(100),
                 },
                 ShardWitnessPayload::StakeDeposit {
                     pool_id: StakePoolId::new(1),
-                    amount: Stake::new(100),
+                    amount: Stake::from_whole_tokens(100),
                 },
             ),
             (
                 BeaconWitnessEvent::StakeWithdraw {
                     pool_id: StakePoolId::new(2),
-                    amount: Stake::new(50),
+                    amount: Stake::from_whole_tokens(50),
                 },
                 ShardWitnessPayload::StakeWithdraw {
                     pool_id: StakePoolId::new(2),
-                    amount: Stake::new(50),
+                    amount: Stake::from_whole_tokens(50),
                 },
             ),
             (

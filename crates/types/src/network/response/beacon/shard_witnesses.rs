@@ -72,7 +72,7 @@ mod tests {
         Arc::new(ShardWitness {
             payload: ShardWitnessPayload::StakeDeposit {
                 pool_id: StakePoolId::new(1),
-                amount: Stake::new(1_000),
+                amount: Stake::from_whole_tokens(1_000),
             },
             proof: ShardWitnessProof {
                 shard_id: ShardGroupId::new(2),

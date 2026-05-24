@@ -381,25 +381,48 @@ impl Display for RecoveryRound {
 /// live in the staking contract on the shard layer; the beacon tracks
 /// per-pool aggregate `Stake` deltas via `ShardWitnessPayload::StakeDeposit`
 /// / `StakeWithdraw`.
+///
+/// Denominated in **attos** (10⁻¹⁸ whole tokens) for lossless interop
+/// with Radix's [`Decimal`](https://docs.rs/radix-common). `u128` gives
+/// ~3.4 × 10²⁰ whole tokens of headroom — vastly more than any realistic
+/// supply, so arithmetic doesn't need to be defensive against overflow
+/// at protocol-reasonable values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, BasicSbor)]
 #[sbor(transparent)]
-pub struct Stake(u64);
+pub struct Stake(u128);
 
 impl Stake {
+    /// Whole tokens per atto — the unit shift factor `10^18`. Matches
+    /// Radix `Decimal`'s 18-decimal scale.
+    pub const ATTOS_PER_WHOLE: u128 = 1_000_000_000_000_000_000;
+
     /// Zero stake.
     pub const ZERO: Self = Self(0);
 
-    /// Construct a stake amount from a raw `u64`.
+    /// Construct from a raw atto count. The canonical primary
+    /// constructor — sites that hold a Radix-derived atto value pass it
+    /// straight through, no rounding policy needed.
     #[must_use]
-    pub const fn new(value: u64) -> Self {
-        Self(value)
+    pub const fn from_attos(attos: u128) -> Self {
+        Self(attos)
     }
 
-    /// Inner `u64`. Use sparingly — at boundaries (display, threshold
-    /// arithmetic that needs `u128` widening, structured log fields)
-    /// only.
+    /// Construct from a whole-token count.
+    ///
+    /// `n * ATTOS_PER_WHOLE` always fits in `u128` for any `u64` input
+    /// (`u64::MAX * 10^18` is ~1.8 × 10³⁷, well below `u128::MAX` of
+    /// ~3.4 × 10³⁸), so the multiplication is overflow-safe by
+    /// construction.
     #[must_use]
-    pub const fn inner(self) -> u64 {
+    pub const fn from_whole_tokens(n: u64) -> Self {
+        Self((n as u128) * Self::ATTOS_PER_WHOLE)
+    }
+
+    /// Inner atto count. Use at boundaries (display, threshold
+    /// arithmetic, Radix-side conversion via
+    /// `Decimal::from_attos`) only.
+    #[must_use]
+    pub const fn attos(self) -> u128 {
         self.0
     }
 }

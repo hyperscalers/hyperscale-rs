@@ -44,7 +44,7 @@ pub const SHARD_CAPACITY: usize = 4;
 /// must hold at least this much stake per active node to support it.
 /// The dynamic per-node minimum clamps up to this floor as a
 /// Sybil-resistance backstop.
-pub const MIN_STAKE_FLOOR: Stake = Stake::new(1_000_000);
+pub const MIN_STAKE_FLOOR: Stake = Stake::from_whole_tokens(1_000_000);
 
 /// Target buffer of unplaced (`Pooled`) validators in the global pool.
 ///
@@ -88,13 +88,23 @@ pub const UNBONDING_WINDOW_EPOCHS: u64 = 32;
 
 // ─── Economics ─────────────────────────────────────────────────────────────
 
+/// Target annual emission envelope in whole tokens.
+pub const TOKENS_PER_YEAR_TARGET: u64 = 300_000_000;
+
+/// Epochs per year at the target epoch cadence.
+///
+/// `(60 / 5) * 24 * 365` at 5-minute epochs
+/// ([`EPOCH_DURATION`](hyperscale_types::EPOCH_DURATION)). Maintainers
+/// who change `EPOCH_DURATION` must update this number too.
+pub const EPOCHS_PER_YEAR: u64 = (60 / 5) * 24 * 365;
+
 /// Per-epoch tokens credited to active stake pools, split pro-rata
 /// across pools by their count of `OnShard { ready: true }` validators.
 ///
-/// Sized for ~300M tokens/year at the target epoch cadence:
-/// `(60 / 5) * 24 * 365 = 105,120` epochs/year at 5-minute epochs, so
-/// `2853 * 105_120 = 299,907,360` ≈ 300M (within 0.03%). The annual
-/// envelope is a sizing target, not a hard cap — per-epoch rounding
-/// remainders are burned, and epochs with zero ready validators mint
-/// nothing.
-pub const EMISSIONS_PER_EPOCH: Stake = Stake::new(2853);
+/// Computed as `TOKENS_PER_YEAR_TARGET / EPOCHS_PER_YEAR` in attos, so
+/// the annual sum equals the target modulo per-epoch attos rounding
+/// (remainder of ≈ 10⁻¹⁴ tokens/year, well below any display
+/// precision). Epochs with zero ready validators mint nothing.
+pub const EMISSIONS_PER_EPOCH: Stake = Stake::from_attos(
+    (TOKENS_PER_YEAR_TARGET as u128) * Stake::ATTOS_PER_WHOLE / (EPOCHS_PER_YEAR as u128),
+);
