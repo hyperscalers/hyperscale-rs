@@ -39,12 +39,14 @@ use std::time::Duration;
 use blake3::Hasher;
 use hyperscale_types::{
     Bls12381G1PrivateKey, Bls12381G1PublicKey, MscEmptyLowAccusation, MscSlotProposal,
-    NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PcValueElement, PcVector, Slot, SpcEmptyLowEvidence,
-    SpcView, ValidatorId, spc_context,
+    NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PcValueElement, PcVector, PcVoteEquivocation, Slot,
+    SpcEmptyLowEvidence, SpcView, ValidatorId, spc_context,
 };
 use sbor::basic_encode;
 
-use crate::spc::{SpcInstance, rank_shift_for_view, verify_empty_low_evidence};
+use crate::spc::{
+    SpcEffect, SpcEvent, SpcInstance, SpcMessage, rank_shift_for_view, verify_empty_low_evidence,
+};
 
 /// Largest gap between a peer's claimed `slot` and our current slot
 /// for which we still buffer the proposal. Beyond this we drop —
@@ -201,6 +203,14 @@ pub enum MscEffect {
         /// SPC views and bundled into this proposal.
         accusations: Vec<MscEmptyLowAccusation>,
     },
+    /// Broadcast an inner-SPC message, tagged with the slot it belongs
+    /// to so peers route it to the right `SpcInstance`.
+    BroadcastSpcMsg {
+        /// Slot whose SPC instance produced this message.
+        slot: Slot,
+        /// The wire-form SPC message.
+        msg: Box<SpcMessage>,
+    },
     /// Schedule a timer. The parent (coordinator) fires
     /// [`MscEvent::TimerExpired`] when it elapses.
     SetTimer {
@@ -209,6 +219,27 @@ pub enum MscEffect {
         id: MscTimerId,
         /// How long to wait before firing.
         duration: Duration,
+    },
+    /// A slot's high output committed. `included` lists the preimages
+    /// of every non-bottom entry in rank order — the slot's agreed
+    /// output set `b_i,s^out`.
+    SlotCommitted {
+        /// Committed slot.
+        slot: Slot,
+        /// `(sender, content)` pairs in rank order, skipping bottom
+        /// slots.
+        included: Vec<(ValidatorId, PcVector)>,
+    },
+    /// Pass-through of an inner-PC equivocation surfaced by SPC.
+    /// Tagged with `(slot, view)` so a downstream verifier can
+    /// rebuild the inner PC context.
+    Equivocation {
+        /// Slot whose SPC instance routed this equivocation.
+        slot: Slot,
+        /// SPC view within that slot.
+        view: SpcView,
+        /// Slim wire-form evidence of the double-sign.
+        evidence: Box<PcVoteEquivocation>,
     },
 }
 
@@ -230,6 +261,16 @@ pub enum MscEvent {
         content: PcVector,
         /// Empty-low accusations attached to this proposal.
         accusations: Vec<MscEmptyLowAccusation>,
+    },
+    /// Inner-SPC message from a peer, tagged with the slot it belongs
+    /// to.
+    SpcMsg {
+        /// Transport-level sender id.
+        from: ValidatorId,
+        /// Slot whose SPC instance owns this message.
+        slot: Slot,
+        /// The wire-form SPC message.
+        msg: Box<SpcMessage>,
     },
     /// Timer expiry — slot proposal-collection deadline or SPC view
     /// timer.
@@ -387,9 +428,162 @@ impl MscInstance {
                 content,
                 accusations,
             } => self.on_proposal(from, slot, content, accusations),
-            // SPC routing + timer firing land in B.4.3.c / B.4.3.d.
-            MscEvent::TimerExpired { id: _ } => vec![],
+            MscEvent::SpcMsg { from, slot, msg } => self.on_spc_msg(from, slot, *msg),
+            MscEvent::TimerExpired { id } => self.on_timer_expired(id),
         }
+    }
+
+    fn on_spc_msg(&mut self, from: ValidatorId, slot: Slot, msg: SpcMessage) -> Vec<MscEffect> {
+        let Some(slot_state) = self.slots.get_mut(&slot) else {
+            return vec![];
+        };
+        let event = msg.into_event(from);
+        let spc_effects = slot_state.spc.handle(event);
+        self.translate_spc_effects(slot, spc_effects)
+    }
+
+    fn on_timer_expired(&mut self, id: MscTimerId) -> Vec<MscEffect> {
+        match id {
+            // Slot timer: B.4.3.d adds proposal-collection-deadline
+            // handling (forces SPC input with whatever's buffered).
+            MscTimerId::Slot(_) => vec![],
+            MscTimerId::View { slot, view } => {
+                let Some(slot_state) = self.slots.get_mut(&slot) else {
+                    return vec![];
+                };
+                let spc_effects = slot_state.spc.handle(SpcEvent::TimerExpired { view });
+                self.translate_spc_effects(slot, spc_effects)
+            }
+        }
+    }
+
+    /// Lift the effects produced by a slot's [`SpcInstance`] into
+    /// MSC's effect surface. Broadcast effects get slot-tagged into
+    /// [`MscEffect::BroadcastSpcMsg`]; the terminal `OutputHigh`
+    /// triggers the slot commit walk.
+    fn translate_spc_effects(&mut self, slot: Slot, spc_effects: Vec<SpcEffect>) -> Vec<MscEffect> {
+        let mut out = vec![];
+        for effect in spc_effects {
+            match effect {
+                SpcEffect::BroadcastVpcMsg(payload) => {
+                    out.push(MscEffect::BroadcastSpcMsg {
+                        slot,
+                        msg: Box::new(SpcMessage::VpcMsg(payload)),
+                    });
+                }
+                SpcEffect::BroadcastNewView { view, cert } => {
+                    out.push(MscEffect::BroadcastSpcMsg {
+                        slot,
+                        msg: Box::new(SpcMessage::NewView { view, cert }),
+                    });
+                }
+                SpcEffect::BroadcastNewCommit { view, value, proof } => {
+                    out.push(MscEffect::BroadcastSpcMsg {
+                        slot,
+                        msg: Box::new(SpcMessage::NewCommit { view, value, proof }),
+                    });
+                }
+                SpcEffect::BroadcastEmptyView(msg) => {
+                    out.push(MscEffect::BroadcastSpcMsg {
+                        slot,
+                        msg: Box::new(SpcMessage::EmptyView(msg)),
+                    });
+                }
+                SpcEffect::SetTimer { view, duration } => {
+                    out.push(MscEffect::SetTimer {
+                        id: MscTimerId::View { slot, view },
+                        duration,
+                    });
+                }
+                SpcEffect::EmptyLowEvidence(evidence) => {
+                    // Slot-tag and queue for the next slot's outgoing
+                    // proposal.
+                    self.pending_accusations.push(MscEmptyLowAccusation {
+                        slot,
+                        view: evidence.view,
+                        proof: evidence.proof,
+                    });
+                }
+                SpcEffect::Equivocation { view, evidence } => {
+                    out.push(MscEffect::Equivocation {
+                        slot,
+                        view,
+                        evidence,
+                    });
+                }
+                SpcEffect::OutputHigh(high) => {
+                    out.extend(self.commit_slot(slot, &high));
+                }
+            }
+        }
+        out
+    }
+
+    /// Resolve each non-bottom hash in `high` against
+    /// `proposals_by_hash` and emit [`MscEffect::SlotCommitted`] with
+    /// the included `(sender, content)` pairs in rank order.
+    fn commit_slot(&mut self, slot: Slot, high: &PcVector) -> Vec<MscEffect> {
+        let Some(slot_state) = self.slots.get_mut(&slot) else {
+            return vec![];
+        };
+        if slot_state.output_emitted {
+            return vec![];
+        }
+        slot_state.committed_high = Some(high.clone());
+        slot_state.output_emitted = true;
+
+        let mut included = Vec::new();
+        for entry in high.iter() {
+            if *entry == HASH_BOTTOM {
+                continue;
+            }
+            if let Some((signer, prop)) = self.proposals_by_hash.get(entry) {
+                included.push((*signer, prop.content.clone()));
+            }
+        }
+        vec![MscEffect::SlotCommitted { slot, included }]
+    }
+
+    /// Try to feed the slot's SPC instance its input vector. Fires
+    /// only when the slot has all `n` proposals buffered and the SPC
+    /// hasn't already been fed. Returns the resulting SPC-effect-
+    /// translated `MscEffect`s.
+    fn try_feed_slot_input(&mut self, slot: Slot) -> Vec<MscEffect> {
+        let Some(slot_state) = self.slots.get_mut(&slot) else {
+            return vec![];
+        };
+        if slot_state.spc_input_fed {
+            return vec![];
+        }
+        let n = self.committee.len();
+        if slot_state.proposals.len() < n {
+            return vec![];
+        }
+        slot_state.spc_input_fed = true;
+        let input = self.compute_slot_input(slot);
+        let Some(slot_state) = self.slots.get_mut(&slot) else {
+            return vec![];
+        };
+        let spc_effects = slot_state.spc.handle(SpcEvent::Input(input));
+        self.translate_spc_effects(slot, spc_effects)
+    }
+
+    /// Compute the SPC input vector for `slot`: each rank position
+    /// holds either the hash of the proposal from that validator, or
+    /// [`HASH_BOTTOM`] if no proposal arrived.
+    fn compute_slot_input(&self, slot: Slot) -> PcVector {
+        let slot_state = self.slots.get(&slot).expect("slot present");
+        let elements: Vec<PcValueElement> = slot_state
+            .rank
+            .iter()
+            .map(|p| {
+                slot_state
+                    .proposals
+                    .get(p)
+                    .map_or(HASH_BOTTOM, hash_proposal_msc)
+            })
+            .collect();
+        PcVector::new(elements)
     }
 
     fn on_input(&mut self, v: PcVector) -> Vec<MscEffect> {
@@ -586,7 +780,10 @@ impl MscInstance {
                 slot_state.accusations.push(acc);
             }
         }
-        vec![]
+
+        // If we now have all `n` proposals for this slot, kick the
+        // inner SPC. (Timer-driven partial-buffer flush lands later.)
+        self.try_feed_slot_input(slot)
     }
 }
 

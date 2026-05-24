@@ -712,6 +712,58 @@ pub enum SpcEvent {
     },
 }
 
+/// Wire-form SPC message — the sender-implicit shape that rides
+/// between participants.
+///
+/// Distinct from [`SpcEvent`] (the FSM input form, which carries
+/// `from` for [`Self::NewView`] dispatch) and [`SpcEffect`] (the FSM
+/// output form, which has effect variants beyond the four broadcast
+/// shapes).
+///
+/// MSC wraps these with a slot tag in
+/// [`MscEffect::BroadcastSpcMsg`](crate::msc::MscEffect) for outbound,
+/// and reconstructs an `SpcEvent` via [`Self::into_event`] when a
+/// peer message arrives at the IO layer (which knows the sender id).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpcMessage {
+    /// Inner-PC vote tagged with its SPC view.
+    VpcMsg(Box<VpcMsgPayload>),
+    /// `new-view` authorising entry to `view` under `cert`.
+    NewView {
+        /// View this notification authorises entry to.
+        view: SpcView,
+        /// Cert backing the authorisation.
+        cert: Box<SpcCert>,
+    },
+    /// `new-commit` for `view`.
+    NewCommit {
+        /// View whose inner PC produced this commit.
+        view: SpcView,
+        /// Committed low value.
+        value: PcVector,
+        /// PC round-3 cert anchoring `value` as `proof.x_pp`.
+        proof: Box<PcQc3>,
+    },
+    /// Empty-view attestation.
+    EmptyView(Box<SpcEmptyViewMsg>),
+}
+
+impl SpcMessage {
+    /// Reconstruct an [`SpcEvent`] from this wire message and the
+    /// transport-level sender id. `from` only affects routing of
+    /// `NewView` (it determines which validator's proposal-object
+    /// slot to fill); the other variants are sender-independent.
+    #[must_use]
+    pub fn into_event(self, from: ValidatorId) -> SpcEvent {
+        match self {
+            Self::VpcMsg(payload) => SpcEvent::VpcMsg(payload),
+            Self::NewView { view, cert } => SpcEvent::NewView { from, view, cert },
+            Self::NewCommit { view, value, proof } => SpcEvent::NewCommit { view, value, proof },
+            Self::EmptyView(msg) => SpcEvent::EmptyView(msg),
+        }
+    }
+}
+
 /// Per-view local state owned by [`SpcInstance`].
 struct ViewState {
     vpc: PcInstance,
