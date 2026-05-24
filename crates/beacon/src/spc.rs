@@ -41,6 +41,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use blake3::Hasher;
 use hyperscale_types::{
@@ -624,6 +625,19 @@ pub enum SpcEffect {
     /// parent so MSC can demote the cyclic-first party in the next
     /// slot.
     EmptyLowEvidence(Box<SpcEmptyLowEvidence>),
+    /// Broadcast our own empty-view attestation to peers — we
+    /// produced a high output at `msg.view` but our local table
+    /// can't resolve its parent, so we fall back to the view-change
+    /// path.
+    BroadcastEmptyView(Box<SpcEmptyViewMsg>),
+    /// Schedule a view-timeout timer. The parent fires
+    /// [`SpcEvent::TimerExpired`] when it elapses.
+    SetTimer {
+        /// View this timer is scoped to.
+        view: SpcView,
+        /// How long to wait before firing.
+        duration: Duration,
+    },
     /// Agreed high output — terminal effect for this SPC instance.
     OutputHigh(PcVector),
 }
@@ -678,6 +692,15 @@ pub enum SpcEvent {
         /// PC round-3 cert anchoring `value` as `proof.x_pp`.
         proof: Box<PcQc3>,
     },
+    /// `empty-view` attestation from a peer.
+    EmptyView(Box<SpcEmptyViewMsg>),
+    /// Timer for `view` fired — its leader's grace period elapsed.
+    /// Drives `RunVPC(view)` even on a partial proposal-object
+    /// buffer so a silent leader can't stall the view indefinitely.
+    TimerExpired {
+        /// View whose timer fired.
+        view: SpcView,
+    },
 }
 
 /// Per-view local state owned by [`SpcInstance`].
@@ -685,6 +708,14 @@ struct ViewState {
     vpc: PcInstance,
     proposal_objects: BTreeMap<ValidatorId, SpcProposalObject>,
     vpc_input_fed: bool,
+    /// `Q_i,w` — empty-view messages collected for this view,
+    /// indexed by signer. At `f + 1` we form the indirect cert.
+    empty_views: BTreeMap<ValidatorId, SpcEmptyViewMsg>,
+    /// Latched once we've assembled and broadcast an indirect cert
+    /// from this view's empty-views.
+    indirect_cert_built: bool,
+    /// Whether we've broadcast our own empty-view for this view.
+    empty_view_broadcast: bool,
 }
 
 impl ViewState {
@@ -700,16 +731,25 @@ impl ViewState {
             vpc: PcInstance::new(network, slot, view, committee, me, me_sk),
             proposal_objects: BTreeMap::new(),
             vpc_input_fed: false,
+            empty_views: BTreeMap::new(),
+            indirect_cert_built: false,
+            empty_view_broadcast: false,
         }
     }
 }
 
+/// Bound on `pending_empty_views` memory: at most
+/// `MAX_PENDING_EMPTY_VIEW_AHEAD × n` entries. Beyond this we drop —
+/// the message is far enough ahead of `current_view` that catching
+/// up via state-sync is the right move.
+const MAX_PENDING_EMPTY_VIEW_AHEAD: u32 = 4;
+
 /// One SPC FSM instance, scoped to a single slot.
 ///
 /// Owns one inner PC instance per view it enters. MSC drives one
-/// `SpcInstance` per slot; this commit's scope handles the happy
-/// path (view 1 input → view 2 cert → commit). View-change machinery
-/// (`empty-view` + indirect-cert formation) lands in a follow-up.
+/// `SpcInstance` per slot. Handles both the happy path (view 1
+/// input → view 2 cert → commit) and view-change (empty-view
+/// attestations → indirect cert → skip ahead).
 pub struct SpcInstance {
     network: NetworkDefinition,
     slot: Slot,
@@ -717,12 +757,21 @@ pub struct SpcInstance {
     committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
     me: ValidatorId,
     me_sk: Arc<Bls12381G1PrivateKey>,
+    view_timeout: Duration,
 
     current_view: SpcView,
     views: BTreeMap<SpcView, ViewState>,
     proposals_by_hash: BTreeMap<PcValueElement, SpcProposalObject>,
     new_commit_broadcast: BTreeSet<SpcView>,
     max_high: Option<SpcHighTriple>,
+
+    /// Empty-view messages we've sig-/Qc3-validated but couldn't admit
+    /// yet because `has_parent` failed at receipt. Keyed by `msg.view`
+    /// then sender. Re-scanned after every `enter_view` so a missing-
+    /// parent message that arrives ahead of its parent proposal-object
+    /// still counts toward the `f + 1` indirect-cert threshold once
+    /// the gap closes.
+    pending_empty_views: BTreeMap<SpcView, BTreeMap<ValidatorId, SpcEmptyViewMsg>>,
 
     low_output: Option<PcVector>,
     high_output: Option<PcVector>,
@@ -731,6 +780,11 @@ pub struct SpcInstance {
 impl SpcInstance {
     /// Construct a fresh SPC instance for `slot`. Creates the view-1
     /// `PcInstance` eagerly.
+    ///
+    /// `view_timeout` is the duration the parent (MSC) is asked to
+    /// wait between `SetTimer { view }` and `TimerExpired { view }`
+    /// firing — the `2Δ` cap on a view's leader-proposal grace period
+    /// before participants exchange empty-views and skip ahead.
     ///
     /// # Panics
     ///
@@ -742,6 +796,7 @@ impl SpcInstance {
         committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
         me: ValidatorId,
         me_sk: Arc<Bls12381G1PrivateKey>,
+        view_timeout: Duration,
     ) -> Self {
         let spc_ctx = spc_context(slot);
         let mut views = BTreeMap::new();
@@ -763,11 +818,13 @@ impl SpcInstance {
             committee,
             me,
             me_sk,
+            view_timeout,
             current_view: SpcView::new(1),
             views,
             proposals_by_hash: BTreeMap::new(),
             new_commit_broadcast: BTreeSet::new(),
             max_high: None,
+            pending_empty_views: BTreeMap::new(),
             low_output: None,
             high_output: None,
         }
@@ -800,6 +857,8 @@ impl SpcInstance {
             SpcEvent::VpcMsg(payload) => self.on_vpc_msg(*payload),
             SpcEvent::NewView { view, cert } => self.on_new_view(view, *cert),
             SpcEvent::NewCommit { view, value, proof } => self.on_new_commit(view, &value, *proof),
+            SpcEvent::EmptyView(msg) => self.on_empty_view(*msg),
+            SpcEvent::TimerExpired { view } => self.on_timer_expired(view),
         }
     }
 
@@ -923,9 +982,34 @@ impl SpcInstance {
                 view: next,
                 cert: Box::new(cert),
             });
+        } else {
+            // Empty-view path: our high has no known parent. Sign an
+            // empty-view attestation reporting our current `max_high`
+            // and broadcast; self-process so our own attestation
+            // counts toward the `f + 1` quorum.
+            let reported = self.max_high.clone();
+            let should_broadcast = self
+                .views
+                .get(&view)
+                .is_some_and(|vs| !vs.empty_view_broadcast);
+            if let Some(reported) = reported
+                && should_broadcast
+            {
+                if let Some(vs) = self.views.get_mut(&view) {
+                    vs.empty_view_broadcast = true;
+                }
+                let msg = sign_empty_view_msg(
+                    &self.me_sk,
+                    self.me,
+                    &self.network,
+                    &self.spc_ctx,
+                    view,
+                    reported,
+                );
+                out.extend(self.process_empty_view(msg.clone()));
+                out.push(SpcEffect::BroadcastEmptyView(Box::new(msg)));
+            }
         }
-        // Empty-view path (view's high had no known parent) lands in
-        // the view-change follow-up.
         out
     }
 
@@ -985,8 +1069,19 @@ impl SpcInstance {
             return vec![];
         }
         let entered_new = view.inner() > self.current_view.inner();
+        let mut out = vec![];
         if entered_new {
             self.current_view = view;
+            // Start the view-timeout timer for view ≥ 2. View 1 is
+            // never entered via this path (it's eager at
+            // construction), so this branch only fires for views
+            // that just got authorised by a cert.
+            if view.inner() > 1 {
+                out.push(SpcEffect::SetTimer {
+                    view,
+                    duration: self.view_timeout,
+                });
+            }
         }
 
         self.update_max_high(referenced_triple(&cert));
@@ -1013,7 +1108,6 @@ impl SpcInstance {
         // Kick the inner PC once we have all `n` proposal objects
         // (view ≥ 2; view 1 takes the application input directly).
         let n = self.committee.len();
-        let mut out = vec![];
         let ready =
             view.inner() > 1 && !view_state.vpc_input_fed && view_state.proposal_objects.len() == n;
         if ready {
@@ -1022,6 +1116,136 @@ impl SpcInstance {
             let view_state = self.views.get_mut(&view).expect("present");
             let pc_effects = view_state.vpc.handle(PcEvent::Input(input));
             out.extend(self.translate_pc_effects(view, pc_effects));
+        }
+        // `proposals_by_hash` just gained an entry, so previously-
+        // buffered empty-views may now pass their `has_parent` check.
+        out.extend(self.rescan_pending_empty_views());
+        out
+    }
+
+    fn on_empty_view(&mut self, msg: SpcEmptyViewMsg) -> Vec<SpcEffect> {
+        self.process_empty_view(msg)
+    }
+
+    /// Forces `RunVPC(view)` on timer expiry even with a partial
+    /// proposal-object buffer. Idempotent if VPC already fired.
+    fn on_timer_expired(&mut self, view: SpcView) -> Vec<SpcEffect> {
+        if view.inner() <= 1 {
+            return vec![];
+        }
+        let Some(view_state) = self.views.get_mut(&view) else {
+            return vec![];
+        };
+        if view_state.vpc_input_fed {
+            return vec![];
+        }
+        view_state.vpc_input_fed = true;
+        let input = self.compute_view_input(view);
+        let view_state = self.views.get_mut(&view).expect("present");
+        let pc_effects = view_state.vpc.handle(PcEvent::Input(input));
+        self.translate_pc_effects(view, pc_effects)
+    }
+
+    /// Validate an empty-view, add it to `Q_i,w`, and on reaching
+    /// `f + 1` distinct signers build an indirect cert and advance.
+    fn process_empty_view(&mut self, msg: SpcEmptyViewMsg) -> Vec<SpcEffect> {
+        let view = msg.view;
+        if view.inner() < self.current_view.inner() {
+            return vec![];
+        }
+        // Paper requires `w > w_h` — empty-view must skip ahead of
+        // the reported high triple's view.
+        if view.inner() <= msg.reported.view.inner() {
+            return vec![];
+        }
+        if !verify_empty_view_msg(&msg, &self.network, &self.spc_ctx, &self.committee) {
+            return vec![];
+        }
+        if !has_parent(
+            msg.reported.view,
+            &msg.reported.value,
+            &self.proposals_by_hash,
+        ) {
+            // Parent ProposalObject hasn't arrived yet. Buffer the
+            // empty-view; `rescan_pending_empty_views` retries it
+            // after every `enter_view`.
+            self.buffer_pending_empty_view(msg);
+            return vec![];
+        }
+
+        self.update_max_high(msg.reported.clone());
+
+        let view_state = self.views.entry(view).or_insert_with(|| {
+            ViewState::new(
+                self.network.clone(),
+                self.slot,
+                view,
+                self.committee.clone(),
+                self.me,
+                Arc::clone(&self.me_sk),
+            )
+        });
+        if view_state.indirect_cert_built {
+            return vec![];
+        }
+        if view_state.empty_views.contains_key(&msg.signer) {
+            return vec![];
+        }
+        view_state.empty_views.insert(msg.signer, msg);
+
+        let n = self.committee.len();
+        let threshold = byzantine_threshold(n) + 1;
+        if view_state.empty_views.len() < threshold {
+            return vec![];
+        }
+        // Quorum reached — build the indirect cert and enter the
+        // next view.
+        view_state.indirect_cert_built = true;
+        let msgs: Vec<SpcEmptyViewMsg> = view_state.empty_views.values().cloned().collect();
+        let Some(cert) = build_indirect_cert(view, &msgs) else {
+            // Shouldn't happen — the threshold check above guarantees
+            // non-empty input and `view + 1` overflow is the only
+            // other failure mode (only at u32 saturation).
+            return vec![];
+        };
+        let Some(next_raw) = view.inner().checked_add(1) else {
+            return vec![];
+        };
+        let next = SpcView::new(next_raw);
+        let mut out = self.enter_view(next, cert.clone());
+        out.push(SpcEffect::BroadcastNewView {
+            view: next,
+            cert: Box::new(cert),
+        });
+        out
+    }
+
+    fn buffer_pending_empty_view(&mut self, msg: SpcEmptyViewMsg) {
+        let current = self.current_view.inner();
+        let view = msg.view.inner();
+        if view < current || view > current + MAX_PENDING_EMPTY_VIEW_AHEAD {
+            return;
+        }
+        let bucket = self.pending_empty_views.entry(msg.view).or_default();
+        bucket.entry(msg.signer).or_insert(msg);
+    }
+
+    /// Drain `pending_empty_views` and re-attempt each entry. Every
+    /// `proposals_by_hash` insert must follow with a call here —
+    /// `has_parent` flips from false to true when the value's first
+    /// non-bottom hash gains a preimage, and entries waiting on that
+    /// would otherwise stall. Today only `enter_view` inserts; the
+    /// rescan-on-insert is colocated there.
+    fn rescan_pending_empty_views(&mut self) -> Vec<SpcEffect> {
+        let current = self.current_view;
+        self.pending_empty_views
+            .retain(|v, _| v.inner() >= current.inner());
+        let pending = std::mem::take(&mut self.pending_empty_views);
+        let mut out = vec![];
+        for (_view, by_sender) in pending {
+            for (_sender, msg) in by_sender {
+                out.extend(self.process_empty_view(msg));
+            }
         }
         out
     }
@@ -1320,6 +1544,7 @@ mod tests {
             members.clone(),
             members[idx].0,
             Arc::clone(&sks[idx]),
+            Duration::from_millis(100),
         )
     }
 
@@ -1430,5 +1655,52 @@ mod tests {
         let h2 = hash_proposal_object(&po);
         assert_eq!(h1, h2);
         assert_ne!(h1, HASH_BOTTOM);
+    }
+
+    /// `TimerExpired` for view ≤ 1 is a no-op — view 1 has no timer
+    /// (input drives it directly).
+    #[test]
+    fn timer_expiry_at_view_one_is_noop() {
+        let mut fsm = fsm_instance(0);
+        let effects = fsm.handle(SpcEvent::TimerExpired {
+            view: SpcView::new(1),
+        });
+        assert!(effects.is_empty());
+    }
+
+    /// `TimerExpired` for an unknown view is a no-op.
+    #[test]
+    fn timer_expiry_for_unknown_view_is_noop() {
+        let mut fsm = fsm_instance(0);
+        let effects = fsm.handle(SpcEvent::TimerExpired {
+            view: SpcView::new(42),
+        });
+        assert!(effects.is_empty());
+    }
+
+    /// `EmptyView` whose `view <= reported.view` is rejected — paper
+    /// requires `w > w_h` so the skip statement points strictly
+    /// forward.
+    #[test]
+    fn empty_view_with_non_progressing_reported_view_rejected() {
+        let mut fsm = fsm_instance(0);
+        let (sks, members) = fsm_committee(4);
+        let spc_ctx = spc_context(Slot::new(1));
+        let reported = SpcHighTriple {
+            view: SpcView::new(5),
+            value: PcVector::empty(),
+            proof: dummy_pc_qc3(),
+        };
+        // View 3 < reported view 5 — rejected.
+        let msg = sign_empty_view_msg(
+            &sks[1],
+            members[1].0,
+            &net(),
+            &spc_ctx,
+            SpcView::new(3),
+            reported,
+        );
+        let effects = fsm.handle(SpcEvent::EmptyView(Box::new(msg)));
+        assert!(effects.is_empty());
     }
 }
