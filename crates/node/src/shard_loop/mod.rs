@@ -32,7 +32,7 @@ use hyperscale_core::{Action, ProtocolEvent, StateMachine, TimerId};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{ProcessExecutionCache, RadixExecutor};
 use hyperscale_network::Network;
-use hyperscale_storage::{PendingChain, Storage};
+use hyperscale_storage::{PendingChain, ShardStorage};
 use hyperscale_types::{
     LocalTimestamp, RoutableTransaction, ShardGroupId, TopologySnapshot, TransactionStatus, TxHash,
 };
@@ -72,7 +72,7 @@ pub type SharedTopologySnapshot = Arc<ArcSwap<TopologySnapshot>>;
 /// Shard-scoped handles (`pending_chain`, `prepared_commits`) live in
 /// `per_shard`, keyed by the hosted shard id. Delegated handlers select
 /// the right entry from the emitting vnode's shard.
-pub(crate) struct DispatchHandles<S: Storage, N> {
+pub(crate) struct DispatchHandles<S: ShardStorage, N> {
     pub(crate) executor: RadixExecutor,
     pub(crate) network: Arc<N>,
     pub(crate) execution_cache: Arc<ProcessExecutionCache>,
@@ -80,7 +80,7 @@ pub(crate) struct DispatchHandles<S: Storage, N> {
 }
 
 /// Per-shard subset of [`DispatchHandles`]. One entry per hosted shard.
-pub(crate) struct ShardDispatchHandles<S: Storage> {
+pub(crate) struct ShardDispatchHandles<S: ShardStorage> {
     pub(crate) pending_chain: Arc<PendingChain<S>>,
     pub(crate) prepared_commits: Arc<Mutex<PreparedCommitMap<S>>>,
 }
@@ -192,7 +192,7 @@ pub struct StepOutput {
 /// handler.
 pub struct ShardLoop<S, N, D>
 where
-    S: Storage,
+    S: ShardStorage,
     D: Dispatch,
 {
     /// Shard this loop drives. Mirrors the key in `NodeHost::shards`;
@@ -242,7 +242,7 @@ where
 
 impl<S, N, D> ShardLoop<S, N, D>
 where
-    S: Storage,
+    S: ShardStorage,
     N: Network,
     D: Dispatch,
 {

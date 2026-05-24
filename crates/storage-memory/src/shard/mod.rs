@@ -1,4 +1,4 @@
-//! Shard-side in-memory storage backend — `SimStorage`, its snapshot,
+//! Shard-side in-memory storage backend — `SimShardStorage`, its snapshot,
 //! and the tree-store adapter that mirrors the `RocksDB` JMT semantics
 //! for deterministic simulation.
 //!

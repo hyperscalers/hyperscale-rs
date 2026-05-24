@@ -26,8 +26,8 @@ use radix_common::types::{NodeId as RadixNodeId, PartitionNumber};
 use radix_substate_store_interface::db_key_mapper::{DatabaseKeyMapper, SpreadPrefixKeyMapper};
 
 use crate::{
-    BeaconWitnessCommit, ChainReader, ChainWriter, DatabaseUpdates, DbSortKey, NodeDatabaseUpdates,
-    PartitionDatabaseUpdates,
+    BeaconWitnessCommit, DatabaseUpdates, DbSortKey, NodeDatabaseUpdates, PartitionDatabaseUpdates,
+    ShardChainReader, ShardChainWriter,
 };
 
 /// Build a `DatabaseUpdates` containing a single `Set` operation.
@@ -290,7 +290,10 @@ fn make_test_block_with_ecs(height: BlockHeight, ecs: Vec<Arc<ExecutionCertifica
 }
 
 /// Helper to commit empty blocks up to (but not including) the target height.
-fn commit_empty_blocks_up_to(storage: &(impl ChainReader + ChainWriter), target: BlockHeight) {
+fn commit_empty_blocks_up_to(
+    storage: &(impl ShardChainReader + ShardChainWriter),
+    target: BlockHeight,
+) {
     let witness = empty_witness();
     for h in 0..target.inner() {
         let b = make_test_block(BlockHeight::new(h));
@@ -309,7 +312,7 @@ const fn empty_witness() -> BeaconWitnessCommit {
 /// # Panics
 ///
 /// Panics if any assertion fails (this is a test helper).
-pub fn test_ec_storage_roundtrip(storage: &(impl ChainReader + ChainWriter)) {
+pub fn test_ec_storage_roundtrip(storage: &(impl ShardChainReader + ShardChainWriter)) {
     let ec = make_test_execution_certificate(1, BlockHeight::new(10));
     let wave_id = ec.wave_id().clone();
 
@@ -334,7 +337,7 @@ pub fn test_ec_storage_roundtrip(storage: &(impl ChainReader + ChainWriter)) {
 /// # Panics
 ///
 /// Panics if any assertion fails (this is a test helper).
-pub fn test_ec_storage_batch(storage: &(impl ChainReader + ChainWriter)) {
+pub fn test_ec_storage_batch(storage: &(impl ShardChainReader + ShardChainWriter)) {
     let ec1 = make_test_execution_certificate(1, BlockHeight::new(10));
     let ec2 = make_test_execution_certificate(2, BlockHeight::new(10));
     let ec3 = make_test_execution_certificate(3, BlockHeight::new(20));

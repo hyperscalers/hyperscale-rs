@@ -22,8 +22,8 @@ use hyperscale_node::shard_loop::{ShardEvent, StepOutput};
 use hyperscale_node::{NodeConfig, NodeHost, NodeStateMachine, TimerOp, VnodeInit, timer_event};
 use hyperscale_provisions::{ProvisionConfig, ProvisionStore};
 use hyperscale_shard::ShardConsensusConfig;
-use hyperscale_storage::{ChainReader, RecoveredState};
-use hyperscale_storage_memory::SimStorage;
+use hyperscale_storage::{RecoveredState, ShardChainReader};
+use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_topology::TopologyCoordinator;
 use hyperscale_types::{
     BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey, CertifiedBlock, LocalTimestamp, NodeId,
@@ -40,7 +40,7 @@ use tracing::{debug, info, trace};
 use crate::event_queue::EventKey;
 
 /// Type alias for the simulation's concrete `NodeHost`.
-type SimHost = NodeHost<SimStorage, SimNetworkAdapter, SyncDispatch>;
+type SimHost = NodeHost<SimShardStorage, SimNetworkAdapter, SyncDispatch>;
 
 /// Per-(host, shard) shared store bundle — `ProvisionStore`, `TxStore`,
 /// `ExecCertStore`, and `FinalizedWaveStore` cloned into every same-shard
@@ -291,9 +291,11 @@ impl SimulationRunner {
             let tx_validator = Arc::new(TransactionValidation::permissive(network_def.clone()));
             let executor = RadixExecutor::new(network_def);
 
-            // One `SimStorage` per hosted shard on this host.
-            let storages: HashMap<ShardGroupId, SimStorage> =
-                by_shard.keys().map(|s| (*s, SimStorage::new())).collect();
+            // One `SimShardStorage` per hosted shard on this host.
+            let storages: HashMap<ShardGroupId, SimShardStorage> = by_shard
+                .keys()
+                .map(|s| (*s, SimShardStorage::new()))
+                .collect();
             // Single receiver per host: every hosted shard's sender is a
             // clone of the same `event_tx`, and the harness drains all
             // shards through `event_rx` deterministically.
@@ -381,7 +383,7 @@ impl SimulationRunner {
     /// Get a reference to a node's storage. Returns the storage for the
     /// host's first hosted shard.
     #[must_use]
-    pub fn node_storage(&self, node: NodeIndex) -> Option<&SimStorage> {
+    pub fn node_storage(&self, node: NodeIndex) -> Option<&SimShardStorage> {
         let host = self.hosts.get(node as usize)?;
         let shard = host.hosted_shards().next()?;
         Some(&host.shard_io(shard).storage)

@@ -22,9 +22,9 @@ use crate::lock_recover::{lock_or_recover, read_or_recover, write_or_recover};
 use crate::shard::keys::node_entity_key;
 use crate::tree::proofs::generate_proof;
 use crate::{
-    BeaconWitnessCommit, BlockForSync, ChainReader, ChainWriter, DatabaseUpdates, DbPartitionKey,
-    DbSortKey, JmtSnapshot, PartitionDatabaseUpdates, PreparedCommitBatchEntry, SubstateStore,
-    VersionedStore,
+    BeaconWitnessCommit, BlockForSync, DatabaseUpdates, DbPartitionKey, DbSortKey, JmtSnapshot,
+    PartitionDatabaseUpdates, PreparedCommitBatchEntry, ShardChainReader, ShardChainWriter,
+    SubstateStore, VersionedStore,
 };
 
 /// Cached base-storage reads observed through a [`SubstateView`].
@@ -72,7 +72,7 @@ pub struct PendingChain<S> {
 
 impl<S> PendingChain<S>
 where
-    S: SubstateStore + TreeReader + ChainReader + Sync + 'static,
+    S: SubstateStore + TreeReader + ShardChainReader + Sync + 'static,
 {
     /// Create a new empty `PendingChain` over the given base storage.
     pub fn new(base: Arc<S>) -> Self {
@@ -209,7 +209,7 @@ where
     /// `provision_hashes` list is still populated so the caller's
     /// dedup-horizon gate can short-circuit when the block carries no
     /// provisions. Persisted heights delegate to the base store's
-    /// [`ChainReader::get_block_for_sync`], which returns
+    /// [`ShardChainReader::get_block_for_sync`], which returns
     /// [`Block::Sealed`] paired with the manifest's hashes.
     pub fn block_for_sync(&self, height: BlockHeight) -> Option<BlockForSync> {
         if let Some(certified) = self.pending_certified_at(height) {
@@ -339,7 +339,7 @@ type JmtNodeIndex = HashMap<JmtNodeKey, Arc<JmtNode>>;
 ///
 /// Built once per anchor by [`PendingChain::view_at`] and cached via an
 /// `Arc`. Implements [`SubstateDatabase`], [`SubstateStore`],
-/// [`ChainWriter`], and `jmt::TreeReader` so it can substitute
+/// [`ShardChainWriter`], and `jmt::TreeReader` so it can substitute
 /// for the base storage in delegated action handlers.
 ///
 /// Once built the view is immutable — interior data is never mutated.
@@ -776,7 +776,7 @@ impl<S: TreeReader + Send + Sync> TreeReader for SubstateView<S> {
     }
 }
 
-impl<S: ChainWriter> ChainWriter for SubstateView<S> {
+impl<S: ShardChainWriter> ShardChainWriter for SubstateView<S> {
     type PreparedCommit = S::PreparedCommit;
 
     fn prepare_block_commit(
@@ -948,7 +948,7 @@ mod tests {
         }
     }
 
-    impl ChainReader for StubStore {
+    impl ShardChainReader for StubStore {
         fn get_block(&self, height: BlockHeight) -> Option<CertifiedBlock> {
             self.blocks.get(&height).cloned()
         }
@@ -1364,7 +1364,7 @@ mod tests {
         // StubStore's get_block_for_sync isn't implemented above; rather
         // than expand the stub, exercise just the pending arm here. The
         // persisted fall-through is covered by integration tests in the
-        // node crate where a real ChainReader is wired in.
+        // node crate where a real ShardChainReader is wired in.
         let chain = Arc::new(PendingChain::new(Arc::new(stub)));
         // No pending entry — pending arm misses, base arm returns None
         // because StubStore::get_block_for_sync is the trait default

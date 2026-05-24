@@ -10,14 +10,14 @@
 use hyperscale_core::ProtocolEvent;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_network::Network;
-use hyperscale_storage::Storage;
+use hyperscale_storage::ShardStorage;
 use hyperscale_types::BlockHeight;
 
 use crate::shard_loop::ShardLoop;
 
 impl<S, N, D> ShardLoop<S, N, D>
 where
-    S: Storage,
+    S: ShardStorage,
     N: Network,
     D: Dispatch,
 {

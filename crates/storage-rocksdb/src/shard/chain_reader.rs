@@ -1,8 +1,8 @@
-//! `ChainReader` implementation for `RocksDbStorage`.
+//! `ShardChainReader` implementation for `RocksDbShardStorage`.
 
 use std::sync::Arc;
 
-use hyperscale_storage::{BlockForSync, ChainReader};
+use hyperscale_storage::{BlockForSync, ShardChainReader};
 use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, CertifiedBlock, CommittedBlockHeader,
     ConsensusReceipt, ExecutionCertificate, QuorumCertificate, RoutableTransaction,
@@ -10,10 +10,10 @@ use hyperscale_types::{
 };
 
 use super::column_families::{BeaconWitnessesCf, ExecutionCertsCf};
-use super::core::RocksDbStorage;
+use super::core::RocksDbShardStorage;
 use crate::typed_cf::{TypedCf, get, iter_all};
 
-impl ChainReader for RocksDbStorage {
+impl ShardChainReader for RocksDbShardStorage {
     fn get_block(&self, height: BlockHeight) -> Option<CertifiedBlock> {
         self.get_block_denormalized(height)
     }

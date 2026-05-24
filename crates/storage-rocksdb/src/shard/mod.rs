@@ -1,4 +1,4 @@
-//! Shard-side `RocksDB` backend — `RocksDbStorage`, its `SharedStorage`
+//! Shard-side `RocksDB` backend — `RocksDbShardStorage`, its `SharedStorage`
 //! Arc wrapper, JMT integration, per-shard column families, GC, and
 //! recovery flows.
 //!

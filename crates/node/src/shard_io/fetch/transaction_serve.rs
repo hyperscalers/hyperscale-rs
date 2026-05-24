@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use hyperscale_mempool::TxStore;
 use hyperscale_metrics::record_fetch_response_sent;
-use hyperscale_storage::{PendingChain, Storage};
+use hyperscale_storage::{PendingChain, ShardStorage};
 use hyperscale_types::network::request::GetTransactionsRequest;
 use hyperscale_types::network::response::GetTransactionsResponse;
 use tracing::{debug, trace};
@@ -27,7 +27,7 @@ const MAX_ITEMS_PER_RESPONSE: usize = 500;
 /// shard, that shard's mempool fetches by hash from the source committee
 /// and this handler answers without distinction. Don't add a peer / shard
 /// check here without redesigning the cross-shard DA path.
-pub fn serve_transaction_request<S: Storage>(
+pub fn serve_transaction_request<S: ShardStorage>(
     pending_chain: &PendingChain<S>,
     tx_store: &TxStore,
     req: &GetTransactionsRequest,

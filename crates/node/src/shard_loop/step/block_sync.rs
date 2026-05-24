@@ -43,7 +43,7 @@ use hyperscale_metrics::{
     record_sync_round_retried, record_sync_round_started,
 };
 use hyperscale_network::{Network, ResponseVerdict};
-use hyperscale_storage::Storage;
+use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::response::GetBlockResponse;
 #[cfg(test)]
 use hyperscale_types::{BeaconWitnessLeafCount, BeaconWitnessRoot};
@@ -59,7 +59,7 @@ use crate::shard_loop::{ShardLoop, push_shard_input};
 
 impl<S, N, D> ShardLoop<S, N, D>
 where
-    S: Storage,
+    S: ShardStorage,
     N: Network,
     D: Dispatch,
 {

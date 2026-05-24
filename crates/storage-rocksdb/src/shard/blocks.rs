@@ -28,11 +28,11 @@ use rocksdb::{ColumnFamily, WriteBatch};
 use super::column_families::{
     BeaconWitnessesCf, BlocksCf, CertificatesCf, ConsensusReceiptsCf, TransactionsCf,
 };
-use super::core::RocksDbStorage;
+use super::core::RocksDbShardStorage;
 use super::metadata::{read_committed_hash, read_committed_height, read_committed_qc};
 use crate::typed_cf::{TypedCf, batch_put, batch_put_raw, get, multi_get};
 
-impl RocksDbStorage {
+impl RocksDbShardStorage {
     /// Get a range of committed blocks [from, to).
     ///
     /// Returns blocks in ascending height order. Uses `get_block_denormalized`
@@ -563,13 +563,13 @@ mod test_helpers {
     use tracing::{Level, Span, instrument};
 
     use super::super::column_families::CertificatesCf;
-    use super::super::core::RocksDbStorage;
+    use super::super::core::RocksDbShardStorage;
     use super::super::metadata::{
         write_committed_hash, write_committed_height, write_committed_qc,
     };
     use super::Instant;
 
-    impl RocksDbStorage {
+    impl RocksDbShardStorage {
         /// Test-only seed for `committed_height` / `committed_hash` /
         /// `latest_qc`. Production block commits write these three keys
         /// inside the main commit batch via `append_consensus_to_batch`,

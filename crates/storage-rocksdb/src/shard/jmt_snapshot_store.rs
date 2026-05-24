@@ -57,7 +57,7 @@ impl<'a> SnapshotTreeStore<'a> {
     }
 
     /// Read the JMT version and root hash from this snapshot. Uses the
-    /// same `jmt:metadata` encoding as `RocksDbStorage`, so reads are
+    /// same `jmt:metadata` encoding as `RocksDbShardStorage`, so reads are
     /// atomic with respect to the nodes visible through this snapshot.
     ///
     /// Returns `(version, root_hash)`. For an empty tree, returns `(0, [0; 32])`.

@@ -1,18 +1,18 @@
-//! `ChainReader` implementation for `SimStorage`.
+//! `ShardChainReader` implementation for `SimShardStorage`.
 
 use std::sync::Arc;
 
 use hyperscale_storage::lock_recover::read_or_recover;
-use hyperscale_storage::{BlockForSync, ChainReader};
+use hyperscale_storage::{BlockForSync, ShardChainReader};
 use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockManifest, CertifiedBlock,
     CommittedBlockHeader, ConsensusReceipt, ExecutionCertificate, QuorumCertificate,
     RoutableTransaction, ShardWitnessPayload, TxHash, WaveCertificate, WaveId,
 };
 
-use super::core::SimStorage;
+use super::core::SimShardStorage;
 
-impl ChainReader for SimStorage {
+impl ShardChainReader for SimShardStorage {
     fn get_block(&self, height: BlockHeight) -> Option<CertifiedBlock> {
         read_or_recover(&self.consensus)
             .blocks

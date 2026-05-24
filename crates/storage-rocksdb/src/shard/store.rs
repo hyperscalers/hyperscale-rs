@@ -1,4 +1,4 @@
-//! `SubstateStore` implementation for `RocksDbStorage`.
+//! `SubstateStore` implementation for `RocksDbShardStorage`.
 
 use std::time::Instant;
 
@@ -11,12 +11,12 @@ use hyperscale_types::{
 };
 use rocksdb::{WriteBatch, WriteOptions};
 
-use super::core::RocksDbStorage;
+use super::core::RocksDbShardStorage;
 use super::jmt_snapshot_store::SnapshotTreeStore;
 use super::metadata::read_jmt_metadata;
 use super::snapshot::RocksDbSnapshot;
 
-impl SubstateStore for RocksDbStorage {
+impl SubstateStore for RocksDbShardStorage {
     type Snapshot<'a> = RocksDbSnapshot<'a>;
 
     fn snapshot(&self) -> Self::Snapshot<'_> {
@@ -83,7 +83,7 @@ impl SubstateStore for RocksDbStorage {
     }
 }
 
-impl VersionedStore for RocksDbStorage {
+impl VersionedStore for RocksDbShardStorage {
     fn snapshot_at(&self, height: BlockHeight) -> Self::Snapshot<'_> {
         // Take the DB snapshot FIRST, then read metadata THROUGH it.
         // Reading metadata from the live DB and then taking the snapshot
@@ -121,7 +121,7 @@ impl VersionedStore for RocksDbStorage {
     }
 }
 
-impl RocksDbStorage {
+impl RocksDbShardStorage {
     /// Try to apply a prepared block commit with a single fsync.
     ///
     /// This is the fast path for block commit. Applies the pre-built `WriteBatch`

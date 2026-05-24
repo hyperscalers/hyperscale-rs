@@ -11,7 +11,7 @@ use hyperscale_metrics::record_transaction_finalized;
 use hyperscale_network::Network;
 use hyperscale_provisions::action_handlers::handle_action as handle_provisions_action;
 use hyperscale_shard::action_handlers::handle_action as handle_shard_action;
-use hyperscale_storage::{BeaconWitnessCommit, Storage};
+use hyperscale_storage::{BeaconWitnessCommit, ShardStorage};
 use hyperscale_types::{
     Block, BlockHeight, CertifiedBlock, QuorumCertificate, StateRoot, TopologySnapshot,
     TransactionStatus, TxHash,
@@ -32,7 +32,7 @@ use crate::shard_io::sync::block::BlockSyncInput;
 
 impl<S, N, D> ShardLoop<S, N, D>
 where
-    S: Storage,
+    S: ShardStorage,
     N: Network,
     D: Dispatch,
 {

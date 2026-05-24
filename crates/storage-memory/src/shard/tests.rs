@@ -7,10 +7,10 @@ use hyperscale_storage::test_helpers::{
 };
 use hyperscale_storage::tree::{jmt_parent_height, put_at_version};
 use hyperscale_storage::{
-    BeaconWitnessCommit, ChainReader, ChainWriter, CommittableSubstateDatabase, DatabaseUpdate,
-    DatabaseUpdates, DbPartitionKey, DbSortKey, NodeDatabaseUpdates, PartitionDatabaseUpdates,
-    SubstateDatabase, SubstateStore, VersionedStore, merge_database_updates, merge_into,
-    test_helpers,
+    BeaconWitnessCommit, CommittableSubstateDatabase, DatabaseUpdate, DatabaseUpdates,
+    DbPartitionKey, DbSortKey, NodeDatabaseUpdates, PartitionDatabaseUpdates, ShardChainReader,
+    ShardChainWriter, SubstateDatabase, SubstateStore, VersionedStore, merge_database_updates,
+    merge_into, test_helpers,
 };
 use hyperscale_types::test_utils::test_transaction;
 use hyperscale_types::{
@@ -24,15 +24,15 @@ fn no_witness() -> BeaconWitnessCommit {
 }
 use indexmap::IndexMap;
 
-use super::core::SimStorage;
+use super::core::SimShardStorage;
 use super::state::apply_updates;
 
-impl SimStorage {
+impl SimShardStorage {
     /// Atomically commit a certificate and its state writes.
     ///
     /// Applies database updates and stores certificate metadata.
     /// JMT is deferred to block commit — this mirrors the production
-    /// `RocksDbStorage::commit_certificate_with_writes()` to ensure DST
+    /// `RocksDbShardStorage::commit_certificate_with_writes()` to ensure DST
     /// catches timing bugs where code incorrectly assumes state is available
     /// before certificate persistence.
     ///
@@ -96,7 +96,7 @@ impl SimStorage {
     }
 }
 
-impl CommittableSubstateDatabase for SimStorage {
+impl CommittableSubstateDatabase for SimShardStorage {
     fn commit(&mut self, updates: &DatabaseUpdates) {
         self.commit_shared(updates);
     }
@@ -105,7 +105,7 @@ impl CommittableSubstateDatabase for SimStorage {
 /// Helper: commit a block with given updates by injecting them via a single-tx
 /// `FinalizedWave` inside `block.certificates`.
 fn commit_with(
-    storage: &SimStorage,
+    storage: &SimShardStorage,
     updates: &DatabaseUpdates,
     block: &Block,
     qc: &QuorumCertificate,
@@ -168,13 +168,13 @@ fn commit_with(
 }
 
 /// Helper: commit a block with empty updates and no ECs/receipts.
-fn commit_empty(storage: &SimStorage, block: &Block, qc: &QuorumCertificate) -> StateRoot {
+fn commit_empty(storage: &SimShardStorage, block: &Block, qc: &QuorumCertificate) -> StateRoot {
     commit_with(storage, &DatabaseUpdates::default(), block, qc)
 }
 
 #[test]
 fn test_basic_substate_operations() {
-    let mut storage = SimStorage::new();
+    let mut storage = SimShardStorage::new();
 
     // Create a partition key and sort key
     let partition_key = DbPartitionKey {
@@ -217,7 +217,7 @@ fn test_basic_substate_operations() {
 
 #[test]
 fn test_snapshot_isolation() {
-    let mut storage = SimStorage::new();
+    let mut storage = SimShardStorage::new();
 
     let partition_key = DbPartitionKey {
         node_key: vec![1, 2, 3],
@@ -283,7 +283,7 @@ fn test_snapshot_isolation() {
 
 #[test]
 fn test_snapshot_structural_sharing_performance() {
-    let storage = SimStorage::new();
+    let storage = SimShardStorage::new();
 
     // Insert 10,000 items via substates-only (no JMT computation).
     // This test measures OrdMap snapshot performance, not tree commit speed.
@@ -337,7 +337,7 @@ fn test_snapshot_structural_sharing_performance() {
 
 #[test]
 fn test_block_storage_and_retrieval() {
-    let storage = SimStorage::new();
+    let storage = SimShardStorage::new();
     let block = make_test_block(BlockHeight::new(1));
     let qc = make_test_qc(&block);
 
@@ -356,13 +356,13 @@ fn test_block_storage_and_retrieval() {
 
 #[test]
 fn test_block_get_nonexistent() {
-    let storage = SimStorage::new();
+    let storage = SimShardStorage::new();
     assert!(storage.get_block(BlockHeight::new(999)).is_none());
 }
 
 #[test]
 fn test_committed_height_default() {
-    let storage = SimStorage::new();
+    let storage = SimShardStorage::new();
     assert_eq!(storage.committed_height(), BlockHeight::new(0));
     assert!(storage.committed_hash().is_none());
     assert!(storage.latest_qc().is_none());
@@ -370,7 +370,7 @@ fn test_committed_height_default() {
 
 #[test]
 fn test_get_block_for_sync() {
-    let storage = SimStorage::new();
+    let storage = SimShardStorage::new();
     let block = make_test_block(BlockHeight::new(1));
     let qc = make_test_qc(&block);
     commit_empty(&storage, &block, &qc);
@@ -384,14 +384,14 @@ fn test_get_block_for_sync() {
 
 #[test]
 fn test_transactions_batch_missing() {
-    let storage = SimStorage::new();
+    let storage = SimShardStorage::new();
     let result = storage.get_transactions_batch(&[TxHash::from_raw(Hash::from_bytes(&[1; 32]))]);
     assert!(result.is_empty());
 }
 
 #[test]
 fn test_transactions_batch_with_indexed_block() {
-    let storage = SimStorage::new();
+    let storage = SimShardStorage::new();
     let block = make_test_block(BlockHeight::new(1));
 
     let tx = Arc::new(test_transaction(42));
@@ -440,19 +440,19 @@ fn test_transactions_batch_with_indexed_block() {
 
 #[test]
 fn test_initial_jmt_height_is_zero() {
-    let storage = SimStorage::new();
+    let storage = SimShardStorage::new();
     assert_eq!(storage.jmt_height(), BlockHeight::new(0));
 }
 
 #[test]
 fn test_initial_state_root_is_zero() {
-    let storage = SimStorage::new();
+    let storage = SimShardStorage::new();
     assert_eq!(storage.state_root(), StateRoot::ZERO);
 }
 
 #[test]
 fn test_jmt_height_increments_on_commit() {
-    let storage = SimStorage::new();
+    let storage = SimShardStorage::new();
     assert_eq!(storage.jmt_height(), BlockHeight::new(0));
 
     storage.commit_shared(&make_database_update(vec![1, 2, 3], 0, vec![10], vec![1]));
@@ -464,7 +464,7 @@ fn test_jmt_height_increments_on_commit() {
 
 #[test]
 fn test_state_root_changes_on_commit() {
-    let storage = SimStorage::new();
+    let storage = SimShardStorage::new();
     let root0 = storage.state_root();
 
     storage.commit_shared(&make_database_update(vec![1, 2, 3], 0, vec![10], vec![1]));
@@ -479,8 +479,8 @@ fn test_state_root_changes_on_commit() {
 #[test]
 fn test_state_root_deterministic() {
     // Two storage instances with identical commits should have identical roots
-    let s1 = SimStorage::new();
-    let s2 = SimStorage::new();
+    let s1 = SimShardStorage::new();
+    let s2 = SimShardStorage::new();
 
     let updates = make_database_update(vec![1, 2, 3], 0, vec![10], vec![42]);
     s1.commit_shared(&updates);
@@ -492,8 +492,8 @@ fn test_state_root_deterministic() {
 
 #[test]
 fn test_state_root_differs_for_different_data() {
-    let s1 = SimStorage::new();
-    let s2 = SimStorage::new();
+    let s1 = SimShardStorage::new();
+    let s2 = SimShardStorage::new();
 
     s1.commit_shared(&make_database_update(vec![1, 2, 3], 0, vec![10], vec![1]));
     s2.commit_shared(&make_database_update(vec![1, 2, 3], 0, vec![10], vec![2]));
@@ -503,19 +503,19 @@ fn test_state_root_differs_for_different_data() {
 
 #[test]
 fn test_empty_commit_still_advances_version() {
-    let storage = SimStorage::new();
+    let storage = SimShardStorage::new();
     let updates = DatabaseUpdates::default();
     storage.commit_shared(&updates);
     assert_eq!(storage.jmt_height(), BlockHeight::new(1));
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// ChainWriter
+// ShardChainWriter
 // ═══════════════════════════════════════════════════════════════════════
 
 #[test]
 fn test_commit_block_single() {
-    let storage = SimStorage::new();
+    let storage = SimShardStorage::new();
     let updates = make_mapped_database_update(1, 0, vec![10], vec![42]);
     let block = make_test_block(BlockHeight::new(1));
     let qc = make_test_qc(&block);
@@ -526,7 +526,7 @@ fn test_commit_block_single() {
 
 #[test]
 fn test_commit_block_multiple_updates() {
-    let storage = SimStorage::new();
+    let storage = SimShardStorage::new();
     let updates1 = make_mapped_database_update(1, 0, vec![10], vec![1]);
     let updates2 = make_mapped_database_update(2, 0, vec![20], vec![2]);
     let merged = merge_database_updates(&[updates1, updates2]);
@@ -539,7 +539,7 @@ fn test_commit_block_multiple_updates() {
 
 #[test]
 fn test_commit_block_empty() {
-    let storage = SimStorage::new();
+    let storage = SimShardStorage::new();
     let block = make_test_block(BlockHeight::new(1));
     let qc = make_test_qc(&block);
     commit_empty(&storage, &block, &qc);
@@ -551,8 +551,8 @@ fn test_commit_block_empty() {
 fn test_prepare_then_commit_fast_path() {
     // Two identical storage instances: one uses prepare+commit, other uses commit_block.
     // Both should produce the same result.
-    let s_prepared = SimStorage::new();
-    let s_direct = SimStorage::new();
+    let s_prepared = SimShardStorage::new();
+    let s_direct = SimShardStorage::new();
     let block = make_test_block(BlockHeight::new(1));
     let qc = make_test_qc(&block);
 
@@ -584,7 +584,7 @@ fn test_prepare_then_commit_fast_path() {
 
 #[test]
 fn test_prepare_commit_state_root_matches() {
-    let storage = SimStorage::new();
+    let storage = SimShardStorage::new();
     let block = make_test_block(BlockHeight::new(1));
     let qc = make_test_qc(&block);
 
@@ -615,7 +615,7 @@ fn test_prepare_commit_state_root_matches() {
 
 #[test]
 fn test_clear() {
-    let mut storage = SimStorage::new();
+    let mut storage = SimShardStorage::new();
 
     // Add some data
     storage.commit_shared(&make_database_update(vec![1, 2, 3], 0, vec![10], vec![1]));
@@ -631,7 +631,7 @@ fn test_clear() {
 
 #[test]
 fn test_len_and_is_empty() {
-    let storage = SimStorage::new();
+    let storage = SimShardStorage::new();
     assert!(storage.is_empty());
     assert_eq!(storage.len(), 0);
 
@@ -645,7 +645,7 @@ fn test_len_and_is_empty() {
 
 #[test]
 fn test_list_substates_for_node_at_height_returns_historical_data() {
-    let storage = SimStorage::new();
+    let storage = SimShardStorage::new();
     let node_id = NodeId([1; 30]);
 
     // Block height 1: commit value [100] for node 1
@@ -696,13 +696,13 @@ fn test_list_substates_for_node_at_height_returns_historical_data() {
 
 #[test]
 fn test_ec_storage_roundtrip() {
-    let storage = SimStorage::new();
+    let storage = SimShardStorage::new();
     test_helpers::test_ec_storage_roundtrip(&storage);
 }
 
 #[test]
 fn test_ec_storage_batch() {
-    let storage = SimStorage::new();
+    let storage = SimShardStorage::new();
     test_helpers::test_ec_storage_batch(&storage);
 }
 
@@ -720,7 +720,7 @@ fn test_snapshot_at_version_is_deterministic_across_persistence_lag() {
     let partition_num = 0;
     let sort_key = vec![1u8];
 
-    let commit = |storage: &SimStorage, height: BlockHeight, value: Vec<u8>| {
+    let commit = |storage: &SimShardStorage, height: BlockHeight, value: Vec<u8>| {
         let block = make_test_block(height);
         let qc = make_test_qc(&block);
         let updates = make_mapped_database_update(1, partition_num, sort_key.clone(), value);
@@ -728,7 +728,7 @@ fn test_snapshot_at_version_is_deterministic_across_persistence_lag() {
     };
 
     // Validator A: persists through block 5.
-    let a = SimStorage::new();
+    let a = SimShardStorage::new();
     for h in 1..=5u64 {
         commit(
             &a,
@@ -739,7 +739,7 @@ fn test_snapshot_at_version_is_deterministic_across_persistence_lag() {
     assert_eq!(a.jmt_height(), BlockHeight::new(5));
 
     // Validator B: stops at block 3.
-    let b = SimStorage::new();
+    let b = SimShardStorage::new();
     for h in 1..=3u64 {
         commit(
             &b,
@@ -782,7 +782,7 @@ fn test_snapshot_resolves_floor_among_many_versions() {
     let partition_num = 0;
     let sort_key = vec![1u8];
 
-    let storage = SimStorage::new();
+    let storage = SimShardStorage::new();
     for h in 1..=50u64 {
         let block = make_test_block(BlockHeight::new(h));
         let qc = make_test_qc(&block);
@@ -831,7 +831,7 @@ fn test_state_history_create_delete_create() {
     };
     let sk = DbSortKey(sort_key.clone());
 
-    let storage = SimStorage::new();
+    let storage = SimShardStorage::new();
 
     // Keep a second key alive throughout so the JMT never empties out
     // — the JMT parent-version chain would otherwise break at V2 if
@@ -900,14 +900,14 @@ fn test_state_history_create_delete_create() {
 #[should_panic(expected = "below retention floor")]
 fn test_snapshot_at_below_retention_panics() {
     // Tiny retention: floor = current - 2.
-    let storage = SimStorage::with_jmt_history_length(2);
+    let storage = SimShardStorage::with_jmt_history_length(2);
     for h in 1..=10u64 {
         let block = make_test_block(BlockHeight::new(h));
         let qc = make_test_qc(&block);
         commit_with(&storage, &DatabaseUpdates::default(), &block, &qc);
     }
     // current=10, floor=8. Asking for V=1 is well below floor.
-    let _snap = <SimStorage as VersionedStore>::snapshot_at(&storage, BlockHeight::new(1));
+    let _snap = <SimShardStorage as VersionedStore>::snapshot_at(&storage, BlockHeight::new(1));
 }
 
 /// `list_substates_for_node_at_height` is an external-facing API —
@@ -919,7 +919,7 @@ fn test_list_substates_at_height_respects_retention() {
     let partition_num = 0;
     let sort_key = vec![1u8];
 
-    let storage = SimStorage::with_jmt_history_length(2);
+    let storage = SimShardStorage::with_jmt_history_length(2);
     for h in 1..=10u64 {
         let block = make_test_block(BlockHeight::new(h));
         let qc = make_test_qc(&block);
@@ -958,7 +958,7 @@ fn test_reset_partition_captures_history_for_all_removed_keys() {
         partition_num,
     };
 
-    let storage = SimStorage::new();
+    let storage = SimShardStorage::new();
 
     // V1: populate partition with A/B/C.
     {
@@ -1051,7 +1051,7 @@ fn test_reset_partition_captures_history_for_all_removed_keys() {
 /// until GC.
 #[test]
 fn test_genesis_skips_history_entries() {
-    let storage = SimStorage::new();
+    let storage = SimShardStorage::new();
 
     let updates = make_database_update(vec![1u8; 50], 0, vec![1], vec![0xAA]);
     storage.commit_substates_only(&updates);

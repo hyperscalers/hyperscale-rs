@@ -10,11 +10,11 @@
 use rocksdb::WriteBatch;
 
 use super::column_families::{JmtNodesCf, StaleJmtNodesCf, StaleStateHistoryCf, StateHistoryCf};
-use super::core::RocksDbStorage;
+use super::core::RocksDbShardStorage;
 use super::jmt_stored::StaleTreePart;
 use crate::typed_cf::{self, TypedCf};
 
-impl RocksDbStorage {
+impl RocksDbShardStorage {
     /// Run garbage collection for stale JMT nodes.
     ///
     /// Deletes JMT nodes that became stale at heights older than
@@ -236,7 +236,7 @@ mod tests {
     };
     use tempfile::TempDir;
 
-    use super::super::core::RocksDbStorage;
+    use super::super::core::RocksDbShardStorage;
     use crate::config::RocksDbConfig;
 
     /// Aggressive state-history GC must not affect current-tip reads.
@@ -250,7 +250,7 @@ mod tests {
             jmt_history_length: 2, // tiny retention for test
             ..Default::default()
         };
-        let storage = RocksDbStorage::open_with_config(temp_dir.path(), &config).unwrap();
+        let storage = RocksDbShardStorage::open_with_config(temp_dir.path(), &config).unwrap();
 
         let mk_key = |seed: u8, sort: u8| {
             (

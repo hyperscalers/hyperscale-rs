@@ -18,7 +18,7 @@ use std::sync::Arc;
 use hyperscale_core::ProtocolEvent;
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_network::Network;
-use hyperscale_storage::Storage;
+use hyperscale_storage::ShardStorage;
 use hyperscale_types::{
     Bls12381G1PublicKey, Bls12381G2Signature, CommittedBlockHeader, ValidatorId,
     committed_block_header_message,
@@ -30,7 +30,7 @@ use crate::shard_loop::{ShardLoop, push_protocol_event};
 
 impl<S, N, D> ShardLoop<S, N, D>
 where
-    S: Storage,
+    S: ShardStorage,
     N: Network,
     D: Dispatch,
 {

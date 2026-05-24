@@ -17,7 +17,7 @@ pub mod verify;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use hyperscale_storage::{PendingChain, Storage};
+use hyperscale_storage::{PendingChain, ShardStorage};
 use hyperscale_types::{
     Bls12381G1PublicKey, Bls12381G2Signature, CommittedBlockHeader, LocalTimestamp,
     RoutableTransaction, TxHash, ValidatorId,
@@ -40,7 +40,7 @@ pub type CommittedHeaderVerificationItem = (
 );
 
 /// Per-shard I/O state hosted by the `NodeHost`.
-pub struct ShardIo<S: Storage> {
+pub struct ShardIo<S: ShardStorage> {
     /// Persistent block / receipt / JMT store for this shard. `Arc` so
     /// delegated closures (block-commit, fetch-serve, sync) can read
     /// it from thread pools without crossing back to the pinned thread.

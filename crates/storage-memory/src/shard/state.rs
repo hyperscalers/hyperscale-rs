@@ -1,6 +1,6 @@
 //! Shared state types for simulated storage.
 //!
-//! Contains the internal state structures protected by `RwLocks` in `SimStorage`.
+//! Contains the internal state structures protected by `RwLocks` in `SimShardStorage`.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;

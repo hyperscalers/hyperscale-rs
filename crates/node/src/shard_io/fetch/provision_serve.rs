@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use hyperscale_core::ProvisionsRequest;
 use hyperscale_provisions::build_provisions;
-use hyperscale_storage::{PendingChain, Storage};
+use hyperscale_storage::{PendingChain, ShardStorage};
 use hyperscale_types::network::request::GetProvisionsRequest;
 use hyperscale_types::network::response::GetProvisionResponse;
 use hyperscale_types::{NodeId, ShardGroupId, shard_for_node};
@@ -25,7 +25,7 @@ use tracing::warn;
 ///
 /// Takes `local_shard` and `num_shards` instead of `&TopologyCoordinator`
 /// to avoid topology dependency in the I/O layer.
-pub fn serve_provision_request<S: Storage>(
+pub fn serve_provision_request<S: ShardStorage>(
     pending_chain: &Arc<PendingChain<S>>,
     local_shard: ShardGroupId,
     num_shards: u64,

@@ -4,7 +4,7 @@ use hyperscale_core::ProtocolEvent;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_network::Network;
-use hyperscale_storage::Storage;
+use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::gossip::{CommittedBlockHeaderGossip, TransactionGossip};
 use hyperscale_types::network::notification::{
     BlockHeaderNotification, BlockVoteNotification, ExecutionCertificatesNotification,
@@ -29,7 +29,7 @@ use crate::shard_loop::{push_protocol_event, push_shard_input};
 
 impl<S, N, D> NodeHost<S, N, D>
 where
-    S: Storage,
+    S: ShardStorage,
     N: Network,
     D: Dispatch,
 {

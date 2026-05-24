@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use hyperscale_metrics::record_sync_response_error;
 use hyperscale_provisions::ProvisionStore;
-use hyperscale_storage::{BlockForSync, PendingChain, Storage};
+use hyperscale_storage::{BlockForSync, PendingChain, ShardStorage};
 use hyperscale_types::network::request::GetBlockRequest;
 use hyperscale_types::network::response::GetBlockResponse;
 use hyperscale_types::{ElidedCertifiedBlock, ProvisionHash, Provisions, RETENTION_HORIZON};
@@ -40,7 +40,7 @@ use tracing::{trace, warn};
 /// response. The requester rotates to another peer who has the provisions
 /// cached. Pending-window blocks never hit this path because their
 /// provisions are inline.
-pub fn serve_block_request<S: Storage>(
+pub fn serve_block_request<S: ShardStorage>(
     pending_chain: &PendingChain<S>,
     provision_store: &ProvisionStore,
     req: &GetBlockRequest,

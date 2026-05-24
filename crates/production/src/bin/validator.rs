@@ -67,7 +67,7 @@ use hyperscale_production::{
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage_rocksdb::{
-    CompressionType as RocksCompressionType, RocksDbConfig, RocksDbStorage,
+    CompressionType as RocksCompressionType, RocksDbConfig, RocksDbShardStorage,
 };
 use hyperscale_topology::TopologyCoordinator;
 use hyperscale_types::{
@@ -1171,7 +1171,7 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
     // the storage Arc; different-shard vnodes each provision their own.
     let hosted_shards: std::collections::BTreeSet<u64> =
         config.vnodes.iter().map(|v| v.shard).collect();
-    let mut storages: std::collections::HashMap<ShardGroupId, Arc<RocksDbStorage>> =
+    let mut storages: std::collections::HashMap<ShardGroupId, Arc<RocksDbShardStorage>> =
         std::collections::HashMap::new();
     for shard in &hosted_shards {
         let db_path = config
@@ -1179,7 +1179,7 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
             .data_dir
             .join(format!("shard-{shard}"))
             .join("db");
-        let storage = RocksDbStorage::open_with_config(&db_path, &rocksdb_config)
+        let storage = RocksDbShardStorage::open_with_config(&db_path, &rocksdb_config)
             .with_context(|| format!("Failed to open database at {}", db_path.display()))?;
         info!(shard = shard, path = %db_path.display(), "Storage opened");
         storages.insert(ShardGroupId::new(*shard), Arc::new(storage));

@@ -16,7 +16,7 @@ use hyperscale_jmt::TreeReader as JmtTreeReader;
 use hyperscale_metrics::record_signature_verification_latency;
 use hyperscale_network::Network;
 use hyperscale_storage::tree::proofs::verify_proof;
-use hyperscale_storage::{Storage, SubstateStore, SubstateView, VersionedStore};
+use hyperscale_storage::{ShardStorage, SubstateStore, SubstateView, VersionedStore};
 use hyperscale_types::network::notification::ProvisionsNotification;
 use hyperscale_types::{
     BlockHeight, Provisions, ShardGroupId, ValidatorId, state_provisions_message,
@@ -71,7 +71,7 @@ where
 /// crates hit `unreachable!()` — node's dispatcher routes by variant prefix.
 pub fn handle_action<S, N>(action: Action, ctx: &ActionContext<'_, S, N>)
 where
-    S: Storage,
+    S: ShardStorage,
     N: Network,
 {
     match action {

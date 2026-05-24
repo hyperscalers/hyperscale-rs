@@ -1,6 +1,6 @@
 //! Shared error type for the `RocksDB` backend.
 //!
-//! Both the shard tier ([`crate::RocksDbStorage`]) and the beacon tier
+//! Both the shard tier ([`crate::RocksDbShardStorage`]) and the beacon tier
 //! ([`crate::RocksDbBeaconStorage`]) surface the same `RocksDB` failures
 //! through a single string-wrapped variant — call sites never
 //! discriminate beyond "the database returned an error."

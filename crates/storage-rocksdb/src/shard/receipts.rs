@@ -6,10 +6,10 @@ use hyperscale_types::{ConsensusReceipt, ExecutionMetadata, StoredReceipt, TxHas
 use rocksdb::{ColumnFamily, WriteBatch};
 
 use super::column_families::{ConsensusReceiptsCf, ExecutionMetadataCf};
-use super::core::RocksDbStorage;
+use super::core::RocksDbShardStorage;
 use crate::typed_cf::{TypedCf, batch_put};
 
-impl RocksDbStorage {
+impl RocksDbShardStorage {
     /// One-shot variant of [`Self::store_receipts`] for a single receipt.
     ///
     /// # Panics
@@ -67,8 +67,8 @@ impl RocksDbStorage {
 
 /// Append a single receipt's writes against pre-resolved column-family
 /// handles. Use this from per-block receipt loops where the caller has
-/// already paid for one [`RocksDbStorage::cf`] resolution; the
-/// `&mut self`-method form on `RocksDbStorage` repeats that resolution
+/// already paid for one [`RocksDbShardStorage::cf`] resolution; the
+/// `&mut self`-method form on `RocksDbShardStorage` repeats that resolution
 /// per call and is the right shape only for one-shot writes.
 pub fn add_receipt_to_batch(
     batch: &mut WriteBatch,

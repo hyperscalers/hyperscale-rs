@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use hyperscale_execution::ExecCertStore;
 use hyperscale_metrics::record_fetch_response_sent;
-use hyperscale_storage::{PendingChain, Storage};
+use hyperscale_storage::{PendingChain, ShardStorage};
 use hyperscale_types::network::request::GetExecutionCertsRequest;
 use hyperscale_types::network::response::GetExecutionCertsResponse;
 use hyperscale_types::{ExecutionCertificate, WaveId};
@@ -15,7 +15,7 @@ use hyperscale_types::{ExecutionCertificate, WaveId};
 /// EC aggregation and the wave's containing block committing) and chain
 /// storage via [`PendingChain`]. Cache eviction happens at wave-cert
 /// commit, at which point storage is the authoritative source.
-pub fn serve_execution_certs_request<S: Storage>(
+pub fn serve_execution_certs_request<S: ShardStorage>(
     pending_chain: &PendingChain<S>,
     exec_cert_store: &ExecCertStore,
     req: &GetExecutionCertsRequest,

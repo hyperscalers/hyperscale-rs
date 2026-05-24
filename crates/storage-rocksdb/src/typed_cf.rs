@@ -221,7 +221,7 @@ impl ReadableStore for Snapshot<'_> {
 // ─── Typed free functions ────────────────────────────────────────────────────
 //
 // These work with any ReadableStore (DB or Snapshot) and any TypedCf.
-// The RocksDbStorage methods become thin wrappers over these.
+// The RocksDbShardStorage methods become thin wrappers over these.
 
 /// Typed get from any readable store.
 pub fn get<CF: TypedCf>(

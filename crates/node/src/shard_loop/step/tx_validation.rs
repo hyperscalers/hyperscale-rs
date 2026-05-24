@@ -18,7 +18,7 @@ use std::sync::Arc;
 use hyperscale_core::ProtocolEvent;
 use hyperscale_dispatch::{Dispatch, DispatchPool, Parallelism};
 use hyperscale_network::Network;
-use hyperscale_storage::Storage;
+use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::gossip::TransactionGossip;
 use hyperscale_types::{RoutableTransaction, ShardGroupId, TxHash};
 
@@ -29,7 +29,7 @@ use crate::shard_loop::{ShardLoop, ShardScopedInput, push_shard_input};
 
 impl<S, N, D> ShardLoop<S, N, D>
 where
-    S: Storage,
+    S: ShardStorage,
     N: Network,
     D: Dispatch,
 {
@@ -250,7 +250,7 @@ where
 
 impl<S, N, D> NodeHost<S, N, D>
 where
-    S: Storage,
+    S: ShardStorage,
     N: Network,
     D: Dispatch,
 {

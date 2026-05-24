@@ -17,7 +17,7 @@
 //! Eviction is lifecycle-driven: entries are dropped in
 //! [`ExecutionCoordinator::remove_finalized_wave`] once the wave's containing
 //! block commits, at which point the EC is durably available via
-//! [`Storage::get_execution_certificates_by_height`] and the network handler
+//! [`ShardStorage::get_execution_certificates_by_height`] and the network handler
 //! falls through to that on cache miss.
 //!
 //! Mirrors [`hyperscale_mempool::TxStore`] in shape and intent: a single
@@ -30,7 +30,7 @@
 //!
 //! [`ExecutionCertificate`]: hyperscale_types::ExecutionCertificate
 //! [`ExecutionCoordinator::remove_finalized_wave`]: crate::ExecutionCoordinator::remove_finalized_wave
-//! [`Storage::get_execution_certificates_by_height`]: hyperscale_storage::Storage::get_execution_certificates_by_height
+//! [`ShardStorage::get_execution_certificates_by_height`]: hyperscale_storage::ShardStorage::get_execution_certificates_by_height
 
 use std::sync::Arc;
 

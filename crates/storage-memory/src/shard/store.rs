@@ -1,4 +1,4 @@
-//! `SubstateStore` implementation for `SimStorage`.
+//! `SubstateStore` implementation for `SimShardStorage`.
 
 use std::sync::Arc;
 
@@ -8,10 +8,10 @@ use hyperscale_storage::tree::proofs::generate_proof;
 use hyperscale_storage::{DbSortKey, SubstateStore, VersionedStore};
 use hyperscale_types::{BlockHeight, MerkleInclusionProof, NodeId, StateRoot};
 
-use super::core::SimStorage;
+use super::core::SimShardStorage;
 use super::snapshot::SimSnapshot;
 
-impl SubstateStore for SimStorage {
+impl SubstateStore for SimShardStorage {
     type Snapshot<'a> = SimSnapshot;
 
     fn snapshot(&self) -> Self::Snapshot<'_> {
@@ -61,9 +61,9 @@ impl SubstateStore for SimStorage {
     }
 }
 
-impl VersionedStore for SimStorage {
+impl VersionedStore for SimShardStorage {
     fn snapshot_at(&self, height: BlockHeight) -> Self::Snapshot<'_> {
-        // Retention invariant: see `RocksDbStorage::snapshot_at` for the
+        // Retention invariant: see `RocksDbShardStorage::snapshot_at` for the
         // full reasoning. Below the floor we can't serve historical
         // reads; hitting this is a DA-assumption bug in the caller.
         let guard = read_or_recover(&self.state);
@@ -88,7 +88,7 @@ impl VersionedStore for SimStorage {
     }
 }
 
-impl TreeReader for SimStorage {
+impl TreeReader for SimShardStorage {
     fn get_node(&self, key: &JmtNodeKey) -> Option<Arc<JmtNode>> {
         read_or_recover(&self.state).tree_store.get_node(key)
     }

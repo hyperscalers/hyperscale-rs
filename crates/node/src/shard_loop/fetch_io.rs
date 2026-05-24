@@ -5,7 +5,7 @@ use std::time::Duration;
 use hyperscale_core::{ProtocolEvent, TimerId};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_network::Network;
-use hyperscale_storage::Storage;
+use hyperscale_storage::ShardStorage;
 
 use super::{ShardLoop, TimerOp};
 use crate::shard_io::fetch::binding::{
@@ -16,7 +16,7 @@ use crate::shard_io::fetch::{FetchInput, FetchOutput};
 
 impl<S, N, D> ShardLoop<S, N, D>
 where
-    S: Storage,
+    S: ShardStorage,
     N: Network,
     D: Dispatch,
 {
@@ -145,7 +145,7 @@ where
 
 impl<S, N, D> ShardLoop<S, N, D>
 where
-    S: Storage,
+    S: ShardStorage,
     N: Network,
     D: Dispatch,
 {

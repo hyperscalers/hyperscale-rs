@@ -14,7 +14,7 @@ use hyperscale_metrics::{
     record_sync_round_completed, record_sync_round_retried, record_sync_round_started,
 };
 use hyperscale_network::{Network, ResponseVerdict};
-use hyperscale_storage::Storage;
+use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::request::GetRemoteHeadersRequest;
 use hyperscale_types::network::response::GetRemoteHeadersResponse;
 use hyperscale_types::{
@@ -28,7 +28,7 @@ use crate::shard_loop::{FetchFailureKind, ShardLoop, ShardScopedInput, push_shar
 
 impl<S, N, D> ShardLoop<S, N, D>
 where
-    S: Storage,
+    S: ShardStorage,
     N: Network,
     D: Dispatch,
 {

@@ -16,14 +16,14 @@
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{GenesisConfig, prepared_genesis};
 use hyperscale_network::Network;
-use hyperscale_storage::{GenesisCommit, Storage};
+use hyperscale_storage::{GenesisCommit, ShardStorage};
 use hyperscale_types::{Block, ShardGroupId, StateRoot};
 
 use crate::host::NodeHost;
 
 impl<S, N, D> NodeHost<S, N, D>
 where
-    S: Storage,
+    S: ShardStorage,
     N: Network,
     D: Dispatch,
 {

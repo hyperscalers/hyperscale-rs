@@ -70,7 +70,7 @@ pub type ResetOldKeys = std::collections::HashMap<(Vec<u8>, u8), Vec<DbSortKey>>
 /// (version and root hash) is in the default CF under `jmt:metadata` and read
 /// directly from `RocksDB` on demand — always hot in the memtable since they're
 /// written on every commit.
-pub struct RocksDbStorage {
+pub struct RocksDbShardStorage {
     pub(crate) db: Arc<DB>,
 
     /// Serializes JMT-mutating commits to prevent interleaved read-modify-write
@@ -81,7 +81,7 @@ pub struct RocksDbStorage {
     pub(crate) jmt_history_length: u64,
 }
 
-impl RocksDbStorage {
+impl RocksDbShardStorage {
     /// Open or create a `RocksDB` database at the given path.
     ///
     /// Creates default column families: default, blocks, transactions, state, certificates.
@@ -698,14 +698,14 @@ impl RocksDbStorage {
     }
 }
 
-impl GenesisCommit for RocksDbStorage {
+impl GenesisCommit for RocksDbShardStorage {
     fn install_genesis(&self, merged: &DatabaseUpdates) -> StateRoot {
         Self::commit_substates_only(self, merged);
         Self::finalize_genesis_jmt(self, merged)
     }
 }
 
-impl SubstateDatabase for RocksDbStorage {
+impl SubstateDatabase for RocksDbShardStorage {
     #[instrument(level = Level::DEBUG, skip_all, fields(
         found = Empty,
         latency_us = Empty,
@@ -749,7 +749,7 @@ impl SubstateDatabase for RocksDbStorage {
     }
 }
 
-impl TreeReader for RocksDbStorage {
+impl TreeReader for RocksDbShardStorage {
     fn get_node(&self, key: &JmtNodeKey) -> Option<Arc<JmtNode>> {
         let stored_key = StoredNodeKey::from_jmt(key);
         self.cf_get::<JmtNodesCf>(&stored_key)
@@ -774,7 +774,7 @@ mod test_helpers {
 
     use super::*;
 
-    impl RocksDbStorage {
+    impl RocksDbShardStorage {
         /// Test helper: commits database updates with auto-incrementing JMT version.
         /// Production uses `commit_block` / `commit_prepared_block` instead.
         ///
@@ -847,7 +847,7 @@ mod test_helpers {
         }
     }
 
-    impl CommittableSubstateDatabase for RocksDbStorage {
+    impl CommittableSubstateDatabase for RocksDbShardStorage {
         fn commit(&mut self, updates: &DatabaseUpdates) {
             Self::commit(self, updates)
                 .expect("Storage commit failed - cannot maintain consistent state");

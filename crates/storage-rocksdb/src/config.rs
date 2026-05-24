@@ -1,7 +1,7 @@
 //! Configuration types for `RocksDB` storage.
 //!
 //! Pure tuning knobs shared by both the shard tier
-//! ([`crate::RocksDbStorage`]) and the beacon tier
+//! ([`crate::RocksDbShardStorage`]) and the beacon tier
 //! ([`crate::RocksDbBeaconStorage`]). Column-family sets are fixed per
 //! tier and live in the respective `column_families` submodules.
 

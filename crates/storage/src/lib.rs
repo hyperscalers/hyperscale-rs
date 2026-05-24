@@ -11,14 +11,14 @@
 //! `ProtocolEvent::ExecutionBatchCompleted` - it never touches storage directly.
 //!
 //! Runners own storage and pass it to the executor:
-//! - `SimulationRunner` uses in-memory storage (`SimStorage`)
-//! - `ProductionRunner` uses `RocksDB` (`RocksDbStorage`)
+//! - `SimulationRunner` uses in-memory storage (`SimShardStorage`)
+//! - `ProductionRunner` uses `RocksDB` (`RocksDbShardStorage`)
 //!
 //! # Jellyfish Merkle Tree (JMT)
 //!
 //! The `tree` module provides the binary Blake3 JMT state tree adapter.
 //! Storage backends implement `jmt::TreeReader` to provide tree access —
-//! both `RocksDB` and `SimStorage` hook into the same trait.
+//! both `RocksDB` and `SimShardStorage` hook into the same trait.
 
 #![warn(missing_docs)]
 
@@ -34,8 +34,8 @@ pub use beacon::chain_reader::BeaconChainReader;
 pub use beacon::chain_writer::BeaconChainWriter;
 pub use beacon::storage::BeaconStorage;
 use hyperscale_jmt::TreeReader;
-pub use shard::chain_reader::{BlockForSync, ChainReader};
-pub use shard::chain_writer::{BeaconWitnessCommit, ChainWriter, PreparedCommitBatchEntry};
+pub use shard::chain_reader::{BlockForSync, ShardChainReader};
+pub use shard::chain_writer::{BeaconWitnessCommit, PreparedCommitBatchEntry, ShardChainWriter};
 pub use shard::genesis::GenesisCommit;
 pub use shard::overlay::{SubstateDbLookup, SubstateLookup};
 pub use shard::pending_chain::{BaseReadCache, ChainEntry, PendingChain, SubstateView};
@@ -52,13 +52,19 @@ pub use tree::{CollectedWrites, JmtSnapshot, LeafSubstateKeyAssociation};
 /// `IoLoop` ultimately needs. For narrower scopes (block commit, shard consensus
 /// proposal building, provision handlers), bound on the specific traits
 /// directly so the signature reflects what the function actually touches.
-pub trait Storage:
-    ChainWriter + SubstateStore + VersionedStore + ChainReader + TreeReader + Send + Sync
+pub trait ShardStorage:
+    ShardChainWriter + SubstateStore + VersionedStore + ShardChainReader + TreeReader + Send + Sync
 {
 }
 
-impl<S> Storage for S where
-    S: ChainWriter + SubstateStore + VersionedStore + ChainReader + TreeReader + Send + Sync
+impl<S> ShardStorage for S where
+    S: ShardChainWriter
+        + SubstateStore
+        + VersionedStore
+        + ShardChainReader
+        + TreeReader
+        + Send
+        + Sync
 {
 }
 

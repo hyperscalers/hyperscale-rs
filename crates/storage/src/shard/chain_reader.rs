@@ -33,10 +33,10 @@ pub struct BlockForSync {
 /// Provides a uniform interface for reading blocks, certificates, receipts,
 /// and chain metadata across different storage backends.
 ///
-/// Block and certificate writes happen atomically via `ChainWriter`.
+/// Block and certificate writes happen atomically via `ShardChainWriter`.
 /// Vote persistence is not needed — in-memory tracking in shard consensus state
 /// is sufficient (nodes sync past voted heights on restart).
-pub trait ChainReader: Send + Sync + 'static {
+pub trait ShardChainReader: Send + Sync + 'static {
     /// Get a committed block by height.
     fn get_block(&self, height: BlockHeight) -> Option<CertifiedBlock>;
 

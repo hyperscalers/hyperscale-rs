@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use hyperscale_storage::{PendingChain, Storage};
+use hyperscale_storage::{PendingChain, ShardStorage};
 use hyperscale_types::network::request::GetFinalizedWavesRequest;
 use hyperscale_types::network::response::GetFinalizedWavesResponse;
 use hyperscale_types::{FinalizedWave, WaveId};
@@ -17,7 +17,7 @@ use quick_cache::sync::Cache as QuickCache;
 /// reconstruct the full `FinalizedWave` by pulling the certificate +
 /// receipts. Peers requesting waves past the cache window must still get a
 /// complete answer from durable storage.
-pub fn serve_finalized_waves_request<S: Storage>(
+pub fn serve_finalized_waves_request<S: ShardStorage>(
     pending_chain: &PendingChain<S>,
     fw_cache: &QuickCache<WaveId, Arc<FinalizedWave>>,
     req: &GetFinalizedWavesRequest,

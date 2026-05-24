@@ -43,8 +43,8 @@ use hyperscale_node::shard_loop::{ShardEvent, ShardLoop, TimerOp, timer_event};
 use hyperscale_node::{NodeConfig, NodeHost, NodeStateMachine, SharedTopologySnapshot, VnodeInit};
 use hyperscale_provisions::{ProvisionConfig, ProvisionStore};
 use hyperscale_shard::ShardConsensusConfig;
-use hyperscale_storage::ChainReader;
-use hyperscale_storage_rocksdb::{RocksDbStorage, SharedStorage};
+use hyperscale_storage::ShardChainReader;
+use hyperscale_storage_rocksdb::{RocksDbShardStorage, SharedStorage};
 use hyperscale_topology::TopologyCoordinator;
 use hyperscale_types::{
     Block, BlockHeight, Bls12381G1PrivateKey, CertifiedBlock, InFlightCount, LocalTimestamp,
@@ -164,7 +164,7 @@ pub struct VnodeConfig {
 pub struct ProductionRunnerBuilder {
     vnodes: Vec<VnodeConfig>,
     shard_config: ShardConsensusConfig,
-    storages: HashMap<ShardGroupId, Arc<RocksDbStorage>>,
+    storages: HashMap<ShardGroupId, Arc<RocksDbShardStorage>>,
     network_config: Libp2pConfig,
     dispatch: Option<Arc<PooledDispatch>>,
     channel_capacity: usize,
@@ -193,7 +193,7 @@ impl ProductionRunnerBuilder {
     pub fn new(
         vnodes: Vec<VnodeConfig>,
         shard_config: ShardConsensusConfig,
-        storages: HashMap<ShardGroupId, Arc<RocksDbStorage>>,
+        storages: HashMap<ShardGroupId, Arc<RocksDbShardStorage>>,
         network_config: Libp2pConfig,
     ) -> Self {
         assert!(
@@ -461,9 +461,9 @@ impl ProductionRunnerBuilder {
             })
             .collect();
 
-        // Wrap each per-shard `RocksDbStorage` in a `SharedStorage` for
+        // Wrap each per-shard `RocksDbShardStorage` in a `SharedStorage` for
         // `NodeHost::new`'s `HashMap<ShardGroupId, S>` argument; the
-        // runner keeps the bare `Arc<RocksDbStorage>`s alive for GC +
+        // runner keeps the bare `Arc<RocksDbShardStorage>`s alive for GC +
         // metrics.
         let shared_storages: HashMap<ShardGroupId, SharedStorage> = storages
             .iter()
@@ -578,7 +578,7 @@ pub struct ProductionRunner {
     /// loop's [`PinnedLoopConfig::storages`] for per-shard JMT GC and
     /// storage-memory metrics.
     #[allow(dead_code)]
-    storages: HashMap<ShardGroupId, Arc<RocksDbStorage>>,
+    storages: HashMap<ShardGroupId, Arc<RocksDbShardStorage>>,
     /// Thread pool dispatch.
     dispatch: Arc<PooledDispatch>,
     /// Every shard this runner hosts vnodes for.
@@ -619,7 +619,7 @@ impl ProductionRunner {
     pub fn builder(
         vnodes: Vec<VnodeConfig>,
         shard_config: ShardConsensusConfig,
-        storages: HashMap<ShardGroupId, Arc<RocksDbStorage>>,
+        storages: HashMap<ShardGroupId, Arc<RocksDbShardStorage>>,
         network_config: Libp2pConfig,
     ) -> ProductionRunnerBuilder {
         ProductionRunnerBuilder::new(vnodes, shard_config, storages, network_config)
@@ -974,7 +974,7 @@ impl ProductionRunner {
     /// passes on top of each other.
     fn schedule_jmt_gc(&self, in_flight: &Arc<std::sync::atomic::AtomicBool>) {
         in_flight.store(true, std::sync::atomic::Ordering::Relaxed);
-        let storages: Vec<(ShardGroupId, Arc<RocksDbStorage>)> = self
+        let storages: Vec<(ShardGroupId, Arc<RocksDbShardStorage>)> = self
             .storages
             .iter()
             .map(|(s, st)| (*s, Arc::clone(st)))

@@ -16,7 +16,7 @@ use std::sync::Arc;
 use crossbeam::channel::Sender;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::TransactionValidation;
-use hyperscale_storage::Storage;
+use hyperscale_storage::ShardStorage;
 use hyperscale_types::{RoutableTransaction, ShardGroupId, shard_for_node};
 
 use crate::event::{ShardEvent, ShardScopedInput};
@@ -30,7 +30,7 @@ use crate::shard_loop::{DispatchHandles, SharedTopologySnapshot};
 /// sharing.
 pub struct ProcessIo<S, N, D>
 where
-    S: Storage,
+    S: ShardStorage,
     D: Dispatch,
 {
     /// Network sender plus the registry of inbound gossip / request
@@ -71,7 +71,7 @@ where
 
 impl<S, N, D> ProcessIo<S, N, D>
 where
-    S: Storage,
+    S: ShardStorage,
     D: Dispatch,
 {
     /// Construct a `ProcessIo` from its shared resources. Callers wrap

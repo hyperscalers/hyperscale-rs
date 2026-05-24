@@ -7,7 +7,7 @@
 //! short-caps on the first missing height rather than failing.
 
 use hyperscale_metrics::record_fetch_response_sent;
-use hyperscale_storage::{PendingChain, Storage};
+use hyperscale_storage::{PendingChain, ShardStorage};
 use hyperscale_types::network::request::{GetRemoteHeadersRequest, MAX_REMOTE_HEADERS_PER_REQUEST};
 use hyperscale_types::network::response::GetRemoteHeadersResponse;
 use hyperscale_types::{BlockHeight, ShardGroupId};
@@ -30,7 +30,7 @@ use hyperscale_types::{BlockHeight, ShardGroupId};
 /// in response to a request for shard B headers; the requester filters
 /// only by height and would buffer them under the wrong shard scope,
 /// stalling sync until rotation.
-pub fn serve_remote_headers_request<S: Storage>(
+pub fn serve_remote_headers_request<S: ShardStorage>(
     pending_chain: &PendingChain<S>,
     local_shard: ShardGroupId,
     req: &GetRemoteHeadersRequest,

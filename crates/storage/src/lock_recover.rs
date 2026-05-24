@@ -9,9 +9,9 @@
 //!
 //! 2. **The lock spans test or process boundaries you don't want to
 //!    cascade.** In particular: storage backends shared across tests
-//!    (`SimStorage`) and pending-state caches that long-lived async
+//!    (`SimShardStorage`) and pending-state caches that long-lived async
 //!    machinery reads through (`PendingChain`). A panic in one test
-//!    poisoning a shared `SimStorage` would cascade across every
+//!    poisoning a shared `SimShardStorage` would cascade across every
 //!    subsequent test, even ones with nothing to do with the original
 //!    fault.
 //!

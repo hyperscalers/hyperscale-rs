@@ -1,4 +1,4 @@
-//! `ChainWriter` implementation for `RocksDbStorage`.
+//! `ShardChainWriter` implementation for `RocksDbShardStorage`.
 
 use std::sync::Arc;
 
@@ -6,7 +6,7 @@ use hyperscale_storage::tree::{
     OverlayTreeReader, jmt_parent_height, noop_jmt_snapshot, put_at_version,
 };
 use hyperscale_storage::{
-    BaseReadCache, BeaconWitnessCommit, ChainWriter, JmtSnapshot, PreparedCommitBatchEntry,
+    BaseReadCache, BeaconWitnessCommit, JmtSnapshot, PreparedCommitBatchEntry, ShardChainWriter,
     merge_database_updates, merge_updates_from_receipts,
 };
 use hyperscale_types::{
@@ -16,7 +16,7 @@ use radix_substate_store_interface::interface::DatabaseUpdates;
 use rocksdb::{WriteBatch, WriteOptions};
 
 use super::column_families::{ALL_COLUMN_FAMILIES, ConsensusReceiptsCf, ExecutionMetadataCf};
-use super::core::RocksDbStorage;
+use super::core::RocksDbShardStorage;
 use super::execution_certs::append_block_certs_to_batch;
 use super::jmt_snapshot_store::SnapshotTreeStore;
 use super::receipts::add_receipt_to_batch;
@@ -36,7 +36,7 @@ pub struct RocksDbPreparedCommit {
     pub(crate) jmt_snapshot: JmtSnapshot,
 }
 
-impl ChainWriter for RocksDbStorage {
+impl ShardChainWriter for RocksDbShardStorage {
     type PreparedCommit = RocksDbPreparedCommit;
 
     fn jmt_snapshot(prepared: &Self::PreparedCommit) -> &JmtSnapshot {
@@ -274,7 +274,7 @@ impl ChainWriter for RocksDbStorage {
     }
 }
 
-impl RocksDbStorage {
+impl RocksDbShardStorage {
     /// Internal commit path used by `commit_block` (sync blocks without a `PreparedCommit`).
     ///
     /// The caller MUST hold `self.commit_lock`. The callers that do are

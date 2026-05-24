@@ -10,7 +10,7 @@ use std::sync::Arc;
 use hyperscale_dispatch::Parallelism;
 use hyperscale_engine::{ProcessExecutionCache, RadixExecutor};
 use hyperscale_network::Network;
-use hyperscale_storage::{PendingChain, Storage};
+use hyperscale_storage::{PendingChain, ShardStorage};
 use hyperscale_types::{
     BlockHash, BlockHeight, Bls12381G1PrivateKey, ConsensusReceipt, TopologySnapshot,
 };
@@ -24,7 +24,7 @@ use crate::ProtocolEvent;
 /// block lives on the `Action` variant itself, so the dispatcher doesn't
 /// need to know which actions read state at which anchor.
 #[allow(missing_docs)] // bag of references; field names match the borrowed types
-pub struct ActionContext<'a, S: Storage, N: Network> {
+pub struct ActionContext<'a, S: ShardStorage, N: Network> {
     pub executor: &'a RadixExecutor,
     pub topology_snapshot: &'a TopologySnapshot,
     /// Chain-state lookup. Handlers that read state call
@@ -59,7 +59,7 @@ pub struct ActionContext<'a, S: Storage, N: Network> {
     pub par: Parallelism,
 }
 
-impl<S: Storage, N: Network> ActionContext<'_, S, N> {
+impl<S: ShardStorage, N: Network> ActionContext<'_, S, N> {
     /// Invoke `notify`; common spelling at action-handler call sites.
     pub fn notify_protocol(&self, event: ProtocolEvent) {
         (self.notify)(event);

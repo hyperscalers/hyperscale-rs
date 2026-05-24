@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use hyperscale_dispatch::Dispatch;
 use hyperscale_network::Network;
-use hyperscale_storage::Storage;
+use hyperscale_storage::ShardStorage;
 use hyperscale_types::{
     BlockHeight, InFlightCount, MAX_TX_IN_FLIGHT, ShardGroupId, StateRoot, ValidatorId,
 };
@@ -88,7 +88,7 @@ impl NodeStatusSnapshot {
 
 impl<S, N, D> NodeHost<S, N, D>
 where
-    S: Storage,
+    S: ShardStorage,
     N: Network,
     D: Dispatch,
 {

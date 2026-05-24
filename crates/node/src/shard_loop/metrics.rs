@@ -29,7 +29,7 @@ use hyperscale_metrics::{
     set_view_syncs,
 };
 use hyperscale_network::Network;
-use hyperscale_storage::Storage;
+use hyperscale_storage::ShardStorage;
 use hyperscale_types::{ShardGroupId, ValidatorId};
 
 use crate::host::NodeHost;
@@ -143,7 +143,7 @@ pub fn record_metrics(
 
 impl<S, N, D> super::ShardLoop<S, N, D>
 where
-    S: Storage,
+    S: ShardStorage,
     N: Network,
     D: Dispatch,
 {
@@ -216,7 +216,7 @@ where
 
 impl<S, N, D> NodeHost<S, N, D>
 where
-    S: Storage,
+    S: ShardStorage,
     N: Network,
     D: Dispatch,
 {

@@ -1,4 +1,4 @@
-//! Core `SimStorage` struct and basic implementations.
+//! Core `SimShardStorage` struct and basic implementations.
 //!
 //! In-memory storage for deterministic simulation testing (DST).
 //! Substates live in two `BTreeMaps`: `current_state: (storage_key →
@@ -25,7 +25,7 @@ use super::state::{ConsensusState, SharedState, apply_updates};
 /// Substates live in a `current_state` `BTreeMap` (authoritative for
 /// current-tip reads) with a companion `state_history` `BTreeMap`
 /// capturing per-write prior values for historical reads. This mirrors
-/// `RocksDbStorage`'s two-CF layout.
+/// `RocksDbShardStorage`'s two-CF layout.
 ///
 /// Implements Radix's `SubstateDatabase` directly, plus our `SubstateStore` /
 /// `VersionedStore` extensions for snapshots, node listing, and JMT state
@@ -39,7 +39,7 @@ use super::state::{ConsensusState, SharedState, apply_updates};
 ///   Write lock for commits (substate writes + JMT updates in one acquisition).
 /// - `consensus`: Block metadata, certificates, votes, committed state.
 ///   Separate because consensus metadata is independent of substate/JMT state.
-pub struct SimStorage {
+pub struct SimShardStorage {
     /// Substate data + JMT state (single `RwLock`).
     pub(crate) state: Arc<RwLock<SharedState>>,
 
@@ -54,13 +54,13 @@ pub struct SimStorage {
     pub(crate) jmt_history_length: u64,
 }
 
-impl Default for SimStorage {
+impl Default for SimShardStorage {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl SimStorage {
+impl SimShardStorage {
     /// Create a new empty simulated storage.
     #[must_use]
     pub fn new() -> Self {
@@ -176,14 +176,14 @@ impl SimStorage {
     }
 }
 
-impl GenesisCommit for SimStorage {
+impl GenesisCommit for SimShardStorage {
     fn install_genesis(&self, merged: &DatabaseUpdates) -> StateRoot {
         Self::commit_substates_only(self, merged);
         Self::finalize_genesis_jmt(self, merged)
     }
 }
 
-impl SubstateDatabase for SimStorage {
+impl SubstateDatabase for SimShardStorage {
     fn get_raw_substate_by_db_key(
         &self,
         partition_key: &DbPartitionKey,

@@ -5,10 +5,10 @@ use hyperscale_storage::{RecoveredState, SubstateStore};
 use hyperscale_types::{BlockHash, BlockHeight, Hash, ShardWitnessPayload};
 
 use super::column_families::BeaconWitnessesCf;
-use super::core::RocksDbStorage;
+use super::core::RocksDbShardStorage;
 use crate::typed_cf::{TypedCf, iter_all};
 
-impl RocksDbStorage {
+impl RocksDbShardStorage {
     /// Load recovered state from storage for crash recovery.
     ///
     /// This should be called on startup before creating the state machine.

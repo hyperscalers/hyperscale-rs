@@ -23,7 +23,7 @@ const VERSION_LEN: usize = 8;
 
 /// Point-in-time `RocksDB` snapshot scoped to a specific version within
 /// the retention window. Retention enforcement happens at construction
-/// in `RocksDbStorage::snapshot_at`.
+/// in `RocksDbShardStorage::snapshot_at`.
 pub struct RocksDbSnapshot<'a> {
     pub(crate) snapshot: Snapshot<'a>,
     pub(crate) db: &'a DB,

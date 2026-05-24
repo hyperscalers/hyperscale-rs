@@ -24,7 +24,8 @@ use hyperscale_core::{CommitSource, PreparedBlock, ProtocolEvent};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_metrics::{record_block_committed, set_block_height};
 use hyperscale_storage::{
-    BeaconWitnessCommit, ChainEntry, ChainWriter, PendingChain, PreparedCommitBatchEntry, Storage,
+    BeaconWitnessCommit, ChainEntry, PendingChain, PreparedCommitBatchEntry, ShardChainWriter,
+    ShardStorage,
 };
 #[cfg(test)]
 use hyperscale_types::BeaconWitnessLeafCount;
@@ -46,7 +47,7 @@ pub type NotifyHandles = (Arc<Block>, Arc<QuorumCertificate>);
 /// Shared between the coordinator and the delegated-action dispatch closures
 /// that produce prepared commits asynchronously on the consensus crypto pool.
 pub type PreparedCommitMap<S> =
-    HashMap<BlockHash, (BlockHeight, <S as ChainWriter>::PreparedCommit)>;
+    HashMap<BlockHash, (BlockHeight, <S as ShardChainWriter>::PreparedCommit)>;
 
 /// Whether a queued QC-only commit needs JMT recomputation or can
 /// reuse a `PreparedCommit` already in the cache. Set when the shard
@@ -157,7 +158,7 @@ pub fn run_qc_only_prep<S>(
     pending: &QcOnlyPending,
 ) -> Result<(), Box<QcOnlyDivergence>>
 where
-    S: Storage,
+    S: ShardStorage,
 {
     let block_hash = pending.block.hash();
     let height = pending.block.height();
@@ -245,7 +246,7 @@ pub fn make_commit_prepared<S>(
     prepared_commits: Arc<Mutex<PreparedCommitMap<S>>>,
 ) -> impl Fn(PreparedBlock<S::PreparedCommit>) + Send + Sync + 'static
 where
-    S: Storage,
+    S: ShardStorage,
 {
     move |prep: PreparedBlock<S::PreparedCommit>| {
         let PreparedBlock {
@@ -316,7 +317,7 @@ pub enum AccumulateDecision {
     },
 }
 
-pub struct BlockCommitCoordinator<S: ChainWriter> {
+pub struct BlockCommitCoordinator<S: ShardChainWriter> {
     /// Shard this coordinator persists for. Stamped onto emitted
     /// `BlockPersisted` events.
     shard: ShardGroupId,
@@ -361,7 +362,7 @@ pub struct BlockCommitCoordinator<S: ChainWriter> {
 
 impl<S> BlockCommitCoordinator<S>
 where
-    S: ChainWriter + Send + Sync + 'static,
+    S: ShardChainWriter + Send + Sync + 'static,
 {
     /// Maximum number of blocks consensus can advance ahead of persistence
     /// before falling back to deferred `BlockCommitted` notification.
@@ -756,7 +757,7 @@ mod tests {
         tag: u64,
     }
 
-    /// `ChainWriter` impl that records the order in which heights are committed.
+    /// `ShardChainWriter` impl that records the order in which heights are committed.
     /// `prepare_block_commit` / `commit_block` are unreachable in these tests
     /// because `BlockCommitCoordinator` only calls `commit_prepared_blocks`.
     #[derive(Default)]
@@ -784,7 +785,7 @@ mod tests {
         }
     }
 
-    impl ChainWriter for MockStorage {
+    impl ShardChainWriter for MockStorage {
         type PreparedCommit = MockPrepared;
 
         fn jmt_snapshot(prepared: &Self::PreparedCommit) -> &JmtSnapshot {

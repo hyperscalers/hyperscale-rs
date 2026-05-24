@@ -8,7 +8,7 @@ use hyperscale_types::{Block, ExecutionCertificate};
 use rocksdb::{ColumnFamily, WriteBatch};
 
 use super::column_families::ExecutionCertsCf;
-use super::core::RocksDbStorage;
+use super::core::RocksDbShardStorage;
 use crate::typed_cf::{TypedCf, batch_put_raw};
 
 /// Append execution certificate writes for a block to an existing `WriteBatch`.
@@ -16,7 +16,7 @@ use crate::typed_cf::{TypedCf, batch_put_raw};
 /// Extracts ECs from the block's wave certificates and folds them into the
 /// same atomic batch as JMT + block data (one fsync per block).
 pub fn append_block_certs_to_batch(
-    storage: &RocksDbStorage,
+    storage: &RocksDbShardStorage,
     batch: &mut WriteBatch,
     block: &Arc<Block>,
 ) {

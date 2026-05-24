@@ -1,4 +1,4 @@
-//! `ChainWriter` implementation for `SimStorage`.
+//! `ShardChainWriter` implementation for `SimShardStorage`.
 
 use std::sync::Arc;
 
@@ -7,17 +7,17 @@ use hyperscale_storage::tree::{
     OverlayTreeReader, jmt_parent_height, noop_jmt_snapshot, put_at_version,
 };
 use hyperscale_storage::{
-    BaseReadCache, BeaconWitnessCommit, ChainWriter, DatabaseUpdates, JmtSnapshot,
-    PreparedCommitBatchEntry, merge_updates_from_receipts,
+    BaseReadCache, BeaconWitnessCommit, DatabaseUpdates, JmtSnapshot, PreparedCommitBatchEntry,
+    ShardChainWriter, merge_updates_from_receipts,
 };
 use hyperscale_types::{
     Block, BlockHeight, CertifiedBlock, FinalizedWave, QuorumCertificate, StateRoot, StoredReceipt,
 };
 
-use super::core::SimStorage;
+use super::core::SimShardStorage;
 use super::state::apply_updates;
 
-/// Precomputed commit work for a `SimStorage` block commit.
+/// Precomputed commit work for a `SimShardStorage` block commit.
 ///
 /// Contains a `JmtSnapshot` (precomputed merkle tree nodes) plus the
 /// merged updates and receipts for substate application at commit time.
@@ -27,7 +27,7 @@ pub struct SimPreparedCommit {
     receipts: Vec<StoredReceipt>,
 }
 
-impl ChainWriter for SimStorage {
+impl ShardChainWriter for SimShardStorage {
     type PreparedCommit = SimPreparedCommit;
 
     fn jmt_snapshot(prepared: &Self::PreparedCommit) -> &JmtSnapshot {
@@ -200,7 +200,7 @@ impl ChainWriter for SimStorage {
     }
 }
 
-impl SimStorage {
+impl SimShardStorage {
     /// Append `witness.leaves` into the in-memory beacon-witness map.
     /// Lives next to the commit paths so both prepared-commit and
     /// from-scratch commits share one entry point.
@@ -217,7 +217,7 @@ impl SimStorage {
     }
 }
 
-impl SimStorage {
+impl SimShardStorage {
     /// Internal commit path used by `commit_block` (sync blocks without a `PreparedCommit`).
     fn commit_block_inner(
         &self,

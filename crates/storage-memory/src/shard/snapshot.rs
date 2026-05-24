@@ -18,7 +18,7 @@ use hyperscale_types::NodeId;
 
 /// Point-in-time snapshot of in-memory storage scoped to a specific
 /// version within the retention window. Retention enforcement happens
-/// at construction in `SimStorage::snapshot_at`.
+/// at construction in `SimShardStorage::snapshot_at`.
 pub struct SimSnapshot {
     pub(crate) current_state: BTreeMap<Vec<u8>, Vec<u8>>,
     pub(crate) state_history: BTreeMap<(Vec<u8>, u64), Option<Vec<u8>>>,

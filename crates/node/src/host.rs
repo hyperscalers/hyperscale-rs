@@ -17,7 +17,7 @@ use crossbeam::channel::Sender;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{ProcessExecutionCache, RadixExecutor, TransactionValidation};
 use hyperscale_network::Network;
-use hyperscale_storage::{PendingChain, Storage};
+use hyperscale_storage::{PendingChain, ShardStorage};
 use hyperscale_types::{LocalTimestamp, ShardGroupId, TransactionStatus, TxHash};
 use quick_cache::sync::Cache as QuickCache;
 
@@ -48,12 +48,12 @@ pub type NodeHostParts<S, N, D> = (
 /// [`ShardLoop`] per hosted shard.
 ///
 /// Generic over:
-/// - `S`: Storage (umbrella bound — see [`Storage`])
+/// - `S`: `ShardStorage` (umbrella bound — see [`ShardStorage`])
 /// - `N`: Network (message sending)
 /// - `D`: Dispatch (thread pool work scheduling)
 pub struct NodeHost<S, N, D>
 where
-    S: Storage,
+    S: ShardStorage,
     D: Dispatch,
 {
     /// One [`ShardLoop`] per hosted shard. State machines are driven
@@ -75,7 +75,7 @@ where
 
 impl<S, N, D> NodeHost<S, N, D>
 where
-    S: Storage,
+    S: ShardStorage,
     N: Network,
     D: Dispatch,
 {

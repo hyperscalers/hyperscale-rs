@@ -18,7 +18,7 @@ use hyperscale_engine::{
 };
 use hyperscale_metrics::record_execution_latency;
 use hyperscale_network::Network;
-use hyperscale_storage::{Storage, SubstateStore, SubstateView};
+use hyperscale_storage::{ShardStorage, SubstateStore, SubstateView};
 use hyperscale_types::network::notification::{
     ExecutionCertificatesNotification, ExecutionVotesNotification,
 };
@@ -300,7 +300,7 @@ fn batch_compute_cached(
 #[allow(clippy::too_many_lines)] // single dispatch over execution-owned Action variants
 pub fn handle_action<S, N>(action: Action, ctx: &ActionContext<'_, S, N>)
 where
-    S: Storage,
+    S: ShardStorage,
     N: Network,
 {
     match action {

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use hyperscale_core::{Action, ActionContext, PreparedBlock, ProtocolEvent, VerificationKind};
 use hyperscale_metrics::record_signature_verification_latency;
 use hyperscale_network::Network;
-use hyperscale_storage::{ChainWriter, JmtSnapshot, Storage, SubstateStore};
+use hyperscale_storage::{JmtSnapshot, ShardChainWriter, ShardStorage, SubstateStore};
 use hyperscale_types::network::gossip::CommittedBlockHeaderGossip;
 use hyperscale_types::network::notification::{BlockHeaderNotification, BlockVoteNotification};
 use hyperscale_types::{
@@ -396,7 +396,7 @@ pub struct StateRootResult<P: Send> {
 /// Calls `storage.prepare_block_commit()` to compute the speculative state root
 /// from the wave receipts, then compares against the expected root. Returns the
 /// prepared commit handle for caching on success.
-pub fn verify_state_root<S: ChainWriter + SubstateStore>(
+pub fn verify_state_root<S: ShardChainWriter + SubstateStore>(
     storage: &S,
     parent_state_root: StateRoot,
     parent_block_height: BlockHeight,
@@ -468,7 +468,7 @@ pub struct ProposalResult<P: Send> {
 /// 3. Build `BlockHeader` + `Block`, hash it
 /// 4. Return block, hash, prepared commit handle
 #[allow(clippy::too_many_arguments)]
-pub fn build_proposal<S: ChainWriter + SubstateStore>(
+pub fn build_proposal<S: ShardChainWriter + SubstateStore>(
     storage: &S,
     proposer: ValidatorId,
     height: BlockHeight,
@@ -589,7 +589,7 @@ fn collect_finalized_receipts(waves: &[Arc<FinalizedWave>]) -> Vec<Arc<Consensus
 #[allow(clippy::too_many_lines)] // single dispatch over shard-owned Action variants
 pub fn handle_action<S, N>(action: Action, ctx: &ActionContext<'_, S, N>)
 where
-    S: Storage,
+    S: ShardStorage,
     N: Network,
 {
     match action {

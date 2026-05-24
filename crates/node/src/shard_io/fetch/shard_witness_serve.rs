@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use hyperscale_storage::{PendingChain, Storage};
+use hyperscale_storage::{PendingChain, ShardStorage};
 use hyperscale_types::network::request::beacon::GetShardWitnessesRequest;
 use hyperscale_types::network::response::beacon::GetShardWitnessesResponse;
 use hyperscale_types::{
@@ -34,7 +34,7 @@ use tracing::{debug, warn};
 ///    to another peer rather than receiving proofs against the wrong
 ///    root.
 /// 3. Read retained leaf payloads via
-///    [`ChainReader::get_beacon_witness_payloads`](hyperscale_storage::ChainReader)
+///    [`ShardChainReader::get_beacon_witness_payloads`](hyperscale_storage::ShardChainReader)
 ///    up to `header.beacon_witness_leaf_count()`. A retention-pruned
 ///    anchor returns short — those leaves yield no proof and are
 ///    silently skipped.
@@ -48,7 +48,7 @@ use tracing::{debug, warn};
 /// silently dropped from the response (the responder has no leaf at
 /// that position to prove). Requesters detect missing indices by
 /// pairing the response order against their request's order.
-pub fn serve_shard_witnesses_request<S: Storage>(
+pub fn serve_shard_witnesses_request<S: ShardStorage>(
     pending_chain: &PendingChain<S>,
     req: &GetShardWitnessesRequest,
 ) -> GetShardWitnessesResponse {
@@ -119,8 +119,8 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
-    use hyperscale_storage::{BeaconWitnessCommit, ChainWriter, PendingChain};
-    use hyperscale_storage_memory::SimStorage;
+    use hyperscale_storage::{BeaconWitnessCommit, PendingChain, ShardChainWriter};
+    use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::network::request::beacon::GetShardWitnessesRequest;
     use hyperscale_types::{
         BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight,
@@ -186,7 +186,7 @@ mod tests {
     /// accumulator state after appending `leaves`, with the leaves
     /// folded into the same atomic write.
     fn commit_block_with_witnesses(
-        storage: &SimStorage,
+        storage: &SimShardStorage,
         height: BlockHeight,
         leaves: &[ShardWitnessPayload],
         starting_leaf_index: BeaconWitnessLeafCount,
@@ -215,7 +215,7 @@ mod tests {
 
     #[test]
     fn fetch_returns_proofs_that_verify_against_the_anchor_root() {
-        let storage = Arc::new(SimStorage::new());
+        let storage = Arc::new(SimShardStorage::new());
         let leaves: Vec<_> = (1u64..=5).map(deposit).collect();
         let (block_hash, root, _count) = commit_block_with_witnesses(
             &storage,
@@ -253,7 +253,7 @@ mod tests {
 
     #[test]
     fn fetch_against_unknown_block_height_returns_empty() {
-        let storage = Arc::new(SimStorage::new());
+        let storage = Arc::new(SimShardStorage::new());
         let pending_chain = PendingChain::new(storage);
         let req = GetShardWitnessesRequest::new(
             SHARD,
@@ -267,7 +267,7 @@ mod tests {
 
     #[test]
     fn fetch_against_fork_divergent_hash_returns_empty() {
-        let storage = Arc::new(SimStorage::new());
+        let storage = Arc::new(SimShardStorage::new());
         let leaves: Vec<_> = (1u64..=3).map(deposit).collect();
         let (_block_hash, _root, _count) = commit_block_with_witnesses(
             &storage,
@@ -292,7 +292,7 @@ mod tests {
 
     #[test]
     fn fetch_silently_drops_out_of_range_indices() {
-        let storage = Arc::new(SimStorage::new());
+        let storage = Arc::new(SimShardStorage::new());
         let leaves: Vec<_> = (1u64..=3).map(deposit).collect();
         let (block_hash, _root, _count) = commit_block_with_witnesses(
             &storage,
@@ -316,7 +316,7 @@ mod tests {
 
     #[test]
     fn fetch_returns_empty_when_anchor_has_zero_leaves() {
-        let storage = Arc::new(SimStorage::new());
+        let storage = Arc::new(SimShardStorage::new());
         let (block_hash, _root, _count) = commit_block_with_witnesses(
             &storage,
             BlockHeight::new(1),

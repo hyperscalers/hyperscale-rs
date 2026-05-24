@@ -16,7 +16,7 @@ use radix_substate_store_interface::interface::{DbSortKey, SubstateDatabase};
 /// internally to maintain cryptographic state roots, updated on each
 /// `commit_block()`.
 ///
-/// Runner storage types (`SimStorage`, `RocksDbStorage`) implement this trait
+/// Runner storage types (`SimShardStorage`, `RocksDbShardStorage`) implement this trait
 /// along with `SubstateDatabase`. They additionally implement [`VersionedStore`]
 /// for explicit historical-version reads; views do not, since a view carries
 /// a bound anchor and has no meaningful answer for an arbitrary version.
@@ -34,7 +34,7 @@ pub trait SubstateStore: SubstateDatabase + Send + Sync + 'static {
 
     /// Create a snapshot at the impl-defined default version.
     ///
-    /// - Base storage (`RocksDbStorage`, `SimStorage`): snapshots at the
+    /// - Base storage (`RocksDbShardStorage`, `SimShardStorage`): snapshots at the
     ///   current `jmt_height()`, i.e. the latest committed state.
     /// - [`crate::pending_chain::SubstateView`]: snapshots at the view's
     ///   bound anchor height, combining the overlay with a version-anchored
@@ -89,7 +89,7 @@ pub trait SubstateStore: SubstateDatabase + Send + Sync + 'static {
 /// Storage that supports reads at an explicit historical version.
 ///
 /// Implemented by base storage types that own the state-history log —
-/// `RocksDbStorage` and `SimStorage`. Views do **not** implement this:
+/// `RocksDbShardStorage` and `SimShardStorage`. Views do **not** implement this:
 /// a view is bound to a single anchor, so asking for "snapshot at
 /// arbitrary version V" is not meaningful. Views produce anchor-based
 /// snapshots via [`SubstateStore::snapshot`], which internally delegate

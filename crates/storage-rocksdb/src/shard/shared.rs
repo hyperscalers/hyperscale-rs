@@ -1,21 +1,21 @@
-//! `SharedStorage` newtype — Arc-wrapped `RocksDbStorage` with full trait impls.
+//! `SharedStorage` newtype — Arc-wrapped `RocksDbShardStorage` with full trait impls.
 //!
-//! Production wraps `Arc<RocksDbStorage>` in this newtype so that the pinned
+//! Production wraps `Arc<RocksDbShardStorage>` in this newtype so that the pinned
 //! `IoLoop` thread and async tasks (e.g. `InboundRouter`) can both hold the
 //! same underlying database via cheap Arc clones, each going through the same
 //! storage-trait implementations.
 //!
 //! The orphan rule prevents implementing foreign traits (`SubstateDatabase`,
-//! `CommittableSubstateDatabase`) for `Arc<RocksDbStorage>` directly. This
+//! `CommittableSubstateDatabase`) for `Arc<RocksDbShardStorage>` directly. This
 //! newtype sidesteps that while providing zero-cost delegation.
 
 use std::sync::Arc;
 
 use hyperscale_jmt::{Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_storage::{
-    BaseReadCache, BeaconWitnessCommit, BlockForSync, ChainReader, ChainWriter, DatabaseUpdates,
-    DbPartitionKey, DbSortKey, DbSubstateValue, GenesisCommit, JmtSnapshot, PartitionEntry,
-    PreparedCommitBatchEntry, SubstateDatabase, SubstateStore, VersionedStore,
+    BaseReadCache, BeaconWitnessCommit, BlockForSync, DatabaseUpdates, DbPartitionKey, DbSortKey,
+    DbSubstateValue, GenesisCommit, JmtSnapshot, PartitionEntry, PreparedCommitBatchEntry,
+    ShardChainReader, ShardChainWriter, SubstateDatabase, SubstateStore, VersionedStore,
 };
 use hyperscale_types::{
     BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, CertifiedBlock, CommittedBlockHeader,
@@ -25,39 +25,39 @@ use hyperscale_types::{
 };
 
 use super::chain_writer::RocksDbPreparedCommit;
-use super::core::RocksDbStorage;
+use super::core::RocksDbShardStorage;
 use super::snapshot::RocksDbSnapshot;
 
 /// Shared `RocksDB` storage handle with full storage trait implementations.
 ///
-/// A cheap-to-clone wrapper around `Arc<RocksDbStorage>` that implements all
+/// A cheap-to-clone wrapper around `Arc<RocksDbShardStorage>` that implements all
 /// storage traits needed by `IoLoop`. The pinned thread and async tasks
 /// share the same underlying database via Arc clones of this handle.
 ///
 /// # Why a newtype?
 ///
 /// Rust's orphan rule prevents implementing foreign traits (`SubstateDatabase`,
-/// `CommittableSubstateDatabase`) for `Arc<RocksDbStorage>`. This local newtype
+/// `CommittableSubstateDatabase`) for `Arc<RocksDbShardStorage>`. This local newtype
 /// can implement all traits while `Arc::clone` keeps sharing cheap.
 #[derive(Clone)]
-pub struct SharedStorage(pub Arc<RocksDbStorage>);
+pub struct SharedStorage(pub Arc<RocksDbShardStorage>);
 
 impl SharedStorage {
     /// Create a new shared storage handle.
-    pub const fn new(storage: Arc<RocksDbStorage>) -> Self {
+    pub const fn new(storage: Arc<RocksDbShardStorage>) -> Self {
         Self(storage)
     }
 
-    /// Get a reference to the underlying `Arc<RocksDbStorage>`.
+    /// Get a reference to the underlying `Arc<RocksDbShardStorage>`.
     #[must_use]
-    pub const fn arc(&self) -> &Arc<RocksDbStorage> {
+    pub const fn arc(&self) -> &Arc<RocksDbShardStorage> {
         &self.0
     }
 }
 
 impl std::ops::Deref for SharedStorage {
-    type Target = RocksDbStorage;
-    fn deref(&self) -> &RocksDbStorage {
+    type Target = RocksDbShardStorage;
+    fn deref(&self) -> &RocksDbShardStorage {
         &self.0
     }
 }
@@ -140,7 +140,7 @@ impl TreeReader for SharedStorage {
     }
 }
 
-impl ChainWriter for SharedStorage {
+impl ShardChainWriter for SharedStorage {
     type PreparedCommit = RocksDbPreparedCommit;
 
     fn jmt_snapshot(prepared: &Self::PreparedCommit) -> &JmtSnapshot {
@@ -187,13 +187,13 @@ impl ChainWriter for SharedStorage {
     }
 }
 
-impl ChainReader for SharedStorage {
+impl ShardChainReader for SharedStorage {
     fn get_block(&self, height: BlockHeight) -> Option<CertifiedBlock> {
         self.0.get_block(height)
     }
 
     fn get_committed_header(&self, height: BlockHeight) -> Option<CommittedBlockHeader> {
-        ChainReader::get_committed_header(&*self.0, height)
+        ShardChainReader::get_committed_header(&*self.0, height)
     }
 
     fn committed_height(&self) -> BlockHeight {
@@ -209,7 +209,7 @@ impl ChainReader for SharedStorage {
     }
 
     fn get_block_for_sync(&self, height: BlockHeight) -> Option<BlockForSync> {
-        ChainReader::get_block_for_sync(&*self.0, height)
+        ShardChainReader::get_block_for_sync(&*self.0, height)
     }
 
     fn get_transactions_batch(&self, hashes: &[TxHash]) -> Vec<RoutableTransaction> {
@@ -245,7 +245,7 @@ mod test_helpers {
 
     impl CommittableSubstateDatabase for SharedStorage {
         fn commit(&mut self, updates: &DatabaseUpdates) {
-            RocksDbStorage::commit(&self.0, updates)
+            RocksDbShardStorage::commit(&self.0, updates)
                 .expect("Storage commit failed - cannot maintain consistent state");
         }
     }
