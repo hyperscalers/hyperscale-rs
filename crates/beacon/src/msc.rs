@@ -444,9 +444,7 @@ impl MscInstance {
 
     fn on_timer_expired(&mut self, id: MscTimerId) -> Vec<MscEffect> {
         match id {
-            // Slot timer: B.4.3.d adds proposal-collection-deadline
-            // handling (forces SPC input with whatever's buffered).
-            MscTimerId::Slot(_) => vec![],
+            MscTimerId::Slot(slot) => self.on_slot_timer(slot),
             MscTimerId::View { slot, view } => {
                 let Some(slot_state) = self.slots.get_mut(&slot) else {
                     return vec![];
@@ -455,6 +453,31 @@ impl MscInstance {
                 self.translate_spc_effects(slot, spc_effects)
             }
         }
+    }
+
+    /// Slot proposal-collection deadline. Forces `try_feed_slot_input`
+    /// even on a partial buffer — missing positions become
+    /// [`HASH_BOTTOM`] in the computed input vector. Idempotent if
+    /// SPC has already been fed (e.g., all `n` proposals arrived
+    /// before the timer).
+    fn on_slot_timer(&mut self, slot: Slot) -> Vec<MscEffect> {
+        if slot.inner() != self.current_slot {
+            return vec![];
+        }
+        let Some(slot_state) = self.slots.get_mut(&slot) else {
+            return vec![];
+        };
+        if slot_state.spc_input_fed {
+            return vec![];
+        }
+        // Force-feed, ignoring the `proposals.len() == n` gate.
+        slot_state.spc_input_fed = true;
+        let input = self.compute_slot_input(slot);
+        let Some(slot_state) = self.slots.get_mut(&slot) else {
+            return vec![];
+        };
+        let spc_effects = slot_state.spc.handle(SpcEvent::Input(input));
+        self.translate_spc_effects(slot, spc_effects)
     }
 
     /// Lift the effects produced by a slot's [`SpcInstance`] into
@@ -522,6 +545,10 @@ impl MscInstance {
     /// Resolve each non-bottom hash in `high` against
     /// `proposals_by_hash` and emit [`MscEffect::SlotCommitted`] with
     /// the included `(sender, content)` pairs in rank order.
+    ///
+    /// After emitting, attempts to advance to the next slot — if
+    /// `pending_inputs` has an entry, [`Self::start_next_slot`] kicks
+    /// off slot `slot + 1`'s SPC.
     fn commit_slot(&mut self, slot: Slot, high: &PcVector) -> Vec<MscEffect> {
         let Some(slot_state) = self.slots.get_mut(&slot) else {
             return vec![];
@@ -541,7 +568,15 @@ impl MscInstance {
                 included.push((*signer, prop.content.clone()));
             }
         }
-        vec![MscEffect::SlotCommitted { slot, included }]
+        let mut out = vec![MscEffect::SlotCommitted { slot, included }];
+        // Advance to slot+1 if there's a pending input waiting. Only
+        // current_slot's commit triggers this; commit walks on stale
+        // slots (e.g. peer-relayed NewCommits for already-committed
+        // slots) leave current_slot alone.
+        if slot.inner() == self.current_slot {
+            out.extend(self.start_next_slot());
+        }
+        out
     }
 
     /// Try to feed the slot's SPC instance its input vector. Fires
@@ -1100,5 +1135,47 @@ mod tests {
             accusations: vec![],
         });
         assert!(effects.is_empty());
+    }
+
+    /// Slot timer for a non-current slot is dropped — only the
+    /// current slot's leader-grace period matters.
+    #[test]
+    fn slot_timer_for_non_current_slot_dropped() {
+        let mut fsm = msc_instance(0);
+        let _ = fsm.handle(MscEvent::Input(PcVector::empty()));
+        // current_slot = 1. Fire timer for slot 5.
+        let effects = fsm.handle(MscEvent::TimerExpired {
+            id: MscTimerId::Slot(Slot::new(5)),
+        });
+        assert!(effects.is_empty());
+    }
+
+    /// Slot timer that fires after SPC has already been fed is a
+    /// no-op — happy path where all `n` proposals arrived before
+    /// the timeout.
+    #[test]
+    fn slot_timer_after_spc_fed_is_noop() {
+        let mut fsm = msc_instance(0);
+        let _ = fsm.handle(MscEvent::Input(PcVector::empty()));
+        // Drive proposals from the other 3 parties + we already
+        // self-stored. Now `proposals.len() == n == 4`, so SPC fires.
+        for i in 1..4 {
+            let _ = fsm.handle(MscEvent::Proposal {
+                from: ValidatorId::new(i),
+                slot: Slot::new(1),
+                content: PcVector::empty(),
+                accusations: vec![],
+            });
+        }
+        // Subsequent slot timer is now a no-op — SPC already fed.
+        let effects = fsm.handle(MscEvent::TimerExpired {
+            id: MscTimerId::Slot(Slot::new(1)),
+        });
+        // No new MscEffect::SetTimer/BroadcastSpcMsg should fire here.
+        // (Empty or sub-flow that doesn't restart SPC.)
+        assert!(!effects.iter().any(|e| matches!(
+            e,
+            MscEffect::BroadcastSpcMsg { .. } | MscEffect::SetTimer { .. }
+        )));
     }
 }
