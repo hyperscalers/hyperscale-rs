@@ -31,7 +31,7 @@ pub const PC_VALUE_ELEMENT_BYTES: usize = 32;
 /// digest so committed vectors retain the hash function's collision
 /// resistance (~2^128 birthday work for the 32-byte digest) rather
 /// than the ~2^32 a truncated `u64` would give.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, BasicSbor)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, BasicSbor)]
 #[sbor(transparent)]
 pub struct PcValueElement(pub [u8; PC_VALUE_ELEMENT_BYTES]);
 

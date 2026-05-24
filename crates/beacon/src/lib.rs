@@ -9,3 +9,5 @@
 //! successful `apply_slot` it derives a fresh
 //! [`TopologySnapshot`](hyperscale_types::TopologySnapshot) from
 //! `BeaconState` and exposes it via `current_topology_snapshot()`.
+
+pub mod prefix_ops;
