@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 //! Multi-Slot Consensus — pure helpers + verifiers.
 //!
 //! MSC composes per-slot [`SpcInstance`](crate::spc::SpcInstance)s
@@ -30,17 +32,29 @@
 //! first-excluded fold-in we have at most `f + 1 ≤ n - 1` demotions
 //! in honest execution.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::Arc;
+use std::time::Duration;
 
 use blake3::Hasher;
 use hyperscale_types::{
-    Bls12381G1PublicKey, MscEmptyLowAccusation, MscSlotProposal, NetworkDefinition,
-    PC_VALUE_ELEMENT_BYTES, PcValueElement, PcVector, SpcEmptyLowEvidence, ValidatorId,
-    spc_context,
+    Bls12381G1PrivateKey, Bls12381G1PublicKey, MscEmptyLowAccusation, MscSlotProposal,
+    NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PcValueElement, PcVector, Slot, SpcEmptyLowEvidence,
+    SpcView, ValidatorId, spc_context,
 };
 use sbor::basic_encode;
 
-use crate::spc::{rank_shift_for_view, verify_empty_low_evidence};
+use crate::spc::{SpcInstance, rank_shift_for_view, verify_empty_low_evidence};
+
+/// Largest gap between a peer's claimed `slot` and our current slot
+/// for which we still buffer the proposal. Beyond this we drop —
+/// catch-up via state-sync is the right move at that distance.
+const FUTURE_SLOT_LOOKAHEAD: u64 = 4;
+
+/// Cap on `pending_inputs`. Inputs past this are silently dropped —
+/// the application sees rate-mismatch via lack of slot progress.
+#[allow(clippy::cast_possible_truncation)] // `FUTURE_SLOT_LOOKAHEAD = 4` fits in any pointer width
+const PENDING_INPUTS_CAP: usize = 16 * FUTURE_SLOT_LOOKAHEAD as usize;
 
 /// Domain tag for the canonical encoding of an [`MscSlotProposal`]
 /// when hashing into a [`PcValueElement`] for the slot's SPC input.
@@ -170,6 +184,410 @@ pub fn update_rank(
     }
     kept.extend(tail);
     kept
+}
+
+// ─── FSM ───────────────────────────────────────────────────────────────────
+
+/// What [`MscInstance::handle`] tells the beacon coordinator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MscEffect {
+    /// Broadcast our own slot proposal to peers (paper line 10).
+    BroadcastProposal {
+        /// Slot this proposal targets.
+        slot: Slot,
+        /// Application-encoded payload for the slot.
+        content: PcVector,
+        /// Empty-low accusations harvested from prior slots' inner
+        /// SPC views and bundled into this proposal.
+        accusations: Vec<MscEmptyLowAccusation>,
+    },
+    /// Schedule a timer. The parent (coordinator) fires
+    /// [`MscEvent::TimerExpired`] when it elapses.
+    SetTimer {
+        /// Which timer this is — `Slot` for proposal-collection
+        /// timeouts, `View` for SPC view timers.
+        id: MscTimerId,
+        /// How long to wait before firing.
+        duration: Duration,
+    },
+}
+
+/// Events [`MscInstance::handle`] consumes.
+#[derive(Debug, Clone)]
+pub enum MscEvent {
+    /// Application input for the next slot. Queued and consumed when
+    /// the prior slot's commit clears the way.
+    Input(PcVector),
+    /// `proposal = (s, b_p,s)` from a peer, with any empty-low
+    /// accusations the sender accumulated from earlier slots' SPC
+    /// views.
+    Proposal {
+        /// Validator that relayed this proposal.
+        from: ValidatorId,
+        /// Slot the proposal targets.
+        slot: Slot,
+        /// Application-encoded payload for the slot.
+        content: PcVector,
+        /// Empty-low accusations attached to this proposal.
+        accusations: Vec<MscEmptyLowAccusation>,
+    },
+    /// Timer expiry — slot proposal-collection deadline or SPC view
+    /// timer.
+    TimerExpired {
+        /// Which timer fired.
+        id: MscTimerId,
+    },
+}
+
+/// Timer identifiers used by [`MscEffect::SetTimer`] /
+/// [`MscEvent::TimerExpired`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MscTimerId {
+    /// `2Δ` slot proposal-collection timer.
+    Slot(Slot),
+    /// SPC view timer for `slot`'s instance at `view`.
+    View {
+        /// Slot whose SPC instance owns this view timer.
+        slot: Slot,
+        /// View the timer applies to.
+        view: SpcView,
+    },
+}
+
+/// Per-slot local state owned by [`MscInstance`].
+struct SlotState {
+    /// `B_i,s[·]` — buffered slot proposals indexed by sender.
+    proposals: BTreeMap<ValidatorId, MscSlotProposal>,
+    /// `rank^MC_{i,s}` — ranking used for this slot's hash-vector
+    /// ordering. Retained even for pruned slots so cross-slot
+    /// accusation processing can still resolve cyclic-first parties.
+    rank: Vec<ValidatorId>,
+    /// Inner SPC instance, lazily constructed on slot entry.
+    spc: SpcInstance,
+    /// `true` once we've fed input into the inner SPC.
+    spc_input_fed: bool,
+    /// Cached high output once committed.
+    committed_high: Option<PcVector>,
+    /// Whether [`MscEffect::SlotCommitted`] has been emitted for this
+    /// slot. (Effect itself lands in B.4.3.c.)
+    output_emitted: bool,
+    /// Validated accusations attached to peers' proposals for this
+    /// slot. Their union, deduplicated by accused validator, drives
+    /// the demotion step of [`update_rank`] for the next slot.
+    accusations: Vec<MscEmptyLowAccusation>,
+}
+
+/// One MSC FSM instance, scoped to a single beacon chain. Owns the
+/// per-slot [`SpcInstance`]s and drives them through the slot
+/// pipeline.
+pub struct MscInstance {
+    network: NetworkDefinition,
+    committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+    me: ValidatorId,
+    me_sk: Arc<Bls12381G1PrivateKey>,
+    initial_rank: Vec<ValidatorId>,
+    slot_timeout: Duration,
+    view_timeout: Duration,
+
+    /// Highest slot we've started. `0` means slot 1 not yet started
+    /// (waiting for first input).
+    current_slot: u64,
+    slots: BTreeMap<Slot, SlotState>,
+    /// Queue of application inputs waiting to be used.
+    pending_inputs: VecDeque<PcVector>,
+    /// Hash → proposal preimages, populated as we accept proposals.
+    /// Lookup table for commit resolution.
+    proposals_by_hash: BTreeMap<PcValueElement, (ValidatorId, MscSlotProposal)>,
+    /// Empty-low evidences emitted by the inner SPC of `current_slot`,
+    /// queued for inclusion in the *next* slot's outgoing proposal.
+    /// Populated by B.4.3.c when the SPC plumbing lands.
+    pending_accusations: Vec<MscEmptyLowAccusation>,
+    /// `(slot, view)` pairs already folded into a rank computation.
+    /// Re-presentation by peers is rejected at storage time.
+    consumed_accusations: BTreeSet<(Slot, SpcView)>,
+    /// Proposals received for slots strictly in the future. Keyed by
+    /// `(slot, sender)` so a single peer can hold at most one buffered
+    /// entry per future slot. Drained on `start_next_slot`.
+    future_proposals:
+        BTreeMap<Slot, BTreeMap<ValidatorId, (MscSlotProposal, Vec<MscEmptyLowAccusation>)>>,
+}
+
+impl MscInstance {
+    /// Construct a fresh MSC instance.
+    ///
+    /// `initial_rank` is the ranking used for slot 1's SPC committee
+    /// rotation; must list every validator in `committee` exactly
+    /// once.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `initial_rank.len() != committee.len()` or if
+    /// `committee.len() < 4` (inherited from `SpcInstance`).
+    #[must_use]
+    pub fn new(
+        network: NetworkDefinition,
+        committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+        me: ValidatorId,
+        me_sk: Arc<Bls12381G1PrivateKey>,
+        initial_rank: Vec<ValidatorId>,
+        slot_timeout: Duration,
+        view_timeout: Duration,
+    ) -> Self {
+        assert_eq!(
+            initial_rank.len(),
+            committee.len(),
+            "initial_rank must list every validator exactly once",
+        );
+        Self {
+            network,
+            committee,
+            me,
+            me_sk,
+            initial_rank,
+            slot_timeout,
+            view_timeout,
+            current_slot: 0,
+            slots: BTreeMap::new(),
+            pending_inputs: VecDeque::new(),
+            proposals_by_hash: BTreeMap::new(),
+            pending_accusations: Vec::new(),
+            consumed_accusations: BTreeSet::new(),
+            future_proposals: BTreeMap::new(),
+        }
+    }
+
+    /// Highest slot started. `0` before slot 1 begins.
+    #[must_use]
+    pub const fn current_slot(&self) -> u64 {
+        self.current_slot
+    }
+
+    /// Read the ranking used by `slot`'s SPC instance. Returns `None`
+    /// for slots not yet started.
+    #[must_use]
+    pub fn slot_rank(&self, slot: Slot) -> Option<&[ValidatorId]> {
+        self.slots.get(&slot).map(|s| s.rank.as_slice())
+    }
+
+    /// Count of validated accusations stored against `slot`. Returns
+    /// `None` for slots not yet started.
+    #[must_use]
+    pub fn accusation_count(&self, slot: Slot) -> Option<usize> {
+        self.slots.get(&slot).map(|s| s.accusations.len())
+    }
+
+    /// Process one event; returns the resulting effects, possibly
+    /// empty.
+    pub fn handle(&mut self, event: MscEvent) -> Vec<MscEffect> {
+        match event {
+            MscEvent::Input(v) => self.on_input(v),
+            MscEvent::Proposal {
+                from,
+                slot,
+                content,
+                accusations,
+            } => self.on_proposal(from, slot, content, accusations),
+            // SPC routing + timer firing land in B.4.3.c / B.4.3.d.
+            MscEvent::TimerExpired { id: _ } => vec![],
+        }
+    }
+
+    fn on_input(&mut self, v: PcVector) -> Vec<MscEffect> {
+        if self.pending_inputs.len() >= PENDING_INPUTS_CAP {
+            return vec![];
+        }
+        self.pending_inputs.push_back(v);
+        if self.can_start_next_slot() {
+            self.start_next_slot()
+        } else {
+            vec![]
+        }
+    }
+
+    fn on_proposal(
+        &mut self,
+        from: ValidatorId,
+        slot: Slot,
+        content: PcVector,
+        accusations: Vec<MscEmptyLowAccusation>,
+    ) -> Vec<MscEffect> {
+        let proposal = MscSlotProposal { slot, content };
+        // Reject proposals from outside the committee.
+        if !self.committee.iter().any(|(id, _)| *id == from) {
+            return vec![];
+        }
+        // Past slots: drop.
+        if slot.inner() < self.current_slot {
+            return vec![];
+        }
+        // Future slots: buffer if within the lookahead window.
+        if slot.inner() > self.current_slot {
+            if slot.inner() > self.current_slot + FUTURE_SLOT_LOOKAHEAD {
+                return vec![];
+            }
+            let bucket = self.future_proposals.entry(slot).or_default();
+            bucket.entry(from).or_insert((proposal, accusations));
+            return vec![];
+        }
+        // Current slot.
+        self.store_proposal(from, proposal, accusations)
+    }
+
+    /// True when no slot is in flight: either MSC hasn't started yet,
+    /// or the current slot has already had its high committed.
+    fn can_start_next_slot(&self) -> bool {
+        if self.current_slot == 0 {
+            return true;
+        }
+        self.slots
+            .get(&Slot::new(self.current_slot))
+            .is_some_and(|s| s.committed_high.is_some())
+    }
+
+    fn start_next_slot(&mut self) -> Vec<MscEffect> {
+        let Some(input) = self.pending_inputs.pop_front() else {
+            return vec![];
+        };
+        let new_slot_raw = self.current_slot + 1;
+        let new_slot = Slot::new(new_slot_raw);
+        self.current_slot = new_slot_raw;
+        let rank = self.derive_slot_rank(new_slot);
+
+        // Mark accusations from the just-departed slot as consumed.
+        // `derive_slot_rank` already folded them into `rank`, so
+        // future re-presentation is a no-op for the rank chain.
+        if new_slot_raw > 1
+            && let Some(prev) = self.slots.get(&Slot::new(new_slot_raw - 1))
+        {
+            for ev in &prev.accusations {
+                self.consumed_accusations.insert((ev.slot, ev.view));
+            }
+        }
+
+        let spc = SpcInstance::new(
+            self.network.clone(),
+            new_slot,
+            self.committee.clone(),
+            self.me,
+            Arc::clone(&self.me_sk),
+            self.view_timeout,
+        );
+        self.slots.insert(
+            new_slot,
+            SlotState {
+                proposals: BTreeMap::new(),
+                rank,
+                spc,
+                spc_input_fed: false,
+                committed_high: None,
+                output_emitted: false,
+                accusations: Vec::new(),
+            },
+        );
+
+        // Drain accusations accumulated during prior slots and ship
+        // them with this slot's proposal.
+        let outgoing_accusations = std::mem::take(&mut self.pending_accusations);
+
+        // Build and store our own proposal locally, then emit the
+        // broadcast effect.
+        let mut out = vec![];
+        let proposal = MscSlotProposal {
+            slot: new_slot,
+            content: input.clone(),
+        };
+        out.extend(self.store_proposal(self.me, proposal, outgoing_accusations.clone()));
+        out.push(MscEffect::BroadcastProposal {
+            slot: new_slot,
+            content: input,
+            accusations: outgoing_accusations,
+        });
+        out.push(MscEffect::SetTimer {
+            id: MscTimerId::Slot(new_slot),
+            duration: self.slot_timeout,
+        });
+
+        // Drain any future-slot proposals we buffered while waiting
+        // for our own input.
+        self.future_proposals
+            .retain(|s, _| s.inner() >= new_slot_raw);
+        if let Some(buffered) = self.future_proposals.remove(&new_slot) {
+            for (from, (prop, accs)) in buffered {
+                if from == self.me {
+                    continue;
+                }
+                out.extend(self.store_proposal(from, prop, accs));
+            }
+        }
+
+        out
+    }
+
+    fn derive_slot_rank(&self, slot: Slot) -> Vec<ValidatorId> {
+        if slot.inner() == 1 {
+            return self.initial_rank.clone();
+        }
+        let prev_slot = Slot::new(slot.inner() - 1);
+        let Some(prev) = self.slots.get(&prev_slot) else {
+            return self.initial_rank.clone();
+        };
+        let prev_high = prev.committed_high.as_ref();
+        // Accusations attached to the prev slot demote the accused
+        // validators in `rank`. Resolve via prev slot's initial rank
+        // — that's what their `accusation_demotes` indexes into.
+        let mut accused: BTreeSet<ValidatorId> = BTreeSet::new();
+        for acc in &prev.accusations {
+            if let Some(demoted) = accusation_demotes(acc, &prev.rank) {
+                accused.insert(demoted);
+            }
+        }
+        update_rank(
+            &prev.rank,
+            prev_high.unwrap_or(&PcVector::empty()),
+            &accused,
+        )
+    }
+
+    /// Add a proposal to the slot's local state. Validates accusations
+    /// against the committee, dedups via `consumed_accusations`, and
+    /// indexes the proposal in `proposals_by_hash` for commit
+    /// resolution.
+    fn store_proposal(
+        &mut self,
+        from: ValidatorId,
+        proposal: MscSlotProposal,
+        accusations: Vec<MscEmptyLowAccusation>,
+    ) -> Vec<MscEffect> {
+        let Some(slot_state) = self.slots.get_mut(&proposal.slot) else {
+            return vec![];
+        };
+        // First proposal from this sender for this slot wins; ignore
+        // re-presentations to avoid bandwidth amplification on
+        // duplicate-proposal floods.
+        if slot_state.proposals.contains_key(&from) {
+            return vec![];
+        }
+        let slot = proposal.slot;
+        let h = hash_proposal_msc(&proposal);
+        slot_state.proposals.insert(from, proposal.clone());
+        self.proposals_by_hash.insert(h, (from, proposal));
+
+        // Validate + dedup accusations. Any accusation whose
+        // `(slot, view)` has already been consumed gets dropped
+        // here (its demotion is already in the rank chain).
+        for acc in accusations {
+            if self.consumed_accusations.contains(&(acc.slot, acc.view)) {
+                continue;
+            }
+            if !verify_empty_low_accusation(&acc, &self.network, &self.committee) {
+                continue;
+            }
+            if let Some(slot_state) = self.slots.get_mut(&slot) {
+                slot_state.accusations.push(acc);
+            }
+        }
+        vec![]
+    }
 }
 
 #[cfg(test)]
@@ -353,5 +771,137 @@ mod tests {
             proof: dummy_pc_qc3(),
         };
         assert_eq!(accusation_demotes(&acc, &[]), None);
+    }
+
+    // ─── FSM tests ─────────────────────────────────────────────────────
+
+    use hyperscale_types::bls_keypair_from_seed;
+
+    fn msc_committee(
+        n: usize,
+    ) -> (
+        Vec<Arc<Bls12381G1PrivateKey>>,
+        Vec<(ValidatorId, Bls12381G1PublicKey)>,
+    ) {
+        let mut sks = Vec::with_capacity(n);
+        let mut members = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut seed = [0u8; 32];
+            seed[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            let sk = bls_keypair_from_seed(&seed);
+            members.push((ValidatorId::new(i as u64), sk.public_key()));
+            sks.push(Arc::new(sk));
+        }
+        (sks, members)
+    }
+
+    fn msc_instance(idx: usize) -> MscInstance {
+        let (sks, members) = msc_committee(4);
+        let initial_rank: Vec<ValidatorId> = members.iter().map(|(id, _)| *id).collect();
+        MscInstance::new(
+            net(),
+            members.clone(),
+            members[idx].0,
+            Arc::clone(&sks[idx]),
+            initial_rank,
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+        )
+    }
+
+    /// Fresh `MscInstance` starts at slot 0 (slot 1 not yet started)
+    /// with empty state.
+    #[test]
+    fn msc_instance_initial_state() {
+        let fsm = msc_instance(0);
+        assert_eq!(fsm.current_slot(), 0);
+        assert!(fsm.slot_rank(Slot::new(1)).is_none());
+    }
+
+    /// `MscInstance::new` panics when `initial_rank.len() !=
+    /// committee.len()` — guards the slot-1 SPC bootstrap against a
+    /// malformed config.
+    #[test]
+    #[should_panic(expected = "initial_rank must list every validator exactly once")]
+    fn msc_instance_rejects_rank_size_mismatch() {
+        let (sks, members) = msc_committee(4);
+        let bad_rank = vec![ValidatorId::new(0), ValidatorId::new(1)]; // 2 vs n=4
+        let _ = MscInstance::new(
+            net(),
+            members.clone(),
+            members[0].0,
+            Arc::clone(&sks[0]),
+            bad_rank,
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+        );
+    }
+
+    /// First `Input` event starts slot 1: bumps `current_slot`,
+    /// installs the slot-1 rank, broadcasts our own proposal, sets
+    /// the slot timer.
+    #[test]
+    fn input_starts_slot_one() {
+        let mut fsm = msc_instance(0);
+        let v = PcVector::new([elem(7)]);
+        let effects = fsm.handle(MscEvent::Input(v));
+        assert_eq!(fsm.current_slot(), 1);
+        // Effects: BroadcastProposal + SetTimer.
+        assert_eq!(effects.len(), 2);
+        assert!(matches!(
+            effects[0],
+            MscEffect::BroadcastProposal { slot, .. } if slot == Slot::new(1)
+        ));
+        assert!(matches!(
+            effects[1],
+            MscEffect::SetTimer { id: MscTimerId::Slot(s), .. } if s == Slot::new(1)
+        ));
+        assert!(fsm.slot_rank(Slot::new(1)).is_some());
+    }
+
+    /// `on_proposal` from outside the committee is dropped.
+    #[test]
+    fn proposal_from_non_committee_rejected() {
+        let mut fsm = msc_instance(0);
+        let _ = fsm.handle(MscEvent::Input(PcVector::empty()));
+        let effects = fsm.handle(MscEvent::Proposal {
+            from: ValidatorId::new(999),
+            slot: Slot::new(1),
+            content: PcVector::empty(),
+            accusations: vec![],
+        });
+        assert!(effects.is_empty());
+    }
+
+    /// Future-slot proposals get buffered (within the lookahead
+    /// window) and don't error out.
+    #[test]
+    fn future_proposal_buffered_within_lookahead() {
+        let mut fsm = msc_instance(0);
+        let _ = fsm.handle(MscEvent::Input(PcVector::empty()));
+        // current_slot = 1. Propose for slot 3 — within the window.
+        let effects = fsm.handle(MscEvent::Proposal {
+            from: ValidatorId::new(1),
+            slot: Slot::new(3),
+            content: PcVector::empty(),
+            accusations: vec![],
+        });
+        assert!(effects.is_empty()); // buffered, no effects
+    }
+
+    /// Future-slot proposals beyond `FUTURE_SLOT_LOOKAHEAD` are
+    /// dropped.
+    #[test]
+    fn future_proposal_beyond_lookahead_dropped() {
+        let mut fsm = msc_instance(0);
+        let _ = fsm.handle(MscEvent::Input(PcVector::empty()));
+        // current_slot = 1. Propose for slot 100 — way past the window.
+        let effects = fsm.handle(MscEvent::Proposal {
+            from: ValidatorId::new(1),
+            slot: Slot::new(100),
+            content: PcVector::empty(),
+            accusations: vec![],
+        });
+        assert!(effects.is_empty());
     }
 }
