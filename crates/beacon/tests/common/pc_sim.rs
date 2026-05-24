@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use hyperscale_beacon::pc::{PcEffect, PcEvent, PcInstance};
 use hyperscale_types::{
-    Bls12381G1PublicKey, NetworkDefinition, PcQc3, PcVector, Slot, SpcView, ValidatorId,
-    bls_keypair_from_seed,
+    Bls12381G1PrivateKey, Bls12381G1PublicKey, NetworkDefinition, PcQc3, PcVector, Slot, SpcView,
+    ValidatorId, bls_keypair_from_seed,
 };
 
 /// One pending message in the network: a vote event addressed to a
@@ -26,6 +26,7 @@ struct Envelope {
 pub struct PcSim {
     pub instances: Vec<PcInstance>,
     pub members: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+    pub sks: Vec<Arc<Bls12381G1PrivateKey>>,
     pending: VecDeque<Envelope>,
     pub decided: Vec<Option<Box<PcQc3>>>,
 }
@@ -63,9 +64,24 @@ impl PcSim {
         Self {
             instances,
             members,
+            sks,
             pending: VecDeque::new(),
             decided,
         }
+    }
+
+    /// Tuple-up `(secret_key, validator_id)` for each of the indices —
+    /// used by SPC tests that need to sign empty-view messages with
+    /// the same keys PC used.
+    #[must_use]
+    pub fn sks_for_indices(
+        &self,
+        indices: &[usize],
+    ) -> Vec<(Arc<Bls12381G1PrivateKey>, ValidatorId)> {
+        indices
+            .iter()
+            .map(|&i| (Arc::clone(&self.sks[i]), self.members[i].0))
+            .collect()
     }
 
     /// Feed party `idx`'s local input vector. Drains the resulting
