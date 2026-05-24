@@ -1,29 +1,9 @@
-use std::sync::Arc;
-
+use hyperscale_storage::test_helpers::make_test_beacon_block as block_at;
 use hyperscale_storage::{BeaconChainReader, BeaconChainWriter};
-use hyperscale_types::{
-    BeaconBlock, BeaconBlockHash, BeaconBlockHeader, BeaconProposalsRoot, BeaconStateRoot,
-    Bls12381G2Signature, Hash, RecoveryCertHash, SignerBitfield, Slot,
-};
+use hyperscale_types::{BeaconBlockHash, Slot};
 use tempfile::TempDir;
 
 use super::core::RocksDbBeaconStorage;
-
-fn block_at(slot: u64, tag: &[u8]) -> Arc<BeaconBlock> {
-    let header = BeaconBlockHeader::new(
-        Slot::new(slot),
-        BeaconBlockHash::from_raw(Hash::from_bytes(tag)),
-        BeaconProposalsRoot::from_raw(Hash::from_bytes(b"proposals")),
-        BeaconStateRoot::from_raw(Hash::from_bytes(b"state")),
-        RecoveryCertHash::ZERO,
-    );
-    Arc::new(BeaconBlock::new(
-        header,
-        SignerBitfield::empty(),
-        Bls12381G2Signature([0x11; 96]),
-        None,
-    ))
-}
 
 fn fresh_store() -> (RocksDbBeaconStorage, TempDir) {
     let tmp = TempDir::new().expect("tempdir");

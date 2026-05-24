@@ -14,6 +14,7 @@ use rocksdb::{ColumnFamilyDescriptor, DB, Options, WriteBatch, WriteOptions};
 use super::column_families::{
     ALL_COLUMN_FAMILIES, BeaconBlocksBySlotCf, BeaconHashToSlotCf, CfHandles,
 };
+use crate::StorageError;
 use crate::config::RocksDbConfig;
 use crate::typed_cf::{TypedCf, batch_put, get};
 
@@ -32,21 +33,13 @@ pub struct RocksDbBeaconStorage {
     pub(super) commit_lock: Mutex<()>,
 }
 
-/// Error type for beacon storage operations.
-#[derive(Debug, thiserror::Error)]
-pub enum BeaconStorageError {
-    /// Database error
-    #[error("Database error: {0}")]
-    DatabaseError(String),
-}
-
 impl RocksDbBeaconStorage {
     /// Open or create the beacon-chain database at `path`.
     ///
     /// # Errors
     ///
-    /// Returns [`BeaconStorageError`] if `RocksDB` fails to open the database.
-    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, BeaconStorageError> {
+    /// Returns [`StorageError`] if `RocksDB` fails to open the database.
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
         Self::open_with_config(path, &RocksDbConfig::default())
     }
 
@@ -59,11 +52,11 @@ impl RocksDbBeaconStorage {
     ///
     /// # Errors
     ///
-    /// Returns [`BeaconStorageError`] if `RocksDB` fails to open the database.
+    /// Returns [`StorageError`] if `RocksDB` fails to open the database.
     pub fn open_with_config<P: AsRef<Path>>(
         path: P,
         config: &RocksDbConfig,
-    ) -> Result<Self, BeaconStorageError> {
+    ) -> Result<Self, StorageError> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
@@ -77,7 +70,7 @@ impl RocksDbBeaconStorage {
             .collect();
 
         let db = DB::open_cf_descriptors(&opts, path, cf_descriptors)
-            .map_err(|e| BeaconStorageError::DatabaseError(e.to_string()))?;
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
 
         // Validate all expected column families exist at startup so we
         // fail fast instead of panicking on first access at runtime.

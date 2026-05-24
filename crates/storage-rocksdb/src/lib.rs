@@ -14,11 +14,13 @@
 
 pub mod beacon;
 pub(crate) mod config;
+pub(crate) mod error;
 pub mod shard;
 pub(crate) mod typed_cf;
 
-pub use beacon::core::{BeaconStorageError, RocksDbBeaconStorage};
+pub use beacon::core::RocksDbBeaconStorage;
 pub use config::{CompressionType, RocksDbConfig};
-pub use shard::core::{RocksDbStorage, StorageError};
+pub use error::StorageError;
+pub use shard::core::RocksDbStorage;
 pub use shard::shared::SharedStorage;
 pub use shard::snapshot::RocksDbSnapshot;

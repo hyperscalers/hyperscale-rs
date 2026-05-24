@@ -45,6 +45,7 @@ use super::metadata::{
 };
 use super::substate_key::partition_prefix;
 use super::versioned_key::VersionedSubstateKeyCodec;
+use crate::StorageError;
 use crate::config::RocksDbConfig;
 use crate::typed_cf::{DbEncode, TypedCf, batch_delete, batch_put, get, multi_get, prefix_iter};
 
@@ -78,14 +79,6 @@ pub struct RocksDbStorage {
 
     /// Number of block heights of JMT history to retain before garbage collection.
     pub(crate) jmt_history_length: u64,
-}
-
-/// Error type for storage operations.
-#[derive(Debug, thiserror::Error)]
-pub enum StorageError {
-    /// Database error
-    #[error("Database error: {0}")]
-    DatabaseError(String),
 }
 
 impl RocksDbStorage {

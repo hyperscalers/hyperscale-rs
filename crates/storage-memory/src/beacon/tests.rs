@@ -1,28 +1,8 @@
-use std::sync::Arc;
-
+use hyperscale_storage::test_helpers::make_test_beacon_block as block_at;
 use hyperscale_storage::{BeaconChainReader, BeaconChainWriter};
-use hyperscale_types::{
-    BeaconBlock, BeaconBlockHash, BeaconBlockHeader, BeaconProposalsRoot, BeaconStateRoot,
-    Bls12381G2Signature, Hash, RecoveryCertHash, SignerBitfield, Slot,
-};
+use hyperscale_types::{BeaconBlockHash, Slot};
 
 use super::core::SimBeaconStorage;
-
-fn block_at(slot: u64, tag: &[u8]) -> Arc<BeaconBlock> {
-    let header = BeaconBlockHeader::new(
-        Slot::new(slot),
-        BeaconBlockHash::from_raw(Hash::from_bytes(tag)),
-        BeaconProposalsRoot::from_raw(Hash::from_bytes(b"proposals")),
-        BeaconStateRoot::from_raw(Hash::from_bytes(b"state")),
-        RecoveryCertHash::ZERO,
-    );
-    Arc::new(BeaconBlock::new(
-        header,
-        SignerBitfield::empty(),
-        Bls12381G2Signature([0x11; 96]),
-        None,
-    ))
-}
 
 #[test]
 fn empty_store_has_no_latest_and_misses_all_reads() {
