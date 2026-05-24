@@ -242,6 +242,103 @@ pub struct BeaconState {
     pub miss_counters: BTreeMap<ValidatorId, u32>,
 }
 
+// ─── slot effects ───────────────────────────────────────────────────────────
+
+/// What caused a [`CommitteeTransition`].
+///
+/// The runner uses this to tell "scheduled rotation, no anomaly" apart
+/// from "the old committee failed and was replaced" — different
+/// operator-facing signals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransitionCause {
+    /// Natural rotation at an epoch boundary — the trickled shuffle for
+    /// per-shard committees, the epoch-rotation step for the beacon
+    /// committee.
+    NaturalShuffle,
+    /// Committee replaced by a [`RecoveryCertificate`] after the old
+    /// committee stalled past the recovery timeout.
+    Recovery,
+    /// A mid-epoch jail, deactivation, or withdrawal-driven
+    /// auto-deactivation changed a shard's `members` list without a
+    /// fresh shuffle.
+    MembershipChange,
+}
+
+/// Structured description of a committee handover.
+///
+/// Surfaced both by natural epoch boundaries (in
+/// [`SlotEffects::beacon_committee_transition`] and
+/// [`SlotEffects::shard_committee_transitions`]) and by recovery-cert
+/// application, so the runner has a unified signal for "tear down the
+/// MSC instance you were running for `from` and bootstrap a fresh one
+/// with `to`."
+///
+/// Honest committee members of `from` whose membership has ended see
+/// `to` and either bootstrap a new MSC instance (if `to` contains them)
+/// or shut down MSC participation cleanly (if `to` excludes them).
+///
+/// Cross-validator agreement on `(from, to, cause, at_slot)` follows
+/// from `apply_slot` being deterministic; every honest party computes
+/// the same transition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitteeTransition {
+    /// Outgoing committee.
+    pub from: Vec<ValidatorId>,
+    /// Incoming committee.
+    pub to: Vec<ValidatorId>,
+    /// Why the transition fired.
+    pub cause: TransitionCause,
+    /// Slot the transition was applied at.
+    pub at_slot: Slot,
+}
+
+/// Effects of applying one slot, returned by `apply_slot`.
+///
+/// Surfaced for observability, runner-side wiring (committee handover
+/// detection), and tests. Empty defaults match "nothing happened" — a
+/// slot with no commits and no boundary crossings returns
+/// [`SlotEffects::default()`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SlotEffects {
+    /// New validators registered via a `RegisterValidator` witness.
+    pub registered: Vec<ValidatorId>,
+    /// Validators transitioned to `InsufficientStake` — via explicit
+    /// `DeactivateValidator` witness or via withdrawal-completion
+    /// auto-deactivation.
+    pub deactivated: Vec<ValidatorId>,
+    /// Validators jailed this slot (`Jail` witness, malformed VRF
+    /// reveal, beacon-side `MissedProposal` threshold crossing, or
+    /// equivocation evidence).
+    pub jailed: Vec<ValidatorId>,
+    /// Validators returned from `Jailed` to `Pooled` via a successful
+    /// `Unjail` lift.
+    pub unjailed: Vec<ValidatorId>,
+    /// `InsufficientStake` validators returned to `Pooled` by the
+    /// auto-reactivation scan.
+    pub reactivated: Vec<ValidatorId>,
+    /// `OnShard` validators whose `ready` flag flipped to `true` —
+    /// via `Ready` witness or auto-ready timeout.
+    pub readied: Vec<ValidatorId>,
+    /// True iff `state.committee` (beacon committee) was re-sampled
+    /// this slot.
+    pub committee_changed: bool,
+    /// Beacon-committee handover when `committee_changed`.
+    pub beacon_committee_transition: Option<CommitteeTransition>,
+    /// Per-shard transitions emitted for any shard whose `members`
+    /// list changed this slot.
+    pub shard_committee_transitions: BTreeMap<ShardGroupId, CommitteeTransition>,
+    /// Committee members whose `vrf_reveal` failed verification —
+    /// their reveal did not contribute to the new randomness and their
+    /// witnesses were also dropped (a malformed reveal is treated as a
+    /// malformed proposal).
+    pub rejected_reveals: Vec<ValidatorId>,
+    /// Per-pool emission credit applied to `pool.total_stake` this
+    /// slot. Sum equals one epoch's emission share minus the burned
+    /// integer-division remainder. Empty when no pool had a ready
+    /// `OnShard` validator (whole slot's share burned).
+    pub rewards_credited: BTreeMap<StakePoolId, Stake>,
+}
+
 // ─── derived helpers ────────────────────────────────────────────────────────
 
 /// Stake available to support active validators on this pool after
@@ -642,12 +739,10 @@ mod tests {
 
     // ─── miss counter sanity ──────────────────────────────────────────────
 
-    /// `miss_counters` is a plain `BTreeMap<ValidatorId, u32>` — no
-    /// special construction or invariant on the type itself. The
-    /// invariants (scoping to current epoch and current shard, reset on
-    /// status transition) live in `apply_slot` and ride in later
-    /// sub-commits. This test pins the field shape so a future refactor
-    /// that changes the value type is caught.
+    /// Pins the `miss_counters` field shape (per-validator `u32`
+    /// counter) so a future refactor that changes the value type is
+    /// caught. The scoping invariants (per-epoch reset, status-
+    /// transition reset) live with `apply_slot`, not the type.
     #[test]
     fn miss_counters_field_is_per_validator_u32_map() {
         let mut state = empty_state();
