@@ -5,5 +5,7 @@
 //! consuming tests reference `common::Committee`, `common::pc_ctx`, etc.
 
 mod fixtures;
+mod pc_sim;
 
 pub use fixtures::{Committee, pc_ctx};
+pub use pc_sim::PcSim;

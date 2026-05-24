@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 //! Prefix Consensus inner-consensus vote and QC verifiers.
 //!
 //! PC is the per-view inner consensus that drives one validator's
@@ -30,15 +28,16 @@
 //!   re-asserted here as a defense against caller-built QCs that bypass
 //!   decode.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use hyperscale_types::{
     Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature, DOMAIN_PC_VOTE1,
     DOMAIN_PC_VOTE2, DOMAIN_PC_VOTE2_LENGTH, DOMAIN_PC_VOTE3, MAX_VOTE_VECTOR_LEN,
     NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PcCompactLenSigner, PcCompactVote, PcDivergingProof,
     PcQc1, PcQc2, PcQc3, PcValueElement, PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation,
-    PcVoteRound, PcXpProof, SignerBitfield, ValidatorId, aggregate_verify_bls_different_messages,
-    pc_context, pc_vote_signing_message, spc_context,
+    PcVoteRound, PcXpProof, SignerBitfield, Slot, SpcView, ValidatorId,
+    aggregate_verify_bls_different_messages, pc_context, pc_vote_signing_message, spc_context,
 };
 
 use crate::prefix_ops::{mce, mcp, qc1_certify};
@@ -798,6 +797,305 @@ fn mcp_two(a: &PcVector, b: &PcVector) -> usize {
     k
 }
 
+// ─── FSM ───────────────────────────────────────────────────────────────────
+
+/// What `PcInstance::handle` tells its parent.
+///
+/// Sub-machine-local — the parent (SPC) drains these and lifts them
+/// into either internal state mutations or further effects bubbling
+/// up to MSC and the `BeaconCoordinator`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PcEffect {
+    /// Broadcast a freshly-signed round-1 vote.
+    BroadcastVote1(Box<PcVote1>),
+    /// Broadcast a freshly-signed round-2 vote.
+    BroadcastVote2(Box<PcVote2>),
+    /// Broadcast a freshly-signed round-3 vote.
+    BroadcastVote3(Box<PcVote3>),
+    /// Slim wire-form evidence that a peer double-signed at the same
+    /// `(slot, view, round)`. The parent assembles this into beacon
+    /// witnesses for inclusion in a future beacon proposal.
+    EquivocationObserved(Box<PcVoteEquivocation>),
+    /// Round-3 quorum reached — terminal cert ready. The parent reads
+    /// the certified low (`qc3.x_pp`) and high (`qc3.x_pe`) out of
+    /// the embedded QC.
+    Decided(Box<PcQc3>),
+}
+
+/// Events `PcInstance::handle` consumes.
+#[derive(Debug, Clone)]
+pub enum PcEvent {
+    /// The local validator's input vector. Idempotent: subsequent
+    /// inputs after the first are dropped.
+    Input(PcVector),
+    /// A peer's round-1 vote arrived. The IO layer is responsible for
+    /// the sender-to-validator authentication check before dispatch.
+    Vote1Received(PcVote1),
+    /// A peer's round-2 vote arrived.
+    Vote2Received(Box<PcVote2>),
+    /// A peer's round-3 vote arrived.
+    Vote3Received(Box<PcVote3>),
+}
+
+/// One inner-PC FSM instance, scoped to a single `(slot, view)`.
+///
+/// SPC owns one `PcInstance` per view it drives; MSC owns one
+/// `SpcInstance` per slot. The FSM is synchronous — every event-
+/// handler invocation returns the full set of effects that follow,
+/// and the parent drains them.
+pub struct PcInstance {
+    network: NetworkDefinition,
+    slot: Slot,
+    view: SpcView,
+    pc_ctx: Vec<u8>,
+    committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+    me: ValidatorId,
+    me_sk: Arc<Bls12381G1PrivateKey>,
+
+    vote1_pool: BTreeMap<ValidatorId, PcVote1>,
+    vote2_pool: BTreeMap<ValidatorId, PcVote2>,
+    vote3_pool: BTreeMap<ValidatorId, PcVote3>,
+
+    input: Option<PcVector>,
+    sent_vote2: bool,
+    sent_vote3: bool,
+    decided: bool,
+}
+
+impl PcInstance {
+    /// Construct a fresh PC instance for `(slot, view)`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `committee.len() < 4` — PC requires `n >= 3f + 1`
+    /// and `f = (n - 1) / 3`, which collapses to `n >= 4`.
+    #[must_use]
+    pub fn new(
+        network: NetworkDefinition,
+        slot: Slot,
+        view: SpcView,
+        committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+        me: ValidatorId,
+        me_sk: Arc<Bls12381G1PrivateKey>,
+    ) -> Self {
+        assert!(
+            committee.len() >= 4,
+            "PC requires n >= 4 (3f + 1 with f = 1); got n = {}",
+            committee.len()
+        );
+        let pc_ctx = pc_context(&spc_context(slot), view);
+        Self {
+            network,
+            slot,
+            view,
+            pc_ctx,
+            committee,
+            me,
+            me_sk,
+            vote1_pool: BTreeMap::new(),
+            vote2_pool: BTreeMap::new(),
+            vote3_pool: BTreeMap::new(),
+            input: None,
+            sent_vote2: false,
+            sent_vote3: false,
+            decided: false,
+        }
+    }
+
+    /// Whether the local validator's input has been set.
+    #[must_use]
+    pub const fn has_input(&self) -> bool {
+        self.input.is_some()
+    }
+
+    /// Whether the FSM has emitted a `Decided` effect (round-3 quorum
+    /// reached at least once).
+    #[must_use]
+    pub const fn is_decided(&self) -> bool {
+        self.decided
+    }
+
+    /// Process one event; returns the resulting effects, possibly
+    /// empty.
+    pub fn handle(&mut self, event: PcEvent) -> Vec<PcEffect> {
+        match event {
+            PcEvent::Input(v) => self.on_input(v),
+            PcEvent::Vote1Received(vote) => self.on_vote1(vote),
+            PcEvent::Vote2Received(vote) => self.on_vote2(*vote),
+            PcEvent::Vote3Received(vote) => self.on_vote3(*vote),
+        }
+    }
+
+    const fn quorum(&self) -> usize {
+        let n = self.committee.len();
+        n - byzantine_threshold(n)
+    }
+
+    fn on_input(&mut self, v: PcVector) -> Vec<PcEffect> {
+        if self.input.is_some() {
+            return vec![];
+        }
+        let vote1 = sign_vote1(&self.me_sk, self.me, &self.network, &self.pc_ctx, v.clone());
+        self.input = Some(v);
+        self.vote1_pool.insert(self.me, vote1.clone());
+        let mut effects = vec![PcEffect::BroadcastVote1(Box::new(vote1))];
+        effects.extend(self.maybe_advance_to_round2());
+        effects
+    }
+
+    fn on_vote1(&mut self, v1: PcVote1) -> Vec<PcEffect> {
+        if !verify_vote1(&v1, &self.network, &self.pc_ctx, &self.committee) {
+            return vec![];
+        }
+        let from = v1.validator();
+        if let Some(existing) = self.vote1_pool.get(&from) {
+            if existing.v_in() == v1.v_in() {
+                return vec![];
+            }
+            return vec![PcEffect::EquivocationObserved(Box::new(
+                self.equivocation_wire(
+                    from,
+                    PcVoteRound::Vote1,
+                    existing.v_in().clone(),
+                    prefix_top_sig(existing),
+                    v1.v_in().clone(),
+                    prefix_top_sig(&v1),
+                ),
+            ))];
+        }
+        self.vote1_pool.insert(from, v1);
+        self.maybe_advance_to_round2()
+    }
+
+    fn on_vote2(&mut self, v2: PcVote2) -> Vec<PcEffect> {
+        if !verify_vote2(&v2, &self.network, &self.pc_ctx, &self.committee) {
+            return vec![];
+        }
+        let from = v2.validator();
+        if let Some(existing) = self.vote2_pool.get(&from) {
+            // Vote2's signed payload is `x` — different `qc1` aggregations
+            // are honest re-aggregations, not equivocation.
+            if existing.x() == v2.x() {
+                return vec![];
+            }
+            return vec![PcEffect::EquivocationObserved(Box::new(
+                self.equivocation_wire(
+                    from,
+                    PcVoteRound::Vote2,
+                    existing.x().clone(),
+                    vote2_top_sig(existing),
+                    v2.x().clone(),
+                    vote2_top_sig(&v2),
+                ),
+            ))];
+        }
+        self.vote2_pool.insert(from, v2);
+        self.maybe_advance_to_round3()
+    }
+
+    fn on_vote3(&mut self, v3: PcVote3) -> Vec<PcEffect> {
+        if !verify_vote3(&v3, &self.network, &self.pc_ctx, &self.committee) {
+            return vec![];
+        }
+        let from = v3.validator();
+        if let Some(existing) = self.vote3_pool.get(&from) {
+            // Vote3's signed payload is `x_p` — different `qc2`s are
+            // honest re-aggregations, not equivocation.
+            if existing.x_p() == v3.x_p() {
+                return vec![];
+            }
+            return vec![PcEffect::EquivocationObserved(Box::new(
+                self.equivocation_wire(
+                    from,
+                    PcVoteRound::Vote3,
+                    existing.x_p().clone(),
+                    existing.sig_xp(),
+                    v3.x_p().clone(),
+                    v3.sig_xp(),
+                ),
+            ))];
+        }
+        self.vote3_pool.insert(from, v3);
+        self.maybe_finalize()
+    }
+
+    fn maybe_advance_to_round2(&mut self) -> Vec<PcEffect> {
+        if self.sent_vote2 || self.vote1_pool.len() < self.quorum() {
+            return vec![];
+        }
+        let q = self.quorum();
+        let n = self.committee.len();
+        let vote1s: Vec<&PcVote1> = self.vote1_pool.values().take(q).collect();
+        let qc1 = build_qc1(&vote1s, n);
+        let our_vote2 = sign_vote2(&self.me_sk, self.me, &self.network, &self.pc_ctx, qc1);
+        self.sent_vote2 = true;
+        self.vote2_pool.insert(self.me, our_vote2.clone());
+        let mut effects = vec![PcEffect::BroadcastVote2(Box::new(our_vote2))];
+        effects.extend(self.maybe_advance_to_round3());
+        effects
+    }
+
+    fn maybe_advance_to_round3(&mut self) -> Vec<PcEffect> {
+        if self.sent_vote3 || self.vote2_pool.len() < self.quorum() {
+            return vec![];
+        }
+        let q = self.quorum();
+        let vote2s: Vec<&PcVote2> = self.vote2_pool.values().take(q).collect();
+        let qc2 = build_qc2(&vote2s, &self.committee);
+        let our_vote3 = sign_vote3(&self.me_sk, self.me, &self.network, &self.pc_ctx, qc2);
+        self.sent_vote3 = true;
+        self.vote3_pool.insert(self.me, our_vote3.clone());
+        let mut effects = vec![PcEffect::BroadcastVote3(Box::new(our_vote3))];
+        effects.extend(self.maybe_finalize());
+        effects
+    }
+
+    fn maybe_finalize(&mut self) -> Vec<PcEffect> {
+        if self.decided || self.vote3_pool.len() < self.quorum() {
+            return vec![];
+        }
+        let q = self.quorum();
+        let vote3s: Vec<&PcVote3> = self.vote3_pool.values().take(q).collect();
+        let qc3 = build_qc3(&vote3s);
+        self.decided = true;
+        vec![PcEffect::Decided(Box::new(qc3))]
+    }
+
+    const fn equivocation_wire(
+        &self,
+        equivocator: ValidatorId,
+        round: PcVoteRound,
+        value_a: PcVector,
+        sig_a: Bls12381G2Signature,
+        value_b: PcVector,
+        sig_b: Bls12381G2Signature,
+    ) -> PcVoteEquivocation {
+        PcVoteEquivocation {
+            validator: equivocator,
+            slot: self.slot,
+            view: self.view,
+            round,
+            value_a,
+            sig_a,
+            value_b,
+            sig_b,
+        }
+    }
+}
+
+/// Pull the round-1 vote's "primary" sig — the sig over the full
+/// `v_in` vector, sitting at `prefix_sigs[v_in.len()]`. This is the
+/// sig the slim wire form carries.
+fn prefix_top_sig(v: &PcVote1) -> Bls12381G2Signature {
+    v.prefix_sigs()[v.v_in().len()]
+}
+
+/// Pull the round-2 vote's "primary" sig — the sig over the full
+/// `x` vector at `prefix_sigs[x.len()]`.
+fn vote2_top_sig(v: &PcVote2) -> Bls12381G2Signature {
+    v.prefix_sigs()[v.x().len()]
+}
+
 #[cfg(test)]
 mod tests {
     //! Structural-rejection smoke tests for the verifier gates.
@@ -1035,5 +1333,106 @@ mod tests {
                 length_multi_sig: generate_bls_keypair().sign_v1(b"unused"),
             },
         )
+    }
+
+    // ─── FSM tests ─────────────────────────────────────────────────────
+
+    use hyperscale_types::{Slot, SpcView, bls_keypair_from_seed};
+
+    fn fsm_committee(
+        n: usize,
+    ) -> (
+        Vec<Arc<Bls12381G1PrivateKey>>,
+        Vec<(ValidatorId, Bls12381G1PublicKey)>,
+    ) {
+        let mut sks = Vec::with_capacity(n);
+        let mut members = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut seed = [0u8; 32];
+            seed[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            let sk = bls_keypair_from_seed(&seed);
+            let pk = sk.public_key();
+            members.push((ValidatorId::new(i as u64), pk));
+            sks.push(Arc::new(sk));
+        }
+        (sks, members)
+    }
+
+    fn fsm_instance(idx: usize) -> PcInstance {
+        let (sks, members) = fsm_committee(4);
+        PcInstance::new(
+            net(),
+            Slot::new(1),
+            SpcView::new(0),
+            members.clone(),
+            members[idx].0,
+            Arc::clone(&sks[idx]),
+        )
+    }
+
+    /// `PcInstance::new` panics when the committee is too small for
+    /// any BFT (`n < 4`). Enforces the `n >= 3f + 1` precondition at
+    /// construction so the FSM never enters a state where `quorum()`
+    /// is undefined.
+    #[test]
+    #[should_panic(expected = "PC requires n >= 4")]
+    fn pc_instance_rejects_undersized_committee() {
+        let (sks, members) = fsm_committee(3);
+        let _ = PcInstance::new(
+            net(),
+            Slot::new(1),
+            SpcView::new(0),
+            members,
+            ValidatorId::new(0),
+            Arc::clone(&sks[0]),
+        );
+    }
+
+    /// First `Input` event emits a `BroadcastVote1` and seeds the
+    /// local vote-1 pool. Subsequent inputs are idempotent.
+    #[test]
+    fn pc_input_emits_single_broadcast_then_idempotent() {
+        let mut fsm = fsm_instance(0);
+        let v = PcVector::new(std::iter::once(elem(7)));
+        let effects = fsm.handle(PcEvent::Input(v.clone()));
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(effects[0], PcEffect::BroadcastVote1(_)));
+        assert!(fsm.has_input());
+
+        // Second input — already set, no effects.
+        let effects2 = fsm.handle(PcEvent::Input(v));
+        assert!(effects2.is_empty());
+    }
+
+    /// Two distinct round-1 votes from the same peer (different
+    /// `v_in`) trigger `EquivocationObserved`. Both sides individually
+    /// verify; the FSM's pool collision is what surfaces it.
+    #[test]
+    fn pc_observes_round1_equivocation() {
+        let (sks, members) = fsm_committee(4);
+        let mut fsm = PcInstance::new(
+            net(),
+            Slot::new(1),
+            SpcView::new(0),
+            members.clone(),
+            members[0].0,
+            Arc::clone(&sks[0]),
+        );
+
+        // Two distinct v_ins signed by validator 1 (the equivocator).
+        let pc_ctx_bytes = pc_context(&spc_context(Slot::new(1)), SpcView::new(0));
+        let v_a = PcVector::new(std::iter::once(elem(1)));
+        let v_b = PcVector::new(std::iter::once(elem(2)));
+        let vote_a = sign_vote1(&sks[1], members[1].0, &net(), &pc_ctx_bytes, v_a);
+        let vote_b = sign_vote1(&sks[1], members[1].0, &net(), &pc_ctx_bytes, v_b);
+
+        let effects_a = fsm.handle(PcEvent::Vote1Received(vote_a));
+        assert!(effects_a.is_empty(), "first vote pools without effect");
+        let effects_b = fsm.handle(PcEvent::Vote1Received(vote_b));
+        let [PcEffect::EquivocationObserved(ev)] = effects_b.as_slice() else {
+            panic!("expected EquivocationObserved, got {effects_b:?}");
+        };
+        assert_eq!(ev.validator, members[1].0);
+        assert_eq!(ev.round, PcVoteRound::Vote1);
     }
 }

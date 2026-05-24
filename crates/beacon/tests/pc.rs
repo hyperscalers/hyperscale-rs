@@ -6,7 +6,7 @@
 
 mod common;
 
-use common::{Committee, pc_ctx};
+use common::{Committee, PcSim, pc_ctx};
 use hyperscale_beacon::pc::{
     build_qc1, build_qc2, build_qc3, sign_vote1, sign_vote2, sign_vote3, verify_qc1, verify_qc2,
     verify_qc3, verify_vote_equivocation,
@@ -198,6 +198,72 @@ fn equivocation_round_trip_round1() {
         sig_b: vote_b.prefix_sigs()[vote_b.v_in().len()],
     };
     assert!(verify_vote_equivocation(&ev, &network, &cm.members));
+}
+
+/// Drive a 4-party `PcSim` end-to-end with every party voting the
+/// same `v_in`. All parties reach `Decided` and converge on the
+/// same `(x_pp, x_pe)`.
+#[test]
+fn sim_n4_all_agree_converges() {
+    let mut sim = PcSim::new(4, 0xAA, Slot::new(1), SpcView::new(0));
+    let v = PcVector::new([elem(1), elem(2)]);
+    for i in 0..4 {
+        sim.input(i, v.clone());
+    }
+    let steps = sim.run_until_quiescent(1_000);
+    assert!(sim.all_decided(), "all 4 parties should reach Decided");
+    let baseline_low = sim.decided(0).unwrap().x_pp().clone();
+    let baseline_high = sim.decided(0).unwrap().x_pe().clone();
+    for i in 1..4 {
+        let qc3 = sim.decided(i).unwrap();
+        assert_eq!(*qc3.x_pp(), baseline_low);
+        assert_eq!(*qc3.x_pe(), baseline_high);
+    }
+    // Sanity: should converge in well under the budget.
+    assert!(steps < 500, "convergence took {steps} steps");
+}
+
+/// Sim at n=7 (q=5): all-agree still converges. Catches off-by-one
+/// in quorum sizing.
+#[test]
+fn sim_n7_all_agree_converges() {
+    let mut sim = PcSim::new(7, 0x07, Slot::new(2), SpcView::new(0));
+    let v = PcVector::new([elem(0xA1)]);
+    for i in 0..7 {
+        sim.input(i, v.clone());
+    }
+    sim.run_until_quiescent(2_000);
+    assert!(sim.all_decided());
+    let first = sim.decided(0).unwrap().x_pp().clone();
+    for i in 1..7 {
+        assert_eq!(*sim.decided(i).unwrap().x_pp(), first);
+    }
+}
+
+/// `f` parties silent: the remaining `q = n - f` parties still
+/// converge. Verifies the FSM doesn't deadlock on the missing
+/// quorum threshold.
+#[test]
+fn sim_n4_with_one_silent_party_still_converges() {
+    let mut sim = PcSim::new(4, 0xFF, Slot::new(3), SpcView::new(0));
+    let v = PcVector::new([elem(5)]);
+    // Parties 0..3 vote; party 3 stays silent.
+    for i in 0..3 {
+        sim.input(i, v.clone());
+    }
+    sim.run_until_quiescent(1_000);
+    // Parties 0, 1, 2 reach Decided (3 = n-f).
+    for i in 0..3 {
+        assert!(sim.decided(i).is_some(), "party {i} should decide");
+    }
+    // Party 3 (silent) never received an Input, so no votes to drive
+    // its own quorum into round 1 — it observes others' votes but
+    // never broadcasts, so it gathers the 3 other votes per round
+    // and also reaches Decided.
+    assert!(
+        sim.decided(3).is_some(),
+        "silent observer should also decide via received votes"
+    );
 }
 
 /// A tampered `sig_b` (signed by a different validator) must not
