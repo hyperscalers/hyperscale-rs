@@ -20,8 +20,5 @@ pub(crate) mod typed_cf;
 pub use beacon::core::{BeaconStorageError, RocksDbBeaconStorage};
 pub use config::{CompressionType, RocksDbConfig};
 pub use shard::core::{RocksDbStorage, StorageError};
-// Re-export the public module at its original path so external callers
-// using `hyperscale_storage_rocksdb::jmt_stored` keep compiling.
-pub use shard::jmt_stored;
 pub use shard::shared::SharedStorage;
 pub use shard::snapshot::RocksDbSnapshot;

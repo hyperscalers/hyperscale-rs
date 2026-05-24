@@ -10,12 +10,13 @@
 
 // Mirror types and their constructors/accessors are self-documenting:
 // fields name the JMT concept (version, path_bytes, hash, value_hash);
-// methods (`from_jmt`/`to_jmt`/`version()`/`path_bits()`) say what they do.
+// methods (`from_jmt`/`to_jmt`) say what they do.
 #![allow(missing_docs)]
 
+#[cfg(test)]
+use hyperscale_jmt::PathDecodeError;
 use hyperscale_jmt::{
     Child, ChildKind, Hash as JmtHash, InternalNode, Key as JmtKey, LeafNode, Node, NodeKey,
-    PathDecodeError,
 };
 use sbor::prelude::*;
 
@@ -52,32 +53,20 @@ impl StoredNodeKey {
             path_bytes: key.path.as_bytes().to_vec(),
         }
     }
+}
 
-    /// # Errors
-    ///
-    /// Returns [`PathDecodeError`] if `path_bits` and `path_bytes`
-    /// disagree (e.g. corrupted storage).
+#[cfg(test)]
+impl StoredNodeKey {
+    /// Test-only inverse of [`Self::from_jmt`]. Production never decodes
+    /// stored keys back to `NodeKey` — the JMT keys CF is point-lookup
+    /// only by design (see `JmtKeyCodec`). The round-trip exists to
+    /// pin down the encoding invariant in tests.
     pub fn to_jmt(&self) -> Result<NodeKey, PathDecodeError> {
         let mut encoded = Vec::with_capacity(8 + 2 + self.path_bytes.len());
         encoded.extend_from_slice(&self.version.to_be_bytes());
         encoded.extend_from_slice(&self.path_bits.to_be_bytes());
         encoded.extend_from_slice(&self.path_bytes);
         NodeKey::decode(&encoded)
-    }
-
-    #[must_use]
-    pub const fn version(&self) -> Version {
-        self.version
-    }
-
-    #[must_use]
-    pub const fn path_bits(&self) -> u16 {
-        self.path_bits
-    }
-
-    #[must_use]
-    pub fn path_bytes(&self) -> &[u8] {
-        &self.path_bytes
     }
 }
 

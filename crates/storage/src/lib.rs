@@ -41,10 +41,7 @@ pub use shard::recovered_state::RecoveredState;
 pub use shard::store::{SubstateStore, VersionedStore};
 pub use shard::tree::{CollectedWrites, JmtSnapshot, LeafSubstateKeyAssociation};
 pub use shard::writes::{merge_database_updates, merge_into, merge_updates_from_receipts};
-// Re-export the public modules at the original paths so consumers using
-// `hyperscale_storage::{keys, lock_recover, pending_chain, tree}` continue
-// to compile unchanged.
-pub use shard::{keys, lock_recover, pending_chain, tree};
+pub use shard::{keys, lock_recover, tree};
 
 /// Umbrella bound for storage backends threaded as a generic `S` through
 /// node-side machinery (the `IoLoop` and its delegated action handler).

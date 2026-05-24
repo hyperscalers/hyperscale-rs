@@ -14,7 +14,7 @@ pub(crate) mod core;
 pub(crate) mod execution_certs;
 pub(crate) mod gc;
 pub(crate) mod jmt_snapshot_store;
-pub mod jmt_stored;
+pub(crate) mod jmt_stored;
 pub(crate) mod metadata;
 pub(crate) mod receipts;
 pub(crate) mod recovery;
