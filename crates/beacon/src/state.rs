@@ -30,12 +30,12 @@ use hyperscale_types::{
 use rand::RngExt;
 
 use crate::constants::{
-    EMISSIONS_PER_EPOCH, JAIL_COOLDOWN_EPOCHS, MIN_STAKE_FLOOR, MISSED_PROPOSAL_JAIL_THRESHOLD,
-    POOL_BUFFER_TARGET, READY_TIMEOUT_EPOCHS, SHARD_CAPACITY, SHUFFLE_INTERVAL_EPOCHS,
-    UNBONDING_WINDOW_EPOCHS,
+    BEACON_SIGNER_COUNT, EMISSIONS_PER_EPOCH, JAIL_COOLDOWN_EPOCHS, MIN_STAKE_FLOOR,
+    MISSED_PROPOSAL_JAIL_THRESHOLD, POOL_BUFFER_TARGET, READY_TIMEOUT_EPOCHS, SHARD_CAPACITY,
+    SHUFFLE_INTERVAL_EPOCHS, UNBONDING_WINDOW_EPOCHS,
 };
 use crate::pc::verify_vote_equivocation;
-use crate::sampling::{draw_from_pool, prng_from};
+use crate::sampling::{draw_from_pool, prng_from, sample_committee};
 
 /// Domain tag for the beacon-randomness mixer. Binds the BLAKE3 input
 /// to "beacon randomness v1" so the digest can't collide with any
@@ -432,6 +432,26 @@ pub fn pooled_validators(state: &BeaconState) -> Vec<ValidatorId> {
         .collect()
 }
 
+/// Validators eligible to serve on the beacon committee: status is
+/// `OnShard { ready: true, .. }` on any shard.
+///
+/// Every beacon committee member is therefore a signer on some shard —
+/// an offline validator can't escape detection by hiding in the beacon
+/// set. Pooled, jailed, insufficient-stake, and not-yet-ready
+/// validators are all excluded.
+///
+/// Returned sorted by `ValidatorId` (`BTreeMap` iteration order) for
+/// deterministic Fisher–Yates input downstream.
+#[must_use]
+pub fn beacon_eligible(state: &BeaconState) -> Vec<ValidatorId> {
+    state
+        .validators
+        .iter()
+        .filter(|(_, r)| matches!(r.status, ValidatorStatus::OnShard { ready: true, .. }))
+        .map(|(id, _)| *id)
+        .collect()
+}
+
 /// Dynamic per-validator minimum stake.
 ///
 /// Pure function of state — no stored "current `min_stake`" field.
@@ -635,6 +655,7 @@ pub fn apply_epoch(
     let rewards_credited = distribute_epoch_rewards(state);
     let timeout_readied = auto_ready_timeout(state);
     run_shuffle_step(state);
+    let beacon_committee_transition = resample_beacon_committee(state);
 
     let mut jailed = vrf.jailed;
     jailed.extend(witness.jailed);
@@ -655,7 +676,8 @@ pub fn apply_epoch(
         rejected_reveals: vrf.rejected_reveals,
         rewards_credited,
         shard_committee_transitions,
-        ..SlotEffects::default()
+        committee_changed: true,
+        beacon_committee_transition: Some(beacon_committee_transition),
     }
 }
 
@@ -1570,6 +1592,32 @@ fn run_shuffle_step(state: &mut BeaconState) {
             .get_mut(&victim)
             .expect("victim is in state.validators")
             .status = ValidatorStatus::Pooled;
+    }
+}
+
+// ─── beacon committee resample ─────────────────────────────────────────────
+
+/// Resample `state.committee` from [`beacon_eligible`] using
+/// `state.randomness`, returning the resulting handover.
+///
+/// Runs every epoch — the slot-equals-epoch model makes every
+/// `apply_epoch` a beacon-committee boundary, so the runner gets a
+/// fresh SPC instance per epoch regardless of whether the resampled
+/// set differs from the prior one.
+///
+/// Reads the post-shuffle eligible set: validators rotated to `Pooled`
+/// by [`run_shuffle_step`] are excluded from this resample's input.
+/// Order matters — putting the resample before the shuffle would feed
+/// stale `OnShard { ready: true }` ids into the sampler.
+fn resample_beacon_committee(state: &mut BeaconState) -> CommitteeTransition {
+    let prior = std::mem::take(&mut state.committee);
+    let eligible = beacon_eligible(state);
+    state.committee = sample_committee(&eligible, state.randomness.as_bytes(), BEACON_SIGNER_COUNT);
+    CommitteeTransition {
+        from: prior,
+        to: state.committee.clone(),
+        cause: TransitionCause::NaturalShuffle,
+        at_slot: state.current_epoch,
     }
 }
 
@@ -4799,5 +4847,169 @@ mod tests {
         state.committee = (0u64..4).map(ValidatorId::new).collect();
         let effects = apply_next_epoch(&mut state, &[]);
         assert!(effects.shard_committee_transitions.is_empty());
+    }
+
+    // ─── beacon_eligible + resample_beacon_committee ─────────────────────
+
+    /// `beacon_eligible` returns exactly the `OnShard { ready: true }`
+    /// validators; `Pooled`, `Jailed`, `InsufficientStake`, and
+    /// not-yet-ready `OnShard` validators are all excluded.
+    #[test]
+    fn beacon_eligible_filters_to_on_shard_ready() {
+        let shard = ShardGroupId::new(0);
+        let mut state = empty_state();
+        let ready_id = ValidatorId::new(1);
+        state.validators.insert(
+            ready_id,
+            validator_record(
+                1,
+                0,
+                ValidatorStatus::OnShard {
+                    shard,
+                    ready: true,
+                    placed_at_epoch: Epoch::GENESIS,
+                },
+            ),
+        );
+        state.validators.insert(
+            ValidatorId::new(2),
+            validator_record(
+                2,
+                0,
+                ValidatorStatus::OnShard {
+                    shard,
+                    ready: false,
+                    placed_at_epoch: Epoch::GENESIS,
+                },
+            ),
+        );
+        state.validators.insert(
+            ValidatorId::new(3),
+            validator_record(3, 0, ValidatorStatus::Pooled),
+        );
+        state.validators.insert(
+            ValidatorId::new(4),
+            validator_record(
+                4,
+                0,
+                ValidatorStatus::Jailed {
+                    since_epoch: Epoch::GENESIS,
+                    reason: JailReason::Performance,
+                },
+            ),
+        );
+        state.validators.insert(
+            ValidatorId::new(5),
+            validator_record(5, 0, ValidatorStatus::InsufficientStake),
+        );
+
+        assert_eq!(beacon_eligible(&state), vec![ready_id]);
+    }
+
+    /// `apply_epoch` always populates `committee_changed = true` and a
+    /// `beacon_committee_transition` with `NaturalShuffle` cause anchored
+    /// at the applied epoch.
+    #[test]
+    fn apply_epoch_populates_committee_changed_and_transition() {
+        let mut state = single_pool_state(4);
+        state.committee = vec![]; // start empty to make the handover visible
+
+        let effects = apply_next_epoch(&mut state, &[]);
+
+        assert!(effects.committee_changed);
+        let transition = effects
+            .beacon_committee_transition
+            .expect("resample populates the transition");
+        assert_eq!(transition.from, vec![]);
+        assert_eq!(
+            transition.to,
+            (0u64..4).map(ValidatorId::new).collect::<Vec<_>>()
+        );
+        assert_eq!(transition.cause, TransitionCause::NaturalShuffle);
+        assert_eq!(transition.at_slot, Epoch::new(1));
+        // State carries the resampled committee.
+        assert_eq!(state.committee, transition.to);
+    }
+
+    /// When `beacon_eligible` exceeds `BEACON_SIGNER_COUNT`, the
+    /// resample returns exactly `BEACON_SIGNER_COUNT` validators, all
+    /// drawn from the eligible set.
+    #[test]
+    fn resample_picks_subset_when_eligible_oversize() {
+        // 2 shards × 4 ready actives = 8 eligible, BEACON_SIGNER_COUNT = 4.
+        let mut state = multi_shard_state(2, 4, 0);
+        let eligible: BTreeSet<ValidatorId> = beacon_eligible(&state).into_iter().collect();
+        assert!(eligible.len() > BEACON_SIGNER_COUNT);
+
+        apply_next_epoch(&mut state, &[]);
+
+        assert_eq!(state.committee.len(), BEACON_SIGNER_COUNT);
+        for id in &state.committee {
+            assert!(eligible.contains(id), "{id:?} not in eligible set");
+        }
+        // Sorted output (sample_committee's contract).
+        let mut sorted = state.committee.clone();
+        sorted.sort();
+        assert_eq!(state.committee, sorted);
+    }
+
+    /// Two states with byte-identical inputs (validators, pools,
+    /// randomness, `current_epoch`) produce byte-identical committees
+    /// after `apply_epoch`. Pins the cross-replica determinism property
+    /// the resample relies on.
+    #[test]
+    fn resample_is_deterministic_across_replicas() {
+        let mut a = multi_shard_state(2, 4, 0);
+        let mut b = multi_shard_state(2, 4, 0);
+        // Same non-zero seed on both — the Fisher–Yates path activates
+        // only when the eligible set exceeds `BEACON_SIGNER_COUNT`,
+        // which is true here (8 > 4).
+        a.randomness = Randomness([0x5A; 32]);
+        b.randomness = Randomness([0x5A; 32]);
+
+        apply_next_epoch(&mut a, &[]);
+        apply_next_epoch(&mut b, &[]);
+
+        assert_eq!(a.committee, b.committee);
+        assert_eq!(a.randomness, b.randomness);
+    }
+
+    /// A validator jailed during the epoch must not appear in the
+    /// resampled committee — the resample reads the post-pipeline
+    /// `beacon_eligible` set.
+    #[test]
+    fn resample_excludes_jailed_validators() {
+        let mut state = single_pool_state(4);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        // Pre-jail validator 0 — `beacon_eligible` excludes them on the
+        // next apply.
+        state
+            .validators
+            .get_mut(&ValidatorId::new(0))
+            .unwrap()
+            .status = ValidatorStatus::Jailed {
+            since_epoch: Epoch::GENESIS,
+            reason: JailReason::Performance,
+        };
+        // Drop validator 0 from the shard committee too, matching the
+        // global invariant.
+        state
+            .shard_committees
+            .get_mut(&ShardGroupId::new(0))
+            .unwrap()
+            .members
+            .retain(|v| *v != ValidatorId::new(0));
+
+        apply_next_epoch(&mut state, &[]);
+
+        assert!(!state.committee.contains(&ValidatorId::new(0)));
+        assert_eq!(
+            state.committee,
+            vec![
+                ValidatorId::new(1),
+                ValidatorId::new(2),
+                ValidatorId::new(3),
+            ]
+        );
     }
 }
