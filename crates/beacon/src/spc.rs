@@ -584,11 +584,11 @@ fn referenced_triple(cert: &SpcCert) -> SpcHighTriple {
 
 // ─── FSM ───────────────────────────────────────────────────────────────────
 
-/// What [`SpcInstance::handle`] tells MSC.
+/// What [`SpcInstance::handle`] tells its parent.
 ///
-/// Sub-machine-local — the parent (MSC) drains these and lifts them
-/// into either internal state mutations or further effects bubbling
-/// up to the `BeaconCoordinator`.
+/// Sub-machine-local — the parent (the `BeaconCoordinator`) drains
+/// these and lifts them into either internal state mutations or
+/// further effects.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpcEffect {
     /// Relay an inner-PC vote to peers, tagged with the SPC view it
@@ -622,8 +622,7 @@ pub enum SpcEffect {
         evidence: Box<PcVoteEquivocation>,
     },
     /// View `> 1` produced an empty low — surface evidence to the
-    /// parent so MSC can demote the cyclic-first party in the next
-    /// slot.
+    /// parent for downstream handling.
     EmptyLowEvidence(Box<SpcEmptyLowEvidence>),
     /// Broadcast our own empty-view attestation to peers — we
     /// produced a high output at `msg.view` but our local table
@@ -720,10 +719,10 @@ pub enum SpcEvent {
 /// output form, which has effect variants beyond the four broadcast
 /// shapes).
 ///
-/// MSC wraps these with a slot tag in
-/// [`MscEffect::BroadcastSpcMsg`](crate::msc::MscEffect) for outbound,
-/// and reconstructs an `SpcEvent` via [`Self::into_event`] when a
-/// peer message arrives at the IO layer (which knows the sender id).
+/// The `BeaconCoordinator` lifts these into network broadcast effects
+/// for outbound, and reconstructs an `SpcEvent` via
+/// [`Self::into_event`] when a peer message arrives at the IO layer
+/// (which knows the sender id).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpcMessage {
     /// Inner-PC vote tagged with its SPC view.
@@ -805,12 +804,13 @@ impl ViewState {
 /// up via state-sync is the right move.
 const MAX_PENDING_EMPTY_VIEW_AHEAD: u32 = 4;
 
-/// One SPC FSM instance, scoped to a single slot.
+/// One SPC FSM instance, scoped to a single epoch.
 ///
-/// Owns one inner PC instance per view it enters. MSC drives one
-/// `SpcInstance` per slot. Handles both the happy path (view 1
-/// input → view 2 cert → commit) and view-change (empty-view
-/// attestations → indirect cert → skip ahead).
+/// Owns one inner PC instance per view it enters. The
+/// `BeaconCoordinator` drives one `SpcInstance` per epoch. Handles
+/// both the happy path (view 1 input → view 2 cert → commit) and
+/// view-change (empty-view attestations → indirect cert → skip
+/// ahead).
 pub struct SpcInstance {
     network: NetworkDefinition,
     slot: Slot,
@@ -842,10 +842,11 @@ impl SpcInstance {
     /// Construct a fresh SPC instance for `slot`. Creates the view-1
     /// `PcInstance` eagerly.
     ///
-    /// `view_timeout` is the duration the parent (MSC) is asked to
-    /// wait between `SetTimer { view }` and `TimerExpired { view }`
-    /// firing — the `2Δ` cap on a view's leader-proposal grace period
-    /// before participants exchange empty-views and skip ahead.
+    /// `view_timeout` is the duration the parent (the
+    /// `BeaconCoordinator`) is asked to wait between `SetTimer { view }`
+    /// and `TimerExpired { view }` firing — the `2Δ` cap on a view's
+    /// leader-proposal grace period before participants exchange
+    /// empty-views and skip ahead.
     ///
     /// # Panics
     ///

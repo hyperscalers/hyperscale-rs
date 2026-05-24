@@ -4,8 +4,6 @@
 //!   recovery cert).
 //! - [`header`]: [`BeaconBlockHeader`] (committee-signed chain link).
 //! - [`limits`]: protocol-level caps on per-proposal payload sizes.
-//! - [`msc`]: Multi-Slot Consensus wire types (slot proposals + empty-low
-//!   accusations).
 //! - [`pc`]: Prefix Consensus vote / QC wire types.
 //! - [`proposal`]: [`BeaconProposal`] (one committee member's slot
 //!   submission: witnesses + VRF reveal).
@@ -22,7 +20,6 @@
 pub mod block;
 pub mod header;
 pub mod limits;
-pub mod msc;
 pub mod pc;
 pub mod proposal;
 pub mod ready_signal;
@@ -33,11 +30,10 @@ pub mod witness;
 pub use block::BeaconBlock;
 pub use header::BeaconBlockHeader;
 pub use limits::{
-    MAX_ACCUSATIONS_PER_PROPOSAL, MAX_BEACON_WITNESS_EVENTS_PER_TX, MAX_PREFIX_SIGS,
-    MAX_READY_SIGNALS_PER_BLOCK, MAX_READY_WINDOW_BLOCKS, MAX_SKIP_SIGS, MAX_VOTE_VECTOR_LEN,
-    MAX_WITNESS_PROOF_DEPTH, MAX_WITNESSES_PER_FETCH, MAX_WITNESSES_PER_PROPOSER,
+    MAX_BEACON_WITNESS_EVENTS_PER_TX, MAX_PREFIX_SIGS, MAX_READY_SIGNALS_PER_BLOCK,
+    MAX_READY_WINDOW_BLOCKS, MAX_SKIP_SIGS, MAX_VOTE_VECTOR_LEN, MAX_WITNESS_PROOF_DEPTH,
+    MAX_WITNESSES_PER_FETCH, MAX_WITNESSES_PER_PROPOSER,
 };
-pub use msc::{MscEmptyLowAccusation, MscSlotProposal};
 pub use pc::{
     PC_VALUE_ELEMENT_BYTES, PcCompactLenSigner, PcCompactVote, PcDivergingProof, PcQc1, PcQc2,
     PcQc3, PcValueElement, PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation, PcVoteRound,

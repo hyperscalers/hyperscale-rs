@@ -42,16 +42,6 @@ pub const MAX_PREFIX_SIGS: usize = MAX_VOTE_VECTOR_LEN + 1;
 /// actual count against the committee size at the cert's slot.
 pub const MAX_SKIP_SIGS: usize = 4096;
 
-/// Cap on the `accusations` vector carried by an
-/// [`MscSlotProposalNotification`](crate::network::notification::beacon::MscSlotProposalNotification).
-///
-/// Accusations accumulate across recent slots' SPC views that produced
-/// empty-low outputs; the proposer attaches the batch to their next
-/// outgoing slot proposal so MSC's ranking update can demote the
-/// accused validators. Steady-state count is near zero; cap sized for
-/// burst recovery after a partition or extended thrash window.
-pub const MAX_ACCUSATIONS_PER_PROPOSAL: usize = 256;
-
 /// Cap on the depth of a [`ShardWitnessProof`](crate::ShardWitnessProof)'s
 /// Merkle path.
 ///

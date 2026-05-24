@@ -202,7 +202,7 @@ pub struct ShardCommittee {
 ///
 /// Cross-validator agreement on every field at every slot follows from
 /// `apply_slot` being a pure deterministic function of `(state, slot,
-/// committed)` and MSC's Agreement guaranteeing all honest parties see
+/// committed)` and SPC's Agreement guaranteeing all honest parties see
 /// the same `committed` argument.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BeaconState {
@@ -218,7 +218,7 @@ pub struct BeaconState {
     /// each slot's accepted VRF outputs.
     pub randomness: Randomness,
     /// Beacon committee for the current epoch — the validators running
-    /// the MSC instance producing this chain.
+    /// the SPC instance producing this epoch's block.
     pub committee: Vec<ValidatorId>,
     /// Per-shard ordered committee. Membership evolves via the
     /// trickled shuffle (slow per-interval churn), jail/exit/
@@ -282,12 +282,12 @@ pub enum TransitionCause {
 /// [`SlotEffects::beacon_committee_transition`] and
 /// [`SlotEffects::shard_committee_transitions`]) and by recovery-cert
 /// application, so the runner has a unified signal for "tear down the
-/// MSC instance you were running for `from` and bootstrap a fresh one
+/// SPC instance you were running for `from` and bootstrap a fresh one
 /// with `to`."
 ///
 /// Honest committee members of `from` whose membership has ended see
-/// `to` and either bootstrap a new MSC instance (if `to` contains them)
-/// or shut down MSC participation cleanly (if `to` excludes them).
+/// `to` and either bootstrap a new SPC instance (if `to` contains them)
+/// or shut down SPC participation cleanly (if `to` excludes them).
 ///
 /// Cross-validator agreement on `(from, to, cause, at_slot)` follows
 /// from `apply_slot` being deterministic; every honest party computes
@@ -580,9 +580,9 @@ pub fn pool_draw(state: &mut BeaconState, shard: ShardGroupId) -> Option<Validat
 
 // ─── slot pipeline ─────────────────────────────────────────────────────────
 
-/// Apply one slot's MSC commit to `state`.
+/// Apply one slot's SPC commit to `state`.
 ///
-/// `committed` is the per-slot proposals MSC's Agreement layer has
+/// `committed` is the per-slot proposals SPC's Agreement layer has
 /// agreed on. Pure deterministic function of `(state, network, slot,
 /// committed)` — every honest party with byte-identical inputs lands
 /// at byte-identical state.
@@ -1868,7 +1868,7 @@ mod tests {
 
     /// `apply_slot` rejects a slot that doesn't strictly advance
     /// `state.current_slot`. Catches runner bugs that replay or
-    /// re-order MSC commits before the chain-difference math
+    /// re-order SPC commits before the chain-difference math
     /// (cooldown, unbonding, ready-timeout) silently underflows.
     #[test]
     #[should_panic(expected = "apply_slot regression")]

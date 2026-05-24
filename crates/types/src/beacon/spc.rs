@@ -58,9 +58,9 @@ pub struct SpcEmptyViewMsg {
 /// the inner PC's certified low is empty, so the view contributed
 /// nothing to the slot's progress.
 ///
-/// `apply_slot` walks these into MSC's ranking-update logic at the
-/// next slot's boundary (the `MscEmptyLowAccusation` is the
-/// slot-tagged form of this).
+/// Surfaced as an effect for the parent coordinator to handle
+/// (logging, accusations, or proposer-schedule input — depending on
+/// the surrounding architecture).
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct SpcEmptyLowEvidence {
     /// View whose inner PC certified an empty low. Must be `> 1`

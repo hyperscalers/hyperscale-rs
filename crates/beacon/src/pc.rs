@@ -803,7 +803,7 @@ fn mcp_two(a: &PcVector, b: &PcVector) -> usize {
 ///
 /// Sub-machine-local — the parent (SPC) drains these and lifts them
 /// into either internal state mutations or further effects bubbling
-/// up to MSC and the `BeaconCoordinator`.
+/// up to the `BeaconCoordinator`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PcEffect {
     /// Broadcast a freshly-signed round-1 vote.
@@ -839,10 +839,10 @@ pub enum PcEvent {
 
 /// One inner-PC FSM instance, scoped to a single `(slot, view)`.
 ///
-/// SPC owns one `PcInstance` per view it drives; MSC owns one
-/// `SpcInstance` per slot. The FSM is synchronous — every event-
-/// handler invocation returns the full set of effects that follow,
-/// and the parent drains them.
+/// SPC owns one `PcInstance` per view it drives; the
+/// `BeaconCoordinator` owns one `SpcInstance` per epoch. The FSM is
+/// synchronous — every event-handler invocation returns the full set
+/// of effects that follow, and the parent drains them.
 pub struct PcInstance {
     network: NetworkDefinition,
     slot: Slot,

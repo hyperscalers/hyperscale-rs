@@ -11,11 +11,9 @@
 //! consuming tests reference `common::Committee`, `common::pc_ctx`, etc.
 
 mod fixtures;
-mod msc_sim;
 mod pc_sim;
 mod spc_sim;
 
 pub use fixtures::{Committee, pc_ctx};
-pub use msc_sim::{CommittedSet, MscSim};
 pub use pc_sim::PcSim;
 pub use spc_sim::SpcSim;
