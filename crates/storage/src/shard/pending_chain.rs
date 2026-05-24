@@ -18,8 +18,8 @@ use hyperscale_types::{
 use radix_common::prelude::DatabaseUpdate;
 use radix_substate_store_interface::interface::SubstateDatabase;
 
-use crate::keys::node_entity_key;
 use crate::lock_recover::{lock_or_recover, read_or_recover, write_or_recover};
+use crate::shard::keys::node_entity_key;
 use crate::tree::proofs::generate_proof;
 use crate::{
     BeaconWitnessCommit, BlockForSync, ChainReader, ChainWriter, DatabaseUpdates, DbPartitionKey,

@@ -24,7 +24,7 @@
 
 use std::collections::BTreeMap;
 
-use hyperscale_storage::keys;
+use hyperscale_storage::shard::keys;
 use hyperscale_types::SubstateEntry;
 use radix_engine::transaction::{ExecutionConfig, TransactionReceipt, execute_transaction};
 use radix_engine::vm::DefaultVmModules;

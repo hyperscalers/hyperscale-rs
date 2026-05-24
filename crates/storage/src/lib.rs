@@ -23,7 +23,9 @@
 #![warn(missing_docs)]
 
 pub mod beacon;
+pub mod lock_recover;
 pub mod shard;
+pub mod tree;
 
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_helpers;
@@ -39,9 +41,8 @@ pub use shard::overlay::{SubstateDbLookup, SubstateLookup};
 pub use shard::pending_chain::{BaseReadCache, ChainEntry, PendingChain, SubstateView};
 pub use shard::recovered_state::RecoveredState;
 pub use shard::store::{SubstateStore, VersionedStore};
-pub use shard::tree::{CollectedWrites, JmtSnapshot, LeafSubstateKeyAssociation};
 pub use shard::writes::{merge_database_updates, merge_into, merge_updates_from_receipts};
-pub use shard::{keys, lock_recover, tree};
+pub use tree::{CollectedWrites, JmtSnapshot, LeafSubstateKeyAssociation};
 
 /// Umbrella bound for storage backends threaded as a generic `S` through
 /// node-side machinery (the `IoLoop` and its delegated action handler).
