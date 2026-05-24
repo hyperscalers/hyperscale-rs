@@ -909,13 +909,100 @@ fn apply_shard_payload(
             });
             None
         }
-        ShardWitnessPayload::RegisterValidator { .. }
-        | ShardWitnessPayload::DeactivateValidator { .. }
-        | ShardWitnessPayload::Unjail { .. }
+        ShardWitnessPayload::RegisterValidator {
+            pool_id,
+            validator_id,
+            pubkey,
+        } => {
+            // Re-registration policy: once a `ValidatorRecord` exists
+            // for `validator_id`, no second `RegisterValidator` for
+            // that id ever takes effect. The id is dead for the
+            // lifetime of the chain.
+            if state.validators.contains_key(validator_id) {
+                return None;
+            }
+            // Pool must exist and have capacity at the current dynamic
+            // `min_stake` for one more active validator.
+            let pool = state.pools.get(pool_id)?;
+            if current_active_count(pool, state) + 1 > max_active_count(pool, state) {
+                return None;
+            }
+            // We accept any 48-byte BLS pubkey at registration. Radix's
+            // `Bls12381G1PublicKey` doesn't validate G1 membership at
+            // construction and exposes no public validator, so the
+            // prototype's eager-reject path isn't available here. A
+            // malformed key just fails every signature verification it
+            // touches; the validator never signs successfully and gets
+            // jailed via the miss-counter, costing at most one stalled
+            // slot per malformed registration.
+            state.validators.insert(
+                *validator_id,
+                ValidatorRecord {
+                    id: *validator_id,
+                    pool: *pool_id,
+                    status: ValidatorStatus::Pooled,
+                    registered_at_epoch: state.current_epoch,
+                    pubkey: *pubkey,
+                },
+            );
+            state
+                .pools
+                .get_mut(pool_id)
+                .expect("pool existence checked above")
+                .validators
+                .insert(*validator_id);
+            Some(ShardEvent::Registered(*validator_id))
+        }
+        ShardWitnessPayload::DeactivateValidator { validator_id } => {
+            // Operator-initiated retirement. Flips to
+            // `InsufficientStake` from every status except those that
+            // already represent "not consuming a slot" or "permanently
+            // out": `InsufficientStake` itself and
+            // `Jailed { Equivocation }`. Fault-cause jails
+            // (`Performance`, `Recovery`) can still be deactivated —
+            // the operator chooses to retire a jailed validator rather
+            // than wait out the cooldown.
+            let rec = state.validators.get(validator_id)?;
+            let should_deactivate = !matches!(
+                rec.status,
+                ValidatorStatus::InsufficientStake
+                    | ValidatorStatus::Jailed {
+                        reason: JailReason::Equivocation,
+                        ..
+                    }
+            );
+            if !should_deactivate {
+                return None;
+            }
+            deactivate_to_insufficient_stake(state, *validator_id);
+            Some(ShardEvent::Deactivated(*validator_id))
+        }
+        ShardWitnessPayload::Unjail { .. }
         | ShardWitnessPayload::Ready { .. }
         | ShardWitnessPayload::MissedProposal { .. } => {
             todo!("ShardWitnessPayload variant not yet implemented")
         }
+    }
+}
+
+/// Transition `victim_id` to `InsufficientStake` with the standard
+/// `OnShard` cascade (remove from shard committee + `pool_draw`
+/// refill). Other statuses (`Pooled`, fault-cause `Jailed`) flip in
+/// place. Already-`InsufficientStake` and already-permanent
+/// `Jailed { Equivocation }` callers should not invoke this — there's
+/// no transition to make. Callers gate on those cases at the variant
+/// dispatch level (see `DeactivateValidator`).
+fn deactivate_to_insufficient_stake(state: &mut BeaconState, victim_id: ValidatorId) {
+    let Some(rec) = state.validators.get_mut(&victim_id) else {
+        return;
+    };
+    let prior_status = rec.status;
+    rec.status = ValidatorStatus::InsufficientStake;
+    if let ValidatorStatus::OnShard { shard, .. } = prior_status {
+        if let Some(committee) = state.shard_committees.get_mut(&shard) {
+            committee.members.retain(|v| *v != victim_id);
+        }
+        pool_draw(state, shard);
     }
 }
 
@@ -1766,6 +1853,310 @@ mod tests {
         assert_eq!(
             state.consumed_through.get(&ShardGroupId::new(0)),
             Some(&LeafIndex::new(3))
+        );
+    }
+
+    // ─── RegisterValidator + DeactivateValidator ─────────────────────────
+
+    /// Happy path: a `RegisterValidator` for an unknown id with a pool
+    /// that has capacity adds the validator at `Pooled` with
+    /// `registered_at_epoch = state.current_epoch`, and the pool's
+    /// validator set includes the new id.
+    #[test]
+    fn register_validator_happy_path() {
+        let mut state = single_pool_state(4);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        state.current_epoch = Epoch::new(2);
+        // Bump pool 0's stake to cover one more at floor.
+        let pool_id = StakePoolId::new(0);
+        state.pools.get_mut(&pool_id).unwrap().total_stake =
+            Stake::from_attos(5 * MIN_STAKE_FLOOR.attos());
+
+        let new_id = ValidatorId::new(5);
+        let new_pubkey = pubkey(5);
+        let w = shard_witness(
+            0,
+            1,
+            ShardWitnessPayload::RegisterValidator {
+                pool_id,
+                validator_id: new_id,
+                pubkey: new_pubkey,
+            },
+        );
+        let committed = vec![(
+            ValidatorId::new(0),
+            vrf_proposal_with_witnesses(0, Slot::new(1), vec![w]),
+        )];
+        let effects = apply_slot(&mut state, &net(), Slot::new(1), &committed);
+
+        assert_eq!(effects.registered, vec![new_id]);
+        let rec = state.validators.get(&new_id).unwrap();
+        assert_eq!(rec.pool, pool_id);
+        assert_eq!(rec.status, ValidatorStatus::Pooled);
+        assert_eq!(rec.registered_at_epoch, Epoch::new(2));
+        assert_eq!(rec.pubkey, new_pubkey);
+        assert!(state.pools[&pool_id].validators.contains(&new_id));
+    }
+
+    /// A registration for an already-known id is silently dropped —
+    /// no state change, no effect, no entry in `registered`. The
+    /// id-is-dead-forever policy.
+    #[test]
+    fn register_validator_duplicate_id_is_no_op() {
+        let mut state = single_pool_state(4);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        let pool_id = StakePoolId::new(0);
+        state.pools.get_mut(&pool_id).unwrap().total_stake =
+            Stake::from_attos(5 * MIN_STAKE_FLOOR.attos());
+
+        let existing_id = ValidatorId::new(0); // already on shard
+        let prior = state.validators.get(&existing_id).unwrap().clone();
+
+        let w = shard_witness(
+            0,
+            1,
+            ShardWitnessPayload::RegisterValidator {
+                pool_id,
+                validator_id: existing_id,
+                pubkey: pubkey(99),
+            },
+        );
+        let committed = vec![(
+            ValidatorId::new(0),
+            vrf_proposal_with_witnesses(0, Slot::new(1), vec![w]),
+        )];
+        let effects = apply_slot(&mut state, &net(), Slot::new(1), &committed);
+
+        assert!(effects.registered.is_empty());
+        // Record unchanged — pubkey from the duplicate witness didn't
+        // overwrite the prior one.
+        assert_eq!(state.validators.get(&existing_id).unwrap(), &prior);
+    }
+
+    /// A registration that would push the pool over `max_active_count`
+    /// at the current dynamic `min_stake` is silently dropped.
+    #[test]
+    fn register_validator_rejected_when_pool_lacks_capacity() {
+        let mut state = single_pool_state(4); // pool stake = 4 * MIN_STAKE_FLOOR
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        // Pool already supports 4 actives at the floor; a 5th would
+        // exceed max_active_count without bumping stake.
+        let w = shard_witness(
+            0,
+            1,
+            ShardWitnessPayload::RegisterValidator {
+                pool_id: StakePoolId::new(0),
+                validator_id: ValidatorId::new(5),
+                pubkey: pubkey(5),
+            },
+        );
+        let committed = vec![(
+            ValidatorId::new(0),
+            vrf_proposal_with_witnesses(0, Slot::new(1), vec![w]),
+        )];
+        let effects = apply_slot(&mut state, &net(), Slot::new(1), &committed);
+
+        assert!(effects.registered.is_empty());
+        assert!(!state.validators.contains_key(&ValidatorId::new(5)));
+        // Watermark still advances — the witness was consumed even
+        // though the variant rejected it.
+        assert_eq!(
+            state.consumed_through.get(&ShardGroupId::new(0)),
+            Some(&LeafIndex::new(1))
+        );
+    }
+
+    /// `DeactivateValidator` from `OnShard` flips status to
+    /// `InsufficientStake` AND cascades: shard committee loses the
+    /// validator, `pool_draw` refills from any remaining pooled.
+    #[test]
+    fn deactivate_validator_on_shard_cascades() {
+        let mut state = single_pool_state(4);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        let pool_id = StakePoolId::new(0);
+        // Add a 5th validator in the pool to fuel the refill draw.
+        state.pools.get_mut(&pool_id).unwrap().total_stake =
+            Stake::from_attos(5 * MIN_STAKE_FLOOR.attos());
+        state
+            .pools
+            .get_mut(&pool_id)
+            .unwrap()
+            .validators
+            .insert(ValidatorId::new(4));
+        state.validators.insert(
+            ValidatorId::new(4),
+            validator_record(4, 0, ValidatorStatus::Pooled),
+        );
+
+        let w = shard_witness(
+            0,
+            1,
+            ShardWitnessPayload::DeactivateValidator {
+                validator_id: ValidatorId::new(0),
+            },
+        );
+        let committed = vec![(
+            ValidatorId::new(0),
+            vrf_proposal_with_witnesses(0, Slot::new(1), vec![w]),
+        )];
+        let effects = apply_slot(&mut state, &net(), Slot::new(1), &committed);
+
+        assert_eq!(effects.deactivated, vec![ValidatorId::new(0)]);
+        assert_eq!(
+            state.validators.get(&ValidatorId::new(0)).unwrap().status,
+            ValidatorStatus::InsufficientStake,
+        );
+        let members = &state.shard_committees[&ShardGroupId::new(0)].members;
+        assert_eq!(members.len(), 4);
+        assert!(!members.contains(&ValidatorId::new(0)));
+        assert!(members.contains(&ValidatorId::new(4)));
+    }
+
+    /// `DeactivateValidator` from `Pooled` flips status; no cascade
+    /// (validator wasn't on a shard).
+    #[test]
+    fn deactivate_validator_pooled_flips_in_place() {
+        let mut state = single_pool_state(4);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        let pool_id = StakePoolId::new(0);
+        // Add a pooled validator and try to deactivate them.
+        state.validators.insert(
+            ValidatorId::new(5),
+            validator_record(5, 0, ValidatorStatus::Pooled),
+        );
+        state
+            .pools
+            .get_mut(&pool_id)
+            .unwrap()
+            .validators
+            .insert(ValidatorId::new(5));
+
+        let pre_members = state.shard_committees[&ShardGroupId::new(0)]
+            .members
+            .clone();
+
+        let w = shard_witness(
+            0,
+            1,
+            ShardWitnessPayload::DeactivateValidator {
+                validator_id: ValidatorId::new(5),
+            },
+        );
+        let committed = vec![(
+            ValidatorId::new(0),
+            vrf_proposal_with_witnesses(0, Slot::new(1), vec![w]),
+        )];
+        let effects = apply_slot(&mut state, &net(), Slot::new(1), &committed);
+
+        assert_eq!(effects.deactivated, vec![ValidatorId::new(5)]);
+        assert_eq!(
+            state.validators.get(&ValidatorId::new(5)).unwrap().status,
+            ValidatorStatus::InsufficientStake,
+        );
+        // Shard committee unchanged (the validator wasn't there).
+        assert_eq!(
+            state.shard_committees[&ShardGroupId::new(0)].members,
+            pre_members,
+        );
+    }
+
+    /// `DeactivateValidator` against an already-`InsufficientStake`
+    /// or an already-permanent `Jailed { Equivocation }` validator is
+    /// a silent no-op.
+    #[test]
+    fn deactivate_validator_no_op_for_insufficient_or_equivocation() {
+        let mut state = single_pool_state(4);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        // Insert two unreachable-status validators.
+        state.validators.insert(
+            ValidatorId::new(10),
+            validator_record(10, 0, ValidatorStatus::InsufficientStake),
+        );
+        state.validators.insert(
+            ValidatorId::new(11),
+            validator_record(
+                11,
+                0,
+                ValidatorStatus::Jailed {
+                    since_epoch: Epoch::GENESIS,
+                    reason: JailReason::Equivocation,
+                },
+            ),
+        );
+
+        let ws = vec![
+            shard_witness(
+                0,
+                1,
+                ShardWitnessPayload::DeactivateValidator {
+                    validator_id: ValidatorId::new(10),
+                },
+            ),
+            shard_witness(
+                0,
+                2,
+                ShardWitnessPayload::DeactivateValidator {
+                    validator_id: ValidatorId::new(11),
+                },
+            ),
+        ];
+        let committed = vec![(
+            ValidatorId::new(0),
+            vrf_proposal_with_witnesses(0, Slot::new(1), ws),
+        )];
+        let effects = apply_slot(&mut state, &net(), Slot::new(1), &committed);
+
+        assert!(effects.deactivated.is_empty());
+        assert_eq!(
+            state.validators.get(&ValidatorId::new(10)).unwrap().status,
+            ValidatorStatus::InsufficientStake,
+        );
+        assert_eq!(
+            state.validators.get(&ValidatorId::new(11)).unwrap().status,
+            ValidatorStatus::Jailed {
+                since_epoch: Epoch::GENESIS,
+                reason: JailReason::Equivocation,
+            },
+        );
+    }
+
+    /// `DeactivateValidator` against a fault-cause `Jailed` validator
+    /// IS allowed (operator retires a jailed node rather than waiting
+    /// out the cooldown). No cascade — they were already off-shard.
+    #[test]
+    fn deactivate_validator_allowed_for_fault_cause_jailed() {
+        let mut state = single_pool_state(4);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        // Insert a Jailed{Performance} validator.
+        state.validators.insert(
+            ValidatorId::new(10),
+            validator_record(
+                10,
+                0,
+                ValidatorStatus::Jailed {
+                    since_epoch: Epoch::GENESIS,
+                    reason: JailReason::Performance,
+                },
+            ),
+        );
+
+        let w = shard_witness(
+            0,
+            1,
+            ShardWitnessPayload::DeactivateValidator {
+                validator_id: ValidatorId::new(10),
+            },
+        );
+        let committed = vec![(
+            ValidatorId::new(0),
+            vrf_proposal_with_witnesses(0, Slot::new(1), vec![w]),
+        )];
+        let effects = apply_slot(&mut state, &net(), Slot::new(1), &committed);
+
+        assert_eq!(effects.deactivated, vec![ValidatorId::new(10)]);
+        assert_eq!(
+            state.validators.get(&ValidatorId::new(10)).unwrap().status,
+            ValidatorStatus::InsufficientStake,
         );
     }
 }
