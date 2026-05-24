@@ -35,6 +35,7 @@ use crate::constants::{
     SHUFFLE_INTERVAL_EPOCHS, UNBONDING_WINDOW_EPOCHS,
 };
 use crate::pc::verify_vote_equivocation;
+use crate::recovery::verify_recovery_equivocation;
 use crate::sampling::{draw_from_pool, prng_from, sample_committee};
 
 /// Domain tag for the beacon-randomness mixer. Binds the BLAKE3 input
@@ -990,9 +991,8 @@ fn ingest_witnesses(
 
 /// Re-validate an [`EquivocationEvidence`] under the current
 /// validator-set pubkey lookup. `Vote` re-runs the PC double-sign
-/// check; `Recovery` evidence requires recovery-cert infrastructure
-/// that hasn't been built yet and currently always returns `false`
-/// (silently dropped at the ingestion site).
+/// check; `Recovery` re-runs the recovery-request / finalized-block
+/// double-attestation check.
 fn verify_equivocation_evidence(
     evidence: &EquivocationEvidence,
     network: &NetworkDefinition,
@@ -1000,7 +1000,7 @@ fn verify_equivocation_evidence(
 ) -> bool {
     match evidence {
         EquivocationEvidence::Vote(v) => verify_vote_equivocation(v, network, lookup),
-        EquivocationEvidence::Recovery(_) => false,
+        EquivocationEvidence::Recovery(r) => verify_recovery_equivocation(r, network, lookup),
     }
 }
 
@@ -3650,12 +3650,13 @@ mod tests {
         ));
     }
 
-    /// `Recovery` equivocation always rejects under the current
-    /// verifier (recovery-cert infrastructure not yet wired). Pins
-    /// the "drop silently" behaviour against a regression that
-    /// silently jails on unverified evidence.
+    /// A malformed `RecoveryEquivocation` (zero signature, block
+    /// header at genesis epoch — no semantic contradiction with the
+    /// request's claim) is silently dropped by `apply_epoch`. Pins
+    /// the "drop silently" path against a regression where invalid
+    /// evidence would jail the named validator.
     #[test]
-    fn recovery_equivocation_always_rejects() {
+    fn apply_epoch_drops_invalid_recovery_equivocation() {
         use hyperscale_types::{
             BeaconBlockHash, BeaconBlockHeader, BeaconStateRoot, Hash, RecoveryRequest,
             RecoveryRound, SignerBitfield, zero_bls_signature,
@@ -3664,8 +3665,9 @@ mod tests {
         let mut state = single_pool_state(4);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
 
-        // Construct a minimally-valid-looking RecoveryEquivocation;
-        // the verifier returns false regardless of contents.
+        // Request claims anchor at epoch 7; the block header is genesis
+        // (epoch 0). `block_header.epoch() <= request.last_block_epoch()`
+        // means no semantic contradiction — the verifier rejects.
         let anchor = BeaconBlockHash::from_raw(Hash::from_bytes(b"anchor"));
         let request = RecoveryRequest::new(
             anchor,

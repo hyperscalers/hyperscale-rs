@@ -14,6 +14,7 @@ pub mod constants;
 pub mod genesis;
 pub mod pc;
 pub mod prefix_ops;
+pub mod recovery;
 pub mod sampling;
 pub mod spc;
 pub mod state;
