@@ -118,7 +118,7 @@ pub use signing::{
     block_vote_message, committed_block_header_message, exec_cert_batch_message,
     exec_vote_batch_message, exec_vote_message, pc_context, pc_vote_signing_message,
     ready_signal_message, recovery_request_message, spc_context, state_provisions_message,
-    validator_bind_message, vrf_reveal_message,
+    validator_bind_message, vrf_output_from_proof, vrf_reveal_message, vrf_sign, vrf_verify,
 };
 pub use time::limits::{MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH};
 pub use time::range::{MAX_VALIDITY_RANGE, TimestampRange};

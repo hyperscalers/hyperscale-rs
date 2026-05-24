@@ -48,7 +48,9 @@ pub use beacon_pc::{
     DOMAIN_PC_VOTE3, pc_context, pc_vote_signing_message, spc_context,
 };
 pub use beacon_recovery::{DOMAIN_RECOVERY_REQUEST, recovery_request_message};
-pub use beacon_vrf::{DOMAIN_PC_VRF, vrf_reveal_message};
+pub use beacon_vrf::{
+    DOMAIN_PC_VRF, vrf_output_from_proof, vrf_reveal_message, vrf_sign, vrf_verify,
+};
 pub use execution::{
     DOMAIN_EXEC_CERT_BATCH, DOMAIN_EXEC_VOTE, DOMAIN_EXEC_VOTE_BATCH, exec_cert_batch_message,
     exec_vote_batch_message, exec_vote_message,
