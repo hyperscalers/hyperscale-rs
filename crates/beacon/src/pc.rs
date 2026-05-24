@@ -33,14 +33,14 @@
 use std::collections::BTreeSet;
 
 use hyperscale_types::{
-    Bls12381G1PublicKey, Bls12381G2Signature, DOMAIN_PC_VOTE1, DOMAIN_PC_VOTE2,
-    DOMAIN_PC_VOTE2_LENGTH, DOMAIN_PC_VOTE3, MAX_VOTE_VECTOR_LEN, NetworkDefinition,
-    PC_VALUE_ELEMENT_BYTES, PcCompactVote, PcDivergingProof, PcQc1, PcQc2, PcQc3, PcValueElement,
-    PcVector, PcVote1, PcVote2, PcVote3, PcXpProof, ValidatorId,
-    aggregate_verify_bls_different_messages, pc_vote_signing_message,
+    Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature, DOMAIN_PC_VOTE1,
+    DOMAIN_PC_VOTE2, DOMAIN_PC_VOTE2_LENGTH, DOMAIN_PC_VOTE3, MAX_VOTE_VECTOR_LEN,
+    NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PcCompactLenSigner, PcCompactVote, PcDivergingProof,
+    PcQc1, PcQc2, PcQc3, PcValueElement, PcVector, PcVote1, PcVote2, PcVote3, PcXpProof,
+    SignerBitfield, ValidatorId, aggregate_verify_bls_different_messages, pc_vote_signing_message,
 };
 
-use crate::prefix_ops::qc1_certify;
+use crate::prefix_ops::{mce, mcp, qc1_certify};
 
 /// Resolve a committee signer's public key, or return `None` if they
 /// aren't in the committee. Linear scan — committee sizes are small
@@ -467,6 +467,294 @@ pub fn verify_qc3(
         .collect();
     let messages: Vec<&[u8]> = messages_owned.iter().map(Vec::as_slice).collect();
     aggregate_verify_bls_different_messages(&messages, &qc3.agg_sig(), &pks)
+}
+
+// ─── Signing ───────────────────────────────────────────────────────────────
+
+/// Sign one signer's round-1 vote — produces `|v_in| + 1` prefix
+/// signatures over `v_in[..k]` for `k ∈ 0..=|v_in|`, packaged as a
+/// `PcVote1`.
+#[must_use]
+pub fn sign_vote1(
+    sk: &Bls12381G1PrivateKey,
+    validator: ValidatorId,
+    network: &NetworkDefinition,
+    pc_ctx: &[u8],
+    v_in: PcVector,
+) -> PcVote1 {
+    let prefix_sigs = sign_all_prefixes(sk, network, pc_ctx, &v_in, DOMAIN_PC_VOTE1);
+    PcVote1::new(validator, v_in, prefix_sigs)
+}
+
+/// Sign one signer's round-2 vote.
+///
+/// `x` is derived from `qc1` so the `v2.x == v2.qc1.x` soundness
+/// invariant is unforgeable at the source. The length attestation
+/// pins `|x|`, closing the prefix-sig splice attack on
+/// [`PcXpProof::ShortWitness`] verification.
+#[must_use]
+pub fn sign_vote2(
+    sk: &Bls12381G1PrivateKey,
+    validator: ValidatorId,
+    network: &NetworkDefinition,
+    pc_ctx: &[u8],
+    qc1: PcQc1,
+) -> PcVote2 {
+    let x = qc1.x().clone();
+    let prefix_sigs = sign_all_prefixes(sk, network, pc_ctx, &x, DOMAIN_PC_VOTE2);
+    let length_attestation = sk.sign_v1(&length_attestation_message(network, pc_ctx, x.len()));
+    PcVote2::new(validator, x, prefix_sigs, qc1, length_attestation)
+}
+
+/// Sign one signer's round-3 vote.
+///
+/// `x_p` is derived from `qc2`, and the individual sig over `x_p`
+/// rides separately from the per-prefix fan-out used in rounds 1/2
+/// (round 3 only needs the single `x_p` commitment).
+#[must_use]
+pub fn sign_vote3(
+    sk: &Bls12381G1PrivateKey,
+    validator: ValidatorId,
+    network: &NetworkDefinition,
+    pc_ctx: &[u8],
+    qc2: PcQc2,
+) -> PcVote3 {
+    let x_p = qc2.x_p().clone();
+    let sig_xp = sk.sign_v1(&pc_vote_signing_message(
+        network,
+        DOMAIN_PC_VOTE3,
+        pc_ctx,
+        &x_p,
+    ));
+    PcVote3::new(validator, x_p, sig_xp, qc2)
+}
+
+/// Produce all `|v| + 1` prefix signatures, one per length `k ∈ 0..=|v|`.
+fn sign_all_prefixes(
+    sk: &Bls12381G1PrivateKey,
+    network: &NetworkDefinition,
+    pc_ctx: &[u8],
+    v: &PcVector,
+    domain: &[u8],
+) -> Vec<Bls12381G2Signature> {
+    (0..=v.len())
+        .map(|k| {
+            let prefix = PcVector::new(v.iter().take(k).copied());
+            sk.sign_v1(&pc_vote_signing_message(network, domain, pc_ctx, &prefix))
+        })
+        .collect()
+}
+
+// ─── Build ─────────────────────────────────────────────────────────────────
+
+/// Assemble a [`PcQc1`] from a round-1 quorum.
+///
+/// # Panics
+///
+/// Panics if `votes.len() < f + 1` (where `f = (n - 1) / 3`) — the
+/// caller is the FSM, which guarantees full `n - f` quorums.
+#[must_use]
+pub fn build_qc1(votes: &[&PcVote1], n: usize) -> PcQc1 {
+    let f = byzantine_threshold(n);
+    let raw_inputs: Vec<PcVector> = votes.iter().map(|v| v.v_in().clone()).collect();
+    let x = qc1_certify(&raw_inputs, f).expect("build_qc1 caller guarantees votes.len() >= f+1");
+
+    // Dedup by validator: the FSM supplies distinct senders, but a
+    // downstream caller could pass duplicates. A silent skip yields a
+    // short `x_signers` that the verifier rejects for size; cheaper
+    // than panicking on a malformed inbox.
+    let mut seen: BTreeSet<ValidatorId> = BTreeSet::new();
+    let mut x_signers: Vec<PcCompactVote> = Vec::with_capacity(votes.len());
+    let mut x_sigs: Vec<Bls12381G2Signature> = Vec::with_capacity(votes.len());
+    for v1 in votes {
+        if !seen.insert(v1.validator()) {
+            continue;
+        }
+        let cv = compact_vote_for(v1.validator(), v1.v_in(), &x);
+        let sig_idx = cv.shared_len() as usize + usize::from(cv.divergent().is_some());
+        let sig = v1
+            .prefix_sigs()
+            .get(sig_idx)
+            .copied()
+            .expect("vote-1 carries |v_in|+1 prefix sigs; sig_idx ≤ |v_in|");
+        x_signers.push(cv);
+        x_sigs.push(sig);
+    }
+    let x_agg_sig = Bls12381G2Signature::aggregate(&x_sigs, true).expect("non-empty signers");
+    PcQc1::new(x, x_signers, x_agg_sig)
+}
+
+/// Assemble a [`PcQc2`] from a round-2 quorum.
+///
+/// `committee` is required to resolve `ValidatorId`s to bitfield
+/// positions for [`PcQc2::signers`].
+///
+/// # Panics
+///
+/// Panics if `votes` is empty, or if any signer in `votes` is not
+/// present in `committee`.
+#[must_use]
+pub fn build_qc2(votes: &[&PcVote2], committee: &[(ValidatorId, Bls12381G1PublicKey)]) -> PcQc2 {
+    let n = committee.len();
+    let xs: Vec<PcVector> = votes.iter().map(|v| v.x().clone()).collect();
+    let x_p = mcp(&xs).expect("build_qc2 caller guarantees non-empty votes");
+
+    // Pull each signer's prefix sig at index |x_p| — covers x[..|x_p|]
+    // = x_p (since every x extends x_p).
+    let mut signers_bf = SignerBitfield::new(n);
+    let mut sigs: Vec<Bls12381G2Signature> = Vec::with_capacity(votes.len());
+    for v2 in votes {
+        let pos = committee
+            .iter()
+            .position(|(id, _)| *id == v2.validator())
+            .expect("vote-2 signer must be in committee");
+        signers_bf.set(pos);
+        let sig = v2
+            .prefix_sigs()
+            .get(x_p.len())
+            .copied()
+            .expect("vote-2 carries |x|+1 prefix sigs; index ≤ |x_p| ≤ |x|");
+        sigs.push(sig);
+    }
+    let multi_sig = Bls12381G2Signature::aggregate(&sigs, true).expect("non-empty signers");
+
+    // π proof. Three branches:
+    //   - Full: every signer's `x` equals `x_p` exactly.
+    //   - Diverging: at least two signers' `x` extend past `|x_p|`
+    //     with different elements at position `|x_p|`.
+    //   - ShortWitness: at least one signer's `|x| = |x_p|`, while
+    //     extending signers all agree at position `|x_p|`.
+    let pi = build_xp_proof(votes, &x_p);
+
+    PcQc2::new(x_p, signers_bf, multi_sig, pi)
+}
+
+fn build_xp_proof(votes: &[&PcVote2], x_p: &PcVector) -> PcXpProof {
+    let input_len = votes.first().map_or(0, |v| v.x().len());
+    let all_equal_length = !votes.is_empty()
+        && x_p.len() == input_len
+        && votes.iter().all(|v| v.x().len() == input_len);
+    if all_equal_length {
+        let length_sigs: Vec<Bls12381G2Signature> =
+            votes.iter().map(|v| v.length_attestation()).collect();
+        let length_multi_sig =
+            Bls12381G2Signature::aggregate(&length_sigs, true).expect("non-empty signers");
+        return PcXpProof::Full { length_multi_sig };
+    }
+
+    let pos = x_p.len();
+    let mut extending = votes.iter().filter(|v| v.x().len() > pos);
+    let j_vote = extending
+        .next()
+        .expect("|x_p| < every-extending implies some voter extends past pos");
+    let j_div = j_vote.x().as_slice()[pos];
+    if let Some(k_vote) = extending.find(|v| v.x().as_slice()[pos] != j_div) {
+        let sig_idx = pos + 1;
+        let j_sig = j_vote
+            .prefix_sigs()
+            .get(sig_idx)
+            .copied()
+            .expect("prefix_sigs has |x|+1 entries; index ≤ |x|");
+        let k_sig = k_vote
+            .prefix_sigs()
+            .get(sig_idx)
+            .copied()
+            .expect("prefix_sigs has |x|+1 entries; index ≤ |x|");
+        return PcXpProof::Diverging(Box::new(PcDivergingProof {
+            j: j_vote.validator(),
+            j_divergent: j_div,
+            j_sig,
+            qc1_j: j_vote.qc1().clone(),
+            k: k_vote.validator(),
+            k_divergent: k_vote.x().as_slice()[pos],
+            k_sig,
+            qc1_k: k_vote.qc1().clone(),
+        }));
+    }
+
+    // All extending votes agree at position |x_p|. The mcp is
+    // constrained from below by a short voter whose |x| = |x_p|.
+    let short = votes
+        .iter()
+        .find(|v| v.x().len() == pos)
+        .expect("Full didn't fire and Diverging unavailable ⇒ some |x| = |x_p|");
+    PcXpProof::ShortWitness {
+        witness: Box::new((*short).clone()),
+    }
+}
+
+/// Assemble a [`PcQc3`] from a round-3 quorum.
+///
+/// Endpoints `(x_pp, x_pe)` get dedup-encoded when they coincide (the
+/// common case: every signer's `x_p` equal). The verifier resolves
+/// the dedup via [`PcQc3::x_pe`] / [`PcQc3::qc2_xpe`].
+///
+/// # Panics
+///
+/// Panics if `votes` is empty.
+#[must_use]
+#[allow(clippy::similar_names)] // x_pp / x_pe / qc2_xpp / qc2_xpe match PcQc3's wire-type field names
+pub fn build_qc3(votes: &[&PcVote3]) -> PcQc3 {
+    let x_ps: Vec<PcVector> = votes.iter().map(|v| v.x_p().clone()).collect();
+    let x_pp = mcp(&x_ps).expect("build_qc3 caller guarantees non-empty votes");
+    let x_pe = mce(&x_ps).expect("round-3 x_p values mutually extend");
+
+    let qc2_xpp = votes
+        .iter()
+        .find(|v| v.x_p() == &x_pp)
+        .map(|v| v.qc2().clone())
+        .expect("x_pp is some vote's x_p");
+    let qc2_xpe_full = votes
+        .iter()
+        .find(|v| v.x_p() == &x_pe)
+        .map(|v| v.qc2().clone())
+        .expect("x_pe is some vote's x_p");
+
+    let mut all_signers: Vec<PcCompactLenSigner> = Vec::with_capacity(votes.len());
+    let mut sig_bytes: Vec<Bls12381G2Signature> = Vec::with_capacity(votes.len());
+    for v in votes {
+        let prefix_len = u32::try_from(v.x_p().len()).unwrap_or(u32::MAX);
+        all_signers.push(PcCompactLenSigner::new(v.validator(), prefix_len));
+        sig_bytes.push(v.sig_xp());
+    }
+    let agg_sig = Bls12381G2Signature::aggregate(&sig_bytes, true).expect("non-empty signers");
+
+    let x_pe_dedup = (x_pp != x_pe).then_some(x_pe);
+    let qc2_xpe_dedup = (qc2_xpp != qc2_xpe_full).then_some(qc2_xpe_full);
+
+    PcQc3::new(
+        x_pp,
+        qc2_xpp,
+        x_pe_dedup,
+        qc2_xpe_dedup,
+        all_signers,
+        agg_sig,
+    )
+}
+
+/// Compact-encode `v_in` relative to the canonical `x`. The encoding
+/// captures the deviation point (length of the maximum common prefix)
+/// and the first divergent element when `v_in` is not itself a prefix
+/// of `x`.
+fn compact_vote_for(validator: ValidatorId, v_in: &PcVector, x: &PcVector) -> PcCompactVote {
+    if v_in.as_slice() == x.as_slice() {
+        let shared_len = u32::try_from(v_in.len()).unwrap_or(u32::MAX);
+        return PcCompactVote::new(validator, shared_len, None);
+    }
+    let shared = mcp_two(v_in, x);
+    let divergent = v_in.as_slice().get(shared).copied();
+    let shared_len = u32::try_from(shared).unwrap_or(u32::MAX);
+    PcCompactVote::new(validator, shared_len, divergent)
+}
+
+/// Length of the maximum common prefix of two vectors.
+fn mcp_two(a: &PcVector, b: &PcVector) -> usize {
+    let n = a.len().min(b.len());
+    let mut k = 0;
+    while k < n && a.as_slice()[k] == b.as_slice()[k] {
+        k += 1;
+    }
+    k
 }
 
 #[cfg(test)]
