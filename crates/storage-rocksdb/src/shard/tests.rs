@@ -1063,7 +1063,7 @@ fn test_snapshot_at_below_retention_panics() {
         jmt_history_length: 2,
         ..Default::default()
     };
-    let storage = RocksDbStorage::open_with_config(temp_dir.path(), config).unwrap();
+    let storage = RocksDbStorage::open_with_config(temp_dir.path(), &config).unwrap();
 
     for h in 1..=10u64 {
         let block = make_test_block(BlockHeight::new(h));
@@ -1085,7 +1085,7 @@ fn test_list_substates_at_height_respects_retention() {
         jmt_history_length: 2,
         ..Default::default()
     };
-    let storage = RocksDbStorage::open_with_config(temp_dir.path(), config).unwrap();
+    let storage = RocksDbStorage::open_with_config(temp_dir.path(), &config).unwrap();
 
     let nid = NodeId([9u8; 30]);
     let partition_num = 0u8;

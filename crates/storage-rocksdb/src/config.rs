@@ -1,11 +1,11 @@
 //! Configuration types for `RocksDB` storage.
 //!
-//! Pure tuning knobs and options. Column family definitions live in
-//! [`column_families`](crate::column_families).
+//! Pure tuning knobs shared by both the shard tier
+//! ([`crate::RocksDbStorage`]) and the beacon tier
+//! ([`crate::RocksDbBeaconStorage`]). Column-family sets are fixed per
+//! tier and live in the respective `column_families` submodules.
 
 use rocksdb::DBCompressionType;
-
-use crate::shard::column_families::ALL_COLUMN_FAMILIES;
 
 /// Compression type for `RocksDB`. Each variant maps 1:1 to the
 /// same-named [`rocksdb::DBCompressionType`].
@@ -58,8 +58,6 @@ pub struct RocksDbConfig {
     pub bytes_per_sync: usize,
     /// Number of log files to keep
     pub keep_log_file_num: usize,
-    /// Column families to create
-    pub column_families: Vec<String>,
     /// Number of block heights of JMT history to retain before garbage collection.
     ///
     /// Stale JMT nodes and their associations are kept for this many heights
@@ -82,10 +80,6 @@ impl Default for RocksDbConfig {
             bloom_filter_bits: 10.0,
             bytes_per_sync: 1024 * 1024, // 1MB
             keep_log_file_num: 10,
-            column_families: ALL_COLUMN_FAMILIES
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
             jmt_history_length: 256,
         }
     }

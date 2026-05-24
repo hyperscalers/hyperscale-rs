@@ -911,7 +911,6 @@ fn build_rocksdb_config(config: &StorageConfig) -> RocksDbConfig {
         bytes_per_sync: config.bytes_per_sync_mb * 1024 * 1024,
         keep_log_file_num: config.keep_log_file_num,
         jmt_history_length: config.jmt_history_length,
-        ..RocksDbConfig::default()
     }
 }
 
@@ -1180,7 +1179,7 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
             .data_dir
             .join(format!("shard-{shard}"))
             .join("db");
-        let storage = RocksDbStorage::open_with_config(&db_path, rocksdb_config.clone())
+        let storage = RocksDbStorage::open_with_config(&db_path, &rocksdb_config)
             .with_context(|| format!("Failed to open database at {}", db_path.display()))?;
         info!(shard = shard, path = %db_path.display(), "Storage opened");
         storages.insert(ShardGroupId::new(*shard), Arc::new(storage));

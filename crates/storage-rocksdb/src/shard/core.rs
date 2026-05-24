@@ -34,8 +34,8 @@ use tracing::field::Empty;
 use tracing::{Level, Span, instrument};
 
 use super::column_families::{
-    CfHandles, HOT_WRITE_COLUMN_FAMILIES, JmtNodesCf, STATE_HISTORY_CF, StaleJmtNodesCf,
-    StaleStateHistoryCf, StateCf, StateHistoryCf,
+    ALL_COLUMN_FAMILIES, CfHandles, HOT_WRITE_COLUMN_FAMILIES, JmtNodesCf, STATE_HISTORY_CF,
+    StaleJmtNodesCf, StaleStateHistoryCf, StateCf, StateHistoryCf,
 };
 use super::jmt_snapshot_store::SnapshotTreeStore;
 use super::jmt_stored::{StaleTreePart, StoredNode, StoredNodeKey, VersionedStoredNode};
@@ -90,8 +90,7 @@ impl RocksDbStorage {
     ///
     /// Returns [`StorageError`] if `RocksDB` fails to open the database.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
-        let config = RocksDbConfig::default();
-        Self::open_with_config(path, config)
+        Self::open_with_config(path, &RocksDbConfig::default())
     }
 
     /// Open with custom configuration.
@@ -101,7 +100,7 @@ impl RocksDbStorage {
     /// Returns [`StorageError`] if `RocksDB` fails to open the database.
     pub fn open_with_config<P: AsRef<Path>>(
         path: P,
-        config: RocksDbConfig,
+        config: &RocksDbConfig,
     ) -> Result<Self, StorageError> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
@@ -170,15 +169,15 @@ impl RocksDbStorage {
 
         let cold_write_buffer_size: usize = 16 * 1024 * 1024; // 16MB
 
-        let cf_descriptors: Vec<_> = config
-            .column_families
-            .into_iter()
+        let cf_descriptors: Vec<_> = ALL_COLUMN_FAMILIES
+            .iter()
+            .copied()
             .map(|name| {
                 let mut cf_opts = Options::default();
                 cf_opts.set_block_based_table_factory(&block_opts);
                 cf_opts.set_max_write_buffer_number(config.max_write_buffer_number);
 
-                let is_hot = hot_write_cfs.iter().any(|&cf| cf == name);
+                let is_hot = hot_write_cfs.contains(&name);
                 if is_hot {
                     cf_opts.set_write_buffer_size(config.write_buffer_size);
                     cf_opts.set_compression_per_level(tiered_compression);

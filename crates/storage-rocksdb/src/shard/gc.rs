@@ -250,7 +250,7 @@ mod tests {
             jmt_history_length: 2, // tiny retention for test
             ..Default::default()
         };
-        let storage = RocksDbStorage::open_with_config(temp_dir.path(), config).unwrap();
+        let storage = RocksDbStorage::open_with_config(temp_dir.path(), &config).unwrap();
 
         let mk_key = |seed: u8, sort: u8| {
             (
