@@ -7,6 +7,9 @@ description = "Beacon-chain coordinator (PC/SPC/MSC consensus, validator-set + t
 [dependencies]
 hyperscale-core.workspace = true
 hyperscale-types.workspace = true
+blake3.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
