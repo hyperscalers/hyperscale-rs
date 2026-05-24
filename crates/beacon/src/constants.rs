@@ -23,7 +23,7 @@
 //! unbonding window is ≈ 2.5 hours at 5-min epochs, where real networks
 //! use weeks). Tuning lands when operational data warrants.
 
-use hyperscale_types::Stake;
+use hyperscale_types::{MAX_WITNESSES_PER_PROPOSER, Stake};
 
 // ─── Committee sizing ──────────────────────────────────────────────────────
 
@@ -85,6 +85,36 @@ pub const JAIL_COOLDOWN_EPOCHS: u64 = 16;
 /// byzantine validators permanently before their pool's stake fully
 /// escapes.
 pub const UNBONDING_WINDOW_EPOCHS: u64 = 32;
+
+/// Per-epoch `MissedProposal` count that trips a `JailReason::Performance`
+/// jail on a placed validator.
+///
+/// One `MissedProposal` lands per skipped round whenever a shard's
+/// fallback commits past the originally-scheduled proposer. The counter
+/// scopes to the validator's current `OnShard { shard }`: witnesses from
+/// other shards never count, and any status transition out of `OnShard`
+/// resets the count along with the natural per-epoch reset.
+///
+/// Starting value provisional — pending operational data on per-shard
+/// miss cadence under real workloads. Revisit once `MissedProposal`
+/// emission rates settle.
+pub const MISSED_PROPOSAL_JAIL_THRESHOLD: u32 = 16;
+
+// ─── Apply-slot caps ───────────────────────────────────────────────────────
+
+/// Aggregate cap on distinct witnesses `apply_slot` folds into state in
+/// one slot.
+///
+/// Bounds the per-slot `consumed_witnesses` size and the dedup-set
+/// allocations against a byzantine majority that tries to inflate
+/// witness counts coordinated across proposers. The wire decoder
+/// already bounds each proposal at
+/// [`MAX_WITNESSES_PER_PROPOSER`], so a fully-packed committee already
+/// caps the aggregate at `BEACON_SIGNER_COUNT * MAX_WITNESSES_PER_PROPOSER`;
+/// this constant is the same product made explicit, sitting at the
+/// application layer rather than relying on the wire bound to stay
+/// authoritative through future committee-size changes.
+pub const MAX_WITNESSES_PER_SLOT: usize = BEACON_SIGNER_COUNT * MAX_WITNESSES_PER_PROPOSER;
 
 // ─── Economics ─────────────────────────────────────────────────────────────
 

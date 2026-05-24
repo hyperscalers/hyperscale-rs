@@ -21,6 +21,9 @@ pub const VRF_OUTPUT_BYTES: usize = 32;
 /// Wire length of a `VrfProof` in bytes (compressed BLS12-381 signature).
 pub const VRF_PROOF_BYTES: usize = 96;
 
+/// Wire length of a [`Randomness`] in bytes.
+pub const RANDOMNESS_BYTES: usize = 32;
+
 /// 32-byte VRF output. Hash-of-the-proof; mixed into beacon randomness.
 ///
 /// Distinct from [`Hash`](crate::Hash) at the type level — a VRF output
@@ -73,6 +76,32 @@ impl VrfProof {
     }
 }
 
+/// 32-byte beacon randomness.
+///
+/// BLAKE3 digest of the prior randomness concatenated with each slot's
+/// accepted [`VrfOutput`]s. Seeds committee sampling and pool draws on
+/// the beacon, and feeds per-shard randomness derivations downstream.
+///
+/// Distinct from [`Hash`](crate::Hash) and [`VrfOutput`] at the type
+/// level: this is the running beacon seed, not a free-floating digest
+/// or a per-slot VRF output. The type forces call sites to be explicit
+/// about which 32-byte input the PRNG seed actually is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, BasicSbor)]
+#[sbor(transparent)]
+pub struct Randomness(pub [u8; RANDOMNESS_BYTES]);
+
+impl Randomness {
+    /// All-zero randomness — bootstrap value used as the genesis seed
+    /// before any VRF reveal has been folded in.
+    pub const ZERO: Self = Self([0u8; RANDOMNESS_BYTES]);
+
+    /// Get the underlying bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; RANDOMNESS_BYTES] {
+        &self.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,6 +126,15 @@ mod tests {
     fn zero_sentinels() {
         assert_eq!(VrfOutput::ZERO.as_bytes(), &[0u8; VRF_OUTPUT_BYTES]);
         assert_eq!(VrfProof::ZERO.as_bytes(), &[0u8; VRF_PROOF_BYTES]);
+        assert_eq!(Randomness::ZERO.as_bytes(), &[0u8; RANDOMNESS_BYTES]);
+    }
+
+    #[test]
+    fn randomness_sbor_round_trip() {
+        let original = Randomness([0x42; RANDOMNESS_BYTES]);
+        let bytes = basic_encode(&original).unwrap();
+        let decoded: Randomness = basic_decode(&bytes).unwrap();
+        assert_eq!(original, decoded);
     }
 
     #[test]

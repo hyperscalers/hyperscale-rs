@@ -315,6 +315,16 @@ impl Epoch {
         Self(self.0 + 1)
     }
 
+    /// Saturating subtraction. Beacon cooldown and unbonding checks
+    /// compare `current_epoch.saturating_sub(initiated_at_epoch.inner())`
+    /// against the relevant `*_EPOCHS` constant; saturating semantics
+    /// keep the comparison well-defined if a record from a never-reached
+    /// future epoch ever shows up.
+    #[must_use]
+    pub const fn saturating_sub(self, rhs: u64) -> Self {
+        Self(self.0.saturating_sub(rhs))
+    }
+
     /// Little-endian byte representation of the inner value.
     #[must_use]
     pub const fn to_le_bytes(self) -> [u8; 8] {
@@ -399,6 +409,12 @@ impl Stake {
     /// Zero stake.
     pub const ZERO: Self = Self(0);
 
+    /// Saturating upper bound used as the "no active validator" sentinel
+    /// in `min_stake` computations: an empty active-validator set imposes
+    /// no eject ceiling, so the field reads as `Stake::MAX` and the
+    /// `.min(...)` clamp picks the admit-threshold or floor instead.
+    pub const MAX: Self = Self(u128::MAX);
+
     /// Construct from a raw atto count. The canonical primary
     /// constructor — sites that hold a Radix-derived atto value pass it
     /// straight through, no rounding policy needed.
@@ -424,6 +440,36 @@ impl Stake {
     #[must_use]
     pub const fn attos(self) -> u128 {
         self.0
+    }
+
+    /// Saturating sum. Beacon stake-accumulation sites (deposits,
+    /// reward distribution) should use this rather than reaching for the
+    /// inner attos, so the saturating semantics live with the type.
+    #[must_use]
+    pub const fn saturating_add(self, rhs: Self) -> Self {
+        Self(self.0.saturating_add(rhs.0))
+    }
+
+    /// Saturating difference. Used by withdrawal accounting and
+    /// `effective_stake` to keep the result non-negative when bookkeeping
+    /// drifts (e.g. a bogus over-withdrawal that survives upstream
+    /// validation).
+    #[must_use]
+    pub const fn saturating_sub(self, rhs: Self) -> Self {
+        Self(self.0.saturating_sub(rhs.0))
+    }
+
+    /// Divide this stake equally across `n` shares, returning the
+    /// per-share amount with the integer-division remainder discarded.
+    /// Returns `None` when `n == 0`; callers handle that as "no shares,
+    /// no distribution."
+    #[must_use]
+    pub const fn checked_div_count(self, n: u64) -> Option<Self> {
+        if n == 0 {
+            None
+        } else {
+            Some(Self(self.0 / n as u128))
+        }
     }
 }
 
