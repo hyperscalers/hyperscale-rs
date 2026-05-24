@@ -87,3 +87,18 @@ pub const VIEW_CHANGE_TIMEOUT_MAX: Duration = Duration::from_secs(30);
 /// the chain. Once this elapses since the last leader-activity reset,
 /// the timer fires regardless of pending work.
 pub const MAX_PROGRESS_WAIT: Duration = Duration::from_secs(9);
+
+/// Beacon-chain epoch length, measured against committed beacon-slot
+/// `weighted_timestamp`.
+///
+/// Epoch boundaries are time-based, not slot-count-based: a slot's epoch
+/// is `(slot.weighted_timestamp - genesis_wt) / EPOCH_DURATION`, derivable
+/// independently by every validator without consensus on which slot
+/// counts as the boundary. Recovery slots can wedge in mid-epoch without
+/// rolling the epoch counter, decoupling committee-replacement from
+/// natural epoch rotation.
+///
+/// Also bounds the witness-inclusion window: a [`ShardWitness`](crate::ShardWitness)
+/// is includable in a beacon proposal during epoch `E` if its source
+/// block's `weighted_timestamp ≤ t_end_E`.
+pub const EPOCH_DURATION: Duration = Duration::from_mins(5);

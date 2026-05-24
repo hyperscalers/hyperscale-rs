@@ -10,5 +10,6 @@
 //! [`TopologySnapshot`](hyperscale_types::TopologySnapshot) from
 //! `BeaconState` and exposes it via `current_topology_snapshot()`.
 
+pub mod constants;
 pub mod prefix_ops;
 pub mod sampling;
