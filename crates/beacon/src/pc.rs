@@ -36,8 +36,9 @@ use hyperscale_types::{
     Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature, DOMAIN_PC_VOTE1,
     DOMAIN_PC_VOTE2, DOMAIN_PC_VOTE2_LENGTH, DOMAIN_PC_VOTE3, MAX_VOTE_VECTOR_LEN,
     NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PcCompactLenSigner, PcCompactVote, PcDivergingProof,
-    PcQc1, PcQc2, PcQc3, PcValueElement, PcVector, PcVote1, PcVote2, PcVote3, PcXpProof,
-    SignerBitfield, ValidatorId, aggregate_verify_bls_different_messages, pc_vote_signing_message,
+    PcQc1, PcQc2, PcQc3, PcValueElement, PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation,
+    PcVoteRound, PcXpProof, SignerBitfield, ValidatorId, aggregate_verify_bls_different_messages,
+    pc_context, pc_vote_signing_message, spc_context,
 };
 
 use crate::prefix_ops::{mce, mcp, qc1_certify};
@@ -467,6 +468,46 @@ pub fn verify_qc3(
         .collect();
     let messages: Vec<&[u8]> = messages_owned.iter().map(Vec::as_slice).collect();
     aggregate_verify_bls_different_messages(&messages, &qc3.agg_sig(), &pks)
+}
+
+// ─── Equivocation ──────────────────────────────────────────────────────────
+
+/// Verify that a [`PcVoteEquivocation`] is a genuine double-sign by
+/// the same validator at the same `(slot, view, round)`.
+///
+/// Returns `true` only when:
+/// 1. `value_a != value_b` (otherwise no contradiction).
+/// 2. Both signatures verify under the validator's committee pubkey
+///    against the canonical signing message for `(network, round-tag,
+///    pc_context(slot, view), value)`.
+///
+/// The validator must be in `committee`; non-members are rejected
+/// before any pairing. Round-3 sigs are individual sigs over `x_p`
+/// (the prototype's `sig_xp`), so the verifier treats all three
+/// rounds uniformly — only the domain tag varies.
+#[must_use]
+pub fn verify_vote_equivocation(
+    ev: &PcVoteEquivocation,
+    network: &NetworkDefinition,
+    committee: &[(ValidatorId, Bls12381G1PublicKey)],
+) -> bool {
+    if ev.value_a == ev.value_b {
+        return false;
+    }
+    let Some(pk) = pubkey_in_committee(committee, ev.validator) else {
+        return false;
+    };
+    let domain = match ev.round {
+        PcVoteRound::Vote1 => DOMAIN_PC_VOTE1,
+        PcVoteRound::Vote2 => DOMAIN_PC_VOTE2,
+        PcVoteRound::Vote3 => DOMAIN_PC_VOTE3,
+    };
+    let spc_ctx = spc_context(ev.slot);
+    let ctx = pc_context(&spc_ctx, ev.view);
+    let msg_a = pc_vote_signing_message(network, domain, &ctx, &ev.value_a);
+    let msg_b = pc_vote_signing_message(network, domain, &ctx, &ev.value_b);
+    aggregate_verify_bls_different_messages(&[msg_a.as_slice()], &ev.sig_a, &[pk])
+        && aggregate_verify_bls_different_messages(&[msg_b.as_slice()], &ev.sig_b, &[pk])
 }
 
 // ─── Signing ───────────────────────────────────────────────────────────────
@@ -932,6 +973,45 @@ mod tests {
         // Diverges at position 0 but the "divergent" element IS x[0].
         let cv = PcCompactVote::new(ValidatorId::new(0), 0, Some(elem(1)));
         assert!(reconstruct_compact_vote(&cv, &x).is_none());
+    }
+
+    /// `verify_vote_equivocation` rejects evidence where both sides
+    /// carry the same value — no actual contradiction.
+    #[test]
+    fn verify_vote_equivocation_rejects_same_value() {
+        use hyperscale_types::{PcVoteEquivocation, PcVoteRound, Slot, SpcView};
+        let c = committee(4);
+        let v = PcVector::new(std::iter::once(elem(1)));
+        let ev = PcVoteEquivocation {
+            validator: ValidatorId::new(0),
+            slot: Slot::new(1),
+            view: SpcView::new(0),
+            round: PcVoteRound::Vote1,
+            value_a: v.clone(),
+            sig_a: generate_bls_keypair().sign_v1(b"unused"),
+            value_b: v,
+            sig_b: generate_bls_keypair().sign_v1(b"unused"),
+        };
+        assert!(!verify_vote_equivocation(&ev, &net(), &c));
+    }
+
+    /// `verify_vote_equivocation` rejects evidence naming a non-
+    /// committee validator before any pairing.
+    #[test]
+    fn verify_vote_equivocation_rejects_non_committee_validator() {
+        use hyperscale_types::{PcVoteEquivocation, PcVoteRound, Slot, SpcView};
+        let c = committee(4);
+        let ev = PcVoteEquivocation {
+            validator: ValidatorId::new(999),
+            slot: Slot::new(1),
+            view: SpcView::new(0),
+            round: PcVoteRound::Vote1,
+            value_a: PcVector::new(std::iter::once(elem(1))),
+            sig_a: generate_bls_keypair().sign_v1(b"unused"),
+            value_b: PcVector::new(std::iter::once(elem(2))),
+            sig_b: generate_bls_keypair().sign_v1(b"unused"),
+        };
+        assert!(!verify_vote_equivocation(&ev, &net(), &c));
     }
 
     /// Length attestation message must differ across `len` values to

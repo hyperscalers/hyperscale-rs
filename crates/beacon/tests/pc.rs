@@ -9,11 +9,11 @@ mod common;
 use common::{Committee, pc_ctx};
 use hyperscale_beacon::pc::{
     build_qc1, build_qc2, build_qc3, sign_vote1, sign_vote2, sign_vote3, verify_qc1, verify_qc2,
-    verify_qc3,
+    verify_qc3, verify_vote_equivocation,
 };
 use hyperscale_types::{
     NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PcQc1, PcQc2, PcValueElement, PcVector, PcVote1,
-    PcVote2, PcVote3,
+    PcVote2, PcVote3, PcVoteEquivocation, PcVoteRound, Slot, SpcView,
 };
 
 const fn elem(byte: u8) -> PcValueElement {
@@ -165,4 +165,68 @@ fn qc3_round_trip_n7_all_agree() {
     let v3_refs: Vec<&PcVote3> = v3s.iter().collect();
     let qc3 = build_qc3(&v3_refs);
     assert!(verify_qc3(&qc3, &network, &ctx, &cm.members));
+}
+
+/// Round-1 equivocation round-trip: have validator 0 sign two
+/// distinct `v_in` vectors at the same `(slot, view)`, package the
+/// `(value, sig)` pairs into a `PcVoteEquivocation`, and assert the
+/// verifier accepts it.
+#[test]
+fn equivocation_round_trip_round1() {
+    let cm = Committee::new(4, 0xE0);
+    let network = NetworkDefinition::simulator();
+    let slot = Slot::new(1);
+    let view = SpcView::new(0);
+    let ctx = pc_ctx(slot.inner(), view.inner());
+
+    let value_a = PcVector::new([elem(1), elem(2)]);
+    let value_b = PcVector::new([elem(1), elem(3)]);
+
+    let vote_a = sign_vote1(cm.sk(0), cm.id(0), &network, &ctx, value_a.clone());
+    let vote_b = sign_vote1(cm.sk(0), cm.id(0), &network, &ctx, value_b.clone());
+
+    // Slim wire-form pulls the primary sig from `prefix_sigs[|v_in|]`
+    // — the BLS sig over the full vector.
+    let ev = PcVoteEquivocation {
+        validator: cm.id(0),
+        slot,
+        view,
+        round: PcVoteRound::Vote1,
+        value_a,
+        sig_a: vote_a.prefix_sigs()[vote_a.v_in().len()],
+        value_b,
+        sig_b: vote_b.prefix_sigs()[vote_b.v_in().len()],
+    };
+    assert!(verify_vote_equivocation(&ev, &network, &cm.members));
+}
+
+/// A tampered `sig_b` (signed by a different validator) must not
+/// verify even though `(value_a, sig_a)` is legitimate.
+#[test]
+fn equivocation_rejected_when_one_side_signed_by_other_validator() {
+    let cm = Committee::new(4, 0xE1);
+    let network = NetworkDefinition::simulator();
+    let slot = Slot::new(1);
+    let view = SpcView::new(0);
+    let ctx = pc_ctx(slot.inner(), view.inner());
+
+    let value_a = PcVector::new([elem(1), elem(2)]);
+    let value_b = PcVector::new([elem(1), elem(3)]);
+
+    let vote_a = sign_vote1(cm.sk(0), cm.id(0), &network, &ctx, value_a.clone());
+    // Validator 1 signs the other vote — there's no contradiction
+    // from validator 0's perspective.
+    let vote_b_by_other = sign_vote1(cm.sk(1), cm.id(0), &network, &ctx, value_b.clone());
+
+    let ev = PcVoteEquivocation {
+        validator: cm.id(0),
+        slot,
+        view,
+        round: PcVoteRound::Vote1,
+        value_a,
+        sig_a: vote_a.prefix_sigs()[vote_a.v_in().len()],
+        value_b,
+        sig_b: vote_b_by_other.prefix_sigs()[vote_b_by_other.v_in().len()],
+    };
+    assert!(!verify_vote_equivocation(&ev, &network, &cm.members));
 }
