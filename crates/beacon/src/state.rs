@@ -3407,24 +3407,24 @@ mod tests {
         ));
     }
 
-    /// A malformed `RecoveryEquivocation` (zero signature, block
-    /// header at genesis epoch — no semantic contradiction with the
-    /// request's claim) is silently dropped by `apply_epoch`. Pins
-    /// the "drop silently" path against a regression where invalid
-    /// evidence would jail the named validator.
+    /// A malformed `RecoveryEquivocation` (block cert at an epoch not
+    /// strictly past the request's anchor) is silently dropped by
+    /// `apply_epoch`. Pins the "drop silently" path against a
+    /// regression where invalid evidence would jail the named
+    /// validator.
     #[test]
     fn apply_epoch_drops_invalid_recovery_equivocation() {
         use hyperscale_types::{
-            BeaconBlockHash, BeaconBlockHeader, BeaconStateRoot, Hash, RecoveryRequest,
-            RecoveryRound, SignerBitfield, zero_bls_signature,
+            BeaconBlockHash, GenesisConfigHash, Hash, RecoveryRequest, RecoveryRound, SpcCert,
+            zero_bls_signature,
         };
 
         let mut state = single_pool_state(4);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
 
-        // Request claims anchor at epoch 7; the block header is genesis
-        // (epoch 0). `block_header.epoch() <= request.last_block_epoch()`
-        // means no semantic contradiction — the verifier rejects.
+        // Request claims anchor at epoch 7; the block sits at genesis
+        // (epoch 0). `block_epoch <= request.last_block_epoch()` means
+        // no semantic contradiction — the verifier rejects.
         let anchor = BeaconBlockHash::from_raw(Hash::from_bytes(b"anchor"));
         let request = RecoveryRequest::new(
             anchor,
@@ -3433,16 +3433,13 @@ mod tests {
             ValidatorId::new(1),
             zero_bls_signature(),
         );
-        let block_header =
-            BeaconBlockHeader::genesis(BeaconStateRoot::from_raw(Hash::from_bytes(b"state")));
-        let mut signers = SignerBitfield::new(4);
-        signers.set(0);
         let ev = RecoveryEquivocation {
             validator: ValidatorId::new(1),
             request,
-            block_header,
-            block_signers: signers,
-            block_aggregate_sig: zero_bls_signature(),
+            block_epoch: Epoch::GENESIS,
+            block_cert: SpcCert::Genesis {
+                config_hash: GenesisConfigHash::ZERO,
+            },
         };
         let w = Witness::Beacon(BeaconWitness::Equivocation {
             evidence: Box::new(Evidence::Recovery(Box::new(ev))),

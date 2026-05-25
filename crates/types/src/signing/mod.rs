@@ -23,7 +23,6 @@
 //! | `HYPERSCALE_PC_VOTE2_LENGTH_v1` | Length attestation rider on PC round-2 |
 //! | `HYPERSCALE_PC_EMPTY_VIEW_v1` | SPC empty-view skip statement |
 //! | `HYPERSCALE_PC_VRF_v1` | Beacon VRF reveal (per-epoch randomness contribution) |
-//! | `HYPERSCALE_BEACON_BLOCK_HEADER_v1` | Epoch-committee sig over a beacon block header |
 //! | `HYPERSCALE_RECOVERY_REQUEST_v1` | Recovery request + aggregated recovery cert sig |
 //!
 //! # Usage
@@ -32,7 +31,6 @@
 //! constructs the bytes to sign by prepending its domain tag to the
 //! serialized content.
 
-mod beacon_block;
 mod beacon_pc;
 mod beacon_recovery;
 mod beacon_vrf;
@@ -42,7 +40,6 @@ mod ready_signal;
 mod shard;
 mod validator_bind;
 
-pub use beacon_block::{DOMAIN_BEACON_BLOCK_HEADER, beacon_block_header_message};
 pub use beacon_pc::{
     DOMAIN_PC_EMPTY_VIEW, DOMAIN_PC_VOTE1, DOMAIN_PC_VOTE2, DOMAIN_PC_VOTE2_LENGTH,
     DOMAIN_PC_VOTE3, pc_context, pc_vote_signing_message, spc_context,

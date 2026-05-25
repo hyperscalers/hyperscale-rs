@@ -1,8 +1,7 @@
 //! Beacon-chain consensus types.
 //!
-//! - [`block`]: [`BeaconBlock`] (header + committee aggregate + optional
-//!   recovery cert).
-//! - [`header`]: [`BeaconBlockHeader`] (committee-signed chain link).
+//! - [`block`]: [`BeaconBlock`] (epoch + cert + committed proposals +
+//!   optional recovery cert).
 //! - [`limits`]: protocol-level caps on per-proposal payload sizes.
 //! - [`pc`]: Prefix Consensus vote / QC wire types.
 //! - [`proposal`]: [`BeaconProposal`] (one committee member's slot
@@ -24,7 +23,6 @@
 //!   beacon applies per slot).
 
 pub mod block;
-pub mod header;
 pub mod limits;
 pub mod pc;
 pub mod proposal;
@@ -36,7 +34,6 @@ pub mod state_root;
 pub mod witness;
 
 pub use block::BeaconBlock;
-pub use header::BeaconBlockHeader;
 pub use limits::{
     MAX_BEACON_WITNESS_EVENTS_PER_TX, MAX_EXCLUDED_VALIDATORS, MAX_PREFIX_SIGS,
     MAX_READY_SIGNALS_PER_BLOCK, MAX_READY_WINDOW_BLOCKS, MAX_VOTE_VECTOR_LEN,
@@ -47,7 +44,7 @@ pub use pc::{
     PcValueElement, PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation, PcVoteRound,
     PcXpProof,
 };
-pub use proposal::{BeaconProposal, compute_proposals_root};
+pub use proposal::BeaconProposal;
 pub use ready_signal::ReadySignal;
 pub use recovery::{
     RecoveryCertificate, RecoveryEquivocation, RecoveryRequest, recovery_cert_hash,

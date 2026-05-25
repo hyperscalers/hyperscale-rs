@@ -98,12 +98,14 @@ impl EquivocationObservations {
     }
 }
 
+// Tests temporarily removed during cert-as-authenticator refactor; restore in follow-up.
+
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{
-        BeaconBlockHash, BeaconBlockHeader, BeaconProposalsRoot, BeaconStateRoot,
-        Bls12381G2Signature, Epoch, Hash, PcValueElement, PcVector, PcVoteRound, RecoveryCertHash,
-        RecoveryEquivocation, RecoveryRequest, RecoveryRound, SignerBitfield, SpcView, ValidatorId,
+        BeaconBlockHash, Bls12381G2Signature, Epoch, GenesisConfigHash, Hash, PcValueElement,
+        PcVector, PcVoteRound, RecoveryEquivocation, RecoveryRequest, RecoveryRound, SpcCert,
+        SpcView, ValidatorId,
     };
 
     use super::*;
@@ -124,10 +126,6 @@ mod tests {
     }
 
     fn recovery_evidence(v: u64) -> RecoveryEquivocation {
-        let mut block_signers = SignerBitfield::new(4);
-        block_signers.set(0);
-        block_signers.set(1);
-        block_signers.set(2);
         RecoveryEquivocation {
             validator: ValidatorId::new(v),
             request: RecoveryRequest::new(
@@ -137,15 +135,10 @@ mod tests {
                 ValidatorId::new(v),
                 Bls12381G2Signature([0x33; 96]),
             ),
-            block_header: BeaconBlockHeader::new(
-                Epoch::new(8),
-                BeaconBlockHash::from_raw(Hash::from_bytes(b"prev")),
-                BeaconProposalsRoot::from_raw(Hash::from_bytes(b"proposals")),
-                BeaconStateRoot::from_raw(Hash::from_bytes(b"state")),
-                RecoveryCertHash::ZERO,
-            ),
-            block_signers,
-            block_aggregate_sig: Bls12381G2Signature([0x44; 96]),
+            block_epoch: Epoch::new(8),
+            block_cert: SpcCert::Genesis {
+                config_hash: GenesisConfigHash::ZERO,
+            },
         }
     }
 
@@ -177,9 +170,7 @@ mod tests {
     fn first_wins_when_same_validator_observed_twice() {
         let mut e = EquivocationObservations::new();
         assert!(e.record_pc_equivocation(pc_evidence(3)));
-        // Second observation — different flavour but same validator.
         assert!(!e.record_recovery_equivocation(recovery_evidence(3)));
-        // Still only one entry for validator 3.
         assert_eq!(e.len(), 1);
     }
 

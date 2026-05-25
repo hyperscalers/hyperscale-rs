@@ -486,13 +486,27 @@ mod tests {
 
     fn sample_recovery_equivocation() -> RecoveryEquivocation {
         use crate::{
-            BeaconBlockHash, BeaconBlockHeader, BeaconProposalsRoot, BeaconStateRoot,
-            Bls12381G2Signature, Epoch, Hash, RecoveryCertHash, RecoveryRequest, RecoveryRound,
-            SignerBitfield,
+            BeaconBlockHash, Bls12381G2Signature, Epoch, Hash, PcQc2, PcQc3, PcSignerLengths,
+            PcVector, PcXpProof, RecoveryRequest, RecoveryRound, SignerBitfield, SpcCert, SpcView,
         };
-        let mut block_signers = SignerBitfield::new(4);
-        block_signers.set(0);
-        block_signers.set(1);
+        let mut signers = SignerBitfield::new(4);
+        signers.set(0);
+        signers.set(1);
+        let qc2 = PcQc2::new(
+            PcVector::empty(),
+            signers.clone(),
+            Bls12381G2Signature([0x11; 96]),
+            PcXpProof::Full,
+        );
+        let proof = PcQc3::new(
+            PcVector::empty(),
+            qc2,
+            None,
+            None,
+            signers,
+            PcSignerLengths::Uniform(0),
+            Bls12381G2Signature([0x33; 96]),
+        );
         RecoveryEquivocation {
             validator: ValidatorId::new(6),
             request: RecoveryRequest::new(
@@ -502,15 +516,12 @@ mod tests {
                 ValidatorId::new(6),
                 Bls12381G2Signature([0x11; 96]),
             ),
-            block_header: BeaconBlockHeader::new(
-                Epoch::new(8),
-                BeaconBlockHash::from_raw(Hash::from_bytes(b"prev")),
-                BeaconProposalsRoot::from_raw(Hash::from_bytes(b"proposals")),
-                BeaconStateRoot::from_raw(Hash::from_bytes(b"state")),
-                RecoveryCertHash::ZERO,
-            ),
-            block_signers,
-            block_aggregate_sig: Bls12381G2Signature([0x44; 96]),
+            block_epoch: Epoch::new(8),
+            block_cert: SpcCert::Direct {
+                prev_view: SpcView::new(1),
+                value: PcVector::empty(),
+                proof,
+            },
         }
     }
 

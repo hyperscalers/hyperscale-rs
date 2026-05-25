@@ -11,12 +11,11 @@ use hyperscale_beacon::constants::{BEACON_SIGNER_COUNT, MIN_STAKE_FLOOR};
 use hyperscale_beacon::recovery::select_winning_block;
 use hyperscale_beacon::state::apply_epoch;
 use hyperscale_types::{
-    BeaconBlock, BeaconBlockHash, BeaconBlockHeader, BeaconProposalsRoot, BeaconState,
-    BeaconStateRoot, Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature, Epoch, Hash,
-    NetworkDefinition, Randomness, RecoveryCertHash, RecoveryCertificate, RecoveryRound,
-    ShardCommittee, ShardGroupId, SignerBitfield, Stake, StakePool, StakePoolId, TransitionCause,
-    ValidatorId, ValidatorRecord, ValidatorStatus, bls_keypair_from_seed, recovery_cert_hash,
-    recovery_request_message,
+    BeaconBlock, BeaconBlockHash, BeaconState, Bls12381G1PrivateKey, Bls12381G1PublicKey,
+    Bls12381G2Signature, Epoch, GenesisConfigHash, Hash, NetworkDefinition, Randomness,
+    RecoveryCertificate, RecoveryRound, ShardCommittee, ShardGroupId, SignerBitfield, SpcCert,
+    Stake, StakePool, StakePoolId, TransitionCause, ValidatorId, ValidatorRecord, ValidatorStatus,
+    bls_keypair_from_seed, recovery_request_message,
 };
 
 const fn net() -> NetworkDefinition {
@@ -192,16 +191,11 @@ fn catchup_brings_chain_forward_after_committee_stall() {
 /// same anchor (round 0 fails, round 1 fails, round 2 succeeds). Only
 /// the final cert lands on-chain, carrying the cumulative exclusions
 /// of every failed round.
-///
-/// The verifier accepts the round-2 cert; the committee is resampled
-/// from the eligible set minus the cumulative dead committees.
 #[test]
 fn cumulative_exclusions_via_high_round_cert() {
     let mut state = ready_state(10);
     let anchor = BeaconBlockHash::from_raw(Hash::from_bytes(b"path-anchor"));
 
-    // Cumulative exclusions: dead committees from rounds 0 and 1
-    // collected into round-2's `excluded_validators`.
     let excluded = vec![
         ValidatorId::new(0),
         ValidatorId::new(1),
@@ -232,8 +226,6 @@ fn cumulative_exclusions_via_high_round_cert() {
             "excluded validator {ex:?} landed in the resampled committee"
         );
     }
-    // 6 remaining eligibles (4..10) cover the `BEACON_SIGNER_COUNT`
-    // target with two to spare.
     assert_eq!(state.committee.len(), BEACON_SIGNER_COUNT);
 }
 
@@ -245,7 +237,6 @@ fn stale_round_replay_at_same_anchor_is_dropped() {
     let mut state = ready_state(7);
     let anchor = BeaconBlockHash::from_raw(Hash::from_bytes(b"replay-anchor"));
 
-    // Round 3 lands first.
     let high = build_cert(
         7,
         7,
@@ -263,7 +254,6 @@ fn stale_round_replay_at_same_anchor_is_dropped() {
         Some(RecoveryRound::new(3)),
     );
 
-    // Round 1 attempt at the same anchor — must not replace.
     let stale_round = build_cert(
         7,
         7,
@@ -288,7 +278,8 @@ fn stale_round_replay_at_same_anchor_is_dropped() {
 /// recovery committee's output) wins over a no-cert block (a slow
 /// original committee finally proposing). Pinned by the rule's
 /// determinism — both honest validators converge regardless of network
-/// arrival order.
+/// arrival order. Block-cert verification isn't this rule's
+/// responsibility, so a `Genesis` placeholder cert suffices.
 #[test]
 fn cert_bearing_block_wins_against_competing_no_cert_block() {
     let cert = build_cert(
@@ -300,35 +291,26 @@ fn cert_bearing_block_wins_against_competing_no_cert_block() {
         Vec::new(),
     );
 
-    let cert_header = BeaconBlockHeader::new(
-        Epoch::new(1),
-        BeaconBlockHash::from_raw(Hash::from_bytes(b"prev")),
-        BeaconProposalsRoot::from_raw(Hash::from_bytes(b"prop-cert")),
-        BeaconStateRoot::from_raw(Hash::from_bytes(b"state-cert")),
-        recovery_cert_hash(Some(&cert)),
-    );
+    let placeholder_cert = SpcCert::Genesis {
+        config_hash: GenesisConfigHash::ZERO,
+    };
+
     let cert_block = BeaconBlock::new(
-        cert_header,
-        SignerBitfield::new(7),
-        Bls12381G2Signature([0u8; 96]),
-        Some(cert),
-    );
-
-    let original_header = BeaconBlockHeader::new(
         Epoch::new(1),
-        BeaconBlockHash::from_raw(Hash::from_bytes(b"prev")),
-        BeaconProposalsRoot::from_raw(Hash::from_bytes(b"prop-orig")),
-        BeaconStateRoot::from_raw(Hash::from_bytes(b"state-orig")),
-        RecoveryCertHash::ZERO,
-    );
-    let original_block = BeaconBlock::new(
-        original_header,
-        SignerBitfield::new(7),
-        Bls12381G2Signature([0u8; 96]),
-        None,
+        BeaconBlockHash::from_raw(Hash::from_bytes(b"prev-cert")),
+        placeholder_cert.clone(),
+        Some(cert),
+        Vec::new(),
     );
 
-    // Winner is the cert-bearing block regardless of argument order.
+    let original_block = BeaconBlock::new(
+        Epoch::new(1),
+        BeaconBlockHash::from_raw(Hash::from_bytes(b"prev-orig")),
+        placeholder_cert,
+        None,
+        Vec::new(),
+    );
+
     assert_eq!(
         select_winning_block(&cert_block, &original_block).block_hash(),
         cert_block.block_hash(),

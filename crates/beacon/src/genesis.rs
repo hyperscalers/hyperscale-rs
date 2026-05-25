@@ -15,9 +15,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_types::{
-    BeaconState, Bls12381G1PublicKey, Epoch, Randomness, ShardCommittee, ShardGroupId, Stake,
-    StakePool, StakePoolId, ValidatorId, ValidatorRecord, ValidatorStatus,
+    BeaconState, Bls12381G1PublicKey, Epoch, GenesisConfigHash, Hash, Randomness, ShardCommittee,
+    ShardGroupId, Stake, StakePool, StakePoolId, ValidatorId, ValidatorRecord, ValidatorStatus,
 };
+use sbor::prelude::*;
 
 use crate::constants::{BEACON_SIGNER_COUNT, MIN_STAKE_FLOOR, SHARD_CAPACITY};
 
@@ -29,7 +30,7 @@ use crate::constants::{BEACON_SIGNER_COUNT, MIN_STAKE_FLOOR, SHARD_CAPACITY};
 /// one pool); the pool's validator set is derived by filtering
 /// `initial_validators` on `pool == this_pool_id` inside
 /// [`build_genesis_beacon_state`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct GenesisValidator {
     /// Validator id.
     pub id: ValidatorId,
@@ -40,7 +41,7 @@ pub struct GenesisValidator {
 }
 
 /// One stake pool as supplied at genesis.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct GenesisPool {
     /// Pool id.
     pub id: StakePoolId,
@@ -53,8 +54,12 @@ pub struct GenesisPool {
 /// Loaded from TOML at the validator binary's startup; consumed once by
 /// [`build_genesis_beacon_state`]. Every field is consensus-critical —
 /// two validators with different `BeaconGenesisConfig`s produce
-/// divergent `BeaconState`s at epoch 0 and never converge.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// divergent `BeaconState`s at epoch 0 and never converge. The
+/// SBOR-canonical hash of this struct is the [`GenesisConfigHash`]
+/// embedded in [`SpcCert::Genesis`](hyperscale_types::SpcCert), binding
+/// the chain identity to operator-supplied TOML; see
+/// [`genesis_config_hash`].
+#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct BeaconGenesisConfig {
     /// Initial validator set.
     pub initial_validators: Vec<GenesisValidator>,
@@ -73,6 +78,28 @@ pub struct BeaconGenesisConfig {
     /// `state.randomness`; subsequent slots roll it through accepted
     /// VRF outputs.
     pub initial_randomness: Randomness,
+}
+
+// ─── identity ──────────────────────────────────────────────────────────────
+
+/// Hash a [`BeaconGenesisConfig`] into the [`GenesisConfigHash`] embedded
+/// in [`SpcCert::Genesis`](hyperscale_types::SpcCert).
+///
+/// Pure function over the SBOR-canonical encoding: two operators with
+/// byte-identical TOML produce the same hash; any divergent field
+/// (validator pubkey, pool stake, initial randomness, ...) yields a
+/// different hash and therefore a different
+/// [`BeaconBlockHash`](hyperscale_types::BeaconBlockHash) at genesis,
+/// keeping chains with mismatched bootstraps from accidentally merging.
+///
+/// # Panics
+///
+/// Never in practice: every field is `BasicSbor` and the struct is
+/// closed, so encoding is total.
+#[must_use]
+pub fn genesis_config_hash(config: &BeaconGenesisConfig) -> GenesisConfigHash {
+    let bytes = basic_encode(config).expect("BeaconGenesisConfig SBOR encode is infallible");
+    GenesisConfigHash::from_raw(Hash::from_bytes(&bytes))
 }
 
 // ─── builder ───────────────────────────────────────────────────────────────

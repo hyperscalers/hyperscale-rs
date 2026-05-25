@@ -9,10 +9,10 @@ use std::sync::Arc;
 
 use hyperscale_types::{
     BeaconBlock, BeaconProposal, Block, BlockHash, BlockHeader, BlockHeight, BlockManifest,
-    BlockVote, Bls12381G2Signature, CertifiedBlock, CommittedBlockHeader, Epoch,
-    ExecutionCertificate, ExecutionVote, FinalizedWave, Hash, Provisions, QuorumCertificate,
-    ReadySignal, RecoveryRequest, Round, RoutableTransaction, ShardGroupId, ShardWitness,
-    StoredReceipt, TxOutcome, ValidatorId, VotePower, WaveId, WeightedTimestamp,
+    BlockVote, CertifiedBlock, CommittedBlockHeader, Epoch, ExecutionCertificate, ExecutionVote,
+    FinalizedWave, Hash, Provisions, QuorumCertificate, ReadySignal, RecoveryRequest, Round,
+    RoutableTransaction, ShardGroupId, ShardWitness, StoredReceipt, TxOutcome, ValidatorId,
+    VotePower, WaveId, WeightedTimestamp,
 };
 
 use crate::BeaconVerificationKind;
@@ -554,20 +554,6 @@ pub enum ProtocolEvent {
         epoch: Epoch,
         /// Received proposal.
         proposal: Arc<BeaconProposal>,
-    },
-
-    /// One committee member's BLS signature over a `BeaconBlockHeader`
-    /// arrived. `IoLoop` has already authenticated `from`; the
-    /// coordinator verifies the signature against the locally-derived
-    /// header bytes and pools it for aggregation into the block's
-    /// committee aggregate.
-    BeaconBlockSigReceived {
-        /// Authenticated signer.
-        from: ValidatorId,
-        /// Epoch the signed header finalizes.
-        epoch: Epoch,
-        /// Signature over the canonical header bytes.
-        sig: Bls12381G2Signature,
     },
 
     /// A `RecoveryRequest` arrived via gossip.

@@ -183,8 +183,8 @@ impl SpcSim {
                     // Honest path: no timer firing, no empty-low or
                     // equivocation to absorb.
                 }
-                SpcEffect::OutputHigh(v) => {
-                    self.outputs[sender_idx] = Some(v);
+                SpcEffect::OutputHigh { value, cert: _ } => {
+                    self.outputs[sender_idx] = Some(value);
                 }
             }
         }

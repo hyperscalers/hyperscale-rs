@@ -115,28 +115,23 @@ impl BeaconBlockSyncManager {
     }
 }
 
+// Tests temporarily removed during cert-as-authenticator refactor; restore in follow-up.
+
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::{
-        BeaconBlock, BeaconBlockHash, BeaconBlockHeader, BeaconProposalsRoot, BeaconStateRoot,
-        Bls12381G2Signature, Epoch, Hash, RecoveryCertHash, SignerBitfield,
-    };
+    use hyperscale_types::{BeaconBlock, BeaconBlockHash, Epoch, GenesisConfigHash, Hash, SpcCert};
 
     use super::*;
 
     fn block_at(epoch: u64) -> Arc<BeaconBlock> {
-        let header = BeaconBlockHeader::new(
+        Arc::new(BeaconBlock::new(
             Epoch::new(epoch),
             BeaconBlockHash::from_raw(Hash::from_bytes(format!("prev-{epoch}").as_bytes())),
-            BeaconProposalsRoot::from_raw(Hash::from_bytes(b"proposals")),
-            BeaconStateRoot::from_raw(Hash::from_bytes(b"state")),
-            RecoveryCertHash::ZERO,
-        );
-        Arc::new(BeaconBlock::new(
-            header,
-            SignerBitfield::empty(),
-            Bls12381G2Signature([0u8; 96]),
+            SpcCert::Genesis {
+                config_hash: GenesisConfigHash::ZERO,
+            },
             None,
+            Vec::new(),
         ))
     }
 
@@ -176,7 +171,7 @@ mod tests {
         while let Some(e) = m.next_fetch_to_dispatch(committed) {
             emitted.push(e);
         }
-        assert_eq!(emitted, vec![Epoch::new(1), Epoch::new(2), Epoch::new(3)],);
+        assert_eq!(emitted, vec![Epoch::new(1), Epoch::new(2), Epoch::new(3)]);
     }
 
     #[test]
@@ -229,7 +224,6 @@ mod tests {
     fn take_next_applicable_returns_none_when_next_not_buffered() {
         let mut m = BeaconBlockSyncManager::new();
         m.start_sync_to(Epoch::new(3));
-        // Buffered out of order — epoch 3 present but next needed is 1.
         m.on_synced_block_received(block_at(3));
         assert!(m.take_next_applicable(Epoch::new(0)).is_none());
         assert_eq!(m.buffered_count(), 1);
@@ -254,26 +248,23 @@ mod tests {
         let mut m = BeaconBlockSyncManager::new();
         m.start_sync_to(Epoch::new(3));
 
-        // Coordinator dispatches all three fetches up front.
         for _ in 0..3 {
             m.next_fetch_to_dispatch(Epoch::new(0));
         }
         assert_eq!(m.in_flight_count(), 3);
 
-        // Blocks arrive out of order.
         m.on_synced_block_received(block_at(3));
         m.on_synced_block_received(block_at(1));
         m.on_synced_block_received(block_at(2));
         assert_eq!(m.in_flight_count(), 0);
         assert_eq!(m.buffered_count(), 3);
 
-        // Drain in epoch order.
         let mut committed = Epoch::new(0);
         let mut drained = Vec::new();
         while let Some(b) = m.take_next_applicable(committed) {
             drained.push(b.epoch());
             committed = b.epoch();
         }
-        assert_eq!(drained, vec![Epoch::new(1), Epoch::new(2), Epoch::new(3)],);
+        assert_eq!(drained, vec![Epoch::new(1), Epoch::new(2), Epoch::new(3)]);
     }
 }

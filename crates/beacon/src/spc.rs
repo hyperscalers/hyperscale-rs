@@ -714,7 +714,14 @@ pub enum SpcEffect {
         duration: Duration,
     },
     /// Agreed high output — terminal effect for this SPC instance.
-    OutputHigh(PcVector),
+    /// `cert` is the [`SpcCert::Direct`] that proves view 1's PC
+    /// produced this high; it authenticates the resulting beacon block.
+    OutputHigh {
+        /// Committed high vector.
+        value: PcVector,
+        /// Authenticating cert.
+        cert: Box<SpcCert>,
+    },
 }
 
 /// Events [`SpcInstance::handle`] consumes.
@@ -847,6 +854,11 @@ pub struct SpcInstance {
 
     low_output: Option<PcVector>,
     high_output: Option<PcVector>,
+    /// Cert authenticating the eventual high output — stashed in
+    /// `on_vpc_output_high` for view 1's PC output, retrieved by
+    /// `commit()` when the walk reaches view-1's parent and emits
+    /// [`SpcEffect::OutputHigh`].
+    high_decisive_cert: Option<SpcCert>,
 }
 
 impl SpcInstance {
@@ -891,6 +903,7 @@ impl SpcInstance {
             pending_empty_views: BTreeMap::new(),
             low_output: None,
             high_output: None,
+            high_decisive_cert: None,
         }
     }
 
@@ -1048,6 +1061,9 @@ impl SpcInstance {
                 value: high,
                 proof,
             };
+            // Stash for later retrieval when commit() walks back to
+            // view 1 and emits `OutputHigh`.
+            self.high_decisive_cert = Some(cert.clone());
             // Self-process: enter view+1 and broadcast. `from = me`
             // because we're the relay for our own proposal-object.
             out.extend(self.enter_view(self.me, next, cert.clone()));
@@ -1331,7 +1347,14 @@ impl SpcInstance {
             if parent_view.inner() == 1 {
                 if self.high_output.is_none() {
                     self.high_output = Some(parent_value.clone());
-                    out.push(SpcEffect::OutputHigh(parent_value));
+                    let cert = self
+                        .high_decisive_cert
+                        .clone()
+                        .expect("on_vpc_output_high stashes the cert before commit walks here");
+                    out.push(SpcEffect::OutputHigh {
+                        value: parent_value,
+                        cert: Box::new(cert),
+                    });
                     // Instance is done: free the proposal table.
                     self.proposals_by_hash.clear();
                 }

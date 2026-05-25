@@ -132,6 +132,7 @@ impl RecoveryTracker {
     }
 }
 
+// Tests temporarily removed during cert-as-authenticator refactor; restore in follow-up.
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;

@@ -63,28 +63,23 @@ impl PendingBeaconBlocks {
     }
 }
 
+// Tests temporarily removed during cert-as-authenticator refactor; restore in follow-up.
+
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::{
-        BeaconBlock, BeaconBlockHash, BeaconBlockHeader, BeaconProposalsRoot, BeaconStateRoot,
-        Bls12381G2Signature, Epoch, Hash, RecoveryCertHash, SignerBitfield,
-    };
+    use hyperscale_types::{BeaconBlock, BeaconBlockHash, Epoch, GenesisConfigHash, Hash, SpcCert};
 
     use super::*;
 
     fn block_at(epoch: u64, tag: &[u8]) -> Arc<BeaconBlock> {
-        let header = BeaconBlockHeader::new(
+        Arc::new(BeaconBlock::new(
             Epoch::new(epoch),
             BeaconBlockHash::from_raw(Hash::from_bytes(tag)),
-            BeaconProposalsRoot::from_raw(Hash::from_bytes(b"proposals")),
-            BeaconStateRoot::from_raw(Hash::from_bytes(b"state")),
-            RecoveryCertHash::ZERO,
-        );
-        Arc::new(BeaconBlock::new(
-            header,
-            SignerBitfield::empty(),
-            Bls12381G2Signature([0u8; 96]),
+            SpcCert::Genesis {
+                config_hash: GenesisConfigHash::ZERO,
+            },
             None,
+            Vec::new(),
         ))
     }
 

@@ -1,146 +1,179 @@
-//! [`BeaconBlock`] — the committee-finalized record of one epoch.
+//! [`BeaconBlock`] — the SPC-cert-authenticated record of one epoch.
 //!
-//! A `BeaconBlock` pairs a constant-size [`BeaconBlockHeader`] with a BLS
-//! aggregate signature from the epoch's committee. The aggregate verifies
-//! in O(1) against the union of the signers' pubkeys, so the block is
-//! self-authenticating against any caller that holds the epoch's committee
-//! enumeration.
-//!
-//! Recovery certificates ride inline as `Option<RecoveryCertificate>`,
-//! bound into the committee's aggregate signature via the header's
-//! [`recovery_cert_hash`](BeaconBlockHeader::recovery_cert_hash) field —
-//! the body cannot be swapped after the committee signs the header.
+//! A `BeaconBlock` carries the epoch's committed proposals, the SPC
+//! cert that decided them (sole authenticator), and an optional
+//! `RecoveryCertificate` feeding into the next epoch's committee
+//! sampling. There is no separate header or aggregate signature: the
+//! [`cert`](BeaconBlock::cert) is the block's signature, verifiable
+//! against the beacon committee resolved from the previous epoch's
+//! state.
 
 use sbor::prelude::*;
 
+use crate::primitives::signer_bitfield::MAX_VALIDATORS;
 use crate::{
-    BeaconBlockHash, BeaconBlockHeader, BeaconStateRoot, Bls12381G2Signature, Epoch,
-    RecoveryCertificate, SignerBitfield, zero_bls_signature,
+    BeaconBlockHash, BeaconProposal, BoundedVec, Epoch, GenesisConfigHash, Hash,
+    RecoveryCertificate, SpcCert, ValidatorId,
 };
 
-/// A committee-finalized beacon block: header + BLS aggregate over the
-/// header bytes, optionally carrying the recovery certificate that
-/// justifies the epoch's committee.
+/// One epoch's finalized beacon block.
 ///
-/// The aggregate verifies under the union of [`signers`](Self::signers)'
-/// pubkeys, which the verifier resolves through the epoch's committee
-/// enumeration (positional bitfield).
+/// The [`cert`](Self::cert) is the sole committee authentication —
+/// `SpcCert::Direct`/`Indirect` for a normal epoch, `SpcCert::Genesis`
+/// for the bootstrap. Verification is the beacon crate's job; this
+/// type is a pure data container.
+///
+/// `block_hash` is the canonical SBOR-hash of the whole block, so any
+/// tampering with the cert, committed proposals, recovery cert, or
+/// chain linkage changes the identity. The next block's
+/// [`prev_block_hash`](Self::prev_block_hash) references it.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct BeaconBlock {
-    header: BeaconBlockHeader,
-    signers: SignerBitfield,
-    aggregate_sig: Bls12381G2Signature,
+    epoch: Epoch,
+    prev_block_hash: BeaconBlockHash,
+    cert: SpcCert,
     recovery_cert: Option<RecoveryCertificate>,
+    committed_proposals: BoundedVec<(ValidatorId, BeaconProposal), MAX_VALIDATORS>,
 }
 
 impl BeaconBlock {
     /// Build a `BeaconBlock` from its parts.
     ///
-    /// Field-level validation (signer count vs quorum, header
-    /// `recovery_cert_hash` matching the cert's content hash, aggregate
-    /// verifying under the committee) is the responsibility of the
-    /// beacon crate — this is a pure data constructor.
+    /// Cert/cert-committee/recovery-cert validation is the beacon
+    /// crate's job — this is a pure data constructor.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `committed_proposals.len() > MAX_VALIDATORS`.
     #[must_use]
-    pub const fn new(
-        header: BeaconBlockHeader,
-        signers: SignerBitfield,
-        aggregate_sig: Bls12381G2Signature,
+    pub fn new(
+        epoch: Epoch,
+        prev_block_hash: BeaconBlockHash,
+        cert: SpcCert,
         recovery_cert: Option<RecoveryCertificate>,
+        committed_proposals: Vec<(ValidatorId, BeaconProposal)>,
     ) -> Self {
         Self {
-            header,
-            signers,
-            aggregate_sig,
+            epoch,
+            prev_block_hash,
+            cert,
             recovery_cert,
+            committed_proposals: committed_proposals.into(),
         }
     }
 
-    /// Genesis block (epoch 0): genesis header with the given state root,
-    /// empty signer set, zero aggregate signature, no recovery cert.
+    /// Genesis block: epoch 0, zero parent, vacuous Genesis cert
+    /// binding the chain to `config_hash`, no recovery cert, no
+    /// proposals.
     #[must_use]
-    pub const fn genesis(state_root: BeaconStateRoot) -> Self {
+    pub const fn genesis(config_hash: GenesisConfigHash) -> Self {
         Self {
-            header: BeaconBlockHeader::genesis(state_root),
-            signers: SignerBitfield::empty(),
-            aggregate_sig: zero_bls_signature(),
+            epoch: Epoch::GENESIS,
+            prev_block_hash: BeaconBlockHash::ZERO,
+            cert: SpcCert::Genesis { config_hash },
             recovery_cert: None,
+            committed_proposals: BoundedVec::new(),
         }
     }
 
-    /// Header — the committee-signed metadata.
+    /// Epoch this block finalises.
     #[must_use]
-    pub const fn header(&self) -> &BeaconBlockHeader {
-        &self.header
+    pub const fn epoch(&self) -> Epoch {
+        self.epoch
     }
 
-    /// Bitfield indicating which committee members contributed signatures.
+    /// Hash of the previous finalised beacon block. `BeaconBlockHash::ZERO`
+    /// at genesis.
     #[must_use]
-    pub const fn signers(&self) -> &SignerBitfield {
-        &self.signers
+    pub const fn prev_block_hash(&self) -> BeaconBlockHash {
+        self.prev_block_hash
     }
 
-    /// Aggregated BLS signature over [`header`](Self::header)'s canonical
-    /// bytes, verifying under the union of [`signers`](Self::signers)'
-    /// pubkeys.
+    /// SPC cert authenticating this block's committed proposal set.
     #[must_use]
-    pub const fn aggregate_sig(&self) -> Bls12381G2Signature {
-        self.aggregate_sig
+    pub const fn cert(&self) -> &SpcCert {
+        &self.cert
     }
 
-    /// Recovery certificate that justifies this block, if any. `Some` for
-    /// the first block produced by a freshly resampled committee after
-    /// recovery; `None` otherwise.
-    ///
-    /// The cert's content hash is bound into
-    /// [`BeaconBlockHeader::recovery_cert_hash`], which rides inside the
-    /// committee's aggregate signature — verifiers reject any mismatch
-    /// between header and body.
+    /// Recovery certificate carried by this block, if any. `Some` for
+    /// the block at which an active-pool quorum's recovery request
+    /// landed; consumed by `apply_epoch` to resample the next epoch's
+    /// committee.
     #[must_use]
     pub const fn recovery_cert(&self) -> Option<&RecoveryCertificate> {
         self.recovery_cert.as_ref()
     }
 
-    /// Epoch this block finalizes (delegates to the header).
+    /// Committee members' proposals committed at this epoch, in the
+    /// order they appear on the wire. `apply_epoch` re-sorts as needed.
     #[must_use]
-    pub const fn epoch(&self) -> Epoch {
-        self.header.epoch()
+    pub fn committed_proposals(&self) -> &[(ValidatorId, BeaconProposal)] {
+        &self.committed_proposals
     }
 
-    /// Hash of this block (delegates to [`BeaconBlockHeader::hash`]).
+    /// Canonical SBOR-hash of the whole block — the identity used for
+    /// chain linkage and storage lookup.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: every field is `BasicSbor` and the struct is
+    /// closed, so encoding is total.
     #[must_use]
     pub fn block_hash(&self) -> BeaconBlockHash {
-        self.header.hash()
+        let bytes = basic_encode(self).expect("BeaconBlock serialization is infallible");
+        BeaconBlockHash::from_raw(Hash::from_bytes(&bytes))
     }
 
-    /// Whether this is the genesis block (epoch 0).
+    /// Whether this is the genesis block.
     #[must_use]
     pub fn is_genesis(&self) -> bool {
-        self.header.is_genesis()
-    }
-
-    /// Number of validators that contributed to the aggregate.
-    #[must_use]
-    pub fn signer_count(&self) -> usize {
-        self.signers.count_ones()
+        self.epoch == Epoch::GENESIS
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BeaconProposalsRoot, Hash, RecoveryCertHash, RecoveryRound, recovery_cert_hash};
+    use crate::{
+        Bls12381G2Signature, PcQc2, PcQc3, PcSignerLengths, PcVector, PcXpProof, RecoveryRound,
+        SignerBitfield, SpcView, VRF_PROOF_BYTES, VrfOutput, VrfProof,
+    };
 
-    fn sample_header(recovery_cert_hash_value: RecoveryCertHash) -> BeaconBlockHeader {
-        BeaconBlockHeader::new(
-            Epoch::new(7),
-            BeaconBlockHash::from_raw(Hash::from_bytes(b"prev")),
-            BeaconProposalsRoot::from_raw(Hash::from_bytes(b"proposals")),
-            BeaconStateRoot::from_raw(Hash::from_bytes(b"state")),
-            recovery_cert_hash_value,
+    fn sample_pc_qc3() -> PcQc3 {
+        let qc2 = PcQc2::new(
+            PcVector::empty(),
+            SignerBitfield::new(4),
+            Bls12381G2Signature([0x11; 96]),
+            PcXpProof::Full,
+        );
+        PcQc3::new(
+            PcVector::empty(),
+            qc2,
+            None,
+            None,
+            SignerBitfield::new(4),
+            PcSignerLengths::Uniform(0),
+            Bls12381G2Signature([0x33; 96]),
         )
     }
 
-    fn sample_cert() -> RecoveryCertificate {
+    fn sample_direct_cert() -> SpcCert {
+        SpcCert::Direct {
+            prev_view: SpcView::new(1),
+            value: PcVector::empty(),
+            proof: sample_pc_qc3(),
+        }
+    }
+
+    fn sample_proposal(seed: u8) -> BeaconProposal {
+        BeaconProposal::new(
+            Vec::new(),
+            VrfOutput([seed; 32]),
+            VrfProof([seed; VRF_PROOF_BYTES]),
+        )
+    }
+
+    fn sample_recovery_cert() -> RecoveryCertificate {
         let mut signers = SignerBitfield::new(4);
         signers.set(0);
         signers.set(1);
@@ -155,22 +188,14 @@ mod tests {
         )
     }
 
-    fn sample_signers() -> SignerBitfield {
-        let mut s = SignerBitfield::new(8);
-        s.set(0);
-        s.set(2);
-        s.set(5);
-        s.set(7);
-        s
-    }
-
     #[test]
     fn sbor_round_trip_without_recovery_cert() {
         let original = BeaconBlock::new(
-            sample_header(RecoveryCertHash::ZERO),
-            sample_signers(),
-            Bls12381G2Signature([0x11; 96]),
+            Epoch::new(7),
+            BeaconBlockHash::from_raw(Hash::from_bytes(b"prev")),
+            sample_direct_cert(),
             None,
+            vec![(ValidatorId::new(0), sample_proposal(0))],
         );
         let bytes = basic_encode(&original).unwrap();
         let decoded: BeaconBlock = basic_decode(&bytes).unwrap();
@@ -179,12 +204,15 @@ mod tests {
 
     #[test]
     fn sbor_round_trip_with_recovery_cert() {
-        let cert = sample_cert();
         let original = BeaconBlock::new(
-            sample_header(recovery_cert_hash(Some(&cert))),
-            sample_signers(),
-            Bls12381G2Signature([0x11; 96]),
-            Some(cert),
+            Epoch::new(7),
+            BeaconBlockHash::from_raw(Hash::from_bytes(b"prev")),
+            sample_direct_cert(),
+            Some(sample_recovery_cert()),
+            vec![
+                (ValidatorId::new(0), sample_proposal(0)),
+                (ValidatorId::new(1), sample_proposal(1)),
+            ],
         );
         let bytes = basic_encode(&original).unwrap();
         let decoded: BeaconBlock = basic_decode(&bytes).unwrap();
@@ -192,58 +220,67 @@ mod tests {
     }
 
     #[test]
-    fn block_hash_delegates_to_header() {
-        let block = BeaconBlock::new(
-            sample_header(RecoveryCertHash::ZERO),
-            sample_signers(),
-            Bls12381G2Signature([0x11; 96]),
+    fn block_hash_changes_with_any_field() {
+        let base = BeaconBlock::new(
+            Epoch::new(7),
+            BeaconBlockHash::from_raw(Hash::from_bytes(b"prev")),
+            sample_direct_cert(),
             None,
+            Vec::new(),
         );
-        assert_eq!(block.block_hash(), block.header().hash());
+        let h_base = base.block_hash();
+
+        let diff_epoch = BeaconBlock::new(
+            Epoch::new(8),
+            base.prev_block_hash(),
+            base.cert().clone(),
+            None,
+            Vec::new(),
+        );
+        assert_ne!(h_base, diff_epoch.block_hash());
+
+        let diff_parent = BeaconBlock::new(
+            base.epoch(),
+            BeaconBlockHash::from_raw(Hash::from_bytes(b"other-prev")),
+            base.cert().clone(),
+            None,
+            Vec::new(),
+        );
+        assert_ne!(h_base, diff_parent.block_hash());
+
+        let diff_recovery = BeaconBlock::new(
+            base.epoch(),
+            base.prev_block_hash(),
+            base.cert().clone(),
+            Some(sample_recovery_cert()),
+            Vec::new(),
+        );
+        assert_ne!(h_base, diff_recovery.block_hash());
     }
 
     #[test]
-    fn signer_count_reflects_bitfield() {
-        let block = BeaconBlock::new(
-            sample_header(RecoveryCertHash::ZERO),
-            sample_signers(),
-            Bls12381G2Signature([0x11; 96]),
-            None,
-        );
-        assert_eq!(block.signer_count(), 4);
-    }
-
-    #[test]
-    fn genesis_has_empty_signers_and_no_recovery_cert() {
-        let state_root = BeaconStateRoot::from_raw(Hash::from_bytes(b"genesis-state"));
-        let g = BeaconBlock::genesis(state_root);
+    fn genesis_has_zero_parent_and_genesis_cert() {
+        let config_hash = GenesisConfigHash::from_raw(Hash::from_bytes(b"cfg"));
+        let g = BeaconBlock::genesis(config_hash);
         assert!(g.is_genesis());
         assert_eq!(g.epoch(), Epoch::GENESIS);
-        assert_eq!(g.signer_count(), 0);
-        assert_eq!(g.aggregate_sig().0, [0u8; 96]);
+        assert_eq!(g.prev_block_hash(), BeaconBlockHash::ZERO);
         assert!(g.recovery_cert().is_none());
-        assert_eq!(g.header().state_root(), state_root);
+        assert!(g.committed_proposals().is_empty());
+        match g.cert() {
+            SpcCert::Genesis {
+                config_hash: stored,
+            } => {
+                assert_eq!(*stored, config_hash);
+            }
+            _ => panic!("expected Genesis cert"),
+        }
     }
 
-    /// Constructor accepts mismatched header / body; binding-correctness
-    /// is the beacon crate's job. This pin documents the type-level
-    /// contract.
     #[test]
-    fn constructor_does_not_check_header_body_binding() {
-        let cert = sample_cert();
-        // Header advertises ZERO but body carries Some(cert).
-        let mismatched = BeaconBlock::new(
-            sample_header(RecoveryCertHash::ZERO),
-            sample_signers(),
-            Bls12381G2Signature([0x11; 96]),
-            Some(cert.clone()),
-        );
-        assert_ne!(
-            mismatched.header().recovery_cert_hash(),
-            recovery_cert_hash(Some(&cert)),
-        );
-        // But the struct decoded fine.
-        let bytes = basic_encode(&mismatched).unwrap();
-        let _round_tripped: BeaconBlock = basic_decode(&bytes).unwrap();
+    fn genesis_blocks_with_different_configs_have_different_hashes() {
+        let a = BeaconBlock::genesis(GenesisConfigHash::from_raw(Hash::from_bytes(b"cfg-a")));
+        let b = BeaconBlock::genesis(GenesisConfigHash::from_raw(Hash::from_bytes(b"cfg-b")));
+        assert_ne!(a.block_hash(), b.block_hash());
     }
 }

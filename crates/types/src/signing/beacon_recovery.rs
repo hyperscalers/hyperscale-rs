@@ -46,7 +46,7 @@ pub fn recovery_request_message(
 mod tests {
     use super::*;
     use crate::Hash;
-    use crate::signing::{DOMAIN_BEACON_BLOCK_HEADER, DOMAIN_PC_VRF};
+    use crate::signing::DOMAIN_PC_VRF;
 
     fn net() -> NetworkDefinition {
         NetworkDefinition::simulator()
@@ -119,16 +119,12 @@ mod tests {
     }
 
     /// Cross-domain replay protection: a recovery sig must not collide
-    /// with a VRF reveal or a beacon-header sig — distinct domain tags
-    /// guarantee the prefixes diverge.
+    /// with a VRF reveal — distinct domain tags guarantee the prefixes
+    /// diverge.
     #[test]
     fn recovery_request_message_differs_from_other_beacon_domains() {
         let bytes =
             recovery_request_message(&net(), &anchor(), Epoch::new(1), RecoveryRound::INITIAL);
         assert_ne!(&bytes[..DOMAIN_RECOVERY_REQUEST.len()], DOMAIN_PC_VRF);
-        assert_ne!(
-            &bytes[..DOMAIN_RECOVERY_REQUEST.len()],
-            DOMAIN_BEACON_BLOCK_HEADER
-        );
     }
 }

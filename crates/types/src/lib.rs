@@ -31,7 +31,7 @@ mod transaction;
 mod wave;
 
 pub use beacon::{
-    BeaconBlock, BeaconBlockHeader, BeaconProposal, BeaconState, BeaconWitness, BeaconWitnessEvent,
+    BeaconBlock, BeaconProposal, BeaconState, BeaconWitness, BeaconWitnessEvent,
     CommitteeTransition, EquivocationEvidence, JailReason, MAX_BEACON_WITNESS_EVENTS_PER_TX,
     MAX_EXCLUDED_VALIDATORS, MAX_PREFIX_SIGS, MAX_READY_SIGNALS_PER_BLOCK, MAX_READY_WINDOW_BLOCKS,
     MAX_VOTE_VECTOR_LEN, MAX_WITNESS_PROOF_DEPTH, MAX_WITNESSES_PER_FETCH,
@@ -42,8 +42,7 @@ pub use beacon::{
     ShardCommittee, ShardWitness, ShardWitnessPayload, ShardWitnessProof, SkipReport, SlotEffects,
     SpcCert, SpcEmptyLowEvidence, SpcEmptyViewMsg, SpcHighTriple, SpcMessage, SpcProposalObject,
     StakePool, StateKey, StateProof, StateValue, SubtreePath, TransitionCause, ValidatorRecord,
-    ValidatorStatus, VpcMsgPayload, Witness, compute_proposals_root, prove, recovery_cert_hash,
-    state_root, verify,
+    ValidatorStatus, VpcMsgPayload, Witness, prove, recovery_cert_hash, state_root, verify,
 };
 pub use crypto::batch_verify::{
     aggregate_verify_bls_different_messages, batch_verify_bls_different_messages,
@@ -65,10 +64,10 @@ pub use network::{GossipMessage, MessageClass, NetworkMessage, Request, TopicSco
 pub use primitives::bloom::{BloomFilter, BloomKey, DEFAULT_FPR, MAX_BITS};
 pub use primitives::hash::{Hash, TypedHash};
 pub use primitives::hash_kinds::{
-    BeaconBlockHash, BeaconProposalsRoot, BeaconStateRoot, BeaconWitnessRoot, BlockHash,
-    CertificateRoot, EventRoot, GenesisConfigHash, GlobalReceiptHash, GlobalReceiptRoot,
-    LocalReceiptRoot, ProvisionHash, ProvisionTxRoot, ProvisionsRoot, RecoveryCertHash, StateRoot,
-    TransactionRoot, TxHash, WaveReceiptHash, WritesRoot,
+    BeaconBlockHash, BeaconStateRoot, BeaconWitnessRoot, BlockHash, CertificateRoot, EventRoot,
+    GenesisConfigHash, GlobalReceiptHash, GlobalReceiptRoot, LocalReceiptRoot, ProvisionHash,
+    ProvisionTxRoot, ProvisionsRoot, RecoveryCertHash, StateRoot, TransactionRoot, TxHash,
+    WaveReceiptHash, WritesRoot,
 };
 pub use primitives::identifiers::{
     Attempt, BeaconWitnessLeafCount, BlockHeight, Epoch, HeaderFetchCount, InFlightCount,
@@ -113,16 +112,15 @@ pub use shard::roots::{
 pub use shard::vote::BlockVote;
 pub use shard::{Block, SharedCertificates, SharedProvisions, SharedTransactions};
 pub use signing::{
-    DOMAIN_BEACON_BLOCK_HEADER, DOMAIN_BLOCK_HEADER, DOMAIN_BLOCK_VOTE,
-    DOMAIN_COMMITTED_BLOCK_HEADER, DOMAIN_EXEC_CERT_BATCH, DOMAIN_EXEC_VOTE,
-    DOMAIN_EXEC_VOTE_BATCH, DOMAIN_PC_EMPTY_VIEW, DOMAIN_PC_VOTE1, DOMAIN_PC_VOTE2,
-    DOMAIN_PC_VOTE2_LENGTH, DOMAIN_PC_VOTE3, DOMAIN_PC_VRF, DOMAIN_READY_SIGNAL,
+    DOMAIN_BLOCK_HEADER, DOMAIN_BLOCK_VOTE, DOMAIN_COMMITTED_BLOCK_HEADER, DOMAIN_EXEC_CERT_BATCH,
+    DOMAIN_EXEC_VOTE, DOMAIN_EXEC_VOTE_BATCH, DOMAIN_PC_EMPTY_VIEW, DOMAIN_PC_VOTE1,
+    DOMAIN_PC_VOTE2, DOMAIN_PC_VOTE2_LENGTH, DOMAIN_PC_VOTE3, DOMAIN_PC_VRF, DOMAIN_READY_SIGNAL,
     DOMAIN_RECOVERY_REQUEST, DOMAIN_STATE_PROVISION_BATCH, DOMAIN_VALIDATOR_BIND,
-    VALIDATOR_BIND_NONCE_LEN, beacon_block_header_message, block_header_message,
-    block_vote_message, committed_block_header_message, exec_cert_batch_message,
-    exec_vote_batch_message, exec_vote_message, pc_context, pc_vote_signing_message,
-    ready_signal_message, recovery_request_message, spc_context, state_provisions_message,
-    validator_bind_message, vrf_output_from_proof, vrf_reveal_message, vrf_sign, vrf_verify,
+    VALIDATOR_BIND_NONCE_LEN, block_header_message, block_vote_message,
+    committed_block_header_message, exec_cert_batch_message, exec_vote_batch_message,
+    exec_vote_message, pc_context, pc_vote_signing_message, ready_signal_message,
+    recovery_request_message, spc_context, state_provisions_message, validator_bind_message,
+    vrf_output_from_proof, vrf_reveal_message, vrf_sign, vrf_verify,
 };
 pub use time::limits::{MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH};
 pub use time::range::{MAX_VALIDITY_RANGE, TimestampRange};

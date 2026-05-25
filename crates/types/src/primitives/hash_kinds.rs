@@ -140,17 +140,6 @@ hash_newtype!(
 );
 
 hash_newtype!(
-    /// Deterministic merkle root over a slot's committed proposals
-    /// (validator id + encoded proposal, sorted by id).
-    ///
-    /// Carried in `BeaconBlockHeader::proposals_root`; binds the slot's
-    /// committee aggregate signature to the exact set of inputs the
-    /// committee finalized.
-    pub BeaconProposalsRoot,
-    "BeaconProposalsRoot"
-);
-
-hash_newtype!(
     /// Merkle commitment to the beacon-chain state after applying a slot.
     ///
     /// Carried in `BeaconBlockHeader::state_root`. Lets light clients

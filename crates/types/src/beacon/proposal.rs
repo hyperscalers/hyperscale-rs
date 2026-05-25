@@ -10,8 +10,8 @@ use blake3::Hasher;
 use sbor::prelude::*;
 
 use crate::{
-    BeaconProposalsRoot, BoundedVec, Epoch, Hash, MAX_WITNESSES_PER_PROPOSER,
-    PC_VALUE_ELEMENT_BYTES, PcValueElement, ValidatorId, VrfOutput, VrfProof, Witness,
+    BoundedVec, Epoch, MAX_WITNESSES_PER_PROPOSER, PC_VALUE_ELEMENT_BYTES, PcValueElement,
+    VrfOutput, VrfProof, Witness,
 };
 
 /// One committee member's slot submission.
@@ -106,35 +106,6 @@ impl BeaconProposal {
         }
         PcValueElement::new(raw)
     }
-}
-
-/// Compute the [`BeaconProposalsRoot`] over an epoch's committed
-/// proposal set — a deterministic 32-byte hash of `[(validator_id,
-/// encoded_proposal)]` sorted by `validator_id`.
-///
-/// SPC's Agreement guarantees the committed set is byte-identical
-/// across honest committee members, so every member computes the
-/// same root and signs the same header.
-///
-/// # Panics
-///
-/// Never in practice: every field is `BasicSbor` and the struct is
-/// closed, so encoding is total.
-#[must_use]
-pub fn compute_proposals_root(committed: &[(ValidatorId, BeaconProposal)]) -> BeaconProposalsRoot {
-    const DOMAIN: &[u8] = b"hyperscale-beacon-proposals-root-v1";
-    let mut sorted: Vec<&(ValidatorId, BeaconProposal)> = committed.iter().collect();
-    sorted.sort_by_key(|(id, _)| *id);
-    let mut hasher = Hasher::new();
-    hasher.update(DOMAIN);
-    for (id, proposal) in sorted {
-        hasher.update(&id.to_le_bytes());
-        let encoded = basic_encode(proposal).expect("BeaconProposal SBOR encoding is infallible");
-        hasher.update(&encoded);
-    }
-    let mut raw = [0u8; 32];
-    raw.copy_from_slice(hasher.finalize().as_bytes());
-    BeaconProposalsRoot::from_raw(Hash::from_bytes(&raw))
 }
 
 #[cfg(test)]
@@ -243,28 +214,5 @@ mod tests {
         let p = sample_proposal();
         let h = p.pc_element_hash(Epoch::new(1));
         assert_ne!(h, PcValueElement::new([0u8; PC_VALUE_ELEMENT_BYTES]));
-    }
-
-    #[test]
-    fn proposals_root_invariant_under_committed_order() {
-        let p_a = BeaconProposal::vrf_only(VrfOutput([1; 32]), VrfProof([1; 96]));
-        let p_b = BeaconProposal::vrf_only(VrfOutput([2; 32]), VrfProof([2; 96]));
-        let committed_in_order = vec![
-            (ValidatorId::new(0), p_a.clone()),
-            (ValidatorId::new(1), p_b.clone()),
-        ];
-        let committed_out_of_order = vec![(ValidatorId::new(1), p_b), (ValidatorId::new(0), p_a)];
-        let r1 = compute_proposals_root(&committed_in_order);
-        let r2 = compute_proposals_root(&committed_out_of_order);
-        assert_eq!(r1, r2);
-    }
-
-    #[test]
-    fn proposals_root_changes_with_membership() {
-        let p_a = BeaconProposal::vrf_only(VrfOutput([1; 32]), VrfProof([1; 96]));
-        let p_b = BeaconProposal::vrf_only(VrfOutput([2; 32]), VrfProof([2; 96]));
-        let one = vec![(ValidatorId::new(0), p_a.clone())];
-        let two = vec![(ValidatorId::new(0), p_a), (ValidatorId::new(1), p_b)];
-        assert_ne!(compute_proposals_root(&one), compute_proposals_root(&two));
     }
 }

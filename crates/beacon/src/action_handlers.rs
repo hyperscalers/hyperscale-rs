@@ -13,13 +13,12 @@ use hyperscale_core::{Action, ActionContext, ProtocolEvent};
 use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::notification::{
-    BeaconBlockHeaderSigNotification, BeaconProposalNotification, PcVote1Notification,
-    PcVote2Notification, PcVote3Notification, SpcEmptyViewMsgNotification,
-    SpcNewCommitNotification, SpcNewViewNotification,
+    BeaconProposalNotification, PcVote1Notification, PcVote2Notification, PcVote3Notification,
+    SpcEmptyViewMsgNotification, SpcNewCommitNotification, SpcNewViewNotification,
 };
 use hyperscale_types::{
-    BeaconProposal, SpcHighTriple, SpcMessage, SpcProposalObject, VpcMsgPayload,
-    beacon_block_header_message, pc_context, spc_context, vrf_sign,
+    BeaconProposal, SpcHighTriple, SpcMessage, SpcProposalObject, VpcMsgPayload, pc_context,
+    spc_context, vrf_sign,
 };
 use tracing::warn;
 
@@ -152,23 +151,6 @@ where
                 from: me,
                 epoch,
                 proposal,
-            });
-        }
-        Action::SignAndBroadcastBeaconBlockHeader {
-            epoch,
-            header,
-            recipients,
-        } => {
-            let msg = beacon_block_header_message(network, &header);
-            let sig = ctx.signing_key.sign_v1(&msg);
-            ctx.network.notify(
-                &recipients,
-                &BeaconBlockHeaderSigNotification::new(epoch, me, sig),
-            );
-            ctx.notify_protocol(ProtocolEvent::BeaconBlockSigReceived {
-                from: me,
-                epoch,
-                sig,
             });
         }
         Action::BroadcastBeaconBlock { block } => {

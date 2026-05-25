@@ -86,7 +86,6 @@ where
             | Action::BroadcastSpcNewView { .. }
             | Action::BroadcastSpcNewCommit { .. }
             | Action::BuildAndBroadcastBeaconProposal { .. }
-            | Action::SignAndBroadcastBeaconBlockHeader { .. }
             | Action::BroadcastBeaconBlock { .. }
             | Action::BroadcastRecoveryRequest { .. }
             | Action::FetchShardWitnesses { .. }

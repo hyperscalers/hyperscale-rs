@@ -13,22 +13,22 @@
 //! PC commits all-`HASH_BOTTOM`s every epoch — the honest path still
 //! terminates but exercises an uninteresting branch.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use hyperscale_beacon::constants::{BEACON_SIGNER_COUNT, MIN_STAKE_FLOOR};
 use hyperscale_beacon::coordinator::BeaconCoordinator;
 use hyperscale_beacon::genesis::{
     BeaconGenesisConfig, GenesisPool, GenesisValidator, build_genesis_beacon_state,
+    genesis_config_hash,
 };
 use hyperscale_beacon::pc::{sign_vote1, sign_vote2, sign_vote3};
 use hyperscale_beacon::spc::sign_empty_view_msg;
 use hyperscale_core::Action;
 use hyperscale_types::{
-    BeaconBlock, BeaconProposal, BeaconState, Bls12381G1PrivateKey, Bls12381G1PublicKey,
-    Bls12381G2Signature, Epoch, NetworkDefinition, Randomness, ShardGroupId, SpcMessage, Stake,
-    StakePoolId, ValidatorId, VpcMsgPayload, beacon_block_header_message, bls_keypair_from_seed,
-    pc_context, spc_context, state_root, vrf_sign,
+    BeaconBlock, BeaconProposal, BeaconState, Bls12381G1PrivateKey, Bls12381G1PublicKey, Epoch,
+    NetworkDefinition, Randomness, ShardGroupId, SpcMessage, Stake, StakePoolId, ValidatorId,
+    VpcMsgPayload, bls_keypair_from_seed, pc_context, spc_context, vrf_sign,
 };
 
 /// One captured commit event from a replica's `Action::CommitBeaconBlock`.
@@ -60,10 +60,8 @@ enum SimEvent {
         epoch: Epoch,
         proposal: Arc<BeaconProposal>,
     },
-    BeaconBlockSig {
-        from: ValidatorId,
-        epoch: Epoch,
-        sig: Bls12381G2Signature,
+    BeaconBlock {
+        block: Arc<BeaconBlock>,
     },
 }
 
@@ -81,10 +79,6 @@ pub struct CoordinatorSim {
     pub commits: Vec<Vec<CapturedCommit>>,
     network_q: VecDeque<Envelope>,
     loopback_q: VecDeque<Envelope>,
-    /// Replicas whose header-sig deliveries (both peer-bound and the
-    /// emitter's own loopback) are dropped at enqueue time. Set up via
-    /// [`Self::suppress_sig_delivery_to`] for adoption-path tests.
-    sig_suppressed: BTreeSet<usize>,
 }
 
 impl CoordinatorSim {
@@ -143,7 +137,8 @@ impl CoordinatorSim {
         };
 
         let initial_state = build_genesis_beacon_state(&config);
-        let genesis_block = Arc::new(BeaconBlock::genesis(state_root(&initial_state)));
+        let config_hash = genesis_config_hash(&config);
+        let genesis_block = Arc::new(BeaconBlock::genesis(config_hash));
 
         let coordinators: Vec<BeaconCoordinator> = (0..n)
             .map(|i| {
@@ -152,6 +147,7 @@ impl CoordinatorSim {
                     initial_state.clone(),
                     members[i].0,
                     network.clone(),
+                    config_hash,
                 )
             })
             .collect();
@@ -164,18 +160,7 @@ impl CoordinatorSim {
             commits: (0..n).map(|_| Vec::new()).collect(),
             network_q: VecDeque::new(),
             loopback_q: VecDeque::new(),
-            sig_suppressed: BTreeSet::new(),
         }
-    }
-
-    /// Suppress all subsequent `BeaconBlockSig` deliveries — both
-    /// peer-bound broadcasts and the emitter's own loopback feedback —
-    /// addressed to `replica_idx`. Replica `replica_idx` then sits in
-    /// `commit_in_progress` after its SPC reaches `OutputHigh`,
-    /// modelling a missed-quorum vnode that must adopt a peer-built
-    /// `BeaconBlock` instead of closing the local sig pool.
-    pub fn suppress_sig_delivery_to(&mut self, replica_idx: usize) {
-        self.sig_suppressed.insert(replica_idx);
     }
 
     /// Hand `block` directly to `replica_idx` via
@@ -269,8 +254,8 @@ impl CoordinatorSim {
                 epoch,
                 proposal,
             } => self.coordinators[env.to_idx].on_beacon_proposal_received(from, epoch, proposal),
-            SimEvent::BeaconBlockSig { from, epoch, sig } => {
-                self.coordinators[env.to_idx].on_beacon_block_sig_received(from, epoch, sig)
+            SimEvent::BeaconBlock { block } => {
+                self.coordinators[env.to_idx].on_beacon_block_received(block)
             }
         }
     }
@@ -417,34 +402,15 @@ impl CoordinatorSim {
                     });
                 }
             }
-            Action::SignAndBroadcastBeaconBlockHeader {
-                epoch,
-                header,
-                recipients,
-            } => {
-                let msg = beacon_block_header_message(&self.network, &header);
-                let sig = self.sks[emitter_idx].sign_v1(&msg);
-                for rcpt in &recipients {
-                    let to_idx = self.idx_of(*rcpt);
-                    if self.sig_suppressed.contains(&to_idx) {
+            Action::BroadcastBeaconBlock { block } => {
+                for to_idx in 0..self.coordinators.len() {
+                    if to_idx == emitter_idx {
                         continue;
                     }
                     self.network_q.push_back(Envelope {
                         to_idx,
-                        event: SimEvent::BeaconBlockSig {
-                            from: me,
-                            epoch,
-                            sig,
-                        },
-                    });
-                }
-                if !self.sig_suppressed.contains(&emitter_idx) {
-                    self.loopback_q.push_back(Envelope {
-                        to_idx: emitter_idx,
-                        event: SimEvent::BeaconBlockSig {
-                            from: me,
-                            epoch,
-                            sig,
+                        event: SimEvent::BeaconBlock {
+                            block: Arc::clone(&block),
                         },
                     });
                 }
@@ -456,9 +422,7 @@ impl CoordinatorSim {
                     state: *state,
                 });
             }
-            Action::BroadcastBeaconBlock { .. }
-            | Action::SetTimer { .. }
-            | Action::CancelTimer { .. } => {}
+            Action::SetTimer { .. } | Action::CancelTimer { .. } => {}
             other => panic!(
                 "CoordinatorSim received unmodelled action variant: {}",
                 other.type_name(),

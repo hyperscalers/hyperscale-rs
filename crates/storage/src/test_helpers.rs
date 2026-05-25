@@ -9,15 +9,15 @@ use std::sync::Arc;
 
 use hyperscale_types::test_utils::test_event_type_identifier;
 use hyperscale_types::{
-    ApplicationEvent, BeaconBlock, BeaconBlockHash, BeaconBlockHeader, BeaconProposalsRoot,
-    BeaconState, BeaconStateRoot, BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash,
-    BlockHeader, BlockHeight, Bls12381G2Signature, BoundedVec, CertificateRoot, ConsensusReceipt,
-    Epoch, EventData, ExecutionCertificate, ExecutionMetadata, ExecutionOutcome, FeeSummary,
-    FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, InFlightCount, LocalReceiptRoot,
-    LogLevel, NodeId, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Randomness,
-    RecoveryCertHash, Round, ShardGroupId, SignerBitfield, StateRoot, StoredReceipt,
-    TransactionRoot, TxHash, TxOutcome, ValidatorId, WaveCertificate, WaveId, WeightedTimestamp,
-    compute_global_receipt_root, state_root, zero_bls_signature,
+    ApplicationEvent, BeaconBlock, BeaconBlockHash, BeaconState, BeaconWitnessLeafCount,
+    BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight, Bls12381G2Signature, BoundedVec,
+    CertificateRoot, ConsensusReceipt, Epoch, EventData, ExecutionCertificate, ExecutionMetadata,
+    ExecutionOutcome, FeeSummary, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash,
+    InFlightCount, LocalReceiptRoot, LogLevel, NodeId, PcQc2, PcQc3, PcSignerLengths, PcVector,
+    PcXpProof, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Randomness, Round,
+    ShardGroupId, SignerBitfield, SpcCert, SpcView, StateRoot, StoredReceipt, TransactionRoot,
+    TxHash, TxOutcome, ValidatorId, WaveCertificate, WaveId, WeightedTimestamp,
+    compute_global_receipt_root, zero_bls_signature,
 };
 use indexmap::IndexMap;
 use radix_common::math::Decimal;
@@ -156,27 +156,48 @@ pub fn make_test_qc(block: &Block) -> QuorumCertificate {
     )
 }
 
-/// Build a beacon block at `epoch` whose header hash is derived from `tag`.
+/// Build a placeholder [`SpcCert::Direct`] for test fixtures.
 ///
-/// All other header fields are filled with fixed test sentinels — the
-/// resulting block round-trips through SBOR and exercises epoch/hash
-/// lookups but is not a valid block under beacon-state verification.
-/// Tests that need a header whose `state_root` matches a real
-/// `BeaconState` should use [`make_test_block_and_state`] instead.
+/// The embedded `PcQc3` is structurally well-formed but doesn't
+/// verify; the cert is intended for storage round-trip tests, not
+/// consensus verification.
+#[must_use]
+fn placeholder_cert() -> SpcCert {
+    let qc2 = PcQc2::new(
+        PcVector::empty(),
+        SignerBitfield::new(4),
+        Bls12381G2Signature([0x11; 96]),
+        PcXpProof::Full,
+    );
+    let proof = PcQc3::new(
+        PcVector::empty(),
+        qc2,
+        None,
+        None,
+        SignerBitfield::new(4),
+        PcSignerLengths::Uniform(0),
+        Bls12381G2Signature([0x33; 96]),
+    );
+    SpcCert::Direct {
+        prev_view: SpcView::new(1),
+        value: PcVector::empty(),
+        proof,
+    }
+}
+
+/// Build a beacon block at `epoch` with tag-derived `prev_block_hash`.
+///
+/// The cert is a structurally-valid but cryptographically-unverified
+/// placeholder. Suitable for storage round-trip tests, not for
+/// consensus verification.
 #[must_use]
 pub fn make_test_beacon_block(epoch: u64, tag: &[u8]) -> Arc<BeaconBlock> {
-    let header = BeaconBlockHeader::new(
+    Arc::new(BeaconBlock::new(
         Epoch::new(epoch),
         BeaconBlockHash::from_raw(Hash::from_bytes(tag)),
-        BeaconProposalsRoot::from_raw(Hash::from_bytes(b"proposals")),
-        BeaconStateRoot::from_raw(Hash::from_bytes(b"state")),
-        RecoveryCertHash::ZERO,
-    );
-    Arc::new(BeaconBlock::new(
-        header,
-        SignerBitfield::empty(),
-        Bls12381G2Signature([0x11; 96]),
+        placeholder_cert(),
         None,
+        Vec::new(),
     ))
 }
 
@@ -206,30 +227,16 @@ pub fn make_test_beacon_state(epoch: u64, tag: &[u8]) -> Arc<BeaconState> {
     })
 }
 
-/// Build a `(block, state)` pair where the block's
-/// `header.state_root` equals `state_root(&state)`.
+/// Build a `(block, state)` pair for storage round-trip tests.
 ///
-/// Mirrors the binding a real committee attests to over
-/// `apply_epoch`. Tests that need to exercise verifier-side
-/// state-root consistency use this instead of pairing
-/// [`make_test_beacon_block`] and [`make_test_beacon_state`]
-/// independently.
+/// Under the cert-as-authenticator model the block's `state_root` is
+/// no longer carried on-chain (it's derived by re-running `apply_epoch`),
+/// so this helper just produces a structurally well-formed block paired
+/// with an arbitrary state.
 #[must_use]
 pub fn make_test_block_and_state(epoch: u64, tag: &[u8]) -> (Arc<BeaconBlock>, Arc<BeaconState>) {
     let state = make_test_beacon_state(epoch, tag);
-    let header = BeaconBlockHeader::new(
-        Epoch::new(epoch),
-        BeaconBlockHash::from_raw(Hash::from_bytes(tag)),
-        BeaconProposalsRoot::from_raw(Hash::from_bytes(b"proposals")),
-        state_root(&state),
-        RecoveryCertHash::ZERO,
-    );
-    let block = Arc::new(BeaconBlock::new(
-        header,
-        SignerBitfield::empty(),
-        Bls12381G2Signature([0x11; 96]),
-        None,
-    ));
+    let block = make_test_beacon_block(epoch, tag);
     (block, state)
 }
 

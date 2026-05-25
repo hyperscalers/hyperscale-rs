@@ -7,15 +7,15 @@ use std::time::Duration;
 use hyperscale_dispatch::DispatchPool;
 use hyperscale_storage::BeaconWitnessCommit;
 use hyperscale_types::{
-    BeaconBlock, BeaconBlockHeader, BeaconState, BeaconWitnessLeafCount, BeaconWitnessRoot, Block,
-    BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PublicKey,
-    CertificateRoot, CommittedBlockHeader, Epoch, ExecutionCertificate, ExecutionVote,
-    FinalizedWave, GlobalReceiptRoot, Hash, InFlightCount, LeafIndex, LocalReceiptRoot, NodeId,
-    PcQc1, PcQc2, PcQc3, PcVector, ProposerTimestamp, ProvisionHash, ProvisionTxRoot, Provisions,
-    ProvisionsRoot, QuorumCertificate, ReadySignal, RecoveryRequest, Round, RoutableTransaction,
-    ShardGroupId, SharedCertificates, SharedTransactions, SpcCert, SpcHighTriple, SpcView,
-    StateRoot, SubstateEntry, TopologySnapshot, TransactionRoot, TransactionStatus, TxHash,
-    TxOutcome, ValidatorId, VotePower, WaveId, WeightedTimestamp, Witness,
+    BeaconBlock, BeaconState, BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash,
+    BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PublicKey, CertificateRoot,
+    CommittedBlockHeader, Epoch, ExecutionCertificate, ExecutionVote, FinalizedWave,
+    GlobalReceiptRoot, Hash, InFlightCount, LeafIndex, LocalReceiptRoot, NodeId, PcQc1, PcQc2,
+    PcQc3, PcVector, ProposerTimestamp, ProvisionHash, ProvisionTxRoot, Provisions, ProvisionsRoot,
+    QuorumCertificate, ReadySignal, RecoveryRequest, Round, RoutableTransaction, ShardGroupId,
+    SharedCertificates, SharedTransactions, SpcCert, SpcHighTriple, SpcView, StateRoot,
+    SubstateEntry, TopologySnapshot, TransactionRoot, TransactionStatus, TxHash, TxOutcome,
+    ValidatorId, VotePower, WaveId, WeightedTimestamp, Witness,
 };
 
 use crate::{CommitSource, FetchAbandon, FetchRequest, ProtocolEvent, TimerId};
@@ -899,22 +899,6 @@ pub enum Action {
         recipients: Vec<ValidatorId>,
     },
 
-    /// Sign the canonical bytes of `header` with the local BLS key
-    /// and ship the signature to the SPC committee. Handler feeds
-    /// the local signature back to the state machine via
-    /// `ProtocolEvent::BeaconBlockSigReceived` with `from = local
-    /// validator` so the same admission path peer sigs use also
-    /// admits our own.
-    SignAndBroadcastBeaconBlockHeader {
-        /// Epoch this header finalizes.
-        epoch: Epoch,
-        /// Header to sign. Boxed to keep [`Action`] compact —
-        /// `BeaconBlockHeader` is wider than the average variant.
-        header: Box<BeaconBlockHeader>,
-        /// SPC committee members the sig ships to (excluding self).
-        recipients: Vec<ValidatorId>,
-    },
-
     /// Broadcast a finalized beacon block (post-SPC commit) over the
     /// beacon gossip topic.
     BroadcastBeaconBlock {
@@ -1007,7 +991,6 @@ impl Action {
             | Self::BroadcastSpcNewView { .. }
             | Self::BroadcastSpcNewCommit { .. }
             | Self::BuildAndBroadcastBeaconProposal { .. }
-            | Self::SignAndBroadcastBeaconBlockHeader { .. }
             | Self::BroadcastBeaconBlock { .. }
             | Self::BroadcastRecoveryRequest { .. }
             | Self::FetchShardWitnesses { .. }
@@ -1068,7 +1051,6 @@ impl Action {
             | Self::BroadcastSpcNewView { .. }
             | Self::BroadcastSpcNewCommit { .. }
             | Self::BuildAndBroadcastBeaconProposal { .. }
-            | Self::SignAndBroadcastBeaconBlockHeader { .. }
             | Self::BroadcastBeaconBlock { .. }
             | Self::BroadcastRecoveryRequest { .. }
             | Self::FetchShardWitnesses { .. }

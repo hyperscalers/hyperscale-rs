@@ -16,8 +16,8 @@
 use sbor::prelude::*;
 
 use crate::{
-    BeaconBlockHash, BeaconBlockHeader, Bls12381G2Signature, BoundedVec, Epoch, Hash,
-    MAX_EXCLUDED_VALIDATORS, RecoveryCertHash, RecoveryRound, SignerBitfield, ValidatorId,
+    BeaconBlockHash, Bls12381G2Signature, BoundedVec, Epoch, Hash, MAX_EXCLUDED_VALIDATORS,
+    RecoveryCertHash, RecoveryRound, SignerBitfield, SpcCert, ValidatorId,
 };
 
 /// One active validator's signed attestation that the beacon chain has
@@ -222,31 +222,28 @@ pub fn recovery_cert_hash(cert: Option<&RecoveryCertificate>) -> RecoveryCertHas
 /// Self-authenticating evidence that a single validator signed both:
 ///   1. a [`RecoveryRequest`] claiming `request.last_block_hash` was their
 ///      latest finalized view, AND
-///   2. a finalized [`BeaconBlock`](crate::BeaconBlock) at a epoch
+///   2. a finalized [`BeaconBlock`](crate::BeaconBlock) at an epoch
 ///      strictly greater than `request.last_block_epoch`.
 ///
 /// The two attestations are semantically contradictory. The recovery
 /// request is carried verbatim; the finalized block is collapsed to
-/// just the header plus its committee aggregate (`block_signers` +
-/// `block_aggregate_sig`) — enough for the verifier to confirm the
-/// equivocator's BLS sig contributed to the aggregate without
-/// shipping the full block body.
+/// just its [`SpcCert`] (the cert IS the committee aggregate; the
+/// equivocator's bit is set in the cert's signer bitfield).
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct RecoveryEquivocation {
     /// Validator whose double-attestation is the evidence.
     pub validator: ValidatorId,
     /// Recovery request claiming the anchor was the validator's latest view.
     pub request: RecoveryRequest,
-    /// Header of a beacon block finalized strictly past
+    /// Epoch of a finalized beacon block strictly past
     /// `request.last_block_epoch`.
-    pub block_header: BeaconBlockHeader,
-    /// Committee bitfield from the finalized block. The equivocator's
-    /// position is set; the verifier confirms membership and reruns the
-    /// aggregate-sig check.
-    pub block_signers: SignerBitfield,
-    /// Aggregate signature over `block_header`'s canonical bytes from
-    /// the bits in `block_signers`.
-    pub block_aggregate_sig: Bls12381G2Signature,
+    pub block_epoch: Epoch,
+    /// SPC cert from that block. The verifier checks the cert validates
+    /// as a real SPC cert under the epoch's committee, and that the
+    /// equivocator's position is set in the cert's signer bitfield
+    /// (`proof.all_signers` for Direct, `skip_reports.signers()` for
+    /// Indirect).
+    pub block_cert: SpcCert,
 }
 
 #[cfg(test)]
@@ -335,23 +332,35 @@ mod tests {
     }
 
     fn sample_recovery_equivocation() -> RecoveryEquivocation {
-        use crate::{BeaconProposalsRoot, BeaconStateRoot};
-        let mut block_signers = SignerBitfield::new(4);
-        block_signers.set(0);
-        block_signers.set(1);
-        block_signers.set(2);
+        use crate::{PcQc2, PcQc3, PcSignerLengths, PcVector, PcXpProof, SpcView};
+        let mut signers = SignerBitfield::new(4);
+        signers.set(0);
+        signers.set(1);
+        signers.set(2);
+        let qc2 = PcQc2::new(
+            PcVector::empty(),
+            signers.clone(),
+            Bls12381G2Signature([0x11; 96]),
+            PcXpProof::Full,
+        );
+        let proof = PcQc3::new(
+            PcVector::empty(),
+            qc2,
+            None,
+            None,
+            signers,
+            PcSignerLengths::Uniform(0),
+            Bls12381G2Signature([0x33; 96]),
+        );
         RecoveryEquivocation {
             validator: ValidatorId::new(2),
             request: sample_request(),
-            block_header: BeaconBlockHeader::new(
-                Epoch::new(8),
-                BeaconBlockHash::from_raw(Hash::from_bytes(b"prev")),
-                BeaconProposalsRoot::from_raw(Hash::from_bytes(b"proposals")),
-                BeaconStateRoot::from_raw(Hash::from_bytes(b"state")),
-                RecoveryCertHash::ZERO,
-            ),
-            block_signers,
-            block_aggregate_sig: Bls12381G2Signature([0x44; 96]),
+            block_epoch: Epoch::new(8),
+            block_cert: SpcCert::Direct {
+                prev_view: SpcView::new(1),
+                value: PcVector::empty(),
+                proof,
+            },
         }
     }
 
