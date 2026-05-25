@@ -35,7 +35,7 @@ use hyperscale_types::{
     DOMAIN_PC_VOTE2, DOMAIN_PC_VOTE2_LENGTH, DOMAIN_PC_VOTE3, Epoch, MAX_VOTE_VECTOR_LEN,
     NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PcCompactLenSigner, PcCompactVote, PcDivergingProof,
     PcQc1, PcQc2, PcQc3, PcValueElement, PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation,
-    PcVoteRound, PcXpProof, SignerBitfield, SpcView, ValidatorId,
+    PcVoteRound, PcXpProof, PositionalBundle, SignerBitfield, SpcView, ValidatorId,
     aggregate_verify_bls_different_messages, pc_context, pc_vote_signing_message, spc_context,
 };
 
@@ -161,16 +161,16 @@ pub fn verify_qc1(
         return false;
     }
 
-    let mut seen: BTreeSet<ValidatorId> = BTreeSet::new();
+    let mut seen: BTreeSet<usize> = BTreeSet::new();
     let mut values: Vec<PcVector> = Vec::with_capacity(q);
     let mut pks: Vec<Bls12381G1PublicKey> = Vec::with_capacity(q);
     let mut subset_inputs: Vec<PcVector> = Vec::with_capacity(q);
 
-    for cv in qc1.x_signers().iter() {
-        let Some(pk) = pubkey_in_committee(committee, cv.validator()) else {
+    for (idx, cv) in qc1.x_signers().iter() {
+        let Some((_, pk)) = committee.get(idx) else {
             return false;
         };
-        if !seen.insert(cv.validator()) {
+        if !seen.insert(idx) {
             return false;
         }
         let Some(v_prime) = reconstruct_compact_vote(cv, qc1.x()) else {
@@ -178,7 +178,7 @@ pub fn verify_qc1(
         };
         subset_inputs.push(v_prime.clone());
         values.push(v_prime);
-        pks.push(pk);
+        pks.push(*pk);
     }
 
     let messages_owned: Vec<Vec<u8>> = values
@@ -588,39 +588,57 @@ fn sign_all_prefixes(
 
 /// Assemble a [`PcQc1`] from a round-1 quorum.
 ///
+/// `committee` is required to resolve `ValidatorId`s to bitfield
+/// positions for the [`PositionalBundle`] wrapping the signers.
+///
 /// # Panics
 ///
 /// Panics if `votes.len() < f + 1` (where `f = (n - 1) / 3`) — the
-/// caller is the FSM, which guarantees full `n - f` quorums.
+/// caller is the FSM, which guarantees full `n - f` quorums. Panics
+/// if any signer in `votes` is not present in `committee`.
 #[must_use]
-pub fn build_qc1(votes: &[&PcVote1], n: usize) -> PcQc1 {
+pub fn build_qc1(votes: &[&PcVote1], committee: &[(ValidatorId, Bls12381G1PublicKey)]) -> PcQc1 {
+    let n = committee.len();
     let f = byzantine_threshold(n);
     let raw_inputs: Vec<PcVector> = votes.iter().map(|v| v.v_in().clone()).collect();
     let x = qc1_certify(&raw_inputs, f).expect("build_qc1 caller guarantees votes.len() >= f+1");
 
-    // Dedup by validator: the FSM supplies distinct senders, but a
+    // Dedup by position: the FSM supplies distinct senders, but a
     // downstream caller could pass duplicates. A silent skip yields a
     // short `x_signers` that the verifier rejects for size; cheaper
     // than panicking on a malformed inbox.
-    let mut seen: BTreeSet<ValidatorId> = BTreeSet::new();
-    let mut x_signers: Vec<PcCompactVote> = Vec::with_capacity(votes.len());
-    let mut x_sigs: Vec<Bls12381G2Signature> = Vec::with_capacity(votes.len());
+    let mut signers_bf = SignerBitfield::new(n);
+    let mut indexed: Vec<(usize, PcCompactVote, Bls12381G2Signature)> =
+        Vec::with_capacity(votes.len());
     for v1 in votes {
-        if !seen.insert(v1.validator()) {
+        let pos = committee
+            .iter()
+            .position(|(id, _)| *id == v1.validator())
+            .expect("build_qc1: vote signer not in committee");
+        if signers_bf.is_set(pos) {
             continue;
         }
-        let cv = compact_vote_for(v1.validator(), v1.v_in(), &x);
+        signers_bf.set(pos);
+        let cv = compact_vote_for(v1.v_in(), &x);
         let sig_idx = cv.shared_len() as usize + usize::from(cv.divergent().is_some());
         let sig = v1
             .prefix_sigs()
             .get(sig_idx)
             .copied()
             .expect("vote-1 carries |v_in|+1 prefix sigs; sig_idx ≤ |v_in|");
-        x_signers.push(cv);
-        x_sigs.push(sig);
+        indexed.push((pos, cv, sig));
     }
+    // Reorder to bitfield set-bit order (ascending position) so the
+    // PositionalBundle items line up with `signers.set_indices()`.
+    indexed.sort_by_key(|(pos, _, _)| *pos);
+    let x_signers_items: Vec<PcCompactVote> = indexed.iter().map(|(_, cv, _)| cv.clone()).collect();
+    let x_sigs: Vec<Bls12381G2Signature> = indexed.iter().map(|(_, _, sig)| *sig).collect();
     let x_agg_sig = Bls12381G2Signature::aggregate(&x_sigs, true).expect("non-empty signers");
-    PcQc1::new(x, x_signers, x_agg_sig)
+    PcQc1::new(
+        x,
+        PositionalBundle::new(signers_bf, x_signers_items),
+        x_agg_sig,
+    )
 }
 
 /// Assemble a [`PcQc2`] from a round-2 quorum.
@@ -775,15 +793,15 @@ pub fn build_qc3(votes: &[&PcVote3]) -> PcQc3 {
 /// captures the deviation point (length of the maximum common prefix)
 /// and the first divergent element when `v_in` is not itself a prefix
 /// of `x`.
-fn compact_vote_for(validator: ValidatorId, v_in: &PcVector, x: &PcVector) -> PcCompactVote {
+fn compact_vote_for(v_in: &PcVector, x: &PcVector) -> PcCompactVote {
     if v_in.as_slice() == x.as_slice() {
         let shared_len = u32::try_from(v_in.len()).unwrap_or(u32::MAX);
-        return PcCompactVote::new(validator, shared_len, None);
+        return PcCompactVote::new(shared_len, None);
     }
     let shared = mcp_two(v_in, x);
     let divergent = v_in.as_slice().get(shared).copied();
     let shared_len = u32::try_from(shared).unwrap_or(u32::MAX);
-    PcCompactVote::new(validator, shared_len, divergent)
+    PcCompactVote::new(shared_len, divergent)
 }
 
 /// Length of the maximum common prefix of two vectors.
@@ -1031,9 +1049,8 @@ impl PcInstance {
             return vec![];
         }
         let q = self.quorum();
-        let n = self.committee.len();
         let vote1s: Vec<&PcVote1> = self.vote1_pool.values().take(q).collect();
-        let qc1 = build_qc1(&vote1s, n);
+        let qc1 = build_qc1(&vote1s, &self.committee);
         self.sent_vote2 = true;
         let mut effects = vec![PcEffect::SignAndBroadcastVote2 { qc1: Box::new(qc1) }];
         effects.extend(self.maybe_advance_to_round3());
@@ -1140,48 +1157,41 @@ mod tests {
     fn verify_qc1_rejects_wrong_signer_count() {
         let c = committee(4);
         // n=4, f=1, q=3 — supply only 2 signers.
+        let mut signers = SignerBitfield::new(4);
+        signers.set(0);
+        signers.set(1);
         let qc1 = PcQc1::new(
             PcVector::new(std::iter::once(elem(1))),
-            vec![
-                PcCompactVote::new(ValidatorId::new(0), 1, None),
-                PcCompactVote::new(ValidatorId::new(1), 1, None),
-            ],
+            PositionalBundle::new(
+                signers,
+                vec![PcCompactVote::new(1, None), PcCompactVote::new(1, None)],
+            ),
             generate_bls_keypair().sign_v1(b"unused"),
         );
         assert!(!verify_qc1(&qc1, &net(), &ctx(), &c));
     }
 
-    /// QC1 carrying a non-committee `ValidatorId` in its signer list
-    /// must be rejected — this is the committee-membership gate.
+    /// QC1 with a signer-bitfield bit set outside the committee range
+    /// must be rejected — analogue of the prior non-committee-signer test
+    /// under positional encoding.
     #[test]
-    fn verify_qc1_rejects_non_committee_signer() {
+    fn verify_qc1_rejects_out_of_range_bitfield() {
         let c = committee(4);
+        // Size 8 bitfield with bits 0, 1, 7 set — 7 is outside the n=4 committee.
+        let mut signers = SignerBitfield::new(8);
+        signers.set(0);
+        signers.set(1);
+        signers.set(7);
         let qc1 = PcQc1::new(
             PcVector::empty(),
-            vec![
-                PcCompactVote::new(ValidatorId::new(0), 0, None),
-                PcCompactVote::new(ValidatorId::new(1), 0, None),
-                // 999 is outside the committee.
-                PcCompactVote::new(ValidatorId::new(999), 0, None),
-            ],
-            generate_bls_keypair().sign_v1(b"unused"),
-        );
-        assert!(!verify_qc1(&qc1, &net(), &ctx(), &c));
-    }
-
-    /// QC1 with a duplicate signer must be rejected — closes the
-    /// sub-quorum-inflation path.
-    #[test]
-    fn verify_qc1_rejects_duplicate_signer() {
-        let c = committee(4);
-        let qc1 = PcQc1::new(
-            PcVector::empty(),
-            vec![
-                PcCompactVote::new(ValidatorId::new(0), 0, None),
-                PcCompactVote::new(ValidatorId::new(1), 0, None),
-                // Duplicate of validator 1.
-                PcCompactVote::new(ValidatorId::new(1), 0, None),
-            ],
+            PositionalBundle::new(
+                signers,
+                vec![
+                    PcCompactVote::new(0, None),
+                    PcCompactVote::new(0, None),
+                    PcCompactVote::new(0, None),
+                ],
+            ),
             generate_bls_keypair().sign_v1(b"unused"),
         );
         assert!(!verify_qc1(&qc1, &net(), &ctx(), &c));
@@ -1274,7 +1284,7 @@ mod tests {
     fn reconstruct_compact_vote_rejects_non_unique_divergent() {
         let x = PcVector::new([elem(1), elem(2)]);
         // Diverges at position 0 but the "divergent" element IS x[0].
-        let cv = PcCompactVote::new(ValidatorId::new(0), 0, Some(elem(1)));
+        let cv = PcCompactVote::new(0, Some(elem(1)));
         assert!(reconstruct_compact_vote(&cv, &x).is_none());
     }
 

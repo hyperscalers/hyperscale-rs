@@ -52,12 +52,17 @@ mod tests {
     use sbor::prelude::*;
 
     use super::*;
-    use crate::{Bls12381G2Signature, PcCompactVote, PcQc1, PcVector, ValidatorId};
+    use crate::{
+        Bls12381G2Signature, PcCompactVote, PcQc1, PcVector, PositionalBundle, SignerBitfield,
+        ValidatorId,
+    };
 
     fn sample_qc1() -> PcQc1 {
+        let mut signers = SignerBitfield::new(4);
+        signers.set(0);
         PcQc1::new(
             PcVector::empty(),
-            vec![PcCompactVote::new(ValidatorId::new(0), 0, None)],
+            PositionalBundle::new(signers, vec![PcCompactVote::new(0, None)]),
             Bls12381G2Signature([0xAA; 96]),
         )
     }

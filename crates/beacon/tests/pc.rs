@@ -71,7 +71,7 @@ fn qc1_round_trip_n4() {
 
     let votes = round1_quorum(&cm, &network, &ctx, 3, &v_in);
     let refs: Vec<&PcVote1> = votes.iter().collect();
-    let qc1 = build_qc1(&refs, cm.len());
+    let qc1 = build_qc1(&refs, &cm.members);
 
     assert!(verify_qc1(&qc1, &network, &ctx, &cm.members));
 }
@@ -88,7 +88,7 @@ fn qc1_rejected_under_different_network() {
 
     let votes = round1_quorum(&cm, &network, &ctx, 3, &v_in);
     let refs: Vec<&PcVote1> = votes.iter().collect();
-    let qc1 = build_qc1(&refs, cm.len());
+    let qc1 = build_qc1(&refs, &cm.members);
 
     assert!(verify_qc1(&qc1, &network, &ctx, &cm.members));
     assert!(!verify_qc1(&qc1, &other_network, &ctx, &cm.members));
@@ -106,7 +106,7 @@ fn qc1_rejected_under_different_view() {
 
     let votes = round1_quorum(&cm, &network, &ctx_v0, 3, &v_in);
     let refs: Vec<&PcVote1> = votes.iter().collect();
-    let qc1 = build_qc1(&refs, cm.len());
+    let qc1 = build_qc1(&refs, &cm.members);
 
     assert!(verify_qc1(&qc1, &network, &ctx_v0, &cm.members));
     assert!(!verify_qc1(&qc1, &network, &ctx_v1, &cm.members));
@@ -125,7 +125,7 @@ fn qc3_round_trip_n4_all_agree() {
     // Round 1.
     let v1s = round1_quorum(&cm, &network, &ctx, 3, &v_in);
     let v1_refs: Vec<&PcVote1> = v1s.iter().collect();
-    let qc1 = build_qc1(&v1_refs, cm.len());
+    let qc1 = build_qc1(&v1_refs, &cm.members);
     assert!(verify_qc1(&qc1, &network, &ctx, &cm.members));
 
     // Round 2.
@@ -153,7 +153,7 @@ fn qc3_round_trip_n7_all_agree() {
 
     let v1s = round1_quorum(&cm, &network, &ctx, 5, &v_in);
     let v1_refs: Vec<&PcVote1> = v1s.iter().collect();
-    let qc1 = build_qc1(&v1_refs, cm.len());
+    let qc1 = build_qc1(&v1_refs, &cm.members);
     assert!(verify_qc1(&qc1, &network, &ctx, &cm.members));
 
     let v2s = round2_quorum(&cm, &network, &ctx, 5, &qc1);

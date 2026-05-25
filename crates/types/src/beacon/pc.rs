@@ -15,8 +15,8 @@ use sbor::prelude::*;
 
 use crate::primitives::signer_bitfield::MAX_VALIDATORS;
 use crate::{
-    Bls12381G2Signature, BoundedVec, Epoch, MAX_PREFIX_SIGS, MAX_VOTE_VECTOR_LEN, SignerBitfield,
-    SpcView, ValidatorId,
+    Bls12381G2Signature, BoundedVec, Epoch, MAX_PREFIX_SIGS, MAX_VOTE_VECTOR_LEN, PositionalBundle,
+    SignerBitfield, SpcView, ValidatorId,
 };
 
 // ── ValueElement and Vector ──────────────────────────────────────────────────
@@ -188,9 +188,11 @@ impl PcVote1 {
 /// `v_in_i` agree with `x` (always in `[0, |x|]`), and `divergent` is
 /// the first element past `shared_len` when one exists, `None` when
 /// `v_in_i` is a prefix of `x`.
+///
+/// Validator identity is carried positionally by the enclosing
+/// [`PositionalBundle`] in [`PcQc1::x_signers`].
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct PcCompactVote {
-    validator: ValidatorId,
     /// `|mcp(v_in_i, x)|` — fixed-width on the wire across host word
     /// sizes; bounded above by [`MAX_VOTE_VECTOR_LEN`].
     shared_len: u32,
@@ -202,22 +204,11 @@ pub struct PcCompactVote {
 impl PcCompactVote {
     /// Build a `PcCompactVote` from its parts.
     #[must_use]
-    pub const fn new(
-        validator: ValidatorId,
-        shared_len: u32,
-        divergent: Option<PcValueElement>,
-    ) -> Self {
+    pub const fn new(shared_len: u32, divergent: Option<PcValueElement>) -> Self {
         Self {
-            validator,
             shared_len,
             divergent,
         }
-    }
-
-    /// Signer this compact vote represents.
-    #[must_use]
-    pub const fn validator(&self) -> ValidatorId {
-        self.validator
     }
 
     /// Length of the maximum common prefix between the signer's
@@ -247,8 +238,8 @@ impl PcCompactVote {
 pub struct PcQc1 {
     x: PcVector,
     /// Round-1 quorum (`n - f` signers), each compact-encoded against
-    /// `x`.
-    x_signers: BoundedVec<PcCompactVote, MAX_VALIDATORS>,
+    /// `x`. Validator identity is positional in the bundle's bitfield.
+    x_signers: PositionalBundle<PcCompactVote>,
     /// Aggregate over each signer's `sig_i(v'_i)` — different-messages
     /// aggregate, since each `v'_i` may be a different length.
     x_agg_sig: Bls12381G2Signature,
@@ -256,15 +247,15 @@ pub struct PcQc1 {
 
 impl PcQc1 {
     /// Build a `PcQc1` from its parts.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `x_signers.len() > MAX_VALIDATORS`.
     #[must_use]
-    pub fn new(x: PcVector, x_signers: Vec<PcCompactVote>, x_agg_sig: Bls12381G2Signature) -> Self {
+    pub const fn new(
+        x: PcVector,
+        x_signers: PositionalBundle<PcCompactVote>,
+        x_agg_sig: Bls12381G2Signature,
+    ) -> Self {
         Self {
             x,
-            x_signers: x_signers.into(),
+            x_signers,
             x_agg_sig,
         }
     }
@@ -275,9 +266,9 @@ impl PcQc1 {
         &self.x
     }
 
-    /// Compact round-1 signer set.
+    /// Compact round-1 signer set, paired with positional validator ids.
     #[must_use]
-    pub const fn x_signers(&self) -> &BoundedVec<PcCompactVote, MAX_VALIDATORS> {
+    pub const fn x_signers(&self) -> &PositionalBundle<PcCompactVote> {
         &self.x_signers
     }
 
@@ -713,12 +704,18 @@ mod tests {
     }
 
     fn sample_qc1() -> PcQc1 {
+        let mut signers = SignerBitfield::new(4);
+        signers.set(0);
+        signers.set(1);
         PcQc1::new(
             sample_vector(3),
-            vec![
-                PcCompactVote::new(ValidatorId::new(0), 3, None),
-                PcCompactVote::new(ValidatorId::new(1), 2, Some(sample_value(99))),
-            ],
+            PositionalBundle::new(
+                signers,
+                vec![
+                    PcCompactVote::new(3, None),
+                    PcCompactVote::new(2, Some(sample_value(99))),
+                ],
+            ),
             sample_sig(0xAA),
         )
     }
