@@ -15,8 +15,8 @@
 use sbor::prelude::*;
 
 use crate::{
-    Bls12381G2Signature, Hash, PcQc3, PcVector, PcVote1, PcVote2, PcVote3, PositionalBundle,
-    SpcView, ValidatorId,
+    Bls12381G2Signature, GenesisConfigHash, Hash, PcQc3, PcVector, PcVote1, PcVote2, PcVote3,
+    PositionalBundle, SpcView, ValidatorId,
 };
 
 /// `(view, value, proof)` — a verifiable high triple.
@@ -92,17 +92,29 @@ pub struct SkipReport {
     pub reported_value_hash: Hash,
 }
 
-/// Certificate authorising entry into a view.
+/// Certificate authorising entry into a view, or — as the sole
+/// authenticator of a beacon block — a vacuous bootstrap for genesis.
 ///
-/// Either:
-/// - the previous view's verifiable high output ([`Self::Direct`]) —
-///   the simple case where the previous view succeeded — or
-/// - `f+1` empty-view attestations bundled into an indirect cert
-///   ([`Self::Indirect`]) — when the previous view failed, the next
+/// The three variants:
+/// - [`Self::Genesis`] is vacuously valid; the `config_hash` field
+///   binds the chain to a specific operator-supplied
+///   [`BeaconGenesisConfig`](crate::BeaconGenesisConfig).
+/// - [`Self::Direct`] is the previous view's verifiable high output —
+///   the simple case where the previous view succeeded.
+/// - [`Self::Indirect`] is `f+1` empty-view attestations bundled into
+///   an indirect cert — when the previous view failed, the next
 ///   leader skips ahead by pointing at the maximum-view triple any of
 ///   the skip signers reported.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub enum SpcCert {
+    /// Vacuously-valid bootstrap cert for the genesis block. `config_hash`
+    /// is the canonical hash of the operator's `BeaconGenesisConfig`;
+    /// verifiers reject any mismatch against the local config so two
+    /// operators with different TOMLs can't accidentally interoperate.
+    Genesis {
+        /// SBOR-canonical hash of `BeaconGenesisConfig`.
+        config_hash: GenesisConfigHash,
+    },
     /// `cert^dir(prev_view, value, proof)` — the verifiable high
     /// output of `prev_view`, authorising entry to `prev_view + 1`.
     Direct {

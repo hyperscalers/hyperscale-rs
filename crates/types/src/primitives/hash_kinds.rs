@@ -174,6 +174,19 @@ hash_newtype!(
 );
 
 hash_newtype!(
+    /// SBOR-canonical hash of a [`BeaconGenesisConfig`](crate::BeaconGenesisConfig).
+    ///
+    /// Embedded in [`SpcCert::Genesis`](crate::SpcCert) so the genesis
+    /// block's authenticator binds the chain to a specific operator
+    /// configuration. Two operators with different TOMLs produce
+    /// different `GenesisConfigHash`es and therefore different
+    /// `BeaconBlockHash`es at genesis — chains can't accidentally
+    /// merge.
+    pub GenesisConfigHash,
+    "GenesisConfigHash"
+);
+
+hash_newtype!(
     /// Root of a shard's monotonic beacon-witness accumulator at a
     /// given committed block.
     ///

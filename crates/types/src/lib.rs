@@ -66,9 +66,9 @@ pub use primitives::bloom::{BloomFilter, BloomKey, DEFAULT_FPR, MAX_BITS};
 pub use primitives::hash::{Hash, TypedHash};
 pub use primitives::hash_kinds::{
     BeaconBlockHash, BeaconProposalsRoot, BeaconStateRoot, BeaconWitnessRoot, BlockHash,
-    CertificateRoot, EventRoot, GlobalReceiptHash, GlobalReceiptRoot, LocalReceiptRoot,
-    ProvisionHash, ProvisionTxRoot, ProvisionsRoot, RecoveryCertHash, StateRoot, TransactionRoot,
-    TxHash, WaveReceiptHash, WritesRoot,
+    CertificateRoot, EventRoot, GenesisConfigHash, GlobalReceiptHash, GlobalReceiptRoot,
+    LocalReceiptRoot, ProvisionHash, ProvisionTxRoot, ProvisionsRoot, RecoveryCertHash, StateRoot,
+    TransactionRoot, TxHash, WaveReceiptHash, WritesRoot,
 };
 pub use primitives::identifiers::{
     Attempt, BeaconWitnessLeafCount, BlockHeight, Epoch, HeaderFetchCount, InFlightCount,
