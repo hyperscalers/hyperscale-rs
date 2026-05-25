@@ -10,12 +10,12 @@ use hyperscale_types::{
     BeaconBlock, BeaconState, BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash,
     BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PublicKey, CertificateRoot,
     CommittedBlockHeader, Epoch, ExecutionCertificate, ExecutionVote, FinalizedWave,
-    GlobalReceiptRoot, Hash, InFlightCount, LeafIndex, LocalReceiptRoot, NodeId, PcVector,
-    PcVoteRound, ProposerTimestamp, ProvisionHash, ProvisionTxRoot, Provisions, ProvisionsRoot,
+    GlobalReceiptRoot, Hash, InFlightCount, LeafIndex, LocalReceiptRoot, NodeId, PcQc1, PcQc2,
+    PcQc3, PcVector, ProposerTimestamp, ProvisionHash, ProvisionTxRoot, Provisions, ProvisionsRoot,
     QuorumCertificate, ReadySignal, RecoveryRequest, Round, RoutableTransaction, ShardGroupId,
-    SharedCertificates, SharedTransactions, SpcView, StateRoot, SubstateEntry, TopologySnapshot,
-    TransactionRoot, TransactionStatus, TxHash, TxOutcome, ValidatorId, VotePower, WaveId,
-    WeightedTimestamp,
+    SharedCertificates, SharedTransactions, SpcCert, SpcHighTriple, SpcView, StateRoot,
+    SubstateEntry, TopologySnapshot, TransactionRoot, TransactionStatus, TxHash, TxOutcome,
+    ValidatorId, VotePower, WaveId, WeightedTimestamp,
 };
 
 use crate::{CommitSource, FetchAbandon, FetchRequest, ProtocolEvent, TimerId};
@@ -791,31 +791,92 @@ pub enum Action {
     // ═══════════════════════════════════════════════════════════════════════
     // Beacon consensus
     // ═══════════════════════════════════════════════════════════════════════
-    /// Sign a PC inner-consensus vote with the local BLS key and ship it
-    /// to the SPC committee.
-    SignAndBroadcastPcVote {
+    /// Sign a PC round-1 vote over `v_in` and broadcast it to the SPC
+    /// committee. Handler reconstructs the canonical signing bytes
+    /// from `(epoch, view, v_in)`, signs with the local BLS key,
+    /// broadcasts the wire-form vote, and feeds the signed vote back
+    /// to the state machine via `ProtocolEvent::PcVoteReceived` with
+    /// `from = local validator`.
+    SignAndBroadcastPcVote1 {
         /// Epoch the PC instance belongs to.
         epoch: Epoch,
         /// SPC view this vote belongs to.
         view: SpcView,
-        /// Inner-PC round of the vote.
-        round: PcVoteRound,
-        /// PC vector value being signed.
-        value: PcVector,
-        /// SPC committee members the vote ships to.
+        /// Local input vector being signed as `v_in`.
+        v_in: PcVector,
+        /// SPC committee members the vote ships to (excluding self).
         recipients: Vec<ValidatorId>,
     },
 
-    /// Sign an SPC-level message and broadcast it. Payload is the
-    /// SBOR-encoded `SpcMessage` from `hyperscale_beacon::spc` — kept
-    /// opaque at the core layer so beacon-internal message types
-    /// don't bleed across the crate boundary.
-    SignAndBroadcastSpcMessage {
+    /// Sign a PC round-2 vote derived from `qc1` and broadcast it.
+    SignAndBroadcastPcVote2 {
+        /// Epoch the PC instance belongs to.
+        epoch: Epoch,
+        /// SPC view this vote belongs to.
+        view: SpcView,
+        /// Source round-1 QC; `v2.x == qc1.x` is enforced at the
+        /// signer.
+        qc1: Box<PcQc1>,
+        /// SPC committee members the vote ships to (excluding self).
+        recipients: Vec<ValidatorId>,
+    },
+
+    /// Sign a PC round-3 vote derived from `qc2` and broadcast it.
+    SignAndBroadcastPcVote3 {
+        /// Epoch the PC instance belongs to.
+        epoch: Epoch,
+        /// SPC view this vote belongs to.
+        view: SpcView,
+        /// Source round-2 QC; `v3.x_p == qc2.x_p` is enforced at the
+        /// signer.
+        qc2: Box<PcQc2>,
+        /// SPC committee members the vote ships to (excluding self).
+        recipients: Vec<ValidatorId>,
+    },
+
+    /// Sign an SPC empty-view attestation and broadcast it. Feeds the
+    /// signed message back to the state machine via
+    /// `ProtocolEvent::SpcMessageReceived` with `from = local
+    /// validator`.
+    SignAndBroadcastEmptyView {
         /// Epoch the SPC instance belongs to.
         epoch: Epoch,
-        /// Wire-form `SpcMessage` payload (SBOR-encoded by beacon).
-        payload: Vec<u8>,
-        /// SPC committee members the message ships to.
+        /// View this empty-view attestation skips.
+        view: SpcView,
+        /// Local max high triple reported in the attestation.
+        reported: Box<SpcHighTriple>,
+        /// SPC committee members the message ships to (excluding
+        /// self).
+        recipients: Vec<ValidatorId>,
+    },
+
+    /// Broadcast a `new-view` notification to the SPC committee — the
+    /// cert is already aggregated, no signing happens at the handler.
+    BroadcastSpcNewView {
+        /// Epoch the SPC instance belongs to.
+        epoch: Epoch,
+        /// View this notification authorises entry to.
+        view: SpcView,
+        /// Cert backing the authorisation.
+        cert: Box<SpcCert>,
+        /// SPC committee members the notification ships to (excluding
+        /// self).
+        recipients: Vec<ValidatorId>,
+    },
+
+    /// Broadcast a `new-commit` notification — the embedded `proof`
+    /// is a `PcQc3` that self-authenticates the committed value.
+    BroadcastSpcNewCommit {
+        /// Epoch the SPC instance belongs to.
+        epoch: Epoch,
+        /// View whose inner PC produced this commit.
+        view: SpcView,
+        /// Committed low value.
+        value: PcVector,
+        /// PC round-3 cert anchoring `value` as `proof.x_pp`.
+        proof: Box<PcQc3>,
+        /// SPC committee members the notification ships to (excluding
+        /// self).
         recipients: Vec<ValidatorId>,
     },
 
@@ -904,8 +965,12 @@ impl Action {
             | Self::BroadcastBlockHeader { .. }
             | Self::SignAndBroadcastBlockVote { .. }
             | Self::BroadcastCommittedBlockHeader { .. }
-            | Self::SignAndBroadcastPcVote { .. }
-            | Self::SignAndBroadcastSpcMessage { .. }
+            | Self::SignAndBroadcastPcVote1 { .. }
+            | Self::SignAndBroadcastPcVote2 { .. }
+            | Self::SignAndBroadcastPcVote3 { .. }
+            | Self::SignAndBroadcastEmptyView { .. }
+            | Self::BroadcastSpcNewView { .. }
+            | Self::BroadcastSpcNewCommit { .. }
             | Self::BroadcastBeaconBlock { .. }
             | Self::BroadcastRecoveryRequest { .. }
             | Self::FetchShardWitnesses { .. }
@@ -959,8 +1024,12 @@ impl Action {
                 ActionOwner::Provisions
             }
 
-            Self::SignAndBroadcastPcVote { .. }
-            | Self::SignAndBroadcastSpcMessage { .. }
+            Self::SignAndBroadcastPcVote1 { .. }
+            | Self::SignAndBroadcastPcVote2 { .. }
+            | Self::SignAndBroadcastPcVote3 { .. }
+            | Self::SignAndBroadcastEmptyView { .. }
+            | Self::BroadcastSpcNewView { .. }
+            | Self::BroadcastSpcNewCommit { .. }
             | Self::BroadcastBeaconBlock { .. }
             | Self::BroadcastRecoveryRequest { .. }
             | Self::FetchShardWitnesses { .. }

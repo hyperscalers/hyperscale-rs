@@ -668,7 +668,7 @@ pub enum SpcEffect {
 }
 
 /// One inner-PC vote tagged with its SPC view.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, sbor::BasicSbor)]
 pub enum VpcMsgPayload {
     /// Round-1 vote.
     Vote1 {
@@ -749,7 +749,7 @@ pub enum SpcEvent {
 /// for outbound, and reconstructs an `SpcEvent` via
 /// [`Self::into_event`] when a peer message arrives at the IO layer
 /// (which knows the sender id).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, sbor::BasicSbor)]
 pub enum SpcMessage {
     /// Inner-PC vote tagged with its SPC view.
     VpcMsg(Box<VpcMsgPayload>),

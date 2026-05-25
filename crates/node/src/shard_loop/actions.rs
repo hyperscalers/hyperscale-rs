@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use hyperscale_beacon::action_handlers as beacon_handlers;
+use hyperscale_beacon::action_handlers::handle_action as handle_beacon_action;
 use hyperscale_core::{
     Action, ActionContext, ActionOwner, CommitSource, FetchAbandon, FetchRequest, ProtocolEvent,
 };
@@ -79,8 +79,12 @@ where
             | Action::BroadcastCommittedBlockHeader { .. }
             | Action::SignAndSendExecutionVote { .. }
             | Action::BroadcastExecutionCertificate { .. }
-            | Action::SignAndBroadcastPcVote { .. }
-            | Action::SignAndBroadcastSpcMessage { .. }
+            | Action::SignAndBroadcastPcVote1 { .. }
+            | Action::SignAndBroadcastPcVote2 { .. }
+            | Action::SignAndBroadcastPcVote3 { .. }
+            | Action::SignAndBroadcastEmptyView { .. }
+            | Action::BroadcastSpcNewView { .. }
+            | Action::BroadcastSpcNewCommit { .. }
             | Action::BroadcastBeaconBlock { .. }
             | Action::BroadcastRecoveryRequest { .. }
             | Action::FetchShardWitnesses { .. }
@@ -638,7 +642,7 @@ where
                 ActionOwner::Shard => handle_shard_action(action, &ctx),
                 ActionOwner::Execution => handle_execution_action(action, &ctx),
                 ActionOwner::Provisions => handle_provisions_action(action, &ctx),
-                ActionOwner::Beacon => dispatch_beacon_action(action, &ctx),
+                ActionOwner::Beacon => handle_beacon_action(action, &ctx),
                 ActionOwner::Local => unreachable!(
                     "dispatch_delegated_action called with Local-owned action — \
                      process_action's outer match should have routed inline"
@@ -704,57 +708,4 @@ pub(in crate::shard_loop) fn handle_qc_only_commit_diverged(div: &QcOnlyDivergen
         expected_root = div.expected_root,
         computed_root = div.computed_root,
     );
-}
-
-/// Route a beacon-owned [`Action`] to its handler. Mirrors the
-/// per-variant pattern in `process_action`'s outer match: destructure
-/// the payload, call the matching helper from
-/// [`hyperscale_beacon::action_handlers`].
-fn dispatch_beacon_action<S, N>(action: Action, ctx: &ActionContext<'_, S, N>)
-where
-    S: ShardStorage,
-    N: Network,
-{
-    match action {
-        Action::SignAndBroadcastPcVote {
-            epoch,
-            view,
-            round,
-            value,
-            recipients,
-        } => {
-            beacon_handlers::sign_and_broadcast_pc_vote(ctx, epoch, view, round, value, recipients);
-        }
-        Action::SignAndBroadcastSpcMessage {
-            epoch,
-            payload,
-            recipients,
-        } => beacon_handlers::sign_and_broadcast_spc_message(ctx, epoch, payload, recipients),
-        Action::BroadcastBeaconBlock { block } => {
-            beacon_handlers::broadcast_beacon_block(ctx, block);
-        }
-        Action::BroadcastRecoveryRequest {
-            request,
-            recipients,
-        } => beacon_handlers::broadcast_recovery_request(ctx, request, recipients),
-        Action::FetchShardWitnesses {
-            shard_id,
-            committed_block_hash,
-            leaf_indices,
-            peers,
-        } => beacon_handlers::fetch_shard_witnesses(
-            ctx,
-            shard_id,
-            committed_block_hash,
-            leaf_indices,
-            peers,
-        ),
-        Action::VerifyBeaconRoot { kind, key, payload } => {
-            beacon_handlers::verify_beacon_root(ctx, kind, key, payload);
-        }
-        other => unreachable!(
-            "dispatch_beacon_action called with non-beacon action: {}",
-            other.type_name()
-        ),
-    }
 }
