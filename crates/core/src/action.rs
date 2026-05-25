@@ -15,7 +15,7 @@ use hyperscale_types::{
     QuorumCertificate, ReadySignal, RecoveryRequest, Round, RoutableTransaction, ShardGroupId,
     SharedCertificates, SharedTransactions, SpcCert, SpcHighTriple, SpcView, StateRoot,
     SubstateEntry, TopologySnapshot, TransactionRoot, TransactionStatus, TxHash, TxOutcome,
-    ValidatorId, VotePower, WaveId, WeightedTimestamp,
+    ValidatorId, VotePower, WaveId, WeightedTimestamp, Witness,
 };
 
 use crate::{CommitSource, FetchAbandon, FetchRequest, ProtocolEvent, TimerId};
@@ -880,6 +880,22 @@ pub enum Action {
         recipients: Vec<ValidatorId>,
     },
 
+    /// Sign a VRF reveal, build a `BeaconProposal` carrying
+    /// `witnesses`, and gossip it. Handler feeds the signed proposal
+    /// back to the state machine via
+    /// `ProtocolEvent::BeaconProposalReceived` with `from = local
+    /// validator` so the same admission path peer proposals use also
+    /// admits our own.
+    BuildAndBroadcastBeaconProposal {
+        /// Epoch this proposal targets; bound into the VRF reveal's
+        /// signing context.
+        epoch: Epoch,
+        /// Drained witnesses + equivocation evidence to embed in the
+        /// proposal. Order is preserved into `BeaconProposal::new`'s
+        /// `BoundedVec`.
+        witnesses: Vec<Witness>,
+    },
+
     /// Broadcast a finalized beacon block (post-SPC commit) over the
     /// beacon gossip topic.
     BroadcastBeaconBlock {
@@ -971,6 +987,7 @@ impl Action {
             | Self::SignAndBroadcastEmptyView { .. }
             | Self::BroadcastSpcNewView { .. }
             | Self::BroadcastSpcNewCommit { .. }
+            | Self::BuildAndBroadcastBeaconProposal { .. }
             | Self::BroadcastBeaconBlock { .. }
             | Self::BroadcastRecoveryRequest { .. }
             | Self::FetchShardWitnesses { .. }
@@ -1030,6 +1047,7 @@ impl Action {
             | Self::SignAndBroadcastEmptyView { .. }
             | Self::BroadcastSpcNewView { .. }
             | Self::BroadcastSpcNewCommit { .. }
+            | Self::BuildAndBroadcastBeaconProposal { .. }
             | Self::BroadcastBeaconBlock { .. }
             | Self::BroadcastRecoveryRequest { .. }
             | Self::FetchShardWitnesses { .. }

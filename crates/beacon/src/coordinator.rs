@@ -19,7 +19,8 @@ use std::sync::Arc;
 use hyperscale_core::{Action, TimerId};
 use hyperscale_types::{
     BeaconBlock, BeaconProposal, BeaconState, Bls12381G1PublicKey, Epoch, LocalTimestamp,
-    NetworkDefinition, RECOVERY_TIMEOUT, SpcMessage, ValidatorId, VpcMsgPayload, state_root,
+    NetworkDefinition, PcValueElement, PcVector, RECOVERY_TIMEOUT, SpcMessage, ValidatorId,
+    VpcMsgPayload, state_root,
 };
 use tracing::{trace, warn};
 
@@ -212,6 +213,12 @@ impl BeaconCoordinator {
     /// `IoLoop` has already authenticated `from` and verified the
     /// proposal's VRF reveal against `(network.id, epoch)` under
     /// `from`'s pubkey, so admission here is a pure pool insert.
+    ///
+    /// When the local validator's own proposal arrives back via the
+    /// action handler's feedback, this is also the trigger that
+    /// feeds SPC's view-1 PC instance — `compute_view_one_input`
+    /// reads the pool's current view of committee proposals and
+    /// `SpcEvent::Input` kicks the FSM into outbound traffic.
     pub fn on_beacon_proposal_received(
         &mut self,
         from: ValidatorId,
@@ -233,16 +240,87 @@ impl BeaconCoordinator {
                 pool_epoch = self.proposal_pool.epoch().inner(),
                 "BeaconProposalReceived rejected — wrong epoch or duplicate sender",
             );
+            return Vec::new();
+        }
+        if from == self.me && self.should_feed_view_one_input(epoch) {
+            return self.feed_view_one_input(epoch);
         }
         Vec::new()
+    }
+
+    /// Whether the current SPC instance is ready to receive its
+    /// view-1 `Input`: instance exists, drives `epoch`, and hasn't
+    /// been fed already.
+    fn should_feed_view_one_input(&self, epoch: Epoch) -> bool {
+        self.spc
+            .as_ref()
+            .is_some_and(|spc| spc.epoch() == epoch && !spc.view_one_input_fed())
+    }
+
+    /// Build view 1's local input vector from the current pool view
+    /// and drive it into SPC. Lifts the resulting effects.
+    fn feed_view_one_input(&mut self, epoch: Epoch) -> Vec<Action> {
+        let input = self.compute_view_one_input(epoch);
+        let recipients = self.spc_recipients();
+        let spc = self.spc.as_mut().expect("checked by should_feed");
+        let effects = spc.handle(SpcEvent::Input(input));
+        self.lift_spc_effects(epoch, &recipients, effects)
+    }
+
+    /// Build the PC input vector for view 1: one `PcValueElement` per
+    /// committee position, the hashed proposal if we've seen it or
+    /// `PcValueElement::ZERO` (`HASH_BOTTOM`) if not.
+    fn compute_view_one_input(&self, epoch: Epoch) -> PcVector {
+        let elements: Vec<PcValueElement> = self
+            .state
+            .committee
+            .iter()
+            .map(|id| {
+                self.proposal_pool
+                    .get(*id)
+                    .map_or(PcValueElement::ZERO, |p| p.pc_element_hash(epoch))
+            })
+            .collect();
+        PcVector::new(elements)
+    }
+
+    /// Local-proposal trigger: if the local validator is on the
+    /// committee, an SPC instance is bootstrapped, and we haven't
+    /// already proposed this epoch, emit
+    /// [`Action::BuildAndBroadcastBeaconProposal`] so the action
+    /// handler can VRF-sign and gossip. The signed proposal arrives
+    /// back via `on_beacon_proposal_received` which feeds SPC's
+    /// view-1 input.
+    pub fn try_propose(&mut self) -> Vec<Action> {
+        if self.spc.is_none() {
+            trace!("try_propose: no SPC instance — deferring");
+            return Vec::new();
+        }
+        if !self.is_on_committee() {
+            return Vec::new();
+        }
+        if self.proposal_pool.contains(self.me) {
+            // Already proposed this epoch; admission feedback path
+            // will (or did) feed SPC's input.
+            return Vec::new();
+        }
+        let epoch = self.proposal_pool.epoch();
+        // Witness + equivocation draining lands with the proposer-
+        // assembly wiring in a follow-up sub-commit. For now ship a
+        // VRF-only proposal so the FSM still has byte-distinct
+        // per-validator entries to commit on.
+        vec![Action::BuildAndBroadcastBeaconProposal {
+            epoch,
+            witnesses: Vec::new(),
+        }]
     }
 
     /// `TimerId::BeaconCommitteeStart` fired — the upcoming epoch's
     /// wall-clock boundary has been reached. If the local validator
     /// is on the next committee and no SPC instance is already
-    /// running, bootstrap one. The proposal-Input that kicks the FSM
-    /// into outbound traffic arrives via `try_propose` once witness
-    /// readiness is satisfied — this handler is pure state mutation.
+    /// running, bootstrap one and immediately invoke
+    /// [`Self::try_propose`] so the local `BeaconProposal` enters
+    /// the gossip + admission cycle.
     pub fn on_beacon_committee_start_timer(&mut self) -> Vec<Action> {
         if self.spc.is_some() {
             trace!("BeaconCommitteeStart fired with SPC already running");
@@ -253,7 +331,7 @@ impl BeaconCoordinator {
             return Vec::new();
         }
         self.bootstrap_spc_for_next_epoch();
-        Vec::new()
+        self.try_propose()
     }
 
     /// Stand up a fresh [`SpcInstance`] for the upcoming epoch.
@@ -682,10 +760,17 @@ mod tests {
         let mut coord = fresh_coord();
         assert!(coord.spc.is_none());
         let actions = coord.on_beacon_committee_start_timer();
-        assert!(actions.is_empty(), "bootstrap emits no actions");
         let spc = coord.spc.as_ref().expect("SPC bootstrapped");
         assert_eq!(spc.epoch(), Epoch::GENESIS.next());
         assert_eq!(spc.current_view(), SpcView::new(1));
+        // Bootstrap chains into try_propose which emits the
+        // local-proposal build-and-broadcast.
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::BuildAndBroadcastBeaconProposal { .. })),
+            "expected BuildAndBroadcastBeaconProposal in {actions:?}",
+        );
     }
 
     #[test]
@@ -755,5 +840,87 @@ mod tests {
         );
         assert!(actions.is_empty());
         assert!(coord.proposal_pool.is_empty());
+    }
+
+    #[test]
+    fn try_propose_emits_build_action_after_bootstrap() {
+        let mut coord = fresh_coord();
+        coord.bootstrap_spc_for_next_epoch();
+        let actions = coord.try_propose();
+        let in_flight = Epoch::GENESIS.next();
+        let [Action::BuildAndBroadcastBeaconProposal { epoch, witnesses }] = actions.as_slice()
+        else {
+            panic!("expected BuildAndBroadcastBeaconProposal, got {actions:?}");
+        };
+        assert_eq!(*epoch, in_flight);
+        assert!(witnesses.is_empty());
+    }
+
+    #[test]
+    fn try_propose_is_no_op_without_spc() {
+        let mut coord = fresh_coord();
+        assert!(coord.try_propose().is_empty());
+    }
+
+    #[test]
+    fn try_propose_is_no_op_off_committee() {
+        let (block, state) = genesis_pair();
+        let mut coord = BeaconCoordinator::new(
+            block,
+            state,
+            ValidatorId::new(99),
+            NetworkDefinition::simulator(),
+        );
+        // SPC won't bootstrap because off-committee, but try_propose
+        // gates first on `is_on_committee()`.
+        assert!(coord.try_propose().is_empty());
+    }
+
+    #[test]
+    fn try_propose_idempotent_after_own_proposal_in_pool() {
+        let mut coord = fresh_coord();
+        coord.bootstrap_spc_for_next_epoch();
+        let first = coord.try_propose();
+        assert!(!first.is_empty());
+        // Simulate the action-handler feedback path: own proposal
+        // arrives back.
+        let me = coord.me;
+        let in_flight = Epoch::GENESIS.next();
+        coord.on_beacon_proposal_received(me, in_flight, sample_proposal(0xAB));
+        // Second try_propose sees own entry in pool and drops.
+        assert!(coord.try_propose().is_empty());
+    }
+
+    #[test]
+    fn own_proposal_feedback_feeds_spc_view_one_input() {
+        let mut coord = fresh_coord();
+        coord.bootstrap_spc_for_next_epoch();
+        let me = coord.me;
+        let in_flight = Epoch::GENESIS.next();
+        assert!(!coord.spc.as_ref().unwrap().view_one_input_fed());
+        let actions = coord.on_beacon_proposal_received(me, in_flight, sample_proposal(0xAB));
+        // SPC's view-1 PC fires its sign-and-broadcast-vote-1 effect
+        // once we feed input; the lifter turns that into the
+        // matching beacon action.
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::SignAndBroadcastPcVote1 { .. })),
+            "expected SignAndBroadcastPcVote1 in {actions:?}",
+        );
+        assert!(coord.spc.as_ref().unwrap().view_one_input_fed());
+    }
+
+    #[test]
+    fn peer_proposal_does_not_trigger_view_one_input_feed() {
+        let mut coord = fresh_coord();
+        coord.bootstrap_spc_for_next_epoch();
+        let actions = coord.on_beacon_proposal_received(
+            ValidatorId::new(1), // peer, not self
+            Epoch::GENESIS.next(),
+            sample_proposal(0xAB),
+        );
+        assert!(actions.is_empty(), "peer proposal alone doesn't kick PC");
+        assert!(!coord.spc.as_ref().unwrap().view_one_input_fed());
     }
 }

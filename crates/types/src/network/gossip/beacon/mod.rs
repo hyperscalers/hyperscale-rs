@@ -12,7 +12,9 @@
 //! validators fetch witness contents on demand via request/response.
 
 mod beacon_block;
+mod proposal;
 mod recovery_request;
 
 pub use beacon_block::BeaconBlockGossip;
+pub use proposal::BeaconProposalGossip;
 pub use recovery_request::RecoveryRequestGossip;

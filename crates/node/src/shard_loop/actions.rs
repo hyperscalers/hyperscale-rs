@@ -85,6 +85,7 @@ where
             | Action::SignAndBroadcastEmptyView { .. }
             | Action::BroadcastSpcNewView { .. }
             | Action::BroadcastSpcNewCommit { .. }
+            | Action::BuildAndBroadcastBeaconProposal { .. }
             | Action::BroadcastBeaconBlock { .. }
             | Action::BroadcastRecoveryRequest { .. }
             | Action::FetchShardWitnesses { .. }

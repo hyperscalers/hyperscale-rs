@@ -854,6 +854,17 @@ impl SpcInstance {
         self.current_view
     }
 
+    /// Whether view 1's inner PC has been fed its `Input`. Coordinator
+    /// reads this to gate the local-proposal arrival path: once the
+    /// input is fed the PC FSM has started its round-trips and a
+    /// second feed would be a no-op anyway.
+    #[must_use]
+    pub fn view_one_input_fed(&self) -> bool {
+        self.views
+            .get(&SpcView::new(1))
+            .is_some_and(|v| v.vpc_input_fed)
+    }
+
     /// Latched low output, if any. View-1's inner PC produces this.
     #[must_use]
     pub const fn low_output(&self) -> Option<&PcVector> {
