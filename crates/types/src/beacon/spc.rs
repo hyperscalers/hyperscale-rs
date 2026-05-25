@@ -15,8 +15,8 @@
 use sbor::prelude::*;
 
 use crate::{
-    Bls12381G2Signature, BoundedVec, Hash, MAX_SKIP_SIGS, PcQc3, PcVector, PcVote1, PcVote2,
-    PcVote3, SpcView, ValidatorId,
+    Bls12381G2Signature, Hash, PcQc3, PcVector, PcVote1, PcVote2, PcVote3, PositionalBundle,
+    SpcView, ValidatorId,
 };
 
 /// `(view, value, proof)` — a verifiable high triple.
@@ -79,17 +79,17 @@ pub struct SpcEmptyLowEvidence {
 /// reported_value)` — committed as a hash so the indirect cert points
 /// to a *specific* high triple from a *specific* attestor, not any
 /// arbitrary valid `PcQc3` at `reported_view`.
+///
+/// Validator identity is carried positionally by the enclosing
+/// [`PositionalBundle`] in [`SpcCert::Indirect::skip_reports`]; the BLS
+/// signature is folded into the cert-level
+/// [`SpcCert::Indirect::skip_aggregate_sig`].
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
-pub struct SpcSkipSig {
-    /// Validator that signed this skip statement.
-    pub signer: ValidatorId,
+pub struct SkipReport {
     /// View of the signer's `max_high` at the time of the skip.
     pub reported_view: SpcView,
     /// Content hash of the signer's reported high value.
     pub reported_value_hash: Hash,
-    /// BLS signature over the canonical skip-statement bytes under the
-    /// empty-view tag.
-    pub sig: Bls12381G2Signature,
 }
 
 /// Certificate authorising entry into a view.
@@ -121,15 +121,19 @@ pub enum SpcCert {
     Indirect {
         /// View this cert authorises entry to.
         for_view: SpcView,
-        /// View of the parent triple — the maximum view in `skip_sigs`.
+        /// View of the parent triple — the maximum view in `skip_reports`.
         target_view: SpcView,
         /// Parent triple's high value at `target_view`.
         target_value: PcVector,
         /// Round-3 cert anchoring `target_value` in `target_view`'s
         /// inner PC.
         target_proof: PcQc3,
-        /// `Σ` — `f+1` skip statements, one per signer.
-        skip_sigs: BoundedVec<SpcSkipSig, MAX_SKIP_SIGS>,
+        /// `Σ` — `f+1` skip statements, paired positionally with the
+        /// signers' committee positions via the bundle's bitfield.
+        skip_reports: PositionalBundle<SkipReport>,
+        /// Different-messages BLS aggregate over each signer's BLS
+        /// signature on their canonical skip-target bytes.
+        skip_aggregate_sig: Bls12381G2Signature,
     },
 }
 
@@ -342,18 +346,17 @@ mod tests {
 
     #[test]
     fn cert_indirect_sbor_round_trip() {
-        let skip_sigs = vec![
-            SpcSkipSig {
-                signer: ValidatorId::new(0),
+        let mut signers = SignerBitfield::new(4);
+        signers.set(0);
+        signers.set(1);
+        let reports = vec![
+            SkipReport {
                 reported_view: SpcView::new(3),
                 reported_value_hash: Hash::from_bytes(b"value-a"),
-                sig: Bls12381G2Signature([0xAA; 96]),
             },
-            SpcSkipSig {
-                signer: ValidatorId::new(1),
+            SkipReport {
                 reported_view: SpcView::new(4),
                 reported_value_hash: Hash::from_bytes(b"value-b"),
-                sig: Bls12381G2Signature([0xBB; 96]),
             },
         ];
         let c = SpcCert::Indirect {
@@ -361,7 +364,8 @@ mod tests {
             target_view: SpcView::new(4),
             target_value: sample_pc_vector(2),
             target_proof: sample_pc_qc3(),
-            skip_sigs: skip_sigs.into(),
+            skip_reports: PositionalBundle::new(signers, reports),
+            skip_aggregate_sig: Bls12381G2Signature([0xCC; 96]),
         };
         let bytes = basic_encode(&c).unwrap();
         let decoded: SpcCert = basic_decode(&bytes).unwrap();

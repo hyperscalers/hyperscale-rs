@@ -39,7 +39,7 @@ pub use block::BeaconBlock;
 pub use header::BeaconBlockHeader;
 pub use limits::{
     MAX_BEACON_WITNESS_EVENTS_PER_TX, MAX_EXCLUDED_VALIDATORS, MAX_PREFIX_SIGS,
-    MAX_READY_SIGNALS_PER_BLOCK, MAX_READY_WINDOW_BLOCKS, MAX_SKIP_SIGS, MAX_VOTE_VECTOR_LEN,
+    MAX_READY_SIGNALS_PER_BLOCK, MAX_READY_WINDOW_BLOCKS, MAX_VOTE_VECTOR_LEN,
     MAX_WITNESS_PROOF_DEPTH, MAX_WITNESSES_PER_FETCH, MAX_WITNESSES_PER_PROPOSER,
 };
 pub use pc::{
@@ -53,8 +53,8 @@ pub use recovery::{
     RecoveryCertificate, RecoveryEquivocation, RecoveryRequest, recovery_cert_hash,
 };
 pub use spc::{
-    SpcCert, SpcEmptyLowEvidence, SpcEmptyViewMsg, SpcHighTriple, SpcMessage, SpcProposalObject,
-    SpcSkipSig, VpcMsgPayload,
+    SkipReport, SpcCert, SpcEmptyLowEvidence, SpcEmptyViewMsg, SpcHighTriple, SpcMessage,
+    SpcProposalObject, VpcMsgPayload,
 };
 pub use state::{
     BeaconState, CommitteeTransition, JailReason, PendingWithdrawal, ShardCommittee, SlotEffects,

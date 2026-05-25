@@ -44,11 +44,12 @@ use std::time::Duration;
 
 use blake3::Hasher;
 use hyperscale_types::{
-    Bls12381G1PrivateKey, Bls12381G1PublicKey, DOMAIN_PC_EMPTY_VIEW, Epoch, Hash,
-    NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PcQc1, PcQc2, PcQc3, PcValueElement, PcVector,
-    PcVoteEquivocation, SpcCert, SpcEmptyLowEvidence, SpcEmptyViewMsg, SpcHighTriple, SpcMessage,
-    SpcProposalObject, SpcSkipSig, SpcView, ValidatorId, VpcMsgPayload,
-    aggregate_verify_bls_different_messages, pc_context, pc_vote_signing_message, spc_context,
+    Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature, DOMAIN_PC_EMPTY_VIEW, Epoch,
+    Hash, NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PcQc1, PcQc2, PcQc3, PcValueElement, PcVector,
+    PcVoteEquivocation, PositionalBundle, SignerBitfield, SkipReport, SpcCert, SpcEmptyLowEvidence,
+    SpcEmptyViewMsg, SpcHighTriple, SpcMessage, SpcProposalObject, SpcView, ValidatorId,
+    VpcMsgPayload, aggregate_verify_bls_different_messages, pc_context, pc_vote_signing_message,
+    spc_context,
 };
 
 use crate::pc::{PcEffect, PcEvent, PcInstance, verify_qc3};
@@ -144,29 +145,6 @@ pub const fn rank_shift_for_view(view: SpcView, n: usize) -> usize {
 
 // ─── Verifiers ─────────────────────────────────────────────────────────────
 
-/// Verify one [`SpcSkipSig`] against the canonical
-/// `skip_target(empty_view, sig.reported_view, sig.reported_value_hash)`
-/// under the SPC instance context and [`DOMAIN_PC_EMPTY_VIEW`].
-///
-/// Internal to [`verify_indirect_cert`]; `pub` so the FSM can also
-/// gate ingestion of arriving skip statements without re-implementing
-/// the message construction.
-#[must_use]
-pub fn verify_skip_sig(
-    sig: &SpcSkipSig,
-    empty_view: SpcView,
-    network: &NetworkDefinition,
-    spc_ctx: &[u8],
-    committee: &[(ValidatorId, Bls12381G1PublicKey)],
-) -> bool {
-    let Some(pk) = pubkey_in_committee(committee, sig.signer) else {
-        return false;
-    };
-    let target = skip_target(empty_view, sig.reported_view, sig.reported_value_hash);
-    let msg = pc_vote_signing_message(network, DOMAIN_PC_EMPTY_VIEW, spc_ctx, &target);
-    aggregate_verify_bls_different_messages(&[msg.as_slice()], &sig.sig, &[pk])
-}
-
 /// Verify an [`SpcEmptyViewMsg`] — the signer attested to their
 /// `max_high` at the time of timing out on `msg.view`.
 ///
@@ -259,13 +237,15 @@ pub fn verify_cert(
             target_view,
             target_value,
             target_proof,
-            skip_sigs,
+            skip_reports,
+            skip_aggregate_sig,
         } => verify_indirect_cert(
             *for_view,
             *target_view,
             target_value,
             target_proof,
-            skip_sigs.as_slice(),
+            skip_reports,
+            *skip_aggregate_sig,
             entering_view,
             network,
             spc_ctx,
@@ -305,7 +285,8 @@ fn verify_indirect_cert(
     target_view: SpcView,
     target_value: &PcVector,
     target_proof: &PcQc3,
-    skip_sigs: &[SpcSkipSig],
+    skip_reports: &PositionalBundle<SkipReport>,
+    skip_aggregate_sig: Bls12381G2Signature,
     entering_view: SpcView,
     network: &NetworkDefinition,
     spc_ctx: &[u8],
@@ -321,38 +302,47 @@ fn verify_indirect_cert(
     }
     let n = committee.len();
     let f = byzantine_threshold(n);
-    if skip_sigs.len() < f + 1 {
+    if skip_reports.len() < f + 1 {
         return false;
     }
-    // Distinct signers.
-    let mut seen: BTreeSet<ValidatorId> = BTreeSet::new();
-    for sig in skip_sigs {
-        if !seen.insert(sig.signer) {
-            return false;
-        }
-    }
-    let empty_view = SpcView::new(entering_view.inner() - 1);
-    for sig in skip_sigs {
-        if !verify_skip_sig(sig, empty_view, network, spc_ctx, committee) {
-            return false;
-        }
-    }
     // Cert's target_view must equal max(reported_view) across Σ.
-    let max_reported = skip_sigs
+    let max_reported = skip_reports
         .iter()
-        .map(|s| s.reported_view)
+        .map(|(_, r)| r.reported_view)
         .max()
-        .expect("skip_sigs non-empty by f+1 threshold");
+        .expect("skip_reports non-empty by f+1 threshold");
     if target_view != max_reported {
         return false;
     }
     // Cert's target_value must hash to the value the max-reported
     // signer actually attested to.
     let target_value_hash = hash_high_value(target_value);
-    let max_signer_attests = skip_sigs
-        .iter()
-        .any(|s| s.reported_view == max_reported && s.reported_value_hash == target_value_hash);
+    let max_signer_attests = skip_reports.iter().any(|(_, r)| {
+        r.reported_view == max_reported && r.reported_value_hash == target_value_hash
+    });
     if !max_signer_attests {
+        return false;
+    }
+    // Aggregate-verify every skip statement under each signer's pubkey
+    // against the canonical skip-target bytes.
+    let empty_view = SpcView::new(entering_view.inner() - 1);
+    let mut pks: Vec<Bls12381G1PublicKey> = Vec::with_capacity(skip_reports.len());
+    let mut messages_owned: Vec<Vec<u8>> = Vec::with_capacity(skip_reports.len());
+    for (idx, report) in skip_reports.iter() {
+        let Some((_, pk)) = committee.get(idx) else {
+            return false;
+        };
+        let target = skip_target(empty_view, report.reported_view, report.reported_value_hash);
+        messages_owned.push(pc_vote_signing_message(
+            network,
+            DOMAIN_PC_EMPTY_VIEW,
+            spc_ctx,
+            &target,
+        ));
+        pks.push(*pk);
+    }
+    let messages: Vec<&[u8]> = messages_owned.iter().map(Vec::as_slice).collect();
+    if !aggregate_verify_bls_different_messages(&messages, &skip_aggregate_sig, &pks) {
         return false;
     }
     // Target proof verifies under target_view's PC ctx, and its x_pe
@@ -413,17 +403,19 @@ pub fn sign_empty_view_msg(
 /// messages.
 ///
 /// All inputs are assumed to verify against `empty_view` (callers run
-/// [`verify_empty_view_msg`] before pooling). The cert targets the
-/// triple whose `reported_view` is the maximum across the inputs —
-/// per the protocol invariant — and carries every signer's
-/// `(signer, reported_view, value_hash, sig)` quadruple for the
-/// indirect-cert verifier.
+/// [`verify_empty_view_msg`] before pooling). `committee` is required
+/// to resolve `ValidatorId`s to positional bits in the cert's signer
+/// bitfield. The cert targets the triple whose `reported_view` is the
+/// maximum across the inputs — per the protocol invariant — and folds
+/// every signer's individual BLS sig into a single different-messages
+/// aggregate.
 ///
 /// Returns `None` when:
 /// - `empty_view_msgs` is empty (no skip statements to aggregate)
 /// - `empty_view + 1` overflows the `SpcView` u32
 /// - any input message's `view` differs from `empty_view` (caller
 ///   passed mismatched skip statements)
+/// - any input message's signer is not present in `committee`
 ///
 /// Doesn't enforce `f + 1` threshold here — the verifier rejects
 /// short sets, but callers typically pool until they have `f + 1`
@@ -432,6 +424,7 @@ pub fn sign_empty_view_msg(
 pub fn build_indirect_cert(
     empty_view: SpcView,
     empty_view_msgs: &[SpcEmptyViewMsg],
+    committee: &[(ValidatorId, Bls12381G1PublicKey)],
 ) -> Option<SpcCert> {
     if empty_view_msgs.is_empty() {
         return None;
@@ -448,22 +441,34 @@ pub fn build_indirect_cert(
     let target_view = target_msg.reported.view;
     let target_proof = target_msg.reported.proof.clone();
 
-    let skip_sigs: Vec<SpcSkipSig> = empty_view_msgs
-        .iter()
-        .map(|m| SpcSkipSig {
-            signer: m.signer,
+    let n = committee.len();
+    let mut signers_bf = SignerBitfield::new(n);
+    let mut indexed: Vec<(usize, SkipReport, Bls12381G2Signature)> =
+        Vec::with_capacity(empty_view_msgs.len());
+    for m in empty_view_msgs {
+        let pos = committee.iter().position(|(id, _)| *id == m.signer)?;
+        if signers_bf.is_set(pos) {
+            continue;
+        }
+        signers_bf.set(pos);
+        let report = SkipReport {
             reported_view: m.reported.view,
             reported_value_hash: hash_high_value(&m.reported.value),
-            sig: m.sig,
-        })
-        .collect();
+        };
+        indexed.push((pos, report, m.sig));
+    }
+    indexed.sort_by_key(|(pos, _, _)| *pos);
+    let reports: Vec<SkipReport> = indexed.iter().map(|(_, r, _)| r.clone()).collect();
+    let sigs: Vec<Bls12381G2Signature> = indexed.iter().map(|(_, _, s)| *s).collect();
+    let skip_aggregate_sig = Bls12381G2Signature::aggregate(&sigs, true).ok()?;
 
     Some(SpcCert::Indirect {
         for_view,
         target_view,
         target_value,
         target_proof,
-        skip_sigs: skip_sigs.into(),
+        skip_reports: PositionalBundle::new(signers_bf, reports),
+        skip_aggregate_sig,
     })
 }
 
@@ -1215,7 +1220,7 @@ impl SpcInstance {
         // next view.
         view_state.indirect_cert_built = true;
         let msgs: Vec<SpcEmptyViewMsg> = view_state.empty_views.values().cloned().collect();
-        let Some(cert) = build_indirect_cert(view, &msgs) else {
+        let Some(cert) = build_indirect_cert(view, &msgs, &self.committee) else {
             // Shouldn't happen — the threshold check above guarantees
             // non-empty input and `view + 1` overflow is the only
             // other failure mode (only at u32 saturation).
@@ -1423,48 +1428,29 @@ mod tests {
             target_view: SpcView::new(0),
             target_value: PcVector::empty(),
             target_proof: dummy_pc_qc3(),
-            skip_sigs: vec![].into(),
+            skip_reports: PositionalBundle::empty(),
+            skip_aggregate_sig: generate_bls_keypair().sign_v1(b"unused"),
         };
         assert!(!verify_cert(&cert, SpcView::new(1), &net(), &ctx(), &c));
     }
 
-    /// Indirect cert with fewer than `f + 1` skip sigs is rejected.
+    /// Indirect cert with fewer than `f + 1` skip reports is rejected.
     #[test]
     fn verify_indirect_cert_rejects_under_quorum() {
         let c = committee(4); // n=4, f=1, threshold f+1=2.
-        let one_sig = SpcSkipSig {
-            signer: ValidatorId::new(0),
+        let mut signers = SignerBitfield::new(4);
+        signers.set(0);
+        let reports = vec![SkipReport {
             reported_view: SpcView::new(1),
             reported_value_hash: Hash::ZERO,
-            sig: generate_bls_keypair().sign_v1(b"unused"),
-        };
+        }];
         let cert = SpcCert::Indirect {
             for_view: SpcView::new(2),
             target_view: SpcView::new(1),
             target_value: PcVector::empty(),
             target_proof: dummy_pc_qc3(),
-            skip_sigs: vec![one_sig].into(),
-        };
-        assert!(!verify_cert(&cert, SpcView::new(2), &net(), &ctx(), &c));
-    }
-
-    /// Indirect cert with duplicate signers in `skip_sigs` is
-    /// rejected — closes a sub-quorum-inflation path.
-    #[test]
-    fn verify_indirect_cert_rejects_duplicate_signers() {
-        let c = committee(4);
-        let sig = SpcSkipSig {
-            signer: ValidatorId::new(0),
-            reported_view: SpcView::new(1),
-            reported_value_hash: Hash::ZERO,
-            sig: generate_bls_keypair().sign_v1(b"unused"),
-        };
-        let cert = SpcCert::Indirect {
-            for_view: SpcView::new(2),
-            target_view: SpcView::new(1),
-            target_value: PcVector::empty(),
-            target_proof: dummy_pc_qc3(),
-            skip_sigs: vec![sig.clone(), sig].into(),
+            skip_reports: PositionalBundle::new(signers, reports),
+            skip_aggregate_sig: generate_bls_keypair().sign_v1(b"unused"),
         };
         assert!(!verify_cert(&cert, SpcView::new(2), &net(), &ctx(), &c));
     }
@@ -1472,7 +1458,8 @@ mod tests {
     /// `build_indirect_cert` returns `None` on empty input.
     #[test]
     fn build_indirect_cert_returns_none_on_empty_input() {
-        assert!(build_indirect_cert(SpcView::new(1), &[]).is_none());
+        let c = committee(4);
+        assert!(build_indirect_cert(SpcView::new(1), &[], &c).is_none());
     }
 
     /// `build_indirect_cert` returns `None` when an input message's
@@ -1480,6 +1467,7 @@ mod tests {
     /// pooling skip statements from a different empty view.
     #[test]
     fn build_indirect_cert_rejects_mismatched_view() {
+        let c = committee(4);
         let kp = generate_bls_keypair();
         let msg = SpcEmptyViewMsg {
             view: SpcView::new(2),
@@ -1492,13 +1480,14 @@ mod tests {
             sig: kp.sign_v1(b"unused"),
         };
         // Caller asks for empty_view = 3 but supplies a msg for view 2.
-        assert!(build_indirect_cert(SpcView::new(3), std::slice::from_ref(&msg)).is_none());
+        assert!(build_indirect_cert(SpcView::new(3), std::slice::from_ref(&msg), &c).is_none());
     }
 
     /// `build_indirect_cert` picks the max-reported triple as target
-    /// and assembles `skip_sigs` from every input.
+    /// and assembles a populated `skip_reports` bundle from every input.
     #[test]
     fn build_indirect_cert_targets_max_reported() {
+        let c = committee(4);
         let kp_a = generate_bls_keypair();
         let kp_b = generate_bls_keypair();
         let kp_c = generate_bls_keypair();
@@ -1513,11 +1502,11 @@ mod tests {
             sig: bls_sign_unused(sk),
         };
         let msgs = vec![mk(0, 2, &kp_a), mk(1, 4, &kp_b), mk(2, 3, &kp_c)];
-        let cert = build_indirect_cert(SpcView::new(5), &msgs).expect("build succeeds");
+        let cert = build_indirect_cert(SpcView::new(5), &msgs, &c).expect("build succeeds");
         let SpcCert::Indirect {
             for_view,
             target_view,
-            skip_sigs,
+            skip_reports,
             ..
         } = cert
         else {
@@ -1525,7 +1514,7 @@ mod tests {
         };
         assert_eq!(for_view, SpcView::new(6));
         assert_eq!(target_view, SpcView::new(4)); // max of {2,4,3}
-        assert_eq!(skip_sigs.len(), 3);
+        assert_eq!(skip_reports.len(), 3);
     }
 
     fn bls_sign_unused(sk: &Bls12381G1PrivateKey) -> Bls12381G2Signature {

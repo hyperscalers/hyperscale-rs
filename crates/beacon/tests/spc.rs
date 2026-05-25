@@ -113,7 +113,7 @@ fn indirect_cert_round_trip() {
         assert!(verify_empty_view_msg(m, &network, &spc_ctx, &sim.members));
     }
 
-    let cert = build_indirect_cert(empty_view, &msgs).expect("build succeeds");
+    let cert = build_indirect_cert(empty_view, &msgs, &sim.members).expect("build succeeds");
     assert!(verify_cert(
         &cert,
         entering_view,
@@ -163,14 +163,15 @@ fn indirect_cert_with_swapped_target_value_rejected() {
             )
         })
         .collect();
-    let real_cert = build_indirect_cert(empty_view, &msgs).expect("build succeeds");
+    let real_cert = build_indirect_cert(empty_view, &msgs, &sim.members).expect("build succeeds");
 
     // Swap target_value/target_proof for triple_b's data, keeping
-    // the (skip_sigs over value_a's hash) intact.
+    // the (skip_reports over value_a's hash + aggregate sig) intact.
     let SpcCert::Indirect {
         for_view,
         target_view,
-        skip_sigs,
+        skip_reports,
+        skip_aggregate_sig,
         ..
     } = real_cert
     else {
@@ -181,7 +182,8 @@ fn indirect_cert_with_swapped_target_value_rejected() {
         target_view,
         target_value: qc3_b.x_pe().clone(),
         target_proof: qc3_b,
-        skip_sigs,
+        skip_reports,
+        skip_aggregate_sig,
     };
     assert!(
         !verify_cert(&forged, entering_view, &network, &spc_ctx, &sim.members),
