@@ -10,6 +10,7 @@
 //! [`TopologySnapshot`](hyperscale_types::TopologySnapshot) from
 //! `BeaconState` and exposes it via `current_topology_snapshot()`.
 
+pub mod block_sync;
 pub mod constants;
 pub mod coordinator;
 pub mod equivocations;

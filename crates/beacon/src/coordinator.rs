@@ -21,6 +21,7 @@ use hyperscale_types::{
     ValidatorId, state_root,
 };
 
+use crate::block_sync::BeaconBlockSyncManager;
 use crate::equivocations::EquivocationObservations;
 use crate::pending_blocks::PendingBeaconBlocks;
 use crate::recovery_tracker::RecoveryTracker;
@@ -69,6 +70,10 @@ pub struct BeaconCoordinator {
     /// Equivocation evidence the local vnode has observed but not
     /// yet proposed for inclusion.
     equivocations: EquivocationObservations,
+
+    /// Gap-fill sync state: target epoch, buffered blocks awaiting
+    /// their turn through `apply_epoch`, in-flight fetches.
+    sync: BeaconBlockSyncManager,
 
     me: ValidatorId,
 
@@ -122,6 +127,7 @@ impl BeaconCoordinator {
             witness_fetcher: ShardWitnessFetchTracker::new(),
             recovery_tracker: RecoveryTracker::new(),
             equivocations: EquivocationObservations::new(),
+            sync: BeaconBlockSyncManager::new(),
             me,
             me_sk,
             network,
@@ -188,6 +194,7 @@ impl std::fmt::Debug for BeaconCoordinator {
             .field("witness_pool", &self.witness_fetcher.total_pool_len())
             .field("recovery_buckets", &self.recovery_tracker.bucket_count())
             .field("equivocations", &self.equivocations.len())
+            .field("syncing", &self.sync.is_syncing())
             .finish_non_exhaustive()
     }
 }
