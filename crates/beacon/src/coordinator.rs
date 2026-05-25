@@ -21,8 +21,8 @@ use hyperscale_types::{
     BeaconBlock, BeaconBlockHeader, BeaconProposal, BeaconState, Bls12381G1PublicKey,
     Bls12381G2Signature, Epoch, LocalTimestamp, NetworkDefinition, PcValueElement, PcVector,
     RECOVERY_TIMEOUT, RecoveryCertificate, SignerBitfield, SpcMessage, ValidatorId, VpcMsgPayload,
-    beacon_block_header_message, compute_proposals_root, recovery_cert_hash, state_root,
-    verify_bls12381_v1,
+    aggregate_verify_bls_different_messages, beacon_block_header_message, compute_proposals_root,
+    recovery_cert_hash, state_root, verify_bls12381_v1,
 };
 use tracing::{trace, warn};
 
@@ -477,6 +477,143 @@ impl BeaconCoordinator {
         self.assemble_and_commit()
     }
 
+    /// A peer-aggregated [`BeaconBlock`] arrived via the beacon gossip
+    /// topic. Validate the block; if it matches the local pending
+    /// commit, adopt the peer's aggregate sig and advance state
+    /// instead of waiting on the local header-sig quorum. Otherwise
+    /// buffer in [`PendingBeaconBlocks`] for a future apply path.
+    ///
+    /// Adoption is the missed-quorum branch: pending commit's derived
+    /// `new_state` is already byte-identical to the new committed
+    /// state (the header binds it via `state_root`), so the local
+    /// sig pool just gets discarded.
+    ///
+    /// The passive-observer apply-epoch-from-peer-block path (for
+    /// vnodes not on the committee, which never set `commit_in_progress`)
+    /// stays unbuilt: those blocks land in `pending_blocks` and a
+    /// follow-up sub-commit will drive `apply_epoch` from the peer
+    /// block's proposals once the proposal-fetch protocol exists.
+    pub fn on_beacon_block_received(&mut self, block: Arc<BeaconBlock>) -> Vec<Action> {
+        let epoch = block.epoch();
+        if epoch <= self.state.current_epoch {
+            trace!(
+                epoch = epoch.inner(),
+                "BeaconBlockReceived for past/current epoch — dropping",
+            );
+            return Vec::new();
+        }
+        let expected_epoch = self.state.current_epoch.next();
+        if epoch > expected_epoch {
+            trace!(
+                epoch = epoch.inner(),
+                expected = expected_epoch.inner(),
+                "BeaconBlockReceived for future epoch — buffering",
+            );
+            self.pending_blocks.insert(block);
+            return Vec::new();
+        }
+
+        if block.header().prev_block_hash() != self.latest_block.block_hash() {
+            warn!(
+                epoch = epoch.inner(),
+                "BeaconBlockReceived with mismatched prev_block_hash — dropping",
+            );
+            return Vec::new();
+        }
+        if !self.verify_beacon_block_aggregate(&block) {
+            warn!(
+                epoch = epoch.inner(),
+                "BeaconBlockReceived failed aggregate-sig verification — dropping",
+            );
+            return Vec::new();
+        }
+
+        let Some(pending) = self.commit_in_progress.as_ref() else {
+            trace!(
+                epoch = epoch.inner(),
+                "BeaconBlockReceived without local pending commit — buffering",
+            );
+            self.pending_blocks.insert(block);
+            return Vec::new();
+        };
+        if block.block_hash() != pending.header.hash() {
+            warn!(
+                epoch = epoch.inner(),
+                "BeaconBlockReceived header differs from local pending commit — dropping",
+            );
+            return Vec::new();
+        }
+
+        self.adopt_peer_block(block)
+    }
+
+    /// Verify a `BeaconBlock`'s committee-aggregate signature against
+    /// the union of its signers' pubkeys, drawn from
+    /// `self.state.committee` at the bitfield's set positions.
+    ///
+    /// Mirrors [`crate::recovery::verify_recovery_cert`]'s shape: same
+    /// quorum threshold, same domain helper, same aggregate-verify
+    /// primitive.
+    fn verify_beacon_block_aggregate(&self, block: &BeaconBlock) -> bool {
+        let committee_size = self.state.committee.len();
+        if block.signers().num_validators() != committee_size {
+            return false;
+        }
+        if block.signer_count() < self.commit_quorum() {
+            return false;
+        }
+        let signer_pks: Vec<Bls12381G1PublicKey> = block
+            .signers()
+            .set_indices()
+            .filter_map(|i| {
+                let id = self.state.committee.get(i)?;
+                self.state.validators.get(id).map(|v| v.pubkey)
+            })
+            .collect();
+        if signer_pks.len() != block.signer_count() {
+            return false;
+        }
+        let msg = beacon_block_header_message(&self.network, block.header());
+        let msgs: Vec<&[u8]> = std::iter::repeat_n(msg.as_slice(), signer_pks.len()).collect();
+        aggregate_verify_bls_different_messages(&msgs, &block.aggregate_sig(), &signer_pks)
+    }
+
+    /// Peer-aggregated block matches the local pending commit: swap
+    /// in the peer's aggregate-sig'd block, advance state, reset
+    /// per-epoch caches, and bootstrap the next epoch if the local
+    /// validator is on the new committee.
+    ///
+    /// No `Action::BroadcastBeaconBlock` — the peer is already
+    /// disseminating it.
+    fn adopt_peer_block(&mut self, block: Arc<BeaconBlock>) -> Vec<Action> {
+        let pending = self
+            .commit_in_progress
+            .take()
+            .expect("adopt_peer_block requires a pending commit");
+
+        self.state = *pending.new_state;
+        self.latest_block = Arc::clone(&block);
+        self.spc = None;
+
+        let next_epoch = self.state.current_epoch.next();
+        self.proposal_pool.reset(next_epoch);
+        self.sig_pool.reset(next_epoch);
+        self.pending_blocks
+            .prune_committed(self.state.current_epoch);
+
+        let mut actions = vec![Action::CommitBeaconBlock {
+            block,
+            state: Box::new(self.state.clone()),
+        }];
+
+        if self.is_on_committee() {
+            self.bootstrap_spc_for_next_epoch();
+            actions.extend(self.try_propose());
+        }
+
+        actions
+    }
+
     /// Classic-BFT commit quorum over the beacon committee:
     /// `⌈2N/3⌉ + 1`. Mirrors `verify_recovery_cert`'s threshold.
     const fn commit_quorum(&self) -> usize {
@@ -779,6 +916,11 @@ impl BeaconCoordinator {
     pub const fn now(&self) -> LocalTimestamp {
         self.now
     }
+
+    #[must_use]
+    pub const fn has_pending_commit(&self) -> bool {
+        self.commit_in_progress.is_some()
+    }
 }
 
 impl std::fmt::Debug for BeaconCoordinator {
@@ -806,8 +948,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use hyperscale_types::{
-        BeaconBlock, Bls12381G1PublicKey, Epoch, NetworkDefinition, Randomness, ShardGroupId,
-        Stake, StakePoolId, ValidatorId, bls_keypair_from_seed, state_root,
+        BeaconBlock, BeaconBlockHash, BeaconBlockHeader, Bls12381G1PublicKey, Epoch,
+        NetworkDefinition, Randomness, ShardGroupId, Stake, StakePoolId, ValidatorId,
+        bls_keypair_from_seed, state_root,
     };
 
     use super::*;
@@ -1382,6 +1525,207 @@ mod tests {
         );
         assert!(actions.is_empty());
         assert!(coord.sig_pool.is_empty());
+    }
+
+    /// Build a syntactically valid `BeaconBlock` at `epoch` whose
+    /// aggregate sig is over the produced canonical-bytes — passes
+    /// [`verify_beacon_block_aggregate`] without needing to match any
+    /// particular pending commit. Roots are arbitrary; the verifier
+    /// only checks signer count, bitfield width, and BLS validity.
+    fn valid_block_at(
+        coord: &BeaconCoordinator,
+        epoch: Epoch,
+        prev_hash: BeaconBlockHash,
+    ) -> Arc<BeaconBlock> {
+        use hyperscale_types::{BeaconProposalsRoot, BeaconStateRoot, RecoveryCertHash};
+        let header = BeaconBlockHeader::new(
+            epoch,
+            prev_hash,
+            BeaconProposalsRoot::ZERO,
+            BeaconStateRoot::ZERO,
+            RecoveryCertHash::ZERO,
+        );
+        let msg = beacon_block_header_message(&coord.network, &header);
+        let mut sigs = Vec::with_capacity(coord.state.committee.len());
+        for id in &coord.state.committee {
+            sigs.push(beacon_sign(id.inner(), &msg));
+        }
+        let aggregate_sig = Bls12381G2Signature::aggregate(&sigs, true).unwrap();
+        let mut signers = SignerBitfield::new(coord.state.committee.len());
+        for i in 0..coord.state.committee.len() {
+            signers.set(i);
+        }
+        Arc::new(BeaconBlock::new(header, signers, aggregate_sig, None))
+    }
+
+    #[test]
+    fn on_beacon_block_received_drops_past_epoch() {
+        let mut coord = fresh_coord();
+        let prev = coord.latest_block.block_hash();
+        let block = valid_block_at(&coord, Epoch::GENESIS, prev);
+        let actions = coord.on_beacon_block_received(block);
+        assert!(actions.is_empty());
+        assert!(coord.pending_blocks.is_empty());
+        assert_eq!(coord.state.current_epoch, Epoch::GENESIS);
+    }
+
+    #[test]
+    fn on_beacon_block_received_buffers_future_epoch() {
+        let mut coord = fresh_coord();
+        let prev = coord.latest_block.block_hash();
+        // current = GENESIS = 0; expected = 1; future = 5.
+        let block = valid_block_at(&coord, Epoch::new(5), prev);
+        let block_hash = block.block_hash();
+        let actions = coord.on_beacon_block_received(block);
+        assert!(actions.is_empty());
+        assert_eq!(coord.pending_blocks.len(), 1);
+        assert!(coord.pending_blocks.contains_key(block_hash));
+        assert_eq!(coord.state.current_epoch, Epoch::GENESIS);
+    }
+
+    #[test]
+    fn on_beacon_block_received_drops_wrong_prev_hash() {
+        use hyperscale_types::BeaconBlockHash;
+        let mut coord = fresh_coord();
+        let block = valid_block_at(&coord, Epoch::new(1), BeaconBlockHash::ZERO);
+        let actions = coord.on_beacon_block_received(block);
+        assert!(actions.is_empty());
+        assert!(coord.pending_blocks.is_empty());
+    }
+
+    #[test]
+    fn on_beacon_block_received_drops_invalid_aggregate() {
+        use hyperscale_types::{
+            BeaconBlockHeader, BeaconProposalsRoot, BeaconStateRoot, RecoveryCertHash,
+        };
+        let mut coord = fresh_coord();
+        let prev = coord.latest_block.block_hash();
+        let header = BeaconBlockHeader::new(
+            Epoch::new(1),
+            prev,
+            BeaconProposalsRoot::ZERO,
+            BeaconStateRoot::ZERO,
+            RecoveryCertHash::ZERO,
+        );
+        // Full signer bitfield, but a zero (invalid) aggregate sig.
+        let mut signers = SignerBitfield::new(coord.state.committee.len());
+        for i in 0..coord.state.committee.len() {
+            signers.set(i);
+        }
+        let block = Arc::new(BeaconBlock::new(
+            header,
+            signers,
+            Bls12381G2Signature([0u8; 96]),
+            None,
+        ));
+        let actions = coord.on_beacon_block_received(block);
+        assert!(actions.is_empty());
+        assert!(coord.pending_blocks.is_empty());
+    }
+
+    #[test]
+    fn on_beacon_block_received_buffers_when_no_pending_commit() {
+        let mut coord = fresh_coord();
+        let prev = coord.latest_block.block_hash();
+        let block = valid_block_at(&coord, Epoch::new(1), prev);
+        let block_hash = block.block_hash();
+        // No commit_in_progress (we haven't reached OutputHigh) — block
+        // is valid but can't be adopted into the local apply path yet.
+        let actions = coord.on_beacon_block_received(block);
+        assert!(actions.is_empty());
+        assert_eq!(coord.pending_blocks.len(), 1);
+        assert!(coord.pending_blocks.contains_key(block_hash));
+    }
+
+    /// Drive a coordinator to `OutputHigh` + `commit_in_progress` using
+    /// the same path `quorum_sigs_commit_block_and_advance_state` uses,
+    /// then return the locally-derived header so a sibling coordinator
+    /// can synthesise the peer-aggregated block that triggers
+    /// adoption.
+    fn drive_to_pending_commit(coord: &mut BeaconCoordinator) -> (Epoch, BeaconBlockHeader) {
+        use hyperscale_types::PcVector;
+        coord.bootstrap_spc_for_next_epoch();
+        let in_flight = Epoch::GENESIS.next();
+        let committee = coord.state.committee.clone();
+        let mut elements = Vec::with_capacity(committee.len());
+        for id in &committee {
+            let p = sample_real_proposal(id.inner(), in_flight);
+            elements.push(p.pc_element_hash(in_flight));
+            coord.proposal_pool.admit(*id, in_flight, p);
+        }
+        let output = PcVector::new(elements);
+        let recipients = coord.spc_recipients();
+        let _ = coord.on_spc_output_high(in_flight, &output, &recipients);
+        let header = coord
+            .commit_in_progress
+            .as_ref()
+            .expect("OutputHigh stashed pending commit")
+            .header
+            .clone();
+        (in_flight, header)
+    }
+
+    #[test]
+    fn on_beacon_block_received_adopts_matching_peer_block() {
+        let mut coord = fresh_coord();
+        let (in_flight, header) = drive_to_pending_commit(&mut coord);
+        // Synthesise the peer-aggregated block that the rest of the
+        // committee would have built off the same `OutputHigh`. The
+        // sim's `assemble_and_commit` produces a byte-identical
+        // header across replicas, so we sign THIS header (which is
+        // also `commit_in_progress.header`) with every committee
+        // member.
+        let msg = beacon_block_header_message(&coord.network, &header);
+        let mut sigs = Vec::with_capacity(coord.state.committee.len());
+        for id in &coord.state.committee {
+            sigs.push(beacon_sign(id.inner(), &msg));
+        }
+        let aggregate_sig = Bls12381G2Signature::aggregate(&sigs, true).unwrap();
+        let mut signers = SignerBitfield::new(coord.state.committee.len());
+        for i in 0..coord.state.committee.len() {
+            signers.set(i);
+        }
+        let peer_block = Arc::new(BeaconBlock::new(header, signers, aggregate_sig, None));
+        let peer_block_hash = peer_block.block_hash();
+
+        let actions = coord.on_beacon_block_received(Arc::clone(&peer_block));
+
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::CommitBeaconBlock { .. })),
+            "expected CommitBeaconBlock in {actions:?}",
+        );
+        // Adoption skips BroadcastBeaconBlock — peer is disseminating.
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::BroadcastBeaconBlock { .. })),
+            "adoption path should not re-broadcast",
+        );
+        assert_eq!(coord.state.current_epoch, in_flight);
+        assert_eq!(coord.latest_block.block_hash(), peer_block_hash);
+        assert!(coord.commit_in_progress.is_none());
+        assert!(coord.spc.is_some(), "next epoch's SPC should bootstrap");
+    }
+
+    #[test]
+    fn on_beacon_block_received_drops_when_header_differs_from_pending() {
+        let mut coord = fresh_coord();
+        let (_in_flight, _header) = drive_to_pending_commit(&mut coord);
+        // Build a block at the right epoch with the right prev_hash
+        // but DIFFERENT header roots — won't match `commit_in_progress`
+        // even though the aggregate sig is valid.
+        let prev = coord.latest_block.block_hash();
+        let other_block = valid_block_at(&coord, Epoch::new(1), prev);
+        let pending_hash_before = coord.commit_in_progress.as_ref().unwrap().header.hash();
+        assert_ne!(other_block.block_hash(), pending_hash_before);
+
+        let actions = coord.on_beacon_block_received(other_block);
+        assert!(actions.is_empty());
+        // Pending commit still in place; state still at genesis.
+        assert!(coord.commit_in_progress.is_some());
+        assert_eq!(coord.state.current_epoch, Epoch::GENESIS);
     }
 
     #[test]

@@ -11,7 +11,10 @@
 
 mod common;
 
+use std::sync::Arc;
+
 use common::CoordinatorSim;
+use hyperscale_core::Action;
 use hyperscale_types::{Epoch, compute_proposals_root};
 
 /// Three epochs is enough to exercise the closed loop more than once:
@@ -101,4 +104,62 @@ fn cluster_commits_non_empty_proposal_set_per_epoch() {
         "committed block's proposals_root matches the empty-input case — view-1 PC \
          collapsed to all-HASH_BOTTOMs",
     );
+}
+
+#[test]
+fn missed_quorum_replica_adopts_peer_block() {
+    // Sim A: full honest path → capture the committed block to feed
+    // into sim B as the "peer-aggregated" block.
+    let seed = 0xADD0;
+    let mut sim_a = CoordinatorSim::new(4, seed);
+    sim_a.kick_off();
+    sim_a.run_until_committed(1, MAX_STEPS);
+    let peer_block = Arc::clone(&sim_a.commits[0][0].block);
+    let expected_state = sim_a.commits[0][0].state.clone();
+
+    // Sim B: byte-identical setup; suppress sig delivery to replica 0
+    // so its sig pool can't reach quorum. Drive until peers commit.
+    let mut sim_b = CoordinatorSim::new(4, seed);
+    sim_b.suppress_sig_delivery_to(0);
+    sim_b.kick_off();
+    let mut steps = 0;
+    while sim_b.commits[1].is_empty() || sim_b.commits[2].is_empty() || sim_b.commits[3].is_empty()
+    {
+        assert!(
+            steps < MAX_STEPS,
+            "sig-suppressed sim never reached peer-commit",
+        );
+        assert!(sim_b.step(), "sig-suppressed sim went quiescent early");
+        steps += 1;
+    }
+
+    // Replica 0 has no commits and is sitting in `commit_in_progress`.
+    assert!(sim_b.commits[0].is_empty());
+    assert!(
+        sim_b.coordinators[0].has_pending_commit(),
+        "replica 0 should be holding a pending commit",
+    );
+
+    // Inject sim A's block: replica 0 adopts via the missed-quorum
+    // path.
+    let actions = sim_b.deliver_block_to(0, Arc::clone(&peer_block));
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, Action::CommitBeaconBlock { .. })),
+        "expected CommitBeaconBlock in {actions:?}",
+    );
+    assert!(
+        !actions
+            .iter()
+            .any(|a| matches!(a, Action::BroadcastBeaconBlock { .. })),
+        "adoption path must not re-broadcast: {actions:?}",
+    );
+
+    // Replica 0 captured its commit and the (block, state) pair
+    // matches sim A's byte-for-byte.
+    assert_eq!(sim_b.commits[0].len(), 1);
+    let adopted = &sim_b.commits[0][0];
+    assert_eq!(adopted.block.block_hash(), peer_block.block_hash());
+    assert_eq!(adopted.state, expected_state);
 }

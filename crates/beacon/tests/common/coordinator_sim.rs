@@ -13,7 +13,7 @@
 //! PC commits all-`HASH_BOTTOM`s every epoch — the honest path still
 //! terminates but exercises an uninteresting branch.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use hyperscale_beacon::constants::{BEACON_SIGNER_COUNT, MIN_STAKE_FLOOR};
@@ -81,6 +81,10 @@ pub struct CoordinatorSim {
     pub commits: Vec<Vec<CapturedCommit>>,
     network_q: VecDeque<Envelope>,
     loopback_q: VecDeque<Envelope>,
+    /// Replicas whose header-sig deliveries (both peer-bound and the
+    /// emitter's own loopback) are dropped at enqueue time. Set up via
+    /// [`Self::suppress_sig_delivery_to`] for adoption-path tests.
+    sig_suppressed: BTreeSet<usize>,
 }
 
 impl CoordinatorSim {
@@ -160,7 +164,29 @@ impl CoordinatorSim {
             commits: (0..n).map(|_| Vec::new()).collect(),
             network_q: VecDeque::new(),
             loopback_q: VecDeque::new(),
+            sig_suppressed: BTreeSet::new(),
         }
+    }
+
+    /// Suppress all subsequent `BeaconBlockSig` deliveries — both
+    /// peer-bound broadcasts and the emitter's own loopback feedback —
+    /// addressed to `replica_idx`. Replica `replica_idx` then sits in
+    /// `commit_in_progress` after its SPC reaches `OutputHigh`,
+    /// modelling a missed-quorum vnode that must adopt a peer-built
+    /// `BeaconBlock` instead of closing the local sig pool.
+    pub fn suppress_sig_delivery_to(&mut self, replica_idx: usize) {
+        self.sig_suppressed.insert(replica_idx);
+    }
+
+    /// Hand `block` directly to `replica_idx` via
+    /// `on_beacon_block_received` and absorb any actions it emits.
+    /// Returns the actions the handler produced — useful for asserting
+    /// `CommitBeaconBlock` was emitted on the adoption path.
+    pub fn deliver_block_to(&mut self, replica_idx: usize, block: Arc<BeaconBlock>) -> Vec<Action> {
+        let actions = self.coordinators[replica_idx].on_beacon_block_received(block);
+        let returned = actions.clone();
+        self.absorb(replica_idx, actions);
+        returned
     }
 
     /// Number of replicas.
@@ -400,6 +426,9 @@ impl CoordinatorSim {
                 let sig = self.sks[emitter_idx].sign_v1(&msg);
                 for rcpt in &recipients {
                     let to_idx = self.idx_of(*rcpt);
+                    if self.sig_suppressed.contains(&to_idx) {
+                        continue;
+                    }
                     self.network_q.push_back(Envelope {
                         to_idx,
                         event: SimEvent::BeaconBlockSig {
@@ -409,14 +438,16 @@ impl CoordinatorSim {
                         },
                     });
                 }
-                self.loopback_q.push_back(Envelope {
-                    to_idx: emitter_idx,
-                    event: SimEvent::BeaconBlockSig {
-                        from: me,
-                        epoch,
-                        sig,
-                    },
-                });
+                if !self.sig_suppressed.contains(&emitter_idx) {
+                    self.loopback_q.push_back(Envelope {
+                        to_idx: emitter_idx,
+                        event: SimEvent::BeaconBlockSig {
+                            from: me,
+                            epoch,
+                            sig,
+                        },
+                    });
+                }
             }
             Action::CommitBeaconBlock { block, state } => {
                 self.commits[emitter_idx].push(CapturedCommit {
