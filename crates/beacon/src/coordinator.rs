@@ -18,10 +18,11 @@ use std::sync::Arc;
 
 use hyperscale_core::{Action, TimerId};
 use hyperscale_types::{
-    BeaconBlock, BeaconBlockHeader, BeaconProposal, BeaconState, Bls12381G1PublicKey, Epoch,
-    LocalTimestamp, NetworkDefinition, PcValueElement, PcVector, RECOVERY_TIMEOUT,
-    RecoveryCertificate, SpcMessage, ValidatorId, VpcMsgPayload, compute_proposals_root,
-    recovery_cert_hash, state_root,
+    BeaconBlock, BeaconBlockHeader, BeaconProposal, BeaconState, Bls12381G1PublicKey,
+    Bls12381G2Signature, Epoch, LocalTimestamp, NetworkDefinition, PcValueElement, PcVector,
+    RECOVERY_TIMEOUT, RecoveryCertificate, SignerBitfield, SpcMessage, ValidatorId, VpcMsgPayload,
+    beacon_block_header_message, compute_proposals_root, recovery_cert_hash, state_root,
+    verify_bls12381_v1,
 };
 use tracing::{trace, warn};
 
@@ -31,6 +32,7 @@ use crate::equivocations::EquivocationObservations;
 use crate::pending_blocks::PendingBeaconBlocks;
 use crate::proposal_pool::BeaconProposalPool;
 use crate::recovery_tracker::RecoveryTracker;
+use crate::sig_pool::BeaconBlockSigPool;
 use crate::spc::{SpcEffect, SpcEvent, SpcInstance};
 use crate::state::apply_epoch;
 use crate::verification::BeaconVerificationPipeline;
@@ -100,10 +102,15 @@ pub struct BeaconCoordinator {
     /// reset on commit.
     proposal_pool: BeaconProposalPool,
 
+    /// Per-epoch cache of header sigs collected post-OutputHigh; the
+    /// committee aggregate over the header is built from this pool
+    /// once quorum lands.
+    sig_pool: BeaconBlockSigPool,
+
     /// Set after SPC's `OutputHigh` lands and `apply_epoch` has run:
     /// the post-apply state, the header derived from it, and any
-    /// attached recovery cert. The aggregator (B.8.c.iv) uses this
-    /// once the committee's header sigs gather to quorum.
+    /// attached recovery cert. The aggregator uses this once the
+    /// committee's header sigs gather to quorum.
     commit_in_progress: Option<PendingCommit>,
 
     me: ValidatorId,
@@ -156,6 +163,7 @@ impl BeaconCoordinator {
             equivocations: EquivocationObservations::new(),
             sync: BeaconBlockSyncManager::new(),
             proposal_pool: BeaconProposalPool::new(next_epoch),
+            sig_pool: BeaconBlockSigPool::new(next_epoch),
             commit_in_progress: None,
             me,
             network,
@@ -403,6 +411,149 @@ impl BeaconCoordinator {
         let epoch = spc.epoch();
         let effects = spc.handle(event);
         self.lift_spc_effects(epoch, &recipients, effects)
+    }
+
+    /// A peer committee member's header sig arrived. Gate on
+    /// committee membership + epoch matches the pending commit +
+    /// sig verifies under `from`'s pubkey against the locally-derived
+    /// header bytes; admit on success. On quorum, aggregate sigs,
+    /// build the `BeaconBlock`, advance `state` / `latest_block`,
+    /// emit commit + broadcast actions, and bootstrap the next
+    /// epoch's `SpcInstance` if local is on the new committee.
+    pub fn on_beacon_block_sig_received(
+        &mut self,
+        from: ValidatorId,
+        epoch: Epoch,
+        sig: Bls12381G2Signature,
+    ) -> Vec<Action> {
+        if !self.state.committee.contains(&from) {
+            trace!(
+                ?from,
+                epoch = epoch.inner(),
+                "BeaconBlockSig from non-committee sender — dropping",
+            );
+            return Vec::new();
+        }
+        let Some(pending) = self.commit_in_progress.as_ref() else {
+            trace!(
+                ?from,
+                epoch = epoch.inner(),
+                "BeaconBlockSig with no pending commit — dropping",
+            );
+            return Vec::new();
+        };
+        if pending.epoch != epoch {
+            trace!(
+                ?from,
+                sig_epoch = epoch.inner(),
+                pending_epoch = pending.epoch.inner(),
+                "BeaconBlockSig epoch mismatch — dropping",
+            );
+            return Vec::new();
+        }
+        let Some(pubkey) = self.state.validators.get(&from).map(|v| v.pubkey) else {
+            warn!(
+                ?from,
+                "BeaconBlockSig from validator absent from `state.validators` — dropping",
+            );
+            return Vec::new();
+        };
+        let msg = beacon_block_header_message(&self.network, &pending.header);
+        if !verify_bls12381_v1(&msg, &pubkey, &sig) {
+            warn!(
+                ?from,
+                epoch = epoch.inner(),
+                "BeaconBlockSig failed verification — dropping",
+            );
+            return Vec::new();
+        }
+        if !self.sig_pool.admit(from, epoch, sig) {
+            trace!(?from, "BeaconBlockSig admission rejected (duplicate)");
+            return Vec::new();
+        }
+        if self.sig_pool.len() < self.commit_quorum() {
+            return Vec::new();
+        }
+        self.assemble_and_commit()
+    }
+
+    /// Classic-BFT commit quorum over the beacon committee:
+    /// `⌈2N/3⌉ + 1`. Mirrors `verify_recovery_cert`'s threshold.
+    const fn commit_quorum(&self) -> usize {
+        let n = self.state.committee.len();
+        (2 * n).div_ceil(3) + 1
+    }
+
+    /// Sig pool reached quorum: aggregate, build the `BeaconBlock`,
+    /// advance `self.state` / `self.latest_block` from the pending
+    /// commit, emit commit + broadcast actions, reset per-epoch
+    /// caches, and bootstrap the next epoch's `SpcInstance` if local
+    /// is on the new committee.
+    fn assemble_and_commit(&mut self) -> Vec<Action> {
+        let pending = self.commit_in_progress.take().expect("checked by caller");
+
+        let mut signers = SignerBitfield::new(self.state.committee.len());
+        let mut sigs = Vec::with_capacity(self.sig_pool.len());
+        for (signer, sig) in self.sig_pool.iter() {
+            // `position` is in O(n) per signer — committee sizes are
+            // small (≤ BEACON_SIGNER_COUNT). Worth a re-look if the
+            // committee grows.
+            let Some(idx) = self.state.committee.iter().position(|v| v == signer) else {
+                warn!(
+                    ?signer,
+                    "sig from committee member with no position — skipping"
+                );
+                continue;
+            };
+            signers.set(idx);
+            sigs.push(*sig);
+        }
+
+        let aggregate_sig = match Bls12381G2Signature::aggregate(&sigs, true) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "BLS aggregate failed — commit deferred");
+                // Replant the pending commit so a future sig can
+                // retry. The pool already has the sigs.
+                self.commit_in_progress = Some(pending);
+                return Vec::new();
+            }
+        };
+
+        let block = BeaconBlock::new(
+            pending.header,
+            signers,
+            aggregate_sig,
+            pending.recovery_cert.map(|c| *c),
+        );
+        let block_arc = Arc::new(block);
+
+        // Advance committed state.
+        self.state = *pending.new_state;
+        self.latest_block = Arc::clone(&block_arc);
+        self.spc = None;
+
+        // Reset per-epoch caches for the next in-flight epoch.
+        let next_epoch = self.state.current_epoch.next();
+        self.proposal_pool.reset(next_epoch);
+        self.sig_pool.reset(next_epoch);
+
+        let mut actions = vec![
+            Action::CommitBeaconBlock {
+                block: Arc::clone(&block_arc),
+                state: Box::new(self.state.clone()),
+            },
+            Action::BroadcastBeaconBlock { block: block_arc },
+        ];
+
+        // Bootstrap the next epoch's SPC if the new committee
+        // includes us, and kick try_propose.
+        if self.is_on_committee() {
+            self.bootstrap_spc_for_next_epoch();
+            actions.extend(self.try_propose());
+        }
+
+        actions
     }
 
     /// SPC has decided this epoch — apply the committed proposal
@@ -1098,6 +1249,139 @@ mod tests {
 
         // The pre-commit state on the coordinator is untouched.
         assert_eq!(coord.state.current_epoch, Epoch::GENESIS);
+    }
+
+    fn beacon_sign(seed: u64, msg: &[u8]) -> Bls12381G2Signature {
+        let mut s = [0u8; 32];
+        s[..8].copy_from_slice(&seed.to_le_bytes());
+        bls_keypair_from_seed(&s).sign_v1(msg)
+    }
+
+    /// Build a real VRF-signed proposal for validator `seed` at
+    /// `epoch`. Required for `apply_epoch` flows: fake VRFs jail
+    /// every committee member on the Performance counter.
+    fn sample_real_proposal(seed: u64, epoch: Epoch) -> Arc<BeaconProposal> {
+        use hyperscale_types::vrf_sign;
+        let mut s = [0u8; 32];
+        s[..8].copy_from_slice(&seed.to_le_bytes());
+        let sk = bls_keypair_from_seed(&s);
+        let (output, proof) = vrf_sign(&sk, &NetworkDefinition::simulator(), epoch);
+        Arc::new(BeaconProposal::vrf_only(output, proof))
+    }
+
+    /// Drive an honest n=4 commit flow end-to-end: bootstrap, drain
+    /// the local proposal back into the pool, populate peer
+    /// proposals, force `OutputHigh`, gather quorum sigs, assert
+    /// state and `latest_block` advance and a fresh SPC bootstraps.
+    #[test]
+    fn quorum_sigs_commit_block_and_advance_state() {
+        use hyperscale_types::{PcVector, beacon_block_header_message};
+        let mut coord = fresh_coord();
+        coord.bootstrap_spc_for_next_epoch();
+        let in_flight = Epoch::GENESIS.next();
+        let committee = coord.state.committee.clone();
+        // Populate the pool with every committee member's REAL
+        // VRF-signed proposal. Fake VRFs would jail every member on
+        // the Performance counter during `apply_epoch`, leaving the
+        // next committee empty and skipping the bootstrap path.
+        let mut elements = Vec::with_capacity(committee.len());
+        for id in &committee {
+            let p = sample_real_proposal(id.inner(), in_flight);
+            elements.push(p.pc_element_hash(in_flight));
+            coord.proposal_pool.admit(*id, in_flight, p);
+        }
+        let output = PcVector::new(elements);
+        let recipients = coord.spc_recipients();
+        let _ = coord.on_spc_output_high(in_flight, &output, &recipients);
+        let pending_header = coord
+            .commit_in_progress
+            .as_ref()
+            .expect("OutputHigh stashed pending commit")
+            .header
+            .clone();
+        let msg = beacon_block_header_message(&coord.network, &pending_header);
+
+        // Quorum for n=4 is ⌈8/3⌉+1 = 4: every signer needs to
+        // contribute. Sign as each committee member (seeds match
+        // `sample_genesis()`).
+        let mut last_actions = Vec::new();
+        for id in &committee {
+            let sig = beacon_sign(id.inner(), &msg);
+            last_actions = coord.on_beacon_block_sig_received(*id, in_flight, sig);
+        }
+
+        // Final admission triggered assembly: commit + broadcast +
+        // (try_propose for next epoch).
+        assert!(
+            last_actions
+                .iter()
+                .any(|a| matches!(a, Action::CommitBeaconBlock { .. })),
+            "expected CommitBeaconBlock in {last_actions:?}",
+        );
+        assert!(
+            last_actions
+                .iter()
+                .any(|a| matches!(a, Action::BroadcastBeaconBlock { .. })),
+            "expected BroadcastBeaconBlock in {last_actions:?}",
+        );
+
+        // State advanced; latest_block points at the new block.
+        assert_eq!(coord.state.current_epoch, in_flight);
+        assert_eq!(coord.latest_block.epoch(), in_flight);
+        assert!(coord.commit_in_progress.is_none());
+        assert!(coord.sig_pool.is_empty());
+        // Pool re-targeted to the next in-flight epoch.
+        assert_eq!(coord.proposal_pool.epoch(), in_flight.next());
+
+        // Local is still on committee (genesis committee doesn't
+        // rotate on a single commit), so a fresh SPC bootstraps and
+        // try_propose emits a new proposal action.
+        assert!(coord.spc.is_some());
+        assert_eq!(coord.spc.as_ref().unwrap().epoch(), in_flight.next());
+        assert!(
+            last_actions
+                .iter()
+                .any(|a| matches!(a, Action::BuildAndBroadcastBeaconProposal { .. })),
+            "expected next-epoch BuildAndBroadcastBeaconProposal in {last_actions:?}",
+        );
+    }
+
+    #[test]
+    fn sig_dropped_when_no_pending_commit() {
+        let mut coord = fresh_coord();
+        coord.bootstrap_spc_for_next_epoch();
+        // No OutputHigh yet, so no pending commit.
+        let actions = coord.on_beacon_block_sig_received(
+            ValidatorId::new(1),
+            Epoch::GENESIS.next(),
+            Bls12381G2Signature([0u8; 96]),
+        );
+        assert!(actions.is_empty());
+        assert!(coord.sig_pool.is_empty());
+    }
+
+    #[test]
+    fn sig_dropped_from_non_committee_sender() {
+        use hyperscale_types::PcVector;
+        let mut coord = fresh_coord();
+        coord.bootstrap_spc_for_next_epoch();
+        let in_flight = Epoch::GENESIS.next();
+        let committee = coord.state.committee.clone();
+        for id in &committee {
+            let p = sample_proposal(id.inner().try_into().unwrap_or(0u8));
+            coord.proposal_pool.admit(*id, in_flight, p);
+        }
+        let output = PcVector::new(committee.iter().map(|_| PcValueElement::ZERO));
+        let recipients = coord.spc_recipients();
+        let _ = coord.on_spc_output_high(in_flight, &output, &recipients);
+
+        let actions = coord.on_beacon_block_sig_received(
+            ValidatorId::new(99), // not on committee
+            in_flight,
+            Bls12381G2Signature([0u8; 96]),
+        );
+        assert!(actions.is_empty());
+        assert!(coord.sig_pool.is_empty());
     }
 
     #[test]
