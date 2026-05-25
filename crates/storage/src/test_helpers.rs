@@ -17,7 +17,7 @@ use hyperscale_types::{
     LogLevel, NodeId, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Randomness,
     RecoveryCertHash, Round, ShardGroupId, SignerBitfield, StateRoot, StoredReceipt,
     TransactionRoot, TxHash, TxOutcome, ValidatorId, WaveCertificate, WaveId, WeightedTimestamp,
-    compute_global_receipt_root, zero_bls_signature,
+    compute_global_receipt_root, state_root, zero_bls_signature,
 };
 use indexmap::IndexMap;
 use radix_common::math::Decimal;
@@ -161,6 +161,8 @@ pub fn make_test_qc(block: &Block) -> QuorumCertificate {
 /// All other header fields are filled with fixed test sentinels — the
 /// resulting block round-trips through SBOR and exercises epoch/hash
 /// lookups but is not a valid block under beacon-state verification.
+/// Tests that need a header whose `state_root` matches a real
+/// `BeaconState` should use [`make_test_block_and_state`] instead.
 #[must_use]
 pub fn make_test_beacon_block(epoch: u64, tag: &[u8]) -> Arc<BeaconBlock> {
     let header = BeaconBlockHeader::new(
@@ -202,6 +204,33 @@ pub fn make_test_beacon_state(epoch: u64, tag: &[u8]) -> Arc<BeaconState> {
         last_recovery_cert: None,
         miss_counters: BTreeMap::new(),
     })
+}
+
+/// Build a `(block, state)` pair where the block's
+/// `header.state_root` equals `state_root(&state)`.
+///
+/// Mirrors the binding a real committee attests to over
+/// `apply_epoch`. Tests that need to exercise verifier-side
+/// state-root consistency use this instead of pairing
+/// [`make_test_beacon_block`] and [`make_test_beacon_state`]
+/// independently.
+#[must_use]
+pub fn make_test_block_and_state(epoch: u64, tag: &[u8]) -> (Arc<BeaconBlock>, Arc<BeaconState>) {
+    let state = make_test_beacon_state(epoch, tag);
+    let header = BeaconBlockHeader::new(
+        Epoch::new(epoch),
+        BeaconBlockHash::from_raw(Hash::from_bytes(tag)),
+        BeaconProposalsRoot::from_raw(Hash::from_bytes(b"proposals")),
+        state_root(&state),
+        RecoveryCertHash::ZERO,
+    );
+    let block = Arc::new(BeaconBlock::new(
+        header,
+        SignerBitfield::empty(),
+        Bls12381G2Signature([0x11; 96]),
+        None,
+    ));
+    (block, state)
 }
 
 /// Build a deterministic locally-executed `StoredReceipt` from `seed`

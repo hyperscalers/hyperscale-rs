@@ -1,6 +1,8 @@
-use hyperscale_storage::test_helpers::{make_test_beacon_block, make_test_beacon_state};
+use hyperscale_storage::test_helpers::{
+    make_test_beacon_block, make_test_beacon_state, make_test_block_and_state,
+};
 use hyperscale_storage::{BeaconChainReader, BeaconChainWriter};
-use hyperscale_types::{BeaconBlockHash, Epoch};
+use hyperscale_types::{BeaconBlockHash, Epoch, state_root};
 use tempfile::TempDir;
 
 use super::core::RocksDbBeaconStorage;
@@ -88,20 +90,18 @@ fn commit_is_idempotent_on_same_epoch_block_and_state() {
 }
 
 /// Persistence round-trip: reopening the directory recovers the
-/// committed (block, state) pairs intact. `BeaconCoordinator` relies
-/// on this for restart — `latest_committed()` returns a state whose
-/// `state_root` matches the corresponding block's
-/// `header.state_root`.
+/// committed (block, state) pairs intact, and the
+/// `header.state_root` ↔ `state_root(&state)` binding the committee
+/// attested to still holds. `BeaconCoordinator` relies on both
+/// properties for restart.
 #[test]
 fn reopen_recovers_committed_block_and_state_pairs() {
     let tmp = TempDir::new().expect("tempdir");
     {
         let store = RocksDbBeaconStorage::open(tmp.path()).expect("open");
         for epoch in 1u64..=5 {
-            store.commit_beacon_block(
-                &make_test_beacon_block(epoch, format!("b{epoch}").as_bytes()),
-                &make_test_beacon_state(epoch, format!("s{epoch}").as_bytes()),
-            );
+            let (block, state) = make_test_block_and_state(epoch, format!("e{epoch}").as_bytes());
+            store.commit_beacon_block(&block, &state);
         }
     }
     let store = RocksDbBeaconStorage::open(tmp.path()).expect("reopen");
@@ -109,6 +109,11 @@ fn reopen_recovers_committed_block_and_state_pairs() {
     let (block, state) = store.latest_committed().expect("latest after reopen");
     assert_eq!(block.epoch(), Epoch::new(5));
     assert_eq!(state.current_epoch, Epoch::new(5));
+    assert_eq!(
+        block.header().state_root(),
+        state_root(&state),
+        "block↔state binding lost across reopen for latest_committed",
+    );
 
     for epoch in 1u64..=5 {
         let b = store
@@ -117,5 +122,10 @@ fn reopen_recovers_committed_block_and_state_pairs() {
         let s = store.get_state_by_epoch(Epoch::new(epoch)).expect("state");
         assert_eq!(b.epoch(), Epoch::new(epoch));
         assert_eq!(s.current_epoch, Epoch::new(epoch));
+        assert_eq!(
+            b.header().state_root(),
+            state_root(&s),
+            "block↔state binding lost across reopen for epoch {epoch}",
+        );
     }
 }

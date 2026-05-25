@@ -27,6 +27,7 @@ test-utils = ["hyperscale-types/test-utils"]
 
 [dev-dependencies]
 hyperscale-dispatch-sync.workspace = true
+hyperscale-types = { workspace = true, features = ["test-utils"] }
 
 [lints]
 workspace = true
