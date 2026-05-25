@@ -18,12 +18,13 @@ use std::sync::Arc;
 
 use hyperscale_core::{Action, TimerId};
 use hyperscale_types::{
-    BeaconBlock, BeaconState, Epoch, LocalTimestamp, NetworkDefinition, RECOVERY_TIMEOUT,
-    SpcMessage, ValidatorId, VpcMsgPayload, state_root,
+    BeaconBlock, BeaconState, Bls12381G1PublicKey, Epoch, LocalTimestamp, NetworkDefinition,
+    RECOVERY_TIMEOUT, SpcMessage, ValidatorId, VpcMsgPayload, state_root,
 };
 use tracing::{trace, warn};
 
 use crate::block_sync::BeaconBlockSyncManager;
+use crate::constants::SPC_VIEW_TIMEOUT;
 use crate::equivocations::EquivocationObservations;
 use crate::pending_blocks::PendingBeaconBlocks;
 use crate::recovery_tracker::RecoveryTracker;
@@ -196,6 +197,57 @@ impl BeaconCoordinator {
         };
         let view = spc.current_view();
         self.dispatch_spc_event(self.me, SpcEvent::TimerExpired { view })
+    }
+
+    /// `TimerId::BeaconCommitteeStart` fired — the upcoming epoch's
+    /// wall-clock boundary has been reached. If the local validator
+    /// is on the next committee and no SPC instance is already
+    /// running, bootstrap one. The proposal-Input that kicks the FSM
+    /// into outbound traffic arrives via `try_propose` once witness
+    /// readiness is satisfied — this handler is pure state mutation.
+    pub fn on_beacon_committee_start_timer(&mut self) -> Vec<Action> {
+        if self.spc.is_some() {
+            trace!("BeaconCommitteeStart fired with SPC already running");
+            return Vec::new();
+        }
+        if !self.is_on_committee() {
+            trace!("BeaconCommitteeStart fired but local validator not on committee");
+            return Vec::new();
+        }
+        self.bootstrap_spc_for_next_epoch();
+        Vec::new()
+    }
+
+    /// Stand up a fresh [`SpcInstance`] for the upcoming epoch.
+    /// Pairs each committee member with their pubkey by looking up
+    /// `state.validators`. Skips validators absent from the validator
+    /// table — a structurally impossible state for an on-chain
+    /// committee, so the skip is defensive rather than expected.
+    fn bootstrap_spc_for_next_epoch(&mut self) {
+        let committee = self.committee_with_pubkeys();
+        let next_epoch = self.state.current_epoch.next();
+        self.spc = Some(SpcInstance::new(
+            self.network.clone(),
+            next_epoch,
+            committee,
+            self.me,
+            SPC_VIEW_TIMEOUT,
+        ));
+    }
+
+    /// Pair every member of the beacon committee with their pubkey
+    /// from `state.validators`. Returns the pairs in committee order.
+    fn committee_with_pubkeys(&self) -> Vec<(ValidatorId, Bls12381G1PublicKey)> {
+        self.state
+            .committee
+            .iter()
+            .filter_map(|id| {
+                self.state
+                    .validators
+                    .get(id)
+                    .map(|record| (*id, record.pubkey))
+            })
+            .collect()
     }
 
     /// Drive `event` through the current `SpcInstance` and lift the
@@ -584,5 +636,43 @@ mod tests {
     fn on_beacon_spc_view_timer_drops_when_no_spc_instance() {
         let mut coord = fresh_coord();
         assert!(coord.on_beacon_spc_view_timer().is_empty());
+    }
+
+    #[test]
+    fn committee_start_bootstraps_spc_for_on_committee_local() {
+        use hyperscale_types::SpcView;
+        let mut coord = fresh_coord();
+        assert!(coord.spc.is_none());
+        let actions = coord.on_beacon_committee_start_timer();
+        assert!(actions.is_empty(), "bootstrap emits no actions");
+        let spc = coord.spc.as_ref().expect("SPC bootstrapped");
+        assert_eq!(spc.epoch(), Epoch::GENESIS.next());
+        assert_eq!(spc.current_view(), SpcView::new(1));
+    }
+
+    #[test]
+    fn committee_start_no_op_when_off_committee() {
+        let (block, state) = genesis_pair();
+        let mut coord = BeaconCoordinator::new(
+            block,
+            state,
+            // 99 isn't in the 0..4 committee.
+            ValidatorId::new(99),
+            NetworkDefinition::simulator(),
+        );
+        let actions = coord.on_beacon_committee_start_timer();
+        assert!(actions.is_empty());
+        assert!(coord.spc.is_none());
+    }
+
+    #[test]
+    fn committee_start_is_idempotent() {
+        let mut coord = fresh_coord();
+        coord.on_beacon_committee_start_timer();
+        let spc_view_first = coord.spc.as_ref().unwrap().current_view();
+        // Second fire should not rebuild the instance.
+        coord.on_beacon_committee_start_timer();
+        let spc_view_second = coord.spc.as_ref().unwrap().current_view();
+        assert_eq!(spc_view_first, spc_view_second);
     }
 }

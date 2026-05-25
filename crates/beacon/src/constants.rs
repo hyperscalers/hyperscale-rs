@@ -23,7 +23,24 @@
 //! unbonding window is ≈ 2.5 hours at 5-min epochs, where real networks
 //! use weeks). Tuning lands when operational data warrants.
 
+use std::time::Duration;
+
 use hyperscale_types::{MAX_WITNESSES_PER_PROPOSER, Stake};
+
+// ─── Consensus timeouts ────────────────────────────────────────────────────
+
+/// Leader-proposal grace per SPC view.
+///
+/// Once this elapses without an `SpcProposalObject` from the view's
+/// leader, the local participant fires its empty-view path so a
+/// silent or Byzantine leader can't stall the view indefinitely.
+///
+/// Sized as the `2Δ` cap on a single view: long enough for a healthy
+/// leader to broadcast the proposal-object, gather inner-PC voting
+/// material, and circulate the cert; short enough that a stalled
+/// epoch clears via view rotation well inside the 45 s recovery
+/// trigger.
+pub const SPC_VIEW_TIMEOUT: Duration = Duration::from_secs(15);
 
 // ─── Committee sizing ──────────────────────────────────────────────────────
 
