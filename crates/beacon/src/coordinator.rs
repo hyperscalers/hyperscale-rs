@@ -23,6 +23,7 @@ use hyperscale_types::{
 
 use crate::pending_blocks::PendingBeaconBlocks;
 use crate::spc::SpcInstance;
+use crate::verification::BeaconVerificationPipeline;
 
 /// Per-vnode beacon-chain coordinator.
 ///
@@ -47,6 +48,11 @@ pub struct BeaconCoordinator {
     /// Gossip-arrival cache for beacon blocks awaiting verification.
     /// Pruned past `state.current_epoch` after every committed epoch.
     pending_blocks: PendingBeaconBlocks,
+
+    /// In-flight and verified slot tracking for async crypto checks
+    /// (block aggregate sigs, cert sigs, VRF reveals, witness
+    /// Merkle paths).
+    verification: BeaconVerificationPipeline,
 
     me: ValidatorId,
 
@@ -96,6 +102,7 @@ impl BeaconCoordinator {
             latest_block,
             spc: None,
             pending_blocks: PendingBeaconBlocks::new(),
+            verification: BeaconVerificationPipeline::new(),
             me,
             me_sk,
             network,
@@ -155,6 +162,10 @@ impl std::fmt::Debug for BeaconCoordinator {
             .field("me", &self.me)
             .field("spc_active", &self.spc.is_some())
             .field("pending_blocks", &self.pending_blocks.len())
+            .field(
+                "verifications_in_flight",
+                &self.verification.in_flight_count(),
+            )
             .finish_non_exhaustive()
     }
 }

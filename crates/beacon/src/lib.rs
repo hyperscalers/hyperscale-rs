@@ -20,3 +20,4 @@ pub mod recovery;
 pub mod sampling;
 pub mod spc;
 pub mod state;
+pub mod verification;
