@@ -381,11 +381,12 @@ fn verify_diverging_proof(
         return false;
     }
     let j_msg = pc_vote_signing_message(network, DOMAIN_PC_VOTE2, pc_ctx, &j_vec);
-    if !aggregate_verify_bls_different_messages(&[j_msg.as_slice()], &proof.j_sig, &[pk_j]) {
-        return false;
-    }
     let k_msg = pc_vote_signing_message(network, DOMAIN_PC_VOTE2, pc_ctx, &k_vec);
-    aggregate_verify_bls_different_messages(&[k_msg.as_slice()], &proof.k_sig, &[pk_k])
+    aggregate_verify_bls_different_messages(
+        &[j_msg.as_slice(), k_msg.as_slice()],
+        &proof.combined_sig,
+        &[pk_j, pk_k],
+    )
 }
 
 // ─── Round 3 ───────────────────────────────────────────────────────────────
@@ -753,15 +754,16 @@ fn build_xp_proof(votes: &[&PcVote2], x_p: &PcVector) -> PcXpProof {
             .get(sig_idx)
             .copied()
             .expect("prefix_sigs has |x|+1 entries; index ≤ |x|");
+        let combined_sig =
+            Bls12381G2Signature::aggregate(&[j_sig, k_sig], true).expect("two non-zero sigs");
         return PcXpProof::Diverging(Box::new(PcDivergingProof {
             j: j_vote.validator(),
             j_divergent: j_div,
-            j_sig,
             qc1_j: j_vote.qc1().clone(),
             k: k_vote.validator(),
             k_divergent: k_vote.x().as_slice()[pos],
-            k_sig,
             qc1_k: k_vote.qc1().clone(),
+            combined_sig,
         }));
     }
 

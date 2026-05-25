@@ -363,18 +363,17 @@ pub struct PcDivergingProof {
     pub j: ValidatorId,
     /// First diverging signer's value at position `|x_p|`.
     pub j_divergent: PcValueElement,
-    /// First diverging signer's prefix sig over `x_p ++ [j_divergent]`.
-    pub j_sig: Bls12381G2Signature,
     /// Round-1 QC anchoring the first diverging signer's full `x`.
     pub qc1_j: PcQc1,
     /// Second diverging signer.
     pub k: ValidatorId,
     /// Second diverging signer's value at position `|x_p|`.
     pub k_divergent: PcValueElement,
-    /// Second diverging signer's prefix sig over `x_p ++ [k_divergent]`.
-    pub k_sig: Bls12381G2Signature,
     /// Round-1 QC anchoring the second diverging signer's full `x`.
     pub qc1_k: PcQc1,
+    /// Different-messages aggregate of j's sig over `x_p ++ [j_divergent]`
+    /// and k's sig over `x_p ++ [k_divergent]`.
+    pub combined_sig: Bls12381G2Signature,
 }
 
 /// Witness that `PcQc2.x_p` is the actual mcp of the round-2 quorum's
@@ -861,12 +860,11 @@ mod tests {
             PcXpProof::Diverging(Box::new(PcDivergingProof {
                 j: ValidatorId::new(0),
                 j_divergent: sample_value(11),
-                j_sig: sample_sig(0xBB),
                 qc1_j: sample_qc1(),
                 k: ValidatorId::new(1),
                 k_divergent: sample_value(22),
-                k_sig: sample_sig(0xCC),
                 qc1_k: sample_qc1(),
+                combined_sig: sample_sig(0xBB),
             })),
             PcXpProof::ShortWitness {
                 witness: Box::new(PcVote2::new(
