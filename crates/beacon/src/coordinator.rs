@@ -22,6 +22,7 @@ use hyperscale_types::{
 };
 
 use crate::pending_blocks::PendingBeaconBlocks;
+use crate::recovery_tracker::RecoveryTracker;
 use crate::spc::SpcInstance;
 use crate::verification::BeaconVerificationPipeline;
 use crate::witness_fetcher::ShardWitnessFetchTracker;
@@ -59,6 +60,10 @@ pub struct BeaconCoordinator {
     /// in-flight fetches; drives proposal-readiness and the
     /// witness drain.
     witness_fetcher: ShardWitnessFetchTracker,
+
+    /// Buckets observed recovery requests and aggregates them into
+    /// a `RecoveryCertificate` once quorum lands.
+    recovery_tracker: RecoveryTracker,
 
     me: ValidatorId,
 
@@ -110,6 +115,7 @@ impl BeaconCoordinator {
             pending_blocks: PendingBeaconBlocks::new(),
             verification: BeaconVerificationPipeline::new(),
             witness_fetcher: ShardWitnessFetchTracker::new(),
+            recovery_tracker: RecoveryTracker::new(),
             me,
             me_sk,
             network,
@@ -174,6 +180,7 @@ impl std::fmt::Debug for BeaconCoordinator {
                 &self.verification.in_flight_count(),
             )
             .field("witness_pool", &self.witness_fetcher.total_pool_len())
+            .field("recovery_buckets", &self.recovery_tracker.bucket_count())
             .finish_non_exhaustive()
     }
 }

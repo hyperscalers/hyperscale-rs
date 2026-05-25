@@ -17,6 +17,7 @@ pub mod pc;
 pub mod pending_blocks;
 pub mod prefix_ops;
 pub mod recovery;
+pub mod recovery_tracker;
 pub mod sampling;
 pub mod spc;
 pub mod state;
