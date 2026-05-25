@@ -10,10 +10,12 @@
 //! pulls helpers from here via `mod common;`. Re-exports are flat — the
 //! consuming tests reference `common::Committee`, `common::pc_ctx`, etc.
 
+mod coordinator_sim;
 mod fixtures;
 mod pc_sim;
 mod spc_sim;
 
+pub use coordinator_sim::{CapturedCommit, CoordinatorSim};
 pub use fixtures::{Committee, pc_ctx};
 pub use pc_sim::PcSim;
 pub use spc_sim::SpcSim;
