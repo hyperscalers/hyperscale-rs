@@ -33,8 +33,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use hyperscale_types::{
     Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature, DOMAIN_PC_VOTE1,
     DOMAIN_PC_VOTE2, DOMAIN_PC_VOTE2_LENGTH, DOMAIN_PC_VOTE3, Epoch, MAX_VOTE_VECTOR_LEN,
-    NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PcCompactVote, PcDivergingProof, PcQc1, PcQc2,
-    PcQc3, PcSignerLengths, PcValueElement, PcVector, PcVote1, PcVote2, PcVote3,
+    NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PcCompactVote, PcContext, PcDivergingProof, PcQc1,
+    PcQc2, PcQc3, PcSignerLengths, PcValueElement, PcVector, PcVote1, PcVote2, PcVote3,
     PcVoteEquivocation, PcVoteRound, PcXpProof, PositionalBundle, SignerBitfield, SpcView,
     ValidatorId, aggregate_verify_bls_different_messages, pc_context, pc_vote_signing_message,
     spc_context,
@@ -70,7 +70,7 @@ const fn byzantine_threshold(n: usize) -> usize {
 fn prefix_signing_messages(
     network: &NetworkDefinition,
     domain: &[u8],
-    pc_ctx: &[u8],
+    pc_ctx: &PcContext,
     v: &PcVector,
 ) -> Vec<Vec<u8>> {
     (0..=v.len())
@@ -85,7 +85,11 @@ fn prefix_signing_messages(
 /// a single-element vector carrying `len` under [`DOMAIN_PC_VOTE2_LENGTH`].
 /// Binds a [`PcVote2`] signer to their specific `|x|`, closing the
 /// prefix-sig splice attack on [`PcXpProof::ShortWitness`].
-fn length_attestation_message(network: &NetworkDefinition, pc_ctx: &[u8], len: usize) -> Vec<u8> {
+fn length_attestation_message(
+    network: &NetworkDefinition,
+    pc_ctx: &PcContext,
+    len: usize,
+) -> Vec<u8> {
     let len_element = PcValueElement::new({
         let mut bytes = [0u8; PC_VALUE_ELEMENT_BYTES];
         bytes[..8].copy_from_slice(&(len as u64).to_le_bytes());
@@ -100,7 +104,7 @@ pub(crate) fn verify_length_attestation(
     sig: &Bls12381G2Signature,
     pk: &Bls12381G1PublicKey,
     network: &NetworkDefinition,
-    pc_ctx: &[u8],
+    pc_ctx: &PcContext,
     len: usize,
 ) -> bool {
     let msg = length_attestation_message(network, pc_ctx, len);
@@ -113,7 +117,7 @@ pub(crate) fn verify_length_attestation(
 pub(crate) fn verify_vote1(
     v1: &PcVote1,
     network: &NetworkDefinition,
-    pc_ctx: &[u8],
+    pc_ctx: &PcContext,
     committee: &[(ValidatorId, Bls12381G1PublicKey)],
 ) -> bool {
     let Some(pk) = pubkey_in_committee(committee, v1.validator()) else {
@@ -148,7 +152,7 @@ pub(crate) fn verify_vote1(
 pub fn verify_qc1(
     qc1: &PcQc1,
     network: &NetworkDefinition,
-    pc_ctx: &[u8],
+    pc_ctx: &PcContext,
     committee: &[(ValidatorId, Bls12381G1PublicKey)],
 ) -> bool {
     let n = committee.len();
@@ -229,7 +233,7 @@ fn reconstruct_compact_vote(cv: &PcCompactVote, x: &PcVector) -> Option<PcVector
 pub(crate) fn verify_vote2(
     v2: &PcVote2,
     network: &NetworkDefinition,
-    pc_ctx: &[u8],
+    pc_ctx: &PcContext,
     committee: &[(ValidatorId, Bls12381G1PublicKey)],
 ) -> bool {
     let Some(pk) = pubkey_in_committee(committee, v2.validator()) else {
@@ -273,7 +277,7 @@ pub(crate) fn verify_vote2(
 pub fn verify_qc2(
     qc2: &PcQc2,
     network: &NetworkDefinition,
-    pc_ctx: &[u8],
+    pc_ctx: &PcContext,
     committee: &[(ValidatorId, Bls12381G1PublicKey)],
 ) -> bool {
     let n = committee.len();
@@ -349,7 +353,7 @@ fn verify_diverging_proof(
     qc2: &PcQc2,
     signer_ids: &BTreeSet<ValidatorId>,
     network: &NetworkDefinition,
-    pc_ctx: &[u8],
+    pc_ctx: &PcContext,
     committee: &[(ValidatorId, Bls12381G1PublicKey)],
 ) -> bool {
     if proof.j == proof.k || proof.j_divergent == proof.k_divergent {
@@ -397,7 +401,7 @@ fn verify_diverging_proof(
 pub(crate) fn verify_vote3(
     v3: &PcVote3,
     network: &NetworkDefinition,
-    pc_ctx: &[u8],
+    pc_ctx: &PcContext,
     committee: &[(ValidatorId, Bls12381G1PublicKey)],
 ) -> bool {
     let Some(pk) = pubkey_in_committee(committee, v3.validator()) else {
@@ -428,7 +432,7 @@ pub(crate) fn verify_vote3(
 pub fn verify_qc3(
     qc3: &PcQc3,
     network: &NetworkDefinition,
-    pc_ctx: &[u8],
+    pc_ctx: &PcContext,
     committee: &[(ValidatorId, Bls12381G1PublicKey)],
 ) -> bool {
     let n = committee.len();
@@ -547,7 +551,7 @@ pub fn sign_vote1(
     sk: &Bls12381G1PrivateKey,
     validator: ValidatorId,
     network: &NetworkDefinition,
-    pc_ctx: &[u8],
+    pc_ctx: &PcContext,
     v_in: PcVector,
 ) -> PcVote1 {
     let prefix_sigs = sign_all_prefixes(sk, network, pc_ctx, &v_in, DOMAIN_PC_VOTE1);
@@ -565,7 +569,7 @@ pub fn sign_vote2(
     sk: &Bls12381G1PrivateKey,
     validator: ValidatorId,
     network: &NetworkDefinition,
-    pc_ctx: &[u8],
+    pc_ctx: &PcContext,
     qc1: PcQc1,
 ) -> PcVote2 {
     let x = qc1.x().clone();
@@ -584,7 +588,7 @@ pub fn sign_vote3(
     sk: &Bls12381G1PrivateKey,
     validator: ValidatorId,
     network: &NetworkDefinition,
-    pc_ctx: &[u8],
+    pc_ctx: &PcContext,
     qc2: PcQc2,
 ) -> PcVote3 {
     let x_p = qc2.x_p().clone();
@@ -601,7 +605,7 @@ pub fn sign_vote3(
 fn sign_all_prefixes(
     sk: &Bls12381G1PrivateKey,
     network: &NetworkDefinition,
-    pc_ctx: &[u8],
+    pc_ctx: &PcContext,
     v: &PcVector,
     domain: &[u8],
 ) -> Vec<Bls12381G2Signature> {
@@ -934,7 +938,7 @@ pub struct PcInstance {
     network: NetworkDefinition,
     epoch: Epoch,
     view: SpcView,
-    pc_ctx: Vec<u8>,
+    pc_ctx: PcContext,
     committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
 
     vote1_pool: BTreeMap<ValidatorId, PcVote1>,
@@ -1197,12 +1201,12 @@ mod tests {
         PcValueElement::new([b; PC_VALUE_ELEMENT_BYTES])
     }
 
-    fn ctx() -> Vec<u8> {
-        // Standalone test context — real callers use `spc_context(epoch)`
-        // followed by `pc_context(spc_ctx, view)`, but the verifier
-        // doesn't care about its internal shape so long as it agrees
-        // with the signer.
-        vec![1, 2, 3, 4]
+    fn ctx() -> PcContext {
+        // Standalone test context: real callers compose `pc_context`
+        // over `(epoch, view)`, but these isolated tests only need a
+        // stable canonical context — the verifier doesn't care about
+        // the bytes so long as signer and verifier agree.
+        pc_context(&spc_context(Epoch::new(1)), SpcView::new(0))
     }
 
     /// QC1 with the wrong signer-set size (≠ n - f) must be rejected

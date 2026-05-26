@@ -12,8 +12,8 @@ use hyperscale_beacon::pc::{
     verify_qc3, verify_vote_equivocation,
 };
 use hyperscale_types::{
-    Epoch, NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PcQc1, PcQc2, PcValueElement, PcVector,
-    PcVote1, PcVote2, PcVote3, PcVoteEquivocation, PcVoteRound, PcXpProof, SpcView,
+    Epoch, NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PcContext, PcQc1, PcQc2, PcValueElement,
+    PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation, PcVoteRound, PcXpProof, SpcView,
 };
 
 const fn elem(byte: u8) -> PcValueElement {
@@ -24,7 +24,7 @@ const fn elem(byte: u8) -> PcValueElement {
 fn round1_quorum(
     cm: &Committee,
     network: &NetworkDefinition,
-    ctx: &[u8],
+    ctx: &PcContext,
     quorum: usize,
     v_in: &PcVector,
 ) -> Vec<PcVote1> {
@@ -38,7 +38,7 @@ fn round1_quorum(
 fn round2_quorum(
     cm: &Committee,
     network: &NetworkDefinition,
-    ctx: &[u8],
+    ctx: &PcContext,
     quorum: usize,
     qc1: &PcQc1,
 ) -> Vec<PcVote2> {
@@ -51,7 +51,7 @@ fn round2_quorum(
 fn round3_quorum(
     cm: &Committee,
     network: &NetworkDefinition,
-    ctx: &[u8],
+    ctx: &PcContext,
     quorum: usize,
     qc2: &PcQc2,
 ) -> Vec<PcVote3> {
@@ -283,7 +283,7 @@ fn sim_n4_with_one_silent_party_still_converges() {
 fn qc1_over(
     cm: &Committee,
     network: &NetworkDefinition,
-    ctx: &[u8],
+    ctx: &PcContext,
     quorum: usize,
     v_in: &PcVector,
 ) -> PcQc1 {

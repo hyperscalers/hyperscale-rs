@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use hyperscale_beacon::pc::{PcEffect, PcEvent, PcInstance, sign_vote1, sign_vote2, sign_vote3};
 use hyperscale_types::{
-    Bls12381G1PrivateKey, Bls12381G1PublicKey, Epoch, NetworkDefinition, PcQc3, PcVector, SpcView,
-    ValidatorId, bls_keypair_from_seed, pc_context, spc_context,
+    Bls12381G1PrivateKey, Bls12381G1PublicKey, Epoch, NetworkDefinition, PcContext, PcQc3,
+    PcVector, SpcView, ValidatorId, bls_keypair_from_seed, pc_context, spc_context,
 };
 
 /// One pending message in the network: a vote event addressed to a
@@ -28,7 +28,7 @@ pub struct PcSim {
     pub members: Vec<(ValidatorId, Bls12381G1PublicKey)>,
     pub sks: Vec<Arc<Bls12381G1PrivateKey>>,
     network: NetworkDefinition,
-    pc_ctx: Vec<u8>,
+    pc_ctx: PcContext,
     pending: VecDeque<Envelope>,
     pub decided: Vec<Option<Box<PcQc3>>>,
 }

@@ -46,10 +46,10 @@ use blake3::Hasher;
 use hyperscale_types::{
     Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature, DOMAIN_PC_EMPTY_VIEW, Epoch,
     Hash, NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PcQc1, PcQc2, PcQc3, PcValueElement, PcVector,
-    PcVoteEquivocation, PositionalBundle, SignerBitfield, SkipReport, SpcCert, SpcEmptyLowEvidence,
-    SpcEmptyViewMsg, SpcHighTriple, SpcMessage, SpcProposalObject, SpcView, ValidatorId,
-    VpcMsgPayload, aggregate_verify_bls_different_messages, pc_context, pc_vote_signing_message,
-    spc_context,
+    PcVoteEquivocation, PositionalBundle, SignerBitfield, SkipReport, SpcCert, SpcContext,
+    SpcEmptyLowEvidence, SpcEmptyViewMsg, SpcHighTriple, SpcMessage, SpcProposalObject, SpcView,
+    ValidatorId, VpcMsgPayload, aggregate_verify_bls_different_messages, pc_context,
+    pc_vote_signing_message, spc_context,
 };
 
 use crate::pc::{PcEffect, PcEvent, PcInstance, verify_qc3};
@@ -159,7 +159,7 @@ pub const fn rank_shift_for_view(view: SpcView, n: usize) -> usize {
 pub fn verify_empty_view_msg(
     msg: &SpcEmptyViewMsg,
     network: &NetworkDefinition,
-    spc_ctx: &[u8],
+    spc_ctx: &SpcContext,
     committee: &[(ValidatorId, Bls12381G1PublicKey)],
 ) -> bool {
     let Some(pk) = pubkey_in_committee(committee, msg.signer) else {
@@ -191,7 +191,7 @@ pub fn verify_empty_view_msg(
 pub fn verify_empty_low_evidence(
     evidence: &SpcEmptyLowEvidence,
     network: &NetworkDefinition,
-    spc_ctx: &[u8],
+    spc_ctx: &SpcContext,
     committee: &[(ValidatorId, Bls12381G1PublicKey)],
 ) -> bool {
     if evidence.view.inner() <= 1 {
@@ -218,7 +218,7 @@ pub fn verify_empty_low_evidence(
 pub fn verify_block_cert(
     cert: &SpcCert,
     network: &NetworkDefinition,
-    spc_ctx: &[u8],
+    spc_ctx: &SpcContext,
     committee: &[(ValidatorId, Bls12381G1PublicKey)],
 ) -> bool {
     match cert {
@@ -246,7 +246,7 @@ pub fn verify_cert(
     cert: &SpcCert,
     entering_view: SpcView,
     network: &NetworkDefinition,
-    spc_ctx: &[u8],
+    spc_ctx: &SpcContext,
     committee: &[(ValidatorId, Bls12381G1PublicKey)],
 ) -> bool {
     match cert {
@@ -297,7 +297,7 @@ fn verify_direct_cert(
     proof: &PcQc3,
     entering_view: SpcView,
     network: &NetworkDefinition,
-    spc_ctx: &[u8],
+    spc_ctx: &SpcContext,
     committee: &[(ValidatorId, Bls12381G1PublicKey)],
 ) -> bool {
     // `prev_view + 1 == entering_view`, guarded against u32 overflow.
@@ -325,7 +325,7 @@ fn verify_indirect_cert(
     skip_aggregate_sig: Bls12381G2Signature,
     entering_view: SpcView,
     network: &NetworkDefinition,
-    spc_ctx: &[u8],
+    spc_ctx: &SpcContext,
     committee: &[(ValidatorId, Bls12381G1PublicKey)],
 ) -> bool {
     // Indirect certs only make sense at entering_view >= 2 (view 1
@@ -397,7 +397,7 @@ fn verify_indirect_cert(
 pub fn verify_proposal_object(
     po: &SpcProposalObject,
     network: &NetworkDefinition,
-    spc_ctx: &[u8],
+    spc_ctx: &SpcContext,
     committee: &[(ValidatorId, Bls12381G1PublicKey)],
 ) -> bool {
     verify_cert(&po.cert, po.view, network, spc_ctx, committee)
@@ -417,7 +417,7 @@ pub fn sign_empty_view_msg(
     sk: &Bls12381G1PrivateKey,
     signer: ValidatorId,
     network: &NetworkDefinition,
-    spc_ctx: &[u8],
+    spc_ctx: &SpcContext,
     empty_view: SpcView,
     reported: SpcHighTriple,
 ) -> SpcEmptyViewMsg {
@@ -833,7 +833,7 @@ const MAX_PENDING_EMPTY_VIEW_AHEAD: u32 = 4;
 pub struct SpcInstance {
     network: NetworkDefinition,
     epoch: Epoch,
-    spc_ctx: Vec<u8>,
+    spc_ctx: SpcContext,
     committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
     me: ValidatorId,
     view_timeout: Duration,
@@ -1411,7 +1411,7 @@ mod tests {
             .collect()
     }
 
-    fn ctx() -> Vec<u8> {
+    fn ctx() -> SpcContext {
         spc_context(Epoch::new(1))
     }
 

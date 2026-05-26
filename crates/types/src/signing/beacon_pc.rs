@@ -1,6 +1,60 @@
 //! Domain-separated signing for beacon PC inner-consensus votes.
 
+use std::ops::Deref;
+
 use crate::{Epoch, NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PcVector, SpcView};
+
+/// Per-epoch SPC signing context. Holds the byte-encoding that binds
+/// SPC-level signatures (block certs, empty-views, recovery
+/// equivocations) to a specific epoch.
+///
+/// Wrapping the bytes as a newtype prevents the SPC and PC contexts
+/// from being silently cross-fed at call sites: an `&SpcContext`
+/// passed where the verifier expects `&PcContext` fails at compile
+/// time rather than producing a vote that verifies against the wrong
+/// domain.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpcContext(Vec<u8>);
+
+impl SpcContext {
+    /// Borrow the canonical signing bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Deref for SpcContext {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// Per-(epoch, view) PC signing context. Holds the byte-encoding that
+/// binds PC-level signatures (per-round votes, QC verification) to a
+/// specific SPC view within an epoch.
+///
+/// See [`SpcContext`] for the type-level rationale.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PcContext(Vec<u8>);
+
+impl PcContext {
+    /// Borrow the canonical signing bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Deref for PcContext {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
 
 /// Domain tag for beacon PC round-1 votes.
 pub const DOMAIN_PC_VOTE1: &[u8] = b"HYPERSCALE_PC_VOTE1_v1";
@@ -31,8 +85,8 @@ pub const DOMAIN_PC_EMPTY_VIEW: &[u8] = b"HYPERSCALE_PC_EMPTY_VIEW_v1";
 /// — the same vector signed under one epoch's context will not verify
 /// against another epoch's context.
 #[must_use]
-pub fn spc_context(epoch: Epoch) -> Vec<u8> {
-    epoch.to_le_bytes().to_vec()
+pub fn spc_context(epoch: Epoch) -> SpcContext {
+    SpcContext(epoch.to_le_bytes().to_vec())
 }
 
 /// Derive a PC instance's domain context from its containing SPC
@@ -42,11 +96,12 @@ pub fn spc_context(epoch: Epoch) -> Vec<u8> {
 /// inside a specific SPC view, so a vote in view `w` will not verify
 /// as a vote in view `w' ≠ w`.
 #[must_use]
-pub fn pc_context(spc_ctx: &[u8], view: SpcView) -> Vec<u8> {
-    let mut out = Vec::with_capacity(spc_ctx.len() + 4);
-    out.extend_from_slice(spc_ctx);
+pub fn pc_context(spc_ctx: &SpcContext, view: SpcView) -> PcContext {
+    let spc_bytes = spc_ctx.as_bytes();
+    let mut out = Vec::with_capacity(spc_bytes.len() + 4);
+    out.extend_from_slice(spc_bytes);
     out.extend_from_slice(&view.to_le_bytes());
-    out
+    PcContext(out)
 }
 
 /// Build the canonical signing bytes for a PC round vote.
@@ -178,8 +233,8 @@ mod tests {
     #[test]
     fn spc_context_byte_layout_is_pinned() {
         assert_eq!(
-            spc_context(Epoch::new(0x42)),
-            0x42u64.to_le_bytes().to_vec()
+            spc_context(Epoch::new(0x42)).as_bytes(),
+            &0x42u64.to_le_bytes(),
         );
     }
 }

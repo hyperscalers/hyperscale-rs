@@ -42,7 +42,7 @@ mod validator_bind;
 
 pub use beacon_pc::{
     DOMAIN_PC_EMPTY_VIEW, DOMAIN_PC_VOTE1, DOMAIN_PC_VOTE2, DOMAIN_PC_VOTE2_LENGTH,
-    DOMAIN_PC_VOTE3, pc_context, pc_vote_signing_message, spc_context,
+    DOMAIN_PC_VOTE3, PcContext, SpcContext, pc_context, pc_vote_signing_message, spc_context,
 };
 pub use beacon_recovery::{DOMAIN_RECOVERY_REQUEST, recovery_request_message};
 pub use beacon_vrf::{

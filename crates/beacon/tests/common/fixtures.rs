@@ -2,8 +2,8 @@
 //! signing-context builders.
 
 use hyperscale_types::{
-    Bls12381G1PrivateKey, Bls12381G1PublicKey, Epoch, SpcView, ValidatorId, bls_keypair_from_seed,
-    pc_context, spc_context,
+    Bls12381G1PrivateKey, Bls12381G1PublicKey, Epoch, PcContext, SpcView, ValidatorId,
+    bls_keypair_from_seed, pc_context, spc_context,
 };
 
 /// A small in-test validator committee — deterministic keys derived
@@ -69,7 +69,7 @@ impl Committee {
 /// Build a PC signing context for `(epoch, view)`. Matches the runtime
 /// path: SPC binds the epoch, PC binds the view on top.
 #[must_use]
-pub fn pc_ctx(epoch: u64, view: u32) -> Vec<u8> {
+pub fn pc_ctx(epoch: u64, view: u32) -> PcContext {
     let spc = spc_context(Epoch::new(epoch));
     pc_context(&spc, SpcView::new(view))
 }
