@@ -87,7 +87,8 @@ where
             | Action::BroadcastSpcNewCommit { .. }
             | Action::BuildAndBroadcastBeaconProposal { .. }
             | Action::BroadcastBeaconBlock { .. }
-            | Action::BroadcastRecoveryRequest { .. }
+            | Action::BroadcastSkipRequest { .. }
+            | Action::BroadcastSkipCert { .. }
             | Action::FetchShardWitnesses { .. }
             | Action::VerifyBeaconRoot { .. } => {
                 self.dispatch_delegated_action(vnode_idx, action);

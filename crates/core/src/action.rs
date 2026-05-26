@@ -12,10 +12,10 @@ use hyperscale_types::{
     CertifiedBeaconBlock, CommittedBlockHeader, Epoch, ExecutionCertificate, ExecutionVote,
     FinalizedWave, GlobalReceiptRoot, Hash, InFlightCount, LeafIndex, LocalReceiptRoot, NodeId,
     PcQc1, PcQc2, PcQc3, PcVector, ProposerTimestamp, ProvisionHash, ProvisionTxRoot, Provisions,
-    ProvisionsRoot, QuorumCertificate, ReadySignal, RecoveryRequest, Round, RoutableTransaction,
-    ShardGroupId, SharedCertificates, SharedTransactions, SpcCert, SpcHighTriple, SpcView,
-    StateRoot, SubstateEntry, TopologySnapshot, TransactionRoot, TransactionStatus, TxHash,
-    TxOutcome, ValidatorId, VotePower, WaveId, WeightedTimestamp, Witness,
+    ProvisionsRoot, QuorumCertificate, ReadySignal, Round, RoutableTransaction, ShardGroupId,
+    SharedCertificates, SharedTransactions, SkipEpochCert, SkipRequest, SpcCert, SpcHighTriple,
+    SpcView, StateRoot, SubstateEntry, TopologySnapshot, TransactionRoot, TransactionStatus,
+    TxHash, TxOutcome, ValidatorId, VotePower, WaveId, WeightedTimestamp, Witness,
 };
 
 use crate::{CommitSource, FetchAbandon, FetchRequest, ProtocolEvent, TimerId};
@@ -906,13 +906,23 @@ pub enum Action {
         block: Arc<CertifiedBeaconBlock>,
     },
 
-    /// Broadcast a locally-signed [`RecoveryRequest`] to the active-duty
+    /// Broadcast a locally-signed [`SkipRequest`] to the active-duty
     /// pool. Quorum aggregation happens off-chain inside
-    /// `RecoveryTracker`.
-    BroadcastRecoveryRequest {
+    /// `SkipTracker`.
+    BroadcastSkipRequest {
         /// Request to broadcast.
-        request: Arc<RecoveryRequest>,
+        request: Arc<SkipRequest>,
         /// Active-pool validators the request ships to.
+        recipients: Vec<ValidatorId>,
+    },
+
+    /// Broadcast an assembled [`SkipEpochCert`] to the active-duty
+    /// pool. Standalone cert gossip helps late-joining or syncing
+    /// nodes that didn't observe the requests directly.
+    BroadcastSkipCert {
+        /// Cert to broadcast.
+        cert: Arc<SkipEpochCert>,
+        /// Active-pool validators the cert ships to.
         recipients: Vec<ValidatorId>,
     },
 
@@ -992,7 +1002,8 @@ impl Action {
             | Self::BroadcastSpcNewCommit { .. }
             | Self::BuildAndBroadcastBeaconProposal { .. }
             | Self::BroadcastBeaconBlock { .. }
-            | Self::BroadcastRecoveryRequest { .. }
+            | Self::BroadcastSkipRequest { .. }
+            | Self::BroadcastSkipCert { .. }
             | Self::FetchShardWitnesses { .. }
             | Self::VerifyBeaconRoot { .. } => Some(DispatchPool::Consensus),
 
@@ -1052,7 +1063,8 @@ impl Action {
             | Self::BroadcastSpcNewCommit { .. }
             | Self::BuildAndBroadcastBeaconProposal { .. }
             | Self::BroadcastBeaconBlock { .. }
-            | Self::BroadcastRecoveryRequest { .. }
+            | Self::BroadcastSkipRequest { .. }
+            | Self::BroadcastSkipCert { .. }
             | Self::FetchShardWitnesses { .. }
             | Self::VerifyBeaconRoot { .. } => ActionOwner::Beacon,
 
