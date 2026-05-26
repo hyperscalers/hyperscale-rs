@@ -3,11 +3,9 @@
 //!
 //! Buckets verified requests by `(anchor_hash, epoch_to_skip)` and
 //! aggregates them into a self-authenticating certificate once the
-//! `⌈2N/3⌉ + 1` pool-quorum lands. Wired into the coordinator in
-//! phase 3.
+//! `⌈2N/3⌉ + 1` pool-quorum lands.
 //!
-//! Mirrors [`recovery_tracker`](crate::recovery_tracker) for the skip
-//! flow. No topology — pure data structure; tests don't need a
+//! No topology — pure data structure; tests don't need a
 //! `BeaconState`, just an anchor and validator keypairs.
 
 use std::collections::BTreeMap;

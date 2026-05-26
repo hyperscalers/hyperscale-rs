@@ -29,8 +29,6 @@ pub enum BeaconVerificationKind {
     PcQc3,
     /// SPC certificate signature.
     SpcCert,
-    /// Recovery certificate signature.
-    RecoveryCert,
     /// Committee aggregate signature over a beacon block header.
     BeaconBlockAggregate,
     /// VRF reveal (output + proof) from a beacon proposal.

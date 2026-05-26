@@ -17,10 +17,6 @@
 //! Enforced at [`new_checked`](CertifiedBeaconBlock::new_checked) and
 //! at SBOR-decode (manual `Decode` impl below). Wire bytes carrying a
 //! mismatched pairing reject with `DecodeError::InvalidCustomValue`.
-//!
-//! The `recovery_cert` side-data field is transitional through phases
-//! 1-3 of the recovery → skip migration. Phase 4 removes it once the
-//! coordinator no longer threads `RecoveryCertificate` through commit.
 
 use sbor::prelude::*;
 use sbor::{
@@ -28,19 +24,13 @@ use sbor::{
     NoCustomTypeKind, NoCustomValueKind, RustTypeId, TypeData, TypeKind, ValueKind,
 };
 
-use crate::{
-    BeaconBlock, BeaconBlockHash, BeaconCert, Epoch, GenesisConfigHash, RecoveryCertificate,
-};
+use crate::{BeaconBlock, BeaconBlockHash, BeaconCert, Epoch, GenesisConfigHash};
 
 /// A beacon block paired with the cert that authenticates it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CertifiedBeaconBlock {
     block: BeaconBlock,
     cert: BeaconCert,
-    /// Transitional through phases 1-3 of the recovery → skip
-    /// migration. Carried as side-data only — never enters the block
-    /// hash. Removed in phase 4.
-    recovery_cert: Option<RecoveryCertificate>,
 }
 
 /// Error variants for the cert-body pairing invariant.
@@ -68,14 +58,9 @@ impl CertifiedBeaconBlock {
     pub fn new_checked(
         block: BeaconBlock,
         cert: BeaconCert,
-        recovery_cert: Option<RecoveryCertificate>,
     ) -> Result<Self, CertifiedBeaconBlockPairingError> {
         Self::check_pairing(&block, &cert)?;
-        Ok(Self {
-            block,
-            cert,
-            recovery_cert,
-        })
+        Ok(Self { block, cert })
     }
 
     /// Pair a block with a cert, panicking on pairing mismatch. Use at
@@ -89,12 +74,8 @@ impl CertifiedBeaconBlock {
     ///
     /// Panics if `cert`'s shape doesn't match `block`'s shape.
     #[must_use]
-    pub fn new_unchecked(
-        block: BeaconBlock,
-        cert: BeaconCert,
-        recovery_cert: Option<RecoveryCertificate>,
-    ) -> Self {
-        match Self::new_checked(block, cert, recovery_cert) {
+    pub fn new_unchecked(block: BeaconBlock, cert: BeaconCert) -> Self {
+        match Self::new_checked(block, cert) {
             Ok(this) => this,
             Err(e) => panic!("CertifiedBeaconBlock pairing invariant: {e:?}"),
         }
@@ -106,7 +87,6 @@ impl CertifiedBeaconBlock {
         Self {
             block: BeaconBlock::genesis(),
             cert: BeaconCert::Genesis(config_hash),
-            recovery_cert: None,
         }
     }
 
@@ -120,13 +100,6 @@ impl CertifiedBeaconBlock {
     #[must_use]
     pub const fn cert(&self) -> &BeaconCert {
         &self.cert
-    }
-
-    /// Transitional `RecoveryCertificate` side-data; `None` once phase
-    /// 4 removes the field. Never part of the block hash.
-    #[must_use]
-    pub const fn recovery_cert(&self) -> Option<&RecoveryCertificate> {
-        self.recovery_cert.as_ref()
     }
 
     /// Block hash — chain-linkage identity. Delegates to the inner
@@ -156,8 +129,8 @@ impl CertifiedBeaconBlock {
 
     /// Consume and return parts.
     #[must_use]
-    pub fn into_parts(self) -> (BeaconBlock, BeaconCert, Option<RecoveryCertificate>) {
-        (self.block, self.cert, self.recovery_cert)
+    pub fn into_parts(self) -> (BeaconBlock, BeaconCert) {
+        (self.block, self.cert)
     }
 
     fn check_pairing(
@@ -200,10 +173,9 @@ impl<E: Encoder<NoCustomValueKind>> Encode<NoCustomValueKind, E> for CertifiedBe
     }
 
     fn encode_body(&self, encoder: &mut E) -> Result<(), EncodeError> {
-        encoder.write_size(3)?;
+        encoder.write_size(2)?;
         encoder.encode(&self.block)?;
         encoder.encode(&self.cert)?;
-        encoder.encode(&self.recovery_cert)?;
         Ok(())
     }
 }
@@ -215,16 +187,15 @@ impl<D: Decoder<NoCustomValueKind>> Decode<NoCustomValueKind, D> for CertifiedBe
     ) -> Result<Self, DecodeError> {
         decoder.check_preloaded_value_kind(value_kind, ValueKind::Tuple)?;
         let length = decoder.read_size()?;
-        if length != 3 {
+        if length != 2 {
             return Err(DecodeError::UnexpectedSize {
-                expected: 3,
+                expected: 2,
                 actual: length,
             });
         }
         let block: BeaconBlock = decoder.decode()?;
         let cert: BeaconCert = decoder.decode()?;
-        let recovery_cert: Option<RecoveryCertificate> = decoder.decode()?;
-        Self::new_checked(block, cert, recovery_cert).map_err(|_| DecodeError::InvalidCustomValue)
+        Self::new_checked(block, cert).map_err(|_| DecodeError::InvalidCustomValue)
     }
 }
 
@@ -312,12 +283,9 @@ mod tests {
             BeaconBlockHash::from_raw(Hash::from_bytes(b"prev")),
             vec![(ValidatorId::new(0), proposal(0))],
         );
-        let pair = CertifiedBeaconBlock::new_checked(
-            block,
-            BeaconCert::Normal(Box::new(direct_cert())),
-            None,
-        )
-        .unwrap();
+        let pair =
+            CertifiedBeaconBlock::new_checked(block, BeaconCert::Normal(Box::new(direct_cert())))
+                .unwrap();
         let bytes = basic_encode(&pair).unwrap();
         let decoded: CertifiedBeaconBlock = basic_decode(&bytes).unwrap();
         assert_eq!(pair, decoded);
@@ -329,8 +297,7 @@ mod tests {
             Epoch::new(5),
             BeaconBlockHash::from_raw(Hash::from_bytes(b"prev")),
         );
-        let pair =
-            CertifiedBeaconBlock::new_checked(block, BeaconCert::Skip(skip_cert()), None).unwrap();
+        let pair = CertifiedBeaconBlock::new_checked(block, BeaconCert::Skip(skip_cert())).unwrap();
         let bytes = basic_encode(&pair).unwrap();
         let decoded: CertifiedBeaconBlock = basic_decode(&bytes).unwrap();
         assert_eq!(pair, decoded);
@@ -368,10 +335,8 @@ mod tests {
             Bls12381G2Signature([0x44; 96]),
         );
 
-        let pair_a =
-            CertifiedBeaconBlock::new_checked(block_a, BeaconCert::Skip(cert_a), None).unwrap();
-        let pair_b =
-            CertifiedBeaconBlock::new_checked(block_b, BeaconCert::Skip(cert_b), None).unwrap();
+        let pair_a = CertifiedBeaconBlock::new_checked(block_a, BeaconCert::Skip(cert_a)).unwrap();
+        let pair_b = CertifiedBeaconBlock::new_checked(block_b, BeaconCert::Skip(cert_b)).unwrap();
         assert_eq!(pair_a.block_hash(), pair_b.block_hash());
     }
 
@@ -382,12 +347,9 @@ mod tests {
             BeaconBlockHash::from_raw(Hash::from_bytes(b"prev")),
             Vec::new(),
         );
-        let err = CertifiedBeaconBlock::new_checked(
-            block,
-            BeaconCert::Genesis(GenesisConfigHash::ZERO),
-            None,
-        )
-        .unwrap_err();
+        let err =
+            CertifiedBeaconBlock::new_checked(block, BeaconCert::Genesis(GenesisConfigHash::ZERO))
+                .unwrap_err();
         assert_eq!(
             err,
             CertifiedBeaconBlockPairingError::GenesisCertWithNonGenesisBlock
@@ -397,12 +359,9 @@ mod tests {
     #[test]
     fn rejects_normal_cert_at_genesis() {
         let block = BeaconBlock::genesis();
-        let err = CertifiedBeaconBlock::new_checked(
-            block,
-            BeaconCert::Normal(Box::new(direct_cert())),
-            None,
-        )
-        .unwrap_err();
+        let err =
+            CertifiedBeaconBlock::new_checked(block, BeaconCert::Normal(Box::new(direct_cert())))
+                .unwrap_err();
         assert_eq!(err, CertifiedBeaconBlockPairingError::NormalCertAtGenesis);
     }
 
@@ -413,8 +372,8 @@ mod tests {
             BeaconBlockHash::from_raw(Hash::from_bytes(b"prev")),
             vec![(ValidatorId::new(0), proposal(0))],
         );
-        let err = CertifiedBeaconBlock::new_checked(block, BeaconCert::Skip(skip_cert()), None)
-            .unwrap_err();
+        let err =
+            CertifiedBeaconBlock::new_checked(block, BeaconCert::Skip(skip_cert())).unwrap_err();
         assert_eq!(err, CertifiedBeaconBlockPairingError::SkipCertWithProposals);
     }
 
@@ -432,7 +391,6 @@ mod tests {
         let bytes = basic_encode(&CertifiedBeaconBlockWire {
             block,
             cert: BeaconCert::Skip(skip_cert()),
-            recovery_cert: None,
         })
         .unwrap();
         let err = basic_decode::<CertifiedBeaconBlock>(&bytes).unwrap_err();
@@ -449,7 +407,6 @@ mod tests {
         let bytes = basic_encode(&CertifiedBeaconBlockWire {
             block,
             cert: BeaconCert::Genesis(GenesisConfigHash::ZERO),
-            recovery_cert: None,
         })
         .unwrap();
         let err = basic_decode::<CertifiedBeaconBlock>(&bytes).unwrap_err();
@@ -462,7 +419,6 @@ mod tests {
         let bytes = basic_encode(&CertifiedBeaconBlockWire {
             block,
             cert: BeaconCert::Normal(Box::new(direct_cert())),
-            recovery_cert: None,
         })
         .unwrap();
         let err = basic_decode::<CertifiedBeaconBlock>(&bytes).unwrap_err();
@@ -478,6 +434,5 @@ mod tests {
     struct CertifiedBeaconBlockWire {
         block: BeaconBlock,
         cert: BeaconCert,
-        recovery_cert: Option<RecoveryCertificate>,
     }
 }

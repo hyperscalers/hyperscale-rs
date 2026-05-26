@@ -10,13 +10,15 @@
 //! timing constants ([`EPOCH_DURATION`](hyperscale_types::EPOCH_DURATION)
 //! and friends) live in [`hyperscale_types::time`].
 //!
-//! # Slots vs epochs
+//! # Epoch-keyed time
 //!
-//! Time-scoped constants are denominated in **epochs**, never slots.
-//! Recovery slots can wedge in mid-epoch without representing real
-//! elapsed time, so anything counting wall-clock duration (cooldowns,
+//! Time-scoped constants are denominated in **epochs**. Every committed
+//! block (Normal or Skip) advances the epoch counter by exactly one
+//! and represents roughly one
+//! [`EPOCH_DURATION`](hyperscale_types::EPOCH_DURATION) of wall-clock
+//! time, so anything counting wall-clock duration (cooldowns,
 //! unbonding windows, shuffle cadence) keys off epoch transitions to
-//! stay faithful to time even when consensus stalls and recovers.
+//! stay faithful to time even when the chain skips a stalled epoch.
 //!
 //! The numerical values are ported from the prototype's defaults — fine
 //! for tests, almost certainly wrong for production (e.g. a 32-epoch
@@ -38,8 +40,8 @@ use hyperscale_types::{MAX_WITNESSES_PER_PROPOSER, Stake};
 /// Sized as the `2Δ` cap on a single view: long enough for a healthy
 /// leader to broadcast the proposal-object, gather inner-PC voting
 /// material, and circulate the cert; short enough that a stalled
-/// epoch clears via view rotation well inside the 45 s recovery
-/// trigger.
+/// epoch clears via view rotation well inside the 45 s
+/// [`SKIP_TIMEOUT`](hyperscale_types::SKIP_TIMEOUT) trigger.
 pub const SPC_VIEW_TIMEOUT: Duration = Duration::from_secs(15);
 
 // ─── Committee sizing ──────────────────────────────────────────────────────
@@ -91,8 +93,8 @@ pub const READY_TIMEOUT_EPOCHS: u64 = 32;
 /// How long a fault-cause jail must elapse before an `Unjail` lift can
 /// return the validator to `Pooled`.
 ///
-/// Applies to performance and recovery jail reasons; equivocation jail
-/// is permanent regardless of this value.
+/// Applies to the performance jail reason; equivocation jail is
+/// permanent regardless of this value.
 pub const JAIL_COOLDOWN_EPOCHS: u64 = 16;
 
 /// How long a stake-pool withdrawal request remains pending before its

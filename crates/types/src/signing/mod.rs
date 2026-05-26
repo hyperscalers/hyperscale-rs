@@ -23,7 +23,7 @@
 //! | `HYPERSCALE_PC_VOTE2_LENGTH_v1` | Length attestation rider on PC round-2 |
 //! | `HYPERSCALE_PC_EMPTY_VIEW_v1` | SPC empty-view skip statement |
 //! | `HYPERSCALE_PC_VRF_v1` | Beacon VRF reveal (per-epoch randomness contribution) |
-//! | `HYPERSCALE_RECOVERY_REQUEST_v1` | Recovery request + aggregated recovery cert sig |
+//! | `HYPERSCALE_SKIP_REQUEST_v1` | Skip request + aggregated skip cert sig |
 //!
 //! # Usage
 //!
@@ -32,7 +32,6 @@
 //! serialized content.
 
 mod beacon_pc;
-mod beacon_recovery;
 mod beacon_skip;
 mod beacon_vrf;
 mod execution;
@@ -45,7 +44,6 @@ pub use beacon_pc::{
     DOMAIN_PC_EMPTY_VIEW, DOMAIN_PC_VOTE1, DOMAIN_PC_VOTE2, DOMAIN_PC_VOTE2_LENGTH,
     DOMAIN_PC_VOTE3, PcContext, SpcContext, pc_context, pc_vote_signing_message, spc_context,
 };
-pub use beacon_recovery::{DOMAIN_RECOVERY_REQUEST, recovery_request_message};
 pub use beacon_skip::{DOMAIN_SKIP_REQUEST, skip_request_message};
 pub use beacon_vrf::{
     DOMAIN_PC_VRF, vrf_output_from_proof, vrf_reveal_message, vrf_sign, vrf_verify,

@@ -11,8 +11,6 @@ pub enum VerificationKind {
     PcQc3,
     /// SPC certificate signature.
     SpcCert,
-    /// Recovery certificate signature.
-    RecoveryCert,
     /// Committee aggregate signature over a beacon block header.
     BeaconBlockAggregate,
     /// VRF reveal (output + proof) from a beacon proposal.
@@ -182,13 +180,13 @@ mod tests {
     #[test]
     fn forget_clears_both_states() {
         let mut p = BeaconVerificationPipeline::new();
-        p.mark_in_flight(VerificationKind::RecoveryCert, key(7));
-        p.on_result(VerificationKind::RecoveryCert, key(7), true);
-        p.forget(VerificationKind::RecoveryCert, key(7));
-        assert!(!p.is_verified(VerificationKind::RecoveryCert, key(7)));
+        p.mark_in_flight(VerificationKind::VrfReveal, key(7));
+        p.on_result(VerificationKind::VrfReveal, key(7), true);
+        p.forget(VerificationKind::VrfReveal, key(7));
+        assert!(!p.is_verified(VerificationKind::VrfReveal, key(7)));
 
-        p.mark_in_flight(VerificationKind::RecoveryCert, key(8));
-        p.forget(VerificationKind::RecoveryCert, key(8));
-        assert!(!p.is_in_flight(VerificationKind::RecoveryCert, key(8)));
+        p.mark_in_flight(VerificationKind::VrfReveal, key(8));
+        p.forget(VerificationKind::VrfReveal, key(8));
+        assert!(!p.is_in_flight(VerificationKind::VrfReveal, key(8)));
     }
 }

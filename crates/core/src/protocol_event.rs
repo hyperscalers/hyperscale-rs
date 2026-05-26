@@ -597,7 +597,7 @@ pub enum ProtocolEvent {
     BeaconCommitteeStartTimer,
 
     /// Beacon skip-trigger timer fired — the local vnode hasn't
-    /// observed the expected commit within `RECOVERY_TIMEOUT` of its
+    /// observed the expected commit within `SKIP_TIMEOUT` of its
     /// expected block time. If the local node is in the active pool,
     /// the coordinator emits a [`Action::BroadcastSkipRequest`]
     /// proposing to abandon the next epoch.

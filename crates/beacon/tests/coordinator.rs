@@ -13,8 +13,8 @@ use std::sync::Arc;
 use common::{ByzantineBehaviour, CoordinatorSim};
 use hyperscale_core::Action;
 use hyperscale_types::{
-    BlockHash, BoundedVec, Epoch, LeafIndex, ShardGroupId, ShardWitness, ShardWitnessPayload,
-    ShardWitnessProof, ValidatorId, Witness,
+    BeaconCert, BlockHash, BoundedVec, Epoch, LeafIndex, ShardGroupId, ShardWitness,
+    ShardWitnessPayload, ShardWitnessProof, ValidatorId, Witness,
 };
 
 /// Three epochs is enough to exercise the closed loop more than once:
@@ -95,8 +95,8 @@ fn cluster_commits_non_empty_proposal_set_per_epoch() {
 
     let first_commit = &sim.commits[0][0];
     assert!(
-        first_commit.state.last_recovery_cert.is_none(),
-        "honest-path commit unexpectedly carries a recovery cert",
+        matches!(first_commit.block.cert(), BeaconCert::Normal(_)),
+        "honest-path commit unexpectedly carries a non-Normal cert",
     );
     assert_eq!(
         first_commit.block.block().committed_proposals().len(),

@@ -1,12 +1,10 @@
 //! Equivocation evidence the local coordinator has observed but not
 //! yet broadcast as a proposal witness.
 //!
-//! Two flavours of evidence land here: PC double-signs (caught at
-//! vote-handler time when conflicting votes arrive at the same
-//! `(validator, epoch, view, round)`) and recovery contradictions
-//! (caught when a validator that signed a recovery request also signs
-//! a finalized block past the request's anchor). Either jails the
-//! equivocator permanently when `apply_epoch` re-runs verification.
+//! PC double-signs land here, caught at vote-handler time when
+//! conflicting votes arrive at the same `(validator, epoch, view,
+//! round)`. `apply_epoch` re-runs verification on inclusion and jails
+//! the equivocator permanently.
 //!
 //! Keyed by `ValidatorId` with first-wins semantics — one piece of
 //! evidence per validator is enough to jail them, so subsequent
@@ -15,9 +13,7 @@
 
 use std::collections::BTreeMap;
 
-use hyperscale_types::{
-    BeaconWitness, EquivocationEvidence, PcVoteEquivocation, RecoveryEquivocation, ValidatorId,
-};
+use hyperscale_types::{BeaconWitness, EquivocationEvidence, PcVoteEquivocation, ValidatorId};
 
 /// Buffered equivocation evidence awaiting inclusion in a beacon
 /// proposal.
@@ -42,19 +38,6 @@ impl EquivocationObservations {
         }
         self.by_validator
             .insert(v, EquivocationEvidence::Vote(Box::new(evidence)));
-        true
-    }
-
-    /// Record a recovery contradiction. Returns `true` if newly
-    /// recorded; `false` if evidence for this validator was already
-    /// buffered.
-    pub fn record_recovery_equivocation(&mut self, evidence: RecoveryEquivocation) -> bool {
-        let v = evidence.validator;
-        if self.by_validator.contains_key(&v) {
-            return false;
-        }
-        self.by_validator
-            .insert(v, EquivocationEvidence::Recovery(Box::new(evidence)));
         true
     }
 
@@ -98,14 +81,10 @@ impl EquivocationObservations {
     }
 }
 
-// Tests temporarily removed during cert-as-authenticator refactor; restore in follow-up.
-
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{
-        BeaconBlockHash, Bls12381G2Signature, Epoch, GenesisConfigHash, Hash, PcValueElement,
-        PcVector, PcVoteRound, RecoveryEquivocation, RecoveryRequest, RecoveryRound, SpcCert,
-        SpcView, ValidatorId,
+        Bls12381G2Signature, Epoch, PcValueElement, PcVector, PcVoteRound, SpcView, ValidatorId,
     };
 
     use super::*;
@@ -122,23 +101,6 @@ mod tests {
             sig_a: Bls12381G2Signature([0x11; 96]),
             value_b: PcVector::new(std::iter::once(element_b)),
             sig_b: Bls12381G2Signature([0x22; 96]),
-        }
-    }
-
-    fn recovery_evidence(v: u64) -> RecoveryEquivocation {
-        RecoveryEquivocation {
-            validator: ValidatorId::new(v),
-            request: RecoveryRequest::new(
-                BeaconBlockHash::from_raw(Hash::from_bytes(b"anchor")),
-                Epoch::new(7),
-                RecoveryRound::new(0),
-                ValidatorId::new(v),
-                Bls12381G2Signature([0x33; 96]),
-            ),
-            block_epoch: Epoch::new(8),
-            block_cert: SpcCert::Genesis {
-                config_hash: GenesisConfigHash::ZERO,
-            },
         }
     }
 
@@ -159,18 +121,10 @@ mod tests {
     }
 
     #[test]
-    fn record_recovery_then_query_round_trips() {
-        let mut e = EquivocationObservations::new();
-        assert!(e.record_recovery_equivocation(recovery_evidence(2)));
-        assert!(e.contains(ValidatorId::new(2)));
-        assert_eq!(e.len(), 1);
-    }
-
-    #[test]
     fn first_wins_when_same_validator_observed_twice() {
         let mut e = EquivocationObservations::new();
         assert!(e.record_pc_equivocation(pc_evidence(3)));
-        assert!(!e.record_recovery_equivocation(recovery_evidence(3)));
+        assert!(!e.record_pc_equivocation(pc_evidence(3)));
         assert_eq!(e.len(), 1);
     }
 
@@ -178,7 +132,7 @@ mod tests {
     fn drain_returns_all_evidence_as_witnesses_and_empties_buffer() {
         let mut e = EquivocationObservations::new();
         e.record_pc_equivocation(pc_evidence(1));
-        e.record_recovery_equivocation(recovery_evidence(2));
+        e.record_pc_equivocation(pc_evidence(2));
         let drained = e.drain_for_proposal();
         assert_eq!(drained.len(), 2);
         for witness in &drained {
@@ -202,7 +156,7 @@ mod tests {
     fn drained_evidence_preserves_validator_id() {
         let mut e = EquivocationObservations::new();
         e.record_pc_equivocation(pc_evidence(7));
-        e.record_recovery_equivocation(recovery_evidence(9));
+        e.record_pc_equivocation(pc_evidence(9));
         let drained = e.drain_for_proposal();
         let validators: Vec<ValidatorId> = drained
             .iter()

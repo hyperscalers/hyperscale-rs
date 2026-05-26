@@ -201,7 +201,6 @@ pub fn make_test_beacon_block(epoch: u64, tag: &[u8]) -> Arc<CertifiedBeaconBloc
     Arc::new(CertifiedBeaconBlock::new_unchecked(
         block,
         BeaconCert::Normal(Box::new(placeholder_cert())),
-        None,
     ))
 }
 
@@ -226,7 +225,6 @@ pub fn make_test_beacon_state(epoch: u64, tag: &[u8]) -> Arc<BeaconState> {
         committee: Vec::new(),
         shard_committees: BTreeMap::new(),
         consumed_through: BTreeMap::new(),
-        last_recovery_cert: None,
         miss_counters: BTreeMap::new(),
     })
 }

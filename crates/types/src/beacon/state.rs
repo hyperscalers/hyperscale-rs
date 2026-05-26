@@ -30,8 +30,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use sbor::prelude::*;
 
 use crate::{
-    Bls12381G1PublicKey, Epoch, LeafIndex, Randomness, RecoveryCertificate, ShardGroupId, Stake,
-    StakePoolId, ValidatorId,
+    Bls12381G1PublicKey, Epoch, LeafIndex, Randomness, ShardGroupId, Stake, StakePoolId,
+    ValidatorId,
 };
 
 // ─── pool types ──────────────────────────────────────────────────────────────
@@ -94,10 +94,6 @@ pub enum JailReason {
     /// own proposal (self-inflicted cryptographic fault, jailed on
     /// first sighting). Unjails after cooldown.
     Performance,
-    /// Jailed by recovery-cert application — the validator was on the
-    /// dead committee at recovery time. Unjails after cooldown (genuine
-    /// outages aren't permanent).
-    Recovery,
     /// Cryptographic proof of byzantine signing. Permanent — the key is
     /// provably hostile, no cooldown unjails it.
     Equivocation,
@@ -225,12 +221,6 @@ pub struct BeaconState {
     /// shard provenance and re-application is idempotent once the
     /// validator is `Jailed { Equivocation }`.
     pub consumed_through: BTreeMap<ShardGroupId, LeafIndex>,
-    /// Most recent recovery cert applied to this state, if any. Drives
-    /// the double-application guard inside recovery-cert handling: a
-    /// later cert at the same anchor only supersedes when its
-    /// `recovery_round` is strictly higher than this one's. Cleared
-    /// implicitly by anchor change.
-    pub last_recovery_cert: Option<RecoveryCertificate>,
     /// Per-validator `MissedProposal` counter, scoped to the current
     /// epoch and the validator's current shard. Incremented when a
     /// `MissedProposal` witness arrives whose proposer is currently
@@ -254,9 +244,6 @@ pub enum TransitionCause {
     /// per-shard committees, the epoch-rotation step for the beacon
     /// committee.
     NaturalShuffle,
-    /// Committee replaced by a [`RecoveryCertificate`] after the old
-    /// committee stalled past the recovery timeout.
-    Recovery,
     /// Committee resampled because the pool-quorum
     /// [`SkipEpochCert`](crate::SkipEpochCert) abandoned the prior
     /// epoch. Same pipeline as `NaturalShuffle` over an empty proposal
@@ -271,9 +258,9 @@ pub enum TransitionCause {
 
 /// Structured description of a committee handover.
 ///
-/// Surfaced both by natural epoch boundaries (in
+/// Surfaced by natural epoch boundaries (in
 /// [`SlotEffects::beacon_committee_transition`] and
-/// [`SlotEffects::shard_committee_transitions`]) and by recovery-cert
+/// [`SlotEffects::shard_committee_transitions`]) and by skip-cert
 /// application, so the runner has a unified signal for "tear down the
 /// SPC instance you were running for `from` and bootstrap a fresh one
 /// with `to`."

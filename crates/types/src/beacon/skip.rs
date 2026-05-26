@@ -1,8 +1,8 @@
 //! Beacon-chain skip primitive: per-validator skip attestations and the
 //! pool-quorum certificate they assemble into.
 //!
-//! When the beacon chain stalls past the recovery timeout at a given
-//! anchor, active validators broadcast individually signed
+//! When the beacon chain stalls past [`SKIP_TIMEOUT`](crate::SKIP_TIMEOUT)
+//! at a given anchor, active validators broadcast individually signed
 //! [`SkipRequest`]s naming `(anchor_hash, epoch_to_skip)`. Once ⌈2M/3⌉ + 1
 //! of the active pool sign the same pair, anyone can aggregate them into
 //! a [`SkipEpochCert`] authenticating an empty skip block at

@@ -80,15 +80,3 @@ pub const MAX_READY_SIGNALS_PER_BLOCK: usize = 32;
 /// Sized to a few minutes at the target shard block rate; validators
 /// re-emit if their original signal expires uncollected.
 pub const MAX_READY_WINDOW_BLOCKS: u64 = 1024;
-
-/// Cap on the cumulative `excluded_validators` field carried in a
-/// [`RecoveryCertificate`](crate::RecoveryCertificate).
-///
-/// Sized as `BEACON_SIGNER_COUNT × MAX_RECOVERY_ROUNDS_PER_EPOCH`
-/// (128 × 8 = 1024) — the maximum cumulative exclusion across all
-/// failed recovery rounds for one epoch before the chain is deemed
-/// unrecoverable algorithmically and falls to social-consensus hard
-/// fork. Any update to either of those constants in
-/// [`crates/beacon/src/constants.rs`](../../../beacon/src/constants.rs)
-/// must keep this number in sync.
-pub const MAX_EXCLUDED_VALIDATORS: usize = 1024;

@@ -115,7 +115,6 @@ fn initial_state() -> BeaconState {
         committee: (0u64..4).map(ValidatorId::new).collect(),
         shard_committees,
         consumed_through: BTreeMap::new(),
-        last_recovery_cert: None,
         miss_counters: BTreeMap::new(),
     }
 }
@@ -136,10 +135,7 @@ fn fifty_epochs_byte_identical_across_replicas() {
                 replica,
                 &network,
                 target,
-                ApplyEpochInput::Normal {
-                    committed: &[],
-                    recovery_cert: None,
-                },
+                ApplyEpochInput::Normal { committed: &[] },
             );
         }
         for i in 1..V {

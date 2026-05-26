@@ -121,7 +121,6 @@ pub fn build_genesis_beacon_state(config: &BeaconGenesisConfig) -> BeaconState {
         committee,
         shard_committees,
         consumed_through: BTreeMap::new(),
-        last_recovery_cert: None,
         miss_counters: BTreeMap::new(),
     }
 }
@@ -271,7 +270,6 @@ mod tests {
         assert_eq!(state.current_epoch, Epoch::GENESIS);
         assert_eq!(state.randomness, cfg.initial_randomness);
         assert!(state.consumed_through.is_empty());
-        assert!(state.last_recovery_cert.is_none());
         assert!(state.miss_counters.is_empty());
     }
 
