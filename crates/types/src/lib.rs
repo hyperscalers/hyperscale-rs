@@ -40,9 +40,9 @@ pub use beacon::{
     PcValueElement, PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation, PcVoteRound,
     PcXpProof, PendingWithdrawal, ReadySignal, RecoveryCertificate, RecoveryEquivocation,
     RecoveryRequest, SHARD_WITNESS_LEAF_DOMAIN_TAG, ShardCommittee, ShardWitness,
-    ShardWitnessPayload, ShardWitnessProof, SkipReport, SlotEffects, SpcCert, SpcEmptyLowEvidence,
-    SpcEmptyViewMsg, SpcHighTriple, SpcMessage, SpcProposalObject, StakePool, TransitionCause,
-    ValidatorRecord, ValidatorStatus, VpcMsgPayload, Witness, genesis_config_hash,
+    ShardWitnessPayload, ShardWitnessProof, SkipReport, SlotEffects, SpcCert, SpcEmptyViewMsg,
+    SpcHighTriple, SpcMessage, SpcProposalObject, StakePool, TransitionCause, ValidatorRecord,
+    ValidatorStatus, VpcMsgPayload, Witness, genesis_config_hash,
 };
 pub use crypto::batch_verify::{
     aggregate_verify_bls_different_messages, batch_verify_bls_different_messages,

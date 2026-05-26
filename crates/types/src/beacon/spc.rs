@@ -55,23 +55,6 @@ pub struct SpcEmptyViewMsg {
     pub sig: Bls12381G2Signature,
 }
 
-/// Evidence that a specific SPC view produced an empty-low output —
-/// the inner PC's certified low is empty, so the view contributed
-/// nothing to the slot's progress.
-///
-/// Surfaced as an effect for the parent coordinator to handle
-/// (logging, accusations, or proposer-schedule input — depending on
-/// the surrounding architecture).
-#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
-pub struct SpcEmptyLowEvidence {
-    /// View whose inner PC certified an empty low. Must be `> 1`
-    /// (view 1 is excused from accusations per paper §7.2.2).
-    pub view: SpcView,
-    /// Round-3 cert from `view`'s inner PC. `proof.x_pp().is_empty()`
-    /// is the empty-low witness.
-    pub proof: PcQc3,
-}
-
 /// One signer's contribution to an [`SpcCert::Indirect`].
 ///
 /// The signer attested that they observed `view = for_view - 1` as
@@ -329,17 +312,6 @@ mod tests {
         let bytes = basic_encode(&m).unwrap();
         let decoded: SpcEmptyViewMsg = basic_decode(&bytes).unwrap();
         assert_eq!(m, decoded);
-    }
-
-    #[test]
-    fn empty_low_evidence_sbor_round_trip() {
-        let e = SpcEmptyLowEvidence {
-            view: SpcView::new(4),
-            proof: sample_pc_qc3(),
-        };
-        let bytes = basic_encode(&e).unwrap();
-        let decoded: SpcEmptyLowEvidence = basic_decode(&bytes).unwrap();
-        assert_eq!(e, decoded);
     }
 
     #[test]

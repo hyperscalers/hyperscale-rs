@@ -885,12 +885,6 @@ impl BeaconCoordinator {
                 SpcEffect::Equivocation { view: _, evidence } => {
                     self.equivocations.record_pc_equivocation(*evidence);
                 }
-                SpcEffect::EmptyLowEvidence(evidence) => {
-                    warn!(
-                        view = evidence.view.inner(),
-                        "SPC empty-low evidence — downstream handling deferred",
-                    );
-                }
                 SpcEffect::OutputHigh { value, cert } => {
                     actions.extend(self.on_spc_output_high(epoch, &value, *cert, recipients));
                 }

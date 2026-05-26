@@ -177,11 +177,8 @@ impl SpcSim {
                         sign_empty_view_msg(&sk, sender, &self.network, &spc_ctx, view, *reported);
                     self.deliver_to_all(&SpcEvent::EmptyView(Box::new(msg)));
                 }
-                SpcEffect::SetTimer { .. }
-                | SpcEffect::EmptyLowEvidence(_)
-                | SpcEffect::Equivocation { .. } => {
-                    // Honest path: no timer firing, no empty-low or
-                    // equivocation to absorb.
+                SpcEffect::SetTimer { .. } | SpcEffect::Equivocation { .. } => {
+                    // Honest path: no timer firing, no equivocation to absorb.
                 }
                 SpcEffect::OutputHigh { value, cert: _ } => {
                     self.outputs[sender_idx] = Some(value);

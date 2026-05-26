@@ -49,8 +49,8 @@ pub use proposal::BeaconProposal;
 pub use ready_signal::ReadySignal;
 pub use recovery::{RecoveryCertificate, RecoveryEquivocation, RecoveryRequest};
 pub use spc::{
-    SkipReport, SpcCert, SpcEmptyLowEvidence, SpcEmptyViewMsg, SpcHighTriple, SpcMessage,
-    SpcProposalObject, VpcMsgPayload,
+    SkipReport, SpcCert, SpcEmptyViewMsg, SpcHighTriple, SpcMessage, SpcProposalObject,
+    VpcMsgPayload,
 };
 pub use state::{
     BeaconState, CommitteeTransition, JailReason, PendingWithdrawal, ShardCommittee, SlotEffects,

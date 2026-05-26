@@ -47,9 +47,9 @@ use hyperscale_types::{
     Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature, DOMAIN_PC_EMPTY_VIEW, Epoch,
     Hash, NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PcQc1, PcQc2, PcQc3, PcValueElement, PcVector,
     PcVoteEquivocation, PositionalBundle, SignerBitfield, SkipReport, SpcCert, SpcContext,
-    SpcEmptyLowEvidence, SpcEmptyViewMsg, SpcHighTriple, SpcMessage, SpcProposalObject, SpcView,
-    ValidatorId, VpcMsgPayload, aggregate_verify_bls_different_messages, pc_context,
-    pc_vote_signing_message, spc_context,
+    SpcEmptyViewMsg, SpcHighTriple, SpcMessage, SpcProposalObject, SpcView, ValidatorId,
+    VpcMsgPayload, aggregate_verify_bls_different_messages, pc_context, pc_vote_signing_message,
+    spc_context,
 };
 
 use crate::pc::{PcEffect, PcEvent, PcInstance, verify_qc3};
@@ -116,10 +116,6 @@ pub fn hash_high_value(v: &PcVector) -> Hash {
 /// Cyclic-shift offset for view `view` in an SPC instance with `n`
 /// parties. Views 1 and 2 use the input ranking (offset 0); from view
 /// 3 the ranking left-shifts by `view - 2 mod n` each step.
-///
-/// Shared between the FSM's view-leader lookup and
-/// `SpcEmptyLowEvidence::accused`-style demotion logic so the two
-/// can't silently drift apart.
 #[must_use]
 pub const fn rank_shift_for_view(view: SpcView, n: usize) -> usize {
     let v = view.inner();
@@ -162,29 +158,6 @@ pub fn verify_empty_view_msg(
     let target = skip_target(msg.view, msg.reported.view, value_hash);
     let signed = pc_vote_signing_message(network, DOMAIN_PC_EMPTY_VIEW, spc_ctx, &target);
     aggregate_verify_bls_different_messages(&[signed.as_slice()], &msg.sig, &[pk])
-}
-
-/// Verify [`SpcEmptyLowEvidence`]: the embedded round-3 cert's `x_pp`
-/// is empty (an empty-low witness) and the cert itself verifies under
-/// the view's PC context.
-///
-/// View 1 is excused from accusations, so evidence for `view <= 1` is
-/// rejected even when otherwise well-formed.
-#[must_use]
-pub fn verify_empty_low_evidence(
-    evidence: &SpcEmptyLowEvidence,
-    network: &NetworkDefinition,
-    spc_ctx: &SpcContext,
-    committee: &[(ValidatorId, Bls12381G1PublicKey)],
-) -> bool {
-    if evidence.view.inner() <= 1 {
-        return false;
-    }
-    let pc_ctx = pc_context(spc_ctx, evidence.view);
-    if !verify_qc3(&evidence.proof, network, &pc_ctx, committee) {
-        return false;
-    }
-    evidence.proof.x_pp().is_empty()
 }
 
 /// Verify an [`SpcCert`] as a beacon-block authenticator, deriving
@@ -673,9 +646,6 @@ pub enum SpcEffect {
         /// Slim wire-form evidence of the double-sign.
         evidence: Box<PcVoteEquivocation>,
     },
-    /// View `> 1` produced an empty low — surface evidence to the
-    /// parent for downstream handling.
-    EmptyLowEvidence(Box<SpcEmptyLowEvidence>),
     /// Sign an empty-view attestation reporting `reported` as our
     /// max high triple and broadcast it — we produced a high output
     /// at `view` but our local table can't resolve its parent, so
@@ -1001,13 +971,6 @@ impl SpcInstance {
             return vec![];
         }
         let mut out = vec![];
-        // Empty low at view > 1 → record evidence.
-        if low.is_empty() {
-            out.push(SpcEffect::EmptyLowEvidence(Box::new(SpcEmptyLowEvidence {
-                view,
-                proof: proof.clone(),
-            })));
-        }
         if self.new_commit_broadcast.insert(view) {
             out.push(SpcEffect::BroadcastNewCommit {
                 view,
@@ -1455,18 +1418,6 @@ mod tests {
         assert_ne!(t1, t2);
         assert_ne!(t1, t3);
         assert_ne!(t1, t4);
-    }
-
-    /// `verify_empty_low_evidence` rejects evidence for view 1 even
-    /// when otherwise well-formed — view 1 is excused from accusations.
-    #[test]
-    fn verify_empty_low_evidence_rejects_view_one() {
-        let c = committee(4);
-        let evidence = SpcEmptyLowEvidence {
-            view: SpcView::new(1),
-            proof: dummy_pc_qc3(),
-        };
-        assert!(!verify_empty_low_evidence(&evidence, &net(), &ctx(), &c));
     }
 
     /// Direct cert with `prev_view + 1 != entering_view` is rejected
