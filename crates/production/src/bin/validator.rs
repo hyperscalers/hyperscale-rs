@@ -69,10 +69,9 @@ use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage_rocksdb::{
     CompressionType as RocksCompressionType, RocksDbConfig, RocksDbShardStorage,
 };
-use hyperscale_topology::TopologyCoordinator;
 use hyperscale_types::{
-    Bls12381G1PrivateKey, Bls12381G1PublicKey, ShardGroupId, ValidatorId, ValidatorInfo,
-    ValidatorSet, VotePower, bls_keypair_from_seed, generate_bls_keypair,
+    Bls12381G1PrivateKey, Bls12381G1PublicKey, ShardGroupId, TopologySnapshot, ValidatorId,
+    ValidatorInfo, ValidatorSet, VotePower, bls_keypair_from_seed, generate_bls_keypair,
 };
 use igd_next::aio::tokio::search_gateway;
 use igd_next::{PortMappingProtocol, SearchOptions};
@@ -664,7 +663,7 @@ fn build_topology(
     num_shards: u64,
     genesis: &GenesisConfig,
     local_keypair: &Bls12381G1PrivateKey,
-) -> Result<TopologyCoordinator> {
+) -> Result<Arc<TopologySnapshot>> {
     use std::collections::HashMap;
 
     // Build validator set from genesis config
@@ -732,14 +731,14 @@ fn build_topology(
                 .push(ValidatorId::new(v.id));
         }
 
-        Ok(TopologyCoordinator::with_shard_committees(
+        Ok(Arc::new(TopologySnapshot::with_shard_committees(
             network,
             local_validator_id,
             local_shard,
             num_shards,
             &validator_set,
             shard_committees,
-        ))
+        )))
     } else {
         // No explicit shard assignments: all genesis validators belong to the
         // local shard, which only works for single-shard deployments.
@@ -750,13 +749,13 @@ fn build_topology(
             );
         }
 
-        Ok(TopologyCoordinator::with_local_shard(
+        Ok(Arc::new(TopologySnapshot::with_local_shard(
             network,
             local_validator_id,
             local_shard,
             num_shards,
             validator_set,
-        ))
+        )))
     }
 }
 
@@ -1207,8 +1206,8 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
         info!(
             validator_id = entry.validator_id,
             shard = entry.shard,
-            committee_size = topology.snapshot().local_committee_size(),
-            quorum_threshold = topology.snapshot().local_quorum_threshold().inner(),
+            committee_size = topology.local_committee_size(),
+            quorum_threshold = topology.local_quorum_threshold().inner(),
             "Topology initialized for vnode"
         );
 

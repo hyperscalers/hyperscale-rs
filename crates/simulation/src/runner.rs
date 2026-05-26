@@ -24,11 +24,10 @@ use hyperscale_provisions::{ProvisionConfig, ProvisionStore};
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{RecoveredState, ShardChainReader};
 use hyperscale_storage_memory::SimShardStorage;
-use hyperscale_topology::TopologyCoordinator;
 use hyperscale_types::{
     BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey, CertifiedBlock, LocalTimestamp, NodeId,
-    QuorumCertificate, ShardGroupId, TransactionStatus, TxHash, ValidatorId, ValidatorInfo,
-    ValidatorSet, VotePower, bls_keypair_from_seed, shard_for_node,
+    QuorumCertificate, ShardGroupId, TopologySnapshot, TransactionStatus, TxHash, ValidatorId,
+    ValidatorInfo, ValidatorSet, VotePower, bls_keypair_from_seed, shard_for_node,
 };
 use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
@@ -243,14 +242,14 @@ impl SimulationRunner {
                 for &validator_idx in validator_idxs {
                     let validator_id = ValidatorId::new(u64::from(validator_idx));
 
-                    let topology_state = TopologyCoordinator::with_shard_committees(
+                    let topology_state = Arc::new(TopologySnapshot::with_shard_committees(
                         NetworkDefinition::simulator(),
                         validator_id,
                         *shard,
                         u64::from(network_config.num_shards),
                         &global_validator_set,
                         shard_committees.clone(),
-                    );
+                    ));
 
                     let key_bytes = keys[validator_idx as usize].to_bytes();
                     let signing_key = Arc::new(
@@ -264,9 +263,8 @@ impl SimulationRunner {
                     // works across both same-shard and cross-shard
                     // hosting.
                     if topology_arc_for_host.is_none() {
-                        topology_arc_for_host = Some(Arc::new(ArcSwap::from(Arc::clone(
-                            topology_state.snapshot(),
-                        ))));
+                        topology_arc_for_host =
+                            Some(Arc::new(ArcSwap::from(Arc::clone(&topology_state))));
                     }
 
                     let state = NodeStateMachine::new(

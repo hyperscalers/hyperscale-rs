@@ -30,19 +30,19 @@ impl NodeStateMachine {
                 );
                 actions.extend(
                     self.execution_coordinator
-                        .emit_vote_actions(self.topology_coordinator.snapshot()),
+                        .emit_vote_actions(&self.topology_snapshot),
                 );
                 actions
             }
             ProtocolEvent::ExecutionVoteReceived { vote } => self
                 .execution_coordinator
-                .on_execution_vote(self.topology_coordinator.snapshot(), vote),
+                .on_execution_vote(&self.topology_snapshot, vote),
             ProtocolEvent::ExecutionVotesVerifiedAndAggregated {
                 wave_id,
                 block_hash,
                 verified_votes,
             } => self.execution_coordinator.on_votes_verified(
-                self.topology_coordinator.snapshot(),
+                &self.topology_snapshot,
                 wave_id,
                 block_hash,
                 verified_votes,
@@ -51,12 +51,12 @@ impl NodeStateMachine {
                 wave_id,
                 certificate,
             } => self.execution_coordinator.on_certificate_aggregated(
-                self.topology_coordinator.snapshot(),
+                &self.topology_snapshot,
                 &wave_id,
                 &certificate,
             ),
             ProtocolEvent::ExecutionCertificatesReceived { certificates } => {
-                let topology = self.topology_coordinator.snapshot();
+                let topology = &self.topology_snapshot;
                 let mut actions = Vec::new();
                 for cert in certificates {
                     actions.extend(
@@ -67,7 +67,7 @@ impl NodeStateMachine {
                 actions
             }
             ProtocolEvent::FinalizedWavesReceived { waves } => {
-                let topology = self.topology_coordinator.snapshot();
+                let topology = &self.topology_snapshot;
                 let mut actions = Vec::new();
                 for wave in waves {
                     actions.extend(
@@ -82,9 +82,9 @@ impl NodeStateMachine {
                 .on_finalized_wave_verified(wave, valid),
             ProtocolEvent::ExecutionCertificateSignatureVerified { certificate, valid } => self
                 .execution_coordinator
-                .on_certificate_verified(self.topology_coordinator.snapshot(), certificate, valid),
+                .on_certificate_verified(&self.topology_snapshot, certificate, valid),
             ProtocolEvent::ExecutionCertificateAdmitted { certificate } => {
-                let local_shard = self.topology_coordinator.snapshot().local_shard();
+                let local_shard = self.topology_snapshot.local_shard();
                 let mut actions = Vec::new();
                 // If the EC is for a remote wave where we were a source, the
                 // target shard's tx_outcomes acknowledge outbound batches we
@@ -100,7 +100,7 @@ impl NodeStateMachine {
                 // Remote EC abort propagation may unlock local accumulators — re-scan.
                 actions.extend(
                     self.execution_coordinator
-                        .emit_vote_actions(self.topology_coordinator.snapshot()),
+                        .emit_vote_actions(&self.topology_snapshot),
                 );
                 actions
             }

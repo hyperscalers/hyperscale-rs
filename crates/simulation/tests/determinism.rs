@@ -1580,11 +1580,10 @@ fn test_cross_shard_latency() {
 fn test_cross_shard_transaction_detection() {
     use std::collections::HashMap;
 
-    use hyperscale_topology::TopologyCoordinator;
     use hyperscale_types::test_utils::{test_node, test_transaction_with_nodes};
     use hyperscale_types::{
-        Bls12381G1PrivateKey, ShardGroupId, ValidatorId, ValidatorInfo, ValidatorSet, VotePower,
-        generate_bls_keypair,
+        Bls12381G1PrivateKey, ShardGroupId, TopologySnapshot, ValidatorId, ValidatorInfo,
+        ValidatorSet, VotePower, generate_bls_keypair,
     };
 
     // Create a 2-shard network with 2 validators per shard
@@ -1611,7 +1610,7 @@ fn test_cross_shard_transaction_detection() {
         vec![ValidatorId::new(2), ValidatorId::new(3)],
     );
 
-    let topology = TopologyCoordinator::with_shard_committees(
+    let topology = TopologySnapshot::with_shard_committees(
         NetworkDefinition::simulator(),
         ValidatorId::new(0),
         ShardGroupId::new(0),
@@ -1625,9 +1624,9 @@ fn test_cross_shard_transaction_detection() {
     let node_b = test_node(1);
     let node_c = test_node(100);
 
-    let shard_a = topology.snapshot().shard_for_node_id(&node_a);
-    let shard_b = topology.snapshot().shard_for_node_id(&node_b);
-    let shard_c = topology.snapshot().shard_for_node_id(&node_c);
+    let shard_a = topology.shard_for_node_id(&node_a);
+    let shard_b = topology.shard_for_node_id(&node_b);
+    let shard_c = topology.shard_for_node_id(&node_c);
 
     println!("Node A shard: {shard_a:?}");
     println!("Node B shard: {shard_b:?}");
@@ -1636,7 +1635,7 @@ fn test_cross_shard_transaction_detection() {
     // Create a single-shard transaction (all nodes in same shard)
     let same_shard_nodes: Vec<_> = (0..10u8)
         .map(test_node)
-        .filter(|n| topology.snapshot().shard_for_node_id(n) == ShardGroupId::new(0))
+        .filter(|n| topology.shard_for_node_id(n) == ShardGroupId::new(0))
         .take(2)
         .collect();
 
@@ -1646,7 +1645,7 @@ fn test_cross_shard_transaction_detection() {
             vec![same_shard_nodes[0]],
             vec![same_shard_nodes[1]],
         );
-        let shards = topology.snapshot().all_shards_for_transaction(&tx);
+        let shards = topology.all_shards_for_transaction(&tx);
         println!("Single-shard tx touches shards: {shards:?}");
         assert_eq!(shards.len(), 1, "Single-shard tx should touch 1 shard");
     }
@@ -1654,14 +1653,14 @@ fn test_cross_shard_transaction_detection() {
     // Create a cross-shard transaction (nodes in different shards)
     let shard0_node = (0..255u8)
         .map(test_node)
-        .find(|n| topology.snapshot().shard_for_node_id(n) == ShardGroupId::new(0));
+        .find(|n| topology.shard_for_node_id(n) == ShardGroupId::new(0));
     let shard1_node = (0..255u8)
         .map(test_node)
-        .find(|n| topology.snapshot().shard_for_node_id(n) == ShardGroupId::new(1));
+        .find(|n| topology.shard_for_node_id(n) == ShardGroupId::new(1));
 
     if let (Some(node0), Some(node1)) = (shard0_node, shard1_node) {
         let tx = test_transaction_with_nodes(b"cross_shard_tx", vec![node0], vec![node1]);
-        let shards = topology.snapshot().all_shards_for_transaction(&tx);
+        let shards = topology.all_shards_for_transaction(&tx);
         println!("Cross-shard tx touches shards: {shards:?}");
         assert_eq!(shards.len(), 2, "Cross-shard tx should touch 2 shards");
     }

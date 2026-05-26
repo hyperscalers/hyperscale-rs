@@ -19,8 +19,7 @@ use hyperscale_provisions::{ProvisionConfig, ProvisionStore};
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::RecoveredState;
 use hyperscale_test_helpers::TestCommittee;
-use hyperscale_topology::TopologyCoordinator;
-use hyperscale_types::ValidatorSet;
+use hyperscale_types::{TopologySnapshot, ValidatorSet};
 
 use super::NodeStateMachine;
 
@@ -75,12 +74,12 @@ impl TestNodeBuilder {
         let snapshot = committee.topology_snapshot(self.local_idx, self.num_shards);
         let validator_set: ValidatorSet = (**snapshot.global_validator_set()).clone();
         let local_validator_id = committee.validator_id(self.local_idx);
-        let topology = TopologyCoordinator::new(
+        let topology = Arc::new(TopologySnapshot::new(
             snapshot.network().clone(),
             local_validator_id,
             self.num_shards,
             validator_set,
-        );
+        ));
         let provision_store = Arc::new(ProvisionStore::new());
 
         let node = NodeStateMachine::new(

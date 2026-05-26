@@ -33,7 +33,7 @@ impl NodeStateMachine {
         let max_txs = MAX_TXS_PER_BLOCK
             + self
                 .shard_coordinator
-                .dedup_overhead(self.topology_coordinator.snapshot().local_shard());
+                .dedup_overhead(self.topology_snapshot.local_shard());
         let ready_txs = self.mempool_coordinator.ready_transactions(
             max_txs,
             pending_txs,
@@ -57,7 +57,7 @@ impl NodeStateMachine {
         let inputs = self.gather_proposal_inputs(pending_txs, pending_certs);
 
         self.shard_coordinator.try_propose(
-            self.topology_coordinator.snapshot(),
+            &self.topology_snapshot,
             &inputs.ready_txs,
             inputs.finalized_waves,
             inputs.provisions,

@@ -22,7 +22,7 @@ impl NodeStateMachine {
         // and local certificate creation time to fill in missing data first.
         actions.extend(
             self.shard_coordinator
-                .check_pending_block_fetches(self.topology_coordinator.snapshot(), false),
+                .check_pending_block_fetches(&self.topology_snapshot, false),
         );
 
         // Check if we're behind and need to catch up via sync. Handles the
@@ -30,7 +30,7 @@ impl NodeStateMachine {
         // but we're stuck.
         actions.extend(
             self.shard_coordinator
-                .check_sync_health(self.topology_coordinator.snapshot()),
+                .check_sync_health(&self.topology_snapshot),
         );
 
         // Drop tombstones whose `end_timestamp_exclusive` has passed — past
@@ -48,7 +48,7 @@ impl NodeStateMachine {
     pub(super) fn on_view_change_timer(&mut self) -> Vec<Action> {
         if let Some(actions) = self
             .shard_coordinator
-            .check_round_timeout(self.topology_coordinator.snapshot())
+            .check_round_timeout(&self.topology_snapshot)
         {
             actions
         } else {

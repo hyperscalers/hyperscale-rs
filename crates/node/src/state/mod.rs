@@ -2,8 +2,8 @@
 //!
 //! [`NodeStateMachine`] composes the per-domain coordinators —
 //! [`ShardCoordinator`], [`ExecutionCoordinator`], [`MempoolCoordinator`],
-//! [`ProvisionCoordinator`], [`RemoteHeaderCoordinator`], and
-//! [`TopologyCoordinator`] — into a single deterministic
+//! [`ProvisionCoordinator`], [`RemoteHeaderCoordinator`] — over a
+//! shared [`TopologySnapshot`] into a single deterministic
 //! [`StateMachine`] over [`ProtocolEvent`] inputs and [`Action`] outputs.
 //!
 //! All consensus-critical mutation flows through this state machine.
@@ -39,7 +39,6 @@ use hyperscale_provisions::{
 use hyperscale_remote_headers::RemoteHeaderCoordinator;
 use hyperscale_shard::{ShardConsensusConfig, ShardCoordinator};
 use hyperscale_storage::RecoveredState;
-use hyperscale_topology::TopologyCoordinator;
 use hyperscale_types::{Block, LocalTimestamp, ShardGroupId, StateRoot, TopologySnapshot};
 use tracing::instrument;
 
@@ -55,7 +54,7 @@ use tracing::instrument;
 /// which routes it to shard consensus.
 pub struct NodeStateMachine {
     /// Network topology — passed by reference to subsystem methods.
-    topology_coordinator: TopologyCoordinator,
+    topology_snapshot: Arc<TopologySnapshot>,
 
     /// Shard consensus state (includes implicit round advancement).
     shard_coordinator: ShardCoordinator,
@@ -83,14 +82,8 @@ pub struct NodeStateMachine {
 impl std::fmt::Debug for NodeStateMachine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NodeStateMachine")
-            .field(
-                "validator",
-                &self.topology_coordinator.snapshot().local_validator_id(),
-            )
-            .field(
-                "shard_id",
-                &self.topology_coordinator.snapshot().local_shard(),
-            )
+            .field("validator", &self.topology_snapshot.local_validator_id())
+            .field("shard_id", &self.topology_snapshot.local_shard())
             .field("shard_coordinator", &self.shard_coordinator)
             .field("now", &self.now)
             .finish_non_exhaustive()
@@ -107,7 +100,7 @@ impl NodeStateMachine {
     #[must_use]
     #[allow(clippy::too_many_arguments)] // per-shard-shared stores threaded explicitly
     pub fn new(
-        topology_coordinator: TopologyCoordinator,
+        topology_snapshot: Arc<TopologySnapshot>,
         shard_config: &ShardConsensusConfig,
         recovered: RecoveredState,
         mempool_config: MempoolConfig,
@@ -130,7 +123,7 @@ impl NodeStateMachine {
             ),
             outbound_provisions: OutboundProvisionTracker::new(provision_store),
             remote_headers_coordinator: RemoteHeaderCoordinator::new(),
-            topology_coordinator,
+            topology_snapshot,
             now: LocalTimestamp::ZERO,
         }
     }
@@ -140,13 +133,13 @@ impl NodeStateMachine {
     /// Get this node's shard.
     #[must_use]
     pub fn shard_id(&self) -> ShardGroupId {
-        self.topology_coordinator.snapshot().local_shard()
+        self.topology_snapshot.local_shard()
     }
 
     /// Get the current topology snapshot.
     #[must_use]
     pub fn topology(&self) -> &TopologySnapshot {
-        self.topology_coordinator.snapshot()
+        &self.topology_snapshot
     }
 
     /// Get the current topology snapshot as an `Arc`, for sites that
@@ -156,7 +149,7 @@ impl NodeStateMachine {
     /// handler reads.
     #[must_use]
     pub const fn topology_arc(&self) -> &Arc<TopologySnapshot> {
-        self.topology_coordinator.snapshot()
+        &self.topology_snapshot
     }
 
     /// Get a reference to the mempool coordinator.
@@ -206,14 +199,14 @@ impl NodeStateMachine {
     /// Returns actions to be processed (e.g., initial timers).
     pub fn initialize_genesis(&mut self, genesis: &Block) -> Vec<Action> {
         self.shard_coordinator
-            .initialize_genesis(self.topology_coordinator.snapshot(), genesis)
+            .initialize_genesis(&self.topology_snapshot, genesis)
     }
 }
 
 impl StateMachine for NodeStateMachine {
     #[instrument(skip(self), fields(
-        validator = self.topology_coordinator.snapshot().local_validator_id().inner(),
-        shard = self.topology_coordinator.snapshot().local_shard().inner(),
+        validator = self.topology_snapshot.local_validator_id().inner(),
+        shard = self.topology_snapshot.local_shard().inner(),
         event = %event.type_name(),
         height = self.shard_coordinator.committed_height().inner(),
     ))]
@@ -286,7 +279,7 @@ impl StateMachine for NodeStateMachine {
         };
 
         // Drain any state root verifications that became ready during this event.
-        let local_shard = self.topology_coordinator.snapshot().local_shard();
+        let local_shard = self.topology_snapshot.local_shard();
         for ready in self
             .shard_coordinator
             .drain_ready_state_root_verifications(local_shard)

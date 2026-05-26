@@ -14,7 +14,7 @@ impl NodeStateMachine {
         match event {
             ProtocolEvent::ProvisionsReceived { provisions } => {
                 self.provisions_coordinator.on_state_provisions_received(
-                    self.topology_coordinator.snapshot(),
+                    &self.topology_snapshot,
                     std::sync::Arc::unwrap_or_clone(provisions),
                 )
             }
@@ -31,7 +31,7 @@ impl NodeStateMachine {
             ProtocolEvent::ProvisionsAdmitted { provisions, .. } => {
                 let actions = self
                     .shard_coordinator
-                    .on_provisions_admitted(self.topology_coordinator.snapshot(), &[provisions]);
+                    .on_provisions_admitted(&self.topology_snapshot, &[provisions]);
                 self.shard_coordinator.queue_ready_proposal();
                 actions
             }

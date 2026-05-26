@@ -6,10 +6,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use hyperscale_network::ValidatorKeyMap;
-use hyperscale_topology::TopologyCoordinator;
 use hyperscale_types::{
-    Bls12381G1PrivateKey, Bls12381G1PublicKey, NetworkDefinition, ShardGroupId, ValidatorId,
-    ValidatorInfo, ValidatorSet, VotePower, bls_keypair_from_seed,
+    Bls12381G1PrivateKey, Bls12381G1PublicKey, NetworkDefinition, ShardGroupId, TopologySnapshot,
+    ValidatorId, ValidatorInfo, ValidatorSet, VotePower, bls_keypair_from_seed,
 };
 use libp2p::identity::Keypair;
 use libp2p::identity::ed25519::{Keypair as Ed25519Keypair, SecretKey};
@@ -27,7 +26,7 @@ pub struct TestFixtures {
     pub ed25519_keys: Vec<Keypair>,
 
     /// Per-validator topologies.
-    topologies: Vec<TopologyCoordinator>,
+    topologies: Vec<Arc<TopologySnapshot>>,
 
     /// Number of validators.
     pub num_validators: u32,
@@ -113,20 +112,20 @@ impl TestFixtures {
         }
 
         // Create per-validator topologies
-        let topologies: Vec<TopologyCoordinator> = (0..num_validators)
+        let topologies: Vec<Arc<TopologySnapshot>> = (0..num_validators)
             .map(|i| {
                 let shard_id = u64::from(i) / u64::from(validators_per_shard);
                 let shard = ShardGroupId::new(shard_id);
                 let validator_id = ValidatorId::new(u64::from(i));
 
-                TopologyCoordinator::with_shard_committees(
+                Arc::new(TopologySnapshot::with_shard_committees(
                     NetworkDefinition::simulator(),
                     validator_id,
                     shard,
                     num_shards,
                     &global_validator_set,
                     shard_committees.clone(),
-                )
+                ))
             })
             .collect();
 
@@ -141,13 +140,13 @@ impl TestFixtures {
     }
 
     /// Get the topology for a validator by index.
-    pub fn topology(&self, index: u32) -> TopologyCoordinator {
-        self.topologies[index as usize].clone()
+    pub fn topology(&self, index: u32) -> Arc<TopologySnapshot> {
+        Arc::clone(&self.topologies[index as usize])
     }
 
     /// Extract a validator key map for network adapter construction.
     pub fn validator_key_map(&self, index: u32) -> Arc<ValidatorKeyMap> {
-        let snapshot = self.topologies[index as usize].snapshot();
+        let snapshot = &self.topologies[index as usize];
         Arc::new(
             snapshot
                 .global_validator_set()
@@ -257,16 +256,10 @@ mod tests {
         let fixtures = TestFixtures::new(42, 4);
 
         let topology = fixtures.topology(0);
-        assert_eq!(
-            topology.snapshot().local_validator_id(),
-            ValidatorId::new(0)
-        );
-        assert_eq!(topology.snapshot().local_shard(), ShardGroupId::new(0));
+        assert_eq!(topology.local_validator_id(), ValidatorId::new(0));
+        assert_eq!(topology.local_shard(), ShardGroupId::new(0));
 
         let topology2 = fixtures.topology(2);
-        assert_eq!(
-            topology2.snapshot().local_validator_id(),
-            ValidatorId::new(2)
-        );
+        assert_eq!(topology2.local_validator_id(), ValidatorId::new(2));
     }
 }

@@ -86,7 +86,7 @@ impl NodeStateMachine {
                 // Route through the centralized remote header coordinator.
                 // Structural pre-checks happen there; downstream consumers
                 // receive headers via `RemoteHeaderAdmitted`.
-                let topology = self.topology_coordinator.snapshot();
+                let topology = &self.topology_snapshot;
                 self.remote_headers_coordinator.on_remote_header_received(
                     topology,
                     committed_header,
@@ -95,10 +95,10 @@ impl NodeStateMachine {
             }
             ProtocolEvent::BlockVoteReceived { vote } => self
                 .shard_coordinator
-                .on_block_vote(self.topology_coordinator.snapshot(), vote),
+                .on_block_vote(&self.topology_snapshot, vote),
             ProtocolEvent::ReadySignalReceived { signal } => {
                 self.shard_coordinator
-                    .on_ready_signal_received(self.topology_coordinator.snapshot(), signal);
+                    .on_ready_signal_received(&self.topology_snapshot, signal);
                 Vec::new()
             }
             ProtocolEvent::BlockReadyToCommit {
@@ -106,7 +106,7 @@ impl NodeStateMachine {
                 qc,
                 source,
             } => self.shard_coordinator.on_block_ready_to_commit(
-                self.topology_coordinator.snapshot(),
+                &self.topology_snapshot,
                 block_hash,
                 qc,
                 source,
@@ -116,14 +116,14 @@ impl NodeStateMachine {
                 qc,
                 verified_votes,
             } => self.shard_coordinator.on_qc_result(
-                self.topology_coordinator.snapshot(),
+                &self.topology_snapshot,
                 block_hash,
                 qc,
                 verified_votes,
             ),
             ProtocolEvent::QcSignatureVerified { block_hash, valid } => self
                 .shard_coordinator
-                .on_qc_signature_verified(self.topology_coordinator.snapshot(), block_hash, valid),
+                .on_qc_signature_verified(&self.topology_snapshot, block_hash, valid),
             ProtocolEvent::RemoteHeaderQcVerified {
                 shard,
                 height,
@@ -132,7 +132,7 @@ impl NodeStateMachine {
             } => self
                 .remote_headers_coordinator
                 .on_remote_header_qc_verified(
-                    self.topology_coordinator.snapshot(),
+                    &self.topology_snapshot,
                     shard,
                     height,
                     committed_header,
@@ -142,7 +142,7 @@ impl NodeStateMachine {
                 // Fan out the verified header to downstream consumers. Shard consensus
                 // already received the header in `RemoteHeaderQcVerified`
                 // (early insertion for deferral proof validation).
-                let topology = self.topology_coordinator.snapshot();
+                let topology = &self.topology_snapshot;
                 let shard = committed_header.shard_group_id();
 
                 self.execution_coordinator.on_verified_remote_header(
@@ -160,7 +160,7 @@ impl NodeStateMachine {
                 block_hash,
                 valid,
             } => self.shard_coordinator.on_block_root_verified(
-                self.topology_coordinator.snapshot(),
+                &self.topology_snapshot,
                 kind,
                 block_hash,
                 valid,
@@ -174,7 +174,7 @@ impl NodeStateMachine {
                 finalized_waves,
                 provisions,
             } => self.shard_coordinator.on_proposal_built(
-                self.topology_coordinator.snapshot(),
+                &self.topology_snapshot,
                 height,
                 round,
                 &block,
@@ -193,7 +193,7 @@ impl NodeStateMachine {
             ProtocolEvent::BlockPersisted { height, .. } => {
                 let mut actions = self
                     .shard_coordinator
-                    .on_block_persisted(self.topology_coordinator.snapshot(), height);
+                    .on_block_persisted(&self.topology_snapshot, height);
                 // If shard consensus just resumed from sync, reschedule the cleanup timer.
                 if !actions.is_empty() {
                     actions.push(Action::SetTimer {
@@ -205,7 +205,7 @@ impl NodeStateMachine {
             }
             ProtocolEvent::FinalizedWavesAdmitted { waves } => self
                 .shard_coordinator
-                .on_finalized_waves_admitted(self.topology_coordinator.snapshot(), &waves),
+                .on_finalized_waves_admitted(&self.topology_snapshot, &waves),
             _ => unreachable!("non-shard event routed to handle_shard"),
         }
     }
@@ -261,7 +261,7 @@ impl NodeStateMachine {
         }
 
         self.shard_coordinator.on_block_header(
-            self.topology_coordinator.snapshot(),
+            &self.topology_snapshot,
             header,
             manifest,
             |h| self.mempool_coordinator.get_transaction(h),
@@ -282,7 +282,7 @@ impl NodeStateMachine {
         let inputs = self.gather_proposal_inputs(pending_tx_count, pending_cert_count);
 
         self.shard_coordinator.on_qc_formed(
-            self.topology_coordinator.snapshot(),
+            &self.topology_snapshot,
             block_hash,
             qc,
             &inputs.ready_txs,
@@ -311,13 +311,13 @@ impl NodeStateMachine {
         // commit paths.
         actions.extend(
             self.mempool_coordinator
-                .on_block_committed(self.topology_coordinator.snapshot(), certified),
+                .on_block_committed(&self.topology_snapshot, certified),
         );
 
         // Remote header coordinator: update liveness and check for timeouts.
         actions.extend(
             self.remote_headers_coordinator
-                .on_block_committed(self.topology_coordinator.snapshot(), certified),
+                .on_block_committed(&self.topology_snapshot, certified),
         );
 
         // Provisions coordinator: prune + schedule fallback timeouts. Reads
@@ -355,7 +355,7 @@ impl NodeStateMachine {
 
         actions.extend(
             self.execution_coordinator
-                .on_block_committed(self.topology_coordinator.snapshot(), certified),
+                .on_block_committed(&self.topology_snapshot, certified),
         );
 
         // Round voting: scan all incomplete waves and emit votes for
@@ -365,7 +365,7 @@ impl NodeStateMachine {
         // validators at this height produce the same votes.
         actions.extend(
             self.execution_coordinator
-                .emit_vote_actions(self.topology_coordinator.snapshot()),
+                .emit_vote_actions(&self.topology_snapshot),
         );
 
         actions

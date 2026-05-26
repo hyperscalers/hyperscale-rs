@@ -16,7 +16,6 @@ hyperscale-mempool.workspace = true
 hyperscale-network.workspace = true
 hyperscale-provisions.workspace = true
 hyperscale-remote-headers.workspace = true
-hyperscale-topology.workspace = true
 hyperscale-storage.workspace = true
 hyperscale-types.workspace = true
 arc-swap.workspace = true

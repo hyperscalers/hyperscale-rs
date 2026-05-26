@@ -15,7 +15,6 @@ hyperscale-node.workspace = true
 hyperscale-provisions.workspace = true
 hyperscale-storage.workspace = true
 hyperscale-storage-memory.workspace = true
-hyperscale-topology.workspace = true
 hyperscale-types.workspace = true
 hyperscale-dispatch-sync.workspace = true
 

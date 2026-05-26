@@ -45,11 +45,10 @@ use hyperscale_provisions::{ProvisionConfig, ProvisionStore};
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::ShardChainReader;
 use hyperscale_storage_rocksdb::{RocksDbShardStorage, SharedStorage};
-use hyperscale_topology::TopologyCoordinator;
 use hyperscale_types::{
     Block, BlockHeight, Bls12381G1PrivateKey, CertifiedBlock, InFlightCount, LocalTimestamp,
     MAX_TX_IN_FLIGHT, NodeId, QuorumCertificate, RoutableTransaction, ShardGroupId,
-    TransactionStatus, TxHash, ValidatorId, shard_for_node,
+    TopologySnapshot, TransactionStatus, TxHash, ValidatorId, shard_for_node,
 };
 use libp2p::identity::Keypair;
 use quick_cache::sync::Cache as QuickCache;
@@ -130,7 +129,7 @@ impl Drop for ShutdownHandle {
 pub struct VnodeConfig {
     /// Per-validator topology view. Provides this vnode's `validator_id`,
     /// `local_shard`, and the shard committee membership it participates in.
-    pub topology: TopologyCoordinator,
+    pub topology: Arc<TopologySnapshot>,
     /// BLS signing key for this validator's votes, proposals, and the
     /// per-session validator-bind attestation. Held by `Arc` so the same
     /// allocation is shared between the bind service, the state machine,
@@ -316,7 +315,7 @@ impl ProductionRunnerBuilder {
         // referenced by a vnode must have a matching storage entry.
         let local_shards: HashSet<ShardGroupId> = vnode_configs
             .iter()
-            .map(|cfg| cfg.topology.snapshot().local_shard())
+            .map(|cfg| cfg.topology.local_shard())
             .collect();
         for shard in &local_shards {
             assert!(
@@ -327,7 +326,7 @@ impl ProductionRunnerBuilder {
         // Recovery reads from a single shard's storage. Pick the first
         // hosted shard arbitrarily — every hosted storage exposes the
         // same `RecoveredState` shape.
-        let recovery_shard = vnode_configs[0].topology.snapshot().local_shard();
+        let recovery_shard = vnode_configs[0].topology.local_shard();
         let recovery_storage = Arc::clone(
             storages
                 .get(&recovery_shard)
@@ -337,15 +336,13 @@ impl ProductionRunnerBuilder {
         // The shared snapshot drives off-thread handlers that read
         // shard-level info only. We seed it with the first vnode's
         // snapshot; per-vnode snapshots are taken inside dispatch.
-        let topology: SharedTopologySnapshot = Arc::new(ArcSwap::from(Arc::clone(
-            vnode_configs[0].topology.snapshot(),
-        )));
+        let topology: SharedTopologySnapshot =
+            Arc::new(ArcSwap::from(Arc::clone(&vnode_configs[0].topology)));
 
         // Extract initial validator keys for network-layer bind verification.
         let initial_validator_keys: Arc<ValidatorKeyMap> = Arc::new(
             vnode_configs[0]
                 .topology
-                .snapshot()
                 .global_validator_set()
                 .validators
                 .iter()
@@ -358,7 +355,7 @@ impl ProductionRunnerBuilder {
         let bind_vnodes: Vec<(ValidatorId, Arc<Bls12381G1PrivateKey>)> = vnode_configs
             .iter()
             .map(|cfg| {
-                let vid = cfg.topology.snapshot().local_validator_id();
+                let vid = cfg.topology.local_validator_id();
                 (vid, Arc::clone(&cfg.signing_key))
             })
             .collect();
@@ -422,7 +419,7 @@ impl ProductionRunnerBuilder {
         let vnode_inits: Vec<VnodeInit> = vnode_configs
             .into_iter()
             .map(|cfg| {
-                let shard = cfg.topology.snapshot().local_shard();
+                let shard = cfg.topology.local_shard();
                 let provision_store = Arc::clone(
                     provision_stores
                         .get(&shard)

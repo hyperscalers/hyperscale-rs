@@ -31,7 +31,7 @@ impl NodeStateMachine {
             ProtocolEvent::TransactionsAdmitted { txs } => {
                 let actions = self
                     .shard_coordinator
-                    .on_transactions_admitted(self.topology_coordinator.snapshot(), &txs);
+                    .on_transactions_admitted(&self.topology_snapshot, &txs);
                 self.shard_coordinator.queue_ready_proposal();
                 actions
             }
@@ -48,16 +48,12 @@ impl NodeStateMachine {
         tx: Arc<RoutableTransaction>,
         submitted_locally: bool,
     ) -> Vec<Action> {
-        if !self
-            .topology_coordinator
-            .snapshot()
-            .involves_local_shard(&tx)
-        {
+        if !self.topology_snapshot.involves_local_shard(&tx) {
             return vec![];
         }
 
         self.mempool_coordinator.on_transaction_gossip(
-            self.topology_coordinator.snapshot(),
+            &self.topology_snapshot,
             tx,
             submitted_locally,
             self.now,
@@ -72,11 +68,8 @@ impl NodeStateMachine {
         if txs.is_empty() {
             return vec![];
         }
-        self.mempool_coordinator.on_fetched_transactions(
-            self.topology_coordinator.snapshot(),
-            txs,
-            self.now,
-        )
+        self.mempool_coordinator
+            .on_fetched_transactions(&self.topology_snapshot, txs, self.now)
     }
 }
 

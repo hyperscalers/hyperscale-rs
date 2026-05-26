@@ -43,7 +43,6 @@ Rust implementation of Hyperscale consensus protocol.
 | [`storage-memory`](crates/storage-memory) | In-memory storage using persistent data structures for deterministic simulation |
 | [`storage-rocksdb`](crates/storage-rocksdb) | Production RocksDB storage with JMT state roots and snapshot isolation |
 | [`test-helpers`](crates/test-helpers) | Test helpers providing properly-signed fixtures for crypto testing |
-| [`topology`](crates/topology) | Topology coordinator wrapping shard committee state for the node |
 | [`types`](crates/types) | Core types: hashes, blocks, votes, QCs, keys, transactions, topology |
 
 ## Installation
