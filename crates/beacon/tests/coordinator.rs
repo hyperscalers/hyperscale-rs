@@ -410,3 +410,140 @@ fn injected_topology_witness_mutates_state_at_commit() {
         );
     }
 }
+
+// ─── Skip-path integration ─────────────────────────────────────────────
+
+/// Pool-quorum skip drives the chain past an abandoned epoch on every
+/// replica.
+///
+/// All four replicas (which form both the active pool and the beacon
+/// committee at n=4) fire the skip trigger at the genesis tip. With
+/// quorum = ⌈8/3⌉+1 = 4, the third request hits quorum at every honest
+/// node within a network hop of being dispatched; each replica then
+/// assembles, broadcasts, and adopts the skip block — converging on a
+/// single block hash regardless of which signer subset the local
+/// cert holds.
+#[test]
+fn skip_quorum_drives_chain_past_abandoned_epoch() {
+    let mut sim = CoordinatorSim::new(4, 0);
+    let n = sim.n();
+
+    let pre_tip = sim.coordinators[0].latest_block().block_hash();
+    let pre_epoch = sim.coordinators[0].current_state().current_epoch;
+    let skipped_epoch = pre_epoch.next();
+
+    // All n replicas dispatch a SkipRequest at the genesis anchor for
+    // the same `epoch_to_skip = pre_epoch.next()`. The sim's
+    // `fire_skip_trigger` mirrors what the production runner does on
+    // the skip-trigger timer firing: sign, admit locally, fan out.
+    for idx in 0..n {
+        sim.fire_skip_trigger(idx);
+    }
+    // Bound by target_commits=1 — once every replica has committed
+    // the skip block, stop. Letting the sim run further would push
+    // the chain through subsequent autonomous Normal commits and
+    // exercise the shuffle path at epoch 16, which is unrelated to
+    // what this test pins.
+    let _ = sim.run_until_committed(1, MAX_STEPS);
+
+    // Every replica has committed exactly one Skip block at the
+    // expected epoch, anchored at the prior tip.
+    for r in 0..n {
+        let commits = &sim.commits[r];
+        assert_eq!(
+            commits.len(),
+            1,
+            "replica {r} expected 1 commit, got {}",
+            commits.len(),
+        );
+        let c = &commits[0];
+        assert_eq!(c.epoch, skipped_epoch);
+        assert!(
+            matches!(c.block.cert(), BeaconCert::Skip(cert) if cert.anchor_hash() == pre_tip),
+            "replica {r} commit isn't a Skip cert at pre_tip",
+        );
+    }
+
+    // All replicas converged on the same block hash even though they
+    // may have assembled certs with different signer subsets — the
+    // cert lives outside the block hash.
+    let canonical_hash = sim.commits[0][0].block.block_hash();
+    for r in 1..n {
+        assert_eq!(
+            sim.commits[r][0].block.block_hash(),
+            canonical_hash,
+            "replica {r} block hash diverged from replica 0",
+        );
+    }
+
+    // Skip-cert convergence isn't required to be byte-identical; the
+    // adoption rule only insists on block-hash agreement. So this test
+    // pins the load-bearing invariant (block hash) but doesn't require
+    // cert equality.
+
+    // Post-state advanced by exactly one epoch — that's the load-bearing
+    // outcome (chain didn't wedge at the abandoned epoch).
+    let post = &sim.commits[0][0].state;
+    assert_eq!(post.current_epoch, skipped_epoch);
+}
+
+/// Two skips in succession: the first abandons epoch 1, the second
+/// abandons epoch 2. Each fully advances the chain — `apply_epoch`
+/// rolls randomness and resamples the committee on every transition,
+/// so consecutive bad samples just produce consecutive Skip blocks
+/// without wedging the chain.
+#[test]
+fn consecutive_skips_advance_chain() {
+    let mut sim = CoordinatorSim::new(4, 0);
+    let n = sim.n();
+
+    // First skip: at the genesis tip, abandon epoch 1.
+    for idx in 0..n {
+        sim.fire_skip_trigger(idx);
+    }
+    let _ = sim.run_until_committed(1, MAX_STEPS);
+    for r in 0..n {
+        assert_eq!(
+            sim.commits[r].len(),
+            1,
+            "replica {r} commit count post-skip-1"
+        );
+        assert_eq!(sim.commits[r][0].epoch, Epoch::new(1));
+        assert!(matches!(
+            sim.commits[r][0].block.cert(),
+            BeaconCert::Skip(_)
+        ));
+    }
+    let post_skip_1_randomness = sim.commits[0][0].state.randomness;
+
+    // Drain any pipelined envelopes from the autonomous Normal flow
+    // that may have started after the skip block adoption (each
+    // replica bootstraps SPC for epoch 2 and try_proposes). We don't
+    // want them to commit yet — second skip should kick in first.
+    let _ = sim.run_for_at_most(0);
+
+    // Second skip: from the post-skip-1 tip, abandon epoch 2.
+    for idx in 0..n {
+        sim.fire_skip_trigger(idx);
+    }
+    let _ = sim.run_until_committed(2, MAX_STEPS);
+    for r in 0..n {
+        assert_eq!(
+            sim.commits[r].len(),
+            2,
+            "replica {r} commit count post-skip-2"
+        );
+        assert_eq!(sim.commits[r][1].epoch, Epoch::new(2));
+        assert!(matches!(
+            sim.commits[r][1].block.cert(),
+            BeaconCert::Skip(_)
+        ));
+    }
+    // Randomness rolled between consecutive skips — pinning the
+    // "each skip advances randomness" property.
+    let post_skip_2_randomness = sim.commits[0][1].state.randomness;
+    assert_ne!(
+        post_skip_1_randomness, post_skip_2_randomness,
+        "consecutive skips must roll randomness; chain wouldn't converge otherwise",
+    );
+}

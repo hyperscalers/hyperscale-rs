@@ -20,13 +20,15 @@ use hyperscale_beacon::constants::{BEACON_SIGNER_COUNT, MIN_STAKE_FLOOR};
 use hyperscale_beacon::coordinator::BeaconCoordinator;
 use hyperscale_beacon::genesis::build_genesis_beacon_state;
 use hyperscale_beacon::pc::{sign_vote1, sign_vote2, sign_vote3};
+use hyperscale_beacon::skip::sign_skip_request;
 use hyperscale_beacon::spc::sign_empty_view_msg;
 use hyperscale_core::Action;
 use hyperscale_types::{
     BeaconGenesisConfig, BeaconProposal, BeaconState, Bls12381G1PrivateKey, Bls12381G1PublicKey,
     CertifiedBeaconBlock, Epoch, GenesisPool, GenesisValidator, NetworkDefinition, PcValueElement,
-    PcVector, Randomness, ShardGroupId, SpcMessage, Stake, StakePoolId, ValidatorId, VpcMsgPayload,
-    Witness, bls_keypair_from_seed, genesis_config_hash, pc_context, spc_context, vrf_sign,
+    PcVector, Randomness, ShardGroupId, SkipEpochCert, SkipRequest, SpcMessage, Stake, StakePoolId,
+    ValidatorId, VpcMsgPayload, Witness, bls_keypair_from_seed, genesis_config_hash, pc_context,
+    spc_context, vrf_sign,
 };
 
 /// Adversarial transform a flagged replica applies to its next matching
@@ -81,6 +83,12 @@ enum SimEvent {
     },
     BeaconBlock {
         block: Arc<CertifiedBeaconBlock>,
+    },
+    SkipRequest {
+        request: SkipRequest,
+    },
+    SkipCert {
+        cert: SkipEpochCert,
     },
 }
 
@@ -246,6 +254,39 @@ impl CoordinatorSim {
         returned
     }
 
+    /// Fire the skip-trigger path on `signer_idx`: build and sign a
+    /// `SkipRequest` against the replica's current tip + next epoch,
+    /// then admit it locally and queue it for delivery to every peer.
+    /// Mirrors what the production runner does on
+    /// `skip_trigger_due() && !is_committed && is_on_active_pool`.
+    pub fn fire_skip_trigger(&mut self, signer_idx: usize) {
+        let signer = self.members[signer_idx].0;
+        let sk = &self.sks[signer_idx];
+        let anchor = self.coordinators[signer_idx].latest_block().block_hash();
+        let epoch_to_skip = self.coordinators[signer_idx]
+            .current_state()
+            .current_epoch
+            .next();
+        let request = sign_skip_request(sk, signer, &self.network, anchor, epoch_to_skip);
+        // Admit locally first — the production runner feeds the
+        // request back into the local coordinator via the action
+        // handler's loopback.
+        let actions = self.coordinators[signer_idx].on_skip_request_received(request.clone());
+        self.absorb(signer_idx, actions);
+        // Queue for every peer.
+        for to_idx in 0..self.coordinators.len() {
+            if to_idx == signer_idx {
+                continue;
+            }
+            self.network_q.push_back(Envelope {
+                to_idx,
+                event: SimEvent::SkipRequest {
+                    request: request.clone(),
+                },
+            });
+        }
+    }
+
     /// Number of replicas.
     #[must_use]
     pub const fn n(&self) -> usize {
@@ -360,6 +401,12 @@ impl CoordinatorSim {
             } => self.coordinators[env.to_idx].on_beacon_proposal_received(from, epoch, proposal),
             SimEvent::BeaconBlock { block } => {
                 self.coordinators[env.to_idx].on_beacon_block_received(block)
+            }
+            SimEvent::SkipRequest { request } => {
+                self.coordinators[env.to_idx].on_skip_request_received(request)
+            }
+            SimEvent::SkipCert { cert } => {
+                self.coordinators[env.to_idx].on_skip_cert_received(cert)
             }
         }
     }
@@ -588,6 +635,38 @@ impl CoordinatorSim {
                         event: SimEvent::BeaconBlock {
                             block: Arc::clone(&block),
                         },
+                    });
+                }
+            }
+            Action::BroadcastSkipRequest {
+                request,
+                recipients: _,
+            } => {
+                let req = (*request).clone();
+                for to_idx in 0..self.coordinators.len() {
+                    if to_idx == emitter_idx {
+                        continue;
+                    }
+                    self.network_q.push_back(Envelope {
+                        to_idx,
+                        event: SimEvent::SkipRequest {
+                            request: req.clone(),
+                        },
+                    });
+                }
+            }
+            Action::BroadcastSkipCert {
+                cert,
+                recipients: _,
+            } => {
+                let cert = (*cert).clone();
+                for to_idx in 0..self.coordinators.len() {
+                    if to_idx == emitter_idx {
+                        continue;
+                    }
+                    self.network_q.push_back(Envelope {
+                        to_idx,
+                        event: SimEvent::SkipCert { cert: cert.clone() },
                     });
                 }
             }
