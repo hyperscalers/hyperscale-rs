@@ -38,26 +38,6 @@ pub enum BeaconCert {
     Skip(SkipEpochCert),
 }
 
-impl BeaconCert {
-    /// Whether this is the `Genesis` variant.
-    #[must_use]
-    pub const fn is_genesis(&self) -> bool {
-        matches!(self, Self::Genesis(_))
-    }
-
-    /// Whether this is the `Normal` variant.
-    #[must_use]
-    pub const fn is_normal(&self) -> bool {
-        matches!(self, Self::Normal(_))
-    }
-
-    /// Whether this is the `Skip` variant.
-    #[must_use]
-    pub const fn is_skip(&self) -> bool {
-        matches!(self, Self::Skip(_))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,9 +62,6 @@ mod tests {
         let bytes = basic_encode(&original).unwrap();
         let decoded: BeaconCert = basic_decode(&bytes).unwrap();
         assert_eq!(original, decoded);
-        assert!(decoded.is_genesis());
-        assert!(!decoded.is_normal());
-        assert!(!decoded.is_skip());
     }
 
     #[test]
@@ -93,7 +70,5 @@ mod tests {
         let bytes = basic_encode(&original).unwrap();
         let decoded: BeaconCert = basic_decode(&bytes).unwrap();
         assert_eq!(original, decoded);
-        assert!(decoded.is_skip());
-        assert!(!decoded.is_normal());
     }
 }

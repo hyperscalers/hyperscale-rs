@@ -7,8 +7,8 @@
 //! authenticating the skip block.
 //!
 //! Domain separation here keeps a skip sig from being confused with a
-//! PC vote, a VRF reveal, a recovery request, or any other BLS message
-//! reusing the same key material.
+//! PC vote, a VRF reveal, or any other BLS message reusing the same
+//! key material.
 
 use crate::{BeaconBlockHash, Epoch, NetworkDefinition};
 

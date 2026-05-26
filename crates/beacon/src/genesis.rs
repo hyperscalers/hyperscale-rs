@@ -10,7 +10,7 @@
 //! validated [`BeaconGenesisConfig`] and produces the live
 //! `BeaconState` for `Epoch::GENESIS`. The TOML-loading wrapper that
 //! produces `BeaconGenesisConfig` from disk lives at the validator
-//! binary layer (Phase B.10).
+//! binary layer.
 
 use std::collections::{BTreeMap, BTreeSet};
 

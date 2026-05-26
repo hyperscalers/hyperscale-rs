@@ -145,7 +145,7 @@ fn adoption_path_advances_non_participating_replica() {
 //
 // These tests prove each adversarial hook fires when set; the protocol-level
 // scenarios that exercise the resulting Byzantine state machine paths live in
-// the broader Phase 3 sim suite.
+// the broader sim suite.
 
 #[test]
 fn drop_for_consumes_envelopes_addressed_to_target_without_delivery() {
@@ -265,23 +265,10 @@ fn witness_leaf_index_of(w: &Witness) -> LeafIndex {
     }
 }
 
-// ─── Phase 3 Byzantine + topology-change scenarios ────────────────────────────
+// ─── Byzantine + topology-change scenarios ────────────────────────────────────
 //
 // Each test exercises one adversarial-or-degraded path end-to-end through the
 // coordinator state machine.
-//
-// Deferred from the plan's original five:
-//
-// * Concurrent recovery certs — disjoint-quorum cert collision is impossible
-//   by pigeonhole at the cluster sizes the sim supports (each quorum needs
-//   `(2n)/3 + 1` signers, so two strictly-disjoint quorums require more
-//   distinct signers than `n`). `select_winning_block`'s tiebreak is unit-
-//   tested directly in `crates/beacon/src/recovery.rs`.
-//
-// * View-1 PC-mid timeout — `SpcInstance::on_timer_expired` ignores
-//   `view <= 1`. The view-1 timer is a runner-level no-op today; the only
-//   timeout-driven recovery path the FSM models is view ≥ 2, which the silent-
-//   voter scenario below exercises.
 
 /// Scenario 1: a Byzantine proposer broadcasts two beacon proposals at the
 /// same epoch with different witness sets. The honest replicas accept the

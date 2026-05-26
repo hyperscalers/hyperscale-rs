@@ -7,9 +7,8 @@
 //!
 //! The VRF property — uniquely determined by `(secret_key, message)` —
 //! follows from BLS signatures being deterministic in min-pk mode. Domain
-//! separation here keeps a VRF reveal from being confused with a PC vote,
-//! a block header sig, or a recovery request sig, all of which reuse the
-//! same BLS keys.
+//! separation here keeps a VRF reveal from being confused with a PC vote
+//! or a block header sig, both of which reuse the same BLS keys.
 
 use blake3::Hasher;
 

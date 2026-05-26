@@ -5,8 +5,8 @@
 //! a `BeaconConfig` struct) so that altering one is a visible source-level
 //! edit, not a runtime knob someone can tweak by accident.
 //!
-//! Consumed by `BeaconState::apply_epoch` (Phase B.5) to drive shuffles,
-//! jail cooldowns, unbonding windows, and reward emission. Workspace-wide
+//! Consumed by `BeaconState::apply_epoch` to drive shuffles, jail
+//! cooldowns, unbonding windows, and reward emission. Workspace-wide
 //! timing constants ([`EPOCH_DURATION`](hyperscale_types::EPOCH_DURATION)
 //! and friends) live in [`hyperscale_types::time`].
 //!
