@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use hyperscale_types::{BeaconBlock, Epoch};
+use hyperscale_types::{CertifiedBeaconBlock, Epoch};
 
 /// Sync orchestration state.
 ///
@@ -21,7 +21,7 @@ use hyperscale_types::{BeaconBlock, Epoch};
 #[derive(Debug, Default)]
 pub struct BeaconBlockSyncManager {
     target: Option<Epoch>,
-    buffered: BTreeMap<Epoch, Arc<BeaconBlock>>,
+    buffered: BTreeMap<Epoch, Arc<CertifiedBeaconBlock>>,
     in_flight: BTreeSet<Epoch>,
 }
 
@@ -76,7 +76,7 @@ impl BeaconBlockSyncManager {
     /// epoch. Silently overwrites any prior buffered entry at the
     /// same epoch — under honest sync there's one canonical block
     /// per epoch.
-    pub fn on_synced_block_received(&mut self, block: Arc<BeaconBlock>) {
+    pub fn on_synced_block_received(&mut self, block: Arc<CertifiedBeaconBlock>) {
         let epoch = block.epoch();
         self.in_flight.remove(&epoch);
         self.buffered.insert(epoch, block);
@@ -86,7 +86,10 @@ impl BeaconBlockSyncManager {
     /// `committed_epoch + 1`. The coordinator runs it through
     /// verification + `apply_epoch`, then calls this again to drain
     /// the next.
-    pub fn take_next_applicable(&mut self, committed_epoch: Epoch) -> Option<Arc<BeaconBlock>> {
+    pub fn take_next_applicable(
+        &mut self,
+        committed_epoch: Epoch,
+    ) -> Option<Arc<CertifiedBeaconBlock>> {
         self.buffered.remove(&committed_epoch.next())
     }
 }
@@ -119,19 +122,30 @@ impl BeaconBlockSyncManager {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::{BeaconBlock, BeaconBlockHash, Epoch, GenesisConfigHash, Hash, SpcCert};
+    use hyperscale_types::{
+        BeaconBlock, BeaconBlockHash, BeaconCert, Bls12381G2Signature, Epoch, Hash, SignerBitfield,
+        SkipEpochCert,
+    };
 
     use super::*;
 
-    fn block_at(epoch: u64) -> Arc<BeaconBlock> {
-        Arc::new(BeaconBlock::new(
+    fn block_at(epoch: u64) -> Arc<CertifiedBeaconBlock> {
+        // Tests don't exercise cert verification — Skip-shaped is the
+        // cheapest cert+body to construct.
+        let block = BeaconBlock::skip(
             Epoch::new(epoch),
             BeaconBlockHash::from_raw(Hash::from_bytes(format!("prev-{epoch}").as_bytes())),
-            SpcCert::Genesis {
-                config_hash: GenesisConfigHash::ZERO,
-            },
+        );
+        let cert = SkipEpochCert::new(
+            BeaconBlockHash::from_raw(Hash::from_bytes(b"anchor")),
+            Epoch::new(epoch),
+            SignerBitfield::new(4),
+            Bls12381G2Signature([0u8; 96]),
+        );
+        Arc::new(CertifiedBeaconBlock::new_unchecked(
+            block,
+            BeaconCert::Skip(cert),
             None,
-            Vec::new(),
         ))
     }
 

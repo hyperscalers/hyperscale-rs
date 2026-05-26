@@ -23,6 +23,7 @@ pub mod proposal_pool;
 pub mod recovery;
 pub mod recovery_tracker;
 pub mod sampling;
+pub mod skip;
 pub mod spc;
 pub mod state;
 pub mod verification;

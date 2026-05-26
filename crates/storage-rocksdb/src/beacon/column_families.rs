@@ -13,7 +13,7 @@
 //! `RocksDbBeaconStorage` opens its own database directory; this CF
 //! set is disjoint from the per-shard tier.
 
-use hyperscale_types::{BeaconBlock, BeaconState, Hash};
+use hyperscale_types::{BeaconState, CertifiedBeaconBlock, Hash};
 use rocksdb::{ColumnFamily, DB};
 
 use crate::typed_cf::{BeU64Codec, HashCodec, SborCodec, TypedCf};
@@ -81,14 +81,14 @@ impl<'a> CfHandles<'a> {
 // ─── Typed CF definitions ────────────────────────────────────────────────────
 
 /// Primary beacon-blocks-by-epoch CF. Key: `u64` epoch (BE-encoded for
-/// lex ordering). Value: SBOR-encoded `BeaconBlock`.
+/// lex ordering). Value: SBOR-encoded `CertifiedBeaconBlock`.
 pub struct BeaconBlocksByEpochCf;
 impl TypedCf for BeaconBlocksByEpochCf {
     const NAME: &'static str = BEACON_BLOCKS_BY_EPOCH_CF;
     type Key = u64;
-    type Value = BeaconBlock;
+    type Value = CertifiedBeaconBlock;
     type KeyCodec = BeU64Codec;
-    type ValueCodec = SborCodec<BeaconBlock>;
+    type ValueCodec = SborCodec<CertifiedBeaconBlock>;
     type Handles<'a> = CfHandles<'a>;
     fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
         cf.blocks_by_epoch

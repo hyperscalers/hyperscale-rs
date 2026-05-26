@@ -56,7 +56,7 @@ fn four_party_cluster_converges_on_per_epoch_state() {
             reference.epoch, expected_epoch,
             "replica 0's commit {e} is not at expected epoch {expected_epoch:?}",
         );
-        let mut ref_proposals: Vec<_> = reference.block.committed_proposals().to_vec();
+        let mut ref_proposals: Vec<_> = reference.block.block().committed_proposals().to_vec();
         ref_proposals.sort_by_key(|(id, _)| id.inner());
         for r in 1..sim.n() {
             let cmp = &sim.commits[r][e];
@@ -65,7 +65,7 @@ fn four_party_cluster_converges_on_per_epoch_state() {
                 "replica {r} committed epoch {:?} at slot {e}, expected {:?}",
                 cmp.epoch, reference.epoch,
             );
-            let mut cmp_proposals: Vec<_> = cmp.block.committed_proposals().to_vec();
+            let mut cmp_proposals: Vec<_> = cmp.block.block().committed_proposals().to_vec();
             cmp_proposals.sort_by_key(|(id, _)| id.inner());
             assert_eq!(
                 cmp_proposals, ref_proposals,
@@ -99,7 +99,7 @@ fn cluster_commits_non_empty_proposal_set_per_epoch() {
         "honest-path commit unexpectedly carries a recovery cert",
     );
     assert_eq!(
-        first_commit.block.committed_proposals().len(),
+        first_commit.block.block().committed_proposals().len(),
         sim.n(),
         "committed block dropped proposals — view-1 PC may have collapsed",
     );
@@ -230,6 +230,7 @@ fn inject_topology_change_splices_witnesses_into_epoch_one_proposal() {
     let commit = &sim.commits[0][0];
     let any_proposal_has_witness = commit
         .block
+        .block()
         .committed_proposals()
         .iter()
         .any(|(_, prop)| {

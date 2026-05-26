@@ -8,11 +8,11 @@
 use std::sync::Arc;
 
 use hyperscale_types::{
-    BeaconBlock, BeaconProposal, Block, BlockHash, BlockHeader, BlockHeight, BlockManifest,
-    BlockVote, CertifiedBlock, CommittedBlockHeader, Epoch, ExecutionCertificate, ExecutionVote,
-    FinalizedWave, Hash, Provisions, QuorumCertificate, ReadySignal, RecoveryRequest, Round,
-    RoutableTransaction, ShardGroupId, ShardWitness, StoredReceipt, TxOutcome, ValidatorId,
-    VotePower, WaveId, WeightedTimestamp,
+    BeaconProposal, Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote,
+    CertifiedBeaconBlock, CertifiedBlock, CommittedBlockHeader, Epoch, ExecutionCertificate,
+    ExecutionVote, FinalizedWave, Hash, Provisions, QuorumCertificate, ReadySignal,
+    RecoveryRequest, Round, RoutableTransaction, ShardGroupId, ShardWitness, StoredReceipt,
+    TxOutcome, ValidatorId, VotePower, WaveId, WeightedTimestamp,
 };
 
 use crate::BeaconVerificationKind;
@@ -537,8 +537,8 @@ pub enum ProtocolEvent {
 
     /// A beacon block arrived via gossip.
     BeaconBlockReceived {
-        /// Received block.
-        block: Arc<BeaconBlock>,
+        /// Received certified block.
+        block: Arc<CertifiedBeaconBlock>,
     },
 
     /// A peer committee member's `BeaconProposal` arrived via gossip.

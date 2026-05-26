@@ -2,15 +2,15 @@
 
 use std::sync::Arc;
 
-use hyperscale_types::{BeaconBlock, BeaconState};
+use hyperscale_types::{BeaconState, CertifiedBeaconBlock};
 
 /// Write access to the process-level beacon chain.
 ///
-/// Beacon blocks are self-authenticating — the inline
-/// [`BeaconBlock::aggregate_sig`](hyperscale_types::BeaconBlock::aggregate_sig)
-/// over the [`signers`](hyperscale_types::BeaconBlock::signers) bitfield
-/// is the committee QC — so no separate certificate parameter is
-/// threaded through.
+/// Beacon blocks are paired with their authenticating
+/// [`BeaconCert`](hyperscale_types::BeaconCert) on the
+/// [`CertifiedBeaconBlock`] wrapper — the cert (Genesis / Normal / Skip)
+/// is the committee QC. No separate certificate parameter is threaded
+/// through.
 pub trait BeaconChainWriter: Send + Sync {
     /// Persist `block` together with the `BeaconState` it advances to.
     ///
@@ -31,5 +31,5 @@ pub trait BeaconChainWriter: Send + Sync {
     /// activity. Implementations may panic, log, or overwrite — none
     /// of these is safety-critical because the BFT layer's dedup
     /// catches it first.
-    fn commit_beacon_block(&self, block: &Arc<BeaconBlock>, state: &BeaconState);
+    fn commit_beacon_block(&self, block: &Arc<CertifiedBeaconBlock>, state: &BeaconState);
 }

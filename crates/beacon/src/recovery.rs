@@ -8,9 +8,9 @@
 //! committee sampler that consumes `excluded_validators`.
 
 use hyperscale_types::{
-    BeaconBlock, Bls12381G1PublicKey, NetworkDefinition, RecoveryCertificate, RecoveryEquivocation,
-    SpcCert, ValidatorId, aggregate_verify_bls_different_messages, recovery_request_message,
-    spc_context,
+    Bls12381G1PublicKey, CertifiedBeaconBlock, NetworkDefinition, RecoveryCertificate,
+    RecoveryEquivocation, SpcCert, ValidatorId, aggregate_verify_bls_different_messages,
+    recovery_request_message, spc_context,
 };
 
 use crate::spc::verify_block_cert;
@@ -159,8 +159,8 @@ pub fn verify_recovery_cert(
 
 // ─── Block-selection rule ──────────────────────────────────────────────────
 
-/// Pick the winning [`BeaconBlock`] when two valid candidates exist for
-/// the same epoch.
+/// Pick the winning [`CertifiedBeaconBlock`] when two valid candidates
+/// exist for the same epoch.
 ///
 /// Race source: a slow original committee can finalize a block while a
 /// recovery cert is being assembled in parallel. Both blocks pass their
@@ -189,7 +189,10 @@ pub fn verify_recovery_cert(
 /// [`RecoveryRound`]: hyperscale_types::RecoveryRound
 /// [`BeaconBlockHash`]: hyperscale_types::BeaconBlockHash
 #[must_use]
-pub fn select_winning_block<'a>(a: &'a BeaconBlock, b: &'a BeaconBlock) -> &'a BeaconBlock {
+pub fn select_winning_block<'a>(
+    a: &'a CertifiedBeaconBlock,
+    b: &'a CertifiedBeaconBlock,
+) -> &'a CertifiedBeaconBlock {
     assert_eq!(
         a.epoch(),
         b.epoch(),
@@ -209,7 +212,10 @@ pub fn select_winning_block<'a>(a: &'a BeaconBlock, b: &'a BeaconBlock) -> &'a B
 
 /// Tie-break: lower [`BeaconBlockHash`] wins. Deterministic across
 /// replicas.
-fn tie_break_by_hash<'a>(a: &'a BeaconBlock, b: &'a BeaconBlock) -> &'a BeaconBlock {
+fn tie_break_by_hash<'a>(
+    a: &'a CertifiedBeaconBlock,
+    b: &'a CertifiedBeaconBlock,
+) -> &'a CertifiedBeaconBlock {
     if a.block_hash() <= b.block_hash() {
         a
     } else {
@@ -220,9 +226,10 @@ fn tie_break_by_hash<'a>(a: &'a BeaconBlock, b: &'a BeaconBlock) -> &'a BeaconBl
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{
-        BeaconBlockHash, Bls12381G1PrivateKey, Bls12381G2Signature, Epoch, GenesisConfigHash, Hash,
-        PcValueElement, PcVector, RecoveryRequest, RecoveryRound, SignerBitfield, SpcCert, SpcView,
-        bls_keypair_from_seed, pc_context, spc_context,
+        BeaconBlock, BeaconBlockHash, BeaconCert, Bls12381G1PrivateKey, Bls12381G2Signature, Epoch,
+        GenesisConfigHash, Hash, PcValueElement, PcVector, RecoveryRequest, RecoveryRound,
+        SignerBitfield, SkipEpochCert, SpcCert, SpcView, bls_keypair_from_seed, pc_context,
+        spc_context,
     };
 
     use super::*;
@@ -663,22 +670,26 @@ mod tests {
 
     // ─── select_winning_block ────────────────────────────────────────────
 
-    /// Build a `BeaconBlock` for `epoch` whose prev-hash is keyed off
-    /// `prev_byte` (so two callers can build distinct blocks at the
-    /// same epoch with predictable hash ordering). The selection rule
-    /// doesn't re-verify the cert — only inspects `recovery_cert` and
-    /// the block hash.
-    fn block(epoch: u64, prev_byte: u8, cert: Option<RecoveryCertificate>) -> BeaconBlock {
+    /// Build a `CertifiedBeaconBlock` for `epoch` whose prev-hash is
+    /// keyed off `prev_byte` (so two callers can build distinct blocks
+    /// at the same epoch with predictable hash ordering). Pairs with a
+    /// Skip cert — the selection rule only inspects `recovery_cert`
+    /// (wrapper side-data) and the block hash, so the authenticating
+    /// cert kind doesn't matter.
+    fn block(
+        epoch: u64,
+        prev_byte: u8,
+        recovery_cert: Option<RecoveryCertificate>,
+    ) -> CertifiedBeaconBlock {
         let prev_block_hash = BeaconBlockHash::from_raw(Hash::from_bytes(&[prev_byte; 8]));
-        BeaconBlock::new(
+        let block = BeaconBlock::skip(Epoch::new(epoch), prev_block_hash);
+        let skip_cert = SkipEpochCert::new(
+            BeaconBlockHash::from_raw(Hash::from_bytes(b"anchor")),
             Epoch::new(epoch),
-            prev_block_hash,
-            SpcCert::Genesis {
-                config_hash: GenesisConfigHash::ZERO,
-            },
-            cert,
-            Vec::new(),
-        )
+            SignerBitfield::new(4),
+            Bls12381G2Signature([0u8; 96]),
+        );
+        CertifiedBeaconBlock::new_unchecked(block, BeaconCert::Skip(skip_cert), recovery_cert)
     }
 
     /// Helper: synthesize a cert at the given round. Signature bytes

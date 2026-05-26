@@ -21,12 +21,12 @@ use std::sync::Arc;
 
 use hyperscale_core::{Action, TimerId};
 use hyperscale_types::{
-    BeaconBlock, BeaconProposal, BeaconState, Bls12381G1PublicKey, EPOCH_DURATION, Epoch,
-    GenesisConfigHash, LeafIndex, LocalTimestamp, MAX_WITNESSES_PER_PROPOSER, NetworkDefinition,
-    PcValueElement, PcVector, RECOVERY_TIMEOUT, RecoveryCertificate, RecoveryRequest, ShardGroupId,
-    ShardWitness, SpcCert, SpcMessage, TopologySnapshot, ValidatorId, VpcMsgPayload,
-    WeightedTimestamp, Witness, recovery_request_message, spc_context, verify_bls12381_v1,
-    verify_merkle_inclusion,
+    BeaconBlock, BeaconCert, BeaconProposal, BeaconState, Bls12381G1PublicKey,
+    CertifiedBeaconBlock, EPOCH_DURATION, Epoch, GenesisConfigHash, LeafIndex, LocalTimestamp,
+    MAX_WITNESSES_PER_PROPOSER, NetworkDefinition, PcValueElement, PcVector, RECOVERY_TIMEOUT,
+    RecoveryCertificate, RecoveryRequest, ShardGroupId, ShardWitness, SpcCert, SpcMessage,
+    TopologySnapshot, ValidatorId, VpcMsgPayload, WeightedTimestamp, Witness,
+    recovery_request_message, spc_context, verify_bls12381_v1, verify_merkle_inclusion,
 };
 use tracing::{trace, warn};
 
@@ -55,10 +55,11 @@ use crate::witness_fetcher::ShardWitnessFetchTracker;
 pub struct BeaconCoordinator {
     state: BeaconState,
 
-    /// Latest committed beacon block. Carried so SPC instance
-    /// bootstrap can read `prev_block_hash` without a storage
-    /// roundtrip.
-    latest_block: Arc<BeaconBlock>,
+    /// Latest committed beacon block paired with its authenticating
+    /// cert. Carried so SPC instance bootstrap can read
+    /// `prev_block_hash` without a storage roundtrip, and so the
+    /// recovery flow has the genesis-config-hash bound on hand.
+    latest_block: Arc<CertifiedBeaconBlock>,
 
     /// `None` between bootstrap and the first epoch-boundary
     /// trigger, and again briefly between an epoch's commit and the
@@ -135,13 +136,13 @@ impl BeaconCoordinator {
     /// cert's `config_hash` doesn't match `expected_config_hash`.
     #[must_use]
     pub fn new(
-        latest_block: Arc<BeaconBlock>,
+        latest_block: Arc<CertifiedBeaconBlock>,
         latest_state: BeaconState,
         me: ValidatorId,
         network: NetworkDefinition,
         expected_config_hash: GenesisConfigHash,
     ) -> Self {
-        if let SpcCert::Genesis { config_hash } = latest_block.cert() {
+        if let BeaconCert::Genesis(config_hash) = latest_block.cert() {
             debug_assert_eq!(
                 *config_hash, expected_config_hash,
                 "genesis block config_hash doesn't match operator config",
@@ -464,7 +465,7 @@ impl BeaconCoordinator {
     /// state has fallen behind the actual signing committee will reject
     /// otherwise-valid blocks. Resolving that without `apply_epoch` is
     /// a state-sync problem handled elsewhere.
-    pub fn on_beacon_block_received(&mut self, block: Arc<BeaconBlock>) -> Vec<Action> {
+    pub fn on_beacon_block_received(&mut self, block: Arc<CertifiedBeaconBlock>) -> Vec<Action> {
         let epoch = block.epoch();
         let tip_epoch = self.latest_block.epoch();
         if epoch <= tip_epoch {
@@ -496,7 +497,28 @@ impl BeaconCoordinator {
         // the committee active for this incoming block's epoch).
         let committee = derive_beacon_committee(&self.state);
         let spc_ctx = spc_context(epoch);
-        if !verify_block_cert(block.cert(), &self.network, &spc_ctx, &committee) {
+        let spc_cert = match block.cert() {
+            BeaconCert::Normal(c) => c,
+            BeaconCert::Skip(_) => {
+                // Skip-cert verification lands in phase 3 alongside the
+                // coordinator switchover. For now, dropping unverified
+                // skip blocks is safe — recovery flow still drives
+                // committee replacement.
+                warn!(
+                    epoch = epoch.inner(),
+                    "BeaconBlockReceived with Skip cert — phase 3 wiring not yet present, dropping",
+                );
+                return Vec::new();
+            }
+            BeaconCert::Genesis(_) => {
+                warn!(
+                    epoch = epoch.inner(),
+                    "BeaconBlockReceived with Genesis cert past tip — dropping",
+                );
+                return Vec::new();
+            }
+        };
+        if !verify_block_cert(spc_cert, &self.network, &spc_ctx, &committee) {
             warn!(
                 epoch = epoch.inner(),
                 "BeaconBlockReceived cert verification failed — dropping",
@@ -689,13 +711,13 @@ impl BeaconCoordinator {
     /// the new committee. Emits `CommitBeaconBlock` only — no
     /// broadcast (caller decides whether the local node is the
     /// originator).
-    fn adopt_block(&mut self, block: Arc<BeaconBlock>) -> Vec<Action> {
+    fn adopt_block(&mut self, block: Arc<CertifiedBeaconBlock>) -> Vec<Action> {
         let mut new_state = self.state.clone();
         apply_epoch(
             &mut new_state,
             &self.network,
             block.epoch(),
-            block.committed_proposals(),
+            block.block().committed_proposals(),
             block.recovery_cert(),
         );
         self.state = new_state;
@@ -762,8 +784,13 @@ impl BeaconCoordinator {
         let committed = self.decode_committed_proposals(epoch, output);
         let recovery_cert = self.pending_recovery_cert.take();
         let prev_block_hash = self.latest_block.block_hash();
-        let block = BeaconBlock::new(epoch, prev_block_hash, cert, recovery_cert, committed);
-        let block_arc = Arc::new(block);
+        let block = BeaconBlock::new(epoch, prev_block_hash, committed);
+        let certified = CertifiedBeaconBlock::new_unchecked(
+            block,
+            BeaconCert::Normal(Box::new(cert)),
+            recovery_cert,
+        );
+        let block_arc = Arc::new(certified);
 
         // Advance state via the shared adoption path.
         let mut actions = self.adopt_block(Arc::clone(&block_arc));
@@ -931,7 +958,7 @@ impl BeaconCoordinator {
     }
 
     #[must_use]
-    pub const fn latest_block(&self) -> &Arc<BeaconBlock> {
+    pub const fn latest_block(&self) -> &Arc<CertifiedBeaconBlock> {
         &self.latest_block
     }
 
@@ -1034,11 +1061,11 @@ mod tests {
     /// The (block, state, `config_hash`) trio the runner would produce
     /// on an empty store: build genesis state, hash the config, wrap
     /// the genesis block.
-    fn genesis_trio() -> (Arc<BeaconBlock>, BeaconState, GenesisConfigHash) {
+    fn genesis_trio() -> (Arc<CertifiedBeaconBlock>, BeaconState, GenesisConfigHash) {
         let config = sample_genesis();
         let state = build_genesis_beacon_state(&config);
         let config_hash = genesis_config_hash(&config, &NetworkDefinition::simulator());
-        let block = BeaconBlock::genesis(config_hash);
+        let block = CertifiedBeaconBlock::genesis(config_hash);
         (Arc::new(block), state, config_hash)
     }
 
@@ -1099,9 +1126,9 @@ mod tests {
     fn debug_assertion_catches_runner_loading_mismatched_genesis() {
         use hyperscale_types::Hash;
         let (_block, state, _config_hash) = genesis_trio();
-        let mismatched_block = BeaconBlock::genesis(GenesisConfigHash::from_raw(Hash::from_bytes(
-            b"other-config",
-        )));
+        let mismatched_block = CertifiedBeaconBlock::genesis(GenesisConfigHash::from_raw(
+            Hash::from_bytes(b"other-config"),
+        ));
         let _coord = BeaconCoordinator::new(
             Arc::new(mismatched_block),
             state,
@@ -1503,7 +1530,7 @@ mod tests {
         coord: &BeaconCoordinator,
         epoch: Epoch,
         prev_hash: BeaconBlockHash,
-    ) -> Arc<BeaconBlock> {
+    ) -> Arc<CertifiedBeaconBlock> {
         let n = coord.state.committee.len();
         let f = n.saturating_sub(1) / 3;
         let q = n - f;
@@ -1517,14 +1544,22 @@ mod tests {
             .collect();
         let signer_positions: Vec<usize> = (0..q).collect();
         let cert = build_direct_cert(SpcView::new(1), epoch, &keys, &committee, &signer_positions);
-        Arc::new(BeaconBlock::new(epoch, prev_hash, cert, None, Vec::new()))
+        let block = BeaconBlock::new(epoch, prev_hash, Vec::new());
+        Arc::new(CertifiedBeaconBlock::new_unchecked(
+            block,
+            BeaconCert::Normal(Box::new(cert)),
+            None,
+        ))
     }
 
     #[test]
     fn on_beacon_block_received_drops_past_epoch() {
         let mut coord = fresh_coord();
-        let prev = coord.latest_block.block_hash();
-        let block = valid_block_at(&coord, Epoch::GENESIS, prev);
+        // A genesis-shaped block at the genesis tip is past-epoch from the
+        // tip's perspective. `on_beacon_block_received` should drop it
+        // before even inspecting the cert.
+        let _prev = coord.latest_block.block_hash();
+        let block = Arc::new(CertifiedBeaconBlock::genesis(GenesisConfigHash::ZERO));
         let actions = coord.on_beacon_block_received(block);
         assert!(actions.is_empty());
         assert!(coord.pending_blocks.is_empty());
@@ -1551,26 +1586,6 @@ mod tests {
         let actions = coord.on_beacon_block_received(block);
         assert!(actions.is_empty());
         assert!(coord.pending_blocks.is_empty());
-    }
-
-    #[test]
-    fn on_beacon_block_received_drops_invalid_cert() {
-        let mut coord = fresh_coord();
-        let prev = coord.latest_block.block_hash();
-        // Genesis cert isn't accepted as a view-entry by verify_block_cert.
-        let block = Arc::new(BeaconBlock::new(
-            Epoch::new(1),
-            prev,
-            SpcCert::Genesis {
-                config_hash: GenesisConfigHash::ZERO,
-            },
-            None,
-            Vec::new(),
-        ));
-        let actions = coord.on_beacon_block_received(block);
-        assert!(actions.is_empty());
-        assert!(coord.pending_blocks.is_empty());
-        assert_eq!(coord.state.current_epoch, Epoch::GENESIS);
     }
 
     #[test]

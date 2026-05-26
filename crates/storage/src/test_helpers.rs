@@ -9,15 +9,15 @@ use std::sync::Arc;
 
 use hyperscale_types::test_utils::test_event_type_identifier;
 use hyperscale_types::{
-    ApplicationEvent, BeaconBlock, BeaconBlockHash, BeaconState, BeaconWitnessLeafCount,
-    BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight, Bls12381G2Signature, BoundedVec,
-    CertificateRoot, ConsensusReceipt, Epoch, EventData, ExecutionCertificate, ExecutionMetadata,
-    ExecutionOutcome, FeeSummary, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash,
-    InFlightCount, LocalReceiptRoot, LogLevel, NodeId, PcQc2, PcQc3, PcSignerLengths, PcVector,
-    PcXpProof, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Randomness, Round,
-    ShardGroupId, SignerBitfield, SpcCert, SpcView, StateRoot, StoredReceipt, TransactionRoot,
-    TxHash, TxOutcome, ValidatorId, WaveCertificate, WaveId, WeightedTimestamp,
-    compute_global_receipt_root, zero_bls_signature,
+    ApplicationEvent, BeaconBlock, BeaconBlockHash, BeaconCert, BeaconState,
+    BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight,
+    Bls12381G2Signature, BoundedVec, CertificateRoot, CertifiedBeaconBlock, ConsensusReceipt,
+    Epoch, EventData, ExecutionCertificate, ExecutionMetadata, ExecutionOutcome, FeeSummary,
+    FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, InFlightCount, LocalReceiptRoot,
+    LogLevel, NodeId, PcQc2, PcQc3, PcSignerLengths, PcVector, PcXpProof, ProposerTimestamp,
+    ProvisionsRoot, QuorumCertificate, Randomness, Round, ShardGroupId, SignerBitfield, SpcCert,
+    SpcView, StateRoot, StoredReceipt, TransactionRoot, TxHash, TxOutcome, ValidatorId,
+    WaveCertificate, WaveId, WeightedTimestamp, compute_global_receipt_root, zero_bls_signature,
 };
 use indexmap::IndexMap;
 use radix_common::math::Decimal;
@@ -185,19 +185,23 @@ fn placeholder_cert() -> SpcCert {
     }
 }
 
-/// Build a beacon block at `epoch` with tag-derived `prev_block_hash`.
+/// Build a certified beacon block at `epoch` with tag-derived
+/// `prev_block_hash`.
 ///
 /// The cert is a structurally-valid but cryptographically-unverified
 /// placeholder. Suitable for storage round-trip tests, not for
 /// consensus verification.
 #[must_use]
-pub fn make_test_beacon_block(epoch: u64, tag: &[u8]) -> Arc<BeaconBlock> {
-    Arc::new(BeaconBlock::new(
+pub fn make_test_beacon_block(epoch: u64, tag: &[u8]) -> Arc<CertifiedBeaconBlock> {
+    let block = BeaconBlock::new(
         Epoch::new(epoch),
         BeaconBlockHash::from_raw(Hash::from_bytes(tag)),
-        placeholder_cert(),
-        None,
         Vec::new(),
+    );
+    Arc::new(CertifiedBeaconBlock::new_unchecked(
+        block,
+        BeaconCert::Normal(Box::new(placeholder_cert())),
+        None,
     ))
 }
 
@@ -234,7 +238,10 @@ pub fn make_test_beacon_state(epoch: u64, tag: &[u8]) -> Arc<BeaconState> {
 /// so this helper just produces a structurally well-formed block paired
 /// with an arbitrary state.
 #[must_use]
-pub fn make_test_block_and_state(epoch: u64, tag: &[u8]) -> (Arc<BeaconBlock>, Arc<BeaconState>) {
+pub fn make_test_block_and_state(
+    epoch: u64,
+    tag: &[u8],
+) -> (Arc<CertifiedBeaconBlock>, Arc<BeaconState>) {
     let state = make_test_beacon_state(epoch, tag);
     let block = make_test_beacon_block(epoch, tag);
     (block, state)

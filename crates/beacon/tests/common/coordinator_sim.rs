@@ -23,8 +23,8 @@ use hyperscale_beacon::pc::{sign_vote1, sign_vote2, sign_vote3};
 use hyperscale_beacon::spc::sign_empty_view_msg;
 use hyperscale_core::Action;
 use hyperscale_types::{
-    BeaconBlock, BeaconGenesisConfig, BeaconProposal, BeaconState, Bls12381G1PrivateKey,
-    Bls12381G1PublicKey, Epoch, GenesisPool, GenesisValidator, NetworkDefinition, PcValueElement,
+    BeaconGenesisConfig, BeaconProposal, BeaconState, Bls12381G1PrivateKey, Bls12381G1PublicKey,
+    CertifiedBeaconBlock, Epoch, GenesisPool, GenesisValidator, NetworkDefinition, PcValueElement,
     PcVector, Randomness, ShardGroupId, SpcMessage, Stake, StakePoolId, ValidatorId, VpcMsgPayload,
     Witness, bls_keypair_from_seed, genesis_config_hash, pc_context, spc_context, vrf_sign,
 };
@@ -54,7 +54,7 @@ pub enum ByzantineBehaviour {
 #[derive(Clone)]
 pub struct CapturedCommit {
     pub epoch: Epoch,
-    pub block: Arc<BeaconBlock>,
+    pub block: Arc<CertifiedBeaconBlock>,
     pub state: BeaconState,
 }
 
@@ -80,7 +80,7 @@ enum SimEvent {
         proposal: Arc<BeaconProposal>,
     },
     BeaconBlock {
-        block: Arc<BeaconBlock>,
+        block: Arc<CertifiedBeaconBlock>,
     },
 }
 
@@ -173,7 +173,7 @@ impl CoordinatorSim {
 
         let initial_state = build_genesis_beacon_state(&config);
         let config_hash = genesis_config_hash(&config, &network);
-        let genesis_block = Arc::new(BeaconBlock::genesis(config_hash));
+        let genesis_block = Arc::new(CertifiedBeaconBlock::genesis(config_hash));
 
         let coordinators: Vec<BeaconCoordinator> = (0..n)
             .map(|i| {
@@ -235,7 +235,11 @@ impl CoordinatorSim {
     /// `on_beacon_block_received` and absorb any actions it emits.
     /// Returns the actions the handler produced — useful for asserting
     /// `CommitBeaconBlock` was emitted on the adoption path.
-    pub fn deliver_block_to(&mut self, replica_idx: usize, block: Arc<BeaconBlock>) -> Vec<Action> {
+    pub fn deliver_block_to(
+        &mut self,
+        replica_idx: usize,
+        block: Arc<CertifiedBeaconBlock>,
+    ) -> Vec<Action> {
         let actions = self.coordinators[replica_idx].on_beacon_block_received(block);
         let returned = actions.clone();
         self.absorb(replica_idx, actions);

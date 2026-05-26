@@ -11,11 +11,12 @@ use hyperscale_beacon::constants::{BEACON_SIGNER_COUNT, MIN_STAKE_FLOOR};
 use hyperscale_beacon::recovery::select_winning_block;
 use hyperscale_beacon::state::apply_epoch;
 use hyperscale_types::{
-    BeaconBlock, BeaconBlockHash, BeaconState, Bls12381G1PrivateKey, Bls12381G1PublicKey,
-    Bls12381G2Signature, Epoch, GenesisConfigHash, Hash, NetworkDefinition, Randomness,
-    RecoveryCertificate, RecoveryRound, ShardCommittee, ShardGroupId, SignerBitfield, SpcCert,
-    Stake, StakePool, StakePoolId, TransitionCause, ValidatorId, ValidatorRecord, ValidatorStatus,
-    aggregate_verify_bls_different_messages, bls_keypair_from_seed, recovery_request_message,
+    BeaconBlock, BeaconBlockHash, BeaconCert, BeaconState, Bls12381G1PrivateKey,
+    Bls12381G1PublicKey, Bls12381G2Signature, CertifiedBeaconBlock, Epoch, Hash, NetworkDefinition,
+    Randomness, RecoveryCertificate, RecoveryRound, ShardCommittee, ShardGroupId, SignerBitfield,
+    SkipEpochCert, Stake, StakePool, StakePoolId, TransitionCause, ValidatorId, ValidatorRecord,
+    ValidatorStatus, aggregate_verify_bls_different_messages, bls_keypair_from_seed,
+    recovery_request_message,
 };
 
 const fn net() -> NetworkDefinition {
@@ -291,24 +292,34 @@ fn cert_bearing_block_wins_against_competing_no_cert_block() {
         Vec::new(),
     );
 
-    let placeholder_cert = SpcCert::Genesis {
-        config_hash: GenesisConfigHash::ZERO,
+    // Both blocks are Skip-shaped to satisfy the wrapper's cert-body
+    // pairing invariant cheaply — select_winning_block only inspects
+    // the wrapper's `recovery_cert` side-data and the block hash.
+    let skip_placeholder = || {
+        SkipEpochCert::new(
+            BeaconBlockHash::from_raw(Hash::from_bytes(b"skip-anchor")),
+            Epoch::new(1),
+            SignerBitfield::new(4),
+            Bls12381G2Signature([0u8; 96]),
+        )
     };
 
-    let cert_block = BeaconBlock::new(
-        Epoch::new(1),
-        BeaconBlockHash::from_raw(Hash::from_bytes(b"prev-cert")),
-        placeholder_cert.clone(),
+    let cert_block = CertifiedBeaconBlock::new_unchecked(
+        BeaconBlock::skip(
+            Epoch::new(1),
+            BeaconBlockHash::from_raw(Hash::from_bytes(b"prev-cert")),
+        ),
+        BeaconCert::Skip(skip_placeholder()),
         Some(cert),
-        Vec::new(),
     );
 
-    let original_block = BeaconBlock::new(
-        Epoch::new(1),
-        BeaconBlockHash::from_raw(Hash::from_bytes(b"prev-orig")),
-        placeholder_cert,
+    let original_block = CertifiedBeaconBlock::new_unchecked(
+        BeaconBlock::skip(
+            Epoch::new(1),
+            BeaconBlockHash::from_raw(Hash::from_bytes(b"prev-orig")),
+        ),
+        BeaconCert::Skip(skip_placeholder()),
         None,
-        Vec::new(),
     );
 
     assert_eq!(

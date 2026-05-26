@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use hyperscale_storage::BeaconChainReader;
-use hyperscale_types::{BeaconBlock, BeaconBlockHash, BeaconState, Epoch};
+use hyperscale_types::{BeaconBlockHash, BeaconState, CertifiedBeaconBlock, Epoch};
 use rocksdb::IteratorMode;
 
 use super::column_families::{BeaconBlocksByEpochCf, BeaconHashToEpochCf, BeaconStateByEpochCf};
@@ -11,12 +11,12 @@ use super::core::RocksDbBeaconStorage;
 use crate::typed_cf::TypedCf;
 
 impl BeaconChainReader for RocksDbBeaconStorage {
-    fn get_beacon_block_by_epoch(&self, epoch: Epoch) -> Option<Arc<BeaconBlock>> {
+    fn get_beacon_block_by_epoch(&self, epoch: Epoch) -> Option<Arc<CertifiedBeaconBlock>> {
         self.cf_get::<BeaconBlocksByEpochCf>(&epoch.inner())
             .map(Arc::new)
     }
 
-    fn get_beacon_block_by_hash(&self, hash: BeaconBlockHash) -> Option<Arc<BeaconBlock>> {
+    fn get_beacon_block_by_hash(&self, hash: BeaconBlockHash) -> Option<Arc<CertifiedBeaconBlock>> {
         let epoch = self.cf_get::<BeaconHashToEpochCf>(&hash.into_raw())?;
         self.cf_get::<BeaconBlocksByEpochCf>(&epoch).map(Arc::new)
     }
@@ -39,7 +39,7 @@ impl BeaconChainReader for RocksDbBeaconStorage {
         Some(Epoch::new(u64::from_be_bytes(bytes)))
     }
 
-    fn latest_committed(&self) -> Option<(Arc<BeaconBlock>, Arc<BeaconState>)> {
+    fn latest_committed(&self) -> Option<(Arc<CertifiedBeaconBlock>, Arc<BeaconState>)> {
         let epoch = self.latest_committed_epoch()?;
         let block = self.get_beacon_block_by_epoch(epoch)?;
         let state = self.get_state_by_epoch(epoch)?;

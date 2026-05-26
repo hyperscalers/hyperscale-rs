@@ -3,15 +3,15 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use hyperscale_types::{BeaconBlock, BeaconBlockHash, Epoch};
+use hyperscale_types::{BeaconBlockHash, CertifiedBeaconBlock, Epoch};
 
-/// Map of `BeaconBlockHash → Arc<BeaconBlock>` for blocks received via
-/// gossip but not yet verified or applied.
+/// Map of `BeaconBlockHash → Arc<CertifiedBeaconBlock>` for blocks
+/// received via gossip but not yet verified or applied.
 ///
 /// Bounded by [`Self::prune_committed`] — callers invoke it after
 /// every committed epoch to drop settled entries.
 #[derive(Debug, Default)]
-pub struct PendingBeaconBlocks(BTreeMap<BeaconBlockHash, Arc<BeaconBlock>>);
+pub struct PendingBeaconBlocks(BTreeMap<BeaconBlockHash, Arc<CertifiedBeaconBlock>>);
 
 impl PendingBeaconBlocks {
     /// Empty cache.
@@ -20,9 +20,12 @@ impl PendingBeaconBlocks {
         Self::default()
     }
 
-    /// Insert `block` keyed on its own header hash. Returns the
+    /// Insert `block` keyed on its own block hash. Returns the
     /// prior entry under the same hash, if any.
-    pub fn insert(&mut self, block: Arc<BeaconBlock>) -> Option<Arc<BeaconBlock>> {
+    pub fn insert(
+        &mut self,
+        block: Arc<CertifiedBeaconBlock>,
+    ) -> Option<Arc<CertifiedBeaconBlock>> {
         self.0.insert(block.block_hash(), block)
     }
 
@@ -39,11 +42,11 @@ impl PendingBeaconBlocks {
 #[allow(missing_docs)]
 impl PendingBeaconBlocks {
     #[must_use]
-    pub fn get(&self, hash: BeaconBlockHash) -> Option<&Arc<BeaconBlock>> {
+    pub fn get(&self, hash: BeaconBlockHash) -> Option<&Arc<CertifiedBeaconBlock>> {
         self.0.get(&hash)
     }
 
-    pub fn remove(&mut self, hash: BeaconBlockHash) -> Option<Arc<BeaconBlock>> {
+    pub fn remove(&mut self, hash: BeaconBlockHash) -> Option<Arc<CertifiedBeaconBlock>> {
         self.0.remove(&hash)
     }
 
@@ -63,23 +66,36 @@ impl PendingBeaconBlocks {
     }
 }
 
-// Tests temporarily removed during cert-as-authenticator refactor; restore in follow-up.
-
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::{BeaconBlock, BeaconBlockHash, Epoch, GenesisConfigHash, Hash, SpcCert};
+    use hyperscale_types::{
+        BeaconBlock, BeaconBlockHash, BeaconCert, Bls12381G2Signature, CertifiedBeaconBlock, Epoch,
+        GenesisConfigHash, Hash, SignerBitfield, SkipEpochCert,
+    };
 
     use super::*;
 
-    fn block_at(epoch: u64, tag: &[u8]) -> Arc<BeaconBlock> {
-        Arc::new(BeaconBlock::new(
+    fn block_at(epoch: u64, tag: &[u8]) -> Arc<CertifiedBeaconBlock> {
+        // Past genesis: use a Skip-shaped block so we have an empty
+        // proposal list without needing to manufacture an SPC cert. The
+        // tests only care about hash/epoch identity, not cert content.
+        if epoch == 0 {
+            return Arc::new(CertifiedBeaconBlock::genesis(GenesisConfigHash::ZERO));
+        }
+        let block = BeaconBlock::skip(
             Epoch::new(epoch),
             BeaconBlockHash::from_raw(Hash::from_bytes(tag)),
-            SpcCert::Genesis {
-                config_hash: GenesisConfigHash::ZERO,
-            },
+        );
+        let skip_cert = SkipEpochCert::new(
+            BeaconBlockHash::from_raw(Hash::from_bytes(b"anchor")),
+            Epoch::new(epoch),
+            SignerBitfield::new(4),
+            Bls12381G2Signature([0u8; 96]),
+        );
+        Arc::new(CertifiedBeaconBlock::new_unchecked(
+            block,
+            BeaconCert::Skip(skip_cert),
             None,
-            Vec::new(),
         ))
     }
 

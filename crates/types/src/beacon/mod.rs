@@ -1,15 +1,23 @@
 //! Beacon-chain consensus types.
 //!
-//! - [`block`]: [`BeaconBlock`] (epoch + cert + committed proposals +
-//!   optional recovery cert).
+//! - [`block`]: [`BeaconBlock`] (epoch + parent linkage + committed
+//!   proposals). The authenticating cert lives outside the block hash
+//!   on a wrapper.
+//! - [`cert`]: [`BeaconCert`] discriminator (Genesis / Normal / Skip).
+//! - [`certified`]: [`CertifiedBeaconBlock`] — block + cert pair with
+//!   decode-checked pairing invariant; mirrors shard
+//!   [`CertifiedBlock`](crate::CertifiedBlock).
 //! - [`genesis`]: [`BeaconGenesisConfig`] and the chain-identity hash
-//!   embedded in [`SpcCert::Genesis`].
+//!   embedded in [`BeaconCert::Genesis`](crate::BeaconCert::Genesis).
 //! - [`limits`]: protocol-level caps on per-proposal payload sizes.
 //! - [`pc`]: Prefix Consensus vote / QC wire types.
 //! - [`proposal`]: [`BeaconProposal`] (one committee member's slot
 //!   submission: witnesses + VRF reveal).
 //! - [`recovery`]: [`RecoveryRequest`] and [`RecoveryCertificate`] (committee
-//!   replacement after stall).
+//!   replacement after stall) — being phased out; see
+//!   `.plans/beacon-recovery-to-skip.md`.
+//! - [`skip`]: [`SkipRequest`] and [`SkipEpochCert`] (pool-quorum
+//!   abandonment of a stalled epoch).
 //! - [`spc`]: Strong Prefix Consensus wire types (high triples, empty-view
 //!   messages, view-entry certificates).
 //! - [`ready_signal`]: [`ReadySignal`] validator-emitted "ready on shard"
@@ -23,17 +31,22 @@
 //!   beacon applies per slot).
 
 pub mod block;
+pub mod cert;
+pub mod certified;
 pub mod genesis;
 pub mod limits;
 pub mod pc;
 pub mod proposal;
 pub mod ready_signal;
 pub mod recovery;
+pub mod skip;
 pub mod spc;
 pub mod state;
 pub mod witness;
 
 pub use block::BeaconBlock;
+pub use cert::BeaconCert;
+pub use certified::{CertifiedBeaconBlock, CertifiedBeaconBlockPairingError};
 pub use genesis::{BeaconGenesisConfig, GenesisPool, GenesisValidator, genesis_config_hash};
 pub use limits::{
     MAX_BEACON_WITNESS_EVENTS_PER_TX, MAX_EXCLUDED_VALIDATORS, MAX_PREFIX_SIGS,
@@ -48,6 +61,7 @@ pub use pc::{
 pub use proposal::BeaconProposal;
 pub use ready_signal::ReadySignal;
 pub use recovery::{RecoveryCertificate, RecoveryEquivocation, RecoveryRequest};
+pub use skip::{SkipEpochCert, SkipRequest};
 pub use spc::{
     SkipReport, SpcCert, SpcEmptyViewMsg, SpcHighTriple, SpcMessage, SpcProposalObject,
     VpcMsgPayload,

@@ -33,6 +33,7 @@
 
 mod beacon_pc;
 mod beacon_recovery;
+mod beacon_skip;
 mod beacon_vrf;
 mod execution;
 mod provisions;
@@ -45,6 +46,7 @@ pub use beacon_pc::{
     DOMAIN_PC_VOTE3, PcContext, SpcContext, pc_context, pc_vote_signing_message, spc_context,
 };
 pub use beacon_recovery::{DOMAIN_RECOVERY_REQUEST, recovery_request_message};
+pub use beacon_skip::{DOMAIN_SKIP_REQUEST, skip_request_message};
 pub use beacon_vrf::{
     DOMAIN_PC_VRF, vrf_output_from_proof, vrf_reveal_message, vrf_sign, vrf_verify,
 };

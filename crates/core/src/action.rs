@@ -7,15 +7,15 @@ use std::time::Duration;
 use hyperscale_dispatch::DispatchPool;
 use hyperscale_storage::BeaconWitnessCommit;
 use hyperscale_types::{
-    BeaconBlock, BeaconState, BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash,
-    BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PublicKey, CertificateRoot,
-    CommittedBlockHeader, Epoch, ExecutionCertificate, ExecutionVote, FinalizedWave,
-    GlobalReceiptRoot, Hash, InFlightCount, LeafIndex, LocalReceiptRoot, NodeId, PcQc1, PcQc2,
-    PcQc3, PcVector, ProposerTimestamp, ProvisionHash, ProvisionTxRoot, Provisions, ProvisionsRoot,
-    QuorumCertificate, ReadySignal, RecoveryRequest, Round, RoutableTransaction, ShardGroupId,
-    SharedCertificates, SharedTransactions, SpcCert, SpcHighTriple, SpcView, StateRoot,
-    SubstateEntry, TopologySnapshot, TransactionRoot, TransactionStatus, TxHash, TxOutcome,
-    ValidatorId, VotePower, WaveId, WeightedTimestamp, Witness,
+    BeaconState, BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader,
+    BlockHeight, BlockManifest, BlockVote, Bls12381G1PublicKey, CertificateRoot,
+    CertifiedBeaconBlock, CommittedBlockHeader, Epoch, ExecutionCertificate, ExecutionVote,
+    FinalizedWave, GlobalReceiptRoot, Hash, InFlightCount, LeafIndex, LocalReceiptRoot, NodeId,
+    PcQc1, PcQc2, PcQc3, PcVector, ProposerTimestamp, ProvisionHash, ProvisionTxRoot, Provisions,
+    ProvisionsRoot, QuorumCertificate, ReadySignal, RecoveryRequest, Round, RoutableTransaction,
+    ShardGroupId, SharedCertificates, SharedTransactions, SpcCert, SpcHighTriple, SpcView,
+    StateRoot, SubstateEntry, TopologySnapshot, TransactionRoot, TransactionStatus, TxHash,
+    TxOutcome, ValidatorId, VotePower, WaveId, WeightedTimestamp, Witness,
 };
 
 use crate::{CommitSource, FetchAbandon, FetchRequest, ProtocolEvent, TimerId};
@@ -902,8 +902,8 @@ pub enum Action {
     /// Broadcast a finalized beacon block (post-SPC commit) over the
     /// beacon gossip topic.
     BroadcastBeaconBlock {
-        /// Block to broadcast.
-        block: Arc<BeaconBlock>,
+        /// Certified block to broadcast.
+        block: Arc<CertifiedBeaconBlock>,
     },
 
     /// Broadcast a locally-signed [`RecoveryRequest`] to the active-duty
@@ -947,8 +947,8 @@ pub enum Action {
     /// Persist a committed beacon block + its resulting `BeaconState`
     /// to `BeaconStorage`. Both writes go in one atomic batch.
     CommitBeaconBlock {
-        /// Committed block.
-        block: Arc<BeaconBlock>,
+        /// Certified committed block.
+        block: Arc<CertifiedBeaconBlock>,
         /// State the block advances to. Boxed to bound enum size.
         state: Box<BeaconState>,
     },

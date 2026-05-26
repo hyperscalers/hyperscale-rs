@@ -8,7 +8,7 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use hyperscale_types::{BeaconBlock, BeaconState};
+use hyperscale_types::{BeaconState, CertifiedBeaconBlock};
 use rocksdb::{ColumnFamilyDescriptor, DB, Options, WriteBatch, WriteOptions};
 
 use super::column_families::{
@@ -110,7 +110,7 @@ impl RocksDbBeaconStorage {
     /// Convenience for committing one (block, state) pair atomically:
     /// typed writes for all three CFs in a single `WriteBatch`, flushed
     /// sync under `commit_lock`.
-    pub(super) fn commit_block_inner(&self, block: &BeaconBlock, state: &BeaconState) {
+    pub(super) fn commit_block_inner(&self, block: &CertifiedBeaconBlock, state: &BeaconState) {
         let _guard = self
             .commit_lock
             .lock()
