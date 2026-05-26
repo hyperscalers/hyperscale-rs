@@ -21,11 +21,12 @@ use std::sync::Arc;
 
 use hyperscale_core::{Action, TimerId};
 use hyperscale_types::{
-    BeaconBlock, BeaconProposal, BeaconState, EPOCH_DURATION, Epoch, GenesisConfigHash,
-    LocalTimestamp, MAX_WITNESSES_PER_PROPOSER, NetworkDefinition, PcValueElement, PcVector,
-    RECOVERY_TIMEOUT, RecoveryCertificate, RecoveryRequest, ShardGroupId, ShardWitness, SpcCert,
-    SpcMessage, TopologySnapshot, ValidatorId, VpcMsgPayload, WeightedTimestamp, Witness,
-    recovery_request_message, spc_context, verify_bls12381_v1, verify_merkle_inclusion,
+    BeaconBlock, BeaconProposal, BeaconState, Bls12381G1PublicKey, EPOCH_DURATION, Epoch,
+    GenesisConfigHash, LocalTimestamp, MAX_WITNESSES_PER_PROPOSER, NetworkDefinition,
+    PcValueElement, PcVector, RECOVERY_TIMEOUT, RecoveryCertificate, RecoveryRequest, ShardGroupId,
+    ShardWitness, SpcCert, SpcMessage, TopologySnapshot, ValidatorId, VpcMsgPayload,
+    WeightedTimestamp, Witness, recovery_request_message, spc_context, verify_bls12381_v1,
+    verify_merkle_inclusion,
 };
 use tracing::{trace, warn};
 
@@ -38,7 +39,8 @@ use crate::recovery::verify_recovery_cert;
 use crate::recovery_tracker::RecoveryTracker;
 use crate::spc::{SpcEffect, SpcEvent, SpcInstance, verify_block_cert};
 use crate::state::{
-    apply_epoch, derive_active_pool, derive_beacon_committee, derive_topology_snapshot,
+    apply_epoch, apply_recovery_or_resample, derive_active_pool, derive_beacon_committee,
+    derive_topology_snapshot,
 };
 use crate::verification::BeaconVerificationPipeline;
 use crate::witness_fetcher::ShardWitnessFetchTracker;
@@ -397,13 +399,36 @@ impl BeaconCoordinator {
         self.try_propose()
     }
 
-    /// Stand up a fresh [`SpcInstance`] for the upcoming epoch.
-    /// Pairs each committee member with their pubkey by looking up
-    /// `state.validators`. Skips validators absent from the validator
-    /// table — a structurally impossible state for an on-chain
-    /// committee, so the skip is defensive rather than expected.
+    /// Stand up a fresh [`SpcInstance`] for the upcoming epoch under
+    /// the current `state.committee`. Skips validators absent from
+    /// `state.validators` — a structurally impossible state for an
+    /// on-chain committee, so the skip is defensive rather than
+    /// expected.
     fn bootstrap_spc_for_next_epoch(&mut self) {
         let committee = derive_beacon_committee(&self.state);
+        self.bootstrap_spc_with_committee(committee);
+    }
+
+    /// Stand up a fresh [`SpcInstance`] for the upcoming epoch under
+    /// the recovery-resampled committee implied by `cert` and the
+    /// current state. Used after `on_recovery_request_received`
+    /// gathers quorum at the local tip: the old committee is dead,
+    /// the new one is what the cert's `excluded_validators` carves
+    /// out of the active pool.
+    ///
+    /// Derives the committee by cloning state and running
+    /// [`apply_recovery_or_resample`](crate::state::apply_recovery_or_resample)
+    /// against the clone — no state mutation here, the real
+    /// resample lands inside [`apply_epoch`] when this SPC's
+    /// `OutputHigh` produces a block carrying the cert.
+    fn bootstrap_spc_with_recovery(&mut self, cert: &RecoveryCertificate) {
+        let mut tentative = self.state.clone();
+        let _ = apply_recovery_or_resample(&mut tentative, &self.network, Some(cert));
+        let committee = derive_beacon_committee(&tentative);
+        self.bootstrap_spc_with_committee(committee);
+    }
+
+    fn bootstrap_spc_with_committee(&mut self, committee: Vec<(ValidatorId, Bls12381G1PublicKey)>) {
         let next_epoch = self.state.current_epoch.next();
         self.spc = Some(SpcInstance::new(
             self.network.clone(),
@@ -582,10 +607,17 @@ impl BeaconCoordinator {
             return Vec::new();
         }
 
+        // Tear down the old (stalled) SPC and stand up a new one
+        // running under the recovery-resampled committee. Subsequent
+        // PC/SPC traffic from members of the old committee that
+        // aren't in the new one will fail the cert verifier's
+        // `pubkey_in_committee` lookup and bounce harmlessly.
+        let cert_for_bootstrap = cert.clone();
         self.pending_recovery_cert = Some(cert);
         self.spc = None;
         self.recovery_tracker
             .forget_anchor(request.last_block_hash(), request.last_block_epoch());
+        self.bootstrap_spc_with_recovery(&cert_for_bootstrap);
         Vec::new()
     }
 
@@ -715,9 +747,7 @@ impl BeaconCoordinator {
         _recipients: &[ValidatorId],
     ) -> Vec<Action> {
         let committed = self.decode_committed_proposals(epoch, output);
-        // Recovery-cert assembly (`RecoveryTracker::try_assemble`) lands
-        // in a follow-up; for now every commit is plain-path.
-        let recovery_cert = None;
+        let recovery_cert = self.pending_recovery_cert.take();
         let prev_block_hash = self.latest_block.block_hash();
         let block = BeaconBlock::new(epoch, prev_block_hash, cert, recovery_cert, committed);
         let block_arc = Arc::new(block);
@@ -1768,9 +1798,10 @@ mod tests {
     }
 
     #[test]
-    fn on_recovery_request_assembles_cert_at_quorum_and_tears_down_spc() {
+    fn on_recovery_request_assembles_cert_and_swaps_spc_for_recovery_committee() {
         let mut coord = fresh_coord();
         coord.bootstrap_spc_for_next_epoch();
+        let old_spc_epoch = coord.spc.as_ref().unwrap().epoch();
         let anchor_hash = coord.latest_block.block_hash();
         let anchor_epoch = coord.latest_block.epoch();
 
@@ -1791,11 +1822,75 @@ mod tests {
         assert_eq!(cert.last_block_epoch(), anchor_epoch);
         assert_eq!(cert.recovery_round(), RecoveryRound::INITIAL);
         assert_eq!(cert.signer_count(), 4);
-        // SPC torn down — the old committee is dead. Re-bootstrap with
-        // the recovery-resampled committee is a follow-up.
-        assert!(coord.spc.is_none());
+        // Old SPC dropped; new one bootstrapped under the
+        // recovery-resampled committee for the same epoch.
+        let new_spc = coord
+            .spc
+            .as_ref()
+            .expect("recovery-bootstrapped SPC should be present");
+        assert_eq!(new_spc.epoch(), old_spc_epoch);
         // Anchor bucket dropped from the tracker.
         assert_eq!(coord.recovery_tracker.bucket_count(), 0);
+    }
+
+    #[test]
+    fn output_high_attaches_pending_recovery_cert_to_block() {
+        let mut coord = fresh_coord();
+        coord.bootstrap_spc_for_next_epoch();
+        let in_flight = Epoch::GENESIS.next();
+        let committee = coord.state.committee.clone();
+        let n = committee.len();
+
+        // Build a real cert via the recovery-tracker assembly path so
+        // the produced cert verifies under the active pool.
+        let anchor_hash = coord.latest_block.block_hash();
+        let anchor_epoch = coord.latest_block.epoch();
+        for i in 0..u64::try_from(n).unwrap() {
+            let req = signed_recovery_request(
+                i,
+                ValidatorId::new(i),
+                anchor_hash,
+                anchor_epoch,
+                RecoveryRound::INITIAL,
+            );
+            let _ = coord.on_recovery_request_received(&req);
+        }
+        assert!(coord.has_pending_recovery_cert());
+        let expected_cert = coord.pending_recovery_cert.clone().unwrap();
+
+        // Drive OutputHigh on the recovery-bootstrapped SPC.
+        let mut elements = Vec::with_capacity(n);
+        for id in &committee {
+            let p = sample_proposal(u8::try_from(id.inner()).unwrap_or(0));
+            elements.push(p.pc_element_hash(in_flight));
+            coord.proposal_pool.admit(*id, in_flight, p);
+        }
+        let output = PcVector::new(elements);
+        let keys: Vec<_> = (0..n as u64).map(keypair).collect();
+        let cert_committee: Vec<_> = coord
+            .state
+            .committee
+            .iter()
+            .copied()
+            .zip(keys.iter().map(Bls12381G1PrivateKey::public_key))
+            .collect();
+        let f = n.saturating_sub(1) / 3;
+        let q = n - f;
+        let signer_positions: Vec<usize> = (0..q).collect();
+        let cert = build_direct_cert(
+            SpcView::new(1),
+            in_flight,
+            &keys,
+            &cert_committee,
+            &signer_positions,
+        );
+
+        let recipients = coord.spc_recipients();
+        let _actions = coord.on_spc_output_high(in_flight, &output, cert, &recipients);
+
+        // Stash consumed; the cert rides on the new latest_block.
+        assert!(!coord.has_pending_recovery_cert());
+        assert_eq!(coord.latest_block.recovery_cert(), Some(&expected_cert));
     }
 
     #[test]

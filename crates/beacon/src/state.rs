@@ -470,16 +470,19 @@ pub fn apply_epoch(
     }
 }
 
-/// Resample the beacon committee under either the recovery path (a
-/// valid cert is present, install replacement committee with
-/// exclusion-aware sampling) or the natural path (no cert, or cert
-/// failed verification — silently fall through to the normal resample).
+/// Resample the beacon committee.
+///
+/// Recovery path: `recovery_cert` is `Some` and verifies — install
+/// the replacement committee with exclusion-aware sampling against
+/// the cert's `excluded_validators`. Natural path: no cert, or the
+/// supplied cert failed verification — fall through to the normal
+/// resample over the full pool.
 ///
 /// A failed-verification cert is dropped rather than panicking: the
 /// runner shouldn't be able to brick the chain by submitting a bad
 /// cert, and a well-formed honest committee will produce a normal
 /// block at this epoch in that case.
-fn apply_recovery_or_resample(
+pub fn apply_recovery_or_resample(
     state: &mut BeaconState,
     network: &NetworkDefinition,
     recovery_cert: Option<&RecoveryCertificate>,
