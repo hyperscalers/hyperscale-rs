@@ -16,8 +16,6 @@
 //!   pool aggregates, committee tables, the epoch-effect bundle). Pure
 //!   data shapes — the application logic that mutates these lives in
 //!   `hyperscale_beacon::state`.
-//! - [`state_root`]: SSZ-style tagged-Merkle commitment over
-//!   [`BeaconState`] plus light-client field proofs.
 //! - [`witness`]: [`Witness`] / [`ShardWitness`] / [`ShardWitnessPayload`] /
 //!   [`ShardWitnessProof`] / [`BeaconWitnessEvent`] (observations the
 //!   beacon applies per slot).
@@ -30,7 +28,6 @@ pub mod ready_signal;
 pub mod recovery;
 pub mod spc;
 pub mod state;
-pub mod state_root;
 pub mod witness;
 
 pub use block::BeaconBlock;
@@ -46,9 +43,7 @@ pub use pc::{
 };
 pub use proposal::BeaconProposal;
 pub use ready_signal::ReadySignal;
-pub use recovery::{
-    RecoveryCertificate, RecoveryEquivocation, RecoveryRequest, recovery_cert_hash,
-};
+pub use recovery::{RecoveryCertificate, RecoveryEquivocation, RecoveryRequest};
 pub use spc::{
     SkipReport, SpcCert, SpcEmptyLowEvidence, SpcEmptyViewMsg, SpcHighTriple, SpcMessage,
     SpcProposalObject, VpcMsgPayload,
@@ -57,7 +52,6 @@ pub use state::{
     BeaconState, CommitteeTransition, JailReason, PendingWithdrawal, ShardCommittee, SlotEffects,
     StakePool, TransitionCause, ValidatorRecord, ValidatorStatus,
 };
-pub use state_root::{StateKey, StateProof, StateValue, SubtreePath, prove, state_root, verify};
 pub use witness::{
     BeaconWitness, BeaconWitnessEvent, EquivocationEvidence, SHARD_WITNESS_LEAF_DOMAIN_TAG,
     ShardWitness, ShardWitnessPayload, ShardWitnessProof, Witness,

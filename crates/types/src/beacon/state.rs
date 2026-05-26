@@ -8,10 +8,11 @@
 //! `hyperscale_beacon::state` — they need beacon-side protocol
 //! constants and are not part of the consumer-facing type surface.
 //!
-//! Light clients pulled in via [`crate::beacon::state_root`] consume
-//! these types directly to verify proofs against a committed
-//! `state_root`; full nodes consume them through `hyperscale_beacon`'s
-//! coordinator. Both share one schema and one set of SBOR encodings.
+//! Light clients re-execute `apply_epoch` over committed
+//! [`BeaconBlock`](crate::BeaconBlock)s instead of verifying merkle
+//! proofs against an on-chain state root: the SPC cert is the sole
+//! block authenticator and there is no on-chain commitment to the
+//! resulting `BeaconState` to prove against.
 //!
 //! # Epoch-time vs slot-time
 //!

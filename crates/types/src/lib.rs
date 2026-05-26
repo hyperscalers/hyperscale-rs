@@ -41,8 +41,7 @@ pub use beacon::{
     RecoveryCertificate, RecoveryEquivocation, RecoveryRequest, SHARD_WITNESS_LEAF_DOMAIN_TAG,
     ShardCommittee, ShardWitness, ShardWitnessPayload, ShardWitnessProof, SkipReport, SlotEffects,
     SpcCert, SpcEmptyLowEvidence, SpcEmptyViewMsg, SpcHighTriple, SpcMessage, SpcProposalObject,
-    StakePool, StateKey, StateProof, StateValue, SubtreePath, TransitionCause, ValidatorRecord,
-    ValidatorStatus, VpcMsgPayload, Witness, prove, recovery_cert_hash, state_root, verify,
+    StakePool, TransitionCause, ValidatorRecord, ValidatorStatus, VpcMsgPayload, Witness,
 };
 pub use crypto::batch_verify::{
     aggregate_verify_bls_different_messages, batch_verify_bls_different_messages,
@@ -64,10 +63,9 @@ pub use network::{GossipMessage, MessageClass, NetworkMessage, Request, TopicSco
 pub use primitives::bloom::{BloomFilter, BloomKey, DEFAULT_FPR, MAX_BITS};
 pub use primitives::hash::{Hash, TypedHash};
 pub use primitives::hash_kinds::{
-    BeaconBlockHash, BeaconStateRoot, BeaconWitnessRoot, BlockHash, CertificateRoot, EventRoot,
-    GenesisConfigHash, GlobalReceiptHash, GlobalReceiptRoot, LocalReceiptRoot, ProvisionHash,
-    ProvisionTxRoot, ProvisionsRoot, RecoveryCertHash, StateRoot, TransactionRoot, TxHash,
-    WaveReceiptHash, WritesRoot,
+    BeaconBlockHash, BeaconWitnessRoot, BlockHash, CertificateRoot, EventRoot, GenesisConfigHash,
+    GlobalReceiptHash, GlobalReceiptRoot, LocalReceiptRoot, ProvisionHash, ProvisionTxRoot,
+    ProvisionsRoot, StateRoot, TransactionRoot, TxHash, WaveReceiptHash, WritesRoot,
 };
 pub use primitives::identifiers::{
     Attempt, BeaconWitnessLeafCount, BlockHeight, Epoch, HeaderFetchCount, InFlightCount,

@@ -140,29 +140,6 @@ hash_newtype!(
 );
 
 hash_newtype!(
-    /// Merkle commitment to the beacon-chain state after applying a slot.
-    ///
-    /// Carried in `BeaconBlockHeader::state_root`. Lets light clients
-    /// read post-slot state (validator set, committee, randomness) with
-    /// one hash check instead of replaying the application logic.
-    pub BeaconStateRoot,
-    "BeaconStateRoot"
-);
-
-hash_newtype!(
-    /// Hash binding an optional `RecoveryCertificate` into a beacon
-    /// block header.
-    ///
-    /// `RecoveryCertHash::ZERO` is the sentinel for "no recovery cert
-    /// attached at this slot". For any present cert, this is the content
-    /// hash of the canonically-encoded certificate; the committee
-    /// aggregate signs over the header (and therefore over this hash),
-    /// so the cert body cannot be swapped post-hoc.
-    pub RecoveryCertHash,
-    "RecoveryCertHash"
-);
-
-hash_newtype!(
     /// SBOR-canonical hash of a [`BeaconGenesisConfig`](crate::BeaconGenesisConfig).
     ///
     /// Embedded in [`SpcCert::Genesis`](crate::SpcCert) so the genesis

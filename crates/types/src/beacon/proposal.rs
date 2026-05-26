@@ -2,9 +2,9 @@
 //!
 //! Each member's proposal carries (1) a bounded list of observations
 //! ([`Witness`]es lifted from shards) and (2) a VRF reveal for the
-//! slot. Once a slot's committee reaches agreement, every accepted
-//! proposal becomes a leaf of the slot's `proposals_root` in the
-//! resulting [`BeaconBlockHeader`](crate::BeaconBlockHeader).
+//! slot. Once SPC produces an `OutputHigh` for the slot, every
+//! accepted proposal lands in the resulting
+//! [`BeaconBlock::committed_proposals`](crate::BeaconBlock).
 
 use blake3::Hasher;
 use sbor::prelude::*;

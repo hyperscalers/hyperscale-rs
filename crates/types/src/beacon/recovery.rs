@@ -8,16 +8,16 @@
 //! anyone can aggregate them into a [`RecoveryCertificate`] that triggers
 //! deterministic committee replacement at the consensus layer.
 //!
-//! The cert's content hash rides inside the next [`BeaconBlockHeader`]'s
-//! `recovery_cert_hash` field via [`recovery_cert_hash`], binding it into
-//! the post-recovery committee's aggregate signature so the cert body
-//! cannot be swapped post-hoc.
+//! Carried verbatim on the next finalized [`BeaconBlock`](crate::BeaconBlock).
+//! Block-level authentication is the SPC cert, so the recovery cert
+//! doesn't need a separate binding hash: any tamper changes the block
+//! body and breaks the SPC cert's verifier-derived committee.
 
 use sbor::prelude::*;
 
 use crate::{
-    BeaconBlockHash, Bls12381G2Signature, BoundedVec, Epoch, Hash, MAX_EXCLUDED_VALIDATORS,
-    RecoveryCertHash, RecoveryRound, SignerBitfield, SpcCert, ValidatorId,
+    BeaconBlockHash, Bls12381G2Signature, BoundedVec, Epoch, MAX_EXCLUDED_VALIDATORS,
+    RecoveryRound, SignerBitfield, SpcCert, ValidatorId,
 };
 
 /// One active validator's signed attestation that the beacon chain has
@@ -91,10 +91,10 @@ impl RecoveryRequest {
 /// `(last_block_hash, last_block_epoch)` within their recovery timeout.
 ///
 /// Triggers deterministic committee replacement when the cert is
-/// observed by the beacon state machine. The cert's content hash is
-/// bound into the next [`BeaconBlockHeader`]'s `recovery_cert_hash` via
-/// [`recovery_cert_hash`] so the post-recovery committee's aggregate
-/// signature covers it.
+/// observed by the beacon state machine. Carried verbatim inside the
+/// next [`BeaconBlock`](crate::BeaconBlock); the SPC cert that
+/// authenticates the block covers the recovery cert implicitly via
+/// the block-level canonical encoding.
 ///
 /// Signer membership is positional against the active validator set at
 /// the anchor block's epoch — [`signers`](Self::signers) is a bitfield
@@ -190,35 +190,6 @@ impl RecoveryCertificate {
     }
 }
 
-/// Content hash of an optional recovery certificate, used to bind the
-/// cert into a [`BeaconBlockHeader`]'s
-/// `recovery_cert_hash` field.
-///
-/// Returns [`RecoveryCertHash::ZERO`] for `None`. For `Some(cert)`,
-/// returns the SBOR-encoded cert's hash under the workspace `Hash`
-/// function.
-///
-/// # Cryptographic assumption
-///
-/// Aliasing condition: a `Some(cert)` whose SBOR hash happens to be all
-/// zero would alias `None`. Under BLAKE3's pre-image resistance (~2^256)
-/// and collision resistance (~2^128 birthday work for a 32-byte digest),
-/// this is cryptographically infeasible — but if BLAKE3 were broken, an
-/// attacker could swap the cert body to `None` while keeping the header
-/// verifying against the same committee aggregate.
-///
-/// # Panics
-///
-/// Panics if SBOR encoding fails — `RecoveryCertificate` is a closed
-/// SBOR type and encoding is infallible in practice.
-#[must_use]
-pub fn recovery_cert_hash(cert: Option<&RecoveryCertificate>) -> RecoveryCertHash {
-    cert.map_or(RecoveryCertHash::ZERO, |c| {
-        let bytes = basic_encode(c).expect("RecoveryCertificate serialization should never fail");
-        RecoveryCertHash::from_raw(Hash::from_bytes(&bytes))
-    })
-}
-
 /// Self-authenticating evidence that a single validator signed both:
 ///   1. a [`RecoveryRequest`] claiming `request.last_block_hash` was their
 ///      latest finalized view, AND
@@ -249,6 +220,7 @@ pub struct RecoveryEquivocation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Hash;
 
     fn sample_cert() -> RecoveryCertificate {
         let mut signers = SignerBitfield::new(4);
@@ -295,40 +267,6 @@ mod tests {
     fn cert_signer_count_reflects_bitfield() {
         let cert = sample_cert();
         assert_eq!(cert.signer_count(), 3);
-    }
-
-    #[test]
-    fn recovery_cert_hash_of_none_is_zero() {
-        assert_eq!(recovery_cert_hash(None), RecoveryCertHash::ZERO);
-    }
-
-    #[test]
-    fn recovery_cert_hash_of_some_is_not_zero() {
-        let cert = sample_cert();
-        assert_ne!(recovery_cert_hash(Some(&cert)), RecoveryCertHash::ZERO);
-    }
-
-    #[test]
-    fn recovery_cert_hash_is_content_sensitive() {
-        let a = sample_cert();
-        let b = RecoveryCertificate::new(
-            a.last_block_hash(),
-            a.last_block_epoch(),
-            a.recovery_round().next(),
-            Vec::new(),
-            a.signers().clone(),
-            a.aggregate_sig(),
-        );
-        assert_ne!(recovery_cert_hash(Some(&a)), recovery_cert_hash(Some(&b)));
-    }
-
-    #[test]
-    fn recovery_cert_hash_is_deterministic() {
-        let cert = sample_cert();
-        assert_eq!(
-            recovery_cert_hash(Some(&cert)),
-            recovery_cert_hash(Some(&cert))
-        );
     }
 
     fn sample_recovery_equivocation() -> RecoveryEquivocation {
