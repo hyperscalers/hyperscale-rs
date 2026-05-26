@@ -22,8 +22,9 @@ use std::sync::Arc;
 use hyperscale_core::{Action, TimerId};
 use hyperscale_types::{
     BeaconBlock, BeaconProposal, BeaconState, Epoch, GenesisConfigHash, LocalTimestamp,
-    NetworkDefinition, PcValueElement, PcVector, RECOVERY_TIMEOUT, SpcCert, SpcMessage,
-    ValidatorId, VpcMsgPayload, spc_context,
+    NetworkDefinition, PcValueElement, PcVector, RECOVERY_TIMEOUT, RecoveryCertificate,
+    RecoveryRequest, SpcCert, SpcMessage, ValidatorId, VpcMsgPayload, recovery_request_message,
+    spc_context, verify_bls12381_v1,
 };
 use tracing::{trace, warn};
 
@@ -32,9 +33,10 @@ use crate::constants::SPC_VIEW_TIMEOUT;
 use crate::equivocations::EquivocationObservations;
 use crate::pending_blocks::PendingBeaconBlocks;
 use crate::proposal_pool::BeaconProposalPool;
+use crate::recovery::verify_recovery_cert;
 use crate::recovery_tracker::RecoveryTracker;
 use crate::spc::{SpcEffect, SpcEvent, SpcInstance, verify_block_cert};
-use crate::state::{apply_epoch, derive_beacon_committee};
+use crate::state::{apply_epoch, derive_active_pool, derive_beacon_committee};
 use crate::verification::BeaconVerificationPipeline;
 use crate::witness_fetcher::ShardWitnessFetchTracker;
 
@@ -89,6 +91,12 @@ pub struct BeaconCoordinator {
     /// reset on commit.
     proposal_pool: BeaconProposalPool,
 
+    /// Assembled-but-not-yet-applied `RecoveryCertificate`. Set when
+    /// `on_recovery_request_received` lands quorum at the local tip's
+    /// anchor; consumed by the next block construction so the cert
+    /// rides on-chain and `apply_epoch` resamples the committee.
+    pending_recovery_cert: Option<RecoveryCertificate>,
+
     me: ValidatorId,
 
     /// Mixed into every signing helper's domain bytes; carried so
@@ -140,6 +148,7 @@ impl BeaconCoordinator {
             equivocations: EquivocationObservations::new(),
             sync: BeaconBlockSyncManager::new(),
             proposal_pool: BeaconProposalPool::new(next_epoch),
+            pending_recovery_cert: None,
             me,
             network,
             now: LocalTimestamp::ZERO,
@@ -430,6 +439,109 @@ impl BeaconCoordinator {
         self.adopt_block(block)
     }
 
+    /// A peer's [`RecoveryRequest`] arrived via gossip. Validate it,
+    /// admit it to the [`RecoveryTracker`], and — on quorum at the
+    /// local tip's anchor — assemble + self-verify a
+    /// [`RecoveryCertificate`], stash it for the next block
+    /// construction, and tear down the current SPC instance.
+    ///
+    /// Validation:
+    /// - Anchor must equal `(latest_block.block_hash(),
+    ///   latest_block.epoch())`. Requests pinning a different anchor
+    ///   are either stale or for a chain head we haven't seen.
+    /// - Signer must sit in the active-duty pool
+    ///   ([`derive_active_pool`]).
+    /// - BLS sig must verify against the canonical
+    ///   [`recovery_request_message`] under the signer's pubkey.
+    ///
+    /// Cert assembly is round-0 only here:
+    /// `excluded_validators = vec![]`. Multi-round recovery with
+    /// cumulative exclusions is a follow-up; reaching round > 0 in
+    /// production means recovery itself stalled, which the chain
+    /// treats as catastrophic anyway.
+    ///
+    /// Bootstrap with the recovery-resampled committee and
+    /// cert-into-block at `on_spc_output_high` are deliberate
+    /// follow-ups — the cert sits in `pending_recovery_cert` until
+    /// those land, so a recovery event today stashes evidence but
+    /// doesn't progress the chain on its own.
+    pub fn on_recovery_request_received(&mut self, request: &RecoveryRequest) -> Vec<Action> {
+        if request.last_block_hash() != self.latest_block.block_hash()
+            || request.last_block_epoch() != self.latest_block.epoch()
+        {
+            trace!(
+                signer = ?request.signer(),
+                anchor_epoch = request.last_block_epoch().inner(),
+                "RecoveryRequest at unknown anchor — dropping",
+            );
+            return Vec::new();
+        }
+
+        let active_pool = derive_active_pool(&self.state);
+        let Some(signer_pk) = active_pool
+            .iter()
+            .find(|(id, _)| *id == request.signer())
+            .map(|(_, pk)| *pk)
+        else {
+            trace!(
+                signer = ?request.signer(),
+                "RecoveryRequest from non-active-pool signer — dropping",
+            );
+            return Vec::new();
+        };
+
+        let msg = recovery_request_message(
+            &self.network,
+            &request.last_block_hash(),
+            request.last_block_epoch(),
+            request.recovery_round(),
+        );
+        if !verify_bls12381_v1(&msg, &signer_pk, &request.sig()) {
+            warn!(
+                signer = ?request.signer(),
+                "RecoveryRequest sig verification failed — dropping",
+            );
+            return Vec::new();
+        }
+
+        if !self.recovery_tracker.observe(request) {
+            return Vec::new();
+        }
+
+        if self.pending_recovery_cert.is_some() {
+            return Vec::new();
+        }
+
+        let Some(cert) = self.recovery_tracker.try_assemble(
+            request.last_block_hash(),
+            request.last_block_epoch(),
+            request.recovery_round(),
+            &active_pool,
+            Vec::new(),
+        ) else {
+            return Vec::new();
+        };
+
+        if !verify_recovery_cert(
+            &cert,
+            &self.network,
+            &active_pool,
+            self.state.last_recovery_cert.as_ref(),
+        ) {
+            warn!(
+                round = request.recovery_round().inner(),
+                "assembled RecoveryCertificate failed self-verify — dropping",
+            );
+            return Vec::new();
+        }
+
+        self.pending_recovery_cert = Some(cert);
+        self.spc = None;
+        self.recovery_tracker
+            .forget_anchor(request.last_block_hash(), request.last_block_epoch());
+        Vec::new()
+    }
+
     /// Advance `self.state` / `self.latest_block` to `block` after
     /// running `apply_epoch` over its committed proposals. Resets
     /// per-epoch caches, bootstraps next epoch's SPC if local is on
@@ -662,6 +774,11 @@ impl BeaconCoordinator {
     pub const fn now(&self) -> LocalTimestamp {
         self.now
     }
+
+    #[must_use]
+    pub const fn has_pending_recovery_cert(&self) -> bool {
+        self.pending_recovery_cert.is_some()
+    }
 }
 
 impl std::fmt::Debug for BeaconCoordinator {
@@ -678,6 +795,10 @@ impl std::fmt::Debug for BeaconCoordinator {
             )
             .field("witness_pool", &self.witness_fetcher.total_pool_len())
             .field("recovery_buckets", &self.recovery_tracker.bucket_count())
+            .field(
+                "pending_recovery_cert",
+                &self.pending_recovery_cert.is_some(),
+            )
             .field("equivocations", &self.equivocations.len())
             .field("syncing", &self.sync.is_syncing())
             .finish_non_exhaustive()
@@ -691,9 +812,9 @@ mod tests {
     use hyperscale_types::{
         BeaconBlock, BeaconBlockHash, BeaconGenesisConfig, Bls12381G1PrivateKey,
         Bls12381G1PublicKey, Epoch, GenesisConfigHash, GenesisPool, GenesisValidator,
-        NetworkDefinition, PcVector, Randomness, ShardGroupId, SpcCert, SpcView, Stake,
-        StakePoolId, ValidatorId, bls_keypair_from_seed, genesis_config_hash, pc_context,
-        spc_context,
+        NetworkDefinition, PcVector, Randomness, RecoveryRound, ShardGroupId, SpcCert, SpcView,
+        Stake, StakePoolId, ValidatorId, bls_keypair_from_seed, genesis_config_hash, pc_context,
+        recovery_request_message, spc_context,
     };
 
     use super::*;
@@ -1284,5 +1405,178 @@ mod tests {
         );
         assert_eq!(coord.state.current_epoch, in_flight);
         assert_eq!(coord.latest_block.epoch(), in_flight);
+    }
+
+    /// Build a real (anchor, epoch, round) recovery request signed by
+    /// validator `seed`'s key. The signed message is the canonical
+    /// [`recovery_request_message`]; the request lives behind an
+    /// `Arc` to match the `ProtocolEvent::RecoveryRequestReceived`
+    /// wire shape.
+    fn signed_recovery_request(
+        seed: u64,
+        validator: ValidatorId,
+        anchor_hash: BeaconBlockHash,
+        anchor_epoch: Epoch,
+        round: RecoveryRound,
+    ) -> Arc<RecoveryRequest> {
+        let sk = keypair(seed);
+        let net = NetworkDefinition::simulator();
+        let msg = recovery_request_message(&net, &anchor_hash, anchor_epoch, round);
+        let sig = sk.sign_v1(&msg);
+        Arc::new(RecoveryRequest::new(
+            anchor_hash,
+            anchor_epoch,
+            round,
+            validator,
+            sig,
+        ))
+    }
+
+    #[test]
+    fn on_recovery_request_drops_at_wrong_anchor() {
+        let mut coord = fresh_coord();
+        // Anchor doesn't match local tip (we're at genesis, anchor is
+        // the zero hash — but `last_block_epoch` is 99).
+        let req = signed_recovery_request(
+            0,
+            ValidatorId::new(0),
+            coord.latest_block.block_hash(),
+            Epoch::new(99),
+            RecoveryRound::INITIAL,
+        );
+        let actions = coord.on_recovery_request_received(&req);
+        assert!(actions.is_empty());
+        assert!(coord.pending_recovery_cert.is_none());
+        assert_eq!(coord.recovery_tracker.bucket_count(), 0);
+    }
+
+    #[test]
+    fn on_recovery_request_drops_non_pool_signer() {
+        let mut coord = fresh_coord();
+        // Signer 99 isn't in the active pool.
+        let req = signed_recovery_request(
+            99,
+            ValidatorId::new(99),
+            coord.latest_block.block_hash(),
+            coord.latest_block.epoch(),
+            RecoveryRound::INITIAL,
+        );
+        let actions = coord.on_recovery_request_received(&req);
+        assert!(actions.is_empty());
+        assert!(coord.pending_recovery_cert.is_none());
+        assert_eq!(coord.recovery_tracker.bucket_count(), 0);
+    }
+
+    #[test]
+    fn on_recovery_request_drops_invalid_sig() {
+        use hyperscale_types::Bls12381G2Signature;
+        let mut coord = fresh_coord();
+        // Signer 0 is in the pool, but the sig is all-zeros — won't
+        // verify under any pubkey.
+        let req = Arc::new(RecoveryRequest::new(
+            coord.latest_block.block_hash(),
+            coord.latest_block.epoch(),
+            RecoveryRound::INITIAL,
+            ValidatorId::new(0),
+            Bls12381G2Signature([0u8; 96]),
+        ));
+        let actions = coord.on_recovery_request_received(&req);
+        assert!(actions.is_empty());
+        assert!(coord.pending_recovery_cert.is_none());
+        assert_eq!(coord.recovery_tracker.bucket_count(), 0);
+    }
+
+    #[test]
+    fn on_recovery_request_admits_valid_request_below_quorum() {
+        let mut coord = fresh_coord();
+        coord.bootstrap_spc_for_next_epoch();
+        let anchor_hash = coord.latest_block.block_hash();
+        let anchor_epoch = coord.latest_block.epoch();
+        let req = signed_recovery_request(
+            0,
+            ValidatorId::new(0),
+            anchor_hash,
+            anchor_epoch,
+            RecoveryRound::INITIAL,
+        );
+        let actions = coord.on_recovery_request_received(&req);
+        assert!(actions.is_empty());
+        // The observation landed in the tracker.
+        assert_eq!(
+            coord
+                .recovery_tracker
+                .signer_count(anchor_hash, anchor_epoch, RecoveryRound::INITIAL),
+            1,
+        );
+        // n=4 quorum is ⌈8/3⌉+1 = 4 — single sig is short.
+        assert!(coord.pending_recovery_cert.is_none());
+        // SPC instance still running.
+        assert!(coord.spc.is_some());
+    }
+
+    #[test]
+    fn on_recovery_request_assembles_cert_at_quorum_and_tears_down_spc() {
+        let mut coord = fresh_coord();
+        coord.bootstrap_spc_for_next_epoch();
+        let anchor_hash = coord.latest_block.block_hash();
+        let anchor_epoch = coord.latest_block.epoch();
+
+        for i in 0..4 {
+            let req = signed_recovery_request(
+                i,
+                ValidatorId::new(i),
+                anchor_hash,
+                anchor_epoch,
+                RecoveryRound::INITIAL,
+            );
+            let _ = coord.on_recovery_request_received(&req);
+        }
+
+        assert!(coord.has_pending_recovery_cert());
+        let cert = coord.pending_recovery_cert.as_ref().unwrap();
+        assert_eq!(cert.last_block_hash(), anchor_hash);
+        assert_eq!(cert.last_block_epoch(), anchor_epoch);
+        assert_eq!(cert.recovery_round(), RecoveryRound::INITIAL);
+        assert_eq!(cert.signer_count(), 4);
+        // SPC torn down — the old committee is dead. Re-bootstrap with
+        // the recovery-resampled committee is a follow-up.
+        assert!(coord.spc.is_none());
+        // Anchor bucket dropped from the tracker.
+        assert_eq!(coord.recovery_tracker.bucket_count(), 0);
+    }
+
+    #[test]
+    fn on_recovery_request_ignored_after_cert_already_assembled() {
+        let mut coord = fresh_coord();
+        let anchor_hash = coord.latest_block.block_hash();
+        let anchor_epoch = coord.latest_block.epoch();
+        for i in 0..4 {
+            let req = signed_recovery_request(
+                i,
+                ValidatorId::new(i),
+                anchor_hash,
+                anchor_epoch,
+                RecoveryRound::INITIAL,
+            );
+            let _ = coord.on_recovery_request_received(&req);
+        }
+        assert!(coord.has_pending_recovery_cert());
+
+        // A late additional request at the same anchor lands but should
+        // be a no-op: cert already assembled, tracker bucket already
+        // cleared (so `observe` finds an empty bucket and admits one
+        // entry, but the `pending_recovery_cert.is_some()` guard prevents
+        // a second assembly attempt).
+        let dup = signed_recovery_request(
+            0,
+            ValidatorId::new(0),
+            anchor_hash,
+            anchor_epoch,
+            RecoveryRound::INITIAL,
+        );
+        let actions = coord.on_recovery_request_received(&dup);
+        assert!(actions.is_empty());
+        // Pending cert unchanged.
+        assert!(coord.has_pending_recovery_cert());
     }
 }

@@ -159,6 +159,24 @@ pub fn derive_beacon_committee(state: &BeaconState) -> Vec<(ValidatorId, Bls1238
         .collect()
 }
 
+/// Active-duty validator pool: every validator `OnShard { ready: true }`
+/// on any shard, paired with their pubkey. Returned in `BTreeMap`
+/// iteration order over `state.validators` (sorted by `ValidatorId`).
+///
+/// This is the quorum substrate for recovery: `RecoveryRequest`s are
+/// signed by members of this pool and assembled into a
+/// `RecoveryCertificate` whose `signers` bitfield is positionally
+/// indexed against the same ordering.
+#[must_use]
+pub fn derive_active_pool(state: &BeaconState) -> Vec<(ValidatorId, Bls12381G1PublicKey)> {
+    state
+        .validators
+        .iter()
+        .filter(|(_, r)| matches!(r.status, ValidatorStatus::OnShard { ready: true, .. }))
+        .map(|(id, r)| (*id, r.pubkey))
+        .collect()
+}
+
 /// Dynamic per-validator minimum stake.
 ///
 /// Pure function of state — no stored "current `min_stake`" field.
@@ -404,12 +422,7 @@ fn apply_recovery_or_resample(
     recovery_cert: Option<&RecoveryCertificate>,
 ) -> CommitteeTransition {
     if let Some(cert) = recovery_cert {
-        let active_pool: Vec<(ValidatorId, Bls12381G1PublicKey)> = state
-            .validators
-            .iter()
-            .filter(|(_, r)| matches!(r.status, ValidatorStatus::OnShard { ready: true, .. }))
-            .map(|(id, rec)| (*id, rec.pubkey))
-            .collect();
+        let active_pool = derive_active_pool(state);
         if verify_recovery_cert(
             cert,
             network,
