@@ -90,7 +90,8 @@ where
             | Action::BroadcastSkipRequest { .. }
             | Action::BroadcastSkipCert { .. }
             | Action::FetchShardWitnesses { .. }
-            | Action::VerifyBeaconRoot { .. } => {
+            | Action::VerifyBeaconBlock { .. }
+            | Action::VerifySkipRequest { .. } => {
                 self.dispatch_delegated_action(vnode_idx, action);
             }
 

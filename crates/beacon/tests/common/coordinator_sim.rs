@@ -22,13 +22,13 @@ use hyperscale_beacon::genesis::build_genesis_beacon_state;
 use hyperscale_beacon::pc::{sign_vote1, sign_vote2, sign_vote3};
 use hyperscale_beacon::skip::{sign_skip_request, verify_skip_cert, verify_skip_request};
 use hyperscale_beacon::spc::{sign_empty_view_msg, verify_block_cert};
-use hyperscale_core::{Action, BeaconVerifyPayload};
+use hyperscale_core::Action;
 use hyperscale_types::{
-    BeaconGenesisConfig, BeaconProposal, BeaconState, Bls12381G1PrivateKey, Bls12381G1PublicKey,
-    CertifiedBeaconBlock, Epoch, GenesisPool, GenesisValidator, NetworkDefinition, PcValueElement,
-    PcVector, Randomness, ShardGroupId, SkipEpochCert, SkipRequest, SpcMessage, Stake, StakePoolId,
-    ValidatorId, VpcMsgPayload, Witness, bls_keypair_from_seed, genesis_config_hash, pc_context,
-    spc_context, vrf_sign,
+    BeaconCert, BeaconGenesisConfig, BeaconProposal, BeaconState, Bls12381G1PrivateKey,
+    Bls12381G1PublicKey, CertifiedBeaconBlock, Epoch, GenesisPool, GenesisValidator,
+    NetworkDefinition, PcValueElement, PcVector, Randomness, ShardGroupId, SkipEpochCert,
+    SkipRequest, SpcMessage, Stake, StakePoolId, ValidatorId, VpcMsgPayload, Witness,
+    bls_keypair_from_seed, genesis_config_hash, pc_context, spc_context, vrf_sign,
 };
 
 /// Adversarial transform a flagged replica applies to its next matching
@@ -240,11 +240,10 @@ impl CoordinatorSim {
     }
 
     /// Hand `block` directly to `replica_idx` via
-    /// `on_beacon_block_received`, then drain any
-    /// [`Action::VerifyBeaconRoot`] loopback to completion so the
-    /// adoption-path actions land in the returned list. Useful for
-    /// asserting `CommitBeaconBlock` was emitted without manually
-    /// stepping the verification round-trip.
+    /// `on_beacon_block_received`, then drain any verify loopback to
+    /// completion so the adoption-path actions land in the returned
+    /// list. Useful for asserting `CommitBeaconBlock` was emitted
+    /// without manually stepping the verification round-trip.
     pub fn deliver_block_to(
         &mut self,
         replica_idx: usize,
@@ -257,34 +256,39 @@ impl CoordinatorSim {
     }
 
     /// Walk `actions`: pass non-verify actions through, and for each
-    /// [`Action::VerifyBeaconRoot`] run the verifier inline, re-enter
-    /// `on_beacon_verification_result`, and recursively expand. Returns
-    /// the post-verification action list — caller absorbs them in one
+    /// beacon-verify action run the verifier inline, re-enter the
+    /// matching result handler, and recursively expand. Returns the
+    /// post-verification action list — caller absorbs them in one
     /// pass.
     fn resolve_verifications(&mut self, replica_idx: usize, actions: Vec<Action>) -> Vec<Action> {
         let mut out = Vec::new();
         for action in actions {
-            if let Action::VerifyBeaconRoot { key, payload } = action {
-                let kind = payload.kind();
-                let valid = match *payload {
-                    BeaconVerifyPayload::SpcCert {
-                        cert,
-                        spc_ctx,
-                        committee,
-                    } => verify_block_cert(&cert, &self.network, &spc_ctx, &committee),
-                    BeaconVerifyPayload::SkipCert { cert, active_pool } => {
-                        verify_skip_cert(&cert, &self.network, &active_pool)
-                    }
-                    BeaconVerifyPayload::SkipRequest {
-                        request,
-                        active_pool,
-                    } => verify_skip_request(&request, &self.network, &active_pool),
-                };
-                let post =
-                    self.coordinators[replica_idx].on_beacon_verification_result(kind, key, valid);
-                out.extend(self.resolve_verifications(replica_idx, post));
-            } else {
-                out.push(action);
+            match action {
+                Action::VerifyBeaconBlock { block, signers } => {
+                    let valid = match block.cert() {
+                        BeaconCert::Normal(cert) => verify_block_cert(
+                            cert,
+                            &self.network,
+                            &spc_context(block.epoch()),
+                            &signers,
+                        ),
+                        BeaconCert::Skip(cert) => verify_skip_cert(cert, &self.network, &signers),
+                        BeaconCert::Genesis(_) => false,
+                    };
+                    let post =
+                        self.coordinators[replica_idx].on_beacon_block_verified(block, valid);
+                    out.extend(self.resolve_verifications(replica_idx, post));
+                }
+                Action::VerifySkipRequest {
+                    request,
+                    active_pool,
+                } => {
+                    let valid = verify_skip_request(&request, &self.network, &active_pool);
+                    let post =
+                        self.coordinators[replica_idx].on_skip_request_verified(*request, valid);
+                    out.extend(self.resolve_verifications(replica_idx, post));
+                }
+                other => out.push(other),
             }
         }
         out
@@ -713,31 +717,31 @@ impl CoordinatorSim {
                     state: *state,
                 });
             }
-            Action::VerifyBeaconRoot { key, payload } => {
+            Action::VerifyBeaconBlock { block, signers } => {
                 // Production runs this on the consensus crypto pool; the
                 // sim collapses the round-trip to a synchronous inline
                 // verify + result-feedback so the verification-bound
                 // pipeline doesn't reshape envelope-delivery ordering
-                // relative to the pre-async flow. The result re-enters
-                // `on_beacon_verification_result` directly, and any
-                // actions it produces recurse back through `absorb_one`.
-                let kind = payload.kind();
-                let valid = match *payload {
-                    BeaconVerifyPayload::SpcCert {
+                // relative to the pre-async flow.
+                let valid = match block.cert() {
+                    BeaconCert::Normal(cert) => verify_block_cert(
                         cert,
-                        spc_ctx,
-                        committee,
-                    } => verify_block_cert(&cert, &self.network, &spc_ctx, &committee),
-                    BeaconVerifyPayload::SkipCert { cert, active_pool } => {
-                        verify_skip_cert(&cert, &self.network, &active_pool)
-                    }
-                    BeaconVerifyPayload::SkipRequest {
-                        request,
-                        active_pool,
-                    } => verify_skip_request(&request, &self.network, &active_pool),
+                        &self.network,
+                        &spc_context(block.epoch()),
+                        &signers,
+                    ),
+                    BeaconCert::Skip(cert) => verify_skip_cert(cert, &self.network, &signers),
+                    BeaconCert::Genesis(_) => false,
                 };
-                let post =
-                    self.coordinators[emitter_idx].on_beacon_verification_result(kind, key, valid);
+                let post = self.coordinators[emitter_idx].on_beacon_block_verified(block, valid);
+                self.absorb(emitter_idx, post);
+            }
+            Action::VerifySkipRequest {
+                request,
+                active_pool,
+            } => {
+                let valid = verify_skip_request(&request, &self.network, &active_pool);
+                let post = self.coordinators[emitter_idx].on_skip_request_verified(*request, valid);
                 self.absorb(emitter_idx, post);
             }
             Action::SetTimer { .. }

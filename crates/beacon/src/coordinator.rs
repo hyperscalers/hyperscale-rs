@@ -17,16 +17,15 @@
 //! matches `expected_config_hash` — a tripwire against booting a
 //! validator off a chain initialised by a different operator TOML.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use hyperscale_core::{Action, BeaconVerificationKind, BeaconVerifyPayload, TimerId};
+use hyperscale_core::{Action, TimerId};
 use hyperscale_types::{
-    BeaconBlock, BeaconBlockHash, BeaconCert, BeaconProposal, BeaconState, Bls12381G1PublicKey,
+    BeaconBlock, BeaconCert, BeaconProposal, BeaconState, Bls12381G1PublicKey,
     CertifiedBeaconBlock, EPOCH_DURATION, Epoch, GenesisConfigHash, Hash, LeafIndex,
     LocalTimestamp, MAX_WITNESSES_PER_PROPOSER, NetworkDefinition, PcValueElement, PcVector,
     SKIP_TIMEOUT, ShardGroupId, ShardWitness, SkipEpochCert, SkipRequest, SpcCert, SpcMessage,
-    TopologySnapshot, ValidatorId, VpcMsgPayload, WeightedTimestamp, Witness, spc_context,
+    TopologySnapshot, ValidatorId, VpcMsgPayload, WeightedTimestamp, Witness,
     verify_merkle_inclusion,
 };
 use tracing::{trace, warn};
@@ -69,23 +68,10 @@ pub struct BeaconCoordinator {
     /// Pruned past `state.current_epoch` after every committed epoch.
     pending_blocks: PendingBeaconBlocks,
 
-    /// Blocks whose cert verification has been dispatched to the crypto
-    /// pool and is awaiting a [`ProtocolEvent::BeaconVerificationResult`].
-    /// Keyed on the block hash so the result handler can pair the
-    /// verified cert with the buffered block. Covers both
-    /// [`BeaconCert::Normal`] (SPC cert) and [`BeaconCert::Skip`]
-    /// (pool-quorum cert) — the verification kind disambiguates.
-    pending_block_verifications: BTreeMap<BeaconBlockHash, Arc<CertifiedBeaconBlock>>,
-
-    /// [`SkipRequest`]s whose per-validator BLS verification has been
-    /// dispatched and is awaiting a result. Keyed on the request's
-    /// content hash so duplicate observes collapse onto a single in-flight
-    /// slot. The tracker only ever admits verified requests.
-    pending_skip_requests: BTreeMap<Hash, SkipRequest>,
-
     /// In-flight and verified slot tracking for async crypto checks
-    /// (block aggregate sigs, cert sigs, VRF reveals, witness
-    /// Merkle paths).
+    /// (block cert sigs + skip-request sigs). Dedup-only — the payload
+    /// rides through the dispatch/result round-trip in the action and
+    /// event themselves, not stashed here.
     verification: BeaconVerificationPipeline,
 
     /// Per-shard header records, validated-witness pool, and
@@ -164,8 +150,6 @@ impl BeaconCoordinator {
             latest_block,
             spc: None,
             pending_blocks: PendingBeaconBlocks::new(),
-            pending_block_verifications: BTreeMap::new(),
-            pending_skip_requests: BTreeMap::new(),
             verification: BeaconVerificationPipeline::new(),
             witness_fetcher: ShardWitnessFetchTracker::new(),
             skip_tracker: SkipTracker::new(),
@@ -513,20 +497,11 @@ impl BeaconCoordinator {
             );
             return Vec::new();
         }
-        // Structural checks pass — build the verify dispatch. Normal
-        // blocks: SPC cert under the current beacon committee. Skip
-        // blocks: pool-quorum cert under the current active pool.
-        let (kind, payload) = match block.cert() {
-            BeaconCert::Normal(spc_cert) => {
-                let committee = derive_beacon_committee(&self.state);
-                let spc_ctx = spc_context(epoch);
-                let payload = BeaconVerifyPayload::SpcCert {
-                    cert: spc_cert.clone(),
-                    spc_ctx,
-                    committee,
-                };
-                (BeaconVerificationKind::SpcCert, payload)
-            }
+        // Structural checks pass — pick the signer set the cert
+        // verifies against. Normal blocks bind to the current beacon
+        // committee; Skip blocks bind to the current active pool.
+        let signers = match block.cert() {
+            BeaconCert::Normal(_) => derive_beacon_committee(&self.state),
             BeaconCert::Skip(skip_cert) => {
                 if skip_cert.anchor_hash() != self.latest_block.block_hash()
                     || skip_cert.epoch_to_skip() != epoch
@@ -537,12 +512,7 @@ impl BeaconCoordinator {
                     );
                     return Vec::new();
                 }
-                let active_pool = derive_active_pool(&self.state);
-                let payload = BeaconVerifyPayload::SkipCert {
-                    cert: Box::new(skip_cert.clone()),
-                    active_pool,
-                };
-                (BeaconVerificationKind::SkipCert, payload)
+                derive_active_pool(&self.state)
             }
             BeaconCert::Genesis(_) => {
                 warn!(
@@ -552,38 +522,28 @@ impl BeaconCoordinator {
                 return Vec::new();
             }
         };
-        self.dispatch_block_verification(block, kind, payload)
+        self.dispatch_block_verification(block, signers)
     }
 
-    /// Stash the block and dispatch its cert verification. Returns
-    /// either a single [`Action::VerifyBeaconRoot`] (new dispatch) or
-    /// an empty vector when the slot is already in flight or verified —
+    /// Dispatch a block's cert verification. Returns a single
+    /// [`Action::VerifyBeaconBlock`] on a fresh slot, or an empty
+    /// vector when the slot is already in flight or already verified —
     /// the in-flight slot's result drives admission for any duplicate.
     fn dispatch_block_verification(
         &mut self,
         block: Arc<CertifiedBeaconBlock>,
-        kind: BeaconVerificationKind,
-        payload: BeaconVerifyPayload,
+        signers: Vec<(ValidatorId, Bls12381G1PublicKey)>,
     ) -> Vec<Action> {
-        let block_hash = block.block_hash();
-        let key = *block_hash.as_raw();
-        // Always remember the latest block bytes at this hash — the
-        // result handler reads from this map. Insertions at an already-
-        // pending key are idempotent (block hash binds the contents).
-        self.pending_block_verifications.insert(block_hash, block);
-        if !self.verification.mark_in_flight(kind, key) {
+        if !self.verification.mark_block_in_flight(block.block_hash()) {
             return Vec::new();
         }
-        vec![Action::VerifyBeaconRoot {
-            key,
-            payload: Box::new(payload),
-        }]
+        vec![Action::VerifyBeaconBlock { block, signers }]
     }
 
     /// A peer's [`SkipRequest`] arrived via gossip. Validate the
     /// non-crypto fields and dispatch BLS verification to the crypto
     /// pool. Admission to the [`SkipTracker`] happens in
-    /// [`Self::on_beacon_verification_result`] once the result lands;
+    /// [`Self::on_skip_request_verified`] once the result lands;
     /// quorum assembly + adoption follow from there.
     ///
     /// Synchronous validation (before dispatch):
@@ -629,22 +589,12 @@ impl BeaconCoordinator {
         }
 
         let key = Hash::from_bytes(&request.encode_bytes());
-        // The latest body wins on duplicate keys; under deterministic
-        // BLS the body is byte-identical anyway, so this is a no-op in
-        // the honest case.
-        self.pending_skip_requests.insert(key, request.clone());
-        if !self
-            .verification
-            .mark_in_flight(BeaconVerificationKind::SkipRequest, key)
-        {
+        if !self.verification.mark_skip_request_in_flight(key) {
             return Vec::new();
         }
-        vec![Action::VerifyBeaconRoot {
-            key,
-            payload: Box::new(BeaconVerifyPayload::SkipRequest {
-                request: Box::new(request),
-                active_pool,
-            }),
+        vec![Action::VerifySkipRequest {
+            request: Box::new(request),
+            active_pool,
         }]
     }
 
@@ -671,13 +621,9 @@ impl BeaconCoordinator {
         let active_pool = derive_active_pool(&self.state);
         let anchor = self.latest_block.block_hash();
         let block = BeaconBlock::skip(expected_epoch, anchor);
-        let certified = CertifiedBeaconBlock::new_unchecked(block, BeaconCert::Skip(cert.clone()));
+        let certified = CertifiedBeaconBlock::new_unchecked(block, BeaconCert::Skip(cert));
         let block_arc = Arc::new(certified);
-        let payload = BeaconVerifyPayload::SkipCert {
-            cert: Box::new(cert),
-            active_pool,
-        };
-        self.dispatch_block_verification(block_arc, BeaconVerificationKind::SkipCert, payload)
+        self.dispatch_block_verification(block_arc, active_pool)
     }
 
     /// Build the skip block paired with `cert`, adopt it via the
@@ -700,84 +646,60 @@ impl BeaconCoordinator {
         actions
     }
 
-    /// A previously-dispatched [`Action::VerifyBeaconRoot`] has
-    /// returned. Clear the pipeline slot, take the buffered payload
-    /// matching `(kind, key)`, and drive the post-verify flow on
-    /// `valid=true`. Drops silently on `valid=false`.
+    /// A previously-dispatched [`Action::VerifyBeaconBlock`] has
+    /// returned. Clear the pipeline slot, and on `valid=true` adopt
+    /// the block (unless the tip has since moved past it). Drops
+    /// silently on `valid=false`.
     ///
-    /// Stale or duplicate results (slot wasn't in flight) are tolerated
-    /// — they unblock no work and leave the pending maps untouched.
-    pub fn on_beacon_verification_result(
+    /// Stale or duplicate results (slot wasn't in flight) are
+    /// tolerated.
+    pub fn on_beacon_block_verified(
         &mut self,
-        kind: BeaconVerificationKind,
-        key: Hash,
+        block: Arc<CertifiedBeaconBlock>,
         valid: bool,
     ) -> Vec<Action> {
-        let was_in_flight = self.verification.on_result(kind, key, valid);
-        match kind {
-            BeaconVerificationKind::SpcCert | BeaconVerificationKind::SkipCert => {
-                let block_hash = BeaconBlockHash::from_raw(key);
-                let Some(block) = self.pending_block_verifications.remove(&block_hash) else {
-                    if was_in_flight {
-                        trace!(
-                            ?kind,
-                            "BeaconVerificationResult for an unknown pending block",
-                        );
-                    }
-                    return Vec::new();
-                };
-                if !valid {
-                    warn!(
-                        ?kind,
-                        epoch = block.epoch().inner(),
-                        "BeaconBlock cert verification failed — dropping",
-                    );
-                    return Vec::new();
-                }
-                // Idempotency: another path (local skip-quorum assembly,
-                // an earlier peer-broadcast adoption) may have already
-                // advanced the tip at or past this block's epoch.
-                // Re-entering `adopt_block` would trip `apply_epoch`'s
-                // regression guard.
-                if block.epoch() <= self.state.current_epoch
-                    || block.prev_block_hash() != self.latest_block.block_hash()
-                {
-                    trace!(
-                        ?kind,
-                        block_epoch = block.epoch().inner(),
-                        tip_epoch = self.state.current_epoch.inner(),
-                        "Verified BeaconBlock no longer chains off the tip — dropping",
-                    );
-                    return Vec::new();
-                }
-                self.verification.forget(kind, key);
-                self.adopt_block(block)
-            }
-            BeaconVerificationKind::SkipRequest => {
-                let Some(request) = self.pending_skip_requests.remove(&key) else {
-                    if was_in_flight {
-                        trace!("BeaconVerificationResult for an unknown pending skip request");
-                    }
-                    return Vec::new();
-                };
-                self.verification.forget(kind, key);
-                if !valid {
-                    warn!(
-                        signer = ?request.signer(),
-                        "SkipRequest BLS verification failed — dropping",
-                    );
-                    return Vec::new();
-                }
-                self.admit_verified_skip_request(request)
-            }
-            _ => {
-                trace!(
-                    ?kind,
-                    "BeaconVerificationResult for unsupported kind — ignoring",
-                );
-                Vec::new()
-            }
+        let block_hash = block.block_hash();
+        self.verification.on_block_result(block_hash, valid);
+        if !valid {
+            warn!(
+                epoch = block.epoch().inner(),
+                "BeaconBlock cert verification failed — dropping",
+            );
+            return Vec::new();
         }
+        // Idempotency: another path (local skip-quorum assembly, an
+        // earlier peer-broadcast adoption) may have already advanced
+        // the tip at or past this block's epoch. Re-entering
+        // `adopt_block` would trip `apply_epoch`'s regression guard.
+        if block.epoch() <= self.state.current_epoch
+            || block.prev_block_hash() != self.latest_block.block_hash()
+        {
+            trace!(
+                block_epoch = block.epoch().inner(),
+                tip_epoch = self.state.current_epoch.inner(),
+                "Verified BeaconBlock no longer chains off the tip — dropping",
+            );
+            return Vec::new();
+        }
+        self.verification.forget_block(block_hash);
+        self.adopt_block(block)
+    }
+
+    /// A previously-dispatched [`Action::VerifySkipRequest`] has
+    /// returned. Clear the pipeline slot, and on `valid=true` admit
+    /// the request to the [`SkipTracker`].
+    pub fn on_skip_request_verified(&mut self, request: SkipRequest, valid: bool) -> Vec<Action> {
+        let key = Hash::from_bytes(&request.encode_bytes());
+        self.verification.on_skip_request_result(key, valid);
+        self.verification.forget_skip_request(key);
+        if !valid {
+            warn!(
+                signer = ?request.signer(),
+                "SkipRequest BLS verification failed — dropping",
+            );
+            return Vec::new();
+        }
+        self.admit_verified_skip_request(request)
     }
 
     /// A [`SkipRequest`] has passed BLS verification: admit it to the
@@ -1246,12 +1168,12 @@ mod tests {
         new_coord(ValidatorId::new(0))
     }
 
-    /// Drive any [`Action::VerifyBeaconRoot`] entries in `actions`
-    /// through to their result event, appending the post-verify actions
-    /// in dispatch order. Mirrors the round-trip the production runner
-    /// (and `CoordinatorSim`) perform; lets tests assert the
-    /// synchronous-equivalent outcome without manually threading results
-    /// back to the coordinator.
+    /// Drive any beacon-verify actions in `actions` through to their
+    /// result event, appending the post-verify actions in dispatch
+    /// order. Mirrors the round-trip the production runner (and
+    /// `CoordinatorSim`) perform; lets tests assert the
+    /// synchronous-equivalent outcome without manually threading
+    /// results back to the coordinator.
     fn complete_verifications(coord: &mut BeaconCoordinator, actions: Vec<Action>) -> Vec<Action> {
         use crate::skip::{verify_skip_cert, verify_skip_request};
         use crate::spc::verify_block_cert;
@@ -1260,23 +1182,23 @@ mod tests {
         let mut out = Vec::new();
         for action in actions {
             match action {
-                Action::VerifyBeaconRoot { key, payload } => {
-                    let kind = payload.kind();
-                    let valid = match *payload {
-                        BeaconVerifyPayload::SpcCert {
-                            cert,
-                            spc_ctx,
-                            committee,
-                        } => verify_block_cert(&cert, &net, &spc_ctx, &committee),
-                        BeaconVerifyPayload::SkipCert { cert, active_pool } => {
-                            verify_skip_cert(&cert, &net, &active_pool)
+                Action::VerifyBeaconBlock { block, signers } => {
+                    let valid = match block.cert() {
+                        BeaconCert::Normal(cert) => {
+                            verify_block_cert(cert, &net, &spc_context(block.epoch()), &signers)
                         }
-                        BeaconVerifyPayload::SkipRequest {
-                            request,
-                            active_pool,
-                        } => verify_skip_request(&request, &net, &active_pool),
+                        BeaconCert::Skip(cert) => verify_skip_cert(cert, &net, &signers),
+                        BeaconCert::Genesis(_) => false,
                     };
-                    let post = coord.on_beacon_verification_result(kind, key, valid);
+                    let post = coord.on_beacon_block_verified(block, valid);
+                    out.extend(complete_verifications(coord, post));
+                }
+                Action::VerifySkipRequest {
+                    request,
+                    active_pool,
+                } => {
+                    let valid = verify_skip_request(&request, &net, &active_pool);
+                    let post = coord.on_skip_request_verified(*request, valid);
                     out.extend(complete_verifications(coord, post));
                 }
                 other => out.push(other),
@@ -1763,7 +1685,6 @@ mod tests {
         let actions = coord.on_beacon_block_received(block);
         assert!(actions.is_empty());
         assert!(coord.pending_blocks.is_empty());
-        assert!(coord.pending_block_verifications.is_empty());
         assert_eq!(coord.state.current_epoch, Epoch::GENESIS);
     }
 
@@ -1777,7 +1698,6 @@ mod tests {
         assert!(actions.is_empty());
         assert_eq!(coord.pending_blocks.len(), 1);
         assert!(coord.pending_blocks.contains_key(block_hash));
-        assert!(coord.pending_block_verifications.is_empty());
         assert_eq!(coord.state.current_epoch, Epoch::GENESIS);
     }
 
@@ -1788,7 +1708,6 @@ mod tests {
         let actions = coord.on_beacon_block_received(block);
         assert!(actions.is_empty());
         assert!(coord.pending_blocks.is_empty());
-        assert!(coord.pending_block_verifications.is_empty());
     }
 
     #[test]
@@ -1800,11 +1719,11 @@ mod tests {
         let dispatched = coord.on_beacon_block_received(Arc::clone(&block));
 
         // Cert verification is offloaded — the immediate handler emits
-        // exactly one `VerifyBeaconRoot` action and stashes the block.
-        let [Action::VerifyBeaconRoot { .. }] = dispatched.as_slice() else {
-            panic!("expected single VerifyBeaconRoot, got {dispatched:?}");
+        // exactly one `VerifyBeaconBlock` action.
+        let [Action::VerifyBeaconBlock { .. }] = dispatched.as_slice() else {
+            panic!("expected single VerifyBeaconBlock, got {dispatched:?}");
         };
-        assert_eq!(coord.pending_block_verifications.len(), 1);
+        assert!(coord.verification.is_block_in_flight(block_hash));
 
         let actions = complete_verifications(&mut coord, dispatched);
         assert!(
@@ -1822,7 +1741,7 @@ mod tests {
         );
         assert_eq!(coord.state.current_epoch, Epoch::new(1));
         assert_eq!(coord.latest_block.block_hash(), block_hash);
-        assert!(coord.pending_block_verifications.is_empty());
+        assert!(!coord.verification.is_block_in_flight(block_hash));
         assert!(coord.spc.is_some(), "next epoch's SPC should bootstrap");
     }
 
@@ -2008,13 +1927,12 @@ mod tests {
         let dispatched = coord.on_skip_request_received(req);
         // Synchronous validation passes (signer in pool, anchor + epoch
         // match) — so a verify action is dispatched.
-        let [Action::VerifyBeaconRoot { .. }] = dispatched.as_slice() else {
-            panic!("expected single VerifyBeaconRoot, got {dispatched:?}");
+        let [Action::VerifySkipRequest { .. }] = dispatched.as_slice() else {
+            panic!("expected single VerifySkipRequest, got {dispatched:?}");
         };
         let actions = complete_verifications(&mut coord, dispatched);
         assert!(actions.is_empty(), "invalid sig should drop on result");
         assert_eq!(coord.skip_tracker.bucket_count(), 0);
-        assert!(coord.pending_skip_requests.is_empty());
     }
 
     #[test]

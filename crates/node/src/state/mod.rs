@@ -272,7 +272,8 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::SkipRequestReceived { .. }
             | ProtocolEvent::SkipCertReceived { .. }
             | ProtocolEvent::ShardWitnessesReceived { .. }
-            | ProtocolEvent::BeaconVerificationResult { .. }
+            | ProtocolEvent::BeaconBlockVerified { .. }
+            | ProtocolEvent::SkipRequestVerified { .. }
             | ProtocolEvent::BeaconCommitteeStartTimer
             | ProtocolEvent::BeaconSkipTimer
             | ProtocolEvent::BeaconSpcViewTimer

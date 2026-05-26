@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use hyperscale_core::{Action, ActionContext, BeaconVerifyPayload, ProtocolEvent};
+use hyperscale_core::{Action, ActionContext, ProtocolEvent};
 use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::notification::{
@@ -17,8 +17,8 @@ use hyperscale_types::network::notification::{
     SpcEmptyViewMsgNotification, SpcNewCommitNotification, SpcNewViewNotification,
 };
 use hyperscale_types::{
-    BeaconProposal, SpcHighTriple, SpcMessage, SpcProposalObject, VpcMsgPayload, pc_context,
-    spc_context, vrf_sign,
+    BeaconCert, BeaconProposal, SpcHighTriple, SpcMessage, SpcProposalObject, VpcMsgPayload,
+    pc_context, spc_context, vrf_sign,
 };
 use tracing::warn;
 
@@ -189,23 +189,28 @@ where
                 "FetchShardWitnesses",
             );
         }
-        Action::VerifyBeaconRoot { key, payload } => {
-            let kind = payload.kind();
-            let valid = match *payload {
-                BeaconVerifyPayload::SpcCert {
-                    cert,
-                    spc_ctx,
-                    committee,
-                } => verify_block_cert(&cert, network, &spc_ctx, &committee),
-                BeaconVerifyPayload::SkipCert { cert, active_pool } => {
-                    verify_skip_cert(&cert, network, &active_pool)
+        Action::VerifyBeaconBlock { block, signers } => {
+            let valid = match block.cert() {
+                BeaconCert::Normal(cert) => {
+                    verify_block_cert(cert, network, &spc_context(block.epoch()), &signers)
                 }
-                BeaconVerifyPayload::SkipRequest {
-                    request,
-                    active_pool,
-                } => verify_skip_request(&request, network, &active_pool),
+                BeaconCert::Skip(cert) => verify_skip_cert(cert, network, &signers),
+                BeaconCert::Genesis(_) => {
+                    warn!(
+                        epoch = block.epoch().inner(),
+                        "VerifyBeaconBlock dispatched with Genesis cert — rejecting",
+                    );
+                    false
+                }
             };
-            ctx.notify_protocol(ProtocolEvent::BeaconVerificationResult { kind, key, valid });
+            ctx.notify_protocol(ProtocolEvent::BeaconBlockVerified { block, valid });
+        }
+        Action::VerifySkipRequest {
+            request,
+            active_pool,
+        } => {
+            let valid = verify_skip_request(&request, network, &active_pool);
+            ctx.notify_protocol(ProtocolEvent::SkipRequestVerified { request, valid });
         }
         _ => unreachable!("hyperscale_beacon::handle_action called with non-beacon action"),
     }

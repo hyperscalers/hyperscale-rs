@@ -10,12 +10,10 @@ use std::sync::Arc;
 use hyperscale_types::{
     BeaconProposal, Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote,
     CertifiedBeaconBlock, CertifiedBlock, CommittedBlockHeader, Epoch, ExecutionCertificate,
-    ExecutionVote, FinalizedWave, Hash, Provisions, QuorumCertificate, ReadySignal, Round,
+    ExecutionVote, FinalizedWave, Provisions, QuorumCertificate, ReadySignal, Round,
     RoutableTransaction, ShardGroupId, ShardWitness, SkipEpochCert, SkipRequest, StoredReceipt,
     TxOutcome, ValidatorId, VotePower, WaveId, WeightedTimestamp,
 };
-
-use crate::BeaconVerificationKind;
 
 /// How a node learned about the certifying QC that commits a given block.
 ///
@@ -580,15 +578,21 @@ pub enum ProtocolEvent {
         witnesses: Vec<Arc<ShardWitness>>,
     },
 
-    /// Result of an [`Action::VerifyBeaconRoot`] dispatch.
-    /// `BeaconCoordinator` routes back into the verification pipeline
-    /// keyed on `(kind, key)`.
-    BeaconVerificationResult {
-        /// What kind of verification finished.
-        kind: BeaconVerificationKind,
-        /// Slot key that the dispatching action carried.
-        key: Hash,
-        /// Whether the crypto check passed.
+    /// Result of an [`Action::VerifyBeaconBlock`] dispatch. The block
+    /// rides back so the coordinator doesn't have to stash it during
+    /// the verify round-trip.
+    BeaconBlockVerified {
+        /// The block whose cert was verified.
+        block: Arc<CertifiedBeaconBlock>,
+        /// Whether the cert check passed.
+        valid: bool,
+    },
+
+    /// Result of an [`Action::VerifySkipRequest`] dispatch.
+    SkipRequestVerified {
+        /// The request whose BLS sig was verified.
+        request: Box<SkipRequest>,
+        /// Whether the sig check passed.
         valid: bool,
     },
 
