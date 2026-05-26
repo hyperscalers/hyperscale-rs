@@ -39,8 +39,8 @@ use crate::recovery::verify_recovery_cert;
 use crate::recovery_tracker::RecoveryTracker;
 use crate::spc::{SpcEffect, SpcEvent, SpcInstance, verify_block_cert};
 use crate::state::{
-    apply_epoch, apply_recovery_or_resample, derive_active_pool, derive_beacon_committee,
-    derive_topology_snapshot,
+    ApplyEpochInput, apply_epoch, apply_recovery_or_resample, derive_active_pool,
+    derive_beacon_committee, derive_topology_snapshot,
 };
 use crate::verification::BeaconVerificationPipeline;
 use crate::witness_fetcher::ShardWitnessFetchTracker;
@@ -713,13 +713,15 @@ impl BeaconCoordinator {
     /// originator).
     fn adopt_block(&mut self, block: Arc<CertifiedBeaconBlock>) -> Vec<Action> {
         let mut new_state = self.state.clone();
-        apply_epoch(
-            &mut new_state,
-            &self.network,
-            block.epoch(),
-            block.block().committed_proposals(),
-            block.recovery_cert(),
-        );
+        let input = match block.cert() {
+            BeaconCert::Normal(_) => ApplyEpochInput::Normal {
+                committed: block.block().committed_proposals(),
+                recovery_cert: block.recovery_cert(),
+            },
+            BeaconCert::Skip(_) => ApplyEpochInput::Skip,
+            BeaconCert::Genesis(_) => unreachable!("adopt_block called on genesis"),
+        };
+        apply_epoch(&mut new_state, &self.network, block.epoch(), input);
         self.state = new_state;
         self.latest_block = Arc::clone(&block);
         self.spc = None;

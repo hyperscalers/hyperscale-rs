@@ -19,7 +19,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_beacon::constants::MIN_STAKE_FLOOR;
-use hyperscale_beacon::state::apply_epoch;
+use hyperscale_beacon::state::{ApplyEpochInput, apply_epoch};
 use hyperscale_types::{
     BeaconState, Bls12381G1PublicKey, Epoch, NetworkDefinition, Randomness, ShardCommittee,
     ShardGroupId, Stake, StakePool, StakePoolId, ValidatorId, ValidatorRecord, ValidatorStatus,
@@ -132,7 +132,15 @@ fn fifty_epochs_byte_identical_across_replicas() {
     for e in 1..=EPOCHS {
         let target = Epoch::new(e);
         for replica in &mut replicas {
-            apply_epoch(replica, &network, target, &[], None);
+            apply_epoch(
+                replica,
+                &network,
+                target,
+                ApplyEpochInput::Normal {
+                    committed: &[],
+                    recovery_cert: None,
+                },
+            );
         }
         for i in 1..V {
             assert_eq!(replicas[0], replicas[i], "replicas diverged at epoch {e}");

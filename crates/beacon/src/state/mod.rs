@@ -36,7 +36,7 @@ pub use derived::{
     beacon_eligible, current_active_count, derive_active_pool, derive_beacon_committee,
     derive_topology_snapshot, effective_stake, max_active_count, min_stake, pooled_validators,
 };
-pub use epoch::{apply_epoch, apply_recovery_or_resample};
+pub use epoch::{ApplyEpochInput, apply_epoch, apply_recovery_or_resample};
 pub use pool::pool_draw;
 
 #[cfg(test)]

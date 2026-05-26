@@ -24,6 +24,7 @@ pub mod recovery;
 pub mod recovery_tracker;
 pub mod sampling;
 pub mod skip;
+pub mod skip_tracker;
 pub mod spc;
 pub mod state;
 pub mod verification;

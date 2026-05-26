@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_beacon::constants::{BEACON_SIGNER_COUNT, MIN_STAKE_FLOOR};
 use hyperscale_beacon::recovery::select_winning_block;
-use hyperscale_beacon::state::apply_epoch;
+use hyperscale_beacon::state::{ApplyEpochInput, apply_epoch};
 use hyperscale_types::{
     BeaconBlock, BeaconBlockHash, BeaconCert, BeaconState, Bls12381G1PrivateKey,
     Bls12381G1PublicKey, Bls12381G2Signature, CertifiedBeaconBlock, Epoch, Hash, NetworkDefinition,
@@ -132,7 +132,15 @@ fn catchup_brings_chain_forward_after_committee_stall() {
 
     // Three normal epochs.
     for e in 1u64..=3 {
-        let effects = apply_epoch(&mut state, &net(), Epoch::new(e), &[], None);
+        let effects = apply_epoch(
+            &mut state,
+            &net(),
+            Epoch::new(e),
+            ApplyEpochInput::Normal {
+                committed: &[],
+                recovery_cert: None,
+            },
+        );
         let transition = effects
             .beacon_committee_transition
             .expect("normal epoch always emits a committee transition");
@@ -155,7 +163,15 @@ fn catchup_brings_chain_forward_after_committee_stall() {
         RecoveryRound::new(0),
         Vec::new(),
     );
-    let effects = apply_epoch(&mut state, &net(), Epoch::new(4), &[], Some(&cert));
+    let effects = apply_epoch(
+        &mut state,
+        &net(),
+        Epoch::new(4),
+        ApplyEpochInput::Normal {
+            committed: &[],
+            recovery_cert: Some(&cert),
+        },
+    );
 
     let transition = effects
         .beacon_committee_transition
@@ -172,7 +188,15 @@ fn catchup_brings_chain_forward_after_committee_stall() {
     assert_eq!(state.committee.len(), BEACON_SIGNER_COUNT);
 
     // Chain continues normally at epoch 5 (no cert).
-    let effects = apply_epoch(&mut state, &net(), Epoch::new(5), &[], None);
+    let effects = apply_epoch(
+        &mut state,
+        &net(),
+        Epoch::new(5),
+        ApplyEpochInput::Normal {
+            committed: &[],
+            recovery_cert: None,
+        },
+    );
     let transition = effects
         .beacon_committee_transition
         .expect("post-recovery epoch emits a transition");
@@ -212,7 +236,15 @@ fn cumulative_exclusions_via_high_round_cert() {
         excluded.clone(),
     );
 
-    apply_epoch(&mut state, &net(), Epoch::new(1), &[], Some(&cert));
+    apply_epoch(
+        &mut state,
+        &net(),
+        Epoch::new(1),
+        ApplyEpochInput::Normal {
+            committed: &[],
+            recovery_cert: Some(&cert),
+        },
+    );
 
     assert_eq!(
         state
@@ -246,7 +278,15 @@ fn stale_round_replay_at_same_anchor_is_dropped() {
         RecoveryRound::new(3),
         Vec::new(),
     );
-    apply_epoch(&mut state, &net(), Epoch::new(1), &[], Some(&high));
+    apply_epoch(
+        &mut state,
+        &net(),
+        Epoch::new(1),
+        ApplyEpochInput::Normal {
+            committed: &[],
+            recovery_cert: Some(&high),
+        },
+    );
     assert_eq!(
         state
             .last_recovery_cert
@@ -263,7 +303,15 @@ fn stale_round_replay_at_same_anchor_is_dropped() {
         RecoveryRound::new(1),
         Vec::new(),
     );
-    let effects = apply_epoch(&mut state, &net(), Epoch::new(2), &[], Some(&stale_round));
+    let effects = apply_epoch(
+        &mut state,
+        &net(),
+        Epoch::new(2),
+        ApplyEpochInput::Normal {
+            committed: &[],
+            recovery_cert: Some(&stale_round),
+        },
+    );
     let transition = effects.beacon_committee_transition.unwrap();
     assert_eq!(transition.cause, TransitionCause::NaturalShuffle);
     assert_eq!(

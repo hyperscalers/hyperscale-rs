@@ -17,7 +17,7 @@ use hyperscale_types::{
 };
 
 use crate::constants::MIN_STAKE_FLOOR;
-use crate::state::apply_epoch;
+use crate::state::{ApplyEpochInput, apply_epoch};
 
 pub fn keypair(seed: u64) -> Bls12381G1PrivateKey {
     let mut s = [0u8; 32];
@@ -132,7 +132,15 @@ pub fn apply_next_epoch(
     committed: &[(ValidatorId, BeaconProposal)],
 ) -> SlotEffects {
     let next = state.current_epoch.next();
-    apply_epoch(state, &net(), next, committed, None)
+    apply_epoch(
+        state,
+        &net(),
+        next,
+        ApplyEpochInput::Normal {
+            committed,
+            recovery_cert: None,
+        },
+    )
 }
 
 /// Build a VRF-signed proposal for `id` at `epoch` carrying the given

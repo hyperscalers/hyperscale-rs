@@ -257,6 +257,12 @@ pub enum TransitionCause {
     /// Committee replaced by a [`RecoveryCertificate`] after the old
     /// committee stalled past the recovery timeout.
     Recovery,
+    /// Committee resampled because the pool-quorum
+    /// [`SkipEpochCert`](crate::SkipEpochCert) abandoned the prior
+    /// epoch. Same pipeline as `NaturalShuffle` over an empty proposal
+    /// set, distinguished only for observability so operators can tell
+    /// "scheduled rotation" apart from "the chain just skipped."
+    Skip,
     /// A mid-epoch jail, deactivation, or withdrawal-driven
     /// auto-deactivation changed a shard's `members` list without a
     /// fresh shuffle.
