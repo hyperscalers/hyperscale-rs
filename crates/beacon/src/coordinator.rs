@@ -1030,7 +1030,7 @@ mod tests {
     fn genesis_trio() -> (Arc<BeaconBlock>, BeaconState, GenesisConfigHash) {
         let config = sample_genesis();
         let state = build_genesis_beacon_state(&config);
-        let config_hash = genesis_config_hash(&config);
+        let config_hash = genesis_config_hash(&config, &NetworkDefinition::simulator());
         let block = BeaconBlock::genesis(config_hash);
         (Arc::new(block), state, config_hash)
     }

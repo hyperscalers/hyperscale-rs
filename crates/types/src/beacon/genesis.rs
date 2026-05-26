@@ -9,12 +9,19 @@
 
 use std::collections::BTreeMap;
 
+use blake3::Hasher;
 use sbor::prelude::*;
 
 use crate::{
-    Bls12381G1PublicKey, GenesisConfigHash, Hash, Randomness, ShardGroupId, Stake, StakePoolId,
-    ValidatorId,
+    Bls12381G1PublicKey, GenesisConfigHash, Hash, NetworkDefinition, Randomness, ShardGroupId,
+    Stake, StakePoolId, ValidatorId,
 };
+
+/// Domain tag for the genesis-config hash. Binds the digest to "beacon
+/// genesis v1" so it can't collide with any other 32-byte BLAKE3 hash
+/// in the codebase, and so a future hash-input layout change forces a
+/// version bump rather than silently shifting chain identity.
+const DOMAIN_BEACON_GENESIS: &[u8] = b"HYPERSCALE_BEACON_GENESIS_v1";
 
 /// One validator as supplied at genesis.
 ///
@@ -74,21 +81,32 @@ pub struct BeaconGenesisConfig {
 /// Hash a [`BeaconGenesisConfig`] into the [`GenesisConfigHash`] embedded
 /// in [`SpcCert::Genesis`](crate::SpcCert).
 ///
-/// Pure function over the SBOR-canonical encoding: two operators with
-/// byte-identical TOML produce the same hash; any divergent field
-/// (validator pubkey, pool stake, initial randomness, ...) yields a
-/// different hash and therefore a different
-/// [`BeaconBlockHash`](crate::BeaconBlockHash) at genesis, keeping
-/// chains with mismatched bootstraps from accidentally merging.
+/// Pure function over the SBOR-canonical encoding plus the network's
+/// id byte. Two operators with byte-identical TOML produce the same
+/// hash *only* when bootstrapping the same network — mainnet and
+/// stokenet operators using identical genesis TOML still get distinct
+/// chain identities. Any divergent field (validator pubkey, pool stake,
+/// initial randomness, ...) likewise yields a different hash and a
+/// different [`BeaconBlockHash`](crate::BeaconBlockHash) at genesis.
+///
+/// Layout: `BLAKE3(DOMAIN_BEACON_GENESIS || network.id || SBOR(config))`.
+/// The domain tag bumps with any future layout change.
 ///
 /// # Panics
 ///
 /// Never in practice: every field is `BasicSbor` and the struct is
 /// closed, so encoding is total.
 #[must_use]
-pub fn genesis_config_hash(config: &BeaconGenesisConfig) -> GenesisConfigHash {
+pub fn genesis_config_hash(
+    config: &BeaconGenesisConfig,
+    network: &NetworkDefinition,
+) -> GenesisConfigHash {
+    let mut h = Hasher::new();
+    h.update(DOMAIN_BEACON_GENESIS);
+    h.update(&[network.id]);
     let bytes = basic_encode(config).expect("BeaconGenesisConfig SBOR encode is infallible");
-    GenesisConfigHash::from_raw(Hash::from_bytes(&bytes))
+    h.update(&bytes);
+    GenesisConfigHash::from_raw(Hash::from_hash_bytes(h.finalize().as_bytes()))
 }
 
 #[cfg(test)]
@@ -133,27 +151,46 @@ mod tests {
         assert_eq!(original, decoded);
     }
 
+    fn net() -> NetworkDefinition {
+        NetworkDefinition::simulator()
+    }
+
     #[test]
     fn config_hash_is_deterministic() {
         let a = sample_config();
-        assert_eq!(genesis_config_hash(&a), genesis_config_hash(&a));
+        assert_eq!(
+            genesis_config_hash(&a, &net()),
+            genesis_config_hash(&a, &net())
+        );
     }
 
     #[test]
     fn config_hash_changes_on_any_field() {
         let base = sample_config();
-        let base_hash = genesis_config_hash(&base);
+        let base_hash = genesis_config_hash(&base, &net());
 
         let mut diff_randomness = base.clone();
         diff_randomness.initial_randomness = Randomness([0xCD; 32]);
-        assert_ne!(genesis_config_hash(&diff_randomness), base_hash);
+        assert_ne!(genesis_config_hash(&diff_randomness, &net()), base_hash);
 
         let mut diff_pool_stake = base.clone();
         diff_pool_stake.initial_pools[0].total_stake = Stake::from_whole_tokens(2_000_000);
-        assert_ne!(genesis_config_hash(&diff_pool_stake), base_hash);
+        assert_ne!(genesis_config_hash(&diff_pool_stake, &net()), base_hash);
 
         let mut diff_pubkey = base;
         diff_pubkey.initial_validators[0].pubkey = pubkey(99);
-        assert_ne!(genesis_config_hash(&diff_pubkey), base_hash);
+        assert_ne!(genesis_config_hash(&diff_pubkey, &net()), base_hash);
+    }
+
+    /// Identical TOML on different networks must produce different
+    /// chain identities — locks the network-id binding into the
+    /// genesis hash.
+    #[test]
+    fn config_hash_differs_across_networks() {
+        let config = sample_config();
+        assert_ne!(
+            genesis_config_hash(&config, &NetworkDefinition::mainnet()),
+            genesis_config_hash(&config, &NetworkDefinition::stokenet()),
+        );
     }
 }
