@@ -31,17 +31,18 @@ mod transaction;
 mod wave;
 
 pub use beacon::{
-    BeaconBlock, BeaconProposal, BeaconState, BeaconWitness, BeaconWitnessEvent,
-    CommitteeTransition, EquivocationEvidence, JailReason, MAX_BEACON_WITNESS_EVENTS_PER_TX,
-    MAX_EXCLUDED_VALIDATORS, MAX_PREFIX_SIGS, MAX_READY_SIGNALS_PER_BLOCK, MAX_READY_WINDOW_BLOCKS,
-    MAX_VOTE_VECTOR_LEN, MAX_WITNESS_PROOF_DEPTH, MAX_WITNESSES_PER_FETCH,
-    MAX_WITNESSES_PER_PROPOSER, PC_VALUE_ELEMENT_BYTES, PcCompactVote, PcDivergingProof, PcQc1,
-    PcQc2, PcQc3, PcSignerLengths, PcValueElement, PcVector, PcVote1, PcVote2, PcVote3,
-    PcVoteEquivocation, PcVoteRound, PcXpProof, PendingWithdrawal, ReadySignal,
-    RecoveryCertificate, RecoveryEquivocation, RecoveryRequest, SHARD_WITNESS_LEAF_DOMAIN_TAG,
-    ShardCommittee, ShardWitness, ShardWitnessPayload, ShardWitnessProof, SkipReport, SlotEffects,
-    SpcCert, SpcEmptyLowEvidence, SpcEmptyViewMsg, SpcHighTriple, SpcMessage, SpcProposalObject,
-    StakePool, TransitionCause, ValidatorRecord, ValidatorStatus, VpcMsgPayload, Witness,
+    BeaconBlock, BeaconGenesisConfig, BeaconProposal, BeaconState, BeaconWitness,
+    BeaconWitnessEvent, CommitteeTransition, EquivocationEvidence, GenesisPool, GenesisValidator,
+    JailReason, MAX_BEACON_WITNESS_EVENTS_PER_TX, MAX_EXCLUDED_VALIDATORS, MAX_PREFIX_SIGS,
+    MAX_READY_SIGNALS_PER_BLOCK, MAX_READY_WINDOW_BLOCKS, MAX_VOTE_VECTOR_LEN,
+    MAX_WITNESS_PROOF_DEPTH, MAX_WITNESSES_PER_FETCH, MAX_WITNESSES_PER_PROPOSER,
+    PC_VALUE_ELEMENT_BYTES, PcCompactVote, PcDivergingProof, PcQc1, PcQc2, PcQc3, PcSignerLengths,
+    PcValueElement, PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation, PcVoteRound,
+    PcXpProof, PendingWithdrawal, ReadySignal, RecoveryCertificate, RecoveryEquivocation,
+    RecoveryRequest, SHARD_WITNESS_LEAF_DOMAIN_TAG, ShardCommittee, ShardWitness,
+    ShardWitnessPayload, ShardWitnessProof, SkipReport, SlotEffects, SpcCert, SpcEmptyLowEvidence,
+    SpcEmptyViewMsg, SpcHighTriple, SpcMessage, SpcProposalObject, StakePool, TransitionCause,
+    ValidatorRecord, ValidatorStatus, VpcMsgPayload, Witness, genesis_config_hash,
 };
 pub use crypto::batch_verify::{
     aggregate_verify_bls_different_messages, batch_verify_bls_different_messages,

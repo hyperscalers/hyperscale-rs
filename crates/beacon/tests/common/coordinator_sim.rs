@@ -18,17 +18,15 @@ use std::sync::Arc;
 
 use hyperscale_beacon::constants::{BEACON_SIGNER_COUNT, MIN_STAKE_FLOOR};
 use hyperscale_beacon::coordinator::BeaconCoordinator;
-use hyperscale_beacon::genesis::{
-    BeaconGenesisConfig, GenesisPool, GenesisValidator, build_genesis_beacon_state,
-    genesis_config_hash,
-};
+use hyperscale_beacon::genesis::build_genesis_beacon_state;
 use hyperscale_beacon::pc::{sign_vote1, sign_vote2, sign_vote3};
 use hyperscale_beacon::spc::sign_empty_view_msg;
 use hyperscale_core::Action;
 use hyperscale_types::{
-    BeaconBlock, BeaconProposal, BeaconState, Bls12381G1PrivateKey, Bls12381G1PublicKey, Epoch,
-    NetworkDefinition, Randomness, ShardGroupId, SpcMessage, Stake, StakePoolId, ValidatorId,
-    VpcMsgPayload, bls_keypair_from_seed, pc_context, spc_context, vrf_sign,
+    BeaconBlock, BeaconGenesisConfig, BeaconProposal, BeaconState, Bls12381G1PrivateKey,
+    Bls12381G1PublicKey, Epoch, GenesisPool, GenesisValidator, NetworkDefinition, Randomness,
+    ShardGroupId, SpcMessage, Stake, StakePoolId, ValidatorId, VpcMsgPayload,
+    bls_keypair_from_seed, genesis_config_hash, pc_context, spc_context, vrf_sign,
 };
 
 /// One captured commit event from a replica's `Action::CommitBeaconBlock`.

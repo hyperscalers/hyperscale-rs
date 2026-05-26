@@ -2,6 +2,8 @@
 //!
 //! - [`block`]: [`BeaconBlock`] (epoch + cert + committed proposals +
 //!   optional recovery cert).
+//! - [`genesis`]: [`BeaconGenesisConfig`] and the chain-identity hash
+//!   embedded in [`SpcCert::Genesis`].
 //! - [`limits`]: protocol-level caps on per-proposal payload sizes.
 //! - [`pc`]: Prefix Consensus vote / QC wire types.
 //! - [`proposal`]: [`BeaconProposal`] (one committee member's slot
@@ -21,6 +23,7 @@
 //!   beacon applies per slot).
 
 pub mod block;
+pub mod genesis;
 pub mod limits;
 pub mod pc;
 pub mod proposal;
@@ -31,6 +34,7 @@ pub mod state;
 pub mod witness;
 
 pub use block::BeaconBlock;
+pub use genesis::{BeaconGenesisConfig, GenesisPool, GenesisValidator, genesis_config_hash};
 pub use limits::{
     MAX_BEACON_WITNESS_EVENTS_PER_TX, MAX_EXCLUDED_VALIDATORS, MAX_PREFIX_SIGS,
     MAX_READY_SIGNALS_PER_BLOCK, MAX_READY_WINDOW_BLOCKS, MAX_VOTE_VECTOR_LEN,

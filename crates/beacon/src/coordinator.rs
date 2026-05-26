@@ -689,17 +689,16 @@ mod tests {
     use std::collections::BTreeMap;
 
     use hyperscale_types::{
-        BeaconBlock, BeaconBlockHash, Bls12381G1PrivateKey, Bls12381G1PublicKey, Epoch,
-        GenesisConfigHash, NetworkDefinition, PcVector, Randomness, ShardGroupId, SpcCert, SpcView,
-        Stake, StakePoolId, ValidatorId, bls_keypair_from_seed, pc_context, spc_context,
+        BeaconBlock, BeaconBlockHash, BeaconGenesisConfig, Bls12381G1PrivateKey,
+        Bls12381G1PublicKey, Epoch, GenesisConfigHash, GenesisPool, GenesisValidator,
+        NetworkDefinition, PcVector, Randomness, ShardGroupId, SpcCert, SpcView, Stake,
+        StakePoolId, ValidatorId, bls_keypair_from_seed, genesis_config_hash, pc_context,
+        spc_context,
     };
 
     use super::*;
     use crate::constants::MIN_STAKE_FLOOR;
-    use crate::genesis::{
-        BeaconGenesisConfig, GenesisPool, GenesisValidator, build_genesis_beacon_state,
-        genesis_config_hash,
-    };
+    use crate::genesis::build_genesis_beacon_state;
     use crate::pc::{build_qc1, build_qc2, build_qc3, sign_vote1, sign_vote2, sign_vote3};
 
     fn keypair(seed: u64) -> Bls12381G1PrivateKey {

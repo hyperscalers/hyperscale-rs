@@ -15,92 +15,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_types::{
-    BeaconState, Bls12381G1PublicKey, Epoch, GenesisConfigHash, Hash, Randomness, ShardCommittee,
-    ShardGroupId, Stake, StakePool, StakePoolId, ValidatorId, ValidatorRecord, ValidatorStatus,
+    BeaconGenesisConfig, BeaconState, Epoch, ShardCommittee, ShardGroupId, Stake, StakePool,
+    StakePoolId, ValidatorId, ValidatorRecord, ValidatorStatus,
 };
-use sbor::prelude::*;
 
 use crate::constants::{BEACON_SIGNER_COUNT, MIN_STAKE_FLOOR, SHARD_CAPACITY};
-
-// ─── config shape ──────────────────────────────────────────────────────────
-
-/// One validator as supplied at genesis.
-///
-/// Pool linkage lives on the validator (a validator belongs to exactly
-/// one pool); the pool's validator set is derived by filtering
-/// `initial_validators` on `pool == this_pool_id` inside
-/// [`build_genesis_beacon_state`].
-#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
-pub struct GenesisValidator {
-    /// Validator id.
-    pub id: ValidatorId,
-    /// Pool this validator operates under.
-    pub pool: StakePoolId,
-    /// Compressed BLS pubkey.
-    pub pubkey: Bls12381G1PublicKey,
-}
-
-/// One stake pool as supplied at genesis.
-#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
-pub struct GenesisPool {
-    /// Pool id.
-    pub id: StakePoolId,
-    /// Total stake credited to this pool at genesis.
-    pub total_stake: Stake,
-}
-
-/// Genesis configuration for a beacon chain.
-///
-/// Loaded from TOML at the validator binary's startup; consumed once by
-/// [`build_genesis_beacon_state`]. Every field is consensus-critical —
-/// two validators with different `BeaconGenesisConfig`s produce
-/// divergent `BeaconState`s at epoch 0 and never converge. The
-/// SBOR-canonical hash of this struct is the [`GenesisConfigHash`]
-/// embedded in [`SpcCert::Genesis`](hyperscale_types::SpcCert), binding
-/// the chain identity to operator-supplied TOML; see
-/// [`genesis_config_hash`].
-#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
-pub struct BeaconGenesisConfig {
-    /// Initial validator set.
-    pub initial_validators: Vec<GenesisValidator>,
-    /// Initial stake pools. Each pool's validator set is derived from
-    /// `initial_validators` filtered on the pool id.
-    pub initial_pools: Vec<GenesisPool>,
-    /// Explicit initial beacon committee. Stored sorted in
-    /// `BeaconState.committee`; the genesis builder sorts on the way
-    /// in so the input order is incidental.
-    pub initial_beacon_committee: Vec<ValidatorId>,
-    /// Explicit initial per-shard committees. Members of each shard
-    /// get `OnShard { ready: true, placed_at_epoch: GENESIS }` —
-    /// presumed synced by construction at chain bootstrap.
-    pub initial_shard_committees: BTreeMap<ShardGroupId, Vec<ValidatorId>>,
-    /// Seed for the very first epoch's randomness. Mixed straight into
-    /// `state.randomness`; subsequent slots roll it through accepted
-    /// VRF outputs.
-    pub initial_randomness: Randomness,
-}
-
-// ─── identity ──────────────────────────────────────────────────────────────
-
-/// Hash a [`BeaconGenesisConfig`] into the [`GenesisConfigHash`] embedded
-/// in [`SpcCert::Genesis`](hyperscale_types::SpcCert).
-///
-/// Pure function over the SBOR-canonical encoding: two operators with
-/// byte-identical TOML produce the same hash; any divergent field
-/// (validator pubkey, pool stake, initial randomness, ...) yields a
-/// different hash and therefore a different
-/// [`BeaconBlockHash`](hyperscale_types::BeaconBlockHash) at genesis,
-/// keeping chains with mismatched bootstraps from accidentally merging.
-///
-/// # Panics
-///
-/// Never in practice: every field is `BasicSbor` and the struct is
-/// closed, so encoding is total.
-#[must_use]
-pub fn genesis_config_hash(config: &BeaconGenesisConfig) -> GenesisConfigHash {
-    let bytes = basic_encode(config).expect("BeaconGenesisConfig SBOR encode is infallible");
-    GenesisConfigHash::from_raw(Hash::from_bytes(&bytes))
-}
 
 // ─── builder ───────────────────────────────────────────────────────────────
 
@@ -297,7 +216,9 @@ fn validate_config(config: &BeaconGenesisConfig) -> BTreeMap<ValidatorId, ShardG
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::bls_keypair_from_seed;
+    use hyperscale_types::{
+        Bls12381G1PublicKey, GenesisPool, GenesisValidator, Randomness, bls_keypair_from_seed,
+    };
 
     use super::*;
 
