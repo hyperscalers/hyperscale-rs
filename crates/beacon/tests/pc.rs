@@ -13,7 +13,7 @@ use hyperscale_beacon::pc::{
 };
 use hyperscale_types::{
     Epoch, NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PcQc1, PcQc2, PcValueElement, PcVector,
-    PcVote1, PcVote2, PcVote3, PcVoteEquivocation, PcVoteRound, SpcView,
+    PcVote1, PcVote2, PcVote3, PcVoteEquivocation, PcVoteRound, PcXpProof, SpcView,
 };
 
 const fn elem(byte: u8) -> PcValueElement {
@@ -264,6 +264,96 @@ fn sim_n4_with_one_silent_party_still_converges() {
         sim.decided(3).is_some(),
         "silent observer should also decide via received votes"
     );
+}
+
+// ─── `build_qc2` proof-variant coverage ────────────────────────────────────────
+//
+// `PcSim` can't reach the Diverging or ShortWitness branches end-to-end: its
+// deterministic FIFO delivery makes every party see the same first `q` round-1
+// votes, so every party builds the *same* QC1 and signs round-2 over an
+// identical `x`. Round 2 collapses to `PcXpProof::Full`. Forcing two signers
+// to back round-2 with different QC1s — which is what Diverging and
+// ShortWitness require — has to be done by composing the votes directly.
+// These tests cover the same code path (`build_qc2` → `build_xp_proof`) as
+// the planned sim tests would have, at the layer that can actually produce
+// divergent inputs.
+
+/// Build a QC1 over `v_in` from a `quorum`-sized subset of the
+/// committee. The signers collectively cover positions `0..quorum`.
+fn qc1_over(
+    cm: &Committee,
+    network: &NetworkDefinition,
+    ctx: &[u8],
+    quorum: usize,
+    v_in: &PcVector,
+) -> PcQc1 {
+    let votes = round1_quorum(cm, network, ctx, quorum, v_in);
+    let refs: Vec<&PcVote1> = votes.iter().collect();
+    build_qc1(&refs, &cm.members)
+}
+
+/// Two signers vote round-2 over a QC1 with `x = [1, 2]`; one signs
+/// over a QC1 with `x = [1, 3]`. The resulting QC2 must witness the
+/// divergence — `x_p = [1]` and `pi = Diverging`.
+#[test]
+fn build_qc2_produces_diverging_proof_under_divergent_round1_inputs() {
+    let cm = Committee::new(4, 0xD1);
+    let network = NetworkDefinition::simulator();
+    let ctx = pc_ctx(11, 0);
+    let x_a = PcVector::new([elem(1), elem(2)]);
+    let x_b = PcVector::new([elem(1), elem(3)]);
+
+    let qc1_a = qc1_over(&cm, &network, &ctx, 3, &x_a);
+    let qc1_b = qc1_over(&cm, &network, &ctx, 3, &x_b);
+
+    let v2_0 = sign_vote2(cm.sk(0), cm.id(0), &network, &ctx, qc1_a.clone());
+    let v2_1 = sign_vote2(cm.sk(1), cm.id(1), &network, &ctx, qc1_a);
+    let v2_2 = sign_vote2(cm.sk(2), cm.id(2), &network, &ctx, qc1_b);
+
+    let refs: Vec<&PcVote2> = vec![&v2_0, &v2_1, &v2_2];
+    let qc2 = build_qc2(&refs, &cm.members);
+
+    assert_eq!(qc2.x_p(), &PcVector::new([elem(1)]));
+    assert!(
+        matches!(qc2.pi(), PcXpProof::Diverging(_)),
+        "qc2.pi is {:?}, expected Diverging",
+        qc2.pi(),
+    );
+    assert!(verify_qc2(&qc2, &network, &ctx, &cm.members));
+}
+
+/// Four signers vote round-2 over a QC1 with `x = [1, 2]`; one signs
+/// over a QC1 with `x = [1]`. The short signer's vote constrains the
+/// mcp; the resulting QC2 must carry a `PcXpProof::ShortWitness`
+/// witness. `x_p = [1]`.
+#[test]
+fn build_qc2_produces_short_witness_proof_when_one_signer_is_short() {
+    let cm = Committee::new(7, 0x5F);
+    let network = NetworkDefinition::simulator();
+    let ctx = pc_ctx(13, 0);
+    let x_long = PcVector::new([elem(1), elem(2)]);
+    let x_short = PcVector::new([elem(1)]);
+
+    let qc1_long = qc1_over(&cm, &network, &ctx, 5, &x_long);
+    let qc1_short = qc1_over(&cm, &network, &ctx, 5, &x_short);
+
+    let v2s = [
+        sign_vote2(cm.sk(0), cm.id(0), &network, &ctx, qc1_long.clone()),
+        sign_vote2(cm.sk(1), cm.id(1), &network, &ctx, qc1_long.clone()),
+        sign_vote2(cm.sk(2), cm.id(2), &network, &ctx, qc1_long.clone()),
+        sign_vote2(cm.sk(3), cm.id(3), &network, &ctx, qc1_long),
+        sign_vote2(cm.sk(4), cm.id(4), &network, &ctx, qc1_short),
+    ];
+    let refs: Vec<&PcVote2> = v2s.iter().collect();
+    let qc2 = build_qc2(&refs, &cm.members);
+
+    assert_eq!(qc2.x_p(), &PcVector::new([elem(1)]));
+    assert!(
+        matches!(qc2.pi(), PcXpProof::ShortWitness { .. }),
+        "qc2.pi is {:?}, expected ShortWitness",
+        qc2.pi(),
+    );
+    assert!(verify_qc2(&qc2, &network, &ctx, &cm.members));
 }
 
 /// A tampered `sig_b` (signed by a different validator) must not
