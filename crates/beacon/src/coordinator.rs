@@ -22,7 +22,7 @@ use std::sync::Arc;
 use hyperscale_core::{Action, TimerId};
 use hyperscale_types::{
     BeaconBlock, BeaconProposal, BeaconState, Bls12381G1PublicKey, EPOCH_DURATION, Epoch,
-    GenesisConfigHash, LocalTimestamp, MAX_WITNESSES_PER_PROPOSER, NetworkDefinition,
+    GenesisConfigHash, LeafIndex, LocalTimestamp, MAX_WITNESSES_PER_PROPOSER, NetworkDefinition,
     PcValueElement, PcVector, RECOVERY_TIMEOUT, RecoveryCertificate, RecoveryRequest, ShardGroupId,
     ShardWitness, SpcCert, SpcMessage, TopologySnapshot, ValidatorId, VpcMsgPayload,
     WeightedTimestamp, Witness, recovery_request_message, spc_context, verify_bls12381_v1,
@@ -355,8 +355,11 @@ impl BeaconCoordinator {
 
     /// Drain equivocations and eligible shard witnesses for inclusion
     /// in the proposal for `epoch`, capped at
-    /// [`MAX_WITNESSES_PER_PROPOSER`]. Overflow shard witnesses are
-    /// re-admitted to the pool for a future epoch's drain.
+    /// [`MAX_WITNESSES_PER_PROPOSER`]. Drained shard witnesses stay in
+    /// the pool; the fetcher evicts them when the chain advances
+    /// `consumed_through` past their leaf indices. Overflow above the
+    /// cap is truncated — the pool retains the excess for a future
+    /// epoch's drain.
     fn drain_witnesses_for(&mut self, epoch: Epoch) -> Vec<Witness> {
         let equivocations = self.equivocations.drain_for_proposal();
         let cap = MAX_WITNESSES_PER_PROPOSER.saturating_sub(equivocations.len());
@@ -365,11 +368,7 @@ impl BeaconCoordinator {
         let mut shard_witnesses = self
             .witness_fetcher
             .drain_for_proposal(epoch_end_wt, &self.state.consumed_through);
-        if shard_witnesses.len() > cap {
-            for excess in shard_witnesses.split_off(cap) {
-                self.witness_fetcher.admit_witness(excess);
-            }
-        }
+        shard_witnesses.truncate(cap);
 
         let mut witnesses: Vec<Witness> = equivocations.into_iter().map(Witness::Beacon).collect();
         witnesses.extend(
@@ -707,6 +706,20 @@ impl BeaconCoordinator {
             self.network.clone(),
             self.me,
         ));
+
+        // Witness fetcher uses mark-not-remove on drain; physical
+        // eviction is driven by the chain's `consumed_through`
+        // advancement.
+        let consumed_snapshot: Vec<(ShardGroupId, LeafIndex)> = self
+            .state
+            .consumed_through
+            .iter()
+            .map(|(s, w)| (*s, *w))
+            .collect();
+        for (shard, watermark) in consumed_snapshot {
+            self.witness_fetcher
+                .notify_consumed_advanced(shard, watermark);
+        }
 
         let next_epoch = self.state.current_epoch.next();
         self.proposal_pool.reset(next_epoch);
@@ -1372,11 +1385,19 @@ mod tests {
         let witnesses = proposal_witnesses(&actions);
         assert_eq!(witnesses.len(), 1);
         assert!(matches!(witnesses[0], Witness::Shard(_)));
-        assert_eq!(coord.witness_fetcher.pool_len(shard), 0);
+        // Mark-not-remove: drained witness still resident, marked in
+        // `pending_in_proposal` until the chain advances
+        // `consumed_through` past its leaf.
+        assert_eq!(coord.witness_fetcher.pool_len(shard), 1);
+        assert!(
+            coord
+                .witness_fetcher
+                .is_pending_in_proposal(shard, LeafIndex::new(1))
+        );
     }
 
     #[test]
-    fn try_propose_caps_at_max_witnesses_and_readmits_overflow() {
+    fn try_propose_caps_at_max_witnesses_and_retains_overflow_in_pool() {
         use hyperscale_types::MAX_WITNESSES_PER_PROPOSER;
         let mut coord = fresh_coord();
         coord.bootstrap_spc_for_next_epoch();
@@ -1398,8 +1419,10 @@ mod tests {
         let actions = coord.try_propose();
         let witnesses = proposal_witnesses(&actions);
         assert_eq!(witnesses.len(), MAX_WITNESSES_PER_PROPOSER);
-        // The 5 overflow witnesses got re-admitted to the pool.
-        assert_eq!(coord.witness_fetcher.pool_len(shard), 5);
+        // Mark-not-remove: pool retains every leaf — the cap truncates
+        // the proposal output, not the pool. Eviction is driven by
+        // `consumed_through` advancement on `adopt_block`.
+        assert_eq!(coord.witness_fetcher.pool_len(shard), total);
     }
 
     #[test]

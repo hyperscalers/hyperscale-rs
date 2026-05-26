@@ -32,18 +32,27 @@ pub struct ShardHeaderRecord {
 
 /// Per-shard witness tracking.
 ///
-/// Three internal maps:
+/// Four internal maps:
 ///
 /// - `shard_header_records` — populated from every verified remote
 ///   header regardless of committee membership; needed by off-committee
 ///   vnodes to verify incoming `BeaconBlock`s' witness Merkle paths.
 /// - `pool` — validated witnesses ready for inclusion. Empty when the
-///   local validator is off-committee.
+///   local validator is off-committee. `drain_for_proposal` clones
+///   eligible entries out without removing them; physical eviction
+///   happens only when [`notify_consumed_advanced`](Self::notify_consumed_advanced)
+///   advances past a leaf index. This keeps witnesses available for a
+///   future proposal if the current epoch's block doesn't commit
+///   (e.g. SPC fails to reach `OutputHigh`, or the epoch is skipped).
+/// - `pending_in_proposal` — leaves the local proposer has drained
+///   into a proposal but not yet seen committed. Mirrors the eviction
+///   path of `pool`.
 /// - `pending_fetches` — outstanding fetch dedup. Empty when off-committee.
 #[derive(Debug, Default)]
 pub struct ShardWitnessFetchTracker {
     shard_header_records: BTreeMap<ShardGroupId, BTreeMap<BlockHeight, ShardHeaderRecord>>,
     pool: BTreeMap<ShardGroupId, BTreeMap<LeafIndex, Arc<ShardWitness>>>,
+    pending_in_proposal: BTreeMap<ShardGroupId, BTreeSet<LeafIndex>>,
     pending_fetches: BTreeMap<ShardGroupId, BTreeSet<LeafIndex>>,
 }
 
@@ -106,6 +115,14 @@ impl ShardWitnessFetchTracker {
     /// shard's `consumed_through` watermark and `≤` the largest
     /// `leaf_count_at_block_end` from any header record whose
     /// `weighted_timestamp ≤ epoch_end_wt`.
+    ///
+    /// Mark-not-remove: returned `Arc`s are clones; the witnesses stay
+    /// in the pool until [`notify_consumed_advanced`](Self::notify_consumed_advanced)
+    /// evicts them after `consumed_through` advances on-chain. A second
+    /// drain at the same watermark returns the same set — so a proposer
+    /// whose block doesn't commit (e.g. SPC stall, epoch skipped) can
+    /// re-propose the same witnesses without re-fetching from shards.
+    /// Drained leaves are recorded in `pending_in_proposal`.
     pub fn drain_for_proposal(
         &mut self,
         epoch_end_wt: WeightedTimestamp,
@@ -120,23 +137,44 @@ impl ShardWitnessFetchTracker {
                 .get(shard)
                 .copied()
                 .unwrap_or(LeafIndex::new(0));
-            let Some(pool_for_shard) = self.pool.get_mut(shard) else {
+            let Some(pool_for_shard) = self.pool.get(shard) else {
                 continue;
             };
-            let drained: Vec<LeafIndex> = pool_for_shard
+            let drained: Vec<(LeafIndex, Arc<ShardWitness>)> = pool_for_shard
                 .range(..)
                 .filter(|(idx, _)| {
                     idx.inner() > watermark.inner() && idx.inner() <= max_eligible.inner()
                 })
-                .map(|(idx, _)| *idx)
+                .map(|(idx, w)| (*idx, Arc::clone(w)))
                 .collect();
-            for idx in drained {
-                if let Some(w) = pool_for_shard.remove(&idx) {
-                    out.push(w);
-                }
+            if drained.is_empty() {
+                continue;
+            }
+            let pip_for_shard = self.pending_in_proposal.entry(*shard).or_default();
+            for (idx, w) in drained {
+                pip_for_shard.insert(idx);
+                out.push(w);
             }
         }
         out
+    }
+
+    /// On-chain `consumed_through[shard]` has advanced to `new_watermark`.
+    /// Evict pool and `pending_in_proposal` entries at-or-below the new
+    /// watermark — witnesses past their consumed leaf are stale and
+    /// can't appear in a future proposal. `O(log n + evicted)` via
+    /// `BTreeMap::split_off`. Idempotent: calling with a non-advancing
+    /// watermark is a no-op.
+    pub fn notify_consumed_advanced(&mut self, shard: ShardGroupId, new_watermark: LeafIndex) {
+        let cutoff = LeafIndex::new(new_watermark.inner().saturating_add(1));
+        if let Some(pool_for_shard) = self.pool.get_mut(&shard) {
+            let above = pool_for_shard.split_off(&cutoff);
+            *pool_for_shard = above;
+        }
+        if let Some(pip_for_shard) = self.pending_in_proposal.get_mut(&shard) {
+            let above = pip_for_shard.split_off(&cutoff);
+            *pip_for_shard = above;
+        }
     }
 
     /// Whether the local proposer can build an epoch's contribution:
@@ -160,11 +198,12 @@ impl ShardWitnessFetchTracker {
     }
 
     /// Called when the local validator is removed from the beacon
-    /// committee. Drops the pool and pending-fetch state; keeps
-    /// `shard_header_records` since the vnode still needs them to
-    /// verify incoming `BeaconBlock`s.
+    /// committee. Drops the pool, pending-fetch, and in-proposal state;
+    /// keeps `shard_header_records` since the vnode still needs them
+    /// to verify incoming `BeaconBlock`s.
     pub fn evicted_from_committee(&mut self) {
         self.pool.clear();
+        self.pending_in_proposal.clear();
         self.pending_fetches.clear();
     }
 
@@ -228,6 +267,20 @@ impl ShardWitnessFetchTracker {
     #[must_use]
     pub fn is_pending_fetch(&self, shard: ShardGroupId, leaf_index: LeafIndex) -> bool {
         self.pending_fetches
+            .get(&shard)
+            .is_some_and(|s| s.contains(&leaf_index))
+    }
+
+    #[must_use]
+    pub fn pending_in_proposal_len(&self, shard: ShardGroupId) -> usize {
+        self.pending_in_proposal
+            .get(&shard)
+            .map_or(0, BTreeSet::len)
+    }
+
+    #[must_use]
+    pub fn is_pending_in_proposal(&self, shard: ShardGroupId, leaf_index: LeafIndex) -> bool {
+        self.pending_in_proposal
             .get(&shard)
             .is_some_and(|s| s.contains(&leaf_index))
     }
@@ -369,7 +422,96 @@ mod tests {
         let drained = t.drain_for_proposal(WeightedTimestamp::from_millis(2_000), &consumed);
         let indices: Vec<u64> = drained.iter().map(|w| w.proof.leaf_index.inner()).collect();
         assert_eq!(indices, vec![3, 4]);
-        assert_eq!(t.pool_len(shard(0)), 1);
+        // Mark-not-remove: all three leaves still resident; the two
+        // drained ones are marked in pending_in_proposal.
+        assert_eq!(t.pool_len(shard(0)), 3);
+        assert_eq!(t.pending_in_proposal_len(shard(0)), 2);
+        assert!(t.is_pending_in_proposal(shard(0), LeafIndex::new(3)));
+        assert!(t.is_pending_in_proposal(shard(0), LeafIndex::new(4)));
+    }
+
+    /// A drained witness whose block doesn't commit is still in the
+    /// pool, and a subsequent drain at the same watermark returns it
+    /// again. This is the property that lets a proposer re-propose
+    /// after an SPC stall or a skipped epoch without re-fetching from
+    /// shards.
+    #[test]
+    fn drain_is_idempotent_when_watermark_unchanged() {
+        let mut t = ShardWitnessFetchTracker::new();
+        t.on_verified_remote_header(&committed_header(shard(0), 1, 1_000, 5));
+        t.admit_witness(witness(shard(0), 3));
+        t.admit_witness(witness(shard(0), 4));
+        let consumed = BTreeMap::new();
+
+        let first = t.drain_for_proposal(WeightedTimestamp::from_millis(2_000), &consumed);
+        let second = t.drain_for_proposal(WeightedTimestamp::from_millis(2_000), &consumed);
+        let first_indices: Vec<u64> = first.iter().map(|w| w.proof.leaf_index.inner()).collect();
+        let second_indices: Vec<u64> = second.iter().map(|w| w.proof.leaf_index.inner()).collect();
+        assert_eq!(first_indices, vec![3, 4]);
+        assert_eq!(second_indices, vec![3, 4]);
+    }
+
+    /// `notify_consumed_advanced(shard, w)` evicts pool entries with
+    /// `leaf_index ≤ w` and retains those with `leaf_index > w`.
+    #[test]
+    fn notify_consumed_advanced_evicts_at_or_below_watermark() {
+        let mut t = ShardWitnessFetchTracker::new();
+        t.admit_witness(witness(shard(0), 1));
+        t.admit_witness(witness(shard(0), 2));
+        t.admit_witness(witness(shard(0), 3));
+        t.admit_witness(witness(shard(0), 4));
+        t.admit_witness(witness(shard(0), 5));
+
+        t.notify_consumed_advanced(shard(0), LeafIndex::new(3));
+
+        assert_eq!(t.pool_len(shard(0)), 2);
+        assert!(
+            t.pool
+                .get(&shard(0))
+                .unwrap()
+                .contains_key(&LeafIndex::new(4))
+        );
+        assert!(
+            t.pool
+                .get(&shard(0))
+                .unwrap()
+                .contains_key(&LeafIndex::new(5))
+        );
+    }
+
+    /// `notify_consumed_advanced` mirrors the eviction over
+    /// `pending_in_proposal`: leaves at-or-below the watermark are
+    /// dropped, leaves above are retained.
+    #[test]
+    fn notify_consumed_advanced_evicts_pending_in_proposal() {
+        let mut t = ShardWitnessFetchTracker::new();
+        t.on_verified_remote_header(&committed_header(shard(0), 1, 1_000, 5));
+        for leaf in 1..=5u64 {
+            t.admit_witness(witness(shard(0), leaf));
+        }
+        let consumed = BTreeMap::new();
+        let _ = t.drain_for_proposal(WeightedTimestamp::from_millis(2_000), &consumed);
+        assert_eq!(t.pending_in_proposal_len(shard(0)), 5);
+
+        t.notify_consumed_advanced(shard(0), LeafIndex::new(3));
+
+        assert_eq!(t.pending_in_proposal_len(shard(0)), 2);
+        assert!(t.is_pending_in_proposal(shard(0), LeafIndex::new(4)));
+        assert!(t.is_pending_in_proposal(shard(0), LeafIndex::new(5)));
+    }
+
+    /// `notify_consumed_advanced` with a non-advancing watermark is a
+    /// no-op — calling it repeatedly across blocks that don't advance
+    /// `consumed_through` for this shard doesn't disturb the pool.
+    #[test]
+    fn notify_consumed_advanced_is_idempotent() {
+        let mut t = ShardWitnessFetchTracker::new();
+        t.admit_witness(witness(shard(0), 4));
+        t.admit_witness(witness(shard(0), 5));
+
+        t.notify_consumed_advanced(shard(0), LeafIndex::new(3));
+        t.notify_consumed_advanced(shard(0), LeafIndex::new(3));
+        assert_eq!(t.pool_len(shard(0)), 2);
     }
 
     #[test]
@@ -427,11 +569,15 @@ mod tests {
         t.on_verified_remote_header(&committed_header(shard(0), 1, 1_000, 5));
         t.admit_witness(witness(shard(0), 3));
         t.register_pending_fetch(shard(0), LeafIndex::new(4));
+        let consumed = BTreeMap::new();
+        let _ = t.drain_for_proposal(WeightedTimestamp::from_millis(2_000), &consumed);
+        assert_eq!(t.pending_in_proposal_len(shard(0)), 1);
 
         t.evicted_from_committee();
 
         assert_eq!(t.pool_len(shard(0)), 0);
         assert_eq!(t.pending_fetches_len(shard(0)), 0);
+        assert_eq!(t.pending_in_proposal_len(shard(0)), 0);
         assert!(t.header_record(shard(0), BlockHeight::new(1)).is_some());
     }
 }
