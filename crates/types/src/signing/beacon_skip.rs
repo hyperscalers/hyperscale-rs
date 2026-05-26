@@ -40,7 +40,7 @@ pub fn skip_request_message(
 mod tests {
     use super::*;
     use crate::Hash;
-    use crate::signing::DOMAIN_RECOVERY_REQUEST;
+    use crate::signing::DOMAIN_PC_VRF;
 
     fn net() -> NetworkDefinition {
         NetworkDefinition::simulator()
@@ -91,14 +91,12 @@ mod tests {
         assert_ne!(mainnet, stokenet);
     }
 
-    /// Domain separation: a skip sig must not collide with a recovery
-    /// request — distinct domain tags guarantee the prefixes diverge.
+    /// Domain separation: a skip sig must not collide with a VRF reveal
+    /// (or any other beacon BLS message reusing the same key material) —
+    /// distinct domain tags guarantee the prefixes diverge.
     #[test]
-    fn skip_request_message_differs_from_recovery_request() {
+    fn skip_request_message_differs_from_other_beacon_domains() {
         let bytes = skip_request_message(&net(), &anchor(), Epoch::new(5));
-        assert_ne!(
-            &bytes[..DOMAIN_RECOVERY_REQUEST.len().min(bytes.len())],
-            &DOMAIN_RECOVERY_REQUEST[..DOMAIN_RECOVERY_REQUEST.len().min(bytes.len())]
-        );
+        assert_ne!(&bytes[..DOMAIN_PC_VRF.len()], DOMAIN_PC_VRF);
     }
 }

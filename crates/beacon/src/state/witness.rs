@@ -13,7 +13,6 @@ use crate::constants::{
     JAIL_COOLDOWN_EPOCHS, MAX_WITNESSES_PER_SLOT, MISSED_PROPOSAL_JAIL_THRESHOLD,
 };
 use crate::pc::verify_vote_equivocation;
-use crate::recovery::verify_recovery_equivocation;
 use crate::state::derived::{current_active_count, effective_stake, max_active_count};
 use crate::state::vrf::jail_validator;
 use crate::state::withdrawals::deactivate_to_insufficient_stake;
@@ -184,9 +183,7 @@ pub(super) fn ingest_witnesses(
 }
 
 /// Re-validate an [`EquivocationEvidence`] under the current
-/// validator-set pubkey lookup. `Vote` re-runs the PC double-sign
-/// check; `Recovery` re-runs the recovery-request / finalized-block
-/// double-attestation check.
+/// validator-set pubkey lookup. Re-runs the PC double-sign check.
 pub(super) fn verify_equivocation_evidence(
     evidence: &EquivocationEvidence,
     network: &NetworkDefinition,
@@ -194,7 +191,6 @@ pub(super) fn verify_equivocation_evidence(
 ) -> bool {
     match evidence {
         EquivocationEvidence::Vote(v) => verify_vote_equivocation(v, network, lookup),
-        EquivocationEvidence::Recovery(r) => verify_recovery_equivocation(r, network, lookup),
     }
 }
 
@@ -303,9 +299,9 @@ pub(super) fn apply_shard_payload(
             // already represent "not consuming a epoch" or "permanently
             // out": `InsufficientStake` itself and
             // `Jailed { Equivocation }`. Fault-cause jails
-            // (`Performance`, `Recovery`) can still be deactivated —
-            // the operator chooses to retire a jailed validator rather
-            // than wait out the cooldown.
+            // (`Performance`) can still be deactivated — the operator
+            // chooses to retire a jailed validator rather than wait
+            // out the cooldown.
             let rec = state.validators.get(validator_id)?;
             let should_deactivate = !matches!(
                 rec.status,
@@ -1570,8 +1566,7 @@ mod tests {
 
     use hyperscale_types::{
         BeaconWitness, DOMAIN_PC_VOTE1, EquivocationEvidence as Evidence, PcValueElement, PcVector,
-        PcVoteEquivocation, PcVoteRound, RecoveryEquivocation, SpcView, pc_context,
-        pc_vote_signing_message, spc_context,
+        PcVoteEquivocation, PcVoteRound, SpcView, pc_context, pc_vote_signing_message, spc_context,
     };
 
     /// Build a valid `PcVoteEquivocation` for `equivocator` at
@@ -1774,56 +1769,6 @@ mod tests {
 
         assert!(effects.jailed.is_empty());
         // Validator 1's status unchanged — still OnShard.
-        assert!(matches!(
-            state.validators.get(&ValidatorId::new(1)).unwrap().status,
-            ValidatorStatus::OnShard { .. },
-        ));
-    }
-
-    /// A malformed `RecoveryEquivocation` (block cert at an epoch not
-    /// strictly past the request's anchor) is silently dropped by
-    /// `apply_epoch`. Pins the "drop silently" path against a
-    /// regression where invalid evidence would jail the named
-    /// validator.
-    #[test]
-    fn apply_epoch_drops_invalid_recovery_equivocation() {
-        use hyperscale_types::{
-            BeaconBlockHash, GenesisConfigHash, Hash, RecoveryRequest, RecoveryRound, SpcCert,
-            zero_bls_signature,
-        };
-
-        let mut state = single_pool_state(4);
-        state.committee = (0u64..4).map(ValidatorId::new).collect();
-
-        // Request claims anchor at epoch 7; the block sits at genesis
-        // (epoch 0). `block_epoch <= request.last_block_epoch()` means
-        // no semantic contradiction — the verifier rejects.
-        let anchor = BeaconBlockHash::from_raw(Hash::from_bytes(b"anchor"));
-        let request = RecoveryRequest::new(
-            anchor,
-            Epoch::new(7),
-            RecoveryRound::new(1),
-            ValidatorId::new(1),
-            zero_bls_signature(),
-        );
-        let ev = RecoveryEquivocation {
-            validator: ValidatorId::new(1),
-            request,
-            block_epoch: Epoch::GENESIS,
-            block_cert: SpcCert::Genesis {
-                config_hash: GenesisConfigHash::ZERO,
-            },
-        };
-        let w = Witness::Beacon(BeaconWitness::Equivocation {
-            evidence: Box::new(Evidence::Recovery(Box::new(ev))),
-        });
-        let committed = vec![(
-            ValidatorId::new(0),
-            vrf_proposal_with_witnesses(0, state.current_epoch.next(), vec![w]),
-        )];
-        let effects = apply_next_epoch(&mut state, &committed);
-
-        assert!(effects.jailed.is_empty());
         assert!(matches!(
             state.validators.get(&ValidatorId::new(1)).unwrap().status,
             ValidatorStatus::OnShard { .. },

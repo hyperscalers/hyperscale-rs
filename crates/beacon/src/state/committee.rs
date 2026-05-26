@@ -116,10 +116,10 @@ pub(super) fn run_shuffle_step(state: &mut BeaconState) {
 /// stale `OnShard { ready: true }` ids into the sampler.
 ///
 /// `excluded` is the validator set the sampler must skip on top of the
-/// natural [`beacon_eligible`] filter — empty on the normal path,
-/// populated from a
-/// [`RecoveryCertificate`](hyperscale_types::RecoveryCertificate)'s
-/// cumulative exclusions on the recovery path. `cause` tags the
+/// natural [`beacon_eligible`] filter — empty under both the natural
+/// resample and the Skip-cert path; carried so future schedulers that
+/// want to exclude additional validators (e.g. operator-driven
+/// quarantine) have a single seam to plumb through. `cause` tags the
 /// resulting transition.
 pub(super) fn resample_beacon_committee(
     state: &mut BeaconState,

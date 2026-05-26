@@ -17,7 +17,7 @@ pub enum TimerId {
     /// wall-clock boundary if the local vnode is on the next
     /// committee and that block isn't committed yet. Process-scoped.
     BeaconCommitteeStart,
-    /// Beacon skip-trigger timer. Fires `RECOVERY_TIMEOUT` past
+    /// Beacon skip-trigger timer. Fires `SKIP_TIMEOUT` past
     /// the expected block time when the local vnode hasn't observed
     /// the expected commit; the coordinator's `skip_trigger_due` check
     /// reads against this. Process-scoped.

@@ -95,7 +95,6 @@ mod tests {
         Arc::new(CertifiedBeaconBlock::new_unchecked(
             block,
             BeaconCert::Skip(skip_cert),
-            None,
         ))
     }
 

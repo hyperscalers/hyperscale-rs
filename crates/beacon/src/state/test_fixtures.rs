@@ -75,7 +75,6 @@ pub fn empty_state() -> BeaconState {
         committee: Vec::new(),
         shard_committees: BTreeMap::new(),
         consumed_through: BTreeMap::new(),
-        last_recovery_cert: None,
         miss_counters: BTreeMap::new(),
     }
 }
@@ -132,15 +131,7 @@ pub fn apply_next_epoch(
     committed: &[(ValidatorId, BeaconProposal)],
 ) -> SlotEffects {
     let next = state.current_epoch.next();
-    apply_epoch(
-        state,
-        &net(),
-        next,
-        ApplyEpochInput::Normal {
-            committed,
-            recovery_cert: None,
-        },
-    )
+    apply_epoch(state, &net(), next, ApplyEpochInput::Normal { committed })
 }
 
 /// Build a VRF-signed proposal for `id` at `epoch` carrying the given

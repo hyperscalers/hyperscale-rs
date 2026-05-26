@@ -1,9 +1,9 @@
 //! Skip-cert / skip-request verification and assembly helpers.
 //!
-//! Mirrors [`recovery.rs`](crate::recovery) for the skip flow that will
-//! replace recovery in phase 3 of the recovery → skip migration. These
-//! helpers are additive — phase 1 lands them alongside the existing
-//! recovery code without wiring them into the coordinator yet.
+//! `verify_skip_request` checks a single signed request against the
+//! active pool. `verify_skip_cert` checks an aggregated cert against
+//! the same pool. `build_skip_cert` assembles quorum-many requests
+//! into a self-authenticating cert.
 
 use hyperscale_types::{
     BeaconBlockHash, Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature, Epoch,

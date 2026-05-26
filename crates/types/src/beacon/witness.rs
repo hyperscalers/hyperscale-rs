@@ -17,8 +17,8 @@ use sbor::prelude::*;
 
 use crate::{
     BlockHash, BlockHeight, Bls12381G1PublicKey, BoundedVec, Hash, LeafIndex,
-    MAX_WITNESS_PROOF_DEPTH, PcVoteEquivocation, RecoveryEquivocation, Round, ShardGroupId, Stake,
-    StakePoolId, ValidatorId,
+    MAX_WITNESS_PROOF_DEPTH, PcVoteEquivocation, Round, ShardGroupId, Stake, StakePoolId,
+    ValidatorId,
 };
 
 /// Domain tag for accumulator leaf hashing.
@@ -256,30 +256,22 @@ pub struct ShardWitness {
 /// Self-authenticating equivocation evidence — the cryptographic basis
 /// for a [`BeaconWitness::Equivocation`].
 ///
-/// Two flavors:
-///
-/// - [`Self::Recovery`] — a committee member signed both a recovery
-///   request and a finalized block past the request's anchor epoch.
 /// - [`Self::Vote`] — a single validator double-signed at the same
 ///   `(epoch, view, round)` of an inner Prefix Consensus instance.
 ///
-/// Both variants jail the equivocator permanently. Each is boxed so
-/// the enum's stack size stays balanced.
+/// The equivocator is jailed permanently. The variant is boxed so this
+/// evidence enum can grow new variants without shifting stack layout.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub enum EquivocationEvidence {
-    /// Recovery-request / finalized-block contradiction.
-    Recovery(Box<RecoveryEquivocation>),
     /// PC double-sign at the same round.
     Vote(Box<PcVoteEquivocation>),
 }
 
 impl EquivocationEvidence {
-    /// The equivocator's `ValidatorId`. Same field across variants;
-    /// downstream callers (jailing, dedup) just want the id.
+    /// The equivocator's `ValidatorId`.
     #[must_use]
     pub const fn validator(&self) -> ValidatorId {
         match self {
-            Self::Recovery(r) => r.validator,
             Self::Vote(v) => v.validator,
         }
     }
@@ -292,8 +284,7 @@ pub enum BeaconWitness {
     /// Cryptographic equivocation evidence. `apply_epoch` re-runs
     /// verification and jails the equivocator permanently on success.
     Equivocation {
-        /// The underlying evidence — recovery contradiction or PC
-        /// double-sign.
+        /// The underlying evidence — a PC double-sign.
         evidence: Box<EquivocationEvidence>,
     },
 }
@@ -484,65 +475,16 @@ mod tests {
         }
     }
 
-    fn sample_recovery_equivocation() -> RecoveryEquivocation {
-        use crate::{
-            BeaconBlockHash, Bls12381G2Signature, Epoch, Hash, PcQc2, PcQc3, PcSignerLengths,
-            PcVector, PcXpProof, RecoveryRequest, RecoveryRound, SignerBitfield, SpcCert, SpcView,
-        };
-        let mut signers = SignerBitfield::new(4);
-        signers.set(0);
-        signers.set(1);
-        let qc2 = PcQc2::new(
-            PcVector::empty(),
-            signers.clone(),
-            Bls12381G2Signature([0x11; 96]),
-            PcXpProof::Full,
-        );
-        let proof = PcQc3::new(
-            PcVector::empty(),
-            qc2,
-            None,
-            None,
-            signers,
-            PcSignerLengths::Uniform(0),
-            Bls12381G2Signature([0x33; 96]),
-        );
-        RecoveryEquivocation {
-            validator: ValidatorId::new(6),
-            request: RecoveryRequest::new(
-                BeaconBlockHash::from_raw(Hash::from_bytes(b"anchor")),
-                Epoch::new(7),
-                RecoveryRound::new(1),
-                ValidatorId::new(6),
-                Bls12381G2Signature([0x11; 96]),
-            ),
-            block_epoch: Epoch::new(8),
-            block_cert: SpcCert::Direct {
-                prev_view: SpcView::new(1),
-                value: PcVector::empty(),
-                proof,
-            },
-        }
-    }
-
     #[test]
-    fn equivocation_evidence_sbor_round_trip_both_variants() {
-        let variants = vec![
-            EquivocationEvidence::Recovery(Box::new(sample_recovery_equivocation())),
-            EquivocationEvidence::Vote(Box::new(sample_pc_vote_equivocation())),
-        ];
-        for e in variants {
-            let bytes = basic_encode(&e).unwrap();
-            let decoded: EquivocationEvidence = basic_decode(&bytes).unwrap();
-            assert_eq!(e, decoded);
-        }
+    fn equivocation_evidence_sbor_round_trip_vote_variant() {
+        let e = EquivocationEvidence::Vote(Box::new(sample_pc_vote_equivocation()));
+        let bytes = basic_encode(&e).unwrap();
+        let decoded: EquivocationEvidence = basic_decode(&bytes).unwrap();
+        assert_eq!(e, decoded);
     }
 
     #[test]
     fn equivocation_evidence_validator_accessor_returns_inner_validator() {
-        let rec = EquivocationEvidence::Recovery(Box::new(sample_recovery_equivocation()));
-        assert_eq!(rec.validator(), ValidatorId::new(6));
-
         let vote = EquivocationEvidence::Vote(Box::new(sample_pc_vote_equivocation()));
         assert_eq!(vote.validator(), ValidatorId::new(5));
     }
@@ -562,8 +504,8 @@ mod tests {
     #[test]
     fn witness_beacon_variant_sbor_round_trip() {
         let w = Witness::Beacon(BeaconWitness::Equivocation {
-            evidence: Box::new(EquivocationEvidence::Recovery(Box::new(
-                sample_recovery_equivocation(),
+            evidence: Box::new(EquivocationEvidence::Vote(Box::new(
+                sample_pc_vote_equivocation(),
             ))),
         });
         let bytes = basic_encode(&w).unwrap();

@@ -23,7 +23,7 @@ use hyperscale_core::{Action, TimerId};
 use hyperscale_types::{
     BeaconBlock, BeaconCert, BeaconProposal, BeaconState, Bls12381G1PublicKey,
     CertifiedBeaconBlock, EPOCH_DURATION, Epoch, GenesisConfigHash, LeafIndex, LocalTimestamp,
-    MAX_WITNESSES_PER_PROPOSER, NetworkDefinition, PcValueElement, PcVector, RECOVERY_TIMEOUT,
+    MAX_WITNESSES_PER_PROPOSER, NetworkDefinition, PcValueElement, PcVector, SKIP_TIMEOUT,
     ShardGroupId, ShardWitness, SkipEpochCert, SkipRequest, SpcCert, SpcMessage, TopologySnapshot,
     ValidatorId, VpcMsgPayload, WeightedTimestamp, Witness, spc_context, verify_merkle_inclusion,
 };
@@ -55,9 +55,8 @@ pub struct BeaconCoordinator {
     state: BeaconState,
 
     /// Latest committed beacon block paired with its authenticating
-    /// cert. Carried so SPC instance bootstrap can read
-    /// `prev_block_hash` without a storage roundtrip, and so the
-    /// recovery flow has the genesis-config-hash bound on hand.
+    /// cert. Carried so SPC instance bootstrap and skip-cert anchor
+    /// checks read `prev_block_hash` without a storage roundtrip.
     latest_block: Arc<CertifiedBeaconBlock>,
 
     /// `None` between bootstrap and the first epoch-boundary
@@ -188,13 +187,13 @@ impl BeaconCoordinator {
     }
 
     /// Whether the skip-trigger timer is due — i.e. wall-clock time
-    /// has reached `expected_block_time + RECOVERY_TIMEOUT`. The
+    /// has reached `expected_block_time + SKIP_TIMEOUT`. The
     /// runner combines this with its own "expected block hasn't
     /// arrived" + "local on active pool" checks before actually
     /// broadcasting a [`SkipRequest`](hyperscale_types::SkipRequest).
     #[must_use]
     pub fn skip_trigger_due(&self, expected_block_time: LocalTimestamp) -> bool {
-        self.now.as_millis() >= expected_block_time.plus(RECOVERY_TIMEOUT).as_millis()
+        self.now.as_millis() >= expected_block_time.plus(SKIP_TIMEOUT).as_millis()
     }
 
     /// A peer's PC vote arrived. SBOR-decode and route into the
@@ -647,7 +646,7 @@ impl BeaconCoordinator {
         let anchor = self.latest_block.block_hash();
         let epoch_to_skip = cert.epoch_to_skip();
         let block = BeaconBlock::skip(epoch_to_skip, anchor);
-        let certified = CertifiedBeaconBlock::new_unchecked(block, BeaconCert::Skip(cert), None);
+        let certified = CertifiedBeaconBlock::new_unchecked(block, BeaconCert::Skip(cert));
         let block_arc = Arc::new(certified);
 
         // Forget the anchor before adoption advances the tip — once we
@@ -733,7 +732,6 @@ impl BeaconCoordinator {
         let input = match block.cert() {
             BeaconCert::Normal(_) => ApplyEpochInput::Normal {
                 committed: block.block().committed_proposals(),
-                recovery_cert: block.recovery_cert(),
             },
             BeaconCert::Skip(_) => ApplyEpochInput::Skip,
             BeaconCert::Genesis(_) => unreachable!("adopt_block called on genesis"),
@@ -804,7 +802,7 @@ impl BeaconCoordinator {
         let prev_block_hash = self.latest_block.block_hash();
         let block = BeaconBlock::new(epoch, prev_block_hash, committed);
         let certified =
-            CertifiedBeaconBlock::new_unchecked(block, BeaconCert::Normal(Box::new(cert)), None);
+            CertifiedBeaconBlock::new_unchecked(block, BeaconCert::Normal(Box::new(cert)));
         let block_arc = Arc::new(certified);
 
         // Advance state via the shared adoption path.
@@ -1160,10 +1158,10 @@ mod tests {
     fn skip_trigger_due_fires_one_timeout_past_expected() {
         let mut coord = fresh_coord();
         let expected = LocalTimestamp::from_millis(100_000);
-        let timeout_ms: u64 = RECOVERY_TIMEOUT
+        let timeout_ms: u64 = SKIP_TIMEOUT
             .as_millis()
             .try_into()
-            .expect("RECOVERY_TIMEOUT fits in u64 millis");
+            .expect("SKIP_TIMEOUT fits in u64 millis");
 
         coord.set_now(LocalTimestamp::from_millis(100_000 + timeout_ms - 1));
         assert!(!coord.skip_trigger_due(expected));
@@ -1554,7 +1552,6 @@ mod tests {
         Arc::new(CertifiedBeaconBlock::new_unchecked(
             block,
             BeaconCert::Normal(Box::new(cert)),
-            None,
         ))
     }
 

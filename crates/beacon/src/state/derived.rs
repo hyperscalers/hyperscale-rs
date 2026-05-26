@@ -197,10 +197,11 @@ pub fn derive_topology_snapshot(
 /// on any shard, paired with their pubkey. Returned in `BTreeMap`
 /// iteration order over `state.validators` (sorted by `ValidatorId`).
 ///
-/// This is the quorum substrate for recovery: `RecoveryRequest`s are
-/// signed by members of this pool and assembled into a
-/// `RecoveryCertificate` whose `signers` bitfield is positionally
-/// indexed against the same ordering.
+/// This is the quorum substrate for [skip](crate::skip):
+/// [`SkipRequest`](hyperscale_types::SkipRequest)s are signed by
+/// members of this pool and assembled into a
+/// [`SkipEpochCert`](hyperscale_types::SkipEpochCert) whose `signers`
+/// bitfield is positionally indexed against the same ordering.
 #[must_use]
 pub fn derive_active_pool(state: &BeaconState) -> Vec<(ValidatorId, Bls12381G1PublicKey)> {
     state
