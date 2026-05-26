@@ -156,14 +156,24 @@ where
         Action::BroadcastBeaconBlock { block } => {
             warn!(epoch = block.epoch().inner(), "BroadcastBeaconBlock");
         }
-        Action::BroadcastRecoveryRequest {
+        Action::BroadcastSkipRequest {
             request,
             recipients: _,
         } => {
             warn!(
-                anchor_epoch = request.last_block_epoch().inner(),
-                round = request.recovery_round().inner(),
-                "BroadcastRecoveryRequest",
+                epoch_to_skip = request.epoch_to_skip().inner(),
+                signer = ?request.signer(),
+                "BroadcastSkipRequest",
+            );
+        }
+        Action::BroadcastSkipCert {
+            cert,
+            recipients: _,
+        } => {
+            warn!(
+                epoch_to_skip = cert.epoch_to_skip().inner(),
+                signer_count = cert.signer_count(),
+                "BroadcastSkipCert",
             );
         }
         Action::FetchShardWitnesses {

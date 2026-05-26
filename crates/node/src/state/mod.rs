@@ -269,11 +269,12 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::SpcMessageReceived { .. }
             | ProtocolEvent::BeaconBlockReceived { .. }
             | ProtocolEvent::BeaconProposalReceived { .. }
-            | ProtocolEvent::RecoveryRequestReceived { .. }
+            | ProtocolEvent::SkipRequestReceived { .. }
+            | ProtocolEvent::SkipCertReceived { .. }
             | ProtocolEvent::ShardWitnessesReceived { .. }
             | ProtocolEvent::BeaconVerificationResult { .. }
             | ProtocolEvent::BeaconCommitteeStartTimer
-            | ProtocolEvent::BeaconRecoveryTimer
+            | ProtocolEvent::BeaconSkipTimer
             | ProtocolEvent::BeaconSpcViewTimer
             | ProtocolEvent::BeaconBlockPersisted { .. } => Vec::new(),
         };

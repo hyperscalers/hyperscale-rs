@@ -13,6 +13,10 @@
 
 mod beacon_block;
 mod recovery_request;
+mod skip_cert;
+mod skip_request;
 
 pub use beacon_block::BeaconBlockGossip;
 pub use recovery_request::RecoveryRequestGossip;
+pub use skip_cert::SkipCertGossip;
+pub use skip_request::SkipRequestGossip;

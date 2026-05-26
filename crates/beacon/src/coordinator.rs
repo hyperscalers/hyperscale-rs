@@ -24,9 +24,8 @@ use hyperscale_types::{
     BeaconBlock, BeaconCert, BeaconProposal, BeaconState, Bls12381G1PublicKey,
     CertifiedBeaconBlock, EPOCH_DURATION, Epoch, GenesisConfigHash, LeafIndex, LocalTimestamp,
     MAX_WITNESSES_PER_PROPOSER, NetworkDefinition, PcValueElement, PcVector, RECOVERY_TIMEOUT,
-    RecoveryCertificate, RecoveryRequest, ShardGroupId, ShardWitness, SpcCert, SpcMessage,
-    TopologySnapshot, ValidatorId, VpcMsgPayload, WeightedTimestamp, Witness,
-    recovery_request_message, spc_context, verify_bls12381_v1, verify_merkle_inclusion,
+    ShardGroupId, ShardWitness, SkipEpochCert, SkipRequest, SpcCert, SpcMessage, TopologySnapshot,
+    ValidatorId, VpcMsgPayload, WeightedTimestamp, Witness, spc_context, verify_merkle_inclusion,
 };
 use tracing::{trace, warn};
 
@@ -35,12 +34,12 @@ use crate::constants::SPC_VIEW_TIMEOUT;
 use crate::equivocations::EquivocationObservations;
 use crate::pending_blocks::PendingBeaconBlocks;
 use crate::proposal_pool::BeaconProposalPool;
-use crate::recovery::verify_recovery_cert;
-use crate::recovery_tracker::RecoveryTracker;
+use crate::skip::{verify_skip_cert, verify_skip_request};
+use crate::skip_tracker::SkipTracker;
 use crate::spc::{SpcEffect, SpcEvent, SpcInstance, verify_block_cert};
 use crate::state::{
-    ApplyEpochInput, apply_epoch, apply_recovery_or_resample, derive_active_pool,
-    derive_beacon_committee, derive_topology_snapshot,
+    ApplyEpochInput, apply_epoch, derive_active_pool, derive_beacon_committee,
+    derive_topology_snapshot,
 };
 use crate::verification::BeaconVerificationPipeline;
 use crate::witness_fetcher::ShardWitnessFetchTracker;
@@ -80,9 +79,10 @@ pub struct BeaconCoordinator {
     /// witness drain.
     witness_fetcher: ShardWitnessFetchTracker,
 
-    /// Buckets observed recovery requests and aggregates them into
-    /// a `RecoveryCertificate` once quorum lands.
-    recovery_tracker: RecoveryTracker,
+    /// Buckets observed [`SkipRequest`]s and aggregates them into a
+    /// [`SkipEpochCert`](hyperscale_types::SkipEpochCert) once
+    /// ⌈2M/3⌉ + 1 active-pool quorum lands.
+    skip_tracker: SkipTracker,
 
     /// Equivocation evidence the local vnode has observed but not
     /// yet proposed for inclusion.
@@ -96,12 +96,6 @@ pub struct BeaconCoordinator {
     /// Scoped to the in-flight epoch (`state.current_epoch.next()`);
     /// reset on commit.
     proposal_pool: BeaconProposalPool,
-
-    /// Assembled-but-not-yet-applied `RecoveryCertificate`. Set when
-    /// `on_recovery_request_received` lands quorum at the local tip's
-    /// anchor; consumed by the next block construction so the cert
-    /// rides on-chain and `apply_epoch` resamples the committee.
-    pending_recovery_cert: Option<RecoveryCertificate>,
 
     /// Read-only topology view derived from the current `BeaconState`.
     /// Refreshed on every `adopt_block` so consumers (shard
@@ -158,11 +152,10 @@ impl BeaconCoordinator {
             pending_blocks: PendingBeaconBlocks::new(),
             verification: BeaconVerificationPipeline::new(),
             witness_fetcher: ShardWitnessFetchTracker::new(),
-            recovery_tracker: RecoveryTracker::new(),
+            skip_tracker: SkipTracker::new(),
             equivocations: EquivocationObservations::new(),
             sync: BeaconBlockSyncManager::new(),
             proposal_pool: BeaconProposalPool::new(next_epoch),
-            pending_recovery_cert: None,
             topology_snapshot,
             me,
             network,
@@ -194,13 +187,13 @@ impl BeaconCoordinator {
         self.now.as_millis() >= epoch_boundary.as_millis()
     }
 
-    /// Whether the recovery-trigger timer is due — i.e. wall-clock
-    /// time has reached `expected_block_time + RECOVERY_TIMEOUT`.
-    /// The runner combines this with its own "expected block hasn't
+    /// Whether the skip-trigger timer is due — i.e. wall-clock time
+    /// has reached `expected_block_time + RECOVERY_TIMEOUT`. The
+    /// runner combines this with its own "expected block hasn't
     /// arrived" + "local on active pool" checks before actually
-    /// broadcasting a `RecoveryRequest`.
+    /// broadcasting a [`SkipRequest`](hyperscale_types::SkipRequest).
     #[must_use]
-    pub fn recovery_trigger_due(&self, expected_block_time: LocalTimestamp) -> bool {
+    pub fn skip_trigger_due(&self, expected_block_time: LocalTimestamp) -> bool {
         self.now.as_millis() >= expected_block_time.plus(RECOVERY_TIMEOUT).as_millis()
     }
 
@@ -409,25 +402,6 @@ impl BeaconCoordinator {
         self.bootstrap_spc_with_committee(committee);
     }
 
-    /// Stand up a fresh [`SpcInstance`] for the upcoming epoch under
-    /// the recovery-resampled committee implied by `cert` and the
-    /// current state. Used after `on_recovery_request_received`
-    /// gathers quorum at the local tip: the old committee is dead,
-    /// the new one is what the cert's `excluded_validators` carves
-    /// out of the active pool.
-    ///
-    /// Derives the committee by cloning state and running
-    /// [`apply_recovery_or_resample`](crate::state::apply_recovery_or_resample)
-    /// against the clone — no state mutation here, the real
-    /// resample lands inside [`apply_epoch`] when this SPC's
-    /// `OutputHigh` produces a block carrying the cert.
-    fn bootstrap_spc_with_recovery(&mut self, cert: &RecoveryCertificate) {
-        let mut tentative = self.state.clone();
-        let _ = apply_recovery_or_resample(&mut tentative, &self.network, Some(cert));
-        let committee = derive_beacon_committee(&tentative);
-        self.bootstrap_spc_with_committee(committee);
-    }
-
     fn bootstrap_spc_with_committee(&mut self, committee: Vec<(ValidatorId, Bls12381G1PublicKey)>) {
         let next_epoch = self.state.current_epoch.next();
         self.spc = Some(SpcInstance::new(
@@ -442,9 +416,26 @@ impl BeaconCoordinator {
     /// Drive `event` through the current `SpcInstance` and lift the
     /// resulting effects. The `from` argument is logged on the
     /// not-bootstrapped path so dropped messages are attributable.
+    ///
+    /// Skip-quorum gate: if the local node has already observed the
+    /// ⌈2M/3⌉ + 1 active-pool quorum to skip
+    /// `current_epoch.next()` at the local tip, drop the event
+    /// without dispatching. The SPC instance for the abandoned epoch
+    /// can't reach `n - f` once the pool has committed to skipping;
+    /// continued dispatch would just produce wasted work and admit
+    /// equivocation patterns the per-FSM detector doesn't catch.
+    /// Query-based, not state-based — `self.spc` stays `Some` until
+    /// ordinary `adopt_block` teardown clears it.
     fn dispatch_spc_event(&mut self, from: ValidatorId, event: SpcEvent) -> Vec<Action> {
         if self.spc.is_none() {
             trace!(?from, "SPC event received but no SPC instance bootstrapped");
+            return Vec::new();
+        }
+        if self.skip_quorum_at_tip() {
+            trace!(
+                ?from,
+                "SPC event received but skip-quorum reached at local tip — dropping",
+            );
             return Vec::new();
         }
         let recipients = self.spc_recipients();
@@ -452,6 +443,17 @@ impl BeaconCoordinator {
         let epoch = spc.epoch();
         let effects = spc.handle(event);
         self.lift_spc_effects(epoch, &recipients, effects)
+    }
+
+    /// Whether the skip tracker has accumulated quorum to abandon
+    /// `current_epoch.next()` at the local tip's anchor.
+    fn skip_quorum_at_tip(&self) -> bool {
+        let active_pool_size = derive_active_pool(&self.state).len();
+        self.skip_tracker.quorum_reached(
+            self.latest_block.block_hash(),
+            self.state.current_epoch.next(),
+            active_pool_size,
+        )
     }
 
     /// A peer-aggregated [`BeaconBlock`] arrived via the beacon gossip
@@ -493,22 +495,40 @@ impl BeaconCoordinator {
             );
             return Vec::new();
         }
-        // Verify the cert under the current beacon committee (which is
-        // the committee active for this incoming block's epoch).
-        let committee = derive_beacon_committee(&self.state);
-        let spc_ctx = spc_context(epoch);
-        let spc_cert = match block.cert() {
-            BeaconCert::Normal(c) => c,
-            BeaconCert::Skip(_) => {
-                // Skip-cert verification lands in phase 3 alongside the
-                // coordinator switchover. For now, dropping unverified
-                // skip blocks is safe — recovery flow still drives
-                // committee replacement.
-                warn!(
-                    epoch = epoch.inner(),
-                    "BeaconBlockReceived with Skip cert — phase 3 wiring not yet present, dropping",
-                );
-                return Vec::new();
+        // Verify the cert. Normal blocks: SPC cert under the current
+        // beacon committee (which is the committee active for this
+        // incoming block's epoch). Skip blocks: pool-quorum cert under
+        // the current active pool.
+        match block.cert() {
+            BeaconCert::Normal(spc_cert) => {
+                let committee = derive_beacon_committee(&self.state);
+                let spc_ctx = spc_context(epoch);
+                if !verify_block_cert(spc_cert, &self.network, &spc_ctx, &committee) {
+                    warn!(
+                        epoch = epoch.inner(),
+                        "BeaconBlockReceived cert verification failed — dropping",
+                    );
+                    return Vec::new();
+                }
+            }
+            BeaconCert::Skip(skip_cert) => {
+                if skip_cert.anchor_hash() != self.latest_block.block_hash()
+                    || skip_cert.epoch_to_skip() != epoch
+                {
+                    warn!(
+                        epoch = epoch.inner(),
+                        "BeaconBlockReceived Skip cert anchor/epoch mismatch — dropping",
+                    );
+                    return Vec::new();
+                }
+                let active_pool = derive_active_pool(&self.state);
+                if !verify_skip_cert(skip_cert, &self.network, &active_pool) {
+                    warn!(
+                        epoch = epoch.inner(),
+                        "BeaconBlockReceived Skip cert verification failed — dropping",
+                    );
+                    return Vec::new();
+                }
             }
             BeaconCert::Genesis(_) => {
                 warn!(
@@ -517,13 +537,6 @@ impl BeaconCoordinator {
                 );
                 return Vec::new();
             }
-        };
-        if !verify_block_cert(spc_cert, &self.network, &spc_ctx, &committee) {
-            warn!(
-                epoch = epoch.inner(),
-                "BeaconBlockReceived cert verification failed — dropping",
-            );
-            return Vec::new();
         }
 
         // If our local SPC already produced an OutputHigh, the peer's
@@ -532,114 +545,118 @@ impl BeaconCoordinator {
         self.adopt_block(block)
     }
 
-    /// A peer's [`RecoveryRequest`] arrived via gossip. Validate it,
-    /// admit it to the [`RecoveryTracker`], and — on quorum at the
-    /// local tip's anchor — assemble + self-verify a
-    /// [`RecoveryCertificate`], stash it for the next block
-    /// construction, and tear down the current SPC instance.
+    /// A peer's [`SkipRequest`] arrived via gossip. Validate it, admit
+    /// it to the [`SkipTracker`], and — on quorum at the local tip's
+    /// anchor — assemble a [`SkipEpochCert`](hyperscale_types::SkipEpochCert),
+    /// build the skip block, broadcast it, and adopt locally.
     ///
     /// Validation:
-    /// - Anchor must equal `(latest_block.block_hash(),
-    ///   latest_block.epoch())`. Requests pinning a different anchor
-    ///   are either stale or for a chain head we haven't seen.
+    /// - Anchor must equal `latest_block.block_hash()`. Requests
+    ///   pinning a different anchor are stale or for a chain head we
+    ///   haven't seen.
+    /// - `epoch_to_skip` must equal `current_epoch.next()` — the
+    ///   in-flight epoch.
     /// - Signer must sit in the active-duty pool
     ///   ([`derive_active_pool`]).
     /// - BLS sig must verify against the canonical
-    ///   [`recovery_request_message`] under the signer's pubkey.
-    ///
-    /// Cert assembly is round-0 only here:
-    /// `excluded_validators = vec![]`. Multi-round recovery with
-    /// cumulative exclusions is a follow-up; reaching round > 0 in
-    /// production means recovery itself stalled, which the chain
-    /// treats as catastrophic anyway.
-    ///
-    /// Bootstrap with the recovery-resampled committee and
-    /// cert-into-block at `on_spc_output_high` are deliberate
-    /// follow-ups — the cert sits in `pending_recovery_cert` until
-    /// those land, so a recovery event today stashes evidence but
-    /// doesn't progress the chain on its own.
-    pub fn on_recovery_request_received(&mut self, request: &RecoveryRequest) -> Vec<Action> {
-        if request.last_block_hash() != self.latest_block.block_hash()
-            || request.last_block_epoch() != self.latest_block.epoch()
-        {
+    ///   [`skip_request_message`](hyperscale_types::skip_request_message)
+    ///   under the signer's pubkey.
+    pub fn on_skip_request_received(&mut self, request: SkipRequest) -> Vec<Action> {
+        if request.anchor_hash() != self.latest_block.block_hash() {
             trace!(
                 signer = ?request.signer(),
-                anchor_epoch = request.last_block_epoch().inner(),
-                "RecoveryRequest at unknown anchor — dropping",
+                "SkipRequest at unknown anchor — dropping",
+            );
+            return Vec::new();
+        }
+        let expected_epoch = self.state.current_epoch.next();
+        if request.epoch_to_skip() != expected_epoch {
+            trace!(
+                signer = ?request.signer(),
+                epoch_to_skip = request.epoch_to_skip().inner(),
+                expected = expected_epoch.inner(),
+                "SkipRequest at unexpected epoch — dropping",
             );
             return Vec::new();
         }
 
         let active_pool = derive_active_pool(&self.state);
-        let Some(signer_pk) = active_pool
-            .iter()
-            .find(|(id, _)| *id == request.signer())
-            .map(|(_, pk)| *pk)
+        if !verify_skip_request(&request, &self.network, &active_pool) {
+            warn!(
+                signer = ?request.signer(),
+                "SkipRequest verification failed — dropping",
+            );
+            return Vec::new();
+        }
+
+        if !self.skip_tracker.observe(request) {
+            return Vec::new();
+        }
+
+        let anchor = self.latest_block.block_hash();
+        if !self
+            .skip_tracker
+            .quorum_reached(anchor, expected_epoch, active_pool.len())
+        {
+            return Vec::new();
+        }
+
+        // Quorum reached at the local tip — assemble the cert, build
+        // the skip block, adopt it, and broadcast for peers.
+        let Some(cert) = self
+            .skip_tracker
+            .try_assemble(anchor, expected_epoch, &active_pool)
         else {
+            warn!("SkipTracker quorum reached but try_assemble returned None");
+            return Vec::new();
+        };
+        self.commit_skip_block(cert)
+    }
+
+    /// A peer-assembled [`SkipEpochCert`](hyperscale_types::SkipEpochCert)
+    /// arrived via gossip. Verify it against the local active pool;
+    /// on success, build + adopt the skip block (idempotent: ignored
+    /// if the local tip has already advanced past the cert's epoch).
+    pub fn on_skip_cert_received(&mut self, cert: SkipEpochCert) -> Vec<Action> {
+        if cert.anchor_hash() != self.latest_block.block_hash() {
+            trace!("SkipCert at unknown anchor — dropping");
+            return Vec::new();
+        }
+        let expected_epoch = self.state.current_epoch.next();
+        if cert.epoch_to_skip() != expected_epoch {
             trace!(
-                signer = ?request.signer(),
-                "RecoveryRequest from non-active-pool signer — dropping",
-            );
-            return Vec::new();
-        };
-
-        let msg = recovery_request_message(
-            &self.network,
-            &request.last_block_hash(),
-            request.last_block_epoch(),
-            request.recovery_round(),
-        );
-        if !verify_bls12381_v1(&msg, &signer_pk, &request.sig()) {
-            warn!(
-                signer = ?request.signer(),
-                "RecoveryRequest sig verification failed — dropping",
+                epoch_to_skip = cert.epoch_to_skip().inner(),
+                expected = expected_epoch.inner(),
+                "SkipCert at unexpected epoch — dropping",
             );
             return Vec::new();
         }
-
-        if !self.recovery_tracker.observe(request) {
+        let active_pool = derive_active_pool(&self.state);
+        if !verify_skip_cert(&cert, &self.network, &active_pool) {
+            warn!("SkipCert verification failed — dropping");
             return Vec::new();
         }
+        self.commit_skip_block(cert)
+    }
 
-        if self.pending_recovery_cert.is_some() {
-            return Vec::new();
-        }
+    /// Build the skip block paired with `cert`, adopt it via the
+    /// shared adoption path, and emit a broadcast so peers converge.
+    /// Also forgets the anchor in the local `SkipTracker` so it doesn't
+    /// keep accumulating stale buckets.
+    fn commit_skip_block(&mut self, cert: SkipEpochCert) -> Vec<Action> {
+        let anchor = self.latest_block.block_hash();
+        let epoch_to_skip = cert.epoch_to_skip();
+        let block = BeaconBlock::skip(epoch_to_skip, anchor);
+        let certified = CertifiedBeaconBlock::new_unchecked(block, BeaconCert::Skip(cert), None);
+        let block_arc = Arc::new(certified);
 
-        let Some(cert) = self.recovery_tracker.try_assemble(
-            request.last_block_hash(),
-            request.last_block_epoch(),
-            request.recovery_round(),
-            &active_pool,
-            Vec::new(),
-        ) else {
-            return Vec::new();
-        };
+        // Forget the anchor before adoption advances the tip — once we
+        // commit, further requests at the now-prior anchor are stale.
+        self.skip_tracker.forget_anchor(anchor);
 
-        if !verify_recovery_cert(
-            &cert,
-            &self.network,
-            &active_pool,
-            self.state.last_recovery_cert.as_ref(),
-        ) {
-            warn!(
-                round = request.recovery_round().inner(),
-                "assembled RecoveryCertificate failed self-verify — dropping",
-            );
-            return Vec::new();
-        }
-
-        // Tear down the old (stalled) SPC and stand up a new one
-        // running under the recovery-resampled committee. Subsequent
-        // PC/SPC traffic from members of the old committee that
-        // aren't in the new one will fail the cert verifier's
-        // `pubkey_in_committee` lookup and bounce harmlessly.
-        let cert_for_bootstrap = cert.clone();
-        self.pending_recovery_cert = Some(cert);
-        self.spc = None;
-        self.recovery_tracker
-            .forget_anchor(request.last_block_hash(), request.last_block_epoch());
-        self.bootstrap_spc_with_recovery(&cert_for_bootstrap);
-        Vec::new()
+        let mut actions = self.adopt_block(Arc::clone(&block_arc));
+        actions.push(Action::BroadcastBeaconBlock { block: block_arc });
+        actions
     }
 
     /// A shard-witness fetch response arrived. For each witness:
@@ -784,14 +801,10 @@ impl BeaconCoordinator {
         _recipients: &[ValidatorId],
     ) -> Vec<Action> {
         let committed = self.decode_committed_proposals(epoch, output);
-        let recovery_cert = self.pending_recovery_cert.take();
         let prev_block_hash = self.latest_block.block_hash();
         let block = BeaconBlock::new(epoch, prev_block_hash, committed);
-        let certified = CertifiedBeaconBlock::new_unchecked(
-            block,
-            BeaconCert::Normal(Box::new(cert)),
-            recovery_cert,
-        );
+        let certified =
+            CertifiedBeaconBlock::new_unchecked(block, BeaconCert::Normal(Box::new(cert)), None);
         let block_arc = Arc::new(certified);
 
         // Advance state via the shared adoption path.
@@ -975,11 +988,6 @@ impl BeaconCoordinator {
     }
 
     #[must_use]
-    pub const fn has_pending_recovery_cert(&self) -> bool {
-        self.pending_recovery_cert.is_some()
-    }
-
-    #[must_use]
     pub const fn current_topology_snapshot(&self) -> &Arc<TopologySnapshot> {
         &self.topology_snapshot
     }
@@ -998,11 +1006,7 @@ impl std::fmt::Debug for BeaconCoordinator {
                 &self.verification.in_flight_count(),
             )
             .field("witness_pool", &self.witness_fetcher.total_pool_len())
-            .field("recovery_buckets", &self.recovery_tracker.bucket_count())
-            .field(
-                "pending_recovery_cert",
-                &self.pending_recovery_cert.is_some(),
-            )
+            .field("skip_buckets", &self.skip_tracker.bucket_count())
             .field("equivocations", &self.equivocations.len())
             .field("syncing", &self.sync.is_syncing())
             .finish_non_exhaustive()
@@ -1016,9 +1020,9 @@ mod tests {
     use hyperscale_types::{
         BeaconBlock, BeaconBlockHash, BeaconGenesisConfig, Bls12381G1PrivateKey,
         Bls12381G1PublicKey, CommittedBlockHeader, Epoch, GenesisConfigHash, GenesisPool,
-        GenesisValidator, NetworkDefinition, PcVector, Randomness, RecoveryRound, ShardGroupId,
-        ShardWitness, SpcCert, SpcView, Stake, StakePoolId, ValidatorId, bls_keypair_from_seed,
-        genesis_config_hash, pc_context, recovery_request_message, spc_context,
+        GenesisValidator, NetworkDefinition, PcVector, Randomness, ShardGroupId, ShardWitness,
+        SpcCert, SpcView, Stake, StakePoolId, ValidatorId, bls_keypair_from_seed,
+        genesis_config_hash, pc_context, spc_context,
     };
 
     use super::*;
@@ -1153,7 +1157,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_trigger_due_fires_one_timeout_past_expected() {
+    fn skip_trigger_due_fires_one_timeout_past_expected() {
         let mut coord = fresh_coord();
         let expected = LocalTimestamp::from_millis(100_000);
         let timeout_ms: u64 = RECOVERY_TIMEOUT
@@ -1162,9 +1166,9 @@ mod tests {
             .expect("RECOVERY_TIMEOUT fits in u64 millis");
 
         coord.set_now(LocalTimestamp::from_millis(100_000 + timeout_ms - 1));
-        assert!(!coord.recovery_trigger_due(expected));
+        assert!(!coord.skip_trigger_due(expected));
         coord.set_now(LocalTimestamp::from_millis(100_000 + timeout_ms));
-        assert!(coord.recovery_trigger_due(expected));
+        assert!(coord.skip_trigger_due(expected));
     }
 
     #[test]
@@ -1724,242 +1728,209 @@ mod tests {
         assert_eq!(coord.latest_block.epoch(), in_flight);
     }
 
-    /// Build a real (anchor, epoch, round) recovery request signed by
-    /// validator `seed`'s key. The signed message is the canonical
-    /// [`recovery_request_message`]; the request lives behind an
-    /// `Arc` to match the `ProtocolEvent::RecoveryRequestReceived`
-    /// wire shape.
-    fn signed_recovery_request(
+    /// Build a real skip request signed by validator `seed`'s key.
+    fn signed_skip_request(
         seed: u64,
         validator: ValidatorId,
         anchor_hash: BeaconBlockHash,
-        anchor_epoch: Epoch,
-        round: RecoveryRound,
-    ) -> Arc<RecoveryRequest> {
+        epoch_to_skip: Epoch,
+    ) -> SkipRequest {
+        use crate::skip::sign_skip_request;
         let sk = keypair(seed);
         let net = NetworkDefinition::simulator();
-        let msg = recovery_request_message(&net, &anchor_hash, anchor_epoch, round);
-        let sig = sk.sign_v1(&msg);
-        Arc::new(RecoveryRequest::new(
-            anchor_hash,
-            anchor_epoch,
-            round,
-            validator,
-            sig,
-        ))
+        sign_skip_request(&sk, validator, &net, anchor_hash, epoch_to_skip)
     }
 
     #[test]
-    fn on_recovery_request_drops_at_wrong_anchor() {
+    fn on_skip_request_drops_at_wrong_anchor() {
         let mut coord = fresh_coord();
-        // Anchor doesn't match local tip (we're at genesis, anchor is
-        // the zero hash — but `last_block_epoch` is 99).
-        let req = signed_recovery_request(
+        // Wrong anchor: zero hash isn't the local tip.
+        let req = signed_skip_request(
+            0,
+            ValidatorId::new(0),
+            BeaconBlockHash::ZERO,
+            coord.state.current_epoch.next(),
+        );
+        let actions = coord.on_skip_request_received(req);
+        assert!(actions.is_empty());
+        assert_eq!(coord.skip_tracker.bucket_count(), 0);
+    }
+
+    #[test]
+    fn on_skip_request_drops_at_wrong_epoch() {
+        let mut coord = fresh_coord();
+        // Right anchor, wrong epoch_to_skip (we expect current.next()).
+        let req = signed_skip_request(
             0,
             ValidatorId::new(0),
             coord.latest_block.block_hash(),
             Epoch::new(99),
-            RecoveryRound::INITIAL,
         );
-        let actions = coord.on_recovery_request_received(&req);
+        let actions = coord.on_skip_request_received(req);
         assert!(actions.is_empty());
-        assert!(coord.pending_recovery_cert.is_none());
-        assert_eq!(coord.recovery_tracker.bucket_count(), 0);
+        assert_eq!(coord.skip_tracker.bucket_count(), 0);
     }
 
     #[test]
-    fn on_recovery_request_drops_non_pool_signer() {
+    fn on_skip_request_drops_non_pool_signer() {
         let mut coord = fresh_coord();
-        // Signer 99 isn't in the active pool.
-        let req = signed_recovery_request(
+        let req = signed_skip_request(
             99,
             ValidatorId::new(99),
             coord.latest_block.block_hash(),
-            coord.latest_block.epoch(),
-            RecoveryRound::INITIAL,
+            coord.state.current_epoch.next(),
         );
-        let actions = coord.on_recovery_request_received(&req);
+        let actions = coord.on_skip_request_received(req);
         assert!(actions.is_empty());
-        assert!(coord.pending_recovery_cert.is_none());
-        assert_eq!(coord.recovery_tracker.bucket_count(), 0);
+        assert_eq!(coord.skip_tracker.bucket_count(), 0);
     }
 
     #[test]
-    fn on_recovery_request_drops_invalid_sig() {
+    fn on_skip_request_drops_invalid_sig() {
         use hyperscale_types::Bls12381G2Signature;
         let mut coord = fresh_coord();
-        // Signer 0 is in the pool, but the sig is all-zeros — won't
-        // verify under any pubkey.
-        let req = Arc::new(RecoveryRequest::new(
+        // Signer 0 is in the pool, but sig is all-zeros — won't verify.
+        let req = SkipRequest::new(
             coord.latest_block.block_hash(),
-            coord.latest_block.epoch(),
-            RecoveryRound::INITIAL,
+            coord.state.current_epoch.next(),
             ValidatorId::new(0),
             Bls12381G2Signature([0u8; 96]),
-        ));
-        let actions = coord.on_recovery_request_received(&req);
+        );
+        let actions = coord.on_skip_request_received(req);
         assert!(actions.is_empty());
-        assert!(coord.pending_recovery_cert.is_none());
-        assert_eq!(coord.recovery_tracker.bucket_count(), 0);
+        assert_eq!(coord.skip_tracker.bucket_count(), 0);
     }
 
     #[test]
-    fn on_recovery_request_admits_valid_request_below_quorum() {
+    fn on_skip_request_admits_valid_request_below_quorum() {
         let mut coord = fresh_coord();
         coord.bootstrap_spc_for_next_epoch();
-        let anchor_hash = coord.latest_block.block_hash();
-        let anchor_epoch = coord.latest_block.epoch();
-        let req = signed_recovery_request(
-            0,
-            ValidatorId::new(0),
-            anchor_hash,
-            anchor_epoch,
-            RecoveryRound::INITIAL,
-        );
-        let actions = coord.on_recovery_request_received(&req);
+        let anchor = coord.latest_block.block_hash();
+        let epoch_to_skip = coord.state.current_epoch.next();
+        let req = signed_skip_request(0, ValidatorId::new(0), anchor, epoch_to_skip);
+        let actions = coord.on_skip_request_received(req);
         assert!(actions.is_empty());
-        // The observation landed in the tracker.
         assert_eq!(
-            coord
-                .recovery_tracker
-                .signer_count(anchor_hash, anchor_epoch, RecoveryRound::INITIAL),
+            coord.skip_tracker.signer_count(anchor, epoch_to_skip),
             1,
+            "request must land in the tracker",
         );
-        // n=4 quorum is ⌈8/3⌉+1 = 4 — single sig is short.
-        assert!(coord.pending_recovery_cert.is_none());
-        // SPC instance still running.
-        assert!(coord.spc.is_some());
+        // n=4 → quorum is ⌈8/3⌉+1 = 4. One sig is below.
+        assert!(coord.spc.is_some(), "SPC still running below quorum");
     }
 
+    /// Reaching skip-quorum at the local tip builds + adopts the skip
+    /// block, broadcasts it, advances the epoch counter, and clears
+    /// the SPC instance for the abandoned epoch (the next epoch's SPC
+    /// bootstraps on adoption since the local node remains on the
+    /// committee).
     #[test]
-    fn on_recovery_request_assembles_cert_and_swaps_spc_for_recovery_committee() {
+    fn on_skip_request_assembles_cert_and_adopts_skip_block_on_quorum() {
         let mut coord = fresh_coord();
         coord.bootstrap_spc_for_next_epoch();
-        let old_spc_epoch = coord.spc.as_ref().unwrap().epoch();
-        let anchor_hash = coord.latest_block.block_hash();
-        let anchor_epoch = coord.latest_block.epoch();
+        let anchor = coord.latest_block.block_hash();
+        let epoch_to_skip = coord.state.current_epoch.next();
+        let n = coord.state.committee.len();
 
-        for i in 0..4 {
-            let req = signed_recovery_request(
-                i,
-                ValidatorId::new(i),
-                anchor_hash,
-                anchor_epoch,
-                RecoveryRound::INITIAL,
-            );
-            let _ = coord.on_recovery_request_received(&req);
-        }
-
-        assert!(coord.has_pending_recovery_cert());
-        let cert = coord.pending_recovery_cert.as_ref().unwrap();
-        assert_eq!(cert.last_block_hash(), anchor_hash);
-        assert_eq!(cert.last_block_epoch(), anchor_epoch);
-        assert_eq!(cert.recovery_round(), RecoveryRound::INITIAL);
-        assert_eq!(cert.signer_count(), 4);
-        // Old SPC dropped; new one bootstrapped under the
-        // recovery-resampled committee for the same epoch.
-        let new_spc = coord
-            .spc
-            .as_ref()
-            .expect("recovery-bootstrapped SPC should be present");
-        assert_eq!(new_spc.epoch(), old_spc_epoch);
-        // Anchor bucket dropped from the tracker.
-        assert_eq!(coord.recovery_tracker.bucket_count(), 0);
-    }
-
-    #[test]
-    fn output_high_attaches_pending_recovery_cert_to_block() {
-        let mut coord = fresh_coord();
-        coord.bootstrap_spc_for_next_epoch();
-        let in_flight = Epoch::GENESIS.next();
-        let committee = coord.state.committee.clone();
-        let n = committee.len();
-
-        // Build a real cert via the recovery-tracker assembly path so
-        // the produced cert verifies under the active pool.
-        let anchor_hash = coord.latest_block.block_hash();
-        let anchor_epoch = coord.latest_block.epoch();
+        let mut emitted: Vec<Action> = Vec::new();
         for i in 0..u64::try_from(n).unwrap() {
-            let req = signed_recovery_request(
-                i,
-                ValidatorId::new(i),
-                anchor_hash,
-                anchor_epoch,
-                RecoveryRound::INITIAL,
-            );
-            let _ = coord.on_recovery_request_received(&req);
+            let req = signed_skip_request(i, ValidatorId::new(i), anchor, epoch_to_skip);
+            emitted.extend(coord.on_skip_request_received(req));
         }
-        assert!(coord.has_pending_recovery_cert());
-        let expected_cert = coord.pending_recovery_cert.clone().unwrap();
 
-        // Drive OutputHigh on the recovery-bootstrapped SPC.
-        let mut elements = Vec::with_capacity(n);
-        for id in &committee {
-            let p = sample_proposal(u8::try_from(id.inner()).unwrap_or(0));
-            elements.push(p.pc_element_hash(in_flight));
-            coord.proposal_pool.admit(*id, in_flight, p);
+        // Adoption happened: epoch advanced past the skipped one.
+        assert_eq!(coord.state.current_epoch, epoch_to_skip);
+        // Tip now points at the Skip block.
+        assert!(matches!(coord.latest_block.cert(), BeaconCert::Skip(_)));
+        // Skip cert anchored at the previous tip's hash.
+        if let BeaconCert::Skip(cert) = coord.latest_block.cert() {
+            assert_eq!(cert.anchor_hash(), anchor);
+            assert_eq!(cert.epoch_to_skip(), epoch_to_skip);
         }
-        let output = PcVector::new(elements);
-        let keys: Vec<_> = (0..n as u64).map(keypair).collect();
-        let cert_committee: Vec<_> = coord
-            .state
-            .committee
-            .iter()
-            .copied()
-            .zip(keys.iter().map(Bls12381G1PrivateKey::public_key))
-            .collect();
-        let f = n.saturating_sub(1) / 3;
-        let q = n - f;
-        let signer_positions: Vec<usize> = (0..q).collect();
-        let cert = build_direct_cert(
-            SpcView::new(1),
-            in_flight,
-            &keys,
-            &cert_committee,
-            &signer_positions,
+        // Broadcast emitted for peers.
+        assert!(
+            emitted
+                .iter()
+                .any(|a| matches!(a, Action::BroadcastBeaconBlock { .. })),
+            "expected BroadcastBeaconBlock in {emitted:?}",
         );
-
-        let recipients = coord.spc_recipients();
-        let _actions = coord.on_spc_output_high(in_flight, &output, cert, &recipients);
-
-        // Stash consumed; the cert rides on the new latest_block.
-        assert!(!coord.has_pending_recovery_cert());
-        assert_eq!(coord.latest_block.recovery_cert(), Some(&expected_cert));
+        // Commit emitted alongside.
+        assert!(
+            emitted
+                .iter()
+                .any(|a| matches!(a, Action::CommitBeaconBlock { .. })),
+            "expected CommitBeaconBlock in {emitted:?}",
+        );
+        // Tracker bucket cleared after adoption.
+        assert_eq!(coord.skip_tracker.bucket_count(), 0);
     }
 
+    /// Two assemblies at the same quorum — e.g. a duplicate
+    /// re-observation that re-hits quorum — must be idempotent: the
+    /// adoption path's `apply_epoch` regression check would panic if
+    /// the coordinator tried to re-adopt the skip block.
     #[test]
-    fn on_recovery_request_ignored_after_cert_already_assembled() {
+    fn on_skip_request_duplicate_after_adoption_is_noop() {
         let mut coord = fresh_coord();
-        let anchor_hash = coord.latest_block.block_hash();
-        let anchor_epoch = coord.latest_block.epoch();
-        for i in 0..4 {
-            let req = signed_recovery_request(
-                i,
-                ValidatorId::new(i),
-                anchor_hash,
-                anchor_epoch,
-                RecoveryRound::INITIAL,
-            );
-            let _ = coord.on_recovery_request_received(&req);
-        }
-        assert!(coord.has_pending_recovery_cert());
+        coord.bootstrap_spc_for_next_epoch();
+        let anchor = coord.latest_block.block_hash();
+        let epoch_to_skip = coord.state.current_epoch.next();
+        let n = coord.state.committee.len();
 
-        // A late additional request at the same anchor lands but should
-        // be a no-op: cert already assembled, tracker bucket already
-        // cleared (so `observe` finds an empty bucket and admits one
-        // entry, but the `pending_recovery_cert.is_some()` guard prevents
-        // a second assembly attempt).
-        let dup = signed_recovery_request(
-            0,
-            ValidatorId::new(0),
-            anchor_hash,
-            anchor_epoch,
-            RecoveryRound::INITIAL,
+        for i in 0..u64::try_from(n).unwrap() {
+            let req = signed_skip_request(i, ValidatorId::new(i), anchor, epoch_to_skip);
+            let _ = coord.on_skip_request_received(req);
+        }
+        // The tip's anchor has moved on. A late duplicate against the
+        // old anchor is dropped by the anchor-mismatch check.
+        let stale = signed_skip_request(0, ValidatorId::new(0), anchor, epoch_to_skip);
+        let actions = coord.on_skip_request_received(stale);
+        assert!(actions.is_empty(), "stale anchor must be a no-op");
+    }
+
+    /// Once the skip-quorum is reached at the local tip, the SPC
+    /// dispatch gate drops further SPC events for the abandoned
+    /// epoch.
+    #[test]
+    fn dispatch_spc_event_gated_by_skip_quorum() {
+        let mut coord = fresh_coord();
+        coord.bootstrap_spc_for_next_epoch();
+        let anchor = coord.latest_block.block_hash();
+        let epoch_to_skip = coord.state.current_epoch.next();
+        let n = coord.state.committee.len();
+        // Observe quorum-1 requests so the tracker holds quorum-many
+        // entries but we observe them without triggering the adoption
+        // path. To do that, observe one fewer than required, then
+        // separately bump the tracker via `observe` to cross quorum
+        // without re-driving adoption — this is what the gate is for.
+        for i in 0..u64::try_from(n - 1).unwrap() {
+            let req = signed_skip_request(i, ValidatorId::new(i), anchor, epoch_to_skip);
+            let _ = coord.on_skip_request_received(req);
+        }
+        // Push the last request directly into the tracker, bypassing
+        // the adoption-on-quorum branch — simulates the gate firing
+        // between observation and the next dispatch.
+        coord.skip_tracker.observe(signed_skip_request(
+            u64::try_from(n - 1).unwrap(),
+            ValidatorId::new(u64::try_from(n - 1).unwrap()),
+            anchor,
+            epoch_to_skip,
+        ));
+        assert!(coord.skip_quorum_at_tip());
+
+        // SPC dispatch is now gated — events drop without dispatching
+        // into the FSM (state unchanged, no broadcast actions).
+        let from = ValidatorId::new(0);
+        let actions = coord.dispatch_spc_event(
+            from,
+            SpcEvent::TimerExpired {
+                view: SpcView::new(1),
+            },
         );
-        let actions = coord.on_recovery_request_received(&dup);
-        assert!(actions.is_empty());
-        // Pending cert unchanged.
-        assert!(coord.has_pending_recovery_cert());
+        assert!(actions.is_empty(), "gated dispatch must emit no actions");
+        // The SPC instance stays Some — gate is query-based, not
+        // state-based.
+        assert!(coord.spc.is_some());
     }
 
     /// Build a (witness, source-shard header) pair where the witness's

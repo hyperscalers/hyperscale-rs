@@ -10,8 +10,8 @@ use std::sync::Arc;
 use hyperscale_types::{
     BeaconProposal, Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote,
     CertifiedBeaconBlock, CertifiedBlock, CommittedBlockHeader, Epoch, ExecutionCertificate,
-    ExecutionVote, FinalizedWave, Hash, Provisions, QuorumCertificate, ReadySignal,
-    RecoveryRequest, Round, RoutableTransaction, ShardGroupId, ShardWitness, StoredReceipt,
+    ExecutionVote, FinalizedWave, Hash, Provisions, QuorumCertificate, ReadySignal, Round,
+    RoutableTransaction, ShardGroupId, ShardWitness, SkipEpochCert, SkipRequest, StoredReceipt,
     TxOutcome, ValidatorId, VotePower, WaveId, WeightedTimestamp,
 };
 
@@ -556,10 +556,18 @@ pub enum ProtocolEvent {
         proposal: Arc<BeaconProposal>,
     },
 
-    /// A `RecoveryRequest` arrived via gossip.
-    RecoveryRequestReceived {
+    /// A `SkipRequest` arrived via gossip.
+    SkipRequestReceived {
         /// Received request.
-        request: Arc<RecoveryRequest>,
+        request: Arc<SkipRequest>,
+    },
+
+    /// A standalone `SkipEpochCert` arrived via gossip. Useful for
+    /// late-joining or syncing nodes that didn't observe the requests
+    /// directly.
+    SkipCertReceived {
+        /// Received cert.
+        cert: Arc<SkipEpochCert>,
     },
 
     /// A shard-witness fetch response landed. `BeaconCoordinator`
@@ -588,10 +596,12 @@ pub enum ProtocolEvent {
     /// wall-clock boundary has been reached.
     BeaconCommitteeStartTimer,
 
-    /// Beacon recovery-trigger timer fired — the local vnode hasn't
+    /// Beacon skip-trigger timer fired — the local vnode hasn't
     /// observed the expected commit within `RECOVERY_TIMEOUT` of its
-    /// expected block time.
-    BeaconRecoveryTimer,
+    /// expected block time. If the local node is in the active pool,
+    /// the coordinator emits a [`Action::BroadcastSkipRequest`]
+    /// proposing to abandon the next epoch.
+    BeaconSkipTimer,
 
     /// Beacon SPC view-timeout timer fired. The coordinator routes
     /// `SpcEvent::TimerExpired { view: spc.current_view() }` into
