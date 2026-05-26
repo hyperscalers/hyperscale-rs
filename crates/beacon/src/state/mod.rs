@@ -35,8 +35,9 @@ mod witness;
 pub use derived::{
     beacon_eligible, current_active_count, derive_active_pool, derive_beacon_committee,
     derive_topology_snapshot, effective_stake, max_active_count, min_stake, pooled_validators,
+    signer_pool_for,
 };
-pub use epoch::{ApplyEpochInput, apply_epoch};
+pub use epoch::{ApplyEpochInput, apply_epoch, apply_input_for};
 pub use pool::pool_draw;
 
 #[cfg(test)]

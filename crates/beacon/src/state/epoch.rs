@@ -6,8 +6,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_types::{
-    BeaconProposal, BeaconState, Epoch, NetworkDefinition, ShardGroupId, SlotEffects,
-    TransitionCause, ValidatorId,
+    BeaconCert, BeaconProposal, BeaconState, CertifiedBeaconBlock, Epoch, NetworkDefinition,
+    ShardGroupId, SlotEffects, TransitionCause, ValidatorId,
 };
 
 use crate::state::committee::{diff_shard_committees, resample_beacon_committee, run_shuffle_step};
@@ -37,6 +37,23 @@ pub enum ApplyEpochInput<'a> {
     /// runs over an empty proposal set; committee resamples under
     /// [`TransitionCause::Skip`].
     Skip,
+}
+
+/// Pick the [`ApplyEpochInput`] for a certified block.
+///
+/// # Panics
+///
+/// Panics on `BeaconCert::Genesis` — callers must filter genesis blocks
+/// before adoption.
+#[must_use]
+pub fn apply_input_for(block: &CertifiedBeaconBlock) -> ApplyEpochInput<'_> {
+    match block.cert() {
+        BeaconCert::Normal(_) => ApplyEpochInput::Normal {
+            committed: block.block().committed_proposals(),
+        },
+        BeaconCert::Skip(_) => ApplyEpochInput::Skip,
+        BeaconCert::Genesis(_) => panic!("apply_input_for called on Genesis block"),
+    }
 }
 
 /// Apply one epoch to `state`.

@@ -38,8 +38,8 @@ use crate::proposal_pool::BeaconProposalPool;
 use crate::skip_tracker::SkipTracker;
 use crate::spc::{SpcEffect, SpcEvent, SpcInstance};
 use crate::state::{
-    ApplyEpochInput, apply_epoch, derive_active_pool, derive_beacon_committee,
-    derive_topology_snapshot,
+    apply_epoch, apply_input_for, derive_active_pool, derive_beacon_committee,
+    derive_topology_snapshot, signer_pool_for,
 };
 use crate::verification::BeaconVerificationPipeline;
 use crate::witness_fetcher::ShardWitnessFetchTracker;
@@ -497,30 +497,24 @@ impl BeaconCoordinator {
             );
             return Vec::new();
         }
-        // Structural checks pass — pick the signer set the cert
-        // verifies against. Normal blocks bind to the current beacon
-        // committee; Skip blocks bind to the current active pool.
-        let signers = match block.cert() {
-            BeaconCert::Normal(_) => derive_beacon_committee(&self.state),
-            BeaconCert::Skip(skip_cert) => {
-                if skip_cert.anchor_hash() != self.latest_block.block_hash()
-                    || skip_cert.epoch_to_skip() != epoch
-                {
-                    warn!(
-                        epoch = epoch.inner(),
-                        "BeaconBlockReceived Skip cert anchor/epoch mismatch — dropping",
-                    );
-                    return Vec::new();
-                }
-                derive_active_pool(&self.state)
-            }
-            BeaconCert::Genesis(_) => {
-                warn!(
-                    epoch = epoch.inner(),
-                    "BeaconBlockReceived with Genesis cert past tip — dropping",
-                );
-                return Vec::new();
-            }
+        // Structural checks pass. Skip blocks carry an extra anchor +
+        // epoch gate beyond the cert-type → signer-pool dispatch.
+        if let BeaconCert::Skip(skip_cert) = block.cert()
+            && (skip_cert.anchor_hash() != self.latest_block.block_hash()
+                || skip_cert.epoch_to_skip() != epoch)
+        {
+            warn!(
+                epoch = epoch.inner(),
+                "BeaconBlockReceived Skip cert anchor/epoch mismatch — dropping",
+            );
+            return Vec::new();
+        }
+        let Some(signers) = signer_pool_for(&block, &self.state) else {
+            warn!(
+                epoch = epoch.inner(),
+                "BeaconBlockReceived with Genesis cert past tip — dropping",
+            );
+            return Vec::new();
         };
         self.dispatch_block_verification(block, signers)
     }
@@ -809,13 +803,7 @@ impl BeaconCoordinator {
     /// originator).
     fn adopt_block(&mut self, block: Arc<CertifiedBeaconBlock>) -> Vec<Action> {
         let mut new_state = self.state.clone();
-        let input = match block.cert() {
-            BeaconCert::Normal(_) => ApplyEpochInput::Normal {
-                committed: block.block().committed_proposals(),
-            },
-            BeaconCert::Skip(_) => ApplyEpochInput::Skip,
-            BeaconCert::Genesis(_) => unreachable!("adopt_block called on genesis"),
-        };
+        let input = apply_input_for(&block);
         apply_epoch(&mut new_state, &self.network, block.epoch(), input);
         self.state = new_state;
         self.latest_block = Arc::clone(&block);
@@ -1175,21 +1163,15 @@ mod tests {
     /// synchronous-equivalent outcome without manually threading
     /// results back to the coordinator.
     fn complete_verifications(coord: &mut BeaconCoordinator, actions: Vec<Action>) -> Vec<Action> {
-        use crate::skip::{verify_skip_cert, verify_skip_request};
-        use crate::spc::verify_block_cert;
+        use crate::skip::verify_skip_request;
+        use crate::verification::verify_certified;
 
         let net = NetworkDefinition::simulator();
         let mut out = Vec::new();
         for action in actions {
             match action {
                 Action::VerifyBeaconBlock { block, signers } => {
-                    let valid = match block.cert() {
-                        BeaconCert::Normal(cert) => {
-                            verify_block_cert(cert, &net, &spc_context(block.epoch()), &signers)
-                        }
-                        BeaconCert::Skip(cert) => verify_skip_cert(cert, &net, &signers),
-                        BeaconCert::Genesis(_) => false,
-                    };
+                    let valid = verify_certified(&block, &net, &signers);
                     let post = coord.on_beacon_block_verified(block, valid);
                     out.extend(complete_verifications(coord, post));
                 }

@@ -11,8 +11,9 @@
 use std::collections::HashMap;
 
 use hyperscale_types::{
-    BeaconState, Bls12381G1PublicKey, NetworkDefinition, ShardGroupId, Stake, StakePool,
-    TopologySnapshot, ValidatorId, ValidatorInfo, ValidatorSet, ValidatorStatus, VotePower,
+    BeaconCert, BeaconState, Bls12381G1PublicKey, CertifiedBeaconBlock, NetworkDefinition,
+    ShardGroupId, Stake, StakePool, TopologySnapshot, ValidatorId, ValidatorInfo, ValidatorSet,
+    ValidatorStatus, VotePower,
 };
 
 use crate::constants::{MIN_STAKE_FLOOR, POOL_BUFFER_TARGET, SHARD_CAPACITY};
@@ -210,6 +211,23 @@ pub fn derive_active_pool(state: &BeaconState) -> Vec<(ValidatorId, Bls12381G1Pu
         .filter(|(_, r)| matches!(r.status, ValidatorStatus::OnShard { ready: true, .. }))
         .map(|(id, r)| (*id, r.pubkey))
         .collect()
+}
+
+/// Pick the signer pool a certified block's cert verifies against.
+///
+/// Beacon committee for a Normal cert, active pool for a Skip cert.
+/// Returns `None` for `BeaconCert::Genesis` — past-tip genesis blocks
+/// have no signer pool to verify against.
+#[must_use]
+pub fn signer_pool_for(
+    block: &CertifiedBeaconBlock,
+    state: &BeaconState,
+) -> Option<Vec<(ValidatorId, Bls12381G1PublicKey)>> {
+    match block.cert() {
+        BeaconCert::Normal(_) => Some(derive_beacon_committee(state)),
+        BeaconCert::Skip(_) => Some(derive_active_pool(state)),
+        BeaconCert::Genesis(_) => None,
+    }
 }
 
 /// Dynamic per-validator minimum stake.

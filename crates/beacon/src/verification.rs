@@ -2,7 +2,34 @@
 
 use std::collections::BTreeSet;
 
-use hyperscale_types::{BeaconBlockHash, Hash};
+use hyperscale_types::{
+    BeaconBlockHash, BeaconCert, Bls12381G1PublicKey, CertifiedBeaconBlock, Hash,
+    NetworkDefinition, ValidatorId, spc_context,
+};
+
+use crate::skip::verify_skip_cert;
+use crate::spc::verify_block_cert;
+
+/// Verify a [`CertifiedBeaconBlock`] under the cert variant's required
+/// signer pool.
+///
+/// Dispatches: SPC cert against the beacon committee, Skip cert against
+/// the active pool. `Genesis` certs reject — past-tip genesis blocks
+/// have no replayable verification.
+#[must_use]
+pub fn verify_certified(
+    block: &CertifiedBeaconBlock,
+    network: &NetworkDefinition,
+    signers: &[(ValidatorId, Bls12381G1PublicKey)],
+) -> bool {
+    match block.cert() {
+        BeaconCert::Normal(cert) => {
+            verify_block_cert(cert, network, &spc_context(block.epoch()), signers)
+        }
+        BeaconCert::Skip(cert) => verify_skip_cert(cert, network, signers),
+        BeaconCert::Genesis(_) => false,
+    }
+}
 
 /// In-flight + verified slots over an arbitrary key.
 ///

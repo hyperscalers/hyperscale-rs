@@ -17,14 +17,15 @@ use hyperscale_types::network::notification::{
     SpcEmptyViewMsgNotification, SpcNewCommitNotification, SpcNewViewNotification,
 };
 use hyperscale_types::{
-    BeaconCert, BeaconProposal, SpcHighTriple, SpcMessage, SpcProposalObject, VpcMsgPayload,
-    pc_context, spc_context, vrf_sign,
+    BeaconProposal, SpcHighTriple, SpcMessage, SpcProposalObject, VpcMsgPayload, pc_context,
+    spc_context, vrf_sign,
 };
 use tracing::warn;
 
 use crate::pc::{sign_vote1, sign_vote2, sign_vote3};
-use crate::skip::{verify_skip_cert, verify_skip_request};
-use crate::spc::{sign_empty_view_msg, verify_block_cert};
+use crate::skip::verify_skip_request;
+use crate::spc::sign_empty_view_msg;
+use crate::verification::verify_certified;
 
 /// Dispatch a beacon-owned [`Action`] on the consensus pool. Panics on
 /// non-beacon variants — the node's owner-keyed dispatch is the gate.
@@ -190,19 +191,7 @@ where
             );
         }
         Action::VerifyBeaconBlock { block, signers } => {
-            let valid = match block.cert() {
-                BeaconCert::Normal(cert) => {
-                    verify_block_cert(cert, network, &spc_context(block.epoch()), &signers)
-                }
-                BeaconCert::Skip(cert) => verify_skip_cert(cert, network, &signers),
-                BeaconCert::Genesis(_) => {
-                    warn!(
-                        epoch = block.epoch().inner(),
-                        "VerifyBeaconBlock dispatched with Genesis cert — rejecting",
-                    );
-                    false
-                }
-            };
+            let valid = verify_certified(&block, network, &signers);
             ctx.notify_protocol(ProtocolEvent::BeaconBlockVerified { block, valid });
         }
         Action::VerifySkipRequest {
