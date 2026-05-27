@@ -96,35 +96,24 @@ pub use receipt::stored::StoredReceipt;
 pub use sbor_codec::{
     BoundedBTreeMap, BoundedBTreeSet, BoundedBytes, BoundedLengthError, BoundedString, BoundedVec,
 };
-pub use shard::certified::{
-    CertifiedBlock, CertifiedBlockHashMismatch, LinkageError, VerifiedCertifiedBlock,
-};
-pub use shard::committed_header::{
-    CommittedBlockHeader, CommittedHeaderVerifyError, VerifiedCommittedBlockHeader,
-};
-pub use shard::header::{BlockHeader, BlockHeaderVerifyError, VerifiedBlockHeader};
-pub use shard::inventory::{
-    ElidedCertifiedBlock, Inventory, RehydrateError, RehydrationMiss, VerifiedElidedCertifiedBlock,
-};
+pub use shard::certified::{CertifiedBlock, CertifiedBlockHashMismatch, LinkageError};
+pub use shard::committed_header::{CommittedBlockHeader, CommittedHeaderVerifyError};
+pub use shard::header::{BlockHeader, BlockHeaderVerifyError};
+pub use shard::inventory::{ElidedCertifiedBlock, Inventory, RehydrateError, RehydrationMiss};
 pub use shard::limits::{
     MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK, MAX_TX_IN_FLIGHT, MAX_TXS_PER_BLOCK,
 };
-pub use shard::manifest::{BlockManifest, BlockMetadata, VerifiedBlockMetadata};
-pub use shard::quorum_certificate::{
-    QcContext, QcVerifyError, QuorumCertificate, VerifiedQuorumCertificate,
-};
+pub use shard::manifest::{BlockManifest, BlockMetadata};
+pub use shard::quorum_certificate::{QcContext, QcVerifyError, QuorumCertificate};
 pub use shard::roots::{
     BeaconWitnessRootVerifyError, CertRootVerifyError, CertificateRootContext,
     LocalReceiptRootContext, LocalReceiptRootVerifyError, ProvisionRootVerifyError,
     ProvisionTxRootsContext, ProvisionTxRootsMap, ProvisionTxRootsVerifyError,
-    ProvisionsRootContext, TransactionRootContext, TxRootVerifyError, VerifiedBeaconWitnessRoot,
-    VerifiedCertificateRoot, VerifiedLocalReceiptRoot, VerifiedProvisionTxRoots,
-    VerifiedProvisionsRoot, VerifiedTransactionRoot,
+    ProvisionsRootContext, TransactionRootContext, TxRootVerifyError,
 };
-pub use shard::vote::{BlockVote, BlockVoteContext, BlockVoteVerifyError, VerifiedBlockVote};
+pub use shard::vote::{BlockVote, BlockVoteContext, BlockVoteVerifyError};
 pub use shard::{
-    Block, SharedCertificates, SharedProvisions, SharedTransactions, VerifiedBlock,
-    VerifiedBlockAssembleError,
+    Block, SharedCertificates, SharedProvisions, SharedTransactions, VerifiedBlockAssembleError,
 };
 pub use signing::{
     DOMAIN_BLOCK_HEADER, DOMAIN_BLOCK_VOTE, DOMAIN_COMMITTED_BLOCK_HEADER, DOMAIN_EXEC_CERT_BATCH,
@@ -153,12 +142,11 @@ pub use transaction::limits::{MAX_DECLARED_NODES_PER_TX, MAX_TX_BYTES_LEN};
 pub use transaction::notarize::{sign_and_notarize, sign_and_notarize_with_options};
 pub use transaction::routable::{
     RoutableTransaction, RoutableTransactionContext, RoutableTransactionVerifyError,
-    VerifiedRoutableTransaction,
 };
 pub use transaction::status::{
     TransactionDecision, TransactionError, TransactionStatus, TransactionStatusParseError,
 };
-pub use verifiable::{Verifiable, Verify};
+pub use verifiable::{Verifiable, Verified, Verify};
 pub use wave::certificate::WaveCertificate;
 pub use wave::computation::{compute_waves, wave_leader, wave_leader_at};
 pub use wave::execution_certificate::ExecutionCertificate;

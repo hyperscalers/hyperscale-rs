@@ -7,13 +7,15 @@
 //! produces a side artifact — the prepared-commit handle — that the
 //! commit pipeline reuses so it doesn't have to redo the JMT replay.
 //!
-//! [`VerifiedStateRoot<P>`] carries both the verified root and the
-//! prepared-commit handle. Holding one is type-level proof that the
-//! JMT was actually replayed, not just that the claim was trusted.
+//! Its verified form is `Verified<StateRoot, S::PreparedCommit>` —
+//! holding one is type-level proof that the JMT was actually replayed,
+//! not just that the claim was trusted. The prepared-commit handle
+//! rides in the augment slot. Predicate at
+//! [`impl Verify<&StateRootContext<'_, S>>`](Verify::verify) below.
 
 use std::sync::Arc;
 
-use hyperscale_types::{BlockHeight, FinalizedWave, StateRoot, Verify};
+use hyperscale_types::{BlockHeight, FinalizedWave, StateRoot, Verified, Verify};
 use thiserror::Error;
 
 use crate::shard::pending_chain::BaseReadCache;
@@ -60,70 +62,29 @@ pub enum StateRootVerifyError {
     },
 }
 
-/// Verified state root paired with its prepared-commit handle.
-///
 /// Construction asserts: replaying the supplied finalized waves against
 /// the JMT rooted at the parent's state root produces a root that
-/// equals the wrapped [`StateRoot`]. The `prepared_commit` is the JMT
-/// write batch from that replay, ready for the commit pipeline to apply
-/// without recomputing.
+/// equals the wrapped [`StateRoot`]. The augment carries the JMT write
+/// batch from that replay (`S::PreparedCommit`), ready for the commit
+/// pipeline to apply without recomputing.
 ///
 /// Construction goes through one of two gates:
 ///
 /// - [`<StateRoot as Verify>::verify`](Verify::verify) — runs the JMT
 ///   replay against [`StateRootContext::storage`] and compares.
-/// - [`Self::new_unchecked`] — audit point. Used at storage-recovery
-///   sites where the root was verified before persistence and the
-///   prepared-commit handle has been re-derived from the persisted JMT.
-///   Every call site documents the trust source with a `// SAFETY:`
-///   comment.
-pub struct VerifiedStateRoot<P> {
-    root: StateRoot,
-    prepared_commit: P,
-}
-
-impl<P> VerifiedStateRoot<P> {
-    /// Audit-point constructor. Skips the predicate.
-    #[must_use]
-    pub const fn new_unchecked(root: StateRoot, prepared_commit: P) -> Self {
-        Self {
-            root,
-            prepared_commit,
-        }
-    }
-
-    /// The verified state root.
-    #[must_use]
-    pub const fn root(&self) -> StateRoot {
-        self.root
-    }
-
-    /// The prepared-commit handle from the JMT replay. The commit
-    /// pipeline applies this directly when the block commits, avoiding
-    /// a second replay.
-    #[must_use]
-    pub const fn prepared_commit(&self) -> &P {
-        &self.prepared_commit
-    }
-
-    /// Consume the wrapper and return both halves.
-    #[must_use]
-    pub fn into_parts(self) -> (StateRoot, P) {
-        (self.root, self.prepared_commit)
-    }
-}
-
-impl<P> AsRef<StateRoot> for VerifiedStateRoot<P> {
-    fn as_ref(&self) -> &StateRoot {
-        &self.root
-    }
-}
-
+/// - [`Verified::<StateRoot, _>::new_unchecked_with`] — audit point.
+///   Used at storage-recovery sites where the root was verified before
+///   persistence and the prepared-commit handle has been re-derived
+///   from the persisted JMT. Every call site documents the trust
+///   source with a `// SAFETY:` comment.
 impl<S: ShardChainWriter + SubstateStore> Verify<&StateRootContext<'_, S>> for StateRoot {
-    type Verified = VerifiedStateRoot<S::PreparedCommit>;
+    type Augment = S::PreparedCommit;
     type Error = StateRootVerifyError;
 
-    fn verify(&self, ctx: &StateRootContext<'_, S>) -> Result<Self::Verified, Self::Error> {
+    fn verify(
+        &self,
+        ctx: &StateRootContext<'_, S>,
+    ) -> Result<Verified<Self, Self::Augment>, Self::Error> {
         let (computed, prepared) = ctx.storage.prepare_block_commit(
             ctx.parent_state_root,
             ctx.parent_block_height,
@@ -138,6 +99,6 @@ impl<S: ShardChainWriter + SubstateStore> Verify<&StateRootContext<'_, S>> for S
                 computed,
             });
         }
-        Ok(VerifiedStateRoot::new_unchecked(*self, prepared))
+        Ok(Verified::new_unchecked_with(*self, prepared))
     }
 }

@@ -48,8 +48,7 @@ use hyperscale_storage_rocksdb::{RocksDbShardStorage, SharedStorage};
 use hyperscale_types::{
     Block, BlockHeight, Bls12381G1PrivateKey, CertifiedBlock, InFlightCount, LocalTimestamp,
     MAX_TX_IN_FLIGHT, NodeId, QuorumCertificate, RoutableTransaction, ShardGroupId,
-    TopologySnapshot, TransactionStatus, TxHash, ValidatorId, VerifiedCertifiedBlock,
-    shard_for_node,
+    TopologySnapshot, TransactionStatus, TxHash, ValidatorId, Verified, shard_for_node,
 };
 use libp2p::identity::Keypair;
 use quick_cache::sync::Cache as QuickCache;
@@ -790,7 +789,7 @@ impl ProductionRunner {
             // empty-input compute; the synthetic genesis QC pairs with
             // `genesis_block.hash()` by construction; no adversarial
             // input touches it before the typestate wrap.
-            let genesis_certified = Arc::new(VerifiedCertifiedBlock::new_unchecked(
+            let genesis_certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked(
                 CertifiedBlock::new_unchecked(genesis_block, genesis_qc),
             ));
             let genesis_commit_output = host.step(ShardEvent::protocol(

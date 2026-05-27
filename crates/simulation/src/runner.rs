@@ -27,8 +27,7 @@ use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::{
     BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey, CertifiedBlock, LocalTimestamp, NodeId,
     QuorumCertificate, ShardGroupId, TopologySnapshot, TransactionStatus, TxHash, ValidatorId,
-    ValidatorInfo, ValidatorSet, VerifiedCertifiedBlock, VotePower, bls_keypair_from_seed,
-    shard_for_node,
+    ValidatorInfo, ValidatorSet, Verified, VotePower, bls_keypair_from_seed, shard_for_node,
 };
 use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
@@ -657,7 +656,7 @@ impl SimulationRunner {
                 // with `genesis_block.hash()` by construction; nothing
                 // crosses an adversarial boundary before the typestate
                 // wrap.
-                let genesis_certified = Arc::new(VerifiedCertifiedBlock::new_unchecked(
+                let genesis_certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked(
                     CertifiedBlock::new_unchecked(genesis_block.clone(), genesis_qc),
                 ));
                 let genesis_commit_event = ShardEvent::protocol(

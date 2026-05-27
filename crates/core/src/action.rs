@@ -15,8 +15,8 @@ use hyperscale_types::{
     ProvisionTxRootsMap, Provisions, ProvisionsRoot, QuorumCertificate, ReadySignal, Round,
     RoutableTransaction, ShardGroupId, SharedCertificates, SharedTransactions, SkipEpochCert,
     SkipRequest, SpcCert, SpcEmptyViewMsg, SpcHighTriple, SpcView, StateRoot, SubstateEntry,
-    TopologySnapshot, TransactionRoot, TransactionStatus, TxHash, TxOutcome, ValidatorId,
-    VerifiedBlockVote, VotePower, WaveId, WeightedTimestamp, Witness,
+    TopologySnapshot, TransactionRoot, TransactionStatus, TxHash, TxOutcome, ValidatorId, Verified,
+    VotePower, WaveId, WeightedTimestamp, Witness,
 };
 
 use crate::{CommitSource, FetchAbandon, FetchRequest, ProtocolEvent, TimerId};
@@ -242,7 +242,7 @@ pub enum Action {
         votes_to_verify: Vec<(usize, BlockVote, Bls12381G1PublicKey, VotePower)>,
         /// Already-verified votes (e.g., our own vote).
         /// Each tuple is (`committee_index`, vote, `voting_power`).
-        verified_votes: Vec<(usize, VerifiedBlockVote, VotePower)>,
+        verified_votes: Vec<(usize, Verified<BlockVote>, VotePower)>,
         /// Total voting power in the committee (for quorum calculation).
         total_voting_power: VotePower,
     },
@@ -318,7 +318,7 @@ pub enum Action {
 
     /// Verify a Quorum Certificate's aggregated BLS signature **and**
     /// confirm the signers carry quorum-meeting voting power. Both checks
-    /// together constitute the [`VerifiedQuorumCertificate`] predicate.
+    /// together constitute the [`Verified<QuorumCertificate>`] predicate.
     ///
     /// CRITICAL for shard consensus safety: a Byzantine proposer could otherwise
     /// include a fake QC with invalid signatures or under-quorum signers.

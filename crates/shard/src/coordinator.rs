@@ -81,13 +81,12 @@ use std::time::Duration;
 
 use hyperscale_storage::{BeaconWitnessCommit, RecoveredState, StateRootVerifyError};
 use hyperscale_types::{
-    BeaconWitnessRootVerifyError, Block, BlockHeader, BlockHeight, BlockManifest, BlockVote,
-    CertRootVerifyError, CertifiedBlock, CommittedBlockHeader, FinalizedWave,
-    LocalReceiptRootVerifyError, ProvisionRootVerifyError, ProvisionTxRootsVerifyError, Provisions,
-    QcVerifyError, QuorumCertificate, Round, RoutableTransaction, StateRoot, TopologySnapshot,
-    TxHash, TxRootVerifyError, Verifiable, VerifiedBeaconWitnessRoot, VerifiedBlockVote,
-    VerifiedCertificateRoot, VerifiedLocalReceiptRoot, VerifiedProvisionTxRoots,
-    VerifiedProvisionsRoot, VerifiedQuorumCertificate, VerifiedTransactionRoot, VotePower,
+    BeaconWitnessRoot, BeaconWitnessRootVerifyError, Block, BlockHeader, BlockHeight,
+    BlockManifest, BlockVote, CertRootVerifyError, CertificateRoot, CertifiedBlock,
+    CommittedBlockHeader, FinalizedWave, LocalReceiptRoot, LocalReceiptRootVerifyError,
+    ProvisionRootVerifyError, ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions,
+    ProvisionsRoot, QcVerifyError, QuorumCertificate, Round, RoutableTransaction, StateRoot,
+    TopologySnapshot, TransactionRoot, TxHash, TxRootVerifyError, Verifiable, Verified, VotePower,
 };
 use tracing::field::Empty;
 use tracing::{debug, info, instrument, trace, warn};
@@ -151,7 +150,7 @@ pub struct ShardCoordinator {
 
     /// Latest QC (certifies the latest certified block). Verified at
     /// every adoption gate; the typestate makes that invariant local.
-    latest_qc: Option<VerifiedQuorumCertificate>,
+    latest_qc: Option<Verified<QuorumCertificate>>,
 
     /// QC deferred because the block header wasn't in memory when it formed.
     /// Adopted in `on_block_header` when the header arrives.
@@ -589,7 +588,7 @@ impl ShardCoordinator {
         topology_snapshot: &TopologySnapshot,
         height: BlockHeight,
         hash: Option<BlockHash>,
-        qc: Option<VerifiedQuorumCertificate>,
+        qc: Option<Verified<QuorumCertificate>>,
     ) -> Vec<Action> {
         if height == BlockHeight::GENESIS && hash.is_none() {
             // No committed blocks - this is a fresh start
@@ -1153,7 +1152,7 @@ impl ShardCoordinator {
     fn try_adopt_verified_qc(
         &mut self,
         topology_snapshot: &TopologySnapshot,
-        qc: &VerifiedQuorumCertificate,
+        qc: &Verified<QuorumCertificate>,
     ) -> Vec<Action> {
         let advances = self
             .latest_qc
@@ -1593,7 +1592,7 @@ impl ShardCoordinator {
     pub fn on_block_vote(
         &mut self,
         topology_snapshot: &TopologySnapshot,
-        vote: Verifiable<BlockVote, VerifiedBlockVote>,
+        vote: Verifiable<BlockVote>,
     ) -> Vec<Action> {
         trace!(
             validator = ?topology_snapshot.local_validator_id(),
@@ -1634,7 +1633,7 @@ impl ShardCoordinator {
     fn on_block_vote_internal(
         &mut self,
         topology_snapshot: &TopologySnapshot,
-        vote: Verifiable<BlockVote, VerifiedBlockVote>,
+        vote: Verifiable<BlockVote>,
     ) -> Vec<Action> {
         let header_for_vote = self.pending_blocks.get_header(vote.block_hash());
         self.votes.accept_vote(
@@ -1661,8 +1660,8 @@ impl ShardCoordinator {
         &mut self,
         topology_snapshot: &TopologySnapshot,
         block_hash: BlockHash,
-        qc: Option<VerifiedQuorumCertificate>,
-        verified_votes: Vec<(usize, VerifiedBlockVote, VotePower)>,
+        qc: Option<Verified<QuorumCertificate>>,
+        verified_votes: Vec<(usize, Verified<BlockVote>, VotePower)>,
     ) -> Vec<Action> {
         if let Some(qc) = qc {
             info!(
@@ -1716,7 +1715,7 @@ impl ShardCoordinator {
         &mut self,
         topology_snapshot: &TopologySnapshot,
         block_hash: BlockHash,
-        result: Result<VerifiedQuorumCertificate, QcVerifyError>,
+        result: Result<Verified<QuorumCertificate>, QcVerifyError>,
     ) -> Vec<Action> {
         let valid = result.is_ok();
         // Check if this is a synced block verification
@@ -1801,7 +1800,7 @@ impl ShardCoordinator {
         &mut self,
         topology_snapshot: &TopologySnapshot,
         block_hash: BlockHash,
-        result: Result<VerifiedTransactionRoot, TxRootVerifyError>,
+        result: Result<Verified<TransactionRoot>, TxRootVerifyError>,
     ) -> Vec<Action> {
         let valid = result.is_ok();
         if let Ok(verified) = result {
@@ -1821,7 +1820,7 @@ impl ShardCoordinator {
         &mut self,
         topology_snapshot: &TopologySnapshot,
         block_hash: BlockHash,
-        result: Result<VerifiedCertificateRoot, CertRootVerifyError>,
+        result: Result<Verified<CertificateRoot>, CertRootVerifyError>,
     ) -> Vec<Action> {
         let valid = result.is_ok();
         if let Ok(verified) = result {
@@ -1841,7 +1840,7 @@ impl ShardCoordinator {
         &mut self,
         topology_snapshot: &TopologySnapshot,
         block_hash: BlockHash,
-        result: Result<VerifiedLocalReceiptRoot, LocalReceiptRootVerifyError>,
+        result: Result<Verified<LocalReceiptRoot>, LocalReceiptRootVerifyError>,
     ) -> Vec<Action> {
         let valid = result.is_ok();
         if let Ok(verified) = result {
@@ -1861,7 +1860,7 @@ impl ShardCoordinator {
         &mut self,
         topology_snapshot: &TopologySnapshot,
         block_hash: BlockHash,
-        result: Result<VerifiedProvisionsRoot, ProvisionRootVerifyError>,
+        result: Result<Verified<ProvisionsRoot>, ProvisionRootVerifyError>,
     ) -> Vec<Action> {
         let valid = result.is_ok();
         if let Ok(verified) = result {
@@ -1881,7 +1880,7 @@ impl ShardCoordinator {
         &mut self,
         topology_snapshot: &TopologySnapshot,
         block_hash: BlockHash,
-        result: Result<VerifiedProvisionTxRoots, ProvisionTxRootsVerifyError>,
+        result: Result<Verified<ProvisionTxRootsMap>, ProvisionTxRootsVerifyError>,
     ) -> Vec<Action> {
         let valid = result.is_ok();
         if let Ok(verified) = result {
@@ -1901,7 +1900,7 @@ impl ShardCoordinator {
         &mut self,
         topology_snapshot: &TopologySnapshot,
         block_hash: BlockHash,
-        result: Result<VerifiedBeaconWitnessRoot, BeaconWitnessRootVerifyError>,
+        result: Result<Verified<BeaconWitnessRoot>, BeaconWitnessRootVerifyError>,
     ) -> Vec<Action> {
         let valid = result.is_ok();
         if let Ok(verified) = result {
@@ -2247,7 +2246,7 @@ impl ShardCoordinator {
         &mut self,
         topology_snapshot: &TopologySnapshot,
         block_hash: BlockHash,
-        qc: &VerifiedQuorumCertificate,
+        qc: &Verified<QuorumCertificate>,
         ready_txs: &[Arc<RoutableTransaction>],
         finalized_waves: Vec<Arc<FinalizedWave>>,
         provisions: Vec<Arc<Provisions>>,
@@ -2803,7 +2802,7 @@ impl ShardCoordinator {
         // tracks that result in `block_sync.on_qc_verified`; only
         // verified entries flow into `apply_synced_block` via
         // `try_apply_verified_synced_blocks`.
-        let verified_qc = VerifiedQuorumCertificate::new_unchecked((*qc).clone());
+        let verified_qc = Verified::<QuorumCertificate>::new_unchecked((*qc).clone());
         let qc = qc.into_unverified();
         let block_hash = block.hash();
         let height = block.height();
@@ -2859,7 +2858,7 @@ impl ShardCoordinator {
             // produced a verifying QC over this block also vouches for
             // the parent_qc it contains.
             let verified_parent =
-                VerifiedQuorumCertificate::new_unchecked(block.header().parent_qc().clone());
+                Verified::<QuorumCertificate>::new_unchecked(block.header().parent_qc().clone());
             self.latest_qc = Some(verified_parent);
             self.maybe_unlock_for_qc(topology_snapshot, block.header().parent_qc());
         }
@@ -3395,7 +3394,7 @@ impl ShardCoordinator {
 
     /// Get the latest QC.
     #[must_use]
-    pub const fn latest_qc(&self) -> Option<&VerifiedQuorumCertificate> {
+    pub const fn latest_qc(&self) -> Option<&Verified<QuorumCertificate>> {
         self.latest_qc.as_ref()
     }
 
@@ -3668,9 +3667,9 @@ mod tests {
         )
     }
 
-    fn make_test_qc(block_hash: BlockHash, height: BlockHeight) -> VerifiedQuorumCertificate {
+    fn make_test_qc(block_hash: BlockHash, height: BlockHeight) -> Verified<QuorumCertificate> {
         // SAFETY: synthetic test fixture, no real signature.
-        VerifiedQuorumCertificate::new_unchecked(QuorumCertificate::new(
+        Verified::<QuorumCertificate>::new_unchecked(QuorumCertificate::new(
             block_hash,
             ShardGroupId::new(0),
             height,
@@ -3896,7 +3895,7 @@ mod tests {
 
         // SAFETY: synthetic test fixture, parent_qc was constructed locally,
         // so wrapping it as verified models the action arm's success result.
-        let verified = VerifiedQuorumCertificate::new_unchecked(header.parent_qc().clone());
+        let verified = Verified::<QuorumCertificate>::new_unchecked(header.parent_qc().clone());
         let _ = state.on_qc_signature_verified(&topology, block_hash, Ok(verified));
         assert_eq!(
             state.latest_qc.as_deref().map(QuorumCertificate::height),
@@ -3974,7 +3973,7 @@ mod tests {
 
         // QC verified — but state root verification is still pending, so no vote yet.
         // SAFETY: synthetic test fixture, parent_qc built locally.
-        let verified = VerifiedQuorumCertificate::new_unchecked(header.parent_qc().clone());
+        let verified = Verified::<QuorumCertificate>::new_unchecked(header.parent_qc().clone());
         let after_qc = state.on_qc_signature_verified(&topology, block_hash, Ok(verified));
         assert!(
             !after_qc
@@ -4000,7 +3999,7 @@ mod tests {
         let after_roots = state.on_beacon_witness_root_verified(
             &topology,
             block_hash,
-            Ok(VerifiedBeaconWitnessRoot::new_unchecked(beacon_root)),
+            Ok(Verified::<BeaconWitnessRoot>::new_unchecked(beacon_root)),
         );
         assert!(
             after_roots
@@ -4340,7 +4339,11 @@ mod tests {
             &topology,
             block_b,
             None,
-            vec![(0, VerifiedBlockVote::new_unchecked(vote), VotePower::new(1))],
+            vec![(
+                0,
+                Verified::<BlockVote>::new_unchecked(vote),
+                VotePower::new(1),
+            )],
         );
 
         let (recorded_hash, _) = state
@@ -4556,7 +4559,7 @@ mod tests {
         let qc = {
             let __qc = make_test_qc(block_3_hash, BlockHeight::new(3));
             // SAFETY: synthetic test fixture, no real signature.
-            VerifiedQuorumCertificate::new_unchecked(QuorumCertificate::new(
+            Verified::<QuorumCertificate>::new_unchecked(QuorumCertificate::new(
                 __qc.block_hash(),
                 __qc.shard_group_id(),
                 __qc.height(),
@@ -4692,7 +4695,7 @@ mod tests {
         let actions = state.on_block_ready_to_commit(
             &topology,
             block_hash,
-            qc.into(),
+            qc.into_inner(),
             CommitSource::Aggregator,
         );
         assert!(
@@ -4765,6 +4768,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // straight-line sequence; splitting hurts readability
     fn test_qc_verification_caching_skips_redundant_verification() {
         // When the same parent QC appears in multiple block headers (e.g. after a
         // view change), we verify it once and hit the cache for subsequent blocks.
@@ -4836,7 +4840,9 @@ mod tests {
         // SAFETY: synthetic test fixture, no real signature.
         state
             .verification
-            .cache_verified_qc(VerifiedQuorumCertificate::new_unchecked(parent_qc.clone()));
+            .cache_verified_qc(Verified::<QuorumCertificate>::new_unchecked(
+                parent_qc.clone(),
+            ));
 
         // Second block at round 1 sharing the same parent QC.
         let header2 = {
@@ -4914,7 +4920,9 @@ mod tests {
         // SAFETY: synthetic test fixture, no real signature.
         state
             .verification
-            .cache_verified_qc(VerifiedQuorumCertificate::new_unchecked(honest_qc.clone()));
+            .cache_verified_qc(Verified::<QuorumCertificate>::new_unchecked(
+                honest_qc.clone(),
+            ));
 
         // Byzantine header reuses the honest QC's block_hash + signers + height
         // (so `validate_header`'s quorum-power and structural checks still pass)
@@ -5017,7 +5025,7 @@ mod tests {
                 BlockHeight::new(3),
             );
             // SAFETY: synthetic test fixture, no real signature.
-            VerifiedQuorumCertificate::new_unchecked(QuorumCertificate::new(
+            Verified::<QuorumCertificate>::new_unchecked(QuorumCertificate::new(
                 __qc.block_hash(),
                 __qc.shard_group_id(),
                 __qc.height(),
@@ -5071,7 +5079,7 @@ mod tests {
                 BlockHeight::new(3),
             );
             // SAFETY: synthetic test fixture, no real signature.
-            VerifiedQuorumCertificate::new_unchecked(QuorumCertificate::new(
+            Verified::<QuorumCertificate>::new_unchecked(QuorumCertificate::new(
                 __qc.block_hash(),
                 __qc.shard_group_id(),
                 __qc.height(),
@@ -5202,7 +5210,7 @@ mod tests {
                 BlockHeight::new(5),
             );
             // SAFETY: synthetic test fixture, no real signature.
-            VerifiedQuorumCertificate::new_unchecked(QuorumCertificate::new(
+            Verified::<QuorumCertificate>::new_unchecked(QuorumCertificate::new(
                 __qc.block_hash(),
                 __qc.shard_group_id(),
                 __qc.height(),
@@ -5360,7 +5368,7 @@ mod tests {
                 BlockHeight::new(3),
             );
             // SAFETY: synthetic test fixture, no real signature.
-            VerifiedQuorumCertificate::new_unchecked(QuorumCertificate::new(
+            Verified::<QuorumCertificate>::new_unchecked(QuorumCertificate::new(
                 __qc.block_hash(),
                 __qc.shard_group_id(),
                 __qc.height(),
@@ -5396,7 +5404,7 @@ mod tests {
                 BlockHeight::new(3),
             );
             // SAFETY: synthetic test fixture, no real signature.
-            VerifiedQuorumCertificate::new_unchecked(QuorumCertificate::new(
+            Verified::<QuorumCertificate>::new_unchecked(QuorumCertificate::new(
                 __qc.block_hash(),
                 __qc.shard_group_id(),
                 __qc.height(),
@@ -5460,7 +5468,7 @@ mod tests {
                 BlockHeight::new(3),
             );
             // SAFETY: synthetic test fixture, no real signature.
-            VerifiedQuorumCertificate::new_unchecked(QuorumCertificate::new(
+            Verified::<QuorumCertificate>::new_unchecked(QuorumCertificate::new(
                 __qc.block_hash(),
                 __qc.shard_group_id(),
                 __qc.height(),

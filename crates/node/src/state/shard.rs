@@ -63,7 +63,7 @@
 use hyperscale_core::{Action, ProtocolEvent, TimerId};
 use hyperscale_types::{
     BlockHash, BlockHeader, BlockManifest, CertifiedBlock, MAX_FINALIZED_TX_PER_BLOCK,
-    MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, VerifiedQuorumCertificate,
+    MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, QuorumCertificate, Verified,
 };
 
 use super::NodeStateMachine;
@@ -285,7 +285,7 @@ impl NodeStateMachine {
     fn on_qc_formed(
         &mut self,
         block_hash: BlockHash,
-        qc: &VerifiedQuorumCertificate,
+        qc: &Verified<QuorumCertificate>,
     ) -> Vec<Action> {
         // Count transactions and certificates in the block that will be
         // committed. Critical for in-flight limits: the `BlockCommitted`
@@ -397,9 +397,9 @@ mod tests {
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
         BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHeader, BlockHeight, BlockManifest,
-        CommittedBlockHeader, Hash, LocalTimestamp, MerkleInclusionProof, ProvisionEntry,
-        Provisions, QuorumCertificate, RETENTION_HORIZON, Round, ShardGroupId, TransactionStatus,
-        TxHash, ValidatorId, VerifiedCertifiedBlock, WaveId,
+        CertifiedBlock, CommittedBlockHeader, Hash, LocalTimestamp, MerkleInclusionProof,
+        ProvisionEntry, Provisions, QuorumCertificate, RETENTION_HORIZON, Round, ShardGroupId,
+        TransactionStatus, TxHash, ValidatorId, Verified, WaveId,
     };
 
     use super::super::test_support::TestNode;
@@ -633,7 +633,7 @@ mod tests {
         );
         // SAFETY: test fixture; block and synthesized QC are produced
         // in-process for the orchestrator test, no adversarial input.
-        let certified = Arc::new(VerifiedCertifiedBlock::new_unchecked(certify(
+        let certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked(certify(
             block, /* weighted_timestamp_ms */ 1_000,
         )));
         let _ = node.handle(past_deadline, ProtocolEvent::BlockCommitted { certified });
@@ -655,7 +655,7 @@ mod tests {
             vec![],
         );
         // SAFETY: test fixture; same rationale as above.
-        let certified = Arc::new(VerifiedCertifiedBlock::new_unchecked(certify(
+        let certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked(certify(
             block,
             past_deadline_ms,
         )));
@@ -751,7 +751,7 @@ mod tests {
         // SAFETY: test fixture; block and synthesized QC are produced
         // in-process to exercise the commit fan-out, no adversarial
         // input.
-        let certified = Arc::new(VerifiedCertifiedBlock::new_unchecked(certify(
+        let certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked(certify(
             block, /* weighted_timestamp_ms */ 1_000,
         )));
         let _ = node.handle(

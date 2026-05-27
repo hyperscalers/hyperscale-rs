@@ -9,17 +9,16 @@ use std::sync::Arc;
 
 use hyperscale_storage::StateRootVerifyError;
 use hyperscale_types::{
-    BeaconProposal, BeaconWitnessRootVerifyError, Block, BlockHash, BlockHeader, BlockHeight,
-    BlockManifest, BlockVote, CertRootVerifyError, CertifiedBeaconBlock, CertifiedBlock,
-    CommittedBlockHeader, CommittedHeaderVerifyError, Epoch, ExecutionCertificate, ExecutionVote,
-    FinalizedWave, LocalReceiptRootVerifyError, PcQc3, PcVector, PcVoteMessage,
-    ProvisionRootVerifyError, ProvisionTxRootsVerifyError, Provisions, QcVerifyError,
+    BeaconProposal, BeaconWitnessRoot, BeaconWitnessRootVerifyError, Block, BlockHash, BlockHeader,
+    BlockHeight, BlockManifest, BlockVote, CertRootVerifyError, CertificateRoot,
+    CertifiedBeaconBlock, CertifiedBlock, CommittedBlockHeader, CommittedHeaderVerifyError, Epoch,
+    ExecutionCertificate, ExecutionVote, FinalizedWave, LocalReceiptRoot,
+    LocalReceiptRootVerifyError, PcQc3, PcVector, PcVoteMessage, ProvisionRootVerifyError,
+    ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, QcVerifyError,
     QuorumCertificate, ReadySignal, Round, RoutableTransaction, ShardGroupId, ShardWitness,
-    SkipEpochCert, SkipRequest, SpcCert, SpcEmptyViewMsg, SpcView, StoredReceipt, TxOutcome,
-    TxRootVerifyError, ValidatorId, Verifiable, VerifiedBeaconWitnessRoot, VerifiedBlockVote,
-    VerifiedCertificateRoot, VerifiedCertifiedBlock, VerifiedLocalReceiptRoot,
-    VerifiedProvisionTxRoots, VerifiedProvisionsRoot, VerifiedQuorumCertificate,
-    VerifiedTransactionRoot, VotePower, WaveId, WeightedTimestamp,
+    SkipEpochCert, SkipRequest, SpcCert, SpcEmptyViewMsg, SpcView, StoredReceipt, TransactionRoot,
+    TxOutcome, TxRootVerifyError, ValidatorId, Verifiable, Verified, VotePower, WaveId,
+    WeightedTimestamp,
 };
 
 /// How a node learned about the certifying QC that commits a given block.
@@ -99,7 +98,7 @@ pub enum ProtocolEvent {
         /// Block vote received from a peer. Wire bytes always land in
         /// [`Verifiable::Unverified`]; local-dispatched delivery from a
         /// colocated voter preserves [`Verifiable::Verified`].
-        vote: Verifiable<BlockVote, VerifiedBlockVote>,
+        vote: Verifiable<BlockVote>,
     },
 
     /// Received a validator's "ready on shard" signal.
@@ -122,7 +121,7 @@ pub enum ProtocolEvent {
         /// The newly formed QC. Verified by construction — built from
         /// pre-verified votes whose combined power cleared the quorum
         /// threshold in `verify_and_build_qc`.
-        qc: VerifiedQuorumCertificate,
+        qc: Verified<QuorumCertificate>,
     },
 
     /// A block is ready to be committed.
@@ -143,14 +142,14 @@ pub enum ProtocolEvent {
     /// `PendingChain::view_at` to see unpersisted state.
     BlockCommitted {
         /// The committed block + its certifying QC. Wrapped as
-        /// [`VerifiedCertifiedBlock`] so consumers see the typestate
+        /// [`Verified<CertifiedBlock>`] so consumers see the typestate
         /// claim that the block, the QC, and the linkage are all
         /// verified — header verified, every applicable per-root
         /// verifier succeeded, QC's BLS aggregate cleared the quorum
         /// threshold, and `qc.block_hash == block.hash()`. State-root
         /// verification rides the parallel pipeline path (see the doc
         /// on [`VerifiedBlock`](hyperscale_types::VerifiedBlock)).
-        certified: Arc<VerifiedCertifiedBlock>,
+        certified: Arc<Verified<CertifiedBlock>>,
     },
 
     /// A block has been durably persisted to `RocksDB`.
@@ -168,9 +167,9 @@ pub enum ProtocolEvent {
         /// Block hash the QC was assembled for.
         block_hash: BlockHash,
         /// The verified QC if quorum was reached, or `None` if not.
-        qc: Option<VerifiedQuorumCertificate>,
+        qc: Option<Verified<QuorumCertificate>>,
         /// Verified votes, returned for accumulation when no QC was built.
-        verified_votes: Vec<(usize, VerifiedBlockVote, VotePower)>,
+        verified_votes: Vec<(usize, Verified<BlockVote>, VotePower)>,
     },
 
     /// QC signature verification completed. The payload carries the
@@ -180,7 +179,7 @@ pub enum ProtocolEvent {
         /// Block whose parent-QC signature was verified.
         block_hash: BlockHash,
         /// Verified QC on success; the reason it failed otherwise.
-        result: Result<VerifiedQuorumCertificate, QcVerifyError>,
+        result: Result<Verified<QuorumCertificate>, QcVerifyError>,
     },
 
     /// Remote header QC verification completed.
@@ -197,7 +196,7 @@ pub enum ProtocolEvent {
         /// Verified QC on success; the reason verification failed
         /// otherwise (QC-level signature/quorum failure or QC↔header
         /// linkage mismatch).
-        result: Result<VerifiedQuorumCertificate, CommittedHeaderVerifyError>,
+        result: Result<Verified<QuorumCertificate>, CommittedHeaderVerifyError>,
     },
 
     /// A remote committed block header has been fully verified (QC + structural checks).
@@ -218,7 +217,7 @@ pub enum ProtocolEvent {
         /// Block whose root was verified.
         block_hash: BlockHash,
         /// Typed verification result.
-        result: Result<VerifiedTransactionRoot, TxRootVerifyError>,
+        result: Result<Verified<TransactionRoot>, TxRootVerifyError>,
     },
 
     /// Certificate-root verification completed for a pending block.
@@ -226,7 +225,7 @@ pub enum ProtocolEvent {
         /// Block whose root was verified.
         block_hash: BlockHash,
         /// Typed verification result.
-        result: Result<VerifiedCertificateRoot, CertRootVerifyError>,
+        result: Result<Verified<CertificateRoot>, CertRootVerifyError>,
     },
 
     /// Local-receipt-root verification completed for a pending block.
@@ -240,7 +239,7 @@ pub enum ProtocolEvent {
         /// Block whose root was verified.
         block_hash: BlockHash,
         /// Typed verification result.
-        result: Result<VerifiedLocalReceiptRoot, LocalReceiptRootVerifyError>,
+        result: Result<Verified<LocalReceiptRoot>, LocalReceiptRootVerifyError>,
     },
 
     /// Provisions-root verification completed for a pending block.
@@ -248,7 +247,7 @@ pub enum ProtocolEvent {
         /// Block whose root was verified.
         block_hash: BlockHash,
         /// Typed verification result.
-        result: Result<VerifiedProvisionsRoot, ProvisionRootVerifyError>,
+        result: Result<Verified<ProvisionsRoot>, ProvisionRootVerifyError>,
     },
 
     /// Provision-tx-roots map verification completed for a pending block.
@@ -256,7 +255,7 @@ pub enum ProtocolEvent {
         /// Block whose root was verified.
         block_hash: BlockHash,
         /// Typed verification result.
-        result: Result<VerifiedProvisionTxRoots, ProvisionTxRootsVerifyError>,
+        result: Result<Verified<ProvisionTxRootsMap>, ProvisionTxRootsVerifyError>,
     },
 
     /// Beacon-witness-root verification completed for a pending block.
@@ -264,7 +263,7 @@ pub enum ProtocolEvent {
         /// Block whose root was verified.
         block_hash: BlockHash,
         /// Typed verification result.
-        result: Result<VerifiedBeaconWitnessRoot, BeaconWitnessRootVerifyError>,
+        result: Result<Verified<BeaconWitnessRoot>, BeaconWitnessRootVerifyError>,
     },
 
     /// State-root verification completed for a pending block.
@@ -531,9 +530,9 @@ pub enum ProtocolEvent {
         /// Hash of the highest committed block, if present.
         hash: Option<BlockHash>,
         /// Latest QC found in storage, if present. Carried as
-        /// `VerifiedQuorumCertificate` because storage holds only
+        /// `Verified<QuorumCertificate>` because storage holds only
         /// already-verified QCs.
-        qc: Option<VerifiedQuorumCertificate>,
+        qc: Option<Verified<QuorumCertificate>>,
     },
 
     // ═══════════════════════════════════════════════════════════════════════

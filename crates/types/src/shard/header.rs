@@ -1,18 +1,10 @@
 //! Block header containing consensus metadata.
 //!
-//! [`BlockHeader`] is the raw wire form. [`VerifiedBlockHeader`] is the
-//! verified typestate — constructed only via
-//! [`<BlockHeader as Verify>::verify`](Verify::verify) or
-//! [`VerifiedBlockHeader::new_unchecked`].
-//!
-//! Construction asserts: the header's `parent_qc` carries a
-//! [`Verifiable::Verified`] marker — i.e. the parent QC has been
-//! verified against its committee context. The header's `hash()` is
-//! derived from its content by definition, so there is no separately
-//! claimed hash to check.
+//! [`BlockHeader`] is the raw wire form. Its verified form is
+//! `Verified<BlockHeader>`; predicate at [`impl Verify<()>`](Verify::verify)
+//! below.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ops::Deref;
 
 use sbor::prelude::*;
 use thiserror::Error;
@@ -21,8 +13,8 @@ use crate::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight, BoundedBTreeMap, BoundedVec,
     CertificateRoot, Hash, InFlightCount, LocalReceiptRoot, MAX_REMOTE_SHARDS_PER_WAVE,
     MAX_TXS_PER_BLOCK, ProposerTimestamp, ProvisionTxRoot, ProvisionsRoot, QuorumCertificate,
-    Round, ShardGroupId, StateRoot, TransactionRoot, ValidatorId, Verifiable,
-    VerifiedQuorumCertificate, Verify, WaveId,
+    Round, ShardGroupId, StateRoot, TransactionRoot, ValidatorId, Verifiable, Verified, Verify,
+    WaveId,
 };
 
 /// Block header containing consensus metadata.
@@ -38,7 +30,7 @@ pub struct BlockHeader {
     shard_group_id: ShardGroupId,
     height: BlockHeight,
     parent_block_hash: BlockHash,
-    parent_qc: Verifiable<QuorumCertificate, VerifiedQuorumCertificate>,
+    parent_qc: Verifiable<QuorumCertificate>,
     proposer: ValidatorId,
     timestamp: ProposerTimestamp,
     round: Round,
@@ -68,7 +60,7 @@ impl BlockHeader {
         shard_group_id: ShardGroupId,
         height: BlockHeight,
         parent_block_hash: BlockHash,
-        parent_qc: impl Into<Verifiable<QuorumCertificate, VerifiedQuorumCertificate>>,
+        parent_qc: impl Into<Verifiable<QuorumCertificate>>,
         proposer: ValidatorId,
         timestamp: ProposerTimestamp,
         round: Round,
@@ -118,10 +110,10 @@ impl BlockHeader {
             height: BlockHeight::new(0),
             parent_block_hash: BlockHash::from_raw(Hash::from_bytes(&[0u8; 32])),
             // Genesis QC carries no signature and is valid by definition;
-            // `VerifiedQuorumCertificate::genesis` is the only path to a
+            // `Verified::<QuorumCertificate>::genesis` is the only path to a
             // verified genesis value (the predicate's signer check would
             // reject the zero-signers genesis bitfield).
-            parent_qc: Verifiable::Verified(VerifiedQuorumCertificate::genesis(shard_group_id)),
+            parent_qc: Verifiable::Verified(Verified::<QuorumCertificate>::genesis(shard_group_id)),
             proposer,
             timestamp: ProposerTimestamp::ZERO,
             round: Round::INITIAL,
@@ -170,9 +162,7 @@ impl BlockHeader {
     /// verification marker. Used by typestate consumers that branch on
     /// whether the parent QC has already been verified.
     #[must_use]
-    pub const fn parent_qc_verifiable(
-        &self,
-    ) -> &Verifiable<QuorumCertificate, VerifiedQuorumCertificate> {
+    pub const fn parent_qc_verifiable(&self) -> &Verifiable<QuorumCertificate> {
         &self.parent_qc
     }
 
@@ -341,7 +331,7 @@ impl BlockHeader {
         ShardGroupId,
         BlockHeight,
         BlockHash,
-        Verifiable<QuorumCertificate, VerifiedQuorumCertificate>,
+        Verifiable<QuorumCertificate>,
         ValidatorId,
         ProposerTimestamp,
         Round,
@@ -427,79 +417,29 @@ pub enum BlockHeaderVerifyError {
     ParentQcUnverified,
 }
 
-/// Verified block header.
+/// Construction asserts: the header's `parent_qc` carries a
+/// [`Verifiable::Verified`] marker — i.e. the parent QC has been
+/// verified against its committee context. The header's `hash()` is
+/// derived from its content by definition, so there is no separately
+/// claimed hash to check.
 ///
-/// The construction predicate is stated in the module docs. Construction
-/// goes through one of two gates:
+/// Construction goes through one of two gates:
 ///
 /// - [`<BlockHeader as Verify>::verify`](Verify::verify) — checks that
 ///   the embedded `parent_qc` is in [`Verifiable::Verified`].
-/// - [`Self::new_unchecked`] — audit point. Used at storage-recovery
-///   boundaries and at composite-assembly sites that established the
-///   predicate by other means. Every call site documents the trust
-///   source with a `// SAFETY:` comment.
-///
-/// Read-only: [`Deref<Target = BlockHeader>`](Deref) exposes the raw
-/// header's accessors. No `&mut`, no `AsMut`, no `Encode`/`Decode` —
-/// verified values cannot be produced from wire bytes.
-#[repr(transparent)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VerifiedBlockHeader(BlockHeader);
-
-impl VerifiedBlockHeader {
-    /// Audit-point constructor. Skips the predicate.
-    ///
-    /// Permitted use sites: storage-recovery (header was verified
-    /// before persistence), composite-assembly sites that established
-    /// the predicate by other means, and genesis. Every call site
-    /// carries a `// SAFETY:` comment naming the trust source.
-    #[must_use]
-    pub const fn new_unchecked(header: BlockHeader) -> Self {
-        Self(header)
-    }
-
-    /// Consume the verified header and return the raw form. Drops the
-    /// verified claim.
-    #[must_use]
-    pub fn into_inner(self) -> BlockHeader {
-        self.0
-    }
-}
-
-impl AsRef<BlockHeader> for VerifiedBlockHeader {
-    fn as_ref(&self) -> &BlockHeader {
-        &self.0
-    }
-}
-
-impl Deref for VerifiedBlockHeader {
-    type Target = BlockHeader;
-    fn deref(&self) -> &BlockHeader {
-        &self.0
-    }
-}
-
-impl From<VerifiedBlockHeader> for BlockHeader {
-    fn from(verified: VerifiedBlockHeader) -> Self {
-        verified.0
-    }
-}
-
-impl From<VerifiedBlockHeader> for Verifiable<BlockHeader, VerifiedBlockHeader> {
-    fn from(verified: VerifiedBlockHeader) -> Self {
-        Self::Verified(verified)
-    }
-}
-
+/// - [`Verified::<BlockHeader>::new_unchecked`] — audit point. Used at
+///   storage-recovery boundaries and at composite-assembly sites that
+///   established the predicate by other means. Every call site carries
+///   a `// SAFETY:` comment naming the trust source.
 impl Verify<()> for BlockHeader {
-    type Verified = VerifiedBlockHeader;
+    type Augment = ();
     type Error = BlockHeaderVerifyError;
 
-    fn verify(&self, _ctx: ()) -> Result<Self::Verified, Self::Error> {
+    fn verify(&self, _ctx: ()) -> Result<Verified<Self>, Self::Error> {
         if self.parent_qc.verified().is_none() {
             return Err(BlockHeaderVerifyError::ParentQcUnverified);
         }
-        Ok(VerifiedBlockHeader(self.clone()))
+        Ok(Verified::new_unchecked(self.clone()))
     }
 }
 

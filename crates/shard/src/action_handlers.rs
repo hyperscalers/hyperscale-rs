@@ -16,15 +16,14 @@ use hyperscale_types::network::gossip::CommittedBlockHeaderGossip;
 use hyperscale_types::network::notification::{BlockHeaderNotification, BlockVoteNotification};
 use hyperscale_types::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight,
-    BlockManifest, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, CertificateRootContext,
-    CommittedHeaderVerifyError, ConsensusReceipt, FinalizedWave, Hash, InFlightCount,
-    LocalReceiptRootContext, NetworkDefinition, ProposerTimestamp, ProvisionHash,
-    ProvisionTxRootsContext, Provisions, ProvisionsRootContext, QcContext, QuorumCertificate,
-    ReadySignal, Round, RoutableTransaction, ShardGroupId, SignerBitfield, StateRoot,
-    StoredReceipt, TopologySnapshot, TransactionRootContext, ValidatorId, VerifiedBlockVote,
-    VerifiedCertificateRoot, VerifiedLocalReceiptRoot, VerifiedProvisionTxRoots,
-    VerifiedProvisionsRoot, VerifiedQuorumCertificate, VerifiedTransactionRoot, Verify, VotePower,
-    WeightedTimestamp, batch_verify_bls_same_message, block_header_message, block_vote_message,
+    BlockManifest, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, CertificateRoot,
+    CertificateRootContext, CommittedHeaderVerifyError, ConsensusReceipt, FinalizedWave, Hash,
+    InFlightCount, LocalReceiptRoot, LocalReceiptRootContext, NetworkDefinition, ProposerTimestamp,
+    ProvisionHash, ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions, ProvisionsRoot,
+    ProvisionsRootContext, QcContext, QuorumCertificate, ReadySignal, Round, RoutableTransaction,
+    ShardGroupId, SignerBitfield, StateRoot, StoredReceipt, TopologySnapshot, TransactionRoot,
+    TransactionRootContext, ValidatorId, Verified, Verify, VotePower, WeightedTimestamp,
+    batch_verify_bls_same_message, block_header_message, block_vote_message,
     committed_block_header_message, compute_waves, verify_bls12381_v1,
 };
 
@@ -36,15 +35,15 @@ pub struct QcVerificationResult {
     pub block_hash: BlockHash,
     /// Assembled QC, or `None` if quorum wasn't reached or aggregation failed.
     ///
-    /// Carried as a [`VerifiedQuorumCertificate`] because the QC is verified
+    /// Carried as a [`Verified<QuorumCertificate>`] because the QC is verified
     /// by construction: every vote that fed into the aggregation was
     /// individually signature-checked, the signer set cleared the quorum
     /// threshold before aggregation, and `build_qc_from_verified` wraps the
     /// result with `new_unchecked` under that trust source.
-    pub qc: Option<VerifiedQuorumCertificate>,
+    pub qc: Option<Verified<QuorumCertificate>>,
     /// Verified votes returned when no QC was formed (for accumulation across rounds).
     /// Empty when a QC is successfully built.
-    pub verified_votes: Vec<(usize, VerifiedBlockVote, VotePower)>,
+    pub verified_votes: Vec<(usize, Verified<BlockVote>, VotePower)>,
 }
 
 /// Verify block votes and build a quorum certificate if quorum is reached.
@@ -68,7 +67,7 @@ pub fn verify_and_build_qc(
     parent_block_hash: BlockHash,
     parent_weighted_timestamp: WeightedTimestamp,
     votes_to_verify: Vec<(usize, BlockVote, Bls12381G1PublicKey, VotePower)>,
-    already_verified: Vec<(usize, VerifiedBlockVote, VotePower)>,
+    already_verified: Vec<(usize, Verified<BlockVote>, VotePower)>,
     total_voting_power: VotePower,
 ) -> QcVerificationResult {
     let signing_message = block_vote_message(network, shard_group_id, height, round, &block_hash);
@@ -117,8 +116,8 @@ pub fn verify_vote_batch(
     block_hash: BlockHash,
     signing_message: &[u8],
     votes_to_verify: Vec<(usize, BlockVote, Bls12381G1PublicKey, VotePower)>,
-    already_verified: Vec<(usize, VerifiedBlockVote, VotePower)>,
-) -> Vec<(usize, VerifiedBlockVote, VotePower)> {
+    already_verified: Vec<(usize, Verified<BlockVote>, VotePower)>,
+) -> Vec<(usize, Verified<BlockVote>, VotePower)> {
     let mut all_verified = already_verified;
 
     if votes_to_verify.is_empty() {
@@ -138,7 +137,7 @@ pub fn verify_vote_batch(
             // signature in this batch against its committee public key over
             // the canonical `block_vote_message` for `block_hash`, which is
             // exactly the `BlockVote::verify` predicate.
-            all_verified.push((idx, VerifiedBlockVote::new_unchecked(vote), power));
+            all_verified.push((idx, Verified::<BlockVote>::new_unchecked(vote), power));
         }
         return all_verified;
     }
@@ -153,7 +152,7 @@ pub fn verify_vote_batch(
         if verify_bls12381_v1(signing_message, &pk, &vote.signature()) {
             // SAFETY: the per-vote BLS check on the line above re-runs the
             // exact `BlockVote::verify` predicate against the voter's pubkey.
-            all_verified.push((idx, VerifiedBlockVote::new_unchecked(vote), power));
+            all_verified.push((idx, Verified::<BlockVote>::new_unchecked(vote), power));
         } else {
             tracing::warn!(
                 voter = ?vote.voter(),
@@ -174,7 +173,7 @@ pub fn verify_vote_batch(
 ///
 /// Returns `None` only if BLS aggregation itself fails. Caller must ensure
 /// `verified_votes` is non-empty and that quorum has been reached — the
-/// returned QC is wrapped as [`VerifiedQuorumCertificate::new_unchecked`]
+/// returned QC is wrapped as [`Verified::<QuorumCertificate>::new_unchecked`]
 /// under those preconditions (votes were individually signature-checked
 /// before this call and quorum was confirmed in `verify_and_build_qc`).
 pub fn build_qc_from_verified(
@@ -184,8 +183,8 @@ pub fn build_qc_from_verified(
     round: Round,
     parent_block_hash: BlockHash,
     parent_weighted_timestamp: WeightedTimestamp,
-    verified_votes: &[(usize, VerifiedBlockVote, VotePower)],
-) -> Option<VerifiedQuorumCertificate> {
+    verified_votes: &[(usize, Verified<BlockVote>, VotePower)],
+) -> Option<Verified<QuorumCertificate>> {
     let mut sorted: Vec<_> = verified_votes.to_vec();
     sorted.sort_by_key(|(idx, _, _)| *idx);
 
@@ -225,8 +224,8 @@ pub fn build_qc_from_verified(
     // SAFETY: votes were individually signature-verified upstream of this
     // call and `verify_and_build_qc` confirmed quorum before invoking
     // `build_qc_from_verified`. The constructed QC therefore satisfies the
-    // `VerifiedQuorumCertificate` predicate by construction.
-    Some(VerifiedQuorumCertificate::new_unchecked(
+    // `Verified<QuorumCertificate>` predicate by construction.
+    Some(Verified::<QuorumCertificate>::new_unchecked(
         QuorumCertificate::new(
             block_hash,
             shard_group_id,
@@ -308,13 +307,13 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore>(
     let mut provision_hashes: Vec<ProvisionHash> = provisions.iter().map(|p| p.hash()).collect();
     provision_hashes.sort();
 
-    let transaction_root = VerifiedTransactionRoot::compute(&transactions).into_inner();
-    let certificate_root = VerifiedCertificateRoot::compute(&certificates).into_inner();
-    let local_receipt_root = VerifiedLocalReceiptRoot::compute(&receipts).into_inner();
+    let transaction_root = Verified::<TransactionRoot>::compute(&transactions).into_inner();
+    let certificate_root = Verified::<CertificateRoot>::compute(&certificates).into_inner();
+    let local_receipt_root = Verified::<LocalReceiptRoot>::compute(&receipts).into_inner();
     let raw_provision_hashes: Vec<Hash> = provision_hashes.iter().map(|h| h.into_raw()).collect();
-    let provision_root = VerifiedProvisionsRoot::compute(&raw_provision_hashes).into_inner();
+    let provision_root = Verified::<ProvisionsRoot>::compute(&raw_provision_hashes).into_inner();
     let waves = compute_waves(topology, height, &transactions);
-    let provision_tx_roots = VerifiedProvisionTxRoots::compute(topology, &transactions)
+    let provision_tx_roots = Verified::<ProvisionTxRootsMap>::compute(topology, &transactions)
         .into_inner()
         .0;
 
@@ -799,7 +798,7 @@ where
             );
             // SAFETY: we just signed `vote` with our own key, so the
             // BlockVote::verify predicate holds by construction.
-            let verified = VerifiedBlockVote::new_unchecked(vote);
+            let verified = Verified::<BlockVote>::new_unchecked(vote);
             let gossip = BlockVoteNotification::new(verified.clone());
             ctx.network.notify(&next_proposers, &gossip);
             // Feed our own signed vote back for local VoteSet tracking.
@@ -887,7 +886,7 @@ mod tests {
         );
         let already = vec![(
             0usize,
-            VerifiedBlockVote::new_unchecked(v),
+            Verified::<BlockVote>::new_unchecked(v),
             VotePower::new(1),
         )];
         let out = verify_vote_batch(block_hash, b"msg", Vec::new(), already.clone());
@@ -992,7 +991,11 @@ mod tests {
         let verified: Vec<_> = (0..3)
             .map(|i| {
                 let vote = make_vote(&keys, i, block_hash, height, round, 1000);
-                (i, VerifiedBlockVote::new_unchecked(vote), VotePower::new(1))
+                (
+                    i,
+                    Verified::<BlockVote>::new_unchecked(vote),
+                    VotePower::new(1),
+                )
             })
             .collect();
 
@@ -1044,7 +1047,11 @@ mod tests {
                     Round::INITIAL,
                     1000,
                 );
-                (i, VerifiedBlockVote::new_unchecked(vote), VotePower::new(1))
+                (
+                    i,
+                    Verified::<BlockVote>::new_unchecked(vote),
+                    VotePower::new(1),
+                )
             })
             .collect();
 
@@ -1071,7 +1078,7 @@ mod tests {
         let verified = vec![
             (
                 0usize,
-                VerifiedBlockVote::new_unchecked(make_vote(
+                Verified::<BlockVote>::new_unchecked(make_vote(
                     &keys,
                     0,
                     block_hash,
@@ -1083,7 +1090,7 @@ mod tests {
             ),
             (
                 1,
-                VerifiedBlockVote::new_unchecked(make_vote(
+                Verified::<BlockVote>::new_unchecked(make_vote(
                     &keys,
                     1,
                     block_hash,
@@ -1095,7 +1102,7 @@ mod tests {
             ),
             (
                 2,
-                VerifiedBlockVote::new_unchecked(make_vote(
+                Verified::<BlockVote>::new_unchecked(make_vote(
                     &keys,
                     2,
                     block_hash,
@@ -1132,7 +1139,7 @@ mod tests {
         let verified = vec![
             (
                 0usize,
-                VerifiedBlockVote::new_unchecked(make_vote(
+                Verified::<BlockVote>::new_unchecked(make_vote(
                     &keys,
                     0,
                     block_hash,
@@ -1144,7 +1151,7 @@ mod tests {
             ),
             (
                 1,
-                VerifiedBlockVote::new_unchecked(make_vote(
+                Verified::<BlockVote>::new_unchecked(make_vote(
                     &keys,
                     1,
                     block_hash,
@@ -1156,7 +1163,7 @@ mod tests {
             ),
             (
                 2,
-                VerifiedBlockVote::new_unchecked(make_vote(
+                Verified::<BlockVote>::new_unchecked(make_vote(
                     &keys,
                     2,
                     block_hash,
@@ -1257,7 +1264,7 @@ mod tests {
     #[test]
     fn verify_transaction_root_accepts_matching_root_and_rejects_otherwise() {
         let txs: Vec<Arc<RoutableTransaction>> = Vec::new();
-        let root = VerifiedTransactionRoot::compute(&txs).into_inner();
+        let root = Verified::<TransactionRoot>::compute(&txs).into_inner();
         let anchor = WeightedTimestamp::ZERO;
         let ctx = TransactionRootContext {
             transactions: &txs,
@@ -1287,7 +1294,7 @@ mod tests {
             routable_from_notarized_v1(notarized, expired_range).expect("valid notarized fixture"),
         );
         let txs = vec![tx];
-        let root = VerifiedTransactionRoot::compute(&txs).into_inner();
+        let root = Verified::<TransactionRoot>::compute(&txs).into_inner();
 
         let ctx = TransactionRootContext {
             transactions: &txs,
@@ -1305,7 +1312,7 @@ mod tests {
             routable_from_notarized_v1(notarized2, valid_range).expect("valid notarized fixture"),
         );
         let txs2 = vec![tx2];
-        let root2 = VerifiedTransactionRoot::compute(&txs2).into_inner();
+        let root2 = Verified::<TransactionRoot>::compute(&txs2).into_inner();
         let ctx2 = TransactionRootContext {
             transactions: &txs2,
             validity_anchor: anchor,
@@ -1328,7 +1335,7 @@ mod tests {
             routable_from_notarized_v1(notarized, too_wide).expect("valid notarized fixture"),
         );
         let txs = vec![tx];
-        let root = VerifiedTransactionRoot::compute(&txs).into_inner();
+        let root = Verified::<TransactionRoot>::compute(&txs).into_inner();
 
         let ctx = TransactionRootContext {
             transactions: &txs,
@@ -1343,7 +1350,7 @@ mod tests {
     #[test]
     fn verify_provision_root_matches_compute_provision_root() {
         let hashes = vec![Hash::from_bytes(b"a"), Hash::from_bytes(b"b")];
-        let root = VerifiedProvisionsRoot::compute(&hashes).into_inner();
+        let root = Verified::<ProvisionsRoot>::compute(&hashes).into_inner();
         let ctx = ProvisionsRootContext {
             batch_hashes: &hashes,
         };
@@ -1358,7 +1365,7 @@ mod tests {
     #[test]
     fn verify_certificate_root_matches_compute_certificate_root() {
         let certs: Vec<Arc<FinalizedWave>> = Vec::new();
-        let root = VerifiedCertificateRoot::compute(&certs).into_inner();
+        let root = Verified::<CertificateRoot>::compute(&certs).into_inner();
         let ctx = CertificateRootContext {
             certificates: &certs,
         };
@@ -1373,7 +1380,7 @@ mod tests {
     #[test]
     fn verify_local_receipt_root_matches_compute_local_receipt_root() {
         let receipts: Vec<StoredReceipt> = Vec::new();
-        let root = VerifiedLocalReceiptRoot::compute(&receipts).into_inner();
+        let root = Verified::<LocalReceiptRoot>::compute(&receipts).into_inner();
         let ctx = LocalReceiptRootContext {
             receipts: &receipts,
         };

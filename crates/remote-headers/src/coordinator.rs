@@ -19,8 +19,8 @@ use hyperscale_core::{Action, ProtocolEvent};
 use hyperscale_types::{BeaconWitnessLeafCount, BeaconWitnessRoot};
 use hyperscale_types::{
     BlockHeight, Bls12381G1PublicKey, CertifiedBlock, CommittedBlockHeader,
-    CommittedHeaderVerifyError, InFlightCount, REMOTE_HEADER_RETENTION, ShardGroupId,
-    TopologySnapshot, ValidatorId, VerifiedQuorumCertificate, VotePower, WeightedTimestamp,
+    CommittedHeaderVerifyError, InFlightCount, QuorumCertificate, REMOTE_HEADER_RETENTION,
+    ShardGroupId, TopologySnapshot, ValidatorId, Verified, VotePower, WeightedTimestamp,
 };
 use tracing::{debug, info, trace, warn};
 
@@ -251,7 +251,7 @@ impl RemoteHeaderCoordinator {
         shard: ShardGroupId,
         height: BlockHeight,
         header: Arc<CommittedBlockHeader>,
-        result: Result<VerifiedQuorumCertificate, CommittedHeaderVerifyError>,
+        result: Result<Verified<QuorumCertificate>, CommittedHeaderVerifyError>,
     ) -> Vec<Action> {
         let key = (shard, height);
 

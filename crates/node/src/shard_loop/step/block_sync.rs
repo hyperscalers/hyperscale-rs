@@ -48,9 +48,8 @@ use hyperscale_types::network::response::GetBlockResponse;
 #[cfg(test)]
 use hyperscale_types::{BeaconWitnessLeafCount, BeaconWitnessRoot};
 use hyperscale_types::{
-    BlockHeight, CertifiedBlock, ElidedCertifiedBlock, Hash, Inventory, RehydrateError,
-    StoredReceipt, VerifiedCertificateRoot, VerifiedLocalReceiptRoot, VerifiedProvisionsRoot,
-    VerifiedTransactionRoot,
+    BlockHeight, CertificateRoot, CertifiedBlock, ElidedCertifiedBlock, Hash, Inventory,
+    LocalReceiptRoot, ProvisionsRoot, RehydrateError, StoredReceipt, TransactionRoot, Verified,
 };
 
 use crate::shard_io::sync::SyncOutput;
@@ -366,14 +365,14 @@ fn validate_synced_block(
     let header = certified.block().header();
 
     if !certified.block().transactions().is_empty()
-        && VerifiedTransactionRoot::compute(certified.block().transactions()).into_inner()
+        && Verified::<TransactionRoot>::compute(certified.block().transactions()).into_inner()
             != header.transaction_root()
     {
         return Err("transaction_root_mismatch");
     }
 
     if !certified.block().certificates().is_empty() {
-        if VerifiedCertificateRoot::compute(certified.block().certificates()).into_inner()
+        if Verified::<CertificateRoot>::compute(certified.block().certificates()).into_inner()
             != header.certificate_root()
         {
             return Err("certificate_root_mismatch");
@@ -395,7 +394,8 @@ fn validate_synced_block(
             .iter()
             .flat_map(|fw| fw.receipts().iter().cloned())
             .collect();
-        if VerifiedLocalReceiptRoot::compute(&receipts).into_inner() != header.local_receipt_root()
+        if Verified::<LocalReceiptRoot>::compute(&receipts).into_inner()
+            != header.local_receipt_root()
         {
             return Err("local_receipt_root_mismatch");
         }
@@ -408,7 +408,7 @@ fn validate_synced_block(
             .iter()
             .map(|p| p.hash().into_raw())
             .collect();
-        if VerifiedProvisionsRoot::compute(&provision_hashes).into_inner()
+        if Verified::<ProvisionsRoot>::compute(&provision_hashes).into_inner()
             != header.provision_root()
         {
             return Err("provision_root_mismatch");
@@ -548,8 +548,8 @@ mod tests {
             Arc::new(WaveCertificate::new(wave_id, vec![Arc::new(ec)])),
             vec![receipt.clone()],
         ));
-        let lrr = VerifiedLocalReceiptRoot::compute(&[receipt]).into_inner();
-        let cr = VerifiedCertificateRoot::compute(std::slice::from_ref(&fw)).into_inner();
+        let lrr = Verified::<LocalReceiptRoot>::compute(&[receipt]).into_inner();
+        let cr = Verified::<CertificateRoot>::compute(std::slice::from_ref(&fw)).into_inner();
         (fw, lrr, cr)
     }
 
@@ -652,7 +652,7 @@ mod tests {
         let tx = Arc::new(test_transaction(1));
         let h = header_with_roots(
             &header(),
-            Some(VerifiedTransactionRoot::compute(std::slice::from_ref(&tx)).into_inner()),
+            Some(Verified::<TransactionRoot>::compute(std::slice::from_ref(&tx)).into_inner()),
             None,
             None,
         );
@@ -728,8 +728,8 @@ mod tests {
         let h = header_with_roots(
             &header(),
             None,
-            Some(VerifiedCertificateRoot::compute(std::slice::from_ref(&fw)).into_inner()),
-            Some(VerifiedLocalReceiptRoot::compute(&[receipt]).into_inner()),
+            Some(Verified::<CertificateRoot>::compute(std::slice::from_ref(&fw)).into_inner()),
+            Some(Verified::<LocalReceiptRoot>::compute(&[receipt]).into_inner()),
         );
         let block = Block::Live {
             header: h,

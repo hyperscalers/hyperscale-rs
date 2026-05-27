@@ -1,23 +1,21 @@
 //! [`Block`] enum (Live/Sealed).
 //!
-//! [`Block`] is the raw wire form. [`VerifiedBlock`] is the verified
-//! typestate produced by composite assembly — it carries the claim that
-//! the block's header is verified (and thus its parent QC is verified)
-//! and every internal commitment root the block declares has been
-//! checked against the inline data.
+//! [`Block`] is the raw wire form. Its verified form is
+//! `Verified<Block>` — produced by composite assembly, carrying the
+//! claim that the block's header is verified (and thus its parent QC is
+//! verified) and every internal commitment root the block declares has
+//! been checked against the inline data.
 
-use std::ops::Deref;
 use std::sync::Arc;
 
 use sbor::prelude::*;
 use thiserror::Error;
 
 use crate::{
-    BlockHash, BlockHeader, BlockHeight, BoundedVec, FinalizedWave, MAX_FINALIZED_TX_PER_BLOCK,
-    MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash, Provisions, RoutableTransaction,
-    ShardGroupId, StateRoot, TxHash, ValidatorId, VerifiedBeaconWitnessRoot, VerifiedBlockHeader,
-    VerifiedCertificateRoot, VerifiedLocalReceiptRoot, VerifiedProvisionTxRoots,
-    VerifiedProvisionsRoot, VerifiedTransactionRoot,
+    BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight, BoundedVec, CertificateRoot,
+    FinalizedWave, LocalReceiptRoot, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK,
+    MAX_TXS_PER_BLOCK, ProvisionHash, ProvisionTxRootsMap, Provisions, ProvisionsRoot,
+    RoutableTransaction, ShardGroupId, StateRoot, TransactionRoot, TxHash, ValidatorId, Verified,
 };
 
 /// Shared transaction list — wrapped in `Arc` so root-verification actions
@@ -304,52 +302,32 @@ pub enum VerifiedBlockAssembleError {
     },
 }
 
-/// Verified block — header verified plus every internal commitment root
-/// checked against the inline data.
-///
-/// Construction asserts:
-/// 1. The header passes [`<BlockHeader as crate::Verify>`](crate::Verify)
-///    (which transitively asserts `parent_qc` is verified).
-/// 2. The block's contents match its declared commitment roots
-///    (`transaction_root`, `certificate_root`, `local_receipt_root`,
-///    `provision_root`, `provision_tx_roots`, `beacon_witness_root`).
-///    Each per-root check is witnessed by a typed `VerifiedXRoot`
-///    value the constructor consumes.
-///
-/// Construction goes through one of two gates:
-///
-/// - [`Self::assemble`] — composite path. Takes a [`VerifiedBlockHeader`]
-///   for the block plus the typed per-root witnesses, and checks that
-///   the header refers to this block.
-/// - [`Self::new_unchecked`] — audit point. Used at storage-recovery
-///   boundaries and at sites that established the predicate by other
-///   means (e.g. the block was produced and verified in-process). Every
-///   call site documents the trust source with a `// SAFETY:` comment.
-///
-/// State-root verification is intentionally not a witness here. Its
-/// verified value (`VerifiedStateRoot<P>`) carries a `PreparedCommit`
-/// byproduct that the action handler side-channels via
-/// `ActionContext::commit_prepared`, so the verified value can't ride
-/// in cleanly; the JMT-replay check still gates voting and commit via
-/// the parallel pipeline path.
-///
-/// `#[repr(transparent)]` over [`Block`]; [`Deref<Target = Block>`](Deref)
-/// exposes the raw accessors. No mutable access, no `Encode`/`Decode` —
-/// the wire decode path always produces an unverified [`Block`].
-#[repr(transparent)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VerifiedBlock(Block);
-
-impl VerifiedBlock {
-    /// Composite assembly. Pairs `block` with a [`VerifiedBlockHeader`]
+impl Verified<Block> {
+    /// Composite assembly. Pairs `block` with a `Verified<BlockHeader>`
     /// after confirming the header's content matches the block, and
     /// consumes a typed witness for each per-root verification.
     ///
-    /// The witnesses are taken by value: each `VerifiedXRoot` can only
+    /// Construction asserts:
+    /// 1. The header passes [`<BlockHeader as crate::Verify>`](crate::Verify)
+    ///    (which transitively asserts `parent_qc` is verified).
+    /// 2. The block's contents match its declared commitment roots
+    ///    (`transaction_root`, `certificate_root`, `local_receipt_root`,
+    ///    `provision_root`, `provision_tx_roots`, `beacon_witness_root`).
+    ///    Each per-root check is witnessed by a typed `Verified<XRoot>`
+    ///    value the constructor consumes.
+    ///
+    /// The witnesses are taken by value: each `Verified<XRoot>` can only
     /// have been produced by its `Verify` impl (the only constructor
     /// outside `new_unchecked`), so consuming them at assemble time
     /// makes the predicate structurally unforgeable — no caller can
     /// fabricate a "verified" marker without having run the check.
+    ///
+    /// State-root verification is intentionally not a witness here. Its
+    /// verified value (`Verified<StateRoot, PreparedCommit>`) carries a
+    /// byproduct that the action handler side-channels via
+    /// `ActionContext::commit_prepared`, so the verified value can't
+    /// ride in cleanly; the JMT-replay check still gates voting and
+    /// commit via the parallel pipeline path.
     ///
     /// # Errors
     ///
@@ -362,13 +340,13 @@ impl VerifiedBlock {
     )] // typed witnesses are consumed; the moves make the assembly contract explicit
     pub fn assemble(
         block: Block,
-        header: VerifiedBlockHeader,
-        _tx_root: VerifiedTransactionRoot,
-        _certificate_root: VerifiedCertificateRoot,
-        _local_receipt_root: VerifiedLocalReceiptRoot,
-        _provision_root: VerifiedProvisionsRoot,
-        _provision_tx_roots: VerifiedProvisionTxRoots,
-        _beacon_witness_root: VerifiedBeaconWitnessRoot,
+        header: Verified<BlockHeader>,
+        _tx_root: Verified<TransactionRoot>,
+        _certificate_root: Verified<CertificateRoot>,
+        _local_receipt_root: Verified<LocalReceiptRoot>,
+        _provision_root: Verified<ProvisionsRoot>,
+        _provision_tx_roots: Verified<ProvisionTxRootsMap>,
+        _beacon_witness_root: Verified<BeaconWitnessRoot>,
     ) -> Result<Self, VerifiedBlockAssembleError> {
         let header_hash = header.as_ref().hash();
         let block_hash = block.hash();
@@ -378,43 +356,6 @@ impl VerifiedBlock {
                 block_hash,
             });
         }
-        Ok(Self(block))
-    }
-
-    /// Audit-point constructor. Skips the predicate.
-    ///
-    /// Permitted use sites: storage-recovery (block was verified before
-    /// persistence), genesis, and own-block paths where the local
-    /// proposer just built and roots-checked the block in-process. Every
-    /// call site carries a `// SAFETY:` comment naming the trust source.
-    #[must_use]
-    pub const fn new_unchecked(block: Block) -> Self {
-        Self(block)
-    }
-
-    /// Consume the verified block and return the raw form. Drops the
-    /// verified claim.
-    #[must_use]
-    pub fn into_inner(self) -> Block {
-        self.0
-    }
-}
-
-impl AsRef<Block> for VerifiedBlock {
-    fn as_ref(&self) -> &Block {
-        &self.0
-    }
-}
-
-impl Deref for VerifiedBlock {
-    type Target = Block;
-    fn deref(&self) -> &Block {
-        &self.0
-    }
-}
-
-impl From<VerifiedBlock> for Block {
-    fn from(verified: VerifiedBlock) -> Self {
-        verified.0
+        Ok(Self::new_unchecked(block))
     }
 }

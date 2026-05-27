@@ -31,7 +31,7 @@ use hyperscale_storage::{
 use hyperscale_types::BeaconWitnessLeafCount;
 use hyperscale_types::{
     Block, BlockHash, BlockHeight, CertifiedBlock, ConsensusReceipt, FinalizedWave, LocalTimestamp,
-    QuorumCertificate, ShardGroupId, StateRoot, VerifiedCertifiedBlock,
+    QuorumCertificate, ShardGroupId, StateRoot, Verified,
 };
 use tracing::debug;
 
@@ -710,9 +710,9 @@ where
                     // ran the equivalent checks during sync; the QC
                     // itself was verified upstream and the linkage
                     // between QC and block-hash was established at the
-                    // coordinator. The full `VerifiedCertifiedBlock`
+                    // coordinator. The full `Verified<CertifiedBlock>`
                     // predicate holds at this point.
-                    let certified = Arc::new(VerifiedCertifiedBlock::new_unchecked(
+                    let certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked(
                         CertifiedBlock::new_unchecked(
                             Arc::unwrap_or_clone(commit.block),
                             Arc::unwrap_or_clone(commit.qc),

@@ -15,7 +15,7 @@
 use hyperscale_types::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, BeaconWitnessRootVerifyError, BlockHash,
     BlockHeight, ConsensusReceipt, Hash, ReadySignal, Round, ShardWitnessPayload, StoredReceipt,
-    TopologySnapshot, VerifiedBeaconWitnessRoot, Verify, compute_merkle_root,
+    TopologySnapshot, Verified, Verify, compute_merkle_root,
 };
 
 use crate::pending::PendingBlocks;
@@ -276,10 +276,10 @@ pub fn prospective_parent_witness_leaves(
 }
 
 impl Verify<&BeaconWitnessRootContext<'_>> for BeaconWitnessRoot {
-    type Verified = VerifiedBeaconWitnessRoot;
+    type Augment = ();
     type Error = BeaconWitnessRootVerifyError;
 
-    fn verify(&self, ctx: &BeaconWitnessRootContext<'_>) -> Result<Self::Verified, Self::Error> {
+    fn verify(&self, ctx: &BeaconWitnessRootContext<'_>) -> Result<Verified<Self>, Self::Error> {
         let expected_root = *self;
         let missed = missed_proposals_since_prev_commit(
             ctx.height,
@@ -313,7 +313,7 @@ impl Verify<&BeaconWitnessRootContext<'_>> for BeaconWitnessRoot {
                 computed_count: computed_count.inner(),
             });
         }
-        Ok(VerifiedBeaconWitnessRoot::new_unchecked(expected_root))
+        Ok(Verified::<Self>::new_unchecked(expected_root))
     }
 }
 

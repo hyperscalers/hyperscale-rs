@@ -704,21 +704,12 @@ mod tests {
     fn local_dispatch_gossip_preserves_verified_marker() {
         use std::sync::Mutex;
 
-        use hyperscale_types::{NetworkMessage, Verifiable};
+        use hyperscale_types::{NetworkMessage, Verifiable, Verified};
         use sbor::prelude::BasicSbor;
-
-        #[derive(Debug, Clone, PartialEq, Eq)]
-        struct VTest(u32);
-
-        impl AsRef<u32> for VTest {
-            fn as_ref(&self) -> &u32 {
-                &self.0
-            }
-        }
 
         #[derive(Debug, Clone, BasicSbor)]
         struct VTestMsg {
-            payload: Verifiable<u32, VTest>,
+            payload: Verifiable<u32>,
         }
 
         impl NetworkMessage for VTestMsg {
@@ -734,7 +725,7 @@ mod tests {
             Arc::new(std::iter::once(ShardGroupId::new(0)).collect());
         let registry = HandlerRegistry::new(hosted);
 
-        let observed: Arc<Mutex<Option<Verifiable<u32, VTest>>>> = Arc::new(Mutex::new(None));
+        let observed: Arc<Mutex<Option<Verifiable<u32>>>> = Arc::new(Mutex::new(None));
         let observed_clone = Arc::clone(&observed);
 
         registry.register_gossip(
@@ -745,14 +736,14 @@ mod tests {
         );
 
         let verified_msg = VTestMsg {
-            payload: Verifiable::Verified(VTest(42)),
+            payload: Verifiable::Verified(Verified::new_unchecked(42)),
         };
         let verdict = registry.local_dispatch_gossip(&verified_msg, Some(ShardGroupId::new(0)));
         assert_eq!(verdict, Some(GossipVerdict::Accept));
 
         let received = observed.lock().unwrap().clone();
         match received {
-            Some(Verifiable::Verified(VTest(42))) => {}
+            Some(Verifiable::Verified(v)) if *v.as_ref() == 42 => {}
             other => panic!(
                 "local dispatch must preserve Verifiable::Verified across the boundary, got {other:?}"
             ),

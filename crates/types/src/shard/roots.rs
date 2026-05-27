@@ -1,28 +1,22 @@
 //! Merkle root computation and verification for the per-block fields in
 //! [`BlockHeader`].
 //!
-//! Each per-root verified typestate carries the claim that the root was
-//! computed from the canonical leaf data. Construction goes through one
-//! of three gates per type:
+//! Each per-root type's verified form is `Verified<XRoot>`; predicate at
+//! the `impl Verify<&XRootContext<'_>>` below. Construction goes through
+//! one of three gates per type:
 //!
-//! - `VerifiedXRoot::compute(data) -> Self` — produce the canonical
+//! - `Verified::<XRoot>::compute(data) -> Self` — produce the canonical
 //!   root from leaf data. Infallible; verified-by-construction.
-//! - `VerifiedXRoot::verify(claimed, data) -> Result<Self, XRootVerifyError>`
-//!   — recompute from data and compare against `claimed`. On success
-//!   the returned wrapper carries `claimed`, which (by the predicate)
-//!   equals `compute(data)`. The error reports the computed/claimed
-//!   pair on mismatch.
-//! - `VerifiedXRoot::new_unchecked(root) -> Self` — audit point.
-//!   Reserved for storage-recovery and other call sites where the
-//!   predicate was established by other means.
-//!
-//! The free `compute_x_root` functions remain as thin wrappers around
-//! `VerifiedXRoot::compute(...).into_inner()` for proposer / builder
-//! sites that only need the raw root value (e.g. populating a
-//! [`BlockHeader`](crate::BlockHeader) field for the wire).
+//! - `<XRoot as Verify>::verify(&self, ctx)` — recompute from data
+//!   carried in `ctx` and compare against `self`. On success the
+//!   returned wrapper carries `self`, which (by the predicate) equals
+//!   `compute(data)`. The error reports the computed/claimed pair on
+//!   mismatch.
+//! - `Verified::<XRoot>::new_unchecked(root)` — audit point. Reserved
+//!   for storage-recovery and other call sites where the predicate was
+//!   established by other means.
 
 use std::collections::BTreeMap;
-use std::ops::Deref;
 use std::sync::Arc;
 
 use thiserror::Error;
@@ -30,7 +24,7 @@ use thiserror::Error;
 use crate::{
     BeaconWitnessRoot, BoundedBTreeMap, CertificateRoot, FinalizedWave, Hash, LocalReceiptRoot,
     MAX_REMOTE_SHARDS_PER_WAVE, ProvisionTxRoot, ProvisionsRoot, RoutableTransaction, ShardGroupId,
-    StoredReceipt, TopologySnapshot, TransactionRoot, TxHash, Verify, WeightedTimestamp,
+    StoredReceipt, TopologySnapshot, TransactionRoot, TxHash, Verified, Verify, WeightedTimestamp,
     compute_merkle_root,
 };
 
@@ -58,74 +52,38 @@ pub enum CertRootVerifyError {
     },
 }
 
-/// Certificate merkle root whose authenticity against a set of
-/// finalized waves is type-level.
-///
-/// Construction asserts: the wrapped [`CertificateRoot`] equals
-/// `compute_merkle_root` of each underlying wave certificate's
-/// `receipt_hash`, in block order.
-#[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VerifiedCertificateRoot(CertificateRoot);
-
-impl VerifiedCertificateRoot {
+impl Verified<CertificateRoot> {
     /// Compute the certificate root from `certificates`. Verified by
     /// construction.
     #[must_use]
     pub fn compute(certificates: &[Arc<FinalizedWave>]) -> Self {
         if certificates.is_empty() {
-            return Self(CertificateRoot::ZERO);
+            return Self::new_unchecked(CertificateRoot::ZERO);
         }
         let leaves: Vec<Hash> = certificates
             .iter()
             .map(|fw| fw.certificate().receipt_hash().into_raw())
             .collect();
-        Self(CertificateRoot::from_raw(compute_merkle_root(&leaves)))
-    }
-
-    /// Audit-point constructor. Skips the predicate.
-    ///
-    /// Reserved for storage-recovery (root was verified before
-    /// persistence). Every call site carries a `// SAFETY:` comment
-    /// naming the trust source.
-    #[must_use]
-    pub const fn new_unchecked(root: CertificateRoot) -> Self {
-        Self(root)
-    }
-
-    /// Consume and return the raw root, dropping the verified claim.
-    #[must_use]
-    pub const fn into_inner(self) -> CertificateRoot {
-        self.0
+        Self::new_unchecked(CertificateRoot::from_raw(compute_merkle_root(&leaves)))
     }
 }
 
-impl AsRef<CertificateRoot> for VerifiedCertificateRoot {
-    fn as_ref(&self) -> &CertificateRoot {
-        &self.0
-    }
-}
-
-impl Deref for VerifiedCertificateRoot {
-    type Target = CertificateRoot;
-    fn deref(&self) -> &CertificateRoot {
-        &self.0
-    }
-}
-
+/// Construction asserts: the wrapped [`CertificateRoot`] equals
+/// `compute_merkle_root` of each underlying wave certificate's
+/// `receipt_hash`, in block order.
 impl Verify<&CertificateRootContext<'_>> for CertificateRoot {
-    type Verified = VerifiedCertificateRoot;
+    type Augment = ();
     type Error = CertRootVerifyError;
 
-    fn verify(&self, ctx: &CertificateRootContext<'_>) -> Result<Self::Verified, Self::Error> {
-        let computed = VerifiedCertificateRoot::compute(ctx.certificates).0;
+    fn verify(&self, ctx: &CertificateRootContext<'_>) -> Result<Verified<Self>, Self::Error> {
+        let computed = *Verified::<Self>::compute(ctx.certificates).as_ref();
         if computed != *self {
             return Err(CertRootVerifyError::Mismatch {
                 expected: *self,
                 computed,
             });
         }
-        Ok(VerifiedCertificateRoot(*self))
+        Ok(Verified::new_unchecked(*self))
     }
 }
 
@@ -153,70 +111,38 @@ pub enum LocalReceiptRootVerifyError {
     },
 }
 
-/// Local-receipt merkle root whose authenticity against a receipt list
-/// is type-level.
-///
-/// Construction asserts: the wrapped [`LocalReceiptRoot`] equals
-/// `compute_merkle_root` of each receipt's `local_receipt_hash`, in
-/// block order.
-#[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VerifiedLocalReceiptRoot(LocalReceiptRoot);
-
-impl VerifiedLocalReceiptRoot {
+impl Verified<LocalReceiptRoot> {
     /// Compute the local-receipt root from `receipts`. Verified by
     /// construction.
     #[must_use]
     pub fn compute(receipts: &[StoredReceipt]) -> Self {
         if receipts.is_empty() {
-            return Self(LocalReceiptRoot::ZERO);
+            return Self::new_unchecked(LocalReceiptRoot::ZERO);
         }
         let leaves: Vec<Hash> = receipts
             .iter()
             .map(|r| r.consensus.local_receipt_hash())
             .collect();
-        Self(LocalReceiptRoot::from_raw(compute_merkle_root(&leaves)))
-    }
-
-    /// Audit-point constructor. Skips the predicate.
-    #[must_use]
-    pub const fn new_unchecked(root: LocalReceiptRoot) -> Self {
-        Self(root)
-    }
-
-    /// Consume and return the raw root, dropping the verified claim.
-    #[must_use]
-    pub const fn into_inner(self) -> LocalReceiptRoot {
-        self.0
+        Self::new_unchecked(LocalReceiptRoot::from_raw(compute_merkle_root(&leaves)))
     }
 }
 
-impl AsRef<LocalReceiptRoot> for VerifiedLocalReceiptRoot {
-    fn as_ref(&self) -> &LocalReceiptRoot {
-        &self.0
-    }
-}
-
-impl Deref for VerifiedLocalReceiptRoot {
-    type Target = LocalReceiptRoot;
-    fn deref(&self) -> &LocalReceiptRoot {
-        &self.0
-    }
-}
-
+/// Construction asserts: the wrapped [`LocalReceiptRoot`] equals
+/// `compute_merkle_root` of each receipt's `local_receipt_hash`, in
+/// block order.
 impl Verify<&LocalReceiptRootContext<'_>> for LocalReceiptRoot {
-    type Verified = VerifiedLocalReceiptRoot;
+    type Augment = ();
     type Error = LocalReceiptRootVerifyError;
 
-    fn verify(&self, ctx: &LocalReceiptRootContext<'_>) -> Result<Self::Verified, Self::Error> {
-        let computed = VerifiedLocalReceiptRoot::compute(ctx.receipts).0;
+    fn verify(&self, ctx: &LocalReceiptRootContext<'_>) -> Result<Verified<Self>, Self::Error> {
+        let computed = *Verified::<Self>::compute(ctx.receipts).as_ref();
         if computed != *self {
             return Err(LocalReceiptRootVerifyError::Mismatch {
                 expected: *self,
                 computed,
             });
         }
-        Ok(VerifiedLocalReceiptRoot(*self))
+        Ok(Verified::new_unchecked(*self))
     }
 }
 
@@ -244,65 +170,33 @@ pub enum ProvisionRootVerifyError {
     },
 }
 
-/// Provisions merkle root whose authenticity against a list of batch
-/// hashes is type-level.
-///
-/// Construction asserts: the wrapped [`ProvisionsRoot`] equals
-/// `compute_merkle_root` of the batch hashes in block order.
-#[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VerifiedProvisionsRoot(ProvisionsRoot);
-
-impl VerifiedProvisionsRoot {
+impl Verified<ProvisionsRoot> {
     /// Compute the provisions root from `batch_hashes`. Verified by
     /// construction.
     #[must_use]
     pub fn compute(batch_hashes: &[Hash]) -> Self {
         if batch_hashes.is_empty() {
-            return Self(ProvisionsRoot::ZERO);
+            return Self::new_unchecked(ProvisionsRoot::ZERO);
         }
-        Self(ProvisionsRoot::from_raw(compute_merkle_root(batch_hashes)))
-    }
-
-    /// Audit-point constructor. Skips the predicate.
-    #[must_use]
-    pub const fn new_unchecked(root: ProvisionsRoot) -> Self {
-        Self(root)
-    }
-
-    /// Consume and return the raw root, dropping the verified claim.
-    #[must_use]
-    pub const fn into_inner(self) -> ProvisionsRoot {
-        self.0
+        Self::new_unchecked(ProvisionsRoot::from_raw(compute_merkle_root(batch_hashes)))
     }
 }
 
-impl AsRef<ProvisionsRoot> for VerifiedProvisionsRoot {
-    fn as_ref(&self) -> &ProvisionsRoot {
-        &self.0
-    }
-}
-
-impl Deref for VerifiedProvisionsRoot {
-    type Target = ProvisionsRoot;
-    fn deref(&self) -> &ProvisionsRoot {
-        &self.0
-    }
-}
-
+/// Construction asserts: the wrapped [`ProvisionsRoot`] equals
+/// `compute_merkle_root` of the batch hashes in block order.
 impl Verify<&ProvisionsRootContext<'_>> for ProvisionsRoot {
-    type Verified = VerifiedProvisionsRoot;
+    type Augment = ();
     type Error = ProvisionRootVerifyError;
 
-    fn verify(&self, ctx: &ProvisionsRootContext<'_>) -> Result<Self::Verified, Self::Error> {
-        let computed = VerifiedProvisionsRoot::compute(ctx.batch_hashes).0;
+    fn verify(&self, ctx: &ProvisionsRootContext<'_>) -> Result<Verified<Self>, Self::Error> {
+        let computed = *Verified::<Self>::compute(ctx.batch_hashes).as_ref();
         if computed != *self {
             return Err(ProvisionRootVerifyError::Mismatch {
                 expected: *self,
                 computed,
             });
         }
-        Ok(VerifiedProvisionsRoot(*self))
+        Ok(Verified::new_unchecked(*self))
     }
 }
 
@@ -352,9 +246,21 @@ pub enum TxRootVerifyError {
     },
 }
 
-/// Transaction merkle root paired with type-level proof that every
-/// included transaction is in-window for this block.
-///
+impl Verified<TransactionRoot> {
+    /// Compute the transaction root from `transactions`. Verified by
+    /// construction.
+    #[must_use]
+    pub fn compute(transactions: &[Arc<RoutableTransaction>]) -> Self {
+        if transactions.is_empty() {
+            return Self::new_unchecked(TransactionRoot::ZERO);
+        }
+        let leaves: Vec<Hash> = transactions.iter().map(|tx| tx.hash().into_raw()).collect();
+        // Use padded merkle root (power-of-2 padding with Hash::ZERO) so that
+        // merkle inclusion proofs can be generated and verified for any leaf.
+        Self::new_unchecked(TransactionRoot::from_raw(compute_merkle_root(&leaves)))
+    }
+}
+
 /// Construction asserts both:
 ///
 /// 1. The wrapped [`TransactionRoot`] equals `compute_merkle_root` of
@@ -362,56 +268,12 @@ pub enum TxRootVerifyError {
 /// 2. Every transaction's `validity_range` is well-formed against and
 ///    contains the block's `validity_anchor` (the parent QC's
 ///    weighted timestamp).
-#[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VerifiedTransactionRoot(TransactionRoot);
-
-impl VerifiedTransactionRoot {
-    /// Compute the transaction root from `transactions`. Verified by
-    /// construction.
-    #[must_use]
-    pub fn compute(transactions: &[Arc<RoutableTransaction>]) -> Self {
-        if transactions.is_empty() {
-            return Self(TransactionRoot::ZERO);
-        }
-        let leaves: Vec<Hash> = transactions.iter().map(|tx| tx.hash().into_raw()).collect();
-        // Use padded merkle root (power-of-2 padding with Hash::ZERO) so that
-        // merkle inclusion proofs can be generated and verified for any leaf.
-        Self(TransactionRoot::from_raw(compute_merkle_root(&leaves)))
-    }
-
-    /// Audit-point constructor. Skips the predicate.
-    #[must_use]
-    pub const fn new_unchecked(root: TransactionRoot) -> Self {
-        Self(root)
-    }
-
-    /// Consume and return the raw root, dropping the verified claim.
-    #[must_use]
-    pub const fn into_inner(self) -> TransactionRoot {
-        self.0
-    }
-}
-
-impl AsRef<TransactionRoot> for VerifiedTransactionRoot {
-    fn as_ref(&self) -> &TransactionRoot {
-        &self.0
-    }
-}
-
-impl Deref for VerifiedTransactionRoot {
-    type Target = TransactionRoot;
-    fn deref(&self) -> &TransactionRoot {
-        &self.0
-    }
-}
-
 impl Verify<&TransactionRootContext<'_>> for TransactionRoot {
-    type Verified = VerifiedTransactionRoot;
+    type Augment = ();
     type Error = TxRootVerifyError;
 
-    fn verify(&self, ctx: &TransactionRootContext<'_>) -> Result<Self::Verified, Self::Error> {
-        let computed = VerifiedTransactionRoot::compute(ctx.transactions).0;
+    fn verify(&self, ctx: &TransactionRootContext<'_>) -> Result<Verified<Self>, Self::Error> {
+        let computed = *Verified::<Self>::compute(ctx.transactions).as_ref();
         if computed != *self {
             return Err(TxRootVerifyError::Mismatch {
                 expected: *self,
@@ -429,7 +291,7 @@ impl Verify<&TransactionRootContext<'_>> for TransactionRoot {
                 });
             }
         }
-        Ok(VerifiedTransactionRoot(*self))
+        Ok(Verified::new_unchecked(*self))
     }
 }
 
@@ -466,16 +328,7 @@ pub enum ProvisionTxRootsVerifyError {
     },
 }
 
-/// Per-target-shard provision-tx merkle root map whose authenticity
-/// against a block's transactions is type-level.
-///
-/// Construction asserts: the wrapped map equals
-/// [`compute_provision_tx_roots`](crate::compute_provision_tx_roots) of
-/// the block's transactions under the supplied topology.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VerifiedProvisionTxRoots(ProvisionTxRootsMap);
-
-impl VerifiedProvisionTxRoots {
+impl Verified<ProvisionTxRootsMap> {
     /// Compute the per-target-shard provision-tx roots from
     /// `transactions` under `topology`. Verified by construction.
     ///
@@ -520,47 +373,26 @@ impl VerifiedProvisionTxRoots {
                 )
             })
             .collect();
-        Self(map.into())
-    }
-
-    /// Audit-point constructor. Skips the predicate.
-    #[must_use]
-    pub const fn new_unchecked(roots: ProvisionTxRootsMap) -> Self {
-        Self(roots)
-    }
-
-    /// Consume and return the raw bounded map, dropping the verified claim.
-    #[must_use]
-    pub fn into_inner(self) -> ProvisionTxRootsMap {
-        self.0
+        Self::new_unchecked(map.into())
     }
 }
 
-impl AsRef<ProvisionTxRootsMap> for VerifiedProvisionTxRoots {
-    fn as_ref(&self) -> &ProvisionTxRootsMap {
-        &self.0
-    }
-}
-
-impl Deref for VerifiedProvisionTxRoots {
-    type Target = ProvisionTxRootsMap;
-    fn deref(&self) -> &ProvisionTxRootsMap {
-        &self.0
-    }
-}
-
+/// Construction asserts: the wrapped map equals
+/// [`Verified::<ProvisionTxRootsMap>::compute`] of the block's
+/// transactions under the supplied topology.
 impl Verify<&ProvisionTxRootsContext<'_>> for ProvisionTxRootsMap {
-    type Verified = VerifiedProvisionTxRoots;
+    type Augment = ();
     type Error = ProvisionTxRootsVerifyError;
 
-    fn verify(&self, ctx: &ProvisionTxRootsContext<'_>) -> Result<Self::Verified, Self::Error> {
-        let computed = VerifiedProvisionTxRoots::compute(ctx.topology, ctx.transactions);
-        if computed.0 != *self {
+    fn verify(&self, ctx: &ProvisionTxRootsContext<'_>) -> Result<Verified<Self>, Self::Error> {
+        let computed = Verified::<ProvisionTxRootsMap>::compute(ctx.topology, ctx.transactions);
+        if computed.as_ref() != self {
             let expected: BTreeMap<_, _> = self.iter().map(|(k, v)| (*k, *v)).collect();
-            let computed: BTreeMap<_, _> = computed.0.iter().map(|(k, v)| (*k, *v)).collect();
+            let computed: BTreeMap<_, _> =
+                computed.as_ref().iter().map(|(k, v)| (*k, *v)).collect();
             return Err(ProvisionTxRootsVerifyError::Mismatch { expected, computed });
         }
-        Ok(VerifiedProvisionTxRoots(self.clone()))
+        Ok(Verified::new_unchecked(self.clone()))
     }
 }
 
@@ -590,43 +422,4 @@ pub enum BeaconWitnessRootVerifyError {
         /// Count computed from the recomputed leaves.
         computed_count: u64,
     },
-}
-
-/// Verified beacon-witness root whose authenticity against the block's
-/// witness inputs is type-level.
-///
-/// Construction asserts: re-deriving the block's new witness payloads
-/// from `receipts`, the missed-round walk, and `ready_signals` (in the
-/// canonical leaf-derivation order), appending their leaf hashes to
-/// `parent_witness_leaves`, and merkle-ing the result produces a root
-/// and leaf count equal to the wrapped values.
-#[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VerifiedBeaconWitnessRoot(BeaconWitnessRoot);
-
-impl VerifiedBeaconWitnessRoot {
-    /// Audit-point constructor. Skips the predicate.
-    #[must_use]
-    pub const fn new_unchecked(root: BeaconWitnessRoot) -> Self {
-        Self(root)
-    }
-
-    /// Consume and return the raw root, dropping the verified claim.
-    #[must_use]
-    pub const fn into_inner(self) -> BeaconWitnessRoot {
-        self.0
-    }
-}
-
-impl AsRef<BeaconWitnessRoot> for VerifiedBeaconWitnessRoot {
-    fn as_ref(&self) -> &BeaconWitnessRoot {
-        &self.0
-    }
-}
-
-impl Deref for VerifiedBeaconWitnessRoot {
-    type Target = BeaconWitnessRoot;
-    fn deref(&self) -> &BeaconWitnessRoot {
-        &self.0
-    }
 }

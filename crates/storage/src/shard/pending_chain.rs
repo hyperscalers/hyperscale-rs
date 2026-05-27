@@ -10,9 +10,9 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use hyperscale_jmt::{Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_types::{
-    BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, CommittedBlockHeader, ConsensusReceipt,
-    ExecutionCertificate, FinalizedWave, MerkleInclusionProof, NodeId, QuorumCertificate,
-    RoutableTransaction, ShardWitnessPayload, StateRoot, TxHash, VerifiedCertifiedBlock,
+    BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, CertifiedBlock, CommittedBlockHeader,
+    ConsensusReceipt, ExecutionCertificate, FinalizedWave, MerkleInclusionProof, NodeId,
+    QuorumCertificate, RoutableTransaction, ShardWitnessPayload, StateRoot, TxHash, Verified,
     WaveCertificate, WaveId,
 };
 use radix_common::prelude::DatabaseUpdate;
@@ -53,7 +53,7 @@ pub struct ChainEntry {
     /// [`PendingChain::attach_certified_block`] from
     /// `BlockCommitCoordinator::accumulate`, making the block visible to
     /// fetch handlers throughout the shard-committed / JMT-persisted window.
-    pub certified_block: Option<Arc<VerifiedCertifiedBlock>>,
+    pub certified_block: Option<Arc<Verified<CertifiedBlock>>>,
 }
 
 /// Append-only index of pending block state, shared between the `io_loop`
@@ -156,7 +156,7 @@ where
     pub fn attach_certified_block(
         &self,
         block_hash: BlockHash,
-        certified: Arc<VerifiedCertifiedBlock>,
+        certified: Arc<Verified<CertifiedBlock>>,
     ) {
         if let Some(entry) = write_or_recover(&self.entries).get_mut(&block_hash) {
             entry.certified_block = Some(certified);
@@ -171,7 +171,7 @@ where
     /// Forks may produce multiple pending entries at the same height;
     /// only the entry whose block won certification ever gets a
     /// `certified_block`, so iteration here is unambiguous.
-    pub fn certified_block(&self, height: BlockHeight) -> Option<Arc<VerifiedCertifiedBlock>> {
+    pub fn certified_block(&self, height: BlockHeight) -> Option<Arc<Verified<CertifiedBlock>>> {
         let pending = self.pending_certified_at(height);
         if pending.is_some() {
             return pending;
@@ -182,7 +182,7 @@ where
         // them through the unified read path.
         self.base
             .get_block(height)
-            .map(|cb| Arc::new(VerifiedCertifiedBlock::new_unchecked(cb)))
+            .map(|cb| Arc::new(Verified::<CertifiedBlock>::new_unchecked(cb)))
     }
 
     /// Committed header at `height`. Header-only view of
@@ -291,7 +291,7 @@ where
     /// attached. Scoped so the read lock drops before the result is used —
     /// holding it across the caller's match arms would chain the lock
     /// lifetime to base-storage reads on the fall-through path.
-    fn pending_certified_at(&self, height: BlockHeight) -> Option<Arc<VerifiedCertifiedBlock>> {
+    fn pending_certified_at(&self, height: BlockHeight) -> Option<Arc<Verified<CertifiedBlock>>> {
         read_or_recover(&self.entries)
             .values()
             .find(|e| e.height == height)
@@ -1259,11 +1259,11 @@ mod tests {
 
     use crate::test_helpers::{make_test_block, make_test_qc};
 
-    fn make_certified(height: BlockHeight) -> Arc<VerifiedCertifiedBlock> {
+    fn make_certified(height: BlockHeight) -> Arc<Verified<CertifiedBlock>> {
         let block = make_test_block(height);
         let qc = make_test_qc(&block);
         // SAFETY: synthetic test fixture, no real signature.
-        Arc::new(VerifiedCertifiedBlock::new_unchecked(
+        Arc::new(Verified::<CertifiedBlock>::new_unchecked(
             CertifiedBlock::new_unchecked(block, qc),
         ))
     }
@@ -1272,7 +1272,7 @@ mod tests {
         chain: &PendingChain<StubStore>,
         height: BlockHeight,
         attach: bool,
-    ) -> Arc<VerifiedCertifiedBlock> {
+    ) -> Arc<Verified<CertifiedBlock>> {
         let certified = make_certified(height);
         let block_hash = certified.block().hash();
         chain.insert(
@@ -1313,7 +1313,7 @@ mod tests {
     #[test]
     fn certified_block_falls_through_to_storage_for_persisted_heights() {
         let persisted = make_certified(BlockHeight::new(3));
-        let chain = chain_with_persisted(vec![persisted.as_certified().clone()]);
+        let chain = chain_with_persisted(vec![persisted.as_ref().as_ref().clone()]);
         let got = chain
             .certified_block(BlockHeight::new(3))
             .expect("should fall through to persisted storage");
@@ -1329,7 +1329,7 @@ mod tests {
     #[test]
     fn committed_header_pending_persisted_and_missing() {
         let persisted = make_certified(BlockHeight::new(2));
-        let chain = chain_with_persisted(vec![persisted.as_certified().clone()]);
+        let chain = chain_with_persisted(vec![persisted.as_ref().as_ref().clone()]);
         let pending = insert_pending(&chain, BlockHeight::new(7), true);
 
         let p = chain
@@ -1348,7 +1348,7 @@ mod tests {
     #[test]
     fn transactions_for_block_pending_persisted_and_missing() {
         let persisted = make_certified(BlockHeight::new(4));
-        let chain = chain_with_persisted(vec![persisted.as_certified().clone()]);
+        let chain = chain_with_persisted(vec![persisted.as_ref().as_ref().clone()]);
         let _ = insert_pending(&chain, BlockHeight::new(9), true);
 
         // `make_test_block` produces an empty tx list — assert presence, not contents.
@@ -1373,7 +1373,7 @@ mod tests {
     #[test]
     fn block_for_sync_falls_through_to_storage() {
         let persisted = make_certified(BlockHeight::new(3));
-        let stub = StubStore::default().with_block(persisted.as_certified().clone());
+        let stub = StubStore::default().with_block(persisted.as_ref().as_ref().clone());
         // StubStore's get_block_for_sync isn't implemented above; rather
         // than expand the stub, exercise just the pending arm here. The
         // persisted fall-through is covered by integration tests in the

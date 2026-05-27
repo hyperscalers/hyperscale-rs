@@ -1,25 +1,15 @@
 //! Quorum certificate for shard consensus.
 //!
-//! [`QuorumCertificate`] is the raw wire form. [`VerifiedQuorumCertificate`]
-//! is the verified typestate — constructed only via
-//! [`<QuorumCertificate as Verify>::verify`](Verify::verify), [`VerifiedQuorumCertificate::genesis`],
-//! or [`VerifiedQuorumCertificate::new_unchecked`].
-//!
-//! Construction asserts: the aggregated BLS signature over the QC's signing
-//! message validates against the aggregated public keys selected by the
-//! signer bitfield, **and** the signers' combined voting power meets the
-//! quorum threshold. The QC↔block linkage check (`qc.block_hash ==
-//! block.header.hash()`) is *not* part of this predicate — it belongs to
-//! the container types that hold the QC.
-
-use std::ops::Deref;
+//! [`QuorumCertificate`] is the raw wire form. Its verified form is
+//! `Verified<QuorumCertificate>`; predicate at
+//! [`impl Verify<&QcContext<'_>>`](Verify::verify) below.
 
 use sbor::prelude::*;
 use thiserror::Error;
 
 use crate::{
     BlockHash, BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, NetworkDefinition, Round,
-    ShardGroupId, SignerBitfield, Verifiable, Verify, VotePower, WeightedTimestamp,
+    ShardGroupId, SignerBitfield, Verified, Verify, VotePower, WeightedTimestamp,
     block_vote_message, verify_bls12381_v1, zero_bls_signature,
 };
 
@@ -267,88 +257,41 @@ pub enum QcVerifyError {
     },
 }
 
-/// Verified quorum certificate.
-///
-/// The construction predicate is stated in the module docs. Construction
-/// goes through one of three gates:
-///
-/// - [`<QuorumCertificate as Verify>::verify`](Verify::verify) — runs the
-///   full predicate.
-/// - [`Self::genesis`] — produces the well-defined zero-signature QC for
-///   block 0. Valid by definition; no signature exists to verify.
-/// - [`Self::new_unchecked`] — audit point. Used at storage-recovery
-///   boundaries where the QC was verified before persistence, and to
-///   re-wrap QCs assembled from already-verified votes inside
-///   `build_qc_from_verified`. Every call site carries a `// SAFETY:`
-///   comment naming the trust source.
-///
-/// Read-only: [`Deref<Target = QuorumCertificate>`](Deref) exposes the
-/// raw QC's accessors. No `&mut`, no `AsMut`, no `Encode`/`Decode` —
-/// verified values cannot be produced from wire bytes.
-#[repr(transparent)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VerifiedQuorumCertificate(QuorumCertificate);
-
-impl VerifiedQuorumCertificate {
+impl Verified<QuorumCertificate> {
     /// Verified form of the genesis QC. Valid by definition: the genesis
     /// QC carries no signature, and `verify` would reject it for having
     /// zero signers, so this constructor is the only path to the genesis
     /// verified value.
     #[must_use]
     pub const fn genesis(shard_group_id: ShardGroupId) -> Self {
-        Self(QuorumCertificate::genesis(shard_group_id))
-    }
-
-    /// Audit-point constructor. Skips the predicate.
-    ///
-    /// Permitted use sites: storage-recovery (QC was verified before
-    /// persistence) and `build_qc_from_verified` (QC assembled from
-    /// already-verified votes). Every call site documents the trust
-    /// source with a `// SAFETY:` comment. `grep new_unchecked` produces
-    /// the audit list.
-    #[must_use]
-    pub const fn new_unchecked(qc: QuorumCertificate) -> Self {
-        Self(qc)
-    }
-
-    /// Consume the verified QC and return the raw form. Drops the
-    /// verified claim.
-    #[must_use]
-    pub fn into_inner(self) -> QuorumCertificate {
-        self.0
+        Self::new_unchecked(QuorumCertificate::genesis(shard_group_id))
     }
 }
 
-impl AsRef<QuorumCertificate> for VerifiedQuorumCertificate {
-    fn as_ref(&self) -> &QuorumCertificate {
-        &self.0
-    }
-}
-
-impl Deref for VerifiedQuorumCertificate {
-    type Target = QuorumCertificate;
-    fn deref(&self) -> &QuorumCertificate {
-        &self.0
-    }
-}
-
-impl From<VerifiedQuorumCertificate> for QuorumCertificate {
-    fn from(verified: VerifiedQuorumCertificate) -> Self {
-        verified.0
-    }
-}
-
-impl From<VerifiedQuorumCertificate> for Verifiable<QuorumCertificate, VerifiedQuorumCertificate> {
-    fn from(verified: VerifiedQuorumCertificate) -> Self {
-        Self::Verified(verified)
-    }
-}
-
+/// Construction asserts: the aggregated BLS signature over the QC's
+/// signing message validates against the aggregated public keys selected
+/// by the signer bitfield, **and** the signers' combined voting power
+/// meets the quorum threshold. The QC↔block linkage check
+/// (`qc.block_hash == block.header.hash()`) is *not* part of this
+/// predicate — it belongs to the container types that hold the QC.
+///
+/// Construction goes through one of three gates:
+///
+/// - [`<QuorumCertificate as Verify>::verify`](Verify::verify) — runs the
+///   full predicate.
+/// - [`Verified::<QuorumCertificate>::genesis`] — produces the
+///   well-defined zero-signature QC for block 0. Valid by definition; no
+///   signature exists to verify.
+/// - [`Verified::<QuorumCertificate>::new_unchecked`] — audit point. Used
+///   at storage-recovery boundaries where the QC was verified before
+///   persistence, and to re-wrap QCs assembled from already-verified
+///   votes inside `build_qc_from_verified`. Every call site carries a
+///   `// SAFETY:` comment naming the trust source.
 impl Verify<&QcContext<'_>> for QuorumCertificate {
-    type Verified = VerifiedQuorumCertificate;
+    type Augment = ();
     type Error = QcVerifyError;
 
-    fn verify(&self, ctx: &QcContext<'_>) -> Result<Self::Verified, Self::Error> {
+    fn verify(&self, ctx: &QcContext<'_>) -> Result<Verified<Self>, Self::Error> {
         let signer_keys: Vec<Bls12381G1PublicKey> = ctx
             .public_keys
             .iter()
@@ -379,7 +322,7 @@ impl Verify<&QcContext<'_>> for QuorumCertificate {
             });
         }
 
-        Ok(VerifiedQuorumCertificate(self.clone()))
+        Ok(Verified::new_unchecked(self.clone()))
     }
 }
 

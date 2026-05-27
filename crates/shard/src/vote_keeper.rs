@@ -25,7 +25,7 @@ use hyperscale_core::Action;
 use hyperscale_types::{BeaconWitnessLeafCount, BeaconWitnessRoot};
 use hyperscale_types::{
     BlockHash, BlockHeader, BlockHeight, BlockVote, Round, TopologySnapshot, ValidatorId,
-    Verifiable, VerifiedBlockVote, VotePower,
+    Verifiable, Verified, VotePower,
 };
 use tracing::{info, trace, warn};
 
@@ -202,7 +202,7 @@ impl VoteKeeper {
     pub fn accept_vote(
         &mut self,
         topology: &TopologySnapshot,
-        vote: Verifiable<BlockVote, VerifiedBlockVote>,
+        vote: Verifiable<BlockVote>,
         committed_height: BlockHeight,
         header_for_vote: Option<&BlockHeader>,
     ) -> Vec<Action> {
@@ -273,7 +273,7 @@ impl VoteKeeper {
                 // that trust source.
                 vote_set.add_verified_vote(
                     voter_index,
-                    VerifiedBlockVote::new_unchecked(raw),
+                    Verified::<BlockVote>::new_unchecked(raw),
                     voting_power,
                 );
             }
@@ -385,7 +385,7 @@ impl VoteKeeper {
     pub fn finalize_pending_batch(
         &mut self,
         block_hash: BlockHash,
-        verified_votes: Vec<(usize, VerifiedBlockVote, VotePower)>,
+        verified_votes: Vec<(usize, Verified<BlockVote>, VotePower)>,
     ) {
         let Some(vote_set) = self.vote_sets.get_mut(&block_hash) else {
             warn!(

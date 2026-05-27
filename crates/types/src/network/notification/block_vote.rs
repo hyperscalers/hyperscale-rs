@@ -2,7 +2,7 @@
 
 use sbor::prelude::BasicSbor;
 
-use crate::{BlockVote, MessageClass, NetworkMessage, Verifiable, VerifiedBlockVote};
+use crate::{BlockVote, MessageClass, NetworkMessage, Verifiable};
 
 /// Vote on a block proposal. 2f+1 matching votes create a `QuorumCertificate`.
 ///
@@ -13,13 +13,13 @@ pub struct BlockVoteNotification {
     /// The block vote — wire bytes always land in [`Verifiable::Unverified`];
     /// local-dispatched sends from a colocated voter preserve
     /// [`Verifiable::Verified`].
-    pub vote: Verifiable<BlockVote, VerifiedBlockVote>,
+    pub vote: Verifiable<BlockVote>,
 }
 
 impl BlockVoteNotification {
     /// Create a new block vote notification message.
     #[must_use]
-    pub fn new(vote: impl Into<Verifiable<BlockVote, VerifiedBlockVote>>) -> Self {
+    pub fn new(vote: impl Into<Verifiable<BlockVote>>) -> Self {
         Self { vote: vote.into() }
     }
 
@@ -31,7 +31,7 @@ impl BlockVoteNotification {
 
     /// Consume and return the inner block vote wrapper.
     #[must_use]
-    pub const fn into_vote(self) -> Verifiable<BlockVote, VerifiedBlockVote> {
+    pub const fn into_vote(self) -> Verifiable<BlockVote> {
         self.vote
     }
 }

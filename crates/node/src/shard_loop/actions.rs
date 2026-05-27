@@ -15,7 +15,7 @@ use hyperscale_shard::action_handlers::handle_action as handle_shard_action;
 use hyperscale_storage::{BeaconWitnessCommit, ShardStorage};
 use hyperscale_types::{
     Block, BlockHeight, CertifiedBlock, QuorumCertificate, StateRoot, TopologySnapshot,
-    TransactionStatus, TxHash, VerifiedCertifiedBlock, VerifiedQuorumCertificate,
+    TransactionStatus, TxHash, Verified,
 };
 use tracing::{debug, error, trace, warn};
 
@@ -236,7 +236,7 @@ where
         // doesn't need to re-verify.
         let qc = storage
             .latest_qc()
-            .map(VerifiedQuorumCertificate::new_unchecked);
+            .map(Verified::<QuorumCertificate>::new_unchecked);
         push_protocol_event(
             self.event_sender(),
             self.shard,
@@ -463,9 +463,9 @@ where
                 // checks during sync; the QC itself was verified
                 // upstream and the linkage between QC and block-hash
                 // was established at the coordinator. The full
-                // `VerifiedCertifiedBlock` predicate holds at this
+                // `Verified<CertifiedBlock>` predicate holds at this
                 // point.
-                let certified = Arc::new(VerifiedCertifiedBlock::new_unchecked(
+                let certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked(
                     CertifiedBlock::new_unchecked(
                         Arc::unwrap_or_clone(block),
                         Arc::unwrap_or_clone(qc),

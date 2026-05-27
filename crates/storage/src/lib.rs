@@ -40,7 +40,7 @@ pub use shard::genesis::GenesisCommit;
 pub use shard::overlay::{SubstateDbLookup, SubstateLookup};
 pub use shard::pending_chain::{BaseReadCache, ChainEntry, PendingChain, SubstateView};
 pub use shard::recovered_state::RecoveredState;
-pub use shard::state_root::{StateRootContext, StateRootVerifyError, VerifiedStateRoot};
+pub use shard::state_root::{StateRootContext, StateRootVerifyError};
 pub use shard::store::{SubstateStore, VersionedStore};
 pub use shard::writes::{merge_database_updates, merge_into, merge_updates_from_receipts};
 pub use tree::{CollectedWrites, JmtSnapshot, LeafSubstateKeyAssociation};
