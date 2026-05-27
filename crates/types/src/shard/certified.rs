@@ -100,6 +100,14 @@ impl CertifiedBlock {
         self.qc.as_unverified()
     }
 
+    /// Borrow the QC's [`Verifiable`] wrapper, exposing the verification
+    /// marker. Used by typestate consumers that branch on whether the
+    /// QC has already been verified.
+    #[must_use]
+    pub const fn qc_verifiable(&self) -> &Verifiable<QuorumCertificate> {
+        &self.qc
+    }
+
     /// Consume the pair and return its parts.
     #[must_use]
     pub fn into_parts(self) -> (Block, Verifiable<QuorumCertificate>) {
@@ -218,6 +226,45 @@ impl Verified<CertifiedBlock> {
             qc: Verifiable::Verified(qc),
         }))
     }
+
+    /// Borrow the verified QC. Total by the [`Verified<CertifiedBlock>`]
+    /// predicate, which stores a [`Verifiable::Verified`] QC at
+    /// assembly time.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the embedded QC is `Unverified` — only reachable
+    /// through a misuse of [`Verified::new_unchecked`].
+    #[must_use]
+    pub fn qc_verified(&self) -> &Verified<QuorumCertificate> {
+        self.qc_verifiable()
+            .verified()
+            .expect("Verified<CertifiedBlock> predicate guarantees qc is Verified")
+    }
+
+    /// Consume into a verified-`Block` + verified-QC pair. Total by the
+    /// [`Verified<CertifiedBlock>`] predicate: assembly consumed a
+    /// `Verified<Block>` and a `Verified<QuorumCertificate>`. The
+    /// re-wrap on `Block` skips the predicate via
+    /// [`Verified::new_unchecked`] because the wrapper was discarded at
+    /// assembly time but the predicate still holds.
+    #[must_use]
+    pub fn into_verified_parts(self) -> (Verified<Block>, Verified<QuorumCertificate>) {
+        let (cb, ()) = self.into_parts();
+        let CertifiedBlock { block, qc } = cb;
+        let qc = match qc {
+            Verifiable::Verified(v) => v,
+            Verifiable::Unverified(_) => {
+                unreachable!("Verified<CertifiedBlock> predicate guarantees qc is Verified")
+            }
+        };
+        // SAFETY: Verified<CertifiedBlock>::assemble consumed a
+        // Verified<Block>; the wrapper was discarded but the predicate
+        // (header verified + every per-root verifier passed) still
+        // holds for the contained block.
+        let block = Verified::<Block>::new_unchecked(block);
+        (block, qc)
+    }
 }
 
 #[cfg(test)]
@@ -256,5 +303,38 @@ mod tests {
         let bytes_unverified = basic_encode(&unverified).unwrap();
         let bytes_verified = basic_encode(&verified).unwrap();
         assert_eq!(bytes_unverified, bytes_verified);
+    }
+
+    /// `Verified<CertifiedBlock>::into_verified_parts` round-trips both
+    /// halves: the QC borrow matches what `qc_verified` returns, and the
+    /// resulting `Verified<Block>` agrees with the input block.
+    #[test]
+    fn into_verified_parts_round_trips() {
+        let block = Block::genesis(ShardGroupId::new(0), ValidatorId::new(0), StateRoot::ZERO);
+        let block_hash = block.hash();
+        let raw_qc = QuorumCertificate::genesis(ShardGroupId::new(0));
+        let qc_for_block = QuorumCertificate::new(
+            block_hash,
+            raw_qc.shard_group_id(),
+            raw_qc.height(),
+            raw_qc.parent_block_hash(),
+            raw_qc.round(),
+            raw_qc.signers().clone(),
+            raw_qc.aggregated_signature(),
+            raw_qc.weighted_timestamp(),
+        );
+        let verified_qc = Verified::<QuorumCertificate>::new_unchecked(qc_for_block);
+
+        let cb = CertifiedBlock {
+            block: block.clone(),
+            qc: Verifiable::Verified(verified_qc),
+        };
+        let verified_cb = Verified::<CertifiedBlock>::new_unchecked(cb);
+
+        // qc_verified borrow agrees with into_verified_parts consume.
+        let qc_borrow_hash = verified_cb.qc_verified().block_hash();
+        let (vb, vq) = verified_cb.into_verified_parts();
+        assert_eq!(vq.block_hash(), qc_borrow_hash);
+        assert_eq!(vb.hash(), block.hash());
     }
 }

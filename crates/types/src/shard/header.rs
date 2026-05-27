@@ -443,6 +443,25 @@ impl Verify<()> for BlockHeader {
     }
 }
 
+impl Verified<BlockHeader> {
+    /// Borrow the verified parent QC. Total by the
+    /// [`Verified<BlockHeader>`] predicate, which requires
+    /// `parent_qc` to sit in [`Verifiable::Verified`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if a caller produced a `Verified<BlockHeader>` whose
+    /// `parent_qc` is `Unverified` — only reachable through a misuse of
+    /// [`Verified::new_unchecked`]. The audit list at the
+    /// `new_unchecked` call sites is the right place to investigate.
+    #[must_use]
+    pub fn parent_qc_verified(&self) -> &Verified<QuorumCertificate> {
+        self.parent_qc_verifiable()
+            .verified()
+            .expect("Verified<BlockHeader> predicate guarantees parent_qc is Verified")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use sbor::{
@@ -536,5 +555,28 @@ mod tests {
                 if expected == MAX_REMOTE_SHARDS_PER_WAVE
                     && actual == MAX_REMOTE_SHARDS_PER_WAVE + 1
         ));
+    }
+
+    /// Genesis headers verify (`parent_qc` arrives pre-marked verified),
+    /// and the resulting `Verified<BlockHeader>` projects out the
+    /// verified parent QC through the type-level borrow.
+    #[test]
+    fn verified_header_projects_parent_qc() {
+        let header = sample_header();
+        let verified = header.verify(()).expect("genesis header verifies");
+        let pqc = verified.parent_qc_verified();
+        assert!(pqc.is_genesis());
+    }
+
+    /// A header with an unverified `parent_qc` fails `verify`, so the
+    /// projector is unreachable without resorting to `new_unchecked`.
+    #[test]
+    fn verify_rejects_unverified_parent_qc() {
+        let mut header = sample_header();
+        header.parent_qc = Verifiable::Unverified(header.parent_qc.as_unverified().clone());
+        let err = header
+            .verify(())
+            .expect_err("unverified parent_qc rejected");
+        assert_eq!(err, BlockHeaderVerifyError::ParentQcUnverified);
     }
 }

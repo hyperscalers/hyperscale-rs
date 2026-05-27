@@ -15,7 +15,8 @@ use crate::{
     BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight, BoundedVec, CertificateRoot,
     FinalizedWave, LocalReceiptRoot, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK,
     MAX_TXS_PER_BLOCK, ProvisionHash, ProvisionTxRootsMap, Provisions, ProvisionsRoot,
-    RoutableTransaction, ShardGroupId, StateRoot, TransactionRoot, TxHash, ValidatorId, Verified,
+    QuorumCertificate, RoutableTransaction, ShardGroupId, StateRoot, TransactionRoot, TxHash,
+    ValidatorId, Verified,
 };
 
 /// Shared transaction list — wrapped in `Arc` so root-verification actions
@@ -357,5 +358,24 @@ impl Verified<Block> {
             });
         }
         Ok(Self::new_unchecked(block))
+    }
+
+    /// Borrow the verified parent QC. Total by the
+    /// [`Verified<Block>`] predicate, which folds in
+    /// [`Verified<BlockHeader>`]'s claim that `parent_qc` sits in
+    /// [`Verifiable::Verified`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the embedded header's `parent_qc` is `Unverified` —
+    /// only reachable through a misuse of
+    /// [`Verified::new_unchecked`].
+    #[must_use]
+    pub fn parent_qc_verified(&self) -> &Verified<QuorumCertificate> {
+        self.as_ref()
+            .header()
+            .parent_qc_verifiable()
+            .verified()
+            .expect("Verified<Block> predicate guarantees header.parent_qc is Verified")
     }
 }
