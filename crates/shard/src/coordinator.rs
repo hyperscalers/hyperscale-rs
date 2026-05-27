@@ -3517,7 +3517,7 @@ mod tests {
     }
 
     fn make_test_qc(block_hash: BlockHash, height: BlockHeight) -> VerifiedQuorumCertificate {
-        // SAFETY: test scaffold — QC built locally, no real signature.
+        // SAFETY: synthetic test fixture, no real signature.
         VerifiedQuorumCertificate::new_unchecked(QuorumCertificate::new(
             block_hash,
             ShardGroupId::new(0),
@@ -3742,7 +3742,7 @@ mod tests {
             "precondition: latest_qc not yet at height 1"
         );
 
-        // SAFETY: test scaffold — the parent_qc was constructed locally,
+        // SAFETY: synthetic test fixture, parent_qc was constructed locally,
         // so wrapping it as verified models the action arm's success result.
         let verified = VerifiedQuorumCertificate::new_unchecked(header.parent_qc().clone());
         let _ = state.on_qc_signature_verified(&topology, block_hash, Ok(verified));
@@ -3821,7 +3821,7 @@ mod tests {
         );
 
         // QC verified — but state root verification is still pending, so no vote yet.
-        // SAFETY: test scaffold — parent_qc built locally.
+        // SAFETY: synthetic test fixture, parent_qc built locally.
         let verified = VerifiedQuorumCertificate::new_unchecked(header.parent_qc().clone());
         let after_qc = state.on_qc_signature_verified(&topology, block_hash, Ok(verified));
         assert!(
@@ -4394,7 +4394,7 @@ mod tests {
 
         let qc = {
             let __qc = make_test_qc(block_3_hash, BlockHeight::new(3));
-            // SAFETY: test scaffold — synthetic QC.
+            // SAFETY: synthetic test fixture, no real signature.
             VerifiedQuorumCertificate::new_unchecked(QuorumCertificate::new(
                 __qc.block_hash(),
                 __qc.shard_group_id(),
@@ -4672,7 +4672,7 @@ mod tests {
         );
 
         // Simulate verification success; same path as on_qc_signature_verified(valid=true).
-        // SAFETY: test scaffold — synthetic QC, no real signature.
+        // SAFETY: synthetic test fixture, no real signature.
         state
             .verification
             .cache_verified_qc(VerifiedQuorumCertificate::new_unchecked(parent_qc.clone()));
@@ -4750,7 +4750,7 @@ mod tests {
         };
 
         // Cache the honest QC as if it had been verified.
-        // SAFETY: test scaffold — synthetic QC.
+        // SAFETY: synthetic test fixture, no real signature.
         state
             .verification
             .cache_verified_qc(VerifiedQuorumCertificate::new_unchecked(honest_qc.clone()));
@@ -4855,7 +4855,7 @@ mod tests {
                 BlockHash::from_raw(Hash::from_bytes(b"block_3")),
                 BlockHeight::new(3),
             );
-            // SAFETY: test scaffold — synthetic QC.
+            // SAFETY: synthetic test fixture, no real signature.
             VerifiedQuorumCertificate::new_unchecked(QuorumCertificate::new(
                 __qc.block_hash(),
                 __qc.shard_group_id(),
@@ -4909,7 +4909,7 @@ mod tests {
                 BlockHash::from_raw(Hash::from_bytes(b"block_3")),
                 BlockHeight::new(3),
             );
-            // SAFETY: test scaffold — synthetic QC.
+            // SAFETY: synthetic test fixture, no real signature.
             VerifiedQuorumCertificate::new_unchecked(QuorumCertificate::new(
                 __qc.block_hash(),
                 __qc.shard_group_id(),
@@ -5040,7 +5040,7 @@ mod tests {
                 BlockHash::from_raw(Hash::from_bytes(b"block_5")),
                 BlockHeight::new(5),
             );
-            // SAFETY: test scaffold — synthetic QC.
+            // SAFETY: synthetic test fixture, no real signature.
             VerifiedQuorumCertificate::new_unchecked(QuorumCertificate::new(
                 __qc.block_hash(),
                 __qc.shard_group_id(),
@@ -5198,7 +5198,7 @@ mod tests {
                 BlockHash::from_raw(Hash::from_bytes(b"block_3")),
                 BlockHeight::new(3),
             );
-            // SAFETY: test scaffold — synthetic QC.
+            // SAFETY: synthetic test fixture, no real signature.
             VerifiedQuorumCertificate::new_unchecked(QuorumCertificate::new(
                 __qc.block_hash(),
                 __qc.shard_group_id(),
@@ -5234,7 +5234,7 @@ mod tests {
                 BlockHash::from_raw(Hash::from_bytes(b"block_3")),
                 BlockHeight::new(3),
             );
-            // SAFETY: test scaffold — synthetic QC.
+            // SAFETY: synthetic test fixture, no real signature.
             VerifiedQuorumCertificate::new_unchecked(QuorumCertificate::new(
                 __qc.block_hash(),
                 __qc.shard_group_id(),
@@ -5298,7 +5298,7 @@ mod tests {
                 BlockHash::from_raw(Hash::from_bytes(b"block_3")),
                 BlockHeight::new(3),
             );
-            // SAFETY: test scaffold — synthetic QC.
+            // SAFETY: synthetic test fixture, no real signature.
             VerifiedQuorumCertificate::new_unchecked(QuorumCertificate::new(
                 __qc.block_hash(),
                 __qc.shard_group_id(),

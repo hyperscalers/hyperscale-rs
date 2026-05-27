@@ -391,7 +391,7 @@ mod tests {
             zero_bls_signature(),
             WeightedTimestamp::from_millis(1000),
         );
-        // SAFETY: scaffold-only QC; the verified view requires a
+        // SAFETY: synthetic test fixture; the verified view requires a
         // VerifiedQuorumCertificate input.
         let qc = VerifiedQuorumCertificate::new_unchecked(qc);
 
