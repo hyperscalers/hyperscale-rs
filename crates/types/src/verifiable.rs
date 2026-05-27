@@ -156,10 +156,10 @@ impl<U, V: AsRef<U>> From<U> for Verifiable<U, V> {
 }
 
 /// Deref to the raw `U` so consumers can call `U`'s accessor methods on
-/// the wrapper without an explicit `.as_unverified()` hop. This is the
-/// read-only equivalent of the plan's "wrapper is for storage, not
-/// function signatures" — callers reading off the wire form keep
-/// working unchanged after a container's field type changes from `U` to
+/// the wrapper without an explicit `.as_unverified()` hop. The wrapper
+/// is for storage (struct fields, event payloads, buffers), not for
+/// function signatures: callers reading off the wire form keep working
+/// unchanged after a container's field type changes from `U` to
 /// `Verifiable<U, V>`. Verified-aware code uses [`Self::verified`]
 /// explicitly to branch on the marker.
 impl<U, V: AsRef<U>> Deref for Verifiable<U, V> {

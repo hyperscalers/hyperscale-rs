@@ -10,8 +10,7 @@
 //! signer bitfield, **and** the signers' combined voting power meets the
 //! quorum threshold. The QC↔block linkage check (`qc.block_hash ==
 //! block.header.hash()`) is *not* part of this predicate — it belongs to
-//! the container types that hold the QC (see `LinkedCertifiedBlock` in
-//! Phase 1, `VerifiedCertifiedBlock` in Phase 3).
+//! the container types that hold the QC.
 
 use std::ops::Deref;
 
@@ -20,8 +19,8 @@ use thiserror::Error;
 
 use crate::{
     BlockHash, BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, NetworkDefinition, Round,
-    ShardGroupId, SignerBitfield, Verify, VotePower, WeightedTimestamp, block_vote_message,
-    verify_bls12381_v1, zero_bls_signature,
+    ShardGroupId, SignerBitfield, Verifiable, Verify, VotePower, WeightedTimestamp,
+    block_vote_message, verify_bls12381_v1, zero_bls_signature,
 };
 
 /// A quorum certificate proving 2f+1 validators voted for a block.
@@ -336,6 +335,12 @@ impl Deref for VerifiedQuorumCertificate {
 impl From<VerifiedQuorumCertificate> for QuorumCertificate {
     fn from(verified: VerifiedQuorumCertificate) -> Self {
         verified.0
+    }
+}
+
+impl From<VerifiedQuorumCertificate> for Verifiable<QuorumCertificate, VerifiedQuorumCertificate> {
+    fn from(verified: VerifiedQuorumCertificate) -> Self {
+        Self::Verified(verified)
     }
 }
 

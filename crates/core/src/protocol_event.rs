@@ -485,8 +485,10 @@ pub enum ProtocolEvent {
         height: BlockHeight,
         /// Hash of the highest committed block, if present.
         hash: Option<BlockHash>,
-        /// Latest QC found in storage, if present.
-        qc: Option<QuorumCertificate>,
+        /// Latest QC found in storage, if present. Carried as
+        /// `VerifiedQuorumCertificate` because storage holds only
+        /// already-verified QCs.
+        qc: Option<VerifiedQuorumCertificate>,
     },
 
     // ═══════════════════════════════════════════════════════════════════════

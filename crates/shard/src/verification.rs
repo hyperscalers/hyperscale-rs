@@ -16,7 +16,7 @@ use hyperscale_core::{Action, VerificationKind};
 use hyperscale_types::{BeaconWitnessLeafCount, BeaconWitnessRoot};
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, FinalizedWave, InFlightCount,
-    LocalReceiptRoot, ProvisionsRoot, QuorumCertificate, StateRoot, TopologySnapshot,
+    LocalReceiptRoot, ProvisionsRoot, StateRoot, TopologySnapshot, VerifiedQuorumCertificate,
 };
 use tracing::{debug, trace, warn};
 
@@ -115,7 +115,7 @@ pub struct VerificationPipeline {
     /// reuse a known-cached `block_hash` while fabricating `signers`,
     /// `round`, or `parent_block_hash` and have those fields adopted into
     /// `latest_qc` / drive view sync without re-verification.
-    verified_qcs: HashMap<BlockHash, QuorumCertificate>,
+    verified_qcs: HashMap<BlockHash, VerifiedQuorumCertificate>,
 
     // === State root verification ===
     /// Blocks where state root verification is currently in-flight.
@@ -270,7 +270,7 @@ impl VerificationPipeline {
     /// when no QC for that block has been verified yet. Callers MUST compare
     /// the candidate QC to the cached value byte-for-byte before treating it
     /// as a cache hit — see the field doc on [`Self::verified_qcs`].
-    pub fn cached_qc(&self, qc_block_hash: &BlockHash) -> Option<&QuorumCertificate> {
+    pub fn cached_qc(&self, qc_block_hash: &BlockHash) -> Option<&VerifiedQuorumCertificate> {
         self.verified_qcs.get(qc_block_hash)
     }
 
@@ -285,7 +285,7 @@ impl VerificationPipeline {
     }
 
     /// Cache a verified QC to skip future re-verification.
-    pub fn cache_verified_qc(&mut self, qc: QuorumCertificate) {
+    pub fn cache_verified_qc(&mut self, qc: VerifiedQuorumCertificate) {
         let qc_block_hash = qc.block_hash();
         let qc_height = qc.height();
         self.verified_qcs.insert(qc_block_hash, qc);
@@ -1373,7 +1373,7 @@ mod tests {
     fn chain_view<'a>(
         committed_height: BlockHeight,
         committed_hash: BlockHash,
-        latest_qc: Option<&'a QuorumCertificate>,
+        latest_qc: Option<&'a VerifiedQuorumCertificate>,
         pending: &'a PendingBlocks,
     ) -> ChainView<'a> {
         ChainView::new(

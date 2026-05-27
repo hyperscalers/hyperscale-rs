@@ -15,7 +15,7 @@ use hyperscale_shard::action_handlers::handle_action as handle_shard_action;
 use hyperscale_storage::{BeaconWitnessCommit, ShardStorage};
 use hyperscale_types::{
     Block, BlockHeight, CertifiedBlock, QuorumCertificate, StateRoot, TopologySnapshot,
-    TransactionStatus, TxHash,
+    TransactionStatus, TxHash, VerifiedQuorumCertificate,
 };
 use tracing::{debug, error, trace, warn};
 
@@ -231,7 +231,12 @@ where
         let storage = &self.io.storage;
         let height = storage.committed_height();
         let hash = storage.committed_hash();
-        let qc = storage.latest_qc();
+        // SAFETY: QCs only land in storage after verification at the
+        // shard-consensus admission boundary, so the recovery wrap
+        // doesn't need to re-verify.
+        let qc = storage
+            .latest_qc()
+            .map(VerifiedQuorumCertificate::new_unchecked);
         push_protocol_event(
             self.event_sender(),
             self.shard,

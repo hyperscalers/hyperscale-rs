@@ -365,13 +365,17 @@ pub fn assemble_build_action(
         ),
     };
 
+    // The proposer's new BlockHeader will carry parent_qc in its wire
+    // form; SBOR encoding is byte-identical between the raw and
+    // verified shapes, but the field type is raw.
+    let parent_qc_raw = parent_qc.into_inner();
     let action = Action::BuildProposal {
         shard_group_id: topology.local_shard(),
         proposer: topology.local_validator_id(),
         height,
         round,
         parent_block_hash,
-        parent_qc,
+        parent_qc: parent_qc_raw,
         timestamp,
         is_fallback,
         parent_state_root,

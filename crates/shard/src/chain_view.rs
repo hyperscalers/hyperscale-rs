@@ -15,8 +15,8 @@ use std::collections::HashSet;
 #[cfg(test)]
 use hyperscale_types::{BeaconWitnessLeafCount, BeaconWitnessRoot};
 use hyperscale_types::{
-    Block, BlockHash, BlockHeader, BlockHeight, InFlightCount, ProvisionHash, QuorumCertificate,
-    ShardGroupId, StateRoot, TxHash, WaveId,
+    Block, BlockHash, BlockHeader, BlockHeight, InFlightCount, ProvisionHash, ShardGroupId,
+    StateRoot, TxHash, VerifiedQuorumCertificate, WaveId,
 };
 use tracing::warn;
 
@@ -27,7 +27,7 @@ pub struct ChainView<'a> {
     committed_height: BlockHeight,
     committed_hash: BlockHash,
     committed_state_root: StateRoot,
-    latest_qc: Option<&'a QuorumCertificate>,
+    latest_qc: Option<&'a VerifiedQuorumCertificate>,
     pending: &'a PendingBlocks,
 }
 
@@ -37,7 +37,7 @@ impl<'a> ChainView<'a> {
         committed_height: BlockHeight,
         committed_hash: BlockHash,
         committed_state_root: StateRoot,
-        latest_qc: Option<&'a QuorumCertificate>,
+        latest_qc: Option<&'a VerifiedQuorumCertificate>,
         pending: &'a PendingBlocks,
     ) -> Self {
         Self {
@@ -102,12 +102,12 @@ impl<'a> ChainView<'a> {
     /// Parent to use when building the next proposal: the latest QC's block
     /// if any, otherwise the committed tip under a genesis QC tagged with
     /// the local shard.
-    pub fn proposal_parent(&self) -> (BlockHash, QuorumCertificate) {
+    pub fn proposal_parent(&self) -> (BlockHash, VerifiedQuorumCertificate) {
         self.latest_qc.map_or_else(
             || {
                 (
                     self.committed_hash,
-                    QuorumCertificate::genesis(self.local_shard),
+                    VerifiedQuorumCertificate::genesis(self.local_shard),
                 )
             },
             |qc| (qc.block_hash(), qc.clone()),
@@ -176,8 +176,8 @@ mod tests {
 
     use hyperscale_types::{
         BlockManifest, BoundedVec, CertificateRoot, Hash, LocalReceiptRoot, LocalTimestamp,
-        ProposerTimestamp, ProvisionsRoot, Round, ShardGroupId, SignerBitfield, TransactionRoot,
-        ValidatorId, WeightedTimestamp, zero_bls_signature,
+        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, SignerBitfield,
+        TransactionRoot, ValidatorId, WeightedTimestamp, zero_bls_signature,
     };
 
     use super::*;
@@ -221,7 +221,7 @@ mod tests {
         committed_hash: BlockHash,
         committed_state_root: StateRoot,
         pending: &PendingBlocks,
-        latest_qc: Option<&QuorumCertificate>,
+        latest_qc: Option<&VerifiedQuorumCertificate>,
         f: impl FnOnce(&ChainView<'_>) -> R,
     ) -> R {
         let view = ChainView {
@@ -391,6 +391,9 @@ mod tests {
             zero_bls_signature(),
             WeightedTimestamp::from_millis(1000),
         );
+        // SAFETY: scaffold-only QC; the verified view requires a
+        // VerifiedQuorumCertificate input.
+        let qc = VerifiedQuorumCertificate::new_unchecked(qc);
 
         run_view(
             0,

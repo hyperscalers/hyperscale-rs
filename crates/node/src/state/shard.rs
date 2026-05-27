@@ -63,7 +63,7 @@
 use hyperscale_core::{Action, ProtocolEvent, TimerId};
 use hyperscale_types::{
     BlockHash, BlockHeader, BlockManifest, CertifiedBlock, MAX_FINALIZED_TX_PER_BLOCK,
-    MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, QuorumCertificate,
+    MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, VerifiedQuorumCertificate,
 };
 
 use super::NodeStateMachine;
@@ -271,7 +271,11 @@ impl NodeStateMachine {
     }
 
     /// QC formed — may trigger immediate next proposal.
-    fn on_qc_formed(&mut self, block_hash: BlockHash, qc: &QuorumCertificate) -> Vec<Action> {
+    fn on_qc_formed(
+        &mut self,
+        block_hash: BlockHash,
+        qc: &VerifiedQuorumCertificate,
+    ) -> Vec<Action> {
         // Count transactions and certificates in the block that will be
         // committed. Critical for in-flight limits: the `BlockCommitted`
         // event won't be processed until after we select transactions, so
