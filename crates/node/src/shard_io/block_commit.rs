@@ -30,8 +30,8 @@ use hyperscale_storage::{
 #[cfg(test)]
 use hyperscale_types::BeaconWitnessLeafCount;
 use hyperscale_types::{
-    Block, BlockHash, BlockHeight, CertifiedBlock, ConsensusReceipt, FinalizedWave,
-    LinkedCertifiedBlock, LocalTimestamp, QuorumCertificate, ShardGroupId, StateRoot,
+    Block, BlockHash, BlockHeight, CertifiedBlock, ConsensusReceipt, FinalizedWave, LocalTimestamp,
+    QuorumCertificate, ShardGroupId, StateRoot, VerifiedCertifiedBlock,
 };
 use tracing::debug;
 
@@ -704,9 +704,15 @@ where
                 if !already_notified[i] {
                     let commit = commit_slots[i].take().unwrap();
                     // SAFETY: the commit pipeline only enqueues commits
-                    // after QC verification and block-hash linkage, so
-                    // the typestate wrap matches what is established.
-                    let certified = Arc::new(LinkedCertifiedBlock::new_unchecked(
+                    // after this node either voted on the block (which
+                    // requires every applicable per-root verifier to
+                    // have succeeded) or observed the certifying QC and
+                    // ran the equivalent checks during sync; the QC
+                    // itself was verified upstream and the linkage
+                    // between QC and block-hash was established at the
+                    // coordinator. The full `VerifiedCertifiedBlock`
+                    // predicate holds at this point.
+                    let certified = Arc::new(VerifiedCertifiedBlock::new_unchecked(
                         CertifiedBlock::new_unchecked(
                             Arc::unwrap_or_clone(commit.block),
                             Arc::unwrap_or_clone(commit.qc),

@@ -46,9 +46,10 @@ use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::ShardChainReader;
 use hyperscale_storage_rocksdb::{RocksDbShardStorage, SharedStorage};
 use hyperscale_types::{
-    Block, BlockHeight, Bls12381G1PrivateKey, CertifiedBlock, InFlightCount, LinkedCertifiedBlock,
-    LocalTimestamp, MAX_TX_IN_FLIGHT, NodeId, QuorumCertificate, RoutableTransaction, ShardGroupId,
-    TopologySnapshot, TransactionStatus, TxHash, ValidatorId, shard_for_node,
+    Block, BlockHeight, Bls12381G1PrivateKey, CertifiedBlock, InFlightCount, LocalTimestamp,
+    MAX_TX_IN_FLIGHT, NodeId, QuorumCertificate, RoutableTransaction, ShardGroupId,
+    TopologySnapshot, TransactionStatus, TxHash, ValidatorId, VerifiedCertifiedBlock,
+    shard_for_node,
 };
 use libp2p::identity::Keypair;
 use quick_cache::sync::Cache as QuickCache;
@@ -782,9 +783,14 @@ impl ProductionRunner {
                     __qc.weighted_timestamp(),
                 )
             };
-            // SAFETY: genesis pair is constructed locally with a
-            // matching block_hash; no adversarial input.
-            let genesis_certified = Arc::new(LinkedCertifiedBlock::new_unchecked(
+            // SAFETY: genesis is constructed locally with empty
+            // content (no txs, no certificates, no provisions, no
+            // beacon-witness deltas over the empty accumulator), so
+            // every per-root predicate holds trivially against the
+            // empty-input compute; the synthetic genesis QC pairs with
+            // `genesis_block.hash()` by construction; no adversarial
+            // input touches it before the typestate wrap.
+            let genesis_certified = Arc::new(VerifiedCertifiedBlock::new_unchecked(
                 CertifiedBlock::new_unchecked(genesis_block, genesis_qc),
             ));
             let genesis_commit_output = host.step(ShardEvent::protocol(

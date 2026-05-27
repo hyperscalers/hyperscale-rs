@@ -16,11 +16,13 @@ use hyperscale_core::Action;
 use hyperscale_types::{BeaconWitnessLeafCount, BeaconWitnessRoot};
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, FinalizedWave, InFlightCount,
-    LinkageError, LinkedCertifiedBlock, LocalReceiptRoot, ProvisionsRoot, StateRoot,
-    TopologySnapshot, VerifiedBeaconWitnessRoot, VerifiedCertificateRoot, VerifiedLocalReceiptRoot,
+    LinkageError, LocalReceiptRoot, ProvisionsRoot, StateRoot, TopologySnapshot,
+    VerifiedBeaconWitnessRoot, VerifiedBlock, VerifiedBlockAssembleError, VerifiedBlockHeader,
+    VerifiedCertificateRoot, VerifiedCertifiedBlock, VerifiedLocalReceiptRoot,
     VerifiedProvisionTxRoots, VerifiedProvisionsRoot, VerifiedQuorumCertificate,
     VerifiedTransactionRoot,
 };
+use thiserror::Error;
 use tracing::{debug, trace, warn};
 
 use crate::beacon_witnesses::{BeaconWitnessAccumulator, prospective_parent_witness_leaves};
@@ -121,8 +123,26 @@ pub struct PendingStateRootVerification {
     pub block_height: BlockHeight,
 }
 
+/// Why [`VerificationPipeline::try_complete_assembly`] rejected the
+/// completed slot set. Both variants are defensive — a coordinator bug
+/// is the only way either is reachable at runtime.
+#[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
+pub enum AssemblyError {
+    /// [`VerifiedBlock::assemble`] rejected the (block, header) pair.
+    /// Structurally impossible: `block.hash()` is defined as
+    /// `block.header().hash()`, so they always agree on a well-formed
+    /// `Block`.
+    #[error(transparent)]
+    Block(VerifiedBlockAssembleError),
+    /// [`VerifiedCertifiedBlock::assemble`] rejected the (block, qc)
+    /// pair. Structurally impossible: the QC was associated with this
+    /// block's hash via the slot-keying invariant of `record_qc_assembly`.
+    #[error(transparent)]
+    Linkage(LinkageError),
+}
+
 /// A block awaiting the sub-results required to produce a
-/// [`LinkedCertifiedBlock`]: a verified QC paired with the block, plus
+/// [`VerifiedCertifiedBlock`]: a verified QC paired with the block, plus
 /// per-root verification outcomes for the block's internal commitments.
 ///
 /// Each per-root slot is `Some(value)` either because the verification
@@ -262,7 +282,7 @@ pub struct VerificationPipeline {
 
     // === Composite assembly ===
     /// Blocks awaiting all sub-results required to produce a
-    /// [`LinkedCertifiedBlock`]. Keyed by `block.hash()`. Entries are
+    /// [`VerifiedCertifiedBlock`]. Keyed by `block.hash()`. Entries are
     /// inserted via [`Self::track_pending_assembly`] and removed when the
     /// completion check fires inside [`Self::record_qc_assembly`].
     pending_assemblies: HashMap<BlockHash, PendingAssembly>,
@@ -399,7 +419,7 @@ impl VerificationPipeline {
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Start tracking `block` as awaiting the sub-results required for
-    /// [`LinkedCertifiedBlock`] assembly. The QC slot starts empty.
+    /// [`VerifiedCertifiedBlock`] assembly. The QC slot starts empty.
     /// Per-root slots reflect the current pipeline state:
     ///
     /// - if the block carries no relevant content for a kind, the slot
@@ -465,15 +485,17 @@ impl VerificationPipeline {
 
     /// Populate the QC slot for `block_hash`'s pending assembly. When the
     /// last outstanding slot lands as a result, the entry is removed and
-    /// a [`LinkedCertifiedBlock`] is produced via
-    /// [`LinkedCertifiedBlock::assemble_from_qc`]. Returns `None` when no
+    /// a [`VerifiedCertifiedBlock`] is produced by feeding the verified
+    /// header + typed per-root witnesses into [`VerifiedBlock::assemble`]
+    /// then linking the resulting verified block with the QC via
+    /// [`VerifiedCertifiedBlock::assemble`]. Returns `None` when no
     /// assembly is tracked for `block_hash`, or when more sub-results are
     /// still outstanding.
     pub fn record_qc_assembly(
         &mut self,
         block_hash: BlockHash,
         qc: VerifiedQuorumCertificate,
-    ) -> Option<Result<LinkedCertifiedBlock, LinkageError>> {
+    ) -> Option<Result<VerifiedCertifiedBlock, AssemblyError>> {
         let entry = self.pending_assemblies.get_mut(&block_hash)?;
         entry.qc_result = Some(qc);
         self.try_complete_assembly(block_hash)
@@ -484,7 +506,7 @@ impl VerificationPipeline {
         &mut self,
         block_hash: BlockHash,
         verified: VerifiedTransactionRoot,
-    ) -> Option<Result<LinkedCertifiedBlock, LinkageError>> {
+    ) -> Option<Result<VerifiedCertifiedBlock, AssemblyError>> {
         let entry = self.pending_assemblies.get_mut(&block_hash)?;
         entry.tx_root_result = Some(verified);
         self.try_complete_assembly(block_hash)
@@ -495,7 +517,7 @@ impl VerificationPipeline {
         &mut self,
         block_hash: BlockHash,
         verified: VerifiedCertificateRoot,
-    ) -> Option<Result<LinkedCertifiedBlock, LinkageError>> {
+    ) -> Option<Result<VerifiedCertifiedBlock, AssemblyError>> {
         let entry = self.pending_assemblies.get_mut(&block_hash)?;
         entry.certificate_root_result = Some(verified);
         self.try_complete_assembly(block_hash)
@@ -506,7 +528,7 @@ impl VerificationPipeline {
         &mut self,
         block_hash: BlockHash,
         verified: VerifiedLocalReceiptRoot,
-    ) -> Option<Result<LinkedCertifiedBlock, LinkageError>> {
+    ) -> Option<Result<VerifiedCertifiedBlock, AssemblyError>> {
         let entry = self.pending_assemblies.get_mut(&block_hash)?;
         entry.local_receipt_root_result = Some(verified);
         self.try_complete_assembly(block_hash)
@@ -517,7 +539,7 @@ impl VerificationPipeline {
         &mut self,
         block_hash: BlockHash,
         verified: VerifiedProvisionsRoot,
-    ) -> Option<Result<LinkedCertifiedBlock, LinkageError>> {
+    ) -> Option<Result<VerifiedCertifiedBlock, AssemblyError>> {
         let entry = self.pending_assemblies.get_mut(&block_hash)?;
         entry.provision_root_result = Some(verified);
         self.try_complete_assembly(block_hash)
@@ -528,7 +550,7 @@ impl VerificationPipeline {
         &mut self,
         block_hash: BlockHash,
         verified: VerifiedProvisionTxRoots,
-    ) -> Option<Result<LinkedCertifiedBlock, LinkageError>> {
+    ) -> Option<Result<VerifiedCertifiedBlock, AssemblyError>> {
         let entry = self.pending_assemblies.get_mut(&block_hash)?;
         entry.provision_tx_roots_result = Some(verified);
         self.try_complete_assembly(block_hash)
@@ -539,7 +561,7 @@ impl VerificationPipeline {
         &mut self,
         block_hash: BlockHash,
         verified: VerifiedBeaconWitnessRoot,
-    ) -> Option<Result<LinkedCertifiedBlock, LinkageError>> {
+    ) -> Option<Result<VerifiedCertifiedBlock, AssemblyError>> {
         let entry = self.pending_assemblies.get_mut(&block_hash)?;
         entry.beacon_witness_root_result = Some(verified);
         self.try_complete_assembly(block_hash)
@@ -549,7 +571,7 @@ impl VerificationPipeline {
     pub fn record_state_root_result(
         &mut self,
         block_hash: BlockHash,
-    ) -> Option<Result<LinkedCertifiedBlock, LinkageError>> {
+    ) -> Option<Result<VerifiedCertifiedBlock, AssemblyError>> {
         let entry = self.pending_assemblies.get_mut(&block_hash)?;
         entry.state_root_result = Some(());
         self.try_complete_assembly(block_hash)
@@ -558,7 +580,7 @@ impl VerificationPipeline {
     fn try_complete_assembly(
         &mut self,
         block_hash: BlockHash,
-    ) -> Option<Result<LinkedCertifiedBlock, LinkageError>> {
+    ) -> Option<Result<VerifiedCertifiedBlock, AssemblyError>> {
         if !self.pending_assemblies.get(&block_hash)?.is_complete() {
             return None;
         }
@@ -567,7 +589,48 @@ impl VerificationPipeline {
         let qc = entry
             .qc_result
             .expect("completion check just confirmed qc_result is Some");
-        Some(LinkedCertifiedBlock::assemble_from_qc(block, qc))
+        let tx_root = entry
+            .tx_root_result
+            .expect("completion check just confirmed tx_root_result is Some");
+        let certificate_root = entry
+            .certificate_root_result
+            .expect("completion check just confirmed certificate_root_result is Some");
+        let local_receipt_root = entry
+            .local_receipt_root_result
+            .expect("completion check just confirmed local_receipt_root_result is Some");
+        let provision_root = entry
+            .provision_root_result
+            .expect("completion check just confirmed provision_root_result is Some");
+        let provision_tx_roots = entry
+            .provision_tx_roots_result
+            .expect("completion check just confirmed provision_tx_roots_result is Some");
+        let beacon_witness_root = entry
+            .beacon_witness_root_result
+            .expect("completion check just confirmed beacon_witness_root_result is Some");
+
+        // SAFETY: the slot prefill (or per-root setter) only populates the
+        // typed witnesses on successful verification, which includes the
+        // parent QC having been verified — `VerifiedBlockHeader::verify`'s
+        // sole predicate. We materialise the verified header directly here
+        // rather than re-running the trait impl against a header whose
+        // `parent_qc` is still raw on the wire-decoded `Block`.
+        let verified_header = VerifiedBlockHeader::new_unchecked(block.header().clone());
+
+        let verified_block = match VerifiedBlock::assemble(
+            block,
+            verified_header,
+            tx_root,
+            certificate_root,
+            local_receipt_root,
+            provision_root,
+            provision_tx_roots,
+            beacon_witness_root,
+        ) {
+            Ok(v) => v,
+            Err(e) => return Some(Err(AssemblyError::Block(e))),
+        };
+
+        Some(VerifiedCertifiedBlock::assemble(verified_block, qc).map_err(AssemblyError::Linkage))
     }
 
     /// Number of in-flight composite assemblies.

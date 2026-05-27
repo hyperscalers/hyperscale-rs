@@ -12,7 +12,8 @@ use sbor::{
 use thiserror::Error;
 
 use crate::{
-    Block, BlockHash, BlockHeight, QuorumCertificate, Verifiable, VerifiedQuorumCertificate,
+    Block, BlockHash, BlockHeight, QuorumCertificate, Verifiable, VerifiedBlock,
+    VerifiedQuorumCertificate,
 };
 
 /// A block alongside the QC that certifies it.
@@ -179,7 +180,7 @@ impl Describe<NoCustomTypeKind> for CertifiedBlock {
     }
 }
 
-/// Why [`LinkedCertifiedBlock::assemble_from_qc`] rejected its inputs.
+/// Why [`VerifiedCertifiedBlock::assemble`] rejected its inputs.
 #[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
 pub enum LinkageError {
     /// `qc.block_hash` does not match the paired block's computed hash.
@@ -192,27 +193,27 @@ pub enum LinkageError {
     },
 }
 
-/// A `CertifiedBlock` whose QC has been verified and whose QC↔block
-/// linkage has been checked.
+/// A `CertifiedBlock` whose block contents and QC have both been verified
+/// and whose QC↔block linkage has been checked.
 ///
 /// Construction asserts:
-/// 1. The QC passes its own verification predicate
+/// 1. The block passes its full [`VerifiedBlock`] predicate (header
+///    verified, every applicable per-root verifier succeeded).
+/// 2. The QC passes its own verification predicate
 ///    ([`VerifiedQuorumCertificate`]).
-/// 2. `qc.block_hash == block.hash()` (structural pairing).
+/// 3. `qc.block_hash == block.hash()` (structural pairing).
 ///
-/// Construction does **not** assert that the block's internal commitment
-/// roots (transaction root, certificate root, provision root, state
-/// root, …) match the inline data. Those checks run as separate action
-/// arms in the commit pipeline; correctness depends on pipeline
-/// ordering, not on this type.
+/// State-root verification is tracked separately in the verification
+/// pipeline and gates voting/commit via the parallel path, but is not
+/// folded into this type's predicate — see the doc on [`VerifiedBlock`].
 ///
 /// Construction goes through one of two gates:
 ///
-/// - [`Self::assemble_from_qc`] — runs the linkage check on a fresh
-///   `(Block, VerifiedQuorumCertificate)` pair.
+/// - [`Self::assemble`] — runs the linkage check on a fresh
+///   `(VerifiedBlock, VerifiedQuorumCertificate)` pair.
 /// - [`Self::new_unchecked`] — audit point reserved for storage-recovery,
-///   genesis, and commit-pipeline call sites where the linkage was
-///   established upstream.
+///   genesis, and commit-pipeline call sites where the full predicate
+///   was established upstream.
 ///
 /// `#[repr(transparent)]` over `CertifiedBlock`: `Deref<Target =
 /// CertifiedBlock>` exposes the existing accessors; no mutable access,
@@ -220,20 +221,21 @@ pub enum LinkageError {
 /// in-process events only).
 #[repr(transparent)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LinkedCertifiedBlock(CertifiedBlock);
+pub struct VerifiedCertifiedBlock(CertifiedBlock);
 
-impl LinkedCertifiedBlock {
-    /// Pair a `Block` with a [`VerifiedQuorumCertificate`], checking the
-    /// linkage invariant.
+impl VerifiedCertifiedBlock {
+    /// Pair a [`VerifiedBlock`] with a [`VerifiedQuorumCertificate`],
+    /// checking the linkage invariant.
     ///
     /// # Errors
     ///
     /// Returns [`LinkageError::BlockHashMismatch`] when `qc.block_hash`
     /// does not equal `block.hash()`.
-    pub fn assemble_from_qc(
-        block: Block,
+    pub fn assemble(
+        block: VerifiedBlock,
         qc: VerifiedQuorumCertificate,
     ) -> Result<Self, LinkageError> {
+        let block = block.into_inner();
         let block_hash = block.hash();
         let qc_block_hash = qc.block_hash();
         if qc_block_hash != block_hash {
@@ -248,13 +250,15 @@ impl LinkedCertifiedBlock {
         }))
     }
 
-    /// Audit-point constructor. Skips the linkage check.
+    /// Audit-point constructor. Skips the predicate.
     ///
-    /// Permitted use sites: storage-recovery (linkage was established
-    /// before persistence) and commit-pipeline interceptors that
-    /// produced the pair from already-checked inputs. Each call site
-    /// documents the trust source with a `// SAFETY:` comment;
-    /// `grep new_unchecked` produces the audit list.
+    /// Permitted use sites: storage-recovery (full predicate established
+    /// before persistence), genesis (locally constructed with empty
+    /// content), and commit-pipeline interceptors that produced the
+    /// `CertifiedBlock` from inputs already checked at the coordinator
+    /// or vote-path layer. Each call site documents the trust source
+    /// with a `// SAFETY:` comment; `grep new_unchecked` produces the
+    /// audit list.
     #[must_use]
     pub const fn new_unchecked(inner: CertifiedBlock) -> Self {
         Self(inner)
@@ -273,22 +277,22 @@ impl LinkedCertifiedBlock {
     }
 }
 
-impl AsRef<CertifiedBlock> for LinkedCertifiedBlock {
+impl AsRef<CertifiedBlock> for VerifiedCertifiedBlock {
     fn as_ref(&self) -> &CertifiedBlock {
         &self.0
     }
 }
 
-impl Deref for LinkedCertifiedBlock {
+impl Deref for VerifiedCertifiedBlock {
     type Target = CertifiedBlock;
     fn deref(&self) -> &CertifiedBlock {
         &self.0
     }
 }
 
-impl From<LinkedCertifiedBlock> for CertifiedBlock {
-    fn from(linked: LinkedCertifiedBlock) -> Self {
-        linked.0
+impl From<VerifiedCertifiedBlock> for CertifiedBlock {
+    fn from(verified: VerifiedCertifiedBlock) -> Self {
+        verified.0
     }
 }
 

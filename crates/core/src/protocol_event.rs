@@ -12,14 +12,14 @@ use hyperscale_types::{
     BeaconProposal, BeaconWitnessRootVerifyError, Block, BlockHash, BlockHeader, BlockHeight,
     BlockManifest, BlockVote, CertRootVerifyError, CertifiedBeaconBlock, CertifiedBlock,
     CommittedBlockHeader, CommittedHeaderVerifyError, Epoch, ExecutionCertificate, ExecutionVote,
-    FinalizedWave, LinkedCertifiedBlock, LocalReceiptRootVerifyError, PcQc3, PcVector,
-    PcVoteMessage, ProvisionRootVerifyError, ProvisionTxRootsVerifyError, Provisions,
-    QcVerifyError, QuorumCertificate, ReadySignal, Round, RoutableTransaction, ShardGroupId,
-    ShardWitness, SkipEpochCert, SkipRequest, SpcCert, SpcEmptyViewMsg, SpcView, StoredReceipt,
-    TxOutcome, TxRootVerifyError, ValidatorId, Verifiable, VerifiedBeaconWitnessRoot,
-    VerifiedBlockVote, VerifiedCertificateRoot, VerifiedLocalReceiptRoot, VerifiedProvisionTxRoots,
-    VerifiedProvisionsRoot, VerifiedQuorumCertificate, VerifiedTransactionRoot, VotePower, WaveId,
-    WeightedTimestamp,
+    FinalizedWave, LocalReceiptRootVerifyError, PcQc3, PcVector, PcVoteMessage,
+    ProvisionRootVerifyError, ProvisionTxRootsVerifyError, Provisions, QcVerifyError,
+    QuorumCertificate, ReadySignal, Round, RoutableTransaction, ShardGroupId, ShardWitness,
+    SkipEpochCert, SkipRequest, SpcCert, SpcEmptyViewMsg, SpcView, StoredReceipt, TxOutcome,
+    TxRootVerifyError, ValidatorId, Verifiable, VerifiedBeaconWitnessRoot, VerifiedBlockVote,
+    VerifiedCertificateRoot, VerifiedCertifiedBlock, VerifiedLocalReceiptRoot,
+    VerifiedProvisionTxRoots, VerifiedProvisionsRoot, VerifiedQuorumCertificate,
+    VerifiedTransactionRoot, VotePower, WaveId, WeightedTimestamp,
 };
 
 /// How a node learned about the certifying QC that commits a given block.
@@ -143,12 +143,14 @@ pub enum ProtocolEvent {
     /// `PendingChain::view_at` to see unpersisted state.
     BlockCommitted {
         /// The committed block + its certifying QC. Wrapped as
-        /// [`LinkedCertifiedBlock`] so consumers see the typestate
-        /// claim that the QC has been verified and `qc.block_hash ==
-        /// block.hash()` — block-internal commitments (transaction
-        /// root, provision root, etc.) are checked by separate
-        /// pipeline arms and are not asserted by this type.
-        certified: Arc<LinkedCertifiedBlock>,
+        /// [`VerifiedCertifiedBlock`] so consumers see the typestate
+        /// claim that the block, the QC, and the linkage are all
+        /// verified — header verified, every applicable per-root
+        /// verifier succeeded, QC's BLS aggregate cleared the quorum
+        /// threshold, and `qc.block_hash == block.hash()`. State-root
+        /// verification rides the parallel pipeline path (see the doc
+        /// on [`VerifiedBlock`](hyperscale_types::VerifiedBlock)).
+        certified: Arc<VerifiedCertifiedBlock>,
     },
 
     /// A block has been durably persisted to `RocksDB`.
