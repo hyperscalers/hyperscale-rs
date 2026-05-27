@@ -134,21 +134,23 @@ pub(super) fn ingest_witnesses(
             .insert(sw.proof.shard_id, sw.proof.leaf_index);
     }
 
-    // Apply equivocations. Each is re-verified independently before
-    // jailing; permanent-Equivocation already-jailed validators are
-    // the no-op idempotence case. The validator-id→pubkey lookup is
-    // built once per epoch, only when at least one equivocation is
-    // present (most slots carry none).
     if !equivocations.is_empty() {
-        let lookup: Vec<(ValidatorId, Bls12381G1PublicKey)> = state
-            .validators
-            .iter()
-            .map(|(id, rec)| (*id, rec.pubkey))
-            .collect();
+        // Sigs are checked at block admission; this debug-only sweep
+        // catches an admission-gate regression in CI.
+        debug_assert!(
+            {
+                let lookup: Vec<(ValidatorId, Bls12381G1PublicKey)> = state
+                    .validators
+                    .iter()
+                    .map(|(id, rec)| (*id, rec.pubkey))
+                    .collect();
+                equivocations
+                    .iter()
+                    .all(|ev| verify_vote_equivocation(ev, network, &lookup))
+            },
+            "apply_witnesses called with unverified equivocation evidence",
+        );
         for evidence in equivocations {
-            if !verify_vote_equivocation(evidence, network, &lookup) {
-                continue;
-            }
             let validator_id = evidence.validator;
             let Some(rec) = state.validators.get(&validator_id) else {
                 continue;
@@ -1733,28 +1735,5 @@ mod tests {
                 reason: JailReason::Equivocation,
             },
         );
-    }
-
-    /// Invalid equivocation evidence (sigs don't verify) is silently
-    /// dropped. Tampered `sig_a` here; verify rejects.
-    #[test]
-    fn vote_equivocation_with_invalid_sig_is_dropped() {
-        let mut state = single_pool_state(4);
-        state.committee = (0u64..4).map(ValidatorId::new).collect();
-        let mut ev = build_vote_equivocation(1, Epoch::new(5), SpcView::new(0));
-        ev.sig_a.0[0] ^= 1;
-        let w = Witness::Equivocation(Box::new(ev));
-        let committed = vec![(
-            ValidatorId::new(0),
-            vrf_proposal_with_witnesses(0, state.current_epoch.next(), vec![w]),
-        )];
-        let effects = apply_next_epoch(&mut state, &committed);
-
-        assert!(effects.jailed.is_empty());
-        // Validator 1's status unchanged — still OnShard.
-        assert!(matches!(
-            state.validators.get(&ValidatorId::new(1)).unwrap().status,
-            ValidatorStatus::OnShard { .. },
-        ));
     }
 }

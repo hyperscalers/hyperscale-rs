@@ -26,6 +26,7 @@ use hyperscale_beacon::skip::{sign_skip_request, verify_skip_cert, verify_skip_r
 use hyperscale_beacon::spc::{
     sign_empty_view_msg, verify_block_cert, verify_cert, verify_empty_view_msg,
 };
+use hyperscale_beacon::verification::verify_block_equivocations;
 use hyperscale_core::Action;
 use hyperscale_types::{
     BeaconCert, BeaconGenesisConfig, BeaconProposal, BeaconState, Bls12381G1PrivateKey,
@@ -268,8 +269,12 @@ impl CoordinatorSim {
         let mut out = Vec::new();
         for action in actions {
             match action {
-                Action::VerifyBeaconBlock { block, signers } => {
-                    let valid = match block.cert() {
+                Action::VerifyBeaconBlock {
+                    block,
+                    signers,
+                    equivocation_signers,
+                } => {
+                    let cert_ok = match block.cert() {
                         BeaconCert::Normal(cert) => verify_block_cert(
                             cert,
                             &self.network,
@@ -279,6 +284,8 @@ impl CoordinatorSim {
                         BeaconCert::Skip(cert) => verify_skip_cert(cert, &self.network, &signers),
                         BeaconCert::Genesis(_) => false,
                     };
+                    let valid = cert_ok
+                        && verify_block_equivocations(&block, &self.network, &equivocation_signers);
                     let post =
                         self.coordinators[replica_idx].on_beacon_block_verified(block, valid);
                     out.extend(self.resolve_verifications(replica_idx, post));
@@ -718,13 +725,17 @@ impl CoordinatorSim {
                     state: *state,
                 });
             }
-            Action::VerifyBeaconBlock { block, signers } => {
+            Action::VerifyBeaconBlock {
+                block,
+                signers,
+                equivocation_signers,
+            } => {
                 // Production runs this on the consensus crypto pool; the
                 // sim collapses the round-trip to a synchronous inline
                 // verify + result-feedback so the verification-bound
                 // pipeline doesn't reshape envelope-delivery ordering
                 // relative to the pre-async flow.
-                let valid = match block.cert() {
+                let cert_ok = match block.cert() {
                     BeaconCert::Normal(cert) => verify_block_cert(
                         cert,
                         &self.network,
@@ -734,6 +745,8 @@ impl CoordinatorSim {
                     BeaconCert::Skip(cert) => verify_skip_cert(cert, &self.network, &signers),
                     BeaconCert::Genesis(_) => false,
                 };
+                let valid = cert_ok
+                    && verify_block_equivocations(&block, &self.network, &equivocation_signers);
                 let post = self.coordinators[emitter_idx].on_beacon_block_verified(block, valid);
                 self.absorb(emitter_idx, post);
             }
