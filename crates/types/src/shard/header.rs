@@ -148,30 +148,9 @@ impl BlockHeader {
     }
 
     /// Quorum certificate proving parent block was committed.
-    ///
-    /// Returns the raw QC regardless of verification status; verified-aware
-    /// callers should use [`Self::parent_qc_verifiable`] or
-    /// [`Self::verified_parent_qc`].
     #[must_use]
     pub fn parent_qc(&self) -> &QuorumCertificate {
         self.parent_qc.as_unverified()
-    }
-
-    /// Verified handle on the parent QC, present only when the producer
-    /// constructed the header with a verified QC or after explicit
-    /// verification at an admission boundary.
-    #[must_use]
-    pub const fn verified_parent_qc(&self) -> Option<&VerifiedQuorumCertificate> {
-        self.parent_qc.verified()
-    }
-
-    /// Borrow the parent QC together with its verification marker. Used
-    /// by admission handlers branching on `Verified` vs `Unverified`.
-    #[must_use]
-    pub const fn parent_qc_verifiable(
-        &self,
-    ) -> &Verifiable<QuorumCertificate, VerifiedQuorumCertificate> {
-        &self.parent_qc
     }
 
     /// Validator that proposed this block.

@@ -118,24 +118,9 @@ impl ElidedCertifiedBlock {
     }
 
     /// Certifying quorum certificate (always inline).
-    ///
-    /// Returns the raw QC regardless of verification status; verified-aware
-    /// callers should use [`Self::qc_verifiable`] or [`Self::verified_qc`].
     #[must_use]
     pub fn qc(&self) -> &QuorumCertificate {
         self.qc.as_unverified()
-    }
-
-    /// Verified handle on the QC.
-    #[must_use]
-    pub const fn verified_qc(&self) -> Option<&VerifiedQuorumCertificate> {
-        self.qc.verified()
-    }
-
-    /// Borrow the QC together with its verification marker.
-    #[must_use]
-    pub const fn qc_verifiable(&self) -> &Verifiable<QuorumCertificate, VerifiedQuorumCertificate> {
-        &self.qc
     }
 
     /// Per-transaction `(hash, optional body)` pairs; body is `None` when elided.

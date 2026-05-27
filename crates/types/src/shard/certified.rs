@@ -102,24 +102,9 @@ impl CertifiedBlock {
     }
 
     /// QC certifying [`Self::block`]. Invariant: `qc.block_hash == block.hash()`.
-    ///
-    /// Returns the raw QC regardless of verification status; verified-aware
-    /// callers should use [`Self::qc_verifiable`] or [`Self::verified_qc`].
     #[must_use]
     pub fn qc(&self) -> &QuorumCertificate {
         self.qc.as_unverified()
-    }
-
-    /// Verified handle on the QC.
-    #[must_use]
-    pub const fn verified_qc(&self) -> Option<&VerifiedQuorumCertificate> {
-        self.qc.verified()
-    }
-
-    /// Borrow the QC together with its verification marker.
-    #[must_use]
-    pub const fn qc_verifiable(&self) -> &Verifiable<QuorumCertificate, VerifiedQuorumCertificate> {
-        &self.qc
     }
 
     /// Consume the pair and return its parts.
@@ -221,15 +206,13 @@ pub enum LinkageError {
 /// arms in the commit pipeline; correctness depends on pipeline
 /// ordering, not on this type.
 ///
-/// Construction goes through one of three gates:
+/// Construction goes through one of two gates:
 ///
 /// - [`Self::assemble_from_qc`] — runs the linkage check on a fresh
 ///   `(Block, VerifiedQuorumCertificate)` pair.
-/// - [`Self::genesis`] — wraps a `CertifiedBlock::new_unchecked`-style
-///   genesis pair whose linkage is trivially satisfied.
-/// - [`Self::new_unchecked`] — audit point reserved for storage-recovery
-///   and commit-pipeline call sites where the linkage was established
-///   upstream.
+/// - [`Self::new_unchecked`] — audit point reserved for storage-recovery,
+///   genesis, and commit-pipeline call sites where the linkage was
+///   established upstream.
 ///
 /// `#[repr(transparent)]` over `CertifiedBlock`: `Deref<Target =
 /// CertifiedBlock>` exposes the existing accessors; no mutable access,
