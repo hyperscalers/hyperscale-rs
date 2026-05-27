@@ -24,7 +24,8 @@ use hyperscale_core::Action;
 #[cfg(test)]
 use hyperscale_types::{BeaconWitnessLeafCount, BeaconWitnessRoot};
 use hyperscale_types::{
-    BlockHash, BlockHeader, BlockHeight, BlockVote, Round, TopologySnapshot, ValidatorId, VotePower,
+    BlockHash, BlockHeader, BlockHeight, BlockVote, Round, TopologySnapshot, ValidatorId,
+    Verifiable, VerifiedBlockVote, VotePower,
 };
 use tracing::{info, trace, warn};
 
@@ -194,10 +195,14 @@ impl VoteKeeper {
     /// reach quorum. `header_for_vote` is the header from the caller's
     /// pending-block map; `None` is acceptable when the header hasn't been
     /// received yet — a later [`VoteSet::set_header`] fills it in.
+    ///
+    /// If `vote` arrives [`Verifiable::Verified`] (own vote, or local
+    /// dispatch from a colocated voter), it's admitted directly to the
+    /// verified set without re-checking the BLS signature.
     pub fn accept_vote(
         &mut self,
         topology: &TopologySnapshot,
-        vote: BlockVote,
+        vote: Verifiable<BlockVote, VerifiedBlockVote>,
         committed_height: BlockHeight,
         header_for_vote: Option<&BlockHeader>,
     ) -> Vec<Action> {
@@ -251,23 +256,39 @@ impl VoteKeeper {
             return vec![];
         }
 
-        if is_own_vote {
-            trace!(
-                block_hash = ?block_hash,
-                "Adding own vote as verified"
-            );
-            vote_set.add_verified_vote(voter_index, vote, voting_power);
-        } else {
-            let public_key = public_key.expect("non-own vote implies public key resolved");
-            vote_set.buffer_unverified_vote(voter_index, vote, public_key, voting_power);
-            trace!(
-                validator = ?validator_id,
-                block_hash = ?block_hash,
-                verified_power = vote_set.verified_power().inner(),
-                unverified_power = vote_set.unverified_power().inner(),
-                total_power = total_power.inner(),
-                "Vote buffered"
-            );
+        match vote {
+            Verifiable::Verified(verified) => {
+                trace!(
+                    block_hash = ?block_hash,
+                    is_own_vote,
+                    "Admitting pre-verified vote"
+                );
+                vote_set.add_verified_vote(voter_index, verified, voting_power);
+            }
+            Verifiable::Unverified(raw) if is_own_vote => {
+                // SAFETY: own votes are produced by `SignAndBroadcastBlockVote`
+                // with our own signing key; if such a vote ever arrives here
+                // as `Unverified`, it was assembled from already-signed parts
+                // and the predicate holds. The own-vote branch wraps under
+                // that trust source.
+                vote_set.add_verified_vote(
+                    voter_index,
+                    VerifiedBlockVote::new_unchecked(raw),
+                    voting_power,
+                );
+            }
+            Verifiable::Unverified(raw) => {
+                let public_key = public_key.expect("non-own vote implies public key resolved");
+                vote_set.buffer_unverified_vote(voter_index, raw, public_key, voting_power);
+                trace!(
+                    validator = ?validator_id,
+                    block_hash = ?block_hash,
+                    verified_power = vote_set.verified_power().inner(),
+                    unverified_power = vote_set.unverified_power().inner(),
+                    total_power = total_power.inner(),
+                    "Vote buffered"
+                );
+            }
         }
 
         self.maybe_trigger_verification(topology, block_hash)
@@ -364,7 +385,7 @@ impl VoteKeeper {
     pub fn finalize_pending_batch(
         &mut self,
         block_hash: BlockHash,
-        verified_votes: Vec<(usize, BlockVote, VotePower)>,
+        verified_votes: Vec<(usize, VerifiedBlockVote, VotePower)>,
     ) {
         let Some(vote_set) = self.vote_sets.get_mut(&block_hash) else {
             warn!(

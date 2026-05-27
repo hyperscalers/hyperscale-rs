@@ -16,7 +16,7 @@ use hyperscale_types::{
     RoutableTransaction, ShardGroupId, SharedCertificates, SharedTransactions, SkipEpochCert,
     SkipRequest, SpcCert, SpcEmptyViewMsg, SpcHighTriple, SpcView, StateRoot, SubstateEntry,
     TopologySnapshot, TransactionRoot, TransactionStatus, TxHash, TxOutcome, ValidatorId,
-    VotePower, WaveId, WeightedTimestamp, Witness,
+    VerifiedBlockVote, VotePower, WaveId, WeightedTimestamp, Witness,
 };
 
 use crate::{CommitSource, FetchAbandon, FetchRequest, ProtocolEvent, TimerId};
@@ -242,7 +242,7 @@ pub enum Action {
         votes_to_verify: Vec<(usize, BlockVote, Bls12381G1PublicKey, VotePower)>,
         /// Already-verified votes (e.g., our own vote).
         /// Each tuple is (`committee_index`, vote, `voting_power`).
-        verified_votes: Vec<(usize, BlockVote, VotePower)>,
+        verified_votes: Vec<(usize, VerifiedBlockVote, VotePower)>,
         /// Total voting power in the committee (for quorum calculation).
         total_voting_power: VotePower,
     },

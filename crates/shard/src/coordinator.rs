@@ -84,7 +84,8 @@ use hyperscale_storage::{BeaconWitnessCommit, RecoveredState};
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, CertifiedBlock,
     CommittedBlockHeader, FinalizedWave, Provisions, QcVerifyError, QuorumCertificate, Round,
-    RoutableTransaction, StateRoot, TopologySnapshot, TxHash, VerifiedQuorumCertificate, VotePower,
+    RoutableTransaction, StateRoot, TopologySnapshot, TxHash, Verifiable, VerifiedBlockVote,
+    VerifiedQuorumCertificate, VotePower,
 };
 use tracing::field::Empty;
 use tracing::{debug, info, instrument, trace, warn};
@@ -1588,7 +1589,7 @@ impl ShardCoordinator {
     pub fn on_block_vote(
         &mut self,
         topology_snapshot: &TopologySnapshot,
-        vote: BlockVote,
+        vote: Verifiable<BlockVote, VerifiedBlockVote>,
     ) -> Vec<Action> {
         trace!(
             validator = ?topology_snapshot.local_validator_id(),
@@ -1629,7 +1630,7 @@ impl ShardCoordinator {
     fn on_block_vote_internal(
         &mut self,
         topology_snapshot: &TopologySnapshot,
-        vote: BlockVote,
+        vote: Verifiable<BlockVote, VerifiedBlockVote>,
     ) -> Vec<Action> {
         let header_for_vote = self.pending_blocks.get_header(vote.block_hash());
         self.votes.accept_vote(
@@ -1657,7 +1658,7 @@ impl ShardCoordinator {
         topology_snapshot: &TopologySnapshot,
         block_hash: BlockHash,
         qc: Option<VerifiedQuorumCertificate>,
-        verified_votes: Vec<(usize, BlockVote, VotePower)>,
+        verified_votes: Vec<(usize, VerifiedBlockVote, VotePower)>,
     ) -> Vec<Action> {
         if let Some(qc) = qc {
             info!(
@@ -4188,7 +4189,12 @@ mod tests {
             ProposerTimestamp::from_millis(100_000),
         );
 
-        let _ = state.on_qc_result(&topology, block_b, None, vec![(0, vote, VotePower::new(1))]);
+        let _ = state.on_qc_result(
+            &topology,
+            block_b,
+            None,
+            vec![(0, VerifiedBlockVote::new_unchecked(vote), VotePower::new(1))],
+        );
 
         let (recorded_hash, _) = state
             .votes

@@ -19,15 +19,16 @@
 //! types defined here.
 
 use std::fmt;
+use std::ops::Deref;
 use std::sync::Arc;
 
 use sbor::prelude::BasicSbor;
 
 use crate::{
     Block, BlockHash, BlockHeader, BloomFilter, BloomKey, BoundedVec, CertifiedBlock,
-    FinalizedWave, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK,
-    ProvisionHash, Provisions, QuorumCertificate, RoutableTransaction, TxHash, Verifiable,
-    VerifiedQuorumCertificate, WaveId,
+    FinalizedWave, LinkageError, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK,
+    MAX_TXS_PER_BLOCK, ProvisionHash, Provisions, QuorumCertificate, RoutableTransaction, TxHash,
+    Verifiable, VerifiedQuorumCertificate, WaveId,
 };
 
 /// Inventory of locally-known item hashes, grouped by category.
@@ -334,6 +335,94 @@ impl ElidedCertifiedBlock {
             }
         };
         Ok(CertifiedBlock::new_unchecked(block, self.qc.clone()))
+    }
+}
+
+/// Verified [`ElidedCertifiedBlock`] — the elided form's analogue of
+/// [`super::certified::LinkedCertifiedBlock`].
+///
+/// Construction asserts: the inline QC was verified, and
+/// `qc.block_hash == header.hash()`. Per-element verification of the
+/// inline transaction / certificate bodies is *not* part of this
+/// predicate — callers that need verified bodies run those checks
+/// separately at admission, the same way they would on a rehydrated
+/// [`CertifiedBlock`].
+///
+/// Construction goes through [`Self::assemble_from_qc`] (composite
+/// path, checks linkage) or [`Self::new_unchecked`] (audit point).
+#[repr(transparent)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedElidedCertifiedBlock(ElidedCertifiedBlock);
+
+impl VerifiedElidedCertifiedBlock {
+    /// Pair an [`ElidedCertifiedBlock`] with a verified QC after
+    /// confirming the linkage invariant.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LinkageError::BlockHashMismatch`] when
+    /// `qc.block_hash != elided.header().hash()`.
+    pub fn assemble_from_qc(
+        elided: ElidedCertifiedBlock,
+        qc: VerifiedQuorumCertificate,
+    ) -> Result<Self, LinkageError> {
+        let header_hash = elided.header.hash();
+        let qc_block_hash = qc.block_hash();
+        if qc_block_hash != header_hash {
+            return Err(LinkageError::BlockHashMismatch {
+                block_hash: header_hash,
+                qc_block_hash,
+            });
+        }
+        Ok(Self(ElidedCertifiedBlock {
+            header: elided.header,
+            qc: Verifiable::Verified(qc),
+            transactions: elided.transactions,
+            certificates: elided.certificates,
+            provisions: elided.provisions,
+        }))
+    }
+
+    /// Audit-point constructor. Skips the linkage check.
+    ///
+    /// Permitted use sites: storage-recovery (linkage was established
+    /// before persistence) and call sites that established the predicate
+    /// by other means. Every call site carries a `// SAFETY:` comment
+    /// naming the trust source.
+    #[must_use]
+    pub const fn new_unchecked(inner: ElidedCertifiedBlock) -> Self {
+        Self(inner)
+    }
+
+    /// Borrow the underlying [`ElidedCertifiedBlock`].
+    #[must_use]
+    pub const fn as_elided(&self) -> &ElidedCertifiedBlock {
+        &self.0
+    }
+
+    /// Consume the wrapper and return the raw [`ElidedCertifiedBlock`].
+    #[must_use]
+    pub fn into_inner(self) -> ElidedCertifiedBlock {
+        self.0
+    }
+}
+
+impl AsRef<ElidedCertifiedBlock> for VerifiedElidedCertifiedBlock {
+    fn as_ref(&self) -> &ElidedCertifiedBlock {
+        &self.0
+    }
+}
+
+impl Deref for VerifiedElidedCertifiedBlock {
+    type Target = ElidedCertifiedBlock;
+    fn deref(&self) -> &ElidedCertifiedBlock {
+        &self.0
+    }
+}
+
+impl From<VerifiedElidedCertifiedBlock> for ElidedCertifiedBlock {
+    fn from(verified: VerifiedElidedCertifiedBlock) -> Self {
+        verified.0
     }
 }
 

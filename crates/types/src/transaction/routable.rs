@@ -1,6 +1,17 @@
 //! `RoutableTransaction` — wraps a Radix `UserTransaction` with shard-routing metadata.
+//!
+//! [`RoutableTransaction`] is the raw wire form. [`VerifiedRoutableTransaction`]
+//! is the verified typestate — constructed only via
+//! [`<RoutableTransaction as Verify>::verify`](Verify::verify) or
+//! [`VerifiedRoutableTransaction::new_unchecked`].
+//!
+//! Construction asserts: the underlying `UserTransaction` passes Radix's
+//! [`TransactionValidator::prepare_and_validate`], i.e. its sender
+//! signature is valid and the transaction is well-formed for the active
+//! protocol version.
 
 use std::fmt::{self, Debug, Formatter};
+use std::ops::Deref;
 use std::sync::OnceLock;
 
 use blake3::Hasher;
@@ -8,10 +19,11 @@ use radix_common::data::manifest::{manifest_decode, manifest_encode};
 use radix_transactions::model::{UserTransaction, ValidatedUserTransaction};
 use radix_transactions::validation::TransactionValidator;
 use sbor::prelude::*;
+use thiserror::Error;
 
 use crate::{
     BoundedBytes, BoundedVec, Hash, MAX_DECLARED_NODES_PER_TX, MAX_TX_BYTES_LEN, NodeId,
-    TimestampRange, TxHash, shard_for_node,
+    TimestampRange, TxHash, Verifiable, Verify, shard_for_node,
 };
 
 /// A transaction with routing information.
@@ -289,6 +301,109 @@ impl RoutableTransaction {
         self.declared_reads
             .iter()
             .chain(self.declared_writes.iter())
+    }
+}
+
+/// Inputs the [`RoutableTransaction`] verifier reads against.
+///
+/// Borrows the [`TransactionValidator`] (typically owned by the engine /
+/// executor caches) without consuming it; multiple verifications can
+/// share the same validator.
+#[derive(Debug, Copy, Clone)]
+pub struct RoutableTransactionContext<'a> {
+    /// Radix-side validator running signature + structural checks.
+    pub validator: &'a TransactionValidator,
+}
+
+/// Failure modes of [`RoutableTransaction`] verification.
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum RoutableTransactionVerifyError {
+    /// Radix's [`TransactionValidator::prepare_and_validate`] rejected
+    /// the transaction (bad signature, malformed payload, or version
+    /// mismatch).
+    #[error("transaction failed Radix prepare_and_validate")]
+    InvalidUserTransaction,
+}
+
+/// Verified routable transaction.
+///
+/// The construction predicate is stated in the module docs. Construction
+/// goes through one of two gates:
+///
+/// - [`<RoutableTransaction as Verify>::verify`](Verify::verify) — runs
+///   Radix `prepare_and_validate` against the supplied
+///   [`TransactionValidator`].
+/// - [`Self::new_unchecked`] — audit point. Used at storage-recovery
+///   boundaries (the transaction was validated before persistence) and
+///   by callers re-wrapping under an equivalent trust source. Every
+///   call site documents the trust source with a `// SAFETY:` comment.
+///
+/// Read-only: [`Deref<Target = RoutableTransaction>`](Deref) exposes
+/// the raw transaction's accessors (including the cached
+/// [`get_or_validate`](RoutableTransaction::get_or_validate)). No
+/// `&mut`, no `AsMut`, no `Encode`/`Decode` — verified values cannot
+/// be produced from wire bytes.
+#[repr(transparent)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedRoutableTransaction(RoutableTransaction);
+
+impl VerifiedRoutableTransaction {
+    /// Audit-point constructor. Skips the predicate.
+    ///
+    /// Permitted use sites: storage-recovery (transaction was validated
+    /// before persistence) and call sites re-wrapping under an
+    /// equivalent trust source (e.g. own transactions whose signing
+    /// happened in this process). Every call site carries a `// SAFETY:`
+    /// comment naming the trust source.
+    #[must_use]
+    pub const fn new_unchecked(tx: RoutableTransaction) -> Self {
+        Self(tx)
+    }
+
+    /// Consume the verified transaction and return the raw form.
+    /// Drops the verified claim.
+    #[must_use]
+    pub fn into_inner(self) -> RoutableTransaction {
+        self.0
+    }
+}
+
+impl AsRef<RoutableTransaction> for VerifiedRoutableTransaction {
+    fn as_ref(&self) -> &RoutableTransaction {
+        &self.0
+    }
+}
+
+impl Deref for VerifiedRoutableTransaction {
+    type Target = RoutableTransaction;
+    fn deref(&self) -> &RoutableTransaction {
+        &self.0
+    }
+}
+
+impl From<VerifiedRoutableTransaction> for RoutableTransaction {
+    fn from(verified: VerifiedRoutableTransaction) -> Self {
+        verified.0
+    }
+}
+
+impl From<VerifiedRoutableTransaction>
+    for Verifiable<RoutableTransaction, VerifiedRoutableTransaction>
+{
+    fn from(verified: VerifiedRoutableTransaction) -> Self {
+        Self::Verified(verified)
+    }
+}
+
+impl Verify<&RoutableTransactionContext<'_>> for RoutableTransaction {
+    type Verified = VerifiedRoutableTransaction;
+    type Error = RoutableTransactionVerifyError;
+
+    fn verify(&self, ctx: &RoutableTransactionContext<'_>) -> Result<Self::Verified, Self::Error> {
+        if self.get_or_validate(ctx.validator).is_none() {
+            return Err(RoutableTransactionVerifyError::InvalidUserTransaction);
+        }
+        Ok(VerifiedRoutableTransaction(self.clone()))
     }
 }
 
