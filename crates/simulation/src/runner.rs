@@ -25,9 +25,9 @@ use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{RecoveredState, ShardChainReader};
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::{
-    BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey, CertifiedBlock, LinkedCertifiedBlock,
-    LocalTimestamp, NodeId, QuorumCertificate, ShardGroupId, TopologySnapshot, TransactionStatus,
-    TxHash, ValidatorId, ValidatorInfo, ValidatorSet, VotePower, bls_keypair_from_seed,
+    BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey, CertifiedBlock, LocalTimestamp, NodeId,
+    QuorumCertificate, ShardGroupId, TopologySnapshot, TransactionStatus, TxHash, ValidatorId,
+    ValidatorInfo, ValidatorSet, VerifiedCertifiedBlock, VotePower, bls_keypair_from_seed,
     shard_for_node,
 };
 use radix_common::math::Decimal;
@@ -649,10 +649,15 @@ impl SimulationRunner {
                         __qc.weighted_timestamp(),
                     )
                 };
-                // SAFETY: genesis pair is constructed locally with a
-                // matching block_hash; nothing has touched it across an
-                // adversarial boundary.
-                let genesis_certified = Arc::new(LinkedCertifiedBlock::new_unchecked(
+                // SAFETY: genesis is constructed locally with empty
+                // content (no txs, no certificates, no provisions, no
+                // beacon-witness deltas over the empty accumulator), so
+                // every per-root predicate holds trivially against the
+                // empty-input compute; the synthetic genesis QC pairs
+                // with `genesis_block.hash()` by construction; nothing
+                // crosses an adversarial boundary before the typestate
+                // wrap.
+                let genesis_certified = Arc::new(VerifiedCertifiedBlock::new_unchecked(
                     CertifiedBlock::new_unchecked(genesis_block.clone(), genesis_qc),
                 ));
                 let genesis_commit_event = ShardEvent::protocol(

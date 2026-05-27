@@ -15,7 +15,9 @@ use thiserror::Error;
 use crate::{
     BlockHash, BlockHeader, BlockHeight, BoundedVec, FinalizedWave, MAX_FINALIZED_TX_PER_BLOCK,
     MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash, Provisions, RoutableTransaction,
-    ShardGroupId, StateRoot, TxHash, ValidatorId, VerifiedBlockHeader,
+    ShardGroupId, StateRoot, TxHash, ValidatorId, VerifiedBeaconWitnessRoot, VerifiedBlockHeader,
+    VerifiedCertificateRoot, VerifiedLocalReceiptRoot, VerifiedProvisionTxRoots,
+    VerifiedProvisionsRoot, VerifiedTransactionRoot,
 };
 
 /// Shared transaction list — wrapped in `Arc` so root-verification actions
@@ -311,19 +313,25 @@ pub enum VerifiedBlockAssembleError {
 /// 2. The block's contents match its declared commitment roots
 ///    (`transaction_root`, `certificate_root`, `local_receipt_root`,
 ///    `provision_root`, `provision_tx_roots`, `beacon_witness_root`).
-///    The per-root checks are run upstream of [`Self::assemble`]; the
-///    constructor accepts witnessed-success markers (`Some(())`) for
-///    each that applies to this block.
+///    Each per-root check is witnessed by a typed `VerifiedXRoot`
+///    value the constructor consumes.
 ///
 /// Construction goes through one of two gates:
 ///
 /// - [`Self::assemble`] — composite path. Takes a [`VerifiedBlockHeader`]
-///   for the block plus witnessed-success markers for each per-root
-///   verification, and checks that the header refers to this block.
+///   for the block plus the typed per-root witnesses, and checks that
+///   the header refers to this block.
 /// - [`Self::new_unchecked`] — audit point. Used at storage-recovery
 ///   boundaries and at sites that established the predicate by other
 ///   means (e.g. the block was produced and verified in-process). Every
 ///   call site documents the trust source with a `// SAFETY:` comment.
+///
+/// State-root verification is intentionally not a witness here. Its
+/// verified value (`VerifiedStateRoot<P>`) carries a `PreparedCommit`
+/// byproduct that the action handler side-channels via
+/// `ActionContext::commit_prepared`, so the verified value can't ride
+/// in cleanly; the JMT-replay check still gates voting and commit via
+/// the parallel pipeline path.
 ///
 /// `#[repr(transparent)]` over [`Block`]; [`Deref<Target = Block>`](Deref)
 /// exposes the raw accessors. No mutable access, no `Encode`/`Decode` —
@@ -335,30 +343,32 @@ pub struct VerifiedBlock(Block);
 impl VerifiedBlock {
     /// Composite assembly. Pairs `block` with a [`VerifiedBlockHeader`]
     /// after confirming the header's content matches the block, and
-    /// witnesses that every applicable per-root verification has
-    /// succeeded.
+    /// consumes a typed witness for each per-root verification.
+    ///
+    /// The witnesses are taken by value: each `VerifiedXRoot` can only
+    /// have been produced by its `Verify` impl (the only constructor
+    /// outside `new_unchecked`), so consuming them at assemble time
+    /// makes the predicate structurally unforgeable — no caller can
+    /// fabricate a "verified" marker without having run the check.
     ///
     /// # Errors
     ///
     /// Returns [`VerifiedBlockAssembleError::HeaderMismatch`] when the
-    /// verified header does not match the supplied block. (The
-    /// witnessed-success markers are zero-sized so they can only be
-    /// produced by code that ran the actual checks; no value-level
-    /// validation is needed here.)
+    /// verified header does not match the supplied block.
     #[allow(
         clippy::needless_pass_by_value,
         clippy::too_many_arguments,
         clippy::missing_const_for_fn
-    )] // structural witnesses are zero-sized; consuming makes the assembly contract explicit
+    )] // typed witnesses are consumed; the moves make the assembly contract explicit
     pub fn assemble(
         block: Block,
         header: VerifiedBlockHeader,
-        _tx_root_check: (),
-        _certificate_root_check: (),
-        _local_receipt_root_check: (),
-        _provision_root_check: (),
-        _provision_tx_roots_check: (),
-        _beacon_witness_root_check: (),
+        _tx_root: VerifiedTransactionRoot,
+        _certificate_root: VerifiedCertificateRoot,
+        _local_receipt_root: VerifiedLocalReceiptRoot,
+        _provision_root: VerifiedProvisionsRoot,
+        _provision_tx_roots: VerifiedProvisionTxRoots,
+        _beacon_witness_root: VerifiedBeaconWitnessRoot,
     ) -> Result<Self, VerifiedBlockAssembleError> {
         let header_hash = header.as_ref().hash();
         let block_hash = block.hash();

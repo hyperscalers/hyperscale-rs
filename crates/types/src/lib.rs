@@ -97,7 +97,7 @@ pub use sbor_codec::{
     BoundedBTreeMap, BoundedBTreeSet, BoundedBytes, BoundedLengthError, BoundedString, BoundedVec,
 };
 pub use shard::certified::{
-    CertifiedBlock, CertifiedBlockHashMismatch, LinkageError, LinkedCertifiedBlock,
+    CertifiedBlock, CertifiedBlockHashMismatch, LinkageError, VerifiedCertifiedBlock,
 };
 pub use shard::committed_header::{
     CommittedBlockHeader, CommittedHeaderVerifyError, VerifiedCommittedBlockHeader,

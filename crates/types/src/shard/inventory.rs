@@ -339,7 +339,7 @@ impl ElidedCertifiedBlock {
 }
 
 /// Verified [`ElidedCertifiedBlock`] — the elided form's analogue of
-/// [`super::certified::LinkedCertifiedBlock`].
+/// [`super::certified::VerifiedCertifiedBlock`].
 ///
 /// Construction asserts: the inline QC was verified, and
 /// `qc.block_hash == header.hash()`. Per-element verification of the

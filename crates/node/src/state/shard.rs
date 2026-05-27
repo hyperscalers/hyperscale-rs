@@ -397,9 +397,9 @@ mod tests {
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
         BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHeader, BlockHeight, BlockManifest,
-        CommittedBlockHeader, Hash, LinkedCertifiedBlock, LocalTimestamp, MerkleInclusionProof,
-        ProvisionEntry, Provisions, QuorumCertificate, RETENTION_HORIZON, Round, ShardGroupId,
-        TransactionStatus, TxHash, ValidatorId, WaveId,
+        CommittedBlockHeader, Hash, LocalTimestamp, MerkleInclusionProof, ProvisionEntry,
+        Provisions, QuorumCertificate, RETENTION_HORIZON, Round, ShardGroupId, TransactionStatus,
+        TxHash, ValidatorId, VerifiedCertifiedBlock, WaveId,
     };
 
     use super::super::test_support::TestNode;
@@ -631,7 +631,9 @@ mod tests {
             vec![],
             vec![],
         );
-        let certified = Arc::new(LinkedCertifiedBlock::new_unchecked(certify(
+        // SAFETY: test fixture; block and synthesized QC are produced
+        // in-process for the orchestrator test, no adversarial input.
+        let certified = Arc::new(VerifiedCertifiedBlock::new_unchecked(certify(
             block, /* weighted_timestamp_ms */ 1_000,
         )));
         let _ = node.handle(past_deadline, ProtocolEvent::BlockCommitted { certified });
@@ -652,7 +654,8 @@ mod tests {
             vec![],
             vec![],
         );
-        let certified = Arc::new(LinkedCertifiedBlock::new_unchecked(certify(
+        // SAFETY: test fixture; same rationale as above.
+        let certified = Arc::new(VerifiedCertifiedBlock::new_unchecked(certify(
             block,
             past_deadline_ms,
         )));
@@ -745,7 +748,10 @@ mod tests {
             vec![tx],
             vec![],
         );
-        let certified = Arc::new(LinkedCertifiedBlock::new_unchecked(certify(
+        // SAFETY: test fixture; block and synthesized QC are produced
+        // in-process to exercise the commit fan-out, no adversarial
+        // input.
+        let certified = Arc::new(VerifiedCertifiedBlock::new_unchecked(certify(
             block, /* weighted_timestamp_ms */ 1_000,
         )));
         let _ = node.handle(

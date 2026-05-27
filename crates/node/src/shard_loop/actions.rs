@@ -14,8 +14,8 @@ use hyperscale_provisions::action_handlers::handle_action as handle_provisions_a
 use hyperscale_shard::action_handlers::handle_action as handle_shard_action;
 use hyperscale_storage::{BeaconWitnessCommit, ShardStorage};
 use hyperscale_types::{
-    Block, BlockHeight, CertifiedBlock, LinkedCertifiedBlock, QuorumCertificate, StateRoot,
-    TopologySnapshot, TransactionStatus, TxHash, VerifiedQuorumCertificate,
+    Block, BlockHeight, CertifiedBlock, QuorumCertificate, StateRoot, TopologySnapshot,
+    TransactionStatus, TxHash, VerifiedCertifiedBlock, VerifiedQuorumCertificate,
 };
 use tracing::{debug, error, trace, warn};
 
@@ -456,10 +456,16 @@ where
 
                 let weighted_ts = qc.weighted_timestamp();
                 let block_hash = block.hash();
-                // SAFETY: the commit pipeline only fires after QC
-                // verification and the block-hash linkage check; the
-                // typestate marker reflects what is already established.
-                let certified = Arc::new(LinkedCertifiedBlock::new_unchecked(
+                // SAFETY: the commit pipeline only fires after this
+                // node either voted on the block (which requires every
+                // applicable per-root verifier to have succeeded) or
+                // observed the certifying QC and ran the equivalent
+                // checks during sync; the QC itself was verified
+                // upstream and the linkage between QC and block-hash
+                // was established at the coordinator. The full
+                // `VerifiedCertifiedBlock` predicate holds at this
+                // point.
+                let certified = Arc::new(VerifiedCertifiedBlock::new_unchecked(
                     CertifiedBlock::new_unchecked(
                         Arc::unwrap_or_clone(block),
                         Arc::unwrap_or_clone(qc),
