@@ -1,14 +1,14 @@
 //! Block-derived helpers: wave assignment, per-target provision merkle roots,
 //! and wave-leader selection.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use sbor::prelude::*;
 
 use crate::{
-    Attempt, BlockHeight, Hash, ProvisionTxRoot, RoutableTransaction, ShardGroupId,
-    TopologySnapshot, ValidatorId, WaveId, compute_merkle_root,
+    Attempt, BlockHeight, Hash, RoutableTransaction, ShardGroupId, TopologySnapshot, ValidatorId,
+    WaveId,
 };
 
 /// Compute the set of cross-shard waves for a block's transactions.
@@ -46,49 +46,6 @@ pub fn compute_waves(
     remote_shard_sets
         .into_iter()
         .map(|remote_shards| WaveId::new(local_shard, block_height, remote_shards))
-        .collect()
-}
-
-/// Per-target-shard merkle commitment over the tx hashes destined for each
-/// target shard in a block's cross-shard provisions.
-///
-/// For each cross-shard tx, emit the tx hash into the bucket of every remote
-/// shard that tx touches. The resulting per-target leaves are merkle-committed
-/// in block order (already hash-ascending) so the target shard can verify a
-/// received `Provisions` contains the full set it was meant to receive.
-///
-/// Only emits an entry for targets with ≥1 tx. Empty for blocks with no
-/// cross-shard txs.
-pub fn compute_provision_tx_roots(
-    topology: &TopologySnapshot,
-    transactions: &[Arc<RoutableTransaction>],
-) -> BTreeMap<ShardGroupId, ProvisionTxRoot> {
-    let local_shard = topology.local_shard();
-    let mut per_target: BTreeMap<ShardGroupId, Vec<Hash>> = BTreeMap::new();
-
-    for tx in transactions {
-        if topology.is_single_shard_transaction(tx) {
-            continue;
-        }
-        for shard in topology.all_shards_for_transaction(tx) {
-            if shard == local_shard {
-                continue;
-            }
-            per_target
-                .entry(shard)
-                .or_default()
-                .push(tx.hash().into_raw());
-        }
-    }
-
-    per_target
-        .into_iter()
-        .map(|(shard, hashes)| {
-            (
-                shard,
-                ProvisionTxRoot::from_raw(compute_merkle_root(&hashes)),
-            )
-        })
         .collect()
 }
 

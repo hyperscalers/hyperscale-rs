@@ -22,10 +22,10 @@ use hyperscale_types::{
     ProvisionTxRootsContext, Provisions, ProvisionsRootContext, QcContext, QuorumCertificate,
     ReadySignal, Round, RoutableTransaction, ShardGroupId, SignerBitfield, StateRoot,
     StoredReceipt, TopologySnapshot, TransactionRootContext, ValidatorId, VerifiedBlockVote,
-    VerifiedQuorumCertificate, Verify, VotePower, WeightedTimestamp, batch_verify_bls_same_message,
-    block_header_message, block_vote_message, committed_block_header_message,
-    compute_certificate_root, compute_local_receipt_root, compute_provision_root,
-    compute_provision_tx_roots, compute_transaction_root, compute_waves, verify_bls12381_v1,
+    VerifiedCertificateRoot, VerifiedLocalReceiptRoot, VerifiedProvisionTxRoots,
+    VerifiedProvisionsRoot, VerifiedQuorumCertificate, VerifiedTransactionRoot, Verify, VotePower,
+    WeightedTimestamp, batch_verify_bls_same_message, block_header_message, block_vote_message,
+    committed_block_header_message, compute_waves, verify_bls12381_v1,
 };
 
 use crate::beacon_witnesses::BeaconWitnessRootContext;
@@ -308,13 +308,15 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore>(
     let mut provision_hashes: Vec<ProvisionHash> = provisions.iter().map(|p| p.hash()).collect();
     provision_hashes.sort();
 
-    let transaction_root = compute_transaction_root(&transactions);
-    let certificate_root = compute_certificate_root(&certificates);
-    let local_receipt_root = compute_local_receipt_root(&receipts);
+    let transaction_root = VerifiedTransactionRoot::compute(&transactions).into_inner();
+    let certificate_root = VerifiedCertificateRoot::compute(&certificates).into_inner();
+    let local_receipt_root = VerifiedLocalReceiptRoot::compute(&receipts).into_inner();
     let raw_provision_hashes: Vec<Hash> = provision_hashes.iter().map(|h| h.into_raw()).collect();
-    let provision_root = compute_provision_root(&raw_provision_hashes);
+    let provision_root = VerifiedProvisionsRoot::compute(&raw_provision_hashes).into_inner();
     let waves = compute_waves(topology, height, &transactions);
-    let provision_tx_roots = compute_provision_tx_roots(topology, &transactions);
+    let provision_tx_roots = VerifiedProvisionTxRoots::compute(topology, &transactions)
+        .into_inner()
+        .0;
 
     // in_flight is deterministic from chain state:
     // parent's in_flight + new transactions committed - transactions finalized by certificates.
@@ -831,9 +833,8 @@ mod tests {
     use hyperscale_types::test_utils::test_notarized_transaction_v1;
     use hyperscale_types::{
         Bls12381G1PrivateKey, CertificateRoot, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
-        StoredReceipt, TimestampRange, TransactionRoot, TxRootVerifyError,
-        compute_certificate_root, compute_local_receipt_root, compute_provision_root,
-        compute_transaction_root, generate_bls_keypair, routable_from_notarized_v1,
+        StoredReceipt, TimestampRange, TransactionRoot, TxRootVerifyError, generate_bls_keypair,
+        routable_from_notarized_v1,
     };
 
     use super::*;
@@ -1256,7 +1257,7 @@ mod tests {
     #[test]
     fn verify_transaction_root_accepts_matching_root_and_rejects_otherwise() {
         let txs: Vec<Arc<RoutableTransaction>> = Vec::new();
-        let root = compute_transaction_root(&txs);
+        let root = VerifiedTransactionRoot::compute(&txs).into_inner();
         let anchor = WeightedTimestamp::ZERO;
         let ctx = TransactionRootContext {
             transactions: &txs,
@@ -1286,7 +1287,7 @@ mod tests {
             routable_from_notarized_v1(notarized, expired_range).expect("valid notarized fixture"),
         );
         let txs = vec![tx];
-        let root = compute_transaction_root(&txs);
+        let root = VerifiedTransactionRoot::compute(&txs).into_inner();
 
         let ctx = TransactionRootContext {
             transactions: &txs,
@@ -1304,7 +1305,7 @@ mod tests {
             routable_from_notarized_v1(notarized2, valid_range).expect("valid notarized fixture"),
         );
         let txs2 = vec![tx2];
-        let root2 = compute_transaction_root(&txs2);
+        let root2 = VerifiedTransactionRoot::compute(&txs2).into_inner();
         let ctx2 = TransactionRootContext {
             transactions: &txs2,
             validity_anchor: anchor,
@@ -1327,7 +1328,7 @@ mod tests {
             routable_from_notarized_v1(notarized, too_wide).expect("valid notarized fixture"),
         );
         let txs = vec![tx];
-        let root = compute_transaction_root(&txs);
+        let root = VerifiedTransactionRoot::compute(&txs).into_inner();
 
         let ctx = TransactionRootContext {
             transactions: &txs,
@@ -1342,7 +1343,7 @@ mod tests {
     #[test]
     fn verify_provision_root_matches_compute_provision_root() {
         let hashes = vec![Hash::from_bytes(b"a"), Hash::from_bytes(b"b")];
-        let root = compute_provision_root(&hashes);
+        let root = VerifiedProvisionsRoot::compute(&hashes).into_inner();
         let ctx = ProvisionsRootContext {
             batch_hashes: &hashes,
         };
@@ -1357,7 +1358,7 @@ mod tests {
     #[test]
     fn verify_certificate_root_matches_compute_certificate_root() {
         let certs: Vec<Arc<FinalizedWave>> = Vec::new();
-        let root = compute_certificate_root(&certs);
+        let root = VerifiedCertificateRoot::compute(&certs).into_inner();
         let ctx = CertificateRootContext {
             certificates: &certs,
         };
@@ -1372,7 +1373,7 @@ mod tests {
     #[test]
     fn verify_local_receipt_root_matches_compute_local_receipt_root() {
         let receipts: Vec<StoredReceipt> = Vec::new();
-        let root = compute_local_receipt_root(&receipts);
+        let root = VerifiedLocalReceiptRoot::compute(&receipts).into_inner();
         let ctx = LocalReceiptRootContext {
             receipts: &receipts,
         };
