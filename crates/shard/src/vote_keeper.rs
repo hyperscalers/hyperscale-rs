@@ -237,11 +237,7 @@ impl VoteKeeper {
         let total_power = topology.local_voting_power();
         let validator_id = topology.local_validator_id();
 
-        let public_key = if is_own_vote {
-            None
-        } else if let Some(pk) = topology.public_key(voter) {
-            Some(pk)
-        } else {
+        let Some(public_key) = topology.public_key(voter) else {
             warn!("No public key for validator {:?}", voter);
             return vec![];
         };
@@ -265,20 +261,12 @@ impl VoteKeeper {
                 );
                 vote_set.add_verified_vote(voter_index, verified, voting_power);
             }
-            Verifiable::Unverified(raw) if is_own_vote => {
-                // SAFETY: own votes are produced by `SignAndBroadcastBlockVote`
-                // with our own signing key; if such a vote ever arrives here
-                // as `Unverified`, it was assembled from already-signed parts
-                // and the predicate holds. The own-vote branch wraps under
-                // that trust source.
-                vote_set.add_verified_vote(
-                    voter_index,
-                    Verified::<BlockVote>::new_unchecked(raw),
-                    voting_power,
-                );
-            }
             Verifiable::Unverified(raw) => {
-                let public_key = public_key.expect("non-own vote implies public key resolved");
+                // Own-vote unverified arrivals (echo from a peer after a
+                // restart, or never-self-broadcast paths) take the same
+                // BLS batch route as any other voter — a wire-arrived
+                // vote claiming `voter == self` cannot be trusted without
+                // signature verification.
                 vote_set.buffer_unverified_vote(voter_index, raw, public_key, voting_power);
                 trace!(
                     validator = ?validator_id,
