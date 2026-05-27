@@ -331,6 +331,7 @@ impl RocksDbShardStorage {
         // 1. Get block metadata
         let metadata: BlockMetadata = get::<BlocksCf>(&*self.db, blocks_cf, &height.inner())?;
         let (header, manifest, qc, _) = metadata.into_parts();
+        let qc = qc.into_unverified();
 
         // 2. Try to batch-fetch transactions (preserving order)
         let transactions =

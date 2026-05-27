@@ -8,7 +8,8 @@ use crate::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight, BoundedBTreeMap, BoundedVec,
     CertificateRoot, Hash, InFlightCount, LocalReceiptRoot, MAX_REMOTE_SHARDS_PER_WAVE,
     MAX_TXS_PER_BLOCK, ProposerTimestamp, ProvisionTxRoot, ProvisionsRoot, QuorumCertificate,
-    Round, ShardGroupId, StateRoot, TransactionRoot, ValidatorId, WaveId,
+    Round, ShardGroupId, StateRoot, TransactionRoot, ValidatorId, Verifiable,
+    VerifiedQuorumCertificate, WaveId,
 };
 
 /// Block header containing consensus metadata.
@@ -24,7 +25,7 @@ pub struct BlockHeader {
     shard_group_id: ShardGroupId,
     height: BlockHeight,
     parent_block_hash: BlockHash,
-    parent_qc: QuorumCertificate,
+    parent_qc: Verifiable<QuorumCertificate, VerifiedQuorumCertificate>,
     proposer: ValidatorId,
     timestamp: ProposerTimestamp,
     round: Round,
@@ -54,7 +55,7 @@ impl BlockHeader {
         shard_group_id: ShardGroupId,
         height: BlockHeight,
         parent_block_hash: BlockHash,
-        parent_qc: QuorumCertificate,
+        parent_qc: impl Into<Verifiable<QuorumCertificate, VerifiedQuorumCertificate>>,
         proposer: ValidatorId,
         timestamp: ProposerTimestamp,
         round: Round,
@@ -74,7 +75,7 @@ impl BlockHeader {
             shard_group_id,
             height,
             parent_block_hash,
-            parent_qc,
+            parent_qc: parent_qc.into(),
             proposer,
             timestamp,
             round,
@@ -103,7 +104,11 @@ impl BlockHeader {
             shard_group_id,
             height: BlockHeight::new(0),
             parent_block_hash: BlockHash::from_raw(Hash::from_bytes(&[0u8; 32])),
-            parent_qc: QuorumCertificate::genesis(shard_group_id),
+            // Genesis QC carries no signature and is valid by definition;
+            // `VerifiedQuorumCertificate::genesis` is the only path to a
+            // verified genesis value (the predicate's signer check would
+            // reject the zero-signers genesis bitfield).
+            parent_qc: Verifiable::Verified(VerifiedQuorumCertificate::genesis(shard_group_id)),
             proposer,
             timestamp: ProposerTimestamp::ZERO,
             round: Round::INITIAL,
@@ -143,8 +148,29 @@ impl BlockHeader {
     }
 
     /// Quorum certificate proving parent block was committed.
+    ///
+    /// Returns the raw QC regardless of verification status; verified-aware
+    /// callers should use [`Self::parent_qc_verifiable`] or
+    /// [`Self::verified_parent_qc`].
     #[must_use]
-    pub const fn parent_qc(&self) -> &QuorumCertificate {
+    pub fn parent_qc(&self) -> &QuorumCertificate {
+        self.parent_qc.as_unverified()
+    }
+
+    /// Verified handle on the parent QC, present only when the producer
+    /// constructed the header with a verified QC or after explicit
+    /// verification at an admission boundary.
+    #[must_use]
+    pub const fn verified_parent_qc(&self) -> Option<&VerifiedQuorumCertificate> {
+        self.parent_qc.verified()
+    }
+
+    /// Borrow the parent QC together with its verification marker. Used
+    /// by admission handlers branching on `Verified` vs `Unverified`.
+    #[must_use]
+    pub const fn parent_qc_verifiable(
+        &self,
+    ) -> &Verifiable<QuorumCertificate, VerifiedQuorumCertificate> {
         &self.parent_qc
     }
 
@@ -313,7 +339,7 @@ impl BlockHeader {
         ShardGroupId,
         BlockHeight,
         BlockHash,
-        QuorumCertificate,
+        Verifiable<QuorumCertificate, VerifiedQuorumCertificate>,
         ValidatorId,
         ProposerTimestamp,
         Round,

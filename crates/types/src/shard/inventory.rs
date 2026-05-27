@@ -26,7 +26,8 @@ use sbor::prelude::BasicSbor;
 use crate::{
     Block, BlockHash, BlockHeader, BloomFilter, BloomKey, BoundedVec, CertifiedBlock,
     FinalizedWave, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK,
-    ProvisionHash, Provisions, QuorumCertificate, RoutableTransaction, TxHash, WaveId,
+    ProvisionHash, Provisions, QuorumCertificate, RoutableTransaction, TxHash, Verifiable,
+    VerifiedQuorumCertificate, WaveId,
 };
 
 /// Inventory of locally-known item hashes, grouped by category.
@@ -86,7 +87,7 @@ impl Inventory {
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct ElidedCertifiedBlock {
     header: BlockHeader,
-    qc: QuorumCertificate,
+    qc: Verifiable<QuorumCertificate, VerifiedQuorumCertificate>,
     transactions: BoundedVec<(TxHash, Option<Arc<RoutableTransaction>>), MAX_TXS_PER_BLOCK>,
     certificates: BoundedVec<(WaveId, Option<Arc<FinalizedWave>>), MAX_FINALIZED_TX_PER_BLOCK>,
     provisions: ElidedProvisions,
@@ -117,8 +118,23 @@ impl ElidedCertifiedBlock {
     }
 
     /// Certifying quorum certificate (always inline).
+    ///
+    /// Returns the raw QC regardless of verification status; verified-aware
+    /// callers should use [`Self::qc_verifiable`] or [`Self::verified_qc`].
     #[must_use]
-    pub const fn qc(&self) -> &QuorumCertificate {
+    pub fn qc(&self) -> &QuorumCertificate {
+        self.qc.as_unverified()
+    }
+
+    /// Verified handle on the QC.
+    #[must_use]
+    pub const fn verified_qc(&self) -> Option<&VerifiedQuorumCertificate> {
+        self.qc.verified()
+    }
+
+    /// Borrow the QC together with its verification marker.
+    #[must_use]
+    pub const fn qc_verifiable(&self) -> &Verifiable<QuorumCertificate, VerifiedQuorumCertificate> {
         &self.qc
     }
 
@@ -154,7 +170,12 @@ impl ElidedCertifiedBlock {
     /// replaced with `None`; hashes are always included so the requester
     /// can reconstruct the block.
     #[must_use]
-    pub fn elide(block: &Block, qc: QuorumCertificate, inventory: &Inventory) -> Self {
+    pub fn elide(
+        block: &Block,
+        qc: impl Into<Verifiable<QuorumCertificate, VerifiedQuorumCertificate>>,
+        inventory: &Inventory,
+    ) -> Self {
+        let qc = qc.into();
         let header = block.header().clone();
         let is_live = block.is_live();
 
@@ -249,10 +270,10 @@ impl ElidedCertifiedBlock {
         // before resolving any bodies. A peer that sends a mismatched
         // (header, qc) pair fails fast without us doing lookup work.
         let header_hash = self.header.hash();
-        if self.qc.block_hash() != header_hash {
+        if self.qc.as_unverified().block_hash() != header_hash {
             return Err(RehydrateError::QcMismatch {
                 header_hash,
-                qc_block_hash: self.qc.block_hash(),
+                qc_block_hash: self.qc.as_unverified().block_hash(),
             });
         }
         let mut miss = RehydrationMiss::default();

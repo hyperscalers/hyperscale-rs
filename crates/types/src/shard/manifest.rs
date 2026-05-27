@@ -6,7 +6,8 @@ use sbor::prelude::*;
 use crate::{
     BeaconWitnessLeafCount, Block, BlockHash, BlockHeader, BlockHeight, BoundedVec,
     MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK, MAX_READY_SIGNALS_PER_BLOCK,
-    MAX_TXS_PER_BLOCK, ProvisionHash, QuorumCertificate, ReadySignal, TxHash, WaveId,
+    MAX_TXS_PER_BLOCK, ProvisionHash, QuorumCertificate, ReadySignal, TxHash, Verifiable,
+    VerifiedQuorumCertificate, WaveId,
 };
 
 /// Hash-level description of a block's contents (transactions and certificates).
@@ -121,7 +122,7 @@ impl BlockManifest {
 pub struct BlockMetadata {
     header: BlockHeader,
     manifest: BlockManifest,
-    qc: QuorumCertificate,
+    qc: Verifiable<QuorumCertificate, VerifiedQuorumCertificate>,
     beacon_witness_leaf_count_at_block_end: BeaconWitnessLeafCount,
 }
 
@@ -131,7 +132,10 @@ impl BlockMetadata {
     /// `ZERO`; callers that know the leaf count (the per-block commit
     /// path) should use [`Self::from_block_with_witness_count`].
     #[must_use]
-    pub fn from_block(block: &Block, qc: QuorumCertificate) -> Self {
+    pub fn from_block(
+        block: &Block,
+        qc: impl Into<Verifiable<QuorumCertificate, VerifiedQuorumCertificate>>,
+    ) -> Self {
         Self::from_block_with_witness_count(block, qc, BeaconWitnessLeafCount::ZERO)
     }
 
@@ -142,13 +146,13 @@ impl BlockMetadata {
     #[must_use]
     pub fn from_block_with_witness_count(
         block: &Block,
-        qc: QuorumCertificate,
+        qc: impl Into<Verifiable<QuorumCertificate, VerifiedQuorumCertificate>>,
         beacon_witness_leaf_count_at_block_end: BeaconWitnessLeafCount,
     ) -> Self {
         Self {
             header: block.header().clone(),
             manifest: BlockManifest::from_block(block),
-            qc,
+            qc: qc.into(),
             beacon_witness_leaf_count_at_block_end,
         }
     }
@@ -166,8 +170,23 @@ impl BlockMetadata {
     }
 
     /// Quorum certificate that commits this block.
+    ///
+    /// Returns the raw QC regardless of verification status; verified-aware
+    /// callers should use [`Self::qc_verifiable`] or [`Self::verified_qc`].
     #[must_use]
-    pub const fn qc(&self) -> &QuorumCertificate {
+    pub fn qc(&self) -> &QuorumCertificate {
+        self.qc.as_unverified()
+    }
+
+    /// Verified handle on the QC.
+    #[must_use]
+    pub const fn verified_qc(&self) -> Option<&VerifiedQuorumCertificate> {
+        self.qc.verified()
+    }
+
+    /// Borrow the QC together with its verification marker.
+    #[must_use]
+    pub const fn qc_verifiable(&self) -> &Verifiable<QuorumCertificate, VerifiedQuorumCertificate> {
         &self.qc
     }
 
@@ -185,7 +204,7 @@ impl BlockMetadata {
     ) -> (
         BlockHeader,
         BlockManifest,
-        QuorumCertificate,
+        Verifiable<QuorumCertificate, VerifiedQuorumCertificate>,
         BeaconWitnessLeafCount,
     ) {
         (

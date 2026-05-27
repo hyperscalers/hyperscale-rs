@@ -2,7 +2,10 @@
 
 use sbor::prelude::*;
 
-use crate::{BlockHash, BlockHeader, BlockHeight, QuorumCertificate, ShardGroupId, StateRoot};
+use crate::{
+    BlockHash, BlockHeader, BlockHeight, QuorumCertificate, ShardGroupId, StateRoot, Verifiable,
+    VerifiedQuorumCertificate,
+};
 
 /// A block header paired with the QC that committed it.
 ///
@@ -13,14 +16,20 @@ use crate::{BlockHash, BlockHeader, BlockHeight, QuorumCertificate, ShardGroupId
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct CommittedBlockHeader {
     header: BlockHeader,
-    qc: QuorumCertificate,
+    qc: Verifiable<QuorumCertificate, VerifiedQuorumCertificate>,
 }
 
 impl CommittedBlockHeader {
     /// Create a new committed block header.
     #[must_use]
-    pub const fn new(header: BlockHeader, qc: QuorumCertificate) -> Self {
-        Self { header, qc }
+    pub fn new(
+        header: BlockHeader,
+        qc: impl Into<Verifiable<QuorumCertificate, VerifiedQuorumCertificate>>,
+    ) -> Self {
+        Self {
+            header,
+            qc: qc.into(),
+        }
     }
 
     /// Header whose `hash()` matches the QC's `block_hash`.
@@ -31,14 +40,35 @@ impl CommittedBlockHeader {
 
     /// QC committing [`Self::header`]; verifiable against the source shard's
     /// validator keys without access to the block body.
+    ///
+    /// Returns the raw QC regardless of verification status; verified-aware
+    /// callers should use [`Self::qc_verifiable`] or [`Self::verified_qc`].
     #[must_use]
-    pub const fn qc(&self) -> &QuorumCertificate {
+    pub fn qc(&self) -> &QuorumCertificate {
+        self.qc.as_unverified()
+    }
+
+    /// Verified handle on the QC, when the producer constructed this
+    /// container with a verified QC or after explicit verification.
+    #[must_use]
+    pub const fn verified_qc(&self) -> Option<&VerifiedQuorumCertificate> {
+        self.qc.verified()
+    }
+
+    /// Borrow the QC together with its verification marker.
+    #[must_use]
+    pub const fn qc_verifiable(&self) -> &Verifiable<QuorumCertificate, VerifiedQuorumCertificate> {
         &self.qc
     }
 
     /// Consume the pair and return its parts.
     #[must_use]
-    pub fn into_parts(self) -> (BlockHeader, QuorumCertificate) {
+    pub fn into_parts(
+        self,
+    ) -> (
+        BlockHeader,
+        Verifiable<QuorumCertificate, VerifiedQuorumCertificate>,
+    ) {
         (self.header, self.qc)
     }
 

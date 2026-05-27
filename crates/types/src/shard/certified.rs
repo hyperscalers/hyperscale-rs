@@ -8,7 +8,9 @@ use sbor::{
     NoCustomTypeKind, NoCustomValueKind, RustTypeId, TypeData, TypeKind, ValueKind,
 };
 
-use crate::{Block, BlockHash, BlockHeight, QuorumCertificate};
+use crate::{
+    Block, BlockHash, BlockHeight, QuorumCertificate, Verifiable, VerifiedQuorumCertificate,
+};
 
 /// A block alongside the QC that certifies it.
 ///
@@ -26,7 +28,7 @@ use crate::{Block, BlockHash, BlockHeight, QuorumCertificate};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CertifiedBlock {
     block: Block,
-    qc: QuorumCertificate,
+    qc: Verifiable<QuorumCertificate, VerifiedQuorumCertificate>,
 }
 
 /// Error returned when the block hash doesn't match the QC's `block_hash`.
@@ -50,13 +52,15 @@ impl CertifiedBlock {
     /// not match `block.hash()`.
     pub fn new_checked(
         block: Block,
-        qc: QuorumCertificate,
+        qc: impl Into<Verifiable<QuorumCertificate, VerifiedQuorumCertificate>>,
     ) -> Result<Self, CertifiedBlockHashMismatch> {
+        let qc = qc.into();
         let block_hash = block.hash();
-        if qc.block_hash() != block_hash {
+        let qc_block_hash = qc.as_unverified().block_hash();
+        if qc_block_hash != block_hash {
             return Err(CertifiedBlockHashMismatch {
                 block_hash,
-                qc_block_hash: qc.block_hash(),
+                qc_block_hash,
             });
         }
         Ok(Self { block, qc })
@@ -75,9 +79,13 @@ impl CertifiedBlock {
     ///
     /// Panics if `qc.block_hash != block.hash()`.
     #[must_use]
-    pub fn new_unchecked(block: Block, qc: QuorumCertificate) -> Self {
+    pub fn new_unchecked(
+        block: Block,
+        qc: impl Into<Verifiable<QuorumCertificate, VerifiedQuorumCertificate>>,
+    ) -> Self {
+        let qc = qc.into();
         assert_eq!(
-            qc.block_hash(),
+            qc.as_unverified().block_hash(),
             block.hash(),
             "CertifiedBlock pairing invariant"
         );
@@ -91,14 +99,34 @@ impl CertifiedBlock {
     }
 
     /// QC certifying [`Self::block`]. Invariant: `qc.block_hash == block.hash()`.
+    ///
+    /// Returns the raw QC regardless of verification status; verified-aware
+    /// callers should use [`Self::qc_verifiable`] or [`Self::verified_qc`].
     #[must_use]
-    pub const fn qc(&self) -> &QuorumCertificate {
+    pub fn qc(&self) -> &QuorumCertificate {
+        self.qc.as_unverified()
+    }
+
+    /// Verified handle on the QC.
+    #[must_use]
+    pub const fn verified_qc(&self) -> Option<&VerifiedQuorumCertificate> {
+        self.qc.verified()
+    }
+
+    /// Borrow the QC together with its verification marker.
+    #[must_use]
+    pub const fn qc_verifiable(&self) -> &Verifiable<QuorumCertificate, VerifiedQuorumCertificate> {
         &self.qc
     }
 
     /// Consume the pair and return its parts.
     #[must_use]
-    pub fn into_parts(self) -> (Block, QuorumCertificate) {
+    pub fn into_parts(
+        self,
+    ) -> (
+        Block,
+        Verifiable<QuorumCertificate, VerifiedQuorumCertificate>,
+    ) {
         (self.block, self.qc)
     }
 
@@ -143,6 +171,8 @@ impl<D: Decoder<NoCustomValueKind>> Decode<NoCustomValueKind, D> for CertifiedBl
         }
         let block: Block = decoder.decode()?;
         let qc: QuorumCertificate = decoder.decode()?;
+        // Wire decode always produces an unverified QC; verification
+        // happens at the admission layer.
         Self::new_checked(block, qc).map_err(|_| DecodeError::InvalidCustomValue)
     }
 }

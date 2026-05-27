@@ -34,6 +34,7 @@
 //! must be revisited.
 
 use std::hash::{Hash, Hasher};
+use std::ops::Deref;
 
 use sbor::{
     Categorize, Decode, DecodeError, Decoder, Describe, Encode, EncodeError, Encoder,
@@ -151,6 +152,20 @@ impl<U: Hash, V: AsRef<U>> Hash for Verifiable<U, V> {
 impl<U, V: AsRef<U>> From<U> for Verifiable<U, V> {
     fn from(u: U) -> Self {
         Self::Unverified(u)
+    }
+}
+
+/// Deref to the raw `U` so consumers can call `U`'s accessor methods on
+/// the wrapper without an explicit `.as_unverified()` hop. This is the
+/// read-only equivalent of the plan's "wrapper is for storage, not
+/// function signatures" — callers reading off the wire form keep
+/// working unchanged after a container's field type changes from `U` to
+/// `Verifiable<U, V>`. Verified-aware code uses [`Self::verified`]
+/// explicitly to branch on the marker.
+impl<U, V: AsRef<U>> Deref for Verifiable<U, V> {
+    type Target = U;
+    fn deref(&self) -> &U {
+        self.as_unverified()
     }
 }
 

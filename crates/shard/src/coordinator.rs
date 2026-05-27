@@ -2613,6 +2613,7 @@ impl ShardCoordinator {
         certified: CertifiedBlock,
     ) -> Vec<Action> {
         let (block, qc) = certified.into_parts();
+        let qc = qc.into_unverified();
         let block_hash = block.hash();
         let height = block.height();
 
