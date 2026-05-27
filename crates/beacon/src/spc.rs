@@ -649,8 +649,8 @@ pub enum SpcEffect {
     /// max high triple and broadcast it — we produced a high output
     /// at `view` but our local table can't resolve its parent, so
     /// we fall back to the view-change path. The signed message
-    /// lands back on the FSM via the same `SpcEvent::EmptyView` path
-    /// peer messages use.
+    /// lands back on the FSM via the same `SpcEvent::EmptyViewVerified`
+    /// path peer messages use.
     SignAndBroadcastEmptyView {
         /// View this empty-view attestation skips.
         view: SpcView,
@@ -1045,8 +1045,8 @@ impl SpcInstance {
             // Empty-view path: our high has no known parent. Emit a
             // sign-and-broadcast intent reporting our current
             // `max_high`; the signed message lands back on the FSM
-            // via `SpcEvent::EmptyView` and gets pooled toward the
-            // `f + 1` indirect-cert quorum the same way peer
+            // via `SpcEvent::EmptyViewVerified` and gets pooled toward
+            // the `f + 1` indirect-cert quorum the same way peer
             // attestations are.
             let reported = self.max_high.clone();
             let should_broadcast = self
