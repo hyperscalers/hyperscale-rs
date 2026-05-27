@@ -694,4 +694,68 @@ mod tests {
             GossipVerdict::Accept
         });
     }
+
+    /// A [`Verifiable::Verified`] value handed to [`HandlerRegistry::local_dispatch_gossip`]
+    /// must arrive at the handler still in the `Verified` variant. This is the
+    /// in-process fast path: colocated vnodes share a trust domain, so a
+    /// producer that verified a payload before publishing must not have its
+    /// verification thrown away by the dispatch boundary.
+    #[test]
+    fn local_dispatch_gossip_preserves_verified_marker() {
+        use std::sync::Mutex;
+
+        use hyperscale_types::{NetworkMessage, Verifiable};
+        use sbor::prelude::BasicSbor;
+
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        struct VTest(u32);
+
+        impl AsRef<u32> for VTest {
+            fn as_ref(&self) -> &u32 {
+                &self.0
+            }
+        }
+
+        #[derive(Debug, Clone, BasicSbor)]
+        struct VTestMsg {
+            payload: Verifiable<u32, VTest>,
+        }
+
+        impl NetworkMessage for VTestMsg {
+            fn message_type_id() -> &'static str {
+                "test.local_dispatch_verified"
+            }
+        }
+        impl GossipMessage for VTestMsg {
+            const SCOPE: TopicScope = TopicScope::Shard;
+        }
+
+        let hosted: Arc<HashSet<ShardGroupId>> =
+            Arc::new(std::iter::once(ShardGroupId::new(0)).collect());
+        let registry = HandlerRegistry::new(hosted);
+
+        let observed: Arc<Mutex<Option<Verifiable<u32, VTest>>>> = Arc::new(Mutex::new(None));
+        let observed_clone = Arc::clone(&observed);
+
+        registry.register_gossip(
+            move |msg: VTestMsg, _shard: ShardGroupId| -> GossipVerdict {
+                *observed_clone.lock().unwrap() = Some(msg.payload);
+                GossipVerdict::Accept
+            },
+        );
+
+        let verified_msg = VTestMsg {
+            payload: Verifiable::Verified(VTest(42)),
+        };
+        let verdict = registry.local_dispatch_gossip(&verified_msg, Some(ShardGroupId::new(0)));
+        assert_eq!(verdict, Some(GossipVerdict::Accept));
+
+        let received = observed.lock().unwrap().clone();
+        match received {
+            Some(Verifiable::Verified(VTest(42))) => {}
+            other => panic!(
+                "local dispatch must preserve Verifiable::Verified across the boundary, got {other:?}"
+            ),
+        }
+    }
 }

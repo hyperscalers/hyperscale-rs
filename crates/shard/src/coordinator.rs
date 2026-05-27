@@ -71,6 +71,8 @@ pub struct ShardMemoryStats {
     pub buffered_synced_blocks: usize,
     /// Synced blocks pending QC-signature verification before apply.
     pub pending_synced_block_verifications: usize,
+    /// Composite assemblies awaiting QC + per-root sub-results.
+    pub pending_assemblies: usize,
 }
 
 use std::collections::HashMap;
@@ -1665,6 +1667,11 @@ impl ShardCoordinator {
                 "QC built successfully"
             );
             self.votes.mark_qc_built(block_hash);
+            if let Some(block) = self.pending_blocks.get_block(block_hash) {
+                let block = Arc::clone(block);
+                self.verification.track_pending_assembly(block);
+                let _ = self.verification.record_qc_assembly(block_hash, qc.clone());
+            }
             return vec![Action::Continuation(
                 ProtocolEvent::QuorumCertificateFormed { block_hash, qc },
             )];
@@ -3285,6 +3292,7 @@ impl ShardCoordinator {
                 .pending_state_root_verifications_len(),
             buffered_synced_blocks: self.block_sync.buffered_synced_blocks_len(),
             pending_synced_block_verifications: self.block_sync.pending_verification_count(),
+            pending_assemblies: self.verification.pending_assembly_count(),
         }
     }
 
