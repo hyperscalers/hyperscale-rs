@@ -943,7 +943,7 @@ pub enum Action {
         /// Request to verify.
         request: Box<SkipRequest>,
         /// Active validator pool used to look up the signer's pubkey.
-        active_pool: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+        signers: Vec<(ValidatorId, Bls12381G1PublicKey)>,
     },
 
     /// Persist a committed beacon block + its resulting `BeaconState`

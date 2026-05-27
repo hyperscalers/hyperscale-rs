@@ -588,7 +588,7 @@ impl BeaconCoordinator {
         }
         vec![Action::VerifySkipRequest {
             request: Box::new(request),
-            active_pool,
+            signers: active_pool,
         }]
     }
 
@@ -1175,11 +1175,8 @@ mod tests {
                     let post = coord.on_beacon_block_verified(block, valid);
                     out.extend(complete_verifications(coord, post));
                 }
-                Action::VerifySkipRequest {
-                    request,
-                    active_pool,
-                } => {
-                    let valid = verify_skip_request(&request, &net, &active_pool);
+                Action::VerifySkipRequest { request, signers } => {
+                    let valid = verify_skip_request(&request, &net, &signers);
                     let post = coord.on_skip_request_verified(*request, valid);
                     out.extend(complete_verifications(coord, post));
                 }

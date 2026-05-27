@@ -279,11 +279,8 @@ impl CoordinatorSim {
                         self.coordinators[replica_idx].on_beacon_block_verified(block, valid);
                     out.extend(self.resolve_verifications(replica_idx, post));
                 }
-                Action::VerifySkipRequest {
-                    request,
-                    active_pool,
-                } => {
-                    let valid = verify_skip_request(&request, &self.network, &active_pool);
+                Action::VerifySkipRequest { request, signers } => {
+                    let valid = verify_skip_request(&request, &self.network, &signers);
                     let post =
                         self.coordinators[replica_idx].on_skip_request_verified(*request, valid);
                     out.extend(self.resolve_verifications(replica_idx, post));
@@ -736,11 +733,8 @@ impl CoordinatorSim {
                 let post = self.coordinators[emitter_idx].on_beacon_block_verified(block, valid);
                 self.absorb(emitter_idx, post);
             }
-            Action::VerifySkipRequest {
-                request,
-                active_pool,
-            } => {
-                let valid = verify_skip_request(&request, &self.network, &active_pool);
+            Action::VerifySkipRequest { request, signers } => {
+                let valid = verify_skip_request(&request, &self.network, &signers);
                 let post = self.coordinators[emitter_idx].on_skip_request_verified(*request, valid);
                 self.absorb(emitter_idx, post);
             }

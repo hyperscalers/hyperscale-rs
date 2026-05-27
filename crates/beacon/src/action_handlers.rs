@@ -194,11 +194,8 @@ where
             let valid = verify_certified(&block, network, &signers);
             ctx.notify_protocol(ProtocolEvent::BeaconBlockVerified { block, valid });
         }
-        Action::VerifySkipRequest {
-            request,
-            active_pool,
-        } => {
-            let valid = verify_skip_request(&request, network, &active_pool);
+        Action::VerifySkipRequest { request, signers } => {
+            let valid = verify_skip_request(&request, network, &signers);
             ctx.notify_protocol(ProtocolEvent::SkipRequestVerified { request, valid });
         }
         _ => unreachable!("hyperscale_beacon::handle_action called with non-beacon action"),
