@@ -12,8 +12,7 @@ use hyperscale_network_memory::{HostingMode, NetworkConfig};
 use hyperscale_node::shard_loop::ShardEvent;
 use hyperscale_simulation::SimulationRunner;
 use hyperscale_types::{
-    BlockHeight, LocalTimestamp, NetworkDefinition, QuorumCertificate, Round, ShardGroupId,
-    TransactionStatus,
+    BlockHeight, LocalTimestamp, NetworkDefinition, Round, ShardGroupId, TransactionStatus,
 };
 use tracing_test::traced_test;
 
@@ -977,7 +976,7 @@ fn test_block_commit_verification() {
                 .unwrap()
                 .shard_coordinator()
                 .latest_qc()
-                .map_or(BlockHeight::GENESIS, QuorumCertificate::height)
+                .map_or(BlockHeight::GENESIS, |qc| qc.height())
         })
         .collect();
 

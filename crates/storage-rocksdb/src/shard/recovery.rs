@@ -2,7 +2,9 @@
 
 use hyperscale_metrics::record_storage_operation;
 use hyperscale_storage::{RecoveredState, SubstateStore};
-use hyperscale_types::{BlockHash, BlockHeight, Hash, ShardWitnessPayload};
+use hyperscale_types::{
+    BlockHash, BlockHeight, Hash, ShardWitnessPayload, VerifiedQuorumCertificate,
+};
 
 use super::column_families::BeaconWitnessesCf;
 use super::core::RocksDbShardStorage;
@@ -55,6 +57,11 @@ impl RocksDbShardStorage {
             load_time_ms = elapsed * 1000.0,
             "Loaded recovered state from storage"
         );
+
+        // SAFETY: QCs only land in storage after verification at the
+        // shard-consensus admission boundary, so recovery can rewrap
+        // with `new_unchecked` without re-verifying.
+        let latest_qc = latest_qc.map(VerifiedQuorumCertificate::new_unchecked);
 
         RecoveredState {
             committed_height,

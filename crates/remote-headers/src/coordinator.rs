@@ -256,11 +256,8 @@ impl RemoteHeaderCoordinator {
         let key = (shard, height);
 
         if let Err(e) = result {
-            // The verified QC handle is dropped on success too in this
-            // commit; downstream consumers re-look it up from
-            // `header.qc()`. A follow-up commit will plumb the verified
-            // value through `verified` storage so consumers see the
-            // typestate marker directly.
+            // The verified QC handle isn't propagated yet; downstream
+            // consumers re-read it from `header.qc()`.
             warn!(
                 shard = shard.inner(),
                 height = height.inner(),

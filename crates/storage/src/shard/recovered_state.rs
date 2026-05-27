@@ -1,7 +1,7 @@
 //! State recovered from storage on startup, used to restore the consensus
 //! state machine after a crash or restart.
 
-use hyperscale_types::{BlockHash, BlockHeight, Hash, QuorumCertificate, StateRoot};
+use hyperscale_types::{BlockHash, BlockHeight, Hash, StateRoot, VerifiedQuorumCertificate};
 
 /// State recovered from storage on startup.
 ///
@@ -16,8 +16,11 @@ pub struct RecoveredState {
     /// Last committed block hash (None for fresh start).
     pub committed_hash: Option<BlockHash>,
 
-    /// Latest QC (certifies the highest certified block).
-    pub latest_qc: Option<QuorumCertificate>,
+    /// Latest QC (certifies the highest certified block). Wrapped as
+    /// [`VerifiedQuorumCertificate`] via `new_unchecked` inside the
+    /// storage adapter; the trust source is the persistence invariant
+    /// that QCs only land in storage after verification at admission.
+    pub latest_qc: Option<VerifiedQuorumCertificate>,
 
     /// Last committed JMT root hash.
     ///

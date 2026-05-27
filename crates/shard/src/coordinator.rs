@@ -142,12 +142,9 @@ pub struct ShardCoordinator {
     /// Updated synchronously at commit time (not dependent on async JMT).
     committed_state_root: StateRoot,
 
-    /// Latest QC (certifies the latest certified block).
-    ///
-    /// Currently stored raw; promotion to `Option<VerifiedQuorumCertificate>`
-    /// is deferred to a follow-up commit so this change stays focused on
-    /// the event/action surface.
-    latest_qc: Option<QuorumCertificate>,
+    /// Latest QC (certifies the latest certified block). Verified at
+    /// every adoption gate; the typestate makes that invariant local.
+    latest_qc: Option<VerifiedQuorumCertificate>,
 
     /// QC deferred because the block header wasn't in memory when it formed.
     /// Adopted in `on_block_header` when the header arrives.
@@ -233,7 +230,7 @@ impl ShardCoordinator {
             view_change: ViewChangeController::new(),
             committed_height: recovered.committed_height,
             committed_hash: recovered.committed_hash.unwrap_or(BlockHash::ZERO),
-            committed_ts: recovered.latest_qc.as_ref().map_or(
+            committed_ts: recovered.latest_qc.as_deref().map_or(
                 WeightedTimestamp::ZERO,
                 QuorumCertificate::weighted_timestamp,
             ),
@@ -585,7 +582,7 @@ impl ShardCoordinator {
         topology_snapshot: &TopologySnapshot,
         height: BlockHeight,
         hash: Option<BlockHash>,
-        qc: Option<QuorumCertificate>,
+        qc: Option<VerifiedQuorumCertificate>,
     ) -> Vec<Action> {
         if height == BlockHeight::GENESIS && hash.is_none() {
             // No committed blocks - this is a fresh start
@@ -1127,13 +1124,15 @@ impl ShardCoordinator {
         // cached `block_hash` X while fabricating `signers` / `round` /
         // `parent_block_hash`, and have those forged fields adopted into
         // `latest_qc` / drive view sync without re-verification.
-        if have_parent
-            && self
+        if have_parent {
+            let cached = self
                 .verification
                 .cached_qc(&header.parent_qc().block_hash())
-                .is_some_and(|cached| cached == header.parent_qc())
-        {
-            actions.extend(self.try_adopt_verified_qc(topology_snapshot, header.parent_qc()));
+                .filter(|cached| cached.as_ref() == header.parent_qc())
+                .cloned();
+            if let Some(cached) = cached {
+                actions.extend(self.try_adopt_verified_qc(topology_snapshot, &cached));
+            }
         }
 
         actions
@@ -1147,7 +1146,7 @@ impl ShardCoordinator {
     fn try_adopt_verified_qc(
         &mut self,
         topology_snapshot: &TopologySnapshot,
-        qc: &QuorumCertificate,
+        qc: &VerifiedQuorumCertificate,
     ) -> Vec<Action> {
         let advances = self
             .latest_qc
@@ -1162,11 +1161,12 @@ impl ShardCoordinator {
             "Adopted verified parent QC"
         );
         self.latest_qc = Some(qc.clone());
-        self.maybe_unlock_for_qc(topology_snapshot, qc);
+        self.maybe_unlock_for_qc(topology_snapshot, qc.as_ref());
         // Non-proposers learn about QCs via block headers rather than
         // forming them locally — they need two-chain commit + a proposal
         // kick to advance the chain in the event-driven model.
-        let actions = self.try_two_chain_commit(topology_snapshot, qc, CommitSource::Header);
+        let actions =
+            self.try_two_chain_commit(topology_snapshot, qc.as_ref(), CommitSource::Header);
         self.queue_ready_proposal();
         actions
     }
@@ -1328,7 +1328,7 @@ impl ShardCoordinator {
             if self
                 .verification
                 .cached_qc(&qc_block_hash)
-                .is_some_and(|cached| cached == header.parent_qc())
+                .is_some_and(|cached| cached.as_ref() == header.parent_qc())
             {
                 trace!(
                     qc_block_hash = ?qc_block_hash,
@@ -1345,7 +1345,8 @@ impl ShardCoordinator {
             }
 
             // Collect public keys and voting powers for verification —
-            // both halves of the QC's predicate (Decision 10).
+            // both halves of the QC's predicate (signature + quorum
+            // power) need them.
             let Some(public_keys) = committee_public_keys(topology_snapshot) else {
                 warn!("Failed to collect public keys for QC verification");
                 return vec![];
@@ -1760,20 +1761,15 @@ impl ShardCoordinator {
         // with the same parent_qc (e.g., during view changes). Cache hits
         // require full byte equality with the cached QC — see the field
         // doc on `VerificationPipeline::verified_qcs`.
-        //
-        // Cache + adoption sites still take a raw QC; the verified
-        // marker comes from the call path's invariant. A follow-up
-        // commit will promote both to `VerifiedQuorumCertificate`.
-        let raw_qc: QuorumCertificate = (*verified_qc).clone();
-        self.verification.cache_verified_qc(raw_qc.clone());
+        self.verification.cache_verified_qc(verified_qc.clone());
 
         // The parent QC is now provably authentic; perform the adoption
         // that `absorb_parent_qc_from_header` deferred. Safe to run before
         // `try_vote_on_block` — adoption only mutates `latest_qc` /
         // commit-related state, not the per-block voting machinery.
         let mut actions = Vec::new();
-        if self.has_complete_block_at_height(raw_qc.height()) {
-            actions.extend(self.try_adopt_verified_qc(topology_snapshot, &raw_qc));
+        if self.has_complete_block_at_height(verified_qc.height()) {
+            actions.extend(self.try_adopt_verified_qc(topology_snapshot, &verified_qc));
         }
 
         // QC is valid - proceed to vote on the block
@@ -2100,7 +2096,7 @@ impl ShardCoordinator {
         &mut self,
         topology_snapshot: &TopologySnapshot,
         block_hash: BlockHash,
-        qc: &QuorumCertificate,
+        qc: &VerifiedQuorumCertificate,
         ready_txs: &[Arc<RoutableTransaction>],
         finalized_waves: Vec<Arc<FinalizedWave>>,
         provisions: Vec<Arc<Provisions>>,
@@ -2132,7 +2128,7 @@ impl ShardCoordinator {
                 .is_some()
             {
                 self.latest_qc = Some(qc.clone());
-                self.maybe_unlock_for_qc(topology_snapshot, qc);
+                self.maybe_unlock_for_qc(topology_snapshot, qc.as_ref());
             } else {
                 debug!(
                     block_hash = ?block_hash,
@@ -2149,7 +2145,11 @@ impl ShardCoordinator {
             duration: self.current_view_change_timeout(),
         }];
 
-        actions.extend(self.try_two_chain_commit(topology_snapshot, qc, CommitSource::Aggregator));
+        actions.extend(self.try_two_chain_commit(
+            topology_snapshot,
+            qc.as_ref(),
+            CommitSource::Aggregator,
+        ));
 
         // Propose the next block immediately — under the 2-chain commit rule,
         // block N+1 is what certifies block N, so any gap in proposing N+1
@@ -2647,6 +2647,12 @@ impl ShardCoordinator {
         certified: CertifiedBlock,
     ) -> Vec<Action> {
         let (block, qc) = certified.into_parts();
+        // SAFETY: synced blocks reach this function only after their QC
+        // passed `Action::VerifyQcSignature`. The verification gate
+        // tracks that result in `block_sync.on_qc_verified`; only
+        // verified entries flow into `apply_synced_block` via
+        // `try_apply_verified_synced_blocks`.
+        let verified_qc = VerifiedQuorumCertificate::new_unchecked((*qc).clone());
         let qc = qc.into_unverified();
         let block_hash = block.hash();
         let height = block.height();
@@ -2684,7 +2690,7 @@ impl ShardCoordinator {
             .as_ref()
             .is_none_or(|existing| qc.height() > existing.height())
         {
-            self.latest_qc = Some(qc.clone());
+            self.latest_qc = Some(verified_qc);
             self.maybe_unlock_for_qc(topology_snapshot, &qc);
         }
 
@@ -2695,7 +2701,15 @@ impl ShardCoordinator {
                 .as_ref()
                 .is_none_or(|existing| block.header().parent_qc().height() > existing.height())
         {
-            self.latest_qc = Some(block.header().parent_qc().clone());
+            // SAFETY: `verified_qc` certifies this synced block, and
+            // BFT pairing guarantees `qc.block_hash == block.hash`. The
+            // header's `parent_qc` is the signed-over evidence that the
+            // parent committed under the same chain, so a peer that
+            // produced a verifying QC over this block also vouches for
+            // the parent_qc it contains.
+            let verified_parent =
+                VerifiedQuorumCertificate::new_unchecked(block.header().parent_qc().clone());
+            self.latest_qc = Some(verified_parent);
             self.maybe_unlock_for_qc(topology_snapshot, block.header().parent_qc());
         }
 
@@ -2806,7 +2820,7 @@ impl ShardCoordinator {
         // higher QC to unlock). See `maybe_unlock_for_qc` for QC-based unlocking.
         let latest_qc_height = self
             .latest_qc
-            .as_ref()
+            .as_deref()
             .map_or(BlockHeight::GENESIS, QuorumCertificate::height);
         if latest_qc_height < height {
             // No QC formed at current height - safe to unlock
@@ -3142,7 +3156,7 @@ impl ShardCoordinator {
         match self.block_sync.health_check(
             topology_snapshot,
             self.committed_height,
-            self.latest_qc.as_ref(),
+            self.latest_qc.as_deref(),
             has_next_block,
             &self.commits,
             self.pending_blocks.len(),
@@ -3230,7 +3244,7 @@ impl ShardCoordinator {
 
     /// Get the latest QC.
     #[must_use]
-    pub const fn latest_qc(&self) -> Option<&QuorumCertificate> {
+    pub const fn latest_qc(&self) -> Option<&VerifiedQuorumCertificate> {
         self.latest_qc.as_ref()
     }
 
@@ -3291,7 +3305,7 @@ impl ShardCoordinator {
     #[must_use]
     pub fn proposal_parent_block_hash(&self) -> BlockHash {
         self.latest_qc
-            .as_ref()
+            .as_deref()
             .map_or(self.committed_hash, QuorumCertificate::block_hash)
     }
 
@@ -3502,8 +3516,9 @@ mod tests {
         )
     }
 
-    fn make_test_qc(block_hash: BlockHash, height: BlockHeight) -> QuorumCertificate {
-        QuorumCertificate::new(
+    fn make_test_qc(block_hash: BlockHash, height: BlockHeight) -> VerifiedQuorumCertificate {
+        // SAFETY: test scaffold — QC built locally, no real signature.
+        VerifiedQuorumCertificate::new_unchecked(QuorumCertificate::new(
             block_hash,
             ShardGroupId::new(0),
             height,
@@ -3512,7 +3527,7 @@ mod tests {
             SignerBitfield::empty(),
             zero_bls_signature(),
             WeightedTimestamp::from_millis(100_000),
-        )
+        ))
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -3653,8 +3668,8 @@ mod tests {
         // latest_qc must still be the pre-header value — adoption is gated
         // on BLS verification, which hasn't happened yet.
         assert_eq!(
-            state.latest_qc.as_ref().map(QuorumCertificate::height),
-            prior_latest_qc.as_ref().map(QuorumCertificate::height),
+            state.latest_qc.as_deref().map(QuorumCertificate::height),
+            prior_latest_qc.as_deref().map(QuorumCertificate::height),
             "unverified parent_qc must not advance latest_qc"
         );
     }
@@ -3722,7 +3737,7 @@ mod tests {
             |_| None,
         );
         assert_ne!(
-            state.latest_qc.as_ref().map(QuorumCertificate::height),
+            state.latest_qc.as_deref().map(QuorumCertificate::height),
             Some(BlockHeight::new(1)),
             "precondition: latest_qc not yet at height 1"
         );
@@ -3732,7 +3747,7 @@ mod tests {
         let verified = VerifiedQuorumCertificate::new_unchecked(header.parent_qc().clone());
         let _ = state.on_qc_signature_verified(&topology, block_hash, Ok(verified));
         assert_eq!(
-            state.latest_qc.as_ref().map(QuorumCertificate::height),
+            state.latest_qc.as_deref().map(QuorumCertificate::height),
             Some(BlockHeight::new(1)),
             "successful verification must trigger the deferred adoption"
         );
@@ -4379,7 +4394,8 @@ mod tests {
 
         let qc = {
             let __qc = make_test_qc(block_3_hash, BlockHeight::new(3));
-            QuorumCertificate::new(
+            // SAFETY: test scaffold — synthetic QC.
+            VerifiedQuorumCertificate::new_unchecked(QuorumCertificate::new(
                 __qc.block_hash(),
                 __qc.shard_group_id(),
                 __qc.height(),
@@ -4388,7 +4404,7 @@ mod tests {
                 __qc.signers().clone(),
                 __qc.aggregated_signature(),
                 __qc.weighted_timestamp(),
-            )
+            ))
         };
 
         let actions = state.on_qc_formed(&topology, block_3_hash, &qc, &[], vec![], vec![]);
@@ -4512,8 +4528,12 @@ mod tests {
             BlockHeight::new(4),
         );
 
-        let actions =
-            state.on_block_ready_to_commit(&topology, block_hash, qc, CommitSource::Aggregator);
+        let actions = state.on_block_ready_to_commit(
+            &topology,
+            block_hash,
+            qc.into(),
+            CommitSource::Aggregator,
+        );
         assert!(
             actions.is_empty(),
             "expected no actions on mismatched (block_hash, qc), got {actions:?}"
@@ -4652,7 +4672,10 @@ mod tests {
         );
 
         // Simulate verification success; same path as on_qc_signature_verified(valid=true).
-        state.verification.cache_verified_qc(parent_qc.clone());
+        // SAFETY: test scaffold — synthetic QC, no real signature.
+        state
+            .verification
+            .cache_verified_qc(VerifiedQuorumCertificate::new_unchecked(parent_qc.clone()));
 
         // Second block at round 1 sharing the same parent QC.
         let header2 = {
@@ -4727,7 +4750,10 @@ mod tests {
         };
 
         // Cache the honest QC as if it had been verified.
-        state.verification.cache_verified_qc(honest_qc.clone());
+        // SAFETY: test scaffold — synthetic QC.
+        state
+            .verification
+            .cache_verified_qc(VerifiedQuorumCertificate::new_unchecked(honest_qc.clone()));
 
         // Byzantine header reuses the honest QC's block_hash + signers + height
         // (so `validate_header`'s quorum-power and structural checks still pass)
@@ -4829,7 +4855,8 @@ mod tests {
                 BlockHash::from_raw(Hash::from_bytes(b"block_3")),
                 BlockHeight::new(3),
             );
-            QuorumCertificate::new(
+            // SAFETY: test scaffold — synthetic QC.
+            VerifiedQuorumCertificate::new_unchecked(QuorumCertificate::new(
                 __qc.block_hash(),
                 __qc.shard_group_id(),
                 __qc.height(),
@@ -4838,7 +4865,7 @@ mod tests {
                 __qc.signers().clone(),
                 __qc.aggregated_signature(),
                 __qc.weighted_timestamp(),
-            )
+            ))
         });
 
         state.set_block_syncing(&topology, true);
@@ -4882,7 +4909,8 @@ mod tests {
                 BlockHash::from_raw(Hash::from_bytes(b"block_3")),
                 BlockHeight::new(3),
             );
-            QuorumCertificate::new(
+            // SAFETY: test scaffold — synthetic QC.
+            VerifiedQuorumCertificate::new_unchecked(QuorumCertificate::new(
                 __qc.block_hash(),
                 __qc.shard_group_id(),
                 __qc.height(),
@@ -4891,7 +4919,7 @@ mod tests {
                 __qc.signers().clone(),
                 __qc.aggregated_signature(),
                 WeightedTimestamp::from_millis(old_timestamp),
-            )
+            ))
         });
         state.set_block_syncing(&topology, true);
 
@@ -5012,7 +5040,8 @@ mod tests {
                 BlockHash::from_raw(Hash::from_bytes(b"block_5")),
                 BlockHeight::new(5),
             );
-            QuorumCertificate::new(
+            // SAFETY: test scaffold — synthetic QC.
+            VerifiedQuorumCertificate::new_unchecked(QuorumCertificate::new(
                 __qc.block_hash(),
                 __qc.shard_group_id(),
                 __qc.height(),
@@ -5021,7 +5050,7 @@ mod tests {
                 __qc.signers().clone(),
                 __qc.aggregated_signature(),
                 WeightedTimestamp::from_millis(1000),
-            )
+            ))
         });
         let actions = state.check_sync_health(&topology);
 
@@ -5169,7 +5198,8 @@ mod tests {
                 BlockHash::from_raw(Hash::from_bytes(b"block_3")),
                 BlockHeight::new(3),
             );
-            QuorumCertificate::new(
+            // SAFETY: test scaffold — synthetic QC.
+            VerifiedQuorumCertificate::new_unchecked(QuorumCertificate::new(
                 __qc.block_hash(),
                 __qc.shard_group_id(),
                 __qc.height(),
@@ -5178,7 +5208,7 @@ mod tests {
                 __qc.signers().clone(),
                 __qc.aggregated_signature(),
                 __qc.weighted_timestamp(),
-            )
+            ))
         });
         state.set_block_syncing(&topology, true);
         let _ = state.try_propose(&topology, &[], vec![], vec![]);
@@ -5204,7 +5234,8 @@ mod tests {
                 BlockHash::from_raw(Hash::from_bytes(b"block_3")),
                 BlockHeight::new(3),
             );
-            QuorumCertificate::new(
+            // SAFETY: test scaffold — synthetic QC.
+            VerifiedQuorumCertificate::new_unchecked(QuorumCertificate::new(
                 __qc.block_hash(),
                 __qc.shard_group_id(),
                 __qc.height(),
@@ -5213,7 +5244,7 @@ mod tests {
                 __qc.signers().clone(),
                 __qc.aggregated_signature(),
                 WeightedTimestamp::from_millis(parent_timestamp),
-            )
+            ))
         });
 
         state.set_block_syncing(&topology, true);
@@ -5267,7 +5298,8 @@ mod tests {
                 BlockHash::from_raw(Hash::from_bytes(b"block_3")),
                 BlockHeight::new(3),
             );
-            QuorumCertificate::new(
+            // SAFETY: test scaffold — synthetic QC.
+            VerifiedQuorumCertificate::new_unchecked(QuorumCertificate::new(
                 __qc.block_hash(),
                 __qc.shard_group_id(),
                 __qc.height(),
@@ -5276,7 +5308,7 @@ mod tests {
                 __qc.signers().clone(),
                 __qc.aggregated_signature(),
                 __qc.weighted_timestamp(),
-            )
+            ))
         });
         state.set_block_syncing(&topology, true);
 
