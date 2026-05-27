@@ -15,8 +15,8 @@ use hyperscale_types::{
     ProvisionTxRootsMap, Provisions, ProvisionsRoot, QuorumCertificate, ReadySignal, Round,
     RoutableTransaction, ShardGroupId, SharedCertificates, SharedTransactions, SkipEpochCert,
     SkipRequest, SpcCert, SpcEmptyViewMsg, SpcHighTriple, SpcView, StateRoot, SubstateEntry,
-    TopologySnapshot, TransactionRoot, TransactionStatus, TxHash, TxOutcome, ValidatorId, Verified,
-    VotePower, WaveId, WeightedTimestamp, Witness,
+    TopologySnapshot, TransactionRoot, TransactionStatus, TxHash, TxOutcome, ValidatorId,
+    Verifiable, Verified, VotePower, WaveId, WeightedTimestamp, Witness,
 };
 
 use crate::{CommitSource, FetchAbandon, FetchRequest, ProtocolEvent, TimerId};
@@ -326,8 +326,12 @@ pub enum Action {
     /// Delegated to a thread pool in production, instant in simulation.
     /// Returns `ProtocolEvent::QcSignatureVerified` when complete.
     VerifyQcSignature {
-        /// The QC to verify (carries `shard_group_id` for self-contained verification).
-        qc: QuorumCertificate,
+        /// The QC to verify (carries `shard_group_id` for self-contained
+        /// verification). When the wrapper is already
+        /// [`Verifiable::Verified`] — e.g. the caller hit a cached
+        /// verified value — the handler short-circuits and emits the
+        /// verified result without rerunning BLS aggregation.
+        qc: Verifiable<QuorumCertificate>,
         /// Public keys of the signers (pre-resolved by state machine from QC's signer bitfield).
         public_keys: Vec<Bls12381G1PublicKey>,
         /// Voting power for each committee member (parallel to `public_keys`).

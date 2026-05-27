@@ -22,8 +22,8 @@ use hyperscale_types::{
     ProvisionHash, ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions, ProvisionsRoot,
     ProvisionsRootContext, QcContext, QuorumCertificate, ReadySignal, Round, RoutableTransaction,
     ShardGroupId, SignerBitfield, StateRoot, StoredReceipt, TopologySnapshot, TransactionRoot,
-    TransactionRootContext, ValidatorId, Verified, Verify, VotePower, WeightedTimestamp,
-    batch_verify_bls_same_message, block_header_message, block_vote_message,
+    TransactionRootContext, ValidatorId, Verifiable, Verified, Verify, VotePower,
+    WeightedTimestamp, batch_verify_bls_same_message, block_header_message, block_vote_message,
     committed_block_header_message, compute_waves, verify_bls12381_v1,
 };
 
@@ -433,15 +433,24 @@ where
             quorum_threshold,
             block_hash,
         } => {
-            let start = std::time::Instant::now();
-            let qc_ctx = QcContext {
-                network: ctx.topology_snapshot.network(),
-                public_keys: &public_keys,
-                voting_powers: &voting_powers,
-                quorum_threshold,
+            let result = match qc {
+                // Short-circuit: caller already holds the verified
+                // witness (cached verified QC, local-dispatch from a
+                // colocated origin). Skip BLS aggregation.
+                Verifiable::Verified(verified) => Ok(verified),
+                Verifiable::Unverified(raw) => {
+                    let start = std::time::Instant::now();
+                    let qc_ctx = QcContext {
+                        network: ctx.topology_snapshot.network(),
+                        public_keys: &public_keys,
+                        voting_powers: &voting_powers,
+                        quorum_threshold,
+                    };
+                    let result = raw.verify(&qc_ctx);
+                    record_signature_verification_latency("qc", start.elapsed().as_secs_f64());
+                    result
+                }
             };
-            let result = qc.verify(&qc_ctx);
-            record_signature_verification_latency("qc", start.elapsed().as_secs_f64());
             ctx.notify_protocol(ProtocolEvent::QcSignatureVerified { block_hash, result });
         }
 

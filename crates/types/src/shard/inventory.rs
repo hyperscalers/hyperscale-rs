@@ -86,7 +86,7 @@ impl Inventory {
 /// natural ceilings.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct ElidedCertifiedBlock {
-    header: BlockHeader,
+    header: Verifiable<BlockHeader>,
     qc: Verifiable<QuorumCertificate>,
     transactions: BoundedVec<(TxHash, Option<Arc<RoutableTransaction>>), MAX_TXS_PER_BLOCK>,
     certificates: BoundedVec<(WaveId, Option<Arc<FinalizedWave>>), MAX_FINALIZED_TX_PER_BLOCK>,
@@ -113,7 +113,15 @@ pub enum ElidedProvisions {
 impl ElidedCertifiedBlock {
     /// Block header (always inline).
     #[must_use]
-    pub const fn header(&self) -> &BlockHeader {
+    pub fn header(&self) -> &BlockHeader {
+        self.header.as_unverified()
+    }
+
+    /// Borrow the header's [`Verifiable`] wrapper, exposing the verification
+    /// marker. Used by typestate consumers that branch on whether the
+    /// inline header has already been verified.
+    #[must_use]
+    pub const fn header_verifiable(&self) -> &Verifiable<BlockHeader> {
         &self.header
     }
 
@@ -216,7 +224,7 @@ impl ElidedCertifiedBlock {
         };
 
         Self {
-            header,
+            header: Verifiable::Unverified(header),
             qc,
             transactions: transactions.into(),
             certificates: certificates.into(),
@@ -317,14 +325,14 @@ impl ElidedCertifiedBlock {
                 let provisions: Vec<Arc<Provisions>> =
                     entries.into_iter().map(Option::unwrap).collect();
                 Block::Live {
-                    header: self.header.clone(),
+                    header: self.header.as_unverified().clone(),
                     transactions: txs,
                     certificates: certs,
                     provisions: Arc::new(provisions.into()),
                 }
             }
             (None, ElidedProvisions::Sealed(hashes)) => Block::Sealed {
-                header: self.header.clone(),
+                header: self.header.as_unverified().clone(),
                 transactions: txs,
                 certificates: certs,
                 provision_hashes: Arc::new(hashes.clone()),

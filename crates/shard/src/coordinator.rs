@@ -1369,9 +1369,12 @@ impl ShardCoordinator {
             self.verification
                 .track_pending_qc(block_hash, header.clone());
 
-            // Delegate verification to runner
+            // Delegate verification to runner. Preserve any verified
+            // marker on the embedded parent_qc so the handler can short-
+            // circuit when the wrapper arrives `Verifiable::Verified`
+            // (cache hit, local dispatch).
             return vec![Action::VerifyQcSignature {
-                qc: header.parent_qc().clone(),
+                qc: header.parent_qc_verifiable().clone(),
                 public_keys,
                 voting_powers,
                 quorum_threshold,

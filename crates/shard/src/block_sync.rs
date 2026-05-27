@@ -351,7 +351,7 @@ impl BlockSyncManager {
     ) -> Action {
         let block_hash = certified.block().hash();
         let height = certified.block().height();
-        let qc = certified.qc().clone();
+        let qc = certified.qc_verifiable().clone();
 
         if self
             .pending_synced_block_verifications

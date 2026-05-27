@@ -51,6 +51,18 @@ pub enum VerificationKind {
     BeaconWitnessRoot,
 }
 
+/// Lifecycle position for a verification entry. `InFlight` covers the
+/// window between dispatch and result; `Verified` is the terminal-success
+/// stage. Failure removes the entry (returning to "not tracked"), so the
+/// stage stays a closed pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootStage {
+    /// Verification has been dispatched but not yet completed.
+    InFlight,
+    /// Verification completed successfully.
+    Verified,
+}
+
 /// Block header pending QC signature verification.
 ///
 /// When we receive a block header with a non-genesis `parent_qc`, we need to
@@ -216,11 +228,10 @@ pub struct VerificationPipeline {
     verified_qcs: HashMap<BlockHash, Verified<QuorumCertificate>>,
 
     // === State root verification ===
-    /// Blocks where state root verification is currently in-flight.
-    state_root_verifications_in_flight: HashSet<BlockHash>,
-
-    /// Blocks with verified state roots.
-    verified_state_roots: HashSet<BlockHash>,
+    /// State-root verification stage per block. Entries appear when the
+    /// verification is queued or completes; absence means "not tracked"
+    /// (either never started or failed).
+    state_roots: HashMap<BlockHash, RootStage>,
 
     /// Blocks waiting for their parent's tree nodes to become available (via
     /// commit or prior verification). Keyed by `parent_block_hash`.
@@ -256,14 +267,12 @@ pub struct VerificationPipeline {
     proposal_unblocked: bool,
 
     // === Per-root merkle verification ===
-    /// `(block_hash, kind)` pairs currently being verified (transaction,
-    /// certificate, local-receipt, provision, provision-tx roots).
-    /// State-root uses separate fields above because its lifecycle
-    /// includes deferred/ready queues for parent-tree availability.
-    in_flight_roots: HashSet<(BlockHash, VerificationKind)>,
-
-    /// `(block_hash, kind)` pairs whose merkle root has been verified.
-    verified_roots: HashSet<(BlockHash, VerificationKind)>,
+    /// Verification stage per `(block_hash, kind)` (transaction,
+    /// certificate, local-receipt, provision, provision-tx, beacon-
+    /// witness). State-root rides [`Self::state_roots`] above because
+    /// its lifecycle includes deferred/ready queues for parent-tree
+    /// availability.
+    roots: HashMap<(BlockHash, VerificationKind), RootStage>,
 
     /// Beacon-witness verifications waiting for a missing/unassembled
     /// ancestor to become available. Keyed by the blocking ancestor's
@@ -292,15 +301,13 @@ impl VerificationPipeline {
         Self {
             pending_qc_verifications: HashMap::new(),
             verified_qcs: HashMap::new(),
-            state_root_verifications_in_flight: HashSet::new(),
-            verified_state_roots: HashSet::new(),
+            state_roots: HashMap::new(),
             deferred_state_root_verifications: HashMap::new(),
             deferred_proposal: None,
             ready_state_root_verifications: Vec::new(),
             proposal_unblocked: false,
             last_persisted_height: persisted_height,
-            in_flight_roots: HashSet::new(),
-            verified_roots: HashSet::new(),
+            roots: HashMap::new(),
             deferred_beacon_witness_verifications: HashMap::new(),
             verified_in_flight: HashSet::new(),
             pending_assemblies: HashMap::new(),
@@ -314,13 +321,19 @@ impl VerificationPipeline {
     /// Whether the given merkle root has been verified for `block_hash`.
     /// State-root callers use [`Self::is_state_root_verified`] instead.
     fn is_root_verified(&self, block_hash: BlockHash, kind: VerificationKind) -> bool {
-        self.verified_roots.contains(&(block_hash, kind))
+        matches!(
+            self.roots.get(&(block_hash, kind)),
+            Some(RootStage::Verified)
+        )
     }
 
     /// Whether a merkle-root verification is currently in-flight for
     /// `(block_hash, kind)`.
     fn is_root_in_flight(&self, block_hash: BlockHash, kind: VerificationKind) -> bool {
-        self.in_flight_roots.contains(&(block_hash, kind))
+        matches!(
+            self.roots.get(&(block_hash, kind)),
+            Some(RootStage::InFlight)
+        )
     }
 
     /// Skip the verification when the block carries no relevant content,
@@ -339,7 +352,7 @@ impl VerificationPipeline {
     /// Mark the root verification as in-flight so duplicate dispatch is
     /// avoided until the result lands.
     fn mark_root_in_flight(&mut self, block_hash: BlockHash, kind: VerificationKind) {
-        self.in_flight_roots.insert((block_hash, kind));
+        self.roots.insert((block_hash, kind), RootStage::InFlight);
     }
 
     /// Record a merkle-root verification result for one of the per-kind
@@ -352,12 +365,14 @@ impl VerificationPipeline {
         kind: VerificationKind,
         valid: bool,
     ) -> bool {
-        self.in_flight_roots.remove(&(block_hash, kind));
         if valid {
-            self.verified_roots.insert((block_hash, kind));
+            self.roots.insert((block_hash, kind), RootStage::Verified);
             debug!(?kind, ?block_hash, "Merkle root verified successfully");
-        } else if kind == VerificationKind::BeaconWitnessRoot {
-            self.discard_deferred_beacon_witness_children(block_hash);
+        } else {
+            self.roots.remove(&(block_hash, kind));
+            if kind == VerificationKind::BeaconWitnessRoot {
+                self.discard_deferred_beacon_witness_children(block_hash);
+            }
         }
         valid
     }
@@ -446,7 +461,7 @@ impl VerificationPipeline {
         let provision_tx_done = h.provision_tx_roots().is_empty()
             || self.is_root_verified(block_hash, VerificationKind::ProvisionTxRoots);
         let beacon_done = self.is_root_verified(block_hash, VerificationKind::BeaconWitnessRoot);
-        let state_done = self.verified_state_roots.contains(&block_hash);
+        let state_done = self.is_state_root_verified(&block_hash);
 
         // SAFETY: at this point the header's claim either equals the
         // empty-input compute (skip case) or was already accepted by
@@ -647,11 +662,16 @@ impl VerificationPipeline {
     /// verification is running — the leader proposed, we received the block,
     /// the timeout should detect leader failure, not slow verification.
     pub fn has_verification_in_flight(&self) -> bool {
-        !self.state_root_verifications_in_flight.is_empty()
+        self.state_roots
+            .values()
+            .any(|stage| *stage == RootStage::InFlight)
             || !self.deferred_state_root_verifications.is_empty()
             || !self.deferred_beacon_witness_verifications.is_empty()
             || self.deferred_proposal.is_some()
-            || !self.in_flight_roots.is_empty()
+            || self
+                .roots
+                .values()
+                .any(|stage| *stage == RootStage::InFlight)
             || !self.pending_qc_verifications.is_empty()
     }
 
@@ -666,7 +686,12 @@ impl VerificationPipeline {
     /// `PreparedCommit` from `VerifyStateRoot` already in the cache) and
     /// `CommitBlockByQcOnly` (slow path — compute inline at commit time).
     pub fn is_state_root_verified(&self, block_hash: &BlockHash) -> bool {
-        self.verified_state_roots.contains(block_hash)
+        matches!(self.state_roots.get(block_hash), Some(RootStage::Verified))
+    }
+
+    /// Whether state-root verification is currently in-flight for `block_hash`.
+    fn is_state_root_in_flight(&self, block_hash: &BlockHash) -> bool {
+        matches!(self.state_roots.get(block_hash), Some(RootStage::InFlight))
     }
 
     /// Check if all async verifications are complete for a block.
@@ -680,7 +705,7 @@ impl VerificationPipeline {
         let root_ok =
             |kind, has_content: bool| !has_content || self.is_root_verified(block_hash, kind);
 
-        self.verified_state_roots.contains(&block_hash)
+        self.is_state_root_verified(&block_hash)
             && root_ok(
                 VerificationKind::TransactionRoot,
                 block.transaction_count() > 0,
@@ -711,12 +736,9 @@ impl VerificationPipeline {
         let block_hash = block.hash();
         let h = block.header();
 
-        let state_root_status = if self.verified_state_roots.contains(&block_hash) {
+        let state_root_status = if self.is_state_root_verified(&block_hash) {
             "verified"
-        } else if self
-            .state_root_verifications_in_flight
-            .contains(&block_hash)
-        {
+        } else if self.is_state_root_in_flight(&block_hash) {
             "in_flight"
         } else if self
             .deferred_state_root_verifications
@@ -805,10 +827,7 @@ impl VerificationPipeline {
     pub fn needs_state_root_verification(&self, block: &Block) -> bool {
         let block_hash = block.hash();
 
-        if self.verified_state_roots.contains(&block_hash)
-            || self
-                .state_root_verifications_in_flight
-                .contains(&block_hash)
+        if self.state_roots.contains_key(&block_hash)
             || self
                 .deferred_state_root_verifications
                 .values()
@@ -825,10 +844,12 @@ impl VerificationPipeline {
     /// in-flight marker tracks the same dispatch lifecycle as state-root —
     /// the unified `VerifyStateRoot` handler emits both events.
     fn enqueue_ready_state_root(&mut self, ready: PendingStateRootVerification) {
-        self.state_root_verifications_in_flight
-            .insert(ready.block_hash);
-        self.in_flight_roots
-            .insert((ready.block_hash, VerificationKind::LocalReceiptRoot));
+        self.state_roots
+            .insert(ready.block_hash, RootStage::InFlight);
+        self.roots.insert(
+            (ready.block_hash, VerificationKind::LocalReceiptRoot),
+            RootStage::InFlight,
+        );
         self.ready_state_root_verifications.push(ready);
     }
 
@@ -861,7 +882,7 @@ impl VerificationPipeline {
         // Defer if: parent height exceeds committed JMT AND parent hasn't
         // been verified (no snapshot in the overlay).
         let parent_tree_available = parent_block_height <= self.last_persisted_height
-            || self.verified_state_roots.contains(&parent_block_hash);
+            || self.is_state_root_verified(&parent_block_hash);
 
         if parent_tree_available {
             self.enqueue_ready_state_root(ready);
@@ -883,10 +904,8 @@ impl VerificationPipeline {
     /// On success, unblocks any child blocks that were deferred waiting for
     /// this parent's verification to complete.
     pub fn on_state_root_verified(&mut self, block_hash: BlockHash, valid: bool) -> bool {
-        self.state_root_verifications_in_flight.remove(&block_hash);
-
         if valid {
-            self.verified_state_roots.insert(block_hash);
+            self.state_roots.insert(block_hash, RootStage::Verified);
             debug!(block_hash = ?block_hash, "State root verified successfully");
 
             // Unblock children that were waiting for this parent.
@@ -904,6 +923,7 @@ impl VerificationPipeline {
             // Unblock deferred proposal if it was waiting for this parent.
             self.try_unblock_proposal(block_hash);
         } else {
+            self.state_roots.remove(&block_hash);
             warn!(block_hash = ?block_hash, "State root verification FAILED");
 
             // Clear deferred children — they can never unblock since the
@@ -927,7 +947,7 @@ impl VerificationPipeline {
     /// inherently correct. This populates the overlay chain so that child
     /// blocks can verify without waiting for the block to be committed.
     fn mark_proposal_state_root_verified(&mut self, block_hash: BlockHash) {
-        self.verified_state_roots.insert(block_hash);
+        self.state_roots.insert(block_hash, RootStage::Verified);
 
         // Unblock children deferred on this parent.
         if let Some(deferred) = self.deferred_state_root_verifications.remove(&block_hash) {
@@ -962,7 +982,7 @@ impl VerificationPipeline {
             VerificationKind::ProvisionRoot,
             VerificationKind::ProvisionTxRoots,
         ] {
-            self.verified_roots.insert((block_hash, kind));
+            self.roots.insert((block_hash, kind), RootStage::Verified);
         }
         self.verified_in_flight.insert(block_hash);
     }
@@ -1427,7 +1447,7 @@ impl VerificationPipeline {
         parent_block_hash: BlockHash,
     ) -> bool {
         parent_block_height <= self.last_persisted_height
-            || self.verified_state_roots.contains(&parent_block_hash)
+            || self.is_state_root_verified(&parent_block_hash)
     }
 
     /// Record that a proposal is deferred until the parent's tree nodes are
@@ -1521,7 +1541,11 @@ impl VerificationPipeline {
     /// verifications proceed as soon as the parent's tree is readable from
     /// the overlay, without waiting for `BlockPersisted`.
     pub fn on_block_committed(&mut self, block_hash: BlockHash) {
-        if !self.verified_state_roots.insert(block_hash) {
+        let was_verified = matches!(
+            self.state_roots.insert(block_hash, RootStage::Verified),
+            Some(RootStage::Verified)
+        );
+        if was_verified {
             return;
         }
 
@@ -1559,11 +1583,8 @@ impl VerificationPipeline {
         self.pending_qc_verifications
             .retain(|hash, _| pending_blocks.contains_key(*hash));
 
-        self.state_root_verifications_in_flight
-            .retain(|hash| pending_blocks.contains_key(*hash));
-
-        self.verified_state_roots
-            .retain(|hash| pending_blocks.contains_key(*hash));
+        self.state_roots
+            .retain(|hash, _| pending_blocks.contains_key(*hash));
 
         self.ready_state_root_verifications
             .retain(|r| pending_blocks.contains_key(r.block_hash));
@@ -1584,10 +1605,8 @@ impl VerificationPipeline {
             self.deferred_proposal = None;
         }
 
-        self.in_flight_roots
-            .retain(|(hash, _)| pending_blocks.contains_key(*hash));
-        self.verified_roots
-            .retain(|(hash, _)| pending_blocks.contains_key(*hash));
+        self.roots
+            .retain(|(hash, _), _| pending_blocks.contains_key(*hash));
 
         // Drop deferred beacon-witness entries whose child has been
         // pruned. Parent keys whose values empty out are removed too.
@@ -2061,9 +2080,11 @@ mod tests {
         let verified_qc = Verified::<QuorumCertificate>::new_unchecked(assembly_qc_for(&block));
 
         // Beacon-witness + state root verify before the QC arrives.
-        vp.verified_roots
-            .insert((block_hash, VerificationKind::BeaconWitnessRoot));
-        vp.verified_state_roots.insert(block_hash);
+        vp.roots.insert(
+            (block_hash, VerificationKind::BeaconWitnessRoot),
+            RootStage::Verified,
+        );
+        vp.state_roots.insert(block_hash, RootStage::Verified);
 
         vp.track_pending_assembly(Arc::new(block));
 
