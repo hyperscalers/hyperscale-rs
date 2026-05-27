@@ -14,5 +14,6 @@ pub mod keys;
 pub mod overlay;
 pub mod pending_chain;
 pub mod recovered_state;
+pub mod state_root;
 pub mod store;
 pub mod writes;

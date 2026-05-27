@@ -9,7 +9,9 @@ use std::sync::Arc;
 use hyperscale_core::{Action, ActionContext, PreparedBlock, ProtocolEvent, VerificationKind};
 use hyperscale_metrics::record_signature_verification_latency;
 use hyperscale_network::Network;
-use hyperscale_storage::{JmtSnapshot, ShardChainWriter, ShardStorage, SubstateStore};
+use hyperscale_storage::{
+    JmtSnapshot, ShardChainWriter, ShardStorage, StateRootContext, SubstateStore,
+};
 use hyperscale_types::network::gossip::CommittedBlockHeaderGossip;
 use hyperscale_types::network::notification::{BlockHeaderNotification, BlockVoteNotification};
 use hyperscale_types::{
@@ -372,64 +374,6 @@ pub fn verify_local_receipt_root(
     }
 
     valid
-}
-
-/// Result of state root verification.
-pub struct StateRootResult<P: Send> {
-    /// `true` when the computed state root matched the expected root.
-    pub valid: bool,
-    /// Prepared commit handle from the JMT verifier — `Some` on success so the
-    /// commit pipeline can write it back without recomputing.
-    pub prepared_commit: Option<P>,
-}
-
-/// Verify that the computed state root matches the expected root.
-///
-/// Calls `storage.prepare_block_commit()` to compute the speculative state root
-/// from the wave receipts, then compares against the expected root. Returns the
-/// prepared commit handle for caching on success.
-pub fn verify_state_root<S: ShardChainWriter + SubstateStore>(
-    storage: &S,
-    parent_state_root: StateRoot,
-    parent_block_height: BlockHeight,
-    expected_root: StateRoot,
-    finalized_waves: &[Arc<FinalizedWave>],
-    block_height: BlockHeight,
-    pending_snapshots: &[Arc<JmtSnapshot>],
-) -> StateRootResult<S::PreparedCommit> {
-    // Use the stable parent_block_height from the verification pipeline, not
-    // storage.jmt_height() which is racy — by the time this runs on the
-    // ConsensusCrypto pool, other blocks may have committed and advanced the
-    // JMT past the parent version.
-    // `base_reads=None` lets a `SubstateView` storage drain its own
-    // execution-time cache inside its `prepare_block_commit` impl. Raw
-    // storage types (no view) fall through to `multi_get_cf`.
-    let (computed_root, prepared) = storage.prepare_block_commit(
-        parent_state_root,
-        parent_block_height,
-        finalized_waves,
-        block_height,
-        pending_snapshots,
-        None,
-    );
-
-    let valid = computed_root == expected_root;
-
-    if !valid {
-        tracing::warn!(
-            ?expected_root,
-            ?computed_root,
-            ?parent_state_root,
-            block_height = block_height.inner(),
-            parent_block_height = parent_block_height.inner(),
-            "State root verification FAILED"
-        );
-    }
-
-    StateRootResult {
-        valid,
-        prepared_commit: if valid { Some(prepared) } else { None },
-    }
 }
 
 /// Result of building a proposal block.
@@ -834,29 +778,44 @@ where
                 .pending_chain
                 .view_at(parent_block_hash, parent_block_height);
             let pending_snapshots = view.pending_snapshots().to_vec();
-            let result = verify_state_root(
-                &*view,
+            let state_root_ctx = StateRootContext {
+                storage: &*view,
                 parent_state_root,
                 parent_block_height,
-                expected_root,
-                &finalized_waves,
+                finalized_waves: &finalized_waves,
                 block_height,
-                &pending_snapshots,
-            );
+                pending_snapshots: &pending_snapshots,
+                base_reads: None,
+            };
+            let result = expected_root.verify(&state_root_ctx);
             record_signature_verification_latency("state_root", start.elapsed().as_secs_f64());
-            if let Some(prepared) = result.prepared_commit {
-                (ctx.commit_prepared)(PreparedBlock {
-                    block_hash,
-                    parent_block_hash,
-                    block_height,
-                    prepared,
-                    receipts: collect_finalized_receipts(&finalized_waves),
-                });
-            }
+            let valid = match result {
+                Ok(verified) => {
+                    let (_, prepared) = verified.into_parts();
+                    (ctx.commit_prepared)(PreparedBlock {
+                        block_hash,
+                        parent_block_hash,
+                        block_height,
+                        prepared,
+                        receipts: collect_finalized_receipts(&finalized_waves),
+                    });
+                    true
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        block_hash = ?block_hash,
+                        block_height = block_height.inner(),
+                        parent_block_height = parent_block_height.inner(),
+                        reason = %e,
+                        "State root verification FAILED"
+                    );
+                    false
+                }
+            };
             ctx.notify_protocol(ProtocolEvent::BlockRootVerified {
                 kind: VerificationKind::StateRoot,
                 block_hash,
-                valid: result.valid,
+                valid,
             });
         }
 

@@ -22,6 +22,9 @@ radix-substate-store-interface.workspace = true
 # Key encoding
 indexmap.workspace = true
 
+# Error derive
+thiserror.workspace = true
+
 [features]
 test-utils = ["hyperscale-types/test-utils"]
 
