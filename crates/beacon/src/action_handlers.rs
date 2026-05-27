@@ -238,6 +238,7 @@ where
         }
         Action::VerifySpcNewCommit {
             epoch,
+            from,
             view,
             value,
             proof,
@@ -250,6 +251,7 @@ where
             let valid = verify_qc3(&proof, network, &pc_ctx, &committee);
             ctx.notify_protocol(ProtocolEvent::SpcNewCommitVerified {
                 epoch,
+                from,
                 view,
                 value,
                 proof,

@@ -629,6 +629,9 @@ pub enum ProtocolEvent {
     SpcNewCommitVerified {
         /// Epoch the SPC instance belongs to.
         epoch: Epoch,
+        /// Wire-level sender — used by the coordinator to clear its
+        /// per-`(epoch, view, sender)` pipeline slot.
+        from: ValidatorId,
         /// SPC view whose inner PC produced this commit.
         view: SpcView,
         /// Committed low value.

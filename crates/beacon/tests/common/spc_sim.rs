@@ -53,15 +53,7 @@ impl SpcSim {
             sks.push(Arc::new(sk));
         }
         let instances: Vec<SpcInstance> = (0..n)
-            .map(|i| {
-                SpcInstance::new(
-                    network.clone(),
-                    epoch,
-                    members.clone(),
-                    members[i].0,
-                    view_timeout,
-                )
-            })
+            .map(|i| SpcInstance::new(epoch, members.clone(), members[i].0, view_timeout))
             .collect();
         let outputs = vec![None; n];
         Self {
@@ -158,14 +150,14 @@ impl SpcSim {
                 }
                 SpcEffect::BroadcastNewView { view, cert } => {
                     let from = sender;
-                    self.fanout(sender_idx, |_| SpcEvent::NewView {
+                    self.fanout(sender_idx, |_| SpcEvent::NewViewVerified {
                         from,
                         view,
                         cert: cert.clone(),
                     });
                 }
                 SpcEffect::BroadcastNewCommit { view, value, proof } => {
-                    self.fanout(sender_idx, |_| SpcEvent::NewCommit {
+                    self.fanout(sender_idx, |_| SpcEvent::NewCommitVerified {
                         view,
                         value: value.clone(),
                         proof: proof.clone(),
@@ -175,7 +167,7 @@ impl SpcSim {
                     let spc_ctx = spc_context(self.epoch);
                     let msg =
                         sign_empty_view_msg(&sk, sender, &self.network, &spc_ctx, view, *reported);
-                    self.deliver_to_all(&SpcEvent::EmptyView(Box::new(msg)));
+                    self.deliver_to_all(&SpcEvent::EmptyViewVerified(Box::new(msg)));
                 }
                 SpcEffect::SetTimer { .. } | SpcEffect::Equivocation { .. } => {
                     // Honest path: no timer firing, no equivocation to absorb.

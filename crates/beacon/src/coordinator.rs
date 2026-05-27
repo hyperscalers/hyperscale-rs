@@ -23,10 +23,10 @@ use hyperscale_core::{Action, TimerId};
 use hyperscale_types::{
     BeaconBlock, BeaconCert, BeaconProposal, BeaconState, Bls12381G1PublicKey,
     CertifiedBeaconBlock, EPOCH_DURATION, Epoch, GenesisConfigHash, Hash, LeafIndex,
-    LocalTimestamp, MAX_WITNESSES_PER_PROPOSER, NetworkDefinition, PcValueElement, PcVector,
+    LocalTimestamp, MAX_WITNESSES_PER_PROPOSER, NetworkDefinition, PcQc3, PcValueElement, PcVector,
     PcVoteMessage, SKIP_TIMEOUT, ShardGroupId, ShardWitness, SkipEpochCert, SkipRequest, SpcCert,
-    SpcMessage, SpcView, TopologySnapshot, ValidatorId, VpcMsgPayload, WeightedTimestamp, Witness,
-    verify_merkle_inclusion,
+    SpcEmptyViewMsg, SpcMessage, SpcView, TopologySnapshot, ValidatorId, VpcMsgPayload,
+    WeightedTimestamp, Witness, verify_merkle_inclusion,
 };
 use tracing::{trace, warn};
 
@@ -41,7 +41,7 @@ use crate::state::{
     apply_epoch, apply_input_for, derive_active_pool, derive_beacon_committee,
     derive_topology_snapshot, signer_pool_for,
 };
-use crate::verification::BeaconVerificationPipeline;
+use crate::verification::{BeaconVerificationPipeline, SpcMsgKind};
 use crate::witness_fetcher::ShardWitnessFetchTracker;
 
 /// Per-vnode beacon-chain coordinator.
@@ -239,21 +239,158 @@ impl BeaconCoordinator {
     }
 
     /// A peer's SPC message arrived (new-view / new-commit /
-    /// empty-view). SBOR-decode and route in. Inner-PC votes flow
-    /// through [`Self::on_pc_vote_received`] instead.
+    /// empty-view). SBOR-decode, validate non-crypto, and dispatch the
+    /// BLS check to the crypto pool. Admission happens in the matching
+    /// `on_spc_*_verified` handler. Inner-PC votes flow through
+    /// [`Self::on_pc_vote_received`] instead.
     pub fn on_spc_message_received(&mut self, from: ValidatorId, payload: &[u8]) -> Vec<Action> {
         let Some(msg) = SpcMessage::decode(payload) else {
             warn!(?from, "SPC message payload SBOR-decode failed");
             return Vec::new();
         };
-        let Some(event) = SpcEvent::from_message(msg, from) else {
+        let Some(spc) = self.spc.as_ref() else {
             trace!(
                 ?from,
-                "SpcMessage::VpcMsg received via SPC channel — dropping; PC votes flow through on_pc_vote_received",
+                "SPC message received but no SPC instance bootstrapped"
             );
             return Vec::new();
         };
-        self.dispatch_spc_event(from, event)
+        if self.skip_quorum_at_tip() {
+            trace!(
+                ?from,
+                "SPC message received but skip-quorum reached at local tip — dropping",
+            );
+            return Vec::new();
+        }
+        let epoch = spc.epoch();
+        let committee: Vec<(ValidatorId, Bls12381G1PublicKey)> = spc.committee().to_vec();
+        match msg {
+            SpcMessage::VpcMsg(_) => {
+                trace!(
+                    ?from,
+                    "SpcMessage::VpcMsg received via SPC channel — dropping; PC votes flow through on_pc_vote_received",
+                );
+                Vec::new()
+            }
+            SpcMessage::NewView { view, cert } => {
+                let key = (epoch, view, from, SpcMsgKind::NewView);
+                if !self.verification.mark_spc_msg_in_flight(key) {
+                    return Vec::new();
+                }
+                vec![Action::VerifySpcNewView {
+                    epoch,
+                    from,
+                    view,
+                    cert,
+                    committee,
+                }]
+            }
+            SpcMessage::NewCommit { view, value, proof } => {
+                let key = (epoch, view, from, SpcMsgKind::NewCommit);
+                if !self.verification.mark_spc_msg_in_flight(key) {
+                    return Vec::new();
+                }
+                vec![Action::VerifySpcNewCommit {
+                    epoch,
+                    from,
+                    view,
+                    value,
+                    proof,
+                    committee,
+                }]
+            }
+            SpcMessage::EmptyView(msg) => {
+                let key = (epoch, msg.view, msg.signer, SpcMsgKind::EmptyView);
+                if !self.verification.mark_spc_msg_in_flight(key) {
+                    return Vec::new();
+                }
+                vec![Action::VerifySpcEmptyView {
+                    epoch,
+                    msg,
+                    committee,
+                }]
+            }
+        }
+    }
+
+    /// Result of an [`Action::VerifySpcNewView`] dispatch.
+    pub fn on_spc_new_view_verified(
+        &mut self,
+        epoch: Epoch,
+        from: ValidatorId,
+        view: SpcView,
+        cert: Box<SpcCert>,
+        valid: bool,
+    ) -> Vec<Action> {
+        let key = (epoch, view, from, SpcMsgKind::NewView);
+        self.verification.on_spc_msg_result(key, valid);
+        self.verification.forget_spc_msg(key);
+        if !valid {
+            warn!(
+                ?from,
+                epoch = epoch.inner(),
+                view = view.inner(),
+                "SPC NewView cert verification failed — dropping",
+            );
+            return Vec::new();
+        }
+        if self.spc.as_ref().is_some_and(|s| s.epoch() != epoch) {
+            return Vec::new();
+        }
+        self.dispatch_spc_event(from, SpcEvent::NewViewVerified { from, view, cert })
+    }
+
+    /// Result of an [`Action::VerifySpcNewCommit`] dispatch.
+    pub fn on_spc_new_commit_verified(
+        &mut self,
+        epoch: Epoch,
+        from: ValidatorId,
+        view: SpcView,
+        value: PcVector,
+        proof: Box<PcQc3>,
+        valid: bool,
+    ) -> Vec<Action> {
+        let key = (epoch, view, from, SpcMsgKind::NewCommit);
+        self.verification.on_spc_msg_result(key, valid);
+        self.verification.forget_spc_msg(key);
+        if !valid {
+            warn!(
+                ?from,
+                epoch = epoch.inner(),
+                view = view.inner(),
+                "SPC NewCommit QC3 verification failed — dropping",
+            );
+            return Vec::new();
+        }
+        if self.spc.as_ref().is_some_and(|s| s.epoch() != epoch) {
+            return Vec::new();
+        }
+        self.dispatch_spc_event(from, SpcEvent::NewCommitVerified { view, value, proof })
+    }
+
+    /// Result of an [`Action::VerifySpcEmptyView`] dispatch.
+    pub fn on_spc_empty_view_verified(
+        &mut self,
+        epoch: Epoch,
+        msg: Box<SpcEmptyViewMsg>,
+        valid: bool,
+    ) -> Vec<Action> {
+        let key = (epoch, msg.view, msg.signer, SpcMsgKind::EmptyView);
+        self.verification.on_spc_msg_result(key, valid);
+        self.verification.forget_spc_msg(key);
+        if !valid {
+            warn!(
+                signer = ?msg.signer,
+                epoch = epoch.inner(),
+                view = msg.view.inner(),
+                "SPC EmptyView verification failed — dropping",
+            );
+            return Vec::new();
+        }
+        if self.spc.as_ref().is_some_and(|s| s.epoch() != epoch) {
+            return Vec::new();
+        }
+        self.dispatch_spc_event(msg.signer, SpcEvent::EmptyViewVerified(msg))
     }
 
     /// Result of an [`Action::VerifyPcVote`] dispatch. Clears the
@@ -478,7 +615,6 @@ impl BeaconCoordinator {
     fn bootstrap_spc_with_committee(&mut self, committee: Vec<(ValidatorId, Bls12381G1PublicKey)>) {
         let next_epoch = self.state.current_epoch.next();
         self.spc = Some(SpcInstance::new(
-            self.network.clone(),
             next_epoch,
             committee,
             self.me,

@@ -20,10 +20,12 @@ use hyperscale_beacon::constants::{BEACON_SIGNER_COUNT, MIN_STAKE_FLOOR};
 use hyperscale_beacon::coordinator::BeaconCoordinator;
 use hyperscale_beacon::genesis::build_genesis_beacon_state;
 use hyperscale_beacon::pc::{
-    sign_vote1, sign_vote2, sign_vote3, verify_vote1, verify_vote2, verify_vote3,
+    sign_vote1, sign_vote2, sign_vote3, verify_qc3, verify_vote1, verify_vote2, verify_vote3,
 };
 use hyperscale_beacon::skip::{sign_skip_request, verify_skip_cert, verify_skip_request};
-use hyperscale_beacon::spc::{sign_empty_view_msg, verify_block_cert};
+use hyperscale_beacon::spc::{
+    sign_empty_view_msg, verify_block_cert, verify_cert, verify_empty_view_msg,
+};
 use hyperscale_core::Action;
 use hyperscale_types::{
     BeaconCert, BeaconGenesisConfig, BeaconProposal, BeaconState, Bls12381G1PrivateKey,
@@ -754,6 +756,44 @@ impl CoordinatorSim {
                 };
                 let post =
                     self.coordinators[emitter_idx].on_pc_vote_verified(epoch, view, *vote, valid);
+                self.absorb(emitter_idx, post);
+            }
+            Action::VerifySpcNewView {
+                epoch,
+                from,
+                view,
+                cert,
+                committee,
+            } => {
+                let spc_ctx = spc_context(epoch);
+                let valid = verify_cert(&cert, view, &self.network, &spc_ctx, &committee);
+                let post = self.coordinators[emitter_idx]
+                    .on_spc_new_view_verified(epoch, from, view, cert, valid);
+                self.absorb(emitter_idx, post);
+            }
+            Action::VerifySpcNewCommit {
+                epoch,
+                from,
+                view,
+                value,
+                proof,
+                committee,
+            } => {
+                let pc_ctx = pc_context(&spc_context(epoch), view);
+                let valid = verify_qc3(&proof, &self.network, &pc_ctx, &committee);
+                let post = self.coordinators[emitter_idx]
+                    .on_spc_new_commit_verified(epoch, from, view, value, proof, valid);
+                self.absorb(emitter_idx, post);
+            }
+            Action::VerifySpcEmptyView {
+                epoch,
+                msg,
+                committee,
+            } => {
+                let spc_ctx = spc_context(epoch);
+                let valid = verify_empty_view_msg(&msg, &self.network, &spc_ctx, &committee);
+                let post =
+                    self.coordinators[emitter_idx].on_spc_empty_view_verified(epoch, msg, valid);
                 self.absorb(emitter_idx, post);
             }
             Action::SetTimer { .. }
