@@ -10,8 +10,8 @@ use hyperscale_core::Action;
 #[cfg(test)]
 use hyperscale_types::{BeaconWitnessLeafCount, BeaconWitnessRoot};
 use hyperscale_types::{
-    BlockHash, BlockHeight, Bls12381G1PublicKey, CertifiedBlock, QuorumCertificate,
-    TopologySnapshot, VotePower,
+    Block, BlockHash, BlockHeight, Bls12381G1PublicKey, CertifiedBlock, QuorumCertificate,
+    TopologySnapshot, Verifiable, Verified, VotePower,
 };
 use tracing::{debug, info, warn};
 
@@ -42,16 +42,33 @@ const MAX_BUFFERED_PER_HEIGHT: usize = 4;
 /// bounded.
 const MAX_BUFFER_FUTURE_HORIZON: u64 = 256;
 
-/// Synced block pending QC signature verification.
+/// Synced block tracked by the sync manager, split by QC-verification stage.
 ///
-/// When we receive a synced block, we must verify its QC signature before
-/// applying it to our state.
+/// `InFlight` covers the window between QC-signature dispatch and the
+/// `on_qc_verified` callback. `QcVerified` carries the typestate witness
+/// produced by the verifier; once a block reaches this variant it can be
+/// handed to `apply_synced_block` without further re-wrapping.
 #[derive(Debug, Clone)]
-pub struct PendingSyncedBlockVerification {
-    /// The synced block + certifying QC awaiting QC-signature verification.
-    pub certified: CertifiedBlock,
-    /// Whether the QC signature has been verified.
-    pub verified: bool,
+pub enum PendingSyncedBlockVerification {
+    /// QC signature verification has been dispatched but not yet completed.
+    InFlight(CertifiedBlock),
+    /// QC signature has been verified. The paired `block`'s hash equals
+    /// `qc.block_hash()` by [`CertifiedBlock`]'s pairing invariant.
+    QcVerified {
+        /// The synced block whose QC has been verified.
+        block: Block,
+        /// The verified QC; `qc.block_hash() == block.hash()`.
+        qc: Verified<QuorumCertificate>,
+    },
+}
+
+impl PendingSyncedBlockVerification {
+    const fn block(&self) -> &Block {
+        match self {
+            Self::InFlight(c) => c.block(),
+            Self::QcVerified { block, .. } => block,
+        }
+    }
 }
 
 /// Sync block coordination state.
@@ -186,7 +203,7 @@ impl BlockSyncManager {
     pub fn has_pending_at_height(&self, height: BlockHeight) -> bool {
         self.pending_synced_block_verifications
             .values()
-            .any(|p| p.certified.block().height() == height)
+            .any(|p| p.block().height() == height)
     }
 
     /// Buffer a future synced block for later processing. Returns `false`
@@ -354,10 +371,7 @@ impl BlockSyncManager {
         );
         self.pending_synced_block_verifications.insert(
             block_hash,
-            PendingSyncedBlockVerification {
-                certified,
-                verified: false,
-            },
+            PendingSyncedBlockVerification::InFlight(certified),
         );
 
         Action::VerifyQcSignature {
@@ -371,21 +385,26 @@ impl BlockSyncManager {
 
     /// Handle QC verification result for a synced block.
     ///
-    /// Returns `Some(pending)` if this was a synced block verification,
-    /// `None` if the `block_hash` wasn't found in pending synced verifications.
+    /// On success, `verified_qc` carries the typestate witness produced by
+    /// the verifier; the pending entry transitions from `InFlight` to
+    /// `QcVerified`, pairing the block with the verified QC. On failure,
+    /// the entry is dropped.
+    ///
+    /// Returns `Some(result)` if this was a synced block verification,
+    /// `None` if the `block_hash` wasn't found.
     pub fn on_qc_verified(
         &mut self,
         block_hash: BlockHash,
-        valid: bool,
+        verified_qc: Option<Verified<QuorumCertificate>>,
     ) -> Option<BlockSyncVerificationResult> {
-        let mut pending = self
+        let pending = self
             .pending_synced_block_verifications
             .remove(&block_hash)?;
 
-        if !valid {
+        let Some(verified_qc) = verified_qc else {
             warn!(
                 block_hash = ?block_hash,
-                height = pending.certified.block().height().inner(),
+                height = pending.block().height().inner(),
                 "Synced block QC signature verification FAILED - rejecting block"
             );
             // Only this block is removed (already done above). Other pending
@@ -393,18 +412,28 @@ impl BlockSyncManager {
             // into losing all in-flight sync work. Blocks above this height
             // will be blocked by the gap until a re-sync fills it.
             return Some(BlockSyncVerificationResult::Failed);
-        }
+        };
 
         info!(
             block_hash = ?block_hash,
-            height = pending.certified.block().height().inner(),
+            height = pending.block().height().inner(),
             "Synced block QC verified successfully"
         );
 
-        // Mark as verified and put back for ordering
-        pending.verified = true;
-        self.pending_synced_block_verifications
-            .insert(block_hash, pending);
+        let (block, _) = match pending {
+            PendingSyncedBlockVerification::InFlight(c) => c.into_parts(),
+            PendingSyncedBlockVerification::QcVerified { block, qc } => {
+                // Duplicate verification callback — replace and continue.
+                (block, Verifiable::Verified(qc))
+            }
+        };
+        self.pending_synced_block_verifications.insert(
+            block_hash,
+            PendingSyncedBlockVerification::QcVerified {
+                block,
+                qc: verified_qc,
+            },
+        );
 
         Some(BlockSyncVerificationResult::Verified)
     }
@@ -423,7 +452,7 @@ impl BlockSyncManager {
     pub fn has_unverified_in_flight(&self) -> bool {
         self.pending_synced_block_verifications
             .values()
-            .any(|p| !p.verified)
+            .any(|p| matches!(p, PendingSyncedBlockVerification::InFlight(_)))
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -432,21 +461,36 @@ impl BlockSyncManager {
 
     /// Take the next consecutive verified block at the given height.
     ///
-    /// Returns the certified block if a verified entry exists at `height`,
-    /// otherwise None.
-    pub fn take_verified_at_height(&mut self, height: BlockHeight) -> Option<CertifiedBlock> {
-        let block_hash = self
-            .pending_synced_block_verifications
-            .iter()
-            .find(|(_, p)| p.verified && p.certified.block().height() == height)
-            .map(|(h, _)| *h)?;
+    /// Returns the (block, verified QC) pair if a QC-verified entry exists
+    /// at `height`, otherwise `None`. The pairing invariant
+    /// `qc.block_hash == block.hash()` is preserved across the move.
+    pub fn take_verified_at_height(
+        &mut self,
+        height: BlockHeight,
+    ) -> Option<(Block, Verified<QuorumCertificate>)> {
+        let block_hash =
+            self.pending_synced_block_verifications
+                .iter()
+                .find_map(|(h, p)| match p {
+                    PendingSyncedBlockVerification::QcVerified { block, .. }
+                        if block.height() == height =>
+                    {
+                        Some(*h)
+                    }
+                    _ => None,
+                })?;
 
         let pending = self
             .pending_synced_block_verifications
             .remove(&block_hash)
             .unwrap();
 
-        Some(pending.certified)
+        match pending {
+            PendingSyncedBlockVerification::QcVerified { block, qc } => Some((block, qc)),
+            PendingSyncedBlockVerification::InFlight(_) => {
+                unreachable!("filter above selected only QcVerified entries")
+            }
+        }
     }
 
     /// Take the next block to apply in the consecutive-verified sequence.
@@ -455,7 +499,10 @@ impl BlockSyncManager {
     /// pops the matching verified entry. Returns `None` once the chain
     /// catches up to the verified frontier; also logs the verified /
     /// unverified pending heights for diagnostics.
-    pub fn take_next_verified(&mut self, committed_height: BlockHeight) -> Option<CertifiedBlock> {
+    pub fn take_next_verified(
+        &mut self,
+        committed_height: BlockHeight,
+    ) -> Option<(Block, Verified<QuorumCertificate>)> {
         let base = committed_height.max(self.sync_applied_height);
         let next_height = base + 1u64;
         self.log_verification_state(committed_height, next_height);
@@ -467,14 +514,20 @@ impl BlockSyncManager {
         let verified_heights: Vec<_> = self
             .pending_synced_block_verifications
             .values()
-            .filter(|p| p.verified)
-            .map(|p| p.certified.block().height().inner())
+            .filter_map(|p| match p {
+                PendingSyncedBlockVerification::QcVerified { block, .. } => {
+                    Some(block.height().inner())
+                }
+                PendingSyncedBlockVerification::InFlight(_) => None,
+            })
             .collect();
         let unverified_heights: Vec<_> = self
             .pending_synced_block_verifications
             .values()
-            .filter(|p| !p.verified)
-            .map(|p| p.certified.block().height().inner())
+            .filter_map(|p| match p {
+                PendingSyncedBlockVerification::InFlight(c) => Some(c.block().height().inner()),
+                PendingSyncedBlockVerification::QcVerified { .. } => None,
+            })
             .collect();
         info!(
             committed_height = committed_height.inner(),
@@ -529,7 +582,7 @@ impl BlockSyncManager {
     pub fn highest_pending_height(&self, committed_height: BlockHeight) -> BlockHeight {
         self.pending_synced_block_verifications
             .values()
-            .map(|p| p.certified.block().height())
+            .map(|p| p.block().height())
             .max()
             .unwrap_or(committed_height)
     }
@@ -549,7 +602,7 @@ impl BlockSyncManager {
             .retain(|height, _| *height > committed_height);
 
         self.pending_synced_block_verifications
-            .retain(|_, pending| pending.certified.block().height() > committed_height);
+            .retain(|_, pending| pending.block().height() > committed_height);
     }
 
     /// Total number of buffered candidates across all heights. May exceed
@@ -1179,10 +1232,7 @@ mod tests {
             let block_hash = certified.block().hash();
             self.pending_synced_block_verifications.insert(
                 block_hash,
-                PendingSyncedBlockVerification {
-                    certified,
-                    verified: false,
-                },
+                PendingSyncedBlockVerification::InFlight(certified),
             );
         }
     }

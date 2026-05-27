@@ -1726,7 +1726,10 @@ impl ShardCoordinator {
             pending_consensus_count = self.verification.pending_qc_count(),
             "on_qc_signature_verified: received callback"
         );
-        if let Some(sync_result) = self.block_sync.on_qc_verified(block_hash, valid) {
+        if let Some(sync_result) = self
+            .block_sync
+            .on_qc_verified(block_hash, result.as_ref().ok().cloned())
+        {
             return match sync_result {
                 // Even on failure, try applying verified blocks below the gap.
                 // The failed block creates a gap that blocks further progress,
@@ -2728,7 +2731,10 @@ impl ShardCoordinator {
                 height = certified.block().height().inner(),
                 "Synced block has genesis QC, applying directly"
             );
-            return self.apply_synced_block(topology_snapshot, certified);
+            let shard = certified.qc().shard_group_id();
+            let (block, _) = certified.into_parts();
+            let verified_qc = Verified::<QuorumCertificate>::genesis(shard);
+            return self.apply_synced_block(topology_snapshot, block, verified_qc);
         }
 
         // Quorum-power gate: `VerifyQcSignature` only checks the BLS
@@ -2794,16 +2800,10 @@ impl ShardCoordinator {
     fn apply_synced_block(
         &mut self,
         topology_snapshot: &TopologySnapshot,
-        certified: CertifiedBlock,
+        block: Block,
+        verified_qc: Verified<QuorumCertificate>,
     ) -> Vec<Action> {
-        let (block, qc) = certified.into_parts();
-        // SAFETY: synced blocks reach this function only after their QC
-        // passed `Action::VerifyQcSignature`. The verification gate
-        // tracks that result in `block_sync.on_qc_verified`; only
-        // verified entries flow into `apply_synced_block` via
-        // `try_apply_verified_synced_blocks`.
-        let verified_qc = Verified::<QuorumCertificate>::new_unchecked((*qc).clone());
-        let qc = qc.into_unverified();
+        let qc = (*verified_qc).clone();
         let block_hash = block.hash();
         let height = block.height();
 
@@ -2863,8 +2863,13 @@ impl ShardCoordinator {
             self.maybe_unlock_for_qc(topology_snapshot, block.header().parent_qc());
         }
 
+        // Admit the synced block's wave certs through the canonical pathway
+        // — io_loop's `Continuation(FinalizedWavesAdmitted)` interception
+        // populates the serving cache so other peers can fetch from us.
+        let synced_waves: Vec<_> = block.certificates().iter().map(Arc::clone).collect();
+
         let mut actions = vec![Action::CommitBlockByQcOnly {
-            block: block.clone(),
+            block,
             qc,
             parent_state_root,
             parent_block_height,
@@ -2872,10 +2877,6 @@ impl ShardCoordinator {
             witness,
         }];
 
-        // Admit the synced block's wave certs through the canonical pathway
-        // — io_loop's `Continuation(FinalizedWavesAdmitted)` interception
-        // populates the serving cache so other peers can fetch from us.
-        let synced_waves: Vec<_> = block.certificates().iter().map(Arc::clone).collect();
         if !synced_waves.is_empty() {
             actions.push(Action::Continuation(
                 ProtocolEvent::FinalizedWavesAdmitted {
@@ -2896,8 +2897,10 @@ impl ShardCoordinator {
         topology_snapshot: &TopologySnapshot,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
-        while let Some(certified) = self.block_sync.take_next_verified(self.committed_height) {
-            actions.extend(self.apply_synced_block(topology_snapshot, certified));
+        while let Some((block, verified_qc)) =
+            self.block_sync.take_next_verified(self.committed_height)
+        {
+            actions.extend(self.apply_synced_block(topology_snapshot, block, verified_qc));
         }
         actions.extend(self.try_drain_buffered_synced_blocks(topology_snapshot));
         actions
