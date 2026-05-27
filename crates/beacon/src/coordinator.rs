@@ -1299,6 +1299,13 @@ impl BeaconCoordinator {
     pub const fn current_topology_snapshot(&self) -> &Arc<TopologySnapshot> {
         &self.topology_snapshot
     }
+
+    /// Number of crypto verifications dispatched but not yet resulted.
+    /// Test introspection — production code shouldn't gate on this.
+    #[must_use]
+    pub fn verifications_in_flight(&self) -> usize {
+        self.verification.in_flight_count()
+    }
 }
 
 impl std::fmt::Debug for BeaconCoordinator {

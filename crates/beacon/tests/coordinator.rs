@@ -103,6 +103,16 @@ fn cluster_commits_non_empty_proposal_set_per_epoch() {
         sim.n(),
         "committed block dropped proposals — view-1 PC may have collapsed",
     );
+    // Tripwire: every dispatched verify must resolve. A non-zero
+    // in-flight count after the cluster quiesces means the result
+    // path didn't clear a pipeline slot somewhere.
+    for r in 0..sim.n() {
+        assert_eq!(
+            sim.coordinators[r].verifications_in_flight(),
+            0,
+            "replica {r} leaked verify slots",
+        );
+    }
 }
 
 #[test]
@@ -533,4 +543,12 @@ fn consecutive_skips_advance_chain() {
         post_skip_1_randomness, post_skip_2_randomness,
         "consecutive skips must roll randomness; chain wouldn't converge otherwise",
     );
+    // Tripwire: verify pipeline drains after consecutive skips.
+    for r in 0..n {
+        assert_eq!(
+            sim.coordinators[r].verifications_in_flight(),
+            0,
+            "replica {r} leaked verify slots across two skips",
+        );
+    }
 }
