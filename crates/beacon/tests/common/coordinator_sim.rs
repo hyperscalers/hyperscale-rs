@@ -19,16 +19,18 @@ use std::sync::Arc;
 use hyperscale_beacon::constants::{BEACON_SIGNER_COUNT, MIN_STAKE_FLOOR};
 use hyperscale_beacon::coordinator::BeaconCoordinator;
 use hyperscale_beacon::genesis::build_genesis_beacon_state;
-use hyperscale_beacon::pc::{sign_vote1, sign_vote2, sign_vote3};
+use hyperscale_beacon::pc::{
+    sign_vote1, sign_vote2, sign_vote3, verify_vote1, verify_vote2, verify_vote3,
+};
 use hyperscale_beacon::skip::{sign_skip_request, verify_skip_cert, verify_skip_request};
 use hyperscale_beacon::spc::{sign_empty_view_msg, verify_block_cert};
 use hyperscale_core::Action;
 use hyperscale_types::{
     BeaconCert, BeaconGenesisConfig, BeaconProposal, BeaconState, Bls12381G1PrivateKey,
     Bls12381G1PublicKey, CertifiedBeaconBlock, Epoch, GenesisPool, GenesisValidator,
-    NetworkDefinition, PcValueElement, PcVector, Randomness, ShardGroupId, SkipEpochCert,
-    SkipRequest, SpcMessage, Stake, StakePoolId, ValidatorId, VpcMsgPayload, Witness,
-    bls_keypair_from_seed, genesis_config_hash, pc_context, spc_context, vrf_sign,
+    NetworkDefinition, PcValueElement, PcVector, PcVoteMessage, Randomness, ShardGroupId,
+    SkipEpochCert, SkipRequest, SpcMessage, Stake, StakePoolId, ValidatorId, VpcMsgPayload,
+    Witness, bls_keypair_from_seed, genesis_config_hash, pc_context, spc_context, vrf_sign,
 };
 
 /// Adversarial transform a flagged replica applies to its next matching
@@ -736,6 +738,22 @@ impl CoordinatorSim {
             Action::VerifySkipRequest { request, signers } => {
                 let valid = verify_skip_request(&request, &self.network, &signers);
                 let post = self.coordinators[emitter_idx].on_skip_request_verified(*request, valid);
+                self.absorb(emitter_idx, post);
+            }
+            Action::VerifyPcVote {
+                epoch,
+                view,
+                vote,
+                committee,
+            } => {
+                let pc_ctx = pc_context(&spc_context(epoch), view);
+                let valid = match vote.as_ref() {
+                    PcVoteMessage::Vote1(v) => verify_vote1(v, &self.network, &pc_ctx, &committee),
+                    PcVoteMessage::Vote2(v) => verify_vote2(v, &self.network, &pc_ctx, &committee),
+                    PcVoteMessage::Vote3(v) => verify_vote3(v, &self.network, &pc_ctx, &committee),
+                };
+                let post =
+                    self.coordinators[emitter_idx].on_pc_vote_verified(epoch, view, *vote, valid);
                 self.absorb(emitter_idx, post);
             }
             Action::SetTimer { .. }
