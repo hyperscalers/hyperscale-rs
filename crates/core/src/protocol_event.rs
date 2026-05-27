@@ -10,10 +10,11 @@ use std::sync::Arc;
 use hyperscale_types::{
     BeaconProposal, Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote,
     CertifiedBeaconBlock, CertifiedBlock, CommittedBlockHeader, CommittedHeaderVerifyError, Epoch,
-    ExecutionCertificate, ExecutionVote, FinalizedWave, PcQc3, PcVector, PcVoteMessage, Provisions,
-    QcVerifyError, QuorumCertificate, ReadySignal, Round, RoutableTransaction, ShardGroupId,
-    ShardWitness, SkipEpochCert, SkipRequest, SpcCert, SpcEmptyViewMsg, SpcView, StoredReceipt,
-    TxOutcome, ValidatorId, VerifiedQuorumCertificate, VotePower, WaveId, WeightedTimestamp,
+    ExecutionCertificate, ExecutionVote, FinalizedWave, LinkedCertifiedBlock, PcQc3, PcVector,
+    PcVoteMessage, Provisions, QcVerifyError, QuorumCertificate, ReadySignal, Round,
+    RoutableTransaction, ShardGroupId, ShardWitness, SkipEpochCert, SkipRequest, SpcCert,
+    SpcEmptyViewMsg, SpcView, StoredReceipt, TxOutcome, ValidatorId, VerifiedQuorumCertificate,
+    VotePower, WaveId, WeightedTimestamp,
 };
 
 /// How a node learned about the certifying QC that commits a given block.
@@ -160,8 +161,13 @@ pub enum ProtocolEvent {
     /// from the action payload. Delegated actions that read substates use
     /// `PendingChain::view_at` to see unpersisted state.
     BlockCommitted {
-        /// The committed block + its certifying QC.
-        certified: Arc<CertifiedBlock>,
+        /// The committed block + its certifying QC. Wrapped as
+        /// [`LinkedCertifiedBlock`] so consumers see the typestate
+        /// claim that the QC has been verified and `qc.block_hash ==
+        /// block.hash()` — block-internal commitments (transaction
+        /// root, provision root, etc.) are checked by separate
+        /// pipeline arms and are not asserted by this type.
+        certified: Arc<LinkedCertifiedBlock>,
     },
 
     /// A block has been durably persisted to `RocksDB`.

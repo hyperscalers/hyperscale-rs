@@ -96,7 +96,9 @@ pub use receipt::stored::StoredReceipt;
 pub use sbor_codec::{
     BoundedBTreeMap, BoundedBTreeSet, BoundedBytes, BoundedLengthError, BoundedString, BoundedVec,
 };
-pub use shard::certified::{CertifiedBlock, CertifiedBlockHashMismatch};
+pub use shard::certified::{
+    CertifiedBlock, CertifiedBlockHashMismatch, LinkageError, LinkedCertifiedBlock,
+};
 pub use shard::committed_header::{CommittedBlockHeader, CommittedHeaderVerifyError};
 pub use shard::header::BlockHeader;
 pub use shard::inventory::{ElidedCertifiedBlock, Inventory, RehydrateError, RehydrationMiss};

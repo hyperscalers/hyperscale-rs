@@ -2,11 +2,14 @@
 //!
 //! Every committed block has exactly one QC where `qc.block_hash == block.hash()`.
 
+use std::ops::Deref;
+
 use sbor::prelude::*;
 use sbor::{
     Categorize, Decode, DecodeError, Decoder, Describe, Encode, EncodeError, Encoder,
     NoCustomTypeKind, NoCustomValueKind, RustTypeId, TypeData, TypeKind, ValueKind,
 };
+use thiserror::Error;
 
 use crate::{
     Block, BlockHash, BlockHeight, QuorumCertificate, Verifiable, VerifiedQuorumCertificate,
@@ -188,5 +191,120 @@ impl Describe<NoCustomTypeKind> for CertifiedBlock {
 
     fn type_data() -> TypeData<NoCustomTypeKind, RustTypeId> {
         TypeData::unnamed(TypeKind::Any)
+    }
+}
+
+/// Why [`LinkedCertifiedBlock::assemble_from_qc`] rejected its inputs.
+#[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
+pub enum LinkageError {
+    /// `qc.block_hash` does not match the paired block's computed hash.
+    #[error("qc.block_hash {qc_block_hash:?} does not match block.hash {block_hash:?}")]
+    BlockHashMismatch {
+        /// Hash computed from the block's content.
+        block_hash: BlockHash,
+        /// `block_hash` field from the QC.
+        qc_block_hash: BlockHash,
+    },
+}
+
+/// A `CertifiedBlock` whose QC has been verified and whose QC↔block
+/// linkage has been checked.
+///
+/// Construction asserts:
+/// 1. The QC passes its own verification predicate
+///    ([`VerifiedQuorumCertificate`]).
+/// 2. `qc.block_hash == block.hash()` (structural pairing).
+///
+/// Construction does **not** assert that the block's internal commitment
+/// roots (transaction root, certificate root, provision root, state
+/// root, …) match the inline data. Those checks run as separate action
+/// arms in the commit pipeline; correctness depends on pipeline
+/// ordering, not on this type.
+///
+/// Construction goes through one of three gates:
+///
+/// - [`Self::assemble_from_qc`] — runs the linkage check on a fresh
+///   `(Block, VerifiedQuorumCertificate)` pair.
+/// - [`Self::genesis`] — wraps a `CertifiedBlock::new_unchecked`-style
+///   genesis pair whose linkage is trivially satisfied.
+/// - [`Self::new_unchecked`] — audit point reserved for storage-recovery
+///   and commit-pipeline call sites where the linkage was established
+///   upstream.
+///
+/// `#[repr(transparent)]` over `CertifiedBlock`: `Deref<Target =
+/// CertifiedBlock>` exposes the existing accessors; no mutable access,
+/// no `Encode`/`Decode` (this is a runtime-only typestate marker,
+/// in-process events only).
+#[repr(transparent)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkedCertifiedBlock(CertifiedBlock);
+
+impl LinkedCertifiedBlock {
+    /// Pair a `Block` with a [`VerifiedQuorumCertificate`], checking the
+    /// linkage invariant.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LinkageError::BlockHashMismatch`] when `qc.block_hash`
+    /// does not equal `block.hash()`.
+    pub fn assemble_from_qc(
+        block: Block,
+        qc: VerifiedQuorumCertificate,
+    ) -> Result<Self, LinkageError> {
+        let block_hash = block.hash();
+        let qc_block_hash = qc.block_hash();
+        if qc_block_hash != block_hash {
+            return Err(LinkageError::BlockHashMismatch {
+                block_hash,
+                qc_block_hash,
+            });
+        }
+        Ok(Self(CertifiedBlock {
+            block,
+            qc: Verifiable::Verified(qc),
+        }))
+    }
+
+    /// Audit-point constructor. Skips the linkage check.
+    ///
+    /// Permitted use sites: storage-recovery (linkage was established
+    /// before persistence) and commit-pipeline interceptors that
+    /// produced the pair from already-checked inputs. Each call site
+    /// documents the trust source with a `// SAFETY:` comment;
+    /// `grep new_unchecked` produces the audit list.
+    #[must_use]
+    pub const fn new_unchecked(inner: CertifiedBlock) -> Self {
+        Self(inner)
+    }
+
+    /// Borrow the underlying [`CertifiedBlock`].
+    #[must_use]
+    pub const fn as_certified(&self) -> &CertifiedBlock {
+        &self.0
+    }
+
+    /// Consume the wrapper and return the raw [`CertifiedBlock`].
+    #[must_use]
+    pub fn into_inner(self) -> CertifiedBlock {
+        self.0
+    }
+}
+
+impl AsRef<CertifiedBlock> for LinkedCertifiedBlock {
+    fn as_ref(&self) -> &CertifiedBlock {
+        &self.0
+    }
+}
+
+impl Deref for LinkedCertifiedBlock {
+    type Target = CertifiedBlock;
+    fn deref(&self) -> &CertifiedBlock {
+        &self.0
+    }
+}
+
+impl From<LinkedCertifiedBlock> for CertifiedBlock {
+    fn from(linked: LinkedCertifiedBlock) -> Self {
+        linked.0
     }
 }

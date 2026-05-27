@@ -46,8 +46,8 @@ use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::ShardChainReader;
 use hyperscale_storage_rocksdb::{RocksDbShardStorage, SharedStorage};
 use hyperscale_types::{
-    Block, BlockHeight, Bls12381G1PrivateKey, CertifiedBlock, InFlightCount, LocalTimestamp,
-    MAX_TX_IN_FLIGHT, NodeId, QuorumCertificate, RoutableTransaction, ShardGroupId,
+    Block, BlockHeight, Bls12381G1PrivateKey, CertifiedBlock, InFlightCount, LinkedCertifiedBlock,
+    LocalTimestamp, MAX_TX_IN_FLIGHT, NodeId, QuorumCertificate, RoutableTransaction, ShardGroupId,
     TopologySnapshot, TransactionStatus, TxHash, ValidatorId, shard_for_node,
 };
 use libp2p::identity::Keypair;
@@ -782,8 +782,11 @@ impl ProductionRunner {
                     __qc.weighted_timestamp(),
                 )
             };
-            let genesis_certified =
-                Arc::new(CertifiedBlock::new_unchecked(genesis_block, genesis_qc));
+            // SAFETY: genesis pair is constructed locally with a
+            // matching block_hash; no adversarial input.
+            let genesis_certified = Arc::new(LinkedCertifiedBlock::new_unchecked(
+                CertifiedBlock::new_unchecked(genesis_block, genesis_qc),
+            ));
             let genesis_commit_output = host.step(ShardEvent::protocol(
                 shard,
                 ProtocolEvent::BlockCommitted {

@@ -386,9 +386,9 @@ mod tests {
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
         BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHeader, BlockHeight, BlockManifest,
-        CommittedBlockHeader, Hash, LocalTimestamp, MerkleInclusionProof, ProvisionEntry,
-        Provisions, QuorumCertificate, RETENTION_HORIZON, Round, ShardGroupId, TransactionStatus,
-        TxHash, ValidatorId, WaveId,
+        CommittedBlockHeader, Hash, LinkedCertifiedBlock, LocalTimestamp, MerkleInclusionProof,
+        ProvisionEntry, Provisions, QuorumCertificate, RETENTION_HORIZON, Round, ShardGroupId,
+        TransactionStatus, TxHash, ValidatorId, WaveId,
     };
 
     use super::super::test_support::TestNode;
@@ -620,7 +620,9 @@ mod tests {
             vec![],
             vec![],
         );
-        let certified = Arc::new(certify(block, /* weighted_timestamp_ms */ 1_000));
+        let certified = Arc::new(LinkedCertifiedBlock::new_unchecked(certify(
+            block, /* weighted_timestamp_ms */ 1_000,
+        )));
         let _ = node.handle(past_deadline, ProtocolEvent::BlockCommitted { certified });
         assert_eq!(
             node.outbound_provisions().memory_stats().tracked_provisions,
@@ -639,7 +641,10 @@ mod tests {
             vec![],
             vec![],
         );
-        let certified = Arc::new(certify(block, past_deadline_ms));
+        let certified = Arc::new(LinkedCertifiedBlock::new_unchecked(certify(
+            block,
+            past_deadline_ms,
+        )));
         let _ = node.handle(past_deadline, ProtocolEvent::BlockCommitted { certified });
         assert_eq!(
             node.outbound_provisions().memory_stats().tracked_provisions,
@@ -729,7 +734,9 @@ mod tests {
             vec![tx],
             vec![],
         );
-        let certified = Arc::new(certify(block, /* weighted_timestamp_ms */ 1_000));
+        let certified = Arc::new(LinkedCertifiedBlock::new_unchecked(certify(
+            block, /* weighted_timestamp_ms */ 1_000,
+        )));
         let _ = node.handle(
             LocalTimestamp::ZERO,
             ProtocolEvent::BlockCommitted { certified },

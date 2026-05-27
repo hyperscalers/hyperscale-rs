@@ -30,8 +30,8 @@ use hyperscale_storage::{
 #[cfg(test)]
 use hyperscale_types::BeaconWitnessLeafCount;
 use hyperscale_types::{
-    Block, BlockHash, BlockHeight, CertifiedBlock, ConsensusReceipt, FinalizedWave, LocalTimestamp,
-    QuorumCertificate, ShardGroupId, StateRoot,
+    Block, BlockHash, BlockHeight, CertifiedBlock, ConsensusReceipt, FinalizedWave,
+    LinkedCertifiedBlock, LocalTimestamp, QuorumCertificate, ShardGroupId, StateRoot,
 };
 use tracing::debug;
 
@@ -703,9 +703,14 @@ where
             for (i, _) in heights.iter().enumerate() {
                 if !already_notified[i] {
                     let commit = commit_slots[i].take().unwrap();
-                    let certified = Arc::new(CertifiedBlock::new_unchecked(
-                        Arc::unwrap_or_clone(commit.block),
-                        Arc::unwrap_or_clone(commit.qc),
+                    // SAFETY: the commit pipeline only enqueues commits
+                    // after QC verification and block-hash linkage, so
+                    // the typestate wrap matches what is established.
+                    let certified = Arc::new(LinkedCertifiedBlock::new_unchecked(
+                        CertifiedBlock::new_unchecked(
+                            Arc::unwrap_or_clone(commit.block),
+                            Arc::unwrap_or_clone(commit.qc),
+                        ),
                     ));
                     push_protocol_event(
                         &event_tx,
