@@ -291,3 +291,42 @@ impl From<LinkedCertifiedBlock> for CertifiedBlock {
         linked.0
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use sbor::basic_encode;
+
+    use super::*;
+    use crate::{
+        Round, ShardGroupId, SignerBitfield, StateRoot, ValidatorId, WeightedTimestamp,
+        zero_bls_signature,
+    };
+
+    /// A [`CertifiedBlock`]'s SBOR encoding does not depend on whether its
+    /// QC is wrapped as [`Verifiable::Unverified`] or [`Verifiable::Verified`].
+    /// This is the invariant that keeps wire bytes (and every merkle root or
+    /// signature computed over them) stable across the field's type change
+    /// from raw `QuorumCertificate` to `Verifiable<QC, VerifiedQC>`.
+    #[test]
+    fn wire_bypass_identical_across_verified_states() {
+        let block = Block::genesis(ShardGroupId::new(0), ValidatorId::new(0), StateRoot::ZERO);
+        let qc = QuorumCertificate::new(
+            block.hash(),
+            ShardGroupId::new(0),
+            BlockHeight::GENESIS,
+            BlockHash::ZERO,
+            Round::INITIAL,
+            SignerBitfield::empty(),
+            zero_bls_signature(),
+            WeightedTimestamp::ZERO,
+        );
+
+        let unverified = CertifiedBlock::new_unchecked(block.clone(), qc.clone());
+        let verified =
+            CertifiedBlock::new_unchecked(block, VerifiedQuorumCertificate::new_unchecked(qc));
+
+        let bytes_unverified = basic_encode(&unverified).unwrap();
+        let bytes_verified = basic_encode(&verified).unwrap();
+        assert_eq!(bytes_unverified, bytes_verified);
+    }
+}

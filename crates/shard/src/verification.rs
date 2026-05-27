@@ -16,7 +16,8 @@ use hyperscale_core::{Action, VerificationKind};
 use hyperscale_types::{BeaconWitnessLeafCount, BeaconWitnessRoot};
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, FinalizedWave, InFlightCount,
-    LocalReceiptRoot, ProvisionsRoot, StateRoot, TopologySnapshot, VerifiedQuorumCertificate,
+    LinkageError, LinkedCertifiedBlock, LocalReceiptRoot, ProvisionsRoot, StateRoot,
+    TopologySnapshot, VerifiedQuorumCertificate,
 };
 use tracing::{debug, trace, warn};
 
@@ -92,6 +93,37 @@ pub struct PendingStateRootVerification {
     pub expected_root: StateRoot,
     pub expected_local_receipt_root: LocalReceiptRoot,
     pub block_height: BlockHeight,
+}
+
+/// A block awaiting the sub-results required to produce a
+/// [`LinkedCertifiedBlock`]: a verified QC paired with the block, plus
+/// per-root verification outcomes for the block's internal commitments.
+/// The assembly is complete when every slot is `Some`; on completion
+/// [`VerificationPipeline::record_qc_assembly`] returns the linked block.
+#[derive(Debug)]
+pub struct PendingAssembly {
+    /// Block whose commitments are being verified.
+    pub block: Arc<Block>,
+    /// Verified QC for [`Self::block`], populated when QC signature
+    /// verification completes.
+    pub qc_result: Option<VerifiedQuorumCertificate>,
+    /// Transaction-root verification outcome (`Some(())` on success).
+    pub tx_root_result: Option<()>,
+    /// Provision-root verification outcome (`Some(())` on success).
+    pub provision_root_result: Option<()>,
+    /// Certificate-root verification outcome (`Some(())` on success).
+    pub certificate_root_result: Option<()>,
+}
+
+impl PendingAssembly {
+    /// Every required sub-result is present.
+    #[must_use]
+    pub const fn is_complete(&self) -> bool {
+        self.qc_result.is_some()
+            && self.tx_root_result.is_some()
+            && self.provision_root_result.is_some()
+            && self.certificate_root_result.is_some()
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -179,6 +211,13 @@ pub struct VerificationPipeline {
     // === In-flight count verification ===
     /// Blocks with verified in-flight counts (synchronous tolerance check).
     verified_in_flight: HashSet<BlockHash>,
+
+    // === Composite assembly ===
+    /// Blocks awaiting all sub-results required to produce a
+    /// [`LinkedCertifiedBlock`]. Keyed by `block.hash()`. Entries are
+    /// inserted via [`Self::track_pending_assembly`] and removed when the
+    /// completion check fires inside [`Self::record_qc_assembly`].
+    pending_assemblies: HashMap<BlockHash, PendingAssembly>,
 }
 
 impl VerificationPipeline {
@@ -198,6 +237,7 @@ impl VerificationPipeline {
             verified_roots: HashSet::new(),
             deferred_beacon_witness_verifications: HashMap::new(),
             verified_in_flight: HashSet::new(),
+            pending_assemblies: HashMap::new(),
         }
     }
 
@@ -304,6 +344,68 @@ impl VerificationPipeline {
     /// Number of pending QC verifications (for logging).
     pub fn pending_qc_count(&self) -> usize {
         self.pending_qc_verifications.len()
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Composite assembly
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Start tracking `block` as awaiting the sub-results required for
+    /// [`LinkedCertifiedBlock`] assembly. The QC slot is initialized empty;
+    /// per-root slots are initialized as already-verified placeholders. The
+    /// completion check fires from [`Self::record_qc_assembly`] when every
+    /// slot is populated.
+    pub fn track_pending_assembly(&mut self, block: Arc<Block>) {
+        let block_hash = block.hash();
+        self.pending_assemblies.insert(
+            block_hash,
+            PendingAssembly {
+                block,
+                qc_result: None,
+                tx_root_result: Some(()),
+                provision_root_result: Some(()),
+                certificate_root_result: Some(()),
+            },
+        );
+    }
+
+    /// Populate the QC slot for `block_hash`'s pending assembly. When every
+    /// slot is now `Some`, the entry is removed and a `LinkedCertifiedBlock`
+    /// is produced via [`LinkedCertifiedBlock::assemble_from_qc`]. Returns
+    /// `None` when no assembly is tracked for `block_hash`, or when more
+    /// sub-results are still outstanding.
+    pub fn record_qc_assembly(
+        &mut self,
+        block_hash: BlockHash,
+        qc: VerifiedQuorumCertificate,
+    ) -> Option<Result<LinkedCertifiedBlock, LinkageError>> {
+        let entry = self.pending_assemblies.get_mut(&block_hash)?;
+        entry.qc_result = Some(qc);
+        if !entry.is_complete() {
+            return None;
+        }
+        let entry = self.pending_assemblies.remove(&block_hash)?;
+        let block = Arc::try_unwrap(entry.block).unwrap_or_else(|arc| (*arc).clone());
+        let qc = entry
+            .qc_result
+            .expect("completion check just confirmed qc_result is Some");
+        Some(LinkedCertifiedBlock::assemble_from_qc(block, qc))
+    }
+
+    /// Number of in-flight composite assemblies.
+    #[must_use]
+    pub fn pending_assembly_count(&self) -> usize {
+        self.pending_assemblies.len()
+    }
+
+    /// Mutable borrow of an assembly entry. Used by tests that need to
+    /// reset placeholder slots to exercise the multi-slot completion check.
+    #[cfg(test)]
+    pub(crate) fn pending_assembly_mut(
+        &mut self,
+        block_hash: &BlockHash,
+    ) -> Option<&mut PendingAssembly> {
+        self.pending_assemblies.get_mut(block_hash)
     }
 
     /// Whether any block verification is currently in-flight.
@@ -1272,6 +1374,9 @@ impl VerificationPipeline {
         // at the same height reference the same parent QC.
         self.verified_qcs
             .retain(|_, qc| qc.height() > committed_height.saturating_sub(2));
+
+        self.pending_assemblies
+            .retain(|hash, _| pending_blocks.contains_key(*hash));
     }
 
     /// Number of pending QC verifications.
@@ -1650,5 +1755,83 @@ mod tests {
             vp.take_deferred_beacon_witness_children(parent_block_hash)
                 .is_empty()
         );
+    }
+
+    // ─── PendingAssembly multi-slot completion ──────────────────────────
+
+    fn assembly_block() -> Block {
+        Block::genesis(ShardGroupId::new(0), ValidatorId::new(0), StateRoot::ZERO)
+    }
+
+    fn assembly_qc_for(block: &Block) -> QuorumCertificate {
+        QuorumCertificate::new(
+            block.hash(),
+            ShardGroupId::new(0),
+            BlockHeight::GENESIS,
+            BlockHash::ZERO,
+            Round::INITIAL,
+            SignerBitfield::empty(),
+            zero_bls_signature(),
+            WeightedTimestamp::ZERO,
+        )
+    }
+
+    /// `record_qc_assembly` returns the assembled [`LinkedCertifiedBlock`]
+    /// only when every sub-result slot is `Some`. Clearing any non-QC slot
+    /// keeps the assembly pending even after the QC arrives, proving the
+    /// completion check ranges over all slots.
+    #[test]
+    fn record_qc_assembly_waits_for_every_slot() {
+        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
+        let block = assembly_block();
+        let block_hash = block.hash();
+        let verified_qc = VerifiedQuorumCertificate::new_unchecked(assembly_qc_for(&block));
+
+        vp.track_pending_assembly(Arc::new(block));
+        assert_eq!(vp.pending_assembly_count(), 1);
+
+        // Clear two of the auto-filled slots so the completion check has to
+        // wait on multiple sub-results, not just QC.
+        let entry = vp.pending_assembly_mut(&block_hash).unwrap();
+        entry.tx_root_result = None;
+        entry.provision_root_result = None;
+
+        // QC arrives, but tx_root and provision_root are still missing.
+        assert!(
+            vp.record_qc_assembly(block_hash, verified_qc.clone())
+                .is_none()
+        );
+        assert_eq!(vp.pending_assembly_count(), 1);
+
+        // Fill tx_root only — provision_root still missing.
+        vp.pending_assembly_mut(&block_hash).unwrap().tx_root_result = Some(());
+        assert!(
+            vp.record_qc_assembly(block_hash, verified_qc.clone())
+                .is_none()
+        );
+        assert_eq!(vp.pending_assembly_count(), 1);
+
+        // Fill the last slot; completion fires, entry is removed, and the
+        // produced LinkedCertifiedBlock matches the block we tracked.
+        vp.pending_assembly_mut(&block_hash)
+            .unwrap()
+            .provision_root_result = Some(());
+        let linked = vp
+            .record_qc_assembly(block_hash, verified_qc)
+            .expect("completion fires when every slot is Some")
+            .expect("linkage check passes for the matching qc.block_hash");
+        assert_eq!(linked.qc().block_hash(), block_hash);
+        assert_eq!(vp.pending_assembly_count(), 0);
+    }
+
+    /// `record_qc_assembly` against a block hash with no tracked assembly
+    /// is a no-op returning `None`.
+    #[test]
+    fn record_qc_assembly_returns_none_for_unknown_block() {
+        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
+        let block = assembly_block();
+        let verified_qc = VerifiedQuorumCertificate::new_unchecked(assembly_qc_for(&block));
+        assert!(vp.record_qc_assembly(block.hash(), verified_qc).is_none());
+        assert_eq!(vp.pending_assembly_count(), 0);
     }
 }

@@ -58,6 +58,7 @@ fn memory_stats_reports_all_zeros_for_fresh_coordinator() {
         pending_state_root_verifications,
         buffered_synced_blocks,
         pending_synced_block_verifications,
+        pending_assemblies,
     } = coordinator.memory_stats();
 
     assert_eq!(pending_blocks, 0);
@@ -74,6 +75,7 @@ fn memory_stats_reports_all_zeros_for_fresh_coordinator() {
     assert_eq!(pending_state_root_verifications, 0);
     assert_eq!(buffered_synced_blocks, 0);
     assert_eq!(pending_synced_block_verifications, 0);
+    assert_eq!(pending_assemblies, 0);
 }
 
 #[test]
