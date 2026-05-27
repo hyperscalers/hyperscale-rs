@@ -699,6 +699,47 @@ impl PcQc3 {
     }
 }
 
+// ── Verify-dispatch carrier ─────────────────────────────────────────────────
+
+/// A round-tagged PC vote, sized for the verify-dispatch round-trip.
+///
+/// The dispatcher needs to know which round to verify so it can pick the
+/// right `verify_vote*` helper. The variant carries the same vote types
+/// the gossip layer decodes from [`VpcMsgPayload`](crate::VpcMsgPayload),
+/// minus the SPC view (which is already a field on the carrying
+/// `Action::VerifyPcVote` / `ProtocolEvent::PcVoteVerified`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PcVoteMessage {
+    /// Round-1 vote.
+    Vote1(PcVote1),
+    /// Round-2 vote.
+    Vote2(Box<PcVote2>),
+    /// Round-3 vote.
+    Vote3(Box<PcVote3>),
+}
+
+impl PcVoteMessage {
+    /// Round this vote belongs to.
+    #[must_use]
+    pub const fn round(&self) -> PcVoteRound {
+        match self {
+            Self::Vote1(_) => PcVoteRound::Vote1,
+            Self::Vote2(_) => PcVoteRound::Vote2,
+            Self::Vote3(_) => PcVoteRound::Vote3,
+        }
+    }
+
+    /// Validator that signed this vote.
+    #[must_use]
+    pub fn validator(&self) -> ValidatorId {
+        match self {
+            Self::Vote1(v) => v.validator(),
+            Self::Vote2(v) => v.validator(),
+            Self::Vote3(v) => v.validator(),
+        }
+    }
+}
+
 // ── Equivocation ─────────────────────────────────────────────────────────────
 
 /// Which PC round a [`PcVoteEquivocation`] references.

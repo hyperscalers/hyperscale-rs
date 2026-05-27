@@ -10,9 +10,10 @@ use std::sync::Arc;
 use hyperscale_types::{
     BeaconProposal, Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote,
     CertifiedBeaconBlock, CertifiedBlock, CommittedBlockHeader, Epoch, ExecutionCertificate,
-    ExecutionVote, FinalizedWave, Provisions, QuorumCertificate, ReadySignal, Round,
-    RoutableTransaction, ShardGroupId, ShardWitness, SkipEpochCert, SkipRequest, StoredReceipt,
-    TxOutcome, ValidatorId, VotePower, WaveId, WeightedTimestamp,
+    ExecutionVote, FinalizedWave, PcQc3, PcVector, PcVoteMessage, Provisions, QuorumCertificate,
+    ReadySignal, Round, RoutableTransaction, ShardGroupId, ShardWitness, SkipEpochCert,
+    SkipRequest, SpcCert, SpcEmptyViewMsg, SpcView, StoredReceipt, TxOutcome, ValidatorId,
+    VotePower, WaveId, WeightedTimestamp,
 };
 
 /// How a node learned about the certifying QC that commits a given block.
@@ -593,6 +594,58 @@ pub enum ProtocolEvent {
         /// The request whose BLS sig was verified.
         request: Box<SkipRequest>,
         /// Whether the sig check passed.
+        valid: bool,
+    },
+
+    /// Result of an [`Action::VerifyPcVote`] dispatch. The vote rides
+    /// back so the coordinator can route it into the right view's inner
+    /// PC sub-machine without stashing.
+    PcVoteVerified {
+        /// Epoch the inner PC instance belongs to.
+        epoch: Epoch,
+        /// SPC view whose inner PC produced this vote.
+        view: SpcView,
+        /// Vote whose signature was checked.
+        vote: Box<PcVoteMessage>,
+        /// Whether the signature check passed.
+        valid: bool,
+    },
+
+    /// Result of an [`Action::VerifySpcNewView`] dispatch.
+    SpcNewViewVerified {
+        /// Epoch the SPC instance belongs to.
+        epoch: Epoch,
+        /// Sender of the `NewView`.
+        from: ValidatorId,
+        /// View this cert authorises entry to.
+        view: SpcView,
+        /// Cert that was verified.
+        cert: Box<SpcCert>,
+        /// Whether the cert check passed.
+        valid: bool,
+    },
+
+    /// Result of an [`Action::VerifySpcNewCommit`] dispatch.
+    SpcNewCommitVerified {
+        /// Epoch the SPC instance belongs to.
+        epoch: Epoch,
+        /// SPC view whose inner PC produced this commit.
+        view: SpcView,
+        /// Committed low value.
+        value: PcVector,
+        /// PC round-3 cert anchoring `value` as `proof.x_pp`.
+        proof: Box<PcQc3>,
+        /// Whether the embedded QC3 check passed.
+        valid: bool,
+    },
+
+    /// Result of an [`Action::VerifySpcEmptyView`] dispatch.
+    SpcEmptyViewVerified {
+        /// Epoch the SPC instance belongs to.
+        epoch: Epoch,
+        /// Attestation that was verified.
+        msg: Box<SpcEmptyViewMsg>,
+        /// Whether the sig + embedded QC3 checks passed.
         valid: bool,
     },
 

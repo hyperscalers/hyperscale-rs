@@ -3,8 +3,8 @@
 use std::collections::BTreeSet;
 
 use hyperscale_types::{
-    BeaconBlockHash, BeaconCert, Bls12381G1PublicKey, CertifiedBeaconBlock, Hash,
-    NetworkDefinition, ValidatorId, spc_context,
+    BeaconBlockHash, BeaconCert, Bls12381G1PublicKey, CertifiedBeaconBlock, Epoch, Hash,
+    NetworkDefinition, PcVoteRound, SpcView, ValidatorId, spc_context,
 };
 
 use crate::skip::verify_skip_cert;
@@ -91,17 +91,46 @@ impl<K: Ord> VerificationSlots<K> {
     }
 }
 
+/// Slot key for a pending PC-vote verification.
+///
+/// Per-`(epoch, view, signer, round)` because a Byzantine signer may
+/// dispatch divergent votes at the same round within a view; each gets
+/// its own slot so the post-verify equivocation check sees both.
+pub type PcVoteSlotKey = (Epoch, SpcView, ValidatorId, PcVoteRound);
+
+/// Which SPC message kind a verification slot refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SpcMsgKind {
+    /// `NewView` cert verification.
+    NewView,
+    /// `NewCommit` embedded QC3 verification.
+    NewCommit,
+    /// `EmptyView` sig + embedded QC3 verification.
+    EmptyView,
+}
+
+/// Slot key for a pending SPC message verification.
+pub type SpcMsgSlotKey = (Epoch, SpcView, ValidatorId, SpcMsgKind);
+
 /// Tracks asynchronous beacon verifications dispatched to the crypto
 /// pool.
 ///
-/// Two domains: block-cert verifications (keyed on block hash) and
-/// skip-request sig verifications (keyed on the request's content
-/// hash). The two never share keys by construction — different domain
-/// types, both blake3.
+/// Four domains:
+/// - Block-cert verifications, keyed on [`BeaconBlockHash`].
+/// - Skip-request sig verifications, keyed on the request's content
+///   hash.
+/// - PC-vote verifications, keyed on `(epoch, view, signer, round)`.
+/// - SPC message verifications, keyed on
+///   `(epoch, view, sender, msg-kind)`.
+///
+/// Domains never share keys by construction — different `K` types per
+/// slot pool.
 #[derive(Debug, Default)]
 pub struct BeaconVerificationPipeline {
     blocks: VerificationSlots<BeaconBlockHash>,
     skip_requests: VerificationSlots<Hash>,
+    pc_votes: VerificationSlots<PcVoteSlotKey>,
+    spc_msgs: VerificationSlots<SpcMsgSlotKey>,
 }
 
 impl BeaconVerificationPipeline {
@@ -147,6 +176,38 @@ impl BeaconVerificationPipeline {
     pub fn forget_skip_request(&mut self, key: Hash) {
         self.skip_requests.forget(&key);
     }
+
+    /// Mark a PC-vote verification in flight. Same semantics as
+    /// [`Self::mark_block_in_flight`].
+    pub fn mark_pc_vote_in_flight(&mut self, key: PcVoteSlotKey) -> bool {
+        self.pc_votes.mark_in_flight(key)
+    }
+
+    /// Apply a PC-vote verification result.
+    pub fn on_pc_vote_result(&mut self, key: PcVoteSlotKey, valid: bool) {
+        self.pc_votes.on_result(&key, valid);
+    }
+
+    /// Drop the PC-vote slot. Called after the post-verify path consumes
+    /// the result (admission or drop).
+    pub fn forget_pc_vote(&mut self, key: PcVoteSlotKey) {
+        self.pc_votes.forget(&key);
+    }
+
+    /// Mark an SPC message verification in flight.
+    pub fn mark_spc_msg_in_flight(&mut self, key: SpcMsgSlotKey) -> bool {
+        self.spc_msgs.mark_in_flight(key)
+    }
+
+    /// Apply an SPC message verification result.
+    pub fn on_spc_msg_result(&mut self, key: SpcMsgSlotKey, valid: bool) {
+        self.spc_msgs.on_result(&key, valid);
+    }
+
+    /// Drop the SPC message slot.
+    pub fn forget_spc_msg(&mut self, key: SpcMsgSlotKey) {
+        self.spc_msgs.forget(&key);
+    }
 }
 
 // Flat queries; names are the documentation.
@@ -173,13 +234,39 @@ impl BeaconVerificationPipeline {
     }
 
     #[must_use]
+    pub fn is_pc_vote_in_flight(&self, key: PcVoteSlotKey) -> bool {
+        self.pc_votes.is_in_flight(&key)
+    }
+
+    #[must_use]
+    pub fn is_pc_vote_verified(&self, key: PcVoteSlotKey) -> bool {
+        self.pc_votes.is_verified(&key)
+    }
+
+    #[must_use]
+    pub fn is_spc_msg_in_flight(&self, key: SpcMsgSlotKey) -> bool {
+        self.spc_msgs.is_in_flight(&key)
+    }
+
+    #[must_use]
+    pub fn is_spc_msg_verified(&self, key: SpcMsgSlotKey) -> bool {
+        self.spc_msgs.is_verified(&key)
+    }
+
+    #[must_use]
     pub fn in_flight_count(&self) -> usize {
-        self.blocks.in_flight_count() + self.skip_requests.in_flight_count()
+        self.blocks.in_flight_count()
+            + self.skip_requests.in_flight_count()
+            + self.pc_votes.in_flight_count()
+            + self.spc_msgs.in_flight_count()
     }
 
     #[must_use]
     pub fn verified_count(&self) -> usize {
-        self.blocks.verified_count() + self.skip_requests.verified_count()
+        self.blocks.verified_count()
+            + self.skip_requests.verified_count()
+            + self.pc_votes.verified_count()
+            + self.spc_msgs.verified_count()
     }
 }
 
