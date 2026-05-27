@@ -924,17 +924,25 @@ pub enum Action {
 
     /// Verify the cert authenticating a beacon block (SPC cert on a
     /// Normal block, pool-quorum cert on a Skip block — the handler
-    /// reads `block.cert()` to branch). Result returns via
-    /// [`ProtocolEvent::BeaconBlockVerified`] carrying the block back.
+    /// reads `block.cert()` to branch) **and** every
+    /// `Witness::Equivocation` carried in the block's committed
+    /// proposals. Result returns via [`ProtocolEvent::BeaconBlockVerified`]
+    /// carrying the block back; `valid` is the AND-reduction over the
+    /// cert check and every equivocation check.
     VerifyBeaconBlock {
-        /// Block whose cert is being verified. Carried back through
-        /// the result event so the coordinator doesn't have to stash
-        /// it separately.
+        /// Block whose cert + embedded equivocation witnesses are
+        /// being verified. Carried back through the result event so
+        /// the coordinator doesn't have to stash it separately.
         block: Arc<CertifiedBeaconBlock>,
         /// Signers paired with their pubkeys — committee for a Normal
         /// block, active pool for a Skip block. Positional ordering
         /// matches the cert's signer bitfield.
         signers: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+        /// Pubkeys for the validators referenced by embedded
+        /// `Witness::Equivocation` evidence. Empty when the block
+        /// carries no equivocations. Lookup-shape, order doesn't
+        /// matter.
+        equivocation_signers: Vec<(ValidatorId, Bls12381G1PublicKey)>,
     },
 
     /// Verify a single-signer [`SkipRequest`] BLS signature. Result

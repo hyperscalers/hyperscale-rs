@@ -27,7 +27,7 @@ use crate::pc::{
 };
 use crate::skip::verify_skip_request;
 use crate::spc::{sign_empty_view_msg, verify_cert, verify_empty_view_msg};
-use crate::verification::verify_certified;
+use crate::verification::{verify_block_equivocations, verify_certified};
 
 /// Dispatch a beacon-owned [`Action`] on the consensus pool. Panics on
 /// non-beacon variants — the node's owner-keyed dispatch is the gate.
@@ -192,8 +192,14 @@ where
                 "FetchShardWitnesses",
             );
         }
-        Action::VerifyBeaconBlock { block, signers } => {
-            let valid = verify_certified(&block, network, &signers);
+        Action::VerifyBeaconBlock {
+            block,
+            signers,
+            equivocation_signers,
+        } => {
+            let cert_ok = verify_certified(&block, network, &signers);
+            let valid =
+                cert_ok && verify_block_equivocations(&block, network, &equivocation_signers);
             ctx.notify_protocol(ProtocolEvent::BeaconBlockVerified { block, valid });
         }
         Action::VerifySkipRequest { request, signers } => {

@@ -725,22 +725,53 @@ impl BeaconCoordinator {
             );
             return Vec::new();
         };
-        self.dispatch_block_verification(block, signers)
+        let equivocation_signers = self.equivocation_signers_for(&block);
+        self.dispatch_block_verification(block, signers, equivocation_signers)
     }
 
-    /// Dispatch a block's cert verification. Returns a single
-    /// [`Action::VerifyBeaconBlock`] on a fresh slot, or an empty
+    /// Pubkey lookup covering every validator referenced by an
+    /// `Witness::Equivocation` in `block`'s committed proposals.
+    /// Returns an empty `Vec` when the block carries no equivocations —
+    /// the common path. Validators referenced by evidence but missing
+    /// from `state.validators` are silently elided; the verifier rejects
+    /// such evidence at admission via the pubkey-lookup miss.
+    fn equivocation_signers_for(
+        &self,
+        block: &CertifiedBeaconBlock,
+    ) -> Vec<(ValidatorId, Bls12381G1PublicKey)> {
+        let mut signers: Vec<(ValidatorId, Bls12381G1PublicKey)> = Vec::new();
+        let mut seen: std::collections::BTreeSet<ValidatorId> = std::collections::BTreeSet::new();
+        for (_, proposal) in block.block().committed_proposals() {
+            for witness in proposal.witnesses().iter() {
+                if let Witness::Equivocation(ev) = witness
+                    && seen.insert(ev.validator)
+                    && let Some(rec) = self.state.validators.get(&ev.validator)
+                {
+                    signers.push((ev.validator, rec.pubkey));
+                }
+            }
+        }
+        signers
+    }
+
+    /// Dispatch a block's cert + equivocation verification. Returns a
+    /// single [`Action::VerifyBeaconBlock`] on a fresh slot, or an empty
     /// vector when the slot is already in flight or already verified —
     /// the in-flight slot's result drives admission for any duplicate.
     fn dispatch_block_verification(
         &mut self,
         block: Arc<CertifiedBeaconBlock>,
         signers: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+        equivocation_signers: Vec<(ValidatorId, Bls12381G1PublicKey)>,
     ) -> Vec<Action> {
         if !self.verification.mark_block_in_flight(block.block_hash()) {
             return Vec::new();
         }
-        vec![Action::VerifyBeaconBlock { block, signers }]
+        vec![Action::VerifyBeaconBlock {
+            block,
+            signers,
+            equivocation_signers,
+        }]
     }
 
     /// A peer's [`SkipRequest`] arrived via gossip. Validate the
@@ -826,7 +857,9 @@ impl BeaconCoordinator {
         let block = BeaconBlock::skip(expected_epoch, anchor);
         let certified = CertifiedBeaconBlock::new_unchecked(block, BeaconCert::Skip(cert));
         let block_arc = Arc::new(certified);
-        self.dispatch_block_verification(block_arc, active_pool)
+        // Skip blocks carry no `committed_proposals`, so the equivocation
+        // lookup is necessarily empty.
+        self.dispatch_block_verification(block_arc, active_pool, Vec::new())
     }
 
     /// Build the skip block paired with `cert`, adopt it via the
@@ -1373,14 +1406,19 @@ mod tests {
     /// results back to the coordinator.
     fn complete_verifications(coord: &mut BeaconCoordinator, actions: Vec<Action>) -> Vec<Action> {
         use crate::skip::verify_skip_request;
-        use crate::verification::verify_certified;
+        use crate::verification::{verify_block_equivocations, verify_certified};
 
         let net = NetworkDefinition::simulator();
         let mut out = Vec::new();
         for action in actions {
             match action {
-                Action::VerifyBeaconBlock { block, signers } => {
-                    let valid = verify_certified(&block, &net, &signers);
+                Action::VerifyBeaconBlock {
+                    block,
+                    signers,
+                    equivocation_signers,
+                } => {
+                    let valid = verify_certified(&block, &net, &signers)
+                        && verify_block_equivocations(&block, &net, &equivocation_signers);
                     let post = coord.on_beacon_block_verified(block, valid);
                     out.extend(complete_verifications(coord, post));
                 }

@@ -4,9 +4,10 @@ use std::collections::BTreeSet;
 
 use hyperscale_types::{
     BeaconBlockHash, BeaconCert, Bls12381G1PublicKey, CertifiedBeaconBlock, Epoch, Hash,
-    NetworkDefinition, PcVoteRound, SpcView, ValidatorId, spc_context,
+    NetworkDefinition, PcVoteRound, SpcView, ValidatorId, Witness, spc_context,
 };
 
+use crate::pc::verify_vote_equivocation;
 use crate::skip::verify_skip_cert;
 use crate::spc::verify_block_cert;
 
@@ -29,6 +30,33 @@ pub fn verify_certified(
         BeaconCert::Skip(cert) => verify_skip_cert(cert, network, signers),
         BeaconCert::Genesis(_) => false,
     }
+}
+
+/// Verify every `Witness::Equivocation` carried in `block`'s committed
+/// proposals against the supplied `signers` lookup.
+///
+/// `signers` must cover every equivocating validator referenced by the
+/// block's witnesses — the coordinator filters `state.validators` down
+/// to the referenced subset before dispatch. Missing pubkeys reject the
+/// block at admission, matching the "fail closed" stance.
+///
+/// Returns `true` when the block carries no equivocations.
+#[must_use]
+pub fn verify_block_equivocations(
+    block: &CertifiedBeaconBlock,
+    network: &NetworkDefinition,
+    signers: &[(ValidatorId, Bls12381G1PublicKey)],
+) -> bool {
+    for (_, proposal) in block.block().committed_proposals() {
+        for witness in proposal.witnesses().iter() {
+            if let Witness::Equivocation(ev) = witness
+                && !verify_vote_equivocation(ev, network, signers)
+            {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// In-flight + verified slots over an arbitrary key.
