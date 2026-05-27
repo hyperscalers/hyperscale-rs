@@ -13,8 +13,8 @@ use hyperscale_types::{
     ExecutionCertificate, ExecutionVote, FinalizedWave, LinkedCertifiedBlock, PcQc3, PcVector,
     PcVoteMessage, Provisions, QcVerifyError, QuorumCertificate, ReadySignal, Round,
     RoutableTransaction, ShardGroupId, ShardWitness, SkipEpochCert, SkipRequest, SpcCert,
-    SpcEmptyViewMsg, SpcView, StoredReceipt, TxOutcome, ValidatorId, VerifiedQuorumCertificate,
-    VotePower, WaveId, WeightedTimestamp,
+    SpcEmptyViewMsg, SpcView, StoredReceipt, TxOutcome, ValidatorId, Verifiable, VerifiedBlockVote,
+    VerifiedQuorumCertificate, VotePower, WaveId, WeightedTimestamp,
 };
 
 /// How a node learned about the certifying QC that commits a given block.
@@ -117,8 +117,10 @@ pub enum ProtocolEvent {
 
     /// Received a vote on a block header.
     BlockVoteReceived {
-        /// Block vote received from a peer.
-        vote: BlockVote,
+        /// Block vote received from a peer. Wire bytes always land in
+        /// [`Verifiable::Unverified`]; local-dispatched delivery from a
+        /// colocated voter preserves [`Verifiable::Verified`].
+        vote: Verifiable<BlockVote, VerifiedBlockVote>,
     },
 
     /// Received a validator's "ready on shard" signal.
@@ -187,7 +189,7 @@ pub enum ProtocolEvent {
         /// The verified QC if quorum was reached, or `None` if not.
         qc: Option<VerifiedQuorumCertificate>,
         /// Verified votes, returned for accumulation when no QC was built.
-        verified_votes: Vec<(usize, BlockVote, VotePower)>,
+        verified_votes: Vec<(usize, VerifiedBlockVote, VotePower)>,
     },
 
     /// QC signature verification completed. The payload carries the

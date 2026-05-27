@@ -99,13 +99,17 @@ pub use sbor_codec::{
 pub use shard::certified::{
     CertifiedBlock, CertifiedBlockHashMismatch, LinkageError, LinkedCertifiedBlock,
 };
-pub use shard::committed_header::{CommittedBlockHeader, CommittedHeaderVerifyError};
-pub use shard::header::BlockHeader;
-pub use shard::inventory::{ElidedCertifiedBlock, Inventory, RehydrateError, RehydrationMiss};
+pub use shard::committed_header::{
+    CommittedBlockHeader, CommittedHeaderVerifyError, VerifiedCommittedBlockHeader,
+};
+pub use shard::header::{BlockHeader, BlockHeaderVerifyError, VerifiedBlockHeader};
+pub use shard::inventory::{
+    ElidedCertifiedBlock, Inventory, RehydrateError, RehydrationMiss, VerifiedElidedCertifiedBlock,
+};
 pub use shard::limits::{
     MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK, MAX_TX_IN_FLIGHT, MAX_TXS_PER_BLOCK,
 };
-pub use shard::manifest::{BlockManifest, BlockMetadata};
+pub use shard::manifest::{BlockManifest, BlockMetadata, VerifiedBlockMetadata};
 pub use shard::quorum_certificate::{
     QcContext, QcVerifyError, QuorumCertificate, VerifiedQuorumCertificate,
 };
@@ -113,8 +117,11 @@ pub use shard::roots::{
     compute_certificate_root, compute_local_receipt_root, compute_provision_root,
     compute_transaction_root,
 };
-pub use shard::vote::BlockVote;
-pub use shard::{Block, SharedCertificates, SharedProvisions, SharedTransactions};
+pub use shard::vote::{BlockVote, BlockVoteContext, BlockVoteVerifyError, VerifiedBlockVote};
+pub use shard::{
+    Block, SharedCertificates, SharedProvisions, SharedTransactions, VerifiedBlock,
+    VerifiedBlockAssembleError,
+};
 pub use signing::{
     DOMAIN_BLOCK_HEADER, DOMAIN_BLOCK_VOTE, DOMAIN_COMMITTED_BLOCK_HEADER, DOMAIN_EXEC_CERT_BATCH,
     DOMAIN_EXEC_VOTE, DOMAIN_EXEC_VOTE_BATCH, DOMAIN_PC_EMPTY_VIEW, DOMAIN_PC_VOTE1,
@@ -140,7 +147,10 @@ pub use transaction::constructors::{
 };
 pub use transaction::limits::{MAX_DECLARED_NODES_PER_TX, MAX_TX_BYTES_LEN};
 pub use transaction::notarize::{sign_and_notarize, sign_and_notarize_with_options};
-pub use transaction::routable::RoutableTransaction;
+pub use transaction::routable::{
+    RoutableTransaction, RoutableTransactionContext, RoutableTransactionVerifyError,
+    VerifiedRoutableTransaction,
+};
 pub use transaction::status::{
     TransactionDecision, TransactionError, TransactionStatus, TransactionStatusParseError,
 };

@@ -5,9 +5,9 @@ use sbor::prelude::*;
 
 use crate::{
     BeaconWitnessLeafCount, Block, BlockHash, BlockHeader, BlockHeight, BoundedVec,
-    MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK, MAX_READY_SIGNALS_PER_BLOCK,
-    MAX_TXS_PER_BLOCK, ProvisionHash, QuorumCertificate, ReadySignal, TxHash, Verifiable,
-    VerifiedQuorumCertificate, WaveId,
+    CommittedHeaderVerifyError, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK,
+    MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash, QuorumCertificate, ReadySignal,
+    TxHash, Verifiable, VerifiedBlockHeader, VerifiedQuorumCertificate, WaveId,
 };
 
 /// Hash-level description of a block's contents (transactions and certificates).
@@ -216,6 +216,94 @@ impl BlockMetadata {
     #[must_use]
     pub const fn transaction_count(&self) -> usize {
         self.manifest.transaction_count()
+    }
+}
+
+/// Verified [`BlockMetadata`].
+///
+/// Construction asserts:
+/// 1. The header passes [`<BlockHeader as crate::Verify>`](crate::Verify)
+///    (so its `parent_qc` is verified).
+/// 2. The QC pairing this metadata was verified against the
+///    source-shard committee.
+/// 3. `qc.block_hash == header.hash()`.
+/// 4. `manifest` is the canonical hash projection of the block's
+///    contents.
+///
+/// Construction goes through [`Self::assemble`] (composite path that
+/// runs the linkage check) or [`Self::new_unchecked`] (audit point).
+#[repr(transparent)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedBlockMetadata(BlockMetadata);
+
+impl VerifiedBlockMetadata {
+    /// Composite assembly. Pairs a verified header with a verified QC
+    /// and a [`BlockManifest`], confirming the QC↔header linkage.
+    ///
+    /// `manifest` and `beacon_witness_leaf_count_at_block_end` are
+    /// pure data projections of the block; they're not verified by
+    /// this constructor — callers supply them from a verified context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::CommittedHeaderVerifyError::LinkageMismatch`]
+    /// when `qc.block_hash() != header.hash()`.
+    pub fn assemble(
+        header: VerifiedBlockHeader,
+        manifest: BlockManifest,
+        qc: VerifiedQuorumCertificate,
+        beacon_witness_leaf_count_at_block_end: BeaconWitnessLeafCount,
+    ) -> Result<Self, CommittedHeaderVerifyError> {
+        if qc.block_hash() != header.as_ref().hash() {
+            return Err(CommittedHeaderVerifyError::LinkageMismatch);
+        }
+        Ok(Self(BlockMetadata {
+            header: header.into_inner(),
+            manifest,
+            qc: Verifiable::Verified(qc),
+            beacon_witness_leaf_count_at_block_end,
+        }))
+    }
+
+    /// Audit-point constructor. Skips the predicate.
+    ///
+    /// Permitted use sites: storage-recovery (metadata was verified
+    /// before persistence). Every call site carries a `// SAFETY:`
+    /// comment naming the trust source.
+    #[must_use]
+    pub const fn new_unchecked(inner: BlockMetadata) -> Self {
+        Self(inner)
+    }
+
+    /// Borrow the underlying [`BlockMetadata`].
+    #[must_use]
+    pub const fn as_metadata(&self) -> &BlockMetadata {
+        &self.0
+    }
+
+    /// Consume the wrapper and return the raw [`BlockMetadata`].
+    #[must_use]
+    pub fn into_inner(self) -> BlockMetadata {
+        self.0
+    }
+}
+
+impl AsRef<BlockMetadata> for VerifiedBlockMetadata {
+    fn as_ref(&self) -> &BlockMetadata {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for VerifiedBlockMetadata {
+    type Target = BlockMetadata;
+    fn deref(&self) -> &BlockMetadata {
+        &self.0
+    }
+}
+
+impl From<VerifiedBlockMetadata> for BlockMetadata {
+    fn from(verified: VerifiedBlockMetadata) -> Self {
+        verified.0
     }
 }
 

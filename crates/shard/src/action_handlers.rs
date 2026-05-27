@@ -19,8 +19,8 @@ use hyperscale_types::{
     LocalReceiptRoot, NetworkDefinition, ProposerTimestamp, ProvisionHash, ProvisionTxRoot,
     Provisions, ProvisionsRoot, QcContext, QuorumCertificate, ReadySignal, Round,
     RoutableTransaction, ShardGroupId, SignerBitfield, StateRoot, StoredReceipt, TopologySnapshot,
-    TransactionRoot, ValidatorId, VerifiedQuorumCertificate, Verify, VotePower, WeightedTimestamp,
-    batch_verify_bls_same_message, block_header_message, block_vote_message,
+    TransactionRoot, ValidatorId, VerifiedBlockVote, VerifiedQuorumCertificate, Verify, VotePower,
+    WeightedTimestamp, batch_verify_bls_same_message, block_header_message, block_vote_message,
     committed_block_header_message, compute_certificate_root, compute_local_receipt_root,
     compute_provision_root, compute_provision_tx_roots, compute_transaction_root, compute_waves,
     verify_bls12381_v1,
@@ -42,7 +42,7 @@ pub struct QcVerificationResult {
     pub qc: Option<VerifiedQuorumCertificate>,
     /// Verified votes returned when no QC was formed (for accumulation across rounds).
     /// Empty when a QC is successfully built.
-    pub verified_votes: Vec<(usize, BlockVote, VotePower)>,
+    pub verified_votes: Vec<(usize, VerifiedBlockVote, VotePower)>,
 }
 
 /// Verify block votes and build a quorum certificate if quorum is reached.
@@ -66,7 +66,7 @@ pub fn verify_and_build_qc(
     parent_block_hash: BlockHash,
     parent_weighted_timestamp: WeightedTimestamp,
     votes_to_verify: Vec<(usize, BlockVote, Bls12381G1PublicKey, VotePower)>,
-    already_verified: Vec<(usize, BlockVote, VotePower)>,
+    already_verified: Vec<(usize, VerifiedBlockVote, VotePower)>,
     total_voting_power: VotePower,
 ) -> QcVerificationResult {
     let signing_message = block_vote_message(network, shard_group_id, height, round, &block_hash);
@@ -115,8 +115,8 @@ pub fn verify_vote_batch(
     block_hash: BlockHash,
     signing_message: &[u8],
     votes_to_verify: Vec<(usize, BlockVote, Bls12381G1PublicKey, VotePower)>,
-    already_verified: Vec<(usize, BlockVote, VotePower)>,
-) -> Vec<(usize, BlockVote, VotePower)> {
+    already_verified: Vec<(usize, VerifiedBlockVote, VotePower)>,
+) -> Vec<(usize, VerifiedBlockVote, VotePower)> {
     let mut all_verified = already_verified;
 
     if votes_to_verify.is_empty() {
@@ -132,7 +132,11 @@ pub fn verify_vote_batch(
 
     if batch_verify_bls_same_message(signing_message, &signatures, &public_keys) {
         for (idx, vote, _, power) in votes_to_verify {
-            all_verified.push((idx, vote, power));
+            // SAFETY: same-message BLS batch verify just confirmed every
+            // signature in this batch against its committee public key over
+            // the canonical `block_vote_message` for `block_hash`, which is
+            // exactly the `BlockVote::verify` predicate.
+            all_verified.push((idx, VerifiedBlockVote::new_unchecked(vote), power));
         }
         return all_verified;
     }
@@ -145,7 +149,9 @@ pub fn verify_vote_batch(
 
     for (idx, vote, pk, power) in votes_to_verify {
         if verify_bls12381_v1(signing_message, &pk, &vote.signature()) {
-            all_verified.push((idx, vote, power));
+            // SAFETY: the per-vote BLS check on the line above re-runs the
+            // exact `BlockVote::verify` predicate against the voter's pubkey.
+            all_verified.push((idx, VerifiedBlockVote::new_unchecked(vote), power));
         } else {
             tracing::warn!(
                 voter = ?vote.voter(),
@@ -176,7 +182,7 @@ pub fn build_qc_from_verified(
     round: Round,
     parent_block_hash: BlockHash,
     parent_weighted_timestamp: WeightedTimestamp,
-    verified_votes: &[(usize, BlockVote, VotePower)],
+    verified_votes: &[(usize, VerifiedBlockVote, VotePower)],
 ) -> Option<VerifiedQuorumCertificate> {
     let mut sorted: Vec<_> = verified_votes.to_vec();
     sorted.sort_by_key(|(idx, _, _)| *idx);
@@ -961,10 +967,15 @@ where
                 ctx.signing_key,
                 timestamp,
             );
-            let gossip = BlockVoteNotification { vote: vote.clone() };
+            // SAFETY: we just signed `vote` with our own key, so the
+            // BlockVote::verify predicate holds by construction.
+            let verified = VerifiedBlockVote::new_unchecked(vote);
+            let gossip = BlockVoteNotification::new(verified.clone());
             ctx.network.notify(&next_proposers, &gossip);
             // Feed our own signed vote back for local VoteSet tracking.
-            ctx.notify_protocol(ProtocolEvent::BlockVoteReceived { vote });
+            ctx.notify_protocol(ProtocolEvent::BlockVoteReceived {
+                vote: verified.into(),
+            });
         }
 
         Action::BroadcastCommittedBlockHeader { committed_header } => {
@@ -1044,7 +1055,11 @@ mod tests {
             Round::INITIAL,
             1000,
         );
-        let already = vec![(0usize, v, VotePower::new(1))];
+        let already = vec![(
+            0usize,
+            VerifiedBlockVote::new_unchecked(v),
+            VotePower::new(1),
+        )];
         let out = verify_vote_batch(block_hash, b"msg", Vec::new(), already.clone());
         assert_eq!(out.len(), already.len());
     }
@@ -1147,7 +1162,7 @@ mod tests {
         let verified: Vec<_> = (0..3)
             .map(|i| {
                 let vote = make_vote(&keys, i, block_hash, height, round, 1000);
-                (i, vote, VotePower::new(1))
+                (i, VerifiedBlockVote::new_unchecked(vote), VotePower::new(1))
             })
             .collect();
 
@@ -1199,7 +1214,7 @@ mod tests {
                     Round::INITIAL,
                     1000,
                 );
-                (i, vote, VotePower::new(1))
+                (i, VerifiedBlockVote::new_unchecked(vote), VotePower::new(1))
             })
             .collect();
 
@@ -1225,39 +1240,39 @@ mod tests {
         // Votes with different timestamps and powers; weighted mean = (1000*1 + 2000*2 + 3000*3) / 6 = 14000/6 ≈ 2333.
         let verified = vec![
             (
-                0,
-                make_vote(
+                0usize,
+                VerifiedBlockVote::new_unchecked(make_vote(
                     &keys,
                     0,
                     block_hash,
                     BlockHeight::new(1),
                     Round::INITIAL,
                     1000,
-                ),
+                )),
                 VotePower::new(1),
             ),
             (
                 1,
-                make_vote(
+                VerifiedBlockVote::new_unchecked(make_vote(
                     &keys,
                     1,
                     block_hash,
                     BlockHeight::new(1),
                     Round::INITIAL,
                     2000,
-                ),
+                )),
                 VotePower::new(2),
             ),
             (
                 2,
-                make_vote(
+                VerifiedBlockVote::new_unchecked(make_vote(
                     &keys,
                     2,
                     block_hash,
                     BlockHeight::new(1),
                     Round::INITIAL,
                     3000,
-                ),
+                )),
                 VotePower::new(3),
             ),
         ];
@@ -1286,39 +1301,39 @@ mod tests {
         // of (2000 + 2000 + 3000) / 3 = 2333, monotonically >= parent.
         let verified = vec![
             (
-                0,
-                make_vote(
+                0usize,
+                VerifiedBlockVote::new_unchecked(make_vote(
                     &keys,
                     0,
                     block_hash,
                     BlockHeight::new(1),
                     Round::INITIAL,
                     500,
-                ),
+                )),
                 VotePower::new(1),
             ),
             (
                 1,
-                make_vote(
+                VerifiedBlockVote::new_unchecked(make_vote(
                     &keys,
                     1,
                     block_hash,
                     BlockHeight::new(1),
                     Round::INITIAL,
                     800,
-                ),
+                )),
                 VotePower::new(1),
             ),
             (
                 2,
-                make_vote(
+                VerifiedBlockVote::new_unchecked(make_vote(
                     &keys,
                     2,
                     block_hash,
                     BlockHeight::new(1),
                     Round::INITIAL,
                     3000,
-                ),
+                )),
                 VotePower::new(1),
             ),
         ];

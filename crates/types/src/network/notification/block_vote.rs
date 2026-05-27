@@ -2,7 +2,7 @@
 
 use sbor::prelude::BasicSbor;
 
-use crate::{BlockVote, MessageClass, NetworkMessage};
+use crate::{BlockVote, MessageClass, NetworkMessage, Verifiable, VerifiedBlockVote};
 
 /// Vote on a block proposal. 2f+1 matching votes create a `QuorumCertificate`.
 ///
@@ -10,26 +10,28 @@ use crate::{BlockVote, MessageClass, NetworkMessage};
 /// contains the voter identity and BLS signature, making it self-authenticating.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct BlockVoteNotification {
-    /// The block vote.
-    pub vote: BlockVote,
+    /// The block vote — wire bytes always land in [`Verifiable::Unverified`];
+    /// local-dispatched sends from a colocated voter preserve
+    /// [`Verifiable::Verified`].
+    pub vote: Verifiable<BlockVote, VerifiedBlockVote>,
 }
 
 impl BlockVoteNotification {
     /// Create a new block vote notification message.
     #[must_use]
-    pub const fn new(vote: BlockVote) -> Self {
-        Self { vote }
+    pub fn new(vote: impl Into<Verifiable<BlockVote, VerifiedBlockVote>>) -> Self {
+        Self { vote: vote.into() }
     }
 
-    /// Get the inner block vote.
+    /// Get the inner block vote (raw view, regardless of verification state).
     #[must_use]
-    pub const fn vote(&self) -> &BlockVote {
-        &self.vote
+    pub fn vote(&self) -> &BlockVote {
+        self.vote.as_unverified()
     }
 
-    /// Consume and return the inner block vote.
+    /// Consume and return the inner block vote wrapper.
     #[must_use]
-    pub const fn into_vote(self) -> BlockVote {
+    pub const fn into_vote(self) -> Verifiable<BlockVote, VerifiedBlockVote> {
         self.vote
     }
 }
@@ -83,6 +85,6 @@ mod tests {
 
         let gossip = BlockVoteNotification::new(vote.clone());
         let extracted = gossip.into_vote();
-        assert_eq!(extracted, vote);
+        assert_eq!(extracted.as_unverified(), &vote);
     }
 }

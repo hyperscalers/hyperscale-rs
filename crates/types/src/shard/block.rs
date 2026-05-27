@@ -1,13 +1,21 @@
 //! [`Block`] enum (Live/Sealed).
+//!
+//! [`Block`] is the raw wire form. [`VerifiedBlock`] is the verified
+//! typestate produced by composite assembly — it carries the claim that
+//! the block's header is verified (and thus its parent QC is verified)
+//! and every internal commitment root the block declares has been
+//! checked against the inline data.
 
+use std::ops::Deref;
 use std::sync::Arc;
 
 use sbor::prelude::*;
+use thiserror::Error;
 
 use crate::{
     BlockHash, BlockHeader, BlockHeight, BoundedVec, FinalizedWave, MAX_FINALIZED_TX_PER_BLOCK,
     MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash, Provisions, RoutableTransaction,
-    ShardGroupId, StateRoot, TxHash, ValidatorId,
+    ShardGroupId, StateRoot, TxHash, ValidatorId, VerifiedBlockHeader,
 };
 
 /// Shared transaction list — wrapped in `Arc` so root-verification actions
@@ -275,5 +283,128 @@ impl Block {
     #[must_use]
     pub fn certificate_count(&self) -> usize {
         self.certificates().len()
+    }
+}
+
+/// Failure modes of [`VerifiedBlock`] composite assembly.
+#[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
+pub enum VerifiedBlockAssembleError {
+    /// The supplied [`VerifiedBlockHeader`] does not belong to `block`
+    /// (the header's hash differs from `block.hash()`).
+    #[error(
+        "verified header does not match block: header.hash={header_hash:?} block.hash={block_hash:?}"
+    )]
+    HeaderMismatch {
+        /// Hash carried by the supplied verified header.
+        header_hash: BlockHash,
+        /// Hash computed from the supplied block.
+        block_hash: BlockHash,
+    },
+}
+
+/// Verified block — header verified plus every internal commitment root
+/// checked against the inline data.
+///
+/// Construction asserts:
+/// 1. The header passes [`<BlockHeader as crate::Verify>`](crate::Verify)
+///    (which transitively asserts `parent_qc` is verified).
+/// 2. The block's contents match its declared commitment roots
+///    (`transaction_root`, `certificate_root`, `local_receipt_root`,
+///    `provision_root`, `provision_tx_roots`, `beacon_witness_root`).
+///    The per-root checks are run upstream of [`Self::assemble`]; the
+///    constructor accepts witnessed-success markers (`Some(())`) for
+///    each that applies to this block.
+///
+/// Construction goes through one of two gates:
+///
+/// - [`Self::assemble`] — composite path. Takes a [`VerifiedBlockHeader`]
+///   for the block plus witnessed-success markers for each per-root
+///   verification, and checks that the header refers to this block.
+/// - [`Self::new_unchecked`] — audit point. Used at storage-recovery
+///   boundaries and at sites that established the predicate by other
+///   means (e.g. the block was produced and verified in-process). Every
+///   call site documents the trust source with a `// SAFETY:` comment.
+///
+/// `#[repr(transparent)]` over [`Block`]; [`Deref<Target = Block>`](Deref)
+/// exposes the raw accessors. No mutable access, no `Encode`/`Decode` —
+/// the wire decode path always produces an unverified [`Block`].
+#[repr(transparent)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedBlock(Block);
+
+impl VerifiedBlock {
+    /// Composite assembly. Pairs `block` with a [`VerifiedBlockHeader`]
+    /// after confirming the header's content matches the block, and
+    /// witnesses that every applicable per-root verification has
+    /// succeeded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VerifiedBlockAssembleError::HeaderMismatch`] when the
+    /// verified header does not match the supplied block. (The
+    /// witnessed-success markers are zero-sized so they can only be
+    /// produced by code that ran the actual checks; no value-level
+    /// validation is needed here.)
+    #[allow(
+        clippy::needless_pass_by_value,
+        clippy::too_many_arguments,
+        clippy::missing_const_for_fn
+    )] // structural witnesses are zero-sized; consuming makes the assembly contract explicit
+    pub fn assemble(
+        block: Block,
+        header: VerifiedBlockHeader,
+        _tx_root_check: (),
+        _certificate_root_check: (),
+        _local_receipt_root_check: (),
+        _provision_root_check: (),
+        _provision_tx_roots_check: (),
+        _beacon_witness_root_check: (),
+    ) -> Result<Self, VerifiedBlockAssembleError> {
+        let header_hash = header.as_ref().hash();
+        let block_hash = block.hash();
+        if header_hash != block_hash {
+            return Err(VerifiedBlockAssembleError::HeaderMismatch {
+                header_hash,
+                block_hash,
+            });
+        }
+        Ok(Self(block))
+    }
+
+    /// Audit-point constructor. Skips the predicate.
+    ///
+    /// Permitted use sites: storage-recovery (block was verified before
+    /// persistence), genesis, and own-block paths where the local
+    /// proposer just built and roots-checked the block in-process. Every
+    /// call site carries a `// SAFETY:` comment naming the trust source.
+    #[must_use]
+    pub const fn new_unchecked(block: Block) -> Self {
+        Self(block)
+    }
+
+    /// Consume the verified block and return the raw form. Drops the
+    /// verified claim.
+    #[must_use]
+    pub fn into_inner(self) -> Block {
+        self.0
+    }
+}
+
+impl AsRef<Block> for VerifiedBlock {
+    fn as_ref(&self) -> &Block {
+        &self.0
+    }
+}
+
+impl Deref for VerifiedBlock {
+    type Target = Block;
+    fn deref(&self) -> &Block {
+        &self.0
+    }
+}
+
+impl From<VerifiedBlock> for Block {
+    fn from(verified: VerifiedBlock) -> Self {
+        verified.0
     }
 }

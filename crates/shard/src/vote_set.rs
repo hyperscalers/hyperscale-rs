@@ -12,8 +12,8 @@
 #[cfg(test)]
 use hyperscale_types::{BeaconWitnessLeafCount, BeaconWitnessRoot};
 use hyperscale_types::{
-    BlockHash, BlockHeader, BlockHeight, BlockVote, Bls12381G1PublicKey, Round, VotePower,
-    WeightedTimestamp,
+    BlockHash, BlockHeader, BlockHeight, BlockVote, Bls12381G1PublicKey, Round, VerifiedBlockVote,
+    VotePower, WeightedTimestamp,
 };
 
 /// Votes for a specific block.
@@ -46,7 +46,7 @@ pub struct VoteSet {
     // ═══════════════════════════════════════════════════════════════════════
     /// Verified votes with their committee indices.
     /// Each tuple is (`committee_index`, vote, `voting_power`).
-    verified_votes: Vec<(usize, BlockVote, VotePower)>,
+    verified_votes: Vec<(usize, VerifiedBlockVote, VotePower)>,
 
     /// Total voting power from verified votes.
     verified_power: VotePower,
@@ -228,7 +228,7 @@ impl VoteSet {
     ///
     /// These are votes that were added via `add_verified_vote` (e.g., our own vote)
     /// and need to be included in the QC along with newly verified votes.
-    pub fn get_verified_votes(&self) -> Vec<(usize, BlockVote, VotePower)> {
+    pub fn get_verified_votes(&self) -> Vec<(usize, VerifiedBlockVote, VotePower)> {
         self.verified_votes.clone()
     }
 
@@ -265,7 +265,10 @@ impl VoteSet {
     /// Called when verification completes but quorum wasn't reached.
     ///
     /// Adds the verified votes to the verified set and clears pending flag.
-    pub fn on_votes_verified(&mut self, verified_votes: Vec<(usize, BlockVote, VotePower)>) {
+    pub fn on_votes_verified(
+        &mut self,
+        verified_votes: Vec<(usize, VerifiedBlockVote, VotePower)>,
+    ) {
         self.pending_verification = false;
 
         let floor_ms = self
@@ -296,7 +299,7 @@ impl VoteSet {
     pub fn add_verified_vote(
         &mut self,
         committee_index: usize,
-        vote: BlockVote,
+        vote: VerifiedBlockVote,
         voting_power: VotePower,
     ) -> bool {
         // Reject malformed index: see `buffer_unverified_vote` for rationale.
@@ -541,7 +544,11 @@ mod tests {
         // Add verified votes directly (e.g., own votes)
         for i in 0..3 {
             let vote = make_vote(&keys, i, block_hash, BlockHeight::new(1));
-            assert!(vote_set.add_verified_vote(i, vote, VotePower::new(1)));
+            assert!(vote_set.add_verified_vote(
+                i,
+                VerifiedBlockVote::new_unchecked(vote),
+                VotePower::new(1)
+            ));
         }
 
         assert_eq!(vote_set.verified_power(), VotePower::new(3));

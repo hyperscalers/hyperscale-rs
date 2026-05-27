@@ -22,7 +22,10 @@ pub mod quorum_certificate;
 pub mod roots;
 pub mod vote;
 
-pub use block::{Block, SharedCertificates, SharedProvisions, SharedTransactions};
+pub use block::{
+    Block, SharedCertificates, SharedProvisions, SharedTransactions, VerifiedBlock,
+    VerifiedBlockAssembleError,
+};
 
 #[cfg(test)]
 mod tests {
