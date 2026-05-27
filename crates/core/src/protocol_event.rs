@@ -46,31 +46,6 @@ impl CommitSource {
     }
 }
 
-/// Which block root verification was dispatched.
-///
-/// Used by the verification pipeline's in-flight / verified-set bookkeeping
-/// to track per-root state across the action dispatch. The result events
-/// (`TransactionRootVerified`, `CertificateRootVerified`, …) are one-to-one
-/// with these variants.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum VerificationKind {
-    /// State root computed by replaying the block's database updates against the JMT.
-    StateRoot,
-    /// Merkle root over the block's transactions plus per-tx validity-window check.
-    TransactionRoot,
-    /// Merkle root over included wave certificates' receipt hashes.
-    CertificateRoot,
-    /// Merkle root over the block's local receipts.
-    LocalReceiptRoot,
-    /// Merkle root over the block's provision-batch hashes.
-    ProvisionRoot,
-    /// Per-target-shard provision-tx merkle roots map.
-    ProvisionTxRoots,
-    /// Merkle root over the per-shard beacon-witness accumulator after this
-    /// block's appended leaves.
-    BeaconWitnessRoot,
-}
-
 /// Events that the state machine processes.
 ///
 /// These are the typed protocol events that `NodeStateMachine::handle()`

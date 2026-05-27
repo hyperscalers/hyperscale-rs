@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use hyperscale_core::{Action, VerificationKind};
+use hyperscale_core::Action;
 #[cfg(test)]
 use hyperscale_types::{BeaconWitnessLeafCount, BeaconWitnessRoot};
 use hyperscale_types::{
@@ -24,6 +24,30 @@ use tracing::{debug, trace, warn};
 use crate::beacon_witnesses::{BeaconWitnessAccumulator, prospective_parent_witness_leaves};
 use crate::chain_view::ChainView;
 use crate::pending::{PendingBlock, PendingBlocks};
+
+/// Discriminant for the verification pipeline's per-root bookkeeping
+/// (in-flight set, verified set, parametric helpers). The corresponding
+/// `ProtocolEvent::*Verified` variants are the per-kind result events;
+/// the coordinator's per-kind public methods thread the matching kind
+/// here for the shared completion logic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VerificationKind {
+    /// State root computed by replaying the block's database updates against the JMT.
+    StateRoot,
+    /// Merkle root over the block's transactions plus per-tx validity-window check.
+    TransactionRoot,
+    /// Merkle root over included wave certificates' receipt hashes.
+    CertificateRoot,
+    /// Merkle root over the block's local receipts.
+    LocalReceiptRoot,
+    /// Merkle root over the block's provision-batch hashes.
+    ProvisionRoot,
+    /// Per-target-shard provision-tx merkle roots map.
+    ProvisionTxRoots,
+    /// Merkle root over the per-shard beacon-witness accumulator after this
+    /// block's appended leaves.
+    BeaconWitnessRoot,
+}
 
 /// Block header pending QC signature verification.
 ///

@@ -79,7 +79,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_core::VerificationKind;
 use hyperscale_storage::{BeaconWitnessCommit, RecoveredState};
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, CertifiedBlock,
@@ -107,7 +106,9 @@ use crate::proposal::{
 };
 use crate::ready_signal_pool::{MIN_READY_SIGNAL_DWELL, ReadySignalPool};
 use crate::validation::{qc_has_local_quorum_power, validate_block_for_vote, validate_header};
-use crate::verification::{InFlightCheck, ReadyStateRootVerification, VerificationPipeline};
+use crate::verification::{
+    InFlightCheck, ReadyStateRootVerification, VerificationKind, VerificationPipeline,
+};
 use crate::view_change::ViewChangeController;
 use crate::vote_keeper::{LockDecision, VoteKeeper};
 
@@ -1792,12 +1793,116 @@ impl ShardCoordinator {
     /// Called when the runner completes `Action::VerifyStateRoot`. If the state root
     /// Handle a block root verification result (unified handler).
     ///
-    /// Called when any of the 5 verification actions complete (state root,
-    /// transaction root, certificate root, local receipt root, conflict proofs).
-    /// If invalid, the block is rejected. If valid and all other verifications are
-    /// also complete, proceeds to vote for the block.
+    /// Handle a completed transaction-root verification.
+    pub fn on_transaction_root_verified(
+        &mut self,
+        topology_snapshot: &TopologySnapshot,
+        block_hash: BlockHash,
+        valid: bool,
+    ) -> Vec<Action> {
+        self.on_root_verified_impl(
+            topology_snapshot,
+            VerificationKind::TransactionRoot,
+            block_hash,
+            valid,
+        )
+    }
+
+    /// Handle a completed certificate-root verification.
+    pub fn on_certificate_root_verified(
+        &mut self,
+        topology_snapshot: &TopologySnapshot,
+        block_hash: BlockHash,
+        valid: bool,
+    ) -> Vec<Action> {
+        self.on_root_verified_impl(
+            topology_snapshot,
+            VerificationKind::CertificateRoot,
+            block_hash,
+            valid,
+        )
+    }
+
+    /// Handle a completed local-receipt-root verification.
+    pub fn on_local_receipt_root_verified(
+        &mut self,
+        topology_snapshot: &TopologySnapshot,
+        block_hash: BlockHash,
+        valid: bool,
+    ) -> Vec<Action> {
+        self.on_root_verified_impl(
+            topology_snapshot,
+            VerificationKind::LocalReceiptRoot,
+            block_hash,
+            valid,
+        )
+    }
+
+    /// Handle a completed provisions-root verification.
+    pub fn on_provisions_root_verified(
+        &mut self,
+        topology_snapshot: &TopologySnapshot,
+        block_hash: BlockHash,
+        valid: bool,
+    ) -> Vec<Action> {
+        self.on_root_verified_impl(
+            topology_snapshot,
+            VerificationKind::ProvisionRoot,
+            block_hash,
+            valid,
+        )
+    }
+
+    /// Handle a completed provision-tx-roots verification.
+    pub fn on_provision_tx_roots_verified(
+        &mut self,
+        topology_snapshot: &TopologySnapshot,
+        block_hash: BlockHash,
+        valid: bool,
+    ) -> Vec<Action> {
+        self.on_root_verified_impl(
+            topology_snapshot,
+            VerificationKind::ProvisionTxRoots,
+            block_hash,
+            valid,
+        )
+    }
+
+    /// Handle a completed beacon-witness-root verification.
+    pub fn on_beacon_witness_root_verified(
+        &mut self,
+        topology_snapshot: &TopologySnapshot,
+        block_hash: BlockHash,
+        valid: bool,
+    ) -> Vec<Action> {
+        self.on_root_verified_impl(
+            topology_snapshot,
+            VerificationKind::BeaconWitnessRoot,
+            block_hash,
+            valid,
+        )
+    }
+
+    /// Handle a completed state-root verification.
+    pub fn on_state_root_verified(
+        &mut self,
+        topology_snapshot: &TopologySnapshot,
+        block_hash: BlockHash,
+        valid: bool,
+    ) -> Vec<Action> {
+        self.on_root_verified_impl(
+            topology_snapshot,
+            VerificationKind::StateRoot,
+            block_hash,
+            valid,
+        )
+    }
+
+    /// Shared completion logic for the per-kind root-verified handlers above.
+    /// If invalid, the block is rejected. If valid and every other root for
+    /// the block has been verified, proceeds to vote.
     #[instrument(skip(self), fields(block_hash = ?block_hash, ?kind, valid = valid))]
-    pub fn on_block_root_verified(
+    fn on_root_verified_impl(
         &mut self,
         topology_snapshot: &TopologySnapshot,
         kind: VerificationKind,
@@ -1826,7 +1931,6 @@ impl ShardCoordinator {
         }
 
         let Some(pending_block) = self.pending_blocks.get(block_hash) else {
-            // Block not in pending — likely already committed or evicted.
             debug!(
                 block_hash = ?block_hash,
                 ?kind,
@@ -3840,8 +3944,7 @@ mod tests {
         );
 
         // State root completes — beacon witness root still pending.
-        let after_state =
-            state.on_block_root_verified(&topology, VerificationKind::StateRoot, block_hash, true);
+        let after_state = state.on_state_root_verified(&topology, block_hash, true);
         assert!(
             !after_state
                 .iter()
@@ -3849,12 +3952,7 @@ mod tests {
         );
 
         // Beacon witness root completes — now we vote.
-        let after_roots = state.on_block_root_verified(
-            &topology,
-            VerificationKind::BeaconWitnessRoot,
-            block_hash,
-            true,
-        );
+        let after_roots = state.on_beacon_witness_root_verified(&topology, block_hash, true);
         assert!(
             after_roots
                 .iter()
