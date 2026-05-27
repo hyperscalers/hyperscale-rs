@@ -701,13 +701,14 @@ impl PcQc3 {
 
 // ── Verify-dispatch carrier ─────────────────────────────────────────────────
 
-/// A round-tagged PC vote, sized for the verify-dispatch round-trip.
+/// A round-tagged PC vote.
 ///
-/// The dispatcher needs to know which round to verify so it can pick the
-/// right `verify_vote*` helper. The variant carries the same vote types
-/// the gossip layer decodes from [`VpcMsgPayload`](crate::VpcMsgPayload),
-/// minus the SPC view (which is already a field on the carrying
-/// `Action::VerifyPcVote` / `ProtocolEvent::PcVoteVerified`).
+/// Carrier shape used across `Action::VerifyPcVote`,
+/// `ProtocolEvent::PcVote{Received,Verified}`, and the post-verify
+/// `SpcEvent::PcVoteVerified` route into the right view's `PcInstance`.
+/// The variant tags the round so the dispatcher picks the matching
+/// `verify_vote*` helper; the SPC view is carried alongside on the
+/// enclosing action/event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PcVoteMessage {
     /// Round-1 vote.

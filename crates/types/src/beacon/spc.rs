@@ -15,8 +15,8 @@
 use sbor::prelude::*;
 
 use crate::{
-    Bls12381G2Signature, GenesisConfigHash, Hash, PcQc3, PcVector, PcVote1, PcVote2, PcVote3,
-    PositionalBundle, SpcView, ValidatorId,
+    Bls12381G2Signature, GenesisConfigHash, Hash, PcQc3, PcVector, PositionalBundle, SpcView,
+    ValidatorId,
 };
 
 /// `(view, value, proof)` — a verifiable high triple.
@@ -153,57 +153,6 @@ impl SpcCert {
     #[must_use]
     pub fn encode_bytes(&self) -> Vec<u8> {
         basic_encode(self).expect("SpcCert SBOR encoding is infallible")
-    }
-}
-
-/// One inner-PC vote tagged with its SPC view.
-///
-/// The body of an SPC participant's inner-PC broadcast — the FSM
-/// routes the wrapped vote back into the right view's PC instance on
-/// receipt.
-#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
-pub enum VpcMsgPayload {
-    /// Round-1 vote.
-    Vote1 {
-        /// SPC view this vote belongs to.
-        view: SpcView,
-        /// The vote payload.
-        vote: PcVote1,
-    },
-    /// Round-2 vote.
-    Vote2 {
-        /// SPC view this vote belongs to.
-        view: SpcView,
-        /// The vote payload.
-        vote: Box<PcVote2>,
-    },
-    /// Round-3 vote.
-    Vote3 {
-        /// SPC view this vote belongs to.
-        view: SpcView,
-        /// The vote payload.
-        vote: Box<PcVote3>,
-    },
-}
-
-impl VpcMsgPayload {
-    /// SBOR-encoded canonical bytes for the wire.
-    ///
-    /// # Panics
-    ///
-    /// Never in practice: every field is `BasicSbor` and the enum is
-    /// closed, so encoding is total.
-    #[must_use]
-    pub fn encode_bytes(&self) -> Vec<u8> {
-        basic_encode(self).expect("VpcMsgPayload SBOR encoding is infallible")
-    }
-
-    /// Decode SBOR-encoded bytes. Returns `None` on malformed input —
-    /// callers (the beacon coordinator on a peer-message path) drop
-    /// with a trace rather than propagating an opaque error.
-    #[must_use]
-    pub fn decode(bytes: &[u8]) -> Option<Self> {
-        basic_decode(bytes).ok()
     }
 }
 

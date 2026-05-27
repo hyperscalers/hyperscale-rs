@@ -25,8 +25,8 @@ use hyperscale_types::{
     CertifiedBeaconBlock, EPOCH_DURATION, Epoch, GenesisConfigHash, Hash, LeafIndex,
     LocalTimestamp, MAX_WITNESSES_PER_PROPOSER, NetworkDefinition, PcQc3, PcValueElement, PcVector,
     PcVoteMessage, SKIP_TIMEOUT, ShardGroupId, ShardWitness, SkipEpochCert, SkipRequest, SpcCert,
-    SpcEmptyViewMsg, SpcView, TopologySnapshot, ValidatorId, VpcMsgPayload, WeightedTimestamp,
-    Witness, verify_merkle_inclusion,
+    SpcEmptyViewMsg, SpcView, TopologySnapshot, ValidatorId, WeightedTimestamp, Witness,
+    verify_merkle_inclusion,
 };
 use tracing::{trace, warn};
 
@@ -197,32 +197,18 @@ impl BeaconCoordinator {
         self.now.as_millis() >= expected_block_time.plus(SKIP_TIMEOUT).as_millis()
     }
 
-    /// A peer's PC vote arrived. SBOR-decode, validate non-crypto
-    /// (instance bootstrapped, not skipped, view present), and dispatch
-    /// the BLS check to the crypto pool. Admission happens in
-    /// [`Self::on_pc_vote_verified`] when the result lands.
-    pub fn on_pc_vote_received(&mut self, from: ValidatorId, payload: &[u8]) -> Vec<Action> {
-        let Some(msg) = VpcMsgPayload::decode(payload) else {
-            warn!(?from, "PC vote payload SBOR-decode failed");
+    /// A peer's PC vote arrived. Gate on instance/skip-quorum, mark the
+    /// slot in-flight, and dispatch the BLS check to the crypto pool.
+    /// Admission happens in [`Self::on_pc_vote_verified`] when the
+    /// result lands.
+    pub fn on_pc_vote_received(
+        &mut self,
+        from: ValidatorId,
+        view: SpcView,
+        vote: Box<PcVoteMessage>,
+    ) -> Vec<Action> {
+        let Some((epoch, committee)) = self.spc_admission_ctx(from, "PcVote") else {
             return Vec::new();
-        };
-        let Some(spc) = self.spc.as_ref() else {
-            trace!(?from, "PC vote received but no SPC instance bootstrapped");
-            return Vec::new();
-        };
-        if self.skip_quorum_at_tip() {
-            trace!(
-                ?from,
-                "PC vote received but skip-quorum reached at local tip — dropping",
-            );
-            return Vec::new();
-        }
-        let epoch = spc.epoch();
-        let committee: Vec<(ValidatorId, Bls12381G1PublicKey)> = spc.committee().to_vec();
-        let (view, vote) = match msg {
-            VpcMsgPayload::Vote1 { view, vote } => (view, PcVoteMessage::Vote1(vote)),
-            VpcMsgPayload::Vote2 { view, vote } => (view, PcVoteMessage::Vote2(vote)),
-            VpcMsgPayload::Vote3 { view, vote } => (view, PcVoteMessage::Vote3(vote)),
         };
         let signer = vote.validator();
         let round = vote.round();
@@ -233,7 +219,7 @@ impl BeaconCoordinator {
         vec![Action::VerifyPcVote {
             epoch,
             view,
-            vote: Box::new(vote),
+            vote,
             committee,
         }]
     }
@@ -1558,23 +1544,13 @@ mod tests {
     fn on_pc_vote_received_drops_when_no_spc_instance() {
         use hyperscale_types::{Bls12381G2Signature, PcVote1};
         let mut coord = fresh_coord();
-        let payload = VpcMsgPayload::Vote1 {
-            view: SpcView::new(1),
-            vote: PcVote1::new(
-                ValidatorId::new(1),
-                PcVector::empty(),
-                vec![Bls12381G2Signature([0u8; 96])],
-            ),
-        }
-        .encode_bytes();
-        let actions = coord.on_pc_vote_received(ValidatorId::new(1), &payload);
-        assert!(actions.is_empty());
-    }
-
-    #[test]
-    fn on_pc_vote_received_drops_on_malformed_payload() {
-        let mut coord = fresh_coord();
-        let actions = coord.on_pc_vote_received(ValidatorId::new(1), &[0xFF; 8]);
+        let vote = PcVoteMessage::Vote1(PcVote1::new(
+            ValidatorId::new(1),
+            PcVector::empty(),
+            vec![Bls12381G2Signature([0u8; 96])],
+        ));
+        let actions =
+            coord.on_pc_vote_received(ValidatorId::new(1), SpcView::new(1), Box::new(vote));
         assert!(actions.is_empty());
     }
 

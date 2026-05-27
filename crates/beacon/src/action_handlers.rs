@@ -17,8 +17,8 @@ use hyperscale_types::network::notification::{
     SpcEmptyViewMsgNotification, SpcNewCommitNotification, SpcNewViewNotification,
 };
 use hyperscale_types::{
-    BeaconProposal, PcVoteMessage, SpcHighTriple, SpcProposalObject, VpcMsgPayload, pc_context,
-    spc_context, vrf_sign,
+    BeaconProposal, PcVoteMessage, SpcHighTriple, SpcProposalObject, pc_context, spc_context,
+    vrf_sign,
 };
 use tracing::warn;
 
@@ -50,11 +50,10 @@ where
             let vote = sign_vote1(ctx.signing_key, me, network, &pc_ctx, v_in);
             ctx.network
                 .notify(&recipients, &PcVote1Notification::new(vote.clone()));
-            let payload = VpcMsgPayload::Vote1 { view, vote };
-            let bytes = payload.encode_bytes();
             ctx.notify_protocol(ProtocolEvent::PcVoteReceived {
                 from: me,
-                payload: bytes,
+                view,
+                vote: Box::new(PcVoteMessage::Vote1(vote)),
             });
         }
         Action::SignAndBroadcastPcVote2 {
@@ -67,14 +66,10 @@ where
             let vote = sign_vote2(ctx.signing_key, me, network, &pc_ctx, *qc1);
             ctx.network
                 .notify(&recipients, &PcVote2Notification::new(vote.clone()));
-            let payload = VpcMsgPayload::Vote2 {
-                view,
-                vote: Box::new(vote),
-            };
-            let bytes = payload.encode_bytes();
             ctx.notify_protocol(ProtocolEvent::PcVoteReceived {
                 from: me,
-                payload: bytes,
+                view,
+                vote: Box::new(PcVoteMessage::Vote2(Box::new(vote))),
             });
         }
         Action::SignAndBroadcastPcVote3 {
@@ -87,14 +82,10 @@ where
             let vote = sign_vote3(ctx.signing_key, me, network, &pc_ctx, *qc2);
             ctx.network
                 .notify(&recipients, &PcVote3Notification::new(vote.clone()));
-            let payload = VpcMsgPayload::Vote3 {
-                view,
-                vote: Box::new(vote),
-            };
-            let bytes = payload.encode_bytes();
             ctx.notify_protocol(ProtocolEvent::PcVoteReceived {
                 from: me,
-                payload: bytes,
+                view,
+                vote: Box::new(PcVoteMessage::Vote3(Box::new(vote))),
             });
         }
         Action::SignAndBroadcastEmptyView {

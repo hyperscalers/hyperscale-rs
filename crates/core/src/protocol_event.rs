@@ -515,15 +515,16 @@ pub enum ProtocolEvent {
     // ═══════════════════════════════════════════════════════════════════════
     // Beacon consensus
     // ═══════════════════════════════════════════════════════════════════════
-    /// PC inner-consensus vote received from a peer. Payload is the
-    /// wire-form `PcVote` SBOR-encoded by the gossip decoder;
-    /// `BeaconCoordinator` decodes and routes into the per-epoch
-    /// `SpcInstance`.
+    /// PC inner-consensus vote received from a peer. `BeaconCoordinator`
+    /// gates on instance bootstrap and skip-quorum, then routes into the
+    /// per-epoch `SpcInstance`.
     PcVoteReceived {
         /// Sender id (transport-level).
         from: ValidatorId,
-        /// SBOR-encoded `VpcMsgPayload`.
-        payload: Vec<u8>,
+        /// SPC view this vote belongs to.
+        view: SpcView,
+        /// The vote; variant tags the round.
+        vote: Box<PcVoteMessage>,
     },
 
     /// SPC `new-view` notification received from a peer. The cert is
