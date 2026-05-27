@@ -31,7 +31,7 @@ use crate::{
     BeaconWitnessRoot, BoundedBTreeMap, CertificateRoot, FinalizedWave, Hash, LocalReceiptRoot,
     MAX_REMOTE_SHARDS_PER_WAVE, ProvisionTxRoot, ProvisionsRoot, RoutableTransaction, ShardGroupId,
     StoredReceipt, TopologySnapshot, TransactionRoot, TxHash, Verify, WeightedTimestamp,
-    compute_merkle_root, compute_provision_tx_roots,
+    compute_merkle_root,
 };
 
 // ─── VerifiedCertificateRoot ────────────────────────────────────────────────
@@ -129,17 +129,6 @@ impl Verify<&CertificateRootContext<'_>> for CertificateRoot {
     }
 }
 
-/// Compute the certificate merkle root for a block's finalized waves.
-///
-/// Each underlying wave certificate's `receipt_hash` becomes a leaf.
-/// Returns `Hash::ZERO` if there are no certificates. Thin wrapper around
-/// [`VerifiedCertificateRoot::compute`] for sites that only need the raw
-/// root value.
-#[must_use]
-pub fn compute_certificate_root(certificates: &[Arc<FinalizedWave>]) -> CertificateRoot {
-    VerifiedCertificateRoot::compute(certificates).into_inner()
-}
-
 // ─── VerifiedLocalReceiptRoot ───────────────────────────────────────────────
 
 /// Inputs the [`LocalReceiptRoot`] verifier reads against.
@@ -231,22 +220,6 @@ impl Verify<&LocalReceiptRootContext<'_>> for LocalReceiptRoot {
     }
 }
 
-/// Compute the local-receipt merkle root for a block's receipts.
-///
-/// Each receipt's [`ConsensusReceipt::local_receipt_hash`](crate::ConsensusReceipt::local_receipt_hash)
-/// (outcome tag + `event_root` + `database_updates_hash`) becomes a leaf,
-/// in canonical block order — the same order
-/// [`FinalizedWave::validate_receipts_against_ec`](crate::FinalizedWave::validate_receipts_against_ec)
-/// walks them, and the order every construction site (`finalize_wave`,
-/// `FinalizedWave::reconstruct`) builds them.
-///
-/// Returns `Hash::ZERO` if there are no receipts. Thin wrapper around
-/// [`VerifiedLocalReceiptRoot::compute`].
-#[must_use]
-pub fn compute_local_receipt_root(receipts: &[StoredReceipt]) -> LocalReceiptRoot {
-    VerifiedLocalReceiptRoot::compute(receipts).into_inner()
-}
-
 // ─── VerifiedProvisionsRoot ─────────────────────────────────────────────────
 
 /// Inputs the [`ProvisionsRoot`] verifier reads against.
@@ -331,15 +304,6 @@ impl Verify<&ProvisionsRootContext<'_>> for ProvisionsRoot {
         }
         Ok(VerifiedProvisionsRoot(*self))
     }
-}
-
-/// Compute the provisions merkle root for a block.
-///
-/// Each provisions' hash becomes a leaf. Returns `Hash::ZERO` if empty.
-/// Thin wrapper around [`VerifiedProvisionsRoot::compute`].
-#[must_use]
-pub fn compute_provision_root(batch_hashes: &[Hash]) -> ProvisionsRoot {
-    VerifiedProvisionsRoot::compute(batch_hashes).into_inner()
 }
 
 // ─── VerifiedTransactionRoot ────────────────────────────────────────────────
@@ -469,15 +433,6 @@ impl Verify<&TransactionRootContext<'_>> for TransactionRoot {
     }
 }
 
-/// Compute the transaction merkle root for a block.
-///
-/// Each transaction's hash becomes a leaf directly. Returns `Hash::ZERO`
-/// if empty. Thin wrapper around [`VerifiedTransactionRoot::compute`].
-#[must_use]
-pub fn compute_transaction_root(transactions: &[Arc<RoutableTransaction>]) -> TransactionRoot {
-    VerifiedTransactionRoot::compute(transactions).into_inner()
-}
-
 // ─── VerifiedProvisionTxRoots ───────────────────────────────────────────────
 
 /// Inputs the provision-tx-roots verifier reads against.
@@ -524,6 +479,13 @@ impl VerifiedProvisionTxRoots {
     /// Compute the per-target-shard provision-tx roots from
     /// `transactions` under `topology`. Verified by construction.
     ///
+    /// For each cross-shard tx, the tx hash lands in the bucket of every
+    /// remote shard it touches. Each bucket is merkle-committed in
+    /// already-hash-ascending block order so the target shard can verify
+    /// a received `Provisions` carries the full set it was meant to
+    /// receive. Only emits an entry for targets with ≥1 tx — empty for
+    /// blocks with no cross-shard txs.
+    ///
     /// # Panics
     ///
     /// Panics if the computed map exceeds [`MAX_REMOTE_SHARDS_PER_WAVE`]
@@ -531,7 +493,34 @@ impl VerifiedProvisionTxRoots {
     /// more shards than the consensus configuration allows.
     #[must_use]
     pub fn compute(topology: &TopologySnapshot, transactions: &[Arc<RoutableTransaction>]) -> Self {
-        Self(compute_provision_tx_roots(topology, transactions).into())
+        let local_shard = topology.local_shard();
+        let mut per_target: BTreeMap<ShardGroupId, Vec<Hash>> = BTreeMap::new();
+
+        for tx in transactions {
+            if topology.is_single_shard_transaction(tx) {
+                continue;
+            }
+            for shard in topology.all_shards_for_transaction(tx) {
+                if shard == local_shard {
+                    continue;
+                }
+                per_target
+                    .entry(shard)
+                    .or_default()
+                    .push(tx.hash().into_raw());
+            }
+        }
+
+        let map: BTreeMap<ShardGroupId, ProvisionTxRoot> = per_target
+            .into_iter()
+            .map(|(shard, hashes)| {
+                (
+                    shard,
+                    ProvisionTxRoot::from_raw(compute_merkle_root(&hashes)),
+                )
+            })
+            .collect();
+        Self(map.into())
     }
 
     /// Audit-point constructor. Skips the predicate.
@@ -565,9 +554,10 @@ impl Verify<&ProvisionTxRootsContext<'_>> for ProvisionTxRootsMap {
     type Error = ProvisionTxRootsVerifyError;
 
     fn verify(&self, ctx: &ProvisionTxRootsContext<'_>) -> Result<Self::Verified, Self::Error> {
-        let computed = compute_provision_tx_roots(ctx.topology, ctx.transactions);
-        if computed != self.0 {
+        let computed = VerifiedProvisionTxRoots::compute(ctx.topology, ctx.transactions);
+        if computed.0 != *self {
             let expected: BTreeMap<_, _> = self.iter().map(|(k, v)| (*k, *v)).collect();
+            let computed: BTreeMap<_, _> = computed.0.iter().map(|(k, v)| (*k, *v)).collect();
             return Err(ProvisionTxRootsVerifyError::Mismatch { expected, computed });
         }
         Ok(VerifiedProvisionTxRoots(self.clone()))

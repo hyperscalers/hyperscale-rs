@@ -45,9 +45,9 @@ mod tests {
         ExecutionCertificate, ExecutionOutcome, FinalizedWave, GlobalReceiptHash,
         GlobalReceiptRoot, Hash, NetworkDefinition, NodeId, ProvisionTxRoot, RETENTION_HORIZON,
         ReceiptValidationError, ShardGroupId, SignerBitfield, StoredReceipt, TopologySnapshot,
-        TxHash, TxOutcome, ValidatorId, ValidatorInfo, ValidatorSet, VotePower, WaveCertificate,
-        WaveId, WaveReceiptHash, WeightedTimestamp, compute_global_receipt_root,
-        compute_global_receipt_root_with_proof, compute_merkle_root, compute_provision_tx_roots,
+        TxHash, TxOutcome, ValidatorId, ValidatorInfo, ValidatorSet, VerifiedProvisionTxRoots,
+        VotePower, WaveCertificate, WaveId, WaveReceiptHash, WeightedTimestamp,
+        compute_global_receipt_root, compute_global_receipt_root_with_proof, compute_merkle_root,
         generate_bls_keypair, tx_outcome_leaf, verify_merkle_inclusion, wave_leader,
         wave_leader_at,
     };
@@ -135,7 +135,7 @@ mod tests {
     #[test]
     fn test_compute_provision_tx_roots_empty() {
         let topology = two_shard_topology();
-        let map = compute_provision_tx_roots(&topology, &[]);
+        let map = VerifiedProvisionTxRoots::compute(&topology, &[]);
         assert!(map.is_empty());
     }
 
@@ -148,7 +148,7 @@ mod tests {
             vec![local_node],
             vec![local_node],
         ));
-        let map = compute_provision_tx_roots(&topology, &[tx]);
+        let map = VerifiedProvisionTxRoots::compute(&topology, &[tx]);
         assert!(map.is_empty(), "single-shard tx must not produce an entry");
     }
 
@@ -170,7 +170,7 @@ mod tests {
             vec![local_node, remote_node],
         ));
 
-        let roots = compute_provision_tx_roots(&topology, &[tx_a.clone(), tx_b.clone()]);
+        let roots = VerifiedProvisionTxRoots::compute(&topology, &[tx_a.clone(), tx_b.clone()]);
 
         // Local shard excluded; only shard 1 receives provisions.
         assert_eq!(roots.len(), 1);

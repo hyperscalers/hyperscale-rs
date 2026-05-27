@@ -119,8 +119,7 @@ pub use shard::roots::{
     ProvisionTxRootsContext, ProvisionTxRootsMap, ProvisionTxRootsVerifyError,
     ProvisionsRootContext, TransactionRootContext, TxRootVerifyError, VerifiedBeaconWitnessRoot,
     VerifiedCertificateRoot, VerifiedLocalReceiptRoot, VerifiedProvisionTxRoots,
-    VerifiedProvisionsRoot, VerifiedTransactionRoot, compute_certificate_root,
-    compute_local_receipt_root, compute_provision_root, compute_transaction_root,
+    VerifiedProvisionsRoot, VerifiedTransactionRoot,
 };
 pub use shard::vote::{BlockVote, BlockVoteContext, BlockVoteVerifyError, VerifiedBlockVote};
 pub use shard::{
@@ -161,9 +160,7 @@ pub use transaction::status::{
 };
 pub use verifiable::{Verifiable, Verify};
 pub use wave::certificate::WaveCertificate;
-pub use wave::computation::{
-    compute_provision_tx_roots, compute_waves, wave_leader, wave_leader_at,
-};
+pub use wave::computation::{compute_waves, wave_leader, wave_leader_at};
 pub use wave::execution_certificate::ExecutionCertificate;
 pub use wave::finalized::{FinalizedWave, ReceiptValidationError};
 pub use wave::id::{MAX_REMOTE_SHARDS_PER_WAVE, WaveId};

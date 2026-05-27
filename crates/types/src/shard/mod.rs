@@ -39,8 +39,8 @@ mod tests {
         Bls12381G2Signature, BoundedVec, CertificateRoot, ExecutionCertificate, ExecutionOutcome,
         FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, InFlightCount, LocalReceiptRoot,
         ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, SignerBitfield,
-        StateRoot, TransactionRoot, TxHash, TxOutcome, ValidatorId, WaveCertificate, WaveId,
-        WeightedTimestamp, compute_certificate_root, compute_transaction_root,
+        StateRoot, TransactionRoot, TxHash, TxOutcome, ValidatorId, VerifiedCertificateRoot,
+        VerifiedTransactionRoot, WaveCertificate, WaveId, WeightedTimestamp,
         generate_ed25519_keypair, routable_from_notarized_v1, sign_and_notarize,
     };
 
@@ -88,7 +88,7 @@ mod tests {
 
     #[test]
     fn test_compute_transaction_root_empty() {
-        let root = compute_transaction_root(&[]);
+        let root = VerifiedTransactionRoot::compute(&[]).into_inner();
         assert_eq!(root, TransactionRoot::ZERO);
     }
 
@@ -104,15 +104,15 @@ mod tests {
         let notarized = sign_and_notarize(manifest, &network, 1, &key).unwrap();
         let tx = Arc::new(routable_from_notarized_v1(notarized, test_validity_range()).unwrap());
 
-        let root1 = compute_transaction_root(std::slice::from_ref(&tx));
-        let root2 = compute_transaction_root(std::slice::from_ref(&tx));
+        let root1 = VerifiedTransactionRoot::compute(std::slice::from_ref(&tx)).into_inner();
+        let root2 = VerifiedTransactionRoot::compute(std::slice::from_ref(&tx)).into_inner();
         assert_eq!(root1, root2);
         assert_ne!(root1, TransactionRoot::ZERO);
     }
 
     #[test]
     fn test_compute_certificate_root_empty() {
-        let root = compute_certificate_root(&[]);
+        let root = VerifiedCertificateRoot::compute(&[]).into_inner();
         assert_eq!(root, CertificateRoot::ZERO);
     }
 
@@ -152,8 +152,8 @@ mod tests {
         };
 
         let certs = vec![make_fw(1), make_fw(2)];
-        let root1 = compute_certificate_root(&certs);
-        let root2 = compute_certificate_root(&certs);
+        let root1 = VerifiedCertificateRoot::compute(&certs).into_inner();
+        let root2 = VerifiedCertificateRoot::compute(&certs).into_inner();
         assert_eq!(root1, root2);
         assert_ne!(root1, CertificateRoot::ZERO);
     }
@@ -180,7 +180,7 @@ mod tests {
         let expected_receipt_hash = cert.receipt_hash();
         let fw = Arc::new(FinalizedWave::new(cert, vec![]));
 
-        let root = compute_certificate_root(std::slice::from_ref(&fw));
+        let root = VerifiedCertificateRoot::compute(std::slice::from_ref(&fw)).into_inner();
         // Single cert: certificate_root should equal the cert's receipt_hash
         assert_eq!(root.into_raw(), expected_receipt_hash.into_raw());
     }
