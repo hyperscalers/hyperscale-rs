@@ -11,11 +11,12 @@ use hyperscale_types::{
     BlockHeight, BlockManifest, BlockVote, Bls12381G1PublicKey, CertificateRoot,
     CertifiedBeaconBlock, CommittedBlockHeader, Epoch, ExecutionCertificate, ExecutionVote,
     FinalizedWave, GlobalReceiptRoot, Hash, InFlightCount, LeafIndex, LocalReceiptRoot, NodeId,
-    PcQc1, PcQc2, PcQc3, PcVector, ProposerTimestamp, ProvisionHash, ProvisionTxRoot, Provisions,
-    ProvisionsRoot, QuorumCertificate, ReadySignal, Round, RoutableTransaction, ShardGroupId,
-    SharedCertificates, SharedTransactions, SkipEpochCert, SkipRequest, SpcCert, SpcHighTriple,
-    SpcView, StateRoot, SubstateEntry, TopologySnapshot, TransactionRoot, TransactionStatus,
-    TxHash, TxOutcome, ValidatorId, VotePower, WaveId, WeightedTimestamp, Witness,
+    PcQc1, PcQc2, PcQc3, PcVector, PcVoteMessage, ProposerTimestamp, ProvisionHash,
+    ProvisionTxRoot, Provisions, ProvisionsRoot, QuorumCertificate, ReadySignal, Round,
+    RoutableTransaction, ShardGroupId, SharedCertificates, SharedTransactions, SkipEpochCert,
+    SkipRequest, SpcCert, SpcEmptyViewMsg, SpcHighTriple, SpcView, StateRoot, SubstateEntry,
+    TopologySnapshot, TransactionRoot, TransactionStatus, TxHash, TxOutcome, ValidatorId,
+    VotePower, WaveId, WeightedTimestamp, Witness,
 };
 
 use crate::{CommitSource, FetchAbandon, FetchRequest, ProtocolEvent, TimerId};
@@ -946,6 +947,62 @@ pub enum Action {
         signers: Vec<(ValidatorId, Bls12381G1PublicKey)>,
     },
 
+    /// Verify a PC round vote against its `(epoch, view)` committee.
+    /// Result returns via [`ProtocolEvent::PcVoteVerified`] carrying the
+    /// vote back so the coordinator can route it into the post-verify
+    /// admission path without stashing.
+    VerifyPcVote {
+        /// Epoch the inner PC instance belongs to.
+        epoch: Epoch,
+        /// SPC view whose inner PC produced this vote.
+        view: SpcView,
+        /// Vote to verify; the variant selects the verifier.
+        vote: Box<PcVoteMessage>,
+        /// Beacon committee at `epoch`, positional order.
+        committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+    },
+
+    /// Verify an SPC `NewView` cert authorising entry to `view`. Result
+    /// returns via [`ProtocolEvent::SpcNewViewVerified`].
+    VerifySpcNewView {
+        /// Epoch the SPC instance belongs to.
+        epoch: Epoch,
+        /// Sender of the `NewView` (carried back through the result event).
+        from: ValidatorId,
+        /// View this cert authorises entry to.
+        view: SpcView,
+        /// Cert to verify.
+        cert: Box<SpcCert>,
+        /// Beacon committee at `epoch`, positional order.
+        committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+    },
+
+    /// Verify an SPC `NewCommit`'s embedded [`PcQc3`]. Result returns
+    /// via [`ProtocolEvent::SpcNewCommitVerified`].
+    VerifySpcNewCommit {
+        /// Epoch the SPC instance belongs to.
+        epoch: Epoch,
+        /// SPC view whose inner PC produced this commit.
+        view: SpcView,
+        /// Committed low value.
+        value: PcVector,
+        /// PC round-3 cert anchoring `value` as `proof.x_pp`.
+        proof: Box<PcQc3>,
+        /// Beacon committee at `epoch`, positional order.
+        committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+    },
+
+    /// Verify an empty-view attestation (sig + embedded reported QC3).
+    /// Result returns via [`ProtocolEvent::SpcEmptyViewVerified`].
+    VerifySpcEmptyView {
+        /// Epoch the SPC instance belongs to.
+        epoch: Epoch,
+        /// Attestation to verify.
+        msg: Box<SpcEmptyViewMsg>,
+        /// Beacon committee at `epoch`, positional order.
+        committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+    },
+
     /// Persist a committed beacon block + its resulting `BeaconState`
     /// to `BeaconStorage`. Both writes go in one atomic batch.
     CommitBeaconBlock {
@@ -998,7 +1055,11 @@ impl Action {
             | Self::BroadcastSkipCert { .. }
             | Self::FetchShardWitnesses { .. }
             | Self::VerifyBeaconBlock { .. }
-            | Self::VerifySkipRequest { .. } => Some(DispatchPool::Consensus),
+            | Self::VerifySkipRequest { .. }
+            | Self::VerifyPcVote { .. }
+            | Self::VerifySpcNewView { .. }
+            | Self::VerifySpcNewCommit { .. }
+            | Self::VerifySpcEmptyView { .. } => Some(DispatchPool::Consensus),
 
             // Throughput-bound: provision/cert/wave verification,
             // execution-vote crypto, and Radix Engine execution.
@@ -1060,7 +1121,11 @@ impl Action {
             | Self::BroadcastSkipCert { .. }
             | Self::FetchShardWitnesses { .. }
             | Self::VerifyBeaconBlock { .. }
-            | Self::VerifySkipRequest { .. } => ActionOwner::Beacon,
+            | Self::VerifySkipRequest { .. }
+            | Self::VerifyPcVote { .. }
+            | Self::VerifySpcNewView { .. }
+            | Self::VerifySpcNewCommit { .. }
+            | Self::VerifySpcEmptyView { .. } => ActionOwner::Beacon,
 
             _ => ActionOwner::Local,
         }

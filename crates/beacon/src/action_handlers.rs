@@ -17,14 +17,16 @@ use hyperscale_types::network::notification::{
     SpcEmptyViewMsgNotification, SpcNewCommitNotification, SpcNewViewNotification,
 };
 use hyperscale_types::{
-    BeaconProposal, SpcHighTriple, SpcMessage, SpcProposalObject, VpcMsgPayload, pc_context,
-    spc_context, vrf_sign,
+    BeaconProposal, PcVoteMessage, SpcHighTriple, SpcMessage, SpcProposalObject, VpcMsgPayload,
+    pc_context, spc_context, vrf_sign,
 };
 use tracing::warn;
 
-use crate::pc::{sign_vote1, sign_vote2, sign_vote3};
+use crate::pc::{
+    sign_vote1, sign_vote2, sign_vote3, verify_qc3, verify_vote1, verify_vote2, verify_vote3,
+};
 use crate::skip::verify_skip_request;
-use crate::spc::sign_empty_view_msg;
+use crate::spc::{sign_empty_view_msg, verify_cert, verify_empty_view_msg};
 use crate::verification::verify_certified;
 
 /// Dispatch a beacon-owned [`Action`] on the consensus pool. Panics on
@@ -197,6 +199,71 @@ where
         Action::VerifySkipRequest { request, signers } => {
             let valid = verify_skip_request(&request, network, &signers);
             ctx.notify_protocol(ProtocolEvent::SkipRequestVerified { request, valid });
+        }
+        Action::VerifyPcVote {
+            epoch,
+            view,
+            vote,
+            committee,
+        } => {
+            let pc_ctx = pc_context(&spc_context(epoch), view);
+            let valid = match vote.as_ref() {
+                PcVoteMessage::Vote1(v) => verify_vote1(v, network, &pc_ctx, &committee),
+                PcVoteMessage::Vote2(v) => verify_vote2(v, network, &pc_ctx, &committee),
+                PcVoteMessage::Vote3(v) => verify_vote3(v, network, &pc_ctx, &committee),
+            };
+            ctx.notify_protocol(ProtocolEvent::PcVoteVerified {
+                epoch,
+                view,
+                vote,
+                valid,
+            });
+        }
+        Action::VerifySpcNewView {
+            epoch,
+            from,
+            view,
+            cert,
+            committee,
+        } => {
+            let spc_ctx = spc_context(epoch);
+            let valid = verify_cert(&cert, view, network, &spc_ctx, &committee);
+            ctx.notify_protocol(ProtocolEvent::SpcNewViewVerified {
+                epoch,
+                from,
+                view,
+                cert,
+                valid,
+            });
+        }
+        Action::VerifySpcNewCommit {
+            epoch,
+            view,
+            value,
+            proof,
+            committee,
+        } => {
+            let pc_ctx = pc_context(&spc_context(epoch), view);
+            // `proof.x_pp() == value` is an FSM-level invariant the
+            // post-verify path enforces; the crypto pool only checks the
+            // BLS aggregate over the embedded QC3.
+            let valid = verify_qc3(&proof, network, &pc_ctx, &committee);
+            ctx.notify_protocol(ProtocolEvent::SpcNewCommitVerified {
+                epoch,
+                view,
+                value,
+                proof,
+                valid,
+            });
+        }
+        Action::VerifySpcEmptyView {
+            epoch,
+            msg,
+            committee,
+        } => {
+            let spc_ctx = spc_context(epoch);
+            let valid = verify_empty_view_msg(&msg, network, &spc_ctx, &committee);
+            ctx.notify_protocol(ProtocolEvent::SpcEmptyViewVerified { epoch, msg, valid });
         }
         _ => unreachable!("hyperscale_beacon::handle_action called with non-beacon action"),
     }

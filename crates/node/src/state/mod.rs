@@ -274,6 +274,10 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::ShardWitnessesReceived { .. }
             | ProtocolEvent::BeaconBlockVerified { .. }
             | ProtocolEvent::SkipRequestVerified { .. }
+            | ProtocolEvent::PcVoteVerified { .. }
+            | ProtocolEvent::SpcNewViewVerified { .. }
+            | ProtocolEvent::SpcNewCommitVerified { .. }
+            | ProtocolEvent::SpcEmptyViewVerified { .. }
             | ProtocolEvent::BeaconCommitteeStartTimer
             | ProtocolEvent::BeaconSkipTimer
             | ProtocolEvent::BeaconSpcViewTimer

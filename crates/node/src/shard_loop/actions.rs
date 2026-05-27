@@ -91,7 +91,11 @@ where
             | Action::BroadcastSkipCert { .. }
             | Action::FetchShardWitnesses { .. }
             | Action::VerifyBeaconBlock { .. }
-            | Action::VerifySkipRequest { .. } => {
+            | Action::VerifySkipRequest { .. }
+            | Action::VerifyPcVote { .. }
+            | Action::VerifySpcNewView { .. }
+            | Action::VerifySpcNewCommit { .. }
+            | Action::VerifySpcEmptyView { .. } => {
                 self.dispatch_delegated_action(vnode_idx, action);
             }
 

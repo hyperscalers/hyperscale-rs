@@ -51,8 +51,8 @@ pub use limits::{
 };
 pub use pc::{
     PC_VALUE_ELEMENT_BYTES, PcCompactVote, PcDivergingProof, PcQc1, PcQc2, PcQc3, PcSignerLengths,
-    PcValueElement, PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation, PcVoteRound,
-    PcXpProof,
+    PcValueElement, PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation, PcVoteMessage,
+    PcVoteRound, PcXpProof,
 };
 pub use proposal::BeaconProposal;
 pub use ready_signal::ReadySignal;

@@ -37,11 +37,12 @@ pub use beacon::{
     MAX_READY_SIGNALS_PER_BLOCK, MAX_READY_WINDOW_BLOCKS, MAX_VOTE_VECTOR_LEN,
     MAX_WITNESS_PROOF_DEPTH, MAX_WITNESSES_PER_FETCH, MAX_WITNESSES_PER_PROPOSER,
     PC_VALUE_ELEMENT_BYTES, PcCompactVote, PcDivergingProof, PcQc1, PcQc2, PcQc3, PcSignerLengths,
-    PcValueElement, PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation, PcVoteRound,
-    PcXpProof, PendingWithdrawal, ReadySignal, SHARD_WITNESS_LEAF_DOMAIN_TAG, ShardCommittee,
-    ShardWitness, ShardWitnessPayload, ShardWitnessProof, SkipEpochCert, SkipReport, SkipRequest,
-    SlotEffects, SpcCert, SpcEmptyViewMsg, SpcHighTriple, SpcMessage, SpcProposalObject, StakePool,
-    TransitionCause, ValidatorRecord, ValidatorStatus, VpcMsgPayload, Witness, genesis_config_hash,
+    PcValueElement, PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation, PcVoteMessage,
+    PcVoteRound, PcXpProof, PendingWithdrawal, ReadySignal, SHARD_WITNESS_LEAF_DOMAIN_TAG,
+    ShardCommittee, ShardWitness, ShardWitnessPayload, ShardWitnessProof, SkipEpochCert,
+    SkipReport, SkipRequest, SlotEffects, SpcCert, SpcEmptyViewMsg, SpcHighTriple, SpcMessage,
+    SpcProposalObject, StakePool, TransitionCause, ValidatorRecord, ValidatorStatus, VpcMsgPayload,
+    Witness, genesis_config_hash,
 };
 pub use crypto::batch_verify::{
     aggregate_verify_bls_different_messages, batch_verify_bls_different_messages,
