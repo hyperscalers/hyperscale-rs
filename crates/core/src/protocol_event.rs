@@ -46,13 +46,12 @@ impl CommitSource {
     }
 }
 
-/// Which block root verification completed.
+/// Which block root verification was dispatched.
 ///
-/// Used with `ProtocolEvent::BlockRootVerified` to identify which
-/// verification finished. The actions that produce these results
-/// remain separate (they have different input types), but the
-/// callback event is unified because the handler logic is identical:
-/// record result → check if all verifications complete → vote.
+/// Used by the verification pipeline's in-flight / verified-set bookkeeping
+/// to track per-root state across the action dispatch. The result events
+/// (`TransactionRootVerified`, `CertificateRootVerified`, …) are one-to-one
+/// with these variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VerificationKind {
     /// State root computed by replaying the block's database updates against the JMT.
@@ -229,18 +228,69 @@ pub enum ProtocolEvent {
         committed_header: Arc<CommittedBlockHeader>,
     },
 
-    /// A block root verification completed (state, transaction, certificate,
-    /// local receipt, or abort intent proofs).
-    ///
-    /// The handler logic is identical for all kinds: record the result in the
-    /// verification pipeline, check if all verifications are complete, and
-    /// vote if so. The `kind` field distinguishes which verification finished.
-    BlockRootVerified {
-        /// Which root verification just completed.
-        kind: VerificationKind,
+    /// Transaction-root verification completed for a pending block.
+    TransactionRootVerified {
+        /// Block whose root was verified.
+        block_hash: BlockHash,
+        /// `true` when the computed root matched the header's claim and
+        /// every transaction's validity window contained the parent QC's
+        /// weighted timestamp.
+        valid: bool,
+    },
+
+    /// Certificate-root verification completed for a pending block.
+    CertificateRootVerified {
         /// Block whose root was verified.
         block_hash: BlockHash,
         /// `true` when the computed root matched the header's claim.
+        valid: bool,
+    },
+
+    /// Local-receipt-root verification completed for a pending block.
+    ///
+    /// Emitted as a pre-flight by the `VerifyStateRoot` handler: when the
+    /// computed receipt root diverges from the header's claim, state-root
+    /// recomputation can't match either, so a paired `StateRootVerified`
+    /// with `valid = false` follows immediately.
+    LocalReceiptRootVerified {
+        /// Block whose root was verified.
+        block_hash: BlockHash,
+        /// `true` when the computed root matched the header's claim.
+        valid: bool,
+    },
+
+    /// Provisions-root verification completed for a pending block.
+    ProvisionsRootVerified {
+        /// Block whose root was verified.
+        block_hash: BlockHash,
+        /// `true` when the computed root matched the header's claim.
+        valid: bool,
+    },
+
+    /// Provision-tx-roots map verification completed for a pending block.
+    ProvisionTxRootsVerified {
+        /// Block whose root was verified.
+        block_hash: BlockHash,
+        /// `true` when the computed map matched the header's claim.
+        valid: bool,
+    },
+
+    /// Beacon-witness-root verification completed for a pending block.
+    BeaconWitnessRootVerified {
+        /// Block whose root was verified.
+        block_hash: BlockHash,
+        /// `true` when the recomputed beacon-witness root matched the header's claim.
+        valid: bool,
+    },
+
+    /// State-root verification completed for a pending block.
+    ///
+    /// When `valid = true`, the corresponding `PreparedBlock` has already
+    /// been side-channelled via `ActionContext::commit_prepared`.
+    StateRootVerified {
+        /// Block whose root was verified.
+        block_hash: BlockHash,
+        /// `true` when the recomputed JMT root matched the header's claim.
         valid: bool,
     },
 
@@ -725,24 +775,10 @@ pub enum ProtocolEvent {
 }
 
 impl ProtocolEvent {
-    /// Get the event type name for telemetry.
-    ///
-    /// Variant names come from the `IntoStaticStr` derive; `BlockRootVerified`
-    /// is sub-discriminated by `VerificationKind` so root-verification telemetry
-    /// is attributable per root.
+    /// Get the event type name for telemetry. Falls through to the
+    /// `IntoStaticStr` derive.
     #[must_use]
     pub fn type_name(&self) -> &'static str {
-        match self {
-            Self::BlockRootVerified { kind, .. } => match kind {
-                VerificationKind::StateRoot => "BlockRootVerified::StateRoot",
-                VerificationKind::TransactionRoot => "BlockRootVerified::TransactionRoot",
-                VerificationKind::CertificateRoot => "BlockRootVerified::CertificateRoot",
-                VerificationKind::LocalReceiptRoot => "BlockRootVerified::LocalReceiptRoot",
-                VerificationKind::ProvisionRoot => "BlockRootVerified::ProvisionRoot",
-                VerificationKind::ProvisionTxRoots => "BlockRootVerified::ProvisionTxRoots",
-                VerificationKind::BeaconWitnessRoot => "BlockRootVerified::BeaconWitnessRoot",
-            },
-            other => other.into(),
-        }
+        self.into()
     }
 }

@@ -228,7 +228,13 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::QcSignatureVerified { .. }
             | ProtocolEvent::RemoteHeaderQcVerified { .. }
             | ProtocolEvent::RemoteHeaderAdmitted { .. }
-            | ProtocolEvent::BlockRootVerified { .. }
+            | ProtocolEvent::TransactionRootVerified { .. }
+            | ProtocolEvent::CertificateRootVerified { .. }
+            | ProtocolEvent::LocalReceiptRootVerified { .. }
+            | ProtocolEvent::ProvisionsRootVerified { .. }
+            | ProtocolEvent::ProvisionTxRootsVerified { .. }
+            | ProtocolEvent::BeaconWitnessRootVerified { .. }
+            | ProtocolEvent::StateRootVerified { .. }
             | ProtocolEvent::ProposalBuilt { .. }
             | ProtocolEvent::BlockCommitted { .. }
             | ProtocolEvent::BlockPersisted { .. }

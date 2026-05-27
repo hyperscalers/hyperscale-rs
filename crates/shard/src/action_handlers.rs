@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use hyperscale_core::{Action, ActionContext, PreparedBlock, ProtocolEvent, VerificationKind};
+use hyperscale_core::{Action, ActionContext, PreparedBlock, ProtocolEvent};
 use hyperscale_metrics::record_signature_verification_latency;
 use hyperscale_network::Network;
 use hyperscale_storage::{
@@ -631,11 +631,7 @@ where
                 "transaction_root",
                 start.elapsed().as_secs_f64(),
             );
-            ctx.notify_protocol(ProtocolEvent::BlockRootVerified {
-                kind: VerificationKind::TransactionRoot,
-                block_hash,
-                valid,
-            });
+            ctx.notify_protocol(ProtocolEvent::TransactionRootVerified { block_hash, valid });
         }
 
         Action::VerifyProvisionTxRoots {
@@ -650,11 +646,7 @@ where
                 "provision_tx_roots",
                 start.elapsed().as_secs_f64(),
             );
-            ctx.notify_protocol(ProtocolEvent::BlockRootVerified {
-                kind: VerificationKind::ProvisionTxRoots,
-                block_hash,
-                valid,
-            });
+            ctx.notify_protocol(ProtocolEvent::ProvisionTxRootsVerified { block_hash, valid });
         }
 
         Action::VerifyProvisionRoot {
@@ -666,11 +658,7 @@ where
             let raw_batch_hashes: Vec<Hash> = batch_hashes.iter().map(|h| h.into_raw()).collect();
             let valid = verify_provision_root(expected_root, &raw_batch_hashes);
             record_signature_verification_latency("provision_root", start.elapsed().as_secs_f64());
-            ctx.notify_protocol(ProtocolEvent::BlockRootVerified {
-                kind: VerificationKind::ProvisionRoot,
-                block_hash,
-                valid,
-            });
+            ctx.notify_protocol(ProtocolEvent::ProvisionsRootVerified { block_hash, valid });
         }
 
         Action::VerifyCertificateRoot {
@@ -684,11 +672,7 @@ where
                 "certificate_root",
                 start.elapsed().as_secs_f64(),
             );
-            ctx.notify_protocol(ProtocolEvent::BlockRootVerified {
-                kind: VerificationKind::CertificateRoot,
-                block_hash,
-                valid,
-            });
+            ctx.notify_protocol(ProtocolEvent::CertificateRootVerified { block_hash, valid });
         }
 
         Action::VerifyBeaconWitnessRoot {
@@ -723,11 +707,7 @@ where
                 "beacon_witness_root",
                 start.elapsed().as_secs_f64(),
             );
-            ctx.notify_protocol(ProtocolEvent::BlockRootVerified {
-                kind: VerificationKind::BeaconWitnessRoot,
-                block_hash,
-                valid,
-            });
+            ctx.notify_protocol(ProtocolEvent::BeaconWitnessRootVerified { block_hash, valid });
         }
 
         Action::VerifyStateRoot {
@@ -758,15 +738,13 @@ where
                 "local_receipt_root",
                 receipt_start.elapsed().as_secs_f64(),
             );
-            ctx.notify_protocol(ProtocolEvent::BlockRootVerified {
-                kind: VerificationKind::LocalReceiptRoot,
+            ctx.notify_protocol(ProtocolEvent::LocalReceiptRootVerified {
                 block_hash,
                 valid: receipt_root_valid,
             });
 
             if !receipt_root_valid {
-                ctx.notify_protocol(ProtocolEvent::BlockRootVerified {
-                    kind: VerificationKind::StateRoot,
+                ctx.notify_protocol(ProtocolEvent::StateRootVerified {
                     block_hash,
                     valid: false,
                 });
@@ -812,11 +790,7 @@ where
                     false
                 }
             };
-            ctx.notify_protocol(ProtocolEvent::BlockRootVerified {
-                kind: VerificationKind::StateRoot,
-                block_hash,
-                valid,
-            });
+            ctx.notify_protocol(ProtocolEvent::StateRootVerified { block_hash, valid });
         }
 
         Action::BuildProposal {

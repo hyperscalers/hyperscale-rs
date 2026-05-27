@@ -837,7 +837,7 @@ impl VerificationPipeline {
     /// pending block's manifest, `finalized_waves` from the block's
     /// own certificates) so callers only thread the parts they own.
     /// The handler re-derives the leaf list and emits
-    /// `BlockRootVerified { kind: BeaconWitnessRoot, valid }`.
+    /// `BeaconWitnessRootVerified { block_hash, valid }`.
     ///
     /// When [`prospective_parent_witness_leaves`] returns `Err`, the
     /// verification is parked on the blocking ancestor's hash and the

@@ -371,9 +371,8 @@ pub enum Action {
     /// shard-local state changes to the JMT and compares the resulting
     /// root against the header's `state_root`.
     ///
-    /// Emits two `ProtocolEvent::BlockRootVerified` events — one for
-    /// `VerificationKind::LocalReceiptRoot`, one for
-    /// `VerificationKind::StateRoot`. On receipt-root mismatch, the
+    /// Emits two events: `ProtocolEvent::LocalReceiptRootVerified` and
+    /// `ProtocolEvent::StateRootVerified`. On receipt-root mismatch, the
     /// state-root event reports `valid=false` so the coordinator's
     /// per-kind tracking still completes.
     ///
@@ -449,7 +448,7 @@ pub enum Action {
     /// against the header's `transaction_root`. Also checks that every tx's
     /// `validity_range` is well-formed and contains `validity_anchor` — the
     /// parent QC's `weighted_timestamp` carried on the block. Returns
-    /// `ProtocolEvent::BlockRootVerified { kind: TransactionRoot, valid }`;
+    /// `ProtocolEvent::TransactionRootVerified { block_hash, valid }`;
     /// `valid` is true iff both the merkle root matches and every tx is
     /// in-window.
     ///
