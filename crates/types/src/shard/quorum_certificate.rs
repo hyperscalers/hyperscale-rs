@@ -242,7 +242,7 @@ pub struct QcContext<'a> {
 }
 
 /// Failure modes of [`QuorumCertificate`] verification.
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum QcVerifyError {
     /// The QC has no signers set in its bitfield. A QC with zero signers
     /// is rejected before any cryptographic work; the genesis QC bypasses

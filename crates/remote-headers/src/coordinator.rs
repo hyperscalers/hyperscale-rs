@@ -18,9 +18,9 @@ use hyperscale_core::{Action, ProtocolEvent};
 #[cfg(test)]
 use hyperscale_types::{BeaconWitnessLeafCount, BeaconWitnessRoot};
 use hyperscale_types::{
-    BlockHeight, Bls12381G1PublicKey, CertifiedBlock, CommittedBlockHeader, InFlightCount,
-    REMOTE_HEADER_RETENTION, ShardGroupId, TopologySnapshot, ValidatorId, VotePower,
-    WeightedTimestamp,
+    BlockHeight, Bls12381G1PublicKey, CertifiedBlock, CommittedBlockHeader,
+    CommittedHeaderVerifyError, InFlightCount, REMOTE_HEADER_RETENTION, ShardGroupId,
+    TopologySnapshot, ValidatorId, VerifiedQuorumCertificate, VotePower, WeightedTimestamp,
 };
 use tracing::{debug, info, trace, warn};
 
@@ -251,14 +251,20 @@ impl RemoteHeaderCoordinator {
         shard: ShardGroupId,
         height: BlockHeight,
         header: Arc<CommittedBlockHeader>,
-        valid: bool,
+        result: Result<VerifiedQuorumCertificate, CommittedHeaderVerifyError>,
     ) -> Vec<Action> {
         let key = (shard, height);
 
-        if !valid {
+        if let Err(e) = result {
+            // The verified QC handle is dropped on success too in this
+            // commit; downstream consumers re-look it up from
+            // `header.qc()`. A follow-up commit will plumb the verified
+            // value through `verified` storage so consumers see the
+            // typestate marker directly.
             warn!(
                 shard = shard.inner(),
                 height = height.inner(),
+                reason = %e,
                 "Remote header QC verification failed"
             );
 

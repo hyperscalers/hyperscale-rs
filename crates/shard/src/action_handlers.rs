@@ -15,11 +15,12 @@ use hyperscale_types::network::notification::{BlockHeaderNotification, BlockVote
 use hyperscale_types::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight,
     BlockManifest, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, CertificateRoot,
-    ConsensusReceipt, FinalizedWave, Hash, InFlightCount, LocalReceiptRoot, NetworkDefinition,
-    ProposerTimestamp, ProvisionHash, ProvisionTxRoot, Provisions, ProvisionsRoot,
-    QuorumCertificate, ReadySignal, Round, RoutableTransaction, ShardGroupId, SignerBitfield,
-    StateRoot, StoredReceipt, TopologySnapshot, TransactionRoot, ValidatorId, VotePower,
-    WeightedTimestamp, batch_verify_bls_same_message, block_header_message, block_vote_message,
+    CommittedHeaderVerifyError, ConsensusReceipt, FinalizedWave, Hash, InFlightCount,
+    LocalReceiptRoot, NetworkDefinition, ProposerTimestamp, ProvisionHash, ProvisionTxRoot,
+    Provisions, ProvisionsRoot, QcContext, QuorumCertificate, ReadySignal, Round,
+    RoutableTransaction, ShardGroupId, SignerBitfield, StateRoot, StoredReceipt, TopologySnapshot,
+    TransactionRoot, ValidatorId, VerifiedQuorumCertificate, Verify, VotePower, WeightedTimestamp,
+    batch_verify_bls_same_message, block_header_message, block_vote_message,
     committed_block_header_message, compute_certificate_root, compute_local_receipt_root,
     compute_provision_root, compute_provision_tx_roots, compute_transaction_root, compute_waves,
     verify_bls12381_v1,
@@ -32,7 +33,13 @@ pub struct QcVerificationResult {
     /// Block being voted on.
     pub block_hash: BlockHash,
     /// Assembled QC, or `None` if quorum wasn't reached or aggregation failed.
-    pub qc: Option<QuorumCertificate>,
+    ///
+    /// Carried as a [`VerifiedQuorumCertificate`] because the QC is verified
+    /// by construction: every vote that fed into the aggregation was
+    /// individually signature-checked, the signer set cleared the quorum
+    /// threshold before aggregation, and `build_qc_from_verified` wraps the
+    /// result with `new_unchecked` under that trust source.
+    pub qc: Option<VerifiedQuorumCertificate>,
     /// Verified votes returned when no QC was formed (for accumulation across rounds).
     /// Empty when a QC is successfully built.
     pub verified_votes: Vec<(usize, BlockVote, VotePower)>,
@@ -158,7 +165,10 @@ pub fn verify_vote_batch(
 /// from the vote timestamps.
 ///
 /// Returns `None` only if BLS aggregation itself fails. Caller must ensure
-/// `verified_votes` is non-empty and that quorum has been reached.
+/// `verified_votes` is non-empty and that quorum has been reached — the
+/// returned QC is wrapped as [`VerifiedQuorumCertificate::new_unchecked`]
+/// under those preconditions (votes were individually signature-checked
+/// before this call and quorum was confirmed in `verify_and_build_qc`).
 pub fn build_qc_from_verified(
     block_hash: BlockHash,
     shard_group_id: ShardGroupId,
@@ -167,7 +177,7 @@ pub fn build_qc_from_verified(
     parent_block_hash: BlockHash,
     parent_weighted_timestamp: WeightedTimestamp,
     verified_votes: &[(usize, BlockVote, VotePower)],
-) -> Option<QuorumCertificate> {
+) -> Option<VerifiedQuorumCertificate> {
     let mut sorted: Vec<_> = verified_votes.to_vec();
     sorted.sort_by_key(|(idx, _, _)| *idx);
 
@@ -204,46 +214,22 @@ pub fn build_qc_from_verified(
         u64::try_from(timestamp_weight_sum / u128::from(verified_power.inner())).unwrap_or(u64::MAX)
     };
 
-    Some(QuorumCertificate::new(
-        block_hash,
-        shard_group_id,
-        height,
-        parent_block_hash,
-        round,
-        signers,
-        aggregated_signature,
-        WeightedTimestamp::from_millis(weighted_timestamp_ms),
+    // SAFETY: votes were individually signature-verified upstream of this
+    // call and `verify_and_build_qc` confirmed quorum before invoking
+    // `build_qc_from_verified`. The constructed QC therefore satisfies the
+    // `VerifiedQuorumCertificate` predicate by construction.
+    Some(VerifiedQuorumCertificate::new_unchecked(
+        QuorumCertificate::new(
+            block_hash,
+            shard_group_id,
+            height,
+            parent_block_hash,
+            round,
+            signers,
+            aggregated_signature,
+            WeightedTimestamp::from_millis(weighted_timestamp_ms),
+        ),
     ))
-}
-
-/// Verify a quorum certificate's aggregated BLS signature.
-///
-/// Filters public keys by the QC's signer bitfield, aggregates the filtered
-/// keys, and verifies the aggregated signature against the signing message.
-#[must_use]
-pub fn verify_qc_signature(
-    network: &NetworkDefinition,
-    qc: &QuorumCertificate,
-    public_keys: &[Bls12381G1PublicKey],
-) -> bool {
-    let signing_message = qc.signing_message(network);
-    // Get signer keys based on QC's signer bitfield
-    let signer_keys: Vec<_> = public_keys
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| qc.signers().is_set(*i))
-        .map(|(_, pk)| *pk)
-        .collect();
-
-    if signer_keys.is_empty() {
-        // No signers - invalid QC (genesis is handled before action is emitted)
-        return false;
-    }
-
-    // Aggregate the public keys and verify (skip PK validation - trusted topology)
-    Bls12381G1PublicKey::aggregate(&signer_keys, false).is_ok_and(|aggregated_pk| {
-        verify_bls12381_v1(&signing_message, &aggregated_pk, &qc.aggregated_signature())
-    })
 }
 
 /// Verify that the computed transaction merkle root matches the expected root.
@@ -628,12 +614,20 @@ where
         Action::VerifyQcSignature {
             qc,
             public_keys,
+            voting_powers,
+            quorum_threshold,
             block_hash,
         } => {
             let start = std::time::Instant::now();
-            let valid = verify_qc_signature(ctx.topology_snapshot.network(), &qc, &public_keys);
+            let qc_ctx = QcContext {
+                network: ctx.topology_snapshot.network(),
+                public_keys: &public_keys,
+                voting_powers: &voting_powers,
+                quorum_threshold,
+            };
+            let result = qc.verify(&qc_ctx);
             record_signature_verification_latency("qc", start.elapsed().as_secs_f64());
-            ctx.notify_protocol(ProtocolEvent::QcSignatureVerified { block_hash, valid });
+            ctx.notify_protocol(ProtocolEvent::QcSignatureVerified { block_hash, result });
         }
 
         Action::VerifyRemoteHeaderQc {
@@ -645,23 +639,24 @@ where
             height,
         } => {
             let start = std::time::Instant::now();
-            let qc_valid = verify_qc_signature(
-                ctx.topology_snapshot.network(),
-                committed_header.qc(),
-                &committee_public_keys,
-            );
-            let valid = if qc_valid {
-                let total_power: VotePower = committed_header
-                    .qc()
-                    .signers()
-                    .set_indices()
-                    .filter_map(|idx| committee_voting_power.get(idx).copied())
-                    .sum();
-                total_power >= quorum_threshold
-                    && committed_header.qc().block_hash() == committed_header.header().hash()
-            } else {
-                false
+            let qc_ctx = QcContext {
+                network: ctx.topology_snapshot.network(),
+                public_keys: &committee_public_keys,
+                voting_powers: &committee_voting_power,
+                quorum_threshold,
             };
+            let linkage_ok = committed_header.qc().block_hash() == committed_header.header().hash();
+            let result = committed_header
+                .qc()
+                .verify(&qc_ctx)
+                .map_err(CommittedHeaderVerifyError::from)
+                .and_then(|verified| {
+                    if linkage_ok {
+                        Ok(verified)
+                    } else {
+                        Err(CommittedHeaderVerifyError::LinkageMismatch)
+                    }
+                });
             record_signature_verification_latency(
                 "remote_header_qc",
                 start.elapsed().as_secs_f64(),
@@ -670,7 +665,7 @@ where
                 shard,
                 height,
                 committed_header,
-                valid,
+                result,
             });
         }
 
@@ -1167,8 +1162,22 @@ mod tests {
         )
         .expect("build_qc should succeed");
 
+        // build_qc_from_verified wraps with `new_unchecked` under the
+        // "votes pre-verified + quorum confirmed" trust source, so the
+        // returned QC must round-trip through the Verify impl when fed
+        // back its committee context.
         let pubs: Vec<_> = keys.iter().map(Bls12381G1PrivateKey::public_key).collect();
-        assert!(verify_qc_signature(&net(), &qc, &pubs));
+        let powers = vec![VotePower::new(1); keys.len()];
+        let net = net();
+        let qc_ctx = QcContext {
+            network: &net,
+            public_keys: &pubs,
+            voting_powers: &powers,
+            quorum_threshold: VotePower::new(3),
+        };
+        qc.as_ref()
+            .verify(&qc_ctx)
+            .expect("freshly built QC must re-verify");
         assert_eq!(qc.block_hash(), block_hash);
         assert_eq!(qc.height(), height);
         assert_eq!(qc.parent_block_hash(), parent);
@@ -1395,85 +1404,8 @@ mod tests {
         assert!(result.verified_votes.is_empty());
     }
 
-    // ─── verify_qc_signature ────────────────────────────────────────────
-
-    #[test]
-    fn verify_qc_signature_rejects_empty_signer_set() {
-        let keys = keypairs(3);
-        let block_hash = BlockHash::from_raw(Hash::from_bytes(b"b"));
-        let verified: Vec<_> = (0..3)
-            .map(|i| {
-                let vote = make_vote(
-                    &keys,
-                    i,
-                    block_hash,
-                    BlockHeight::new(1),
-                    Round::INITIAL,
-                    1000,
-                );
-                (i, vote, VotePower::new(1))
-            })
-            .collect();
-        let qc = build_qc_from_verified(
-            block_hash,
-            shard(),
-            BlockHeight::new(1),
-            Round::INITIAL,
-            BlockHash::ZERO,
-            WeightedTimestamp::ZERO,
-            &verified,
-        )
-        .unwrap();
-        let qc = QuorumCertificate::new(
-            qc.block_hash(),
-            qc.shard_group_id(),
-            qc.height(),
-            qc.parent_block_hash(),
-            qc.round(),
-            SignerBitfield::new(3),
-            qc.aggregated_signature(),
-            qc.weighted_timestamp(),
-        );
-
-        let pubs: Vec<_> = keys.iter().map(Bls12381G1PrivateKey::public_key).collect();
-        assert!(!verify_qc_signature(&net(), &qc, &pubs));
-    }
-
-    #[test]
-    fn verify_qc_signature_rejects_wrong_public_keys() {
-        let keys = keypairs(3);
-        let block_hash = BlockHash::from_raw(Hash::from_bytes(b"b"));
-        let verified: Vec<_> = (0..3)
-            .map(|i| {
-                let vote = make_vote(
-                    &keys,
-                    i,
-                    block_hash,
-                    BlockHeight::new(1),
-                    Round::INITIAL,
-                    1000,
-                );
-                (i, vote, VotePower::new(1))
-            })
-            .collect();
-        let qc = build_qc_from_verified(
-            block_hash,
-            shard(),
-            BlockHeight::new(1),
-            Round::INITIAL,
-            BlockHash::ZERO,
-            WeightedTimestamp::ZERO,
-            &verified,
-        )
-        .unwrap();
-
-        let wrong_keys = keypairs(3);
-        let wrong_pubs: Vec<_> = wrong_keys
-            .iter()
-            .map(Bls12381G1PrivateKey::public_key)
-            .collect();
-        assert!(!verify_qc_signature(&net(), &qc, &wrong_pubs));
-    }
+    // Signature-verification predicate tests live next to the type, in
+    // `crates/types/src/shard/quorum_certificate.rs::tests`.
 
     // ─── root verifiers ─────────────────────────────────────────────────
 

@@ -121,14 +121,14 @@ impl NodeStateMachine {
                 qc,
                 verified_votes,
             ),
-            ProtocolEvent::QcSignatureVerified { block_hash, valid } => self
+            ProtocolEvent::QcSignatureVerified { block_hash, result } => self
                 .shard_coordinator
-                .on_qc_signature_verified(&self.topology_snapshot, block_hash, valid),
+                .on_qc_signature_verified(&self.topology_snapshot, block_hash, result),
             ProtocolEvent::RemoteHeaderQcVerified {
                 shard,
                 height,
                 committed_header,
-                valid,
+                result,
             } => self
                 .remote_headers_coordinator
                 .on_remote_header_qc_verified(
@@ -136,7 +136,7 @@ impl NodeStateMachine {
                     shard,
                     height,
                     committed_header,
-                    valid,
+                    result,
                 ),
             ProtocolEvent::RemoteHeaderAdmitted { committed_header } => {
                 // Fan out the verified header to downstream consumers. Shard consensus

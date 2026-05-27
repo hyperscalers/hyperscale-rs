@@ -11,7 +11,7 @@ use hyperscale_core::Action;
 use hyperscale_types::{BeaconWitnessLeafCount, BeaconWitnessRoot};
 use hyperscale_types::{
     BlockHash, BlockHeight, Bls12381G1PublicKey, CertifiedBlock, QuorumCertificate,
-    TopologySnapshot,
+    TopologySnapshot, VotePower,
 };
 use tracing::{debug, info, warn};
 
@@ -329,6 +329,8 @@ impl BlockSyncManager {
         &mut self,
         certified: CertifiedBlock,
         public_keys: Vec<Bls12381G1PublicKey>,
+        voting_powers: Vec<VotePower>,
+        quorum_threshold: VotePower,
     ) -> Action {
         let block_hash = certified.block().hash();
         let height = certified.block().height();
@@ -361,6 +363,8 @@ impl BlockSyncManager {
         Action::VerifyQcSignature {
             qc,
             public_keys,
+            voting_powers,
+            quorum_threshold,
             block_hash,
         }
     }
