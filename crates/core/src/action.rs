@@ -316,11 +316,12 @@ pub enum Action {
         ec_public_keys: Vec<Vec<Bls12381G1PublicKey>>,
     },
 
-    /// Verify a Quorum Certificate's aggregated BLS signature.
+    /// Verify a Quorum Certificate's aggregated BLS signature **and**
+    /// confirm the signers carry quorum-meeting voting power. Both checks
+    /// together constitute the [`VerifiedQuorumCertificate`] predicate.
     ///
-    /// This is CRITICAL for shard consensus safety: we must verify that the QC's aggregated signature
-    /// was actually produced by the claimed signers. Without this check, a Byzantine proposer
-    /// could include a fake QC with invalid signatures.
+    /// CRITICAL for shard consensus safety: a Byzantine proposer could otherwise
+    /// include a fake QC with invalid signatures or under-quorum signers.
     ///
     /// Delegated to a thread pool in production, instant in simulation.
     /// Returns `ProtocolEvent::QcSignatureVerified` when complete.
@@ -329,6 +330,10 @@ pub enum Action {
         qc: QuorumCertificate,
         /// Public keys of the signers (pre-resolved by state machine from QC's signer bitfield).
         public_keys: Vec<Bls12381G1PublicKey>,
+        /// Voting power for each committee member (parallel to `public_keys`).
+        voting_powers: Vec<VotePower>,
+        /// Quorum threshold for the QC's shard.
+        quorum_threshold: VotePower,
         /// The block hash this QC verification is associated with (for correlation).
         /// This is the hash of the block whose header contains this QC as `parent_qc`.
         block_hash: BlockHash,

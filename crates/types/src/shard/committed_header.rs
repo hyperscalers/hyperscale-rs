@@ -1,11 +1,29 @@
 //! `CommittedBlockHeader` — block header paired with the QC that committed it.
 
 use sbor::prelude::*;
+use thiserror::Error;
 
 use crate::{
-    BlockHash, BlockHeader, BlockHeight, QuorumCertificate, ShardGroupId, StateRoot, Verifiable,
-    VerifiedQuorumCertificate,
+    BlockHash, BlockHeader, BlockHeight, QcVerifyError, QuorumCertificate, ShardGroupId, StateRoot,
+    Verifiable, VerifiedQuorumCertificate,
 };
+
+/// Failure modes of [`CommittedBlockHeader`] verification.
+///
+/// Combines QC-level failures with the linkage check that ties the QC to
+/// its paired header. Phase 4 will promote this to the construction
+/// predicate of `VerifiedCommittedBlockHeader`; until then the variants
+/// surface through the `RemoteHeaderQcVerified` event payload.
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum CommittedHeaderVerifyError {
+    /// The QC failed its own verification predicate.
+    #[error("QC verification failed: {0}")]
+    Qc(#[from] QcVerifyError),
+    /// The QC's `block_hash` does not match the paired header's
+    /// computed hash. Indicates a malformed or adversarial pair.
+    #[error("qc.block_hash does not match header.hash()")]
+    LinkageMismatch,
+}
 
 /// A block header paired with the QC that committed it.
 ///

@@ -9,11 +9,11 @@ use std::sync::Arc;
 
 use hyperscale_types::{
     BeaconProposal, Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote,
-    CertifiedBeaconBlock, CertifiedBlock, CommittedBlockHeader, Epoch, ExecutionCertificate,
-    ExecutionVote, FinalizedWave, PcQc3, PcVector, PcVoteMessage, Provisions, QuorumCertificate,
-    ReadySignal, Round, RoutableTransaction, ShardGroupId, ShardWitness, SkipEpochCert,
-    SkipRequest, SpcCert, SpcEmptyViewMsg, SpcView, StoredReceipt, TxOutcome, ValidatorId,
-    VotePower, WaveId, WeightedTimestamp,
+    CertifiedBeaconBlock, CertifiedBlock, CommittedBlockHeader, CommittedHeaderVerifyError, Epoch,
+    ExecutionCertificate, ExecutionVote, FinalizedWave, PcQc3, PcVector, PcVoteMessage, Provisions,
+    QcVerifyError, QuorumCertificate, ReadySignal, Round, RoutableTransaction, ShardGroupId,
+    ShardWitness, SkipEpochCert, SkipRequest, SpcCert, SpcEmptyViewMsg, SpcView, StoredReceipt,
+    TxOutcome, ValidatorId, VerifiedQuorumCertificate, VotePower, WaveId, WeightedTimestamp,
 };
 
 /// How a node learned about the certifying QC that commits a given block.
@@ -137,8 +137,10 @@ pub enum ProtocolEvent {
     QuorumCertificateFormed {
         /// Block the QC certifies.
         block_hash: BlockHash,
-        /// The newly formed QC.
-        qc: QuorumCertificate,
+        /// The newly formed QC. Verified by construction — built from
+        /// pre-verified votes whose combined power cleared the quorum
+        /// threshold in `verify_and_build_qc`.
+        qc: VerifiedQuorumCertificate,
     },
 
     /// A block is ready to be committed.
@@ -176,18 +178,20 @@ pub enum ProtocolEvent {
     QuorumCertificateResult {
         /// Block hash the QC was assembled for.
         block_hash: BlockHash,
-        /// The QC if quorum was reached, or `None` if not.
-        qc: Option<QuorumCertificate>,
+        /// The verified QC if quorum was reached, or `None` if not.
+        qc: Option<VerifiedQuorumCertificate>,
         /// Verified votes, returned for accumulation when no QC was built.
         verified_votes: Vec<(usize, BlockVote, VotePower)>,
     },
 
-    /// QC signature verification completed.
+    /// QC signature verification completed. The payload carries the
+    /// verified QC directly so the consumer doesn't need a separate
+    /// cache lookup after a positive result.
     QcSignatureVerified {
         /// Block whose parent-QC signature was verified.
         block_hash: BlockHash,
-        /// `true` when the aggregated signature passed verification.
-        valid: bool,
+        /// Verified QC on success; the reason it failed otherwise.
+        result: Result<VerifiedQuorumCertificate, QcVerifyError>,
     },
 
     /// Remote header QC verification completed.
@@ -196,10 +200,15 @@ pub enum ProtocolEvent {
         shard: ShardGroupId,
         /// Remote block height (for correlation).
         height: BlockHeight,
-        /// The verified committed header.
+        /// The committed header whose QC was verified (the QC field
+        /// inside remains structurally `Verifiable::Unverified` because
+        /// `Arc<CommittedBlockHeader>` can't be upgraded in place; the
+        /// authoritative verified handle rides in `result`).
         committed_header: Arc<CommittedBlockHeader>,
-        /// `true` when the QC passed verification.
-        valid: bool,
+        /// Verified QC on success; the reason verification failed
+        /// otherwise (QC-level signature/quorum failure or QC↔header
+        /// linkage mismatch).
+        result: Result<VerifiedQuorumCertificate, CommittedHeaderVerifyError>,
     },
 
     /// A remote committed block header has been fully verified (QC + structural checks).

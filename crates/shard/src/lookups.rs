@@ -5,7 +5,9 @@
 //! the coordinator so the topology-only parts are unit-testable without a
 //! full driver fixture.
 
-use hyperscale_types::{BlockHeight, Bls12381G1PublicKey, Round, TopologySnapshot, ValidatorId};
+use hyperscale_types::{
+    BlockHeight, Bls12381G1PublicKey, Round, TopologySnapshot, ValidatorId, VotePower,
+};
 use tracing::warn;
 
 /// Recipients for a vote at `(height, round)`.
@@ -75,6 +77,30 @@ pub fn committee_public_keys(topology: &TopologySnapshot) -> Option<Vec<Bls12381
     }
 
     Some(pubkeys)
+}
+
+/// Resolve voting power for every member of the local shard's committee,
+/// indexed parallel to [`committee_public_keys`].
+///
+/// Returns `None` if any committee index fails to resolve — same failure
+/// semantics as the public-key lookup.
+pub fn committee_voting_powers(topology: &TopologySnapshot) -> Option<Vec<VotePower>> {
+    let committee_size = topology.local_committee_size();
+    let mut powers = Vec::with_capacity(committee_size);
+
+    for idx in 0..committee_size {
+        let Some(validator_id) = topology.local_validator_at_index(idx) else {
+            warn!(idx, "Invalid committee index for voting power lookup");
+            return None;
+        };
+        let Some(power) = topology.voting_power(validator_id) else {
+            warn!(validator_id = ?validator_id, "Missing voting power for committee member");
+            return None;
+        };
+        powers.push(power);
+    }
+
+    Some(powers)
 }
 
 #[cfg(test)]

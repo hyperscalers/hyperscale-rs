@@ -81,8 +81,8 @@ use hyperscale_core::VerificationKind;
 use hyperscale_storage::{BeaconWitnessCommit, RecoveredState};
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, CertifiedBlock,
-    CommittedBlockHeader, FinalizedWave, Provisions, QuorumCertificate, Round, RoutableTransaction,
-    StateRoot, TopologySnapshot, TxHash, VotePower,
+    CommittedBlockHeader, FinalizedWave, Provisions, QcVerifyError, QuorumCertificate, Round,
+    RoutableTransaction, StateRoot, TopologySnapshot, TxHash, VerifiedQuorumCertificate, VotePower,
 };
 use tracing::field::Empty;
 use tracing::{debug, info, instrument, trace, warn};
@@ -96,7 +96,7 @@ use crate::commit_dedup::CommitDedupIndex;
 use crate::commit_pipeline::CommitPipeline;
 use crate::config::ShardConsensusConfig;
 use crate::deferred_qc::DeferredQc;
-use crate::lookups::{committee_public_keys, vote_recipients};
+use crate::lookups::{committee_public_keys, committee_voting_powers, vote_recipients};
 use crate::pending::{PendingBlock, PendingBlocks};
 use crate::proposal::{
     ProposalKind, ProposalTracker, TakeResult, assemble_build_action, dispatch_or_defer,
@@ -143,6 +143,10 @@ pub struct ShardCoordinator {
     committed_state_root: StateRoot,
 
     /// Latest QC (certifies the latest certified block).
+    ///
+    /// Currently stored raw; promotion to `Option<VerifiedQuorumCertificate>`
+    /// is deferred to a follow-up commit so this change stays focused on
+    /// the event/action surface.
     latest_qc: Option<QuorumCertificate>,
 
     /// QC deferred because the block header wasn't in memory when it formed.
@@ -1340,11 +1344,19 @@ impl ShardCoordinator {
                 return vec![];
             }
 
-            // Collect public keys for verification
+            // Collect public keys and voting powers for verification —
+            // both halves of the QC's predicate (Decision 10).
             let Some(public_keys) = committee_public_keys(topology_snapshot) else {
                 warn!("Failed to collect public keys for QC verification");
                 return vec![];
             };
+            let Some(voting_powers) = committee_voting_powers(topology_snapshot) else {
+                warn!("Failed to collect voting powers for QC verification");
+                return vec![];
+            };
+            let quorum_threshold = VotePower::quorum_threshold(
+                topology_snapshot.voting_power_for_shard(topology_snapshot.local_shard()),
+            );
 
             // Store pending verification info
             self.verification
@@ -1354,6 +1366,8 @@ impl ShardCoordinator {
             return vec![Action::VerifyQcSignature {
                 qc: header.parent_qc().clone(),
                 public_keys,
+                voting_powers,
+                quorum_threshold,
                 block_hash,
             }];
         }
@@ -1639,7 +1653,7 @@ impl ShardCoordinator {
         &mut self,
         topology_snapshot: &TopologySnapshot,
         block_hash: BlockHash,
-        qc: Option<QuorumCertificate>,
+        qc: Option<VerifiedQuorumCertificate>,
         verified_votes: Vec<(usize, BlockVote, VotePower)>,
     ) -> Vec<Action> {
         if let Some(qc) = qc {
@@ -1682,14 +1696,16 @@ impl ShardCoordinator {
     /// Handle QC signature verification result.
     ///
     /// Called when the runner completes `Action::VerifyQcSignature`.
-    /// If valid, we proceed to vote on the block (for consensus) or apply the block (for sync).
-    #[instrument(skip(self), fields(block_hash = ?block_hash, valid = valid))]
+    /// On success, the verified QC rides in the event payload — no
+    /// separate cache lookup needed.
+    #[instrument(skip(self, result), fields(block_hash = ?block_hash, valid = result.is_ok()))]
     pub fn on_qc_signature_verified(
         &mut self,
         topology_snapshot: &TopologySnapshot,
         block_hash: BlockHash,
-        valid: bool,
+        result: Result<VerifiedQuorumCertificate, QcVerifyError>,
     ) -> Vec<Action> {
+        let valid = result.is_ok();
         // Check if this is a synced block verification
         info!(
             block_hash = ?block_hash,
@@ -1698,8 +1714,8 @@ impl ShardCoordinator {
             pending_consensus_count = self.verification.pending_qc_count(),
             "on_qc_signature_verified: received callback"
         );
-        if let Some(result) = self.block_sync.on_qc_verified(block_hash, valid) {
-            return match result {
+        if let Some(sync_result) = self.block_sync.on_qc_verified(block_hash, valid) {
+            return match sync_result {
                 // Even on failure, try applying verified blocks below the gap.
                 // The failed block creates a gap that blocks further progress,
                 // but blocks already verified at lower heights can still apply.
@@ -1718,16 +1734,21 @@ impl ShardCoordinator {
             return vec![];
         };
 
-        if !is_valid {
-            warn!(
-                block_hash = ?block_hash,
-                height = header.height().inner(),
-                "QC signature verification FAILED - potential Byzantine attack! Rejecting block."
-            );
-            // Remove the pending block since we can't trust it; surface any
-            // orphaned local-DA fetches so the FSM releases their slots.
-            return self.remove_pending_block(block_hash).into_iter().collect();
-        }
+        let verified_qc = match result {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    block_hash = ?block_hash,
+                    height = header.height().inner(),
+                    reason = %e,
+                    "QC signature verification FAILED - potential Byzantine attack! Rejecting block."
+                );
+                // Remove the pending block since we can't trust it; surface any
+                // orphaned local-DA fetches so the FSM releases their slots.
+                let _ = is_valid; // tracked by `verification.on_qc_verified` for diagnostics
+                return self.remove_pending_block(block_hash).into_iter().collect();
+            }
+        };
 
         debug!(
             block_hash = ?block_hash,
@@ -1739,16 +1760,20 @@ impl ShardCoordinator {
         // with the same parent_qc (e.g., during view changes). Cache hits
         // require full byte equality with the cached QC — see the field
         // doc on `VerificationPipeline::verified_qcs`.
-        self.verification
-            .cache_verified_qc(header.parent_qc().clone());
+        //
+        // Cache + adoption sites still take a raw QC; the verified
+        // marker comes from the call path's invariant. A follow-up
+        // commit will promote both to `VerifiedQuorumCertificate`.
+        let raw_qc: QuorumCertificate = (*verified_qc).clone();
+        self.verification.cache_verified_qc(raw_qc.clone());
 
         // The parent QC is now provably authentic; perform the adoption
         // that `absorb_parent_qc_from_header` deferred. Safe to run before
         // `try_vote_on_block` — adoption only mutates `latest_qc` /
         // commit-related state, not the per-block voting machinery.
         let mut actions = Vec::new();
-        if self.has_complete_block_at_height(header.parent_qc().height()) {
-            actions.extend(self.try_adopt_verified_qc(topology_snapshot, header.parent_qc()));
+        if self.has_complete_block_at_height(raw_qc.height()) {
+            actions.extend(self.try_adopt_verified_qc(topology_snapshot, &raw_qc));
         }
 
         // QC is valid - proceed to vote on the block
@@ -2574,11 +2599,20 @@ impl ShardCoordinator {
             warn!("Failed to collect public keys for synced block QC verification");
             return vec![];
         };
+        let Some(voting_powers) = committee_voting_powers(topology_snapshot) else {
+            warn!("Failed to collect voting powers for synced block QC verification");
+            return vec![];
+        };
+        let quorum_threshold = VotePower::quorum_threshold(
+            topology_snapshot.voting_power_for_shard(topology_snapshot.local_shard()),
+        );
 
-        vec![
-            self.block_sync
-                .register_for_verification(certified, public_keys),
-        ]
+        vec![self.block_sync.register_for_verification(
+            certified,
+            public_keys,
+            voting_powers,
+            quorum_threshold,
+        )]
     }
 
     /// Try to drain buffered synced blocks in sequential order. Asks
@@ -3693,7 +3727,10 @@ mod tests {
             "precondition: latest_qc not yet at height 1"
         );
 
-        let _ = state.on_qc_signature_verified(&topology, block_hash, true);
+        // SAFETY: test scaffold — the parent_qc was constructed locally,
+        // so wrapping it as verified models the action arm's success result.
+        let verified = VerifiedQuorumCertificate::new_unchecked(header.parent_qc().clone());
+        let _ = state.on_qc_signature_verified(&topology, block_hash, Ok(verified));
         assert_eq!(
             state.latest_qc.as_ref().map(QuorumCertificate::height),
             Some(BlockHeight::new(1)),
@@ -3769,7 +3806,9 @@ mod tests {
         );
 
         // QC verified — but state root verification is still pending, so no vote yet.
-        let after_qc = state.on_qc_signature_verified(&topology, block_hash, true);
+        // SAFETY: test scaffold — parent_qc built locally.
+        let verified = VerifiedQuorumCertificate::new_unchecked(header.parent_qc().clone());
+        let after_qc = state.on_qc_signature_verified(&topology, block_hash, Ok(verified));
         assert!(
             !after_qc
                 .iter()
@@ -3860,7 +3899,11 @@ mod tests {
         );
         assert!(state.pending_blocks.contains_key(block_hash));
 
-        let actions = state.on_qc_signature_verified(&topology, block_hash, false);
+        let actions = state.on_qc_signature_verified(
+            &topology,
+            block_hash,
+            Err(QcVerifyError::InvalidSignature),
+        );
         assert!(actions.is_empty());
         assert!(!state.pending_blocks.contains_key(block_hash));
     }
