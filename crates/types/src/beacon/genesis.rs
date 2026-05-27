@@ -54,9 +54,9 @@ pub struct GenesisPool {
 /// the state builder. Every field is consensus-critical — two
 /// validators with different `BeaconGenesisConfig`s produce divergent
 /// `BeaconState`s at epoch 0 and never converge. The SBOR-canonical
-/// hash of this struct is the [`GenesisConfigHash`] embedded in
-/// [`SpcCert::Genesis`](crate::SpcCert), binding the chain identity to
-/// operator-supplied TOML; see [`genesis_config_hash`].
+/// hash of this struct is the [`GenesisConfigHash`] carried by
+/// [`BeaconCert::Genesis`](crate::BeaconCert), binding the chain
+/// identity to operator-supplied TOML; see [`genesis_config_hash`].
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct BeaconGenesisConfig {
     /// Initial validator set.
@@ -78,8 +78,8 @@ pub struct BeaconGenesisConfig {
     pub initial_randomness: Randomness,
 }
 
-/// Hash a [`BeaconGenesisConfig`] into the [`GenesisConfigHash`] embedded
-/// in [`SpcCert::Genesis`](crate::SpcCert).
+/// Hash a [`BeaconGenesisConfig`] into the [`GenesisConfigHash`] carried
+/// by [`BeaconCert::Genesis`](crate::BeaconCert).
 ///
 /// Pure function over the SBOR-canonical encoding plus the network's
 /// id byte. Two operators with byte-identical TOML produce the same

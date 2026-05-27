@@ -13,7 +13,7 @@
 //! commits the genesis pair on an empty store, then loads it back via
 //! the same `latest_committed()` call. When the loaded block is
 //! genesis the constructor debug-asserts its
-//! [`SpcCert::Genesis`](hyperscale_types::SpcCert) `config_hash`
+//! [`BeaconCert::Genesis`](hyperscale_types::BeaconCert) `config_hash`
 //! matches `expected_config_hash` — a tripwire against booting a
 //! validator off a chain initialised by a different operator TOML.
 

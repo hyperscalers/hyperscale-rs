@@ -163,8 +163,7 @@ pub fn verify_empty_view_msg(
 /// the cert's claimed view-entry from its own contents.
 ///
 /// Direct certs authorise entry to `prev_view + 1`; indirect certs to
-/// their `for_view`. Genesis certs aren't SPC view-entries and are
-/// rejected here — beacon-block genesis verification has its own path.
+/// their `for_view`.
 ///
 /// Use this when verifying an arbitrary cert as a standalone proof,
 /// not when verifying a cert in the context of a known target view
@@ -177,7 +176,6 @@ pub fn verify_block_cert(
     committee: &[(ValidatorId, Bls12381G1PublicKey)],
 ) -> bool {
     match cert {
-        SpcCert::Genesis { .. } => false,
         SpcCert::Direct { prev_view, .. } => {
             let Some(entering) = prev_view.inner().checked_add(1) else {
                 return false;
@@ -205,11 +203,6 @@ pub fn verify_cert(
     committee: &[(ValidatorId, Bls12381G1PublicKey)],
 ) -> bool {
     match cert {
-        // Genesis isn't a real SPC view-entry cert — it's a chain
-        // bootstrap. Rejecting here means the SPC FSM can't be tricked
-        // into accepting a Genesis cert as a view-entry authorisation;
-        // genesis-block verification has its own path.
-        SpcCert::Genesis { .. } => false,
         SpcCert::Direct {
             prev_view,
             value,
@@ -530,9 +523,6 @@ fn parent_of(
                     target_value,
                     ..
                 } => (*target_view, target_value.clone()),
-                // Genesis certs never ride in SPC proposal objects;
-                // the FSM rejects them at ingestion. Unreachable here.
-                SpcCert::Genesis { .. } => return None,
             });
         }
     }
@@ -554,16 +544,8 @@ fn has_parent(
 /// should update to on cert acceptance. Direct certs reference their
 /// own `(prev_view, value, proof)`; indirect certs reference the
 /// `(target_view, target_value, target_proof)` triple.
-///
-/// # Panics
-///
-/// Panics on [`SpcCert::Genesis`] — the SPC FSM rejects Genesis certs
-/// at ingestion, so callers must never reach this function with one.
 fn referenced_triple(cert: &SpcCert) -> SpcHighTriple {
     match cert {
-        SpcCert::Genesis { .. } => {
-            panic!("referenced_triple: SpcCert::Genesis not valid inside SPC FSM")
-        }
         SpcCert::Direct {
             prev_view,
             value,
@@ -1071,8 +1053,6 @@ impl SpcInstance {
                 target_value,
                 ..
             } => (*target_view, target_value.clone()),
-            // Genesis carries no FSM-level entry semantics.
-            SpcCert::Genesis { .. } => return vec![],
         };
         if !has_parent(prev_view, &parent_value, &self.proposals_by_hash) {
             return vec![];
