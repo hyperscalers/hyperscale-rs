@@ -49,7 +49,6 @@ use hyperscale_types::{
     PcVoteEquivocation, PcVoteMessage, PositionalBundle, SignerBitfield, SkipReport, SpcCert,
     SpcContext, SpcEmptyViewMsg, SpcHighTriple, SpcMessage, SpcProposalObject, SpcView,
     ValidatorId, aggregate_verify_bls_different_messages, pc_context, pc_vote_signing_message,
-    spc_context,
 };
 
 use crate::pc::{PcEffect, PcEvent, PcInstance, verify_qc3};
@@ -698,7 +697,7 @@ pub enum SpcEvent {
         /// The verified vote, round implicit in the variant.
         vote: PcVoteMessage,
     },
-    /// `new-view` from a peer entering `view` under `cert`.
+    /// BLS-verified `new-view` from a peer entering `view` under `cert`.
     ///
     /// `from` is the transport-level sender id. `NewView` isn't
     /// sender-signed (the cert authenticates the parent claim
@@ -706,7 +705,7 @@ pub enum SpcEvent {
     /// proposal-object epoch this `NewView` fills. Two distinct valid
     /// certs from the same `from` are valid relays, not equivocation —
     /// last-write-wins.
-    NewView {
+    NewViewVerified {
         /// Validator that relayed this notification.
         from: ValidatorId,
         /// View the peer entered.
@@ -714,9 +713,9 @@ pub enum SpcEvent {
         /// Cert backing the entry.
         cert: Box<SpcCert>,
     },
-    /// `new-commit` from a peer. Self-authenticating via the embedded
-    /// `proof`; sender label isn't load-bearing.
-    NewCommit {
+    /// BLS-verified `new-commit` from a peer. Self-authenticating via
+    /// the embedded `proof`; sender label isn't load-bearing.
+    NewCommitVerified {
         /// View whose inner PC produced this commit.
         view: SpcView,
         /// Committed low value.
@@ -724,8 +723,8 @@ pub enum SpcEvent {
         /// PC round-3 cert anchoring `value` as `proof.x_pp`.
         proof: Box<PcQc3>,
     },
-    /// `empty-view` attestation from a peer.
-    EmptyView(Box<SpcEmptyViewMsg>),
+    /// BLS-verified `empty-view` attestation from a peer.
+    EmptyViewVerified(Box<SpcEmptyViewMsg>),
     /// Timer for `view` fired — its leader's grace period elapsed.
     /// Drives `RunVPC(view)` even on a partial proposal-object
     /// buffer so a silent leader can't stall the view indefinitely.
@@ -746,9 +745,11 @@ impl SpcEvent {
     pub fn from_message(msg: SpcMessage, from: ValidatorId) -> Option<Self> {
         Some(match msg {
             SpcMessage::VpcMsg(_) => return None,
-            SpcMessage::NewView { view, cert } => Self::NewView { from, view, cert },
-            SpcMessage::NewCommit { view, value, proof } => Self::NewCommit { view, value, proof },
-            SpcMessage::EmptyView(msg) => Self::EmptyView(msg),
+            SpcMessage::NewView { view, cert } => Self::NewViewVerified { from, view, cert },
+            SpcMessage::NewCommit { view, value, proof } => {
+                Self::NewCommitVerified { view, value, proof }
+            }
+            SpcMessage::EmptyView(msg) => Self::EmptyViewVerified(msg),
         })
     }
 }
@@ -799,9 +800,7 @@ const MAX_PENDING_EMPTY_VIEW_AHEAD: u32 = 4;
 /// view-change (empty-view attestations → indirect cert → skip
 /// ahead).
 pub struct SpcInstance {
-    network: NetworkDefinition,
     epoch: Epoch,
-    spc_ctx: SpcContext,
     committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
     me: ValidatorId,
     view_timeout: Duration,
@@ -843,22 +842,18 @@ impl SpcInstance {
     /// Panics if `committee.len() < 4` (inherited from `PcInstance`).
     #[must_use]
     pub fn new(
-        network: NetworkDefinition,
         epoch: Epoch,
         committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
         me: ValidatorId,
         view_timeout: Duration,
     ) -> Self {
-        let spc_ctx = spc_context(epoch);
         let mut views = BTreeMap::new();
         views.insert(
             SpcView::new(1),
             ViewState::new(epoch, SpcView::new(1), committee.clone()),
         );
         Self {
-            network,
             epoch,
-            spc_ctx,
             committee,
             me,
             view_timeout,
@@ -916,9 +911,13 @@ impl SpcInstance {
         match event {
             SpcEvent::Input(v) => self.on_input(v),
             SpcEvent::PcVoteVerified { view, vote } => self.on_pc_vote_verified(view, vote),
-            SpcEvent::NewView { from, view, cert } => self.on_new_view(from, view, *cert),
-            SpcEvent::NewCommit { view, value, proof } => self.on_new_commit(view, &value, *proof),
-            SpcEvent::EmptyView(msg) => self.on_empty_view(*msg),
+            SpcEvent::NewViewVerified { from, view, cert } => {
+                self.on_new_view_verified(from, view, *cert)
+            }
+            SpcEvent::NewCommitVerified { view, value, proof } => {
+                self.on_new_commit_verified(view, &value, *proof)
+            }
+            SpcEvent::EmptyViewVerified(msg) => self.on_empty_view_verified(*msg),
             SpcEvent::TimerExpired { view } => self.on_timer_expired(view),
         }
     }
@@ -1069,10 +1068,15 @@ impl SpcInstance {
         out
     }
 
-    fn on_new_view(&mut self, from: ValidatorId, view: SpcView, cert: SpcCert) -> Vec<SpcEffect> {
-        if !verify_cert(&cert, view, &self.network, &self.spc_ctx, &self.committee) {
-            return vec![];
-        }
+    /// Admit a BLS-verified `NewView`. Caller MUST have already verified
+    /// the cert; this entry skips the sig check and runs the FSM-level
+    /// `has_parent` / view-entry logic.
+    fn on_new_view_verified(
+        &mut self,
+        from: ValidatorId,
+        view: SpcView,
+        cert: SpcCert,
+    ) -> Vec<SpcEffect> {
         if view.inner() < self.current_view.inner() {
             return vec![];
         }
@@ -1087,7 +1091,7 @@ impl SpcInstance {
                 target_value,
                 ..
             } => (*target_view, target_value.clone()),
-            // Genesis already rejected by verify_cert above.
+            // Genesis carries no FSM-level entry semantics.
             SpcCert::Genesis { .. } => return vec![],
         };
         if !has_parent(prev_view, &parent_value, &self.proposals_by_hash) {
@@ -1096,7 +1100,14 @@ impl SpcInstance {
         self.enter_view(from, view, cert)
     }
 
-    fn on_new_commit(&mut self, view: SpcView, value: &PcVector, proof: PcQc3) -> Vec<SpcEffect> {
+    /// Admit a BLS-verified `NewCommit`. Caller MUST have already
+    /// verified the embedded QC3.
+    fn on_new_commit_verified(
+        &mut self,
+        view: SpcView,
+        value: &PcVector,
+        proof: PcQc3,
+    ) -> Vec<SpcEffect> {
         // View-1 new-commits carry no information the local FSM acts on
         // — peers learn view 1 from view-2 NewView, which embeds the
         // view-1 QC3 in its direct cert. Defensive drop; honest peers
@@ -1105,13 +1116,9 @@ impl SpcInstance {
         if view.inner() == 1 {
             return vec![];
         }
-        // `new-commit` is self-authenticating via the embedded
-        // `PcQc3` whose low is the committed value. Verify under the
-        // view's PC context, then walk the parent chain.
-        let pc_ctx = pc_context(&self.spc_ctx, view);
-        if !verify_qc3(&proof, &self.network, &pc_ctx, &self.committee) {
-            return vec![];
-        }
+        // FSM-level binding between the committed `value` and the
+        // cert's low. The crypto pool checked the QC3 signature; this
+        // method enforces the structural identity.
         if proof.x_pp() != value {
             return vec![];
         }
@@ -1183,7 +1190,9 @@ impl SpcInstance {
         out
     }
 
-    fn on_empty_view(&mut self, msg: SpcEmptyViewMsg) -> Vec<SpcEffect> {
+    /// Admit a BLS-verified `EmptyView` attestation. Caller MUST have
+    /// already verified the sig + embedded QC3.
+    fn on_empty_view_verified(&mut self, msg: SpcEmptyViewMsg) -> Vec<SpcEffect> {
         self.process_empty_view(msg)
     }
 
@@ -1206,8 +1215,9 @@ impl SpcInstance {
         self.translate_pc_effects(view, pc_effects)
     }
 
-    /// Validate an empty-view, add it to `Q_i,w`, and on reaching
-    /// `f + 1` distinct signers build an indirect cert and advance.
+    /// Add a verified empty-view to `Q_i,w`, and on reaching `f + 1`
+    /// distinct signers build an indirect cert and advance. Caller MUST
+    /// have already verified the sig + embedded reported-triple QC3.
     fn process_empty_view(&mut self, msg: SpcEmptyViewMsg) -> Vec<SpcEffect> {
         let view = msg.view;
         if view.inner() < self.current_view.inner() {
@@ -1216,9 +1226,6 @@ impl SpcInstance {
         // Paper requires `w > w_h` — empty-view must skip ahead of
         // the reported high triple's view.
         if view.inner() <= msg.reported.view.inner() {
-            return vec![];
-        }
-        if !verify_empty_view_msg(&msg, &self.network, &self.spc_ctx, &self.committee) {
             return vec![];
         }
         if !has_parent(
@@ -1575,7 +1582,6 @@ mod tests {
     fn fsm_instance(idx: usize) -> SpcInstance {
         let (_, members) = fsm_committee(4);
         SpcInstance::new(
-            net(),
             Epoch::new(1),
             members.clone(),
             members[idx].0,
@@ -1732,7 +1738,7 @@ mod tests {
             SpcView::new(3),
             reported,
         );
-        let effects = fsm.handle(SpcEvent::EmptyView(Box::new(msg)));
+        let effects = fsm.handle(SpcEvent::EmptyViewVerified(Box::new(msg)));
         assert!(effects.is_empty());
     }
 }

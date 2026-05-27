@@ -982,6 +982,11 @@ pub enum Action {
     VerifySpcNewCommit {
         /// Epoch the SPC instance belongs to.
         epoch: Epoch,
+        /// Wire-level sender — carried back through the result so the
+        /// coordinator can clear its per-`(epoch, view, sender)`
+        /// pipeline slot. `NewCommit` is self-authenticating via
+        /// `proof`, so this label is dedup metadata only.
+        from: ValidatorId,
         /// SPC view whose inner PC produced this commit.
         view: SpcView,
         /// Committed low value.
