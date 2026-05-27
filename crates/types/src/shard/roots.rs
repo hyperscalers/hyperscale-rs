@@ -28,10 +28,10 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::{
-    BoundedBTreeMap, CertificateRoot, FinalizedWave, Hash, LocalReceiptRoot,
+    BeaconWitnessRoot, BoundedBTreeMap, CertificateRoot, FinalizedWave, Hash, LocalReceiptRoot,
     MAX_REMOTE_SHARDS_PER_WAVE, ProvisionTxRoot, ProvisionsRoot, RoutableTransaction, ShardGroupId,
-    StoredReceipt, TopologySnapshot, TransactionRoot, Verify, compute_merkle_root,
-    compute_provision_tx_roots,
+    StoredReceipt, TopologySnapshot, TransactionRoot, TxHash, Verify, WeightedTimestamp,
+    compute_merkle_root, compute_provision_tx_roots,
 };
 
 // ─── VerifiedCertificateRoot ────────────────────────────────────────────────
@@ -350,6 +350,12 @@ pub struct TransactionRootContext<'a> {
     /// The block's transactions — each contributes one leaf (its
     /// content hash) to the recomputed root.
     pub transactions: &'a [Arc<RoutableTransaction>],
+    /// Parent QC's `weighted_timestamp` — the shard-consensus-authenticated
+    /// clock for this block, used as the anchor every tx's `validity_range`
+    /// must enclose. An honest cluster never sees a window mismatch here
+    /// because the proposer applied the same check during transaction
+    /// selection.
+    pub validity_anchor: WeightedTimestamp,
 }
 
 /// Failure modes of [`TransactionRoot`] verification.
@@ -364,14 +370,34 @@ pub enum TxRootVerifyError {
         /// Root computed from the supplied transactions.
         computed: TransactionRoot,
     },
+    /// A transaction's `validity_range` either was malformed or did not
+    /// contain the parent QC's weighted timestamp.
+    #[error(
+        "tx {tx_hash:?} validity window {start_ms}..{end_ms} \
+         does not contain anchor {anchor_ms}"
+    )]
+    ValidityWindowExpired {
+        /// Hash of the offending transaction.
+        tx_hash: TxHash,
+        /// Anchor (parent QC's weighted timestamp) in millis.
+        anchor_ms: u64,
+        /// Start of the tx's validity window in millis (inclusive).
+        start_ms: u64,
+        /// End of the tx's validity window in millis (exclusive).
+        end_ms: u64,
+    },
 }
 
-/// Transaction merkle root whose authenticity against a list of
-/// transactions is type-level.
+/// Transaction merkle root paired with type-level proof that every
+/// included transaction is in-window for this block.
 ///
-/// Construction asserts: the wrapped [`TransactionRoot`] equals
-/// `compute_merkle_root` of each transaction's hash, in block order
-/// (already hash-ascending).
+/// Construction asserts both:
+///
+/// 1. The wrapped [`TransactionRoot`] equals `compute_merkle_root` of
+///    each transaction's hash, in block order (already hash-ascending).
+/// 2. Every transaction's `validity_range` is well-formed against and
+///    contains the block's `validity_anchor` (the parent QC's
+///    weighted timestamp).
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VerifiedTransactionRoot(TransactionRoot);
@@ -427,6 +453,17 @@ impl Verify<&TransactionRootContext<'_>> for TransactionRoot {
                 expected: *self,
                 computed,
             });
+        }
+        for tx in ctx.transactions {
+            let range = tx.validity_range();
+            if !range.is_well_formed(ctx.validity_anchor) || !range.contains(ctx.validity_anchor) {
+                return Err(TxRootVerifyError::ValidityWindowExpired {
+                    tx_hash: tx.hash(),
+                    anchor_ms: ctx.validity_anchor.as_millis(),
+                    start_ms: range.start_timestamp_inclusive.as_millis(),
+                    end_ms: range.end_timestamp_exclusive.as_millis(),
+                });
+            }
         }
         Ok(VerifiedTransactionRoot(*self))
     }
@@ -534,5 +571,72 @@ impl Verify<&ProvisionTxRootsContext<'_>> for ProvisionTxRootsMap {
             return Err(ProvisionTxRootsVerifyError::Mismatch { expected, computed });
         }
         Ok(VerifiedProvisionTxRoots(self.clone()))
+    }
+}
+
+// ─── VerifiedBeaconWitnessRoot ──────────────────────────────────────────────
+//
+// The `Verify` impl and `BeaconWitnessRootContext` live in the
+// `hyperscale-shard` crate alongside the leaf-derivation helpers; only
+// the verified type and error live here so they can ride in
+// protocol-event payloads from `hyperscale-core`.
+
+/// Failure modes of [`BeaconWitnessRoot`] verification.
+#[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
+pub enum BeaconWitnessRootVerifyError {
+    /// Either the recomputed merkle root or the leaf count diverges
+    /// from the header's claim — either one fails the block.
+    #[error(
+        "computed beacon-witness root {computed_root:?}/count {computed_count} ≠ \
+         claimed {expected_root:?}/count {expected_count}"
+    )]
+    Mismatch {
+        /// Header's claimed beacon-witness root.
+        expected_root: BeaconWitnessRoot,
+        /// Root computed by re-deriving leaves and merkle-ing.
+        computed_root: BeaconWitnessRoot,
+        /// Header's claimed leaf count.
+        expected_count: u64,
+        /// Count computed from the recomputed leaves.
+        computed_count: u64,
+    },
+}
+
+/// Verified beacon-witness root whose authenticity against the block's
+/// witness inputs is type-level.
+///
+/// Construction asserts: re-deriving the block's new witness payloads
+/// from `receipts`, the missed-round walk, and `ready_signals` (in the
+/// canonical leaf-derivation order), appending their leaf hashes to
+/// `parent_witness_leaves`, and merkle-ing the result produces a root
+/// and leaf count equal to the wrapped values.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerifiedBeaconWitnessRoot(BeaconWitnessRoot);
+
+impl VerifiedBeaconWitnessRoot {
+    /// Audit-point constructor. Skips the predicate.
+    #[must_use]
+    pub const fn new_unchecked(root: BeaconWitnessRoot) -> Self {
+        Self(root)
+    }
+
+    /// Consume and return the raw root, dropping the verified claim.
+    #[must_use]
+    pub const fn into_inner(self) -> BeaconWitnessRoot {
+        self.0
+    }
+}
+
+impl AsRef<BeaconWitnessRoot> for VerifiedBeaconWitnessRoot {
+    fn as_ref(&self) -> &BeaconWitnessRoot {
+        &self.0
+    }
+}
+
+impl Deref for VerifiedBeaconWitnessRoot {
+    type Target = BeaconWitnessRoot;
+    fn deref(&self) -> &BeaconWitnessRoot {
+        &self.0
     }
 }

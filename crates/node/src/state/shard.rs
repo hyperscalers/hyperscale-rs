@@ -155,27 +155,27 @@ impl NodeStateMachine {
                 self.provisions_coordinator
                     .on_verified_remote_header(topology, &committed_header)
             }
-            ProtocolEvent::TransactionRootVerified { block_hash, valid } => self
+            ProtocolEvent::TransactionRootVerified { block_hash, result } => self
                 .shard_coordinator
-                .on_transaction_root_verified(&self.topology_snapshot, block_hash, valid),
-            ProtocolEvent::CertificateRootVerified { block_hash, valid } => self
+                .on_transaction_root_verified(&self.topology_snapshot, block_hash, result),
+            ProtocolEvent::CertificateRootVerified { block_hash, result } => self
                 .shard_coordinator
-                .on_certificate_root_verified(&self.topology_snapshot, block_hash, valid),
-            ProtocolEvent::LocalReceiptRootVerified { block_hash, valid } => self
+                .on_certificate_root_verified(&self.topology_snapshot, block_hash, result),
+            ProtocolEvent::LocalReceiptRootVerified { block_hash, result } => self
                 .shard_coordinator
-                .on_local_receipt_root_verified(&self.topology_snapshot, block_hash, valid),
-            ProtocolEvent::ProvisionsRootVerified { block_hash, valid } => self
+                .on_local_receipt_root_verified(&self.topology_snapshot, block_hash, result),
+            ProtocolEvent::ProvisionsRootVerified { block_hash, result } => self
                 .shard_coordinator
-                .on_provisions_root_verified(&self.topology_snapshot, block_hash, valid),
-            ProtocolEvent::ProvisionTxRootsVerified { block_hash, valid } => self
+                .on_provisions_root_verified(&self.topology_snapshot, block_hash, result),
+            ProtocolEvent::ProvisionTxRootsVerified { block_hash, result } => self
                 .shard_coordinator
-                .on_provision_tx_roots_verified(&self.topology_snapshot, block_hash, valid),
-            ProtocolEvent::BeaconWitnessRootVerified { block_hash, valid } => self
+                .on_provision_tx_roots_verified(&self.topology_snapshot, block_hash, result),
+            ProtocolEvent::BeaconWitnessRootVerified { block_hash, result } => self
                 .shard_coordinator
-                .on_beacon_witness_root_verified(&self.topology_snapshot, block_hash, valid),
-            ProtocolEvent::StateRootVerified { block_hash, valid } => self
+                .on_beacon_witness_root_verified(&self.topology_snapshot, block_hash, result),
+            ProtocolEvent::StateRootVerified { block_hash, result } => self
                 .shard_coordinator
-                .on_state_root_verified(&self.topology_snapshot, block_hash, valid),
+                .on_state_root_verified(&self.topology_snapshot, block_hash, result),
             ProtocolEvent::ProposalBuilt {
                 height,
                 round,

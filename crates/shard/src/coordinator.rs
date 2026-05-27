@@ -79,12 +79,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_storage::{BeaconWitnessCommit, RecoveredState};
+use hyperscale_storage::{BeaconWitnessCommit, RecoveredState, StateRootVerifyError};
 use hyperscale_types::{
-    Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, CertifiedBlock,
-    CommittedBlockHeader, FinalizedWave, Provisions, QcVerifyError, QuorumCertificate, Round,
-    RoutableTransaction, StateRoot, TopologySnapshot, TxHash, Verifiable, VerifiedBlockVote,
-    VerifiedQuorumCertificate, VotePower,
+    BeaconWitnessRootVerifyError, Block, BlockHeader, BlockHeight, BlockManifest, BlockVote,
+    CertRootVerifyError, CertifiedBlock, CommittedBlockHeader, FinalizedWave,
+    LocalReceiptRootVerifyError, ProvisionRootVerifyError, ProvisionTxRootsVerifyError, Provisions,
+    QcVerifyError, QuorumCertificate, Round, RoutableTransaction, StateRoot, TopologySnapshot,
+    TxHash, TxRootVerifyError, Verifiable, VerifiedBeaconWitnessRoot, VerifiedBlockVote,
+    VerifiedCertificateRoot, VerifiedLocalReceiptRoot, VerifiedProvisionTxRoots,
+    VerifiedProvisionsRoot, VerifiedQuorumCertificate, VerifiedTransactionRoot, VotePower,
 };
 use tracing::field::Empty;
 use tracing::{debug, info, instrument, trace, warn};
@@ -1798,8 +1801,13 @@ impl ShardCoordinator {
         &mut self,
         topology_snapshot: &TopologySnapshot,
         block_hash: BlockHash,
-        valid: bool,
+        result: Result<VerifiedTransactionRoot, TxRootVerifyError>,
     ) -> Vec<Action> {
+        let valid = result.is_ok();
+        if let Ok(verified) = result {
+            self.verification
+                .record_transaction_root_result(block_hash, verified);
+        }
         self.on_root_verified_impl(
             topology_snapshot,
             VerificationKind::TransactionRoot,
@@ -1813,8 +1821,13 @@ impl ShardCoordinator {
         &mut self,
         topology_snapshot: &TopologySnapshot,
         block_hash: BlockHash,
-        valid: bool,
+        result: Result<VerifiedCertificateRoot, CertRootVerifyError>,
     ) -> Vec<Action> {
+        let valid = result.is_ok();
+        if let Ok(verified) = result {
+            self.verification
+                .record_certificate_root_result(block_hash, verified);
+        }
         self.on_root_verified_impl(
             topology_snapshot,
             VerificationKind::CertificateRoot,
@@ -1828,8 +1841,13 @@ impl ShardCoordinator {
         &mut self,
         topology_snapshot: &TopologySnapshot,
         block_hash: BlockHash,
-        valid: bool,
+        result: Result<VerifiedLocalReceiptRoot, LocalReceiptRootVerifyError>,
     ) -> Vec<Action> {
+        let valid = result.is_ok();
+        if let Ok(verified) = result {
+            self.verification
+                .record_local_receipt_root_result(block_hash, verified);
+        }
         self.on_root_verified_impl(
             topology_snapshot,
             VerificationKind::LocalReceiptRoot,
@@ -1843,8 +1861,13 @@ impl ShardCoordinator {
         &mut self,
         topology_snapshot: &TopologySnapshot,
         block_hash: BlockHash,
-        valid: bool,
+        result: Result<VerifiedProvisionsRoot, ProvisionRootVerifyError>,
     ) -> Vec<Action> {
+        let valid = result.is_ok();
+        if let Ok(verified) = result {
+            self.verification
+                .record_provisions_root_result(block_hash, verified);
+        }
         self.on_root_verified_impl(
             topology_snapshot,
             VerificationKind::ProvisionRoot,
@@ -1858,8 +1881,13 @@ impl ShardCoordinator {
         &mut self,
         topology_snapshot: &TopologySnapshot,
         block_hash: BlockHash,
-        valid: bool,
+        result: Result<VerifiedProvisionTxRoots, ProvisionTxRootsVerifyError>,
     ) -> Vec<Action> {
+        let valid = result.is_ok();
+        if let Ok(verified) = result {
+            self.verification
+                .record_provision_tx_roots_result(block_hash, verified);
+        }
         self.on_root_verified_impl(
             topology_snapshot,
             VerificationKind::ProvisionTxRoots,
@@ -1873,8 +1901,13 @@ impl ShardCoordinator {
         &mut self,
         topology_snapshot: &TopologySnapshot,
         block_hash: BlockHash,
-        valid: bool,
+        result: Result<VerifiedBeaconWitnessRoot, BeaconWitnessRootVerifyError>,
     ) -> Vec<Action> {
+        let valid = result.is_ok();
+        if let Ok(verified) = result {
+            self.verification
+                .record_beacon_witness_root_result(block_hash, verified);
+        }
         self.on_root_verified_impl(
             topology_snapshot,
             VerificationKind::BeaconWitnessRoot,
@@ -1883,13 +1916,19 @@ impl ShardCoordinator {
         )
     }
 
-    /// Handle a completed state-root verification.
+    /// Handle a completed state-root verification. The `PreparedCommit`
+    /// byproduct was already side-channelled inside the action handler;
+    /// the result here just signals success or failure of the JMT replay.
     pub fn on_state_root_verified(
         &mut self,
         topology_snapshot: &TopologySnapshot,
         block_hash: BlockHash,
-        valid: bool,
+        result: Result<(), StateRootVerifyError>,
     ) -> Vec<Action> {
+        let valid = result.is_ok();
+        if result.is_ok() {
+            self.verification.record_state_root_result(block_hash);
+        }
         self.on_root_verified_impl(
             topology_snapshot,
             VerificationKind::StateRoot,
@@ -3944,7 +3983,7 @@ mod tests {
         );
 
         // State root completes — beacon witness root still pending.
-        let after_state = state.on_state_root_verified(&topology, block_hash, true);
+        let after_state = state.on_state_root_verified(&topology, block_hash, Ok(()));
         assert!(
             !after_state
                 .iter()
@@ -3952,7 +3991,17 @@ mod tests {
         );
 
         // Beacon witness root completes — now we vote.
-        let after_roots = state.on_beacon_witness_root_verified(&topology, block_hash, true);
+        let beacon_root = state
+            .pending_blocks
+            .get_block(block_hash)
+            .expect("pending block")
+            .header()
+            .beacon_witness_root();
+        let after_roots = state.on_beacon_witness_root_verified(
+            &topology,
+            block_hash,
+            Ok(VerifiedBeaconWitnessRoot::new_unchecked(beacon_root)),
+        );
         assert!(
             after_roots
                 .iter()

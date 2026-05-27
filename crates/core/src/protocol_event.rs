@@ -7,14 +7,19 @@
 
 use std::sync::Arc;
 
+use hyperscale_storage::StateRootVerifyError;
 use hyperscale_types::{
-    BeaconProposal, Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote,
-    CertifiedBeaconBlock, CertifiedBlock, CommittedBlockHeader, CommittedHeaderVerifyError, Epoch,
-    ExecutionCertificate, ExecutionVote, FinalizedWave, LinkedCertifiedBlock, PcQc3, PcVector,
-    PcVoteMessage, Provisions, QcVerifyError, QuorumCertificate, ReadySignal, Round,
-    RoutableTransaction, ShardGroupId, ShardWitness, SkipEpochCert, SkipRequest, SpcCert,
-    SpcEmptyViewMsg, SpcView, StoredReceipt, TxOutcome, ValidatorId, Verifiable, VerifiedBlockVote,
-    VerifiedQuorumCertificate, VotePower, WaveId, WeightedTimestamp,
+    BeaconProposal, BeaconWitnessRootVerifyError, Block, BlockHash, BlockHeader, BlockHeight,
+    BlockManifest, BlockVote, CertRootVerifyError, CertifiedBeaconBlock, CertifiedBlock,
+    CommittedBlockHeader, CommittedHeaderVerifyError, Epoch, ExecutionCertificate, ExecutionVote,
+    FinalizedWave, LinkedCertifiedBlock, LocalReceiptRootVerifyError, PcQc3, PcVector,
+    PcVoteMessage, ProvisionRootVerifyError, ProvisionTxRootsVerifyError, Provisions,
+    QcVerifyError, QuorumCertificate, ReadySignal, Round, RoutableTransaction, ShardGroupId,
+    ShardWitness, SkipEpochCert, SkipRequest, SpcCert, SpcEmptyViewMsg, SpcView, StoredReceipt,
+    TxOutcome, TxRootVerifyError, ValidatorId, Verifiable, VerifiedBeaconWitnessRoot,
+    VerifiedBlockVote, VerifiedCertificateRoot, VerifiedLocalReceiptRoot, VerifiedProvisionTxRoots,
+    VerifiedProvisionsRoot, VerifiedQuorumCertificate, VerifiedTransactionRoot, VotePower, WaveId,
+    WeightedTimestamp,
 };
 
 /// How a node learned about the certifying QC that commits a given block.
@@ -204,69 +209,74 @@ pub enum ProtocolEvent {
     },
 
     /// Transaction-root verification completed for a pending block.
+    /// On success the payload carries the verified root (predicate
+    /// includes per-tx validity-window checks against the parent QC's
+    /// weighted timestamp).
     TransactionRootVerified {
         /// Block whose root was verified.
         block_hash: BlockHash,
-        /// `true` when the computed root matched the header's claim and
-        /// every transaction's validity window contained the parent QC's
-        /// weighted timestamp.
-        valid: bool,
+        /// Typed verification result.
+        result: Result<VerifiedTransactionRoot, TxRootVerifyError>,
     },
 
     /// Certificate-root verification completed for a pending block.
     CertificateRootVerified {
         /// Block whose root was verified.
         block_hash: BlockHash,
-        /// `true` when the computed root matched the header's claim.
-        valid: bool,
+        /// Typed verification result.
+        result: Result<VerifiedCertificateRoot, CertRootVerifyError>,
     },
 
     /// Local-receipt-root verification completed for a pending block.
     ///
-    /// Emitted as a pre-flight by the `VerifyStateRoot` handler: when the
-    /// computed receipt root diverges from the header's claim, state-root
-    /// recomputation can't match either, so a paired `StateRootVerified`
-    /// with `valid = false` follows immediately.
+    /// Emitted as a pre-flight by the `VerifyStateRoot` handler: when
+    /// the computed receipt root diverges from the header's claim,
+    /// state-root recomputation can't match either, so the handler
+    /// short-circuits without emitting a separate `StateRootVerified`
+    /// — the pipeline rejects the block on this failure alone.
     LocalReceiptRootVerified {
         /// Block whose root was verified.
         block_hash: BlockHash,
-        /// `true` when the computed root matched the header's claim.
-        valid: bool,
+        /// Typed verification result.
+        result: Result<VerifiedLocalReceiptRoot, LocalReceiptRootVerifyError>,
     },
 
     /// Provisions-root verification completed for a pending block.
     ProvisionsRootVerified {
         /// Block whose root was verified.
         block_hash: BlockHash,
-        /// `true` when the computed root matched the header's claim.
-        valid: bool,
+        /// Typed verification result.
+        result: Result<VerifiedProvisionsRoot, ProvisionRootVerifyError>,
     },
 
     /// Provision-tx-roots map verification completed for a pending block.
     ProvisionTxRootsVerified {
         /// Block whose root was verified.
         block_hash: BlockHash,
-        /// `true` when the computed map matched the header's claim.
-        valid: bool,
+        /// Typed verification result.
+        result: Result<VerifiedProvisionTxRoots, ProvisionTxRootsVerifyError>,
     },
 
     /// Beacon-witness-root verification completed for a pending block.
     BeaconWitnessRootVerified {
         /// Block whose root was verified.
         block_hash: BlockHash,
-        /// `true` when the recomputed beacon-witness root matched the header's claim.
-        valid: bool,
+        /// Typed verification result.
+        result: Result<VerifiedBeaconWitnessRoot, BeaconWitnessRootVerifyError>,
     },
 
     /// State-root verification completed for a pending block.
     ///
-    /// When `valid = true`, the corresponding `PreparedBlock` has already
-    /// been side-channelled via `ActionContext::commit_prepared`.
+    /// The verified state root carries a `PreparedCommit` byproduct
+    /// that the commit pipeline needs; on success the action handler
+    /// side-channels that handle via `ActionContext::commit_prepared`
+    /// before emitting this event. The event payload carries only
+    /// success/failure of the JMT-replay check.
     StateRootVerified {
         /// Block whose root was verified.
         block_hash: BlockHash,
-        /// `true` when the recomputed JMT root matched the header's claim.
-        valid: bool,
+        /// Typed verification result.
+        result: Result<(), StateRootVerifyError>,
     },
 
     /// Proposal block built by the runner.

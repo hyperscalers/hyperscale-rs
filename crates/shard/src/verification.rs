@@ -17,7 +17,9 @@ use hyperscale_types::{BeaconWitnessLeafCount, BeaconWitnessRoot};
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, FinalizedWave, InFlightCount,
     LinkageError, LinkedCertifiedBlock, LocalReceiptRoot, ProvisionsRoot, StateRoot,
-    TopologySnapshot, VerifiedQuorumCertificate,
+    TopologySnapshot, VerifiedBeaconWitnessRoot, VerifiedCertificateRoot, VerifiedLocalReceiptRoot,
+    VerifiedProvisionTxRoots, VerifiedProvisionsRoot, VerifiedQuorumCertificate,
+    VerifiedTransactionRoot,
 };
 use tracing::{debug, trace, warn};
 
@@ -122,8 +124,16 @@ pub struct PendingStateRootVerification {
 /// A block awaiting the sub-results required to produce a
 /// [`LinkedCertifiedBlock`]: a verified QC paired with the block, plus
 /// per-root verification outcomes for the block's internal commitments.
-/// The assembly is complete when every slot is `Some`; on completion
-/// [`VerificationPipeline::record_qc_assembly`] returns the linked block.
+///
+/// Each per-root slot is `Some(value)` either because the verification
+/// succeeded (carrying the typed verified value) or because the block
+/// carries no relevant content for that root (skip case, prefilled by
+/// [`VerificationPipeline::track_pending_assembly`] with
+/// `new_unchecked(header.x_root())` — the empty-input compute is
+/// trivially equal to the header's claim). A slot is `None` only while
+/// the verification is outstanding. The assembly is complete when every
+/// slot is `Some`; on completion the pipeline's per-root and per-QC
+/// setters return the linked block.
 #[derive(Debug)]
 pub struct PendingAssembly {
     /// Block whose commitments are being verified.
@@ -131,12 +141,22 @@ pub struct PendingAssembly {
     /// Verified QC for [`Self::block`], populated when QC signature
     /// verification completes.
     pub qc_result: Option<VerifiedQuorumCertificate>,
-    /// Transaction-root verification outcome (`Some(())` on success).
-    pub tx_root_result: Option<()>,
-    /// Provision-root verification outcome (`Some(())` on success).
-    pub provision_root_result: Option<()>,
-    /// Certificate-root verification outcome (`Some(())` on success).
-    pub certificate_root_result: Option<()>,
+    /// Transaction-root verification outcome.
+    pub tx_root_result: Option<VerifiedTransactionRoot>,
+    /// Certificate-root verification outcome.
+    pub certificate_root_result: Option<VerifiedCertificateRoot>,
+    /// Local-receipt-root verification outcome.
+    pub local_receipt_root_result: Option<VerifiedLocalReceiptRoot>,
+    /// Provisions-root verification outcome.
+    pub provision_root_result: Option<VerifiedProvisionsRoot>,
+    /// Provision-tx-roots map verification outcome.
+    pub provision_tx_roots_result: Option<VerifiedProvisionTxRoots>,
+    /// Beacon-witness-root verification outcome.
+    pub beacon_witness_root_result: Option<VerifiedBeaconWitnessRoot>,
+    /// State-root verification outcome. State-root's verified value
+    /// carries a `PreparedCommit` byproduct that the action handler
+    /// already side-channelled, so the slot only tracks success.
+    pub state_root_result: Option<()>,
 }
 
 impl PendingAssembly {
@@ -145,8 +165,12 @@ impl PendingAssembly {
     pub const fn is_complete(&self) -> bool {
         self.qc_result.is_some()
             && self.tx_root_result.is_some()
-            && self.provision_root_result.is_some()
             && self.certificate_root_result.is_some()
+            && self.local_receipt_root_result.is_some()
+            && self.provision_root_result.is_some()
+            && self.provision_tx_roots_result.is_some()
+            && self.beacon_witness_root_result.is_some()
+            && self.state_root_result.is_some()
     }
 }
 
@@ -375,29 +399,76 @@ impl VerificationPipeline {
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Start tracking `block` as awaiting the sub-results required for
-    /// [`LinkedCertifiedBlock`] assembly. The QC slot is initialized empty;
-    /// per-root slots are initialized as already-verified placeholders. The
-    /// completion check fires from [`Self::record_qc_assembly`] when every
-    /// slot is populated.
+    /// [`LinkedCertifiedBlock`] assembly. The QC slot starts empty.
+    /// Per-root slots reflect the current pipeline state:
+    ///
+    /// - if the block carries no relevant content for a kind, the slot
+    ///   is prefilled with `VerifiedXRoot::new_unchecked(header.x_root())`
+    ///   — for empty inputs the header's claimed root must equal the
+    ///   empty-input compute, so the predicate is trivially satisfied;
+    /// - if the verification has already completed (its kind is in
+    ///   `verified_roots`) the slot is prefilled with the same
+    ///   `new_unchecked` wrap of the header's claim — the verifier
+    ///   produced exactly that value on success and the audit point is
+    ///   the verified-roots set;
+    /// - otherwise the slot starts `None` and lands via the matching
+    ///   `record_<kind>_root_result` setter.
     pub fn track_pending_assembly(&mut self, block: Arc<Block>) {
         let block_hash = block.hash();
+        let h = block.header();
+
+        let tx_done = block.transaction_count() == 0
+            || self.is_root_verified(block_hash, VerificationKind::TransactionRoot);
+        let cert_done = block.certificates().is_empty()
+            || self.is_root_verified(block_hash, VerificationKind::CertificateRoot);
+        let receipt_done = block.certificates().is_empty()
+            || self.is_root_verified(block_hash, VerificationKind::LocalReceiptRoot);
+        let provision_done = h.provision_root() == ProvisionsRoot::ZERO
+            || self.is_root_verified(block_hash, VerificationKind::ProvisionRoot);
+        let provision_tx_done = h.provision_tx_roots().is_empty()
+            || self.is_root_verified(block_hash, VerificationKind::ProvisionTxRoots);
+        let beacon_done = self.is_root_verified(block_hash, VerificationKind::BeaconWitnessRoot);
+        let state_done = self.verified_state_roots.contains(&block_hash);
+
+        // SAFETY: at this point the header's claim either equals the
+        // empty-input compute (skip case) or was already accepted by
+        // the verifier (verified-roots set).
+        let tx_root_result =
+            tx_done.then(|| VerifiedTransactionRoot::new_unchecked(h.transaction_root()));
+        let certificate_root_result =
+            cert_done.then(|| VerifiedCertificateRoot::new_unchecked(h.certificate_root()));
+        let local_receipt_root_result =
+            receipt_done.then(|| VerifiedLocalReceiptRoot::new_unchecked(h.local_receipt_root()));
+        let provision_root_result =
+            provision_done.then(|| VerifiedProvisionsRoot::new_unchecked(h.provision_root()));
+        let provision_tx_roots_result = provision_tx_done
+            .then(|| VerifiedProvisionTxRoots::new_unchecked(h.provision_tx_roots().clone()));
+        let beacon_witness_root_result =
+            beacon_done.then(|| VerifiedBeaconWitnessRoot::new_unchecked(h.beacon_witness_root()));
+        let state_root_result = state_done.then_some(());
+
         self.pending_assemblies.insert(
             block_hash,
             PendingAssembly {
-                block,
                 qc_result: None,
-                tx_root_result: Some(()),
-                provision_root_result: Some(()),
-                certificate_root_result: Some(()),
+                tx_root_result,
+                certificate_root_result,
+                local_receipt_root_result,
+                provision_root_result,
+                provision_tx_roots_result,
+                beacon_witness_root_result,
+                state_root_result,
+                block,
             },
         );
     }
 
-    /// Populate the QC slot for `block_hash`'s pending assembly. When every
-    /// slot is now `Some`, the entry is removed and a `LinkedCertifiedBlock`
-    /// is produced via [`LinkedCertifiedBlock::assemble_from_qc`]. Returns
-    /// `None` when no assembly is tracked for `block_hash`, or when more
-    /// sub-results are still outstanding.
+    /// Populate the QC slot for `block_hash`'s pending assembly. When the
+    /// last outstanding slot lands as a result, the entry is removed and
+    /// a [`LinkedCertifiedBlock`] is produced via
+    /// [`LinkedCertifiedBlock::assemble_from_qc`]. Returns `None` when no
+    /// assembly is tracked for `block_hash`, or when more sub-results are
+    /// still outstanding.
     pub fn record_qc_assembly(
         &mut self,
         block_hash: BlockHash,
@@ -405,7 +476,90 @@ impl VerificationPipeline {
     ) -> Option<Result<LinkedCertifiedBlock, LinkageError>> {
         let entry = self.pending_assemblies.get_mut(&block_hash)?;
         entry.qc_result = Some(qc);
-        if !entry.is_complete() {
+        self.try_complete_assembly(block_hash)
+    }
+
+    /// Populate the transaction-root slot.
+    pub fn record_transaction_root_result(
+        &mut self,
+        block_hash: BlockHash,
+        verified: VerifiedTransactionRoot,
+    ) -> Option<Result<LinkedCertifiedBlock, LinkageError>> {
+        let entry = self.pending_assemblies.get_mut(&block_hash)?;
+        entry.tx_root_result = Some(verified);
+        self.try_complete_assembly(block_hash)
+    }
+
+    /// Populate the certificate-root slot.
+    pub fn record_certificate_root_result(
+        &mut self,
+        block_hash: BlockHash,
+        verified: VerifiedCertificateRoot,
+    ) -> Option<Result<LinkedCertifiedBlock, LinkageError>> {
+        let entry = self.pending_assemblies.get_mut(&block_hash)?;
+        entry.certificate_root_result = Some(verified);
+        self.try_complete_assembly(block_hash)
+    }
+
+    /// Populate the local-receipt-root slot.
+    pub fn record_local_receipt_root_result(
+        &mut self,
+        block_hash: BlockHash,
+        verified: VerifiedLocalReceiptRoot,
+    ) -> Option<Result<LinkedCertifiedBlock, LinkageError>> {
+        let entry = self.pending_assemblies.get_mut(&block_hash)?;
+        entry.local_receipt_root_result = Some(verified);
+        self.try_complete_assembly(block_hash)
+    }
+
+    /// Populate the provisions-root slot.
+    pub fn record_provisions_root_result(
+        &mut self,
+        block_hash: BlockHash,
+        verified: VerifiedProvisionsRoot,
+    ) -> Option<Result<LinkedCertifiedBlock, LinkageError>> {
+        let entry = self.pending_assemblies.get_mut(&block_hash)?;
+        entry.provision_root_result = Some(verified);
+        self.try_complete_assembly(block_hash)
+    }
+
+    /// Populate the provision-tx-roots slot.
+    pub fn record_provision_tx_roots_result(
+        &mut self,
+        block_hash: BlockHash,
+        verified: VerifiedProvisionTxRoots,
+    ) -> Option<Result<LinkedCertifiedBlock, LinkageError>> {
+        let entry = self.pending_assemblies.get_mut(&block_hash)?;
+        entry.provision_tx_roots_result = Some(verified);
+        self.try_complete_assembly(block_hash)
+    }
+
+    /// Populate the beacon-witness-root slot.
+    pub fn record_beacon_witness_root_result(
+        &mut self,
+        block_hash: BlockHash,
+        verified: VerifiedBeaconWitnessRoot,
+    ) -> Option<Result<LinkedCertifiedBlock, LinkageError>> {
+        let entry = self.pending_assemblies.get_mut(&block_hash)?;
+        entry.beacon_witness_root_result = Some(verified);
+        self.try_complete_assembly(block_hash)
+    }
+
+    /// Populate the state-root slot.
+    pub fn record_state_root_result(
+        &mut self,
+        block_hash: BlockHash,
+    ) -> Option<Result<LinkedCertifiedBlock, LinkageError>> {
+        let entry = self.pending_assemblies.get_mut(&block_hash)?;
+        entry.state_root_result = Some(());
+        self.try_complete_assembly(block_hash)
+    }
+
+    fn try_complete_assembly(
+        &mut self,
+        block_hash: BlockHash,
+    ) -> Option<Result<LinkedCertifiedBlock, LinkageError>> {
+        if !self.pending_assemblies.get(&block_hash)?.is_complete() {
             return None;
         }
         let entry = self.pending_assemblies.remove(&block_hash)?;
@@ -420,16 +574,6 @@ impl VerificationPipeline {
     #[must_use]
     pub fn pending_assembly_count(&self) -> usize {
         self.pending_assemblies.len()
-    }
-
-    /// Mutable borrow of an assembly entry. Used by tests that need to
-    /// reset placeholder slots to exercise the multi-slot completion check.
-    #[cfg(test)]
-    pub(crate) fn pending_assembly_mut(
-        &mut self,
-        block_hash: &BlockHash,
-    ) -> Option<&mut PendingAssembly> {
-        self.pending_assemblies.get_mut(block_hash)
     }
 
     /// Whether any block verification is currently in-flight.
@@ -845,7 +989,7 @@ impl VerificationPipeline {
         self.mark_root_in_flight(block_hash, VerificationKind::ProvisionTxRoots);
         vec![Action::VerifyProvisionTxRoots {
             block_hash,
-            expected: block.header().provision_tx_roots().0.clone(),
+            expected: block.header().provision_tx_roots().clone(),
             transactions: block.transactions().clone(),
             topology_snapshot: topology.clone(),
         }]
@@ -1800,46 +1944,65 @@ mod tests {
         )
     }
 
-    /// `record_qc_assembly` returns the assembled [`LinkedCertifiedBlock`]
-    /// only when every sub-result slot is `Some`. Clearing any non-QC slot
-    /// keeps the assembly pending even after the QC arrives, proving the
-    /// completion check ranges over all slots.
+    /// Completion fires only when every outstanding slot is `Some`.
+    /// For a genesis block the per-root content slots auto-skip (empty
+    /// txs / certs / provisions), so beacon-witness and state-root are
+    /// the two slots that must arrive via `record_*_root_result` before
+    /// QC completes the assembly.
     #[test]
-    fn record_qc_assembly_waits_for_every_slot() {
+    fn record_assembly_waits_for_every_outstanding_slot() {
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
         let block = assembly_block();
         let block_hash = block.hash();
+        let header = block.header().clone();
         let verified_qc = VerifiedQuorumCertificate::new_unchecked(assembly_qc_for(&block));
 
         vp.track_pending_assembly(Arc::new(block));
         assert_eq!(vp.pending_assembly_count(), 1);
 
-        // Clear two of the auto-filled slots so the completion check has to
-        // wait on multiple sub-results, not just QC.
-        let entry = vp.pending_assembly_mut(&block_hash).unwrap();
-        entry.tx_root_result = None;
-        entry.provision_root_result = None;
+        // QC arrives — beacon-witness + state root still outstanding.
+        assert!(vp.record_qc_assembly(block_hash, verified_qc).is_none());
+        assert_eq!(vp.pending_assembly_count(), 1);
 
-        // QC arrives, but tx_root and provision_root are still missing.
+        // Beacon-witness arrives — state root still outstanding.
+        let beacon_verified =
+            VerifiedBeaconWitnessRoot::new_unchecked(header.beacon_witness_root());
         assert!(
-            vp.record_qc_assembly(block_hash, verified_qc.clone())
+            vp.record_beacon_witness_root_result(block_hash, beacon_verified)
                 .is_none()
         );
         assert_eq!(vp.pending_assembly_count(), 1);
 
-        // Fill tx_root only — provision_root still missing.
-        vp.pending_assembly_mut(&block_hash).unwrap().tx_root_result = Some(());
-        assert!(
-            vp.record_qc_assembly(block_hash, verified_qc.clone())
-                .is_none()
-        );
-        assert_eq!(vp.pending_assembly_count(), 1);
+        // State root closes out the last slot; completion fires from the
+        // per-root setter (not from `record_qc_assembly`), proving either
+        // path can be the trigger.
+        let linked = vp
+            .record_state_root_result(block_hash)
+            .expect("completion fires when every slot is Some")
+            .expect("linkage check passes for the matching qc.block_hash");
+        assert_eq!(linked.qc().block_hash(), block_hash);
+        assert_eq!(vp.pending_assembly_count(), 0);
+    }
 
-        // Fill the last slot; completion fires, entry is removed, and the
-        // produced LinkedCertifiedBlock matches the block we tracked.
-        vp.pending_assembly_mut(&block_hash)
-            .unwrap()
-            .provision_root_result = Some(());
+    /// Per-root verifications that complete before `track_pending_assembly`
+    /// runs are reflected in the initial slot state — `verified_roots`
+    /// (and `verified_state_roots`) prefill matching slots so the assembly
+    /// doesn't deadlock waiting for events that already fired.
+    #[test]
+    fn track_pending_assembly_prefills_already_verified_slots() {
+        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
+        let block = assembly_block();
+        let block_hash = block.hash();
+        let verified_qc = VerifiedQuorumCertificate::new_unchecked(assembly_qc_for(&block));
+
+        // Beacon-witness + state root verify before the QC arrives.
+        vp.verified_roots
+            .insert((block_hash, VerificationKind::BeaconWitnessRoot));
+        vp.verified_state_roots.insert(block_hash);
+
+        vp.track_pending_assembly(Arc::new(block));
+
+        // QC is the only outstanding slot — completion fires immediately.
         let linked = vp
             .record_qc_assembly(block_hash, verified_qc)
             .expect("completion fires when every slot is Some")
@@ -1857,5 +2020,12 @@ mod tests {
         let verified_qc = VerifiedQuorumCertificate::new_unchecked(assembly_qc_for(&block));
         assert!(vp.record_qc_assembly(block.hash(), verified_qc).is_none());
         assert_eq!(vp.pending_assembly_count(), 0);
+    }
+
+    /// `record_root_assembly` against an unknown block is a no-op too.
+    #[test]
+    fn record_root_assembly_returns_none_for_unknown_block() {
+        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
+        assert!(vp.record_state_root_result(bh(b"no-such-block")).is_none());
     }
 }

@@ -114,13 +114,13 @@ pub use shard::quorum_certificate::{
     QcContext, QcVerifyError, QuorumCertificate, VerifiedQuorumCertificate,
 };
 pub use shard::roots::{
-    CertRootVerifyError, CertificateRootContext, LocalReceiptRootContext,
-    LocalReceiptRootVerifyError, ProvisionRootVerifyError, ProvisionTxRootsContext,
-    ProvisionTxRootsMap, ProvisionTxRootsVerifyError, ProvisionsRootContext,
-    TransactionRootContext, TxRootVerifyError, VerifiedCertificateRoot, VerifiedLocalReceiptRoot,
-    VerifiedProvisionTxRoots, VerifiedProvisionsRoot, VerifiedTransactionRoot,
-    compute_certificate_root, compute_local_receipt_root, compute_provision_root,
-    compute_transaction_root,
+    BeaconWitnessRootVerifyError, CertRootVerifyError, CertificateRootContext,
+    LocalReceiptRootContext, LocalReceiptRootVerifyError, ProvisionRootVerifyError,
+    ProvisionTxRootsContext, ProvisionTxRootsMap, ProvisionTxRootsVerifyError,
+    ProvisionsRootContext, TransactionRootContext, TxRootVerifyError, VerifiedBeaconWitnessRoot,
+    VerifiedCertificateRoot, VerifiedLocalReceiptRoot, VerifiedProvisionTxRoots,
+    VerifiedProvisionsRoot, VerifiedTransactionRoot, compute_certificate_root,
+    compute_local_receipt_root, compute_provision_root, compute_transaction_root,
 };
 pub use shard::vote::{BlockVote, BlockVoteContext, BlockVoteVerifyError, VerifiedBlockVote};
 pub use shard::{

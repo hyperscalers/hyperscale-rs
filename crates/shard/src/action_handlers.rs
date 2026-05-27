@@ -16,19 +16,19 @@ use hyperscale_types::network::gossip::CommittedBlockHeaderGossip;
 use hyperscale_types::network::notification::{BlockHeaderNotification, BlockVoteNotification};
 use hyperscale_types::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight,
-    BlockManifest, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, CertificateRoot,
+    BlockManifest, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, CertificateRootContext,
     CommittedHeaderVerifyError, ConsensusReceipt, FinalizedWave, Hash, InFlightCount,
-    LocalReceiptRoot, NetworkDefinition, ProposerTimestamp, ProvisionHash, ProvisionTxRoot,
-    Provisions, ProvisionsRoot, QcContext, QuorumCertificate, ReadySignal, Round,
-    RoutableTransaction, ShardGroupId, SignerBitfield, StateRoot, StoredReceipt, TopologySnapshot,
-    TransactionRoot, ValidatorId, VerifiedBlockVote, VerifiedQuorumCertificate, Verify, VotePower,
-    WeightedTimestamp, batch_verify_bls_same_message, block_header_message, block_vote_message,
-    committed_block_header_message, compute_certificate_root, compute_local_receipt_root,
-    compute_provision_root, compute_provision_tx_roots, compute_transaction_root, compute_waves,
-    verify_bls12381_v1,
+    LocalReceiptRootContext, NetworkDefinition, ProposerTimestamp, ProvisionHash,
+    ProvisionTxRootsContext, Provisions, ProvisionsRootContext, QcContext, QuorumCertificate,
+    ReadySignal, Round, RoutableTransaction, ShardGroupId, SignerBitfield, StateRoot,
+    StoredReceipt, TopologySnapshot, TransactionRootContext, ValidatorId, VerifiedBlockVote,
+    VerifiedQuorumCertificate, Verify, VotePower, WeightedTimestamp, batch_verify_bls_same_message,
+    block_header_message, block_vote_message, committed_block_header_message,
+    compute_certificate_root, compute_local_receipt_root, compute_provision_root,
+    compute_provision_tx_roots, compute_transaction_root, compute_waves, verify_bls12381_v1,
 };
 
-use crate::beacon_witnesses::derive_and_verify as derive_and_verify_beacon_witness;
+use crate::beacon_witnesses::BeaconWitnessRootContext;
 
 /// Result of QC verification and assembly.
 pub struct QcVerificationResult {
@@ -238,142 +238,6 @@ pub fn build_qc_from_verified(
             WeightedTimestamp::from_millis(weighted_timestamp_ms),
         ),
     ))
-}
-
-/// Verify that the computed transaction merkle root matches the expected root.
-pub fn verify_provision_root(expected_root: ProvisionsRoot, batch_hashes: &[Hash]) -> bool {
-    let computed_root = compute_provision_root(batch_hashes);
-    let valid = computed_root == expected_root;
-
-    if !valid {
-        tracing::warn!(
-            ?expected_root,
-            ?computed_root,
-            batch_count = batch_hashes.len(),
-            "Provision root verification FAILED"
-        );
-    }
-
-    valid
-}
-
-/// Verify a block's transaction root and per-tx validity windows.
-///
-/// Two checks, both load-bearing for block validity:
-///
-/// 1. The merkle root of `transactions` matches `expected_root`.
-/// 2. Every tx's `validity_range` is well-formed against `validity_anchor`
-///    AND contains it. `validity_anchor` is the parent QC's
-///    `weighted_timestamp` — the shard consensus-authenticated clock every honest
-///    validator agrees on for this block. The check is the same expression
-///    the proposer applied during selection, so an honest cluster never
-///    sees this fail; a malicious proposer that included an expired tx
-///    has the block rejected.
-///
-/// Half-open semantics: `start_inclusive <= anchor < end_exclusive`.
-pub fn verify_transaction_root(
-    expected_root: TransactionRoot,
-    transactions: &[Arc<RoutableTransaction>],
-    validity_anchor: WeightedTimestamp,
-) -> bool {
-    let computed_root = compute_transaction_root(transactions);
-    let root_valid = computed_root == expected_root;
-
-    if !root_valid {
-        tracing::warn!(
-            ?expected_root,
-            ?computed_root,
-            tx_count = transactions.len(),
-            "Transaction root verification FAILED"
-        );
-    }
-
-    let mut windows_valid = true;
-    for tx in transactions {
-        if !tx.validity_range().is_well_formed(validity_anchor)
-            || !tx.validity_range().contains(validity_anchor)
-        {
-            tracing::warn!(
-                tx_hash = ?tx.hash(),
-                anchor_ms = validity_anchor.as_millis(),
-                start_ms = tx.validity_range().start_timestamp_inclusive.as_millis(),
-                end_ms = tx.validity_range().end_timestamp_exclusive.as_millis(),
-                "Transaction validity range check FAILED"
-            );
-            windows_valid = false;
-        }
-    }
-
-    root_valid && windows_valid
-}
-
-/// Verify a block's per-target-shard provisions commitments.
-///
-/// Recomputes the per-target merkle roots from the block's transactions and
-/// compares against the header's claimed map by full equality. A missing or
-/// tampered target-root fails because the recomputed root won't match.
-pub fn verify_provision_tx_roots(
-    expected: &std::collections::BTreeMap<ShardGroupId, ProvisionTxRoot>,
-    transactions: &[Arc<RoutableTransaction>],
-    topology: &TopologySnapshot,
-) -> bool {
-    let computed = compute_provision_tx_roots(topology, transactions);
-    let valid = &computed == expected;
-
-    if !valid {
-        tracing::warn!(
-            tx_count = transactions.len(),
-            ?expected,
-            ?computed,
-            "Provision tx-root verification FAILED"
-        );
-    }
-
-    valid
-}
-
-/// Verify a block's receipt root against its wave certificates.
-///
-/// Pure computation over the certificates' `receipt_hash` values.
-pub fn verify_certificate_root(
-    expected_root: CertificateRoot,
-    certificates: &[Arc<FinalizedWave>],
-) -> bool {
-    let computed_root = compute_certificate_root(certificates);
-    let valid = computed_root == expected_root;
-
-    if !valid {
-        tracing::warn!(
-            ?expected_root,
-            ?computed_root,
-            cert_count = certificates.len(),
-            "Certificate root verification FAILED"
-        );
-    }
-
-    valid
-}
-
-/// Verify a block's local receipt root against its stored receipts.
-///
-/// Pure computation over the receipts' `local_receipt_hash()` values.
-pub fn verify_local_receipt_root(
-    expected_root: LocalReceiptRoot,
-    receipts: &[StoredReceipt],
-) -> bool {
-    let computed_root = compute_local_receipt_root(receipts);
-    let valid = computed_root == expected_root;
-
-    if !valid {
-        tracing::warn!(
-            ?expected_root,
-            ?computed_root,
-            receipt_count = receipts.len(),
-            "Local receipt root verification FAILED"
-        );
-    }
-
-    valid
 }
 
 /// Result of building a proposal block.
@@ -626,12 +490,19 @@ where
             validity_anchor,
         } => {
             let start = std::time::Instant::now();
-            let valid = verify_transaction_root(expected_root, &transactions, validity_anchor);
+            let tx_ctx = TransactionRootContext {
+                transactions: &transactions,
+                validity_anchor,
+            };
+            let result = expected_root.verify(&tx_ctx);
             record_signature_verification_latency(
                 "transaction_root",
                 start.elapsed().as_secs_f64(),
             );
-            ctx.notify_protocol(ProtocolEvent::TransactionRootVerified { block_hash, valid });
+            if let Err(e) = &result {
+                tracing::warn!(?block_hash, reason = %e, "Transaction root verification FAILED");
+            }
+            ctx.notify_protocol(ProtocolEvent::TransactionRootVerified { block_hash, result });
         }
 
         Action::VerifyProvisionTxRoots {
@@ -641,12 +512,19 @@ where
             topology_snapshot,
         } => {
             let start = std::time::Instant::now();
-            let valid = verify_provision_tx_roots(&expected, &transactions, &topology_snapshot);
+            let ptx_ctx = ProvisionTxRootsContext {
+                topology: &topology_snapshot,
+                transactions: &transactions,
+            };
+            let result = expected.verify(&ptx_ctx);
             record_signature_verification_latency(
                 "provision_tx_roots",
                 start.elapsed().as_secs_f64(),
             );
-            ctx.notify_protocol(ProtocolEvent::ProvisionTxRootsVerified { block_hash, valid });
+            if let Err(e) = &result {
+                tracing::warn!(?block_hash, reason = %e, "Provision tx-roots verification FAILED");
+            }
+            ctx.notify_protocol(ProtocolEvent::ProvisionTxRootsVerified { block_hash, result });
         }
 
         Action::VerifyProvisionRoot {
@@ -656,9 +534,15 @@ where
         } => {
             let start = std::time::Instant::now();
             let raw_batch_hashes: Vec<Hash> = batch_hashes.iter().map(|h| h.into_raw()).collect();
-            let valid = verify_provision_root(expected_root, &raw_batch_hashes);
+            let pr_ctx = ProvisionsRootContext {
+                batch_hashes: &raw_batch_hashes,
+            };
+            let result = expected_root.verify(&pr_ctx);
             record_signature_verification_latency("provision_root", start.elapsed().as_secs_f64());
-            ctx.notify_protocol(ProtocolEvent::ProvisionsRootVerified { block_hash, valid });
+            if let Err(e) = &result {
+                tracing::warn!(?block_hash, reason = %e, "Provision root verification FAILED");
+            }
+            ctx.notify_protocol(ProtocolEvent::ProvisionsRootVerified { block_hash, result });
         }
 
         Action::VerifyCertificateRoot {
@@ -667,12 +551,18 @@ where
             certificates,
         } => {
             let start = std::time::Instant::now();
-            let valid = verify_certificate_root(expected_root, &certificates);
+            let cert_ctx = CertificateRootContext {
+                certificates: &certificates,
+            };
+            let result = expected_root.verify(&cert_ctx);
             record_signature_verification_latency(
                 "certificate_root",
                 start.elapsed().as_secs_f64(),
             );
-            ctx.notify_protocol(ProtocolEvent::CertificateRootVerified { block_hash, valid });
+            if let Err(e) = &result {
+                tracing::warn!(?block_hash, reason = %e, "Certificate root verification FAILED");
+            }
+            ctx.notify_protocol(ProtocolEvent::CertificateRootVerified { block_hash, result });
         }
 
         Action::VerifyBeaconWitnessRoot {
@@ -692,22 +582,22 @@ where
                 .iter()
                 .flat_map(|fw| fw.receipts().iter().cloned())
                 .collect();
-            let valid = derive_and_verify_beacon_witness(
-                expected_root,
+            let bw_ctx = BeaconWitnessRootContext {
                 expected_leaf_count,
                 parent_witness_leaves,
                 parent_round,
                 height,
                 round,
-                &receipts,
-                &ready_signals,
-                &topology_snapshot,
-            );
+                receipts: &receipts,
+                ready_signals: &ready_signals,
+                topology: &topology_snapshot,
+            };
+            let result = expected_root.verify(&bw_ctx);
             record_signature_verification_latency(
                 "beacon_witness_root",
                 start.elapsed().as_secs_f64(),
             );
-            ctx.notify_protocol(ProtocolEvent::BeaconWitnessRootVerified { block_hash, valid });
+            ctx.notify_protocol(ProtocolEvent::BeaconWitnessRootVerified { block_hash, result });
         }
 
         Action::VerifyStateRoot {
@@ -723,31 +613,33 @@ where
             // Pre-flight: hash the receipts and compare to the QC'd
             // `local_receipt_root`. If they diverge, JMT recomputation
             // can't match `state_root` either (receipts ARE the JMT input),
-            // so short-circuit and report both roots as invalid. The
-            // coordinator's per-kind tracking still completes because both
-            // events are emitted.
+            // so short-circuit on the receipt-root failure alone — the
+            // pipeline rejects the block on the `LocalReceiptRootVerified`
+            // error without needing a synthetic state-root failure event.
             let stored_receipts: Vec<StoredReceipt> = finalized_waves
                 .iter()
                 .flat_map(|fw| fw.receipts().iter().cloned())
                 .collect();
 
             let receipt_start = std::time::Instant::now();
-            let receipt_root_valid =
-                verify_local_receipt_root(expected_local_receipt_root, &stored_receipts);
+            let receipt_ctx = LocalReceiptRootContext {
+                receipts: &stored_receipts,
+            };
+            let receipt_result = expected_local_receipt_root.verify(&receipt_ctx);
             record_signature_verification_latency(
                 "local_receipt_root",
                 receipt_start.elapsed().as_secs_f64(),
             );
+            let receipt_root_valid = receipt_result.is_ok();
+            if let Err(e) = &receipt_result {
+                tracing::warn!(?block_hash, reason = %e, "Local receipt root verification FAILED");
+            }
             ctx.notify_protocol(ProtocolEvent::LocalReceiptRootVerified {
                 block_hash,
-                valid: receipt_root_valid,
+                result: receipt_result,
             });
 
             if !receipt_root_valid {
-                ctx.notify_protocol(ProtocolEvent::StateRootVerified {
-                    block_hash,
-                    valid: false,
-                });
                 return;
             }
 
@@ -765,9 +657,9 @@ where
                 pending_snapshots: &pending_snapshots,
                 base_reads: None,
             };
-            let result = expected_root.verify(&state_root_ctx);
+            let verify_result = expected_root.verify(&state_root_ctx);
             record_signature_verification_latency("state_root", start.elapsed().as_secs_f64());
-            let valid = match result {
+            let event_result = match verify_result {
                 Ok(verified) => {
                     let (_, prepared) = verified.into_parts();
                     (ctx.commit_prepared)(PreparedBlock {
@@ -777,7 +669,7 @@ where
                         prepared,
                         receipts: collect_finalized_receipts(&finalized_waves),
                     });
-                    true
+                    Ok(())
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -787,10 +679,13 @@ where
                         reason = %e,
                         "State root verification FAILED"
                     );
-                    false
+                    Err(e)
                 }
             };
-            ctx.notify_protocol(ProtocolEvent::StateRootVerified { block_hash, valid });
+            ctx.notify_protocol(ProtocolEvent::StateRootVerified {
+                block_hash,
+                result: event_result,
+            });
         }
 
         Action::BuildProposal {
@@ -935,7 +830,8 @@ where
 mod tests {
     use hyperscale_types::test_utils::test_notarized_transaction_v1;
     use hyperscale_types::{
-        Bls12381G1PrivateKey, ProposerTimestamp, StoredReceipt, TimestampRange,
+        Bls12381G1PrivateKey, CertificateRoot, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
+        StoredReceipt, TimestampRange, TransactionRoot, TxRootVerifyError,
         compute_certificate_root, compute_local_receipt_root, compute_provision_root,
         compute_transaction_root, generate_bls_keypair, routable_from_notarized_v1,
     };
@@ -1362,12 +1258,16 @@ mod tests {
         let txs: Vec<Arc<RoutableTransaction>> = Vec::new();
         let root = compute_transaction_root(&txs);
         let anchor = WeightedTimestamp::ZERO;
-        assert!(verify_transaction_root(root, &txs, anchor));
-        assert!(!verify_transaction_root(
-            TransactionRoot::from_raw(Hash::from_bytes(b"wrong")),
-            &txs,
-            anchor,
-        ));
+        let ctx = TransactionRootContext {
+            transactions: &txs,
+            validity_anchor: anchor,
+        };
+        assert!(root.verify(&ctx).is_ok());
+        assert!(
+            TransactionRoot::from_raw(Hash::from_bytes(b"wrong"))
+                .verify(&ctx)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1388,8 +1288,14 @@ mod tests {
         let txs = vec![tx];
         let root = compute_transaction_root(&txs);
 
-        // Merkle root matches but the tx is expired — verification fails.
-        assert!(!verify_transaction_root(root, &txs, anchor));
+        let ctx = TransactionRootContext {
+            transactions: &txs,
+            validity_anchor: anchor,
+        };
+        assert!(matches!(
+            root.verify(&ctx),
+            Err(TxRootVerifyError::ValidityWindowExpired { .. })
+        ));
 
         // Same root, anchor inside the range — verification passes.
         let valid_range = TimestampRange::new(anchor, anchor.plus(Duration::from_mins(1)));
@@ -1399,7 +1305,11 @@ mod tests {
         );
         let txs2 = vec![tx2];
         let root2 = compute_transaction_root(&txs2);
-        assert!(verify_transaction_root(root2, &txs2, anchor));
+        let ctx2 = TransactionRootContext {
+            transactions: &txs2,
+            validity_anchor: anchor,
+        };
+        assert!(root2.verify(&ctx2).is_ok());
     }
 
     #[test]
@@ -1419,8 +1329,12 @@ mod tests {
         let txs = vec![tx];
         let root = compute_transaction_root(&txs);
 
+        let ctx = TransactionRootContext {
+            transactions: &txs,
+            validity_anchor: anchor,
+        };
         assert!(
-            !verify_transaction_root(root, &txs, anchor),
+            root.verify(&ctx).is_err(),
             "malformed range must reject even when merkle root matches"
         );
     }
@@ -1429,32 +1343,44 @@ mod tests {
     fn verify_provision_root_matches_compute_provision_root() {
         let hashes = vec![Hash::from_bytes(b"a"), Hash::from_bytes(b"b")];
         let root = compute_provision_root(&hashes);
-        assert!(verify_provision_root(root, &hashes));
-        assert!(!verify_provision_root(
-            ProvisionsRoot::from_raw(Hash::from_bytes(b"nope")),
-            &hashes
-        ));
+        let ctx = ProvisionsRootContext {
+            batch_hashes: &hashes,
+        };
+        assert!(root.verify(&ctx).is_ok());
+        assert!(
+            ProvisionsRoot::from_raw(Hash::from_bytes(b"nope"))
+                .verify(&ctx)
+                .is_err()
+        );
     }
 
     #[test]
     fn verify_certificate_root_matches_compute_certificate_root() {
         let certs: Vec<Arc<FinalizedWave>> = Vec::new();
         let root = compute_certificate_root(&certs);
-        assert!(verify_certificate_root(root, &certs));
-        assert!(!verify_certificate_root(
-            CertificateRoot::from_raw(Hash::from_bytes(b"wrong")),
-            &certs
-        ));
+        let ctx = CertificateRootContext {
+            certificates: &certs,
+        };
+        assert!(root.verify(&ctx).is_ok());
+        assert!(
+            CertificateRoot::from_raw(Hash::from_bytes(b"wrong"))
+                .verify(&ctx)
+                .is_err()
+        );
     }
 
     #[test]
     fn verify_local_receipt_root_matches_compute_local_receipt_root() {
         let receipts: Vec<StoredReceipt> = Vec::new();
         let root = compute_local_receipt_root(&receipts);
-        assert!(verify_local_receipt_root(root, &receipts));
-        assert!(!verify_local_receipt_root(
-            LocalReceiptRoot::from_raw(Hash::from_bytes(b"wrong")),
-            &receipts
-        ));
+        let ctx = LocalReceiptRootContext {
+            receipts: &receipts,
+        };
+        assert!(root.verify(&ctx).is_ok());
+        assert!(
+            LocalReceiptRoot::from_raw(Hash::from_bytes(b"wrong"))
+                .verify(&ctx)
+                .is_err()
+        );
     }
 }

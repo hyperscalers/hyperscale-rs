@@ -13,11 +13,42 @@
 //! and let proposer + verifier share them verbatim.
 
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight, ConsensusReceipt, Hash,
-    ReadySignal, Round, ShardWitnessPayload, StoredReceipt, TopologySnapshot, compute_merkle_root,
+    BeaconWitnessLeafCount, BeaconWitnessRoot, BeaconWitnessRootVerifyError, BlockHash,
+    BlockHeight, ConsensusReceipt, Hash, ReadySignal, Round, ShardWitnessPayload, StoredReceipt,
+    TopologySnapshot, VerifiedBeaconWitnessRoot, Verify, compute_merkle_root,
 };
 
 use crate::pending::PendingBlocks;
+
+/// Inputs the [`BeaconWitnessRoot`] verifier reads against.
+///
+/// Re-derives the block's new witness payloads from the three canonical
+/// sources (`receipts`, the missed-round walk over
+/// `(parent_round, round)`, and `ready_signals`), appends them to
+/// `parent_witness_leaves`, and checks the resulting `(root, count)`
+/// matches the header's claim.
+#[derive(Debug)]
+pub struct BeaconWitnessRootContext<'a> {
+    /// Header's claimed leaf count after appending this block's new
+    /// witness payloads. Verification checks the computed count matches.
+    pub expected_leaf_count: BeaconWitnessLeafCount,
+    /// Accumulator leaves at the parent block's tip — the prefix the
+    /// new payloads append onto.
+    pub parent_witness_leaves: Vec<Hash>,
+    /// Round of the parent block — anchors the missed-proposal walk.
+    pub parent_round: Round,
+    /// Height of the block being verified.
+    pub height: BlockHeight,
+    /// Round at which the block was proposed.
+    pub round: Round,
+    /// Receipts that contribute leaves via `beacon_witness_events`.
+    pub receipts: &'a [StoredReceipt],
+    /// Ready signals carried on the block's manifest.
+    pub ready_signals: &'a [ReadySignal],
+    /// Topology snapshot anchoring the proposer-rotation rule the
+    /// missed-round walk reads.
+    pub topology: &'a TopologySnapshot,
+}
 
 /// Per-shard append-only beacon-witness accumulator.
 ///
@@ -244,52 +275,46 @@ pub fn prospective_parent_witness_leaves(
     Ok(leaves)
 }
 
-/// Post-execution verifier for the block's beacon-witness commitment.
-///
-/// Re-derives the new payloads from the three canonical sources
-/// (`receipts`, the missed-round walk over `(parent_round, round)`,
-/// and `ready_signals`), appends them to `parent_witness_leaves`, and
-/// confirms the resulting `(root, leaf_count)` matches the header's
-/// claim. Logs a `warn!` diagnostic and returns `false` on mismatch;
-/// the caller treats `false` as block rejection.
-#[must_use]
-#[allow(clippy::too_many_arguments)] // unified inputs for the off-thread verifier
-pub fn derive_and_verify(
-    expected_root: BeaconWitnessRoot,
-    expected_leaf_count: BeaconWitnessLeafCount,
-    parent_witness_leaves: Vec<Hash>,
-    parent_round: Round,
-    height: BlockHeight,
-    round: Round,
-    receipts: &[StoredReceipt],
-    ready_signals: &[ReadySignal],
-    topology: &TopologySnapshot,
-) -> bool {
-    let missed = missed_proposals_since_prev_commit(height, parent_round, round, topology);
-    let new_leaves = derive_leaves(receipts, &missed, ready_signals);
+impl Verify<&BeaconWitnessRootContext<'_>> for BeaconWitnessRoot {
+    type Verified = VerifiedBeaconWitnessRoot;
+    type Error = BeaconWitnessRootVerifyError;
 
-    let mut leaves = parent_witness_leaves;
-    leaves.reserve(new_leaves.len());
-    for payload in &new_leaves {
-        leaves.push(payload.leaf_hash());
-    }
-    let root = BeaconWitnessRoot::from_raw(compute_merkle_root(&leaves));
-    let count = BeaconWitnessLeafCount::new(leaves.len() as u64);
-    let valid = root == expected_root && count == expected_leaf_count;
-
-    if !valid {
-        tracing::warn!(
-            ?expected_root,
-            ?root,
-            expected_count = expected_leaf_count.inner(),
-            computed_count = count.inner(),
-            height = height.inner(),
-            round = round.inner(),
-            "Beacon-witness root verification FAILED"
+    fn verify(&self, ctx: &BeaconWitnessRootContext<'_>) -> Result<Self::Verified, Self::Error> {
+        let expected_root = *self;
+        let missed = missed_proposals_since_prev_commit(
+            ctx.height,
+            ctx.parent_round,
+            ctx.round,
+            ctx.topology,
         );
-    }
+        let new_leaves = derive_leaves(ctx.receipts, &missed, ctx.ready_signals);
 
-    valid
+        let mut leaves = ctx.parent_witness_leaves.clone();
+        leaves.reserve(new_leaves.len());
+        for payload in &new_leaves {
+            leaves.push(payload.leaf_hash());
+        }
+        let computed_root = Self::from_raw(compute_merkle_root(&leaves));
+        let computed_count = BeaconWitnessLeafCount::new(leaves.len() as u64);
+        if computed_root != expected_root || computed_count != ctx.expected_leaf_count {
+            tracing::warn!(
+                ?expected_root,
+                ?computed_root,
+                expected_count = ctx.expected_leaf_count.inner(),
+                computed_count = computed_count.inner(),
+                height = ctx.height.inner(),
+                round = ctx.round.inner(),
+                "Beacon-witness root verification FAILED"
+            );
+            return Err(BeaconWitnessRootVerifyError::Mismatch {
+                expected_root,
+                computed_root,
+                expected_count: ctx.expected_leaf_count.inner(),
+                computed_count: computed_count.inner(),
+            });
+        }
+        Ok(VerifiedBeaconWitnessRoot::new_unchecked(expected_root))
+    }
 }
 
 #[cfg(test)]

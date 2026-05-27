@@ -12,7 +12,7 @@ use hyperscale_types::{
     CertifiedBeaconBlock, CommittedBlockHeader, Epoch, ExecutionCertificate, ExecutionVote,
     FinalizedWave, GlobalReceiptRoot, Hash, InFlightCount, LeafIndex, LocalReceiptRoot, NodeId,
     PcQc1, PcQc2, PcQc3, PcVector, PcVoteMessage, ProposerTimestamp, ProvisionHash,
-    ProvisionTxRoot, Provisions, ProvisionsRoot, QuorumCertificate, ReadySignal, Round,
+    ProvisionTxRootsMap, Provisions, ProvisionsRoot, QuorumCertificate, ReadySignal, Round,
     RoutableTransaction, ShardGroupId, SharedCertificates, SharedTransactions, SkipEpochCert,
     SkipRequest, SpcCert, SpcEmptyViewMsg, SpcHighTriple, SpcView, StateRoot, SubstateEntry,
     TopologySnapshot, TransactionRoot, TransactionStatus, TxHash, TxOutcome, ValidatorId,
@@ -508,8 +508,8 @@ pub enum Action {
     VerifyProvisionTxRoots {
         /// Block whose provision-tx roots are being verified.
         block_hash: BlockHash,
-        /// Expected per-target roots from block header.
-        expected: std::collections::BTreeMap<ShardGroupId, ProvisionTxRoot>,
+        /// Expected per-target roots from the block header.
+        expected: ProvisionTxRootsMap,
         /// Transactions in the block.
         transactions: SharedTransactions,
         /// Topology snapshot used to route txs to target shards.
