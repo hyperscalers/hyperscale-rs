@@ -104,7 +104,9 @@ pub use shard::limits::{
     MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK, MAX_TX_IN_FLIGHT, MAX_TXS_PER_BLOCK,
 };
 pub use shard::manifest::{BlockManifest, BlockMetadata};
-pub use shard::quorum_certificate::QuorumCertificate;
+pub use shard::quorum_certificate::{
+    QcContext, QcVerifyError, QuorumCertificate, VerifiedQuorumCertificate,
+};
 pub use shard::roots::{
     compute_certificate_root, compute_local_receipt_root, compute_provision_root,
     compute_transaction_root,

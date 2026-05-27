@@ -1,10 +1,27 @@
 //! Quorum certificate for shard consensus.
+//!
+//! [`QuorumCertificate`] is the raw wire form. [`VerifiedQuorumCertificate`]
+//! is the verified typestate — constructed only via
+//! [`<QuorumCertificate as Verify>::verify`](Verify::verify), [`VerifiedQuorumCertificate::genesis`],
+//! or [`VerifiedQuorumCertificate::new_unchecked`].
+//!
+//! Construction asserts: the aggregated BLS signature over the QC's signing
+//! message validates against the aggregated public keys selected by the
+//! signer bitfield, **and** the signers' combined voting power meets the
+//! quorum threshold. The QC↔block linkage check (`qc.block_hash ==
+//! block.header.hash()`) is *not* part of this predicate — it belongs to
+//! the container types that hold the QC (see `LinkedCertifiedBlock` in
+//! Phase 1, `VerifiedCertifiedBlock` in Phase 3).
+
+use std::ops::Deref;
 
 use sbor::prelude::*;
+use thiserror::Error;
 
 use crate::{
-    BlockHash, BlockHeight, Bls12381G2Signature, NetworkDefinition, Round, ShardGroupId,
-    SignerBitfield, WeightedTimestamp, block_vote_message, zero_bls_signature,
+    BlockHash, BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, NetworkDefinition, Round,
+    ShardGroupId, SignerBitfield, Verify, VotePower, WeightedTimestamp, block_vote_message,
+    verify_bls12381_v1, zero_bls_signature,
 };
 
 /// A quorum certificate proving 2f+1 validators voted for a block.
@@ -205,6 +222,162 @@ impl QuorumCertificate {
     }
 }
 
+/// Inputs the QC verifier reads against. The verifier borrows everything;
+/// nothing in here is consumed.
+///
+/// `public_keys` and `voting_powers` are indexed parallel to the QC's
+/// signer bitfield — `public_keys[i]` and `voting_powers[i]` correspond to
+/// the validator whose bit `i` may be set in `qc.signers()`.
+#[derive(Debug, Clone, Copy)]
+pub struct QcContext<'a> {
+    /// Network identifier — feeds the domain-separated signing message.
+    pub network: &'a NetworkDefinition,
+    /// BLS public keys for every validator in this QC's committee.
+    pub public_keys: &'a [Bls12381G1PublicKey],
+    /// Stake-weighted voting power for every validator in this QC's
+    /// committee. Same indexing as `public_keys`.
+    pub voting_powers: &'a [VotePower],
+    /// Minimum aggregate voting power required to constitute a quorum.
+    pub quorum_threshold: VotePower,
+}
+
+/// Failure modes of [`QuorumCertificate`] verification.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum QcVerifyError {
+    /// The QC has no signers set in its bitfield. A QC with zero signers
+    /// is rejected before any cryptographic work; the genesis QC bypasses
+    /// `verify` via [`VerifiedQuorumCertificate::genesis`].
+    #[error("QC has no signers")]
+    NoSigners,
+    /// Aggregating the selected signer public keys failed (the BLS
+    /// library rejected the input — typically an empty aggregate or an
+    /// internal validation failure).
+    #[error("failed to aggregate signer public keys")]
+    PublicKeyAggregationFailed,
+    /// The aggregated signature did not validate against the aggregated
+    /// public keys for the QC's signing message.
+    #[error("aggregated BLS signature invalid")]
+    InvalidSignature,
+    /// The signers' combined voting power is below the quorum threshold.
+    #[error("insufficient quorum power: have {have:?}, need {need:?}")]
+    InsufficientQuorumPower {
+        /// Voting power held by the signers in the QC's bitfield.
+        have: VotePower,
+        /// Voting power required to constitute a quorum.
+        need: VotePower,
+    },
+}
+
+/// Verified quorum certificate.
+///
+/// The construction predicate is stated in the module docs. Construction
+/// goes through one of three gates:
+///
+/// - [`<QuorumCertificate as Verify>::verify`](Verify::verify) — runs the
+///   full predicate.
+/// - [`Self::genesis`] — produces the well-defined zero-signature QC for
+///   block 0. Valid by definition; no signature exists to verify.
+/// - [`Self::new_unchecked`] — audit point. Used at storage-recovery
+///   boundaries where the QC was verified before persistence, and to
+///   re-wrap QCs assembled from already-verified votes inside
+///   `build_qc_from_verified`. Every call site carries a `// SAFETY:`
+///   comment naming the trust source.
+///
+/// Read-only: [`Deref<Target = QuorumCertificate>`](Deref) exposes the
+/// raw QC's accessors. No `&mut`, no `AsMut`, no `Encode`/`Decode` —
+/// verified values cannot be produced from wire bytes.
+#[repr(transparent)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedQuorumCertificate(QuorumCertificate);
+
+impl VerifiedQuorumCertificate {
+    /// Verified form of the genesis QC. Valid by definition: the genesis
+    /// QC carries no signature, and `verify` would reject it for having
+    /// zero signers, so this constructor is the only path to the genesis
+    /// verified value.
+    #[must_use]
+    pub const fn genesis(shard_group_id: ShardGroupId) -> Self {
+        Self(QuorumCertificate::genesis(shard_group_id))
+    }
+
+    /// Audit-point constructor. Skips the predicate.
+    ///
+    /// Permitted use sites: storage-recovery (QC was verified before
+    /// persistence) and `build_qc_from_verified` (QC assembled from
+    /// already-verified votes). Every call site documents the trust
+    /// source with a `// SAFETY:` comment. `grep new_unchecked` produces
+    /// the audit list.
+    #[must_use]
+    pub const fn new_unchecked(qc: QuorumCertificate) -> Self {
+        Self(qc)
+    }
+
+    /// Consume the verified QC and return the raw form. Drops the
+    /// verified claim.
+    #[must_use]
+    pub fn into_inner(self) -> QuorumCertificate {
+        self.0
+    }
+}
+
+impl AsRef<QuorumCertificate> for VerifiedQuorumCertificate {
+    fn as_ref(&self) -> &QuorumCertificate {
+        &self.0
+    }
+}
+
+impl Deref for VerifiedQuorumCertificate {
+    type Target = QuorumCertificate;
+    fn deref(&self) -> &QuorumCertificate {
+        &self.0
+    }
+}
+
+impl From<VerifiedQuorumCertificate> for QuorumCertificate {
+    fn from(verified: VerifiedQuorumCertificate) -> Self {
+        verified.0
+    }
+}
+
+impl Verify<&QcContext<'_>> for QuorumCertificate {
+    type Verified = VerifiedQuorumCertificate;
+    type Error = QcVerifyError;
+
+    fn verify(&self, ctx: &QcContext<'_>) -> Result<Self::Verified, Self::Error> {
+        let signer_keys: Vec<Bls12381G1PublicKey> = ctx
+            .public_keys
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| self.signers.is_set(*i))
+            .map(|(_, pk)| *pk)
+            .collect();
+        if signer_keys.is_empty() {
+            return Err(QcVerifyError::NoSigners);
+        }
+
+        let signing_message = self.signing_message(ctx.network);
+        let aggregated_pk = Bls12381G1PublicKey::aggregate(&signer_keys, false)
+            .map_err(|_| QcVerifyError::PublicKeyAggregationFailed)?;
+        if !verify_bls12381_v1(&signing_message, &aggregated_pk, &self.aggregated_signature) {
+            return Err(QcVerifyError::InvalidSignature);
+        }
+
+        let total_power: VotePower = self
+            .signers
+            .set_indices()
+            .filter_map(|idx| ctx.voting_powers.get(idx).copied())
+            .fold(VotePower::ZERO, VotePower::saturating_add);
+        if total_power < ctx.quorum_threshold {
+            return Err(QcVerifyError::InsufficientQuorumPower {
+                have: total_power,
+                need: ctx.quorum_threshold,
+            });
+        }
+
+        Ok(VerifiedQuorumCertificate(self.clone()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,5 +419,178 @@ mod tests {
         assert!(qc.has_committable_block());
         assert_eq!(qc.committable_height(), Some(BlockHeight::new(0)));
         assert_eq!(qc.committable_hash(), Some(parent_block_hash));
+    }
+
+    // ─── Verify impl tests ──────────────────────────────────────────────
+
+    use crate::{Bls12381G1PrivateKey, generate_bls_keypair};
+
+    /// Build a QC with `signer_indices` of the `n`-validator committee
+    /// signing it. Each signer signs the canonical `block_vote_message`,
+    /// and the resulting signatures are aggregated into the QC. Returns
+    /// the QC and the committee's public keys (in committee order).
+    fn signed_qc(
+        keys: &[Bls12381G1PrivateKey],
+        signer_indices: &[usize],
+        block_hash: BlockHash,
+        shard: ShardGroupId,
+        height: BlockHeight,
+        round: Round,
+    ) -> QuorumCertificate {
+        let net = NetworkDefinition::simulator();
+        let message = block_vote_message(&net, shard, height, round, &block_hash);
+
+        let sigs: Vec<Bls12381G2Signature> = signer_indices
+            .iter()
+            .map(|&i| keys[i].sign_v1(&message))
+            .collect();
+        let agg_sig = Bls12381G2Signature::aggregate(&sigs, true).expect("aggregate sigs");
+
+        let mut signers = SignerBitfield::new(keys.len());
+        for &i in signer_indices {
+            signers.set(i);
+        }
+
+        QuorumCertificate::new(
+            block_hash,
+            shard,
+            height,
+            BlockHash::ZERO,
+            round,
+            signers,
+            agg_sig,
+            WeightedTimestamp::ZERO,
+        )
+    }
+
+    fn ctx<'a>(
+        net: &'a NetworkDefinition,
+        public_keys: &'a [Bls12381G1PublicKey],
+        voting_powers: &'a [VotePower],
+        quorum_threshold: VotePower,
+    ) -> QcContext<'a> {
+        QcContext {
+            network: net,
+            public_keys,
+            voting_powers,
+            quorum_threshold,
+        }
+    }
+
+    #[test]
+    fn verify_accepts_valid_qc_with_quorum_signers() {
+        let keys: Vec<_> = (0..4).map(|_| generate_bls_keypair()).collect();
+        let pubs: Vec<_> = keys.iter().map(Bls12381G1PrivateKey::public_key).collect();
+        let powers = vec![VotePower::new(1); 4];
+
+        let qc = signed_qc(
+            &keys,
+            &[0, 1, 2],
+            BlockHash::from_raw(Hash::from_bytes(b"block")),
+            ShardGroupId::new(0),
+            BlockHeight::new(1),
+            Round::INITIAL,
+        );
+
+        let net = NetworkDefinition::simulator();
+        let verified = qc
+            .verify(&ctx(&net, &pubs, &powers, VotePower::new(3)))
+            .unwrap();
+        assert_eq!(verified.signer_count(), 3);
+    }
+
+    #[test]
+    fn verify_rejects_tampered_signature() {
+        let keys: Vec<_> = (0..4).map(|_| generate_bls_keypair()).collect();
+        let pubs: Vec<_> = keys.iter().map(Bls12381G1PrivateKey::public_key).collect();
+        let powers = vec![VotePower::new(1); 4];
+
+        let mut qc = signed_qc(
+            &keys,
+            &[0, 1, 2],
+            BlockHash::from_raw(Hash::from_bytes(b"block")),
+            ShardGroupId::new(0),
+            BlockHeight::new(1),
+            Round::INITIAL,
+        );
+
+        // Tamper: replace the aggregated signature with one signed over a
+        // different message, so the BLS check fails on aggregation.
+        let net = NetworkDefinition::simulator();
+        let wrong_msg = block_vote_message(
+            &net,
+            ShardGroupId::new(0),
+            BlockHeight::new(1),
+            Round::INITIAL,
+            &BlockHash::from_raw(Hash::from_bytes(b"other_block")),
+        );
+        let bad_sigs: Vec<_> = [0, 1, 2]
+            .iter()
+            .map(|&i| keys[i].sign_v1(&wrong_msg))
+            .collect();
+        let bad_agg = Bls12381G2Signature::aggregate(&bad_sigs, true).unwrap();
+        let (block_hash, shard, height, parent, round, signers, _sig, ts) = qc.clone().into_parts();
+        qc = QuorumCertificate::new(
+            block_hash, shard, height, parent, round, signers, bad_agg, ts,
+        );
+
+        let err = qc
+            .verify(&ctx(&net, &pubs, &powers, VotePower::new(3)))
+            .unwrap_err();
+        assert_eq!(err, QcVerifyError::InvalidSignature);
+    }
+
+    #[test]
+    fn verify_rejects_under_quorum_signer_set() {
+        let keys: Vec<_> = (0..4).map(|_| generate_bls_keypair()).collect();
+        let pubs: Vec<_> = keys.iter().map(Bls12381G1PrivateKey::public_key).collect();
+        let powers = vec![VotePower::new(1); 4];
+
+        // Only two of four sign — quorum is three. Signatures themselves
+        // are valid; the stake total falls short.
+        let qc = signed_qc(
+            &keys,
+            &[0, 1],
+            BlockHash::from_raw(Hash::from_bytes(b"block")),
+            ShardGroupId::new(0),
+            BlockHeight::new(1),
+            Round::INITIAL,
+        );
+
+        let net = NetworkDefinition::simulator();
+        let err = qc
+            .verify(&ctx(&net, &pubs, &powers, VotePower::new(3)))
+            .unwrap_err();
+        assert_eq!(
+            err,
+            QcVerifyError::InsufficientQuorumPower {
+                have: VotePower::new(2),
+                need: VotePower::new(3),
+            }
+        );
+    }
+
+    #[test]
+    fn verify_rejects_qc_with_no_signers() {
+        let keys: Vec<_> = (0..2).map(|_| generate_bls_keypair()).collect();
+        let pubs: Vec<_> = keys.iter().map(Bls12381G1PrivateKey::public_key).collect();
+        let powers = vec![VotePower::new(1); 2];
+
+        let qc = QuorumCertificate::new(
+            BlockHash::from_raw(Hash::from_bytes(b"b")),
+            ShardGroupId::new(0),
+            BlockHeight::new(1),
+            BlockHash::ZERO,
+            Round::INITIAL,
+            SignerBitfield::new(2),
+            zero_bls_signature(),
+            WeightedTimestamp::ZERO,
+        );
+
+        let net = NetworkDefinition::simulator();
+        let err = qc
+            .verify(&ctx(&net, &pubs, &powers, VotePower::new(1)))
+            .unwrap_err();
+        assert_eq!(err, QcVerifyError::NoSigners);
     }
 }
