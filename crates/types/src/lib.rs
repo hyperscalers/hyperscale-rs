@@ -21,6 +21,7 @@ mod provisioning;
 mod sbor_codec;
 mod signing;
 mod time;
+mod verifiable;
 
 // Consensus types
 mod beacon;
@@ -139,6 +140,7 @@ pub use transaction::routable::RoutableTransaction;
 pub use transaction::status::{
     TransactionDecision, TransactionError, TransactionStatus, TransactionStatusParseError,
 };
+pub use verifiable::{Verifiable, Verify};
 pub use wave::certificate::WaveCertificate;
 pub use wave::computation::{
     compute_provision_tx_roots, compute_waves, wave_leader, wave_leader_at,
