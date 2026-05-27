@@ -51,7 +51,7 @@ impl PcSim {
             sks.push(Arc::new(sk));
         }
         let instances: Vec<PcInstance> = (0..n)
-            .map(|_| PcInstance::new(network.clone(), epoch, view, members.clone()))
+            .map(|_| PcInstance::new(epoch, view, members.clone()))
             .collect();
         let decided = vec![None; n];
         let pc_ctx = pc_context(&spc_context(epoch), view);
@@ -141,15 +141,15 @@ impl PcSim {
             match effect {
                 PcEffect::SignAndBroadcastVote1 { v_in } => {
                     let vote = sign_vote1(&sk, sender, &self.network, &self.pc_ctx, v_in);
-                    self.deliver_to_all(&PcEvent::Vote1Received(vote));
+                    self.deliver_to_all(&PcEvent::Vote1Verified(vote));
                 }
                 PcEffect::SignAndBroadcastVote2 { qc1 } => {
                     let vote = sign_vote2(&sk, sender, &self.network, &self.pc_ctx, *qc1);
-                    self.deliver_to_all(&PcEvent::Vote2Received(Box::new(vote)));
+                    self.deliver_to_all(&PcEvent::Vote2Verified(Box::new(vote)));
                 }
                 PcEffect::SignAndBroadcastVote3 { qc2 } => {
                     let vote = sign_vote3(&sk, sender, &self.network, &self.pc_ctx, *qc2);
-                    self.deliver_to_all(&PcEvent::Vote3Received(Box::new(vote)));
+                    self.deliver_to_all(&PcEvent::Vote3Verified(Box::new(vote)));
                 }
                 PcEffect::EquivocationObserved(_) => {
                     // Honest path: no equivocations to absorb.

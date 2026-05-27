@@ -46,9 +46,9 @@ use blake3::Hasher;
 use hyperscale_types::{
     Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature, DOMAIN_PC_EMPTY_VIEW, Epoch,
     Hash, NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PcQc1, PcQc2, PcQc3, PcValueElement, PcVector,
-    PcVoteEquivocation, PositionalBundle, SignerBitfield, SkipReport, SpcCert, SpcContext,
-    SpcEmptyViewMsg, SpcHighTriple, SpcMessage, SpcProposalObject, SpcView, ValidatorId,
-    VpcMsgPayload, aggregate_verify_bls_different_messages, pc_context, pc_vote_signing_message,
+    PcVoteEquivocation, PcVoteMessage, PositionalBundle, SignerBitfield, SkipReport, SpcCert,
+    SpcContext, SpcEmptyViewMsg, SpcHighTriple, SpcMessage, SpcProposalObject, SpcView,
+    ValidatorId, aggregate_verify_bls_different_messages, pc_context, pc_vote_signing_message,
     spc_context,
 };
 
@@ -680,12 +680,24 @@ pub enum SpcEffect {
 }
 
 /// Events [`SpcInstance::handle`] consumes.
+///
+/// Peer messages flow in as `*Verified` variants after the
+/// [`BeaconCoordinator`](crate::coordinator::BeaconCoordinator) has
+/// dispatched the BLS check to the crypto pool and received the
+/// `valid=true` result. There is no unverified admission path — the
+/// type system forbids passing an unverified message into `handle`.
 #[derive(Debug, Clone)]
 pub enum SpcEvent {
     /// The local validator's input vector for view 1.
     Input(PcVector),
-    /// An inner-PC vote arrived, tagged with the SPC view.
-    VpcMsg(Box<VpcMsgPayload>),
+    /// A BLS-verified inner-PC vote, tagged with the SPC view it
+    /// belongs to. Routed to the right view's `PcInstance::handle`.
+    PcVoteVerified {
+        /// SPC view whose inner PC produced this vote.
+        view: SpcView,
+        /// The verified vote, round implicit in the variant.
+        vote: PcVoteMessage,
+    },
     /// `new-view` from a peer entering `view` under `cert`.
     ///
     /// `from` is the transport-level sender id. `NewView` isn't
@@ -724,18 +736,20 @@ pub enum SpcEvent {
 }
 
 impl SpcEvent {
-    /// Reconstruct a [`SpcEvent`] from a wire [`SpcMessage`] and the
-    /// transport-level sender id. `from` only affects routing of
-    /// `NewView` (it determines which validator's proposal-object
-    /// epoch to fill); the other variants are sender-independent.
+    /// Reconstruct a non-vote [`SpcEvent`] from a wire [`SpcMessage`]
+    /// and the transport-level sender id. Returns `None` for
+    /// [`SpcMessage::VpcMsg`] — PC votes flow through the coordinator's
+    /// async-verify path
+    /// ([`BeaconCoordinator::on_pc_vote_received`](crate::coordinator::BeaconCoordinator::on_pc_vote_received)),
+    /// not through this FSM-event constructor.
     #[must_use]
-    pub fn from_message(msg: SpcMessage, from: ValidatorId) -> Self {
-        match msg {
-            SpcMessage::VpcMsg(payload) => Self::VpcMsg(payload),
+    pub fn from_message(msg: SpcMessage, from: ValidatorId) -> Option<Self> {
+        Some(match msg {
+            SpcMessage::VpcMsg(_) => return None,
             SpcMessage::NewView { view, cert } => Self::NewView { from, view, cert },
             SpcMessage::NewCommit { view, value, proof } => Self::NewCommit { view, value, proof },
             SpcMessage::EmptyView(msg) => Self::EmptyView(msg),
-        }
+        })
     }
 }
 
@@ -756,13 +770,12 @@ struct ViewState {
 
 impl ViewState {
     fn new(
-        network: NetworkDefinition,
         epoch: Epoch,
         view: SpcView,
         committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
     ) -> Self {
         Self {
-            vpc: PcInstance::new(network, epoch, view, committee),
+            vpc: PcInstance::new(epoch, view, committee),
             proposal_objects: BTreeMap::new(),
             vpc_input_fed: false,
             empty_views: BTreeMap::new(),
@@ -840,7 +853,7 @@ impl SpcInstance {
         let mut views = BTreeMap::new();
         views.insert(
             SpcView::new(1),
-            ViewState::new(network.clone(), epoch, SpcView::new(1), committee.clone()),
+            ViewState::new(epoch, SpcView::new(1), committee.clone()),
         );
         Self {
             network,
@@ -872,6 +885,13 @@ impl SpcInstance {
         self.current_view
     }
 
+    /// Beacon committee driving this instance, positional order matching
+    /// every embedded signer bitfield.
+    #[must_use]
+    pub fn committee(&self) -> &[(ValidatorId, Bls12381G1PublicKey)] {
+        &self.committee
+    }
+
     /// Whether view 1's inner PC has been fed its `Input`. Coordinator
     /// reads this to gate the local-proposal arrival path: once the
     /// input is fed the PC FSM has started its round-trips and a
@@ -895,7 +915,7 @@ impl SpcInstance {
     pub fn handle(&mut self, event: SpcEvent) -> Vec<SpcEffect> {
         match event {
             SpcEvent::Input(v) => self.on_input(v),
-            SpcEvent::VpcMsg(payload) => self.on_vpc_msg(*payload),
+            SpcEvent::PcVoteVerified { view, vote } => self.on_pc_vote_verified(view, vote),
             SpcEvent::NewView { from, view, cert } => self.on_new_view(from, view, *cert),
             SpcEvent::NewCommit { view, value, proof } => self.on_new_commit(view, &value, *proof),
             SpcEvent::EmptyView(msg) => self.on_empty_view(*msg),
@@ -913,22 +933,23 @@ impl SpcInstance {
         self.translate_pc_effects(SpcView::new(1), pc_effects)
     }
 
-    fn on_vpc_msg(&mut self, payload: VpcMsgPayload) -> Vec<SpcEffect> {
-        let view = match &payload {
-            VpcMsgPayload::Vote1 { view, .. }
-            | VpcMsgPayload::Vote2 { view, .. }
-            | VpcMsgPayload::Vote3 { view, .. } => *view,
-        };
+    /// Route a BLS-verified PC vote into the right view's inner PC
+    /// instance. Drop on a view the local FSM hasn't entered (no
+    /// buffering — peer is ahead of us, the view-entry path will re-feed
+    /// inputs).
+    pub(crate) fn on_pc_vote_verified(
+        &mut self,
+        view: SpcView,
+        vote: PcVoteMessage,
+    ) -> Vec<SpcEffect> {
         let Some(view_state) = self.views.get_mut(&view) else {
-            // No buffering — drop messages for views we haven't entered.
             return vec![];
         };
-        let pc_event = match payload {
-            VpcMsgPayload::Vote1 { vote, .. } => PcEvent::Vote1Received(vote),
-            VpcMsgPayload::Vote2 { vote, .. } => PcEvent::Vote2Received(vote),
-            VpcMsgPayload::Vote3 { vote, .. } => PcEvent::Vote3Received(vote),
+        let pc_effects = match vote {
+            PcVoteMessage::Vote1(v) => view_state.vpc.on_vote1_verified(v),
+            PcVoteMessage::Vote2(v) => view_state.vpc.on_vote2_verified(*v),
+            PcVoteMessage::Vote3(v) => view_state.vpc.on_vote3_verified(*v),
         };
-        let pc_effects = view_state.vpc.handle(pc_event);
         self.translate_pc_effects(view, pc_effects)
     }
 
@@ -1134,14 +1155,10 @@ impl SpcInstance {
         let po = SpcProposalObject { view, cert };
         let h = hash_proposal_object(&po);
         self.proposals_by_hash.insert(h, po.clone());
-        let view_state = self.views.entry(view).or_insert_with(|| {
-            ViewState::new(
-                self.network.clone(),
-                self.epoch,
-                view,
-                self.committee.clone(),
-            )
-        });
+        let view_state = self
+            .views
+            .entry(view)
+            .or_insert_with(|| ViewState::new(self.epoch, view, self.committee.clone()));
         // Last-write-wins on `(view, sender)` for proposal objects.
         // The cert authenticates the parent claim, so two distinct
         // valid certs from the "same sender" are valid relays, not
@@ -1218,14 +1235,10 @@ impl SpcInstance {
 
         self.update_max_high(msg.reported.clone());
 
-        let view_state = self.views.entry(view).or_insert_with(|| {
-            ViewState::new(
-                self.network.clone(),
-                self.epoch,
-                view,
-                self.committee.clone(),
-            )
-        });
+        let view_state = self
+            .views
+            .entry(view)
+            .or_insert_with(|| ViewState::new(self.epoch, view, self.committee.clone()));
         if view_state.indirect_cert_built {
             return vec![];
         }
@@ -1619,10 +1632,7 @@ mod tests {
             PcVector::empty(),
             vec![Bls12381G2Signature([0u8; 96])],
         );
-        let effects = fsm.handle(SpcEvent::VpcMsg(Box::new(VpcMsgPayload::Vote1 {
-            view: SpcView::new(99),
-            vote: dummy,
-        })));
+        let effects = fsm.on_pc_vote_verified(SpcView::new(99), PcVoteMessage::Vote1(dummy));
         assert!(effects.is_empty());
     }
 

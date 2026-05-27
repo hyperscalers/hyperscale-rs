@@ -14,8 +14,8 @@ use std::time::Duration;
 use hyperscale_beacon::pc::{sign_vote1, sign_vote2, sign_vote3};
 use hyperscale_beacon::spc::{SpcEffect, SpcEvent, SpcInstance, sign_empty_view_msg};
 use hyperscale_types::{
-    Bls12381G1PrivateKey, Bls12381G1PublicKey, Epoch, NetworkDefinition, PcVector, SpcView,
-    ValidatorId, VpcMsgPayload, bls_keypair_from_seed, pc_context, spc_context,
+    Bls12381G1PrivateKey, Bls12381G1PublicKey, Epoch, NetworkDefinition, PcVector, PcVoteMessage,
+    SpcView, ValidatorId, bls_keypair_from_seed, pc_context, spc_context,
 };
 
 /// One pending event in the network: an `SpcEvent` addressed to a
@@ -135,26 +135,26 @@ impl SpcSim {
                 SpcEffect::SignAndBroadcastPcVote1 { view, v_in } => {
                     let pc_ctx = pc_context(&spc_context(self.epoch), view);
                     let vote = sign_vote1(&sk, sender, &self.network, &pc_ctx, v_in);
-                    let payload = Box::new(VpcMsgPayload::Vote1 { view, vote });
-                    self.deliver_to_all(&SpcEvent::VpcMsg(payload));
+                    self.deliver_to_all(&SpcEvent::PcVoteVerified {
+                        view,
+                        vote: PcVoteMessage::Vote1(vote),
+                    });
                 }
                 SpcEffect::SignAndBroadcastPcVote2 { view, qc1 } => {
                     let pc_ctx = pc_context(&spc_context(self.epoch), view);
                     let vote = sign_vote2(&sk, sender, &self.network, &pc_ctx, *qc1);
-                    let payload = Box::new(VpcMsgPayload::Vote2 {
+                    self.deliver_to_all(&SpcEvent::PcVoteVerified {
                         view,
-                        vote: Box::new(vote),
+                        vote: PcVoteMessage::Vote2(Box::new(vote)),
                     });
-                    self.deliver_to_all(&SpcEvent::VpcMsg(payload));
                 }
                 SpcEffect::SignAndBroadcastPcVote3 { view, qc2 } => {
                     let pc_ctx = pc_context(&spc_context(self.epoch), view);
                     let vote = sign_vote3(&sk, sender, &self.network, &pc_ctx, *qc2);
-                    let payload = Box::new(VpcMsgPayload::Vote3 {
+                    self.deliver_to_all(&SpcEvent::PcVoteVerified {
                         view,
-                        vote: Box::new(vote),
+                        vote: PcVoteMessage::Vote3(Box::new(vote)),
                     });
-                    self.deliver_to_all(&SpcEvent::VpcMsg(payload));
                 }
                 SpcEffect::BroadcastNewView { view, cert } => {
                     let from = sender;

@@ -114,7 +114,8 @@ pub(crate) fn verify_length_attestation(
 // ─── Round 1 ───────────────────────────────────────────────────────────────
 
 /// Verify a single round-1 vote. Pure function over wire types.
-pub(crate) fn verify_vote1(
+#[must_use]
+pub fn verify_vote1(
     v1: &PcVote1,
     network: &NetworkDefinition,
     pc_ctx: &PcContext,
@@ -227,10 +228,12 @@ fn reconstruct_compact_vote(cv: &PcCompactVote, x: &PcVector) -> Option<PcVector
 // ─── Round 2 ───────────────────────────────────────────────────────────────
 
 /// Verify a single round-2 vote — `(x, prefix_sigs, embedded qc1,
-/// length_attestation)`. Calls into [`verify_qc1`] for the embedded
-/// round-1 QC; recurses indirectly through
-/// [`PcXpProof::ShortWitness`] in [`verify_qc2`].
-pub(crate) fn verify_vote2(
+/// length_attestation)`.
+///
+/// Calls into [`verify_qc1`] for the embedded round-1 QC; recurses
+/// indirectly through [`PcXpProof::ShortWitness`] in [`verify_qc2`].
+#[must_use]
+pub fn verify_vote2(
     v2: &PcVote2,
     network: &NetworkDefinition,
     pc_ctx: &PcContext,
@@ -398,7 +401,8 @@ fn verify_diverging_proof(
 /// Verify a single round-3 vote — `(x_p, sig_xp, embedded qc2)`. The
 /// signer's individual sig over `x_p` plus the embedded QC2 binding
 /// `x_p` to a real round-2 quorum.
-pub(crate) fn verify_vote3(
+#[must_use]
+pub fn verify_vote3(
     v3: &PcVote3,
     network: &NetworkDefinition,
     pc_ctx: &PcContext,
@@ -914,18 +918,23 @@ pub enum PcEffect {
 }
 
 /// Events `PcInstance::handle` consumes.
+///
+/// Peer votes flow in as `Vote*Verified` after the
+/// [`BeaconCoordinator`](crate::coordinator::BeaconCoordinator) has
+/// dispatched the BLS check to the crypto pool and received the
+/// `valid=true` result. There is no `*Received` admission path — the
+/// type system forbids passing an unverified vote into `handle`.
 #[derive(Debug, Clone)]
 pub enum PcEvent {
     /// The local validator's input vector. Idempotent: subsequent
     /// inputs after the first are dropped.
     Input(PcVector),
-    /// A peer's round-1 vote arrived. The IO layer is responsible for
-    /// the sender-to-validator authentication check before dispatch.
-    Vote1Received(PcVote1),
-    /// A peer's round-2 vote arrived.
-    Vote2Received(Box<PcVote2>),
-    /// A peer's round-3 vote arrived.
-    Vote3Received(Box<PcVote3>),
+    /// A BLS-verified round-1 vote, ready for admission to the pool.
+    Vote1Verified(PcVote1),
+    /// A BLS-verified round-2 vote.
+    Vote2Verified(Box<PcVote2>),
+    /// A BLS-verified round-3 vote.
+    Vote3Verified(Box<PcVote3>),
 }
 
 /// One inner-PC FSM instance, scoped to a single `(epoch, view)`.
@@ -935,10 +944,8 @@ pub enum PcEvent {
 /// synchronous — every event-handler invocation returns the full set
 /// of effects that follow, and the parent drains them.
 pub struct PcInstance {
-    network: NetworkDefinition,
     epoch: Epoch,
     view: SpcView,
-    pc_ctx: PcContext,
     committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
 
     vote1_pool: BTreeMap<ValidatorId, PcVote1>,
@@ -960,7 +967,6 @@ impl PcInstance {
     /// and `f = (n - 1) / 3`, which collapses to `n >= 4`.
     #[must_use]
     pub fn new(
-        network: NetworkDefinition,
         epoch: Epoch,
         view: SpcView,
         committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
@@ -970,12 +976,9 @@ impl PcInstance {
             "PC requires n >= 4 (3f + 1 with f = 1); got n = {}",
             committee.len()
         );
-        let pc_ctx = pc_context(&spc_context(epoch), view);
         Self {
-            network,
             epoch,
             view,
-            pc_ctx,
             committee,
             vote1_pool: BTreeMap::new(),
             vote2_pool: BTreeMap::new(),
@@ -1005,9 +1008,9 @@ impl PcInstance {
     pub fn handle(&mut self, event: PcEvent) -> Vec<PcEffect> {
         match event {
             PcEvent::Input(v) => self.on_input(v),
-            PcEvent::Vote1Received(vote) => self.on_vote1(vote),
-            PcEvent::Vote2Received(vote) => self.on_vote2(*vote),
-            PcEvent::Vote3Received(vote) => self.on_vote3(*vote),
+            PcEvent::Vote1Verified(v) => self.on_vote1_verified(v),
+            PcEvent::Vote2Verified(v) => self.on_vote2_verified(*v),
+            PcEvent::Vote3Verified(v) => self.on_vote3_verified(*v),
         }
     }
 
@@ -1026,10 +1029,10 @@ impl PcInstance {
         effects
     }
 
-    fn on_vote1(&mut self, v1: PcVote1) -> Vec<PcEffect> {
-        if !verify_vote1(&v1, &self.network, &self.pc_ctx, &self.committee) {
-            return vec![];
-        }
+    /// Admit a BLS-verified round-1 vote. Callers MUST have already
+    /// run [`verify_vote1`] (or its async dispatch); this entry skips
+    /// the sig check and runs the pool / equivocation logic.
+    pub(crate) fn on_vote1_verified(&mut self, v1: PcVote1) -> Vec<PcEffect> {
         let from = v1.validator();
         if let Some(existing) = self.vote1_pool.get(&from) {
             if existing.v_in() == v1.v_in() {
@@ -1050,10 +1053,9 @@ impl PcInstance {
         self.maybe_advance_to_round2()
     }
 
-    fn on_vote2(&mut self, v2: PcVote2) -> Vec<PcEffect> {
-        if !verify_vote2(&v2, &self.network, &self.pc_ctx, &self.committee) {
-            return vec![];
-        }
+    /// Admit a BLS-verified round-2 vote. Callers MUST have already
+    /// run [`verify_vote2`].
+    pub(crate) fn on_vote2_verified(&mut self, v2: PcVote2) -> Vec<PcEffect> {
         let from = v2.validator();
         if let Some(existing) = self.vote2_pool.get(&from) {
             // Vote2's signed payload is `x` — different `qc1` aggregations
@@ -1076,10 +1078,9 @@ impl PcInstance {
         self.maybe_advance_to_round3()
     }
 
-    fn on_vote3(&mut self, v3: PcVote3) -> Vec<PcEffect> {
-        if !verify_vote3(&v3, &self.network, &self.pc_ctx, &self.committee) {
-            return vec![];
-        }
+    /// Admit a BLS-verified round-3 vote. Callers MUST have already
+    /// run [`verify_vote3`].
+    pub(crate) fn on_vote3_verified(&mut self, v3: PcVote3) -> Vec<PcEffect> {
         let from = v3.validator();
         if let Some(existing) = self.vote3_pool.get(&from) {
             // Vote3's signed payload is `x_p` — different `qc2`s are
@@ -1431,7 +1432,7 @@ mod tests {
 
     fn fsm_instance() -> PcInstance {
         let (_, members) = fsm_committee(4);
-        PcInstance::new(net(), Epoch::new(1), SpcView::new(0), members)
+        PcInstance::new(Epoch::new(1), SpcView::new(0), members)
     }
 
     /// `PcInstance::new` panics when the committee is too small for
@@ -1442,7 +1443,7 @@ mod tests {
     #[should_panic(expected = "PC requires n >= 4")]
     fn pc_instance_rejects_undersized_committee() {
         let (_, members) = fsm_committee(3);
-        let _ = PcInstance::new(net(), Epoch::new(1), SpcView::new(0), members);
+        let _ = PcInstance::new(Epoch::new(1), SpcView::new(0), members);
     }
 
     /// First `Input` event emits a sign-and-broadcast intent for
@@ -1470,7 +1471,7 @@ mod tests {
     #[test]
     fn pc_observes_round1_equivocation() {
         let (sks, members) = fsm_committee(4);
-        let mut fsm = PcInstance::new(net(), Epoch::new(1), SpcView::new(0), members.clone());
+        let mut fsm = PcInstance::new(Epoch::new(1), SpcView::new(0), members.clone());
 
         // Two distinct v_ins signed by validator 1 (the equivocator).
         let pc_ctx_bytes = pc_context(&spc_context(Epoch::new(1)), SpcView::new(0));
@@ -1479,9 +1480,9 @@ mod tests {
         let vote_a = sign_vote1(&sks[1], members[1].0, &net(), &pc_ctx_bytes, v_a);
         let vote_b = sign_vote1(&sks[1], members[1].0, &net(), &pc_ctx_bytes, v_b);
 
-        let effects_a = fsm.handle(PcEvent::Vote1Received(vote_a));
+        let effects_a = fsm.handle(PcEvent::Vote1Verified(vote_a));
         assert!(effects_a.is_empty(), "first vote pools without effect");
-        let effects_b = fsm.handle(PcEvent::Vote1Received(vote_b));
+        let effects_b = fsm.handle(PcEvent::Vote1Verified(vote_b));
         let [PcEffect::EquivocationObserved(ev)] = effects_b.as_slice() else {
             panic!("expected EquivocationObserved, got {effects_b:?}");
         };
