@@ -157,7 +157,9 @@ pub use wave::computation::{compute_waves, wave_leader, wave_leader_at};
 pub use wave::execution_certificate::{
     ExecutionCertificate, ExecutionCertificateContext, ExecutionCertificateVerifyError,
 };
-pub use wave::finalized::{FinalizedWave, ReceiptValidationError};
+pub use wave::finalized::{
+    FinalizedWave, FinalizedWaveContext, FinalizedWaveVerifyError, ReceiptValidationError,
+};
 pub use wave::id::{MAX_REMOTE_SHARDS_PER_WAVE, WaveId};
 pub use wave::outcome::{ExecutionOutcome, TxOutcome};
 pub use wave::receipt_tree::{
