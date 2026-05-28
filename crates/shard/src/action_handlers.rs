@@ -190,7 +190,7 @@ pub fn build_proposal<S: ShardChainWriter>(
     is_fallback: bool,
     parent_state_root: StateRoot,
     parent_block_height: BlockHeight,
-    transactions: Vec<Arc<RoutableTransaction>>,
+    transactions: Vec<Arc<Verified<RoutableTransaction>>>,
     certificates: Vec<Arc<Verifiable<FinalizedWave>>>,
     local_shard: ShardGroupId,
     topology: &TopologySnapshot,
@@ -211,11 +211,9 @@ pub fn build_proposal<S: ShardChainWriter>(
         None,
     );
 
-    // Mempool admission produced `Verified<RoutableTransaction>` upstream,
-    // but the [`Action::BuildProposal`] payload still carries the raw form
-    // (Phase 4 of the verification plan threads Verified into the action
-    // payload). Wrap here so block construction and per-root compute calls
-    // see the [`Verifiable`] form that `Block.transactions` requires.
+    // Lift each `Verified<RoutableTransaction>` into `Verifiable` so block
+    // construction and per-root compute calls see the form that
+    // `Block.transactions` carries.
     let transactions: Vec<Arc<Verifiable<RoutableTransaction>>> = transactions
         .into_iter()
         .map(|tx| Arc::new(Verifiable::from((*tx).clone())))

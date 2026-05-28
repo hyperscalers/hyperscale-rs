@@ -21,7 +21,7 @@ use hyperscale_core::Action;
 use hyperscale_types::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight, FinalizedWave,
     LocalTimestamp, ProposerTimestamp, ProvisionHash, Provisions, ReadySignal, Round,
-    RoutableTransaction, TopologySnapshot, TxHash, Verifiable, WaveId, WeightedTimestamp,
+    RoutableTransaction, TopologySnapshot, TxHash, Verifiable, Verified, WaveId, WeightedTimestamp,
 };
 use tracing::debug;
 
@@ -38,7 +38,7 @@ use crate::verification::VerificationPipeline;
 pub enum ProposalKind {
     /// Normal proposal with a filtered payload and a real-clock timestamp.
     Normal {
-        transactions: Vec<Arc<RoutableTransaction>>,
+        transactions: Vec<Arc<Verified<RoutableTransaction>>>,
         finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>>,
         provisions: Vec<Arc<Verifiable<Provisions>>>,
         finalized_tx_count: u32,
@@ -159,11 +159,11 @@ impl ProposalTracker {
 ///
 /// Logs the dedup and expiry counts when non-zero.
 pub fn select_transactions(
-    ready_txs: &[Arc<RoutableTransaction>],
+    ready_txs: &[Arc<Verified<RoutableTransaction>>],
     qc_chain_tx_hashes: &HashSet<TxHash>,
     dedup_index: &CommitDedupIndex,
     validity_anchor: WeightedTimestamp,
-) -> Vec<Arc<RoutableTransaction>> {
+) -> Vec<Arc<Verified<RoutableTransaction>>> {
     let before = ready_txs.len();
     let mut deduped = 0;
     let mut expired = 0;
@@ -534,9 +534,11 @@ mod tests {
         WeightedTimestamp::from_millis(ms)
     }
 
-    fn tx_with_range(seed: u8, range: TimestampRange) -> Arc<RoutableTransaction> {
+    fn tx_with_range(seed: u8, range: TimestampRange) -> Arc<Verified<RoutableTransaction>> {
         let notarized = test_notarized_transaction_v1(&[seed]);
-        Arc::new(routable_from_notarized_v1(notarized, range).expect("valid notarized"))
+        Arc::new(Verified::<RoutableTransaction>::from_persisted(
+            routable_from_notarized_v1(notarized, range).expect("valid notarized"),
+        ))
     }
 
     fn empty_dedup_index() -> CommitDedupIndex {

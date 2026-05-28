@@ -279,11 +279,30 @@ pub fn validate_block_for_vote(
     qc_chain_provision_hashes: &HashSet<ProvisionHash>,
     dedup_index: &CommitDedupIndex,
 ) -> Result<(), String> {
+    validate_transactions_verified(block)?;
     validate_transaction_ordering(block)?;
     validate_waves(topology, block)?;
     validate_no_duplicate_transactions(block, qc_chain_tx_hashes, dedup_index)?;
     validate_no_duplicate_certificates(block, qc_chain_cert_ids, dedup_index)?;
     validate_no_duplicate_provisions(block, qc_chain_provision_hashes, dedup_index)?;
+    Ok(())
+}
+
+/// Refuse to vote on a block whose `transactions` entries are not all
+/// `Verifiable::Verified`. Honest voters source every tx from local
+/// admission-validated state (mempool / fetch cache); an `Unverified` entry
+/// means assembly couldn't obtain or validate the body, and voting would
+/// break the BFT-transitive trust chain that downstream `from_persisted`
+/// gates rely on.
+fn validate_transactions_verified(block: &Block) -> Result<(), String> {
+    for tx in block.transactions().iter() {
+        if tx.verified().is_none() {
+            return Err(format!(
+                "transaction {} is not admission-validated",
+                tx.hash()
+            ));
+        }
+    }
     Ok(())
 }
 

@@ -270,7 +270,11 @@ impl RocksDbShardStorage {
         // execution window.
         let transactions: Vec<Arc<Verifiable<RoutableTransaction>>> = transactions
             .into_iter()
-            .map(|tx| Arc::new(Verifiable::from((*tx).clone())))
+            .map(|tx| {
+                Arc::new(Verifiable::from(
+                    Verified::<RoutableTransaction>::from_persisted((*tx).clone()),
+                ))
+            })
             .collect();
         let block = Block::Sealed {
             header,
@@ -410,7 +414,11 @@ impl RocksDbShardStorage {
         let provision_hashes_bounded = manifest.provision_hashes().clone();
         let transactions: Vec<Arc<Verifiable<RoutableTransaction>>> = transactions
             .into_iter()
-            .map(|tx| Arc::new(Verifiable::from((*tx).clone())))
+            .map(|tx| {
+                Arc::new(Verifiable::from(
+                    Verified::<RoutableTransaction>::from_persisted((*tx).clone()),
+                ))
+            })
             .collect();
         let block = Block::Sealed {
             header,

@@ -31,13 +31,15 @@ use crate::{
 pub type SharedTransactions =
     Arc<BoundedVec<Arc<Verifiable<RoutableTransaction>>, MAX_TXS_PER_BLOCK>>;
 
-/// Build a [`SharedTransactions`] from a list of raw `Arc<RoutableTransaction>`.
+/// Build a [`SharedTransactions`] from a list of raw `Arc<RoutableTransaction>`
+/// recovered from persistent storage.
 ///
-/// Each entry is wrapped as [`Verifiable::Unverified`] — paths that have
-/// already-verified txs (mempool admission, proposal building) should
-/// construct directly via `Vec<Arc<Verifiable<RoutableTransaction>>>` to
-/// preserve the marker. This helper is for paths that genuinely have
-/// raw txs (storage rehydration, fetch-response reconstruction).
+/// Each entry is lifted via
+/// [`Verified::<RoutableTransaction>::from_persisted`] — the BFT-transitive
+/// trust chain (persisted ⇒ committed block ⇒ voter-validated by ≥1 honest
+/// voter) justifies marking each as [`Verifiable::Verified`]. Callers
+/// outside that trust source must construct
+/// `Vec<Arc<Verifiable<RoutableTransaction>>>` directly.
 ///
 /// # Panics
 ///
@@ -46,7 +48,11 @@ pub type SharedTransactions =
 pub fn shared_transactions_from_raw(txs: Vec<Arc<RoutableTransaction>>) -> SharedTransactions {
     let wrapped: Vec<Arc<Verifiable<RoutableTransaction>>> = txs
         .into_iter()
-        .map(|tx| Arc::new(Verifiable::from((*tx).clone())))
+        .map(|tx| {
+            Arc::new(Verifiable::from(
+                Verified::<RoutableTransaction>::from_persisted((*tx).clone()),
+            ))
+        })
         .collect();
     Arc::new(wrapped.into())
 }

@@ -27,16 +27,23 @@
 
 use std::sync::Arc;
 
-use hyperscale_types::{BloomFilter, DEFAULT_FPR, RoutableTransaction, TxHash};
+use hyperscale_types::{BloomFilter, DEFAULT_FPR, RoutableTransaction, TxHash, Verified};
 use papaya::HashMap;
 
 /// Shared content-addressed store of [`RoutableTransaction`] bodies.
+///
+/// Bodies are stored as `Arc<Verified<RoutableTransaction>>`; admission to
+/// the store is gated by the standard `Verify` predicate (gossip / RPC /
+/// fetch all run through the validation pipeline), and re-population from
+/// committed blocks goes through
+/// [`Verified::<RoutableTransaction>::from_persisted`] under BFT-transitive
+/// trust. The store's type expresses that invariant directly.
 ///
 /// Read-heavy: every mempool iteration and every inbound fetch serve
 /// reads bodies; writes (insert on validation, evict on retention sweep)
 /// are infrequent and single-threaded (state machine).
 pub struct TxStore {
-    inner: HashMap<TxHash, Arc<RoutableTransaction>>,
+    inner: HashMap<TxHash, Arc<Verified<RoutableTransaction>>>,
 }
 
 impl TxStore {
@@ -51,21 +58,24 @@ impl TxStore {
     /// Insert a transaction body. Idempotent: re-inserting the same hash is
     /// a no-op (the existing `Arc` is preserved so callers holding clones
     /// keep pointing at the same allocation).
-    pub fn insert(&self, tx: Arc<RoutableTransaction>) {
+    pub fn insert(&self, tx: Arc<Verified<RoutableTransaction>>) {
         let hash = tx.hash();
         self.inner.pin().get_or_insert_with(hash, || tx);
     }
 
     /// Look up a transaction body by hash.
     #[must_use]
-    pub fn get(&self, hash: &TxHash) -> Option<Arc<RoutableTransaction>> {
+    pub fn get(&self, hash: &TxHash) -> Option<Arc<Verified<RoutableTransaction>>> {
         self.inner.pin().get(hash).cloned()
     }
 
     /// Bulk lookup. Returns `(hash, body)` pairs for those found; missing
     /// hashes are skipped (caller decides fallback policy).
     #[must_use]
-    pub fn get_batch(&self, hashes: &[TxHash]) -> Vec<(TxHash, Arc<RoutableTransaction>)> {
+    pub fn get_batch(
+        &self,
+        hashes: &[TxHash],
+    ) -> Vec<(TxHash, Arc<Verified<RoutableTransaction>>)> {
         let g = self.inner.pin();
         hashes
             .iter()
@@ -129,12 +139,12 @@ impl Default for TxStore {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::test_utils::test_transaction;
+    use hyperscale_types::test_utils::verified_test_transaction;
 
     use super::*;
 
-    fn tx(seed: u8) -> Arc<RoutableTransaction> {
-        Arc::new(test_transaction(seed))
+    fn tx(seed: u8) -> Arc<Verified<RoutableTransaction>> {
+        Arc::new(verified_test_transaction(seed))
     }
 
     #[test]

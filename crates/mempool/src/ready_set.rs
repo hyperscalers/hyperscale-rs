@@ -19,12 +19,12 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_types::{LocalTimestamp, NodeId, RoutableTransaction, TxHash};
+use hyperscale_types::{LocalTimestamp, NodeId, RoutableTransaction, TxHash, Verified};
 
 use crate::lock_tracker::LockTracker;
 
 struct ReadyEntry {
-    tx: Arc<RoutableTransaction>,
+    tx: Arc<Verified<RoutableTransaction>>,
     added_at: LocalTimestamp,
 }
 
@@ -53,7 +53,7 @@ impl ReadySet {
     pub fn add(
         &mut self,
         hash: TxHash,
-        tx: Arc<RoutableTransaction>,
+        tx: Arc<Verified<RoutableTransaction>>,
         added_at: LocalTimestamp,
         locks: &LockTracker,
     ) {
@@ -176,7 +176,7 @@ impl ReadySet {
         &self,
         min_dwell: Duration,
         now: LocalTimestamp,
-    ) -> impl Iterator<Item = Arc<RoutableTransaction>> + '_ {
+    ) -> impl Iterator<Item = Arc<Verified<RoutableTransaction>>> + '_ {
         self.ready
             .values()
             .filter(move |entry| now.saturating_sub(entry.added_at) >= min_dwell)
@@ -206,11 +206,11 @@ mod tests {
 
     use super::*;
 
-    fn tx_with(seed: u8, nodes: &[u8]) -> (TxHash, Arc<RoutableTransaction>) {
+    fn tx_with(seed: u8, nodes: &[u8]) -> (TxHash, Arc<Verified<RoutableTransaction>>) {
         let nodes: Vec<_> = nodes.iter().map(|n| test_node(*n)).collect();
         let tx = test_transaction_with_nodes(&[seed], nodes.clone(), nodes);
         let hash = tx.hash();
-        (hash, Arc::new(tx))
+        (hash, Arc::new(Verified::new_unchecked_for_test(tx)))
     }
 
     // ─── Invariant helpers ──────────────────────────────────────────────
@@ -481,7 +481,7 @@ mod tests {
         op: &Op,
         rs: &mut ReadySet,
         locks: &mut LockTracker,
-        fixture: &[(TxHash, Arc<RoutableTransaction>)],
+        fixture: &[(TxHash, Arc<Verified<RoutableTransaction>>)],
     ) {
         let pool_len = fixture.len();
         match op {
@@ -514,7 +514,7 @@ mod tests {
     fn cascade_promote(
         rs: &mut ReadySet,
         locks: &LockTracker,
-        fixture: &[(TxHash, Arc<RoutableTransaction>)],
+        fixture: &[(TxHash, Arc<Verified<RoutableTransaction>>)],
         node: NodeId,
     ) {
         let mut promotable = rs.promotable_for_node(node);
@@ -535,7 +535,7 @@ mod tests {
         ) {
             // Fixture: 8 txs over 4 declared-node seeds, heavy overlap so the
             // deferred path gets real exercise.
-            let fixture: Vec<(TxHash, Arc<RoutableTransaction>)> = (0..8)
+            let fixture: Vec<(TxHash, Arc<Verified<RoutableTransaction>>)> = (0..8)
                 .map(|seed| tx_with(seed, &[0, 1, 2, 3][..=((seed as usize) % 4)]))
                 .collect();
 

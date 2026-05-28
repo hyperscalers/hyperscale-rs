@@ -664,7 +664,7 @@ impl ShardCoordinator {
     pub fn try_propose(
         &mut self,
         topology_snapshot: &TopologySnapshot,
-        ready_txs: &[Arc<RoutableTransaction>],
+        ready_txs: &[Arc<Verified<RoutableTransaction>>],
         finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>>,
         provisions: Vec<Arc<Verifiable<Provisions>>>,
     ) -> Vec<Action> {
@@ -2339,7 +2339,7 @@ impl ShardCoordinator {
         topology_snapshot: &TopologySnapshot,
         block_hash: BlockHash,
         qc: &Verified<QuorumCertificate>,
-        ready_txs: &[Arc<RoutableTransaction>],
+        ready_txs: &[Arc<Verified<RoutableTransaction>>],
         finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>>,
         provisions: Vec<Arc<Verifiable<Provisions>>>,
     ) -> Vec<Action> {
@@ -4984,7 +4984,7 @@ mod tests {
         assert!(state.is_block_syncing());
 
         // Ready txs must be dropped — sync blocks are always empty.
-        let ready_txs = vec![Arc::new(test_utils::test_transaction(1))];
+        let ready_txs = vec![Arc::new(test_utils::verified_test_transaction(1))];
         let actions = state.try_propose(&topology, &ready_txs, vec![], vec![]);
 
         let proposal = actions
