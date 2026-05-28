@@ -576,10 +576,9 @@ impl ProvisionCoordinator {
                 return actions;
             }
         };
-        let provisions = Arc::new((**verified).clone());
         let source_block_ts = committed_header.qc().weighted_timestamp();
-        let provisions_hash = provisions.hash();
-        let source_shard = provisions.source_shard();
+        let provisions_hash = verified.hash();
+        let source_shard = verified.source_shard();
 
         // The verify path is async: the action was dispatched at receipt,
         // before the same batch may have been committed in another block.
@@ -598,7 +597,7 @@ impl ProvisionCoordinator {
             return actions;
         }
 
-        let provisions = self.pipeline.insert_verified(provisions, source_block_ts);
+        let provisions = self.pipeline.insert_verified(verified, source_block_ts);
 
         // Queue for inclusion in the next block proposal. Timestamp drives
         // the dwell-time filter in `queued_provisions()` — peers need time
