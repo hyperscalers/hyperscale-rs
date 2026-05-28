@@ -295,6 +295,9 @@ where
             ShardScopedInput::TransactionGossipReceived { tx } => {
                 self.handle_gossip_received_tx_for_validation(tx);
             }
+            ShardScopedInput::TransactionsFetched { batch } => {
+                self.handle_fetched_txs_for_validation(batch);
+            }
             ShardScopedInput::AdmitTransaction { tx } => {
                 self.handle_admit_transaction(tx);
             }

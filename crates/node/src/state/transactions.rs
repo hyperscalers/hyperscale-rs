@@ -60,10 +60,12 @@ impl NodeStateMachine {
         )
     }
 
-    /// Admit a batch of fetch-delivered transactions through mempool. Bypasses
-    /// the gossip-side validation pipeline (the txs came from a peer we
-    /// asked). Mempool emits `Continuation(TransactionsAdmitted)` for the
-    /// admitted subset; the admission arm latches the proposal-retry.
+    /// Admit a batch of fetch-delivered transactions through mempool. The
+    /// batch already passed the io-loop's validation pipeline upstream
+    /// (`handle_fetched_txs_for_validation`); invalid-signature txs were
+    /// dropped before reaching this arm. Mempool emits
+    /// `Continuation(TransactionsAdmitted)` for the admitted subset; the
+    /// admission arm latches the proposal-retry.
     fn on_transactions_fetched(&mut self, txs: Vec<Arc<RoutableTransaction>>) -> Vec<Action> {
         if txs.is_empty() {
             return vec![];

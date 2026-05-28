@@ -178,12 +178,10 @@ impl FetchBinding for TransactionBinding {
                 if let Ok(resp) = result {
                     let split = partition_solicited(resp.into_transactions(), &hs, |tx| tx.hash());
                     if !split.kept.is_empty() {
-                        push_protocol_event(
+                        push_shard_input(
                             &es,
                             local_shard,
-                            ProtocolEvent::TransactionsReceived {
-                                transactions: split.kept,
-                            },
+                            ShardScopedInput::TransactionsFetched { batch: split.kept },
                         );
                     }
                     if !split.missing.is_empty() {

@@ -104,6 +104,17 @@ pub enum ShardScopedInput {
         tx: Arc<RoutableTransaction>,
     },
 
+    /// Raw batch delivered by the transaction fetch protocol's response
+    /// callback. `NodeHost` drives the fetch-FSM drain for every
+    /// delivered hash (so invalid-signature payloads don't pin
+    /// in-flight slots) and dispatches the batch for async validation;
+    /// the validated subset surfaces as
+    /// `ProtocolEvent::TransactionsReceived`.
+    TransactionsFetched {
+        /// Transactions returned by the peer.
+        batch: Vec<Arc<RoutableTransaction>>,
+    },
+
     /// Locally-submitted tx delivered to a passive co-host: a hosted
     /// shard that touches the tx but isn't the source. Admits to the
     /// shard's validation pipeline if not already pending / cached;
@@ -334,7 +345,9 @@ impl ShardScopedInput {
                 // through to Internal.
                 _ => EventPriority::Internal,
             },
-            Self::TransactionGossipReceived { .. } => EventPriority::Network,
+            Self::TransactionGossipReceived { .. } | Self::TransactionsFetched { .. } => {
+                EventPriority::Network
+            }
             Self::CommittedBlockGossipReceived { .. } => EventPriority::Network,
             Self::AdmitTransaction { .. }
             | Self::AdmitAndGossipTransaction { .. }

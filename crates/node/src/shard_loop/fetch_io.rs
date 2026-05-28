@@ -100,17 +100,6 @@ where
     /// of being silently dropped.
     pub(in crate::shard_loop) fn drive_fetch_admission(&mut self, event: &ProtocolEvent) {
         match event {
-            // Drain on TransactionsReceived to catch every delivered hash —
-            // duplicates / tombstoned / validity-expired txs don't surface
-            // via TransactionsAdmitted, so without this they'd pin the
-            // in-flight set forever. TransactionsAdmitted covers the
-            // broadcast path that has no Received event precursor.
-            ProtocolEvent::TransactionsReceived { transactions } => {
-                let ids: Vec<_> = transactions.iter().map(|tx| tx.hash()).collect();
-                if !ids.is_empty() {
-                    self.drive_fetch::<TransactionBinding>(FetchInput::Admitted { ids });
-                }
-            }
             ProtocolEvent::TransactionsAdmitted { txs } => {
                 let ids: Vec<_> = txs.iter().map(|tx| tx.hash()).collect();
                 if !ids.is_empty() {

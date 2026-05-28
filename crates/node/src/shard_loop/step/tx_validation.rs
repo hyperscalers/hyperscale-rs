@@ -1,10 +1,14 @@
 //! Transaction-validation pipeline step handlers.
 //!
-//! Four `NodeInput` variants drive the pipeline:
+//! Five `NodeInput` variants drive the pipeline:
 //!
 //! - `TransactionGossipReceived` — raw gossip arrival; queue for batched
 //!   validation if not already cached/tombstoned. Never reaches the state
 //!   machine.
+//! - `TransactionsFetched` — raw fetch-response delivery; drive the
+//!   fetch-FSM drain for every delivered hash, dispatch the batch for
+//!   validation, then surface the valid subset as
+//!   `ProtocolEvent::TransactionsReceived`.
 //! - `SubmitTransaction` — locally-submitted tx: gossip to relevant shards,
 //!   then queue for validation if needed;
 //! - `TransactionValidated` — async-validation success: resolve
@@ -25,7 +29,9 @@ use hyperscale_types::{RoutableTransaction, ShardGroupId, TxHash};
 use crate::batch_accumulator::BatchAccumulator;
 use crate::host::NodeHost;
 use crate::process_io::SubmitFanout;
-use crate::shard_loop::{ShardLoop, ShardScopedInput, push_shard_input};
+use crate::shard_io::fetch::FetchInput;
+use crate::shard_io::fetch::binding::TransactionBinding;
+use crate::shard_loop::{ShardLoop, ShardScopedInput, push_protocol_event, push_shard_input};
 
 impl<S, N, D> ShardLoop<S, N, D>
 where
@@ -148,6 +154,68 @@ where
             self.io.pending_validation.insert(tx_hash);
             self.queue_validation(tx);
         }
+    }
+
+    /// Intercept a fetch-delivered batch before it reaches the state
+    /// machine. Drives the fetch-FSM drain for every delivered hash
+    /// (releases in-flight slots regardless of validation outcome,
+    /// so an invalid-signature payload can't pin a slot) and dispatches
+    /// the batch for async validation. The valid subset surfaces as
+    /// `ProtocolEvent::TransactionsReceived`; invalid hashes surface as
+    /// `ShardScopedInput::TransactionValidationsFailed`, mirroring the
+    /// gossip-path tracking-set cleanup.
+    pub(in crate::shard_loop) fn handle_fetched_txs_for_validation(
+        &mut self,
+        batch: Vec<Arc<RoutableTransaction>>,
+    ) {
+        if batch.is_empty() {
+            return;
+        }
+
+        let delivered_ids: Vec<TxHash> = batch.iter().map(|tx| tx.hash()).collect();
+        self.drive_fetch::<TransactionBinding>(FetchInput::Admitted { ids: delivered_ids });
+
+        let validator = self.process.tx_validator.clone();
+        let event_tx = self.event_sender().clone();
+        let local_shard = self.shard;
+        let par: Parallelism = self.process.dispatch.parallelism();
+        self.process
+            .dispatch
+            .spawn(DispatchPool::Throughput, move || {
+                let results: Vec<(Arc<RoutableTransaction>, bool)> = par.map(batch, |tx| {
+                    let valid = validator.validate_transaction(&tx).is_ok();
+                    (tx, valid)
+                });
+
+                let mut valid = Vec::new();
+                let mut failed_hashes = Vec::new();
+                for (tx, ok) in results {
+                    if ok {
+                        valid.push(tx);
+                    } else {
+                        failed_hashes.push(tx.hash());
+                    }
+                }
+
+                if !valid.is_empty() {
+                    push_protocol_event(
+                        &event_tx,
+                        local_shard,
+                        ProtocolEvent::TransactionsReceived {
+                            transactions: valid,
+                        },
+                    );
+                }
+                if !failed_hashes.is_empty() {
+                    push_shard_input(
+                        &event_tx,
+                        local_shard,
+                        ShardScopedInput::TransactionValidationsFailed {
+                            hashes: failed_hashes,
+                        },
+                    );
+                }
+            });
     }
 
     /// Append a tx to the destination shard's outbound gossip

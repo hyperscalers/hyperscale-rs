@@ -530,13 +530,13 @@ pub enum ProtocolEvent {
         submitted_locally: bool,
     },
 
-    /// Transactions delivered from a fetch request (raw, before mempool admission).
+    /// Transactions delivered from a fetch request, post-validation.
     ///
     /// Routed to `NodeStateMachine::on_transactions_fetched`, which funnels
-    /// them through mempool admission. The fetch protocol drain hooks this
-    /// event directly to drop every delivered hash from `in_flight`,
-    /// including duplicates / tombstoned / validity-expired txs that won't
-    /// surface via `TransactionsAdmitted`.
+    /// the batch through mempool admission. The fetch-FSM drain runs
+    /// upstream on the raw delivery (`ShardScopedInput::TransactionsFetched`)
+    /// so invalid-signature payloads don't pin in-flight slots; only
+    /// signature-valid txs reach this event.
     TransactionsReceived {
         /// Transactions returned by the peer.
         transactions: Vec<Arc<RoutableTransaction>>,
