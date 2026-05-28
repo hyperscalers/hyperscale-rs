@@ -417,20 +417,31 @@ pub enum BlockHeaderVerifyError {
     ParentQcUnverified,
 }
 
+/// Returned when an external `Verified<QuorumCertificate>` supplied to
+/// [`Verified::<BlockHeader>::with_verified_parent_qc`] doesn't byte-match
+/// the header's claimed `parent_qc`.
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+#[error("supplied verified parent_qc does not match the header's claimed parent_qc")]
+pub struct BlockHeaderParentQcMismatch;
+
 /// Construction asserts: the header's `parent_qc` carries a
 /// [`Verifiable::Verified`] marker — i.e. the parent QC has been
 /// verified against its committee context. The header's `hash()` is
 /// derived from its content by definition, so there is no separately
 /// claimed hash to check.
 ///
-/// Construction goes through one of two gates:
+/// Construction goes through one of three gates:
 ///
 /// - [`<BlockHeader as Verify>::verify`](Verify::verify) — checks that
 ///   the embedded `parent_qc` is in [`Verifiable::Verified`].
+/// - [`Verified::<BlockHeader>::with_verified_parent_qc`] — accepts an
+///   external `Verified<QuorumCertificate>` witness and rebinds the
+///   header's `parent_qc` field after a byte-equality check. Used at
+///   composite-assembly sites where the verified QC sits in a separate
+///   cache rather than inside the wire-decoded header.
 /// - [`Verified::<BlockHeader>::new_unchecked`] — audit point. Used at
-///   storage-recovery boundaries and at composite-assembly sites that
-///   established the predicate by other means. Every call site carries
-///   a `// SAFETY:` comment naming the trust source.
+///   storage-recovery boundaries. Every call site carries a `// SAFETY:`
+///   comment naming the trust source.
 impl Verify<()> for BlockHeader {
     type Augment = ();
     type Error = BlockHeaderVerifyError;
@@ -459,6 +470,42 @@ impl Verified<BlockHeader> {
         self.parent_qc_verifiable()
             .verified()
             .expect("Verified<BlockHeader> predicate guarantees parent_qc is Verified")
+    }
+
+    /// Promote a wire-decoded `BlockHeader` to its verified form by
+    /// pairing it with an externally-verified `parent_qc` witness.
+    ///
+    /// Wire-decoded headers always carry `parent_qc` in
+    /// [`Verifiable::Unverified`] even after the QC has been verified
+    /// elsewhere (e.g. in a coordinator's verified-QC cache), because
+    /// the marker can't be upgraded in place on a shared `Arc<Block>`.
+    /// This constructor closes that gap: it byte-equality-checks the
+    /// supplied verified QC against the header's claimed `parent_qc`,
+    /// rebinds the field to [`Verifiable::Verified`], and produces the
+    /// typed verified header.
+    ///
+    /// Construction asserts:
+    /// 1. The supplied `parent_qc` passes its own verification predicate
+    ///    (witnessed by its `Verified<QuorumCertificate>` type).
+    /// 2. The supplied `parent_qc` equals the header's claimed
+    ///    `parent_qc` (byte-equality).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BlockHeaderParentQcMismatch`] when the supplied verified
+    /// QC differs from the header's claimed `parent_qc`.
+    pub fn with_verified_parent_qc(
+        header: BlockHeader,
+        parent_qc: Verified<QuorumCertificate>,
+    ) -> Result<Self, BlockHeaderParentQcMismatch> {
+        if header.parent_qc.as_unverified() != parent_qc.as_ref() {
+            return Err(BlockHeaderParentQcMismatch);
+        }
+        let header = BlockHeader {
+            parent_qc: Verifiable::Verified(parent_qc),
+            ..header
+        };
+        Ok(Self::new_unchecked(header))
     }
 }
 
@@ -578,5 +625,31 @@ mod tests {
             .verify(())
             .expect_err("unverified parent_qc rejected");
         assert_eq!(err, BlockHeaderVerifyError::ParentQcUnverified);
+    }
+
+    /// `with_verified_parent_qc` upgrades a wire-decoded header by pairing
+    /// it with an externally-verified QC witness that byte-matches the
+    /// claimed `parent_qc`.
+    #[test]
+    fn with_verified_parent_qc_upgrades_matching_header() {
+        let mut header = sample_header();
+        header.parent_qc = Verifiable::Unverified(header.parent_qc.as_unverified().clone());
+        let verified_qc = Verified::<QuorumCertificate>::genesis(header.shard_group_id());
+        let verified =
+            Verified::<BlockHeader>::with_verified_parent_qc(header.clone(), verified_qc)
+                .expect("matching parent_qc accepted");
+        assert!(verified.parent_qc_verified().is_genesis());
+    }
+
+    /// `with_verified_parent_qc` rejects a witness QC that differs from
+    /// the header's claimed `parent_qc`.
+    #[test]
+    fn with_verified_parent_qc_rejects_mismatched_witness() {
+        let header = sample_header();
+        let other_shard = ShardGroupId::new(header.shard_group_id().inner() + 1);
+        let mismatched = Verified::<QuorumCertificate>::genesis(other_shard);
+        let err = Verified::<BlockHeader>::with_verified_parent_qc(header, mismatched)
+            .expect_err("mismatched parent_qc rejected");
+        assert_eq!(err, BlockHeaderParentQcMismatch);
     }
 }

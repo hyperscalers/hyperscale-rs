@@ -98,7 +98,7 @@ pub use sbor_codec::{
 };
 pub use shard::certified::{CertifiedBlock, CertifiedBlockHashMismatch, LinkageError};
 pub use shard::committed_header::{CommittedBlockHeader, CommittedHeaderVerifyError};
-pub use shard::header::{BlockHeader, BlockHeaderVerifyError};
+pub use shard::header::{BlockHeader, BlockHeaderParentQcMismatch, BlockHeaderVerifyError};
 pub use shard::inventory::{ElidedCertifiedBlock, Inventory, RehydrateError, RehydrationMiss};
 pub use shard::limits::{
     MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK, MAX_TX_IN_FLIGHT, MAX_TXS_PER_BLOCK,

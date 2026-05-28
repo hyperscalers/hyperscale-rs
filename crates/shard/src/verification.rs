@@ -134,8 +134,8 @@ pub struct PendingStateRootVerification {
 }
 
 /// Why [`VerificationPipeline::try_complete_assembly`] rejected the
-/// completed slot set. Both variants are defensive — a coordinator bug
-/// is the only way either is reachable at runtime.
+/// completed slot set. All variants are defensive — a coordinator bug
+/// is the only way any of them is reachable at runtime.
 #[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
 pub enum AssemblyError {
     /// [`Verified::<Block>::assemble`] rejected the (block, header) pair.
@@ -149,6 +149,19 @@ pub enum AssemblyError {
     /// block's hash via the slot-keying invariant of `record_qc_assembly`.
     #[error(transparent)]
     Linkage(LinkageError),
+    /// The header's `parent_qc` had no entry in `verified_qcs` at
+    /// assembly time. Structurally impossible: per-root dispatch is
+    /// gated on `try_vote_on_block`, which only runs after
+    /// `on_qc_signature_verified` cached the parent QC.
+    #[error("parent QC not verified at assembly time")]
+    ParentQcUnverified,
+    /// The cached `Verified<QuorumCertificate>` differed from the
+    /// header's claimed `parent_qc`. Structurally impossible: the
+    /// cache is keyed by `qc.block_hash` and the
+    /// `absorb_parent_qc_from_header` cache lookup already enforces
+    /// byte-equality before treating an entry as a hit.
+    #[error("parent QC byte-mismatch against verified cache")]
+    ParentQcMismatch,
 }
 
 /// A block awaiting the sub-results required to produce a
@@ -631,16 +644,26 @@ impl VerificationPipeline {
             .beacon_witness_root_result
             .expect("completion check just confirmed beacon_witness_root_result is Some");
 
-        // SAFETY: the pipeline gates per-root dispatch on parent_qc having
-        // been verified — `try_vote_on_block` only runs after
-        // `on_qc_signature_verified` accepts the parent QC, so by the time
-        // any root-result slot lands, `Verified::<BlockHeader>::verify`'s
-        // predicate already holds. The block's wire-decoded `parent_qc`
-        // field stays `Unverified` (the verified QC lives in the pipeline's
-        // `verified_qcs` cache rather than being upgraded in place on the
-        // shared `Arc<Block>`), so we wrap the header directly rather than
-        // calling `.verify(())`, which would fail on that raw field.
-        let verified_header = Verified::<BlockHeader>::new_unchecked(block.header().clone());
+        let parent_qc_raw = block.header().parent_qc();
+        let parent_qc_verified = if parent_qc_raw.is_genesis() {
+            Verified::<QuorumCertificate>::genesis(parent_qc_raw.shard_group_id())
+        } else {
+            let Some(cached) = self.verified_qcs.get(&parent_qc_raw.block_hash()).cloned() else {
+                warn!(
+                    ?block_hash,
+                    parent_qc_block_hash = ?parent_qc_raw.block_hash(),
+                    "Verified parent_qc missing from cache at assembly time"
+                );
+                return Some(Err(AssemblyError::ParentQcUnverified));
+            };
+            cached
+        };
+        let Ok(verified_header) = Verified::<BlockHeader>::with_verified_parent_qc(
+            block.header().clone(),
+            parent_qc_verified,
+        ) else {
+            return Some(Err(AssemblyError::ParentQcMismatch));
+        };
 
         let verified_block = match Verified::<Block>::assemble(
             block,
