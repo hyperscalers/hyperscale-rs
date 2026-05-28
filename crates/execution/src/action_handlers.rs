@@ -8,7 +8,7 @@
 //! event plumbing — sharing the handlers between production and
 //! simulation keeps execution behavior identical across both backends.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use hyperscale_core::{Action, ActionContext, Parallelism, ProtocolEvent};
@@ -23,124 +23,28 @@ use hyperscale_types::network::notification::{
     ExecutionCertificatesNotification, ExecutionVotesNotification,
 };
 use hyperscale_types::{
-    Bls12381G1PublicKey, Bls12381G2Signature, ExecutionCertificate, ExecutionVote,
-    GlobalReceiptRoot, NetworkDefinition, NodeId, RoutableTransaction, ShardGroupId,
-    SignerBitfield, StoredReceipt, ValidatorId, Verifiable, Verified, WaveId, WeightedTimestamp,
-    compute_global_receipt_root, exec_cert_batch_message, exec_vote_batch_message,
-    exec_vote_message, shard_for_node, verify_bls12381_v1, zero_bls_signature,
+    Bls12381G1PublicKey, ExecutionCertificate, ExecutionCertificateContext, ExecutionVote,
+    NetworkDefinition, NodeId, RoutableTransaction, ShardGroupId, StoredReceipt, Verifiable,
+    Verified, Verify, exec_cert_batch_message, exec_vote_batch_message, shard_for_node,
 };
 
 // ============================================================================
 // Wave-based execution voting handlers
 // ============================================================================
 
-/// Aggregate verified execution votes into an `ExecutionCertificate`.
-///
-/// Deduplicates votes by validator, aggregates BLS signatures, and builds a
-/// signer bitfield using the committee's indices.
-///
-/// `tx_outcomes` are taken from the first vote whose outcomes hash to the
-/// signed `global_receipt_root`. Every `Verified<ExecutionVote>` already
-/// satisfies the binding by predicate — this lookup just picks one to
-/// supply the unsigned payload for the EC.
-///
-/// # Panics
-///
-/// Panics if no vote has outcomes hashing to `global_receipt_root`, or if
-/// BLS aggregation of the (already individually-verified) signatures fails.
-/// Both indicate an upstream invariant violation (predicate bypass via
-/// `new_unchecked`, sub-quorum input, or BLS library bug) — neither is
-/// recoverable.
-#[must_use]
-pub fn aggregate_execution_certificate(
-    wave_id: &WaveId,
-    global_receipt_root: GlobalReceiptRoot,
-    votes: &[Verified<ExecutionVote>],
-    committee: &[ValidatorId],
-) -> ExecutionCertificate {
-    let tx_outcomes = votes
-        .iter()
-        .find(|v| compute_global_receipt_root(v.tx_outcomes()) == global_receipt_root)
-        .map(|v| v.tx_outcomes().to_vec())
-        .expect("verified votes guarantee at least one with matching outcomes");
-
-    // Deduplicate votes by validator
-    let mut seen_validators = HashSet::new();
-    let unique_votes: Vec<&Verified<ExecutionVote>> = votes
-        .iter()
-        .filter(|vote| seen_validators.insert(vote.validator()))
-        .collect();
-
-    // Aggregate BLS signatures
-    let bls_signatures: Vec<Bls12381G2Signature> =
-        unique_votes.iter().map(|vote| vote.signature()).collect();
-
-    let aggregated_signature = if bls_signatures.is_empty() {
-        zero_bls_signature()
-    } else {
-        Bls12381G2Signature::aggregate(&bls_signatures, true)
-            .expect("aggregation of upstream-verified BLS signatures cannot fail")
-    };
-
-    // Create signer bitfield using committee ordering
-    let committee_index: HashMap<ValidatorId, usize> = committee
-        .iter()
-        .enumerate()
-        .map(|(idx, &vid)| (vid, idx))
-        .collect();
-    let mut signers = SignerBitfield::new(committee.len());
-    for vote in &unique_votes {
-        if let Some(&idx) = committee_index.get(&vote.validator()) {
-            signers.set(idx);
-        }
-    }
-
-    let vote_anchor_ts = votes
-        .first()
-        .map_or(WeightedTimestamp::ZERO, |v| v.vote_anchor_ts());
-
-    ExecutionCertificate::new(
-        wave_id.clone(),
-        vote_anchor_ts,
-        global_receipt_root,
-        tx_outcomes,
-        aggregated_signature,
-        signers,
-    )
-}
-
-/// Verify an execution certificate's aggregated signature.
-///
-/// Verify an execution certificate's aggregated BLS signature.
+/// Run the [`ExecutionCertificate`] verification predicate against a
+/// committee public-key vector. See [`Verified::<ExecutionCertificate>::verify`].
 #[must_use]
 pub fn verify_execution_certificate_signature(
     network: &NetworkDefinition,
     certificate: &ExecutionCertificate,
     public_keys: &[Bls12381G1PublicKey],
 ) -> bool {
-    let msg = exec_vote_message(
+    let ctx = ExecutionCertificateContext {
         network,
-        certificate.vote_anchor_ts(),
-        certificate.wave_id(),
-        certificate.shard_group_id(),
-        &certificate.global_receipt_root(),
-        u32::try_from(certificate.tx_outcomes().len()).unwrap_or(u32::MAX),
-    );
-
-    let signer_keys: Vec<_> = public_keys
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| certificate.signers().is_set(*i))
-        .map(|(_, pk)| *pk)
-        .collect();
-
-    if signer_keys.is_empty() {
-        certificate.aggregated_signature() == zero_bls_signature()
-    } else {
-        Bls12381G1PublicKey::aggregate(&signer_keys, false).is_ok_and(|aggregated_pk| {
-            verify_bls12381_v1(&msg, &aggregated_pk, &certificate.aggregated_signature())
-        })
-    }
+        public_keys,
+    };
+    certificate.verify(&ctx).is_ok()
 }
 
 /// Handle the execution-owned delegated [`Action`] variants.
@@ -230,11 +134,15 @@ where
             votes,
             committee,
         } => {
-            let certificate =
-                aggregate_execution_certificate(&wave_id, global_receipt_root, &votes, &committee);
+            let certificate = Verified::<ExecutionCertificate>::aggregate(
+                &wave_id,
+                global_receipt_root,
+                &votes,
+                &committee,
+            );
             ctx.notify_protocol(ProtocolEvent::ExecutionCertificateAggregated {
                 wave_id,
-                certificate: Arc::new(certificate),
+                certificate: Arc::new(certificate.into_inner()),
             });
         }
         Action::VerifyAndAggregateExecutionVotes {
@@ -477,235 +385,5 @@ where
         }
 
         _ => unreachable!("hyperscale_execution::handle_action called with non-execution action"),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::BTreeSet;
-
-    use hyperscale_types::{
-        BlockHash, BlockHeight, Bls12381G1PrivateKey, ExecutionOutcome, GlobalReceiptHash, Hash,
-        ShardGroupId, TxHash, TxOutcome, bls_keypair_from_seed,
-    };
-
-    use super::*;
-
-    fn shard() -> ShardGroupId {
-        ShardGroupId::new(0)
-    }
-
-    fn wave_id(height: u64) -> WaveId {
-        WaveId::new(shard(), BlockHeight::new(height), BTreeSet::new())
-    }
-
-    fn keypair(seed: u8) -> Bls12381G1PrivateKey {
-        bls_keypair_from_seed(&[seed; 32])
-    }
-
-    fn outcome(tx: TxHash) -> TxOutcome {
-        TxOutcome::new(
-            tx,
-            ExecutionOutcome::Succeeded {
-                receipt_hash: GlobalReceiptHash::ZERO,
-            },
-        )
-    }
-
-    fn signed_vote(
-        voter: ValidatorId,
-        sk: &Bls12381G1PrivateKey,
-        wid: &WaveId,
-        global_receipt_root: GlobalReceiptRoot,
-        anchor: WeightedTimestamp,
-        tx_outcomes: Vec<TxOutcome>,
-    ) -> ExecutionVote {
-        let tx_count = u32::try_from(tx_outcomes.len()).unwrap_or(u32::MAX);
-        let msg = exec_vote_message(
-            &NetworkDefinition::simulator(),
-            anchor,
-            wid,
-            shard(),
-            &global_receipt_root,
-            tx_count,
-        );
-        ExecutionVote::new(
-            BlockHash::ZERO,
-            BlockHeight::new(1),
-            anchor,
-            wid.clone(),
-            shard(),
-            global_receipt_root,
-            tx_count,
-            tx_outcomes,
-            voter,
-            sk.sign_v1(&msg),
-        )
-    }
-
-    fn verified_votes(votes: Vec<ExecutionVote>) -> Vec<Verified<ExecutionVote>> {
-        votes
-            .into_iter()
-            .map(Verified::new_unchecked_for_test)
-            .collect()
-    }
-
-    // ─── aggregate_execution_certificate ─────────────────────────────────
-
-    #[test]
-    fn aggregate_produces_signer_bitfield_in_committee_order() {
-        // Committee is [V0, V1, V2, V3]; voters are V1 and V3.
-        // Expected bits set: 1, 3.
-        let committee = vec![
-            ValidatorId::new(0),
-            ValidatorId::new(1),
-            ValidatorId::new(2),
-            ValidatorId::new(3),
-        ];
-        let wid = wave_id(1);
-        let tx = TxHash::from_raw(Hash::from_bytes(b"tx"));
-        let outcomes = vec![outcome(tx)];
-        let root = compute_global_receipt_root(&outcomes);
-
-        let sk1 = keypair(1);
-        let sk3 = keypair(3);
-        let votes = vec![
-            signed_vote(
-                ValidatorId::new(1),
-                &sk1,
-                &wid,
-                root,
-                WeightedTimestamp::from_millis(100),
-                outcomes.clone(),
-            ),
-            signed_vote(
-                ValidatorId::new(3),
-                &sk3,
-                &wid,
-                root,
-                WeightedTimestamp::from_millis(100),
-                outcomes.clone(),
-            ),
-        ];
-
-        let ec = aggregate_execution_certificate(&wid, root, &verified_votes(votes), &committee);
-        assert!(ec.signers().is_set(1));
-        assert!(ec.signers().is_set(3));
-        assert!(!ec.signers().is_set(0));
-        assert!(!ec.signers().is_set(2));
-        assert_eq!(ec.tx_outcomes(), &outcomes);
-    }
-
-    #[test]
-    fn aggregate_dedups_votes_from_same_validator() {
-        let committee = vec![ValidatorId::new(0), ValidatorId::new(1)];
-        let wid = wave_id(1);
-        let outcomes = vec![outcome(TxHash::from_raw(Hash::from_bytes(b"tx")))];
-        let root = compute_global_receipt_root(&outcomes);
-        let sk0 = keypair(0);
-
-        // Same voter cast twice.
-        let votes = vec![
-            signed_vote(
-                ValidatorId::new(0),
-                &sk0,
-                &wid,
-                root,
-                WeightedTimestamp::from_millis(100),
-                outcomes.clone(),
-            ),
-            signed_vote(
-                ValidatorId::new(0),
-                &sk0,
-                &wid,
-                root,
-                WeightedTimestamp::from_millis(100),
-                outcomes,
-            ),
-        ];
-
-        let ec = aggregate_execution_certificate(&wid, root, &verified_votes(votes), &committee);
-        assert!(ec.signers().is_set(0));
-        assert!(!ec.signers().is_set(1));
-        assert_eq!(
-            ec.signers().count_ones(),
-            1,
-            "duplicate votes must collapse"
-        );
-    }
-
-    // ─── verify_execution_certificate_signature ──────────────────────────
-
-    #[test]
-    fn verify_ec_signature_accepts_valid_aggregation() {
-        let committee = vec![
-            ValidatorId::new(0),
-            ValidatorId::new(1),
-            ValidatorId::new(2),
-            ValidatorId::new(3),
-        ];
-        let wid = wave_id(1);
-        let outcomes = vec![outcome(TxHash::from_raw(Hash::from_bytes(b"tx")))];
-        let root = compute_global_receipt_root(&outcomes);
-        let sks: Vec<_> = (0_u8..4).map(keypair).collect();
-
-        let votes: Vec<ExecutionVote> = (0_usize..4)
-            .map(|i| {
-                signed_vote(
-                    ValidatorId::new(u64::try_from(i).unwrap()),
-                    &sks[i],
-                    &wid,
-                    root,
-                    WeightedTimestamp::from_millis(100),
-                    outcomes.clone(),
-                )
-            })
-            .collect();
-        let ec = aggregate_execution_certificate(&wid, root, &verified_votes(votes), &committee);
-
-        let pubs: Vec<_> = sks.iter().map(Bls12381G1PrivateKey::public_key).collect();
-        assert!(verify_execution_certificate_signature(
-            &NetworkDefinition::simulator(),
-            &ec,
-            &pubs
-        ));
-    }
-
-    #[test]
-    fn verify_ec_signature_rejects_wrong_public_keys() {
-        let committee = vec![ValidatorId::new(0), ValidatorId::new(1)];
-        let wid = wave_id(1);
-        let outcomes = vec![outcome(TxHash::from_raw(Hash::from_bytes(b"tx")))];
-        let root = compute_global_receipt_root(&outcomes);
-        let sk0 = keypair(0);
-        let sk1 = keypair(1);
-
-        let votes = vec![
-            signed_vote(
-                ValidatorId::new(0),
-                &sk0,
-                &wid,
-                root,
-                WeightedTimestamp::from_millis(100),
-                outcomes.clone(),
-            ),
-            signed_vote(
-                ValidatorId::new(1),
-                &sk1,
-                &wid,
-                root,
-                WeightedTimestamp::from_millis(100),
-                outcomes,
-            ),
-        ];
-        let ec = aggregate_execution_certificate(&wid, root, &verified_votes(votes), &committee);
-
-        // Provide the wrong public keys — signature must not verify.
-        let wrong_pubs = vec![keypair(42).public_key(), keypair(43).public_key()];
-        assert!(!verify_execution_certificate_signature(
-            &NetworkDefinition::simulator(),
-            &ec,
-            &wrong_pubs
-        ));
     }
 }

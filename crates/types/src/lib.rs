@@ -154,14 +154,16 @@ pub use transaction::status::{
 pub use verifiable::{Verifiable, Verified, Verify};
 pub use wave::certificate::WaveCertificate;
 pub use wave::computation::{compute_waves, wave_leader, wave_leader_at};
-pub use wave::execution_certificate::ExecutionCertificate;
+pub use wave::execution_certificate::{
+    ExecutionCertificate, ExecutionCertificateContext, ExecutionCertificateVerifyError,
+};
 pub use wave::finalized::{FinalizedWave, ReceiptValidationError};
 pub use wave::id::{MAX_REMOTE_SHARDS_PER_WAVE, WaveId};
 pub use wave::outcome::{ExecutionOutcome, TxOutcome};
 pub use wave::receipt_tree::{
     compute_global_receipt_root, compute_global_receipt_root_with_proof, tx_outcome_leaf,
 };
-pub use wave::vote::ExecutionVote;
+pub use wave::vote::{ExecutionVote, ExecutionVoteContext, ExecutionVoteVerifyError};
 
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils;
