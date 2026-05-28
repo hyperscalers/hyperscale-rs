@@ -297,8 +297,12 @@ pub enum Action {
     /// Delegated to a thread pool in production, instant in simulation.
     /// Returns `ProtocolEvent::ExecutionCertificateSignatureVerified` when complete.
     VerifyExecutionCertificateSignature {
-        /// The execution certificate to verify.
-        certificate: ExecutionCertificate,
+        /// The execution certificate to verify. When the wrapper is
+        /// already [`Verifiable::Verified`] — e.g. a locally-aggregated
+        /// EC fed back through the coordinator — the handler
+        /// short-circuits and emits the verified result without
+        /// rerunning BLS aggregation.
+        certificate: Verifiable<ExecutionCertificate>,
         /// Public keys of the signers (in committee order).
         public_keys: Vec<Bls12381G1PublicKey>,
     },

@@ -11,13 +11,13 @@ use hyperscale_types::{
     BeaconProposal, BeaconWitnessRoot, BeaconWitnessRootVerifyError, Block, BlockHash, BlockHeader,
     BlockHeight, BlockManifest, BlockVote, CertRootVerifyError, CertificateRoot,
     CertifiedBeaconBlock, CertifiedBlock, CommittedBlockHeader, CommittedHeaderVerifyError, Epoch,
-    ExecutionCertificate, ExecutionVote, FinalizedWave, LocalReceiptRoot,
-    LocalReceiptRootVerifyError, PcQc3, PcVector, PcVoteMessage, ProvisionRootVerifyError,
-    ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, QcVerifyError,
-    QuorumCertificate, ReadySignal, Round, RoutableTransaction, ShardGroupId, ShardWitness,
-    SkipEpochCert, SkipRequest, SpcCert, SpcEmptyViewMsg, SpcView, StateRoot, StateRootVerifyError,
-    StoredReceipt, TransactionRoot, TxOutcome, TxRootVerifyError, ValidatorId, Verifiable,
-    Verified, VotePower, WaveId, WeightedTimestamp,
+    ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote, FinalizedWave,
+    LocalReceiptRoot, LocalReceiptRootVerifyError, PcQc3, PcVector, PcVoteMessage,
+    ProvisionRootVerifyError, ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions,
+    ProvisionsRoot, QcVerifyError, QuorumCertificate, ReadySignal, Round, RoutableTransaction,
+    ShardGroupId, ShardWitness, SkipEpochCert, SkipRequest, SpcCert, SpcEmptyViewMsg, SpcView,
+    StateRoot, StateRootVerifyError, StoredReceipt, TransactionRoot, TxOutcome, TxRootVerifyError,
+    ValidatorId, Verifiable, Verified, VotePower, WaveId, WeightedTimestamp,
 };
 
 /// How a node learned about the certifying QC that commits a given block.
@@ -430,12 +430,17 @@ pub enum ProtocolEvent {
         certificates: Vec<ExecutionCertificate>,
     },
 
-    /// Execution certificate signature verification completed.
+    /// Execution certificate signature verification completed. The
+    /// success payload carries the verified handle directly so the
+    /// consumer doesn't need a separate cache lookup; the sibling
+    /// `certificate` mirrors the raw `Arc` for correlation
+    /// (`wire_hash` slot release, error-path logging).
     ExecutionCertificateSignatureVerified {
-        /// The certificate whose signature was verified.
+        /// The raw certificate that triggered verification, retained
+        /// for correlation and identity on both result arms.
         certificate: Arc<ExecutionCertificate>,
-        /// `true` when the aggregated signature passed verification.
-        valid: bool,
+        /// Verified handle on success; the reason it failed otherwise.
+        result: Result<Verified<ExecutionCertificate>, ExecutionCertificateVerifyError>,
     },
 
     /// All BLS verifications for a fetched [`FinalizedWave`] completed.

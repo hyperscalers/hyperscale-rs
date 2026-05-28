@@ -163,14 +163,23 @@ where
             public_keys,
             ..
         } => {
-            let valid = verify_execution_certificate_signature(
-                ctx.topology_snapshot.network(),
-                &certificate,
-                &public_keys,
-            );
+            let ctx_ec = ExecutionCertificateContext {
+                network: ctx.topology_snapshot.network(),
+                public_keys: &public_keys,
+            };
+            let (certificate, result) = match certificate {
+                Verifiable::Verified(verified) => {
+                    let cert = Arc::new(verified.as_ref().clone());
+                    (cert, Ok(verified))
+                }
+                Verifiable::Unverified(raw) => {
+                    let result = raw.verify(&ctx_ec);
+                    (Arc::new(raw), result)
+                }
+            };
             ctx.notify_protocol(ProtocolEvent::ExecutionCertificateSignatureVerified {
-                certificate: Arc::new(certificate),
-                valid,
+                certificate,
+                result,
             });
         }
         Action::VerifyFinalizedWave {

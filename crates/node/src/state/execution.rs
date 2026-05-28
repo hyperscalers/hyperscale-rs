@@ -80,9 +80,14 @@ impl NodeStateMachine {
             ProtocolEvent::FinalizedWaveVerified { wave, valid } => self
                 .execution_coordinator
                 .on_finalized_wave_verified(wave, valid),
-            ProtocolEvent::ExecutionCertificateSignatureVerified { certificate, valid } => self
-                .execution_coordinator
-                .on_certificate_verified(&self.topology_snapshot, certificate, valid),
+            ProtocolEvent::ExecutionCertificateSignatureVerified {
+                certificate,
+                result,
+            } => self.execution_coordinator.on_certificate_verified(
+                &self.topology_snapshot,
+                certificate,
+                result,
+            ),
             ProtocolEvent::ExecutionCertificateAdmitted { certificate } => {
                 let local_shard = self.topology_snapshot.local_shard();
                 let mut actions = Vec::new();

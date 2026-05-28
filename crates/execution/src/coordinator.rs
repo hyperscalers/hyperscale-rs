@@ -43,10 +43,10 @@ use std::sync::Arc;
 use hyperscale_core::{Action, FetchAbandon, FetchRequest, ProtocolEvent};
 use hyperscale_types::{
     Attempt, Block, BlockHash, BlockHeader, BlockHeight, BloomFilter, CertifiedBlock,
-    ExecutionCertificate, ExecutionVote, FinalizedWave, GlobalReceiptRoot, Hash, Provisions,
-    RoutableTransaction, ShardGroupId, StoredReceipt, TopologySnapshot, TxHash, TxOutcome,
-    ValidatorId, Verifiable, Verified, VotePower, WAVE_TIMEOUT, WaveCertificate, WaveId,
-    WeightedTimestamp, wave_leader, wave_leader_at,
+    ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote, FinalizedWave,
+    GlobalReceiptRoot, Hash, Provisions, RoutableTransaction, ShardGroupId, StoredReceipt,
+    TopologySnapshot, TxHash, TxOutcome, ValidatorId, Verifiable, Verified, VotePower,
+    WAVE_TIMEOUT, WaveCertificate, WaveId, WeightedTimestamp, wave_leader, wave_leader_at,
 };
 use tracing::instrument;
 
@@ -1016,7 +1016,7 @@ impl ExecutionCoordinator {
         };
 
         vec![Action::VerifyExecutionCertificateSignature {
-            certificate: cert,
+            certificate: Verifiable::Unverified(cert),
             public_keys,
         }]
     }
@@ -1030,7 +1030,7 @@ impl ExecutionCoordinator {
         &mut self,
         topology: &TopologySnapshot,
         certificate: Arc<ExecutionCertificate>,
-        valid: bool,
+        result: Result<Verified<ExecutionCertificate>, ExecutionCertificateVerifyError>,
     ) -> Vec<Action> {
         // Release the in-flight slot regardless of outcome — a failed
         // signature still lets the next byte-identical retransmit dispatch
@@ -1041,10 +1041,11 @@ impl ExecutionCoordinator {
         self.pending_ec_verifications
             .remove(&certificate.wire_hash());
 
-        if !valid {
+        if let Err(err) = result {
             tracing::warn!(
                 shard = certificate.shard_group_id().inner(),
                 wave = %certificate.wave_id(),
+                error = ?err,
                 "Invalid execution certificate signature"
             );
             return vec![Action::AbandonFetch(FetchAbandon::ExecutionCerts {
@@ -2271,7 +2272,11 @@ mod tests {
             zero_bls_signature(),
             signers,
         );
-        state.on_certificate_verified(&topo, Arc::new(cert), true);
+        state.on_certificate_verified(
+            &topo,
+            Arc::new(cert.clone()),
+            Ok(Verified::new_unchecked_for_test(cert)),
+        );
 
         // Advance time past the retry deadline; if the retry had survived,
         // this would fire a SignAndSendExecutionVote action.
@@ -2308,7 +2313,8 @@ mod tests {
             signers,
         ));
 
-        let actions = state.on_certificate_verified(&topo, cert, true);
+        let verified = Verified::new_unchecked_for_test((*cert).clone());
+        let actions = state.on_certificate_verified(&topo, cert, Ok(verified));
         assert!(
             !actions.iter().any(|a| matches!(
                 a,
@@ -2351,7 +2357,11 @@ mod tests {
             signers,
         ));
 
-        let actions = state.on_certificate_verified(&topo, cert, false);
+        let actions = state.on_certificate_verified(
+            &topo,
+            cert,
+            Err(ExecutionCertificateVerifyError::BadAggregatedSignature),
+        );
         assert!(
             actions.iter().any(|a| matches!(
                 a,
@@ -2686,7 +2696,11 @@ mod tests {
         let _ = state.on_wave_certificate(&topo, cert.clone());
         // Simulate the BLS pool returning an invalid result. The slot is
         // released so a follow-up arrival can re-dispatch.
-        let _ = state.on_certificate_verified(&topo, Arc::new(cert.clone()), false);
+        let _ = state.on_certificate_verified(
+            &topo,
+            Arc::new(cert.clone()),
+            Err(ExecutionCertificateVerifyError::BadAggregatedSignature),
+        );
         let again = state.on_wave_certificate(&topo, cert);
         assert_eq!(again.len(), 1);
         assert!(matches!(
@@ -2853,7 +2867,11 @@ mod tests {
 
         // Verification fails — the EC was a forgery. State is unchanged;
         // the legitimate cert can still arrive and clear the expectation.
-        let _ = state.on_certificate_verified(&topo, Arc::new(cert), false);
+        let _ = state.on_certificate_verified(
+            &topo,
+            Arc::new(cert),
+            Err(ExecutionCertificateVerifyError::BadAggregatedSignature),
+        );
         assert_eq!(state.expected_certs.expected_len(), 1);
         assert_eq!(state.expected_certs.fulfilled_len(), 0);
     }
