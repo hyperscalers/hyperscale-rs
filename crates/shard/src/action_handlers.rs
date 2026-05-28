@@ -16,15 +16,15 @@ use hyperscale_types::network::gossip::CommittedBlockHeaderGossip;
 use hyperscale_types::network::notification::{BlockHeaderNotification, BlockVoteNotification};
 use hyperscale_types::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight,
-    BlockManifest, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, CertificateRoot,
-    CertificateRootContext, CommittedHeaderVerifyError, ConsensusReceipt, FinalizedWave, Hash,
-    InFlightCount, LocalReceiptRoot, LocalReceiptRootContext, NetworkDefinition, ProposerTimestamp,
-    ProvisionHash, ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions, ProvisionsRoot,
+    BlockManifest, BlockVote, Bls12381G1PublicKey, CertificateRoot, CertificateRootContext,
+    CommittedHeaderVerifyError, ConsensusReceipt, FinalizedWave, Hash, InFlightCount,
+    LocalReceiptRoot, LocalReceiptRootContext, NetworkDefinition, ProposerTimestamp, ProvisionHash,
+    ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions, ProvisionsRoot,
     ProvisionsRootContext, QcContext, QuorumCertificate, ReadySignal, Round, RoutableTransaction,
     ShardGroupId, StateRoot, StoredReceipt, TopologySnapshot, TransactionRoot,
     TransactionRootContext, ValidatorId, Verifiable, Verified, Verify, VotePower,
-    WeightedTimestamp, batch_verify_bls_same_message, block_header_message, block_vote_message,
-    committed_block_header_message, compute_waves, verify_bls12381_v1,
+    WeightedTimestamp, block_header_message, block_vote_message, committed_block_header_message,
+    compute_waves,
 };
 
 use crate::beacon_witnesses::BeaconWitnessRootContext;
@@ -109,9 +109,10 @@ pub fn verify_and_build_qc(
 /// Verify a batch of vote signatures, appending the valid ones to
 /// `already_verified` and returning the combined verified set.
 ///
-/// Uses the same-message BLS batch check for speed; on batch failure (one
-/// or more bad signatures) falls back to individual verification so a
-/// single forged vote doesn't poison the whole batch.
+/// Wraps [`Verified::<BlockVote>::verify_batch`] with the committee
+/// bookkeeping (`(idx, vote, pubkey, power)` tuples → `(idx, verified,
+/// power)`); the typed batch verifier owns the BLS work and the
+/// individual-verify fallback.
 pub fn verify_vote_batch(
     block_hash: BlockHash,
     signing_message: &[u8],
@@ -124,41 +125,25 @@ pub fn verify_vote_batch(
         return all_verified;
     }
 
-    let signatures: Vec<Bls12381G2Signature> = votes_to_verify
-        .iter()
-        .map(|(_, v, _, _)| v.signature())
-        .collect();
-    let public_keys: Vec<Bls12381G1PublicKey> =
-        votes_to_verify.iter().map(|(_, _, pk, _)| *pk).collect();
-
-    if batch_verify_bls_same_message(signing_message, &signatures, &public_keys) {
-        for (idx, vote, _, power) in votes_to_verify {
-            // SAFETY: same-message BLS batch verify just confirmed every
-            // signature in this batch against its committee public key over
-            // the canonical `block_vote_message` for `block_hash`, which is
-            // exactly the `BlockVote::verify` predicate.
-            all_verified.push((idx, Verified::<BlockVote>::new_unchecked(vote), power));
-        }
-        return all_verified;
+    // Capture per-vote bookkeeping (`idx`, `power`, and the raw vote for
+    // failure logging) alongside the `(vote, pubkey)` pairs the typed
+    // verifier consumes.
+    let mut bookkeeping: Vec<(usize, VotePower, ValidatorId)> =
+        Vec::with_capacity(votes_to_verify.len());
+    let mut to_verify: Vec<(BlockVote, Bls12381G1PublicKey)> =
+        Vec::with_capacity(votes_to_verify.len());
+    for (idx, vote, pk, power) in votes_to_verify {
+        bookkeeping.push((idx, power, vote.voter()));
+        to_verify.push((vote, pk));
     }
 
-    tracing::warn!(
-        ?block_hash,
-        vote_count = votes_to_verify.len(),
-        "Batch vote verification failed, falling back to individual verification"
-    );
+    let results = Verified::<BlockVote>::verify_batch(signing_message, to_verify);
 
-    for (idx, vote, pk, power) in votes_to_verify {
-        if verify_bls12381_v1(signing_message, &pk, &vote.signature()) {
-            // SAFETY: the per-vote BLS check on the line above re-runs the
-            // exact `BlockVote::verify` predicate against the voter's pubkey.
-            all_verified.push((idx, Verified::<BlockVote>::new_unchecked(vote), power));
+    for ((idx, power, voter), result) in bookkeeping.into_iter().zip(results) {
+        if let Some(verified) = result {
+            all_verified.push((idx, verified, power));
         } else {
-            tracing::warn!(
-                voter = ?vote.voter(),
-                ?block_hash,
-                "Invalid vote signature detected"
-            );
+            tracing::warn!(?voter, ?block_hash, "Invalid vote signature detected");
         }
     }
 

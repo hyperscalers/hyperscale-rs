@@ -10,7 +10,7 @@ use thiserror::Error;
 use crate::{
     BlockHash, BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature,
     NetworkDefinition, ProposerTimestamp, Round, ShardGroupId, ValidatorId, Verified, Verify,
-    block_vote_message, verify_bls12381_v1,
+    batch_verify_bls_same_message, block_vote_message, verify_bls12381_v1,
 };
 
 /// Block vote for shard consensus.
@@ -181,16 +181,17 @@ pub enum BlockVoteVerifyError {
 /// the voter's public key for the domain-separated signing message
 /// `block_vote_message(network, shard, height, round, block_hash)`.
 ///
-/// Construction goes through one of two gates:
+/// Construction goes through one of three gates:
 ///
 /// - [`<BlockVote as Verify>::verify`](Verify::verify) — runs the BLS
 ///   signature check against the voter's public key.
+/// - [`Verified::<BlockVote>::verify_batch`] — runs the same predicate
+///   over a slice using the BLS same-message batch optimisation, with
+///   individual-verify fallback when the batch fails.
 /// - [`Verified::<BlockVote>::new_unchecked`] — audit point. Used by
-///   batch verification helpers that ran the same predicate (typically
-///   same-message BLS batch verify) over a slice and re-wrap each
-///   element under the batch's trust source, and by own-vote paths
-///   where the local signer just produced the signature. Every call
-///   site carries a `// SAFETY:` comment naming the trust source.
+///   own-vote paths where the local signer just produced the signature.
+///   Every call site carries a `// SAFETY:` comment naming the trust
+///   source.
 impl Verify<&BlockVoteContext<'_>> for BlockVote {
     type Augment = ();
     type Error = BlockVoteVerifyError;
@@ -201,5 +202,151 @@ impl Verify<&BlockVoteContext<'_>> for BlockVote {
             return Err(BlockVoteVerifyError::InvalidSignature);
         }
         Ok(Verified::new_unchecked(self.clone()))
+    }
+}
+
+impl Verified<BlockVote> {
+    /// Verify a slice of `(vote, pubkey)` pairs against a single
+    /// `signing_message` using the BLS same-message batch optimisation.
+    ///
+    /// Every vote in the batch must have been signed over `signing_message`
+    /// (the canonical [`block_vote_message`] for some `block_hash`,
+    /// `height`, `round`, `shard_group_id`). The caller is responsible
+    /// for assembling the batch with matching messages — mismatched
+    /// votes will simply fail to verify.
+    ///
+    /// On batch failure the implementation falls back to individual
+    /// [`Verify::verify`] calls so a single forged signature doesn't
+    /// poison the whole batch. Each output position mirrors its input
+    /// position: `Some(verified)` for votes that passed, `None` for
+    /// votes whose signature didn't validate.
+    #[must_use]
+    pub fn verify_batch(
+        signing_message: &[u8],
+        votes: Vec<(BlockVote, Bls12381G1PublicKey)>,
+    ) -> Vec<Option<Self>> {
+        if votes.is_empty() {
+            return Vec::new();
+        }
+
+        let signatures: Vec<Bls12381G2Signature> =
+            votes.iter().map(|(v, _)| v.signature()).collect();
+        let public_keys: Vec<Bls12381G1PublicKey> = votes.iter().map(|(_, pk)| *pk).collect();
+
+        if batch_verify_bls_same_message(signing_message, &signatures, &public_keys) {
+            // SAFETY: BLS same-message batch verify just confirmed every
+            // signature in this batch against its paired public key over
+            // `signing_message`, which is exactly the `BlockVote::verify`
+            // predicate (the caller's contract is to pass votes that
+            // share that signing message).
+            return votes
+                .into_iter()
+                .map(|(vote, _)| Some(Self::new_unchecked(vote)))
+                .collect();
+        }
+
+        votes
+            .into_iter()
+            .map(|(vote, pk)| {
+                if verify_bls12381_v1(signing_message, &pk, &vote.signature()) {
+                    // SAFETY: individual BLS verify just re-ran the
+                    // `BlockVote::verify` predicate against the voter's
+                    // pubkey.
+                    Some(Self::new_unchecked(vote))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Hash, generate_bls_keypair};
+
+    /// All-valid batch verifies via the fast path and yields one
+    /// `Some(verified)` per input position.
+    #[test]
+    fn verify_batch_all_valid_returns_all_verified() {
+        let net = NetworkDefinition::simulator();
+        let message = block_vote_message(
+            &net,
+            ShardGroupId::new(0),
+            BlockHeight::new(1),
+            Round::INITIAL,
+            &BlockHash::from_raw(Hash::from_bytes(&[1u8; 32])),
+        );
+        let votes: Vec<_> = (0..3)
+            .map(|i| {
+                let sk = generate_bls_keypair();
+                let signature = sk.sign_v1(&message);
+                let pk = sk.public_key();
+                let vote = BlockVote::from_parts(
+                    BlockHash::from_raw(Hash::from_bytes(&[1u8; 32])),
+                    ShardGroupId::new(0),
+                    BlockHeight::new(1),
+                    Round::INITIAL,
+                    ValidatorId::new(i),
+                    signature,
+                    ProposerTimestamp::ZERO,
+                );
+                (vote, pk)
+            })
+            .collect();
+
+        let results = Verified::<BlockVote>::verify_batch(&message, votes);
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(Option::is_some));
+    }
+
+    /// One forged signature in the batch triggers the per-vote fallback;
+    /// every honest vote still surfaces verified, the forged position
+    /// surfaces `None`.
+    #[test]
+    fn verify_batch_falls_back_and_drops_only_the_forged_vote() {
+        let net = NetworkDefinition::simulator();
+        let message = block_vote_message(
+            &net,
+            ShardGroupId::new(0),
+            BlockHeight::new(1),
+            Round::INITIAL,
+            &BlockHash::from_raw(Hash::from_bytes(&[2u8; 32])),
+        );
+        let mut votes: Vec<(BlockVote, Bls12381G1PublicKey)> = Vec::new();
+        for i in 0..3u64 {
+            let sk = generate_bls_keypair();
+            let signature = sk.sign_v1(&message);
+            let pk = sk.public_key();
+            let vote = BlockVote::from_parts(
+                BlockHash::from_raw(Hash::from_bytes(&[2u8; 32])),
+                ShardGroupId::new(0),
+                BlockHeight::new(1),
+                Round::INITIAL,
+                ValidatorId::new(i),
+                signature,
+                ProposerTimestamp::ZERO,
+            );
+            votes.push((vote, pk));
+        }
+
+        // Replace the middle vote's pubkey with a fresh unrelated one so the
+        // signature no longer validates.
+        let intruder_sk = generate_bls_keypair();
+        votes[1].1 = intruder_sk.public_key();
+
+        let results = Verified::<BlockVote>::verify_batch(&message, votes);
+        assert_eq!(results.len(), 3);
+        assert!(results[0].is_some());
+        assert!(results[1].is_none());
+        assert!(results[2].is_some());
+    }
+
+    /// Empty input produces an empty output (no allocation, no fallback).
+    #[test]
+    fn verify_batch_empty_input_returns_empty() {
+        let results = Verified::<BlockVote>::verify_batch(b"unused", Vec::new());
+        assert!(results.is_empty());
     }
 }
