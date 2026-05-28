@@ -8,8 +8,8 @@ use sbor::prelude::*;
 use thiserror::Error;
 
 use crate::{
-    BlockHash, BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, NetworkDefinition, Round,
-    ShardGroupId, SignerBitfield, Verified, Verify, VotePower, WeightedTimestamp,
+    BlockHash, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, NetworkDefinition,
+    Round, ShardGroupId, SignerBitfield, Verified, Verify, VotePower, WeightedTimestamp,
     block_vote_message, verify_bls12381_v1, zero_bls_signature,
 };
 
@@ -266,6 +266,91 @@ impl Verified<QuorumCertificate> {
     pub const fn genesis(shard_group_id: ShardGroupId) -> Self {
         Self::new_unchecked(QuorumCertificate::genesis(shard_group_id))
     }
+
+    /// Aggregate a verified vote set into a `Verified<QuorumCertificate>`.
+    ///
+    /// Sorts by committee index so the signer bitfield matches the order
+    /// the verifier will use, aggregates the BLS signatures, and computes
+    /// the stake-weighted timestamp clamped to `parent_weighted_timestamp`
+    /// (so the resulting QC's `weighted_timestamp` is monotonically `>=`
+    /// the parent's).
+    ///
+    /// Construction asserts:
+    /// 1. Every vote was verified — witnessed by the typed
+    ///    `Verified<BlockVote>` input.
+    /// 2. BLS aggregation over the votes' signatures succeeded.
+    ///
+    /// The caller is responsible for ensuring `verified_votes` is
+    /// non-empty and that the combined voting power clears the quorum
+    /// threshold — both checks live one level up in the verify-and-build
+    /// flow that calls this constructor. The
+    /// `Verified<QuorumCertificate>` predicate folds in both an
+    /// aggregated-signature check and a quorum-power check, so the
+    /// caller's quorum pre-check is what makes the typed result honest.
+    ///
+    /// Returns `None` when the BLS aggregation library rejects the
+    /// signature set (empty input or internal validation failure).
+    #[must_use]
+    #[allow(clippy::too_many_arguments)] // mirrors the QC's signed-over fields
+    pub fn from_verified_votes(
+        block_hash: BlockHash,
+        shard_group_id: ShardGroupId,
+        height: BlockHeight,
+        round: Round,
+        parent_block_hash: BlockHash,
+        parent_weighted_timestamp: WeightedTimestamp,
+        verified_votes: &[(usize, Verified<BlockVote>, VotePower)],
+    ) -> Option<Self> {
+        let mut sorted: Vec<_> = verified_votes.to_vec();
+        sorted.sort_by_key(|(idx, _, _)| *idx);
+
+        let signatures: Vec<Bls12381G2Signature> =
+            sorted.iter().map(|(_, v, _)| v.signature()).collect();
+        let aggregated_signature = Bls12381G2Signature::aggregate(&signatures, true).ok()?;
+
+        let floor_ms = parent_weighted_timestamp.as_millis();
+        let max_idx = sorted.iter().map(|(idx, _, _)| *idx).max().unwrap_or(0);
+        let mut signers = SignerBitfield::new(max_idx + 1);
+        let mut timestamp_weight_sum: u128 = 0;
+        let mut verified_power = VotePower::ZERO;
+        for (idx, vote, power) in &sorted {
+            signers.set(*idx);
+            // Per-vote monotonicity clamp: a vote timestamp below
+            // parent's `weighted_timestamp` (slow honest clock or
+            // Byzantine voter) is raised to the floor before
+            // aggregation, so the resulting QC's `weighted_timestamp`
+            // is guaranteed >= parent's.
+            let clamped_ms = vote.timestamp().as_millis().max(floor_ms);
+            timestamp_weight_sum += u128::from(clamped_ms) * u128::from(power.inner());
+            verified_power += *power;
+        }
+
+        let weighted_timestamp_ms = if verified_power == VotePower::ZERO {
+            0
+        } else {
+            // Mean of u64 timestamps weighted by u64 powers always
+            // fits in u64.
+            u64::try_from(timestamp_weight_sum / u128::from(verified_power.inner()))
+                .unwrap_or(u64::MAX)
+        };
+
+        // SAFETY: every vote in `verified_votes` carries a type-level
+        // claim that its BLS signature validates against the voter's
+        // pubkey for `block_vote_message`. The BLS aggregation just
+        // succeeded against those same signatures, so the resulting
+        // aggregated signature verifies against the matching
+        // aggregated public key. Quorum is the caller's precondition.
+        Some(Self::new_unchecked(QuorumCertificate::new(
+            block_hash,
+            shard_group_id,
+            height,
+            parent_block_hash,
+            round,
+            signers,
+            aggregated_signature,
+            WeightedTimestamp::from_millis(weighted_timestamp_ms),
+        )))
+    }
 }
 
 /// Construction asserts: the aggregated BLS signature over the QC's
@@ -275,18 +360,21 @@ impl Verified<QuorumCertificate> {
 /// (`qc.block_hash == block.header.hash()`) is *not* part of this
 /// predicate — it belongs to the container types that hold the QC.
 ///
-/// Construction goes through one of three gates:
+/// Construction goes through one of four gates:
 ///
 /// - [`<QuorumCertificate as Verify>::verify`](Verify::verify) — runs the
 ///   full predicate.
 /// - [`Verified::<QuorumCertificate>::genesis`] — produces the
 ///   well-defined zero-signature QC for block 0. Valid by definition; no
 ///   signature exists to verify.
-/// - [`Verified::<QuorumCertificate>::new_unchecked`] — audit point. Used
-///   at storage-recovery boundaries where the QC was verified before
-///   persistence, and to re-wrap QCs assembled from already-verified
-///   votes inside `build_qc_from_verified`. Every call site carries a
-///   `// SAFETY:` comment naming the trust source.
+/// - [`Verified::<QuorumCertificate>::from_verified_votes`] — aggregates
+///   a typed-`Verified<BlockVote>` set into a verified QC. Per-vote
+///   signatures are witnessed by the typed input; the caller supplies
+///   the quorum precondition before invoking.
+/// - [`Verified::<QuorumCertificate>::new_unchecked`] — audit point.
+///   Used at storage-recovery boundaries where the QC was verified
+///   before persistence. Every call site carries a `// SAFETY:` comment
+///   naming the trust source.
 impl Verify<&QcContext<'_>> for QuorumCertificate {
     type Augment = ();
     type Error = QcVerifyError;
