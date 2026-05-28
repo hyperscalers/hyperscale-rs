@@ -727,13 +727,14 @@ mod tests {
     fn block_committed_flips_admitted_tx_to_committed_in_mempool() {
         let TestNode { mut node, .. } = TestNode::new();
 
-        let tx = Arc::new(test_transaction(/* seed */ 1));
-        let tx_hash = tx.hash();
+        let raw_tx = Arc::new(test_transaction(/* seed */ 1));
+        let tx_hash = raw_tx.hash();
+        let verified_tx = Arc::new(Verified::new_unchecked_for_test((*raw_tx).clone()));
 
         let _ = node.handle(
             LocalTimestamp::ZERO,
             ProtocolEvent::TransactionValidated {
-                tx: Arc::clone(&tx),
+                tx: Arc::clone(&verified_tx),
                 submitted_locally: true,
             },
         );
@@ -748,7 +749,7 @@ mod tests {
             BlockHeight::new(1),
             /* timestamp_ms */ 1_000,
             ValidatorId::new(0),
-            vec![tx],
+            vec![raw_tx],
             vec![],
         );
         // SAFETY: test fixture; block and synthesized QC are produced

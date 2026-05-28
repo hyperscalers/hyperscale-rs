@@ -12,7 +12,9 @@ use radix_transactions::model::{
 };
 use radix_transactions::prelude::PreparationSettings;
 
-use crate::{NetworkDefinition, NodeId, RoutableTransaction, TimestampRange, WeightedTimestamp};
+use crate::{
+    NetworkDefinition, NodeId, RoutableTransaction, TimestampRange, Verified, WeightedTimestamp,
+};
 
 /// Create a test `NodeId` from a seed byte.
 #[must_use]
@@ -145,4 +147,15 @@ pub fn test_transaction(seed: u8) -> RoutableTransaction {
         vec![test_node(seed)],
         vec![test_node(seed + 10)],
     )
+}
+
+/// Convenience: wrap [`test_transaction`] in a `Verified` witness via
+/// the test-only gate.
+///
+/// Use at any test call site that needs a pre-validated transaction
+/// (mempool admission API, event payloads carrying
+/// `Arc<Verified<RoutableTransaction>>`).
+#[must_use]
+pub fn verified_test_transaction(seed: u8) -> Verified<RoutableTransaction> {
+    Verified::new_unchecked_for_test(test_transaction(seed))
 }

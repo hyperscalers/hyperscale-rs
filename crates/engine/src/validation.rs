@@ -22,7 +22,7 @@
 //! }
 //! ```
 
-use hyperscale_types::{RoutableTransaction, TxHash};
+use hyperscale_types::{RoutableTransaction, RoutableTransactionContext, TxHash, Verified, Verify};
 use radix_common::network::NetworkDefinition;
 use radix_transactions::errors::TransactionValidationError;
 use radix_transactions::validation::TransactionValidator;
@@ -112,6 +112,26 @@ impl TransactionValidation {
             .ok_or_else(|| ValidationError::PreparationFailed("Validation failed".to_string()))?;
 
         Ok(())
+    }
+
+    /// Validate a transaction and return a typed `Verified<RoutableTransaction>`
+    /// witness on success. The typestate witness is the canonical proof
+    /// the predicate held; downstream callers that need to demand "this
+    /// tx is admission-validated" take `Verified<RoutableTransaction>`
+    /// in their signatures.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::PreparationFailed`] when Radix
+    /// `prepare_and_validate` rejects the transaction.
+    pub fn verify_transaction(
+        &self,
+        tx: &RoutableTransaction,
+    ) -> Result<Verified<RoutableTransaction>, ValidationError> {
+        tx.verify(&RoutableTransactionContext {
+            validator: &self.validator,
+        })
+        .map_err(|_| ValidationError::PreparationFailed("Validation failed".to_string()))
     }
 
     /// Validate a transaction and return a result suitable for async dispatch.

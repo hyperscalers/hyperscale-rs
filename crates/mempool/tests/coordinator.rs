@@ -12,9 +12,15 @@ use hyperscale_mempool::{MempoolConfig, MempoolCoordinator, MempoolMemoryStats};
 use hyperscale_test_helpers::{TestCommittee, certify, make_finalized_wave, make_live_block};
 use hyperscale_types::test_utils::test_transaction;
 use hyperscale_types::{
-    BlockHeight, Hash, LocalTimestamp, ShardGroupId, TopologySnapshot, TransactionDecision,
-    TransactionStatus, TxHash, ValidatorId,
+    BlockHeight, Hash, LocalTimestamp, RoutableTransaction, ShardGroupId, TopologySnapshot,
+    TransactionDecision, TransactionStatus, TxHash, ValidatorId, Verified,
 };
+
+/// Test-only convenience: wrap any `RoutableTransaction` in a `Verified`
+/// witness via the test-only gate.
+const fn verified(tx: RoutableTransaction) -> Verified<RoutableTransaction> {
+    Verified::new_unchecked_for_test(tx)
+}
 
 fn test_topology() -> TopologySnapshot {
     TestCommittee::new(4, 42).topology_snapshot(0, 1)
@@ -125,7 +131,7 @@ fn submit_then_ready_round_trips_a_transaction() {
 
     let tx = test_transaction(1);
     let tx_hash = tx.hash();
-    coord.on_submit_transaction(&topology, Arc::new(tx), LocalTimestamp::ZERO);
+    coord.on_submit_transaction(&topology, Arc::new(verified(tx)), LocalTimestamp::ZERO);
 
     assert!(coord.has_transaction(&tx_hash));
     assert_eq!(coord.status(&tx_hash), Some(TransactionStatus::Pending));
@@ -142,7 +148,11 @@ fn on_block_committed_transitions_pending_to_committed_and_bumps_in_flight() {
 
     let tx = test_transaction(1);
     let tx_hash = tx.hash();
-    coord.on_submit_transaction(&topology, Arc::new(tx.clone()), LocalTimestamp::ZERO);
+    coord.on_submit_transaction(
+        &topology,
+        Arc::new(verified(tx.clone())),
+        LocalTimestamp::ZERO,
+    );
     assert_eq!(coord.in_flight(), 0);
 
     let block = make_live_block(
@@ -169,7 +179,11 @@ fn on_block_committed_with_finalized_wave_tombstones_and_evicts() {
 
     let tx = test_transaction(1);
     let tx_hash = tx.hash();
-    coord.on_submit_transaction(&topology, Arc::new(tx.clone()), LocalTimestamp::ZERO);
+    coord.on_submit_transaction(
+        &topology,
+        Arc::new(verified(tx.clone())),
+        LocalTimestamp::ZERO,
+    );
 
     // Single block that both includes the tx and carries the wave cert
     // completing it — drives Pending → Committed → Completed in one call.
@@ -188,7 +202,12 @@ fn on_block_committed_with_finalized_wave_tombstones_and_evicts() {
     assert!(coord.status(&tx_hash).is_none());
     assert!(coord.is_tombstoned(&tx_hash));
 
-    let actions = coord.on_transaction_gossip(&topology, Arc::new(tx), false, LocalTimestamp::ZERO);
+    let actions = coord.on_transaction_gossip(
+        &topology,
+        Arc::new(verified(tx)),
+        false,
+        LocalTimestamp::ZERO,
+    );
     assert!(actions.is_empty(), "tombstoned tx must not be re-accepted");
     assert!(!coord.has_transaction(&tx_hash));
 }

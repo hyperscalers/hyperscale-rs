@@ -3162,11 +3162,12 @@ impl ShardCoordinator {
     pub fn on_transactions_admitted(
         &mut self,
         topology_snapshot: &TopologySnapshot,
-        txs: &[Arc<RoutableTransaction>],
+        txs: &[Arc<Verified<RoutableTransaction>>],
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         for tx in txs {
-            for block_hash in self.pending_blocks.receive_transaction(tx) {
+            let raw: Arc<RoutableTransaction> = Arc::new((***tx).clone());
+            for block_hash in self.pending_blocks.receive_transaction(&raw) {
                 actions.extend(self.dispatch_block_complete(topology_snapshot, block_hash));
             }
         }

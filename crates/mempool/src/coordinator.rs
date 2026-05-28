@@ -38,7 +38,7 @@ use hyperscale_metrics::{record_expected_tx_dropped, record_transaction_aborted}
 use hyperscale_types::{
     BlockHeight, CertifiedBlock, LocalTimestamp, MAX_TX_IN_FLIGHT, MessageClass, NodeId,
     RETENTION_HORIZON, RoutableTransaction, ShardGroupId, TopologySnapshot, TransactionDecision,
-    TransactionStatus, TxHash, WeightedTimestamp,
+    TransactionStatus, TxHash, Verified, WeightedTimestamp,
 };
 use serde::Deserialize;
 use tracing::instrument;
@@ -344,7 +344,7 @@ impl MempoolCoordinator {
     pub fn on_submit_transaction(
         &mut self,
         topology: &TopologySnapshot,
-        tx: Arc<RoutableTransaction>,
+        tx: Arc<Verified<RoutableTransaction>>,
         now: LocalTimestamp,
     ) -> Vec<Action> {
         let hash = tx.hash();
@@ -358,7 +358,8 @@ impl MempoolCoordinator {
             }];
         }
 
-        match self.admit_internal(topology, &tx, true, now) {
+        let raw: Arc<RoutableTransaction> = Arc::new((**tx).clone());
+        match self.admit_internal(topology, &raw, true, now) {
             Some(cross_shard) => {
                 tracing::info!(
                     tx_hash = ?hash,
@@ -386,11 +387,12 @@ impl MempoolCoordinator {
     pub fn on_transaction_gossip(
         &mut self,
         topology: &TopologySnapshot,
-        tx: Arc<RoutableTransaction>,
+        tx: Arc<Verified<RoutableTransaction>>,
         submitted_locally: bool,
         now: LocalTimestamp,
     ) -> Vec<Action> {
-        match self.admit_internal(topology, &tx, submitted_locally, now) {
+        let raw: Arc<RoutableTransaction> = Arc::new((**tx).clone());
+        match self.admit_internal(topology, &raw, submitted_locally, now) {
             Some(_) => {
                 tracing::trace!(
                     tx_hash = ?tx.hash(),
@@ -411,7 +413,7 @@ impl MempoolCoordinator {
     pub fn on_fetched_transactions(
         &mut self,
         topology: &TopologySnapshot,
-        txs: Vec<Arc<RoutableTransaction>>,
+        txs: Vec<Arc<Verified<RoutableTransaction>>>,
         now: LocalTimestamp,
     ) -> Vec<Action> {
         let mut admitted = Vec::with_capacity(txs.len());
@@ -423,7 +425,8 @@ impl MempoolCoordinator {
         let mut moot: Vec<TxHash> = Vec::new();
         for tx in txs {
             let hash = tx.hash();
-            if self.admit_internal(topology, &tx, false, now).is_some() {
+            let raw: Arc<RoutableTransaction> = Arc::new((**tx).clone());
+            if self.admit_internal(topology, &raw, false, now).is_some() {
                 admitted.push(tx);
             } else if self.expected_txs.forget(&hash) {
                 moot.push(hash);
@@ -1057,7 +1060,14 @@ mod tests {
     use hyperscale_metrics::{MetricsRecorder, with_scoped_recorder};
     use hyperscale_metrics_memory::MemoryRecorder;
     use hyperscale_test_helpers::{TestCommittee, certify, make_finalized_wave, make_live_block};
+    use hyperscale_types::Verified;
     use hyperscale_types::test_utils::{test_transaction, test_transaction_with_nodes};
+
+    /// Test-only convenience: wrap any `RoutableTransaction` in a
+    /// `Verified` witness via the test-only gate.
+    fn verified(tx: RoutableTransaction) -> Verified<RoutableTransaction> {
+        Verified::new_unchecked_for_test(tx)
+    }
     use hyperscale_types::{
         Block, FinalizedWave, MAX_TXS_PER_BLOCK, MerkleInclusionProof, ProvisionEntry, Provisions,
         ShardGroupId, ValidatorId,
@@ -1142,7 +1152,11 @@ mod tests {
 
         let already_seen = test_transaction(1);
         let already_seen_hash = already_seen.hash();
-        mempool.on_submit_transaction(&topology, Arc::new(already_seen), LocalTimestamp::ZERO);
+        mempool.on_submit_transaction(
+            &topology,
+            Arc::new(verified(already_seen)),
+            LocalTimestamp::ZERO,
+        );
 
         let unseen_hash = test_transaction(2).hash();
 
@@ -1233,7 +1247,12 @@ mod tests {
         assert_eq!(mempool.pending_expected_count(), 1);
 
         // Gossip arrives — expectation cleared.
-        mempool.on_transaction_gossip(&topology, Arc::new(tx), false, LocalTimestamp::ZERO);
+        mempool.on_transaction_gossip(
+            &topology,
+            Arc::new(verified(tx)),
+            false,
+            LocalTimestamp::ZERO,
+        );
         assert_eq!(mempool.pending_expected_count(), 0);
     }
 
@@ -1251,7 +1270,7 @@ mod tests {
         );
         assert_eq!(mempool.pending_expected_count(), 1);
 
-        mempool.on_submit_transaction(&topology, Arc::new(tx), LocalTimestamp::ZERO);
+        mempool.on_submit_transaction(&topology, Arc::new(verified(tx)), LocalTimestamp::ZERO);
         assert_eq!(mempool.pending_expected_count(), 0);
     }
 
@@ -1551,8 +1570,11 @@ mod tests {
 
         // Source committee delivers the tx body — but admission rejects
         // because the tx is past its validity window.
-        let actions =
-            mempool.on_fetched_transactions(&topology, vec![Arc::new(tx)], LocalTimestamp::ZERO);
+        let actions = mempool.on_fetched_transactions(
+            &topology,
+            vec![Arc::new(verified(tx))],
+            LocalTimestamp::ZERO,
+        );
 
         assert_eq!(
             mempool.pending_expected_count(),
@@ -1582,7 +1604,12 @@ mod tests {
             &topology,
             &certified_block_with_provisions(BlockHeight::new(1), ShardGroupId::new(0), &[tx_hash]),
         );
-        mempool.on_transaction_gossip(&topology, Arc::new(tx), false, LocalTimestamp::ZERO);
+        mempool.on_transaction_gossip(
+            &topology,
+            Arc::new(verified(tx)),
+            false,
+            LocalTimestamp::ZERO,
+        );
 
         let actions = mempool.on_block_committed(
             &topology,
@@ -1604,7 +1631,11 @@ mod tests {
         // Submit a TX, then commit a block whose FinalizedWave aborts it.
         let tx = test_transaction(1);
         let tx_hash = tx.hash();
-        mempool.on_submit_transaction(&topology, Arc::new(tx.clone()), LocalTimestamp::ZERO);
+        mempool.on_submit_transaction(
+            &topology,
+            Arc::new(verified(tx.clone())),
+            LocalTimestamp::ZERO,
+        );
 
         let certified = certified_commit_block(
             BlockHeight::new(1),
@@ -1641,13 +1672,17 @@ mod tests {
         // A submitted-but-not-yet-committed tx lands in pool.
         let tx_live = test_transaction(1);
         let tx_live_hash = tx_live.hash();
-        mempool.on_submit_transaction(&topology, Arc::new(tx_live), LocalTimestamp::ZERO);
+        mempool.on_submit_transaction(&topology, Arc::new(verified(tx_live)), LocalTimestamp::ZERO);
 
         // A second tx commits and gets tombstoned. Body stays in TxStore
         // until the tombstone retention window elapses.
         let tx_done = test_transaction(2);
         let tx_done_hash = tx_done.hash();
-        mempool.on_submit_transaction(&topology, Arc::new(tx_done.clone()), LocalTimestamp::ZERO);
+        mempool.on_submit_transaction(
+            &topology,
+            Arc::new(verified(tx_done.clone())),
+            LocalTimestamp::ZERO,
+        );
         let certified = certified_commit_block(
             BlockHeight::new(1),
             tx_done,
@@ -1680,7 +1715,11 @@ mod tests {
         let tx_hash = tx.hash();
 
         // Submit and complete the transaction (commit + Accept wave cert in one block).
-        mempool.on_submit_transaction(&topology, Arc::new(tx.clone()), LocalTimestamp::ZERO);
+        mempool.on_submit_transaction(
+            &topology,
+            Arc::new(verified(tx.clone())),
+            LocalTimestamp::ZERO,
+        );
         let certified = certified_commit_block(
             BlockHeight::new(1),
             tx.clone(),
@@ -1692,8 +1731,12 @@ mod tests {
         assert!(mempool.is_tombstoned(&tx_hash));
 
         // Try to re-add via gossip - should be rejected
-        let actions =
-            mempool.on_transaction_gossip(&topology, Arc::new(tx), false, LocalTimestamp::ZERO);
+        let actions = mempool.on_transaction_gossip(
+            &topology,
+            Arc::new(verified(tx)),
+            false,
+            LocalTimestamp::ZERO,
+        );
         assert!(actions.is_empty(), "Tombstoned tx should be rejected");
 
         // Should still not be in pool
@@ -1709,7 +1752,11 @@ mod tests {
         let tx_hash = tx.hash();
 
         // Submit and complete the transaction (commit + Accept wave cert in one block).
-        mempool.on_submit_transaction(&topology, Arc::new(tx.clone()), LocalTimestamp::ZERO);
+        mempool.on_submit_transaction(
+            &topology,
+            Arc::new(verified(tx.clone())),
+            LocalTimestamp::ZERO,
+        );
         let certified = certified_commit_block(
             BlockHeight::new(1),
             tx.clone(),
@@ -1718,7 +1765,8 @@ mod tests {
         mempool.on_block_committed(&topology, &certified);
 
         // Try to re-submit - should be rejected (no status emitted)
-        let actions = mempool.on_submit_transaction(&topology, Arc::new(tx), LocalTimestamp::ZERO);
+        let actions =
+            mempool.on_submit_transaction(&topology, Arc::new(verified(tx)), LocalTimestamp::ZERO);
         assert!(actions.is_empty(), "Tombstoned tx should be rejected");
 
         // Should still not be in pool
@@ -1748,7 +1796,11 @@ mod tests {
             .map(|i| Arc::new(unique_test_tx(i)))
             .collect();
         for tx in &txs {
-            mempool.on_submit_transaction(topology, Arc::clone(tx), LocalTimestamp::ZERO);
+            mempool.on_submit_transaction(
+                topology,
+                Arc::new(verified((**tx).clone())),
+                LocalTimestamp::ZERO,
+            );
         }
         for (i, chunk) in txs.chunks(MAX_TXS_PER_BLOCK).enumerate() {
             let block = make_live_block(
@@ -1817,11 +1869,11 @@ mod tests {
 
         // Add a single-shard transaction
         let single_shard_tx = test_transaction(1);
-        mempool.on_submit_transaction(&topology, Arc::new(single_shard_tx), submit_at);
+        mempool.on_submit_transaction(&topology, Arc::new(verified(single_shard_tx)), submit_at);
 
         // Add a cross-shard transaction
         let cross_shard_tx = test_cross_shard_transaction(50);
-        mempool.on_submit_transaction(&topology, Arc::new(cross_shard_tx), submit_at);
+        mempool.on_submit_transaction(&topology, Arc::new(verified(cross_shard_tx)), submit_at);
 
         // Below limit: all TXs should be returned
         let ready = mempool.ready_transactions(10, 0, 0, read_at);
@@ -1839,7 +1891,7 @@ mod tests {
 
         // Add a transaction
         let tx = test_transaction(1);
-        mempool.on_submit_transaction(&topology, Arc::new(tx), LocalTimestamp::ZERO);
+        mempool.on_submit_transaction(&topology, Arc::new(verified(tx)), LocalTimestamp::ZERO);
 
         // At limit: no TXs should be returned
         let ready = mempool.ready_transactions(10, 0, 0, LocalTimestamp::ZERO);
@@ -1863,11 +1915,19 @@ mod tests {
 
         // Add a single-shard transaction
         let single_tx = test_transaction(1);
-        mempool.on_submit_transaction(&topology, Arc::new(single_tx), LocalTimestamp::ZERO);
+        mempool.on_submit_transaction(
+            &topology,
+            Arc::new(verified(single_tx)),
+            LocalTimestamp::ZERO,
+        );
 
         // Add a cross-shard transaction
         let cross_tx = test_cross_shard_transaction(50);
-        mempool.on_submit_transaction(&topology, Arc::new(cross_tx), LocalTimestamp::ZERO);
+        mempool.on_submit_transaction(
+            &topology,
+            Arc::new(verified(cross_tx)),
+            LocalTimestamp::ZERO,
+        );
 
         // Not at limit: all TXs should be allowed
         let ready = mempool.ready_transactions(10, 0, 0, LocalTimestamp::ZERO);
@@ -1885,8 +1945,16 @@ mod tests {
         let single_hash = single_tx.hash();
         let cross_tx = test_cross_shard_transaction(1);
         let cross_hash = cross_tx.hash();
-        mempool.on_submit_transaction(&topology, Arc::new(single_tx.clone()), LocalTimestamp::ZERO);
-        mempool.on_submit_transaction(&topology, Arc::new(cross_tx.clone()), LocalTimestamp::ZERO);
+        mempool.on_submit_transaction(
+            &topology,
+            Arc::new(verified(single_tx.clone())),
+            LocalTimestamp::ZERO,
+        );
+        mempool.on_submit_transaction(
+            &topology,
+            Arc::new(verified(cross_tx.clone())),
+            LocalTimestamp::ZERO,
+        );
         assert_eq!(mempool.in_flight(), 0, "Pending TXs do not count");
 
         // Block 1 commits both txs — both transition Pending → Committed.
@@ -1950,7 +2018,7 @@ mod tests {
 
         let now = LocalTimestamp::from_millis(10_000);
         let tx = test_transaction(1);
-        mempool.on_submit_transaction(&topology, Arc::new(tx), now);
+        mempool.on_submit_transaction(&topology, Arc::new(verified(tx)), now);
 
         let ready = mempool.ready_transactions(10, 0, 0, now);
         assert_eq!(ready.len(), 1, "Zero dwell time should select immediately");
@@ -1964,7 +2032,7 @@ mod tests {
 
         let submitted_at = LocalTimestamp::from_millis(10_000);
         let tx = test_transaction(1);
-        mempool.on_submit_transaction(&topology, Arc::new(tx), submitted_at);
+        mempool.on_submit_transaction(&topology, Arc::new(verified(tx)), submitted_at);
 
         // At t=10.1s — not yet eligible (100ms < 150ms)
         let ready = mempool.ready_transactions(10, 0, 0, LocalTimestamp::from_millis(10_100));
@@ -1991,7 +2059,7 @@ mod tests {
         // Submit at t=10s
         let submitted_at = LocalTimestamp::from_millis(10_000);
         let tx = test_transaction(1);
-        mempool.on_submit_transaction(&topology, Arc::new(tx), submitted_at);
+        mempool.on_submit_transaction(&topology, Arc::new(verified(tx)), submitted_at);
 
         // Still at t=10s — dwell time not met
         let ready = mempool.ready_transactions(10, 0, 0, submitted_at);
@@ -2021,11 +2089,19 @@ mod tests {
 
         // Submit tx1 at t=1s
         let tx1 = test_transaction(1);
-        mempool.on_submit_transaction(&topology, Arc::new(tx1), LocalTimestamp::from_millis(1_000));
+        mempool.on_submit_transaction(
+            &topology,
+            Arc::new(verified(tx1)),
+            LocalTimestamp::from_millis(1_000),
+        );
 
         // Submit tx2 at t=1.3s
         let tx2 = test_transaction(2);
-        mempool.on_submit_transaction(&topology, Arc::new(tx2), LocalTimestamp::from_millis(1_300));
+        mempool.on_submit_transaction(
+            &topology,
+            Arc::new(verified(tx2)),
+            LocalTimestamp::from_millis(1_300),
+        );
 
         // At t=1.4s — tx1 has 400ms dwell (eligible), tx2 has 100ms (not eligible).
         let ready = mempool.ready_transactions(10, 0, 0, LocalTimestamp::from_millis(1_400));
@@ -2038,7 +2114,7 @@ mod tests {
 
     // ─── validity-window admission + pending sweep ──────────────────────
 
-    fn tx_with_end(seed: u8, end_ms: u64) -> Arc<RoutableTransaction> {
+    fn tx_with_end(seed: u8, end_ms: u64) -> Arc<Verified<RoutableTransaction>> {
         use hyperscale_types::test_utils::test_notarized_transaction_v1;
         use hyperscale_types::{TimestampRange, routable_from_notarized_v1};
         let notarized = test_notarized_transaction_v1(&[seed]);
@@ -2046,7 +2122,9 @@ mod tests {
             WeightedTimestamp::ZERO,
             WeightedTimestamp::from_millis(end_ms),
         );
-        Arc::new(routable_from_notarized_v1(notarized, range).expect("valid notarized fixture"))
+        Arc::new(verified(
+            routable_from_notarized_v1(notarized, range).expect("valid notarized fixture"),
+        ))
     }
 
     /// Force-set `current_ts` for tests that need to control the admission /

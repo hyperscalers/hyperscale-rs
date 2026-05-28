@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use hyperscale_core::{Action, ProtocolEvent};
-use hyperscale_types::RoutableTransaction;
+use hyperscale_types::{RoutableTransaction, Verified};
 
 use super::NodeStateMachine;
 
@@ -45,7 +45,7 @@ impl NodeStateMachine {
     /// here.
     fn on_transaction_validated(
         &mut self,
-        tx: Arc<RoutableTransaction>,
+        tx: Arc<Verified<RoutableTransaction>>,
         submitted_locally: bool,
     ) -> Vec<Action> {
         if !self.topology_snapshot.involves_local_shard(&tx) {
@@ -66,7 +66,10 @@ impl NodeStateMachine {
     /// dropped before reaching this arm. Mempool emits
     /// `Continuation(TransactionsAdmitted)` for the admitted subset; the
     /// admission arm latches the proposal-retry.
-    fn on_transactions_fetched(&mut self, txs: Vec<Arc<RoutableTransaction>>) -> Vec<Action> {
+    fn on_transactions_fetched(
+        &mut self,
+        txs: Vec<Arc<Verified<RoutableTransaction>>>,
+    ) -> Vec<Action> {
         if txs.is_empty() {
             return vec![];
         }
@@ -80,8 +83,8 @@ mod tests {
     use std::sync::Arc;
 
     use hyperscale_core::{ProtocolEvent, StateMachine};
-    use hyperscale_types::LocalTimestamp;
     use hyperscale_types::test_utils::{test_transaction, test_transaction_with_nodes};
+    use hyperscale_types::{LocalTimestamp, Verified};
 
     use super::super::test_support::TestNode;
 
@@ -93,10 +96,12 @@ mod tests {
     fn transaction_validated_drops_tx_with_no_local_shard_involvement() {
         let TestNode { mut node, .. } = TestNode::new();
 
-        let tx = Arc::new(test_transaction_with_nodes(
-            b"empty-shards-xyz",
-            /* read_nodes */ vec![],
-            /* write_nodes */ vec![],
+        let tx = Arc::new(Verified::new_unchecked_for_test(
+            test_transaction_with_nodes(
+                b"empty-shards-xyz",
+                /* read_nodes */ vec![],
+                /* write_nodes */ vec![],
+            ),
         ));
 
         let actions = node.handle(
@@ -121,7 +126,9 @@ mod tests {
     #[test]
     fn transaction_validated_routes_local_shard_tx_to_mempool() {
         let TestNode { mut node, .. } = TestNode::new();
-        let tx = Arc::new(test_transaction(/* seed */ 1));
+        let tx = Arc::new(Verified::new_unchecked_for_test(test_transaction(
+            /* seed */ 1,
+        )));
 
         let _ = node.handle(
             LocalTimestamp::ZERO,
@@ -150,8 +157,12 @@ mod tests {
     fn transactions_received_admits_fetched_batch_to_mempool() {
         let TestNode { mut node, .. } = TestNode::new();
         let txs = vec![
-            Arc::new(test_transaction(/* seed */ 1)),
-            Arc::new(test_transaction(/* seed */ 2)),
+            Arc::new(Verified::new_unchecked_for_test(test_transaction(
+                /* seed */ 1,
+            ))),
+            Arc::new(Verified::new_unchecked_for_test(test_transaction(
+                /* seed */ 2,
+            ))),
         ];
 
         let _ = node.handle(

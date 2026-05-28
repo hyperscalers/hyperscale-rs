@@ -242,7 +242,7 @@ pub enum ShardScopedInput {
     /// before forwarding as `ProtocolEvent::TransactionValidated`.
     TransactionValidated {
         /// Validated transaction ready for the mempool.
-        tx: Arc<RoutableTransaction>,
+        tx: Arc<Verified<RoutableTransaction>>,
     },
 
     /// Transactions that failed validation — sent back so the `NodeHost` can

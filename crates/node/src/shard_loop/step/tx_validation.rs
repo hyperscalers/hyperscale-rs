@@ -24,7 +24,7 @@ use hyperscale_dispatch::{Dispatch, DispatchPool, Parallelism};
 use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::gossip::TransactionGossip;
-use hyperscale_types::{RoutableTransaction, ShardGroupId, TxHash};
+use hyperscale_types::{RoutableTransaction, ShardGroupId, TxHash, Verified};
 
 use crate::batch_accumulator::BatchAccumulator;
 use crate::host::NodeHost;
@@ -51,7 +51,7 @@ where
     /// [`MempoolCoordinator::on_transaction_gossip`]: hyperscale_mempool::MempoolCoordinator
     pub(in crate::shard_loop) fn handle_transaction_validated(
         &mut self,
-        tx: Arc<RoutableTransaction>,
+        tx: Arc<Verified<RoutableTransaction>>,
     ) {
         let tx_hash = tx.hash();
         self.io.pending_validation.remove(&tx_hash);
@@ -182,18 +182,19 @@ where
         self.process
             .dispatch
             .spawn(DispatchPool::Throughput, move || {
-                let results: Vec<(Arc<RoutableTransaction>, bool)> = par.map(batch, |tx| {
-                    let valid = validator.validate_transaction(&tx).is_ok();
-                    (tx, valid)
-                });
+                let results: Vec<(TxHash, Option<Verified<RoutableTransaction>>)> =
+                    par.map(batch, |tx| {
+                        let hash = tx.hash();
+                        (hash, validator.verify_transaction(&tx).ok())
+                    });
 
-                let mut valid = Vec::new();
+                let mut valid: Vec<Arc<Verified<RoutableTransaction>>> = Vec::new();
                 let mut failed_hashes = Vec::new();
-                for (tx, ok) in results {
-                    if ok {
-                        valid.push(tx);
+                for (hash, verified) in results {
+                    if let Some(v) = verified {
+                        valid.push(Arc::new(v));
                     } else {
-                        failed_hashes.push(tx.hash());
+                        failed_hashes.push(hash);
                     }
                 }
 
@@ -286,21 +287,22 @@ where
         self.process
             .dispatch
             .spawn(DispatchPool::Throughput, move || {
-                let results: Vec<(Arc<RoutableTransaction>, bool)> = par.map(batch, |tx| {
-                    let valid = validator.validate_transaction(&tx).is_ok();
-                    (tx, valid)
-                });
+                let results: Vec<(TxHash, Option<Verified<RoutableTransaction>>)> =
+                    par.map(batch, |tx| {
+                        let hash = tx.hash();
+                        (hash, validator.verify_transaction(&tx).ok())
+                    });
 
                 let mut failed_hashes = Vec::new();
-                for (tx, valid) in results {
-                    if valid {
+                for (hash, verified) in results {
+                    if let Some(v) = verified {
                         push_shard_input(
                             &event_tx,
                             local_shard,
-                            ShardScopedInput::TransactionValidated { tx },
+                            ShardScopedInput::TransactionValidated { tx: Arc::new(v) },
                         );
                     } else {
-                        failed_hashes.push(tx.hash());
+                        failed_hashes.push(hash);
                     }
                 }
                 if !failed_hashes.is_empty() {

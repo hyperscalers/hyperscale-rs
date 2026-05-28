@@ -525,7 +525,7 @@ pub enum ProtocolEvent {
     /// for whatever it admits.
     TransactionValidated {
         /// The validated transaction.
-        tx: Arc<RoutableTransaction>,
+        tx: Arc<Verified<RoutableTransaction>>,
         /// `true` if this validator submitted the tx (don't gossip back to client).
         submitted_locally: bool,
     },
@@ -539,7 +539,7 @@ pub enum ProtocolEvent {
     /// signature-valid txs reach this event.
     TransactionsReceived {
         /// Transactions returned by the peer.
-        transactions: Vec<Arc<RoutableTransaction>>,
+        transactions: Vec<Arc<Verified<RoutableTransaction>>>,
     },
 
     /// One or more transactions were just admitted to the canonical mempool.
@@ -557,7 +557,7 @@ pub enum ProtocolEvent {
     /// the canonical-store admission story is uniform across payloads.
     TransactionsAdmitted {
         /// Transactions newly admitted to mempool on this admission call.
-        txs: Vec<Arc<RoutableTransaction>>,
+        txs: Vec<Arc<Verified<RoutableTransaction>>>,
     },
 
     // ═══════════════════════════════════════════════════════════════════════
