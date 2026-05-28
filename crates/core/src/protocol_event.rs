@@ -14,11 +14,11 @@ use hyperscale_types::{
     ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote, FinalizedWave,
     FinalizedWaveVerifyError, LocalReceiptRoot, LocalReceiptRootVerifyError, PcQc3, PcVector,
     PcVoteMessage, ProvisionRootVerifyError, ProvisionTxRootsMap, ProvisionTxRootsVerifyError,
-    Provisions, ProvisionsRoot, QcVerifyError, QuorumCertificate, ReadySignal, Round,
-    RoutableTransaction, ShardGroupId, ShardWitness, SkipEpochCert, SkipRequest, SpcCert,
-    SpcEmptyViewMsg, SpcView, StateRoot, StateRootVerifyError, StoredReceipt, TransactionRoot,
-    TxOutcome, TxRootVerifyError, ValidatorId, Verifiable, Verified, VotePower, WaveId,
-    WeightedTimestamp,
+    Provisions, ProvisionsRoot, ProvisionsVerifyError, QcVerifyError, QuorumCertificate,
+    ReadySignal, Round, RoutableTransaction, ShardGroupId, ShardWitness, SkipEpochCert,
+    SkipRequest, SpcCert, SpcEmptyViewMsg, SpcView, StateRoot, StateRootVerifyError, StoredReceipt,
+    TransactionRoot, TxOutcome, TxRootVerifyError, ValidatorId, Verifiable, Verified, VotePower,
+    WaveId, WeightedTimestamp,
 };
 
 /// How a node learned about the certifying QC that commits a given block.
@@ -318,18 +318,17 @@ pub enum ProtocolEvent {
 
     /// Batch-level provision verification completed.
     ///
-    /// The QC is verified once for the source block's attestation; merkle
-    /// proofs are checked against the verified state root. The committed
-    /// header is returned so the state machine can promote it without
-    /// re-lookup.
+    /// The QC was verified upstream as part of promoting the source
+    /// header to [`Verified<CommittedBlockHeader>`]; merkle proofs are
+    /// checked against the verified state root. The committed header is
+    /// returned so the state machine can promote it without re-lookup.
     StateProvisionsVerified {
-        /// The verified provisions.
-        provisions: Arc<Provisions>,
-        /// The committed header whose QC passed verification.
-        /// `None` if no candidate header passed QC verification.
-        committed_header: Option<Arc<Verified<CommittedBlockHeader>>>,
-        /// Whether the batch passed verification.
-        valid: bool,
+        /// Verified provisions on success; the raw bundle paired with
+        /// its error on failure.
+        result: Result<Arc<Verified<Provisions>>, (Arc<Provisions>, ProvisionsVerifyError)>,
+        /// The committed header whose `state_root` the merkle proof was
+        /// checked against.
+        committed_header: Arc<Verified<CommittedBlockHeader>>,
     },
 
     /// A provisions has been verified — ready for downstream consumption.

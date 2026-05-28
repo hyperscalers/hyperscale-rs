@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use hyperscale_types::{
     NodeId, Provisions, RETENTION_HORIZON, ShardGroupId, SubstateEntry, TopologySnapshot, TxHash,
-    WeightedTimestamp,
+    Verified, WeightedTimestamp,
 };
 
 use crate::conflict::{ConflictDetector, DetectedConflict};
@@ -143,7 +143,7 @@ impl ProvisioningTracker {
     /// which local waves are affected and to drive the dispatch check.
     /// Preserves iteration order of `provisions.transactions` (callers sort
     /// batches upstream for determinism).
-    pub fn absorb_provisions(&mut self, provisions: &Provisions) -> Vec<TxHash> {
+    pub fn absorb_provisions(&mut self, provisions: &Verified<Provisions>) -> Vec<TxHash> {
         let mut touched = Vec::with_capacity(provisions.transactions().len());
         let source_shard = provisions.source_shard();
         for tx_entry in provisions.transactions().iter() {
@@ -300,12 +300,12 @@ mod tests {
         source: ShardGroupId,
         block_height: BlockHeight,
         tx_hashes: Vec<TxHash>,
-    ) -> Arc<Provisions> {
+    ) -> Verified<Provisions> {
         let transactions: Vec<ProvisionEntry> = tx_hashes
             .into_iter()
             .map(|tx_hash| ProvisionEntry::new(tx_hash, vec![], vec![], vec![]))
             .collect();
-        Arc::new(Provisions::new(
+        Verified::<Provisions>::new_unchecked_for_test(Provisions::new(
             source,
             ShardGroupId::new(0),
             block_height,

@@ -18,7 +18,8 @@ use hyperscale_core::{Action, FetchAbandon, ProtocolEvent};
 use hyperscale_types::{BeaconWitnessLeafCount, BeaconWitnessRoot};
 use hyperscale_types::{
     BlockHeight, BlockManifest, CertifiedBlock, CommittedBlockHeader, LocalTimestamp,
-    ProvisionHash, Provisions, RETENTION_HORIZON, ShardGroupId, TopologySnapshot, Verified,
+    ProvisionHash, Provisions, ProvisionsVerifyError, RETENTION_HORIZON, ShardGroupId,
+    TopologySnapshot, Verified,
 };
 use serde::Deserialize;
 use tracing::{debug, info, warn};
@@ -537,13 +538,11 @@ impl ProvisionCoordinator {
     /// Uses the verified header returned by the action handler directly (no re-lookup).
     pub fn on_state_provisions_verified(
         &mut self,
-        provisions: Arc<Provisions>,
-        committed_header: Option<&Arc<Verified<CommittedBlockHeader>>>,
-        valid: bool,
+        result: Result<Arc<Verified<Provisions>>, (Arc<Provisions>, ProvisionsVerifyError)>,
+        committed_header: &Arc<Verified<CommittedBlockHeader>>,
         now: LocalTimestamp,
     ) -> Vec<Action> {
         let mut actions = vec![];
-        let source_shard = provisions.source_shard();
 
         // Clear the expectation tracker so the in-flight fallback fetch
         // (if any) is drained — once one batch verifies the shard consensus
@@ -562,30 +561,25 @@ impl ProvisionCoordinator {
         // remote proposer later commits. Keeping the header lets every
         // distinct batch verify against it, so the pending-block lookup
         // can find whichever hash the proposer committed.
-        if let Some(header) = committed_header {
-            let shard = header.shard_group_id();
-            let height = header.height();
-            self.expected.on_provisions_verified(shard, height);
-        }
+        self.expected
+            .on_provisions_verified(committed_header.shard_group_id(), committed_header.height());
 
-        if !valid {
-            warn!(
-                source_shard = source_shard.inner(),
-                tx_count = provisions.transactions().len(),
-                "Provisions verification failed"
-            );
-            return actions;
-        }
-
-        let Some(header) = committed_header else {
-            warn!(
-                source_shard = source_shard.inner(),
-                "Provisions marked valid but no committed header"
-            );
-            return actions;
+        let verified = match result {
+            Ok(v) => v,
+            Err((raw, err)) => {
+                warn!(
+                    source_shard = raw.source_shard().inner(),
+                    tx_count = raw.transactions().len(),
+                    error = ?err,
+                    "Provisions verification failed"
+                );
+                return actions;
+            }
         };
-        let source_block_ts = header.qc().weighted_timestamp();
+        let provisions = Arc::new((**verified).clone());
+        let source_block_ts = committed_header.qc().weighted_timestamp();
         let provisions_hash = provisions.hash();
+        let source_shard = provisions.source_shard();
 
         // The verify path is async: the action was dispatched at receipt,
         // before the same batch may have been committed in another block.
@@ -1016,9 +1010,10 @@ mod tests {
         );
         coordinator.on_state_provisions_received(&topology, provisions.clone());
         coordinator.on_state_provisions_verified(
-            Arc::new(provisions),
-            Some(&header),
-            true,
+            Ok(Arc::new(Verified::<Provisions>::new_unchecked_for_test(
+                provisions,
+            ))),
+            &header,
             LocalTimestamp::ZERO,
         );
 
@@ -1056,9 +1051,10 @@ mod tests {
 
         // Verify
         let actions = coordinator.on_state_provisions_verified(
-            Arc::new(provisions),
-            Some(&header),
-            true,
+            Ok(Arc::new(Verified::<Provisions>::new_unchecked_for_test(
+                provisions,
+            ))),
+            &header,
             LocalTimestamp::ZERO,
         );
 
@@ -1090,9 +1086,8 @@ mod tests {
 
         // Verification fails — no committed_header returned
         let actions = coordinator.on_state_provisions_verified(
-            Arc::new(provisions),
-            None,
-            false,
+            Err((Arc::new(provisions), ProvisionsVerifyError::BadInclusion)),
+            &header,
             LocalTimestamp::ZERO,
         );
 
@@ -1304,9 +1299,8 @@ mod tests {
 
         // Entire provisions fails verification
         let actions = coordinator.on_state_provisions_verified(
-            Arc::new(provisions),
-            Some(&header),
-            false,
+            Err((Arc::new(provisions), ProvisionsVerifyError::BadInclusion)),
+            &header,
             LocalTimestamp::ZERO,
         );
 
@@ -1479,9 +1473,10 @@ mod tests {
         );
         coordinator.on_state_provisions_received(&topology, provisions.clone());
         coordinator.on_state_provisions_verified(
-            Arc::new(provisions),
-            Some(&header),
-            true,
+            Ok(Arc::new(Verified::<Provisions>::new_unchecked_for_test(
+                provisions,
+            ))),
+            &header,
             LocalTimestamp::ZERO,
         );
 
@@ -1620,9 +1615,10 @@ mod tests {
         );
         coordinator.on_state_provisions_received(&topology, provisions.clone());
         coordinator.on_state_provisions_verified(
-            Arc::new(provisions),
-            Some(&header),
-            true,
+            Ok(Arc::new(Verified::<Provisions>::new_unchecked_for_test(
+                provisions,
+            ))),
+            &header,
             LocalTimestamp::ZERO,
         );
 
@@ -1663,9 +1659,10 @@ mod tests {
         );
         coordinator.on_state_provisions_received(&topology, provisions.clone());
         coordinator.on_state_provisions_verified(
-            Arc::new(provisions),
-            Some(&header),
-            true,
+            Ok(Arc::new(Verified::<Provisions>::new_unchecked_for_test(
+                provisions,
+            ))),
+            &header,
             LocalTimestamp::ZERO,
         );
 
@@ -1765,9 +1762,10 @@ mod tests {
         // First arrival → queued.
         coordinator.on_state_provisions_received(&topology, provisions.clone());
         coordinator.on_state_provisions_verified(
-            Arc::new(provisions.clone()),
-            Some(&header),
-            true,
+            Ok(Arc::new(Verified::<Provisions>::new_unchecked_for_test(
+                provisions.clone(),
+            ))),
+            &header,
             LocalTimestamp::ZERO,
         );
         assert_eq!(coordinator.queue.queue_len(), 1);
@@ -1852,9 +1850,10 @@ mod tests {
         coordinator.on_verified_remote_header(&topology, &header);
         coordinator.on_state_provisions_received(&topology, provisions.clone());
         coordinator.on_state_provisions_verified(
-            Arc::new(provisions.clone()),
-            Some(&header),
-            true,
+            Ok(Arc::new(Verified::<Provisions>::new_unchecked_for_test(
+                provisions.clone(),
+            ))),
+            &header,
             LocalTimestamp::ZERO,
         );
         let committing_block =
@@ -1985,9 +1984,10 @@ mod tests {
         );
         coordinator.on_state_provisions_received(&topology, provisions.clone());
         coordinator.on_state_provisions_verified(
-            Arc::new(provisions),
-            Some(&header),
-            true,
+            Ok(Arc::new(Verified::<Provisions>::new_unchecked_for_test(
+                provisions,
+            ))),
+            &header,
             LocalTimestamp::ZERO,
         );
 
@@ -2061,9 +2061,10 @@ mod tests {
         );
         coordinator.on_state_provisions_received(&topology, provisions.clone());
         coordinator.on_state_provisions_verified(
-            Arc::new(provisions),
-            Some(&header),
-            true,
+            Ok(Arc::new(Verified::<Provisions>::new_unchecked_for_test(
+                provisions,
+            ))),
+            &header,
             LocalTimestamp::ZERO,
         );
         assert_eq!(coordinator.queue.queue_len(), 1);
@@ -2213,7 +2214,13 @@ mod tests {
         coordinator.on_verified_remote_header(topology, &header);
         let provisions = make_provisions(tx_hash, source_shard, ShardGroupId::new(0), height);
         coordinator.on_state_provisions_received(topology, provisions.clone());
-        coordinator.on_state_provisions_verified(Arc::new(provisions), Some(&header), true, now);
+        coordinator.on_state_provisions_verified(
+            Ok(Arc::new(Verified::<Provisions>::new_unchecked_for_test(
+                provisions,
+            ))),
+            &header,
+            now,
+        );
     }
 
     #[test]
@@ -2355,9 +2362,10 @@ mod tests {
                     coordinator.on_verified_remote_header(&topology, &header);
                     coordinator.on_state_provisions_received(&topology, provisions.clone());
                     coordinator.on_state_provisions_verified(
-                        Arc::new(provisions),
-                        Some(&header),
-                        true,
+                        Ok(Arc::new(Verified::<Provisions>::new_unchecked_for_test(
+                            provisions,
+                        ))),
+                        &header,
                         LocalTimestamp::ZERO,
                     );
                 } else {

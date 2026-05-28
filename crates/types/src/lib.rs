@@ -88,7 +88,7 @@ pub use provisioning::limits::{
     MAX_STATE_ENTRY_KEY_LEN, MAX_STATE_ENTRY_VALUE_LEN,
 };
 pub use provisioning::proof::MerkleInclusionProof;
-pub use provisioning::provisions::Provisions;
+pub use provisioning::provisions::{Provisions, ProvisionsContext, ProvisionsVerifyError};
 pub use provisioning::substate::SubstateEntry;
 pub use radix_common::network::NetworkDefinition;
 pub use radix_substate_store_interface::interface::DatabaseUpdates;

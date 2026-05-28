@@ -19,13 +19,11 @@ impl NodeStateMachine {
                 )
             }
             ProtocolEvent::StateProvisionsVerified {
-                provisions,
+                result,
                 committed_header,
-                valid,
             } => self.provisions_coordinator.on_state_provisions_verified(
-                provisions,
-                committed_header.as_ref(),
-                valid,
+                result,
+                &committed_header,
                 self.now,
             ),
             ProtocolEvent::ProvisionsAdmitted { provisions, .. } => {

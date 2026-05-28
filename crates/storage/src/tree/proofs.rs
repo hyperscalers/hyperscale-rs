@@ -1,18 +1,15 @@
-//! Merkle multiproof generation and verification.
+//! Merkle multiproof generation.
 //!
-//! Thin adapter between `hyperscale_jmt`'s `MultiProof` and the
-//! on-wire `MerkleInclusionProof` (opaque bytes wrapper). The wire
-//! format is owned by the JMT crate; this module only wraps it in the
-//! hyperscale type system.
+//! Thin adapter between `hyperscale_jmt`'s `MultiProof` and the on-wire
+//! [`MerkleInclusionProof`] (opaque bytes wrapper). The wire format is
+//! owned by the JMT crate; this module wraps it in the hyperscale type
+//! system. Verification lives on `Verify<&ProvisionsContext<'_>> for
+//! Provisions` in `crates/types/src/provisioning/provisions.rs`.
 
-use hyperscale_jmt::{Blake3Hasher, Key, MultiProof, NodeKey, Tree, TreeReader, ValueHash};
-use hyperscale_types::{BlockHeight, MerkleInclusionProof, StateRoot, SubstateEntry};
+use hyperscale_jmt::{Key, NodeKey, TreeReader};
+use hyperscale_types::{BlockHeight, MerkleInclusionProof};
 
-use super::{Jmt, hash_storage_key, hash_value};
-
-// ============================================================================
-// Proof generation
-// ============================================================================
+use super::{Jmt, hash_storage_key};
 
 /// Generate a batched merkle multiproof for a set of storage keys against
 /// a committed root.
@@ -31,35 +28,4 @@ pub fn generate_proof<S: TreeReader>(
     Jmt::prove(store, &root_key, &jmt_keys)
         .ok()
         .map(|proof| MerkleInclusionProof::new(proof.encode()))
-}
-
-/// Verify a merkle multiproof against a state root.
-///
-/// For each entry, checks that the proof asserts the expected inclusion
-/// (with `hash_value(value)` for `Set`) or non-inclusion (for `None`).
-pub fn verify_proof(
-    proof: &MerkleInclusionProof,
-    entries: &[SubstateEntry],
-    state_root: StateRoot,
-    storage_key_for_entry: impl Fn(&SubstateEntry) -> &[u8],
-) -> bool {
-    if proof.as_bytes().is_empty() {
-        return entries.is_empty();
-    }
-
-    let Ok(multi_proof) = MultiProof::decode(proof.as_bytes()) else {
-        return false;
-    };
-
-    let expected: Vec<(Key, Option<ValueHash>)> = entries
-        .iter()
-        .map(|e| {
-            let key = hash_storage_key(storage_key_for_entry(e));
-            let value_hash = e.value.as_ref().map(|v| hash_value(v));
-            (key, value_hash)
-        })
-        .collect();
-
-    let root_bytes: [u8; 32] = *state_root.as_raw().as_bytes();
-    <Tree<Blake3Hasher, 1>>::verify(&multi_proof, root_bytes, &expected).is_ok()
 }

@@ -581,7 +581,8 @@ impl ExecutionCoordinator {
         // `setup_waves_and_dispatch` can replay them at wave-creation time.
         let mut affected_waves: BTreeSet<WaveId> = BTreeSet::new();
         for provisions in &ordered {
-            for tx_hash in self.provisioning.absorb_provisions(provisions) {
+            let verified = Verified::<Provisions>::from_committed_block((***provisions).clone());
+            for tx_hash in self.provisioning.absorb_provisions(&verified) {
                 if let Some(wave_id) = self.waves.wave_assignment(tx_hash) {
                     affected_waves.insert(wave_id);
                 }

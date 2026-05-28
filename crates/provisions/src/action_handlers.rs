@@ -15,11 +15,11 @@ use hyperscale_core::{Action, ActionContext, ProtocolEvent, ProvisionsRequest};
 use hyperscale_jmt::TreeReader as JmtTreeReader;
 use hyperscale_metrics::record_signature_verification_latency;
 use hyperscale_network::Network;
-use hyperscale_storage::tree::proofs::verify_proof;
 use hyperscale_storage::{ShardStorage, SubstateStore, SubstateView, VersionedStore};
 use hyperscale_types::network::notification::ProvisionsNotification;
 use hyperscale_types::{
-    BlockHeight, Provisions, ShardGroupId, ValidatorId, state_provisions_message,
+    BlockHeight, Provisions, ProvisionsContext, ShardGroupId, ValidatorId, Verify,
+    state_provisions_message,
 };
 use tracing::warn;
 
@@ -80,29 +80,22 @@ where
             committed_header,
         } => {
             let merkle_start = Instant::now();
-            let all_valid = {
-                let all_entries = provisions.all_entries_deduped();
-                if all_entries.is_empty() {
-                    true
-                } else {
-                    let valid = verify_proof(
-                        provisions.proof(),
-                        &all_entries,
-                        committed_header.state_root(),
-                        |e| &e.storage_key,
+            let ctx_verify = ProvisionsContext {
+                committed_header: &committed_header,
+            };
+            let result = match provisions.verify(&ctx_verify) {
+                Ok(verified) => Ok(Arc::new(verified)),
+                Err(err) => {
+                    warn!(
+                        source_shard = provisions.source_shard().inner(),
+                        block_height = provisions.block_height().inner(),
+                        header_height = committed_header.height().inner(),
+                        header_state_root = ?committed_header.state_root(),
+                        proof_len = provisions.proof().as_bytes().len(),
+                        error = ?err,
+                        "Provision merkle proof verification failed"
                     );
-                    if !valid {
-                        warn!(
-                            source_shard = provisions.source_shard().inner(),
-                            block_height = provisions.block_height().inner(),
-                            header_height = committed_header.height().inner(),
-                            header_state_root = ?committed_header.state_root(),
-                            entry_count = all_entries.len(),
-                            proof_len = provisions.proof().as_bytes().len(),
-                            "Provision merkle proof verification failed"
-                        );
-                    }
-                    valid
+                    Err((Arc::new(provisions), err))
                 }
             };
             record_signature_verification_latency(
@@ -110,9 +103,8 @@ where
                 merkle_start.elapsed().as_secs_f64(),
             );
             ctx.notify_protocol(ProtocolEvent::StateProvisionsVerified {
-                provisions: Arc::new(provisions),
-                committed_header: Some(committed_header),
-                valid: all_valid,
+                result,
+                committed_header,
             });
         }
         Action::FetchAndBroadcastProvisions {

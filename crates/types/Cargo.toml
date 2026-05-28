@@ -12,6 +12,9 @@ hex.workspace = true
 ed25519-dalek = { workspace = true, features = ["batch"] }
 rand.workspace = true
 
+# Merkle proof verification (Verify<ProvisionsContext>)
+hyperscale-jmt.workspace = true
+
 # Serialization
 sbor.workspace = true
 

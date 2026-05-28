@@ -1,14 +1,22 @@
 //! Per-block bundle of transaction provisions with a shared merkle proof.
+//!
+//! [`Provisions`] is the raw wire form. Its verified form is
+//! `Verified<Provisions>`; predicate at
+//! [`impl Verify<&ProvisionsContext<'_>>`](Verify::verify) below.
 
 use std::collections::HashSet;
 use std::fmt::{self, Debug, Formatter};
 use std::sync::OnceLock;
 
+use blake3::hash as blake3_hash;
+use hyperscale_jmt::{Blake3Hasher, MultiProof, Tree};
 use sbor::prelude::*;
+use thiserror::Error;
 
 use crate::{
-    BlockHeight, BoundedVec, Hash, MAX_TXS_PER_BLOCK, MerkleInclusionProof, NodeId, ProvisionEntry,
-    ProvisionHash, RETENTION_HORIZON, ShardGroupId, SubstateEntry, TxHash, WeightedTimestamp,
+    BlockHeight, BoundedVec, CommittedBlockHeader, Hash, MAX_TXS_PER_BLOCK, MerkleInclusionProof,
+    NodeId, ProvisionEntry, ProvisionHash, RETENTION_HORIZON, ShardGroupId, SubstateEntry, TxHash,
+    Verified, Verify, WeightedTimestamp,
 };
 
 /// All provisions from a single source block, scoped to a single target shard.
@@ -233,6 +241,111 @@ impl Provisions {
     }
 }
 
+/// Inputs the [`Provisions`] verifier reads against.
+#[derive(Debug, Clone, Copy)]
+pub struct ProvisionsContext<'a> {
+    /// The committed source-block header whose `state_root` the merkle
+    /// proof must validate against. Carrying the verified marker means
+    /// the QC over the source header has already cleared.
+    pub committed_header: &'a Verified<CommittedBlockHeader>,
+}
+
+/// Failure modes of [`Provisions`] verification.
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum ProvisionsVerifyError {
+    /// `proof` bytes are non-empty but did not decode as a JMT
+    /// [`MultiProof`].
+    #[error("merkle proof bytes failed to decode")]
+    MalformedProof,
+    /// `proof` bytes are empty but the bundle carries entries.
+    #[error("empty merkle proof with non-empty entry set")]
+    EmptyProofWithEntries,
+    /// The decoded multiproof did not validate against
+    /// `ctx.committed_header.state_root()` for the bundle's claimed
+    /// entries.
+    #[error("merkle inclusion verification failed against committed state root")]
+    BadInclusion,
+}
+
+/// Construction asserts: the aggregated merkle multiproof in
+/// `provisions.proof()` validates every entry under
+/// `ctx.committed_header.state_root()`.
+///
+/// Construction goes through one of three gates:
+///
+/// - [`<Provisions as Verify>::verify`](Verify::verify) — runs the JMT
+///   multiproof check against the committed state root. The
+///   wire-admission path.
+/// - [`Verified::<Provisions>::from_local`] — wraps a locally-built
+///   bundle whose proof was generated from this validator's own JMT
+///   view.
+/// - [`Verified::<Provisions>::from_committed_block`] — wraps a bundle
+///   reaching execution via a [`Verified<CertifiedBlock>`], where the
+///   source committee's QC BFT-transitively attests the inclusion claim.
+///
+/// [`Verified<CertifiedBlock>`]: crate::CertifiedBlock
+impl Verify<&ProvisionsContext<'_>> for Provisions {
+    type Error = ProvisionsVerifyError;
+
+    fn verify(&self, ctx: &ProvisionsContext<'_>) -> Result<Verified<Self>, Self::Error> {
+        let entries = self.all_entries_deduped();
+        let proof_bytes = self.proof.as_bytes();
+
+        if proof_bytes.is_empty() {
+            if entries.is_empty() {
+                return Ok(Verified::new_unchecked(self.clone()));
+            }
+            return Err(ProvisionsVerifyError::EmptyProofWithEntries);
+        }
+
+        let multi_proof =
+            MultiProof::decode(proof_bytes).map_err(|_| ProvisionsVerifyError::MalformedProof)?;
+
+        let expected: Vec<([u8; 32], Option<[u8; 32]>)> = entries
+            .iter()
+            .map(|e| {
+                let key: [u8; 32] = *blake3_hash(&e.storage_key).as_bytes();
+                let value_hash = e.value.as_ref().map(|v| *blake3_hash(v).as_bytes());
+                (key, value_hash)
+            })
+            .collect();
+
+        let root_bytes: [u8; 32] = *ctx.committed_header.state_root().as_raw().as_bytes();
+        <Tree<Blake3Hasher, 1>>::verify(&multi_proof, root_bytes, &expected)
+            .map_err(|_| ProvisionsVerifyError::BadInclusion)?;
+
+        Ok(Verified::new_unchecked(self.clone()))
+    }
+}
+
+impl Verified<Provisions> {
+    /// Wrap a locally-built provisions whose proof was generated
+    /// against this validator's own JMT view of a committed state.
+    ///
+    /// Trust source: assembled by the `FetchAndBroadcastProvisions`
+    /// action handler from the local substate view at a committed
+    /// source-block height; the inclusion claim holds by construction
+    /// of the proof bytes.
+    #[must_use]
+    pub const fn from_local(provisions: Provisions) -> Self {
+        Self::new_unchecked(provisions)
+    }
+
+    /// Wrap a provisions reaching execution via a committed block.
+    ///
+    /// Trust source: the bundle arrived inside a
+    /// [`Verified<CertifiedBlock>`]; 2f+1 source-shard validators ran
+    /// the merkle predicate at receipt before signing the block, so
+    /// the inclusion claim is BFT-transitively attested by the
+    /// source committee's QC.
+    ///
+    /// [`Verified<CertifiedBlock>`]: crate::CertifiedBlock
+    #[must_use]
+    pub const fn from_committed_block(provisions: Provisions) -> Self {
+        Self::new_unchecked(provisions)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use sbor::{Categorize as _, DecodeError, Encoder as _, NoCustomValueKind, ValueKind};
@@ -348,6 +461,164 @@ mod tests {
         let bytes = basic_encode(&proof).unwrap();
         let decoded: MerkleInclusionProof = basic_decode(&bytes).unwrap();
         assert_eq!(proof, decoded);
+    }
+
+    mod verify {
+        use std::collections::BTreeMap;
+
+        use blake3::hash as blake3_hash;
+        use hyperscale_jmt::{Blake3Hasher, MemoryStore, NodeKey, Tree};
+
+        use super::*;
+        use crate::{
+            BlockHeader, BlockHeight, Hash, QuorumCertificate, ShardGroupId, StateRoot,
+            ValidatorId, Verifiable,
+        };
+
+        type Jmt = Tree<Blake3Hasher, 1>;
+
+        fn entry(seed: u8) -> (Vec<u8>, Vec<u8>) {
+            let mut storage_key = Vec::with_capacity(20 + 30 + 1 + 1);
+            storage_key.extend_from_slice(&[0u8; 20]);
+            storage_key.extend_from_slice(&[seed; 30]);
+            storage_key.push(0);
+            storage_key.push(seed);
+            (storage_key, vec![seed, seed.wrapping_add(1)])
+        }
+
+        fn build_jmt(entries: &[(Vec<u8>, Vec<u8>)]) -> (StateRoot, MerkleInclusionProof) {
+            let mut store = MemoryStore::new();
+            let updates: BTreeMap<[u8; 32], Option<[u8; 32]>> = entries
+                .iter()
+                .map(|(k, v)| {
+                    let key: [u8; 32] = *blake3_hash(k).as_bytes();
+                    let val: [u8; 32] = *blake3_hash(v).as_bytes();
+                    (key, Some(val))
+                })
+                .collect();
+            let result = Jmt::apply_updates(&store, None, 1, &updates).unwrap();
+            let root_hash = result.root_hash;
+            store.apply(&result);
+            let root_key = NodeKey::root(1);
+            let jmt_keys: Vec<[u8; 32]> = entries
+                .iter()
+                .map(|(k, _)| *blake3_hash(k).as_bytes())
+                .collect();
+            let proof = Jmt::prove(&store, &root_key, &jmt_keys).unwrap();
+            let state_root = StateRoot::from_raw(Hash::from_hash_bytes(&root_hash));
+            (state_root, MerkleInclusionProof::new(proof.encode()))
+        }
+
+        fn header_with_state_root(state_root: StateRoot) -> Verified<CommittedBlockHeader> {
+            let shard = ShardGroupId::new(0);
+            let header = BlockHeader::genesis(shard, ValidatorId::new(0), state_root);
+            Verified::<CommittedBlockHeader>::new_unchecked_for_test(CommittedBlockHeader::new(
+                header,
+                Verifiable::Verified(Verified::<QuorumCertificate>::genesis(shard)),
+            ))
+        }
+
+        fn provisions_with(
+            proof: MerkleInclusionProof,
+            items: Vec<(Vec<u8>, Vec<u8>)>,
+        ) -> Provisions {
+            let tx_entries = items
+                .into_iter()
+                .enumerate()
+                .map(|(i, (storage_key, value))| {
+                    let tx_hash =
+                        TxHash::from_raw(Hash::from_bytes(&[u8::try_from(i).unwrap(); 4]));
+                    ProvisionEntry::new(
+                        tx_hash,
+                        vec![SubstateEntry::new(storage_key, Some(value))],
+                        vec![],
+                        vec![],
+                    )
+                })
+                .collect();
+            Provisions::new(
+                ShardGroupId::new(1),
+                ShardGroupId::new(0),
+                BlockHeight::new(1),
+                proof,
+                tx_entries,
+            )
+        }
+
+        #[test]
+        fn verify_accepts_provisions_with_valid_inclusion_proof() {
+            let items = vec![entry(1), entry(2), entry(3)];
+            let (state_root, proof) = build_jmt(&items);
+            let verified_header = header_with_state_root(state_root);
+            let provisions = provisions_with(proof, items);
+            let ctx = ProvisionsContext {
+                committed_header: &verified_header,
+            };
+            provisions
+                .verify(&ctx)
+                .expect("honest provisions must verify");
+        }
+
+        #[test]
+        fn verify_rejects_tampered_proof_bytes() {
+            let items = vec![entry(1), entry(2)];
+            let (state_root, proof) = build_jmt(&items);
+            let verified_header = header_with_state_root(state_root);
+
+            let mut bytes = proof.as_bytes().to_vec();
+            assert!(bytes.len() > 4);
+            let last = bytes.len() - 1;
+            bytes[last] ^= 0xFF;
+            let tampered = MerkleInclusionProof::new(bytes);
+            let provisions = provisions_with(tampered, items);
+
+            let ctx = ProvisionsContext {
+                committed_header: &verified_header,
+            };
+            let err = provisions
+                .verify(&ctx)
+                .expect_err("tampered proof must fail verify");
+            assert!(
+                matches!(
+                    err,
+                    ProvisionsVerifyError::BadInclusion | ProvisionsVerifyError::MalformedProof,
+                ),
+                "got {err:?}",
+            );
+        }
+
+        #[test]
+        fn verify_accepts_empty_proof_with_empty_entries() {
+            let state_root = StateRoot::ZERO;
+            let verified_header = header_with_state_root(state_root);
+            let provisions = Provisions::new(
+                ShardGroupId::new(1),
+                ShardGroupId::new(0),
+                BlockHeight::new(1),
+                MerkleInclusionProof::new(vec![]),
+                vec![],
+            );
+            let ctx = ProvisionsContext {
+                committed_header: &verified_header,
+            };
+            provisions
+                .verify(&ctx)
+                .expect("empty proof + empty entries is vacuously valid");
+        }
+
+        #[test]
+        fn verify_rejects_empty_proof_with_non_empty_entries() {
+            let state_root = StateRoot::ZERO;
+            let verified_header = header_with_state_root(state_root);
+            let provisions = provisions_with(MerkleInclusionProof::new(vec![]), vec![entry(1)]);
+            let ctx = ProvisionsContext {
+                committed_header: &verified_header,
+            };
+            assert_eq!(
+                provisions.verify(&ctx),
+                Err(ProvisionsVerifyError::EmptyProofWithEntries)
+            );
+        }
     }
 
     #[test]
