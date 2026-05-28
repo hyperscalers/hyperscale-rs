@@ -72,7 +72,7 @@ enum Plan {
 fn batch_compute_cached(
     par: Parallelism,
     cache: &ProcessExecutionCache,
-    txs: &[Arc<RoutableTransaction>],
+    txs: &[Arc<Verified<RoutableTransaction>>],
     num_shards: u64,
     compute: impl Fn(usize) -> CachedVmOutput + Send + Sync,
 ) -> Vec<Arc<CachedVmOutput>> {
@@ -232,7 +232,7 @@ where
             let num_shards = ctx.topology_snapshot.num_shards();
             let view = ctx.pending_chain.view_at(block_hash, block_height);
             let view_snap = <SubstateView<_> as SubstateStore>::snapshot(&*view);
-            let txs: Vec<Arc<RoutableTransaction>> = requests
+            let txs: Vec<Arc<Verified<RoutableTransaction>>> = requests
                 .iter()
                 .map(|r| Arc::clone(&r.transaction))
                 .collect();
