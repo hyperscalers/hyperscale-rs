@@ -45,8 +45,8 @@ use hyperscale_types::{
     Attempt, Block, BlockHash, BlockHeader, BlockHeight, BloomFilter, CertifiedBlock,
     ExecutionCertificate, ExecutionVote, FinalizedWave, GlobalReceiptRoot, Hash, Provisions,
     RoutableTransaction, ShardGroupId, StoredReceipt, TopologySnapshot, TxHash, TxOutcome,
-    ValidatorId, VotePower, WAVE_TIMEOUT, WaveCertificate, WaveId, WeightedTimestamp, wave_leader,
-    wave_leader_at,
+    ValidatorId, Verifiable, Verified, VotePower, WAVE_TIMEOUT, WaveCertificate, WaveId,
+    WeightedTimestamp, wave_leader, wave_leader_at,
 };
 use tracing::instrument;
 
@@ -298,12 +298,12 @@ impl ExecutionCoordinator {
         block_height: BlockHeight,
         block_ts: WeightedTimestamp,
         transactions: &[Arc<RoutableTransaction>],
-    ) -> (Vec<Action>, Vec<ExecutionVote>) {
+    ) -> (Vec<Action>, Vec<Verifiable<ExecutionVote>>) {
         let waves = assign_waves(topology, block_height, transactions);
         let quorum = topology.local_quorum_threshold();
         let local_shard = topology.local_shard();
         let mut dispatch_actions: Vec<Action> = Vec::new();
-        let mut votes_to_replay: Vec<ExecutionVote> = Vec::new();
+        let mut votes_to_replay: Vec<Verifiable<ExecutionVote>> = Vec::new();
 
         for (wave_id, txs) in waves {
             let tx_hashes: Vec<TxHash> = txs.iter().map(|(tx, _)| tx.hash()).collect();
@@ -659,7 +659,7 @@ impl ExecutionCoordinator {
     pub fn on_execution_vote(
         &mut self,
         topology: &TopologySnapshot,
-        vote: ExecutionVote,
+        vote: Verifiable<ExecutionVote>,
     ) -> Vec<Action> {
         let wave_id = vote.wave_id().clone();
         let validator_id = vote.validator();
@@ -724,10 +724,13 @@ impl ExecutionCoordinator {
             }
         }
 
-        // Skip verification for our own vote
-        if validator_id == topology.local_validator_id() {
-            return self.handle_verified_vote(topology, vote);
+        // Already-verified votes (own votes from the sign-and-send gate, or
+        // future cached-verified inputs) skip the buffer + batch-verify
+        // round trip and land directly in the verified tally.
+        if let Verifiable::Verified(verified) = vote {
+            return self.handle_verified_vote(topology, verified);
         }
+        let vote = vote.into_unverified();
 
         // Committee membership was confirmed above; the topology snapshot
         // invariant guarantees both the public key and the voting power
@@ -787,7 +790,7 @@ impl ExecutionCoordinator {
     fn handle_verified_vote(
         &mut self,
         topology: &TopologySnapshot,
-        vote: ExecutionVote,
+        vote: Verified<ExecutionVote>,
     ) -> Vec<Action> {
         let wave_id = vote.wave_id().clone();
         // Callers (`on_execution_vote` for own votes, `on_votes_verified`
@@ -814,7 +817,7 @@ impl ExecutionCoordinator {
         topology: &TopologySnapshot,
         wave_id: WaveId,
         block_hash: BlockHash,
-        verified_votes: Vec<(ExecutionVote, VotePower)>,
+        verified_votes: Vec<(Verified<ExecutionVote>, VotePower)>,
     ) -> Vec<Action> {
         let Some(tracker) = self.waves.get_tracker_mut(&wave_id) else {
             return vec![];
@@ -2123,7 +2126,7 @@ mod tests {
             zero_bls_signature(),
         );
 
-        state_non.on_execution_vote(&topo_non, fake_vote);
+        state_non.on_execution_vote(&topo_non, Verifiable::Unverified(fake_vote));
 
         // Should have created a fallback VoteTracker.
         assert!(
@@ -2161,7 +2164,7 @@ mod tests {
             zero_bls_signature(),
         );
 
-        let actions = state.on_execution_vote(&topo, vote);
+        let actions = state.on_execution_vote(&topo, Verifiable::Unverified(vote));
         assert!(actions.is_empty(), "non-committee vote must be dropped");
         assert!(
             !state.waves.contains_tracker(&wave_id),

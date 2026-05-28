@@ -388,10 +388,17 @@ pub enum ProtocolEvent {
         tx_outcomes: Vec<TxOutcome>,
     },
 
-    /// Received an execution vote from another validator.
+    /// Received an execution vote from any source.
+    ///
+    /// `Verifiable::Verified` for own votes the local sign-and-send
+    /// handler produced through the [`Verified::<ExecutionVote>::sign_local`]
+    /// gate; `Verifiable::Unverified` for peer-arrived votes the wire
+    /// handler hands off after sender-batch authentication. The
+    /// coordinator branches on the marker to skip per-vote
+    /// re-verification of own votes.
     ExecutionVoteReceived {
-        /// Execution vote received from a peer.
-        vote: ExecutionVote,
+        /// Execution vote, carrying its verification status.
+        vote: Verifiable<ExecutionVote>,
     },
 
     /// Batch execution vote verification completed.
@@ -401,7 +408,7 @@ pub enum ProtocolEvent {
         /// Source block hash for correlation.
         block_hash: BlockHash,
         /// Verified votes paired with their voting power.
-        verified_votes: Vec<(ExecutionVote, VotePower)>,
+        verified_votes: Vec<(Verified<ExecutionVote>, VotePower)>,
     },
 
     /// Execution certificate aggregation completed.

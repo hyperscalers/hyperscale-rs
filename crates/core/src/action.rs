@@ -272,9 +272,10 @@ pub enum Action {
         wave_id: WaveId,
         /// Global receipt root (merkle root over per-tx outcome leaves).
         global_receipt_root: GlobalReceiptRoot,
-        /// Votes to aggregate (with quorum). The first vote's `tx_outcomes`
-        /// is used for the EC payload (all quorum votes have identical outcomes).
-        votes: Vec<ExecutionVote>,
+        /// Verified votes to aggregate (with quorum). The first vote's
+        /// `tx_outcomes` is used for the EC payload (all quorum votes have
+        /// identical outcomes).
+        votes: Vec<Verified<ExecutionVote>>,
         /// Ordered committee for the shard (for `SignerBitfield` index mapping).
         committee: Vec<ValidatorId>,
     },
