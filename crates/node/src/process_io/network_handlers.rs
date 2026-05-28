@@ -293,8 +293,12 @@ where
                         let mut entries = Vec::with_capacity(req.batch_hashes.len());
                         for h in &req.batch_hashes {
                             if let Some(provisions) = provision_store.get(*h) {
+                                // The buffer holds Verified handles; the wire
+                                // form takes raw `Arc<CommittedBlockHeader>`,
+                                // so materialize the inner header for ship.
                                 let source_header = verified_headers
-                                    .get((provisions.source_shard(), provisions.block_height()));
+                                    .get((provisions.source_shard(), provisions.block_height()))
+                                    .map(|v| Arc::new(v.as_ref().clone().into_inner()));
                                 entries.push(LocalProvisionEntry {
                                     provisions,
                                     source_header,

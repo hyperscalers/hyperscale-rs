@@ -51,7 +51,8 @@ mod tests {
     use hyperscale_test_helpers::make_live_block;
     use hyperscale_types::{
         BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight,
-        CommittedBlockHeader, LocalTimestamp, QuorumCertificate, ShardGroupId, ValidatorId, WaveId,
+        CommittedBlockHeader, LocalTimestamp, QuorumCertificate, ShardGroupId, ValidatorId,
+        Verified, WaveId,
     };
 
     use super::super::test_support::TestNode;
@@ -103,10 +104,11 @@ mod tests {
                 BeaconWitnessLeafCount::ZERO,
             );
         }
-        let committed_header = Arc::new(CommittedBlockHeader::new(
-            block.header().clone(),
-            QuorumCertificate::genesis(ShardGroupId::new(0)),
-        ));
+        let committed_header =
+            Arc::new(Verified::new_unchecked_for_test(CommittedBlockHeader::new(
+                block.header().clone(),
+                QuorumCertificate::genesis(ShardGroupId::new(0)),
+            )));
         let _ = node.handle(
             LocalTimestamp::ZERO,
             ProtocolEvent::RemoteHeaderAdmitted { committed_header },

@@ -188,15 +188,16 @@ pub enum ProtocolEvent {
         shard: ShardGroupId,
         /// Remote block height (for correlation).
         height: BlockHeight,
-        /// The committed header whose QC was verified (the QC field
-        /// inside remains structurally `Verifiable::Unverified` because
-        /// `Arc<CommittedBlockHeader>` can't be upgraded in place; the
-        /// authoritative verified handle rides in `result`).
-        committed_header: Arc<CommittedBlockHeader>,
-        /// Verified QC on success; the reason verification failed
-        /// otherwise (QC-level signature/quorum failure or QC↔header
-        /// linkage mismatch).
-        result: Result<Verified<QuorumCertificate>, CommittedHeaderVerifyError>,
+        /// Sender of the candidate header — needed by the coordinator to
+        /// remove the failed candidate from its pending map on error.
+        sender: ValidatorId,
+        /// Verified composite on success (full predicate: QC verified +
+        /// linkage check, BFT-transitive header trust via the source
+        /// committee — see
+        /// [`Verified::<CommittedBlockHeader>::from_qc_attestation`]).
+        /// QC-level signature/quorum failure or QC↔header linkage
+        /// mismatch on error.
+        result: Box<Result<Verified<CommittedBlockHeader>, CommittedHeaderVerifyError>>,
     },
 
     /// A remote committed block header has been fully verified (QC + structural checks).
@@ -205,8 +206,9 @@ pub enum ProtocolEvent {
     /// Downstream consumers (shard consensus, Provision, Execution) use this as their single
     /// source of verified remote headers.
     RemoteHeaderAdmitted {
-        /// The fully-verified committed header.
-        committed_header: Arc<CommittedBlockHeader>,
+        /// The fully-verified committed header — predicate established by
+        /// [`Verified::<CommittedBlockHeader>::from_qc_attestation`].
+        committed_header: Arc<Verified<CommittedBlockHeader>>,
     },
 
     /// Transaction-root verification completed for a pending block.
@@ -324,7 +326,7 @@ pub enum ProtocolEvent {
         provisions: Arc<Provisions>,
         /// The committed header whose QC passed verification.
         /// `None` if no candidate header passed QC verification.
-        committed_header: Option<Arc<CommittedBlockHeader>>,
+        committed_header: Option<Arc<Verified<CommittedBlockHeader>>>,
         /// Whether the batch passed verification.
         valid: bool,
     },

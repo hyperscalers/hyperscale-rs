@@ -15,14 +15,14 @@ use hyperscale_types::network::notification::{BlockHeaderNotification, BlockVote
 use hyperscale_types::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, BeaconWitnessRootContext, Block, BlockHash,
     BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PublicKey, CertificateRoot,
-    CertificateRootContext, CommittedHeaderVerifyError, ConsensusReceipt, FinalizedWave, Hash,
-    InFlightCount, LocalReceiptRoot, LocalReceiptRootContext, NetworkDefinition, PreparedCommit,
-    ProposerTimestamp, ProvisionHash, ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions,
-    ProvisionsRoot, ProvisionsRootContext, QcContext, QuorumCertificate, ReadySignal, Round,
-    RoutableTransaction, ShardGroupId, StateRoot, StateRootContext, StoredReceipt,
-    TopologySnapshot, TransactionRoot, TransactionRootContext, ValidatorId, Verifiable, Verified,
-    Verify, VotePower, WeightedTimestamp, block_header_message, block_vote_message,
-    committed_block_header_message, compute_waves,
+    CertificateRootContext, CommittedBlockHeader, CommittedHeaderVerifyError, ConsensusReceipt,
+    FinalizedWave, Hash, InFlightCount, LocalReceiptRoot, LocalReceiptRootContext,
+    NetworkDefinition, PreparedCommit, ProposerTimestamp, ProvisionHash, ProvisionTxRootsContext,
+    ProvisionTxRootsMap, Provisions, ProvisionsRoot, ProvisionsRootContext, QcContext,
+    QuorumCertificate, ReadySignal, Round, RoutableTransaction, ShardGroupId, StateRoot,
+    StateRootContext, StoredReceipt, TopologySnapshot, TransactionRoot, TransactionRootContext,
+    ValidatorId, Verifiable, Verified, Verify, VotePower, WeightedTimestamp, block_header_message,
+    block_vote_message, committed_block_header_message, compute_waves,
 };
 
 /// Result of QC verification and assembly.
@@ -369,6 +369,7 @@ where
 
         Action::VerifyRemoteHeaderQc {
             committed_header,
+            sender,
             committee_public_keys,
             committee_voting_power,
             quorum_threshold,
@@ -382,18 +383,22 @@ where
                 voting_powers: &committee_voting_power,
                 quorum_threshold,
             };
-            let linkage_ok = committed_header.qc().block_hash() == committed_header.header().hash();
-            let result = committed_header
-                .qc()
-                .verify(&qc_ctx)
-                .map_err(CommittedHeaderVerifyError::from)
-                .and_then(|verified| {
-                    if linkage_ok {
-                        Ok(verified)
-                    } else {
-                        Err(CommittedHeaderVerifyError::LinkageMismatch)
-                    }
-                });
+            // SAFETY for `from_qc_attestation`: the verified QC's source
+            // committee accepted the header (and its `parent_qc`) before
+            // voting; this node skips local per-root verification because
+            // the QC's BFT majority attests on its behalf.
+            let result = Box::new(
+                committed_header
+                    .qc()
+                    .verify(&qc_ctx)
+                    .map_err(CommittedHeaderVerifyError::from)
+                    .and_then(|verified_qc| {
+                        Verified::<CommittedBlockHeader>::from_qc_attestation(
+                            committed_header.header().clone(),
+                            verified_qc,
+                        )
+                    }),
+            );
             record_signature_verification_latency(
                 "remote_header_qc",
                 start.elapsed().as_secs_f64(),
@@ -401,7 +406,7 @@ where
             ctx.notify_protocol(ProtocolEvent::RemoteHeaderQcVerified {
                 shard,
                 height,
-                committed_header,
+                sender,
                 result,
             });
         }

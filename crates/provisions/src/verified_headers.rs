@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 #[cfg(test)]
 use hyperscale_types::{BeaconWitnessLeafCount, BeaconWitnessRoot};
-use hyperscale_types::{BlockHeight, CommittedBlockHeader, ShardGroupId};
+use hyperscale_types::{BlockHeight, CommittedBlockHeader, ShardGroupId, Verified};
 use papaya::HashMap;
 
 type Key = (ShardGroupId, BlockHeight);
@@ -34,7 +34,7 @@ type Key = (ShardGroupId, BlockHeight);
 /// inbound request handlers (readers).
 #[derive(Debug, Default)]
 pub struct VerifiedHeaderBuffer {
-    headers: HashMap<Key, Arc<CommittedBlockHeader>>,
+    headers: HashMap<Key, Arc<Verified<CommittedBlockHeader>>>,
 }
 
 impl VerifiedHeaderBuffer {
@@ -47,18 +47,18 @@ impl VerifiedHeaderBuffer {
     }
 
     /// Insert a verified header. Overwrites any previous entry for the same key.
-    pub fn insert(&self, key: Key, header: Arc<CommittedBlockHeader>) {
+    pub fn insert(&self, key: Key, header: Arc<Verified<CommittedBlockHeader>>) {
         self.headers.pin().insert(key, header);
     }
 
     /// Look up a verified header by key.
     #[must_use]
-    pub fn get(&self, key: Key) -> Option<Arc<CommittedBlockHeader>> {
+    pub fn get(&self, key: Key) -> Option<Arc<Verified<CommittedBlockHeader>>> {
         self.headers.pin().get(&key).cloned()
     }
 
     /// Remove and return a verified header.
-    pub fn remove(&self, key: Key) -> Option<Arc<CommittedBlockHeader>> {
+    pub fn remove(&self, key: Key) -> Option<Arc<Verified<CommittedBlockHeader>>> {
         self.headers.pin().remove(&key).cloned()
     }
 
@@ -85,7 +85,10 @@ mod tests {
 
     use super::*;
 
-    fn make_header(shard: ShardGroupId, height: BlockHeight) -> Arc<CommittedBlockHeader> {
+    fn make_header(
+        shard: ShardGroupId,
+        height: BlockHeight,
+    ) -> Arc<Verified<CommittedBlockHeader>> {
         let header = BlockHeader::new(
             shard,
             height,
@@ -117,7 +120,9 @@ mod tests {
             zero_bls_signature(),
             WeightedTimestamp::ZERO,
         );
-        Arc::new(CommittedBlockHeader::new(header, qc))
+        Arc::new(Verified::new_unchecked_for_test(CommittedBlockHeader::new(
+            header, qc,
+        )))
     }
 
     #[test]

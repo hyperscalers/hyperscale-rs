@@ -259,7 +259,7 @@ pub enum Action {
         /// The provisions to verify (all from the same source block).
         provisions: Provisions,
         /// The QC-verified committed block header from `RemoteHeaderCoordinator`.
-        committed_header: Arc<CommittedBlockHeader>,
+        committed_header: Arc<Verified<CommittedBlockHeader>>,
     },
 
     /// Aggregate execution votes into an `ExecutionCertificate` (quorum reached).
@@ -353,6 +353,10 @@ pub enum Action {
     VerifyRemoteHeaderQc {
         /// The remote header to verify.
         committed_header: Arc<CommittedBlockHeader>,
+        /// Sender of the candidate header; threaded back through the
+        /// callback so the coordinator can remove the failed candidate
+        /// from its pending map on error.
+        sender: ValidatorId,
         /// Public keys for the remote shard's committee (from topology).
         committee_public_keys: Vec<Bls12381G1PublicKey>,
         /// Voting power for each committee member (parallel to `committee_public_keys`).
@@ -656,7 +660,7 @@ pub enum Action {
         /// Block + certifying QC. On the sync path the
         /// [`Verified<CertifiedBlock>`] predicate is established by
         /// BFT-transitive trust in the source committee's QC (see
-        /// [`Verified::<CertifiedBlock>::from_external_qc`]) rather
+        /// [`Verified::<CertifiedBlock>::from_qc_attestation`]) rather
         /// than by local per-root verification.
         certified: Arc<Verified<CertifiedBlock>>,
         /// Parent block's state root — base state for JMT computation.

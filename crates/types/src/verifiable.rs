@@ -109,7 +109,7 @@ impl<T, A> Verified<T, A> {
     /// via an out-of-band trust source.
     ///
     /// Production callers reach this through the named typed gates
-    /// (`genesis`, `from_persisted`, `assemble`, `from_external_qc`,
+    /// (`genesis`, `from_persisted`, `assemble`, `from_qc_attestation`,
     /// `from_pipeline_attestation`, …) defined inside `crates/types`,
     /// each delegating here under a documented trust source. The only
     /// outside-`crates/types` access is via

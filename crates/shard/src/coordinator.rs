@@ -2030,7 +2030,7 @@ impl ShardCoordinator {
     /// Populate `verified_certified_blocks[block_hash]` so the 2-chain
     /// commit can thread a typed handle. Tries the local-assembly path
     /// first via [`VerificationPipeline::record_qc_assembly`]; falls
-    /// back to [`Verified::<CertifiedBlock>::from_external_qc`] when
+    /// back to [`Verified::<CertifiedBlock>::from_qc_attestation`] when
     /// the local per-root state isn't complete (typical for an
     /// aggregator that collected 2f+1 votes without voting itself, so
     /// never ran the per-root verifiers locally — the QC's BFT
@@ -2055,7 +2055,7 @@ impl ShardCoordinator {
         // verifiers at the source committee.
         let block = Arc::unwrap_or_clone(block);
         let certified_raw = CertifiedBlock::new_unchecked(block, qc.clone());
-        match Verified::<CertifiedBlock>::from_external_qc(certified_raw, qc) {
+        match Verified::<CertifiedBlock>::from_qc_attestation(certified_raw, qc) {
             Ok(certified) => {
                 self.verification
                     .insert_verified_certified_block(block_hash, Arc::new(certified));
@@ -2418,7 +2418,7 @@ impl ShardCoordinator {
         // The committable block's `Verified<CertifiedBlock>` was produced
         // by the verification pipeline when its per-root verifications
         // completed (consensus path) or by sync's
-        // `from_external_qc` constructor (sync path); look it up
+        // `from_qc_attestation` constructor (sync path); look it up
         // rather than reassembling. If the handle isn't present yet
         // (per-root verifications haven't all completed for the
         // committable block), defer — the next commit-driving trigger
@@ -2839,7 +2839,7 @@ impl ShardCoordinator {
         // attests to the block's per-root verifications.
         let certified_raw = CertifiedBlock::new_unchecked(block, verified_qc.clone());
         let certified =
-            match Verified::<CertifiedBlock>::from_external_qc(certified_raw, verified_qc) {
+            match Verified::<CertifiedBlock>::from_qc_attestation(certified_raw, verified_qc) {
                 Ok(c) => Arc::new(c),
                 Err(e) => {
                     warn!(?block_hash, ?e, "synced block QC linkage failed");

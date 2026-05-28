@@ -14,7 +14,7 @@ use hyperscale_types::{
     BoundedVec, CertificateRoot, CertifiedBlock, CommittedBlockHeader, Hash, InFlightCount,
     LocalReceiptRoot, LocalTimestamp, ProposerTimestamp, ProvisionHash, ProvisionsRoot,
     QuorumCertificate, Round, ShardGroupId, SignerBitfield, StateRoot, TopologySnapshot,
-    TransactionRoot, ValidatorId, WaveId, WeightedTimestamp, zero_bls_signature,
+    TransactionRoot, ValidatorId, Verified, WaveId, WeightedTimestamp, zero_bls_signature,
 };
 
 const TEST_BLOCK_INTERVAL_MS: u64 = 500;
@@ -78,7 +78,7 @@ fn make_remote_header_targeting(
     source_shard: ShardGroupId,
     height: BlockHeight,
     local_shard: ShardGroupId,
-) -> Arc<CommittedBlockHeader> {
+) -> Arc<Verified<CommittedBlockHeader>> {
     let waves = vec![WaveId::new(
         source_shard,
         height,
@@ -115,7 +115,9 @@ fn make_remote_header_targeting(
         zero_bls_signature(),
         WeightedTimestamp::ZERO,
     );
-    Arc::new(CommittedBlockHeader::new(header, qc))
+    Arc::new(Verified::new_unchecked_for_test(CommittedBlockHeader::new(
+        header, qc,
+    )))
 }
 
 #[test]

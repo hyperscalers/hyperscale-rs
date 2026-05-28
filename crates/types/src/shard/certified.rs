@@ -266,7 +266,7 @@ impl Verified<CertifiedBlock> {
     ///    (`Verified<QuorumCertificate>`).
     /// 3. `qc.block_hash == block.hash()` (structural pairing).
     ///
-    /// See [`Self::from_external_qc`] for the alternate construction
+    /// See [`Self::from_qc_attestation`] for the alternate construction
     /// gate when per-root verification was performed by an external
     /// committee whose QC certifies the block.
     ///
@@ -329,7 +329,7 @@ impl Verified<CertifiedBlock> {
     /// QC, but this constructor *replaces* that embedded QC with the
     /// supplied verified one, so the linkage must be re-checked
     /// against the new QC.
-    pub fn from_external_qc(
+    pub fn from_qc_attestation(
         certified: CertifiedBlock,
         qc: Verified<QuorumCertificate>,
     ) -> Result<Self, LinkageError> {
@@ -371,7 +371,7 @@ impl Verified<CertifiedBlock> {
     /// `Verified<CertifiedBlock>` predicate asserts at least 2f+1 of the
     /// source committee signed that bundle, so at least one honest
     /// signer verified `parent_qc` before voting. Same trust shape as
-    /// [`Self::from_external_qc`] but applied to the embedded parent
+    /// [`Self::from_qc_attestation`] but applied to the embedded parent
     /// rather than the block-level QC.
     ///
     /// Returns the wrapped `parent_qc` regardless of whether it's
@@ -403,7 +403,7 @@ impl Verified<CertifiedBlock> {
         // SAFETY: the `Verified<CertifiedBlock>` predicate carries the
         // block's per-root claim either locally (via [`Self::assemble`])
         // or by BFT-transitive attestation (via
-        // [`Self::from_external_qc`]). Either way the contained block
+        // [`Self::from_qc_attestation`]). Either way the contained block
         // satisfies the `Verified<Block>` contract for downstream
         // consumers.
         let block = Verified::<Block>::new_unchecked(block);
@@ -449,11 +449,11 @@ mod tests {
         assert_eq!(bytes_unverified, bytes_verified);
     }
 
-    /// `from_external_qc` produces a `Verified<CertifiedBlock>` when the
+    /// `from_qc_attestation` produces a `Verified<CertifiedBlock>` when the
     /// QC's `block_hash` matches the paired block, and rejects mismatches
     /// with the same `LinkageError` shape as `assemble`.
     #[test]
-    fn from_external_qc_accepts_matching_pair_and_rejects_mismatch() {
+    fn from_qc_attestation_accepts_matching_pair_and_rejects_mismatch() {
         let block = Block::genesis(ShardGroupId::new(0), ValidatorId::new(0), StateRoot::ZERO);
         let block_hash = block.hash();
         let qc = QuorumCertificate::new(
@@ -470,14 +470,14 @@ mod tests {
         let verified_qc = Verified::<QuorumCertificate>::new_unchecked(qc.clone());
 
         let cb = CertifiedBlock::new_unchecked(block.clone(), qc.clone());
-        let verified_cb = Verified::<CertifiedBlock>::from_external_qc(cb, verified_qc)
+        let verified_cb = Verified::<CertifiedBlock>::from_qc_attestation(cb, verified_qc)
             .expect("matching block_hash succeeds");
         assert_eq!(verified_cb.qc_verified().block_hash(), block_hash);
 
         // Mismatched pair: pass a verified QC whose `block_hash` points
         // somewhere other than the certified block's hash. The
         // `CertifiedBlock` pairing invariant is satisfied internally
-        // (its embedded QC matches its block), but `from_external_qc`
+        // (its embedded QC matches its block), but `from_qc_attestation`
         // replaces the embedded QC with the supplied one, so it must
         // re-check the linkage against the new QC.
         let other_block =
@@ -495,7 +495,7 @@ mod tests {
         // SAFETY: synthetic test fixture.
         let other_verified_qc = Verified::<QuorumCertificate>::new_unchecked(other_qc_raw);
         let original_cb = CertifiedBlock::new_unchecked(block, qc);
-        let err = Verified::<CertifiedBlock>::from_external_qc(original_cb, other_verified_qc)
+        let err = Verified::<CertifiedBlock>::from_qc_attestation(original_cb, other_verified_qc)
             .expect_err("supplied QC's block_hash doesn't match the certified block");
         assert!(matches!(err, LinkageError::BlockHashMismatch { .. }));
     }

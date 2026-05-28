@@ -120,7 +120,7 @@ impl NodeStateMachine {
             ProtocolEvent::RemoteHeaderQcVerified {
                 shard,
                 height,
-                committed_header,
+                sender,
                 result,
             } => self
                 .remote_headers_coordinator
@@ -128,8 +128,8 @@ impl NodeStateMachine {
                     &self.topology_snapshot,
                     shard,
                     height,
-                    committed_header,
-                    result,
+                    sender,
+                    *result,
                 ),
             ProtocolEvent::RemoteHeaderAdmitted { committed_header } => {
                 // Fan out the verified header to downstream consumers. Shard consensus
@@ -442,10 +442,11 @@ mod tests {
                 BeaconWitnessLeafCount::ZERO,
             );
         }
-        let committed_header = Arc::new(CommittedBlockHeader::new(
-            block.header().clone(),
-            QuorumCertificate::genesis(ShardGroupId::new(0)),
-        ));
+        let committed_header =
+            Arc::new(Verified::new_unchecked_for_test(CommittedBlockHeader::new(
+                block.header().clone(),
+                QuorumCertificate::genesis(ShardGroupId::new(0)),
+            )));
 
         let pre_exec = node
             .execution_coordinator

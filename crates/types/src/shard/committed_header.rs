@@ -1,9 +1,11 @@
 //! `CommittedBlockHeader` — block header paired with the QC that committed it.
 //!
 //! [`CommittedBlockHeader`] is the raw wire form. Its verified form is
-//! `Verified<CommittedBlockHeader>` — header verified + QC verified +
-//! `qc.block_hash == header.hash()`; predicate at
-//! [`impl Verified<CommittedBlockHeader>::assemble`] below.
+//! `Verified<CommittedBlockHeader>` — produced either by local-assembly
+//! ([`impl Verified<CommittedBlockHeader>::assemble`] — requires a
+//! locally-verified header) or by BFT-transitive trust
+//! ([`impl Verified<CommittedBlockHeader>::from_qc_attestation`] — the
+//! light-client trust path for remote-shard headers).
 
 use sbor::prelude::*;
 use thiserror::Error;
@@ -120,6 +122,48 @@ impl Verified<CommittedBlockHeader> {
             return Err(CommittedHeaderVerifyError::LinkageMismatch);
         }
         let header = header.into_inner();
+        Ok(Self::new_unchecked(CommittedBlockHeader {
+            header,
+            qc: Verifiable::Verified(qc),
+        }))
+    }
+
+    /// Construct from a raw header paired with a verified QC, trusting the
+    /// QC's signers to have validated the header at their committee. The
+    /// light-client construction gate: receivers of cross-shard committed
+    /// headers don't re-run the source committee's per-root verifiers, so
+    /// the `Verified<CommittedBlockHeader>` predicate's "header verified"
+    /// claim rests on the BFT property of the supplied QC rather than a
+    /// local `Verified<BlockHeader>` witness.
+    ///
+    /// Construction asserts:
+    /// 1. The QC passes its own verification predicate (witnessed by its
+    ///    `Verified<QuorumCertificate>` type).
+    /// 2. `qc.block_hash == header.hash()` — the QC commits exactly this
+    ///    header.
+    /// 3. The header's structural validity is asserted by the QC's
+    ///    signers: at least 2f+1 of the source committee accepted the
+    ///    header (and its `parent_qc`) before voting, so at least one
+    ///    honest signer's checks stand behind the claim. This trust
+    ///    source is parallel to
+    ///    [`Verified::<CertifiedBlock>::from_qc_attestation`].
+    ///
+    /// Misuse — invoking this on a path where local header verification
+    /// WOULD have run and rejected — silently weakens the typestate to a
+    /// BFT-transitive claim, so call sites carry a `// SAFETY:` comment
+    /// naming the attestation source.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CommittedHeaderVerifyError::LinkageMismatch`] when
+    /// `qc.block_hash() != header.hash()`.
+    pub fn from_qc_attestation(
+        header: BlockHeader,
+        qc: Verified<QuorumCertificate>,
+    ) -> Result<Self, CommittedHeaderVerifyError> {
+        if qc.block_hash() != header.hash() {
+            return Err(CommittedHeaderVerifyError::LinkageMismatch);
+        }
         Ok(Self::new_unchecked(CommittedBlockHeader {
             header,
             qc: Verifiable::Verified(qc),

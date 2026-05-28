@@ -19,8 +19,8 @@ use hyperscale_core::{Action, ProtocolEvent};
 use hyperscale_types::{BeaconWitnessLeafCount, BeaconWitnessRoot};
 use hyperscale_types::{
     BlockHeight, Bls12381G1PublicKey, CertifiedBlock, CommittedBlockHeader,
-    CommittedHeaderVerifyError, InFlightCount, QuorumCertificate, REMOTE_HEADER_RETENTION,
-    ShardGroupId, TopologySnapshot, ValidatorId, Verified, VotePower, WeightedTimestamp,
+    CommittedHeaderVerifyError, InFlightCount, REMOTE_HEADER_RETENTION, ShardGroupId,
+    TopologySnapshot, ValidatorId, Verified, VotePower, WeightedTimestamp,
 };
 use tracing::{debug, info, trace, warn};
 
@@ -102,8 +102,9 @@ pub struct RemoteHeaderCoordinator {
     // Verified Headers
     // ═══════════════════════════════════════════════════════════════════
     /// Verified committed block headers — one per `(shard, height)`.
-    /// These have passed QC signature verification and structural checks.
-    verified: HashMap<(ShardGroupId, BlockHeight), Arc<CommittedBlockHeader>>,
+    /// Holds the BFT-transitive trust composite produced by
+    /// [`Verified::<CommittedBlockHeader>::from_qc_attestation`].
+    verified: HashMap<(ShardGroupId, BlockHeight), Arc<Verified<CommittedBlockHeader>>>,
 
     /// Highest seen `(block_height, weighted_timestamp)` per remote shard.
     /// The timestamp is the pruning anchor — retention is measured against
@@ -231,7 +232,7 @@ impl RemoteHeaderCoordinator {
 
         if first_for_key {
             // Emit QC verification for the first header at this (shard, height).
-            Self::emit_verify_qc(topology, shard, height, committed_header)
+            Self::emit_verify_qc(topology, shard, height, sender, committed_header)
         } else {
             vec![]
         }
@@ -250,46 +251,52 @@ impl RemoteHeaderCoordinator {
         topology: &TopologySnapshot,
         shard: ShardGroupId,
         height: BlockHeight,
-        header: Arc<CommittedBlockHeader>,
-        result: Result<Verified<QuorumCertificate>, CommittedHeaderVerifyError>,
+        sender: ValidatorId,
+        result: Result<Verified<CommittedBlockHeader>, CommittedHeaderVerifyError>,
     ) -> Vec<Action> {
         let key = (shard, height);
 
-        if let Err(e) = result {
-            // The verified QC handle isn't propagated yet; downstream
-            // consumers re-read it from `header.qc()`.
-            warn!(
-                shard = shard.inner(),
-                height = height.inner(),
-                reason = %e,
-                "Remote header QC verification failed"
-            );
+        let verified = match result {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    shard = shard.inner(),
+                    height = height.inner(),
+                    sender = sender.inner(),
+                    reason = %e,
+                    "Remote header QC verification failed"
+                );
 
-            // Remove the failed candidate. Try the next sender's header if available.
-            if let Some(sender_map) = self.pending.get_mut(&key) {
-                // Remove the header that failed — find by Arc pointer equality.
-                sender_map.retain(|_, h| !Arc::ptr_eq(h, &header));
-
-                // Try next candidate if any remain.
-                if let Some((_, next_header)) = sender_map.iter().next() {
-                    let next = Arc::clone(next_header);
-                    return Self::emit_verify_qc(topology, shard, height, next);
+                // Remove the failed candidate by sender key, then try the
+                // next candidate if any remain.
+                if let Some(sender_map) = self.pending.get_mut(&key) {
+                    sender_map.remove(&sender);
+                    if let Some((next_sender, next_header)) = sender_map.iter().next() {
+                        let next_sender = *next_sender;
+                        let next_header = Arc::clone(next_header);
+                        return Self::emit_verify_qc(
+                            topology,
+                            shard,
+                            height,
+                            next_sender,
+                            next_header,
+                        );
+                    }
                 }
+
+                self.pending.remove(&key);
+                return vec![];
             }
+        };
 
-            // No more candidates — remove the empty pending entry.
-            self.pending.remove(&key);
-            return vec![];
-        }
-
-        // QC verified — promote to verified storage.
         debug!(
             shard = shard.inner(),
             height = height.inner(),
             "Remote header QC verified — promoting"
         );
 
-        self.verified.insert(key, Arc::clone(&header));
+        let verified = Arc::new(verified);
+        self.verified.insert(key, Arc::clone(&verified));
         self.pending.remove(&key);
 
         let mut actions = Vec::new();
@@ -306,9 +313,8 @@ impl RemoteHeaderCoordinator {
             expected.last_verified_at = Some(self.local_committed_ts);
         }
 
-        // Emit continuation so downstream consumers receive the verified header.
         actions.push(Action::Continuation(ProtocolEvent::RemoteHeaderAdmitted {
-            committed_header: header,
+            committed_header: verified,
         }));
         actions
     }
@@ -449,7 +455,7 @@ impl RemoteHeaderCoordinator {
         &self,
         shard: ShardGroupId,
         height: BlockHeight,
-    ) -> Option<&Arc<CommittedBlockHeader>> {
+    ) -> Option<&Arc<Verified<CommittedBlockHeader>>> {
         self.verified.get(&(shard, height))
     }
 
@@ -553,6 +559,7 @@ impl RemoteHeaderCoordinator {
         topology: &TopologySnapshot,
         shard: ShardGroupId,
         height: BlockHeight,
+        sender: ValidatorId,
         committed_header: Arc<CommittedBlockHeader>,
     ) -> Vec<Action> {
         let committee = topology.committee_for_shard(shard);
@@ -576,6 +583,7 @@ impl RemoteHeaderCoordinator {
 
         vec![Action::VerifyRemoteHeaderQc {
             committed_header,
+            sender,
             committee_public_keys,
             committee_voting_power,
             quorum_threshold,

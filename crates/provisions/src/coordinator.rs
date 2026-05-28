@@ -18,7 +18,7 @@ use hyperscale_core::{Action, FetchAbandon, ProtocolEvent};
 use hyperscale_types::{BeaconWitnessLeafCount, BeaconWitnessRoot};
 use hyperscale_types::{
     BlockHeight, BlockManifest, CertifiedBlock, CommittedBlockHeader, LocalTimestamp,
-    ProvisionHash, Provisions, RETENTION_HORIZON, ShardGroupId, TopologySnapshot,
+    ProvisionHash, Provisions, RETENTION_HORIZON, ShardGroupId, TopologySnapshot, Verified,
 };
 use serde::Deserialize;
 use tracing::{debug, info, warn};
@@ -346,7 +346,7 @@ impl ProvisionCoordinator {
     pub fn on_verified_remote_header(
         &mut self,
         topology: &TopologySnapshot,
-        committed_header: &Arc<CommittedBlockHeader>,
+        committed_header: &Arc<Verified<CommittedBlockHeader>>,
     ) -> Vec<Action> {
         let shard = committed_header.shard_group_id();
         let height = committed_header.height();
@@ -538,7 +538,7 @@ impl ProvisionCoordinator {
     pub fn on_state_provisions_verified(
         &mut self,
         provisions: Arc<Provisions>,
-        committed_header: Option<&Arc<CommittedBlockHeader>>,
+        committed_header: Option<&Arc<Verified<CommittedBlockHeader>>>,
         valid: bool,
         now: LocalTimestamp,
     ) -> Vec<Action> {
@@ -661,7 +661,7 @@ impl ProvisionCoordinator {
         &self,
         shard: ShardGroupId,
         height: BlockHeight,
-    ) -> Option<Arc<CommittedBlockHeader>> {
+    ) -> Option<Arc<Verified<CommittedBlockHeader>>> {
         self.headers.get((shard, height))
     }
 
@@ -727,7 +727,7 @@ mod tests {
     fn make_committed_header(
         shard: ShardGroupId,
         height: BlockHeight,
-    ) -> Arc<CommittedBlockHeader> {
+    ) -> Arc<Verified<CommittedBlockHeader>> {
         make_committed_header_with_targets(shard, height, vec![ShardGroupId::new(0)])
     }
 
@@ -739,11 +739,11 @@ mod tests {
         height: BlockHeight,
         local_shard: ShardGroupId,
         tx_hashes: &[TxHash],
-    ) -> Arc<CommittedBlockHeader> {
+    ) -> Arc<Verified<CommittedBlockHeader>> {
         let header_arc = make_committed_header_with_targets(shard, height, vec![local_shard]);
         let raw: Vec<Hash> = tx_hashes.iter().map(|h| h.into_raw()).collect();
         let root = ProvisionTxRoot::from_raw(compute_merkle_root(&raw));
-        let (header, qc) = Arc::unwrap_or_clone(header_arc).into_parts();
+        let (header, qc) = Arc::unwrap_or_clone(header_arc).into_inner().into_parts();
         let mut roots = header.provision_tx_roots().clone().into_inner();
         roots.insert(local_shard, root);
         let header = BlockHeader::new(
@@ -766,7 +766,9 @@ mod tests {
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
         );
-        Arc::new(CommittedBlockHeader::new(header, qc))
+        Arc::new(Verified::new_unchecked_for_test(CommittedBlockHeader::new(
+            header, qc,
+        )))
     }
 
     #[test]
@@ -1324,7 +1326,7 @@ mod tests {
         shard: ShardGroupId,
         height: BlockHeight,
         provision_targets: Vec<ShardGroupId>,
-    ) -> Arc<CommittedBlockHeader> {
+    ) -> Arc<Verified<CommittedBlockHeader>> {
         // Each target shard gets its own single-dependency wave so that
         // `provision_targets()` on the resulting header yields the input set.
         let waves: Vec<WaveId> = provision_targets
@@ -1364,7 +1366,9 @@ mod tests {
             zero_bls_signature(),
             WeightedTimestamp::ZERO,
         );
-        Arc::new(CommittedBlockHeader::new(header, qc))
+        Arc::new(Verified::new_unchecked_for_test(CommittedBlockHeader::new(
+            header, qc,
+        )))
     }
 
     /// Nominal block spacing used by tests to synthesize `weighted_timestamp_ms`

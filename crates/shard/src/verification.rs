@@ -707,7 +707,7 @@ impl VerificationPipeline {
 
     /// Insert a `Verified<CertifiedBlock>` keyed by `block_hash`. Used
     /// by paths that produce the typed handle via
-    /// [`Verified::<CertifiedBlock>::from_external_qc`] (sync, or
+    /// [`Verified::<CertifiedBlock>::from_qc_attestation`] (sync, or
     /// aggregator-without-local-verification) rather than by full
     /// per-root assembly through [`Self::try_complete_assembly`].
     pub fn insert_verified_certified_block(
