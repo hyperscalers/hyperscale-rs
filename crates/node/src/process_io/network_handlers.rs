@@ -17,7 +17,7 @@ use hyperscale_types::network::request::{
 use hyperscale_types::network::response::{
     GetLocalProvisionsResponse, GetProvisionResponse, LocalProvisionEntry,
 };
-use hyperscale_types::{ShardGroupId, ready_signal_message};
+use hyperscale_types::{ExecutionCertificate, ShardGroupId, Verifiable, ready_signal_message};
 use tracing::warn;
 
 use crate::event::ShardScopedInput;
@@ -631,7 +631,11 @@ where
                         return;
                     }
 
-                    let certificates = batch.into_certificates();
+                    let certificates: Vec<Verifiable<ExecutionCertificate>> = batch
+                        .into_certificates()
+                        .into_iter()
+                        .map(Verifiable::from)
+                        .collect();
                     // Fan out across every hosted shard — the destination
                     // shard for a cert isn't known here without inspecting
                     // expected-cert sets, so each hosted shard decides

@@ -447,8 +447,10 @@ pub enum ProtocolEvent {
     /// which dispatches signature verification. The fetch protocol drain
     /// hooks this event by `wave_id`.
     ExecutionCertificatesReceived {
-        /// Execution certificates to admit.
-        certificates: Vec<ExecutionCertificate>,
+        /// Execution certificates to admit. Wire-decoded entries land
+        /// `Unverified`; a [`Verifiable::Verified`] entry short-circuits
+        /// BLS dispatch at the coordinator.
+        certificates: Vec<Verifiable<ExecutionCertificate>>,
     },
 
     /// Execution certificate signature verification completed.
@@ -489,8 +491,10 @@ pub enum ProtocolEvent {
     /// The fetch protocol drain hooks the subsequent `FinalizedWavesAdmitted`
     /// continuation, not this event.
     FinalizedWavesReceived {
-        /// Finalized waves returned by the peer.
-        waves: Vec<Arc<FinalizedWave>>,
+        /// Finalized waves returned by the peer. Wire-decoded entries
+        /// land `Unverified`; a [`Verifiable::Verified`] entry
+        /// short-circuits BLS dispatch at the coordinator.
+        waves: Vec<Arc<Verifiable<FinalizedWave>>>,
     },
 
     /// Finalized waves were just admitted to the canonical execution store.

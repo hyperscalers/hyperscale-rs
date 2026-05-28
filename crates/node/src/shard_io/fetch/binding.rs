@@ -30,7 +30,8 @@ use hyperscale_types::network::request::{
     GetProvisionsRequest, GetTransactionsRequest,
 };
 use hyperscale_types::{
-    BlockHeight, MessageClass, ProvisionHash, ShardGroupId, TxHash, ValidatorId, WaveId,
+    BlockHeight, ExecutionCertificate, FinalizedWave, MessageClass, ProvisionHash, ShardGroupId,
+    TxHash, ValidatorId, Verifiable, WaveId,
 };
 
 use super::Fetch;
@@ -335,10 +336,16 @@ impl FetchBinding for FinalizedWaveBinding {
                         w.wave_id().clone()
                     });
                     if !split.kept.is_empty() {
+                        // Refcount is 1 right after decode, so each unwrap moves.
+                        let waves: Vec<Arc<Verifiable<FinalizedWave>>> = split
+                            .kept
+                            .into_iter()
+                            .map(|arc| Arc::new(Arc::unwrap_or_clone(arc).into()))
+                            .collect();
                         push_protocol_event(
                             &es,
                             local_shard,
-                            ProtocolEvent::FinalizedWavesReceived { waves: split.kept },
+                            ProtocolEvent::FinalizedWavesReceived { waves },
                         );
                     }
                     let had_misses = !split.missing.is_empty();
@@ -405,8 +412,11 @@ impl FetchBinding for ExecCertBinding {
                     let had_misses = !split.missing.is_empty();
                     if !split.kept.is_empty() {
                         // Refcount is 1 right after decode, so each unwrap moves.
-                        let certificates =
-                            split.kept.into_iter().map(Arc::unwrap_or_clone).collect();
+                        let certificates: Vec<Verifiable<ExecutionCertificate>> = split
+                            .kept
+                            .into_iter()
+                            .map(|arc| Arc::unwrap_or_clone(arc).into())
+                            .collect();
                         push_protocol_event(
                             &es,
                             local_shard,

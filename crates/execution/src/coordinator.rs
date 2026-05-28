@@ -1032,7 +1032,7 @@ impl ExecutionCoordinator {
     pub fn on_wave_certificate(
         &mut self,
         topology: &TopologySnapshot,
-        cert: ExecutionCertificate,
+        cert: Verifiable<ExecutionCertificate>,
     ) -> Vec<Action> {
         let shard = cert.shard_group_id();
         let wire_hash = cert.wire_hash();
@@ -1082,7 +1082,7 @@ impl ExecutionCoordinator {
         };
 
         vec![Action::VerifyExecutionCertificateSignature {
-            certificate: cert.into(),
+            certificate: cert,
             public_keys,
         }]
     }
@@ -1668,7 +1668,7 @@ impl ExecutionCoordinator {
     pub fn admit_finalized_wave(
         &mut self,
         topology: &TopologySnapshot,
-        wave: Arc<FinalizedWave>,
+        wave: Arc<Verifiable<FinalizedWave>>,
     ) -> Vec<Action> {
         let wave_id = wave.wave_id().clone();
 
@@ -1724,7 +1724,7 @@ impl ExecutionCoordinator {
             ec_public_keys.push(public_keys);
         }
         vec![Action::VerifyFinalizedWave {
-            wave: Arc::new(Arc::unwrap_or_clone(wave).into()),
+            wave,
             ec_public_keys,
         }]
     }
@@ -2552,10 +2552,9 @@ mod tests {
             zero_bls_signature(),
             signers,
         ));
-        let wave = Arc::new(FinalizedWave::new(
-            Arc::new(WaveCertificate::new(wave_id, vec![ec])),
-            vec![],
-        ));
+        let wave: Arc<Verifiable<FinalizedWave>> = Arc::new(
+            FinalizedWave::new(Arc::new(WaveCertificate::new(wave_id, vec![ec])), vec![]).into(),
+        );
 
         let actions = state.admit_finalized_wave(&topo, wave);
         assert_eq!(actions.len(), 1);
@@ -2635,10 +2634,13 @@ mod tests {
             zero_bls_signature(),
             signers,
         ));
-        let wave = Arc::new(FinalizedWave::new(
-            Arc::new(WaveCertificate::new(wave_id.clone(), vec![ec])),
-            vec![],
-        ));
+        let wave: Arc<Verifiable<FinalizedWave>> = Arc::new(
+            FinalizedWave::new(
+                Arc::new(WaveCertificate::new(wave_id.clone(), vec![ec])),
+                vec![],
+            )
+            .into(),
+        );
 
         let actions = state.admit_finalized_wave(&topo, Arc::clone(&wave));
         assert!(
@@ -2684,10 +2686,13 @@ mod tests {
             zero_bls_signature(),
             signers,
         ));
-        let wave = Arc::new(FinalizedWave::new(
-            Arc::new(WaveCertificate::new(wave_id.clone(), vec![ec])),
-            vec![],
-        ));
+        let wave: Arc<Verifiable<FinalizedWave>> = Arc::new(
+            FinalizedWave::new(
+                Arc::new(WaveCertificate::new(wave_id.clone(), vec![ec])),
+                vec![],
+            )
+            .into(),
+        );
 
         let actions = state.admit_finalized_wave(&topo, Arc::clone(&wave));
         assert!(
@@ -2756,7 +2761,7 @@ mod tests {
             signers,
         );
 
-        let first = state.on_wave_certificate(&topo, cert.clone());
+        let first = state.on_wave_certificate(&topo, cert.clone().into());
         assert_eq!(first.len(), 1);
         assert!(matches!(
             first[0],
@@ -2765,7 +2770,7 @@ mod tests {
 
         // Same bytes mid-flight — must drop without dispatching another
         // verify.
-        let second = state.on_wave_certificate(&topo, cert);
+        let second = state.on_wave_certificate(&topo, cert.into());
         assert!(second.is_empty());
     }
 
@@ -2791,7 +2796,7 @@ mod tests {
             signers,
         );
 
-        let _ = state.on_wave_certificate(&topo, cert.clone());
+        let _ = state.on_wave_certificate(&topo, cert.clone().into());
         // Simulate the BLS pool returning an invalid result. The slot is
         // released so a follow-up arrival can re-dispatch.
         let _ = state.on_certificate_verified(
@@ -2801,7 +2806,7 @@ mod tests {
                 ExecutionCertificateVerifyError::BadAggregatedSignature,
             )),
         );
-        let again = state.on_wave_certificate(&topo, cert);
+        let again = state.on_wave_certificate(&topo, cert.into());
         assert_eq!(again.len(), 1);
         assert!(matches!(
             again[0],
@@ -2834,7 +2839,7 @@ mod tests {
             .exec_certs
             .insert(Arc::new(Verified::new_unchecked_for_test(cert.clone())));
 
-        let actions = state.on_wave_certificate(&topo, cert);
+        let actions = state.on_wave_certificate(&topo, cert.into());
         assert!(
             actions.is_empty(),
             "cached wire-hash match must short-circuit"
@@ -2881,7 +2886,7 @@ mod tests {
             .exec_certs
             .insert(Arc::new(Verified::new_unchecked_for_test(cached)));
 
-        let actions = state.on_wave_certificate(&topo, incoming);
+        let actions = state.on_wave_certificate(&topo, incoming.into());
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             actions[0],
@@ -2909,10 +2914,9 @@ mod tests {
             zero_bls_signature(),
             signers,
         ));
-        let wave = Arc::new(FinalizedWave::new(
-            Arc::new(WaveCertificate::new(wave_id, vec![ec])),
-            vec![],
-        ));
+        let wave: Arc<Verifiable<FinalizedWave>> = Arc::new(
+            FinalizedWave::new(Arc::new(WaveCertificate::new(wave_id, vec![ec])), vec![]).into(),
+        );
 
         let first = state.admit_finalized_wave(&topo, Arc::clone(&wave));
         assert_eq!(first.len(), 1);
@@ -2951,7 +2955,7 @@ mod tests {
         // does on the local-aggregation path).
         state.finalized.insert(wave_id, verifiable_wave);
 
-        let actions = state.admit_finalized_wave(&topo, Arc::new(raw_wave));
+        let actions = state.admit_finalized_wave(&topo, Arc::new(Verifiable::from(raw_wave)));
         assert!(actions.is_empty());
     }
 
@@ -2975,10 +2979,13 @@ mod tests {
             zero_bls_signature(),
             SignerBitfield::empty(), // no signers — far below 2f+1
         ));
-        let wave = Arc::new(FinalizedWave::new(
-            Arc::new(WaveCertificate::new(wave_id.clone(), vec![bogus_ec])),
-            vec![],
-        ));
+        let wave: Arc<Verifiable<FinalizedWave>> = Arc::new(
+            FinalizedWave::new(
+                Arc::new(WaveCertificate::new(wave_id.clone(), vec![bogus_ec])),
+                vec![],
+            )
+            .into(),
+        );
 
         let actions = state.admit_finalized_wave(&topo, wave);
         // No admission continuation — the poisoning vector this gate
@@ -3034,7 +3041,7 @@ mod tests {
             zero_bls_signature(),
             SignerBitfield::new(4),
         );
-        let _ = state.on_wave_certificate(&topo, cert.clone());
+        let _ = state.on_wave_certificate(&topo, cert.clone().into());
         assert_eq!(
             state.expected_certs.expected_len(),
             1,
@@ -3088,7 +3095,7 @@ mod tests {
             SignerBitfield::new(4),
         );
 
-        let actions = state.on_wave_certificate(&topo, cert);
+        let actions = state.on_wave_certificate(&topo, cert.into());
         assert!(
             actions
                 .iter()
