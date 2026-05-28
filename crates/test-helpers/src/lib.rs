@@ -217,6 +217,14 @@ impl TestCommittee {
 /// are `Hash::ZERO`, `parent_qc` is `QuorumCertificate::genesis(ShardGroupId::new(0))`, `round`
 /// is `Round::INITIAL`, and there are no wave roots or provisions. Callers
 /// pass only the bits that vary between tests.
+///
+/// Transactions are wrapped as `Verifiable::Unverified` — adequate for the
+/// `on_block_committed` path (`WaveState` lifts via
+/// [`Verified::<RoutableTransaction>::from_persisted`]) and for storage
+/// fixtures. The pre-vote path (`validate_block_for_vote`) refuses to vote
+/// on blocks with any un-`Verified` entry; tests targeting that path must
+/// construct `Block` directly with `Vec<Arc<Verifiable<RoutableTransaction>>>`
+/// holding `Verified` entries.
 #[must_use]
 pub fn make_live_block(
     shard_group_id: ShardGroupId,

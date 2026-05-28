@@ -767,4 +767,66 @@ mod tests {
         let err = validate_no_duplicate_provisions(&block, &qc_chain, &dedup_index).unwrap_err();
         assert!(err.contains("already committed"));
     }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // validate_transactions_verified / validate_block_for_vote verified-arm
+    // ═══════════════════════════════════════════════════════════════════════
+
+    fn verified_tx(seed: u8) -> Arc<Verifiable<RoutableTransaction>> {
+        Arc::new(Verifiable::from(test_utils::verified_test_transaction(
+            seed,
+        )))
+    }
+
+    fn sorted_verified_txs(seeds: &[u8]) -> Vec<Arc<Verifiable<RoutableTransaction>>> {
+        let mut txs: Vec<_> = seeds.iter().map(|&s| verified_tx(s)).collect();
+        txs.sort_by_key(|t| t.hash());
+        txs
+    }
+
+    #[test]
+    fn validate_transactions_verified_accepts_empty_block() {
+        let block = block_with_transactions(BlockHeight::new(1), vec![]);
+        assert!(validate_transactions_verified(&block).is_ok());
+    }
+
+    #[test]
+    fn validate_transactions_verified_accepts_all_verified() {
+        let block =
+            block_with_transactions(BlockHeight::new(1), sorted_verified_txs(&[10, 20, 30]));
+        assert!(validate_transactions_verified(&block).is_ok());
+    }
+
+    #[test]
+    fn validate_transactions_verified_rejects_any_unverified() {
+        // Mix one Unverified entry into an otherwise-Verified block.
+        let mut txs = sorted_verified_txs(&[10, 20]);
+        let unverified = tx(30);
+        txs.push(unverified);
+        txs.sort_by_key(|t| t.hash());
+        let block = block_with_transactions(BlockHeight::new(1), txs);
+        let err = validate_transactions_verified(&block).unwrap_err();
+        assert!(err.contains("not admission-validated"));
+    }
+
+    #[test]
+    fn validate_block_for_vote_rejects_unverified_before_other_checks() {
+        // Out-of-order + Unverified: the verified-check fires first and
+        // short-circuits before ordering is examined.
+        let topo = topology();
+        let mut txs = sorted_verified_txs(&[10, 20]);
+        txs.reverse(); // intentionally mis-sort to prove short-circuit
+        txs.push(tx(30)); // Unverified entry
+        let block = block_with_transactions(BlockHeight::new(1), txs);
+        let err = validate_block_for_vote(
+            &topo,
+            &block,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &CommitDedupIndex::new(),
+        )
+        .unwrap_err();
+        assert!(err.contains("not admission-validated"));
+    }
 }
