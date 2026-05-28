@@ -79,15 +79,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_storage::{BeaconWitnessCommit, RecoveredState, StateRootVerifyError};
+use hyperscale_storage::RecoveredState;
 use hyperscale_types::{
-    BeaconWitnessRoot, BeaconWitnessRootVerifyError, Block, BlockHeader, BlockHeight,
-    BlockManifest, BlockVote, CertRootVerifyError, CertificateRoot, CertifiedBlock,
+    BeaconWitnessCommit, BeaconWitnessRoot, BeaconWitnessRootVerifyError, Block, BlockHeader,
+    BlockHeight, BlockManifest, BlockVote, CertRootVerifyError, CertificateRoot, CertifiedBlock,
     CommittedBlockHeader, FinalizedWave, LocalReceiptRoot, LocalReceiptRootVerifyError,
     ProvisionRootVerifyError, ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions,
     ProvisionsRoot, QcVerifyError, QuorumCertificate, Round, RoutableTransaction, StateRoot,
-    TopologySnapshot, TransactionRoot, TxHash, TxRootVerifyError, Verifiable, Verified, VotePower,
-    derive_leaves, missed_proposals_since_prev_commit,
+    StateRootVerifyError, TopologySnapshot, TransactionRoot, TxHash, TxRootVerifyError, Verifiable,
+    Verified, VotePower, derive_leaves, missed_proposals_since_prev_commit,
 };
 use tracing::field::Empty;
 use tracing::{debug, info, instrument, trace, warn};
@@ -3659,7 +3659,7 @@ mod tests {
 
     fn make_test_qc(block_hash: BlockHash, height: BlockHeight) -> Verified<QuorumCertificate> {
         // SAFETY: synthetic test fixture, no real signature.
-        Verified::<QuorumCertificate>::new_unchecked(QuorumCertificate::new(
+        Verified::<QuorumCertificate>::new_unchecked_for_test(QuorumCertificate::new(
             block_hash,
             ShardGroupId::new(0),
             height,
@@ -3885,7 +3885,8 @@ mod tests {
 
         // SAFETY: synthetic test fixture, parent_qc was constructed locally,
         // so wrapping it as verified models the action arm's success result.
-        let verified = Verified::<QuorumCertificate>::new_unchecked(header.parent_qc().clone());
+        let verified =
+            Verified::<QuorumCertificate>::new_unchecked_for_test(header.parent_qc().clone());
         let _ = state.on_qc_signature_verified(&topology, block_hash, Ok(verified));
         assert_eq!(
             state.latest_qc.as_deref().map(QuorumCertificate::height),
@@ -3963,7 +3964,8 @@ mod tests {
 
         // QC verified — but state root verification is still pending, so no vote yet.
         // SAFETY: synthetic test fixture, parent_qc built locally.
-        let verified = Verified::<QuorumCertificate>::new_unchecked(header.parent_qc().clone());
+        let verified =
+            Verified::<QuorumCertificate>::new_unchecked_for_test(header.parent_qc().clone());
         let after_qc = state.on_qc_signature_verified(&topology, block_hash, Ok(verified));
         assert!(
             !after_qc
@@ -3989,7 +3991,9 @@ mod tests {
         let after_roots = state.on_beacon_witness_root_verified(
             &topology,
             block_hash,
-            Ok(Verified::<BeaconWitnessRoot>::new_unchecked(beacon_root)),
+            Ok(Verified::<BeaconWitnessRoot>::new_unchecked_for_test(
+                beacon_root,
+            )),
         );
         assert!(
             after_roots
@@ -4331,7 +4335,7 @@ mod tests {
             None,
             vec![(
                 0,
-                Verified::<BlockVote>::new_unchecked(vote),
+                Verified::<BlockVote>::new_unchecked_for_test(vote),
                 VotePower::new(1),
             )],
         );
@@ -4549,7 +4553,7 @@ mod tests {
         let qc = {
             let __qc = make_test_qc(block_3_hash, BlockHeight::new(3));
             // SAFETY: synthetic test fixture, no real signature.
-            Verified::<QuorumCertificate>::new_unchecked(QuorumCertificate::new(
+            Verified::<QuorumCertificate>::new_unchecked_for_test(QuorumCertificate::new(
                 __qc.block_hash(),
                 __qc.shard_group_id(),
                 __qc.height(),
@@ -4740,11 +4744,9 @@ mod tests {
 
         // Simulate verification success; same path as on_qc_signature_verified(valid=true).
         // SAFETY: synthetic test fixture, no real signature.
-        state
-            .verification
-            .cache_verified_qc(Verified::<QuorumCertificate>::new_unchecked(
-                parent_qc.clone(),
-            ));
+        state.verification.cache_verified_qc(
+            Verified::<QuorumCertificate>::new_unchecked_for_test(parent_qc.clone()),
+        );
 
         // Second block at round 1 sharing the same parent QC.
         let header2 = {
@@ -4820,11 +4822,9 @@ mod tests {
 
         // Cache the honest QC as if it had been verified.
         // SAFETY: synthetic test fixture, no real signature.
-        state
-            .verification
-            .cache_verified_qc(Verified::<QuorumCertificate>::new_unchecked(
-                honest_qc.clone(),
-            ));
+        state.verification.cache_verified_qc(
+            Verified::<QuorumCertificate>::new_unchecked_for_test(honest_qc.clone()),
+        );
 
         // Byzantine header reuses the honest QC's block_hash + signers + height
         // (so `validate_header`'s quorum-power and structural checks still pass)
@@ -4927,7 +4927,7 @@ mod tests {
                 BlockHeight::new(3),
             );
             // SAFETY: synthetic test fixture, no real signature.
-            Verified::<QuorumCertificate>::new_unchecked(QuorumCertificate::new(
+            Verified::<QuorumCertificate>::new_unchecked_for_test(QuorumCertificate::new(
                 __qc.block_hash(),
                 __qc.shard_group_id(),
                 __qc.height(),
@@ -4981,7 +4981,7 @@ mod tests {
                 BlockHeight::new(3),
             );
             // SAFETY: synthetic test fixture, no real signature.
-            Verified::<QuorumCertificate>::new_unchecked(QuorumCertificate::new(
+            Verified::<QuorumCertificate>::new_unchecked_for_test(QuorumCertificate::new(
                 __qc.block_hash(),
                 __qc.shard_group_id(),
                 __qc.height(),
@@ -5112,7 +5112,7 @@ mod tests {
                 BlockHeight::new(5),
             );
             // SAFETY: synthetic test fixture, no real signature.
-            Verified::<QuorumCertificate>::new_unchecked(QuorumCertificate::new(
+            Verified::<QuorumCertificate>::new_unchecked_for_test(QuorumCertificate::new(
                 __qc.block_hash(),
                 __qc.shard_group_id(),
                 __qc.height(),
@@ -5270,7 +5270,7 @@ mod tests {
                 BlockHeight::new(3),
             );
             // SAFETY: synthetic test fixture, no real signature.
-            Verified::<QuorumCertificate>::new_unchecked(QuorumCertificate::new(
+            Verified::<QuorumCertificate>::new_unchecked_for_test(QuorumCertificate::new(
                 __qc.block_hash(),
                 __qc.shard_group_id(),
                 __qc.height(),
@@ -5306,7 +5306,7 @@ mod tests {
                 BlockHeight::new(3),
             );
             // SAFETY: synthetic test fixture, no real signature.
-            Verified::<QuorumCertificate>::new_unchecked(QuorumCertificate::new(
+            Verified::<QuorumCertificate>::new_unchecked_for_test(QuorumCertificate::new(
                 __qc.block_hash(),
                 __qc.shard_group_id(),
                 __qc.height(),
@@ -5370,7 +5370,7 @@ mod tests {
                 BlockHeight::new(3),
             );
             // SAFETY: synthetic test fixture, no real signature.
-            Verified::<QuorumCertificate>::new_unchecked(QuorumCertificate::new(
+            Verified::<QuorumCertificate>::new_unchecked_for_test(QuorumCertificate::new(
                 __qc.block_hash(),
                 __qc.shard_group_id(),
                 __qc.height(),

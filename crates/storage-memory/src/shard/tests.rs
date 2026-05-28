@@ -8,16 +8,17 @@ use hyperscale_storage::test_helpers::{
 };
 use hyperscale_storage::tree::{jmt_parent_height, put_at_version};
 use hyperscale_storage::{
-    BeaconWitnessCommit, CommittableSubstateDatabase, DatabaseUpdate, DatabaseUpdates,
-    DbPartitionKey, DbSortKey, NodeDatabaseUpdates, PartitionDatabaseUpdates, ShardChainReader,
-    ShardChainWriter, SubstateDatabase, SubstateStore, VersionedStore, merge_database_updates,
-    merge_into, test_helpers,
+    CommittableSubstateDatabase, DatabaseUpdate, DatabaseUpdates, DbPartitionKey, DbSortKey,
+    NodeDatabaseUpdates, PartitionDatabaseUpdates, ShardChainReader, ShardChainWriter,
+    SubstateDatabase, SubstateStore, VersionedStore, merge_database_updates, merge_into,
+    test_helpers,
 };
 use hyperscale_types::test_utils::test_transaction;
 use hyperscale_types::{
-    BeaconWitnessLeafCount, Block, BlockHeight, CertifiedBlock, ConsensusReceipt, FinalizedWave,
-    GlobalReceiptHash, Hash, NodeId, ProposerTimestamp, QuorumCertificate, ShardGroupId, StateRoot,
-    StoredReceipt, TxHash, Verified, WaveCertificate, WaveId,
+    BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeight, CertifiedBlock,
+    ConsensusReceipt, FinalizedWave, GlobalReceiptHash, Hash, NodeId, ProposerTimestamp,
+    QuorumCertificate, ShardGroupId, StateRoot, StoredReceipt, SyncHint, TxHash, Verified,
+    WaveCertificate, WaveId,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -167,7 +168,7 @@ fn commit_with(
     };
     // SAFETY: synthetic test fixture; storage round-trip tests don't
     // exercise the `Verified<CertifiedBlock>` predicate.
-    let certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked(
+    let certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked_for_test(
         CertifiedBlock::new_unchecked(block, <Verified<_>>::clone(qc)),
     ));
     storage.commit_block(&certified, &no_witness())
@@ -563,14 +564,14 @@ fn test_commit_block_empty() {
 fn test_prepare_then_commit_fast_path() {
     // Two identical storage instances: one uses prepare+commit, other uses commit_block.
     // Both should produce the same result.
-    let s_prepared = SimShardStorage::new();
+    let s_prepared = Arc::new(SimShardStorage::new());
     let s_direct = SimShardStorage::new();
     let block = make_test_block(BlockHeight::new(1));
     let qc = make_test_qc(&block);
 
     // Prepare path
     let parent_root = s_prepared.state_root();
-    let (spec_root, prepared) = s_prepared.prepare_block_commit(
+    let (spec_root, _jmt_snapshot, prepared) = s_prepared.prepare_block_commit(
         parent_root,
         BlockHeight::GENESIS,
         &[],
@@ -579,9 +580,7 @@ fn test_prepare_then_commit_fast_path() {
         None,
     );
     let certified = make_test_certified(block.clone());
-    let result_prepared = s_prepared
-        .commit_prepared_blocks(vec![(prepared, certified, no_witness())])
-        .remove(0);
+    let result_prepared = prepared(SyncHint::FlushNow, &certified, &no_witness());
 
     // Direct path
     let result_direct = commit_empty(&s_direct, &block, &qc);
@@ -592,12 +591,12 @@ fn test_prepare_then_commit_fast_path() {
 
 #[test]
 fn test_prepare_commit_state_root_matches() {
-    let storage = SimShardStorage::new();
+    let storage = Arc::new(SimShardStorage::new());
     let block = make_test_block(BlockHeight::new(1));
     let qc = make_test_qc(&block);
 
     let parent_root = storage.state_root();
-    let (spec_root, prepared) = storage.prepare_block_commit(
+    let (spec_root, _jmt_snapshot, prepared) = storage.prepare_block_commit(
         parent_root,
         BlockHeight::GENESIS,
         &[],
@@ -609,9 +608,7 @@ fn test_prepare_commit_state_root_matches() {
     // Embed the supplied verified QC by replacing the helper's
     // placeholder. SAFETY: synthetic test fixture.
     let _ = qc;
-    let result = storage
-        .commit_prepared_blocks(vec![(prepared, certified, no_witness())])
-        .remove(0);
+    let result = prepared(SyncHint::FlushNow, &certified, &no_witness());
 
     assert_eq!(spec_root, result);
 }

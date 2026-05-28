@@ -9,22 +9,20 @@ use std::sync::Arc;
 use hyperscale_core::{Action, ActionContext, PreparedBlock, ProtocolEvent};
 use hyperscale_metrics::record_signature_verification_latency;
 use hyperscale_network::Network;
-use hyperscale_storage::{
-    JmtSnapshot, ShardChainWriter, ShardStorage, StateRootContext, SubstateStore,
-};
+use hyperscale_storage::{JmtSnapshot, ShardChainWriter, ShardStorage};
 use hyperscale_types::network::gossip::CommittedBlockHeaderGossip;
 use hyperscale_types::network::notification::{BlockHeaderNotification, BlockVoteNotification};
 use hyperscale_types::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, BeaconWitnessRootContext, Block, BlockHash,
     BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PublicKey, CertificateRoot,
     CertificateRootContext, CommittedHeaderVerifyError, ConsensusReceipt, FinalizedWave, Hash,
-    InFlightCount, LocalReceiptRoot, LocalReceiptRootContext, NetworkDefinition, ProposerTimestamp,
-    ProvisionHash, ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions, ProvisionsRoot,
-    ProvisionsRootContext, QcContext, QuorumCertificate, ReadySignal, Round, RoutableTransaction,
-    ShardGroupId, StateRoot, StoredReceipt, TopologySnapshot, TransactionRoot,
-    TransactionRootContext, ValidatorId, Verifiable, Verified, Verify, VotePower,
-    WeightedTimestamp, block_header_message, block_vote_message, committed_block_header_message,
-    compute_waves,
+    InFlightCount, LocalReceiptRoot, LocalReceiptRootContext, NetworkDefinition, PreparedCommit,
+    ProposerTimestamp, ProvisionHash, ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions,
+    ProvisionsRoot, ProvisionsRootContext, QcContext, QuorumCertificate, ReadySignal, Round,
+    RoutableTransaction, ShardGroupId, StateRoot, StateRootContext, StoredReceipt,
+    TopologySnapshot, TransactionRoot, TransactionRootContext, ValidatorId, Verifiable, Verified,
+    Verify, VotePower, WeightedTimestamp, block_header_message, block_vote_message,
+    committed_block_header_message, compute_waves,
 };
 
 /// Result of QC verification and assembly.
@@ -149,7 +147,7 @@ pub fn verify_vote_batch(
 }
 
 /// Result of building a proposal block.
-pub struct ProposalResult<P: Send> {
+pub struct ProposalResult {
     /// The constructed proposal block (header + payload).
     pub block: Block,
     /// Hash of the constructed block, cached so callers don't recompute.
@@ -160,9 +158,14 @@ pub struct ProposalResult<P: Send> {
     /// alone can't recover `ready_signals` since the field isn't on
     /// `Block`.
     pub manifest: BlockManifest,
-    /// JMT prepared-commit handle from the proposer's pre-commit, threaded
-    /// to the commit pipeline so the proposer doesn't recompute on commit.
-    pub prepared_commit: Option<P>,
+    /// JMT prepared-commit closure from the proposer's pre-commit,
+    /// threaded to the commit pipeline so the proposer doesn't recompute
+    /// on commit.
+    pub prepared_commit: PreparedCommit,
+    /// JMT snapshot from the speculative state-root computation.
+    /// Inserted into `PendingChain` so child verifications can chain on
+    /// top.
+    pub jmt_snapshot: Arc<JmtSnapshot>,
 }
 
 /// Build a proposal block, always computing the state root via `prepare_block_commit`.
@@ -176,8 +179,8 @@ pub struct ProposalResult<P: Send> {
 /// 3. Build `BlockHeader` + `Block`, hash it
 /// 4. Return block, hash, prepared commit handle
 #[allow(clippy::too_many_arguments)]
-pub fn build_proposal<S: ShardChainWriter + SubstateStore>(
-    storage: &S,
+pub fn build_proposal<S: ShardChainWriter>(
+    storage: &Arc<S>,
     proposer: ValidatorId,
     height: BlockHeight,
     round: Round,
@@ -198,8 +201,8 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore>(
     beacon_witness_root: BeaconWitnessRoot,
     beacon_witness_leaf_count: BeaconWitnessLeafCount,
     pending_snapshots: &[Arc<JmtSnapshot>],
-) -> ProposalResult<S::PreparedCommit> {
-    let (state_root, prepared) = storage.prepare_block_commit(
+) -> ProposalResult {
+    let (state_root, jmt_snapshot, prepared) = storage.prepare_block_commit(
         parent_state_root,
         parent_block_height,
         &certificates,
@@ -279,7 +282,8 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore>(
         block,
         block_hash,
         manifest,
-        prepared_commit: Some(prepared),
+        prepared_commit: prepared,
+        jmt_snapshot,
     }
 }
 
@@ -567,16 +571,19 @@ where
                 .pending_chain
                 .view_at(parent_block_hash, parent_block_height);
             let pending_snapshots = view.pending_snapshots().to_vec();
-            let state_root_ctx = StateRootContext {
-                storage: &*view,
+            let (computed_root, jmt_snapshot, prepared) = view.prepare_block_commit(
                 parent_state_root,
                 parent_block_height,
-                finalized_waves: &finalized_waves,
+                &finalized_waves,
                 block_height,
-                pending_snapshots: &pending_snapshots,
-                base_reads: None,
+                &pending_snapshots,
+                None,
+            );
+            let state_root_ctx = StateRootContext {
+                computed_root,
+                prepared,
             };
-            let verify_result = expected_root.verify(&state_root_ctx);
+            let verify_result = expected_root.verify(state_root_ctx);
             record_signature_verification_latency("state_root", start.elapsed().as_secs_f64());
             let event_result = match verify_result {
                 Ok(verified) => {
@@ -586,6 +593,7 @@ where
                         parent_block_hash,
                         block_height,
                         prepared,
+                        jmt_snapshot,
                         receipts: collect_finalized_receipts(&finalized_waves),
                     });
                     Ok(())
@@ -632,7 +640,7 @@ where
                 .view_at(parent_block_hash, parent_block_height);
             let pending_snapshots = view.pending_snapshots().to_vec();
             let result = build_proposal(
-                &*view,
+                &view,
                 proposer,
                 height,
                 round,
@@ -655,15 +663,14 @@ where
                 &pending_snapshots,
             );
             let block_hash = result.block_hash;
-            if let Some(prepared) = result.prepared_commit {
-                (ctx.commit_prepared)(PreparedBlock {
-                    block_hash,
-                    parent_block_hash,
-                    block_height: height,
-                    prepared,
-                    receipts: collect_finalized_receipts(&finalized_waves),
-                });
-            }
+            (ctx.commit_prepared)(PreparedBlock {
+                block_hash,
+                parent_block_hash,
+                block_height: height,
+                prepared: result.prepared_commit,
+                jmt_snapshot: result.jmt_snapshot,
+                receipts: collect_finalized_receipts(&finalized_waves),
+            });
             ctx.notify_protocol(ProtocolEvent::ProposalBuilt {
                 height,
                 round,
@@ -801,7 +808,7 @@ mod tests {
         );
         let already = vec![(
             0usize,
-            Verified::<BlockVote>::new_unchecked(v),
+            Verified::<BlockVote>::new_unchecked_for_test(v),
             VotePower::new(1),
         )];
         let out = verify_vote_batch(block_hash, b"msg", Vec::new(), already.clone());
@@ -908,7 +915,7 @@ mod tests {
                 let vote = make_vote(&keys, i, block_hash, height, round, 1000);
                 (
                     i,
-                    Verified::<BlockVote>::new_unchecked(vote),
+                    Verified::<BlockVote>::new_unchecked_for_test(vote),
                     VotePower::new(1),
                 )
             })
@@ -964,7 +971,7 @@ mod tests {
                 );
                 (
                     i,
-                    Verified::<BlockVote>::new_unchecked(vote),
+                    Verified::<BlockVote>::new_unchecked_for_test(vote),
                     VotePower::new(1),
                 )
             })
@@ -993,7 +1000,7 @@ mod tests {
         let verified = vec![
             (
                 0usize,
-                Verified::<BlockVote>::new_unchecked(make_vote(
+                Verified::<BlockVote>::new_unchecked_for_test(make_vote(
                     &keys,
                     0,
                     block_hash,
@@ -1005,7 +1012,7 @@ mod tests {
             ),
             (
                 1,
-                Verified::<BlockVote>::new_unchecked(make_vote(
+                Verified::<BlockVote>::new_unchecked_for_test(make_vote(
                     &keys,
                     1,
                     block_hash,
@@ -1017,7 +1024,7 @@ mod tests {
             ),
             (
                 2,
-                Verified::<BlockVote>::new_unchecked(make_vote(
+                Verified::<BlockVote>::new_unchecked_for_test(make_vote(
                     &keys,
                     2,
                     block_hash,
@@ -1054,7 +1061,7 @@ mod tests {
         let verified = vec![
             (
                 0usize,
-                Verified::<BlockVote>::new_unchecked(make_vote(
+                Verified::<BlockVote>::new_unchecked_for_test(make_vote(
                     &keys,
                     0,
                     block_hash,
@@ -1066,7 +1073,7 @@ mod tests {
             ),
             (
                 1,
-                Verified::<BlockVote>::new_unchecked(make_vote(
+                Verified::<BlockVote>::new_unchecked_for_test(make_vote(
                     &keys,
                     1,
                     block_hash,
@@ -1078,7 +1085,7 @@ mod tests {
             ),
             (
                 2,
-                Verified::<BlockVote>::new_unchecked(make_vote(
+                Verified::<BlockVote>::new_unchecked_for_test(make_vote(
                     &keys,
                     2,
                     block_hash,

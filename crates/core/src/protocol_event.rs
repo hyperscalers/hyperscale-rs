@@ -7,7 +7,6 @@
 
 use std::sync::Arc;
 
-use hyperscale_storage::StateRootVerifyError;
 use hyperscale_types::{
     BeaconProposal, BeaconWitnessRoot, BeaconWitnessRootVerifyError, Block, BlockHash, BlockHeader,
     BlockHeight, BlockManifest, BlockVote, CertRootVerifyError, CertificateRoot,
@@ -16,9 +15,9 @@ use hyperscale_types::{
     LocalReceiptRootVerifyError, PcQc3, PcVector, PcVoteMessage, ProvisionRootVerifyError,
     ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, QcVerifyError,
     QuorumCertificate, ReadySignal, Round, RoutableTransaction, ShardGroupId, ShardWitness,
-    SkipEpochCert, SkipRequest, SpcCert, SpcEmptyViewMsg, SpcView, StoredReceipt, TransactionRoot,
-    TxOutcome, TxRootVerifyError, ValidatorId, Verifiable, Verified, VotePower, WaveId,
-    WeightedTimestamp,
+    SkipEpochCert, SkipRequest, SpcCert, SpcEmptyViewMsg, SpcView, StateRootVerifyError,
+    StoredReceipt, TransactionRoot, TxOutcome, TxRootVerifyError, ValidatorId, Verifiable,
+    Verified, VotePower, WaveId, WeightedTimestamp,
 };
 
 /// How a node learned about the certifying QC that commits a given block.

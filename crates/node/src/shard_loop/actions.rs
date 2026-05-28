@@ -12,10 +12,10 @@ use hyperscale_metrics::record_transaction_finalized;
 use hyperscale_network::Network;
 use hyperscale_provisions::action_handlers::handle_action as handle_provisions_action;
 use hyperscale_shard::action_handlers::handle_action as handle_shard_action;
-use hyperscale_storage::{BeaconWitnessCommit, ShardStorage};
+use hyperscale_storage::ShardStorage;
 use hyperscale_types::{
-    BlockHeight, CertifiedBlock, QuorumCertificate, StateRoot, TopologySnapshot, TransactionStatus,
-    TxHash, Verified,
+    BeaconWitnessCommit, BlockHeight, CertifiedBlock, QuorumCertificate, StateRoot,
+    TopologySnapshot, TransactionStatus, TxHash, Verified,
 };
 use tracing::{debug, error, trace, warn};
 
@@ -460,7 +460,7 @@ where
         let event_sender = self.event_sender().clone();
         let dispatch = self.process.dispatch.clone();
         let io = &mut self.io;
-        io.block_commit.flush(&io.storage, &event_sender, &dispatch);
+        io.block_commit.flush(&event_sender, &dispatch);
     }
 
     /// Dispatch a typed fetch request to the corresponding binding.

@@ -108,21 +108,15 @@ impl<T, A> Verified<T, A> {
     /// running the predicate. The caller asserts the predicate holds
     /// via an out-of-band trust source.
     ///
-    /// Production callers prefer named typed gates (`genesis`,
-    /// `from_persisted`, `assemble`, `from_external_qc`,
-    /// `from_pipeline_attestation`, …) — the gate's body delegates here
-    /// under a documented trust source. Direct callers outside
-    /// `crates/types` are limited to:
-    /// - [`Verify`] impls in downstream crates (e.g. `StateRoot` in
-    ///   `crates/storage`, per Decision 19 of the typestate plan),
-    ///   producing their typed output after the predicate check.
-    /// - Test fixtures via [`Self::new_unchecked_with_for_test`]
-    ///   (re-exported behind the `test-utils` feature).
-    ///
-    /// Every direct call site outside `crates/types` carries a
-    /// `// SAFETY:` comment naming the trust source.
+    /// Production callers reach this through the named typed gates
+    /// (`genesis`, `from_persisted`, `assemble`, `from_external_qc`,
+    /// `from_pipeline_attestation`, …) defined inside `crates/types`,
+    /// each delegating here under a documented trust source. The only
+    /// outside-`crates/types` access is via
+    /// [`Self::new_unchecked_with_for_test`], re-exported behind the
+    /// `test-utils` feature for fixture construction.
     #[must_use]
-    pub const fn new_unchecked_with(inner: T, augment: A) -> Self {
+    pub(crate) const fn new_unchecked_with(inner: T, augment: A) -> Self {
         Self { inner, augment }
     }
 
@@ -158,7 +152,7 @@ impl<T> Verified<T, ()> {
     /// Witness-form sibling of [`Self::new_unchecked_with`]; same trust
     /// contract, no augment value.
     #[must_use]
-    pub const fn new_unchecked(inner: T) -> Self {
+    pub(crate) const fn new_unchecked(inner: T) -> Self {
         Self { inner, augment: () }
     }
 

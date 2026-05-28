@@ -392,7 +392,7 @@ mod tests {
             WeightedTimestamp::from_millis(1000),
         );
         // SAFETY: synthetic test fixture, no real signature.
-        let qc = Verified::<QuorumCertificate>::new_unchecked(qc);
+        let qc = Verified::<QuorumCertificate>::new_unchecked_for_test(qc);
 
         run_view(
             0,

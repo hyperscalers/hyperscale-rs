@@ -2113,7 +2113,8 @@ mod tests {
         let block = assembly_block();
         let block_hash = block.hash();
         let header = block.header().clone();
-        let verified_qc = Verified::<QuorumCertificate>::new_unchecked(assembly_qc_for(&block));
+        let verified_qc =
+            Verified::<QuorumCertificate>::new_unchecked_for_test(assembly_qc_for(&block));
 
         vp.track_pending_assembly(Arc::new(block));
         assert_eq!(vp.pending_assembly_count(), 1);
@@ -2124,7 +2125,7 @@ mod tests {
 
         // Beacon-witness arrives — state root still outstanding.
         let beacon_verified =
-            Verified::<BeaconWitnessRoot>::new_unchecked(header.beacon_witness_root());
+            Verified::<BeaconWitnessRoot>::new_unchecked_for_test(header.beacon_witness_root());
         assert!(
             vp.record_beacon_witness_root_result(block_hash, beacon_verified)
                 .is_none()
@@ -2152,7 +2153,8 @@ mod tests {
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
         let block = assembly_block();
         let block_hash = block.hash();
-        let verified_qc = Verified::<QuorumCertificate>::new_unchecked(assembly_qc_for(&block));
+        let verified_qc =
+            Verified::<QuorumCertificate>::new_unchecked_for_test(assembly_qc_for(&block));
 
         // Beacon-witness + state root verify before the QC arrives.
         vp.roots.insert(
@@ -2178,7 +2180,8 @@ mod tests {
     fn record_qc_assembly_returns_none_for_unknown_block() {
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
         let block = assembly_block();
-        let verified_qc = Verified::<QuorumCertificate>::new_unchecked(assembly_qc_for(&block));
+        let verified_qc =
+            Verified::<QuorumCertificate>::new_unchecked_for_test(assembly_qc_for(&block));
         assert!(vp.record_qc_assembly(block.hash(), verified_qc).is_none());
         assert_eq!(vp.pending_assembly_count(), 0);
     }
