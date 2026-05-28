@@ -390,15 +390,19 @@ impl Verified<CertifiedBlock> {
 
     /// Consume into a verified-`Block` + verified-QC pair. Total by the
     /// [`Verified<CertifiedBlock>`] predicate.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner `qc` is not in the verified arm. The
+    /// [`Verified<CertifiedBlock>`] predicate forbids this: every gate
+    /// ([`Self::assemble`], [`Self::from_qc_attestation`],
+    /// [`Self::genesis`]) constructs the wrapper as `Verified`.
     #[must_use]
     pub fn into_verified_parts(self) -> (Verified<Block>, Verified<QuorumCertificate>) {
         let CertifiedBlock { block, qc } = self.into_inner();
-        let qc = match qc {
-            Verifiable::Verified(v) => v,
-            Verifiable::Unverified(_) => {
-                unreachable!("Verified<CertifiedBlock> predicate guarantees qc is Verified")
-            }
-        };
+        let qc = qc
+            .into_verified()
+            .expect("Verified<CertifiedBlock> predicate guarantees qc is Verified");
         // SAFETY: the `Verified<CertifiedBlock>` predicate carries the
         // block's per-root claim either locally (via [`Self::assemble`])
         // or by BFT-transitive attestation (via

@@ -207,6 +207,52 @@ impl<T> Verifiable<T> {
             Self::Unverified(_) => unreachable!("just set above"),
         }
     }
+
+    /// Consume and return a [`Verified<T>`], running `Verify::verify`
+    /// only when the marker isn't already live. The verified arm
+    /// short-circuits; the unverified arm runs the predicate and
+    /// packages the raw value alongside the error on failure so the
+    /// caller can still report or buffer it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `(T, <T as Verify<Ctx>>::Error)` if the predicate fails
+    /// on the unverified arm.
+    pub fn upgrade<Ctx>(self, ctx: Ctx) -> Result<Verified<T>, (T, T::Error)>
+    where
+        T: Verify<Ctx>,
+    {
+        match self {
+            Self::Verified(v) => Ok(v),
+            Self::Unverified(t) => match t.verify(ctx) {
+                Ok(v) => Ok(v),
+                Err(e) => Err((t, e)),
+            },
+        }
+    }
+
+    /// Whether the wrapper holds a verified value. Named alias of
+    /// `self.verified().is_some()` for readable assertions.
+    #[must_use]
+    pub const fn is_verified(&self) -> bool {
+        matches!(self, Self::Verified(_))
+    }
+
+    /// Consume the wrapper, returning `Some(verified)` only when the
+    /// marker is live. The raw `T` on the unverified arm is dropped —
+    /// callers that need to recover or report the raw should use
+    /// [`Self::upgrade`] or [`Self::into_unverified`] instead.
+    ///
+    /// Sized for the narrow case where an upstream type-level invariant
+    /// already proves the wrapper is verified and the caller wants the
+    /// inner [`Verified<T>`] by value without running the predicate.
+    #[must_use]
+    pub fn into_verified(self) -> Option<Verified<T>> {
+        match self {
+            Self::Verified(v) => Some(v),
+            Self::Unverified(_) => None,
+        }
+    }
 }
 
 impl<T: PartialEq> PartialEq for Verifiable<T> {
@@ -416,5 +462,57 @@ mod tests {
         let mut v: V = Verifiable::Verified(Verified::new_unchecked(7));
         let r = v.upgrade_in_place(()).unwrap();
         assert_eq!(r.as_ref(), &7);
+    }
+
+    /// Test-only verifier that always fails, paired with `u64` so it
+    /// doesn't collide with the infallible `u32` verifier above.
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct AlwaysFails;
+
+    impl Verify<()> for u64 {
+        type Error = AlwaysFails;
+        fn verify(&self, _ctx: ()) -> Result<Verified<Self>, Self::Error> {
+            Err(AlwaysFails)
+        }
+    }
+
+    #[test]
+    fn upgrade_verified_short_circuits() {
+        let v: V = Verified::new_unchecked(7u32).into();
+        let verified = v.upgrade(()).expect("verified arm short-circuits");
+        assert_eq!(verified.as_ref(), &7);
+    }
+
+    #[test]
+    fn upgrade_unverified_runs_predicate() {
+        let v: V = 42u32.into();
+        let verified = v.upgrade(()).expect("u32 verifier is infallible");
+        assert_eq!(verified.as_ref(), &42);
+    }
+
+    #[test]
+    fn upgrade_unverified_packages_raw_with_error() {
+        let v: Verifiable<u64> = 99u64.into();
+        let (raw, err) = v.upgrade(()).expect_err("u64 verifier always fails");
+        assert_eq!(raw, 99);
+        assert_eq!(err, AlwaysFails);
+    }
+
+    #[test]
+    fn is_verified_matches_state() {
+        let unv: V = 7u32.into();
+        let ver: V = Verified::new_unchecked(7u32).into();
+        assert!(!unv.is_verified());
+        assert!(ver.is_verified());
+    }
+
+    #[test]
+    fn into_verified_extracts_only_verified_arm() {
+        let ver: V = Verified::new_unchecked(7u32).into();
+        let inner = ver.into_verified().expect("verified arm yields Some");
+        assert_eq!(inner.as_ref(), &7);
+
+        let unv: V = 99u32.into();
+        assert!(unv.into_verified().is_none());
     }
 }

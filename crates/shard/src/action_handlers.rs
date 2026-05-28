@@ -348,24 +348,22 @@ where
             quorum_threshold,
             block_hash,
         } => {
-            let result = match qc {
-                // Short-circuit: caller already holds the verified
-                // witness (cached verified QC, local-dispatch from a
-                // colocated origin). Skip BLS aggregation.
-                Verifiable::Verified(verified) => Ok(verified),
-                Verifiable::Unverified(raw) => {
-                    let start = std::time::Instant::now();
-                    let qc_ctx = QcContext {
-                        network: ctx.topology_snapshot.network(),
-                        public_keys: &public_keys,
-                        voting_powers: &voting_powers,
-                        quorum_threshold,
-                    };
-                    let result = raw.verify(&qc_ctx);
-                    record_signature_verification_latency("qc", start.elapsed().as_secs_f64());
-                    result
-                }
+            let qc_ctx = QcContext {
+                network: ctx.topology_snapshot.network(),
+                public_keys: &public_keys,
+                voting_powers: &voting_powers,
+                quorum_threshold,
             };
+            // The verified arm short-circuits inside `upgrade`; only the
+            // unverified arm performs BLS work, so we gate the latency
+            // metric on `is_verified` to keep the histogram aligned with
+            // actual aggregation calls.
+            let measured = !qc.is_verified();
+            let start = std::time::Instant::now();
+            let result = qc.upgrade(&qc_ctx).map_err(|(_, err)| err);
+            if measured {
+                record_signature_verification_latency("qc", start.elapsed().as_secs_f64());
+            }
             ctx.notify_protocol(ProtocolEvent::QcSignatureVerified { block_hash, result });
         }
 

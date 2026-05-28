@@ -24,8 +24,8 @@ use hyperscale_types::network::notification::{
 };
 use hyperscale_types::{
     ExecutionCertificate, ExecutionCertificateContext, ExecutionVote, FinalizedWaveContext, NodeId,
-    RoutableTransaction, ShardGroupId, StoredReceipt, Verifiable, Verified, Verify,
-    exec_cert_batch_message, exec_vote_batch_message, shard_for_node,
+    RoutableTransaction, ShardGroupId, StoredReceipt, Verified, exec_cert_batch_message,
+    exec_vote_batch_message, shard_for_node,
 };
 
 // ============================================================================
@@ -152,33 +152,24 @@ where
                 network: ctx.topology_snapshot.network(),
                 public_keys: &public_keys,
             };
-            let result = match certificate {
-                Verifiable::Verified(verified) => Ok(Arc::new(verified)),
-                Verifiable::Unverified(raw) => match raw.verify(&ctx_ec) {
-                    Ok(verified) => Ok(Arc::new(verified)),
-                    Err(err) => Err((Arc::new(raw), err)),
-                },
-            };
+            let result = certificate
+                .upgrade(&ctx_ec)
+                .map(Arc::new)
+                .map_err(|(raw, err)| (Arc::new(raw), err));
             ctx.notify_protocol(ProtocolEvent::ExecutionCertificateSignatureVerified { result });
         }
         Action::VerifyFinalizedWave {
             wave,
             ec_public_keys,
         } => {
-            let network = ctx.topology_snapshot.network();
-            let result = match Arc::unwrap_or_clone(wave) {
-                Verifiable::Verified(verified) => Ok(Arc::new(verified)),
-                Verifiable::Unverified(raw) => {
-                    let fw_ctx = FinalizedWaveContext {
-                        network,
-                        ec_public_keys: &ec_public_keys,
-                    };
-                    match raw.verify(&fw_ctx) {
-                        Ok(verified) => Ok(Arc::new(verified)),
-                        Err(err) => Err((Arc::new(raw), err)),
-                    }
-                }
+            let fw_ctx = FinalizedWaveContext {
+                network: ctx.topology_snapshot.network(),
+                ec_public_keys: &ec_public_keys,
             };
+            let result = Arc::unwrap_or_clone(wave)
+                .upgrade(&fw_ctx)
+                .map(Arc::new)
+                .map_err(|(raw, err)| (Arc::new(raw), err));
             ctx.notify_protocol(ProtocolEvent::FinalizedWaveVerified { result });
         }
         Action::ExecuteTransactions {
