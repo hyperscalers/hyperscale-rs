@@ -775,13 +775,10 @@ impl ExecutionCoordinator {
         // Already-verified votes (own votes from the sign-and-send gate, or
         // future cached-verified inputs) skip the buffer + batch-verify
         // round trip and land directly in the verified tally.
-        if vote.is_verified() {
-            let verified = vote
-                .into_verified()
-                .expect("is_verified() returned true on the line above");
-            return self.handle_verified_vote(topology, verified);
-        }
-        let vote = vote.into_unverified();
+        let vote = match vote.into_verified() {
+            Ok(verified) => return self.handle_verified_vote(topology, verified),
+            Err(raw) => raw,
+        };
 
         // Committee membership was confirmed above; the topology snapshot
         // invariant guarantees both the public key and the voting power

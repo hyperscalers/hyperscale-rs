@@ -250,19 +250,23 @@ impl<T> Verifiable<T> {
         matches!(self.0, VerifiableState::Verified(_))
     }
 
-    /// Consume the wrapper, returning `Some(verified)` only when the
-    /// marker is live. The raw `T` on the unverified arm is dropped —
-    /// callers that need to recover or report the raw should use
-    /// [`Self::upgrade`] or [`Self::into_unverified`] instead.
+    /// Consume the wrapper, returning `Ok(verified)` when the marker
+    /// is live and `Err(raw)` when it isn't — the unverified arm has
+    /// to be matched, so the raw cannot silently disappear. Callers
+    /// that want to verify on the `Err` arm should use
+    /// [`Self::upgrade`] instead.
     ///
     /// Sized for the narrow case where an upstream type-level invariant
     /// already proves the wrapper is verified and the caller wants the
     /// inner [`Verified<T>`] by value without running the predicate.
-    #[must_use]
-    pub fn into_verified(self) -> Option<Verified<T>> {
+    ///
+    /// # Errors
+    ///
+    /// Returns the recovered raw `T` on the unverified arm.
+    pub fn into_verified(self) -> Result<Verified<T>, T> {
         match self.0 {
-            VerifiableState::Verified(v) => Some(v),
-            VerifiableState::Unverified(_) => None,
+            VerifiableState::Verified(v) => Ok(v),
+            VerifiableState::Unverified(t) => Err(t),
         }
     }
 }
@@ -519,10 +523,13 @@ mod tests {
     #[test]
     fn into_verified_extracts_only_verified_arm() {
         let ver: V = Verified::new_unchecked(7u32).into();
-        let inner = ver.into_verified().expect("verified arm yields Some");
+        let inner = ver.into_verified().expect("verified arm yields Ok");
         assert_eq!(inner.as_ref(), &7);
 
         let unv: V = 99u32.into();
-        assert!(unv.into_verified().is_none());
+        let raw = unv
+            .into_verified()
+            .expect_err("unverified arm yields Err with the raw");
+        assert_eq!(raw, 99);
     }
 }
