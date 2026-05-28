@@ -23,7 +23,8 @@ use tracing::warn;
 use crate::event::ShardScopedInput;
 use crate::host::NodeHost;
 use crate::shard_io::verify::{
-    resolve_sender_key, verify_bls_with_metrics, verify_sender_signature,
+    resolve_sender_key, verify_bls_with_metrics, verify_signed_by_committee,
+    verify_signed_by_proposer,
 };
 use crate::shard_loop::{push_protocol_event, push_shard_input};
 
@@ -480,27 +481,7 @@ where
                         return;
                     };
                     let topo = topology.load();
-                    let proposer = gossip.header.proposer();
-                    let Some(public_key) = topo.public_key(proposer) else {
-                        warn!(
-                            proposer = proposer.inner(),
-                            "Unknown proposer for block header"
-                        );
-                        return;
-                    };
-                    let msg = gossip.signing_message(topo.network());
-                    if !verify_bls_with_metrics(
-                        &msg,
-                        &public_key,
-                        &gossip.proposer_signature,
-                        "block_header",
-                    ) {
-                        warn!(
-                            proposer = proposer.inner(),
-                            height = gossip.header.height().inner(),
-                            round = gossip.header.round().inner(),
-                            "Block header proposer signature invalid — dropping"
-                        );
+                    if !verify_signed_by_proposer(&topo, &gossip, "block_header", "block header") {
                         return;
                     }
                     let (header, manifest, _sig) = gossip.into_parts();
@@ -533,15 +514,11 @@ where
                     };
 
                     let topo = topology.load();
-                    let sender = notification.sender;
                     let source_shard = notification.provisions.source_shard();
-                    let msg = notification.signing_message(topo.network());
-                    if !verify_sender_signature(
+                    if !verify_signed_by_committee(
                         &topo,
-                        sender,
                         source_shard,
-                        &msg,
-                        &notification.sender_signature,
+                        &notification,
                         "state_provisions",
                         "state provision",
                     ) {
@@ -584,14 +561,10 @@ where
                     };
 
                     let topo = topology.load();
-                    let sender = batch.sender;
-                    let msg = batch.signing_message(topo.network(), target_shard);
-                    if !verify_sender_signature(
+                    if !verify_signed_by_committee(
                         &topo,
-                        sender,
                         target_shard,
-                        &msg,
-                        &batch.sender_signature,
+                        &batch,
                         "exec_vote_batch",
                         "execution vote batch",
                     ) {
@@ -627,7 +600,6 @@ where
                         return;
                     }
 
-                    let topo = topology.load();
                     let sender = batch.sender;
                     let source_shard = batch.certificates[0].shard_group_id();
                     if batch
@@ -641,14 +613,12 @@ where
                         );
                         return;
                     }
+                    let topo = topology.load();
                     // Sender signed with source_shard (their local shard), not our local shard
-                    let msg = batch.signing_message(topo.network(), source_shard);
-                    if !verify_sender_signature(
+                    if !verify_signed_by_committee(
                         &topo,
-                        sender,
                         source_shard,
-                        &msg,
-                        &batch.sender_signature,
+                        &batch,
                         "exec_cert_batch",
                         "execution certificate batch",
                     ) {

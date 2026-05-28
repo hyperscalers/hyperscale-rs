@@ -6,7 +6,7 @@ use sbor::prelude::BasicSbor;
 
 use crate::{
     BlockHeader, BlockManifest, Bls12381G2Signature, MessageClass, NetworkDefinition,
-    NetworkMessage, block_header_message,
+    NetworkMessage, Signed, ValidatorId, block_header_message,
 };
 
 /// Notifies committee members of a block proposal (header + manifest, not full block).
@@ -42,18 +42,6 @@ impl BlockHeaderNotification {
         }
     }
 
-    /// Build the domain-separated signing message for this block header.
-    #[must_use]
-    pub fn signing_message(&self, network: &NetworkDefinition) -> Vec<u8> {
-        block_header_message(
-            network,
-            self.header.shard_group_id(),
-            self.header.height(),
-            self.header.round(),
-            &self.header.hash(),
-        )
-    }
-
     /// Consume and return header (as `Arc`), manifest, and proposer signature.
     #[must_use]
     pub fn into_parts(self) -> (Arc<BlockHeader>, BlockManifest, Bls12381G2Signature) {
@@ -62,6 +50,28 @@ impl BlockHeaderNotification {
 }
 
 // Network message implementation
+impl Signed for BlockHeaderNotification {
+    /// The proposer is the implicit signer — no separate `sender` field
+    /// rides on this notification.
+    fn signer(&self) -> ValidatorId {
+        self.header.proposer()
+    }
+
+    fn signature(&self) -> &Bls12381G2Signature {
+        &self.proposer_signature
+    }
+
+    fn signing_message(&self, network: &NetworkDefinition) -> Vec<u8> {
+        block_header_message(
+            network,
+            self.header.shard_group_id(),
+            self.header.height(),
+            self.header.round(),
+            &self.header.hash(),
+        )
+    }
+}
+
 impl NetworkMessage for BlockHeaderNotification {
     fn message_type_id() -> &'static str {
         "block.header"

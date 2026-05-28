@@ -4,7 +4,7 @@ use sbor::prelude::BasicSbor;
 
 use crate::{
     Bls12381G2Signature, ExecutionVote, MessageClass, NetworkDefinition, NetworkMessage,
-    ShardGroupId, ValidatorId, exec_vote_batch_message,
+    ShardGroupId, Signed, ValidatorId, exec_vote_batch_message,
 };
 
 /// Batched execution votes within a shard.
@@ -36,12 +36,6 @@ impl ExecutionVotesNotification {
         }
     }
 
-    /// Build the canonical signing message for this batch.
-    #[must_use]
-    pub fn signing_message(&self, network: &NetworkDefinition, shard: ShardGroupId) -> Vec<u8> {
-        exec_vote_batch_message(network, shard, &self.votes)
-    }
-
     /// Get the votes.
     #[must_use]
     pub fn votes(&self) -> &[ExecutionVote] {
@@ -64,6 +58,28 @@ impl ExecutionVotesNotification {
     #[must_use]
     pub const fn len(&self) -> usize {
         self.votes.len()
+    }
+}
+
+impl Signed for ExecutionVotesNotification {
+    fn signer(&self) -> ValidatorId {
+        self.sender
+    }
+
+    fn signature(&self) -> &Bls12381G2Signature {
+        &self.sender_signature
+    }
+
+    /// Derives the batch's shard from `votes[0]`. Empty batches use a
+    /// sentinel shard so the resulting message can never match a real
+    /// signature; the `IoLoop` also early-drops empty batches before
+    /// verification, so this branch is defensive only.
+    fn signing_message(&self, network: &NetworkDefinition) -> Vec<u8> {
+        let shard = self
+            .votes
+            .first()
+            .map_or(ShardGroupId::new(0), ExecutionVote::shard_group_id);
+        exec_vote_batch_message(network, shard, &self.votes)
     }
 }
 

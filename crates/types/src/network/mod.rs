@@ -47,6 +47,9 @@ pub mod gossip;
 pub mod notification;
 pub mod request;
 pub mod response;
+mod signed;
+
+pub use signed::{Signed, SignedContext, SignedVerifyError};
 
 /// Network message class.
 ///

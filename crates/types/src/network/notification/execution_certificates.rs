@@ -4,7 +4,7 @@ use sbor::prelude::BasicSbor;
 
 use crate::{
     Bls12381G2Signature, ExecutionCertificate, MessageClass, NetworkDefinition, NetworkMessage,
-    ShardGroupId, ValidatorId, exec_cert_batch_message,
+    ShardGroupId, Signed, ValidatorId, exec_cert_batch_message,
 };
 
 /// Batched execution certificates proving quorum for execution waves.
@@ -37,12 +37,6 @@ impl ExecutionCertificatesNotification {
         }
     }
 
-    /// Build the canonical signing message for this batch.
-    #[must_use]
-    pub fn signing_message(&self, network: &NetworkDefinition, shard: ShardGroupId) -> Vec<u8> {
-        exec_cert_batch_message(network, shard, &self.certificates)
-    }
-
     /// Get the certificates.
     #[must_use]
     pub fn certificates(&self) -> &[ExecutionCertificate] {
@@ -65,6 +59,28 @@ impl ExecutionCertificatesNotification {
     #[must_use]
     pub const fn len(&self) -> usize {
         self.certificates.len()
+    }
+}
+
+impl Signed for ExecutionCertificatesNotification {
+    fn signer(&self) -> ValidatorId {
+        self.sender
+    }
+
+    fn signature(&self) -> &Bls12381G2Signature {
+        &self.sender_signature
+    }
+
+    /// Derives the batch's shard from `certificates[0]`. Empty batches use
+    /// a sentinel shard so the resulting message can never match a real
+    /// signature; the `IoLoop` also early-drops empty batches before
+    /// verification, so this branch is defensive only.
+    fn signing_message(&self, network: &NetworkDefinition) -> Vec<u8> {
+        let shard = self
+            .certificates
+            .first()
+            .map_or(ShardGroupId::new(0), ExecutionCertificate::shard_group_id);
+        exec_cert_batch_message(network, shard, &self.certificates)
     }
 }
 

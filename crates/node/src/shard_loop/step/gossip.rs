@@ -17,15 +17,16 @@ use std::sync::Arc;
 
 use hyperscale_core::ProtocolEvent;
 use hyperscale_dispatch::{Dispatch, DispatchPool};
+use hyperscale_metrics::record_signature_verification_latency;
 use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
+use hyperscale_types::network::gossip::CommittedBlockHeaderGossip;
 use hyperscale_types::{
-    Bls12381G1PublicKey, Bls12381G2Signature, CommittedBlockHeader, ValidatorId,
-    committed_block_header_message,
+    Bls12381G1PublicKey, Bls12381G2Signature, CommittedBlockHeader, Signed, SignedContext,
+    ValidatorId,
 };
 
 use crate::shard_io::CommittedHeaderVerificationItem;
-use crate::shard_io::verify::verify_bls_with_metrics;
 use crate::shard_loop::{ShardLoop, push_protocol_event};
 
 impl<S, N, D> ShardLoop<S, N, D>
@@ -72,31 +73,35 @@ where
             .spawn(DispatchPool::Throughput, move || {
                 let topo = topology.load();
                 for (committed_header, sender, public_key, sender_signature) in items {
-                    let msg = committed_block_header_message(
-                        topo.network(),
-                        committed_header.header().shard_group_id(),
-                        committed_header.header().height(),
-                        &committed_header.header().hash(),
-                    );
-                    let valid = verify_bls_with_metrics(
-                        &msg,
-                        &public_key,
-                        &sender_signature,
+                    let gossip = CommittedBlockHeaderGossip {
+                        committed_header,
+                        sender,
+                        sender_signature,
+                    };
+                    let start = std::time::Instant::now();
+                    let valid = gossip
+                        .verify_signature(&SignedContext {
+                            network: topo.network(),
+                            public_key: &public_key,
+                        })
+                        .is_ok();
+                    record_signature_verification_latency(
                         "committed_header",
+                        start.elapsed().as_secs_f64(),
                     );
                     if valid {
                         push_protocol_event(
                             &event_tx,
                             shard,
                             ProtocolEvent::RemoteHeaderReceived {
-                                committed_header,
-                                sender,
+                                committed_header: gossip.committed_header,
+                                sender: gossip.sender,
                             },
                         );
                     } else {
                         tracing::warn!(
-                            sender = sender.inner(),
-                            height = committed_header.header().height().inner(),
+                            sender = gossip.sender.inner(),
+                            height = gossip.committed_header.header().height().inner(),
                             "Committed header sender signature verification failed"
                         );
                     }

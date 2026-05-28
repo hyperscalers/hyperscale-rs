@@ -5,8 +5,8 @@ use std::sync::Arc;
 use sbor::prelude::BasicSbor;
 
 use crate::{
-    Bls12381G2Signature, MessageClass, NetworkDefinition, NetworkMessage, Provisions, ValidatorId,
-    state_provisions_message,
+    Bls12381G2Signature, MessageClass, NetworkDefinition, NetworkMessage, Provisions, Signed,
+    ValidatorId, state_provisions_message,
 };
 
 /// Cross-shard state provisions for one (`source_block`, `target_shard`) pair.
@@ -38,10 +38,18 @@ impl ProvisionsNotification {
             sender_signature,
         }
     }
+}
 
-    /// Build the canonical signing message for this notification.
-    #[must_use]
-    pub fn signing_message(&self, network: &NetworkDefinition) -> Vec<u8> {
+impl Signed for ProvisionsNotification {
+    fn signer(&self) -> ValidatorId {
+        self.sender
+    }
+
+    fn signature(&self) -> &Bls12381G2Signature {
+        &self.sender_signature
+    }
+
+    fn signing_message(&self, network: &NetworkDefinition) -> Vec<u8> {
         state_provisions_message(network, &self.provisions)
     }
 }

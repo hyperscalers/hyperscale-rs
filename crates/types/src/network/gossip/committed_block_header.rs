@@ -7,7 +7,7 @@ use sbor::prelude::BasicSbor;
 use crate::network::{GossipMessage, TopicScope};
 use crate::{
     Bls12381G2Signature, CommittedBlockHeader, MessageClass, NetworkDefinition, NetworkMessage,
-    ShardGroupId, ValidatorId, committed_block_header_message,
+    ShardGroupId, Signed, ValidatorId, committed_block_header_message,
 };
 
 /// Gossips a committed block header globally to all shards.
@@ -26,12 +26,16 @@ pub struct CommittedBlockHeaderGossip {
     pub sender_signature: Bls12381G2Signature,
 }
 
-impl CommittedBlockHeaderGossip {
-    /// Build the canonical signing message for this gossip.
-    ///
-    /// Uses `DOMAIN_COMMITTED_BLOCK_HEADER` tag for domain separation.
-    #[must_use]
-    pub fn signing_message(&self, network: &NetworkDefinition) -> Vec<u8> {
+impl Signed for CommittedBlockHeaderGossip {
+    fn signer(&self) -> ValidatorId {
+        self.sender
+    }
+
+    fn signature(&self) -> &Bls12381G2Signature {
+        &self.sender_signature
+    }
+
+    fn signing_message(&self, network: &NetworkDefinition) -> Vec<u8> {
         committed_block_header_message(
             network,
             self.committed_header.header().shard_group_id(),
