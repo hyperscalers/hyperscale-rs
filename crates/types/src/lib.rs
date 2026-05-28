@@ -110,10 +110,9 @@ pub use shard::roots::{
     BeaconWitnessRootContext, BeaconWitnessRootVerifyError, CertRootVerifyError,
     CertificateRootContext, LocalReceiptRootContext, LocalReceiptRootVerifyError,
     ProvisionRootVerifyError, ProvisionTxRootsContext, ProvisionTxRootsMap,
-    ProvisionTxRootsVerifyError, ProvisionsRootContext, TransactionRootContext, TxRootVerifyError,
-    derive_leaves, missed_proposals_since_prev_commit,
+    ProvisionTxRootsVerifyError, ProvisionsRootContext, StateRootContext, StateRootVerifyError,
+    TransactionRootContext, TxRootVerifyError, derive_leaves, missed_proposals_since_prev_commit,
 };
-pub use shard::state_root::{StateRootContext, StateRootVerifyError};
 pub use shard::vote::{BlockVote, BlockVoteContext, BlockVoteVerifyError};
 pub use shard::{
     Block, SharedCertificates, SharedProvisions, SharedTransactions, VerifiedBlockAssembleError,
