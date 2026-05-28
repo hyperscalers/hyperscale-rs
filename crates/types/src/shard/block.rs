@@ -323,6 +323,18 @@ impl Verified<Block> {
     /// makes the predicate structurally unforgeable — no caller can
     /// fabricate a "verified" marker without having run the check.
     ///
+    /// The witnesses are **not** rebound to the block at this layer: a
+    /// `Verified<TransactionRoot>` carries a typed claim that some root
+    /// equals the merkle commitment over some content, but the verifier
+    /// doesn't record which block the content came from. Pairing each
+    /// witness with this block's content is the caller's responsibility
+    /// — in practice the verification pipeline keys per-root slots by
+    /// `block_hash` so the witness fed into `assemble` is always the one
+    /// produced from this block's own dispatch. Direct callers outside
+    /// that pipeline (tests, future helpers) must uphold the same
+    /// pairing or the resulting `Verified<Block>`'s internal-commitment
+    /// claim becomes unsound.
+    ///
     /// State-root verification is intentionally not a witness here. Its
     /// verified value (`Verified<StateRoot, PreparedCommit>`) carries a
     /// byproduct that the action handler side-channels via

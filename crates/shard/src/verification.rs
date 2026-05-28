@@ -439,11 +439,11 @@ impl VerificationPipeline {
     ///   is prefilled with `VerifiedXRoot::new_unchecked(header.x_root())`
     ///   — for empty inputs the header's claimed root must equal the
     ///   empty-input compute, so the predicate is trivially satisfied;
-    /// - if the verification has already completed (its kind is in
-    ///   `verified_roots`) the slot is prefilled with the same
-    ///   `new_unchecked` wrap of the header's claim — the verifier
-    ///   produced exactly that value on success and the audit point is
-    ///   the verified-roots set;
+    /// - if the verification has already completed (its `(block_hash,
+    ///   kind)` entry in [`Self::roots`] is `RootStage::Verified`) the
+    ///   slot is prefilled with the same `new_unchecked` wrap of the
+    ///   header's claim — the verifier produced exactly that value on
+    ///   success and that map entry is the audit source;
     /// - otherwise the slot starts `None` and lands via the matching
     ///   `record_<kind>_root_result` setter.
     pub fn track_pending_assembly(&mut self, block: Arc<Block>) {
@@ -622,12 +622,15 @@ impl VerificationPipeline {
             .beacon_witness_root_result
             .expect("completion check just confirmed beacon_witness_root_result is Some");
 
-        // SAFETY: the slot prefill (or per-root setter) only populates the
-        // typed witnesses on successful verification, which includes the
-        // parent QC having been verified — `Verified::<BlockHeader>::verify`'s
-        // sole predicate. We materialise the verified header directly here
-        // rather than re-running the trait impl against a header whose
-        // `parent_qc` is still raw on the wire-decoded `Block`.
+        // SAFETY: the pipeline gates per-root dispatch on parent_qc having
+        // been verified — `try_vote_on_block` only runs after
+        // `on_qc_signature_verified` accepts the parent QC, so by the time
+        // any root-result slot lands, `Verified::<BlockHeader>::verify`'s
+        // predicate already holds. The block's wire-decoded `parent_qc`
+        // field stays `Unverified` (the verified QC lives in the pipeline's
+        // `verified_qcs` cache rather than being upgraded in place on the
+        // shared `Arc<Block>`), so we wrap the header directly rather than
+        // calling `.verify(())`, which would fail on that raw field.
         let verified_header = Verified::<BlockHeader>::new_unchecked(block.header().clone());
 
         let verified_block = match Verified::<Block>::assemble(
@@ -2069,9 +2072,10 @@ mod tests {
     }
 
     /// Per-root verifications that complete before `track_pending_assembly`
-    /// runs are reflected in the initial slot state — `verified_roots`
-    /// (and `verified_state_roots`) prefill matching slots so the assembly
-    /// doesn't deadlock waiting for events that already fired.
+    /// runs are reflected in the initial slot state — pre-existing
+    /// `RootStage::Verified` entries in `roots` / `state_roots` prefill
+    /// matching slots so the assembly doesn't deadlock waiting for events
+    /// that already fired.
     #[test]
     fn track_pending_assembly_prefills_already_verified_slots() {
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);

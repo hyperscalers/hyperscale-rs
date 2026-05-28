@@ -375,10 +375,10 @@ pub enum Action {
     /// shard-local state changes to the JMT and compares the resulting
     /// root against the header's `state_root`.
     ///
-    /// Emits two events: `ProtocolEvent::LocalReceiptRootVerified` and
-    /// `ProtocolEvent::StateRootVerified`. On receipt-root mismatch, the
-    /// state-root event reports `valid=false` so the coordinator's
-    /// per-kind tracking still completes.
+    /// Always emits `ProtocolEvent::LocalReceiptRootVerified`. Emits
+    /// `ProtocolEvent::StateRootVerified` only on receipt-root pass; on
+    /// receipt-root failure the handler short-circuits and the pipeline
+    /// rejects the block from the receipt-root event alone.
     ///
     /// The action handler walks the snapshot chain from `parent_block_hash`
     /// to build an overlay of uncommitted tree nodes, then calls
@@ -452,9 +452,10 @@ pub enum Action {
     /// against the header's `transaction_root`. Also checks that every tx's
     /// `validity_range` is well-formed and contains `validity_anchor` — the
     /// parent QC's `weighted_timestamp` carried on the block. Returns
-    /// `ProtocolEvent::TransactionRootVerified { block_hash, valid }`;
-    /// `valid` is true iff both the merkle root matches and every tx is
-    /// in-window.
+    /// `ProtocolEvent::TransactionRootVerified` carrying
+    /// `Result<Verified<TransactionRoot>, TxRootVerifyError>`; the `Err`
+    /// variant distinguishes a merkle-root mismatch from an out-of-window
+    /// transaction.
     ///
     /// Pure CPU; no JMT dependency.
     VerifyTransactionRoot {

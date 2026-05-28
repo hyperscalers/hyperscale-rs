@@ -391,8 +391,7 @@ mod tests {
             zero_bls_signature(),
             WeightedTimestamp::from_millis(1000),
         );
-        // SAFETY: synthetic test fixture; the verified view requires a
-        // Verified<QuorumCertificate> input.
+        // SAFETY: synthetic test fixture, no real signature.
         let qc = Verified::<QuorumCertificate>::new_unchecked(qc);
 
         run_view(

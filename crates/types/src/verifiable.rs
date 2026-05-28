@@ -398,9 +398,9 @@ mod tests {
 
     /// `HashMap` lookup must find an entry inserted as `Unverified(t)` when
     /// the query key is `Verified(v)` with the same underlying content,
-    /// and vice-versa. This is what makes
-    /// [`coordinator.rs:1129`](../../shard/src/coordinator.rs#L1129)'s
-    /// cached-vs-incoming check work after the field becomes `Verifiable`.
+    /// and vice-versa. Underpins the cached-vs-incoming lookups in the
+    /// shard coordinator's verified-QC cache, which key off the raw
+    /// `block_hash` regardless of the candidate's current marker.
     #[test]
     fn verifiable_hashmap_collision_across_states() {
         let u: u32 = 0xDEAD_BEEF;
