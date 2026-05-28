@@ -626,7 +626,7 @@ mod tests {
         );
         // SAFETY: test fixture; block and synthesized QC are produced
         // in-process for the orchestrator test, no adversarial input.
-        let certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked(certify(
+        let certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked_for_test(certify(
             block, /* weighted_timestamp_ms */ 1_000,
         )));
         let _ = node.handle(past_deadline, ProtocolEvent::BlockCommitted { certified });
@@ -648,7 +648,7 @@ mod tests {
             vec![],
         );
         // SAFETY: test fixture; same rationale as above.
-        let certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked(certify(
+        let certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked_for_test(certify(
             block,
             past_deadline_ms,
         )));
@@ -744,7 +744,7 @@ mod tests {
         // SAFETY: test fixture; block and synthesized QC are produced
         // in-process to exercise the commit fan-out, no adversarial
         // input.
-        let certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked(certify(
+        let certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked_for_test(certify(
             block, /* weighted_timestamp_ms */ 1_000,
         )));
         let _ = node.handle(

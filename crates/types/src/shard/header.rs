@@ -636,9 +636,8 @@ mod tests {
         let mut header = sample_header();
         header.parent_qc = Verifiable::Unverified(header.parent_qc.as_unverified().clone());
         let verified_qc = Verified::<QuorumCertificate>::genesis(header.shard_group_id());
-        let verified =
-            Verified::<BlockHeader>::with_verified_parent_qc(header.clone(), verified_qc)
-                .expect("matching parent_qc accepted");
+        let verified = Verified::<BlockHeader>::with_verified_parent_qc(header, verified_qc)
+            .expect("matching parent_qc accepted");
         assert!(verified.parent_qc_verified().is_genesis());
     }
 

@@ -16,11 +16,10 @@
 use std::sync::Arc;
 
 use hyperscale_core::{CommitSource, ProtocolEvent};
-use hyperscale_storage::BeaconWitnessCommit;
 use hyperscale_types::{
-    BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, CertifiedBlock, CommittedBlockHeader,
-    ElidedCertifiedBlock, HeaderFetchCount, ProvisionHash, RoutableTransaction, ShardGroupId,
-    TxHash, ValidatorId, Verified, WaveId,
+    BeaconWitnessCommit, BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, CertifiedBlock,
+    CommittedBlockHeader, ElidedCertifiedBlock, HeaderFetchCount, ProvisionHash,
+    RoutableTransaction, ShardGroupId, TxHash, ValidatorId, Verified, WaveId,
 };
 
 use crate::shard_io::block_commit::QcOnlyDivergence;

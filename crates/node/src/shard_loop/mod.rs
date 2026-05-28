@@ -82,7 +82,7 @@ pub(crate) struct DispatchHandles<S: ShardStorage, N> {
 /// Per-shard subset of [`DispatchHandles`]. One entry per hosted shard.
 pub(crate) struct ShardDispatchHandles<S: ShardStorage> {
     pub(crate) pending_chain: Arc<PendingChain<S>>,
-    pub(crate) prepared_commits: Arc<Mutex<PreparedCommitMap<S>>>,
+    pub(crate) prepared_commits: Arc<Mutex<PreparedCommitMap>>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════

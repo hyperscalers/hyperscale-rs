@@ -119,13 +119,13 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
-    use hyperscale_storage::{BeaconWitnessCommit, PendingChain, ShardChainWriter};
+    use hyperscale_storage::{PendingChain, ShardChainWriter};
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::network::request::beacon::GetShardWitnessesRequest;
     use hyperscale_types::{
-        BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight,
-        BoundedVec, CertificateRoot, CertifiedBlock, Hash, InFlightCount, LeafIndex,
-        LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round,
+        BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash,
+        BlockHeader, BlockHeight, BoundedVec, CertificateRoot, CertifiedBlock, Hash, InFlightCount,
+        LeafIndex, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round,
         ShardGroupId, ShardWitnessPayload, SignerBitfield, Stake, StakePoolId, StateRoot,
         TransactionRoot, ValidatorId, Verified, WeightedTimestamp, compute_merkle_root,
         verify_merkle_inclusion, zero_bls_signature,
@@ -210,10 +210,10 @@ mod tests {
             leaf_count_at_block_end,
         };
         // SAFETY: synthetic test fixture, no real signature.
-        let qc = Verified::<QuorumCertificate>::new_unchecked(qc);
+        let qc = Verified::<QuorumCertificate>::new_unchecked_for_test(qc);
         // SAFETY: synthetic test fixture; round-trip tests don't
         // exercise the `Verified<CertifiedBlock>` predicate.
-        let certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked(
+        let certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked_for_test(
             CertifiedBlock::new_unchecked(block, qc),
         ));
         storage.commit_block(&certified, &witness);

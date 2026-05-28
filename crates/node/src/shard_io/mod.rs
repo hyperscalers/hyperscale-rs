@@ -57,7 +57,7 @@ pub struct ShardIo<S: ShardStorage> {
     /// backpressure, and drains them into a single async closure that
     /// runs on the execution pool. Owns the prepared-commit cache
     /// shared with delegated dispatch closures.
-    pub block_commit: BlockCommitCoordinator<S>,
+    pub block_commit: BlockCommitCoordinator,
 
     /// Inbound request-serving caches plus the cross-thread tx-status
     /// view shared with external RPC consumers.

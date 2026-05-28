@@ -10,9 +10,10 @@ use std::sync::Arc;
 use hyperscale_dispatch::Parallelism;
 use hyperscale_engine::{ProcessExecutionCache, RadixExecutor};
 use hyperscale_network::Network;
-use hyperscale_storage::{PendingChain, ShardStorage};
+use hyperscale_storage::{JmtSnapshot, PendingChain, ShardStorage};
 use hyperscale_types::{
-    BlockHash, BlockHeight, Bls12381G1PrivateKey, ConsensusReceipt, TopologySnapshot,
+    BlockHash, BlockHeight, Bls12381G1PrivateKey, ConsensusReceipt, PreparedCommit,
+    TopologySnapshot,
 };
 
 use crate::ProtocolEvent;
@@ -50,7 +51,7 @@ pub struct ActionContext<'a, S: ShardStorage, N: Network> {
     /// Hand a freshly prepared block to the `io_loop` for insertion into
     /// `PendingChain` + `prepared_commits`. Only `BuildProposal` and
     /// `VerifyStateRoot` produce these.
-    pub commit_prepared: &'a (dyn Fn(PreparedBlock<S::PreparedCommit>) + Send + Sync),
+    pub commit_prepared: &'a (dyn Fn(PreparedBlock) + Send + Sync),
     /// Parallelism strategy for in-handler batch fan-out. Sourced from
     /// the dispatch backend at spawn time so handlers running on
     /// `PooledDispatch` use rayon `par_iter` (work-stealing across the
@@ -69,10 +70,11 @@ impl<S: ShardStorage, N: Network> ActionContext<'_, S, N> {
 /// A successful prepare result, ready to insert into `PendingChain` and
 /// `prepared_commits`.
 #[allow(missing_docs)] // flat bundle threaded straight to the chain insert site
-pub struct PreparedBlock<P: Send> {
+pub struct PreparedBlock {
     pub block_hash: BlockHash,
     pub parent_block_hash: BlockHash,
     pub block_height: BlockHeight,
-    pub prepared: P,
+    pub prepared: PreparedCommit,
+    pub jmt_snapshot: Arc<JmtSnapshot>,
     pub receipts: Vec<Arc<ConsensusReceipt>>,
 }

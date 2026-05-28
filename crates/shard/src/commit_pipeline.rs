@@ -85,11 +85,13 @@ mod tests {
             WeightedTimestamp::ZERO,
         );
         // SAFETY: synthetic test fixture, no real signature.
-        let verified_qc = Verified::<QuorumCertificate>::new_unchecked(qc);
+        let verified_qc = Verified::<QuorumCertificate>::new_unchecked_for_test(qc);
         let certified = CertifiedBlock::new_unchecked(block, verified_qc);
         // SAFETY: synthetic test fixture; pipeline buffering doesn't
         // exercise the predicate.
-        Arc::new(Verified::<CertifiedBlock>::new_unchecked(certified))
+        Arc::new(Verified::<CertifiedBlock>::new_unchecked_for_test(
+            certified,
+        ))
     }
 
     #[test]
@@ -153,11 +155,13 @@ mod properties {
             WeightedTimestamp::ZERO,
         );
         // SAFETY: synthetic test fixture, no real signature.
-        let verified_qc = Verified::<QuorumCertificate>::new_unchecked(qc);
+        let verified_qc = Verified::<QuorumCertificate>::new_unchecked_for_test(qc);
         let certified = CertifiedBlock::new_unchecked(block, verified_qc);
         // SAFETY: synthetic test fixture; pipeline buffering doesn't
         // exercise the predicate.
-        Arc::new(Verified::<CertifiedBlock>::new_unchecked(certified))
+        Arc::new(Verified::<CertifiedBlock>::new_unchecked_for_test(
+            certified,
+        ))
     }
 
     proptest! {

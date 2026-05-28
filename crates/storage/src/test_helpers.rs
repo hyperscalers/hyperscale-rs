@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use hyperscale_types::test_utils::test_event_type_identifier;
 use hyperscale_types::{
-    ApplicationEvent, BeaconBlock, BeaconBlockHash, BeaconCert, BeaconState,
+    ApplicationEvent, BeaconBlock, BeaconBlockHash, BeaconCert, BeaconState, BeaconWitnessCommit,
     BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight,
     Bls12381G2Signature, BoundedVec, CertificateRoot, CertifiedBeaconBlock, CertifiedBlock,
     ConsensusReceipt, Epoch, EventData, ExecutionCertificate, ExecutionMetadata, ExecutionOutcome,
@@ -27,8 +27,8 @@ use radix_common::types::{NodeId as RadixNodeId, PartitionNumber};
 use radix_substate_store_interface::db_key_mapper::{DatabaseKeyMapper, SpreadPrefixKeyMapper};
 
 use crate::{
-    BeaconWitnessCommit, DatabaseUpdates, DbSortKey, NodeDatabaseUpdates, PartitionDatabaseUpdates,
-    ShardChainReader, ShardChainWriter,
+    DatabaseUpdates, DbSortKey, NodeDatabaseUpdates, PartitionDatabaseUpdates, ShardChainReader,
+    ShardChainWriter,
 };
 
 /// Build a `DatabaseUpdates` containing a single `Set` operation.
@@ -152,7 +152,7 @@ pub fn make_test_block(height: BlockHeight) -> Block {
 #[must_use]
 pub fn make_test_qc(block: &Block) -> Verified<QuorumCertificate> {
     // SAFETY: synthetic test fixture, no real signature.
-    Verified::<QuorumCertificate>::new_unchecked(QuorumCertificate::new(
+    Verified::<QuorumCertificate>::new_unchecked_for_test(QuorumCertificate::new(
         block.hash(),
         ShardGroupId::new(0),
         block.height(),
@@ -178,7 +178,9 @@ pub fn make_test_certified(block: Block) -> Arc<Verified<CertifiedBlock>> {
     let certified = CertifiedBlock::new_unchecked(block, qc);
     // SAFETY: synthetic test fixture; storage round-trip tests don't
     // exercise the `Verified<CertifiedBlock>` predicate.
-    Arc::new(Verified::<CertifiedBlock>::new_unchecked(certified))
+    Arc::new(Verified::<CertifiedBlock>::new_unchecked_for_test(
+        certified,
+    ))
 }
 
 /// Build a placeholder [`SpcCert::Direct`] for test fixtures.

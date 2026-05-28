@@ -10,10 +10,10 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use hyperscale_jmt::{Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BlockHash, BlockHeight, CertifiedBlock, CommittedBlockHeader,
-    ConsensusReceipt, ExecutionCertificate, FinalizedWave, MerkleInclusionProof, NodeId,
-    QuorumCertificate, RoutableTransaction, ShardWitnessPayload, StateRoot, TxHash, Verified,
-    WaveCertificate, WaveId,
+    BeaconWitnessCommit, BeaconWitnessLeafCount, BlockHash, BlockHeight, CertifiedBlock,
+    CommittedBlockHeader, ConsensusReceipt, ExecutionCertificate, FinalizedWave,
+    MerkleInclusionProof, NodeId, PreparedCommit, QuorumCertificate, RoutableTransaction,
+    ShardWitnessPayload, StateRoot, TxHash, Verified, WaveCertificate, WaveId,
 };
 use radix_common::prelude::DatabaseUpdate;
 use radix_substate_store_interface::interface::SubstateDatabase;
@@ -22,9 +22,8 @@ use crate::lock_recover::{lock_or_recover, read_or_recover, write_or_recover};
 use crate::shard::keys::node_entity_key;
 use crate::tree::proofs::generate_proof;
 use crate::{
-    BeaconWitnessCommit, BlockForSync, DatabaseUpdates, DbPartitionKey, DbSortKey, JmtSnapshot,
-    PartitionDatabaseUpdates, PreparedCommitBatchEntry, ShardChainReader, ShardChainWriter,
-    SubstateStore, VersionedStore,
+    BlockForSync, DatabaseUpdates, DbPartitionKey, DbSortKey, JmtSnapshot,
+    PartitionDatabaseUpdates, ShardChainReader, ShardChainWriter, SubstateStore, VersionedStore,
 };
 
 /// Cached base-storage reads observed through a [`SubstateView`].
@@ -787,17 +786,15 @@ impl<S: TreeReader + Send + Sync> TreeReader for SubstateView<S> {
 }
 
 impl<S: ShardChainWriter> ShardChainWriter for SubstateView<S> {
-    type PreparedCommit = S::PreparedCommit;
-
     fn prepare_block_commit(
-        &self,
+        self: &Arc<Self>,
         parent_state_root: StateRoot,
         parent_block_height: BlockHeight,
         finalized_waves: &[Arc<FinalizedWave>],
         block_height: BlockHeight,
         pending_snapshots: &[Arc<JmtSnapshot>],
         base_reads: Option<&BaseReadCache>,
-    ) -> (StateRoot, Self::PreparedCommit) {
+    ) -> (StateRoot, Arc<JmtSnapshot>, PreparedCommit) {
         // Drain the view's own cache when the caller didn't supply one.
         // This is the common path: execution reads through the view,
         // prepare_block_commit consumes the accumulated priors so the
@@ -808,7 +805,7 @@ impl<S: ShardChainWriter> ShardChainWriter for SubstateView<S> {
             None
         };
         let effective = base_reads.or(drained.as_ref());
-        (*self.base).prepare_block_commit(
+        self.base.prepare_block_commit(
             parent_state_root,
             parent_block_height,
             finalized_waves,
@@ -818,23 +815,12 @@ impl<S: ShardChainWriter> ShardChainWriter for SubstateView<S> {
         )
     }
 
-    fn commit_prepared_blocks(
-        &self,
-        blocks: Vec<PreparedCommitBatchEntry<Self::PreparedCommit>>,
-    ) -> Vec<StateRoot> {
-        (*self.base).commit_prepared_blocks(blocks)
-    }
-
     fn commit_block(
         &self,
         certified: &Arc<Verified<CertifiedBlock>>,
         witness: &BeaconWitnessCommit,
     ) -> StateRoot {
         (*self.base).commit_block(certified, witness)
-    }
-
-    fn jmt_snapshot(prepared: &Self::PreparedCommit) -> &JmtSnapshot {
-        S::jmt_snapshot(prepared)
     }
 
     fn memory_usage_bytes(&self) -> (u64, u64) {
@@ -1262,7 +1248,7 @@ mod tests {
         let block = make_test_block(height);
         let qc = make_test_qc(&block);
         // SAFETY: synthetic test fixture, no real signature.
-        Arc::new(Verified::<CertifiedBlock>::new_unchecked(
+        Arc::new(Verified::<CertifiedBlock>::new_unchecked_for_test(
             CertifiedBlock::new_unchecked(block, qc),
         ))
     }

@@ -7,16 +7,16 @@ use hyperscale_storage::test_helpers::{
     test_ec_storage_roundtrip as helpers_test_ec_storage_roundtrip,
 };
 use hyperscale_storage::{
-    BeaconWitnessCommit, DatabaseUpdate, DatabaseUpdates, DbPartitionKey, DbSortKey,
-    NodeDatabaseUpdates, PartitionDatabaseUpdates, ShardChainReader, ShardChainWriter,
-    SubstateDatabase, SubstateStore, VersionedStore, merge_database_updates, merge_into,
+    DatabaseUpdate, DatabaseUpdates, DbPartitionKey, DbSortKey, NodeDatabaseUpdates,
+    PartitionDatabaseUpdates, ShardChainReader, ShardChainWriter, SubstateDatabase, SubstateStore,
+    VersionedStore, merge_database_updates, merge_into,
 };
 use hyperscale_types::{
-    BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, Bls12381G2Signature, BoundedVec,
-    CertifiedBlock, ConsensusReceipt, ExecutionCertificate, FinalizedWave, GlobalReceiptHash,
-    GlobalReceiptRoot, Hash, ProposerTimestamp, QuorumCertificate, Round, ShardGroupId,
-    SignerBitfield, StateRoot, StoredReceipt, TxHash, Verified, WaveCertificate, WaveId,
-    WeightedTimestamp,
+    BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash, BlockHeight,
+    Bls12381G2Signature, BoundedVec, CertifiedBlock, ConsensusReceipt, ExecutionCertificate,
+    FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, ProposerTimestamp,
+    QuorumCertificate, Round, ShardGroupId, SignerBitfield, StateRoot, StoredReceipt, SyncHint,
+    TxHash, Verified, WaveCertificate, WaveId, WeightedTimestamp,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -65,7 +65,7 @@ fn updates_to_receipts(updates: &DatabaseUpdates) -> Vec<StoredReceipt> {
 fn commit_empty(storage: &RocksDbShardStorage, block: &Block, qc: &Verified<QuorumCertificate>) {
     // SAFETY: synthetic test fixture; round-trip tests don't exercise
     // the `Verified<CertifiedBlock>` predicate.
-    let certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked(
+    let certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked_for_test(
         CertifiedBlock::new_unchecked(block.clone(), <Verified<_>>::clone(qc)),
     ));
     storage.commit_block(&certified, &no_witness());
@@ -514,9 +514,9 @@ fn test_commit_block_empty_certs() {
 #[test]
 fn test_prepare_then_commit_matches_direct() {
     let temp_dir1 = TempDir::new().unwrap();
-    let s_prepared = RocksDbShardStorage::open(temp_dir1.path()).unwrap();
+    let s_prepared = Arc::new(RocksDbShardStorage::open(temp_dir1.path()).unwrap());
     let parent_root = s_prepared.state_root();
-    let (spec_root, prepared) = s_prepared.prepare_block_commit(
+    let (spec_root, _jmt_snapshot, prepared) = s_prepared.prepare_block_commit(
         parent_root,
         BlockHeight::GENESIS,
         &[],
@@ -525,9 +525,11 @@ fn test_prepare_then_commit_matches_direct() {
         None,
     );
     let block = make_test_block(BlockHeight::new(1));
-    let result_prepared = s_prepared
-        .commit_prepared_blocks(vec![(prepared, make_test_certified(block), no_witness())])
-        .remove(0);
+    let result_prepared = prepared(
+        SyncHint::FlushNow,
+        &make_test_certified(block),
+        &no_witness(),
+    );
 
     let temp_dir2 = TempDir::new().unwrap();
     let s_direct = RocksDbShardStorage::open(temp_dir2.path()).unwrap();
@@ -946,7 +948,7 @@ fn rocks_commit_with(
     }
     // SAFETY: synthetic test fixture; round-trip tests don't exercise
     // the `Verified<CertifiedBlock>` predicate.
-    let certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked(
+    let certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked_for_test(
         CertifiedBlock::new_unchecked(block, <Verified<_>>::clone(qc)),
     ));
     storage.commit_block(&certified, &no_witness());

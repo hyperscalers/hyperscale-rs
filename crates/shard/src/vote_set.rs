@@ -546,7 +546,7 @@ mod tests {
             let vote = make_vote(&keys, i, block_hash, BlockHeight::new(1));
             assert!(vote_set.add_verified_vote(
                 i,
-                Verified::<BlockVote>::new_unchecked(vote),
+                Verified::<BlockVote>::new_unchecked_for_test(vote),
                 VotePower::new(1)
             ));
         }

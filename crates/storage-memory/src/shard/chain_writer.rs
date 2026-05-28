@@ -7,36 +7,19 @@ use hyperscale_storage::tree::{
     OverlayTreeReader, jmt_parent_height, noop_jmt_snapshot, put_at_version,
 };
 use hyperscale_storage::{
-    BaseReadCache, BeaconWitnessCommit, DatabaseUpdates, JmtSnapshot, PreparedCommitBatchEntry,
-    ShardChainWriter, merge_updates_from_receipts,
+    BaseReadCache, DatabaseUpdates, JmtSnapshot, ShardChainWriter, merge_updates_from_receipts,
 };
 use hyperscale_types::{
-    Block, BlockHeight, CertifiedBlock, FinalizedWave, QuorumCertificate, StateRoot, StoredReceipt,
-    Verified,
+    BeaconWitnessCommit, Block, BlockHeight, CertifiedBlock, FinalizedWave, PreparedCommit,
+    QuorumCertificate, StateRoot, StoredReceipt, SyncHint, Verified,
 };
 
 use super::core::SimShardStorage;
 use super::state::apply_updates;
 
-/// Precomputed commit work for a `SimShardStorage` block commit.
-///
-/// Contains a `JmtSnapshot` (precomputed merkle tree nodes) plus the
-/// merged updates and receipts for substate application at commit time.
-pub struct SimPreparedCommit {
-    snapshot: JmtSnapshot,
-    merged_updates: DatabaseUpdates,
-    receipts: Vec<StoredReceipt>,
-}
-
 impl ShardChainWriter for SimShardStorage {
-    type PreparedCommit = SimPreparedCommit;
-
-    fn jmt_snapshot(prepared: &Self::PreparedCommit) -> &JmtSnapshot {
-        &prepared.snapshot
-    }
-
     fn prepare_block_commit(
-        &self,
+        self: &Arc<Self>,
         parent_state_root: StateRoot,
         parent_block_height: BlockHeight,
         finalized_waves: &[Arc<FinalizedWave>],
@@ -45,7 +28,7 @@ impl ShardChainWriter for SimShardStorage {
         // Memory backend already keeps state in-memory — the priors
         // hint is irrelevant to its perf and is ignored.
         _base_reads: Option<&BaseReadCache>,
-    ) -> (StateRoot, Self::PreparedCommit) {
+    ) -> (StateRoot, Arc<JmtSnapshot>, PreparedCommit) {
         let receipts: Vec<StoredReceipt> = finalized_waves
             .iter()
             .flat_map(|fw| fw.receipts().iter().cloned())
@@ -56,20 +39,21 @@ impl ShardChainWriter for SimShardStorage {
         // would fail if the parent's tree nodes aren't in the store yet.
         if receipts.is_empty() {
             let s = read_or_recover(&self.state);
-            let snapshot = noop_jmt_snapshot(
+            let snapshot = Arc::new(noop_jmt_snapshot(
                 &s.tree_store,
                 pending_snapshots,
                 parent_state_root,
                 parent_block_height,
                 block_height,
-            );
+            ));
             drop(s);
-            let prepared = SimPreparedCommit {
-                snapshot,
-                merged_updates: DatabaseUpdates::default(),
-                receipts: vec![],
-            };
-            return (parent_state_root, prepared);
+            let prepared = build_prepared_commit(
+                Arc::clone(self),
+                Arc::clone(&snapshot),
+                DatabaseUpdates::default(),
+                Vec::new(),
+            );
+            return (parent_state_root, snapshot, prepared);
         }
 
         // Read lock: compute speculative JMT root.
@@ -103,88 +87,27 @@ impl ShardChainWriter for SimShardStorage {
             )
         };
 
-        let snapshot = JmtSnapshot::from_collected_writes(
+        let snapshot = Arc::new(JmtSnapshot::from_collected_writes(
             collected,
             parent_state_root,
             parent_block_height,
             result_root,
             block_height,
-        );
+        ));
 
         drop(s); // Release read lock
 
         // Merge for commit-time substate writes (off the state_root critical path).
         let merged_updates = merge_updates_from_receipts(&receipts);
 
-        let prepared = SimPreparedCommit {
-            snapshot,
+        let prepared = build_prepared_commit(
+            Arc::clone(self),
+            Arc::clone(&snapshot),
             merged_updates,
             receipts,
-        };
+        );
 
-        (result_root, prepared)
-    }
-
-    #[allow(clippy::significant_drop_tightening)] // every locked op needs the lock
-    fn commit_prepared_blocks(
-        &self,
-        blocks: Vec<PreparedCommitBatchEntry<Self::PreparedCommit>>,
-    ) -> Vec<StateRoot> {
-        blocks
-            .into_iter()
-            .map(|(prepared, certified, witness)| {
-                self.append_beacon_witnesses(&witness);
-                let block_height_u64 = prepared.snapshot.new_height.inner();
-                let result_root = prepared.snapshot.result_root;
-
-                {
-                    let mut s = write_or_recover(&self.state);
-
-                    s.apply_jmt_snapshot(prepared.snapshot);
-
-                    apply_updates(
-                        &mut s,
-                        &prepared.merged_updates,
-                        block_height_u64,
-                        /* write_history */ true,
-                    );
-                }
-
-                let block = certified.block();
-                let qc = certified.qc_verified();
-
-                let mut c = write_or_recover(&self.consensus);
-                for tx in block.transactions().iter() {
-                    c.transactions.insert(tx.hash(), tx.as_ref().clone());
-                }
-                c.blocks.insert(
-                    block.height(),
-                    CertifiedBlock::new_unchecked(block.clone().into_sealed(), qc.clone()),
-                );
-                for fw in block.certificates().iter() {
-                    let cert = fw.certificate();
-                    let wave_id = cert.wave_id().clone();
-                    c.certificates.insert(wave_id.clone(), (**cert).clone());
-                    c.wave_certs_by_height
-                        .entry(wave_id.block_height())
-                        .or_default()
-                        .push(wave_id);
-                }
-                c.insert_receipts(&prepared.receipts);
-                for fw in block.certificates().iter() {
-                    for ec in fw.certificate().execution_certificates() {
-                        c.execution_certs
-                            .insert(ec.wave_id().clone(), (**ec).clone());
-                    }
-                }
-                c.committed_height = block.height();
-                c.committed_hash = Some(block.hash());
-                c.committed_qc = Some(qc.as_ref().clone());
-                c.prune_receipts(block.height());
-
-                result_root
-            })
-            .collect()
+        (result_root, snapshot, prepared)
     }
 
     fn commit_block(
@@ -203,6 +126,83 @@ impl ShardChainWriter for SimShardStorage {
         self.append_beacon_witnesses(witness);
         self.commit_block_inner(&merged_updates, block, qc, &receipts)
     }
+}
+
+/// Build the closure that performs the in-memory atomic block commit.
+///
+/// Captures the storage handle, the JMT snapshot, the merged updates,
+/// and the receipts. At invocation time the closure receives the
+/// `Verified<CertifiedBlock>` and witness, applies the snapshot/state/
+/// consensus changes, and returns the resulting state root.
+#[allow(clippy::significant_drop_tightening)] // state write held across snapshot + substate apply by design
+fn build_prepared_commit(
+    storage: Arc<SimShardStorage>,
+    snapshot: Arc<JmtSnapshot>,
+    merged_updates: DatabaseUpdates,
+    receipts: Vec<StoredReceipt>,
+) -> PreparedCommit {
+    Box::new(
+        move |_sync_hint: SyncHint,
+              certified: &Arc<Verified<CertifiedBlock>>,
+              witness: &BeaconWitnessCommit|
+              -> StateRoot {
+            storage.append_beacon_witnesses(witness);
+
+            let block_height_u64 = snapshot.new_height.inner();
+            let result_root = snapshot.result_root;
+            let snapshot = match Arc::try_unwrap(snapshot) {
+                Ok(s) => s,
+                Err(arc) => (*arc).clone(),
+            };
+
+            {
+                let mut s = write_or_recover(&storage.state);
+                s.apply_jmt_snapshot(snapshot);
+                apply_updates(
+                    &mut s,
+                    &merged_updates,
+                    block_height_u64,
+                    /* write_history */ true,
+                );
+            }
+
+            let block = certified.block();
+            let qc = certified.qc_verified();
+
+            // SAFETY: synthetic in-memory commit wrapper; the certified
+            // value is already verified upstream and we're just copying
+            // its inner shape into the consensus map.
+            let unwrapped = CertifiedBlock::new_unchecked(block.clone().into_sealed(), qc.clone());
+
+            let mut c = write_or_recover(&storage.consensus);
+            for tx in block.transactions().iter() {
+                c.transactions.insert(tx.hash(), tx.as_ref().clone());
+            }
+            c.blocks.insert(block.height(), unwrapped);
+            for fw in block.certificates().iter() {
+                let cert = fw.certificate();
+                let wave_id = cert.wave_id().clone();
+                c.certificates.insert(wave_id.clone(), (**cert).clone());
+                c.wave_certs_by_height
+                    .entry(wave_id.block_height())
+                    .or_default()
+                    .push(wave_id);
+            }
+            c.insert_receipts(&receipts);
+            for fw in block.certificates().iter() {
+                for ec in fw.certificate().execution_certificates() {
+                    c.execution_certs
+                        .insert(ec.wave_id().clone(), (**ec).clone());
+                }
+            }
+            c.committed_height = block.height();
+            c.committed_hash = Some(block.hash());
+            c.committed_qc = Some(qc.as_ref().clone());
+            c.prune_receipts(block.height());
+
+            result_root
+        },
+    )
 }
 
 impl SimShardStorage {
@@ -280,6 +280,8 @@ impl SimShardStorage {
             for tx in block.transactions().iter() {
                 c.transactions.insert(tx.hash(), tx.as_ref().clone());
             }
+            // SAFETY: sync-path commit; certified value is already
+            // verified upstream.
             c.blocks.insert(
                 block.height(),
                 CertifiedBlock::new_unchecked(block.clone().into_sealed(), qc.clone()),

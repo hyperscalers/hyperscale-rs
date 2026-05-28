@@ -6,12 +6,12 @@ use hyperscale_storage::tree::{
     OverlayTreeReader, jmt_parent_height, noop_jmt_snapshot, put_at_version,
 };
 use hyperscale_storage::{
-    BaseReadCache, BeaconWitnessCommit, JmtSnapshot, PreparedCommitBatchEntry, ShardChainWriter,
-    merge_database_updates, merge_updates_from_receipts,
+    BaseReadCache, JmtSnapshot, ShardChainWriter, merge_database_updates,
+    merge_updates_from_receipts,
 };
 use hyperscale_types::{
-    Block, BlockHeight, CertifiedBlock, FinalizedWave, QuorumCertificate, StateRoot, StoredReceipt,
-    Verified,
+    BeaconWitnessCommit, Block, BlockHeight, CertifiedBlock, FinalizedWave, PreparedCommit,
+    QuorumCertificate, StateRoot, StoredReceipt, SyncHint, Verified,
 };
 use radix_substate_store_interface::interface::DatabaseUpdates;
 use rocksdb::{WriteBatch, WriteOptions};
@@ -23,36 +23,16 @@ use super::jmt_snapshot_store::SnapshotTreeStore;
 use super::receipts::add_receipt_to_batch;
 use crate::typed_cf::TypedCf;
 
-/// Precomputed commit work for a `RocksDB` block commit.
-///
-/// Contains a pre-built `WriteBatch` (substate + receipt writes) and a
-/// `JmtSnapshot` (precomputed Merkle tree nodes).
-///
-/// # Performance
-///
-/// Without batching: 40 certificates × ~5ms fsync = ~200ms per block commit
-/// With batching: 1 fsync = ~5ms per block commit
-pub struct RocksDbPreparedCommit {
-    pub(crate) write_batch: WriteBatch,
-    pub(crate) jmt_snapshot: JmtSnapshot,
-}
-
 impl ShardChainWriter for RocksDbShardStorage {
-    type PreparedCommit = RocksDbPreparedCommit;
-
-    fn jmt_snapshot(prepared: &Self::PreparedCommit) -> &JmtSnapshot {
-        &prepared.jmt_snapshot
-    }
-
     fn prepare_block_commit(
-        &self,
+        self: &Arc<Self>,
         parent_state_root: StateRoot,
         parent_block_height: BlockHeight,
         finalized_waves: &[Arc<FinalizedWave>],
         block_height: BlockHeight,
         pending_snapshots: &[Arc<JmtSnapshot>],
         base_reads: Option<&BaseReadCache>,
-    ) -> (StateRoot, Self::PreparedCommit) {
+    ) -> (StateRoot, Arc<JmtSnapshot>, PreparedCommit) {
         let receipts: Vec<&StoredReceipt> = finalized_waves
             .iter()
             .flat_map(|fw| fw.receipts().iter())
@@ -63,19 +43,19 @@ impl ShardChainWriter for RocksDbShardStorage {
         // would fail if the parent's tree nodes aren't in the store yet
         // (e.g., proposer just exited sync and BlockPersisted hasn't fired).
         if receipts.is_empty() {
-            let jmt_snapshot = noop_jmt_snapshot(
+            let jmt_snapshot = Arc::new(noop_jmt_snapshot(
                 &SnapshotTreeStore::new(&self.db),
                 pending_snapshots,
                 parent_state_root,
                 parent_block_height,
                 block_height,
+            ));
+            let prepared = build_prepared_commit(
+                Arc::clone(self),
+                WriteBatch::default(),
+                Arc::clone(&jmt_snapshot),
             );
-            let write_batch = WriteBatch::default();
-            let prepared = RocksDbPreparedCommit {
-                write_batch,
-                jmt_snapshot,
-            };
-            return (parent_state_root, prepared);
+            return (parent_state_root, jmt_snapshot, prepared);
         }
 
         let snapshot_store = SnapshotTreeStore::new(&self.db);
@@ -109,13 +89,13 @@ impl ShardChainWriter for RocksDbShardStorage {
             )
         };
 
-        let jmt_snapshot = JmtSnapshot::from_collected_writes(
+        let jmt_snapshot = Arc::new(JmtSnapshot::from_collected_writes(
             collected,
             parent_state_root,
             parent_block_height,
             computed_root,
             block_height,
-        );
+        ));
 
         // Merge updates for the substate WriteBatch (off the state_root critical path).
         let updates: Vec<DatabaseUpdates> = receipts
@@ -139,100 +119,10 @@ impl ShardChainWriter for RocksDbShardStorage {
             add_receipt_to_batch(&mut write_batch, consensus_cf, metadata_cf, receipt);
         }
 
-        let prepared = RocksDbPreparedCommit {
-            write_batch,
-            jmt_snapshot,
-        };
+        let prepared =
+            build_prepared_commit(Arc::clone(self), write_batch, Arc::clone(&jmt_snapshot));
 
-        (computed_root, prepared)
-    }
-
-    fn commit_prepared_blocks(
-        &self,
-        blocks: Vec<PreparedCommitBatchEntry<Self::PreparedCommit>>,
-    ) -> Vec<StateRoot> {
-        let total = blocks.len();
-        let mut roots = Vec::with_capacity(total);
-
-        for (i, (prepared, certified, witness)) in blocks.into_iter().enumerate() {
-            let result_root = prepared.jmt_snapshot.result_root;
-
-            let mut write_batch = prepared.write_batch;
-
-            let block = certified.block();
-            let qc = certified.qc_verified();
-
-            // Persist block data (header, transactions, certificates) +
-            // beacon-witness leaves atomically. Receipt writes are
-            // already in the write_batch from prepare time.
-            self.append_block_to_batch(
-                &mut write_batch,
-                block,
-                qc,
-                witness.leaf_count_at_block_end,
-            );
-            self.append_beacon_witnesses_to_batch(
-                &mut write_batch,
-                witness.starting_leaf_index,
-                &witness.leaves,
-            );
-
-            append_block_certs_to_batch(self, &mut write_batch, block);
-
-            // Defer fsync for all blocks except the last. The final sync=true
-            // flushes the entire WAL, covering all prior deferred writes.
-            let sync = i == total - 1;
-            let applied = self.try_apply_prepared_commit(
-                write_batch,
-                &prepared.jmt_snapshot,
-                block,
-                qc,
-                sync,
-            );
-            if applied {
-                roots.push(result_root);
-            } else {
-                // Fast path failed — RocksDB state advanced since
-                // preparation (sync path committed blocks between prepare
-                // and flush). Hold `commit_lock` across the version check
-                // AND the commit so `base_version` can't move under us;
-                // splitting the lock would let a concurrent sync commit
-                // open a gap and trip the contiguity assert in
-                // `commit_block_inner_locked`.
-                let _guard = self.commit_lock.lock().unwrap();
-                let (current_version, _) = SnapshotTreeStore::new(&self.db).read_jmt_metadata();
-                if block.height().inner() <= current_version {
-                    tracing::debug!(
-                        height = block.height().inner(),
-                        current_version,
-                        "PreparedCommit stale — block already committed, skipping"
-                    );
-                    roots.push(result_root);
-                } else {
-                    tracing::debug!(
-                        height = block.height().inner(),
-                        current_version,
-                        "PreparedCommit stale, falling back to commit_block"
-                    );
-                    let receipts: Vec<StoredReceipt> = block
-                        .certificates()
-                        .iter()
-                        .flat_map(|fw| fw.receipts().iter().cloned())
-                        .collect();
-                    let merged_updates = merge_updates_from_receipts(&receipts);
-                    let root = self.commit_block_inner_locked(
-                        &merged_updates,
-                        block,
-                        qc,
-                        &receipts,
-                        &witness,
-                    );
-                    roots.push(root);
-                }
-            }
-        }
-
-        roots
+        (computed_root, jmt_snapshot, prepared)
     }
 
     fn commit_block(
@@ -279,15 +169,95 @@ impl ShardChainWriter for RocksDbShardStorage {
     }
 }
 
+/// Build the closure that performs the atomic block commit.
+///
+/// Captures the storage handle, the pre-built `WriteBatch`, and the JMT
+/// snapshot. At invocation time the closure receives the
+/// `Verified<CertifiedBlock>` and beacon-witness commit, folds them into
+/// the batch, and writes — with a fallback through
+/// [`RocksDbShardStorage::commit_block_inner_locked`] if a concurrent sync
+/// commit advanced past us.
+fn build_prepared_commit(
+    storage: Arc<RocksDbShardStorage>,
+    write_batch: WriteBatch,
+    jmt_snapshot: Arc<JmtSnapshot>,
+) -> PreparedCommit {
+    Box::new(
+        move |sync_hint: SyncHint,
+              certified: &Arc<Verified<CertifiedBlock>>,
+              witness: &BeaconWitnessCommit|
+              -> StateRoot {
+            let result_root = jmt_snapshot.result_root;
+            let mut write_batch = write_batch;
+
+            let block = certified.block();
+            let qc = certified.qc_verified();
+
+            storage.append_block_to_batch(
+                &mut write_batch,
+                block,
+                qc,
+                witness.leaf_count_at_block_end,
+            );
+            storage.append_beacon_witnesses_to_batch(
+                &mut write_batch,
+                witness.starting_leaf_index,
+                &witness.leaves,
+            );
+            append_block_certs_to_batch(&storage, &mut write_batch, block);
+
+            let applied = storage.try_apply_prepared_commit(
+                write_batch,
+                &jmt_snapshot,
+                block,
+                qc,
+                sync_hint.is_flush_now(),
+            );
+            if applied {
+                return result_root;
+            }
+
+            // Fast path failed — RocksDB state advanced since preparation
+            // (sync path committed blocks between prepare and flush). Hold
+            // `commit_lock` across the version check AND the commit so
+            // `base_version` can't move under us; splitting the lock
+            // would let a concurrent sync commit open a gap and trip the
+            // contiguity assert in `commit_block_inner_locked`.
+            let _guard = storage.commit_lock.lock().unwrap();
+            let (current_version, _) = SnapshotTreeStore::new(&storage.db).read_jmt_metadata();
+            if block.height().inner() <= current_version {
+                tracing::debug!(
+                    height = block.height().inner(),
+                    current_version,
+                    "PreparedCommit stale — block already committed, skipping"
+                );
+                return result_root;
+            }
+            tracing::debug!(
+                height = block.height().inner(),
+                current_version,
+                "PreparedCommit stale, falling back to commit_block"
+            );
+            let receipts: Vec<StoredReceipt> = block
+                .certificates()
+                .iter()
+                .flat_map(|fw| fw.receipts().iter().cloned())
+                .collect();
+            let merged_updates = merge_updates_from_receipts(&receipts);
+            storage.commit_block_inner_locked(&merged_updates, block, qc, &receipts, witness)
+        },
+    )
+}
+
 impl RocksDbShardStorage {
     /// Internal commit path used by `commit_block` (sync blocks without a `PreparedCommit`).
     ///
     /// The caller MUST hold `self.commit_lock`. The callers that do are
-    /// [`Self::commit_block`] and the fallback branch in
-    /// [`Self::commit_prepared_blocks`]; the latter holds the lock across
-    /// its own `read_jmt_metadata` so the contiguity check and the commit
-    /// see the same `base_version`.
-    fn commit_block_inner_locked(
+    /// [`Self::commit_block`] and the fallback branch inside the closure
+    /// returned by `build_prepared_commit`; the latter holds the lock
+    /// across its own `read_jmt_metadata` so the contiguity check and
+    /// the commit see the same `base_version`.
+    pub(crate) fn commit_block_inner_locked(
         &self,
         merged_updates: &DatabaseUpdates,
         block: &Block,

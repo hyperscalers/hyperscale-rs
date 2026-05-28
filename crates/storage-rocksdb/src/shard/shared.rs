@@ -13,18 +13,17 @@ use std::sync::Arc;
 
 use hyperscale_jmt::{Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_storage::{
-    BaseReadCache, BeaconWitnessCommit, BlockForSync, DatabaseUpdates, DbPartitionKey, DbSortKey,
-    DbSubstateValue, GenesisCommit, JmtSnapshot, PartitionEntry, PreparedCommitBatchEntry,
-    ShardChainReader, ShardChainWriter, SubstateDatabase, SubstateStore, VersionedStore,
+    BaseReadCache, BlockForSync, DatabaseUpdates, DbPartitionKey, DbSortKey, DbSubstateValue,
+    GenesisCommit, JmtSnapshot, PartitionEntry, ShardChainReader, ShardChainWriter,
+    SubstateDatabase, SubstateStore, VersionedStore,
 };
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BlockHash, BlockHeight, CertifiedBlock, CommittedBlockHeader,
-    ConsensusReceipt, ExecutionCertificate, FinalizedWave, MerkleInclusionProof, NodeId,
-    QuorumCertificate, RoutableTransaction, ShardWitnessPayload, StateRoot, TxHash, Verified,
-    WaveCertificate, WaveId,
+    BeaconWitnessCommit, BeaconWitnessLeafCount, BlockHash, BlockHeight, CertifiedBlock,
+    CommittedBlockHeader, ConsensusReceipt, ExecutionCertificate, FinalizedWave,
+    MerkleInclusionProof, NodeId, PreparedCommit, QuorumCertificate, RoutableTransaction,
+    ShardWitnessPayload, StateRoot, TxHash, Verified, WaveCertificate, WaveId,
 };
 
-use super::chain_writer::RocksDbPreparedCommit;
 use super::core::RocksDbShardStorage;
 use super::snapshot::RocksDbSnapshot;
 
@@ -141,21 +140,15 @@ impl TreeReader for SharedStorage {
 }
 
 impl ShardChainWriter for SharedStorage {
-    type PreparedCommit = RocksDbPreparedCommit;
-
-    fn jmt_snapshot(prepared: &Self::PreparedCommit) -> &JmtSnapshot {
-        &prepared.jmt_snapshot
-    }
-
     fn prepare_block_commit(
-        &self,
+        self: &Arc<Self>,
         parent_state_root: StateRoot,
         parent_block_height: BlockHeight,
         finalized_waves: &[Arc<FinalizedWave>],
         block_height: BlockHeight,
         pending_snapshots: &[Arc<JmtSnapshot>],
         base_reads: Option<&BaseReadCache>,
-    ) -> (StateRoot, Self::PreparedCommit) {
+    ) -> (StateRoot, Arc<JmtSnapshot>, PreparedCommit) {
         self.0.prepare_block_commit(
             parent_state_root,
             parent_block_height,
@@ -164,13 +157,6 @@ impl ShardChainWriter for SharedStorage {
             pending_snapshots,
             base_reads,
         )
-    }
-
-    fn commit_prepared_blocks(
-        &self,
-        blocks: Vec<PreparedCommitBatchEntry<Self::PreparedCommit>>,
-    ) -> Vec<StateRoot> {
-        self.0.commit_prepared_blocks(blocks)
     }
 
     fn commit_block(

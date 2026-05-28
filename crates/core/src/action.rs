@@ -5,18 +5,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_dispatch::DispatchPool;
-use hyperscale_storage::BeaconWitnessCommit;
 use hyperscale_types::{
-    BeaconState, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight,
-    BlockManifest, BlockVote, Bls12381G1PublicKey, CertificateRoot, CertifiedBeaconBlock,
-    CertifiedBlock, CommittedBlockHeader, Epoch, ExecutionCertificate, ExecutionVote,
-    FinalizedWave, GlobalReceiptRoot, Hash, InFlightCount, LeafIndex, LocalReceiptRoot, NodeId,
-    PcQc1, PcQc2, PcQc3, PcVector, PcVoteMessage, ProposerTimestamp, ProvisionHash,
-    ProvisionTxRootsMap, Provisions, ProvisionsRoot, QuorumCertificate, ReadySignal, Round,
-    RoutableTransaction, ShardGroupId, SharedCertificates, SharedTransactions, SkipEpochCert,
-    SkipRequest, SpcCert, SpcEmptyViewMsg, SpcHighTriple, SpcView, StateRoot, SubstateEntry,
-    TopologySnapshot, TransactionRoot, TransactionStatus, TxHash, TxOutcome, ValidatorId,
-    Verifiable, Verified, VotePower, WaveId, WeightedTimestamp, Witness,
+    BeaconState, BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash,
+    BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PublicKey, CertificateRoot,
+    CertifiedBeaconBlock, CertifiedBlock, CommittedBlockHeader, Epoch, ExecutionCertificate,
+    ExecutionVote, FinalizedWave, GlobalReceiptRoot, Hash, InFlightCount, LeafIndex,
+    LocalReceiptRoot, NodeId, PcQc1, PcQc2, PcQc3, PcVector, PcVoteMessage, ProposerTimestamp,
+    ProvisionHash, ProvisionTxRootsMap, Provisions, ProvisionsRoot, QuorumCertificate, ReadySignal,
+    Round, RoutableTransaction, ShardGroupId, SharedCertificates, SharedTransactions,
+    SkipEpochCert, SkipRequest, SpcCert, SpcEmptyViewMsg, SpcHighTriple, SpcView, StateRoot,
+    SubstateEntry, TopologySnapshot, TransactionRoot, TransactionStatus, TxHash, TxOutcome,
+    ValidatorId, Verifiable, Verified, VotePower, WaveId, WeightedTimestamp, Witness,
 };
 
 use crate::{CommitSource, FetchAbandon, FetchRequest, ProtocolEvent, TimerId};
