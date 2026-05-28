@@ -665,7 +665,7 @@ impl ShardCoordinator {
         &mut self,
         topology_snapshot: &TopologySnapshot,
         ready_txs: &[Arc<RoutableTransaction>],
-        finalized_waves: Vec<Arc<FinalizedWave>>,
+        finalized_waves: Vec<Arc<Verified<FinalizedWave>>>,
         provisions: Vec<Arc<Provisions>>,
     ) -> Vec<Action> {
         // The next height to propose is one above the highest certified block,
@@ -1015,7 +1015,7 @@ impl ShardCoordinator {
         header: &BlockHeader,
         manifest: BlockManifest,
         lookup_tx: impl Fn(&TxHash) -> Option<Arc<RoutableTransaction>>,
-        lookup_finalized_wave: impl Fn(&WaveId) -> Option<Arc<FinalizedWave>>,
+        lookup_finalized_wave: impl Fn(&WaveId) -> Option<Arc<Verified<FinalizedWave>>>,
         lookup_provision: impl Fn(&ProvisionHash) -> Option<Arc<Provisions>>,
     ) -> Vec<Action> {
         let block_hash = header.hash();
@@ -2117,7 +2117,7 @@ impl ShardCoordinator {
         block: &Block,
         block_hash: BlockHash,
         manifest: &BlockManifest,
-        finalized_waves: Vec<Arc<FinalizedWave>>,
+        finalized_waves: Vec<Arc<Verified<FinalizedWave>>>,
         provisions: Vec<Arc<Provisions>>,
     ) -> Vec<Action> {
         match self.proposal.take_matching(height, round) {
@@ -2322,7 +2322,7 @@ impl ShardCoordinator {
         block_hash: BlockHash,
         qc: &Verified<QuorumCertificate>,
         ready_txs: &[Arc<RoutableTransaction>],
-        finalized_waves: Vec<Arc<FinalizedWave>>,
+        finalized_waves: Vec<Arc<Verified<FinalizedWave>>>,
         provisions: Vec<Arc<Provisions>>,
     ) -> Vec<Action> {
         let height = qc.height();
@@ -2831,7 +2831,13 @@ impl ShardCoordinator {
         }
 
         // Adopt the parent_qc from the block header if it's newer still.
-        let synced_waves: Vec<_> = block.certificates().iter().map(Arc::clone).collect();
+        // The synced block's QC vouches for its embedded waves, so wrap
+        // them with the typed marker for typed downstream consumers.
+        let synced_waves: Vec<Arc<Verified<FinalizedWave>>> = block
+            .certificates()
+            .iter()
+            .map(|fw| Arc::new(Verified::<FinalizedWave>::seal((**fw).clone())))
+            .collect();
         let parent_qc_height = block.header().parent_qc().height();
         let parent_qc_not_genesis = !block.header().parent_qc().is_genesis();
 
@@ -3157,7 +3163,7 @@ impl ShardCoordinator {
     pub fn on_finalized_waves_admitted(
         &mut self,
         topology_snapshot: &TopologySnapshot,
-        waves: &[Arc<FinalizedWave>],
+        waves: &[Arc<Verified<FinalizedWave>>],
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         for fw in waves {

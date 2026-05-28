@@ -21,7 +21,7 @@ use hyperscale_core::Action;
 use hyperscale_types::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight, FinalizedWave,
     LocalTimestamp, ProposerTimestamp, ProvisionHash, Provisions, ReadySignal, Round,
-    RoutableTransaction, TopologySnapshot, TxHash, WaveId, WeightedTimestamp,
+    RoutableTransaction, TopologySnapshot, TxHash, Verified, WaveId, WeightedTimestamp,
 };
 use tracing::debug;
 
@@ -39,7 +39,7 @@ pub enum ProposalKind {
     /// Normal proposal with a filtered payload and a real-clock timestamp.
     Normal {
         transactions: Vec<Arc<RoutableTransaction>>,
-        finalized_waves: Vec<Arc<FinalizedWave>>,
+        finalized_waves: Vec<Arc<Verified<FinalizedWave>>>,
         provisions: Vec<Arc<Provisions>>,
         finalized_tx_count: u32,
     },
@@ -207,11 +207,11 @@ pub fn select_transactions(
 /// in manifest order, and the `BTreeMap` collapse there is last-writer-wins,
 /// so the proposer must produce a deterministic order.
 pub fn select_finalized_waves(
-    finalized_waves: Vec<Arc<FinalizedWave>>,
+    finalized_waves: Vec<Arc<Verified<FinalizedWave>>>,
     qc_chain_cert_ids: &HashSet<WaveId>,
     dedup_index: &CommitDedupIndex,
     max_finalized_txs: usize,
-) -> (Vec<Arc<FinalizedWave>>, usize) {
+) -> (Vec<Arc<Verified<FinalizedWave>>>, usize) {
     let mut candidate_waves: Vec<_> = finalized_waves
         .into_iter()
         .filter(|fw| {

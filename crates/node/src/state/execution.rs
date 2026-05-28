@@ -77,9 +77,9 @@ impl NodeStateMachine {
                 }
                 actions
             }
-            ProtocolEvent::FinalizedWaveVerified { wave, valid } => self
+            ProtocolEvent::FinalizedWaveVerified { result } => self
                 .execution_coordinator
-                .on_finalized_wave_verified(wave, valid),
+                .on_finalized_wave_verified(result),
             ProtocolEvent::ExecutionCertificateSignatureVerified { result } => self
                 .execution_coordinator
                 .on_certificate_verified(&self.topology_snapshot, result),

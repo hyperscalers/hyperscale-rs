@@ -23,29 +23,14 @@ use hyperscale_types::network::notification::{
     ExecutionCertificatesNotification, ExecutionVotesNotification,
 };
 use hyperscale_types::{
-    Bls12381G1PublicKey, ExecutionCertificate, ExecutionCertificateContext, ExecutionVote,
-    NetworkDefinition, NodeId, RoutableTransaction, ShardGroupId, StoredReceipt, Verifiable,
-    Verified, Verify, exec_cert_batch_message, exec_vote_batch_message, shard_for_node,
+    ExecutionCertificate, ExecutionCertificateContext, ExecutionVote, FinalizedWaveContext, NodeId,
+    RoutableTransaction, ShardGroupId, StoredReceipt, Verifiable, Verified, Verify,
+    exec_cert_batch_message, exec_vote_batch_message, shard_for_node,
 };
 
 // ============================================================================
 // Wave-based execution voting handlers
 // ============================================================================
-
-/// Run the [`ExecutionCertificate`] verification predicate against a
-/// committee public-key vector. See [`Verified::<ExecutionCertificate>::verify`].
-#[must_use]
-pub fn verify_execution_certificate_signature(
-    network: &NetworkDefinition,
-    certificate: &ExecutionCertificate,
-    public_keys: &[Bls12381G1PublicKey],
-) -> bool {
-    let ctx = ExecutionCertificateContext {
-        network,
-        public_keys,
-    };
-    certificate.verify(&ctx).is_ok()
-}
 
 /// Handle the execution-owned delegated [`Action`] variants.
 ///
@@ -181,12 +166,20 @@ where
             ec_public_keys,
         } => {
             let network = ctx.topology_snapshot.network();
-            let valid = wave
-                .execution_certificates()
-                .iter()
-                .zip(ec_public_keys.iter())
-                .all(|(ec, keys)| verify_execution_certificate_signature(network, ec, keys));
-            ctx.notify_protocol(ProtocolEvent::FinalizedWaveVerified { wave, valid });
+            let result = match Arc::unwrap_or_clone(wave) {
+                Verifiable::Verified(verified) => Ok(Arc::new(verified)),
+                Verifiable::Unverified(raw) => {
+                    let fw_ctx = FinalizedWaveContext {
+                        network,
+                        ec_public_keys: &ec_public_keys,
+                    };
+                    match raw.verify(&fw_ctx) {
+                        Ok(verified) => Ok(Arc::new(verified)),
+                        Err(err) => Err((Arc::new(raw), err)),
+                    }
+                }
+            };
+            ctx.notify_protocol(ProtocolEvent::FinalizedWaveVerified { result });
         }
         Action::ExecuteTransactions {
             wave_id,

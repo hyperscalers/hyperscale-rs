@@ -24,11 +24,13 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, PoisonError, RwLock};
 
-use hyperscale_types::{BloomFilter, DEFAULT_FPR, FinalizedWave, TxHash, WaveCertificate, WaveId};
+use hyperscale_types::{
+    BloomFilter, DEFAULT_FPR, FinalizedWave, TxHash, Verified, WaveCertificate, WaveId,
+};
 
 /// Per-shard finalized-wave store. See module docs for lifecycle.
 pub struct FinalizedWaveStore {
-    waves: RwLock<BTreeMap<WaveId, Arc<FinalizedWave>>>,
+    waves: RwLock<BTreeMap<WaveId, Arc<Verified<FinalizedWave>>>>,
 }
 
 impl Default for FinalizedWaveStore {
@@ -56,7 +58,7 @@ impl FinalizedWaveStore {
     }
 
     /// Record a newly-finalized wave under its `WaveId`.
-    pub fn insert(&self, wave_id: WaveId, fw: Arc<FinalizedWave>) {
+    pub fn insert(&self, wave_id: WaveId, fw: Arc<Verified<FinalizedWave>>) {
         self.waves
             .write()
             .unwrap_or_else(PoisonError::into_inner)
@@ -75,7 +77,7 @@ impl FinalizedWaveStore {
     /// All finalized waves in `WaveId` order. Used by the proposer to
     /// include finalized waves in the next block.
     #[must_use]
-    pub fn all_waves(&self) -> Vec<Arc<FinalizedWave>> {
+    pub fn all_waves(&self) -> Vec<Arc<Verified<FinalizedWave>>> {
         self.waves
             .read()
             .unwrap_or_else(PoisonError::into_inner)
@@ -87,7 +89,7 @@ impl FinalizedWaveStore {
     /// Lookup by `WaveId`. Peers reference waves by id in fetch requests,
     /// so this is the primary ingress lookup for serving finalized-wave data.
     #[must_use]
-    pub fn get(&self, wave_id: &WaveId) -> Option<Arc<FinalizedWave>> {
+    pub fn get(&self, wave_id: &WaveId) -> Option<Arc<Verified<FinalizedWave>>> {
         self.waves
             .read()
             .unwrap_or_else(PoisonError::into_inner)
@@ -197,7 +199,7 @@ mod tests {
     fn make_finalized_wave(
         block_height: u64,
         tx_hashes: &[TxHash],
-    ) -> (WaveId, Arc<FinalizedWave>) {
+    ) -> (WaveId, Arc<Verified<FinalizedWave>>) {
         let wave_id = make_wave_id(block_height);
         let tx_outcomes: Vec<TxOutcome> = tx_hashes
             .iter()
@@ -221,7 +223,10 @@ mod tests {
         let cert = WaveCertificate::new(wave_id.clone(), vec![Arc::new(ec)]);
         // Lookups in this module only inspect the certificate's outcomes; an
         // empty receipts vector is fine for the store's contract.
-        let fw = Arc::new(FinalizedWave::new(Arc::new(cert), vec![]));
+        let fw = Arc::new(Verified::new_unchecked_for_test(FinalizedWave::new(
+            Arc::new(cert),
+            vec![],
+        )));
         (wave_id, fw)
     }
 

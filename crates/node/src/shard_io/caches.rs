@@ -17,7 +17,7 @@ use std::sync::Arc;
 use hyperscale_execution::{ExecCertStore, FinalizedWaveStore};
 use hyperscale_mempool::TxStore;
 use hyperscale_provisions::{ProvisionStore, VerifiedHeaderBuffer};
-use hyperscale_types::{FinalizedWave, TransactionStatus, TxHash, WaveId};
+use hyperscale_types::{FinalizedWave, TransactionStatus, TxHash, Verified, WaveId};
 use quick_cache::sync::Cache as QuickCache;
 
 /// Default certificate cache capacity.
@@ -41,7 +41,7 @@ pub struct SharedCaches {
     /// Finalized waves, keyed by `WaveId`. Populated by `io_loop`'s
     /// `Continuation(FinalizedWavesAdmitted)` interception; queried by the
     /// inbound finalized-wave handler.
-    pub finalized_wave: Arc<QuickCache<WaveId, Arc<FinalizedWave>>>,
+    pub finalized_wave: Arc<QuickCache<WaveId, Arc<Verified<FinalizedWave>>>>,
     /// Outbound + local provision store, owned by the
     /// [`ProvisionCoordinator`]. Cloned here so handlers (block, block-topup,
     /// local-provision, cross-shard provision) can read it without going

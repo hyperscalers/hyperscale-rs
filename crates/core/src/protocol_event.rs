@@ -12,12 +12,13 @@ use hyperscale_types::{
     BlockHeight, BlockManifest, BlockVote, CertRootVerifyError, CertificateRoot,
     CertifiedBeaconBlock, CertifiedBlock, CommittedBlockHeader, CommittedHeaderVerifyError, Epoch,
     ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote, FinalizedWave,
-    LocalReceiptRoot, LocalReceiptRootVerifyError, PcQc3, PcVector, PcVoteMessage,
-    ProvisionRootVerifyError, ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions,
-    ProvisionsRoot, QcVerifyError, QuorumCertificate, ReadySignal, Round, RoutableTransaction,
-    ShardGroupId, ShardWitness, SkipEpochCert, SkipRequest, SpcCert, SpcEmptyViewMsg, SpcView,
-    StateRoot, StateRootVerifyError, StoredReceipt, TransactionRoot, TxOutcome, TxRootVerifyError,
-    ValidatorId, Verifiable, Verified, VotePower, WaveId, WeightedTimestamp,
+    FinalizedWaveVerifyError, LocalReceiptRoot, LocalReceiptRootVerifyError, PcQc3, PcVector,
+    PcVoteMessage, ProvisionRootVerifyError, ProvisionTxRootsMap, ProvisionTxRootsVerifyError,
+    Provisions, ProvisionsRoot, QcVerifyError, QuorumCertificate, ReadySignal, Round,
+    RoutableTransaction, ShardGroupId, ShardWitness, SkipEpochCert, SkipRequest, SpcCert,
+    SpcEmptyViewMsg, SpcView, StateRoot, StateRootVerifyError, StoredReceipt, TransactionRoot,
+    TxOutcome, TxRootVerifyError, ValidatorId, Verifiable, Verified, VotePower, WaveId,
+    WeightedTimestamp,
 };
 
 /// How a node learned about the certifying QC that commits a given block.
@@ -298,7 +299,7 @@ pub enum ProtocolEvent {
         /// recover `ready_signals` from a `Block` alone.
         manifest: BlockManifest,
         /// Finalized waves included in the block (carry certs + receipts + ECs).
-        finalized_waves: Vec<Arc<FinalizedWave>>,
+        finalized_waves: Vec<Arc<Verified<FinalizedWave>>>,
         /// Provisions included in the block.
         provisions: Vec<Arc<Provisions>>,
     },
@@ -446,10 +447,10 @@ pub enum ProtocolEvent {
     /// emits the matching `Continuation(FinalizedWavesAdmitted)` only when
     /// every contained EC's signature passed.
     FinalizedWaveVerified {
-        /// The wave whose ECs were verified.
-        wave: Arc<FinalizedWave>,
-        /// `true` when every contained EC's signature passed verification.
-        valid: bool,
+        /// Verified wave on success; the raw wave plus the reason it
+        /// failed otherwise.
+        result:
+            Result<Arc<Verified<FinalizedWave>>, (Arc<FinalizedWave>, FinalizedWaveVerifyError)>,
     },
 
     /// An execution certificate was just admitted to the canonical EC store.
@@ -485,7 +486,7 @@ pub enum ProtocolEvent {
     ///   any pending block waiting on its hash.
     FinalizedWavesAdmitted {
         /// Finalized waves newly admitted on this admission call.
-        waves: Vec<Arc<FinalizedWave>>,
+        waves: Vec<Arc<Verified<FinalizedWave>>>,
     },
 
     // ═══════════════════════════════════════════════════════════════════════

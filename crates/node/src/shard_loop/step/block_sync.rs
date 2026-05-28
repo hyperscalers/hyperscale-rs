@@ -281,7 +281,12 @@ where
         let caches = &self.io.caches;
         elided.try_rehydrate(
             |h| caches.tx_store.get(h),
-            |id| caches.finalized_wave_store.get(id),
+            |id| {
+                caches
+                    .finalized_wave_store
+                    .get(id)
+                    .map(|v| Arc::new((**v).clone()))
+            },
             |h| caches.provision_store.get(*h),
         )
     }

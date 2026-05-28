@@ -44,9 +44,10 @@ use hyperscale_core::{Action, FetchAbandon, FetchRequest, ProtocolEvent};
 use hyperscale_types::{
     Attempt, Block, BlockHash, BlockHeader, BlockHeight, BloomFilter, CertifiedBlock,
     ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote, FinalizedWave,
-    GlobalReceiptRoot, Hash, Provisions, RoutableTransaction, ShardGroupId, StoredReceipt,
-    TopologySnapshot, TxHash, TxOutcome, ValidatorId, Verifiable, Verified, VotePower,
-    WAVE_TIMEOUT, WaveCertificate, WaveId, WeightedTimestamp, wave_leader, wave_leader_at,
+    FinalizedWaveVerifyError, GlobalReceiptRoot, Hash, Provisions, RoutableTransaction,
+    ShardGroupId, StoredReceipt, TopologySnapshot, TxHash, TxOutcome, ValidatorId, Verifiable,
+    Verified, VotePower, WAVE_TIMEOUT, WaveCertificate, WaveId, WeightedTimestamp, wave_leader,
+    wave_leader_at,
 };
 use tracing::instrument;
 
@@ -1562,7 +1563,7 @@ impl ExecutionCoordinator {
         // re-broadcast tracker entry to stop wasting bandwidth.
         self.outbound_certs.on_wave_finalized(wave_id);
 
-        let finalized_arc = Arc::new(wave.into_finalized());
+        let finalized_arc = Arc::new(Verified::<FinalizedWave>::seal(wave.into_finalized()));
         self.finalized
             .insert(wave_id.clone(), Arc::clone(&finalized_arc));
 
@@ -1654,7 +1655,7 @@ impl ExecutionCoordinator {
             ec_public_keys.push(public_keys);
         }
         vec![Action::VerifyFinalizedWave {
-            wave,
+            wave: Arc::new(Verifiable::Unverified(Arc::unwrap_or_clone(wave))),
             ec_public_keys,
         }]
     }
@@ -1664,23 +1665,32 @@ impl ExecutionCoordinator {
     #[must_use]
     pub fn on_finalized_wave_verified(
         &mut self,
-        wave: Arc<FinalizedWave>,
-        valid: bool,
+        result: Result<
+            Arc<Verified<FinalizedWave>>,
+            (Arc<FinalizedWave>, FinalizedWaveVerifyError),
+        >,
     ) -> Vec<Action> {
-        // Release the in-flight slot regardless of outcome — symmetry with
-        // `on_certificate_verified`. Future arrivals can dispatch again.
-        self.pending_finalized_wave_verifications
-            .remove(wave.wave_id());
-
-        if !valid {
-            tracing::warn!(
-                wave = %wave.wave_id(),
-                "Dropping fetched FinalizedWave: contained EC signature invalid"
-            );
-            return vec![Action::AbandonFetch(FetchAbandon::FinalizedWaves {
-                ids: vec![wave.wave_id().clone()],
-            })];
-        }
+        // Release the in-flight slot regardless of outcome — future
+        // arrivals can dispatch again.
+        let wave = match result {
+            Ok(verified) => {
+                self.pending_finalized_wave_verifications
+                    .remove(verified.wave_id());
+                verified
+            }
+            Err((raw, err)) => {
+                self.pending_finalized_wave_verifications
+                    .remove(raw.wave_id());
+                tracing::warn!(
+                    wave = %raw.wave_id(),
+                    error = ?err,
+                    "Dropping fetched FinalizedWave: contained EC signature invalid"
+                );
+                return vec![Action::AbandonFetch(FetchAbandon::FinalizedWaves {
+                    ids: vec![raw.wave_id().clone()],
+                })];
+            }
+        };
         vec![Action::Continuation(
             ProtocolEvent::FinalizedWavesAdmitted { waves: vec![wave] },
         )]
@@ -1698,13 +1708,13 @@ impl ExecutionCoordinator {
 
     /// Get all finalized waves (for proposal building).
     #[must_use]
-    pub fn get_finalized_waves(&self) -> Vec<Arc<FinalizedWave>> {
+    pub fn get_finalized_waves(&self) -> Vec<Arc<Verified<FinalizedWave>>> {
         self.finalized.all_waves()
     }
 
     /// Get a finalized wave by its `WaveId` (returns `Arc` for sharing).
     #[must_use]
-    pub fn get_finalized_wave(&self, wave_id: &WaveId) -> Option<Arc<FinalizedWave>> {
+    pub fn get_finalized_wave(&self, wave_id: &WaveId) -> Option<Arc<Verified<FinalizedWave>>> {
         self.finalized.get(wave_id)
     }
 
@@ -2505,7 +2515,13 @@ mod tests {
             Arc::new(WaveCertificate::new(wave_id.clone(), vec![ec])),
             vec![],
         ));
-        let actions = state.on_finalized_wave_verified(wave, false);
+        let actions = state.on_finalized_wave_verified(Err((
+            wave,
+            FinalizedWaveVerifyError::ExecutionCertificate {
+                index: 0,
+                source: ExecutionCertificateVerifyError::BadAggregatedSignature,
+            },
+        )));
         assert!(
             actions.iter().any(|a| matches!(
                 a,
@@ -2631,11 +2647,11 @@ mod tests {
             zero_bls_signature(),
             SignerBitfield::new(4),
         ));
-        let wave = Arc::new(FinalizedWave::new(
+        let wave = Arc::new(Verified::new_unchecked_for_test(FinalizedWave::new(
             Arc::new(WaveCertificate::new(wave_id, vec![ec])),
             vec![],
-        ));
-        let actions = state.on_finalized_wave_verified(wave, true);
+        )));
+        let actions = state.on_finalized_wave_verified(Ok(wave));
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             actions[0],
@@ -2771,15 +2787,16 @@ mod tests {
             zero_bls_signature(),
             signers,
         ));
-        let wave = Arc::new(FinalizedWave::new(
+        let raw_wave = FinalizedWave::new(
             Arc::new(WaveCertificate::new(wave_id.clone(), vec![ec])),
             vec![],
-        ));
+        );
+        let verified_wave = Arc::new(Verified::new_unchecked_for_test(raw_wave.clone()));
         // Seed the canonical store directly (mirrors what `finalize_wave`
         // does on the local-aggregation path).
-        state.finalized.insert(wave_id, Arc::clone(&wave));
+        state.finalized.insert(wave_id, verified_wave);
 
-        let actions = state.admit_finalized_wave(&topo, wave);
+        let actions = state.admit_finalized_wave(&topo, Arc::new(raw_wave));
         assert!(actions.is_empty());
     }
 

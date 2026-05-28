@@ -287,11 +287,20 @@ pub fn build_proposal<S: ShardChainWriter>(
     }
 }
 
-fn collect_finalized_receipts(waves: &[Arc<FinalizedWave>]) -> Vec<Arc<ConsensusReceipt>> {
+fn collect_finalized_receipts(
+    waves: &[Arc<Verified<FinalizedWave>>],
+) -> Vec<Arc<ConsensusReceipt>> {
     waves
         .iter()
         .flat_map(|fw| fw.consensus_receipts())
         .collect()
+}
+
+/// Strip the verified marker from each wave for downstream consumers
+/// that take raw `Arc<FinalizedWave>` slices (storage writes, wire
+/// types, root computations).
+fn strip_verified_waves(waves: &[Arc<Verified<FinalizedWave>>]) -> Vec<Arc<FinalizedWave>> {
+    waves.iter().map(|v| Arc::new((***v).clone())).collect()
 }
 
 /// Handle the shard-owned delegated [`Action`] variants.
@@ -576,10 +585,11 @@ where
                 .pending_chain
                 .view_at(parent_block_hash, parent_block_height);
             let pending_snapshots = view.pending_snapshots().to_vec();
+            let raw_waves = strip_verified_waves(&finalized_waves);
             let (computed_root, jmt_snapshot, prepared) = view.prepare_block_commit(
                 parent_state_root,
                 parent_block_height,
-                &finalized_waves,
+                &raw_waves,
                 block_height,
                 &pending_snapshots,
                 None,
@@ -637,6 +647,7 @@ where
                 .pending_chain
                 .view_at(parent_block_hash, parent_block_height);
             let pending_snapshots = view.pending_snapshots().to_vec();
+            let raw_waves = strip_verified_waves(&finalized_waves);
             let result = build_proposal(
                 &view,
                 proposer,
@@ -649,7 +660,7 @@ where
                 parent_state_root,
                 parent_block_height,
                 transactions,
-                finalized_waves.clone(),
+                raw_waves,
                 shard_group_id,
                 ctx.topology_snapshot,
                 provisions.clone(),

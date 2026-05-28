@@ -5,7 +5,7 @@ use std::sync::Arc;
 use hyperscale_storage::{PendingChain, ShardStorage};
 use hyperscale_types::network::request::GetFinalizedWavesRequest;
 use hyperscale_types::network::response::GetFinalizedWavesResponse;
-use hyperscale_types::{FinalizedWave, WaveId};
+use hyperscale_types::{FinalizedWave, Verified, WaveId};
 use quick_cache::sync::Cache as QuickCache;
 
 /// Serve an inbound finalized-wave fetch request.
@@ -19,14 +19,14 @@ use quick_cache::sync::Cache as QuickCache;
 /// complete answer from durable storage.
 pub fn serve_finalized_waves_request<S: ShardStorage>(
     pending_chain: &PendingChain<S>,
-    fw_cache: &QuickCache<WaveId, Arc<FinalizedWave>>,
+    fw_cache: &QuickCache<WaveId, Arc<Verified<FinalizedWave>>>,
     req: &GetFinalizedWavesRequest,
 ) -> GetFinalizedWavesResponse {
     let mut waves: Vec<Arc<FinalizedWave>> = Vec::new();
     let mut missing: Vec<WaveId> = Vec::new();
     for id in &req.wave_ids {
         if let Some(fw) = fw_cache.get(id) {
-            waves.push(fw);
+            waves.push(Arc::new((**fw).clone()));
         } else {
             missing.push(id.clone());
         }

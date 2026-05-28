@@ -7,14 +7,16 @@
 use std::sync::Arc;
 
 use hyperscale_core::Action;
-use hyperscale_types::{FinalizedWave, MAX_TXS_PER_BLOCK, Provisions, RoutableTransaction};
+use hyperscale_types::{
+    FinalizedWave, MAX_TXS_PER_BLOCK, Provisions, RoutableTransaction, Verified,
+};
 
 use super::NodeStateMachine;
 
 /// Inputs gathered for building a block proposal.
 pub(super) struct ProposalInputs {
     pub ready_txs: Vec<Arc<RoutableTransaction>>,
-    pub finalized_waves: Vec<Arc<FinalizedWave>>,
+    pub finalized_waves: Vec<Arc<Verified<FinalizedWave>>>,
     pub provisions: Vec<Arc<Provisions>>,
 }
 
