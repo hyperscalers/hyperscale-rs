@@ -17,7 +17,7 @@ use super::NodeStateMachine;
 pub(super) struct ProposalInputs {
     pub ready_txs: Vec<Arc<RoutableTransaction>>,
     pub finalized_waves: Vec<Arc<Verified<FinalizedWave>>>,
-    pub provisions: Vec<Arc<Provisions>>,
+    pub provisions: Vec<Arc<Verified<Provisions>>>,
 }
 
 impl NodeStateMachine {

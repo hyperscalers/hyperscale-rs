@@ -15,14 +15,14 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_types::{LocalTimestamp, ProvisionHash, Provisions, WeightedTimestamp};
+use hyperscale_types::{LocalTimestamp, ProvisionHash, Provisions, Verified, WeightedTimestamp};
 
 /// A queued provisions entry awaiting block inclusion. `added_at` drives
 /// dwell-time filtering; `source_block_ts` anchors deadline-based eviction
 /// via [`Provision::deadline`].
 #[derive(Debug, Clone)]
 struct QueuedProvision {
-    provisions: Arc<Provisions>,
+    provisions: Arc<Verified<Provisions>>,
     added_at: LocalTimestamp,
     source_block_ts: WeightedTimestamp,
 }
@@ -45,7 +45,7 @@ impl QueuedProvisionBuffer {
     /// Push verified provisions onto the proposal queue.
     pub(crate) fn enqueue(
         &mut self,
-        provisions: Arc<Provisions>,
+        provisions: Arc<Verified<Provisions>>,
         source_block_ts: WeightedTimestamp,
         added_at: LocalTimestamp,
     ) {
@@ -82,7 +82,7 @@ impl QueuedProvisionBuffer {
         &self,
         now: LocalTimestamp,
         weighted_now: WeightedTimestamp,
-    ) -> Vec<Arc<Provisions>> {
+    ) -> Vec<Arc<Verified<Provisions>>> {
         self.queue
             .iter()
             .filter(|q| now.saturating_sub(q.added_at) >= self.min_dwell_time)
@@ -116,8 +116,8 @@ mod tests {
         seed: u8,
         source_shard: ShardGroupId,
         height: BlockHeight,
-    ) -> Arc<Provisions> {
-        Arc::new(Provisions::new(
+    ) -> Arc<Verified<Provisions>> {
+        Arc::new(Verified::new_unchecked_for_test(Provisions::new(
             source_shard,
             ShardGroupId::new(0),
             height,
@@ -128,7 +128,7 @@ mod tests {
                 vec![],
                 vec![],
             )],
-        ))
+        )))
     }
 
     #[test]

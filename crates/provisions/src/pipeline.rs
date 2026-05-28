@@ -124,7 +124,7 @@ impl ProvisionPipeline {
     }
 
     /// Insert verified provisions into the pipeline + store. Returns the
-    /// raw `Arc` the coordinator hands downstream (queue + `ProvisionsAdmitted`
+    /// verified `Arc` the coordinator hands downstream (queue + `ProvisionsAdmitted`
     /// emit). Idempotent if the same content hash is inserted twice.
     ///
     /// The shared [`ProvisionStore`] holds raw `Arc<Provisions>` because the
@@ -135,18 +135,17 @@ impl ProvisionPipeline {
         &mut self,
         verified: Arc<Verified<Provisions>>,
         source_block_ts: WeightedTimestamp,
-    ) -> Arc<Provisions> {
+    ) -> Arc<Verified<Provisions>> {
         let hash = verified.hash();
-        let raw = Arc::new((**verified).clone());
+        self.store.insert(Arc::new((**verified).clone()));
         self.verified.insert(
             hash,
             VerifiedProvision {
-                provisions: verified,
+                provisions: Arc::clone(&verified),
                 source_block_ts,
             },
         );
-        self.store.insert(Arc::clone(&raw));
-        raw
+        verified
     }
 
     /// Drop verified and pending entries whose deadline has passed `now`.
@@ -200,8 +199,15 @@ impl ProvisionPipeline {
         }
     }
 
-    pub(crate) fn get_provisions_by_hash(&self, hash: ProvisionHash) -> Option<Arc<Provisions>> {
-        self.store.get(hash)
+    /// Verified handle by content hash, if held in the pipeline's
+    /// `verified` map. The shared store still holds raw bodies for
+    /// wire-serving; this is the typed-state-bearing read path used by
+    /// pending-block assembly.
+    pub(crate) fn get_provisions_by_hash(
+        &self,
+        hash: ProvisionHash,
+    ) -> Option<Arc<Verified<Provisions>>> {
+        self.verified.get(&hash).map(|v| Arc::clone(&v.provisions))
     }
 
     pub(crate) const fn store(&self) -> &Arc<ProvisionStore> {
