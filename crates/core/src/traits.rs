@@ -20,7 +20,7 @@ use crate::{Action, ProtocolEvent};
 ///     fn handle(&mut self, now: LocalTimestamp, event: ProtocolEvent) -> Vec<Action> {
 ///         self.now = now;
 ///         match event {
-///             ProtocolEvent::BlockVoteReceived { vote } => self.on_block_vote(vote),
+///             ProtocolEvent::UnverifiedBlockVoteReceived { vote } => self.on_block_vote(vote),
 ///             // ... etc
 ///         }
 ///     }

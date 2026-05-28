@@ -34,9 +34,12 @@ impl NodeStateMachine {
                 );
                 actions
             }
-            ProtocolEvent::ExecutionVoteReceived { vote } => self
+            ProtocolEvent::VerifiedExecutionVoteReceived { vote } => self
                 .execution_coordinator
-                .on_execution_vote(&self.topology_snapshot, vote),
+                .on_verified_execution_vote(&self.topology_snapshot, vote),
+            ProtocolEvent::UnverifiedExecutionVoteReceived { vote } => self
+                .execution_coordinator
+                .on_unverified_execution_vote(&self.topology_snapshot, vote),
             ProtocolEvent::ExecutionVotesVerifiedAndAggregated {
                 wave_id,
                 block_hash,

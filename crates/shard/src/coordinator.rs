@@ -1562,7 +1562,7 @@ impl ShardCoordinator {
 
         // Emit SignAndBroadcastBlockVote — the io_loop signs on the consensus
         // crypto pool, broadcasts, and feeds the signed vote back for local
-        // VoteSet tracking via BlockVoteReceived.
+        // VoteSet tracking via VerifiedBlockVoteReceived.
         vec![Action::SignAndBroadcastBlockVote {
             block_hash,
             height,
@@ -1576,23 +1576,52 @@ impl ShardCoordinator {
     // Vote Collection (Deferred Verification)
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// Handle received block vote.
-    ///
-    /// Uses deferred verification: votes are buffered until we have enough
-    /// voting power to possibly reach quorum. Only then do we batch-verify
-    /// all buffered votes and build the QC in a single operation.
-    ///
-    /// Note: The sender identity comes from `vote.voter` (`ValidatorId`), which is
-    /// signed and verified.
+    /// Handle a locally-produced, pre-verified block vote. Skips the
+    /// BLS batch path — the vote is admitted directly to the verified
+    /// tally. Wire-arrived votes route through
+    /// [`Self::on_unverified_block_vote`].
     #[instrument(skip(self, vote), fields(
         height = vote.height().inner(),
         voter = ?vote.voter(),
         block_hash = ?vote.block_hash()
     ))]
-    pub fn on_block_vote(
+    pub fn on_verified_block_vote(
         &mut self,
         topology_snapshot: &TopologySnapshot,
-        vote: Verifiable<BlockVote>,
+        vote: Verified<BlockVote>,
+    ) -> Vec<Action> {
+        trace!(
+            validator = ?topology_snapshot.local_validator_id(),
+            voter = ?vote.voter(),
+            block_hash = ?vote.block_hash(),
+            "Received pre-verified block vote"
+        );
+
+        let header_for_vote = self.pending_blocks.get_header(vote.block_hash());
+        self.votes.accept_verified_vote(
+            topology_snapshot,
+            vote,
+            self.committed_height,
+            header_for_vote,
+        )
+    }
+
+    /// Handle a wire-arrived block vote.
+    ///
+    /// Uses deferred verification: votes are buffered until we have
+    /// enough voting power to possibly reach quorum. Only then do we
+    /// batch-verify all buffered signatures and build the QC in a
+    /// single operation. The sender identity comes from `vote.voter`
+    /// (`ValidatorId`), which is itself part of the signed payload.
+    #[instrument(skip(self, vote), fields(
+        height = vote.height().inner(),
+        voter = ?vote.voter(),
+        block_hash = ?vote.block_hash()
+    ))]
+    pub fn on_unverified_block_vote(
+        &mut self,
+        topology_snapshot: &TopologySnapshot,
+        vote: BlockVote,
     ) -> Vec<Action> {
         trace!(
             validator = ?topology_snapshot.local_validator_id(),
@@ -1601,7 +1630,13 @@ impl ShardCoordinator {
             "Received block vote"
         );
 
-        self.on_block_vote_internal(topology_snapshot, vote)
+        let header_for_vote = self.pending_blocks.get_header(vote.block_hash());
+        self.votes.accept_unverified_vote(
+            topology_snapshot,
+            vote,
+            self.committed_height,
+            header_for_vote,
+        )
     }
 
     /// Admit a validator's "ready on shard" signal into the local pool.
@@ -1625,23 +1660,6 @@ impl ShardCoordinator {
             return;
         }
         self.ready_signal_pool.admit(signal, self.now);
-    }
-
-    /// Internal vote processing. Delegates to [`VoteKeeper::accept_vote`]
-    /// which runs the committee/power checks, buffers the signature, and
-    /// fires batch verification once quorum is reachable.
-    fn on_block_vote_internal(
-        &mut self,
-        topology_snapshot: &TopologySnapshot,
-        vote: Verifiable<BlockVote>,
-    ) -> Vec<Action> {
-        let header_for_vote = self.pending_blocks.get_header(vote.block_hash());
-        self.votes.accept_vote(
-            topology_snapshot,
-            vote,
-            self.committed_height,
-            header_for_vote,
-        )
     }
 
     /// Handle QC verification and building result.

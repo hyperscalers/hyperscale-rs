@@ -322,7 +322,8 @@ impl ShardScopedInput {
                 }
                 ProtocolEvent::BlockHeaderReceived { .. }
                 | ProtocolEvent::RemoteHeaderReceived { .. }
-                | ProtocolEvent::BlockVoteReceived { .. }
+                | ProtocolEvent::VerifiedBlockVoteReceived { .. }
+                | ProtocolEvent::UnverifiedBlockVoteReceived { .. }
                 | ProtocolEvent::ProvisionsReceived { .. }
                 | ProtocolEvent::ExecutionCertificatesReceived { .. }
                 | ProtocolEvent::FinalizedWavesReceived { .. }

@@ -17,7 +17,7 @@ use hyperscale_types::network::request::{
 use hyperscale_types::network::response::{
     GetLocalProvisionsResponse, GetProvisionResponse, LocalProvisionEntry,
 };
-use hyperscale_types::{ShardGroupId, Verifiable, ready_signal_message};
+use hyperscale_types::{ShardGroupId, ready_signal_message};
 use tracing::warn;
 
 use crate::event::ShardScopedInput;
@@ -440,7 +440,7 @@ where
     /// to known committee members.
     #[allow(clippy::too_many_lines)] // single registration table; one closure per notification type
     pub(crate) fn register_notification_handlers(&self) {
-        // ── block.vote → ProtocolEvent::BlockVoteReceived ────────────
+        // ── block.vote → ProtocolEvent::UnverifiedBlockVoteReceived ──
         //
         // `BlockVote.shard_group_id()` is the shard whose consensus the
         // vote is for; with cross-shard hosting that selects which of
@@ -463,7 +463,9 @@ where
                     push_protocol_event(
                         tx,
                         shard,
-                        ProtocolEvent::BlockVoteReceived { vote: gossip.vote },
+                        ProtocolEvent::UnverifiedBlockVoteReceived {
+                            vote: gossip.vote.into_unverified(),
+                        },
                     );
                 },
             );
@@ -539,7 +541,7 @@ where
                 },
             );
 
-        // ── execution.vote.batch → verify sender sig, then ProtocolEvent::ExecutionVoteReceived ─
+        // ── execution.vote.batch → verify sender sig, then ProtocolEvent::UnverifiedExecutionVoteReceived ─
 
         let senders = self.process.shard_event_senders.clone();
         let topology = self.process.topology_snapshot.clone();
@@ -579,9 +581,7 @@ where
                         push_protocol_event(
                             tx,
                             target_shard,
-                            ProtocolEvent::ExecutionVoteReceived {
-                                vote: Verifiable::Unverified(vote),
-                            },
+                            ProtocolEvent::UnverifiedExecutionVoteReceived { vote },
                         );
                     }
                 },

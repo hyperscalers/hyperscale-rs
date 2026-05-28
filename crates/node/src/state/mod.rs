@@ -222,7 +222,8 @@ impl StateMachine for NodeStateMachine {
             evt @ (ProtocolEvent::BlockHeaderReceived { .. }
             | ProtocolEvent::QuorumCertificateFormed { .. }
             | ProtocolEvent::RemoteHeaderReceived { .. }
-            | ProtocolEvent::BlockVoteReceived { .. }
+            | ProtocolEvent::VerifiedBlockVoteReceived { .. }
+            | ProtocolEvent::UnverifiedBlockVoteReceived { .. }
             | ProtocolEvent::BlockReadyToCommit { .. }
             | ProtocolEvent::QuorumCertificateResult { .. }
             | ProtocolEvent::QcSignatureVerified { .. }
@@ -250,7 +251,8 @@ impl StateMachine for NodeStateMachine {
 
             // ── Execution ────────────────────────────────────────────────
             evt @ (ProtocolEvent::ExecutionBatchCompleted { .. }
-            | ProtocolEvent::ExecutionVoteReceived { .. }
+            | ProtocolEvent::VerifiedExecutionVoteReceived { .. }
+            | ProtocolEvent::UnverifiedExecutionVoteReceived { .. }
             | ProtocolEvent::ExecutionVotesVerifiedAndAggregated { .. }
             | ProtocolEvent::ExecutionCertificateAggregated { .. }
             | ProtocolEvent::ExecutionCertificatesReceived { .. }

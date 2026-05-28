@@ -291,7 +291,7 @@ impl ExecutionCoordinator {
     /// arrived before block commit.
     ///
     /// Returns the emitted dispatch actions plus any early execution votes
-    /// that need to be replayed through `on_execution_vote()`.
+    /// that need to be replayed through `dispatch_execution_vote()`.
     fn setup_waves_and_dispatch(
         &mut self,
         topology: &TopologySnapshot,
@@ -663,19 +663,48 @@ impl ExecutionCoordinator {
     // Wave Vote Handling
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// Handle an execution vote received from another validator (or self).
+    /// Handle a locally-produced, pre-verified execution vote.
+    /// Bypasses the BLS batch path and lands directly in the verified
+    /// tally. See [`Self::dispatch_execution_vote`] for the leader,
+    /// fallback, and early-buffer routing rules.
+    pub fn on_verified_execution_vote(
+        &mut self,
+        topology: &TopologySnapshot,
+        vote: Verified<ExecutionVote>,
+    ) -> Vec<Action> {
+        self.dispatch_execution_vote(topology, vote.into())
+    }
+
+    /// Handle a wire-arrived execution vote. Buffered for batch BLS
+    /// verification once combined power could reach quorum. See
+    /// [`Self::dispatch_execution_vote`] for the full routing rules.
+    pub fn on_unverified_execution_vote(
+        &mut self,
+        topology: &TopologySnapshot,
+        vote: ExecutionVote,
+    ) -> Vec<Action> {
+        self.dispatch_execution_vote(topology, vote.into())
+    }
+
+    /// Routing hub for both ingestion paths.
     ///
-    /// Only the wave leader (or a fallback leader via rotation) aggregates votes.
-    /// If a vote arrives at a non-leader that has the accumulator but no tracker,
-    /// a fallback `VoteTracker` is created on-demand (the sender determined this
-    /// validator is the rotated leader for their retry attempt).
+    /// Only the wave leader (or a fallback leader via rotation)
+    /// aggregates votes. If a vote arrives at a non-leader that has
+    /// the accumulator but no tracker, a fallback `VoteTracker` is
+    /// created on-demand (the sender determined this validator is the
+    /// rotated leader for their retry attempt).
+    ///
+    /// The `Verifiable<ExecutionVote>` signature lets the
+    /// early-arrivals buffer hold either taxonomy under one shape and
+    /// replay them through the same path when a fallback tracker
+    /// spins up.
     ///
     /// # Panics
     ///
-    /// Panics if a vote tracker is created or recovered for a wave but is
-    /// missing on the immediate `take_unverified_votes` lookup — the tracker
-    /// is locked across `&mut self`, so this is unreachable.
-    pub fn on_execution_vote(
+    /// Panics if a vote tracker is created or recovered for a wave but
+    /// is missing on the immediate `take_unverified_votes` lookup — the
+    /// tracker is locked across `&mut self`, so this is unreachable.
+    fn dispatch_execution_vote(
         &mut self,
         topology: &TopologySnapshot,
         vote: Verifiable<ExecutionVote>,
@@ -735,10 +764,10 @@ impl ExecutionCoordinator {
                 );
                 let mut actions = Vec::new();
                 for ev in early {
-                    actions.extend(self.on_execution_vote(topology, ev));
+                    actions.extend(self.dispatch_execution_vote(topology, ev));
                 }
                 // Process the current vote that triggered fallback creation.
-                actions.extend(self.on_execution_vote(topology, vote));
+                actions.extend(self.dispatch_execution_vote(topology, vote));
                 return actions;
             }
         }
@@ -1461,7 +1490,7 @@ impl ExecutionCoordinator {
             );
             actions.extend(dispatch_actions);
             for vote in early_votes {
-                actions.extend(self.on_execution_vote(topology, vote));
+                actions.extend(self.dispatch_execution_vote(topology, vote));
             }
 
             actions.extend(self.replay_early_wave_attestations(topology, transactions));
@@ -2190,7 +2219,7 @@ mod tests {
             zero_bls_signature(),
         );
 
-        state_non.on_execution_vote(&topo_non, Verifiable::Unverified(fake_vote));
+        state_non.on_unverified_execution_vote(&topo_non, fake_vote);
 
         // Should have created a fallback VoteTracker.
         assert!(
@@ -2228,7 +2257,7 @@ mod tests {
             zero_bls_signature(),
         );
 
-        let actions = state.on_execution_vote(&topo, Verifiable::Unverified(vote));
+        let actions = state.on_unverified_execution_vote(&topo, vote);
         assert!(actions.is_empty(), "non-committee vote must be dropped");
         assert!(
             !state.waves.contains_tracker(&wave_id),

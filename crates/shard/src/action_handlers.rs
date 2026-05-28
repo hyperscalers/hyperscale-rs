@@ -724,9 +724,7 @@ where
             let gossip = BlockVoteNotification::new(verified.clone());
             ctx.network.notify(&next_proposers, &gossip);
             // Feed our own signed vote back for local VoteSet tracking.
-            ctx.notify_protocol(ProtocolEvent::BlockVoteReceived {
-                vote: verified.into(),
-            });
+            ctx.notify_protocol(ProtocolEvent::VerifiedBlockVoteReceived { vote: verified });
         }
 
         Action::BroadcastCommittedBlockHeader { committed_header } => {

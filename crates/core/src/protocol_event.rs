@@ -93,12 +93,26 @@ pub enum ProtocolEvent {
         sender: ValidatorId,
     },
 
-    /// Received a vote on a block header.
-    BlockVoteReceived {
-        /// Block vote received from a peer. Wire bytes always land in
-        /// [`Verifiable::Unverified`]; local-dispatched delivery from a
-        /// colocated voter preserves [`Verifiable::Verified`].
-        vote: Verifiable<BlockVote>,
+    /// Received a block vote whose BLS signature has already been
+    /// established at emit time.
+    ///
+    /// Produced only by the local sign-and-send handler, which routes
+    /// our own signed vote back to the state machine for `VoteSet`
+    /// tracking. Wire-arrived votes — even when the sender claims our
+    /// validator id — take the [`Self::UnverifiedBlockVoteReceived`]
+    /// path.
+    VerifiedBlockVoteReceived {
+        /// Our locally-signed vote, sealed via
+        /// [`Verified::<BlockVote>::sign_local`].
+        vote: Verified<BlockVote>,
+    },
+
+    /// Received a block vote whose BLS signature still needs to be
+    /// checked. Produced by the gossip handler after sender-batch
+    /// authentication.
+    UnverifiedBlockVoteReceived {
+        /// Raw block vote off the wire.
+        vote: BlockVote,
     },
 
     /// Received a validator's "ready on shard" signal.
@@ -388,17 +402,24 @@ pub enum ProtocolEvent {
         tx_outcomes: Vec<TxOutcome>,
     },
 
-    /// Received an execution vote from any source.
+    /// Received an execution vote whose BLS signature has already been
+    /// established at emit time.
     ///
-    /// `Verifiable::Verified` for own votes the local sign-and-send
-    /// handler produced through the [`Verified::<ExecutionVote>::sign_local`]
-    /// gate; `Verifiable::Unverified` for peer-arrived votes the wire
-    /// handler hands off after sender-batch authentication. The
-    /// coordinator branches on the marker to skip per-vote
-    /// re-verification of own votes.
-    ExecutionVoteReceived {
-        /// Execution vote, carrying its verification status.
-        vote: Verifiable<ExecutionVote>,
+    /// Produced only by the local sign-and-send handler when this node
+    /// is the wave leader, so its own vote is fed straight into the
+    /// verified tally.
+    VerifiedExecutionVoteReceived {
+        /// Our locally-signed vote, sealed via
+        /// [`Verified::<ExecutionVote>::sign_local`].
+        vote: Verified<ExecutionVote>,
+    },
+
+    /// Received an execution vote whose BLS signature still needs to be
+    /// checked. Produced by the wire handler after sender-batch
+    /// authentication.
+    UnverifiedExecutionVoteReceived {
+        /// Raw execution vote off the wire.
+        vote: ExecutionVote,
     },
 
     /// Batch execution vote verification completed.

@@ -354,8 +354,8 @@ where
 
             // Feed own vote to state machine only if we are the leader.
             if leader == validator_id {
-                ctx.notify_protocol(ProtocolEvent::ExecutionVoteReceived {
-                    vote: Verifiable::Verified(verified),
+                ctx.notify_protocol(ProtocolEvent::VerifiedExecutionVoteReceived {
+                    vote: verified,
                 });
             }
         }

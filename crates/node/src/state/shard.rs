@@ -95,9 +95,12 @@ impl NodeStateMachine {
                     sender,
                 )
             }
-            ProtocolEvent::BlockVoteReceived { vote } => self
+            ProtocolEvent::VerifiedBlockVoteReceived { vote } => self
                 .shard_coordinator
-                .on_block_vote(&self.topology_snapshot, vote),
+                .on_verified_block_vote(&self.topology_snapshot, vote),
+            ProtocolEvent::UnverifiedBlockVoteReceived { vote } => self
+                .shard_coordinator
+                .on_unverified_block_vote(&self.topology_snapshot, vote),
             ProtocolEvent::ReadySignalReceived { signal } => {
                 self.shard_coordinator
                     .on_ready_signal_received(&self.topology_snapshot, signal);

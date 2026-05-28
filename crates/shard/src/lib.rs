@@ -9,7 +9,7 @@
 //!
 //! - new-content latch → Build and broadcast block if we're the proposer
 //! - `Event::BlockHeaderReceived` → Validate header, assemble block, vote
-//! - `Event::BlockVoteReceived` → Collect votes, form QC when quorum reached
+//! - `Event::{Verified,Unverified}BlockVoteReceived` → Collect votes, form QC when quorum reached
 //! - `Event::QuorumCertificateFormed` → Update chain state, commit if ready
 //!
 //! All I/O is performed by the runner via returned `Action`s.

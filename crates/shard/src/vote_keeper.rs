@@ -24,12 +24,19 @@ use hyperscale_core::Action;
 #[cfg(test)]
 use hyperscale_types::{BeaconWitnessLeafCount, BeaconWitnessRoot};
 use hyperscale_types::{
-    BlockHash, BlockHeader, BlockHeight, BlockVote, Round, TopologySnapshot, ValidatorId,
-    Verifiable, Verified, VotePower,
+    BlockHash, BlockHeader, BlockHeight, BlockVote, Bls12381G1PublicKey, Round, TopologySnapshot,
+    ValidatorId, Verified, VotePower,
 };
 use tracing::{info, trace, warn};
 
 pub use crate::vote_set::VoteSet;
+
+/// Shared per-vote lookup result from [`VoteKeeper::preflight`].
+struct VotePreflight {
+    voter_index: usize,
+    voting_power: VotePower,
+    public_key: Bls12381G1PublicKey,
+}
 
 /// Top-level vote accounting state.
 ///
@@ -189,27 +196,100 @@ impl VoteKeeper {
     // Vote ingestion
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Accept a received block vote: committee/power checks, buffering the
-    /// signature (or marking own votes as verified) into the block's
-    /// [`VoteSet`], and firing batch verification once combined power can
-    /// reach quorum. `header_for_vote` is the header from the caller's
-    /// pending-block map; `None` is acceptable when the header hasn't been
-    /// received yet — a later [`VoteSet::set_header`] fills it in.
-    ///
-    /// If `vote` arrives [`Verifiable::Verified`] (own vote, or local
-    /// dispatch from a colocated voter), it's admitted directly to the
-    /// verified set without re-checking the BLS signature.
-    pub fn accept_vote(
+    /// Admit a locally-produced, already-verified block vote into the
+    /// block's [`VoteSet`] without re-checking the BLS signature, then
+    /// fire batch verification if the combined power can now reach
+    /// quorum. `header_for_vote` is the header from the caller's
+    /// pending-block map; `None` is acceptable when the header hasn't
+    /// been received yet — a later [`VoteSet::set_header`] fills it in.
+    pub fn accept_verified_vote(
         &mut self,
         topology: &TopologySnapshot,
-        vote: Verifiable<BlockVote>,
+        vote: Verified<BlockVote>,
         committed_height: BlockHeight,
         header_for_vote: Option<&BlockHeader>,
     ) -> Vec<Action> {
         let block_hash = vote.block_hash();
+        let Some(prep) = Self::preflight(topology, &vote, committed_height) else {
+            return vec![];
+        };
+
+        let committee_size = topology.local_committee().len();
+        let vote_set = self
+            .vote_sets
+            .entry(block_hash)
+            .or_insert_with(|| VoteSet::new(header_for_vote, committee_size));
+
+        if vote_set.has_seen_validator(prep.voter_index) {
+            trace!("Already seen vote from validator {:?}", vote.voter());
+            return vec![];
+        }
+
+        let is_own_vote = vote.voter() == topology.local_validator_id();
+        trace!(
+            block_hash = ?block_hash,
+            is_own_vote,
+            "Admitting pre-verified vote"
+        );
+        vote_set.add_verified_vote(prep.voter_index, vote, prep.voting_power);
+
+        self.maybe_trigger_verification(topology, block_hash)
+    }
+
+    /// Accept a wire-arrived block vote: buffer its signature into the
+    /// block's [`VoteSet`] and fire batch verification once combined
+    /// power can reach quorum. Wire-arrived votes that claim our own
+    /// validator id take the same BLS batch route as any other voter —
+    /// the in-process verified path is only reachable through
+    /// [`Self::accept_verified_vote`].
+    pub fn accept_unverified_vote(
+        &mut self,
+        topology: &TopologySnapshot,
+        vote: BlockVote,
+        committed_height: BlockHeight,
+        header_for_vote: Option<&BlockHeader>,
+    ) -> Vec<Action> {
+        let block_hash = vote.block_hash();
+        let Some(prep) = Self::preflight(topology, &vote, committed_height) else {
+            return vec![];
+        };
+
+        let committee_size = topology.local_committee().len();
+        let vote_set = self
+            .vote_sets
+            .entry(block_hash)
+            .or_insert_with(|| VoteSet::new(header_for_vote, committee_size));
+
+        if vote_set.has_seen_validator(prep.voter_index) {
+            trace!("Already seen vote from validator {:?}", vote.voter());
+            return vec![];
+        }
+
+        let total_power = topology.local_voting_power();
+        let validator_id = topology.local_validator_id();
+        vote_set.buffer_unverified_vote(prep.voter_index, vote, prep.public_key, prep.voting_power);
+        trace!(
+            validator = ?validator_id,
+            block_hash = ?block_hash,
+            verified_power = vote_set.verified_power().inner(),
+            unverified_power = vote_set.unverified_power().inner(),
+            total_power = total_power.inner(),
+            "Vote buffered"
+        );
+
+        self.maybe_trigger_verification(topology, block_hash)
+    }
+
+    /// Shared committee/power lookup for both vote-ingestion paths.
+    /// Returns `None` when the vote should be dropped (committed height,
+    /// non-committee voter, missing public key).
+    fn preflight(
+        topology: &TopologySnapshot,
+        vote: &BlockVote,
+        committed_height: BlockHeight,
+    ) -> Option<VotePreflight> {
         let height = vote.height();
         let voter = vote.voter();
-        let is_own_vote = voter == topology.local_validator_id();
 
         if height <= committed_height {
             trace!(
@@ -218,12 +298,12 @@ impl VoteKeeper {
                 voter = ?voter,
                 "Skipping vote for already-committed height"
             );
-            return vec![];
+            return None;
         }
 
         let Some(voter_index) = topology.local_committee_index(voter) else {
             warn!("Vote from validator {:?} not in committee", voter);
-            return vec![];
+            return None;
         };
 
         // `local_committee_index` returning `Some` means the voter is in the
@@ -233,53 +313,16 @@ impl VoteKeeper {
             .voting_power(voter)
             .expect("committee member has voting power (TopologySnapshot invariant)");
 
-        let committee_size = topology.local_committee().len();
-        let total_power = topology.local_voting_power();
-        let validator_id = topology.local_validator_id();
-
         let Some(public_key) = topology.public_key(voter) else {
             warn!("No public key for validator {:?}", voter);
-            return vec![];
+            return None;
         };
 
-        let vote_set = self
-            .vote_sets
-            .entry(block_hash)
-            .or_insert_with(|| VoteSet::new(header_for_vote, committee_size));
-
-        if vote_set.has_seen_validator(voter_index) {
-            trace!("Already seen vote from validator {:?}", voter);
-            return vec![];
-        }
-
-        match vote {
-            Verifiable::Verified(verified) => {
-                trace!(
-                    block_hash = ?block_hash,
-                    is_own_vote,
-                    "Admitting pre-verified vote"
-                );
-                vote_set.add_verified_vote(voter_index, verified, voting_power);
-            }
-            Verifiable::Unverified(raw) => {
-                // Own-vote unverified arrivals (echo from a peer after a
-                // restart, or never-self-broadcast paths) take the same
-                // BLS batch route as any other voter — a wire-arrived
-                // vote claiming `voter == self` cannot be trusted without
-                // signature verification.
-                vote_set.buffer_unverified_vote(voter_index, raw, public_key, voting_power);
-                trace!(
-                    validator = ?validator_id,
-                    block_hash = ?block_hash,
-                    verified_power = vote_set.verified_power().inner(),
-                    unverified_power = vote_set.unverified_power().inner(),
-                    total_power = total_power.inner(),
-                    "Vote buffered"
-                );
-            }
-        }
-
-        self.maybe_trigger_verification(topology, block_hash)
+        Some(VotePreflight {
+            voter_index,
+            voting_power,
+            public_key,
+        })
     }
 
     /// Trigger batch vote verification for `block_hash` once the combined
