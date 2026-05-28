@@ -64,16 +64,6 @@ pub struct VoteTracker {
     /// Validators we've already seen votes from at each `vote_anchor_ts` (dedup).
     /// Key is (`validator_id`, `vote_anchor_ts`).
     seen: HashSet<(ValidatorId, WeightedTimestamp)>,
-    /// Validators whose vote has already been counted toward the verified
-    /// power tally. Required because own votes bypass [`Self::buffer_unverified_vote`]
-    /// (and therefore [`Self::seen`]) via the `handle_verified_vote` path,
-    /// and leader-rotation retries that land on `self` re-feed the same own
-    /// vote each time. Without this guard, [`Self::power_by_key`] inflates
-    /// past the unique-signer count and [`Self::check_quorum`] fires on
-    /// fewer-than-quorum distinct validators, producing an aggregated EC
-    /// whose signer bitfield reflects the deduped signer set and is rejected
-    /// as sub-quorum by peers.
-    verified_seen: HashSet<(ValidatorId, WeightedTimestamp)>,
     /// Whether a verification batch is currently in flight.
     pending_verification: bool,
 }
@@ -91,7 +81,6 @@ impl VoteTracker {
             unverified_votes: Vec::new(),
             unverified_power: VotePower::ZERO,
             seen: HashSet::new(),
-            verified_seen: HashSet::new(),
             pending_verification: false,
         }
     }
@@ -183,12 +172,21 @@ impl VoteTracker {
     /// Idempotent per `(validator, vote_anchor_ts)`: redundant calls (e.g.
     /// own-vote re-feeds from leader-rotation retries that land on `self`)
     /// are dropped so [`Self::power_by_key`] only counts unique signers.
+    /// Dedup scans [`Self::votes_by_key`] — a validator may have voted on
+    /// any `global_receipt_root` at this anchor, so the check spans every
+    /// bucket sharing the incoming `vote_anchor_ts`.
     pub fn add_verified_vote(&mut self, vote: Verified<ExecutionVote>, power: VotePower) {
-        let dedup_key = (vote.validator(), vote.vote_anchor_ts());
-        if !self.verified_seen.insert(dedup_key) {
+        let validator = vote.validator();
+        let anchor_ts = vote.vote_anchor_ts();
+        let already_counted = self
+            .votes_by_key
+            .iter()
+            .filter(|((_, ts), _)| *ts == anchor_ts)
+            .any(|(_, votes)| votes.iter().any(|v| v.validator() == validator));
+        if already_counted {
             return;
         }
-        let key = (vote.global_receipt_root(), vote.vote_anchor_ts());
+        let key = (vote.global_receipt_root(), anchor_ts);
         self.votes_by_key.entry(key).or_default().push(vote);
         *self.power_by_key.entry(key).or_insert(VotePower::ZERO) += power;
     }
