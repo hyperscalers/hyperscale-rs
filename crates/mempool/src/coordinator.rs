@@ -147,7 +147,7 @@ pub struct MempoolMemoryStats {
 /// in-mempool reads go through this field directly.
 #[derive(Debug)]
 struct PoolEntry {
-    tx: Arc<RoutableTransaction>,
+    tx: Arc<Verified<RoutableTransaction>>,
     status: TransactionStatus,
     /// Whether this is a cross-shard transaction (cached at insertion time).
     cross_shard: bool,
@@ -294,7 +294,7 @@ impl MempoolCoordinator {
     fn admit_internal(
         &mut self,
         topology: &TopologySnapshot,
-        tx: &Arc<RoutableTransaction>,
+        tx: &Arc<Verified<RoutableTransaction>>,
         submitted_locally: bool,
         now: LocalTimestamp,
     ) -> Option<bool> {
@@ -358,8 +358,7 @@ impl MempoolCoordinator {
             }];
         }
 
-        let raw: Arc<RoutableTransaction> = Arc::new((**tx).clone());
-        match self.admit_internal(topology, &raw, true, now) {
+        match self.admit_internal(topology, &tx, true, now) {
             Some(cross_shard) => {
                 tracing::info!(
                     tx_hash = ?hash,
@@ -391,8 +390,7 @@ impl MempoolCoordinator {
         submitted_locally: bool,
         now: LocalTimestamp,
     ) -> Vec<Action> {
-        let raw: Arc<RoutableTransaction> = Arc::new((**tx).clone());
-        match self.admit_internal(topology, &raw, submitted_locally, now) {
+        match self.admit_internal(topology, &tx, submitted_locally, now) {
             Some(_) => {
                 tracing::trace!(
                     tx_hash = ?tx.hash(),
@@ -425,8 +423,7 @@ impl MempoolCoordinator {
         let mut moot: Vec<TxHash> = Vec::new();
         for tx in txs {
             let hash = tx.hash();
-            let raw: Arc<RoutableTransaction> = Arc::new((**tx).clone());
-            if self.admit_internal(topology, &raw, false, now).is_some() {
+            if self.admit_internal(topology, &tx, false, now).is_some() {
                 admitted.push(tx);
             } else if self.expected_txs.forget(&hash) {
                 moot.push(hash);
@@ -535,16 +532,23 @@ impl MempoolCoordinator {
         for tx in block.transactions().iter() {
             let hash = tx.hash();
             let num_shards = topology.num_shards();
-            let raw: Arc<RoutableTransaction> = Arc::new((***tx).clone());
+            // Prefer the marker the wrapper already carries; fall back to
+            // the BFT-transitive `from_persisted` gate for sync-loaded
+            // blocks whose `Verifiable` entries decoded as Unverified.
+            let verified: Arc<Verified<RoutableTransaction>> = match (**tx).clone().into_verified()
+            {
+                Ok(v) => Arc::new(v),
+                Err(raw) => Arc::new(Verified::<RoutableTransaction>::from_persisted(raw)),
+            };
             self.pool.entry(hash).or_insert_with(|| {
                 tracing::debug!(
                     tx_hash = ?hash,
                     height = height.inner(),
                     "Added committed transaction to mempool"
                 );
-                self.tx_store.insert(Arc::clone(&raw));
+                self.tx_store.insert(Arc::clone(&verified));
                 PoolEntry {
-                    tx: raw,
+                    tx: verified,
                     status: TransactionStatus::Pending, // Will be updated by execution
                     cross_shard: tx.is_cross_shard(num_shards),
                     submitted_locally: false, // Fetched for block processing
@@ -760,7 +764,7 @@ impl MempoolCoordinator {
     fn add_to_ready_tracking(
         &mut self,
         hash: TxHash,
-        tx: &Arc<RoutableTransaction>,
+        tx: &Arc<Verified<RoutableTransaction>>,
         added_at: LocalTimestamp,
     ) {
         self.ready.add(hash, Arc::clone(tx), added_at, &self.locks);
@@ -782,7 +786,8 @@ impl MempoolCoordinator {
     fn promote_transactions_for_node(&mut self, node: NodeId) {
         let mut promotable = self.ready.promotable_for_node(node);
         promotable.sort();
-        let mut to_readd: Vec<(TxHash, Arc<RoutableTransaction>, LocalTimestamp)> = Vec::new();
+        let mut to_readd: Vec<(TxHash, Arc<Verified<RoutableTransaction>>, LocalTimestamp)> =
+            Vec::new();
         for tx_hash in promotable {
             if let Some(entry) = self.pool.get(&tx_hash)
                 && entry.status == TransactionStatus::Pending
@@ -827,7 +832,7 @@ impl MempoolCoordinator {
         pending_commit_tx_count: usize,
         pending_commit_cert_count: usize,
         now: LocalTimestamp,
-    ) -> Vec<Arc<RoutableTransaction>> {
+    ) -> Vec<Arc<Verified<RoutableTransaction>>> {
         // Certificates reduce in-flight (transactions complete), txs increase it
         let effective_in_flight = self
             .in_flight()
@@ -949,7 +954,7 @@ impl MempoolCoordinator {
     /// answer covers both live pool entries and tombstone-window bodies
     /// (terminal-state txs whose body we still hold for slow peers).
     #[must_use]
-    pub fn get_transaction(&self, hash: &TxHash) -> Option<Arc<RoutableTransaction>> {
+    pub fn get_transaction(&self, hash: &TxHash) -> Option<Arc<Verified<RoutableTransaction>>> {
         self.tx_store.get(hash)
     }
 
@@ -991,7 +996,11 @@ impl MempoolCoordinator {
     #[must_use]
     pub fn incomplete_transactions(
         &self,
-    ) -> Vec<(TxHash, TransactionStatus, Arc<RoutableTransaction>)> {
+    ) -> Vec<(
+        TxHash,
+        TransactionStatus,
+        Arc<Verified<RoutableTransaction>>,
+    )> {
         self.pool
             .iter()
             .filter(|(_, entry)| !matches!(entry.status, TransactionStatus::Completed(_)))

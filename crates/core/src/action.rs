@@ -561,7 +561,7 @@ pub enum Action {
         /// Height of the parent block (stable anchor for JMT computation).
         parent_block_height: BlockHeight,
         /// Transactions to include in the proposal.
-        transactions: Vec<Arc<RoutableTransaction>>,
+        transactions: Vec<Arc<Verified<RoutableTransaction>>>,
         /// Finalized waves to include in the block (carries certs + receipts + ECs).
         finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>>,
         /// Provisions from remote shards, included in this block.

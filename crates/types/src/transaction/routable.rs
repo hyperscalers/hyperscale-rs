@@ -344,6 +344,29 @@ impl Verify<&RoutableTransactionContext<'_>> for RoutableTransaction {
     }
 }
 
+impl Verified<RoutableTransaction> {
+    /// Re-wrap a `RoutableTransaction` whose trust derives from inclusion
+    /// in a committed block.
+    ///
+    /// Trust chain (BFT-transitive):
+    /// 1. The tx is contained in a `CertifiedBlock`.
+    /// 2. `CertifiedBlock` carries a QC attesting ≥2f+1 voting power.
+    /// 3. Voters refuse to vote on blocks whose `Block.transactions`
+    ///    entries are not all `Verifiable::Verified` — see
+    ///    `validate_block_for_vote` in `crates/shard`.
+    /// 4. Therefore every tx in a committed block was admission-validated
+    ///    by at least one honest voter through the standard `Verify` gate.
+    ///
+    /// Callers: mempool reload from a committed block, storage
+    /// rehydration into block containers, and any other path that
+    /// surfaces a raw `RoutableTransaction` whose container is itself
+    /// the trust anchor.
+    #[must_use]
+    pub const fn from_persisted(tx: RoutableTransaction) -> Self {
+        Self::new_unchecked(tx)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use sbor::{
