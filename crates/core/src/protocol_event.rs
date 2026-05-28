@@ -416,7 +416,7 @@ pub enum ProtocolEvent {
         /// Wave whose EC was aggregated.
         wave_id: WaveId,
         /// The newly aggregated execution certificate.
-        certificate: Arc<ExecutionCertificate>,
+        certificate: Arc<Verified<ExecutionCertificate>>,
     },
 
     /// Execution certificates delivered from any source — fetch response or
@@ -430,17 +430,14 @@ pub enum ProtocolEvent {
         certificates: Vec<ExecutionCertificate>,
     },
 
-    /// Execution certificate signature verification completed. The
-    /// success payload carries the verified handle directly so the
-    /// consumer doesn't need a separate cache lookup; the sibling
-    /// `certificate` mirrors the raw `Arc` for correlation
-    /// (`wire_hash` slot release, error-path logging).
+    /// Execution certificate signature verification completed.
     ExecutionCertificateSignatureVerified {
-        /// The raw certificate that triggered verification, retained
-        /// for correlation and identity on both result arms.
-        certificate: Arc<ExecutionCertificate>,
-        /// Verified handle on success; the reason it failed otherwise.
-        result: Result<Verified<ExecutionCertificate>, ExecutionCertificateVerifyError>,
+        /// Verified certificate on success; the raw certificate plus
+        /// the reason it failed otherwise.
+        result: Result<
+            Arc<Verified<ExecutionCertificate>>,
+            (Arc<ExecutionCertificate>, ExecutionCertificateVerifyError),
+        >,
     },
 
     /// All BLS verifications for a fetched [`FinalizedWave`] completed.
@@ -461,8 +458,8 @@ pub enum ProtocolEvent {
     /// the aggregated BLS signature passes verification. Drives state-machine
     /// fan-out (cross-shard ACK observation, vote-action re-scan).
     ExecutionCertificateAdmitted {
-        /// The verified certificate.
-        certificate: Arc<ExecutionCertificate>,
+        /// The admitted execution certificate.
+        certificate: Arc<Verified<ExecutionCertificate>>,
     },
 
     /// Finalized waves delivered from a peer in response to a fetch request.

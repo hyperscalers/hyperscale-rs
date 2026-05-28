@@ -24,7 +24,7 @@ pub fn serve_execution_certs_request<S: ShardStorage>(
     let mut missing: Vec<WaveId> = Vec::new();
     for wave_id in &req.wave_ids {
         match exec_cert_store.get(wave_id) {
-            Some(cert) => certs.push(cert),
+            Some(cert) => certs.push(Arc::new((**cert).clone())),
             None => missing.push(wave_id.clone()),
         }
     }

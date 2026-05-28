@@ -920,7 +920,7 @@ impl ExecutionCoordinator {
         &mut self,
         topology: &TopologySnapshot,
         wave_id: &WaveId,
-        certificate: &Arc<ExecutionCertificate>,
+        certificate: &Arc<Verified<ExecutionCertificate>>,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
 
@@ -1029,46 +1029,51 @@ impl ExecutionCoordinator {
     pub fn on_certificate_verified(
         &mut self,
         topology: &TopologySnapshot,
-        certificate: Arc<ExecutionCertificate>,
-        result: Result<Verified<ExecutionCertificate>, ExecutionCertificateVerifyError>,
+        result: Result<
+            Arc<Verified<ExecutionCertificate>>,
+            (Arc<ExecutionCertificate>, ExecutionCertificateVerifyError),
+        >,
     ) -> Vec<Action> {
         // Release the in-flight slot regardless of outcome — a failed
-        // signature still lets the next byte-identical retransmit dispatch
-        // again (in case the failure was transient pool error rather than a
-        // real signature mismatch). Subsequent arrivals with a different
-        // aggregation hash to a different `wire_hash` and aren't gated by
-        // this slot.
-        self.pending_ec_verifications
-            .remove(&certificate.wire_hash());
-
-        if let Err(err) = result {
-            tracing::warn!(
-                shard = certificate.shard_group_id().inner(),
-                wave = %certificate.wave_id(),
-                error = ?err,
-                "Invalid execution certificate signature"
-            );
-            return vec![Action::AbandonFetch(FetchAbandon::ExecutionCerts {
-                ids: vec![certificate.wave_id().clone()],
-            })];
-        }
+        // signature still lets the next byte-identical retransmit
+        // dispatch again (in case the failure was transient pool error
+        // rather than a real signature mismatch). Subsequent arrivals
+        // with a different aggregation hash to a different `wire_hash`
+        // and aren't gated by this slot.
+        let ec_arc = match result {
+            Ok(verified) => {
+                self.pending_ec_verifications.remove(&verified.wire_hash());
+                verified
+            }
+            Err((raw, err)) => {
+                self.pending_ec_verifications.remove(&raw.wire_hash());
+                tracing::warn!(
+                    shard = raw.shard_group_id().inner(),
+                    wave = %raw.wave_id(),
+                    error = ?err,
+                    "Invalid execution certificate signature"
+                );
+                return vec![Action::AbandonFetch(FetchAbandon::ExecutionCerts {
+                    ids: vec![raw.wave_id().clone()],
+                })];
+            }
+        };
 
         // A single Byzantine signer can produce a cryptographically valid
         // EC; require 2f+1 voting power on the EC's own shard before any
         // state mutation downstream.
-        if !ec_has_shard_quorum_power(topology, &certificate) {
+        if !ec_has_shard_quorum_power(topology, &ec_arc) {
             tracing::warn!(
-                shard = certificate.shard_group_id().inner(),
-                wave = %certificate.wave_id(),
+                shard = ec_arc.shard_group_id().inner(),
+                wave = %ec_arc.wave_id(),
                 "Discarding sub-quorum execution certificate"
             );
             return vec![Action::AbandonFetch(FetchAbandon::ExecutionCerts {
-                ids: vec![certificate.wave_id().clone()],
+                ids: vec![ec_arc.wave_id().clone()],
             })];
         }
 
-        let shard = certificate.shard_group_id();
-        let ec_arc = certificate;
+        let shard = ec_arc.shard_group_id();
 
         // Clearing the tombstone before verification would let a Byzantine
         // peer ship an EC with a far-future `vote_anchor_ts`, populating
@@ -1515,7 +1520,7 @@ impl ExecutionCoordinator {
     fn handle_wave_attestation(
         &mut self,
         _topology: &TopologySnapshot,
-        ec: &Arc<ExecutionCertificate>,
+        ec: &Arc<Verified<ExecutionCertificate>>,
     ) -> Vec<Action> {
         let routing = self.waves.classify_attestation(ec);
 
@@ -2272,11 +2277,7 @@ mod tests {
             zero_bls_signature(),
             signers,
         );
-        state.on_certificate_verified(
-            &topo,
-            Arc::new(cert.clone()),
-            Ok(Verified::new_unchecked_for_test(cert)),
-        );
+        state.on_certificate_verified(&topo, Ok(Arc::new(Verified::new_unchecked_for_test(cert))));
 
         // Advance time past the retry deadline; if the retry had survived,
         // this would fire a SignAndSendExecutionVote action.
@@ -2313,8 +2314,8 @@ mod tests {
             signers,
         ));
 
-        let verified = Verified::new_unchecked_for_test((*cert).clone());
-        let actions = state.on_certificate_verified(&topo, cert, Ok(verified));
+        let verified = Arc::new(Verified::new_unchecked_for_test((*cert).clone()));
+        let actions = state.on_certificate_verified(&topo, Ok(verified));
         assert!(
             !actions.iter().any(|a| matches!(
                 a,
@@ -2359,8 +2360,10 @@ mod tests {
 
         let actions = state.on_certificate_verified(
             &topo,
-            cert,
-            Err(ExecutionCertificateVerifyError::BadAggregatedSignature),
+            Err((
+                cert,
+                ExecutionCertificateVerifyError::BadAggregatedSignature,
+            )),
         );
         assert!(
             actions.iter().any(|a| matches!(
@@ -2408,7 +2411,11 @@ mod tests {
             SignerBitfield::new(4),
         );
 
-        let actions = state.on_certificate_aggregated(&topo, &wave_id, &Arc::new(cert));
+        let actions = state.on_certificate_aggregated(
+            &topo,
+            &wave_id,
+            &Arc::new(Verified::new_unchecked_for_test(cert)),
+        );
 
         // Should have: BroadcastEC(local) + BroadcastEC(remote shard 1)
         let broadcast_actions: Vec<_> = actions
@@ -2698,8 +2705,10 @@ mod tests {
         // released so a follow-up arrival can re-dispatch.
         let _ = state.on_certificate_verified(
             &topo,
-            Arc::new(cert.clone()),
-            Err(ExecutionCertificateVerifyError::BadAggregatedSignature),
+            Err((
+                Arc::new(cert.clone()),
+                ExecutionCertificateVerifyError::BadAggregatedSignature,
+            )),
         );
         let again = state.on_wave_certificate(&topo, cert);
         assert_eq!(again.len(), 1);
@@ -2869,8 +2878,10 @@ mod tests {
         // the legitimate cert can still arrive and clear the expectation.
         let _ = state.on_certificate_verified(
             &topo,
-            Arc::new(cert),
-            Err(ExecutionCertificateVerifyError::BadAggregatedSignature),
+            Err((
+                Arc::new(cert),
+                ExecutionCertificateVerifyError::BadAggregatedSignature,
+            )),
         );
         assert_eq!(state.expected_certs.expected_len(), 1);
         assert_eq!(state.expected_certs.fulfilled_len(), 0);
@@ -3090,14 +3101,14 @@ mod tests {
         }
 
         // Add the local EC; same wave_id flips `local_ec_emitted` to true.
-        let local_ec = Arc::new(ExecutionCertificate::new(
+        let local_ec = Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
             wave_id.clone(),
             WeightedTimestamp::from_millis(1_000),
             GlobalReceiptRoot::from_raw(Hash::from_bytes(b"global_receipt_root")),
             tx_outcomes,
             zero_bls_signature(),
             SignerBitfield::new(4),
-        ));
+        )));
         wave.add_execution_certificate(local_ec);
         assert!(
             wave.is_complete(),

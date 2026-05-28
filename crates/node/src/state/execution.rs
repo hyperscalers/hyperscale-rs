@@ -80,14 +80,9 @@ impl NodeStateMachine {
             ProtocolEvent::FinalizedWaveVerified { wave, valid } => self
                 .execution_coordinator
                 .on_finalized_wave_verified(wave, valid),
-            ProtocolEvent::ExecutionCertificateSignatureVerified {
-                certificate,
-                result,
-            } => self.execution_coordinator.on_certificate_verified(
-                &self.topology_snapshot,
-                certificate,
-                result,
-            ),
+            ProtocolEvent::ExecutionCertificateSignatureVerified { result } => self
+                .execution_coordinator
+                .on_certificate_verified(&self.topology_snapshot, result),
             ProtocolEvent::ExecutionCertificateAdmitted { certificate } => {
                 let local_shard = self.topology_snapshot.local_shard();
                 let mut actions = Vec::new();
@@ -122,8 +117,8 @@ mod tests {
     use hyperscale_core::{Action, ProtocolEvent, StateMachine};
     use hyperscale_types::{
         BlockHeight, Bls12381G2Signature, ExecutionCertificate, ExecutionOutcome,
-        GlobalReceiptRoot, LocalTimestamp, ShardGroupId, SignerBitfield, TxHash, TxOutcome, WaveId,
-        WeightedTimestamp,
+        GlobalReceiptRoot, LocalTimestamp, ShardGroupId, SignerBitfield, TxHash, TxOutcome,
+        Verified, WaveId, WeightedTimestamp,
     };
 
     use super::super::test_support::TestNode;
@@ -134,16 +129,16 @@ mod tests {
         remote_shards: BTreeSet<ShardGroupId>,
         height: BlockHeight,
         outcomes: Vec<TxOutcome>,
-    ) -> Arc<ExecutionCertificate> {
+    ) -> Arc<Verified<ExecutionCertificate>> {
         let wave_id = WaveId::new(shard, height, remote_shards);
-        Arc::new(ExecutionCertificate::new(
+        Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
             wave_id,
             WeightedTimestamp::from_millis(0),
             GlobalReceiptRoot::ZERO,
             outcomes,
             Bls12381G2Signature([0u8; 96]),
             SignerBitfield::new(4),
-        ))
+        )))
     }
 
     /// `ExecutionCertificateAdmitted` for a remote-shard EC where the

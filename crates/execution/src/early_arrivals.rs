@@ -45,7 +45,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_types::{
-    ExecutionCertificate, ExecutionVote, TxHash, Verifiable, WAVE_TIMEOUT, WaveId,
+    ExecutionCertificate, ExecutionVote, TxHash, Verifiable, Verified, WAVE_TIMEOUT, WaveId,
     WeightedTimestamp,
 };
 
@@ -65,7 +65,7 @@ pub const EARLY_VOTE_RETENTION: Duration = WAVE_TIMEOUT;
 /// and the entry is dropped.
 #[derive(Debug)]
 struct BufferedEc {
-    ec: Arc<ExecutionCertificate>,
+    ec: Arc<Verified<ExecutionCertificate>>,
     pending_txs: HashSet<TxHash>,
 }
 
@@ -74,9 +74,9 @@ pub struct EarlyArrivalBuffer {
     votes: HashMap<WaveId, Vec<Verifiable<ExecutionVote>>>,
 
     /// Reverse index from `tx_hash` to any buffered ECs mentioning it.
-    /// Multiple `tx_hash` entries may reference the same `Arc<EC>` (one EC
+    /// Multiple `tx_hash` entries may reference the same handle (one EC
     /// covers many txs).
-    tx_index: HashMap<TxHash, Vec<Arc<ExecutionCertificate>>>,
+    tx_index: HashMap<TxHash, Vec<Arc<Verified<ExecutionCertificate>>>>,
 
     /// Per-EC bookkeeping. `tx_index` and `pending_routing` must stay
     /// consistent: an EC present in `tx_index[tx_hash]` for some `tx_hash`
@@ -127,7 +127,7 @@ impl EarlyArrivalBuffer {
     /// assignment. Idempotent: `tx_hashes` already tracked for this EC's
     /// `wave_id` are skipped, so replaying a previously-buffered EC won't
     /// create duplicate entries in the reverse index.
-    pub fn buffer_ec(&mut self, ec: &Arc<ExecutionCertificate>, tx_hashes: &[TxHash]) {
+    pub fn buffer_ec(&mut self, ec: &Arc<Verified<ExecutionCertificate>>, tx_hashes: &[TxHash]) {
         if tx_hashes.is_empty() {
             return;
         }
@@ -152,7 +152,7 @@ impl EarlyArrivalBuffer {
     /// empty the EC has been fully delivered and the entry is dropped.
     /// The reverse index is NOT touched here — the EC's `tx_hashes` are
     /// drained explicitly by [`drain_ecs_for_txs`] when those txs commit.
-    pub fn clear_routed(&mut self, ec: &Arc<ExecutionCertificate>, tx_hashes: &[TxHash]) {
+    pub fn clear_routed(&mut self, ec: &Arc<Verified<ExecutionCertificate>>, tx_hashes: &[TxHash]) {
         let Some(entry) = self.pending_routing.get_mut(ec.wave_id()) else {
             return;
         };
@@ -172,8 +172,11 @@ impl EarlyArrivalBuffer {
     /// `pending_routing` entry is left alone (the caller will typically
     /// feed the EC into `handle_wave_attestation`, which then calls
     /// `clear_routed` to drop the entry).
-    pub fn drain_ecs_for_txs(&mut self, tx_hashes: &[TxHash]) -> Vec<Arc<ExecutionCertificate>> {
-        let mut ecs: Vec<Arc<ExecutionCertificate>> = Vec::new();
+    pub fn drain_ecs_for_txs(
+        &mut self,
+        tx_hashes: &[TxHash],
+    ) -> Vec<Arc<Verified<ExecutionCertificate>>> {
+        let mut ecs: Vec<Arc<Verified<ExecutionCertificate>>> = Vec::new();
         let mut seen_ptrs: HashSet<usize> = HashSet::new();
         for tx_hash in tx_hashes {
             if let Some(entries) = self.tx_index.remove(tx_hash) {
@@ -276,7 +279,7 @@ mod tests {
         )
     }
 
-    fn make_ec(wave_id: WaveId, tx_hashes: &[TxHash]) -> Arc<ExecutionCertificate> {
+    fn make_ec(wave_id: WaveId, tx_hashes: &[TxHash]) -> Arc<Verified<ExecutionCertificate>> {
         make_ec_with_anchor(wave_id, tx_hashes, WeightedTimestamp::ZERO)
     }
 
@@ -284,16 +287,16 @@ mod tests {
         wave_id: WaveId,
         tx_hashes: &[TxHash],
         vote_anchor_ts: WeightedTimestamp,
-    ) -> Arc<ExecutionCertificate> {
+    ) -> Arc<Verified<ExecutionCertificate>> {
         let outcomes: Vec<TxOutcome> = tx_hashes.iter().map(|h| make_tx_outcome(*h)).collect();
-        Arc::new(ExecutionCertificate::new(
+        Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
             wave_id,
             vote_anchor_ts,
             GlobalReceiptRoot::ZERO,
             outcomes,
             zero_bls_signature(),
             SignerBitfield::new(4),
-        ))
+        )))
     }
 
     fn make_vote(wave_id: WaveId, anchor_ts: WeightedTimestamp) -> ExecutionVote {

@@ -34,7 +34,7 @@
 
 use std::sync::Arc;
 
-use hyperscale_types::{ExecutionCertificate, WaveId};
+use hyperscale_types::{ExecutionCertificate, Verified, WaveId};
 use papaya::HashMap;
 
 /// Shared, content-addressed store of aggregated [`ExecutionCertificate`]s
@@ -44,7 +44,7 @@ use papaya::HashMap;
 /// fetch); writes (insert on aggregation/verification, evict on wave-cert
 /// commit) are infrequent and single-threaded (state machine).
 pub struct ExecCertStore {
-    inner: HashMap<WaveId, Arc<ExecutionCertificate>>,
+    inner: HashMap<WaveId, Arc<Verified<ExecutionCertificate>>>,
 }
 
 impl ExecCertStore {
@@ -56,17 +56,17 @@ impl ExecCertStore {
         }
     }
 
-    /// Insert an execution certificate. Idempotent: re-inserting the same
-    /// `WaveId` is a no-op (the existing `Arc` is preserved so callers
-    /// holding clones keep pointing at the same allocation).
-    pub fn insert(&self, cert: Arc<ExecutionCertificate>) {
+    /// Insert a verified execution certificate. Idempotent: re-inserting
+    /// the same `WaveId` is a no-op (the existing `Arc` is preserved so
+    /// callers holding clones keep pointing at the same allocation).
+    pub fn insert(&self, cert: Arc<Verified<ExecutionCertificate>>) {
         let wave_id = cert.wave_id().clone();
         self.inner.pin().get_or_insert_with(wave_id, || cert);
     }
 
-    /// Look up an execution certificate by `WaveId`.
+    /// Look up a verified execution certificate by `WaveId`.
     #[must_use]
-    pub fn get(&self, wave_id: &WaveId) -> Option<Arc<ExecutionCertificate>> {
+    pub fn get(&self, wave_id: &WaveId) -> Option<Arc<Verified<ExecutionCertificate>>> {
         self.inner.pin().get(wave_id).cloned()
     }
 
@@ -105,20 +105,20 @@ mod tests {
 
     use super::*;
 
-    fn cert(block_height: u64) -> Arc<ExecutionCertificate> {
+    fn cert(block_height: u64) -> Arc<Verified<ExecutionCertificate>> {
         let wave_id = WaveId::new(
             ShardGroupId::new(0),
             BlockHeight::new(block_height),
             BTreeSet::new(),
         );
-        Arc::new(ExecutionCertificate::new(
+        Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
             wave_id,
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
             vec![],
             zero_bls_signature(),
             SignerBitfield::new(4),
-        ))
+        )))
     }
 
     #[test]

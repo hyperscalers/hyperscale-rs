@@ -32,7 +32,7 @@ use hyperscale_core::{Action, CrossShardExecutionRequest};
 use hyperscale_types::{
     BlockHash, BlockHeight, ExecutionCertificate, ExecutionOutcome, FinalizedWave,
     GlobalReceiptRoot, RoutableTransaction, ShardGroupId, StateRoot, StoredReceipt,
-    TransactionDecision, TxHash, TxOutcome, WAVE_TIMEOUT, WaveCertificate, WaveId,
+    TransactionDecision, TxHash, TxOutcome, Verified, WAVE_TIMEOUT, WaveCertificate, WaveId,
     WeightedTimestamp, compute_global_receipt_root,
 };
 
@@ -137,7 +137,7 @@ pub struct WaveState {
     /// Per-tx, whether any shard's EC reported a non-success outcome.
     tx_has_failure: HashSet<TxHash>,
     /// All collected ECs (local + remote).
-    execution_certificates: Vec<Arc<ExecutionCertificate>>,
+    execution_certificates: Vec<Arc<Verified<ExecutionCertificate>>>,
     /// Deduplication of received ECs by `wave_id`. At most one valid EC
     /// exists per `wave_id` (signature verification upstream ensures this),
     /// so `wave_id` is a content-equivalent identity for dedup.
@@ -588,7 +588,7 @@ impl WaveState {
     /// `build_vote_data` once the local vote lands.
     ///
     /// Returns `true` if the wave is now complete (ready for `finalize_wave`).
-    pub fn add_execution_certificate(&mut self, ec: Arc<ExecutionCertificate>) -> bool {
+    pub fn add_execution_certificate(&mut self, ec: Arc<Verified<ExecutionCertificate>>) -> bool {
         if !self.seen_ec_wave_ids.insert(ec.wave_id().clone()) {
             return self.is_complete();
         }
@@ -804,7 +804,7 @@ impl WaveState {
             .filter(|ec| {
                 ec.wave_id() == &self.wave_id || required_remote_wave_ids.contains(ec.wave_id())
             })
-            .cloned()
+            .map(|verified| Arc::new((***verified).clone()))
             .collect();
 
         ecs.sort_by(|a, b| {
@@ -986,7 +986,7 @@ mod tests {
         ec_shard: ShardGroupId,
         tx_hashes: &[TxHash],
         success: bool,
-    ) -> Arc<ExecutionCertificate> {
+    ) -> Arc<Verified<ExecutionCertificate>> {
         let outcomes: Vec<TxOutcome> = tx_hashes
             .iter()
             .map(|h| {
@@ -1005,14 +1005,14 @@ mod tests {
             wave_id.block_height(),
             wave_id.remote_shards().iter().copied().collect(),
         );
-        Arc::new(ExecutionCertificate::new(
+        Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
             ec_wave_id,
             WeightedTimestamp::from_millis(wave_id.block_height().inner() + 1),
             GlobalReceiptRoot::from_raw(Hash::from_bytes(b"global_receipt_root")),
             outcomes,
             Bls12381G2Signature([0u8; 96]),
             SignerBitfield::new(4),
-        ))
+        )))
     }
 
     #[test]
@@ -1259,14 +1259,14 @@ mod tests {
             .collect();
         let divergent_root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"divergent"));
         assert_ne!(local_root, divergent_root);
-        let ec_local = Arc::new(ExecutionCertificate::new(
+        let ec_local = Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
             w.wave_id().clone(),
             WeightedTimestamp::from_millis(WAVE_START.inner() + 1),
             divergent_root,
             outcomes,
             Bls12381G2Signature([0u8; 96]),
             SignerBitfield::new(4),
-        ));
+        )));
 
         w.add_execution_certificate(ec_local);
 
@@ -1284,14 +1284,14 @@ mod tests {
         record_executed(&mut w, h0, true);
         let (_, local_root, outcomes) = w.build_vote_data(ts_for(WAVE_START + 2)).unwrap();
 
-        let ec_local = Arc::new(ExecutionCertificate::new(
+        let ec_local = Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
             w.wave_id().clone(),
             WeightedTimestamp::from_millis(WAVE_START.inner() + 1),
             local_root,
             outcomes,
             Bls12381G2Signature([0u8; 96]),
             SignerBitfield::new(4),
-        ));
+        )));
         w.add_execution_certificate(ec_local);
 
         assert!(!w.is_locally_divergent());
@@ -1310,14 +1310,14 @@ mod tests {
 
         // EC arrives first with a root we will NOT match locally.
         let ec_root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"ec"));
-        let ec_local = Arc::new(ExecutionCertificate::new(
+        let ec_local = Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
             w.wave_id().clone(),
             WeightedTimestamp::from_millis(WAVE_START.inner() + 1),
             ec_root,
             vec![TxOutcome::new(h0, executed(true))],
             Bls12381G2Signature([0u8; 96]),
             SignerBitfield::new(4),
-        ));
+        )));
         w.add_execution_certificate(ec_local);
         // Vote not yet emitted — divergence undetectable, wave still
         // appears completable.
@@ -1429,14 +1429,14 @@ mod tests {
             w.wave_id().block_height(),
             w.wave_id().remote_shards().iter().copied().collect(),
         );
-        let ec_remote = Arc::new(ExecutionCertificate::new(
+        let ec_remote = Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
             ec_wave_id,
             WeightedTimestamp::from_millis(w.wave_id().block_height().inner() + 1),
             GlobalReceiptRoot::from_raw(Hash::from_bytes(b"gr")),
             std::mem::take(&mut outcomes),
             Bls12381G2Signature([0u8; 96]),
             SignerBitfield::new(4),
-        ));
+        )));
         w.add_execution_certificate(ec_remote);
 
         let decisions: HashMap<TxHash, TransactionDecision> =

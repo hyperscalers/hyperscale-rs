@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_types::{
-    ExecutionCertificate, ShardGroupId, ValidatorId, WaveId, WeightedTimestamp,
+    ExecutionCertificate, ShardGroupId, ValidatorId, Verified, WaveId, WeightedTimestamp,
 };
 use tracing::{debug, warn};
 
@@ -46,7 +46,7 @@ pub struct OutboundCertMemoryStats {
 
 /// A single tracked outbound EC for one (wave, `target_shard`) destination.
 struct OutboundCertEntry {
-    certificate: Arc<ExecutionCertificate>,
+    certificate: Arc<Verified<ExecutionCertificate>>,
     target_shard: ShardGroupId,
     recipients: Vec<ValidatorId>,
     /// Hard deadline past which the EC is provably useless: every tx in the
@@ -63,8 +63,8 @@ struct OutboundCertEntry {
 pub struct RebroadcastDirective {
     /// Shard the EC should be re-broadcast to.
     pub target_shard: ShardGroupId,
-    /// The execution certificate to re-broadcast.
-    pub certificate: Arc<ExecutionCertificate>,
+    /// The verified execution certificate to re-broadcast.
+    pub certificate: Arc<Verified<ExecutionCertificate>>,
     /// Per-shard recipients (peer pool) for the broadcast.
     pub recipients: Vec<ValidatorId>,
 }
@@ -103,7 +103,7 @@ impl OutboundExecutionCertificateTracker {
     /// `first_sent_at` so the safety horizon counts from the first send.
     pub fn on_broadcast(
         &mut self,
-        certificate: Arc<ExecutionCertificate>,
+        certificate: Arc<Verified<ExecutionCertificate>>,
         target_shard: ShardGroupId,
         recipients: Vec<ValidatorId>,
     ) {
@@ -225,15 +225,15 @@ mod tests {
         )
     }
 
-    fn cert(wave_id: WaveId) -> Arc<ExecutionCertificate> {
-        Arc::new(ExecutionCertificate::new(
+    fn cert(wave_id: WaveId) -> Arc<Verified<ExecutionCertificate>> {
+        Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
             wave_id,
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::from_raw(Hash::ZERO),
             Vec::new(),
             Bls12381G2Signature([0u8; 96]),
             SignerBitfield::new(4),
-        ))
+        )))
     }
 
     fn vids(ids: &[u64]) -> Vec<ValidatorId> {

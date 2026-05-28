@@ -142,7 +142,7 @@ where
             );
             ctx.notify_protocol(ProtocolEvent::ExecutionCertificateAggregated {
                 wave_id,
-                certificate: Arc::new(certificate.into_inner()),
+                certificate: Arc::new(certificate),
             });
         }
         Action::VerifyAndAggregateExecutionVotes {
@@ -167,20 +167,14 @@ where
                 network: ctx.topology_snapshot.network(),
                 public_keys: &public_keys,
             };
-            let (certificate, result) = match certificate {
-                Verifiable::Verified(verified) => {
-                    let cert = Arc::new(verified.as_ref().clone());
-                    (cert, Ok(verified))
-                }
-                Verifiable::Unverified(raw) => {
-                    let result = raw.verify(&ctx_ec);
-                    (Arc::new(raw), result)
-                }
+            let result = match certificate {
+                Verifiable::Verified(verified) => Ok(Arc::new(verified)),
+                Verifiable::Unverified(raw) => match raw.verify(&ctx_ec) {
+                    Ok(verified) => Ok(Arc::new(verified)),
+                    Err(err) => Err((Arc::new(raw), err)),
+                },
             };
-            ctx.notify_protocol(ProtocolEvent::ExecutionCertificateSignatureVerified {
-                certificate,
-                result,
-            });
+            ctx.notify_protocol(ProtocolEvent::ExecutionCertificateSignatureVerified { result });
         }
         Action::VerifyFinalizedWave {
             wave,
@@ -378,7 +372,7 @@ where
             certificate,
             recipients,
         } => {
-            let cert = Arc::unwrap_or_clone(certificate);
+            let cert = Arc::unwrap_or_clone(certificate).into_inner();
             let msg = exec_cert_batch_message(
                 ctx.topology_snapshot.network(),
                 cert.shard_group_id(),

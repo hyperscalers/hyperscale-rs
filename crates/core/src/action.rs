@@ -126,7 +126,7 @@ pub enum Action {
         /// Target shard receiving the EC.
         shard: ShardGroupId,
         /// Aggregated execution certificate.
-        certificate: Arc<ExecutionCertificate>,
+        certificate: Arc<Verified<ExecutionCertificate>>,
         /// Target shard peers (excluding self) for the broadcast.
         recipients: Vec<ValidatorId>,
     },
@@ -297,11 +297,9 @@ pub enum Action {
     /// Delegated to a thread pool in production, instant in simulation.
     /// Returns `ProtocolEvent::ExecutionCertificateSignatureVerified` when complete.
     VerifyExecutionCertificateSignature {
-        /// The execution certificate to verify. When the wrapper is
-        /// already [`Verifiable::Verified`] — e.g. a locally-aggregated
-        /// EC fed back through the coordinator — the handler
-        /// short-circuits and emits the verified result without
-        /// rerunning BLS aggregation.
+        /// The execution certificate to verify. A
+        /// [`Verifiable::Verified`] wrapper short-circuits BLS
+        /// verification.
         certificate: Verifiable<ExecutionCertificate>,
         /// Public keys of the signers (in committee order).
         public_keys: Vec<Bls12381G1PublicKey>,
