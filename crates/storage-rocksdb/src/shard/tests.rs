@@ -15,7 +15,7 @@ use hyperscale_types::{
     BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, Bls12381G2Signature, BoundedVec,
     ConsensusReceipt, ExecutionCertificate, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot,
     Hash, ProposerTimestamp, QuorumCertificate, Round, ShardGroupId, SignerBitfield, StateRoot,
-    StoredReceipt, TxHash, WaveCertificate, WaveId, WeightedTimestamp,
+    StoredReceipt, TxHash, Verified, WaveCertificate, WaveId, WeightedTimestamp,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -61,10 +61,10 @@ fn updates_to_receipts(updates: &DatabaseUpdates) -> Vec<StoredReceipt> {
 }
 
 /// Helper: commit a block with empty updates and no ECs/receipts.
-fn commit_empty(storage: &RocksDbShardStorage, block: &Block, qc: &QuorumCertificate) {
+fn commit_empty(storage: &RocksDbShardStorage, block: &Block, qc: &Verified<QuorumCertificate>) {
     storage.commit_block(
         &Arc::new(block.clone()),
-        &Arc::new(qc.clone()),
+        &Arc::new(<Verified<_>>::clone(qc)),
         &no_witness(),
     );
 }
@@ -934,7 +934,7 @@ fn rocks_commit_with(
     storage: &RocksDbShardStorage,
     updates: &DatabaseUpdates,
     block: &Block,
-    qc: &QuorumCertificate,
+    qc: &Verified<QuorumCertificate>,
 ) {
     let mut block = block.clone();
     if !updates.node_updates.is_empty() {
@@ -961,7 +961,11 @@ fn rocks_commit_with(
         ));
         push_wave(&mut block, wave);
     }
-    storage.commit_block(&Arc::new(block), &Arc::new(qc.clone()), &no_witness());
+    storage.commit_block(
+        &Arc::new(block),
+        &Arc::new(<Verified<_>>::clone(qc)),
+        &no_witness(),
+    );
 }
 
 /// State-history walkthrough: key K created at V1 with value A, deleted

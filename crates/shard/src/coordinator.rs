@@ -2285,6 +2285,11 @@ impl ShardCoordinator {
             {
                 self.latest_qc = Some(qc.clone());
                 self.maybe_unlock_for_qc(topology_snapshot, qc.as_ref());
+                // Cache the just-formed QC so the next 2-chain commit
+                // (driven by the *next* QC certifying our successor)
+                // can look up this QC as the certifying handle for the
+                // committable block.
+                self.verification.cache_verified_qc(qc.clone());
             } else {
                 debug!(
                     block_hash = ?block_hash,
@@ -2344,22 +2349,25 @@ impl ShardCoordinator {
         }
 
         // The certifying QC for the committable block (block N-1) is the
-        // parent_qc of the block whose QC this is (block N). If we no longer
-        // hold block N (evicted from pending_blocks), we can't extract that
-        // parent_qc — defer the commit rather than pair `qc` (which certifies
-        // N) with the block at `committable_hash` (N-1). The next QC for this
-        // chain or the sync path will re-drive the commit.
-        let block_hash = qc.block_hash();
-        let Some(pending) = self.pending_blocks.get(block_hash) else {
+        // parent_qc of the block whose QC this is (block N). Pull the
+        // verified handle from the verification cache rather than re-
+        // wrapping `pending.header().parent_qc()` — the wire-decoded
+        // header keeps its `parent_qc` as `Verifiable::Unverified` even
+        // after local verification (the marker rides in the cache, not
+        // in the shared `Arc<Block>`). The cache is populated whenever
+        // a QC is verified locally, which is a precondition for either
+        // path that reaches here (`on_qc_formed` voted on N — which
+        // required verifying parent_qc — and `try_adopt_verified_qc`
+        // just verified it).
+        let Some(certifying_qc) = self.verification.cached_qc(&committable_hash).cloned() else {
             warn!(
                 validator = ?topology_snapshot.local_validator_id(),
-                block_hash = ?block_hash,
+                qc_block_hash = ?qc.block_hash(),
                 committable_hash = ?committable_hash,
-                "Cannot extract certifying QC for committable block — child block missing from pending_blocks; deferring commit"
+                "Cannot extract certifying QC for committable block — verified QC for the committable block was not cached; deferring commit"
             );
             return vec![];
         };
-        let certifying_qc = pending.header().parent_qc().clone();
 
         vec![Action::Continuation(ProtocolEvent::BlockReadyToCommit {
             block_hash: committable_hash,
@@ -2377,7 +2385,7 @@ impl ShardCoordinator {
         &mut self,
         topology_snapshot: &TopologySnapshot,
         block_hash: BlockHash,
-        qc: QuorumCertificate,
+        qc: Verified<QuorumCertificate>,
         source: CommitSource,
     ) -> Vec<Action> {
         // The downstream commit pipeline pairs this `qc` with the block
@@ -2575,7 +2583,7 @@ impl ShardCoordinator {
         &mut self,
         topology_snapshot: &TopologySnapshot,
         block_hash: BlockHash,
-        certifying_qc: QuorumCertificate,
+        certifying_qc: Verified<QuorumCertificate>,
         source: CommitSource,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
@@ -2617,7 +2625,7 @@ impl ShardCoordinator {
         &mut self,
         topology_snapshot: &TopologySnapshot,
         block_hash: BlockHash,
-        qc: QuorumCertificate,
+        qc: Verified<QuorumCertificate>,
         source: CommitSource,
         actions: &mut Vec<Action>,
     ) -> Option<BlockHeight> {
@@ -2806,7 +2814,6 @@ impl ShardCoordinator {
         block: Block,
         verified_qc: Verified<QuorumCertificate>,
     ) -> Vec<Action> {
-        let qc = (*verified_qc).clone();
         let block_hash = block.hash();
         let height = block.height();
 
@@ -2831,7 +2838,7 @@ impl ShardCoordinator {
             topology_snapshot,
             &block,
             block_hash,
-            qc.weighted_timestamp(),
+            verified_qc.weighted_timestamp(),
         );
 
         // Track sync progress for the loop iterator.
@@ -2841,10 +2848,10 @@ impl ShardCoordinator {
         if self
             .latest_qc
             .as_ref()
-            .is_none_or(|existing| qc.height() > existing.height())
+            .is_none_or(|existing| verified_qc.height() > existing.height())
         {
-            self.latest_qc = Some(verified_qc);
-            self.maybe_unlock_for_qc(topology_snapshot, &qc);
+            self.maybe_unlock_for_qc(topology_snapshot, verified_qc.as_ref());
+            self.latest_qc = Some(verified_qc.clone());
         }
 
         // Adopt the parent_qc from the block header if it's newer still.
@@ -2873,7 +2880,7 @@ impl ShardCoordinator {
 
         let mut actions = vec![Action::CommitBlockByQcOnly {
             block,
-            qc,
+            qc: verified_qc,
             parent_state_root,
             parent_block_height,
             source: CommitSource::Sync,
@@ -4591,13 +4598,15 @@ mod tests {
     }
 
     #[test]
-    fn test_two_chain_commit_defers_when_child_block_missing() {
-        // Two-chain commit emits `BlockReadyToCommit { committable_hash, qc:
-        // parent_qc }`, pulling `parent_qc` from `pending_blocks[block_hash]`
-        // (the child of the committable block). If we no longer hold the
-        // child, we must defer — pairing `qc` (which certifies the child)
-        // with the block at `committable_hash` (the parent) would land at
-        // `CertifiedBlock::new_unchecked` and panic the shard loop.
+    fn test_two_chain_commit_defers_when_certifying_qc_uncached() {
+        // Two-chain commit emits `BlockReadyToCommit { committable_hash,
+        // qc: certifying_qc }` where `certifying_qc` is the verified QC
+        // for the committable block. The certifying QC lives in the
+        // pipeline's verified-QC cache once parent_qc verification has
+        // completed locally. If the cache entry is missing (e.g. the QC
+        // hasn't been verified yet), we must defer — emitting an
+        // unverified QC into the commit pipeline would defeat the
+        // typestate.
         let (state, topology) = make_test_state();
 
         let committable_hash = BlockHash::from_raw(Hash::from_bytes(b"parent"));
@@ -4613,52 +4622,29 @@ mod tests {
             WeightedTimestamp::from_millis(100_000),
         );
 
-        // No insert into pending_blocks — exercises the fallback path.
+        // No verified parent_qc cached — exercises the fallback path.
         let actions = state.try_two_chain_commit(&topology, &qc, CommitSource::Aggregator);
         assert!(
             actions.is_empty(),
-            "expected no BlockReadyToCommit when child block missing, got {actions:?}"
+            "expected no BlockReadyToCommit when certifying QC uncached, got {actions:?}"
         );
     }
 
     #[test]
-    fn test_two_chain_commit_uses_child_parent_qc_when_present() {
-        // Happy path: when the child block is in `pending_blocks`, the
-        // emitted `BlockReadyToCommit` carries its `parent_qc`, not the
-        // current QC.
+    fn test_two_chain_commit_pulls_certifying_qc_from_cache() {
+        // Happy path: when the committable block's QC is cached as
+        // verified, `try_two_chain_commit` emits a typed
+        // `BlockReadyToCommit` carrying that handle.
         let (mut state, topology) = make_test_state();
 
         let parent_hash = BlockHash::from_raw(Hash::from_bytes(b"parent_h3"));
         let parent_qc = make_test_qc(parent_hash, BlockHeight::new(3));
 
-        let mut child_header = make_header_at_height(BlockHeight::new(4), 100_000);
-        child_header = BlockHeader::new(
-            child_header.shard_group_id(),
-            child_header.height(),
-            parent_hash,
-            parent_qc.clone(),
-            child_header.proposer(),
-            child_header.timestamp(),
-            child_header.round(),
-            child_header.is_fallback(),
-            child_header.state_root(),
-            child_header.transaction_root(),
-            child_header.certificate_root(),
-            child_header.local_receipt_root(),
-            child_header.provision_root(),
-            child_header.waves().clone().into_inner(),
-            child_header.provision_tx_roots().clone().into_inner(),
-            child_header.in_flight(),
-            BeaconWitnessRoot::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-        );
-        let child_hash = child_header.hash();
-        state.pending_blocks.insert(PendingBlock::from_manifest(
-            child_header,
-            BlockManifest::default(),
-            LocalTimestamp::ZERO,
-        ));
+        // Cache the committable block's verified QC — this is what the
+        // pipeline does after `on_qc_signature_verified` succeeds.
+        state.verification.cache_verified_qc(parent_qc.clone());
 
+        let child_hash = BlockHash::from_raw(Hash::from_bytes(b"child_h4"));
         let qc = QuorumCertificate::new(
             child_hash,
             ShardGroupId::new(0),
@@ -4698,12 +4684,8 @@ mod tests {
             BlockHeight::new(4),
         );
 
-        let actions = state.on_block_ready_to_commit(
-            &topology,
-            block_hash,
-            qc.into_inner(),
-            CommitSource::Aggregator,
-        );
+        let actions =
+            state.on_block_ready_to_commit(&topology, block_hash, qc, CommitSource::Aggregator);
         assert!(
             actions.is_empty(),
             "expected no actions on mismatched (block_hash, qc), got {actions:?}"

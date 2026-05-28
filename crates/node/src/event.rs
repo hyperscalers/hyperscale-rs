@@ -20,7 +20,7 @@ use hyperscale_storage::BeaconWitnessCommit;
 use hyperscale_types::{
     Block, BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, CertifiedBlock,
     CommittedBlockHeader, ElidedCertifiedBlock, HeaderFetchCount, ProvisionHash, QuorumCertificate,
-    RoutableTransaction, ShardGroupId, TxHash, ValidatorId, WaveId,
+    RoutableTransaction, ShardGroupId, TxHash, ValidatorId, Verified, WaveId,
 };
 
 use crate::shard_io::block_commit::QcOnlyDivergence;
@@ -289,8 +289,11 @@ pub enum ShardScopedInput {
     QcOnlyCommitPrepared {
         /// The committed block, already wrapped for the commit pipeline.
         block: Arc<Block>,
-        /// QC certifying `block`.
-        qc: Arc<QuorumCertificate>,
+        /// QC certifying `block`. Verified handle preserved across the
+        /// off-thread JMT-prep round-trip so the downstream
+        /// `accept_block_commit` doesn't have to re-establish the QC's
+        /// predicate.
+        qc: Arc<Verified<QuorumCertificate>>,
         /// How this node learned the certifying QC. Threaded through to
         /// `accept_block_commit` for metrics labelling.
         source: CommitSource,

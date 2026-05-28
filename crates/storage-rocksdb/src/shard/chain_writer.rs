@@ -10,7 +10,7 @@ use hyperscale_storage::{
     merge_database_updates, merge_updates_from_receipts,
 };
 use hyperscale_types::{
-    Block, BlockHeight, FinalizedWave, QuorumCertificate, StateRoot, StoredReceipt,
+    Block, BlockHeight, FinalizedWave, QuorumCertificate, StateRoot, StoredReceipt, Verified,
 };
 use radix_substate_store_interface::interface::DatabaseUpdates;
 use rocksdb::{WriteBatch, WriteOptions};
@@ -234,7 +234,7 @@ impl ShardChainWriter for RocksDbShardStorage {
     fn commit_block(
         &self,
         block: &Arc<Block>,
-        qc: &Arc<QuorumCertificate>,
+        qc: &Arc<Verified<QuorumCertificate>>,
         witness: &BeaconWitnessCommit,
     ) -> StateRoot {
         let receipts: Vec<StoredReceipt> = block
@@ -286,7 +286,7 @@ impl RocksDbShardStorage {
         &self,
         merged_updates: &DatabaseUpdates,
         block: &Arc<Block>,
-        qc: &Arc<QuorumCertificate>,
+        qc: &Arc<Verified<QuorumCertificate>>,
         receipts: &[StoredReceipt],
         witness: &BeaconWitnessCommit,
     ) -> StateRoot {

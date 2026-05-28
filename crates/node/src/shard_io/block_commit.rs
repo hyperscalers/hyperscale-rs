@@ -40,7 +40,7 @@ use crate::shard_loop::{ShardEvent, push_protocol_event};
 /// Block + QC pair handed back to the `io_loop` to build a [`CertifiedBlock`]
 /// for immediate `BlockCommitted` delivery. Cloned `Arc` handles to the
 /// commit just enqueued in the pending backlog.
-pub type NotifyHandles = (Arc<Block>, Arc<QuorumCertificate>);
+pub type NotifyHandles = (Arc<Block>, Arc<Verified<QuorumCertificate>>);
 
 /// Prepared commit cache: `block_hash → (block_height, prepared_commit)`.
 ///
@@ -74,7 +74,7 @@ pub struct QcOnlyPending {
     /// Block being committed.
     pub block: Arc<Block>,
     /// QC certifying `block`.
-    pub qc: Arc<QuorumCertificate>,
+    pub qc: Arc<Verified<QuorumCertificate>>,
     /// Parent's state root (base for the JMT recomputation). Unused
     /// when `kind == AlreadyPrepared`.
     pub parent_state_root: StateRoot,
@@ -282,7 +282,7 @@ pub struct PendingCommit {
     /// Block being committed.
     pub block: Arc<Block>,
     /// Quorum certificate certifying `block`.
-    pub qc: Arc<QuorumCertificate>,
+    pub qc: Arc<Verified<QuorumCertificate>>,
     /// How this node learned the certifying QC. Tagged into metrics so
     /// dashboards can separate aggregator/header/sync commit paths.
     pub source: CommitSource,
@@ -703,15 +703,15 @@ where
             for (i, _) in heights.iter().enumerate() {
                 if !already_notified[i] {
                     let commit = commit_slots[i].take().unwrap();
-                    // SAFETY: the commit pipeline only enqueues commits
-                    // after this node either voted on the block (which
-                    // requires every applicable per-root verifier to
-                    // have succeeded) or observed the certifying QC and
-                    // ran the equivalent checks during sync; the QC
-                    // itself was verified upstream and the linkage
-                    // between QC and block-hash was established at the
-                    // coordinator. The full `Verified<CertifiedBlock>`
-                    // predicate holds at this point.
+                    // SAFETY: the QC rides in typed `Verified<QC>` from
+                    // the `Action::CommitBlock` / `CommitBlockByQcOnly`
+                    // payload. The block predicate (header verified +
+                    // every applicable per-root verifier succeeded)
+                    // holds because the commit pipeline only enqueues
+                    // commits after voting completed or sync ran the
+                    // equivalent checks. The linkage between QC and
+                    // block-hash was enforced at the coordinator before
+                    // dispatch.
                     let certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked(
                         CertifiedBlock::new_unchecked(
                             Arc::unwrap_or_clone(commit.block),
@@ -832,7 +832,7 @@ mod tests {
         fn commit_block(
             &self,
             _block: &Arc<Block>,
-            _qc: &Arc<QuorumCertificate>,
+            _qc: &Arc<Verified<QuorumCertificate>>,
             _witness: &BeaconWitnessCommit,
         ) -> StateRoot {
             unreachable!("BlockCommitCoordinator does not call commit_block");
@@ -882,6 +882,8 @@ mod tests {
             )
         };
         let _ = committee; // committee unused here but kept for future signing-required tests
+        // SAFETY: synthetic test fixture, no real signature.
+        let qc = Verified::<QuorumCertificate>::new_unchecked(qc);
         let pending = PendingCommit {
             block: Arc::new(block),
             qc: Arc::new(qc),

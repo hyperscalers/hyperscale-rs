@@ -828,7 +828,7 @@ impl<S: ShardChainWriter> ShardChainWriter for SubstateView<S> {
     fn commit_block(
         &self,
         block: &Arc<Block>,
-        qc: &Arc<QuorumCertificate>,
+        qc: &Arc<Verified<QuorumCertificate>>,
         witness: &BeaconWitnessCommit,
     ) -> StateRoot {
         (*self.base).commit_block(block, qc, witness)

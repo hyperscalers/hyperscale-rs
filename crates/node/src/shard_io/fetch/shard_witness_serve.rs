@@ -127,7 +127,7 @@ mod tests {
         BoundedVec, CertificateRoot, Hash, InFlightCount, LeafIndex, LocalReceiptRoot,
         ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardGroupId,
         ShardWitnessPayload, SignerBitfield, Stake, StakePoolId, StateRoot, TransactionRoot,
-        ValidatorId, WeightedTimestamp, compute_merkle_root, verify_merkle_inclusion,
+        ValidatorId, Verified, WeightedTimestamp, compute_merkle_root, verify_merkle_inclusion,
         zero_bls_signature,
     };
 
@@ -209,6 +209,8 @@ mod tests {
             leaves: leaves.to_vec(),
             leaf_count_at_block_end,
         };
+        // SAFETY: synthetic test fixture, no real signature.
+        let qc = Verified::<QuorumCertificate>::new_unchecked(qc);
         storage.commit_block(&Arc::new(block), &Arc::new(qc), &witness);
         (block_hash, root, leaf_count_at_block_end)
     }

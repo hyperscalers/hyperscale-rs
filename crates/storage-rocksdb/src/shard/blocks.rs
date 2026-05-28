@@ -20,7 +20,7 @@ use std::time::Instant;
 use hyperscale_metrics::{record_storage_operation, record_storage_read};
 use hyperscale_types::{
     BeaconWitnessLeafCount, Block, BlockHeight, BlockMetadata, CertifiedBlock, FinalizedWave, Hash,
-    ProvisionHash, QuorumCertificate, RoutableTransaction, ShardWitnessPayload, TxHash,
+    ProvisionHash, QuorumCertificate, RoutableTransaction, ShardWitnessPayload, TxHash, Verified,
     WaveCertificate, WaveId,
 };
 use rocksdb::{ColumnFamily, WriteBatch};
@@ -120,7 +120,7 @@ impl RocksDbShardStorage {
         &self,
         batch: &mut WriteBatch,
         block: &Block,
-        qc: &QuorumCertificate,
+        qc: &Verified<QuorumCertificate>,
         beacon_witness_leaf_count_at_block_end: BeaconWitnessLeafCount,
     ) {
         // Resolve column-family handles once for the whole append loop.

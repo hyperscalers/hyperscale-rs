@@ -14,18 +14,18 @@
 use std::collections::{BTreeMap, HashMap};
 
 use hyperscale_core::CommitSource;
-use hyperscale_types::{BlockHash, BlockHeight, QuorumCertificate};
+use hyperscale_types::{BlockHash, BlockHeight, QuorumCertificate, Verified};
 
 pub struct CommitPipeline {
     /// Out-of-order commit buffer: commits received with height greater than
     /// `committed_height + 1`, parked until the predecessor commits.
     /// Keyed by target height.
-    out_of_order: BTreeMap<BlockHeight, (BlockHash, QuorumCertificate, CommitSource)>,
+    out_of_order: BTreeMap<BlockHeight, (BlockHash, Verified<QuorumCertificate>, CommitSource)>,
 
     /// Awaiting-data commit buffer: commits whose block payload
     /// (transactions/certificates) has not fully arrived yet, retried when
     /// the block completes. Keyed by block hash.
-    awaiting_data: HashMap<BlockHash, (BlockHeight, QuorumCertificate, CommitSource)>,
+    awaiting_data: HashMap<BlockHash, (BlockHeight, Verified<QuorumCertificate>, CommitSource)>,
 }
 
 impl CommitPipeline {
@@ -49,7 +49,7 @@ impl CommitPipeline {
         &mut self,
         block_hash: BlockHash,
         height: BlockHeight,
-        qc: QuorumCertificate,
+        qc: Verified<QuorumCertificate>,
         source: CommitSource,
     ) {
         self.awaiting_data.insert(block_hash, (height, qc, source));
@@ -60,7 +60,7 @@ impl CommitPipeline {
         &mut self,
         height: BlockHeight,
         block_hash: BlockHash,
-        qc: QuorumCertificate,
+        qc: Verified<QuorumCertificate>,
         source: CommitSource,
     ) {
         self.out_of_order.insert(height, (block_hash, qc, source));
@@ -73,7 +73,7 @@ impl CommitPipeline {
     pub fn take_out_of_order(
         &mut self,
         height: BlockHeight,
-    ) -> Option<(BlockHash, QuorumCertificate, CommitSource)> {
+    ) -> Option<(BlockHash, Verified<QuorumCertificate>, CommitSource)> {
         self.out_of_order.remove(&height)
     }
 
@@ -84,7 +84,7 @@ impl CommitPipeline {
     pub fn take_awaiting_data(
         &mut self,
         block_hash: BlockHash,
-    ) -> Option<(BlockHeight, QuorumCertificate, CommitSource)> {
+    ) -> Option<(BlockHeight, Verified<QuorumCertificate>, CommitSource)> {
         self.awaiting_data.remove(&block_hash)
     }
 
@@ -111,8 +111,9 @@ mod tests {
 
     use super::*;
 
-    fn make_qc(height: u64) -> QuorumCertificate {
-        QuorumCertificate::new(
+    fn make_qc(height: u64) -> Verified<QuorumCertificate> {
+        // SAFETY: synthetic test fixture, no real signature.
+        Verified::<QuorumCertificate>::new_unchecked(QuorumCertificate::new(
             BlockHash::ZERO,
             ShardGroupId::new(0),
             BlockHeight::new(height),
@@ -121,7 +122,7 @@ mod tests {
             SignerBitfield::empty(),
             zero_bls_signature(),
             WeightedTimestamp::ZERO,
-        )
+        ))
     }
 
     fn bh(tag: &[u8]) -> BlockHash {
@@ -204,8 +205,9 @@ mod properties {
 
     use super::*;
 
-    fn make_qc(height: u64) -> QuorumCertificate {
-        QuorumCertificate::new(
+    fn make_qc(height: u64) -> Verified<QuorumCertificate> {
+        // SAFETY: synthetic test fixture, no real signature.
+        Verified::<QuorumCertificate>::new_unchecked(QuorumCertificate::new(
             BlockHash::ZERO,
             ShardGroupId::new(0),
             BlockHeight::new(height),
@@ -214,7 +216,7 @@ mod properties {
             SignerBitfield::empty(),
             zero_bls_signature(),
             WeightedTimestamp::ZERO,
-        )
+        ))
     }
 
     fn hash_for(tag: u64) -> BlockHash {

@@ -12,6 +12,7 @@ use hyperscale_storage::{
 };
 use hyperscale_types::{
     Block, BlockHeight, CertifiedBlock, FinalizedWave, QuorumCertificate, StateRoot, StoredReceipt,
+    Verified,
 };
 
 use super::core::SimShardStorage;
@@ -175,7 +176,7 @@ impl ShardChainWriter for SimShardStorage {
                 }
                 c.committed_height = block.height();
                 c.committed_hash = Some(block.hash());
-                c.committed_qc = Some((*qc).clone());
+                c.committed_qc = Some(qc.as_ref().as_ref().clone());
                 c.prune_receipts(block.height());
 
                 result_root
@@ -186,7 +187,7 @@ impl ShardChainWriter for SimShardStorage {
     fn commit_block(
         &self,
         block: &Arc<Block>,
-        qc: &Arc<QuorumCertificate>,
+        qc: &Arc<Verified<QuorumCertificate>>,
         witness: &BeaconWitnessCommit,
     ) -> StateRoot {
         let receipts: Vec<StoredReceipt> = block
@@ -223,7 +224,7 @@ impl SimShardStorage {
         &self,
         merged_updates: &DatabaseUpdates,
         block: &Arc<Block>,
-        qc: &Arc<QuorumCertificate>,
+        qc: &Arc<Verified<QuorumCertificate>>,
         receipts: &[StoredReceipt],
     ) -> StateRoot {
         let block_height = block.height();
@@ -299,7 +300,7 @@ impl SimShardStorage {
             }
             c.committed_height = block.height();
             c.committed_hash = Some(block.hash());
-            c.committed_qc = Some((**qc).clone());
+            c.committed_qc = Some(qc.as_ref().as_ref().clone());
             c.prune_receipts(block.height());
         }
 

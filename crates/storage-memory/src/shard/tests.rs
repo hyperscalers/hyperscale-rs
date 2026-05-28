@@ -16,7 +16,7 @@ use hyperscale_types::test_utils::test_transaction;
 use hyperscale_types::{
     BeaconWitnessLeafCount, Block, BlockHeight, ConsensusReceipt, FinalizedWave, GlobalReceiptHash,
     Hash, NodeId, ProposerTimestamp, QuorumCertificate, ShardGroupId, StateRoot, StoredReceipt,
-    TxHash, WaveCertificate, WaveId,
+    TxHash, Verified, WaveCertificate, WaveId,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -108,7 +108,7 @@ fn commit_with(
     storage: &SimShardStorage,
     updates: &DatabaseUpdates,
     block: &Block,
-    qc: &QuorumCertificate,
+    qc: &Verified<QuorumCertificate>,
 ) -> StateRoot {
     let block = block.clone();
     let block = if updates.node_updates.is_empty() {
@@ -164,11 +164,19 @@ fn commit_with(
             }
         }
     };
-    storage.commit_block(&Arc::new(block), &Arc::new(qc.clone()), &no_witness())
+    storage.commit_block(
+        &Arc::new(block),
+        &Arc::new(<Verified<_>>::clone(qc)),
+        &no_witness(),
+    )
 }
 
 /// Helper: commit a block with empty updates and no ECs/receipts.
-fn commit_empty(storage: &SimShardStorage, block: &Block, qc: &QuorumCertificate) -> StateRoot {
+fn commit_empty(
+    storage: &SimShardStorage,
+    block: &Block,
+    qc: &Verified<QuorumCertificate>,
+) -> StateRoot {
     commit_with(storage, &DatabaseUpdates::default(), block, qc)
 }
 

@@ -297,7 +297,7 @@ where
     fn accept_qc_only_commit(
         &mut self,
         block: Block,
-        qc: QuorumCertificate,
+        qc: Verified<QuorumCertificate>,
         parent_state_root: StateRoot,
         parent_block_height: BlockHeight,
         source: CommitSource,
@@ -415,7 +415,7 @@ where
     pub(in crate::shard_loop) fn handle_qc_only_commit_prepared(
         &mut self,
         block: Arc<Block>,
-        qc: Arc<QuorumCertificate>,
+        qc: Arc<Verified<QuorumCertificate>>,
         source: CommitSource,
         witness: BeaconWitnessCommit,
     ) {
@@ -456,15 +456,16 @@ where
 
                 let weighted_ts = qc.weighted_timestamp();
                 let block_hash = block.hash();
-                // SAFETY: the commit pipeline only fires after this
-                // node either voted on the block (which requires every
-                // applicable per-root verifier to have succeeded) or
-                // observed the certifying QC and ran the equivalent
-                // checks during sync; the QC itself was verified
-                // upstream and the linkage between QC and block-hash
-                // was established at the coordinator. The full
-                // `Verified<CertifiedBlock>` predicate holds at this
-                // point.
+                // SAFETY: the QC is typed `Verified<QC>` (it rode in
+                // verified through `Action::CommitBlock` /
+                // `CommitBlockByQcOnly`). The block predicate (header
+                // verified + every applicable per-root verifier
+                // succeeded) holds because the commit pipeline only
+                // fires after voting completed or sync ran the
+                // equivalent checks. The linkage between QC and
+                // block-hash was enforced at the coordinator before
+                // dispatch. The `Verified<CertifiedBlock>` predicate
+                // therefore holds.
                 let certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked(
                     CertifiedBlock::new_unchecked(
                         Arc::unwrap_or_clone(block),

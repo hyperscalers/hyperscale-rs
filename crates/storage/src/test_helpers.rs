@@ -16,7 +16,7 @@ use hyperscale_types::{
     FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, InFlightCount, LocalReceiptRoot,
     LogLevel, NodeId, PcQc2, PcQc3, PcSignerLengths, PcVector, PcXpProof, ProposerTimestamp,
     ProvisionsRoot, QuorumCertificate, Randomness, Round, ShardGroupId, SignerBitfield, SpcCert,
-    SpcView, StateRoot, StoredReceipt, TransactionRoot, TxHash, TxOutcome, ValidatorId,
+    SpcView, StateRoot, StoredReceipt, TransactionRoot, TxHash, TxOutcome, ValidatorId, Verified,
     WaveCertificate, WaveId, WeightedTimestamp, compute_global_receipt_root, zero_bls_signature,
 };
 use indexmap::IndexMap;
@@ -141,10 +141,17 @@ pub fn make_test_block(height: BlockHeight) -> Block {
     }
 }
 
-/// Build a `QuorumCertificate` that references the given block.
+/// Build a verified `QuorumCertificate` that references the given block.
+///
+/// The signature is the zero placeholder — these fixtures don't drive real
+/// verification, they exercise storage and pipeline shapes. The `Verified`
+/// wrapper is `new_unchecked` because the test cluster predates a real BLS
+/// signing path; consumers downstream of storage and the commit pipeline
+/// require the verified marker.
 #[must_use]
-pub fn make_test_qc(block: &Block) -> QuorumCertificate {
-    QuorumCertificate::new(
+pub fn make_test_qc(block: &Block) -> Verified<QuorumCertificate> {
+    // SAFETY: synthetic test fixture, no real signature.
+    Verified::<QuorumCertificate>::new_unchecked(QuorumCertificate::new(
         block.hash(),
         ShardGroupId::new(0),
         block.height(),
@@ -153,7 +160,7 @@ pub fn make_test_qc(block: &Block) -> QuorumCertificate {
         SignerBitfield::new(4),
         zero_bls_signature(),
         WeightedTimestamp::from_millis(block.header().timestamp().as_millis()),
-    )
+    ))
 }
 
 /// Build a placeholder [`SpcCert::Direct`] for test fixtures.

@@ -7,7 +7,7 @@ use hyperscale_metrics::{record_storage_operation, record_storage_write};
 use hyperscale_storage::tree::proofs::generate_proof;
 use hyperscale_storage::{DbSortKey, JmtSnapshot, SubstateStore, VersionedStore};
 use hyperscale_types::{
-    Block, BlockHeight, MerkleInclusionProof, NodeId, QuorumCertificate, StateRoot,
+    Block, BlockHeight, MerkleInclusionProof, NodeId, QuorumCertificate, StateRoot, Verified,
 };
 use rocksdb::{WriteBatch, WriteOptions};
 
@@ -138,7 +138,7 @@ impl RocksDbShardStorage {
         mut write_batch: WriteBatch,
         jmt_snapshot: &JmtSnapshot,
         block: &Block,
-        qc: &QuorumCertificate,
+        qc: &Verified<QuorumCertificate>,
         sync: bool,
     ) -> bool {
         let _commit_guard = self.commit_lock.lock().unwrap();

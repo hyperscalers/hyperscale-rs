@@ -24,7 +24,7 @@ use hyperscale_storage::{
     GenesisCommit, JmtSnapshot, PartitionDatabaseUpdates, PartitionEntry, SubstateDatabase,
     SubstateStore, tree,
 };
-use hyperscale_types::{Block, BlockHeight, QuorumCertificate, StateRoot};
+use hyperscale_types::{Block, BlockHeight, QuorumCertificate, StateRoot, Verified};
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamilyDescriptor, DB, DBCompressionType, Options,
     SliceTransform, WriteBatch,
@@ -349,11 +349,11 @@ impl RocksDbShardStorage {
     pub(crate) fn append_consensus_to_batch(
         batch: &mut WriteBatch,
         block: &Block,
-        qc: &QuorumCertificate,
+        qc: &Verified<QuorumCertificate>,
     ) {
         write_committed_height(batch, block.height());
         write_committed_hash(batch, block.hash().as_raw());
-        write_committed_qc(batch, qc);
+        write_committed_qc(batch, qc.as_ref());
     }
 
     /// Build a `WriteBatch` containing all substate puts/deletes from `updates`.

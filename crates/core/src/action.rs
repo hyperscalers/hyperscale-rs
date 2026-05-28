@@ -631,8 +631,10 @@ pub enum Action {
     CommitBlock {
         /// Block to commit.
         block: Block,
-        /// The QC that certified this block.
-        qc: QuorumCertificate,
+        /// QC certifying `block`. Carried verified so the downstream
+        /// `Verified<CertifiedBlock>` wrap on `BlockCommitted` doesn't
+        /// re-establish the QC's predicate at the consumer.
+        qc: Verified<QuorumCertificate>,
         /// How this node learned the certifying QC (aggregator vs header).
         source: CommitSource,
         /// Beacon-witness leaves to persist alongside the block in the
@@ -653,8 +655,8 @@ pub enum Action {
     CommitBlockByQcOnly {
         /// Block to commit.
         block: Block,
-        /// The QC that certified this block.
-        qc: QuorumCertificate,
+        /// QC certifying `block`. Carried verified — see [`Self::CommitBlock`].
+        qc: Verified<QuorumCertificate>,
         /// Parent block's state root — base state for JMT computation.
         parent_state_root: StateRoot,
         /// Parent block's height — JMT parent version.

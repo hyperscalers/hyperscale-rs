@@ -128,8 +128,11 @@ pub enum ProtocolEvent {
     BlockReadyToCommit {
         /// Block being committed.
         block_hash: BlockHash,
-        /// QC that triggers this commit (the next block's `parent_qc` under 2-chain).
-        qc: QuorumCertificate,
+        /// QC certifying the committed block (under 2-chain, this is the
+        /// next block's `parent_qc`). Verified before the event is
+        /// emitted so the commit handler doesn't re-establish the QC's
+        /// predicate.
+        qc: Verified<QuorumCertificate>,
         /// How this node learned the certifying QC.
         source: CommitSource,
     },
