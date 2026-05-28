@@ -68,7 +68,7 @@ pub struct WaveState {
     tx_hash_set: HashSet<TxHash>,
     /// Transactions owned by the wave, used to build execution requests at
     /// dispatch time.
-    transactions: HashMap<TxHash, Arc<RoutableTransaction>>,
+    transactions: HashMap<TxHash, Arc<Verified<RoutableTransaction>>>,
 
     /// BFT-authenticated weighted timestamp of the wave-starting block.
     /// Anchor for wave-level wall-clock timeouts (wave abort, vote anchor
@@ -160,7 +160,7 @@ impl WaveState {
         single_shard: bool,
     ) -> Self {
         let mut tx_hashes: Vec<TxHash> = Vec::with_capacity(txs.len());
-        let mut transactions: HashMap<TxHash, Arc<RoutableTransaction>> =
+        let mut transactions: HashMap<TxHash, Arc<Verified<RoutableTransaction>>> =
             HashMap::with_capacity(txs.len());
         let mut participating_shards: HashMap<TxHash, BTreeSet<ShardGroupId>> =
             HashMap::with_capacity(txs.len());
@@ -170,13 +170,16 @@ impl WaveState {
         for (tx, shards) in txs {
             let h = tx.hash();
             tx_hashes.push(h);
-            // Extract raw `RoutableTransaction` for the in-memory wave
-            // store — execution dispatch (`Action::ExecuteTransactions`)
-            // and the engine still consume raw `Arc<RoutableTransaction>`,
-            // so converting at this boundary keeps the storage form
-            // matched to its only consumer.
-            let raw: Arc<RoutableTransaction> = Arc::new((**tx).clone());
-            transactions.insert(h, raw);
+            // Block-container entries decoded from the wire land as
+            // `Unverified`; lift via `from_persisted` under the same
+            // BFT-transitive trust that gates the containing block. Honest
+            // live-consensus blocks already carry `Verified` entries (the
+            // `.into_verified()` arm short-circuits without re-validating).
+            let verified: Arc<Verified<RoutableTransaction>> = match (*tx).clone().into_verified() {
+                Ok(v) => Arc::new(v),
+                Err(raw) => Arc::new(Verified::<RoutableTransaction>::from_persisted(raw)),
+            };
+            transactions.insert(h, verified);
             participating_shards.insert(h, shards);
             covered_shards.insert(h, BTreeSet::new());
         }
@@ -298,7 +301,7 @@ impl WaveState {
     fn build_dispatch_action(&self, provisioning: &ProvisioningTracker) -> Option<Action> {
         if self.wave_id.is_zero() {
             // Single-shard wave: no provisions needed.
-            let transactions: Vec<Arc<RoutableTransaction>> = self
+            let transactions: Vec<Arc<Verified<RoutableTransaction>>> = self
                 .tx_hashes
                 .iter()
                 .filter(|h| !self.is_tx_explicitly_aborted(**h))

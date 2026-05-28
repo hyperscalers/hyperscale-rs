@@ -26,7 +26,7 @@ pub struct CrossShardExecutionRequest {
     /// Transaction hash (for correlation).
     pub tx_hash: TxHash,
     /// The transaction to execute.
-    pub transaction: Arc<RoutableTransaction>,
+    pub transaction: Arc<Verified<RoutableTransaction>>,
     /// State entries provisioned by other shards (one `Arc` per source shard
     /// contribution). Engine layers them on top of the local snapshot.
     pub provisions: Vec<Arc<Vec<SubstateEntry>>>,
@@ -603,7 +603,7 @@ pub enum Action {
         /// [`PendingChain`].
         block_height: BlockHeight,
         /// Transactions to execute (all members of the wave).
-        transactions: Vec<Arc<RoutableTransaction>>,
+        transactions: Vec<Arc<Verified<RoutableTransaction>>>,
         /// State root to anchor reads against.
         state_root: StateRoot,
     },
