@@ -74,9 +74,11 @@ impl PartialEq for RoutableTransaction {
 
 impl Eq for RoutableTransaction {}
 
-// Manual Clone - OnceLock doesn't implement Clone. Eagerly-populated
-// caches (`transaction`, `hash`) are copied if present so the clone
-// doesn't pay first-access cost twice.
+// Manual Clone - OnceLock doesn't implement Clone. Every populated cache
+// is copied so the clone doesn't pay first-access cost twice; in
+// particular `validated` rides across clones so the BLS-sig validation a
+// fresh tx incurs at admission is amortized over every later raw clone
+// (wave-state extract, mempool block-commit lift, proposal build).
 impl Clone for RoutableTransaction {
     fn clone(&self) -> Self {
         let transaction = OnceLock::new();
@@ -86,6 +88,10 @@ impl Clone for RoutableTransaction {
         let hash = OnceLock::new();
         if let Some(h) = self.hash.get() {
             let _ = hash.set(*h);
+        }
+        let validated = OnceLock::new();
+        if let Some(v) = self.validated.get() {
+            let _ = validated.set(v.clone());
         }
         let cached_sbor = OnceLock::new();
         if let Some(b) = self.cached_sbor.get() {
@@ -98,7 +104,7 @@ impl Clone for RoutableTransaction {
             validity_range: self.validity_range,
             transaction,
             hash,
-            validated: OnceLock::new(),
+            validated,
             cached_sbor,
         }
     }
