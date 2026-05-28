@@ -736,17 +736,20 @@ mod tests {
         );
 
         let verified_msg = VTestMsg {
-            payload: Verifiable::Verified(Verified::new_unchecked_for_test(42)),
+            payload: Verified::new_unchecked_for_test(42u32).into(),
         };
         let verdict = registry.local_dispatch_gossip(&verified_msg, Some(ShardGroupId::new(0)));
         assert_eq!(verdict, Some(GossipVerdict::Accept));
 
-        let received = observed.lock().unwrap().clone();
-        match received {
-            Some(Verifiable::Verified(v)) if *v.as_ref() == 42 => {}
-            other => panic!(
-                "local dispatch must preserve Verifiable::Verified across the boundary, got {other:?}"
-            ),
-        }
+        let received = observed
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("local dispatch delivers the payload");
+        assert!(
+            received.is_verified(),
+            "local dispatch must preserve the verified marker across the boundary"
+        );
+        assert_eq!(*received, 42, "inner value must round-trip");
     }
 }

@@ -49,8 +49,7 @@ use hyperscale_types::network::response::GetBlockResponse;
 use hyperscale_types::{BeaconWitnessLeafCount, BeaconWitnessRoot};
 use hyperscale_types::{
     BlockHeight, CertificateRoot, CertifiedBlock, ElidedCertifiedBlock, Hash, Inventory,
-    LocalReceiptRoot, ProvisionsRoot, RehydrateError, StoredReceipt, TransactionRoot, Verifiable,
-    Verified,
+    LocalReceiptRoot, ProvisionsRoot, RehydrateError, StoredReceipt, TransactionRoot, Verified,
 };
 
 use crate::shard_io::sync::SyncOutput;
@@ -283,13 +282,14 @@ where
         elided.try_rehydrate(
             |h| caches.tx_store.get(h),
             |id| caches.finalized_wave_store.get(id),
-            // `provision_store` holds raw bodies; wrap into `Verifiable::Unverified`
-            // — the wave-cert linkage gates trust on the rehydrated block.
+            // `provision_store` holds raw bodies; lift into the unverified
+            // transport shape — the wave-cert linkage gates trust on the
+            // rehydrated block.
             |h| {
                 caches
                     .provision_store
                     .get(*h)
-                    .map(|p| Arc::new(Verifiable::Unverified((*p).clone())))
+                    .map(|p| Arc::new((*p).clone().into()))
             },
         )
     }
@@ -436,7 +436,8 @@ mod tests {
         ConsensusReceipt, ExecutionCertificate, ExecutionOutcome, FinalizedWave, GlobalReceiptHash,
         GlobalReceiptRoot, InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
         QuorumCertificate, Round, ShardGroupId, SignerBitfield, StateRoot, TransactionRoot, TxHash,
-        TxOutcome, ValidatorId, WaveCertificate, WaveId, WeightedTimestamp, zero_bls_signature,
+        TxOutcome, ValidatorId, Verifiable, WaveCertificate, WaveId, WeightedTimestamp,
+        zero_bls_signature,
     };
 
     use super::*;
@@ -558,10 +559,13 @@ mod tests {
             }),
             metadata: None,
         };
-        let fw = Arc::new(Verifiable::Unverified(FinalizedWave::new(
-            Arc::new(WaveCertificate::new(wave_id, vec![Arc::new(ec)])),
-            vec![receipt.clone()],
-        )));
+        let fw = Arc::new(
+            FinalizedWave::new(
+                Arc::new(WaveCertificate::new(wave_id, vec![Arc::new(ec)])),
+                vec![receipt.clone()],
+            )
+            .into(),
+        );
         let lrr = Verified::<LocalReceiptRoot>::compute(&[receipt]).into_inner();
         let cr = Verified::<CertificateRoot>::compute(std::slice::from_ref(&fw)).into_inner();
         (fw, lrr, cr)
@@ -735,10 +739,13 @@ mod tests {
             consensus: Arc::new(ConsensusReceipt::Failed),
             metadata: None,
         };
-        let fw = Arc::new(Verifiable::Unverified(FinalizedWave::new(
-            Arc::new(WaveCertificate::new(wave_id, vec![Arc::new(ec)])),
-            vec![receipt.clone()],
-        )));
+        let fw = Arc::new(
+            FinalizedWave::new(
+                Arc::new(WaveCertificate::new(wave_id, vec![Arc::new(ec)])),
+                vec![receipt.clone()],
+            )
+            .into(),
+        );
         let h = header_with_roots(
             &header(),
             None,

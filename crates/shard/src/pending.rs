@@ -774,9 +774,13 @@ mod tests {
         assert_eq!(pb.missing_wave_count(), 1);
         assert!(!pb.is_complete());
 
-        let fw = Arc::new(Verifiable::Verified(Verified::new_unchecked_for_test(
-            FinalizedWave::new(Arc::new(WaveCertificate::new(wave_id, vec![])), vec![]),
-        )));
+        let fw = Arc::new(
+            Verified::new_unchecked_for_test(FinalizedWave::new(
+                Arc::new(WaveCertificate::new(wave_id, vec![])),
+                vec![],
+            ))
+            .into(),
+        );
 
         let added = pb.add_finalized_wave(fw);
         assert!(added);
@@ -805,9 +809,13 @@ mod tests {
         assert!(!pb.is_complete()); // Still missing wave
 
         // Add finalized wave
-        let fw = Arc::new(Verifiable::Verified(Verified::new_unchecked_for_test(
-            FinalizedWave::new(Arc::new(WaveCertificate::new(wave_id, vec![])), vec![]),
-        )));
+        let fw = Arc::new(
+            Verified::new_unchecked_for_test(FinalizedWave::new(
+                Arc::new(WaveCertificate::new(wave_id, vec![])),
+                vec![],
+            ))
+            .into(),
+        );
         pb.add_finalized_wave(fw);
         assert!(pb.is_complete());
     }
@@ -818,10 +826,8 @@ mod tests {
         let cert = Arc::new(WaveCertificate::new(wave_id, vec![]));
 
         let fw = Arc::new(FinalizedWave::new(cert, vec![]));
-        let verified_fw = Arc::new(Verifiable::Verified(Verified::new_unchecked_for_test(
-            (*fw).clone(),
-        )));
-        let wire_fw = Arc::new(Verifiable::Unverified((*fw).clone()));
+        let verified_fw = Arc::new(Verified::new_unchecked_for_test((*fw).clone()).into());
+        let wire_fw = Arc::new((*fw).clone().into());
 
         let block = Block::Live {
             header: make_header(BlockHeight::new(1)),

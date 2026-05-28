@@ -471,8 +471,7 @@ mod tests {
 
         use super::*;
         use crate::{
-            BlockHeader, BlockHeight, Hash, QuorumCertificate, ShardGroupId, StateRoot,
-            ValidatorId, Verifiable,
+            BlockHeader, BlockHeight, Hash, QuorumCertificate, ShardGroupId, StateRoot, ValidatorId,
         };
 
         type Jmt = Tree<Blake3Hasher, 1>;
@@ -514,7 +513,7 @@ mod tests {
             let header = BlockHeader::genesis(shard, ValidatorId::new(0), state_root);
             Verified::<CommittedBlockHeader>::new_unchecked_for_test(CommittedBlockHeader::new(
                 header,
-                Verifiable::Verified(Verified::<QuorumCertificate>::genesis(shard)),
+                Verified::<QuorumCertificate>::genesis(shard),
             ))
         }
 

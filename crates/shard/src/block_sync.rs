@@ -11,7 +11,7 @@ use hyperscale_core::Action;
 use hyperscale_types::{BeaconWitnessLeafCount, BeaconWitnessRoot};
 use hyperscale_types::{
     Block, BlockHash, BlockHeight, Bls12381G1PublicKey, CertifiedBlock, QuorumCertificate,
-    TopologySnapshot, Verifiable, Verified, VotePower,
+    TopologySnapshot, Verified, VotePower,
 };
 use tracing::{debug, info, warn};
 
@@ -424,7 +424,7 @@ impl BlockSyncManager {
             PendingSyncedBlockVerification::InFlight(c) => c.into_parts(),
             PendingSyncedBlockVerification::QcVerified { block, qc } => {
                 // Duplicate verification callback — replace and continue.
-                (block, Verifiable::Verified(qc))
+                (block, qc.into())
             }
         };
         self.pending_synced_block_verifications.insert(

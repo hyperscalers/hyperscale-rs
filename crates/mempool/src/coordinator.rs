@@ -1060,7 +1060,7 @@ mod tests {
     use hyperscale_types::test_utils::{test_transaction, test_transaction_with_nodes};
     use hyperscale_types::{
         Block, FinalizedWave, MAX_TXS_PER_BLOCK, MerkleInclusionProof, ProvisionEntry, Provisions,
-        ShardGroupId, ValidatorId, Verifiable,
+        ShardGroupId, ValidatorId,
     };
 
     use super::*;
@@ -1087,7 +1087,7 @@ mod tests {
             1_234_567_890,
             ValidatorId::new(0),
             vec![Arc::new(tx)],
-            vec![Arc::new(Verifiable::Unverified(fw))],
+            vec![Arc::new(fw.into())],
         );
         certify(block, height.inner() * TEST_BLOCK_INTERVAL_MS)
     }
@@ -1128,7 +1128,7 @@ mod tests {
                 header,
                 transactions,
                 certificates,
-                provisions: Arc::new(vec![Arc::new(Verifiable::Unverified(provision))].into()),
+                provisions: Arc::new(vec![Arc::new(provision.into())].into()),
             },
             sealed @ Block::Sealed { .. } => sealed,
         };
@@ -1908,11 +1908,10 @@ mod tests {
             2_000,
             ValidatorId::new(0),
             vec![],
-            vec![Arc::new(Verifiable::Unverified(make_finalized_wave(
-                BlockHeight::new(2),
-                cross_hash,
-                TransactionDecision::Accept,
-            )))],
+            vec![Arc::new(
+                make_finalized_wave(BlockHeight::new(2), cross_hash, TransactionDecision::Accept)
+                    .into(),
+            )],
         );
         mempool.on_block_committed(&topology, &certify(block2, 2_000));
         assert_eq!(mempool.in_flight(), 1, "Completed TX releases its lock");
@@ -1923,11 +1922,14 @@ mod tests {
             3_000,
             ValidatorId::new(0),
             vec![],
-            vec![Arc::new(Verifiable::Unverified(make_finalized_wave(
-                BlockHeight::new(3),
-                single_hash,
-                TransactionDecision::Accept,
-            )))],
+            vec![Arc::new(
+                make_finalized_wave(
+                    BlockHeight::new(3),
+                    single_hash,
+                    TransactionDecision::Accept,
+                )
+                .into(),
+            )],
         );
         mempool.on_block_committed(&topology, &certify(block3, 3_000));
         assert_eq!(mempool.in_flight(), 0, "All completed");

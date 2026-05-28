@@ -146,9 +146,23 @@ impl<T: Hash> Hash for Verified<T> {
 /// Typestate wrapper carrying either the raw form `T` or a verified form
 /// [`Verified<T>`].
 ///
+/// The wrapper's two-state taxonomy is a private implementation detail
+/// of this module. Construction goes through the [`From`] impls
+/// (`T → Verifiable<T>::Unverified` and `Verified<T> → Verifiable<T>::Verified`);
+/// inspection goes through [`Self::is_verified`], [`Self::verified`],
+/// [`Self::into_verified`], [`Self::upgrade`], and the
+/// [`Deref<Target = T>`](Deref) raw-access path.
+///
 /// See the module-level docs for the design contract.
 #[derive(Debug, Clone)]
-pub enum Verifiable<T> {
+pub struct Verifiable<T>(VerifiableState<T>);
+
+/// Internal taxonomy of a [`Verifiable<T>`]. Kept private so the
+/// two-state design isn't part of the public API surface — extending
+/// the taxonomy (e.g. negative caching) wouldn't be a breaking change
+/// to downstream pattern matches.
+#[derive(Debug, Clone)]
+enum VerifiableState<T> {
     /// Decoded-from-wire or freshly-constructed value that has not yet
     /// passed its verification predicate.
     Unverified(T),
@@ -160,26 +174,26 @@ pub enum Verifiable<T> {
 impl<T> Verifiable<T> {
     /// Borrow the raw content regardless of variant.
     pub fn as_unverified(&self) -> &T {
-        match self {
-            Self::Unverified(t) => t,
-            Self::Verified(v) => v.as_ref(),
+        match &self.0 {
+            VerifiableState::Unverified(t) => t,
+            VerifiableState::Verified(v) => v.as_ref(),
         }
     }
 
     /// Borrow the verified value if this wrapper has been upgraded.
     pub const fn verified(&self) -> Option<&Verified<T>> {
-        match self {
-            Self::Verified(v) => Some(v),
-            Self::Unverified(_) => None,
+        match &self.0 {
+            VerifiableState::Verified(v) => Some(v),
+            VerifiableState::Unverified(_) => None,
         }
     }
 
     /// Consume the wrapper and return the raw `T`, dropping the verified
     /// claim if present.
     pub fn into_unverified(self) -> T {
-        match self {
-            Self::Unverified(t) => t,
-            Self::Verified(v) => v.into_inner(),
+        match self.0 {
+            VerifiableState::Unverified(t) => t,
+            VerifiableState::Verified(v) => v.into_inner(),
         }
     }
 
@@ -195,16 +209,16 @@ impl<T> Verifiable<T> {
     where
         T: Verify<Ctx>,
     {
-        let verified = match self {
-            Self::Verified(_) => None,
-            Self::Unverified(t) => Some(t.verify(ctx)?),
+        let verified = match &self.0 {
+            VerifiableState::Verified(_) => None,
+            VerifiableState::Unverified(t) => Some(t.verify(ctx)?),
         };
         if let Some(v) = verified {
-            *self = Self::Verified(v);
+            self.0 = VerifiableState::Verified(v);
         }
-        match self {
-            Self::Verified(v) => Ok(v),
-            Self::Unverified(_) => unreachable!("just set above"),
+        match &self.0 {
+            VerifiableState::Verified(v) => Ok(v),
+            VerifiableState::Unverified(_) => unreachable!("just set above"),
         }
     }
 
@@ -222,9 +236,9 @@ impl<T> Verifiable<T> {
     where
         T: Verify<Ctx>,
     {
-        match self {
-            Self::Verified(v) => Ok(v),
-            Self::Unverified(t) => match t.verify(ctx) {
+        match self.0 {
+            VerifiableState::Verified(v) => Ok(v),
+            VerifiableState::Unverified(t) => match t.verify(ctx) {
                 Ok(v) => Ok(v),
                 Err(e) => Err((t, e)),
             },
@@ -235,7 +249,7 @@ impl<T> Verifiable<T> {
     /// `self.verified().is_some()` for readable assertions.
     #[must_use]
     pub const fn is_verified(&self) -> bool {
-        matches!(self, Self::Verified(_))
+        matches!(self.0, VerifiableState::Verified(_))
     }
 
     /// Consume the wrapper, returning `Some(verified)` only when the
@@ -248,9 +262,9 @@ impl<T> Verifiable<T> {
     /// inner [`Verified<T>`] by value without running the predicate.
     #[must_use]
     pub fn into_verified(self) -> Option<Verified<T>> {
-        match self {
-            Self::Verified(v) => Some(v),
-            Self::Unverified(_) => None,
+        match self.0 {
+            VerifiableState::Verified(v) => Some(v),
+            VerifiableState::Unverified(_) => None,
         }
     }
 }
@@ -271,13 +285,13 @@ impl<T: Hash> Hash for Verifiable<T> {
 
 impl<T> From<T> for Verifiable<T> {
     fn from(t: T) -> Self {
-        Self::Unverified(t)
+        Self(VerifiableState::Unverified(t))
     }
 }
 
 impl<T> From<Verified<T>> for Verifiable<T> {
     fn from(v: Verified<T>) -> Self {
-        Self::Verified(v)
+        Self(VerifiableState::Verified(v))
     }
 }
 
@@ -329,7 +343,7 @@ where
         value_kind: ValueKind<NoCustomValueKind>,
     ) -> Result<Self, DecodeError> {
         let t = T::decode_body_with_value_kind(decoder, value_kind)?;
-        Ok(Self::Unverified(t))
+        Ok(Self(VerifiableState::Unverified(t)))
     }
 }
 
@@ -369,8 +383,8 @@ mod tests {
     #[test]
     fn verifiable_encode_matches_inner_regardless_of_state() {
         let u: u32 = 0xABCD_1234;
-        let unverified: V = Verifiable::Unverified(u);
-        let verified: V = Verifiable::Verified(Verified::new_unchecked(u));
+        let unverified: V = u.into();
+        let verified: V = Verified::new_unchecked(u).into();
 
         let bare = basic_encode(&u).unwrap();
         let unv = basic_encode(&unverified).unwrap();
@@ -385,42 +399,41 @@ mod tests {
         let u: u32 = 7;
         let bytes = basic_encode(&u).unwrap();
         let decoded: V = basic_decode(&bytes).unwrap();
-        match decoded {
-            Verifiable::Unverified(x) => assert_eq!(x, u),
-            Verifiable::Verified(_) => panic!("wire decode must land in Unverified"),
-        }
+        assert!(!decoded.is_verified(), "wire decode must land Unverified");
+        assert_eq!(*decoded, u);
     }
 
     #[test]
     fn verifiable_equality_across_states() {
         let u: u32 = 42;
-        let unv: V = Verifiable::Unverified(u);
-        let ver: V = Verifiable::Verified(Verified::new_unchecked(u));
+        let unv: V = u.into();
+        let ver: V = Verified::new_unchecked(u).into();
         assert_eq!(unv, ver);
         assert_eq!(ver, unv);
 
-        let other_unv: V = Verifiable::Unverified(43);
+        let other_unv: V = 43u32.into();
         assert_ne!(unv, other_unv);
     }
 
-    /// `HashMap` lookup must find an entry inserted as `Unverified(t)` when
-    /// the query key is `Verified(v)` with the same underlying content,
-    /// and vice-versa. Underpins the cached-vs-incoming lookups in the
-    /// shard coordinator's verified-QC cache, which key off the raw
-    /// `block_hash` regardless of the candidate's current marker.
+    /// `HashMap` lookup must find an entry inserted as the unverified
+    /// state when the query key is in the verified state with the same
+    /// underlying content, and vice-versa. Underpins the
+    /// cached-vs-incoming lookups in the shard coordinator's verified-QC
+    /// cache, which key off the raw `block_hash` regardless of the
+    /// candidate's current marker.
     #[test]
     fn verifiable_hashmap_collision_across_states() {
         let u: u32 = 0xDEAD_BEEF;
 
-        let unv: V = Verifiable::Unverified(u);
-        let ver: V = Verifiable::Verified(Verified::new_unchecked(u));
+        let unv: V = u.into();
+        let ver: V = Verified::new_unchecked(u).into();
 
         let mut by_unverified: HashMap<V, &'static str> = HashMap::new();
         by_unverified.insert(unv.clone(), "inserted as unverified");
         assert_eq!(
             by_unverified.get(&ver),
             Some(&"inserted as unverified"),
-            "Verified key must find an entry inserted under the T-equivalent Unverified key"
+            "verified key must find an entry inserted under the T-equivalent unverified key"
         );
 
         let mut by_verified: HashMap<V, &'static str> = HashMap::new();
@@ -428,38 +441,37 @@ mod tests {
         assert_eq!(
             by_verified.get(&unv),
             Some(&"inserted as verified"),
-            "Unverified key must find an entry inserted under the T-equivalent Verified key"
+            "unverified key must find an entry inserted under the T-equivalent verified key"
         );
     }
 
     #[test]
     fn verifiable_from_raw_produces_unverified() {
-        let u: u32 = 99;
-        let v: V = u.into();
-        assert!(matches!(v, Verifiable::Unverified(99)));
+        let v: V = 99u32.into();
+        assert!(!v.is_verified());
+        assert_eq!(*v, 99);
     }
 
     #[test]
     fn verifiable_from_verified_produces_verified() {
         let v: V = Verified::new_unchecked(99u32).into();
-        assert!(matches!(v, Verifiable::Verified(_)));
-        match v {
-            Verifiable::Verified(inner) => assert_eq!(*inner, 99),
-            Verifiable::Unverified(_) => unreachable!(),
-        }
+        assert!(v.is_verified());
+        assert_eq!(*v, 99);
+        let inner = v.into_verified().expect("verified arm");
+        assert_eq!(*inner, 99);
     }
 
     #[test]
     fn upgrade_in_place_unverified_becomes_verified() {
-        let mut v: V = Verifiable::Unverified(123);
+        let mut v: V = 123u32.into();
         let r = v.upgrade_in_place(()).unwrap();
         assert_eq!(r.as_ref(), &123);
-        assert!(matches!(v, Verifiable::Verified(_)));
+        assert!(v.is_verified());
     }
 
     #[test]
     fn upgrade_in_place_verified_is_noop() {
-        let mut v: V = Verifiable::Verified(Verified::new_unchecked(7));
+        let mut v: V = Verified::new_unchecked(7u32).into();
         let r = v.upgrade_in_place(()).unwrap();
         assert_eq!(r.as_ref(), &7);
     }

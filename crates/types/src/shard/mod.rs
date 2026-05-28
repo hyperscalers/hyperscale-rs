@@ -142,17 +142,20 @@ mod tests {
                 Bls12381G2Signature([0u8; 96]),
                 SignerBitfield::new(4),
             ));
-            Arc::new(Verifiable::Unverified(FinalizedWave::new(
-                Arc::new(WaveCertificate::new(
-                    WaveId::new(
-                        ShardGroupId::new(0),
-                        BlockHeight::new(10),
-                        BTreeSet::from([ShardGroupId::new(1)]),
-                    ),
-                    vec![ec],
-                )),
-                vec![],
-            )))
+            Arc::new(
+                FinalizedWave::new(
+                    Arc::new(WaveCertificate::new(
+                        WaveId::new(
+                            ShardGroupId::new(0),
+                            BlockHeight::new(10),
+                            BTreeSet::from([ShardGroupId::new(1)]),
+                        ),
+                        vec![ec],
+                    )),
+                    vec![],
+                )
+                .into(),
+            )
         };
 
         let certs = vec![make_fw(1), make_fw(2)];
@@ -182,8 +185,7 @@ mod tests {
             vec![ec],
         ));
         let expected_receipt_hash = cert.receipt_hash();
-        let fw: Arc<Verifiable<FinalizedWave>> =
-            Arc::new(Verifiable::Unverified(FinalizedWave::new(cert, vec![])));
+        let fw: Arc<Verifiable<FinalizedWave>> = Arc::new(FinalizedWave::new(cert, vec![]).into());
 
         let root = Verified::<CertificateRoot>::compute(std::slice::from_ref(&fw)).into_inner();
         // Single cert: certificate_root should equal the cert's receipt_hash

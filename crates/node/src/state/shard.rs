@@ -65,7 +65,7 @@ use std::sync::Arc;
 use hyperscale_core::{Action, ProtocolEvent, TimerId};
 use hyperscale_types::{
     BlockHash, BlockHeader, BlockManifest, CertifiedBlock, MAX_FINALIZED_TX_PER_BLOCK,
-    MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, QuorumCertificate, Verifiable, Verified,
+    MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, QuorumCertificate, Verified,
 };
 
 use super::NodeStateMachine;
@@ -278,7 +278,7 @@ impl NodeStateMachine {
             |h| {
                 self.provisions_coordinator
                     .get_provisions_by_hash(*h)
-                    .map(|v| Arc::new(Verifiable::Verified((*v).clone())))
+                    .map(|v| Arc::new((*v).clone().into()))
             },
         )
     }

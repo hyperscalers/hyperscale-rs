@@ -620,7 +620,7 @@ mod tests {
     ) -> Block {
         let wrapped: Vec<Arc<Verifiable<FinalizedWave>>> = certificates
             .into_iter()
-            .map(|fw| Arc::new(Verifiable::Unverified((*fw).clone())))
+            .map(|fw| Arc::new((*fw).clone().into()))
             .collect();
         Block::Live {
             header: header_at_height(height, 100_000),
@@ -673,7 +673,7 @@ mod tests {
         let block = block_with_certificates(BlockHeight::new(6), vec![Arc::clone(&fw)]);
         let qc_chain = HashSet::new();
         let mut dedup_index = CommitDedupIndex::new();
-        let fw_verifiable = Arc::new(Verifiable::Unverified((*fw).clone()));
+        let fw_verifiable = Arc::new((*fw).clone().into());
         dedup_index.register_committed_certs(&[fw_verifiable]);
         let err = validate_no_duplicate_certificates(&block, &qc_chain, &dedup_index).unwrap_err();
         assert!(err.contains("already committed"));
@@ -686,7 +686,7 @@ mod tests {
     fn block_with_provisions(height: BlockHeight, provisions: Vec<Arc<Provisions>>) -> Block {
         let wrapped: Vec<Arc<Verifiable<Provisions>>> = provisions
             .into_iter()
-            .map(|p| Arc::new(Verifiable::Unverified((*p).clone())))
+            .map(|p| Arc::new((*p).clone().into()))
             .collect();
         Block::Live {
             header: header_at_height(height, 100_000),

@@ -294,7 +294,7 @@ impl Verified<CertifiedBlock> {
         }
         Ok(Self::new_unchecked(CertifiedBlock {
             block,
-            qc: Verifiable::Verified(qc),
+            qc: qc.into(),
         }))
     }
 
@@ -344,7 +344,7 @@ impl Verified<CertifiedBlock> {
         let CertifiedBlock { block, qc: _ } = certified;
         Ok(Self::new_unchecked(CertifiedBlock {
             block,
-            qc: Verifiable::Verified(qc),
+            qc: qc.into(),
         }))
     }
 
@@ -525,7 +525,7 @@ mod tests {
 
         let cb = CertifiedBlock {
             block: block.clone(),
-            qc: Verifiable::Verified(verified_qc),
+            qc: verified_qc.into(),
         };
         let verified_cb = Verified::<CertifiedBlock>::new_unchecked(cb);
 
@@ -558,7 +558,7 @@ mod tests {
 
         let cb = CertifiedBlock {
             block: block.clone(),
-            qc: Verifiable::Verified(verified_qc),
+            qc: verified_qc.into(),
         };
         let verified_cb = Verified::<CertifiedBlock>::new_unchecked(cb);
 

@@ -124,7 +124,7 @@ impl Verified<CommittedBlockHeader> {
         let header = header.into_inner();
         Ok(Self::new_unchecked(CommittedBlockHeader {
             header,
-            qc: Verifiable::Verified(qc),
+            qc: qc.into(),
         }))
     }
 
@@ -166,7 +166,7 @@ impl Verified<CommittedBlockHeader> {
         }
         Ok(Self::new_unchecked(CommittedBlockHeader {
             header,
-            qc: Verifiable::Verified(qc),
+            qc: qc.into(),
         }))
     }
 }

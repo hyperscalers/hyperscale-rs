@@ -126,13 +126,16 @@ fn commit_with(
             }),
             metadata: None,
         };
-        let new_fw = Arc::new(Verifiable::Unverified(FinalizedWave::new(
-            Arc::new(WaveCertificate::new(
-                WaveId::new(ShardGroupId::new(0), block.height(), BTreeSet::new()),
-                vec![],
-            )),
-            vec![receipt],
-        )));
+        let new_fw: Arc<Verifiable<FinalizedWave>> = Arc::new(
+            FinalizedWave::new(
+                Arc::new(WaveCertificate::new(
+                    WaveId::new(ShardGroupId::new(0), block.height(), BTreeSet::new()),
+                    vec![],
+                )),
+                vec![receipt],
+            )
+            .into(),
+        );
         match block {
             Block::Live {
                 header,

@@ -44,13 +44,13 @@ impl NodeStateMachine {
         );
         let finalized_waves = self.execution_coordinator.get_finalized_waves();
         // Provisions coordinator stores `Verified` internally; lift each
-        // batch into `Verifiable::Verified` so the marker survives across
-        // the proposal-build action.
+        // batch into the `Verifiable` transport shape so the marker
+        // survives across the proposal-build action.
         let provisions = self
             .provisions_coordinator
             .queued_provisions(self.now)
             .into_iter()
-            .map(|v| Arc::new(Verifiable::Verified((*v).clone())))
+            .map(|v| Arc::new((*v).clone().into()))
             .collect();
 
         ProposalInputs {

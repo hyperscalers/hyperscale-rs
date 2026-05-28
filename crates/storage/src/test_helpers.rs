@@ -17,8 +17,8 @@ use hyperscale_types::{
     LocalReceiptRoot, LogLevel, NodeId, PcQc2, PcQc3, PcSignerLengths, PcVector, PcXpProof,
     ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Randomness, Round, ShardGroupId,
     SignerBitfield, SpcCert, SpcView, StateRoot, StoredReceipt, TransactionRoot, TxHash, TxOutcome,
-    ValidatorId, Verifiable, Verified, WaveCertificate, WaveId, WeightedTimestamp,
-    compute_global_receipt_root, zero_bls_signature,
+    ValidatorId, Verified, WaveCertificate, WaveId, WeightedTimestamp, compute_global_receipt_root,
+    zero_bls_signature,
 };
 use indexmap::IndexMap;
 use radix_common::math::Decimal;
@@ -348,10 +348,7 @@ fn make_test_block_with_ecs(height: BlockHeight, ecs: Vec<Arc<ExecutionCertifica
         return block;
     }
     let certificate = Arc::new(WaveCertificate::new(ecs[0].wave_id().clone(), ecs));
-    let new_fw = Arc::new(Verifiable::Unverified(FinalizedWave::new(
-        certificate,
-        vec![],
-    )));
+    let new_fw = Arc::new(FinalizedWave::new(certificate, vec![]).into());
     match block {
         Block::Live {
             header,

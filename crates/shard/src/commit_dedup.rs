@@ -157,13 +157,16 @@ mod tests {
     }
 
     fn make_fw(height: u64) -> Arc<Verifiable<FinalizedWave>> {
-        Arc::new(Verifiable::Unverified(make_finalized_wave(
-            BlockHeight::new(height),
-            TxHash::from_raw(Hash::from_bytes(
-                &[u8::try_from(height).unwrap_or(u8::MAX); 32],
-            )),
-            TransactionDecision::Accept,
-        )))
+        Arc::new(
+            make_finalized_wave(
+                BlockHeight::new(height),
+                TxHash::from_raw(Hash::from_bytes(
+                    &[u8::try_from(height).unwrap_or(u8::MAX); 32],
+                )),
+                TransactionDecision::Accept,
+            )
+            .into(),
+        )
     }
 
     fn make_provisions(seed: u8) -> Arc<Provisions> {

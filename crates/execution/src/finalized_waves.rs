@@ -241,7 +241,7 @@ mod tests {
         // Lookups in this module only inspect the certificate's outcomes; an
         // empty receipts vector is fine for the store's contract.
         let verified = Verified::new_unchecked_for_test(FinalizedWave::new(Arc::new(cert), vec![]));
-        let fw = Arc::new(Verifiable::Verified(verified));
+        let fw = Arc::new(verified.into());
         (wave_id, fw)
     }
 

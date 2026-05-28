@@ -252,7 +252,7 @@ impl RocksDbShardStorage {
                 FinalizedWave::reconstruct(cert, |h| {
                     get::<ConsensusReceiptsCf>(&*self.db, consensus_cf, h.as_raw()).map(Arc::new)
                 })
-                .map(|fw| Arc::new(Verifiable::Unverified(fw)))
+                .map(|fw| Arc::new(fw.into()))
             })
             .collect();
         let Some(certificates) = certificates else {
@@ -385,7 +385,7 @@ impl RocksDbShardStorage {
                 FinalizedWave::reconstruct(cert, |h| {
                     get::<ConsensusReceiptsCf>(&*self.db, consensus_cf, h.as_raw()).map(Arc::new)
                 })
-                .map(|fw| Arc::new(Verifiable::Unverified(fw)))
+                .map(|fw| Arc::new(fw.into()))
             })
             .collect();
         let Some(certificates) = certificates else {

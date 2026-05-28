@@ -113,7 +113,7 @@ impl BlockHeader {
             // `Verified::<QuorumCertificate>::genesis` is the only path to a
             // verified genesis value (the predicate's signer check would
             // reject the zero-signers genesis bitfield).
-            parent_qc: Verifiable::Verified(Verified::<QuorumCertificate>::genesis(shard_group_id)),
+            parent_qc: Verified::<QuorumCertificate>::genesis(shard_group_id).into(),
             proposer,
             timestamp: ProposerTimestamp::ZERO,
             round: Round::INITIAL,
@@ -502,7 +502,7 @@ impl Verified<BlockHeader> {
             return Err(BlockHeaderParentQcMismatch);
         }
         let header = BlockHeader {
-            parent_qc: Verifiable::Verified(parent_qc),
+            parent_qc: parent_qc.into(),
             ..header
         };
         Ok(Self::new_unchecked(header))
@@ -620,7 +620,7 @@ mod tests {
     #[test]
     fn verify_rejects_unverified_parent_qc() {
         let mut header = sample_header();
-        header.parent_qc = Verifiable::Unverified(header.parent_qc.as_unverified().clone());
+        header.parent_qc = header.parent_qc.as_unverified().clone().into();
         let err = header
             .verify(())
             .expect_err("unverified parent_qc rejected");
@@ -633,7 +633,7 @@ mod tests {
     #[test]
     fn with_verified_parent_qc_upgrades_matching_header() {
         let mut header = sample_header();
-        header.parent_qc = Verifiable::Unverified(header.parent_qc.as_unverified().clone());
+        header.parent_qc = header.parent_qc.as_unverified().clone().into();
         let verified_qc = Verified::<QuorumCertificate>::genesis(header.shard_group_id());
         let verified = Verified::<BlockHeader>::with_verified_parent_qc(header, verified_qc)
             .expect("matching parent_qc accepted");

@@ -13,7 +13,7 @@ use hyperscale_test_helpers::{TestCommittee, certify, make_finalized_wave, make_
 use hyperscale_types::test_utils::test_transaction;
 use hyperscale_types::{
     BlockHeight, Hash, LocalTimestamp, ShardGroupId, TopologySnapshot, TransactionDecision,
-    TransactionStatus, TxHash, ValidatorId, Verifiable,
+    TransactionStatus, TxHash, ValidatorId,
 };
 
 fn test_topology() -> TopologySnapshot {
@@ -180,7 +180,7 @@ fn on_block_committed_with_finalized_wave_tombstones_and_evicts() {
         1_000,
         ValidatorId::new(0),
         vec![Arc::new(tx.clone())],
-        vec![Arc::new(Verifiable::Unverified(fw))],
+        vec![Arc::new(fw.into())],
     );
     coord.on_block_committed(&topology, &certify(block, 1_000));
 

@@ -1085,7 +1085,7 @@ impl ExecutionCoordinator {
         };
 
         vec![Action::VerifyExecutionCertificateSignature {
-            certificate: Verifiable::Unverified(cert),
+            certificate: cert.into(),
             public_keys,
         }]
     }
@@ -1635,9 +1635,7 @@ impl ExecutionCoordinator {
         // into the `Block::Live.certificates` transport shape once so the
         // store, the admission event, and any downstream `PendingBlock`
         // entry share the same `Arc` without further per-consumer cloning.
-        let finalized_arc = Arc::new(Verifiable::Verified(Verified::<FinalizedWave>::seal(
-            wave.into_finalized(),
-        )));
+        let finalized_arc = Arc::new(Verified::<FinalizedWave>::seal(wave.into_finalized()).into());
         self.finalized
             .insert(wave_id.clone(), Arc::clone(&finalized_arc));
 
@@ -1729,7 +1727,7 @@ impl ExecutionCoordinator {
             ec_public_keys.push(public_keys);
         }
         vec![Action::VerifyFinalizedWave {
-            wave: Arc::new(Verifiable::Unverified(Arc::unwrap_or_clone(wave))),
+            wave: Arc::new(Arc::unwrap_or_clone(wave).into()),
             ec_public_keys,
         }]
     }
@@ -1768,7 +1766,7 @@ impl ExecutionCoordinator {
         // Lift the verification result into the `Block::Live.certificates`
         // transport shape exactly once so the admission event and any
         // downstream pending-block storage share the same `Arc`.
-        let wave = Arc::new(Verifiable::Verified((*wave).clone()));
+        let wave = Arc::new((*wave).clone().into());
         vec![Action::Continuation(
             ProtocolEvent::FinalizedWavesAdmitted { waves: vec![wave] },
         )]
@@ -2951,9 +2949,7 @@ mod tests {
             Arc::new(WaveCertificate::new(wave_id.clone(), vec![ec])),
             vec![],
         );
-        let verifiable_wave = Arc::new(Verifiable::Verified(Verified::new_unchecked_for_test(
-            raw_wave.clone(),
-        )));
+        let verifiable_wave = Arc::new(Verified::new_unchecked_for_test(raw_wave.clone()).into());
         // Seed the canonical store directly (mirrors what `finalize_wave`
         // does on the local-aggregation path).
         state.finalized.insert(wave_id, verifiable_wave);

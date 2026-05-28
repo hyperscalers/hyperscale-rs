@@ -113,7 +113,7 @@ pub fn serve_block_request<S: ShardStorage>(
         .into_iter()
         .map(|(_, p)| {
             let raw = p.expect("missing entries handled above");
-            Arc::new(Verifiable::Unverified((*raw).clone()))
+            Arc::new((*raw).clone().into())
         })
         .collect();
 

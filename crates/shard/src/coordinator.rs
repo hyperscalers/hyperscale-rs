@@ -2861,7 +2861,7 @@ impl ShardCoordinator {
                     .unwrap_or_else(|| {
                         Verified::<FinalizedWave>::from_committed_block(fw.as_unverified().clone())
                     });
-                Arc::new(Verifiable::Verified(verified))
+                Arc::new(verified.into())
             })
             .collect();
         let parent_qc_height = block.header().parent_qc().height();

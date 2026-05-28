@@ -227,7 +227,7 @@ impl ElidedCertifiedBlock {
         };
 
         Self {
-            header: Verifiable::Unverified(header),
+            header: header.into(),
             qc,
             transactions: transactions.into(),
             certificates: certificates.into(),

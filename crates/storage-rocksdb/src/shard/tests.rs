@@ -418,17 +418,20 @@ fn push_wave(block: &mut Block, fw: Arc<Verifiable<FinalizedWave>>) {
 /// so the new `commit_block` (which derives receipts from `block.certificates`)
 /// can apply them.
 fn attach_receipts(block: &mut Block, receipts: Vec<StoredReceipt>) {
-    let new_fw = Arc::new(Verifiable::Unverified(FinalizedWave::new(
-        Arc::new(WaveCertificate::new(
-            WaveId::new(
-                ShardGroupId::new(0),
-                block.height(),
-                std::collections::BTreeSet::new(),
-            ),
-            vec![placeholder_local_ec(ShardGroupId::new(0), block.height())],
-        )),
-        receipts,
-    )));
+    let new_fw: Arc<Verifiable<FinalizedWave>> = Arc::new(
+        FinalizedWave::new(
+            Arc::new(WaveCertificate::new(
+                WaveId::new(
+                    ShardGroupId::new(0),
+                    block.height(),
+                    std::collections::BTreeSet::new(),
+                ),
+                vec![placeholder_local_ec(ShardGroupId::new(0), block.height())],
+            )),
+            receipts,
+        )
+        .into(),
+    );
     // Take block out, mutate, and put back.
     let taken = std::mem::replace(
         block,
@@ -551,13 +554,7 @@ fn test_commit_block_stores_certificates() {
 
     // Create a block that includes this certificate
     let block = make_test_block(BlockHeight::new(1));
-    let fw_certificates = Arc::new(
-        vec![Arc::new(Verifiable::Unverified(FinalizedWave::new(
-            cert,
-            vec![],
-        )))]
-        .into(),
-    );
+    let fw_certificates = Arc::new(vec![Arc::new(FinalizedWave::new(cert, vec![]).into())].into());
     let block = match block {
         Block::Live {
             header,
@@ -867,10 +864,13 @@ fn test_ec_survives_reopen() {
         let mut block = make_test_block(BlockHeight::new(1));
         push_wave(
             &mut block,
-            Arc::new(Verifiable::Unverified(FinalizedWave::new(
-                Arc::new(WaveCertificate::new(wave_id.clone(), vec![Arc::new(ec)])),
-                vec![],
-            ))),
+            Arc::new(
+                FinalizedWave::new(
+                    Arc::new(WaveCertificate::new(wave_id.clone(), vec![Arc::new(ec)])),
+                    vec![],
+                )
+                .into(),
+            ),
         );
         storage.commit_block(&make_test_certified(block), &no_witness());
     }
@@ -894,10 +894,13 @@ fn test_ec_atomic_with_block_commit() {
     let mut block = make_test_block(BlockHeight::new(1));
     push_wave(
         &mut block,
-        Arc::new(Verifiable::Unverified(FinalizedWave::new(
-            Arc::new(WaveCertificate::new(wave_id.clone(), vec![Arc::new(ec)])),
-            vec![],
-        ))),
+        Arc::new(
+            FinalizedWave::new(
+                Arc::new(WaveCertificate::new(wave_id.clone(), vec![Arc::new(ec)])),
+                vec![],
+            )
+            .into(),
+        ),
     );
     // Commit block with EC atomically
     storage.commit_block(&make_test_certified(block), &no_witness());
@@ -940,17 +943,20 @@ fn rocks_commit_with(
             }),
             metadata: None,
         };
-        let wave = Arc::new(Verifiable::Unverified(FinalizedWave::new(
-            Arc::new(WaveCertificate::new(
-                WaveId::new(
-                    ShardGroupId::new(0),
-                    block.height(),
-                    std::collections::BTreeSet::new(),
-                ),
-                vec![placeholder_local_ec(ShardGroupId::new(0), block.height())],
-            )),
-            vec![receipt],
-        )));
+        let wave = Arc::new(
+            FinalizedWave::new(
+                Arc::new(WaveCertificate::new(
+                    WaveId::new(
+                        ShardGroupId::new(0),
+                        block.height(),
+                        std::collections::BTreeSet::new(),
+                    ),
+                    vec![placeholder_local_ec(ShardGroupId::new(0), block.height())],
+                )),
+                vec![receipt],
+            )
+            .into(),
+        );
         push_wave(&mut block, wave);
     }
     // SAFETY: synthetic test fixture; round-trip tests don't exercise
