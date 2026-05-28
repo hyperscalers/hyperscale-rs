@@ -72,10 +72,11 @@ pub enum StateRootVerifyError {
 ///
 /// - [`<StateRoot as Verify>::verify`](Verify::verify) — runs the JMT
 ///   replay against [`StateRootContext::storage`] and compares.
-/// - [`Verified::<StateRoot, _>::new_unchecked_with`] — audit point.
-///   Used at storage-recovery sites where the root was verified before
+/// - [`Verified::<StateRoot, _>::new_unchecked_with`] — re-wraps a
+///   root whose predicate already held via an out-of-band trust
+///   source (storage-recovery, where the root was verified before
 ///   persistence and the prepared-commit handle has been re-derived
-///   from the persisted JMT. Every call site documents the trust
+///   from the persisted JMT). Every call site documents the trust
 ///   source with a `// SAFETY:` comment.
 impl<S: ShardChainWriter + SubstateStore> Verify<&StateRootContext<'_, S>> for StateRoot {
     type Augment = S::PreparedCommit;

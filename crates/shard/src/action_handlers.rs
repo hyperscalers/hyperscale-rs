@@ -15,19 +15,17 @@ use hyperscale_storage::{
 use hyperscale_types::network::gossip::CommittedBlockHeaderGossip;
 use hyperscale_types::network::notification::{BlockHeaderNotification, BlockVoteNotification};
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight,
-    BlockManifest, BlockVote, Bls12381G1PublicKey, CertificateRoot, CertificateRootContext,
-    CommittedHeaderVerifyError, ConsensusReceipt, FinalizedWave, Hash, InFlightCount,
-    LocalReceiptRoot, LocalReceiptRootContext, NetworkDefinition, ProposerTimestamp, ProvisionHash,
-    ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions, ProvisionsRoot,
+    BeaconWitnessLeafCount, BeaconWitnessRoot, BeaconWitnessRootContext, Block, BlockHash,
+    BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PublicKey, CertificateRoot,
+    CertificateRootContext, CommittedHeaderVerifyError, ConsensusReceipt, FinalizedWave, Hash,
+    InFlightCount, LocalReceiptRoot, LocalReceiptRootContext, NetworkDefinition, ProposerTimestamp,
+    ProvisionHash, ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions, ProvisionsRoot,
     ProvisionsRootContext, QcContext, QuorumCertificate, ReadySignal, Round, RoutableTransaction,
     ShardGroupId, StateRoot, StoredReceipt, TopologySnapshot, TransactionRoot,
     TransactionRootContext, ValidatorId, Verifiable, Verified, Verify, VotePower,
     WeightedTimestamp, block_header_message, block_vote_message, committed_block_header_message,
     compute_waves,
 };
-
-use crate::beacon_witnesses::BeaconWitnessRootContext;
 
 /// Result of QC verification and assembly.
 pub struct QcVerificationResult {
@@ -706,7 +704,7 @@ where
             timestamp,
             next_proposers,
         } => {
-            let vote = BlockVote::new(
+            let verified = Verified::<BlockVote>::sign_local(
                 ctx.topology_snapshot.network(),
                 block_hash,
                 ctx.topology_snapshot.local_shard(),
@@ -716,9 +714,6 @@ where
                 ctx.signing_key,
                 timestamp,
             );
-            // SAFETY: we just signed `vote` with our own key, so the
-            // BlockVote::verify predicate holds by construction.
-            let verified = Verified::<BlockVote>::new_unchecked(vote);
             let gossip = BlockVoteNotification::new(verified.clone());
             ctx.network.notify(&next_proposers, &gossip);
             // Feed our own signed vote back for local VoteSet tracking.

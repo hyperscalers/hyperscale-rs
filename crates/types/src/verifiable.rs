@@ -104,18 +104,35 @@ pub struct Verified<T, A = ()> {
 }
 
 impl<T, A> Verified<T, A> {
-    /// Audit-point constructor carrying an explicit augment. Skips the
-    /// predicate.
+    /// Construct a verified value with an explicit augment, without
+    /// running the predicate. The caller asserts the predicate holds
+    /// via an out-of-band trust source.
     ///
-    /// Permitted use sites: storage-recovery (value was verified before
-    /// persistence), `PendingAssembly` slot prefill (skipped or
-    /// previously-verified roots), and `build_qc_from_verified`-style
-    /// re-wraps of values assembled from already-verified inputs. Every
-    /// call site carries a `// SAFETY:` comment naming the trust source.
-    /// `grep new_unchecked` produces the audit list.
+    /// Production callers prefer named typed gates (`genesis`,
+    /// `from_persisted`, `assemble`, `from_external_qc`,
+    /// `from_pipeline_attestation`, …) — the gate's body delegates here
+    /// under a documented trust source. Direct callers outside
+    /// `crates/types` are limited to:
+    /// - [`Verify`] impls in downstream crates (e.g. `StateRoot` in
+    ///   `crates/storage`, per Decision 19 of the typestate plan),
+    ///   producing their typed output after the predicate check.
+    /// - Test fixtures via [`Self::new_unchecked_with_for_test`]
+    ///   (re-exported behind the `test-utils` feature).
+    ///
+    /// Every direct call site outside `crates/types` carries a
+    /// `// SAFETY:` comment naming the trust source.
     #[must_use]
     pub const fn new_unchecked_with(inner: T, augment: A) -> Self {
         Self { inner, augment }
+    }
+
+    /// Test-only [`Self::new_unchecked_with`]. Available behind
+    /// `#[cfg(test)]` inside `crates/types` and to downstream crates
+    /// that enable the `test-utils` feature.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub const fn new_unchecked_with_for_test(inner: T, augment: A) -> Self {
+        Self::new_unchecked_with(inner, augment)
     }
 
     /// Borrow the augmenting byproduct.
@@ -138,13 +155,20 @@ impl<T, A> Verified<T, A> {
 }
 
 impl<T> Verified<T, ()> {
-    /// Audit-point constructor for the witness form. Skips the predicate.
-    ///
-    /// Same audit policy as [`Self::new_unchecked_with`]; the witness
-    /// variant doesn't need an augment value.
+    /// Witness-form sibling of [`Self::new_unchecked_with`]; same trust
+    /// contract, no augment value.
     #[must_use]
     pub const fn new_unchecked(inner: T) -> Self {
         Self { inner, augment: () }
+    }
+
+    /// Test-only [`Self::new_unchecked`]. Available behind
+    /// `#[cfg(test)]` inside `crates/types` and to downstream crates
+    /// that enable the `test-utils` feature.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub const fn new_unchecked_for_test(inner: T) -> Self {
+        Self::new_unchecked(inner)
     }
 }
 

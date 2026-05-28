@@ -328,11 +328,11 @@ pub enum RoutableTransactionVerifyError {
 /// - [`<RoutableTransaction as Verify>::verify`](Verify::verify) — runs
 ///   Radix `prepare_and_validate` against the supplied
 ///   [`TransactionValidator`].
-/// - [`Verified::<RoutableTransaction>::new_unchecked`] — audit point.
-///   Used at storage-recovery boundaries (the transaction was validated
-///   before persistence) and by callers re-wrapping under an equivalent
-///   trust source. Every call site carries a `// SAFETY:` comment
-///   naming the trust source.
+/// - [`Verified::<RoutableTransaction>::new_unchecked`] — re-wraps a
+///   transaction whose predicate already held via an out-of-band trust
+///   source (storage-recovery, where the value was validated before
+///   persistence; equivalent-attestation paths). Every call site
+///   carries a `// SAFETY:` comment naming the trust source.
 impl Verify<&RoutableTransactionContext<'_>> for RoutableTransaction {
     type Augment = ();
     type Error = RoutableTransactionVerifyError;

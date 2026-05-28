@@ -227,12 +227,9 @@ where
         let storage = &self.io.storage;
         let height = storage.committed_height();
         let hash = storage.committed_hash();
-        // SAFETY: QCs only land in storage after verification at the
-        // shard-consensus admission boundary, so the recovery wrap
-        // doesn't need to re-verify.
         let qc = storage
             .latest_qc()
-            .map(Verified::<QuorumCertificate>::new_unchecked);
+            .map(Verified::<QuorumCertificate>::from_persisted);
         push_protocol_event(
             self.event_sender(),
             self.shard,

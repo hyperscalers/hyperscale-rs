@@ -87,11 +87,12 @@ use hyperscale_types::{
     ProvisionRootVerifyError, ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions,
     ProvisionsRoot, QcVerifyError, QuorumCertificate, Round, RoutableTransaction, StateRoot,
     TopologySnapshot, TransactionRoot, TxHash, TxRootVerifyError, Verifiable, Verified, VotePower,
+    derive_leaves, missed_proposals_since_prev_commit,
 };
 use tracing::field::Empty;
 use tracing::{debug, info, instrument, trace, warn};
 
-use crate::beacon_witnesses::{self, BeaconWitnessAccumulator};
+use crate::beacon_witnesses::BeaconWitnessAccumulator;
 use crate::block_sync::{
     BlockSyncHealthDecision, BlockSyncManager, BlockSyncVerificationResult, IngestOutcome,
 };
@@ -865,19 +866,15 @@ impl ShardCoordinator {
                 .collect(),
             ProposalKind::Fallback | ProposalKind::Sync => Vec::new(),
         };
-        let missed = beacon_witnesses::missed_proposals_since_prev_commit(
-            height,
-            parent_round,
-            round,
-            topology_snapshot,
-        );
+        let missed =
+            missed_proposals_since_prev_commit(height, parent_round, round, topology_snapshot);
         let ready_signals = self.ready_signal_pool.drain_eligible(
             height,
             self.now,
             MIN_READY_SIGNAL_DWELL,
             MAX_READY_SIGNALS_PER_BLOCK,
         );
-        let new_leaves = beacon_witnesses::derive_leaves(&receipts, &missed, &ready_signals);
+        let new_leaves = derive_leaves(&receipts, &missed, &ready_signals);
         let (beacon_witness_root, beacon_witness_leaf_count) =
             self.beacon_witness_accumulator.preview_append(&new_leaves);
 
@@ -2539,17 +2536,13 @@ impl ShardCoordinator {
             .iter()
             .flat_map(|fw| fw.receipts().iter().cloned())
             .collect();
-        let missed = beacon_witnesses::missed_proposals_since_prev_commit(
+        let missed = missed_proposals_since_prev_commit(
             height,
             parent_round,
             block.header().round(),
             topology_snapshot,
         );
-        let new_leaves = beacon_witnesses::derive_leaves(
-            &receipts,
-            &missed,
-            manifest.ready_signals().as_slice(),
-        );
+        let new_leaves = derive_leaves(&receipts, &missed, manifest.ready_signals().as_slice());
         let starting_leaf_index = self.beacon_witness_accumulator.leaf_count();
         self.beacon_witness_accumulator.commit_append(&new_leaves);
         let leaf_count_at_block_end = self.beacon_witness_accumulator.leaf_count();

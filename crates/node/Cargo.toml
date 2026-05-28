@@ -29,6 +29,7 @@ serde.workspace = true
 hyperscale-dispatch-sync.workspace = true
 hyperscale-storage-memory.workspace = true
 hyperscale-test-helpers.workspace = true
+hyperscale-types = { workspace = true, features = ["test-utils"] }
 
 [lints]
 workspace = true

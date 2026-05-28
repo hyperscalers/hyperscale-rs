@@ -188,10 +188,8 @@ pub enum BlockVoteVerifyError {
 /// - [`Verified::<BlockVote>::verify_batch`] — runs the same predicate
 ///   over a slice using the BLS same-message batch optimisation, with
 ///   individual-verify fallback when the batch fails.
-/// - [`Verified::<BlockVote>::new_unchecked`] — audit point. Used by
-///   own-vote paths where the local signer just produced the signature.
-///   Every call site carries a `// SAFETY:` comment naming the trust
-///   source.
+/// - [`Verified::<BlockVote>::sign_local`] — signs a fresh vote with
+///   the caller's key; the act of signing is the predicate witness.
 impl Verify<&BlockVoteContext<'_>> for BlockVote {
     type Augment = ();
     type Error = BlockVoteVerifyError;
@@ -206,6 +204,45 @@ impl Verify<&BlockVoteContext<'_>> for BlockVote {
 }
 
 impl Verified<BlockVote> {
+    /// Sign a fresh [`BlockVote`] with `signing_key` and return its
+    /// verified form.
+    ///
+    /// The predicate holds by construction: the BLS signature over the
+    /// canonical `block_vote_message` is produced from `signing_key`
+    /// inside this call, so any later
+    /// [`<BlockVote as Verify>::verify`](Verify::verify) call against
+    /// the matching public key would succeed. Used at proposer/voter
+    /// sites that need the verified value immediately for local-fast-
+    /// path consumers (e.g. echoing the signed vote back to the local
+    /// [`VoteSet`](crate::Verified)).
+    #[must_use]
+    #[allow(clippy::too_many_arguments)] // mirrors the 7 stored fields plus the network identity
+    pub fn sign_local(
+        network: &NetworkDefinition,
+        block_hash: BlockHash,
+        shard_group_id: ShardGroupId,
+        height: BlockHeight,
+        round: Round,
+        voter: ValidatorId,
+        signing_key: &Bls12381G1PrivateKey,
+        timestamp: ProposerTimestamp,
+    ) -> Self {
+        // SAFETY: the BLS signature is produced by `signing_key` over
+        // the canonical `block_vote_message`, which is exactly the
+        // `BlockVote::verify` predicate's check against this voter's
+        // matching pubkey.
+        Self::new_unchecked(BlockVote::new(
+            network,
+            block_hash,
+            shard_group_id,
+            height,
+            round,
+            voter,
+            signing_key,
+            timestamp,
+        ))
+    }
+
     /// Verify a slice of `(vote, pubkey)` pairs against a single
     /// `signing_message` using the BLS same-message batch optimisation.
     ///

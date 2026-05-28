@@ -485,22 +485,23 @@ impl VerificationPipeline {
         let beacon_done = self.is_root_verified(block_hash, VerificationKind::BeaconWitnessRoot);
         let state_done = self.is_state_root_verified(&block_hash);
 
-        // SAFETY: at this point the header's claim either equals the
-        // empty-input compute (skip case) or was already accepted by
-        // the verifier (verified-roots set).
-        let tx_root_result =
-            tx_done.then(|| Verified::<TransactionRoot>::new_unchecked(h.transaction_root()));
-        let certificate_root_result =
-            cert_done.then(|| Verified::<CertificateRoot>::new_unchecked(h.certificate_root()));
-        let local_receipt_root_result = receipt_done
-            .then(|| Verified::<LocalReceiptRoot>::new_unchecked(h.local_receipt_root()));
-        let provision_root_result =
-            provision_done.then(|| Verified::<ProvisionsRoot>::new_unchecked(h.provision_root()));
-        let provision_tx_roots_result = provision_tx_done.then(|| {
-            Verified::<ProvisionTxRootsMap>::new_unchecked(h.provision_tx_roots().clone())
+        let tx_root_result = tx_done
+            .then(|| Verified::<TransactionRoot>::from_pipeline_attestation(h.transaction_root()));
+        let certificate_root_result = cert_done
+            .then(|| Verified::<CertificateRoot>::from_pipeline_attestation(h.certificate_root()));
+        let local_receipt_root_result = receipt_done.then(|| {
+            Verified::<LocalReceiptRoot>::from_pipeline_attestation(h.local_receipt_root())
         });
-        let beacon_witness_root_result = beacon_done
-            .then(|| Verified::<BeaconWitnessRoot>::new_unchecked(h.beacon_witness_root()));
+        let provision_root_result = provision_done
+            .then(|| Verified::<ProvisionsRoot>::from_pipeline_attestation(h.provision_root()));
+        let provision_tx_roots_result = provision_tx_done.then(|| {
+            Verified::<ProvisionTxRootsMap>::from_pipeline_attestation(
+                h.provision_tx_roots().clone(),
+            )
+        });
+        let beacon_witness_root_result = beacon_done.then(|| {
+            Verified::<BeaconWitnessRoot>::from_pipeline_attestation(h.beacon_witness_root())
+        });
         let state_root_result = state_done.then_some(());
 
         self.pending_assemblies.insert(

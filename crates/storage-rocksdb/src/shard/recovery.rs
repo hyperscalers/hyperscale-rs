@@ -58,10 +58,7 @@ impl RocksDbShardStorage {
             "Loaded recovered state from storage"
         );
 
-        // SAFETY: QCs only land in storage after verification at the
-        // shard-consensus admission boundary, so recovery can rewrap
-        // with `new_unchecked` without re-verifying.
-        let latest_qc = latest_qc.map(Verified::<QuorumCertificate>::new_unchecked);
+        let latest_qc = latest_qc.map(Verified::<QuorumCertificate>::from_persisted);
 
         RecoveredState {
             committed_height,

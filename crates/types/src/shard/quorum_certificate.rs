@@ -267,6 +267,20 @@ impl Verified<QuorumCertificate> {
         Self::new_unchecked(QuorumCertificate::genesis(shard_group_id))
     }
 
+    /// Re-wrap a [`QuorumCertificate`] read out of persistent storage
+    /// as verified.
+    ///
+    /// QCs are persisted only after passing
+    /// [`<QuorumCertificate as Verify>::verify`](Verify::verify) at
+    /// admission, so re-reading them post-restart returns values whose
+    /// predicate already held at write-time. Callers in storage
+    /// adapters or recovery paths use this constructor; any other
+    /// caller is misusing it.
+    #[must_use]
+    pub const fn from_persisted(qc: QuorumCertificate) -> Self {
+        Self::new_unchecked(qc)
+    }
+
     /// Aggregate a verified vote set into a `Verified<QuorumCertificate>`.
     ///
     /// Sorts by committee index so the signer bitfield matches the order
@@ -371,10 +385,10 @@ impl Verified<QuorumCertificate> {
 ///   a typed-`Verified<BlockVote>` set into a verified QC. Per-vote
 ///   signatures are witnessed by the typed input; the caller supplies
 ///   the quorum precondition before invoking.
-/// - [`Verified::<QuorumCertificate>::new_unchecked`] — audit point.
-///   Used at storage-recovery boundaries where the QC was verified
-///   before persistence. Every call site carries a `// SAFETY:` comment
-///   naming the trust source.
+/// - [`Verified::<QuorumCertificate>::from_persisted`] — re-wraps a QC
+///   recovered from persistent storage. The trust source is that
+///   persistence runs only after [`<QuorumCertificate as Verify>::verify`](Verify::verify)
+///   accepted the QC at admission.
 impl Verify<&QcContext<'_>> for QuorumCertificate {
     type Augment = ();
     type Error = QcVerifyError;

@@ -106,10 +106,11 @@ pub use shard::limits::{
 pub use shard::manifest::{BlockManifest, BlockMetadata};
 pub use shard::quorum_certificate::{QcContext, QcVerifyError, QuorumCertificate};
 pub use shard::roots::{
-    BeaconWitnessRootVerifyError, CertRootVerifyError, CertificateRootContext,
-    LocalReceiptRootContext, LocalReceiptRootVerifyError, ProvisionRootVerifyError,
-    ProvisionTxRootsContext, ProvisionTxRootsMap, ProvisionTxRootsVerifyError,
-    ProvisionsRootContext, TransactionRootContext, TxRootVerifyError,
+    BeaconWitnessRootContext, BeaconWitnessRootVerifyError, CertRootVerifyError,
+    CertificateRootContext, LocalReceiptRootContext, LocalReceiptRootVerifyError,
+    ProvisionRootVerifyError, ProvisionTxRootsContext, ProvisionTxRootsMap,
+    ProvisionTxRootsVerifyError, ProvisionsRootContext, TransactionRootContext, TxRootVerifyError,
+    derive_leaves, missed_proposals_since_prev_commit,
 };
 pub use shard::vote::{BlockVote, BlockVoteContext, BlockVoteVerifyError};
 pub use shard::{
