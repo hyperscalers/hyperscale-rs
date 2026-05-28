@@ -9,6 +9,10 @@
 //! - [`roots`]: per-block merkle root helpers used by [`BlockHeader`] consumers.
 //! - [`limits`]: protocol-level caps on per-block payload sizes.
 //! - [`quorum_certificate`]: [`QuorumCertificate`] aggregating shard consensus votes.
+//! - [`storage_commit`]: type-erased [`PreparedCommit`](storage_commit::PreparedCommit)
+//!   closure, [`SyncHint`](storage_commit::SyncHint), and
+//!   [`BeaconWitnessCommit`](storage_commit::BeaconWitnessCommit) payload
+//!   threaded through shard block commits.
 
 #[allow(clippy::module_inception)]
 mod block;
@@ -20,6 +24,7 @@ pub mod limits;
 pub mod manifest;
 pub mod quorum_certificate;
 pub mod roots;
+pub mod storage_commit;
 pub mod vote;
 
 pub use block::{

@@ -20,7 +20,6 @@ mod primitives;
 mod provisioning;
 mod sbor_codec;
 mod signing;
-mod storage_commit;
 mod time;
 mod verifiable;
 
@@ -116,6 +115,7 @@ pub use shard::roots::{
     ProvisionTxRootsVerifyError, ProvisionsRootContext, StateRootContext, StateRootVerifyError,
     TransactionRootContext, TxRootVerifyError, derive_leaves, missed_proposals_since_prev_commit,
 };
+pub use shard::storage_commit::{BeaconWitnessCommit, PreparedCommit, SyncHint};
 pub use shard::vote::{BlockVote, BlockVoteContext, BlockVoteVerifyError};
 pub use shard::{
     Block, SharedCertificates, SharedProvisions, SharedTransactions, VerifiedBlockAssembleError,
@@ -131,7 +131,6 @@ pub use signing::{
     skip_request_message, spc_context, state_provisions_message, validator_bind_message,
     vrf_output_from_proof, vrf_reveal_message, vrf_sign, vrf_verify,
 };
-pub use storage_commit::{BeaconWitnessCommit, PreparedCommit, SyncHint};
 pub use time::limits::{MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH};
 pub use time::range::{MAX_VALIDITY_RANGE, TimestampRange};
 pub use time::timeouts::{

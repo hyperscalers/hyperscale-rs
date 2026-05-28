@@ -17,8 +17,7 @@
 
 use thiserror::Error;
 
-use crate::storage_commit::PreparedCommit;
-use crate::{StateRoot, Verified, Verify};
+use crate::{PreparedCommit, StateRoot, Verified, Verify};
 
 /// Inputs the [`StateRoot`] verifier checks against.
 ///
