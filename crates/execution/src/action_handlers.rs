@@ -25,10 +25,9 @@ use hyperscale_types::network::notification::{
 use hyperscale_types::{
     Bls12381G1PublicKey, Bls12381G2Signature, ExecutionCertificate, ExecutionVote,
     GlobalReceiptRoot, NetworkDefinition, NodeId, RoutableTransaction, ShardGroupId,
-    SignerBitfield, StoredReceipt, ValidatorId, VotePower, WaveId, WeightedTimestamp,
-    batch_verify_bls_same_message, compute_global_receipt_root, exec_cert_batch_message,
-    exec_vote_batch_message, exec_vote_message, shard_for_node, verify_bls12381_v1,
-    zero_bls_signature,
+    SignerBitfield, StoredReceipt, ValidatorId, Verified, VotePower, WaveId, WeightedTimestamp,
+    compute_global_receipt_root, exec_cert_batch_message, exec_vote_batch_message,
+    exec_vote_message, shard_for_node, verify_bls12381_v1, zero_bls_signature,
 };
 
 // ============================================================================
@@ -114,79 +113,16 @@ pub fn aggregate_execution_certificate(
     )
 }
 
-/// Batch verify execution votes.
-///
-/// Uses BLS same-message batch verification since all votes in a wave
-/// should sign the same message (same `global_receipt_root`). Falls back to
-/// individual verification on batch failure.
-///
-/// Drops votes whose `tx_outcomes` don't hash to the claimed
-/// `global_receipt_root` before signature verification — the BLS signature
-/// covers `(root, tx_count)` but not the unsigned outcomes payload, so a
-/// vote that signs an honest root while shipping tampered outcomes is
-/// self-inconsistent. Filtering at intake (rather than defending at
-/// aggregation) keeps the bucket invariant tight: every verified vote has
-/// outcomes that produce its claimed root.
-///
-/// Returns an iterator of `(vote, voting_power)` for verified votes.
+/// Batch-verify execution votes and yield each surviving raw vote
+/// paired with its voting power. See
+/// [`Verified::<ExecutionVote>::verify_batch`] for the predicate.
 pub fn batch_verify_execution_votes(
     network: &NetworkDefinition,
     votes: Vec<(ExecutionVote, Bls12381G1PublicKey, VotePower)>,
 ) -> impl Iterator<Item = (ExecutionVote, VotePower)> {
-    let votes: Vec<_> = votes
+    Verified::<ExecutionVote>::verify_batch(network, votes)
         .into_iter()
-        .filter(|(v, _, _)| compute_global_receipt_root(v.tx_outcomes()) == v.global_receipt_root())
-        .collect();
-
-    if votes.is_empty() {
-        return Vec::new().into_iter();
-    }
-
-    // Group by signing message (all votes for same wave should share one)
-    let mut by_message: HashMap<Vec<u8>, Vec<(ExecutionVote, Bls12381G1PublicKey, VotePower)>> =
-        HashMap::new();
-    for (vote, pk, power) in votes {
-        let msg = exec_vote_message(
-            network,
-            vote.vote_anchor_ts(),
-            vote.wave_id(),
-            vote.shard_group_id(),
-            &vote.global_receipt_root(),
-            vote.tx_count(),
-        );
-        by_message.entry(msg).or_default().push((vote, pk, power));
-    }
-
-    let mut verified: Vec<(ExecutionVote, VotePower)> = Vec::new();
-
-    for (message, group) in by_message {
-        if group.len() >= 2 {
-            let signatures: Vec<_> = group.iter().map(|(v, _, _)| v.signature()).collect();
-            let pubkeys: Vec<_> = group.iter().map(|(_, pk, _)| *pk).collect();
-
-            if batch_verify_bls_same_message(&message, &signatures, &pubkeys) {
-                for (vote, _, power) in group {
-                    verified.push((vote, power));
-                }
-            } else {
-                // Batch failed — verify individually
-                for (vote, pk, power) in group {
-                    if verify_bls12381_v1(&message, &pk, &vote.signature()) {
-                        verified.push((vote, power));
-                    }
-                }
-            }
-        } else {
-            // Single vote — verify directly
-            for (vote, pk, power) in group {
-                if verify_bls12381_v1(&message, &pk, &vote.signature()) {
-                    verified.push((vote, power));
-                }
-            }
-        }
-    }
-
-    verified.into_iter()
+        .map(|(v, power)| (v.into_inner(), power))
 }
 
 /// Verify an execution certificate's aggregated signature.
