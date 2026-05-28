@@ -2860,14 +2860,7 @@ impl ShardCoordinator {
                 .as_ref()
                 .is_none_or(|existing| parent_qc_height > existing.height())
         {
-            // SAFETY: `verified_qc` certifies this synced block, and
-            // BFT pairing guarantees `qc.block_hash == block.hash`. The
-            // header's `parent_qc` is the signed-over evidence that the
-            // parent committed under the same chain, so a peer that
-            // produced a verifying QC over this block also vouches for
-            // the parent_qc it contains.
-            let parent_qc_raw = certified.block().header().parent_qc().clone();
-            let verified_parent = Verified::<QuorumCertificate>::new_unchecked(parent_qc_raw);
+            let verified_parent = certified.parent_qc_attested();
             self.maybe_unlock_for_qc(topology_snapshot, verified_parent.as_ref());
             self.latest_qc = Some(verified_parent);
         }

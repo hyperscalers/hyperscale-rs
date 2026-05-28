@@ -297,6 +297,31 @@ impl Verified<CertifiedBlock> {
             .expect("Verified<CertifiedBlock> predicate guarantees qc is Verified")
     }
 
+    /// Synthesize a verified `parent_qc` via the BFT-transitive trust of
+    /// this descendant's verified QC.
+    ///
+    /// The descendant's QC signs over `block.hash()`, which is derived
+    /// from header content that includes the `parent_qc` field. The
+    /// `Verified<CertifiedBlock>` predicate asserts at least 2f+1 of the
+    /// source committee signed that bundle, so at least one honest
+    /// signer verified `parent_qc` before voting. Same trust shape as
+    /// [`Self::from_external_qc`] but applied to the embedded parent
+    /// rather than the block-level QC.
+    ///
+    /// Returns the wrapped `parent_qc` regardless of whether it's
+    /// genesis or signed — for genesis the result is byte-equal to
+    /// [`Verified::<QuorumCertificate>::genesis`] for the same shard.
+    /// Callers wanting only the signed case should pre-check
+    /// `parent_qc().is_genesis()`.
+    #[must_use]
+    pub fn parent_qc_attested(&self) -> Verified<QuorumCertificate> {
+        // SAFETY: the descendant's verified QC's signers attested to the
+        // descendant's block content, which binds `parent_qc` by hash.
+        // At least one honest signer ran the parent QC verifier before
+        // voting; BFT-transitive trust.
+        Verified::<QuorumCertificate>::new_unchecked(self.block().header().parent_qc().clone())
+    }
+
     /// Consume into a verified-`Block` + verified-QC pair. Total by the
     /// [`Verified<CertifiedBlock>`] predicate.
     #[must_use]
@@ -440,5 +465,35 @@ mod tests {
         let (vb, vq) = verified_cb.into_verified_parts();
         assert_eq!(vq.block_hash(), qc_borrow_hash);
         assert_eq!(vb.hash(), block.hash());
+    }
+
+    /// `parent_qc_attested` returns the descendant's `parent_qc` wrapped as
+    /// verified — byte-equal to whatever the header carries.
+    #[test]
+    fn parent_qc_attested_returns_header_parent_qc() {
+        let block = Block::genesis(ShardGroupId::new(0), ValidatorId::new(0), StateRoot::ZERO);
+        let block_hash = block.hash();
+        let raw_qc = QuorumCertificate::genesis(ShardGroupId::new(0));
+        let qc_for_block = QuorumCertificate::new(
+            block_hash,
+            raw_qc.shard_group_id(),
+            raw_qc.height(),
+            raw_qc.parent_block_hash(),
+            raw_qc.round(),
+            raw_qc.signers().clone(),
+            raw_qc.aggregated_signature(),
+            raw_qc.weighted_timestamp(),
+        );
+        // SAFETY: synthetic test fixture, no real signature.
+        let verified_qc = Verified::<QuorumCertificate>::new_unchecked(qc_for_block);
+
+        let cb = CertifiedBlock {
+            block: block.clone(),
+            qc: Verifiable::Verified(verified_qc),
+        };
+        let verified_cb = Verified::<CertifiedBlock>::new_unchecked(cb);
+
+        let attested = verified_cb.parent_qc_attested();
+        assert_eq!(attested.as_ref(), block.header().parent_qc());
     }
 }
