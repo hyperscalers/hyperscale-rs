@@ -119,6 +119,7 @@ pub use shard::storage_commit::{BeaconWitnessCommit, PreparedCommit, SyncHint};
 pub use shard::vote::{BlockVote, BlockVoteContext, BlockVoteVerifyError};
 pub use shard::{
     Block, SharedCertificates, SharedProvisions, SharedTransactions, VerifiedBlockAssembleError,
+    shared_transactions_from_raw,
 };
 pub use signing::{
     DOMAIN_BLOCK_HEADER, DOMAIN_BLOCK_VOTE, DOMAIN_COMMITTED_BLOCK_HEADER, DOMAIN_EXEC_CERT_BATCH,

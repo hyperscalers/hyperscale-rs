@@ -63,7 +63,10 @@ impl CommitDedupIndex {
 
     /// Record a block's transactions in the retention lookup. Each entry's
     /// stored value is the tx's `validity_range.end_timestamp_exclusive`.
-    pub fn register_committed_txs(&mut self, transactions: &[Arc<RoutableTransaction>]) {
+    pub fn register_committed_txs(
+        &mut self,
+        transactions: &[Arc<Verifiable<RoutableTransaction>>],
+    ) {
         for tx in transactions {
             let tx_hash = tx.hash();
             let end = tx.validity_range().end_timestamp_exclusive;
@@ -147,13 +150,15 @@ mod tests {
     use super::*;
 
     /// Build a test tx whose `validity_range.end_timestamp_exclusive == end_ms`.
-    fn tx_with_end(seed: u8, end_ms: u64) -> Arc<RoutableTransaction> {
+    fn tx_with_end(seed: u8, end_ms: u64) -> Arc<Verifiable<RoutableTransaction>> {
         let notarized = test_notarized_transaction_v1(&[seed]);
         let range = TimestampRange::new(
             WeightedTimestamp::ZERO,
             WeightedTimestamp::from_millis(end_ms),
         );
-        Arc::new(routable_from_notarized_v1(notarized, range).expect("valid notarized fixture"))
+        Arc::new(Verifiable::from(
+            routable_from_notarized_v1(notarized, range).expect("valid notarized fixture"),
+        ))
     }
 
     fn make_fw(height: u64) -> Arc<Verifiable<FinalizedWave>> {

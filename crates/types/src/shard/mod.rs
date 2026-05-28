@@ -29,6 +29,7 @@ pub mod vote;
 
 pub use block::{
     Block, SharedCertificates, SharedProvisions, SharedTransactions, VerifiedBlockAssembleError,
+    shared_transactions_from_raw,
 };
 
 #[cfg(test)]
@@ -106,7 +107,9 @@ mod tests {
         let network = NetworkDefinition::simulator();
         let key = generate_ed25519_keypair();
         let notarized = sign_and_notarize(manifest, &network, 1, &key).unwrap();
-        let tx = Arc::new(routable_from_notarized_v1(notarized, test_validity_range()).unwrap());
+        let tx = Arc::new(Verifiable::from(
+            routable_from_notarized_v1(notarized, test_validity_range()).unwrap(),
+        ));
 
         let root1 = Verified::<TransactionRoot>::compute(std::slice::from_ref(&tx)).into_inner();
         let root2 = Verified::<TransactionRoot>::compute(std::slice::from_ref(&tx)).into_inner();

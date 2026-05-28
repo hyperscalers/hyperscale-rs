@@ -131,7 +131,7 @@ impl PendingBlocks {
         header: BlockHeader,
         manifest: BlockManifest,
         now: LocalTimestamp,
-        lookup_tx: impl Fn(&TxHash) -> Option<Arc<RoutableTransaction>>,
+        lookup_tx: impl Fn(&TxHash) -> Option<Arc<Verifiable<RoutableTransaction>>>,
         lookup_finalized_wave: impl Fn(&WaveId) -> Option<Arc<Verifiable<FinalizedWave>>>,
         lookup_provision: impl Fn(&ProvisionHash) -> Option<Arc<Verifiable<Provisions>>>,
     ) {
@@ -139,7 +139,7 @@ impl PendingBlocks {
 
         // Borrow the manifest only long enough to collect locally-available
         // Arcs, releasing it before the mutable `add_*` calls below.
-        let txs: Vec<Arc<RoutableTransaction>> = pending
+        let txs: Vec<Arc<Verifiable<RoutableTransaction>>> = pending
             .manifest()
             .tx_hashes()
             .iter()
@@ -218,7 +218,10 @@ impl PendingBlocks {
 
     /// Record an arrived transaction against any pending block that needs it.
     /// Returns the hashes of blocks that became complete as a result.
-    pub fn receive_transaction(&mut self, tx: &Arc<RoutableTransaction>) -> Vec<BlockHash> {
+    pub fn receive_transaction(
+        &mut self,
+        tx: &Arc<Verifiable<RoutableTransaction>>,
+    ) -> Vec<BlockHash> {
         let tx_hash = tx.hash();
         self.fold_arrival(
             |pending| pending.needs_transaction(&tx_hash),
@@ -363,8 +366,8 @@ pub struct PendingBlock {
     /// Block contents manifest (transaction hashes, certificates, etc.)
     manifest: BlockManifest,
 
-    /// Map of transaction hash -> Arc<RoutableTransaction> (for received transactions).
-    received_transactions: HashMap<TxHash, Arc<RoutableTransaction>>,
+    /// Map of transaction hash -> Arc<Verifiable<RoutableTransaction>> (for received transactions).
+    received_transactions: HashMap<TxHash, Arc<Verifiable<RoutableTransaction>>>,
 
     /// Set of transaction hashes we're still waiting for (`HashSet` for O(1) lookup).
     missing_transaction_hashes: HashSet<TxHash>,
@@ -481,7 +484,7 @@ impl PendingBlock {
     /// Add a received transaction.
     ///
     /// Returns true if this transaction was needed, false if duplicate or not in this block.
-    pub fn add_transaction(&mut self, tx: Arc<RoutableTransaction>) -> bool {
+    pub fn add_transaction(&mut self, tx: Arc<Verifiable<RoutableTransaction>>) -> bool {
         let hash = tx.hash();
         if self.missing_transaction_hashes.remove(&hash) {
             self.received_transactions.insert(hash, tx);
@@ -591,7 +594,7 @@ impl PendingBlock {
         }
 
         // Build transactions in the ORIGINAL order from the gossip message.
-        let transactions: Vec<Arc<RoutableTransaction>> = self
+        let transactions: Vec<Arc<Verifiable<RoutableTransaction>>> = self
             .manifest
             .tx_hashes()
             .iter()
@@ -790,7 +793,7 @@ mod tests {
 
     #[test]
     fn test_block_needs_transactions_and_waves() {
-        let tx = Arc::new(test_transaction(1));
+        let tx = Arc::new(Verifiable::from(test_transaction(1)));
         let tx_hash = tx.hash();
         let wave_id = WaveId::new(ShardGroupId::new(0), BlockHeight::new(1), BTreeSet::new());
         let header = make_header(BlockHeight::new(1));

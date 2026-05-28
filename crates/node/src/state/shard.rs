@@ -65,7 +65,7 @@ use std::sync::Arc;
 use hyperscale_core::{Action, ProtocolEvent, TimerId};
 use hyperscale_types::{
     BlockHash, BlockHeader, BlockManifest, CertifiedBlock, MAX_FINALIZED_TX_PER_BLOCK,
-    MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, QuorumCertificate, Verified,
+    MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, QuorumCertificate, Verifiable, Verified,
 };
 
 use super::NodeStateMachine;
@@ -273,7 +273,11 @@ impl NodeStateMachine {
             &self.topology_snapshot,
             header,
             manifest,
-            |h| self.mempool_coordinator.get_transaction(h),
+            |h| {
+                self.mempool_coordinator
+                    .get_transaction(h)
+                    .map(|tx| Arc::new(Verifiable::from((*tx).clone())))
+            },
             |id| self.execution_coordinator.get_finalized_wave(id),
             |h| {
                 self.provisions_coordinator

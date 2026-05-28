@@ -176,7 +176,7 @@ fn build_prepared_commit(
 
             let mut c = write_or_recover(&storage.consensus);
             for tx in block.transactions().iter() {
-                c.transactions.insert(tx.hash(), tx.as_ref().clone());
+                c.transactions.insert(tx.hash(), (***tx).clone());
             }
             c.blocks.insert(block.height(), unwrapped);
             for fw in block.certificates().iter() {
@@ -278,7 +278,7 @@ impl SimShardStorage {
         {
             let mut c = write_or_recover(&self.consensus);
             for tx in block.transactions().iter() {
-                c.transactions.insert(tx.hash(), tx.as_ref().clone());
+                c.transactions.insert(tx.hash(), (***tx).clone());
             }
             // SAFETY: sync-path commit; certified value is already
             // verified upstream.

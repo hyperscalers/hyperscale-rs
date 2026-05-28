@@ -410,7 +410,7 @@ fn test_transactions_batch_with_indexed_block() {
     let storage = SimShardStorage::new();
     let block = make_test_block(BlockHeight::new(1));
 
-    let tx = Arc::new(test_transaction(42));
+    let tx = Arc::new(Verifiable::from(test_transaction(42)));
     let tx_hash = tx.hash();
     let block = match block {
         Block::Live {

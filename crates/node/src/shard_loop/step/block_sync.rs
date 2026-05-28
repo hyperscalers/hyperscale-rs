@@ -49,7 +49,8 @@ use hyperscale_types::network::response::GetBlockResponse;
 use hyperscale_types::{BeaconWitnessLeafCount, BeaconWitnessRoot};
 use hyperscale_types::{
     BlockHeight, CertificateRoot, CertifiedBlock, ElidedCertifiedBlock, Hash, Inventory,
-    LocalReceiptRoot, ProvisionsRoot, RehydrateError, StoredReceipt, TransactionRoot, Verified,
+    LocalReceiptRoot, ProvisionsRoot, RehydrateError, StoredReceipt, TransactionRoot, Verifiable,
+    Verified,
 };
 
 use crate::shard_io::sync::SyncOutput;
@@ -280,7 +281,12 @@ where
     ) -> Result<CertifiedBlock, RehydrateError> {
         let caches = &self.io.caches;
         elided.try_rehydrate(
-            |h| caches.tx_store.get(h),
+            |h| {
+                caches
+                    .tx_store
+                    .get(h)
+                    .map(|tx| Arc::new(Verifiable::from((*tx).clone())))
+            },
             |id| caches.finalized_wave_store.get(id),
             // `provision_store` holds raw bodies; lift into the unverified
             // transport shape — the wave-cert linkage gates trust on the
@@ -649,7 +655,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_transaction_root_mismatch() {
-        let tx = Arc::new(test_transaction(1));
+        let tx = Arc::new(Verifiable::from(test_transaction(1)));
         let h = header_with_roots(&header(), Some(TransactionRoot::ZERO), None, None); // canonical would be non-zero
         let block = Block::Live {
             header: h,
@@ -667,7 +673,7 @@ mod tests {
 
     #[test]
     fn validate_passes_when_transaction_root_matches() {
-        let tx = Arc::new(test_transaction(1));
+        let tx = Arc::new(Verifiable::from(test_transaction(1)));
         let h = header_with_roots(
             &header(),
             Some(Verified::<TransactionRoot>::compute(std::slice::from_ref(&tx)).into_inner()),

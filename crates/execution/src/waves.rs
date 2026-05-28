@@ -397,7 +397,7 @@ mod tests {
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
         BlockHash, BlockHeight, ExecutionOutcome, GlobalReceiptHash, Hash, ShardGroupId,
-        SignerBitfield, zero_bls_signature,
+        SignerBitfield, Verifiable, zero_bls_signature,
     };
     use proptest::collection::vec as prop_vec;
 
@@ -416,7 +416,7 @@ mod tests {
     }
 
     fn make_wave_state(wave_id: WaveId, block_hash: BlockHash, tx_seed: u8) -> WaveState {
-        let tx = Arc::new(test_transaction(tx_seed));
+        let tx = Arc::new(Verifiable::from(test_transaction(tx_seed)));
         let mut participating = BTreeSet::new();
         participating.insert(shard());
         WaveState::new(wave_id, block_hash, ms(0), vec![(tx, participating)], true)

@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::{
     BoundedBTreeMap, Hash, MAX_REMOTE_SHARDS_PER_WAVE, ProvisionTxRoot, RoutableTransaction,
-    ShardGroupId, TopologySnapshot, Verified, Verify, compute_merkle_root,
+    ShardGroupId, TopologySnapshot, Verifiable, Verified, Verify, compute_merkle_root,
 };
 
 /// Inputs the provision-tx-roots verifier reads against.
@@ -17,7 +17,7 @@ pub struct ProvisionTxRootsContext<'a> {
     /// shards each cross-shard tx contributes to.
     pub topology: &'a TopologySnapshot,
     /// The block's transactions in block order.
-    pub transactions: &'a [Arc<RoutableTransaction>],
+    pub transactions: &'a [Arc<Verifiable<RoutableTransaction>>],
 }
 
 /// Provision-tx roots map type as carried by [`BlockHeader`](crate::BlockHeader).
@@ -67,7 +67,10 @@ impl Verified<ProvisionTxRootsMap> {
     /// entries — that would require a single block to fan out across
     /// more shards than the consensus configuration allows.
     #[must_use]
-    pub fn compute(topology: &TopologySnapshot, transactions: &[Arc<RoutableTransaction>]) -> Self {
+    pub fn compute(
+        topology: &TopologySnapshot,
+        transactions: &[Arc<Verifiable<RoutableTransaction>>],
+    ) -> Self {
         let local_shard = topology.local_shard();
         let mut per_target: BTreeMap<ShardGroupId, Vec<Hash>> = BTreeMap::new();
 

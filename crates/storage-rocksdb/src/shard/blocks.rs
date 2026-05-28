@@ -268,6 +268,10 @@ impl RocksDbShardStorage {
         // along so sync-serving glue can re-attach bodies from the
         // in-memory cache when a requester is still within the
         // execution window.
+        let transactions: Vec<Arc<Verifiable<RoutableTransaction>>> = transactions
+            .into_iter()
+            .map(|tx| Arc::new(Verifiable::from((*tx).clone())))
+            .collect();
         let block = Block::Sealed {
             header,
             transactions: Arc::new(transactions.into()),
@@ -404,6 +408,10 @@ impl RocksDbShardStorage {
         // can attach bodies from the in-memory cache when the requester
         // needs them.
         let provision_hashes_bounded = manifest.provision_hashes().clone();
+        let transactions: Vec<Arc<Verifiable<RoutableTransaction>>> = transactions
+            .into_iter()
+            .map(|tx| Arc::new(Verifiable::from((*tx).clone())))
+            .collect();
         let block = Block::Sealed {
             header,
             transactions: Arc::new(transactions.into()),

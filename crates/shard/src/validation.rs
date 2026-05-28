@@ -20,8 +20,8 @@ use std::sync::Arc;
 use hyperscale_types::{BeaconWitnessLeafCount, BeaconWitnessRoot};
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, LocalTimestamp, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH,
-    ProvisionHash, QuorumCertificate, RoutableTransaction, TopologySnapshot, TxHash, VotePower,
-    WaveId, compute_waves,
+    ProvisionHash, QuorumCertificate, RoutableTransaction, TopologySnapshot, TxHash, Verifiable,
+    VotePower, WaveId, compute_waves,
 };
 
 use crate::commit_dedup::CommitDedupIndex;
@@ -289,7 +289,10 @@ pub fn validate_block_for_vote(
 
 /// Verify that a list of transactions is sorted by hash in strict ascending
 /// order. `section` is used in the error message for diagnostics.
-fn verify_hash_sorted(txs: &[Arc<RoutableTransaction>], section: &str) -> Result<(), String> {
+fn verify_hash_sorted(
+    txs: &[Arc<Verifiable<RoutableTransaction>>],
+    section: &str,
+) -> Result<(), String> {
     for window in txs.windows(2) {
         if window[0].hash() >= window[1].hash() {
             return Err(format!(
@@ -520,7 +523,7 @@ mod tests {
 
     fn block_with_transactions(
         height: BlockHeight,
-        transactions: Vec<Arc<RoutableTransaction>>,
+        transactions: Vec<Arc<Verifiable<RoutableTransaction>>>,
     ) -> Block {
         Block::Live {
             header: header_at_height(height, 100_000),
@@ -530,11 +533,11 @@ mod tests {
         }
     }
 
-    fn tx(seed: u8) -> Arc<RoutableTransaction> {
-        Arc::new(test_utils::test_transaction(seed))
+    fn tx(seed: u8) -> Arc<Verifiable<RoutableTransaction>> {
+        Arc::new(Verifiable::from(test_utils::test_transaction(seed)))
     }
 
-    fn sorted_txs(seeds: &[u8]) -> Vec<Arc<RoutableTransaction>> {
+    fn sorted_txs(seeds: &[u8]) -> Vec<Arc<Verifiable<RoutableTransaction>>> {
         let mut txs: Vec<_> = seeds.iter().map(|&s| tx(s)).collect();
         txs.sort_by_key(|t| t.hash());
         txs
