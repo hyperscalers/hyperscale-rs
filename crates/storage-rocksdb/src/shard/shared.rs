@@ -18,7 +18,7 @@ use hyperscale_storage::{
     ShardChainReader, ShardChainWriter, SubstateDatabase, SubstateStore, VersionedStore,
 };
 use hyperscale_types::{
-    BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, CertifiedBlock, CommittedBlockHeader,
+    BeaconWitnessLeafCount, BlockHash, BlockHeight, CertifiedBlock, CommittedBlockHeader,
     ConsensusReceipt, ExecutionCertificate, FinalizedWave, MerkleInclusionProof, NodeId,
     QuorumCertificate, RoutableTransaction, ShardWitnessPayload, StateRoot, TxHash, Verified,
     WaveCertificate, WaveId,
@@ -175,11 +175,10 @@ impl ShardChainWriter for SharedStorage {
 
     fn commit_block(
         &self,
-        block: &Arc<Block>,
-        qc: &Arc<Verified<QuorumCertificate>>,
+        certified: &Arc<Verified<CertifiedBlock>>,
         witness: &BeaconWitnessCommit,
     ) -> StateRoot {
-        self.0.commit_block(block, qc, witness)
+        self.0.commit_block(certified, witness)
     }
 
     fn memory_usage_bytes(&self) -> (u64, u64) {

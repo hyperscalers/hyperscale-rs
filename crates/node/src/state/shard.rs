@@ -101,16 +101,9 @@ impl NodeStateMachine {
                     .on_ready_signal_received(&self.topology_snapshot, signal);
                 Vec::new()
             }
-            ProtocolEvent::BlockReadyToCommit {
-                block_hash,
-                qc,
-                source,
-            } => self.shard_coordinator.on_block_ready_to_commit(
-                &self.topology_snapshot,
-                block_hash,
-                qc,
-                source,
-            ),
+            ProtocolEvent::BlockReadyToCommit { certified, source } => self
+                .shard_coordinator
+                .on_block_ready_to_commit(&self.topology_snapshot, certified, source),
             ProtocolEvent::QuorumCertificateResult {
                 block_hash,
                 qc,

@@ -2,8 +2,6 @@
 //!
 //! Writes ECs to a single column family keyed by [`hyperscale_types::WaveId`].
 
-use std::sync::Arc;
-
 use hyperscale_types::{Block, ExecutionCertificate};
 use rocksdb::{ColumnFamily, WriteBatch};
 
@@ -18,7 +16,7 @@ use crate::typed_cf::{TypedCf, batch_put_raw};
 pub fn append_block_certs_to_batch(
     storage: &RocksDbShardStorage,
     batch: &mut WriteBatch,
-    block: &Arc<Block>,
+    block: &Block,
 ) {
     // Resolve the CF handle once for the whole append loop. Per-call
     // `cf_put_raw` would each invoke `storage.cf()`, re-walking the

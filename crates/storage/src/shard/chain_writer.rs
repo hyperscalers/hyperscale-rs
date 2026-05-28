@@ -7,8 +7,8 @@
 use std::sync::Arc;
 
 use hyperscale_types::{
-    BeaconWitnessLeafCount, Block, BlockHeight, FinalizedWave, QuorumCertificate,
-    ShardWitnessPayload, StateRoot, Verified,
+    BeaconWitnessLeafCount, BlockHeight, CertifiedBlock, FinalizedWave, ShardWitnessPayload,
+    StateRoot, Verified,
 };
 
 use crate::{BaseReadCache, JmtSnapshot};
@@ -57,12 +57,7 @@ impl BeaconWitnessCommit {
 /// beacon-witness leaves to fold into the same atomic write. Aliased
 /// because the inline tuple type trips the `clippy::type_complexity`
 /// lint when used in trait signatures.
-pub type PreparedCommitBatchEntry<P> = (
-    P,
-    Arc<Block>,
-    Arc<Verified<QuorumCertificate>>,
-    BeaconWitnessCommit,
-);
+pub type PreparedCommitBatchEntry<P> = (P, Arc<Verified<CertifiedBlock>>, BeaconWitnessCommit);
 
 /// Abstracts state commitment for both simulation and production storage.
 ///
@@ -150,8 +145,7 @@ pub trait ShardChainWriter: Send + Sync + 'static {
     /// or proposer fast-path not applicable).
     fn commit_block(
         &self,
-        block: &Arc<Block>,
-        qc: &Arc<Verified<QuorumCertificate>>,
+        certified: &Arc<Verified<CertifiedBlock>>,
         witness: &BeaconWitnessCommit,
     ) -> StateRoot;
 

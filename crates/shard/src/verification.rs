@@ -293,6 +293,14 @@ pub struct VerificationPipeline {
     /// inserted via [`Self::track_pending_assembly`] and removed when the
     /// completion check fires inside [`Self::record_qc_assembly`].
     pending_assemblies: HashMap<BlockHash, PendingAssembly>,
+
+    /// Fully-assembled `Verified<CertifiedBlock>` handles keyed by
+    /// `block.hash()`. Populated when [`Self::try_complete_assembly`]
+    /// finishes; consumed by the commit path via
+    /// [`Self::take_verified_certified_block`] so the typed handle rides
+    /// straight into `Action::CommitBlock` and `BlockCommitted` without
+    /// being reconstructed.
+    verified_certified_blocks: HashMap<BlockHash, Arc<Verified<CertifiedBlock>>>,
 }
 
 impl VerificationPipeline {
@@ -311,6 +319,7 @@ impl VerificationPipeline {
             deferred_beacon_witness_verifications: HashMap::new(),
             verified_in_flight: HashSet::new(),
             pending_assemblies: HashMap::new(),
+            verified_certified_blocks: HashMap::new(),
         }
     }
 
@@ -509,7 +518,7 @@ impl VerificationPipeline {
         &mut self,
         block_hash: BlockHash,
         qc: Verified<QuorumCertificate>,
-    ) -> Option<Result<Verified<CertifiedBlock>, AssemblyError>> {
+    ) -> Option<Result<Arc<Verified<CertifiedBlock>>, AssemblyError>> {
         let entry = self.pending_assemblies.get_mut(&block_hash)?;
         entry.qc_result = Some(qc);
         self.try_complete_assembly(block_hash)
@@ -520,7 +529,7 @@ impl VerificationPipeline {
         &mut self,
         block_hash: BlockHash,
         verified: Verified<TransactionRoot>,
-    ) -> Option<Result<Verified<CertifiedBlock>, AssemblyError>> {
+    ) -> Option<Result<Arc<Verified<CertifiedBlock>>, AssemblyError>> {
         let entry = self.pending_assemblies.get_mut(&block_hash)?;
         entry.tx_root_result = Some(verified);
         self.try_complete_assembly(block_hash)
@@ -531,7 +540,7 @@ impl VerificationPipeline {
         &mut self,
         block_hash: BlockHash,
         verified: Verified<CertificateRoot>,
-    ) -> Option<Result<Verified<CertifiedBlock>, AssemblyError>> {
+    ) -> Option<Result<Arc<Verified<CertifiedBlock>>, AssemblyError>> {
         let entry = self.pending_assemblies.get_mut(&block_hash)?;
         entry.certificate_root_result = Some(verified);
         self.try_complete_assembly(block_hash)
@@ -542,7 +551,7 @@ impl VerificationPipeline {
         &mut self,
         block_hash: BlockHash,
         verified: Verified<LocalReceiptRoot>,
-    ) -> Option<Result<Verified<CertifiedBlock>, AssemblyError>> {
+    ) -> Option<Result<Arc<Verified<CertifiedBlock>>, AssemblyError>> {
         let entry = self.pending_assemblies.get_mut(&block_hash)?;
         entry.local_receipt_root_result = Some(verified);
         self.try_complete_assembly(block_hash)
@@ -553,7 +562,7 @@ impl VerificationPipeline {
         &mut self,
         block_hash: BlockHash,
         verified: Verified<ProvisionsRoot>,
-    ) -> Option<Result<Verified<CertifiedBlock>, AssemblyError>> {
+    ) -> Option<Result<Arc<Verified<CertifiedBlock>>, AssemblyError>> {
         let entry = self.pending_assemblies.get_mut(&block_hash)?;
         entry.provision_root_result = Some(verified);
         self.try_complete_assembly(block_hash)
@@ -564,7 +573,7 @@ impl VerificationPipeline {
         &mut self,
         block_hash: BlockHash,
         verified: Verified<ProvisionTxRootsMap>,
-    ) -> Option<Result<Verified<CertifiedBlock>, AssemblyError>> {
+    ) -> Option<Result<Arc<Verified<CertifiedBlock>>, AssemblyError>> {
         let entry = self.pending_assemblies.get_mut(&block_hash)?;
         entry.provision_tx_roots_result = Some(verified);
         self.try_complete_assembly(block_hash)
@@ -575,7 +584,7 @@ impl VerificationPipeline {
         &mut self,
         block_hash: BlockHash,
         verified: Verified<BeaconWitnessRoot>,
-    ) -> Option<Result<Verified<CertifiedBlock>, AssemblyError>> {
+    ) -> Option<Result<Arc<Verified<CertifiedBlock>>, AssemblyError>> {
         let entry = self.pending_assemblies.get_mut(&block_hash)?;
         entry.beacon_witness_root_result = Some(verified);
         self.try_complete_assembly(block_hash)
@@ -585,7 +594,7 @@ impl VerificationPipeline {
     pub fn record_state_root_result(
         &mut self,
         block_hash: BlockHash,
-    ) -> Option<Result<Verified<CertifiedBlock>, AssemblyError>> {
+    ) -> Option<Result<Arc<Verified<CertifiedBlock>>, AssemblyError>> {
         let entry = self.pending_assemblies.get_mut(&block_hash)?;
         entry.state_root_result = Some(());
         self.try_complete_assembly(block_hash)
@@ -594,7 +603,7 @@ impl VerificationPipeline {
     fn try_complete_assembly(
         &mut self,
         block_hash: BlockHash,
-    ) -> Option<Result<Verified<CertifiedBlock>, AssemblyError>> {
+    ) -> Option<Result<Arc<Verified<CertifiedBlock>>, AssemblyError>> {
         if !self.pending_assemblies.get(&block_hash)?.is_complete() {
             return None;
         }
@@ -647,10 +656,42 @@ impl VerificationPipeline {
             Err(e) => return Some(Err(AssemblyError::Block(e))),
         };
 
-        Some(
-            Verified::<CertifiedBlock>::assemble(verified_block, qc)
-                .map_err(AssemblyError::Linkage),
-        )
+        match Verified::<CertifiedBlock>::assemble(verified_block, qc) {
+            Ok(certified) => {
+                let certified = Arc::new(certified);
+                self.verified_certified_blocks
+                    .insert(block_hash, Arc::clone(&certified));
+                Some(Ok(certified))
+            }
+            Err(e) => Some(Err(AssemblyError::Linkage(e))),
+        }
+    }
+
+    /// Borrow the assembled `Verified<CertifiedBlock>` for `block_hash`,
+    /// if assembly has completed. The commit path Arc-clones from this
+    /// borrow to thread the typed handle through
+    /// [`Action::CommitBlock`](hyperscale_core::Action::CommitBlock).
+    /// Entries are evicted from the cache by [`Self::cleanup`] once the
+    /// block leaves `pending_blocks`, so callers don't need to take by
+    /// value.
+    pub fn cached_verified_certified_block(
+        &self,
+        block_hash: BlockHash,
+    ) -> Option<&Arc<Verified<CertifiedBlock>>> {
+        self.verified_certified_blocks.get(&block_hash)
+    }
+
+    /// Insert a `Verified<CertifiedBlock>` keyed by `block_hash`. Used
+    /// by paths that produce the typed handle via
+    /// [`Verified::<CertifiedBlock>::from_external_qc`] (sync, or
+    /// aggregator-without-local-verification) rather than by full
+    /// per-root assembly through [`Self::try_complete_assembly`].
+    pub fn insert_verified_certified_block(
+        &mut self,
+        block_hash: BlockHash,
+        certified: Arc<Verified<CertifiedBlock>>,
+    ) {
+        self.verified_certified_blocks.insert(block_hash, certified);
     }
 
     /// Number of in-flight composite assemblies.
@@ -1631,6 +1672,12 @@ impl VerificationPipeline {
             .retain(|_, qc| qc.height() > committed_height.saturating_sub(2));
 
         self.pending_assemblies
+            .retain(|hash, _| pending_blocks.contains_key(*hash));
+
+        // Drop completed-assembly handles whose blocks are no longer in
+        // `pending_blocks` (block evicted, or commit drained the
+        // handle). Lifecycle mirrors `pending_assemblies`.
+        self.verified_certified_blocks
             .retain(|hash, _| pending_blocks.contains_key(*hash));
     }
 

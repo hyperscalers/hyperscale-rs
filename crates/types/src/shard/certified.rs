@@ -190,7 +190,8 @@ pub enum LinkageError {
 
 impl Verified<CertifiedBlock> {
     /// Pair a `Verified<Block>` with a `Verified<QuorumCertificate>`,
-    /// checking the linkage invariant.
+    /// checking the linkage invariant. Construction gate when this node
+    /// ran the block's per-root verifiers locally.
     ///
     /// Construction asserts:
     /// 1. The block passes its full `Verified<Block>` predicate (header
@@ -198,6 +199,10 @@ impl Verified<CertifiedBlock> {
     /// 2. The QC passes its own verification predicate
     ///    (`Verified<QuorumCertificate>`).
     /// 3. `qc.block_hash == block.hash()` (structural pairing).
+    ///
+    /// See [`Self::from_external_qc`] for the alternate construction
+    /// gate when per-root verification was performed by an external
+    /// committee whose QC certifies the block.
     ///
     /// State-root verification is tracked separately in the verification
     /// pipeline and gates voting/commit via the parallel path, but is
@@ -227,6 +232,56 @@ impl Verified<CertifiedBlock> {
         }))
     }
 
+    /// Construct from a raw `CertifiedBlock` paired with a verified QC,
+    /// trusting the QC's signers to have run the block's per-root
+    /// verifiers at their committee. Construction gate for sync-applied
+    /// blocks and any other path where this node skips local per-root
+    /// verification because the QC's BFT majority already attested.
+    ///
+    /// Construction asserts:
+    /// 1. The QC passes its own verification predicate.
+    /// 2. `qc.block_hash == certified.block().hash()`.
+    /// 3. Every per-root verifier holds for the block — **not locally
+    ///    re-run**. The trust source is the BFT property of the QC: at
+    ///    least 2f+1 voters at the source committee verified each
+    ///    per-root commitment before signing, so at least one honest
+    ///    voter's check stands behind every claim.
+    ///
+    /// This constructor is the only path into `Verified<CertifiedBlock>`
+    /// that exchanges local verification for an external attestation;
+    /// every call site sits at a deliberate sync/admission boundary.
+    /// Misuse — invoking this on a path where local verifiers WOULD
+    /// have run and rejected — silently weakens the typestate to a
+    /// BFT-transitive claim, so call sites carry a `// SAFETY:` comment
+    /// naming the external-attestation source.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LinkageError::BlockHashMismatch`] when
+    /// `qc.block_hash` does not equal `certified.block().hash()`.
+    /// `CertifiedBlock` already enforces the pairing on its embedded
+    /// QC, but this constructor *replaces* that embedded QC with the
+    /// supplied verified one, so the linkage must be re-checked
+    /// against the new QC.
+    pub fn from_external_qc(
+        certified: CertifiedBlock,
+        qc: Verified<QuorumCertificate>,
+    ) -> Result<Self, LinkageError> {
+        let block_hash = certified.block().hash();
+        let qc_block_hash = qc.block_hash();
+        if qc_block_hash != block_hash {
+            return Err(LinkageError::BlockHashMismatch {
+                block_hash,
+                qc_block_hash,
+            });
+        }
+        let CertifiedBlock { block, qc: _ } = certified;
+        Ok(Self::new_unchecked(CertifiedBlock {
+            block,
+            qc: Verifiable::Verified(qc),
+        }))
+    }
+
     /// Borrow the verified QC. Total by the [`Verified<CertifiedBlock>`]
     /// predicate, which stores a [`Verifiable::Verified`] QC at
     /// assembly time.
@@ -243,11 +298,7 @@ impl Verified<CertifiedBlock> {
     }
 
     /// Consume into a verified-`Block` + verified-QC pair. Total by the
-    /// [`Verified<CertifiedBlock>`] predicate: assembly consumed a
-    /// `Verified<Block>` and a `Verified<QuorumCertificate>`. The
-    /// re-wrap on `Block` skips the predicate via
-    /// [`Verified::new_unchecked`] because the wrapper was discarded at
-    /// assembly time but the predicate still holds.
+    /// [`Verified<CertifiedBlock>`] predicate.
     #[must_use]
     pub fn into_verified_parts(self) -> (Verified<Block>, Verified<QuorumCertificate>) {
         let (cb, ()) = self.into_parts();
@@ -258,10 +309,12 @@ impl Verified<CertifiedBlock> {
                 unreachable!("Verified<CertifiedBlock> predicate guarantees qc is Verified")
             }
         };
-        // SAFETY: Verified<CertifiedBlock>::assemble consumed a
-        // Verified<Block>; the wrapper was discarded but the predicate
-        // (header verified + every per-root verifier passed) still
-        // holds for the contained block.
+        // SAFETY: the `Verified<CertifiedBlock>` predicate carries the
+        // block's per-root claim either locally (via [`Self::assemble`])
+        // or by BFT-transitive attestation (via
+        // [`Self::from_external_qc`]). Either way the contained block
+        // satisfies the `Verified<Block>` contract for downstream
+        // consumers.
         let block = Verified::<Block>::new_unchecked(block);
         (block, qc)
     }
@@ -303,6 +356,57 @@ mod tests {
         let bytes_unverified = basic_encode(&unverified).unwrap();
         let bytes_verified = basic_encode(&verified).unwrap();
         assert_eq!(bytes_unverified, bytes_verified);
+    }
+
+    /// `from_external_qc` produces a `Verified<CertifiedBlock>` when the
+    /// QC's `block_hash` matches the paired block, and rejects mismatches
+    /// with the same `LinkageError` shape as `assemble`.
+    #[test]
+    fn from_external_qc_accepts_matching_pair_and_rejects_mismatch() {
+        let block = Block::genesis(ShardGroupId::new(0), ValidatorId::new(0), StateRoot::ZERO);
+        let block_hash = block.hash();
+        let qc = QuorumCertificate::new(
+            block_hash,
+            ShardGroupId::new(0),
+            BlockHeight::GENESIS,
+            BlockHash::ZERO,
+            Round::INITIAL,
+            SignerBitfield::empty(),
+            zero_bls_signature(),
+            WeightedTimestamp::ZERO,
+        );
+        // SAFETY: synthetic test fixture.
+        let verified_qc = Verified::<QuorumCertificate>::new_unchecked(qc.clone());
+
+        let cb = CertifiedBlock::new_unchecked(block.clone(), qc.clone());
+        let verified_cb = Verified::<CertifiedBlock>::from_external_qc(cb, verified_qc)
+            .expect("matching block_hash succeeds");
+        assert_eq!(verified_cb.qc_verified().block_hash(), block_hash);
+
+        // Mismatched pair: pass a verified QC whose `block_hash` points
+        // somewhere other than the certified block's hash. The
+        // `CertifiedBlock` pairing invariant is satisfied internally
+        // (its embedded QC matches its block), but `from_external_qc`
+        // replaces the embedded QC with the supplied one, so it must
+        // re-check the linkage against the new QC.
+        let other_block =
+            Block::genesis(ShardGroupId::new(1), ValidatorId::new(1), StateRoot::ZERO);
+        let other_qc_raw = QuorumCertificate::new(
+            other_block.hash(),
+            ShardGroupId::new(1),
+            BlockHeight::GENESIS,
+            BlockHash::ZERO,
+            Round::INITIAL,
+            SignerBitfield::empty(),
+            zero_bls_signature(),
+            WeightedTimestamp::ZERO,
+        );
+        // SAFETY: synthetic test fixture.
+        let other_verified_qc = Verified::<QuorumCertificate>::new_unchecked(other_qc_raw);
+        let original_cb = CertifiedBlock::new_unchecked(block, qc);
+        let err = Verified::<CertifiedBlock>::from_external_qc(original_cb, other_verified_qc)
+            .expect_err("supplied QC's block_hash doesn't match the certified block");
+        assert!(matches!(err, LinkageError::BlockHashMismatch { .. }));
     }
 
     /// `Verified<CertifiedBlock>::into_verified_parts` round-trips both

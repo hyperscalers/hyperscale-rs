@@ -731,7 +731,6 @@ impl BlockSyncManager {
                 has_next_complete = has_next_block,
                 has_pending_commit = has_pending_commit,
                 pending_commits = commits.out_of_order_len(),
-                pending_commits_awaiting_data = commits.awaiting_data_len(),
                 pending_blocks = pending_blocks_len,
                 "Sync health check status"
             );

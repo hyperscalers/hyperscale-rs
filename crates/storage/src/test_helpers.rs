@@ -11,13 +11,14 @@ use hyperscale_types::test_utils::test_event_type_identifier;
 use hyperscale_types::{
     ApplicationEvent, BeaconBlock, BeaconBlockHash, BeaconCert, BeaconState,
     BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight,
-    Bls12381G2Signature, BoundedVec, CertificateRoot, CertifiedBeaconBlock, ConsensusReceipt,
-    Epoch, EventData, ExecutionCertificate, ExecutionMetadata, ExecutionOutcome, FeeSummary,
-    FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, InFlightCount, LocalReceiptRoot,
-    LogLevel, NodeId, PcQc2, PcQc3, PcSignerLengths, PcVector, PcXpProof, ProposerTimestamp,
-    ProvisionsRoot, QuorumCertificate, Randomness, Round, ShardGroupId, SignerBitfield, SpcCert,
-    SpcView, StateRoot, StoredReceipt, TransactionRoot, TxHash, TxOutcome, ValidatorId, Verified,
-    WaveCertificate, WaveId, WeightedTimestamp, compute_global_receipt_root, zero_bls_signature,
+    Bls12381G2Signature, BoundedVec, CertificateRoot, CertifiedBeaconBlock, CertifiedBlock,
+    ConsensusReceipt, Epoch, EventData, ExecutionCertificate, ExecutionMetadata, ExecutionOutcome,
+    FeeSummary, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, InFlightCount,
+    LocalReceiptRoot, LogLevel, NodeId, PcQc2, PcQc3, PcSignerLengths, PcVector, PcXpProof,
+    ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Randomness, Round, ShardGroupId,
+    SignerBitfield, SpcCert, SpcView, StateRoot, StoredReceipt, TransactionRoot, TxHash, TxOutcome,
+    ValidatorId, Verified, WaveCertificate, WaveId, WeightedTimestamp, compute_global_receipt_root,
+    zero_bls_signature,
 };
 use indexmap::IndexMap;
 use radix_common::math::Decimal;
@@ -161,6 +162,23 @@ pub fn make_test_qc(block: &Block) -> Verified<QuorumCertificate> {
         zero_bls_signature(),
         WeightedTimestamp::from_millis(block.header().timestamp().as_millis()),
     ))
+}
+
+/// Build a `Verified<CertifiedBlock>` for use with `commit_block` and the
+/// commit-pipeline test fixtures.
+///
+/// # Panics
+///
+/// Panics if internal `CertifiedBlock` construction fails — only happens
+/// when callers feed a `qc` whose `block_hash` doesn't match `block`, which
+/// the helper precludes by construction.
+#[must_use]
+pub fn make_test_certified(block: Block) -> Arc<Verified<CertifiedBlock>> {
+    let qc = make_test_qc(&block);
+    let certified = CertifiedBlock::new_unchecked(block, qc);
+    // SAFETY: synthetic test fixture; storage round-trip tests don't
+    // exercise the `Verified<CertifiedBlock>` predicate.
+    Arc::new(Verified::<CertifiedBlock>::new_unchecked(certified))
 }
 
 /// Build a placeholder [`SpcCert::Direct`] for test fixtures.
@@ -370,9 +388,8 @@ fn commit_empty_blocks_up_to(
 ) {
     let witness = empty_witness();
     for h in 0..target.inner() {
-        let b = make_test_block(BlockHeight::new(h));
-        let q = make_test_qc(&b);
-        storage.commit_block(&Arc::new(b), &Arc::new(q), &witness);
+        let certified = make_test_certified(make_test_block(BlockHeight::new(h)));
+        storage.commit_block(&certified, &witness);
     }
 }
 
@@ -395,8 +412,8 @@ pub fn test_ec_storage_roundtrip(storage: &(impl ShardChainReader + ShardChainWr
 
     commit_empty_blocks_up_to(storage, BlockHeight::new(10));
     let block = make_test_block_with_ecs(BlockHeight::new(10), vec![Arc::new(ec)]);
-    let qc = make_test_qc(&block);
-    storage.commit_block(&Arc::new(block), &Arc::new(qc), &empty_witness());
+    let certified = make_test_certified(block);
+    storage.commit_block(&certified, &empty_witness());
 
     let direct = storage
         .get_execution_certificate(&wave_id)
@@ -421,17 +438,14 @@ pub fn test_ec_storage_batch(storage: &(impl ShardChainReader + ShardChainWriter
         BlockHeight::new(10),
         vec![Arc::new(ec1.clone()), Arc::new(ec2.clone())],
     );
-    let qc10 = make_test_qc(&block10);
-    storage.commit_block(&Arc::new(block10), &Arc::new(qc10), &empty_witness());
+    storage.commit_block(&make_test_certified(block10), &empty_witness());
 
     for h in 11..20 {
-        let b = make_test_block(BlockHeight::new(h));
-        let q = make_test_qc(&b);
-        storage.commit_block(&Arc::new(b), &Arc::new(q), &empty_witness());
+        let certified = make_test_certified(make_test_block(BlockHeight::new(h)));
+        storage.commit_block(&certified, &empty_witness());
     }
     let block20 = make_test_block_with_ecs(BlockHeight::new(20), vec![Arc::new(ec3.clone())]);
-    let qc20 = make_test_qc(&block20);
-    storage.commit_block(&Arc::new(block20), &Arc::new(qc20), &empty_witness());
+    storage.commit_block(&make_test_certified(block20), &empty_witness());
 
     let known = [
         ec1.wave_id().clone(),

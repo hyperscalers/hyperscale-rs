@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use hyperscale_jmt::{Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_types::{
-    BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, CertifiedBlock, CommittedBlockHeader,
+    BeaconWitnessLeafCount, BlockHash, BlockHeight, CertifiedBlock, CommittedBlockHeader,
     ConsensusReceipt, ExecutionCertificate, FinalizedWave, MerkleInclusionProof, NodeId,
     QuorumCertificate, RoutableTransaction, ShardWitnessPayload, StateRoot, TxHash, Verified,
     WaveCertificate, WaveId,
@@ -827,11 +827,10 @@ impl<S: ShardChainWriter> ShardChainWriter for SubstateView<S> {
 
     fn commit_block(
         &self,
-        block: &Arc<Block>,
-        qc: &Arc<Verified<QuorumCertificate>>,
+        certified: &Arc<Verified<CertifiedBlock>>,
         witness: &BeaconWitnessCommit,
     ) -> StateRoot {
-        (*self.base).commit_block(block, qc, witness)
+        (*self.base).commit_block(certified, witness)
     }
 
     fn jmt_snapshot(prepared: &Self::PreparedCommit) -> &JmtSnapshot {

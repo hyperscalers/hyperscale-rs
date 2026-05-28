@@ -14,8 +14,8 @@ use hyperscale_provisions::action_handlers::handle_action as handle_provisions_a
 use hyperscale_shard::action_handlers::handle_action as handle_shard_action;
 use hyperscale_storage::{BeaconWitnessCommit, ShardStorage};
 use hyperscale_types::{
-    Block, BlockHeight, CertifiedBlock, QuorumCertificate, StateRoot, TopologySnapshot,
-    TransactionStatus, TxHash, Verified,
+    BlockHeight, CertifiedBlock, QuorumCertificate, StateRoot, TopologySnapshot, TransactionStatus,
+    TxHash, Verified,
 };
 use tracing::{debug, error, trace, warn};
 
@@ -134,30 +134,26 @@ where
             Action::Continuation(pe) => self.handle_continuation(pe),
             Action::RestoreCommittedState => self.handle_restore_committed_state(),
             Action::CommitBlock {
-                block,
-                qc,
+                certified,
                 source,
                 witness,
             } => {
                 self.accept_block_commit(PendingCommit {
-                    block: Arc::new(block),
-                    qc: Arc::new(qc),
+                    certified,
                     source,
                     committed_notified: false, // set by accumulate
                     witness,
                 });
             }
             Action::CommitBlockByQcOnly {
-                block,
-                qc,
+                certified,
                 parent_state_root,
                 parent_block_height,
                 source,
                 witness,
             } => {
                 self.accept_qc_only_commit(
-                    block,
-                    qc,
+                    certified,
                     parent_state_root,
                     parent_block_height,
                     source,
@@ -296,15 +292,14 @@ where
     /// shard step.
     fn accept_qc_only_commit(
         &mut self,
-        block: Block,
-        qc: Verified<QuorumCertificate>,
+        certified: Arc<Verified<CertifiedBlock>>,
         parent_state_root: StateRoot,
         parent_block_height: BlockHeight,
         source: CommitSource,
         witness: BeaconWitnessCommit,
     ) {
-        let block_hash = block.hash();
-        let height = block.height();
+        let block_hash = certified.block().hash();
+        let height = certified.block().height();
 
         let kind = match self.io.block_commit.decide_qc_only(&block_hash, height) {
             QcOnlyDecision::Skip => return,
@@ -320,8 +315,7 @@ where
         };
 
         let pending = QcOnlyPending {
-            block: Arc::new(block),
-            qc: Arc::new(qc),
+            certified,
             parent_state_root,
             parent_block_height,
             source,
@@ -349,8 +343,7 @@ where
                 }
                 QcOnlyKind::AlreadyPrepared => {
                     self.accept_block_commit(PendingCommit {
-                        block: pending.block,
-                        qc: pending.qc,
+                        certified: pending.certified,
                         source: pending.source,
                         committed_notified: false,
                         witness: pending.witness,
@@ -381,8 +374,7 @@ where
             .spawn(DispatchPool::Consensus, move || {
                 let result = run_qc_only_prep(&pending_chain, &prepared_commits, &pending);
                 let QcOnlyPending {
-                    block,
-                    qc,
+                    certified,
                     source,
                     witness,
                     ..
@@ -392,8 +384,7 @@ where
                         &event_tx,
                         shard,
                         ShardScopedInput::QcOnlyCommitPrepared {
-                            block,
-                            qc,
+                            certified,
                             source,
                             witness,
                         },
@@ -414,14 +405,12 @@ where
     /// head accepts inline rather than triggering another pool round-trip.
     pub(in crate::shard_loop) fn handle_qc_only_commit_prepared(
         &mut self,
-        block: Arc<Block>,
-        qc: Arc<Verified<QuorumCertificate>>,
+        certified: Arc<Verified<CertifiedBlock>>,
         source: CommitSource,
         witness: BeaconWitnessCommit,
     ) {
         self.accept_block_commit(PendingCommit {
-            block,
-            qc,
+            certified,
             source,
             committed_notified: false,
             witness,
@@ -443,7 +432,7 @@ where
             AccumulateDecision::Skip => {}
             AccumulateDecision::Accepted {
                 height,
-                handles: (block, qc),
+                handle: certified,
                 notify_now,
             } => {
                 debug!(height = height.inner(), "Block committed");
@@ -454,24 +443,8 @@ where
                     .handle(BlockSyncInput::Admitted { scope: (), height });
                 self.process_block_sync_outputs(outputs);
 
-                let weighted_ts = qc.weighted_timestamp();
-                let block_hash = block.hash();
-                // SAFETY: the QC is typed `Verified<QC>` (it rode in
-                // verified through `Action::CommitBlock` /
-                // `CommitBlockByQcOnly`). The block predicate (header
-                // verified + every applicable per-root verifier
-                // succeeded) holds because the commit pipeline only
-                // fires after voting completed or sync ran the
-                // equivalent checks. The linkage between QC and
-                // block-hash was enforced at the coordinator before
-                // dispatch. The `Verified<CertifiedBlock>` predicate
-                // therefore holds.
-                let certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked(
-                    CertifiedBlock::new_unchecked(
-                        Arc::unwrap_or_clone(block),
-                        Arc::unwrap_or_clone(qc),
-                    ),
-                ));
+                let weighted_ts = certified.qc_verified().weighted_timestamp();
+                let block_hash = certified.block().hash();
                 self.io
                     .pending_chain
                     .attach_certified_block(block_hash, Arc::clone(&certified));

@@ -3,7 +3,8 @@ use std::sync::Arc;
 
 use hyperscale_storage::shard::keys;
 use hyperscale_storage::test_helpers::{
-    make_database_update, make_mapped_database_update, make_test_block, make_test_qc,
+    make_database_update, make_mapped_database_update, make_test_block, make_test_certified,
+    make_test_qc,
 };
 use hyperscale_storage::tree::{jmt_parent_height, put_at_version};
 use hyperscale_storage::{
@@ -14,9 +15,9 @@ use hyperscale_storage::{
 };
 use hyperscale_types::test_utils::test_transaction;
 use hyperscale_types::{
-    BeaconWitnessLeafCount, Block, BlockHeight, ConsensusReceipt, FinalizedWave, GlobalReceiptHash,
-    Hash, NodeId, ProposerTimestamp, QuorumCertificate, ShardGroupId, StateRoot, StoredReceipt,
-    TxHash, Verified, WaveCertificate, WaveId,
+    BeaconWitnessLeafCount, Block, BlockHeight, CertifiedBlock, ConsensusReceipt, FinalizedWave,
+    GlobalReceiptHash, Hash, NodeId, ProposerTimestamp, QuorumCertificate, ShardGroupId, StateRoot,
+    StoredReceipt, TxHash, Verified, WaveCertificate, WaveId,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -164,11 +165,12 @@ fn commit_with(
             }
         }
     };
-    storage.commit_block(
-        &Arc::new(block),
-        &Arc::new(<Verified<_>>::clone(qc)),
-        &no_witness(),
-    )
+    // SAFETY: synthetic test fixture; storage round-trip tests don't
+    // exercise the `Verified<CertifiedBlock>` predicate.
+    let certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked(
+        CertifiedBlock::new_unchecked(block, <Verified<_>>::clone(qc)),
+    ));
+    storage.commit_block(&certified, &no_witness())
 }
 
 /// Helper: commit a block with empty updates and no ECs/receipts.
@@ -576,13 +578,9 @@ fn test_prepare_then_commit_fast_path() {
         &[],
         None,
     );
+    let certified = make_test_certified(block.clone());
     let result_prepared = s_prepared
-        .commit_prepared_blocks(vec![(
-            prepared,
-            Arc::new(block.clone()),
-            Arc::new(qc.clone()),
-            no_witness(),
-        )])
+        .commit_prepared_blocks(vec![(prepared, certified, no_witness())])
         .remove(0);
 
     // Direct path
@@ -607,13 +605,12 @@ fn test_prepare_commit_state_root_matches() {
         &[],
         None,
     );
+    let certified = make_test_certified(block);
+    // Embed the supplied verified QC by replacing the helper's
+    // placeholder. SAFETY: synthetic test fixture.
+    let _ = qc;
     let result = storage
-        .commit_prepared_blocks(vec![(
-            prepared,
-            Arc::new(block),
-            Arc::new(qc),
-            no_witness(),
-        )])
+        .commit_prepared_blocks(vec![(prepared, certified, no_witness())])
         .remove(0);
 
     assert_eq!(spec_root, result);

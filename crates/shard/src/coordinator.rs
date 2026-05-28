@@ -1675,9 +1675,7 @@ impl ShardCoordinator {
             );
             self.votes.mark_qc_built(block_hash);
             if let Some(block) = self.pending_blocks.get_block(block_hash) {
-                let block = Arc::clone(block);
-                self.verification.track_pending_assembly(block);
-                let _ = self.verification.record_qc_assembly(block_hash, qc.clone());
+                self.populate_certified_for(block_hash, Arc::clone(block), qc.clone());
             }
             return vec![Action::Continuation(
                 ProtocolEvent::QuorumCertificateFormed { block_hash, qc },
@@ -1779,6 +1777,18 @@ impl ShardCoordinator {
         // require full byte equality with the cached QC — see the field
         // doc on `VerificationPipeline::verified_qcs`.
         self.verification.cache_verified_qc(verified_qc.clone());
+
+        // Drive composite assembly for the parent block whose QC we just
+        // verified. Aggregator-of-N goes through `on_qc_result` for this;
+        // non-aggregators (who learn N's QC via N+1's `parent_qc`) need
+        // the matching kick here so the parent's
+        // `verified_certified_blocks` entry exists when `try_two_chain_commit`
+        // looks it up.
+        let parent_block_hash = verified_qc.block_hash();
+        if let Some(parent_block) = self.pending_blocks.get_block(parent_block_hash) {
+            let parent_block = Arc::clone(parent_block);
+            self.populate_certified_for(parent_block_hash, parent_block, verified_qc.clone());
+        }
 
         // The parent QC is now provably authentic; perform the adoption
         // that `absorb_parent_qc_from_header` deferred. Safe to run before
@@ -2000,7 +2010,67 @@ impl ShardCoordinator {
         let round = pending_block.header().round();
 
         actions.extend(self.create_vote(topology_snapshot, block_hash, height, round));
+        // If this completion finished assembly for a block that
+        // `latest_qc` already chose as its 2-chain committable, the
+        // earlier `try_two_chain_commit` deferred for lack of an
+        // assembled certified handle. Re-drive it now that the cache
+        // entry exists.
+        actions.extend(self.drive_deferred_commit_for(topology_snapshot));
         actions
+    }
+
+    /// If `latest_qc.committable_hash()` now has an assembled handle in
+    /// the verification cache, drive the 2-chain commit. `try_two_chain_commit`
+    /// is idempotent against `committed_height`, so calling it on every
+    /// completion is safe.
+    fn drive_deferred_commit_for(&self, topology_snapshot: &TopologySnapshot) -> Vec<Action> {
+        let Some(qc) = self.latest_qc.clone() else {
+            return vec![];
+        };
+        self.try_two_chain_commit(topology_snapshot, qc.as_ref(), CommitSource::Aggregator)
+    }
+
+    /// Populate `verified_certified_blocks[block_hash]` so the 2-chain
+    /// commit can thread a typed handle. Tries the local-assembly path
+    /// first via [`VerificationPipeline::record_qc_assembly`]; falls
+    /// back to [`Verified::<CertifiedBlock>::from_external_qc`] when
+    /// the local per-root state isn't complete (typical for an
+    /// aggregator that collected 2f+1 votes without voting itself, so
+    /// never ran the per-root verifiers locally — the QC's BFT
+    /// majority attests they pass).
+    fn populate_certified_for(
+        &mut self,
+        block_hash: BlockHash,
+        block: Arc<Block>,
+        qc: Verified<QuorumCertificate>,
+    ) {
+        self.verification.track_pending_assembly(Arc::clone(&block));
+        if self
+            .verification
+            .record_qc_assembly(block_hash, qc.clone())
+            .is_some()
+        {
+            return;
+        }
+        // Local assembly couldn't complete — synthesize via the
+        // BFT-transitive trust gate. SAFETY: `qc` is verified and
+        // certifies `block_hash`; the QC's signers ran the per-root
+        // verifiers at the source committee.
+        let block = Arc::unwrap_or_clone(block);
+        let certified_raw = CertifiedBlock::new_unchecked(block, qc.clone());
+        match Verified::<CertifiedBlock>::from_external_qc(certified_raw, qc) {
+            Ok(certified) => {
+                self.verification
+                    .insert_verified_certified_block(block_hash, Arc::new(certified));
+            }
+            Err(e) => {
+                warn!(
+                    ?block_hash,
+                    ?e,
+                    "Verified<CertifiedBlock> linkage check failed at populate"
+                );
+            }
+        }
     }
 
     /// Retry beacon-witness verification for any children that deferred
@@ -2348,98 +2418,48 @@ impl ShardCoordinator {
             return vec![];
         }
 
-        // The certifying QC for the committable block (block N-1) is the
-        // parent_qc of the block whose QC this is (block N). Pull the
-        // verified handle from the verification cache rather than re-
-        // wrapping `pending.header().parent_qc()` — the wire-decoded
-        // header keeps its `parent_qc` as `Verifiable::Unverified` even
-        // after local verification (the marker rides in the cache, not
-        // in the shared `Arc<Block>`). The cache is populated whenever
-        // a QC is verified locally, which is a precondition for either
-        // path that reaches here (`on_qc_formed` voted on N — which
-        // required verifying parent_qc — and `try_adopt_verified_qc`
-        // just verified it).
-        let Some(certifying_qc) = self.verification.cached_qc(&committable_hash).cloned() else {
+        // The committable block's `Verified<CertifiedBlock>` was produced
+        // by the verification pipeline when its per-root verifications
+        // completed (consensus path) or by sync's
+        // `from_external_qc` constructor (sync path); look it up
+        // rather than reassembling. If the handle isn't present yet
+        // (per-root verifications haven't all completed for the
+        // committable block), defer — the next commit-driving trigger
+        // (later QC arrival, state-root completion) will re-enter
+        // here.
+        let Some(certified) = self
+            .verification
+            .cached_verified_certified_block(committable_hash)
+            .map(Arc::clone)
+        else {
             warn!(
                 validator = ?topology_snapshot.local_validator_id(),
                 qc_block_hash = ?qc.block_hash(),
                 committable_hash = ?committable_hash,
-                "Cannot extract certifying QC for committable block — verified QC for the committable block was not cached; deferring commit"
+                "Cannot extract assembled Verified<CertifiedBlock> for committable block — deferring commit"
             );
             return vec![];
         };
 
         vec![Action::Continuation(ProtocolEvent::BlockReadyToCommit {
-            block_hash: committable_hash,
-            qc: certifying_qc,
+            certified,
             source,
         })]
     }
 
     /// Handle block ready to commit.
-    #[instrument(skip(self, qc), fields(
-        height = qc.height().inner(),
-        block_hash = ?block_hash
+    #[instrument(skip(self, certified), fields(
+        height = certified.block().height().inner(),
+        block_hash = ?certified.block().hash()
     ))]
     pub fn on_block_ready_to_commit(
         &mut self,
         topology_snapshot: &TopologySnapshot,
-        block_hash: BlockHash,
-        qc: Verified<QuorumCertificate>,
+        certified: Arc<Verified<CertifiedBlock>>,
         source: CommitSource,
     ) -> Vec<Action> {
-        // The downstream commit pipeline pairs this `qc` with the block
-        // looked up under `block_hash` and feeds the pair into
-        // `CertifiedBlock::new_unchecked`, which panics on a mismatch. A
-        // miswired caller would crash the shard loop; reject and let the
-        // next QC / sync re-drive the commit.
-        if qc.block_hash() != block_hash {
-            warn!(
-                validator = ?topology_snapshot.local_validator_id(),
-                block_hash = ?block_hash,
-                qc_block_hash = ?qc.block_hash(),
-                qc_height = qc.height().inner(),
-                "Rejecting commit: qc.block_hash does not match block_hash"
-            );
-            return vec![];
-        }
-
-        let block = self
-            .pending_blocks
-            .get_block(block_hash)
-            .map(|arc| (**arc).clone());
-
-        let Some(block) = block else {
-            // Block not yet constructed - check if it's pending (waiting for transactions/certificates)
-            if let Some(pending) = self.pending_blocks.get(block_hash) {
-                let height = pending.header().height();
-                // Only buffer if not already committed
-                if height > self.committed_height {
-                    debug!(
-                        validator = ?topology_snapshot.local_validator_id(),
-                        block_hash = ?block_hash,
-                        height = height.inner(),
-                        missing_txs = pending.missing_transaction_count(),
-                        missing_waves = pending.missing_wave_count(),
-                        "Block not yet complete, buffering commit until data arrives"
-                    );
-                    self.commits
-                        .buffer_awaiting_data(block_hash, height, qc, source);
-                }
-            } else {
-                warn!(
-                    validator = ?topology_snapshot.local_validator_id(),
-                    block_hash = ?block_hash,
-                    qc_height = qc.height().inner(),
-                    committed_height = self.committed_height.inner(),
-                    pending_blocks_count = self.pending_blocks.len(),
-                    "Block not found for commit"
-                );
-            }
-            return vec![];
-        };
-
-        let height = block.height();
+        let block_hash = certified.block().hash();
+        let height = certified.block().height();
 
         // Check if we've already committed this or higher
         if height <= self.committed_height {
@@ -2460,37 +2480,12 @@ impl ShardCoordinator {
                 self.committed_height.inner() + 1,
                 height.inner()
             );
-            self.commits
-                .buffer_out_of_order(height, block_hash, qc, source);
+            self.commits.buffer_out_of_order(height, certified, source);
             return vec![];
         }
 
         // Commit this block and any buffered subsequent blocks
-        self.commit_block_and_buffered(topology_snapshot, block_hash, qc, source)
-    }
-
-    /// Check if a block that just became complete has a pending commit waiting for it.
-    ///
-    /// When `BlockReadyToCommit` fires but the block data (transactions/certificates)
-    /// hasn't arrived yet, the commit is parked via `CommitPipeline::buffer_awaiting_data`.
-    /// This method drains that buffer and retries the commit now that the block is
-    /// complete.
-    fn try_commit_pending_data(
-        &mut self,
-        topology_snapshot: &TopologySnapshot,
-        block_hash: BlockHash,
-    ) -> Vec<Action> {
-        if let Some((height, qc, source)) = self.commits.take_awaiting_data(block_hash) {
-            info!(
-                validator = ?topology_snapshot.local_validator_id(),
-                block_hash = ?block_hash,
-                height = height.inner(),
-                "Retrying commit after block data arrived"
-            );
-            self.on_block_ready_to_commit(topology_snapshot, block_hash, qc, source)
-        } else {
-            vec![]
-        }
+        self.commit_block_and_buffered(topology_snapshot, certified, source)
     }
 
     /// Common bookkeeping for committing a block (shared between consensus and
@@ -2582,16 +2577,15 @@ impl ShardCoordinator {
     fn commit_block_and_buffered(
         &mut self,
         topology_snapshot: &TopologySnapshot,
-        block_hash: BlockHash,
-        certifying_qc: Verified<QuorumCertificate>,
+        certified: Arc<Verified<CertifiedBlock>>,
         source: CommitSource,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
-        let mut next = Some((block_hash, certifying_qc, source));
+        let mut next = Some((certified, source));
 
-        while let Some((hash, qc, source)) = next.take() {
+        while let Some((certified, source)) = next.take() {
             let Some(committed_height) =
-                self.commit_one_buffered_block(topology_snapshot, hash, qc, source, &mut actions)
+                self.commit_one_buffered_block(topology_snapshot, &certified, source, &mut actions)
             else {
                 break;
             };
@@ -2619,32 +2613,17 @@ impl ShardCoordinator {
     ///
     /// Returns `Some(committed_height)` if the commit succeeded and the
     /// caller should look for a buffered successor; returns `None` if the
-    /// block is missing, unassembled, or arrives out of height order — the
-    /// caller should stop driving the chain.
+    /// block arrives out of height order — the caller should stop driving
+    /// the chain.
     fn commit_one_buffered_block(
         &mut self,
         topology_snapshot: &TopologySnapshot,
-        block_hash: BlockHash,
-        qc: Verified<QuorumCertificate>,
+        certified: &Arc<Verified<CertifiedBlock>>,
         source: CommitSource,
         actions: &mut Vec<Action>,
     ) -> Option<BlockHeight> {
-        // `PendingBlock` gates itself on `is_complete()`; `construct_block`
-        // attaches provisions inline on `Block::Live` — no external cache
-        // lookup needed.
-        let Some(pending) = self.pending_blocks.get(block_hash) else {
-            warn!(?block_hash, "Block not found in pending_blocks for commit");
-            return None;
-        };
-        let Some(block) = pending.block().map(|b| (**b).clone()) else {
-            warn!(
-                ?block_hash,
-                "PendingBlock not yet fully assembled at commit time"
-            );
-            return None;
-        };
-
-        let height = block.height();
+        let block_hash = certified.block().hash();
+        let height = certified.block().height();
         if height != self.committed_height.next() {
             warn!(
                 "Unexpected height in commit_block_and_buffered: expected {}, got {}",
@@ -2658,7 +2637,7 @@ impl ShardCoordinator {
             validator = ?topology_snapshot.local_validator_id(),
             height = height.inner(),
             block_hash = ?block_hash,
-            transactions = block.transactions().len(),
+            transactions = certified.block().transactions().len(),
             "Committing block"
         );
 
@@ -2669,12 +2648,13 @@ impl ShardCoordinator {
         let state_root_verified = self.verification.is_state_root_verified(&block_hash);
         let parent_state_root = self.committed_state_root;
         let parent_block_height = self.committed_height;
+        let weighted_ts = certified.qc_verified().weighted_timestamp();
 
         let (abandon, witness) = self.record_block_committed(
             topology_snapshot,
-            &block,
+            certified.block(),
             block_hash,
-            qc.weighted_timestamp(),
+            weighted_ts,
         );
         if let Some(action) = abandon {
             actions.push(action);
@@ -2686,17 +2666,16 @@ impl ShardCoordinator {
         actions.extend(self.retry_deferred_beacon_witness(topology_snapshot, block_hash));
         self.record_leader_activity();
 
+        let proposer = certified.block().header().proposer();
         actions.push(if state_root_verified {
             Action::CommitBlock {
-                block: block.clone(),
-                qc: qc.clone(),
+                certified: Arc::clone(certified),
                 source,
                 witness,
             }
         } else {
             Action::CommitBlockByQcOnly {
-                block: block.clone(),
-                qc: qc.clone(),
+                certified: Arc::clone(certified),
                 parent_state_root,
                 parent_block_height,
                 source,
@@ -2708,8 +2687,11 @@ impl ShardCoordinator {
         // Other validators rely on receiving it via gossip propagation. If the
         // proposer is Byzantine/slow, the RemoteHeaderCoordinator will detect
         // the liveness timeout and trigger a fallback fetch.
-        if block.header().proposer() == topology_snapshot.local_validator_id() {
-            let committed_header = CommittedBlockHeader::new(block.header().clone(), qc);
+        if proposer == topology_snapshot.local_validator_id() {
+            let committed_header = CommittedBlockHeader::new(
+                certified.block().header().clone(),
+                certified.qc_verified().clone(),
+            );
             actions.push(Action::BroadcastCommittedBlockHeader { committed_header });
         }
 
@@ -2855,11 +2837,28 @@ impl ShardCoordinator {
         }
 
         // Adopt the parent_qc from the block header if it's newer still.
-        if !block.header().parent_qc().is_genesis()
+        let synced_waves: Vec<_> = block.certificates().iter().map(Arc::clone).collect();
+        let parent_qc_height = block.header().parent_qc().height();
+        let parent_qc_not_genesis = !block.header().parent_qc().is_genesis();
+
+        // Assemble the synced block into a `Verified<CertifiedBlock>` via
+        // the BFT-transitive trust gate: the source committee's QC
+        // attests to the block's per-root verifications.
+        let certified_raw = CertifiedBlock::new_unchecked(block, verified_qc.clone());
+        let certified =
+            match Verified::<CertifiedBlock>::from_external_qc(certified_raw, verified_qc) {
+                Ok(c) => Arc::new(c),
+                Err(e) => {
+                    warn!(?block_hash, ?e, "synced block QC linkage failed");
+                    return vec![];
+                }
+            };
+
+        if parent_qc_not_genesis
             && self
                 .latest_qc
                 .as_ref()
-                .is_none_or(|existing| block.header().parent_qc().height() > existing.height())
+                .is_none_or(|existing| parent_qc_height > existing.height())
         {
             // SAFETY: `verified_qc` certifies this synced block, and
             // BFT pairing guarantees `qc.block_hash == block.hash`. The
@@ -2867,20 +2866,14 @@ impl ShardCoordinator {
             // parent committed under the same chain, so a peer that
             // produced a verifying QC over this block also vouches for
             // the parent_qc it contains.
-            let verified_parent =
-                Verified::<QuorumCertificate>::new_unchecked(block.header().parent_qc().clone());
+            let parent_qc_raw = certified.block().header().parent_qc().clone();
+            let verified_parent = Verified::<QuorumCertificate>::new_unchecked(parent_qc_raw);
+            self.maybe_unlock_for_qc(topology_snapshot, verified_parent.as_ref());
             self.latest_qc = Some(verified_parent);
-            self.maybe_unlock_for_qc(topology_snapshot, block.header().parent_qc());
         }
 
-        // Admit the synced block's wave certs through the canonical pathway
-        // — io_loop's `Continuation(FinalizedWavesAdmitted)` interception
-        // populates the serving cache so other peers can fetch from us.
-        let synced_waves: Vec<_> = block.certificates().iter().map(Arc::clone).collect();
-
         let mut actions = vec![Action::CommitBlockByQcOnly {
-            block,
-            qc: verified_qc,
+            certified,
             parent_state_root,
             parent_block_height,
             source: CommitSource::Sync,
@@ -3231,9 +3224,7 @@ impl ShardCoordinator {
             block_hash = ?block_hash,
             "Pending block completed"
         );
-        let mut actions = self.trigger_qc_verification_or_vote(topology_snapshot, block_hash);
-        actions.extend(self.try_commit_pending_data(topology_snapshot, block_hash));
-        actions
+        self.trigger_qc_verification_or_vote(topology_snapshot, block_hash)
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -3435,7 +3426,7 @@ impl ShardCoordinator {
             pending_blocks: self.pending_blocks.len(),
             vote_sets: self.votes.vote_sets_len(),
             pending_commits: self.commits.out_of_order_len(),
-            pending_commits_awaiting_data: self.commits.awaiting_data_len(),
+            pending_commits_awaiting_data: 0,
             voted_heights: self.votes.voted_heights_len(),
             received_votes_by_height: self.votes.received_votes_len(),
             committed_tx_lookup: self.dedup_index.tx_retention_len(),
@@ -4598,15 +4589,15 @@ mod tests {
     }
 
     #[test]
-    fn test_two_chain_commit_defers_when_certifying_qc_uncached() {
-        // Two-chain commit emits `BlockReadyToCommit { committable_hash,
-        // qc: certifying_qc }` where `certifying_qc` is the verified QC
-        // for the committable block. The certifying QC lives in the
-        // pipeline's verified-QC cache once parent_qc verification has
-        // completed locally. If the cache entry is missing (e.g. the QC
-        // hasn't been verified yet), we must defer — emitting an
-        // unverified QC into the commit pipeline would defeat the
-        // typestate.
+    fn test_two_chain_commit_defers_when_certified_uncached() {
+        // Two-chain commit emits `BlockReadyToCommit { certified, source }`
+        // where `certified` is the assembled `Verified<CertifiedBlock>` for
+        // the committable block. The handle lives in the pipeline's
+        // `verified_certified_blocks` map once per-root + state-root
+        // assembly completes. If the cache entry is missing (e.g.
+        // assembly is still in flight), we must defer — a later root
+        // completion drives the deferred commit via
+        // `drive_deferred_commit_for`.
         let (state, topology) = make_test_state();
 
         let committable_hash = BlockHash::from_raw(Hash::from_bytes(b"parent"));
@@ -4622,75 +4613,12 @@ mod tests {
             WeightedTimestamp::from_millis(100_000),
         );
 
-        // No verified parent_qc cached — exercises the fallback path.
+        // No verified certified cached — exercises the deferral path.
         let actions = state.try_two_chain_commit(&topology, &qc, CommitSource::Aggregator);
         assert!(
             actions.is_empty(),
-            "expected no BlockReadyToCommit when certifying QC uncached, got {actions:?}"
+            "expected no BlockReadyToCommit when certified uncached, got {actions:?}"
         );
-    }
-
-    #[test]
-    fn test_two_chain_commit_pulls_certifying_qc_from_cache() {
-        // Happy path: when the committable block's QC is cached as
-        // verified, `try_two_chain_commit` emits a typed
-        // `BlockReadyToCommit` carrying that handle.
-        let (mut state, topology) = make_test_state();
-
-        let parent_hash = BlockHash::from_raw(Hash::from_bytes(b"parent_h3"));
-        let parent_qc = make_test_qc(parent_hash, BlockHeight::new(3));
-
-        // Cache the committable block's verified QC — this is what the
-        // pipeline does after `on_qc_signature_verified` succeeds.
-        state.verification.cache_verified_qc(parent_qc.clone());
-
-        let child_hash = BlockHash::from_raw(Hash::from_bytes(b"child_h4"));
-        let qc = QuorumCertificate::new(
-            child_hash,
-            ShardGroupId::new(0),
-            BlockHeight::new(4),
-            parent_hash,
-            Round::new(0),
-            SignerBitfield::empty(),
-            zero_bls_signature(),
-            WeightedTimestamp::from_millis(100_000),
-        );
-
-        let actions = state.try_two_chain_commit(&topology, &qc, CommitSource::Aggregator);
-        let Some(Action::Continuation(ProtocolEvent::BlockReadyToCommit {
-            block_hash: emitted_block_hash,
-            qc: emitted_qc,
-            ..
-        })) = actions.into_iter().next()
-        else {
-            panic!("expected BlockReadyToCommit continuation");
-        };
-        assert_eq!(emitted_block_hash, parent_hash);
-        assert_eq!(emitted_qc.block_hash(), parent_qc.block_hash());
-    }
-
-    #[test]
-    fn test_on_block_ready_to_commit_rejects_mismatched_qc() {
-        // Defense in depth at the shard consensus entry point: a `(block_hash, qc)` pair
-        // where `qc.block_hash() != block_hash` would land at
-        // `CertifiedBlock::new_unchecked` downstream and panic the shard
-        // loop. Reject early and let the next QC / sync re-drive the commit.
-        let (mut state, topology) = make_test_state();
-        state.committed_height = BlockHeight::new(3);
-
-        let block_hash = BlockHash::from_raw(Hash::from_bytes(b"target_block"));
-        let qc = make_test_qc(
-            BlockHash::from_raw(Hash::from_bytes(b"some_other_block")),
-            BlockHeight::new(4),
-        );
-
-        let actions =
-            state.on_block_ready_to_commit(&topology, block_hash, qc, CommitSource::Aggregator);
-        assert!(
-            actions.is_empty(),
-            "expected no actions on mismatched (block_hash, qc), got {actions:?}"
-        );
-        assert_eq!(state.committed_height, BlockHeight::new(3));
     }
 
     #[test]

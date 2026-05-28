@@ -126,13 +126,11 @@ pub enum ProtocolEvent {
 
     /// A block is ready to be committed.
     BlockReadyToCommit {
-        /// Block being committed.
-        block_hash: BlockHash,
-        /// QC certifying the committed block (under 2-chain, this is the
-        /// next block's `parent_qc`). Verified before the event is
-        /// emitted so the commit handler doesn't re-establish the QC's
-        /// predicate.
-        qc: Verified<QuorumCertificate>,
+        /// Block + certifying QC, with the full
+        /// [`Verified<CertifiedBlock>`] predicate established upstream
+        /// — either by local per-root assembly (consensus path) or
+        /// BFT-transitive trust in the source committee (sync path).
+        certified: Arc<Verified<CertifiedBlock>>,
         /// How this node learned the certifying QC.
         source: CommitSource,
     },

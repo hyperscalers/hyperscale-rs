@@ -7,9 +7,9 @@ use std::time::Duration;
 use hyperscale_dispatch::DispatchPool;
 use hyperscale_storage::BeaconWitnessCommit;
 use hyperscale_types::{
-    BeaconState, BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader,
-    BlockHeight, BlockManifest, BlockVote, Bls12381G1PublicKey, CertificateRoot,
-    CertifiedBeaconBlock, CommittedBlockHeader, Epoch, ExecutionCertificate, ExecutionVote,
+    BeaconState, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight,
+    BlockManifest, BlockVote, Bls12381G1PublicKey, CertificateRoot, CertifiedBeaconBlock,
+    CertifiedBlock, CommittedBlockHeader, Epoch, ExecutionCertificate, ExecutionVote,
     FinalizedWave, GlobalReceiptRoot, Hash, InFlightCount, LeafIndex, LocalReceiptRoot, NodeId,
     PcQc1, PcQc2, PcQc3, PcVector, PcVoteMessage, ProposerTimestamp, ProvisionHash,
     ProvisionTxRootsMap, Provisions, ProvisionsRoot, QuorumCertificate, ReadySignal, Round,
@@ -59,6 +59,7 @@ pub struct ProvisionsRequest {
 /// Actions are **commands** - they describe something to do.
 /// The runner executes actions and may convert results back into events.
 #[derive(Debug, Clone, strum::IntoStaticStr)]
+#[allow(clippy::large_enum_variant)] // mixed-size shard/beacon variants; boxing every large variant adds allocations on the hot dispatch path
 pub enum Action {
     // ═══════════════════════════════════════════════════════════════════════
     // Network: shard consensus
@@ -629,12 +630,12 @@ pub enum Action {
     /// or `VerifyStateRoot`). Block data + JMT + substates + receipts + ECs +
     /// consensus metadata are written atomically.
     CommitBlock {
-        /// Block to commit.
-        block: Block,
-        /// QC certifying `block`. Carried verified so the downstream
-        /// `Verified<CertifiedBlock>` wrap on `BlockCommitted` doesn't
-        /// re-establish the QC's predicate at the consumer.
-        qc: Verified<QuorumCertificate>,
+        /// Block + certifying QC, with the full
+        /// [`Verified<CertifiedBlock>`] predicate already established
+        /// upstream of dispatch. The IO-loop threads this directly
+        /// into the `BlockCommitted` event without re-establishing the
+        /// predicate.
+        certified: Arc<Verified<CertifiedBlock>>,
         /// How this node learned the certifying QC (aggregator vs header).
         source: CommitSource,
         /// Beacon-witness leaves to persist alongside the block in the
@@ -653,10 +654,12 @@ pub enum Action {
     /// detection as async `VerifyStateRoot`), then feeds into the normal
     /// `flush_block_commits` pipeline for async `RocksDB` persistence.
     CommitBlockByQcOnly {
-        /// Block to commit.
-        block: Block,
-        /// QC certifying `block`. Carried verified — see [`Self::CommitBlock`].
-        qc: Verified<QuorumCertificate>,
+        /// Block + certifying QC. On the sync path the
+        /// [`Verified<CertifiedBlock>`] predicate is established by
+        /// BFT-transitive trust in the source committee's QC (see
+        /// [`Verified::<CertifiedBlock>::from_external_qc`]) rather
+        /// than by local per-root verification.
+        certified: Arc<Verified<CertifiedBlock>>,
         /// Parent block's state root — base state for JMT computation.
         parent_state_root: StateRoot,
         /// Parent block's height — JMT parent version.

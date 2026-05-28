@@ -132,7 +132,7 @@ impl ShardChainWriter for SimShardStorage {
     ) -> Vec<StateRoot> {
         blocks
             .into_iter()
-            .map(|(prepared, block, qc, witness)| {
+            .map(|(prepared, certified, witness)| {
                 self.append_beacon_witnesses(&witness);
                 let block_height_u64 = prepared.snapshot.new_height.inner();
                 let result_root = prepared.snapshot.result_root;
@@ -150,13 +150,16 @@ impl ShardChainWriter for SimShardStorage {
                     );
                 }
 
+                let block = certified.block();
+                let qc = certified.qc_verified();
+
                 let mut c = write_or_recover(&self.consensus);
                 for tx in block.transactions().iter() {
                     c.transactions.insert(tx.hash(), tx.as_ref().clone());
                 }
                 c.blocks.insert(
                     block.height(),
-                    CertifiedBlock::new_unchecked((*block).clone().into_sealed(), (*qc).clone()),
+                    CertifiedBlock::new_unchecked(block.clone().into_sealed(), qc.clone()),
                 );
                 for fw in block.certificates().iter() {
                     let cert = fw.certificate();
@@ -176,7 +179,7 @@ impl ShardChainWriter for SimShardStorage {
                 }
                 c.committed_height = block.height();
                 c.committed_hash = Some(block.hash());
-                c.committed_qc = Some(qc.as_ref().as_ref().clone());
+                c.committed_qc = Some(qc.as_ref().clone());
                 c.prune_receipts(block.height());
 
                 result_root
@@ -186,10 +189,11 @@ impl ShardChainWriter for SimShardStorage {
 
     fn commit_block(
         &self,
-        block: &Arc<Block>,
-        qc: &Arc<Verified<QuorumCertificate>>,
+        certified: &Arc<Verified<CertifiedBlock>>,
         witness: &BeaconWitnessCommit,
     ) -> StateRoot {
+        let block = certified.block();
+        let qc = certified.qc_verified();
         let receipts: Vec<StoredReceipt> = block
             .certificates()
             .iter()
@@ -223,8 +227,8 @@ impl SimShardStorage {
     fn commit_block_inner(
         &self,
         merged_updates: &DatabaseUpdates,
-        block: &Arc<Block>,
-        qc: &Arc<Verified<QuorumCertificate>>,
+        block: &Block,
+        qc: &Verified<QuorumCertificate>,
         receipts: &[StoredReceipt],
     ) -> StateRoot {
         let block_height = block.height();
@@ -278,7 +282,7 @@ impl SimShardStorage {
             }
             c.blocks.insert(
                 block.height(),
-                CertifiedBlock::new_unchecked((**block).clone().into_sealed(), (**qc).clone()),
+                CertifiedBlock::new_unchecked(block.clone().into_sealed(), qc.clone()),
             );
             for fw in block.certificates().iter() {
                 let cert = fw.certificate();
@@ -300,7 +304,7 @@ impl SimShardStorage {
             }
             c.committed_height = block.height();
             c.committed_hash = Some(block.hash());
-            c.committed_qc = Some(qc.as_ref().as_ref().clone());
+            c.committed_qc = Some(qc.as_ref().clone());
             c.prune_receipts(block.height());
         }
 

@@ -391,12 +391,11 @@ where
 
             // ── QC-only commit prep callbacks ──────────────────────────
             ShardScopedInput::QcOnlyCommitPrepared {
-                block,
-                qc,
+                certified,
                 source,
                 witness,
             } => {
-                self.handle_qc_only_commit_prepared(block, qc, source, witness);
+                self.handle_qc_only_commit_prepared(certified, source, witness);
             }
             ShardScopedInput::QcOnlyCommitDiverged(div) => {
                 handle_qc_only_commit_diverged(&div);

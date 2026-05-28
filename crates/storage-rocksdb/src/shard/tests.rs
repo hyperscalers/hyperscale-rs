@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use hyperscale_storage::test_helpers::{
-    make_database_update, make_mapped_database_update, make_test_block,
+    make_database_update, make_mapped_database_update, make_test_block, make_test_certified,
     make_test_execution_certificate, make_test_qc, make_test_receipt, make_test_wave_certificate,
     test_ec_storage_batch as helpers_test_ec_storage_batch,
     test_ec_storage_roundtrip as helpers_test_ec_storage_roundtrip,
@@ -13,9 +13,10 @@ use hyperscale_storage::{
 };
 use hyperscale_types::{
     BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, Bls12381G2Signature, BoundedVec,
-    ConsensusReceipt, ExecutionCertificate, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot,
-    Hash, ProposerTimestamp, QuorumCertificate, Round, ShardGroupId, SignerBitfield, StateRoot,
-    StoredReceipt, TxHash, Verified, WaveCertificate, WaveId, WeightedTimestamp,
+    CertifiedBlock, ConsensusReceipt, ExecutionCertificate, FinalizedWave, GlobalReceiptHash,
+    GlobalReceiptRoot, Hash, ProposerTimestamp, QuorumCertificate, Round, ShardGroupId,
+    SignerBitfield, StateRoot, StoredReceipt, TxHash, Verified, WaveCertificate, WaveId,
+    WeightedTimestamp,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -62,11 +63,12 @@ fn updates_to_receipts(updates: &DatabaseUpdates) -> Vec<StoredReceipt> {
 
 /// Helper: commit a block with empty updates and no ECs/receipts.
 fn commit_empty(storage: &RocksDbShardStorage, block: &Block, qc: &Verified<QuorumCertificate>) {
-    storage.commit_block(
-        &Arc::new(block.clone()),
-        &Arc::new(<Verified<_>>::clone(qc)),
-        &no_witness(),
-    );
+    // SAFETY: synthetic test fixture; round-trip tests don't exercise
+    // the `Verified<CertifiedBlock>` predicate.
+    let certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked(
+        CertifiedBlock::new_unchecked(block.clone(), <Verified<_>>::clone(qc)),
+    ));
+    storage.commit_block(&certified, &no_witness());
 }
 
 #[test]
@@ -480,9 +482,7 @@ fn test_commit_block_applies_writes() {
     let mut block = make_test_block(BlockHeight::new(1));
     let receipts = updates_to_receipts(&updates);
     attach_receipts(&mut block, receipts);
-    let qc = make_test_qc(&block);
-
-    let result = storage.commit_block(&Arc::new(block), &Arc::new(qc), &no_witness());
+    let result = storage.commit_block(&make_test_certified(block), &no_witness());
     assert_ne!(result, StateRoot::ZERO);
 }
 
@@ -497,9 +497,7 @@ fn test_commit_block_multiple_certs() {
     let mut block = make_test_block(BlockHeight::new(1));
     let receipts = updates_to_receipts(&merged);
     attach_receipts(&mut block, receipts);
-    let qc = make_test_qc(&block);
-
-    let result = storage.commit_block(&Arc::new(block), &Arc::new(qc), &no_witness());
+    let result = storage.commit_block(&make_test_certified(block), &no_witness());
     assert_ne!(result, StateRoot::ZERO);
 }
 
@@ -509,9 +507,7 @@ fn test_commit_block_empty_certs() {
     let storage = RocksDbShardStorage::open(temp_dir.path()).unwrap();
 
     let block = make_test_block(BlockHeight::new(1));
-    let qc = make_test_qc(&block);
-
-    storage.commit_block(&Arc::new(block), &Arc::new(qc), &no_witness());
+    storage.commit_block(&make_test_certified(block), &no_witness());
     assert_eq!(storage.jmt_height(), BlockHeight::new(1));
 }
 
@@ -529,21 +525,14 @@ fn test_prepare_then_commit_matches_direct() {
         None,
     );
     let block = make_test_block(BlockHeight::new(1));
-    let qc = make_test_qc(&block);
     let result_prepared = s_prepared
-        .commit_prepared_blocks(vec![(
-            prepared,
-            Arc::new(block),
-            Arc::new(qc),
-            no_witness(),
-        )])
+        .commit_prepared_blocks(vec![(prepared, make_test_certified(block), no_witness())])
         .remove(0);
 
     let temp_dir2 = TempDir::new().unwrap();
     let s_direct = RocksDbShardStorage::open(temp_dir2.path()).unwrap();
     let block2 = make_test_block(BlockHeight::new(1));
-    let qc2 = make_test_qc(&block2);
-    let result_direct = s_direct.commit_block(&Arc::new(block2), &Arc::new(qc2), &no_witness());
+    let result_direct = s_direct.commit_block(&make_test_certified(block2), &no_witness());
 
     assert_eq!(result_prepared, result_direct);
     assert_eq!(spec_root, result_prepared);
@@ -584,9 +573,7 @@ fn test_commit_block_stores_certificates() {
             provision_hashes,
         },
     };
-    let qc = make_test_qc(&block);
-
-    let _ = storage.commit_block(&Arc::new(block), &Arc::new(qc), &no_witness());
+    let _ = storage.commit_block(&make_test_certified(block), &no_witness());
 
     assert!(storage.get_certificate(&wave_id).is_some());
 }
@@ -867,8 +854,7 @@ fn test_ec_survives_reopen() {
     {
         let storage = RocksDbShardStorage::open(temp_dir.path()).unwrap();
         let block = make_test_block(BlockHeight::new(0));
-        let qc = make_test_qc(&block);
-        storage.commit_block(&Arc::new(block), &Arc::new(qc), &no_witness());
+        storage.commit_block(&make_test_certified(block), &no_witness());
         let mut block = make_test_block(BlockHeight::new(1));
         push_wave(
             &mut block,
@@ -877,8 +863,7 @@ fn test_ec_survives_reopen() {
                 vec![],
             )),
         );
-        let qc = make_test_qc(&block);
-        storage.commit_block(&Arc::new(block), &Arc::new(qc), &no_witness());
+        storage.commit_block(&make_test_certified(block), &no_witness());
     }
 
     {
@@ -905,10 +890,8 @@ fn test_ec_atomic_with_block_commit() {
             vec![],
         )),
     );
-    let qc = make_test_qc(&block);
-
     // Commit block with EC atomically
-    storage.commit_block(&Arc::new(block), &Arc::new(qc), &no_witness());
+    storage.commit_block(&make_test_certified(block), &no_witness());
 
     let cert = storage
         .get_execution_certificate(&wave_id)
@@ -961,11 +944,12 @@ fn rocks_commit_with(
         ));
         push_wave(&mut block, wave);
     }
-    storage.commit_block(
-        &Arc::new(block),
-        &Arc::new(<Verified<_>>::clone(qc)),
-        &no_witness(),
-    );
+    // SAFETY: synthetic test fixture; round-trip tests don't exercise
+    // the `Verified<CertifiedBlock>` predicate.
+    let certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked(
+        CertifiedBlock::new_unchecked(block, <Verified<_>>::clone(qc)),
+    ));
+    storage.commit_block(&certified, &no_witness());
 }
 
 /// State-history walkthrough: key K created at V1 with value A, deleted

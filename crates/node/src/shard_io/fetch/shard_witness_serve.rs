@@ -124,11 +124,11 @@ mod tests {
     use hyperscale_types::network::request::beacon::GetShardWitnessesRequest;
     use hyperscale_types::{
         BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight,
-        BoundedVec, CertificateRoot, Hash, InFlightCount, LeafIndex, LocalReceiptRoot,
-        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardGroupId,
-        ShardWitnessPayload, SignerBitfield, Stake, StakePoolId, StateRoot, TransactionRoot,
-        ValidatorId, Verified, WeightedTimestamp, compute_merkle_root, verify_merkle_inclusion,
-        zero_bls_signature,
+        BoundedVec, CertificateRoot, CertifiedBlock, Hash, InFlightCount, LeafIndex,
+        LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round,
+        ShardGroupId, ShardWitnessPayload, SignerBitfield, Stake, StakePoolId, StateRoot,
+        TransactionRoot, ValidatorId, Verified, WeightedTimestamp, compute_merkle_root,
+        verify_merkle_inclusion, zero_bls_signature,
     };
 
     use super::*;
@@ -211,7 +211,12 @@ mod tests {
         };
         // SAFETY: synthetic test fixture, no real signature.
         let qc = Verified::<QuorumCertificate>::new_unchecked(qc);
-        storage.commit_block(&Arc::new(block), &Arc::new(qc), &witness);
+        // SAFETY: synthetic test fixture; round-trip tests don't
+        // exercise the `Verified<CertifiedBlock>` predicate.
+        let certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked(
+            CertifiedBlock::new_unchecked(block, qc),
+        ));
+        storage.commit_block(&certified, &witness);
         (block_hash, root, leaf_count_at_block_end)
     }
 

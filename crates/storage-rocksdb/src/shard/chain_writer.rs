@@ -10,7 +10,8 @@ use hyperscale_storage::{
     merge_database_updates, merge_updates_from_receipts,
 };
 use hyperscale_types::{
-    Block, BlockHeight, FinalizedWave, QuorumCertificate, StateRoot, StoredReceipt, Verified,
+    Block, BlockHeight, CertifiedBlock, FinalizedWave, QuorumCertificate, StateRoot, StoredReceipt,
+    Verified,
 };
 use radix_substate_store_interface::interface::DatabaseUpdates;
 use rocksdb::{WriteBatch, WriteOptions};
@@ -153,18 +154,21 @@ impl ShardChainWriter for RocksDbShardStorage {
         let total = blocks.len();
         let mut roots = Vec::with_capacity(total);
 
-        for (i, (prepared, block, qc, witness)) in blocks.into_iter().enumerate() {
+        for (i, (prepared, certified, witness)) in blocks.into_iter().enumerate() {
             let result_root = prepared.jmt_snapshot.result_root;
 
             let mut write_batch = prepared.write_batch;
+
+            let block = certified.block();
+            let qc = certified.qc_verified();
 
             // Persist block data (header, transactions, certificates) +
             // beacon-witness leaves atomically. Receipt writes are
             // already in the write_batch from prepare time.
             self.append_block_to_batch(
                 &mut write_batch,
-                &block,
-                &qc,
+                block,
+                qc,
                 witness.leaf_count_at_block_end,
             );
             self.append_beacon_witnesses_to_batch(
@@ -173,7 +177,7 @@ impl ShardChainWriter for RocksDbShardStorage {
                 &witness.leaves,
             );
 
-            append_block_certs_to_batch(self, &mut write_batch, &block);
+            append_block_certs_to_batch(self, &mut write_batch, block);
 
             // Defer fsync for all blocks except the last. The final sync=true
             // flushes the entire WAL, covering all prior deferred writes.
@@ -181,8 +185,8 @@ impl ShardChainWriter for RocksDbShardStorage {
             let applied = self.try_apply_prepared_commit(
                 write_batch,
                 &prepared.jmt_snapshot,
-                &block,
-                &qc,
+                block,
+                qc,
                 sync,
             );
             if applied {
@@ -218,8 +222,8 @@ impl ShardChainWriter for RocksDbShardStorage {
                     let merged_updates = merge_updates_from_receipts(&receipts);
                     let root = self.commit_block_inner_locked(
                         &merged_updates,
-                        &block,
-                        &qc,
+                        block,
+                        qc,
                         &receipts,
                         &witness,
                     );
@@ -233,10 +237,11 @@ impl ShardChainWriter for RocksDbShardStorage {
 
     fn commit_block(
         &self,
-        block: &Arc<Block>,
-        qc: &Arc<Verified<QuorumCertificate>>,
+        certified: &Arc<Verified<CertifiedBlock>>,
         witness: &BeaconWitnessCommit,
     ) -> StateRoot {
+        let block = certified.block();
+        let qc = certified.qc_verified();
         let receipts: Vec<StoredReceipt> = block
             .certificates()
             .iter()
@@ -285,8 +290,8 @@ impl RocksDbShardStorage {
     fn commit_block_inner_locked(
         &self,
         merged_updates: &DatabaseUpdates,
-        block: &Arc<Block>,
-        qc: &Arc<Verified<QuorumCertificate>>,
+        block: &Block,
+        qc: &Verified<QuorumCertificate>,
         receipts: &[StoredReceipt],
         witness: &BeaconWitnessCommit,
     ) -> StateRoot {

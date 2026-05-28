@@ -30,17 +30,17 @@ use hyperscale_storage::{
 #[cfg(test)]
 use hyperscale_types::BeaconWitnessLeafCount;
 use hyperscale_types::{
-    Block, BlockHash, BlockHeight, CertifiedBlock, ConsensusReceipt, FinalizedWave, LocalTimestamp,
-    QuorumCertificate, ShardGroupId, StateRoot, Verified,
+    BlockHash, BlockHeight, CertifiedBlock, ConsensusReceipt, FinalizedWave, LocalTimestamp,
+    ShardGroupId, StateRoot, Verified,
 };
 use tracing::debug;
 
 use crate::shard_loop::{ShardEvent, push_protocol_event};
 
-/// Block + QC pair handed back to the `io_loop` to build a [`CertifiedBlock`]
-/// for immediate `BlockCommitted` delivery. Cloned `Arc` handles to the
-/// commit just enqueued in the pending backlog.
-pub type NotifyHandles = (Arc<Block>, Arc<Verified<QuorumCertificate>>);
+/// Handle to the assembled `Verified<CertifiedBlock>` that the
+/// `io_loop` forwards to `BlockCommitted`. Cloned `Arc` to the commit
+/// just enqueued in the pending backlog.
+pub type NotifyHandle = Arc<Verified<CertifiedBlock>>;
 
 /// Prepared commit cache: `block_hash → (block_height, prepared_commit)`.
 ///
@@ -71,10 +71,9 @@ pub enum QcOnlyKind {
 /// (sync-burst sibling preps racing each other, an already-prepared
 /// child overtaking a queued parent) trips that assertion.
 pub struct QcOnlyPending {
-    /// Block being committed.
-    pub block: Arc<Block>,
-    /// QC certifying `block`.
-    pub qc: Arc<Verified<QuorumCertificate>>,
+    /// Block + certifying QC, with the full
+    /// [`Verified<CertifiedBlock>`] predicate established upstream.
+    pub certified: Arc<Verified<CertifiedBlock>>,
     /// Parent's state root (base for the JMT recomputation). Unused
     /// when `kind == AlreadyPrepared`.
     pub parent_state_root: StateRoot,
@@ -160,18 +159,19 @@ pub fn run_qc_only_prep<S>(
 where
     S: ShardStorage,
 {
-    let block_hash = pending.block.hash();
-    let height = pending.block.height();
+    let block = pending.certified.block();
+    let block_hash = block.hash();
+    let height = block.height();
 
     // Build view anchored at parent — includes prior synced blocks'
     // JMT snapshots so chained verification can find parent nodes.
     let view = pending_chain.view_at(
-        pending.block.header().parent_block_hash(),
+        block.header().parent_block_hash(),
         pending.parent_block_height,
     );
     let pending_snapshots = view.pending_snapshots().to_vec();
 
-    let finalized_waves: Vec<Arc<FinalizedWave>> = pending.block.certificates().to_vec();
+    let finalized_waves: Vec<Arc<FinalizedWave>> = block.certificates().to_vec();
     let (computed_root, prepared) = view.prepare_block_commit(
         pending.parent_state_root,
         pending.parent_block_height,
@@ -189,7 +189,7 @@ where
     // canonical — a JMT or commit-batch bug, or pre-existing corruption
     // in `StateCf`. Block-by-block sync can't repair this; the operator
     // must restore from a state snapshot or wipe-and-resync from genesis.
-    let expected_root = pending.block.header().state_root();
+    let expected_root = block.header().state_root();
     if computed_root != expected_root {
         return Err(Box::new(QcOnlyDivergence {
             block_height: height,
@@ -207,10 +207,11 @@ where
         .iter()
         .flat_map(|fw| fw.consensus_receipts())
         .collect();
+    let parent_block_hash = block.header().parent_block_hash();
     pending_chain.insert(
         block_hash,
         ChainEntry {
-            parent_block_hash: pending.block.header().parent_block_hash(),
+            parent_block_hash,
             height,
             receipts,
             jmt_snapshot,
@@ -279,10 +280,9 @@ where
 /// All blocks — consensus and sync — go through the same commit pipeline:
 /// `VerifyStateRoot` → `PreparedCommit` → `commit_prepared_blocks`.
 pub struct PendingCommit {
-    /// Block being committed.
-    pub block: Arc<Block>,
-    /// Quorum certificate certifying `block`.
-    pub qc: Arc<Verified<QuorumCertificate>>,
+    /// Block + certifying QC, with the full
+    /// [`Verified<CertifiedBlock>`] predicate established upstream.
+    pub certified: Arc<Verified<CertifiedBlock>>,
     /// How this node learned the certifying QC. Tagged into metrics so
     /// dashboards can separate aggregator/header/sync commit paths.
     pub source: CommitSource,
@@ -305,11 +305,12 @@ pub enum AccumulateDecision {
     Accepted {
         /// Height of the accepted block (used to advance the sync protocol).
         height: BlockHeight,
-        /// Block + QC for the accepted commit. The caller attaches the
-        /// pair to `PendingChain` so the shard-committed-but-not-persisted
-        /// window is readable by fetch handlers, then — if `notify_now`
-        /// — uses the same handles to fire `BlockCommitted`.
-        handles: NotifyHandles,
+        /// `Verified<CertifiedBlock>` handle for the accepted commit.
+        /// The caller attaches it to `PendingChain` so the shard-
+        /// committed-but-not-persisted window is readable by fetch
+        /// handlers, then — if `notify_now` — forwards the same handle
+        /// to `BlockCommitted`.
+        handle: NotifyHandle,
         /// True if the `io_loop` should fire `BlockCommitted` immediately.
         /// False under persistence backpressure: the flush closure fires
         /// the event after the disk write completes instead.
@@ -505,8 +506,8 @@ where
         mut commit: PendingCommit,
         now: LocalTimestamp,
     ) -> AccumulateDecision {
-        let block_hash = commit.block.hash();
-        let height = commit.block.height();
+        let block_hash = commit.certified.block().hash();
+        let height = commit.certified.block().height();
 
         // Skip blocks already persisted by the sync path.
         if height <= self.persisted_height {
@@ -516,7 +517,11 @@ where
         // Dedup: consensus and sync paths can both reach commit for the same
         // block (e.g. self-proposed block whose child arrived via sync). Push
         // once; the prepared commit is also singular in `prepared_commits`.
-        if self.pending.iter().any(|c| c.block.hash() == block_hash) {
+        if self
+            .pending
+            .iter()
+            .any(|c| c.certified.block().hash() == block_hash)
+        {
             return AccumulateDecision::Skip;
         }
 
@@ -526,8 +531,10 @@ where
         // under the 2-chain rule.
         let now_ms = now.as_millis();
         #[allow(clippy::cast_precision_loss)] // latency readout for metrics; ms→f64 lossy is fine
-        let commit_latency_secs =
-            (now_ms.saturating_sub(commit.block.header().timestamp().as_millis())) as f64 / 1000.0;
+        let commit_latency_secs = (now_ms
+            .saturating_sub(commit.certified.block().header().timestamp().as_millis()))
+            as f64
+            / 1000.0;
         record_block_committed(
             self.shard.inner(),
             commit_latency_secs,
@@ -550,13 +557,13 @@ where
             );
         }
 
-        let handles = (Arc::clone(&commit.block), Arc::clone(&commit.qc));
+        let handle = Arc::clone(&commit.certified);
         commit.committed_notified = notify_now;
         self.pending.push(commit);
 
         AccumulateDecision::Accepted {
             height,
-            handles,
+            handle,
             notify_now,
         }
     }
@@ -595,7 +602,7 @@ where
 
         // Drop blocks already persisted by the sync path.
         let persisted = self.persisted_height.inner();
-        commits.retain(|c| c.block.height().inner() > persisted);
+        commits.retain(|c| c.certified.block().height().inner() > persisted);
         if commits.is_empty() {
             return;
         }
@@ -607,13 +614,14 @@ where
         // sorting, the child block (which may lack a PreparedCommit) would defer
         // and block the ready parent, causing a deadlock where BlockPersisted
         // never fires and sync_awaiting_persistence_height is never satisfied.
-        commits.sort_by_key(|c| c.block.height().inner());
+        commits.sort_by_key(|c| c.certified.block().height().inner());
 
         // `commits` is non-empty (checked above) and sorted ascending by height.
         let max_committed_height = commits
             .last()
             .expect("commits is non-empty after the early return")
-            .block
+            .certified
+            .block()
             .height();
 
         // Blocks committed via CommitBlock need the PreparedCommit produced
@@ -628,7 +636,10 @@ where
             let mut deferring = false;
             for commit in commits {
                 if !deferring {
-                    if let Some(prepared) = cache.remove(&commit.block.hash()).map(|(_, p)| p) {
+                    if let Some(prepared) = cache
+                        .remove(&commit.certified.block().hash())
+                        .map(|(_, p)| p)
+                    {
                         prepared_map.push(prepared);
                         ready_commits.push(commit);
                         continue;
@@ -637,8 +648,8 @@ where
                     // defer too, preserving height ordering.
                     deferring = true;
                     tracing::debug!(
-                        height = commit.block.height().inner(),
-                        certs = commit.block.certificates().len(),
+                        height = commit.certified.block().height().inner(),
+                        certs = commit.certified.block().certificates().len(),
                         "Deferring block commit — awaiting PreparedCommit from VerifyStateRoot"
                     );
                 }
@@ -674,7 +685,10 @@ where
             let mut batch: Vec<PreparedCommitBatchEntry<S::PreparedCommit>> =
                 Vec::with_capacity(commits.len());
 
-            let heights: Vec<BlockHeight> = commits.iter().map(|c| c.block.height()).collect();
+            let heights: Vec<BlockHeight> = commits
+                .iter()
+                .map(|c| c.certified.block().height())
+                .collect();
 
             // Wrap commits in Option so we can take() them for deferred notifications.
             let mut commit_slots: Vec<Option<PendingCommit>> =
@@ -684,8 +698,7 @@ where
                 let commit = commit_slots[i].as_ref().unwrap();
                 batch.push((
                     prepared,
-                    Arc::clone(&commit.block),
-                    Arc::clone(&commit.qc),
+                    Arc::clone(&commit.certified),
                     commit.witness.clone(),
                 ));
             }
@@ -703,21 +716,7 @@ where
             for (i, _) in heights.iter().enumerate() {
                 if !already_notified[i] {
                     let commit = commit_slots[i].take().unwrap();
-                    // SAFETY: the QC rides in typed `Verified<QC>` from
-                    // the `Action::CommitBlock` / `CommitBlockByQcOnly`
-                    // payload. The block predicate (header verified +
-                    // every applicable per-root verifier succeeded)
-                    // holds because the commit pipeline only enqueues
-                    // commits after voting completed or sync ran the
-                    // equivalent checks. The linkage between QC and
-                    // block-hash was enforced at the coordinator before
-                    // dispatch.
-                    let certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked(
-                        CertifiedBlock::new_unchecked(
-                            Arc::unwrap_or_clone(commit.block),
-                            Arc::unwrap_or_clone(commit.qc),
-                        ),
-                    ));
+                    let certified = commit.certified;
                     push_protocol_event(
                         &event_tx,
                         shard,
@@ -822,8 +821,8 @@ mod tests {
         ) -> Vec<StateRoot> {
             let mut committed = self.committed.lock().unwrap();
             let mut roots = Vec::with_capacity(blocks.len());
-            for (prepared, block, _qc, _witness) in blocks {
-                committed.push((block.height(), prepared.tag));
+            for (prepared, certified, _witness) in blocks {
+                committed.push((certified.block().height(), prepared.tag));
                 roots.push(StateRoot::ZERO);
             }
             roots
@@ -831,8 +830,7 @@ mod tests {
 
         fn commit_block(
             &self,
-            _block: &Arc<Block>,
-            _qc: &Arc<Verified<QuorumCertificate>>,
+            _certified: &Arc<Verified<CertifiedBlock>>,
             _witness: &BeaconWitnessCommit,
         ) -> StateRoot {
             unreachable!("BlockCommitCoordinator does not call commit_block");
@@ -884,9 +882,12 @@ mod tests {
         let _ = committee; // committee unused here but kept for future signing-required tests
         // SAFETY: synthetic test fixture, no real signature.
         let qc = Verified::<QuorumCertificate>::new_unchecked(qc);
+        let certified = CertifiedBlock::new_unchecked(block, qc);
+        // SAFETY: synthetic test fixture; block-commit-coordinator tests
+        // don't exercise the `Verified<CertifiedBlock>` predicate.
+        let certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked(certified));
         let pending = PendingCommit {
-            block: Arc::new(block),
-            qc: Arc::new(qc),
+            certified,
             source,
             committed_notified: false,
             witness: BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO),
@@ -961,7 +962,7 @@ mod tests {
         let (first, _) = make_commit(&committee, BlockHeight::new(1), CommitSource::Aggregator);
         let (dup, _) = make_commit(&committee, BlockHeight::new(1), CommitSource::Sync);
         // Same height + builder-deterministic header → same hash.
-        assert_eq!(first.block.hash(), dup.block.hash());
+        assert_eq!(first.certified.block().hash(), dup.certified.block().hash());
 
         assert!(matches!(
             coord.accumulate(first, now()),
@@ -1040,11 +1041,11 @@ mod tests {
         let pending = &coord.pending;
         let h_deferred = pending
             .iter()
-            .find(|c| c.block.height() == BlockHeight::new(max_lag + 1))
+            .find(|c| c.certified.block().height() == BlockHeight::new(max_lag + 1))
             .unwrap();
         let h_immediate = pending
             .iter()
-            .find(|c| c.block.height() == BlockHeight::new(1))
+            .find(|c| c.certified.block().height() == BlockHeight::new(1))
             .unwrap();
         assert!(!h_deferred.committed_notified);
         assert!(h_immediate.committed_notified);
@@ -1071,7 +1072,7 @@ mod tests {
         let coord =
             BlockCommitCoordinator::<MockStorage>::new(ShardGroupId::new(0), BlockHeight::GENESIS);
         let (commit, prepared) = make_commit(&committee, BlockHeight::new(1), CommitSource::Sync);
-        let hash = commit.block.hash();
+        let hash = commit.certified.block().hash();
 
         assert!(!coord.has_prepared(&hash));
         coord.insert_prepared(hash, BlockHeight::new(1), prepared);
@@ -1104,7 +1105,7 @@ mod tests {
         source: CommitSource,
     ) -> BlockHash {
         let (commit, prepared) = make_commit(committee, height, source);
-        let hash = commit.block.hash();
+        let hash = commit.certified.block().hash();
         let _ = coord.accumulate(commit, now());
         coord.insert_prepared(hash, height, prepared);
         hash
@@ -1246,7 +1247,7 @@ mod tests {
         let pending_heights: Vec<u64> = coord
             .pending
             .iter()
-            .map(|c| c.block.height().inner())
+            .map(|c| c.certified.block().height().inner())
             .collect();
         assert!(pending_heights.contains(&2));
         assert!(pending_heights.contains(&3));
@@ -1389,7 +1390,7 @@ mod tests {
         let dispatch = SyncDispatch::new();
 
         let (commit, _) = make_commit(&committee, BlockHeight::new(1), CommitSource::Sync);
-        let hash = commit.block.hash();
+        let hash = commit.certified.block().hash();
         let tag = next_tag();
         install_prepared(&coord, hash, BlockHeight::new(1), tag);
         let _ = coord.accumulate(commit, now());
