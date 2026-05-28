@@ -368,7 +368,7 @@ pub enum FinalizedWaveVerifyError {
 /// `wave.execution_certificates()` verifies under its corresponding
 /// `ec_public_keys[i]` committee.
 ///
-/// Construction goes through one of three gates:
+/// Construction goes through one of four gates:
 ///
 /// - [`<FinalizedWave as Verify>::verify`](Verify::verify) — runs the
 ///   embedded-EC predicate over every constituent EC.
@@ -377,6 +377,12 @@ pub enum FinalizedWaveVerifyError {
 ///   [`Verified::<ExecutionCertificate>::aggregate`] gate.
 /// - [`Verified::<FinalizedWave>::from_remote_attestation`] — named
 ///   alias for the `verify` path, used at wire-admission sites.
+/// - [`Verified::<FinalizedWave>::from_committed_block`] — wraps a
+///   wave reaching downstream consumers via a
+///   [`Verified<CertifiedBlock>`], where the source committee's QC
+///   BFT-transitively attests the per-EC signature claim.
+///
+/// [`Verified<CertifiedBlock>`]: crate::CertifiedBlock
 impl Verify<&FinalizedWaveContext<'_>> for FinalizedWave {
     type Error = FinalizedWaveVerifyError;
 
@@ -436,6 +442,32 @@ impl Verified<FinalizedWave> {
         ctx: &FinalizedWaveContext<'_>,
     ) -> Result<Self, FinalizedWaveVerifyError> {
         wave.verify(ctx)
+    }
+
+    /// Wrap a finalized wave reaching the system via a committed block.
+    ///
+    /// Trust source: the wave was carried inside a
+    /// [`Verified<CertifiedBlock>`]; 2f+1 of the block's committee
+    /// signed over `block.hash()`, which commits to every contained
+    /// wave via the header's `certificate_root` and to each wave's
+    /// receipt set via `local_receipt_root`. Honest signers ran the
+    /// per-EC BLS predicate before voting, so the predicate
+    /// [`<FinalizedWave as Verify>::verify`] would run is
+    /// BFT-transitively attested by that committee.
+    ///
+    /// Used at sync admission, where the QC chain replaces local
+    /// per-EC signature checks on each contained wave.
+    ///
+    /// [`Verified<CertifiedBlock>`]: crate::CertifiedBlock
+    #[must_use]
+    pub const fn from_committed_block(wave: FinalizedWave) -> Self {
+        // SAFETY: the wave was carried in a `Verified<CertifiedBlock>`;
+        // the source committee's QC attests its inclusion and per-EC
+        // signature checks via the block's `certificate_root` and
+        // `local_receipt_root`. Mirrors `Verified::<Provisions>::from_committed_block`
+        // and the QC-transitive trust shape on
+        // `Verified::<CertifiedBlock>::from_qc_attestation`.
+        Self::new_unchecked(wave)
     }
 }
 
@@ -594,6 +626,27 @@ mod tests {
             err,
             FinalizedWaveVerifyError::ExecutionCertificate { index: 1, .. }
         ));
+    }
+
+    /// `from_committed_block` produces a verified wave whose inner is
+    /// byte-equal to the input — the gate names the trust source, it
+    /// does not modify the wave. Honest signers behind a real
+    /// `Verified<CertifiedBlock>` would have already cleared every
+    /// contained EC's BLS predicate; this test pins the gate's
+    /// no-op-on-content shape.
+    #[test]
+    fn from_committed_block_wraps_input_without_modification() {
+        let net = NetworkDefinition::simulator();
+        let local_wid = wave_id(0, 7, &[]);
+        let sks: Vec<Bls12381G1PrivateKey> = (0..2).map(|_| generate_bls_keypair()).collect();
+        let outcomes = vec![make_outcome(1)];
+        let ec = make_verified_ec(&net, &local_wid, &outcomes, &sks).into_inner();
+
+        let wc = Arc::new(WaveCertificate::new(local_wid, vec![Arc::new(ec)]));
+        let wave = FinalizedWave::new(wc, vec![]);
+
+        let verified = Verified::<FinalizedWave>::from_committed_block(wave.clone());
+        assert_eq!(verified.into_inner(), wave);
     }
 
     /// `ec_public_keys` length must match the number of ECs.

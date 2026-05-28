@@ -2831,12 +2831,17 @@ impl ShardCoordinator {
         }
 
         // Adopt the parent_qc from the block header if it's newer still.
-        // The synced block's QC vouches for its embedded waves, so wrap
-        // them with the typed marker for typed downstream consumers.
+        // The synced block's QC BFT-transitively attests every embedded
+        // wave's per-EC signature predicate via the source committee's
+        // signature over `certificate_root` + `local_receipt_root`.
         let synced_waves: Vec<Arc<Verified<FinalizedWave>>> = block
             .certificates()
             .iter()
-            .map(|fw| Arc::new(Verified::<FinalizedWave>::seal((**fw).clone())))
+            .map(|fw| {
+                Arc::new(Verified::<FinalizedWave>::from_committed_block(
+                    (**fw).clone(),
+                ))
+            })
             .collect();
         let parent_qc_height = block.header().parent_qc().height();
         let parent_qc_not_genesis = !block.header().parent_qc().is_genesis();
