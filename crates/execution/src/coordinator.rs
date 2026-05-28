@@ -989,12 +989,30 @@ impl ExecutionCoordinator {
         cert: ExecutionCertificate,
     ) -> Vec<Action> {
         let shard = cert.shard_group_id();
+        let wire_hash = cert.wire_hash();
+
+        // Cached-verified short-circuit. `exec_certs` is shared across
+        // same-shard vnodes (one `Arc<ExecCertStore>` per shard), so a
+        // peer vnode's aggregation makes this EC available to ours
+        // before the gossip arrives. A wire-hash match against the
+        // cached entry means this is the same aggregation we already
+        // verified and routed; a mismatch is a different aggregation
+        // of the same logical EC and still needs its own BLS check.
+        if let Some(cached) = self.exec_certs.get(cert.wave_id())
+            && cached.wire_hash() == wire_hash
+        {
+            tracing::debug!(
+                shard = shard.inner(),
+                wave = %cert.wave_id(),
+                "Cached verified EC matches incoming wire hash — skipping BLS dispatch"
+            );
+            return vec![];
+        }
 
         // Skip BLS dispatch for byte-identical retransmits while a
         // verification is already in flight. Different aggregations of the
         // same logical EC produce distinct wire bytes, so the legitimate
         // case of "first aggregation invalid, second valid" is preserved.
-        let wire_hash = cert.wire_hash();
         if !self.pending_ec_verifications.insert(wire_hash) {
             tracing::debug!(
                 shard = shard.inner(),
@@ -2731,6 +2749,86 @@ mod tests {
         assert_eq!(again.len(), 1);
         assert!(matches!(
             again[0],
+            Action::VerifyExecutionCertificateSignature { .. }
+        ));
+    }
+
+    /// An EC already in `exec_certs` (placed there by a co-hosted vnode's
+    /// aggregation, or by an earlier verification of the same wire bytes)
+    /// short-circuits the BLS dispatch on a wire-hash match.
+    #[test]
+    fn on_wave_certificate_skips_dispatch_on_cached_wire_hash_match() {
+        let topo = make_test_topology();
+        let mut state = make_test_state();
+
+        let wave_id = WaveId::new(ShardGroupId::new(0), BlockHeight::new(1), BTreeSet::new());
+        let mut signers = SignerBitfield::new(4);
+        signers.set(0);
+        signers.set(1);
+        signers.set(2);
+        let cert = ExecutionCertificate::new(
+            wave_id,
+            WeightedTimestamp::ZERO,
+            GlobalReceiptRoot::ZERO,
+            vec![],
+            zero_bls_signature(),
+            signers,
+        );
+        state
+            .exec_certs
+            .insert(Arc::new(Verified::new_unchecked_for_test(cert.clone())));
+
+        let actions = state.on_wave_certificate(&topo, cert);
+        assert!(
+            actions.is_empty(),
+            "cached wire-hash match must short-circuit"
+        );
+    }
+
+    /// A different aggregation of the same logical EC (same `WaveId` but
+    /// distinct signers / signature, hence distinct wire bytes) is not
+    /// short-circuited by an earlier cache entry — it still needs its own
+    /// BLS check.
+    #[test]
+    fn on_wave_certificate_falls_through_on_cached_wave_id_with_wire_hash_mismatch() {
+        let topo = make_test_topology();
+        let mut state = make_test_state();
+
+        let wave_id = WaveId::new(ShardGroupId::new(0), BlockHeight::new(1), BTreeSet::new());
+        let mut signers_a = SignerBitfield::new(4);
+        signers_a.set(0);
+        signers_a.set(1);
+        signers_a.set(2);
+        let mut signers_b = SignerBitfield::new(4);
+        signers_b.set(1);
+        signers_b.set(2);
+        signers_b.set(3);
+
+        let cached = ExecutionCertificate::new(
+            wave_id.clone(),
+            WeightedTimestamp::ZERO,
+            GlobalReceiptRoot::ZERO,
+            vec![],
+            zero_bls_signature(),
+            signers_a,
+        );
+        let incoming = ExecutionCertificate::new(
+            wave_id,
+            WeightedTimestamp::ZERO,
+            GlobalReceiptRoot::ZERO,
+            vec![],
+            zero_bls_signature(),
+            signers_b,
+        );
+        assert_ne!(cached.wire_hash(), incoming.wire_hash());
+        state
+            .exec_certs
+            .insert(Arc::new(Verified::new_unchecked_for_test(cached)));
+
+        let actions = state.on_wave_certificate(&topo, incoming);
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(
+            actions[0],
             Action::VerifyExecutionCertificateSignature { .. }
         ));
     }
