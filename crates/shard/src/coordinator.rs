@@ -2257,7 +2257,7 @@ impl ShardCoordinator {
     /// Returns (`tx_count`, `cert_count`). Both are 0 if the QC won't trigger a commit
     /// or the block data isn't available.
     #[must_use]
-    pub fn pending_commit_counts(&self, qc: &QuorumCertificate) -> (usize, usize) {
+    pub fn pending_commit_counts(&self, qc: &Verified<QuorumCertificate>) -> (usize, usize) {
         if !qc.has_committable_block() {
             return (0, 0);
         }
