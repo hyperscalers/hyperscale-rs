@@ -25,9 +25,8 @@ use sbor::prelude::BasicSbor;
 
 use crate::{
     Block, BlockHash, BlockHeader, BloomFilter, BloomKey, BoundedVec, CertifiedBlock,
-    FinalizedWave, LinkageError, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK,
-    MAX_TXS_PER_BLOCK, ProvisionHash, Provisions, QuorumCertificate, RoutableTransaction, TxHash,
-    Verifiable, Verified, WaveId,
+    FinalizedWave, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK,
+    ProvisionHash, Provisions, QuorumCertificate, RoutableTransaction, TxHash, Verifiable, WaveId,
 };
 
 /// Inventory of locally-known item hashes, grouped by category.
@@ -342,43 +341,6 @@ impl ElidedCertifiedBlock {
             }
         };
         Ok(CertifiedBlock::new_unchecked(block, self.qc.clone()))
-    }
-}
-
-impl Verified<ElidedCertifiedBlock> {
-    /// Pair an [`ElidedCertifiedBlock`] with a verified QC after
-    /// confirming the linkage invariant.
-    ///
-    /// Construction asserts: the inline QC was verified, and
-    /// `qc.block_hash == header.hash()`. Per-element verification of
-    /// the inline transaction / certificate bodies is *not* part of
-    /// this predicate — callers that need verified bodies run those
-    /// checks separately at admission, the same way they would on a
-    /// rehydrated [`CertifiedBlock`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`LinkageError::BlockHashMismatch`] when
-    /// `qc.block_hash != elided.header().hash()`.
-    pub fn assemble_from_qc(
-        elided: ElidedCertifiedBlock,
-        qc: Verified<QuorumCertificate>,
-    ) -> Result<Self, LinkageError> {
-        let header_hash = elided.header.hash();
-        let qc_block_hash = qc.block_hash();
-        if qc_block_hash != header_hash {
-            return Err(LinkageError::BlockHashMismatch {
-                block_hash: header_hash,
-                qc_block_hash,
-            });
-        }
-        Ok(Self::new_unchecked(ElidedCertifiedBlock {
-            header: elided.header,
-            qc: Verifiable::Verified(qc),
-            transactions: elided.transactions,
-            certificates: elided.certificates,
-            provisions: elided.provisions,
-        }))
     }
 }
 
