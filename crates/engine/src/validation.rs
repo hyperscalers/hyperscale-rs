@@ -75,9 +75,6 @@ pub struct TransactionValidation {
     network: NetworkDefinition,
     /// Cached Radix transaction validator
     validator: TransactionValidator,
-    /// When true, all transactions are accepted without crypto verification.
-    /// Used in simulation/test environments with synthetic transactions.
-    permissive: bool,
 }
 
 impl TransactionValidation {
@@ -85,25 +82,7 @@ impl TransactionValidation {
     #[must_use]
     pub fn new(network: NetworkDefinition) -> Self {
         let validator = TransactionValidator::new_with_latest_config(&network);
-        Self {
-            network,
-            validator,
-            permissive: false,
-        }
-    }
-
-    /// Create a permissive validator that accepts all transactions.
-    ///
-    /// Used in simulation/test environments where synthetic transactions
-    /// don't have valid cryptographic signatures.
-    #[must_use]
-    pub fn permissive(network: NetworkDefinition) -> Self {
-        let validator = TransactionValidator::new_with_latest_config(&network);
-        Self {
-            network,
-            validator,
-            permissive: true,
-        }
+        Self { network, validator }
     }
 
     /// Validate a transaction's signatures synchronously.
@@ -121,17 +100,13 @@ impl TransactionValidation {
     /// # Errors
     ///
     /// Returns [`ValidationError::PreparationFailed`] when the transaction
-    /// fails Radix decoding or signature verification. Permissive validators
-    /// always return `Ok(())`.
+    /// fails Radix decoding or signature verification.
     ///
     /// # Performance
     ///
     /// Signature verification is CPU-intensive. In production, this should
     /// be called on the crypto thread pool, not the main event loop.
     pub fn validate_transaction(&self, tx: &RoutableTransaction) -> Result<(), ValidationError> {
-        if self.permissive {
-            return Ok(());
-        }
         // Use cached validation if available, otherwise validate and cache
         tx.get_or_validate(&self.validator)
             .ok_or_else(|| ValidationError::PreparationFailed("Validation failed".to_string()))?;

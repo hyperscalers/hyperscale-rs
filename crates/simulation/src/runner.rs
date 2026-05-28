@@ -286,7 +286,7 @@ impl SimulationRunner {
             let (event_tx, event_rx) = unbounded();
 
             let network_def = NetworkDefinition::simulator();
-            let tx_validator = Arc::new(TransactionValidation::permissive(network_def.clone()));
+            let tx_validator = Arc::new(TransactionValidation::new(network_def.clone()));
             let executor = RadixExecutor::new(network_def);
 
             // One `SimShardStorage` per hosted shard on this host.

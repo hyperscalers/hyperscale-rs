@@ -1,16 +1,18 @@
 //! Test utilities.
 
 use radix_common::constants::PACKAGE_PACKAGE;
-use radix_common::crypto::{Ed25519PublicKey, Ed25519Signature, PublicKey as RadixPublicKey};
+use radix_common::crypto::{Ed25519PrivateKey, IsHash, PublicKey as RadixPublicKey};
 use radix_common::prelude::Epoch;
 use radix_common::types::BlueprintId;
 use radix_engine_interface::types::{Emitter, EventTypeIdentifier};
 use radix_transactions::model::{
-    BlobsV1, InstructionsV1, IntentSignaturesV1, IntentV1, MessageV1, NotarizedTransactionV1,
-    NotarySignatureV1, SignatureV1, SignedIntentV1, TransactionHeaderV1, UserTransaction,
+    BlobsV1, HasSignedTransactionIntentHash, InstructionsV1, IntentSignaturesV1, IntentV1,
+    MessageV1, NotarizedTransactionV1, NotarySignatureV1, SignatureV1, SignedIntentV1,
+    TransactionHeaderV1, TransactionPayload, UserTransaction,
 };
+use radix_transactions::prelude::PreparationSettings;
 
-use crate::{NodeId, RoutableTransaction, TimestampRange, WeightedTimestamp};
+use crate::{NetworkDefinition, NodeId, RoutableTransaction, TimestampRange, WeightedTimestamp};
 
 /// Create a test `NodeId` from a seed byte.
 #[must_use]
@@ -35,15 +37,34 @@ pub fn test_event_type_identifier(seed: u8) -> EventTypeIdentifier {
     )
 }
 
+/// Fixed Ed25519 keypair used as the notary for every fixture-built
+/// transaction. Deterministic across runs so test fixtures produce
+/// repeatable tx hashes.
+fn test_notary_key() -> Ed25519PrivateKey {
+    // 32 bytes of 0x42, fixed and unprivileged.
+    Ed25519PrivateKey::from_bytes(&[0x42u8; 32]).expect("static 32-byte seed is valid")
+}
+
 /// Create a minimal test `NotarizedTransactionV1` from seed bytes.
 ///
-/// This creates a valid but minimal transaction structure for testing.
-/// The transaction won't execute successfully but is structurally valid.
+/// The resulting transaction has a properly-computed notary signature
+/// against the intent hash (using a fixed test keypair) and no intent
+/// signatures, so Radix's `prepare_and_validate` accepts it. The
+/// transaction won't execute successfully — its manifest is empty —
+/// but admission-time validation passes, which is what test fixtures
+/// downstream of the validation pool need.
+///
+/// # Panics
+///
+/// Panics if intent or signed-intent preparation fails. Both are
+/// deterministic over the fixture's constant header / empty
+/// instructions, so a panic here indicates a Radix-side breaking
+/// change to preparation rather than a runtime condition.
 #[must_use]
 pub fn test_notarized_transaction_v1(seed_bytes: &[u8]) -> NotarizedTransactionV1 {
-    // Create minimal header with unique nonce from seed
+    let notary = test_notary_key();
     let header = TransactionHeaderV1 {
-        network_id: 0xf2, // Simulator network
+        network_id: NetworkDefinition::simulator().id,
         start_epoch_inclusive: Epoch::of(0),
         end_epoch_exclusive: Epoch::of(100),
         nonce: {
@@ -53,12 +74,11 @@ pub fn test_notarized_transaction_v1(seed_bytes: &[u8]) -> NotarizedTransactionV
             }
             u32::from_le_bytes(nonce_bytes)
         },
-        notary_public_key: RadixPublicKey::Ed25519(Ed25519PublicKey([0u8; 32])),
-        notary_is_signatory: false,
+        notary_public_key: RadixPublicKey::Ed25519(notary.public_key()),
+        notary_is_signatory: true,
         tip_percentage: 0,
     };
 
-    // Create a minimal intent
     let intent = IntentV1 {
         header,
         instructions: InstructionsV1(vec![]),
@@ -66,16 +86,24 @@ pub fn test_notarized_transaction_v1(seed_bytes: &[u8]) -> NotarizedTransactionV
         message: MessageV1::None,
     };
 
-    // Create signed intent with no signatures
     let signed_intent = SignedIntentV1 {
         intent,
         intent_signatures: IntentSignaturesV1 { signatures: vec![] },
     };
 
-    // Create notarized transaction with a zero signature
+    let prepared_signed = signed_intent
+        .prepare(&PreparationSettings::latest())
+        .expect("test signed intent always prepares");
+    let signed_intent_hash = *prepared_signed
+        .signed_transaction_intent_hash()
+        .as_hash()
+        .as_bytes();
+
+    let notary_signature = SignatureV1::Ed25519(notary.sign(signed_intent_hash));
+
     NotarizedTransactionV1 {
         signed_intent,
-        notary_signature: NotarySignatureV1(SignatureV1::Ed25519(Ed25519Signature([0u8; 64]))),
+        notary_signature: NotarySignatureV1(notary_signature),
     }
 }
 
