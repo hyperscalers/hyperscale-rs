@@ -226,12 +226,12 @@ impl Verified<BlockMetadata> {
     /// 2. The QC pairing this metadata was verified against the
     ///    source-shard committee.
     /// 3. `qc.block_hash == header.hash()`.
-    /// 4. `manifest` is the canonical hash projection of the block's
-    ///    contents.
     ///
-    /// `manifest` and `beacon_witness_leaf_count_at_block_end` are pure
-    /// data projections of the block; they're not verified by this
-    /// constructor — callers supply them from a verified context.
+    /// `manifest` and `beacon_witness_leaf_count_at_block_end` are
+    /// caller-supplied data projections of the block; the constructor
+    /// can't recompute them without the block body, so the caller must
+    /// pass values derived from a verified context. They are not part
+    /// of the predicate above.
     ///
     /// # Errors
     ///
