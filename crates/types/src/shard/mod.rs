@@ -43,9 +43,9 @@ mod tests {
         Bls12381G2Signature, BoundedVec, CertificateRoot, ExecutionCertificate, ExecutionOutcome,
         FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, InFlightCount, LocalReceiptRoot,
         ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, SignerBitfield,
-        StateRoot, TransactionRoot, TxHash, TxOutcome, ValidatorId, Verified, WaveCertificate,
-        WaveId, WeightedTimestamp, generate_ed25519_keypair, routable_from_notarized_v1,
-        sign_and_notarize,
+        StateRoot, TransactionRoot, TxHash, TxOutcome, ValidatorId, Verifiable, Verified,
+        WaveCertificate, WaveId, WeightedTimestamp, generate_ed25519_keypair,
+        routable_from_notarized_v1, sign_and_notarize,
     };
 
     #[test]
@@ -122,7 +122,7 @@ mod tests {
 
     #[test]
     fn test_compute_certificate_root_deterministic() {
-        let make_fw = |seed: u8| -> Arc<FinalizedWave> {
+        let make_fw = |seed: u8| -> Arc<Verifiable<FinalizedWave>> {
             let ec = Arc::new(ExecutionCertificate::new(
                 WaveId::new(
                     ShardGroupId::new(0),
@@ -142,7 +142,7 @@ mod tests {
                 Bls12381G2Signature([0u8; 96]),
                 SignerBitfield::new(4),
             ));
-            Arc::new(FinalizedWave::new(
+            Arc::new(Verifiable::Unverified(FinalizedWave::new(
                 Arc::new(WaveCertificate::new(
                     WaveId::new(
                         ShardGroupId::new(0),
@@ -152,7 +152,7 @@ mod tests {
                     vec![ec],
                 )),
                 vec![],
-            ))
+            )))
         };
 
         let certs = vec![make_fw(1), make_fw(2)];
@@ -182,7 +182,8 @@ mod tests {
             vec![ec],
         ));
         let expected_receipt_hash = cert.receipt_hash();
-        let fw = Arc::new(FinalizedWave::new(cert, vec![]));
+        let fw: Arc<Verifiable<FinalizedWave>> =
+            Arc::new(Verifiable::Unverified(FinalizedWave::new(cert, vec![])));
 
         let root = Verified::<CertificateRoot>::compute(std::slice::from_ref(&fw)).into_inner();
         // Single cert: certificate_root should equal the cert's receipt_hash

@@ -12,7 +12,7 @@ use hyperscale_types::{BeaconWitnessLeafCount, BeaconWitnessRoot};
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, FinalizedWave, LocalTimestamp,
     ProvisionHash, Provisions, ReadySignal, RoutableTransaction, TopologySnapshot, TxHash,
-    Verified, WaveId,
+    Verifiable, WaveId,
 };
 use tracing::{debug, warn};
 
@@ -132,8 +132,8 @@ impl PendingBlocks {
         manifest: BlockManifest,
         now: LocalTimestamp,
         lookup_tx: impl Fn(&TxHash) -> Option<Arc<RoutableTransaction>>,
-        lookup_finalized_wave: impl Fn(&WaveId) -> Option<Arc<Verified<FinalizedWave>>>,
-        lookup_provision: impl Fn(&ProvisionHash) -> Option<Arc<Verified<Provisions>>>,
+        lookup_finalized_wave: impl Fn(&WaveId) -> Option<Arc<Verifiable<FinalizedWave>>>,
+        lookup_provision: impl Fn(&ProvisionHash) -> Option<Arc<Verifiable<Provisions>>>,
     ) {
         let mut pending = PendingBlock::from_manifest(header, manifest, now);
 
@@ -149,7 +149,7 @@ impl PendingBlocks {
             pending.add_transaction(tx);
         }
 
-        let waves: Vec<Arc<Verified<FinalizedWave>>> = pending
+        let waves: Vec<Arc<Verifiable<FinalizedWave>>> = pending
             .manifest()
             .cert_ids()
             .iter()
@@ -159,7 +159,7 @@ impl PendingBlocks {
             pending.add_finalized_wave(fw);
         }
 
-        let provisions: Vec<Arc<Verified<Provisions>>> = pending
+        let provisions: Vec<Arc<Verifiable<Provisions>>> = pending
             .manifest()
             .provision_hashes()
             .iter()
@@ -230,7 +230,10 @@ impl PendingBlocks {
 
     /// Record an arrived finalized wave against any pending block that needs
     /// it. Returns the hashes of blocks that became complete as a result.
-    pub fn receive_finalized_wave(&mut self, fw: &Arc<Verified<FinalizedWave>>) -> Vec<BlockHash> {
+    pub fn receive_finalized_wave(
+        &mut self,
+        fw: &Arc<Verifiable<FinalizedWave>>,
+    ) -> Vec<BlockHash> {
         let wave_id = fw.wave_id().clone();
         self.fold_arrival(
             |pending| pending.needs_wave(&wave_id),
@@ -243,7 +246,7 @@ impl PendingBlocks {
     /// Record an arrived provisions batch against any pending block that
     /// needs it. Returns the hashes of blocks that became complete as a
     /// result.
-    pub fn receive_provision(&mut self, batch: &Arc<Verified<Provisions>>) -> Vec<BlockHash> {
+    pub fn receive_provision(&mut self, batch: &Arc<Verifiable<Provisions>>) -> Vec<BlockHash> {
         let provisions_hash = batch.hash();
         self.fold_arrival(
             |pending| pending.needs_provision(&provisions_hash),
@@ -366,18 +369,18 @@ pub struct PendingBlock {
     /// Set of transaction hashes we're still waiting for (`HashSet` for O(1) lookup).
     missing_transaction_hashes: HashSet<TxHash>,
 
-    /// Map of `WaveId` -> `Arc<Verified<FinalizedWave>>` (carries cert + receipts + ECs).
+    /// Map of `WaveId` -> `Arc<Verifiable<FinalizedWave>>` (carries cert + receipts + ECs).
     ///
     /// A block is complete once
     /// all its waves have been independently finalized by this validator.
-    received_waves: BTreeMap<WaveId, Arc<Verified<FinalizedWave>>>,
+    received_waves: BTreeMap<WaveId, Arc<Verifiable<FinalizedWave>>>,
 
     /// Set of `WaveId`s we're still waiting for.
     missing_wave_ids: HashSet<WaveId>,
 
     /// Received provisions keyed by provisions hash. `BTreeMap` so
     /// `provisions()` iteration is deterministic across validators.
-    received_provisions: BTreeMap<ProvisionHash, Arc<Verified<Provisions>>>,
+    received_provisions: BTreeMap<ProvisionHash, Arc<Verifiable<Provisions>>>,
 
     /// Set of provisions hashes we're still waiting for.
     missing_provision_hashes: HashSet<ProvisionHash>,
@@ -431,8 +434,8 @@ impl PendingBlock {
     pub fn from_complete_block(
         block: &Block,
         ready_signals: Vec<ReadySignal>,
-        finalized_waves: Vec<Arc<Verified<FinalizedWave>>>,
-        provisions: Vec<Arc<Verified<Provisions>>>,
+        finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>>,
+        provisions: Vec<Arc<Verifiable<Provisions>>>,
         created_at: LocalTimestamp,
     ) -> Self {
         let mut provision_hashes: Vec<ProvisionHash> =
@@ -445,7 +448,7 @@ impl PendingBlock {
             .map(|c| c.wave_id().clone())
             .collect();
         let manifest = BlockManifest::new(tx_hashes, cert_ids, provision_hashes, ready_signals);
-        let mut received_provisions: BTreeMap<ProvisionHash, Arc<Verified<Provisions>>> =
+        let mut received_provisions: BTreeMap<ProvisionHash, Arc<Verifiable<Provisions>>> =
             BTreeMap::new();
         for p in provisions {
             received_provisions.insert(p.hash(), p);
@@ -491,7 +494,7 @@ impl PendingBlock {
     /// Add a finalized wave (carries certificate + receipts + ECs).
     ///
     /// Returns true if this wave was needed, false if duplicate or not in this block.
-    pub fn add_finalized_wave(&mut self, fw: Arc<Verified<FinalizedWave>>) -> bool {
+    pub fn add_finalized_wave(&mut self, fw: Arc<Verifiable<FinalizedWave>>) -> bool {
         let wave_id = fw.wave_id().clone();
         if self.missing_wave_ids.remove(&wave_id) {
             self.received_waves.insert(wave_id, fw);
@@ -541,7 +544,7 @@ impl PendingBlock {
     /// Add a received provisions.
     ///
     /// Returns true if this provision was needed, false if duplicate or not in this block.
-    pub fn add_provision(&mut self, provisions: Arc<Verified<Provisions>>) -> bool {
+    pub fn add_provision(&mut self, provisions: Arc<Verifiable<Provisions>>) -> bool {
         let hash = provisions.hash();
         if self.missing_provision_hashes.remove(&hash) {
             self.received_provisions.insert(hash, provisions);
@@ -567,7 +570,7 @@ impl PendingBlock {
     }
 
     /// Get all received finalized waves.
-    pub fn finalized_waves(&self) -> Vec<Arc<Verified<FinalizedWave>>> {
+    pub fn finalized_waves(&self) -> Vec<Arc<Verifiable<FinalizedWave>>> {
         self.received_waves.values().cloned().collect()
     }
 
@@ -596,27 +599,26 @@ impl PendingBlock {
             .collect();
 
         // Pass finalized waves into the block in manifest order. The
-        // typed marker is stripped at the Block boundary since `Block`
-        // is a wire type.
-        let certificates: Vec<Arc<FinalizedWave>> = self
+        // upstream-verified marker on each `Arc<Verifiable<FinalizedWave>>`
+        // rides through unchanged so downstream consumers (apply phase,
+        // verification pipeline) can peek `.verified()` and short-circuit.
+        let certificates: Vec<Arc<Verifiable<FinalizedWave>>> = self
             .manifest
             .cert_ids()
             .iter()
             .filter_map(|id| self.received_waves.get(id))
-            .map(|verified| Arc::new((***verified).clone()))
+            .cloned()
             .collect();
 
         // Attach provisions in manifest order. `received_provisions` is
         // populated as provisions arrive via gossip / local fetch,
         // and `is_complete()` gates assembly on all of them being present.
-        // The typed marker is stripped at the Block boundary since `Block`
-        // is a wire type.
-        let provisions: Vec<Arc<Provisions>> = self
+        let provisions: Vec<Arc<Verifiable<Provisions>>> = self
             .manifest
             .provision_hashes()
             .iter()
             .filter_map(|hash| self.received_provisions.get(hash))
-            .map(|verified| Arc::new((***verified).clone()))
+            .cloned()
             .collect();
 
         let block = Arc::new(Block::Live {
@@ -677,7 +679,7 @@ mod tests {
     use hyperscale_types::{
         Block, BlockHeight, BoundedVec, CertificateRoot, Hash, InFlightCount, LocalReceiptRoot,
         ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, StateRoot,
-        TransactionRoot, ValidatorId, WaveCertificate, WaveId,
+        TransactionRoot, ValidatorId, Verified, WaveCertificate, WaveId,
     };
 
     use super::*;
@@ -772,9 +774,8 @@ mod tests {
         assert_eq!(pb.missing_wave_count(), 1);
         assert!(!pb.is_complete());
 
-        let fw = Arc::new(Verified::new_unchecked_for_test(FinalizedWave::new(
-            Arc::new(WaveCertificate::new(wave_id, vec![])),
-            vec![],
+        let fw = Arc::new(Verifiable::Verified(Verified::new_unchecked_for_test(
+            FinalizedWave::new(Arc::new(WaveCertificate::new(wave_id, vec![])), vec![]),
         )));
 
         let added = pb.add_finalized_wave(fw);
@@ -804,9 +805,8 @@ mod tests {
         assert!(!pb.is_complete()); // Still missing wave
 
         // Add finalized wave
-        let fw = Arc::new(Verified::new_unchecked_for_test(FinalizedWave::new(
-            Arc::new(WaveCertificate::new(wave_id, vec![])),
-            vec![],
+        let fw = Arc::new(Verifiable::Verified(Verified::new_unchecked_for_test(
+            FinalizedWave::new(Arc::new(WaveCertificate::new(wave_id, vec![])), vec![]),
         )));
         pb.add_finalized_wave(fw);
         assert!(pb.is_complete());
@@ -818,12 +818,15 @@ mod tests {
         let cert = Arc::new(WaveCertificate::new(wave_id, vec![]));
 
         let fw = Arc::new(FinalizedWave::new(cert, vec![]));
-        let verified_fw = Arc::new(Verified::new_unchecked_for_test((*fw).clone()));
+        let verified_fw = Arc::new(Verifiable::Verified(Verified::new_unchecked_for_test(
+            (*fw).clone(),
+        )));
+        let wire_fw = Arc::new(Verifiable::Unverified((*fw).clone()));
 
         let block = Block::Live {
             header: make_header(BlockHeight::new(1)),
             transactions: Arc::new(BoundedVec::new()),
-            certificates: Arc::new(vec![Arc::clone(&fw)].into()),
+            certificates: Arc::new(vec![wire_fw].into()),
             provisions: Arc::new(BoundedVec::new()),
         };
 

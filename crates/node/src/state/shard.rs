@@ -60,10 +60,12 @@
 //! proposer needs to re-evaluate. The post-dispatch drain in `mod.rs::handle`
 //! invokes `try_event_driven_proposal` once.
 
+use std::sync::Arc;
+
 use hyperscale_core::{Action, ProtocolEvent, TimerId};
 use hyperscale_types::{
     BlockHash, BlockHeader, BlockManifest, CertifiedBlock, MAX_FINALIZED_TX_PER_BLOCK,
-    MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, QuorumCertificate, Verified,
+    MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, QuorumCertificate, Verifiable, Verified,
 };
 
 use super::NodeStateMachine;
@@ -270,7 +272,11 @@ impl NodeStateMachine {
             manifest,
             |h| self.mempool_coordinator.get_transaction(h),
             |id| self.execution_coordinator.get_finalized_wave(id),
-            |h| self.provisions_coordinator.get_provisions_by_hash(*h),
+            |h| {
+                self.provisions_coordinator
+                    .get_provisions_by_hash(*h)
+                    .map(|v| Arc::new(Verifiable::Verified((*v).clone())))
+            },
         )
     }
 

@@ -88,7 +88,8 @@ pub struct ElidedCertifiedBlock {
     header: Verifiable<BlockHeader>,
     qc: Verifiable<QuorumCertificate>,
     transactions: BoundedVec<(TxHash, Option<Arc<RoutableTransaction>>), MAX_TXS_PER_BLOCK>,
-    certificates: BoundedVec<(WaveId, Option<Arc<FinalizedWave>>), MAX_FINALIZED_TX_PER_BLOCK>,
+    certificates:
+        BoundedVec<(WaveId, Option<Arc<Verifiable<FinalizedWave>>>), MAX_FINALIZED_TX_PER_BLOCK>,
     provisions: ElidedProvisions,
 }
 
@@ -104,7 +105,9 @@ pub struct ElidedCertifiedBlock {
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub enum ElidedProvisions {
     /// Block was `Live` at serve time.
-    Live(BoundedVec<(ProvisionHash, Option<Arc<Provisions>>), MAX_PROVISIONS_PER_BLOCK>),
+    Live(
+        BoundedVec<(ProvisionHash, Option<Arc<Verifiable<Provisions>>>), MAX_PROVISIONS_PER_BLOCK>,
+    ),
     /// Block was `Sealed` at serve time; hashes only.
     Sealed(BoundedVec<ProvisionHash, MAX_PROVISIONS_PER_BLOCK>),
 }
@@ -146,7 +149,8 @@ impl ElidedCertifiedBlock {
     #[must_use]
     pub const fn certificates(
         &self,
-    ) -> &BoundedVec<(WaveId, Option<Arc<FinalizedWave>>), MAX_FINALIZED_TX_PER_BLOCK> {
+    ) -> &BoundedVec<(WaveId, Option<Arc<Verifiable<FinalizedWave>>>), MAX_FINALIZED_TX_PER_BLOCK>
+    {
         &self.certificates
     }
 
@@ -255,8 +259,8 @@ impl ElidedCertifiedBlock {
     ) -> Result<CertifiedBlock, RehydrateError>
     where
         FTx: FnMut(&TxHash) -> Option<Arc<RoutableTransaction>>,
-        FCert: FnMut(&WaveId) -> Option<Arc<FinalizedWave>>,
-        FProv: FnMut(&ProvisionHash) -> Option<Arc<Provisions>>,
+        FCert: FnMut(&WaveId) -> Option<Arc<Verifiable<FinalizedWave>>>,
+        FProv: FnMut(&ProvisionHash) -> Option<Arc<Verifiable<Provisions>>>,
     {
         // Header + QC are always inline, so the pairing can be checked
         // before resolving any bodies. A peer that sends a mismatched
@@ -316,12 +320,13 @@ impl ElidedCertifiedBlock {
         }
 
         let txs: Vec<Arc<RoutableTransaction>> = txs.into_iter().map(Option::unwrap).collect();
-        let certs: Vec<Arc<FinalizedWave>> = certs.into_iter().map(Option::unwrap).collect();
+        let certs: Vec<Arc<Verifiable<FinalizedWave>>> =
+            certs.into_iter().map(Option::unwrap).collect();
         let txs = Arc::new(txs.into());
         let certs = Arc::new(certs.into());
         let block = match (live_provs, &self.provisions) {
             (Some(entries), _) => {
-                let provisions: Vec<Arc<Provisions>> =
+                let provisions: Vec<Arc<Verifiable<Provisions>>> =
                     entries.into_iter().map(Option::unwrap).collect();
                 Block::Live {
                     header: self.header.as_unverified().clone(),

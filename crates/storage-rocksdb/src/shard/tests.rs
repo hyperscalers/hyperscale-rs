@@ -16,7 +16,7 @@ use hyperscale_types::{
     Bls12381G2Signature, BoundedVec, CertifiedBlock, ConsensusReceipt, ExecutionCertificate,
     FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, ProposerTimestamp,
     QuorumCertificate, Round, ShardGroupId, SignerBitfield, StateRoot, StoredReceipt, SyncHint,
-    TxHash, Verified, WaveCertificate, WaveId, WeightedTimestamp,
+    TxHash, Verifiable, Verified, WaveCertificate, WaveId, WeightedTimestamp,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -370,7 +370,7 @@ fn test_state_root_changes_on_commit() {
 
 /// Append a `FinalizedWave` to a block in place. Because `Block` is an enum,
 /// this replaces the whole value via `std::mem::replace`.
-fn push_wave(block: &mut Block, fw: Arc<FinalizedWave>) {
+fn push_wave(block: &mut Block, fw: Arc<Verifiable<FinalizedWave>>) {
     let taken = std::mem::replace(
         block,
         Block::Sealed {
@@ -418,7 +418,7 @@ fn push_wave(block: &mut Block, fw: Arc<FinalizedWave>) {
 /// so the new `commit_block` (which derives receipts from `block.certificates`)
 /// can apply them.
 fn attach_receipts(block: &mut Block, receipts: Vec<StoredReceipt>) {
-    let new_fw = Arc::new(FinalizedWave::new(
+    let new_fw = Arc::new(Verifiable::Unverified(FinalizedWave::new(
         Arc::new(WaveCertificate::new(
             WaveId::new(
                 ShardGroupId::new(0),
@@ -428,7 +428,7 @@ fn attach_receipts(block: &mut Block, receipts: Vec<StoredReceipt>) {
             vec![placeholder_local_ec(ShardGroupId::new(0), block.height())],
         )),
         receipts,
-    ));
+    )));
     // Take block out, mutate, and put back.
     let taken = std::mem::replace(
         block,
@@ -551,6 +551,13 @@ fn test_commit_block_stores_certificates() {
 
     // Create a block that includes this certificate
     let block = make_test_block(BlockHeight::new(1));
+    let fw_certificates = Arc::new(
+        vec![Arc::new(Verifiable::Unverified(FinalizedWave::new(
+            cert,
+            vec![],
+        )))]
+        .into(),
+    );
     let block = match block {
         Block::Live {
             header,
@@ -560,7 +567,7 @@ fn test_commit_block_stores_certificates() {
         } => Block::Live {
             header,
             transactions,
-            certificates: Arc::new(vec![Arc::new(FinalizedWave::new(cert, vec![]))].into()),
+            certificates: fw_certificates,
             provisions,
         },
         Block::Sealed {
@@ -571,7 +578,7 @@ fn test_commit_block_stores_certificates() {
         } => Block::Sealed {
             header,
             transactions,
-            certificates: Arc::new(vec![Arc::new(FinalizedWave::new(cert, vec![]))].into()),
+            certificates: fw_certificates,
             provision_hashes,
         },
     };
@@ -860,10 +867,10 @@ fn test_ec_survives_reopen() {
         let mut block = make_test_block(BlockHeight::new(1));
         push_wave(
             &mut block,
-            Arc::new(FinalizedWave::new(
+            Arc::new(Verifiable::Unverified(FinalizedWave::new(
                 Arc::new(WaveCertificate::new(wave_id.clone(), vec![Arc::new(ec)])),
                 vec![],
-            )),
+            ))),
         );
         storage.commit_block(&make_test_certified(block), &no_witness());
     }
@@ -887,10 +894,10 @@ fn test_ec_atomic_with_block_commit() {
     let mut block = make_test_block(BlockHeight::new(1));
     push_wave(
         &mut block,
-        Arc::new(FinalizedWave::new(
+        Arc::new(Verifiable::Unverified(FinalizedWave::new(
             Arc::new(WaveCertificate::new(wave_id.clone(), vec![Arc::new(ec)])),
             vec![],
-        )),
+        ))),
     );
     // Commit block with EC atomically
     storage.commit_block(&make_test_certified(block), &no_witness());
@@ -933,7 +940,7 @@ fn rocks_commit_with(
             }),
             metadata: None,
         };
-        let wave = Arc::new(FinalizedWave::new(
+        let wave = Arc::new(Verifiable::Unverified(FinalizedWave::new(
             Arc::new(WaveCertificate::new(
                 WaveId::new(
                     ShardGroupId::new(0),
@@ -943,7 +950,7 @@ fn rocks_commit_with(
                 vec![placeholder_local_ec(ShardGroupId::new(0), block.height())],
             )),
             vec![receipt],
-        ));
+        )));
         push_wave(&mut block, wave);
     }
     // SAFETY: synthetic test fixture; round-trip tests don't exercise

@@ -11,7 +11,7 @@ use hyperscale_storage::{
 };
 use hyperscale_types::{
     BeaconWitnessCommit, Block, BlockHeight, CertifiedBlock, FinalizedWave, PreparedCommit,
-    QuorumCertificate, StateRoot, StoredReceipt, SyncHint, Verified,
+    QuorumCertificate, StateRoot, StoredReceipt, SyncHint, Verifiable, Verified,
 };
 
 use super::core::SimShardStorage;
@@ -22,7 +22,7 @@ impl ShardChainWriter for SimShardStorage {
         self: &Arc<Self>,
         parent_state_root: StateRoot,
         parent_block_height: BlockHeight,
-        finalized_waves: &[Arc<FinalizedWave>],
+        finalized_waves: &[Arc<Verifiable<FinalizedWave>>],
         block_height: BlockHeight,
         pending_snapshots: &[Arc<JmtSnapshot>],
         // Memory backend already keeps state in-memory — the priors

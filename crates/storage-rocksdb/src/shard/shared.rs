@@ -21,7 +21,7 @@ use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, BlockHash, BlockHeight, CertifiedBlock,
     CommittedBlockHeader, ConsensusReceipt, ExecutionCertificate, FinalizedWave,
     MerkleInclusionProof, NodeId, PreparedCommit, QuorumCertificate, RoutableTransaction,
-    ShardWitnessPayload, StateRoot, TxHash, Verified, WaveCertificate, WaveId,
+    ShardWitnessPayload, StateRoot, TxHash, Verifiable, Verified, WaveCertificate, WaveId,
 };
 
 use super::core::RocksDbShardStorage;
@@ -144,7 +144,7 @@ impl ShardChainWriter for SharedStorage {
         self: &Arc<Self>,
         parent_state_root: StateRoot,
         parent_block_height: BlockHeight,
-        finalized_waves: &[Arc<FinalizedWave>],
+        finalized_waves: &[Arc<Verifiable<FinalizedWave>>],
         block_height: BlockHeight,
         pending_snapshots: &[Arc<JmtSnapshot>],
         base_reads: Option<&BaseReadCache>,

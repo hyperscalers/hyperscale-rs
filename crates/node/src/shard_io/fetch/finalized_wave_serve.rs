@@ -5,28 +5,31 @@ use std::sync::Arc;
 use hyperscale_storage::{PendingChain, ShardStorage};
 use hyperscale_types::network::request::GetFinalizedWavesRequest;
 use hyperscale_types::network::response::GetFinalizedWavesResponse;
-use hyperscale_types::{FinalizedWave, Verified, WaveId};
+use hyperscale_types::{FinalizedWave, Verifiable, WaveId};
 use quick_cache::sync::Cache as QuickCache;
 
 /// Serve an inbound finalized-wave fetch request.
 ///
-/// Two tiers: an in-memory `Arc<FinalizedWave>` cache (entries live here
-/// between EC aggregation and the wave's containing block committing) and
-/// chain storage via [`PendingChain`]. Storage holds `WaveCertificate`s
-/// and per-tx receipts separately; for any wave missed by the cache, we
-/// reconstruct the full `FinalizedWave` by pulling the certificate +
-/// receipts. Peers requesting waves past the cache window must still get a
-/// complete answer from durable storage.
+/// Two tiers: an in-memory cache (entries live here between EC aggregation
+/// and the wave's containing block committing) and chain storage via
+/// [`PendingChain`]. Storage holds `WaveCertificate`s and per-tx receipts
+/// separately; for any wave missed by the cache, we reconstruct the full
+/// `FinalizedWave` by pulling the certificate + receipts. Peers requesting
+/// waves past the cache window must still get a complete answer from
+/// durable storage.
+///
+/// The wire response carries raw `Arc<FinalizedWave>` bodies — the
+/// verification marker is process-local and doesn't cross the network.
 pub fn serve_finalized_waves_request<S: ShardStorage>(
     pending_chain: &PendingChain<S>,
-    fw_cache: &QuickCache<WaveId, Arc<Verified<FinalizedWave>>>,
+    fw_cache: &QuickCache<WaveId, Arc<Verifiable<FinalizedWave>>>,
     req: &GetFinalizedWavesRequest,
 ) -> GetFinalizedWavesResponse {
     let mut waves: Vec<Arc<FinalizedWave>> = Vec::new();
     let mut missing: Vec<WaveId> = Vec::new();
     for id in &req.wave_ids {
         if let Some(fw) = fw_cache.get(id) {
-            waves.push(Arc::new((**fw).clone()));
+            waves.push(Arc::new(fw.as_unverified().clone()));
         } else {
             missing.push(id.clone());
         }

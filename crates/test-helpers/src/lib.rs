@@ -26,7 +26,7 @@ use hyperscale_types::{
     GlobalReceiptRoot, InFlightCount, LocalReceiptRoot, NetworkDefinition, ProposerTimestamp,
     ProvisionsRoot, QuorumCertificate, Round, RoutableTransaction, ShardGroupId, SignerBitfield,
     StateRoot, TopologySnapshot, TransactionDecision, TransactionRoot, TxHash, TxOutcome,
-    ValidatorId, ValidatorInfo, ValidatorSet, VotePower, WaveCertificate, WaveId,
+    ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, VotePower, WaveCertificate, WaveId,
     WeightedTimestamp, bls_keypair_from_seed,
 };
 
@@ -224,7 +224,7 @@ pub fn make_live_block(
     timestamp_ms: u64,
     proposer: ValidatorId,
     transactions: Vec<Arc<RoutableTransaction>>,
-    certificates: Vec<Arc<FinalizedWave>>,
+    certificates: Vec<Arc<Verifiable<FinalizedWave>>>,
 ) -> Block {
     let header = BlockHeader::new(
         shard_group_id,

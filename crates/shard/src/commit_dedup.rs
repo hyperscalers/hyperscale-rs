@@ -30,8 +30,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use hyperscale_types::{
-    FinalizedWave, ProvisionHash, RETENTION_HORIZON, RoutableTransaction, TxHash, WaveId,
-    WeightedTimestamp,
+    FinalizedWave, ProvisionHash, RETENTION_HORIZON, RoutableTransaction, TxHash, Verifiable,
+    WaveId, WeightedTimestamp,
 };
 
 #[allow(clippy::struct_field_names)] // shared `_retention` postfix is the artifact-tier convention
@@ -74,7 +74,7 @@ impl CommitDedupIndex {
     /// Record a block's finalized waves in the retention lookup. Each
     /// entry's deadline is the wave's local EC `vote_anchor_ts +
     /// RETENTION_HORIZON`.
-    pub fn register_committed_certs(&mut self, finalized_waves: &[Arc<FinalizedWave>]) {
+    pub fn register_committed_certs(&mut self, finalized_waves: &[Arc<Verifiable<FinalizedWave>>]) {
         for fw in finalized_waves {
             let wave_id = fw.wave_id().clone();
             let deadline = fw.local_ec().deadline();
@@ -156,14 +156,14 @@ mod tests {
         Arc::new(routable_from_notarized_v1(notarized, range).expect("valid notarized fixture"))
     }
 
-    fn make_fw(height: u64) -> Arc<FinalizedWave> {
-        Arc::new(make_finalized_wave(
+    fn make_fw(height: u64) -> Arc<Verifiable<FinalizedWave>> {
+        Arc::new(Verifiable::Unverified(make_finalized_wave(
             BlockHeight::new(height),
             TxHash::from_raw(Hash::from_bytes(
                 &[u8::try_from(height).unwrap_or(u8::MAX); 32],
             )),
             TransactionDecision::Accept,
-        ))
+        )))
     }
 
     fn make_provisions(seed: u8) -> Arc<Provisions> {

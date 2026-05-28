@@ -313,7 +313,7 @@ mod tests {
         LocalReceiptRoot, MerkleInclusionProof, NetworkDefinition, ProposerTimestamp,
         ProvisionEntry, Provisions, ProvisionsRoot, QuorumCertificate, Round, RoutableTransaction,
         ShardGroupId, StateRoot, TransactionDecision, TransactionRoot, ValidatorId, ValidatorInfo,
-        ValidatorSet, WeightedTimestamp, compute_waves, test_utils,
+        ValidatorSet, Verifiable, WeightedTimestamp, compute_waves, test_utils,
     };
 
     use super::*;
@@ -618,10 +618,14 @@ mod tests {
         height: BlockHeight,
         certificates: Vec<Arc<FinalizedWave>>,
     ) -> Block {
+        let wrapped: Vec<Arc<Verifiable<FinalizedWave>>> = certificates
+            .into_iter()
+            .map(|fw| Arc::new(Verifiable::Unverified((*fw).clone())))
+            .collect();
         Block::Live {
             header: header_at_height(height, 100_000),
             transactions: Arc::new(BoundedVec::new()),
-            certificates: Arc::new(certificates.into()),
+            certificates: Arc::new(wrapped.into()),
             provisions: Arc::new(BoundedVec::new()),
         }
     }
@@ -669,7 +673,8 @@ mod tests {
         let block = block_with_certificates(BlockHeight::new(6), vec![Arc::clone(&fw)]);
         let qc_chain = HashSet::new();
         let mut dedup_index = CommitDedupIndex::new();
-        dedup_index.register_committed_certs(&[fw]);
+        let fw_verifiable = Arc::new(Verifiable::Unverified((*fw).clone()));
+        dedup_index.register_committed_certs(&[fw_verifiable]);
         let err = validate_no_duplicate_certificates(&block, &qc_chain, &dedup_index).unwrap_err();
         assert!(err.contains("already committed"));
     }
@@ -679,11 +684,15 @@ mod tests {
     // ═══════════════════════════════════════════════════════════════════════
 
     fn block_with_provisions(height: BlockHeight, provisions: Vec<Arc<Provisions>>) -> Block {
+        let wrapped: Vec<Arc<Verifiable<Provisions>>> = provisions
+            .into_iter()
+            .map(|p| Arc::new(Verifiable::Unverified((*p).clone())))
+            .collect();
         Block::Live {
             header: header_at_height(height, 100_000),
             transactions: Arc::new(BoundedVec::new()),
             certificates: Arc::new(BoundedVec::new()),
-            provisions: Arc::new(provisions.into()),
+            provisions: Arc::new(wrapped.into()),
         }
     }
 

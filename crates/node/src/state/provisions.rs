@@ -60,8 +60,8 @@ mod tests {
 
     use hyperscale_core::{Action, ProtocolEvent, StateMachine};
     use hyperscale_types::{
-        BlockHeight, LocalTimestamp, MerkleInclusionProof, Provisions, ShardGroupId, Verified,
-        WeightedTimestamp,
+        BlockHeight, LocalTimestamp, MerkleInclusionProof, Provisions, ShardGroupId, Verifiable,
+        Verified, WeightedTimestamp,
     };
 
     use super::super::test_support::TestNode;
@@ -76,12 +76,14 @@ mod tests {
         // proposer; pick local_idx=1 so we are it.
         let TestNode { mut node, .. } = TestNode::builder().local_idx(1).build();
 
-        let provisions = Arc::new(Verified::new_unchecked_for_test(Provisions::new(
-            ShardGroupId::new(1), // source
-            ShardGroupId::new(0), // target (local)
-            BlockHeight::new(1),
-            MerkleInclusionProof::dummy(),
-            vec![],
+        let provisions = Arc::new(Verifiable::Verified(Verified::new_unchecked_for_test(
+            Provisions::new(
+                ShardGroupId::new(1), // source
+                ShardGroupId::new(0), // target (local)
+                BlockHeight::new(1),
+                MerkleInclusionProof::dummy(),
+                vec![],
+            ),
         )));
 
         let actions = node.handle(

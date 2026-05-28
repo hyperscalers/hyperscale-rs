@@ -25,12 +25,18 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, PoisonError, RwLock};
 
 use hyperscale_types::{
-    BloomFilter, DEFAULT_FPR, FinalizedWave, TxHash, Verified, WaveCertificate, WaveId,
+    BloomFilter, DEFAULT_FPR, FinalizedWave, TxHash, Verifiable, WaveCertificate, WaveId,
 };
 
 /// Per-shard finalized-wave store. See module docs for lifecycle.
+///
+/// Stored values are [`Verifiable<FinalizedWave>`] in the
+/// [`Verifiable::Verified`] variant. Holding the `Block::Live.certificates`
+/// transport shape directly lets the proposal-build path source verifiable
+/// arcs without a per-extraction conversion; the typed-gate `insert` is
+/// the single place where the conversion (and body clone) happens.
 pub struct FinalizedWaveStore {
-    waves: RwLock<BTreeMap<WaveId, Arc<Verified<FinalizedWave>>>>,
+    waves: RwLock<BTreeMap<WaveId, Arc<Verifiable<FinalizedWave>>>>,
 }
 
 impl Default for FinalizedWaveStore {
@@ -57,8 +63,19 @@ impl FinalizedWaveStore {
             .is_empty()
     }
 
-    /// Record a newly-finalized wave under its `WaveId`.
-    pub fn insert(&self, wave_id: WaveId, fw: Arc<Verified<FinalizedWave>>) {
+    /// Record a newly-finalized wave under its `WaveId`. Callers wrap
+    /// their upstream [`Verified<FinalizedWave>`] into
+    /// [`Verifiable::Verified`] before insertion so the same `Arc` can be
+    /// shared with downstream `FinalizedWavesAdmitted` consumers without
+    /// re-cloning. The store enforces — by virtue of its `Verifiable`
+    /// argument type and the typed gates the caller went through to
+    /// produce it — that every value held here is in the
+    /// `Verifiable::Verified` variant.
+    pub fn insert(&self, wave_id: WaveId, fw: Arc<Verifiable<FinalizedWave>>) {
+        debug_assert!(
+            fw.verified().is_some(),
+            "FinalizedWaveStore invariant: only Verifiable::Verified entries are admitted"
+        );
         self.waves
             .write()
             .unwrap_or_else(PoisonError::into_inner)
@@ -77,7 +94,7 @@ impl FinalizedWaveStore {
     /// All finalized waves in `WaveId` order. Used by the proposer to
     /// include finalized waves in the next block.
     #[must_use]
-    pub fn all_waves(&self) -> Vec<Arc<Verified<FinalizedWave>>> {
+    pub fn all_waves(&self) -> Vec<Arc<Verifiable<FinalizedWave>>> {
         self.waves
             .read()
             .unwrap_or_else(PoisonError::into_inner)
@@ -89,7 +106,7 @@ impl FinalizedWaveStore {
     /// Lookup by `WaveId`. Peers reference waves by id in fetch requests,
     /// so this is the primary ingress lookup for serving finalized-wave data.
     #[must_use]
-    pub fn get(&self, wave_id: &WaveId) -> Option<Arc<Verified<FinalizedWave>>> {
+    pub fn get(&self, wave_id: &WaveId) -> Option<Arc<Verifiable<FinalizedWave>>> {
         self.waves
             .read()
             .unwrap_or_else(PoisonError::into_inner)
@@ -182,7 +199,7 @@ mod tests {
 
     use hyperscale_types::{
         BlockHeight, ExecutionCertificate, ExecutionOutcome, GlobalReceiptHash, GlobalReceiptRoot,
-        Hash, ShardGroupId, SignerBitfield, TxHash, TxOutcome, WeightedTimestamp,
+        Hash, ShardGroupId, SignerBitfield, TxHash, TxOutcome, Verified, WeightedTimestamp,
         zero_bls_signature,
     };
 
@@ -199,7 +216,7 @@ mod tests {
     fn make_finalized_wave(
         block_height: u64,
         tx_hashes: &[TxHash],
-    ) -> (WaveId, Arc<Verified<FinalizedWave>>) {
+    ) -> (WaveId, Arc<Verifiable<FinalizedWave>>) {
         let wave_id = make_wave_id(block_height);
         let tx_outcomes: Vec<TxOutcome> = tx_hashes
             .iter()
@@ -223,10 +240,8 @@ mod tests {
         let cert = WaveCertificate::new(wave_id.clone(), vec![Arc::new(ec)]);
         // Lookups in this module only inspect the certificate's outcomes; an
         // empty receipts vector is fine for the store's contract.
-        let fw = Arc::new(Verified::new_unchecked_for_test(FinalizedWave::new(
-            Arc::new(cert),
-            vec![],
-        )));
+        let verified = Verified::new_unchecked_for_test(FinalizedWave::new(Arc::new(cert), vec![]));
+        let fw = Arc::new(Verifiable::Verified(verified));
         (wave_id, fw)
     }
 

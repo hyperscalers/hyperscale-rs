@@ -28,7 +28,7 @@ use hyperscale_storage::{ChainEntry, PendingChain, ShardChainWriter, ShardStorag
 use hyperscale_types::BeaconWitnessLeafCount;
 use hyperscale_types::{
     BeaconWitnessCommit, BlockHash, BlockHeight, CertifiedBlock, ConsensusReceipt, FinalizedWave,
-    LocalTimestamp, PreparedCommit, ShardGroupId, StateRoot, SyncHint, Verified,
+    LocalTimestamp, PreparedCommit, ShardGroupId, StateRoot, SyncHint, Verifiable, Verified,
 };
 use tracing::debug;
 
@@ -167,7 +167,7 @@ where
     );
     let pending_snapshots = view.pending_snapshots().to_vec();
 
-    let finalized_waves: Vec<Arc<FinalizedWave>> = block.certificates().to_vec();
+    let finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>> = block.certificates().to_vec();
     let (computed_root, jmt_snapshot, prepared) = view.prepare_block_commit(
         pending.parent_state_root,
         pending.parent_block_height,

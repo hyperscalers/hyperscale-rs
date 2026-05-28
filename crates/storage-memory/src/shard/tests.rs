@@ -17,8 +17,8 @@ use hyperscale_types::test_utils::test_transaction;
 use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeight, CertifiedBlock,
     ConsensusReceipt, FinalizedWave, GlobalReceiptHash, Hash, NodeId, ProposerTimestamp,
-    QuorumCertificate, ShardGroupId, StateRoot, StoredReceipt, SyncHint, TxHash, Verified,
-    WaveCertificate, WaveId,
+    QuorumCertificate, ShardGroupId, StateRoot, StoredReceipt, SyncHint, TxHash, Verifiable,
+    Verified, WaveCertificate, WaveId,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -126,13 +126,13 @@ fn commit_with(
             }),
             metadata: None,
         };
-        let new_fw = Arc::new(FinalizedWave::new(
+        let new_fw = Arc::new(Verifiable::Unverified(FinalizedWave::new(
             Arc::new(WaveCertificate::new(
                 WaveId::new(ShardGroupId::new(0), block.height(), BTreeSet::new()),
                 vec![],
             )),
             vec![receipt],
-        ));
+        )));
         match block {
             Block::Live {
                 header,

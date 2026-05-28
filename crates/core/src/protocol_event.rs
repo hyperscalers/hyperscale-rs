@@ -299,9 +299,9 @@ pub enum ProtocolEvent {
         /// recover `ready_signals` from a `Block` alone.
         manifest: BlockManifest,
         /// Finalized waves included in the block (carry certs + receipts + ECs).
-        finalized_waves: Vec<Arc<Verified<FinalizedWave>>>,
+        finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>>,
         /// Provisions included in the block.
-        provisions: Vec<Arc<Verified<Provisions>>>,
+        provisions: Vec<Arc<Verifiable<Provisions>>>,
     },
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -339,7 +339,7 @@ pub enum ProtocolEvent {
     /// deterministic across validators.
     ProvisionsAdmitted {
         /// Verified provisions batch.
-        provisions: Arc<Verified<Provisions>>,
+        provisions: Arc<Verifiable<Provisions>>,
         /// BFT-authenticated weighted timestamp of the source shard's committing QC.
         source_block_ts: WeightedTimestamp,
     },
@@ -484,8 +484,12 @@ pub enum ProtocolEvent {
     ///   which validates each wave's receipts against its EC and populates
     ///   any pending block waiting on its hash.
     FinalizedWavesAdmitted {
-        /// Finalized waves newly admitted on this admission call.
-        waves: Vec<Arc<Verified<FinalizedWave>>>,
+        /// Finalized waves newly admitted on this admission call. Carried
+        /// in the `Block::Live.certificates` transport shape — every
+        /// entry is in the [`Verifiable::Verified`] variant by virtue of
+        /// the typed gates the emitter went through (`finalize_wave`'s
+        /// `seal`, or `admit_finalized_wave`'s `Verify::verify`).
+        waves: Vec<Arc<Verifiable<FinalizedWave>>>,
     },
 
     // ═══════════════════════════════════════════════════════════════════════

@@ -16,7 +16,9 @@ use hyperscale_provisions::ProvisionStore;
 use hyperscale_storage::{BlockForSync, PendingChain, ShardStorage};
 use hyperscale_types::network::request::GetBlockRequest;
 use hyperscale_types::network::response::GetBlockResponse;
-use hyperscale_types::{ElidedCertifiedBlock, ProvisionHash, Provisions, RETENTION_HORIZON};
+use hyperscale_types::{
+    ElidedCertifiedBlock, ProvisionHash, Provisions, RETENTION_HORIZON, Verifiable,
+};
 use tracing::{trace, warn};
 
 /// Serve an inbound block sync request.
@@ -104,9 +106,15 @@ pub fn serve_block_request<S: ShardStorage>(
         return GetBlockResponse::not_found();
     }
 
-    let provisions: Vec<Arc<Provisions>> = resolved
+    // Sync responses ship raw provision bodies into the wire-typed
+    // `Block::Live.provisions`; encoding lands at `Verifiable::Unverified`
+    // on the receiver and verification proceeds from there.
+    let provisions: Vec<Arc<Verifiable<Provisions>>> = resolved
         .into_iter()
-        .map(|(_, p)| p.expect("missing entries handled above"))
+        .map(|(_, p)| {
+            let raw = p.expect("missing entries handled above");
+            Arc::new(Verifiable::Unverified((*raw).clone()))
+        })
         .collect();
 
     GetBlockResponse::found(ElidedCertifiedBlock::elide(

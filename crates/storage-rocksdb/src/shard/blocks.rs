@@ -20,8 +20,8 @@ use std::time::Instant;
 use hyperscale_metrics::{record_storage_operation, record_storage_read};
 use hyperscale_types::{
     BeaconWitnessLeafCount, Block, BlockHeight, BlockMetadata, CertifiedBlock, FinalizedWave, Hash,
-    ProvisionHash, QuorumCertificate, RoutableTransaction, ShardWitnessPayload, TxHash, Verified,
-    WaveCertificate, WaveId,
+    ProvisionHash, QuorumCertificate, RoutableTransaction, ShardWitnessPayload, TxHash, Verifiable,
+    Verified, WaveCertificate, WaveId,
 };
 use rocksdb::{ColumnFamily, WriteBatch};
 
@@ -241,13 +241,18 @@ impl RocksDbShardStorage {
         }
 
         // 4. Reconstruct each FinalizedWave from cert + stored receipts.
-        let certificates: Option<Vec<Arc<FinalizedWave>>> = certs
+        //
+        // The reconstructed waves arrive at the Block as
+        // [`Verifiable::Unverified`]: the on-disk shape didn't carry the
+        // marker, so the upstream verification claim isn't available here.
+        // Downstream readers run the predicate when needed.
+        let certificates: Option<Vec<Arc<Verifiable<FinalizedWave>>>> = certs
             .into_iter()
             .map(|cert| {
                 FinalizedWave::reconstruct(cert, |h| {
                     get::<ConsensusReceiptsCf>(&*self.db, consensus_cf, h.as_raw()).map(Arc::new)
                 })
-                .map(Arc::new)
+                .map(|fw| Arc::new(Verifiable::Unverified(fw)))
             })
             .collect();
         let Some(certificates) = certificates else {
@@ -370,13 +375,17 @@ impl RocksDbShardStorage {
         // 4. Reconstruct each FinalizedWave from cert + stored receipts. If any
         // wave has a non-aborted tx whose receipt is missing, the block is not
         // servable and the syncing peer must try a different source.
-        let certificates: Option<Vec<Arc<FinalizedWave>>> = certs
+        //
+        // Reconstructed waves arrive at the Block as
+        // [`Verifiable::Unverified`] — see the sibling reader above for
+        // rationale.
+        let certificates: Option<Vec<Arc<Verifiable<FinalizedWave>>>> = certs
             .into_iter()
             .map(|cert| {
                 FinalizedWave::reconstruct(cert, |h| {
                     get::<ConsensusReceiptsCf>(&*self.db, consensus_cf, h.as_raw()).map(Arc::new)
                 })
-                .map(Arc::new)
+                .map(|fw| Arc::new(Verifiable::Unverified(fw)))
             })
             .collect();
         let Some(certificates) = certificates else {

@@ -18,7 +18,7 @@ use hyperscale_types::{
     BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, CertificateRoot,
     CertifiedBlock, FinalizedWave, InFlightCount, LinkageError, LocalReceiptRoot,
     ProvisionTxRootsMap, ProvisionsRoot, QuorumCertificate, StateRoot, TopologySnapshot,
-    TransactionRoot, Verified, VerifiedBlockAssembleError,
+    TransactionRoot, Verifiable, Verified, VerifiedBlockAssembleError,
 };
 use thiserror::Error;
 use tracing::{debug, trace, warn};
@@ -104,7 +104,7 @@ pub struct ReadyStateRootVerification {
     pub expected_local_receipt_root: LocalReceiptRoot,
     /// Finalized waves from the `PendingBlock` — these carry the proposer's receipts,
     /// ensuring all validators verify against the same execution outputs.
-    pub finalized_waves: Vec<Arc<Verified<FinalizedWave>>>,
+    pub finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>>,
     /// Height of the block being verified.
     pub block_height: BlockHeight,
 }
@@ -1203,11 +1203,8 @@ impl VerificationPipeline {
             .map_or_else(Vec::new, |pending| {
                 pending.manifest().ready_signals().as_slice().to_vec()
             });
-        let finalized_waves: Vec<Arc<Verified<FinalizedWave>>> = block
-            .certificates()
-            .iter()
-            .map(|fw| Arc::new(Verified::<FinalizedWave>::seal((**fw).clone())))
-            .collect();
+        let finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>> =
+            block.certificates().iter().cloned().collect();
         debug!(
             ?block_hash,
             expected_leaf_count = header.beacon_witness_leaf_count().inner(),
@@ -1481,11 +1478,8 @@ impl VerificationPipeline {
                         None
                     })?;
                 let parent_state_root = chain.parent_state_root(pending.parent_block_hash);
-                let finalized_waves: Vec<Arc<Verified<FinalizedWave>>> = block
-                    .certificates()
-                    .iter()
-                    .map(|fw| Arc::new(Verified::<FinalizedWave>::seal((**fw).clone())))
-                    .collect();
+                let finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>> =
+                    block.certificates().iter().cloned().collect();
                 Some(ReadyStateRootVerification {
                     block_hash: pending.block_hash,
                     parent_block_hash: pending.parent_block_hash,

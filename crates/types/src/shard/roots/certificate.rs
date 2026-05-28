@@ -4,14 +4,16 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::{CertificateRoot, FinalizedWave, Hash, Verified, Verify, compute_merkle_root};
+use crate::{
+    CertificateRoot, FinalizedWave, Hash, Verifiable, Verified, Verify, compute_merkle_root,
+};
 
 /// Inputs the [`CertificateRoot`] verifier reads against.
 #[derive(Debug, Clone, Copy)]
 pub struct CertificateRootContext<'a> {
     /// The block's finalized wave certificates — each contributes one
     /// leaf (its `receipt_hash`) to the recomputed root.
-    pub certificates: &'a [Arc<FinalizedWave>],
+    pub certificates: &'a [Arc<Verifiable<FinalizedWave>>],
 }
 
 /// Failure modes of [`CertificateRoot`] verification.
@@ -30,9 +32,11 @@ pub enum CertRootVerifyError {
 
 impl Verified<CertificateRoot> {
     /// Compute the certificate root from `certificates`. Verified by
-    /// construction.
+    /// construction. Reads each wave's `receipt_hash` via the
+    /// [`Verifiable`] `Deref` impl so callers can pass the
+    /// `Block::Live.certificates` slice without unwrapping.
     #[must_use]
-    pub fn compute(certificates: &[Arc<FinalizedWave>]) -> Self {
+    pub fn compute(certificates: &[Arc<Verifiable<FinalizedWave>>]) -> Self {
         if certificates.is_empty() {
             return Self::new_unchecked(CertificateRoot::ZERO);
         }

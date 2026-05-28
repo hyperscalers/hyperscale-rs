@@ -13,7 +13,7 @@ use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, BlockHash, BlockHeight, CertifiedBlock,
     CommittedBlockHeader, ConsensusReceipt, ExecutionCertificate, FinalizedWave,
     MerkleInclusionProof, NodeId, PreparedCommit, QuorumCertificate, RoutableTransaction,
-    ShardWitnessPayload, StateRoot, TxHash, Verified, WaveCertificate, WaveId,
+    ShardWitnessPayload, StateRoot, TxHash, Verifiable, Verified, WaveCertificate, WaveId,
 };
 use radix_common::prelude::DatabaseUpdate;
 use radix_substate_store_interface::interface::SubstateDatabase;
@@ -790,7 +790,7 @@ impl<S: ShardChainWriter> ShardChainWriter for SubstateView<S> {
         self: &Arc<Self>,
         parent_state_root: StateRoot,
         parent_block_height: BlockHeight,
-        finalized_waves: &[Arc<FinalizedWave>],
+        finalized_waves: &[Arc<Verifiable<FinalizedWave>>],
         block_height: BlockHeight,
         pending_snapshots: &[Arc<JmtSnapshot>],
         base_reads: Option<&BaseReadCache>,

@@ -19,7 +19,7 @@ use hyperscale_types::{BeaconWitnessLeafCount, BeaconWitnessRoot};
 use hyperscale_types::{
     BlockHeight, BlockManifest, CertifiedBlock, CommittedBlockHeader, LocalTimestamp,
     ProvisionHash, Provisions, ProvisionsVerifyError, RETENTION_HORIZON, ShardGroupId,
-    TopologySnapshot, Verified,
+    TopologySnapshot, Verifiable, Verified,
 };
 use serde::Deserialize;
 use tracing::{debug, info, warn};
@@ -614,8 +614,11 @@ impl ProvisionCoordinator {
 
         // Emit ProvisionsAdmitted for downstream consumption. The source
         // block timestamp anchors retention in the io-loop provision cache.
+        // Wrap into `Verifiable::Verified` so the marker rides through the
+        // event into the in-process consumers.
+        let provisions_verifiable = Arc::new(Verifiable::Verified((*provisions).clone()));
         actions.push(Action::Continuation(ProtocolEvent::ProvisionsAdmitted {
-            provisions,
+            provisions: provisions_verifiable,
             source_block_ts,
         }));
 
@@ -1704,11 +1707,13 @@ mod tests {
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
         );
+        let provisions_verifiable: Arc<Verifiable<Provisions>> =
+            Arc::new(Verifiable::Unverified(Arc::unwrap_or_clone(provisions)));
         let block = Block::Live {
             header,
             transactions: Arc::new(BoundedVec::new()),
             certificates: Arc::new(BoundedVec::new()),
-            provisions: Arc::new(BoundedVec::from(vec![provisions])),
+            provisions: Arc::new(BoundedVec::from(vec![provisions_verifiable])),
         };
         let qc = QuorumCertificate::new(
             block.hash(),

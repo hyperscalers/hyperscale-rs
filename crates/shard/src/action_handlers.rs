@@ -191,10 +191,10 @@ pub fn build_proposal<S: ShardChainWriter>(
     parent_state_root: StateRoot,
     parent_block_height: BlockHeight,
     transactions: Vec<Arc<RoutableTransaction>>,
-    certificates: Vec<Arc<FinalizedWave>>,
+    certificates: Vec<Arc<Verifiable<FinalizedWave>>>,
     local_shard: ShardGroupId,
     topology: &TopologySnapshot,
-    provisions: Vec<Arc<Provisions>>,
+    provisions: Vec<Arc<Verifiable<Provisions>>>,
     parent_in_flight: InFlightCount,
     finalized_tx_count: u32,
     ready_signals: Vec<ReadySignal>,
@@ -288,28 +288,11 @@ pub fn build_proposal<S: ShardChainWriter>(
 }
 
 fn collect_finalized_receipts(
-    waves: &[Arc<Verified<FinalizedWave>>],
+    waves: &[Arc<Verifiable<FinalizedWave>>],
 ) -> Vec<Arc<ConsensusReceipt>> {
     waves
         .iter()
         .flat_map(|fw| fw.consensus_receipts())
-        .collect()
-}
-
-/// Strip the verified marker from each wave for downstream consumers
-/// that take raw `Arc<FinalizedWave>` slices (storage writes, wire
-/// types, root computations).
-fn strip_verified_waves(waves: &[Arc<Verified<FinalizedWave>>]) -> Vec<Arc<FinalizedWave>> {
-    waves.iter().map(|v| Arc::new((***v).clone())).collect()
-}
-
-/// Strip the verified marker from each provisions batch for downstream
-/// consumers that take raw `Arc<Provisions>` slices (`Block::Live`
-/// payload, root computations).
-fn strip_verified_provisions(provisions: &[Arc<Verified<Provisions>>]) -> Vec<Arc<Provisions>> {
-    provisions
-        .iter()
-        .map(|v| Arc::new((***v).clone()))
         .collect()
 }
 
@@ -595,11 +578,10 @@ where
                 .pending_chain
                 .view_at(parent_block_hash, parent_block_height);
             let pending_snapshots = view.pending_snapshots().to_vec();
-            let raw_waves = strip_verified_waves(&finalized_waves);
             let (computed_root, jmt_snapshot, prepared) = view.prepare_block_commit(
                 parent_state_root,
                 parent_block_height,
-                &raw_waves,
+                &finalized_waves,
                 block_height,
                 &pending_snapshots,
                 None,
@@ -657,8 +639,6 @@ where
                 .pending_chain
                 .view_at(parent_block_hash, parent_block_height);
             let pending_snapshots = view.pending_snapshots().to_vec();
-            let raw_waves = strip_verified_waves(&finalized_waves);
-            let raw_provisions = strip_verified_provisions(&provisions);
             let result = build_proposal(
                 &view,
                 proposer,
@@ -671,10 +651,10 @@ where
                 parent_state_root,
                 parent_block_height,
                 transactions,
-                raw_waves,
+                finalized_waves.clone(),
                 shard_group_id,
                 ctx.topology_snapshot,
-                raw_provisions,
+                provisions.clone(),
                 parent_in_flight,
                 finalized_tx_count,
                 ready_signals,
@@ -1306,7 +1286,7 @@ mod tests {
 
     #[test]
     fn verify_certificate_root_matches_compute_certificate_root() {
-        let certs: Vec<Arc<FinalizedWave>> = Vec::new();
+        let certs: Vec<Arc<Verifiable<FinalizedWave>>> = Vec::new();
         let root = Verified::<CertificateRoot>::compute(&certs).into_inner();
         let ctx = CertificateRootContext {
             certificates: &certs,

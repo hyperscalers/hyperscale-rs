@@ -409,7 +409,7 @@ pub enum Action {
         /// Finalized waves whose receipts contribute to both the receipt
         /// root and the state root. The thread pool merges `DatabaseUpdates`
         /// from these.
-        finalized_waves: Vec<Arc<Verified<FinalizedWave>>>,
+        finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>>,
         /// Block height being verified.
         block_height: BlockHeight,
     },
@@ -449,7 +449,7 @@ pub enum Action {
         ready_signals: Vec<ReadySignal>,
         /// Finalized waves whose receipts contribute receipt-sourced
         /// witness events.
-        finalized_waves: Vec<Arc<Verified<FinalizedWave>>>,
+        finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>>,
         /// Topology snapshot for `proposer_for` lookups in the
         /// missed-round walk.
         topology_snapshot: TopologySnapshot,
@@ -563,9 +563,9 @@ pub enum Action {
         /// Transactions to include in the proposal.
         transactions: Vec<Arc<RoutableTransaction>>,
         /// Finalized waves to include in the block (carries certs + receipts + ECs).
-        finalized_waves: Vec<Arc<Verified<FinalizedWave>>>,
+        finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>>,
         /// Provisions from remote shards, included in this block.
-        provisions: Vec<Arc<Verified<Provisions>>>,
+        provisions: Vec<Arc<Verifiable<Provisions>>>,
         /// Parent block's in-flight count (for deterministic computation).
         parent_in_flight: InFlightCount,
         /// Number of transactions finalized by wave certificates in this block.

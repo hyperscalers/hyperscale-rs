@@ -665,8 +665,8 @@ impl ShardCoordinator {
         &mut self,
         topology_snapshot: &TopologySnapshot,
         ready_txs: &[Arc<RoutableTransaction>],
-        finalized_waves: Vec<Arc<Verified<FinalizedWave>>>,
-        provisions: Vec<Arc<Verified<Provisions>>>,
+        finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>>,
+        provisions: Vec<Arc<Verifiable<Provisions>>>,
     ) -> Vec<Action> {
         // The next height to propose is one above the highest certified block,
         // not the committed block — this lets the chain grow while the
@@ -1015,8 +1015,8 @@ impl ShardCoordinator {
         header: &BlockHeader,
         manifest: BlockManifest,
         lookup_tx: impl Fn(&TxHash) -> Option<Arc<RoutableTransaction>>,
-        lookup_finalized_wave: impl Fn(&WaveId) -> Option<Arc<Verified<FinalizedWave>>>,
-        lookup_provision: impl Fn(&ProvisionHash) -> Option<Arc<Verified<Provisions>>>,
+        lookup_finalized_wave: impl Fn(&WaveId) -> Option<Arc<Verifiable<FinalizedWave>>>,
+        lookup_provision: impl Fn(&ProvisionHash) -> Option<Arc<Verifiable<Provisions>>>,
     ) -> Vec<Action> {
         let block_hash = header.hash();
         let height = header.height();
@@ -2117,8 +2117,8 @@ impl ShardCoordinator {
         block: &Block,
         block_hash: BlockHash,
         manifest: &BlockManifest,
-        finalized_waves: Vec<Arc<Verified<FinalizedWave>>>,
-        provisions: Vec<Arc<Verified<Provisions>>>,
+        finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>>,
+        provisions: Vec<Arc<Verifiable<Provisions>>>,
     ) -> Vec<Action> {
         match self.proposal.take_matching(height, round) {
             TakeResult::Matched => {}
@@ -2322,8 +2322,8 @@ impl ShardCoordinator {
         block_hash: BlockHash,
         qc: &Verified<QuorumCertificate>,
         ready_txs: &[Arc<RoutableTransaction>],
-        finalized_waves: Vec<Arc<Verified<FinalizedWave>>>,
-        provisions: Vec<Arc<Verified<Provisions>>>,
+        finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>>,
+        provisions: Vec<Arc<Verifiable<Provisions>>>,
     ) -> Vec<Action> {
         let height = qc.height();
 
@@ -2834,13 +2834,16 @@ impl ShardCoordinator {
         // The synced block's QC BFT-transitively attests every embedded
         // wave's per-EC signature predicate via the source committee's
         // signature over `certificate_root` + `local_receipt_root`.
-        let synced_waves: Vec<Arc<Verified<FinalizedWave>>> = block
+        let synced_waves: Vec<Arc<Verifiable<FinalizedWave>>> = block
             .certificates()
             .iter()
             .map(|fw| {
-                Arc::new(Verified::<FinalizedWave>::from_committed_block(
-                    (**fw).clone(),
-                ))
+                let verified = Verifiable::verified(fw.as_ref())
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        Verified::<FinalizedWave>::from_committed_block(fw.as_unverified().clone())
+                    });
+                Arc::new(Verifiable::Verified(verified))
             })
             .collect();
         let parent_qc_height = block.header().parent_qc().height();
@@ -3168,7 +3171,7 @@ impl ShardCoordinator {
     pub fn on_finalized_waves_admitted(
         &mut self,
         topology_snapshot: &TopologySnapshot,
-        waves: &[Arc<Verified<FinalizedWave>>],
+        waves: &[Arc<Verifiable<FinalizedWave>>],
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         for fw in waves {
@@ -3197,7 +3200,7 @@ impl ShardCoordinator {
     pub fn on_provisions_admitted(
         &mut self,
         topology_snapshot: &TopologySnapshot,
-        provisions: &[Arc<Verified<Provisions>>],
+        provisions: &[Arc<Verifiable<Provisions>>],
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         for batch in provisions {

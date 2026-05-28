@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use hyperscale_core::Action;
 use hyperscale_types::{
-    FinalizedWave, MAX_TXS_PER_BLOCK, Provisions, RoutableTransaction, Verified,
+    FinalizedWave, MAX_TXS_PER_BLOCK, Provisions, RoutableTransaction, Verifiable,
 };
 
 use super::NodeStateMachine;
@@ -16,8 +16,8 @@ use super::NodeStateMachine;
 /// Inputs gathered for building a block proposal.
 pub(super) struct ProposalInputs {
     pub ready_txs: Vec<Arc<RoutableTransaction>>,
-    pub finalized_waves: Vec<Arc<Verified<FinalizedWave>>>,
-    pub provisions: Vec<Arc<Verified<Provisions>>>,
+    pub finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>>,
+    pub provisions: Vec<Arc<Verifiable<Provisions>>>,
 }
 
 impl NodeStateMachine {
@@ -43,7 +43,15 @@ impl NodeStateMachine {
             self.now,
         );
         let finalized_waves = self.execution_coordinator.get_finalized_waves();
-        let provisions = self.provisions_coordinator.queued_provisions(self.now);
+        // Provisions coordinator stores `Verified` internally; lift each
+        // batch into `Verifiable::Verified` so the marker survives across
+        // the proposal-build action.
+        let provisions = self
+            .provisions_coordinator
+            .queued_provisions(self.now)
+            .into_iter()
+            .map(|v| Arc::new(Verifiable::Verified((*v).clone())))
+            .collect();
 
         ProposalInputs {
             ready_txs,

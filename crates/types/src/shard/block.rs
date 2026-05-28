@@ -16,7 +16,7 @@ use crate::{
     FinalizedWave, LocalReceiptRoot, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK,
     MAX_TXS_PER_BLOCK, ProvisionHash, ProvisionTxRootsMap, Provisions, ProvisionsRoot,
     QuorumCertificate, RoutableTransaction, ShardGroupId, StateRoot, TransactionRoot, TxHash,
-    ValidatorId, Verified,
+    ValidatorId, Verifiable, Verified,
 };
 
 /// Shared transaction list — wrapped in `Arc` so root-verification actions
@@ -24,10 +24,19 @@ use crate::{
 pub type SharedTransactions = Arc<BoundedVec<Arc<RoutableTransaction>, MAX_TXS_PER_BLOCK>>;
 
 /// Shared certificate list — same rationale as [`SharedTransactions`].
-pub type SharedCertificates = Arc<BoundedVec<Arc<FinalizedWave>, MAX_FINALIZED_TX_PER_BLOCK>>;
+///
+/// Elements are wrapped in [`Verifiable`] so an in-process upstream's
+/// [`Verified<FinalizedWave>`] marker survives across block construction
+/// and downstream dispatch; wire-decoded blocks land at
+/// [`Verifiable::Unverified`] because SBOR decode is a transparent
+/// passthrough into that variant. Same rationale as
+/// [`BlockHeader::parent_qc`](crate::BlockHeader) which carries
+/// `Verifiable<QuorumCertificate>` for the same reason.
+pub type SharedCertificates =
+    Arc<BoundedVec<Arc<Verifiable<FinalizedWave>>, MAX_FINALIZED_TX_PER_BLOCK>>;
 
-/// Shared provision list — same rationale as [`SharedTransactions`].
-pub type SharedProvisions = Arc<BoundedVec<Arc<Provisions>, MAX_PROVISIONS_PER_BLOCK>>;
+/// Shared provision list — same rationale as [`SharedCertificates`].
+pub type SharedProvisions = Arc<BoundedVec<Arc<Verifiable<Provisions>>, MAX_PROVISIONS_PER_BLOCK>>;
 
 /// Shared provision-hash list — carried on `Block::Sealed` so that
 /// sync-serving glue can re-attach provision bodies even after the
@@ -96,11 +105,13 @@ impl PartialEq for Block {
         fn tx_lists_equal(a: &[Arc<RoutableTransaction>], b: &[Arc<RoutableTransaction>]) -> bool {
             a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.hash() == y.hash())
         }
-        fn cert_lists_equal(a: &[Arc<FinalizedWave>], b: &[Arc<FinalizedWave>]) -> bool {
-            a.len() == b.len()
-                && a.iter()
-                    .zip(b.iter())
-                    .all(|(x, y)| x.as_ref() == y.as_ref())
+        fn cert_lists_equal(
+            a: &[Arc<Verifiable<FinalizedWave>>],
+            b: &[Arc<Verifiable<FinalizedWave>>],
+        ) -> bool {
+            // Compare by inner FW content; the `Verifiable` marker is
+            // irrelevant to whether two blocks are content-equal.
+            a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| ***x == ***y)
         }
 
         self.header() == other.header()
@@ -162,8 +173,12 @@ impl Block {
     /// dropped their provisions because the cross-shard execution window
     /// they served has passed. Use `is_live()` when the variant itself
     /// matters — this accessor flattens both cases to a slice.
+    ///
+    /// Elements are [`Verifiable<Provisions>`] — the in-process upstream's
+    /// verification marker survives across the block boundary; consumers
+    /// peek `.verified()` to skip re-verification when the marker is live.
     #[must_use]
-    pub fn provisions(&self) -> &[Arc<Provisions>] {
+    pub fn provisions(&self) -> &[Arc<Verifiable<Provisions>>] {
         match self {
             Self::Live { provisions, .. } => provisions,
             Self::Sealed { .. } => &[],

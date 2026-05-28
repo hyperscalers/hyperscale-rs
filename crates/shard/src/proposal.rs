@@ -21,7 +21,7 @@ use hyperscale_core::Action;
 use hyperscale_types::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight, FinalizedWave,
     LocalTimestamp, ProposerTimestamp, ProvisionHash, Provisions, ReadySignal, Round,
-    RoutableTransaction, TopologySnapshot, TxHash, Verified, WaveId, WeightedTimestamp,
+    RoutableTransaction, TopologySnapshot, TxHash, Verifiable, WaveId, WeightedTimestamp,
 };
 use tracing::debug;
 
@@ -39,8 +39,8 @@ pub enum ProposalKind {
     /// Normal proposal with a filtered payload and a real-clock timestamp.
     Normal {
         transactions: Vec<Arc<RoutableTransaction>>,
-        finalized_waves: Vec<Arc<Verified<FinalizedWave>>>,
-        provisions: Vec<Arc<Verified<Provisions>>>,
+        finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>>,
+        provisions: Vec<Arc<Verifiable<Provisions>>>,
         finalized_tx_count: u32,
     },
     /// View-change fallback: empty payload, parent's weighted timestamp
@@ -207,11 +207,11 @@ pub fn select_transactions(
 /// in manifest order, and the `BTreeMap` collapse there is last-writer-wins,
 /// so the proposer must produce a deterministic order.
 pub fn select_finalized_waves(
-    finalized_waves: Vec<Arc<Verified<FinalizedWave>>>,
+    finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>>,
     qc_chain_cert_ids: &HashSet<WaveId>,
     dedup_index: &CommitDedupIndex,
     max_finalized_txs: usize,
-) -> (Vec<Arc<Verified<FinalizedWave>>>, usize) {
+) -> (Vec<Arc<Verifiable<FinalizedWave>>>, usize) {
     let mut candidate_waves: Vec<_> = finalized_waves
         .into_iter()
         .filter(|fw| {
@@ -242,11 +242,11 @@ pub fn select_finalized_waves(
 /// Oldest batches go first so the queue drains monotonically; unselected
 /// batches remain queued for the next proposal.
 pub fn select_provisions(
-    provisions: Vec<Arc<Verified<Provisions>>>,
+    provisions: Vec<Arc<Verifiable<Provisions>>>,
     qc_chain_provision_hashes: &HashSet<ProvisionHash>,
     dedup_index: &CommitDedupIndex,
     max_provision_txs: usize,
-) -> Vec<Arc<Verified<Provisions>>> {
+) -> Vec<Arc<Verifiable<Provisions>>> {
     let mut running_tx_count = 0usize;
     provisions
         .into_iter()

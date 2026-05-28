@@ -553,11 +553,11 @@ impl ExecutionCoordinator {
     /// Per-tx terminal state for the mempool is driven by
     /// `mempool::on_block_committed` reading `block.certificates` directly.
     /// This function only handles execution's own bookkeeping.
-    pub fn cleanup_committed_waves(&mut self, certificates: &[Arc<FinalizedWave>]) {
+    pub fn cleanup_committed_waves(&mut self, certificates: &[Arc<Verifiable<FinalizedWave>>]) {
         for fw in certificates {
             // No-op for synced waves we never aggregated locally; for waves we
             // tracked, releases accumulator/cache state for the wave's txs.
-            self.remove_finalized_wave(fw.as_ref());
+            self.remove_finalized_wave(fw.as_unverified());
         }
     }
 
@@ -567,22 +567,36 @@ impl ExecutionCoordinator {
     /// interleaved, the `already_provisioned` guard in phase 2 reads a
     /// partially-absorbed map whose contents depend on provisions iteration order,
     /// which diverges abort decisions across validators.
+    ///
+    /// Each batch is peeked for its [`Verifiable::verified`] marker before
+    /// re-wrapping. Same-process upstream paths leave the marker live, so
+    /// we borrow the existing [`Verified<Provisions>`] without a body
+    /// clone. Wire-decoded blocks land at `Unverified`; the
+    /// [`Verified::<Provisions>::from_committed_block`] gate then carries
+    /// the BFT-transitive trust source via a re-wrap (one body clone).
     fn apply_committed_provisions(
         &mut self,
-        batches: &[Arc<Provisions>],
+        batches: &[Arc<Verifiable<Provisions>>],
         committed_height: BlockHeight,
         committed_ts: WeightedTimestamp,
     ) -> Vec<Action> {
         // Sort for deterministic phase-2 iteration (logs, action vector order).
-        let mut ordered: Vec<&Arc<Provisions>> = batches.iter().collect();
+        let mut ordered: Vec<&Arc<Verifiable<Provisions>>> = batches.iter().collect();
         ordered.sort_by_key(|b| b.hash());
 
         // Phase 1: absorb all provisions. Populated unconditionally so
         // `setup_waves_and_dispatch` can replay them at wave-creation time.
         let mut affected_waves: BTreeSet<WaveId> = BTreeSet::new();
         for provisions in &ordered {
-            let verified = Verified::<Provisions>::from_committed_block((***provisions).clone());
-            for tx_hash in self.provisioning.absorb_provisions(&verified) {
+            let touched = if let Some(v) = provisions.verified() {
+                self.provisioning.absorb_provisions(v)
+            } else {
+                let verified = Verified::<Provisions>::from_committed_block(
+                    provisions.as_unverified().clone(),
+                );
+                self.provisioning.absorb_provisions(&verified)
+            };
+            for tx_hash in touched {
                 if let Some(wave_id) = self.waves.wave_assignment(tx_hash) {
                     affected_waves.insert(wave_id);
                 }
@@ -595,7 +609,10 @@ impl ExecutionCoordinator {
         // dispatched (inert to mid-flight input).
         for provisions in &ordered {
             let source_shard = provisions.source_shard();
-            for conflict in self.provisioning.detect_conflicts(provisions, committed_ts) {
+            for conflict in self
+                .provisioning
+                .detect_conflicts(provisions.as_unverified(), committed_ts)
+            {
                 let loser = conflict.loser_tx;
                 if self.provisioning.is_fully_provisioned(loser) {
                     continue;
@@ -1407,7 +1424,7 @@ impl ExecutionCoordinator {
         block_hash: BlockHash,
         header: &BlockHeader,
         transactions: &[Arc<RoutableTransaction>],
-        provisions: &[Arc<Provisions>],
+        provisions: &[Arc<Verifiable<Provisions>>],
     ) -> Vec<Action> {
         let height = header.height();
         let mut actions = Vec::new();
@@ -1582,7 +1599,13 @@ impl ExecutionCoordinator {
         // re-broadcast tracker entry to stop wasting bandwidth.
         self.outbound_certs.on_wave_finalized(wave_id);
 
-        let finalized_arc = Arc::new(Verified::<FinalizedWave>::seal(wave.into_finalized()));
+        // Local-finalization gate produces `Verified<FinalizedWave>`; lift
+        // into the `Block::Live.certificates` transport shape once so the
+        // store, the admission event, and any downstream `PendingBlock`
+        // entry share the same `Arc` without further per-consumer cloning.
+        let finalized_arc = Arc::new(Verifiable::Verified(Verified::<FinalizedWave>::seal(
+            wave.into_finalized(),
+        )));
         self.finalized
             .insert(wave_id.clone(), Arc::clone(&finalized_arc));
 
@@ -1710,6 +1733,10 @@ impl ExecutionCoordinator {
                 })];
             }
         };
+        // Lift the verification result into the `Block::Live.certificates`
+        // transport shape exactly once so the admission event and any
+        // downstream pending-block storage share the same `Arc`.
+        let wave = Arc::new(Verifiable::Verified((*wave).clone()));
         vec![Action::Continuation(
             ProtocolEvent::FinalizedWavesAdmitted { waves: vec![wave] },
         )]
@@ -1725,15 +1752,17 @@ impl ExecutionCoordinator {
         self.waves.wave_assignment(tx_hash)
     }
 
-    /// Get all finalized waves (for proposal building).
+    /// Get all finalized waves (for proposal building). Returns the
+    /// `Block::Live.certificates` transport shape so the proposer can hand
+    /// the result straight to the action without a per-element conversion.
     #[must_use]
-    pub fn get_finalized_waves(&self) -> Vec<Arc<Verified<FinalizedWave>>> {
+    pub fn get_finalized_waves(&self) -> Vec<Arc<Verifiable<FinalizedWave>>> {
         self.finalized.all_waves()
     }
 
     /// Get a finalized wave by its `WaveId` (returns `Arc` for sharing).
     #[must_use]
-    pub fn get_finalized_wave(&self, wave_id: &WaveId) -> Option<Arc<Verified<FinalizedWave>>> {
+    pub fn get_finalized_wave(&self, wave_id: &WaveId) -> Option<Arc<Verifiable<FinalizedWave>>> {
         self.finalized.get(wave_id)
     }
 
@@ -2890,10 +2919,12 @@ mod tests {
             Arc::new(WaveCertificate::new(wave_id.clone(), vec![ec])),
             vec![],
         );
-        let verified_wave = Arc::new(Verified::new_unchecked_for_test(raw_wave.clone()));
+        let verifiable_wave = Arc::new(Verifiable::Verified(Verified::new_unchecked_for_test(
+            raw_wave.clone(),
+        )));
         // Seed the canonical store directly (mirrors what `finalize_wave`
         // does on the local-aggregation path).
-        state.finalized.insert(wave_id, verified_wave);
+        state.finalized.insert(wave_id, verifiable_wave);
 
         let actions = state.admit_finalized_wave(&topo, Arc::new(raw_wave));
         assert!(actions.is_empty());
