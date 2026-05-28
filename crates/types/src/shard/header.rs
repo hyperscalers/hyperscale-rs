@@ -439,8 +439,9 @@ pub struct BlockHeaderParentQcMismatch;
 ///   header's `parent_qc` field after a byte-equality check. Used at
 ///   composite-assembly sites where the verified QC sits in a separate
 ///   cache rather than inside the wire-decoded header.
-/// - [`Verified::<BlockHeader>::new_unchecked`] — audit point. Used at
-///   storage-recovery boundaries. Every call site carries a `// SAFETY:`
+/// - [`Verified::<BlockHeader>::new_unchecked`] — re-wraps a header
+///   whose predicate already held via an out-of-band trust source
+///   (e.g. storage-recovery). Every call site carries a `// SAFETY:`
 ///   comment naming the trust source.
 impl Verify<()> for BlockHeader {
     type Augment = ();

@@ -9,7 +9,10 @@ use sbor::{
 };
 use thiserror::Error;
 
-use crate::{Block, BlockHash, BlockHeight, QuorumCertificate, Verifiable, Verified};
+use crate::{
+    Block, BlockHash, BlockHeight, QuorumCertificate, ShardGroupId, StateRoot, ValidatorId,
+    Verifiable, Verified,
+};
 
 /// A block alongside the QC that certifies it.
 ///
@@ -189,6 +192,69 @@ pub enum LinkageError {
 }
 
 impl Verified<CertifiedBlock> {
+    /// Verified form of the genesis `CertifiedBlock` for
+    /// `shard_group_id`.
+    ///
+    /// Builds the empty genesis block, pairs it with a genesis-shape
+    /// QC (zero signers, zero signature, zero round/height) whose
+    /// `block_hash` points at the genesis block so the
+    /// [`Verified<CertifiedBlock>`] linkage holds. The canonical
+    /// [`QuorumCertificate::genesis`] carries `BlockHash::ZERO` and
+    /// therefore does not pair directly with a real genesis block;
+    /// this constructor handles the substitution.
+    ///
+    /// Construction asserts the full [`Verified<CertifiedBlock>`]
+    /// predicate by inputs: every commitment root is the empty-input
+    /// compute, the embedded `parent_qc` is the canonical genesis
+    /// (verified by definition), and the synthetic genesis-shape QC
+    /// pairs by construction.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the assemble linkage fails — structurally impossible
+    /// for genesis pairs.
+    #[must_use]
+    pub fn genesis(
+        shard_group_id: ShardGroupId,
+        proposer: ValidatorId,
+        state_root: StateRoot,
+    ) -> Self {
+        let block = Block::genesis(shard_group_id, proposer, state_root);
+        let block_hash = block.hash();
+        let base = QuorumCertificate::genesis(shard_group_id);
+        let qc_for_block = QuorumCertificate::new(
+            block_hash,
+            base.shard_group_id(),
+            base.height(),
+            base.parent_block_hash(),
+            base.round(),
+            base.signers().clone(),
+            base.aggregated_signature(),
+            base.weighted_timestamp(),
+        );
+        // SAFETY: genesis-shape QC paired with a freshly-built local
+        // genesis block; both inputs are verified by construction
+        // (empty-input root compute + zero-signers QC).
+        let verified_block = Verified::<Block>::new_unchecked(block);
+        let verified_qc = Verified::<QuorumCertificate>::new_unchecked(qc_for_block);
+        Self::assemble(verified_block, verified_qc)
+            .expect("genesis QC.block_hash == genesis block.hash() by construction")
+    }
+
+    /// Re-wrap a [`CertifiedBlock`] read out of persistent storage as
+    /// verified.
+    ///
+    /// Certified blocks are persisted only after passing the full
+    /// [`Verified<CertifiedBlock>`] predicate at admission (block
+    /// per-root verifiers + QC sig + linkage), so re-reading them
+    /// post-restart returns values whose predicate already held at
+    /// write-time. Callers in storage adapters or recovery paths use
+    /// this constructor; any other caller is misusing it.
+    #[must_use]
+    pub const fn from_persisted(certified: CertifiedBlock) -> Self {
+        Self::new_unchecked(certified)
+    }
+
     /// Pair a `Verified<Block>` with a `Verified<QuorumCertificate>`,
     /// checking the linkage invariant. Construction gate when this node
     /// ran the block's per-root verifiers locally.

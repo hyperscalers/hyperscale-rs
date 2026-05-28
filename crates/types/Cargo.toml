@@ -18,6 +18,9 @@ sbor.workspace = true
 # Error handling
 thiserror.workspace = true
 
+# Diagnostics
+tracing.workspace = true
+
 # Radix transaction types
 radix-common.workspace = true
 radix-engine-interface.workspace = true

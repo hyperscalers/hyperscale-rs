@@ -47,8 +47,8 @@ use hyperscale_storage::ShardChainReader;
 use hyperscale_storage_rocksdb::{RocksDbShardStorage, SharedStorage};
 use hyperscale_types::{
     Block, BlockHeight, Bls12381G1PrivateKey, CertifiedBlock, InFlightCount, LocalTimestamp,
-    MAX_TX_IN_FLIGHT, NodeId, QuorumCertificate, RoutableTransaction, ShardGroupId,
-    TopologySnapshot, TransactionStatus, TxHash, ValidatorId, Verified, shard_for_node,
+    MAX_TX_IN_FLIGHT, NodeId, RoutableTransaction, ShardGroupId, TopologySnapshot,
+    TransactionStatus, TxHash, ValidatorId, Verified, shard_for_node,
 };
 use libp2p::identity::Keypair;
 use quick_cache::sync::Cache as QuickCache;
@@ -769,28 +769,10 @@ impl ProductionRunner {
 
             // Sync the state machine with the JMT state genesis just
             // installed — vnodes were created with zero state.
-            let genesis_qc = {
-                let __qc = QuorumCertificate::genesis(shard);
-                QuorumCertificate::new(
-                    genesis_block.hash(),
-                    __qc.shard_group_id(),
-                    __qc.height(),
-                    __qc.parent_block_hash(),
-                    __qc.round(),
-                    __qc.signers().clone(),
-                    __qc.aggregated_signature(),
-                    __qc.weighted_timestamp(),
-                )
-            };
-            // SAFETY: genesis is constructed locally with empty
-            // content (no txs, no certificates, no provisions, no
-            // beacon-witness deltas over the empty accumulator), so
-            // every per-root predicate holds trivially against the
-            // empty-input compute; the synthetic genesis QC pairs with
-            // `genesis_block.hash()` by construction; no adversarial
-            // input touches it before the typestate wrap.
-            let genesis_certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked(
-                CertifiedBlock::new_unchecked(genesis_block, genesis_qc),
+            let genesis_certified = Arc::new(Verified::<CertifiedBlock>::genesis(
+                shard,
+                first_validator,
+                genesis_block.header().state_root(),
             ));
             let genesis_commit_output = host.step(ShardEvent::protocol(
                 shard,

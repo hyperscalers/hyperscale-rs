@@ -26,8 +26,8 @@ use hyperscale_storage::{RecoveredState, ShardChainReader};
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::{
     BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey, CertifiedBlock, LocalTimestamp, NodeId,
-    QuorumCertificate, ShardGroupId, TopologySnapshot, TransactionStatus, TxHash, ValidatorId,
-    ValidatorInfo, ValidatorSet, Verified, VotePower, bls_keypair_from_seed, shard_for_node,
+    ShardGroupId, TopologySnapshot, TransactionStatus, TxHash, ValidatorId, ValidatorInfo,
+    ValidatorSet, Verified, VotePower, bls_keypair_from_seed, shard_for_node,
 };
 use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
@@ -633,31 +633,10 @@ impl SimulationRunner {
                 self.process_step_output(*host_index, output);
 
                 // Sync state machine with actual JMT state after genesis bootstrap.
-                // Pair the genesis block with a zeroed QC whose `block_hash` matches
-                // so the CertifiedBlock pairing invariant holds.
-                let genesis_qc = {
-                    let __qc = QuorumCertificate::genesis(genesis_block.header().shard_group_id());
-                    QuorumCertificate::new(
-                        genesis_block.hash(),
-                        __qc.shard_group_id(),
-                        __qc.height(),
-                        __qc.parent_block_hash(),
-                        __qc.round(),
-                        __qc.signers().clone(),
-                        __qc.aggregated_signature(),
-                        __qc.weighted_timestamp(),
-                    )
-                };
-                // SAFETY: genesis is constructed locally with empty
-                // content (no txs, no certificates, no provisions, no
-                // beacon-witness deltas over the empty accumulator), so
-                // every per-root predicate holds trivially against the
-                // empty-input compute; the synthetic genesis QC pairs
-                // with `genesis_block.hash()` by construction; nothing
-                // crosses an adversarial boundary before the typestate
-                // wrap.
-                let genesis_certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked(
-                    CertifiedBlock::new_unchecked(genesis_block.clone(), genesis_qc),
+                let genesis_certified = Arc::new(Verified::<CertifiedBlock>::genesis(
+                    shard,
+                    proposer,
+                    genesis_jmt_root,
                 ));
                 let genesis_commit_event = ShardEvent::protocol(
                     shard,

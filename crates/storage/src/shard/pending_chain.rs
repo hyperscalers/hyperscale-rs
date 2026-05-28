@@ -182,7 +182,7 @@ where
         // them through the unified read path.
         self.base
             .get_block(height)
-            .map(|cb| Arc::new(Verified::<CertifiedBlock>::new_unchecked(cb)))
+            .map(|cb| Arc::new(Verified::<CertifiedBlock>::from_persisted(cb)))
     }
 
     /// Committed header at `height`. Header-only view of

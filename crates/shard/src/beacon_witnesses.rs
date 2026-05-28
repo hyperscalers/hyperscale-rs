@@ -13,42 +13,11 @@
 //! and let proposer + verifier share them verbatim.
 
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BeaconWitnessRoot, BeaconWitnessRootVerifyError, BlockHash,
-    BlockHeight, ConsensusReceipt, Hash, ReadySignal, Round, ShardWitnessPayload, StoredReceipt,
-    TopologySnapshot, Verified, Verify, compute_merkle_root,
+    BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, Hash, ShardWitnessPayload, StoredReceipt,
+    TopologySnapshot, compute_merkle_root, derive_leaves, missed_proposals_since_prev_commit,
 };
 
 use crate::pending::PendingBlocks;
-
-/// Inputs the [`BeaconWitnessRoot`] verifier reads against.
-///
-/// Re-derives the block's new witness payloads from the three canonical
-/// sources (`receipts`, the missed-round walk over
-/// `(parent_round, round)`, and `ready_signals`), appends them to
-/// `parent_witness_leaves`, and checks the resulting `(root, count)`
-/// matches the header's claim.
-#[derive(Debug)]
-pub struct BeaconWitnessRootContext<'a> {
-    /// Header's claimed leaf count after appending this block's new
-    /// witness payloads. Verification checks the computed count matches.
-    pub expected_leaf_count: BeaconWitnessLeafCount,
-    /// Accumulator leaves at the parent block's tip — the prefix the
-    /// new payloads append onto.
-    pub parent_witness_leaves: Vec<Hash>,
-    /// Round of the parent block — anchors the missed-proposal walk.
-    pub parent_round: Round,
-    /// Height of the block being verified.
-    pub height: BlockHeight,
-    /// Round at which the block was proposed.
-    pub round: Round,
-    /// Receipts that contribute leaves via `beacon_witness_events`.
-    pub receipts: &'a [StoredReceipt],
-    /// Ready signals carried on the block's manifest.
-    pub ready_signals: &'a [ReadySignal],
-    /// Topology snapshot anchoring the proposer-rotation rule the
-    /// missed-round walk reads.
-    pub topology: &'a TopologySnapshot,
-}
 
 /// Per-shard append-only beacon-witness accumulator.
 ///
@@ -133,75 +102,6 @@ impl BeaconWitnessAccumulator {
     }
 }
 
-/// Walk the rounds `(parent_round, committed_round)` and emit one
-/// `MissedProposal` witness per skipped round, identifying the expected
-/// proposer via [`TopologySnapshot::proposer_for`].
-///
-/// Returns `Vec::new()` when `committed_round <= parent_round + 1` (the
-/// successful proposer took the first attempt at this height — nothing
-/// to report). Used by both the proposer-side derivation and the
-/// post-execution verifier so a future change to leader rotation moves
-/// both sides simultaneously.
-#[must_use]
-pub fn missed_proposals_since_prev_commit(
-    height: BlockHeight,
-    parent_round: Round,
-    committed_round: Round,
-    topology: &TopologySnapshot,
-) -> Vec<ShardWitnessPayload> {
-    let mut missed = Vec::new();
-    let mut round = parent_round.next();
-    while round < committed_round {
-        let proposer_id = topology.proposer_for(height, round);
-        missed.push(ShardWitnessPayload::MissedProposal {
-            proposer_id,
-            height,
-            round,
-        });
-        round = round.next();
-    }
-    missed
-}
-
-/// Canonical leaf-derivation rule used by both proposer and verifier.
-///
-/// Ordering (locked — every honest validator must produce the same
-/// `Vec<ShardWitnessPayload>` given the same inputs):
-///
-/// 1. Receipt-emitted witnesses in receipt-iteration order; within a
-///    receipt, in the order the engine recorded them.
-/// 2. `MissedProposal` witnesses in ascending round order (the helper
-///    already sorts; pass its output verbatim).
-/// 3. `Ready` witnesses in ascending `validator_id` order.
-#[must_use]
-pub fn derive_leaves(
-    receipts: &[StoredReceipt],
-    missed: &[ShardWitnessPayload],
-    ready_signals: &[ReadySignal],
-) -> Vec<ShardWitnessPayload> {
-    let mut out = Vec::new();
-    for receipt in receipts {
-        if let ConsensusReceipt::Succeeded {
-            beacon_witness_events,
-            ..
-        } = receipt.consensus.as_ref()
-        {
-            for event in beacon_witness_events {
-                out.push(ShardWitnessPayload::from(event.clone()));
-            }
-        }
-    }
-    out.extend_from_slice(missed);
-    let mut sorted: Vec<&ReadySignal> = ready_signals.iter().collect();
-    sorted.sort_by_key(|s| s.validator_id());
-    for signal in sorted {
-        out.push(ShardWitnessPayload::Ready {
-            id: signal.validator_id(),
-        });
-    }
-    out
-}
-
 /// Snapshot of the beacon-witness accumulator's leaf hashes at the
 /// state the supplied parent block would leave behind.
 ///
@@ -275,54 +175,12 @@ pub fn prospective_parent_witness_leaves(
     Ok(leaves)
 }
 
-impl Verify<&BeaconWitnessRootContext<'_>> for BeaconWitnessRoot {
-    type Augment = ();
-    type Error = BeaconWitnessRootVerifyError;
-
-    fn verify(&self, ctx: &BeaconWitnessRootContext<'_>) -> Result<Verified<Self>, Self::Error> {
-        let expected_root = *self;
-        let missed = missed_proposals_since_prev_commit(
-            ctx.height,
-            ctx.parent_round,
-            ctx.round,
-            ctx.topology,
-        );
-        let new_leaves = derive_leaves(ctx.receipts, &missed, ctx.ready_signals);
-
-        let mut leaves = ctx.parent_witness_leaves.clone();
-        leaves.reserve(new_leaves.len());
-        for payload in &new_leaves {
-            leaves.push(payload.leaf_hash());
-        }
-        let computed_root = Self::from_raw(compute_merkle_root(&leaves));
-        let computed_count = BeaconWitnessLeafCount::new(leaves.len() as u64);
-        if computed_root != expected_root || computed_count != ctx.expected_leaf_count {
-            tracing::warn!(
-                ?expected_root,
-                ?computed_root,
-                expected_count = ctx.expected_leaf_count.inner(),
-                computed_count = computed_count.inner(),
-                height = ctx.height.inner(),
-                round = ctx.round.inner(),
-                "Beacon-witness root verification FAILED"
-            );
-            return Err(BeaconWitnessRootVerifyError::Mismatch {
-                expected_root,
-                computed_root,
-                expected_count: ctx.expected_leaf_count.inner(),
-                computed_count: computed_count.inner(),
-            });
-        }
-        Ok(Verified::<Self>::new_unchecked(expected_root))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use hyperscale_test_helpers::TestCommittee;
     use hyperscale_types::{
-        BeaconWitnessRoot, Bls12381G2Signature, Stake, StakePoolId, TopologySnapshot, ValidatorId,
-        compute_merkle_root,
+        BeaconWitnessRoot, BlockHeight, Bls12381G2Signature, ReadySignal, Round, Stake,
+        StakePoolId, TopologySnapshot, ValidatorId, compute_merkle_root,
     };
 
     use super::*;

@@ -736,7 +736,7 @@ mod tests {
         );
 
         let verified_msg = VTestMsg {
-            payload: Verifiable::Verified(Verified::new_unchecked(42)),
+            payload: Verifiable::Verified(Verified::new_unchecked_for_test(42)),
         };
         let verdict = registry.local_dispatch_gossip(&verified_msg, Some(ShardGroupId::new(0)));
         assert_eq!(verdict, Some(GossipVerdict::Accept));
