@@ -20,7 +20,6 @@ pub mod limits;
 pub mod manifest;
 pub mod quorum_certificate;
 pub mod roots;
-pub mod state_root;
 pub mod vote;
 
 pub use block::{
