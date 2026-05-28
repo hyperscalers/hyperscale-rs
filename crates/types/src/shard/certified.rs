@@ -248,8 +248,11 @@ impl Verified<CertifiedBlock> {
     /// [`Verified<CertifiedBlock>`] predicate at admission (block
     /// per-root verifiers + QC sig + linkage), so re-reading them
     /// post-restart returns values whose predicate already held at
-    /// write-time. Callers in storage adapters or recovery paths use
-    /// this constructor; any other caller is misusing it.
+    /// write-time. The shard storage write entry point
+    /// (`commit_block`) takes `&Arc<Verified<CertifiedBlock>>`, so
+    /// unverified blocks can't reach the write path. Callers in
+    /// storage adapters or recovery paths use this constructor; any
+    /// other caller is misusing it.
     #[must_use]
     pub const fn from_persisted(certified: CertifiedBlock) -> Self {
         Self::new_unchecked(certified)

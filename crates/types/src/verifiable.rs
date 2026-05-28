@@ -88,11 +88,9 @@ impl<T> Verified<T> {
     /// Construct a verified value without running the predicate. The
     /// caller asserts the predicate holds via an out-of-band trust source.
     ///
-    /// Production callers reach this through the named typed gates
-    /// (`genesis`, `from_persisted`, `assemble`, `from_qc_attestation`,
-    /// `from_pipeline_attestation`, `sign_local`, …) defined inside
-    /// `crates/types`, each delegating here under a documented trust
-    /// source. The only outside-`crates/types` access is via
+    /// Production callers reach this through named typed gates defined
+    /// inside `crates/types`, each delegating here under a documented
+    /// trust source. The only outside-`crates/types` access is via
     /// [`Self::new_unchecked_for_test`], re-exported behind the
     /// `test-utils` feature for fixture construction.
     #[must_use]

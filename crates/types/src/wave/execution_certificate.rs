@@ -447,9 +447,11 @@ impl Verified<ExecutionCertificate> {
     }
 
     /// Re-wrap a certificate that satisfied the predicate at write
-    /// time. The trust source is the upstream verifier that authorised
-    /// the persistence; storage rehydration paths use this gate to
-    /// avoid re-running BLS aggregation on every load.
+    /// time. ECs ride into storage embedded inside `Verified<FinalizedWave>`
+    /// values inside the `Verified<CertifiedBlock>` argument to
+    /// `commit_block`, so unverified ECs can't reach the write path.
+    /// Storage rehydration paths use this gate to avoid re-running BLS
+    /// aggregation on every load.
     #[must_use]
     pub const fn from_persisted(cert: ExecutionCertificate) -> Self {
         // SAFETY: the certificate's predicate held at write time;
