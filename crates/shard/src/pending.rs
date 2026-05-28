@@ -133,7 +133,7 @@ impl PendingBlocks {
         now: LocalTimestamp,
         lookup_tx: impl Fn(&TxHash) -> Option<Arc<RoutableTransaction>>,
         lookup_finalized_wave: impl Fn(&WaveId) -> Option<Arc<Verified<FinalizedWave>>>,
-        lookup_provision: impl Fn(&ProvisionHash) -> Option<Arc<Provisions>>,
+        lookup_provision: impl Fn(&ProvisionHash) -> Option<Arc<Verified<Provisions>>>,
     ) {
         let mut pending = PendingBlock::from_manifest(header, manifest, now);
 
@@ -159,7 +159,7 @@ impl PendingBlocks {
             pending.add_finalized_wave(fw);
         }
 
-        let provisions: Vec<Arc<Provisions>> = pending
+        let provisions: Vec<Arc<Verified<Provisions>>> = pending
             .manifest()
             .provision_hashes()
             .iter()
@@ -243,7 +243,7 @@ impl PendingBlocks {
     /// Record an arrived provisions batch against any pending block that
     /// needs it. Returns the hashes of blocks that became complete as a
     /// result.
-    pub fn receive_provision(&mut self, batch: &Arc<Provisions>) -> Vec<BlockHash> {
+    pub fn receive_provision(&mut self, batch: &Arc<Verified<Provisions>>) -> Vec<BlockHash> {
         let provisions_hash = batch.hash();
         self.fold_arrival(
             |pending| pending.needs_provision(&provisions_hash),
@@ -377,7 +377,7 @@ pub struct PendingBlock {
 
     /// Received provisions keyed by provisions hash. `BTreeMap` so
     /// `provisions()` iteration is deterministic across validators.
-    received_provisions: BTreeMap<ProvisionHash, Arc<Provisions>>,
+    received_provisions: BTreeMap<ProvisionHash, Arc<Verified<Provisions>>>,
 
     /// Set of provisions hashes we're still waiting for.
     missing_provision_hashes: HashSet<ProvisionHash>,
@@ -432,7 +432,7 @@ impl PendingBlock {
         block: &Block,
         ready_signals: Vec<ReadySignal>,
         finalized_waves: Vec<Arc<Verified<FinalizedWave>>>,
-        provisions: Vec<Arc<Provisions>>,
+        provisions: Vec<Arc<Verified<Provisions>>>,
         created_at: LocalTimestamp,
     ) -> Self {
         let mut provision_hashes: Vec<ProvisionHash> =
@@ -445,7 +445,8 @@ impl PendingBlock {
             .map(|c| c.wave_id().clone())
             .collect();
         let manifest = BlockManifest::new(tx_hashes, cert_ids, provision_hashes, ready_signals);
-        let mut received_provisions: BTreeMap<ProvisionHash, Arc<Provisions>> = BTreeMap::new();
+        let mut received_provisions: BTreeMap<ProvisionHash, Arc<Verified<Provisions>>> =
+            BTreeMap::new();
         for p in provisions {
             received_provisions.insert(p.hash(), p);
         }
@@ -540,7 +541,7 @@ impl PendingBlock {
     /// Add a received provisions.
     ///
     /// Returns true if this provision was needed, false if duplicate or not in this block.
-    pub fn add_provision(&mut self, provisions: Arc<Provisions>) -> bool {
+    pub fn add_provision(&mut self, provisions: Arc<Verified<Provisions>>) -> bool {
         let hash = provisions.hash();
         if self.missing_provision_hashes.remove(&hash) {
             self.received_provisions.insert(hash, provisions);
@@ -608,11 +609,14 @@ impl PendingBlock {
         // Attach provisions in manifest order. `received_provisions` is
         // populated as provisions arrive via gossip / local fetch,
         // and `is_complete()` gates assembly on all of them being present.
+        // The typed marker is stripped at the Block boundary since `Block`
+        // is a wire type.
         let provisions: Vec<Arc<Provisions>> = self
             .manifest
             .provision_hashes()
             .iter()
-            .filter_map(|hash| self.received_provisions.get(hash).cloned())
+            .filter_map(|hash| self.received_provisions.get(hash))
+            .map(|verified| Arc::new((***verified).clone()))
             .collect();
 
         let block = Arc::new(Block::Live {

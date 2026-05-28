@@ -303,6 +303,16 @@ fn strip_verified_waves(waves: &[Arc<Verified<FinalizedWave>>]) -> Vec<Arc<Final
     waves.iter().map(|v| Arc::new((***v).clone())).collect()
 }
 
+/// Strip the verified marker from each provisions batch for downstream
+/// consumers that take raw `Arc<Provisions>` slices (`Block::Live`
+/// payload, root computations).
+fn strip_verified_provisions(provisions: &[Arc<Verified<Provisions>>]) -> Vec<Arc<Provisions>> {
+    provisions
+        .iter()
+        .map(|v| Arc::new((***v).clone()))
+        .collect()
+}
+
 /// Handle the shard-owned delegated [`Action`] variants.
 ///
 /// Outcomes flow through `ctx.notify` (state-machine inputs) and
@@ -648,6 +658,7 @@ where
                 .view_at(parent_block_hash, parent_block_height);
             let pending_snapshots = view.pending_snapshots().to_vec();
             let raw_waves = strip_verified_waves(&finalized_waves);
+            let raw_provisions = strip_verified_provisions(&provisions);
             let result = build_proposal(
                 &view,
                 proposer,
@@ -663,7 +674,7 @@ where
                 raw_waves,
                 shard_group_id,
                 ctx.topology_snapshot,
-                provisions.clone(),
+                raw_provisions,
                 parent_in_flight,
                 finalized_tx_count,
                 ready_signals,

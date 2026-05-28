@@ -565,7 +565,7 @@ pub enum Action {
         /// Finalized waves to include in the block (carries certs + receipts + ECs).
         finalized_waves: Vec<Arc<Verified<FinalizedWave>>>,
         /// Provisions from remote shards, included in this block.
-        provisions: Vec<Arc<Provisions>>,
+        provisions: Vec<Arc<Verified<Provisions>>>,
         /// Parent block's in-flight count (for deterministic computation).
         parent_in_flight: InFlightCount,
         /// Number of transactions finalized by wave certificates in this block.

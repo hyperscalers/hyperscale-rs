@@ -301,7 +301,7 @@ pub enum ProtocolEvent {
         /// Finalized waves included in the block (carry certs + receipts + ECs).
         finalized_waves: Vec<Arc<Verified<FinalizedWave>>>,
         /// Provisions included in the block.
-        provisions: Vec<Arc<Provisions>>,
+        provisions: Vec<Arc<Verified<Provisions>>>,
     },
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -339,7 +339,7 @@ pub enum ProtocolEvent {
     /// deterministic across validators.
     ProvisionsAdmitted {
         /// Verified provisions batch.
-        provisions: Arc<Provisions>,
+        provisions: Arc<Verified<Provisions>>,
         /// BFT-authenticated weighted timestamp of the source shard's committing QC.
         source_block_ts: WeightedTimestamp,
     },

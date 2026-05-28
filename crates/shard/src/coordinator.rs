@@ -666,7 +666,7 @@ impl ShardCoordinator {
         topology_snapshot: &TopologySnapshot,
         ready_txs: &[Arc<RoutableTransaction>],
         finalized_waves: Vec<Arc<Verified<FinalizedWave>>>,
-        provisions: Vec<Arc<Provisions>>,
+        provisions: Vec<Arc<Verified<Provisions>>>,
     ) -> Vec<Action> {
         // The next height to propose is one above the highest certified block,
         // not the committed block — this lets the chain grow while the
@@ -1016,7 +1016,7 @@ impl ShardCoordinator {
         manifest: BlockManifest,
         lookup_tx: impl Fn(&TxHash) -> Option<Arc<RoutableTransaction>>,
         lookup_finalized_wave: impl Fn(&WaveId) -> Option<Arc<Verified<FinalizedWave>>>,
-        lookup_provision: impl Fn(&ProvisionHash) -> Option<Arc<Provisions>>,
+        lookup_provision: impl Fn(&ProvisionHash) -> Option<Arc<Verified<Provisions>>>,
     ) -> Vec<Action> {
         let block_hash = header.hash();
         let height = header.height();
@@ -2118,7 +2118,7 @@ impl ShardCoordinator {
         block_hash: BlockHash,
         manifest: &BlockManifest,
         finalized_waves: Vec<Arc<Verified<FinalizedWave>>>,
-        provisions: Vec<Arc<Provisions>>,
+        provisions: Vec<Arc<Verified<Provisions>>>,
     ) -> Vec<Action> {
         match self.proposal.take_matching(height, round) {
             TakeResult::Matched => {}
@@ -2323,7 +2323,7 @@ impl ShardCoordinator {
         qc: &Verified<QuorumCertificate>,
         ready_txs: &[Arc<RoutableTransaction>],
         finalized_waves: Vec<Arc<Verified<FinalizedWave>>>,
-        provisions: Vec<Arc<Provisions>>,
+        provisions: Vec<Arc<Verified<Provisions>>>,
     ) -> Vec<Action> {
         let height = qc.height();
 
@@ -3192,7 +3192,7 @@ impl ShardCoordinator {
     pub fn on_provisions_admitted(
         &mut self,
         topology_snapshot: &TopologySnapshot,
-        provisions: &[Arc<Provisions>],
+        provisions: &[Arc<Verified<Provisions>>],
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         for batch in provisions {

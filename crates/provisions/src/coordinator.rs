@@ -615,7 +615,7 @@ impl ProvisionCoordinator {
         // Emit ProvisionsAdmitted for downstream consumption. The source
         // block timestamp anchors retention in the io-loop provision cache.
         actions.push(Action::Continuation(ProtocolEvent::ProvisionsAdmitted {
-            provisions: Arc::clone(&provisions),
+            provisions,
             source_block_ts,
         }));
 
@@ -631,13 +631,15 @@ impl ProvisionCoordinator {
     /// stay queued for a later call. Batches remain in the underlying queue
     /// until pruned on block commit.
     #[must_use]
-    pub fn queued_provisions(&self, now: LocalTimestamp) -> Vec<Arc<Provisions>> {
+    pub fn queued_provisions(&self, now: LocalTimestamp) -> Vec<Arc<Verified<Provisions>>> {
         self.queue.queued(now, self.expected.local_ts())
     }
 
-    /// Look up verified provisions by their content hash.
+    /// Look up verified provisions by their content hash. Reads the
+    /// pipeline's verified map (not the raw wire-store), so callers
+    /// receive the typed handle when the bundle has cleared verification.
     #[must_use]
-    pub fn get_provisions_by_hash(&self, hash: ProvisionHash) -> Option<Arc<Provisions>> {
+    pub fn get_provisions_by_hash(&self, hash: ProvisionHash) -> Option<Arc<Verified<Provisions>>> {
         self.pipeline.get_provisions_by_hash(hash)
     }
 

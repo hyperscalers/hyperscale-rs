@@ -40,7 +40,7 @@ pub enum ProposalKind {
     Normal {
         transactions: Vec<Arc<RoutableTransaction>>,
         finalized_waves: Vec<Arc<Verified<FinalizedWave>>>,
-        provisions: Vec<Arc<Provisions>>,
+        provisions: Vec<Arc<Verified<Provisions>>>,
         finalized_tx_count: u32,
     },
     /// View-change fallback: empty payload, parent's weighted timestamp
@@ -242,11 +242,11 @@ pub fn select_finalized_waves(
 /// Oldest batches go first so the queue drains monotonically; unselected
 /// batches remain queued for the next proposal.
 pub fn select_provisions(
-    provisions: Vec<Arc<Provisions>>,
+    provisions: Vec<Arc<Verified<Provisions>>>,
     qc_chain_provision_hashes: &HashSet<ProvisionHash>,
     dedup_index: &CommitDedupIndex,
     max_provision_txs: usize,
-) -> Vec<Arc<Provisions>> {
+) -> Vec<Arc<Verified<Provisions>>> {
     let mut running_tx_count = 0usize;
     provisions
         .into_iter()
