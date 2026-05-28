@@ -20,8 +20,8 @@
 use std::collections::{BTreeMap, HashSet};
 
 use hyperscale_types::{
-    BlockHash, Bls12381G1PublicKey, ExecutionVote, GlobalReceiptRoot, ValidatorId, VotePower,
-    WaveId, WeightedTimestamp,
+    BlockHash, Bls12381G1PublicKey, ExecutionVote, GlobalReceiptRoot, ValidatorId, Verified,
+    VotePower, WaveId, WeightedTimestamp,
 };
 
 /// Key for grouping votes: `(global_receipt_root, vote_anchor_ts)`.
@@ -49,7 +49,7 @@ pub struct VoteTracker {
     // Verified votes (passed signature verification)
     // ═══════════════════════════════════════════════════════════════════════
     /// Verified votes grouped by (`global_receipt_root`, `vote_anchor_ts`).
-    votes_by_key: BTreeMap<VoteKey, Vec<ExecutionVote>>,
+    votes_by_key: BTreeMap<VoteKey, Vec<Verified<ExecutionVote>>>,
     /// Voting power per (`global_receipt_root`, `vote_anchor_ts`) (verified votes only).
     power_by_key: BTreeMap<VoteKey, VotePower>,
 
@@ -183,7 +183,7 @@ impl VoteTracker {
     /// Idempotent per `(validator, vote_anchor_ts)`: redundant calls (e.g.
     /// own-vote re-feeds from leader-rotation retries that land on `self`)
     /// are dropped so [`Self::power_by_key`] only counts unique signers.
-    pub fn add_verified_vote(&mut self, vote: ExecutionVote, power: VotePower) {
+    pub fn add_verified_vote(&mut self, vote: Verified<ExecutionVote>, power: VotePower) {
         let dedup_key = (vote.validator(), vote.vote_anchor_ts());
         if !self.verified_seen.insert(dedup_key) {
             return;
@@ -216,7 +216,7 @@ impl VoteTracker {
         &mut self,
         global_receipt_root: GlobalReceiptRoot,
         vote_anchor_ts: WeightedTimestamp,
-    ) -> Vec<ExecutionVote> {
+    ) -> Vec<Verified<ExecutionVote>> {
         let key = (global_receipt_root, vote_anchor_ts);
         self.votes_by_key.remove(&key).unwrap_or_default()
     }
@@ -268,7 +268,7 @@ impl VoteTracker {
     pub fn votes_for_global_receipt_root(
         &self,
         global_receipt_root: GlobalReceiptRoot,
-    ) -> Vec<&ExecutionVote> {
+    ) -> Vec<&Verified<ExecutionVote>> {
         self.votes_by_key
             .iter()
             .filter(|((root, _), _)| *root == global_receipt_root)
@@ -306,6 +306,13 @@ mod tests {
         )
     }
 
+    fn make_verified_vote(
+        validator: u64,
+        global_receipt_root: GlobalReceiptRoot,
+    ) -> Verified<ExecutionVote> {
+        Verified::new_unchecked_for_test(make_vote(validator, global_receipt_root))
+    }
+
     #[test]
     fn test_vote_tracker_quorum() {
         let mut tracker = VoteTracker::new(
@@ -316,13 +323,13 @@ mod tests {
 
         let root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"receipt_root"));
 
-        tracker.add_verified_vote(make_vote(0, root), VotePower::new(1));
+        tracker.add_verified_vote(make_verified_vote(0, root), VotePower::new(1));
         assert!(tracker.check_quorum().is_none());
 
-        tracker.add_verified_vote(make_vote(1, root), VotePower::new(1));
+        tracker.add_verified_vote(make_verified_vote(1, root), VotePower::new(1));
         assert!(tracker.check_quorum().is_none());
 
-        tracker.add_verified_vote(make_vote(2, root), VotePower::new(1));
+        tracker.add_verified_vote(make_verified_vote(2, root), VotePower::new(1));
         let result = tracker.check_quorum();
         assert!(result.is_some());
         let (r, vh, power) = result.unwrap();
@@ -343,13 +350,13 @@ mod tests {
         let root_a = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root_a"));
         let root_b = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root_b"));
 
-        tracker.add_verified_vote(make_vote(0, root_a), VotePower::new(1));
-        tracker.add_verified_vote(make_vote(1, root_b), VotePower::new(1));
-        tracker.add_verified_vote(make_vote(2, root_a), VotePower::new(1));
+        tracker.add_verified_vote(make_verified_vote(0, root_a), VotePower::new(1));
+        tracker.add_verified_vote(make_verified_vote(1, root_b), VotePower::new(1));
+        tracker.add_verified_vote(make_verified_vote(2, root_a), VotePower::new(1));
         // 2 for root_a, 1 for root_b — no quorum
         assert!(tracker.check_quorum().is_none());
 
-        tracker.add_verified_vote(make_vote(3, root_a), VotePower::new(1));
+        tracker.add_verified_vote(make_verified_vote(3, root_a), VotePower::new(1));
         let result = tracker.check_quorum().unwrap();
         assert_eq!(result.0, root_a);
     }
@@ -410,9 +417,9 @@ mod tests {
             VotePower::new(3),
         );
 
-        tracker.add_verified_vote(make_vote(0, root), VotePower::new(1));
-        tracker.add_verified_vote(make_vote(0, root), VotePower::new(1));
-        tracker.add_verified_vote(make_vote(0, root), VotePower::new(1));
+        tracker.add_verified_vote(make_verified_vote(0, root), VotePower::new(1));
+        tracker.add_verified_vote(make_verified_vote(0, root), VotePower::new(1));
+        tracker.add_verified_vote(make_verified_vote(0, root), VotePower::new(1));
 
         assert_eq!(tracker.total_verified_power(), VotePower::new(1));
         assert!(tracker.check_quorum().is_none());
@@ -429,7 +436,7 @@ mod tests {
         );
 
         // 1 verified + 2 unverified = 3 → should trigger
-        tracker.add_verified_vote(make_vote(0, root), VotePower::new(1));
+        tracker.add_verified_vote(make_verified_vote(0, root), VotePower::new(1));
         assert!(tracker.buffer_unverified_vote(make_vote(1, root), pk, VotePower::new(1)));
         assert!(!tracker.should_trigger_verification());
 

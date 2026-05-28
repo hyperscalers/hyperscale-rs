@@ -45,7 +45,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_types::{
-    ExecutionCertificate, ExecutionVote, TxHash, WAVE_TIMEOUT, WaveId, WeightedTimestamp,
+    ExecutionCertificate, ExecutionVote, TxHash, Verifiable, WAVE_TIMEOUT, WaveId,
+    WeightedTimestamp,
 };
 
 /// How long to retain unmatched early votes whose block never committed
@@ -70,7 +71,7 @@ struct BufferedEc {
 
 pub struct EarlyArrivalBuffer {
     /// Execution votes that arrived before tracking started, keyed by wave.
-    votes: HashMap<WaveId, Vec<ExecutionVote>>,
+    votes: HashMap<WaveId, Vec<Verifiable<ExecutionVote>>>,
 
     /// Reverse index from `tx_hash` to any buffered ECs mentioning it.
     /// Multiple `tx_hash` entries may reference the same `Arc<EC>` (one EC
@@ -98,14 +99,14 @@ impl EarlyArrivalBuffer {
 
     /// Buffer a vote whose wave isn't yet tracked. Called from the
     /// non-leader ingress path.
-    pub fn buffer_vote(&mut self, wave_id: WaveId, vote: ExecutionVote) {
+    pub fn buffer_vote(&mut self, wave_id: WaveId, vote: Verifiable<ExecutionVote>) {
         self.votes.entry(wave_id).or_default().push(vote);
     }
 
     /// Remove and return all buffered votes for `wave_id`. Called when the
     /// coordinator creates a leader or fallback-leader `VoteTracker` and
     /// needs to replay the backlog.
-    pub fn drain_votes_for_wave(&mut self, wave_id: &WaveId) -> Vec<ExecutionVote> {
+    pub fn drain_votes_for_wave(&mut self, wave_id: &WaveId) -> Vec<Verifiable<ExecutionVote>> {
         self.votes.remove(wave_id).unwrap_or_default()
     }
 
@@ -114,7 +115,7 @@ impl EarlyArrivalBuffer {
     /// buffer just exposes the retention cutoff and the retain loop.
     pub fn retain_votes<F>(&mut self, mut predicate: F)
     where
-        F: FnMut(&WaveId, &[ExecutionVote]) -> bool,
+        F: FnMut(&WaveId, &[Verifiable<ExecutionVote>]) -> bool,
     {
         self.votes
             .retain(|wave_id, votes| predicate(wave_id, votes));
@@ -328,8 +329,14 @@ mod tests {
     fn drain_votes_returns_buffered_and_leaves_buffer_empty() {
         let mut b = EarlyArrivalBuffer::new();
         let w = wave(1);
-        b.buffer_vote(w.clone(), make_vote(w.clone(), ms(100)));
-        b.buffer_vote(w.clone(), make_vote(w.clone(), ms(200)));
+        b.buffer_vote(
+            w.clone(),
+            Verifiable::Unverified(make_vote(w.clone(), ms(100))),
+        );
+        b.buffer_vote(
+            w.clone(),
+            Verifiable::Unverified(make_vote(w.clone(), ms(200))),
+        );
 
         let drained = b.drain_votes_for_wave(&w);
         assert_eq!(drained.len(), 2);
@@ -344,8 +351,11 @@ mod tests {
         let mut b = EarlyArrivalBuffer::new();
         let w1 = wave(1);
         let w2 = wave(2);
-        b.buffer_vote(w1.clone(), make_vote(w1.clone(), ms(100)));
-        b.buffer_vote(w2.clone(), make_vote(w2, ms(100)));
+        b.buffer_vote(
+            w1.clone(),
+            Verifiable::Unverified(make_vote(w1.clone(), ms(100))),
+        );
+        b.buffer_vote(w2.clone(), Verifiable::Unverified(make_vote(w2, ms(100))));
 
         let drained = b.drain_votes_for_wave(&w1);
         assert_eq!(drained.len(), 1);
@@ -357,8 +367,14 @@ mod tests {
         let mut b = EarlyArrivalBuffer::new();
         let w1 = wave(1);
         let w2 = wave(2);
-        b.buffer_vote(w1.clone(), make_vote(w1.clone(), ms(100)));
-        b.buffer_vote(w2.clone(), make_vote(w2.clone(), ms(100)));
+        b.buffer_vote(
+            w1.clone(),
+            Verifiable::Unverified(make_vote(w1.clone(), ms(100))),
+        );
+        b.buffer_vote(
+            w2.clone(),
+            Verifiable::Unverified(make_vote(w2.clone(), ms(100))),
+        );
 
         b.retain_votes(|wave_id, _| wave_id == &w1);
 
@@ -513,7 +529,7 @@ mod tests {
             for (i, h) in heights.iter().enumerate() {
                 let w = wave(*h);
                 let anchor = ms(anchors[i % anchors.len()]);
-                b.buffer_vote(w.clone(), make_vote(w, anchor));
+                b.buffer_vote(w.clone(), Verifiable::Unverified(make_vote(w, anchor)));
             }
 
             // Drain every wave once; collect counts. A second drain of each

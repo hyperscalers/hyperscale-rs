@@ -17,7 +17,7 @@ use hyperscale_types::network::request::{
 use hyperscale_types::network::response::{
     GetLocalProvisionsResponse, GetProvisionResponse, LocalProvisionEntry,
 };
-use hyperscale_types::{ShardGroupId, ready_signal_message};
+use hyperscale_types::{ShardGroupId, Verifiable, ready_signal_message};
 use tracing::warn;
 
 use crate::event::ShardScopedInput;
@@ -579,7 +579,9 @@ where
                         push_protocol_event(
                             tx,
                             target_shard,
-                            ProtocolEvent::ExecutionVoteReceived { vote },
+                            ProtocolEvent::ExecutionVoteReceived {
+                                vote: Verifiable::Unverified(vote),
+                            },
                         );
                     }
                 },
