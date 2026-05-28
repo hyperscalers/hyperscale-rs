@@ -8,7 +8,7 @@ use sbor::prelude::*;
 
 use crate::{
     Attempt, BlockHeight, Hash, RoutableTransaction, ShardGroupId, TopologySnapshot, ValidatorId,
-    WaveId,
+    Verifiable, WaveId,
 };
 
 /// Compute the set of cross-shard waves for a block's transactions.
@@ -24,7 +24,7 @@ use crate::{
 pub fn compute_waves(
     topology: &TopologySnapshot,
     block_height: BlockHeight,
-    transactions: &[Arc<RoutableTransaction>],
+    transactions: &[Arc<Verifiable<RoutableTransaction>>],
 ) -> Vec<WaveId> {
     let local_shard = topology.local_shard();
     let mut remote_shard_sets: BTreeSet<BTreeSet<ShardGroupId>> = BTreeSet::new();

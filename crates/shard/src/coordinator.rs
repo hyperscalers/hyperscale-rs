@@ -1014,7 +1014,7 @@ impl ShardCoordinator {
         topology_snapshot: &TopologySnapshot,
         header: &BlockHeader,
         manifest: BlockManifest,
-        lookup_tx: impl Fn(&TxHash) -> Option<Arc<RoutableTransaction>>,
+        lookup_tx: impl Fn(&TxHash) -> Option<Arc<Verifiable<RoutableTransaction>>>,
         lookup_finalized_wave: impl Fn(&WaveId) -> Option<Arc<Verifiable<FinalizedWave>>>,
         lookup_provision: impl Fn(&ProvisionHash) -> Option<Arc<Verifiable<Provisions>>>,
     ) -> Vec<Action> {
@@ -3166,8 +3166,9 @@ impl ShardCoordinator {
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         for tx in txs {
-            let raw: Arc<RoutableTransaction> = Arc::new((***tx).clone());
-            for block_hash in self.pending_blocks.receive_transaction(&raw) {
+            let wrapped: Arc<Verifiable<RoutableTransaction>> =
+                Arc::new(Verifiable::from((**tx).clone()));
+            for block_hash in self.pending_blocks.receive_transaction(&wrapped) {
                 actions.extend(self.dispatch_block_complete(topology_snapshot, block_hash));
             }
         }
@@ -4940,11 +4941,11 @@ mod tests {
     // Helpers retained for no-duplicate-transactions walk tests below
     // ═══════════════════════════════════════════════════════════════════════════
 
-    fn make_test_tx_with_seed(seed: u8) -> Arc<RoutableTransaction> {
-        Arc::new(test_utils::test_transaction(seed))
+    fn make_test_tx_with_seed(seed: u8) -> Arc<Verifiable<RoutableTransaction>> {
+        Arc::new(Verifiable::from(test_utils::test_transaction(seed)))
     }
 
-    fn sort_txs_by_hash(txs: &mut [Arc<RoutableTransaction>]) {
+    fn sort_txs_by_hash(txs: &mut [Arc<Verifiable<RoutableTransaction>>]) {
         txs.sort_by_key(|tx| tx.hash());
     }
 

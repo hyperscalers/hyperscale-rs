@@ -21,7 +21,35 @@ use crate::{
 
 /// Shared transaction list — wrapped in `Arc` so root-verification actions
 /// can hold their own owner without deep-cloning the per-tx `Arc` array.
-pub type SharedTransactions = Arc<BoundedVec<Arc<RoutableTransaction>, MAX_TXS_PER_BLOCK>>;
+///
+/// Elements are wrapped in [`Verifiable`] so a locally-built block (whose
+/// txs were admission-validated through `MempoolCoordinator`) preserves
+/// the [`Verified<RoutableTransaction>`] marker through block
+/// construction; wire-decoded blocks land at [`Verifiable::Unverified`]
+/// because SBOR decode is a transparent passthrough into that variant.
+/// Same rationale as [`SharedCertificates`].
+pub type SharedTransactions =
+    Arc<BoundedVec<Arc<Verifiable<RoutableTransaction>>, MAX_TXS_PER_BLOCK>>;
+
+/// Build a [`SharedTransactions`] from a list of raw `Arc<RoutableTransaction>`.
+///
+/// Each entry is wrapped as [`Verifiable::Unverified`] — paths that have
+/// already-verified txs (mempool admission, proposal building) should
+/// construct directly via `Vec<Arc<Verifiable<RoutableTransaction>>>` to
+/// preserve the marker. This helper is for paths that genuinely have
+/// raw txs (storage rehydration, fetch-response reconstruction).
+///
+/// # Panics
+///
+/// Panics if `txs.len() > MAX_TXS_PER_BLOCK`.
+#[must_use]
+pub fn shared_transactions_from_raw(txs: Vec<Arc<RoutableTransaction>>) -> SharedTransactions {
+    let wrapped: Vec<Arc<Verifiable<RoutableTransaction>>> = txs
+        .into_iter()
+        .map(|tx| Arc::new(Verifiable::from((*tx).clone())))
+        .collect();
+    Arc::new(wrapped.into())
+}
 
 /// Shared certificate list — same rationale as [`SharedTransactions`].
 ///
@@ -102,7 +130,10 @@ const BLOCK_VARIANT_SEALED: u8 = 1;
 // equal for content purposes.
 impl PartialEq for Block {
     fn eq(&self, other: &Self) -> bool {
-        fn tx_lists_equal(a: &[Arc<RoutableTransaction>], b: &[Arc<RoutableTransaction>]) -> bool {
+        fn tx_lists_equal(
+            a: &[Arc<Verifiable<RoutableTransaction>>],
+            b: &[Arc<Verifiable<RoutableTransaction>>],
+        ) -> bool {
             a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.hash() == y.hash())
         }
         fn cert_lists_equal(

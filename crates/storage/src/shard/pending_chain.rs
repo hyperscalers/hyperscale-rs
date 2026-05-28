@@ -202,7 +202,7 @@ where
     pub fn transactions_for_block(
         &self,
         height: BlockHeight,
-    ) -> Option<Vec<Arc<RoutableTransaction>>> {
+    ) -> Option<Vec<Arc<Verifiable<RoutableTransaction>>>> {
         if let Some(certified) = self.pending_certified_at(height) {
             return Some(certified.block().transactions().iter().cloned().collect());
         }

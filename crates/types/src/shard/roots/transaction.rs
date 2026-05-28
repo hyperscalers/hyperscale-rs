@@ -5,8 +5,8 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::{
-    Hash, RoutableTransaction, TransactionRoot, TxHash, Verified, Verify, WeightedTimestamp,
-    compute_merkle_root,
+    Hash, RoutableTransaction, TransactionRoot, TxHash, Verifiable, Verified, Verify,
+    WeightedTimestamp, compute_merkle_root,
 };
 
 /// Inputs the [`TransactionRoot`] verifier reads against.
@@ -14,7 +14,7 @@ use crate::{
 pub struct TransactionRootContext<'a> {
     /// The block's transactions — each contributes one leaf (its
     /// content hash) to the recomputed root.
-    pub transactions: &'a [Arc<RoutableTransaction>],
+    pub transactions: &'a [Arc<Verifiable<RoutableTransaction>>],
     /// Parent QC's `weighted_timestamp` — the shard-consensus-authenticated
     /// clock for this block, used as the anchor every tx's `validity_range`
     /// must enclose. An honest cluster never sees a window mismatch here
@@ -66,7 +66,7 @@ impl Verified<TransactionRoot> {
     /// Compute the transaction root from `transactions`. Verified by
     /// construction.
     #[must_use]
-    pub fn compute(transactions: &[Arc<RoutableTransaction>]) -> Self {
+    pub fn compute(transactions: &[Arc<Verifiable<RoutableTransaction>>]) -> Self {
         if transactions.is_empty() {
             return Self::new_unchecked(TransactionRoot::ZERO);
         }

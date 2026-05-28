@@ -246,6 +246,10 @@ pub fn make_live_block(
         BeaconWitnessRoot::ZERO,
         BeaconWitnessLeafCount::ZERO,
     );
+    let transactions: Vec<Arc<Verifiable<RoutableTransaction>>> = transactions
+        .into_iter()
+        .map(|tx| Arc::new(Verifiable::from((*tx).clone())))
+        .collect();
     Block::Live {
         header,
         transactions: Arc::new(transactions.into()),

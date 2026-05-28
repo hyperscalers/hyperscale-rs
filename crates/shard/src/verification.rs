@@ -1793,7 +1793,7 @@ mod tests {
         height: BlockHeight,
         parent_block_hash: BlockHash,
         in_flight: u32,
-        transactions: Vec<Arc<RoutableTransaction>>,
+        transactions: Vec<Arc<Verifiable<RoutableTransaction>>>,
     ) -> Block {
         Block::Live {
             header: header(height, parent_block_hash, in_flight),

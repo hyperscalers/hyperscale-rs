@@ -87,7 +87,8 @@ impl Inventory {
 pub struct ElidedCertifiedBlock {
     header: Verifiable<BlockHeader>,
     qc: Verifiable<QuorumCertificate>,
-    transactions: BoundedVec<(TxHash, Option<Arc<RoutableTransaction>>), MAX_TXS_PER_BLOCK>,
+    transactions:
+        BoundedVec<(TxHash, Option<Arc<Verifiable<RoutableTransaction>>>), MAX_TXS_PER_BLOCK>,
     certificates:
         BoundedVec<(WaveId, Option<Arc<Verifiable<FinalizedWave>>>), MAX_FINALIZED_TX_PER_BLOCK>,
     provisions: ElidedProvisions,
@@ -141,7 +142,8 @@ impl ElidedCertifiedBlock {
     #[must_use]
     pub const fn transactions(
         &self,
-    ) -> &BoundedVec<(TxHash, Option<Arc<RoutableTransaction>>), MAX_TXS_PER_BLOCK> {
+    ) -> &BoundedVec<(TxHash, Option<Arc<Verifiable<RoutableTransaction>>>), MAX_TXS_PER_BLOCK>
+    {
         &self.transactions
     }
 
@@ -258,7 +260,7 @@ impl ElidedCertifiedBlock {
         mut provision_lookup: FProv,
     ) -> Result<CertifiedBlock, RehydrateError>
     where
-        FTx: FnMut(&TxHash) -> Option<Arc<RoutableTransaction>>,
+        FTx: FnMut(&TxHash) -> Option<Arc<Verifiable<RoutableTransaction>>>,
         FCert: FnMut(&WaveId) -> Option<Arc<Verifiable<FinalizedWave>>>,
         FProv: FnMut(&ProvisionHash) -> Option<Arc<Verifiable<Provisions>>>,
     {
@@ -319,7 +321,8 @@ impl ElidedCertifiedBlock {
             return Err(RehydrateError::Missing(miss));
         }
 
-        let txs: Vec<Arc<RoutableTransaction>> = txs.into_iter().map(Option::unwrap).collect();
+        let txs: Vec<Arc<Verifiable<RoutableTransaction>>> =
+            txs.into_iter().map(Option::unwrap).collect();
         let certs: Vec<Arc<Verifiable<FinalizedWave>>> =
             certs.into_iter().map(Option::unwrap).collect();
         let txs = Arc::new(txs.into());
@@ -458,7 +461,7 @@ mod tests {
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
             ),
-            transactions: Arc::new(vec![Arc::new(tx)].into()),
+            transactions: Arc::new(vec![Arc::new(Verifiable::from(tx))].into()),
             certificates: Arc::new(BoundedVec::new()),
             provisions: Arc::new(BoundedVec::new()),
         }

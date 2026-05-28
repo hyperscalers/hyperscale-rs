@@ -11,7 +11,7 @@ use std::sync::Arc;
 use hyperscale_core::ProvisionsRequest;
 use hyperscale_types::{
     BlockHeight, Bls12381G1PublicKey, ExecutionCertificate, NodeId, RoutableTransaction,
-    ShardGroupId, TopologySnapshot, ValidatorId, VotePower, WaveId,
+    ShardGroupId, TopologySnapshot, ValidatorId, Verifiable, VotePower, WaveId,
 };
 
 /// Per-shard recipient lists for provision broadcasting.
@@ -19,7 +19,7 @@ pub type ShardRecipients = HashMap<ShardGroupId, Vec<ValidatorId>>;
 
 /// A single tx's layout within a wave: the transaction plus the set of shards
 /// that participate in its execution (local + any remote provision sources).
-pub type WaveTxEntry = (Arc<RoutableTransaction>, BTreeSet<ShardGroupId>);
+pub type WaveTxEntry = (Arc<Verifiable<RoutableTransaction>>, BTreeSet<ShardGroupId>);
 
 /// Deterministic grouping of a block's transactions into waves.
 pub type WaveAssignments = BTreeMap<WaveId, Vec<WaveTxEntry>>;
@@ -88,7 +88,7 @@ pub fn committee_public_keys_for_shard(
 pub fn assign_waves(
     topology: &TopologySnapshot,
     block_height: BlockHeight,
-    transactions: &[Arc<RoutableTransaction>],
+    transactions: &[Arc<Verifiable<RoutableTransaction>>],
 ) -> WaveAssignments {
     let local_shard = topology.local_shard();
     let mut waves: WaveAssignments = BTreeMap::new();
@@ -122,7 +122,7 @@ pub fn assign_waves(
 /// Returns `None` if there are no cross-shard transactions needing provisions.
 pub fn build_provision_requests(
     topology: &TopologySnapshot,
-    transactions: &[Arc<RoutableTransaction>],
+    transactions: &[Arc<Verifiable<RoutableTransaction>>],
     local_shard: ShardGroupId,
 ) -> Option<(Vec<ProvisionsRequest>, ShardRecipients)> {
     let local_vid = topology.local_validator_id();

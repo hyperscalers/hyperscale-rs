@@ -211,6 +211,16 @@ pub fn build_proposal<S: ShardChainWriter>(
         None,
     );
 
+    // Mempool admission produced `Verified<RoutableTransaction>` upstream,
+    // but the [`Action::BuildProposal`] payload still carries the raw form
+    // (Phase 4 of the verification plan threads Verified into the action
+    // payload). Wrap here so block construction and per-root compute calls
+    // see the [`Verifiable`] form that `Block.transactions` requires.
+    let transactions: Vec<Arc<Verifiable<RoutableTransaction>>> = transactions
+        .into_iter()
+        .map(|tx| Arc::new(Verifiable::from((*tx).clone())))
+        .collect();
+
     let receipts: Vec<StoredReceipt> = certificates
         .iter()
         .flat_map(|fw| fw.receipts().iter().cloned())
@@ -1183,7 +1193,7 @@ mod tests {
 
     #[test]
     fn verify_transaction_root_accepts_matching_root_and_rejects_otherwise() {
-        let txs: Vec<Arc<RoutableTransaction>> = Vec::new();
+        let txs: Vec<Arc<Verifiable<RoutableTransaction>>> = Vec::new();
         let root = Verified::<TransactionRoot>::compute(&txs).into_inner();
         let anchor = WeightedTimestamp::ZERO;
         let ctx = TransactionRootContext {
@@ -1210,9 +1220,9 @@ mod tests {
             WeightedTimestamp::from_millis(1_000),
         );
         let notarized = test_notarized_transaction_v1(&[1]);
-        let tx = Arc::new(
+        let tx = Arc::new(Verifiable::from(
             routable_from_notarized_v1(notarized, expired_range).expect("valid notarized fixture"),
-        );
+        ));
         let txs = vec![tx];
         let root = Verified::<TransactionRoot>::compute(&txs).into_inner();
 
@@ -1228,9 +1238,9 @@ mod tests {
         // Same root, anchor inside the range — verification passes.
         let valid_range = TimestampRange::new(anchor, anchor.plus(Duration::from_mins(1)));
         let notarized2 = test_notarized_transaction_v1(&[2]);
-        let tx2 = Arc::new(
+        let tx2 = Arc::new(Verifiable::from(
             routable_from_notarized_v1(notarized2, valid_range).expect("valid notarized fixture"),
-        );
+        ));
         let txs2 = vec![tx2];
         let root2 = Verified::<TransactionRoot>::compute(&txs2).into_inner();
         let ctx2 = TransactionRootContext {
@@ -1251,9 +1261,9 @@ mod tests {
             anchor.plus(Duration::from_mins(10)),
         );
         let notarized = test_notarized_transaction_v1(&[3]);
-        let tx = Arc::new(
+        let tx = Arc::new(Verifiable::from(
             routable_from_notarized_v1(notarized, too_wide).expect("valid notarized fixture"),
-        );
+        ));
         let txs = vec![tx];
         let root = Verified::<TransactionRoot>::compute(&txs).into_inner();
 

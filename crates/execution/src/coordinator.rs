@@ -298,7 +298,7 @@ impl ExecutionCoordinator {
         block_hash: BlockHash,
         block_height: BlockHeight,
         block_ts: WeightedTimestamp,
-        transactions: &[Arc<RoutableTransaction>],
+        transactions: &[Arc<Verifiable<RoutableTransaction>>],
     ) -> (Vec<Action>, Vec<Verifiable<ExecutionVote>>) {
         let waves = assign_waves(topology, block_height, transactions);
         let quorum = topology.local_quorum_threshold();
@@ -1452,7 +1452,7 @@ impl ExecutionCoordinator {
         topology: &TopologySnapshot,
         block_hash: BlockHash,
         header: &BlockHeader,
-        transactions: &[Arc<RoutableTransaction>],
+        transactions: &[Arc<Verifiable<RoutableTransaction>>],
         provisions: &[Arc<Verifiable<Provisions>>],
     ) -> Vec<Action> {
         let height = header.height();
@@ -1515,7 +1515,7 @@ impl ExecutionCoordinator {
         &mut self,
         topology: &TopologySnapshot,
         header: &BlockHeader,
-        transactions: &[Arc<RoutableTransaction>],
+        transactions: &[Arc<Verifiable<RoutableTransaction>>],
     ) -> Vec<Action> {
         if transactions.is_empty() {
             return Vec::new();
@@ -1531,7 +1531,7 @@ impl ExecutionCoordinator {
     fn replay_early_wave_attestations(
         &mut self,
         topology: &TopologySnapshot,
-        transactions: &[Arc<RoutableTransaction>],
+        transactions: &[Arc<Verifiable<RoutableTransaction>>],
     ) -> Vec<Action> {
         let tx_hashes: Vec<TxHash> = transactions.iter().map(|tx| tx.hash()).collect();
         let ecs_to_replay = self.early.drain_ecs_for_txs(&tx_hashes);
@@ -1558,7 +1558,7 @@ impl ExecutionCoordinator {
         &mut self,
         topology: &TopologySnapshot,
         block_height: BlockHeight,
-        transactions: &[Arc<RoutableTransaction>],
+        transactions: &[Arc<Verifiable<RoutableTransaction>>],
     ) {
         let waves = assign_waves(topology, block_height, transactions);
         for (wave_id, txs) in waves {
@@ -3181,7 +3181,7 @@ mod tests {
                 local_wave.clone(),
                 BlockHash::from_raw(Hash::from_bytes(b"block")),
                 WeightedTimestamp::from_millis(5_000),
-                vec![(tx, participating)],
+                vec![(Arc::new(Verifiable::from((*tx).clone())), participating)],
                 false,
             ),
         );
@@ -3230,12 +3230,15 @@ mod tests {
     /// been added. `WaveState::is_complete` returns true.
     fn make_ready_single_shard_wave(tx_seeds: &[u8]) -> (WaveId, WaveState) {
         let wave_id = WaveId::new(ShardGroupId::new(0), BlockHeight::new(1), BTreeSet::new());
-        let txs: Vec<(Arc<RoutableTransaction>, BTreeSet<ShardGroupId>)> = tx_seeds
+        let txs: Vec<(Arc<Verifiable<RoutableTransaction>>, BTreeSet<ShardGroupId>)> = tx_seeds
             .iter()
             .map(|s| {
                 let mut participating = BTreeSet::new();
                 participating.insert(ShardGroupId::new(0));
-                (Arc::new(test_transaction(*s)), participating)
+                (
+                    Arc::new(Verifiable::from(test_transaction(*s))),
+                    participating,
+                )
             })
             .collect();
         let mut wave = WaveState::new(
@@ -3421,7 +3424,7 @@ mod tests {
                 local_wave,
                 BlockHash::from_raw(Hash::from_bytes(b"block")),
                 WeightedTimestamp::from_millis(0),
-                vec![(tx, participating)],
+                vec![(Arc::new(Verifiable::from((*tx).clone())), participating)],
                 false,
             ),
         );

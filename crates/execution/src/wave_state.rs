@@ -32,8 +32,8 @@ use hyperscale_core::{Action, CrossShardExecutionRequest};
 use hyperscale_types::{
     BlockHash, BlockHeight, ExecutionCertificate, ExecutionOutcome, FinalizedWave,
     GlobalReceiptRoot, RoutableTransaction, ShardGroupId, StateRoot, StoredReceipt,
-    TransactionDecision, TxHash, TxOutcome, Verified, WAVE_TIMEOUT, WaveCertificate, WaveId,
-    WeightedTimestamp, compute_global_receipt_root,
+    TransactionDecision, TxHash, TxOutcome, Verifiable, Verified, WAVE_TIMEOUT, WaveCertificate,
+    WaveId, WeightedTimestamp, compute_global_receipt_root,
 };
 
 use crate::provisioning::ProvisioningTracker;
@@ -156,7 +156,7 @@ impl WaveState {
         wave_id: WaveId,
         block_hash: BlockHash,
         wave_start_ts: WeightedTimestamp,
-        txs: Vec<(Arc<RoutableTransaction>, BTreeSet<ShardGroupId>)>,
+        txs: Vec<(Arc<Verifiable<RoutableTransaction>>, BTreeSet<ShardGroupId>)>,
         single_shard: bool,
     ) -> Self {
         let mut tx_hashes: Vec<TxHash> = Vec::with_capacity(txs.len());
@@ -170,7 +170,13 @@ impl WaveState {
         for (tx, shards) in txs {
             let h = tx.hash();
             tx_hashes.push(h);
-            transactions.insert(h, tx);
+            // Extract raw `RoutableTransaction` for the in-memory wave
+            // store — execution dispatch (`Action::ExecuteTransactions`)
+            // and the engine still consume raw `Arc<RoutableTransaction>`,
+            // so converting at this boundary keeps the storage form
+            // matched to its only consumer.
+            let raw: Arc<RoutableTransaction> = Arc::new((**tx).clone());
+            transactions.insert(h, raw);
             participating_shards.insert(h, shards);
             covered_shards.insert(h, BTreeSet::new());
         }
@@ -896,12 +902,12 @@ mod tests {
 
     const WAVE_START: BlockHeight = BlockHeight::new(10);
 
-    fn make_tx(seed: u8) -> Arc<RoutableTransaction> {
-        Arc::new(test_transaction_with_nodes(
+    fn make_tx(seed: u8) -> Arc<Verifiable<RoutableTransaction>> {
+        Arc::new(Verifiable::from(test_transaction_with_nodes(
             &[seed, seed + 1, seed + 2],
             vec![test_node(seed)],
             vec![test_node(seed + 50)],
-        ))
+        )))
     }
 
     /// Tests use synthetic timestamps proportional to block heights so the
@@ -913,7 +919,7 @@ mod tests {
     }
 
     fn make_single_shard_wave(n: usize) -> WaveState {
-        let txs: Vec<(Arc<RoutableTransaction>, BTreeSet<ShardGroupId>)> = (0..n)
+        let txs: Vec<(Arc<Verifiable<RoutableTransaction>>, BTreeSet<ShardGroupId>)> = (0..n)
             .map(|i| {
                 (
                     make_tx(u8::try_from(i).unwrap_or(u8::MAX)),
@@ -932,7 +938,7 @@ mod tests {
 
     fn make_cross_shard_wave(n: usize) -> WaveState {
         let shards = BTreeSet::from([ShardGroupId::new(0), ShardGroupId::new(1)]);
-        let txs: Vec<(Arc<RoutableTransaction>, BTreeSet<ShardGroupId>)> = (0..n)
+        let txs: Vec<(Arc<Verifiable<RoutableTransaction>>, BTreeSet<ShardGroupId>)> = (0..n)
             .map(|i| (make_tx(u8::try_from(i).unwrap_or(u8::MAX)), shards.clone()))
             .collect();
         WaveState::new(

@@ -535,15 +535,16 @@ impl MempoolCoordinator {
         for tx in block.transactions().iter() {
             let hash = tx.hash();
             let num_shards = topology.num_shards();
+            let raw: Arc<RoutableTransaction> = Arc::new((***tx).clone());
             self.pool.entry(hash).or_insert_with(|| {
                 tracing::debug!(
                     tx_hash = ?hash,
                     height = height.inner(),
                     "Added committed transaction to mempool"
                 );
-                self.tx_store.insert(Arc::clone(tx));
+                self.tx_store.insert(Arc::clone(&raw));
                 PoolEntry {
-                    tx: Arc::clone(tx),
+                    tx: raw,
                     status: TransactionStatus::Pending, // Will be updated by execution
                     cross_shard: tx.is_cross_shard(num_shards),
                     submitted_locally: false, // Fetched for block processing

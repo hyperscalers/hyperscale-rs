@@ -45,8 +45,8 @@ mod tests {
         ExecutionCertificate, ExecutionOutcome, FinalizedWave, GlobalReceiptHash,
         GlobalReceiptRoot, Hash, NetworkDefinition, NodeId, ProvisionTxRoot, ProvisionTxRootsMap,
         RETENTION_HORIZON, ReceiptValidationError, ShardGroupId, SignerBitfield, StoredReceipt,
-        TopologySnapshot, TxHash, TxOutcome, ValidatorId, ValidatorInfo, ValidatorSet, Verified,
-        VotePower, WaveCertificate, WaveId, WaveReceiptHash, WeightedTimestamp,
+        TopologySnapshot, TxHash, TxOutcome, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable,
+        Verified, VotePower, WaveCertificate, WaveId, WaveReceiptHash, WeightedTimestamp,
         compute_global_receipt_root, compute_global_receipt_root_with_proof, compute_merkle_root,
         generate_bls_keypair, tx_outcome_leaf, verify_merkle_inclusion, wave_leader,
         wave_leader_at,
@@ -143,11 +143,11 @@ mod tests {
     fn test_compute_provision_tx_roots_single_shard_excluded() {
         let topology = two_shard_topology();
         let local_node = node_on_shard(&topology, topology.local_shard());
-        let tx = Arc::new(test_transaction_with_nodes(
+        let tx = Arc::new(Verifiable::from(test_transaction_with_nodes(
             &[1, 2, 3],
             vec![local_node],
             vec![local_node],
-        ));
+        )));
         let map = Verified::<ProvisionTxRootsMap>::compute(&topology, &[tx]);
         assert!(map.is_empty(), "single-shard tx must not produce an entry");
     }
@@ -159,16 +159,16 @@ mod tests {
         let remote_node = node_on_shard(&topology, ShardGroupId::new(1));
 
         // Cross-shard tx: writes span local shard 0 and remote shard 1.
-        let tx_a = Arc::new(test_transaction_with_nodes(
+        let tx_a = Arc::new(Verifiable::from(test_transaction_with_nodes(
             &[1, 2, 3],
             vec![],
             vec![local_node, remote_node],
-        ));
-        let tx_b = Arc::new(test_transaction_with_nodes(
+        )));
+        let tx_b = Arc::new(Verifiable::from(test_transaction_with_nodes(
             &[4, 5, 6],
             vec![],
             vec![local_node, remote_node],
-        ));
+        )));
 
         let roots =
             Verified::<ProvisionTxRootsMap>::compute(&topology, &[tx_a.clone(), tx_b.clone()]);
