@@ -19,18 +19,17 @@ use std::sync::Arc;
 use hyperscale_beacon::constants::{BEACON_SIGNER_COUNT, MIN_STAKE_FLOOR};
 use hyperscale_beacon::coordinator::BeaconCoordinator;
 use hyperscale_beacon::genesis::build_genesis_beacon_state;
-use hyperscale_beacon::skip::{sign_skip_request, verify_skip_cert, verify_skip_request};
-use hyperscale_beacon::verification::verify_block_equivocations;
 use hyperscale_core::Action;
 use hyperscale_types::{
     BeaconCert, BeaconGenesisConfig, BeaconProposal, BeaconState, Bls12381G1PrivateKey,
-    Bls12381G1PublicKey, CertifiedBeaconBlock, Epoch, GenesisPool, GenesisValidator,
-    NetworkDefinition, PcValueElement, PcVector, PcVote1, PcVote2, PcVote3, PcVoteVerifyContext,
-    Randomness, ShardGroupId, SkipEpochCert, SkipRequest, SpcEmptyViewMsg, SpcNewCommitMsg,
-    SpcProposalObject, SpcVerifyContext, SpcView, Stake, StakePoolId, ValidatorId, Verifiable,
-    Witness, bls_keypair_from_seed, genesis_config_hash, pc_context, sign_empty_view_msg,
-    sign_vote1, sign_vote2, sign_vote3, spc_context, verify_block_cert, verify_vote1, verify_vote2,
-    verify_vote3, vrf_sign,
+    Bls12381G1PublicKey, CertifiedBeaconBlock, CertifiedBeaconBlockVerifyContext, Epoch,
+    GenesisPool, GenesisValidator, NetworkDefinition, PcValueElement, PcVector, PcVote1, PcVote2,
+    PcVote3, PcVoteVerifyContext, Randomness, ShardGroupId, SkipEpochCert, SkipRequest,
+    SpcEmptyViewMsg, SpcNewCommitMsg, SpcProposalObject, SpcVerifyContext, SpcView, Stake,
+    StakePoolId, ValidatorId, Verifiable, Witness, bls_keypair_from_seed, genesis_config_hash,
+    pc_context, sign_empty_view_msg, sign_skip_request, sign_vote1, sign_vote2, sign_vote3,
+    spc_context, verify_skip_cert, verify_skip_request, verify_vote1, verify_vote2, verify_vote3,
+    vrf_sign,
 };
 
 /// Adversarial transform a flagged replica applies to its next matching
@@ -267,9 +266,10 @@ impl CoordinatorSim {
     pub fn deliver_block_to(
         &mut self,
         replica_idx: usize,
-        block: Arc<CertifiedBeaconBlock>,
+        block: &Arc<CertifiedBeaconBlock>,
     ) -> Vec<Action> {
-        let dispatched = self.coordinators[replica_idx].on_beacon_block_received(block);
+        let wrapped = Arc::new(Verifiable::from((**block).clone()));
+        let dispatched = self.coordinators[replica_idx].on_beacon_block_received(wrapped);
         let resolved = self.resolve_verifications(replica_idx, dispatched);
         self.absorb(replica_idx, resolved.clone());
         resolved
@@ -289,20 +289,15 @@ impl CoordinatorSim {
                     signers,
                     equivocation_signers,
                 } => {
-                    let cert_ok = match block.cert() {
-                        BeaconCert::Normal(cert) => verify_block_cert(
-                            cert,
-                            &self.network,
-                            &spc_context(block.epoch()),
-                            &signers,
-                        ),
-                        BeaconCert::Skip(cert) => verify_skip_cert(cert, &self.network, &signers),
-                        BeaconCert::Genesis(_) => false,
-                    };
-                    let valid = cert_ok
-                        && verify_block_equivocations(&block, &self.network, &equivocation_signers);
-                    let post =
-                        self.coordinators[replica_idx].on_beacon_block_verified(block, valid);
+                    let result = Arc::unwrap_or_clone(block)
+                        .upgrade(&CertifiedBeaconBlockVerifyContext {
+                            network: &self.network,
+                            signers: &signers,
+                            equivocation_signers: &equivocation_signers,
+                        })
+                        .map(Arc::new)
+                        .map_err(|(_, e)| e);
+                    let post = self.coordinators[replica_idx].on_beacon_block_verified(result);
                     out.extend(self.resolve_verifications(replica_idx, post));
                 }
                 Action::VerifySkipRequest { request, signers } => {
@@ -475,7 +470,8 @@ impl CoordinatorSim {
                 proposal,
             } => self.coordinators[env.to_idx].on_beacon_proposal_received(from, epoch, proposal),
             SimEvent::BeaconBlock { block } => {
-                self.coordinators[env.to_idx].on_beacon_block_received(block)
+                let wrapped = Arc::new(Verifiable::from((*block).clone()));
+                self.coordinators[env.to_idx].on_beacon_block_received(wrapped)
             }
             SimEvent::SkipRequest { request } => {
                 self.coordinators[env.to_idx].on_skip_request_received(request)
@@ -751,19 +747,15 @@ impl CoordinatorSim {
                 // verify + result-feedback so the verification-bound
                 // pipeline doesn't reshape envelope-delivery ordering
                 // relative to the pre-async flow.
-                let cert_ok = match block.cert() {
-                    BeaconCert::Normal(cert) => verify_block_cert(
-                        cert,
-                        &self.network,
-                        &spc_context(block.epoch()),
-                        &signers,
-                    ),
-                    BeaconCert::Skip(cert) => verify_skip_cert(cert, &self.network, &signers),
-                    BeaconCert::Genesis(_) => false,
-                };
-                let valid = cert_ok
-                    && verify_block_equivocations(&block, &self.network, &equivocation_signers);
-                let post = self.coordinators[emitter_idx].on_beacon_block_verified(block, valid);
+                let result = Arc::unwrap_or_clone(block)
+                    .upgrade(&CertifiedBeaconBlockVerifyContext {
+                        network: &self.network,
+                        signers: &signers,
+                        equivocation_signers: &equivocation_signers,
+                    })
+                    .map(Arc::new)
+                    .map_err(|(_, e)| e);
+                let post = self.coordinators[emitter_idx].on_beacon_block_verified(result);
                 self.absorb(emitter_idx, post);
             }
             Action::VerifySkipRequest { request, signers } => {

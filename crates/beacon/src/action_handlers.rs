@@ -17,14 +17,11 @@ use hyperscale_types::network::notification::{
     SpcEmptyViewMsgNotification, SpcNewCommitNotification, SpcNewViewNotification,
 };
 use hyperscale_types::{
-    BeaconProposal, PcQc1, PcQc2, PcVote1, PcVote2, PcVote3, PcVoteVerifyContext, SpcEmptyViewMsg,
-    SpcHighTriple, SpcNewCommitMsg, SpcProposalObject, SpcVerifyContext, Verifiable, Verified,
-    pc_context, spc_context, vrf_sign,
+    BeaconProposal, CertifiedBeaconBlockVerifyContext, PcQc1, PcQc2, PcVote1, PcVote2, PcVote3,
+    PcVoteVerifyContext, SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject,
+    SpcVerifyContext, Verifiable, Verified, pc_context, spc_context, verify_skip_request,
 };
 use tracing::warn;
-
-use crate::skip::verify_skip_request;
-use crate::verification::{verify_block_equivocations, verify_certified};
 
 /// Dispatch a beacon-owned [`Action`] on the consensus pool. Panics on
 /// non-beacon variants — the node's owner-keyed dispatch is the gate.
@@ -157,13 +154,18 @@ where
             witnesses,
             recipients,
         } => {
-            let (vrf_output, vrf_proof) = vrf_sign(ctx.signing_key, network, epoch);
-            let proposal = Arc::new(BeaconProposal::new(witnesses, vrf_output, vrf_proof));
+            let verified =
+                Verified::<BeaconProposal>::sign_local(ctx.signing_key, network, epoch, witnesses);
+            let proposal = Arc::new(verified);
             ctx.network.notify(
                 &recipients,
-                &BeaconProposalNotification::new(me, epoch, Arc::clone(&proposal)),
+                &BeaconProposalNotification::new(
+                    me,
+                    epoch,
+                    Arc::new(Verifiable::from((*proposal).clone())),
+                ),
             );
-            ctx.notify_protocol(ProtocolEvent::BeaconProposalReceived {
+            ctx.notify_protocol(ProtocolEvent::VerifiedBeaconProposalReceived {
                 from: me,
                 epoch,
                 proposal,
@@ -209,10 +211,15 @@ where
             signers,
             equivocation_signers,
         } => {
-            let cert_ok = verify_certified(&block, network, &signers);
-            let valid =
-                cert_ok && verify_block_equivocations(&block, network, &equivocation_signers);
-            ctx.notify_protocol(ProtocolEvent::BeaconBlockVerified { block, valid });
+            let result = Arc::unwrap_or_clone(block)
+                .upgrade(&CertifiedBeaconBlockVerifyContext {
+                    network,
+                    signers: &signers,
+                    equivocation_signers: &equivocation_signers,
+                })
+                .map(Arc::new)
+                .map_err(|(_, e)| e);
+            ctx.notify_protocol(ProtocolEvent::BeaconBlockVerified { result });
         }
         Action::VerifySkipRequest { request, signers } => {
             let valid = verify_skip_request(&request, network, &signers);

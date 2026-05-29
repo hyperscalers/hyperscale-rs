@@ -22,13 +22,14 @@ use std::sync::Arc;
 use hyperscale_core::{Action, TimerId};
 use hyperscale_types::{
     BeaconBlock, BeaconCert, BeaconProposal, BeaconState, Bls12381G1PublicKey,
-    CertifiedBeaconBlock, EPOCH_DURATION, Epoch, GenesisConfigHash, Hash, LeafIndex,
-    LocalTimestamp, MAX_WITNESSES_PER_PROPOSER, NetworkDefinition, PcValueElement, PcVector,
-    PcVote1, PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3, PcVote3VerifyError,
-    PcVoteRound, SKIP_TIMEOUT, ShardGroupId, ShardWitness, SkipEpochCert, SkipRequest, SpcCert,
-    SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError,
-    SpcProposalObject, SpcProposalObjectVerifyError, SpcView, TopologySnapshot, ValidatorId,
-    Verifiable, Verified, WeightedTimestamp, Witness, verify_merkle_inclusion,
+    CertifiedBeaconBlock, CertifiedBeaconBlockVerifyError, EPOCH_DURATION, Epoch,
+    GenesisConfigHash, Hash, LeafIndex, LocalTimestamp, MAX_WITNESSES_PER_PROPOSER,
+    NetworkDefinition, PcValueElement, PcVector, PcVote1, PcVote1VerifyError, PcVote2,
+    PcVote2VerifyError, PcVote3, PcVote3VerifyError, PcVoteRound, SKIP_TIMEOUT, ShardGroupId,
+    ShardWitness, SkipEpochCert, SkipRequest, SpcCert, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError,
+    SpcNewCommitMsg, SpcNewCommitMsgVerifyError, SpcProposalObject, SpcProposalObjectVerifyError,
+    SpcView, TopologySnapshot, ValidatorId, Verifiable, Verified, WeightedTimestamp, Witness,
+    verify_merkle_inclusion,
 };
 use tracing::{trace, warn};
 
@@ -947,7 +948,10 @@ impl BeaconCoordinator {
     /// behind the actual signing committee will reject otherwise-valid
     /// blocks. Resolving that without `apply_epoch` is a state-sync
     /// problem handled elsewhere.
-    pub fn on_beacon_block_received(&mut self, block: Arc<CertifiedBeaconBlock>) -> Vec<Action> {
+    pub fn on_beacon_block_received(
+        &mut self,
+        block: Arc<Verifiable<CertifiedBeaconBlock>>,
+    ) -> Vec<Action> {
         let epoch = block.epoch();
         let tip_epoch = self.latest_block.epoch();
         if epoch <= tip_epoch {
@@ -1029,7 +1033,7 @@ impl BeaconCoordinator {
     /// the in-flight slot's result drives admission for any duplicate.
     fn dispatch_block_verification(
         &mut self,
-        block: Arc<CertifiedBeaconBlock>,
+        block: Arc<Verifiable<CertifiedBeaconBlock>>,
         signers: Vec<(ValidatorId, Bls12381G1PublicKey)>,
         equivocation_signers: Vec<(ValidatorId, Bls12381G1PublicKey)>,
     ) -> Vec<Action> {
@@ -1125,7 +1129,7 @@ impl BeaconCoordinator {
         let anchor = self.latest_block.block_hash();
         let block = BeaconBlock::skip(expected_epoch, anchor);
         let certified = CertifiedBeaconBlock::new_unchecked(block, BeaconCert::Skip(cert));
-        let block_arc = Arc::new(certified);
+        let block_arc = Arc::new(Verifiable::from(certified));
         // Skip blocks carry no `committed_proposals`, so the equivocation
         // lookup is necessarily empty.
         self.dispatch_block_verification(block_arc, active_pool, Vec::new())
@@ -1160,18 +1164,17 @@ impl BeaconCoordinator {
     /// tolerated.
     pub fn on_beacon_block_verified(
         &mut self,
-        block: Arc<CertifiedBeaconBlock>,
-        valid: bool,
+        result: Result<Arc<Verified<CertifiedBeaconBlock>>, CertifiedBeaconBlockVerifyError>,
     ) -> Vec<Action> {
+        let block = match result {
+            Ok(b) => b,
+            Err(err) => {
+                warn!(%err, "BeaconBlock cert verification failed — dropping");
+                return Vec::new();
+            }
+        };
         let block_hash = block.block_hash();
-        self.verification.on_block_result(block_hash, valid);
-        if !valid {
-            warn!(
-                epoch = block.epoch().inner(),
-                "BeaconBlock cert verification failed — dropping",
-            );
-            return Vec::new();
-        }
+        self.verification.on_block_result(block_hash, true);
         // Idempotency: another path (local skip-quorum assembly, an
         // earlier peer-broadcast adoption) may have already advanced
         // the tip at or past this block's epoch. Re-entering
@@ -1187,7 +1190,10 @@ impl BeaconCoordinator {
             return Vec::new();
         }
         self.verification.forget_block(block_hash);
-        self.adopt_block(block)
+        // Strip the marker for adopt_block, which threads the raw
+        // value through state mutation and storage.
+        let raw = Arc::new(Arc::unwrap_or_clone(block).into_inner());
+        self.adopt_block(raw)
     }
 
     /// A previously-dispatched [`Action::VerifySkipRequest`] has
@@ -1684,8 +1690,7 @@ mod tests {
     /// synchronous-equivalent outcome without manually threading
     /// results back to the coordinator.
     fn complete_verifications(coord: &mut BeaconCoordinator, actions: Vec<Action>) -> Vec<Action> {
-        use crate::skip::verify_skip_request;
-        use crate::verification::{verify_block_equivocations, verify_certified};
+        use hyperscale_types::{CertifiedBeaconBlockVerifyContext, verify_skip_request};
 
         let net = NetworkDefinition::simulator();
         let mut out = Vec::new();
@@ -1696,9 +1701,15 @@ mod tests {
                     signers,
                     equivocation_signers,
                 } => {
-                    let valid = verify_certified(&block, &net, &signers)
-                        && verify_block_equivocations(&block, &net, &equivocation_signers);
-                    let post = coord.on_beacon_block_verified(block, valid);
+                    let result = Arc::unwrap_or_clone(block)
+                        .upgrade(&CertifiedBeaconBlockVerifyContext {
+                            network: &net,
+                            signers: &signers,
+                            equivocation_signers: &equivocation_signers,
+                        })
+                        .map(Arc::new)
+                        .map_err(|(_, e)| e);
+                    let post = coord.on_beacon_block_verified(result);
                     out.extend(complete_verifications(coord, post));
                 }
                 Action::VerifySkipRequest { request, signers } => {
@@ -2135,7 +2146,7 @@ mod tests {
         coord: &BeaconCoordinator,
         epoch: Epoch,
         prev_hash: BeaconBlockHash,
-    ) -> Arc<CertifiedBeaconBlock> {
+    ) -> Arc<Verifiable<CertifiedBeaconBlock>> {
         let n = coord.state.committee.len();
         let f = n.saturating_sub(1) / 3;
         let q = n - f;
@@ -2150,10 +2161,10 @@ mod tests {
         let signer_positions: Vec<usize> = (0..q).collect();
         let cert = build_direct_cert(SpcView::new(1), epoch, &keys, &committee, &signer_positions);
         let block = BeaconBlock::new(epoch, prev_hash, Vec::new());
-        Arc::new(CertifiedBeaconBlock::new_unchecked(
+        Arc::new(Verifiable::from(CertifiedBeaconBlock::new_unchecked(
             block,
             BeaconCert::Normal(Box::new(cert)),
-        ))
+        )))
     }
 
     #[test]
@@ -2163,7 +2174,9 @@ mod tests {
         // tip's perspective. `on_beacon_block_received` should drop it
         // before even inspecting the cert.
         let _prev = coord.latest_block.block_hash();
-        let block = Arc::new(CertifiedBeaconBlock::genesis(GenesisConfigHash::ZERO));
+        let block = Arc::new(Verifiable::from(CertifiedBeaconBlock::genesis(
+            GenesisConfigHash::ZERO,
+        )));
         let actions = coord.on_beacon_block_received(block);
         assert!(actions.is_empty());
         assert!(coord.pending_blocks.is_empty());
@@ -2344,7 +2357,7 @@ mod tests {
         anchor_hash: BeaconBlockHash,
         epoch_to_skip: Epoch,
     ) -> SkipRequest {
-        use crate::skip::sign_skip_request;
+        use hyperscale_types::sign_skip_request;
         let sk = keypair(seed);
         let net = NetworkDefinition::simulator();
         sign_skip_request(&sk, validator, &net, anchor_hash, epoch_to_skip)

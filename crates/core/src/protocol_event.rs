@@ -10,17 +10,17 @@ use std::sync::Arc;
 use hyperscale_types::{
     BeaconProposal, BeaconWitnessRoot, BeaconWitnessRootVerifyError, Block, BlockHash, BlockHeader,
     BlockHeight, BlockManifest, BlockVote, CertRootVerifyError, CertificateRoot,
-    CertifiedBeaconBlock, CertifiedBlock, CertifiedBlockHeader, CertifiedHeaderVerifyError, Epoch,
-    ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote, FinalizedWave,
-    FinalizedWaveVerifyError, LocalReceiptRoot, LocalReceiptRootVerifyError, PcVote1,
-    PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3, PcVote3VerifyError,
-    ProvisionRootVerifyError, ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions,
-    ProvisionsRoot, ProvisionsVerifyError, QcVerifyError, QuorumCertificate, ReadySignal, Round,
-    RoutableTransaction, ShardGroupId, ShardWitness, SkipEpochCert, SkipRequest, SpcEmptyViewMsg,
-    SpcEmptyViewMsgVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError, SpcProposalObject,
-    SpcProposalObjectVerifyError, SpcView, StateRoot, StateRootVerifyError, StoredReceipt,
-    TransactionRoot, TxOutcome, TxRootVerifyError, ValidatorId, Verifiable, Verified, VotePower,
-    WaveId, WeightedTimestamp,
+    CertifiedBeaconBlock, CertifiedBeaconBlockVerifyError, CertifiedBlock, CertifiedBlockHeader,
+    CertifiedHeaderVerifyError, Epoch, ExecutionCertificate, ExecutionCertificateVerifyError,
+    ExecutionVote, FinalizedWave, FinalizedWaveVerifyError, LocalReceiptRoot,
+    LocalReceiptRootVerifyError, PcVote1, PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3,
+    PcVote3VerifyError, ProvisionRootVerifyError, ProvisionTxRootsMap, ProvisionTxRootsVerifyError,
+    Provisions, ProvisionsRoot, ProvisionsVerifyError, QcVerifyError, QuorumCertificate,
+    ReadySignal, Round, RoutableTransaction, ShardGroupId, ShardWitness, SkipEpochCert,
+    SkipRequest, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError, SpcNewCommitMsg,
+    SpcNewCommitMsgVerifyError, SpcProposalObject, SpcProposalObjectVerifyError, SpcView,
+    StateRoot, StateRootVerifyError, StoredReceipt, TransactionRoot, TxOutcome, TxRootVerifyError,
+    ValidatorId, Verifiable, Verified, VotePower, WaveId, WeightedTimestamp,
 };
 
 /// How a node learned about the certifying QC that commits a given block.
@@ -760,25 +760,40 @@ pub enum ProtocolEvent {
         msg: Box<Verified<SpcEmptyViewMsg>>,
     },
 
-    /// A beacon block arrived via gossip.
+    /// A beacon block arrived via gossip. Wire decode lands the
+    /// wrapper as `Unverified`; locally-relayed broadcasts preserve
+    /// the `Verified` marker.
     BeaconBlockReceived {
         /// Received certified block.
-        block: Arc<CertifiedBeaconBlock>,
+        block: Arc<Verifiable<CertifiedBeaconBlock>>,
     },
 
-    /// A peer committee member's `BeaconProposal` arrived via gossip.
-    /// `IoLoop` has already authenticated the sender and verified the
-    /// proposal's VRF reveal against `(network.id, epoch)` — the
-    /// coordinator gates admission on committee membership at the
-    /// `epoch` and stores the proposal in its pool.
-    BeaconProposalReceived {
+    /// A peer committee member's `BeaconProposal` arrived over the
+    /// wire. `IoLoop` has already authenticated the sender; the
+    /// coordinator dispatches the VRF reveal check before admission.
+    UnverifiedBeaconProposalReceived {
         /// Authenticated sender id.
         from: ValidatorId,
-        /// Epoch the proposal targets — bound by the verified VRF
-        /// reveal inside `proposal`.
+        /// Epoch the proposal targets — bound by the VRF reveal
+        /// inside `proposal`.
         epoch: Epoch,
         /// Received proposal.
-        proposal: Arc<BeaconProposal>,
+        proposal: Arc<Verifiable<BeaconProposal>>,
+    },
+
+    /// A locally-signed `BeaconProposal` arrived via the
+    /// `Action::BuildAndBroadcastBeaconProposal` self-loopback path.
+    /// The signing-key holder produced the VRF reveal, so the proposal
+    /// is verified by construction — coordinator skips the VRF check
+    /// and admits directly.
+    VerifiedBeaconProposalReceived {
+        /// Local validator id (the loopback sender).
+        from: ValidatorId,
+        /// Epoch the proposal targets.
+        epoch: Epoch,
+        /// Verified proposal, sealed via
+        /// [`Verified::<BeaconProposal>::sign_local`].
+        proposal: Arc<Verified<BeaconProposal>>,
     },
 
     /// A `SkipRequest` arrived via gossip.
@@ -805,14 +820,13 @@ pub enum ProtocolEvent {
         witnesses: Vec<Arc<ShardWitness>>,
     },
 
-    /// Result of an [`Action::VerifyBeaconBlock`] dispatch. The block
-    /// rides back so the coordinator doesn't have to stash it during
-    /// the verify round-trip.
+    /// Result of an [`Action::VerifyBeaconBlock`] dispatch. The
+    /// verified handle rides back on success so the coordinator can
+    /// route it into adoption without stashing during the verify
+    /// round-trip.
     BeaconBlockVerified {
-        /// The block whose cert was verified.
-        block: Arc<CertifiedBeaconBlock>,
-        /// Whether the cert check passed.
-        valid: bool,
+        /// Verified block on success; the typed error otherwise.
+        result: Result<Arc<Verified<CertifiedBeaconBlock>>, CertifiedBeaconBlockVerifyError>,
     },
 
     /// Result of an [`Action::VerifySkipRequest`] dispatch.

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use sbor::prelude::BasicSbor;
 
 use crate::network::{GossipMessage, TopicScope};
-use crate::{CertifiedBeaconBlock, MessageClass, NetworkMessage};
+use crate::{CertifiedBeaconBlock, MessageClass, NetworkMessage, Verifiable};
 
 /// Broadcasts a finalized [`CertifiedBeaconBlock`] globally for
 /// light-client pickup, cross-shard verification, and committee
@@ -16,30 +16,38 @@ use crate::{CertifiedBeaconBlock, MessageClass, NetworkMessage};
 /// epoch's committee (resolved from the previous epoch's `BeaconState`).
 /// No outer sender signature is needed; multiple publishers broadcasting
 /// the same canonical bytes collapse via gossipsub's bytes-id dedup.
+///
+/// Wire decode lands the wrapper as `Verifiable::Unverified`;
+/// locally-dispatched sends from a colocated commit path preserve
+/// `Verifiable::Verified`.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct BeaconBlockGossip {
     /// The finalized beacon block paired with its authenticating cert.
-    pub block: Arc<CertifiedBeaconBlock>,
+    pub block: Arc<Verifiable<CertifiedBeaconBlock>>,
 }
 
 impl BeaconBlockGossip {
-    /// Wrap a [`CertifiedBeaconBlock`] for gossip broadcast.
+    /// Wrap a [`CertifiedBeaconBlock`] for gossip broadcast. Accepts
+    /// a raw block or a `Verified<CertifiedBeaconBlock>` — the wrapper
+    /// preserves the marker.
     #[must_use]
-    pub fn new(block: impl Into<Arc<CertifiedBeaconBlock>>) -> Self {
+    pub fn new(block: impl Into<Arc<Verifiable<CertifiedBeaconBlock>>>) -> Self {
         Self {
             block: block.into(),
         }
     }
 
-    /// Get the inner block.
+    /// Get the inner block (raw view, regardless of verification
+    /// state).
     #[must_use]
     pub fn block(&self) -> &CertifiedBeaconBlock {
-        &self.block
+        self.block.as_unverified()
     }
 
-    /// Consume and return the inner block.
+    /// Consume and return the inner block, preserving the
+    /// verification marker.
     #[must_use]
-    pub fn into_block(self) -> Arc<CertifiedBeaconBlock> {
+    pub fn into_block(self) -> Arc<Verifiable<CertifiedBeaconBlock>> {
         self.block
     }
 }
@@ -68,7 +76,7 @@ mod tests {
     #[test]
     fn sbor_round_trip() {
         let block = CertifiedBeaconBlock::genesis(GenesisConfigHash::ZERO);
-        let g = BeaconBlockGossip::new(block);
+        let g = BeaconBlockGossip::new(Arc::new(Verifiable::from(block)));
         let bytes = basic_encode(&g).unwrap();
         let decoded: BeaconBlockGossip = basic_decode(&bytes).unwrap();
         assert_eq!(g, decoded);

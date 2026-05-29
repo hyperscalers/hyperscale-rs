@@ -1,62 +1,13 @@
 //! Async-verification bookkeeping for beacon-side crypto checks.
+//!
+//! Pure verifiers live alongside their wire types in
+//! [`hyperscale_types::beacon`]; this module owns the slot-tracking
+//! pipeline the coordinator uses to dedup and dispatch in-flight
+//! crypto checks.
 
 use std::collections::BTreeSet;
 
-use hyperscale_types::{
-    BeaconBlockHash, BeaconCert, Bls12381G1PublicKey, CertifiedBeaconBlock, Epoch, Hash,
-    NetworkDefinition, PcVoteRound, SpcView, ValidatorId, Witness, spc_context, verify_block_cert,
-    verify_vote_equivocation,
-};
-
-use crate::skip::verify_skip_cert;
-
-/// Verify a [`CertifiedBeaconBlock`] under the cert variant's required
-/// signer pool.
-///
-/// Dispatches: SPC cert against the beacon committee, Skip cert against
-/// the active pool. `Genesis` certs reject — past-tip genesis blocks
-/// have no replayable verification.
-#[must_use]
-pub fn verify_certified(
-    block: &CertifiedBeaconBlock,
-    network: &NetworkDefinition,
-    signers: &[(ValidatorId, Bls12381G1PublicKey)],
-) -> bool {
-    match block.cert() {
-        BeaconCert::Normal(cert) => {
-            verify_block_cert(cert, network, &spc_context(block.epoch()), signers)
-        }
-        BeaconCert::Skip(cert) => verify_skip_cert(cert, network, signers),
-        BeaconCert::Genesis(_) => false,
-    }
-}
-
-/// Verify every `Witness::Equivocation` carried in `block`'s committed
-/// proposals against the supplied `signers` lookup.
-///
-/// `signers` must cover every equivocating validator referenced by the
-/// block's witnesses — the coordinator filters `state.validators` down
-/// to the referenced subset before dispatch. Missing pubkeys reject the
-/// block at admission, matching the "fail closed" stance.
-///
-/// Returns `true` when the block carries no equivocations.
-#[must_use]
-pub fn verify_block_equivocations(
-    block: &CertifiedBeaconBlock,
-    network: &NetworkDefinition,
-    signers: &[(ValidatorId, Bls12381G1PublicKey)],
-) -> bool {
-    for (_, proposal) in block.block().committed_proposals() {
-        for witness in proposal.witnesses().iter() {
-            if let Witness::Equivocation(ev) = witness
-                && !verify_vote_equivocation(ev, network, signers)
-            {
-                return false;
-            }
-        }
-    }
-    true
-}
+use hyperscale_types::{BeaconBlockHash, Epoch, Hash, PcVoteRound, SpcView, ValidatorId};
 
 /// In-flight + verified slots over an arbitrary key.
 ///

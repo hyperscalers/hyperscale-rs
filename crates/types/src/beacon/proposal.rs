@@ -8,10 +8,12 @@
 
 use blake3::Hasher;
 use sbor::prelude::*;
+use thiserror::Error;
 
 use crate::{
-    BoundedVec, Epoch, MAX_WITNESSES_PER_PROPOSER, PC_VALUE_ELEMENT_BYTES, PcValueElement,
-    VrfOutput, VrfProof, Witness,
+    Bls12381G1PrivateKey, Bls12381G1PublicKey, BoundedVec, Epoch, MAX_WITNESSES_PER_PROPOSER,
+    NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PcValueElement, Verified, Verify, VrfOutput,
+    VrfProof, Witness, vrf_sign, vrf_verify,
 };
 
 /// One committee member's slot submission.
@@ -105,6 +107,87 @@ impl BeaconProposal {
             raw.copy_from_slice(rehash.finalize().as_bytes());
         }
         PcValueElement::new(raw)
+    }
+}
+
+// ─── Typestate ─────────────────────────────────────────────────────────────
+
+/// Verification context for [`BeaconProposal`].
+///
+/// VRF reveal verification is bound to `(network, epoch)` and checks
+/// against the proposer's pubkey. The coordinator resolves `sender_pk`
+/// from `BeaconState.validators` before dispatching the verify action.
+#[derive(Debug, Clone, Copy)]
+pub struct BeaconProposalVerifyContext<'a> {
+    /// Network the proposer was bound to.
+    pub network: &'a NetworkDefinition,
+    /// Epoch the proposal targets — mixed into the VRF reveal's signing
+    /// bytes.
+    pub epoch: Epoch,
+    /// Proposer's BLS public key — the VRF reveal verifies under this.
+    pub sender_pk: Bls12381G1PublicKey,
+}
+
+/// Coarse-grained verification failure for a beacon proposal.
+///
+/// Today the only predicate is the VRF reveal; future expansion (per-
+/// witness validity) would extend this enum with named variants.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+#[error("BeaconProposal verification failed")]
+pub struct BeaconProposalVerifyError;
+
+impl Verify<&BeaconProposalVerifyContext<'_>> for BeaconProposal {
+    type Error = BeaconProposalVerifyError;
+
+    /// Beacon-proposal predicate: VRF reveal verifies under
+    /// `sender_pk` over `(network, epoch)`. Witness-level validity
+    /// (shard merkle proofs, embedded equivocations) lives at the
+    /// `CertifiedBeaconBlock` boundary and isn't part of this
+    /// predicate.
+    fn verify(&self, ctx: &BeaconProposalVerifyContext<'_>) -> Result<Verified<Self>, Self::Error> {
+        if !vrf_verify(
+            &ctx.sender_pk,
+            ctx.network,
+            ctx.epoch,
+            &self.vrf_output,
+            &self.vrf_proof,
+        ) {
+            return Err(BeaconProposalVerifyError);
+        }
+        Ok(Verified::new_unchecked(self.clone()))
+    }
+}
+
+// ─── Named gates ────────────────────────────────────────────────────────────
+
+impl Verified<BeaconProposal> {
+    /// Sign a beacon proposal locally — derive the VRF reveal under
+    /// the signer's key, pair it with `witnesses`, and produce a
+    /// `Verified<BeaconProposal>` whose VRF predicate holds by
+    /// construction.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `witnesses.len() > MAX_WITNESSES_PER_PROPOSER`
+    /// (inherited from [`BeaconProposal::new`]).
+    #[must_use]
+    pub fn sign_local(
+        sk: &Bls12381G1PrivateKey,
+        network: &NetworkDefinition,
+        epoch: Epoch,
+        witnesses: Vec<Witness>,
+    ) -> Self {
+        let (vrf_output, vrf_proof) = vrf_sign(sk, network, epoch);
+        Self::new_unchecked(BeaconProposal::new(witnesses, vrf_output, vrf_proof))
+    }
+
+    /// Wrap a locally-built proposal whose VRF reveal was produced via
+    /// a verified path. Mirror of
+    /// [`Verified::<PcQc1>::from_local_build`]. Used at the bridge
+    /// from coordinator-side assembly to the action handler.
+    #[must_use]
+    pub const fn from_local_build(proposal: BeaconProposal) -> Self {
+        Self::new_unchecked(proposal)
     }
 }
 

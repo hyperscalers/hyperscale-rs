@@ -21,7 +21,6 @@ pub mod pc;
 pub mod pending_blocks;
 pub mod proposal_pool;
 pub mod sampling;
-pub mod skip;
 pub mod skip_tracker;
 pub mod spc;
 pub mod state;
