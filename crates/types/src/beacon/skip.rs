@@ -401,14 +401,6 @@ impl Verified<SkipRequest> {
             epoch_to_skip,
         ))
     }
-
-    /// Wrap a locally-built skip request whose backing sig was produced
-    /// via a verified path. Mirror of
-    /// [`Verified::<PcQc1>::from_local_build`].
-    #[must_use]
-    pub const fn from_local_build(request: SkipRequest) -> Self {
-        Self::new_unchecked(request)
-    }
 }
 
 impl Verified<SkipEpochCert> {
@@ -423,14 +415,6 @@ impl Verified<SkipEpochCert> {
     ) -> Option<Self> {
         let raw: Vec<SkipRequest> = requests.iter().map(|r| (*r).as_ref().clone()).collect();
         build_skip_cert(&raw, active_pool).map(Self::new_unchecked)
-    }
-
-    /// Wrap a locally-assembled cert whose backing requests were
-    /// already verified upstream. Mirror of
-    /// [`Verified::<PcQc1>::from_local_build`].
-    #[must_use]
-    pub const fn from_local_build(cert: SkipEpochCert) -> Self {
-        Self::new_unchecked(cert)
     }
 }
 

@@ -310,14 +310,6 @@ impl Verified<CertifiedBeaconBlock> {
     pub const fn genesis(config_hash: GenesisConfigHash) -> Self {
         Self::new_unchecked(CertifiedBeaconBlock::genesis(config_hash))
     }
-
-    /// Wrap a locally-built certified pair whose backing inputs were
-    /// produced by verified paths (SPC commit, skip-cert assembly).
-    /// Mirror of [`Verified::<PcQc1>::from_local_build`].
-    #[must_use]
-    pub const fn from_local_build(block: CertifiedBeaconBlock) -> Self {
-        Self::new_unchecked(block)
-    }
 }
 
 impl<E: Encoder<NoCustomValueKind>> Encode<NoCustomValueKind, E> for CertifiedBeaconBlock {

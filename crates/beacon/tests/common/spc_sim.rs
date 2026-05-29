@@ -13,9 +13,9 @@ use std::time::Duration;
 
 use hyperscale_beacon::spc::{SpcEffect, SpcEvent, SpcInstance};
 use hyperscale_types::{
-    Bls12381G1PrivateKey, Bls12381G1PublicKey, Epoch, NetworkDefinition, PcVector, SpcView,
-    ValidatorId, bls_keypair_from_seed, pc_context, sign_empty_view_msg, sign_vote1, sign_vote2,
-    sign_vote3, spc_context,
+    Bls12381G1PrivateKey, Bls12381G1PublicKey, Epoch, NetworkDefinition, PcVector, PcVote1,
+    PcVote2, PcVote3, SpcEmptyViewMsg, SpcView, ValidatorId, Verified, bls_keypair_from_seed,
+    pc_context, spc_context,
 };
 
 /// One pending event in the network: an `SpcEvent` addressed to a
@@ -126,12 +126,14 @@ impl SpcSim {
             match effect {
                 SpcEffect::SignAndBroadcastPcVote1 { view, v_in } => {
                     let pc_ctx = pc_context(&spc_context(self.epoch), view);
-                    let vote = sign_vote1(&sk, sender, &self.network, &pc_ctx, v_in);
+                    let vote =
+                        Verified::<PcVote1>::sign_local(&sk, sender, &self.network, &pc_ctx, v_in);
                     self.deliver_to_all(&SpcEvent::PcVote1Verified { view, vote });
                 }
                 SpcEffect::SignAndBroadcastPcVote2 { view, qc1 } => {
                     let pc_ctx = pc_context(&spc_context(self.epoch), view);
-                    let vote = sign_vote2(&sk, sender, &self.network, &pc_ctx, *qc1);
+                    let vote =
+                        Verified::<PcVote2>::sign_local(&sk, sender, &self.network, &pc_ctx, *qc1);
                     self.deliver_to_all(&SpcEvent::PcVote2Verified {
                         view,
                         vote: Box::new(vote),
@@ -139,7 +141,8 @@ impl SpcSim {
                 }
                 SpcEffect::SignAndBroadcastPcVote3 { view, qc2 } => {
                     let pc_ctx = pc_context(&spc_context(self.epoch), view);
-                    let vote = sign_vote3(&sk, sender, &self.network, &pc_ctx, *qc2);
+                    let vote =
+                        Verified::<PcVote3>::sign_local(&sk, sender, &self.network, &pc_ctx, *qc2);
                     self.deliver_to_all(&SpcEvent::PcVote3Verified {
                         view,
                         vote: Box::new(vote),
@@ -162,8 +165,14 @@ impl SpcSim {
                 }
                 SpcEffect::SignAndBroadcastEmptyView { view, reported } => {
                     let spc_ctx = spc_context(self.epoch);
-                    let msg =
-                        sign_empty_view_msg(&sk, sender, &self.network, &spc_ctx, view, *reported);
+                    let msg = Verified::<SpcEmptyViewMsg>::sign_local(
+                        &sk,
+                        sender,
+                        &self.network,
+                        &spc_ctx,
+                        view,
+                        *reported,
+                    );
                     self.deliver_to_all(&SpcEvent::EmptyViewVerified(Box::new(msg)));
                 }
                 SpcEffect::SetTimer { .. } | SpcEffect::Equivocation { .. } => {

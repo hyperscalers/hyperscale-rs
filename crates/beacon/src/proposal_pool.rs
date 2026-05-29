@@ -18,9 +18,9 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use hyperscale_types::{BeaconProposal, Epoch, ValidatorId};
+use hyperscale_types::{BeaconProposal, Epoch, ValidatorId, Verified};
 
-/// Per-epoch cache of received `BeaconProposal`s indexed by sender.
+/// Per-epoch cache of verified `BeaconProposal`s indexed by sender.
 #[derive(Debug)]
 pub struct BeaconProposalPool {
     /// Epoch this pool tracks. Admissions for any other epoch get
@@ -30,7 +30,7 @@ pub struct BeaconProposalPool {
     /// committee member; subsequent admissions from the same sender
     /// are dropped (first-write wins, mirroring the equivocation
     /// pool's discipline).
-    proposals: BTreeMap<ValidatorId, Arc<BeaconProposal>>,
+    proposals: BTreeMap<ValidatorId, Arc<Verified<BeaconProposal>>>,
 }
 
 impl BeaconProposalPool {
@@ -62,7 +62,7 @@ impl BeaconProposalPool {
         &mut self,
         from: ValidatorId,
         epoch: Epoch,
-        proposal: Arc<BeaconProposal>,
+        proposal: Arc<Verified<BeaconProposal>>,
     ) -> bool {
         if epoch != self.epoch {
             return false;
@@ -84,7 +84,7 @@ impl BeaconProposalPool {
     }
 
     #[must_use]
-    pub fn get(&self, from: ValidatorId) -> Option<&Arc<BeaconProposal>> {
+    pub fn get(&self, from: ValidatorId) -> Option<&Arc<Verified<BeaconProposal>>> {
         self.proposals.get(&from)
     }
 
@@ -106,15 +106,15 @@ impl BeaconProposalPool {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::{BeaconProposal, Epoch, ValidatorId, VrfOutput, VrfProof};
+    use hyperscale_types::{BeaconProposal, Epoch, ValidatorId, Verified, VrfOutput, VrfProof};
 
     use super::*;
 
-    fn proposal(seed: u8) -> Arc<BeaconProposal> {
-        Arc::new(BeaconProposal::vrf_only(
+    fn proposal(seed: u8) -> Arc<Verified<BeaconProposal>> {
+        Arc::new(Verified::new_unchecked_for_test(BeaconProposal::vrf_only(
             VrfOutput::new([seed; 32]),
             VrfProof::new([seed; 96]),
-        ))
+        )))
     }
 
     #[test]

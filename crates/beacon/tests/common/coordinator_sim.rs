@@ -56,7 +56,7 @@ pub enum ByzantineBehaviour {
 #[derive(Clone)]
 pub struct CapturedCommit {
     pub epoch: Epoch,
-    pub block: Arc<CertifiedBeaconBlock>,
+    pub block: Arc<Verified<CertifiedBeaconBlock>>,
     pub state: BeaconState,
 }
 
@@ -97,10 +97,10 @@ enum SimEvent {
     BeaconProposal {
         from: ValidatorId,
         epoch: Epoch,
-        proposal: Arc<BeaconProposal>,
+        proposal: Arc<Verified<BeaconProposal>>,
     },
     BeaconBlock {
-        block: Arc<CertifiedBeaconBlock>,
+        block: Arc<Verified<CertifiedBeaconBlock>>,
     },
     SkipRequest {
         request: Arc<Verifiable<SkipRequest>>,
@@ -199,7 +199,7 @@ impl CoordinatorSim {
 
         let initial_state = build_genesis_beacon_state(&config);
         let config_hash = genesis_config_hash(&config, &network);
-        let genesis_block = Arc::new(CertifiedBeaconBlock::genesis(config_hash));
+        let genesis_block = Arc::new(Verified::<CertifiedBeaconBlock>::genesis(config_hash));
 
         let coordinators: Vec<BeaconCoordinator> = (0..n)
             .map(|i| {
@@ -265,9 +265,9 @@ impl CoordinatorSim {
     pub fn deliver_block_to(
         &mut self,
         replica_idx: usize,
-        block: &Arc<CertifiedBeaconBlock>,
+        block: &Arc<Verified<CertifiedBeaconBlock>>,
     ) -> Vec<Action> {
-        let wrapped = Arc::new(Verifiable::from((**block).clone()));
+        let wrapped = Arc::new(Verifiable::from((***block).clone()));
         let dispatched = self.coordinators[replica_idx].on_beacon_block_received(wrapped);
         let resolved = self.resolve_verifications(replica_idx, dispatched);
         self.absorb(replica_idx, resolved.clone());
@@ -478,7 +478,7 @@ impl CoordinatorSim {
                 proposal,
             } => self.coordinators[env.to_idx].on_beacon_proposal_received(from, epoch, proposal),
             SimEvent::BeaconBlock { block } => {
-                let wrapped = Arc::new(Verifiable::from((*block).clone()));
+                let wrapped = Arc::new(Verifiable::from((**block).clone()));
                 self.coordinators[env.to_idx].on_beacon_block_received(wrapped)
             }
             SimEvent::SkipRequest { request } => {
@@ -518,7 +518,9 @@ impl CoordinatorSim {
                 }
                 let sk = &self.sks[emitter_idx];
                 let (vrf_output, vrf_proof) = vrf_sign(sk, &self.network, epoch);
-                let proposal = Arc::new(BeaconProposal::new(witnesses, vrf_output, vrf_proof));
+                let proposal = Arc::new(Verified::new_unchecked_for_test(BeaconProposal::new(
+                    witnesses, vrf_output, vrf_proof,
+                )));
                 for rcpt in &recipients {
                     let to_idx = self.idx_of(*rcpt);
                     self.network_q.push_back(Envelope {
@@ -549,8 +551,9 @@ impl CoordinatorSim {
                 ) {
                     self.byzantine[emitter_idx] = None;
                     self.byzantine_fires[emitter_idx] += 1;
-                    let conflicting =
-                        Arc::new(BeaconProposal::new(Vec::new(), vrf_output, vrf_proof));
+                    let conflicting = Arc::new(Verified::new_unchecked_for_test(
+                        BeaconProposal::new(Vec::new(), vrf_output, vrf_proof),
+                    ));
                     for rcpt in &recipients {
                         let to_idx = self.idx_of(*rcpt);
                         self.network_q.push_back(Envelope {
@@ -636,7 +639,7 @@ impl CoordinatorSim {
                 recipients,
             } => {
                 let spc_ctx = spc_context(epoch);
-                let raw = sign_empty_view_msg(
+                let verified = Verified::<SpcEmptyViewMsg>::sign_local(
                     &self.sks[emitter_idx],
                     me,
                     &self.network,
@@ -644,7 +647,7 @@ impl CoordinatorSim {
                     view,
                     *reported,
                 );
-                let msg = Arc::new(Verifiable::from(raw));
+                let msg = Arc::new(Verifiable::from(verified));
                 for rcpt in &recipients {
                     let to_idx = self.idx_of(*rcpt);
                     self.network_q.push_back(Envelope {

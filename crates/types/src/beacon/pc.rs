@@ -21,9 +21,9 @@ use crate::primitives::signer_bitfield::MAX_VALIDATORS;
 use crate::{
     Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature, BoundedVec, DOMAIN_PC_VOTE1,
     DOMAIN_PC_VOTE2, DOMAIN_PC_VOTE2_LENGTH, DOMAIN_PC_VOTE3, Epoch, MAX_PREFIX_SIGS,
-    MAX_VOTE_VECTOR_LEN, NetworkDefinition, PcContext, PositionalBundle, SignerBitfield, SpcView,
-    ValidatorId, Verifiable, Verified, Verify, aggregate_verify_bls_different_messages, pc_context,
-    pc_vote_signing_message, spc_context,
+    MAX_VOTE_VECTOR_LEN, NetworkDefinition, PcContext, PositionalBundle, SignerBitfield,
+    SpcNewCommitMsg, SpcView, ValidatorId, Verifiable, Verified, Verify,
+    aggregate_verify_bls_different_messages, pc_context, pc_vote_signing_message, spc_context,
 };
 
 // ── ValueElement and Vector ──────────────────────────────────────────────────
@@ -1877,17 +1877,6 @@ impl Verified<PcQc1> {
         let raw: Vec<&PcVote1> = votes.iter().map(|v| AsRef::as_ref(*v)).collect();
         Self::new_unchecked(build_qc1(&raw, committee))
     }
-
-    /// Wrap a locally-aggregated round-1 QC whose backing votes were
-    /// admitted to the local PC pool after verification. Trust source:
-    /// each pooled vote has cleared the round-1 BLS check (pool
-    /// admission is the gate), and [`build_qc1`] is deterministic over
-    /// its inputs. Used at the bridge from the PC FSM (which holds raw
-    /// `PcVote1`s) to the action-handler signer for round-2 votes.
-    #[must_use]
-    pub const fn from_local_build(qc: PcQc1) -> Self {
-        Self::new_unchecked(qc)
-    }
 }
 
 impl Verified<PcQc2> {
@@ -1899,13 +1888,6 @@ impl Verified<PcQc2> {
     ) -> Self {
         let raw: Vec<&PcVote2> = votes.iter().map(|v| AsRef::as_ref(*v)).collect();
         Self::new_unchecked(build_qc2(&raw, committee))
-    }
-
-    /// Wrap a locally-aggregated round-2 QC; analogous to
-    /// [`Verified::<PcQc1>::from_local_build`].
-    #[must_use]
-    pub const fn from_local_build(qc: PcQc2) -> Self {
-        Self::new_unchecked(qc)
     }
 }
 
@@ -1922,11 +1904,14 @@ impl Verified<PcQc3> {
         Self::new_unchecked(build_qc3(&raw, committee))
     }
 
-    /// Wrap a locally-aggregated round-3 (terminal) QC; analogous to
-    /// [`Verified::<PcQc1>::from_local_build`].
+    /// Lift the inner proof out of a verified new-commit message. Trust
+    /// source: the new-commit verifier predicate runs the embedded QC3
+    /// check (or trusts the embedded `Verifiable` marker if already
+    /// set), so a verified outer carries a verified inner by construction.
     #[must_use]
-    pub const fn from_local_build(qc: PcQc3) -> Self {
-        Self::new_unchecked(qc)
+    pub fn from_verified_new_commit(msg: Verified<SpcNewCommitMsg>) -> Self {
+        let proof_verifiable = msg.into_inner().proof;
+        Self::new_unchecked(proof_verifiable.into_unverified())
     }
 }
 

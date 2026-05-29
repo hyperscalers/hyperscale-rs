@@ -13,8 +13,8 @@ use std::sync::Arc;
 use hyperscale_beacon::pc::{PcEffect, PcEvent, PcInstance};
 use hyperscale_types::{
     Bls12381G1PrivateKey, Bls12381G1PublicKey, Epoch, NetworkDefinition, PcContext, PcQc3,
-    PcVector, SpcView, ValidatorId, bls_keypair_from_seed, pc_context, sign_vote1, sign_vote2,
-    sign_vote3, spc_context,
+    PcVector, PcVote1, PcVote2, PcVote3, SpcView, ValidatorId, Verified, bls_keypair_from_seed,
+    pc_context, spc_context,
 };
 
 /// One pending message in the network: a vote event addressed to a
@@ -141,22 +141,40 @@ impl PcSim {
         for effect in effects {
             match effect {
                 PcEffect::SignAndBroadcastVote1 { v_in } => {
-                    let vote = sign_vote1(&sk, sender, &self.network, &self.pc_ctx, v_in);
+                    let vote = Verified::<PcVote1>::sign_local(
+                        &sk,
+                        sender,
+                        &self.network,
+                        &self.pc_ctx,
+                        v_in,
+                    );
                     self.deliver_to_all(&PcEvent::Vote1Verified(vote));
                 }
                 PcEffect::SignAndBroadcastVote2 { qc1 } => {
-                    let vote = sign_vote2(&sk, sender, &self.network, &self.pc_ctx, *qc1);
+                    let vote = Verified::<PcVote2>::sign_local(
+                        &sk,
+                        sender,
+                        &self.network,
+                        &self.pc_ctx,
+                        *qc1,
+                    );
                     self.deliver_to_all(&PcEvent::Vote2Verified(Box::new(vote)));
                 }
                 PcEffect::SignAndBroadcastVote3 { qc2 } => {
-                    let vote = sign_vote3(&sk, sender, &self.network, &self.pc_ctx, *qc2);
+                    let vote = Verified::<PcVote3>::sign_local(
+                        &sk,
+                        sender,
+                        &self.network,
+                        &self.pc_ctx,
+                        *qc2,
+                    );
                     self.deliver_to_all(&PcEvent::Vote3Verified(Box::new(vote)));
                 }
                 PcEffect::EquivocationObserved(_) => {
                     // Honest path: no equivocations to absorb.
                 }
                 PcEffect::Decided(qc3) => {
-                    self.decided[sender_idx] = Some(qc3);
+                    self.decided[sender_idx] = Some(Box::new(qc3.into_inner()));
                 }
             }
         }

@@ -824,7 +824,7 @@ pub enum Action {
         view: SpcView,
         /// Source round-1 QC; `v2.x == qc1.x` is enforced at the
         /// signer.
-        qc1: Box<PcQc1>,
+        qc1: Box<Verified<PcQc1>>,
         /// SPC committee members the vote ships to (excluding self).
         recipients: Vec<ValidatorId>,
     },
@@ -837,7 +837,7 @@ pub enum Action {
         view: SpcView,
         /// Source round-2 QC; `v3.x_p == qc2.x_p` is enforced at the
         /// signer.
-        qc2: Box<PcQc2>,
+        qc2: Box<Verified<PcQc2>>,
         /// SPC committee members the vote ships to (excluding self).
         recipients: Vec<ValidatorId>,
     },
@@ -850,11 +850,10 @@ pub enum Action {
         epoch: Epoch,
         /// View this empty-view attestation skips.
         view: SpcView,
-        /// Local max high triple reported in the attestation. The FSM
-        /// pools triples only after their backing PC instance has
-        /// produced a verified high, so the handler can wrap this in
-        /// `Verified::<SpcHighTriple>::from_local_build` before signing.
-        reported: Box<SpcHighTriple>,
+        /// Local max high triple reported in the attestation, carried
+        /// verified-by-construction from the FSM's
+        /// [`Verified<SpcHighTriple>`] pool.
+        reported: Box<Verified<SpcHighTriple>>,
         /// SPC committee members the message ships to (excluding
         /// self).
         recipients: Vec<ValidatorId>,
@@ -865,11 +864,9 @@ pub enum Action {
     BroadcastSpcNewView {
         /// Epoch the SPC instance belongs to.
         epoch: Epoch,
-        /// Proposal object pairing the view with its backing cert. The
-        /// FSM assembled the cert from verified inputs, so the handler
-        /// wraps with [`Verified::<SpcProposalObject>::from_local_build`]
-        /// before notifying.
-        proposal: Box<SpcProposalObject>,
+        /// Proposal object pairing the view with its backing cert,
+        /// carried verified-by-construction from the FSM.
+        proposal: Box<Verified<SpcProposalObject>>,
         /// SPC committee members the notification ships to (excluding
         /// self).
         recipients: Vec<ValidatorId>,
@@ -880,11 +877,9 @@ pub enum Action {
     BroadcastSpcNewCommit {
         /// Epoch the SPC instance belongs to.
         epoch: Epoch,
-        /// Committed-low message. The FSM produced this from a verified
-        /// inner-PC QC3, so the handler wraps with
-        /// [`Verified::<SpcNewCommitMsg>::from_local_build`] before
-        /// notifying.
-        msg: Box<SpcNewCommitMsg>,
+        /// Committed-low message, carried verified-by-construction
+        /// from the FSM's inner-PC QC3.
+        msg: Box<Verified<SpcNewCommitMsg>>,
         /// SPC committee members the notification ships to (excluding
         /// self).
         recipients: Vec<ValidatorId>,
@@ -913,7 +908,7 @@ pub enum Action {
     /// beacon gossip topic.
     BroadcastBeaconBlock {
         /// Certified block to broadcast.
-        block: Arc<CertifiedBeaconBlock>,
+        block: Arc<Verified<CertifiedBeaconBlock>>,
     },
 
     /// Broadcast a locally-signed [`SkipRequest`] to the active-duty
@@ -1085,7 +1080,7 @@ pub enum Action {
     /// to `BeaconStorage`. Both writes go in one atomic batch.
     CommitBeaconBlock {
         /// Certified committed block.
-        block: Arc<CertifiedBeaconBlock>,
+        block: Arc<Verified<CertifiedBeaconBlock>>,
         /// State the block advances to. Boxed to bound enum size.
         state: Box<BeaconState>,
     },

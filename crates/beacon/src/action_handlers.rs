@@ -17,9 +17,9 @@ use hyperscale_types::network::notification::{
     SpcEmptyViewMsgNotification, SpcNewCommitNotification, SpcNewViewNotification,
 };
 use hyperscale_types::{
-    BeaconProposal, CertifiedBeaconBlockVerifyContext, PcQc1, PcQc2, PcVote1, PcVote2, PcVote3,
-    PcVoteVerifyContext, SkipVerifyContext, SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg,
-    SpcProposalObject, SpcVerifyContext, Verifiable, Verified, pc_context, spc_context,
+    BeaconProposal, CertifiedBeaconBlockVerifyContext, PcVote1, PcVote2, PcVote3,
+    PcVoteVerifyContext, SkipVerifyContext, SpcEmptyViewMsg, SpcVerifyContext, Verifiable,
+    Verified, pc_context, spc_context,
 };
 use tracing::warn;
 
@@ -60,14 +60,8 @@ where
             recipients,
         } => {
             let pc_ctx = pc_context(&spc_context(epoch), view);
-            let qc1_verified = Verified::<PcQc1>::from_local_build(*qc1);
-            let verified = Verified::<PcVote2>::sign_local(
-                ctx.signing_key,
-                me,
-                network,
-                &pc_ctx,
-                qc1_verified,
-            );
+            let verified =
+                Verified::<PcVote2>::sign_local(ctx.signing_key, me, network, &pc_ctx, *qc1);
             ctx.network.notify(
                 &recipients,
                 &PcVote2Notification::new(Arc::new(Verifiable::from(verified.clone()))),
@@ -85,14 +79,8 @@ where
             recipients,
         } => {
             let pc_ctx = pc_context(&spc_context(epoch), view);
-            let qc2_verified = Verified::<PcQc2>::from_local_build(*qc2);
-            let verified = Verified::<PcVote3>::sign_local(
-                ctx.signing_key,
-                me,
-                network,
-                &pc_ctx,
-                qc2_verified,
-            );
+            let verified =
+                Verified::<PcVote3>::sign_local(ctx.signing_key, me, network, &pc_ctx, *qc2);
             ctx.network.notify(
                 &recipients,
                 &PcVote3Notification::new(Arc::new(Verifiable::from(verified.clone()))),
@@ -110,14 +98,13 @@ where
             recipients,
         } => {
             let spc_ctx = spc_context(epoch);
-            let reported_verified = Verified::<SpcHighTriple>::from_local_build(*reported);
             let verified = Verified::<SpcEmptyViewMsg>::sign_local(
                 ctx.signing_key,
                 me,
                 network,
                 &spc_ctx,
                 view,
-                reported_verified,
+                *reported,
             );
             ctx.network.notify(
                 &recipients,
@@ -132,10 +119,9 @@ where
             proposal,
             recipients,
         } => {
-            let verified = Verified::<SpcProposalObject>::from_local_build(*proposal);
             ctx.network.notify(
                 &recipients,
-                &SpcNewViewNotification::new(Arc::new(Verifiable::from(verified))),
+                &SpcNewViewNotification::new(Arc::new(Verifiable::from(*proposal))),
             );
         }
         Action::BroadcastSpcNewCommit {
@@ -143,10 +129,9 @@ where
             msg,
             recipients,
         } => {
-            let verified = Verified::<SpcNewCommitMsg>::from_local_build(*msg);
             ctx.network.notify(
                 &recipients,
-                &SpcNewCommitNotification::new(Arc::new(Verifiable::from(verified))),
+                &SpcNewCommitNotification::new(Arc::new(Verifiable::from(*msg))),
             );
         }
         Action::BuildAndBroadcastBeaconProposal {

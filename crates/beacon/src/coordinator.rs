@@ -24,7 +24,7 @@ use hyperscale_types::{
     BeaconBlock, BeaconCert, BeaconProposal, BeaconState, Bls12381G1PublicKey,
     CertifiedBeaconBlock, CertifiedBeaconBlockVerifyError, EPOCH_DURATION, Epoch,
     GenesisConfigHash, Hash, LeafIndex, LocalTimestamp, MAX_WITNESSES_PER_PROPOSER,
-    NetworkDefinition, PcValueElement, PcVector, PcVote1, PcVote1VerifyError, PcVote2,
+    NetworkDefinition, PcQc3, PcValueElement, PcVector, PcVote1, PcVote1VerifyError, PcVote2,
     PcVote2VerifyError, PcVote3, PcVote3VerifyError, PcVoteRound, SKIP_TIMEOUT, ShardGroupId,
     ShardWitness, SkipEpochCert, SkipRequest, SkipRequestVerifyError, SpcCert, SpcEmptyViewMsg,
     SpcEmptyViewMsgVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError, SpcProposalObject,
@@ -60,7 +60,7 @@ pub struct BeaconCoordinator {
     /// Latest committed beacon block paired with its authenticating
     /// cert. Carried so SPC instance bootstrap and skip-cert anchor
     /// checks read `prev_block_hash` without a storage roundtrip.
-    latest_block: Arc<CertifiedBeaconBlock>,
+    latest_block: Arc<Verified<CertifiedBeaconBlock>>,
 
     /// `None` between bootstrap and the first epoch-boundary
     /// trigger, and again briefly between an epoch's commit and the
@@ -133,7 +133,7 @@ impl BeaconCoordinator {
     /// cert's `config_hash` doesn't match `expected_config_hash`.
     #[must_use]
     pub fn new(
-        latest_block: Arc<CertifiedBeaconBlock>,
+        latest_block: Arc<Verified<CertifiedBeaconBlock>>,
         latest_state: BeaconState,
         me: ValidatorId,
         network: NetworkDefinition,
@@ -353,15 +353,14 @@ impl BeaconCoordinator {
         &mut self,
         msg: Box<Verified<SpcEmptyViewMsg>>,
     ) -> Vec<Action> {
-        let raw = (*msg).into_inner();
-        let signer = raw.signer;
+        let signer = msg.signer;
         if self
             .spc_admission_ctx(signer, "VerifiedEmptyView")
             .is_none()
         {
             return Vec::new();
         }
-        self.dispatch_spc_event(signer, SpcEvent::EmptyViewVerified(Box::new(raw)))
+        self.dispatch_spc_event(signer, SpcEvent::EmptyViewVerified(msg))
     }
 
     /// Common gating for the three SPC receive entries: returns the
@@ -418,7 +417,8 @@ impl BeaconCoordinator {
         if self.spc.as_ref().is_some_and(|s| s.epoch() != epoch) {
             return Vec::new();
         }
-        let SpcProposalObject { view, cert } = proposal.into_inner();
+        let view = proposal.view;
+        let cert = Verified::<SpcCert>::from_verified_proposal_object(proposal);
         self.dispatch_spc_event(
             from,
             SpcEvent::NewViewVerified {
@@ -455,14 +455,15 @@ impl BeaconCoordinator {
         if self.spc.as_ref().is_some_and(|s| s.epoch() != epoch) {
             return Vec::new();
         }
-        let SpcNewCommitMsg { view, value, proof } = msg.into_inner();
-        let proof_raw = proof.into_unverified();
+        let view = msg.view;
+        let value = msg.value.clone();
+        let proof = Verified::<PcQc3>::from_verified_new_commit(msg);
         self.dispatch_spc_event(
             from,
             SpcEvent::NewCommitVerified {
                 view,
                 value,
-                proof: Box::new(proof_raw),
+                proof: Box::new(proof),
             },
         )
     }
@@ -492,8 +493,7 @@ impl BeaconCoordinator {
         if self.spc.as_ref().is_some_and(|s| s.epoch() != epoch) {
             return Vec::new();
         }
-        let raw = msg.into_inner();
-        self.dispatch_spc_event(signer, SpcEvent::EmptyViewVerified(Box::new(raw)))
+        self.dispatch_spc_event(signer, SpcEvent::EmptyViewVerified(Box::new(msg)))
     }
 
     /// Result of an [`Action::VerifyPcVote1`] dispatch. Clears the
@@ -521,13 +521,18 @@ impl BeaconCoordinator {
                 return Vec::new();
             }
         };
-        let raw = verified.into_inner();
-        let signer = raw.validator();
+        let signer = verified.validator();
         self.clear_pc_vote_slot(epoch, view, Some(signer), PcVoteRound::Vote1, true);
         if self.spc.as_ref().is_some_and(|s| s.epoch() != epoch) {
             return Vec::new();
         }
-        self.dispatch_spc_event(self.me, SpcEvent::PcVote1Verified { view, vote: raw })
+        self.dispatch_spc_event(
+            self.me,
+            SpcEvent::PcVote1Verified {
+                view,
+                vote: verified,
+            },
+        )
     }
 
     /// Result of an [`Action::VerifyPcVote2`] dispatch.
@@ -550,8 +555,7 @@ impl BeaconCoordinator {
                 return Vec::new();
             }
         };
-        let raw = verified.into_inner();
-        let signer = raw.validator();
+        let signer = verified.validator();
         self.clear_pc_vote_slot(epoch, view, Some(signer), PcVoteRound::Vote2, true);
         if self.spc.as_ref().is_some_and(|s| s.epoch() != epoch) {
             return Vec::new();
@@ -560,7 +564,7 @@ impl BeaconCoordinator {
             self.me,
             SpcEvent::PcVote2Verified {
                 view,
-                vote: Box::new(raw),
+                vote: Box::new(verified),
             },
         )
     }
@@ -585,8 +589,7 @@ impl BeaconCoordinator {
                 return Vec::new();
             }
         };
-        let raw = verified.into_inner();
-        let signer = raw.validator();
+        let signer = verified.validator();
         self.clear_pc_vote_slot(epoch, view, Some(signer), PcVoteRound::Vote3, true);
         if self.spc.as_ref().is_some_and(|s| s.epoch() != epoch) {
             return Vec::new();
@@ -595,7 +598,7 @@ impl BeaconCoordinator {
             self.me,
             SpcEvent::PcVote3Verified {
                 view,
-                vote: Box::new(raw),
+                vote: Box::new(verified),
             },
         )
     }
@@ -613,12 +616,12 @@ impl BeaconCoordinator {
         let Some((epoch, _)) = self.spc_admission_ctx(from, "PcVote") else {
             return Vec::new();
         };
-        let raw = vote.into_inner();
-        self.clear_pc_vote_slot(epoch, view, Some(raw.validator()), PcVoteRound::Vote1, true);
+        let signer = vote.validator();
+        self.clear_pc_vote_slot(epoch, view, Some(signer), PcVoteRound::Vote1, true);
         if self.spc.as_ref().is_some_and(|s| s.epoch() != epoch) {
             return Vec::new();
         }
-        self.dispatch_spc_event(self.me, SpcEvent::PcVote1Verified { view, vote: raw })
+        self.dispatch_spc_event(self.me, SpcEvent::PcVote1Verified { view, vote })
     }
 
     /// A round-2 PC vote that the coordinator received already verified.
@@ -631,18 +634,12 @@ impl BeaconCoordinator {
         let Some((epoch, _)) = self.spc_admission_ctx(from, "PcVote") else {
             return Vec::new();
         };
-        let raw = (*vote).into_inner();
-        self.clear_pc_vote_slot(epoch, view, Some(raw.validator()), PcVoteRound::Vote2, true);
+        let signer = vote.validator();
+        self.clear_pc_vote_slot(epoch, view, Some(signer), PcVoteRound::Vote2, true);
         if self.spc.as_ref().is_some_and(|s| s.epoch() != epoch) {
             return Vec::new();
         }
-        self.dispatch_spc_event(
-            self.me,
-            SpcEvent::PcVote2Verified {
-                view,
-                vote: Box::new(raw),
-            },
-        )
+        self.dispatch_spc_event(self.me, SpcEvent::PcVote2Verified { view, vote })
     }
 
     /// A round-3 PC vote that the coordinator received already verified.
@@ -655,18 +652,12 @@ impl BeaconCoordinator {
         let Some((epoch, _)) = self.spc_admission_ctx(from, "PcVote") else {
             return Vec::new();
         };
-        let raw = (*vote).into_inner();
-        self.clear_pc_vote_slot(epoch, view, Some(raw.validator()), PcVoteRound::Vote3, true);
+        let signer = vote.validator();
+        self.clear_pc_vote_slot(epoch, view, Some(signer), PcVoteRound::Vote3, true);
         if self.spc.as_ref().is_some_and(|s| s.epoch() != epoch) {
             return Vec::new();
         }
-        self.dispatch_spc_event(
-            self.me,
-            SpcEvent::PcVote3Verified {
-                view,
-                vote: Box::new(raw),
-            },
-        )
+        self.dispatch_spc_event(self.me, SpcEvent::PcVote3Verified { view, vote })
     }
 
     /// Shared slot-clear helper used by all three per-round PC vote
@@ -725,7 +716,7 @@ impl BeaconCoordinator {
         &mut self,
         from: ValidatorId,
         epoch: Epoch,
-        proposal: Arc<BeaconProposal>,
+        proposal: Arc<Verified<BeaconProposal>>,
     ) -> Vec<Action> {
         if !self.state.committee.contains(&from) {
             trace!(
@@ -1159,7 +1150,11 @@ impl BeaconCoordinator {
         let raw_cert = cert.into_inner();
         let epoch_to_skip = raw_cert.epoch_to_skip();
         let block = BeaconBlock::skip(epoch_to_skip, anchor);
-        let certified = CertifiedBeaconBlock::new_unchecked(block, BeaconCert::Skip(raw_cert));
+        let certified = Verified::<CertifiedBeaconBlock>::from_committed_assembly(
+            block,
+            BeaconCert::Skip(raw_cert),
+        )
+        .expect("skip block pairs with skip cert by construction");
         let block_arc = Arc::new(certified);
 
         // Forget the anchor before adoption advances the tip — once we
@@ -1206,10 +1201,7 @@ impl BeaconCoordinator {
             return Vec::new();
         }
         self.verification.forget_block(block_hash);
-        // Strip the marker for adopt_block, which threads the raw
-        // value through state mutation and storage.
-        let raw = Arc::new(Arc::unwrap_or_clone(block).into_inner());
-        self.adopt_block(raw)
+        self.adopt_block(block)
     }
 
     /// A previously-dispatched [`Action::VerifySkipRequest`] has
@@ -1328,7 +1320,7 @@ impl BeaconCoordinator {
     /// the new committee. Emits `CommitBeaconBlock` only — no
     /// broadcast (caller decides whether the local node is the
     /// originator).
-    fn adopt_block(&mut self, block: Arc<CertifiedBeaconBlock>) -> Vec<Action> {
+    fn adopt_block(&mut self, block: Arc<Verified<CertifiedBeaconBlock>>) -> Vec<Action> {
         let mut new_state = self.state.clone();
         let input = apply_input_for(&block);
         apply_epoch(&mut new_state, &self.network, block.epoch(), input);
@@ -1390,14 +1382,17 @@ impl BeaconCoordinator {
         &mut self,
         epoch: Epoch,
         output: &PcVector,
-        cert: SpcCert,
+        cert: Verified<SpcCert>,
         _recipients: &[ValidatorId],
     ) -> Vec<Action> {
         let committed = self.decode_committed_proposals(epoch, output);
         let prev_block_hash = self.latest_block.block_hash();
         let block = BeaconBlock::new(epoch, prev_block_hash, committed);
-        let certified =
-            CertifiedBeaconBlock::new_unchecked(block, BeaconCert::Normal(Box::new(cert)));
+        let certified = Verified::<CertifiedBeaconBlock>::from_committed_assembly(
+            block,
+            BeaconCert::Normal(Box::new(cert.into_inner())),
+        )
+        .expect("Normal beacon block pairs with SPC cert by construction");
         let block_arc = Arc::new(certified);
 
         // Advance state via the shared adoption path.
@@ -1447,7 +1442,7 @@ impl BeaconCoordinator {
                 );
                 continue;
             }
-            committed.push((validator, (**pooled).clone()));
+            committed.push((validator, pooled.as_ref().as_ref().clone()));
         }
         committed
     }
@@ -1508,22 +1503,22 @@ impl BeaconCoordinator {
                     });
                 }
                 SpcEffect::BroadcastNewView { view, cert } => {
-                    let proposal = Box::new(SpcProposalObject { view, cert: *cert });
+                    let proposal = Verified::<SpcProposalObject>::from_verified_cert(view, *cert);
                     actions.push(Action::BroadcastSpcNewView {
                         epoch,
-                        proposal,
+                        proposal: Box::new(proposal),
                         recipients: recipients.to_vec(),
                     });
                 }
-                SpcEffect::BroadcastNewCommit { view, value, proof } => {
-                    let msg = Box::new(SpcNewCommitMsg {
-                        view,
-                        value,
-                        proof: Verifiable::from(*proof),
-                    });
+                SpcEffect::BroadcastNewCommit {
+                    view,
+                    value: _,
+                    proof,
+                } => {
+                    let msg = Verified::<SpcNewCommitMsg>::from_verified_proof(view, *proof);
                     actions.push(Action::BroadcastSpcNewCommit {
                         epoch,
-                        msg,
+                        msg: Box::new(msg),
                         recipients: recipients.to_vec(),
                     });
                 }
@@ -1569,7 +1564,7 @@ impl BeaconCoordinator {
     }
 
     #[must_use]
-    pub const fn latest_block(&self) -> &Arc<CertifiedBeaconBlock> {
+    pub const fn latest_block(&self) -> &Arc<Verified<CertifiedBeaconBlock>> {
         &self.latest_block
     }
 
@@ -1670,11 +1665,15 @@ mod tests {
     /// The (block, state, `config_hash`) trio the runner would produce
     /// on an empty store: build genesis state, hash the config, wrap
     /// the genesis block.
-    fn genesis_trio() -> (Arc<CertifiedBeaconBlock>, BeaconState, GenesisConfigHash) {
+    fn genesis_trio() -> (
+        Arc<Verified<CertifiedBeaconBlock>>,
+        BeaconState,
+        GenesisConfigHash,
+    ) {
         let config = sample_genesis();
         let state = build_genesis_beacon_state(&config);
         let config_hash = genesis_config_hash(&config, &NetworkDefinition::simulator());
-        let block = CertifiedBeaconBlock::genesis(config_hash);
+        let block = Verified::<CertifiedBeaconBlock>::genesis(config_hash);
         (Arc::new(block), state, config_hash)
     }
 
@@ -1780,9 +1779,9 @@ mod tests {
     fn debug_assertion_catches_runner_loading_mismatched_genesis() {
         use hyperscale_types::Hash;
         let (_block, state, _config_hash) = genesis_trio();
-        let mismatched_block = CertifiedBeaconBlock::genesis(GenesisConfigHash::from_raw(
-            Hash::from_bytes(b"other-config"),
-        ));
+        let mismatched_block = Verified::<CertifiedBeaconBlock>::genesis(
+            GenesisConfigHash::from_raw(Hash::from_bytes(b"other-config")),
+        );
         let _coord = BeaconCoordinator::new(
             Arc::new(mismatched_block),
             state,
@@ -1880,12 +1879,12 @@ mod tests {
         assert_eq!(spc_view_first, spc_view_second);
     }
 
-    fn sample_proposal(seed: u8) -> Arc<BeaconProposal> {
+    fn sample_proposal(seed: u8) -> Arc<Verified<BeaconProposal>> {
         use hyperscale_types::{VrfOutput, VrfProof};
-        Arc::new(BeaconProposal::vrf_only(
+        Arc::new(Verified::new_unchecked_for_test(BeaconProposal::vrf_only(
             VrfOutput::new([seed; 32]),
             VrfProof::new([seed; 96]),
-        ))
+        )))
     }
 
     #[test]
@@ -2351,7 +2350,12 @@ mod tests {
         );
 
         let recipients = coord.spc_recipients();
-        let actions = coord.on_spc_output_high(in_flight, &output, cert, &recipients);
+        let actions = coord.on_spc_output_high(
+            in_flight,
+            &output,
+            Verified::new_unchecked_for_test(cert),
+            &recipients,
+        );
 
         // Cert-as-authenticator: no header-sig collection round.
         // OutputHigh produces Commit + TopologyChanged + Broadcast
@@ -2813,7 +2817,12 @@ mod tests {
         );
 
         let recipients = coord.spc_recipients();
-        let actions = coord.on_spc_output_high(in_flight, &output, cert, &recipients);
+        let actions = coord.on_spc_output_high(
+            in_flight,
+            &output,
+            Verified::new_unchecked_for_test(cert),
+            &recipients,
+        );
 
         let topology_changed: Vec<&Action> = actions
             .iter()
