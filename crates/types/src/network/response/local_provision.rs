@@ -29,7 +29,7 @@ use crate::{
 pub struct LocalProvisionEntry {
     /// The provisions batch.
     pub provisions: Arc<Provisions>,
-    /// The source-shard committed header at `provisions.block_height()`,
+    /// The source-shard certified header at `provisions.block_height()`,
     /// if the responder still has it.
     pub source_header: Option<Arc<CertifiedBlockHeader>>,
 }

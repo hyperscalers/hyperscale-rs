@@ -190,7 +190,7 @@ pub enum TopicScope {
 /// - [`SCOPE`](Self::SCOPE) — `Shard` or `Global`. Drives topic
 ///   subscription and which broadcast method may carry this type.
 /// - [`source_shard`](Self::source_shard) — for global messages tied to a
-///   specific shard's history (e.g. a committed-header gossip), the
+///   specific shard's history (e.g. a certified header gossip), the
 ///   originating shard. Cross-shard hosting filters this shard out when
 ///   fanning the message into hosted shards' state machines — a vnode in
 ///   the originating shard sees its own commits directly, not through
@@ -222,7 +222,7 @@ pub trait GossipMessage: NetworkMessage + Clone {
 
     /// Content-key for dedup of equivalent copies emitted by multiple
     /// publishers. Two messages with the same logical content (e.g. the
-    /// same committed header, different sender signatures) must return
+    /// same certified header, different sender signatures) must return
     /// equal keys; the framework's receive-side cache then short-
     /// circuits the second-and-later arrivals.
     ///

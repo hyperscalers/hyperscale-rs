@@ -14,7 +14,7 @@ use crate::{CertifiedBlockHeader, MessageClass, NetworkMessage};
 /// or its own tip.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct GetRemoteHeadersResponse {
-    /// Consecutive committed headers in ascending height order.
+    /// Consecutive certified headers in ascending height order.
     pub headers: Vec<CertifiedBlockHeader>,
 }
 

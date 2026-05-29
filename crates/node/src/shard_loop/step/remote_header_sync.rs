@@ -36,7 +36,7 @@ where
 
     /// Handle `Action::StartRemoteHeaderSync`: feed this shard's FSM and
     /// dispatch any range fetches it emits. `source_shard` is the remote
-    /// shard whose committed headers we're catching up on.
+    /// shard whose certified headers we're catching up on.
     pub(in crate::shard_loop) fn process_start_remote_header_sync(
         &mut self,
         source_shard: ShardGroupId,

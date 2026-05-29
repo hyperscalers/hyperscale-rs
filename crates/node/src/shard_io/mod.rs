@@ -30,7 +30,7 @@ use crate::shard_io::fetch::FetchHost;
 use crate::shard_io::phase_times::TxPhaseTimesCache;
 use crate::shard_io::sync::SyncHost;
 
-/// A committed header pending sender-signature verification, queued in
+/// A certified header pending sender-signature verification, queued in
 /// `ShardIo::certified_header_batch` and drained on the crypto pool.
 ///
 /// The wrapper carries verification state across the in-process gossip
@@ -74,7 +74,7 @@ pub struct ShardIo<S: ShardStorage> {
     pub fetches: FetchHost,
 
     /// Sync state machines: block-sync (catch up the shard chain) and
-    /// remote-header sync (track other shards' committed headers for
+    /// remote-header sync (track other shards' certified headers for
     /// cross-shard data dependencies).
     pub syncs: SyncHost,
 
@@ -103,7 +103,7 @@ pub struct ShardIo<S: ShardStorage> {
     /// declared-shard verification on the `tx_validation` pool.
     pub validation_batch: BatchAccumulator<Arc<RoutableTransaction>>,
 
-    /// Pending remote-committed-header gossip awaiting batched BLS
+    /// Pending remote-certified header gossip awaiting batched BLS
     /// sender-signature verification on the crypto pool.
     pub certified_header_batch: BatchAccumulator<CertifiedHeaderVerificationItem>,
 

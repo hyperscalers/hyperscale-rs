@@ -184,7 +184,7 @@ where
             .map(|cb| Arc::new(Verified::<CertifiedBlock>::from_persisted(cb)))
     }
 
-    /// Committed header at `height`. Header-only view of
+    /// Certified header at `height`. Header-only view of
     /// [`Self::certified_block`] — pending entry first, base store fallback.
     pub fn certified_header(&self, height: BlockHeight) -> Option<Arc<CertifiedBlockHeader>> {
         if let Some(certified) = self.pending_certified_at(height) {

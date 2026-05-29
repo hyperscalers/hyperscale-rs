@@ -23,7 +23,7 @@ pub struct SyncHost {
     pub block: BlockSync,
 
     /// Multi-shard remote-header sync state machine. Catches up missing
-    /// committed-header chains by batching contiguous heights into range
+    /// certified header chains by batching contiguous heights into range
     /// fetches.
     pub remote_header: RemoteHeaderSync,
 }

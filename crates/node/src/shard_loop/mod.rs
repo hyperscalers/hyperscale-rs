@@ -376,7 +376,7 @@ where
                 self.drive_fetch::<FinalizedWaveBinding>(FetchInput::Failed { ids });
             }
 
-            // ── Committed header (gossip → BLS verify → state machine) ──
+            // ── Certified header (gossip → BLS verify → state machine) ──
             ShardScopedInput::CommittedBlockGossipReceived {
                 certified_header,
                 sender,

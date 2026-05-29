@@ -13,7 +13,7 @@ use crate::{
 /// Gossips a committed block header globally to all shards.
 ///
 /// Used for the light-client provisions pattern: when a block commits,
-/// the committed header (header + QC) is broadcast globally so remote
+/// the certified header (header + QC) is broadcast globally so remote
 /// shards can verify state roots and validate merkle inclusion proofs
 /// for provisions.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
@@ -68,7 +68,7 @@ impl GossipMessage for CertifiedBlockHeaderGossip {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
-        // Hash of the committed header (excludes sender / sender_signature),
+        // Hash of the certified header (excludes sender / sender_signature),
         // so every committee member's copy of the same logical header
         // collapses to a single key.
         let mut hasher = DefaultHasher::new();

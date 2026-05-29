@@ -23,7 +23,7 @@ use tracing::{debug, warn};
 ///
 /// Lookup proceeds as:
 ///
-/// 1. Resolve the committed header at `req.block_height` through
+/// 1. Resolve the certified header at `req.block_height` through
 ///    [`PendingChain::certified_header`]. The pending-chain layer spans
 ///    both the shard-committed-but-unpersisted window and durable
 ///    storage, so a peer fetching against a freshly committed block

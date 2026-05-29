@@ -409,7 +409,7 @@ where
                     let Some(tx) = senders.get(&target_shard) else {
                         warn!(
                             target_shard = target_shard.inner(),
-                            "Dropping committed header gossip: shard not hosted"
+                            "Dropping certified header gossip: shard not hosted"
                         );
                         return GossipVerdict::Reject;
                     };
@@ -418,7 +418,7 @@ where
                     let topo = topology.load();
 
                     let Some(public_key) =
-                        resolve_sender_key(&topo, sender, header_shard, "committed header")
+                        resolve_sender_key(&topo, sender, header_shard, "certified header")
                     else {
                         return GossipVerdict::Reject;
                     };

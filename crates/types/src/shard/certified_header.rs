@@ -105,7 +105,7 @@ impl Verified<CertifiedBlockHeader> {
     /// Construction asserts:
     /// 1. The header passes [`<BlockHeader as crate::Verify>`](crate::Verify)
     ///    (so its `parent_qc` is verified).
-    /// 2. The QC pairing this committed-header was verified against the
+    /// 2. The QC pairing this certified header was verified against the
     ///    source-shard committee.
     /// 3. The QC's `block_hash` equals `header.hash()` — the QC commits
     ///    exactly this header.

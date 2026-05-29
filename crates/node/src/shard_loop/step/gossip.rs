@@ -58,7 +58,7 @@ where
         }
     }
 
-    /// Flush accumulated committed-header sender-signature verifications.
+    /// Flush accumulated certified header sender-signature verifications.
     ///
     /// Partitions the batch on `is_verified()`: verified items
     /// (local-dispatched from a colocated proposer) emit directly as
@@ -140,7 +140,7 @@ where
                         tracing::warn!(
                             sender = gossip.sender.inner(),
                             height = gossip.certified_header.header().height().inner(),
-                            "Committed header sender signature verification failed"
+                            "Certified header sender signature verification failed"
                         );
                     }
                 }

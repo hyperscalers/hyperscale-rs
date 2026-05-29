@@ -254,7 +254,7 @@ pub enum Action {
     ///
     /// The QC was already verified by `RemoteHeaderCoordinator` when the header
     /// was promoted to verified, so this only checks merkle proofs against the
-    /// committed header's state root.
+    /// certified header's state root.
     ///
     /// Delegated to a thread pool in production, instant in simulation.
     /// Returns `ProtocolEvent::StateProvisionsVerified` when complete.
@@ -770,7 +770,7 @@ pub enum Action {
     /// emits range fetches and feeds verified headers back to
     /// [`crate::ProtocolEvent::RemoteHeaderReceived`].
     StartRemoteHeaderSync {
-        /// Remote shard whose committed-header chain we're catching up to.
+        /// Remote shard whose certified header chain we're catching up to.
         source_shard: ShardGroupId,
         /// Highest known target height for that shard's chain.
         target: BlockHeight,

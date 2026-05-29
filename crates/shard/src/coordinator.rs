@@ -2695,7 +2695,7 @@ impl ShardCoordinator {
             }
         });
 
-        // Only the block proposer gossips the committed header globally.
+        // Only the block proposer gossips the certified header globally.
         // Other validators rely on receiving it via gossip propagation. If the
         // proposer is Byzantine/slow, the RemoteHeaderCoordinator will detect
         // the liveness timeout and trigger a fallback fetch.

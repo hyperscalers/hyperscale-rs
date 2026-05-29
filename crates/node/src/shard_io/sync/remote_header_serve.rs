@@ -1,7 +1,7 @@
 //! Inbound remote-header range request handling.
 //!
 //! Serves `GetRemoteHeadersRequest`s from peers catching up to this shard's
-//! committed-header chain. Walks local storage from `from_height` and
+//! certified header chain. Walks local storage from `from_height` and
 //! returns up to `count` consecutive headers, capped by
 //! [`MAX_REMOTE_HEADERS_PER_REQUEST`] and the local tip. The response
 //! short-caps on the first missing height rather than failing.
@@ -26,7 +26,7 @@ use hyperscale_types::{BlockHeight, ShardGroupId};
 /// gap and rotate, stretching sync.
 ///
 /// Requests for a shard other than `local_shard` get an empty response.
-/// Without this gate a shard A node would serve its own committed headers
+/// Without this gate a shard A node would serve its own certified headers
 /// in response to a request for shard B headers; the requester filters
 /// only by height and would buffer them under the wrong shard scope,
 /// stalling sync until rotation.

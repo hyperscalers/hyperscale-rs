@@ -71,7 +71,7 @@ fn make_block(height: BlockHeight) -> CertifiedBlock {
     CertifiedBlock::new_unchecked(block, qc)
 }
 
-/// Build a remote committed header whose only wave targets `local_shard`,
+/// Build a remote certified header whose only wave targets `local_shard`,
 /// so a `ProvisionCoordinator` running on `local_shard` will register an
 /// expectation on receipt.
 fn make_remote_header_targeting(

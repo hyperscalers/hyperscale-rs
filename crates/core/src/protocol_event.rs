@@ -233,7 +233,7 @@ pub enum ProtocolEvent {
     /// Downstream consumers (shard consensus, Provision, Execution) use this as their single
     /// source of verified remote headers.
     RemoteHeaderAdmitted {
-        /// The fully-verified committed header — predicate established by
+        /// The fully-verified certified header — predicate established by
         /// [`Verified::<CertifiedBlockHeader>::from_qc_attestation`].
         certified_header: Arc<Verified<CertifiedBlockHeader>>,
     },
@@ -362,13 +362,13 @@ pub enum ProtocolEvent {
     ///
     /// The QC was verified upstream as part of promoting the source
     /// header to [`Verified<CertifiedBlockHeader>`]; merkle proofs are
-    /// checked against the verified state root. The committed header is
+    /// checked against the verified state root. The certified header is
     /// returned so the state machine can promote it without re-lookup.
     StateProvisionsVerified {
         /// Verified provisions on success; the raw bundle paired with
         /// its error on failure.
         result: Result<Arc<Verified<Provisions>>, (Arc<Provisions>, ProvisionsVerifyError)>,
-        /// The committed header whose `state_root` the merkle proof was
+        /// The certified header whose `state_root` the merkle proof was
         /// checked against.
         certified_header: Arc<Verified<CertifiedBlockHeader>>,
     },
@@ -625,7 +625,7 @@ pub enum ProtocolEvent {
     },
 
     /// The `io_loop`'s [`RemoteHeaderSync`] state machine caught
-    /// `source_shard`'s committed-header chain up to `height`.
+    /// `source_shard`'s certified header chain up to `height`.
     /// `RemoteHeaderCoordinator` uses this to clear any "syncing" flag for
     /// that shard and resume normal per-gap behaviour.
     ///
