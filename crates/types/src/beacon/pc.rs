@@ -2073,14 +2073,23 @@ impl Verified<PcQc3> {
         Self::new_unchecked(build_qc3(&raw, committee))
     }
 
-    /// Lift the inner proof out of a verified new-commit message. Trust
-    /// source: the new-commit verifier predicate runs the embedded QC3
-    /// check (or trusts the embedded `Verifiable` marker if already
-    /// set), so a verified outer carries a verified inner by construction.
+    /// Lift the inner proof out of a verified new-commit message. The
+    /// outer verify persists the upgraded marker into the inner
+    /// `Verifiable<PcQc3>`, so the inner unwraps to a `Verified<PcQc3>`
+    /// directly without re-running the predicate.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner proof's marker isn't live — every
+    /// `Verified<SpcNewCommitMsg>` construction path (the verify impl
+    /// and [`Verified::<SpcNewCommitMsg>::from_verified_proof`]) lands
+    /// the inner in `Verifiable::Verified`.
     #[must_use]
     pub fn from_verified_new_commit(msg: Verified<SpcNewCommitMsg>) -> Self {
-        let proof_verifiable = msg.into_inner().proof;
-        Self::new_unchecked(proof_verifiable.into_unverified())
+        msg.into_inner()
+            .proof
+            .into_verified()
+            .expect("Verified<SpcNewCommitMsg> persists its inner proof marker")
     }
 }
 
