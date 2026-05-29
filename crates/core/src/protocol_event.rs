@@ -79,17 +79,29 @@ pub enum ProtocolEvent {
         manifest: BlockManifest,
     },
 
-    /// Received a committed block header from a remote shard (global broadcast).
-    ///
-    /// Used for the light-client provisions pattern: remote shards broadcast
-    /// committed headers so we can verify state roots via merkle inclusion proofs.
+    /// Received a committed block header from a remote shard whose QC
+    /// still needs to be checked. Produced by gossip and sync paths —
+    /// wire decode always lands the wrapper in `Verifiable::Unverified`.
     ///
     /// The `sender` field is the authenticated sender identity — `IoLoop`
     /// verified the sender's BLS signature before admitting this event.
-    RemoteHeaderReceived {
+    UnverifiedRemoteHeaderReceived {
         /// Header + QC bundle from the remote shard.
         certified_header: Arc<CertifiedBlockHeader>,
         /// Authenticated sender identity (BLS-verified by `IoLoop`).
+        sender: ValidatorId,
+    },
+
+    /// Received a committed block header whose composite predicate already
+    /// holds — produced only by the local-dispatch fast path when a
+    /// colocated proposer's broadcast carries `Verifiable::Verified`.
+    /// The recipient skips both the envelope BLS check and
+    /// `Action::VerifyRemoteHeaderQc`, admitting the header directly.
+    VerifiedRemoteHeaderReceived {
+        /// Header + QC bundle, sealed via
+        /// [`Verified::<CertifiedBlockHeader>::from_qc_attestation`].
+        certified_header: Arc<Verified<CertifiedBlockHeader>>,
+        /// Authenticated sender identity (the local proposer).
         sender: ValidatorId,
     },
 

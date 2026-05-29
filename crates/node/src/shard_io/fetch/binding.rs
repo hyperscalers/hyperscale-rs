@@ -256,7 +256,7 @@ impl FetchBinding for LocalProvisionBinding {
                             push_protocol_event(
                                 &es,
                                 local_shard,
-                                ProtocolEvent::RemoteHeaderReceived {
+                                ProtocolEvent::UnverifiedRemoteHeaderReceived {
                                     certified_header,
                                     sender: ValidatorId::new(u64::MAX),
                                 },

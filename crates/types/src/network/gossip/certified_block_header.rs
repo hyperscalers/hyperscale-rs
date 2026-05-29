@@ -7,7 +7,7 @@ use sbor::prelude::BasicSbor;
 use crate::network::{GossipMessage, TopicScope};
 use crate::{
     Bls12381G2Signature, CertifiedBlockHeader, MessageClass, NetworkDefinition, NetworkMessage,
-    ShardGroupId, Signed, ValidatorId, certified_block_header_message,
+    ShardGroupId, Signed, ValidatorId, Verifiable, certified_block_header_message,
 };
 
 /// Gossips a committed block header globally to all shards.
@@ -18,8 +18,10 @@ use crate::{
 /// for provisions.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct CertifiedBlockHeaderGossip {
-    /// The committed block header (header + QC).
-    pub certified_header: Arc<CertifiedBlockHeader>,
+    /// The committed block header (header + QC). Wire bytes always land
+    /// in [`Verifiable::Unverified`]; local-dispatched broadcasts from a
+    /// colocated proposer preserve [`Verifiable::Verified`].
+    pub certified_header: Arc<Verifiable<CertifiedBlockHeader>>,
     /// The validator who sent this gossip (should be the block proposer).
     pub sender: ValidatorId,
     /// BLS signature over the domain-separated signing message, by the sender.
@@ -123,7 +125,7 @@ mod tests {
         let qc = QuorumCertificate::genesis(ShardGroupId::new(0));
 
         let gossip = CertifiedBlockHeaderGossip {
-            certified_header: Arc::new(CertifiedBlockHeader::new(header, qc)),
+            certified_header: Arc::new(Verifiable::from(CertifiedBlockHeader::new(header, qc))),
             sender: ValidatorId::new(0),
             sender_signature: zero_bls_signature(),
         };

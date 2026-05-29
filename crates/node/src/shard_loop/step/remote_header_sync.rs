@@ -101,7 +101,7 @@ where
             delivered_heights.push(h);
             // The `sender` field carries no meaning for fetched headers —
             // a sentinel value avoids confusion with real validator ids.
-            self.dispatch_event(ProtocolEvent::RemoteHeaderReceived {
+            self.dispatch_event(ProtocolEvent::UnverifiedRemoteHeaderReceived {
                 certified_header: Arc::new(header),
                 sender: ValidatorId::new(u64::MAX),
             });

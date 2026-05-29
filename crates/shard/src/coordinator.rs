@@ -2700,10 +2700,12 @@ impl ShardCoordinator {
         // proposer is Byzantine/slow, the RemoteHeaderCoordinator will detect
         // the liveness timeout and trigger a fallback fetch.
         if proposer == topology_snapshot.local_validator_id() {
-            let certified_header = CertifiedBlockHeader::new(
+            // SAFETY: attestation source is the local `Verified<CertifiedBlock>`.
+            let certified_header = Verified::<CertifiedBlockHeader>::from_qc_attestation(
                 certified.block().header().clone(),
                 certified.qc_verified().clone(),
-            );
+            )
+            .expect("Verified<CertifiedBlock> binds qc.block_hash to header.hash");
             actions.push(Action::BroadcastCertifiedBlockHeader { certified_header });
         }
 

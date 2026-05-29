@@ -81,7 +81,7 @@ impl NodeStateMachine {
             ProtocolEvent::QuorumCertificateFormed { block_hash, qc } => {
                 self.on_qc_formed(block_hash, &qc)
             }
-            ProtocolEvent::RemoteHeaderReceived {
+            ProtocolEvent::UnverifiedRemoteHeaderReceived {
                 certified_header,
                 sender,
             } => {
@@ -94,6 +94,14 @@ impl NodeStateMachine {
                     certified_header,
                     sender,
                 )
+            }
+            ProtocolEvent::VerifiedRemoteHeaderReceived {
+                certified_header,
+                sender,
+            } => {
+                let topology = &self.topology_snapshot;
+                self.remote_headers_coordinator
+                    .on_verified_remote_header_received(topology, certified_header, sender)
             }
             ProtocolEvent::VerifiedBlockVoteReceived { vote } => self
                 .shard_coordinator

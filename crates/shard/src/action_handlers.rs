@@ -744,7 +744,9 @@ where
             );
             let sig = ctx.signing_key.sign_v1(&msg);
             let gossip = CertifiedBlockHeaderGossip {
-                certified_header: Arc::new(certified_header),
+                certified_header: Arc::new(Verifiable::<CertifiedBlockHeader>::from(
+                    certified_header,
+                )),
                 sender: ctx.topology_snapshot.local_validator_id(),
                 sender_signature: sig,
             };

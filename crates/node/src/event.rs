@@ -19,7 +19,7 @@ use hyperscale_core::{CommitSource, ProtocolEvent};
 use hyperscale_types::{
     BeaconWitnessCommit, BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, CertifiedBlock,
     CertifiedBlockHeader, ElidedCertifiedBlock, HeaderFetchCount, ProvisionHash,
-    RoutableTransaction, ShardGroupId, TxHash, ValidatorId, Verified, WaveId,
+    RoutableTransaction, ShardGroupId, TxHash, ValidatorId, Verifiable, Verified, WaveId,
 };
 
 use crate::shard_io::block_commit::QcOnlyDivergence;
@@ -256,12 +256,11 @@ pub enum ShardScopedInput {
     /// (sender committee check + public key resolution) but still needs
     /// batched BLS signature verification.
     CommittedBlockGossipReceived {
-        /// Header carried in the gossip envelope. `Arc`-shared so local
-        /// publishers and the BLS-verify batch all hold the same
-        /// allocation — `RemoteHeaderReceived` downstream takes
-        /// `Arc<CertifiedBlockHeader>` and the wire type's
-        /// `SborArc<CertifiedBlockHeader>` exposes the same inner.
-        certified_header: Arc<CertifiedBlockHeader>,
+        /// Header carried in the gossip envelope. Wrapped as `Verifiable`
+        /// so a colocated proposer's local-dispatched broadcast can ride
+        /// `Verifiable::Verified` through to the flush step, which then
+        /// fast-paths the verified arm past the sender-signature batch.
+        certified_header: Arc<Verifiable<CertifiedBlockHeader>>,
         /// Sender validator id.
         sender: ValidatorId,
         /// Sender's public key, resolved from topology.
@@ -332,7 +331,8 @@ impl ShardScopedInput {
                     EventPriority::Timer
                 }
                 ProtocolEvent::BlockHeaderReceived { .. }
-                | ProtocolEvent::RemoteHeaderReceived { .. }
+                | ProtocolEvent::VerifiedRemoteHeaderReceived { .. }
+                | ProtocolEvent::UnverifiedRemoteHeaderReceived { .. }
                 | ProtocolEvent::VerifiedBlockVoteReceived { .. }
                 | ProtocolEvent::UnverifiedBlockVoteReceived { .. }
                 | ProtocolEvent::VerifiedProvisionsReceived { .. }

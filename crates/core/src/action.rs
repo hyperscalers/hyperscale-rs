@@ -158,8 +158,11 @@ pub enum Action {
     /// this broadcasts the header + QC so remote shards can verify state roots.
     /// The `io_loop` signs on the consensus crypto pool before sending.
     BroadcastCertifiedBlockHeader {
-        /// Header + QC bundle to broadcast globally.
-        certified_header: CertifiedBlockHeader,
+        /// Header + QC bundle to broadcast globally. The proposer builds it
+        /// from its locally-verified [`Verified<CertifiedBlock>`], so the
+        /// predicate holds at the emit site; the gossip wrapper preserves
+        /// the marker across in-process local dispatch.
+        certified_header: Verified<CertifiedBlockHeader>,
     },
 
     // ═══════════════════════════════════════════════════════════════════════

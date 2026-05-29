@@ -154,6 +154,56 @@ impl RemoteHeaderCoordinator {
     // Public API: Header Ingestion
     // ═══════════════════════════════════════════════════════════════════════
 
+    /// Handle a committed block header that arrived already verified —
+    /// emitted by a colocated proposer through the local-dispatch fast
+    /// path (see [`ProtocolEvent::VerifiedRemoteHeaderReceived`]). Skips
+    /// the pending bookkeeping and the `Action::VerifyRemoteHeaderQc`
+    /// dispatch, promoting straight to the verified map and emitting
+    /// the same `RemoteHeaderAdmitted` continuation downstream consumers
+    /// already expect.
+    pub fn on_verified_remote_header_received(
+        &mut self,
+        topology: &TopologySnapshot,
+        certified_header: Arc<Verified<CertifiedBlockHeader>>,
+        sender: ValidatorId,
+    ) -> Vec<Action> {
+        let shard = certified_header.shard_group_id();
+        let height = certified_header.height();
+
+        if shard == topology.local_shard() {
+            return vec![];
+        }
+
+        let key = (shard, height);
+        if self.verified.contains_key(&key) {
+            return vec![];
+        }
+
+        debug!(
+            shard = shard.inner(),
+            height = height.inner(),
+            sender = sender.inner(),
+            state_root = %certified_header.state_root(),
+            "Admitting verified remote header (local-dispatch fast path)"
+        );
+
+        let header_ts = certified_header.qc().weighted_timestamp();
+        self.update_tip_and_prune(shard, height, header_ts);
+        self.verified.insert(key, Arc::clone(&certified_header));
+        self.pending.remove(&key);
+
+        if let Some(expected) = self.expected.get_mut(&shard)
+            && height > expected.last_verified_height
+        {
+            expected.last_verified_height = height;
+            expected.last_verified_at = Some(self.local_committed_ts);
+        }
+
+        vec![Action::Continuation(ProtocolEvent::RemoteHeaderAdmitted {
+            certified_header,
+        })]
+    }
+
     /// Handle a committed block header received from a remote shard (gossip or fetch).
     ///
     /// The sender's BLS signature was already verified by `IoLoop`.

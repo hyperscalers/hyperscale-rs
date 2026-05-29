@@ -20,7 +20,7 @@ use std::sync::Arc;
 use hyperscale_storage::{PendingChain, ShardStorage};
 use hyperscale_types::{
     Bls12381G1PublicKey, Bls12381G2Signature, CertifiedBlockHeader, LocalTimestamp,
-    RoutableTransaction, TxHash, ValidatorId,
+    RoutableTransaction, TxHash, ValidatorId, Verifiable,
 };
 
 use crate::batch_accumulator::BatchAccumulator;
@@ -32,8 +32,14 @@ use crate::shard_io::sync::SyncHost;
 
 /// A committed header pending sender-signature verification, queued in
 /// `ShardIo::certified_header_batch` and drained on the crypto pool.
+///
+/// The wrapper carries verification state across the in-process gossip
+/// boundary — wire arrivals land as `Verifiable::Unverified` per SBOR
+/// rules, local-dispatched arrivals from a colocated proposer ride as
+/// `Verifiable::Verified` so the flush step can fast-path them past the
+/// sender-signature batch.
 pub type CertifiedHeaderVerificationItem = (
-    Arc<CertifiedBlockHeader>,
+    Arc<Verifiable<CertifiedBlockHeader>>,
     ValidatorId,
     Bls12381G1PublicKey,
     Bls12381G2Signature,

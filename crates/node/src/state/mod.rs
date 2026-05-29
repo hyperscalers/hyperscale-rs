@@ -221,7 +221,8 @@ impl StateMachine for NodeStateMachine {
             // ── Shard Consensus ────────────────────────────────────────────
             evt @ (ProtocolEvent::BlockHeaderReceived { .. }
             | ProtocolEvent::QuorumCertificateFormed { .. }
-            | ProtocolEvent::RemoteHeaderReceived { .. }
+            | ProtocolEvent::VerifiedRemoteHeaderReceived { .. }
+            | ProtocolEvent::UnverifiedRemoteHeaderReceived { .. }
             | ProtocolEvent::VerifiedBlockVoteReceived { .. }
             | ProtocolEvent::UnverifiedBlockVoteReceived { .. }
             | ProtocolEvent::BlockReadyToCommit { .. }
