@@ -378,12 +378,12 @@ where
 
             // ── Committed header (gossip → BLS verify → state machine) ──
             ShardScopedInput::CommittedBlockGossipReceived {
-                committed_header,
+                certified_header,
                 sender,
                 public_key,
                 sender_signature,
             } => self.handle_committed_block_gossip_received(
-                committed_header,
+                certified_header,
                 sender,
                 public_key,
                 sender_signature,
@@ -476,8 +476,8 @@ where
         if self.io.validation_batch.is_expired(now) {
             self.flush_validation_batch();
         }
-        if self.io.committed_header_batch.is_expired(now) {
-            self.flush_committed_header_verifications();
+        if self.io.certified_header_batch.is_expired(now) {
+            self.flush_certified_header_verifications();
         }
         let expired_dsts: Vec<ShardGroupId> = self
             .outbound_gossip_batches
@@ -494,7 +494,7 @@ where
     pub fn flush_all_batches(&mut self) {
         self.flush_block_commits();
         self.flush_validation_batch();
-        self.flush_committed_header_verifications();
+        self.flush_certified_header_verifications();
         let dsts: Vec<ShardGroupId> = self.outbound_gossip_batches.keys().copied().collect();
         for dst in dsts {
             self.flush_tx_gossip_batch(dst);
@@ -508,7 +508,7 @@ where
     pub fn nearest_batch_deadline(&self) -> Option<LocalTimestamp> {
         [
             self.io.validation_batch.deadline(),
-            self.io.committed_header_batch.deadline(),
+            self.io.certified_header_batch.deadline(),
         ]
         .into_iter()
         .chain(

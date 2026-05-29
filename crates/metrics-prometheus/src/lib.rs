@@ -1447,8 +1447,8 @@ impl MetricsRecorder for PrometheusRecorder {
             .set(m.node_validation_batch as f64);
         self.metrics
             .memory_node
-            .with_label_values(&["committed_header_batch"])
-            .set(m.node_committed_header_batch as f64);
+            .with_label_values(&["certified_header_batch"])
+            .set(m.node_certified_header_batch as f64);
         self.metrics
             .memory_node
             .with_label_values(&["sync_queued_heights"])

@@ -1345,7 +1345,7 @@ mod tests {
 
     use hyperscale_types::{
         BeaconBlock, BeaconBlockHash, BeaconGenesisConfig, Bls12381G1PrivateKey,
-        Bls12381G1PublicKey, CommittedBlockHeader, Epoch, GenesisConfigHash, GenesisPool,
+        Bls12381G1PublicKey, CertifiedBlockHeader, Epoch, GenesisConfigHash, GenesisPool,
         GenesisValidator, NetworkDefinition, PcVector, Randomness, ShardGroupId, ShardWitness,
         SpcCert, SpcView, Stake, StakePoolId, ValidatorId, bls_keypair_from_seed,
         genesis_config_hash, pc_context, spc_context,
@@ -2302,7 +2302,7 @@ mod tests {
         height: u64,
         leaf_index: u64,
         total_leaves: u64,
-    ) -> (Arc<ShardWitness>, CommittedBlockHeader) {
+    ) -> (Arc<ShardWitness>, CertifiedBlockHeader) {
         use hyperscale_types::{
             BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight,
             CertificateRoot, Hash, InFlightCount, LeafIndex, LocalReceiptRoot, ProposerTimestamp,
@@ -2356,7 +2356,7 @@ mod tests {
             zero_bls_signature(),
             WeightedTimestamp::from_millis(1_000),
         );
-        let committed_header = CommittedBlockHeader::new(header, qc);
+        let certified_header = CertifiedBlockHeader::new(header, qc);
 
         let proof = ShardWitnessProof {
             shard_id: shard,
@@ -2365,7 +2365,7 @@ mod tests {
             siblings: siblings.into(),
         };
         let witness = Arc::new(ShardWitness { payload, proof });
-        (witness, committed_header)
+        (witness, certified_header)
     }
 
     #[test]

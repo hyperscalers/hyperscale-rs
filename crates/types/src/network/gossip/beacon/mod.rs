@@ -8,7 +8,7 @@
 //! [`network::notification::beacon`](crate::network::notification::beacon).
 //! Shard witnesses don't gossip individually; their accumulator root
 //! rides in each shard's
-//! [`CommittedBlockHeader`](crate::CommittedBlockHeader), and beacon
+//! [`CertifiedBlockHeader`](crate::CertifiedBlockHeader), and beacon
 //! validators fetch witness contents on demand via request/response.
 
 mod beacon_block;

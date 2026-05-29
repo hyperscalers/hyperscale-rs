@@ -284,7 +284,7 @@ impl BlockHeader {
     ///
     /// "In-flight" = committed + executed transactions in the proposer's mempool,
     /// i.e. transactions actively holding state locks. Gossiped cross-shard via
-    /// `CommittedBlockHeaderGossip` so RPC nodes can reject transactions targeting
+    /// `CertifiedBlockHeaderGossip` so RPC nodes can reject transactions targeting
     /// congested remote shards.
     ///
     /// shard-verified within tolerance (validators may differ slightly due to

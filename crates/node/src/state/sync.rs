@@ -51,7 +51,7 @@ mod tests {
     use hyperscale_test_helpers::make_live_block;
     use hyperscale_types::{
         BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight,
-        CommittedBlockHeader, LocalTimestamp, QuorumCertificate, ShardGroupId, ValidatorId,
+        CertifiedBlockHeader, LocalTimestamp, QuorumCertificate, ShardGroupId, ValidatorId,
         Verified, WaveId,
     };
 
@@ -104,14 +104,14 @@ mod tests {
                 BeaconWitnessLeafCount::ZERO,
             );
         }
-        let committed_header =
-            Arc::new(Verified::new_unchecked_for_test(CommittedBlockHeader::new(
+        let certified_header =
+            Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
                 block.header().clone(),
                 QuorumCertificate::genesis(ShardGroupId::new(0)),
             )));
         let _ = node.handle(
             LocalTimestamp::ZERO,
-            ProtocolEvent::RemoteHeaderAdmitted { committed_header },
+            ProtocolEvent::RemoteHeaderAdmitted { certified_header },
         );
 
         // Now trigger sync-complete. The provisions flush must surface

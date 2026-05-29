@@ -7,7 +7,7 @@
 //!    already verified the sender's committee membership and resolved the
 //!    public key. The header is queued in a batch accumulator for amortized
 //!    BLS verification.
-//! 2. `flush_committed_header_verifications` — fires when the batch fills
+//! 2. `flush_certified_header_verifications` — fires when the batch fills
 //!    or its window expires. Spawns one closure on the crypto pool that
 //!    verifies each sender's BLS signature. Valid headers are emitted
 //!    directly as `ProtocolEvent::RemoteHeaderReceived` for the state
@@ -20,13 +20,13 @@ use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_metrics::record_signature_verification_latency;
 use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
-use hyperscale_types::network::gossip::CommittedBlockHeaderGossip;
+use hyperscale_types::network::gossip::CertifiedBlockHeaderGossip;
 use hyperscale_types::{
-    Bls12381G1PublicKey, Bls12381G2Signature, CommittedBlockHeader, Signed, SignedContext,
+    Bls12381G1PublicKey, Bls12381G2Signature, CertifiedBlockHeader, Signed, SignedContext,
     ValidatorId,
 };
 
-use crate::shard_io::CommittedHeaderVerificationItem;
+use crate::shard_io::CertifiedHeaderVerificationItem;
 use crate::shard_loop::{ShardLoop, push_protocol_event};
 
 impl<S, N, D> ShardLoop<S, N, D>
@@ -37,19 +37,19 @@ where
 {
     /// Inbound handler closure already verified sender's committee
     /// membership and resolved the public key. Queue for batched BLS
-    /// verification; fires `flush_committed_header_verifications` when full.
+    /// verification; fires `flush_certified_header_verifications` when full.
     pub(in crate::shard_loop) fn handle_committed_block_gossip_received(
         &mut self,
-        committed_header: Arc<CommittedBlockHeader>,
+        certified_header: Arc<CertifiedBlockHeader>,
         sender: ValidatorId,
         public_key: Bls12381G1PublicKey,
         sender_signature: Bls12381G2Signature,
     ) {
-        let item: CommittedHeaderVerificationItem =
-            (committed_header, sender, public_key, sender_signature);
+        let item: CertifiedHeaderVerificationItem =
+            (certified_header, sender, public_key, sender_signature);
         let now = self.now;
-        if self.io.committed_header_batch.push(item, now) {
-            self.flush_committed_header_verifications();
+        if self.io.certified_header_batch.push(item, now) {
+            self.flush_certified_header_verifications();
         }
     }
 
@@ -59,8 +59,8 @@ where
     /// BLS signature. Valid headers are emitted directly as
     /// `ProtocolEvent::RemoteHeaderReceived` for state-machine ingestion;
     /// invalid items are warn-dropped (byzantine peer; no cleanup needed).
-    pub(crate) fn flush_committed_header_verifications(&mut self) {
-        let items = self.io.committed_header_batch.take();
+    pub(crate) fn flush_certified_header_verifications(&mut self) {
+        let items = self.io.certified_header_batch.take();
         if items.is_empty() {
             return;
         }
@@ -72,9 +72,9 @@ where
             .dispatch
             .spawn(DispatchPool::Throughput, move || {
                 let topo = topology.load();
-                for (committed_header, sender, public_key, sender_signature) in items {
-                    let gossip = CommittedBlockHeaderGossip {
-                        committed_header,
+                for (certified_header, sender, public_key, sender_signature) in items {
+                    let gossip = CertifiedBlockHeaderGossip {
+                        certified_header,
                         sender,
                         sender_signature,
                     };
@@ -86,7 +86,7 @@ where
                         })
                         .is_ok();
                     record_signature_verification_latency(
-                        "committed_header",
+                        "certified_header",
                         start.elapsed().as_secs_f64(),
                     );
                     if valid {
@@ -94,14 +94,14 @@ where
                             &event_tx,
                             shard,
                             ProtocolEvent::RemoteHeaderReceived {
-                                committed_header: gossip.committed_header,
+                                certified_header: gossip.certified_header,
                                 sender: gossip.sender,
                             },
                         );
                     } else {
                         tracing::warn!(
                             sender = gossip.sender.inner(),
-                            height = gossip.committed_header.header().height().inner(),
+                            height = gossip.certified_header.header().height().inner(),
                             "Committed header sender signature verification failed"
                         );
                     }

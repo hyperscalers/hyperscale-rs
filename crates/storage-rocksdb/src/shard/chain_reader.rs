@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use hyperscale_storage::{BlockForSync, ShardChainReader};
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BlockHash, BlockHeight, CertifiedBlock, CommittedBlockHeader,
+    BeaconWitnessLeafCount, BlockHash, BlockHeight, CertifiedBlock, CertifiedBlockHeader,
     ConsensusReceipt, ExecutionCertificate, QuorumCertificate, RoutableTransaction,
     ShardWitnessPayload, TxHash, WaveCertificate, WaveId,
 };
@@ -18,10 +18,10 @@ impl ShardChainReader for RocksDbShardStorage {
         self.get_block_denormalized(height)
     }
 
-    fn get_committed_header(&self, height: BlockHeight) -> Option<CommittedBlockHeader> {
+    fn get_certified_header(&self, height: BlockHeight) -> Option<CertifiedBlockHeader> {
         let metadata = self.get_block_metadata(height)?;
         let (header, _, qc, _) = metadata.into_parts();
-        Some(CommittedBlockHeader::new(header, qc))
+        Some(CertifiedBlockHeader::new(header, qc))
     }
 
     fn committed_height(&self) -> BlockHeight {

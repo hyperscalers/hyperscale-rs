@@ -82,7 +82,7 @@ impl NodeStateMachine {
                 self.on_qc_formed(block_hash, &qc)
             }
             ProtocolEvent::RemoteHeaderReceived {
-                committed_header,
+                certified_header,
                 sender,
             } => {
                 // Route through the centralized remote header coordinator.
@@ -91,7 +91,7 @@ impl NodeStateMachine {
                 let topology = &self.topology_snapshot;
                 self.remote_headers_coordinator.on_remote_header_received(
                     topology,
-                    committed_header,
+                    certified_header,
                     sender,
                 )
             }
@@ -136,22 +136,22 @@ impl NodeStateMachine {
                     sender,
                     *result,
                 ),
-            ProtocolEvent::RemoteHeaderAdmitted { committed_header } => {
+            ProtocolEvent::RemoteHeaderAdmitted { certified_header } => {
                 // Fan out the verified header to downstream consumers. Shard consensus
                 // already received the header in `RemoteHeaderQcVerified`
                 // (early insertion for deferral proof validation).
                 let topology = &self.topology_snapshot;
-                let shard = committed_header.shard_group_id();
+                let shard = certified_header.shard_group_id();
 
                 self.execution_coordinator.on_verified_remote_header(
                     topology,
                     shard,
-                    committed_header.header().height(),
-                    committed_header.header().waves(),
+                    certified_header.header().height(),
+                    certified_header.header().waves(),
                 );
 
                 self.provisions_coordinator
-                    .on_verified_remote_header(topology, &committed_header)
+                    .on_verified_remote_header(topology, &certified_header)
             }
             ProtocolEvent::TransactionRootVerified { block_hash, result } => self
                 .shard_coordinator
@@ -403,7 +403,7 @@ mod tests {
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
         BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHeader, BlockHeight, BlockManifest,
-        CertifiedBlock, CommittedBlockHeader, Hash, LocalTimestamp, MerkleInclusionProof,
+        CertifiedBlock, CertifiedBlockHeader, Hash, LocalTimestamp, MerkleInclusionProof,
         ProvisionEntry, Provisions, QuorumCertificate, RETENTION_HORIZON, Round, ShardGroupId,
         TransactionStatus, TxHash, ValidatorId, Verified, WaveId,
     };
@@ -455,8 +455,8 @@ mod tests {
                 BeaconWitnessLeafCount::ZERO,
             );
         }
-        let committed_header =
-            Arc::new(Verified::new_unchecked_for_test(CommittedBlockHeader::new(
+        let certified_header =
+            Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
                 block.header().clone(),
                 QuorumCertificate::genesis(ShardGroupId::new(0)),
             )));
@@ -469,7 +469,7 @@ mod tests {
 
         let _ = node.handle(
             LocalTimestamp::ZERO,
-            ProtocolEvent::RemoteHeaderAdmitted { committed_header },
+            ProtocolEvent::RemoteHeaderAdmitted { certified_header },
         );
 
         assert_eq!(

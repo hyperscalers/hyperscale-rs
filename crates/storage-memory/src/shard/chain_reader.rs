@@ -6,7 +6,7 @@ use hyperscale_storage::lock_recover::read_or_recover;
 use hyperscale_storage::{BlockForSync, ShardChainReader};
 use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockManifest, CertifiedBlock,
-    CommittedBlockHeader, ConsensusReceipt, ExecutionCertificate, QuorumCertificate,
+    CertifiedBlockHeader, ConsensusReceipt, ExecutionCertificate, QuorumCertificate,
     RoutableTransaction, ShardWitnessPayload, TxHash, WaveCertificate, WaveId,
 };
 
@@ -20,12 +20,12 @@ impl ShardChainReader for SimShardStorage {
             .cloned()
     }
 
-    fn get_committed_header(&self, height: BlockHeight) -> Option<CommittedBlockHeader> {
+    fn get_certified_header(&self, height: BlockHeight) -> Option<CertifiedBlockHeader> {
         read_or_recover(&self.consensus)
             .blocks
             .get(&height)
             .map(|certified| {
-                CommittedBlockHeader::new(
+                CertifiedBlockHeader::new(
                     certified.block().header().clone(),
                     certified.qc().clone(),
                 )

@@ -14,7 +14,7 @@ use sbor::prelude::*;
 use thiserror::Error;
 
 use crate::{
-    BlockHeight, BoundedVec, CommittedBlockHeader, Hash, MAX_TXS_PER_BLOCK, MerkleInclusionProof,
+    BlockHeight, BoundedVec, CertifiedBlockHeader, Hash, MAX_TXS_PER_BLOCK, MerkleInclusionProof,
     NodeId, ProvisionEntry, ProvisionHash, RETENTION_HORIZON, ShardGroupId, SubstateEntry, TxHash,
     Verified, Verify, WeightedTimestamp,
 };
@@ -28,7 +28,7 @@ use crate::{
 /// multiple `Provisions`, each with its own merkle proof scoped to that
 /// shard's slice of entries.
 ///
-/// The QC and `state_root` are obtained from `CommittedBlockHeader` received
+/// The QC and `state_root` are obtained from `CertifiedBlockHeader` received
 /// via gossip — they don't travel with the provisions.
 ///
 /// The content hash is computed lazily on first call to [`Self::hash`] and
@@ -247,7 +247,7 @@ pub struct ProvisionsContext<'a> {
     /// The committed source-block header whose `state_root` the merkle
     /// proof must validate against. Carrying the verified marker means
     /// the QC over the source header has already cleared.
-    pub committed_header: &'a Verified<CommittedBlockHeader>,
+    pub certified_header: &'a Verified<CertifiedBlockHeader>,
 }
 
 /// Failure modes of [`Provisions`] verification.
@@ -261,7 +261,7 @@ pub enum ProvisionsVerifyError {
     #[error("empty merkle proof with non-empty entry set")]
     EmptyProofWithEntries,
     /// The decoded multiproof did not validate against
-    /// `ctx.committed_header.state_root()` for the bundle's claimed
+    /// `ctx.certified_header.state_root()` for the bundle's claimed
     /// entries.
     #[error("merkle inclusion verification failed against committed state root")]
     BadInclusion,
@@ -269,7 +269,7 @@ pub enum ProvisionsVerifyError {
 
 /// Construction asserts: the aggregated merkle multiproof in
 /// `provisions.proof()` validates every entry under
-/// `ctx.committed_header.state_root()`.
+/// `ctx.certified_header.state_root()`.
 ///
 /// Construction goes through one of three gates:
 ///
@@ -310,7 +310,7 @@ impl Verify<&ProvisionsContext<'_>> for Provisions {
             })
             .collect();
 
-        let root_bytes: [u8; 32] = *ctx.committed_header.state_root().as_raw().as_bytes();
+        let root_bytes: [u8; 32] = *ctx.certified_header.state_root().as_raw().as_bytes();
         <Tree<Blake3Hasher, 1>>::verify(&multi_proof, root_bytes, &expected)
             .map_err(|_| ProvisionsVerifyError::BadInclusion)?;
 
@@ -508,10 +508,10 @@ mod tests {
             (state_root, MerkleInclusionProof::new(proof.encode()))
         }
 
-        fn header_with_state_root(state_root: StateRoot) -> Verified<CommittedBlockHeader> {
+        fn header_with_state_root(state_root: StateRoot) -> Verified<CertifiedBlockHeader> {
             let shard = ShardGroupId::new(0);
             let header = BlockHeader::genesis(shard, ValidatorId::new(0), state_root);
-            Verified::<CommittedBlockHeader>::new_unchecked_for_test(CommittedBlockHeader::new(
+            Verified::<CertifiedBlockHeader>::new_unchecked_for_test(CertifiedBlockHeader::new(
                 header,
                 Verified::<QuorumCertificate>::genesis(shard),
             ))
@@ -551,7 +551,7 @@ mod tests {
             let verified_header = header_with_state_root(state_root);
             let provisions = provisions_with(proof, items);
             let ctx = ProvisionsContext {
-                committed_header: &verified_header,
+                certified_header: &verified_header,
             };
             provisions
                 .verify(&ctx)
@@ -572,7 +572,7 @@ mod tests {
             let provisions = provisions_with(tampered, items);
 
             let ctx = ProvisionsContext {
-                committed_header: &verified_header,
+                certified_header: &verified_header,
             };
             let err = provisions
                 .verify(&ctx)
@@ -598,7 +598,7 @@ mod tests {
                 vec![],
             );
             let ctx = ProvisionsContext {
-                committed_header: &verified_header,
+                certified_header: &verified_header,
             };
             provisions
                 .verify(&ctx)
@@ -611,7 +611,7 @@ mod tests {
             let verified_header = header_with_state_root(state_root);
             let provisions = provisions_with(MerkleInclusionProof::new(vec![]), vec![entry(1)]);
             let ctx = ProvisionsContext {
-                committed_header: &verified_header,
+                certified_header: &verified_header,
             };
             assert_eq!(
                 provisions.verify(&ctx),

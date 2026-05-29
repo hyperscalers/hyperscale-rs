@@ -10,19 +10,19 @@ use hyperscale_core::{Action, ActionContext, PreparedBlock, ProtocolEvent};
 use hyperscale_metrics::record_signature_verification_latency;
 use hyperscale_network::Network;
 use hyperscale_storage::{JmtSnapshot, ShardChainWriter, ShardStorage};
-use hyperscale_types::network::gossip::CommittedBlockHeaderGossip;
+use hyperscale_types::network::gossip::CertifiedBlockHeaderGossip;
 use hyperscale_types::network::notification::{BlockHeaderNotification, BlockVoteNotification};
 use hyperscale_types::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, BeaconWitnessRootContext, Block, BlockHash,
     BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PublicKey, CertificateRoot,
-    CertificateRootContext, CommittedBlockHeader, CommittedHeaderVerifyError, ConsensusReceipt,
+    CertificateRootContext, CertifiedBlockHeader, CertifiedHeaderVerifyError, ConsensusReceipt,
     FinalizedWave, Hash, InFlightCount, LocalReceiptRoot, LocalReceiptRootContext,
     NetworkDefinition, PreparedCommit, ProposerTimestamp, ProvisionHash, ProvisionTxRootsContext,
     ProvisionTxRootsMap, Provisions, ProvisionsRoot, ProvisionsRootContext, QcContext,
     QuorumCertificate, ReadySignal, Round, RoutableTransaction, ShardGroupId, StateRoot,
     StateRootContext, StoredReceipt, TopologySnapshot, TransactionRoot, TransactionRootContext,
     ValidatorId, Verifiable, Verified, Verify, VotePower, WeightedTimestamp, block_header_message,
-    block_vote_message, committed_block_header_message, compute_waves,
+    block_vote_message, certified_block_header_message, compute_waves,
 };
 
 /// Result of QC verification and assembly.
@@ -376,7 +376,7 @@ where
         }
 
         Action::VerifyRemoteHeaderQc {
-            committed_header,
+            certified_header,
             sender,
             committee_public_keys,
             committee_voting_power,
@@ -396,13 +396,13 @@ where
             // voting; this node skips local per-root verification because
             // the QC's BFT majority attests on its behalf.
             let result = Box::new(
-                committed_header
+                certified_header
                     .qc()
                     .verify(&qc_ctx)
-                    .map_err(CommittedHeaderVerifyError::from)
+                    .map_err(CertifiedHeaderVerifyError::from)
                     .and_then(|verified_qc| {
-                        Verified::<CommittedBlockHeader>::from_qc_attestation(
-                            committed_header.header().clone(),
+                        Verified::<CertifiedBlockHeader>::from_qc_attestation(
+                            certified_header.header().clone(),
                             verified_qc,
                         )
                     }),
@@ -735,16 +735,16 @@ where
             ctx.notify_protocol(ProtocolEvent::VerifiedBlockVoteReceived { vote: verified });
         }
 
-        Action::BroadcastCommittedBlockHeader { committed_header } => {
-            let msg = committed_block_header_message(
+        Action::BroadcastCertifiedBlockHeader { certified_header } => {
+            let msg = certified_block_header_message(
                 ctx.topology_snapshot.network(),
-                committed_header.header().shard_group_id(),
-                committed_header.header().height(),
-                &committed_header.header().hash(),
+                certified_header.header().shard_group_id(),
+                certified_header.header().height(),
+                &certified_header.header().hash(),
             );
             let sig = ctx.signing_key.sign_v1(&msg);
-            let gossip = CommittedBlockHeaderGossip {
-                committed_header: Arc::new(committed_header),
+            let gossip = CertifiedBlockHeaderGossip {
+                certified_header: Arc::new(certified_header),
                 sender: ctx.topology_snapshot.local_validator_id(),
                 sender_signature: sig,
             };

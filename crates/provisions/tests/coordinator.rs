@@ -11,7 +11,7 @@ use hyperscale_provisions::{ProvisionConfig, ProvisionCoordinator, ProvisionMemo
 use hyperscale_test_helpers::TestCommittee;
 use hyperscale_types::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight,
-    BoundedVec, CertificateRoot, CertifiedBlock, CommittedBlockHeader, Hash, InFlightCount,
+    BoundedVec, CertificateRoot, CertifiedBlock, CertifiedBlockHeader, Hash, InFlightCount,
     LocalReceiptRoot, LocalTimestamp, ProposerTimestamp, ProvisionHash, ProvisionsRoot,
     QuorumCertificate, Round, ShardGroupId, SignerBitfield, StateRoot, TopologySnapshot,
     TransactionRoot, ValidatorId, Verified, WaveId, WeightedTimestamp, zero_bls_signature,
@@ -78,7 +78,7 @@ fn make_remote_header_targeting(
     source_shard: ShardGroupId,
     height: BlockHeight,
     local_shard: ShardGroupId,
-) -> Arc<Verified<CommittedBlockHeader>> {
+) -> Arc<Verified<CertifiedBlockHeader>> {
     let waves = vec![WaveId::new(
         source_shard,
         height,
@@ -115,7 +115,7 @@ fn make_remote_header_targeting(
         zero_bls_signature(),
         WeightedTimestamp::ZERO,
     );
-    Arc::new(Verified::new_unchecked_for_test(CommittedBlockHeader::new(
+    Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
         header, qc,
     )))
 }

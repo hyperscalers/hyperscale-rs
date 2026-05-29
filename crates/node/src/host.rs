@@ -181,9 +181,9 @@ where
                     b.tx_validation_max,
                     b.tx_validation_window,
                 ),
-                committed_header_batch: BatchAccumulator::new(
-                    b.committed_header_max,
-                    b.committed_header_window,
+                certified_header_batch: BatchAccumulator::new(
+                    b.certified_header_max,
+                    b.certified_header_window,
                 ),
                 tx_phase_times: TxPhaseTimesCache::default(),
                 last_slow_tx_warn: LocalTimestamp::ZERO,

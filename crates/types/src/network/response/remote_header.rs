@@ -2,7 +2,7 @@
 
 use sbor::prelude::BasicSbor;
 
-use crate::{CommittedBlockHeader, MessageClass, NetworkMessage};
+use crate::{CertifiedBlockHeader, MessageClass, NetworkMessage};
 
 /// Response to a [`crate::network::request::GetRemoteHeadersRequest`].
 ///
@@ -15,7 +15,7 @@ use crate::{CommittedBlockHeader, MessageClass, NetworkMessage};
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct GetRemoteHeadersResponse {
     /// Consecutive committed headers in ascending height order.
-    pub headers: Vec<CommittedBlockHeader>,
+    pub headers: Vec<CertifiedBlockHeader>,
 }
 
 impl NetworkMessage for GetRemoteHeadersResponse {

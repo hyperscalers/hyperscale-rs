@@ -7,7 +7,7 @@
 //! It is the consumer-side staging area; the responder-side serve path
 //! (answering peers' `GetRemoteHeadersRequest`s for headers from this
 //! node's own committed chain) lives in `crates/node` and reads through
-//! `PendingChain::committed_header` — those are plain local-chain reads,
+//! `PendingChain::certified_header` — those are plain local-chain reads,
 //! not remote headers.
 //!
 //! ## Why a dedicated crate?

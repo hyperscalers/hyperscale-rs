@@ -77,11 +77,11 @@ where
     match action {
         Action::VerifyProvisions {
             provisions,
-            committed_header,
+            certified_header,
         } => {
             let merkle_start = Instant::now();
             let ctx_verify = ProvisionsContext {
-                committed_header: &committed_header,
+                certified_header: &certified_header,
             };
             let result = match provisions.verify(&ctx_verify) {
                 Ok(verified) => Ok(Arc::new(verified)),
@@ -89,8 +89,8 @@ where
                     warn!(
                         source_shard = provisions.source_shard().inner(),
                         block_height = provisions.block_height().inner(),
-                        header_height = committed_header.height().inner(),
-                        header_state_root = ?committed_header.state_root(),
+                        header_height = certified_header.height().inner(),
+                        header_state_root = ?certified_header.state_root(),
                         proof_len = provisions.proof().as_bytes().len(),
                         error = ?err,
                         "Provision merkle proof verification failed"
@@ -104,7 +104,7 @@ where
             );
             ctx.notify_protocol(ProtocolEvent::StateProvisionsVerified {
                 result,
-                committed_header,
+                certified_header,
             });
         }
         Action::FetchAndBroadcastProvisions {

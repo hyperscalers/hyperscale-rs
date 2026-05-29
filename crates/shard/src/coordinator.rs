@@ -83,7 +83,7 @@ use hyperscale_storage::RecoveredState;
 use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessRoot, BeaconWitnessRootVerifyError, Block, BlockHeader,
     BlockHeight, BlockManifest, BlockVote, CertRootVerifyError, CertificateRoot, CertifiedBlock,
-    CommittedBlockHeader, FinalizedWave, LocalReceiptRoot, LocalReceiptRootVerifyError,
+    CertifiedBlockHeader, FinalizedWave, LocalReceiptRoot, LocalReceiptRootVerifyError,
     ProvisionRootVerifyError, ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions,
     ProvisionsRoot, QcVerifyError, QuorumCertificate, Round, RoutableTransaction, StateRoot,
     StateRootVerifyError, TopologySnapshot, TransactionRoot, TxHash, TxRootVerifyError, Verifiable,
@@ -2700,11 +2700,11 @@ impl ShardCoordinator {
         // proposer is Byzantine/slow, the RemoteHeaderCoordinator will detect
         // the liveness timeout and trigger a fallback fetch.
         if proposer == topology_snapshot.local_validator_id() {
-            let committed_header = CommittedBlockHeader::new(
+            let certified_header = CertifiedBlockHeader::new(
                 certified.block().header().clone(),
                 certified.qc_verified().clone(),
             );
-            actions.push(Action::BroadcastCommittedBlockHeader { committed_header });
+            actions.push(Action::BroadcastCertifiedBlockHeader { certified_header });
         }
 
         Some(height)

@@ -218,7 +218,7 @@ impl From<BeaconWitnessEvent> for ShardWitnessPayload {
 ///
 /// Verifying:
 /// 1. Look up the shard's committed block at `committed_block_hash`
-///    (delivered via the existing `CommittedBlockHeaderGossip` path)
+///    (delivered via the existing `CertifiedBlockHeaderGossip` path)
 ///    and read its [`BeaconWitnessRoot`](crate::BeaconWitnessRoot).
 /// 2. Hash the witness payload to obtain the leaf.
 /// 3. Walk `siblings` from leaf to root using `leaf_index`'s bit

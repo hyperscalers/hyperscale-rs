@@ -10,7 +10,7 @@ use std::sync::Arc;
 use hyperscale_types::{
     BeaconProposal, BeaconWitnessRoot, BeaconWitnessRootVerifyError, Block, BlockHash, BlockHeader,
     BlockHeight, BlockManifest, BlockVote, CertRootVerifyError, CertificateRoot,
-    CertifiedBeaconBlock, CertifiedBlock, CommittedBlockHeader, CommittedHeaderVerifyError, Epoch,
+    CertifiedBeaconBlock, CertifiedBlock, CertifiedBlockHeader, CertifiedHeaderVerifyError, Epoch,
     ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote, FinalizedWave,
     FinalizedWaveVerifyError, LocalReceiptRoot, LocalReceiptRootVerifyError, PcQc3, PcVector,
     PcVoteMessage, ProvisionRootVerifyError, ProvisionTxRootsMap, ProvisionTxRootsVerifyError,
@@ -88,7 +88,7 @@ pub enum ProtocolEvent {
     /// verified the sender's BLS signature before admitting this event.
     RemoteHeaderReceived {
         /// Header + QC bundle from the remote shard.
-        committed_header: Arc<CommittedBlockHeader>,
+        certified_header: Arc<CertifiedBlockHeader>,
         /// Authenticated sender identity (BLS-verified by `IoLoop`).
         sender: ValidatorId,
     },
@@ -209,10 +209,10 @@ pub enum ProtocolEvent {
         /// Verified composite on success (full predicate: QC verified +
         /// linkage check, BFT-transitive header trust via the source
         /// committee — see
-        /// [`Verified::<CommittedBlockHeader>::from_qc_attestation`]).
+        /// [`Verified::<CertifiedBlockHeader>::from_qc_attestation`]).
         /// QC-level signature/quorum failure or QC↔header linkage
         /// mismatch on error.
-        result: Box<Result<Verified<CommittedBlockHeader>, CommittedHeaderVerifyError>>,
+        result: Box<Result<Verified<CertifiedBlockHeader>, CertifiedHeaderVerifyError>>,
     },
 
     /// A remote committed block header has been fully verified (QC + structural checks).
@@ -222,8 +222,8 @@ pub enum ProtocolEvent {
     /// source of verified remote headers.
     RemoteHeaderAdmitted {
         /// The fully-verified committed header — predicate established by
-        /// [`Verified::<CommittedBlockHeader>::from_qc_attestation`].
-        committed_header: Arc<Verified<CommittedBlockHeader>>,
+        /// [`Verified::<CertifiedBlockHeader>::from_qc_attestation`].
+        certified_header: Arc<Verified<CertifiedBlockHeader>>,
     },
 
     /// Transaction-root verification completed for a pending block.
@@ -333,7 +333,7 @@ pub enum ProtocolEvent {
     /// Batch-level provision verification completed.
     ///
     /// The QC was verified upstream as part of promoting the source
-    /// header to [`Verified<CommittedBlockHeader>`]; merkle proofs are
+    /// header to [`Verified<CertifiedBlockHeader>`]; merkle proofs are
     /// checked against the verified state root. The committed header is
     /// returned so the state machine can promote it without re-lookup.
     StateProvisionsVerified {
@@ -342,7 +342,7 @@ pub enum ProtocolEvent {
         result: Result<Arc<Verified<Provisions>>, (Arc<Provisions>, ProvisionsVerifyError)>,
         /// The committed header whose `state_root` the merkle proof was
         /// checked against.
-        committed_header: Arc<Verified<CommittedBlockHeader>>,
+        certified_header: Arc<Verified<CertifiedBlockHeader>>,
     },
 
     /// A provisions has been verified — ready for downstream consumption.

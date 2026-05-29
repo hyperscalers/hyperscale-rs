@@ -18,7 +18,7 @@ use std::sync::Arc;
 use hyperscale_core::{CommitSource, ProtocolEvent};
 use hyperscale_types::{
     BeaconWitnessCommit, BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, CertifiedBlock,
-    CommittedBlockHeader, ElidedCertifiedBlock, HeaderFetchCount, ProvisionHash,
+    CertifiedBlockHeader, ElidedCertifiedBlock, HeaderFetchCount, ProvisionHash,
     RoutableTransaction, ShardGroupId, TxHash, ValidatorId, Verified, WaveId,
 };
 
@@ -203,7 +203,7 @@ pub enum ShardScopedInput {
         /// Number of heights the request covered.
         count: HeaderFetchCount,
         /// Headers the responder returned.
-        headers: Vec<CommittedBlockHeader>,
+        headers: Vec<CertifiedBlockHeader>,
     },
 
     /// Remote-header range fetch failed (transport error / no peer).
@@ -259,9 +259,9 @@ pub enum ShardScopedInput {
         /// Header carried in the gossip envelope. `Arc`-shared so local
         /// publishers and the BLS-verify batch all hold the same
         /// allocation — `RemoteHeaderReceived` downstream takes
-        /// `Arc<CommittedBlockHeader>` and the wire type's
-        /// `SborArc<CommittedBlockHeader>` exposes the same inner.
-        committed_header: Arc<CommittedBlockHeader>,
+        /// `Arc<CertifiedBlockHeader>` and the wire type's
+        /// `SborArc<CertifiedBlockHeader>` exposes the same inner.
+        certified_header: Arc<CertifiedBlockHeader>,
         /// Sender validator id.
         sender: ValidatorId,
         /// Sender's public key, resolved from topology.

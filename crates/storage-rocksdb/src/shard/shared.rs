@@ -19,7 +19,7 @@ use hyperscale_storage::{
 };
 use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, BlockHash, BlockHeight, CertifiedBlock,
-    CommittedBlockHeader, ConsensusReceipt, ExecutionCertificate, FinalizedWave,
+    CertifiedBlockHeader, ConsensusReceipt, ExecutionCertificate, FinalizedWave,
     MerkleInclusionProof, NodeId, PreparedCommit, QuorumCertificate, RoutableTransaction,
     ShardWitnessPayload, StateRoot, TxHash, Verifiable, Verified, WaveCertificate, WaveId,
 };
@@ -177,8 +177,8 @@ impl ShardChainReader for SharedStorage {
         self.0.get_block(height)
     }
 
-    fn get_committed_header(&self, height: BlockHeight) -> Option<CommittedBlockHeader> {
-        ShardChainReader::get_committed_header(&*self.0, height)
+    fn get_certified_header(&self, height: BlockHeight) -> Option<CertifiedBlockHeader> {
+        ShardChainReader::get_certified_header(&*self.0, height)
     }
 
     fn committed_height(&self) -> BlockHeight {

@@ -252,12 +252,12 @@ impl FetchBinding for LocalProvisionBinding {
                     // first. The header is QC-self-authenticating; sender is
                     // the fetched-header sentinel (no peer attestation).
                     for entry in split.kept {
-                        if let Some(committed_header) = entry.source_header {
+                        if let Some(certified_header) = entry.source_header {
                             push_protocol_event(
                                 &es,
                                 local_shard,
                                 ProtocolEvent::RemoteHeaderReceived {
-                                    committed_header,
+                                    certified_header,
                                     sender: ValidatorId::new(u64::MAX),
                                 },
                             );

@@ -20,10 +20,10 @@ impl NodeStateMachine {
             }
             ProtocolEvent::StateProvisionsVerified {
                 result,
-                committed_header,
+                certified_header,
             } => self.provisions_coordinator.on_state_provisions_verified(
                 result,
-                &committed_header,
+                &certified_header,
                 self.now,
             ),
             ProtocolEvent::ProvisionsAdmitted { provisions, .. } => {

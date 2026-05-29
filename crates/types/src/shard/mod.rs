@@ -3,7 +3,7 @@
 //! - [`header`]: [`BlockHeader`] (shard-voted metadata).
 //! - [`block`]: [`Block`] (the Live/Sealed enum).
 //! - [`manifest`]: hash-level [`BlockManifest`] and denormalized [`BlockMetadata`].
-//! - [`committed_header`]: [`CommittedBlockHeader`] cross-shard trust attestation.
+//! - [`certified_header`]: [`CertifiedBlockHeader`] cross-shard trust attestation.
 //! - [`certified`]: [`CertifiedBlock`] pairing of a block with its certifying QC.
 //! - [`vote`]: [`BlockVote`] shard consensus vote.
 //! - [`roots`]: per-block merkle root helpers used by [`BlockHeader`] consumers.
@@ -17,7 +17,7 @@
 #[allow(clippy::module_inception)]
 mod block;
 pub mod certified;
-pub mod committed_header;
+pub mod certified_header;
 pub mod header;
 pub mod inventory;
 pub mod limits;

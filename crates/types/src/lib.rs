@@ -100,7 +100,7 @@ pub use sbor_codec::{
     BoundedBTreeMap, BoundedBTreeSet, BoundedBytes, BoundedLengthError, BoundedString, BoundedVec,
 };
 pub use shard::certified::{CertifiedBlock, CertifiedBlockHashMismatch, LinkageError};
-pub use shard::committed_header::{CommittedBlockHeader, CommittedHeaderVerifyError};
+pub use shard::certified_header::{CertifiedBlockHeader, CertifiedHeaderVerifyError};
 pub use shard::header::{BlockHeader, BlockHeaderParentQcMismatch, BlockHeaderVerifyError};
 pub use shard::inventory::{ElidedCertifiedBlock, Inventory, RehydrateError, RehydrationMiss};
 pub use shard::limits::{
@@ -127,7 +127,7 @@ pub use signing::{
     DOMAIN_PC_VOTE2, DOMAIN_PC_VOTE2_LENGTH, DOMAIN_PC_VOTE3, DOMAIN_PC_VRF, DOMAIN_READY_SIGNAL,
     DOMAIN_SKIP_REQUEST, DOMAIN_STATE_PROVISION_BATCH, DOMAIN_VALIDATOR_BIND, PcContext,
     SpcContext, VALIDATOR_BIND_NONCE_LEN, block_header_message, block_vote_message,
-    committed_block_header_message, exec_cert_batch_message, exec_vote_batch_message,
+    certified_block_header_message, exec_cert_batch_message, exec_vote_batch_message,
     exec_vote_message, pc_context, pc_vote_signing_message, ready_signal_message,
     skip_request_message, spc_context, state_provisions_message, validator_bind_message,
     vrf_output_from_proof, vrf_reveal_message, vrf_sign, vrf_verify,

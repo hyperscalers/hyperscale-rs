@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use hyperscale_storage::{PendingChain, ShardStorage};
 use hyperscale_types::{
-    Bls12381G1PublicKey, Bls12381G2Signature, CommittedBlockHeader, LocalTimestamp,
+    Bls12381G1PublicKey, Bls12381G2Signature, CertifiedBlockHeader, LocalTimestamp,
     RoutableTransaction, TxHash, ValidatorId,
 };
 
@@ -31,9 +31,9 @@ use crate::shard_io::phase_times::TxPhaseTimesCache;
 use crate::shard_io::sync::SyncHost;
 
 /// A committed header pending sender-signature verification, queued in
-/// `ShardIo::committed_header_batch` and drained on the crypto pool.
-pub type CommittedHeaderVerificationItem = (
-    Arc<CommittedBlockHeader>,
+/// `ShardIo::certified_header_batch` and drained on the crypto pool.
+pub type CertifiedHeaderVerificationItem = (
+    Arc<CertifiedBlockHeader>,
     ValidatorId,
     Bls12381G1PublicKey,
     Bls12381G2Signature,
@@ -99,7 +99,7 @@ pub struct ShardIo<S: ShardStorage> {
 
     /// Pending remote-committed-header gossip awaiting batched BLS
     /// sender-signature verification on the crypto pool.
-    pub committed_header_batch: BatchAccumulator<CommittedHeaderVerificationItem>,
+    pub certified_header_batch: BatchAccumulator<CertifiedHeaderVerificationItem>,
 
     /// Per-tx phase-time stamps for the slow-tx finalization log.
     /// Populated from `EmitTransactionStatus` and `RecordTxEcCreated`

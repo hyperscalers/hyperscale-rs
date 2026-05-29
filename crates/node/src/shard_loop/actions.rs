@@ -76,7 +76,7 @@ where
             | Action::FetchAndBroadcastProvisions { .. }
             | Action::BroadcastBlockHeader { .. }
             | Action::SignAndBroadcastBlockVote { .. }
-            | Action::BroadcastCommittedBlockHeader { .. }
+            | Action::BroadcastCertifiedBlockHeader { .. }
             | Action::SignAndSendExecutionVote { .. }
             | Action::BroadcastExecutionCertificate { .. }
             | Action::SignAndBroadcastPcVote1 { .. }
@@ -212,10 +212,10 @@ where
         // Tell the remote-header-sync FSM about admitted headers so it can
         // advance per-shard `committed` and emit `SyncComplete` once the
         // chain catches up. Drives any newly-emitted range fetches inline.
-        if let ProtocolEvent::RemoteHeaderAdmitted { committed_header } = &pe {
+        if let ProtocolEvent::RemoteHeaderAdmitted { certified_header } = &pe {
             let outputs = self.io.syncs.on_remote_header_admitted(
-                committed_header.shard_group_id(),
-                committed_header.header().height(),
+                certified_header.shard_group_id(),
+                certified_header.header().height(),
             );
             self.process_remote_header_sync_outputs(outputs);
         }

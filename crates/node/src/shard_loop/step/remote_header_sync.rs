@@ -18,7 +18,7 @@ use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::request::GetRemoteHeadersRequest;
 use hyperscale_types::network::response::GetRemoteHeadersResponse;
 use hyperscale_types::{
-    BlockHeight, CommittedBlockHeader, HeaderFetchCount, ShardGroupId, ValidatorId,
+    BlockHeight, CertifiedBlockHeader, HeaderFetchCount, ShardGroupId, ValidatorId,
 };
 
 use crate::shard_io::sync::SyncOutput;
@@ -65,7 +65,7 @@ where
         source_shard: ShardGroupId,
         from_height: BlockHeight,
         count: HeaderFetchCount,
-        headers: Vec<CommittedBlockHeader>,
+        headers: Vec<CertifiedBlockHeader>,
     ) {
         // Filter to in-range, in-shard deliveries; deliver each to the
         // existing verification path and collect the heights for the FSM.
@@ -102,7 +102,7 @@ where
             // The `sender` field carries no meaning for fetched headers —
             // a sentinel value avoids confusion with real validator ids.
             self.dispatch_event(ProtocolEvent::RemoteHeaderReceived {
-                committed_header: Arc::new(header),
+                certified_header: Arc::new(header),
                 sender: ValidatorId::new(u64::MAX),
             });
         }

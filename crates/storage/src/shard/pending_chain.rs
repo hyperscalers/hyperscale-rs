@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use hyperscale_jmt::{Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, BlockHash, BlockHeight, CertifiedBlock,
-    CommittedBlockHeader, ConsensusReceipt, ExecutionCertificate, FinalizedWave,
+    CertifiedBlockHeader, ConsensusReceipt, ExecutionCertificate, FinalizedWave,
     MerkleInclusionProof, NodeId, PreparedCommit, QuorumCertificate, RoutableTransaction,
     ShardWitnessPayload, StateRoot, TxHash, Verifiable, Verified, WaveCertificate, WaveId,
 };
@@ -145,7 +145,7 @@ where
 
     /// Attach the [`CertifiedBlock`] to the entry inserted earlier at
     /// JMT-prep time, making the block readable through
-    /// [`Self::certified_block`] / [`Self::committed_header`] /
+    /// [`Self::certified_block`] / [`Self::certified_header`] /
     /// [`Self::transactions_for_block`] while persistence is still
     /// catching up.
     ///
@@ -186,14 +186,14 @@ where
 
     /// Committed header at `height`. Header-only view of
     /// [`Self::certified_block`] — pending entry first, base store fallback.
-    pub fn committed_header(&self, height: BlockHeight) -> Option<Arc<CommittedBlockHeader>> {
+    pub fn certified_header(&self, height: BlockHeight) -> Option<Arc<CertifiedBlockHeader>> {
         if let Some(certified) = self.pending_certified_at(height) {
-            return Some(Arc::new(CommittedBlockHeader::new(
+            return Some(Arc::new(CertifiedBlockHeader::new(
                 certified.block().header().clone(),
                 certified.qc().clone(),
             )));
         }
-        self.base.get_committed_header(height).map(Arc::new)
+        self.base.get_certified_header(height).map(Arc::new)
     }
 
     /// Transactions in the block at `height`. Pending entry first, base
@@ -833,7 +833,7 @@ mod tests {
     use std::sync::PoisonError;
 
     use hyperscale_types::{
-        CertifiedBlock, CommittedBlockHeader, ExecutionCertificate, GlobalReceiptHash, Hash,
+        CertifiedBlock, CertifiedBlockHeader, ExecutionCertificate, GlobalReceiptHash, Hash,
         RoutableTransaction, TxHash, WaveCertificate, WaveId,
     };
     use indexmap::IndexMap;
@@ -947,10 +947,10 @@ mod tests {
         fn get_block(&self, height: BlockHeight) -> Option<CertifiedBlock> {
             self.blocks.get(&height).cloned()
         }
-        fn get_committed_header(&self, height: BlockHeight) -> Option<CommittedBlockHeader> {
+        fn get_certified_header(&self, height: BlockHeight) -> Option<CertifiedBlockHeader> {
             self.blocks
                 .get(&height)
-                .map(|c| CommittedBlockHeader::new(c.block().header().clone(), c.qc().clone()))
+                .map(|c| CertifiedBlockHeader::new(c.block().header().clone(), c.qc().clone()))
         }
         fn committed_height(&self) -> BlockHeight {
             BlockHeight::new(0)
@@ -1312,22 +1312,22 @@ mod tests {
     }
 
     #[test]
-    fn committed_header_pending_persisted_and_missing() {
+    fn certified_header_pending_persisted_and_missing() {
         let persisted = make_certified(BlockHeight::new(2));
         let chain = chain_with_persisted(vec![persisted.as_ref().as_ref().clone()]);
         let pending = insert_pending(&chain, BlockHeight::new(7), true);
 
         let p = chain
-            .committed_header(BlockHeight::new(7))
+            .certified_header(BlockHeight::new(7))
             .expect("pending header");
         assert_eq!(p.block_hash(), pending.block().hash());
 
         let s = chain
-            .committed_header(BlockHeight::new(2))
+            .certified_header(BlockHeight::new(2))
             .expect("persisted header");
         assert_eq!(s.block_hash(), persisted.block().hash());
 
-        assert!(chain.committed_header(BlockHeight::new(42)).is_none());
+        assert!(chain.certified_header(BlockHeight::new(42)).is_none());
     }
 
     #[test]

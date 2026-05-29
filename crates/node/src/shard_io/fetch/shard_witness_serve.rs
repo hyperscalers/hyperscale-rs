@@ -24,7 +24,7 @@ use tracing::{debug, warn};
 /// Lookup proceeds as:
 ///
 /// 1. Resolve the committed header at `req.block_height` through
-///    [`PendingChain::committed_header`]. The pending-chain layer spans
+///    [`PendingChain::certified_header`]. The pending-chain layer spans
 ///    both the shard-committed-but-unpersisted window and durable
 ///    storage, so a peer fetching against a freshly committed block
 ///    sees the same view a peer fetching against a long-persisted
@@ -52,14 +52,14 @@ pub fn serve_shard_witnesses_request<S: ShardStorage>(
     pending_chain: &PendingChain<S>,
     req: &GetShardWitnessesRequest,
 ) -> GetShardWitnessesResponse {
-    let Some(committed_header) = pending_chain.committed_header(req.block_height) else {
+    let Some(certified_header) = pending_chain.certified_header(req.block_height) else {
         debug!(
             block_height = req.block_height.inner(),
             "Shard-witness request: block not found"
         );
         return GetShardWitnessesResponse::empty();
     };
-    let header = committed_header.header();
+    let header = certified_header.header();
     if header.hash() != req.committed_block_hash {
         warn!(
             block_height = req.block_height.inner(),

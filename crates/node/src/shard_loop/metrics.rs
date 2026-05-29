@@ -356,7 +356,7 @@ where
             node_locally_submitted: self.shard_io(primary_shard).locally_submitted.len(),
             node_pending_block_commits: self.shard_io(primary_shard).block_commit.pending_len(),
             node_validation_batch: self.shard_io(primary_shard).validation_batch.len(),
-            node_committed_header_batch: self.shard_io(primary_shard).committed_header_batch.len(),
+            node_certified_header_batch: self.shard_io(primary_shard).certified_header_batch.len(),
             node_block_sync_queued_heights: block_sync_status.queued_heights,
             node_block_sync_in_flight_fetches: block_sync_status.pending_fetches,
             node_tx_fetch_blocks: fetches.transaction_pending,

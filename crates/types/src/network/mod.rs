@@ -31,7 +31,7 @@
 //! 3. **`CrossShardProgress`** — Execution and finalization across shards.
 //!    Delay stalls cross-shard execution but local consensus continues
 //!    (`Provisions`, `ExecutionVotes`, `ExecutionCertificates`,
-//!    `CommittedBlockHeader` gossip).
+//!    `CertifiedBlockHeader` gossip).
 //!
 //! 4. **Recovery** — Catch-up traffic. Steady-state volume is zero
 //!    (`GetBlock`, `GetSync`, `GetRemoteHeader`).
@@ -85,7 +85,7 @@ pub enum MessageClass {
     /// Execution and finalization coordination across shards.
     ///
     /// Includes:
-    /// - `CommittedBlockHeader` gossip — proposer broadcast on commit
+    /// - `CertifiedBlockHeader` gossip — proposer broadcast on commit
     /// - `ProvisionsNotification` — cross-shard state delivery
     /// - `ExecutionVotesNotification` — execution votes
     /// - `ExecutionCertificatesNotification` — execution certificates

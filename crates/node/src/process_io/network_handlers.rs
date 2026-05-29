@@ -5,7 +5,7 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
-use hyperscale_types::network::gossip::{CommittedBlockHeaderGossip, TransactionGossip};
+use hyperscale_types::network::gossip::{CertifiedBlockHeaderGossip, TransactionGossip};
 use hyperscale_types::network::notification::{
     BlockHeaderNotification, BlockVoteNotification, ExecutionCertificatesNotification,
     ExecutionVotesNotification, ProvisionsNotification, ReadySignalNotification,
@@ -294,7 +294,7 @@ where
                         for h in &req.batch_hashes {
                             if let Some(provisions) = provision_store.get(*h) {
                                 // The buffer holds Verified handles; the wire
-                                // form takes raw `Arc<CommittedBlockHeader>`,
+                                // form takes raw `Arc<CertifiedBlockHeader>`,
                                 // so materialize the inner header for ship.
                                 let source_header = verified_headers
                                     .get((provisions.source_shard(), provisions.block_height()))
@@ -400,8 +400,8 @@ where
         let topology = self.process.topology_snapshot.clone();
         self.process
             .network
-            .register_gossip_handler::<CommittedBlockHeaderGossip>(
-                move |gossip: CommittedBlockHeaderGossip,
+            .register_gossip_handler::<CertifiedBlockHeaderGossip>(
+                move |gossip: CertifiedBlockHeaderGossip,
                       target_shard: ShardGroupId|
                       -> GossipVerdict {
                     let Some(tx) = senders.get(&target_shard) else {
@@ -412,7 +412,7 @@ where
                         return GossipVerdict::Reject;
                     };
                     let sender = gossip.sender;
-                    let header_shard = gossip.committed_header.header().shard_group_id();
+                    let header_shard = gossip.certified_header.header().shard_group_id();
                     let topo = topology.load();
 
                     let Some(public_key) =
@@ -425,7 +425,7 @@ where
                         tx,
                         target_shard,
                         ShardScopedInput::CommittedBlockGossipReceived {
-                            committed_header: gossip.committed_header,
+                            certified_header: gossip.certified_header,
                             sender,
                             public_key,
                             sender_signature: gossip.sender_signature,

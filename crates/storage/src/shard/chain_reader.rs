@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use hyperscale_types::{
-    BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, CertifiedBlock, CommittedBlockHeader,
+    BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, CertifiedBlock, CertifiedBlockHeader,
     ConsensusReceipt, ExecutionCertificate, ProvisionHash, QuorumCertificate, RoutableTransaction,
     ShardWitnessPayload, TxHash, WaveCertificate, WaveId,
 };
@@ -45,7 +45,7 @@ pub trait ShardChainReader: Send + Sync + 'static {
     /// Lighter than [`Self::get_block`]: skips the per-tx and per-cert
     /// fan-out reads needed to rehydrate a full block. Used by the
     /// remote-header fallback serve path, which never needs the body.
-    fn get_committed_header(&self, height: BlockHeight) -> Option<CommittedBlockHeader>;
+    fn get_certified_header(&self, height: BlockHeight) -> Option<CertifiedBlockHeader>;
 
     /// Get the highest committed block height.
     fn committed_height(&self) -> BlockHeight;

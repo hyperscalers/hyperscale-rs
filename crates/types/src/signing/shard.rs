@@ -79,7 +79,7 @@ pub fn block_header_message(
 /// This is used for verifying the sender's signature on globally broadcast
 /// committed block headers before admitting them to the state machine.
 #[must_use]
-pub fn committed_block_header_message(
+pub fn certified_block_header_message(
     network: &NetworkDefinition,
     shard_group_id: ShardGroupId,
     height: BlockHeight,
@@ -116,12 +116,12 @@ mod tests {
     }
 
     #[test]
-    fn test_committed_block_header_message_deterministic() {
+    fn test_certified_block_header_message_deterministic() {
         let shard = ShardGroupId::new(1);
         let block = BlockHash::from_raw(Hash::from_bytes(b"test_block"));
 
-        let msg1 = committed_block_header_message(&net(), shard, BlockHeight::new(10), &block);
-        let msg2 = committed_block_header_message(&net(), shard, BlockHeight::new(10), &block);
+        let msg1 = certified_block_header_message(&net(), shard, BlockHeight::new(10), &block);
+        let msg2 = certified_block_header_message(&net(), shard, BlockHeight::new(10), &block);
 
         assert_eq!(msg1, msg2);
         assert!(msg1.starts_with(DOMAIN_COMMITTED_BLOCK_HEADER));

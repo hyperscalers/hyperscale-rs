@@ -5,8 +5,8 @@
 
 pub mod beacon;
 
-mod committed_block_header;
+mod certified_block_header;
 mod transaction;
 
-pub use committed_block_header::CommittedBlockHeaderGossip;
+pub use certified_block_header::CertifiedBlockHeaderGossip;
 pub use transaction::TransactionGossip;

@@ -46,7 +46,7 @@ pub fn serve_remote_headers_request<S: ShardStorage>(
 
     for offset in 0..bounded_count.inner() {
         let height = BlockHeight::new(req.from_height.inner().saturating_add(offset));
-        let Some(header) = pending_chain.committed_header(height) else {
+        let Some(header) = pending_chain.certified_header(height) else {
             break;
         };
         headers.push((*header).clone());

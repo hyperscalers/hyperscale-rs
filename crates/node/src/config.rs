@@ -50,9 +50,9 @@ pub struct BatchConfig {
     pub tx_validation_window: Duration,
 
     /// Max items in the committed-block-header sender-signature batch.
-    pub committed_header_max: usize,
+    pub certified_header_max: usize,
     /// Flush window for the committed-block-header sender-signature batch.
-    pub committed_header_window: Duration,
+    pub certified_header_window: Duration,
 
     /// Max transactions in a per-shard outbound `TransactionGossip` batch.
     /// Bounded so the encoded batch stays well under the gossipsub
@@ -80,8 +80,8 @@ impl Default for BatchConfig {
             tx_validation_max: 512,
             tx_validation_window: Duration::from_millis(50),
 
-            committed_header_max: 32,
-            committed_header_window: Duration::from_millis(15),
+            certified_header_max: 32,
+            certified_header_window: Duration::from_millis(15),
 
             tx_gossip_max: 200,
             tx_gossip_window: Duration::from_millis(50),

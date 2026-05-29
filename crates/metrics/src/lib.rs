@@ -180,7 +180,7 @@ pub struct MemoryMetrics {
     /// Transactions queued in the validation batch.
     pub node_validation_batch: usize,
     /// Committed headers queued in the verification batch.
-    pub node_committed_header_batch: usize,
+    pub node_certified_header_batch: usize,
     /// Block heights queued for sync fetch.
     pub node_block_sync_queued_heights: usize,
     /// In-flight sync fetches.

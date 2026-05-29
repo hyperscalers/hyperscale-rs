@@ -1,4 +1,4 @@
-//! `CommittedBlockHeader` gossip message for cross-shard header broadcast.
+//! `CertifiedBlockHeader` gossip message for cross-shard header broadcast.
 
 use std::sync::Arc;
 
@@ -6,8 +6,8 @@ use sbor::prelude::BasicSbor;
 
 use crate::network::{GossipMessage, TopicScope};
 use crate::{
-    Bls12381G2Signature, CommittedBlockHeader, MessageClass, NetworkDefinition, NetworkMessage,
-    ShardGroupId, Signed, ValidatorId, committed_block_header_message,
+    Bls12381G2Signature, CertifiedBlockHeader, MessageClass, NetworkDefinition, NetworkMessage,
+    ShardGroupId, Signed, ValidatorId, certified_block_header_message,
 };
 
 /// Gossips a committed block header globally to all shards.
@@ -17,16 +17,16 @@ use crate::{
 /// shards can verify state roots and validate merkle inclusion proofs
 /// for provisions.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
-pub struct CommittedBlockHeaderGossip {
+pub struct CertifiedBlockHeaderGossip {
     /// The committed block header (header + QC).
-    pub committed_header: Arc<CommittedBlockHeader>,
+    pub certified_header: Arc<CertifiedBlockHeader>,
     /// The validator who sent this gossip (should be the block proposer).
     pub sender: ValidatorId,
     /// BLS signature over the domain-separated signing message, by the sender.
     pub sender_signature: Bls12381G2Signature,
 }
 
-impl Signed for CommittedBlockHeaderGossip {
+impl Signed for CertifiedBlockHeaderGossip {
     fn signer(&self) -> ValidatorId {
         self.sender
     }
@@ -36,16 +36,16 @@ impl Signed for CommittedBlockHeaderGossip {
     }
 
     fn signing_message(&self, network: &NetworkDefinition) -> Vec<u8> {
-        committed_block_header_message(
+        certified_block_header_message(
             network,
-            self.committed_header.header().shard_group_id(),
-            self.committed_header.header().height(),
-            &self.committed_header.header().hash(),
+            self.certified_header.header().shard_group_id(),
+            self.certified_header.header().height(),
+            &self.certified_header.header().hash(),
         )
     }
 }
 
-impl NetworkMessage for CommittedBlockHeaderGossip {
+impl NetworkMessage for CertifiedBlockHeaderGossip {
     fn message_type_id() -> &'static str {
         "block.committed"
     }
@@ -55,11 +55,11 @@ impl NetworkMessage for CommittedBlockHeaderGossip {
     }
 }
 
-impl GossipMessage for CommittedBlockHeaderGossip {
+impl GossipMessage for CertifiedBlockHeaderGossip {
     const SCOPE: TopicScope = TopicScope::Global;
 
     fn source_shard(&self) -> Option<ShardGroupId> {
-        Some(self.committed_header.header().shard_group_id())
+        Some(self.certified_header.header().shard_group_id())
     }
 
     fn dedup_key(&self) -> Option<u64> {
@@ -70,7 +70,7 @@ impl GossipMessage for CommittedBlockHeaderGossip {
         // so every committee member's copy of the same logical header
         // collapses to a single key.
         let mut hasher = DefaultHasher::new();
-        self.committed_header.header().hash().hash(&mut hasher);
+        self.certified_header.header().hash().hash(&mut hasher);
         Some(hasher.finish())
     }
 }
@@ -87,7 +87,7 @@ mod tests {
     #[test]
     fn test_message_type_id() {
         assert_eq!(
-            CommittedBlockHeaderGossip::message_type_id(),
+            CertifiedBlockHeaderGossip::message_type_id(),
             "block.committed"
         );
     }
@@ -122,14 +122,14 @@ mod tests {
         );
         let qc = QuorumCertificate::genesis(ShardGroupId::new(0));
 
-        let gossip = CommittedBlockHeaderGossip {
-            committed_header: Arc::new(CommittedBlockHeader::new(header, qc)),
+        let gossip = CertifiedBlockHeaderGossip {
+            certified_header: Arc::new(CertifiedBlockHeader::new(header, qc)),
             sender: ValidatorId::new(0),
             sender_signature: zero_bls_signature(),
         };
 
         let encoded = basic_encode(&gossip).unwrap();
-        let decoded: CommittedBlockHeaderGossip = basic_decode(&encoded).unwrap();
+        let decoded: CertifiedBlockHeaderGossip = basic_decode(&encoded).unwrap();
         assert_eq!(gossip, decoded);
     }
 }

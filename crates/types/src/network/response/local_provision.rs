@@ -5,7 +5,7 @@ use std::sync::Arc;
 use sbor::prelude::BasicSbor;
 
 use crate::{
-    BoundedVec, CommittedBlockHeader, MAX_PROVISIONS_PER_BLOCK, MessageClass, NetworkMessage,
+    BoundedVec, CertifiedBlockHeader, MAX_PROVISIONS_PER_BLOCK, MessageClass, NetworkMessage,
     Provisions,
 };
 
@@ -31,7 +31,7 @@ pub struct LocalProvisionEntry {
     pub provisions: Arc<Provisions>,
     /// The source-shard committed header at `provisions.block_height()`,
     /// if the responder still has it.
-    pub source_header: Option<Arc<CommittedBlockHeader>>,
+    pub source_header: Option<Arc<CertifiedBlockHeader>>,
 }
 
 /// Response to a local provisions fetch request.
@@ -113,7 +113,7 @@ mod tests {
     fn entry_with_bundled_header_roundtrips() {
         use crate::{
             BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight,
-            CertificateRoot, CommittedBlockHeader, Hash, InFlightCount, LocalReceiptRoot,
+            CertificateRoot, CertifiedBlockHeader, Hash, InFlightCount, LocalReceiptRoot,
             MerkleInclusionProof, ProposerTimestamp, ProvisionEntry, ProvisionsRoot,
             QuorumCertificate, Round, ShardGroupId, SignerBitfield, StateRoot, TransactionRoot,
             TxHash, ValidatorId, WeightedTimestamp, zero_bls_signature,
@@ -165,7 +165,7 @@ mod tests {
             zero_bls_signature(),
             WeightedTimestamp::ZERO,
         );
-        let source_header = Arc::new(CommittedBlockHeader::new(header, qc));
+        let source_header = Arc::new(CertifiedBlockHeader::new(header, qc));
 
         let original = GetLocalProvisionsResponse::new(vec![LocalProvisionEntry {
             provisions: Arc::clone(&provisions),

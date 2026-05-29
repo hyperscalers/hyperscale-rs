@@ -1,10 +1,10 @@
-//! `CommittedBlockHeader` — block header paired with the QC that committed it.
+//! `CertifiedBlockHeader` — block header paired with the QC that committed it.
 //!
-//! [`CommittedBlockHeader`] is the raw wire form. Its verified form is
-//! `Verified<CommittedBlockHeader>` — produced either by local-assembly
-//! ([`impl Verified<CommittedBlockHeader>::assemble`] — requires a
+//! [`CertifiedBlockHeader`] is the raw wire form. Its verified form is
+//! `Verified<CertifiedBlockHeader>` — produced either by local-assembly
+//! ([`impl Verified<CertifiedBlockHeader>::assemble`] — requires a
 //! locally-verified header) or by BFT-transitive trust
-//! ([`impl Verified<CommittedBlockHeader>::from_qc_attestation`] — the
+//! ([`impl Verified<CertifiedBlockHeader>::from_qc_attestation`] — the
 //! light-client trust path for remote-shard headers).
 
 use sbor::prelude::*;
@@ -15,13 +15,13 @@ use crate::{
     Verifiable, Verified,
 };
 
-/// Failure modes of [`CommittedBlockHeader`] verification.
+/// Failure modes of [`CertifiedBlockHeader`] verification.
 ///
 /// Combines QC-level failures with the linkage check that ties the QC to
 /// its paired header. Variants surface through the
 /// `RemoteHeaderQcVerified` event payload.
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
-pub enum CommittedHeaderVerifyError {
+pub enum CertifiedHeaderVerifyError {
     /// The QC failed its own verification predicate.
     #[error("QC verification failed: {0}")]
     Qc(#[from] QcVerifyError),
@@ -33,18 +33,18 @@ pub enum CommittedHeaderVerifyError {
 
 /// A block header paired with the QC that committed it.
 ///
-/// This is the minimal cross-shard trust attestation: given a `CommittedBlockHeader`,
+/// This is the minimal cross-shard trust attestation: given a `CertifiedBlockHeader`,
 /// a remote shard can verify the QC against the source shard's validator public keys
 /// (from topology), confirm the `block_hash` matches `hash(header)`, and then trust
 /// the `state_root` in the header for merkle inclusion proof verification.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
-pub struct CommittedBlockHeader {
+pub struct CertifiedBlockHeader {
     header: BlockHeader,
     qc: Verifiable<QuorumCertificate>,
 }
 
-impl CommittedBlockHeader {
-    /// Create a new committed block header.
+impl CertifiedBlockHeader {
+    /// Create a new certified block header.
     #[must_use]
     pub fn new(header: BlockHeader, qc: impl Into<Verifiable<QuorumCertificate>>) -> Self {
         Self {
@@ -97,7 +97,7 @@ impl CommittedBlockHeader {
     }
 }
 
-impl Verified<CommittedBlockHeader> {
+impl Verified<CertifiedBlockHeader> {
     /// Composite assembly. Pairs a `Verified<BlockHeader>` with a
     /// `Verified<QuorumCertificate>` after confirming the QC's
     /// `block_hash` matches `header.hash()`.
@@ -112,17 +112,17 @@ impl Verified<CommittedBlockHeader> {
     ///
     /// # Errors
     ///
-    /// Returns [`CommittedHeaderVerifyError::LinkageMismatch`] when
+    /// Returns [`CertifiedHeaderVerifyError::LinkageMismatch`] when
     /// `qc.block_hash() != header.hash()`.
     pub fn assemble(
         header: Verified<BlockHeader>,
         qc: Verified<QuorumCertificate>,
-    ) -> Result<Self, CommittedHeaderVerifyError> {
+    ) -> Result<Self, CertifiedHeaderVerifyError> {
         if qc.block_hash() != header.as_ref().hash() {
-            return Err(CommittedHeaderVerifyError::LinkageMismatch);
+            return Err(CertifiedHeaderVerifyError::LinkageMismatch);
         }
         let header = header.into_inner();
-        Ok(Self::new_unchecked(CommittedBlockHeader {
+        Ok(Self::new_unchecked(CertifiedBlockHeader {
             header,
             qc: qc.into(),
         }))
@@ -132,7 +132,7 @@ impl Verified<CommittedBlockHeader> {
     /// QC's signers to have validated the header at their committee. The
     /// light-client construction gate: receivers of cross-shard committed
     /// headers don't re-run the source committee's per-root verifiers, so
-    /// the `Verified<CommittedBlockHeader>` predicate's "header verified"
+    /// the `Verified<CertifiedBlockHeader>` predicate's "header verified"
     /// claim rests on the BFT property of the supplied QC rather than a
     /// local `Verified<BlockHeader>` witness.
     ///
@@ -155,16 +155,16 @@ impl Verified<CommittedBlockHeader> {
     ///
     /// # Errors
     ///
-    /// Returns [`CommittedHeaderVerifyError::LinkageMismatch`] when
+    /// Returns [`CertifiedHeaderVerifyError::LinkageMismatch`] when
     /// `qc.block_hash() != header.hash()`.
     pub fn from_qc_attestation(
         header: BlockHeader,
         qc: Verified<QuorumCertificate>,
-    ) -> Result<Self, CommittedHeaderVerifyError> {
+    ) -> Result<Self, CertifiedHeaderVerifyError> {
         if qc.block_hash() != header.hash() {
-            return Err(CommittedHeaderVerifyError::LinkageMismatch);
+            return Err(CertifiedHeaderVerifyError::LinkageMismatch);
         }
-        Ok(Self::new_unchecked(CommittedBlockHeader {
+        Ok(Self::new_unchecked(CertifiedBlockHeader {
             header,
             qc: qc.into(),
         }))

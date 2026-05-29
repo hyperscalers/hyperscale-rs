@@ -8,7 +8,7 @@ use hyperscale_dispatch::DispatchPool;
 use hyperscale_types::{
     BeaconState, BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash,
     BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PublicKey, CertificateRoot,
-    CertifiedBeaconBlock, CertifiedBlock, CommittedBlockHeader, Epoch, ExecutionCertificate,
+    CertifiedBeaconBlock, CertifiedBlock, CertifiedBlockHeader, Epoch, ExecutionCertificate,
     ExecutionVote, FinalizedWave, GlobalReceiptRoot, Hash, InFlightCount, LeafIndex,
     LocalReceiptRoot, NodeId, PcQc1, PcQc2, PcQc3, PcVector, PcVoteMessage, ProposerTimestamp,
     ProvisionHash, ProvisionTxRootsMap, Provisions, ProvisionsRoot, QuorumCertificate, ReadySignal,
@@ -157,9 +157,9 @@ pub enum Action {
     /// Used for the light-client provisions pattern. When a block commits,
     /// this broadcasts the header + QC so remote shards can verify state roots.
     /// The `io_loop` signs on the consensus crypto pool before sending.
-    BroadcastCommittedBlockHeader {
+    BroadcastCertifiedBlockHeader {
         /// Header + QC bundle to broadcast globally.
-        committed_header: CommittedBlockHeader,
+        certified_header: CertifiedBlockHeader,
     },
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -259,7 +259,7 @@ pub enum Action {
         /// The provisions to verify (all from the same source block).
         provisions: Provisions,
         /// The QC-verified committed block header from `RemoteHeaderCoordinator`.
-        committed_header: Arc<Verified<CommittedBlockHeader>>,
+        certified_header: Arc<Verified<CertifiedBlockHeader>>,
     },
 
     /// Aggregate execution votes into an `ExecutionCertificate` (quorum reached).
@@ -357,7 +357,7 @@ pub enum Action {
     /// Returns `ProtocolEvent::RemoteHeaderQcVerified` when complete.
     VerifyRemoteHeaderQc {
         /// The remote header to verify.
-        committed_header: Arc<CommittedBlockHeader>,
+        certified_header: Arc<CertifiedBlockHeader>,
         /// Sender of the candidate header; threaded back through the
         /// callback so the coordinator can remove the failed candidate
         /// from its pending map on error.
@@ -1076,7 +1076,7 @@ impl Action {
             | Self::BuildProposal { .. }
             | Self::BroadcastBlockHeader { .. }
             | Self::SignAndBroadcastBlockVote { .. }
-            | Self::BroadcastCommittedBlockHeader { .. }
+            | Self::BroadcastCertifiedBlockHeader { .. }
             | Self::SignAndBroadcastPcVote1 { .. }
             | Self::SignAndBroadcastPcVote2 { .. }
             | Self::SignAndBroadcastPcVote3 { .. }
@@ -1128,7 +1128,7 @@ impl Action {
             | Self::BuildProposal { .. }
             | Self::BroadcastBlockHeader { .. }
             | Self::SignAndBroadcastBlockVote { .. }
-            | Self::BroadcastCommittedBlockHeader { .. } => ActionOwner::Shard,
+            | Self::BroadcastCertifiedBlockHeader { .. } => ActionOwner::Shard,
 
             Self::AggregateExecutionCertificate { .. }
             | Self::VerifyAndAggregateExecutionVotes { .. }

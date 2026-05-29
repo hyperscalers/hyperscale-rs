@@ -14,7 +14,7 @@ use crate::{
 ///
 /// Served by any validator in `shard_id`'s committee at
 /// `(block_height, committed_block_hash)` (the shard's
-/// `CommittedBlockHeader` at that height carries the
+/// `CertifiedBlockHeader` at that height carries the
 /// [`BeaconWitnessRoot`](crate::BeaconWitnessRoot) the responder's
 /// proofs verify against). Receivers verify each returned witness's
 /// inclusion proof against the root in the same committed block they
