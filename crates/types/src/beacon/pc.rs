@@ -1955,6 +1955,17 @@ impl Verified<PcQc1> {
         let raw: Vec<&PcVote1> = votes.iter().map(|v| AsRef::as_ref(*v)).collect();
         Self::new_unchecked(build_qc1(&raw, committee))
     }
+
+    /// Wrap a locally-aggregated round-1 QC whose backing votes were
+    /// admitted to the local PC pool after verification. Trust source:
+    /// each pooled vote has cleared the round-1 BLS check (pool
+    /// admission is the gate), and [`build_qc1`] is deterministic over
+    /// its inputs. Used at the bridge from the PC FSM (which holds raw
+    /// `PcVote1`s) to the action-handler signer for round-2 votes.
+    #[must_use]
+    pub const fn from_local_build(qc: PcQc1) -> Self {
+        Self::new_unchecked(qc)
+    }
 }
 
 impl Verified<PcQc2> {
@@ -1966,6 +1977,13 @@ impl Verified<PcQc2> {
     ) -> Self {
         let raw: Vec<&PcVote2> = votes.iter().map(|v| AsRef::as_ref(*v)).collect();
         Self::new_unchecked(build_qc2(&raw, committee))
+    }
+
+    /// Wrap a locally-aggregated round-2 QC; analogous to
+    /// [`Verified::<PcQc1>::from_local_build`].
+    #[must_use]
+    pub const fn from_local_build(qc: PcQc2) -> Self {
+        Self::new_unchecked(qc)
     }
 }
 
@@ -1980,6 +1998,13 @@ impl Verified<PcQc3> {
     ) -> Self {
         let raw: Vec<&PcVote3> = votes.iter().map(|v| AsRef::as_ref(*v)).collect();
         Self::new_unchecked(build_qc3(&raw, committee))
+    }
+
+    /// Wrap a locally-aggregated round-3 (terminal) QC; analogous to
+    /// [`Verified::<PcQc1>::from_local_build`].
+    #[must_use]
+    pub const fn from_local_build(qc: PcQc3) -> Self {
+        Self::new_unchecked(qc)
     }
 }
 

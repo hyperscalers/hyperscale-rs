@@ -17,8 +17,8 @@ use hyperscale_types::network::notification::{
     SpcEmptyViewMsgNotification, SpcNewCommitNotification, SpcNewViewNotification,
 };
 use hyperscale_types::{
-    BeaconProposal, PcVoteMessage, SpcHighTriple, SpcProposalObject, pc_context, sign_vote1,
-    sign_vote2, sign_vote3, spc_context, verify_qc3, verify_vote1, verify_vote2, verify_vote3,
+    BeaconProposal, PcQc1, PcQc2, PcVote1, PcVote2, PcVote3, PcVoteMessage, PcVoteVerifyContext,
+    SpcHighTriple, SpcProposalObject, Verifiable, Verified, pc_context, spc_context, verify_qc3,
     vrf_sign,
 };
 use tracing::warn;
@@ -45,13 +45,16 @@ where
             recipients,
         } => {
             let pc_ctx = pc_context(&spc_context(epoch), view);
-            let vote = sign_vote1(ctx.signing_key, me, network, &pc_ctx, v_in);
-            ctx.network
-                .notify(&recipients, &PcVote1Notification::new(vote.clone()));
-            ctx.notify_protocol(ProtocolEvent::PcVoteReceived {
+            let verified =
+                Verified::<PcVote1>::sign_local(ctx.signing_key, me, network, &pc_ctx, v_in);
+            ctx.network.notify(
+                &recipients,
+                &PcVote1Notification::new(Arc::new(Verifiable::from(verified.clone()))),
+            );
+            ctx.notify_protocol(ProtocolEvent::VerifiedPcVoteReceived {
                 from: me,
                 view,
-                vote: Box::new(PcVoteMessage::Vote1(vote)),
+                vote: Box::new(Verified::<PcVoteMessage>::from_verified_vote1(verified)),
             });
         }
         Action::SignAndBroadcastPcVote2 {
@@ -61,13 +64,22 @@ where
             recipients,
         } => {
             let pc_ctx = pc_context(&spc_context(epoch), view);
-            let vote = sign_vote2(ctx.signing_key, me, network, &pc_ctx, *qc1);
-            ctx.network
-                .notify(&recipients, &PcVote2Notification::new(vote.clone()));
-            ctx.notify_protocol(ProtocolEvent::PcVoteReceived {
+            let qc1_verified = Verified::<PcQc1>::from_local_build(*qc1);
+            let verified = Verified::<PcVote2>::sign_local(
+                ctx.signing_key,
+                me,
+                network,
+                &pc_ctx,
+                qc1_verified,
+            );
+            ctx.network.notify(
+                &recipients,
+                &PcVote2Notification::new(Arc::new(Verifiable::from(verified.clone()))),
+            );
+            ctx.notify_protocol(ProtocolEvent::VerifiedPcVoteReceived {
                 from: me,
                 view,
-                vote: Box::new(PcVoteMessage::Vote2(Box::new(vote))),
+                vote: Box::new(Verified::<PcVoteMessage>::from_verified_vote2(verified)),
             });
         }
         Action::SignAndBroadcastPcVote3 {
@@ -77,13 +89,22 @@ where
             recipients,
         } => {
             let pc_ctx = pc_context(&spc_context(epoch), view);
-            let vote = sign_vote3(ctx.signing_key, me, network, &pc_ctx, *qc2);
-            ctx.network
-                .notify(&recipients, &PcVote3Notification::new(vote.clone()));
-            ctx.notify_protocol(ProtocolEvent::PcVoteReceived {
+            let qc2_verified = Verified::<PcQc2>::from_local_build(*qc2);
+            let verified = Verified::<PcVote3>::sign_local(
+                ctx.signing_key,
+                me,
+                network,
+                &pc_ctx,
+                qc2_verified,
+            );
+            ctx.network.notify(
+                &recipients,
+                &PcVote3Notification::new(Arc::new(Verifiable::from(verified.clone()))),
+            );
+            ctx.notify_protocol(ProtocolEvent::VerifiedPcVoteReceived {
                 from: me,
                 view,
-                vote: Box::new(PcVoteMessage::Vote3(Box::new(vote))),
+                vote: Box::new(Verified::<PcVoteMessage>::from_verified_vote3(verified)),
             });
         }
         Action::SignAndBroadcastEmptyView {
@@ -189,23 +210,58 @@ where
             let valid = verify_skip_request(&request, network, &signers);
             ctx.notify_protocol(ProtocolEvent::SkipRequestVerified { request, valid });
         }
-        Action::VerifyPcVote {
+        Action::VerifyPcVote1 {
             epoch,
             view,
             vote,
             committee,
         } => {
             let pc_ctx = pc_context(&spc_context(epoch), view);
-            let valid = match vote.as_ref() {
-                PcVoteMessage::Vote1(v) => verify_vote1(v, network, &pc_ctx, &committee),
-                PcVoteMessage::Vote2(v) => verify_vote2(v, network, &pc_ctx, &committee),
-                PcVoteMessage::Vote3(v) => verify_vote3(v, network, &pc_ctx, &committee),
-            };
-            ctx.notify_protocol(ProtocolEvent::PcVoteVerified {
+            let result = vote.upgrade(&PcVoteVerifyContext {
+                network,
+                pc_ctx: &pc_ctx,
+                committee: &committee,
+            });
+            ctx.notify_protocol(ProtocolEvent::PcVote1Verified {
                 epoch,
                 view,
-                vote,
-                valid,
+                result: result.map_err(|(_, e)| e),
+            });
+        }
+        Action::VerifyPcVote2 {
+            epoch,
+            view,
+            vote,
+            committee,
+        } => {
+            let pc_ctx = pc_context(&spc_context(epoch), view);
+            let result = (*vote).upgrade(&PcVoteVerifyContext {
+                network,
+                pc_ctx: &pc_ctx,
+                committee: &committee,
+            });
+            ctx.notify_protocol(ProtocolEvent::PcVote2Verified {
+                epoch,
+                view,
+                result: result.map_err(|(_, e)| e),
+            });
+        }
+        Action::VerifyPcVote3 {
+            epoch,
+            view,
+            vote,
+            committee,
+        } => {
+            let pc_ctx = pc_context(&spc_context(epoch), view);
+            let result = (*vote).upgrade(&PcVoteVerifyContext {
+                network,
+                pc_ctx: &pc_ctx,
+                committee: &committee,
+            });
+            ctx.notify_protocol(ProtocolEvent::PcVote3Verified {
+                epoch,
+                view,
+                result: result.map_err(|(_, e)| e),
             });
         }
         Action::VerifySpcNewView {

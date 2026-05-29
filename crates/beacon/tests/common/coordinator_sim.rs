@@ -28,10 +28,11 @@ use hyperscale_core::Action;
 use hyperscale_types::{
     BeaconCert, BeaconGenesisConfig, BeaconProposal, BeaconState, Bls12381G1PrivateKey,
     Bls12381G1PublicKey, CertifiedBeaconBlock, Epoch, GenesisPool, GenesisValidator,
-    NetworkDefinition, PcQc3, PcValueElement, PcVector, PcVoteMessage, Randomness, ShardGroupId,
-    SkipEpochCert, SkipRequest, SpcCert, SpcEmptyViewMsg, SpcView, Stake, StakePoolId, ValidatorId,
-    Witness, bls_keypair_from_seed, genesis_config_hash, pc_context, sign_vote1, sign_vote2,
-    sign_vote3, spc_context, verify_qc3, verify_vote1, verify_vote2, verify_vote3, vrf_sign,
+    NetworkDefinition, PcQc3, PcValueElement, PcVector, PcVoteMessage, PcVoteVerifyContext,
+    Randomness, ShardGroupId, SkipEpochCert, SkipRequest, SpcCert, SpcEmptyViewMsg, SpcView, Stake,
+    StakePoolId, ValidatorId, Verifiable, Witness, bls_keypair_from_seed, genesis_config_hash,
+    pc_context, sign_vote1, sign_vote2, sign_vote3, spc_context, verify_qc3, verify_vote1,
+    verify_vote2, verify_vote3, vrf_sign,
 };
 
 /// Adversarial transform a flagged replica applies to its next matching
@@ -446,7 +447,7 @@ impl CoordinatorSim {
     fn deliver(&mut self, env: Envelope) -> Vec<Action> {
         match env.event {
             SimEvent::PcVote { from, view, vote } => {
-                self.coordinators[env.to_idx].on_pc_vote_received(from, view, vote)
+                self.coordinators[env.to_idx].on_pc_vote_received(from, view, *vote)
             }
             SimEvent::SpcNewView { from, view, cert } => {
                 self.coordinators[env.to_idx].on_spc_new_view_received(from, view, cert)
@@ -788,20 +789,61 @@ impl CoordinatorSim {
                 let post = self.coordinators[emitter_idx].on_skip_request_verified(*request, valid);
                 self.absorb(emitter_idx, post);
             }
-            Action::VerifyPcVote {
+            Action::VerifyPcVote1 {
                 epoch,
                 view,
                 vote,
                 committee,
             } => {
                 let pc_ctx = pc_context(&spc_context(epoch), view);
-                let valid = match vote.as_ref() {
-                    PcVoteMessage::Vote1(v) => verify_vote1(v, &self.network, &pc_ctx, &committee),
-                    PcVoteMessage::Vote2(v) => verify_vote2(v, &self.network, &pc_ctx, &committee),
-                    PcVoteMessage::Vote3(v) => verify_vote3(v, &self.network, &pc_ctx, &committee),
-                };
-                let post =
-                    self.coordinators[emitter_idx].on_pc_vote_verified(epoch, view, *vote, valid);
+                let result = vote.upgrade(&PcVoteVerifyContext {
+                    network: &self.network,
+                    pc_ctx: &pc_ctx,
+                    committee: &committee,
+                });
+                let post = self.coordinators[emitter_idx].on_pc_vote1_verified(
+                    epoch,
+                    view,
+                    result.map_err(|(_, e)| e),
+                );
+                self.absorb(emitter_idx, post);
+            }
+            Action::VerifyPcVote2 {
+                epoch,
+                view,
+                vote,
+                committee,
+            } => {
+                let pc_ctx = pc_context(&spc_context(epoch), view);
+                let result = (*vote).upgrade(&PcVoteVerifyContext {
+                    network: &self.network,
+                    pc_ctx: &pc_ctx,
+                    committee: &committee,
+                });
+                let post = self.coordinators[emitter_idx].on_pc_vote2_verified(
+                    epoch,
+                    view,
+                    result.map_err(|(_, e)| e),
+                );
+                self.absorb(emitter_idx, post);
+            }
+            Action::VerifyPcVote3 {
+                epoch,
+                view,
+                vote,
+                committee,
+            } => {
+                let pc_ctx = pc_context(&spc_context(epoch), view);
+                let result = (*vote).upgrade(&PcVoteVerifyContext {
+                    network: &self.network,
+                    pc_ctx: &pc_ctx,
+                    committee: &committee,
+                });
+                let post = self.coordinators[emitter_idx].on_pc_vote3_verified(
+                    epoch,
+                    view,
+                    result.map_err(|(_, e)| e),
+                );
                 self.absorb(emitter_idx, post);
             }
             Action::VerifySpcNewView {

@@ -10,12 +10,13 @@ use hyperscale_types::{
     BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PublicKey, CertificateRoot,
     CertifiedBeaconBlock, CertifiedBlock, CertifiedBlockHeader, Epoch, ExecutionCertificate,
     ExecutionVote, FinalizedWave, GlobalReceiptRoot, Hash, InFlightCount, LeafIndex,
-    LocalReceiptRoot, NodeId, PcQc1, PcQc2, PcQc3, PcVector, PcVoteMessage, ProposerTimestamp,
-    ProvisionHash, ProvisionTxRootsMap, Provisions, ProvisionsRoot, QuorumCertificate, ReadySignal,
-    Round, RoutableTransaction, ShardGroupId, SharedCertificates, SharedTransactions,
-    SkipEpochCert, SkipRequest, SpcCert, SpcEmptyViewMsg, SpcHighTriple, SpcView, StateRoot,
-    SubstateEntry, TopologySnapshot, TransactionRoot, TransactionStatus, TxHash, TxOutcome,
-    ValidatorId, Verifiable, Verified, VotePower, WaveId, WeightedTimestamp, Witness,
+    LocalReceiptRoot, NodeId, PcQc1, PcQc2, PcQc3, PcVector, PcVote1, PcVote2, PcVote3,
+    ProposerTimestamp, ProvisionHash, ProvisionTxRootsMap, Provisions, ProvisionsRoot,
+    QuorumCertificate, ReadySignal, Round, RoutableTransaction, ShardGroupId, SharedCertificates,
+    SharedTransactions, SkipEpochCert, SkipRequest, SpcCert, SpcEmptyViewMsg, SpcHighTriple,
+    SpcView, StateRoot, SubstateEntry, TopologySnapshot, TransactionRoot, TransactionStatus,
+    TxHash, TxOutcome, ValidatorId, Verifiable, Verified, VotePower, WaveId, WeightedTimestamp,
+    Witness,
 };
 
 use crate::{CommitSource, FetchAbandon, FetchRequest, ProtocolEvent, TimerId};
@@ -979,17 +980,47 @@ pub enum Action {
         signers: Vec<(ValidatorId, Bls12381G1PublicKey)>,
     },
 
-    /// Verify a PC round vote against its `(epoch, view)` committee.
-    /// Result returns via [`ProtocolEvent::PcVoteVerified`] carrying the
-    /// vote back so the coordinator can route it into the post-verify
-    /// admission path without stashing.
-    VerifyPcVote {
+    /// Verify a round-1 PC vote against its `(epoch, view)` committee.
+    /// Result returns via [`ProtocolEvent::PcVote1Verified`] carrying the
+    /// typed verified handle on success.
+    VerifyPcVote1 {
         /// Epoch the inner PC instance belongs to.
         epoch: Epoch,
         /// SPC view whose inner PC produced this vote.
         view: SpcView,
-        /// Vote to verify; the variant selects the verifier.
-        vote: Box<PcVoteMessage>,
+        /// Vote to verify. A [`Verifiable::Verified`] wrapper
+        /// short-circuits BLS dispatch.
+        vote: Verifiable<PcVote1>,
+        /// Beacon committee at `epoch`, positional order.
+        committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+    },
+
+    /// Verify a round-2 PC vote against its `(epoch, view)` committee.
+    /// Result returns via [`ProtocolEvent::PcVote2Verified`].
+    VerifyPcVote2 {
+        /// Epoch the inner PC instance belongs to.
+        epoch: Epoch,
+        /// SPC view whose inner PC produced this vote.
+        view: SpcView,
+        /// Vote to verify. A [`Verifiable::Verified`] wrapper
+        /// short-circuits BLS dispatch; the embedded round-1 QC's
+        /// marker shortcuts its sub-check.
+        vote: Box<Verifiable<PcVote2>>,
+        /// Beacon committee at `epoch`, positional order.
+        committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+    },
+
+    /// Verify a round-3 PC vote against its `(epoch, view)` committee.
+    /// Result returns via [`ProtocolEvent::PcVote3Verified`].
+    VerifyPcVote3 {
+        /// Epoch the inner PC instance belongs to.
+        epoch: Epoch,
+        /// SPC view whose inner PC produced this vote.
+        view: SpcView,
+        /// Vote to verify. A [`Verifiable::Verified`] wrapper
+        /// short-circuits BLS dispatch; the embedded round-2 QC's
+        /// marker shortcuts its sub-check.
+        vote: Box<Verifiable<PcVote3>>,
         /// Beacon committee at `epoch`, positional order.
         committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
     },
@@ -1093,7 +1124,9 @@ impl Action {
             | Self::FetchShardWitnesses { .. }
             | Self::VerifyBeaconBlock { .. }
             | Self::VerifySkipRequest { .. }
-            | Self::VerifyPcVote { .. }
+            | Self::VerifyPcVote1 { .. }
+            | Self::VerifyPcVote2 { .. }
+            | Self::VerifyPcVote3 { .. }
             | Self::VerifySpcNewView { .. }
             | Self::VerifySpcNewCommit { .. }
             | Self::VerifySpcEmptyView { .. } => Some(DispatchPool::Consensus),
@@ -1159,7 +1192,9 @@ impl Action {
             | Self::FetchShardWitnesses { .. }
             | Self::VerifyBeaconBlock { .. }
             | Self::VerifySkipRequest { .. }
-            | Self::VerifyPcVote { .. }
+            | Self::VerifyPcVote1 { .. }
+            | Self::VerifyPcVote2 { .. }
+            | Self::VerifyPcVote3 { .. }
             | Self::VerifySpcNewView { .. }
             | Self::VerifySpcNewCommit { .. }
             | Self::VerifySpcEmptyView { .. } => ActionOwner::Beacon,

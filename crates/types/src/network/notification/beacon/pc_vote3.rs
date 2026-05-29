@@ -4,35 +4,39 @@ use std::sync::Arc;
 
 use sbor::prelude::BasicSbor;
 
-use crate::{MessageClass, NetworkMessage, PcVote3};
+use crate::{MessageClass, NetworkMessage, PcVote3, Verifiable};
 
 /// PC round-3 vote sent via unicast to peers in the slot's committee.
 ///
 /// The inner [`PcVote3`] is self-authenticating — it carries the signer
 /// id, an individual sig over the certified mcp `x_p`, and the round-2
-/// QC anchoring `x_p`.
+/// QC anchoring `x_p`. Wire decode lands the wrapper as
+/// `Verifiable::Unverified`; local-dispatched sends from a colocated
+/// voter preserve `Verifiable::Verified`.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct PcVote3Notification {
     /// The vote.
-    pub vote: Arc<PcVote3>,
+    pub vote: Arc<Verifiable<PcVote3>>,
 }
 
 impl PcVote3Notification {
-    /// Wrap a [`PcVote3`] for notification.
+    /// Wrap a [`PcVote3`] for notification. Accepts a raw vote or a
+    /// `Verified<PcVote3>`.
     #[must_use]
-    pub fn new(vote: impl Into<Arc<PcVote3>>) -> Self {
+    pub fn new(vote: impl Into<Arc<Verifiable<PcVote3>>>) -> Self {
         Self { vote: vote.into() }
     }
 
-    /// Get the inner vote.
+    /// Get the inner vote (raw view, regardless of verification state).
     #[must_use]
     pub fn vote(&self) -> &PcVote3 {
-        &self.vote
+        self.vote.as_unverified()
     }
 
-    /// Consume and return the inner vote.
+    /// Consume and return the inner vote, preserving the verification
+    /// marker.
     #[must_use]
-    pub fn into_vote(self) -> Arc<PcVote3> {
+    pub fn into_vote(self) -> Arc<Verifiable<PcVote3>> {
         self.vote
     }
 }
@@ -76,7 +80,7 @@ mod tests {
 
     #[test]
     fn sbor_round_trip() {
-        let n = PcVote3Notification::new(sample_vote());
+        let n = PcVote3Notification::new(Arc::new(Verifiable::from(sample_vote())));
         let bytes = basic_encode(&n).unwrap();
         let decoded: PcVote3Notification = basic_decode(&bytes).unwrap();
         assert_eq!(n, decoded);

@@ -92,7 +92,9 @@ where
             | Action::FetchShardWitnesses { .. }
             | Action::VerifyBeaconBlock { .. }
             | Action::VerifySkipRequest { .. }
-            | Action::VerifyPcVote { .. }
+            | Action::VerifyPcVote1 { .. }
+            | Action::VerifyPcVote2 { .. }
+            | Action::VerifyPcVote3 { .. }
             | Action::VerifySpcNewView { .. }
             | Action::VerifySpcNewCommit { .. }
             | Action::VerifySpcEmptyView { .. } => {

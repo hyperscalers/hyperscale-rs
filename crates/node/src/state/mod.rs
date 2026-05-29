@@ -275,7 +275,8 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::CommittedStateRestored { .. }) => self.handle_sync(evt),
 
             // ── Beacon ───────────────────────────────────────────────────
-            ProtocolEvent::PcVoteReceived { .. }
+            ProtocolEvent::UnverifiedPcVoteReceived { .. }
+            | ProtocolEvent::VerifiedPcVoteReceived { .. }
             | ProtocolEvent::SpcNewViewReceived { .. }
             | ProtocolEvent::SpcNewCommitReceived { .. }
             | ProtocolEvent::SpcEmptyViewReceived { .. }
@@ -286,7 +287,9 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::ShardWitnessesReceived { .. }
             | ProtocolEvent::BeaconBlockVerified { .. }
             | ProtocolEvent::SkipRequestVerified { .. }
-            | ProtocolEvent::PcVoteVerified { .. }
+            | ProtocolEvent::PcVote1Verified { .. }
+            | ProtocolEvent::PcVote2Verified { .. }
+            | ProtocolEvent::PcVote3Verified { .. }
             | ProtocolEvent::SpcNewViewVerified { .. }
             | ProtocolEvent::SpcNewCommitVerified { .. }
             | ProtocolEvent::SpcEmptyViewVerified { .. }

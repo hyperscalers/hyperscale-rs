@@ -4,35 +4,39 @@ use std::sync::Arc;
 
 use sbor::prelude::BasicSbor;
 
-use crate::{MessageClass, NetworkMessage, PcVote2};
+use crate::{MessageClass, NetworkMessage, PcVote2, Verifiable};
 
 /// PC round-2 vote sent via unicast to peers in the slot's committee.
 ///
 /// The inner [`PcVote2`] is self-authenticating — it carries the signer
 /// id, one BLS signature per prefix of `x`, the round-1 QC the signer
-/// is building on, and a length attestation pinning `|x|`.
+/// is building on, and a length attestation pinning `|x|`. Wire decode
+/// lands the wrapper as `Verifiable::Unverified`; local-dispatched sends
+/// from a colocated voter preserve `Verifiable::Verified`.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct PcVote2Notification {
     /// The vote.
-    pub vote: Arc<PcVote2>,
+    pub vote: Arc<Verifiable<PcVote2>>,
 }
 
 impl PcVote2Notification {
-    /// Wrap a [`PcVote2`] for notification.
+    /// Wrap a [`PcVote2`] for notification. Accepts a raw vote or a
+    /// `Verified<PcVote2>`.
     #[must_use]
-    pub fn new(vote: impl Into<Arc<PcVote2>>) -> Self {
+    pub fn new(vote: impl Into<Arc<Verifiable<PcVote2>>>) -> Self {
         Self { vote: vote.into() }
     }
 
-    /// Get the inner vote.
+    /// Get the inner vote (raw view, regardless of verification state).
     #[must_use]
     pub fn vote(&self) -> &PcVote2 {
-        &self.vote
+        self.vote.as_unverified()
     }
 
-    /// Consume and return the inner vote.
+    /// Consume and return the inner vote, preserving the verification
+    /// marker.
     #[must_use]
-    pub fn into_vote(self) -> Arc<PcVote2> {
+    pub fn into_vote(self) -> Arc<Verifiable<PcVote2>> {
         self.vote
     }
 }
@@ -79,7 +83,7 @@ mod tests {
 
     #[test]
     fn sbor_round_trip() {
-        let n = PcVote2Notification::new(sample_vote());
+        let n = PcVote2Notification::new(Arc::new(Verifiable::from(sample_vote())));
         let bytes = basic_encode(&n).unwrap();
         let decoded: PcVote2Notification = basic_decode(&bytes).unwrap();
         assert_eq!(n, decoded);
