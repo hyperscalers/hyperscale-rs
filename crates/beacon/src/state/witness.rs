@@ -145,7 +145,7 @@ pub(super) fn ingest_witnesses(
                     .collect();
                 equivocations
                     .iter()
-                    .all(|ev| verify_vote_equivocation(ev, network, &lookup))
+                    .all(|ev| verify_vote_equivocation(ev, network, &lookup).is_ok())
             },
             "apply_witnesses called with unverified equivocation evidence",
         );

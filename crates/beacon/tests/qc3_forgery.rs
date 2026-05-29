@@ -45,7 +45,7 @@ fn forge_qc3_with_empty_xpp_is_rejected() {
 
     // Sanity: the real QC3 verifies and its x_pp matches the input.
     assert_eq!(real.x_pp().as_slice(), &[elem(42), elem(42), elem(42)]);
-    assert!(verify_qc3(&real, &network, &pc_ctx(1, 0), &sim.members));
+    assert!(verify_qc3(&real, &network, &pc_ctx(1, 0), &sim.members).is_ok());
 
     // Forge: swap in an empty x_pp while keeping the rest.
     let real_x_pe = real.x_pe().clone();
@@ -61,7 +61,7 @@ fn forge_qc3_with_empty_xpp_is_rejected() {
     );
 
     assert!(
-        !verify_qc3(&forged, &network, &pc_ctx(1, 0), &sim.members),
+        verify_qc3(&forged, &network, &pc_ctx(1, 0), &sim.members).is_err(),
         "forged QC3 with x_pp=[] but real signers' x_p non-empty must be rejected",
     );
 }
@@ -92,7 +92,7 @@ fn forge_qc3_with_extended_xpe_is_rejected() {
     );
 
     assert!(
-        !verify_qc3(&forged, &network, &pc_ctx(2, 0), &sim.members),
+        verify_qc3(&forged, &network, &pc_ctx(2, 0), &sim.members).is_err(),
         "forged QC3 with x_pe extended past real mce must be rejected",
     );
 }

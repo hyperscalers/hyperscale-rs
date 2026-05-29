@@ -185,26 +185,33 @@ impl SkipEpochCert {
 /// `request.anchor_hash` and `request.epoch_to_skip` are not validated
 /// against any local state — the coordinator gates those at admission
 /// time before calling this helper.
-#[must_use]
+///
+/// # Errors
+///
+/// Returns a [`SkipRequestVerifyError`] variant naming the failing predicate.
 pub fn verify_skip_request(
     request: &SkipRequest,
     network: &NetworkDefinition,
     active_pool: &[(ValidatorId, Bls12381G1PublicKey)],
-) -> bool {
+) -> Result<(), SkipRequestVerifyError> {
     let Some(signer_pk) = active_pool
         .iter()
         .find(|(id, _)| *id == request.signer())
         .map(|(_, pk)| *pk)
     else {
-        return false;
+        return Err(SkipRequestVerifyError::SignerNotInPool);
     };
     let msg = skip_request_message(network, &request.anchor_hash(), request.epoch_to_skip());
-    verify_bls12381_v1(&msg, &signer_pk, &request.sig())
+    if verify_bls12381_v1(&msg, &signer_pk, &request.sig()) {
+        Ok(())
+    } else {
+        Err(SkipRequestVerifyError::BadSignature)
+    }
 }
 
 /// Verify a [`SkipEpochCert`] against `active_pool`.
 ///
-/// Returns `true` only when:
+/// Returns `Ok(())` only when:
 /// - `cert.signers().num_validators() == active_pool.len()` — the bitfield
 ///   must be sized to the current pool; positional indexing breaks if
 ///   these diverge.
@@ -217,34 +224,39 @@ pub fn verify_skip_request(
 /// If the active set has shifted between cert signing and verification,
 /// drift produces a false-negative rejection rather than a false-positive
 /// acceptance, preserving safety.
-#[must_use]
+///
+/// # Errors
+///
+/// Returns a [`SkipEpochCertVerifyError`] variant naming the failing predicate.
 pub fn verify_skip_cert(
     cert: &SkipEpochCert,
     network: &NetworkDefinition,
     active_pool: &[(ValidatorId, Bls12381G1PublicKey)],
-) -> bool {
+) -> Result<(), SkipEpochCertVerifyError> {
     let pool_size = active_pool.len();
     if cert.signers().num_validators() != pool_size {
-        return false;
+        return Err(SkipEpochCertVerifyError::BitfieldSizeMismatch);
     }
-
     let signer_count = cert.signers().count_ones();
     let quorum = (2 * pool_size).div_ceil(3) + 1;
     if signer_count < quorum {
-        return false;
+        return Err(SkipEpochCertVerifyError::InsufficientSigners);
     }
-
     let signer_pks: Vec<Bls12381G1PublicKey> = cert
         .signers()
         .set_indices()
         .map(|i| active_pool[i].1)
         .collect();
     if signer_pks.is_empty() {
-        return false;
+        return Err(SkipEpochCertVerifyError::EmptySignerSet);
     }
     let msg = skip_request_message(network, &cert.anchor_hash(), cert.epoch_to_skip());
     let msgs: Vec<&[u8]> = std::iter::repeat_n(msg.as_slice(), signer_pks.len()).collect();
-    aggregate_verify_bls_different_messages(&msgs, &cert.aggregate_sig(), &signer_pks)
+    if aggregate_verify_bls_different_messages(&msgs, &cert.aggregate_sig(), &signer_pks) {
+        Ok(())
+    } else {
+        Err(SkipEpochCertVerifyError::BadAggregateSignature)
+    }
 }
 
 // ─── Signing ───────────────────────────────────────────────────────────────
@@ -336,18 +348,33 @@ pub struct SkipVerifyContext<'a> {
     pub active_pool: &'a [(ValidatorId, Bls12381G1PublicKey)],
 }
 
-/// Coarse-grained verification failure for a single skip request.
-///
-/// Failure modes (signer-not-in-pool, BLS sig check) summarize into
-/// one variant; the rejection log line records the specific reason.
+/// Failure modes of a single skip request.
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
-#[error("SkipRequest verification failed")]
-pub struct SkipRequestVerifyError;
+pub enum SkipRequestVerifyError {
+    /// `signer` is not in the active validator pool.
+    #[error("signer not in active pool")]
+    SignerNotInPool,
+    /// BLS sig did not verify under the signer's pubkey.
+    #[error("signature did not verify")]
+    BadSignature,
+}
 
-/// Coarse-grained verification failure for an aggregated skip cert.
+/// Failure modes of an aggregated skip cert.
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
-#[error("SkipEpochCert verification failed")]
-pub struct SkipEpochCertVerifyError;
+pub enum SkipEpochCertVerifyError {
+    /// Signer bitfield size doesn't match the active pool's size.
+    #[error("signer bitfield size does not match active pool size")]
+    BitfieldSizeMismatch,
+    /// Signer count below `⌈2N/3⌉ + 1` quorum.
+    #[error("signer count below quorum threshold")]
+    InsufficientSigners,
+    /// Empty signer set after pool intersection.
+    #[error("no signers after pool intersection")]
+    EmptySignerSet,
+    /// Aggregate BLS check rejected the signature bundle.
+    #[error("aggregate signature did not verify")]
+    BadAggregateSignature,
+}
 
 impl Verify<&SkipVerifyContext<'_>> for SkipRequest {
     type Error = SkipRequestVerifyError;
@@ -356,11 +383,8 @@ impl Verify<&SkipVerifyContext<'_>> for SkipRequest {
     /// signature verifies under the signer's pubkey over the canonical
     /// skip-request signing bytes.
     fn verify(&self, ctx: &SkipVerifyContext<'_>) -> Result<Verified<Self>, Self::Error> {
-        if verify_skip_request(self, ctx.network, ctx.active_pool) {
-            Ok(Verified::new_unchecked(self.clone()))
-        } else {
-            Err(SkipRequestVerifyError)
-        }
+        verify_skip_request(self, ctx.network, ctx.active_pool)?;
+        Ok(Verified::new_unchecked(self.clone()))
     }
 }
 
@@ -371,11 +395,8 @@ impl Verify<&SkipVerifyContext<'_>> for SkipEpochCert {
     /// size, signer count meets `⌈2N/3⌉ + 1`, and the aggregate sig
     /// verifies under the union of the set bits' pubkeys.
     fn verify(&self, ctx: &SkipVerifyContext<'_>) -> Result<Verified<Self>, Self::Error> {
-        if verify_skip_cert(self, ctx.network, ctx.active_pool) {
-            Ok(Verified::new_unchecked(self.clone()))
-        } else {
-            Err(SkipEpochCertVerifyError)
-        }
+        verify_skip_cert(self, ctx.network, ctx.active_pool)?;
+        Ok(Verified::new_unchecked(self.clone()))
     }
 }
 
@@ -510,7 +531,7 @@ mod tests {
             anchor(),
             Epoch::new(5),
         );
-        assert!(verify_skip_request(&req, &net(), &active));
+        assert!(verify_skip_request(&req, &net(), &active).is_ok());
     }
 
     #[test]
@@ -524,7 +545,7 @@ mod tests {
             anchor(),
             Epoch::new(5),
         );
-        assert!(!verify_skip_request(&req, &net(), &active));
+        assert!(verify_skip_request(&req, &net(), &active).is_err());
     }
 
     #[test]
@@ -540,7 +561,7 @@ mod tests {
         let mut sig = req.sig();
         sig.0[0] ^= 1;
         req = SkipRequest::new(req.anchor_hash(), req.epoch_to_skip(), req.signer(), sig);
-        assert!(!verify_skip_request(&req, &net(), &active));
+        assert!(verify_skip_request(&req, &net(), &active).is_err());
     }
 
     /// `build_skip_cert` followed by `verify_skip_cert` round-trips a
@@ -562,7 +583,7 @@ mod tests {
             .collect();
         let cert = build_skip_cert(&requests, &active).expect("quorum met");
         assert_eq!(cert.signer_count(), 6);
-        assert!(verify_skip_cert(&cert, &net(), &active));
+        assert!(verify_skip_cert(&cert, &net(), &active).is_ok());
     }
 
     #[test]
@@ -628,7 +649,7 @@ mod tests {
         ));
         let cert = build_skip_cert(&requests, &active).expect("quorum met");
         assert_eq!(cert.signer_count(), 6);
-        assert!(verify_skip_cert(&cert, &net(), &active));
+        assert!(verify_skip_cert(&cert, &net(), &active).is_ok());
     }
 
     #[test]
@@ -649,7 +670,7 @@ mod tests {
         // Verify against a shrunken pool — bitfield positional indexing
         // breaks and the cert must be rejected.
         let shrunken: Vec<_> = active.into_iter().take(6).collect();
-        assert!(!verify_skip_cert(&cert, &net(), &shrunken));
+        assert!(verify_skip_cert(&cert, &net(), &shrunken).is_err());
     }
 
     #[test]
@@ -675,7 +696,7 @@ mod tests {
             cert.signers().clone(),
             bad_sig,
         );
-        assert!(!verify_skip_cert(&tampered, &net(), &active));
+        assert!(verify_skip_cert(&tampered, &net(), &active).is_err());
     }
 
     /// Two disjoint signer subsets at the same `(anchor, epoch)` both
@@ -711,7 +732,7 @@ mod tests {
             cert_a, cert_b,
             "different signer subsets must produce different certs"
         );
-        assert!(verify_skip_cert(&cert_a, &net(), &active));
-        assert!(verify_skip_cert(&cert_b, &net(), &active));
+        assert!(verify_skip_cert(&cert_a, &net(), &active).is_ok());
+        assert!(verify_skip_cert(&cert_b, &net(), &active).is_ok());
     }
 }

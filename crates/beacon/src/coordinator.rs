@@ -929,9 +929,9 @@ impl BeaconCoordinator {
     /// A peer-aggregated [`BeaconBlock`] arrived via the beacon gossip
     /// topic. After structural checks, dispatch cert verification to
     /// the crypto pool and stash the block until the result lands; on
-    /// `valid=true` [`Self::on_beacon_verification_result`] hands off to
-    /// [`Self::adopt_block`]. Blocks too far ahead of the local tip
-    /// land in `pending_blocks` for future redrive.
+    /// success [`Self::on_beacon_block_verified`] hands the verified
+    /// block off to [`Self::adopt_block`]. Blocks too far ahead of the
+    /// local tip land in `pending_blocks` for future redrive.
     ///
     /// Cert verification uses `self.state.committee` for Normal blocks
     /// and the active pool for Skip blocks. Committee rotation across
@@ -1167,9 +1167,9 @@ impl BeaconCoordinator {
     }
 
     /// A previously-dispatched [`Action::VerifyBeaconBlock`] has
-    /// returned. Clear the pipeline slot, and on `valid=true` adopt
-    /// the block (unless the tip has since moved past it). Drops
-    /// silently on `valid=false`.
+    /// returned. Clear the pipeline slot, and on the `Ok` arm adopt
+    /// the verified block (unless the tip has since moved past it).
+    /// Drops silently on the `Err` arm.
     ///
     /// Stale or duplicate results (slot wasn't in flight) are
     /// tolerated.

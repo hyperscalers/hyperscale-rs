@@ -53,11 +53,12 @@ pub enum PcEffect {
 
 /// Events `PcInstance::handle` consumes.
 ///
-/// Peer votes flow in as `Vote*Verified` after the
-/// [`BeaconCoordinator`](crate::coordinator::BeaconCoordinator) has
-/// dispatched the BLS check to the crypto pool and received the
-/// `valid=true` result. There is no `*Received` admission path — the
-/// type system forbids passing an unverified vote into `handle`.
+/// Peer votes flow in as `Vote*Verified` carrying `Verified<PcVoteN>`
+/// — the marker is produced by the BLS dispatch through the crypto pool
+/// (`Action::VerifyPcVote{1,2,3}` → `ProtocolEvent::PcVote{1,2,3}Verified`)
+/// and threaded through the coordinator into the FSM. There is no
+/// `*Received` admission path; the type system forbids passing an
+/// unverified vote into `handle`.
 #[derive(Debug, Clone)]
 pub enum PcEvent {
     /// The local validator's input vector. Idempotent: subsequent

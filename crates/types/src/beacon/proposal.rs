@@ -128,13 +128,13 @@ pub struct BeaconProposalVerifyContext<'a> {
     pub sender_pk: Bls12381G1PublicKey,
 }
 
-/// Coarse-grained verification failure for a beacon proposal.
-///
-/// Today the only predicate is the VRF reveal; future expansion (per-
-/// witness validity) would extend this enum with named variants.
+/// Failure modes of a beacon proposal.
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
-#[error("BeaconProposal verification failed")]
-pub struct BeaconProposalVerifyError;
+pub enum BeaconProposalVerifyError {
+    /// VRF reveal did not verify under `sender_pk` over `(network, epoch)`.
+    #[error("VRF reveal did not verify")]
+    BadVrfReveal,
+}
 
 impl Verify<&BeaconProposalVerifyContext<'_>> for BeaconProposal {
     type Error = BeaconProposalVerifyError;
@@ -152,7 +152,7 @@ impl Verify<&BeaconProposalVerifyContext<'_>> for BeaconProposal {
             &self.vrf_output,
             &self.vrf_proof,
         ) {
-            return Err(BeaconProposalVerifyError);
+            return Err(BeaconProposalVerifyError::BadVrfReveal);
         }
         Ok(Verified::new_unchecked(self.clone()))
     }

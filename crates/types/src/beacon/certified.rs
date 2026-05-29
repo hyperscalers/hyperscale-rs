@@ -188,9 +188,9 @@ pub fn verify_certified(
 ) -> bool {
     match block.cert() {
         BeaconCert::Normal(cert) => {
-            verify_block_cert(cert, network, &spc_context(block.epoch()), signers)
+            verify_block_cert(cert, network, &spc_context(block.epoch()), signers).is_ok()
         }
-        BeaconCert::Skip(cert) => verify_skip_cert(cert, network, signers),
+        BeaconCert::Skip(cert) => verify_skip_cert(cert, network, signers).is_ok(),
         BeaconCert::Genesis(_) => false,
     }
 }
@@ -213,7 +213,7 @@ pub fn verify_block_equivocations(
     for (_, proposal) in block.block().committed_proposals() {
         for witness in proposal.witnesses().iter() {
             if let Witness::Equivocation(ev) = witness
-                && !verify_vote_equivocation(ev, network, signers)
+                && verify_vote_equivocation(ev, network, signers).is_err()
             {
                 return false;
             }
@@ -247,14 +247,19 @@ pub struct CertifiedBeaconBlockVerifyContext<'a> {
     pub equivocation_signers: &'a [(ValidatorId, Bls12381G1PublicKey)],
 }
 
-/// Coarse-grained verification failure for a certified beacon block.
-///
-/// Failure modes (cert variant rejection, BLS aggregate, equivocation
-/// witness check) summarize into one variant; the rejection log line
-/// records the specific reason at the dispatch site.
+/// Failure modes of a certified beacon block.
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
-#[error("CertifiedBeaconBlock verification failed")]
-pub struct CertifiedBeaconBlockVerifyError;
+pub enum CertifiedBeaconBlockVerifyError {
+    /// Cert (Normal or Skip) did not verify under its required signer
+    /// pool, or `Genesis` cert reached the verifier (genesis blocks
+    /// have no replayable verification).
+    #[error("authenticating cert rejected")]
+    BadCert,
+    /// One or more embedded `Witness::Equivocation` did not verify
+    /// against the equivocation signer pool.
+    #[error("embedded equivocation witness rejected")]
+    BadEquivocationWitness,
+}
 
 impl Verify<&CertifiedBeaconBlockVerifyContext<'_>> for CertifiedBeaconBlock {
     type Error = CertifiedBeaconBlockVerifyError;
@@ -268,10 +273,10 @@ impl Verify<&CertifiedBeaconBlockVerifyContext<'_>> for CertifiedBeaconBlock {
         ctx: &CertifiedBeaconBlockVerifyContext<'_>,
     ) -> Result<Verified<Self>, Self::Error> {
         if !verify_certified(self, ctx.network, ctx.signers) {
-            return Err(CertifiedBeaconBlockVerifyError);
+            return Err(CertifiedBeaconBlockVerifyError::BadCert);
         }
         if !verify_block_equivocations(self, ctx.network, ctx.equivocation_signers) {
-            return Err(CertifiedBeaconBlockVerifyError);
+            return Err(CertifiedBeaconBlockVerifyError::BadEquivocationWitness);
         }
         Ok(Verified::new_unchecked(self.clone()))
     }
