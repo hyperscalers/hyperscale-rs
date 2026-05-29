@@ -7,7 +7,7 @@ description = "Shared network protocol logic: Network trait, compression, topics
 [dependencies]
 arc-swap.workspace = true
 hyperscale-types.workspace = true
-lz4_flex = "0.13.0"
+lz4_flex = "0.13.1"
 quick_cache.workspace = true
 sbor.workspace = true
 thiserror.workspace = true

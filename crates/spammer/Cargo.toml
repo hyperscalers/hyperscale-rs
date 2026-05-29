@@ -25,7 +25,7 @@ tokio.workspace = true
 tokio-util = { version = "0.7.18", features = ["rt"] }
 
 # HTTP client
-reqwest = { version = "0.13.3", default-features = false, features = ["json", "rustls"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
 
 # Serialization
 serde.workspace = true
