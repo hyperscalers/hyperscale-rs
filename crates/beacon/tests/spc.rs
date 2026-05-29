@@ -48,7 +48,7 @@ fn direct_cert_round_trip() {
     let cert = SpcCert::Direct {
         prev_view: SpcView::new(3),
         value: qc3.x_pe().clone(),
-        proof: qc3,
+        proof: qc3.into(),
     };
 
     assert!(verify_cert(
@@ -85,7 +85,7 @@ fn indirect_cert_round_trip() {
     let reported = SpcHighTriple {
         view: SpcView::new(3),
         value: qc3.x_pe().clone(),
-        proof: qc3,
+        proof: qc3.into(),
     };
     let empty_view = SpcView::new(5);
     let entering_view = SpcView::new(6);
@@ -141,7 +141,7 @@ fn indirect_cert_with_swapped_target_value_rejected() {
     let reported_a = SpcHighTriple {
         view: SpcView::new(3),
         value: qc3_a.x_pe().clone(),
-        proof: qc3_a,
+        proof: qc3_a.into(),
     };
     let empty_view = SpcView::new(5);
     let entering_view = SpcView::new(6);
@@ -179,7 +179,7 @@ fn indirect_cert_with_swapped_target_value_rejected() {
         for_view,
         target_view,
         target_value: qc3_b.x_pe().clone(),
-        target_proof: qc3_b,
+        target_proof: qc3_b.into(),
         skip_reports,
         skip_aggregate_sig,
     };
@@ -249,7 +249,7 @@ fn spc_empty_view_rejected_under_different_network() {
     let reported = SpcHighTriple {
         view: SpcView::new(3),
         value: qc3.x_pe().clone(),
-        proof: qc3,
+        proof: qc3.into(),
     };
     let empty_view = SpcView::new(5);
     let (sk, validator) = sim.sks_for_indices(&[0]).into_iter().next().unwrap();
@@ -284,7 +284,7 @@ fn spc_block_cert_rejected_under_different_network() {
     let cert = SpcCert::Direct {
         prev_view: SpcView::new(3),
         value: qc3.x_pe().clone(),
-        proof: qc3,
+        proof: qc3.into(),
     };
     assert!(verify_block_cert(&cert, &network, &spc_ctx, &sim.members));
     assert!(!verify_block_cert(

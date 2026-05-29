@@ -138,7 +138,7 @@ where
             let triple = SpcHighTriple {
                 view,
                 value,
-                proof: *proof,
+                proof: Verifiable::from(*proof),
             };
             ctx.network
                 .notify(&recipients, &SpcNewCommitNotification::new(triple));

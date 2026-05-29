@@ -89,7 +89,7 @@ mod tests {
             cert: SpcCert::Direct {
                 prev_view: SpcView::new(1),
                 value: PcVector::empty(),
-                proof: sample_pc_qc3(),
+                proof: sample_pc_qc3().into(),
             },
         }
     }

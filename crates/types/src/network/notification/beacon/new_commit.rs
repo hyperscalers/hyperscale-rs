@@ -85,7 +85,7 @@ mod tests {
         SpcHighTriple {
             view: SpcView::new(4),
             value: PcVector::empty(),
-            proof: sample_pc_qc3(),
+            proof: sample_pc_qc3().into(),
         }
     }
 

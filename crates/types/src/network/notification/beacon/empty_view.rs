@@ -84,7 +84,7 @@ mod tests {
             reported: SpcHighTriple {
                 view: SpcView::new(3),
                 value: PcVector::empty(),
-                proof: sample_pc_qc3(),
+                proof: sample_pc_qc3().into(),
             },
             signer: ValidatorId::new(2),
             sig: Bls12381G2Signature([0x44; 96]),

@@ -28,7 +28,7 @@ use blake3::Hasher;
 use hyperscale_types::{
     Bls12381G1PublicKey, Epoch, PC_VALUE_ELEMENT_BYTES, PcQc1, PcQc2, PcQc3, PcValueElement,
     PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation, SpcCert, SpcEmptyViewMsg,
-    SpcHighTriple, SpcProposalObject, SpcView, ValidatorId, build_indirect_cert,
+    SpcHighTriple, SpcProposalObject, SpcView, ValidatorId, Verifiable, build_indirect_cert,
 };
 
 use crate::pc::{PcEffect, PcEvent, PcInstance};
@@ -597,10 +597,11 @@ impl SpcInstance {
         }
         let mut out = vec![];
         if has_parent(view, &high, &self.proposals_by_hash) {
+            let proof_verifiable: Verifiable<PcQc3> = proof.into();
             let triple = SpcHighTriple {
                 view,
                 value: high.clone(),
-                proof: proof.clone(),
+                proof: proof_verifiable.clone(),
             };
             self.update_max_high(triple);
             let Some(next_raw) = view.inner().checked_add(1) else {
@@ -612,7 +613,7 @@ impl SpcInstance {
             let cert = SpcCert::Direct {
                 prev_view: view,
                 value: high,
-                proof,
+                proof: proof_verifiable,
             };
             // Stash for later retrieval when commit() walks back to
             // view 1 and emits `OutputHigh`.
@@ -1097,7 +1098,7 @@ mod tests {
         let cert = SpcCert::Direct {
             prev_view: SpcView::new(2),
             value: parent_value.clone(),
-            proof: dummy_pc_qc3(),
+            proof: dummy_pc_qc3().into(),
         };
         let po = SpcProposalObject {
             view: SpcView::new(3),
@@ -1123,7 +1124,7 @@ mod tests {
             cert: SpcCert::Direct {
                 prev_view: SpcView::new(1),
                 value: PcVector::empty(),
-                proof: dummy_pc_qc3(),
+                proof: dummy_pc_qc3().into(),
             },
         };
         let h1 = hash_proposal_object(&po);
@@ -1164,7 +1165,7 @@ mod tests {
         let reported = SpcHighTriple {
             view: SpcView::new(5),
             value: PcVector::empty(),
-            proof: dummy_pc_qc3(),
+            proof: dummy_pc_qc3().into(),
         };
         // View 3 < reported view 5 — rejected.
         let msg = sign_empty_view_msg(

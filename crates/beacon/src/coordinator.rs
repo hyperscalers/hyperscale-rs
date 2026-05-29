@@ -2072,7 +2072,7 @@ mod tests {
         SpcCert::Direct {
             prev_view,
             value,
-            proof: qc3,
+            proof: qc3.into(),
         }
     }
 

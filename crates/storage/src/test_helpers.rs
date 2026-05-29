@@ -208,7 +208,7 @@ fn placeholder_cert() -> SpcCert {
     SpcCert::Direct {
         prev_view: SpcView::new(1),
         value: PcVector::empty(),
-        proof,
+        proof: proof.into(),
     }
 }
 

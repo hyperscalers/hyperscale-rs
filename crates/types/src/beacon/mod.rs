@@ -67,9 +67,10 @@ pub use proposal::BeaconProposal;
 pub use ready_signal::ReadySignal;
 pub use skip::{SkipEpochCert, SkipRequest};
 pub use spc::{
-    SkipReport, SpcCert, SpcEmptyViewMsg, SpcHighTriple, SpcProposalObject, build_indirect_cert,
-    hash_high_value, sign_empty_view_msg, skip_target, verify_block_cert, verify_cert,
-    verify_empty_view_msg, verify_proposal_object,
+    SkipReport, SpcCert, SpcCertVerifyError, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError,
+    SpcHighTriple, SpcHighTripleVerifyError, SpcProposalObject, SpcProposalObjectVerifyError,
+    SpcVerifyContext, build_indirect_cert, hash_high_value, sign_empty_view_msg, skip_target,
+    verify_block_cert, verify_cert, verify_empty_view_msg, verify_proposal_object,
 };
 pub use state::{
     BeaconState, CommitteeTransition, JailReason, PendingWithdrawal, ShardCommittee, SlotEffects,
