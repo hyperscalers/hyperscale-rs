@@ -28,11 +28,11 @@ use hyperscale_core::Action;
 use hyperscale_types::{
     BeaconCert, BeaconGenesisConfig, BeaconProposal, BeaconState, Bls12381G1PrivateKey,
     Bls12381G1PublicKey, CertifiedBeaconBlock, Epoch, GenesisPool, GenesisValidator,
-    NetworkDefinition, PcQc3, PcValueElement, PcVector, PcVoteMessage, PcVoteVerifyContext,
-    Randomness, ShardGroupId, SkipEpochCert, SkipRequest, SpcCert, SpcEmptyViewMsg, SpcView, Stake,
-    StakePoolId, ValidatorId, Verifiable, Witness, bls_keypair_from_seed, genesis_config_hash,
-    pc_context, sign_vote1, sign_vote2, sign_vote3, spc_context, verify_qc3, verify_vote1,
-    verify_vote2, verify_vote3, vrf_sign,
+    NetworkDefinition, PcQc3, PcValueElement, PcVector, PcVote1, PcVote2, PcVote3,
+    PcVoteVerifyContext, Randomness, ShardGroupId, SkipEpochCert, SkipRequest, SpcCert,
+    SpcEmptyViewMsg, SpcView, Stake, StakePoolId, ValidatorId, Verifiable, Witness,
+    bls_keypair_from_seed, genesis_config_hash, pc_context, sign_vote1, sign_vote2, sign_vote3,
+    spc_context, verify_qc3, verify_vote1, verify_vote2, verify_vote3, vrf_sign,
 };
 
 /// Adversarial transform a flagged replica applies to its next matching
@@ -72,10 +72,20 @@ struct Envelope {
 
 #[derive(Clone)]
 enum SimEvent {
-    PcVote {
+    PcVote1 {
         from: ValidatorId,
         view: SpcView,
-        vote: Box<PcVoteMessage>,
+        vote: PcVote1,
+    },
+    PcVote2 {
+        from: ValidatorId,
+        view: SpcView,
+        vote: Box<PcVote2>,
+    },
+    PcVote3 {
+        from: ValidatorId,
+        view: SpcView,
+        vote: Box<PcVote3>,
     },
     SpcNewView {
         from: ValidatorId,
@@ -446,8 +456,14 @@ impl CoordinatorSim {
 
     fn deliver(&mut self, env: Envelope) -> Vec<Action> {
         match env.event {
-            SimEvent::PcVote { from, view, vote } => {
-                self.coordinators[env.to_idx].on_pc_vote_received(from, view, *vote)
+            SimEvent::PcVote1 { from, view, vote } => {
+                self.coordinators[env.to_idx].on_pc_vote1_received(from, view, vote)
+            }
+            SimEvent::PcVote2 { from, view, vote } => {
+                self.coordinators[env.to_idx].on_pc_vote2_received(from, view, vote)
+            }
+            SimEvent::PcVote3 { from, view, vote } => {
+                self.coordinators[env.to_idx].on_pc_vote3_received(from, view, vote)
             }
             SimEvent::SpcNewView { from, view, cert } => {
                 self.coordinators[env.to_idx].on_spc_new_view_received(from, view, cert)
@@ -574,13 +590,7 @@ impl CoordinatorSim {
                     &pc_ctx,
                     v_in.clone(),
                 );
-                self.queue_pc_vote(
-                    emitter_idx,
-                    me,
-                    &recipients,
-                    view,
-                    PcVoteMessage::Vote1(vote),
-                );
+                self.queue_pc_vote1(emitter_idx, me, &recipients, view, vote);
                 // Byzantine equivocation at round 1: sign and broadcast
                 // a second vote over a perturbed `v_in` so the same
                 // signer attests to two distinct vectors at the same
@@ -600,13 +610,7 @@ impl CoordinatorSim {
                         &pc_ctx,
                         conflicting_v_in,
                     );
-                    self.queue_pc_vote(
-                        emitter_idx,
-                        me,
-                        &recipients,
-                        view,
-                        PcVoteMessage::Vote1(conflicting_vote),
-                    );
+                    self.queue_pc_vote1(emitter_idx, me, &recipients, view, conflicting_vote);
                 }
             }
             Action::SignAndBroadcastPcVote2 {
@@ -617,13 +621,7 @@ impl CoordinatorSim {
             } => {
                 let pc_ctx = pc_context(&spc_context(epoch), view);
                 let vote = sign_vote2(&self.sks[emitter_idx], me, &self.network, &pc_ctx, *qc1);
-                self.queue_pc_vote(
-                    emitter_idx,
-                    me,
-                    &recipients,
-                    view,
-                    PcVoteMessage::Vote2(Box::new(vote)),
-                );
+                self.queue_pc_vote2(emitter_idx, me, &recipients, view, Box::new(vote));
             }
             Action::SignAndBroadcastPcVote3 {
                 epoch,
@@ -633,13 +631,7 @@ impl CoordinatorSim {
             } => {
                 let pc_ctx = pc_context(&spc_context(epoch), view);
                 let vote = sign_vote3(&self.sks[emitter_idx], me, &self.network, &pc_ctx, *qc2);
-                self.queue_pc_vote(
-                    emitter_idx,
-                    me,
-                    &recipients,
-                    view,
-                    PcVoteMessage::Vote3(Box::new(vote)),
-                );
+                self.queue_pc_vote3(emitter_idx, me, &recipients, view, Box::new(vote));
             }
             Action::SignAndBroadcastEmptyView {
                 epoch,
@@ -894,20 +886,19 @@ impl CoordinatorSim {
         }
     }
 
-    fn queue_pc_vote(
+    fn queue_pc_vote1(
         &mut self,
         emitter_idx: usize,
         me: ValidatorId,
         recipients: &[ValidatorId],
         view: SpcView,
-        vote: PcVoteMessage,
+        vote: PcVote1,
     ) {
-        let vote = Box::new(vote);
         for rcpt in recipients {
             let to_idx = self.idx_of(*rcpt);
             self.network_q.push_back(Envelope {
                 to_idx,
-                event: SimEvent::PcVote {
+                event: SimEvent::PcVote1 {
                     from: me,
                     view,
                     vote: vote.clone(),
@@ -916,7 +907,65 @@ impl CoordinatorSim {
         }
         self.loopback_q.push_back(Envelope {
             to_idx: emitter_idx,
-            event: SimEvent::PcVote {
+            event: SimEvent::PcVote1 {
+                from: me,
+                view,
+                vote,
+            },
+        });
+    }
+
+    fn queue_pc_vote2(
+        &mut self,
+        emitter_idx: usize,
+        me: ValidatorId,
+        recipients: &[ValidatorId],
+        view: SpcView,
+        vote: Box<PcVote2>,
+    ) {
+        for rcpt in recipients {
+            let to_idx = self.idx_of(*rcpt);
+            self.network_q.push_back(Envelope {
+                to_idx,
+                event: SimEvent::PcVote2 {
+                    from: me,
+                    view,
+                    vote: vote.clone(),
+                },
+            });
+        }
+        self.loopback_q.push_back(Envelope {
+            to_idx: emitter_idx,
+            event: SimEvent::PcVote2 {
+                from: me,
+                view,
+                vote,
+            },
+        });
+    }
+
+    fn queue_pc_vote3(
+        &mut self,
+        emitter_idx: usize,
+        me: ValidatorId,
+        recipients: &[ValidatorId],
+        view: SpcView,
+        vote: Box<PcVote3>,
+    ) {
+        for rcpt in recipients {
+            let to_idx = self.idx_of(*rcpt);
+            self.network_q.push_back(Envelope {
+                to_idx,
+                event: SimEvent::PcVote3 {
+                    from: me,
+                    view,
+                    vote: vote.clone(),
+                },
+            });
+        }
+        self.loopback_q.push_back(Envelope {
+            to_idx: emitter_idx,
+            event: SimEvent::PcVote3 {
                 from: me,
                 view,
                 vote,

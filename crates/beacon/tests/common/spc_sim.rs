@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use hyperscale_beacon::spc::{SpcEffect, SpcEvent, SpcInstance, sign_empty_view_msg};
 use hyperscale_types::{
-    Bls12381G1PrivateKey, Bls12381G1PublicKey, Epoch, NetworkDefinition, PcVector, PcVoteMessage,
-    SpcView, ValidatorId, bls_keypair_from_seed, pc_context, sign_vote1, sign_vote2, sign_vote3,
+    Bls12381G1PrivateKey, Bls12381G1PublicKey, Epoch, NetworkDefinition, PcVector, SpcView,
+    ValidatorId, bls_keypair_from_seed, pc_context, sign_vote1, sign_vote2, sign_vote3,
     spc_context,
 };
 
@@ -127,25 +127,22 @@ impl SpcSim {
                 SpcEffect::SignAndBroadcastPcVote1 { view, v_in } => {
                     let pc_ctx = pc_context(&spc_context(self.epoch), view);
                     let vote = sign_vote1(&sk, sender, &self.network, &pc_ctx, v_in);
-                    self.deliver_to_all(&SpcEvent::PcVoteVerified {
-                        view,
-                        vote: PcVoteMessage::Vote1(vote),
-                    });
+                    self.deliver_to_all(&SpcEvent::PcVote1Verified { view, vote });
                 }
                 SpcEffect::SignAndBroadcastPcVote2 { view, qc1 } => {
                     let pc_ctx = pc_context(&spc_context(self.epoch), view);
                     let vote = sign_vote2(&sk, sender, &self.network, &pc_ctx, *qc1);
-                    self.deliver_to_all(&SpcEvent::PcVoteVerified {
+                    self.deliver_to_all(&SpcEvent::PcVote2Verified {
                         view,
-                        vote: PcVoteMessage::Vote2(Box::new(vote)),
+                        vote: Box::new(vote),
                     });
                 }
                 SpcEffect::SignAndBroadcastPcVote3 { view, qc2 } => {
                     let pc_ctx = pc_context(&spc_context(self.epoch), view);
                     let vote = sign_vote3(&sk, sender, &self.network, &pc_ctx, *qc2);
-                    self.deliver_to_all(&SpcEvent::PcVoteVerified {
+                    self.deliver_to_all(&SpcEvent::PcVote3Verified {
                         view,
-                        vote: PcVoteMessage::Vote3(Box::new(vote)),
+                        vote: Box::new(vote),
                     });
                 }
                 SpcEffect::BroadcastNewView { view, cert } => {

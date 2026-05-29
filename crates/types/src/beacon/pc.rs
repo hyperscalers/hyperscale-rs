@@ -757,48 +757,6 @@ impl PcQc3 {
     }
 }
 
-// ── Verify-dispatch carrier ─────────────────────────────────────────────────
-
-/// A round-tagged PC vote.
-///
-/// Carrier shape used across `Action::VerifyPcVote`,
-/// `ProtocolEvent::PcVote{Received,Verified}`, and the post-verify
-/// `SpcEvent::PcVoteVerified` route into the right view's `PcInstance`.
-/// The variant tags the round so the dispatcher picks the matching
-/// `verify_vote*` helper; the SPC view is carried alongside on the
-/// enclosing action/event.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PcVoteMessage {
-    /// Round-1 vote.
-    Vote1(PcVote1),
-    /// Round-2 vote.
-    Vote2(Box<PcVote2>),
-    /// Round-3 vote.
-    Vote3(Box<PcVote3>),
-}
-
-impl PcVoteMessage {
-    /// Round this vote belongs to.
-    #[must_use]
-    pub const fn round(&self) -> PcVoteRound {
-        match self {
-            Self::Vote1(_) => PcVoteRound::Vote1,
-            Self::Vote2(_) => PcVoteRound::Vote2,
-            Self::Vote3(_) => PcVoteRound::Vote3,
-        }
-    }
-
-    /// Validator that signed this vote.
-    #[must_use]
-    pub fn validator(&self) -> ValidatorId {
-        match self {
-            Self::Vote1(v) => v.validator(),
-            Self::Vote2(v) => v.validator(),
-            Self::Vote3(v) => v.validator(),
-        }
-    }
-}
-
 // ── Equivocation ─────────────────────────────────────────────────────────────
 
 /// Which PC round a [`PcVoteEquivocation`] references.
@@ -1712,7 +1670,7 @@ fn mcp_two(a: &PcVector, b: &PcVector) -> usize {
 /// Bundles the per-instance binding context (`network`, `pc_ctx`) with
 /// the committee that every signer must be drawn from. The Verify impls
 /// for [`PcVote1`] / [`PcVote2`] / [`PcVote3`] / [`PcQc1`] / [`PcQc2`] /
-/// [`PcQc3`] / [`PcVoteMessage`] all take this context.
+/// [`PcQc3`] all take this context.
 #[derive(Debug, Clone, Copy)]
 pub struct PcVoteVerifyContext<'a> {
     /// Network the signer was bound to.
@@ -1768,21 +1726,6 @@ pub struct PcVote3VerifyError;
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 #[error("PcQc3 verification failed")]
 pub struct PcQc3VerifyError;
-
-/// Verification failure for the enum carrier — names the inner round
-/// whose verifier produced the failure.
-#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
-pub enum PcVoteMessageVerifyError {
-    /// Round-1 vote verification failed.
-    #[error("round-1: {0}")]
-    Vote1(#[source] PcVote1VerifyError),
-    /// Round-2 vote verification failed.
-    #[error("round-2: {0}")]
-    Vote2(#[source] PcVote2VerifyError),
-    /// Round-3 vote verification failed.
-    #[error("round-3: {0}")]
-    Vote3(#[source] PcVote3VerifyError),
-}
 
 /// Coarse-grained verification failure for vote-equivocation evidence.
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
@@ -1857,27 +1800,6 @@ impl Verify<&PcVoteVerifyContext<'_>> for PcQc3 {
             Ok(Verified::new_unchecked(self.clone()))
         } else {
             Err(PcQc3VerifyError)
-        }
-    }
-}
-
-impl Verify<&PcVoteVerifyContext<'_>> for PcVoteMessage {
-    type Error = PcVoteMessageVerifyError;
-
-    fn verify(&self, ctx: &PcVoteVerifyContext<'_>) -> Result<Verified<Self>, Self::Error> {
-        match self {
-            Self::Vote1(v) => v
-                .verify(ctx)
-                .map(|_| Verified::new_unchecked(self.clone()))
-                .map_err(PcVoteMessageVerifyError::Vote1),
-            Self::Vote2(v) => (**v)
-                .verify(ctx)
-                .map(|_| Verified::new_unchecked(self.clone()))
-                .map_err(PcVoteMessageVerifyError::Vote2),
-            Self::Vote3(v) => (**v)
-                .verify(ctx)
-                .map(|_| Verified::new_unchecked(self.clone()))
-                .map_err(PcVoteMessageVerifyError::Vote3),
         }
     }
 }
@@ -2005,26 +1927,6 @@ impl Verified<PcQc3> {
     #[must_use]
     pub const fn from_local_build(qc: PcQc3) -> Self {
         Self::new_unchecked(qc)
-    }
-}
-
-impl Verified<PcVoteMessage> {
-    /// Promote a verified round-1 vote into the enum carrier.
-    #[must_use]
-    pub fn from_verified_vote1(v: Verified<PcVote1>) -> Self {
-        Self::new_unchecked(PcVoteMessage::Vote1(v.into_inner()))
-    }
-
-    /// Promote a verified round-2 vote into the enum carrier.
-    #[must_use]
-    pub fn from_verified_vote2(v: Verified<PcVote2>) -> Self {
-        Self::new_unchecked(PcVoteMessage::Vote2(Box::new(v.into_inner())))
-    }
-
-    /// Promote a verified round-3 vote into the enum carrier.
-    #[must_use]
-    pub fn from_verified_vote3(v: Verified<PcVote3>) -> Self {
-        Self::new_unchecked(PcVoteMessage::Vote3(Box::new(v.into_inner())))
     }
 }
 

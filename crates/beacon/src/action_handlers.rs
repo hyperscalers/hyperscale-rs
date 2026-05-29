@@ -17,9 +17,8 @@ use hyperscale_types::network::notification::{
     SpcEmptyViewMsgNotification, SpcNewCommitNotification, SpcNewViewNotification,
 };
 use hyperscale_types::{
-    BeaconProposal, PcQc1, PcQc2, PcVote1, PcVote2, PcVote3, PcVoteMessage, PcVoteVerifyContext,
-    SpcHighTriple, SpcProposalObject, Verifiable, Verified, pc_context, spc_context, verify_qc3,
-    vrf_sign,
+    BeaconProposal, PcQc1, PcQc2, PcVote1, PcVote2, PcVote3, PcVoteVerifyContext, SpcHighTriple,
+    SpcProposalObject, Verifiable, Verified, pc_context, spc_context, verify_qc3, vrf_sign,
 };
 use tracing::warn;
 
@@ -51,10 +50,10 @@ where
                 &recipients,
                 &PcVote1Notification::new(Arc::new(Verifiable::from(verified.clone()))),
             );
-            ctx.notify_protocol(ProtocolEvent::VerifiedPcVoteReceived {
+            ctx.notify_protocol(ProtocolEvent::VerifiedPcVote1Received {
                 from: me,
                 view,
-                vote: Box::new(Verified::<PcVoteMessage>::from_verified_vote1(verified)),
+                vote: verified,
             });
         }
         Action::SignAndBroadcastPcVote2 {
@@ -76,10 +75,10 @@ where
                 &recipients,
                 &PcVote2Notification::new(Arc::new(Verifiable::from(verified.clone()))),
             );
-            ctx.notify_protocol(ProtocolEvent::VerifiedPcVoteReceived {
+            ctx.notify_protocol(ProtocolEvent::VerifiedPcVote2Received {
                 from: me,
                 view,
-                vote: Box::new(Verified::<PcVoteMessage>::from_verified_vote2(verified)),
+                vote: Box::new(verified),
             });
         }
         Action::SignAndBroadcastPcVote3 {
@@ -101,10 +100,10 @@ where
                 &recipients,
                 &PcVote3Notification::new(Arc::new(Verifiable::from(verified.clone()))),
             );
-            ctx.notify_protocol(ProtocolEvent::VerifiedPcVoteReceived {
+            ctx.notify_protocol(ProtocolEvent::VerifiedPcVote3Received {
                 from: me,
                 view,
-                vote: Box::new(Verified::<PcVoteMessage>::from_verified_vote3(verified)),
+                vote: Box::new(verified),
             });
         }
         Action::SignAndBroadcastEmptyView {
