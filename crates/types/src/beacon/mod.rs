@@ -54,11 +54,13 @@ pub use limits::{
     MAX_WITNESSES_PER_PROPOSER,
 };
 pub use pc::{
-    PC_VALUE_ELEMENT_BYTES, PcCompactVote, PcDivergingProof, PcQc1, PcQc2, PcQc3, PcSignerLengths,
-    PcValueElement, PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation, PcVoteMessage,
-    PcVoteRound, PcXpProof, build_qc1, build_qc2, build_qc3, sign_vote1, sign_vote2, sign_vote3,
-    verify_qc1, verify_qc2, verify_qc3, verify_vote_equivocation, verify_vote1, verify_vote2,
-    verify_vote3,
+    PC_VALUE_ELEMENT_BYTES, PcCompactVote, PcDivergingProof, PcQc1, PcQc1VerifyError, PcQc2,
+    PcQc2VerifyError, PcQc3, PcQc3VerifyError, PcSignerLengths, PcValueElement, PcVector, PcVote1,
+    PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3, PcVote3VerifyError,
+    PcVoteEquivocation, PcVoteEquivocationContext, PcVoteEquivocationVerifyError, PcVoteMessage,
+    PcVoteMessageVerifyError, PcVoteRound, PcVoteVerifyContext, PcXpProof, build_qc1, build_qc2,
+    build_qc3, sign_vote1, sign_vote2, sign_vote3, verify_qc1, verify_qc2, verify_qc3,
+    verify_vote_equivocation, verify_vote1, verify_vote2, verify_vote3,
 };
 pub use prefix_ops::{mce, mcp, qc1_certify};
 pub use proposal::BeaconProposal;

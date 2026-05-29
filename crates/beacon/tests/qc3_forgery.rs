@@ -12,7 +12,7 @@ mod common;
 use common::{PcSim, pc_ctx};
 use hyperscale_types::{
     Epoch, NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PcQc3, PcValueElement, PcVector, SpcView,
-    verify_qc3,
+    Verifiable, verify_qc3,
 };
 
 const fn elem(byte: u8) -> PcValueElement {
@@ -54,7 +54,7 @@ fn forge_qc3_with_empty_xpp_is_rejected() {
         PcVector::empty(),
         real.qc2_xpp().clone(),
         Some(real_x_pe),
-        Some(real_qc2_xpe),
+        Some(Verifiable::from(real_qc2_xpe)),
         real.all_signers().clone(),
         real.signer_lengths().clone(),
         real.agg_sig(),
@@ -85,7 +85,7 @@ fn forge_qc3_with_extended_xpe_is_rejected() {
         real.x_pp().clone(),
         real.qc2_xpp().clone(),
         Some(extended_x_pe),
-        Some(real.qc2_xpe().clone()),
+        Some(Verifiable::from(real.qc2_xpe().clone())),
         real.all_signers().clone(),
         real.signer_lengths().clone(),
         real.agg_sig(),

@@ -14,6 +14,7 @@
 use std::collections::BTreeSet;
 
 use sbor::prelude::*;
+use thiserror::Error;
 
 use crate::beacon::prefix_ops::{mce, mcp, qc1_certify};
 use crate::primitives::signer_bitfield::MAX_VALIDATORS;
@@ -21,8 +22,8 @@ use crate::{
     Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature, BoundedVec, DOMAIN_PC_VOTE1,
     DOMAIN_PC_VOTE2, DOMAIN_PC_VOTE2_LENGTH, DOMAIN_PC_VOTE3, Epoch, MAX_PREFIX_SIGS,
     MAX_VOTE_VECTOR_LEN, NetworkDefinition, PcContext, PositionalBundle, SignerBitfield, SpcView,
-    ValidatorId, aggregate_verify_bls_different_messages, pc_context, pc_vote_signing_message,
-    spc_context,
+    ValidatorId, Verifiable, Verified, Verify, aggregate_verify_bls_different_messages, pc_context,
+    pc_vote_signing_message, spc_context,
 };
 
 // ── ValueElement and Vector ──────────────────────────────────────────────────
@@ -316,14 +317,20 @@ pub struct PcVote2 {
     x: PcVector,
     /// `prefix_sigs[k]` is `sig_validator(x[..k])`. Length `|x| + 1`.
     prefix_sigs: BoundedVec<Bls12381G2Signature, MAX_PREFIX_SIGS>,
-    qc1: PcQc1,
+    /// Embedded round-1 QC. Wire decode lands as `Verifiable::Unverified`;
+    /// locally-signed votes from `Verified::<PcVote2>::sign_local` carry
+    /// the marker so the round-2 verifier short-circuits the embedded
+    /// QC check.
+    qc1: Verifiable<PcQc1>,
     /// `sig_validator([x.len()])` under the round-2 length tag. Binds
     /// the signer to their specific `x` length.
     length_attestation: Bls12381G2Signature,
 }
 
 impl PcVote2 {
-    /// Build a `PcVote2` from its parts.
+    /// Build a `PcVote2` from its parts. Accepts either a raw `PcQc1`
+    /// or a `Verified<PcQc1>` for `qc1` — the wrapper preserves the
+    /// marker for the round-2 verifier's short-circuit.
     ///
     /// # Panics
     ///
@@ -333,14 +340,14 @@ impl PcVote2 {
         validator: ValidatorId,
         x: PcVector,
         prefix_sigs: Vec<Bls12381G2Signature>,
-        qc1: PcQc1,
+        qc1: impl Into<Verifiable<PcQc1>>,
         length_attestation: Bls12381G2Signature,
     ) -> Self {
         Self {
             validator,
             x,
             prefix_sigs: prefix_sigs.into(),
-            qc1,
+            qc1: qc1.into(),
             length_attestation,
         }
     }
@@ -363,9 +370,18 @@ impl PcVote2 {
         &self.prefix_sigs
     }
 
-    /// Round-1 QC anchoring this validator's `x`.
+    /// Round-1 QC anchoring this validator's `x` (raw view, regardless
+    /// of verification state).
     #[must_use]
-    pub const fn qc1(&self) -> &PcQc1 {
+    pub fn qc1(&self) -> &PcQc1 {
+        self.qc1.as_unverified()
+    }
+
+    /// Embedded round-1 QC including its verification marker. The
+    /// round-2 verifier inspects this directly to short-circuit when
+    /// already verified.
+    #[must_use]
+    pub const fn qc1_verifiable(&self) -> &Verifiable<PcQc1> {
         &self.qc1
     }
 
@@ -504,23 +520,28 @@ pub struct PcVote3 {
     validator: ValidatorId,
     x_p: PcVector,
     sig_xp: Bls12381G2Signature,
-    qc2: PcQc2,
+    /// Embedded round-2 QC. Wire decode lands as `Verifiable::Unverified`;
+    /// locally-signed votes from `Verified::<PcVote3>::sign_local` carry
+    /// the marker so the round-3 verifier short-circuits the embedded
+    /// QC check.
+    qc2: Verifiable<PcQc2>,
 }
 
 impl PcVote3 {
-    /// Build a `PcVote3` from its parts.
+    /// Build a `PcVote3` from its parts. Accepts either a raw `PcQc2`
+    /// or a `Verified<PcQc2>` for `qc2`.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         validator: ValidatorId,
         x_p: PcVector,
         sig_xp: Bls12381G2Signature,
-        qc2: PcQc2,
+        qc2: impl Into<Verifiable<PcQc2>>,
     ) -> Self {
         Self {
             validator,
             x_p,
             sig_xp,
-            qc2,
+            qc2: qc2.into(),
         }
     }
 
@@ -542,9 +563,18 @@ impl PcVote3 {
         self.sig_xp
     }
 
-    /// Round-2 QC anchoring `x_p`.
+    /// Round-2 QC anchoring `x_p` (raw view, regardless of
+    /// verification state).
     #[must_use]
-    pub const fn qc2(&self) -> &PcQc2 {
+    pub fn qc2(&self) -> &PcQc2 {
+        self.qc2.as_unverified()
+    }
+
+    /// Embedded round-2 QC including its verification marker. The
+    /// round-3 verifier inspects this directly to short-circuit when
+    /// already verified.
+    #[must_use]
+    pub const fn qc2_verifiable(&self) -> &Verifiable<PcQc2> {
         &self.qc2
     }
 }
@@ -622,11 +652,13 @@ impl PcSignerLengths {
 pub struct PcQc3 {
     x_pp: PcVector,
     /// `PcQc2` contributed by the round-3 vote that attained `x_pp`.
-    qc2_xpp: PcQc2,
+    /// Wire decode lands `Verifiable::Unverified`; locally-aggregated
+    /// QC3s carry the marker so the round-3 QC verifier short-circuits.
+    qc2_xpp: Verifiable<PcQc2>,
     /// `None` is dedup-encoding for "same as `x_pp`".
     x_pe: Option<PcVector>,
     /// `None` is dedup-encoding for "same as `qc2_xpp`".
-    qc2_xpe: Option<PcQc2>,
+    qc2_xpe: Option<Verifiable<PcQc2>>,
     /// Round-3 signer bitfield (positional against the committee).
     all_signers: SignerBitfield,
     /// `|x_p_i|` for every signer in `all_signers`, in set-bit order;
@@ -637,21 +669,22 @@ pub struct PcQc3 {
 }
 
 impl PcQc3 {
-    /// Build a `PcQc3` from its parts.
+    /// Build a `PcQc3` from its parts. Accepts either raw `PcQc2`s or
+    /// `Verified<PcQc2>`s for `qc2_xpp` / `qc2_xpe`.
     #[must_use]
     #[allow(clippy::similar_names)] // paper notation: x_pp / x_pe and qc2_xpp / qc2_xpe
-    pub const fn new(
+    pub fn new(
         x_pp: PcVector,
-        qc2_xpp: PcQc2,
+        qc2_xpp: impl Into<Verifiable<PcQc2>>,
         x_pe: Option<PcVector>,
-        qc2_xpe: Option<PcQc2>,
+        qc2_xpe: Option<Verifiable<PcQc2>>,
         all_signers: SignerBitfield,
         signer_lengths: PcSignerLengths,
         agg_sig: Bls12381G2Signature,
     ) -> Self {
         Self {
             x_pp,
-            qc2_xpp,
+            qc2_xpp: qc2_xpp.into(),
             x_pe,
             qc2_xpe,
             all_signers,
@@ -666,9 +699,15 @@ impl PcQc3 {
         &self.x_pp
     }
 
-    /// `PcQc2` for the round-3 vote that attained `x_pp`.
+    /// `PcQc2` for the round-3 vote that attained `x_pp` (raw view).
     #[must_use]
-    pub const fn qc2_xpp(&self) -> &PcQc2 {
+    pub fn qc2_xpp(&self) -> &PcQc2 {
+        self.qc2_xpp.as_unverified()
+    }
+
+    /// Embedded `PcQc2` for `x_pp` including its verification marker.
+    #[must_use]
+    pub const fn qc2_xpp_verifiable(&self) -> &Verifiable<PcQc2> {
         &self.qc2_xpp
     }
 
@@ -683,7 +722,20 @@ impl PcQc3 {
     /// Returns `qc2_xpp` when the high coincides with the low.
     #[must_use]
     pub fn qc2_xpe(&self) -> &PcQc2 {
-        self.qc2_xpe.as_ref().unwrap_or(&self.qc2_xpp)
+        self.qc2_xpe
+            .as_ref()
+            .map_or_else(|| self.qc2_xpp.as_unverified(), Verifiable::as_unverified)
+    }
+
+    /// Embedded `PcQc2` for `x_pe` including its verification marker.
+    /// Resolves dedup encoding — returns the `x_pp` slot when high
+    /// coincides with low.
+    #[must_use]
+    pub const fn qc2_xpe_verifiable(&self) -> &Verifiable<PcQc2> {
+        match &self.qc2_xpe {
+            Some(v) => v,
+            None => &self.qc2_xpp,
+        }
     }
 
     /// Round-3 signer bitfield, positional against the committee.
@@ -1011,7 +1063,10 @@ pub fn verify_vote2(
     if v2.prefix_sigs().len() != v2.x().len() + 1 {
         return false;
     }
-    if !verify_qc1(v2.qc1(), network, pc_ctx, committee) {
+    // Embedded QC1: trust the marker when set (sealed construction); otherwise
+    // run the full predicate. Same shape as the round-3 / QC-3 composite gates.
+    if v2.qc1_verifiable().verified().is_none() && !verify_qc1(v2.qc1(), network, pc_ctx, committee)
+    {
         return false;
     }
     // Vote2's `x` must be the QC1Certify output of its embedded QC1.
@@ -1178,7 +1233,8 @@ pub fn verify_vote3(
     if !aggregate_verify_bls_different_messages(&[msg.as_slice()], &v3.sig_xp(), &[pk]) {
         return false;
     }
-    if !verify_qc2(v3.qc2(), network, pc_ctx, committee) {
+    if v3.qc2_verifiable().verified().is_none() && !verify_qc2(v3.qc2(), network, pc_ctx, committee)
+    {
         return false;
     }
     v3.x_p() == v3.qc2().x_p()
@@ -1214,10 +1270,14 @@ pub fn verify_qc3(
     if !qc3.x_pp().is_prefix_of(x_pe) {
         return false;
     }
-    if !verify_qc2(qc3.qc2_xpp(), network, pc_ctx, committee) {
+    if qc3.qc2_xpp_verifiable().verified().is_none()
+        && !verify_qc2(qc3.qc2_xpp(), network, pc_ctx, committee)
+    {
         return false;
     }
-    if !verify_qc2(qc2_xpe, network, pc_ctx, committee) {
+    if qc3.qc2_xpe_verifiable().verified().is_none()
+        && !verify_qc2(qc2_xpe, network, pc_ctx, committee)
+    {
         return false;
     }
     if qc3.qc2_xpp().x_p() != qc3.x_pp() {
@@ -1331,14 +1391,18 @@ pub fn sign_vote1(
 /// invariant is unforgeable at the source. The length attestation
 /// pins `|x|`, closing the prefix-sig splice attack on
 /// [`PcXpProof::ShortWitness`] verification.
+///
+/// Accepts either a raw `PcQc1` or a `Verified<PcQc1>` — the wrapper
+/// preserves the marker through `PcVote2.qc1`.
 #[must_use]
 pub fn sign_vote2(
     sk: &Bls12381G1PrivateKey,
     validator: ValidatorId,
     network: &NetworkDefinition,
     pc_ctx: &PcContext,
-    qc1: PcQc1,
+    qc1: impl Into<Verifiable<PcQc1>>,
 ) -> PcVote2 {
+    let qc1: Verifiable<PcQc1> = qc1.into();
     let x = qc1.x().clone();
     let prefix_sigs = sign_all_prefixes(sk, network, pc_ctx, &x, DOMAIN_PC_VOTE2);
     let length_attestation = sk.sign_v1(&length_attestation_message(network, pc_ctx, x.len()));
@@ -1349,15 +1413,17 @@ pub fn sign_vote2(
 ///
 /// `x_p` is derived from `qc2`, and the individual sig over `x_p`
 /// rides separately from the per-prefix fan-out used in rounds 1/2
-/// (round 3 only needs the single `x_p` commitment).
+/// (round 3 only needs the single `x_p` commitment). Accepts either
+/// a raw `PcQc2` or a `Verified<PcQc2>`.
 #[must_use]
 pub fn sign_vote3(
     sk: &Bls12381G1PrivateKey,
     validator: ValidatorId,
     network: &NetworkDefinition,
     pc_ctx: &PcContext,
-    qc2: PcQc2,
+    qc2: impl Into<Verifiable<PcQc2>>,
 ) -> PcVote3 {
+    let qc2: Verifiable<PcQc2> = qc2.into();
     let x_p = qc2.x_p().clone();
     let sig_xp = sk.sign_v1(&pc_vote_signing_message(
         network,
@@ -1571,12 +1637,12 @@ pub fn build_qc3(votes: &[&PcVote3], committee: &[(ValidatorId, Bls12381G1Public
     let qc2_xpp = votes
         .iter()
         .find(|v| v.x_p() == &x_pp)
-        .map(|v| v.qc2().clone())
+        .map(|v| v.qc2_verifiable().clone())
         .expect("x_pp is some vote's x_p");
     let qc2_xpe_full = votes
         .iter()
         .find(|v| v.x_p() == &x_pe)
-        .map(|v| v.qc2().clone())
+        .map(|v| v.qc2_verifiable().clone())
         .expect("x_pe is some vote's x_p");
 
     let n = committee.len();
@@ -1637,6 +1703,304 @@ fn mcp_two(a: &PcVector, b: &PcVector) -> usize {
         k += 1;
     }
     k
+}
+
+// ── Typestate ──────────────────────────────────────────────────────────────
+
+/// Shared verification context for all PC vote / QC predicates.
+///
+/// Bundles the per-instance binding context (`network`, `pc_ctx`) with
+/// the committee that every signer must be drawn from. The Verify impls
+/// for [`PcVote1`] / [`PcVote2`] / [`PcVote3`] / [`PcQc1`] / [`PcQc2`] /
+/// [`PcQc3`] / [`PcVoteMessage`] all take this context.
+#[derive(Debug, Clone, Copy)]
+pub struct PcVoteVerifyContext<'a> {
+    /// Network the signer was bound to.
+    pub network: &'a NetworkDefinition,
+    /// Canonical signing context for this `(epoch, view)`.
+    pub pc_ctx: &'a PcContext,
+    /// Committee membership and pubkeys.
+    pub committee: &'a [(ValidatorId, Bls12381G1PublicKey)],
+}
+
+/// Verification context for [`PcVoteEquivocation`].
+///
+/// The evidence carries its own `(epoch, view, round)`, so only the
+/// network binding and committee are needed externally.
+#[derive(Debug, Clone, Copy)]
+pub struct PcVoteEquivocationContext<'a> {
+    /// Network the equivocator was bound to.
+    pub network: &'a NetworkDefinition,
+    /// Committee membership and pubkeys.
+    pub committee: &'a [(ValidatorId, Bls12381G1PublicKey)],
+}
+
+/// Coarse-grained verification failure for a round-1 vote.
+///
+/// Failure modes (committee membership, signature aggregation,
+/// per-prefix BLS check) are summarized into one variant; the verifier
+/// log line records the specific reason at the rejection site.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+#[error("PcVote1 verification failed")]
+pub struct PcVote1VerifyError;
+
+/// Coarse-grained verification failure for a round-1 QC.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+#[error("PcQc1 verification failed")]
+pub struct PcQc1VerifyError;
+
+/// Coarse-grained verification failure for a round-2 vote.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+#[error("PcVote2 verification failed")]
+pub struct PcVote2VerifyError;
+
+/// Coarse-grained verification failure for a round-2 QC.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+#[error("PcQc2 verification failed")]
+pub struct PcQc2VerifyError;
+
+/// Coarse-grained verification failure for a round-3 vote.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+#[error("PcVote3 verification failed")]
+pub struct PcVote3VerifyError;
+
+/// Coarse-grained verification failure for a round-3 QC.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+#[error("PcQc3 verification failed")]
+pub struct PcQc3VerifyError;
+
+/// Verification failure for the enum carrier — names the inner round
+/// whose verifier produced the failure.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum PcVoteMessageVerifyError {
+    /// Round-1 vote verification failed.
+    #[error("round-1: {0}")]
+    Vote1(#[source] PcVote1VerifyError),
+    /// Round-2 vote verification failed.
+    #[error("round-2: {0}")]
+    Vote2(#[source] PcVote2VerifyError),
+    /// Round-3 vote verification failed.
+    #[error("round-3: {0}")]
+    Vote3(#[source] PcVote3VerifyError),
+}
+
+/// Coarse-grained verification failure for vote-equivocation evidence.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+#[error("PcVoteEquivocation verification failed")]
+pub struct PcVoteEquivocationVerifyError;
+
+impl Verify<&PcVoteVerifyContext<'_>> for PcVote1 {
+    type Error = PcVote1VerifyError;
+
+    fn verify(&self, ctx: &PcVoteVerifyContext<'_>) -> Result<Verified<Self>, Self::Error> {
+        if verify_vote1(self, ctx.network, ctx.pc_ctx, ctx.committee) {
+            Ok(Verified::new_unchecked(self.clone()))
+        } else {
+            Err(PcVote1VerifyError)
+        }
+    }
+}
+
+impl Verify<&PcVoteVerifyContext<'_>> for PcQc1 {
+    type Error = PcQc1VerifyError;
+
+    fn verify(&self, ctx: &PcVoteVerifyContext<'_>) -> Result<Verified<Self>, Self::Error> {
+        if verify_qc1(self, ctx.network, ctx.pc_ctx, ctx.committee) {
+            Ok(Verified::new_unchecked(self.clone()))
+        } else {
+            Err(PcQc1VerifyError)
+        }
+    }
+}
+
+impl Verify<&PcVoteVerifyContext<'_>> for PcVote2 {
+    type Error = PcVote2VerifyError;
+
+    fn verify(&self, ctx: &PcVoteVerifyContext<'_>) -> Result<Verified<Self>, Self::Error> {
+        if verify_vote2(self, ctx.network, ctx.pc_ctx, ctx.committee) {
+            Ok(Verified::new_unchecked(self.clone()))
+        } else {
+            Err(PcVote2VerifyError)
+        }
+    }
+}
+
+impl Verify<&PcVoteVerifyContext<'_>> for PcQc2 {
+    type Error = PcQc2VerifyError;
+
+    fn verify(&self, ctx: &PcVoteVerifyContext<'_>) -> Result<Verified<Self>, Self::Error> {
+        if verify_qc2(self, ctx.network, ctx.pc_ctx, ctx.committee) {
+            Ok(Verified::new_unchecked(self.clone()))
+        } else {
+            Err(PcQc2VerifyError)
+        }
+    }
+}
+
+impl Verify<&PcVoteVerifyContext<'_>> for PcVote3 {
+    type Error = PcVote3VerifyError;
+
+    fn verify(&self, ctx: &PcVoteVerifyContext<'_>) -> Result<Verified<Self>, Self::Error> {
+        if verify_vote3(self, ctx.network, ctx.pc_ctx, ctx.committee) {
+            Ok(Verified::new_unchecked(self.clone()))
+        } else {
+            Err(PcVote3VerifyError)
+        }
+    }
+}
+
+impl Verify<&PcVoteVerifyContext<'_>> for PcQc3 {
+    type Error = PcQc3VerifyError;
+
+    fn verify(&self, ctx: &PcVoteVerifyContext<'_>) -> Result<Verified<Self>, Self::Error> {
+        if verify_qc3(self, ctx.network, ctx.pc_ctx, ctx.committee) {
+            Ok(Verified::new_unchecked(self.clone()))
+        } else {
+            Err(PcQc3VerifyError)
+        }
+    }
+}
+
+impl Verify<&PcVoteVerifyContext<'_>> for PcVoteMessage {
+    type Error = PcVoteMessageVerifyError;
+
+    fn verify(&self, ctx: &PcVoteVerifyContext<'_>) -> Result<Verified<Self>, Self::Error> {
+        match self {
+            Self::Vote1(v) => v
+                .verify(ctx)
+                .map(|_| Verified::new_unchecked(self.clone()))
+                .map_err(PcVoteMessageVerifyError::Vote1),
+            Self::Vote2(v) => (**v)
+                .verify(ctx)
+                .map(|_| Verified::new_unchecked(self.clone()))
+                .map_err(PcVoteMessageVerifyError::Vote2),
+            Self::Vote3(v) => (**v)
+                .verify(ctx)
+                .map(|_| Verified::new_unchecked(self.clone()))
+                .map_err(PcVoteMessageVerifyError::Vote3),
+        }
+    }
+}
+
+impl Verify<&PcVoteEquivocationContext<'_>> for PcVoteEquivocation {
+    type Error = PcVoteEquivocationVerifyError;
+
+    fn verify(&self, ctx: &PcVoteEquivocationContext<'_>) -> Result<Verified<Self>, Self::Error> {
+        if verify_vote_equivocation(self, ctx.network, ctx.committee) {
+            Ok(Verified::new_unchecked(self.clone()))
+        } else {
+            Err(PcVoteEquivocationVerifyError)
+        }
+    }
+}
+
+// ── Named gates ────────────────────────────────────────────────────────────
+
+impl Verified<PcVote1> {
+    /// Sign a round-1 vote locally. The result is verified by
+    /// construction — the signer's own sigs hold by definition under
+    /// the private key.
+    #[must_use]
+    pub fn sign_local(
+        sk: &Bls12381G1PrivateKey,
+        validator: ValidatorId,
+        network: &NetworkDefinition,
+        pc_ctx: &PcContext,
+        v_in: PcVector,
+    ) -> Self {
+        Self::new_unchecked(sign_vote1(sk, validator, network, pc_ctx, v_in))
+    }
+}
+
+impl Verified<PcVote2> {
+    /// Sign a round-2 vote locally, anchored on a verified round-1 QC.
+    /// The embedded `qc1` carries its `Verified` marker through into
+    /// the produced `PcVote2`, so re-verification short-circuits.
+    #[must_use]
+    pub fn sign_local(
+        sk: &Bls12381G1PrivateKey,
+        validator: ValidatorId,
+        network: &NetworkDefinition,
+        pc_ctx: &PcContext,
+        qc1: Verified<PcQc1>,
+    ) -> Self {
+        Self::new_unchecked(sign_vote2(sk, validator, network, pc_ctx, qc1))
+    }
+}
+
+impl Verified<PcVote3> {
+    /// Sign a round-3 vote locally, anchored on a verified round-2 QC.
+    #[must_use]
+    pub fn sign_local(
+        sk: &Bls12381G1PrivateKey,
+        validator: ValidatorId,
+        network: &NetworkDefinition,
+        pc_ctx: &PcContext,
+        qc2: Verified<PcQc2>,
+    ) -> Self {
+        Self::new_unchecked(sign_vote3(sk, validator, network, pc_ctx, qc2))
+    }
+}
+
+impl Verified<PcQc1> {
+    /// Aggregate a round-1 quorum into a verified QC. Trust source: the
+    /// inputs are `Verified<PcVote1>` (each individual signature
+    /// already checked), and [`build_qc1`] runs the deterministic
+    /// aggregation matching the verifier's reconstruction.
+    #[must_use]
+    pub fn from_verified_votes(
+        votes: &[&Verified<PcVote1>],
+        committee: &[(ValidatorId, Bls12381G1PublicKey)],
+    ) -> Self {
+        let raw: Vec<&PcVote1> = votes.iter().map(|v| AsRef::as_ref(*v)).collect();
+        Self::new_unchecked(build_qc1(&raw, committee))
+    }
+}
+
+impl Verified<PcQc2> {
+    /// Aggregate a round-2 quorum into a verified QC.
+    #[must_use]
+    pub fn from_verified_votes(
+        votes: &[&Verified<PcVote2>],
+        committee: &[(ValidatorId, Bls12381G1PublicKey)],
+    ) -> Self {
+        let raw: Vec<&PcVote2> = votes.iter().map(|v| AsRef::as_ref(*v)).collect();
+        Self::new_unchecked(build_qc2(&raw, committee))
+    }
+}
+
+impl Verified<PcQc3> {
+    /// Aggregate a round-3 quorum into the verified terminal QC. The
+    /// embedded `qc2_xpp` / `qc2_xpe` slots inherit the `Verified`
+    /// marker carried on the input votes' embedded `qc2` fields.
+    #[must_use]
+    pub fn from_verified_votes(
+        votes: &[&Verified<PcVote3>],
+        committee: &[(ValidatorId, Bls12381G1PublicKey)],
+    ) -> Self {
+        let raw: Vec<&PcVote3> = votes.iter().map(|v| AsRef::as_ref(*v)).collect();
+        Self::new_unchecked(build_qc3(&raw, committee))
+    }
+}
+
+impl Verified<PcVoteMessage> {
+    /// Promote a verified round-1 vote into the enum carrier.
+    #[must_use]
+    pub fn from_verified_vote1(v: Verified<PcVote1>) -> Self {
+        Self::new_unchecked(PcVoteMessage::Vote1(v.into_inner()))
+    }
+
+    /// Promote a verified round-2 vote into the enum carrier.
+    #[must_use]
+    pub fn from_verified_vote2(v: Verified<PcVote2>) -> Self {
+        Self::new_unchecked(PcVoteMessage::Vote2(Box::new(v.into_inner())))
+    }
+
+    /// Promote a verified round-3 vote into the enum carrier.
+    #[must_use]
+    pub fn from_verified_vote3(v: Verified<PcVote3>) -> Self {
+        Self::new_unchecked(PcVoteMessage::Vote3(Box::new(v.into_inner())))
+    }
 }
 
 #[cfg(test)]
@@ -1821,7 +2185,7 @@ mod tests {
             sample_vector(2),
             sample_qc2(),
             Some(high.clone()),
-            Some(high_qc2.clone()),
+            Some(Verifiable::from(high_qc2.clone())),
             signers_bitfield(4, &[0, 1]),
             PcSignerLengths::PerSigner(vec![2u32, 3].into()),
             sample_sig(0xEE),
