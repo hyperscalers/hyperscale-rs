@@ -283,7 +283,8 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::VerifiedPcVote3Received { .. }
             | ProtocolEvent::SpcNewViewReceived { .. }
             | ProtocolEvent::SpcNewCommitReceived { .. }
-            | ProtocolEvent::SpcEmptyViewReceived { .. }
+            | ProtocolEvent::UnverifiedSpcEmptyViewReceived { .. }
+            | ProtocolEvent::VerifiedSpcEmptyViewReceived { .. }
             | ProtocolEvent::BeaconBlockReceived { .. }
             | ProtocolEvent::BeaconProposalReceived { .. }
             | ProtocolEvent::SkipRequestReceived { .. }

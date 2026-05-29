@@ -167,6 +167,27 @@ pub struct SpcProposalObject {
     pub cert: SpcCert,
 }
 
+/// `new-commit` message — an SPC participant announces a committed-low
+/// value at `view` along with the round-3 cert anchoring it as
+/// `proof.x_pp`.
+///
+/// Self-authenticating via the embedded `PcQc3`; no outer signature.
+/// Verifier predicate: the embedded QC3 verifies under
+/// `pc_context(spc_ctx, view)` and `proof.x_pp() == value`.
+#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
+pub struct SpcNewCommitMsg {
+    /// View whose inner PC produced this commit.
+    pub view: SpcView,
+    /// Committed low value (the round-1 PC output, `x_pp` in the
+    /// embedded cert).
+    pub value: PcVector,
+    /// PC round-3 cert anchoring `value` as `proof.x_pp`. Wire decode
+    /// lands `Verifiable::Unverified`; locally-built messages from
+    /// [`Verified::<SpcNewCommitMsg>::from_verified_proof`] preserve the
+    /// embedded marker.
+    pub proof: Verifiable<PcQc3>,
+}
+
 impl SpcCert {
     /// SBOR-encoded canonical bytes of this cert. Used by SPC
     /// proposal-object hashing to bind the cert into the input vector.
@@ -637,6 +658,11 @@ pub struct SpcProposalObjectVerifyError;
 #[error("SpcHighTriple verification failed")]
 pub struct SpcHighTripleVerifyError;
 
+/// Coarse-grained verification failure for a new-commit message.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+#[error("SpcNewCommitMsg verification failed")]
+pub struct SpcNewCommitMsgVerifyError;
+
 impl Verify<&SpcVerifyContext<'_>> for SpcEmptyViewMsg {
     type Error = SpcEmptyViewMsgVerifyError;
 
@@ -696,6 +722,32 @@ impl Verify<&SpcVerifyContext<'_>> for SpcHighTriple {
         }
         if self.proof.x_pe() != &self.value {
             return Err(SpcHighTripleVerifyError);
+        }
+        Ok(Verified::new_unchecked(self.clone()))
+    }
+}
+
+impl Verify<&SpcVerifyContext<'_>> for SpcNewCommitMsg {
+    type Error = SpcNewCommitMsgVerifyError;
+
+    /// New-commit predicate: embedded `proof` verifies under
+    /// `pc_context(spc_ctx, view)` and `proof.x_pp() == value` (the
+    /// committed low value matches the embedded round-3 cert's `x_pp`).
+    /// Short-circuits the embedded QC3 check when its marker is live.
+    fn verify(&self, ctx: &SpcVerifyContext<'_>) -> Result<Verified<Self>, Self::Error> {
+        let pc_ctx = pc_context(ctx.spc_ctx, self.view);
+        if self.proof.verified().is_none()
+            && !verify_qc3(
+                self.proof.as_unverified(),
+                ctx.network,
+                &pc_ctx,
+                ctx.committee,
+            )
+        {
+            return Err(SpcNewCommitMsgVerifyError);
+        }
+        if self.proof.x_pp() != &self.value {
+            return Err(SpcNewCommitMsgVerifyError);
         }
         Ok(Verified::new_unchecked(self.clone()))
     }
@@ -782,6 +834,14 @@ impl Verified<SpcProposalObject> {
             cert: cert.into_inner(),
         })
     }
+
+    /// Wrap a locally-assembled proposal object whose backing cert was
+    /// produced from verified inputs. Mirror of
+    /// [`Verified::<PcQc1>::from_local_build`].
+    #[must_use]
+    pub const fn from_local_build(po: SpcProposalObject) -> Self {
+        Self::new_unchecked(po)
+    }
 }
 
 impl Verified<SpcHighTriple> {
@@ -804,6 +864,30 @@ impl Verified<SpcHighTriple> {
     #[must_use]
     pub const fn from_local_build(triple: SpcHighTriple) -> Self {
         Self::new_unchecked(triple)
+    }
+}
+
+impl Verified<SpcNewCommitMsg> {
+    /// Build a verified new-commit message from a verified round-3
+    /// attestation. The committed-low value is extracted from
+    /// `proof.x_pp()`; the embedded marker rides through to the
+    /// message's `proof` field.
+    #[must_use]
+    pub fn from_verified_proof(view: SpcView, proof: Verified<PcQc3>) -> Self {
+        let value = proof.x_pp().clone();
+        Self::new_unchecked(SpcNewCommitMsg {
+            view,
+            value,
+            proof: Verifiable::from(proof),
+        })
+    }
+
+    /// Wrap a locally-built new-commit message whose backing inputs were
+    /// already verified upstream. Mirror of
+    /// [`Verified::<PcQc1>::from_local_build`].
+    #[must_use]
+    pub const fn from_local_build(msg: SpcNewCommitMsg) -> Self {
+        Self::new_unchecked(msg)
     }
 }
 

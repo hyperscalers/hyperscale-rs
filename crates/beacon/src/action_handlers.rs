@@ -17,9 +17,9 @@ use hyperscale_types::network::notification::{
     SpcEmptyViewMsgNotification, SpcNewCommitNotification, SpcNewViewNotification,
 };
 use hyperscale_types::{
-    BeaconProposal, PcQc1, PcQc2, PcVote1, PcVote2, PcVote3, PcVoteVerifyContext, SpcHighTriple,
-    SpcProposalObject, Verifiable, Verified, pc_context, sign_empty_view_msg, spc_context,
-    verify_cert, verify_empty_view_msg, verify_qc3, vrf_sign,
+    BeaconProposal, PcQc1, PcQc2, PcVote1, PcVote2, PcVote3, PcVoteVerifyContext, SpcEmptyViewMsg,
+    SpcHighTriple, SpcNewCommitMsg, SpcProposalObject, SpcVerifyContext, Verifiable, Verified,
+    pc_context, spc_context, vrf_sign,
 };
 use tracing::warn;
 
@@ -113,35 +113,44 @@ where
             recipients,
         } => {
             let spc_ctx = spc_context(epoch);
-            let msg = sign_empty_view_msg(ctx.signing_key, me, network, &spc_ctx, view, *reported);
-            ctx.network
-                .notify(&recipients, &SpcEmptyViewMsgNotification::new(msg.clone()));
-            ctx.notify_protocol(ProtocolEvent::SpcEmptyViewReceived { msg: Box::new(msg) });
+            let reported_verified = Verified::<SpcHighTriple>::from_local_build(*reported);
+            let verified = Verified::<SpcEmptyViewMsg>::sign_local(
+                ctx.signing_key,
+                me,
+                network,
+                &spc_ctx,
+                view,
+                reported_verified,
+            );
+            ctx.network.notify(
+                &recipients,
+                &SpcEmptyViewMsgNotification::new(Arc::new(Verifiable::from(verified.clone()))),
+            );
+            ctx.notify_protocol(ProtocolEvent::VerifiedSpcEmptyViewReceived {
+                msg: Box::new(verified),
+            });
         }
         Action::BroadcastSpcNewView {
             epoch: _,
-            view,
-            cert,
+            proposal,
             recipients,
         } => {
-            let proposal = SpcProposalObject { view, cert: *cert };
-            ctx.network
-                .notify(&recipients, &SpcNewViewNotification::new(proposal));
+            let verified = Verified::<SpcProposalObject>::from_local_build(*proposal);
+            ctx.network.notify(
+                &recipients,
+                &SpcNewViewNotification::new(Arc::new(Verifiable::from(verified))),
+            );
         }
         Action::BroadcastSpcNewCommit {
             epoch: _,
-            view,
-            value,
-            proof,
+            msg,
             recipients,
         } => {
-            let triple = SpcHighTriple {
-                view,
-                value,
-                proof: Verifiable::from(*proof),
-            };
-            ctx.network
-                .notify(&recipients, &SpcNewCommitNotification::new(triple));
+            let verified = Verified::<SpcNewCommitMsg>::from_local_build(*msg);
+            ctx.network.notify(
+                &recipients,
+                &SpcNewCommitNotification::new(Arc::new(Verifiable::from(verified))),
+            );
         }
         Action::BuildAndBroadcastBeaconProposal {
             epoch,
@@ -266,40 +275,37 @@ where
         Action::VerifySpcNewView {
             epoch,
             from,
-            view,
-            cert,
+            proposal,
             committee,
         } => {
             let spc_ctx = spc_context(epoch);
-            let valid = verify_cert(&cert, view, network, &spc_ctx, &committee);
+            let result = (*proposal).upgrade(&SpcVerifyContext {
+                network,
+                spc_ctx: &spc_ctx,
+                committee: &committee,
+            });
             ctx.notify_protocol(ProtocolEvent::SpcNewViewVerified {
                 epoch,
                 from,
-                view,
-                cert,
-                valid,
+                result: result.map_err(|(_, e)| e),
             });
         }
         Action::VerifySpcNewCommit {
             epoch,
             from,
-            view,
-            value,
-            proof,
+            msg,
             committee,
         } => {
-            let pc_ctx = pc_context(&spc_context(epoch), view);
-            // `proof.x_pp() == value` is an FSM-level invariant the
-            // post-verify path enforces; the crypto pool only checks the
-            // BLS aggregate over the embedded QC3.
-            let valid = verify_qc3(&proof, network, &pc_ctx, &committee);
+            let spc_ctx = spc_context(epoch);
+            let result = (*msg).upgrade(&SpcVerifyContext {
+                network,
+                spc_ctx: &spc_ctx,
+                committee: &committee,
+            });
             ctx.notify_protocol(ProtocolEvent::SpcNewCommitVerified {
                 epoch,
                 from,
-                view,
-                value,
-                proof,
-                valid,
+                result: result.map_err(|(_, e)| e),
             });
         }
         Action::VerifySpcEmptyView {
@@ -308,8 +314,15 @@ where
             committee,
         } => {
             let spc_ctx = spc_context(epoch);
-            let valid = verify_empty_view_msg(&msg, network, &spc_ctx, &committee);
-            ctx.notify_protocol(ProtocolEvent::SpcEmptyViewVerified { epoch, msg, valid });
+            let result = (*msg).upgrade(&SpcVerifyContext {
+                network,
+                spc_ctx: &spc_ctx,
+                committee: &committee,
+            });
+            ctx.notify_protocol(ProtocolEvent::SpcEmptyViewVerified {
+                epoch,
+                result: result.map_err(|(_, e)| e),
+            });
         }
         _ => unreachable!("hyperscale_beacon::handle_action called with non-beacon action"),
     }

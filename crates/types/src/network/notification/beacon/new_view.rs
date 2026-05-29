@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use sbor::prelude::BasicSbor;
 
-use crate::{MessageClass, NetworkMessage, SpcProposalObject};
+use crate::{MessageClass, NetworkMessage, SpcProposalObject, Verifiable};
 
 /// View-entry authorization sent by the leader of an SPC view.
 ///
@@ -14,31 +14,37 @@ use crate::{MessageClass, NetworkMessage, SpcProposalObject};
 /// built from `f+1` empty-view attestations). The cert is
 /// self-authenticating — verifiers check the embedded `PcQc3` (Direct)
 /// or `f+1` skip-sig set (Indirect) — so the notification carries no
-/// outer signature.
+/// outer signature. Wire decode lands the wrapper as
+/// `Verifiable::Unverified`; locally-dispatched sends preserve the
+/// `Verified` marker.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct SpcNewViewNotification {
     /// The proposal object.
-    pub proposal: Arc<SpcProposalObject>,
+    pub proposal: Arc<Verifiable<SpcProposalObject>>,
 }
 
 impl SpcNewViewNotification {
-    /// Wrap an [`SpcProposalObject`] for notification.
+    /// Wrap an [`SpcProposalObject`] for notification. Accepts a raw
+    /// proposal or a `Verified<SpcProposalObject>` — the wrapper
+    /// preserves the marker.
     #[must_use]
-    pub fn new(proposal: impl Into<Arc<SpcProposalObject>>) -> Self {
+    pub fn new(proposal: impl Into<Arc<Verifiable<SpcProposalObject>>>) -> Self {
         Self {
             proposal: proposal.into(),
         }
     }
 
-    /// Get the inner proposal object.
+    /// Get the inner proposal object (raw view, regardless of
+    /// verification state).
     #[must_use]
     pub fn proposal(&self) -> &SpcProposalObject {
-        &self.proposal
+        self.proposal.as_unverified()
     }
 
-    /// Consume and return the inner proposal object.
+    /// Consume and return the inner proposal object, preserving the
+    /// verification marker.
     #[must_use]
-    pub fn into_proposal(self) -> Arc<SpcProposalObject> {
+    pub fn into_proposal(self) -> Arc<Verifiable<SpcProposalObject>> {
         self.proposal
     }
 }
@@ -96,7 +102,7 @@ mod tests {
 
     #[test]
     fn sbor_round_trip() {
-        let n = SpcNewViewNotification::new(sample_proposal());
+        let n = SpcNewViewNotification::new(Arc::new(Verifiable::from(sample_proposal())));
         let bytes = basic_encode(&n).unwrap();
         let decoded: SpcNewViewNotification = basic_decode(&bytes).unwrap();
         assert_eq!(n, decoded);

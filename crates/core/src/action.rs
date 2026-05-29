@@ -10,10 +10,10 @@ use hyperscale_types::{
     BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PublicKey, CertificateRoot,
     CertifiedBeaconBlock, CertifiedBlock, CertifiedBlockHeader, Epoch, ExecutionCertificate,
     ExecutionVote, FinalizedWave, GlobalReceiptRoot, Hash, InFlightCount, LeafIndex,
-    LocalReceiptRoot, NodeId, PcQc1, PcQc2, PcQc3, PcVector, PcVote1, PcVote2, PcVote3,
-    ProposerTimestamp, ProvisionHash, ProvisionTxRootsMap, Provisions, ProvisionsRoot,
-    QuorumCertificate, ReadySignal, Round, RoutableTransaction, ShardGroupId, SharedCertificates,
-    SharedTransactions, SkipEpochCert, SkipRequest, SpcCert, SpcEmptyViewMsg, SpcHighTriple,
+    LocalReceiptRoot, NodeId, PcQc1, PcQc2, PcVector, PcVote1, PcVote2, PcVote3, ProposerTimestamp,
+    ProvisionHash, ProvisionTxRootsMap, Provisions, ProvisionsRoot, QuorumCertificate, ReadySignal,
+    Round, RoutableTransaction, ShardGroupId, SharedCertificates, SharedTransactions,
+    SkipEpochCert, SkipRequest, SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject,
     SpcView, StateRoot, SubstateEntry, TopologySnapshot, TransactionRoot, TransactionStatus,
     TxHash, TxOutcome, ValidatorId, Verifiable, Verified, VotePower, WaveId, WeightedTimestamp,
     Witness,
@@ -844,13 +844,16 @@ pub enum Action {
 
     /// Sign an SPC empty-view attestation and broadcast it. Feeds the
     /// signed message back to the state machine via
-    /// `ProtocolEvent::SpcEmptyViewReceived`.
+    /// `ProtocolEvent::VerifiedSpcEmptyViewReceived`.
     SignAndBroadcastEmptyView {
         /// Epoch the SPC instance belongs to.
         epoch: Epoch,
         /// View this empty-view attestation skips.
         view: SpcView,
-        /// Local max high triple reported in the attestation.
+        /// Local max high triple reported in the attestation. The FSM
+        /// pools triples only after their backing PC instance has
+        /// produced a verified high, so the handler can wrap this in
+        /// `Verified::<SpcHighTriple>::from_local_build` before signing.
         reported: Box<SpcHighTriple>,
         /// SPC committee members the message ships to (excluding
         /// self).
@@ -862,10 +865,11 @@ pub enum Action {
     BroadcastSpcNewView {
         /// Epoch the SPC instance belongs to.
         epoch: Epoch,
-        /// View this notification authorises entry to.
-        view: SpcView,
-        /// Cert backing the authorisation.
-        cert: Box<SpcCert>,
+        /// Proposal object pairing the view with its backing cert. The
+        /// FSM assembled the cert from verified inputs, so the handler
+        /// wraps with [`Verified::<SpcProposalObject>::from_local_build`]
+        /// before notifying.
+        proposal: Box<SpcProposalObject>,
         /// SPC committee members the notification ships to (excluding
         /// self).
         recipients: Vec<ValidatorId>,
@@ -876,12 +880,11 @@ pub enum Action {
     BroadcastSpcNewCommit {
         /// Epoch the SPC instance belongs to.
         epoch: Epoch,
-        /// View whose inner PC produced this commit.
-        view: SpcView,
-        /// Committed low value.
-        value: PcVector,
-        /// PC round-3 cert anchoring `value` as `proof.x_pp`.
-        proof: Box<PcQc3>,
+        /// Committed-low message. The FSM produced this from a verified
+        /// inner-PC QC3, so the handler wraps with
+        /// [`Verified::<SpcNewCommitMsg>::from_local_build`] before
+        /// notifying.
+        msg: Box<SpcNewCommitMsg>,
         /// SPC committee members the notification ships to (excluding
         /// self).
         recipients: Vec<ValidatorId>,
@@ -1025,37 +1028,35 @@ pub enum Action {
         committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
     },
 
-    /// Verify an SPC `NewView` cert authorising entry to `view`. Result
-    /// returns via [`ProtocolEvent::SpcNewViewVerified`].
+    /// Verify an SPC `NewView` proposal object. Result returns via
+    /// [`ProtocolEvent::SpcNewViewVerified`] carrying the typed
+    /// verified handle on success.
     VerifySpcNewView {
         /// Epoch the SPC instance belongs to.
         epoch: Epoch,
         /// Sender of the `NewView` (carried back through the result event).
         from: ValidatorId,
-        /// View this cert authorises entry to.
-        view: SpcView,
-        /// Cert to verify.
-        cert: Box<SpcCert>,
+        /// Proposal object to verify. A [`Verifiable::Verified`]
+        /// wrapper short-circuits the dispatch.
+        proposal: Box<Verifiable<SpcProposalObject>>,
         /// Beacon committee at `epoch`, positional order.
         committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
     },
 
-    /// Verify an SPC `NewCommit`'s embedded [`PcQc3`]. Result returns
-    /// via [`ProtocolEvent::SpcNewCommitVerified`].
+    /// Verify an SPC `NewCommit` message. Result returns via
+    /// [`ProtocolEvent::SpcNewCommitVerified`].
     VerifySpcNewCommit {
         /// Epoch the SPC instance belongs to.
         epoch: Epoch,
         /// Wire-level sender — carried back through the result so the
         /// coordinator can clear its per-`(epoch, view, sender)`
-        /// pipeline slot. `NewCommit` is self-authenticating via
-        /// `proof`, so this label is dedup metadata only.
+        /// pipeline slot. `NewCommit` is self-authenticating via the
+        /// embedded `proof`, so this label is dedup metadata only.
         from: ValidatorId,
-        /// SPC view whose inner PC produced this commit.
-        view: SpcView,
-        /// Committed low value.
-        value: PcVector,
-        /// PC round-3 cert anchoring `value` as `proof.x_pp`.
-        proof: Box<PcQc3>,
+        /// New-commit message to verify. A [`Verifiable::Verified`]
+        /// wrapper short-circuits dispatch; the embedded QC3 marker
+        /// shortcuts its sub-check.
+        msg: Box<Verifiable<SpcNewCommitMsg>>,
         /// Beacon committee at `epoch`, positional order.
         committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
     },
@@ -1065,8 +1066,9 @@ pub enum Action {
     VerifySpcEmptyView {
         /// Epoch the SPC instance belongs to.
         epoch: Epoch,
-        /// Attestation to verify.
-        msg: Box<SpcEmptyViewMsg>,
+        /// Attestation to verify. A [`Verifiable::Verified`] wrapper
+        /// short-circuits dispatch.
+        msg: Box<Verifiable<SpcEmptyViewMsg>>,
         /// Beacon committee at `epoch`, positional order.
         committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
     },

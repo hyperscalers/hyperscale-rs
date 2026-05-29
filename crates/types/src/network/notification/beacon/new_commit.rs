@@ -4,40 +4,45 @@ use std::sync::Arc;
 
 use sbor::prelude::BasicSbor;
 
-use crate::{MessageClass, NetworkMessage, SpcHighTriple};
+use crate::{MessageClass, NetworkMessage, SpcNewCommitMsg, Verifiable};
 
-/// Committed-high announcement broadcast within the slot's committee
-/// when an SPC participant commits a verifiable high value.
+/// Committed-low announcement broadcast within the slot's committee
+/// when an SPC participant commits a verifiable low value.
 ///
-/// The inner [`SpcHighTriple`] is self-authenticating via its embedded
-/// `PcQc3` — verifiers check the committee aggregate in the proof.
-/// The notification carries no outer signature; sender identity is
-/// not load-bearing for verification.
+/// The inner [`SpcNewCommitMsg`] is self-authenticating via its
+/// embedded `PcQc3` — verifiers check the committee aggregate in the
+/// proof and that `proof.x_pp() == value`. The notification carries
+/// no outer signature; sender identity is not load-bearing for
+/// verification. Wire decode lands the wrapper as
+/// `Verifiable::Unverified`; locally-dispatched sends preserve the
+/// `Verified` marker.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct SpcNewCommitNotification {
-    /// The committed high triple.
-    pub triple: Arc<SpcHighTriple>,
+    /// The committed new-commit message.
+    pub msg: Arc<Verifiable<SpcNewCommitMsg>>,
 }
 
 impl SpcNewCommitNotification {
-    /// Wrap an [`SpcHighTriple`] for notification.
+    /// Wrap an [`SpcNewCommitMsg`] for notification. Accepts a raw
+    /// message or a `Verified<SpcNewCommitMsg>` — the wrapper preserves
+    /// the marker.
     #[must_use]
-    pub fn new(triple: impl Into<Arc<SpcHighTriple>>) -> Self {
-        Self {
-            triple: triple.into(),
-        }
+    pub fn new(msg: impl Into<Arc<Verifiable<SpcNewCommitMsg>>>) -> Self {
+        Self { msg: msg.into() }
     }
 
-    /// Get the inner triple.
+    /// Get the inner message (raw view, regardless of verification
+    /// state).
     #[must_use]
-    pub fn triple(&self) -> &SpcHighTriple {
-        &self.triple
+    pub fn msg(&self) -> &SpcNewCommitMsg {
+        self.msg.as_unverified()
     }
 
-    /// Consume and return the inner triple.
+    /// Consume and return the inner message, preserving the
+    /// verification marker.
     #[must_use]
-    pub fn into_triple(self) -> Arc<SpcHighTriple> {
-        self.triple
+    pub fn into_msg(self) -> Arc<Verifiable<SpcNewCommitMsg>> {
+        self.msg
     }
 }
 
@@ -81,8 +86,8 @@ mod tests {
         )
     }
 
-    fn sample_triple() -> SpcHighTriple {
-        SpcHighTriple {
+    fn sample_msg() -> SpcNewCommitMsg {
+        SpcNewCommitMsg {
             view: SpcView::new(4),
             value: PcVector::empty(),
             proof: sample_pc_qc3().into(),
@@ -91,7 +96,7 @@ mod tests {
 
     #[test]
     fn sbor_round_trip() {
-        let n = SpcNewCommitNotification::new(sample_triple());
+        let n = SpcNewCommitNotification::new(Arc::new(Verifiable::from(sample_msg())));
         let bytes = basic_encode(&n).unwrap();
         let decoded: SpcNewCommitNotification = basic_decode(&bytes).unwrap();
         assert_eq!(n, decoded);
