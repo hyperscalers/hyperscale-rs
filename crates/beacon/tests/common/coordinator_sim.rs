@@ -25,12 +25,12 @@ use hyperscale_core::Action;
 use hyperscale_types::{
     BeaconCert, BeaconGenesisConfig, BeaconProposal, BeaconState, Bls12381G1PrivateKey,
     Bls12381G1PublicKey, CertifiedBeaconBlock, Epoch, GenesisPool, GenesisValidator,
-    NetworkDefinition, PcQc3, PcValueElement, PcVector, PcVote1, PcVote2, PcVote3,
-    PcVoteVerifyContext, Randomness, ShardGroupId, SkipEpochCert, SkipRequest, SpcCert,
-    SpcEmptyViewMsg, SpcView, Stake, StakePoolId, ValidatorId, Verifiable, Witness,
-    bls_keypair_from_seed, genesis_config_hash, pc_context, sign_empty_view_msg, sign_vote1,
-    sign_vote2, sign_vote3, spc_context, verify_block_cert, verify_cert, verify_empty_view_msg,
-    verify_qc3, verify_vote1, verify_vote2, verify_vote3, vrf_sign,
+    NetworkDefinition, PcValueElement, PcVector, PcVote1, PcVote2, PcVote3, PcVoteVerifyContext,
+    Randomness, ShardGroupId, SkipEpochCert, SkipRequest, SpcEmptyViewMsg, SpcNewCommitMsg,
+    SpcProposalObject, SpcVerifyContext, SpcView, Stake, StakePoolId, ValidatorId, Verifiable,
+    Witness, bls_keypair_from_seed, genesis_config_hash, pc_context, sign_empty_view_msg,
+    sign_vote1, sign_vote2, sign_vote3, spc_context, verify_block_cert, verify_vote1, verify_vote2,
+    verify_vote3, vrf_sign,
 };
 
 /// Adversarial transform a flagged replica applies to its next matching
@@ -87,17 +87,14 @@ enum SimEvent {
     },
     SpcNewView {
         from: ValidatorId,
-        view: SpcView,
-        cert: Box<SpcCert>,
+        proposal: Arc<Verifiable<SpcProposalObject>>,
     },
     SpcNewCommit {
         from: ValidatorId,
-        view: SpcView,
-        value: PcVector,
-        proof: Box<PcQc3>,
+        msg: Arc<Verifiable<SpcNewCommitMsg>>,
     },
     SpcEmptyView {
-        msg: Box<SpcEmptyViewMsg>,
+        msg: Arc<Verifiable<SpcEmptyViewMsg>>,
     },
     BeaconProposal {
         from: ValidatorId,
@@ -463,17 +460,14 @@ impl CoordinatorSim {
             SimEvent::PcVote3 { from, view, vote } => {
                 self.coordinators[env.to_idx].on_pc_vote3_received(from, view, vote)
             }
-            SimEvent::SpcNewView { from, view, cert } => {
-                self.coordinators[env.to_idx].on_spc_new_view_received(from, view, cert)
+            SimEvent::SpcNewView { from, proposal } => {
+                self.coordinators[env.to_idx].on_spc_new_view_received(from, proposal)
             }
-            SimEvent::SpcNewCommit {
-                from,
-                view,
-                value,
-                proof,
-            } => self.coordinators[env.to_idx].on_spc_new_commit_received(from, view, value, proof),
+            SimEvent::SpcNewCommit { from, msg } => {
+                self.coordinators[env.to_idx].on_spc_new_commit_received(from, msg)
+            }
             SimEvent::SpcEmptyView { msg } => {
-                self.coordinators[env.to_idx].on_spc_empty_view_received(msg)
+                self.coordinators[env.to_idx].on_unverified_spc_empty_view_received(msg)
             }
             SimEvent::BeaconProposal {
                 from,
@@ -638,7 +632,7 @@ impl CoordinatorSim {
                 recipients,
             } => {
                 let spc_ctx = spc_context(epoch);
-                let msg = sign_empty_view_msg(
+                let raw = sign_empty_view_msg(
                     &self.sks[emitter_idx],
                     me,
                     &self.network,
@@ -646,12 +640,14 @@ impl CoordinatorSim {
                     view,
                     *reported,
                 );
-                let msg = Box::new(msg);
+                let msg = Arc::new(Verifiable::from(raw));
                 for rcpt in &recipients {
                     let to_idx = self.idx_of(*rcpt);
                     self.network_q.push_back(Envelope {
                         to_idx,
-                        event: SimEvent::SpcEmptyView { msg: msg.clone() },
+                        event: SimEvent::SpcEmptyView {
+                            msg: Arc::clone(&msg),
+                        },
                     });
                 }
                 self.loopback_q.push_back(Envelope {
@@ -661,38 +657,34 @@ impl CoordinatorSim {
             }
             Action::BroadcastSpcNewView {
                 epoch: _,
-                view,
-                cert,
+                proposal,
                 recipients,
             } => {
+                let proposal = Arc::new(Verifiable::from(*proposal));
                 for rcpt in &recipients {
                     let to_idx = self.idx_of(*rcpt);
                     self.network_q.push_back(Envelope {
                         to_idx,
                         event: SimEvent::SpcNewView {
                             from: me,
-                            view,
-                            cert: cert.clone(),
+                            proposal: Arc::clone(&proposal),
                         },
                     });
                 }
             }
             Action::BroadcastSpcNewCommit {
                 epoch: _,
-                view,
-                value,
-                proof,
+                msg,
                 recipients,
             } => {
+                let msg = Arc::new(Verifiable::from(*msg));
                 for rcpt in &recipients {
                     let to_idx = self.idx_of(*rcpt);
                     self.network_q.push_back(Envelope {
                         to_idx,
                         event: SimEvent::SpcNewCommit {
                             from: me,
-                            view,
-                            value: value.clone(),
-                            proof: proof.clone(),
+                            msg: Arc::clone(&msg),
                         },
                     });
                 }
@@ -839,28 +831,39 @@ impl CoordinatorSim {
             Action::VerifySpcNewView {
                 epoch,
                 from,
-                view,
-                cert,
+                proposal,
                 committee,
             } => {
                 let spc_ctx = spc_context(epoch);
-                let valid = verify_cert(&cert, view, &self.network, &spc_ctx, &committee);
-                let post = self.coordinators[emitter_idx]
-                    .on_spc_new_view_verified(epoch, from, view, cert, valid);
+                let result = (*proposal).upgrade(&SpcVerifyContext {
+                    network: &self.network,
+                    spc_ctx: &spc_ctx,
+                    committee: &committee,
+                });
+                let post = self.coordinators[emitter_idx].on_spc_new_view_verified(
+                    epoch,
+                    from,
+                    result.map_err(|(_, e)| e),
+                );
                 self.absorb(emitter_idx, post);
             }
             Action::VerifySpcNewCommit {
                 epoch,
                 from,
-                view,
-                value,
-                proof,
+                msg,
                 committee,
             } => {
-                let pc_ctx = pc_context(&spc_context(epoch), view);
-                let valid = verify_qc3(&proof, &self.network, &pc_ctx, &committee);
-                let post = self.coordinators[emitter_idx]
-                    .on_spc_new_commit_verified(epoch, from, view, value, proof, valid);
+                let spc_ctx = spc_context(epoch);
+                let result = (*msg).upgrade(&SpcVerifyContext {
+                    network: &self.network,
+                    spc_ctx: &spc_ctx,
+                    committee: &committee,
+                });
+                let post = self.coordinators[emitter_idx].on_spc_new_commit_verified(
+                    epoch,
+                    from,
+                    result.map_err(|(_, e)| e),
+                );
                 self.absorb(emitter_idx, post);
             }
             Action::VerifySpcEmptyView {
@@ -869,9 +872,13 @@ impl CoordinatorSim {
                 committee,
             } => {
                 let spc_ctx = spc_context(epoch);
-                let valid = verify_empty_view_msg(&msg, &self.network, &spc_ctx, &committee);
-                let post =
-                    self.coordinators[emitter_idx].on_spc_empty_view_verified(epoch, msg, valid);
+                let result = (*msg).upgrade(&SpcVerifyContext {
+                    network: &self.network,
+                    spc_ctx: &spc_ctx,
+                    committee: &committee,
+                });
+                let post = self.coordinators[emitter_idx]
+                    .on_spc_empty_view_verified(epoch, result.map_err(|(_, e)| e));
                 self.absorb(emitter_idx, post);
             }
             Action::SetTimer { .. }

@@ -4,36 +4,42 @@ use std::sync::Arc;
 
 use sbor::prelude::BasicSbor;
 
-use crate::{MessageClass, NetworkMessage, SpcEmptyViewMsg};
+use crate::{MessageClass, NetworkMessage, SpcEmptyViewMsg, Verifiable};
 
 /// SPC empty-view declaration sent via unicast when a participant
 /// times out on a view without observing a leader proposal.
 ///
 /// The inner [`SpcEmptyViewMsg`] is self-authenticating — it carries
 /// the signer id and a BLS signature over the canonical empty-view
-/// signing bytes.
+/// signing bytes. Wire decode lands the wrapper as
+/// `Verifiable::Unverified`; locally-dispatched sends from a
+/// colocated signer preserve `Verifiable::Verified`.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct SpcEmptyViewMsgNotification {
     /// The empty-view message.
-    pub msg: Arc<SpcEmptyViewMsg>,
+    pub msg: Arc<Verifiable<SpcEmptyViewMsg>>,
 }
 
 impl SpcEmptyViewMsgNotification {
-    /// Wrap an [`SpcEmptyViewMsg`] for notification.
+    /// Wrap an [`SpcEmptyViewMsg`] for notification. Accepts a raw msg
+    /// or a `Verified<SpcEmptyViewMsg>` — the wrapper preserves the
+    /// marker.
     #[must_use]
-    pub fn new(msg: impl Into<Arc<SpcEmptyViewMsg>>) -> Self {
+    pub fn new(msg: impl Into<Arc<Verifiable<SpcEmptyViewMsg>>>) -> Self {
         Self { msg: msg.into() }
     }
 
-    /// Get the inner empty-view message.
+    /// Get the inner empty-view message (raw view, regardless of
+    /// verification state).
     #[must_use]
     pub fn msg(&self) -> &SpcEmptyViewMsg {
-        &self.msg
+        self.msg.as_unverified()
     }
 
-    /// Consume and return the inner empty-view message.
+    /// Consume and return the inner empty-view message, preserving the
+    /// verification marker.
     #[must_use]
-    pub fn into_msg(self) -> Arc<SpcEmptyViewMsg> {
+    pub fn into_msg(self) -> Arc<Verifiable<SpcEmptyViewMsg>> {
         self.msg
     }
 }
@@ -93,7 +99,7 @@ mod tests {
 
     #[test]
     fn sbor_round_trip() {
-        let n = SpcEmptyViewMsgNotification::new(sample_msg());
+        let n = SpcEmptyViewMsgNotification::new(Arc::new(Verifiable::from(sample_msg())));
         let bytes = basic_encode(&n).unwrap();
         let decoded: SpcEmptyViewMsgNotification = basic_decode(&bytes).unwrap();
         assert_eq!(n, decoded);

@@ -12,14 +12,15 @@ use hyperscale_types::{
     BlockHeight, BlockManifest, BlockVote, CertRootVerifyError, CertificateRoot,
     CertifiedBeaconBlock, CertifiedBlock, CertifiedBlockHeader, CertifiedHeaderVerifyError, Epoch,
     ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote, FinalizedWave,
-    FinalizedWaveVerifyError, LocalReceiptRoot, LocalReceiptRootVerifyError, PcQc3, PcVector,
-    PcVote1, PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3, PcVote3VerifyError,
+    FinalizedWaveVerifyError, LocalReceiptRoot, LocalReceiptRootVerifyError, PcVote1,
+    PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3, PcVote3VerifyError,
     ProvisionRootVerifyError, ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions,
     ProvisionsRoot, ProvisionsVerifyError, QcVerifyError, QuorumCertificate, ReadySignal, Round,
-    RoutableTransaction, ShardGroupId, ShardWitness, SkipEpochCert, SkipRequest, SpcCert,
-    SpcEmptyViewMsg, SpcView, StateRoot, StateRootVerifyError, StoredReceipt, TransactionRoot,
-    TxOutcome, TxRootVerifyError, ValidatorId, Verifiable, Verified, VotePower, WaveId,
-    WeightedTimestamp,
+    RoutableTransaction, ShardGroupId, ShardWitness, SkipEpochCert, SkipRequest, SpcEmptyViewMsg,
+    SpcEmptyViewMsgVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError, SpcProposalObject,
+    SpcProposalObjectVerifyError, SpcView, StateRoot, StateRootVerifyError, StoredReceipt,
+    TransactionRoot, TxOutcome, TxRootVerifyError, ValidatorId, Verifiable, Verified, VotePower,
+    WaveId, WeightedTimestamp,
 };
 
 /// How a node learned about the certifying QC that commits a given block.
@@ -717,16 +718,16 @@ pub enum ProtocolEvent {
         vote: Box<Verified<PcVote3>>,
     },
 
-    /// SPC `new-view` notification received from a peer. The cert is
-    /// self-authenticating; `from` only determines which validator's
-    /// proposal-object slot the coordinator fills on admission.
+    /// SPC `new-view` notification received from a peer. The proposal
+    /// is self-authenticating; `from` only determines which validator's
+    /// proposal-object slot the coordinator fills on admission. Wire
+    /// decode lands the wrapper as `Unverified`; locally-relayed
+    /// notifications preserve the `Verified` marker.
     SpcNewViewReceived {
         /// Sender id (transport-level).
         from: ValidatorId,
-        /// View the peer is entering.
-        view: SpcView,
-        /// Cert backing the entry.
-        cert: Box<SpcCert>,
+        /// Proposal object backing the entry.
+        proposal: Arc<Verifiable<SpcProposalObject>>,
     },
 
     /// SPC `new-commit` notification received from a peer.
@@ -735,20 +736,28 @@ pub enum ProtocolEvent {
     SpcNewCommitReceived {
         /// Sender id (transport-level).
         from: ValidatorId,
-        /// SPC view whose inner PC produced this commit.
-        view: SpcView,
-        /// Committed low value.
-        value: PcVector,
-        /// PC round-3 cert anchoring `value` as `proof.x_pp`.
-        proof: Box<PcQc3>,
+        /// Committed-low message.
+        msg: Arc<Verifiable<SpcNewCommitMsg>>,
     },
 
-    /// SPC `empty-view` attestation received from a peer. The signer
-    /// is carried inside `msg`; no separate transport-level sender id
-    /// is needed.
-    SpcEmptyViewReceived {
+    /// SPC `empty-view` attestation received from a peer over the wire.
+    /// The signer is carried inside `msg`; no separate transport-level
+    /// sender id is needed.
+    UnverifiedSpcEmptyViewReceived {
         /// The empty-view attestation.
-        msg: Box<SpcEmptyViewMsg>,
+        msg: Arc<Verifiable<SpcEmptyViewMsg>>,
+    },
+
+    /// SPC `empty-view` attestation whose verification predicate
+    /// already holds — produced only by the local sign-and-emit
+    /// handler. The coordinator skips [`Action::VerifySpcEmptyView`]
+    /// and feeds the typed handle straight into the SPC sub-machine.
+    ///
+    /// [`Action::VerifySpcEmptyView`]: crate::Action::VerifySpcEmptyView
+    VerifiedSpcEmptyViewReceived {
+        /// Verified empty-view attestation, sealed via
+        /// [`Verified::<SpcEmptyViewMsg>::sign_local`].
+        msg: Box<Verified<SpcEmptyViewMsg>>,
     },
 
     /// A beacon block arrived via gossip.
@@ -852,12 +861,8 @@ pub enum ProtocolEvent {
         epoch: Epoch,
         /// Sender of the `NewView`.
         from: ValidatorId,
-        /// View this cert authorises entry to.
-        view: SpcView,
-        /// Cert that was verified.
-        cert: Box<SpcCert>,
-        /// Whether the cert check passed.
-        valid: bool,
+        /// Verified proposal on success; the typed error otherwise.
+        result: Result<Verified<SpcProposalObject>, SpcProposalObjectVerifyError>,
     },
 
     /// Result of an [`Action::VerifySpcNewCommit`] dispatch.
@@ -867,24 +872,17 @@ pub enum ProtocolEvent {
         /// Wire-level sender — used by the coordinator to clear its
         /// per-`(epoch, view, sender)` pipeline slot.
         from: ValidatorId,
-        /// SPC view whose inner PC produced this commit.
-        view: SpcView,
-        /// Committed low value.
-        value: PcVector,
-        /// PC round-3 cert anchoring `value` as `proof.x_pp`.
-        proof: Box<PcQc3>,
-        /// Whether the embedded QC3 check passed.
-        valid: bool,
+        /// Verified new-commit message on success; the typed error
+        /// otherwise.
+        result: Result<Verified<SpcNewCommitMsg>, SpcNewCommitMsgVerifyError>,
     },
 
     /// Result of an [`Action::VerifySpcEmptyView`] dispatch.
     SpcEmptyViewVerified {
         /// Epoch the SPC instance belongs to.
         epoch: Epoch,
-        /// Attestation that was verified.
-        msg: Box<SpcEmptyViewMsg>,
-        /// Whether the sig + embedded QC3 checks passed.
-        valid: bool,
+        /// Verified attestation on success; the typed error otherwise.
+        result: Result<Verified<SpcEmptyViewMsg>, SpcEmptyViewMsgVerifyError>,
     },
 
     /// Beacon committee-start timer fired — the upcoming epoch's
