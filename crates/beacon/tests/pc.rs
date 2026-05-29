@@ -7,13 +7,11 @@
 mod common;
 
 use common::{Committee, PcSim, pc_ctx};
-use hyperscale_beacon::pc::{
-    build_qc1, build_qc2, build_qc3, sign_vote1, sign_vote2, sign_vote3, verify_qc1, verify_qc2,
-    verify_qc3, verify_vote_equivocation,
-};
 use hyperscale_types::{
     Epoch, NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PcContext, PcQc1, PcQc2, PcValueElement,
     PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation, PcVoteRound, PcXpProof, SpcView,
+    build_qc1, build_qc2, build_qc3, sign_vote1, sign_vote2, sign_vote3, verify_qc1, verify_qc2,
+    verify_qc3, verify_vote_equivocation,
 };
 
 const fn elem(byte: u8) -> PcValueElement {

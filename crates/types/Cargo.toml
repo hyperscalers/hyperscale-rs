@@ -34,6 +34,7 @@ radix-substate-store-interface.workspace = true
 test-utils = []
 
 [dev-dependencies]
+proptest.workspace = true
 syn = { version = "2.0.117", features = ["full", "parsing", "visit"] }
 
 [lints]

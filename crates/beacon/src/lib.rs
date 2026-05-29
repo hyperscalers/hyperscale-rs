@@ -19,7 +19,6 @@ pub mod equivocations;
 pub mod genesis;
 pub mod pc;
 pub mod pending_blocks;
-pub mod prefix_ops;
 pub mod proposal_pool;
 pub mod sampling;
 pub mod skip;

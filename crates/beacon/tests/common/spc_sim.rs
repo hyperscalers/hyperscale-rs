@@ -11,11 +11,11 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_beacon::pc::{sign_vote1, sign_vote2, sign_vote3};
 use hyperscale_beacon::spc::{SpcEffect, SpcEvent, SpcInstance, sign_empty_view_msg};
 use hyperscale_types::{
     Bls12381G1PrivateKey, Bls12381G1PublicKey, Epoch, NetworkDefinition, PcVector, PcVoteMessage,
-    SpcView, ValidatorId, bls_keypair_from_seed, pc_context, spc_context,
+    SpcView, ValidatorId, bls_keypair_from_seed, pc_context, sign_vote1, sign_vote2, sign_vote3,
+    spc_context,
 };
 
 /// One pending event in the network: an `SpcEvent` addressed to a

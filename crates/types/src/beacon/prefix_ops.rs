@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 
-use hyperscale_types::{PcValueElement, PcVector};
+use crate::{PcValueElement, PcVector};
 
 /// Maximum common prefix.
 ///
@@ -92,9 +92,8 @@ pub fn qc1_certify(votes: &[PcVector], f: usize) -> Option<PcVector> {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::PC_VALUE_ELEMENT_BYTES;
-
     use super::*;
+    use crate::PC_VALUE_ELEMENT_BYTES;
 
     fn ve(n: u8) -> PcValueElement {
         PcValueElement::new([n; PC_VALUE_ELEMENT_BYTES])

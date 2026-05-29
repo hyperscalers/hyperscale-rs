@@ -5,9 +5,9 @@ use std::collections::BTreeSet;
 use hyperscale_types::{
     BeaconBlockHash, BeaconCert, Bls12381G1PublicKey, CertifiedBeaconBlock, Epoch, Hash,
     NetworkDefinition, PcVoteRound, SpcView, ValidatorId, Witness, spc_context,
+    verify_vote_equivocation,
 };
 
-use crate::pc::verify_vote_equivocation;
 use crate::skip::verify_skip_cert;
 use crate::spc::verify_block_cert;
 

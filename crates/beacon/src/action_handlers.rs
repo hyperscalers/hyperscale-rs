@@ -17,14 +17,12 @@ use hyperscale_types::network::notification::{
     SpcEmptyViewMsgNotification, SpcNewCommitNotification, SpcNewViewNotification,
 };
 use hyperscale_types::{
-    BeaconProposal, PcVoteMessage, SpcHighTriple, SpcProposalObject, pc_context, spc_context,
+    BeaconProposal, PcVoteMessage, SpcHighTriple, SpcProposalObject, pc_context, sign_vote1,
+    sign_vote2, sign_vote3, spc_context, verify_qc3, verify_vote1, verify_vote2, verify_vote3,
     vrf_sign,
 };
 use tracing::warn;
 
-use crate::pc::{
-    sign_vote1, sign_vote2, sign_vote3, verify_qc3, verify_vote1, verify_vote2, verify_vote3,
-};
 use crate::skip::verify_skip_request;
 use crate::spc::{sign_empty_view_msg, verify_cert, verify_empty_view_msg};
 use crate::verification::{verify_block_equivocations, verify_certified};

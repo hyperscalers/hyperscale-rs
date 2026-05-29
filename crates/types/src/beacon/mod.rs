@@ -10,7 +10,10 @@
 //! - [`genesis`]: [`BeaconGenesisConfig`] and the chain-identity hash
 //!   embedded in [`BeaconCert::Genesis`](crate::BeaconCert::Genesis).
 //! - [`limits`]: protocol-level caps on per-proposal payload sizes.
-//! - [`pc`]: Prefix Consensus vote / QC wire types.
+//! - [`pc`]: Prefix Consensus vote / QC wire types, verify / sign /
+//!   build helpers.
+//! - [`prefix_ops`]: prefix algebra ([`mcp`], [`mce`], [`qc1_certify`])
+//!   the PC build path consumes.
 //! - [`proposal`]: [`BeaconProposal`] (one committee member's slot
 //!   submission: witnesses + VRF reveal).
 //! - [`skip`]: [`SkipRequest`] and [`SkipEpochCert`] (pool-quorum
@@ -33,6 +36,7 @@ pub mod certified;
 pub mod genesis;
 pub mod limits;
 pub mod pc;
+pub mod prefix_ops;
 pub mod proposal;
 pub mod ready_signal;
 pub mod skip;
@@ -52,8 +56,11 @@ pub use limits::{
 pub use pc::{
     PC_VALUE_ELEMENT_BYTES, PcCompactVote, PcDivergingProof, PcQc1, PcQc2, PcQc3, PcSignerLengths,
     PcValueElement, PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation, PcVoteMessage,
-    PcVoteRound, PcXpProof,
+    PcVoteRound, PcXpProof, build_qc1, build_qc2, build_qc3, sign_vote1, sign_vote2, sign_vote3,
+    verify_qc1, verify_qc2, verify_qc3, verify_vote_equivocation, verify_vote1, verify_vote2,
+    verify_vote3,
 };
+pub use prefix_ops::{mce, mcp, qc1_certify};
 pub use proposal::BeaconProposal;
 pub use ready_signal::ReadySignal;
 pub use skip::{SkipEpochCert, SkipRequest};

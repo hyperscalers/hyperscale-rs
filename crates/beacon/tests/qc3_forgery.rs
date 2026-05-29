@@ -10,9 +10,9 @@
 mod common;
 
 use common::{PcSim, pc_ctx};
-use hyperscale_beacon::pc::verify_qc3;
 use hyperscale_types::{
     Epoch, NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PcQc3, PcValueElement, PcVector, SpcView,
+    verify_qc3,
 };
 
 const fn elem(byte: u8) -> PcValueElement {

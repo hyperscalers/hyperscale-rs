@@ -48,10 +48,10 @@ use hyperscale_types::{
     Hash, NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PcQc1, PcQc2, PcQc3, PcValueElement, PcVector,
     PcVoteEquivocation, PcVoteMessage, PositionalBundle, SignerBitfield, SkipReport, SpcCert,
     SpcContext, SpcEmptyViewMsg, SpcHighTriple, SpcProposalObject, SpcView, ValidatorId,
-    aggregate_verify_bls_different_messages, pc_context, pc_vote_signing_message,
+    aggregate_verify_bls_different_messages, pc_context, pc_vote_signing_message, verify_qc3,
 };
 
-use crate::pc::{PcEffect, PcEvent, PcInstance, verify_qc3};
+use crate::pc::{PcEffect, PcEvent, PcInstance};
 
 /// Domain tag for hashing a reported high triple's value into a 32-byte
 /// digest. Keeps the digest distinct from any other Blake3 use of the

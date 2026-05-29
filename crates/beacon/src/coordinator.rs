@@ -1347,14 +1347,14 @@ mod tests {
         BeaconBlock, BeaconBlockHash, BeaconGenesisConfig, Bls12381G1PrivateKey,
         Bls12381G1PublicKey, CertifiedBlockHeader, Epoch, GenesisConfigHash, GenesisPool,
         GenesisValidator, NetworkDefinition, PcVector, Randomness, ShardGroupId, ShardWitness,
-        SpcCert, SpcView, Stake, StakePoolId, ValidatorId, bls_keypair_from_seed,
-        genesis_config_hash, pc_context, spc_context,
+        SpcCert, SpcView, Stake, StakePoolId, ValidatorId, bls_keypair_from_seed, build_qc1,
+        build_qc2, build_qc3, genesis_config_hash, pc_context, sign_vote1, sign_vote2, sign_vote3,
+        spc_context,
     };
 
     use super::*;
     use crate::constants::MIN_STAKE_FLOOR;
     use crate::genesis::build_genesis_beacon_state;
-    use crate::pc::{build_qc1, build_qc2, build_qc3, sign_vote1, sign_vote2, sign_vote3};
 
     fn keypair(seed: u64) -> Bls12381G1PrivateKey {
         let mut s = [0u8; 32];

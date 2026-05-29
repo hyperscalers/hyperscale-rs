@@ -6,13 +6,12 @@ use std::collections::BTreeSet;
 use hyperscale_types::{
     BeaconProposal, BeaconState, Bls12381G1PublicKey, JailReason, LeafIndex, NetworkDefinition,
     PcVoteEquivocation, PendingWithdrawal, ShardGroupId, ShardWitness, ShardWitnessPayload, Stake,
-    StakePool, ValidatorId, ValidatorRecord, ValidatorStatus, Witness,
+    StakePool, ValidatorId, ValidatorRecord, ValidatorStatus, Witness, verify_vote_equivocation,
 };
 
 use crate::constants::{
     JAIL_COOLDOWN_EPOCHS, MAX_WITNESSES_PER_SLOT, MISSED_PROPOSAL_JAIL_THRESHOLD,
 };
-use crate::pc::verify_vote_equivocation;
 use crate::state::derived::{current_active_count, effective_stake, max_active_count};
 use crate::state::vrf::jail_validator;
 use crate::state::withdrawals::deactivate_to_insufficient_stake;
