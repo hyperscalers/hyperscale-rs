@@ -222,6 +222,7 @@ where
             committee,
         } => {
             let pc_ctx = pc_context(&spc_context(epoch), view);
+            let signer = vote.validator();
             let result = vote.upgrade(&PcVoteVerifyContext {
                 network,
                 pc_ctx: &pc_ctx,
@@ -230,6 +231,7 @@ where
             ctx.notify_protocol(ProtocolEvent::PcVote1Verified {
                 epoch,
                 view,
+                signer,
                 result: result.map_err(|(_, e)| e),
             });
         }
@@ -240,6 +242,7 @@ where
             committee,
         } => {
             let pc_ctx = pc_context(&spc_context(epoch), view);
+            let signer = vote.validator();
             let result = (*vote).upgrade(&PcVoteVerifyContext {
                 network,
                 pc_ctx: &pc_ctx,
@@ -248,6 +251,7 @@ where
             ctx.notify_protocol(ProtocolEvent::PcVote2Verified {
                 epoch,
                 view,
+                signer,
                 result: result.map_err(|(_, e)| e),
             });
         }
@@ -258,6 +262,7 @@ where
             committee,
         } => {
             let pc_ctx = pc_context(&spc_context(epoch), view);
+            let signer = vote.validator();
             let result = (*vote).upgrade(&PcVoteVerifyContext {
                 network,
                 pc_ctx: &pc_ctx,
@@ -266,6 +271,7 @@ where
             ctx.notify_protocol(ProtocolEvent::PcVote3Verified {
                 epoch,
                 view,
+                signer,
                 result: result.map_err(|(_, e)| e),
             });
         }
@@ -276,6 +282,7 @@ where
             committee,
         } => {
             let spc_ctx = spc_context(epoch);
+            let view = proposal.view;
             let result = (*proposal).upgrade(&SpcVerifyContext {
                 network,
                 spc_ctx: &spc_ctx,
@@ -284,6 +291,7 @@ where
             ctx.notify_protocol(ProtocolEvent::SpcNewViewVerified {
                 epoch,
                 from,
+                view,
                 result: result.map_err(|(_, e)| e),
             });
         }
@@ -294,6 +302,7 @@ where
             committee,
         } => {
             let spc_ctx = spc_context(epoch);
+            let view = msg.view;
             let result = (*msg).upgrade(&SpcVerifyContext {
                 network,
                 spc_ctx: &spc_ctx,
@@ -302,6 +311,7 @@ where
             ctx.notify_protocol(ProtocolEvent::SpcNewCommitVerified {
                 epoch,
                 from,
+                view,
                 result: result.map_err(|(_, e)| e),
             });
         }
@@ -311,6 +321,8 @@ where
             committee,
         } => {
             let spc_ctx = spc_context(epoch);
+            let from = msg.signer;
+            let view = msg.view;
             let result = (*msg).upgrade(&SpcVerifyContext {
                 network,
                 spc_ctx: &spc_ctx,
@@ -318,6 +330,8 @@ where
             });
             ctx.notify_protocol(ProtocolEvent::SpcEmptyViewVerified {
                 epoch,
+                from,
+                view,
                 result: result.map_err(|(_, e)| e),
             });
         }

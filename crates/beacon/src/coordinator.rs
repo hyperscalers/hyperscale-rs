@@ -389,35 +389,37 @@ impl BeaconCoordinator {
         Some((spc.epoch(), spc.committee().to_vec()))
     }
 
-    /// Result of an [`Action::VerifySpcNewView`] dispatch.
+    /// Result of an [`Action::VerifySpcNewView`] dispatch. The view is
+    /// extracted from the unverified payload at dispatch time and
+    /// carried back here so the slot can be cleared on both arms.
     pub fn on_spc_new_view_verified(
         &mut self,
         epoch: Epoch,
         from: ValidatorId,
+        view: SpcView,
         result: Result<Verified<SpcProposalObject>, SpcProposalObjectVerifyError>,
     ) -> Vec<Action> {
+        let key = (epoch, view, from, SpcMsgKind::NewView);
         let proposal = match result {
             Ok(p) => p,
             Err(err) => {
+                self.verification.on_spc_msg_result(key, false);
+                self.verification.forget_spc_msg(key);
                 warn!(
                     ?from,
                     epoch = epoch.inner(),
+                    view = view.inner(),
                     %err,
                     "SPC NewView cert verification failed — dropping",
                 );
-                // We don't know the view without the payload; the in-flight
-                // entry will time out via cleanup elsewhere. Clear what we can.
                 return Vec::new();
             }
         };
-        let view = proposal.view;
-        let key = (epoch, view, from, SpcMsgKind::NewView);
         self.verification.on_spc_msg_result(key, true);
         self.verification.forget_spc_msg(key);
         if self.spc.as_ref().is_some_and(|s| s.epoch() != epoch) {
             return Vec::new();
         }
-        let view = proposal.view;
         let cert = Verified::<SpcCert>::from_verified_proposal_object(proposal);
         self.dispatch_spc_event(
             from,
@@ -434,28 +436,30 @@ impl BeaconCoordinator {
         &mut self,
         epoch: Epoch,
         from: ValidatorId,
+        view: SpcView,
         result: Result<Verified<SpcNewCommitMsg>, SpcNewCommitMsgVerifyError>,
     ) -> Vec<Action> {
+        let key = (epoch, view, from, SpcMsgKind::NewCommit);
         let msg = match result {
             Ok(m) => m,
             Err(err) => {
+                self.verification.on_spc_msg_result(key, false);
+                self.verification.forget_spc_msg(key);
                 warn!(
                     ?from,
                     epoch = epoch.inner(),
+                    view = view.inner(),
                     %err,
                     "SPC NewCommit QC3 verification failed — dropping",
                 );
                 return Vec::new();
             }
         };
-        let view = msg.view;
-        let key = (epoch, view, from, SpcMsgKind::NewCommit);
         self.verification.on_spc_msg_result(key, true);
         self.verification.forget_spc_msg(key);
         if self.spc.as_ref().is_some_and(|s| s.epoch() != epoch) {
             return Vec::new();
         }
-        let view = msg.view;
         let value = msg.value.clone();
         let proof = Verified::<PcQc3>::from_verified_new_commit(msg);
         self.dispatch_spc_event(
@@ -472,28 +476,32 @@ impl BeaconCoordinator {
     pub fn on_spc_empty_view_verified(
         &mut self,
         epoch: Epoch,
+        from: ValidatorId,
+        view: SpcView,
         result: Result<Verified<SpcEmptyViewMsg>, SpcEmptyViewMsgVerifyError>,
     ) -> Vec<Action> {
+        let key = (epoch, view, from, SpcMsgKind::EmptyView);
         let msg = match result {
             Ok(m) => m,
             Err(err) => {
+                self.verification.on_spc_msg_result(key, false);
+                self.verification.forget_spc_msg(key);
                 warn!(
+                    ?from,
                     epoch = epoch.inner(),
+                    view = view.inner(),
                     %err,
                     "SPC EmptyView verification failed — dropping",
                 );
                 return Vec::new();
             }
         };
-        let signer = msg.signer;
-        let view = msg.view;
-        let key = (epoch, view, signer, SpcMsgKind::EmptyView);
         self.verification.on_spc_msg_result(key, true);
         self.verification.forget_spc_msg(key);
         if self.spc.as_ref().is_some_and(|s| s.epoch() != epoch) {
             return Vec::new();
         }
-        self.dispatch_spc_event(signer, SpcEvent::EmptyViewVerified(Box::new(msg)))
+        self.dispatch_spc_event(from, SpcEvent::EmptyViewVerified(Box::new(msg)))
     }
 
     /// Result of an [`Action::VerifyPcVote1`] dispatch. Clears the
@@ -505,24 +513,24 @@ impl BeaconCoordinator {
         &mut self,
         epoch: Epoch,
         view: SpcView,
+        signer: ValidatorId,
         result: Result<Verified<PcVote1>, PcVote1VerifyError>,
     ) -> Vec<Action> {
         let verified = match result {
             Ok(v) => v,
             Err(err) => {
-                let key_signer = None;
-                self.clear_pc_vote_slot(epoch, view, key_signer, PcVoteRound::Vote1, false);
+                self.clear_pc_vote_slot(epoch, view, signer, PcVoteRound::Vote1, false);
                 warn!(
                     epoch = epoch.inner(),
                     view = view.inner(),
+                    ?signer,
                     ?err,
                     "PC vote-1 BLS verification failed — dropping",
                 );
                 return Vec::new();
             }
         };
-        let signer = verified.validator();
-        self.clear_pc_vote_slot(epoch, view, Some(signer), PcVoteRound::Vote1, true);
+        self.clear_pc_vote_slot(epoch, view, signer, PcVoteRound::Vote1, true);
         if self.spc.as_ref().is_some_and(|s| s.epoch() != epoch) {
             return Vec::new();
         }
@@ -540,23 +548,24 @@ impl BeaconCoordinator {
         &mut self,
         epoch: Epoch,
         view: SpcView,
+        signer: ValidatorId,
         result: Result<Verified<PcVote2>, PcVote2VerifyError>,
     ) -> Vec<Action> {
         let verified = match result {
             Ok(v) => v,
             Err(err) => {
-                self.clear_pc_vote_slot(epoch, view, None, PcVoteRound::Vote2, false);
+                self.clear_pc_vote_slot(epoch, view, signer, PcVoteRound::Vote2, false);
                 warn!(
                     epoch = epoch.inner(),
                     view = view.inner(),
+                    ?signer,
                     ?err,
                     "PC vote-2 BLS verification failed — dropping",
                 );
                 return Vec::new();
             }
         };
-        let signer = verified.validator();
-        self.clear_pc_vote_slot(epoch, view, Some(signer), PcVoteRound::Vote2, true);
+        self.clear_pc_vote_slot(epoch, view, signer, PcVoteRound::Vote2, true);
         if self.spc.as_ref().is_some_and(|s| s.epoch() != epoch) {
             return Vec::new();
         }
@@ -574,23 +583,24 @@ impl BeaconCoordinator {
         &mut self,
         epoch: Epoch,
         view: SpcView,
+        signer: ValidatorId,
         result: Result<Verified<PcVote3>, PcVote3VerifyError>,
     ) -> Vec<Action> {
         let verified = match result {
             Ok(v) => v,
             Err(err) => {
-                self.clear_pc_vote_slot(epoch, view, None, PcVoteRound::Vote3, false);
+                self.clear_pc_vote_slot(epoch, view, signer, PcVoteRound::Vote3, false);
                 warn!(
                     epoch = epoch.inner(),
                     view = view.inner(),
+                    ?signer,
                     ?err,
                     "PC vote-3 BLS verification failed — dropping",
                 );
                 return Vec::new();
             }
         };
-        let signer = verified.validator();
-        self.clear_pc_vote_slot(epoch, view, Some(signer), PcVoteRound::Vote3, true);
+        self.clear_pc_vote_slot(epoch, view, signer, PcVoteRound::Vote3, true);
         if self.spc.as_ref().is_some_and(|s| s.epoch() != epoch) {
             return Vec::new();
         }
@@ -617,7 +627,7 @@ impl BeaconCoordinator {
             return Vec::new();
         };
         let signer = vote.validator();
-        self.clear_pc_vote_slot(epoch, view, Some(signer), PcVoteRound::Vote1, true);
+        self.clear_pc_vote_slot(epoch, view, signer, PcVoteRound::Vote1, true);
         if self.spc.as_ref().is_some_and(|s| s.epoch() != epoch) {
             return Vec::new();
         }
@@ -635,7 +645,7 @@ impl BeaconCoordinator {
             return Vec::new();
         };
         let signer = vote.validator();
-        self.clear_pc_vote_slot(epoch, view, Some(signer), PcVoteRound::Vote2, true);
+        self.clear_pc_vote_slot(epoch, view, signer, PcVoteRound::Vote2, true);
         if self.spc.as_ref().is_some_and(|s| s.epoch() != epoch) {
             return Vec::new();
         }
@@ -653,7 +663,7 @@ impl BeaconCoordinator {
             return Vec::new();
         };
         let signer = vote.validator();
-        self.clear_pc_vote_slot(epoch, view, Some(signer), PcVoteRound::Vote3, true);
+        self.clear_pc_vote_slot(epoch, view, signer, PcVoteRound::Vote3, true);
         if self.spc.as_ref().is_some_and(|s| s.epoch() != epoch) {
             return Vec::new();
         }
@@ -661,29 +671,17 @@ impl BeaconCoordinator {
     }
 
     /// Shared slot-clear helper used by all three per-round PC vote
-    /// verify-result handlers.
+    /// verify-result handlers. The signer is extracted from the
+    /// unverified payload at dispatch time and carried back in the
+    /// result event, so the slot can be cleared on both arms.
     fn clear_pc_vote_slot(
         &mut self,
         epoch: Epoch,
         view: SpcView,
-        signer: Option<ValidatorId>,
+        signer: ValidatorId,
         round: PcVoteRound,
         valid: bool,
     ) {
-        let Some(signer) = signer else {
-            // The verify-failed branch can't recover the signer from a
-            // typed error, but the slot-key is keyed on validator id;
-            // there's nothing safe to clear without it. The slot will
-            // expire naturally via the verification pipeline's own
-            // sweep.
-            tracing::debug!(
-                epoch = epoch.inner(),
-                view = view.inner(),
-                ?round,
-                "PC vote verify failed with no recoverable signer; slot will expire on sweep",
-            );
-            return;
-        };
         let key = (epoch, view, signer, round);
         self.verification.on_pc_vote_result(key, valid);
         self.verification.forget_pc_vote(key);

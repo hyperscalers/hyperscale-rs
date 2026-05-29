@@ -788,6 +788,7 @@ impl CoordinatorSim {
                 committee,
             } => {
                 let pc_ctx = pc_context(&spc_context(epoch), view);
+                let signer = vote.validator();
                 let result = vote.upgrade(&PcVoteVerifyContext {
                     network: &self.network,
                     pc_ctx: &pc_ctx,
@@ -796,6 +797,7 @@ impl CoordinatorSim {
                 let post = self.coordinators[emitter_idx].on_pc_vote1_verified(
                     epoch,
                     view,
+                    signer,
                     result.map_err(|(_, e)| e),
                 );
                 self.absorb(emitter_idx, post);
@@ -807,6 +809,7 @@ impl CoordinatorSim {
                 committee,
             } => {
                 let pc_ctx = pc_context(&spc_context(epoch), view);
+                let signer = vote.validator();
                 let result = (*vote).upgrade(&PcVoteVerifyContext {
                     network: &self.network,
                     pc_ctx: &pc_ctx,
@@ -815,6 +818,7 @@ impl CoordinatorSim {
                 let post = self.coordinators[emitter_idx].on_pc_vote2_verified(
                     epoch,
                     view,
+                    signer,
                     result.map_err(|(_, e)| e),
                 );
                 self.absorb(emitter_idx, post);
@@ -826,6 +830,7 @@ impl CoordinatorSim {
                 committee,
             } => {
                 let pc_ctx = pc_context(&spc_context(epoch), view);
+                let signer = vote.validator();
                 let result = (*vote).upgrade(&PcVoteVerifyContext {
                     network: &self.network,
                     pc_ctx: &pc_ctx,
@@ -834,6 +839,7 @@ impl CoordinatorSim {
                 let post = self.coordinators[emitter_idx].on_pc_vote3_verified(
                     epoch,
                     view,
+                    signer,
                     result.map_err(|(_, e)| e),
                 );
                 self.absorb(emitter_idx, post);
@@ -845,6 +851,7 @@ impl CoordinatorSim {
                 committee,
             } => {
                 let spc_ctx = spc_context(epoch);
+                let view = proposal.view;
                 let result = (*proposal).upgrade(&SpcVerifyContext {
                     network: &self.network,
                     spc_ctx: &spc_ctx,
@@ -853,6 +860,7 @@ impl CoordinatorSim {
                 let post = self.coordinators[emitter_idx].on_spc_new_view_verified(
                     epoch,
                     from,
+                    view,
                     result.map_err(|(_, e)| e),
                 );
                 self.absorb(emitter_idx, post);
@@ -864,6 +872,7 @@ impl CoordinatorSim {
                 committee,
             } => {
                 let spc_ctx = spc_context(epoch);
+                let view = msg.view;
                 let result = (*msg).upgrade(&SpcVerifyContext {
                     network: &self.network,
                     spc_ctx: &spc_ctx,
@@ -872,6 +881,7 @@ impl CoordinatorSim {
                 let post = self.coordinators[emitter_idx].on_spc_new_commit_verified(
                     epoch,
                     from,
+                    view,
                     result.map_err(|(_, e)| e),
                 );
                 self.absorb(emitter_idx, post);
@@ -882,13 +892,19 @@ impl CoordinatorSim {
                 committee,
             } => {
                 let spc_ctx = spc_context(epoch);
+                let from = msg.signer;
+                let view = msg.view;
                 let result = (*msg).upgrade(&SpcVerifyContext {
                     network: &self.network,
                     spc_ctx: &spc_ctx,
                     committee: &committee,
                 });
-                let post = self.coordinators[emitter_idx]
-                    .on_spc_empty_view_verified(epoch, result.map_err(|(_, e)| e));
+                let post = self.coordinators[emitter_idx].on_spc_empty_view_verified(
+                    epoch,
+                    from,
+                    view,
+                    result.map_err(|(_, e)| e),
+                );
                 self.absorb(emitter_idx, post);
             }
             Action::SetTimer { .. }
