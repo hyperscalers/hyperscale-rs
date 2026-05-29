@@ -25,11 +25,10 @@ use hyperscale_types::{
     Bls12381G1PublicKey, CertifiedBeaconBlock, CertifiedBeaconBlockVerifyContext, Epoch,
     GenesisPool, GenesisValidator, NetworkDefinition, PcValueElement, PcVector, PcVote1, PcVote2,
     PcVote3, PcVoteVerifyContext, Randomness, ShardGroupId, SkipEpochCert, SkipRequest,
-    SpcEmptyViewMsg, SpcNewCommitMsg, SpcProposalObject, SpcVerifyContext, SpcView, Stake,
-    StakePoolId, ValidatorId, Verifiable, Witness, bls_keypair_from_seed, genesis_config_hash,
-    pc_context, sign_empty_view_msg, sign_skip_request, sign_vote1, sign_vote2, sign_vote3,
-    spc_context, verify_skip_cert, verify_skip_request, verify_vote1, verify_vote2, verify_vote3,
-    vrf_sign,
+    SkipVerifyContext, SpcEmptyViewMsg, SpcNewCommitMsg, SpcProposalObject, SpcVerifyContext,
+    SpcView, Stake, StakePoolId, ValidatorId, Verifiable, Verified, Witness, bls_keypair_from_seed,
+    genesis_config_hash, pc_context, sign_empty_view_msg, sign_vote1, sign_vote2, sign_vote3,
+    spc_context, verify_skip_cert, verify_vote1, verify_vote2, verify_vote3, vrf_sign,
 };
 
 /// Adversarial transform a flagged replica applies to its next matching
@@ -104,10 +103,10 @@ enum SimEvent {
         block: Arc<CertifiedBeaconBlock>,
     },
     SkipRequest {
-        request: SkipRequest,
+        request: Arc<Verifiable<SkipRequest>>,
     },
     SkipCert {
-        cert: SkipEpochCert,
+        cert: Arc<Verifiable<SkipEpochCert>>,
     },
 }
 
@@ -301,9 +300,13 @@ impl CoordinatorSim {
                     out.extend(self.resolve_verifications(replica_idx, post));
                 }
                 Action::VerifySkipRequest { request, signers } => {
-                    let valid = verify_skip_request(&request, &self.network, &signers);
-                    let post =
-                        self.coordinators[replica_idx].on_skip_request_verified(*request, valid);
+                    let result = (*request)
+                        .upgrade(&SkipVerifyContext {
+                            network: &self.network,
+                            active_pool: &signers,
+                        })
+                        .map_err(|(_, e)| e);
+                    let post = self.coordinators[replica_idx].on_skip_request_verified(result);
                     out.extend(self.resolve_verifications(replica_idx, post));
                 }
                 other => out.push(other),
@@ -325,13 +328,18 @@ impl CoordinatorSim {
             .current_state()
             .current_epoch
             .next();
-        let request = sign_skip_request(sk, signer, &self.network, anchor, epoch_to_skip);
+        let verified =
+            Verified::<SkipRequest>::sign_local(sk, signer, &self.network, anchor, epoch_to_skip);
+        let verified_arc = Arc::new(verified);
         // Admit locally first — the production runner feeds the
         // request back into the local coordinator via the action
-        // handler's loopback.
-        let actions = self.coordinators[signer_idx].on_skip_request_received(request.clone());
+        // handler's loopback. The local arm goes through the verified
+        // receive entry.
+        let actions = self.coordinators[signer_idx]
+            .on_verified_skip_request_received(Arc::clone(&verified_arc));
         self.absorb(signer_idx, actions);
-        // Queue for every peer.
+        // Queue for every peer as an unverified wire arrival.
+        let wire = Arc::new(Verifiable::from((*verified_arc).clone()));
         for to_idx in 0..self.coordinators.len() {
             if to_idx == signer_idx {
                 continue;
@@ -339,7 +347,7 @@ impl CoordinatorSim {
             self.network_q.push_back(Envelope {
                 to_idx,
                 event: SimEvent::SkipRequest {
-                    request: request.clone(),
+                    request: Arc::clone(&wire),
                 },
             });
         }
@@ -474,7 +482,7 @@ impl CoordinatorSim {
                 self.coordinators[env.to_idx].on_beacon_block_received(wrapped)
             }
             SimEvent::SkipRequest { request } => {
-                self.coordinators[env.to_idx].on_skip_request_received(request)
+                self.coordinators[env.to_idx].on_unverified_skip_request_received(request)
             }
             SimEvent::SkipCert { cert } => {
                 self.coordinators[env.to_idx].on_skip_cert_received(cert)
@@ -702,7 +710,7 @@ impl CoordinatorSim {
                 request,
                 recipients: _,
             } => {
-                let req = (*request).clone();
+                let wire = Arc::new(Verifiable::from((*request).clone()));
                 for to_idx in 0..self.coordinators.len() {
                     if to_idx == emitter_idx {
                         continue;
@@ -710,7 +718,7 @@ impl CoordinatorSim {
                     self.network_q.push_back(Envelope {
                         to_idx,
                         event: SimEvent::SkipRequest {
-                            request: req.clone(),
+                            request: Arc::clone(&wire),
                         },
                     });
                 }
@@ -719,14 +727,16 @@ impl CoordinatorSim {
                 cert,
                 recipients: _,
             } => {
-                let cert = (*cert).clone();
+                let wire = Arc::new(Verifiable::from((*cert).clone()));
                 for to_idx in 0..self.coordinators.len() {
                     if to_idx == emitter_idx {
                         continue;
                     }
                     self.network_q.push_back(Envelope {
                         to_idx,
-                        event: SimEvent::SkipCert { cert: cert.clone() },
+                        event: SimEvent::SkipCert {
+                            cert: Arc::clone(&wire),
+                        },
                     });
                 }
             }
@@ -759,8 +769,13 @@ impl CoordinatorSim {
                 self.absorb(emitter_idx, post);
             }
             Action::VerifySkipRequest { request, signers } => {
-                let valid = verify_skip_request(&request, &self.network, &signers);
-                let post = self.coordinators[emitter_idx].on_skip_request_verified(*request, valid);
+                let result = (*request)
+                    .upgrade(&SkipVerifyContext {
+                        network: &self.network,
+                        active_pool: &signers,
+                    })
+                    .map_err(|(_, e)| e);
+                let post = self.coordinators[emitter_idx].on_skip_request_verified(result);
                 self.absorb(emitter_idx, post);
             }
             Action::VerifyPcVote1 {

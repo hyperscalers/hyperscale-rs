@@ -21,11 +21,12 @@
 //! observation state these pure verifiers don't see.
 
 use sbor::prelude::*;
+use thiserror::Error;
 
 use crate::{
     BeaconBlockHash, Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature, Epoch,
-    NetworkDefinition, SignerBitfield, ValidatorId, aggregate_verify_bls_different_messages,
-    skip_request_message, verify_bls12381_v1,
+    NetworkDefinition, SignerBitfield, ValidatorId, Verified, Verify,
+    aggregate_verify_bls_different_messages, skip_request_message, verify_bls12381_v1,
 };
 
 /// One active validator's signed vote that the chain should abandon
@@ -316,6 +317,121 @@ pub fn build_skip_cert(
         signers,
         aggregate_sig,
     ))
+}
+
+// ─── Typestate ─────────────────────────────────────────────────────────────
+
+/// Verification context for [`SkipRequest`] and [`SkipEpochCert`].
+///
+/// Both predicates resolve signers through the active validator pool
+/// at the anchor's epoch. Active-pool drift produces a false-negative
+/// rejection rather than a false-positive acceptance — safe at the
+/// cost of liveness.
+#[derive(Debug, Clone, Copy)]
+pub struct SkipVerifyContext<'a> {
+    /// Network the signer was bound to.
+    pub network: &'a NetworkDefinition,
+    /// Active validator pool at verification time. Positional ordering
+    /// matches the cert's signer bitfield.
+    pub active_pool: &'a [(ValidatorId, Bls12381G1PublicKey)],
+}
+
+/// Coarse-grained verification failure for a single skip request.
+///
+/// Failure modes (signer-not-in-pool, BLS sig check) summarize into
+/// one variant; the rejection log line records the specific reason.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+#[error("SkipRequest verification failed")]
+pub struct SkipRequestVerifyError;
+
+/// Coarse-grained verification failure for an aggregated skip cert.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+#[error("SkipEpochCert verification failed")]
+pub struct SkipEpochCertVerifyError;
+
+impl Verify<&SkipVerifyContext<'_>> for SkipRequest {
+    type Error = SkipRequestVerifyError;
+
+    /// Skip-request predicate: signer is in `active_pool` and the BLS
+    /// signature verifies under the signer's pubkey over the canonical
+    /// skip-request signing bytes.
+    fn verify(&self, ctx: &SkipVerifyContext<'_>) -> Result<Verified<Self>, Self::Error> {
+        if verify_skip_request(self, ctx.network, ctx.active_pool) {
+            Ok(Verified::new_unchecked(self.clone()))
+        } else {
+            Err(SkipRequestVerifyError)
+        }
+    }
+}
+
+impl Verify<&SkipVerifyContext<'_>> for SkipEpochCert {
+    type Error = SkipEpochCertVerifyError;
+
+    /// Skip-cert predicate: signer bitfield matches the active pool's
+    /// size, signer count meets `⌈2N/3⌉ + 1`, and the aggregate sig
+    /// verifies under the union of the set bits' pubkeys.
+    fn verify(&self, ctx: &SkipVerifyContext<'_>) -> Result<Verified<Self>, Self::Error> {
+        if verify_skip_cert(self, ctx.network, ctx.active_pool) {
+            Ok(Verified::new_unchecked(self.clone()))
+        } else {
+            Err(SkipEpochCertVerifyError)
+        }
+    }
+}
+
+// ─── Named gates ────────────────────────────────────────────────────────────
+
+impl Verified<SkipRequest> {
+    /// Sign a skip request locally. The signer's own BLS sig holds by
+    /// definition under the private key, so the produced request is
+    /// verified by construction.
+    #[must_use]
+    pub fn sign_local(
+        sk: &Bls12381G1PrivateKey,
+        signer: ValidatorId,
+        network: &NetworkDefinition,
+        anchor_hash: BeaconBlockHash,
+        epoch_to_skip: Epoch,
+    ) -> Self {
+        Self::new_unchecked(sign_skip_request(
+            sk,
+            signer,
+            network,
+            anchor_hash,
+            epoch_to_skip,
+        ))
+    }
+
+    /// Wrap a locally-built skip request whose backing sig was produced
+    /// via a verified path. Mirror of
+    /// [`Verified::<PcQc1>::from_local_build`].
+    #[must_use]
+    pub const fn from_local_build(request: SkipRequest) -> Self {
+        Self::new_unchecked(request)
+    }
+}
+
+impl Verified<SkipEpochCert> {
+    /// Aggregate a quorum-meeting set of verified skip requests into a
+    /// verified [`SkipEpochCert`]. Mirror of
+    /// [`Verified::<PcQc1>::from_verified_votes`]; returns `None` on the
+    /// same conditions as [`build_skip_cert`].
+    #[must_use]
+    pub fn from_verified_requests(
+        requests: &[&Verified<SkipRequest>],
+        active_pool: &[(ValidatorId, Bls12381G1PublicKey)],
+    ) -> Option<Self> {
+        let raw: Vec<SkipRequest> = requests.iter().map(|r| (*r).as_ref().clone()).collect();
+        build_skip_cert(&raw, active_pool).map(Self::new_unchecked)
+    }
+
+    /// Wrap a locally-assembled cert whose backing requests were
+    /// already verified upstream. Mirror of
+    /// [`Verified::<PcQc1>::from_local_build`].
+    #[must_use]
+    pub const fn from_local_build(cert: SkipEpochCert) -> Self {
+        Self::new_unchecked(cert)
+    }
 }
 
 #[cfg(test)]

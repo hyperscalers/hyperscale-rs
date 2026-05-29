@@ -210,6 +210,7 @@ impl StateMachine for NodeStateMachine {
         event = %event.type_name(),
         height = self.shard_coordinator.committed_height().inner(),
     ))]
+    #[allow(clippy::too_many_lines)] // single dispatch over ProtocolEvent variants
     fn handle(&mut self, now: LocalTimestamp, event: ProtocolEvent) -> Vec<Action> {
         self.now = now;
         self.shard_coordinator.set_time(now);
@@ -288,7 +289,8 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::BeaconBlockReceived { .. }
             | ProtocolEvent::UnverifiedBeaconProposalReceived { .. }
             | ProtocolEvent::VerifiedBeaconProposalReceived { .. }
-            | ProtocolEvent::SkipRequestReceived { .. }
+            | ProtocolEvent::UnverifiedSkipRequestReceived { .. }
+            | ProtocolEvent::VerifiedSkipRequestReceived { .. }
             | ProtocolEvent::SkipCertReceived { .. }
             | ProtocolEvent::ShardWitnessesReceived { .. }
             | ProtocolEvent::BeaconBlockVerified { .. }

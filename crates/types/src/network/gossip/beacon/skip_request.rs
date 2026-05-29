@@ -5,7 +5,7 @@ use std::sync::Arc;
 use sbor::prelude::BasicSbor;
 
 use crate::network::{GossipMessage, TopicScope};
-use crate::{MessageClass, NetworkMessage, SkipRequest};
+use crate::{MessageClass, NetworkMessage, SkipRequest, Verifiable};
 
 /// Broadcasts one active validator's signed skip attestation.
 ///
@@ -20,33 +20,41 @@ use crate::{MessageClass, NetworkMessage, SkipRequest};
 /// and gossipsub's bytes-id dedup handles accidental re-publications
 /// without an explicit content-key dedup.
 ///
+/// Wire decode lands the wrapper as `Verifiable::Unverified`;
+/// locally-dispatched sends from a colocated signer preserve
+/// `Verifiable::Verified`.
+///
 /// `MessageClass::Consensus` — skip liveness is round-blocking: until
 /// ⌈2M/3⌉ + 1 active signers' requests assemble, the chain doesn't
 /// make progress.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct SkipRequestGossip {
     /// The signed skip request.
-    pub request: Arc<SkipRequest>,
+    pub request: Arc<Verifiable<SkipRequest>>,
 }
 
 impl SkipRequestGossip {
-    /// Wrap a [`SkipRequest`] for gossip broadcast.
+    /// Wrap a [`SkipRequest`] for gossip broadcast. Accepts a raw
+    /// request or a `Verified<SkipRequest>` — the wrapper preserves
+    /// the marker.
     #[must_use]
-    pub fn new(request: impl Into<Arc<SkipRequest>>) -> Self {
+    pub fn new(request: impl Into<Arc<Verifiable<SkipRequest>>>) -> Self {
         Self {
             request: request.into(),
         }
     }
 
-    /// Get the inner request.
+    /// Get the inner request (raw view, regardless of verification
+    /// state).
     #[must_use]
     pub fn request(&self) -> &SkipRequest {
-        &self.request
+        self.request.as_unverified()
     }
 
-    /// Consume and return the inner request.
+    /// Consume and return the inner request, preserving the
+    /// verification marker.
     #[must_use]
-    pub fn into_request(self) -> Arc<SkipRequest> {
+    pub fn into_request(self) -> Arc<Verifiable<SkipRequest>> {
         self.request
     }
 }
@@ -83,7 +91,7 @@ mod tests {
 
     #[test]
     fn sbor_round_trip() {
-        let g = SkipRequestGossip::new(sample_request());
+        let g = SkipRequestGossip::new(Arc::new(Verifiable::from(sample_request())));
         let bytes = basic_encode(&g).unwrap();
         let decoded: SkipRequestGossip = basic_decode(&bytes).unwrap();
         assert_eq!(g, decoded);

@@ -69,8 +69,8 @@ pub use prefix_ops::{mce, mcp, qc1_certify};
 pub use proposal::{BeaconProposal, BeaconProposalVerifyContext, BeaconProposalVerifyError};
 pub use ready_signal::ReadySignal;
 pub use skip::{
-    SkipEpochCert, SkipRequest, build_skip_cert, sign_skip_request, verify_skip_cert,
-    verify_skip_request,
+    SkipEpochCert, SkipEpochCertVerifyError, SkipRequest, SkipRequestVerifyError,
+    SkipVerifyContext, build_skip_cert, sign_skip_request, verify_skip_cert, verify_skip_request,
 };
 pub use spc::{
     SkipReport, SpcCert, SpcCertVerifyError, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError,
