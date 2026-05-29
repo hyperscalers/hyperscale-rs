@@ -254,14 +254,22 @@ pub struct ShardWitness {
     pub proof: ShardWitnessProof,
 }
 
-/// Coarse-grained verification failure for a [`ShardWitness`].
-///
-/// Failure modes (shard-id mismatch, block-hash mismatch, leaf-index
-/// overflow, merkle path mismatch) summarize into one variant; the
-/// rejection log line records the specific reason.
+/// Failure modes of a [`ShardWitness`].
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
-#[error("ShardWitness verification failed")]
-pub struct ShardWitnessVerifyError;
+pub enum ShardWitnessVerifyError {
+    /// `proof.shard_id != ctx.header().shard_group_id()`.
+    #[error("witness shard_id does not match header shard")]
+    ShardIdMismatch,
+    /// `proof.committed_block_hash != ctx.block_hash()`.
+    #[error("witness committed_block_hash does not match header block hash")]
+    BlockHashMismatch,
+    /// `proof.leaf_index` exceeds the merkle helper's `u32` index width.
+    #[error("leaf_index exceeds u32")]
+    LeafIndexOverflow,
+    /// Merkle inclusion check against `header.beacon_witness_root()` failed.
+    #[error("merkle inclusion against header.beacon_witness_root failed")]
+    BadInclusion,
+}
 
 /// Shard-witness predicate: the witness's claimed `shard_id` and
 /// `committed_block_hash` match the verified header, `leaf_index` fits
@@ -271,32 +279,26 @@ pub struct ShardWitnessVerifyError;
 /// Trust source: the verified header carries 2f+1 source-shard
 /// validators' BFT attestation over `beacon_witness_root`. A valid
 /// inclusion proof against that root transitively attests the witness.
-///
-/// Construction asserts:
-/// 1. `proof.shard_id == ctx.header().shard_group_id()`.
-/// 2. `proof.committed_block_hash == ctx.block_hash()`.
-/// 3. `proof.leaf_index` fits in `u32` (the merkle helper's index width).
-/// 4. The merkle path reaches `header.beacon_witness_root()`.
 impl Verify<&Verified<CertifiedBlockHeader>> for ShardWitness {
     type Error = ShardWitnessVerifyError;
 
     fn verify(&self, ctx: &Verified<CertifiedBlockHeader>) -> Result<Verified<Self>, Self::Error> {
         let header = ctx.header();
         if self.proof.shard_id != header.shard_group_id() {
-            return Err(ShardWitnessVerifyError);
+            return Err(ShardWitnessVerifyError::ShardIdMismatch);
         }
         if self.proof.committed_block_hash != ctx.block_hash() {
-            return Err(ShardWitnessVerifyError);
+            return Err(ShardWitnessVerifyError::BlockHashMismatch);
         }
-        let leaf_index_u32 =
-            u32::try_from(self.proof.leaf_index.inner()).map_err(|_| ShardWitnessVerifyError)?;
+        let leaf_index_u32 = u32::try_from(self.proof.leaf_index.inner())
+            .map_err(|_| ShardWitnessVerifyError::LeafIndexOverflow)?;
         if !verify_merkle_inclusion(
             *header.beacon_witness_root().as_raw(),
             self.payload.leaf_hash(),
             &self.proof.siblings,
             leaf_index_u32,
         ) {
-            return Err(ShardWitnessVerifyError);
+            return Err(ShardWitnessVerifyError::BadInclusion);
         }
         Ok(Verified::new_unchecked(self.clone()))
     }

@@ -227,11 +227,11 @@ pub enum SpcEffect {
 
 /// Events [`SpcInstance::handle`] consumes.
 ///
-/// Peer messages flow in as `*Verified` variants after the
-/// [`BeaconCoordinator`](crate::coordinator::BeaconCoordinator) has
-/// dispatched the BLS check to the crypto pool and received the
-/// `valid=true` result. There is no unverified admission path — the
-/// type system forbids passing an unverified message into `handle`.
+/// Peer messages flow in as `*Verified` variants carrying `Verified<T>`
+/// — the marker is produced by the BLS dispatch through the crypto pool
+/// and threaded through the coordinator into the FSM. There is no
+/// unverified admission path; the type system forbids passing an
+/// unverified message into `handle`.
 #[derive(Debug, Clone)]
 pub enum SpcEvent {
     /// The local validator's input vector for view 1.

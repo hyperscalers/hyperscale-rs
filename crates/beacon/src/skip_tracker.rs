@@ -210,7 +210,7 @@ mod tests {
         assert_eq!(cert.signer_count(), 6);
         assert_eq!(cert.anchor_hash(), anchor());
         assert_eq!(cert.epoch_to_skip(), Epoch::new(7));
-        assert!(verify_skip_cert(&cert, &net(), &active));
+        assert!(verify_skip_cert(&cert, &net(), &active).is_ok());
     }
 
     /// Out-of-pool signers slip past `observe` but `try_assemble`'s
@@ -241,7 +241,7 @@ mod tests {
             .try_assemble(anchor(), Epoch::new(7), &active)
             .expect("quorum reached");
         assert_eq!(cert.signer_count(), 6);
-        assert!(verify_skip_cert(&cert, &net(), &active));
+        assert!(verify_skip_cert(&cert, &net(), &active).is_ok());
     }
 
     #[test]
@@ -310,7 +310,7 @@ mod tests {
         let cert = t
             .try_assemble(anchor(), Epoch::new(9), &active)
             .expect("quorum reached, must assemble");
-        assert!(verify_skip_cert(&cert, &net(), &active));
+        assert!(verify_skip_cert(&cert, &net(), &active).is_ok());
 
         // Forget clears the bucket — both predicates revert.
         t.forget_anchor(anchor());
@@ -325,7 +325,7 @@ mod tests {
         let cert = t
             .try_assemble(anchor(), Epoch::new(9), &active)
             .expect("quorum reached after re-observe");
-        assert!(verify_skip_cert(&cert, &net(), &active));
+        assert!(verify_skip_cert(&cert, &net(), &active).is_ok());
     }
 
     // Small helper trait so the closure inside `property_*` doesn't
