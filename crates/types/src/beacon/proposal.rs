@@ -180,15 +180,6 @@ impl Verified<BeaconProposal> {
         let (vrf_output, vrf_proof) = vrf_sign(sk, network, epoch);
         Self::new_unchecked(BeaconProposal::new(witnesses, vrf_output, vrf_proof))
     }
-
-    /// Wrap a locally-built proposal whose VRF reveal was produced via
-    /// a verified path. Mirror of
-    /// [`Verified::<PcQc1>::from_local_build`]. Used at the bridge
-    /// from coordinator-side assembly to the action handler.
-    #[must_use]
-    pub const fn from_local_build(proposal: BeaconProposal) -> Self {
-        Self::new_unchecked(proposal)
-    }
 }
 
 #[cfg(test)]

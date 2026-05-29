@@ -811,14 +811,13 @@ impl Verified<SpcCert> {
         build_indirect_cert(empty_view, &raw, committee).map(Self::new_unchecked)
     }
 
-    /// Wrap a locally-assembled cert whose backing inputs were verified
-    /// upstream. Trust source: the FSM produced the cert from already-
-    /// verified PC votes / empty-view msgs and the assembly path is
-    /// deterministic. Used at the bridge from the SPC FSM (which holds
-    /// raw `SpcCert`) to coordinator-side admission.
+    /// Lift the inner cert out of a verified proposal object. Trust
+    /// source: the proposal-object verifier predicate is exactly
+    /// `verify_cert(po.cert, po.view, ...)` — so a verified proposal
+    /// object carries a verified cert by construction.
     #[must_use]
-    pub const fn from_local_build(cert: SpcCert) -> Self {
-        Self::new_unchecked(cert)
+    pub fn from_verified_proposal_object(po: Verified<SpcProposalObject>) -> Self {
+        Self::new_unchecked(po.into_inner().cert)
     }
 }
 
@@ -833,14 +832,6 @@ impl Verified<SpcProposalObject> {
             view,
             cert: cert.into_inner(),
         })
-    }
-
-    /// Wrap a locally-assembled proposal object whose backing cert was
-    /// produced from verified inputs. Mirror of
-    /// [`Verified::<PcQc1>::from_local_build`].
-    #[must_use]
-    pub const fn from_local_build(po: SpcProposalObject) -> Self {
-        Self::new_unchecked(po)
     }
 }
 
@@ -858,12 +849,43 @@ impl Verified<SpcHighTriple> {
         })
     }
 
-    /// Wrap a locally-built high triple whose backing inputs were
-    /// already verified upstream. Mirror of
-    /// [`Verified::<PcQc1>::from_local_build`].
+    /// Extract the verified high triple referenced by a verified cert —
+    /// `(prev_view, value, proof)` for [`SpcCert::Direct`],
+    /// `(target_view, target_value, target_proof)` for
+    /// [`SpcCert::Indirect`]. Trust source: the cert's verifier
+    /// predicate subsumes the triple's well-formedness check.
     #[must_use]
-    pub const fn from_local_build(triple: SpcHighTriple) -> Self {
+    pub fn from_verified_cert(cert: &Verified<SpcCert>) -> Self {
+        let triple = match cert.as_ref() {
+            SpcCert::Direct {
+                prev_view,
+                value,
+                proof,
+            } => SpcHighTriple {
+                view: *prev_view,
+                value: value.clone(),
+                proof: proof.clone(),
+            },
+            SpcCert::Indirect {
+                target_view,
+                target_value,
+                target_proof,
+                ..
+            } => SpcHighTriple {
+                view: *target_view,
+                value: target_value.clone(),
+                proof: target_proof.clone(),
+            },
+        };
         Self::new_unchecked(triple)
+    }
+
+    /// Lift the `reported` triple out of a verified empty-view message.
+    /// Trust source: the empty-view verifier predicate already checked
+    /// the triple's well-formedness (including its embedded QC3).
+    #[must_use]
+    pub fn from_verified_empty_view(msg: &Verified<SpcEmptyViewMsg>) -> Self {
+        Self::new_unchecked(msg.reported.clone())
     }
 }
 
@@ -880,14 +902,6 @@ impl Verified<SpcNewCommitMsg> {
             value,
             proof: Verifiable::from(proof),
         })
-    }
-
-    /// Wrap a locally-built new-commit message whose backing inputs were
-    /// already verified upstream. Mirror of
-    /// [`Verified::<PcQc1>::from_local_build`].
-    #[must_use]
-    pub const fn from_local_build(msg: SpcNewCommitMsg) -> Self {
-        Self::new_unchecked(msg)
     }
 }
 

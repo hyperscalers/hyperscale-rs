@@ -9,8 +9,7 @@ use std::collections::BTreeMap;
 
 use hyperscale_types::{
     Bls12381G1PublicKey, Bls12381G2Signature, Epoch, PcQc1, PcQc2, PcQc3, PcVector, PcVote1,
-    PcVote2, PcVote3, PcVoteEquivocation, PcVoteRound, SpcView, ValidatorId, build_qc1, build_qc2,
-    build_qc3,
+    PcVote2, PcVote3, PcVoteEquivocation, PcVoteRound, SpcView, ValidatorId, Verified,
 };
 
 /// What `PcInstance::handle` tells its parent.
@@ -35,12 +34,12 @@ pub enum PcEffect {
     /// Sign a round-2 vote over `qc1.x()` and broadcast it.
     SignAndBroadcastVote2 {
         /// Source QC; `v2.x == qc1.x` is enforced at the signer.
-        qc1: Box<PcQc1>,
+        qc1: Box<Verified<PcQc1>>,
     },
     /// Sign a round-3 vote over `qc2.x_p()` and broadcast it.
     SignAndBroadcastVote3 {
         /// Source QC; `v3.x_p == qc2.x_p` is enforced at the signer.
-        qc2: Box<PcQc2>,
+        qc2: Box<Verified<PcQc2>>,
     },
     /// Slim wire-form evidence that a peer double-signed at the same
     /// `(epoch, view, round)`. The parent assembles this into beacon
@@ -49,7 +48,7 @@ pub enum PcEffect {
     /// Round-3 quorum reached — terminal cert ready. The parent reads
     /// the certified low (`qc3.x_pp`) and high (`qc3.x_pe`) out of
     /// the embedded QC.
-    Decided(Box<PcQc3>),
+    Decided(Box<Verified<PcQc3>>),
 }
 
 /// Events `PcInstance::handle` consumes.
@@ -65,11 +64,11 @@ pub enum PcEvent {
     /// inputs after the first are dropped.
     Input(PcVector),
     /// A BLS-verified round-1 vote, ready for admission to the pool.
-    Vote1Verified(PcVote1),
+    Vote1Verified(Verified<PcVote1>),
     /// A BLS-verified round-2 vote.
-    Vote2Verified(Box<PcVote2>),
+    Vote2Verified(Box<Verified<PcVote2>>),
     /// A BLS-verified round-3 vote.
-    Vote3Verified(Box<PcVote3>),
+    Vote3Verified(Box<Verified<PcVote3>>),
 }
 
 /// One inner-PC FSM instance, scoped to a single `(epoch, view)`.
@@ -83,9 +82,9 @@ pub struct PcInstance {
     view: SpcView,
     committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
 
-    vote1_pool: BTreeMap<ValidatorId, PcVote1>,
-    vote2_pool: BTreeMap<ValidatorId, PcVote2>,
-    vote3_pool: BTreeMap<ValidatorId, PcVote3>,
+    vote1_pool: BTreeMap<ValidatorId, Verified<PcVote1>>,
+    vote2_pool: BTreeMap<ValidatorId, Verified<PcVote2>>,
+    vote3_pool: BTreeMap<ValidatorId, Verified<PcVote3>>,
 
     input: Option<PcVector>,
     sent_vote2: bool,
@@ -171,11 +170,10 @@ impl PcInstance {
         effects
     }
 
-    /// Admit a BLS-verified round-1 vote. Callers MUST have already
-    /// run [`verify_vote1`](hyperscale_types::verify_vote1) (or its
-    /// async dispatch); this entry skips the sig check and runs the
-    /// pool / equivocation logic.
-    pub(crate) fn on_vote1_verified(&mut self, v1: PcVote1) -> Vec<PcEffect> {
+    /// Admit a BLS-verified round-1 vote. The type system guarantees
+    /// the sig check has cleared; this entry runs the pool /
+    /// equivocation logic.
+    pub(crate) fn on_vote1_verified(&mut self, v1: Verified<PcVote1>) -> Vec<PcEffect> {
         let from = v1.validator();
         if let Some(existing) = self.vote1_pool.get(&from) {
             if existing.v_in() == v1.v_in() {
@@ -186,9 +184,9 @@ impl PcInstance {
                     from,
                     PcVoteRound::Vote1,
                     existing.v_in().clone(),
-                    prefix_top_sig(existing),
+                    prefix_top_sig(existing.as_ref()),
                     v1.v_in().clone(),
-                    prefix_top_sig(&v1),
+                    prefix_top_sig(v1.as_ref()),
                 ),
             ))];
         }
@@ -196,9 +194,8 @@ impl PcInstance {
         self.maybe_advance_to_round2()
     }
 
-    /// Admit a BLS-verified round-2 vote. Callers MUST have already
-    /// run [`verify_vote2`](hyperscale_types::verify_vote2).
-    pub(crate) fn on_vote2_verified(&mut self, v2: PcVote2) -> Vec<PcEffect> {
+    /// Admit a BLS-verified round-2 vote.
+    pub(crate) fn on_vote2_verified(&mut self, v2: Verified<PcVote2>) -> Vec<PcEffect> {
         let from = v2.validator();
         if let Some(existing) = self.vote2_pool.get(&from) {
             // Vote2's signed payload is `x` — different `qc1` aggregations
@@ -211,9 +208,9 @@ impl PcInstance {
                     from,
                     PcVoteRound::Vote2,
                     existing.x().clone(),
-                    vote2_top_sig(existing),
+                    vote2_top_sig(existing.as_ref()),
                     v2.x().clone(),
-                    vote2_top_sig(&v2),
+                    vote2_top_sig(v2.as_ref()),
                 ),
             ))];
         }
@@ -221,9 +218,8 @@ impl PcInstance {
         self.maybe_advance_to_round3()
     }
 
-    /// Admit a BLS-verified round-3 vote. Callers MUST have already
-    /// run [`verify_vote3`](hyperscale_types::verify_vote3).
-    pub(crate) fn on_vote3_verified(&mut self, v3: PcVote3) -> Vec<PcEffect> {
+    /// Admit a BLS-verified round-3 vote.
+    pub(crate) fn on_vote3_verified(&mut self, v3: Verified<PcVote3>) -> Vec<PcEffect> {
         let from = v3.validator();
         if let Some(existing) = self.vote3_pool.get(&from) {
             // Vote3's signed payload is `x_p` — different `qc2`s are
@@ -251,8 +247,8 @@ impl PcInstance {
             return vec![];
         }
         let q = self.quorum();
-        let vote1s: Vec<&PcVote1> = self.vote1_pool.values().take(q).collect();
-        let qc1 = build_qc1(&vote1s, &self.committee);
+        let vote1s: Vec<&Verified<PcVote1>> = self.vote1_pool.values().take(q).collect();
+        let qc1 = Verified::<PcQc1>::from_verified_votes(&vote1s, &self.committee);
         self.sent_vote2 = true;
         let mut effects = vec![PcEffect::SignAndBroadcastVote2 { qc1: Box::new(qc1) }];
         effects.extend(self.maybe_advance_to_round3());
@@ -264,8 +260,8 @@ impl PcInstance {
             return vec![];
         }
         let q = self.quorum();
-        let vote2s: Vec<&PcVote2> = self.vote2_pool.values().take(q).collect();
-        let qc2 = build_qc2(&vote2s, &self.committee);
+        let vote2s: Vec<&Verified<PcVote2>> = self.vote2_pool.values().take(q).collect();
+        let qc2 = Verified::<PcQc2>::from_verified_votes(&vote2s, &self.committee);
         self.sent_vote3 = true;
         let mut effects = vec![PcEffect::SignAndBroadcastVote3 { qc2: Box::new(qc2) }];
         effects.extend(self.maybe_finalize());
@@ -277,8 +273,8 @@ impl PcInstance {
             return vec![];
         }
         let q = self.quorum();
-        let vote3s: Vec<&PcVote3> = self.vote3_pool.values().take(q).collect();
-        let qc3 = build_qc3(&vote3s, &self.committee);
+        let vote3s: Vec<&Verified<PcVote3>> = self.vote3_pool.values().take(q).collect();
+        let qc3 = Verified::<PcQc3>::from_verified_votes(&vote3s, &self.committee);
         self.decided = true;
         vec![PcEffect::Decided(Box::new(qc3))]
     }
@@ -324,7 +320,7 @@ mod tests {
 
     use hyperscale_types::{
         Bls12381G1PrivateKey, Epoch, NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PcValueElement,
-        PcVector, PcVoteRound, SpcView, bls_keypair_from_seed, pc_context, sign_vote1, spc_context,
+        PcVector, PcVoteRound, SpcView, bls_keypair_from_seed, pc_context, spc_context,
     };
 
     use super::*;
@@ -403,8 +399,10 @@ mod tests {
         let pc_ctx_bytes = pc_context(&spc_context(Epoch::new(1)), SpcView::new(0));
         let v_a = PcVector::new(std::iter::once(elem(1)));
         let v_b = PcVector::new(std::iter::once(elem(2)));
-        let vote_a = sign_vote1(&sks[1], members[1].0, &net(), &pc_ctx_bytes, v_a);
-        let vote_b = sign_vote1(&sks[1], members[1].0, &net(), &pc_ctx_bytes, v_b);
+        let vote_a =
+            Verified::<PcVote1>::sign_local(&sks[1], members[1].0, &net(), &pc_ctx_bytes, v_a);
+        let vote_b =
+            Verified::<PcVote1>::sign_local(&sks[1], members[1].0, &net(), &pc_ctx_bytes, v_b);
 
         let effects_a = fsm.handle(PcEvent::Vote1Verified(vote_a));
         assert!(effects_a.is_empty(), "first vote pools without effect");
