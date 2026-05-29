@@ -13,6 +13,7 @@ use hyperscale_types::{
     CertifiedBeaconBlock, CertifiedBlock, CertifiedBlockHeader, CertifiedHeaderVerifyError, Epoch,
     ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote, FinalizedWave,
     FinalizedWaveVerifyError, LocalReceiptRoot, LocalReceiptRootVerifyError, PcQc3, PcVector,
+    PcVote1, PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3, PcVote3VerifyError,
     PcVoteMessage, ProvisionRootVerifyError, ProvisionTxRootsMap, ProvisionTxRootsVerifyError,
     Provisions, ProvisionsRoot, ProvisionsVerifyError, QcVerifyError, QuorumCertificate,
     ReadySignal, Round, RoutableTransaction, ShardGroupId, ShardWitness, SkipEpochCert,
@@ -640,16 +641,33 @@ pub enum ProtocolEvent {
     // ═══════════════════════════════════════════════════════════════════════
     // Beacon consensus
     // ═══════════════════════════════════════════════════════════════════════
-    /// PC inner-consensus vote received from a peer. `BeaconCoordinator`
-    /// gates on instance bootstrap and skip-quorum, then routes into the
-    /// per-epoch `SpcInstance`.
-    PcVoteReceived {
+    /// PC inner-consensus vote received whose signature still needs to
+    /// be checked. Produced by the gossip handler — wire decode lands
+    /// the wrapper as `Verifiable::Unverified`.
+    UnverifiedPcVoteReceived {
         /// Sender id (transport-level).
         from: ValidatorId,
         /// SPC view this vote belongs to.
         view: SpcView,
         /// The vote; variant tags the round.
         vote: Box<PcVoteMessage>,
+    },
+
+    /// PC inner-consensus vote received whose verification predicate
+    /// already holds — produced only by the local sign-and-emit handler
+    /// (or by a colocated peer's local-dispatch fast path). The
+    /// recipient skips `Action::VerifyPcVote{N}` and feeds the typed
+    /// handle straight into the SPC sub-machine.
+    VerifiedPcVoteReceived {
+        /// Sender id (transport-level).
+        from: ValidatorId,
+        /// SPC view this vote belongs to.
+        view: SpcView,
+        /// Verified vote, sealed via
+        /// [`Verified::<PcVoteMessage>::from_verified_vote1`] /
+        /// [`Verified::<PcVoteMessage>::from_verified_vote2`] /
+        /// [`Verified::<PcVoteMessage>::from_verified_vote3`].
+        vote: Box<Verified<PcVoteMessage>>,
     },
 
     /// SPC `new-view` notification received from a peer. The cert is
@@ -749,18 +767,36 @@ pub enum ProtocolEvent {
         valid: bool,
     },
 
-    /// Result of an [`Action::VerifyPcVote`] dispatch. The vote rides
-    /// back so the coordinator can route it into the right view's inner
-    /// PC sub-machine without stashing.
-    PcVoteVerified {
+    /// Result of an [`Action::VerifyPcVote1`] dispatch. The verified
+    /// handle rides back so the coordinator can route it into the right
+    /// view's inner PC sub-machine without stashing.
+    PcVote1Verified {
         /// Epoch the inner PC instance belongs to.
         epoch: Epoch,
         /// SPC view whose inner PC produced this vote.
         view: SpcView,
-        /// Vote whose signature was checked.
-        vote: Box<PcVoteMessage>,
-        /// Whether the signature check passed.
-        valid: bool,
+        /// Verified vote on success; the typed error otherwise.
+        result: Result<Verified<PcVote1>, PcVote1VerifyError>,
+    },
+
+    /// Result of an [`Action::VerifyPcVote2`] dispatch.
+    PcVote2Verified {
+        /// Epoch the inner PC instance belongs to.
+        epoch: Epoch,
+        /// SPC view whose inner PC produced this vote.
+        view: SpcView,
+        /// Verified vote on success; the typed error otherwise.
+        result: Result<Verified<PcVote2>, PcVote2VerifyError>,
+    },
+
+    /// Result of an [`Action::VerifyPcVote3`] dispatch.
+    PcVote3Verified {
+        /// Epoch the inner PC instance belongs to.
+        epoch: Epoch,
+        /// SPC view whose inner PC produced this vote.
+        view: SpcView,
+        /// Verified vote on success; the typed error otherwise.
+        result: Result<Verified<PcVote3>, PcVote3VerifyError>,
     },
 
     /// Result of an [`Action::VerifySpcNewView`] dispatch.
