@@ -132,7 +132,7 @@ fn adoption_path_advances_non_participating_replica() {
     // own SPC.
     let mut sim_b = CoordinatorSim::new(4, seed);
     assert!(sim_b.commits[0].is_empty());
-    let actions = sim_b.deliver_block_to(0, Arc::clone(&peer_block));
+    let actions = sim_b.deliver_block_to(0, &peer_block);
     assert!(
         actions
             .iter()

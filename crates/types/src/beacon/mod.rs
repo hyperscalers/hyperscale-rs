@@ -46,7 +46,10 @@ pub mod witness;
 
 pub use block::BeaconBlock;
 pub use cert::BeaconCert;
-pub use certified::{CertifiedBeaconBlock, CertifiedBeaconBlockPairingError};
+pub use certified::{
+    CertifiedBeaconBlock, CertifiedBeaconBlockPairingError, CertifiedBeaconBlockVerifyContext,
+    CertifiedBeaconBlockVerifyError, verify_block_equivocations, verify_certified,
+};
 pub use genesis::{BeaconGenesisConfig, GenesisPool, GenesisValidator, genesis_config_hash};
 pub use limits::{
     MAX_BEACON_WITNESS_EVENTS_PER_TX, MAX_PREFIX_SIGS, MAX_READY_SIGNALS_PER_BLOCK,
@@ -63,9 +66,12 @@ pub use pc::{
     verify_vote2, verify_vote3,
 };
 pub use prefix_ops::{mce, mcp, qc1_certify};
-pub use proposal::BeaconProposal;
+pub use proposal::{BeaconProposal, BeaconProposalVerifyContext, BeaconProposalVerifyError};
 pub use ready_signal::ReadySignal;
-pub use skip::{SkipEpochCert, SkipRequest};
+pub use skip::{
+    SkipEpochCert, SkipRequest, build_skip_cert, sign_skip_request, verify_skip_cert,
+    verify_skip_request,
+};
 pub use spc::{
     SkipReport, SpcCert, SpcCertVerifyError, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError,
     SpcHighTriple, SpcHighTripleVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError,

@@ -286,7 +286,8 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::UnverifiedSpcEmptyViewReceived { .. }
             | ProtocolEvent::VerifiedSpcEmptyViewReceived { .. }
             | ProtocolEvent::BeaconBlockReceived { .. }
-            | ProtocolEvent::BeaconProposalReceived { .. }
+            | ProtocolEvent::UnverifiedBeaconProposalReceived { .. }
+            | ProtocolEvent::VerifiedBeaconProposalReceived { .. }
             | ProtocolEvent::SkipRequestReceived { .. }
             | ProtocolEvent::SkipCertReceived { .. }
             | ProtocolEvent::ShardWitnessesReceived { .. }

@@ -12,9 +12,8 @@ use std::collections::BTreeMap;
 
 use hyperscale_types::{
     BeaconBlockHash, Bls12381G1PublicKey, Epoch, SkipEpochCert, SkipRequest, ValidatorId,
+    build_skip_cert,
 };
-
-use crate::skip::build_skip_cert;
 
 /// Bucket of observed `(anchor_hash, epoch_to_skip)` requests.
 #[derive(Debug, Default)]
@@ -114,11 +113,10 @@ mod tests {
 
     use hyperscale_types::{
         BeaconBlockHash, Bls12381G1PrivateKey, Epoch, Hash, NetworkDefinition, ValidatorId,
-        bls_keypair_from_seed,
+        bls_keypair_from_seed, sign_skip_request, verify_skip_cert,
     };
 
     use super::*;
-    use crate::skip::{sign_skip_request, verify_skip_cert};
 
     fn net() -> NetworkDefinition {
         NetworkDefinition::simulator()

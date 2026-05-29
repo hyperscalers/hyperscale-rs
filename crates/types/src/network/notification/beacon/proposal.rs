@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use sbor::prelude::BasicSbor;
 
-use crate::{BeaconProposal, Epoch, MessageClass, NetworkMessage, ValidatorId};
+use crate::{BeaconProposal, Epoch, MessageClass, NetworkMessage, ValidatorId, Verifiable};
 
 /// One committee member's [`BeaconProposal`] sent to the rest of the
 /// beacon committee for the current epoch.
@@ -15,6 +15,10 @@ use crate::{BeaconProposal, Epoch, MessageClass, NetworkMessage, ValidatorId};
 /// verifiable under `sender`'s pubkey. Receivers gate admission on
 /// the verify result; a tampered `sender` or `epoch` shifts the
 /// signing bytes and the VRF check fails.
+///
+/// Wire decode lands the wrapper as `Verifiable::Unverified`;
+/// locally-dispatched sends from a colocated proposer preserve
+/// `Verifiable::Verified`.
 ///
 /// `MessageClass::Consensus` — proposal arrival is round-blocking:
 /// SPC's view-1 input vector commits to each peer's proposal, so a
@@ -33,16 +37,18 @@ pub struct BeaconProposalNotification {
     /// `(network, epoch)` signing context.
     pub epoch: Epoch,
     /// The proposal: witnesses + VRF reveal.
-    pub proposal: Arc<BeaconProposal>,
+    pub proposal: Arc<Verifiable<BeaconProposal>>,
 }
 
 impl BeaconProposalNotification {
     /// Wrap a [`BeaconProposal`] for committee-internal unicast.
+    /// Accepts a raw proposal or a `Verified<BeaconProposal>` — the
+    /// wrapper preserves the marker.
     #[must_use]
     pub fn new(
         sender: ValidatorId,
         epoch: Epoch,
-        proposal: impl Into<Arc<BeaconProposal>>,
+        proposal: impl Into<Arc<Verifiable<BeaconProposal>>>,
     ) -> Self {
         Self {
             sender,
@@ -75,8 +81,11 @@ mod tests {
 
     #[test]
     fn sbor_round_trip() {
-        let n =
-            BeaconProposalNotification::new(ValidatorId::new(3), Epoch::new(7), sample_proposal());
+        let n = BeaconProposalNotification::new(
+            ValidatorId::new(3),
+            Epoch::new(7),
+            Arc::new(Verifiable::from(sample_proposal())),
+        );
         let bytes = basic_encode(&n).unwrap();
         let decoded: BeaconProposalNotification = basic_decode(&bytes).unwrap();
         assert_eq!(n, decoded);

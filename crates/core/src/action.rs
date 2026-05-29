@@ -959,9 +959,11 @@ pub enum Action {
     /// cert check and every equivocation check.
     VerifyBeaconBlock {
         /// Block whose cert + embedded equivocation witnesses are
-        /// being verified. Carried back through the result event so
-        /// the coordinator doesn't have to stash it separately.
-        block: Arc<CertifiedBeaconBlock>,
+        /// being verified. A [`Verifiable::Verified`] wrapper
+        /// short-circuits dispatch. Carried back through the result
+        /// event so the coordinator doesn't have to stash it
+        /// separately.
+        block: Arc<Verifiable<CertifiedBeaconBlock>>,
         /// Signers paired with their pubkeys — committee for a Normal
         /// block, active pool for a Skip block. Positional ordering
         /// matches the cert's signer bitfield.

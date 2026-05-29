@@ -23,8 +23,13 @@ use sbor::{
     Categorize, Decode, DecodeError, Decoder, Describe, Encode, EncodeError, Encoder,
     NoCustomTypeKind, NoCustomValueKind, RustTypeId, TypeData, TypeKind, ValueKind,
 };
+use thiserror::Error;
 
-use crate::{BeaconBlock, BeaconBlockHash, BeaconCert, Epoch, GenesisConfigHash};
+use crate::{
+    BeaconBlock, BeaconBlockHash, BeaconCert, Bls12381G1PublicKey, Epoch, GenesisConfigHash,
+    NetworkDefinition, ValidatorId, Verified, Verify, Witness, spc_context, verify_block_cert,
+    verify_skip_cert, verify_vote_equivocation,
+};
 
 /// A beacon block paired with the cert that authenticates it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,6 +169,154 @@ impl CertifiedBeaconBlock {
             }
         }
         Ok(())
+    }
+}
+
+// ─── Verifiers ─────────────────────────────────────────────────────────────
+
+/// Verify a [`CertifiedBeaconBlock`] under the cert variant's required
+/// signer pool.
+///
+/// Dispatches: SPC cert against the beacon committee, Skip cert against
+/// the active pool. `Genesis` certs reject — past-tip genesis blocks
+/// have no replayable verification.
+#[must_use]
+pub fn verify_certified(
+    block: &CertifiedBeaconBlock,
+    network: &NetworkDefinition,
+    signers: &[(ValidatorId, Bls12381G1PublicKey)],
+) -> bool {
+    match block.cert() {
+        BeaconCert::Normal(cert) => {
+            verify_block_cert(cert, network, &spc_context(block.epoch()), signers)
+        }
+        BeaconCert::Skip(cert) => verify_skip_cert(cert, network, signers),
+        BeaconCert::Genesis(_) => false,
+    }
+}
+
+/// Verify every `Witness::Equivocation` carried in `block`'s committed
+/// proposals against the supplied `signers` lookup.
+///
+/// `signers` must cover every equivocating validator referenced by the
+/// block's witnesses — the coordinator filters `state.validators` down
+/// to the referenced subset before dispatch. Missing pubkeys reject the
+/// block at admission, matching the "fail closed" stance.
+///
+/// Returns `true` when the block carries no equivocations.
+#[must_use]
+pub fn verify_block_equivocations(
+    block: &CertifiedBeaconBlock,
+    network: &NetworkDefinition,
+    signers: &[(ValidatorId, Bls12381G1PublicKey)],
+) -> bool {
+    for (_, proposal) in block.block().committed_proposals() {
+        for witness in proposal.witnesses().iter() {
+            if let Witness::Equivocation(ev) = witness
+                && !verify_vote_equivocation(ev, network, signers)
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+// ─── Typestate ─────────────────────────────────────────────────────────────
+
+/// Verification context for [`CertifiedBeaconBlock`].
+///
+/// The cert variant determines which signer pool the BLS aggregate
+/// verifies under: SPC certs against the beacon committee for the
+/// block's epoch, Skip certs against the active validator pool at the
+/// anchor's epoch. Equivocation witnesses bring their own per-validator
+/// pubkey lookup since the equivocating validator need not be on the
+/// current signer pool.
+#[derive(Debug, Clone, Copy)]
+pub struct CertifiedBeaconBlockVerifyContext<'a> {
+    /// Network the cert and equivocation evidence were bound to.
+    pub network: &'a NetworkDefinition,
+    /// Signer pool the cert verifies against (committee for Normal,
+    /// active pool for Skip). Positional ordering matches the cert's
+    /// signer bitfield.
+    pub signers: &'a [(ValidatorId, Bls12381G1PublicKey)],
+    /// Pubkeys for the validators referenced by embedded
+    /// `Witness::Equivocation` evidence. The coordinator filters
+    /// `state.validators` down to the referenced subset; an evidence
+    /// signer missing from this lookup rejects the block.
+    pub equivocation_signers: &'a [(ValidatorId, Bls12381G1PublicKey)],
+}
+
+/// Coarse-grained verification failure for a certified beacon block.
+///
+/// Failure modes (cert variant rejection, BLS aggregate, equivocation
+/// witness check) summarize into one variant; the rejection log line
+/// records the specific reason at the dispatch site.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+#[error("CertifiedBeaconBlock verification failed")]
+pub struct CertifiedBeaconBlockVerifyError;
+
+impl Verify<&CertifiedBeaconBlockVerifyContext<'_>> for CertifiedBeaconBlock {
+    type Error = CertifiedBeaconBlockVerifyError;
+
+    /// Composite predicate: the cert verifies under the variant's
+    /// required signer pool (via [`verify_certified`]) and every
+    /// embedded `Witness::Equivocation` verifies against
+    /// `equivocation_signers` (via [`verify_block_equivocations`]).
+    fn verify(
+        &self,
+        ctx: &CertifiedBeaconBlockVerifyContext<'_>,
+    ) -> Result<Verified<Self>, Self::Error> {
+        if !verify_certified(self, ctx.network, ctx.signers) {
+            return Err(CertifiedBeaconBlockVerifyError);
+        }
+        if !verify_block_equivocations(self, ctx.network, ctx.equivocation_signers) {
+            return Err(CertifiedBeaconBlockVerifyError);
+        }
+        Ok(Verified::new_unchecked(self.clone()))
+    }
+}
+
+// ─── Named gates ────────────────────────────────────────────────────────────
+
+impl Verified<CertifiedBeaconBlock> {
+    /// Pair a locally-assembled block with its authenticating cert
+    /// after the SPC FSM committed and the coordinator built the
+    /// `CertifiedBeaconBlock` from verified inputs. The pairing
+    /// invariant is checked at [`CertifiedBeaconBlock::new_checked`];
+    /// trust source: the FSM's committed-block path produces the cert
+    /// directly from verified PC outputs, the block from
+    /// pool-accepted proposals.
+    ///
+    /// Mirror of the shard `Verified::<CertifiedBlock>::assemble`
+    /// pattern. Returns the underlying pairing error if the cert
+    /// shape doesn't match the block shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CertifiedBeaconBlockPairingError`] when the cert
+    /// shape doesn't match the block shape.
+    pub fn from_committed_assembly(
+        block: BeaconBlock,
+        cert: BeaconCert,
+    ) -> Result<Self, CertifiedBeaconBlockPairingError> {
+        CertifiedBeaconBlock::new_checked(block, cert).map(Self::new_unchecked)
+    }
+
+    /// Genesis bootstrap pair, verified by construction — the genesis
+    /// `config_hash` doesn't need a cryptographic check; identity is
+    /// established by the operator config the node was launched with.
+    #[must_use]
+    pub const fn genesis(config_hash: GenesisConfigHash) -> Self {
+        Self::new_unchecked(CertifiedBeaconBlock::genesis(config_hash))
+    }
+
+    /// Wrap a locally-built certified pair whose backing inputs were
+    /// produced by verified paths (SPC commit, skip-cert assembly).
+    /// Mirror of [`Verified::<PcQc1>::from_local_build`].
+    #[must_use]
+    pub const fn from_local_build(block: CertifiedBeaconBlock) -> Self {
+        Self::new_unchecked(block)
     }
 }
 
