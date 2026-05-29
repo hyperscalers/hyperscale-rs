@@ -5,7 +5,7 @@ use std::sync::Arc;
 use sbor::prelude::BasicSbor;
 
 use crate::network::{GossipMessage, TopicScope};
-use crate::{MessageClass, NetworkMessage, SkipEpochCert};
+use crate::{MessageClass, NetworkMessage, SkipEpochCert, Verifiable};
 
 /// Broadcasts an assembled [`SkipEpochCert`] across the active pool.
 ///
@@ -16,29 +16,37 @@ use crate::{MessageClass, NetworkMessage, SkipEpochCert};
 /// hash — adoption converges via the wrapper's
 /// [`CertifiedBeaconBlock`](crate::CertifiedBeaconBlock).
 ///
+/// Wire decode lands the wrapper as `Verifiable::Unverified`;
+/// locally-dispatched sends from a colocated aggregator preserve
+/// `Verifiable::Verified`.
+///
 /// `MessageClass::Consensus` — skip cert delivery unblocks adoption.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct SkipCertGossip {
     /// The assembled skip cert.
-    pub cert: Arc<SkipEpochCert>,
+    pub cert: Arc<Verifiable<SkipEpochCert>>,
 }
 
 impl SkipCertGossip {
-    /// Wrap a [`SkipEpochCert`] for gossip broadcast.
+    /// Wrap a [`SkipEpochCert`] for gossip broadcast. Accepts a raw
+    /// cert or a `Verified<SkipEpochCert>` — the wrapper preserves the
+    /// marker.
     #[must_use]
-    pub fn new(cert: impl Into<Arc<SkipEpochCert>>) -> Self {
+    pub fn new(cert: impl Into<Arc<Verifiable<SkipEpochCert>>>) -> Self {
         Self { cert: cert.into() }
     }
 
-    /// Get the inner cert.
+    /// Get the inner cert (raw view, regardless of verification
+    /// state).
     #[must_use]
     pub fn cert(&self) -> &SkipEpochCert {
-        &self.cert
+        self.cert.as_unverified()
     }
 
-    /// Consume and return the inner cert.
+    /// Consume and return the inner cert, preserving the verification
+    /// marker.
     #[must_use]
-    pub fn into_cert(self) -> Arc<SkipEpochCert> {
+    pub fn into_cert(self) -> Arc<Verifiable<SkipEpochCert>> {
         self.cert
     }
 }
@@ -79,7 +87,7 @@ mod tests {
 
     #[test]
     fn sbor_round_trip() {
-        let g = SkipCertGossip::new(sample_cert());
+        let g = SkipCertGossip::new(Arc::new(Verifiable::from(sample_cert())));
         let bytes = basic_encode(&g).unwrap();
         let decoded: SkipCertGossip = basic_decode(&bytes).unwrap();
         assert_eq!(g, decoded);

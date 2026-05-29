@@ -17,10 +17,10 @@ use hyperscale_types::{
     PcVote3VerifyError, ProvisionRootVerifyError, ProvisionTxRootsMap, ProvisionTxRootsVerifyError,
     Provisions, ProvisionsRoot, ProvisionsVerifyError, QcVerifyError, QuorumCertificate,
     ReadySignal, Round, RoutableTransaction, ShardGroupId, ShardWitness, SkipEpochCert,
-    SkipRequest, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError, SpcNewCommitMsg,
-    SpcNewCommitMsgVerifyError, SpcProposalObject, SpcProposalObjectVerifyError, SpcView,
-    StateRoot, StateRootVerifyError, StoredReceipt, TransactionRoot, TxOutcome, TxRootVerifyError,
-    ValidatorId, Verifiable, Verified, VotePower, WaveId, WeightedTimestamp,
+    SkipRequest, SkipRequestVerifyError, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError,
+    SpcNewCommitMsg, SpcNewCommitMsgVerifyError, SpcProposalObject, SpcProposalObjectVerifyError,
+    SpcView, StateRoot, StateRootVerifyError, StoredReceipt, TransactionRoot, TxOutcome,
+    TxRootVerifyError, ValidatorId, Verifiable, Verified, VotePower, WaveId, WeightedTimestamp,
 };
 
 /// How a node learned about the certifying QC that commits a given block.
@@ -796,18 +796,35 @@ pub enum ProtocolEvent {
         proposal: Arc<Verified<BeaconProposal>>,
     },
 
-    /// A `SkipRequest` arrived via gossip.
-    SkipRequestReceived {
+    /// A `SkipRequest` arrived over the wire. Wire decode lands the
+    /// wrapper as `Unverified`; locally-relayed broadcasts preserve
+    /// the marker.
+    UnverifiedSkipRequestReceived {
         /// Received request.
-        request: Arc<SkipRequest>,
+        request: Arc<Verifiable<SkipRequest>>,
+    },
+
+    /// A locally-signed [`SkipRequest`] arrived via the
+    /// [`Action::BroadcastSkipRequest`] self-loopback path. The signing
+    /// validator produced the BLS sig, so the request is verified by
+    /// construction — coordinator skips
+    /// [`Action::VerifySkipRequest`] and admits directly.
+    ///
+    /// [`Action::BroadcastSkipRequest`]: crate::Action::BroadcastSkipRequest
+    /// [`Action::VerifySkipRequest`]: crate::Action::VerifySkipRequest
+    VerifiedSkipRequestReceived {
+        /// Verified request, sealed via
+        /// [`Verified::<SkipRequest>::sign_local`].
+        request: Arc<Verified<SkipRequest>>,
     },
 
     /// A standalone `SkipEpochCert` arrived via gossip. Useful for
     /// late-joining or syncing nodes that didn't observe the requests
-    /// directly.
+    /// directly. Wire decode lands the wrapper as `Unverified`;
+    /// locally-relayed broadcasts preserve the marker.
     SkipCertReceived {
         /// Received cert.
-        cert: Arc<SkipEpochCert>,
+        cert: Arc<Verifiable<SkipEpochCert>>,
     },
 
     /// A shard-witness fetch response landed. `BeaconCoordinator`
@@ -831,10 +848,8 @@ pub enum ProtocolEvent {
 
     /// Result of an [`Action::VerifySkipRequest`] dispatch.
     SkipRequestVerified {
-        /// The request whose BLS sig was verified.
-        request: Box<SkipRequest>,
-        /// Whether the sig check passed.
-        valid: bool,
+        /// Verified request on success; the typed error otherwise.
+        result: Result<Verified<SkipRequest>, SkipRequestVerifyError>,
     },
 
     /// Result of an [`Action::VerifyPcVote1`] dispatch. The verified

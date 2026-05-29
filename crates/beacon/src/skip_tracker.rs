@@ -11,17 +11,16 @@
 use std::collections::BTreeMap;
 
 use hyperscale_types::{
-    BeaconBlockHash, Bls12381G1PublicKey, Epoch, SkipEpochCert, SkipRequest, ValidatorId,
-    build_skip_cert,
+    BeaconBlockHash, Bls12381G1PublicKey, Epoch, SkipEpochCert, SkipRequest, ValidatorId, Verified,
 };
 
 /// Bucket of observed `(anchor_hash, epoch_to_skip)` requests.
 #[derive(Debug, Default)]
 pub struct SkipTracker {
-    /// Inner map: one request per `ValidatorId`. Duplicate observes
-    /// from the same validator overwrite (BLS sigs over the same
-    /// message are byte-identical so this is a no-op in practice).
-    observed: BTreeMap<(BeaconBlockHash, Epoch), BTreeMap<ValidatorId, SkipRequest>>,
+    /// Inner map: one verified request per `ValidatorId`. Duplicate
+    /// observes from the same validator overwrite (BLS sigs over the
+    /// same message are byte-identical so this is a no-op in practice).
+    observed: BTreeMap<(BeaconBlockHash, Epoch), BTreeMap<ValidatorId, Verified<SkipRequest>>>,
 }
 
 impl SkipTracker {
@@ -34,7 +33,7 @@ impl SkipTracker {
     /// Record an already-verified skip request. Idempotent per
     /// `(anchor_hash, epoch_to_skip, signer)`. Returns `true` if newly
     /// inserted.
-    pub fn observe(&mut self, request: SkipRequest) -> bool {
+    pub fn observe(&mut self, request: Verified<SkipRequest>) -> bool {
         let bucket = self
             .observed
             .entry((request.anchor_hash(), request.epoch_to_skip()))
@@ -65,7 +64,7 @@ impl SkipTracker {
         count >= quorum
     }
 
-    /// Try to assemble a cert for `(anchor_hash, epoch_to_skip)`.
+    /// Try to assemble a verified cert for `(anchor_hash, epoch_to_skip)`.
     ///
     /// Returns `Some(cert)` when observed requests from validators in
     /// `active_pool` meet the quorum threshold and BLS aggregation
@@ -77,10 +76,10 @@ impl SkipTracker {
         anchor_hash: BeaconBlockHash,
         epoch_to_skip: Epoch,
         active_pool: &[(ValidatorId, Bls12381G1PublicKey)],
-    ) -> Option<SkipEpochCert> {
+    ) -> Option<Verified<SkipEpochCert>> {
         let bucket = self.observed.get(&(anchor_hash, epoch_to_skip))?;
-        let requests: Vec<SkipRequest> = bucket.values().cloned().collect();
-        build_skip_cert(&requests, active_pool)
+        let refs: Vec<&Verified<SkipRequest>> = bucket.values().collect();
+        Verified::<SkipEpochCert>::from_verified_requests(&refs, active_pool)
     }
 
     /// Drop all buckets at `anchor_hash` — called by the coordinator
@@ -113,7 +112,7 @@ mod tests {
 
     use hyperscale_types::{
         BeaconBlockHash, Bls12381G1PrivateKey, Epoch, Hash, NetworkDefinition, ValidatorId,
-        bls_keypair_from_seed, sign_skip_request, verify_skip_cert,
+        bls_keypair_from_seed, verify_skip_cert,
     };
 
     use super::*;
@@ -159,7 +158,7 @@ mod tests {
     fn observe_inserts_and_dedupes() {
         let mut t = SkipTracker::new();
         let (_active, keys) = pool(4);
-        let req = sign_skip_request(
+        let req = Verified::<SkipRequest>::sign_local(
             &keys[0],
             ValidatorId::new(0),
             &net(),
@@ -179,7 +178,7 @@ mod tests {
         let (active, keys) = pool(7);
         // Pool 7 → quorum = ⌈14/3⌉ + 1 = 6.
         for (i, sk) in keys.iter().enumerate().take(5) {
-            t.observe(sign_skip_request(
+            t.observe(Verified::<SkipRequest>::sign_local(
                 sk,
                 ValidatorId::new(i as u64),
                 &net(),
@@ -196,7 +195,7 @@ mod tests {
         let mut t = SkipTracker::new();
         let (active, keys) = pool(7);
         for (i, sk) in keys.iter().enumerate().take(6) {
-            t.observe(sign_skip_request(
+            t.observe(Verified::<SkipRequest>::sign_local(
                 sk,
                 ValidatorId::new(i as u64),
                 &net(),
@@ -222,7 +221,7 @@ mod tests {
         let mut t = SkipTracker::new();
         let (active, keys) = pool(7);
         let outsider = signing_key(99);
-        t.observe(sign_skip_request(
+        t.observe(Verified::<SkipRequest>::sign_local(
             &outsider,
             ValidatorId::new(99),
             &net(),
@@ -230,7 +229,7 @@ mod tests {
             Epoch::new(7),
         ));
         for (i, sk) in keys.iter().enumerate().take(6) {
-            t.observe(sign_skip_request(
+            t.observe(Verified::<SkipRequest>::sign_local(
                 sk,
                 ValidatorId::new(i as u64),
                 &net(),
@@ -250,7 +249,7 @@ mod tests {
         let mut t = SkipTracker::new();
         let (_active, keys) = pool(4);
         for epoch in 7u64..=8 {
-            t.observe(sign_skip_request(
+            t.observe(Verified::<SkipRequest>::sign_local(
                 &keys[0],
                 ValidatorId::new(0),
                 &net(),
@@ -259,7 +258,7 @@ mod tests {
             ));
         }
         let other = BeaconBlockHash::from_raw(Hash::from_bytes(b"other"));
-        t.observe(sign_skip_request(
+        t.observe(Verified::<SkipRequest>::sign_local(
             &keys[0],
             ValidatorId::new(0),
             &net(),
@@ -283,7 +282,7 @@ mod tests {
         // Sequence: observe 4, observe-dup 3 of those, observe 2 more
         // (now 6 distinct signers — quorum), forget, observe 6.
         let observe = |t: &mut SkipTracker, i: usize| {
-            t.observe(sign_skip_request(
+            t.observe(Verified::<SkipRequest>::sign_local(
                 &keys[i],
                 ValidatorId::new(i as u64),
                 &net(),

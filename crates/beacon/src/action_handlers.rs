@@ -18,8 +18,8 @@ use hyperscale_types::network::notification::{
 };
 use hyperscale_types::{
     BeaconProposal, CertifiedBeaconBlockVerifyContext, PcQc1, PcQc2, PcVote1, PcVote2, PcVote3,
-    PcVoteVerifyContext, SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject,
-    SpcVerifyContext, Verifiable, Verified, pc_context, spc_context, verify_skip_request,
+    PcVoteVerifyContext, SkipVerifyContext, SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg,
+    SpcProposalObject, SpcVerifyContext, Verifiable, Verified, pc_context, spc_context,
 };
 use tracing::warn;
 
@@ -222,8 +222,13 @@ where
             ctx.notify_protocol(ProtocolEvent::BeaconBlockVerified { result });
         }
         Action::VerifySkipRequest { request, signers } => {
-            let valid = verify_skip_request(&request, network, &signers);
-            ctx.notify_protocol(ProtocolEvent::SkipRequestVerified { request, valid });
+            let result = (*request)
+                .upgrade(&SkipVerifyContext {
+                    network,
+                    active_pool: &signers,
+                })
+                .map_err(|(_, e)| e);
+            ctx.notify_protocol(ProtocolEvent::SkipRequestVerified { result });
         }
         Action::VerifyPcVote1 {
             epoch,

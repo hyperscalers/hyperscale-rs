@@ -918,20 +918,25 @@ pub enum Action {
 
     /// Broadcast a locally-signed [`SkipRequest`] to the active-duty
     /// pool. Quorum aggregation happens off-chain inside
-    /// `SkipTracker`.
+    /// `SkipTracker`. The FSM produces the request via
+    /// [`Verified::<SkipRequest>::sign_local`]; the marker rides
+    /// through into the gossip wrapper.
     BroadcastSkipRequest {
         /// Request to broadcast.
-        request: Arc<SkipRequest>,
+        request: Arc<Verified<SkipRequest>>,
         /// Active-pool validators the request ships to.
         recipients: Vec<ValidatorId>,
     },
 
     /// Broadcast an assembled [`SkipEpochCert`] to the active-duty
     /// pool. Standalone cert gossip helps late-joining or syncing
-    /// nodes that didn't observe the requests directly.
+    /// nodes that didn't observe the requests directly. The FSM
+    /// aggregates the cert from verified requests via
+    /// [`Verified::<SkipEpochCert>::from_verified_requests`]; the
+    /// marker rides through.
     BroadcastSkipCert {
         /// Cert to broadcast.
-        cert: Arc<SkipEpochCert>,
+        cert: Arc<Verified<SkipEpochCert>>,
         /// Active-pool validators the cert ships to.
         recipients: Vec<ValidatorId>,
     },
@@ -977,10 +982,11 @@ pub enum Action {
 
     /// Verify a single-signer [`SkipRequest`] BLS signature. Result
     /// returns via [`ProtocolEvent::SkipRequestVerified`] carrying the
-    /// request back.
+    /// typed verified handle on success.
     VerifySkipRequest {
-        /// Request to verify.
-        request: Box<SkipRequest>,
+        /// Request to verify. A [`Verifiable::Verified`] wrapper
+        /// short-circuits dispatch.
+        request: Box<Verifiable<SkipRequest>>,
         /// Active validator pool used to look up the signer's pubkey.
         signers: Vec<(ValidatorId, Bls12381G1PublicKey)>,
     },
