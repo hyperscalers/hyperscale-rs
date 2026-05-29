@@ -860,6 +860,11 @@ pub enum ProtocolEvent {
         epoch: Epoch,
         /// SPC view whose inner PC produced this vote.
         view: SpcView,
+        /// Vote signer, extracted from the unverified payload at
+        /// dispatch time. Carried in both result arms so the coordinator
+        /// can clear the per-`(epoch, view, signer, round)` pipeline
+        /// slot regardless of the verify outcome.
+        signer: ValidatorId,
         /// Verified vote on success; the typed error otherwise.
         result: Result<Verified<PcVote1>, PcVote1VerifyError>,
     },
@@ -870,6 +875,8 @@ pub enum ProtocolEvent {
         epoch: Epoch,
         /// SPC view whose inner PC produced this vote.
         view: SpcView,
+        /// Vote signer; see [`Self::PcVote1Verified::signer`].
+        signer: ValidatorId,
         /// Verified vote on success; the typed error otherwise.
         result: Result<Verified<PcVote2>, PcVote2VerifyError>,
     },
@@ -880,6 +887,8 @@ pub enum ProtocolEvent {
         epoch: Epoch,
         /// SPC view whose inner PC produced this vote.
         view: SpcView,
+        /// Vote signer; see [`Self::PcVote1Verified::signer`].
+        signer: ValidatorId,
         /// Verified vote on success; the typed error otherwise.
         result: Result<Verified<PcVote3>, PcVote3VerifyError>,
     },
@@ -890,6 +899,12 @@ pub enum ProtocolEvent {
         epoch: Epoch,
         /// Sender of the `NewView`.
         from: ValidatorId,
+        /// View this `NewView` advances into, extracted from the
+        /// unverified payload at dispatch time. Carried in both result
+        /// arms so the coordinator can clear the
+        /// per-`(epoch, view, sender, kind)` pipeline slot regardless
+        /// of the verify outcome.
+        view: SpcView,
         /// Verified proposal on success; the typed error otherwise.
         result: Result<Verified<SpcProposalObject>, SpcProposalObjectVerifyError>,
     },
@@ -901,6 +916,9 @@ pub enum ProtocolEvent {
         /// Wire-level sender — used by the coordinator to clear its
         /// per-`(epoch, view, sender)` pipeline slot.
         from: ValidatorId,
+        /// View this commit was produced in; see
+        /// [`Self::SpcNewViewVerified::view`].
+        view: SpcView,
         /// Verified new-commit message on success; the typed error
         /// otherwise.
         result: Result<Verified<SpcNewCommitMsg>, SpcNewCommitMsgVerifyError>,
@@ -910,6 +928,12 @@ pub enum ProtocolEvent {
     SpcEmptyViewVerified {
         /// Epoch the SPC instance belongs to.
         epoch: Epoch,
+        /// Empty-view signer, extracted from the unverified payload at
+        /// dispatch time; see [`Self::SpcNewViewVerified::view`].
+        from: ValidatorId,
+        /// View this empty-view attestation skips; see
+        /// [`Self::SpcNewViewVerified::view`].
+        view: SpcView,
         /// Verified attestation on success; the typed error otherwise.
         result: Result<Verified<SpcEmptyViewMsg>, SpcEmptyViewMsgVerifyError>,
     },
