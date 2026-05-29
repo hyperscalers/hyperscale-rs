@@ -46,8 +46,8 @@ use blake3::Hasher;
 use hyperscale_types::{
     Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature, DOMAIN_PC_EMPTY_VIEW, Epoch,
     Hash, NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PcQc1, PcQc2, PcQc3, PcValueElement, PcVector,
-    PcVoteEquivocation, PcVoteMessage, PositionalBundle, SignerBitfield, SkipReport, SpcCert,
-    SpcContext, SpcEmptyViewMsg, SpcHighTriple, SpcProposalObject, SpcView, ValidatorId,
+    PcVote1, PcVote2, PcVote3, PcVoteEquivocation, PositionalBundle, SignerBitfield, SkipReport,
+    SpcCert, SpcContext, SpcEmptyViewMsg, SpcHighTriple, SpcProposalObject, SpcView, ValidatorId,
     aggregate_verify_bls_different_messages, pc_context, pc_vote_signing_message, verify_qc3,
 };
 
@@ -671,13 +671,27 @@ pub enum SpcEffect {
 pub enum SpcEvent {
     /// The local validator's input vector for view 1.
     Input(PcVector),
-    /// A BLS-verified inner-PC vote, tagged with the SPC view it
-    /// belongs to. Routed to the right view's `PcInstance::handle`.
-    PcVoteVerified {
+    /// A BLS-verified inner-PC round-1 vote, tagged with the SPC view
+    /// it belongs to. Routed to the right view's `PcInstance::handle`.
+    PcVote1Verified {
         /// SPC view whose inner PC produced this vote.
         view: SpcView,
-        /// The verified vote, round implicit in the variant.
-        vote: PcVoteMessage,
+        /// The verified vote.
+        vote: PcVote1,
+    },
+    /// A BLS-verified inner-PC round-2 vote.
+    PcVote2Verified {
+        /// SPC view whose inner PC produced this vote.
+        view: SpcView,
+        /// The verified vote.
+        vote: Box<PcVote2>,
+    },
+    /// A BLS-verified inner-PC round-3 vote.
+    PcVote3Verified {
+        /// SPC view whose inner PC produced this vote.
+        view: SpcView,
+        /// The verified vote.
+        vote: Box<PcVote3>,
     },
     /// BLS-verified `new-view` from a peer entering `view` under `cert`.
     ///
@@ -872,7 +886,9 @@ impl SpcInstance {
     pub fn handle(&mut self, event: SpcEvent) -> Vec<SpcEffect> {
         match event {
             SpcEvent::Input(v) => self.on_input(v),
-            SpcEvent::PcVoteVerified { view, vote } => self.on_pc_vote_verified(view, vote),
+            SpcEvent::PcVote1Verified { view, vote } => self.on_pc_vote1_verified(view, vote),
+            SpcEvent::PcVote2Verified { view, vote } => self.on_pc_vote2_verified(view, *vote),
+            SpcEvent::PcVote3Verified { view, vote } => self.on_pc_vote3_verified(view, *vote),
             SpcEvent::NewViewVerified { from, view, cert } => {
                 self.on_new_view_verified(from, view, *cert)
             }
@@ -894,23 +910,35 @@ impl SpcInstance {
         self.translate_pc_effects(SpcView::new(1), pc_effects)
     }
 
-    /// Route a BLS-verified PC vote into the right view's inner PC
-    /// instance. Drop on a view the local FSM hasn't entered (no
+    /// Route a BLS-verified PC round-1 vote into the right view's inner
+    /// PC instance. Drop on a view the local FSM hasn't entered (no
     /// buffering — peer is ahead of us, the view-entry path will re-feed
     /// inputs).
-    pub(crate) fn on_pc_vote_verified(
-        &mut self,
-        view: SpcView,
-        vote: PcVoteMessage,
-    ) -> Vec<SpcEffect> {
+    pub(crate) fn on_pc_vote1_verified(&mut self, view: SpcView, vote: PcVote1) -> Vec<SpcEffect> {
         let Some(view_state) = self.views.get_mut(&view) else {
             return vec![];
         };
-        let pc_effects = match vote {
-            PcVoteMessage::Vote1(v) => view_state.vpc.on_vote1_verified(v),
-            PcVoteMessage::Vote2(v) => view_state.vpc.on_vote2_verified(*v),
-            PcVoteMessage::Vote3(v) => view_state.vpc.on_vote3_verified(*v),
+        let pc_effects = view_state.vpc.on_vote1_verified(vote);
+        self.translate_pc_effects(view, pc_effects)
+    }
+
+    /// Route a BLS-verified PC round-2 vote into the right view's inner
+    /// PC instance.
+    pub(crate) fn on_pc_vote2_verified(&mut self, view: SpcView, vote: PcVote2) -> Vec<SpcEffect> {
+        let Some(view_state) = self.views.get_mut(&view) else {
+            return vec![];
         };
+        let pc_effects = view_state.vpc.on_vote2_verified(vote);
+        self.translate_pc_effects(view, pc_effects)
+    }
+
+    /// Route a BLS-verified PC round-3 vote into the right view's inner
+    /// PC instance.
+    pub(crate) fn on_pc_vote3_verified(&mut self, view: SpcView, vote: PcVote3) -> Vec<SpcEffect> {
+        let Some(view_state) = self.views.get_mut(&view) else {
+            return vec![];
+        };
+        let pc_effects = view_state.vpc.on_vote3_verified(vote);
         self.translate_pc_effects(view, pc_effects)
     }
 
@@ -1598,7 +1626,7 @@ mod tests {
             PcVector::empty(),
             vec![Bls12381G2Signature([0u8; 96])],
         );
-        let effects = fsm.on_pc_vote_verified(SpcView::new(99), PcVoteMessage::Vote1(dummy));
+        let effects = fsm.on_pc_vote1_verified(SpcView::new(99), dummy);
         assert!(effects.is_empty());
     }
 

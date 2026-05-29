@@ -25,9 +25,9 @@ use hyperscale_types::{
     CertifiedBeaconBlock, EPOCH_DURATION, Epoch, GenesisConfigHash, Hash, LeafIndex,
     LocalTimestamp, MAX_WITNESSES_PER_PROPOSER, NetworkDefinition, PcQc3, PcValueElement, PcVector,
     PcVote1, PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3, PcVote3VerifyError,
-    PcVoteMessage, PcVoteRound, SKIP_TIMEOUT, ShardGroupId, ShardWitness, SkipEpochCert,
-    SkipRequest, SpcCert, SpcEmptyViewMsg, SpcView, TopologySnapshot, ValidatorId, Verifiable,
-    Verified, WeightedTimestamp, Witness, verify_merkle_inclusion,
+    PcVoteRound, SKIP_TIMEOUT, ShardGroupId, ShardWitness, SkipEpochCert, SkipRequest, SpcCert,
+    SpcEmptyViewMsg, SpcView, TopologySnapshot, ValidatorId, Verifiable, Verified,
+    WeightedTimestamp, Witness, verify_merkle_inclusion,
 };
 use tracing::{trace, warn};
 
@@ -198,46 +198,73 @@ impl BeaconCoordinator {
         self.now.as_millis() >= expected_block_time.plus(SKIP_TIMEOUT).as_millis()
     }
 
-    /// A peer's PC vote arrived. Gate on instance/skip-quorum, mark the
-    /// slot in-flight, and dispatch the per-round BLS check to the
-    /// crypto pool. Admission happens in [`Self::on_pc_vote_verified`]
+    /// A peer's round-1 PC vote arrived. Gate on instance/skip-quorum,
+    /// mark the slot in-flight, and dispatch the BLS check to the
+    /// crypto pool. Admission happens in [`Self::on_pc_vote1_verified`]
     /// when the result lands.
-    pub fn on_pc_vote_received(
+    pub fn on_pc_vote1_received(
         &mut self,
         from: ValidatorId,
         view: SpcView,
-        vote: PcVoteMessage,
+        vote: PcVote1,
     ) -> Vec<Action> {
         let Some((epoch, committee)) = self.spc_admission_ctx(from, "PcVote") else {
             return Vec::new();
         };
-        let signer = vote.validator();
-        let round = vote.round();
-        let key = (epoch, view, signer, round);
+        let key = (epoch, view, vote.validator(), PcVoteRound::Vote1);
         if !self.verification.mark_pc_vote_in_flight(key) {
             return Vec::new();
         }
-        let action = match vote {
-            PcVoteMessage::Vote1(v) => Action::VerifyPcVote1 {
-                epoch,
-                view,
-                vote: Verifiable::from(v),
-                committee,
-            },
-            PcVoteMessage::Vote2(v) => Action::VerifyPcVote2 {
-                epoch,
-                view,
-                vote: Box::new(Verifiable::from(*v)),
-                committee,
-            },
-            PcVoteMessage::Vote3(v) => Action::VerifyPcVote3 {
-                epoch,
-                view,
-                vote: Box::new(Verifiable::from(*v)),
-                committee,
-            },
+        vec![Action::VerifyPcVote1 {
+            epoch,
+            view,
+            vote: Verifiable::from(vote),
+            committee,
+        }]
+    }
+
+    /// A peer's round-2 PC vote arrived.
+    pub fn on_pc_vote2_received(
+        &mut self,
+        from: ValidatorId,
+        view: SpcView,
+        vote: Box<PcVote2>,
+    ) -> Vec<Action> {
+        let Some((epoch, committee)) = self.spc_admission_ctx(from, "PcVote") else {
+            return Vec::new();
         };
-        vec![action]
+        let key = (epoch, view, vote.validator(), PcVoteRound::Vote2);
+        if !self.verification.mark_pc_vote_in_flight(key) {
+            return Vec::new();
+        }
+        vec![Action::VerifyPcVote2 {
+            epoch,
+            view,
+            vote: Box::new(Verifiable::from(*vote)),
+            committee,
+        }]
+    }
+
+    /// A peer's round-3 PC vote arrived.
+    pub fn on_pc_vote3_received(
+        &mut self,
+        from: ValidatorId,
+        view: SpcView,
+        vote: Box<PcVote3>,
+    ) -> Vec<Action> {
+        let Some((epoch, committee)) = self.spc_admission_ctx(from, "PcVote") else {
+            return Vec::new();
+        };
+        let key = (epoch, view, vote.validator(), PcVoteRound::Vote3);
+        if !self.verification.mark_pc_vote_in_flight(key) {
+            return Vec::new();
+        }
+        vec![Action::VerifyPcVote3 {
+            epoch,
+            view,
+            vote: Box::new(Verifiable::from(*vote)),
+            committee,
+        }]
     }
 
     /// A peer's SPC `new-view` arrived. Gate on instance/skip-quorum,
@@ -451,13 +478,7 @@ impl BeaconCoordinator {
         if self.spc.as_ref().is_some_and(|s| s.epoch() != epoch) {
             return Vec::new();
         }
-        self.dispatch_spc_event(
-            self.me,
-            SpcEvent::PcVoteVerified {
-                view,
-                vote: PcVoteMessage::Vote1(raw),
-            },
-        )
+        self.dispatch_spc_event(self.me, SpcEvent::PcVote1Verified { view, vote: raw })
     }
 
     /// Result of an [`Action::VerifyPcVote2`] dispatch.
@@ -488,9 +509,9 @@ impl BeaconCoordinator {
         }
         self.dispatch_spc_event(
             self.me,
-            SpcEvent::PcVoteVerified {
+            SpcEvent::PcVote2Verified {
                 view,
-                vote: PcVoteMessage::Vote2(Box::new(raw)),
+                vote: Box::new(raw),
             },
         )
     }
@@ -523,36 +544,80 @@ impl BeaconCoordinator {
         }
         self.dispatch_spc_event(
             self.me,
-            SpcEvent::PcVoteVerified {
+            SpcEvent::PcVote3Verified {
                 view,
-                vote: PcVoteMessage::Vote3(Box::new(raw)),
+                vote: Box::new(raw),
             },
         )
     }
 
-    /// A PC vote that the coordinator received already verified — fed
-    /// in via the local sign-and-emit handler (or by a colocated peer's
-    /// local-dispatch fast path). Skips the verify dispatch and routes
-    /// straight to the SPC sub-machine.
-    pub fn on_verified_pc_vote_received(
+    /// A round-1 PC vote that the coordinator received already
+    /// verified — fed in via the local sign-and-emit handler (or by a
+    /// colocated peer's local-dispatch fast path). Skips the verify
+    /// dispatch and routes straight to the SPC sub-machine.
+    pub fn on_verified_pc_vote1_received(
         &mut self,
         from: ValidatorId,
         view: SpcView,
-        vote: Verified<PcVoteMessage>,
+        vote: Verified<PcVote1>,
     ) -> Vec<Action> {
         let Some((epoch, _)) = self.spc_admission_ctx(from, "PcVote") else {
             return Vec::new();
         };
         let raw = vote.into_inner();
-        let signer = raw.validator();
-        let round = raw.round();
-        let key = (epoch, view, signer, round);
-        self.verification.on_pc_vote_result(key, true);
-        self.verification.forget_pc_vote(key);
+        self.clear_pc_vote_slot(epoch, view, Some(raw.validator()), PcVoteRound::Vote1, true);
         if self.spc.as_ref().is_some_and(|s| s.epoch() != epoch) {
             return Vec::new();
         }
-        self.dispatch_spc_event(self.me, SpcEvent::PcVoteVerified { view, vote: raw })
+        self.dispatch_spc_event(self.me, SpcEvent::PcVote1Verified { view, vote: raw })
+    }
+
+    /// A round-2 PC vote that the coordinator received already verified.
+    pub fn on_verified_pc_vote2_received(
+        &mut self,
+        from: ValidatorId,
+        view: SpcView,
+        vote: Box<Verified<PcVote2>>,
+    ) -> Vec<Action> {
+        let Some((epoch, _)) = self.spc_admission_ctx(from, "PcVote") else {
+            return Vec::new();
+        };
+        let raw = (*vote).into_inner();
+        self.clear_pc_vote_slot(epoch, view, Some(raw.validator()), PcVoteRound::Vote2, true);
+        if self.spc.as_ref().is_some_and(|s| s.epoch() != epoch) {
+            return Vec::new();
+        }
+        self.dispatch_spc_event(
+            self.me,
+            SpcEvent::PcVote2Verified {
+                view,
+                vote: Box::new(raw),
+            },
+        )
+    }
+
+    /// A round-3 PC vote that the coordinator received already verified.
+    pub fn on_verified_pc_vote3_received(
+        &mut self,
+        from: ValidatorId,
+        view: SpcView,
+        vote: Box<Verified<PcVote3>>,
+    ) -> Vec<Action> {
+        let Some((epoch, _)) = self.spc_admission_ctx(from, "PcVote") else {
+            return Vec::new();
+        };
+        let raw = (*vote).into_inner();
+        self.clear_pc_vote_slot(epoch, view, Some(raw.validator()), PcVoteRound::Vote3, true);
+        if self.spc.as_ref().is_some_and(|s| s.epoch() != epoch) {
+            return Vec::new();
+        }
+        self.dispatch_spc_event(
+            self.me,
+            SpcEvent::PcVote3Verified {
+                view,
+                vote: Box::new(raw),
+            },
+        )
     }
 
     /// Shared slot-clear helper used by all three per-round PC vote
@@ -1689,12 +1754,12 @@ mod tests {
     fn on_pc_vote_received_drops_when_no_spc_instance() {
         use hyperscale_types::{Bls12381G2Signature, PcVote1};
         let mut coord = fresh_coord();
-        let vote = PcVoteMessage::Vote1(PcVote1::new(
+        let vote = PcVote1::new(
             ValidatorId::new(1),
             PcVector::empty(),
             vec![Bls12381G2Signature([0u8; 96])],
-        ));
-        let actions = coord.on_pc_vote_received(ValidatorId::new(1), SpcView::new(1), vote);
+        );
+        let actions = coord.on_pc_vote1_received(ValidatorId::new(1), SpcView::new(1), vote);
         assert!(actions.is_empty());
     }
 

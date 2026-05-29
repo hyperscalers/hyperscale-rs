@@ -14,12 +14,12 @@ use hyperscale_types::{
     ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote, FinalizedWave,
     FinalizedWaveVerifyError, LocalReceiptRoot, LocalReceiptRootVerifyError, PcQc3, PcVector,
     PcVote1, PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3, PcVote3VerifyError,
-    PcVoteMessage, ProvisionRootVerifyError, ProvisionTxRootsMap, ProvisionTxRootsVerifyError,
-    Provisions, ProvisionsRoot, ProvisionsVerifyError, QcVerifyError, QuorumCertificate,
-    ReadySignal, Round, RoutableTransaction, ShardGroupId, ShardWitness, SkipEpochCert,
-    SkipRequest, SpcCert, SpcEmptyViewMsg, SpcView, StateRoot, StateRootVerifyError, StoredReceipt,
-    TransactionRoot, TxOutcome, TxRootVerifyError, ValidatorId, Verifiable, Verified, VotePower,
-    WaveId, WeightedTimestamp,
+    ProvisionRootVerifyError, ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions,
+    ProvisionsRoot, ProvisionsVerifyError, QcVerifyError, QuorumCertificate, ReadySignal, Round,
+    RoutableTransaction, ShardGroupId, ShardWitness, SkipEpochCert, SkipRequest, SpcCert,
+    SpcEmptyViewMsg, SpcView, StateRoot, StateRootVerifyError, StoredReceipt, TransactionRoot,
+    TxOutcome, TxRootVerifyError, ValidatorId, Verifiable, Verified, VotePower, WaveId,
+    WeightedTimestamp,
 };
 
 /// How a node learned about the certifying QC that commits a given block.
@@ -641,33 +641,80 @@ pub enum ProtocolEvent {
     // ═══════════════════════════════════════════════════════════════════════
     // Beacon consensus
     // ═══════════════════════════════════════════════════════════════════════
-    /// PC inner-consensus vote received whose signature still needs to
-    /// be checked. Produced by the gossip handler — wire decode lands
-    /// the wrapper as `Verifiable::Unverified`.
-    UnverifiedPcVoteReceived {
+    /// Round-1 PC vote received whose signature still needs to be
+    /// checked. Produced by the gossip handler — wire decode lands the
+    /// wrapper as `Verifiable::Unverified`.
+    UnverifiedPcVote1Received {
         /// Sender id (transport-level).
         from: ValidatorId,
         /// SPC view this vote belongs to.
         view: SpcView,
-        /// The vote; variant tags the round.
-        vote: Box<PcVoteMessage>,
+        /// The vote.
+        vote: PcVote1,
     },
 
-    /// PC inner-consensus vote received whose verification predicate
-    /// already holds — produced only by the local sign-and-emit handler
-    /// (or by a colocated peer's local-dispatch fast path). The
-    /// recipient skips `Action::VerifyPcVote{N}` and feeds the typed
-    /// handle straight into the SPC sub-machine.
-    VerifiedPcVoteReceived {
+    /// Round-2 PC vote received whose signature still needs to be
+    /// checked.
+    UnverifiedPcVote2Received {
         /// Sender id (transport-level).
         from: ValidatorId,
         /// SPC view this vote belongs to.
         view: SpcView,
-        /// Verified vote, sealed via
-        /// [`Verified::<PcVoteMessage>::from_verified_vote1`] /
-        /// [`Verified::<PcVoteMessage>::from_verified_vote2`] /
-        /// [`Verified::<PcVoteMessage>::from_verified_vote3`].
-        vote: Box<Verified<PcVoteMessage>>,
+        /// The vote.
+        vote: Box<PcVote2>,
+    },
+
+    /// Round-3 PC vote received whose signature still needs to be
+    /// checked.
+    UnverifiedPcVote3Received {
+        /// Sender id (transport-level).
+        from: ValidatorId,
+        /// SPC view this vote belongs to.
+        view: SpcView,
+        /// The vote.
+        vote: Box<PcVote3>,
+    },
+
+    /// Round-1 PC vote received whose verification predicate already
+    /// holds — produced only by the local sign-and-emit handler (or by
+    /// a colocated peer's local-dispatch fast path). The recipient
+    /// skips [`Action::VerifyPcVote1`] and feeds the typed handle
+    /// straight into the SPC sub-machine.
+    ///
+    /// [`Action::VerifyPcVote1`]: crate::Action::VerifyPcVote1
+    VerifiedPcVote1Received {
+        /// Sender id (transport-level).
+        from: ValidatorId,
+        /// SPC view this vote belongs to.
+        view: SpcView,
+        /// Verified vote, sealed via [`Verified::<PcVote1>::sign_local`].
+        vote: Verified<PcVote1>,
+    },
+
+    /// Round-2 PC vote received whose verification predicate already
+    /// holds. Skips [`Action::VerifyPcVote2`].
+    ///
+    /// [`Action::VerifyPcVote2`]: crate::Action::VerifyPcVote2
+    VerifiedPcVote2Received {
+        /// Sender id (transport-level).
+        from: ValidatorId,
+        /// SPC view this vote belongs to.
+        view: SpcView,
+        /// Verified vote, sealed via [`Verified::<PcVote2>::sign_local`].
+        vote: Box<Verified<PcVote2>>,
+    },
+
+    /// Round-3 PC vote received whose verification predicate already
+    /// holds. Skips [`Action::VerifyPcVote3`].
+    ///
+    /// [`Action::VerifyPcVote3`]: crate::Action::VerifyPcVote3
+    VerifiedPcVote3Received {
+        /// Sender id (transport-level).
+        from: ValidatorId,
+        /// SPC view this vote belongs to.
+        view: SpcView,
+        /// Verified vote, sealed via [`Verified::<PcVote3>::sign_local`].
+        vote: Box<Verified<PcVote3>>,
     },
 
     /// SPC `new-view` notification received from a peer. The cert is

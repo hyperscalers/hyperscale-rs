@@ -275,8 +275,12 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::CommittedStateRestored { .. }) => self.handle_sync(evt),
 
             // ── Beacon ───────────────────────────────────────────────────
-            ProtocolEvent::UnverifiedPcVoteReceived { .. }
-            | ProtocolEvent::VerifiedPcVoteReceived { .. }
+            ProtocolEvent::UnverifiedPcVote1Received { .. }
+            | ProtocolEvent::UnverifiedPcVote2Received { .. }
+            | ProtocolEvent::UnverifiedPcVote3Received { .. }
+            | ProtocolEvent::VerifiedPcVote1Received { .. }
+            | ProtocolEvent::VerifiedPcVote2Received { .. }
+            | ProtocolEvent::VerifiedPcVote3Received { .. }
             | ProtocolEvent::SpcNewViewReceived { .. }
             | ProtocolEvent::SpcNewCommitReceived { .. }
             | ProtocolEvent::SpcEmptyViewReceived { .. }
