@@ -4,7 +4,7 @@ use sbor::prelude::BasicSbor;
 
 use crate::{
     Bls12381G2Signature, ExecutionVote, MessageClass, NetworkDefinition, NetworkMessage,
-    ShardGroupId, Signed, ValidatorId, exec_vote_batch_message,
+    ShardGroupId, Signed, ValidatorId, Verifiable, exec_vote_batch_message,
 };
 
 /// Batched execution votes within a shard.
@@ -13,8 +13,10 @@ use crate::{
 /// of a block. 2f+1 matching votes create an `ExecutionCertificate`.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct ExecutionVotesNotification {
-    /// The execution votes being sent.
-    pub votes: Vec<ExecutionVote>,
+    /// The execution votes being sent. Wire bytes always land in
+    /// [`Verifiable::Unverified`]; local-dispatched sends from a
+    /// colocated voter preserve [`Verifiable::Verified`].
+    pub votes: Vec<Verifiable<ExecutionVote>>,
     /// The validator who sent this batch.
     pub sender: ValidatorId,
     /// BLS signature over the domain-separated signing message, by the sender.
@@ -25,7 +27,7 @@ impl ExecutionVotesNotification {
     /// Create a new signed execution vote batch.
     #[must_use]
     pub const fn new(
-        votes: Vec<ExecutionVote>,
+        votes: Vec<Verifiable<ExecutionVote>>,
         sender: ValidatorId,
         sender_signature: Bls12381G2Signature,
     ) -> Self {
@@ -38,13 +40,13 @@ impl ExecutionVotesNotification {
 
     /// Get the votes.
     #[must_use]
-    pub fn votes(&self) -> &[ExecutionVote] {
+    pub fn votes(&self) -> &[Verifiable<ExecutionVote>] {
         &self.votes
     }
 
     /// Consume and return the votes.
     #[must_use]
-    pub fn into_votes(self) -> Vec<ExecutionVote> {
+    pub fn into_votes(self) -> Vec<Verifiable<ExecutionVote>> {
         self.votes
     }
 
@@ -78,8 +80,12 @@ impl Signed for ExecutionVotesNotification {
         let shard = self
             .votes
             .first()
-            .map_or(ShardGroupId::new(0), ExecutionVote::shard_group_id);
-        exec_vote_batch_message(network, shard, &self.votes)
+            .map_or(ShardGroupId::new(0), |v| v.shard_group_id());
+        exec_vote_batch_message(
+            network,
+            shard,
+            self.votes.iter().map(Verifiable::as_unverified),
+        )
     }
 }
 

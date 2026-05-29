@@ -24,8 +24,8 @@ use hyperscale_types::network::notification::{
 };
 use hyperscale_types::{
     ExecutionCertificate, ExecutionCertificateContext, ExecutionVote, FinalizedWaveContext, NodeId,
-    RoutableTransaction, ShardGroupId, StoredReceipt, Verified, exec_cert_batch_message,
-    exec_vote_batch_message, shard_for_node,
+    RoutableTransaction, ShardGroupId, StoredReceipt, Verifiable, Verified,
+    exec_cert_batch_message, exec_vote_batch_message, shard_for_node,
 };
 
 // ============================================================================
@@ -333,13 +333,19 @@ where
                 ctx.signing_key,
             );
 
-            // Send vote to the wave leader (unicast).
+            // Send vote to the wave leader (unicast). When the leader is a
+            // colocated vnode the local-dispatch fast path preserves the
+            // `Verifiable::Verified` marker, letting the handler skip BLS
+            // re-verification of our own signature.
             if leader != validator_id {
-                let raw = (*verified).clone();
                 let batch_msg =
-                    exec_vote_batch_message(network, local_shard, std::slice::from_ref(&raw));
+                    exec_vote_batch_message(network, local_shard, std::iter::once(&*verified));
                 let batch_sig = ctx.signing_key.sign_v1(&batch_msg);
-                let batch = ExecutionVotesNotification::new(vec![raw], validator_id, batch_sig);
+                let batch = ExecutionVotesNotification::new(
+                    vec![Verifiable::from(verified.clone())],
+                    validator_id,
+                    batch_sig,
+                );
                 ctx.network.notify(&[leader], &batch);
             }
 

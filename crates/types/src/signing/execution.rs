@@ -71,11 +71,14 @@ pub fn exec_vote_message(
 
 /// Build the signing message for an execution vote batch gossip.
 #[must_use]
-pub fn exec_vote_batch_message(
+pub fn exec_vote_batch_message<'a, I>(
     network: &NetworkDefinition,
     shard_group: ShardGroupId,
-    votes: &[ExecutionVote],
-) -> Vec<u8> {
+    votes: I,
+) -> Vec<u8>
+where
+    I: IntoIterator<Item = &'a ExecutionVote>,
+{
     let mut hasher = Hasher::new();
     for v in votes {
         hasher.update(v.global_receipt_root().as_raw().as_bytes());

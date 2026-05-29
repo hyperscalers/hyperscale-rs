@@ -440,12 +440,16 @@ where
     /// to known committee members.
     #[allow(clippy::too_many_lines)] // single registration table; one closure per notification type
     pub(crate) fn register_notification_handlers(&self) {
-        // ── block.vote → ProtocolEvent::UnverifiedBlockVoteReceived ──
+        // ── block.vote → ProtocolEvent::{Verified,Unverified}BlockVoteReceived ──
         //
         // `BlockVote.shard_group_id()` is the shard whose consensus the
         // vote is for; with cross-shard hosting that selects which of
         // this host's vnodes the event fans out to. Drop early if the
         // vote targets a shard we don't host.
+        //
+        // Wire decode lands the wrapper as `Verifiable::Unverified`;
+        // local-dispatched sends from a colocated voter arrive already
+        // verified and skip the state machine's BLS round-trip.
 
         let senders = self.process.shard_event_senders.clone();
         self.process
@@ -460,13 +464,11 @@ where
                         );
                         return;
                     };
-                    push_protocol_event(
-                        tx,
-                        shard,
-                        ProtocolEvent::UnverifiedBlockVoteReceived {
-                            vote: gossip.vote.into_unverified(),
-                        },
-                    );
+                    let event = match gossip.vote.into_verified() {
+                        Ok(vote) => ProtocolEvent::VerifiedBlockVoteReceived { vote },
+                        Err(vote) => ProtocolEvent::UnverifiedBlockVoteReceived { vote },
+                    };
+                    push_protocol_event(tx, shard, event);
                 },
             );
 
@@ -577,12 +579,16 @@ where
                         return;
                     }
 
+                    // Wire decode lands each vote as `Verifiable::Unverified`;
+                    // local-dispatched batches from a colocated voter arrive
+                    // already verified and skip the state machine's BLS
+                    // round-trip.
                     for vote in batch.into_votes() {
-                        push_protocol_event(
-                            tx,
-                            target_shard,
-                            ProtocolEvent::UnverifiedExecutionVoteReceived { vote },
-                        );
+                        let event = match vote.into_verified() {
+                            Ok(vote) => ProtocolEvent::VerifiedExecutionVoteReceived { vote },
+                            Err(vote) => ProtocolEvent::UnverifiedExecutionVoteReceived { vote },
+                        };
+                        push_protocol_event(tx, target_shard, event);
                     }
                 },
             );
