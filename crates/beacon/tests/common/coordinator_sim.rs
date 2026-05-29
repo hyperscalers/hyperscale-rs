@@ -20,9 +20,6 @@ use hyperscale_beacon::constants::{BEACON_SIGNER_COUNT, MIN_STAKE_FLOOR};
 use hyperscale_beacon::coordinator::BeaconCoordinator;
 use hyperscale_beacon::genesis::build_genesis_beacon_state;
 use hyperscale_beacon::skip::{sign_skip_request, verify_skip_cert, verify_skip_request};
-use hyperscale_beacon::spc::{
-    sign_empty_view_msg, verify_block_cert, verify_cert, verify_empty_view_msg,
-};
 use hyperscale_beacon::verification::verify_block_equivocations;
 use hyperscale_core::Action;
 use hyperscale_types::{
@@ -31,8 +28,9 @@ use hyperscale_types::{
     NetworkDefinition, PcQc3, PcValueElement, PcVector, PcVote1, PcVote2, PcVote3,
     PcVoteVerifyContext, Randomness, ShardGroupId, SkipEpochCert, SkipRequest, SpcCert,
     SpcEmptyViewMsg, SpcView, Stake, StakePoolId, ValidatorId, Verifiable, Witness,
-    bls_keypair_from_seed, genesis_config_hash, pc_context, sign_vote1, sign_vote2, sign_vote3,
-    spc_context, verify_qc3, verify_vote1, verify_vote2, verify_vote3, vrf_sign,
+    bls_keypair_from_seed, genesis_config_hash, pc_context, sign_empty_view_msg, sign_vote1,
+    sign_vote2, sign_vote3, spc_context, verify_block_cert, verify_cert, verify_empty_view_msg,
+    verify_qc3, verify_vote1, verify_vote2, verify_vote3, vrf_sign,
 };
 
 /// Adversarial transform a flagged replica applies to its next matching

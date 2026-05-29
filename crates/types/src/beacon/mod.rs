@@ -18,8 +18,8 @@
 //!   submission: witnesses + VRF reveal).
 //! - [`skip`]: [`SkipRequest`] and [`SkipEpochCert`] (pool-quorum
 //!   abandonment of a stalled epoch).
-//! - [`spc`]: Strong Prefix Consensus wire types (high triples, empty-view
-//!   messages, view-entry certificates).
+//! - [`spc`]: Strong Prefix Consensus wire types, verify / sign /
+//!   build helpers.
 //! - [`ready_signal`]: [`ReadySignal`] validator-emitted "ready on shard"
 //!   attestation that proposers pull into the block manifest.
 //! - [`state`]: [`BeaconState`] and its components (validator records,
@@ -66,7 +66,11 @@ pub use prefix_ops::{mce, mcp, qc1_certify};
 pub use proposal::BeaconProposal;
 pub use ready_signal::ReadySignal;
 pub use skip::{SkipEpochCert, SkipRequest};
-pub use spc::{SkipReport, SpcCert, SpcEmptyViewMsg, SpcHighTriple, SpcProposalObject};
+pub use spc::{
+    SkipReport, SpcCert, SpcEmptyViewMsg, SpcHighTriple, SpcProposalObject, build_indirect_cert,
+    hash_high_value, sign_empty_view_msg, skip_target, verify_block_cert, verify_cert,
+    verify_empty_view_msg, verify_proposal_object,
+};
 pub use state::{
     BeaconState, CommitteeTransition, JailReason, PendingWithdrawal, ShardCommittee, SlotEffects,
     StakePool, TransitionCause, ValidatorRecord, ValidatorStatus,

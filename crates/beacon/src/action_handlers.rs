@@ -18,12 +18,12 @@ use hyperscale_types::network::notification::{
 };
 use hyperscale_types::{
     BeaconProposal, PcQc1, PcQc2, PcVote1, PcVote2, PcVote3, PcVoteVerifyContext, SpcHighTriple,
-    SpcProposalObject, Verifiable, Verified, pc_context, spc_context, verify_qc3, vrf_sign,
+    SpcProposalObject, Verifiable, Verified, pc_context, sign_empty_view_msg, spc_context,
+    verify_cert, verify_empty_view_msg, verify_qc3, vrf_sign,
 };
 use tracing::warn;
 
 use crate::skip::verify_skip_request;
-use crate::spc::{sign_empty_view_msg, verify_cert, verify_empty_view_msg};
 use crate::verification::{verify_block_equivocations, verify_certified};
 
 /// Dispatch a beacon-owned [`Action`] on the consensus pool. Panics on

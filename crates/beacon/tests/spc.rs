@@ -9,13 +9,11 @@ mod common;
 use std::time::Duration;
 
 use common::{PcSim, SpcSim};
-use hyperscale_beacon::spc::{
-    build_indirect_cert, sign_empty_view_msg, verify_block_cert, verify_cert,
-    verify_empty_view_msg, verify_proposal_object,
-};
 use hyperscale_types::{
     Epoch, NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PcQc3, PcValueElement, PcVector, SpcCert,
-    SpcEmptyViewMsg, SpcHighTriple, SpcProposalObject, SpcView, spc_context,
+    SpcEmptyViewMsg, SpcHighTriple, SpcProposalObject, SpcView, build_indirect_cert,
+    sign_empty_view_msg, spc_context, verify_block_cert, verify_cert, verify_empty_view_msg,
+    verify_proposal_object,
 };
 
 const fn elem(byte: u8) -> PcValueElement {

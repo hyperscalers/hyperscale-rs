@@ -4,12 +4,11 @@ use std::collections::BTreeSet;
 
 use hyperscale_types::{
     BeaconBlockHash, BeaconCert, Bls12381G1PublicKey, CertifiedBeaconBlock, Epoch, Hash,
-    NetworkDefinition, PcVoteRound, SpcView, ValidatorId, Witness, spc_context,
+    NetworkDefinition, PcVoteRound, SpcView, ValidatorId, Witness, spc_context, verify_block_cert,
     verify_vote_equivocation,
 };
 
 use crate::skip::verify_skip_cert;
-use crate::spc::verify_block_cert;
 
 /// Verify a [`CertifiedBeaconBlock`] under the cert variant's required
 /// signer pool.
