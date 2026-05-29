@@ -1,43 +1,28 @@
 //! Per-shard witness tracking for beacon proposals.
 //!
-//! Holds the per-shard header records that a beacon proposer needs to
+//! Holds the per-shard verified headers a beacon proposer needs to
 //! decide eligibility (which leaves are includable in epoch E) and
 //! readiness (have all active shards crossed E's time boundary?), plus
-//! the pool of validated witnesses ready for proposal inclusion.
+//! the pool of verified witnesses ready for proposal inclusion.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight, CertifiedBlockHeader,
-    LeafIndex, ShardGroupId, ShardWitness, WeightedTimestamp,
+    BeaconWitnessLeafCount, BlockHash, BlockHeight, CertifiedBlockHeader, LeafIndex, ShardGroupId,
+    ShardWitness, Verified, WeightedTimestamp,
 };
-
-/// Per-shard header metadata captured at the moment the shard's
-/// committed block was verified.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ShardHeaderRecord {
-    /// Accumulator leaf-count after this block applied.
-    pub leaf_count_at_block_end: BeaconWitnessLeafCount,
-    /// Time the block was BFT-committed at, used to test whether
-    /// the block falls inside the current epoch's `(t_start, t_end]`
-    /// window.
-    pub weighted_timestamp: WeightedTimestamp,
-    /// Source-shard block hash; the `ShardWitnessProof` anchors its
-    /// Merkle path against this block's `beacon_witness_root`.
-    pub committed_block_hash: BlockHash,
-    /// Accumulator root committed in the source block's header.
-    pub beacon_witness_root: BeaconWitnessRoot,
-}
 
 /// Per-shard witness tracking.
 ///
 /// Four internal maps:
 ///
-/// - `shard_header_records` — populated from every verified remote
-///   header regardless of committee membership; needed by off-committee
-///   vnodes to verify incoming `BeaconBlock`s' witness Merkle paths.
-/// - `pool` — validated witnesses ready for inclusion. Empty when the
+/// - `shard_headers` — verified source-shard headers, one per
+///   committed block, populated from every verified remote header
+///   regardless of committee membership; needed by off-committee vnodes
+///   to verify incoming `BeaconBlock`s' witness Merkle paths and used
+///   as the verify context for inbound [`ShardWitness`]es.
+/// - `pool` — verified witnesses ready for inclusion. Empty when the
 ///   local validator is off-committee. `drain_for_proposal` clones
 ///   eligible entries out without removing them; physical eviction
 ///   happens only when [`notify_consumed_advanced`](Self::notify_consumed_advanced)
@@ -50,8 +35,9 @@ pub struct ShardHeaderRecord {
 /// - `pending_fetches` — outstanding fetch dedup. Empty when off-committee.
 #[derive(Debug, Default)]
 pub struct ShardWitnessFetchTracker {
-    shard_header_records: BTreeMap<ShardGroupId, BTreeMap<BlockHeight, ShardHeaderRecord>>,
-    pool: BTreeMap<ShardGroupId, BTreeMap<LeafIndex, Arc<ShardWitness>>>,
+    shard_headers:
+        BTreeMap<ShardGroupId, BTreeMap<BlockHeight, Arc<Verified<CertifiedBlockHeader>>>>,
+    pool: BTreeMap<ShardGroupId, BTreeMap<LeafIndex, Arc<Verified<ShardWitness>>>>,
     pending_in_proposal: BTreeMap<ShardGroupId, BTreeSet<LeafIndex>>,
     pending_fetches: BTreeMap<ShardGroupId, BTreeSet<LeafIndex>>,
 }
@@ -63,27 +49,24 @@ impl ShardWitnessFetchTracker {
         Self::default()
     }
 
-    /// Insert a header record for the source shard's committed block.
-    /// Called by the coordinator from `on_verified_remote_header` for
-    /// every active shard (on- or off-committee).
-    pub fn on_verified_remote_header(&mut self, certified_header: &CertifiedBlockHeader) {
+    /// Insert a verified source-shard header. Called by the coordinator
+    /// from `on_verified_remote_header` for every active shard (on- or
+    /// off-committee).
+    pub fn on_verified_remote_header(
+        &mut self,
+        certified_header: Arc<Verified<CertifiedBlockHeader>>,
+    ) {
         let header = certified_header.header();
-        let record = ShardHeaderRecord {
-            leaf_count_at_block_end: header.beacon_witness_leaf_count(),
-            weighted_timestamp: certified_header.qc().weighted_timestamp(),
-            committed_block_hash: certified_header.block_hash(),
-            beacon_witness_root: header.beacon_witness_root(),
-        };
-        self.shard_header_records
-            .entry(header.shard_group_id())
+        let shard = header.shard_group_id();
+        let height = header.height();
+        self.shard_headers
+            .entry(shard)
             .or_default()
-            .insert(header.height(), record);
+            .insert(height, certified_header);
     }
 
-    /// Admit a validated witness into the pool. The caller is
-    /// responsible for verifying the Merkle path against the shard's
-    /// `beacon_witness_root` first.
-    pub fn admit_witness(&mut self, witness: Arc<ShardWitness>) {
+    /// Admit a verified witness into the pool.
+    pub fn admit_witness(&mut self, witness: Arc<Verified<ShardWitness>>) {
         let shard = witness.proof.shard_id;
         let leaf = witness.proof.leaf_index;
         self.pool.entry(shard).or_default().insert(leaf, witness);
@@ -113,7 +96,7 @@ impl ShardWitnessFetchTracker {
     /// window ends at `epoch_end_wt`. For each shard, takes leaves
     /// from the pool with `leaf_index` strictly greater than the
     /// shard's `consumed_through` watermark and `≤` the largest
-    /// `leaf_count_at_block_end` from any header record whose
+    /// `beacon_witness_leaf_count` from any header whose
     /// `weighted_timestamp ≤ epoch_end_wt`.
     ///
     /// Mark-not-remove: returned `Arc`s are clones; the witnesses stay
@@ -127,10 +110,10 @@ impl ShardWitnessFetchTracker {
         &mut self,
         epoch_end_wt: WeightedTimestamp,
         consumed_through: &BTreeMap<ShardGroupId, LeafIndex>,
-    ) -> Vec<Arc<ShardWitness>> {
+    ) -> Vec<Arc<Verified<ShardWitness>>> {
         let mut out = Vec::new();
-        for (shard, records) in &self.shard_header_records {
-            let Some(max_eligible) = max_eligible_leaf_count(records, epoch_end_wt) else {
+        for (shard, headers) in &self.shard_headers {
+            let Some(max_eligible) = max_eligible_leaf_count(headers, epoch_end_wt) else {
                 continue;
             };
             let watermark = consumed_through
@@ -140,7 +123,7 @@ impl ShardWitnessFetchTracker {
             let Some(pool_for_shard) = self.pool.get(shard) else {
                 continue;
             };
-            let drained: Vec<(LeafIndex, Arc<ShardWitness>)> = pool_for_shard
+            let drained: Vec<(LeafIndex, Arc<Verified<ShardWitness>>)> = pool_for_shard
                 .range(..)
                 .filter(|(idx, _)| {
                     idx.inner() > watermark.inner() && idx.inner() <= max_eligible.inner()
@@ -189,51 +172,51 @@ impl ShardWitnessFetchTracker {
         epoch_end_wt: WeightedTimestamp,
     ) -> bool {
         active_shards.iter().all(|shard| {
-            self.shard_header_records.get(shard).is_some_and(|records| {
-                records
+            self.shard_headers.get(shard).is_some_and(|headers| {
+                headers
                     .values()
-                    .any(|r| r.weighted_timestamp.as_millis() > epoch_end_wt.as_millis())
+                    .any(|h| h.qc().weighted_timestamp().as_millis() > epoch_end_wt.as_millis())
             })
         })
     }
 
     /// Called when the local validator is removed from the beacon
     /// committee. Drops the pool, pending-fetch, and in-proposal state;
-    /// keeps `shard_header_records` since the vnode still needs them
-    /// to verify incoming `BeaconBlock`s.
+    /// keeps `shard_headers` since the vnode still needs them to verify
+    /// incoming `BeaconBlock`s.
     pub fn evicted_from_committee(&mut self) {
         self.pool.clear();
         self.pending_in_proposal.clear();
         self.pending_fetches.clear();
     }
 
-    /// Look up the source-shard header record by `committed_block_hash`.
-    /// Linear scan over the shard's stored records — bounded by the
-    /// sliding window held in `shard_header_records`.
+    /// Look up the verified source-shard header by `committed_block_hash`.
+    /// Linear scan over the shard's stored headers — bounded by the
+    /// sliding window held in `shard_headers`.
     #[must_use]
-    pub fn find_record_by_block_hash(
+    pub fn find_header_by_block_hash(
         &self,
         shard: ShardGroupId,
         block_hash: BlockHash,
-    ) -> Option<&ShardHeaderRecord> {
-        self.shard_header_records
+    ) -> Option<&Arc<Verified<CertifiedBlockHeader>>> {
+        self.shard_headers
             .get(&shard)?
             .values()
-            .find(|r| r.committed_block_hash == block_hash)
+            .find(|h| h.block_hash() == block_hash)
     }
 }
 
-/// Largest `leaf_count_at_block_end` from records whose
+/// Largest `beacon_witness_leaf_count` from headers whose
 /// `weighted_timestamp` is at or before `epoch_end_wt`. `None` if no
-/// such record exists yet.
+/// such header exists yet.
 fn max_eligible_leaf_count(
-    records: &BTreeMap<BlockHeight, ShardHeaderRecord>,
+    headers: &BTreeMap<BlockHeight, Arc<Verified<CertifiedBlockHeader>>>,
     epoch_end_wt: WeightedTimestamp,
 ) -> Option<BeaconWitnessLeafCount> {
-    records
+    headers
         .values()
-        .filter(|r| r.weighted_timestamp.as_millis() <= epoch_end_wt.as_millis())
-        .map(|r| r.leaf_count_at_block_end)
+        .filter(|h| h.qc().weighted_timestamp().as_millis() <= epoch_end_wt.as_millis())
+        .map(|h| h.header().beacon_witness_leaf_count())
         .max()
 }
 
@@ -241,12 +224,12 @@ fn max_eligible_leaf_count(
 #[allow(missing_docs)]
 impl ShardWitnessFetchTracker {
     #[must_use]
-    pub fn header_record(
+    pub fn header(
         &self,
         shard: ShardGroupId,
         height: BlockHeight,
-    ) -> Option<&ShardHeaderRecord> {
-        self.shard_header_records.get(&shard)?.get(&height)
+    ) -> Option<&Arc<Verified<CertifiedBlockHeader>>> {
+        self.shard_headers.get(&shard)?.get(&height)
     }
 
     #[must_use]
@@ -292,10 +275,10 @@ mod tests {
 
     use hyperscale_types::{
         BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight, BoundedVec,
-        CertificateRoot, Hash, InFlightCount, LeafIndex, LocalReceiptRoot, ProposerTimestamp,
-        ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, ShardWitness, ShardWitnessPayload,
-        ShardWitnessProof, SignerBitfield, Stake, StakePoolId, StateRoot, TransactionRoot,
-        ValidatorId, WeightedTimestamp, zero_bls_signature,
+        CertificateRoot, CertifiedBlockHeader, Hash, InFlightCount, LeafIndex, LocalReceiptRoot,
+        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, ShardWitness,
+        ShardWitnessPayload, ShardWitnessProof, SignerBitfield, Stake, StakePoolId, StateRoot,
+        TransactionRoot, ValidatorId, Verified, WeightedTimestamp, zero_bls_signature,
     };
 
     use super::*;
@@ -304,15 +287,15 @@ mod tests {
         ShardGroupId::new(n)
     }
 
-    /// Build a `CertifiedBlockHeader` with the few fields the tracker
-    /// reads — shard, height, `weighted_timestamp` (carried on the QC),
-    /// witness root, leaf count.
-    fn certified_header(
+    /// Build a verified `CertifiedBlockHeader` with the few fields the
+    /// tracker reads — shard, height, `weighted_timestamp` (carried on
+    /// the QC), witness root, leaf count.
+    fn verified_header(
         s: ShardGroupId,
         height: u64,
         wt_millis: u64,
         leaf_count: u64,
-    ) -> CertifiedBlockHeader {
+    ) -> Arc<Verified<CertifiedBlockHeader>> {
         let parent_qc = QuorumCertificate::genesis(s);
         let parent_block_hash = BlockHash::ZERO;
         let header = BlockHeader::new(
@@ -346,11 +329,13 @@ mod tests {
             zero_bls_signature(),
             WeightedTimestamp::from_millis(wt_millis),
         );
-        CertifiedBlockHeader::new(header, qc)
+        Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
+            header, qc,
+        )))
     }
 
-    fn witness(s: ShardGroupId, leaf_index: u64) -> Arc<ShardWitness> {
-        Arc::new(ShardWitness {
+    fn witness(s: ShardGroupId, leaf_index: u64) -> Arc<Verified<ShardWitness>> {
+        Arc::new(Verified::new_unchecked_for_test(ShardWitness {
             payload: ShardWitnessPayload::StakeDeposit {
                 pool_id: StakePoolId::new(0),
                 amount: Stake::from_whole_tokens(1),
@@ -361,24 +346,30 @@ mod tests {
                 leaf_index: LeafIndex::new(leaf_index),
                 siblings: BoundedVec::new(),
             },
-        })
+        }))
     }
 
     #[test]
     fn empty_after_new() {
         let t = ShardWitnessFetchTracker::new();
-        assert!(t.header_record(shard(0), BlockHeight::new(0)).is_none());
+        assert!(t.header(shard(0), BlockHeight::new(0)).is_none());
         assert_eq!(t.pool_len(shard(0)), 0);
         assert_eq!(t.pending_fetches_len(shard(0)), 0);
     }
 
     #[test]
-    fn on_verified_remote_header_inserts_record() {
+    fn on_verified_remote_header_inserts_header() {
         let mut t = ShardWitnessFetchTracker::new();
-        t.on_verified_remote_header(&certified_header(shard(0), 1, 1_000, 7));
-        let r = t.header_record(shard(0), BlockHeight::new(1)).unwrap();
-        assert_eq!(r.leaf_count_at_block_end, BeaconWitnessLeafCount::new(7));
-        assert_eq!(r.weighted_timestamp, WeightedTimestamp::from_millis(1_000));
+        t.on_verified_remote_header(verified_header(shard(0), 1, 1_000, 7));
+        let h = t.header(shard(0), BlockHeight::new(1)).unwrap();
+        assert_eq!(
+            h.header().beacon_witness_leaf_count(),
+            BeaconWitnessLeafCount::new(7),
+        );
+        assert_eq!(
+            h.qc().weighted_timestamp(),
+            WeightedTimestamp::from_millis(1_000),
+        );
     }
 
     #[test]
@@ -410,7 +401,7 @@ mod tests {
         let mut t = ShardWitnessFetchTracker::new();
         // One header at WT 1_000 with leaf_count 5 — leaves 1..=5 are
         // eligible for any epoch with t_end ≥ 1_000.
-        t.on_verified_remote_header(&certified_header(shard(0), 1, 1_000, 5));
+        t.on_verified_remote_header(verified_header(shard(0), 1, 1_000, 5));
         // Pool has leaves 2, 3, 4. consumed_through says we've already
         // consumed up to 2, so only 3 and 4 should drain.
         t.admit_witness(witness(shard(0), 2));
@@ -438,7 +429,7 @@ mod tests {
     #[test]
     fn drain_is_idempotent_when_watermark_unchanged() {
         let mut t = ShardWitnessFetchTracker::new();
-        t.on_verified_remote_header(&certified_header(shard(0), 1, 1_000, 5));
+        t.on_verified_remote_header(verified_header(shard(0), 1, 1_000, 5));
         t.admit_witness(witness(shard(0), 3));
         t.admit_witness(witness(shard(0), 4));
         let consumed = BTreeMap::new();
@@ -485,7 +476,7 @@ mod tests {
     #[test]
     fn notify_consumed_advanced_evicts_pending_in_proposal() {
         let mut t = ShardWitnessFetchTracker::new();
-        t.on_verified_remote_header(&certified_header(shard(0), 1, 1_000, 5));
+        t.on_verified_remote_header(verified_header(shard(0), 1, 1_000, 5));
         for leaf in 1..=5u64 {
             t.admit_witness(witness(shard(0), leaf));
         }
@@ -517,7 +508,7 @@ mod tests {
     #[test]
     fn drain_excludes_leaves_above_wt_eligible_count() {
         let mut t = ShardWitnessFetchTracker::new();
-        t.on_verified_remote_header(&certified_header(shard(0), 1, 1_000, 3));
+        t.on_verified_remote_header(verified_header(shard(0), 1, 1_000, 3));
         // Pool has leaf 5 which is above the WT-eligible count of 3.
         t.admit_witness(witness(shard(0), 5));
         let consumed = BTreeMap::new();
@@ -527,7 +518,7 @@ mod tests {
     }
 
     #[test]
-    fn drain_with_no_records_for_shard_returns_nothing() {
+    fn drain_with_no_headers_for_shard_returns_nothing() {
         let mut t = ShardWitnessFetchTracker::new();
         t.admit_witness(witness(shard(0), 1));
         let consumed = BTreeMap::new();
@@ -539,8 +530,8 @@ mod tests {
     fn is_ready_to_propose_true_when_all_shards_crossed() {
         let mut t = ShardWitnessFetchTracker::new();
         // Both shards have observed a header past t_end = 1_000.
-        t.on_verified_remote_header(&certified_header(shard(0), 1, 1_500, 0));
-        t.on_verified_remote_header(&certified_header(shard(1), 1, 2_000, 0));
+        t.on_verified_remote_header(verified_header(shard(0), 1, 1_500, 0));
+        t.on_verified_remote_header(verified_header(shard(1), 1, 2_000, 0));
         assert!(
             t.is_ready_to_propose(&[shard(0), shard(1)], WeightedTimestamp::from_millis(1_000),)
         );
@@ -549,24 +540,24 @@ mod tests {
     #[test]
     fn is_ready_to_propose_false_when_a_shard_hasnt_crossed() {
         let mut t = ShardWitnessFetchTracker::new();
-        t.on_verified_remote_header(&certified_header(shard(0), 1, 1_500, 0));
+        t.on_verified_remote_header(verified_header(shard(0), 1, 1_500, 0));
         // shard(1) only has a header at WT 500 — not past t_end = 1_000.
-        t.on_verified_remote_header(&certified_header(shard(1), 1, 500, 0));
+        t.on_verified_remote_header(verified_header(shard(1), 1, 500, 0));
         assert!(
             !t.is_ready_to_propose(&[shard(0), shard(1)], WeightedTimestamp::from_millis(1_000),)
         );
     }
 
     #[test]
-    fn is_ready_to_propose_false_when_shard_has_no_records() {
+    fn is_ready_to_propose_false_when_shard_has_no_headers() {
         let t = ShardWitnessFetchTracker::new();
         assert!(!t.is_ready_to_propose(&[shard(0)], WeightedTimestamp::from_millis(1_000),));
     }
 
     #[test]
-    fn evicted_from_committee_clears_pool_and_pending_keeps_records() {
+    fn evicted_from_committee_clears_pool_and_pending_keeps_headers() {
         let mut t = ShardWitnessFetchTracker::new();
-        t.on_verified_remote_header(&certified_header(shard(0), 1, 1_000, 5));
+        t.on_verified_remote_header(verified_header(shard(0), 1, 1_000, 5));
         t.admit_witness(witness(shard(0), 3));
         t.register_pending_fetch(shard(0), LeafIndex::new(4));
         let consumed = BTreeMap::new();
@@ -578,6 +569,6 @@ mod tests {
         assert_eq!(t.pool_len(shard(0)), 0);
         assert_eq!(t.pending_fetches_len(shard(0)), 0);
         assert_eq!(t.pending_in_proposal_len(shard(0)), 0);
-        assert!(t.header_record(shard(0), BlockHeight::new(1)).is_some());
+        assert!(t.header(shard(0), BlockHeight::new(1)).is_some());
     }
 }
