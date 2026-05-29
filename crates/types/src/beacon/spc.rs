@@ -38,8 +38,8 @@ use thiserror::Error;
 
 use crate::{
     Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature, DOMAIN_PC_EMPTY_VIEW, Hash,
-    NetworkDefinition, PcQc3, PcValueElement, PcVector, PositionalBundle, SignerBitfield,
-    SpcContext, SpcView, ValidatorId, Verifiable, Verified, Verify,
+    NetworkDefinition, PcQc3, PcValueElement, PcVector, PcVoteVerifyContext, PositionalBundle,
+    SignerBitfield, SpcContext, SpcView, ValidatorId, Verifiable, Verified, Verify,
     aggregate_verify_bls_different_messages, pc_context, pc_vote_signing_message, verify_qc3,
 };
 
@@ -803,24 +803,25 @@ impl Verify<&SpcVerifyContext<'_>> for SpcNewCommitMsg {
     /// New-commit predicate: embedded `proof` verifies under
     /// `pc_context(spc_ctx, view)` and `proof.x_pp() == value` (the
     /// committed low value matches the embedded round-3 cert's `x_pp`).
-    /// Short-circuits the embedded QC3 check when its marker is live.
+    /// Short-circuits the embedded QC3 check when its marker is live,
+    /// and persists the upgraded marker into the returned
+    /// `Verified<Self>`'s `proof` field so downstream gates lifting the
+    /// inner can extract it as a `Verified<PcQc3>` directly.
     fn verify(&self, ctx: &SpcVerifyContext<'_>) -> Result<Verified<Self>, Self::Error> {
         let pc_ctx = pc_context(ctx.spc_ctx, self.view);
-        if self.proof.verified().is_none()
-            && verify_qc3(
-                self.proof.as_unverified(),
-                ctx.network,
-                &pc_ctx,
-                ctx.committee,
-            )
-            .is_err()
-        {
-            return Err(SpcNewCommitMsgVerifyError::BadQc3);
-        }
-        if self.proof.x_pp() != &self.value {
+        let mut cloned = self.clone();
+        cloned
+            .proof
+            .upgrade_in_place(&PcVoteVerifyContext {
+                network: ctx.network,
+                pc_ctx: &pc_ctx,
+                committee: ctx.committee,
+            })
+            .map_err(|_| SpcNewCommitMsgVerifyError::BadQc3)?;
+        if cloned.proof.x_pp() != &cloned.value {
             return Err(SpcNewCommitMsgVerifyError::ValueMismatch);
         }
-        Ok(Verified::new_unchecked(self.clone()))
+        Ok(Verified::new_unchecked(cloned))
     }
 }
 
