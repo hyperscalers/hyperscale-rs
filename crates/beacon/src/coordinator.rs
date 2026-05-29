@@ -29,7 +29,7 @@ use hyperscale_types::{
     ShardWitness, SkipEpochCert, SkipRequest, SkipRequestVerifyError, SpcCert, SpcEmptyViewMsg,
     SpcEmptyViewMsgVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError, SpcProposalObject,
     SpcProposalObjectVerifyError, SpcView, TopologySnapshot, ValidatorId, Verifiable, Verified,
-    WeightedTimestamp, Witness, verify_merkle_inclusion,
+    Verify, WeightedTimestamp, Witness,
 };
 use tracing::{trace, warn};
 
@@ -848,7 +848,7 @@ impl BeaconCoordinator {
         witnesses.extend(
             shard_witnesses
                 .into_iter()
-                .map(|sw| Witness::Shard((*sw).clone())),
+                .map(|sw| Witness::Shard(sw.as_ref().as_ref().clone())),
         );
         witnesses
     }
@@ -1295,38 +1295,29 @@ impl BeaconCoordinator {
                 );
                 continue;
             }
-            let Some(record) = self
+            let Some(header) = self
                 .witness_fetcher
-                .find_record_by_block_hash(shard_id, witness.proof.committed_block_hash)
+                .find_header_by_block_hash(shard_id, witness.proof.committed_block_hash)
             else {
                 warn!(
                     shard = ?shard_id,
-                    "ShardWitness committed_block_hash has no header record yet — dropping",
+                    "ShardWitness committed_block_hash has no verified header yet — dropping",
                 );
                 continue;
             };
-            let leaf_hash = witness.payload.leaf_hash();
-            let Ok(leaf_index_u32) = u32::try_from(witness.proof.leaf_index.inner()) else {
-                warn!(
-                    leaf = witness.proof.leaf_index.inner(),
-                    "ShardWitness leaf_index exceeds u32 — dropping",
-                );
-                continue;
-            };
-            if !verify_merkle_inclusion(
-                *record.beacon_witness_root.as_raw(),
-                leaf_hash,
-                &witness.proof.siblings,
-                leaf_index_u32,
-            ) {
-                warn!(
-                    shard = ?shard_id,
-                    leaf = witness.proof.leaf_index.inner(),
-                    "ShardWitness Merkle inclusion check failed — dropping",
-                );
-                continue;
+            match witness.verify(header.as_ref()) {
+                Ok(verified) => {
+                    self.witness_fetcher.admit_witness(Arc::new(verified));
+                }
+                Err(err) => {
+                    warn!(
+                        shard = ?shard_id,
+                        leaf = witness.proof.leaf_index.inner(),
+                        %err,
+                        "ShardWitness verification failed — dropping",
+                    );
+                }
             }
-            self.witness_fetcher.admit_witness(witness);
         }
         Vec::new()
     }
@@ -2010,15 +2001,16 @@ mod tests {
         assert!(coord.equivocations.is_empty());
     }
 
-    /// Build a `ShardWitness` for `(shard, leaf_index)` with no real
-    /// Merkle proof. `admit_witness` doesn't verify the path — the
-    /// drain tests bypass admission to focus on the eligibility-window
-    /// filter.
-    fn simple_shard_witness(shard: ShardGroupId, leaf_index: u64) -> Arc<ShardWitness> {
+    /// Build a verified `ShardWitness` for `(shard, leaf_index)` with no
+    /// real Merkle proof. The drain tests bypass the verify path to focus
+    /// on the eligibility-window filter; the test-only verified gate
+    /// stands in for the proper [`Verify::verify`] / `from_verified_block`
+    /// admission used in production.
+    fn simple_shard_witness(shard: ShardGroupId, leaf_index: u64) -> Arc<Verified<ShardWitness>> {
         use hyperscale_types::{
             BlockHash, BoundedVec, LeafIndex, ShardWitnessPayload, ShardWitnessProof,
         };
-        Arc::new(ShardWitness {
+        Arc::new(Verified::new_unchecked_for_test(ShardWitness {
             payload: ShardWitnessPayload::StakeDeposit {
                 pool_id: StakePoolId::new(0),
                 amount: Stake::from_whole_tokens(1),
@@ -2029,7 +2021,7 @@ mod tests {
                 leaf_index: LeafIndex::new(leaf_index),
                 siblings: BoundedVec::new(),
             },
-        })
+        }))
     }
 
     #[test]
@@ -2041,8 +2033,10 @@ mod tests {
         // Header with leaf_count_at_block_end=1; witness at leaf_index=1
         // (the protocol's 1-indexed accumulator — leaf_index 0 is the
         // watermark sentinel for "nothing consumed yet").
-        let (_anchor, header) = make_verifiable_witness_and_record(shard, 1, 0, 1);
-        coord.witness_fetcher.on_verified_remote_header(&header);
+        let (_anchor, header) = make_verifiable_witness_and_header(shard, 1, 0, 1);
+        coord
+            .witness_fetcher
+            .on_verified_remote_header(Arc::clone(&header));
         coord
             .witness_fetcher
             .admit_witness(simple_shard_witness(shard, 1));
@@ -2073,8 +2067,10 @@ mod tests {
         // Header announces `MAX + 5` accumulator leaves at block-end.
         let total = MAX_WITNESSES_PER_PROPOSER + 5;
         let total_u64 = u64::try_from(total).unwrap();
-        let (_anchor, header) = make_verifiable_witness_and_record(shard, 1, 0, total_u64);
-        coord.witness_fetcher.on_verified_remote_header(&header);
+        let (_anchor, header) = make_verifiable_witness_and_header(shard, 1, 0, total_u64);
+        coord
+            .witness_fetcher
+            .on_verified_remote_header(Arc::clone(&header));
         // Admit one witness per leaf_index 1..=total.
         for i in 1..=total_u64 {
             coord
@@ -2597,16 +2593,16 @@ mod tests {
         assert!(coord.spc.is_some());
     }
 
-    /// Build a (witness, source-shard header) pair where the witness's
-    /// Merkle proof verifies under the header's `beacon_witness_root`.
-    /// `total_leaves` controls the accumulator size; `leaf_index` picks
-    /// which slot belongs to our witness.
-    fn make_verifiable_witness_and_record(
+    /// Build a (witness, source-shard verified header) pair where the
+    /// witness's Merkle proof verifies under the header's
+    /// `beacon_witness_root`. `total_leaves` controls the accumulator
+    /// size; `leaf_index` picks which slot belongs to our witness.
+    fn make_verifiable_witness_and_header(
         shard: ShardGroupId,
         height: u64,
         leaf_index: u64,
         total_leaves: u64,
-    ) -> (Arc<ShardWitness>, CertifiedBlockHeader) {
+    ) -> (Arc<ShardWitness>, Arc<Verified<CertifiedBlockHeader>>) {
         use hyperscale_types::{
             BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight,
             CertificateRoot, Hash, InFlightCount, LeafIndex, LocalReceiptRoot, ProposerTimestamp,
@@ -2660,7 +2656,9 @@ mod tests {
             zero_bls_signature(),
             WeightedTimestamp::from_millis(1_000),
         );
-        let certified_header = CertifiedBlockHeader::new(header, qc);
+        let certified_header = Arc::new(Verified::new_unchecked_for_test(
+            CertifiedBlockHeader::new(header, qc),
+        ));
 
         let proof = ShardWitnessProof {
             shard_id: shard,
@@ -2677,8 +2675,10 @@ mod tests {
         use hyperscale_types::ShardGroupId;
         let mut coord = fresh_coord();
         let shard = ShardGroupId::new(0);
-        let (witness, header) = make_verifiable_witness_and_record(shard, 1, 2, 4);
-        coord.witness_fetcher.on_verified_remote_header(&header);
+        let (witness, header) = make_verifiable_witness_and_header(shard, 1, 2, 4);
+        coord
+            .witness_fetcher
+            .on_verified_remote_header(Arc::clone(&header));
 
         let actions = coord.on_shard_witnesses_received(shard, vec![Arc::clone(&witness)]);
         assert!(actions.is_empty());
@@ -2691,8 +2691,10 @@ mod tests {
         let mut coord = fresh_coord();
         let shard = ShardGroupId::new(0);
         let other = ShardGroupId::new(1);
-        let (witness, header) = make_verifiable_witness_and_record(shard, 1, 2, 4);
-        coord.witness_fetcher.on_verified_remote_header(&header);
+        let (witness, header) = make_verifiable_witness_and_header(shard, 1, 2, 4);
+        coord
+            .witness_fetcher
+            .on_verified_remote_header(Arc::clone(&header));
 
         // Witness is for `shard` but envelope claims `other`.
         let actions = coord.on_shard_witnesses_received(other, vec![witness]);
@@ -2707,7 +2709,7 @@ mod tests {
         let shard = ShardGroupId::new(0);
         // Build a witness pointing at a block hash that no header
         // record exists for (we never call on_verified_remote_header).
-        let (witness, _header) = make_verifiable_witness_and_record(shard, 1, 0, 1);
+        let (witness, _header) = make_verifiable_witness_and_header(shard, 1, 0, 1);
 
         let actions = coord.on_shard_witnesses_received(shard, vec![witness]);
         assert!(actions.is_empty());
@@ -2719,8 +2721,10 @@ mod tests {
         use hyperscale_types::{LeafIndex, ShardGroupId};
         let mut coord = fresh_coord();
         let shard = ShardGroupId::new(0);
-        let (witness, header) = make_verifiable_witness_and_record(shard, 1, 2, 4);
-        coord.witness_fetcher.on_verified_remote_header(&header);
+        let (witness, header) = make_verifiable_witness_and_header(shard, 1, 2, 4);
+        coord
+            .witness_fetcher
+            .on_verified_remote_header(Arc::clone(&header));
 
         // Tamper with the witness's leaf_index so the path no longer
         // reconstructs the committed root.
@@ -2741,8 +2745,10 @@ mod tests {
         // Validator 99 isn't on the committee.
         let mut observer = new_coord(ValidatorId::new(99));
         let shard = ShardGroupId::new(0);
-        let (witness, header) = make_verifiable_witness_and_record(shard, 1, 0, 1);
-        observer.witness_fetcher.on_verified_remote_header(&header);
+        let (witness, header) = make_verifiable_witness_and_header(shard, 1, 0, 1);
+        observer
+            .witness_fetcher
+            .on_verified_remote_header(Arc::clone(&header));
 
         let actions = observer.on_shard_witnesses_received(shard, vec![witness]);
         assert!(actions.is_empty());

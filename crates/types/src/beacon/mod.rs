@@ -85,5 +85,5 @@ pub use state::{
 };
 pub use witness::{
     BeaconWitnessEvent, SHARD_WITNESS_LEAF_DOMAIN_TAG, ShardWitness, ShardWitnessPayload,
-    ShardWitnessProof, Witness,
+    ShardWitnessProof, ShardWitnessVerifyError, Witness,
 };

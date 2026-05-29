@@ -14,11 +14,12 @@
 //!   no replay set.
 
 use sbor::prelude::*;
+use thiserror::Error;
 
 use crate::{
-    BlockHash, BlockHeight, Bls12381G1PublicKey, BoundedVec, Hash, LeafIndex,
+    BlockHash, BlockHeight, Bls12381G1PublicKey, BoundedVec, CertifiedBlockHeader, Hash, LeafIndex,
     MAX_WITNESS_PROOF_DEPTH, PcVoteEquivocation, Round, ShardGroupId, Stake, StakePoolId,
-    ValidatorId,
+    ValidatorId, Verified, Verify, verify_merkle_inclusion,
 };
 
 /// Domain tag for accumulator leaf hashing.
@@ -251,6 +252,69 @@ pub struct ShardWitness {
     pub payload: ShardWitnessPayload,
     /// Where it came from.
     pub proof: ShardWitnessProof,
+}
+
+/// Coarse-grained verification failure for a [`ShardWitness`].
+///
+/// Failure modes (shard-id mismatch, block-hash mismatch, leaf-index
+/// overflow, merkle path mismatch) summarize into one variant; the
+/// rejection log line records the specific reason.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+#[error("ShardWitness verification failed")]
+pub struct ShardWitnessVerifyError;
+
+/// Shard-witness predicate: the witness's claimed `shard_id` and
+/// `committed_block_hash` match the verified header, `leaf_index` fits
+/// in the merkle helper's `u32` index width, and the merkle path from
+/// `payload.leaf_hash()` reaches `header.beacon_witness_root()`.
+///
+/// Trust source: the verified header carries 2f+1 source-shard
+/// validators' BFT attestation over `beacon_witness_root`. A valid
+/// inclusion proof against that root transitively attests the witness.
+///
+/// Construction asserts:
+/// 1. `proof.shard_id == ctx.header().shard_group_id()`.
+/// 2. `proof.committed_block_hash == ctx.block_hash()`.
+/// 3. `proof.leaf_index` fits in `u32` (the merkle helper's index width).
+/// 4. The merkle path reaches `header.beacon_witness_root()`.
+impl Verify<&Verified<CertifiedBlockHeader>> for ShardWitness {
+    type Error = ShardWitnessVerifyError;
+
+    fn verify(&self, ctx: &Verified<CertifiedBlockHeader>) -> Result<Verified<Self>, Self::Error> {
+        let header = ctx.header();
+        if self.proof.shard_id != header.shard_group_id() {
+            return Err(ShardWitnessVerifyError);
+        }
+        if self.proof.committed_block_hash != ctx.block_hash() {
+            return Err(ShardWitnessVerifyError);
+        }
+        let leaf_index_u32 =
+            u32::try_from(self.proof.leaf_index.inner()).map_err(|_| ShardWitnessVerifyError)?;
+        if !verify_merkle_inclusion(
+            *header.beacon_witness_root().as_raw(),
+            self.payload.leaf_hash(),
+            &self.proof.siblings,
+            leaf_index_u32,
+        ) {
+            return Err(ShardWitnessVerifyError);
+        }
+        Ok(Verified::new_unchecked(self.clone()))
+    }
+}
+
+impl Verified<ShardWitness> {
+    /// Wrap a locally-built shard witness whose proof was generated
+    /// against this validator's own committed shard block.
+    ///
+    /// Trust source: the witness's merkle path was derived directly
+    /// against the producing shard's
+    /// [`BeaconWitnessRoot`](crate::BeaconWitnessRoot) at commit time,
+    /// so the inclusion claim holds by construction. Mirror of
+    /// [`Verified::<Provisions>::from_local`](crate::Provisions).
+    #[must_use]
+    pub const fn from_verified_block(witness: ShardWitness) -> Self {
+        Self::new_unchecked(witness)
+    }
 }
 
 /// Observation submitted in a [`BeaconProposal`](crate::BeaconProposal).
