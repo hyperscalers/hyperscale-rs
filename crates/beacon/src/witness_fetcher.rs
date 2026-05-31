@@ -32,14 +32,17 @@ use hyperscale_types::{
 /// - `pending_in_proposal` — leaves the local proposer has drained
 ///   into a proposal but not yet seen committed. Mirrors the eviction
 ///   path of `pool`.
-/// - `pending_fetches` — outstanding fetch dedup. Empty when off-committee.
+/// - `pending_fetches` — outstanding fetch dedup mapping each leaf to
+///   the `(anchor_height, anchor_hash)` it was issued against, so
+///   eviction can hand the matching ids to `FetchAbandon::ShardWitnesses`.
+///   Empty when off-committee.
 #[derive(Debug, Default)]
 pub struct ShardWitnessFetchTracker {
     shard_headers:
         BTreeMap<ShardGroupId, BTreeMap<BlockHeight, Arc<Verified<CertifiedBlockHeader>>>>,
     pool: BTreeMap<ShardGroupId, BTreeMap<LeafIndex, Arc<Verified<ShardWitness>>>>,
     pending_in_proposal: BTreeMap<ShardGroupId, BTreeSet<LeafIndex>>,
-    pending_fetches: BTreeMap<ShardGroupId, BTreeSet<LeafIndex>>,
+    pending_fetches: BTreeMap<ShardGroupId, BTreeMap<LeafIndex, (BlockHeight, BlockHash)>>,
 }
 
 impl ShardWitnessFetchTracker {
@@ -70,15 +73,24 @@ impl ShardWitnessFetchTracker {
         let shard = witness.proof.shard_id;
         let leaf = witness.proof.leaf_index;
         self.pool.entry(shard).or_default().insert(leaf, witness);
-        if let Some(set) = self.pending_fetches.get_mut(&shard) {
-            set.remove(&leaf);
+        if let Some(map) = self.pending_fetches.get_mut(&shard) {
+            map.remove(&leaf);
         }
     }
 
-    /// Mark a `(shard, leaf_index)` fetch as in-flight. Returns `true`
-    /// if newly inserted, `false` if already tracked or already in the
-    /// pool — the caller treats `false` as "don't redispatch."
-    pub fn register_pending_fetch(&mut self, shard: ShardGroupId, leaf_index: LeafIndex) -> bool {
+    /// Mark a `(shard, leaf_index)` fetch as in-flight against the
+    /// `(anchor_height, anchor_hash)` it was issued against. Returns
+    /// `true` if newly inserted, `false` if already tracked or already
+    /// in the pool — the caller treats `false` as "don't redispatch."
+    /// The anchor is retained so [`notify_consumed_advanced`] can
+    /// surface the exact id tuple for `FetchAbandon::ShardWitnesses`.
+    pub fn register_pending_fetch(
+        &mut self,
+        shard: ShardGroupId,
+        leaf_index: LeafIndex,
+        anchor_height: BlockHeight,
+        anchor_hash: BlockHash,
+    ) -> bool {
         let already_pooled = self
             .pool
             .get(&shard)
@@ -89,7 +101,8 @@ impl ShardWitnessFetchTracker {
         self.pending_fetches
             .entry(shard)
             .or_default()
-            .insert(leaf_index)
+            .insert(leaf_index, (anchor_height, anchor_hash))
+            .is_none()
     }
 
     /// Drain witnesses eligible for inclusion in an epoch whose time
@@ -143,12 +156,20 @@ impl ShardWitnessFetchTracker {
     }
 
     /// On-chain `consumed_through[shard]` has advanced to `new_watermark`.
-    /// Evict pool and `pending_in_proposal` entries at-or-below the new
-    /// watermark — witnesses past their consumed leaf are stale and
-    /// can't appear in a future proposal. `O(log n + evicted)` via
-    /// `BTreeMap::split_off`. Idempotent: calling with a non-advancing
-    /// watermark is a no-op.
-    pub fn notify_consumed_advanced(&mut self, shard: ShardGroupId, new_watermark: LeafIndex) {
+    /// Evict pool, `pending_in_proposal`, and `pending_fetches` entries
+    /// at-or-below the new watermark — witnesses past their consumed
+    /// leaf are stale and can't appear in a future proposal.
+    /// `O(log n + evicted)` via `BTreeMap::split_off`. Idempotent:
+    /// calling with a non-advancing watermark is a no-op.
+    ///
+    /// Returns the evicted in-flight ids so the caller can hand them to
+    /// `FetchAbandon::ShardWitnesses`. Empty when no fetch was pending
+    /// at-or-below the new watermark.
+    pub fn notify_consumed_advanced(
+        &mut self,
+        shard: ShardGroupId,
+        new_watermark: LeafIndex,
+    ) -> Vec<(ShardGroupId, BlockHeight, BlockHash, LeafIndex)> {
         let cutoff = LeafIndex::new(new_watermark.inner().saturating_add(1));
         if let Some(pool_for_shard) = self.pool.get_mut(&shard) {
             let above = pool_for_shard.split_off(&cutoff);
@@ -158,6 +179,15 @@ impl ShardWitnessFetchTracker {
             let above = pip_for_shard.split_off(&cutoff);
             *pip_for_shard = above;
         }
+        let mut evicted = Vec::new();
+        if let Some(pf_for_shard) = self.pending_fetches.get_mut(&shard) {
+            let above = pf_for_shard.split_off(&cutoff);
+            let stale = std::mem::replace(pf_for_shard, above);
+            for (leaf, (height, hash)) in stale {
+                evicted.push((shard, height, hash, leaf));
+            }
+        }
+        evicted
     }
 
     /// Whether the local proposer can build an epoch's contribution:
@@ -244,14 +274,14 @@ impl ShardWitnessFetchTracker {
 
     #[must_use]
     pub fn pending_fetches_len(&self, shard: ShardGroupId) -> usize {
-        self.pending_fetches.get(&shard).map_or(0, BTreeSet::len)
+        self.pending_fetches.get(&shard).map_or(0, BTreeMap::len)
     }
 
     #[must_use]
     pub fn is_pending_fetch(&self, shard: ShardGroupId, leaf_index: LeafIndex) -> bool {
         self.pending_fetches
             .get(&shard)
-            .is_some_and(|s| s.contains(&leaf_index))
+            .is_some_and(|m| m.contains_key(&leaf_index))
     }
 
     #[must_use]
@@ -375,7 +405,12 @@ mod tests {
     #[test]
     fn admit_witness_lands_in_pool_and_clears_pending_fetch() {
         let mut t = ShardWitnessFetchTracker::new();
-        assert!(t.register_pending_fetch(shard(0), LeafIndex::new(3)));
+        assert!(t.register_pending_fetch(
+            shard(0),
+            LeafIndex::new(3),
+            BlockHeight::new(1),
+            BlockHash::ZERO
+        ));
         assert!(t.is_pending_fetch(shard(0), LeafIndex::new(3)));
         t.admit_witness(witness(shard(0), 3));
         assert_eq!(t.pool_len(shard(0)), 1);
@@ -385,15 +420,30 @@ mod tests {
     #[test]
     fn register_pending_fetch_is_idempotent() {
         let mut t = ShardWitnessFetchTracker::new();
-        assert!(t.register_pending_fetch(shard(0), LeafIndex::new(3)));
-        assert!(!t.register_pending_fetch(shard(0), LeafIndex::new(3)));
+        assert!(t.register_pending_fetch(
+            shard(0),
+            LeafIndex::new(3),
+            BlockHeight::new(1),
+            BlockHash::ZERO
+        ));
+        assert!(!t.register_pending_fetch(
+            shard(0),
+            LeafIndex::new(3),
+            BlockHeight::new(1),
+            BlockHash::ZERO
+        ));
     }
 
     #[test]
     fn register_pending_fetch_rejects_when_already_pooled() {
         let mut t = ShardWitnessFetchTracker::new();
         t.admit_witness(witness(shard(0), 5));
-        assert!(!t.register_pending_fetch(shard(0), LeafIndex::new(5)));
+        assert!(!t.register_pending_fetch(
+            shard(0),
+            LeafIndex::new(5),
+            BlockHeight::new(1),
+            BlockHash::ZERO,
+        ));
     }
 
     #[test]
@@ -559,7 +609,12 @@ mod tests {
         let mut t = ShardWitnessFetchTracker::new();
         t.on_verified_remote_header(verified_header(shard(0), 1, 1_000, 5));
         t.admit_witness(witness(shard(0), 3));
-        t.register_pending_fetch(shard(0), LeafIndex::new(4));
+        t.register_pending_fetch(
+            shard(0),
+            LeafIndex::new(4),
+            BlockHeight::new(1),
+            BlockHash::ZERO,
+        );
         let consumed = BTreeMap::new();
         let _ = t.drain_for_proposal(WeightedTimestamp::from_millis(2_000), &consumed);
         assert_eq!(t.pending_in_proposal_len(shard(0)), 1);

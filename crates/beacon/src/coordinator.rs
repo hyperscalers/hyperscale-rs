@@ -23,15 +23,15 @@ use std::time::Duration;
 
 use hyperscale_core::{Action, FetchAbandon, FetchRequest, TimerId};
 use hyperscale_types::{
-    BeaconBlock, BeaconCert, BeaconProposal, BeaconProposalVerifyContext, BeaconState,
-    Bls12381G1PublicKey, CertifiedBeaconBlock, CertifiedBeaconBlockVerifyError, Epoch,
-    GenesisConfigHash, Hash, LeafIndex, LocalTimestamp, MAX_WITNESSES_PER_PROPOSER,
-    NetworkDefinition, PcQc3, PcValueElement, PcVector, PcVote1, PcVote1VerifyError, PcVote2,
-    PcVote2VerifyError, PcVote3, PcVote3VerifyError, PcVoteRound, SKIP_TIMEOUT, SPC_VIEW_TIMEOUT,
-    ShardGroupId, ShardWitness, SkipEpochCert, SkipRequest, SkipRequestVerifyError, SpcCert,
-    SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError,
-    SpcProposalObject, SpcProposalObjectVerifyError, SpcView, TopologySnapshot, ValidatorId,
-    Verifiable, Verified, Verify, WeightedTimestamp, Witness,
+    BeaconBlock, BeaconCert, BeaconProposal, BeaconProposalVerifyContext, BeaconState, BlockHash,
+    BlockHeight, Bls12381G1PublicKey, CertifiedBeaconBlock, CertifiedBeaconBlockVerifyError,
+    CertifiedBlockHeader, Epoch, GenesisConfigHash, Hash, LeafIndex, LocalTimestamp,
+    MAX_WITNESSES_PER_PROPOSER, NetworkDefinition, PcQc3, PcValueElement, PcVector, PcVote1,
+    PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3, PcVote3VerifyError, PcVoteRound,
+    SKIP_TIMEOUT, SPC_VIEW_TIMEOUT, ShardGroupId, ShardWitness, SkipEpochCert, SkipRequest,
+    SkipRequestVerifyError, SpcCert, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError, SpcNewCommitMsg,
+    SpcNewCommitMsgVerifyError, SpcProposalObject, SpcProposalObjectVerifyError, SpcView,
+    TopologySnapshot, ValidatorId, Verifiable, Verified, Verify, WeightedTimestamp, Witness,
 };
 use tracing::{trace, warn};
 
@@ -1412,6 +1412,63 @@ impl BeaconCoordinator {
         Vec::new()
     }
 
+    /// Record a verified source-shard header. Off-committee vnodes
+    /// retain the header (their inbound `BeaconBlock` verifier needs
+    /// it to check witness Merkle paths) and emit nothing. On-committee
+    /// vnodes additionally fetch the witnesses for any new leaves the
+    /// header makes addressable — every leaf above the local
+    /// `consumed_through[shard]` watermark and at-or-below the
+    /// header's `beacon_witness_leaf_count`, dedup-filtered against
+    /// already-pooled and already-pending leaves.
+    pub fn on_verified_remote_header(
+        &mut self,
+        certified_header: &Arc<Verified<CertifiedBlockHeader>>,
+    ) -> Vec<Action> {
+        self.witness_fetcher
+            .on_verified_remote_header(Arc::clone(certified_header));
+        if !self.is_on_committee() {
+            return Vec::new();
+        }
+        let header = certified_header.header();
+        let shard = header.shard_group_id();
+        let block_height = header.height();
+        let committed_block_hash = header.hash();
+        let leaf_count = header.beacon_witness_leaf_count();
+        let watermark = self
+            .state
+            .consumed_through
+            .get(&shard)
+            .copied()
+            .unwrap_or(LeafIndex::new(0));
+
+        let mut leaves_to_fetch: Vec<LeafIndex> = Vec::new();
+        let mut idx = watermark.inner().saturating_add(1);
+        while idx <= leaf_count.inner() {
+            let leaf = LeafIndex::new(idx);
+            if self.witness_fetcher.register_pending_fetch(
+                shard,
+                leaf,
+                block_height,
+                committed_block_hash,
+            ) {
+                leaves_to_fetch.push(leaf);
+            }
+            idx = idx.saturating_add(1);
+        }
+
+        if leaves_to_fetch.is_empty() {
+            return Vec::new();
+        }
+        vec![Action::Fetch(FetchRequest::ShardWitnesses {
+            source_shard: shard,
+            block_height,
+            committed_block_hash,
+            leaf_indices: leaves_to_fetch,
+            preferred: None,
+            class: None,
+        })]
+    }
+
     /// Advance `self.state` / `self.latest_block` to `block` after
     /// running `apply_epoch` over its committed proposals. Resets
     /// per-epoch caches, bootstraps next epoch's SPC if local is on
@@ -1430,16 +1487,22 @@ impl BeaconCoordinator {
 
         // Witness fetcher uses mark-not-remove on drain; physical
         // eviction is driven by the chain's `consumed_through`
-        // advancement.
+        // advancement. Each eviction may release in-flight leaf fetches
+        // whose witnesses are now stale — collect their ids so the
+        // caller can hand them to `FetchAbandon::ShardWitnesses`.
         let consumed_snapshot: Vec<(ShardGroupId, LeafIndex)> = self
             .state
             .consumed_through
             .iter()
             .map(|(s, w)| (*s, *w))
             .collect();
+        let mut abandoned_witness_ids: Vec<(ShardGroupId, BlockHeight, BlockHash, LeafIndex)> =
+            Vec::new();
         for (shard, watermark) in consumed_snapshot {
-            self.witness_fetcher
-                .notify_consumed_advanced(shard, watermark);
+            abandoned_witness_ids.extend(
+                self.witness_fetcher
+                    .notify_consumed_advanced(shard, watermark),
+            );
         }
 
         let next_epoch = self.state.current_epoch.next();
@@ -1471,6 +1534,11 @@ impl BeaconCoordinator {
 
         if let Some(abandon) = self.prune_stale_assemblies() {
             actions.push(abandon);
+        }
+        if !abandoned_witness_ids.is_empty() {
+            actions.push(Action::AbandonFetch(FetchAbandon::ShardWitnesses {
+                ids: abandoned_witness_ids,
+            }));
         }
 
         if self.is_on_committee() {

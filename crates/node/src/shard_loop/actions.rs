@@ -627,6 +627,9 @@ where
             FetchAbandon::BeaconProposal { ids } => {
                 self.drive_fetch::<BeaconProposalBinding>(FetchInput::Abandoned { ids });
             }
+            FetchAbandon::ShardWitnesses { ids } => {
+                self.drive_fetch::<ShardWitnessBinding>(FetchInput::Abandoned { ids });
+            }
         }
     }
 

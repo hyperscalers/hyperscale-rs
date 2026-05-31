@@ -154,8 +154,14 @@ impl NodeStateMachine {
                     certified_header.header().waves(),
                 );
 
-                self.provisions_coordinator
-                    .on_verified_remote_header(&certified_header)
+                let mut actions = self
+                    .provisions_coordinator
+                    .on_verified_remote_header(&certified_header);
+                actions.extend(
+                    self.beacon_coordinator
+                        .on_verified_remote_header(&certified_header),
+                );
+                actions
             }
             ProtocolEvent::TransactionRootVerified { block_hash, result } => self
                 .shard_coordinator

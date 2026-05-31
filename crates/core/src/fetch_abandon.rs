@@ -11,7 +11,8 @@
 //! `FetchInput::Abandoned` on the corresponding binding.
 
 use hyperscale_types::{
-    BlockHeight, Epoch, ProvisionHash, ShardGroupId, TxHash, ValidatorId, WaveId,
+    BlockHash, BlockHeight, Epoch, LeafIndex, ProvisionHash, ShardGroupId, TxHash, ValidatorId,
+    WaveId,
 };
 
 /// Fetch-cancel family — one variant per payload type. Variants are added
@@ -76,5 +77,16 @@ pub enum FetchAbandon {
     BeaconProposal {
         /// `(epoch, validator)` pairs whose in-flight fetch should be cancelled.
         ids: Vec<(Epoch, ValidatorId)>,
+    },
+    /// Cross-shard witness fetch keyed by
+    /// `(source_shard, block_height, committed_block_hash, leaf_index)`.
+    /// Emitted by the beacon coordinator when `consumed_through[shard]`
+    /// advances past an in-flight leaf — the witness has been consumed
+    /// on-chain and a future proposal can't include it, so the FSM's
+    /// in-flight slot should release rather than pin on a payload the
+    /// pool would only evict.
+    ShardWitnesses {
+        /// Anchor + leaf ids whose in-flight fetch should be cancelled.
+        ids: Vec<(ShardGroupId, BlockHeight, BlockHash, LeafIndex)>,
     },
 }
