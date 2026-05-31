@@ -945,6 +945,20 @@ pub enum Action {
         peers: Vec<ValidatorId>,
     },
 
+    /// Fetch one committee member's `BeaconProposal` for an in-flight
+    /// epoch from a peer who has it pooled. Emitted when SPC's
+    /// `OutputHigh` references a `(validator, epoch)` the local
+    /// `BeaconProposalPool` never observed. The result returns via
+    /// [`ProtocolEvent::BeaconProposalFetched`].
+    FetchBeaconProposal {
+        /// Epoch the proposal targets.
+        epoch: Epoch,
+        /// Validator whose proposal is being fetched.
+        validator: ValidatorId,
+        /// Beacon-committee members (excluding self) who may serve.
+        peers: Vec<ValidatorId>,
+    },
+
     /// Verify the cert authenticating a beacon block (SPC cert on a
     /// Normal block, pool-quorum cert on a Skip block — the handler
     /// reads `block.cert()` to branch) **and** every
@@ -1122,6 +1136,7 @@ impl Action {
             | Self::BroadcastSkipRequest { .. }
             | Self::BroadcastSkipCert { .. }
             | Self::FetchShardWitnesses { .. }
+            | Self::FetchBeaconProposal { .. }
             | Self::VerifyBeaconBlock { .. }
             | Self::VerifySkipRequest { .. }
             | Self::VerifyPcVote1 { .. }
@@ -1190,6 +1205,7 @@ impl Action {
             | Self::BroadcastSkipRequest { .. }
             | Self::BroadcastSkipCert { .. }
             | Self::FetchShardWitnesses { .. }
+            | Self::FetchBeaconProposal { .. }
             | Self::VerifyBeaconBlock { .. }
             | Self::VerifySkipRequest { .. }
             | Self::VerifyPcVote1 { .. }

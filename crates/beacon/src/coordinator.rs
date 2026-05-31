@@ -17,13 +17,16 @@
 //! matches `expected_config_hash` — a tripwire against booting a
 //! validator off a chain initialised by a different operator TOML.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use hyperscale_core::{Action, TimerId};
+use hyperscale_types::network::request::beacon::GetBeaconProposalRequest;
+use hyperscale_types::network::response::beacon::GetBeaconProposalResponse;
 use hyperscale_types::{
-    BeaconBlock, BeaconCert, BeaconProposal, BeaconState, Bls12381G1PublicKey,
-    CertifiedBeaconBlock, CertifiedBeaconBlockVerifyError, EPOCH_DURATION, Epoch,
-    GenesisConfigHash, Hash, LeafIndex, LocalTimestamp, MAX_WITNESSES_PER_PROPOSER,
+    BeaconBlock, BeaconCert, BeaconProposal, BeaconProposalVerifyContext, BeaconState,
+    Bls12381G1PublicKey, CertifiedBeaconBlock, CertifiedBeaconBlockVerifyError, EPOCH_DURATION,
+    Epoch, GenesisConfigHash, Hash, LeafIndex, LocalTimestamp, MAX_WITNESSES_PER_PROPOSER,
     NetworkDefinition, PcQc3, PcValueElement, PcVector, PcVote1, PcVote1VerifyError, PcVote2,
     PcVote2VerifyError, PcVote3, PcVote3VerifyError, PcVoteRound, SKIP_TIMEOUT, SPC_VIEW_TIMEOUT,
     ShardGroupId, ShardWitness, SkipEpochCert, SkipRequest, SkipRequestVerifyError, SpcCert,
@@ -96,6 +99,15 @@ pub struct BeaconCoordinator {
     /// reset on commit.
     proposal_pool: BeaconProposalPool,
 
+    /// Stashed SPC-decided epoch whose committed proposals reference
+    /// at least one `BeaconProposal` the local pool never observed.
+    /// Holds the SPC cert + output vector + the set of validators
+    /// whose proposals are still being fetched. Cleared once every
+    /// awaiting fetch resolves and the block adopts (or once the
+    /// stash is abandoned because a later peer's beacon-block gossip
+    /// committed the same epoch first).
+    pending_assembly: Option<PendingCommitAssembly>,
+
     /// Read-only topology view derived from the current `BeaconState`.
     /// Refreshed on every `adopt_block` so consumers (shard
     /// coordinators reading via `io_loop`'s `ArcSwap`) see the
@@ -113,6 +125,26 @@ pub struct BeaconCoordinator {
     /// fed into deterministic consensus computations — use
     /// `state.current_epoch` or weighted timestamps for that.
     now: LocalTimestamp,
+}
+
+/// Stashed SPC-decided epoch awaiting [`Action::FetchBeaconProposal`]
+/// responses for at least one missing committed proposal.
+struct PendingCommitAssembly {
+    epoch: Epoch,
+    output: PcVector,
+    cert: Verified<SpcCert>,
+    awaiting: BTreeSet<ValidatorId>,
+}
+
+/// Result of [`BeaconCoordinator::decode_committed_proposals`].
+enum DecodeOutcome {
+    /// Every non-zero `PcVector` element resolved to a pooled
+    /// proposal with a matching hash; block assembly may proceed.
+    Complete(Vec<(ValidatorId, BeaconProposal)>),
+    /// At least one element points to a `(validator, epoch)` not in
+    /// the local pool; the listed validators need fetching before
+    /// assembly can complete.
+    Pending { missing: Vec<ValidatorId> },
 }
 
 impl BeaconCoordinator {
@@ -153,6 +185,7 @@ impl BeaconCoordinator {
             equivocations: EquivocationObservations::new(),
             sync: BeaconBlockSyncManager::new(),
             proposal_pool: BeaconProposalPool::new(next_epoch),
+            pending_assembly: None,
             topology_snapshot,
             me,
             network,
@@ -996,7 +1029,7 @@ impl BeaconCoordinator {
         block: &CertifiedBeaconBlock,
     ) -> Vec<(ValidatorId, Bls12381G1PublicKey)> {
         let mut signers: Vec<(ValidatorId, Bls12381G1PublicKey)> = Vec::new();
-        let mut seen: std::collections::BTreeSet<ValidatorId> = std::collections::BTreeSet::new();
+        let mut seen: BTreeSet<ValidatorId> = BTreeSet::new();
         for (_, proposal) in block.block().committed_proposals() {
             for witness in proposal.witnesses().iter() {
                 if let Witness::Equivocation(ev) = witness
@@ -1362,11 +1395,12 @@ impl BeaconCoordinator {
         actions
     }
 
-    /// SPC has decided this epoch — assemble the [`BeaconBlock`]
-    /// directly from the cert SPC produced and the locally-resolved
-    /// committed proposals, then emit `CommitBeaconBlock` +
-    /// `BroadcastBeaconBlock`. No header-sig collection round: the
-    /// SPC cert IS the block's authenticator.
+    /// SPC has decided this epoch. When every committed-vector
+    /// element resolves to a pooled proposal, assemble the block
+    /// directly. Otherwise stash the cert + output and emit one
+    /// [`Action::FetchBeaconProposal`] per missing element; assembly
+    /// resumes from [`Self::on_beacon_proposal_fetched`] once every
+    /// awaited fetch lands.
     fn on_spc_output_high(
         &mut self,
         epoch: Epoch,
@@ -1374,7 +1408,46 @@ impl BeaconCoordinator {
         cert: Verified<SpcCert>,
         _recipients: &[ValidatorId],
     ) -> Vec<Action> {
-        let committed = self.decode_committed_proposals(epoch, output);
+        match self.decode_committed_proposals(epoch, output) {
+            DecodeOutcome::Complete(committed) => self.assemble_and_adopt(epoch, committed, cert),
+            DecodeOutcome::Pending { missing } => {
+                if let Some(prior) = self.pending_assembly.as_ref() {
+                    warn!(
+                        epoch = epoch.inner(),
+                        prior_epoch = prior.epoch.inner(),
+                        "OutputHigh arrived while an earlier assembly is still awaiting fetches — dropping",
+                    );
+                    return Vec::new();
+                }
+                let peers = self.spc_recipients();
+                let actions: Vec<Action> = missing
+                    .iter()
+                    .map(|&validator| Action::FetchBeaconProposal {
+                        epoch,
+                        validator,
+                        peers: peers.clone(),
+                    })
+                    .collect();
+                self.pending_assembly = Some(PendingCommitAssembly {
+                    epoch,
+                    output: output.clone(),
+                    cert,
+                    awaiting: missing.into_iter().collect(),
+                });
+                actions
+            }
+        }
+    }
+
+    /// Build the certified block from `committed` + SPC `cert`, route
+    /// it through the shared adoption path, and emit the gossip
+    /// broadcast.
+    fn assemble_and_adopt(
+        &mut self,
+        epoch: Epoch,
+        committed: Vec<(ValidatorId, BeaconProposal)>,
+        cert: Verified<SpcCert>,
+    ) -> Vec<Action> {
         let prev_block_hash = self.latest_block.block_hash();
         let block = BeaconBlock::new(epoch, prev_block_hash, committed);
         let certified = Verified::<CertifiedBeaconBlock>::from_committed_assembly(
@@ -1384,7 +1457,6 @@ impl BeaconCoordinator {
         .expect("Normal beacon block pairs with SPC cert by construction");
         let block_arc = Arc::new(certified);
 
-        // Advance state via the shared adoption path.
         let mut actions = self.adopt_block(Arc::clone(&block_arc));
         actions.push(Action::BroadcastBeaconBlock { block: block_arc });
         actions
@@ -1395,15 +1467,16 @@ impl BeaconCoordinator {
     /// element against the corresponding validator's
     /// [`BeaconProposal::pc_element_hash`].
     ///
-    /// Mismatches and pool misses get a warn — eventually those want
-    /// a fetch path, but for the all-honest case the local pool has
-    /// every accepted proposal already.
-    fn decode_committed_proposals(
-        &self,
-        epoch: Epoch,
-        output: &PcVector,
-    ) -> Vec<(ValidatorId, BeaconProposal)> {
+    /// Pool misses surface as
+    /// [`DecodeOutcome::Pending`](DecodeOutcome::Pending) so the
+    /// caller can fetch the missing proposals before assembly. Hash
+    /// mismatches (we have a proposal but the digest disagrees with
+    /// what SPC committed) are excluded silently after a warn — the
+    /// pooled entry came from a byzantine peer and a re-fetch would
+    /// likely return the same bad bytes.
+    fn decode_committed_proposals(&self, epoch: Epoch, output: &PcVector) -> DecodeOutcome {
         let mut committed = Vec::new();
+        let mut missing = Vec::new();
         for (i, element) in output.iter().enumerate() {
             if *element == PcValueElement::ZERO {
                 continue;
@@ -1415,25 +1488,130 @@ impl BeaconCoordinator {
                 );
                 continue;
             };
-            let Some(pooled) = self.proposal_pool.get(validator) else {
-                warn!(
-                    ?validator,
-                    epoch = epoch.inner(),
-                    "OutputHigh includes proposal we haven't seen — skipping",
-                );
-                continue;
-            };
-            if pooled.pc_element_hash(epoch) != *element {
-                warn!(
-                    ?validator,
-                    epoch = epoch.inner(),
-                    "OutputHigh hash mismatches pooled proposal — skipping",
-                );
-                continue;
+            match self.proposal_pool.get(validator) {
+                Some(pooled) if pooled.pc_element_hash(epoch) == *element => {
+                    committed.push((validator, pooled.as_ref().as_ref().clone()));
+                }
+                Some(_) => {
+                    warn!(
+                        ?validator,
+                        epoch = epoch.inner(),
+                        "OutputHigh hash mismatches pooled proposal — excluding",
+                    );
+                }
+                None => missing.push(validator),
             }
-            committed.push((validator, pooled.as_ref().as_ref().clone()));
         }
-        committed
+        if missing.is_empty() {
+            DecodeOutcome::Complete(committed)
+        } else {
+            DecodeOutcome::Pending { missing }
+        }
+    }
+
+    /// Handle a [`ProtocolEvent::BeaconProposalFetched`] dispatch:
+    /// verify the returned proposal under the named validator's
+    /// pubkey, admit it to the pool, and resume the stashed assembly
+    /// once every awaited fetch has resolved.
+    ///
+    /// Out-of-band responses — stash already cleared, mismatched
+    /// epoch, or validator not in the awaiting set — drop silently.
+    ///
+    /// [`ProtocolEvent::BeaconProposalFetched`]: hyperscale_core::ProtocolEvent::BeaconProposalFetched
+    pub fn on_beacon_proposal_fetched(
+        &mut self,
+        epoch: Epoch,
+        validator: ValidatorId,
+        proposal: Option<Arc<Verifiable<BeaconProposal>>>,
+    ) -> Vec<Action> {
+        let Some(pending) = self.pending_assembly.as_mut() else {
+            return Vec::new();
+        };
+        if pending.epoch != epoch || !pending.awaiting.remove(&validator) {
+            return Vec::new();
+        }
+        if let Some(proposal) = proposal {
+            if let Some(record) = self.state.validators.get(&validator) {
+                let ctx = BeaconProposalVerifyContext {
+                    network: &self.network,
+                    epoch,
+                    sender_pk: record.pubkey,
+                };
+                match Arc::unwrap_or_clone(proposal).upgrade(&ctx) {
+                    Ok(verified) => {
+                        let _ = self
+                            .proposal_pool
+                            .admit(validator, epoch, Arc::new(verified));
+                    }
+                    Err((_, err)) => {
+                        warn!(
+                            ?validator,
+                            epoch = epoch.inner(),
+                            ?err,
+                            "Fetched BeaconProposal failed VRF verification — dropping",
+                        );
+                    }
+                }
+            } else {
+                warn!(
+                    ?validator,
+                    "Fetched proposal's validator is not in BeaconState — dropping",
+                );
+            }
+        }
+        self.maybe_resume_assembly()
+    }
+
+    /// Drive the stashed assembly forward if every awaited fetch has
+    /// resolved. Re-runs the decode against the now-extended pool;
+    /// `Complete` adopts and broadcasts, `Pending` (a fetch returned
+    /// no proposal or one whose hash still mismatched) drops the
+    /// stash — the local node will catch up via beacon-block gossip
+    /// from a peer that assembled cleanly.
+    fn maybe_resume_assembly(&mut self) -> Vec<Action> {
+        let still_awaiting = self
+            .pending_assembly
+            .as_ref()
+            .is_some_and(|p| !p.awaiting.is_empty());
+        if still_awaiting {
+            return Vec::new();
+        }
+        let Some(pending) = self.pending_assembly.take() else {
+            return Vec::new();
+        };
+        match self.decode_committed_proposals(pending.epoch, &pending.output) {
+            DecodeOutcome::Complete(committed) => {
+                self.assemble_and_adopt(pending.epoch, committed, pending.cert)
+            }
+            DecodeOutcome::Pending { missing } => {
+                warn!(
+                    epoch = pending.epoch.inner(),
+                    still_missing = missing.len(),
+                    "Assembly still incomplete after all fetches resolved — relying on peer beacon-block gossip",
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    /// Serve an inbound
+    /// [`GetBeaconProposalRequest`](hyperscale_types::network::request::beacon::GetBeaconProposalRequest)
+    /// from this vnode's `BeaconProposalPool`. The runner registers
+    /// one closure per hosted vnode capturing a handle to the
+    /// matching coordinator.
+    #[must_use]
+    pub fn serve_beacon_proposal_request(
+        &self,
+        req: &GetBeaconProposalRequest,
+    ) -> GetBeaconProposalResponse {
+        if req.epoch != self.proposal_pool.epoch() {
+            return GetBeaconProposalResponse::empty();
+        }
+        let proposal = self
+            .proposal_pool
+            .get(req.validator)
+            .map(|verified| Arc::new(Verifiable::from((**verified).clone())));
+        GetBeaconProposalResponse::new(proposal)
     }
 
     /// Beacon-committee members excluding the local validator —

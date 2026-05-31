@@ -837,6 +837,22 @@ pub enum ProtocolEvent {
         witnesses: Vec<Arc<ShardWitness>>,
     },
 
+    /// Result of an [`Action::FetchBeaconProposal`] dispatch. `None`
+    /// means the responder didn't have the proposal pooled; the
+    /// coordinator may emit another fetch against a different peer.
+    /// Wire decode lands the wrapper as `Verifiable::Unverified`;
+    /// locally-dispatched serves preserve the `Verified` marker.
+    ///
+    /// [`Action::FetchBeaconProposal`]: crate::Action::FetchBeaconProposal
+    BeaconProposalFetched {
+        /// Epoch the fetched proposal targets.
+        epoch: Epoch,
+        /// Validator whose proposal was requested.
+        validator: ValidatorId,
+        /// Returned proposal, or `None` if the peer didn't hold it.
+        proposal: Option<Arc<Verifiable<BeaconProposal>>>,
+    },
+
     /// Result of an [`Action::VerifyBeaconBlock`] dispatch. The
     /// verified handle rides back on success so the coordinator can
     /// route it into adoption without stashing during the verify

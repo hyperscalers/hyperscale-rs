@@ -90,6 +90,7 @@ where
             | Action::BroadcastSkipRequest { .. }
             | Action::BroadcastSkipCert { .. }
             | Action::FetchShardWitnesses { .. }
+            | Action::FetchBeaconProposal { .. }
             | Action::VerifyBeaconBlock { .. }
             | Action::VerifySkipRequest { .. }
             | Action::VerifyPcVote1 { .. }

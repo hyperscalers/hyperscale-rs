@@ -551,3 +551,68 @@ fn consecutive_skips_advance_chain() {
         );
     }
 }
+
+// ─── Missing-proposal fetch path ──────────────────────────────────────────
+
+/// Scenario: replica 1 misses validator 0's `BeaconProposal` gossip,
+/// but the other replicas (2 and 3) saw it. SPC's committed
+/// `PcVector` carries a non-`ZERO` element at validator 0's position
+/// because the ⌈2M/3⌉+1 quorum's input vectors agree. Replica 1's
+/// `decode_committed_proposals` returns `Pending`, the coordinator
+/// emits `Action::FetchBeaconProposal`, the sim routes the fetch to
+/// a peer who has the proposal pooled, and replica 1 admits it +
+/// finishes assembly + commits the same block hash as everyone else.
+#[test]
+fn missed_proposal_gossip_recovers_via_fetch_protocol() {
+    let mut sim = CoordinatorSim::new(4, 0xFE7C);
+    // Drop validator 0's epoch-1 proposal gossip to replica 1 only.
+    // Validators 2 and 3 still receive it, so SPC's committed
+    // OutputHigh carries a non-ZERO at position 0.
+    sim.block_proposal_from(ValidatorId::new(0), ValidatorId::new(1));
+    sim.kick_off();
+    sim.run_until_committed(1, MAX_STEPS);
+
+    // Every replica must commit the epoch-1 block; replica 1's commit
+    // came through the fetch-recovery path.
+    for r in 0..sim.n() {
+        assert!(
+            !sim.commits[r].is_empty(),
+            "replica {r} failed to commit epoch 1 (fetch path may have stalled)",
+        );
+    }
+    // Same committed proposal set across all replicas — pins the
+    // invariant that the fetched proposal's content matches what the
+    // honest majority committed.
+    let mut reference: Vec<_> = sim.commits[0][0]
+        .block
+        .block()
+        .committed_proposals()
+        .to_vec();
+    reference.sort_by_key(|(id, _)| id.inner());
+    for r in 1..sim.n() {
+        let mut cmp: Vec<_> = sim.commits[r][0]
+            .block
+            .block()
+            .committed_proposals()
+            .to_vec();
+        cmp.sort_by_key(|(id, _)| id.inner());
+        assert_eq!(
+            cmp, reference,
+            "replica {r} committed a different proposal set after fetch recovery",
+        );
+    }
+    // Validator 0's proposal is in the committed set on replica 1
+    // (the recovery path admitted it). If the fetch had returned None
+    // or failed, the committed_proposals would have differed and the
+    // assertion above would have caught it — this is a direct check.
+    let r1_has_v0 = sim.commits[1][0]
+        .block
+        .block()
+        .committed_proposals()
+        .iter()
+        .any(|(id, _)| *id == ValidatorId::new(0));
+    assert!(
+        r1_has_v0,
+        "replica 1's committed block omits validator 0's proposal — fetch path didn't admit it",
+    );
+}

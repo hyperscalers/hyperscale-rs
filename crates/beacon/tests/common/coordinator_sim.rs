@@ -13,12 +13,13 @@
 //! PC commits all-`HASH_BOTTOM`s every epoch — the honest path still
 //! terminates but exercises an uninteresting branch.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use hyperscale_beacon::coordinator::BeaconCoordinator;
 use hyperscale_beacon::genesis::build_genesis_beacon_state;
 use hyperscale_core::Action;
+use hyperscale_types::network::request::beacon::GetBeaconProposalRequest;
 use hyperscale_types::{
     BEACON_SIGNER_COUNT, BeaconCert, BeaconGenesisConfig, BeaconProposal, BeaconState,
     Bls12381G1PrivateKey, Bls12381G1PublicKey, CertifiedBeaconBlock,
@@ -108,6 +109,11 @@ enum SimEvent {
     SkipCert {
         cert: Arc<Verifiable<SkipEpochCert>>,
     },
+    BeaconProposalFetched {
+        epoch: Epoch,
+        validator: ValidatorId,
+        proposal: Option<Arc<Verifiable<BeaconProposal>>>,
+    },
 }
 
 /// Multi-coordinator beacon sim. Owns n `BeaconCoordinator`s, their
@@ -140,6 +146,12 @@ pub struct CoordinatorSim {
     /// Consumed (drained) the first time a proposal at that epoch is
     /// absorbed.
     pending_topology_changes: BTreeMap<Epoch, Vec<Witness>>,
+    /// Single-shot per-pair filter: when `(sender, receiver)` is
+    /// present, the next `BuildAndBroadcastBeaconProposal` from
+    /// `sender` skips queuing the envelope addressed to `receiver`,
+    /// and the entry is removed. Used to simulate a missed proposal
+    /// gossip from `sender` to `receiver`.
+    blocked_proposal_pairs: BTreeSet<(ValidatorId, ValidatorId)>,
 }
 
 impl CoordinatorSim {
@@ -225,7 +237,17 @@ impl CoordinatorSim {
             byzantine: vec![None; n],
             byzantine_fires: vec![0; n],
             pending_topology_changes: BTreeMap::new(),
+            blocked_proposal_pairs: BTreeSet::new(),
         }
+    }
+
+    /// Block the next `BuildAndBroadcastBeaconProposal` from `sender`
+    /// from queuing its envelope addressed to `receiver`. Other
+    /// recipients still receive the proposal. Single-shot per pair:
+    /// the entry is cleared the first time the matching proposal is
+    /// absorbed. Used to model a missed proposal-gossip delivery.
+    pub fn block_proposal_from(&mut self, sender: ValidatorId, receiver: ValidatorId) {
+        self.blocked_proposal_pairs.insert((sender, receiver));
     }
 
     /// Drop the next `n` envelopes addressed to `replica`. Decrements
@@ -487,6 +509,13 @@ impl CoordinatorSim {
             SimEvent::SkipCert { cert } => {
                 self.coordinators[env.to_idx].on_skip_cert_received(cert)
             }
+            SimEvent::BeaconProposalFetched {
+                epoch,
+                validator,
+                proposal,
+            } => {
+                self.coordinators[env.to_idx].on_beacon_proposal_fetched(epoch, validator, proposal)
+            }
         }
     }
 
@@ -522,6 +551,11 @@ impl CoordinatorSim {
                     witnesses, vrf_output, vrf_proof,
                 )));
                 for rcpt in &recipients {
+                    if self.blocked_proposal_pairs.remove(&(me, *rcpt)) {
+                        // Single-shot test filter: simulate a dropped
+                        // proposal-gossip delivery from `me` to `rcpt`.
+                        continue;
+                    }
                     let to_idx = self.idx_of(*rcpt);
                     self.network_q.push_back(Envelope {
                         to_idx,
@@ -900,6 +934,31 @@ impl CoordinatorSim {
                     result.map_err(|(_, e)| e),
                 );
                 self.absorb(emitter_idx, post);
+            }
+            Action::FetchBeaconProposal {
+                epoch,
+                validator,
+                peers,
+            } => {
+                // Walk the recipient peers, ask each in turn for the
+                // proposal via its `serve_beacon_proposal_request`
+                // method, and queue the first non-empty response back
+                // to the emitter. Empty if no peer has it.
+                let req = GetBeaconProposalRequest::new(epoch, validator);
+                let proposal = peers.iter().find_map(|peer| {
+                    let peer_idx = self.idx_of(*peer);
+                    self.coordinators[peer_idx]
+                        .serve_beacon_proposal_request(&req)
+                        .proposal
+                });
+                self.loopback_q.push_back(Envelope {
+                    to_idx: emitter_idx,
+                    event: SimEvent::BeaconProposalFetched {
+                        epoch,
+                        validator,
+                        proposal,
+                    },
+                });
             }
             Action::SetTimer { .. }
             | Action::CancelTimer { .. }

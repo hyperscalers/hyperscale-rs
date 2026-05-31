@@ -322,6 +322,7 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::VerifiedSkipRequestReceived { .. }
             | ProtocolEvent::SkipCertReceived { .. }
             | ProtocolEvent::ShardWitnessesReceived { .. }
+            | ProtocolEvent::BeaconProposalFetched { .. }
             | ProtocolEvent::BeaconBlockVerified { .. }
             | ProtocolEvent::SkipRequestVerified { .. }
             | ProtocolEvent::PcVote1Verified { .. }

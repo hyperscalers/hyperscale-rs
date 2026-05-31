@@ -183,6 +183,12 @@ where
             // into the state machine.
             unimplemented!("FetchShardWitnesses handler awaits runner-side event sender");
         }
+        Action::FetchBeaconProposal { .. } => {
+            // Same dependency as FetchShardWitnesses — the callback
+            // needs a runner-side beacon event sender to push
+            // BeaconProposalFetched back.
+            unimplemented!("FetchBeaconProposal handler awaits runner-side event sender");
+        }
         Action::VerifyBeaconBlock {
             block,
             signers,
