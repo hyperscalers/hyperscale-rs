@@ -10,6 +10,7 @@ hyperscale-network.workspace = true
 hyperscale-storage.workspace = true
 hyperscale-types.workspace = true
 blake3.workspace = true
+papaya.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true
 tracing.workspace = true
