@@ -663,8 +663,7 @@ where
             // Action handlers emit `ProtocolEvent`s; stamp each with the
             // dispatching vnode's shard so the receiver routes back to
             // the right `ShardLoop`. `Arc`-shaped so handlers can clone
-            // it into network-callback closures that outlive the action
-            // call (used by `FetchShardWitnesses`, `FetchBeaconProposal`).
+            // it into callback closures that outlive the action call.
             let notify: Arc<dyn Fn(ProtocolEvent) + Send + Sync> = Arc::new(move |event| {
                 push_protocol_event(&event_tx, shard, event);
             });
