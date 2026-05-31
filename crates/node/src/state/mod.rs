@@ -237,9 +237,15 @@ impl NodeStateMachine {
 
     /// Initialize the node with a genesis block.
     ///
-    /// Returns actions to be processed (e.g., initial timers).
+    /// Returns actions to be processed (e.g., initial timers). Drains
+    /// both the shard coordinator's genesis init and the beacon
+    /// coordinator's `on_startup`, the latter scheduling the first
+    /// `BeaconCommitteeStart` timer so the chain bootstraps from a
+    /// fresh runner.
     pub fn initialize_genesis(&mut self, genesis: &Block) -> Vec<Action> {
-        self.shard_coordinator.initialize_genesis(genesis)
+        let mut actions = self.shard_coordinator.initialize_genesis(genesis);
+        actions.extend(self.beacon_coordinator.on_startup());
+        actions
     }
 }
 

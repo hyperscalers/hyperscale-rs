@@ -23,7 +23,7 @@ use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::RecoveredState;
 use hyperscale_test_helpers::TestCommittee;
 use hyperscale_types::{
-    BEACON_SIGNER_COUNT, BeaconGenesisConfig, CertifiedBeaconBlock, GenesisPool, GenesisValidator,
+    BeaconChainConfig, BeaconGenesisConfig, CertifiedBeaconBlock, GenesisPool, GenesisValidator,
     MIN_STAKE_FLOOR, NetworkDefinition, Randomness, ShardGroupId, Stake, StakePoolId, ValidatorId,
     Verified, genesis_config_hash,
 };
@@ -125,7 +125,8 @@ fn test_beacon_coordinator(
         id: pool_id,
         total_stake: Stake::from_attos(n as u128 * MIN_STAKE_FLOOR.attos()),
     }];
-    let beacon_count = n.min(BEACON_SIGNER_COUNT);
+    let chain_config = BeaconChainConfig::default();
+    let beacon_count = n.min(chain_config.beacon_committee_size as usize);
     let initial_beacon_committee: Vec<_> = (0..beacon_count)
         .map(|i| committee.validator_id(i))
         .collect();
@@ -140,6 +141,7 @@ fn test_beacon_coordinator(
         (0..n).map(|i| committee.validator_id(i)).collect(),
     );
     let config = BeaconGenesisConfig {
+        chain_config: BeaconChainConfig::default(),
         initial_validators,
         initial_pools,
         initial_beacon_committee,

@@ -352,6 +352,12 @@ where
         &self.process.network
     }
 
+    /// Process-shared beacon storage handle.
+    #[must_use]
+    pub fn beacon_storage(&self) -> &Arc<dyn BeaconStorage> {
+        &self.process.beacon_storage
+    }
+
     /// Look up the latest emitted status for a transaction across every
     /// hosted shard.
     ///

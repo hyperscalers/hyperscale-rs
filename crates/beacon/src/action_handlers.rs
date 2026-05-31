@@ -21,8 +21,9 @@ use hyperscale_types::network::notification::{
 };
 use hyperscale_types::{
     BeaconProposal, CertifiedBeaconBlockVerifyContext, DOMAIN_SPC_NEW_COMMIT, DOMAIN_SPC_NEW_VIEW,
-    PcVote1, PcVote2, PcVote3, PcVoteVerifyContext, SkipVerifyContext, SpcEmptyViewMsg,
-    SpcVerifyContext, Verifiable, Verified, pc_context, spc_context, spc_relay_signing_message,
+    PcVote1, PcVote2, PcVote3, PcVoteVerifyContext, SkipRequest, SkipVerifyContext,
+    SpcEmptyViewMsg, SpcVerifyContext, Verifiable, Verified, pc_context, spc_context,
+    spc_relay_signing_message,
 };
 
 /// Dispatch a beacon-owned [`Action`] on the consensus pool. Panics on
@@ -179,7 +180,18 @@ where
                     Arc::unwrap_or_clone(block),
                 ))));
         }
-        Action::BroadcastSkipRequest { request } => {
+        Action::BroadcastSkipRequest {
+            epoch_to_skip,
+            anchor,
+        } => {
+            let verified = Verified::<SkipRequest>::sign_local(
+                ctx.signing_key,
+                me,
+                network,
+                anchor,
+                epoch_to_skip,
+            );
+            let request = Arc::new(verified);
             ctx.network
                 .broadcast_global(&SkipRequestGossip::new(Arc::new(Verifiable::from(
                     (*request).clone(),

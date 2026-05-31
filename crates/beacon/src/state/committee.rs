@@ -5,8 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use blake3::Hasher;
 use hyperscale_types::{
-    BEACON_SIGNER_COUNT, BeaconState, CommitteeTransition, SHUFFLE_INTERVAL_EPOCHS, ShardGroupId,
-    TransitionCause, ValidatorId, ValidatorStatus,
+    BeaconState, CommitteeTransition, SHUFFLE_INTERVAL_EPOCHS, ShardGroupId, TransitionCause,
+    ValidatorId, ValidatorStatus,
 };
 use rand::RngExt;
 
@@ -131,7 +131,8 @@ pub(super) fn resample_beacon_committee(
         .into_iter()
         .filter(|id| !excluded.contains(id))
         .collect();
-    state.committee = sample_committee(&eligible, state.randomness.as_bytes(), BEACON_SIGNER_COUNT);
+    let committee_size = state.chain_config.beacon_committee_size as usize;
+    state.committee = sample_committee(&eligible, state.randomness.as_bytes(), committee_size);
     CommitteeTransition {
         from: prior,
         to: state.committee.clone(),

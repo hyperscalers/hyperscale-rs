@@ -19,14 +19,15 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use hyperscale_core::{Action, FetchRequest, TimerId};
 use hyperscale_types::network::request::beacon::GetBeaconProposalRequest;
 use hyperscale_types::network::response::beacon::GetBeaconProposalResponse;
 use hyperscale_types::{
     BeaconBlock, BeaconCert, BeaconProposal, BeaconProposalVerifyContext, BeaconState,
-    Bls12381G1PublicKey, CertifiedBeaconBlock, CertifiedBeaconBlockVerifyError, EPOCH_DURATION,
-    Epoch, GenesisConfigHash, Hash, LeafIndex, LocalTimestamp, MAX_WITNESSES_PER_PROPOSER,
+    Bls12381G1PublicKey, CertifiedBeaconBlock, CertifiedBeaconBlockVerifyError, Epoch,
+    GenesisConfigHash, Hash, LeafIndex, LocalTimestamp, MAX_WITNESSES_PER_PROPOSER,
     NetworkDefinition, PcQc3, PcValueElement, PcVector, PcVote1, PcVote1VerifyError, PcVote2,
     PcVote2VerifyError, PcVote3, PcVote3VerifyError, PcVoteRound, SKIP_TIMEOUT, SPC_VIEW_TIMEOUT,
     ShardGroupId, ShardWitness, SkipEpochCert, SkipRequest, SkipRequestVerifyError, SpcCert,
@@ -216,6 +217,43 @@ impl BeaconCoordinator {
         self.now = now;
     }
 
+    /// Schedule the first `BeaconCommitteeStart` timer so the upcoming
+    /// epoch's SPC instance bootstraps. Subsequent epochs self-arm via
+    /// `adopt_block`'s direct `bootstrap_spc_for_next_epoch` +
+    /// `try_propose` call; this only covers the resume gap from a
+    /// freshly-constructed or just-loaded coordinator.
+    ///
+    /// Fires at the next epoch's wall-clock boundary
+    /// (`next_epoch × chain_config.epoch_duration`), or immediately if
+    /// `now` is already past it. Tests that want fast beacon kickoff
+    /// override `chain_config.epoch_duration_ms` in the genesis config.
+    #[must_use]
+    pub fn on_startup(&self) -> Vec<Action> {
+        vec![
+            Action::SetTimer {
+                id: TimerId::BeaconCommitteeStart,
+                duration: self.duration_until_next_epoch_boundary(),
+            },
+            Action::SetTimer {
+                id: TimerId::BeaconSkipTrigger,
+                duration: self
+                    .duration_until_next_epoch_boundary()
+                    .saturating_add(SKIP_TIMEOUT),
+            },
+        ]
+    }
+
+    /// Wall-clock duration from `now` to the upcoming epoch's boundary
+    /// (`next_epoch × chain_config.epoch_duration_ms`). Saturates to
+    /// zero if `now` is already past the boundary.
+    const fn duration_until_next_epoch_boundary(&self) -> Duration {
+        let next_epoch = self.state.current_epoch.next();
+        let boundary_ms = next_epoch
+            .inner()
+            .saturating_mul(self.state.chain_config.epoch_duration_ms);
+        Duration::from_millis(boundary_ms.saturating_sub(self.now.as_millis()))
+    }
+
     /// Whether the committee-start timer is due — i.e. wall-clock
     /// time has reached the upcoming epoch's wall-clock boundary.
     /// The runner combines this with its own "block not yet
@@ -234,6 +272,30 @@ impl BeaconCoordinator {
     #[must_use]
     pub fn skip_trigger_due(&self, expected_block_time: LocalTimestamp) -> bool {
         self.now.as_millis() >= expected_block_time.plus(SKIP_TIMEOUT).as_millis()
+    }
+
+    /// `TimerId::BeaconSkipTrigger` fired — the next epoch's expected
+    /// block hasn't committed within `SKIP_TIMEOUT` of its boundary.
+    /// If the local validator sits on the active pool, sign and
+    /// broadcast a [`SkipRequest`] for the next epoch at the current
+    /// tip; otherwise no-op.
+    ///
+    /// The action handler signs the request (the coordinator has no
+    /// key) and emits the loopback into `on_verified_skip_request_received`.
+    pub fn on_beacon_skip_timer(&self) -> Vec<Action> {
+        let local_on_active_pool = self
+            .state
+            .derive_active_pool()
+            .iter()
+            .any(|(id, _)| *id == self.me);
+        if !local_on_active_pool {
+            trace!("BeaconSkipTrigger fired but local validator not on active pool");
+            return Vec::new();
+        }
+        vec![Action::BroadcastSkipRequest {
+            epoch_to_skip: self.state.current_epoch.next(),
+            anchor: self.latest_block.block_hash(),
+        }]
     }
 
     /// A peer's round-1 PC vote arrived. Gate on instance/skip-quorum,
@@ -863,7 +925,8 @@ impl BeaconCoordinator {
         let equivocations = self.equivocations.drain_for_proposal();
         let cap = MAX_WITNESSES_PER_PROPOSER.saturating_sub(equivocations.len());
 
-        let epoch_end_wt = epoch_end_weighted_timestamp(epoch);
+        let epoch_end_wt =
+            epoch_end_weighted_timestamp(epoch, self.state.chain_config.epoch_duration_ms);
         let mut shard_witnesses = self
             .witness_fetcher
             .drain_for_proposal(epoch_end_wt, &self.state.consumed_through);
@@ -1394,6 +1457,15 @@ impl BeaconCoordinator {
             Action::TopologyChanged {
                 topology_snapshot: Arc::clone(&self.topology_snapshot),
             },
+            // Re-arm the skip-trigger timer against the new tip. Fires
+            // `SKIP_TIMEOUT` after the upcoming epoch's boundary if no
+            // commit lands by then.
+            Action::SetTimer {
+                id: TimerId::BeaconSkipTrigger,
+                duration: self
+                    .duration_until_next_epoch_boundary()
+                    .saturating_add(SKIP_TIMEOUT),
+            },
         ];
 
         if self.is_on_committee() {
@@ -1727,14 +1799,13 @@ impl BeaconCoordinator {
     }
 }
 
-/// Canonical end-of-epoch [`WeightedTimestamp`] derived from `epoch` and
-/// [`EPOCH_DURATION`]. Beacon blocks carry no explicit
-/// `weighted_timestamp` field; the value is `epoch.inner() ×
-/// EPOCH_DURATION` by construction (slot-epoch refactor item 5),
+/// Canonical end-of-epoch [`WeightedTimestamp`] derived from `epoch`
+/// and the chain's configured epoch duration. Beacon blocks carry no
+/// explicit `weighted_timestamp` field; the value is `epoch.inner() ×
+/// epoch_duration_ms` by construction (slot-epoch refactor item 5),
 /// matching how shards stamp their accumulators' eligibility windows.
-fn epoch_end_weighted_timestamp(epoch: Epoch) -> WeightedTimestamp {
-    let epoch_ms = u64::try_from(EPOCH_DURATION.as_millis()).unwrap_or(u64::MAX);
-    WeightedTimestamp::from_millis(epoch.inner().saturating_mul(epoch_ms))
+const fn epoch_end_weighted_timestamp(epoch: Epoch, epoch_duration_ms: u64) -> WeightedTimestamp {
+    WeightedTimestamp::from_millis(epoch.inner().saturating_mul(epoch_duration_ms))
 }
 
 // Flat accessors; their names and return types are the documentation.
@@ -1808,7 +1879,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use hyperscale_types::{
-        BeaconBlock, BeaconBlockHash, BeaconGenesisConfig, Bls12381G1PrivateKey,
+        BeaconBlock, BeaconBlockHash, BeaconChainConfig, BeaconGenesisConfig, Bls12381G1PrivateKey,
         Bls12381G1PublicKey, CertifiedBlockHeader, Epoch, GenesisConfigHash, GenesisPool,
         GenesisValidator, MIN_STAKE_FLOOR, NetworkDefinition, PcVector, Randomness, ShardGroupId,
         ShardWitness, SpcCert, SpcView, Stake, StakePoolId, ValidatorId, bls_keypair_from_seed,
@@ -1842,6 +1913,7 @@ mod tests {
             .collect();
         let members: Vec<ValidatorId> = (0u64..4).map(ValidatorId::new).collect();
         BeaconGenesisConfig {
+            chain_config: BeaconChainConfig::default(),
             initial_validators: validators,
             initial_pools: vec![GenesisPool {
                 id: pool_id,

@@ -8,13 +8,14 @@
 //! is not part of the consumer-facing type surface.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use blake3::Hasher;
 use sbor::prelude::*;
 
 use crate::{
-    Bls12381G1PublicKey, GenesisConfigHash, Hash, NetworkDefinition, Randomness, ShardGroupId,
-    Stake, StakePoolId, ValidatorId,
+    BEACON_SIGNER_COUNT, Bls12381G1PublicKey, EPOCH_DURATION, GenesisConfigHash, Hash,
+    NetworkDefinition, Randomness, SHARD_CAPACITY, ShardGroupId, Stake, StakePoolId, ValidatorId,
 };
 
 /// Domain tag for the genesis-config hash. Binds the digest to "beacon
@@ -22,6 +23,49 @@ use crate::{
 /// in the codebase, and so a future hash-input layout change forces a
 /// version bump rather than silently shifting chain identity.
 const DOMAIN_BEACON_GENESIS: &[u8] = b"HYPERSCALE_BEACON_GENESIS_v1";
+
+/// Sizing knobs for a beacon chain. Lives on [`BeaconGenesisConfig`]
+/// and is copied verbatim into `BeaconState.chain_config` at genesis,
+/// where every consensus-critical sizing decision reads it.
+///
+/// Stored as `u64` ms rather than [`Duration`] so the SBOR-canonical
+/// encoding stays stable across host platforms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, BasicSbor)]
+pub struct BeaconChainConfig {
+    /// Wall-clock milliseconds per epoch. Drives the
+    /// `BeaconCommitteeStart` timer and the skip-trigger window.
+    /// Stored as `u64` ms rather than [`Duration`] because the radix
+    /// SBOR derive in this workspace doesn't impl `Encode`/`Decode`
+    /// for `Duration`.
+    pub epoch_duration_ms: u64,
+    /// Number of shards.
+    pub num_shards: u32,
+    /// Max validators per shard committee.
+    pub shard_size: u32,
+    /// Beacon committee size cap. PC requires `>= 4`.
+    pub beacon_committee_size: u32,
+}
+
+impl BeaconChainConfig {
+    /// `epoch_duration_ms` typed as a [`Duration`].
+    #[must_use]
+    pub const fn epoch_duration(&self) -> Duration {
+        Duration::from_millis(self.epoch_duration_ms)
+    }
+}
+
+impl Default for BeaconChainConfig {
+    /// Defaults match the legacy compile-time constants: 5-minute
+    /// epochs, 2 shards, shard size 4, beacon committee 4.
+    fn default() -> Self {
+        Self {
+            epoch_duration_ms: u64::try_from(EPOCH_DURATION.as_millis()).unwrap_or(u64::MAX),
+            num_shards: 2,
+            shard_size: u32::try_from(SHARD_CAPACITY).unwrap_or(u32::MAX),
+            beacon_committee_size: u32::try_from(BEACON_SIGNER_COUNT).unwrap_or(u32::MAX),
+        }
+    }
+}
 
 /// One validator as supplied at genesis.
 ///
@@ -59,6 +103,10 @@ pub struct GenesisPool {
 /// identity to operator-supplied TOML; see [`genesis_config_hash`].
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct BeaconGenesisConfig {
+    /// Sizing knobs (`epoch_duration_ms`, `num_shards`, `shard_size`,
+    /// `beacon_committee_size`). Copied into `BeaconState.chain_config`
+    /// at genesis and read from there forever after.
+    pub chain_config: BeaconChainConfig,
     /// Initial validator set.
     pub initial_validators: Vec<GenesisValidator>,
     /// Initial stake pools. Each pool's validator set is derived from
@@ -132,6 +180,7 @@ mod tests {
             .collect();
         let members: Vec<ValidatorId> = (0u64..4).map(ValidatorId::new).collect();
         BeaconGenesisConfig {
+            chain_config: BeaconChainConfig::default(),
             initial_validators: validators,
             initial_pools: vec![GenesisPool {
                 id: pool_id,

@@ -27,11 +27,11 @@ use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconStorage, RecoveredState, ShardChainReader};
 use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage};
 use hyperscale_types::{
-    BEACON_SIGNER_COUNT, BeaconGenesisConfig, BlockHeight, Bls12381G1PrivateKey,
-    Bls12381G1PublicKey, CertifiedBeaconBlock, CertifiedBlock, GenesisPool, GenesisValidator,
-    LocalTimestamp, MIN_STAKE_FLOOR, NodeId, Randomness, ShardGroupId, Stake, StakePoolId,
-    TopologySnapshot, TransactionStatus, TxHash, ValidatorId, ValidatorInfo, ValidatorSet,
-    Verified, VotePower, bls_keypair_from_seed, genesis_config_hash, shard_for_node,
+    BeaconGenesisConfig, BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey,
+    CertifiedBeaconBlock, CertifiedBlock, GenesisPool, GenesisValidator, LocalTimestamp,
+    MIN_STAKE_FLOOR, NodeId, Randomness, ShardGroupId, Stake, StakePoolId, TopologySnapshot,
+    TransactionStatus, TxHash, ValidatorId, ValidatorInfo, ValidatorSet, Verified, VotePower,
+    bls_keypair_from_seed, genesis_config_hash, shard_for_node,
 };
 use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
@@ -213,7 +213,7 @@ impl SimulationRunner {
         // Beacon genesis: one config + derived (block, state) reused
         // across every host's per-vnode `BeaconCoordinator`. All
         // validators land in a single pool; the first
-        // `BEACON_SIGNER_COUNT` form the beacon committee.
+        // `chain_config.beacon_committee_size` form the beacon committee.
         let (beacon_genesis_block, beacon_genesis_state, beacon_config_hash, beacon_network) = {
             let network = NetworkDefinition::simulator();
             let pool_id = StakePoolId::new(0);
@@ -229,7 +229,9 @@ impl SimulationRunner {
                 id: pool_id,
                 total_stake: Stake::from_attos(n * MIN_STAKE_FLOOR.attos()),
             }];
-            let beacon_committee_size = (total_validators as usize).min(BEACON_SIGNER_COUNT) as u64;
+            let chain_config = network_config.beacon_chain_config.unwrap_or_default();
+            let beacon_committee_size =
+                u64::from(total_validators.min(chain_config.beacon_committee_size));
             let initial_beacon_committee: Vec<ValidatorId> =
                 (0..beacon_committee_size).map(ValidatorId::new).collect();
             let initial_shard_committees: BTreeMap<ShardGroupId, Vec<ValidatorId>> =
@@ -238,6 +240,7 @@ impl SimulationRunner {
                     .map(|(s, v)| (*s, v.clone()))
                     .collect();
             let config = BeaconGenesisConfig {
+                chain_config,
                 initial_validators,
                 initial_pools,
                 initial_beacon_committee,
@@ -431,6 +434,13 @@ impl SimulationRunner {
         let host = self.hosts.get(node as usize)?;
         let shard = host.hosted_shards().next()?;
         Some(&host.shard_io(shard).storage)
+    }
+
+    /// Process-shared beacon storage for a host. One handle per host,
+    /// shared across every vnode on that host.
+    #[must_use]
+    pub fn beacon_storage(&self, node: NodeIndex) -> Option<&Arc<dyn BeaconStorage>> {
+        self.hosts.get(node as usize).map(NodeHost::beacon_storage)
     }
 
     /// Get the last emitted transaction status for a node.

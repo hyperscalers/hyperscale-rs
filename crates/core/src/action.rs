@@ -6,16 +6,17 @@ use std::time::Duration;
 
 use hyperscale_dispatch::DispatchPool;
 use hyperscale_types::{
-    BeaconState, BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash,
-    BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PublicKey, CertificateRoot,
-    CertifiedBeaconBlock, CertifiedBlock, CertifiedBlockHeader, Epoch, ExecutionCertificate,
-    ExecutionVote, FinalizedWave, GlobalReceiptRoot, Hash, InFlightCount, LocalReceiptRoot, NodeId,
-    PcQc1, PcQc2, PcVector, PcVote1, PcVote2, PcVote3, ProposerTimestamp, ProvisionHash,
-    ProvisionTxRootsMap, Provisions, ProvisionsRoot, QuorumCertificate, ReadySignal, Round,
-    RoutableTransaction, ShardGroupId, SharedCertificates, SharedTransactions, SkipEpochCert,
-    SkipRequest, SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject, SpcView,
-    StateRoot, SubstateEntry, TopologySnapshot, TransactionRoot, TransactionStatus, TxHash,
-    TxOutcome, ValidatorId, Verifiable, Verified, VotePower, WaveId, WeightedTimestamp, Witness,
+    BeaconBlockHash, BeaconState, BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot,
+    BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PublicKey,
+    CertificateRoot, CertifiedBeaconBlock, CertifiedBlock, CertifiedBlockHeader, Epoch,
+    ExecutionCertificate, ExecutionVote, FinalizedWave, GlobalReceiptRoot, Hash, InFlightCount,
+    LocalReceiptRoot, NodeId, PcQc1, PcQc2, PcVector, PcVote1, PcVote2, PcVote3, ProposerTimestamp,
+    ProvisionHash, ProvisionTxRootsMap, Provisions, ProvisionsRoot, QuorumCertificate, ReadySignal,
+    Round, RoutableTransaction, ShardGroupId, SharedCertificates, SharedTransactions,
+    SkipEpochCert, SkipRequest, SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject,
+    SpcView, StateRoot, SubstateEntry, TopologySnapshot, TransactionRoot, TransactionStatus,
+    TxHash, TxOutcome, ValidatorId, Verifiable, Verified, VotePower, WaveId, WeightedTimestamp,
+    Witness,
 };
 
 use crate::{CommitSource, FetchAbandon, FetchRequest, ProtocolEvent, TimerId};
@@ -910,13 +911,21 @@ pub enum Action {
         block: Arc<Verified<CertifiedBeaconBlock>>,
     },
 
-    /// Broadcast a locally-signed [`SkipRequest`] globally. Quorum
-    /// aggregation happens off-chain inside `SkipTracker`. The FSM
-    /// produces the request via [`Verified::<SkipRequest>::sign_local`];
-    /// the marker rides through into the gossip wrapper.
+    /// Sign and broadcast a [`SkipRequest`] globally. The action
+    /// handler signs the request using the runner-held BLS key (the
+    /// coordinator has no signing material), broadcasts the result over
+    /// the global beacon-skip topic, and feeds a
+    /// [`ProtocolEvent::VerifiedSkipRequestReceived`] loopback so the
+    /// local `SkipTracker` accumulates its own contribution. Quorum
+    /// aggregation happens off-chain inside `SkipTracker`.
     BroadcastSkipRequest {
-        /// Request to broadcast.
-        request: Arc<Verified<SkipRequest>>,
+        /// Epoch the request asks the active pool to abandon. Must be
+        /// `current_epoch.next()` at the local tip — older or further
+        /// epochs are rejected by the verifier.
+        epoch_to_skip: Epoch,
+        /// Anchor block hash the request rides against (the latest
+        /// committed beacon block at the dispatching coordinator).
+        anchor: BeaconBlockHash,
     },
 
     /// Broadcast an assembled [`SkipEpochCert`] globally. Standalone

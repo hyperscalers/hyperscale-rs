@@ -28,7 +28,7 @@
 
 use std::time::Duration;
 
-use crate::{MAX_WITNESSES_PER_PROPOSER, Stake};
+use crate::Stake;
 
 // ─── Consensus timeouts ────────────────────────────────────────────────────
 
@@ -119,22 +119,6 @@ pub const UNBONDING_WINDOW_EPOCHS: u64 = 32;
 /// miss cadence under real workloads. Revisit once `MissedProposal`
 /// emission rates settle.
 pub const MISSED_PROPOSAL_JAIL_THRESHOLD: u32 = 16;
-
-// ─── Apply-slot caps ───────────────────────────────────────────────────────
-
-/// Aggregate cap on distinct witnesses `apply_epoch` folds into state in
-/// one slot.
-///
-/// Bounds the per-slot `consumed_witnesses` size and the dedup-set
-/// allocations against a byzantine majority that tries to inflate
-/// witness counts coordinated across proposers. The wire decoder
-/// already bounds each proposal at
-/// [`MAX_WITNESSES_PER_PROPOSER`], so a fully-packed committee already
-/// caps the aggregate at `BEACON_SIGNER_COUNT * MAX_WITNESSES_PER_PROPOSER`;
-/// this constant is the same product made explicit, sitting at the
-/// application layer rather than relying on the wire bound to stay
-/// authoritative through future committee-size changes.
-pub const MAX_WITNESSES_PER_SLOT: usize = BEACON_SIGNER_COUNT * MAX_WITNESSES_PER_PROPOSER;
 
 // ─── Economics ─────────────────────────────────────────────────────────────
 

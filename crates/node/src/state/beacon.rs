@@ -152,13 +152,7 @@ impl NodeStateMachine {
             ProtocolEvent::BeaconCommitteeStartTimer => {
                 self.beacon_coordinator.on_beacon_committee_start_timer()
             }
-            ProtocolEvent::BeaconSkipTimer => {
-                // The skip-trigger timer is a runner-side gate; the
-                // coordinator's skip-request emission flow runs through
-                // its sub-machine on every relevant input. No-op here
-                // until the runner side wires the trigger.
-                Vec::new()
-            }
+            ProtocolEvent::BeaconSkipTimer => self.beacon_coordinator.on_beacon_skip_timer(),
             ProtocolEvent::BeaconSpcViewTimer => self.beacon_coordinator.on_beacon_spc_view_timer(),
             ProtocolEvent::BeaconBlockPersisted { .. } => Vec::new(),
             _ => unreachable!("handle_beacon called with non-beacon ProtocolEvent"),

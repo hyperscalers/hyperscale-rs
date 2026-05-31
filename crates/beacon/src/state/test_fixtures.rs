@@ -9,11 +9,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_types::{
-    BeaconProposal, BeaconState, BlockHash, Bls12381G1PrivateKey, Bls12381G1PublicKey, BoundedVec,
-    Epoch, LeafIndex, MIN_STAKE_FLOOR, NetworkDefinition, PendingWithdrawal, Randomness,
-    ShardCommittee, ShardGroupId, ShardWitness, ShardWitnessPayload, ShardWitnessProof,
-    SlotEffects, Stake, StakePool, StakePoolId, ValidatorId, ValidatorRecord, ValidatorStatus,
-    VrfProof, Witness, bls_keypair_from_seed, vrf_output_from_proof, vrf_sign,
+    BeaconChainConfig, BeaconProposal, BeaconState, BlockHash, Bls12381G1PrivateKey,
+    Bls12381G1PublicKey, BoundedVec, Epoch, LeafIndex, MIN_STAKE_FLOOR, NetworkDefinition,
+    PendingWithdrawal, Randomness, ShardCommittee, ShardGroupId, ShardWitness, ShardWitnessPayload,
+    ShardWitnessProof, SlotEffects, Stake, StakePool, StakePoolId, ValidatorId, ValidatorRecord,
+    ValidatorStatus, VrfProof, Witness, bls_keypair_from_seed, vrf_output_from_proof, vrf_sign,
 };
 
 use crate::state::{ApplyEpochInput, apply_epoch};
@@ -67,6 +67,7 @@ pub fn validator_record(id: u64, pool: u32, status: ValidatorStatus) -> Validato
 
 pub fn empty_state() -> BeaconState {
     BeaconState {
+        chain_config: BeaconChainConfig::default(),
         current_epoch: Epoch::GENESIS,
         validators: BTreeMap::new(),
         pools: BTreeMap::new(),

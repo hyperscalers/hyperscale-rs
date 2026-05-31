@@ -33,18 +33,6 @@ use radix_transactions::builder::ManifestBuilder;
 fn multi_shard_config() -> NetworkConfig {
     NetworkConfig {
         num_shards: 2,
-        validators_per_shard: 3,
-        intra_shard_latency: Duration::from_millis(10),
-        cross_shard_latency: Duration::from_millis(50),
-        jitter_fraction: 0.1,
-        ..Default::default()
-    }
-}
-
-/// Create a single-shard network configuration.
-fn single_shard_config() -> NetworkConfig {
-    NetworkConfig {
-        num_shards: 1,
         validators_per_shard: 4,
         intra_shard_latency: Duration::from_millis(10),
         cross_shard_latency: Duration::from_millis(50),
@@ -77,7 +65,13 @@ const fn simulator_network() -> NetworkDefinition {
 /// Test that single-shard transactions work normally regardless of backpressure state.
 #[test]
 fn test_single_shard_unaffected_by_backpressure() {
-    let config = single_shard_config();
+    // 2-shard 6-validator config gives the beacon shuffle enough
+    // eligibility slack to survive past `SHUFFLE_INTERVAL_EPOCHS == 16`
+    // — the single-shard, 4-validator setup runs the beacon committee
+    // down to n=3 once the shuffle starts churning. The test logic
+    // (submit a single tx via validator 0, observe mempool state) is
+    // unchanged by the larger committee.
+    let config = multi_shard_config();
     let mut runner = SimulationRunner::new(&config, 12345);
 
     // Initialize genesis
@@ -341,7 +335,9 @@ fn test_provisions_pending_verification() {
 /// Test that completed transactions don't affect backpressure count.
 #[test]
 fn test_completed_tx_cleanup() {
-    let config = single_shard_config();
+    // See `test_single_shard_unaffected_by_backpressure` for why this
+    // uses `multi_shard_config` rather than `single_shard_config`.
+    let config = multi_shard_config();
     let mut runner = SimulationRunner::new(&config, 12351);
 
     // Initialize genesis

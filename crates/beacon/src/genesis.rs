@@ -15,9 +15,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_types::{
-    BEACON_SIGNER_COUNT, BeaconGenesisConfig, BeaconState, Epoch, MIN_STAKE_FLOOR, SHARD_CAPACITY,
-    ShardCommittee, ShardGroupId, Stake, StakePool, StakePoolId, ValidatorId, ValidatorRecord,
-    ValidatorStatus,
+    BeaconGenesisConfig, BeaconState, Epoch, MIN_STAKE_FLOOR, ShardCommittee, ShardGroupId, Stake,
+    StakePool, StakePoolId, ValidatorId, ValidatorRecord, ValidatorStatus,
 };
 
 // ─── builder ───────────────────────────────────────────────────────────────
@@ -113,6 +112,7 @@ pub fn build_genesis_beacon_state(config: &BeaconGenesisConfig) -> BeaconState {
     committee.sort();
 
     BeaconState {
+        chain_config: config.chain_config,
         current_epoch: Epoch::GENESIS,
         validators,
         pools,
@@ -182,20 +182,22 @@ fn validate_config(config: &BeaconGenesisConfig) -> BTreeMap<ValidatorId, ShardG
             "initial_beacon_committee references unknown validator {id}",
         );
     }
+    let beacon_committee_cap = config.chain_config.beacon_committee_size as usize;
     assert!(
-        config.initial_beacon_committee.len() <= BEACON_SIGNER_COUNT,
-        "initial_beacon_committee ({} members) exceeds BEACON_SIGNER_COUNT ({})",
+        config.initial_beacon_committee.len() <= beacon_committee_cap,
+        "initial_beacon_committee ({} members) exceeds chain_config.beacon_committee_size ({})",
         config.initial_beacon_committee.len(),
-        BEACON_SIGNER_COUNT,
+        beacon_committee_cap,
     );
 
     // Shard committee members exist, each shard fits, no validator
     // sits on two shards.
+    let shard_cap = config.chain_config.shard_size as usize;
     let mut placed: BTreeMap<ValidatorId, ShardGroupId> = BTreeMap::new();
     for (shard, members) in &config.initial_shard_committees {
         assert!(
-            members.len() <= SHARD_CAPACITY,
-            "initial shard committee {shard} has {} members; SHARD_CAPACITY is {SHARD_CAPACITY}",
+            members.len() <= shard_cap,
+            "initial shard committee {shard} has {} members; chain_config.shard_size is {shard_cap}",
             members.len(),
         );
         for id in members {
@@ -215,7 +217,8 @@ fn validate_config(config: &BeaconGenesisConfig) -> BTreeMap<ValidatorId, ShardG
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{
-        Bls12381G1PublicKey, GenesisPool, GenesisValidator, Randomness, bls_keypair_from_seed,
+        BeaconChainConfig, Bls12381G1PublicKey, GenesisPool, GenesisValidator, Randomness,
+        bls_keypair_from_seed,
     };
 
     use super::*;
@@ -248,6 +251,7 @@ mod tests {
         let beacon_members: Vec<ValidatorId> =
             (0..n_beacon_members).map(ValidatorId::new).collect();
         BeaconGenesisConfig {
+            chain_config: BeaconChainConfig::default(),
             initial_validators: validators,
             initial_pools: vec![GenesisPool {
                 id: pool_id,
@@ -325,6 +329,7 @@ mod tests {
             .collect();
         // Beacon committee supplied OUT of id order — builder sorts it.
         let cfg = BeaconGenesisConfig {
+            chain_config: BeaconChainConfig::default(),
             initial_validators: validators,
             initial_pools: vec![GenesisPool {
                 id: pool_id,
@@ -358,6 +363,7 @@ mod tests {
     fn rejects_duplicate_validator_id() {
         let pool_id = StakePoolId::new(0);
         let cfg = BeaconGenesisConfig {
+            chain_config: BeaconChainConfig::default(),
             initial_validators: vec![
                 GenesisValidator {
                     id: ValidatorId::new(2),
@@ -385,6 +391,7 @@ mod tests {
     #[should_panic(expected = "declares pool Pool(99) which is not in initial_pools")]
     fn rejects_validator_referencing_unknown_pool() {
         let cfg = BeaconGenesisConfig {
+            chain_config: BeaconChainConfig::default(),
             initial_validators: vec![GenesisValidator {
                 id: ValidatorId::new(0),
                 pool: StakePoolId::new(99),
@@ -406,6 +413,7 @@ mod tests {
     fn rejects_pool_with_insufficient_stake() {
         let pool_id = StakePoolId::new(0);
         let cfg = BeaconGenesisConfig {
+            chain_config: BeaconChainConfig::default(),
             initial_validators: (0u64..4)
                 .map(|i| GenesisValidator {
                     id: ValidatorId::new(i),
@@ -430,6 +438,7 @@ mod tests {
     fn rejects_validator_in_two_shard_committees() {
         let pool_id = StakePoolId::new(0);
         let cfg = BeaconGenesisConfig {
+            chain_config: BeaconChainConfig::default(),
             initial_validators: vec![GenesisValidator {
                 id: ValidatorId::new(0),
                 pool: pool_id,
@@ -452,11 +461,12 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "exceeds BEACON_SIGNER_COUNT")]
+    #[should_panic(expected = "exceeds chain_config.beacon_committee_size")]
     fn rejects_beacon_committee_over_signer_count() {
-        // BEACON_SIGNER_COUNT is 4 — pass 5 to overflow.
+        // Default beacon_committee_size is 4 — pass 5 to overflow.
         let pool_id = StakePoolId::new(0);
         let cfg = BeaconGenesisConfig {
+            chain_config: BeaconChainConfig::default(),
             initial_validators: (0u64..5)
                 .map(|i| GenesisValidator {
                     id: ValidatorId::new(i),

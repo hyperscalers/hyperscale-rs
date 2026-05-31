@@ -9,16 +9,16 @@ use std::sync::Arc;
 
 use hyperscale_types::test_utils::test_event_type_identifier;
 use hyperscale_types::{
-    ApplicationEvent, BeaconBlock, BeaconBlockHash, BeaconCert, BeaconState, BeaconWitnessCommit,
-    BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight,
-    Bls12381G2Signature, BoundedVec, CertificateRoot, CertifiedBeaconBlock, CertifiedBlock,
-    ConsensusReceipt, Epoch, EventData, ExecutionCertificate, ExecutionMetadata, ExecutionOutcome,
-    FeeSummary, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, InFlightCount,
-    LocalReceiptRoot, LogLevel, NodeId, PcQc2, PcQc3, PcSignerLengths, PcVector, PcXpProof,
-    ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Randomness, Round, ShardGroupId,
-    SignerBitfield, SpcCert, SpcView, StateRoot, StoredReceipt, TransactionRoot, TxHash, TxOutcome,
-    ValidatorId, Verified, WaveCertificate, WaveId, WeightedTimestamp, compute_global_receipt_root,
-    zero_bls_signature,
+    ApplicationEvent, BeaconBlock, BeaconBlockHash, BeaconCert, BeaconChainConfig, BeaconState,
+    BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader,
+    BlockHeight, Bls12381G2Signature, BoundedVec, CertificateRoot, CertifiedBeaconBlock,
+    CertifiedBlock, ConsensusReceipt, Epoch, EventData, ExecutionCertificate, ExecutionMetadata,
+    ExecutionOutcome, FeeSummary, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash,
+    InFlightCount, LocalReceiptRoot, LogLevel, NodeId, PcQc2, PcQc3, PcSignerLengths, PcVector,
+    PcXpProof, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Randomness, Round,
+    ShardGroupId, SignerBitfield, SpcCert, SpcView, StateRoot, StoredReceipt, TransactionRoot,
+    TxHash, TxOutcome, ValidatorId, Verified, WaveCertificate, WaveId, WeightedTimestamp,
+    compute_global_receipt_root, zero_bls_signature,
 };
 use indexmap::IndexMap;
 use radix_common::math::Decimal;
@@ -245,6 +245,7 @@ pub fn make_test_beacon_state(epoch: u64, tag: &[u8]) -> Arc<BeaconState> {
     let copy_len = tag.len().min(32);
     randomness[..copy_len].copy_from_slice(&tag[..copy_len]);
     Arc::new(BeaconState {
+        chain_config: BeaconChainConfig::default(),
         current_epoch: Epoch::new(epoch),
         validators: BTreeMap::new(),
         pools: BTreeMap::new(),

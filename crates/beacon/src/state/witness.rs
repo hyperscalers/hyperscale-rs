@@ -5,9 +5,9 @@ use std::collections::BTreeSet;
 
 use hyperscale_types::{
     BeaconProposal, BeaconState, Bls12381G1PublicKey, JAIL_COOLDOWN_EPOCHS, JailReason, LeafIndex,
-    MAX_WITNESSES_PER_SLOT, MISSED_PROPOSAL_JAIL_THRESHOLD, NetworkDefinition, PcVoteEquivocation,
-    PendingWithdrawal, ShardGroupId, ShardWitness, ShardWitnessPayload, Stake, StakePool,
-    ValidatorId, ValidatorRecord, ValidatorStatus, Witness, verify_vote_equivocation,
+    MISSED_PROPOSAL_JAIL_THRESHOLD, NetworkDefinition, PcVoteEquivocation, PendingWithdrawal,
+    ShardGroupId, ShardWitness, ShardWitnessPayload, Stake, StakePool, ValidatorId,
+    ValidatorRecord, ValidatorStatus, Witness, verify_vote_equivocation,
 };
 
 use crate::state::vrf::jail_validator;
@@ -55,17 +55,11 @@ pub(super) enum ShardEvent {
 /// re-application is idempotent once the validator is `Jailed {
 /// Equivocation }`.
 ///
-/// # Defense-in-depth caps
-///
-/// The wire decoder already bounds proposals at
+/// The wire decoder bounds each proposal at
 /// [`MAX_WITNESSES_PER_PROPOSER`](hyperscale_types::MAX_WITNESSES_PER_PROPOSER)
-/// via [`BeaconProposal`]'s `BoundedVec`. The epoch-level cap
-/// [`MAX_WITNESSES_PER_SLOT`] is the product
-/// `BEACON_SIGNER_COUNT × MAX_WITNESSES_PER_PROPOSER`, which the wire
-/// bounds already imply for a well-formed committee. The check here
-/// exists as defence in depth: if the committee size ever grows
-/// without the epoch cap being re-derived, the epoch cap bounds
-/// aggregate witness work regardless.
+/// via [`BeaconProposal`]'s `BoundedVec`, and the committee size caps
+/// proposers per slot. The aggregate is the product, with no
+/// additional runtime cap — the wire bound is the authoritative limit.
 pub(super) fn ingest_witnesses(
     state: &mut BeaconState,
     network: &NetworkDefinition,
@@ -80,11 +74,8 @@ pub(super) fn ingest_witnesses(
     let mut shard_seen: BTreeSet<(ShardGroupId, LeafIndex)> = BTreeSet::new();
     let mut shard_lifts: Vec<&ShardWitness> = Vec::new();
     let mut equivocations: Vec<&PcVoteEquivocation> = Vec::new();
-    'collect: for (_, prop) in accepted {
+    for (_, prop) in accepted {
         for w in prop.witnesses().iter() {
-            if shard_lifts.len() + equivocations.len() >= MAX_WITNESSES_PER_SLOT {
-                break 'collect;
-            }
             match w {
                 Witness::Shard(sw) => {
                     if !shard_seen.insert((sw.proof.shard_id, sw.proof.leaf_index)) {

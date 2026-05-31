@@ -21,8 +21,8 @@ use hyperscale_beacon::genesis::build_genesis_beacon_state;
 use hyperscale_core::{Action, FetchRequest};
 use hyperscale_types::network::request::beacon::GetBeaconProposalRequest;
 use hyperscale_types::{
-    BEACON_SIGNER_COUNT, BeaconCert, BeaconGenesisConfig, BeaconProposal, BeaconState,
-    Bls12381G1PrivateKey, Bls12381G1PublicKey, CertifiedBeaconBlock,
+    BEACON_SIGNER_COUNT, BeaconCert, BeaconChainConfig, BeaconGenesisConfig, BeaconProposal,
+    BeaconState, Bls12381G1PrivateKey, Bls12381G1PublicKey, CertifiedBeaconBlock,
     CertifiedBeaconBlockVerifyContext, Epoch, GenesisPool, GenesisValidator, MIN_STAKE_FLOOR,
     NetworkDefinition, PcValueElement, PcVector, PcVote1, PcVote2, PcVote3, PcVoteVerifyContext,
     Randomness, ShardGroupId, SkipEpochCert, SkipRequest, SkipVerifyContext, SpcEmptyViewMsg,
@@ -188,6 +188,7 @@ impl CoordinatorSim {
         let pool_id = StakePoolId::new(0);
         let shard = ShardGroupId::new(0);
         let config = BeaconGenesisConfig {
+            chain_config: BeaconChainConfig::default(),
             initial_validators: members
                 .iter()
                 .map(|(id, pk)| GenesisValidator {
@@ -744,7 +745,25 @@ impl CoordinatorSim {
                     });
                 }
             }
-            Action::BroadcastSkipRequest { request } => {
+            Action::BroadcastSkipRequest {
+                epoch_to_skip,
+                anchor,
+            } => {
+                let sk = &self.sks[emitter_idx];
+                let signer = self.members[emitter_idx].0;
+                let verified = Verified::<SkipRequest>::sign_local(
+                    sk,
+                    signer,
+                    &self.network,
+                    anchor,
+                    epoch_to_skip,
+                );
+                let request = Arc::new(verified);
+                // Local loopback: the FSM expects to see its own
+                // verified contribution to the skip pool.
+                let actions = self.coordinators[emitter_idx]
+                    .on_verified_skip_request_received(Arc::clone(&request));
+                self.absorb(emitter_idx, actions);
                 let wire = Arc::new(Verifiable::from((*request).clone()));
                 for to_idx in 0..self.coordinators.len() {
                     if to_idx == emitter_idx {

@@ -37,7 +37,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_network::{HandlerRegistry, RequestError, ResponseVerdict, compression};
-use hyperscale_types::{ShardGroupId, ValidatorId};
+use hyperscale_types::{BeaconChainConfig, ShardGroupId, ValidatorId};
 use rand::RngExt;
 use rand::seq::SliceRandom;
 use rand_chacha::ChaCha8Rng;
@@ -93,6 +93,12 @@ pub struct NetworkConfig {
     pub vnodes_per_host: u32,
     /// How validators are bundled into hosts. See [`HostingMode`].
     pub hosting_mode: HostingMode,
+    /// Override the beacon chain config (epoch duration, committee
+    /// sizes, etc.). `None` uses the defaults from
+    /// [`BeaconChainConfig::default`], which match the legacy
+    /// compile-time constants (5-minute epochs, committee 4). Tests
+    /// that want fast beacon kickoff override `epoch_duration_ms` here.
+    pub beacon_chain_config: Option<BeaconChainConfig>,
 }
 
 impl Default for NetworkConfig {
@@ -106,6 +112,7 @@ impl Default for NetworkConfig {
             packet_loss_rate: 0.0,
             vnodes_per_host: 1,
             hosting_mode: HostingMode::SameShardBundled,
+            beacon_chain_config: None,
         }
     }
 }
@@ -1162,7 +1169,7 @@ mod tests {
     #[test]
     fn test_shard_assignment() {
         let network = SimulatedNetwork::new(NetworkConfig {
-            validators_per_shard: 3,
+            validators_per_shard: 4,
             num_shards: 2,
             ..Default::default()
         });
@@ -1170,7 +1177,7 @@ mod tests {
         assert_eq!(network.shard_for_node(0), ShardGroupId::new(0));
         assert_eq!(network.shard_for_node(1), ShardGroupId::new(0));
         assert_eq!(network.shard_for_node(2), ShardGroupId::new(0));
-        assert_eq!(network.shard_for_node(3), ShardGroupId::new(1));
+        assert_eq!(network.shard_for_node(3), ShardGroupId::new(0));
         assert_eq!(network.shard_for_node(4), ShardGroupId::new(1));
         assert_eq!(network.shard_for_node(5), ShardGroupId::new(1));
     }

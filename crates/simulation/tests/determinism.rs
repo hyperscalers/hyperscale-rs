@@ -157,7 +157,7 @@ fn test_different_seeds_diverge() {
 fn test_multi_shard_simulation() {
     let config = NetworkConfig {
         num_shards: 2,
-        validators_per_shard: 3,
+        validators_per_shard: 4,
         intra_shard_latency: Duration::from_millis(100),
         cross_shard_latency: Duration::from_millis(100),
         jitter_fraction: 0.1,
@@ -166,13 +166,13 @@ fn test_multi_shard_simulation() {
 
     let mut runner = SimulationRunner::new(&config, 42);
 
-    // Should have 6 nodes (2 shards * 3 validators)
+    // Should have 8 nodes (2 shards * 4 validators)
     assert!(runner.node(0).is_some());
-    assert!(runner.node(5).is_some());
-    assert!(runner.node(6).is_none());
+    assert!(runner.node(7).is_some());
+    assert!(runner.node(8).is_none());
 
     // Schedule proposal timers for all nodes
-    for node in 0..6 {
+    for node in 0..8 {
         runner.schedule_initial_event(
             node,
             Duration::from_millis(100),
@@ -2061,6 +2061,7 @@ fn test_packet_loss_application() {
         packet_loss_rate: 0.10, // 10% packet loss
         vnodes_per_host: 1,
         hosting_mode: HostingMode::SameShardBundled,
+        beacon_chain_config: None,
     };
 
     let mut runner = SimulationRunner::new(&config, 42);
@@ -2125,6 +2126,7 @@ fn test_packet_loss_determinism() {
         packet_loss_rate: 0.2, // 20% packet loss for more variation
         vnodes_per_host: 1,
         hosting_mode: HostingMode::SameShardBundled,
+        beacon_chain_config: None,
     };
 
     let seed = 12345u64;

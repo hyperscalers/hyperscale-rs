@@ -48,7 +48,7 @@ use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconStorage, ShardChainReader};
 use hyperscale_storage_rocksdb::{RocksDbShardStorage, SharedStorage};
 use hyperscale_types::{
-    BEACON_SIGNER_COUNT, BeaconGenesisConfig, Block, BlockHeight, Bls12381G1PrivateKey,
+    BeaconChainConfig, BeaconGenesisConfig, Block, BlockHeight, Bls12381G1PrivateKey,
     CertifiedBeaconBlock, CertifiedBlock, GenesisPool, GenesisValidator, InFlightCount,
     LocalTimestamp, MAX_TX_IN_FLIGHT, MIN_STAKE_FLOOR, NodeId, Randomness, RoutableTransaction,
     ShardGroupId, Stake, StakePoolId, TopologySnapshot, TransactionStatus, TxHash, ValidatorId,
@@ -397,10 +397,11 @@ impl ProductionRunnerBuilder {
 
         // Beacon genesis: one config + derived (block, state) reused
         // across every per-vnode `BeaconCoordinator`. All validators
-        // land in a single pool; the first `BEACON_SIGNER_COUNT` form
-        // the beacon committee. Shard committees mirror the topology
-        // snapshot's view so the beacon-state placement agrees with
-        // tx-routing. Storage-loading on restart is a follow-up.
+        // land in a single pool; the first
+        // `chain_config.beacon_committee_size` form the beacon
+        // committee. Shard committees mirror the topology snapshot's
+        // view so the beacon-state placement agrees with tx-routing.
+        // Storage-loading on restart is a follow-up.
         let (beacon_genesis_block, beacon_genesis_state, beacon_config_hash, beacon_network) = {
             let network = NetworkDefinition::simulator();
             let pool_id = StakePoolId::new(0);
@@ -419,7 +420,10 @@ impl ProductionRunnerBuilder {
                 id: pool_id,
                 total_stake: Stake::from_attos(n * MIN_STAKE_FLOOR.attos()),
             }];
-            let beacon_committee_size = initial_validators.len().min(BEACON_SIGNER_COUNT);
+            let chain_config = BeaconChainConfig::default();
+            let beacon_committee_size = initial_validators
+                .len()
+                .min(chain_config.beacon_committee_size as usize);
             let initial_beacon_committee: Vec<ValidatorId> = initial_validators
                 .iter()
                 .take(beacon_committee_size)
@@ -433,6 +437,7 @@ impl ProductionRunnerBuilder {
                 .map(|s| (s, shared_topology.committee_for_shard(s).to_vec()))
                 .collect();
             let config = BeaconGenesisConfig {
+                chain_config,
                 initial_validators,
                 initial_pools,
                 initial_beacon_committee,

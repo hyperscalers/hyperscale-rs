@@ -31,7 +31,8 @@ use sbor::prelude::*;
 
 use crate::beacon::cert::BeaconCert;
 use crate::beacon::certified::CertifiedBeaconBlock;
-use crate::beacon::constants::{MIN_STAKE_FLOOR, POOL_BUFFER_TARGET, SHARD_CAPACITY};
+use crate::beacon::constants::{MIN_STAKE_FLOOR, POOL_BUFFER_TARGET};
+use crate::beacon::genesis::BeaconChainConfig;
 use crate::topology::snapshot::TopologySnapshot;
 use crate::topology::validator::{ValidatorInfo, ValidatorSet};
 use crate::{
@@ -197,6 +198,10 @@ pub struct ShardCommittee {
 /// the same `committed` argument.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct BeaconState {
+    /// Sizing knobs copied from `BeaconGenesisConfig.chain_config` at
+    /// genesis. Frozen for the chain's lifetime — every consensus path
+    /// reads from here instead of compile-time constants.
+    pub chain_config: BeaconChainConfig,
     /// Highest epoch whose block has been applied. Advances by 1 per
     /// successful `apply_epoch`.
     pub current_epoch: Epoch,
@@ -588,14 +593,15 @@ impl BeaconState {
     /// would be e/k." Gather every pool's offerings, sort descending,
     /// return the entry at position `target - 1`.
     ///
-    /// Target is `shard_count × SHARD_CAPACITY + POOL_BUFFER_TARGET`. The
-    /// shard count isn't a stored field — it's `shard_committees.len()`.
-    /// Returns [`Stake::MAX`] for a zero target; returns [`MIN_STAKE_FLOOR`]
-    /// when pools collectively can't fill the target even at floor pricing
-    /// (anything below the floor would be clamped away by `min_stake`'s
-    /// `.max(...)` anyway).
+    /// Target is `shard_count × chain_config.shard_size +
+    /// POOL_BUFFER_TARGET`. The shard count isn't a stored field — it's
+    /// `shard_committees.len()`. Returns [`Stake::MAX`] for a zero
+    /// target; returns [`MIN_STAKE_FLOOR`] when pools collectively
+    /// can't fill the target even at floor pricing (anything below the
+    /// floor would be clamped away by `min_stake`'s `.max(...)` anyway).
     fn admit_threshold(&self) -> Stake {
-        let target = self.shard_committees.len() * SHARD_CAPACITY + POOL_BUFFER_TARGET;
+        let target = self.shard_committees.len() * self.chain_config.shard_size as usize
+            + POOL_BUFFER_TARGET;
         if target == 0 {
             return Stake::MAX;
         }
@@ -656,6 +662,7 @@ mod tests {
 
     fn empty_state() -> BeaconState {
         BeaconState {
+            chain_config: BeaconChainConfig::default(),
             current_epoch: Epoch::GENESIS,
             validators: BTreeMap::new(),
             pools: BTreeMap::new(),

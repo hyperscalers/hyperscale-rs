@@ -28,6 +28,7 @@ fn test_v2_same_shard_hosting_makes_progress() {
         cross_shard_latency: Duration::from_millis(50),
         jitter_fraction: 0.1,
         packet_loss_rate: 0.0,
+        beacon_chain_config: None,
     };
 
     let mut runner = SimulationRunner::new(&config, 7);
