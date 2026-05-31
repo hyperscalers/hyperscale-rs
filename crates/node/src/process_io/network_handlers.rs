@@ -20,7 +20,7 @@ use hyperscale_types::network::notification::{
     ExecutionVotesNotification, ProvisionsNotification, ReadySignalNotification,
 };
 use hyperscale_types::network::request::beacon::{
-    GetBeaconProposalRequest, GetShardWitnessesRequest,
+    GetBeaconBlockRequest, GetBeaconProposalRequest, GetShardWitnessesRequest,
 };
 use hyperscale_types::network::request::{
     GetExecutionCertsRequest, GetFinalizedWavesRequest, GetLocalProvisionsRequest,
@@ -63,6 +63,7 @@ where
         use crate::shard_io::fetch::provision_serve::serve_provision_request;
         use crate::shard_io::fetch::shard_witness_serve::serve_shard_witnesses_request;
         use crate::shard_io::fetch::transaction_serve::serve_transaction_request;
+        use crate::shard_io::sync::beacon_block_serve::serve_beacon_block_request;
         use crate::shard_io::sync::block_serve::serve_block_request;
         use crate::shard_io::sync::remote_header_serve::serve_remote_headers_request;
 
@@ -340,6 +341,14 @@ where
                 .network
                 .register_request_handler::<GetBeaconProposalRequest>(shard, move |req| {
                     serve_beacon_proposal_request(&beacon_proposal_pool, &req)
+                });
+
+            // ── beacon.block.request → committed beacon block by epoch ──
+            let beacon_storage = Arc::clone(&self.process.beacon_storage);
+            self.process
+                .network
+                .register_request_handler::<GetBeaconBlockRequest>(shard, move |req| {
+                    serve_beacon_block_request(beacon_storage.as_ref(), &req)
                 });
         } // end for shard in hosted_shards
     }

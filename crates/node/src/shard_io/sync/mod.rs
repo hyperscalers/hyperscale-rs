@@ -53,6 +53,7 @@ use hyperscale_types::BlockHeight;
 use serde::Serialize;
 use tracing::{info, trace};
 
+pub mod beacon_block_serve;
 pub mod block;
 pub mod block_serve;
 pub mod host;
