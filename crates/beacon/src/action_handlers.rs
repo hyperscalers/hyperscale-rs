@@ -12,6 +12,9 @@ use std::sync::Arc;
 use hyperscale_core::{Action, ActionContext, ProtocolEvent};
 use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
+use hyperscale_types::network::gossip::beacon::{
+    BeaconBlockGossip, SkipCertGossip, SkipRequestGossip,
+};
 use hyperscale_types::network::notification::{
     BeaconProposalNotification, PcVote1Notification, PcVote2Notification, PcVote3Notification,
     SpcEmptyViewMsgNotification, SpcNewCommitNotification, SpcNewViewNotification,
@@ -21,7 +24,6 @@ use hyperscale_types::{
     PcVoteVerifyContext, SkipVerifyContext, SpcEmptyViewMsg, SpcVerifyContext, Verifiable,
     Verified, pc_context, spc_context,
 };
-use tracing::warn;
 
 /// Dispatch a beacon-owned [`Action`] on the consensus pool. Panics on
 /// non-beacon variants — the node's owner-keyed dispatch is the gate.
@@ -157,39 +159,29 @@ where
             });
         }
         Action::BroadcastBeaconBlock { block } => {
-            warn!(epoch = block.epoch().inner(), "BroadcastBeaconBlock");
+            ctx.network
+                .broadcast_global(&BeaconBlockGossip::new(Arc::new(Verifiable::from(
+                    Arc::unwrap_or_clone(block),
+                ))));
         }
-        Action::BroadcastSkipRequest {
-            request,
-            recipients: _,
-        } => {
-            warn!(
-                epoch_to_skip = request.epoch_to_skip().inner(),
-                signer = ?request.signer(),
-                "BroadcastSkipRequest",
-            );
+        Action::BroadcastSkipRequest { request } => {
+            ctx.network
+                .broadcast_global(&SkipRequestGossip::new(Arc::new(Verifiable::from(
+                    (*request).clone(),
+                ))));
+            ctx.notify_protocol(ProtocolEvent::VerifiedSkipRequestReceived { request });
         }
-        Action::BroadcastSkipCert {
-            cert,
-            recipients: _,
-        } => {
-            warn!(
-                epoch_to_skip = cert.epoch_to_skip().inner(),
-                signer_count = cert.signer_count(),
-                "BroadcastSkipCert",
-            );
+        Action::BroadcastSkipCert { cert } => {
+            ctx.network
+                .broadcast_global(&SkipCertGossip::new(Arc::new(Verifiable::from(
+                    (*cert).clone(),
+                ))));
         }
-        Action::FetchShardWitnesses {
-            shard_id,
-            committed_block_hash: _,
-            leaf_indices,
-            peers: _,
-        } => {
-            warn!(
-                shard = shard_id.inner(),
-                leaves = leaf_indices.len(),
-                "FetchShardWitnesses",
-            );
+        Action::FetchShardWitnesses { .. } => {
+            // Awaits a beacon event sender on the runner so the
+            // response callback can push ShardWitnessesReceived back
+            // into the state machine.
+            unimplemented!("FetchShardWitnesses handler awaits runner-side event sender");
         }
         Action::VerifyBeaconBlock {
             block,

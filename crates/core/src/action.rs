@@ -911,29 +911,24 @@ pub enum Action {
         block: Arc<Verified<CertifiedBeaconBlock>>,
     },
 
-    /// Broadcast a locally-signed [`SkipRequest`] to the active-duty
-    /// pool. Quorum aggregation happens off-chain inside
-    /// `SkipTracker`. The FSM produces the request via
-    /// [`Verified::<SkipRequest>::sign_local`]; the marker rides
-    /// through into the gossip wrapper.
+    /// Broadcast a locally-signed [`SkipRequest`] globally. Quorum
+    /// aggregation happens off-chain inside `SkipTracker`. The FSM
+    /// produces the request via [`Verified::<SkipRequest>::sign_local`];
+    /// the marker rides through into the gossip wrapper.
     BroadcastSkipRequest {
         /// Request to broadcast.
         request: Arc<Verified<SkipRequest>>,
-        /// Active-pool validators the request ships to.
-        recipients: Vec<ValidatorId>,
     },
 
-    /// Broadcast an assembled [`SkipEpochCert`] to the active-duty
-    /// pool. Standalone cert gossip helps late-joining or syncing
-    /// nodes that didn't observe the requests directly. The FSM
-    /// aggregates the cert from verified requests via
+    /// Broadcast an assembled [`SkipEpochCert`] globally. Standalone
+    /// cert gossip helps late-joining or syncing nodes that didn't
+    /// observe the requests directly. The FSM aggregates the cert from
+    /// verified requests via
     /// [`Verified::<SkipEpochCert>::from_verified_requests`]; the
     /// marker rides through.
     BroadcastSkipCert {
         /// Cert to broadcast.
         cert: Arc<Verified<SkipEpochCert>>,
-        /// Active-pool validators the cert ships to.
-        recipients: Vec<ValidatorId>,
     },
 
     /// Fetch a batch of shard witnesses by leaf index from a remote

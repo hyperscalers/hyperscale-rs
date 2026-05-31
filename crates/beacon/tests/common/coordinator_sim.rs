@@ -709,10 +709,7 @@ impl CoordinatorSim {
                     });
                 }
             }
-            Action::BroadcastSkipRequest {
-                request,
-                recipients: _,
-            } => {
+            Action::BroadcastSkipRequest { request } => {
                 let wire = Arc::new(Verifiable::from((*request).clone()));
                 for to_idx in 0..self.coordinators.len() {
                     if to_idx == emitter_idx {
@@ -726,10 +723,7 @@ impl CoordinatorSim {
                     });
                 }
             }
-            Action::BroadcastSkipCert {
-                cert,
-                recipients: _,
-            } => {
+            Action::BroadcastSkipCert { cert } => {
                 let wire = Arc::new(Verifiable::from((*cert).clone()));
                 for to_idx in 0..self.coordinators.len() {
                     if to_idx == emitter_idx {
