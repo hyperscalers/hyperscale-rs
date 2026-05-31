@@ -25,9 +25,7 @@ use hyperscale_types::network::request::beacon::{
 use hyperscale_types::network::request::{
     GetExecutionCertsRequest, GetFinalizedWavesRequest, GetLocalProvisionsRequest,
 };
-use hyperscale_types::network::response::{
-    GetLocalProvisionsResponse, GetProvisionResponse, LocalProvisionEntry,
-};
+use hyperscale_types::network::response::GetProvisionResponse;
 use hyperscale_types::{ExecutionCertificate, ShardGroupId, Verifiable, ready_signal_message};
 use tracing::warn;
 
@@ -61,6 +59,7 @@ where
         use crate::shard_io::fetch::beacon_proposal_serve::serve_beacon_proposal_request;
         use crate::shard_io::fetch::exec_cert_serve::serve_execution_certs_request;
         use crate::shard_io::fetch::finalized_wave_serve::serve_finalized_waves_request;
+        use crate::shard_io::fetch::local_provision_serve::serve_local_provisions_request;
         use crate::shard_io::fetch::provision_serve::serve_provision_request;
         use crate::shard_io::fetch::shard_witness_serve::serve_shard_witnesses_request;
         use crate::shard_io::fetch::transaction_serve::serve_transaction_request;
@@ -288,36 +287,9 @@ where
             let verified_headers = Arc::clone(&self.shard_io(shard).caches.verified_headers);
             self.process
                 .network
-                .register_request_handler::<GetLocalProvisionsRequest>(
-                    shard,
-                    move |req: GetLocalProvisionsRequest| {
-                        // Bundle the matching source header alongside each
-                        // returned blob so the requester can verify and admit
-                        // without first racing the remote-header pipeline.
-                        // Both lookups read the same maps the coordinator
-                        // writes through, so a present blob implies the
-                        // header was admitted at some point; `None` means
-                        // it's since been GC'd (retention sweep) and the
-                        // requester falls back to the buffered path.
-                        let mut entries = Vec::with_capacity(req.batch_hashes.len());
-                        for h in &req.batch_hashes {
-                            if let Some(provisions) = provision_store.get(*h) {
-                                // The buffer holds Verified handles; the wire
-                                // form takes raw `Arc<CertifiedBlockHeader>`,
-                                // so materialize the inner header for ship.
-                                let source_header = verified_headers
-                                    .get((provisions.source_shard(), provisions.block_height()))
-                                    .map(|v| Arc::new(v.as_ref().clone().into_inner()));
-                                entries.push(LocalProvisionEntry {
-                                    provisions,
-                                    source_header,
-                                });
-                            }
-                        }
-
-                        GetLocalProvisionsResponse::new(entries)
-                    },
-                );
+                .register_request_handler::<GetLocalProvisionsRequest>(shard, move |req| {
+                    serve_local_provisions_request(&provision_store, &verified_headers, &req)
+                });
 
             // ── finalized_wave.request → cache lookup + pending_chain fallback ─
 
