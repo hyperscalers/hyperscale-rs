@@ -107,7 +107,6 @@ pub struct BeaconCoordinator {
     /// Mixed into every signing helper's domain bytes; carried so
     /// per-epoch SPC instances and outbound canonical-bytes
     /// encoders don't re-thread it from the runner.
-    #[allow(dead_code)] // read by SPC bootstrap once handlers wire it in
     network: NetworkDefinition,
 
     /// Local wall-clock time. Drives the epoch-cadence timers; never

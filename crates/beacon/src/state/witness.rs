@@ -32,7 +32,6 @@ pub(super) struct WitnessOutcome {
 ///
 /// `StakeDeposit` and `StakeWithdraw` payloads mutate pool state but
 /// produce no validator-level event (caller sees `None`).
-#[allow(dead_code)] // not every variant is constructed by the apply_shard_payload arms in place
 pub(super) enum ShardEvent {
     Registered(ValidatorId),
     Deactivated(ValidatorId),
