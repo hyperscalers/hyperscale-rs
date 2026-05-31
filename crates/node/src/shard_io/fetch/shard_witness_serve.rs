@@ -10,6 +10,7 @@
 
 use std::sync::Arc;
 
+use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_storage::{PendingChain, ShardStorage};
 use hyperscale_types::network::request::beacon::GetShardWitnessesRequest;
 use hyperscale_types::network::response::beacon::GetShardWitnessesResponse;
@@ -52,12 +53,21 @@ pub fn serve_shard_witnesses_request<S: ShardStorage>(
     pending_chain: &PendingChain<S>,
     req: &GetShardWitnessesRequest,
 ) -> GetShardWitnessesResponse {
+    let witnesses = build_witnesses(pending_chain, req);
+    record_fetch_response_sent("shard_witness", witnesses.len());
+    GetShardWitnessesResponse::new(witnesses)
+}
+
+fn build_witnesses<S: ShardStorage>(
+    pending_chain: &PendingChain<S>,
+    req: &GetShardWitnessesRequest,
+) -> Vec<Arc<ShardWitness>> {
     let Some(certified_header) = pending_chain.certified_header(req.block_height) else {
         debug!(
             block_height = req.block_height.inner(),
             "Shard-witness request: block not found"
         );
-        return GetShardWitnessesResponse::empty();
+        return Vec::new();
     };
     let header = certified_header.header();
     if header.hash() != req.committed_block_hash {
@@ -67,12 +77,12 @@ pub fn serve_shard_witnesses_request<S: ShardStorage>(
             local = ?header.hash(),
             "Shard-witness request: anchor hash mismatch (fork divergence)"
         );
-        return GetShardWitnessesResponse::empty();
+        return Vec::new();
     }
 
     let leaf_count_at_block_end = header.beacon_witness_leaf_count();
     if leaf_count_at_block_end.inner() == 0 {
-        return GetShardWitnessesResponse::empty();
+        return Vec::new();
     }
 
     let payloads = pending_chain.get_beacon_witness_payloads(leaf_count_at_block_end);
@@ -82,7 +92,7 @@ pub fn serve_shard_witnesses_request<S: ShardStorage>(
             expected = leaf_count_at_block_end.inner(),
             "Shard-witness request: leaves pruned past retention horizon"
         );
-        return GetShardWitnessesResponse::empty();
+        return Vec::new();
     }
     let leaf_hashes: Vec<_> = payloads
         .iter()
@@ -111,7 +121,7 @@ pub fn serve_shard_witnesses_request<S: ShardStorage>(
         witnesses.push(Arc::new(ShardWitness { payload, proof }));
     }
 
-    GetShardWitnessesResponse::new(witnesses)
+    witnesses
 }
 
 #[cfg(test)]

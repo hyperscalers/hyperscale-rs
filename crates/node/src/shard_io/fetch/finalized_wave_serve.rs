@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_storage::{PendingChain, ShardStorage};
 use hyperscale_types::network::request::GetFinalizedWavesRequest;
 use hyperscale_types::network::response::GetFinalizedWavesResponse;
@@ -46,5 +47,6 @@ pub fn serve_finalized_waves_request<S: ShardStorage>(
         }
     }
 
+    record_fetch_response_sent("finalized_wave", waves.len());
     GetFinalizedWavesResponse::new(waves)
 }

@@ -265,9 +265,6 @@ where
 
                         let response =
                             serve_provision_request(&pending_chain, shard, num_shards, &req);
-                        if let Some(p) = &response.provisions {
-                            record_fetch_response_sent("provision", p.transactions().len());
-                        }
 
                         if response.provisions.is_some() {
                             let mut g = dedup.lock().unwrap();
