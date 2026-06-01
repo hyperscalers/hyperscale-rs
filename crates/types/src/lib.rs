@@ -33,11 +33,12 @@ mod wave;
 
 pub use beacon::{
     BEACON_SIGNER_COUNT, BeaconBlock, BeaconCert, BeaconChainConfig, BeaconGenesisConfig,
-    BeaconProposal, BeaconProposalVerifyContext, BeaconProposalVerifyError, BeaconState,
-    BeaconWitnessEvent, CertifiedBeaconBlock, CertifiedBeaconBlockPairingError,
-    CertifiedBeaconBlockVerifyContext, CertifiedBeaconBlockVerifyError, CommitteeTransition,
-    EMISSIONS_PER_EPOCH, EPOCHS_PER_YEAR, GenesisPool, GenesisValidator, JAIL_COOLDOWN_EPOCHS,
-    JailReason, MAX_BEACON_WITNESS_EVENTS_PER_TX, MAX_EQUIVOCATIONS_PER_PROPOSER, MAX_PREFIX_SIGS,
+    BeaconProposal, BeaconProposalVerifyContext, BeaconProposalVerifyError,
+    BeaconProposalWitnessMismatch, BeaconState, BeaconWitnessEvent, CertifiedBeaconBlock,
+    CertifiedBeaconBlockPairingError, CertifiedBeaconBlockVerifyContext,
+    CertifiedBeaconBlockVerifyError, CommitteeTransition, EMISSIONS_PER_EPOCH, EPOCHS_PER_YEAR,
+    GenesisPool, GenesisValidator, JAIL_COOLDOWN_EPOCHS, JailReason,
+    MAX_BEACON_WITNESS_EVENTS_PER_TX, MAX_EQUIVOCATIONS_PER_PROPOSER, MAX_PREFIX_SIGS,
     MAX_READY_SIGNALS_PER_BLOCK, MAX_READY_WINDOW_BLOCKS, MAX_SHARD_WITNESSES_PER_PROPOSER,
     MAX_VOTE_VECTOR_LEN, MAX_WITNESS_PROOF_DEPTH, MAX_WITNESSES_PER_FETCH, MIN_STAKE_FLOOR,
     MISSED_PROPOSAL_JAIL_THRESHOLD, PC_VALUE_ELEMENT_BYTES, POOL_BUFFER_TARGET, PcCompactVote,

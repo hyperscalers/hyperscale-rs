@@ -75,7 +75,10 @@ pub use pc::{
     verify_vote2, verify_vote3,
 };
 pub use prefix_ops::{mce, mcp, qc1_certify};
-pub use proposal::{BeaconProposal, BeaconProposalVerifyContext, BeaconProposalVerifyError};
+pub use proposal::{
+    BeaconProposal, BeaconProposalVerifyContext, BeaconProposalVerifyError,
+    BeaconProposalWitnessMismatch,
+};
 pub use ready_signal::ReadySignal;
 pub use skip::{
     SkipEpochCert, SkipEpochCertVerifyError, SkipRequest, SkipRequestVerifyError,

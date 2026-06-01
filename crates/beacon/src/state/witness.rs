@@ -4,10 +4,10 @@
 use std::collections::BTreeSet;
 
 use hyperscale_types::{
-    BeaconProposal, BeaconState, Bls12381G1PublicKey, JAIL_COOLDOWN_EPOCHS, JailReason, LeafIndex,
+    BeaconProposal, BeaconState, JAIL_COOLDOWN_EPOCHS, JailReason, LeafIndex,
     MISSED_PROPOSAL_JAIL_THRESHOLD, NetworkDefinition, PcVoteEquivocation, PendingWithdrawal,
     ShardGroupId, ShardWitness, ShardWitnessPayload, Stake, StakePool, ValidatorId,
-    ValidatorRecord, ValidatorStatus, verify_vote_equivocation,
+    ValidatorRecord, ValidatorStatus, Verifiable, verify_vote_equivocation,
 };
 
 use crate::state::vrf::jail_validator;
@@ -73,7 +73,7 @@ pub(super) fn ingest_witnesses(
     // gate ("not already permanently jailed") provides the idempotence.
     let mut shard_seen: BTreeSet<(ShardGroupId, LeafIndex)> = BTreeSet::new();
     let mut shard_lifts: Vec<&ShardWitness> = Vec::new();
-    let mut equivocations: Vec<&PcVoteEquivocation> = Vec::new();
+    let mut equivocations: Vec<&Verifiable<PcVoteEquivocation>> = Vec::new();
     for (_, prop) in accepted {
         for sw in prop.shard_witnesses().iter() {
             let sw = sw.as_unverified();
@@ -83,7 +83,7 @@ pub(super) fn ingest_witnesses(
             shard_lifts.push(sw);
         }
         for ev in prop.equivocations().iter() {
-            equivocations.push(ev.as_unverified());
+            equivocations.push(ev);
         }
     }
 
@@ -118,29 +118,25 @@ pub(super) fn ingest_witnesses(
     }
 
     if !equivocations.is_empty() {
-        // Committed equivocation evidence is threshold-vouched: honest
-        // nodes only vote for a proposal whose embedded witnesses they've
-        // verified, so a 2f+1 commit implies ≥ f+1 honest verifiers
-        // behind every entry. This debug-only sweep re-checks the sigs to
-        // catch a vote-gate regression in CI.
-        debug_assert!(
-            {
-                let lookup: Vec<(ValidatorId, Bls12381G1PublicKey)> = state
-                    .validators
-                    .iter()
-                    .map(|(id, rec)| (*id, rec.pubkey))
-                    .collect();
-                equivocations
-                    .iter()
-                    .all(|ev| verify_vote_equivocation(ev, network, &lookup).is_ok())
-            },
-            "apply_witnesses called with unverified equivocation evidence",
-        );
-        for evidence in equivocations {
+        // Committed equivocation evidence is threshold-vouched: an honest
+        // node only votes for a proposal whose witnesses it verified, so a
+        // 2f+1 commit implies ≥ f+1 honest verifiers behind every entry.
+        // Trust a carried `Verified` marker (upgraded at the admission
+        // gate); re-verify against the registry when it's absent — the
+        // gossip path decodes witnesses `Unverified` — so apply stays
+        // fail-closed in release, not just under a debug assert.
+        for ev in equivocations {
+            let evidence = ev.as_unverified();
             let validator_id = evidence.validator;
             let Some(rec) = state.validators.get(&validator_id) else {
                 continue;
             };
+            if ev.verified().is_none()
+                && verify_vote_equivocation(evidence, network, &[(validator_id, rec.pubkey)])
+                    .is_err()
+            {
+                continue;
+            }
             // Equivocation supersedes every status except an existing
             // permanent equivocation jail. The race-exit defence covers
             // `InsufficientStake` (operator tried to escape via

@@ -841,7 +841,8 @@ impl BeaconCoordinator {
         }
         // Witness-admission gate. A peer's proposal only enters the pool —
         // and so only feeds this vnode's PC vote — once every embedded
-        // witness positively verifies against locally-available state.
+        // witness positively verifies against locally-available state; the
+        // pooled copy carries the upgraded `Verified` markers downstream.
         // Because SPC commits a value only on a 2f+1 quorum, gating the
         // vote means ≥ f+1 honest verifiers stand behind every committed
         // proposal, so an unverifiable witness can never reach the
@@ -851,7 +852,9 @@ impl BeaconCoordinator {
         // per-epoch dedup bounds the work to one evaluation per sender so
         // a peer flooding distinct forged proposals can't force unbounded
         // verification.
-        if from != self.me {
+        let proposal = if from == self.me {
+            proposal
+        } else {
             if epoch != self.proposal_pool.epoch() {
                 trace!(
                     ?from,
@@ -864,15 +867,16 @@ impl BeaconCoordinator {
             if !self.evaluated_proposers.insert(from) {
                 return Vec::new();
             }
-            if !self.proposal_witnesses_verified(&proposal) {
+            let Some(upgraded) = self.upgrade_proposal_witnesses(&proposal) else {
                 trace!(
                     ?from,
                     epoch = epoch.inner(),
                     "BeaconProposalReceived carries an unverifiable witness — dropping",
                 );
                 return Vec::new();
-            }
-        }
+            };
+            Arc::new(upgraded)
+        };
         if !self.proposal_pool.admit(from, epoch, proposal) {
             trace!(
                 ?from,
@@ -888,9 +892,10 @@ impl BeaconCoordinator {
         Vec::new()
     }
 
-    /// Whether every observation embedded in `proposal` positively
-    /// verifies against locally-available state. Each list runs its own
-    /// element type's `Verify` predicate:
+    /// Verify every observation embedded in `proposal` against
+    /// locally-available state and return the proposal with each
+    /// `Verifiable` marker upgraded in place, or `None` if any is
+    /// unverifiable. Each list runs its own element type's `Verify`:
     /// - equivocation evidence — both BLS sigs verify under the named
     ///   validator's pubkey (from `state.validators`); evidence naming an
     ///   unknown validator is unverifiable.
@@ -902,24 +907,36 @@ impl BeaconCoordinator {
     /// merkle path can't be made to verify, a forged sig can't pass), so
     /// an honest node never votes for it. A genuine-but-unsynced shard
     /// witness merely abstains until the header lands — the proposer
-    /// re-includes the still-unconsumed witness next epoch.
-    fn proposal_witnesses_verified(&self, proposal: &BeaconProposal) -> bool {
-        let equivocations_ok = proposal.equivocations().iter().all(|ev| {
-            self.state.validators.get(&ev.validator).is_some_and(|rec| {
-                ev.as_unverified()
-                    .verify(&PcVoteEquivocationContext {
-                        network: &self.network,
-                        committee: &[(ev.validator, rec.pubkey)],
-                    })
-                    .is_ok()
+    /// re-includes the still-unconsumed witness next epoch. The upgraded
+    /// markers ride the pooled proposal through to `apply_epoch`.
+    fn upgrade_proposal_witnesses(
+        &self,
+        proposal: &Verified<BeaconProposal>,
+    ) -> Option<Verified<BeaconProposal>> {
+        let mut shard_witnesses = Vec::with_capacity(proposal.shard_witnesses().len());
+        for sw in proposal.shard_witnesses().iter() {
+            let header = self
+                .witness_fetcher
+                .find_header_by_block_hash(sw.proof.shard_id, sw.proof.committed_block_hash)?;
+            let mut sw = sw.clone();
+            sw.upgrade_in_place(header.as_ref()).ok()?;
+            shard_witnesses.push(sw);
+        }
+        let mut equivocations = Vec::with_capacity(proposal.equivocations().len());
+        for ev in proposal.equivocations().iter() {
+            let rec = self.state.validators.get(&ev.validator)?;
+            let mut ev = ev.clone();
+            ev.upgrade_in_place(&PcVoteEquivocationContext {
+                network: &self.network,
+                committee: &[(ev.validator, rec.pubkey)],
             })
-        });
-        let shard_ok = proposal.shard_witnesses().iter().all(|sw| {
-            self.witness_fetcher
-                .find_header_by_block_hash(sw.proof.shard_id, sw.proof.committed_block_hash)
-                .is_some_and(|header| sw.as_unverified().verify(header.as_ref()).is_ok())
-        });
-        equivocations_ok && shard_ok
+            .ok()?;
+            equivocations.push(ev);
+        }
+        proposal
+            .clone()
+            .with_verified_witnesses(shard_witnesses.into(), equivocations.into())
+            .ok()
     }
 
     /// Whether the current SPC instance is ready to receive its

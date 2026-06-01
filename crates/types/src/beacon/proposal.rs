@@ -167,6 +167,14 @@ pub enum BeaconProposalVerifyError {
     BadVrfReveal,
 }
 
+/// The witness lists handed to
+/// [`Verified::<BeaconProposal>::with_verified_witnesses`] aren't
+/// content-identical to the proposal's own — a marker rebind must not
+/// substitute witnesses.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+#[error("witness rebind content mismatch")]
+pub struct BeaconProposalWitnessMismatch;
+
 impl Verify<&BeaconProposalVerifyContext<'_>> for BeaconProposal {
     type Error = BeaconProposalVerifyError;
 
@@ -216,6 +224,35 @@ impl Verified<BeaconProposal> {
             vrf_output,
             vrf_proof,
         ))
+    }
+
+    /// Rebind the proposal's witness lists to their marker-upgraded
+    /// forms. The supplied lists must be content-identical to the
+    /// proposal's own (`Verifiable` compares by raw `T`, so only the
+    /// verification markers may differ); the VRF predicate already
+    /// established on `self` covers `(network, epoch)` only and is
+    /// unaffected, so the rebind is sound by construction.
+    ///
+    /// Mirrors [`Verified::<BlockHeader>::with_verified_parent_qc`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BeaconProposalWitnessMismatch`] if either supplied list
+    /// isn't content-identical to the proposal's own — a rebind must
+    /// upgrade markers, never substitute witnesses.
+    pub fn with_verified_witnesses(
+        self,
+        shard_witnesses: BoundedVec<Verifiable<ShardWitness>, MAX_SHARD_WITNESSES_PER_PROPOSER>,
+        equivocations: BoundedVec<Verifiable<PcVoteEquivocation>, MAX_EQUIVOCATIONS_PER_PROPOSER>,
+    ) -> Result<Self, BeaconProposalWitnessMismatch> {
+        if self.shard_witnesses() != &shard_witnesses || self.equivocations() != &equivocations {
+            return Err(BeaconProposalWitnessMismatch);
+        }
+        Ok(Self::new_unchecked(BeaconProposal {
+            shard_witnesses,
+            equivocations,
+            ..self.into_inner()
+        }))
     }
 }
 
@@ -311,6 +348,28 @@ mod tests {
         assert!(p.equivocations().is_empty());
         assert_eq!(p.vrf_output(), VrfOutput::new([0xAB; 32]));
         assert_eq!(p.vrf_proof(), VrfProof::new([0xCD; 96]));
+    }
+
+    #[test]
+    fn with_verified_witnesses_rebinds_equal_content_and_rejects_substitution() {
+        let verified = Verified::new_unchecked_for_test(sample_proposal());
+        // Content-equal lists (markers may differ) rebind cleanly.
+        let same_shard = verified.shard_witnesses().clone();
+        let same_equiv = verified.equivocations().clone();
+        assert!(
+            verified
+                .clone()
+                .with_verified_witnesses(same_shard, same_equiv)
+                .is_ok()
+        );
+        // Substituting a different witness is rejected — a rebind must
+        // upgrade markers, never swap content.
+        let substituted: BoundedVec<_, MAX_SHARD_WITNESSES_PER_PROPOSER> =
+            vec![Verifiable::from(sample_witness(99))].into();
+        assert_eq!(
+            verified.with_verified_witnesses(substituted, BoundedVec::new()),
+            Err(BeaconProposalWitnessMismatch),
+        );
     }
 
     #[test]
