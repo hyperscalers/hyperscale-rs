@@ -626,6 +626,16 @@ pub enum ProtocolEvent {
         height: BlockHeight,
     },
 
+    /// A synced beacon block is ready to apply. The runner's beacon
+    /// `Sync` machine fetched it from a peer; `BeaconCoordinator` runs it
+    /// through the same cert verification + adoption path as a gossiped
+    /// block. Serial delivery guarantees `block.epoch() == tip + 1`.
+    BeaconBlockSyncReadyToApply {
+        /// The fetched block, wrapped `Unverified` — the coordinator
+        /// dispatches cert verification before adopting.
+        block: Arc<Verifiable<CertifiedBeaconBlock>>,
+    },
+
     /// The `io_loop`'s [`RemoteHeaderSync`] state machine caught
     /// `source_shard`'s certified header chain up to `height`.
     /// `RemoteHeaderCoordinator` uses this to clear any "syncing" flag for

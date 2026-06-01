@@ -766,6 +766,18 @@ pub enum Action {
         target: BlockHeight,
     },
 
+    /// Request the runner to start (or raise the target of) beacon-chain
+    /// gap-fill sync.
+    ///
+    /// Emitted by `BeaconCoordinator` when it observes a committed beacon
+    /// block more than one epoch ahead of its tip. The runner's beacon
+    /// `Sync` machine fetches the missing blocks epoch by epoch and feeds
+    /// each back as `ProtocolEvent::BeaconBlockSyncReadyToApply`.
+    StartBeaconBlockSync {
+        /// The epoch we need to sync the beacon chain up to.
+        target: Epoch,
+    },
+
     /// Request the runner to start (or raise the target of) remote-header
     /// sync for `source_shard`. The runner's `RemoteHeaderSync`
     /// emits range fetches and feeds verified headers back to

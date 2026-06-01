@@ -29,6 +29,7 @@ use crate::shard_io::fetch::binding::{
     BeaconProposalBinding, ExecCertBinding, FinalizedWaveBinding, LocalProvisionBinding,
     ProvisionBinding, ShardWitnessBinding, TransactionBinding,
 };
+use crate::shard_io::sync::beacon_block::BeaconBlockSyncInput;
 use crate::shard_io::sync::block::BlockSyncInput;
 
 impl<S, N, D> ShardLoop<S, N, D>
@@ -104,6 +105,9 @@ where
             Action::StartBlockSync { target } => {
                 self.process_start_block_sync(target);
             }
+            Action::StartBeaconBlockSync { target } => {
+                self.process_start_beacon_block_sync(target);
+            }
             Action::StartRemoteHeaderSync {
                 source_shard,
                 target,
@@ -135,6 +139,19 @@ where
                 self.process
                     .beacon_storage
                     .commit_beacon_block(&block_for_storage, &state);
+                // Advance the beacon sync FSM's committed watermark on
+                // every commit (gossip or sync) so a later
+                // StartBeaconBlockSync fetches from current+1, and so
+                // serial sync unblocks the next epoch's fetch.
+                let outputs = self
+                    .io
+                    .syncs
+                    .beacon_block
+                    .handle(BeaconBlockSyncInput::Admitted {
+                        scope: (),
+                        height: BlockHeight::new(epoch.inner()),
+                    });
+                self.process_beacon_block_sync_outputs(outputs);
                 push_protocol_event(
                     self.process.shard_sender(self.shard),
                     self.shard,

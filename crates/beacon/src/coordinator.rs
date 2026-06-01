@@ -35,7 +35,6 @@ use hyperscale_types::{
 };
 use tracing::{trace, warn};
 
-use crate::block_sync::BeaconBlockSyncManager;
 use crate::equivocations::EquivocationObservations;
 use crate::pending_blocks::PendingBeaconBlocks;
 use crate::proposal_pool::BeaconProposalPool;
@@ -88,10 +87,6 @@ pub struct BeaconCoordinator {
     /// Equivocation evidence the local vnode has observed but not
     /// yet proposed for inclusion.
     equivocations: EquivocationObservations,
-
-    /// Gap-fill sync state: target epoch, buffered blocks awaiting
-    /// their turn through `apply_epoch`, in-flight fetches.
-    sync: BeaconBlockSyncManager,
 
     /// Per-epoch cache of committee members' `BeaconProposal`s.
     /// Scoped to the in-flight epoch (`state.current_epoch.next()`);
@@ -193,7 +188,6 @@ impl BeaconCoordinator {
             witness_fetcher: ShardWitnessFetchTracker::new(),
             skip_tracker: SkipTracker::new(),
             equivocations: EquivocationObservations::new(),
-            sync: BeaconBlockSyncManager::new(),
             proposal_pool,
             pending_assemblies: BTreeMap::new(),
             local_shard,
@@ -1091,6 +1085,21 @@ impl BeaconCoordinator {
         self.dispatch_block_verification(block, signers, equivocation_signers)
     }
 
+    /// Apply a beacon block delivered by the runner's gap-fill sync.
+    ///
+    /// The runner's beacon `Sync` machine fetches one epoch at a time
+    /// and only advances once the prior block commits, so a delivered
+    /// block is always at `epoch == tip + 1`. It therefore flows through
+    /// the identical structural-check + cert-verification + adoption path
+    /// as a gossiped block — verification (and the committed-proposal
+    /// binding) is not bypassed.
+    pub fn on_beacon_block_sync_ready_to_apply(
+        &mut self,
+        block: Arc<Verifiable<CertifiedBeaconBlock>>,
+    ) -> Vec<Action> {
+        self.on_beacon_block_received(block)
+    }
+
     /// Pubkey lookup covering every validator referenced by an
     /// `Witness::Equivocation` in `block`'s committed proposals.
     /// Returns an empty `Vec` when the block carries no equivocations —
@@ -1963,7 +1972,6 @@ impl std::fmt::Debug for BeaconCoordinator {
             .field("witness_pool", &self.witness_fetcher.total_pool_len())
             .field("skip_buckets", &self.skip_tracker.bucket_count())
             .field("equivocations", &self.equivocations.len())
-            .field("syncing", &self.sync.is_syncing())
             .finish_non_exhaustive()
     }
 }

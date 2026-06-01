@@ -351,7 +351,8 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::BeaconCommitteeStartTimer
             | ProtocolEvent::BeaconSkipTimer
             | ProtocolEvent::BeaconSpcViewTimer
-            | ProtocolEvent::BeaconBlockPersisted { .. }) => self.handle_beacon(evt),
+            | ProtocolEvent::BeaconBlockPersisted { .. }
+            | ProtocolEvent::BeaconBlockSyncReadyToApply { .. }) => self.handle_beacon(evt),
         };
 
         // Drain any state root verifications that became ready during this event.

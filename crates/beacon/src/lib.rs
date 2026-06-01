@@ -12,7 +12,6 @@
 //! `BeaconState` and exposes it via `current_topology_snapshot()`.
 
 pub mod action_handlers;
-pub mod block_sync;
 pub mod coordinator;
 pub mod equivocations;
 pub mod genesis;

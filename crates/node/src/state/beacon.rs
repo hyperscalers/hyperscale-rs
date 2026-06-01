@@ -155,6 +155,9 @@ impl NodeStateMachine {
             ProtocolEvent::BeaconSkipTimer => self.beacon_coordinator.on_beacon_skip_timer(),
             ProtocolEvent::BeaconSpcViewTimer => self.beacon_coordinator.on_beacon_spc_view_timer(),
             ProtocolEvent::BeaconBlockPersisted { .. } => Vec::new(),
+            ProtocolEvent::BeaconBlockSyncReadyToApply { block } => self
+                .beacon_coordinator
+                .on_beacon_block_sync_ready_to_apply(block),
             _ => unreachable!("handle_beacon called with non-beacon ProtocolEvent"),
         }
     }

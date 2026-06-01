@@ -18,9 +18,9 @@ use std::sync::Arc;
 use hyperscale_core::{CommitSource, ProtocolEvent};
 use hyperscale_types::{
     BeaconWitnessCommit, BlockHash, BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature,
-    CertifiedBlock, CertifiedBlockHeader, ElidedCertifiedBlock, Epoch, HeaderFetchCount, LeafIndex,
-    ProvisionHash, RoutableTransaction, ShardGroupId, TxHash, ValidatorId, Verifiable, Verified,
-    WaveId,
+    CertifiedBeaconBlock, CertifiedBlock, CertifiedBlockHeader, ElidedCertifiedBlock, Epoch,
+    HeaderFetchCount, LeafIndex, ProvisionHash, RoutableTransaction, ShardGroupId, TxHash,
+    ValidatorId, Verifiable, Verified, WaveId,
 };
 
 use crate::shard_io::block_commit::QcOnlyDivergence;
@@ -171,6 +171,26 @@ pub enum ShardScopedInput {
         height: BlockHeight,
         /// Why the fetch failed — drives whether the sync FSM re-queues
         /// immediately or applies exponential deferral.
+        kind: FetchFailureKind,
+    },
+
+    /// Beacon-block sync response received from a network callback.
+    /// `block` is `None` when the peer couldn't serve the epoch. The
+    /// `NodeHost` hands the block to the beacon coordinator (cert
+    /// verification + adoption) and feeds the beacon `Sync` machine.
+    BeaconBlockSyncResponseReceived {
+        /// Epoch of the block being synced.
+        epoch: Epoch,
+        /// The fetched block, or `None` if the peer didn't have it.
+        block: Option<Arc<Verifiable<CertifiedBeaconBlock>>>,
+    },
+
+    /// Beacon-block sync fetch failed from a network callback.
+    BeaconBlockSyncFetchFailed {
+        /// Epoch that failed to fetch.
+        epoch: Epoch,
+        /// Why the fetch failed — drives the beacon `Sync` machine's
+        /// re-queue vs. deferral decision.
         kind: FetchFailureKind,
     },
 
@@ -373,6 +393,8 @@ impl ShardScopedInput {
             Self::FetchTick => EventPriority::Timer,
             Self::BlockSyncResponseReceived { .. }
             | Self::BlockSyncFetchFailed { .. }
+            | Self::BeaconBlockSyncResponseReceived { .. }
+            | Self::BeaconBlockSyncFetchFailed { .. }
             | Self::SyncBlockValidated { .. }
             | Self::SyncBlockValidationFailed { .. }
             | Self::RemoteHeadersResponseReceived { .. }

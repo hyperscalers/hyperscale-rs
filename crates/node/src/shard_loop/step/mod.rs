@@ -5,6 +5,7 @@
 //! main `step()` match in [`super`] is a thin dispatcher that destructures
 //! variant payloads and forwards to the appropriate `handle_*` method.
 
+mod beacon_block_sync;
 mod block_sync;
 mod gossip;
 mod protocol_event;

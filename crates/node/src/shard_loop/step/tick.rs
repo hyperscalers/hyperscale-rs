@@ -30,6 +30,9 @@ where
         let outputs = self.io.syncs.block_tick(now);
         self.process_block_sync_outputs(outputs);
 
+        let outputs = self.io.syncs.beacon_block_tick(now);
+        self.process_beacon_block_sync_outputs(outputs);
+
         let outputs = self.io.syncs.remote_header_tick(now);
         self.process_remote_header_sync_outputs(outputs);
 

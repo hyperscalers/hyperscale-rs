@@ -325,6 +325,12 @@ where
             ShardScopedInput::BlockSyncFetchFailed { height, kind } => {
                 self.handle_block_sync_fetch_failed(height, kind);
             }
+            ShardScopedInput::BeaconBlockSyncResponseReceived { epoch, block } => {
+                self.handle_beacon_block_sync_response_received(epoch, block);
+            }
+            ShardScopedInput::BeaconBlockSyncFetchFailed { epoch, kind } => {
+                self.handle_beacon_block_sync_fetch_failed(epoch, kind);
+            }
             ShardScopedInput::SyncBlockValidated { height, certified } => {
                 self.handle_sync_block_validated(height, *certified);
             }
