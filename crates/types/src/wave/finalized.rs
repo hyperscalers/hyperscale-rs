@@ -14,7 +14,7 @@ use crate::{
     Bls12381G1PublicKey, BoundedVec, ConsensusReceipt, ExecutionCertificate,
     ExecutionCertificateContext, ExecutionCertificateVerifyError, ExecutionOutcome,
     GlobalReceiptHash, MAX_TXS_PER_BLOCK, NetworkDefinition, StoredReceipt, TransactionDecision,
-    TxHash, TxOutcome, Verified, Verify, WaveCertificate, WaveId,
+    TxHash, TxOutcome, Verifiable, Verified, Verify, WaveCertificate, WaveId,
 };
 
 /// A finalized wave — all participating shards have reported, `WaveCertificate` created.
@@ -114,7 +114,7 @@ impl FinalizedWave {
 
     /// Get the execution certificates (from the wave certificate).
     #[must_use]
-    pub fn execution_certificates(&self) -> &[Arc<ExecutionCertificate>] {
+    pub fn execution_certificates(&self) -> &[Arc<Verifiable<ExecutionCertificate>>] {
         self.certificate.execution_certificates()
     }
 
@@ -371,7 +371,8 @@ pub enum FinalizedWaveVerifyError {
 /// Construction goes through one of four gates:
 ///
 /// - [`<FinalizedWave as Verify>::verify`](Verify::verify) — runs the
-///   embedded-EC predicate over every constituent EC.
+///   embedded-EC predicate over every constituent EC that doesn't
+///   already carry a live verification marker.
 /// - [`Verified::<FinalizedWave>::seal`] — wraps a locally-finalized
 ///   wave whose ECs were produced through the
 ///   [`Verified::<ExecutionCertificate>::aggregate`] gate.
@@ -393,11 +394,17 @@ impl Verify<&FinalizedWaveContext<'_>> for FinalizedWave {
             });
         }
         for (index, (ec, pks)) in ecs.iter().zip(ctx.ec_public_keys.iter()).enumerate() {
+            // A wave assembled in-memory from aggregated ECs carries each
+            // one already Verified; wire-decoded waves arrive Unverified
+            // and run the per-EC predicate here.
+            if ec.is_verified() {
+                continue;
+            }
             let ec_ctx = ExecutionCertificateContext {
                 network: ctx.network,
                 public_keys: pks,
             };
-            ec.verify(&ec_ctx).map_err(|source| {
+            ec.as_unverified().verify(&ec_ctx).map_err(|source| {
                 FinalizedWaveVerifyError::ExecutionCertificate { index, source }
             })?;
         }

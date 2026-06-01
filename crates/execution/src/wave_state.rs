@@ -807,20 +807,20 @@ impl WaveState {
             .map(|ec| ec.wave_id().clone())
             .collect();
 
-        let mut ecs: Vec<Arc<ExecutionCertificate>> = self
+        let mut ecs: Vec<Verified<ExecutionCertificate>> = self
             .execution_certificates
             .iter()
             .filter(|ec| {
                 ec.wave_id() == &self.wave_id || required_remote_wave_ids.contains(ec.wave_id())
             })
-            .map(|verified| Arc::new((***verified).clone()))
+            .map(|verified| (**verified).clone())
             .collect();
 
         ecs.sort_by(|a, b| {
             (&a.shard_group_id(), a.wave_id()).cmp(&(&b.shard_group_id(), b.wave_id()))
         });
 
-        WaveCertificate::new(self.wave_id.clone(), ecs)
+        WaveCertificate::from_verified_ecs(self.wave_id.clone(), ecs)
     }
 
     /// Consume the wave and produce its terminal [`FinalizedWave`].

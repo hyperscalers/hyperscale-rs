@@ -25,7 +25,7 @@ pub fn append_block_certs_to_batch(
     let primary_cf = ExecutionCertsCf::handle(&cf);
     for fw in block.certificates().iter() {
         for ec in fw.certificate().execution_certificates() {
-            append_ec_to_batch(batch, primary_cf, ec);
+            append_ec_to_batch(batch, primary_cf, ec.as_unverified());
         }
     }
 }

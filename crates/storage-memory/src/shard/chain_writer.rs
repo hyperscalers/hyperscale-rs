@@ -192,7 +192,7 @@ fn build_prepared_commit(
             for fw in block.certificates().iter() {
                 for ec in fw.certificate().execution_certificates() {
                     c.execution_certs
-                        .insert(ec.wave_id().clone(), (**ec).clone());
+                        .insert(ec.wave_id().clone(), ec.as_unverified().clone());
                 }
             }
             c.committed_height = block.height();
@@ -301,7 +301,7 @@ impl SimShardStorage {
             for fw in block.certificates().iter() {
                 for ec in fw.certificate().execution_certificates() {
                     c.execution_certs
-                        .insert(ec.wave_id().clone(), (**ec).clone());
+                        .insert(ec.wave_id().clone(), ec.as_unverified().clone());
                 }
             }
             c.committed_height = block.height();

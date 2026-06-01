@@ -7,7 +7,9 @@ use blake3::Hasher;
 use sbor::prelude::*;
 use sbor::{Decode, DecodeError, Decoder, NoCustomValueKind, ValueKind};
 
-use crate::{BoundedVec, ExecutionCertificate, Hash, WaveId, WaveReceiptHash};
+use crate::{
+    BoundedVec, ExecutionCertificate, Hash, Verifiable, Verified, WaveId, WaveReceiptHash,
+};
 
 /// Cap on execution certificates accepted in a single `WaveCertificate` at
 /// decode time.
@@ -42,11 +44,16 @@ const MAX_EXECUTION_CERTIFICATES_PER_WAVE: usize = 1024;
 pub struct WaveCertificate {
     wave_id: WaveId,
     execution_certificates:
-        BoundedVec<Arc<ExecutionCertificate>, MAX_EXECUTION_CERTIFICATES_PER_WAVE>,
+        BoundedVec<Arc<Verifiable<ExecutionCertificate>>, MAX_EXECUTION_CERTIFICATES_PER_WAVE>,
 }
 
 impl WaveCertificate {
-    /// Build a `WaveCertificate` from its parts.
+    /// Build a `WaveCertificate` from its parts. Each EC lands
+    /// [`Verifiable::Unverified`] — this is the constructor for wire
+    /// reconstruction and tests, where the ECs carry no verification
+    /// marker. Locally aggregated waves that already hold
+    /// [`Verified<ExecutionCertificate>`]s use [`Self::from_verified_ecs`]
+    /// to carry their markers through.
     ///
     /// Does not validate the exactly-one-local-EC invariant; that is
     /// enforced at the wire boundary by the `Decode` impl and at the
@@ -59,7 +66,44 @@ impl WaveCertificate {
     pub fn new(wave_id: WaveId, execution_certificates: Vec<Arc<ExecutionCertificate>>) -> Self {
         Self {
             wave_id,
-            execution_certificates: execution_certificates.into(),
+            execution_certificates: execution_certificates
+                .into_iter()
+                .map(|ec| Arc::new(Verifiable::from(Arc::unwrap_or_clone(ec))))
+                .collect::<Vec<_>>()
+                .into(),
+        }
+    }
+
+    /// Build a `WaveCertificate` from execution certificates that have
+    /// already cleared their per-EC BLS predicate, carrying the
+    /// [`Verifiable::Verified`] marker on each.
+    ///
+    /// Used by `WaveCertificateTracker::create_wave_certificate`, whose
+    /// ECs were produced through the
+    /// [`Verified::<ExecutionCertificate>::aggregate`] gate. Keeping the
+    /// marker leaves the wave's ECs internally consistent with the
+    /// [`Verified<FinalizedWave>`](crate::FinalizedWave) they're sealed
+    /// into, so a later [`FinalizedWave::verify`](crate::FinalizedWave)
+    /// short-circuits them instead of re-checking.
+    ///
+    /// Does not validate the exactly-one-local-EC invariant; see
+    /// [`Self::new`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `execution_certificates.len() > MAX_EXECUTION_CERTIFICATES_PER_WAVE`.
+    #[must_use]
+    pub fn from_verified_ecs(
+        wave_id: WaveId,
+        execution_certificates: Vec<Verified<ExecutionCertificate>>,
+    ) -> Self {
+        Self {
+            wave_id,
+            execution_certificates: execution_certificates
+                .into_iter()
+                .map(|ec| Arc::new(Verifiable::from(ec)))
+                .collect::<Vec<_>>()
+                .into(),
         }
     }
 
@@ -76,8 +120,13 @@ impl WaveCertificate {
     /// a remote shard committed this wave's transactions across multiple blocks,
     /// producing separate ECs.
     /// Sorted by (`shard_group_id`, `wave_id`) for deterministic `receipt_hash`.
+    ///
+    /// Each EC rides as `Verifiable<ExecutionCertificate>`: wire-decoded
+    /// certificates land [`Verifiable::Unverified`]; locally assembled
+    /// ones carry the [`Verifiable::Verified`] marker from
+    /// [`Self::from_verified_ecs`].
     #[must_use]
-    pub fn execution_certificates(&self) -> &[Arc<ExecutionCertificate>] {
+    pub fn execution_certificates(&self) -> &[Arc<Verifiable<ExecutionCertificate>>] {
         &self.execution_certificates
     }
 
@@ -120,7 +169,7 @@ impl<D: Decoder<NoCustomValueKind>> Decode<NoCustomValueKind, D> for WaveCertifi
         }
         let wave_id: WaveId = decoder.decode()?;
         let execution_certificates: BoundedVec<
-            Arc<ExecutionCertificate>,
+            Arc<Verifiable<ExecutionCertificate>>,
             MAX_EXECUTION_CERTIFICATES_PER_WAVE,
         > = decoder.decode()?;
         // Reject any WC that violates the exactly-one-local-EC invariant.

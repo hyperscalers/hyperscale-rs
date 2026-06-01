@@ -1709,7 +1709,7 @@ impl ExecutionCoordinator {
         let mut ec_public_keys = Vec::with_capacity(ecs.len());
         for ec in ecs {
             let shard = ec.shard_group_id();
-            if !ec_has_shard_quorum_power(topology, ec) {
+            if !ec_has_shard_quorum_power(topology, ec.as_unverified()) {
                 tracing::warn!(
                     wave = %wave.wave_id(),
                     shard = shard.inner(),
