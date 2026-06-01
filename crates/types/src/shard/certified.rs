@@ -390,31 +390,6 @@ impl Verified<CertifiedBlock> {
         // voting; BFT-transitive trust.
         Verified::<QuorumCertificate>::new_unchecked(self.block().header().parent_qc().clone())
     }
-
-    /// Consume into a verified-`Block` + verified-QC pair. Total by the
-    /// [`Verified<CertifiedBlock>`] predicate.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the inner `qc` is not in the verified arm. The
-    /// [`Verified<CertifiedBlock>`] predicate forbids this: every gate
-    /// ([`Self::assemble`], [`Self::from_qc_attestation`],
-    /// [`Self::genesis`]) constructs the wrapper as `Verified`.
-    #[must_use]
-    pub fn into_verified_parts(self) -> (Verified<Block>, Verified<QuorumCertificate>) {
-        let CertifiedBlock { block, qc } = self.into_inner();
-        let qc = qc
-            .into_verified()
-            .expect("Verified<CertifiedBlock> predicate guarantees qc is Verified");
-        // SAFETY: the `Verified<CertifiedBlock>` predicate carries the
-        // block's per-root claim either locally (via [`Self::assemble`])
-        // or by BFT-transitive attestation (via
-        // [`Self::from_qc_attestation`]). Either way the contained block
-        // satisfies the `Verified<Block>` contract for downstream
-        // consumers.
-        let block = Verified::<Block>::new_unchecked(block);
-        (block, qc)
-    }
 }
 
 #[cfg(test)]
@@ -504,39 +479,6 @@ mod tests {
         let err = Verified::<CertifiedBlock>::from_qc_attestation(original_cb, other_verified_qc)
             .expect_err("supplied QC's block_hash doesn't match the certified block");
         assert!(matches!(err, LinkageError::BlockHashMismatch { .. }));
-    }
-
-    /// `Verified<CertifiedBlock>::into_verified_parts` round-trips both
-    /// halves: the QC borrow matches what `qc_verified` returns, and the
-    /// resulting `Verified<Block>` agrees with the input block.
-    #[test]
-    fn into_verified_parts_round_trips() {
-        let block = Block::genesis(ShardGroupId::new(0), ValidatorId::new(0), StateRoot::ZERO);
-        let block_hash = block.hash();
-        let raw_qc = QuorumCertificate::genesis(ShardGroupId::new(0));
-        let qc_for_block = QuorumCertificate::new(
-            block_hash,
-            raw_qc.shard_group_id(),
-            raw_qc.height(),
-            raw_qc.parent_block_hash(),
-            raw_qc.round(),
-            raw_qc.signers().clone(),
-            raw_qc.aggregated_signature(),
-            raw_qc.weighted_timestamp(),
-        );
-        let verified_qc = Verified::<QuorumCertificate>::new_unchecked(qc_for_block);
-
-        let cb = CertifiedBlock {
-            block: block.clone(),
-            qc: verified_qc.into(),
-        };
-        let verified_cb = Verified::<CertifiedBlock>::new_unchecked(cb);
-
-        // qc_verified borrow agrees with into_verified_parts consume.
-        let qc_borrow_hash = verified_cb.qc_verified().block_hash();
-        let (vb, vq) = verified_cb.into_verified_parts();
-        assert_eq!(vq.block_hash(), qc_borrow_hash);
-        assert_eq!(vb.hash(), block.hash());
     }
 
     /// `parent_qc_attested` returns the descendant's `parent_qc` wrapped as

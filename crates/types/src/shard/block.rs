@@ -356,23 +356,6 @@ pub enum VerifiedBlockAssembleError {
 }
 
 impl Verified<Block> {
-    /// Verified form of the genesis block for `shard_group_id`.
-    ///
-    /// Construction asserts the [`Verified<Block>`] predicate by
-    /// inputs: [`Block::genesis`] builds a block whose every
-    /// commitment root is the empty-input compute (no transactions,
-    /// no certificates, no provisions, no witness deltas), and the
-    /// embedded header's `parent_qc` is the [`Verifiable::Verified`]
-    /// genesis QC by [`BlockHeader::genesis`]'s contract.
-    #[must_use]
-    pub fn genesis(
-        shard_group_id: ShardGroupId,
-        proposer: ValidatorId,
-        state_root: StateRoot,
-    ) -> Self {
-        Self::new_unchecked(Block::genesis(shard_group_id, proposer, state_root))
-    }
-
     /// Composite assembly. Pairs `block` with a `Verified<BlockHeader>`
     /// after confirming the header's content matches the block, and
     /// consumes a typed witness for each per-root verification.

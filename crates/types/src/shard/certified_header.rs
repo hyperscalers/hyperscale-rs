@@ -1,9 +1,7 @@
 //! `CertifiedBlockHeader` — block header paired with the QC that committed it.
 //!
 //! [`CertifiedBlockHeader`] is the raw wire form. Its verified form is
-//! `Verified<CertifiedBlockHeader>` — produced either by local-assembly
-//! ([`impl Verified<CertifiedBlockHeader>::assemble`] — requires a
-//! locally-verified header) or by BFT-transitive trust
+//! `Verified<CertifiedBlockHeader>` — produced by BFT-transitive trust
 //! ([`impl Verified<CertifiedBlockHeader>::from_qc_attestation`] — the
 //! light-client trust path for remote-shard headers).
 
@@ -98,36 +96,6 @@ impl CertifiedBlockHeader {
 }
 
 impl Verified<CertifiedBlockHeader> {
-    /// Composite assembly. Pairs a `Verified<BlockHeader>` with a
-    /// `Verified<QuorumCertificate>` after confirming the QC's
-    /// `block_hash` matches `header.hash()`.
-    ///
-    /// Construction asserts:
-    /// 1. The header passes [`<BlockHeader as crate::Verify>`](crate::Verify)
-    ///    (so its `parent_qc` is verified).
-    /// 2. The QC pairing this certified header was verified against the
-    ///    source-shard committee.
-    /// 3. The QC's `block_hash` equals `header.hash()` — the QC commits
-    ///    exactly this header.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CertifiedHeaderVerifyError::LinkageMismatch`] when
-    /// `qc.block_hash() != header.hash()`.
-    pub fn assemble(
-        header: Verified<BlockHeader>,
-        qc: Verified<QuorumCertificate>,
-    ) -> Result<Self, CertifiedHeaderVerifyError> {
-        if qc.block_hash() != header.as_ref().hash() {
-            return Err(CertifiedHeaderVerifyError::LinkageMismatch);
-        }
-        let header = header.into_inner();
-        Ok(Self::new_unchecked(CertifiedBlockHeader {
-            header,
-            qc: qc.into(),
-        }))
-    }
-
     /// Construct from a raw header paired with a verified QC, trusting the
     /// QC's signers to have validated the header at their committee. The
     /// light-client construction gate: receivers of cross-shard committed
