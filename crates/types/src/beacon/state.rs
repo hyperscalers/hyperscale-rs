@@ -227,7 +227,7 @@ pub struct BeaconState {
     /// consumed, or a gap that must be filled first). Updates
     /// monotonically; never reset.
     ///
-    /// `Witness::Equivocation` is not tracked here — it has no shard
+    /// `PcVoteEquivocation` is not tracked here — it has no shard
     /// provenance and re-application is idempotent once the validator
     /// is `Jailed { Equivocation }`.
     pub consumed_through: BTreeMap<ShardGroupId, LeafIndex>,

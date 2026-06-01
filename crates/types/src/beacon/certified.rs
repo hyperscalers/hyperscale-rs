@@ -27,7 +27,7 @@ use thiserror::Error;
 
 use crate::{
     BeaconBlock, BeaconBlockHash, BeaconCert, Bls12381G1PublicKey, Epoch, GenesisConfigHash,
-    NetworkDefinition, PcValueElement, ValidatorId, Verified, Verify, Witness, spc_context,
+    NetworkDefinition, PcValueElement, ValidatorId, Verified, Verify, spc_context,
     verify_block_cert, verify_skip_cert, verify_vote_equivocation,
 };
 
@@ -195,7 +195,7 @@ pub fn verify_certified(
     }
 }
 
-/// Verify every `Witness::Equivocation` carried in `block`'s committed
+/// Verify every `PcVoteEquivocation` carried in `block`'s committed
 /// proposals against the supplied `signers` lookup.
 ///
 /// `signers` must cover every equivocating validator referenced by the
@@ -211,10 +211,8 @@ pub fn verify_block_equivocations(
     signers: &[(ValidatorId, Bls12381G1PublicKey)],
 ) -> bool {
     for (_, proposal) in block.block().committed_proposals() {
-        for witness in proposal.witnesses().iter() {
-            if let Witness::Equivocation(ev) = witness
-                && verify_vote_equivocation(ev, network, signers).is_err()
-            {
+        for ev in proposal.equivocations().iter() {
+            if verify_vote_equivocation(ev.as_unverified(), network, signers).is_err() {
                 return false;
             }
         }
@@ -241,7 +239,7 @@ pub struct CertifiedBeaconBlockVerifyContext<'a> {
     /// signer bitfield.
     pub signers: &'a [(ValidatorId, Bls12381G1PublicKey)],
     /// Pubkeys for the validators referenced by embedded
-    /// `Witness::Equivocation` evidence. The coordinator filters
+    /// `PcVoteEquivocation` evidence. The coordinator filters
     /// `state.validators` down to the referenced subset; an evidence
     /// signer missing from this lookup rejects the block.
     pub equivocation_signers: &'a [(ValidatorId, Bls12381G1PublicKey)],
@@ -296,7 +294,7 @@ pub enum CertifiedBeaconBlockVerifyError {
     /// have no replayable verification).
     #[error("authenticating cert rejected")]
     BadCert,
-    /// One or more embedded `Witness::Equivocation` did not verify
+    /// One or more embedded `PcVoteEquivocation` did not verify
     /// against the equivocation signer pool.
     #[error("embedded equivocation witness rejected")]
     BadEquivocationWitness,
@@ -312,7 +310,7 @@ impl Verify<&CertifiedBeaconBlockVerifyContext<'_>> for CertifiedBeaconBlock {
 
     /// Composite predicate: the cert verifies under the variant's
     /// required signer pool (via [`verify_certified`]) and every
-    /// embedded `Witness::Equivocation` verifies against
+    /// embedded `PcVoteEquivocation` verifies against
     /// `equivocation_signers` (via [`verify_block_equivocations`]).
     fn verify(
         &self,
@@ -423,6 +421,7 @@ mod tests {
 
     fn proposal(seed: u8) -> BeaconProposal {
         BeaconProposal::new(
+            Vec::new(),
             Vec::new(),
             VrfOutput::new([seed; 32]),
             VrfProof::new([seed; VRF_PROOF_BYTES]),

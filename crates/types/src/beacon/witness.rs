@@ -1,25 +1,21 @@
-//! Beacon-chain witness types.
+//! Beacon-chain shard-witness types.
 //!
-//! Every event the beacon applies — validator registrations, stake
-//! adjustments, missed-proposal observations, equivocation evidence —
-//! flows through a [`Witness`] carried inside a
-//! [`BeaconProposal`](crate::BeaconProposal). Witnesses split by *who
-//! emitted them*:
-//!
-//! - [`Witness::Shard`] — lifted from a shard's VM via that shard's
-//!   monotonic beacon-witness accumulator. Carries a
-//!   [`ShardWitnessProof`] for provenance.
-//! - [`Witness::Equivocation`] — a PC double-sign observed locally.
-//!   Self-authenticating from the embedded BLS sigs — no shard proof,
-//!   no replay set.
+//! A [`ShardWitness`] lifts one event from a shard's VM — validator
+//! registrations, stake adjustments, missed-proposal observations —
+//! via that shard's monotonic beacon-witness accumulator, carrying a
+//! [`ShardWitnessProof`] for provenance. A
+//! [`BeaconProposal`](crate::BeaconProposal) carries a list of these
+//! alongside its equivocation evidence (a
+//! [`PcVoteEquivocation`](crate::PcVoteEquivocation), which is
+//! self-authenticating from its embedded BLS sigs).
 
 use sbor::prelude::*;
 use thiserror::Error;
 
 use crate::{
     BlockHash, BlockHeight, Bls12381G1PublicKey, BoundedVec, CertifiedBlockHeader, Hash, LeafIndex,
-    MAX_WITNESS_PROOF_DEPTH, PcVoteEquivocation, Round, ShardGroupId, Stake, StakePoolId,
-    ValidatorId, Verified, Verify, verify_merkle_inclusion,
+    MAX_WITNESS_PROOF_DEPTH, Round, ShardGroupId, Stake, StakePoolId, ValidatorId, Verified,
+    Verify, verify_merkle_inclusion,
 };
 
 /// Domain tag for accumulator leaf hashing.
@@ -319,19 +315,6 @@ impl Verified<ShardWitness> {
     }
 }
 
-/// Observation submitted in a [`BeaconProposal`](crate::BeaconProposal).
-#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
-pub enum Witness {
-    /// Lifted from a shard's VM via that shard's monotonic
-    /// beacon-witness accumulator.
-    Shard(ShardWitness),
-    /// PC double-sign at the same `(epoch, view, round)` of an inner
-    /// Prefix Consensus instance. Self-authenticating — the embedded
-    /// BLS sigs are the proof. `apply_epoch` re-runs verification and
-    /// jails the equivocator permanently on success.
-    Equivocation(Box<PcVoteEquivocation>),
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,14 +378,6 @@ mod tests {
         let w = sample_shard_witness();
         let bytes = basic_encode(&w).unwrap();
         let decoded: ShardWitness = basic_decode(&bytes).unwrap();
-        assert_eq!(w, decoded);
-    }
-
-    #[test]
-    fn witness_sbor_round_trip() {
-        let w = Witness::Shard(sample_shard_witness());
-        let bytes = basic_encode(&w).unwrap();
-        let decoded: Witness = basic_decode(&bytes).unwrap();
         assert_eq!(w, decoded);
     }
 
@@ -493,27 +468,5 @@ mod tests {
         for (event, expected) in cases {
             assert_eq!(ShardWitnessPayload::from(event), expected);
         }
-    }
-
-    fn sample_pc_vote_equivocation() -> PcVoteEquivocation {
-        use crate::{Bls12381G2Signature, Epoch, PcVector, PcVoteRound, SpcView};
-        PcVoteEquivocation {
-            validator: ValidatorId::new(5),
-            epoch: Epoch::new(10),
-            view: SpcView::new(1),
-            round: PcVoteRound::Vote1,
-            value_a: PcVector::empty(),
-            sig_a: Bls12381G2Signature([0xAA; 96]),
-            value_b: PcVector::empty(),
-            sig_b: Bls12381G2Signature([0xBB; 96]),
-        }
-    }
-
-    #[test]
-    fn witness_equivocation_variant_sbor_round_trip() {
-        let w = Witness::Equivocation(Box::new(sample_pc_vote_equivocation()));
-        let bytes = basic_encode(&w).unwrap();
-        let decoded: Witness = basic_decode(&bytes).unwrap();
-        assert_eq!(w, decoded);
     }
 }

@@ -61,9 +61,9 @@ pub use genesis::{
     BeaconChainConfig, BeaconGenesisConfig, GenesisPool, GenesisValidator, genesis_config_hash,
 };
 pub use limits::{
-    MAX_BEACON_WITNESS_EVENTS_PER_TX, MAX_PREFIX_SIGS, MAX_READY_SIGNALS_PER_BLOCK,
-    MAX_READY_WINDOW_BLOCKS, MAX_VOTE_VECTOR_LEN, MAX_WITNESS_PROOF_DEPTH, MAX_WITNESSES_PER_FETCH,
-    MAX_WITNESSES_PER_PROPOSER,
+    MAX_BEACON_WITNESS_EVENTS_PER_TX, MAX_EQUIVOCATIONS_PER_PROPOSER, MAX_PREFIX_SIGS,
+    MAX_READY_SIGNALS_PER_BLOCK, MAX_READY_WINDOW_BLOCKS, MAX_SHARD_WITNESSES_PER_PROPOSER,
+    MAX_VOTE_VECTOR_LEN, MAX_WITNESS_PROOF_DEPTH, MAX_WITNESSES_PER_FETCH,
 };
 pub use pc::{
     PC_VALUE_ELEMENT_BYTES, PcCompactVote, PcDivergingProof, PcQc1, PcQc1VerifyError, PcQc2,
@@ -94,5 +94,5 @@ pub use state::{
 };
 pub use witness::{
     BeaconWitnessEvent, SHARD_WITNESS_LEAF_DOMAIN_TAG, ShardWitness, ShardWitnessPayload,
-    ShardWitnessProof, ShardWitnessVerifyError, Witness,
+    ShardWitnessProof, ShardWitnessVerifyError,
 };

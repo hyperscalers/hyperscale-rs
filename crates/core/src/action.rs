@@ -10,13 +10,13 @@ use hyperscale_types::{
     BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PublicKey,
     CertificateRoot, CertifiedBeaconBlock, CertifiedBlock, CertifiedBlockHeader, Epoch,
     ExecutionCertificate, ExecutionVote, FinalizedWave, GlobalReceiptRoot, Hash, InFlightCount,
-    LocalReceiptRoot, NodeId, PcQc1, PcQc2, PcVector, PcVote1, PcVote2, PcVote3, ProposerTimestamp,
-    ProvisionHash, ProvisionTxRootsMap, Provisions, ProvisionsRoot, QuorumCertificate, ReadySignal,
-    Round, RoutableTransaction, ShardGroupId, SharedCertificates, SharedTransactions,
-    SkipEpochCert, SkipRequest, SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject,
-    SpcView, StateRoot, SubstateEntry, TopologySnapshot, TransactionRoot, TransactionStatus,
-    TxHash, TxOutcome, ValidatorId, Verifiable, Verified, VotePower, WaveId, WeightedTimestamp,
-    Witness,
+    LocalReceiptRoot, NodeId, PcQc1, PcQc2, PcVector, PcVote1, PcVote2, PcVote3,
+    PcVoteEquivocation, ProposerTimestamp, ProvisionHash, ProvisionTxRootsMap, Provisions,
+    ProvisionsRoot, QuorumCertificate, ReadySignal, Round, RoutableTransaction, ShardGroupId,
+    ShardWitness, SharedCertificates, SharedTransactions, SkipEpochCert, SkipRequest,
+    SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject, SpcView, StateRoot,
+    SubstateEntry, TopologySnapshot, TransactionRoot, TransactionStatus, TxHash, TxOutcome,
+    ValidatorId, Verifiable, Verified, VotePower, WaveId, WeightedTimestamp,
 };
 
 use crate::{CommitSource, FetchAbandon, FetchRequest, ProtocolEvent, TimerId};
@@ -907,10 +907,12 @@ pub enum Action {
         /// Epoch this proposal targets; bound into the VRF reveal's
         /// signing context.
         epoch: Epoch,
-        /// Drained witnesses + equivocation evidence to embed in the
-        /// proposal. Order is preserved into `BeaconProposal::new`'s
-        /// `BoundedVec`.
-        witnesses: Vec<Witness>,
+        /// Shard witnesses to embed. Raw — verified by construction at
+        /// the handler (drained from the local validated pool).
+        shard_witnesses: Vec<ShardWitness>,
+        /// Equivocation evidence to embed. Raw — built locally from
+        /// verified PC votes.
+        equivocations: Vec<PcVoteEquivocation>,
         /// Beacon-committee members the proposal ships to (excluding
         /// self).
         recipients: Vec<ValidatorId>,
@@ -954,7 +956,7 @@ pub enum Action {
     /// Verify the cert authenticating a beacon block (SPC cert on a
     /// Normal block, pool-quorum cert on a Skip block — the handler
     /// reads `block.cert()` to branch) **and** every
-    /// `Witness::Equivocation` carried in the block's committed
+    /// `PcVoteEquivocation` carried in the block's committed
     /// proposals. Result returns via [`ProtocolEvent::BeaconBlockVerified`]
     /// carrying the block back; `valid` is the AND-reduction over the
     /// cert check and every equivocation check.
@@ -970,7 +972,7 @@ pub enum Action {
         /// matches the cert's signer bitfield.
         signers: Vec<(ValidatorId, Bls12381G1PublicKey)>,
         /// Pubkeys for the validators referenced by embedded
-        /// `Witness::Equivocation` evidence. Empty when the block
+        /// `PcVoteEquivocation` evidence. Empty when the block
         /// carries no equivocations. Lookup-shape, order doesn't
         /// matter.
         equivocation_signers: Vec<(ValidatorId, Bls12381G1PublicKey)>,

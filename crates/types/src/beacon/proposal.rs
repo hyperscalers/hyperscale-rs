@@ -1,9 +1,9 @@
 //! [`BeaconProposal`] — what one committee member submits per slot.
 //!
-//! Each member's proposal carries (1) a bounded list of observations
-//! ([`Witness`]es lifted from shards) and (2) a VRF reveal for the
-//! slot. Once SPC produces an `OutputHigh` for the slot, every
-//! accepted proposal lands in the resulting
+//! Each member's proposal carries (1) shard witnesses lifted from
+//! source committees, (2) equivocation evidence observed locally, and
+//! (3) a VRF reveal for the slot. Once SPC produces an `OutputHigh` for
+//! the slot, every accepted proposal lands in the resulting
 //! [`BeaconBlock::committed_proposals`](crate::BeaconBlock).
 
 use blake3::Hasher;
@@ -11,9 +11,10 @@ use sbor::prelude::*;
 use thiserror::Error;
 
 use crate::{
-    Bls12381G1PrivateKey, Bls12381G1PublicKey, BoundedVec, Epoch, MAX_WITNESSES_PER_PROPOSER,
-    NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PcValueElement, Verified, Verify, VrfOutput,
-    VrfProof, Witness, vrf_sign, vrf_verify,
+    Bls12381G1PrivateKey, Bls12381G1PublicKey, BoundedVec, Epoch, MAX_EQUIVOCATIONS_PER_PROPOSER,
+    MAX_SHARD_WITNESSES_PER_PROPOSER, NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PcValueElement,
+    PcVoteEquivocation, ShardWitness, Verifiable, Verified, Verify, VrfOutput, VrfProof, vrf_sign,
+    vrf_verify,
 };
 
 /// One committee member's slot submission.
@@ -24,7 +25,8 @@ use crate::{
 /// crate's job — this is a pure data container.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct BeaconProposal {
-    witnesses: BoundedVec<Witness, MAX_WITNESSES_PER_PROPOSER>,
+    shard_witnesses: BoundedVec<Verifiable<ShardWitness>, MAX_SHARD_WITNESSES_PER_PROPOSER>,
+    equivocations: BoundedVec<Verifiable<PcVoteEquivocation>, MAX_EQUIVOCATIONS_PER_PROPOSER>,
     vrf_output: VrfOutput,
     vrf_proof: VrfProof,
 }
@@ -34,31 +36,60 @@ impl BeaconProposal {
     ///
     /// # Panics
     ///
-    /// Panics if `witnesses.len() > MAX_WITNESSES_PER_PROPOSER`.
+    /// Panics if either list exceeds its per-proposer cap.
     #[must_use]
-    pub fn new(witnesses: Vec<Witness>, vrf_output: VrfOutput, vrf_proof: VrfProof) -> Self {
+    pub fn new(
+        shard_witnesses: Vec<ShardWitness>,
+        equivocations: Vec<PcVoteEquivocation>,
+        vrf_output: VrfOutput,
+        vrf_proof: VrfProof,
+    ) -> Self {
         Self {
-            witnesses: witnesses.into(),
+            shard_witnesses: shard_witnesses
+                .into_iter()
+                .map(Verifiable::from)
+                .collect::<Vec<_>>()
+                .into(),
+            equivocations: equivocations
+                .into_iter()
+                .map(Verifiable::from)
+                .collect::<Vec<_>>()
+                .into(),
             vrf_output,
             vrf_proof,
         }
     }
 
-    /// Empty proposal — no witnesses, given VRF reveal. Useful for
+    /// Empty proposal — no observations, given VRF reveal. Useful for
     /// committee members with nothing to observe in a given slot.
     #[must_use]
     pub const fn vrf_only(vrf_output: VrfOutput, vrf_proof: VrfProof) -> Self {
         Self {
-            witnesses: BoundedVec::new(),
+            shard_witnesses: BoundedVec::new(),
+            equivocations: BoundedVec::new(),
             vrf_output,
             vrf_proof,
         }
     }
 
-    /// Observations the proposer is submitting this slot.
+    /// Shard witnesses lifted from source committees this slot. Each
+    /// rides as `Verifiable<ShardWitness>`: wire-decoded proposals land
+    /// `Unverified`; the beacon admission gate upgrades the marker.
     #[must_use]
-    pub const fn witnesses(&self) -> &BoundedVec<Witness, MAX_WITNESSES_PER_PROPOSER> {
-        &self.witnesses
+    pub const fn shard_witnesses(
+        &self,
+    ) -> &BoundedVec<Verifiable<ShardWitness>, MAX_SHARD_WITNESSES_PER_PROPOSER> {
+        &self.shard_witnesses
+    }
+
+    /// Equivocation evidence observed this slot. Same `Verifiable`
+    /// lifecycle as [`Self::shard_witnesses`]; admission jails the named
+    /// validator once the block commits.
+    #[must_use]
+    pub const fn equivocations(
+        &self,
+    ) -> &BoundedVec<Verifiable<PcVoteEquivocation>, MAX_EQUIVOCATIONS_PER_PROPOSER> {
+        &self.equivocations
     }
 
     /// VRF output for this slot — mixed into beacon randomness once
@@ -162,23 +193,29 @@ impl Verify<&BeaconProposalVerifyContext<'_>> for BeaconProposal {
 
 impl Verified<BeaconProposal> {
     /// Sign a beacon proposal locally — derive the VRF reveal under
-    /// the signer's key, pair it with `witnesses`, and produce a
-    /// `Verified<BeaconProposal>` whose VRF predicate holds by
+    /// the signer's key, pair it with the proposer's observations, and
+    /// produce a `Verified<BeaconProposal>` whose VRF predicate holds by
     /// construction.
     ///
     /// # Panics
     ///
-    /// Panics if `witnesses.len() > MAX_WITNESSES_PER_PROPOSER`
-    /// (inherited from [`BeaconProposal::new`]).
+    /// Panics if either list exceeds its per-proposer cap (inherited
+    /// from [`BeaconProposal::new`]).
     #[must_use]
     pub fn sign_local(
         sk: &Bls12381G1PrivateKey,
         network: &NetworkDefinition,
         epoch: Epoch,
-        witnesses: Vec<Witness>,
+        shard_witnesses: Vec<ShardWitness>,
+        equivocations: Vec<PcVoteEquivocation>,
     ) -> Self {
         let (vrf_output, vrf_proof) = vrf_sign(sk, network, epoch);
-        Self::new_unchecked(BeaconProposal::new(witnesses, vrf_output, vrf_proof))
+        Self::new_unchecked(BeaconProposal::new(
+            shard_witnesses,
+            equivocations,
+            vrf_output,
+            vrf_proof,
+        ))
     }
 }
 
@@ -195,8 +232,8 @@ mod tests {
         Stake, StakePoolId,
     };
 
-    fn sample_witness(leaf_index: u64) -> Witness {
-        Witness::Shard(ShardWitness {
+    fn sample_witness(leaf_index: u64) -> ShardWitness {
+        ShardWitness {
             payload: ShardWitnessPayload::StakeDeposit {
                 pool_id: StakePoolId::new(1),
                 amount: Stake::from_whole_tokens(1_000),
@@ -207,12 +244,13 @@ mod tests {
                 leaf_index: LeafIndex::new(leaf_index),
                 siblings: Vec::new().into(),
             },
-        })
+        }
     }
 
     fn sample_proposal() -> BeaconProposal {
         BeaconProposal::new(
             vec![sample_witness(0), sample_witness(1), sample_witness(2)],
+            Vec::new(),
             VrfOutput::new([0xAB; 32]),
             VrfProof::new([0xCD; 96]),
         )
@@ -229,14 +267,15 @@ mod tests {
     #[test]
     fn vrf_only_has_no_witnesses() {
         let p = BeaconProposal::vrf_only(VrfOutput::ZERO, VrfProof::ZERO);
-        assert!(p.witnesses().is_empty());
+        assert!(p.shard_witnesses().is_empty());
+        assert!(p.equivocations().is_empty());
         assert_eq!(p.vrf_output(), VrfOutput::ZERO);
         assert_eq!(p.vrf_proof(), VrfProof::ZERO);
     }
 
-    /// Hand-roll a `BeaconProposal` whose `witnesses` length prefix
-    /// exceeds the cap. The `BoundedVec` decoder fires before any
-    /// per-element work happens.
+    /// Hand-roll a `BeaconProposal` whose `shard_witnesses` length
+    /// prefix exceeds the cap. The `BoundedVec` decoder fires before
+    /// any per-element work happens.
     #[test]
     fn decode_rejects_oversized_witness_count() {
         let proposal = sample_proposal();
@@ -246,12 +285,13 @@ mod tests {
             enc.write_payload_prefix(BASIC_SBOR_V1_PAYLOAD_PREFIX)
                 .unwrap();
             enc.write_value_kind(ValueKind::Tuple).unwrap();
-            // BeaconProposal has 3 fields.
-            enc.write_size(3).unwrap();
-            // Oversized witnesses array.
+            // BeaconProposal has 4 fields.
+            enc.write_size(4).unwrap();
+            // Oversized shard-witnesses array (the first field).
             enc.write_value_kind(ValueKind::Array).unwrap();
-            enc.write_value_kind(Witness::value_kind()).unwrap();
-            enc.write_size(MAX_WITNESSES_PER_PROPOSER + 1).unwrap();
+            enc.write_value_kind(ShardWitness::value_kind()).unwrap();
+            enc.write_size(MAX_SHARD_WITNESSES_PER_PROPOSER + 1)
+                .unwrap();
             // Don't bother writing the rest — decode fails on the count.
             let _ = &proposal;
         }
@@ -259,15 +299,16 @@ mod tests {
         assert!(matches!(
             err,
             DecodeError::UnexpectedSize { expected, actual }
-                if expected == MAX_WITNESSES_PER_PROPOSER
-                    && actual == MAX_WITNESSES_PER_PROPOSER + 1
+                if expected == MAX_SHARD_WITNESSES_PER_PROPOSER
+                    && actual == MAX_SHARD_WITNESSES_PER_PROPOSER + 1
         ));
     }
 
     #[test]
     fn accessors_return_built_values() {
         let p = sample_proposal();
-        assert_eq!(p.witnesses().len(), 3);
+        assert_eq!(p.shard_witnesses().len(), 3);
+        assert!(p.equivocations().is_empty());
         assert_eq!(p.vrf_output(), VrfOutput::new([0xAB; 32]));
         assert_eq!(p.vrf_proof(), VrfProof::new([0xCD; 96]));
     }

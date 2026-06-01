@@ -7,7 +7,7 @@ use hyperscale_types::{
     BeaconProposal, BeaconState, Bls12381G1PublicKey, JAIL_COOLDOWN_EPOCHS, JailReason, LeafIndex,
     MISSED_PROPOSAL_JAIL_THRESHOLD, NetworkDefinition, PcVoteEquivocation, PendingWithdrawal,
     ShardGroupId, ShardWitness, ShardWitnessPayload, Stake, StakePool, ValidatorId,
-    ValidatorRecord, ValidatorStatus, Witness, verify_vote_equivocation,
+    ValidatorRecord, ValidatorStatus, verify_vote_equivocation,
 };
 
 use crate::state::vrf::jail_validator;
@@ -75,18 +75,15 @@ pub(super) fn ingest_witnesses(
     let mut shard_lifts: Vec<&ShardWitness> = Vec::new();
     let mut equivocations: Vec<&PcVoteEquivocation> = Vec::new();
     for (_, prop) in accepted {
-        for w in prop.witnesses().iter() {
-            match w {
-                Witness::Shard(sw) => {
-                    if !shard_seen.insert((sw.proof.shard_id, sw.proof.leaf_index)) {
-                        continue;
-                    }
-                    shard_lifts.push(sw);
-                }
-                Witness::Equivocation(ev) => {
-                    equivocations.push(ev);
-                }
+        for sw in prop.shard_witnesses().iter() {
+            let sw = sw.as_unverified();
+            if !shard_seen.insert((sw.proof.shard_id, sw.proof.leaf_index)) {
+                continue;
             }
+            shard_lifts.push(sw);
+        }
+        for ev in prop.equivocations().iter() {
+            equivocations.push(ev.as_unverified());
         }
     }
 
@@ -402,7 +399,8 @@ mod tests {
 
     use super::super::test_fixtures::{
         apply_next_epoch, keypair, malformed_vrf_proposal, net, pubkey, shard_witness,
-        single_pool_state, validator_record, vrf_proposal_with_witnesses,
+        single_pool_state, validator_record, vrf_proposal_with_equivocations,
+        vrf_proposal_with_witnesses,
     };
     use super::*;
 
@@ -1310,7 +1308,7 @@ mod tests {
         source_shard: u64,
         leaf_index: u64,
         proposer_id: ValidatorId,
-    ) -> Witness {
+    ) -> ShardWitness {
         shard_witness(
             source_shard,
             leaf_index,
@@ -1428,7 +1426,7 @@ mod tests {
         let target = ValidatorId::new(1);
 
         // Three distinct misses at leaf indices 1..3.
-        let ws: Vec<Witness> = (1u64..=3)
+        let ws: Vec<ShardWitness> = (1u64..=3)
             .map(|leaf| missed_proposal_witness(0, leaf, target))
             .collect();
         let committed = vec![(
@@ -1573,9 +1571,12 @@ mod tests {
         }
     }
 
-    fn vote_equivocation_witness(equivocator: u64, epoch: Epoch, view: SpcView) -> Witness {
-        let ev = build_vote_equivocation(equivocator, epoch, view);
-        Witness::Equivocation(Box::new(ev))
+    fn vote_equivocation_witness(
+        equivocator: u64,
+        epoch: Epoch,
+        view: SpcView,
+    ) -> PcVoteEquivocation {
+        build_vote_equivocation(equivocator, epoch, view)
     }
 
     /// Verified PC vote equivocation against an `OnShard` validator
@@ -1604,7 +1605,7 @@ mod tests {
         let w = vote_equivocation_witness(target.inner(), Epoch::new(5), SpcView::new(0));
         let committed = vec![(
             ValidatorId::new(0),
-            vrf_proposal_with_witnesses(0, state.current_epoch.next(), vec![w]),
+            vrf_proposal_with_equivocations(0, state.current_epoch.next(), vec![w]),
         )];
         let effects = apply_next_epoch(&mut state, &committed);
 
@@ -1637,7 +1638,7 @@ mod tests {
         let w = vote_equivocation_witness(10, Epoch::new(5), SpcView::new(0));
         let committed = vec![(
             ValidatorId::new(0),
-            vrf_proposal_with_witnesses(0, state.current_epoch.next(), vec![w]),
+            vrf_proposal_with_equivocations(0, state.current_epoch.next(), vec![w]),
         )];
         let effects = apply_next_epoch(&mut state, &committed);
 
@@ -1673,7 +1674,7 @@ mod tests {
         let w = vote_equivocation_witness(10, Epoch::new(5), SpcView::new(0));
         let committed = vec![(
             ValidatorId::new(0),
-            vrf_proposal_with_witnesses(0, state.current_epoch.next(), vec![w]),
+            vrf_proposal_with_equivocations(0, state.current_epoch.next(), vec![w]),
         )];
         let effects = apply_next_epoch(&mut state, &committed);
 
@@ -1709,7 +1710,7 @@ mod tests {
         let w = vote_equivocation_witness(10, Epoch::new(5), SpcView::new(0));
         let committed = vec![(
             ValidatorId::new(0),
-            vrf_proposal_with_witnesses(0, state.current_epoch.next(), vec![w]),
+            vrf_proposal_with_equivocations(0, state.current_epoch.next(), vec![w]),
         )];
         let effects = apply_next_epoch(&mut state, &committed);
 

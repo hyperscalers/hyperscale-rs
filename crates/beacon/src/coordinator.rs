@@ -26,13 +26,13 @@ use hyperscale_types::{
     BeaconBlock, BeaconCert, BeaconProposal, BeaconProposalVerifyContext, BeaconState, BlockHash,
     BlockHeight, Bls12381G1PublicKey, CertifiedBeaconBlock, CertifiedBeaconBlockVerifyError,
     CertifiedBlockHeader, Epoch, GenesisConfigHash, Hash, LeafIndex, LocalTimestamp,
-    MAX_WITNESSES_PER_PROPOSER, NetworkDefinition, PcQc3, PcValueElement, PcVector, PcVote1,
-    PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3, PcVote3VerifyError,
-    PcVoteEquivocationContext, PcVoteRound, SKIP_TIMEOUT, SPC_VIEW_TIMEOUT, ShardGroupId,
-    ShardWitness, SkipEpochCert, SkipRequest, SkipRequestVerifyError, SpcCert, SpcEmptyViewMsg,
-    SpcEmptyViewMsgVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError, SpcProposalObject,
-    SpcProposalObjectVerifyError, SpcView, TopologySnapshot, ValidatorId, Verifiable, Verified,
-    Verify, WeightedTimestamp, Witness,
+    MAX_EQUIVOCATIONS_PER_PROPOSER, MAX_SHARD_WITNESSES_PER_PROPOSER, NetworkDefinition, PcQc3,
+    PcValueElement, PcVector, PcVote1, PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3,
+    PcVote3VerifyError, PcVoteEquivocation, PcVoteEquivocationContext, PcVoteRound, SKIP_TIMEOUT,
+    SPC_VIEW_TIMEOUT, ShardGroupId, ShardWitness, SkipEpochCert, SkipRequest,
+    SkipRequestVerifyError, SpcCert, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError, SpcNewCommitMsg,
+    SpcNewCommitMsgVerifyError, SpcProposalObject, SpcProposalObjectVerifyError, SpcView,
+    TopologySnapshot, ValidatorId, Verifiable, Verified, Verify, WeightedTimestamp,
 };
 use tracing::{trace, warn};
 
@@ -888,42 +888,38 @@ impl BeaconCoordinator {
         Vec::new()
     }
 
-    /// Whether every witness embedded in `proposal` positively verifies
-    /// against locally-available state:
-    /// - `Witness::Equivocation` — both BLS sigs verify under the named
-    ///   validator's pubkey (resolved from `state.validators`); evidence
-    ///   naming an unknown validator is unverifiable.
-    /// - `Witness::Shard` — the merkle path reaches the source-shard
+    /// Whether every observation embedded in `proposal` positively
+    /// verifies against locally-available state. Each list runs its own
+    /// element type's `Verify` predicate:
+    /// - equivocation evidence — both BLS sigs verify under the named
+    ///   validator's pubkey (from `state.validators`); evidence naming an
+    ///   unknown validator is unverifiable.
+    /// - shard witness — the merkle path reaches the source-shard
     ///   header's `beacon_witness_root`; a witness whose source header
     ///   hasn't synced yet is unverifiable.
     ///
-    /// A forged witness fails regardless of header availability (a bad
-    /// merkle path can't be made to verify, a forged sig can't pass),
-    /// so an honest node never votes for it. A genuine-but-unsynced
-    /// shard witness merely abstains until the header lands — the
-    /// proposer re-includes the still-unconsumed witness next epoch.
+    /// A forged observation fails regardless of header availability (a bad
+    /// merkle path can't be made to verify, a forged sig can't pass), so
+    /// an honest node never votes for it. A genuine-but-unsynced shard
+    /// witness merely abstains until the header lands — the proposer
+    /// re-includes the still-unconsumed witness next epoch.
     fn proposal_witnesses_verified(&self, proposal: &BeaconProposal) -> bool {
-        proposal.witnesses().iter().all(|witness| match witness {
-            // Each arm resolves its own lookup, then runs the witness
-            // type's own `Verify` predicate: equivocation evidence against
-            // the named validator's pubkey from the registry, a shard
-            // witness against the source header's merkle root. A failed
-            // lookup (unknown validator / unsynced header) reads as
-            // unverifiable.
-            Witness::Equivocation(ev) => {
-                self.state.validators.get(&ev.validator).is_some_and(|rec| {
-                    ev.verify(&PcVoteEquivocationContext {
+        let equivocations_ok = proposal.equivocations().iter().all(|ev| {
+            self.state.validators.get(&ev.validator).is_some_and(|rec| {
+                ev.as_unverified()
+                    .verify(&PcVoteEquivocationContext {
                         network: &self.network,
                         committee: &[(ev.validator, rec.pubkey)],
                     })
                     .is_ok()
-                })
-            }
-            Witness::Shard(sw) => self
-                .witness_fetcher
+            })
+        });
+        let shard_ok = proposal.shard_witnesses().iter().all(|sw| {
+            self.witness_fetcher
                 .find_header_by_block_hash(sw.proof.shard_id, sw.proof.committed_block_hash)
-                .is_some_and(|header| sw.verify(header.as_ref()).is_ok()),
-        })
+                .is_some_and(|header| sw.as_unverified().verify(header.as_ref()).is_ok())
+        });
+        equivocations_ok && shard_ok
     }
 
     /// Whether the current SPC instance is ready to receive its
@@ -995,39 +991,45 @@ impl BeaconCoordinator {
         }
         let epoch = self.proposal_pool.epoch();
         let recipients = self.spc_recipients();
-        let witnesses = self.drain_witnesses_for(epoch);
+        let (shard_witnesses, equivocations) = self.drain_witnesses_for(epoch);
         vec![Action::BuildAndBroadcastBeaconProposal {
             epoch,
-            witnesses,
+            shard_witnesses,
+            equivocations,
             recipients,
         }]
     }
 
-    /// Drain equivocations and eligible shard witnesses for inclusion
-    /// in the proposal for `epoch`, capped at
-    /// [`MAX_WITNESSES_PER_PROPOSER`]. Drained shard witnesses stay in
-    /// the pool; the fetcher evicts them when the chain advances
-    /// `consumed_through` past their leaf indices. Overflow above the
-    /// cap is truncated — the pool retains the excess for a future
-    /// epoch's drain.
-    fn drain_witnesses_for(&mut self, epoch: Epoch) -> Vec<Witness> {
-        let equivocations = self.equivocations.drain_for_proposal();
-        let cap = MAX_WITNESSES_PER_PROPOSER.saturating_sub(equivocations.len());
+    /// Drain eligible shard witnesses and observed equivocations for the
+    /// proposal at `epoch`, each capped independently
+    /// ([`MAX_SHARD_WITNESSES_PER_PROPOSER`] /
+    /// [`MAX_EQUIVOCATIONS_PER_PROPOSER`]) so neither crowds out the
+    /// other. Drained shard witnesses stay in the pool; the fetcher
+    /// evicts them once the chain advances `consumed_through` past their
+    /// leaf indices. Equivocation overflow is re-recorded for a future
+    /// epoch's drain rather than dropped.
+    fn drain_witnesses_for(
+        &mut self,
+        epoch: Epoch,
+    ) -> (Vec<ShardWitness>, Vec<PcVoteEquivocation>) {
+        let mut equivocations = self.equivocations.drain_for_proposal();
+        for overflow in
+            equivocations.split_off(equivocations.len().min(MAX_EQUIVOCATIONS_PER_PROPOSER))
+        {
+            self.equivocations.record_pc_equivocation(overflow);
+        }
 
         let epoch_end_wt =
             epoch_end_weighted_timestamp(epoch, self.state.chain_config.epoch_duration_ms);
-        let mut shard_witnesses = self
+        let mut shard_witnesses: Vec<ShardWitness> = self
             .witness_fetcher
-            .drain_for_proposal(epoch_end_wt, &self.state.consumed_through);
-        shard_witnesses.truncate(cap);
+            .drain_for_proposal(epoch_end_wt, &self.state.consumed_through)
+            .into_iter()
+            .map(|sw| sw.as_ref().as_ref().clone())
+            .collect();
+        shard_witnesses.truncate(MAX_SHARD_WITNESSES_PER_PROPOSER);
 
-        let mut witnesses = equivocations;
-        witnesses.extend(
-            shard_witnesses
-                .into_iter()
-                .map(|sw| Witness::Shard(sw.as_ref().as_ref().clone())),
-        );
-        witnesses
+        (shard_witnesses, equivocations)
     }
 
     /// `TimerId::BeaconCommitteeStart` fired — the upcoming epoch's
@@ -1200,8 +1202,8 @@ impl BeaconCoordinator {
         self.on_beacon_block_received(block)
     }
 
-    /// Pubkey lookup covering every validator referenced by an
-    /// `Witness::Equivocation` in `block`'s committed proposals.
+    /// Pubkey lookup covering every validator referenced by
+    /// `PcVoteEquivocation` in `block`'s committed proposals.
     /// Returns an empty `Vec` when the block carries no equivocations —
     /// the common path. Validators referenced by evidence but missing
     /// from `state.validators` are silently elided; the verifier rejects
@@ -1213,9 +1215,8 @@ impl BeaconCoordinator {
         let mut signers: Vec<(ValidatorId, Bls12381G1PublicKey)> = Vec::new();
         let mut seen: BTreeSet<ValidatorId> = BTreeSet::new();
         for (_, proposal) in block.block().committed_proposals() {
-            for witness in proposal.witnesses().iter() {
-                if let Witness::Equivocation(ev) = witness
-                    && seen.insert(ev.validator)
+            for ev in proposal.equivocations().iter() {
+                if seen.insert(ev.validator)
                     && let Some(rec) = self.state.validators.get(&ev.validator)
                 {
                     signers.push((ev.validator, rec.pubkey));
@@ -2467,7 +2468,8 @@ mod tests {
         let [
             Action::BuildAndBroadcastBeaconProposal {
                 epoch,
-                witnesses,
+                shard_witnesses,
+                equivocations,
                 recipients,
             },
         ] = actions.as_slice()
@@ -2475,7 +2477,8 @@ mod tests {
             panic!("expected BuildAndBroadcastBeaconProposal, got {actions:?}");
         };
         assert_eq!(*epoch, in_flight);
-        assert!(witnesses.is_empty());
+        assert!(shard_witnesses.is_empty());
+        assert!(equivocations.is_empty());
         // Three peers in the n=4 committee (self filtered out).
         assert_eq!(recipients.len(), 3);
         assert!(!recipients.contains(&coord.me));
@@ -2505,9 +2508,22 @@ mod tests {
         assert!(coord.try_propose().is_empty());
     }
 
-    fn proposal_witnesses(actions: &[Action]) -> &[Witness] {
+    fn proposal_shard_witnesses(actions: &[Action]) -> &[ShardWitness] {
         match actions {
-            [Action::BuildAndBroadcastBeaconProposal { witnesses, .. }] => witnesses.as_slice(),
+            [
+                Action::BuildAndBroadcastBeaconProposal {
+                    shard_witnesses, ..
+                },
+            ] => shard_witnesses.as_slice(),
+            other => panic!("expected single BuildAndBroadcastBeaconProposal, got {other:?}"),
+        }
+    }
+
+    fn proposal_equivocations(actions: &[Action]) -> &[PcVoteEquivocation] {
+        match actions {
+            [Action::BuildAndBroadcastBeaconProposal { equivocations, .. }] => {
+                equivocations.as_slice()
+            }
             other => panic!("expected single BuildAndBroadcastBeaconProposal, got {other:?}"),
         }
     }
@@ -2531,9 +2547,9 @@ mod tests {
         assert!(coord.equivocations.record_pc_equivocation(evidence));
 
         let actions = coord.try_propose();
-        let witnesses = proposal_witnesses(&actions);
-        assert_eq!(witnesses.len(), 1);
-        assert!(matches!(witnesses[0], Witness::Equivocation(_)));
+        let equivocations = proposal_equivocations(&actions);
+        assert_eq!(equivocations.len(), 1);
+        assert_eq!(equivocations[0].validator, ValidatorId::new(2));
         assert!(coord.equivocations.is_empty());
     }
 
@@ -2579,9 +2595,8 @@ mod tests {
         assert_eq!(coord.witness_fetcher.pool_len(shard), 1);
 
         let actions = coord.try_propose();
-        let witnesses = proposal_witnesses(&actions);
-        assert_eq!(witnesses.len(), 1);
-        assert!(matches!(witnesses[0], Witness::Shard(_)));
+        let shard_witnesses = proposal_shard_witnesses(&actions);
+        assert_eq!(shard_witnesses.len(), 1);
         // Mark-not-remove: drained witness still resident, marked in
         // `pending_in_proposal` until the chain advances
         // `consumed_through` past its leaf.
@@ -2595,13 +2610,13 @@ mod tests {
 
     #[test]
     fn try_propose_caps_at_max_witnesses_and_retains_overflow_in_pool() {
-        use hyperscale_types::MAX_WITNESSES_PER_PROPOSER;
+        use hyperscale_types::MAX_SHARD_WITNESSES_PER_PROPOSER;
         let mut coord = fresh_coord();
         coord.bootstrap_spc_for_next_epoch();
         let shard = ShardGroupId::new(0);
 
         // Header announces `MAX + 5` accumulator leaves at block-end.
-        let total = MAX_WITNESSES_PER_PROPOSER + 5;
+        let total = MAX_SHARD_WITNESSES_PER_PROPOSER + 5;
         let total_u64 = u64::try_from(total).unwrap();
         let (_anchor, header) = make_verifiable_witness_and_header(shard, 1, 0, total_u64);
         coord
@@ -2616,8 +2631,8 @@ mod tests {
         assert_eq!(coord.witness_fetcher.pool_len(shard), total);
 
         let actions = coord.try_propose();
-        let witnesses = proposal_witnesses(&actions);
-        assert_eq!(witnesses.len(), MAX_WITNESSES_PER_PROPOSER);
+        let shard_witnesses = proposal_shard_witnesses(&actions);
+        assert_eq!(shard_witnesses.len(), MAX_SHARD_WITNESSES_PER_PROPOSER);
         // Mark-not-remove: pool retains every leaf — the cap truncates
         // the proposal output, not the pool. Eviction is driven by
         // `consumed_through` advancement on `adopt_block`.

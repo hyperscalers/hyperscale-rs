@@ -26,12 +26,12 @@ use hyperscale_types::{
     Bls12381G1PrivateKey, Bls12381G1PublicKey, CertificateRoot, CertifiedBeaconBlock,
     CertifiedBeaconBlockVerifyContext, CertifiedBlockHeader, Epoch, GenesisPool, GenesisValidator,
     Hash, InFlightCount, LeafIndex, LocalReceiptRoot, MIN_STAKE_FLOOR, NetworkDefinition,
-    PcValueElement, PcVector, PcVote1, PcVote2, PcVote3, PcVoteVerifyContext, ProposerTimestamp,
-    ProvisionsRoot, QuorumCertificate, Randomness, Round, ShardGroupId, ShardWitness,
-    ShardWitnessPayload, ShardWitnessProof, SignerBitfield, SkipEpochCert, SkipRequest,
-    SkipVerifyContext, SpcEmptyViewMsg, SpcNewCommitMsg, SpcProposalObject, SpcVerifyContext,
-    SpcView, Stake, StakePoolId, StateRoot, TransactionRoot, ValidatorId, Verifiable, Verified,
-    WeightedTimestamp, Witness, bls_keypair_from_seed, compute_merkle_root_with_proof,
+    PcValueElement, PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation, PcVoteVerifyContext,
+    ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Randomness, Round, ShardGroupId,
+    ShardWitness, ShardWitnessPayload, ShardWitnessProof, SignerBitfield, SkipEpochCert,
+    SkipRequest, SkipVerifyContext, SpcEmptyViewMsg, SpcNewCommitMsg, SpcProposalObject,
+    SpcVerifyContext, SpcView, Stake, StakePoolId, StateRoot, TransactionRoot, ValidatorId,
+    Verifiable, Verified, WeightedTimestamp, bls_keypair_from_seed, compute_merkle_root_with_proof,
     genesis_config_hash, pc_context, sign_empty_view_msg, sign_vote1, sign_vote2, sign_vote3,
     spc_context, verify_skip_cert, verify_vote1, verify_vote2, verify_vote3, vrf_sign,
     zero_bls_signature,
@@ -146,11 +146,11 @@ pub struct CoordinatorSim {
     /// Number of Byzantine transforms each replica has applied so far —
     /// test introspection.
     pub byzantine_fires: Vec<usize>,
-    /// Witnesses scheduled to splice into the next `BuildAndBroadcastBeaconProposal`
-    /// at the keyed epoch, regardless of which replica emits it.
-    /// Consumed (drained) the first time a proposal at that epoch is
-    /// absorbed.
-    pending_topology_changes: BTreeMap<Epoch, Vec<Witness>>,
+    /// Observations (shard witnesses, equivocations) scheduled to splice
+    /// into the next `BuildAndBroadcastBeaconProposal` at the keyed
+    /// epoch, regardless of which replica emits it. Consumed (drained)
+    /// the first time a proposal at that epoch is absorbed.
+    pending_topology_changes: BTreeMap<Epoch, (Vec<ShardWitness>, Vec<PcVoteEquivocation>)>,
     /// Single-shot per-pair filter: when `(sender, receiver)` is
     /// present, the next `BuildAndBroadcastBeaconProposal` from
     /// `sender` skips queuing the envelope addressed to `receiver`,
@@ -281,17 +281,28 @@ impl CoordinatorSim {
     /// topology-mutating witnesses (e.g. `DeactivateValidator`) that the
     /// natural sim driver wouldn't otherwise produce. Witnesses for a
     /// given epoch are drained on first fire.
-    pub fn inject_topology_change(&mut self, epoch: Epoch, witnesses: Vec<Witness>) {
+    pub fn inject_topology_change(&mut self, epoch: Epoch, shard_witnesses: Vec<ShardWitness>) {
         self.pending_topology_changes
             .entry(epoch)
             .or_default()
-            .extend(witnesses);
+            .0
+            .extend(shard_witnesses);
+    }
+
+    /// Splice `equivocations` into the next proposal at `epoch`. Same
+    /// one-shot drain semantics as [`Self::inject_topology_change`].
+    pub fn inject_equivocations(&mut self, epoch: Epoch, equivocations: Vec<PcVoteEquivocation>) {
+        self.pending_topology_changes
+            .entry(epoch)
+            .or_default()
+            .1
+            .extend(equivocations);
     }
 
     /// Build a beacon-witness merkle tree carrying `payload` at
     /// `leaf_index`, deliver a source-shard header committing its root to
     /// every replica (so the witness-admission gate's merkle check passes
-    /// on peers), and return the matching `Witness::Shard` for the caller
+    /// on peers), and return the matching `ShardWitness` for the caller
     /// to splice via [`Self::inject_topology_change`]. Deliver before
     /// `kick_off` so the header is present when peers evaluate the
     /// proposal that carries the witness.
@@ -301,7 +312,7 @@ impl CoordinatorSim {
         height: u64,
         leaf_index: u64,
         payload: ShardWitnessPayload,
-    ) -> Witness {
+    ) -> ShardWitness {
         let idx = usize::try_from(leaf_index).expect("leaf index fits usize");
         let leaf_count = leaf_index + 1;
         let mut leaves: Vec<Hash> = (0..leaf_count)
@@ -315,7 +326,7 @@ impl CoordinatorSim {
             let actions = self.coordinators[replica_idx].on_verified_remote_header(&header);
             self.absorb(replica_idx, actions);
         }
-        Witness::Shard(ShardWitness {
+        ShardWitness {
             payload,
             proof: ShardWitnessProof {
                 shard_id: shard,
@@ -323,7 +334,7 @@ impl CoordinatorSim {
                 leaf_index: LeafIndex::new(leaf_index),
                 siblings: siblings.into(),
             },
-        })
+        }
     }
 
     /// Hand `block` directly to `replica_idx` via
@@ -582,20 +593,27 @@ impl CoordinatorSim {
         match action {
             Action::BuildAndBroadcastBeaconProposal {
                 epoch,
-                mut witnesses,
+                mut shard_witnesses,
+                mut equivocations,
                 recipients,
             } => {
-                // Splice in any test-scheduled witnesses for this epoch
+                // Splice in any test-scheduled observations for this epoch
                 // before the proposal's VRF reveal is signed. Consumed
                 // on first fire so only one replica's broadcast picks
                 // them up — that's enough to carry them to commit.
-                if let Some(extras) = self.pending_topology_changes.remove(&epoch) {
-                    witnesses.extend(extras);
+                if let Some((extra_shard, extra_equiv)) =
+                    self.pending_topology_changes.remove(&epoch)
+                {
+                    shard_witnesses.extend(extra_shard);
+                    equivocations.extend(extra_equiv);
                 }
                 let sk = &self.sks[emitter_idx];
                 let (vrf_output, vrf_proof) = vrf_sign(sk, &self.network, epoch);
                 let proposal = Arc::new(Verified::new_unchecked_for_test(BeaconProposal::new(
-                    witnesses, vrf_output, vrf_proof,
+                    shard_witnesses,
+                    equivocations,
+                    vrf_output,
+                    vrf_proof,
                 )));
                 for rcpt in &recipients {
                     if self.blocked_proposal_pairs.remove(&(me, *rcpt)) {
@@ -633,7 +651,7 @@ impl CoordinatorSim {
                     self.byzantine[emitter_idx] = None;
                     self.byzantine_fires[emitter_idx] += 1;
                     let conflicting = Arc::new(Verified::new_unchecked_for_test(
-                        BeaconProposal::new(Vec::new(), vrf_output, vrf_proof),
+                        BeaconProposal::new(Vec::new(), Vec::new(), vrf_output, vrf_proof),
                     ));
                     for rcpt in &recipients {
                         let to_idx = self.idx_of(*rcpt);

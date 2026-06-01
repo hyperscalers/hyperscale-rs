@@ -13,7 +13,7 @@
 
 use std::collections::BTreeMap;
 
-use hyperscale_types::{PcVoteEquivocation, ValidatorId, Witness};
+use hyperscale_types::{PcVoteEquivocation, ValidatorId};
 
 /// Buffered equivocation evidence awaiting inclusion in a beacon
 /// proposal.
@@ -40,14 +40,14 @@ impl EquivocationObservations {
         true
     }
 
-    /// Drain all observed evidence into [`Witness::Equivocation`]
-    /// entries and empty the buffer. The proposer caps the returned
-    /// slice against `MAX_WITNESSES_PER_PROPOSER` and re-records
-    /// anything it dropped if it wants to retry next epoch.
-    pub fn drain_for_proposal(&mut self) -> Vec<Witness> {
+    /// Drain all observed evidence and empty the buffer. The proposer
+    /// caps the returned slice against `MAX_EQUIVOCATIONS_PER_PROPOSER`
+    /// and re-records anything it dropped if it wants to retry next
+    /// epoch.
+    pub fn drain_for_proposal(&mut self) -> Vec<PcVoteEquivocation> {
         std::mem::take(&mut self.by_validator)
             .into_values()
-            .map(Witness::Equivocation)
+            .map(|boxed| *boxed)
             .collect()
     }
 
@@ -126,15 +126,12 @@ mod tests {
     }
 
     #[test]
-    fn drain_returns_all_evidence_as_witnesses_and_empties_buffer() {
+    fn drain_returns_all_evidence_and_empties_buffer() {
         let mut e = EquivocationObservations::new();
         e.record_pc_equivocation(pc_evidence(1));
         e.record_pc_equivocation(pc_evidence(2));
         let drained = e.drain_for_proposal();
         assert_eq!(drained.len(), 2);
-        for witness in &drained {
-            assert!(matches!(witness, Witness::Equivocation(_)));
-        }
         assert!(e.is_empty());
     }
 
@@ -155,15 +152,7 @@ mod tests {
         e.record_pc_equivocation(pc_evidence(7));
         e.record_pc_equivocation(pc_evidence(9));
         let drained = e.drain_for_proposal();
-        let validators: Vec<ValidatorId> = drained
-            .iter()
-            .map(|w| {
-                let Witness::Equivocation(evidence) = w else {
-                    panic!("expected Witness::Equivocation, got {w:?}")
-                };
-                evidence.validator
-            })
-            .collect();
+        let validators: Vec<ValidatorId> = drained.iter().map(|ev| ev.validator).collect();
         assert!(validators.contains(&ValidatorId::new(7)));
         assert!(validators.contains(&ValidatorId::new(9)));
     }

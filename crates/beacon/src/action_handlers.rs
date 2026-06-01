@@ -151,11 +151,17 @@ where
         }
         Action::BuildAndBroadcastBeaconProposal {
             epoch,
-            witnesses,
+            shard_witnesses,
+            equivocations,
             recipients,
         } => {
-            let verified =
-                Verified::<BeaconProposal>::sign_local(ctx.signing_key, network, epoch, witnesses);
+            let verified = Verified::<BeaconProposal>::sign_local(
+                ctx.signing_key,
+                network,
+                epoch,
+                shard_witnesses,
+                equivocations,
+            );
             let proposal = Arc::new(verified);
             ctx.network.notify(
                 &recipients,

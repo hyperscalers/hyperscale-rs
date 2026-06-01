@@ -7,7 +7,7 @@
 //!
 //! These are protocol invariants, not operator-tunable config.
 
-/// Per-proposer fair-share cap on witnesses in a single
+/// Per-proposer cap on shard witnesses in a single
 /// [`BeaconProposal`](crate::BeaconProposal).
 ///
 /// Bounds the proposer's raw wire-bandwidth contribution and the
@@ -15,7 +15,17 @@
 /// to cover legitimate committee turnover (registrations, jails,
 /// unjails) plus headroom; a proposer that tries to crowd in more
 /// loses everything past the cap before any per-witness work runs.
-pub const MAX_WITNESSES_PER_PROPOSER: usize = 32;
+pub const MAX_SHARD_WITNESSES_PER_PROPOSER: usize = 32;
+
+/// Per-proposer cap on equivocation evidence in a single
+/// [`BeaconProposal`](crate::BeaconProposal).
+///
+/// Slashing evidence rides its own reserved slots so a flood of routine
+/// shard witnesses can't crowd it out. Each entry costs two BLS verifies
+/// at admission; the cap times the committee size — gated to one
+/// evaluation per proposer per epoch by the coordinator's dedup — bounds
+/// a Byzantine proposer's forged-evidence verification cost.
+pub const MAX_EQUIVOCATIONS_PER_PROPOSER: usize = 16;
 
 /// Hard cap on a [`PcVector`](crate::PcVector)'s element count.
 ///

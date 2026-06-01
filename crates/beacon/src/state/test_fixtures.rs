@@ -11,9 +11,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use hyperscale_types::{
     BeaconChainConfig, BeaconProposal, BeaconState, BlockHash, Bls12381G1PrivateKey,
     Bls12381G1PublicKey, BoundedVec, Epoch, LeafIndex, MIN_STAKE_FLOOR, NetworkDefinition,
-    PendingWithdrawal, Randomness, ShardCommittee, ShardGroupId, ShardWitness, ShardWitnessPayload,
-    ShardWitnessProof, SlotEffects, Stake, StakePool, StakePoolId, ValidatorId, ValidatorRecord,
-    ValidatorStatus, VrfProof, Witness, bls_keypair_from_seed, vrf_output_from_proof, vrf_sign,
+    PcVoteEquivocation, PendingWithdrawal, Randomness, ShardCommittee, ShardGroupId, ShardWitness,
+    ShardWitnessPayload, ShardWitnessProof, SlotEffects, Stake, StakePool, StakePoolId,
+    ValidatorId, ValidatorRecord, ValidatorStatus, VrfProof, bls_keypair_from_seed,
+    vrf_output_from_proof, vrf_sign,
 };
 
 use crate::state::{ApplyEpochInput, apply_epoch};
@@ -38,7 +39,7 @@ pub fn net() -> NetworkDefinition {
 pub fn vrf_proposal(id: u64, epoch: Epoch) -> BeaconProposal {
     let sk = keypair(id);
     let (output, proof) = vrf_sign(&sk, &net(), epoch);
-    BeaconProposal::new(Vec::new(), output, proof)
+    BeaconProposal::new(Vec::new(), Vec::new(), output, proof)
 }
 
 /// Build a `BeaconProposal` whose VRF proof has been tampered with
@@ -52,7 +53,7 @@ pub fn malformed_vrf_proposal(id: u64, epoch: Epoch) -> BeaconProposal {
     // Output binding still matches the tampered proof (so we get
     // past the binding check); only the BLS verify fails.
     let output = vrf_output_from_proof(&proof);
-    BeaconProposal::new(Vec::new(), output, proof)
+    BeaconProposal::new(Vec::new(), Vec::new(), output, proof)
 }
 
 pub fn validator_record(id: u64, pool: u32, status: ValidatorStatus) -> ValidatorRecord {
@@ -140,18 +141,30 @@ pub fn apply_next_epoch(
 pub fn vrf_proposal_with_witnesses(
     id: u64,
     epoch: Epoch,
-    witnesses: Vec<Witness>,
+    shard_witnesses: Vec<ShardWitness>,
 ) -> BeaconProposal {
     let sk = keypair(id);
     let (output, proof) = vrf_sign(&sk, &net(), epoch);
-    BeaconProposal::new(witnesses, output, proof)
+    BeaconProposal::new(shard_witnesses, Vec::new(), output, proof)
 }
 
-/// Wrap a `ShardWitnessPayload` into a `Witness::Shard` with a
-/// throwaway proof — the watermark gate is the only invariant the
-/// tests exercise, and that only reads `(shard_id, leaf_index)`.
-pub fn shard_witness(shard_id: u64, leaf_index: u64, payload: ShardWitnessPayload) -> Witness {
-    Witness::Shard(ShardWitness {
+/// Build a `BeaconProposal` carrying `equivocations` and no shard
+/// witnesses.
+pub fn vrf_proposal_with_equivocations(
+    id: u64,
+    epoch: Epoch,
+    equivocations: Vec<PcVoteEquivocation>,
+) -> BeaconProposal {
+    let sk = keypair(id);
+    let (output, proof) = vrf_sign(&sk, &net(), epoch);
+    BeaconProposal::new(Vec::new(), equivocations, output, proof)
+}
+
+/// Build a `ShardWitness` with a throwaway proof — the watermark gate
+/// is the only invariant the tests exercise, and that only reads
+/// `(shard_id, leaf_index)`.
+pub fn shard_witness(shard_id: u64, leaf_index: u64, payload: ShardWitnessPayload) -> ShardWitness {
+    ShardWitness {
         payload,
         proof: ShardWitnessProof {
             shard_id: ShardGroupId::new(shard_id),
@@ -159,7 +172,7 @@ pub fn shard_witness(shard_id: u64, leaf_index: u64, payload: ShardWitnessPayloa
             leaf_index: LeafIndex::new(leaf_index),
             siblings: BoundedVec::new(),
         },
-    })
+    }
 }
 
 /// Build a single-pool state with `n_actives` active validators
