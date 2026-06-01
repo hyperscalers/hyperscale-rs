@@ -13,8 +13,8 @@ use thiserror::Error;
 use crate::{
     Bls12381G1PrivateKey, Bls12381G1PublicKey, BoundedVec, Epoch, MAX_EQUIVOCATIONS_PER_PROPOSER,
     MAX_SHARD_WITNESSES_PER_PROPOSER, NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PcValueElement,
-    PcVoteEquivocation, ShardWitness, Verifiable, Verified, Verify, VrfOutput, VrfProof, vrf_sign,
-    vrf_verify,
+    PcVoteEquivocation, ShardWitness, Verifiable, Verified, Verify, VrfOutput, VrfProof,
+    vrf_output_from_proof, vrf_sign, vrf_verify,
 };
 
 /// One committee member's slot submission.
@@ -27,7 +27,8 @@ use crate::{
 pub struct BeaconProposal {
     shard_witnesses: BoundedVec<Verifiable<ShardWitness>, MAX_SHARD_WITNESSES_PER_PROPOSER>,
     equivocations: BoundedVec<Verifiable<PcVoteEquivocation>, MAX_EQUIVOCATIONS_PER_PROPOSER>,
-    vrf_output: VrfOutput,
+    /// The VRF proof for this slot. The output is `vrf_output()`, a pure
+    /// function of the proof — never stored, so it can't disagree.
     vrf_proof: VrfProof,
 }
 
@@ -41,7 +42,6 @@ impl BeaconProposal {
     pub fn new(
         shard_witnesses: Vec<ShardWitness>,
         equivocations: Vec<PcVoteEquivocation>,
-        vrf_output: VrfOutput,
         vrf_proof: VrfProof,
     ) -> Self {
         Self {
@@ -55,7 +55,6 @@ impl BeaconProposal {
                 .map(Verifiable::from)
                 .collect::<Vec<_>>()
                 .into(),
-            vrf_output,
             vrf_proof,
         }
     }
@@ -63,11 +62,10 @@ impl BeaconProposal {
     /// Empty proposal — no observations, given VRF reveal. Useful for
     /// committee members with nothing to observe in a given slot.
     #[must_use]
-    pub const fn vrf_only(vrf_output: VrfOutput, vrf_proof: VrfProof) -> Self {
+    pub const fn vrf_only(vrf_proof: VrfProof) -> Self {
         Self {
             shard_witnesses: BoundedVec::new(),
             equivocations: BoundedVec::new(),
-            vrf_output,
             vrf_proof,
         }
     }
@@ -92,11 +90,13 @@ impl BeaconProposal {
         &self.equivocations
     }
 
-    /// VRF output for this slot — mixed into beacon randomness once
-    /// the committee commits to the slot's proposal set.
+    /// VRF output for this slot — `BLAKE3` of the proof, mixed into
+    /// beacon randomness once the committee commits to the slot's
+    /// proposal set. Derived on demand from [`Self::vrf_proof`], so it
+    /// can never disagree with the proof.
     #[must_use]
-    pub const fn vrf_output(&self) -> VrfOutput {
-        self.vrf_output
+    pub fn vrf_output(&self) -> VrfOutput {
+        vrf_output_from_proof(&self.vrf_proof)
     }
 
     /// VRF proof — verifiable under the proposer's pubkey against the
@@ -184,13 +184,7 @@ impl Verify<&BeaconProposalVerifyContext<'_>> for BeaconProposal {
     /// `CertifiedBeaconBlock` boundary and isn't part of this
     /// predicate.
     fn verify(&self, ctx: &BeaconProposalVerifyContext<'_>) -> Result<Verified<Self>, Self::Error> {
-        if !vrf_verify(
-            &ctx.sender_pk,
-            ctx.network,
-            ctx.epoch,
-            &self.vrf_output,
-            &self.vrf_proof,
-        ) {
+        if !vrf_verify(&ctx.sender_pk, ctx.network, ctx.epoch, &self.vrf_proof) {
             return Err(BeaconProposalVerifyError::BadVrfReveal);
         }
         Ok(Verified::new_unchecked(self.clone()))
@@ -217,11 +211,10 @@ impl Verified<BeaconProposal> {
         shard_witnesses: Vec<ShardWitness>,
         equivocations: Vec<PcVoteEquivocation>,
     ) -> Self {
-        let (vrf_output, vrf_proof) = vrf_sign(sk, network, epoch);
+        let vrf_proof = vrf_sign(sk, network, epoch);
         Self::new_unchecked(BeaconProposal::new(
             shard_witnesses,
             equivocations,
-            vrf_output,
             vrf_proof,
         ))
     }
@@ -288,7 +281,6 @@ mod tests {
         BeaconProposal::new(
             vec![sample_witness(0), sample_witness(1), sample_witness(2)],
             Vec::new(),
-            VrfOutput::new([0xAB; 32]),
             VrfProof::new([0xCD; 96]),
         )
     }
@@ -303,11 +295,12 @@ mod tests {
 
     #[test]
     fn vrf_only_has_no_witnesses() {
-        let p = BeaconProposal::vrf_only(VrfOutput::ZERO, VrfProof::ZERO);
+        let p = BeaconProposal::vrf_only(VrfProof::ZERO);
         assert!(p.shard_witnesses().is_empty());
         assert!(p.equivocations().is_empty());
-        assert_eq!(p.vrf_output(), VrfOutput::ZERO);
         assert_eq!(p.vrf_proof(), VrfProof::ZERO);
+        // Output is derived from the proof, not the all-zero sentinel.
+        assert_eq!(p.vrf_output(), vrf_output_from_proof(&VrfProof::ZERO));
     }
 
     /// Hand-roll a `BeaconProposal` whose `shard_witnesses` length
@@ -322,8 +315,8 @@ mod tests {
             enc.write_payload_prefix(BASIC_SBOR_V1_PAYLOAD_PREFIX)
                 .unwrap();
             enc.write_value_kind(ValueKind::Tuple).unwrap();
-            // BeaconProposal has 4 fields.
-            enc.write_size(4).unwrap();
+            // BeaconProposal has 3 fields.
+            enc.write_size(3).unwrap();
             // Oversized shard-witnesses array (the first field).
             enc.write_value_kind(ValueKind::Array).unwrap();
             enc.write_value_kind(ShardWitness::value_kind()).unwrap();
@@ -346,8 +339,12 @@ mod tests {
         let p = sample_proposal();
         assert_eq!(p.shard_witnesses().len(), 3);
         assert!(p.equivocations().is_empty());
-        assert_eq!(p.vrf_output(), VrfOutput::new([0xAB; 32]));
         assert_eq!(p.vrf_proof(), VrfProof::new([0xCD; 96]));
+        // Output is derived from the proof.
+        assert_eq!(
+            p.vrf_output(),
+            vrf_output_from_proof(&VrfProof::new([0xCD; 96]))
+        );
     }
 
     #[test]

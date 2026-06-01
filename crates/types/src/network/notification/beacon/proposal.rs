@@ -73,10 +73,10 @@ mod tests {
     use sbor::prelude::*;
 
     use super::*;
-    use crate::{VrfOutput, VrfProof};
+    use crate::VrfProof;
 
     fn sample_proposal() -> BeaconProposal {
-        BeaconProposal::vrf_only(VrfOutput::new([0x11; 32]), VrfProof::new([0x22; 96]))
+        BeaconProposal::vrf_only(VrfProof::new([0x22; 96]))
     }
 
     #[test]

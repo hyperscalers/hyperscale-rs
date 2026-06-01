@@ -82,10 +82,8 @@ pub(super) fn filter_and_roll_randomness<'a>(
             rejected_reveals.push(*party);
             continue;
         };
-        let output = prop.vrf_output();
-        let proof = prop.vrf_proof();
-        if vrf_verify(&pk, network, epoch, &output, &proof) {
-            accepted_outputs.push(output);
+        if vrf_verify(&pk, network, epoch, &prop.vrf_proof()) {
+            accepted_outputs.push(prop.vrf_output());
             accepted.push(entry);
         } else {
             rejected_reveals.push(*party);

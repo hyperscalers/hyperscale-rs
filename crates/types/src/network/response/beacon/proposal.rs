@@ -49,13 +49,12 @@ mod tests {
     use sbor::{basic_decode, basic_encode};
 
     use super::*;
-    use crate::{VrfOutput, VrfProof};
+    use crate::VrfProof;
 
     fn sample_proposal() -> Arc<Verifiable<BeaconProposal>> {
-        Arc::new(Verifiable::from(BeaconProposal::vrf_only(
-            VrfOutput::new([0xAB; 32]),
-            VrfProof::new([0xCD; 96]),
-        )))
+        Arc::new(Verifiable::from(BeaconProposal::vrf_only(VrfProof::new(
+            [0xCD; 96],
+        ))))
     }
 
     #[test]

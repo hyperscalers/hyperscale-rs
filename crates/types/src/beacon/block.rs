@@ -118,13 +118,12 @@ impl BeaconBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{VRF_PROOF_BYTES, VrfOutput, VrfProof};
+    use crate::{VRF_PROOF_BYTES, VrfProof};
 
     fn sample_proposal(seed: u8) -> BeaconProposal {
         BeaconProposal::new(
             Vec::new(),
             Vec::new(),
-            VrfOutput::new([seed; 32]),
             VrfProof::new([seed; VRF_PROOF_BYTES]),
         )
     }

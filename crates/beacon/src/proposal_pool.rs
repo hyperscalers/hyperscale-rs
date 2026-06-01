@@ -126,13 +126,12 @@ impl BeaconProposalPool {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::{BeaconProposal, Epoch, ValidatorId, Verified, VrfOutput, VrfProof};
+    use hyperscale_types::{BeaconProposal, Epoch, ValidatorId, Verified, VrfProof};
 
     use super::*;
 
     fn proposal(seed: u8) -> Arc<Verified<BeaconProposal>> {
         Arc::new(Verified::new_unchecked_for_test(BeaconProposal::vrf_only(
-            VrfOutput::new([seed; 32]),
             VrfProof::new([seed; 96]),
         )))
     }
@@ -169,7 +168,7 @@ mod tests {
         assert!(!pool.admit(ValidatorId::new(0), Epoch::new(1), proposal(0xCD)));
         assert_eq!(pool.len(), 1);
         let kept = pool.get(ValidatorId::new(0)).expect("first entry kept");
-        assert_eq!(kept.vrf_output(), VrfOutput::new([0xAB; 32]));
+        assert_eq!(kept.vrf_proof(), VrfProof::new([0xAB; 96]));
     }
 
     #[test]

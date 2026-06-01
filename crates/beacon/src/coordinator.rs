@@ -2434,9 +2434,8 @@ mod tests {
     }
 
     fn sample_proposal(seed: u8) -> Arc<Verified<BeaconProposal>> {
-        use hyperscale_types::{VrfOutput, VrfProof};
+        use hyperscale_types::VrfProof;
         Arc::new(Verified::new_unchecked_for_test(BeaconProposal::vrf_only(
-            VrfOutput::new([seed; 32]),
             VrfProof::new([seed; 96]),
         )))
     }

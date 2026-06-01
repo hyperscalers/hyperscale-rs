@@ -13,8 +13,7 @@ use hyperscale_types::{
     Bls12381G1PublicKey, BoundedVec, Epoch, LeafIndex, MIN_STAKE_FLOOR, NetworkDefinition,
     PcVoteEquivocation, PendingWithdrawal, Randomness, ShardCommittee, ShardGroupId, ShardWitness,
     ShardWitnessPayload, ShardWitnessProof, SlotEffects, Stake, StakePool, StakePoolId,
-    ValidatorId, ValidatorRecord, ValidatorStatus, VrfProof, bls_keypair_from_seed,
-    vrf_output_from_proof, vrf_sign,
+    ValidatorId, ValidatorRecord, ValidatorStatus, VrfProof, bls_keypair_from_seed, vrf_sign,
 };
 
 use crate::state::{ApplyEpochInput, apply_epoch};
@@ -38,22 +37,18 @@ pub fn net() -> NetworkDefinition {
 /// stage); just a deterministic VRF reveal.
 pub fn vrf_proposal(id: u64, epoch: Epoch) -> BeaconProposal {
     let sk = keypair(id);
-    let (output, proof) = vrf_sign(&sk, &net(), epoch);
-    BeaconProposal::new(Vec::new(), Vec::new(), output, proof)
+    let proof = vrf_sign(&sk, &net(), epoch);
+    BeaconProposal::new(Vec::new(), Vec::new(), proof)
 }
 
-/// Build a `BeaconProposal` whose VRF proof has been tampered with
-/// so verification fails. The (output, proof) pair is internally
-/// consistent by hash binding, but the BLS sig is broken.
+/// Build a `BeaconProposal` whose VRF proof has been tampered with so
+/// verification fails — the BLS sig is broken. The derived output
+/// tracks the tampered proof automatically.
 pub fn malformed_vrf_proposal(id: u64, epoch: Epoch) -> BeaconProposal {
     let p = vrf_proposal(id, epoch);
     let mut bytes = *p.vrf_proof().as_bytes();
     bytes[0] ^= 1;
-    let proof = VrfProof::new(bytes);
-    // Output binding still matches the tampered proof (so we get
-    // past the binding check); only the BLS verify fails.
-    let output = vrf_output_from_proof(&proof);
-    BeaconProposal::new(Vec::new(), Vec::new(), output, proof)
+    BeaconProposal::new(Vec::new(), Vec::new(), VrfProof::new(bytes))
 }
 
 pub fn validator_record(id: u64, pool: u32, status: ValidatorStatus) -> ValidatorRecord {
@@ -144,8 +139,8 @@ pub fn vrf_proposal_with_witnesses(
     shard_witnesses: Vec<ShardWitness>,
 ) -> BeaconProposal {
     let sk = keypair(id);
-    let (output, proof) = vrf_sign(&sk, &net(), epoch);
-    BeaconProposal::new(shard_witnesses, Vec::new(), output, proof)
+    let proof = vrf_sign(&sk, &net(), epoch);
+    BeaconProposal::new(shard_witnesses, Vec::new(), proof)
 }
 
 /// Build a `BeaconProposal` carrying `equivocations` and no shard
@@ -156,8 +151,8 @@ pub fn vrf_proposal_with_equivocations(
     equivocations: Vec<PcVoteEquivocation>,
 ) -> BeaconProposal {
     let sk = keypair(id);
-    let (output, proof) = vrf_sign(&sk, &net(), epoch);
-    BeaconProposal::new(Vec::new(), equivocations, output, proof)
+    let proof = vrf_sign(&sk, &net(), epoch);
+    BeaconProposal::new(Vec::new(), equivocations, proof)
 }
 
 /// Build a `ShardWitness` with a throwaway proof — the watermark gate

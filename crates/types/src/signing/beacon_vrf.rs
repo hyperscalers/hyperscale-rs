@@ -55,48 +55,36 @@ pub fn vrf_output_from_proof(proof: &VrfProof) -> VrfOutput {
     VrfOutput::new(*h.finalize().as_bytes())
 }
 
-/// Sign `(network, epoch)` and return the resulting `(VrfOutput,
-/// VrfProof)` pair.
+/// Sign `(network, epoch)` and return the VRF proof. The output is
+/// [`vrf_output_from_proof`] of the result — a pure function of the
+/// proof, never stored separately.
 ///
 /// Deterministic — BLS sigs in min-pk mode are a function of `(sk,
 /// message)` only, so the same `(sk, network, epoch)` always produces
-/// the same pair.
+/// the same proof.
 #[must_use]
-pub fn vrf_sign(
-    sk: &Bls12381G1PrivateKey,
-    network: &NetworkDefinition,
-    epoch: Epoch,
-) -> (VrfOutput, VrfProof) {
+pub fn vrf_sign(sk: &Bls12381G1PrivateKey, network: &NetworkDefinition, epoch: Epoch) -> VrfProof {
     let msg = vrf_reveal_message(network, epoch);
     let sig = sk.sign_v1(&msg);
-    let proof = VrfProof::new(sig.0);
-    let output = vrf_output_from_proof(&proof);
-    (output, proof)
+    VrfProof::new(sig.0)
 }
 
-/// Verify that `(output, proof)` was produced by `pk` over `(network,
-/// epoch)`.
+/// Verify that `proof` was produced by `pk` over `(network, epoch)`.
 ///
-/// Two checks, both must hold:
-/// 1. `proof` (as a BLS sig) verifies against `pk` over the bytes
-///    produced by [`vrf_reveal_message`] at `(network, epoch)`.
-/// 2. `output == vrf_output_from_proof(proof)`. Without this an
-///    adversary holding a valid `(pk, proof)` pair could grind any
-///    `output` they wanted into beacon randomness.
+/// The VRF output is a pure function of the proof
+/// ([`vrf_output_from_proof`]), so there is nothing to grind and only one
+/// check: the proof, as a BLS sig, verifies against `pk` over the bytes
+/// produced by [`vrf_reveal_message`] at `(network, epoch)`.
 #[must_use]
 pub fn vrf_verify(
     pk: &Bls12381G1PublicKey,
     network: &NetworkDefinition,
     epoch: Epoch,
-    output: &VrfOutput,
     proof: &VrfProof,
 ) -> bool {
     let msg = vrf_reveal_message(network, epoch);
     let sig = Bls12381G2Signature(*proof.as_bytes());
-    if !verify_bls12381_v1(&msg, pk, &sig) {
-        return false;
-    }
-    *output == vrf_output_from_proof(proof)
+    verify_bls12381_v1(&msg, pk, &sig)
 }
 
 #[cfg(test)]
@@ -172,17 +160,11 @@ mod tests {
     #[test]
     fn vrf_sign_verify_round_trip() {
         let sk = keypair(3);
-        let (output, proof) = vrf_sign(&sk, &net(), Epoch::new(42));
-        assert!(vrf_verify(
-            &sk.public_key(),
-            &net(),
-            Epoch::new(42),
-            &output,
-            &proof
-        ));
+        let proof = vrf_sign(&sk, &net(), Epoch::new(42));
+        assert!(vrf_verify(&sk.public_key(), &net(), Epoch::new(42), &proof));
     }
 
-    /// Deterministic: same inputs → same outputs across replicas.
+    /// Deterministic: same inputs → same proof across replicas.
     #[test]
     fn vrf_sign_is_deterministic() {
         let sk = keypair(7);
@@ -196,12 +178,11 @@ mod tests {
     fn vrf_verify_rejects_cross_party() {
         let sk_a = keypair(3);
         let sk_b = keypair(4);
-        let (output, proof) = vrf_sign(&sk_a, &net(), Epoch::new(42));
+        let proof = vrf_sign(&sk_a, &net(), Epoch::new(42));
         assert!(!vrf_verify(
             &sk_b.public_key(),
             &net(),
             Epoch::new(42),
-            &output,
             &proof
         ));
     }
@@ -211,12 +192,11 @@ mod tests {
     #[test]
     fn vrf_verify_rejects_wrong_slot() {
         let sk = keypair(3);
-        let (output, proof) = vrf_sign(&sk, &net(), Epoch::new(42));
+        let proof = vrf_sign(&sk, &net(), Epoch::new(42));
         assert!(!vrf_verify(
             &sk.public_key(),
             &net(),
             Epoch::new(43),
-            &output,
             &proof
         ));
     }
@@ -227,41 +207,22 @@ mod tests {
     #[test]
     fn vrf_verify_rejects_cross_network() {
         let sk = keypair(3);
-        let (output, proof) = vrf_sign(&sk, &NetworkDefinition::mainnet(), Epoch::new(42));
+        let proof = vrf_sign(&sk, &NetworkDefinition::mainnet(), Epoch::new(42));
         assert!(!vrf_verify(
             &sk.public_key(),
             &NetworkDefinition::stokenet(),
             Epoch::new(42),
-            &output,
             &proof,
         ));
     }
 
-    /// Tampered output (proof still valid) must reject. Without the
-    /// `output == hash(proof)` check an adversary could grind a chosen
-    /// output into beacon randomness while presenting a real proof.
-    #[test]
-    fn vrf_verify_rejects_tampered_output() {
-        let sk = keypair(3);
-        let (output, proof) = vrf_sign(&sk, &net(), Epoch::new(42));
-        let mut bytes = *output.as_bytes();
-        bytes[0] ^= 1;
-        let output = VrfOutput::new(bytes);
-        assert!(!vrf_verify(
-            &sk.public_key(),
-            &net(),
-            Epoch::new(42),
-            &output,
-            &proof
-        ));
-    }
-
-    /// Tampered proof (BLS sig invalid) must reject — the BLS verify
-    /// fails before the output-binding check.
+    /// Tampered proof (BLS sig invalid) must reject. The output can't be
+    /// tampered independently — it's derived from the proof — so the
+    /// proof's BLS check is the whole predicate.
     #[test]
     fn vrf_verify_rejects_tampered_proof() {
         let sk = keypair(3);
-        let (output, proof) = vrf_sign(&sk, &net(), Epoch::new(42));
+        let proof = vrf_sign(&sk, &net(), Epoch::new(42));
         let mut bytes = *proof.as_bytes();
         bytes[0] ^= 1;
         let proof = VrfProof::new(bytes);
@@ -269,7 +230,6 @@ mod tests {
             &sk.public_key(),
             &net(),
             Epoch::new(42),
-            &output,
             &proof
         ));
     }

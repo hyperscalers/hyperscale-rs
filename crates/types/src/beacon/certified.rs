@@ -445,14 +445,13 @@ mod tests {
     use crate::{
         BeaconBlockHash, BeaconProposal, Bls12381G2Signature, Hash, PcQc2, PcQc3, PcSignerLengths,
         PcVector, PcXpProof, SignerBitfield, SkipEpochCert, SpcCert, SpcView, VRF_PROOF_BYTES,
-        ValidatorId, VrfOutput, VrfProof, bls_keypair_from_seed,
+        ValidatorId, VrfProof, bls_keypair_from_seed,
     };
 
     fn proposal(seed: u8) -> BeaconProposal {
         BeaconProposal::new(
             Vec::new(),
             Vec::new(),
-            VrfOutput::new([seed; 32]),
             VrfProof::new([seed; VRF_PROOF_BYTES]),
         )
     }

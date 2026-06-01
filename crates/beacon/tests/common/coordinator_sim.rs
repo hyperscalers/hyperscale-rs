@@ -608,11 +608,10 @@ impl CoordinatorSim {
                     equivocations.extend(extra_equiv);
                 }
                 let sk = &self.sks[emitter_idx];
-                let (vrf_output, vrf_proof) = vrf_sign(sk, &self.network, epoch);
+                let vrf_proof = vrf_sign(sk, &self.network, epoch);
                 let proposal = Arc::new(Verified::new_unchecked_for_test(BeaconProposal::new(
                     shard_witnesses,
                     equivocations,
-                    vrf_output,
                     vrf_proof,
                 )));
                 for rcpt in &recipients {
@@ -651,7 +650,7 @@ impl CoordinatorSim {
                     self.byzantine[emitter_idx] = None;
                     self.byzantine_fires[emitter_idx] += 1;
                     let conflicting = Arc::new(Verified::new_unchecked_for_test(
-                        BeaconProposal::new(Vec::new(), Vec::new(), vrf_output, vrf_proof),
+                        BeaconProposal::new(Vec::new(), Vec::new(), vrf_proof),
                     ));
                     for rcpt in &recipients {
                         let to_idx = self.idx_of(*rcpt);
