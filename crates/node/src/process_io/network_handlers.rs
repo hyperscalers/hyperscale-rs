@@ -439,7 +439,8 @@ where
         // Beacon-block gossip is `TopicScope::Global`; the framework
         // fans it out to every hosted shard. Each shard's vnodes
         // process the gossip independently through `handle_beacon` —
-        // `pending_blocks` dedups at the coordinator level.
+        // the coordinator dedups verification by block hash and ignores
+        // blocks at or behind its tip.
         let senders = self.process.shard_event_senders.clone();
         self.process
             .network

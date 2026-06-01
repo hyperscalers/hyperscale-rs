@@ -36,7 +36,6 @@ use hyperscale_types::{
 use tracing::{trace, warn};
 
 use crate::equivocations::EquivocationObservations;
-use crate::pending_blocks::PendingBeaconBlocks;
 use crate::proposal_pool::BeaconProposalPool;
 use crate::skip_tracker::SkipTracker;
 use crate::spc::{SpcEffect, SpcEvent, SpcInstance};
@@ -63,10 +62,6 @@ pub struct BeaconCoordinator {
     /// trigger, and again briefly between an epoch's commit and the
     /// next instance's bootstrap.
     spc: Option<SpcInstance>,
-
-    /// Gossip-arrival cache for beacon blocks awaiting verification.
-    /// Pruned past `state.current_epoch` after every committed epoch.
-    pending_blocks: PendingBeaconBlocks,
 
     /// In-flight and verified slot tracking for async crypto checks
     /// (block cert sigs + skip-request sigs). Dedup-only — the payload
@@ -183,7 +178,6 @@ impl BeaconCoordinator {
             state: latest_state,
             latest_block,
             spc: None,
-            pending_blocks: PendingBeaconBlocks::new(),
             verification: BeaconVerificationPipeline::new(),
             witness_fetcher: ShardWitnessFetchTracker::new(),
             skip_tracker: SkipTracker::new(),
@@ -1022,8 +1016,10 @@ impl BeaconCoordinator {
     /// topic. After structural checks, dispatch cert verification to
     /// the crypto pool and stash the block until the result lands; on
     /// success [`Self::on_beacon_block_verified`] hands the verified
-    /// block off to [`Self::adopt_block`]. Blocks too far ahead of the
-    /// local tip land in `pending_blocks` for future redrive.
+    /// block off to [`Self::adopt_block`]. A block more than one epoch
+    /// ahead of the local tip is dropped and triggers gap-fill sync
+    /// ([`Action::StartBeaconBlockSync`]) to fetch the missing epochs in
+    /// order.
     ///
     /// Cert verification uses `self.state.committee` for Normal blocks
     /// and the active pool for Skip blocks. Committee rotation across
@@ -1049,10 +1045,14 @@ impl BeaconCoordinator {
             trace!(
                 epoch = epoch.inner(),
                 expected = expected_epoch.inner(),
-                "BeaconBlockReceived for future epoch — buffering",
+                "BeaconBlockReceived for future epoch — triggering sync",
             );
-            self.pending_blocks.insert(block);
-            return Vec::new();
+            // Drop the unverified block and let gap-fill sync fetch the
+            // missing epochs in order from storage-backed peers. The
+            // claimed epoch is only a target hint — the runner's sync
+            // backs off on epochs that don't exist, so a bogus far-future
+            // epoch can't busy-loop the network.
+            return vec![Action::StartBeaconBlockSync { target: epoch }];
         }
 
         if block.prev_block_hash() != self.latest_block.block_hash() {
@@ -1516,8 +1516,6 @@ impl BeaconCoordinator {
 
         let next_epoch = self.state.current_epoch.next();
         self.proposal_pool.reset(next_epoch);
-        self.pending_blocks
-            .prune_committed(self.state.current_epoch);
 
         // Emit on every commit. Suppression for no-op transitions
         // (committee unchanged) is a future optimisation — at n=128
@@ -1964,7 +1962,6 @@ impl std::fmt::Debug for BeaconCoordinator {
             .field("latest_block_hash", &self.latest_block.block_hash())
             .field("me", &self.me)
             .field("spc_active", &self.spc.is_some())
-            .field("pending_blocks", &self.pending_blocks.len())
             .field(
                 "verifications_in_flight",
                 &self.verification.in_flight_count(),
@@ -2572,20 +2569,22 @@ mod tests {
         )));
         let actions = coord.on_beacon_block_received(block);
         assert!(actions.is_empty());
-        assert!(coord.pending_blocks.is_empty());
         assert_eq!(coord.state.current_epoch, Epoch::GENESIS);
     }
 
     #[test]
-    fn on_beacon_block_received_buffers_future_epoch() {
+    fn on_beacon_block_received_triggers_sync_for_future_epoch() {
         let mut coord = fresh_coord();
         let prev = coord.latest_block.block_hash();
         let block = valid_block_at(&coord, Epoch::new(5), prev);
-        let block_hash = block.block_hash();
         let actions = coord.on_beacon_block_received(block);
-        assert!(actions.is_empty());
-        assert_eq!(coord.pending_blocks.len(), 1);
-        assert!(coord.pending_blocks.contains_key(block_hash));
+        // A block more than one epoch ahead drops and triggers gap-fill
+        // sync up to its claimed epoch; the tip doesn't move.
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(
+            actions[0],
+            Action::StartBeaconBlockSync { target } if target == Epoch::new(5)
+        ));
         assert_eq!(coord.state.current_epoch, Epoch::GENESIS);
     }
 
@@ -2595,7 +2594,6 @@ mod tests {
         let block = valid_block_at(&coord, Epoch::new(1), BeaconBlockHash::ZERO);
         let actions = coord.on_beacon_block_received(block);
         assert!(actions.is_empty());
-        assert!(coord.pending_blocks.is_empty());
     }
 
     #[test]

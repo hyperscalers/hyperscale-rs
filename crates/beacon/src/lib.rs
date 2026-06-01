@@ -16,7 +16,6 @@ pub mod coordinator;
 pub mod equivocations;
 pub mod genesis;
 pub mod pc;
-pub mod pending_blocks;
 pub mod proposal_pool;
 pub mod sampling;
 pub mod skip_tracker;

@@ -69,6 +69,13 @@ pub enum FetchFailureKind {
     /// Transport-level error (connection issue, network shutdown). Rare;
     /// defer with backoff.
     Transport,
+    /// The peer answered, but doesn't have the requested height/epoch.
+    /// Defers with backoff: a sustained not-found (e.g. a beacon sync
+    /// target set from an unverified block beyond the chain's real tip)
+    /// must not busy-loop the network re-requesting an epoch nobody has
+    /// yet. Distinct from `Exhausted`, which re-queues immediately for a
+    /// height that's known to exist.
+    NotFound,
 }
 
 /// Inputs whose dispatch is anchored to a specific hosted shard.

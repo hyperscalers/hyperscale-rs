@@ -623,9 +623,12 @@ impl<B: SyncBinding> Sync<B> {
                         state.deferred.remove(&h);
                         state.queue_height(h);
                     }
-                    // Empty committee or transport-level fault — no point
-                    // retrying immediately. Apply the standard backoff.
-                    FetchFailureKind::NoPeers | FetchFailureKind::Transport => {
+                    // Empty committee, transport fault, or a peer that
+                    // doesn't have this height yet — no point retrying
+                    // immediately. Apply the standard backoff.
+                    FetchFailureKind::NoPeers
+                    | FetchFailureKind::Transport
+                    | FetchFailureKind::NotFound => {
                         state.deferred.entry(h).or_default().advance_round(now);
                     }
                 }

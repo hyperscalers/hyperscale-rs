@@ -80,9 +80,12 @@ where
         block: Option<Arc<Verifiable<CertifiedBeaconBlock>>>,
     ) {
         let Some(block) = block else {
-            // Treat a missing block as exhausted so the FSM re-queues
-            // without piling its own backoff on the request manager's.
-            self.feed_beacon_block_sync_fetch_failed(epoch, FetchFailureKind::Exhausted);
+            // The peer doesn't have this epoch. Back off rather than
+            // re-queue immediately: the sync target comes from an
+            // unverified gossip block, so a bogus far-future epoch would
+            // otherwise busy-loop the network fetching an epoch nobody
+            // has produced yet.
+            self.feed_beacon_block_sync_fetch_failed(epoch, FetchFailureKind::NotFound);
             return;
         };
         self.dispatch_event(ProtocolEvent::BeaconBlockSyncReadyToApply { block });
