@@ -26,9 +26,9 @@ use sbor::{
 use thiserror::Error;
 
 use crate::{
-    BeaconBlock, BeaconBlockHash, BeaconCert, Bls12381G1PublicKey, Epoch, GenesisConfigHash,
-    NetworkDefinition, PcValueElement, ValidatorId, Verified, Verify, spc_context,
-    verify_block_cert, verify_skip_cert, verify_vote_equivocation,
+    BeaconBlock, BeaconBlockHash, BeaconCert, BeaconProposal, Bls12381G1PublicKey, Epoch,
+    GenesisConfigHash, NetworkDefinition, PcValueElement, SpcCert, ValidatorId, Verified, Verify,
+    spc_context, verify_block_cert, verify_skip_cert, verify_vote_equivocation,
 };
 
 /// A beacon block paired with the cert that authenticates it.
@@ -353,6 +353,35 @@ impl Verified<CertifiedBeaconBlock> {
         cert: BeaconCert,
     ) -> Result<Self, CertifiedBeaconBlockPairingError> {
         CertifiedBeaconBlock::new_checked(block, cert).map(Self::new_unchecked)
+    }
+
+    /// Assemble a `Normal` beacon block from the SPC-committed proposals
+    /// and the cert that authenticates them. Consumes the typed
+    /// `Verified<BeaconProposal>` set and the `Verified<SpcCert>` by
+    /// value, so a `Normal` `CertifiedBeaconBlock` cannot be built from
+    /// unverified proposals or an unverified cert — verification is a
+    /// type-level precondition, not a convention.
+    ///
+    /// Mirror of the shard [`Verified::<CertifiedBlock>::assemble`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CertifiedBeaconBlockPairingError`] if the resulting
+    /// block/cert shapes don't pair (e.g. a `Normal` cert at the genesis
+    /// epoch).
+    pub fn assemble(
+        epoch: Epoch,
+        prev_block_hash: BeaconBlockHash,
+        committed: Vec<(ValidatorId, Verified<BeaconProposal>)>,
+        cert: Verified<SpcCert>,
+    ) -> Result<Self, CertifiedBeaconBlockPairingError> {
+        let proposals: Vec<(ValidatorId, BeaconProposal)> = committed
+            .into_iter()
+            .map(|(id, proposal)| (id, proposal.into_inner()))
+            .collect();
+        let block = BeaconBlock::new(epoch, prev_block_hash, proposals);
+        CertifiedBeaconBlock::new_checked(block, BeaconCert::Normal(Box::new(cert.into_inner())))
+            .map(Self::new_unchecked)
     }
 
     /// Genesis bootstrap pair, verified by construction — the genesis

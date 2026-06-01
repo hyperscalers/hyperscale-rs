@@ -146,8 +146,10 @@ struct PendingCommitAssembly {
 /// Result of [`BeaconCoordinator::decode_committed_proposals`].
 enum DecodeOutcome {
     /// Every non-zero `PcVector` element resolved to a pooled
-    /// proposal with a matching hash; block assembly may proceed.
-    Complete(Vec<(ValidatorId, BeaconProposal)>),
+    /// proposal with a matching hash; block assembly may proceed. The
+    /// pooled `Verified<BeaconProposal>` is carried through so the block
+    /// assembles from verified proposals.
+    Complete(Vec<(ValidatorId, Verified<BeaconProposal>)>),
     /// At least one element points to a `(validator, epoch)` not in
     /// the local pool; the listed validators need fetching before
     /// assembly can complete.
@@ -1743,16 +1745,13 @@ impl BeaconCoordinator {
     fn assemble_and_adopt(
         &mut self,
         epoch: Epoch,
-        committed: Vec<(ValidatorId, BeaconProposal)>,
+        committed: Vec<(ValidatorId, Verified<BeaconProposal>)>,
         cert: Verified<SpcCert>,
     ) -> Vec<Action> {
         let prev_block_hash = self.latest_block.block_hash();
-        let block = BeaconBlock::new(epoch, prev_block_hash, committed);
-        let certified = Verified::<CertifiedBeaconBlock>::from_committed_assembly(
-            block,
-            BeaconCert::Normal(Box::new(cert.into_inner())),
-        )
-        .expect("Normal beacon block pairs with SPC cert by construction");
+        let certified =
+            Verified::<CertifiedBeaconBlock>::assemble(epoch, prev_block_hash, committed, cert)
+                .expect("Normal beacon block pairs with SPC cert by construction");
         let block_arc = Arc::new(certified);
 
         let mut actions = self.adopt_block(Arc::clone(&block_arc));
@@ -1788,7 +1787,7 @@ impl BeaconCoordinator {
             };
             match self.proposal_pool.get(validator) {
                 Some(pooled) if pooled.pc_element_hash(epoch) == *element => {
-                    committed.push((validator, pooled.as_ref().as_ref().clone()));
+                    committed.push((validator, pooled.as_ref().clone()));
                 }
                 Some(_) => {
                     warn!(
