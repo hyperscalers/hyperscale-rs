@@ -27,11 +27,12 @@ use hyperscale_types::{
     BlockHeight, Bls12381G1PublicKey, CertifiedBeaconBlock, CertifiedBeaconBlockVerifyError,
     CertifiedBlockHeader, Epoch, GenesisConfigHash, Hash, LeafIndex, LocalTimestamp,
     MAX_WITNESSES_PER_PROPOSER, NetworkDefinition, PcQc3, PcValueElement, PcVector, PcVote1,
-    PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3, PcVote3VerifyError, PcVoteRound,
-    SKIP_TIMEOUT, SPC_VIEW_TIMEOUT, ShardGroupId, ShardWitness, SkipEpochCert, SkipRequest,
-    SkipRequestVerifyError, SpcCert, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError, SpcNewCommitMsg,
-    SpcNewCommitMsgVerifyError, SpcProposalObject, SpcProposalObjectVerifyError, SpcView,
-    TopologySnapshot, ValidatorId, Verifiable, Verified, Verify, WeightedTimestamp, Witness,
+    PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3, PcVote3VerifyError,
+    PcVoteEquivocationContext, PcVoteRound, SKIP_TIMEOUT, SPC_VIEW_TIMEOUT, ShardGroupId,
+    ShardWitness, SkipEpochCert, SkipRequest, SkipRequestVerifyError, SpcCert, SpcEmptyViewMsg,
+    SpcEmptyViewMsgVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError, SpcProposalObject,
+    SpcProposalObjectVerifyError, SpcView, TopologySnapshot, ValidatorId, Verifiable, Verified,
+    Verify, WeightedTimestamp, Witness,
 };
 use tracing::{trace, warn};
 
@@ -89,6 +90,14 @@ pub struct BeaconCoordinator {
     /// network responder and with every co-hosted vnode's
     /// `BeaconCoordinator` — single `Arc` per host.
     proposal_pool: Arc<BeaconProposalPool>,
+
+    /// Committee members whose in-flight-epoch `BeaconProposal` this
+    /// vnode has already run the witness-admission gate over, regardless
+    /// of outcome. Bounds the per-epoch verification work to one
+    /// evaluation per committee member so a peer flooding distinct
+    /// forged proposals can't force unbounded BLS/merkle checks. Cleared
+    /// on `adopt_block` alongside the proposal-pool reset.
+    evaluated_proposers: BTreeSet<ValidatorId>,
 
     /// Stashed SPC-decided epochs whose committed proposals reference
     /// at least one `BeaconProposal` the local pool never observed.
@@ -183,6 +192,7 @@ impl BeaconCoordinator {
             skip_tracker: SkipTracker::new(),
             equivocations: EquivocationObservations::new(),
             proposal_pool,
+            evaluated_proposers: BTreeSet::new(),
             pending_assemblies: BTreeMap::new(),
             local_shard,
             topology_snapshot,
@@ -829,6 +839,40 @@ impl BeaconCoordinator {
             );
             return Vec::new();
         }
+        // Witness-admission gate. A peer's proposal only enters the pool —
+        // and so only feeds this vnode's PC vote — once every embedded
+        // witness positively verifies against locally-available state.
+        // Because SPC commits a value only on a 2f+1 quorum, gating the
+        // vote means ≥ f+1 honest verifiers stand behind every committed
+        // proposal, so an unverifiable witness can never reach the
+        // committed `PcVector`; `apply_epoch` trusts what commits. Own
+        // proposals are verified by construction (built from verified
+        // votes and validated-pool witnesses) and skip the gate. The
+        // per-epoch dedup bounds the work to one evaluation per sender so
+        // a peer flooding distinct forged proposals can't force unbounded
+        // verification.
+        if from != self.me {
+            if epoch != self.proposal_pool.epoch() {
+                trace!(
+                    ?from,
+                    epoch = epoch.inner(),
+                    pool_epoch = self.proposal_pool.epoch().inner(),
+                    "BeaconProposalReceived for a non-inflight epoch — dropping",
+                );
+                return Vec::new();
+            }
+            if !self.evaluated_proposers.insert(from) {
+                return Vec::new();
+            }
+            if !self.proposal_witnesses_verified(&proposal) {
+                trace!(
+                    ?from,
+                    epoch = epoch.inner(),
+                    "BeaconProposalReceived carries an unverifiable witness — dropping",
+                );
+                return Vec::new();
+            }
+        }
         if !self.proposal_pool.admit(from, epoch, proposal) {
             trace!(
                 ?from,
@@ -842,6 +886,44 @@ impl BeaconCoordinator {
             return self.feed_view_one_input(epoch);
         }
         Vec::new()
+    }
+
+    /// Whether every witness embedded in `proposal` positively verifies
+    /// against locally-available state:
+    /// - `Witness::Equivocation` — both BLS sigs verify under the named
+    ///   validator's pubkey (resolved from `state.validators`); evidence
+    ///   naming an unknown validator is unverifiable.
+    /// - `Witness::Shard` — the merkle path reaches the source-shard
+    ///   header's `beacon_witness_root`; a witness whose source header
+    ///   hasn't synced yet is unverifiable.
+    ///
+    /// A forged witness fails regardless of header availability (a bad
+    /// merkle path can't be made to verify, a forged sig can't pass),
+    /// so an honest node never votes for it. A genuine-but-unsynced
+    /// shard witness merely abstains until the header lands — the
+    /// proposer re-includes the still-unconsumed witness next epoch.
+    fn proposal_witnesses_verified(&self, proposal: &BeaconProposal) -> bool {
+        proposal.witnesses().iter().all(|witness| match witness {
+            // Each arm resolves its own lookup, then runs the witness
+            // type's own `Verify` predicate: equivocation evidence against
+            // the named validator's pubkey from the registry, a shard
+            // witness against the source header's merkle root. A failed
+            // lookup (unknown validator / unsynced header) reads as
+            // unverifiable.
+            Witness::Equivocation(ev) => {
+                self.state.validators.get(&ev.validator).is_some_and(|rec| {
+                    ev.verify(&PcVoteEquivocationContext {
+                        network: &self.network,
+                        committee: &[(ev.validator, rec.pubkey)],
+                    })
+                    .is_ok()
+                })
+            }
+            Witness::Shard(sw) => self
+                .witness_fetcher
+                .find_header_by_block_hash(sw.proof.shard_id, sw.proof.committed_block_hash)
+                .is_some_and(|header| sw.verify(header.as_ref()).is_ok()),
+        })
     }
 
     /// Whether the current SPC instance is ready to receive its
@@ -1537,6 +1619,7 @@ impl BeaconCoordinator {
 
         let next_epoch = self.state.current_epoch.next();
         self.proposal_pool.reset(next_epoch);
+        self.evaluated_proposers.clear();
 
         // Emit on every commit. Suppression for no-op transitions
         // (committee unchanged) is a future optimisation — at n=128
@@ -1713,6 +1796,14 @@ impl BeaconCoordinator {
     ///
     /// Out-of-band responses — no stash for the named epoch, or
     /// validator not in the awaiting set — drop silently.
+    ///
+    /// Unlike the gossip path, this admission doesn't re-run the
+    /// witness-admission gate: a fetch only ever resolves a proposal
+    /// referenced by an already-committed `PcVector` element, so the
+    /// embedded witnesses are threshold-vouched (≥ f+1 honest voters
+    /// verified them before the value could commit). The hash match in
+    /// `decode_committed_proposals` pins the fetched bytes to that
+    /// committed element.
     ///
     /// [`ProtocolEvent::BeaconProposalFetched`]: hyperscale_core::ProtocolEvent::BeaconProposalFetched
     pub fn on_beacon_proposal_fetched(

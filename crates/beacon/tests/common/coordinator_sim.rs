@@ -22,14 +22,19 @@ use hyperscale_beacon::proposal_pool::BeaconProposalPool;
 use hyperscale_core::{Action, FetchRequest};
 use hyperscale_types::{
     BEACON_SIGNER_COUNT, BeaconCert, BeaconChainConfig, BeaconGenesisConfig, BeaconProposal,
-    BeaconState, Bls12381G1PrivateKey, Bls12381G1PublicKey, CertifiedBeaconBlock,
-    CertifiedBeaconBlockVerifyContext, Epoch, GenesisPool, GenesisValidator, MIN_STAKE_FLOOR,
-    NetworkDefinition, PcValueElement, PcVector, PcVote1, PcVote2, PcVote3, PcVoteVerifyContext,
-    Randomness, ShardGroupId, SkipEpochCert, SkipRequest, SkipVerifyContext, SpcEmptyViewMsg,
-    SpcNewCommitMsg, SpcProposalObject, SpcVerifyContext, SpcView, Stake, StakePoolId, ValidatorId,
-    Verifiable, Verified, Witness, bls_keypair_from_seed, genesis_config_hash, pc_context,
-    sign_empty_view_msg, sign_vote1, sign_vote2, sign_vote3, spc_context, verify_skip_cert,
-    verify_vote1, verify_vote2, verify_vote3, vrf_sign,
+    BeaconState, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight,
+    Bls12381G1PrivateKey, Bls12381G1PublicKey, CertificateRoot, CertifiedBeaconBlock,
+    CertifiedBeaconBlockVerifyContext, CertifiedBlockHeader, Epoch, GenesisPool, GenesisValidator,
+    Hash, InFlightCount, LeafIndex, LocalReceiptRoot, MIN_STAKE_FLOOR, NetworkDefinition,
+    PcValueElement, PcVector, PcVote1, PcVote2, PcVote3, PcVoteVerifyContext, ProposerTimestamp,
+    ProvisionsRoot, QuorumCertificate, Randomness, Round, ShardGroupId, ShardWitness,
+    ShardWitnessPayload, ShardWitnessProof, SignerBitfield, SkipEpochCert, SkipRequest,
+    SkipVerifyContext, SpcEmptyViewMsg, SpcNewCommitMsg, SpcProposalObject, SpcVerifyContext,
+    SpcView, Stake, StakePoolId, StateRoot, TransactionRoot, ValidatorId, Verifiable, Verified,
+    WeightedTimestamp, Witness, bls_keypair_from_seed, compute_merkle_root_with_proof,
+    genesis_config_hash, pc_context, sign_empty_view_msg, sign_vote1, sign_vote2, sign_vote3,
+    spc_context, verify_skip_cert, verify_vote1, verify_vote2, verify_vote3, vrf_sign,
+    zero_bls_signature,
 };
 
 /// Adversarial transform a flagged replica applies to its next matching
@@ -281,6 +286,44 @@ impl CoordinatorSim {
             .entry(epoch)
             .or_default()
             .extend(witnesses);
+    }
+
+    /// Build a beacon-witness merkle tree carrying `payload` at
+    /// `leaf_index`, deliver a source-shard header committing its root to
+    /// every replica (so the witness-admission gate's merkle check passes
+    /// on peers), and return the matching `Witness::Shard` for the caller
+    /// to splice via [`Self::inject_topology_change`]. Deliver before
+    /// `kick_off` so the header is present when peers evaluate the
+    /// proposal that carries the witness.
+    pub fn admissible_shard_witness(
+        &mut self,
+        shard: ShardGroupId,
+        height: u64,
+        leaf_index: u64,
+        payload: ShardWitnessPayload,
+    ) -> Witness {
+        let idx = usize::try_from(leaf_index).expect("leaf index fits usize");
+        let leaf_count = leaf_index + 1;
+        let mut leaves: Vec<Hash> = (0..leaf_count)
+            .map(|i| Hash::from_bytes(format!("beacon-witness-leaf-{i}").as_bytes()))
+            .collect();
+        leaves[idx] = payload.leaf_hash();
+        let (root, siblings, _) = compute_merkle_root_with_proof(&leaves, idx);
+        let header = make_source_header(shard, height, root, leaf_count);
+        let committed_block_hash = header.block_hash();
+        for replica_idx in 0..self.coordinators.len() {
+            let actions = self.coordinators[replica_idx].on_verified_remote_header(&header);
+            self.absorb(replica_idx, actions);
+        }
+        Witness::Shard(ShardWitness {
+            payload,
+            proof: ShardWitnessProof {
+                shard_id: shard,
+                committed_block_hash,
+                leaf_index: LeafIndex::new(leaf_index),
+                siblings: siblings.into(),
+            },
+        })
     }
 
     /// Hand `block` directly to `replica_idx` via
@@ -1101,6 +1144,53 @@ impl CoordinatorSim {
             .position(|(v, _)| *v == id)
             .expect("validator id present in sim committee")
     }
+}
+
+/// Build a verified source-shard `CertifiedBlockHeader` committing
+/// `witness_root` as its `beacon_witness_root`. Only the fields the
+/// beacon witness-admission gate reads — shard, height, witness root,
+/// leaf count, block hash — carry meaning; the rest are zeroed.
+fn make_source_header(
+    shard: ShardGroupId,
+    height: u64,
+    witness_root: Hash,
+    leaf_count: u64,
+) -> Arc<Verified<CertifiedBlockHeader>> {
+    let parent_block_hash = BlockHash::ZERO;
+    let header = BlockHeader::new(
+        shard,
+        BlockHeight::new(height),
+        parent_block_hash,
+        QuorumCertificate::genesis(shard),
+        ValidatorId::new(0),
+        ProposerTimestamp::ZERO,
+        Round::INITIAL,
+        false,
+        StateRoot::ZERO,
+        TransactionRoot::ZERO,
+        CertificateRoot::ZERO,
+        LocalReceiptRoot::ZERO,
+        ProvisionsRoot::ZERO,
+        Vec::new(),
+        BTreeMap::new(),
+        InFlightCount::ZERO,
+        BeaconWitnessRoot::from_raw(witness_root),
+        BeaconWitnessLeafCount::new(leaf_count),
+    );
+    let block_hash = header.hash();
+    let qc = QuorumCertificate::new(
+        block_hash,
+        shard,
+        BlockHeight::new(height),
+        parent_block_hash,
+        Round::INITIAL,
+        SignerBitfield::new(4),
+        zero_bls_signature(),
+        WeightedTimestamp::from_millis(0),
+    );
+    Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
+        header, qc,
+    )))
 }
 
 /// Build a `PcVector` guaranteed to differ from `v`. Used for round-1

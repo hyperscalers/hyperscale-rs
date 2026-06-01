@@ -121,8 +121,11 @@ pub(super) fn ingest_witnesses(
     }
 
     if !equivocations.is_empty() {
-        // Sigs are checked at block admission; this debug-only sweep
-        // catches an admission-gate regression in CI.
+        // Committed equivocation evidence is threshold-vouched: honest
+        // nodes only vote for a proposal whose embedded witnesses they've
+        // verified, so a 2f+1 commit implies ≥ f+1 honest verifiers
+        // behind every entry. This debug-only sweep re-checks the sigs to
+        // catch a vote-gate regression in CI.
         debug_assert!(
             {
                 let lookup: Vec<(ValidatorId, Bls12381G1PublicKey)> = state

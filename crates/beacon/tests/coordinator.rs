@@ -13,8 +13,9 @@ use std::sync::Arc;
 use common::{ByzantineBehaviour, CoordinatorSim};
 use hyperscale_core::Action;
 use hyperscale_types::{
-    BeaconCert, BlockHash, BoundedVec, Epoch, LeafIndex, ShardGroupId, ShardWitness,
-    ShardWitnessPayload, ShardWitnessProof, ValidatorId, Witness,
+    BeaconCert, BlockHash, BoundedVec, Epoch, LeafIndex, PcValueElement, PcVector,
+    PcVoteEquivocation, PcVoteRound, ShardGroupId, ShardWitness, ShardWitnessPayload,
+    ShardWitnessProof, SpcView, ValidatorId, ValidatorStatus, Witness, zero_bls_signature,
 };
 
 /// Three epochs is enough to exercise the closed loop more than once:
@@ -229,43 +230,41 @@ fn with_byzantine_equivocate_pc_vote1_fires_once() {
 #[test]
 fn inject_topology_change_splices_witnesses_into_epoch_one_proposal() {
     let mut sim = CoordinatorSim::new(4, 0xE1C4);
-    // Use a Ready witness for validator 0 — purely structural; the
-    // assertion is on the witness being present in the committed
-    // block's proposal set, not on its semantic effect.
-    let witness = Witness::Shard(make_dummy_ready_witness(0));
-    sim.inject_topology_change(Epoch::new(1), vec![witness.clone()]);
+    // A `Ready` witness for validator 0 — purely structural; the
+    // assertion is on the witness surviving into the committed block's
+    // proposal set, not its semantic effect. It must be admissible: the
+    // witness-admission gate merkle-checks every peer's proposal, so the
+    // helper delivers a source header committing the witness's leaf root
+    // to all replicas first.
+    let witness = sim.admissible_shard_witness(
+        ShardGroupId::new(0),
+        1,
+        0,
+        ShardWitnessPayload::Ready {
+            id: ValidatorId::new(0),
+        },
+    );
+    let leaf_index = witness_leaf_index_of(&witness);
+    sim.inject_topology_change(Epoch::new(1), vec![witness]);
     sim.kick_off();
     sim.run_until_committed(1, 10_000);
 
     let commit = &sim.commits[0][0];
-    let any_proposal_has_witness = commit
-        .block
-        .block()
-        .committed_proposals()
-        .iter()
-        .any(|(_, prop)| {
-            prop.witnesses()
-                .iter()
-                .any(|w| matches!(w, Witness::Shard(sw) if sw.proof.leaf_index == witness_leaf_index_of(&witness)))
-        });
+    let any_proposal_has_witness =
+        commit
+            .block
+            .block()
+            .committed_proposals()
+            .iter()
+            .any(|(_, prop)| {
+                prop.witnesses()
+                    .iter()
+                    .any(|w| matches!(w, Witness::Shard(sw) if sw.proof.leaf_index == leaf_index))
+            });
     assert!(
         any_proposal_has_witness,
         "scheduled witness didn't survive into any committed proposal at epoch 1",
     );
-}
-
-const fn make_dummy_ready_witness(leaf_index: u64) -> ShardWitness {
-    ShardWitness {
-        payload: ShardWitnessPayload::Ready {
-            id: ValidatorId::new(0),
-        },
-        proof: ShardWitnessProof {
-            shard_id: ShardGroupId::new(0),
-            committed_block_hash: BlockHash::ZERO,
-            leaf_index: LeafIndex::new(leaf_index),
-            siblings: BoundedVec::new(),
-        },
-    }
 }
 
 fn witness_leaf_index_of(w: &Witness) -> LeafIndex {
@@ -366,18 +365,18 @@ fn injected_topology_witness_mutates_state_at_commit() {
     let mut sim = CoordinatorSim::new(4, 0x7010);
     let pool_id = StakePoolId::new(0);
     let bump = Stake::from_whole_tokens(500);
-    let witness = Witness::Shard(ShardWitness {
-        payload: ShardWitnessPayload::StakeDeposit {
+    // Leaf 1 so the witness applies at `consumed_through + 1`. The helper
+    // delivers a source header so the witness-admission gate accepts the
+    // deposit on every peer.
+    let witness = sim.admissible_shard_witness(
+        ShardGroupId::new(0),
+        1,
+        1,
+        ShardWitnessPayload::StakeDeposit {
             pool_id,
             amount: bump,
         },
-        proof: ShardWitnessProof {
-            shard_id: ShardGroupId::new(0),
-            committed_block_hash: BlockHash::ZERO,
-            leaf_index: LeafIndex::new(1),
-            siblings: BoundedVec::new(),
-        },
-    });
+    );
     sim.inject_topology_change(Epoch::new(1), vec![witness]);
     sim.kick_off();
     sim.run_until_committed(1, MAX_STEPS);
@@ -403,6 +402,107 @@ fn injected_topology_witness_mutates_state_at_commit() {
             cmp.pools.get(&pool_id).unwrap().total_stake,
             post_pool.total_stake,
             "replica {r} pool state diverged",
+        );
+    }
+}
+
+/// A Byzantine committee member embeds a forged `Witness::Equivocation`
+/// (garbage sigs) naming an honest validator in its VRF-valid proposal.
+/// The witness-admission gate keeps the proposal out of honest pools, so
+/// it never reaches a `2f + 1` PC quorum and the forged evidence can't
+/// bind into the committed `PcVector`: the named validator is never
+/// jailed and every replica converges on identical state.
+#[test]
+fn forged_equivocation_witness_cannot_jail_or_fork() {
+    let mut sim = CoordinatorSim::new(4, 0xF047);
+    let victim = ValidatorId::new(1);
+    let forged = PcVoteEquivocation {
+        validator: victim,
+        epoch: Epoch::new(1),
+        view: SpcView::INITIAL,
+        round: PcVoteRound::Vote1,
+        value_a: PcVector::new(vec![PcValueElement::new([0x11; 32])]),
+        sig_a: zero_bls_signature(),
+        value_b: PcVector::new(vec![PcValueElement::new([0x22; 32])]),
+        sig_b: zero_bls_signature(),
+    };
+    sim.inject_topology_change(Epoch::new(1), vec![Witness::Equivocation(Box::new(forged))]);
+    sim.kick_off();
+    sim.run_until_committed(1, MAX_STEPS);
+
+    let reference = &sim.commits[0][0].state;
+    for r in 0..sim.n() {
+        let state = &sim.commits[r][0].state;
+        let record = state
+            .validators
+            .get(&victim)
+            .expect("victim is still a registered validator");
+        assert!(
+            !matches!(record.status, ValidatorStatus::Jailed { .. }),
+            "replica {r} jailed an honest validator on a forged equivocation witness",
+        );
+        assert_eq!(
+            state, reference,
+            "replica {r} diverged on a forged equivocation witness",
+        );
+        let committed_forged = sim.commits[r][0]
+            .block
+            .block()
+            .committed_proposals()
+            .iter()
+            .any(|(_, p)| {
+                p.witnesses()
+                    .iter()
+                    .any(|w| matches!(w, Witness::Equivocation(_)))
+            });
+        assert!(
+            !committed_forged,
+            "forged equivocation reached the committed block on replica {r}",
+        );
+    }
+}
+
+/// A forged `Witness::Shard` (bad merkle proof, no source header) is
+/// unverifiable, so the admission gate keeps it out of honest pools and
+/// it never reaches the committed block — an unverified shard payload (a
+/// fake stake deposit, registration, or unjail) can't be applied to
+/// consensus state.
+#[test]
+fn forged_shard_witness_never_reaches_committed_block() {
+    use hyperscale_types::{Stake, StakePoolId};
+
+    let mut sim = CoordinatorSim::new(4, 0xF05D);
+    let forged = Witness::Shard(ShardWitness {
+        payload: ShardWitnessPayload::StakeDeposit {
+            pool_id: StakePoolId::new(0),
+            amount: Stake::from_whole_tokens(500),
+        },
+        proof: ShardWitnessProof {
+            shard_id: ShardGroupId::new(0),
+            committed_block_hash: BlockHash::ZERO,
+            leaf_index: LeafIndex::new(1),
+            siblings: BoundedVec::new(),
+        },
+    });
+    sim.inject_topology_change(Epoch::new(1), vec![forged]);
+    sim.kick_off();
+    sim.run_until_committed(1, MAX_STEPS);
+
+    let reference = &sim.commits[0][0].state;
+    for r in 0..sim.n() {
+        let committed_forged = sim.commits[r][0]
+            .block
+            .block()
+            .committed_proposals()
+            .iter()
+            .any(|(_, p)| p.witnesses().iter().any(|w| matches!(w, Witness::Shard(_))));
+        assert!(
+            !committed_forged,
+            "forged shard witness reached the committed block on replica {r}",
+        );
+        assert_eq!(
+            &sim.commits[r][0].state, reference,
+            "replica {r} diverged on a forged shard witness",
         );
     }
 }
