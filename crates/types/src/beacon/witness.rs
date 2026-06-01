@@ -300,21 +300,6 @@ impl Verify<&Verified<CertifiedBlockHeader>> for ShardWitness {
     }
 }
 
-impl Verified<ShardWitness> {
-    /// Wrap a locally-built shard witness whose proof was generated
-    /// against this validator's own committed shard block.
-    ///
-    /// Trust source: the witness's merkle path was derived directly
-    /// against the producing shard's
-    /// [`BeaconWitnessRoot`](crate::BeaconWitnessRoot) at commit time,
-    /// so the inclusion claim holds by construction. Mirror of
-    /// [`Verified::<Provisions>::from_local`](crate::Provisions).
-    #[must_use]
-    pub const fn from_verified_block(witness: ShardWitness) -> Self {
-        Self::new_unchecked(witness)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

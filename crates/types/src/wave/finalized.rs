@@ -375,8 +375,6 @@ pub enum FinalizedWaveVerifyError {
 /// - [`Verified::<FinalizedWave>::seal`] — wraps a locally-finalized
 ///   wave whose ECs were produced through the
 ///   [`Verified::<ExecutionCertificate>::aggregate`] gate.
-/// - [`Verified::<FinalizedWave>::from_remote_attestation`] — named
-///   alias for the `verify` path, used at wire-admission sites.
 /// - [`Verified::<FinalizedWave>::from_committed_block`] — wraps a
 ///   wave reaching downstream consumers via a
 ///   [`Verified<CertifiedBlock>`], where the source committee's QC
@@ -426,22 +424,6 @@ impl Verified<FinalizedWave> {
         // BLS verify against the matching committee pubkey vector
         // holds by construction.
         Self::new_unchecked(wave)
-    }
-
-    /// Run the wire-admission predicate. Named alias of
-    /// [`<FinalizedWave as Verify>::verify`](Verify::verify) for use
-    /// at delegated-action handlers that admit waves arrived from a
-    /// peer.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FinalizedWaveVerifyError`] from the first EC whose
-    /// predicate fails.
-    pub fn from_remote_attestation(
-        wave: &FinalizedWave,
-        ctx: &FinalizedWaveContext<'_>,
-    ) -> Result<Self, FinalizedWaveVerifyError> {
-        wave.verify(ctx)
     }
 
     /// Wrap a finalized wave reaching the system via a committed block.

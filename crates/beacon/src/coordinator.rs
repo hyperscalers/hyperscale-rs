@@ -2572,8 +2572,8 @@ mod tests {
     /// Build a verified `ShardWitness` for `(shard, leaf_index)` with no
     /// real Merkle proof. The drain tests bypass the verify path to focus
     /// on the eligibility-window filter; the test-only verified gate
-    /// stands in for the proper [`Verify::verify`] / `from_verified_block`
-    /// admission used in production.
+    /// stands in for the proper [`Verify::verify`] admission used in
+    /// production.
     fn simple_shard_witness(shard: ShardGroupId, leaf_index: u64) -> Arc<Verified<ShardWitness>> {
         use hyperscale_types::{
             BlockHash, BoundedVec, LeafIndex, ShardWitnessPayload, ShardWitnessProof,
