@@ -287,11 +287,16 @@ impl TopologySnapshot {
         round: Round,
     ) -> ValidatorId {
         let committee = self.committee_for_shard(shard);
-        debug_assert!(
+        assert!(
             !committee.is_empty(),
             "proposer_for called with empty committee for shard {shard:?}",
         );
-        let index = usize::try_from((height.inner() + round.inner()) % committee.len() as u64)
+        // `height + round` is only a seed for the modulo, so a wrapping sum is
+        // a deterministic index every validator agrees on. Wrapping (not a
+        // checked add) keeps an out-of-range `round` — rejected separately at
+        // header admission — from panicking the selector.
+        let seed = height.inner().wrapping_add(round.inner());
+        let index = usize::try_from(seed % committee.len() as u64)
             .expect("modulo of usize len fits in usize");
         committee[index]
     }
