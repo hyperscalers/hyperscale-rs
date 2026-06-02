@@ -70,7 +70,7 @@ pub fn validate_header(
         ));
     }
 
-    let expected_proposer = topology.proposer_for(local_shard, height, round);
+    let expected_proposer = topology.proposer_for(local_shard, round);
     if header.proposer() != expected_proposer {
         return Err(format!(
             "wrong proposer: expected {:?}, got {:?}",
@@ -579,7 +579,7 @@ mod tests {
 
     fn header_at_round(height: BlockHeight, round: Round, topo: &TopologySnapshot) -> BlockHeader {
         let base = header_at_height(height, 100_000);
-        let proposer = topo.proposer_for(local_shard(), height, round);
+        let proposer = topo.proposer_for(local_shard(), round);
         header_with_overrides(&base, Some(round), None, None, Some(proposer))
     }
 

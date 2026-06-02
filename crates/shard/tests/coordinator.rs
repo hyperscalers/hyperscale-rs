@@ -34,7 +34,9 @@ fn fresh_coordinator_reports_genesis_chain_state() {
 
     assert_eq!(coordinator.committed_height(), BlockHeight::GENESIS);
     assert!(coordinator.latest_qc().is_none());
-    assert_eq!(coordinator.view(), Round::INITIAL);
+    // Rounds increase per block: the genesis QC is round 0, so the first block
+    // is proposed in round 1 — the fresh view.
+    assert_eq!(coordinator.view(), Round::new(1));
     assert!(!coordinator.is_block_syncing());
 }
 
@@ -98,7 +100,7 @@ fn stats_reports_initial_defaults() {
 
     assert_eq!(view_changes, 0);
     assert_eq!(view_syncs, 0);
-    assert_eq!(current_round, Round::INITIAL.inner());
+    assert_eq!(current_round, Round::new(1).inner());
     assert_eq!(committed_height, BlockHeight::GENESIS);
 }
 
@@ -106,9 +108,9 @@ fn stats_reports_initial_defaults() {
 fn is_current_proposer_matches_topology() {
     let committee = TestCommittee::new(4, 42);
 
-    // At height 1, round 0 the proposer rotation picks committee[(1+0) % 4] = V1.
+    // At round 1 the proposer rotation picks committee[1 % 4] = V1.
     // Each validator's coordinator should answer `is_current_proposer` consistently
-    // with `topology.proposer_for(shard, height, round) == me` for that validator.
+    // with `topology.proposer_for(shard, round) == me` for that validator.
     for local_idx in 0_u32..4 {
         let topology = committee.topology_snapshot(1);
         let me = ValidatorId::new(u64::from(local_idx));
@@ -120,9 +122,8 @@ fn is_current_proposer_matches_topology() {
             RecoveredState::default(),
         );
         // Fresh coordinator: latest_qc is None → next height = committed_height + 1 = 1.
-        // view = Round::INITIAL = Round::new(0).
-        let expected =
-            topology.proposer_for(local_shard, BlockHeight::new(1), Round::INITIAL) == me;
+        // Rounds increase per block, so the fresh view is round 1.
+        let expected = topology.proposer_for(local_shard, Round::new(1)) == me;
         assert_eq!(
             coordinator.is_current_proposer(&topology),
             expected,

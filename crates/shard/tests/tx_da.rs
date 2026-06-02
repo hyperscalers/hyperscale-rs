@@ -36,7 +36,7 @@ fn every_committed_block_carries_admitted_txs() {
     );
 }
 
-/// Admitting a tx on the round-0 leader must surface a
+/// Admitting a tx on the round-1 height-1 leader must surface a
 /// `BuildProposal` end-to-end via `queue_ready_proposal` + the
 /// post-dispatch drain. Pre-kickoff, this latch + retry is the
 /// only path the leader has to discover ready txs; a silent-latch
@@ -44,13 +44,13 @@ fn every_committed_block_carries_admitted_txs() {
 #[test]
 fn transactions_admitted_latches_proposal_on_leader() {
     let mut sim = ShardCoordinatorSim::new(4, 0x1A_7C);
-    // proposer_for(shard=0, h=1, r=0) = committee[(1+0) % 4] = idx 1.
+    // Rounds increase per block: height 1 is proposed at round 1, so
+    // proposer_for(shard=0, r=1) = committee[1 % 4] = idx 1.
     let leader_idx = 1u64;
     assert_eq!(
-        sim.topology
-            .proposer_for(sim.shard, BlockHeight::new(1), Round::INITIAL),
+        sim.topology.proposer_for(sim.shard, Round::new(1)),
         ValidatorId::new(leader_idx),
-        "test assumes idx {leader_idx} is the round-0 height-1 leader",
+        "test assumes idx {leader_idx} is the round-1 height-1 leader",
     );
     let tx = Arc::new(verified_test_transaction(/* seed */ 0x22));
     sim.admit_transaction(&tx);
@@ -60,7 +60,7 @@ fn transactions_admitted_latches_proposal_on_leader() {
     assert_eq!(
         proposer,
         ValidatorId::new(leader_idx),
-        "committed block must carry the round-0 leader as proposer",
+        "committed block must carry the round-1 leader as proposer",
     );
 }
 
@@ -71,7 +71,10 @@ fn transactions_admitted_latches_proposal_on_leader() {
 fn vote_withheld_until_tx_admission_completes_header() {
     let mut sim = ShardCoordinatorSim::new(4, 0xDA_70);
     let tx = Arc::new(verified_test_transaction(/* seed */ 0x33));
-    // Admit on every replica except idx 0.
+    // Admit on every replica except idx 0. The early-height leaders — idx 1
+    // (height 1, round 1), idx 2 (height 2, round 2), idx 3 (height 3, round 3)
+    // — all hold the tx, so the {1,2,3} quorum drives the commit while idx 0's
+    // DA gate keeps it from voting.
     let honest_idxs: Vec<usize> = (1..sim.n()).collect();
     for &idx in &honest_idxs {
         sim.admit_transaction_on(idx, Arc::clone(&tx));
@@ -81,7 +84,7 @@ fn vote_withheld_until_tx_admission_completes_header() {
     // subset hits the commit target.
     sim.run_until_committed_for(&honest_idxs, TARGET_COMMITS, MAX_STEPS);
 
-    // The leader (idx 1) had the tx in its own pool, so its
+    // The height-1 leader (idx 1) had the tx in its own pool, so its
     // committed block must include it.
     let leader_block = sim.commits[1][0].certified.block();
     assert!(

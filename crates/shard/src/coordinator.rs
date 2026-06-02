@@ -245,8 +245,16 @@ impl ShardCoordinator {
         config: ShardConsensusConfig,
         recovered: RecoveredState,
     ) -> Self {
+        // Rounds increase per block, so the first block we propose sits one
+        // round past the highest QC we recovered (the genesis QC's round 0 on
+        // a fresh start).
+        let initial_view = recovered
+            .latest_qc
+            .as_deref()
+            .map_or(Round::INITIAL, QuorumCertificate::round)
+            .next();
         Self {
-            view_change: ViewChangeController::new(),
+            view_change: ViewChangeController::new(initial_view),
             committed_height: recovered.committed_height,
             committed_hash: recovered.committed_hash.unwrap_or(BlockHash::ZERO),
             committed_ts: recovered.latest_qc.as_deref().map_or(
@@ -773,7 +781,7 @@ impl ShardCoordinator {
         next_height: BlockHeight,
         round: Round,
     ) -> bool {
-        if topology_snapshot.proposer_for(self.local_shard, next_height, round) != self.me {
+        if topology_snapshot.proposer_for(self.local_shard, round) != self.me {
             return false;
         }
 
@@ -1543,8 +1551,7 @@ impl ShardCoordinator {
             "Emitting vote (signing delegated to crypto pool)"
         );
 
-        let next_proposers =
-            vote_recipients(topology_snapshot, self.local_shard, self.me, height, round);
+        let next_proposers = vote_recipients(topology_snapshot, self.local_shard, self.me, round);
 
         // Emit SignAndBroadcastBlockVote — the io_loop signs on the consensus
         // crypto pool, broadcasts, and feeds the signed vote back for local
@@ -3003,10 +3010,8 @@ impl ShardCoordinator {
             duration: self.current_view_change_timeout(),
         };
 
-        // Check if we're the new proposer for this height/round
-        if topology_snapshot.proposer_for(self.local_shard, height, self.view_change.view)
-            == self.me
-        {
+        // Check if we're the new proposer for this round
+        if topology_snapshot.proposer_for(self.local_shard, self.view_change.view) == self.me {
             // Check if we've already voted at this height - if so, we're locked
             if let Some(existing_hash) = self.votes.locked_block(height) {
                 info!(
@@ -3079,21 +3084,17 @@ impl ShardCoordinator {
             return;
         }
 
-        // View synchronization: advance our view to match the QC's round.
-        // This ensures liveness by keeping nodes in sync with network progress.
-        //
-        // We sync to qc.round (not qc.round() + 1) because:
-        // - The QC proves consensus succeeded at this round
-        // - We should be ready to participate in this round or later
-        // - The proposer for the next height will use their current view
+        // Advance our round to one past the QC's: a QC for round r means the
+        // chain reached r, so the successor block is proposed in r + 1. Rounds
+        // therefore increase per block, keeping them in step with the network.
         let old_view = self.view_change.view;
-        if self.view_change.sync_to_qc_round(qc.round()) {
+        if self.view_change.advance_on_qc(qc.round()) {
             info!(
                 validator = ?self.me,
                 old_view = old_view.inner(),
-                new_view = qc.round().inner(),
+                new_view = self.view_change.view.inner(),
                 qc_height = qc.height().inner(),
-                "View synchronization: advancing view to match QC"
+                "View advanced past QC round"
             );
         }
 
@@ -3438,18 +3439,10 @@ impl ShardCoordinator {
         }
     }
 
-    /// Check if we are the proposer for the current height and round.
+    /// Check if we are the proposer for the current round.
     #[must_use]
     pub fn is_current_proposer(&self, topology_snapshot: &TopologySnapshot) -> bool {
-        let next_height = self.latest_qc.as_ref().map_or_else(
-            || self.committed_height.inner() + 1,
-            |qc| qc.height().inner() + 1,
-        );
-        topology_snapshot.proposer_for(
-            self.local_shard,
-            BlockHeight::new(next_height),
-            self.view_change.view,
-        ) == self.me
+        topology_snapshot.proposer_for(self.local_shard, self.view_change.view) == self.me
     }
 
     /// Compute the parent hash for the next proposal.
@@ -3550,7 +3543,7 @@ impl ShardCoordinator {
             .map_or_else(|| self.committed_height.next(), |qc| qc.height().next());
         let round = self.view_change.view;
 
-        topology_snapshot.proposer_for(self.local_shard, next_height, round) == self.me
+        topology_snapshot.proposer_for(self.local_shard, round) == self.me
             && !self.votes.is_locked_at(next_height)
     }
 }
@@ -3616,24 +3609,24 @@ mod tests {
 
     #[test]
     fn test_proposer_rotation() {
-        // proposer_for = (height + round) % committee_size
+        // proposer_for = round % committee_size
         let (_state, topology) = make_test_state();
         let shard = ShardGroupId::new(0);
         assert_eq!(
-            topology.proposer_for(shard, BlockHeight::new(0), Round::new(0)),
+            topology.proposer_for(shard, Round::new(0)),
             ValidatorId::new(0)
         );
         assert_eq!(
-            topology.proposer_for(shard, BlockHeight::new(1), Round::new(0)),
+            topology.proposer_for(shard, Round::new(1)),
             ValidatorId::new(1)
         );
         assert_eq!(
-            topology.proposer_for(shard, BlockHeight::new(2), Round::new(0)),
+            topology.proposer_for(shard, Round::new(2)),
             ValidatorId::new(2)
         );
         assert_eq!(
-            topology.proposer_for(shard, BlockHeight::new(0), Round::new(1)),
-            ValidatorId::new(1)
+            topology.proposer_for(shard, Round::new(3)),
+            ValidatorId::new(3)
         );
     }
 
@@ -3643,21 +3636,15 @@ mod tests {
         let (state, topology) = make_test_state();
         let shard = state.local_shard;
         let me = state.me;
-        assert_eq!(
-            topology.proposer_for(shard, BlockHeight::new(0), Round::new(0)),
-            me
-        );
-        assert_ne!(
-            topology.proposer_for(shard, BlockHeight::new(1), Round::new(0)),
-            me
-        );
-        assert_ne!(
-            topology.proposer_for(shard, BlockHeight::new(0), Round::new(1)),
-            me
-        );
+        assert_eq!(topology.proposer_for(shard, Round::new(0)), me);
+        assert_ne!(topology.proposer_for(shard, Round::new(1)), me);
+        assert_ne!(topology.proposer_for(shard, Round::new(2)), me);
     }
 
     fn make_header_at_height(height: BlockHeight, timestamp_ms: u64) -> BlockHeader {
+        // Rounds increase per block, so the happy-path round equals the height;
+        // the proposer is then committee[round % 4] = committee[height % 4].
+        let round = Round::new(height.inner());
         BlockHeader::new(
             ShardGroupId::new(0),
             height,
@@ -3665,7 +3652,7 @@ mod tests {
             QuorumCertificate::genesis(ShardGroupId::new(0)),
             ValidatorId::new(height.inner() % 4),
             ProposerTimestamp::from_millis(timestamp_ms),
-            Round::new(0),
+            round,
             false,
             StateRoot::ZERO,
             TransactionRoot::ZERO,
@@ -4152,7 +4139,9 @@ mod tests {
 
     #[test]
     fn test_advance_round_proposer_broadcasts() {
-        // Local = ValidatorId::new(2) is proposer at (1, 1) since (1+1)%4 = 2.
+        // Rounds increase per block: a fresh state starts at view 1, and
+        // advance_round moves to round 2. Local = ValidatorId::new(2) is the
+        // proposer at round 2 since proposer_for(2) = committee[2 % 4] = 2.
         let (mut state, topology) = make_multi_validator_state_at(2);
         state.set_time(LocalTimestamp::from_millis(100_000));
 
@@ -4388,7 +4377,7 @@ mod tests {
         state.set_time(LocalTimestamp::from_millis(100_000));
 
         let height = BlockHeight::new(1);
-        // proposer_for(1, 0) = ValidatorId::new(1)
+        // Height 1 is proposed in round 1: proposer_for(1) = ValidatorId::new(1).
         let original_header = make_header_at_height(height, 100_000);
         let original_block_hash = original_header.hash();
 
@@ -4400,7 +4389,7 @@ mod tests {
         state.pending_blocks.insert(pending);
         state
             .votes
-            .record_own_vote(height, original_block_hash, Round::new(0));
+            .record_own_vote(height, original_block_hash, Round::new(1));
 
         let actions = state.repropose_locked_block(original_block_hash, height);
 
@@ -4411,7 +4400,7 @@ mod tests {
             panic!("expected BroadcastBlockHeader");
         };
         let reproposed = gossip.as_ref();
-        assert_eq!(reproposed.round(), Round::new(0));
+        assert_eq!(reproposed.round(), Round::new(1));
         assert_eq!(reproposed.hash(), original_block_hash);
         assert_eq!(reproposed.proposer(), ValidatorId::new(1));
     }
@@ -4420,7 +4409,7 @@ mod tests {
     fn test_reproposed_block_passes_validation() {
         // A receiving validator (possibly already at view=31) must still accept a
         // re-proposal carrying the original round — validation only keys off
-        // proposer_for(height, header.round()), not the receiver's view.
+        // proposer_for(header.round()), not the receiver's view.
         let (state, topology) = make_multi_validator_state();
         let header = make_header_at_height(BlockHeight::new(1), state.now.as_millis());
 
@@ -4439,7 +4428,7 @@ mod tests {
     #[test]
     fn test_reproposed_block_with_wrong_proposer_fails_validation() {
         let (state, topology) = make_multi_validator_state();
-        // proposer_for(1, 0) = ValidatorId::new(1), but the header claims ValidatorId::new(3).
+        // proposer_for(1) = ValidatorId::new(1), but the header claims ValidatorId::new(3).
         let header = {
             let __h = make_header_at_height(BlockHeight::new(1), state.now.as_millis());
             BlockHeader::new(
@@ -4488,9 +4477,10 @@ mod tests {
     #[test]
     fn test_multiple_consecutive_view_changes_unlock_and_revote() {
         // Three view changes with no QC: each must unlock the current vote. The
-        // third advance lands us as proposer and must emit a fallback.
-        // proposer_for(1, R) = (1 + R) % 4 — local is ValidatorId::new(0), so we're
-        // proposer at R=3.
+        // third advance lands us as proposer and must emit a fallback. Under
+        // round-only rotation proposer_for(R) = R % 4 — local is
+        // ValidatorId::new(0), so we're proposer at R=4. A fresh state starts at
+        // view 1, so three advances reach it.
         let (mut state, topology) = make_test_state();
         state.set_time(LocalTimestamp::from_millis(100_000));
         let height = BlockHeight::new(1);
@@ -4504,19 +4494,18 @@ mod tests {
             state.advance_round(&topology)
         };
 
-        // Rounds 1 and 2: not proposer, vote lock cleared on each advance.
-        state.view_change.view = Round::new(0);
-        let _ = vote_and_advance(&mut state, b"block_a", Round::new(0));
-        assert_eq!(state.view_change.view, Round::new(1));
-        assert!(!state.votes.is_locked_at(height));
-
-        let _ = vote_and_advance(&mut state, b"block_b", Round::new(1));
+        // Rounds 2 and 3: not proposer, vote lock cleared on each advance.
+        let _ = vote_and_advance(&mut state, b"block_a", Round::new(1));
         assert_eq!(state.view_change.view, Round::new(2));
         assert!(!state.votes.is_locked_at(height));
 
-        // Round 3: we're proposer — advance emits a fallback BuildProposal.
-        let actions = vote_and_advance(&mut state, b"block_c", Round::new(2));
+        let _ = vote_and_advance(&mut state, b"block_b", Round::new(2));
         assert_eq!(state.view_change.view, Round::new(3));
+        assert!(!state.votes.is_locked_at(height));
+
+        // Round 4: we're proposer — advance emits a fallback BuildProposal.
+        let actions = vote_and_advance(&mut state, b"block_c", Round::new(3));
+        assert_eq!(state.view_change.view, Round::new(4));
         assert!(!state.votes.is_locked_at(height));
         assert!(actions.iter().any(|a| matches!(
             a,
@@ -4590,6 +4579,9 @@ mod tests {
         // Parent tree must be available or try_propose defers.
         state.committed_height = BlockHeight::new(3);
         state.verification.on_block_persisted(BlockHeight::new(3));
+        // Rounds increase per block: height 4 is proposed at round 4, where
+        // proposer_for(4, 4) = validator 0 (local).
+        state.view_change.view = Round::new(4);
 
         let block_3_hash = BlockHash::from_raw(Hash::from_bytes(b"block_3"));
 
@@ -4667,13 +4659,13 @@ mod tests {
         let (mut state, topology) = make_test_state();
         state.set_time(LocalTimestamp::from_millis(100_000));
 
-        // Local validator is ValidatorId::new(0). Proposer for (h=1, r=0) is
-        // ValidatorId::new((1+0)%4)=ValidatorId::new(1) — not us. Point the chain at
-        // (h=4, r=0) where proposer = (4+0)%4 = ValidatorId::new(0).
+        // Local validator is ValidatorId::new(0). Rounds increase per block, so
+        // point the chain at (h=4, r=4) where proposer = (4+4)%4 = ValidatorId::new(0).
         let parent_block_hash = BlockHash::from_raw(Hash::from_bytes(b"parent_tree_missing"));
         state.committed_height = BlockHeight::new(3);
         state.committed_hash = parent_block_hash;
         state.latest_qc = Some(make_test_qc(parent_block_hash, BlockHeight::new(3)));
+        state.view_change.view = Round::new(4);
         // Intentionally do NOT call on_block_persisted — parent tree
         // unavailable forces the defer branch.
 
@@ -4982,6 +4974,9 @@ mod tests {
             ))
         });
 
+        // Rounds increase per block: height 4 proposes at round 4
+        // (proposer_for(4, 4) = validator 0).
+        state.view_change.view = Round::new(4);
         state.set_block_syncing(true);
         assert!(state.is_block_syncing());
 
@@ -5035,6 +5030,8 @@ mod tests {
                 WeightedTimestamp::from_millis(old_timestamp),
             ))
         });
+        // Height 4 proposes at round 4 (rounds increase per block).
+        state.view_change.view = Round::new(4);
         state.set_block_syncing(true);
 
         let actions = state.try_propose(&topology, &[], vec![], vec![]);
@@ -5324,6 +5321,8 @@ mod tests {
                 __qc.weighted_timestamp(),
             ))
         });
+        // Height 4 proposes at round 4 (rounds increase per block).
+        state.view_change.view = Round::new(4);
         state.set_block_syncing(true);
         let _ = state.try_propose(&topology, &[], vec![], vec![]);
 
@@ -5424,6 +5423,8 @@ mod tests {
                 __qc.weighted_timestamp(),
             ))
         });
+        // Height 4 proposes at round 4 (rounds increase per block).
+        state.view_change.view = Round::new(4);
         state.set_block_syncing(true);
 
         let actions = state.try_propose(&topology, &[], vec![], vec![]);

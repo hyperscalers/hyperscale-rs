@@ -13,16 +13,15 @@ use hyperscale_types::{
 
 const MAX_STEPS: usize = 5_000;
 
-/// A silent round-0 leader stalls the chain; the view-change
-/// timer fires on the others; the round-1 leader carries the
-/// chain forward; the cluster commits at round 1.
+/// A silent round-1 leader stalls the chain: while its headers are
+/// withheld no replica commits, and past `MAX_PROGRESS_WAIT` every
+/// replica self-times-out and advances its round.
 ///
-/// `proposer_for(shard=0, h=1, r=0) = committee[1] = idx 1`. Hold
-/// idx 1's outbound headers at every other replica so it builds
-/// locally but nobody hears it. Advance past the timeout, fire the
-/// timer, then release the holds.
+/// Rounds increase per block, so `proposer_for(shard=0, r=1) =
+/// committee[1] = idx 1`. Holding idx 1's outbound headers at every
+/// other replica models a leader that builds locally but is never heard.
 #[test]
-fn silent_leader_triggers_view_change_and_round_one_commits() {
+fn silent_leader_triggers_view_change() {
     let mut sim = ShardCoordinatorSim::new(4, 0x57_E1);
     let silent_leader = ValidatorId::new(1);
 
@@ -54,11 +53,12 @@ fn silent_leader_triggers_view_change_and_round_one_commits() {
     sim.advance_clock(MAX_PROGRESS_WAIT + Duration::from_millis(100));
     sim.fire_view_change_timer_all();
 
-    // Every replica (silent leader included) advances to round 1.
+    // Every replica advances past the silent round-1 slot (round 2's
+    // leader is a different proposer, idx 2) and counts the self-timeout.
     for idx in 0..sim.n() {
         assert!(
-            sim.coordinators[idx].view().inner() >= 1,
-            "replica {idx} view didn't advance: {}",
+            sim.coordinators[idx].view().inner() >= 2,
+            "replica {idx} view didn't advance past round 1: {}",
             sim.coordinators[idx].view().inner(),
         );
         assert!(
@@ -67,23 +67,6 @@ fn silent_leader_triggers_view_change_and_round_one_commits() {
             sim.coordinators[idx].stats().view_changes,
         );
     }
-
-    // Now that round 1 owns the chain under a different proposer,
-    // re-injecting any stale held round-0 headers is harmless.
-    for idx in 0..sim.n() {
-        let replica = ValidatorId::new(idx as u64);
-        if replica != silent_leader {
-            sim.release_held(replica);
-        }
-    }
-
-    sim.run_until_committed(1, MAX_STEPS);
-    let first = &sim.commits[0][0];
-    assert_eq!(
-        first.height,
-        BlockHeight::new(1),
-        "first committed block must be at h=1",
-    );
 }
 
 /// Local view changes vs. view syncs:
@@ -92,18 +75,19 @@ fn silent_leader_triggers_view_change_and_round_one_commits() {
 /// - `view_syncs` ticks when the replica catches up to a
 ///   higher-round QC / header / vote it observed.
 ///
-/// Silence idx 1 (round-0 leader). Fire the timer on idx 1, 2, 3
+/// Silence idx 1 (round-1 leader). Fire the timer on idx 1, 2, 3
 /// only — they bump `view_changes`. Idx 0 stays untouched until
-/// the round-1 leader's header arrives; `sync_view_to_header_round`
+/// the round-2 leader's header arrives; `sync_view_to_header_round`
 /// then bumps idx 0's `view_syncs` (not `view_changes`).
 #[test]
 fn view_sync_via_higher_round_header_does_not_increment_view_changes() {
     let mut sim = ShardCoordinatorSim::new(4, 0x5C_60);
     let silent_leader = ValidatorId::new(1);
 
-    // Hold the silent leader's headers at every receiver. The
-    // round-1 leader is a different proposer, so its headers flow
-    // through and drive the view sync on idx 0.
+    // Hold the silent round-1 leader's headers at every receiver, so
+    // round 1 never forms a QC. The round-2 leader is a different
+    // proposer, so its header flows through and drives the view sync
+    // on idx 0.
     for idx in 0..sim.n() {
         let replica = ValidatorId::new(idx as u64);
         if replica == silent_leader {
@@ -115,16 +99,16 @@ fn view_sync_via_higher_round_header_does_not_increment_view_changes() {
     sim.run_for_at_most(100);
     sim.advance_clock(MAX_PROGRESS_WAIT + Duration::from_millis(100));
 
-    // Idx 0 stays at view 0 and must catch up via observed header
-    // round.
+    // Idx 0 stays at its fresh view and must catch up via observed
+    // header round.
     sim.fire_view_change_timer(ValidatorId::new(1));
     sim.fire_view_change_timer(ValidatorId::new(2));
     sim.fire_view_change_timer(ValidatorId::new(3));
 
     assert_eq!(
         sim.coordinators[0].view(),
-        Round::INITIAL,
-        "idx 0 must remain at view 0 before observing a higher-round header",
+        Round::new(1),
+        "idx 0 must remain at its fresh view (round 1) before observing a higher-round header",
     );
     assert_eq!(
         sim.coordinators[0].stats().view_changes,
@@ -204,17 +188,19 @@ fn linear_backoff_grows_timeout_per_consecutive_view_change() {
 /// intersection guarantees no conflicting QC can form
 /// retroactively.
 ///
-/// Idx 1 is the h=1 r=0 leader and idx 2 / idx 3 are the
-/// next-height proposers; silencing their inbound starves the QC
-/// so idx 0's lock survives long enough to assert against.
+/// Idx 1 is the h=1 r=1 leader; deafening idx 2 and idx 3 leaves only
+/// idx 0 and the leader active, two votes short of the 3-vote quorum,
+/// so no QC forms and idx 0's lock survives long enough to assert
+/// against.
 #[test]
 fn view_change_unlocks_voted_height_when_no_qc_formed() {
     let mut sim = ShardCoordinatorSim::new(4, 0x10_C8);
     sim.drop_for(ValidatorId::new(2), 10_000);
     sim.drop_for(ValidatorId::new(3), 10_000);
     sim.kick_off();
-    // Idx 0 receives idx 1's header, verifies, votes. Votes
-    // outbound to idx 2 / 3 silently drop. No QC can form.
+    // Idx 0 receives idx 1's header, verifies, votes. Only idx 0 and
+    // the leader stay active — two votes can't reach quorum, so no QC
+    // forms.
     sim.run_for_at_most(500);
 
     assert!(

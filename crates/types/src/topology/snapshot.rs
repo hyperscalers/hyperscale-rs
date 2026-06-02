@@ -11,8 +11,8 @@ use std::sync::Arc;
 use blake3::hash as blake3_hash;
 
 use crate::{
-    BlockHeight, Bls12381G1PublicKey, NetworkDefinition, NodeId, Round, RoutableTransaction,
-    ShardGroupId, ValidatorId, ValidatorSet, VotePower,
+    Bls12381G1PublicKey, NetworkDefinition, NodeId, Round, RoutableTransaction, ShardGroupId,
+    ValidatorId, ValidatorSet, VotePower,
 };
 
 /// Per-shard committee membership.
@@ -275,28 +275,24 @@ impl TopologySnapshot {
 
     // ── Proposer selection ───────────────────────────────────────────────
 
-    /// Get the proposer for `shard` at a given height and round.
+    /// Get the proposer for `shard` at a given round.
+    ///
+    /// Rounds increase per block, so the round alone determines the leader:
+    /// `committee[round % n]`. The round is QC- and header-attested, so every
+    /// validator selects the same proposer. A large `round` is harmless here —
+    /// the modulo can never panic — and is rejected separately at header
+    /// admission.
     ///
     /// # Panics
     /// Panics if the committee for `shard` is empty (invariant violation).
     #[must_use]
-    pub fn proposer_for(
-        &self,
-        shard: ShardGroupId,
-        height: BlockHeight,
-        round: Round,
-    ) -> ValidatorId {
+    pub fn proposer_for(&self, shard: ShardGroupId, round: Round) -> ValidatorId {
         let committee = self.committee_for_shard(shard);
         assert!(
             !committee.is_empty(),
             "proposer_for called with empty committee for shard {shard:?}",
         );
-        // `height + round` is only a seed for the modulo, so a wrapping sum is
-        // a deterministic index every validator agrees on. Wrapping (not a
-        // checked add) keeps an out-of-range `round` — rejected separately at
-        // header admission — from panicking the selector.
-        let seed = height.inner().wrapping_add(round.inner());
-        let index = usize::try_from(seed % committee.len() as u64)
+        let index = usize::try_from(round.inner() % committee.len() as u64)
             .expect("modulo of usize len fits in usize");
         committee[index]
     }
@@ -454,21 +450,22 @@ mod tests {
         let snapshot = make_snapshot(4);
         let shard = ShardGroupId::new(0);
 
+        // Round-only rotation: committee[round % n].
         assert_eq!(
-            snapshot.proposer_for(shard, BlockHeight::new(0), Round::new(0)),
+            snapshot.proposer_for(shard, Round::new(0)),
             ValidatorId::new(0)
         );
         assert_eq!(
-            snapshot.proposer_for(shard, BlockHeight::new(1), Round::new(0)),
+            snapshot.proposer_for(shard, Round::new(1)),
             ValidatorId::new(1)
         );
         assert_eq!(
-            snapshot.proposer_for(shard, BlockHeight::new(4), Round::new(0)),
+            snapshot.proposer_for(shard, Round::new(3)),
+            ValidatorId::new(3)
+        );
+        assert_eq!(
+            snapshot.proposer_for(shard, Round::new(4)),
             ValidatorId::new(0)
-        );
-        assert_eq!(
-            snapshot.proposer_for(shard, BlockHeight::new(0), Round::new(1)),
-            ValidatorId::new(1)
         );
     }
 

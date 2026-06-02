@@ -498,20 +498,19 @@ mod tests {
     /// `shard.queue_ready_proposal()`; the post-dispatch hook in
     /// `mod.rs::handle` calls `try_event_driven_proposal()` when the
     /// latch fires. End-to-end: when the local validator is the
-    /// round-0 proposer for height 1, this chain must surface a
-    /// `BuildProposal` action. Without the latch (or without the
-    /// post-dispatch hook), no proposal would emerge — and that
-    /// regression is silent until liveness breaks.
+    /// height-1 proposer, this chain must surface a `BuildProposal`
+    /// action. Without the latch (or without the post-dispatch hook),
+    /// no proposal would emerge — and that regression is silent until
+    /// liveness breaks.
     #[test]
     fn transactions_admitted_drives_proposal_through_post_dispatch_hook() {
-        // proposer_for(h=1, r=0) = committee[(1+0) % 4] = committee[1]
+        // Rounds increase per block, so height 1 is round 1:
+        // proposer_for(r=1) = committee[1 % 4] = committee[1]
         // = ValidatorId::new(1). Pick local_idx=1 to be the leader.
         let TestNode { mut node, .. } = TestNode::builder().local_idx(1).build();
         assert!(
-            node.topology()
-                .proposer_for(node.shard_id(), BlockHeight::new(1), Round::INITIAL,)
-                == node.validator_id(),
-            "local must be the round-0 height-1 proposer for this test",
+            node.topology().proposer_for(node.shard_id(), Round::new(1)) == node.validator_id(),
+            "local must be the height-1 proposer for this test",
         );
 
         let actions = node.handle(
@@ -534,14 +533,13 @@ mod tests {
     /// guard is at the proposer level, not the latch level.
     #[test]
     fn transactions_admitted_does_not_emit_proposal_on_non_leader() {
-        // local_idx=0 → ValidatorId::new(0); committee[1] = ValidatorId::new(1)
-        // is the proposer, so we are not.
+        // local_idx=0 → ValidatorId::new(0); a fresh node proposes height 1 in
+        // round 1, whose proposer is committee[1] = ValidatorId::new(1), so we
+        // are not the leader.
         let TestNode { mut node, .. } = TestNode::new();
         assert!(
-            node.topology()
-                .proposer_for(node.shard_id(), BlockHeight::new(1), Round::INITIAL,)
-                != node.validator_id(),
-            "local must NOT be the round-0 height-1 proposer for this test",
+            node.topology().proposer_for(node.shard_id(), Round::new(1)) != node.validator_id(),
+            "local must NOT be the height-1 proposer for this test",
         );
 
         let actions = node.handle(
@@ -697,15 +695,15 @@ mod tests {
 
         let manifest = BlockManifest::new(vec![TxHash::ZERO], vec![], vec![], vec![]);
 
-        // proposer_for(h=1, r=0) = committee[(1+0) % 4] = ValidatorId::new(1).
-        // the shard coordinator's header validation rejects on proposer mismatch, so the
-        // header must name the actual round-0 height-1 leader to reach
-        // the pending-blocks insert.
+        // `make_live_block` stamps round 0, and proposer_for(r=0) =
+        // committee[0] = ValidatorId::new(0). The shard coordinator's header
+        // validation rejects on proposer mismatch, so the header must name the
+        // round-0 leader to reach the pending-blocks insert.
         let header = make_live_block(
             ShardGroupId::new(0),
             BlockHeight::new(1),
             /* timestamp_ms */ 1_000,
-            ValidatorId::new(1),
+            ValidatorId::new(0),
             vec![],
             vec![],
         )

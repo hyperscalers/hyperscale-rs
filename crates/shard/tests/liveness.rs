@@ -32,6 +32,15 @@ fn four_party_cluster_converges_per_height() {
 
     for h in 0..TARGET_COMMITS {
         let reference = &sim.commits[0][h];
+        // Rounds increase per block: with no view change, the block at height
+        // H is proposed in round H (genesis is round 0).
+        assert_eq!(
+            reference.certified.block().header().round().inner(),
+            reference.height.inner(),
+            "height {:?} committed at round {} (expected per-block round == height)",
+            reference.height,
+            reference.certified.block().header().round().inner(),
+        );
         for r in 1..sim.n() {
             let cmp = &sim.commits[r][h];
             assert_eq!(

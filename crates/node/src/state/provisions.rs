@@ -69,11 +69,12 @@ mod tests {
     /// `ProvisionsAdmitted` latches a proposal-retry the same way
     /// `TransactionsAdmitted` does. Verify the latch+post-dispatch chain
     /// surfaces a `BuildProposal` when the local validator is the
-    /// round-0 height-1 proposer.
+    /// height-1 proposer.
     #[test]
     fn provisions_admitted_drives_proposal_through_post_dispatch_hook() {
-        // committee[1] = ValidatorId::new(1) is the round-0 height-1
-        // proposer; pick local_idx=1 so we are it.
+        // Rounds increase per block, so height 1 is round 1: committee[1 % 4]
+        // = committee[1] = ValidatorId::new(1) is the leader; pick local_idx=1
+        // so we are it.
         let TestNode { mut node, .. } = TestNode::builder().local_idx(1).build();
 
         let provisions = Arc::new(

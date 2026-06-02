@@ -16,7 +16,7 @@ const MAX_STEPS: usize = 5_000;
 #[test]
 fn equivocating_proposer_does_not_split_consensus() {
     let mut sim = ShardCoordinatorSim::new(4, 0xE9_01);
-    let leader = ValidatorId::new(1); // committee[(1+0) % 4] = idx 1
+    let leader = ValidatorId::new(1); // proposer_for(1) = idx 1 (height 1, round 1)
     sim.with_byzantine(leader, ByzantineBehaviour::EquivocateProposal);
     sim.kick_off();
     sim.run_until_committed(1, MAX_STEPS);
@@ -53,15 +53,14 @@ fn equivocating_proposer_does_not_split_consensus() {
 /// `pending_blocks` and runs through verification.
 ///
 /// `maybe_unlock_for_qc` clears the h=1 lock the moment a QC at
-/// height ≥ 1 is adopted, which on the aggregator's path is the
-/// instant quorum forms. To keep the lock observable, silence the
-/// next-height proposers (idx 2 = h=2 r=0 leader, idx 3 = h=2 r=1
-/// leader) so votes never reach an aggregator that would broadcast
-/// QC{h=1} back via h=2's `parent_qc`.
+/// height ≥ 1 is adopted. To keep the lock observable, deafen idx 2
+/// and idx 3 so only the observer (idx 0) and the h=1 leader (idx 1)
+/// stay active — two votes can't reach the 3-vote quorum, so no
+/// QC{h=1} ever forms to clear the observer's lock.
 #[test]
 fn own_vote_lock_rejects_equivocating_second_block() {
     let mut sim = ShardCoordinatorSim::new(4, 0xE9_15);
-    let leader = ValidatorId::new(1);
+    let leader = ValidatorId::new(1); // proposer_for(1) = idx 1 (height 1, round 1)
     sim.drop_for(ValidatorId::new(2), 100_000);
     sim.drop_for(ValidatorId::new(3), 100_000);
     sim.with_byzantine(leader, ByzantineBehaviour::EquivocateProposal);
@@ -74,7 +73,7 @@ fn own_vote_lock_rejects_equivocating_second_block() {
     );
     assert!(
         sim.commits[0].is_empty(),
-        "idx 0 unexpectedly committed despite next-height starvation",
+        "idx 0 unexpectedly committed despite sub-quorum starvation",
     );
 
     let voted = sim.coordinators[0].voted_heights();
@@ -91,8 +90,8 @@ fn own_vote_lock_rejects_equivocating_second_block() {
     let (_, (_, round)) = h1_entries[0];
     assert_eq!(
         *round,
-        Round::INITIAL,
-        "idx 0 voted at h=1 in round {} (expected round 0)",
+        Round::new(1),
+        "idx 0 voted at h=1 in round {} (expected round 1)",
         round.inner(),
     );
 }

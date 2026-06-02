@@ -57,10 +57,14 @@ pub struct ViewChangeController {
 }
 
 impl ViewChangeController {
-    pub const fn new() -> Self {
+    /// Start the round clock at `initial_view` — `high_qc.round + 1`, the
+    /// round the first block after the recovered (or genesis) QC is proposed
+    /// in. Rounds increase per block, so this is the genesis QC's round (0)
+    /// plus one on a fresh start.
+    pub const fn new(initial_view: Round) -> Self {
         Self {
-            view: Round::INITIAL,
-            view_at_height_start: Round::INITIAL,
+            view: initial_view,
+            view_at_height_start: initial_view,
             last_leader_activity: None,
             last_header_reset: None,
             view_changes: 0,
@@ -143,6 +147,15 @@ impl ViewChangeController {
         self.view
     }
 
+    /// Advance the round one past a verified QC's round, so the next block is
+    /// proposed in a fresh round. A QC for round `r` means the chain reached
+    /// `r`; the proposer of the successor block moves to `r + 1`. This is what
+    /// makes rounds strictly increase per block. Returns `true` if the view
+    /// advanced.
+    pub fn advance_on_qc(&mut self, qc_round: Round) -> bool {
+        self.sync_to_qc_round(qc_round.next())
+    }
+
     /// Synchronize the local round to a higher round proven by a verified
     /// quorum certificate. A QC at round R proves 2f+1 validators reached R,
     /// so the target reflects real network progress and is adopted as-is.
@@ -178,7 +191,7 @@ mod tests {
 
     #[test]
     fn current_timeout_grows_linearly_with_rounds_at_height() {
-        let mut vc = ViewChangeController::new();
+        let mut vc = ViewChangeController::new(Round::INITIAL);
 
         assert_eq!(vc.current_timeout(), VIEW_CHANGE_TIMEOUT);
 
@@ -197,14 +210,14 @@ mod tests {
 
     #[test]
     fn current_timeout_respects_cap() {
-        let mut vc = ViewChangeController::new();
+        let mut vc = ViewChangeController::new(Round::INITIAL);
         vc.view = Round::new(10_000);
         assert_eq!(vc.current_timeout(), VIEW_CHANGE_TIMEOUT_MAX);
     }
 
     #[test]
     fn reset_for_height_advance_rebases_round_counter() {
-        let mut vc = ViewChangeController::new();
+        let mut vc = ViewChangeController::new(Round::INITIAL);
 
         vc.view = Round::new(5);
         assert_eq!(
@@ -218,7 +231,7 @@ mod tests {
 
     #[test]
     fn advance_increments_view_and_metric_and_clears_header_reset() {
-        let mut vc = ViewChangeController::new();
+        let mut vc = ViewChangeController::new(Round::INITIAL);
         vc.last_header_reset = Some((BlockHeight::new(5), Round::new(0)));
 
         let new_round = vc.advance();
@@ -231,7 +244,7 @@ mod tests {
 
     #[test]
     fn sync_to_qc_round_only_advances_forward() {
-        let mut vc = ViewChangeController::new();
+        let mut vc = ViewChangeController::new(Round::INITIAL);
         vc.view = Round::new(5);
 
         assert!(!vc.sync_to_qc_round(Round::new(3)));
@@ -246,7 +259,7 @@ mod tests {
 
     #[test]
     fn sync_to_observed_round_caps_advance_at_max_gap() {
-        let mut vc = ViewChangeController::new();
+        let mut vc = ViewChangeController::new(Round::INITIAL);
 
         // A far-ahead claim advances the view by at most MAX_ROUND_GAP.
         assert!(vc.sync_to_observed_round(Round::new(u64::MAX)));
@@ -260,7 +273,7 @@ mod tests {
 
     #[test]
     fn sync_to_observed_round_adopts_nearby_round_exactly() {
-        let mut vc = ViewChangeController::new();
+        let mut vc = ViewChangeController::new(Round::INITIAL);
         vc.view = Round::new(10);
 
         // Within the cap: adopted verbatim.
@@ -274,7 +287,7 @@ mod tests {
 
     #[test]
     fn record_header_activity_is_rate_limited_per_height_round() {
-        let mut vc = ViewChangeController::new();
+        let mut vc = ViewChangeController::new(Round::INITIAL);
         let t1 = LocalTimestamp::from_millis(1_000);
         let t2 = LocalTimestamp::from_millis(2_000);
 
@@ -292,13 +305,13 @@ mod tests {
 
     #[test]
     fn timeout_elapsed_requires_recorded_leader_activity() {
-        let vc = ViewChangeController::new();
+        let vc = ViewChangeController::new(Round::INITIAL);
         assert!(!vc.timeout_elapsed(LocalTimestamp::from_millis(u64::MAX / 2)));
     }
 
     #[test]
     fn timeout_elapsed_true_once_past_deadline() {
-        let mut vc = ViewChangeController::new();
+        let mut vc = ViewChangeController::new(Round::INITIAL);
         let activity = LocalTimestamp::from_millis(10_000);
         vc.record_leader_activity(activity);
 

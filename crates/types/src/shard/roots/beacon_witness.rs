@@ -83,7 +83,7 @@ pub fn missed_proposals_since_prev_commit(
     let mut missed = Vec::new();
     let mut round = parent_round.next();
     while round < committed_round {
-        let proposer_id = topology.proposer_for(shard, height, round);
+        let proposer_id = topology.proposer_for(shard, round);
         missed.push(ShardWitnessPayload::MissedProposal {
             proposer_id,
             height,
