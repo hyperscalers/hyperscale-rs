@@ -6,7 +6,7 @@ use hyperscale_storage::{BlockForSync, ShardChainReader};
 use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, CertifiedBlock, CertifiedBlockHeader,
     ConsensusReceipt, ExecutionCertificate, QuorumCertificate, RoutableTransaction,
-    ShardWitnessPayload, TxHash, WaveCertificate, WaveId,
+    ShardWitnessPayload, TxHash, Verified, WaveCertificate, WaveId,
 };
 
 use super::column_families::{BeaconWitnessesCf, ExecutionCertsCf};
@@ -14,14 +14,17 @@ use super::core::RocksDbShardStorage;
 use crate::typed_cf::{TypedCf, get, iter_all};
 
 impl ShardChainReader for RocksDbShardStorage {
-    fn get_block(&self, height: BlockHeight) -> Option<CertifiedBlock> {
+    fn get_block(&self, height: BlockHeight) -> Option<Verified<CertifiedBlock>> {
         self.get_block_denormalized(height)
+            .map(Verified::<CertifiedBlock>::from_persisted)
     }
 
-    fn get_certified_header(&self, height: BlockHeight) -> Option<CertifiedBlockHeader> {
+    fn get_certified_header(&self, height: BlockHeight) -> Option<Verified<CertifiedBlockHeader>> {
         let metadata = self.get_block_metadata(height)?;
         let (header, _, qc, _) = metadata.into_parts();
-        Some(CertifiedBlockHeader::new(header, qc))
+        Some(Verified::<CertifiedBlockHeader>::from_persisted(
+            CertifiedBlockHeader::new(header, qc),
+        ))
     }
 
     fn committed_height(&self) -> BlockHeight {
@@ -32,7 +35,7 @@ impl ShardChainReader for RocksDbShardStorage {
         self.read_committed_hash().map(BlockHash::from_raw)
     }
 
-    fn latest_qc(&self) -> Option<QuorumCertificate> {
+    fn latest_qc(&self) -> Option<Verified<QuorumCertificate>> {
         self.read_latest_qc()
     }
 
@@ -44,8 +47,11 @@ impl ShardChainReader for RocksDbShardStorage {
         })
     }
 
-    fn get_transactions_batch(&self, hashes: &[TxHash]) -> Vec<RoutableTransaction> {
+    fn get_transactions_batch(&self, hashes: &[TxHash]) -> Vec<Verified<RoutableTransaction>> {
         Self::get_transactions_batch(self, hashes)
+            .into_iter()
+            .map(Verified::<RoutableTransaction>::from_persisted)
+            .collect()
     }
 
     fn get_certificates_batch(&self, ids: &[WaveId]) -> Vec<WaveCertificate> {
@@ -56,18 +62,26 @@ impl ShardChainReader for RocksDbShardStorage {
         Self::get_consensus_receipt(self, tx_hash)
     }
 
-    fn get_execution_certificate(&self, wave_id: &WaveId) -> Option<ExecutionCertificate> {
+    fn get_execution_certificate(
+        &self,
+        wave_id: &WaveId,
+    ) -> Option<Verified<ExecutionCertificate>> {
         let cfs = self.cf();
         let certs_cf = ExecutionCertsCf::handle(&cfs);
         get::<ExecutionCertsCf>(&*self.db, certs_cf, wave_id)
+            .map(Verified::<ExecutionCertificate>::from_persisted)
     }
 
-    fn get_execution_certificates_batch(&self, wave_ids: &[WaveId]) -> Vec<ExecutionCertificate> {
+    fn get_execution_certificates_batch(
+        &self,
+        wave_ids: &[WaveId],
+    ) -> Vec<Verified<ExecutionCertificate>> {
         let cfs = self.cf();
         let certs_cf = ExecutionCertsCf::handle(&cfs);
         wave_ids
             .iter()
             .filter_map(|wid| get::<ExecutionCertsCf>(&*self.db, certs_cf, wid))
+            .map(Verified::<ExecutionCertificate>::from_persisted)
             .collect()
     }
 

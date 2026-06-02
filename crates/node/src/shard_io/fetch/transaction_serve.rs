@@ -59,7 +59,7 @@ pub fn serve_transaction_request<S: ShardStorage>(
             pending_chain
                 .transactions_batch(&missing)
                 .into_iter()
-                .map(Arc::new),
+                .map(|tx| Arc::new(tx.into_inner())),
         );
     }
 

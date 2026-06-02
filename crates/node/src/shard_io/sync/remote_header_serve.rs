@@ -49,7 +49,7 @@ pub fn serve_remote_headers_request<S: ShardStorage>(
         let Some(header) = pending_chain.certified_header(height) else {
             break;
         };
-        headers.push((*header).clone());
+        headers.push((**header).clone());
     }
 
     if !headers.is_empty() {

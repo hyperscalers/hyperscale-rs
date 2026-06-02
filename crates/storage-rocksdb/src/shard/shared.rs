@@ -173,11 +173,11 @@ impl ShardChainWriter for SharedStorage {
 }
 
 impl ShardChainReader for SharedStorage {
-    fn get_block(&self, height: BlockHeight) -> Option<CertifiedBlock> {
+    fn get_block(&self, height: BlockHeight) -> Option<Verified<CertifiedBlock>> {
         self.0.get_block(height)
     }
 
-    fn get_certified_header(&self, height: BlockHeight) -> Option<CertifiedBlockHeader> {
+    fn get_certified_header(&self, height: BlockHeight) -> Option<Verified<CertifiedBlockHeader>> {
         ShardChainReader::get_certified_header(&*self.0, height)
     }
 
@@ -189,7 +189,7 @@ impl ShardChainReader for SharedStorage {
         self.0.committed_hash()
     }
 
-    fn latest_qc(&self) -> Option<QuorumCertificate> {
+    fn latest_qc(&self) -> Option<Verified<QuorumCertificate>> {
         self.0.latest_qc()
     }
 
@@ -197,8 +197,8 @@ impl ShardChainReader for SharedStorage {
         ShardChainReader::get_block_for_sync(&*self.0, height)
     }
 
-    fn get_transactions_batch(&self, hashes: &[TxHash]) -> Vec<RoutableTransaction> {
-        self.0.get_transactions_batch(hashes)
+    fn get_transactions_batch(&self, hashes: &[TxHash]) -> Vec<Verified<RoutableTransaction>> {
+        ShardChainReader::get_transactions_batch(&*self.0, hashes)
     }
 
     fn get_certificates_batch(&self, ids: &[WaveId]) -> Vec<WaveCertificate> {
@@ -209,11 +209,17 @@ impl ShardChainReader for SharedStorage {
         self.0.get_consensus_receipt(tx_hash)
     }
 
-    fn get_execution_certificate(&self, wave_id: &WaveId) -> Option<ExecutionCertificate> {
+    fn get_execution_certificate(
+        &self,
+        wave_id: &WaveId,
+    ) -> Option<Verified<ExecutionCertificate>> {
         self.0.get_execution_certificate(wave_id)
     }
 
-    fn get_execution_certificates_batch(&self, wave_ids: &[WaveId]) -> Vec<ExecutionCertificate> {
+    fn get_execution_certificates_batch(
+        &self,
+        wave_ids: &[WaveId],
+    ) -> Vec<Verified<ExecutionCertificate>> {
         self.0.get_execution_certificates_batch(wave_ids)
     }
 

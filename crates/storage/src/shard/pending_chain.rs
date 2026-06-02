@@ -175,23 +175,17 @@ where
         if pending.is_some() {
             return pending;
         }
-        // SAFETY: persisted blocks were fully verified (header, every
-        // applicable per-root verifier, QC, linkage) before storage
-        // admission; the wrap preserves that invariant when re-exposing
-        // them through the unified read path.
-        self.base
-            .get_block(height)
-            .map(|cb| Arc::new(Verified::<CertifiedBlock>::from_persisted(cb)))
+        self.base.get_block(height).map(Arc::new)
     }
 
     /// Certified header at `height`. Header-only view of
     /// [`Self::certified_block`] — pending entry first, base store fallback.
-    pub fn certified_header(&self, height: BlockHeight) -> Option<Arc<CertifiedBlockHeader>> {
+    pub fn certified_header(
+        &self,
+        height: BlockHeight,
+    ) -> Option<Arc<Verified<CertifiedBlockHeader>>> {
         if let Some(certified) = self.pending_certified_at(height) {
-            return Some(Arc::new(CertifiedBlockHeader::new(
-                certified.block().header().clone(),
-                certified.qc().clone(),
-            )));
+            return Some(Arc::new(certified.certified_header()));
         }
         self.base.get_certified_header(height).map(Arc::new)
     }
@@ -239,11 +233,15 @@ where
     /// is the highest-height pending entry's, then the base store's
     /// `latest_qc`. Used by sync-serving handlers to compute the dedup
     /// horizon without needing raw `&S`.
-    pub fn latest_qc(&self) -> Option<QuorumCertificate> {
+    pub fn latest_qc(&self) -> Option<Verified<QuorumCertificate>> {
         let entries = read_or_recover(&self.entries);
         let pending_qc = entries
             .values()
-            .filter_map(|e| e.certified_block.as_ref().map(|c| (e.height, c.qc())))
+            .filter_map(|e| {
+                e.certified_block
+                    .as_ref()
+                    .map(|c| (e.height, c.qc_verified()))
+            })
             .max_by_key(|(h, _)| *h)
             .map(|(_, qc)| qc.clone());
         drop(entries);
@@ -255,7 +253,7 @@ where
     /// persistence lag by orders of magnitude), so this method is a
     /// thin pass-through to base storage; keeping it on `PendingChain`
     /// preserves the "no raw `&S` in serve handlers" invariant.
-    pub fn transactions_batch(&self, hashes: &[TxHash]) -> Vec<RoutableTransaction> {
+    pub fn transactions_batch(&self, hashes: &[TxHash]) -> Vec<Verified<RoutableTransaction>> {
         self.base.get_transactions_batch(hashes)
     }
 
@@ -273,7 +271,10 @@ where
 
     /// Batched execution-certificate read by `WaveId`. Pass-through to
     /// base storage.
-    pub fn execution_certificates_batch(&self, ids: &[WaveId]) -> Vec<ExecutionCertificate> {
+    pub fn execution_certificates_batch(
+        &self,
+        ids: &[WaveId],
+    ) -> Vec<Verified<ExecutionCertificate>> {
         self.base.get_execution_certificates_batch(ids)
     }
 
@@ -944,13 +945,22 @@ mod tests {
     }
 
     impl ShardChainReader for StubStore {
-        fn get_block(&self, height: BlockHeight) -> Option<CertifiedBlock> {
-            self.blocks.get(&height).cloned()
-        }
-        fn get_certified_header(&self, height: BlockHeight) -> Option<CertifiedBlockHeader> {
+        fn get_block(&self, height: BlockHeight) -> Option<Verified<CertifiedBlock>> {
             self.blocks
                 .get(&height)
-                .map(|c| CertifiedBlockHeader::new(c.block().header().clone(), c.qc().clone()))
+                .cloned()
+                .map(Verified::<CertifiedBlock>::from_persisted)
+        }
+        fn get_certified_header(
+            &self,
+            height: BlockHeight,
+        ) -> Option<Verified<CertifiedBlockHeader>> {
+            self.blocks.get(&height).map(|c| {
+                Verified::<CertifiedBlockHeader>::from_persisted(CertifiedBlockHeader::new(
+                    c.block().header().clone(),
+                    c.qc().clone(),
+                ))
+            })
         }
         fn committed_height(&self) -> BlockHeight {
             BlockHeight::new(0)
@@ -958,13 +968,13 @@ mod tests {
         fn committed_hash(&self) -> Option<BlockHash> {
             None
         }
-        fn latest_qc(&self) -> Option<QuorumCertificate> {
+        fn latest_qc(&self) -> Option<Verified<QuorumCertificate>> {
             None
         }
         fn get_block_for_sync(&self, _height: BlockHeight) -> Option<BlockForSync> {
             None
         }
-        fn get_transactions_batch(&self, _hashes: &[TxHash]) -> Vec<RoutableTransaction> {
+        fn get_transactions_batch(&self, _hashes: &[TxHash]) -> Vec<Verified<RoutableTransaction>> {
             Vec::new()
         }
         fn get_certificates_batch(&self, _ids: &[WaveId]) -> Vec<WaveCertificate> {
@@ -973,13 +983,16 @@ mod tests {
         fn get_consensus_receipt(&self, _tx_hash: &TxHash) -> Option<Arc<ConsensusReceipt>> {
             None
         }
-        fn get_execution_certificate(&self, _wave_id: &WaveId) -> Option<ExecutionCertificate> {
+        fn get_execution_certificate(
+            &self,
+            _wave_id: &WaveId,
+        ) -> Option<Verified<ExecutionCertificate>> {
             None
         }
         fn get_execution_certificates_batch(
             &self,
             _wave_ids: &[WaveId],
-        ) -> Vec<ExecutionCertificate> {
+        ) -> Vec<Verified<ExecutionCertificate>> {
             Vec::new()
         }
         fn get_beacon_witness_payloads(

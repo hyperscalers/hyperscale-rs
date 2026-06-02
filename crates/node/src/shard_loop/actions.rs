@@ -14,8 +14,8 @@ use hyperscale_provisions::action_handlers::handle_action as handle_provisions_a
 use hyperscale_shard::action_handlers::handle_action as handle_shard_action;
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::{
-    BeaconWitnessCommit, BlockHeight, CertifiedBlock, QuorumCertificate, StateRoot,
-    TopologySnapshot, TransactionStatus, TxHash, Verified,
+    BeaconWitnessCommit, BlockHeight, CertifiedBlock, StateRoot, TopologySnapshot,
+    TransactionStatus, TxHash, Verified,
 };
 use tracing::{debug, error, trace, warn};
 
@@ -250,9 +250,7 @@ where
         let storage = &self.io.storage;
         let height = storage.committed_height();
         let hash = storage.committed_hash();
-        let qc = storage
-            .latest_qc()
-            .map(Verified::<QuorumCertificate>::from_persisted);
+        let qc = storage.latest_qc();
         push_protocol_event(
             self.event_sender(),
             self.shard,

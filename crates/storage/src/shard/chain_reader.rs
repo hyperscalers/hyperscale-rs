@@ -8,7 +8,7 @@ use std::sync::Arc;
 use hyperscale_types::{
     BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, CertifiedBlock, CertifiedBlockHeader,
     ConsensusReceipt, ExecutionCertificate, ProvisionHash, QuorumCertificate, RoutableTransaction,
-    ShardWitnessPayload, TxHash, WaveCertificate, WaveId,
+    ShardWitnessPayload, TxHash, Verified, WaveCertificate, WaveId,
 };
 
 /// A sync-ready block retrieved from storage.
@@ -38,14 +38,14 @@ pub struct BlockForSync {
 /// is sufficient (nodes sync past voted heights on restart).
 pub trait ShardChainReader: Send + Sync + 'static {
     /// Get a committed block by height.
-    fn get_block(&self, height: BlockHeight) -> Option<CertifiedBlock>;
+    fn get_block(&self, height: BlockHeight) -> Option<Verified<CertifiedBlock>>;
 
     /// Get a committed block header (header + committing QC) by height.
     ///
     /// Lighter than [`Self::get_block`]: skips the per-tx and per-cert
     /// fan-out reads needed to rehydrate a full block. Used by the
     /// remote-header fallback serve path, which never needs the body.
-    fn get_certified_header(&self, height: BlockHeight) -> Option<CertifiedBlockHeader>;
+    fn get_certified_header(&self, height: BlockHeight) -> Option<Verified<CertifiedBlockHeader>>;
 
     /// Get the highest committed block height.
     fn committed_height(&self) -> BlockHeight;
@@ -54,7 +54,7 @@ pub trait ShardChainReader: Send + Sync + 'static {
     fn committed_hash(&self) -> Option<BlockHash>;
 
     /// Get the latest quorum certificate.
-    fn latest_qc(&self) -> Option<QuorumCertificate>;
+    fn latest_qc(&self) -> Option<Verified<QuorumCertificate>>;
 
     /// Get a complete block for serving sync requests from persisted
     /// storage.
@@ -76,7 +76,7 @@ pub trait ShardChainReader: Send + Sync + 'static {
     /// Get multiple transactions by hash (batch read).
     ///
     /// Returns only transactions that were found (missing hashes are skipped).
-    fn get_transactions_batch(&self, hashes: &[TxHash]) -> Vec<RoutableTransaction>;
+    fn get_transactions_batch(&self, hashes: &[TxHash]) -> Vec<Verified<RoutableTransaction>>;
 
     /// Get multiple certificates by `WaveId` (batch read).
     ///
@@ -87,12 +87,16 @@ pub trait ShardChainReader: Send + Sync + 'static {
     fn get_consensus_receipt(&self, tx_hash: &TxHash) -> Option<Arc<ConsensusReceipt>>;
 
     /// Retrieve a single execution certificate by [`WaveId`].
-    fn get_execution_certificate(&self, wave_id: &WaveId) -> Option<ExecutionCertificate>;
+    fn get_execution_certificate(&self, wave_id: &WaveId)
+    -> Option<Verified<ExecutionCertificate>>;
 
     /// Retrieve multiple execution certificates by [`WaveId`] (batch read).
     ///
     /// Returns only certificates that were found (missing ids are skipped).
-    fn get_execution_certificates_batch(&self, wave_ids: &[WaveId]) -> Vec<ExecutionCertificate>;
+    fn get_execution_certificates_batch(
+        &self,
+        wave_ids: &[WaveId],
+    ) -> Vec<Verified<ExecutionCertificate>>;
 
     /// Read retained beacon-witness payloads in leaf-index order, up to
     /// (but not including) `end`. Storage is scoped per-shard, so the

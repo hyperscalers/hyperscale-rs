@@ -505,7 +505,13 @@ impl RocksDbShardStorage {
     /// Reads all three chain metadata keys in one call. Use the individual
     /// `read_committed_height`, `read_committed_hash`, `read_latest_qc`
     /// methods when only one value is needed.
-    pub fn get_chain_metadata(&self) -> (BlockHeight, Option<Hash>, Option<QuorumCertificate>) {
+    pub fn get_chain_metadata(
+        &self,
+    ) -> (
+        BlockHeight,
+        Option<Hash>,
+        Option<Verified<QuorumCertificate>>,
+    ) {
         let start = Instant::now();
 
         let height = self.read_committed_height();
@@ -530,8 +536,8 @@ impl RocksDbShardStorage {
     }
 
     /// Read only the latest QC from `RocksDB`.
-    pub(crate) fn read_latest_qc(&self) -> Option<QuorumCertificate> {
-        read_committed_qc(&*self.db)
+    pub(crate) fn read_latest_qc(&self) -> Option<Verified<QuorumCertificate>> {
+        read_committed_qc(&*self.db).map(Verified::<QuorumCertificate>::from_persisted)
     }
 
     // ═══════════════════════════════════════════════════════════════════════

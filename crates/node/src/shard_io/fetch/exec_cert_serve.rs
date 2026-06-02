@@ -31,7 +31,7 @@ pub fn serve_execution_certs_request<S: ShardStorage>(
 
     if !missing.is_empty() {
         for cert in pending_chain.execution_certificates_batch(&missing) {
-            certs.push(Arc::new(cert));
+            certs.push(Arc::new(cert.into_inner()));
         }
     }
 

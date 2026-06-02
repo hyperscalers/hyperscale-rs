@@ -10,8 +10,8 @@ use sbor::{
 use thiserror::Error;
 
 use crate::{
-    Block, BlockHash, BlockHeight, QuorumCertificate, ShardGroupId, StateRoot, ValidatorId,
-    Verifiable, Verified,
+    Block, BlockHash, BlockHeight, CertifiedBlockHeader, QuorumCertificate, ShardGroupId,
+    StateRoot, ValidatorId, Verifiable, Verified,
 };
 
 /// A block alongside the QC that certifies it.
@@ -389,6 +389,19 @@ impl Verified<CertifiedBlock> {
         // At least one honest signer ran the parent QC verifier before
         // voting; BFT-transitive trust.
         Verified::<QuorumCertificate>::new_unchecked(self.block().header().parent_qc().clone())
+    }
+
+    /// Project to the verified certified header — the block's header
+    /// paired with its verified QC. Infallible: the
+    /// [`Verified<CertifiedBlock>`] predicate already guarantees the QC
+    /// commits this block's header, so the
+    /// [`Verified<CertifiedBlockHeader>`] pairing holds by construction.
+    #[must_use]
+    pub fn certified_header(&self) -> Verified<CertifiedBlockHeader> {
+        Verified::new_unchecked(CertifiedBlockHeader::new(
+            self.block().header().clone(),
+            self.qc_verified().clone(),
+        ))
     }
 }
 

@@ -137,4 +137,17 @@ impl Verified<CertifiedBlockHeader> {
             qc: qc.into(),
         }))
     }
+
+    /// Re-wrap a certified header decoded from storage. The header was
+    /// committed as part of a [`Verified<CertifiedBlock>`] — whose
+    /// per-root verifiers, QC, and linkage all held at admission — so
+    /// re-reading the persisted header returns a value whose predicate
+    /// already held at write time. Storage is the trust source; mirror
+    /// of [`Verified::<CertifiedBlock>::from_persisted`](crate::CertifiedBlock).
+    /// Callers in storage adapters use this constructor; any other caller
+    /// is misusing it.
+    #[must_use]
+    pub const fn from_persisted(header: CertifiedBlockHeader) -> Self {
+        Self::new_unchecked(header)
+    }
 }

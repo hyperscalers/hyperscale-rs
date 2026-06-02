@@ -7,28 +7,29 @@ use hyperscale_storage::{BlockForSync, ShardChainReader};
 use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockManifest, CertifiedBlock,
     CertifiedBlockHeader, ConsensusReceipt, ExecutionCertificate, QuorumCertificate,
-    RoutableTransaction, ShardWitnessPayload, TxHash, WaveCertificate, WaveId,
+    RoutableTransaction, ShardWitnessPayload, TxHash, Verified, WaveCertificate, WaveId,
 };
 
 use super::core::SimShardStorage;
 
 impl ShardChainReader for SimShardStorage {
-    fn get_block(&self, height: BlockHeight) -> Option<CertifiedBlock> {
+    fn get_block(&self, height: BlockHeight) -> Option<Verified<CertifiedBlock>> {
         read_or_recover(&self.consensus)
             .blocks
             .get(&height)
             .cloned()
+            .map(Verified::<CertifiedBlock>::from_persisted)
     }
 
-    fn get_certified_header(&self, height: BlockHeight) -> Option<CertifiedBlockHeader> {
+    fn get_certified_header(&self, height: BlockHeight) -> Option<Verified<CertifiedBlockHeader>> {
         read_or_recover(&self.consensus)
             .blocks
             .get(&height)
             .map(|certified| {
-                CertifiedBlockHeader::new(
+                Verified::<CertifiedBlockHeader>::from_persisted(CertifiedBlockHeader::new(
                     certified.block().header().clone(),
                     certified.qc().clone(),
-                )
+                ))
             })
     }
 
@@ -40,8 +41,11 @@ impl ShardChainReader for SimShardStorage {
         read_or_recover(&self.consensus).committed_hash
     }
 
-    fn latest_qc(&self) -> Option<QuorumCertificate> {
-        read_or_recover(&self.consensus).committed_qc.clone()
+    fn latest_qc(&self) -> Option<Verified<QuorumCertificate>> {
+        read_or_recover(&self.consensus)
+            .committed_qc
+            .clone()
+            .map(Verified::<QuorumCertificate>::from_persisted)
     }
 
     fn get_block_for_sync(&self, height: BlockHeight) -> Option<BlockForSync> {
@@ -63,11 +67,12 @@ impl ShardChainReader for SimShardStorage {
             })
     }
 
-    fn get_transactions_batch(&self, hashes: &[TxHash]) -> Vec<RoutableTransaction> {
+    fn get_transactions_batch(&self, hashes: &[TxHash]) -> Vec<Verified<RoutableTransaction>> {
         let c = read_or_recover(&self.consensus);
         hashes
             .iter()
             .filter_map(|h| c.transactions.get(h).cloned())
+            .map(Verified::<RoutableTransaction>::from_persisted)
             .collect()
     }
 
@@ -85,18 +90,26 @@ impl ShardChainReader for SimShardStorage {
             .cloned()
     }
 
-    fn get_execution_certificate(&self, wave_id: &WaveId) -> Option<ExecutionCertificate> {
+    fn get_execution_certificate(
+        &self,
+        wave_id: &WaveId,
+    ) -> Option<Verified<ExecutionCertificate>> {
         read_or_recover(&self.consensus)
             .execution_certs
             .get(wave_id)
             .cloned()
+            .map(Verified::<ExecutionCertificate>::from_persisted)
     }
 
-    fn get_execution_certificates_batch(&self, wave_ids: &[WaveId]) -> Vec<ExecutionCertificate> {
+    fn get_execution_certificates_batch(
+        &self,
+        wave_ids: &[WaveId],
+    ) -> Vec<Verified<ExecutionCertificate>> {
         let c = read_or_recover(&self.consensus);
         wave_ids
             .iter()
             .filter_map(|wid| c.execution_certs.get(wid).cloned())
+            .map(Verified::<ExecutionCertificate>::from_persisted)
             .collect()
     }
 

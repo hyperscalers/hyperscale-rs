@@ -2,9 +2,7 @@
 
 use hyperscale_metrics::record_storage_operation;
 use hyperscale_storage::{RecoveredState, SubstateStore};
-use hyperscale_types::{
-    BlockHash, BlockHeight, Hash, QuorumCertificate, ShardWitnessPayload, Verified,
-};
+use hyperscale_types::{BlockHash, BlockHeight, Hash, ShardWitnessPayload};
 
 use super::column_families::BeaconWitnessesCf;
 use super::core::RocksDbShardStorage;
@@ -57,8 +55,6 @@ impl RocksDbShardStorage {
             load_time_ms = elapsed * 1000.0,
             "Loaded recovered state from storage"
         );
-
-        let latest_qc = latest_qc.map(Verified::<QuorumCertificate>::from_persisted);
 
         RecoveredState {
             committed_height,
