@@ -26,13 +26,13 @@ use hyperscale_types::{
     BeaconBlock, BeaconCert, BeaconProposal, BeaconProposalVerifyContext, BeaconState, BlockHash,
     BlockHeight, Bls12381G1PublicKey, CertifiedBeaconBlock, CertifiedBeaconBlockVerifyError,
     CertifiedBlockHeader, Epoch, GenesisConfigHash, Hash, LeafIndex, LocalTimestamp,
-    MAX_EQUIVOCATIONS_PER_PROPOSER, MAX_SHARD_WITNESSES_PER_PROPOSER, NetworkDefinition, PcQc3,
-    PcValueElement, PcVector, PcVote1, PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3,
-    PcVote3VerifyError, PcVoteEquivocation, PcVoteEquivocationContext, PcVoteRound, SKIP_TIMEOUT,
-    SPC_VIEW_TIMEOUT, ShardGroupId, ShardWitness, SkipEpochCert, SkipRequest,
-    SkipRequestVerifyError, SpcCert, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError, SpcNewCommitMsg,
-    SpcNewCommitMsgVerifyError, SpcProposalObject, SpcProposalObjectVerifyError, SpcView,
-    TopologySnapshot, ValidatorId, Verifiable, Verified, Verify, WeightedTimestamp,
+    MAX_EQUIVOCATIONS_PER_PROPOSER, MAX_SHARD_WITNESSES_PER_PROPOSER, MIN_BEACON_COMMITTEE_SIZE,
+    NetworkDefinition, PcQc3, PcValueElement, PcVector, PcVote1, PcVote1VerifyError, PcVote2,
+    PcVote2VerifyError, PcVote3, PcVote3VerifyError, PcVoteEquivocation, PcVoteEquivocationContext,
+    PcVoteRound, SKIP_TIMEOUT, SPC_VIEW_TIMEOUT, ShardGroupId, ShardWitness, SkipEpochCert,
+    SkipRequest, SkipRequestVerifyError, SpcCert, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError,
+    SpcNewCommitMsg, SpcNewCommitMsgVerifyError, SpcProposalObject, SpcProposalObjectVerifyError,
+    SpcView, TopologySnapshot, ValidatorId, Verifiable, Verified, Verify, WeightedTimestamp,
 };
 use tracing::{trace, warn};
 
@@ -1080,8 +1080,31 @@ impl BeaconCoordinator {
         self.bootstrap_spc_with_committee(committee);
     }
 
+    /// Stand up the per-epoch [`SpcInstance`] from an explicit committee.
+    ///
+    /// Declines (leaves `self.spc` cleared) when `committee.len() <
+    /// MIN_BEACON_COMMITTEE_SIZE`: a committee that can't tolerate a single
+    /// Byzantine fault must not run PC. Rather than panic in
+    /// [`PcInstance::new`], the coordinator skips the bootstrap and lets
+    /// the skip path carry the epoch — the ready on-shard set has
+    /// collapsed below the BFT floor, an operator-visible degradation
+    /// the chain recovers from once enough validators ready up. The
+    /// assertion in `PcInstance::new` stays as a tripwire for a
+    /// genuinely impossible caller.
     fn bootstrap_spc_with_committee(&mut self, committee: Vec<(ValidatorId, Bls12381G1PublicKey)>) {
         let next_epoch = self.state.current_epoch.next();
+        if committee.len() < MIN_BEACON_COMMITTEE_SIZE {
+            warn!(
+                committee_size = committee.len(),
+                min_committee_size = MIN_BEACON_COMMITTEE_SIZE,
+                epoch = next_epoch.inner(),
+                "Beacon-eligible set below the BFT minimum — declining SPC bootstrap. \
+                 The epoch advances via the skip path; normal blocks resume once the \
+                 ready on-shard set recovers.",
+            );
+            self.spc = None;
+            return;
+        }
         self.spc = Some(SpcInstance::new(
             next_epoch,
             committee,
@@ -2433,6 +2456,33 @@ mod tests {
                 .any(|a| matches!(a, Action::BuildAndBroadcastBeaconProposal { .. })),
             "expected BuildAndBroadcastBeaconProposal in {actions:?}",
         );
+    }
+
+    /// A beacon-eligible set that resampled below the BFT minimum
+    /// (`n < MIN_BEACON_COMMITTEE_SIZE`) must not bootstrap an SPC instance —
+    /// `PcInstance::new` would panic on it. The coordinator declines and
+    /// leaves `spc` cleared so the skip path can carry the epoch.
+    #[test]
+    fn bootstrap_below_bft_minimum_declines_without_panicking() {
+        let mut coord = fresh_coord();
+        let undersized: Vec<(ValidatorId, Bls12381G1PublicKey)> = (0u64
+            ..(MIN_BEACON_COMMITTEE_SIZE as u64 - 1))
+            .map(|i| (ValidatorId::new(i), pubkey(i)))
+            .collect();
+        coord.bootstrap_spc_with_committee(undersized);
+        assert!(coord.spc.is_none());
+    }
+
+    /// A committee exactly at the BFT minimum bootstraps normally.
+    #[test]
+    fn bootstrap_at_bft_minimum_creates_instance() {
+        let mut coord = fresh_coord();
+        let committee: Vec<(ValidatorId, Bls12381G1PublicKey)> = (0u64..MIN_BEACON_COMMITTEE_SIZE
+            as u64)
+            .map(|i| (ValidatorId::new(i), pubkey(i)))
+            .collect();
+        coord.bootstrap_spc_with_committee(committee);
+        assert!(coord.spc.is_some());
     }
 
     #[test]

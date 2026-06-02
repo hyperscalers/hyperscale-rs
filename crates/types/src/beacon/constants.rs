@@ -50,6 +50,15 @@ pub const SPC_VIEW_TIMEOUT: Duration = Duration::from_secs(15);
 /// Target signer count for the global (beacon) committee.
 pub const BEACON_SIGNER_COUNT: usize = 4;
 
+/// Smallest beacon committee that can run PC/SPC consensus.
+///
+/// `n >= 3f + 1` with `f >= 1` collapses to `n >= 4`: below this the
+/// committee can't tolerate a single Byzantine fault. The coordinator in
+/// `hyperscale_beacon` gates SPC bootstrap on this floor and falls back
+/// to the skip path when the ready on-shard set drops beneath it; PC
+/// instance construction also asserts on it as a tripwire.
+pub const MIN_BEACON_COMMITTEE_SIZE: usize = 4;
+
 /// Members per shard.
 ///
 /// Sized to accommodate signer target plus a small headroom for in-sync

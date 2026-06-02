@@ -8,8 +8,9 @@
 use std::collections::BTreeMap;
 
 use hyperscale_types::{
-    Bls12381G1PublicKey, Bls12381G2Signature, Epoch, PcQc1, PcQc2, PcQc3, PcVector, PcVote1,
-    PcVote2, PcVote3, PcVoteEquivocation, PcVoteRound, SpcView, ValidatorId, Verified,
+    Bls12381G1PublicKey, Bls12381G2Signature, Epoch, MIN_BEACON_COMMITTEE_SIZE, PcQc1, PcQc2,
+    PcQc3, PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation, PcVoteRound, SpcView,
+    ValidatorId, Verified,
 };
 
 /// What `PcInstance::handle` tells its parent.
@@ -114,7 +115,7 @@ impl PcInstance {
         committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
     ) -> Self {
         assert!(
-            committee.len() >= 4,
+            committee.len() >= MIN_BEACON_COMMITTEE_SIZE,
             "PC requires n >= 4 (3f + 1 with f = 1); got n = {}",
             committee.len()
         );
