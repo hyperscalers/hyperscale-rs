@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use common::{HoldFilter, ShardCoordinatorSim};
 use hyperscale_types::{
-    BlockHeight, MAX_PROGRESS_WAIT, VIEW_CHANGE_TIMEOUT, VIEW_CHANGE_TIMEOUT_INCREMENT, ValidatorId,
+    MAX_PROGRESS_WAIT, Round, VIEW_CHANGE_TIMEOUT, VIEW_CHANGE_TIMEOUT_INCREMENT, ValidatorId,
 };
 
 const MAX_STEPS: usize = 5_000;
@@ -176,41 +176,42 @@ fn linear_backoff_grows_timeout_per_consecutive_view_change() {
     }
 }
 
-/// HotStuff-2's round-fail unlock rule: a view change at `H` with
-/// no QC at `H` clears the local `voted_heights` lock — quorum
-/// intersection guarantees no conflicting QC can form
-/// retroactively.
+/// HotStuff-2 safe-vote state across a timeout view change: casting a vote
+/// parks `last_voted_round` at the voted round but raises `locked_round`
+/// only to the round of the QC the block extended. A timeout-driven advance
+/// never raises the lock, so the node stays free to vote at the new round
+/// for any block extending a QC at least as high as that lock.
 ///
-/// Idx 1 is the h=1 r=1 leader; deafening idx 2 and idx 3 leaves only
-/// idx 0 and the leader active, two votes short of the 3-vote quorum,
-/// so no QC forms and idx 0's lock survives long enough to assert
-/// against.
+/// Idx 1 is the h=1 r=1 leader; deafening idx 2 and idx 3 leaves only idx 0
+/// and the leader active, two votes short of the 3-vote quorum, so no QC
+/// forms and the lock state stays observable.
 #[test]
-fn view_change_unlocks_voted_height_when_no_qc_formed() {
+fn timeout_view_change_preserves_safe_vote_lock() {
     let mut sim = ShardCoordinatorSim::new(4, 0x10_C8);
     sim.drop_for(ValidatorId::new(2), 10_000);
     sim.drop_for(ValidatorId::new(3), 10_000);
     sim.kick_off();
-    // Idx 0 receives idx 1's header, verifies, votes. Only idx 0 and
-    // the leader stay active — two votes can't reach quorum, so no QC
-    // forms.
+    // Idx 0 receives idx 1's height-1 header (round 1, genesis parent QC),
+    // verifies, votes. Only two replicas stay active, so no QC forms.
     sim.run_for_at_most(500);
 
-    assert!(
-        sim.coordinators[0]
-            .voted_heights()
-            .contains_key(&BlockHeight::new(1)),
-        "idx 0 should hold a vote lock at h=1 before view change",
+    assert_eq!(
+        sim.coordinators[0].last_voted_round(),
+        Round::new(1),
+        "idx 0 should have voted at round 1",
+    );
+    assert_eq!(
+        sim.coordinators[0].locked_round(),
+        Round::INITIAL,
+        "voting for a genesis-extending block leaves the lock at the genesis round",
     );
     assert!(
         sim.coordinators[0].latest_qc().is_none(),
-        "no QC must have formed at h=1 — that's the precondition for the unlock rule",
+        "no QC must have formed at h=1",
     );
 
-    // Past `MAX_PROGRESS_WAIT` the pending-block-at-tip suppression in
-    // `should_advance_round` lifts. The deafened idx 2 / idx 3 still
-    // broadcast their own timeouts (only their inbound is dropped), so
-    // idx 0 collects a 2f+1 timeout quorum and advances + unlocks.
+    // A 2f+1 timeout quorum advances idx 0 (the deafened idx 2 / idx 3 still
+    // broadcast their own timeouts — only their inbound is dropped).
     sim.advance_clock(MAX_PROGRESS_WAIT + Duration::from_millis(100));
     sim.fire_view_change_timer_all();
     sim.run_for_at_most(MAX_STEPS);
@@ -219,11 +220,10 @@ fn view_change_unlocks_voted_height_when_no_qc_formed() {
         sim.coordinators[0].stats().view_changes >= 1,
         "idx 0 view_changes must have ticked",
     );
-    assert!(
-        !sim.coordinators[0]
-            .voted_heights()
-            .contains_key(&BlockHeight::new(1)),
-        "idx 0 vote lock at h=1 must clear after view change with no QC formed",
+    assert_eq!(
+        sim.coordinators[0].locked_round(),
+        Round::INITIAL,
+        "a timeout view change must not raise the safe-vote lock",
     );
 }
 

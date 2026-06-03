@@ -64,8 +64,6 @@ pub struct MemoryMetrics {
     pub shard_pending_commits: usize,
     /// Commits waiting for block data (header/txs).
     pub shard_pending_commits_awaiting_data: usize,
-    /// Heights we have voted on (equivocation guard).
-    pub shard_voted_heights: usize,
     /// Votes received per (height, validator) pair.
     pub shard_received_votes_by_height: usize,
     /// Committed transaction hash lookup.

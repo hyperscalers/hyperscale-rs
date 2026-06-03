@@ -1,5 +1,6 @@
-//! Vote accounting: own-vote locks, vote sets per block, and received-vote
-//! equivocation tracking.
+//! Vote accounting: vote sets per block and received-vote equivocation
+//! tracking. The safe-vote lock itself lives on the coordinator
+//! (`locked_round` / `last_voted_round`), not here.
 //!
 //! ## Deferred Verification
 //!
@@ -40,25 +41,16 @@ struct VotePreflight {
 
 /// Top-level vote accounting state.
 ///
-/// Owns the per-block [`VoteSet`]s, the validator's own-vote locks (preventing
-/// same-height re-voting across rounds when locked), and the received-vote
-/// record used for equivocation detection.
+/// Owns the per-block [`VoteSet`]s and the received-vote record used for
+/// equivocation detection. The safe-vote lock lives on the coordinator.
 pub struct VoteKeeper {
     /// Vote sets for blocks being voted on (`block_hash` -> vote set).
     vote_sets: HashMap<BlockHash, VoteSet>,
 
-    /// Own-vote locking: tracks which block hash we voted for at each height.
-    /// Critical for shard consensus safety — prevents voting for conflicting blocks at the
-    /// same height and round. The lock may be released across rounds on
-    /// timeout or when a QC proves the lock is irrelevant.
-    ///
-    /// Key: height, Value: (`block_hash`, round)
-    voted_heights: HashMap<BlockHeight, (BlockHash, Round)>,
-
     /// Per-validator record of received verified votes for equivocation
     /// detection. Key: (height, validator), Value: (`block_hash`, round).
     /// A different-block vote at the same (height, round) is equivocation;
-    /// at a later round it's a legitimate revote after unlock.
+    /// at a later round it's a legitimate revote.
     received_votes_by_height: HashMap<(BlockHeight, ValidatorId), (BlockHash, Round)>,
 }
 
@@ -66,7 +58,6 @@ impl VoteKeeper {
     pub fn new() -> Self {
         Self {
             vote_sets: HashMap::new(),
-            voted_heights: HashMap::new(),
             received_votes_by_height: HashMap::new(),
         }
     }
@@ -75,99 +66,16 @@ impl VoteKeeper {
     pub fn cleanup_committed(&mut self, committed_height: BlockHeight) {
         self.vote_sets
             .retain(|_hash, vote_set| vote_set.height().is_none_or(|h| h > committed_height));
-        self.voted_heights
-            .retain(|height, _| *height > committed_height);
         self.received_votes_by_height
             .retain(|(height, _), _| *height > committed_height);
-    }
-
-    /// Clear vote tracking at `height` for rounds older than `new_round`, used
-    /// when advancing to a new round.
-    ///
-    /// Drops all received-vote records for the height (a validator who voted
-    /// for an older round may now legitimately vote again). Keeps vote sets
-    /// at `height` only if their round is `>= new_round` — earlier-round
-    /// vote sets can no longer form a QC.
-    ///
-    /// Returns the number of received-vote entries cleared.
-    pub fn clear_for_height(&mut self, height: BlockHeight, new_round: Round) -> usize {
-        let mut cleared = 0;
-        self.received_votes_by_height.retain(|(h, _), _| {
-            if *h == height {
-                cleared += 1;
-                false
-            } else {
-                true
-            }
-        });
-        self.vote_sets.retain(|_hash, vote_set| {
-            vote_set.height().is_none_or(|h| h != height)
-                || vote_set.round().is_none_or(|r| r >= new_round)
-        });
-        cleared
     }
 
     pub fn vote_sets_len(&self) -> usize {
         self.vote_sets.len()
     }
 
-    pub fn voted_heights_len(&self) -> usize {
-        self.voted_heights.len()
-    }
-
     pub fn received_votes_len(&self) -> usize {
         self.received_votes_by_height.len()
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // Own-vote lock (safety)
-    // ═══════════════════════════════════════════════════════════════════════
-
-    /// Check whether we may vote for `block_hash` at `height`.
-    pub fn lock_decision(&self, height: BlockHeight, block_hash: BlockHash) -> LockDecision {
-        match self.voted_heights.get(&height).copied() {
-            None => LockDecision::Unlocked,
-            Some((existing_hash, existing_round)) if existing_hash == block_hash => {
-                LockDecision::AlreadyVotedSameBlock { existing_round }
-            }
-            Some((existing_block, existing_round)) => LockDecision::LockedToOther {
-                existing_block,
-                existing_round,
-            },
-        }
-    }
-
-    /// Record our own vote for `block_hash` at `(height, round)`.
-    pub fn record_own_vote(&mut self, height: BlockHeight, block_hash: BlockHash, round: Round) {
-        self.voted_heights.insert(height, (block_hash, round));
-    }
-
-    /// Remove the own-vote lock at `height`. Returns `true` if a lock was
-    /// released. Called by timeout-based and QC-based unlock paths.
-    pub fn unlock_at(&mut self, height: BlockHeight) -> bool {
-        self.voted_heights.remove(&height).is_some()
-    }
-
-    /// Read-only view of own-vote locks, for callers that need to iterate
-    /// (e.g., QC-based unlock iterates all heights ≤ `qc.height()`).
-    pub const fn voted_heights(&self) -> &HashMap<BlockHeight, (BlockHash, Round)> {
-        &self.voted_heights
-    }
-
-    /// Block hash locked at `height`, if any.
-    pub fn locked_block(&self, height: BlockHeight) -> Option<BlockHash> {
-        self.voted_heights.get(&height).map(|(hash, _)| *hash)
-    }
-
-    /// True if any own vote has been recorded at `height`.
-    pub fn is_locked_at(&self, height: BlockHeight) -> bool {
-        self.voted_heights.contains_key(&height)
-    }
-
-    /// Drop every own-vote lock. Test/recovery use only.
-    #[cfg(test)]
-    pub fn clear_voted_heights(&mut self) {
-        self.voted_heights.clear();
     }
 
     /// Verified received vote for `(height, voter)`, if any.
@@ -490,21 +398,6 @@ impl VoteKeeper {
     }
 }
 
-/// Result of `VoteKeeper::lock_decision`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LockDecision {
-    /// No vote recorded at this height — caller may vote.
-    Unlocked,
-    /// Already voted for the same block at this height; caller should not
-    /// re-broadcast but may proceed with verification machinery.
-    AlreadyVotedSameBlock { existing_round: Round },
-    /// Locked to a different block at this height; caller must not vote.
-    LockedToOther {
-        existing_block: BlockHash,
-        existing_round: Round,
-    },
-}
-
 /// Result of `VoteKeeper::record_received_vote`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordResult {
@@ -557,18 +450,12 @@ mod tests {
     #[test]
     fn keeper_cleanup_committed_drops_entries_at_and_below_height() {
         let mut vk = VoteKeeper::new();
-        vk.voted_heights.insert(
-            BlockHeight::new(1),
-            (BlockHash::from_raw(Hash::from_bytes(b"b1")), Round::new(0)),
-        );
-        vk.voted_heights.insert(
-            BlockHeight::new(2),
-            (BlockHash::from_raw(Hash::from_bytes(b"b2")), Round::new(0)),
-        );
-        vk.voted_heights.insert(
-            BlockHeight::new(3),
-            (BlockHash::from_raw(Hash::from_bytes(b"b3")), Round::new(0)),
-        );
+        let hdr_h1 = make_header_at_round(BlockHeight::new(1), Round::new(1));
+        let hdr_h3 = make_header_at_round(BlockHeight::new(3), Round::new(3));
+        vk.vote_sets
+            .insert(hdr_h1.hash(), VoteSet::new(Some(&hdr_h1), 4));
+        vk.vote_sets
+            .insert(hdr_h3.hash(), VoteSet::new(Some(&hdr_h3), 4));
         vk.received_votes_by_height.insert(
             (BlockHeight::new(2), ValidatorId::new(7)),
             (BlockHash::from_raw(Hash::from_bytes(b"b2")), Round::new(0)),
@@ -576,40 +463,11 @@ mod tests {
 
         vk.cleanup_committed(BlockHeight::new(2));
 
-        assert_eq!(vk.voted_heights_len(), 1);
-        assert!(vk.voted_heights.contains_key(&BlockHeight::new(3)));
+        // Vote sets and received-vote records at or below the committed height
+        // are dropped; the height-3 vote set survives.
+        assert!(!vk.vote_sets.contains_key(&hdr_h1.hash()));
+        assert!(vk.vote_sets.contains_key(&hdr_h3.hash()));
         assert_eq!(vk.received_votes_len(), 0);
-    }
-
-    #[test]
-    fn keeper_clear_for_height_keeps_current_or_later_round_vote_sets() {
-        let header_at = |round: Round| make_header_at_round(BlockHeight::new(5), round);
-
-        let mut vk = VoteKeeper::new();
-        let hdr_r0 = header_at(Round::new(0));
-        let hdr_r1 = header_at(Round::new(1));
-        let hdr_r2 = header_at(Round::new(2));
-        vk.vote_sets
-            .insert(hdr_r0.hash(), VoteSet::new(Some(&hdr_r0), 4));
-        vk.vote_sets
-            .insert(hdr_r1.hash(), VoteSet::new(Some(&hdr_r1), 4));
-        vk.vote_sets
-            .insert(hdr_r2.hash(), VoteSet::new(Some(&hdr_r2), 4));
-        vk.received_votes_by_height.insert(
-            (BlockHeight::new(5), ValidatorId::new(1)),
-            (hdr_r0.hash(), Round::new(0)),
-        );
-
-        let cleared = vk.clear_for_height(BlockHeight::new(5), Round::new(1));
-
-        // Received-vote records for the height are always cleared.
-        assert_eq!(cleared, 1);
-        assert_eq!(vk.received_votes_len(), 0);
-
-        // Vote set at round 0 is dropped; rounds 1 and 2 remain.
-        assert!(!vk.vote_sets.contains_key(&hdr_r0.hash()));
-        assert!(vk.vote_sets.contains_key(&hdr_r1.hash()));
-        assert!(vk.vote_sets.contains_key(&hdr_r2.hash()));
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -729,73 +587,6 @@ mod tests {
         assert_eq!(stored_block, block_a);
         assert_eq!(stored_round, Round::new(3));
     }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // Own-vote lock (lock_decision, record_own_vote, unlock_at)
-    // ═══════════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn lock_decision_is_unlocked_without_prior_vote() {
-        let vk = VoteKeeper::new();
-        assert_eq!(
-            vk.lock_decision(
-                BlockHeight::new(1),
-                BlockHash::from_raw(Hash::from_bytes(b"b"))
-            ),
-            LockDecision::Unlocked
-        );
-    }
-
-    #[test]
-    fn lock_decision_reports_same_block_after_own_vote() {
-        let mut vk = VoteKeeper::new();
-        let h = BlockHeight::new(1);
-        let block = BlockHash::from_raw(Hash::from_bytes(b"b"));
-        vk.record_own_vote(h, block, Round::new(0));
-
-        assert_eq!(
-            vk.lock_decision(h, block),
-            LockDecision::AlreadyVotedSameBlock {
-                existing_round: Round::new(0)
-            }
-        );
-    }
-
-    #[test]
-    fn lock_decision_reports_locked_to_other_for_conflicting_block() {
-        let mut vk = VoteKeeper::new();
-        let h = BlockHeight::new(1);
-        let block_a = BlockHash::from_raw(Hash::from_bytes(b"block_a"));
-        let block_b = BlockHash::from_raw(Hash::from_bytes(b"block_b"));
-        vk.record_own_vote(h, block_a, Round::new(0));
-
-        match vk.lock_decision(h, block_b) {
-            LockDecision::LockedToOther {
-                existing_block,
-                existing_round,
-            } => {
-                assert_eq!(existing_block, block_a);
-                assert_eq!(existing_round, Round::new(0));
-            }
-            other => panic!("expected LockedToOther, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn unlock_at_releases_lock_and_reports_prior_presence() {
-        let mut vk = VoteKeeper::new();
-        let h = BlockHeight::new(1);
-        vk.record_own_vote(
-            h,
-            BlockHash::from_raw(Hash::from_bytes(b"b")),
-            Round::new(0),
-        );
-
-        assert!(vk.unlock_at(h));
-        assert!(!vk.is_locked_at(h));
-        // Second unlock: no prior lock.
-        assert!(!vk.unlock_at(h));
-    }
 }
 
 #[cfg(test)]
@@ -892,27 +683,6 @@ mod properties {
                     last_round.insert(key, stored_round);
                 }
             }
-        }
-
-        /// Invariant: `record_own_vote` followed by `unlock_at` returns the
-        /// keeper to an "unlocked" state for that height, regardless of
-        /// prior content.
-        #[test]
-        fn unlock_at_is_complete_inverse_of_record_own_vote(
-            height in 1u64..=100,
-            block_variant in 0u8..8,
-            round in 0u64..=10,
-        ) {
-            let mut vk = VoteKeeper::new();
-            let h = BlockHeight::new(height);
-            let block = BlockHash::from_raw(Hash::from_bytes(&[block_variant; 32]));
-
-            vk.record_own_vote(h, block, Round::new(round));
-            prop_assert!(vk.is_locked_at(h));
-
-            prop_assert!(vk.unlock_at(h));
-            prop_assert!(!vk.is_locked_at(h));
-            prop_assert_eq!(vk.lock_decision(h, block), LockDecision::Unlocked);
         }
     }
 }

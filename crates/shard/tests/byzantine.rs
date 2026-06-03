@@ -47,18 +47,16 @@ fn equivocating_proposer_does_not_split_consensus() {
     }
 }
 
-/// The own-vote lock keeps each honest replica from voting on
-/// more than one block at the same `(height, round)`, even when
+/// The HotStuff-2 one-vote-per-round rule (`last_voted_round`) keeps each
+/// honest replica from voting on more than one block in a round, even when
 /// an equivocating proposer's second header is admitted into
 /// `pending_blocks` and runs through verification.
 ///
-/// `maybe_unlock_for_qc` clears the h=1 lock the moment a QC at
-/// height ≥ 1 is adopted. To keep the lock observable, deafen idx 2
-/// and idx 3 so only the observer (idx 0) and the h=1 leader (idx 1)
-/// stay active — two votes can't reach the 3-vote quorum, so no
-/// QC{h=1} ever forms to clear the observer's lock.
+/// Deafen idx 2 and idx 3 so only the observer (idx 0) and the h=1 leader
+/// (idx 1) stay active — two votes can't reach the 3-vote quorum, so no
+/// QC{h=1} ever forms and the observer stays parked at round 1.
 #[test]
-fn own_vote_lock_rejects_equivocating_second_block() {
+fn safe_vote_rejects_equivocating_second_block() {
     let mut sim = ShardCoordinatorSim::new(4, 0xE9_15);
     let leader = ValidatorId::new(1); // proposer_for(1) = idx 1 (height 1, round 1)
     sim.drop_for(ValidatorId::new(2), 100_000);
@@ -76,51 +74,12 @@ fn own_vote_lock_rejects_equivocating_second_block() {
         "idx 0 unexpectedly committed despite sub-quorum starvation",
     );
 
-    let voted = sim.coordinators[0].voted_heights();
-    let h1_entries: Vec<_> = voted
-        .iter()
-        .filter(|(h, _)| **h == BlockHeight::new(1))
-        .collect();
+    // The observer voted once, at round 1: `last_voted_round` advanced to 1
+    // on the first vote, so the equivocating sibling (also round 1) failed the
+    // `round > last_voted_round` clause and was never signed.
     assert_eq!(
-        h1_entries.len(),
-        1,
-        "idx 0 recorded {} vote-lock entries at h=1 (expected exactly 1 despite equivocating pair)",
-        h1_entries.len(),
-    );
-    let (_, (_, round)) = h1_entries[0];
-    assert_eq!(
-        *round,
+        sim.coordinators[0].last_voted_round(),
         Round::new(1),
-        "idx 0 voted at h=1 in round {} (expected round 1)",
-        round.inner(),
+        "idx 0 should have voted exactly once, at round 1",
     );
-}
-
-/// Unlock-for-QC keeps `voted_heights` bounded over a
-/// multi-commit chain. Each adopted QC at height `H` clears every
-/// vote lock at heights ≤ `H` via `maybe_unlock_for_qc`, so the
-/// committed prefix never appears in the live lock set.
-#[test]
-fn commit_clears_lower_height_vote_locks() {
-    let mut sim = ShardCoordinatorSim::new(4, 0x10_60);
-    sim.kick_off();
-    sim.run_until_committed(4, MAX_STEPS);
-
-    for replica in 0..sim.n() {
-        let committed_height = sim.coordinators[replica].committed_height();
-        let voted = sim.coordinators[replica].voted_heights();
-        for h in voted.keys() {
-            assert!(
-                *h > committed_height,
-                "replica {replica}: stale vote lock at {h:?} ≤ committed_height {committed_height:?} \
-                 — unlock-for-QC must have fired",
-            );
-        }
-        // Confirm the chain actually progressed so the assertion
-        // had bite.
-        assert!(
-            committed_height >= BlockHeight::new(4),
-            "replica {replica} committed_height {committed_height:?} below test target",
-        );
-    }
 }

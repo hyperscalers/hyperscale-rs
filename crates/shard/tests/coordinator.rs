@@ -58,7 +58,6 @@ fn memory_stats_reports_all_zeros_for_fresh_coordinator() {
         vote_sets,
         pending_commits,
         pending_commits_awaiting_data,
-        voted_heights,
         received_votes_by_height,
         committed_tx_lookup,
         committed_cert_lookup,
@@ -75,7 +74,6 @@ fn memory_stats_reports_all_zeros_for_fresh_coordinator() {
     assert_eq!(vote_sets, 0);
     assert_eq!(pending_commits, 0);
     assert_eq!(pending_commits_awaiting_data, 0);
-    assert_eq!(voted_heights, 0);
     assert_eq!(received_votes_by_height, 0);
     assert_eq!(committed_tx_lookup, 0);
     assert_eq!(committed_cert_lookup, 0);

@@ -299,7 +299,6 @@ where
             shard_vote_sets: shard_mem.vote_sets,
             shard_pending_commits: shard_mem.pending_commits,
             shard_pending_commits_awaiting_data: shard_mem.pending_commits_awaiting_data,
-            shard_voted_heights: shard_mem.voted_heights,
             shard_received_votes_by_height: shard_mem.received_votes_by_height,
             shard_committed_tx_lookup: shard_mem.committed_tx_lookup,
             shard_committed_cert_lookup: shard_mem.committed_cert_lookup,

@@ -111,11 +111,6 @@ impl VoteSet {
         self.height
     }
 
-    /// Get the round number.
-    pub const fn round(&self) -> Option<Round> {
-        self.round
-    }
-
     /// Get the current verified voting power.
     pub const fn verified_power(&self) -> VotePower {
         self.verified_power

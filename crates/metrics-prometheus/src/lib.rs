@@ -1229,10 +1229,6 @@ impl MetricsRecorder for PrometheusRecorder {
             .set(m.shard_pending_commits_awaiting_data as f64);
         self.metrics
             .memory_shard
-            .with_label_values(&["voted_heights"])
-            .set(m.shard_voted_heights as f64);
-        self.metrics
-            .memory_shard
             .with_label_values(&["received_votes_by_height"])
             .set(m.shard_received_votes_by_height as f64);
         self.metrics

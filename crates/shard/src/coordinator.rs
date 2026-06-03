@@ -48,8 +48,6 @@ pub struct ShardMemoryStats {
     pub pending_commits: usize,
     /// Commits whose block data hasn't fully arrived yet.
     pub pending_commits_awaiting_data: usize,
-    /// Heights at which the local validator has voted (own-vote lock entries).
-    pub voted_heights: usize,
     /// Equivocation-detection records keyed by `(height, validator)`.
     pub received_votes_by_height: usize,
     /// Committed tx-hash → `end_timestamp_exclusive` entries used for fast
@@ -75,7 +73,6 @@ pub struct ShardMemoryStats {
     pub pending_assemblies: usize,
 }
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -115,7 +112,7 @@ use crate::verification::{
     InFlightCheck, ReadyStateRootVerification, VerificationKind, VerificationPipeline,
 };
 use crate::view_change::ViewChangeController;
-use crate::vote_keeper::{LockDecision, VoteKeeper};
+use crate::vote_keeper::VoteKeeper;
 
 /// Shard consensus state machine (HotStuff-2).
 ///
@@ -173,9 +170,20 @@ pub struct ShardCoordinator {
     /// reporting the f+1 (Bracha) and 2f+1 (advance) thresholds.
     timeouts: TimeoutKeeper,
 
-    /// The last round we broadcast our own timeout for, so we emit at most one
-    /// timeout per round (whether triggered by our timer or by Bracha).
+    /// The last round we broadcast our own timeout for, so Bracha amplification
+    /// emits at most one timeout per round (the timer itself retransmits).
     last_timed_out_round: Option<Round>,
+
+    /// HotStuff-2 safe-vote lock: the highest `parent_qc` round we have ever
+    /// voted to extend. We refuse to vote for a block whose `parent_qc` round
+    /// is below this — the entire fork-safety mechanism, kept local (no
+    /// certificate rides on the block).
+    locked_round: Round,
+
+    /// Highest round in which we have cast a vote or broadcast a timeout. One
+    /// vote per round, monotone: we never sign two votes, or a vote and a
+    /// timeout, in the same round.
+    last_voted_round: Round,
 
     /// Certified blocks awaiting commit, out-of-order commit buffering, and
     /// awaiting-data commit buffering.
@@ -257,11 +265,11 @@ impl ShardCoordinator {
         // Rounds increase per block, so the first block we propose sits one
         // round past the highest QC we recovered (the genesis QC's round 0 on
         // a fresh start).
-        let initial_view = recovered
+        let high_qc_round = recovered
             .latest_qc
             .as_deref()
-            .map_or(Round::INITIAL, QuorumCertificate::round)
-            .next();
+            .map_or(Round::INITIAL, QuorumCertificate::round);
+        let initial_view = high_qc_round.next();
         Self {
             view_change: ViewChangeController::new(initial_view),
             committed_height: recovered.committed_height,
@@ -277,6 +285,11 @@ impl ShardCoordinator {
             votes: VoteKeeper::new(),
             timeouts: TimeoutKeeper::new(),
             last_timed_out_round: None,
+            // Recover the lock conservatively at the high QC's round: we never
+            // regress below the chain we already certified, so the safe-vote
+            // lock can't slip beneath a committed block after a restart.
+            locked_round: high_qc_round,
+            last_voted_round: high_qc_round,
             commits: CommitPipeline::new(),
             verification: VerificationPipeline::new(recovered.committed_height),
             block_sync: BlockSyncManager::new(),
@@ -619,6 +632,12 @@ impl ShardCoordinator {
             self.committed_hash = h;
         }
         let has_qc = qc.is_some();
+        // Recover the safe-vote lock at the QC's round (conservative: never
+        // below the chain we already certified). See `Self::new`.
+        if let Some(qc_round) = qc.as_deref().map(QuorumCertificate::round) {
+            self.locked_round = qc_round;
+            self.last_voted_round = qc_round;
+        }
         self.latest_qc = qc;
 
         self.view_change.reset_for_height_advance();
@@ -783,11 +802,9 @@ impl ShardCoordinator {
         )
     }
 
-    /// Pre-build gate: we must be the proposer, not already building the
-    /// same height/round, and not locked on a vote at the target height.
-    /// Re-proposing a height we've voted on would create a different block
-    /// hash (timestamps differ), which the vote lock then prevents us from
-    /// voting for — so skip.
+    /// Pre-build gate: we must be the proposer for this round and not already
+    /// building (or parked on the verification pipeline for) the same
+    /// height/round.
     fn can_propose(
         &self,
         topology_snapshot: &TopologySnapshot,
@@ -827,10 +844,6 @@ impl ShardCoordinator {
                 round = round.inner(),
                 "Proposal deferred pending parent tree, skipping"
             );
-            return false;
-        }
-
-        if self.votes.is_locked_at(next_height) {
             return false;
         }
 
@@ -950,88 +963,6 @@ impl ShardCoordinator {
             round,
             plan.action,
         )
-    }
-
-    /// Re-propose a block we're vote-locked to after a view change.
-    ///
-    /// When we've already voted for a block at this height but become leader after
-    /// a view change, we must re-propose the same block (with updated round) rather
-    /// than creating a new fallback block. This allows other validators who may have
-    /// missed the original proposal to receive and vote on it.
-    ///
-    /// # Safety
-    ///
-    /// This is safe because:
-    /// - We already validated and voted for this block
-    /// - The block hash remains the same (only round changes in header)
-    /// - Other validators can now receive and vote for it
-    /// - If enough validators vote, the block commits
-    ///
-    /// # Returns
-    ///
-    /// Actions to re-broadcast the block header. We do NOT create a new vote since
-    /// we already voted for this block at this height.
-    fn repropose_locked_block(
-        &mut self,
-        block_hash: BlockHash,
-        height: BlockHeight,
-    ) -> Vec<Action> {
-        let mut actions = vec![];
-
-        // Try to get the pending block we voted for
-        let Some(pending) = self.pending_blocks.get(block_hash) else {
-            // Block not in pending_blocks - might have been cleaned up or committed.
-            // View change timer will handle further recovery.
-            warn!(
-                validator = ?self.me,
-                height = height.inner(),
-                block_hash = ?block_hash,
-                "Cannot re-propose: locked block not found in pending_blocks"
-            );
-            return vec![];
-        };
-
-        // IMPORTANT: Keep the original header unchanged, including the round.
-        //
-        // The block hash is computed from all header fields INCLUDING round.
-        // If we change the round, we change the hash, which would break vote-locking
-        // (validators voted for the original hash, not a new one).
-        //
-        // Receivers will accept this block with an older round because:
-        // 1. The proposer is valid for (height, original_round)
-        // 2. Their view >= original_round (they've also been through view change)
-        // 3. validate_header allows blocks where proposer matches (height, header.round())
-        let header = pending.header().clone();
-        let original_round = header.round();
-
-        let manifest = pending.manifest().clone();
-
-        info!(
-            validator = ?self.me,
-            height = height.inner(),
-            original_round = original_round.inner(),
-            block_hash = ?block_hash,
-            tx_count = manifest.transaction_count(),
-            cert_count = manifest.cert_ids().len(),
-            "Re-proposing vote-locked block after view change (keeping original round)"
-        );
-
-        // Broadcast the block header and manifest
-        actions.push(Action::BroadcastBlockHeader {
-            header: Box::new(header),
-            manifest: Box::new(manifest),
-        });
-
-        // Note: We do NOT create a new vote here - we already voted for this block
-        // at this height. The vote is recorded in voted_heights and our original
-        // vote should still be valid (votes are for block_hash + height, not round).
-
-        // Track proposal time for rate limiting
-
-        // Record leader activity - we are producing blocks
-        self.record_leader_activity();
-
-        actions
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -1178,26 +1109,32 @@ impl ShardCoordinator {
         actions
     }
 
-    /// Adopt `qc` as the new `latest_qc` if it advances the chain, fire
-    /// two-chain commit, and unlock vote locks. Caller MUST have confirmed
-    /// the QC's BLS signature (or it's the genesis QC) — see
-    /// [`Self::absorb_parent_qc_from_header`] for the consensus-path entry
-    /// and [`Self::on_qc_signature_verified`] for the post-verify entry.
+    /// Adopt `qc` as the new `high_qc` (`latest_qc`) if it sits in a higher
+    /// round than the one we hold, advance the view past it, and fire
+    /// two-chain commit. Caller MUST have confirmed the QC's BLS signature (or
+    /// it's the genesis QC) — see [`Self::absorb_parent_qc_from_header`] for
+    /// the consensus-path entry and [`Self::on_qc_signature_verified`] for the
+    /// post-verify entry.
+    ///
+    /// Adoption compares by **round**, not height: along a chain round and
+    /// height move together, but across a fork the higher-round QC is the one
+    /// HotStuff-2 keeps as `high_qc`.
     fn try_adopt_verified_qc(&mut self, qc: &Verified<QuorumCertificate>) -> Vec<Action> {
         let advances = self
             .latest_qc
             .as_ref()
-            .is_none_or(|existing| qc.height() > existing.height());
+            .is_none_or(|existing| qc.round() > existing.round());
         if !advances {
             return Vec::new();
         }
         debug!(
             validator = ?self.me,
             qc_height = qc.height().inner(),
+            qc_round = qc.round().inner(),
             "Adopted verified parent QC"
         );
         self.latest_qc = Some(qc.clone());
-        self.maybe_unlock_for_qc(qc.as_ref());
+        self.advance_view_for_qc(qc.as_ref());
         // Non-proposers learn about QCs via block headers rather than
         // forming them locally — they need two-chain commit + a proposal
         // kick to advance the chain in the event-driven model.
@@ -1260,10 +1197,10 @@ impl ShardCoordinator {
         let should_adopt = self
             .latest_qc
             .as_ref()
-            .is_none_or(|existing| deferred_qc.height() > existing.height());
+            .is_none_or(|existing| deferred_qc.round() > existing.round());
         if should_adopt {
             self.latest_qc = Some(deferred_qc.clone());
-            self.maybe_unlock_for_qc(&deferred_qc);
+            self.advance_view_for_qc(&deferred_qc);
             self.queue_ready_proposal();
         }
     }
@@ -1416,6 +1353,18 @@ impl ShardCoordinator {
         self.try_vote_on_block(topology_snapshot, block_hash, height, round)
     }
 
+    /// HotStuff-2 safe-vote predicate (Rule 1): may vote for a block at
+    /// `round` extending a QC at `parent_qc_round` iff it is the current round,
+    /// strictly beyond any round we have already voted or timed out in, and it
+    /// extends a QC at least as high as our lock. The local `locked_round` is
+    /// the entire fork-safety mechanism — nothing rides on the block but its
+    /// `parent_qc`.
+    fn can_safe_vote(&self, round: Round, parent_qc_round: Round) -> bool {
+        round == self.view_change.view
+            && round > self.last_voted_round
+            && parent_qc_round >= self.locked_round
+    }
+
     /// Try to vote on a block after it's complete and QC is verified.
     ///
     /// Precondition: caller must have completed QC verification. Use
@@ -1427,42 +1376,27 @@ impl ShardCoordinator {
         height: BlockHeight,
         round: Round,
     ) -> Vec<Action> {
-        // BFT safety: a validator must not vote for conflicting blocks at the
-        // same height and round. Across rounds the lock may release on
-        // timeout (no QC formed) or via QC-based unlock.
-        let vote_locked = match self.votes.lock_decision(height, block_hash) {
-            LockDecision::AlreadyVotedSameBlock { existing_round } => {
-                trace!(
-                    validator = ?self.me,
-                    block_hash = ?block_hash,
-                    height = height.inner(),
-                    round = round.inner(),
-                    existing_round = existing_round.inner(),
-                    "Already voted for this block"
-                );
-                return vec![];
-            }
-            LockDecision::Unlocked => false,
-            LockDecision::LockedToOther {
-                existing_block,
-                existing_round,
-            } => {
-                // Fall through to the verification pipeline so that VerifyStateRoot
-                // produces the PreparedCommit needed if this block commits via a
-                // QC formed by other validators. Expected during view changes —
-                // BFT safety working correctly, not a violation.
-                warn!(
-                    validator = ?self.me,
-                    existing = ?existing_block,
-                    existing_round = existing_round.inner(),
-                    new = ?block_hash,
-                    new_round = round.inner(),
-                    height = height.inner(),
-                    "Vote locking: already voted for different block at this height (view change)"
-                );
-                true
-            }
-        };
+        // Safe-vote rule. A block that fails the rule still runs verification —
+        // so its `PreparedCommit` is ready if a quorum forms it elsewhere — but
+        // we never emit a vote for it.
+        let parent_qc_round = self
+            .pending_blocks
+            .get_header(block_hash)
+            .map_or(self.locked_round, |h| h.parent_qc().round());
+        let safe = self.can_safe_vote(round, parent_qc_round);
+        if !safe {
+            trace!(
+                validator = ?self.me,
+                block_hash = ?block_hash,
+                height = height.inner(),
+                round = round.inner(),
+                cur_round = self.view_change.view.inner(),
+                last_voted_round = self.last_voted_round.inner(),
+                locked_round = self.locked_round.inner(),
+                parent_qc_round = parent_qc_round.inner(),
+                "Safe-vote rule declines — running verification only"
+            );
+        }
 
         // If the block is assembled, run validation + verification.
         // Otherwise fall through to the voting path directly — reachable only
@@ -1473,9 +1407,9 @@ impl ShardCoordinator {
                 return vec![];
             }
 
-            // Vote-locked validators must still run verification to produce
-            // PreparedCommit. Parent-pruned blocks likewise run verification
-            // but can't contribute in-flight accounting.
+            // Blocks the safe-vote rule declines must still run verification to
+            // produce PreparedCommit. Parent-pruned blocks likewise run
+            // verification but can't contribute in-flight accounting.
             let chain = ChainView::new(
                 self.local_shard,
                 self.committed_height,
@@ -1484,12 +1418,10 @@ impl ShardCoordinator {
                 self.latest_qc.as_ref(),
                 &self.pending_blocks,
             );
-            let skip_vote = match self.verification.classify_vote_in_flight(
-                &chain,
-                block_hash,
-                block,
-                vote_locked,
-            ) {
+            let skip_vote = match self
+                .verification
+                .classify_vote_in_flight(&chain, block_hash, block, !safe)
+            {
                 InFlightCheck::Proceed => false,
                 InFlightCheck::SkipVote => true,
                 InFlightCheck::Abort => return vec![],
@@ -1516,7 +1448,7 @@ impl ShardCoordinator {
             }
         }
 
-        if vote_locked {
+        if !safe {
             return vec![];
         }
 
@@ -1567,11 +1499,16 @@ impl ShardCoordinator {
         height: BlockHeight,
         round: Round,
     ) -> Vec<Action> {
-        // Record that we voted for this block at this height.
-        // Core safety invariant: we will not vote for a different block at this height
-        // unless the vote lock is released on timeout (see `advance_round`) or by
-        // QC-based unlock (see `maybe_unlock_for_qc`).
-        self.votes.record_own_vote(height, block_hash, round);
+        // Advance the safe-vote lock (Rule 1). `last_voted_round` enforces one
+        // vote per round; `locked_round` rises to the round of the QC this
+        // block extends, so we will never again vote for a block that extends a
+        // QC below it. Both are local — no certificate rides on the block.
+        let parent_qc_round = self
+            .pending_blocks
+            .get_header(block_hash)
+            .map_or(self.locked_round, |h| h.parent_qc().round());
+        self.last_voted_round = round;
+        self.locked_round = self.locked_round.max(parent_qc_round);
 
         // Reset the view change timer — voting proves the leader produced a
         // valid block. Non-proposers only learn about QC formation when the
@@ -2063,8 +2000,15 @@ impl ShardCoordinator {
 
         let height = pending_block.header().height();
         let round = pending_block.header().round();
+        let parent_qc_round = pending_block.header().parent_qc().round();
 
-        actions.extend(self.create_vote(topology_snapshot, block_hash, height, round));
+        // Re-check the safe-vote rule at emission time: the round or our lock
+        // may have advanced while the async verifications were in flight, in
+        // which case this block is now stale and we must not vote for it (it
+        // can still commit via a quorum formed elsewhere).
+        if self.can_safe_vote(round, parent_qc_round) {
+            actions.extend(self.create_vote(topology_snapshot, block_hash, height, round));
+        }
         // If this completion finished assembly for a block that
         // `latest_qc` already chose as its 2-chain committable, the
         // earlier `try_two_chain_commit` deferred for lack of an
@@ -2391,18 +2335,18 @@ impl ShardCoordinator {
         // Record leader activity - QC forming indicates progress
         self.record_leader_activity();
 
-        // Update latest QC if this is newer
+        // Update latest QC if this is newer (by round — see `try_adopt_verified_qc`)
         let should_update = self
             .latest_qc
             .as_ref()
-            .is_none_or(|existing| qc.height() > existing.height());
+            .is_none_or(|existing| qc.round() > existing.round());
 
         if should_update {
             // Defer adoption if the header isn't in memory yet — we need it
             // to look up parent_state_root / parent_in_flight at proposal time.
             if self.chain_view().get_header(block_hash).is_some() {
                 self.latest_qc = Some(qc.clone());
-                self.maybe_unlock_for_qc(qc.as_ref());
+                self.advance_view_for_qc(qc.as_ref());
                 // Cache the just-formed QC so the next 2-chain commit
                 // (driven by the *next* QC certifying our successor)
                 // can look up this QC as the certifying handle for the
@@ -2435,7 +2379,12 @@ impl ShardCoordinator {
         actions
     }
 
-    /// Two-chain commit rule: when we have QC for block N, commit block N-1.
+    /// Round-contiguous two-chain commit rule (Rule 2): a QC for block `C`
+    /// commits its parent `B` only when `C` sits in the round immediately
+    /// following `B` — `qc.round() == B.round() + 1`. A block proposed after a
+    /// view change has a non-contiguous child, so its commit defers until a
+    /// direct 2-chain forms above it; committing that descendant then commits
+    /// the whole prefix back down to the committed tip.
     ///
     /// Called from both `on_qc_formed` (when we build the QC locally) and
     /// `on_block_header` (when we learn about a QC via the next block's
@@ -2466,7 +2415,7 @@ impl ShardCoordinator {
         // committable block), defer — the next commit-driving trigger
         // (later QC arrival, state-root completion) will re-enter
         // here.
-        let Some(certified) = self
+        let Some(committable) = self
             .verification
             .cached_verified_certified_block(committable_hash)
             .map(Arc::clone)
@@ -2480,10 +2429,60 @@ impl ShardCoordinator {
             return vec![];
         };
 
-        vec![Action::Continuation(ProtocolEvent::BlockReadyToCommit {
-            certified,
-            source,
-        })]
+        // Direct-chain check: only a contiguous round (`qc.round ==
+        // committable.round + 1`) finalizes. Otherwise defer — the commit
+        // rides up to a later descendant whose direct 2-chain pulls this
+        // block in.
+        if qc.round() != committable.block().header().round().next() {
+            trace!(
+                validator = ?self.me,
+                qc_round = qc.round().inner(),
+                committable_round = committable.block().header().round().inner(),
+                committable_height = committable_height.inner(),
+                "Two-chain not round-contiguous — deferring commit until a direct chain forms above"
+            );
+            return vec![];
+        }
+
+        // Commit the whole prefix from the committed tip up to the committable
+        // block. Steady state this is just the committable block itself; after
+        // a view change it also flushes the deferred non-contiguous ancestors.
+        let Some(prefix) = self.collect_commit_prefix(&committable) else {
+            return vec![];
+        };
+
+        prefix
+            .into_iter()
+            .map(|certified| {
+                Action::Continuation(ProtocolEvent::BlockReadyToCommit { certified, source })
+            })
+            .collect()
+    }
+
+    /// Walk down from `committable` through its parent links, collecting the
+    /// assembled `Verified<CertifiedBlock>` handles for every block above the
+    /// committed tip, returned in ascending height order. Returns `None` if any
+    /// ancestor's handle isn't assembled yet — the caller defers the whole
+    /// commit until it is.
+    fn collect_commit_prefix(
+        &self,
+        committable: &Arc<Verified<CertifiedBlock>>,
+    ) -> Option<Vec<Arc<Verified<CertifiedBlock>>>> {
+        let mut chain = vec![Arc::clone(committable)];
+        let mut parent_hash = committable.block().header().parent_block_hash();
+        while chain
+            .last()
+            .is_some_and(|c| c.block().height() > self.committed_height.next())
+        {
+            let parent = self
+                .verification
+                .cached_verified_certified_block(parent_hash)
+                .map(Arc::clone)?;
+            parent_hash = parent.block().header().parent_block_hash();
+            chain.push(parent);
+        }
+        chain.reverse();
+        Some(chain)
     }
 
     /// Handle block ready to commit.
@@ -2864,13 +2863,13 @@ impl ShardCoordinator {
         // Track sync progress for the loop iterator.
         self.block_sync.set_sync_applied_height(height);
 
-        // Update latest QC if this one is newer.
+        // Update latest QC if this one is newer (by round).
         if self
             .latest_qc
             .as_ref()
-            .is_none_or(|existing| verified_qc.height() > existing.height())
+            .is_none_or(|existing| verified_qc.round() > existing.round())
         {
-            self.maybe_unlock_for_qc(verified_qc.as_ref());
+            self.advance_view_for_qc(verified_qc.as_ref());
             self.latest_qc = Some(verified_qc.clone());
         }
 
@@ -2890,7 +2889,7 @@ impl ShardCoordinator {
                 Arc::new(verified.into())
             })
             .collect();
-        let parent_qc_height = block.header().parent_qc().height();
+        let parent_qc_round = block.header().parent_qc().round();
         let parent_qc_not_genesis = !block.header().parent_qc().is_genesis();
 
         // Assemble the synced block into a `Verified<CertifiedBlock>` via
@@ -2910,10 +2909,10 @@ impl ShardCoordinator {
             && self
                 .latest_qc
                 .as_ref()
-                .is_none_or(|existing| parent_qc_height > existing.height())
+                .is_none_or(|existing| parent_qc_round > existing.round())
         {
             let verified_parent = certified.parent_qc_attested();
-            self.maybe_unlock_for_qc(verified_parent.as_ref());
+            self.advance_view_for_qc(verified_parent.as_ref());
             self.latest_qc = Some(verified_parent);
         }
 
@@ -2961,10 +2960,10 @@ impl ShardCoordinator {
     // ═══════════════════════════════════════════════════════════════════════════
 
     /// Enter the current `view_change.view` as a fresh round: clear the stale
-    /// proposal, release the height vote lock if no QC formed at the target
-    /// height, schedule the next view-change timer, and propose if we are the
-    /// new round's leader. Reached via the timeout-quorum advance
-    /// ([`Self::advance_on_timeout_quorum`]).
+    /// proposal, schedule the next view-change timer, and — if we are the new
+    /// round's leader — propose a fresh block extending `high_qc` (the
+    /// quorum-max the timeout quorum just adopted). Reached via the
+    /// timeout-quorum advance ([`Self::advance_on_timeout_quorum`]).
     fn enter_round(&mut self, topology_snapshot: &TopologySnapshot) -> Vec<Action> {
         // The next height to propose is one above the highest certified block,
         // NOT one above the committed block. This matches try_propose behavior.
@@ -3007,58 +3006,20 @@ impl ShardCoordinator {
             }
         }
 
-        // Timeout-based unlock: If no QC has formed at this height, we clear our
-        // vote lock to allow voting for a new proposal in the next round. Safety is
-        // maintained by quorum intersection — even if a QC did form but we haven't
-        // seen it, a conflicting block can never reach quorum.
-        // Note: this is more aggressive than HotStuff-2 (which requires a TC or
-        // higher QC to unlock). See `maybe_unlock_for_qc` for QC-based unlocking.
-        let latest_qc_height = self
-            .latest_qc
-            .as_deref()
-            .map_or(BlockHeight::GENESIS, QuorumCertificate::height);
-        if latest_qc_height < height {
-            // No QC formed at current height - safe to unlock
-            let had_vote = self.votes.unlock_at(height);
-            let cleared_votes = self.clear_vote_tracking_for_height(height, self.view_change.view);
-
-            if had_vote || cleared_votes > 0 {
-                info!(
-                    validator = ?self.me,
-                    height = height.inner(),
-                    new_round = self.view_change.view.inner(),
-                    latest_qc_height = latest_qc_height.inner(),
-                    cleared_votes = cleared_votes,
-                    "Unlocking vote at height (no QC formed, safe by quorum intersection)"
-                );
-            }
-        }
-
         // Always schedule the next view change timer — proposers need it too
         // in case their block doesn't gather quorum (e.g., other validators are
-        // vote-locked or offline). Without this, a proposer whose block fails to
+        // behind or offline). Without this, a proposer whose block fails to
         // reach quorum would never advance rounds again.
         let timer = Action::SetTimer {
             id: TimerId::ViewChange,
             duration: self.current_view_change_timeout(),
         };
 
-        // Check if we're the new proposer for this round
+        // The new round's leader proposes a fresh fallback block extending
+        // `high_qc`. There is no lock to re-propose: HotStuff-2 carries safety
+        // in the local `locked_round`, not on the block, so a new round always
+        // builds anew rather than re-broadcasting a prior height's proposal.
         if topology_snapshot.proposer_for(self.local_shard, self.view_change.view) == self.me {
-            // Check if we've already voted at this height - if so, we're locked
-            if let Some(existing_hash) = self.votes.locked_block(height) {
-                info!(
-                    validator = ?self.me,
-                    height = height.inner(),
-                    new_round = self.view_change.view.inner(),
-                    existing_block = ?existing_hash,
-                    "Vote-locked at this height, re-proposing"
-                );
-                let mut actions = self.repropose_locked_block(existing_hash, height);
-                actions.push(timer);
-                return actions;
-            }
-
             info!(
                 validator = ?self.me,
                 height = height.inner(),
@@ -3066,7 +3027,6 @@ impl ShardCoordinator {
                 "We are the new proposer after round advance - building block"
             );
 
-            // Build and broadcast a new block (use fallback block builder)
             let mut actions = self.build_and_broadcast_fallback_block(
                 topology_snapshot,
                 height,
@@ -3100,6 +3060,10 @@ impl ShardCoordinator {
         round: Round,
     ) -> Vec<Action> {
         self.last_timed_out_round = Some(round);
+        // A timed-out round is never voted: bump `last_voted_round` so the
+        // safe-vote rule refuses any block that arrives at this round after we
+        // gave up on it (Rule 1).
+        self.last_voted_round = self.last_voted_round.max(round);
         let recipients: Vec<ValidatorId> = topology_snapshot
             .committee_for_shard(self.local_shard)
             .iter()
@@ -3248,47 +3212,17 @@ impl ShardCoordinator {
         qc.verify(&ctx).ok()
     }
 
-    /// Called when we receive a QC from a block header that allows us to unlock.
+    /// Synchronise our view to a QC we adopted: a QC for round `r` means the
+    /// chain reached `r`, so the successor block is proposed in `r + 1`. Rounds
+    /// therefore increase per block, keeping a lagging node in step with the
+    /// network as it adopts QCs (via headers, votes, or timeout quorums).
     ///
-    /// # HotStuff-2 Unlock Rule
-    ///
-    /// When we see a QC at height H, we can safely remove vote locks at heights ≤ H:
-    ///
-    /// - **Heights < H**: These are older heights where consensus has clearly moved past.
-    ///   Any block we voted for at these heights either got committed or was abandoned.
-    ///
-    /// - **Height = H (same height as QC)**: If we voted for a different block B' at height H
-    ///   but the QC is for block B, then B' can never get a QC (since 2f+1 already voted for B,
-    ///   leaving at most f honest validators who could vote for B'). Our lock is now irrelevant.
-    ///   If we voted for the same block B, unlocking is trivially safe.
-    ///
-    /// This enables voting for new blocks at height H+1 that extend the newly certified block,
-    /// even if we previously voted for a different block at H+1 that didn't get a QC.
-    ///
-    /// # Safety Argument
-    ///
-    /// The key invariant is: once a QC exists for block B at height H, no conflicting block
-    /// at height H can ever get a QC (quorum intersection). Therefore, unlocking vote locks
-    /// at height H is safe - any conflicting vote would be "dead" anyway.
-    ///
-    /// # View Synchronization
-    ///
-    /// This method also synchronizes our view/round to match the QC. In HotStuff-2,
-    /// liveness requires that nodes eventually reach the same view. When we see a QC
-    /// formed at round R, we know the network has made progress, so we advance our
-    /// view to at least R (ready to participate in round R or later).
-    ///
-    /// This is the key mechanism that prevents view divergence: nodes that fall behind
-    /// (e.g., due to network partitions or slow clocks) will catch up when they see
-    /// QCs from the rest of the network.
-    fn maybe_unlock_for_qc(&mut self, qc: &QuorumCertificate) {
+    /// The safe-vote lock is *not* touched here — `locked_round` only ever
+    /// advances on a vote (`create_vote`), never on adopting someone else's QC.
+    fn advance_view_for_qc(&mut self, qc: &QuorumCertificate) {
         if qc.is_genesis() {
             return;
         }
-
-        // Advance our round to one past the QC's: a QC for round r means the
-        // chain reached r, so the successor block is proposed in r + 1. Rounds
-        // therefore increase per block, keeping them in step with the network.
         let old_view = self.view_change.view;
         if self.view_change.advance_on_qc(qc.round()) {
             info!(
@@ -3296,32 +3230,9 @@ impl ShardCoordinator {
                 old_view = old_view.inner(),
                 new_view = self.view_change.view.inner(),
                 qc_height = qc.height().inner(),
+                qc_round = qc.round().inner(),
                 "View advanced past QC round"
             );
-        }
-
-        // Remove vote locks for heights at or below the QC height.
-        // This is safe because:
-        // 1. Heights < H: consensus has moved past these heights
-        // 2. Height = H: if we voted for a different block, it can never get a QC (quorum intersection)
-        let qc_height = qc.height();
-        let unlocked: Vec<BlockHeight> = self
-            .votes
-            .voted_heights()
-            .keys()
-            .filter(|h| **h <= qc_height)
-            .copied()
-            .collect();
-
-        for height in unlocked {
-            if self.votes.unlock_at(height) {
-                trace!(
-                    validator = ?self.me,
-                    height = height.inner(),
-                    qc_height = qc_height.inner(),
-                    "Unlocked vote due to higher QC"
-                );
-            }
         }
     }
 
@@ -3431,24 +3342,6 @@ impl ShardCoordinator {
     // ═══════════════════════════════════════════════════════════════════════════
     // Cleanup
     // ═══════════════════════════════════════════════════════════════════════════
-
-    /// Clear vote tracking for a specific height (used during HotStuff-2 unlock).
-    ///
-    /// This removes all recorded votes for the given height, allowing validators
-    /// to vote again after a view change proves no QC formed. This is safe because
-    /// the view change certificate provides proof that consensus has moved on.
-    ///
-    /// The `new_round` parameter is used to selectively clear pending vote verifications:
-    /// only verifications for votes at rounds LESS than the new round are cleared.
-    /// This prevents a race condition where:
-    /// 1. We receive a vote from another validator at round N
-    /// 2. Before verification completes, we advance to round N
-    /// 3. If we cleared ALL verifications, we'd lose the valid vote at round N
-    ///
-    /// Returns the number of vote entries cleared.
-    fn clear_vote_tracking_for_height(&mut self, height: BlockHeight, new_round: Round) -> usize {
-        self.votes.clear_for_height(height, new_round)
-    }
 
     /// Clean up old state after commit. Drops pending-block, vote, and
     /// commit-tracking entries at or below `committed_height`. Returns an
@@ -3625,7 +3518,6 @@ impl ShardCoordinator {
             vote_sets: self.votes.vote_sets_len(),
             pending_commits: self.commits.out_of_order_len(),
             pending_commits_awaiting_data: 0,
-            voted_heights: self.votes.voted_heights_len(),
             received_votes_by_height: self.votes.received_votes_len(),
             committed_tx_lookup: self.dedup_index.tx_retention_len(),
             committed_cert_lookup: self.dedup_index.cert_retention_len(),
@@ -3692,10 +3584,16 @@ impl ShardCoordinator {
         &self.config
     }
 
-    /// Get the voted heights map (for testing/debugging).
+    /// Highest round in which we have voted or timed out (for testing/debugging).
     #[must_use]
-    pub const fn voted_heights(&self) -> &HashMap<BlockHeight, (BlockHash, Round)> {
-        self.votes.voted_heights()
+    pub const fn last_voted_round(&self) -> Round {
+        self.last_voted_round
+    }
+
+    /// Our current safe-vote lock round (for testing/debugging).
+    #[must_use]
+    pub const fn locked_round(&self) -> Round {
+        self.locked_round
     }
 
     /// Check if we have a COMPLETE block at the given height that can be committed.
@@ -3729,24 +3627,16 @@ impl ShardCoordinator {
         false
     }
 
-    /// Check if this node will propose at the next height.
+    /// Check if this node will propose in the current round.
     ///
-    /// Returns true if:
-    /// 1. We are the proposer for the next height/round
-    /// 2. We haven't already voted at that height
-    ///
-    /// This is used to avoid destructively taking certificates from execution
-    /// state when we won't actually be proposing a block.
+    /// Returns true if we are the round's proposer and haven't already voted
+    /// (or timed out) in it. Used to avoid destructively taking certificates
+    /// from execution state when we won't actually be proposing a block.
     #[must_use]
     pub fn will_propose_next(&self, topology_snapshot: &TopologySnapshot) -> bool {
-        let next_height = self
-            .latest_qc
-            .as_ref()
-            .map_or_else(|| self.committed_height.next(), |qc| qc.height().next());
         let round = self.view_change.view;
-
         topology_snapshot.proposer_for(self.local_shard, round) == self.me
-            && !self.votes.is_locked_at(next_height)
+            && self.last_voted_round < round
     }
 }
 
@@ -3956,8 +3846,8 @@ mod tests {
     /// `absorb_parent_qc_from_header` must NOT mutate `latest_qc` until the
     /// parent QC's BLS signature has been verified — otherwise a Byzantine
     /// proposer can forge a signers-pass-but-signature-invalid QC and have
-    /// us advance the chain (and unlock vote locks via
-    /// `maybe_unlock_for_qc`) on a non-existent quorum.
+    /// us advance the chain (and the view, via `advance_view_for_qc`) on a
+    /// non-existent quorum.
     #[test]
     fn test_header_with_unverified_parent_qc_does_not_update_latest_qc() {
         let (mut state, topology) = make_multi_validator_state_at(1);
@@ -4367,53 +4257,27 @@ mod tests {
     }
 
     #[test]
-    fn test_enter_round_unlocks_when_no_qc() {
-        let (mut state, topology) = make_test_state();
-        state.set_time(LocalTimestamp::from_millis(100_000));
-
-        state.votes.record_own_vote(
-            BlockHeight::new(1),
-            BlockHash::from_raw(Hash::from_bytes(b"voted_block")),
-            Round::new(0),
-        );
-        let _ = advance_one_round(&mut state, &topology);
-
-        assert!(!state.votes.is_locked_at(BlockHeight::new(1)));
-    }
-
-    #[test]
-    fn test_maybe_unlock_for_qc() {
-        // QC at height H unlocks vote locks at all heights ≤ H.
+    fn test_safe_vote_rule_clauses() {
+        // HotStuff-2 Rule 1: vote iff the block is at the current round, beyond
+        // any round we've already voted/timed-out in, and extends a QC at least
+        // as high as our lock.
         let (mut state, _topology) = make_test_state();
-        for h in 1..=3 {
-            state.votes.record_own_vote(
-                BlockHeight::new(h),
-                BlockHash::from_raw(Hash::from_bytes(format!("block{h}").as_bytes())),
-                Round::new(0),
-            );
-        }
+        state.view_change.view = Round::new(5);
+        state.last_voted_round = Round::new(4);
+        state.locked_round = Round::new(3);
 
-        let qc = {
-            let __qc = make_test_qc(
-                BlockHash::from_raw(Hash::from_bytes(b"qc_block")),
-                BlockHeight::new(2),
-            );
-            QuorumCertificate::new(
-                __qc.block_hash(),
-                __qc.shard_group_id(),
-                __qc.height(),
-                BlockHash::from_raw(Hash::from_bytes(b"parent")),
-                __qc.round(),
-                __qc.signers().clone(),
-                __qc.aggregated_signature(),
-                __qc.weighted_timestamp(),
-            )
-        };
-        state.maybe_unlock_for_qc(&qc);
-
-        assert!(!state.votes.is_locked_at(BlockHeight::new(1)));
-        assert!(!state.votes.is_locked_at(BlockHeight::new(2)));
-        assert!(state.votes.is_locked_at(BlockHeight::new(3)));
+        // All three clauses satisfied.
+        assert!(state.can_safe_vote(Round::new(5), Round::new(3)));
+        // The safe-vote bar: an honest validator refuses a block extending a QC
+        // below its locked round.
+        assert!(!state.can_safe_vote(Round::new(5), Round::new(2)));
+        // Not the current round.
+        assert!(!state.can_safe_vote(Round::new(4), Round::new(3)));
+        assert!(!state.can_safe_vote(Round::new(6), Round::new(3)));
+        // One vote per round: a round we have already voted (or timed out) in is
+        // refused even with an otherwise-safe parent QC.
+        state.last_voted_round = Round::new(5);
+        assert!(!state.can_safe_vote(Round::new(5), Round::new(3)));
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -4461,81 +4325,6 @@ mod tests {
         (state, topology, keys)
     }
 
-    /// The vote-lock invariant: after `try_vote_on_block` returns a non-empty
-    /// action set, `voted_heights[height]` is populated.
-    fn voted_block_at(state: &ShardCoordinator, height: BlockHeight) -> BlockHash {
-        state
-            .votes
-            .locked_block(height)
-            .expect("voted_heights must contain height after try_vote_on_block")
-    }
-
-    #[test]
-    fn test_vote_locking_prevents_voting_for_different_block_at_same_height() {
-        let (mut state, topology) = make_multi_validator_state();
-        state.set_time(LocalTimestamp::from_millis(100_000));
-
-        let height = BlockHeight::new(1);
-        let round_0 = Round::new(0);
-        let round_1 = Round::new(1);
-
-        // Two headers at height 1: A at round 0, B at round 1 with different
-        // proposer and timestamp — distinct hashes.
-        let first_block = make_header_at_height(height, 100_000);
-        let first_hash = first_block.hash();
-        let second_block = {
-            let __h = make_header_at_height(height, 100_001);
-            BlockHeader::new(
-                __h.shard_group_id(),
-                __h.height(),
-                __h.parent_block_hash(),
-                __h.parent_qc().clone(),
-                ValidatorId::new(2),
-                __h.timestamp(),
-                round_1,
-                __h.is_fallback(),
-                __h.state_root(),
-                __h.transaction_root(),
-                __h.certificate_root(),
-                __h.local_receipt_root(),
-                __h.provision_root(),
-                __h.waves().clone().into_inner(),
-                __h.provision_tx_roots().clone().into_inner(),
-                __h.in_flight(),
-                BeaconWitnessRoot::ZERO,
-                BeaconWitnessLeafCount::ZERO,
-            )
-        };
-        let second_hash = second_block.hash();
-
-        let actions = state.try_vote_on_block(&topology, first_hash, height, round_0);
-        assert!(!actions.is_empty());
-        assert_eq!(voted_block_at(&state, height), first_hash);
-
-        // Vote lock prevents voting for a different block at the same height,
-        // even in a later round.
-        let actions = state.try_vote_on_block(&topology, second_hash, height, round_1);
-        assert!(actions.is_empty());
-        assert_eq!(voted_block_at(&state, height), first_hash);
-    }
-
-    #[test]
-    fn test_vote_locking_allows_revoting_same_block() {
-        // Re-voting for the same block at a later round is a no-op (no re-broadcast).
-        let (mut state, topology) = make_multi_validator_state();
-        state.set_time(LocalTimestamp::from_millis(100_000));
-
-        let height = BlockHeight::new(1);
-        let block_hash = make_header_at_height(height, 100_000).hash();
-
-        let actions = state.try_vote_on_block(&topology, block_hash, height, Round::new(0));
-        assert!(!actions.is_empty());
-
-        let actions = state.try_vote_on_block(&topology, block_hash, height, Round::new(1));
-        assert!(actions.is_empty());
-        assert_eq!(voted_block_at(&state, height), block_hash);
-    }
-
     #[test]
     fn test_forged_vote_cannot_block_legitimate_validator() {
         // Forged votes are buffered pre-verification and never reach
@@ -4577,44 +4366,6 @@ mod tests {
     // ═══════════════════════════════════════════════════════════════════════════
     // Re-proposal After View Change Tests
     // ═══════════════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn test_repropose_locked_block_keeps_original_round() {
-        // After a view change lands us as leader for a height we've already voted
-        // at, we must re-broadcast the *original* header — same round, proposer,
-        // and block hash — otherwise our vote lock would prevent us from voting
-        // for our own re-proposal.
-        let (mut state, _topology) = make_multi_validator_state();
-        state.set_time(LocalTimestamp::from_millis(100_000));
-
-        let height = BlockHeight::new(1);
-        // Height 1 is proposed in round 1: proposer_for(1) = ValidatorId::new(1).
-        let original_header = make_header_at_height(height, 100_000);
-        let original_block_hash = original_header.hash();
-
-        let pending = PendingBlock::from_manifest(
-            original_header,
-            BlockManifest::default(),
-            LocalTimestamp::ZERO,
-        );
-        state.pending_blocks.insert(pending);
-        state
-            .votes
-            .record_own_vote(height, original_block_hash, Round::new(1));
-
-        let actions = state.repropose_locked_block(original_block_hash, height);
-
-        let Some(Action::BroadcastBlockHeader { header: gossip, .. }) = actions
-            .iter()
-            .find(|a| matches!(a, Action::BroadcastBlockHeader { .. }))
-        else {
-            panic!("expected BroadcastBlockHeader");
-        };
-        let reproposed = gossip.as_ref();
-        assert_eq!(reproposed.round(), Round::new(1));
-        assert_eq!(reproposed.hash(), original_block_hash);
-        assert_eq!(reproposed.proposer(), ValidatorId::new(1));
-    }
 
     #[test]
     fn test_reproposed_block_passes_validation() {
@@ -4684,101 +4435,6 @@ mod tests {
     // ═══════════════════════════════════════════════════════════════════════════
     // Extended View Change Tests
     // ═══════════════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn test_multiple_consecutive_view_changes_unlock_and_revote() {
-        // Three view changes with no QC: each must unlock the current vote. The
-        // third advance lands us as proposer and must emit a fallback. Under
-        // round-only rotation proposer_for(R) = R % 4 — local is
-        // ValidatorId::new(0), so we're proposer at R=4. A fresh state starts at
-        // view 1, so three advances reach it.
-        let (mut state, topology) = make_test_state();
-        state.set_time(LocalTimestamp::from_millis(100_000));
-        let height = BlockHeight::new(1);
-
-        let vote_and_advance = |state: &mut ShardCoordinator, block: &[u8], round: Round| {
-            state.votes.record_own_vote(
-                height,
-                BlockHash::from_raw(Hash::from_bytes(block)),
-                round,
-            );
-            advance_one_round(state, &topology)
-        };
-
-        // Rounds 2 and 3: not proposer, vote lock cleared on each advance.
-        let _ = vote_and_advance(&mut state, b"block_a", Round::new(1));
-        assert_eq!(state.view_change.view, Round::new(2));
-        assert!(!state.votes.is_locked_at(height));
-
-        let _ = vote_and_advance(&mut state, b"block_b", Round::new(2));
-        assert_eq!(state.view_change.view, Round::new(3));
-        assert!(!state.votes.is_locked_at(height));
-
-        // Round 4: we're proposer — advance emits a fallback BuildProposal.
-        let actions = vote_and_advance(&mut state, b"block_c", Round::new(3));
-        assert_eq!(state.view_change.view, Round::new(4));
-        assert!(!state.votes.is_locked_at(height));
-        assert!(actions.iter().any(|a| matches!(
-            a,
-            Action::BuildProposal {
-                is_fallback: true,
-                ..
-            }
-        )));
-    }
-
-    #[test]
-    fn test_view_change_does_not_unlock_lower_heights() {
-        // A round advance only unlocks at the height we're now proposing for
-        // (latest_qc.height() + 1). Vote locks at lower heights are left for
-        // cleanup_committed to remove on commit.
-        let (mut state, topology) = make_test_state();
-        state.set_time(LocalTimestamp::from_millis(100_000));
-
-        let qc_block = BlockHash::from_raw(Hash::from_bytes(b"qc_block_at_1"));
-        state.latest_qc = Some(make_test_qc(qc_block, BlockHeight::new(1)));
-        state
-            .votes
-            .record_own_vote(BlockHeight::new(1), qc_block, Round::new(0));
-        state.votes.record_own_vote(
-            BlockHeight::new(2),
-            BlockHash::from_raw(Hash::from_bytes(b"block_at_2")),
-            Round::new(0),
-        );
-
-        let _ = advance_one_round(&mut state, &topology);
-
-        assert!(state.votes.is_locked_at(BlockHeight::new(1)));
-        assert!(!state.votes.is_locked_at(BlockHeight::new(2)));
-    }
-
-    #[test]
-    fn test_unlock_for_qc_at_same_height_different_block() {
-        // QC for block B proves A can never get a QC (quorum intersection), so
-        // our vote lock on A is safe to release.
-        let (mut state, _topology) = make_test_state();
-        let block_a = BlockHash::from_raw(Hash::from_bytes(b"block_a"));
-        let block_b = BlockHash::from_raw(Hash::from_bytes(b"block_b"));
-        let height = BlockHeight::new(5);
-
-        state.votes.record_own_vote(height, block_a, Round::new(0));
-        let qc = {
-            let __qc = make_test_qc(block_b, height);
-            QuorumCertificate::new(
-                __qc.block_hash(),
-                __qc.shard_group_id(),
-                __qc.height(),
-                BlockHash::from_raw(Hash::from_bytes(b"parent")),
-                __qc.round(),
-                __qc.signers().clone(),
-                __qc.aggregated_signature(),
-                __qc.weighted_timestamp(),
-            )
-        };
-        state.maybe_unlock_for_qc(&qc);
-
-        assert!(!state.votes.is_locked_at(height));
-    }
 
     #[test]
     fn test_qc_formed_proposes_empty_block_for_finalization() {
@@ -5280,14 +4936,16 @@ mod tests {
 
         let block_hash = BlockHash::from_raw(Hash::from_bytes(b"other_proposer_block"));
         let height = BlockHeight::new(1);
-        let actions = state.try_vote_on_block(&topology, block_hash, height, Round::new(0));
+        // A fresh state's current round is 1, so vote at the matching round.
+        let round = Round::new(1);
+        let actions = state.try_vote_on_block(&topology, block_hash, height, round);
 
         assert!(
             actions
                 .iter()
                 .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. }))
         );
-        assert!(state.votes.is_locked_at(height));
+        assert_eq!(state.last_voted_round(), round);
     }
 
     #[test]
@@ -5320,33 +4978,6 @@ mod tests {
             state.view_change.last_leader_activity,
             Some(LocalTimestamp::from_millis(100_000))
         );
-    }
-
-    #[test]
-    fn test_syncing_validator_vote_locking_preserved() {
-        // Vote locking applies during sync just as in normal operation.
-        let (mut state, topology) = make_multi_validator_state();
-        state.set_time(LocalTimestamp::from_millis(100_000));
-        state.set_block_syncing(true);
-
-        let height = BlockHeight::new(1);
-        let block_a = BlockHash::from_raw(Hash::from_bytes(b"block_a"));
-        let block_b = BlockHash::from_raw(Hash::from_bytes(b"block_b"));
-
-        let actions = state.try_vote_on_block(&topology, block_a, height, Round::new(0));
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. }))
-        );
-
-        let actions = state.try_vote_on_block(&topology, block_b, height, Round::new(1));
-        assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. }))
-        );
-        assert_eq!(state.votes.locked_block(height), Some(block_a));
     }
 
     #[test]
@@ -5581,7 +5212,6 @@ mod tests {
         state.set_block_syncing(false);
 
         state.pending_blocks.clear();
-        state.votes.clear_voted_heights();
 
         let fallback_actions =
             state.build_and_broadcast_fallback_block(&topology, BlockHeight::new(4), Round::new(1));
