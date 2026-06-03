@@ -44,6 +44,9 @@ pub const DOMAIN_TIMEOUT: &[u8] = b"TIMEOUT";
 /// - Individual block vote signatures
 /// - QC aggregated signature verification
 /// - View change `highest_qc` verification
+///
+/// `parent_block_hash` is bound in so the QC's committable-block selector (the
+/// two-chain rule) is authenticated by the quorum, not merely trusted.
 #[must_use]
 pub fn block_vote_message(
     network: &NetworkDefinition,
@@ -51,14 +54,16 @@ pub fn block_vote_message(
     height: BlockHeight,
     round: Round,
     block_hash: &BlockHash,
+    parent_block_hash: &BlockHash,
 ) -> Vec<u8> {
-    let mut message = Vec::with_capacity(81);
+    let mut message = Vec::with_capacity(113);
     message.extend_from_slice(DOMAIN_BLOCK_VOTE);
     message.push(network.id);
     message.extend_from_slice(&shard_group.to_le_bytes());
     message.extend_from_slice(&height.to_le_bytes());
     message.extend_from_slice(&round.to_le_bytes());
     message.extend_from_slice(block_hash.as_bytes());
+    message.extend_from_slice(parent_block_hash.as_bytes());
     message
 }
 
@@ -136,12 +141,56 @@ mod tests {
     fn test_block_vote_message_deterministic() {
         let shard = ShardGroupId::new(1);
         let block = BlockHash::from_raw(Hash::from_bytes(b"test_block"));
+        let parent = BlockHash::from_raw(Hash::from_bytes(b"parent_block"));
 
-        let msg1 = block_vote_message(&net(), shard, BlockHeight::new(10), Round::INITIAL, &block);
-        let msg2 = block_vote_message(&net(), shard, BlockHeight::new(10), Round::INITIAL, &block);
+        let msg1 = block_vote_message(
+            &net(),
+            shard,
+            BlockHeight::new(10),
+            Round::INITIAL,
+            &block,
+            &parent,
+        );
+        let msg2 = block_vote_message(
+            &net(),
+            shard,
+            BlockHeight::new(10),
+            Round::INITIAL,
+            &block,
+            &parent,
+        );
 
         assert_eq!(msg1, msg2);
         assert!(msg1.starts_with(DOMAIN_BLOCK_VOTE));
+    }
+
+    #[test]
+    fn block_vote_message_binds_parent_block_hash() {
+        let shard = ShardGroupId::new(1);
+        let block = BlockHash::from_raw(Hash::from_bytes(b"test_block"));
+        let parent_a = BlockHash::from_raw(Hash::from_bytes(b"parent_a"));
+        let parent_b = BlockHash::from_raw(Hash::from_bytes(b"parent_b"));
+
+        // Same block, different parent → different message. This is what stops a
+        // proposer forging a QC's parent_block_hash to point at a sibling block.
+        let msg_a = block_vote_message(
+            &net(),
+            shard,
+            BlockHeight::new(10),
+            Round::INITIAL,
+            &block,
+            &parent_a,
+        );
+        let msg_b = block_vote_message(
+            &net(),
+            shard,
+            BlockHeight::new(10),
+            Round::INITIAL,
+            &block,
+            &parent_b,
+        );
+
+        assert_ne!(msg_a, msg_b);
     }
 
     #[test]
@@ -175,10 +224,17 @@ mod tests {
         let shard = ShardGroupId::new(1);
         let block = BlockHash::from_raw(Hash::from_bytes(b"test_block"));
 
+        let parent = BlockHash::from_raw(Hash::from_bytes(b"parent_block"));
         let header_msg =
             block_header_message(&net(), shard, BlockHeight::new(10), Round::INITIAL, &block);
-        let vote_msg =
-            block_vote_message(&net(), shard, BlockHeight::new(10), Round::INITIAL, &block);
+        let vote_msg = block_vote_message(
+            &net(),
+            shard,
+            BlockHeight::new(10),
+            Round::INITIAL,
+            &block,
+            &parent,
+        );
 
         // Must differ due to different domain tags (prevents cross-protocol replay)
         assert_ne!(header_msg, vote_msg);
@@ -189,12 +245,14 @@ mod tests {
         let shard = ShardGroupId::new(1);
         let block = BlockHash::from_raw(Hash::from_bytes(b"test_block"));
 
+        let parent = BlockHash::from_raw(Hash::from_bytes(b"parent_block"));
         let mainnet = block_vote_message(
             &NetworkDefinition::mainnet(),
             shard,
             BlockHeight::new(10),
             Round::INITIAL,
             &block,
+            &parent,
         );
         let stokenet = block_vote_message(
             &NetworkDefinition::stokenet(),
@@ -202,6 +260,7 @@ mod tests {
             BlockHeight::new(10),
             Round::INITIAL,
             &block,
+            &parent,
         );
         // Cross-network replay protection: byte-identical inputs under
         // different networks must produce different messages.

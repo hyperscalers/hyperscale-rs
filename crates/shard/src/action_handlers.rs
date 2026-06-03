@@ -69,7 +69,14 @@ pub fn verify_and_build_qc(
     already_verified: Vec<(usize, Verified<BlockVote>, VotePower)>,
     total_voting_power: VotePower,
 ) -> QcVerificationResult {
-    let signing_message = block_vote_message(network, shard_group_id, height, round, &block_hash);
+    let signing_message = block_vote_message(
+        network,
+        shard_group_id,
+        height,
+        round,
+        &block_hash,
+        &parent_block_hash,
+    );
 
     let all_verified = verify_vote_batch(
         block_hash,
@@ -720,6 +727,7 @@ where
 
         Action::SignAndBroadcastBlockVote {
             block_hash,
+            parent_block_hash,
             height,
             round,
             timestamp,
@@ -728,6 +736,7 @@ where
             let verified = Verified::<BlockVote>::sign_local(
                 ctx.topology_snapshot.network(),
                 block_hash,
+                parent_block_hash,
                 ctx.shard,
                 height,
                 round,
@@ -834,6 +843,7 @@ mod tests {
         BlockVote::new(
             &net(),
             block_hash,
+            BlockHash::ZERO,
             shard(),
             height,
             round,
@@ -876,7 +886,14 @@ mod tests {
         let block_hash = BlockHash::from_raw(Hash::from_bytes(b"b1"));
         let height = BlockHeight::new(1);
         let round = Round::INITIAL;
-        let msg = block_vote_message(&net(), shard(), height, round, &block_hash);
+        let msg = block_vote_message(
+            &net(),
+            shard(),
+            height,
+            round,
+            &block_hash,
+            &BlockHash::ZERO,
+        );
 
         let to_verify: Vec<_> = (0..3)
             .map(|i| {
@@ -895,7 +912,14 @@ mod tests {
         let block_hash = BlockHash::from_raw(Hash::from_bytes(b"b1"));
         let height = BlockHeight::new(1);
         let round = Round::INITIAL;
-        let msg = block_vote_message(&net(), shard(), height, round, &block_hash);
+        let msg = block_vote_message(
+            &net(),
+            shard(),
+            height,
+            round,
+            &block_hash,
+            &BlockHash::ZERO,
+        );
 
         // Vote 1's signature is replaced by a signature over a different block.
         let other_hash = BlockHash::from_raw(Hash::from_bytes(b"other"));
@@ -963,7 +987,9 @@ mod tests {
         let block_hash = BlockHash::from_raw(Hash::from_bytes(b"block"));
         let height = BlockHeight::new(5);
         let round = Round::INITIAL;
-        let parent = BlockHash::from_raw(Hash::from_bytes(b"parent"));
+        // `make_vote` signs over a ZERO parent, so the QC must carry the same
+        // parent to re-verify — the binding this fix adds.
+        let parent = BlockHash::ZERO;
 
         let verified: Vec<_> = (0..3)
             .map(|i| {

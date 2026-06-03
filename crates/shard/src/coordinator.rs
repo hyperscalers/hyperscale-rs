@@ -1504,10 +1504,10 @@ impl ShardCoordinator {
         // vote per round; `locked_round` rises to the round of the QC this
         // block extends, so we will never again vote for a block that extends a
         // QC below it. Both are local — no certificate rides on the block.
-        let parent_qc_round = self
-            .pending_blocks
-            .get_header(block_hash)
-            .map_or(self.locked_round, |h| h.parent_qc().round());
+        let header = self.pending_blocks.get_header(block_hash);
+        let parent_qc_round = header.map_or(self.locked_round, |h| h.parent_qc().round());
+        // Sign over the block's own parent so the QC commits to which block it extends.
+        let parent_block_hash = header.map_or(self.committed_hash, BlockHeader::parent_block_hash);
         self.last_voted_round = round;
         self.locked_round = self.locked_round.max(parent_qc_round);
 
@@ -1535,6 +1535,7 @@ impl ShardCoordinator {
         // VoteSet tracking via VerifiedBlockVoteReceived.
         vec![Action::SignAndBroadcastBlockVote {
             block_hash,
+            parent_block_hash,
             height,
             round,
             timestamp,

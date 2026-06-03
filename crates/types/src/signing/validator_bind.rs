@@ -87,6 +87,7 @@ mod tests {
             BlockHeight::GENESIS,
             Round::INITIAL,
             &BlockHash::from_raw(Hash::from_bytes(bytes)),
+            &BlockHash::ZERO,
         );
 
         assert_ne!(bind_msg, block_msg);

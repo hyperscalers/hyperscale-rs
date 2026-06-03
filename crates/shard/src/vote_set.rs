@@ -467,6 +467,7 @@ mod tests {
         BlockVote::new(
             &NetworkDefinition::simulator(),
             block_hash,
+            BlockHash::ZERO,
             test_shard_group(),
             height,
             Round::INITIAL,

@@ -162,6 +162,7 @@ impl QuorumCertificate {
             self.height,
             self.round,
             &self.block_hash,
+            &self.parent_block_hash,
         )
     }
 
@@ -490,7 +491,8 @@ mod tests {
         round: Round,
     ) -> QuorumCertificate {
         let net = NetworkDefinition::simulator();
-        let message = block_vote_message(&net, shard, height, round, &block_hash);
+        // Sign over the same parent the QC carries, so the aggregate verifies.
+        let message = block_vote_message(&net, shard, height, round, &block_hash, &BlockHash::ZERO);
 
         let sigs: Vec<Bls12381G2Signature> = signer_indices
             .iter()
@@ -575,6 +577,7 @@ mod tests {
             BlockHeight::new(1),
             Round::INITIAL,
             &BlockHash::from_raw(Hash::from_bytes(b"other_block")),
+            &BlockHash::ZERO,
         );
         let bad_sigs: Vec<_> = [0, 1, 2]
             .iter()
@@ -587,6 +590,44 @@ mod tests {
         );
 
         let err = qc
+            .verify(&ctx(&net, &pubs, &powers, VotePower::new(3)))
+            .unwrap_err();
+        assert_eq!(err, QcVerifyError::InvalidSignature);
+    }
+
+    #[test]
+    fn verify_rejects_forged_parent_block_hash() {
+        // `parent_block_hash` selects the committable block under the two-chain
+        // commit rule. Repointing it at a sibling — the forged-parent fork —
+        // must fail verification now that the field is in the signed message.
+        let keys: Vec<_> = (0..4).map(|_| generate_bls_keypair()).collect();
+        let pubs: Vec<_> = keys.iter().map(Bls12381G1PrivateKey::public_key).collect();
+        let powers = vec![VotePower::new(1); 4];
+
+        // `signed_qc` signs over parent = ZERO; keep the genuine signature but
+        // repoint the parent at a sibling block.
+        let qc = signed_qc(
+            &keys,
+            &[0, 1, 2],
+            BlockHash::from_raw(Hash::from_bytes(b"block")),
+            ShardGroupId::new(0),
+            BlockHeight::new(1),
+            Round::INITIAL,
+        );
+        let (block_hash, shard, height, _parent, round, signers, sig, ts) = qc.into_parts();
+        let forged = QuorumCertificate::new(
+            block_hash,
+            shard,
+            height,
+            BlockHash::from_raw(Hash::from_bytes(b"sibling")),
+            round,
+            signers,
+            sig,
+            ts,
+        );
+
+        let net = NetworkDefinition::simulator();
+        let err = forged
             .verify(&ctx(&net, &pubs, &powers, VotePower::new(3)))
             .unwrap_err();
         assert_eq!(err, QcVerifyError::InvalidSignature);

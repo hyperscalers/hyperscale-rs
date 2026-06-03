@@ -860,6 +860,7 @@ impl ShardCoordinatorSim {
             }
             Action::SignAndBroadcastBlockVote {
                 block_hash,
+                parent_block_hash,
                 height,
                 round,
                 timestamp,
@@ -868,6 +869,7 @@ impl ShardCoordinatorSim {
                 let verified = Verified::<BlockVote>::sign_local(
                     &self.network,
                     block_hash,
+                    parent_block_hash,
                     self.shard,
                     height,
                     round,

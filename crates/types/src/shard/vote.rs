@@ -32,6 +32,7 @@ impl BlockVote {
     pub fn new(
         network: &NetworkDefinition,
         block_hash: BlockHash,
+        parent_block_hash: BlockHash,
         shard_group_id: ShardGroupId,
         height: BlockHeight,
         round: Round,
@@ -39,7 +40,14 @@ impl BlockVote {
         signing_key: &Bls12381G1PrivateKey,
         timestamp: ProposerTimestamp,
     ) -> Self {
-        let message = block_vote_message(network, shard_group_id, height, round, &block_hash);
+        let message = block_vote_message(
+            network,
+            shard_group_id,
+            height,
+            round,
+            &block_hash,
+            &parent_block_hash,
+        );
         let signature = signing_key.sign_v1(&message);
         Self {
             block_hash,
@@ -146,14 +154,22 @@ impl BlockVote {
     ///
     /// Uses `DOMAIN_BLOCK_VOTE` tag for domain separation.
     /// This is the same message used for QC aggregated signature verification.
+    ///
+    /// `parent_block_hash` isn't stored on the vote; the verifier supplies it
+    /// (from the block header, or the QC's own field for an aggregate).
     #[must_use]
-    pub fn signing_message(&self, network: &NetworkDefinition) -> Vec<u8> {
+    pub fn signing_message(
+        &self,
+        network: &NetworkDefinition,
+        parent_block_hash: &BlockHash,
+    ) -> Vec<u8> {
         block_vote_message(
             network,
             self.shard_group_id,
             self.height,
             self.round,
             &self.block_hash,
+            parent_block_hash,
         )
     }
 }
@@ -166,6 +182,8 @@ pub struct BlockVoteContext<'a> {
     pub network: &'a NetworkDefinition,
     /// BLS public key of the voter who cast this vote.
     pub voter_public_key: &'a Bls12381G1PublicKey,
+    /// Parent of the voted block (from its header), bound into the signing message.
+    pub parent_block_hash: BlockHash,
 }
 
 /// Failure modes of [`BlockVote`] verification.
@@ -194,7 +212,7 @@ impl Verify<&BlockVoteContext<'_>> for BlockVote {
     type Error = BlockVoteVerifyError;
 
     fn verify(&self, ctx: &BlockVoteContext<'_>) -> Result<Verified<Self>, Self::Error> {
-        let message = self.signing_message(ctx.network);
+        let message = self.signing_message(ctx.network, &ctx.parent_block_hash);
         if !verify_bls12381_v1(&message, ctx.voter_public_key, &self.signature) {
             return Err(BlockVoteVerifyError::InvalidSignature);
         }
@@ -219,6 +237,7 @@ impl Verified<BlockVote> {
     pub fn sign_local(
         network: &NetworkDefinition,
         block_hash: BlockHash,
+        parent_block_hash: BlockHash,
         shard_group_id: ShardGroupId,
         height: BlockHeight,
         round: Round,
@@ -233,6 +252,7 @@ impl Verified<BlockVote> {
         Self::new_unchecked(BlockVote::new(
             network,
             block_hash,
+            parent_block_hash,
             shard_group_id,
             height,
             round,
@@ -313,6 +333,7 @@ mod tests {
             BlockHeight::new(1),
             Round::INITIAL,
             &BlockHash::from_raw(Hash::from_bytes(&[1u8; 32])),
+            &BlockHash::from_raw(Hash::from_bytes(b"parent")),
         );
         let votes: Vec<_> = (0..3)
             .map(|i| {
@@ -349,6 +370,7 @@ mod tests {
             BlockHeight::new(1),
             Round::INITIAL,
             &BlockHash::from_raw(Hash::from_bytes(&[2u8; 32])),
+            &BlockHash::from_raw(Hash::from_bytes(b"parent")),
         );
         let mut votes: Vec<(BlockVote, Bls12381G1PublicKey)> = Vec::new();
         for i in 0..3u64 {

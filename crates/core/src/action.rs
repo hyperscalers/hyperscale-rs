@@ -82,6 +82,8 @@ pub enum Action {
     SignAndBroadcastBlockVote {
         /// Block being voted on.
         block_hash: BlockHash,
+        /// Parent of the voted block (from its header), bound into the vote signature.
+        parent_block_hash: BlockHash,
         /// Block height.
         height: BlockHeight,
         /// Round at which the vote is being cast.
