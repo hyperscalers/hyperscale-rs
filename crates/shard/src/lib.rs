@@ -31,30 +31,39 @@
 //!
 //! # Consensus Protocol (HotStuff-2)
 //!
-//! This implementation follows HotStuff-2 with implicit view changes:
+//! Rounds increase per block (genesis is round 0, the next block round 1, …);
+//! a view change leaves a gap. Safety is carried entirely in two local,
+//! monotone round counters — nothing but the `parent_qc` rides on a block.
 //!
 //! ## Safety
 //!
-//! - **Vote locking**: Once a validator votes for block B at height H, it cannot
-//!   vote for a different block at height H (prevents equivocation).
+//! - **Safe-vote rule**: a validator votes for block `B` only if `B.round` is
+//!   its current round, strictly above every round it has already voted or timed
+//!   out in (`last_voted_round`), and `B`'s `parent_qc` round is at least its
+//!   `locked_round`. On voting it sets `last_voted_round = B.round` and raises
+//!   `locked_round` to `B.parent_qc.round`.
 //!
-//! - **Quorum intersection**: Any two quorums of 2f+1 overlap in at least one
-//!   honest validator, so conflicting blocks cannot both get QCs.
+//! - **Quorum intersection**: any two quorums of 2f+1 overlap in at least one
+//!   honest validator. With `last_voted_round` giving one vote per round, at
+//!   most one QC forms per round; the safe-vote lock then forces every QC above
+//!   a committed block to extend it.
 //!
-//! - **Two-chain commit**: A block at height H is committed when a QC forms for
-//!   height H+1. This ensures finality even under asynchrony.
+//! - **Round-contiguous two-chain commit**: a block `B` commits only when a QC
+//!   forms for a child at exactly `B.round + 1`. A block proposed after a view
+//!   change defers until a direct two-chain forms above it, then commits with
+//!   the whole intervening prefix.
 //!
 //! ## Liveness
 //!
-//! - **Timeout-based view change**: Each validator advances its round locally on
-//!   timeout. No coordinated view-change voting is required.
+//! - **Timeout pacemaker**: when its round timer fires, a validator broadcasts a
+//!   `Timeout` carrying its `high_qc` instead of advancing locally. f+1 timeouts
+//!   for a round trigger Bracha amplification (broadcast your own); a 2f+1
+//!   timeout quorum advances the round and adopts the quorum-max `high_qc`, which
+//!   the new round's leader extends.
 //!
-//! - **Unlock rule**: When a validator sees a QC at height H, it unlocks any vote
-//!   locks at heights ≤ H. This allows voting for new blocks after failed rounds.
-//!
-//! - **View synchronization**: When a validator sees a QC formed at round R, it
-//!   advances its local view to R. This keeps validators in sync with network
-//!   progress and prevents view divergence.
+//! - **View synchronization**: adopting a verified QC for round R advances the
+//!   local view to R+1, so rounds track the chain; a lagging validator also
+//!   nudges its view toward a higher round observed on a header or vote.
 
 pub mod action_handlers;
 pub mod beacon_witnesses;

@@ -1,10 +1,10 @@
 //! View change liveness state: current round, linear-backoff tracking, and
 //! leader-activity timestamps.
 //!
-//! HotStuff-2 uses implicit view changes: each validator advances its round
-//! locally on timeout, no coordinated TC message required. The controller
-//! owns the local round clock and the signals that determine when the
-//! timeout fires:
+//! When its round timer fires a validator broadcasts a `Timeout` (the
+//! coordinator's pacemaker); the round advances only on a 2f+1 timeout quorum,
+//! or by syncing forward to a verified QC's round. This controller owns the
+//! local round clock and the signals that decide when that timer fires:
 //!
 //! - `view` — current round.
 //! - `view_at_height_start` — round when the current height began; drives
