@@ -11,8 +11,8 @@ use hyperscale_core::{Action, FetchAbandon, FetchRequest};
 use hyperscale_types::{BeaconWitnessLeafCount, BeaconWitnessRoot};
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, FinalizedWave, LocalTimestamp,
-    ProvisionHash, Provisions, ReadySignal, RoutableTransaction, ShardGroupId, TxHash, ValidatorId,
-    Verifiable, WaveId,
+    ProvisionHash, Provisions, ReadySignal, Round, RoutableTransaction, ShardGroupId, TxHash,
+    ValidatorId, Verifiable, WaveId,
 };
 use tracing::{debug, warn};
 
@@ -95,6 +95,20 @@ impl PendingBlocks {
 
     pub fn contains_key(&self, block_hash: BlockHash) -> bool {
         self.0.contains_key(&block_hash)
+    }
+
+    /// Number of distinct pending headers at `(height, round)`. An honest
+    /// proposer produces one; a larger count is a Byzantine proposer
+    /// equivocating, used to cap how many it can make the node store and
+    /// verify.
+    pub fn count_at(&self, height: BlockHeight, round: Round) -> usize {
+        self.0
+            .values()
+            .filter(|p| {
+                let h = p.header();
+                h.height() == height && h.round() == round
+            })
+            .count()
     }
 
     pub fn len(&self) -> usize {

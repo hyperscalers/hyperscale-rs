@@ -114,6 +114,23 @@ use crate::verification::{
 use crate::view_change::ViewChangeController;
 use crate::vote_keeper::VoteKeeper;
 
+/// Largest `round - parent_qc.round` gap for which a header is verified
+/// speculatively. The beacon-witness verification derives one leaf per skipped
+/// round, so this bounds that work per header. It sits far above any legitimate
+/// view-change run (which is bounded by the committee size — an honest leader
+/// commits within one rotation) and far below `MAX_ROUND_GAP`, the ceiling at
+/// which headers are still *accepted*. Blocks with a larger gap are admitted
+/// but not verified here; if one is genuinely committed, this node is behind
+/// and recovers it through block-sync.
+const SPECULATIVE_VERIFY_GAP: u64 = 1024;
+
+/// Cap on distinct pending headers retained per `(height, round)`. An honest
+/// proposer signs exactly one block per round, so anything beyond a small
+/// allowance is a Byzantine proposer equivocating (or varying the unsigned
+/// content roots to mint distinct hashes); the excess is dropped before it is
+/// stored or verified.
+const MAX_HEADERS_PER_HEIGHT_ROUND: usize = 4;
+
 /// Shard consensus state machine (HotStuff-2).
 ///
 /// Handles block proposal, voting, QC formation, commitment, and view changes.
@@ -1018,6 +1035,22 @@ impl ShardCoordinator {
             return vec![];
         }
 
+        // Cap distinct headers per `(height, round)`. The proposer signs one
+        // block per round, so beyond a small allowance the rest are a Byzantine
+        // proposer equivocating — or varying the unsigned content roots to mint
+        // distinct hashes. Drop them before they are stored and verified; the
+        // round is already forfeit if its proposer is equivocating.
+        if self.pending_blocks.count_at(height, round) >= MAX_HEADERS_PER_HEIGHT_ROUND {
+            warn!(
+                validator = ?self.me,
+                proposer = ?header.proposer(),
+                height = height.inner(),
+                round = round.inner(),
+                "Dropping header — (height, round) at equivocation cap"
+            );
+            return vec![];
+        }
+
         self.pending_blocks.assemble(
             header.clone(),
             manifest,
@@ -1400,6 +1433,27 @@ impl ShardCoordinator {
                 parent_qc_round = parent_qc_round.inner(),
                 "Safe-vote rule declines — running verification only"
             );
+        }
+
+        // Bound speculative work to verified progress. The beacon-witness
+        // verification derives one leaf per skipped round, so its cost is
+        // `round - parent_qc.round` — and a Byzantine proposer can drive that
+        // gap to `MAX_ROUND_GAP` (a genesis `parent_qc` makes the gap the whole
+        // round number) and flood the verification pool with such headers. A
+        // gap beyond `SPECULATIVE_VERIFY_GAP` is far past any legitimate
+        // view-change run, so skip verification (and the vote it gates). If an
+        // honest quorum ever commits such a block this node is behind and
+        // recovers it through block-sync, which admits it via QC attestation
+        // rather than re-deriving the witness locally.
+        if round.inner().saturating_sub(parent_qc_round.inner()) > SPECULATIVE_VERIFY_GAP {
+            trace!(
+                validator = ?self.me,
+                block_hash = ?block_hash,
+                round = round.inner(),
+                parent_qc_round = parent_qc_round.inner(),
+                "Round gap beyond speculative bound — deferring to block-sync"
+            );
+            return vec![];
         }
 
         // If the block is assembled, run validation + verification.
@@ -3950,6 +4004,125 @@ mod tests {
             actions
                 .iter()
                 .any(|a| matches!(a, Action::VerifyQcSignature { .. }))
+        );
+    }
+
+    /// Build a complete empty block at `(height=1, round)` extending the
+    /// committed tip under a genesis parent QC — so the round gap is `round`.
+    fn empty_block_at_round(committed_hash: BlockHash, round: u64) -> Block {
+        let header = BlockHeader::new(
+            ShardGroupId::new(0),
+            BlockHeight::new(1),
+            committed_hash,
+            QuorumCertificate::genesis(ShardGroupId::new(0)),
+            ValidatorId::new(round % 4),
+            ProposerTimestamp::from_millis(100_000),
+            Round::new(round),
+            false,
+            StateRoot::from_raw(Hash::from_bytes(&[u8::try_from(round % 251).unwrap(); 32])),
+            TransactionRoot::ZERO,
+            CertificateRoot::ZERO,
+            LocalReceiptRoot::ZERO,
+            ProvisionsRoot::ZERO,
+            Vec::new(),
+            std::collections::BTreeMap::new(),
+            InFlightCount::ZERO,
+            BeaconWitnessRoot::ZERO,
+            BeaconWitnessLeafCount::ZERO,
+        );
+        Block::Live {
+            header,
+            transactions: Arc::new(BoundedVec::new()),
+            certificates: Arc::new(BoundedVec::new()),
+            provisions: Arc::new(BoundedVec::new()),
+        }
+    }
+
+    #[test]
+    fn large_round_gap_header_skips_speculative_verification() {
+        // The beacon-witness verification derives one leaf per skipped round, so
+        // a header whose round is far above its parent QC's round (here a
+        // genesis parent_qc at a high round) would be O(round-gap) to verify. It
+        // must be left for block-sync, not verified speculatively.
+        let (mut state, topology) = make_test_state();
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let committed_hash = BlockHash::from_raw(Hash::from_bytes(b"committed_tip"));
+        state.committed_hash = committed_hash;
+
+        // Just below the bound: verification is dispatched.
+        let near = empty_block_at_round(committed_hash, SPECULATIVE_VERIFY_GAP - 1);
+        let near_hash = near.hash();
+        let near_round = near.header().round();
+        install_complete_block(&mut state, &near);
+        let near_actions =
+            state.try_vote_on_block(&topology, near_hash, BlockHeight::new(1), near_round);
+        assert!(
+            !near_actions.is_empty(),
+            "a within-bound round gap should still verify",
+        );
+
+        // Beyond the bound: no verification, no action.
+        let far = empty_block_at_round(committed_hash, SPECULATIVE_VERIFY_GAP + 10);
+        let far_hash = far.hash();
+        let far_round = far.header().round();
+        install_complete_block(&mut state, &far);
+        let far_actions =
+            state.try_vote_on_block(&topology, far_hash, BlockHeight::new(1), far_round);
+        assert!(
+            far_actions.is_empty(),
+            "a round gap beyond the bound must skip verification: {far_actions:?}",
+        );
+    }
+
+    #[test]
+    fn header_flood_at_one_round_is_capped() {
+        // A Byzantine proposer can mint many distinct hashes at one
+        // (height, round) by varying the unsigned content roots. Only a small
+        // allowance is stored; the rest are dropped before storage/verification.
+        let (mut state, topology) = make_test_state();
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let committed_hash = BlockHash::from_raw(Hash::from_bytes(b"genesis_tip"));
+        state.committed_hash = committed_hash;
+
+        // Round 1's proposer is committee[1]; vary the state root to mint
+        // distinct headers all validly attributed to that proposer.
+        for i in 0..(MAX_HEADERS_PER_HEIGHT_ROUND + 3) {
+            let header = BlockHeader::new(
+                ShardGroupId::new(0),
+                BlockHeight::new(1),
+                committed_hash,
+                QuorumCertificate::genesis(ShardGroupId::new(0)),
+                ValidatorId::new(1),
+                ProposerTimestamp::from_millis(100_000),
+                Round::new(1),
+                false,
+                StateRoot::from_raw(Hash::from_bytes(&[u8::try_from(i).unwrap(); 32])),
+                TransactionRoot::ZERO,
+                CertificateRoot::ZERO,
+                LocalReceiptRoot::ZERO,
+                ProvisionsRoot::ZERO,
+                Vec::new(),
+                std::collections::BTreeMap::new(),
+                InFlightCount::ZERO,
+                BeaconWitnessRoot::ZERO,
+                BeaconWitnessLeafCount::ZERO,
+            );
+            let _ = state.on_block_header(
+                &topology,
+                &header,
+                BlockManifest::default(),
+                |_| None,
+                |_| None,
+                |_| None,
+            );
+        }
+
+        assert_eq!(
+            state
+                .pending_blocks
+                .count_at(BlockHeight::new(1), Round::new(1)),
+            MAX_HEADERS_PER_HEIGHT_ROUND,
+            "distinct headers at one (height, round) must be capped",
         );
     }
 
