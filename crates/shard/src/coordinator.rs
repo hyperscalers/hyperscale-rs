@@ -81,11 +81,11 @@ use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessRoot, BeaconWitnessRootVerifyError, Block, BlockHeader,
     BlockHeight, BlockManifest, BlockVote, CertRootVerifyError, CertificateRoot, CertifiedBlock,
     CertifiedBlockHeader, FinalizedWave, LocalReceiptRoot, LocalReceiptRootVerifyError,
-    ProvisionRootVerifyError, ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions,
-    ProvisionsRoot, QcContext, QcVerifyError, QuorumCertificate, Round, RoutableTransaction,
-    StateRoot, StateRootVerifyError, Timeout, TopologySnapshot, TransactionRoot, TxHash,
-    TxRootVerifyError, ValidatorId, Verifiable, Verified, Verify, VotePower, derive_leaves,
-    missed_proposals_since_prev_commit,
+    MAX_ROUND_GAP, ProvisionRootVerifyError, ProvisionTxRootsMap, ProvisionTxRootsVerifyError,
+    Provisions, ProvisionsRoot, QcContext, QcVerifyError, QuorumCertificate, Round,
+    RoutableTransaction, StateRoot, StateRootVerifyError, Timeout, TopologySnapshot,
+    TransactionRoot, TxHash, TxRootVerifyError, ValidatorId, Verifiable, Verified, Verify,
+    VotePower, derive_leaves, missed_proposals_since_prev_commit,
 };
 use tracing::field::Empty;
 use tracing::{debug, info, instrument, trace, warn};
@@ -3074,6 +3074,16 @@ impl ShardCoordinator {
             .map_or(Round::INITIAL, |qc| qc.round())
     }
 
+    /// Highest timeout round the pacemaker will spend a verify on or tally.
+    /// The pacemaker can only advance within `MAX_ROUND_GAP` of verified
+    /// progress (the same ceiling observed-round view sync uses), so a timeout
+    /// beyond it can never drive a quorum and would only cost a pairing check
+    /// and a never-pruned keeper entry. Anchored to the verified `high_qc`, not
+    /// the local view, so a Byzantine round can't ratchet the bound upward.
+    fn max_pacemaker_round(&self) -> Round {
+        Round::new(self.high_qc_round().inner().saturating_add(MAX_ROUND_GAP))
+    }
+
     /// Broadcast our timeout for `round` (carrying our `high_qc`) to the
     /// committee, which tallies it. The round timer drives this on every fire,
     /// so a timeout lost to a partition is retransmitted until a 2f+1 quorum
@@ -3155,11 +3165,13 @@ impl ShardCoordinator {
             warn!(validator = ?self.me, voter = ?timeout.voter(), "Dropping timeout from non-committee validator");
             return Vec::new();
         }
-        // Skip rounds we've advanced past and voters already tallied: such a
-        // share would verify and then be dropped by `on_verified_timeout`, so
-        // screen it here rather than spend a pairing check. Mirrors the vote
-        // path, which drops a seen voter before delegating crypto.
+        // Skip rounds we've advanced past, rounds too far beyond verified
+        // progress to ever reach, and voters already tallied: such a share
+        // would verify and then be dropped (or never drive a quorum), so screen
+        // it here rather than spend a pairing check. Mirrors the vote path,
+        // which drops a seen voter before delegating crypto.
         if timeout.round() < self.view_change.view
+            || timeout.round() > self.max_pacemaker_round()
             || self.timeouts.contains(timeout.round(), timeout.voter())
         {
             return Vec::new();
@@ -3180,8 +3192,9 @@ impl ShardCoordinator {
         timeout: Verified<Timeout>,
     ) -> Vec<Action> {
         let round = timeout.round();
-        // Ignore timeouts for rounds we've already advanced past.
-        if round < self.view_change.view {
+        // Ignore timeouts we've advanced past or that sit too far beyond
+        // verified progress for the pacemaker to ever reach.
+        if round < self.view_change.view || round > self.max_pacemaker_round() {
             return Vec::new();
         }
         // A verified BLS share proves who signed, not that the signer sits in
@@ -4403,6 +4416,30 @@ mod tests {
     }
 
     #[test]
+    fn far_future_timeout_is_not_tallied() {
+        // The pacemaker advances at most `MAX_ROUND_GAP` beyond verified
+        // progress, so a committee timeout for an unreachable round is dropped
+        // rather than verified and stored — otherwise a Byzantine member could
+        // grow the keeper without bound with rounds the view never reaches.
+        let (mut state, topology) = make_test_state();
+        let shard = ShardGroupId::new(0);
+        let net = NetworkDefinition::simulator();
+        // high_qc is genesis, so the ceiling is `MAX_ROUND_GAP`.
+        let far = Round::new(MAX_ROUND_GAP + 1);
+        let far_timeout = Verified::<Timeout>::sign_local(
+            &net,
+            shard,
+            far,
+            QuorumCertificate::genesis(shard),
+            ValidatorId::new(1),
+            &generate_bls_keypair(),
+        );
+
+        assert!(state.on_verified_timeout(&topology, far_timeout).is_empty());
+        assert_eq!(state.timeouts.power(far), VotePower::ZERO);
+    }
+
+    #[test]
     fn on_unverified_timeout_delegates_committee_share() {
         // Wire timeouts are screened on the shard loop thread, then their BLS
         // share is verified off-thread via `Action::VerifyTimeout`. Outsiders,
@@ -4442,6 +4479,17 @@ mod tests {
             state
                 .on_unverified_timeout(&topology, &mk(1, Round::INITIAL))
                 .is_empty()
+        );
+
+        // Far beyond verified progress (high_qc is genesis here, so the ceiling
+        // is `MAX_ROUND_GAP`): dropped before delegating crypto, so a Byzantine
+        // committee member can't pump unbounded distinct rounds through the
+        // pacemaker.
+        assert!(
+            state
+                .on_unverified_timeout(&topology, &mk(1, Round::new(MAX_ROUND_GAP + 1)))
+                .is_empty(),
+            "a timeout beyond high_qc + MAX_ROUND_GAP must be screened out",
         );
 
         // Already tallied: a retransmit is screened out before re-verifying.
