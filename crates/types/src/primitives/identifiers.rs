@@ -664,6 +664,14 @@ impl VotePower {
         (voted.0 as u128) * 3 > (total.0 as u128) * 2
     }
 
+    /// Calculate if `voted` exceeds the f+1 fault threshold (>1/3 of `total`)
+    /// — enough to guarantee at least one honest contributor. Used for Bracha
+    /// timeout amplification: on f+1 timeouts a replica broadcasts its own.
+    #[must_use]
+    pub const fn has_one_third(voted: Self, total: Self) -> bool {
+        (voted.0 as u128) * 3 > (total.0 as u128)
+    }
+
     /// Minimum voting power required for 2f+1 quorum out of `total`.
     ///
     /// Equivalent to `total * 2 / 3 + 1` but divides first so the multiply
@@ -904,6 +912,21 @@ mod tests {
         assert!(!VotePower::has_quorum(VotePower::new(2), total)); // 2/4 = 50% (not enough)
         assert!(VotePower::has_quorum(VotePower::new(3), total)); // 3/4 = 75% (quorum!)
         assert!(VotePower::has_quorum(VotePower::new(4), total)); // 4/4 = 100% (quorum!)
+    }
+
+    #[test]
+    fn test_vote_power_one_third() {
+        // f+1 (Bracha) threshold: strictly greater than 1/3 of total.
+        let total = VotePower::new(4);
+
+        assert!(!VotePower::has_one_third(VotePower::new(1), total)); // 1/4 = 25% (not enough)
+        assert!(VotePower::has_one_third(VotePower::new(2), total)); // 2/4 = 50% (≥ f+1)
+        assert!(VotePower::has_one_third(VotePower::new(3), total)); // 3/4 (quorum implies f+1)
+
+        // Exactly 1/3 is not enough — need strictly greater.
+        let q = |v, t| VotePower::has_one_third(VotePower::new(v), VotePower::new(t));
+        assert!(!q(3, 9), "exactly 1/3 should not clear the f+1 threshold");
+        assert!(q(4, 9), "just over 1/3 should clear the f+1 threshold");
     }
 
     #[test]

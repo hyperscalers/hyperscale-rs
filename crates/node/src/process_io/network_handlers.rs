@@ -18,6 +18,7 @@ use hyperscale_types::network::notification::beacon::{
 use hyperscale_types::network::notification::{
     BlockHeaderNotification, BlockVoteNotification, ExecutionCertificatesNotification,
     ExecutionVotesNotification, ProvisionsNotification, ReadySignalNotification,
+    TimeoutNotification,
 };
 use hyperscale_types::network::request::beacon::{
     GetBeaconBlockRequest, GetBeaconProposalRequest, GetShardWitnessesRequest,
@@ -534,6 +535,28 @@ where
                     let event = match gossip.vote.into_verified() {
                         Ok(vote) => ProtocolEvent::VerifiedBlockVoteReceived { vote },
                         Err(vote) => ProtocolEvent::UnverifiedBlockVoteReceived { vote },
+                    };
+                    push_protocol_event(tx, shard, event);
+                },
+            );
+
+        // ── shard.timeout → ProtocolEvent::{Verified,Unverified}TimeoutReceived ─
+        let senders = self.process.shard_event_senders.clone();
+        self.process
+            .network
+            .register_notification_handler::<TimeoutNotification>(
+                move |gossip: TimeoutNotification| {
+                    let shard = gossip.timeout.shard_group_id();
+                    let Some(tx) = senders.get(&shard) else {
+                        warn!(
+                            target_shard = shard.inner(),
+                            "Dropping timeout: shard not hosted"
+                        );
+                        return;
+                    };
+                    let event = match gossip.timeout.into_verified() {
+                        Ok(timeout) => ProtocolEvent::VerifiedTimeoutReceived { timeout },
+                        Err(timeout) => ProtocolEvent::UnverifiedTimeoutReceived { timeout },
                     };
                     push_protocol_event(tx, shard, event);
                 },

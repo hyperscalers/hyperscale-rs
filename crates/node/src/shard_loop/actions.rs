@@ -77,6 +77,7 @@ where
             | Action::FetchAndBroadcastProvisions { .. }
             | Action::BroadcastBlockHeader { .. }
             | Action::SignAndBroadcastBlockVote { .. }
+            | Action::SignAndBroadcastTimeout { .. }
             | Action::BroadcastCertifiedBlockHeader { .. }
             | Action::SignAndSendExecutionVote { .. }
             | Action::BroadcastExecutionCertificate { .. }

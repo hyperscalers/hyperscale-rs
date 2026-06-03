@@ -27,6 +27,17 @@ pub const DOMAIN_BLOCK_HEADER: &[u8] = b"BLOCK_HEADER";
 /// globally. Verified by `IoLoop` before admitting to the state machine.
 pub const DOMAIN_COMMITTED_BLOCK_HEADER: &[u8] = b"COMMITTED_BLOCK_HEADER";
 
+/// Domain tag for shard consensus timeout messages.
+///
+/// Format: `TIMEOUT` || `network.id` || `shard_group_id` || round
+///
+/// Signed by a validator when its round timer fires. The share covers only
+/// `(shard, round)` — the timeout also carries the signer's `high_qc`, but a
+/// QC is self-authenticating (it is its own 2f+1 aggregate), so its round need
+/// not be bound here. Distinct domain from `DOMAIN_BLOCK_VOTE` to prevent
+/// cross-protocol replay.
+pub const DOMAIN_TIMEOUT: &[u8] = b"TIMEOUT";
+
 /// Build the signing message for a block vote.
 ///
 /// This is used for:
@@ -71,6 +82,24 @@ pub fn block_header_message(
     message.extend_from_slice(&height.to_le_bytes());
     message.extend_from_slice(&round.to_le_bytes());
     message.extend_from_slice(block_hash.as_bytes());
+    message
+}
+
+/// Build the signing message for a shard consensus timeout.
+///
+/// Covers only `(shard, round)`; the carried `high_qc` self-authenticates as a
+/// QC and is verified separately on receipt.
+#[must_use]
+pub fn timeout_message(
+    network: &NetworkDefinition,
+    shard_group: ShardGroupId,
+    round: Round,
+) -> Vec<u8> {
+    let mut message = Vec::with_capacity(DOMAIN_TIMEOUT.len() + 1 + 8 + 8);
+    message.extend_from_slice(DOMAIN_TIMEOUT);
+    message.push(network.id);
+    message.extend_from_slice(&shard_group.to_le_bytes());
+    message.extend_from_slice(&round.to_le_bytes());
     message
 }
 

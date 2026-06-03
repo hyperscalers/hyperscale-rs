@@ -137,16 +137,6 @@ impl ViewChangeController {
         self.view_at_height_start = self.view;
     }
 
-    /// Advance to the next round (implicit view change). Increments the
-    /// counter and clears the header-reset tracker (a fresh round is allowed
-    /// to accept one header-activity reset). Returns the new round.
-    pub fn advance(&mut self) -> Round {
-        self.view += 1;
-        self.view_changes += 1;
-        self.last_header_reset = None;
-        self.view
-    }
-
     /// Advance the round one past a verified QC's round, so the next block is
     /// proposed in a fresh round. A QC for round `r` means the chain reached
     /// `r`; the proposer of the successor block moves to `r + 1`. This is what
@@ -154,6 +144,21 @@ impl ViewChangeController {
     /// advanced.
     pub fn advance_on_qc(&mut self, qc_round: Round) -> bool {
         self.sync_to_qc_round(qc_round.next())
+    }
+
+    /// Advance the view to `target` because a 2f+1 timeout quorum proved the
+    /// round abandoned. Counts as a view change (the pacemaker synchronised the
+    /// cluster), and clears the header-reset tracker so the new round accepts a
+    /// fresh header-activity reset. Returns `true` if the view advanced.
+    pub fn advance_to(&mut self, target: Round) -> bool {
+        if target > self.view {
+            self.view = target;
+            self.view_changes += 1;
+            self.last_header_reset = None;
+            true
+        } else {
+            false
+        }
     }
 
     /// Synchronize the local round to a higher round proven by a verified
@@ -230,16 +235,21 @@ mod tests {
     }
 
     #[test]
-    fn advance_increments_view_and_metric_and_clears_header_reset() {
+    fn advance_to_increments_view_and_metric_and_clears_header_reset() {
         let mut vc = ViewChangeController::new(Round::INITIAL);
         vc.last_header_reset = Some((BlockHeight::new(5), Round::new(0)));
 
-        let new_round = vc.advance();
+        assert!(vc.advance_to(Round::new(3)));
 
-        assert_eq!(new_round, Round::new(1));
-        assert_eq!(vc.view, Round::new(1));
+        assert_eq!(vc.view, Round::new(3));
         assert_eq!(vc.view_changes, 1);
         assert!(vc.last_header_reset.is_none());
+
+        // A target at or below the current view is a no-op and doesn't tick
+        // the counter.
+        assert!(!vc.advance_to(Round::new(3)));
+        assert_eq!(vc.view, Round::new(3));
+        assert_eq!(vc.view_changes, 1);
     }
 
     #[test]

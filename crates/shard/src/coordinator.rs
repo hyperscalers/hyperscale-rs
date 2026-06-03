@@ -85,15 +85,15 @@ use hyperscale_types::{
     BlockHeight, BlockManifest, BlockVote, CertRootVerifyError, CertificateRoot, CertifiedBlock,
     CertifiedBlockHeader, FinalizedWave, LocalReceiptRoot, LocalReceiptRootVerifyError,
     ProvisionRootVerifyError, ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions,
-    ProvisionsRoot, QcVerifyError, QuorumCertificate, Round, RoutableTransaction, StateRoot,
-    StateRootVerifyError, TopologySnapshot, TransactionRoot, TxHash, TxRootVerifyError,
-    ValidatorId, Verifiable, Verified, VotePower, derive_leaves,
+    ProvisionsRoot, QcContext, QcVerifyError, QuorumCertificate, Round, RoutableTransaction,
+    StateRoot, StateRootVerifyError, Timeout, TimeoutContext, TopologySnapshot, TransactionRoot,
+    TxHash, TxRootVerifyError, ValidatorId, Verifiable, Verified, Verify, VotePower, derive_leaves,
     missed_proposals_since_prev_commit,
 };
 use tracing::field::Empty;
 use tracing::{debug, info, instrument, trace, warn};
 
-use crate::beacon_witnesses::BeaconWitnessAccumulator;
+use crate::beacon_witnesses::{BeaconWitnessAccumulator, prospective_parent_witness_leaves};
 use crate::block_sync::{
     BlockSyncHealthDecision, BlockSyncManager, BlockSyncVerificationResult, IngestOutcome,
 };
@@ -109,6 +109,7 @@ use crate::proposal::{
     select_finalized_waves, select_provisions, select_transactions,
 };
 use crate::ready_signal_pool::{MIN_READY_SIGNAL_DWELL, ReadySignalPool};
+use crate::timeout_keeper::TimeoutKeeper;
 use crate::validation::{qc_has_local_quorum_power, validate_block_for_vote, validate_header};
 use crate::verification::{
     InFlightCheck, ReadyStateRootVerification, VerificationKind, VerificationPipeline,
@@ -167,6 +168,14 @@ pub struct ShardCoordinator {
     /// Vote accounting: per-block vote sets, own-vote locks, and
     /// received-vote equivocation tracking.
     votes: VoteKeeper,
+
+    /// Timeout accounting for the pacemaker: per-round verified timeout shares,
+    /// reporting the f+1 (Bracha) and 2f+1 (advance) thresholds.
+    timeouts: TimeoutKeeper,
+
+    /// The last round we broadcast our own timeout for, so we emit at most one
+    /// timeout per round (whether triggered by our timer or by Bracha).
+    last_timed_out_round: Option<Round>,
 
     /// Certified blocks awaiting commit, out-of-order commit buffering, and
     /// awaiting-data commit buffering.
@@ -266,6 +275,8 @@ impl ShardCoordinator {
             deferred_qc: DeferredQc::new(),
             pending_blocks: PendingBlocks::new(),
             votes: VoteKeeper::new(),
+            timeouts: TimeoutKeeper::new(),
+            last_timed_out_round: None,
             commits: CommitPipeline::new(),
             verification: VerificationPipeline::new(recovered.committed_height),
             block_sync: BlockSyncManager::new(),
@@ -528,26 +539,28 @@ impl ShardCoordinator {
             return None;
         }
 
-        // Reset the timeout so we don't immediately trigger another view change.
+        // Reset the timeout baseline so we don't immediately re-fire; the round
+        // advances on a 2f+1 timeout quorum (`advance_on_timeout_quorum`), not
+        // on this local timer.
         self.view_change.record_leader_activity(self.now);
         self.view_change.last_header_reset = None;
 
-        let timeout = self.current_view_change_timeout();
-        let rounds_at_height = self
-            .view_change
-            .view
-            .inner()
-            .saturating_sub(self.view_change.view_at_height_start.inner());
-
+        let round = self.view_change.view;
         info!(
             validator = ?self.me,
-            view = self.view_change.view.inner(),
-            rounds_at_height = rounds_at_height,
-            timeout_ms = timeout.as_millis(),
-            "Round timeout - advancing round (implicit view change)"
+            view = round.inner(),
+            timeout_ms = self.current_view_change_timeout().as_millis(),
+            "Round timeout — broadcasting timeout (HotStuff-2 pacemaker)"
         );
 
-        Some(self.advance_round(topology_snapshot))
+        // Broadcast our timeout (deduped per round) and keep the timer running
+        // so we re-check until the 2f+1 quorum forms.
+        let mut actions = self.broadcast_timeout(topology_snapshot, round);
+        actions.push(Action::SetTimer {
+            id: TimerId::ViewChange,
+            duration: self.current_view_change_timeout(),
+        });
+        Some(actions)
     }
 
     /// Initialize with genesis block (for fresh start).
@@ -851,7 +864,8 @@ impl ShardCoordinator {
         round: Round,
         kind: ProposalKind,
     ) -> Vec<Action> {
-        let parent_round = self.chain_view().proposal_parent().1.round();
+        let (parent_block_hash, parent_qc) = self.chain_view().proposal_parent();
+        let parent_round = parent_qc.round();
         let receipts: Vec<StoredReceipt> = match &kind {
             ProposalKind::Normal {
                 finalized_waves, ..
@@ -875,8 +889,33 @@ impl ShardCoordinator {
             MAX_READY_SIGNALS_PER_BLOCK,
         );
         let new_leaves = derive_leaves(&receipts, &missed, &ready_signals);
+
+        // Anchor the preview on the prefix the parent block leaves behind,
+        // not the committed accumulator: the parent may be certified but not
+        // yet committed, so its own witness leaves (e.g. a missed-proposal
+        // leaf after a view change) aren't folded into `committed` yet. Every
+        // verifier reconstructs this same prefix via
+        // `prospective_parent_witness_leaves`, so previewing against the
+        // committed accumulator alone would omit those leaves and produce a
+        // root no validator accepts.
+        let parent_leaves = prospective_parent_witness_leaves(
+            &self.beacon_witness_accumulator,
+            self.committed_hash,
+            parent_block_hash,
+            &self.pending_blocks,
+            self.local_shard,
+            topology_snapshot,
+        )
+        .unwrap_or_else(|blocking| {
+            warn!(
+                validator = ?self.me,
+                ?blocking,
+                "Beacon-witness ancestor walk blocked at proposal; previewing against committed prefix"
+            );
+            self.beacon_witness_accumulator.leaves().to_vec()
+        });
         let (beacon_witness_root, beacon_witness_leaf_count) =
-            self.beacon_witness_accumulator.preview_append(&new_leaves);
+            BeaconWitnessAccumulator::from_leaves(parent_leaves).preview_append(&new_leaves);
 
         let plan = assemble_build_action(
             self.me,
@@ -2921,23 +2960,18 @@ impl ShardCoordinator {
     // Implicit Round Advancement (HotStuff-2 Style)
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// Advance the round locally (implicit view change).
-    ///
-    /// This is called when a timeout occurs and we need to try a new round.
-    /// Unlike explicit view changes, this doesn't require coordinated voting -
-    /// each validator advances locally.
-    ///
-    /// Returns actions to propose if we're the new proposer.
-    #[instrument(skip(self), fields(new_round = self.view_change.view.inner() + 1))]
-    fn advance_round(&mut self, topology_snapshot: &TopologySnapshot) -> Vec<Action> {
+    /// Enter the current `view_change.view` as a fresh round: clear the stale
+    /// proposal, release the height vote lock if no QC formed at the target
+    /// height, schedule the next view-change timer, and propose if we are the
+    /// new round's leader. Reached via the timeout-quorum advance
+    /// ([`Self::advance_on_timeout_quorum`]).
+    fn enter_round(&mut self, topology_snapshot: &TopologySnapshot) -> Vec<Action> {
         // The next height to propose is one above the highest certified block,
         // NOT one above the committed block. This matches try_propose behavior.
         let height = self
             .latest_qc
             .as_ref()
             .map_or_else(|| self.committed_height.next(), |qc| qc.height().next());
-        let old_round = self.view_change.view;
-        self.view_change.advance();
 
         // Clear any in-flight proposal — a stale build from the previous
         // round should not block the new round's proposer. If the old build
@@ -2948,10 +2982,9 @@ impl ShardCoordinator {
         info!(
             validator = ?self.me,
             height = height.inner(),
-            old_round = old_round.inner(),
             new_round = self.view_change.view.inner(),
             view_changes = self.view_change.view_changes,
-            "Advancing round locally (implicit view change)"
+            "Entering new round"
         );
 
         // Log why any pending blocks at this height couldn't be verified in time.
@@ -3044,6 +3077,175 @@ impl ShardCoordinator {
         }
 
         vec![timer]
+    }
+
+    // ── Pacemaker: timeout-driven view change (HotStuff-2 synchronizer) ─────
+
+    /// Our current `high_qc` — the highest QC we've adopted, or the genesis QC.
+    fn high_qc(&self) -> QuorumCertificate {
+        self.latest_qc
+            .as_deref()
+            .cloned()
+            .unwrap_or_else(|| QuorumCertificate::genesis(self.local_shard))
+    }
+
+    /// Broadcast our timeout for `round` (carrying our `high_qc`) to the
+    /// committee, which tallies it. The round timer drives this on every fire,
+    /// so a timeout lost to a partition is retransmitted until a 2f+1 quorum
+    /// forms — without retransmission a healed partition never re-collects the
+    /// shares it dropped and the chain wedges.
+    fn broadcast_timeout(
+        &mut self,
+        topology_snapshot: &TopologySnapshot,
+        round: Round,
+    ) -> Vec<Action> {
+        self.last_timed_out_round = Some(round);
+        let recipients: Vec<ValidatorId> = topology_snapshot
+            .committee_for_shard(self.local_shard)
+            .iter()
+            .copied()
+            .filter(|v| *v != self.me)
+            .collect();
+        vec![Action::SignAndBroadcastTimeout {
+            round,
+            high_qc: self.high_qc(),
+            recipients,
+        }]
+    }
+
+    /// Bracha-amplify: broadcast our own timeout for `round` the first time we
+    /// hear f+1 of them, so every honest replica eventually times out. Unlike
+    /// the timer-driven retransmit, this fires at most once per round — a
+    /// replica that already broadcast (via its timer or an earlier amplify)
+    /// stays quiet.
+    fn amplify_timeout(
+        &mut self,
+        topology_snapshot: &TopologySnapshot,
+        round: Round,
+    ) -> Vec<Action> {
+        if self.last_timed_out_round == Some(round) {
+            return Vec::new();
+        }
+        self.broadcast_timeout(topology_snapshot, round)
+    }
+
+    /// Verify a wire timeout's BLS share, then tally it.
+    pub fn on_unverified_timeout(
+        &mut self,
+        topology_snapshot: &TopologySnapshot,
+        timeout: &Timeout,
+    ) -> Vec<Action> {
+        if timeout.shard_group_id() != self.local_shard {
+            return Vec::new();
+        }
+        let Some(pubkey) = topology_snapshot.public_key(timeout.voter()) else {
+            return Vec::new();
+        };
+        let Ok(verified) = timeout.verify(&TimeoutContext {
+            network: topology_snapshot.network(),
+            voter_public_key: &pubkey,
+        }) else {
+            warn!(validator = ?self.me, voter = ?timeout.voter(), "Dropping timeout with invalid BLS share");
+            return Vec::new();
+        };
+        self.on_verified_timeout(topology_snapshot, verified)
+    }
+
+    /// Tally a verified timeout: amplify at f+1 (Bracha), advance at 2f+1.
+    pub fn on_verified_timeout(
+        &mut self,
+        topology_snapshot: &TopologySnapshot,
+        timeout: Verified<Timeout>,
+    ) -> Vec<Action> {
+        let round = timeout.round();
+        // Ignore timeouts for rounds we've already advanced past.
+        if round < self.view_change.view {
+            return Vec::new();
+        }
+        let power = topology_snapshot
+            .voting_power(timeout.voter())
+            .unwrap_or(VotePower::MIN);
+        if !self.timeouts.record(timeout, power) {
+            return Vec::new();
+        }
+
+        let total = topology_snapshot.voting_power_for_shard(self.local_shard);
+        let seen = self.timeouts.power(round);
+        let mut actions = Vec::new();
+
+        // Bracha amplification: f+1 timeouts seen → broadcast our own.
+        if VotePower::has_one_third(seen, total) {
+            actions.extend(self.amplify_timeout(topology_snapshot, round));
+        }
+
+        // 2f+1 timeouts → adopt the quorum-max high_qc and advance together.
+        if VotePower::has_quorum(seen, total) {
+            actions.extend(self.advance_on_timeout_quorum(topology_snapshot, round));
+        }
+
+        actions
+    }
+
+    /// On a 2f+1 timeout quorum for `round`: adopt the quorum-max `high_qc`
+    /// (verified) so the next leader extends it, then advance to `round + 1`.
+    fn advance_on_timeout_quorum(
+        &mut self,
+        topology_snapshot: &TopologySnapshot,
+        round: Round,
+    ) -> Vec<Action> {
+        let mut actions = self.adopt_timeout_quorum_high_qc(topology_snapshot, round);
+        if self.view_change.advance_to(round.next()) {
+            // Reset the timeout baseline so the new leader gets a full window.
+            self.view_change.record_leader_activity(self.now);
+            self.timeouts.prune_below(self.view_change.view);
+            actions.extend(self.enter_round(topology_snapshot));
+        }
+        actions
+    }
+
+    /// Verify and adopt the highest `high_qc` reported by the round's timeouts
+    /// if it exceeds our current `high_qc`. This is what makes the next leader
+    /// extend a QC at least as high as any committed block.
+    fn adopt_timeout_quorum_high_qc(
+        &mut self,
+        topology_snapshot: &TopologySnapshot,
+        round: Round,
+    ) -> Vec<Action> {
+        let cur_high = self
+            .latest_qc
+            .as_deref()
+            .map_or(Round::INITIAL, QuorumCertificate::round);
+        let Some(candidate) = self.timeouts.max_high_qc(round) else {
+            return Vec::new();
+        };
+        if candidate.is_genesis() || candidate.round() <= cur_high {
+            return Vec::new();
+        }
+        let candidate = candidate.clone();
+        let Some(verified) = self.verify_qc_sync(topology_snapshot, &candidate) else {
+            warn!(validator = ?self.me, "Quorum-max high_qc from timeouts failed verification");
+            return Vec::new();
+        };
+        self.try_adopt_verified_qc(&verified)
+    }
+
+    /// Synchronously verify a QC against the local committee. Used on the
+    /// infrequent view-change path; the steady-state QC verification stays
+    /// delegated to the consensus pool.
+    fn verify_qc_sync(
+        &self,
+        topology_snapshot: &TopologySnapshot,
+        qc: &QuorumCertificate,
+    ) -> Option<Verified<QuorumCertificate>> {
+        let public_keys = committee_public_keys(topology_snapshot, self.local_shard)?;
+        let voting_powers = committee_voting_powers(topology_snapshot, self.local_shard)?;
+        let ctx = QcContext {
+            network: topology_snapshot.network(),
+            public_keys: &public_keys,
+            voting_powers: &voting_powers,
+            quorum_threshold: topology_snapshot.quorum_threshold_for_shard(self.local_shard),
+        };
+        qc.verify(&ctx).ok()
     }
 
     /// Called when we receive a QC from a block header that allows us to unlock.
@@ -4137,15 +4339,24 @@ mod tests {
     // Implicit Round Advancement Tests (HotStuff-2 Style)
     // ═══════════════════════════════════════════════════════════════════════════
 
+    /// Advance the coordinator one round the way the pacemaker does on a
+    /// 2f+1 timeout quorum — bump the view, then re-enter — without standing
+    /// up a full timeout quorum. Exercises the shared `enter_round` path.
+    fn advance_one_round(state: &mut ShardCoordinator, topology: &TopologySnapshot) -> Vec<Action> {
+        let next = state.view_change.view.next();
+        state.view_change.advance_to(next);
+        state.enter_round(topology)
+    }
+
     #[test]
-    fn test_advance_round_proposer_broadcasts() {
-        // Rounds increase per block: a fresh state starts at view 1, and
-        // advance_round moves to round 2. Local = ValidatorId::new(2) is the
+    fn test_enter_round_proposer_broadcasts() {
+        // Rounds increase per block: a fresh state starts at view 1, and a
+        // single advance moves to round 2. Local = ValidatorId::new(2) is the
         // proposer at round 2 since proposer_for(2) = committee[2 % 4] = 2.
         let (mut state, topology) = make_multi_validator_state_at(2);
         state.set_time(LocalTimestamp::from_millis(100_000));
 
-        let actions = state.advance_round(&topology);
+        let actions = advance_one_round(&mut state, &topology);
         assert!(actions.iter().any(|a| matches!(
             a,
             Action::BuildProposal {
@@ -4156,7 +4367,7 @@ mod tests {
     }
 
     #[test]
-    fn test_advance_round_unlocks_when_no_qc() {
+    fn test_enter_round_unlocks_when_no_qc() {
         let (mut state, topology) = make_test_state();
         state.set_time(LocalTimestamp::from_millis(100_000));
 
@@ -4165,7 +4376,7 @@ mod tests {
             BlockHash::from_raw(Hash::from_bytes(b"voted_block")),
             Round::new(0),
         );
-        let _ = state.advance_round(&topology);
+        let _ = advance_one_round(&mut state, &topology);
 
         assert!(!state.votes.is_locked_at(BlockHeight::new(1)));
     }
@@ -4491,7 +4702,7 @@ mod tests {
                 BlockHash::from_raw(Hash::from_bytes(block)),
                 round,
             );
-            state.advance_round(&topology)
+            advance_one_round(state, &topology)
         };
 
         // Rounds 2 and 3: not proposer, vote lock cleared on each advance.
@@ -4518,7 +4729,7 @@ mod tests {
 
     #[test]
     fn test_view_change_does_not_unlock_lower_heights() {
-        // advance_round only unlocks at the height we're now proposing for
+        // A round advance only unlocks at the height we're now proposing for
         // (latest_qc.height() + 1). Vote locks at lower heights are left for
         // cleanup_committed to remove on commit.
         let (mut state, topology) = make_test_state();
@@ -4535,7 +4746,7 @@ mod tests {
             Round::new(0),
         );
 
-        let _ = state.advance_round(&topology);
+        let _ = advance_one_round(&mut state, &topology);
 
         assert!(state.votes.is_locked_at(BlockHeight::new(1)));
         assert!(!state.votes.is_locked_at(BlockHeight::new(2)));

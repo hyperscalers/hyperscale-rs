@@ -6,11 +6,11 @@
 //! *different* block at the same height, and one of them two-chain
 //! commits its block. This falsifies the "conflicting blocks cannot both
 //! get QCs by quorum intersection" claim in `lib.rs`: the height-level
-//! vote lock is released on a local timeout (no timeout certificate), so
-//! an overlapping honest quorum signs both sibling blocks across rounds.
-//! Two conflicting certificates plus one finalized block is already a
-//! safety violation; the symmetric second commit completes a full
-//! two-node fork.
+//! vote lock is released whenever a 2f+1 timeout quorum advances the
+//! round — there is still no safe-vote rule binding the new vote to a
+//! locked round — so an overlapping honest quorum signs both sibling
+//! blocks across rounds. Two conflicting certificates plus one finalized
+//! block is already a safety violation.
 //!
 //! The test pins the current unsafe behaviour. Once the rule is hardened
 //! (locked-QC + safe-vote rule + round-contiguous commit) the overlapping
@@ -83,11 +83,11 @@ fn vote_unlock_admits_conflicting_qcs_at_one_height() {
     sim.kick_off();
     sim.run_for_at_most(MAX_STEPS);
 
-    // Timeout to round 2 unlocks V0/V3 at h=1; V2 proposes B@round 2; V0/V2/V3
-    // vote; V2 forms QC_B.
+    // A round-1 timeout quorum (V0/V2/V3) advances them to round 2 and unlocks
+    // V0/V3 at h=1; V2 then auto-proposes B@round 2 in `enter_round`; V0/V2/V3
+    // vote it (routed to V2); V2 forms QC_B.
     sim.advance_clock(PAST_TIMEOUT);
     sim.fire_view_change_timer_all();
-    sim.propose_on(v[2]);
     sim.run_for_at_most(MAX_STEPS);
 
     // Two honest replicas now hold QCs for different sibling blocks at the
@@ -109,20 +109,26 @@ fn vote_unlock_admits_conflicting_qcs_at_one_height() {
         "expected QCs for two distinct blocks at height 1, not the same block",
     );
 
-    // V1 drives branch A's child to a two-chain commit: it advances to its
-    // next proposer slot (round 5) and proposes A2; V0/V3 adopt QC_A and vote
-    // A2; V1 forms QC_A2 and commits A at height 1.
-    for _ in 0..2 {
+    // Drive the timeout pacemaker forward. The round-2 timeout quorum adopts
+    // QC_A as the quorum-max high_qc into V0/V3 (V1 carries it, V0/V3 don't),
+    // so branch A wins the swing voters; a child of A then certifies and its
+    // QC two-chain-commits A at height 1 while branch B's QC_B is orphaned.
+    for _ in 0..4 {
         sim.advance_clock(PAST_TIMEOUT);
-        sim.fire_view_change_timer(v[1]);
+        sim.fire_view_change_timer_all();
+        sim.run_for_at_most(MAX_STEPS);
     }
-    sim.propose_on(v[1]);
-    sim.run_for_at_most(MAX_STEPS);
 
-    // V1 finalized branch A — one of the two conflicting certified blocks.
+    // V1 finalized branch A — one of the two conflicting certified blocks —
+    // while V2 still holds QC_B for the orphaned sibling.
     assert_eq!(
         committed_block(&sim, 1, h1),
         Some(qc_a.block_hash()),
         "V1 should have committed branch A at height 1",
+    );
+    assert_eq!(
+        committed_block(&sim, 2, h1),
+        None,
+        "V2's branch B (QC_B) must never commit at height 1",
     );
 }

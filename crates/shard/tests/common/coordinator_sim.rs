@@ -40,7 +40,7 @@ use hyperscale_types::{
     ProposerTimestamp, ProvisionRootVerifyError, ProvisionTxRootsContext, ProvisionTxRootsMap,
     ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, ProvisionsRootContext, QcContext,
     QcVerifyError, QuorumCertificate, ReadySignal, Round, RoutableTransaction, ShardGroupId,
-    StateRoot, StateRootContext, StateRootVerifyError, StoredReceipt, TopologySnapshot,
+    StateRoot, StateRootContext, StateRootVerifyError, StoredReceipt, Timeout, TopologySnapshot,
     TransactionRoot, TransactionRootContext, TxHash, TxRootVerifyError, ValidatorId, Verifiable,
     Verified, Verify, VotePower, ready_signal_message,
 };
@@ -84,11 +84,19 @@ pub enum HoldFilter {
     /// header that validator broadcasts is diverted at the
     /// receiver before delivery.
     BlockHeaderFromProposer(ValidatorId),
+    /// Match every `SimEvent::BlockHeader`. Keeps the chain from
+    /// ever certifying a block so timeout-driven view changes
+    /// accrue at a single height.
+    AnyHeader,
     /// Match block-vote envelopes (verified or unverified) cast at
     /// `(height, round)`. Lets a test pin which replica aggregates
     /// a given block's QC by withholding that block's votes from
     /// every other would-be aggregator.
     VoteAtHeightRound(BlockHeight, Round),
+    /// Match any timeout envelope (verified or unverified). Keeps a
+    /// replica from joining the timeout quorum so it can only catch
+    /// up via an observed higher-round header.
+    AnyTimeout,
 }
 
 impl HoldFilter {
@@ -100,11 +108,16 @@ impl HoldFilter {
             Self::BlockHeaderFromProposer(v) => {
                 matches!(event, SimEvent::BlockHeader { header, .. } if header.proposer() == v)
             }
+            Self::AnyHeader => matches!(event, SimEvent::BlockHeader { .. }),
             Self::VoteAtHeightRound(h, r) => match event {
                 SimEvent::UnverifiedVote { vote } => vote.height() == h && vote.round() == r,
                 SimEvent::VerifiedVote { vote } => vote.height() == h && vote.round() == r,
                 _ => false,
             },
+            Self::AnyTimeout => matches!(
+                event,
+                SimEvent::UnverifiedTimeout { .. } | SimEvent::VerifiedTimeout { .. }
+            ),
         }
     }
 }
@@ -138,6 +151,12 @@ enum SimEvent {
     },
     VerifiedVote {
         vote: Verified<BlockVote>,
+    },
+    UnverifiedTimeout {
+        timeout: Timeout,
+    },
+    VerifiedTimeout {
+        timeout: Verified<Timeout>,
     },
     ProposalBuilt {
         height: BlockHeight,
@@ -201,6 +220,8 @@ impl SimEvent {
             Self::BlockHeader { .. } => "BlockHeader",
             Self::UnverifiedVote { .. } => "UnverifiedVote",
             Self::VerifiedVote { .. } => "VerifiedVote",
+            Self::UnverifiedTimeout { .. } => "UnverifiedTimeout",
+            Self::VerifiedTimeout { .. } => "VerifiedTimeout",
             Self::ProposalBuilt { .. } => "ProposalBuilt",
             Self::QcResult { .. } => "QcResult",
             Self::QcSignatureVerified { .. } => "QcSignatureVerified",
@@ -713,6 +734,10 @@ impl ShardCoordinatorSim {
             SimEvent::BlockHeader { .. } => unreachable!("handled above"),
             SimEvent::UnverifiedVote { vote } => coord.on_unverified_block_vote(topology, vote),
             SimEvent::VerifiedVote { vote } => coord.on_verified_block_vote(topology, vote),
+            SimEvent::UnverifiedTimeout { timeout } => {
+                coord.on_unverified_timeout(topology, &timeout)
+            }
+            SimEvent::VerifiedTimeout { timeout } => coord.on_verified_timeout(topology, timeout),
             SimEvent::ProposalBuilt {
                 height,
                 round,
@@ -872,6 +897,42 @@ impl ShardCoordinatorSim {
                 self.loopback_q.push_back(Envelope {
                     to_idx: emitter_idx,
                     event: SimEvent::VerifiedVote { vote: verified },
+                });
+            }
+            Action::SignAndBroadcastTimeout {
+                round,
+                high_qc,
+                recipients,
+            } => {
+                let verified = Verified::<Timeout>::sign_local(
+                    &self.network,
+                    self.shard,
+                    round,
+                    high_qc,
+                    me,
+                    &self.sks[emitter_idx],
+                );
+                for &recipient in &recipients {
+                    if recipient == me {
+                        continue;
+                    }
+                    let to_idx = self.idx_of(recipient);
+                    // Wire-arrived timeouts always land unverified at the
+                    // receiver, mirroring the gossip handler's
+                    // `into_verified()` Err arm.
+                    self.network_q.push_back(Envelope {
+                        to_idx,
+                        event: SimEvent::UnverifiedTimeout {
+                            timeout: verified.clone().into_inner(),
+                        },
+                    });
+                }
+                // Self-loopback so the local `TimeoutKeeper` tallies our
+                // own timeout — mirrors the handler's
+                // `notify_protocol(VerifiedTimeoutReceived)`.
+                self.loopback_q.push_back(Envelope {
+                    to_idx: emitter_idx,
+                    event: SimEvent::VerifiedTimeout { timeout: verified },
                 });
             }
             // `BroadcastCertifiedBlockHeader` is cross-shard

@@ -70,6 +70,7 @@ mod deferred_qc;
 mod lookups;
 mod pending;
 mod proposal;
+mod timeout_keeper;
 mod validation;
 mod verification;
 mod view_change;

@@ -1000,9 +1000,6 @@ fn test_e2e_transaction_throughput() {
 /// the case where the isolated node is the wave leader.
 #[traced_test]
 #[test]
-#[ignore = "needs a timeout-certificate pacemaker: with per-block rounds, the \
-            implicit timeout-driven view change scatters votes across a distinct \
-            block per round under a permanently failed leader, so no quorum forms"]
 fn test_wave_leader_failure_recovers_via_rotation() {
     for isolated_node in 0..4u32 {
         println!("\n=== Wave Leader Failure Test: isolating node {isolated_node} ===\n");

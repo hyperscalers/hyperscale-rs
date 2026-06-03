@@ -56,7 +56,7 @@ pub use execution::{
 pub use provisions::{DOMAIN_STATE_PROVISION_BATCH, state_provisions_message};
 pub use ready_signal::{DOMAIN_READY_SIGNAL, ready_signal_message};
 pub use shard::{
-    DOMAIN_BLOCK_HEADER, DOMAIN_BLOCK_VOTE, DOMAIN_COMMITTED_BLOCK_HEADER, block_header_message,
-    block_vote_message, certified_block_header_message,
+    DOMAIN_BLOCK_HEADER, DOMAIN_BLOCK_VOTE, DOMAIN_COMMITTED_BLOCK_HEADER, DOMAIN_TIMEOUT,
+    block_header_message, block_vote_message, certified_block_header_message, timeout_message,
 };
 pub use validator_bind::{DOMAIN_VALIDATOR_BIND, VALIDATOR_BIND_NONCE_LEN, validator_bind_message};

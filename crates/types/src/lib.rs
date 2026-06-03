@@ -134,6 +134,7 @@ pub use shard::roots::{
     TransactionRootContext, TxRootVerifyError, derive_leaves, missed_proposals_since_prev_commit,
 };
 pub use shard::storage_commit::{BeaconWitnessCommit, PreparedCommit, SyncHint};
+pub use shard::timeout::{Timeout, TimeoutContext, TimeoutVerifyError};
 pub use shard::vote::{BlockVote, BlockVoteContext, BlockVoteVerifyError};
 pub use shard::{
     Block, SharedCertificates, SharedProvisions, SharedTransactions, VerifiedBlockAssembleError,
@@ -144,12 +145,12 @@ pub use signing::{
     DOMAIN_EXEC_VOTE, DOMAIN_EXEC_VOTE_BATCH, DOMAIN_PC_EMPTY_VIEW, DOMAIN_PC_VOTE1,
     DOMAIN_PC_VOTE2, DOMAIN_PC_VOTE2_LENGTH, DOMAIN_PC_VOTE3, DOMAIN_PC_VRF, DOMAIN_READY_SIGNAL,
     DOMAIN_SKIP_REQUEST, DOMAIN_SPC_NEW_COMMIT, DOMAIN_SPC_NEW_VIEW, DOMAIN_STATE_PROVISION_BATCH,
-    DOMAIN_VALIDATOR_BIND, PcContext, SpcContext, VALIDATOR_BIND_NONCE_LEN, block_header_message,
-    block_vote_message, certified_block_header_message, exec_cert_batch_message,
-    exec_vote_batch_message, exec_vote_message, pc_context, pc_vote_signing_message,
-    ready_signal_message, skip_request_message, spc_context, spc_relay_signing_message,
-    state_provisions_message, validator_bind_message, vrf_output_from_proof, vrf_reveal_message,
-    vrf_sign, vrf_verify,
+    DOMAIN_TIMEOUT, DOMAIN_VALIDATOR_BIND, PcContext, SpcContext, VALIDATOR_BIND_NONCE_LEN,
+    block_header_message, block_vote_message, certified_block_header_message,
+    exec_cert_batch_message, exec_vote_batch_message, exec_vote_message, pc_context,
+    pc_vote_signing_message, ready_signal_message, skip_request_message, spc_context,
+    spc_relay_signing_message, state_provisions_message, timeout_message, validator_bind_message,
+    vrf_output_from_proof, vrf_reveal_message, vrf_sign, vrf_verify,
 };
 pub use time::limits::{MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH};
 pub use time::range::{MAX_VALIDITY_RANGE, TimestampRange};

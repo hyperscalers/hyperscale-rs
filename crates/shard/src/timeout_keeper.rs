@@ -1,0 +1,180 @@
+//! Buffers verified timeout shares per round for the HotStuff-2 pacemaker.
+//!
+//! A replica broadcasts a [`Timeout`] when its round timer fires instead of
+//! advancing locally. The keeper tallies the verified shares per round and
+//! reports the two thresholds the pacemaker acts on:
+//!
+//! - **f+1** (`> 1/3` power): at least one honest replica has abandoned the
+//!   round, so we broadcast our own timeout too (Bracha amplification).
+//! - **2f+1** (`> 2/3` power, a quorum): the round is provably abandoned, so we
+//!   adopt the quorum-max `high_qc` and advance together.
+//!
+//! Timeouts are deduplicated by voter. Shares are verified before they reach
+//! the keeper; the carried `high_qc` is a self-authenticating QC, verified
+//! separately at adoption.
+
+use std::collections::{BTreeMap, HashMap};
+
+use hyperscale_types::{QuorumCertificate, Round, Timeout, ValidatorId, Verified, VotePower};
+
+/// Per-round tally of verified timeout shares, deduplicated by voter.
+struct RoundTimeouts {
+    by_voter: HashMap<ValidatorId, (Verified<Timeout>, VotePower)>,
+    total_power: VotePower,
+}
+
+impl Default for RoundTimeouts {
+    fn default() -> Self {
+        Self {
+            by_voter: HashMap::new(),
+            total_power: VotePower::ZERO,
+        }
+    }
+}
+
+/// Buffers verified timeouts per round and exposes the pacemaker thresholds.
+#[derive(Default)]
+pub struct TimeoutKeeper {
+    rounds: BTreeMap<Round, RoundTimeouts>,
+}
+
+impl TimeoutKeeper {
+    /// Empty keeper.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a verified timeout, deduplicated by voter. Returns `true` if it
+    /// was newly recorded (a fresh voter for its round).
+    pub fn record(&mut self, timeout: Verified<Timeout>, power: VotePower) -> bool {
+        let round = timeout.round();
+        let voter = timeout.voter();
+        let entry = self.rounds.entry(round).or_default();
+        if entry.by_voter.contains_key(&voter) {
+            return false;
+        }
+        entry.total_power = entry.total_power.saturating_add(power);
+        entry.by_voter.insert(voter, (timeout, power));
+        true
+    }
+
+    /// Combined voting power of the timeouts seen for `round`.
+    #[must_use]
+    pub fn power(&self, round: Round) -> VotePower {
+        self.rounds
+            .get(&round)
+            .map_or(VotePower::ZERO, |r| r.total_power)
+    }
+
+    /// The highest-round `high_qc` carried by any timeout for `round` — the
+    /// quorum-max QC the next leader must extend. `None` if no timeouts seen.
+    #[must_use]
+    pub fn max_high_qc(&self, round: Round) -> Option<&QuorumCertificate> {
+        self.rounds
+            .get(&round)?
+            .by_voter
+            .values()
+            .map(|(timeout, _)| timeout.high_qc())
+            .max_by_key(|qc| qc.round())
+    }
+
+    /// Drop every round strictly below `round` (GC once the chain advances).
+    pub fn prune_below(&mut self, round: Round) {
+        self.rounds.retain(|r, _| *r >= round);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use hyperscale_types::{
+        BlockHash, BlockHeight, NetworkDefinition, ShardGroupId, SignerBitfield, Timeout,
+        WeightedTimestamp, generate_bls_keypair, zero_bls_signature,
+    };
+
+    use super::*;
+
+    const SHARD: ShardGroupId = ShardGroupId::new(0);
+
+    fn high_qc_at(round: u64) -> QuorumCertificate {
+        QuorumCertificate::new(
+            BlockHash::ZERO,
+            SHARD,
+            BlockHeight::new(round),
+            BlockHash::ZERO,
+            Round::new(round),
+            SignerBitfield::empty(),
+            zero_bls_signature(),
+            WeightedTimestamp::ZERO,
+        )
+    }
+
+    fn timeout(round: u64, high_qc_round: u64, voter: u64) -> Verified<Timeout> {
+        let net = NetworkDefinition::simulator();
+        let key = generate_bls_keypair();
+        Verified::<Timeout>::sign_local(
+            &net,
+            SHARD,
+            Round::new(round),
+            high_qc_at(high_qc_round),
+            ValidatorId::new(voter),
+            &key,
+        )
+    }
+
+    #[test]
+    fn record_dedups_by_voter() {
+        let mut keeper = TimeoutKeeper::new();
+        let r = Round::new(5);
+
+        assert!(keeper.record(timeout(5, 1, 7), VotePower::new(1)));
+        // Same voter, same round: rejected, power counted once.
+        assert!(!keeper.record(timeout(5, 2, 7), VotePower::new(1)));
+        assert_eq!(keeper.power(r), VotePower::new(1));
+
+        // Distinct voter: accepted, power accumulates.
+        assert!(keeper.record(timeout(5, 1, 9), VotePower::new(1)));
+        assert_eq!(keeper.power(r), VotePower::new(2));
+    }
+
+    #[test]
+    fn power_is_per_round() {
+        let mut keeper = TimeoutKeeper::new();
+        keeper.record(timeout(5, 1, 7), VotePower::new(1));
+        keeper.record(timeout(6, 1, 7), VotePower::new(1));
+
+        assert_eq!(keeper.power(Round::new(5)), VotePower::new(1));
+        assert_eq!(keeper.power(Round::new(6)), VotePower::new(1));
+        assert_eq!(keeper.power(Round::new(7)), VotePower::ZERO);
+    }
+
+    #[test]
+    fn max_high_qc_picks_highest_round() {
+        let mut keeper = TimeoutKeeper::new();
+        keeper.record(timeout(9, 3, 0), VotePower::new(1));
+        keeper.record(timeout(9, 7, 1), VotePower::new(1));
+        keeper.record(timeout(9, 4, 2), VotePower::new(1));
+
+        assert_eq!(
+            keeper
+                .max_high_qc(Round::new(9))
+                .map(QuorumCertificate::round),
+            Some(Round::new(7)),
+        );
+        assert!(keeper.max_high_qc(Round::new(10)).is_none());
+    }
+
+    #[test]
+    fn prune_below_drops_old_rounds() {
+        let mut keeper = TimeoutKeeper::new();
+        keeper.record(timeout(5, 1, 0), VotePower::new(1));
+        keeper.record(timeout(6, 1, 0), VotePower::new(1));
+        keeper.record(timeout(7, 1, 0), VotePower::new(1));
+
+        keeper.prune_below(Round::new(6));
+
+        assert_eq!(keeper.power(Round::new(5)), VotePower::ZERO);
+        assert_eq!(keeper.power(Round::new(6)), VotePower::new(1));
+        assert_eq!(keeper.power(Round::new(7)), VotePower::new(1));
+    }
+}

@@ -11,6 +11,7 @@ mod execution_certificates;
 mod execution_votes;
 mod provisions;
 mod ready_signal;
+mod timeout;
 
 pub use beacon::{
     BeaconProposalNotification, PcVote1Notification, PcVote2Notification, PcVote3Notification,
@@ -22,3 +23,4 @@ pub use execution_certificates::ExecutionCertificatesNotification;
 pub use execution_votes::ExecutionVotesNotification;
 pub use provisions::ProvisionsNotification;
 pub use ready_signal::ReadySignalNotification;
+pub use timeout::TimeoutNotification;

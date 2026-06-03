@@ -272,6 +272,8 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::UnverifiedRemoteHeaderReceived { .. }
             | ProtocolEvent::VerifiedBlockVoteReceived { .. }
             | ProtocolEvent::UnverifiedBlockVoteReceived { .. }
+            | ProtocolEvent::VerifiedTimeoutReceived { .. }
+            | ProtocolEvent::UnverifiedTimeoutReceived { .. }
             | ProtocolEvent::BlockReadyToCommit { .. }
             | ProtocolEvent::QuorumCertificateResult { .. }
             | ProtocolEvent::QcSignatureVerified { .. }

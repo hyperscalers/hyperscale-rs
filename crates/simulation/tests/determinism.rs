@@ -1885,9 +1885,12 @@ fn test_partition_recovery_hotstuff2() {
         println!("  Node {i}: height={h}, view={v}");
     }
 
-    // Run for longer to allow round advancement and recovery
-    // Round advancement timeout is 5 seconds by default
-    runner.run_until(Duration::from_secs(20));
+    // Run long enough for recovery to clear the post-heal suppression window.
+    // After the partition, every node holds a stale pending block at its tip,
+    // so `should_advance_round` suppresses the first timeout for up to
+    // `MAX_PROGRESS_WAIT` (9s); only then does the pacemaker re-synchronise the
+    // rounds and the chain resume committing.
+    runner.run_until(Duration::from_secs(16));
     let height_after = runner
         .node(0)
         .unwrap()
@@ -1966,18 +1969,16 @@ fn test_partition_recovery_hotstuff2() {
     let height_diff = max_height.inner().saturating_sub(min_height.inner());
     println!("Height difference: {height_diff}");
 
-    // Recovery under the implicit, timeout-driven view change is slow when
-    // per-block rounds have diverged across the partition: the cluster has to
-    // cycle proposers and re-sync the lagging half one timeout at a time. The
-    // load-bearing property is that it is not deadlocked — it resumes
-    // committing rather than wedging.
+    // Once the suppression window clears, the timeout pacemaker re-synchronises
+    // the lagging half on a 2f+1 quorum and the chain resumes in earnest —
+    // committing several more blocks, not crawling one at a time.
     assert!(
-        max_height > height_during,
+        max_height > height_during + 3,
         "Nodes should resume committing blocks after partition heals. \
          height_during={}, max_height={} (expected > {})",
         height_during,
         max_height,
-        height_during.inner()
+        (height_during + 3).inner()
     );
 
     // Small divergence is expected due to in-flight messages and sync timing

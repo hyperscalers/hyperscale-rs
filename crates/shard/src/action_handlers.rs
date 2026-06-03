@@ -11,7 +11,9 @@ use hyperscale_metrics::record_signature_verification_latency;
 use hyperscale_network::Network;
 use hyperscale_storage::{JmtSnapshot, ShardChainWriter, ShardStorage};
 use hyperscale_types::network::gossip::CertifiedBlockHeaderGossip;
-use hyperscale_types::network::notification::{BlockHeaderNotification, BlockVoteNotification};
+use hyperscale_types::network::notification::{
+    BlockHeaderNotification, BlockVoteNotification, TimeoutNotification,
+};
 use hyperscale_types::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, BeaconWitnessRootContext, Block, BlockHash,
     BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PublicKey, CertificateRoot,
@@ -20,9 +22,10 @@ use hyperscale_types::{
     NetworkDefinition, PreparedCommit, ProposerTimestamp, ProvisionHash, ProvisionTxRootsContext,
     ProvisionTxRootsMap, Provisions, ProvisionsRoot, ProvisionsRootContext, QcContext,
     QuorumCertificate, ReadySignal, Round, RoutableTransaction, ShardGroupId, StateRoot,
-    StateRootContext, StoredReceipt, TopologySnapshot, TransactionRoot, TransactionRootContext,
-    ValidatorId, Verifiable, Verified, Verify, VotePower, WeightedTimestamp, block_header_message,
-    block_vote_message, certified_block_header_message, compute_waves,
+    StateRootContext, StoredReceipt, Timeout, TopologySnapshot, TransactionRoot,
+    TransactionRootContext, ValidatorId, Verifiable, Verified, Verify, VotePower,
+    WeightedTimestamp, block_header_message, block_vote_message, certified_block_header_message,
+    compute_waves,
 };
 
 /// Result of QC verification and assembly.
@@ -736,6 +739,25 @@ where
             ctx.network.notify(&next_proposers, &gossip);
             // Feed our own signed vote back for local VoteSet tracking.
             ctx.notify_protocol(ProtocolEvent::VerifiedBlockVoteReceived { vote: verified });
+        }
+
+        Action::SignAndBroadcastTimeout {
+            round,
+            high_qc,
+            recipients,
+        } => {
+            let verified = Verified::<Timeout>::sign_local(
+                ctx.topology_snapshot.network(),
+                ctx.shard,
+                round,
+                high_qc,
+                ctx.me,
+                ctx.signing_key,
+            );
+            let gossip = TimeoutNotification::new(verified.clone());
+            ctx.network.notify(&recipients, &gossip);
+            // Feed our own signed timeout back for local TimeoutKeeper tracking.
+            ctx.notify_protocol(ProtocolEvent::VerifiedTimeoutReceived { timeout: verified });
         }
 
         Action::BroadcastCertifiedBlockHeader { certified_header } => {

@@ -94,6 +94,23 @@ pub enum Action {
         next_proposers: Vec<ValidatorId>,
     },
 
+    /// Sign and broadcast a timeout to the local-shard committee.
+    ///
+    /// Emitted when the round timer fires instead of advancing locally. The
+    /// `io_loop` signs the timeout on the consensus crypto pool, broadcasts it
+    /// to `recipients`, and feeds the signed timeout back to the state machine
+    /// for the local `TimeoutKeeper`. On `2f+1` timeouts the committee adopts
+    /// the maximum `high_qc` and advances the round together.
+    SignAndBroadcastTimeout {
+        /// Round being abandoned.
+        round: Round,
+        /// The signer's highest certified block — carried so the next leader
+        /// can adopt and extend the quorum-max QC. Self-authenticating.
+        high_qc: QuorumCertificate,
+        /// Local-shard committee members who tally timeouts for this round.
+        recipients: Vec<ValidatorId>,
+    },
+
     // ═══════════════════════════════════════════════════════════════════════
     // Network: Execution Layer (domain-specific, batchable by runner)
     // ═══════════════════════════════════════════════════════════════════════
@@ -1119,6 +1136,7 @@ impl Action {
             | Self::BuildProposal { .. }
             | Self::BroadcastBlockHeader { .. }
             | Self::SignAndBroadcastBlockVote { .. }
+            | Self::SignAndBroadcastTimeout { .. }
             | Self::BroadcastCertifiedBlockHeader { .. }
             | Self::SignAndBroadcastPcVote1 { .. }
             | Self::SignAndBroadcastPcVote2 { .. }
@@ -1172,6 +1190,7 @@ impl Action {
             | Self::BuildProposal { .. }
             | Self::BroadcastBlockHeader { .. }
             | Self::SignAndBroadcastBlockVote { .. }
+            | Self::SignAndBroadcastTimeout { .. }
             | Self::BroadcastCertifiedBlockHeader { .. } => ActionOwner::Shard,
 
             Self::AggregateExecutionCertificate { .. }

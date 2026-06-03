@@ -9,6 +9,7 @@
 //! - [`roots`]: per-block merkle root helpers used by [`BlockHeader`] consumers.
 //! - [`limits`]: protocol-level caps on per-block payload sizes.
 //! - [`quorum_certificate`]: [`QuorumCertificate`] aggregating shard consensus votes.
+//! - [`timeout`]: [`Timeout`] view-change share that drives the pacemaker.
 //! - [`storage_commit`]: type-erased [`PreparedCommit`](storage_commit::PreparedCommit)
 //!   closure, [`SyncHint`](storage_commit::SyncHint), and
 //!   [`BeaconWitnessCommit`](storage_commit::BeaconWitnessCommit) payload
@@ -25,6 +26,7 @@ pub mod manifest;
 pub mod quorum_certificate;
 pub mod roots;
 pub mod storage_commit;
+pub mod timeout;
 pub mod vote;
 
 pub use block::{

@@ -19,7 +19,7 @@ use hyperscale_types::{
     QuorumCertificate, ReadySignal, Round, RoutableTransaction, ShardGroupId, ShardWitness,
     SkipEpochCert, SkipRequest, SkipRequestVerifyError, SpcEmptyViewMsg,
     SpcEmptyViewMsgVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError, SpcProposalObject,
-    SpcProposalObjectVerifyError, SpcView, StateRoot, StateRootVerifyError, StoredReceipt,
+    SpcProposalObjectVerifyError, SpcView, StateRoot, StateRootVerifyError, StoredReceipt, Timeout,
     TransactionRoot, TxOutcome, TxRootVerifyError, ValidatorId, Verifiable, Verified, VotePower,
     WaveId, WeightedTimestamp,
 };
@@ -128,6 +128,24 @@ pub enum ProtocolEvent {
     UnverifiedBlockVoteReceived {
         /// Raw block vote off the wire.
         vote: BlockVote,
+    },
+
+    /// Our own locally-signed timeout, routed back to the state machine for
+    /// the local `TimeoutKeeper`. Produced only by the sign-and-broadcast
+    /// handler; wire-arrived timeouts take the
+    /// [`Self::UnverifiedTimeoutReceived`] path.
+    VerifiedTimeoutReceived {
+        /// Our locally-signed timeout, sealed via
+        /// [`Verified::<Timeout>::sign_local`].
+        timeout: Verified<Timeout>,
+    },
+
+    /// Received a timeout whose BLS share still needs to be checked. Produced
+    /// by the gossip handler. The carried `high_qc` is verified separately
+    /// (as a QC) only if it would advance the local `high_qc`.
+    UnverifiedTimeoutReceived {
+        /// Raw timeout off the wire.
+        timeout: Timeout,
     },
 
     /// Received a validator's "ready on shard" signal.

@@ -107,6 +107,12 @@ impl NodeStateMachine {
             ProtocolEvent::UnverifiedBlockVoteReceived { vote } => self
                 .shard_coordinator
                 .on_unverified_block_vote(&self.topology_snapshot, vote),
+            ProtocolEvent::VerifiedTimeoutReceived { timeout } => self
+                .shard_coordinator
+                .on_verified_timeout(&self.topology_snapshot, timeout),
+            ProtocolEvent::UnverifiedTimeoutReceived { timeout } => self
+                .shard_coordinator
+                .on_unverified_timeout(&self.topology_snapshot, &timeout),
             ProtocolEvent::ReadySignalReceived { signal } => {
                 self.shard_coordinator
                     .on_ready_signal_received(&self.topology_snapshot, signal);
