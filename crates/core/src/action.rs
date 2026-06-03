@@ -15,8 +15,8 @@ use hyperscale_types::{
     ProvisionsRoot, QuorumCertificate, ReadySignal, Round, RoutableTransaction, ShardGroupId,
     ShardWitness, SharedCertificates, SharedTransactions, SkipEpochCert, SkipRequest,
     SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject, SpcView, StateRoot,
-    SubstateEntry, TopologySnapshot, TransactionRoot, TransactionStatus, TxHash, TxOutcome,
-    ValidatorId, Verifiable, Verified, VotePower, WaveId, WeightedTimestamp,
+    SubstateEntry, Timeout, TopologySnapshot, TransactionRoot, TransactionStatus, TxHash,
+    TxOutcome, ValidatorId, Verifiable, Verified, VotePower, WaveId, WeightedTimestamp,
 };
 
 use crate::{CommitSource, FetchAbandon, FetchRequest, ProtocolEvent, TimerId};
@@ -368,6 +368,22 @@ pub enum Action {
         /// The block hash this QC verification is associated with (for correlation).
         /// This is the hash of the block whose header contains this QC as `parent_qc`.
         block_hash: BlockHash,
+    },
+
+    /// Verify a wire timeout's BLS share off-thread, then tally it.
+    ///
+    /// Emitted by the state machine after the cheap committee/shard screen
+    /// passes. The consensus crypto pool checks the share against
+    /// `voter_public_key` and feeds the result back as
+    /// `ProtocolEvent::VerifiedTimeoutReceived`, which the `TimeoutKeeper`
+    /// tallies — keeping per-timeout pairing checks off the shard loop thread
+    /// during a view change, as the vote path's aggregate verification does.
+    VerifyTimeout {
+        /// The unverified timeout share to check.
+        timeout: Timeout,
+        /// The voter's BLS public key, pre-resolved by the state machine from
+        /// the topology (where the committee-membership gate also runs).
+        voter_public_key: Bls12381G1PublicKey,
     },
 
     /// Verify a remote block header's QC for cross-shard deferral validation.
@@ -1126,6 +1142,7 @@ impl Action {
             // consensus; plus beacon per-epoch crypto + sign work.
             Self::VerifyAndBuildQuorumCertificate { .. }
             | Self::VerifyQcSignature { .. }
+            | Self::VerifyTimeout { .. }
             | Self::VerifyRemoteHeaderQc { .. }
             | Self::VerifyTransactionRoot { .. }
             | Self::VerifyProvisionRoot { .. }
@@ -1180,6 +1197,7 @@ impl Action {
         match self {
             Self::VerifyAndBuildQuorumCertificate { .. }
             | Self::VerifyQcSignature { .. }
+            | Self::VerifyTimeout { .. }
             | Self::VerifyRemoteHeaderQc { .. }
             | Self::VerifyTransactionRoot { .. }
             | Self::VerifyProvisionRoot { .. }

@@ -67,6 +67,15 @@ impl TimeoutKeeper {
             .map_or(VotePower::ZERO, |r| r.total_power)
     }
 
+    /// Whether `voter`'s timeout for `round` is already tallied. Lets callers
+    /// skip re-verifying a retransmitted share the keeper would dedup anyway.
+    #[must_use]
+    pub fn contains(&self, round: Round, voter: ValidatorId) -> bool {
+        self.rounds
+            .get(&round)
+            .is_some_and(|r| r.by_voter.contains_key(&voter))
+    }
+
     /// Every `high_qc` carried by a timeout for `round`, sorted by QC round
     /// descending. The pacemaker walks these and adopts the highest that
     /// *verifies*: a Byzantine timeout's `high_qc` is unverified here (only its
@@ -144,6 +153,20 @@ mod tests {
         // Distinct voter: accepted, power accumulates.
         assert!(keeper.record(timeout(5, 1, 9), VotePower::new(1)));
         assert_eq!(keeper.power(r), VotePower::new(2));
+    }
+
+    #[test]
+    fn contains_reports_tallied_voters() {
+        let mut keeper = TimeoutKeeper::new();
+        let r = Round::new(5);
+
+        assert!(!keeper.contains(r, ValidatorId::new(7)));
+        keeper.record(timeout(5, 1, 7), VotePower::new(1));
+        assert!(keeper.contains(r, ValidatorId::new(7)));
+
+        // A different voter or round is not present.
+        assert!(!keeper.contains(r, ValidatorId::new(8)));
+        assert!(!keeper.contains(Round::new(6), ValidatorId::new(7)));
     }
 
     #[test]

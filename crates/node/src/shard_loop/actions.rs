@@ -64,6 +64,7 @@ where
             | Action::BuildProposal { .. }
             | Action::VerifyAndBuildQuorumCertificate { .. }
             | Action::VerifyQcSignature { .. }
+            | Action::VerifyTimeout { .. }
             | Action::VerifyRemoteHeaderQc { .. }
             | Action::VerifyStateRoot { .. }
             | Action::VerifyBeaconWitnessRoot { .. }

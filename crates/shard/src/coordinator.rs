@@ -83,8 +83,8 @@ use hyperscale_types::{
     CertifiedBlockHeader, FinalizedWave, LocalReceiptRoot, LocalReceiptRootVerifyError,
     ProvisionRootVerifyError, ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions,
     ProvisionsRoot, QcContext, QcVerifyError, QuorumCertificate, Round, RoutableTransaction,
-    StateRoot, StateRootVerifyError, Timeout, TimeoutContext, TopologySnapshot, TransactionRoot,
-    TxHash, TxRootVerifyError, ValidatorId, Verifiable, Verified, Verify, VotePower, derive_leaves,
+    StateRoot, StateRootVerifyError, Timeout, TopologySnapshot, TransactionRoot, TxHash,
+    TxRootVerifyError, ValidatorId, Verifiable, Verified, Verify, VotePower, derive_leaves,
     missed_proposals_since_prev_commit,
 };
 use tracing::field::Empty;
@@ -3108,7 +3108,11 @@ impl ShardCoordinator {
         topology_snapshot.voting_power(voter)
     }
 
-    /// Verify a wire timeout's BLS share, then tally it.
+    /// Screen a wire timeout, then delegate its BLS share verification to the
+    /// consensus crypto pool. The verified share returns as
+    /// `ProtocolEvent::VerifiedTimeoutReceived` and is tallied by
+    /// [`Self::on_verified_timeout`] — keeping per-timeout pairing checks off
+    /// the shard loop thread during a view change, as the vote path does.
     pub fn on_unverified_timeout(
         &mut self,
         topology_snapshot: &TopologySnapshot,
@@ -3118,7 +3122,7 @@ impl ShardCoordinator {
             return Vec::new();
         }
         // Only this shard's committee drives its pacemaker. Reject outsiders
-        // before spending a BLS verify on them; `on_verified_timeout` enforces
+        // before spending a BLS verify on them; `on_verified_timeout` re-checks
         // the same bound for locally echoed timeouts.
         if self
             .committee_timeout_power(topology_snapshot, timeout.voter())
@@ -3127,17 +3131,22 @@ impl ShardCoordinator {
             warn!(validator = ?self.me, voter = ?timeout.voter(), "Dropping timeout from non-committee validator");
             return Vec::new();
         }
-        let Some(pubkey) = topology_snapshot.public_key(timeout.voter()) else {
+        // Skip rounds we've advanced past and voters already tallied: such a
+        // share would verify and then be dropped by `on_verified_timeout`, so
+        // screen it here rather than spend a pairing check. Mirrors the vote
+        // path, which drops a seen voter before delegating crypto.
+        if timeout.round() < self.view_change.view
+            || self.timeouts.contains(timeout.round(), timeout.voter())
+        {
+            return Vec::new();
+        }
+        let Some(voter_public_key) = topology_snapshot.public_key(timeout.voter()) else {
             return Vec::new();
         };
-        let Ok(verified) = timeout.verify(&TimeoutContext {
-            network: topology_snapshot.network(),
-            voter_public_key: &pubkey,
-        }) else {
-            warn!(validator = ?self.me, voter = ?timeout.voter(), "Dropping timeout with invalid BLS share");
-            return Vec::new();
-        };
-        self.on_verified_timeout(topology_snapshot, verified)
+        vec![Action::VerifyTimeout {
+            timeout: timeout.clone(),
+            voter_public_key,
+        }]
     }
 
     /// Tally a verified timeout: amplify at f+1 (Bracha), advance at 2f+1.
@@ -4359,6 +4368,67 @@ mod tests {
                 .iter()
                 .any(|a| matches!(a, Action::SignAndBroadcastTimeout { .. })),
             "f+1 committee timeouts should amplify",
+        );
+    }
+
+    #[test]
+    fn on_unverified_timeout_delegates_committee_share() {
+        // Wire timeouts are screened on the shard loop thread, then their BLS
+        // share is verified off-thread via `Action::VerifyTimeout`. Outsiders,
+        // stale rounds, and already-tallied voters are dropped before delegating
+        // — no pairing check is spent on a share that would be discarded.
+        let (mut state, topology) = make_test_state();
+        let shard = ShardGroupId::new(0);
+        let round = state.view();
+        let net = NetworkDefinition::simulator();
+        let mk = |voter: u64, round: Round| {
+            Timeout::new(
+                &net,
+                shard,
+                round,
+                QuorumCertificate::genesis(shard),
+                ValidatorId::new(voter),
+                &generate_bls_keypair(),
+            )
+        };
+
+        // Committee member, current round: delegated for off-thread verify.
+        let actions = state.on_unverified_timeout(&topology, &mk(1, round));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::VerifyTimeout { .. })),
+            "a fresh committee timeout should be delegated",
+        );
+
+        // Outsider and stale round: dropped without delegating crypto.
+        assert!(
+            state
+                .on_unverified_timeout(&topology, &mk(9, round))
+                .is_empty()
+        );
+        assert!(
+            state
+                .on_unverified_timeout(&topology, &mk(1, Round::INITIAL))
+                .is_empty()
+        );
+
+        // Already tallied: a retransmit is screened out before re-verifying.
+        state.timeouts.record(
+            Verified::<Timeout>::sign_local(
+                &net,
+                shard,
+                round,
+                QuorumCertificate::genesis(shard),
+                ValidatorId::new(2),
+                &generate_bls_keypair(),
+            ),
+            VotePower::new(1),
+        );
+        assert!(
+            state
+                .on_unverified_timeout(&topology, &mk(2, round))
+                .is_empty()
         );
     }
 

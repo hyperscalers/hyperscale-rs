@@ -22,7 +22,7 @@ use hyperscale_types::{
     NetworkDefinition, PreparedCommit, ProposerTimestamp, ProvisionHash, ProvisionTxRootsContext,
     ProvisionTxRootsMap, Provisions, ProvisionsRoot, ProvisionsRootContext, QcContext,
     QuorumCertificate, ReadySignal, Round, RoutableTransaction, ShardGroupId, StateRoot,
-    StateRootContext, StoredReceipt, Timeout, TopologySnapshot, TransactionRoot,
+    StateRootContext, StoredReceipt, Timeout, TimeoutContext, TopologySnapshot, TransactionRoot,
     TransactionRootContext, ValidatorId, Verifiable, Verified, Verify, VotePower,
     WeightedTimestamp, block_header_message, block_vote_message, certified_block_header_message,
     compute_waves,
@@ -758,6 +758,28 @@ where
             ctx.network.notify(&recipients, &gossip);
             // Feed our own signed timeout back for local TimeoutKeeper tracking.
             ctx.notify_protocol(ProtocolEvent::VerifiedTimeoutReceived { timeout: verified });
+        }
+
+        Action::VerifyTimeout {
+            timeout,
+            voter_public_key,
+        } => {
+            let start = std::time::Instant::now();
+            let result = timeout.verify(&TimeoutContext {
+                network: ctx.topology_snapshot.network(),
+                voter_public_key: &voter_public_key,
+            });
+            record_signature_verification_latency("timeout", start.elapsed().as_secs_f64());
+            match result {
+                Ok(verified) => {
+                    ctx.notify_protocol(ProtocolEvent::VerifiedTimeoutReceived {
+                        timeout: verified,
+                    });
+                }
+                Err(_) => {
+                    tracing::warn!(voter = ?timeout.voter(), "Dropping timeout with invalid BLS share");
+                }
+            }
         }
 
         Action::BroadcastCertifiedBlockHeader { certified_header } => {

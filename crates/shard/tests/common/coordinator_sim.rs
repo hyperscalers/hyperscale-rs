@@ -40,9 +40,9 @@ use hyperscale_types::{
     ProposerTimestamp, ProvisionRootVerifyError, ProvisionTxRootsContext, ProvisionTxRootsMap,
     ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, ProvisionsRootContext, QcContext,
     QcVerifyError, QuorumCertificate, ReadySignal, Round, RoutableTransaction, ShardGroupId,
-    StateRoot, StateRootContext, StateRootVerifyError, StoredReceipt, Timeout, TopologySnapshot,
-    TransactionRoot, TransactionRootContext, TxHash, TxRootVerifyError, ValidatorId, Verifiable,
-    Verified, Verify, VotePower, ready_signal_message,
+    StateRoot, StateRootContext, StateRootVerifyError, StoredReceipt, Timeout, TimeoutContext,
+    TopologySnapshot, TransactionRoot, TransactionRootContext, TxHash, TxRootVerifyError,
+    ValidatorId, Verifiable, Verified, Verify, VotePower, ready_signal_message,
 };
 
 use crate::common::fixtures::build_genesis_block;
@@ -934,6 +934,23 @@ impl ShardCoordinatorSim {
                     to_idx: emitter_idx,
                     event: SimEvent::VerifiedTimeout { timeout: verified },
                 });
+            }
+            Action::VerifyTimeout {
+                timeout,
+                voter_public_key,
+            } => {
+                // Mirror the production handler: the consensus crypto pool
+                // verifies the share (inline here) and feeds the verified
+                // timeout back to the emitter's `TimeoutKeeper`.
+                if let Ok(verified) = timeout.verify(&TimeoutContext {
+                    network: &self.network,
+                    voter_public_key: &voter_public_key,
+                }) {
+                    self.loopback_q.push_back(Envelope {
+                        to_idx: emitter_idx,
+                        event: SimEvent::VerifiedTimeout { timeout: verified },
+                    });
+                }
             }
             // `BroadcastCertifiedBlockHeader` is cross-shard
             // light-client gossip; the single-shard sim has
