@@ -2685,7 +2685,14 @@ impl ShardCoordinator {
         let state_root_verified = self.verification.is_state_root_verified(&block_hash);
         let parent_state_root = self.committed_state_root;
         let parent_block_height = self.committed_height;
-        let weighted_ts = certified.qc_verified().weighted_timestamp();
+        // The QC's `weighted_timestamp` rides outside the signed message, so a
+        // forged network QC could carry one below the chain's clock. Clamp it to
+        // the prior committed value: the deadlines keyed off `committed_ts`
+        // (dedup retention, validity windows) must never run backwards.
+        let weighted_ts = certified
+            .qc_verified()
+            .weighted_timestamp()
+            .max(self.committed_ts);
 
         let (abandon, witness) = self.record_block_committed(
             topology_snapshot,
