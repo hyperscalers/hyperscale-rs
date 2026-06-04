@@ -43,6 +43,7 @@ use hyperscale_shard::{ShardConsensusConfig, ShardCoordinator};
 use hyperscale_storage::RecoveredState;
 use hyperscale_types::{
     Block, LocalTimestamp, ShardGroupId, StateRoot, TopologySnapshot, ValidatorId,
+    WeightedTimestamp,
 };
 use tracing::instrument;
 
@@ -57,9 +58,6 @@ use tracing::instrument;
 /// `NodeHost` fires a `BlockSyncReadyToApply` event into this state machine,
 /// which routes it to shard consensus.
 pub struct NodeStateMachine {
-    /// Network topology — passed by reference to subsystem methods.
-    topology_snapshot: Arc<TopologySnapshot>,
-
     /// Beacon-chain consensus state (PC + SPC + skip + adoption).
     /// One coordinator per vnode; all vnodes on the same host share an
     /// `Arc<dyn BeaconStorage>` on the runner side via [`ProcessIo`].
@@ -119,7 +117,6 @@ impl NodeStateMachine {
     pub fn new(
         me: ValidatorId,
         local_shard: ShardGroupId,
-        topology_snapshot: Arc<TopologySnapshot>,
         shard_config: &ShardConsensusConfig,
         recovered: RecoveredState,
         beacon_coordinator: BeaconCoordinator,
@@ -156,7 +153,6 @@ impl NodeStateMachine {
             ),
             outbound_provisions: OutboundProvisionTracker::new(provision_store),
             remote_headers_coordinator: RemoteHeaderCoordinator::new(local_shard),
-            topology_snapshot,
             now: LocalTimestamp::ZERO,
             me,
             local_shard,
@@ -180,7 +176,7 @@ impl NodeStateMachine {
     /// Get the current topology snapshot.
     #[must_use]
     pub fn topology(&self) -> &TopologySnapshot {
-        &self.topology_snapshot
+        self.beacon_coordinator.current_topology_snapshot()
     }
 
     /// Get the current topology snapshot as an `Arc`, for sites that
@@ -190,7 +186,18 @@ impl NodeStateMachine {
     /// on [`ActionContext`](hyperscale_core::ActionContext).
     #[must_use]
     pub const fn topology_arc(&self) -> &Arc<TopologySnapshot> {
-        &self.topology_snapshot
+        self.beacon_coordinator.current_topology_snapshot()
+    }
+
+    /// Resolve the topology governing a weighted timestamp's window —
+    /// the committee that signed an artifact attested at `wt`, looked up
+    /// from the beacon coordinator's schedule. The verification resolver
+    /// for cross-shard artifacts; `None` when `wt`'s epoch is outside the
+    /// in-memory window (past retention, or beyond the lookahead). Use
+    /// [`topology`](Self::topology) for routing, never this.
+    #[must_use]
+    pub fn topology_for(&self, wt: WeightedTimestamp) -> Option<Arc<TopologySnapshot>> {
+        self.beacon_coordinator.topology_for(wt)
     }
 
     /// Get a reference to the mempool coordinator.

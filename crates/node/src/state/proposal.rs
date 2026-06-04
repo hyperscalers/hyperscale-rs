@@ -64,7 +64,7 @@ impl NodeStateMachine {
         let inputs = self.gather_proposal_inputs(pending_txs, pending_certs);
 
         self.shard_coordinator.try_propose(
-            &self.topology_snapshot,
+            self.beacon_coordinator.current_topology_snapshot(),
             &inputs.ready_txs,
             inputs.finalized_waves,
             inputs.provisions,

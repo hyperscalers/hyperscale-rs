@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use crossbeam::channel::{Receiver, Sender, unbounded};
-use hyperscale_beacon::coordinator::BeaconCoordinator;
+use hyperscale_beacon::coordinator::{BeaconCoordinator, TOPOLOGY_SCHEDULE_RETENTION_EPOCHS};
 use hyperscale_beacon::genesis::build_genesis_beacon_state;
 use hyperscale_beacon::proposal_pool::BeaconProposalPool;
 use hyperscale_core::{ProtocolEvent, TimerId};
@@ -28,7 +28,7 @@ use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconStorage, RecoveredState, ShardChainReader};
 use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage};
 use hyperscale_types::{
-    BeaconGenesisConfig, BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey,
+    BeaconGenesisConfig, BeaconState, BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey,
     CertifiedBeaconBlock, CertifiedBlock, GenesisPool, GenesisValidator, LocalTimestamp,
     MIN_STAKE_FLOOR, NodeId, Randomness, ShardGroupId, Stake, StakePoolId, TopologySnapshot,
     TransactionStatus, TxHash, ValidatorId, ValidatorInfo, ValidatorSet, Verified, VotePower,
@@ -309,6 +309,15 @@ impl SimulationRunner {
                 beacon_latest_state.current_epoch.next(),
             ));
 
+            // Load the topology-history window so each coordinator's
+            // schedule resumes with its full retention of committee
+            // snapshots, not just the latest.
+            let beacon_history: Vec<BeaconState> = beacon_storage
+                .recent_states(TOPOLOGY_SCHEDULE_RETENTION_EPOCHS)
+                .into_iter()
+                .map(|state| state.as_ref().clone())
+                .collect();
+
             let mut vnode_inits: Vec<VnodeInit> = Vec::with_capacity(host_vnodes.len());
             for (shard, validator_idxs) in &by_shard {
                 let (provision_store, tx_store, exec_cert_store, fw_store) =
@@ -322,7 +331,7 @@ impl SimulationRunner {
 
                     let beacon_coordinator = BeaconCoordinator::new(
                         Arc::clone(&beacon_latest_block),
-                        vec![(*beacon_latest_state).clone()],
+                        beacon_history.clone(),
                         validator_id,
                         *shard,
                         beacon_network.clone(),
@@ -333,7 +342,6 @@ impl SimulationRunner {
                     let state = NodeStateMachine::new(
                         validator_id,
                         *shard,
-                        Arc::clone(&shared_topology),
                         &ShardConsensusConfig::default(),
                         RecoveredState::default(),
                         beacon_coordinator,

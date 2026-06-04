@@ -26,7 +26,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use arc_swap::ArcSwap;
 use crossbeam::channel::{Receiver, Sender, unbounded};
 use hex::encode as hex_encode;
-use hyperscale_beacon::coordinator::BeaconCoordinator;
+use hyperscale_beacon::coordinator::{BeaconCoordinator, TOPOLOGY_SCHEDULE_RETENTION_EPOCHS};
 use hyperscale_beacon::genesis::build_genesis_beacon_state;
 use hyperscale_beacon::proposal_pool::BeaconProposalPool;
 use hyperscale_core::{ProtocolEvent, TimerId};
@@ -49,7 +49,7 @@ use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconStorage, ShardChainReader};
 use hyperscale_storage_rocksdb::{RocksDbShardStorage, SharedStorage};
 use hyperscale_types::{
-    BeaconChainConfig, BeaconGenesisConfig, Block, BlockHeight, Bls12381G1PrivateKey,
+    BeaconChainConfig, BeaconGenesisConfig, BeaconState, Block, BlockHeight, Bls12381G1PrivateKey,
     CertifiedBeaconBlock, CertifiedBlock, GenesisPool, GenesisValidator, InFlightCount,
     LocalTimestamp, MAX_TX_IN_FLIGHT, MIN_STAKE_FLOOR, NodeId, Randomness, RoutableTransaction,
     ShardGroupId, Stake, StakePoolId, TopologySnapshot, TransactionStatus, TxHash, ValidatorId,
@@ -499,6 +499,17 @@ impl ProductionRunnerBuilder {
             beacon_latest_state.current_epoch.next(),
         ));
 
+        // Load the topology-history window so each coordinator's schedule
+        // resumes with its full retention of committee snapshots, not just
+        // the latest — cross-shard artifacts back to `RETENTION_HORIZON`
+        // stay verifiable immediately after restart.
+        let beacon_history: Vec<BeaconState> = self
+            .beacon_storage
+            .recent_states(TOPOLOGY_SCHEDULE_RETENTION_EPOCHS)
+            .into_iter()
+            .map(|state| state.as_ref().clone())
+            .collect();
+
         let vnode_inits: Vec<VnodeInit> = vnode_configs
             .into_iter()
             .map(|cfg| {
@@ -525,7 +536,7 @@ impl ProductionRunnerBuilder {
                 );
                 let beacon_coordinator = BeaconCoordinator::new(
                     Arc::clone(&beacon_latest_block),
-                    vec![(*beacon_latest_state).clone()],
+                    beacon_history.clone(),
                     cfg.validator_id,
                     cfg.local_shard,
                     beacon_network.clone(),
@@ -535,7 +546,6 @@ impl ProductionRunnerBuilder {
                 let state = NodeStateMachine::new(
                     cfg.validator_id,
                     cfg.local_shard,
-                    Arc::clone(&shared_topology),
                     &shard_config,
                     recovered.clone(),
                     beacon_coordinator,

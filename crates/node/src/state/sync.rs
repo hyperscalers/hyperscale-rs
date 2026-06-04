@@ -16,7 +16,7 @@ impl NodeStateMachine {
         match event {
             ProtocolEvent::BlockSyncReadyToApply { certified } => {
                 self.shard_coordinator.on_sync_block_ready_to_apply(
-                    &self.topology_snapshot,
+                    self.beacon_coordinator.current_topology_snapshot(),
                     std::sync::Arc::unwrap_or_clone(certified),
                 )
             }
@@ -24,15 +24,20 @@ impl NodeStateMachine {
             // expected provisions + flush expected headers, all in one
             // pass.
             ProtocolEvent::BlockSyncComplete { .. } => {
-                let topo = &self.topology_snapshot;
+                let topo = self.beacon_coordinator.current_topology_snapshot();
                 let mut actions = self.shard_coordinator.on_block_sync_complete();
                 actions.extend(self.remote_headers_coordinator.flush_expected_headers(topo));
                 actions.extend(self.provisions_coordinator.flush_expected_provisions());
                 actions
             }
-            ProtocolEvent::CommittedStateRestored { height, hash, qc } => self
-                .shard_coordinator
-                .on_committed_state_restored(&self.topology_snapshot, height, hash, qc),
+            ProtocolEvent::CommittedStateRestored { height, hash, qc } => {
+                self.shard_coordinator.on_committed_state_restored(
+                    self.beacon_coordinator.current_topology_snapshot(),
+                    height,
+                    hash,
+                    qc,
+                )
+            }
             // Acknowledged but unused for now. Commit 4 wires
             // `RemoteHeaderCoordinator` to clear its per-shard "syncing"
             // flag here.

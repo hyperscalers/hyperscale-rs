@@ -46,16 +46,18 @@ use crate::state::{apply_epoch, apply_input_for};
 use crate::verification::{BeaconVerificationPipeline, SpcMsgKind};
 use crate::witness_fetcher::ShardWitnessFetchTracker;
 
-/// Epochs of committee history the coordinator keeps queryable in its
-/// [`topology_schedule`](BeaconCoordinator). Sized to cover the oldest
-/// cross-shard artifact any consumer would still verify
-/// (`RETENTION_HORIZON` worth of epochs) plus headroom for the lookahead
-/// neighbour and the integer-division floor.
+/// Depth of the coordinator's queryable committee-history window.
+///
+/// Sized to cover the oldest cross-shard artifact any consumer would
+/// still verify (`RETENTION_HORIZON` worth of epochs) plus headroom for
+/// the lookahead neighbour and the integer-division floor.
 ///
 /// **Not consensus-critical**: a node with a smaller value still
 /// produces the same chain, it just can't answer some historical
 /// topology queries. A node-local cache bound, not a protocol parameter.
-const TOPOLOGY_SCHEDULE_RETENTION_EPOCHS: u64 =
+/// Exposed so the runner loads exactly this many states from storage at
+/// boot to seed the schedule's restart history.
+pub const TOPOLOGY_SCHEDULE_RETENTION_EPOCHS: u64 =
     RETENTION_HORIZON.as_secs() / EPOCH_DURATION.as_secs() + 2;
 
 /// Per-vnode beacon-chain coordinator.

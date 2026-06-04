@@ -79,7 +79,6 @@ impl TestNodeBuilder {
 
     pub fn build(self) -> TestNode {
         let committee = TestCommittee::new(4, 7);
-        let topology = Arc::new(committee.topology_snapshot(self.num_shards));
         let me = committee.validator_id(self.local_idx);
         let local_shard = ShardGroupId::new(me.inner() % self.num_shards);
         let provision_store = Arc::new(ProvisionStore::new());
@@ -88,7 +87,6 @@ impl TestNodeBuilder {
         let node = NodeStateMachine::new(
             me,
             local_shard,
-            topology,
             &ShardConsensusConfig::default(),
             RecoveredState::default(),
             beacon_coordinator,

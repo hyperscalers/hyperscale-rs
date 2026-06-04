@@ -42,7 +42,7 @@ impl NodeStateMachine {
     pub(super) fn on_view_change_timer(&mut self) -> Vec<Action> {
         if let Some(actions) = self
             .shard_coordinator
-            .check_round_timeout(&self.topology_snapshot)
+            .check_round_timeout(self.beacon_coordinator.current_topology_snapshot())
         {
             actions
         } else {

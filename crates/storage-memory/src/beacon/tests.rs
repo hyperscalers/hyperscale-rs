@@ -1,6 +1,8 @@
+use std::sync::Arc;
+
 use hyperscale_storage::test_helpers::{make_test_beacon_block, make_test_beacon_state};
 use hyperscale_storage::{BeaconChainReader, BeaconChainWriter};
-use hyperscale_types::{BeaconBlockHash, Epoch};
+use hyperscale_types::{BeaconBlockHash, BeaconState, Epoch};
 
 use super::core::SimBeaconStorage;
 
@@ -61,6 +63,36 @@ fn latest_committed_returns_paired_block_and_state() {
     let (block, state) = store.latest_committed().expect("latest");
     assert_eq!(block.epoch(), Epoch::new(11));
     assert_eq!(state.current_epoch, Epoch::new(11));
+}
+
+#[test]
+fn recent_states_walks_back_oldest_first_capped_at_count() {
+    let store = SimBeaconStorage::new();
+    for e in 1..=5u64 {
+        store.commit_beacon_block(
+            &make_test_beacon_block(e, b"block"),
+            &make_test_beacon_state(e, b"state"),
+        );
+    }
+
+    // count larger than the chain → every committed state, oldest first.
+    // Epoch 0 was never committed and is skipped, not truncated.
+    let epochs = |states: Vec<Arc<BeaconState>>| {
+        states
+            .iter()
+            .map(|s| s.current_epoch.inner())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(epochs(store.recent_states(10)), vec![1, 2, 3, 4, 5]);
+    // count caps the walk to the newest `count` epochs.
+    assert_eq!(epochs(store.recent_states(2)), vec![4, 5]);
+    assert_eq!(epochs(store.recent_states(1)), vec![5]);
+}
+
+#[test]
+fn recent_states_empty_chain_is_empty() {
+    let store = SimBeaconStorage::new();
+    assert!(store.recent_states(4).is_empty());
 }
 
 #[test]

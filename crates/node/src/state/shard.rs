@@ -88,7 +88,7 @@ impl NodeStateMachine {
                 // Route through the centralized remote header coordinator.
                 // Structural pre-checks happen there; downstream consumers
                 // receive headers via `RemoteHeaderAdmitted`.
-                let topology = &self.topology_snapshot;
+                let topology = self.beacon_coordinator.current_topology_snapshot();
                 self.remote_headers_coordinator.on_remote_header_received(
                     topology,
                     certified_header,
@@ -103,37 +103,53 @@ impl NodeStateMachine {
                 .on_verified_remote_header_received(certified_header, sender),
             ProtocolEvent::VerifiedBlockVoteReceived { vote } => self
                 .shard_coordinator
-                .on_verified_block_vote(&self.topology_snapshot, vote),
-            ProtocolEvent::UnverifiedBlockVoteReceived { vote } => self
-                .shard_coordinator
-                .on_unverified_block_vote(&self.topology_snapshot, vote),
+                .on_verified_block_vote(self.beacon_coordinator.current_topology_snapshot(), vote),
+            ProtocolEvent::UnverifiedBlockVoteReceived { vote } => {
+                self.shard_coordinator.on_unverified_block_vote(
+                    self.beacon_coordinator.current_topology_snapshot(),
+                    vote,
+                )
+            }
             ProtocolEvent::VerifiedTimeoutReceived { timeout } => self
                 .shard_coordinator
-                .on_verified_timeout(&self.topology_snapshot, timeout),
-            ProtocolEvent::UnverifiedTimeoutReceived { timeout } => self
-                .shard_coordinator
-                .on_unverified_timeout(&self.topology_snapshot, &timeout),
+                .on_verified_timeout(self.beacon_coordinator.current_topology_snapshot(), timeout),
+            ProtocolEvent::UnverifiedTimeoutReceived { timeout } => {
+                self.shard_coordinator.on_unverified_timeout(
+                    self.beacon_coordinator.current_topology_snapshot(),
+                    &timeout,
+                )
+            }
             ProtocolEvent::ReadySignalReceived { signal } => {
-                self.shard_coordinator
-                    .on_ready_signal_received(&self.topology_snapshot, signal);
+                self.shard_coordinator.on_ready_signal_received(
+                    self.beacon_coordinator.current_topology_snapshot(),
+                    signal,
+                );
                 Vec::new()
             }
-            ProtocolEvent::BlockReadyToCommit { certified, source } => self
-                .shard_coordinator
-                .on_block_ready_to_commit(&self.topology_snapshot, certified, source),
+            ProtocolEvent::BlockReadyToCommit { certified, source } => {
+                self.shard_coordinator.on_block_ready_to_commit(
+                    self.beacon_coordinator.current_topology_snapshot(),
+                    certified,
+                    source,
+                )
+            }
             ProtocolEvent::QuorumCertificateResult {
                 block_hash,
                 qc,
                 verified_votes,
             } => self.shard_coordinator.on_qc_result(
-                &self.topology_snapshot,
+                self.beacon_coordinator.current_topology_snapshot(),
                 block_hash,
                 qc,
                 verified_votes,
             ),
-            ProtocolEvent::QcSignatureVerified { block_hash, result } => self
-                .shard_coordinator
-                .on_qc_signature_verified(&self.topology_snapshot, block_hash, result),
+            ProtocolEvent::QcSignatureVerified { block_hash, result } => {
+                self.shard_coordinator.on_qc_signature_verified(
+                    self.beacon_coordinator.current_topology_snapshot(),
+                    block_hash,
+                    result,
+                )
+            }
             ProtocolEvent::RemoteHeaderQcVerified {
                 shard,
                 height,
@@ -142,7 +158,7 @@ impl NodeStateMachine {
             } => self
                 .remote_headers_coordinator
                 .on_remote_header_qc_verified(
-                    &self.topology_snapshot,
+                    self.beacon_coordinator.current_topology_snapshot(),
                     shard,
                     height,
                     sender,
@@ -169,27 +185,55 @@ impl NodeStateMachine {
                 );
                 actions
             }
-            ProtocolEvent::TransactionRootVerified { block_hash, result } => self
-                .shard_coordinator
-                .on_transaction_root_verified(&self.topology_snapshot, block_hash, result),
-            ProtocolEvent::CertificateRootVerified { block_hash, result } => self
-                .shard_coordinator
-                .on_certificate_root_verified(&self.topology_snapshot, block_hash, result),
-            ProtocolEvent::LocalReceiptRootVerified { block_hash, result } => self
-                .shard_coordinator
-                .on_local_receipt_root_verified(&self.topology_snapshot, block_hash, result),
-            ProtocolEvent::ProvisionsRootVerified { block_hash, result } => self
-                .shard_coordinator
-                .on_provisions_root_verified(&self.topology_snapshot, block_hash, result),
-            ProtocolEvent::ProvisionTxRootsVerified { block_hash, result } => self
-                .shard_coordinator
-                .on_provision_tx_roots_verified(&self.topology_snapshot, block_hash, result),
-            ProtocolEvent::BeaconWitnessRootVerified { block_hash, result } => self
-                .shard_coordinator
-                .on_beacon_witness_root_verified(&self.topology_snapshot, block_hash, result),
-            ProtocolEvent::StateRootVerified { block_hash, result } => self
-                .shard_coordinator
-                .on_state_root_verified(&self.topology_snapshot, block_hash, result),
+            ProtocolEvent::TransactionRootVerified { block_hash, result } => {
+                self.shard_coordinator.on_transaction_root_verified(
+                    self.beacon_coordinator.current_topology_snapshot(),
+                    block_hash,
+                    result,
+                )
+            }
+            ProtocolEvent::CertificateRootVerified { block_hash, result } => {
+                self.shard_coordinator.on_certificate_root_verified(
+                    self.beacon_coordinator.current_topology_snapshot(),
+                    block_hash,
+                    result,
+                )
+            }
+            ProtocolEvent::LocalReceiptRootVerified { block_hash, result } => {
+                self.shard_coordinator.on_local_receipt_root_verified(
+                    self.beacon_coordinator.current_topology_snapshot(),
+                    block_hash,
+                    result,
+                )
+            }
+            ProtocolEvent::ProvisionsRootVerified { block_hash, result } => {
+                self.shard_coordinator.on_provisions_root_verified(
+                    self.beacon_coordinator.current_topology_snapshot(),
+                    block_hash,
+                    result,
+                )
+            }
+            ProtocolEvent::ProvisionTxRootsVerified { block_hash, result } => {
+                self.shard_coordinator.on_provision_tx_roots_verified(
+                    self.beacon_coordinator.current_topology_snapshot(),
+                    block_hash,
+                    result,
+                )
+            }
+            ProtocolEvent::BeaconWitnessRootVerified { block_hash, result } => {
+                self.shard_coordinator.on_beacon_witness_root_verified(
+                    self.beacon_coordinator.current_topology_snapshot(),
+                    block_hash,
+                    result,
+                )
+            }
+            ProtocolEvent::StateRootVerified { block_hash, result } => {
+                self.shard_coordinator.on_state_root_verified(
+                    self.beacon_coordinator.current_topology_snapshot(),
+                    block_hash,
+                    result,
+                )
+            }
             ProtocolEvent::ProposalBuilt {
                 height,
                 round,
@@ -199,7 +243,7 @@ impl NodeStateMachine {
                 finalized_waves,
                 provisions,
             } => self.shard_coordinator.on_proposal_built(
-                &self.topology_snapshot,
+                self.beacon_coordinator.current_topology_snapshot(),
                 height,
                 round,
                 &block,
@@ -226,9 +270,12 @@ impl NodeStateMachine {
                 }
                 actions
             }
-            ProtocolEvent::FinalizedWavesAdmitted { waves } => self
-                .shard_coordinator
-                .on_finalized_waves_admitted(&self.topology_snapshot, &waves),
+            ProtocolEvent::FinalizedWavesAdmitted { waves } => {
+                self.shard_coordinator.on_finalized_waves_admitted(
+                    self.beacon_coordinator.current_topology_snapshot(),
+                    &waves,
+                )
+            }
             _ => unreachable!("non-shard event routed to handle_shard"),
         }
     }
@@ -284,7 +331,7 @@ impl NodeStateMachine {
         }
 
         self.shard_coordinator.on_block_header(
-            &self.topology_snapshot,
+            self.beacon_coordinator.current_topology_snapshot(),
             header,
             manifest,
             |h| {
@@ -317,7 +364,7 @@ impl NodeStateMachine {
         let inputs = self.gather_proposal_inputs(pending_tx_count, pending_cert_count);
 
         self.shard_coordinator.on_qc_formed(
-            &self.topology_snapshot,
+            self.beacon_coordinator.current_topology_snapshot(),
             block_hash,
             qc,
             &inputs.ready_txs,
@@ -344,16 +391,16 @@ impl NodeStateMachine {
         // drives each tx in `block.certificates` to its terminal state
         // (Completed + tombstone). Same behavior for consensus and sync
         // commit paths.
-        actions.extend(
-            self.mempool_coordinator
-                .on_block_committed(&self.topology_snapshot, certified),
-        );
+        actions.extend(self.mempool_coordinator.on_block_committed(
+            self.beacon_coordinator.current_topology_snapshot(),
+            certified,
+        ));
 
         // Remote header coordinator: update liveness and check for timeouts.
-        actions.extend(
-            self.remote_headers_coordinator
-                .on_block_committed(&self.topology_snapshot, certified),
-        );
+        actions.extend(self.remote_headers_coordinator.on_block_committed(
+            self.beacon_coordinator.current_topology_snapshot(),
+            certified,
+        ));
 
         // Provisions coordinator: prune + schedule fallback timeouts. Reads
         // provision hashes directly off the block — `Live` carries them
@@ -388,10 +435,10 @@ impl NodeStateMachine {
         self.execution_coordinator
             .cleanup_committed_waves(certified.block().certificates());
 
-        actions.extend(
-            self.execution_coordinator
-                .on_block_committed(&self.topology_snapshot, certified),
-        );
+        actions.extend(self.execution_coordinator.on_block_committed(
+            self.beacon_coordinator.current_topology_snapshot(),
+            certified,
+        ));
 
         // Round voting: scan all incomplete waves and emit votes for
         // complete ones. Single path to execution voting — abort intents
@@ -400,7 +447,7 @@ impl NodeStateMachine {
         // validators at this height produce the same votes.
         actions.extend(
             self.execution_coordinator
-                .emit_vote_actions(&self.topology_snapshot),
+                .emit_vote_actions(self.beacon_coordinator.current_topology_snapshot()),
         );
 
         actions

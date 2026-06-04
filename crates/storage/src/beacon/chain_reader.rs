@@ -46,4 +46,27 @@ pub trait BeaconChainReader: Send + Sync {
     /// committed. Single read; the coordinator uses this on restart to
     /// resume live without walking the chain.
     fn latest_committed(&self) -> Option<(Arc<Verified<CertifiedBeaconBlock>>, Arc<BeaconState>)>;
+
+    /// Up to `count` most-recently-committed states, oldest first — the
+    /// boot-time topology history the runner threads into
+    /// `BeaconCoordinator::new` so the schedule resumes with its full
+    /// retention window of committee snapshots. Walks back from
+    /// [`latest_committed_epoch`](Self::latest_committed_epoch); empty if
+    /// the chain has no genesis yet. Missing epochs in the range are
+    /// skipped rather than truncating the walk.
+    fn recent_states(&self, count: u64) -> Vec<Arc<BeaconState>> {
+        let Some(latest) = self.latest_committed_epoch() else {
+            return Vec::new();
+        };
+        let oldest = Epoch::new(latest.inner().saturating_sub(count.saturating_sub(1)));
+        let mut states = Vec::new();
+        let mut epoch = oldest;
+        while epoch <= latest {
+            if let Some(state) = self.get_state_by_epoch(epoch) {
+                states.push(state);
+            }
+            epoch = epoch.next();
+        }
+        states
+    }
 }
