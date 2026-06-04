@@ -13,7 +13,7 @@
 use std::collections::HashSet;
 
 use hyperscale_types::{
-    Block, BlockHash, BlockHeader, BlockHeight, InFlightCount, ProvisionHash, QuorumCertificate,
+    BlockHash, BlockHeader, BlockHeight, InFlightCount, ProvisionHash, QuorumCertificate,
     ShardGroupId, StateRoot, TxHash, Verified, WaveId,
 };
 use tracing::warn;
@@ -55,17 +55,9 @@ impl<'a> ChainView<'a> {
         self.pending.get(block_hash)
     }
 
-    /// Look up a block by hash in the pending block map (if assembled).
-    /// Returns `None` if the block isn't pending or hasn't been constructed.
-    fn get_block(&self, block_hash: BlockHash) -> Option<Block> {
-        let pending = self.pending.get(block_hash)?;
-        let block = pending.block()?;
-        Some((**block).clone())
-    }
-
-    /// Header-only lookup, cheaper than `get_block` when only header fields
-    /// are needed. Pending blocks always carry their header even before full
-    /// assembly, so this succeeds in cases where `get_block` would fail.
+    /// Header-only lookup. Pending blocks always carry their header even
+    /// before full assembly, so this succeeds even when the body hasn't been
+    /// constructed yet.
     pub fn get_header(&self, block_hash: BlockHash) -> Option<&BlockHeader> {
         self.pending.get(block_hash).map(PendingBlock::header)
     }
@@ -117,10 +109,13 @@ impl<'a> ChainView<'a> {
     /// ancestor blocks. Used by the proposer (to filter duplicates) and
     /// validators (to reject blocks containing already-included items).
     ///
-    /// Two walks are fused: full blocks via `get_block` (assembled pending
-    /// blocks), then a manifest-only fallback for ancestors not yet
-    /// assembled. The just-committed block (at or below `committed_height`)
-    /// is covered separately by
+    /// The manifest carries the full tx / cert / provision hash lists for
+    /// every pending ancestor whether or not its body has assembled, so a
+    /// single walk reads from it uniformly. Reading the block body instead
+    /// would stop the walk at the first not-yet-assembled ancestor and drop
+    /// the dedup contributions of every assembled block below it. The
+    /// just-committed block (at or below `committed_height`) is covered
+    /// separately by
     /// [`CommitDedupIndex`](crate::commit_dedup::CommitDedupIndex)'s
     /// `contains_*` queries, populated synchronously inside
     /// [`crate::coordinator::ShardCoordinator::record_block_committed`].
@@ -133,33 +128,16 @@ impl<'a> ChainView<'a> {
         let mut provision_hashes: HashSet<ProvisionHash> = HashSet::new();
 
         let mut current_hash = parent_block_hash;
-        while let Some(block) = self.get_block(current_hash) {
-            if block.height() <= self.committed_height {
-                break;
-            }
-            for cert in block.certificates().iter() {
-                cert_ids.insert(cert.wave_id().clone());
-            }
-            for tx in block.transactions().iter() {
-                tx_hashes.insert(tx.hash());
-            }
-            current_hash = block.header().parent_block_hash();
-        }
-
-        let mut current_hash = parent_block_hash;
         while let Some(pending) = self.pending.get(current_hash) {
-            let h = pending.header().height();
-            if h <= self.committed_height {
+            if pending.header().height() <= self.committed_height {
                 break;
             }
             let manifest = pending.manifest();
-            if pending.block().is_none() {
-                for tx_hash in manifest.tx_hashes().iter() {
-                    tx_hashes.insert(*tx_hash);
-                }
-                for cert_id in manifest.cert_ids().iter() {
-                    cert_ids.insert(cert_id.clone());
-                }
+            for tx_hash in manifest.tx_hashes().iter() {
+                tx_hashes.insert(*tx_hash);
+            }
+            for cert_id in manifest.cert_ids().iter() {
+                cert_ids.insert(cert_id.clone());
             }
             for batch_hash in manifest.provision_hashes().iter() {
                 provision_hashes.insert(*batch_hash);
@@ -176,10 +154,11 @@ mod tests {
     use std::sync::Arc;
 
     use hyperscale_types::{
-        BeaconWitnessLeafCount, BeaconWitnessRoot, BlockManifest, BoundedVec, CertificateRoot,
-        Hash, LocalReceiptRoot, LocalTimestamp, ProposerTimestamp, ProvisionsRoot,
-        QuorumCertificate, Round, ShardGroupId, SignerBitfield, TransactionRoot, ValidatorId,
-        WeightedTimestamp, zero_bls_signature,
+        BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockManifest, BoundedVec,
+        CertificateRoot, Hash, LocalReceiptRoot, LocalTimestamp, ProposerTimestamp, ProvisionsRoot,
+        QuorumCertificate, Round, RoutableTransaction, ShardGroupId, SignerBitfield,
+        TransactionRoot, ValidatorId, Verifiable, WeightedTimestamp, test_utils,
+        zero_bls_signature,
     };
 
     use super::*;
@@ -249,36 +228,6 @@ mod tests {
     }
 
     #[test]
-    fn get_block_finds_assembled_pending_blocks() {
-        let hash_missing = bh(b"missing");
-
-        let pending_block = {
-            let mut pb = PendingBlock::from_manifest(
-                make_header(6, BlockHash::ZERO),
-                BlockManifest::default(),
-                LocalTimestamp::ZERO,
-            );
-            pb.construct_block().unwrap();
-            pb
-        };
-        let pending_hash = pending_block.header().hash();
-        let mut pending = PendingBlocks::new();
-        pending.insert(pending_block);
-
-        run_view(
-            0,
-            BlockHash::ZERO,
-            StateRoot::ZERO,
-            &pending,
-            None,
-            |view| {
-                assert!(view.get_block(pending_hash).is_some());
-                assert!(view.get_block(hash_missing).is_none());
-            },
-        );
-    }
-
-    #[test]
     fn get_header_returns_header_even_when_block_not_assembled() {
         let parent = bh(b"parent");
         let header = make_header(3, parent);
@@ -298,7 +247,10 @@ mod tests {
             &pending,
             None,
             |view| {
-                assert!(view.get_block(block_hash).is_none());
+                assert!(
+                    view.get_pending(block_hash)
+                        .is_some_and(|p| p.block().is_none())
+                );
                 let h = view.get_header(block_hash).expect("header available");
                 assert_eq!(h.height(), BlockHeight::new(3));
             },
@@ -331,13 +283,70 @@ mod tests {
             None,
             |view| {
                 assert!(
-                    view.get_block(block_hash).is_none(),
+                    view.get_pending(block_hash)
+                        .is_some_and(|p| p.block().is_none()),
                     "ancestor must stay manifest-only for this case",
                 );
                 let (cert_ids, _txs, _provisions) = view.collect_ancestor_hashes(block_hash);
                 assert!(
                     cert_ids.contains(&wave),
                     "manifest-only ancestor cert wave-id missing from dedup set",
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn collect_ancestor_hashes_covers_assembled_block_below_unassembled() {
+        // Chain above the committed tip: walk start `middle` (manifest-only) ->
+        // `low` (assembled, height 1) -> committed. `low`'s transaction must
+        // still land in the dedup set even though an unassembled ancestor sits
+        // between it and the walk start — otherwise a descendant could
+        // re-include a transaction already present above the committed tip.
+        let tx: Arc<Verifiable<RoutableTransaction>> =
+            Arc::new(Verifiable::from(test_utils::test_transaction(7)));
+        let tx_hash = tx.hash();
+        let low = Block::Live {
+            header: make_header(1, BlockHash::ZERO),
+            transactions: Arc::new(vec![tx].into()),
+            certificates: Arc::new(BoundedVec::new()),
+            provisions: Arc::new(BoundedVec::new()),
+        };
+        let low_pending = pending_from_block(&low);
+        let low_hash = low_pending.header().hash();
+
+        let middle = PendingBlock::from_manifest(
+            make_header(2, low_hash),
+            BlockManifest::default(),
+            LocalTimestamp::ZERO,
+        );
+        let middle_hash = middle.header().hash();
+
+        let mut pending = PendingBlocks::new();
+        pending.insert(low_pending);
+        pending.insert(middle);
+
+        run_view(
+            0,
+            BlockHash::ZERO,
+            StateRoot::ZERO,
+            &pending,
+            None,
+            |view| {
+                // Precondition: `low` is assembled, `middle` is not.
+                assert!(
+                    view.get_pending(low_hash)
+                        .is_some_and(|p| p.block().is_some())
+                );
+                assert!(
+                    view.get_pending(middle_hash)
+                        .is_some_and(|p| p.block().is_none())
+                );
+
+                let (_certs, tx_hashes, _provisions) = view.collect_ancestor_hashes(middle_hash);
+                assert!(
+                    tx_hashes.contains(&tx_hash),
+                    "assembled ancestor below an unassembled one dropped from dedup set",
                 );
             },
         );
