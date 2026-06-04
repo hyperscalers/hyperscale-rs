@@ -50,7 +50,7 @@ pub(super) fn run_shuffle_step(state: &mut BeaconState) {
     if epoch.inner() == 0 || !epoch.inner().is_multiple_of(SHUFFLE_INTERVAL_EPOCHS) {
         return;
     }
-    let shard_ids: Vec<ShardGroupId> = state.shard_committees.keys().copied().collect();
+    let shard_ids: Vec<ShardGroupId> = state.next_shard_committees.keys().copied().collect();
     for shard in shard_ids {
         // Bind the candidate set to validators whose status records
         // *this* shard. The global invariant `members ⇔ status ==
@@ -60,7 +60,7 @@ pub(super) fn run_shuffle_step(state: &mut BeaconState) {
         // to a skipped shuffle rather than picking from the wrong
         // shard.
         let ready_members: Vec<ValidatorId> = state
-            .shard_committees
+            .next_shard_committees
             .get(&shard)
             .expect("just iterated")
             .members
@@ -87,7 +87,7 @@ pub(super) fn run_shuffle_step(state: &mut BeaconState) {
         let victim = ready_members[idx];
 
         state
-            .shard_committees
+            .next_shard_committees
             .get_mut(&shard)
             .expect("present")
             .members
@@ -170,12 +170,12 @@ pub(super) fn diff_shard_committees(
         TransitionCause::MembershipChange
     };
     let mut shard_ids: BTreeSet<ShardGroupId> = pre_shard_members.keys().copied().collect();
-    shard_ids.extend(state.shard_committees.keys().copied());
+    shard_ids.extend(state.next_shard_committees.keys().copied());
     let mut transitions = BTreeMap::new();
     for shard in shard_ids {
         let prior = pre_shard_members.get(&shard).cloned().unwrap_or_default();
         let current = state
-            .shard_committees
+            .next_shard_committees
             .get(&shard)
             .map(|c| c.members.clone())
             .unwrap_or_default();
@@ -242,7 +242,7 @@ mod tests {
                 next_id += 1;
             }
             state
-                .shard_committees
+                .next_shard_committees
                 .insert(shard, ShardCommittee { members });
         }
         for _ in 0..pool_extras {
@@ -290,7 +290,7 @@ mod tests {
             .get_mut(&StakePoolId::new(0))
             .unwrap()
             .total_stake = Stake::from_attos(10 * MIN_STAKE_FLOOR.attos());
-        let initial_members = state.shard_committees[&ShardGroupId::new(0)]
+        let initial_members = state.next_shard_committees[&ShardGroupId::new(0)]
             .members
             .clone();
         let initial_pool = state.pooled_validators();
@@ -298,7 +298,7 @@ mod tests {
         let effects = apply_next_epoch(&mut state, &[]);
 
         assert_eq!(
-            state.shard_committees[&ShardGroupId::new(0)].members,
+            state.next_shard_committees[&ShardGroupId::new(0)].members,
             initial_members
         );
         assert_eq!(state.pooled_validators(), initial_pool);
@@ -315,19 +315,19 @@ mod tests {
         state.committee = (0u64..4).map(ValidatorId::new).collect();
         state.current_epoch = Epoch::new(SHUFFLE_INTERVAL_EPOCHS - 1);
 
-        let initial_shard_0 = state.shard_committees[&ShardGroupId::new(0)]
+        let initial_shard_0 = state.next_shard_committees[&ShardGroupId::new(0)]
             .members
             .clone();
-        let initial_shard_1 = state.shard_committees[&ShardGroupId::new(1)]
+        let initial_shard_1 = state.next_shard_committees[&ShardGroupId::new(1)]
             .members
             .clone();
 
         apply_next_epoch(&mut state, &[]);
 
-        let final_shard_0 = state.shard_committees[&ShardGroupId::new(0)]
+        let final_shard_0 = state.next_shard_committees[&ShardGroupId::new(0)]
             .members
             .clone();
-        let final_shard_1 = state.shard_committees[&ShardGroupId::new(1)]
+        let final_shard_1 = state.next_shard_committees[&ShardGroupId::new(1)]
             .members
             .clone();
 
@@ -379,13 +379,13 @@ mod tests {
         pool.total_stake = Stake::from_attos(10 * MIN_STAKE_FLOOR.attos());
         state.current_epoch = Epoch::new(SHUFFLE_INTERVAL_EPOCHS - 1);
 
-        let initial_members = state.shard_committees[&shard].members.clone();
+        let initial_members = state.next_shard_committees[&shard].members.clone();
         apply_next_epoch(&mut state, &[]);
 
         // Not-ready validators must still be on the shard.
         for not_ready_id in [2u64, 3] {
             assert!(
-                state.shard_committees[&shard]
+                state.next_shard_committees[&shard]
                     .members
                     .contains(&ValidatorId::new(not_ready_id)),
                 "not-ready validator {not_ready_id} got shuffled out"
@@ -394,7 +394,7 @@ mod tests {
         // Exactly one of the ready members (0 or 1) was rotated out.
         let rotated = initial_members
             .iter()
-            .filter(|id| !state.shard_committees[&shard].members.contains(id))
+            .filter(|id| !state.next_shard_committees[&shard].members.contains(id))
             .count();
         assert_eq!(rotated, 1, "exactly one ready member rotates out");
     }
@@ -411,14 +411,16 @@ mod tests {
         state.current_epoch = Epoch::new(SHUFFLE_INTERVAL_EPOCHS - 1);
         assert!(state.pooled_validators().is_empty());
 
-        let initial_members = state.shard_committees[&ShardGroupId::new(0)]
+        let initial_members = state.next_shard_committees[&ShardGroupId::new(0)]
             .members
             .clone();
         apply_next_epoch(&mut state, &[]);
 
         // Shard shrunk by one — empty pool, no refill possible.
         assert_eq!(
-            state.shard_committees[&ShardGroupId::new(0)].members.len(),
+            state.next_shard_committees[&ShardGroupId::new(0)]
+                .members
+                .len(),
             3
         );
         // Victim ended up in the pool, not back on the shard.
@@ -427,7 +429,7 @@ mod tests {
         let victim = pool_now[0];
         assert!(initial_members.contains(&victim));
         assert!(
-            !state.shard_committees[&ShardGroupId::new(0)]
+            !state.next_shard_committees[&ShardGroupId::new(0)]
                 .members
                 .contains(&victim)
         );
@@ -472,6 +474,40 @@ mod tests {
         state.committee = (0u64..4).map(ValidatorId::new).collect();
         let effects = apply_next_epoch(&mut state, &[]);
         assert!(effects.shard_committee_transitions.is_empty());
+    }
+
+    /// The lookahead committee finalized at epoch `E`
+    /// (`next_shard_committees`) becomes the active committee
+    /// (`shard_committees`) at epoch `E + 1` — the one-epoch promotion
+    /// that lets every shard hold its committee before the window opens.
+    /// Checked across a shuffle boundary so the committee provably
+    /// changes between epochs; otherwise active and lookahead coincide
+    /// and the promotion proves nothing.
+    #[test]
+    fn next_shard_committee_promotes_to_active_one_epoch_later() {
+        // 2 shards × 4 ready + 2 pool extras so the shuffle swaps rather
+        // than shrinks, making the lookahead differ from the active.
+        let mut state = multi_shard_state(2, 4, 2);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        state.current_epoch = Epoch::new(SHUFFLE_INTERVAL_EPOCHS - 1);
+
+        // Boundary epoch: the pipeline rotates `next_shard_committees`
+        // (the lookahead governing the following window); the active
+        // committee is the pre-rotation set promoted in at the top of
+        // `apply_epoch`.
+        apply_next_epoch(&mut state, &[]);
+        let lookahead = state.next_shard_committees.clone();
+        assert_ne!(
+            state.shard_committees, lookahead,
+            "shuffle must change the lookahead so the promotion is observable"
+        );
+
+        // The following epoch promotes that lookahead into the active slot.
+        apply_next_epoch(&mut state, &[]);
+        assert_eq!(
+            state.shard_committees, lookahead,
+            "epoch E's next_shard_committees becomes epoch E+1's shard_committees"
+        );
     }
 
     // ─── beacon_eligible + resample_beacon_committee ─────────────────────
@@ -619,7 +655,7 @@ mod tests {
         // Drop validator 0 from the shard committee too, matching the
         // global invariant.
         state
-            .shard_committees
+            .next_shard_committees
             .get_mut(&ShardGroupId::new(0))
             .unwrap()
             .members

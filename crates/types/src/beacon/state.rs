@@ -215,11 +215,32 @@ pub struct BeaconState {
     /// Beacon committee for the current epoch — the validators running
     /// the SPC instance producing this epoch's block.
     pub committee: Vec<ValidatorId>,
-    /// Per-shard ordered committee. Membership evolves via the
-    /// trickled shuffle (slow per-interval churn), jail/exit/
-    /// deactivate (immediate removal), and pool draws (filling slots
-    /// that just opened).
+    /// Per-shard committee governing shard consensus **during**
+    /// `current_epoch` — the committee that signs shard blocks whose
+    /// weighted timestamp falls in `[current_epoch · EPOCH_DURATION,
+    /// (current_epoch + 1) · EPOCH_DURATION)`.
+    ///
+    /// Frozen for the epoch: it's the value `next_shard_committees`
+    /// held at the end of the prior `apply_epoch`, promoted here at the
+    /// start of this one. Unlike `next_shard_committees` it carries **no**
+    /// `members ⇔ status == OnShard` invariant — a validator jailed by a
+    /// witness in `current_epoch` is removed from `next_shard_committees`
+    /// (so it leaves the committee one epoch out) but stays listed here,
+    /// because it was a member for this window. The shard's `2f+1` quorum
+    /// tolerates the absent member.
     pub shard_committees: BTreeMap<ShardGroupId, ShardCommittee>,
+    /// Lookahead per-shard committee — governs the **next** epoch's
+    /// window and is finalized here, one epoch before it takes effect,
+    /// so every shard holds it well before its window opens (one-epoch
+    /// committee lookahead).
+    ///
+    /// This is the live set the epoch pipeline mutates: membership
+    /// evolves via the trickled shuffle (slow per-interval churn),
+    /// jail/exit/deactivate (immediate removal), and pool draws (filling
+    /// slots that just opened). The `members ⇔ status == OnShard{shard}`
+    /// invariant holds here. At the start of the next `apply_epoch` this
+    /// value is promoted into `shard_committees`.
+    pub next_shard_committees: BTreeMap<ShardGroupId, ShardCommittee>,
     /// Per-shard high-water mark over each shard's beacon-witness
     /// accumulator: the largest [`LeafIndex`] this beacon has lifted
     /// from that shard. A `ShardWitness` with `proof.leaf_index !=
@@ -606,12 +627,12 @@ impl BeaconState {
     ///
     /// Target is `shard_count × chain_config.shard_size +
     /// POOL_BUFFER_TARGET`. The shard count isn't a stored field — it's
-    /// `shard_committees.len()`. Returns [`Stake::MAX`] for a zero
+    /// `next_shard_committees.len()`. Returns [`Stake::MAX`] for a zero
     /// target; returns [`MIN_STAKE_FLOOR`] when pools collectively
     /// can't fill the target even at floor pricing (anything below the
     /// floor would be clamped away by `min_stake`'s `.max(...)` anyway).
     fn admit_threshold(&self) -> Stake {
-        let target = self.shard_committees.len() * self.chain_config.shard_size as usize
+        let target = self.next_shard_committees.len() * self.chain_config.shard_size as usize
             + POOL_BUFFER_TARGET;
         if target == 0 {
             return Stake::MAX;
@@ -680,6 +701,7 @@ mod tests {
             randomness: Randomness::ZERO,
             committee: Vec::new(),
             shard_committees: BTreeMap::new(),
+            next_shard_committees: BTreeMap::new(),
             consumed_through: BTreeMap::new(),
             miss_counters: BTreeMap::new(),
         }
@@ -723,7 +745,7 @@ mod tests {
             },
         );
         state
-            .shard_committees
+            .next_shard_committees
             .insert(shard, ShardCommittee { members });
         state
     }

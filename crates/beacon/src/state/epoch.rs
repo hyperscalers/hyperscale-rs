@@ -91,11 +91,21 @@ pub fn apply_epoch(
     // I'm in," not "the epoch before mine."
     state.current_epoch = epoch;
 
+    // Promote the lookahead committee into the active slot before the
+    // pipeline runs. `next_shard_committees` was finalized one epoch ago
+    // and governs this epoch's shard consensus; freeze it here as
+    // `shard_committees`. The pipeline below then evolves
+    // `next_shard_committees` into the lookahead for the epoch after this
+    // one — so the committee for any window is fixed a full epoch before
+    // the window opens, and a validator jailed this epoch leaves the
+    // committee one epoch out rather than mid-window.
+    state.shard_committees = state.next_shard_committees.clone();
+
     // Snapshot each shard's member list before the pipeline runs so the
     // end-of-epoch set-diff against this snapshot can surface
     // membership changes through `SlotEffects.shard_committee_transitions`.
     let pre_shard_members: BTreeMap<ShardGroupId, Vec<ValidatorId>> = state
-        .shard_committees
+        .next_shard_committees
         .iter()
         .map(|(s, c)| (*s, c.members.clone()))
         .collect();

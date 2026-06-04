@@ -91,7 +91,7 @@ pub fn build_genesis_beacon_state(config: &BeaconGenesisConfig) -> BeaconState {
     // `ShardCommittee.members` order is incidental at runtime (status
     // is what gates signing, not list position), so the input order
     // carries through verbatim.
-    let shard_committees: BTreeMap<ShardGroupId, ShardCommittee> = config
+    let next_shard_committees: BTreeMap<ShardGroupId, ShardCommittee> = config
         .initial_shard_committees
         .iter()
         .map(|(shard, members)| {
@@ -119,7 +119,12 @@ pub fn build_genesis_beacon_state(config: &BeaconGenesisConfig) -> BeaconState {
         pools,
         randomness: config.initial_randomness,
         committee,
-        shard_committees,
+        // Genesis fixes both windows to the configured committee: the
+        // first apply_epoch promotes `next_shard_committees`, so epoch 0
+        // and epoch 1 are both governed by the initial set until the
+        // pipeline first rotates it.
+        shard_committees: next_shard_committees.clone(),
+        next_shard_committees,
         consumed_through: BTreeMap::new(),
         miss_counters: BTreeMap::new(),
     }

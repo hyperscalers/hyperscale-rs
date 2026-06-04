@@ -70,6 +70,7 @@ pub fn empty_state() -> BeaconState {
         randomness: Randomness::ZERO,
         committee: Vec::new(),
         shard_committees: BTreeMap::new(),
+        next_shard_committees: BTreeMap::new(),
         consumed_through: BTreeMap::new(),
         miss_counters: BTreeMap::new(),
     }
@@ -113,7 +114,7 @@ pub fn single_pool_state(n_active: u64) -> BeaconState {
         },
     );
     state
-        .shard_committees
+        .next_shard_committees
         .insert(shard, ShardCommittee { members });
     state
 }
@@ -218,7 +219,7 @@ pub fn state_with_pending_withdrawal(
         },
     );
     state
-        .shard_committees
+        .next_shard_committees
         .insert(shard, ShardCommittee { members });
     state.committee = (0..n_actives).map(ValidatorId::new).collect();
     state

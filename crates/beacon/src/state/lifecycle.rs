@@ -247,7 +247,7 @@ mod tests {
             },
         );
         state
-            .shard_committees
+            .next_shard_committees
             .insert(shard, ShardCommittee { members });
         state.committee = (0..n_active).map(ValidatorId::new).collect();
         state
@@ -831,10 +831,10 @@ mod tests {
             ),
         );
         state
-            .shard_committees
+            .next_shard_committees
             .insert(ShardGroupId::new(0), ShardCommittee::default());
         state
-            .shard_committees
+            .next_shard_committees
             .get_mut(&ShardGroupId::new(0))
             .unwrap()
             .members

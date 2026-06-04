@@ -21,7 +21,7 @@ pub(super) fn deactivate_to_insufficient_stake(state: &mut BeaconState, victim_i
     let prior_status = rec.status;
     rec.status = ValidatorStatus::InsufficientStake;
     if let ValidatorStatus::OnShard { shard, .. } = prior_status {
-        if let Some(committee) = state.shard_committees.get_mut(&shard) {
+        if let Some(committee) = state.next_shard_committees.get_mut(&shard) {
             committee.members.retain(|v| *v != victim_id);
         }
         pool_draw(state, shard);
@@ -288,7 +288,7 @@ mod tests {
         // Shard committee shrank (the only pool has no Pooled validators
         // to refill from, so `pool_draw` returns None and the committee
         // stays at 3).
-        let members = &state.shard_committees[&ShardGroupId::new(0)].members;
+        let members = &state.next_shard_committees[&ShardGroupId::new(0)].members;
         assert_eq!(members.len(), 3);
         assert!(!members.contains(&ValidatorId::new(3)));
     }

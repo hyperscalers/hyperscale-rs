@@ -806,7 +806,7 @@ mod tests {
             state.validators.get(&ValidatorId::new(0)).unwrap().status,
             ValidatorStatus::InsufficientStake,
         );
-        let members = &state.shard_committees[&ShardGroupId::new(0)].members;
+        let members = &state.next_shard_committees[&ShardGroupId::new(0)].members;
         assert_eq!(members.len(), 4);
         assert!(!members.contains(&ValidatorId::new(0)));
         assert!(members.contains(&ValidatorId::new(4)));
@@ -831,7 +831,7 @@ mod tests {
             .validators
             .insert(ValidatorId::new(5));
 
-        let pre_members = state.shard_committees[&ShardGroupId::new(0)]
+        let pre_members = state.next_shard_committees[&ShardGroupId::new(0)]
             .members
             .clone();
 
@@ -855,7 +855,7 @@ mod tests {
         );
         // Shard committee unchanged (the validator wasn't there).
         assert_eq!(
-            state.shard_committees[&ShardGroupId::new(0)].members,
+            state.next_shard_committees[&ShardGroupId::new(0)].members,
             pre_members,
         );
     }
@@ -1210,7 +1210,7 @@ mod tests {
             ),
         );
         state.committee = vec![ValidatorId::new(0)];
-        state.shard_committees.insert(
+        state.next_shard_committees.insert(
             shard,
             ShardCommittee {
                 members: vec![ValidatorId::new(0), ValidatorId::new(1)],
@@ -1372,7 +1372,7 @@ mod tests {
                 },
             ),
         );
-        state.shard_committees.insert(
+        state.next_shard_committees.insert(
             ShardGroupId::new(1),
             ShardCommittee {
                 members: vec![target],
@@ -1484,7 +1484,7 @@ mod tests {
         // Counter cleared.
         assert!(!state.miss_counters.contains_key(&target));
         // Shard committee refilled from pool.
-        let members = &state.shard_committees[&ShardGroupId::new(0)].members;
+        let members = &state.next_shard_committees[&ShardGroupId::new(0)].members;
         assert_eq!(members.len(), 4);
         assert!(!members.contains(&target));
         assert!(members.contains(&ValidatorId::new(4)));
@@ -1614,7 +1614,7 @@ mod tests {
                 reason: JailReason::Equivocation,
             },
         );
-        let members = &state.shard_committees[&ShardGroupId::new(0)].members;
+        let members = &state.next_shard_committees[&ShardGroupId::new(0)].members;
         assert_eq!(members.len(), 4);
         assert!(!members.contains(&target));
         assert!(members.contains(&ValidatorId::new(4)));

@@ -145,7 +145,7 @@ pub(super) fn jail_validator(
     };
     state.miss_counters.remove(&victim);
     if let ValidatorStatus::OnShard { shard, .. } = prior_status {
-        if let Some(committee) = state.shard_committees.get_mut(&shard) {
+        if let Some(committee) = state.next_shard_committees.get_mut(&shard) {
             committee.members.retain(|v| *v != victim);
         }
         pool_draw(state, shard);
@@ -285,7 +285,7 @@ mod tests {
         );
         // Shard committee size stays at 4 — validator 4 drawn from
         // pool to refill the freed epoch.
-        let members = &state.shard_committees[&ShardGroupId::new(0)].members;
+        let members = &state.next_shard_committees[&ShardGroupId::new(0)].members;
         assert_eq!(members.len(), 4);
         assert!(!members.contains(&ValidatorId::new(0)));
         assert!(members.contains(&ValidatorId::new(4)));

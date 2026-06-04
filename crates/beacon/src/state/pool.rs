@@ -47,7 +47,7 @@ pub fn pool_draw(state: &mut BeaconState, shard: ShardGroupId) -> Option<Validat
         placed_at_epoch: state.current_epoch,
     };
     state
-        .shard_committees
+        .next_shard_committees
         .entry(shard)
         .or_default()
         .members
@@ -96,7 +96,7 @@ mod tests {
             },
         );
         state
-            .shard_committees
+            .next_shard_committees
             .insert(ShardGroupId::new(0), ShardCommittee::default());
         state
     }
@@ -105,11 +105,11 @@ mod tests {
     fn pool_draw_returns_none_when_pool_empty() {
         let mut state = empty_state();
         state
-            .shard_committees
+            .next_shard_committees
             .insert(ShardGroupId::new(0), ShardCommittee::default());
         assert_eq!(pool_draw(&mut state, ShardGroupId::new(0)), None);
         assert!(
-            state.shard_committees[&ShardGroupId::new(0)]
+            state.next_shard_committees[&ShardGroupId::new(0)]
                 .members
                 .is_empty()
         );
@@ -125,7 +125,7 @@ mod tests {
         let pick_a = pool_draw(&mut a, ShardGroupId::new(0)).unwrap();
         let pick_b = pool_draw(&mut b, ShardGroupId::new(0)).unwrap();
         assert_eq!(pick_a, pick_b);
-        assert_eq!(a.shard_committees, b.shard_committees);
+        assert_eq!(a.next_shard_committees, b.next_shard_committees);
         assert_eq!(a.pooled_validators(), b.pooled_validators());
     }
 
@@ -140,7 +140,7 @@ mod tests {
         let first = pool_draw(&mut state, ShardGroupId::new(0)).unwrap();
         let second = pool_draw(&mut state, ShardGroupId::new(0)).unwrap();
         assert_ne!(first, second);
-        let members = &state.shard_committees[&ShardGroupId::new(0)].members;
+        let members = &state.next_shard_committees[&ShardGroupId::new(0)].members;
         assert_eq!(members.len(), 2);
         assert!(members.contains(&first));
         assert!(members.contains(&second));
@@ -174,7 +174,7 @@ mod tests {
         let any_differ = (0u8..16).any(|i| {
             let mut a = state_with_pool(8, Randomness::new([i; 32]), Epoch::GENESIS);
             // Add a second shard so the draw target exists.
-            a.shard_committees
+            a.next_shard_committees
                 .insert(ShardGroupId::new(1), ShardCommittee::default());
             let mut b = a.clone();
             let pick_a = pool_draw(&mut a, ShardGroupId::new(0)).unwrap();

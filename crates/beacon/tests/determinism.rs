@@ -113,7 +113,8 @@ fn initial_state() -> BeaconState {
         pools,
         randomness: Randomness::new([0x42; 32]),
         committee: (0u64..4).map(ValidatorId::new).collect(),
-        shard_committees,
+        shard_committees: shard_committees.clone(),
+        next_shard_committees: shard_committees,
         consumed_through: BTreeMap::new(),
         miss_counters: BTreeMap::new(),
     }
