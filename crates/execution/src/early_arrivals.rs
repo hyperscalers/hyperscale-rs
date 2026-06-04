@@ -32,6 +32,13 @@
 //! - [`EARLY_VOTE_RETENTION`]: how long to hold votes whose block has never
 //!   committed locally. Cleanup at commit time drops older entries since
 //!   failure to commit past this window signals shard consensus is broken.
+//! - [`MAX_BUFFERED_EARLY_VOTES`]: a hard ceiling on total buffered votes.
+//!   Early votes are committee-gated at ingress but not BLS-verified until a
+//!   vote tracker exists, so without a size bound a Byzantine committee
+//!   member could flood votes for fabricated `WaveId`s up to the time-based
+//!   sweep. Past the ceiling new early votes are dropped; the voter's own
+//!   vote-retry retransmits once the block commits, so a drop costs at most
+//!   one retry interval of latency.
 //! - Buffered ECs evict at the EC's own
 //!   [`ExecutionCertificate::deadline`] — `vote_anchor_ts +
 //!   RETENTION_HORIZON`. Past that point every tx the EC could mention
@@ -55,6 +62,19 @@ use hyperscale_types::{
 /// no longer contribute to a useful wave. Anchored on the committing QC's
 /// `weighted_timestamp_ms` so the bound is BFT-authenticated.
 pub const EARLY_VOTE_RETENTION: Duration = WAVE_TIMEOUT;
+
+/// Hard ceiling on early votes buffered across all waves.
+///
+/// Early votes are committee-gated at ingress but their per-vote BLS
+/// signatures aren't checked until a vote tracker spins up, so a Byzantine
+/// committee member could otherwise grow the buffer without bound by
+/// flooding votes for fabricated `WaveId`s until the [`EARLY_VOTE_RETENTION`]
+/// sweep. The ceiling is a global vote count, not a per-wave or per-shard
+/// limit: legitimate buffering only spans a handful of in-flight waves at a
+/// time, so the sum stays far below this bound unless flooded. Past it, new
+/// early votes are dropped — recoverable via the voter's vote-retry once the
+/// block commits.
+pub const MAX_BUFFERED_EARLY_VOTES: usize = 65_536;
 
 /// Bookkeeping for an EC awaiting local routing.
 ///
@@ -84,6 +104,10 @@ pub struct EarlyArrivalBuffer {
     /// that `tx_hash` in its `pending_txs` set. Enforced by `buffer_ec`,
     /// `clear_routed`, `drain_ecs_for_txs`, and `gc_stale_ecs`.
     pending_routing: HashMap<WaveId, BufferedEc>,
+
+    /// Running total of votes across every `votes` entry, kept in step with
+    /// `votes` so the [`MAX_BUFFERED_EARLY_VOTES`] cap is an O(1) check.
+    buffered: usize,
 }
 
 impl EarlyArrivalBuffer {
@@ -92,22 +116,36 @@ impl EarlyArrivalBuffer {
             votes: HashMap::new(),
             tx_index: HashMap::new(),
             pending_routing: HashMap::new(),
+            buffered: 0,
         }
     }
 
     // ─── Votes ──────────────────────────────────────────────────────────
 
     /// Buffer a vote whose wave isn't yet tracked. Called from the
-    /// non-leader ingress path.
-    pub fn buffer_vote(&mut self, wave_id: WaveId, vote: Verifiable<ExecutionVote>) {
+    /// non-leader ingress path. Returns `false` if the vote was dropped
+    /// because the buffer is at [`MAX_BUFFERED_EARLY_VOTES`] capacity.
+    pub fn buffer_vote(&mut self, wave_id: WaveId, vote: Verifiable<ExecutionVote>) -> bool {
+        if self.buffered >= MAX_BUFFERED_EARLY_VOTES {
+            tracing::debug!(
+                wave = %wave_id,
+                buffered = self.buffered,
+                "Early-vote buffer at capacity — dropping vote"
+            );
+            return false;
+        }
         self.votes.entry(wave_id).or_default().push(vote);
+        self.buffered += 1;
+        true
     }
 
     /// Remove and return all buffered votes for `wave_id`. Called when the
     /// coordinator creates a leader or fallback-leader `VoteTracker` and
     /// needs to replay the backlog.
     pub fn drain_votes_for_wave(&mut self, wave_id: &WaveId) -> Vec<Verifiable<ExecutionVote>> {
-        self.votes.remove(wave_id).unwrap_or_default()
+        let drained = self.votes.remove(wave_id).unwrap_or_default();
+        self.buffered -= drained.len();
+        drained
     }
 
     /// Predicate-driven retention for vote entries. The caller owns the
@@ -117,8 +155,14 @@ impl EarlyArrivalBuffer {
     where
         F: FnMut(&WaveId, &[Verifiable<ExecutionVote>]) -> bool,
     {
-        self.votes
-            .retain(|wave_id, votes| predicate(wave_id, votes));
+        let buffered = &mut self.buffered;
+        self.votes.retain(|wave_id, votes| {
+            let keep = predicate(wave_id, votes);
+            if !keep {
+                *buffered -= votes.len();
+            }
+            keep
+        });
     }
 
     // ─── ECs ────────────────────────────────────────────────────────────
@@ -326,6 +370,24 @@ mod tests {
         )
     }
 
+    /// A vote with a zero signature — cheap to build (no BLS signing), for
+    /// exercising the buffer's size cap at scale.
+    fn cheap_vote(wave_id: WaveId) -> Verifiable<ExecutionVote> {
+        ExecutionVote::new(
+            BlockHash::ZERO,
+            BlockHeight::new(1),
+            WeightedTimestamp::ZERO,
+            wave_id,
+            shard(),
+            GlobalReceiptRoot::ZERO,
+            0,
+            vec![],
+            ValidatorId::new(0),
+            zero_bls_signature(),
+        )
+        .into()
+    }
+
     // ─── Votes ──────────────────────────────────────────────────────────
 
     #[test]
@@ -369,6 +431,57 @@ mod tests {
         assert_eq!(b.vote_len(), 1);
         assert_eq!(b.drain_votes_for_wave(&w1).len(), 1);
         assert!(b.drain_votes_for_wave(&w2).is_empty());
+    }
+
+    #[test]
+    fn buffer_vote_enforces_global_cap() {
+        let mut b = EarlyArrivalBuffer::new();
+        let w = wave(1);
+        for _ in 0..MAX_BUFFERED_EARLY_VOTES {
+            assert!(b.buffer_vote(w.clone(), cheap_vote(w.clone())));
+        }
+        // At capacity, further votes are dropped — including for a wave the
+        // buffer has never seen, so a fabricated-`WaveId` flood can't grow it.
+        assert!(!b.buffer_vote(w, cheap_vote(wave(1))));
+        assert!(!b.buffer_vote(wave(2), cheap_vote(wave(2))));
+        assert!(!b.votes.contains_key(&wave(2)));
+    }
+
+    #[test]
+    fn draining_a_wave_frees_buffer_capacity() {
+        let mut b = EarlyArrivalBuffer::new();
+        let w = wave(1);
+        for _ in 0..MAX_BUFFERED_EARLY_VOTES {
+            b.buffer_vote(w.clone(), cheap_vote(w.clone()));
+        }
+        assert!(!b.buffer_vote(wave(2), cheap_vote(wave(2))));
+
+        let drained = b.drain_votes_for_wave(&w);
+        assert_eq!(drained.len(), MAX_BUFFERED_EARLY_VOTES);
+        // The reclaimed budget lets fresh votes buffer again.
+        assert!(b.buffer_vote(wave(2), cheap_vote(wave(2))));
+    }
+
+    #[test]
+    fn retaining_frees_buffer_capacity_for_dropped_waves() {
+        let mut b = EarlyArrivalBuffer::new();
+        let w1 = wave(1);
+        let w2 = wave(2);
+        let half = MAX_BUFFERED_EARLY_VOTES / 2;
+        for _ in 0..half {
+            b.buffer_vote(w1.clone(), cheap_vote(w1.clone()));
+        }
+        for _ in 0..(MAX_BUFFERED_EARLY_VOTES - half) {
+            b.buffer_vote(w2.clone(), cheap_vote(w2.clone()));
+        }
+        assert!(!b.buffer_vote(wave(3), cheap_vote(wave(3))));
+
+        // Dropping `w1` returns exactly its share of the budget.
+        b.retain_votes(|wave_id, _| wave_id != &w1);
+        for _ in 0..half {
+            assert!(b.buffer_vote(wave(3), cheap_vote(wave(3))));
+        }
+        assert!(!b.buffer_vote(wave(3), cheap_vote(wave(3))));
     }
 
     // ─── ECs ────────────────────────────────────────────────────────────
