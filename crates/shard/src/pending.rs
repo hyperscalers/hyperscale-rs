@@ -109,6 +109,35 @@ impl PendingBlocks {
             .count()
     }
 
+    /// Number of distinct pending headers at `height`, across all rounds. The
+    /// per-height cap is enforced against this.
+    pub fn count_at_height(&self, height: BlockHeight) -> usize {
+        self.0
+            .values()
+            .filter(|p| p.header().height() == height)
+            .count()
+    }
+
+    /// The pending header at `height` whose round is farthest from `anchor`,
+    /// with its round-distance, or `None` if no header is stored at `height`.
+    /// Used to pick the eviction victim when the per-height cap is reached —
+    /// `anchor` is the verified `high_qc` round, so flood rounds far from
+    /// verified progress are shed before rounds near the committable block.
+    pub fn farthest_round_at_height(
+        &self,
+        height: BlockHeight,
+        anchor: Round,
+    ) -> Option<(BlockHash, u64)> {
+        self.0
+            .values()
+            .filter(|p| p.header().height() == height)
+            .map(|p| {
+                let h = p.header();
+                (h.hash(), h.round().inner().abs_diff(anchor.inner()))
+            })
+            .max_by_key(|(_, distance)| *distance)
+    }
+
     pub fn len(&self) -> usize {
         self.0.len()
     }
@@ -796,6 +825,74 @@ mod tests {
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
         )
+    }
+
+    fn make_header_round(height: BlockHeight, round: Round) -> BlockHeader {
+        BlockHeader::new(
+            ShardGroupId::new(0),
+            height,
+            BlockHash::from_raw(Hash::from_bytes(b"parent")),
+            QuorumCertificate::genesis(ShardGroupId::new(0)),
+            ValidatorId::new(0),
+            ProposerTimestamp::from_millis(1_234_567_890),
+            round,
+            false,
+            StateRoot::ZERO,
+            TransactionRoot::ZERO,
+            CertificateRoot::ZERO,
+            LocalReceiptRoot::ZERO,
+            ProvisionsRoot::ZERO,
+            Vec::new(),
+            BTreeMap::new(),
+            InFlightCount::ZERO,
+            BeaconWitnessRoot::ZERO,
+            BeaconWitnessLeafCount::ZERO,
+        )
+    }
+
+    fn insert_at(pending: &mut PendingBlocks, height: BlockHeight, round: Round) -> BlockHash {
+        let header = make_header_round(height, round);
+        let hash = header.hash();
+        pending.insert(PendingBlock::from_manifest(
+            header,
+            BlockManifest::default(),
+            LocalTimestamp::ZERO,
+        ));
+        hash
+    }
+
+    #[test]
+    fn count_at_height_counts_every_round() {
+        let mut pending = PendingBlocks::new();
+        insert_at(&mut pending, BlockHeight::new(5), Round::new(1));
+        insert_at(&mut pending, BlockHeight::new(5), Round::new(2));
+        insert_at(&mut pending, BlockHeight::new(6), Round::new(1));
+
+        assert_eq!(pending.count_at_height(BlockHeight::new(5)), 2);
+        assert_eq!(pending.count_at_height(BlockHeight::new(6)), 1);
+        assert_eq!(pending.count_at_height(BlockHeight::new(7)), 0);
+    }
+
+    #[test]
+    fn farthest_round_at_height_picks_max_distance_from_anchor() {
+        let mut pending = PendingBlocks::new();
+        insert_at(&mut pending, BlockHeight::new(5), Round::new(11));
+        let far = insert_at(&mut pending, BlockHeight::new(5), Round::new(40));
+        // A far-round block at a different height must not be considered.
+        insert_at(&mut pending, BlockHeight::new(6), Round::new(1000));
+
+        // Anchor at round 10: |11 − 10| = 1, |40 − 10| = 30 → round 40 wins.
+        let (hash, distance) = pending
+            .farthest_round_at_height(BlockHeight::new(5), Round::new(10))
+            .expect("entries exist at height 5");
+        assert_eq!(hash, far);
+        assert_eq!(distance, 30);
+
+        assert!(
+            pending
+                .farthest_round_at_height(BlockHeight::new(9), Round::new(10))
+                .is_none()
+        );
     }
 
     #[test]

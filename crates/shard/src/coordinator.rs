@@ -134,6 +134,22 @@ const SPECULATIVE_VERIFY_GAP: u64 = 1024;
 /// stored or verified.
 const MAX_HEADERS_PER_HEIGHT_ROUND: usize = 4;
 
+/// Cap on pending headers retained per height. `validate_header` checks only
+/// the parent QC's signer power, not its signature, so a forged full-bitfield
+/// `parent_qc` lets a Byzantine proposer plant a header at every round it
+/// proposes for a height; this bounds how many are stored at once. On overflow
+/// the entry whose round is farthest from the verified `high_qc` is evicted,
+/// keeping the rounds nearest verified progress (where the committable block
+/// lives) and shedding flood rounds. Generous above honest view-change churn.
+const MAX_PENDING_PER_HEIGHT: usize = 64;
+
+/// Refuse to store a header whose height exceeds `committed + this`. A far
+/// future header isn't actionable until the chain advances to it, and a node
+/// genuinely that far behind catches up via block-sync, not by buffering tip
+/// headers it can't yet vote on. Bounds the number of populated height buckets
+/// so the per-height cap bounds total pending storage.
+const MAX_HEADER_HEIGHT_LOOKAHEAD: u64 = 256;
+
 /// Shard consensus state machine (HotStuff-2).
 ///
 /// Handles block proposal, voting, QC formation, commitment, and view changes.
@@ -1038,6 +1054,26 @@ impl ShardCoordinator {
             return vec![];
         }
 
+        // Don't store headers far above the committed tip. A forged
+        // quorum-power `parent_qc` passes `validate_header` at any height, so
+        // without this a Byzantine proposer plants headers across unbounded
+        // future heights; one this far ahead isn't actionable until the chain
+        // reaches it, and a node genuinely behind catches up via block-sync.
+        if height.inner()
+            > self
+                .committed_height
+                .inner()
+                .saturating_add(MAX_HEADER_HEIGHT_LOOKAHEAD)
+        {
+            warn!(
+                validator = ?self.me,
+                height = height.inner(),
+                committed = self.committed_height.inner(),
+                "Dropping header — height beyond storage lookahead"
+            );
+            return vec![];
+        }
+
         // Cap distinct headers per `(height, round)`. The proposer signs one
         // block per round, so beyond a small allowance the rest are a Byzantine
         // proposer equivocating — or varying the unsigned content roots to mint
@@ -1054,6 +1090,18 @@ impl ShardCoordinator {
             return vec![];
         }
 
+        // Per-height cap: evict the stored header farthest from verified
+        // progress to make room, or drop this one if it is itself the farthest.
+        let Some(cap_actions) = self.enforce_pending_block_cap(height, round) else {
+            warn!(
+                validator = ?self.me,
+                height = height.inner(),
+                round = round.inner(),
+                "Dropping header — height at pending cap and no farther entry to evict"
+            );
+            return vec![];
+        };
+
         self.pending_blocks.assemble(
             header.clone(),
             manifest,
@@ -1069,6 +1117,8 @@ impl ShardCoordinator {
             self.votes
                 .maybe_trigger_verification(topology_snapshot, self.local_shard, block_hash);
         actions.extend(sync_actions);
+        // Cancel fetches orphaned by any eviction the cap performed.
+        actions.extend(cap_actions);
 
         // If vote verification was triggered, return those actions. Still want
         // to fall through for sync-only extensions, so only short-circuit on
@@ -3665,6 +3715,35 @@ impl ShardCoordinator {
             .unwrap_or_default()
     }
 
+    /// Enforce [`MAX_PENDING_PER_HEIGHT`] before storing a header at `(height,
+    /// round)`. Returns `Some(actions)` to proceed — `actions` cancel the
+    /// fetches of any block evicted to make room — or `None` if the incoming
+    /// header should be dropped because it is itself the entry farthest from
+    /// verified progress at a full height.
+    ///
+    /// The eviction anchor is the verified `high_qc` round, not the local
+    /// `view`: `view` is draggable by unverified gossip, so anchoring there
+    /// would let a flood pull the metric onto its own rounds and evict the
+    /// canonical block. `high_qc` only moves on a verified QC.
+    fn enforce_pending_block_cap(
+        &mut self,
+        height: BlockHeight,
+        round: Round,
+    ) -> Option<Vec<Action>> {
+        if self.pending_blocks.count_at_height(height) < MAX_PENDING_PER_HEIGHT {
+            return Some(vec![]);
+        }
+        let anchor = self.high_qc_round();
+        let new_distance = round.inner().abs_diff(anchor.inner());
+        let (farthest_hash, farthest_distance) = self
+            .pending_blocks
+            .farthest_round_at_height(height, anchor)?;
+        if new_distance >= farthest_distance {
+            return None;
+        }
+        Some(self.remove_pending_block(farthest_hash))
+    }
+
     /// Get the committed block hash.
     #[must_use]
     pub const fn committed_hash(&self) -> BlockHash {
@@ -4150,6 +4229,147 @@ mod tests {
                 .count_at(BlockHeight::new(1), Round::new(1)),
             MAX_HEADERS_PER_HEIGHT_ROUND,
             "distinct headers at one (height, round) must be capped",
+        );
+    }
+
+    #[test]
+    fn header_flood_across_rounds_is_capped_per_height() {
+        // A Byzantine proposer plants one genesis-QC header per round it
+        // proposes for, all at the tip height. The per-height cap bounds how
+        // many are stored; eviction anchored to high_qc keeps the rounds
+        // nearest verified progress and sheds the far flood rounds.
+        let (mut state, topology) = make_test_state();
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let committed_hash = BlockHash::from_raw(Hash::from_bytes(b"genesis_tip"));
+        state.committed_hash = committed_hash;
+
+        let round_header = |round: u64| {
+            BlockHeader::new(
+                ShardGroupId::new(0),
+                BlockHeight::new(1),
+                committed_hash,
+                QuorumCertificate::genesis(ShardGroupId::new(0)),
+                ValidatorId::new(round % 4),
+                ProposerTimestamp::from_millis(100_000),
+                Round::new(round),
+                false,
+                StateRoot::ZERO,
+                TransactionRoot::ZERO,
+                CertificateRoot::ZERO,
+                LocalReceiptRoot::ZERO,
+                ProvisionsRoot::ZERO,
+                Vec::new(),
+                std::collections::BTreeMap::new(),
+                InFlightCount::ZERO,
+                BeaconWitnessRoot::ZERO,
+                BeaconWitnessLeafCount::ZERO,
+            )
+        };
+
+        let cap = u64::try_from(MAX_PENDING_PER_HEIGHT).unwrap();
+        for round in 1..=cap + 6 {
+            let header = round_header(round);
+            let _ = state.on_block_header(
+                &topology,
+                &header,
+                BlockManifest::default(),
+                |_| None,
+                |_| None,
+                |_| None,
+            );
+        }
+
+        assert_eq!(
+            state.pending_blocks.count_at_height(BlockHeight::new(1)),
+            MAX_PENDING_PER_HEIGHT,
+            "distinct-round headers at one height must be capped",
+        );
+        // high_qc sits at the genesis round, so the lowest rounds survive and
+        // the farthest flood rounds are shed.
+        assert!(state.pending_blocks.contains_key(round_header(1).hash()));
+        assert!(
+            !state
+                .pending_blocks
+                .contains_key(round_header(cap + 6).hash())
+        );
+    }
+
+    #[test]
+    fn header_beyond_lookahead_is_not_stored() {
+        // A forged full-bitfield `parent_qc` passes `validate_header` (the
+        // signature is checked later) at any height, so a header far above the
+        // committed tip is well-formed — but it must not be stored.
+        let (mut state, topology) = make_test_state();
+        state.set_time(LocalTimestamp::from_millis(1_000_000));
+        let now_ms = state.now.as_millis();
+
+        let forged_future_header = |height: u64| {
+            let round = 4u64; // proposer_for(4) == committee[0]
+            let mut signers = SignerBitfield::new(4);
+            signers.set(0);
+            signers.set(1);
+            signers.set(2);
+            let parent_block_hash = BlockHash::from_raw(Hash::from_bytes(b"forged_parent"));
+            let parent_qc = QuorumCertificate::new(
+                parent_block_hash,
+                ShardGroupId::new(0),
+                BlockHeight::new(height - 1),
+                BlockHash::ZERO,
+                Round::new(round),
+                signers,
+                zero_bls_signature(),
+                WeightedTimestamp::from_millis(now_ms - 5_000),
+            );
+            BlockHeader::new(
+                ShardGroupId::new(0),
+                BlockHeight::new(height),
+                parent_block_hash,
+                parent_qc,
+                ValidatorId::new(round % 4),
+                ProposerTimestamp::from_millis(now_ms),
+                Round::new(round),
+                false,
+                StateRoot::ZERO,
+                TransactionRoot::ZERO,
+                CertificateRoot::ZERO,
+                LocalReceiptRoot::ZERO,
+                ProvisionsRoot::ZERO,
+                Vec::new(),
+                std::collections::BTreeMap::new(),
+                InFlightCount::ZERO,
+                BeaconWitnessRoot::ZERO,
+                BeaconWitnessLeafCount::ZERO,
+            )
+        };
+
+        // At the lookahead edge (committed is genesis): stored.
+        let edge = forged_future_header(MAX_HEADER_HEIGHT_LOOKAHEAD);
+        let _ = state.on_block_header(
+            &topology,
+            &edge,
+            BlockManifest::default(),
+            |_| None,
+            |_| None,
+            |_| None,
+        );
+        assert!(
+            state.pending_blocks.contains_key(edge.hash()),
+            "a header at the lookahead edge must be stored",
+        );
+
+        // One past the edge: dropped before storage.
+        let beyond = forged_future_header(MAX_HEADER_HEIGHT_LOOKAHEAD + 1);
+        let _ = state.on_block_header(
+            &topology,
+            &beyond,
+            BlockManifest::default(),
+            |_| None,
+            |_| None,
+            |_| None,
+        );
+        assert!(
+            !state.pending_blocks.contains_key(beyond.hash()),
+            "a header beyond the lookahead must not be stored",
         );
     }
 
