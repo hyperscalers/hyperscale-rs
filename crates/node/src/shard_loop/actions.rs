@@ -134,9 +134,13 @@ where
             // ─── Beacon-local effects ──────────────────────────────────────
             Action::CommitBeaconBlock { block, state } => {
                 let epoch = block.epoch();
+                // Process-scoped dedup: only the first co-hosted vnode to
+                // reach this `(epoch, hash)` writes to storage. The
+                // per-vnode sync-advance and `BeaconBlockPersisted` below
+                // still run on every vnode regardless.
                 self.process
-                    .beacon_storage
-                    .commit_beacon_block(&block, &state);
+                    .beacon_commit
+                    .commit(&self.process.beacon_storage, &block, &state);
                 // Advance the beacon sync FSM's committed watermark on
                 // every commit (gossip or sync) so a later
                 // StartBeaconBlockSync fetches from current+1, and so

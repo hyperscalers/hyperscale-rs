@@ -8,11 +8,13 @@
 //!
 //! [`ShardLoop`]: crate::shard_loop::ShardLoop
 
+mod beacon_commit;
 mod network_handlers;
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
+pub(crate) use beacon_commit::BeaconCommitCoordinator;
 use crossbeam::channel::Sender;
 use hyperscale_beacon::proposal_pool::BeaconProposalPool;
 use hyperscale_dispatch::Dispatch;
@@ -75,6 +77,12 @@ where
     /// (`RocksDbBeaconStorage::commit_lock`); reads remain lock-free.
     pub(crate) beacon_storage: Arc<dyn BeaconStorage>,
 
+    /// First leg of the beacon-commit dedup: lets only the first
+    /// co-hosted vnode to reach a given `(epoch, hash)` write it to
+    /// `beacon_storage`, so the others skip the round-trip instead of
+    /// bottoming out as idempotent no-ops.
+    pub(crate) beacon_commit: BeaconCommitCoordinator,
+
     /// Host-shared per-epoch `BeaconProposal` pool. Same `Arc` lives
     /// on every co-hosted vnode's `BeaconCoordinator` and on the
     /// inbound `GetBeaconProposalRequest` network handler closure;
@@ -92,7 +100,7 @@ where
     /// the result in `Arc` and share with every `ShardLoop` plus
     /// off-thread closure capture sites.
     #[allow(clippy::too_many_arguments)] // every field threads through one constructor
-    pub(crate) const fn new(
+    pub(crate) fn new(
         network: Arc<N>,
         dispatch: D,
         shard_event_senders: HashMap<ShardGroupId, Sender<ShardEvent>>,
@@ -110,6 +118,7 @@ where
             dispatch_handles,
             tx_validator,
             beacon_storage,
+            beacon_commit: BeaconCommitCoordinator::new(),
             beacon_proposal_pool,
         }
     }
