@@ -322,7 +322,7 @@ impl SimulationRunner {
 
                     let beacon_coordinator = BeaconCoordinator::new(
                         Arc::clone(&beacon_latest_block),
-                        (*beacon_latest_state).clone(),
+                        vec![(*beacon_latest_state).clone()],
                         validator_id,
                         *shard,
                         beacon_network.clone(),

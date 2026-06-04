@@ -25,15 +25,16 @@ use hyperscale_core::{Action, FetchAbandon, FetchRequest, TimerId};
 use hyperscale_types::{
     BeaconBlock, BeaconBlockHash, BeaconCert, BeaconProposal, BeaconProposalVerifyContext,
     BeaconState, BlockHash, BlockHeight, Bls12381G1PublicKey, CertifiedBeaconBlock,
-    CertifiedBeaconBlockVerifyError, CertifiedBlockHeader, Epoch, GenesisConfigHash, LeafIndex,
-    LocalTimestamp, MAX_EQUIVOCATIONS_PER_PROPOSER, MAX_SHARD_WITNESSES_PER_PROPOSER,
-    MAX_WITNESSES_PER_FETCH, MIN_BEACON_COMMITTEE_SIZE, NetworkDefinition, PcQc3, PcValueElement,
-    PcVector, PcVote1, PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3,
-    PcVote3VerifyError, PcVoteEquivocation, PcVoteEquivocationContext, PcVoteRound, SKIP_TIMEOUT,
-    SPC_VIEW_TIMEOUT, ShardGroupId, ShardWitness, SkipEpochCert, SkipRequest,
-    SkipRequestVerifyError, SpcCert, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError, SpcNewCommitMsg,
-    SpcNewCommitMsgVerifyError, SpcProposalObject, SpcProposalObjectVerifyError, SpcView,
-    TopologySnapshot, ValidatorId, Verifiable, Verified, Verify, WeightedTimestamp,
+    CertifiedBeaconBlockVerifyError, CertifiedBlockHeader, EPOCH_DURATION, Epoch,
+    GenesisConfigHash, LeafIndex, LocalTimestamp, MAX_EQUIVOCATIONS_PER_PROPOSER,
+    MAX_SHARD_WITNESSES_PER_PROPOSER, MAX_WITNESSES_PER_FETCH, MIN_BEACON_COMMITTEE_SIZE,
+    NetworkDefinition, PcQc3, PcValueElement, PcVector, PcVote1, PcVote1VerifyError, PcVote2,
+    PcVote2VerifyError, PcVote3, PcVote3VerifyError, PcVoteEquivocation, PcVoteEquivocationContext,
+    PcVoteRound, RETENTION_HORIZON, SKIP_TIMEOUT, SPC_VIEW_TIMEOUT, ShardGroupId, ShardWitness,
+    SkipEpochCert, SkipRequest, SkipRequestVerifyError, SpcCert, SpcEmptyViewMsg,
+    SpcEmptyViewMsgVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError, SpcProposalObject,
+    SpcProposalObjectVerifyError, SpcView, TopologySnapshot, ValidatorId, Verifiable, Verified,
+    Verify, WeightedTimestamp,
 };
 use tracing::{trace, warn};
 
@@ -44,6 +45,18 @@ use crate::spc::{MAX_PENDING_EMPTY_VIEW_AHEAD, SpcEffect, SpcEvent, SpcInstance}
 use crate::state::{apply_epoch, apply_input_for};
 use crate::verification::{BeaconVerificationPipeline, SpcMsgKind};
 use crate::witness_fetcher::ShardWitnessFetchTracker;
+
+/// Epochs of committee history the coordinator keeps queryable in its
+/// [`topology_schedule`](BeaconCoordinator). Sized to cover the oldest
+/// cross-shard artifact any consumer would still verify
+/// (`RETENTION_HORIZON` worth of epochs) plus headroom for the lookahead
+/// neighbour and the integer-division floor.
+///
+/// **Not consensus-critical**: a node with a smaller value still
+/// produces the same chain, it just can't answer some historical
+/// topology queries. A node-local cache bound, not a protocol parameter.
+const TOPOLOGY_SCHEDULE_RETENTION_EPOCHS: u64 =
+    RETENTION_HORIZON.as_secs() / EPOCH_DURATION.as_secs() + 2;
 
 /// Per-vnode beacon-chain coordinator.
 ///
@@ -110,11 +123,21 @@ pub struct BeaconCoordinator {
     /// [`FetchAbandon::BeaconProposal`] for their in-flight ids.
     pending_assemblies: BTreeMap<Epoch, PendingCommitAssembly>,
 
-    /// Read-only topology view derived from the current `BeaconState`.
+    /// Read-only topology view for the current epoch's window — the
+    /// schedule's head, broken out for lock-free hot-path access.
     /// Refreshed on every `adopt_block` so consumers (shard
     /// coordinators reading via `io_loop`'s `ArcSwap`) see the
     /// post-`apply_epoch` placement immediately after commit.
     topology_snapshot: Arc<TopologySnapshot>,
+
+    /// Per-epoch topology schedule keyed by the epoch each snapshot
+    /// governs. Spans `[current_epoch − TOPOLOGY_SCHEDULE_RETENTION_EPOCHS,
+    /// current_epoch + 1]`: the past entries verify cross-shard artifacts
+    /// up to `RETENTION_HORIZON` old, and the `+1` entry is the lookahead
+    /// finalized one epoch before its window opens. Queried by
+    /// weighted timestamp via [`topology_for`](Self::topology_for); a
+    /// node-local cache, not consensus-critical.
+    topology_schedule: BTreeMap<Epoch, Arc<TopologySnapshot>>,
 
     me: ValidatorId,
 
@@ -160,21 +183,26 @@ enum DecodeOutcome {
 }
 
 impl BeaconCoordinator {
-    /// Construct a coordinator from a pre-loaded `(latest_block,
-    /// latest_state)` pair. When `latest_block` is genesis, debug-asserts
-    /// its cert's `config_hash` matches `expected_config_hash` —
-    /// catches a runner that loaded a chain initialised by a different
-    /// operator TOML than the one this process is configured for.
+    /// Construct a coordinator from `latest_block` and a `history` of
+    /// recently-committed states (newest last; `history.last()` becomes
+    /// the live state). Each state seeds the topology schedule with its
+    /// active and lookahead snapshots, so the coordinator boots able to
+    /// verify cross-shard artifacts back across the loaded window. When
+    /// `latest_block` is genesis, debug-asserts its cert's `config_hash`
+    /// matches `expected_config_hash` — catches a runner that loaded a
+    /// chain initialised by a different operator TOML than this process
+    /// is configured for.
     ///
     /// # Panics
     ///
-    /// In debug builds, panics if `latest_block.is_genesis()` and the
-    /// cert's `config_hash` doesn't match `expected_config_hash`.
+    /// Panics if `history` is empty. In debug builds, also panics if
+    /// `latest_block.is_genesis()` and the cert's `config_hash` doesn't
+    /// match `expected_config_hash`.
     #[must_use]
     #[allow(clippy::too_many_arguments)] // identity + storage state both threaded explicitly
     pub fn new(
         latest_block: Arc<Verified<CertifiedBeaconBlock>>,
-        latest_state: BeaconState,
+        history: Vec<BeaconState>,
         me: ValidatorId,
         local_shard: ShardGroupId,
         network: NetworkDefinition,
@@ -187,9 +215,41 @@ impl BeaconCoordinator {
                 "genesis block config_hash doesn't match operator config",
             );
         }
-        let topology_snapshot = Arc::new(latest_state.derive_topology_snapshot(network.clone()));
+        // Seed the schedule from each loaded state: its active committee
+        // under its own epoch, its lookahead under the next epoch.
+        // Consecutive states agree on the shared boundary entry (one's
+        // lookahead is the next's active), so the inserts are
+        // order-independent.
+        let mut topology_schedule: BTreeMap<Epoch, Arc<TopologySnapshot>> = BTreeMap::new();
+        for state in &history {
+            topology_schedule.insert(
+                state.current_epoch,
+                Arc::new(state.derive_topology_snapshot(network.clone())),
+            );
+            topology_schedule.insert(
+                state.current_epoch.next(),
+                Arc::new(state.derive_next_topology_snapshot(network.clone())),
+            );
+        }
+        let state = history
+            .into_iter()
+            .next_back()
+            .expect("history must carry at least the latest committed state");
+        // Bound the schedule to the retention window in case the caller
+        // loaded more states than we keep; `adopt_block` holds the same
+        // bound going forward.
+        let oldest_kept = state
+            .current_epoch
+            .inner()
+            .saturating_sub(TOPOLOGY_SCHEDULE_RETENTION_EPOCHS);
+        topology_schedule.retain(|e, _| e.inner() >= oldest_kept);
+        let topology_snapshot = Arc::clone(
+            topology_schedule
+                .get(&state.current_epoch)
+                .expect("latest state's active snapshot was just inserted"),
+        );
         Self {
-            state: latest_state,
+            state,
             latest_block,
             spc: None,
             verification: BeaconVerificationPipeline::new(),
@@ -201,6 +261,7 @@ impl BeaconCoordinator {
             pending_assemblies: BTreeMap::new(),
             local_shard,
             topology_snapshot,
+            topology_schedule,
             me,
             network,
             now: LocalTimestamp::ZERO,
@@ -1671,6 +1732,26 @@ impl BeaconCoordinator {
         self.topology_snapshot =
             Arc::new(self.state.derive_topology_snapshot(self.network.clone()));
 
+        // Record the active snapshot for the just-applied epoch and the
+        // lookahead for the next, then drop entries that fell out of the
+        // retention window. The lookahead entry lets a shard resolve its
+        // committee a full epoch before its window opens.
+        let epoch = self.state.current_epoch;
+        self.topology_schedule
+            .insert(epoch, Arc::clone(&self.topology_snapshot));
+        self.topology_schedule.insert(
+            epoch.next(),
+            Arc::new(
+                self.state
+                    .derive_next_topology_snapshot(self.network.clone()),
+            ),
+        );
+        let oldest_kept = epoch
+            .inner()
+            .saturating_sub(TOPOLOGY_SCHEDULE_RETENTION_EPOCHS);
+        self.topology_schedule
+            .retain(|e, _| e.inner() >= oldest_kept);
+
         // Witness fetcher uses mark-not-remove on drain; physical
         // eviction is driven by the chain's `consumed_through`
         // advancement. Each eviction may release in-flight leaf fetches
@@ -2102,6 +2183,17 @@ const fn epoch_end_weighted_timestamp(epoch: Epoch, epoch_duration_ms: u64) -> W
     WeightedTimestamp::from_millis(epoch.inner().saturating_mul(epoch_duration_ms))
 }
 
+/// Inverse of [`epoch_end_weighted_timestamp`]: the epoch whose window
+/// contains `wt`, i.e. `floor(wt / epoch_duration)`. A `wt` exactly at
+/// `N · epoch_duration` maps to epoch `N`, matching the witness drain's
+/// `≤ N·ED` eligibility convention. Genesis-relative (`genesis_wt = 0`).
+const fn epoch_for_weighted_timestamp(wt: WeightedTimestamp, epoch_duration_ms: u64) -> Epoch {
+    match wt.as_millis().checked_div(epoch_duration_ms) {
+        Some(epoch) => Epoch::new(epoch),
+        None => Epoch::GENESIS,
+    }
+}
+
 // Flat accessors; their names and return types are the documentation.
 #[allow(missing_docs)]
 impl BeaconCoordinator {
@@ -2140,6 +2232,25 @@ impl BeaconCoordinator {
         &self.topology_snapshot
     }
 
+    /// Topology governing the window a weighted timestamp falls in — the
+    /// committee that signed any artifact attested at `wt`, and the one
+    /// every other validator resolves for it. The verification resolver:
+    /// callers map an artifact's BFT-attested timestamp (a shard QC's
+    /// `weighted_timestamp`, an execution cert's `vote_anchor_ts`) to its
+    /// committee here.
+    ///
+    /// `None` when `wt`'s epoch is outside the in-memory window: past
+    /// `TOPOLOGY_SCHEDULE_RETENTION_EPOCHS` (artifact older than
+    /// `RETENTION_HORIZON` — safe to drop) or beyond the lookahead (this
+    /// node's beacon hasn't committed that epoch yet — buffer until it
+    /// does). Use [`current_topology_snapshot`](Self::current_topology_snapshot)
+    /// for routing, never this.
+    #[must_use]
+    pub fn topology_for(&self, wt: WeightedTimestamp) -> Option<Arc<TopologySnapshot>> {
+        let epoch = epoch_for_weighted_timestamp(wt, self.state.chain_config.epoch_duration_ms);
+        self.topology_schedule.get(&epoch).map(Arc::clone)
+    }
+
     /// Number of crypto verifications dispatched but not yet resulted.
     /// Test introspection — production code shouldn't gate on this.
     #[must_use]
@@ -2173,10 +2284,10 @@ mod tests {
     use hyperscale_types::{
         BeaconBlock, BeaconBlockHash, BeaconChainConfig, BeaconGenesisConfig, Bls12381G1PrivateKey,
         Bls12381G1PublicKey, CertifiedBlockHeader, Epoch, GenesisConfigHash, GenesisPool,
-        GenesisValidator, MIN_STAKE_FLOOR, NetworkDefinition, PcVector, Randomness, ShardGroupId,
-        ShardWitness, SpcCert, SpcView, Stake, StakePoolId, ValidatorId, bls_keypair_from_seed,
-        build_qc1, build_qc2, build_qc3, genesis_config_hash, pc_context, sign_vote1, sign_vote2,
-        sign_vote3, spc_context,
+        GenesisValidator, MIN_STAKE_FLOOR, NetworkDefinition, PcVector, Randomness, ShardCommittee,
+        ShardGroupId, ShardWitness, SpcCert, SpcView, Stake, StakePoolId, ValidatorId,
+        WeightedTimestamp, bls_keypair_from_seed, build_qc1, build_qc2, build_qc3,
+        genesis_config_hash, pc_context, sign_vote1, sign_vote2, sign_vote3, spc_context,
     };
 
     use super::*;
@@ -2237,7 +2348,7 @@ mod tests {
         let pool = Arc::new(BeaconProposalPool::new(state.current_epoch.next()));
         BeaconCoordinator::new(
             block,
-            state,
+            vec![state],
             me,
             ShardGroupId::new(0),
             NetworkDefinition::simulator(),
@@ -2314,7 +2425,7 @@ mod tests {
         let pool = Arc::new(BeaconProposalPool::new(state.current_epoch.next()));
         let coord = BeaconCoordinator::new(
             Arc::clone(&block),
-            state,
+            vec![state],
             ValidatorId::new(0),
             ShardGroupId::new(0),
             NetworkDefinition::simulator(),
@@ -2334,7 +2445,7 @@ mod tests {
         let pool = Arc::new(BeaconProposalPool::new(state.current_epoch.next()));
         let coord = BeaconCoordinator::new(
             block,
-            state,
+            vec![state],
             ValidatorId::new(0),
             ShardGroupId::new(0),
             NetworkDefinition::simulator(),
@@ -2370,7 +2481,7 @@ mod tests {
         let pool = Arc::new(BeaconProposalPool::new(state.current_epoch.next()));
         let _coord = BeaconCoordinator::new(
             Arc::new(mismatched_block),
-            state,
+            vec![state],
             ValidatorId::new(0),
             ShardGroupId::new(0),
             NetworkDefinition::simulator(),
@@ -3669,6 +3780,107 @@ mod tests {
         // 4 validators all on shard 0.
         assert_eq!(snap.num_shards(), 1);
         assert_eq!(snap.committee_for_shard(ShardGroupId::new(0)).len(), 4);
+    }
+
+    // ─── topology schedule + resolver ────────────────────────────────────
+
+    /// `epoch_for_weighted_timestamp` floors to the window a timestamp
+    /// sits in: a WT exactly on a boundary belongs to the epoch it opens
+    /// (`≤ N·ED` convention), and a zero epoch duration degenerates to
+    /// genesis rather than dividing by zero.
+    #[test]
+    fn epoch_for_weighted_timestamp_floors_to_window() {
+        let ed = 300_000u64;
+        let at = |ms| epoch_for_weighted_timestamp(WeightedTimestamp::from_millis(ms), ed);
+        assert_eq!(at(0), Epoch::GENESIS);
+        assert_eq!(at(ed - 1), Epoch::GENESIS);
+        assert_eq!(at(ed), Epoch::new(1));
+        assert_eq!(at(5 * ed - 1), Epoch::new(4));
+        assert_eq!(at(5 * ed), Epoch::new(5));
+        assert_eq!(
+            epoch_for_weighted_timestamp(WeightedTimestamp::from_millis(999), 0),
+            Epoch::GENESIS
+        );
+    }
+
+    /// A state at `epoch` whose shard-0 committee (active and lookahead)
+    /// holds `size` members, so snapshots derived for different epochs
+    /// are distinguishable by committee size.
+    fn state_at(epoch: u64, size: u64) -> BeaconState {
+        let mut s = build_genesis_beacon_state(&sample_genesis());
+        s.current_epoch = Epoch::new(epoch);
+        let committee = ShardCommittee {
+            members: (0..size).map(ValidatorId::new).collect(),
+        };
+        s.shard_committees
+            .insert(ShardGroupId::new(0), committee.clone());
+        s.next_shard_committees
+            .insert(ShardGroupId::new(0), committee);
+        s
+    }
+
+    fn coord_from_history(history: Vec<BeaconState>) -> BeaconCoordinator {
+        let (block, _genesis_state, config_hash) = genesis_trio();
+        let next_epoch = history
+            .last()
+            .expect("non-empty history")
+            .current_epoch
+            .next();
+        BeaconCoordinator::new(
+            block,
+            history,
+            ValidatorId::new(0),
+            ShardGroupId::new(0),
+            NetworkDefinition::simulator(),
+            config_hash,
+            Arc::new(BeaconProposalPool::new(next_epoch)),
+        )
+    }
+
+    /// `topology_for` resolves each loaded window plus the one-epoch
+    /// lookahead, keyed correctly to its committee, and returns `None`
+    /// past the lookahead or below the loaded history. The head is the
+    /// newest active window.
+    #[test]
+    fn topology_for_resolves_active_lookahead_and_none_beyond() {
+        let coord = coord_from_history(vec![state_at(1, 4), state_at(2, 3), state_at(3, 2)]);
+        let ed = coord.current_state().chain_config.epoch_duration_ms;
+        let shard = ShardGroupId::new(0);
+        let len_at = |window: u64| {
+            coord
+                .topology_for(WeightedTimestamp::from_millis(window * ed))
+                .map(|t| t.committee_for_shard(shard).len())
+        };
+        assert_eq!(len_at(1), Some(4)); // active for epoch 1
+        assert_eq!(len_at(2), Some(3)); // epoch 2
+        assert_eq!(len_at(3), Some(2)); // epoch 3 (newest active)
+        assert_eq!(len_at(4), Some(2)); // epoch 3's lookahead
+        assert_eq!(len_at(5), None); // beyond the lookahead
+        assert_eq!(len_at(0), None); // below the loaded history
+        assert_eq!(
+            coord
+                .current_topology_snapshot()
+                .committee_for_shard(shard)
+                .len(),
+            2
+        );
+    }
+
+    /// A history longer than the retention window is bounded at
+    /// construction — the oldest epochs drop out, the newest stay.
+    #[test]
+    fn schedule_evicts_history_beyond_retention() {
+        let newest = TOPOLOGY_SCHEDULE_RETENTION_EPOCHS + 3;
+        let history: Vec<BeaconState> = (0..=newest).map(|e| state_at(e, 4)).collect();
+        let coord = coord_from_history(history);
+        let ed = coord.current_state().chain_config.epoch_duration_ms;
+        let resolves = |window: u64| {
+            coord
+                .topology_for(WeightedTimestamp::from_millis(window * ed))
+                .is_some()
+        };
+        assert!(!resolves(0), "epoch 0 should be evicted past retention");
+        assert!(resolves(newest), "newest epoch retained");
     }
 
     #[test]

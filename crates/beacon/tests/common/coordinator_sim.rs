@@ -224,7 +224,7 @@ impl CoordinatorSim {
             .map(|i| {
                 BeaconCoordinator::new(
                     Arc::clone(&genesis_block),
-                    initial_state.clone(),
+                    vec![initial_state.clone()],
                     members[i].0,
                     ShardGroupId::new(0),
                     network.clone(),

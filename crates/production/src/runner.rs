@@ -525,7 +525,7 @@ impl ProductionRunnerBuilder {
                 );
                 let beacon_coordinator = BeaconCoordinator::new(
                     Arc::clone(&beacon_latest_block),
-                    (*beacon_latest_state).clone(),
+                    vec![(*beacon_latest_state).clone()],
                     cfg.validator_id,
                     cfg.local_shard,
                     beacon_network.clone(),

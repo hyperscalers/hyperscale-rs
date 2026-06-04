@@ -155,7 +155,7 @@ fn test_beacon_coordinator(
     let pool = Arc::new(BeaconProposalPool::new(state.current_epoch.next()));
     BeaconCoordinator::new(
         block,
-        state,
+        vec![state],
         me,
         ShardGroupId::new(0),
         network,

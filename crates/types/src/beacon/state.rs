@@ -497,7 +497,8 @@ impl BeaconState {
             .collect()
     }
 
-    /// Derive an immutable [`TopologySnapshot`] from this state.
+    /// Derive the immutable [`TopologySnapshot`] for the window this
+    /// state governs — the **active** committee (`shard_committees`).
     ///
     /// The snapshot is the read-only consumer-facing view of validator
     /// placement: shard committees, per-validator pubkeys, and the
@@ -507,6 +508,24 @@ impl BeaconState {
     /// All validators are assigned uniform [`VotePower::new(1)`].
     #[must_use]
     pub fn derive_topology_snapshot(&self, network: NetworkDefinition) -> TopologySnapshot {
+        self.derive_topology_from(&self.shard_committees, network)
+    }
+
+    /// Derive the [`TopologySnapshot`] for the **next** epoch's window —
+    /// the lookahead committee (`next_shard_committees`) that becomes
+    /// active one epoch from now. The coordinator inserts this under the
+    /// next epoch's key so a shard can resolve its committee before the
+    /// window opens.
+    #[must_use]
+    pub fn derive_next_topology_snapshot(&self, network: NetworkDefinition) -> TopologySnapshot {
+        self.derive_topology_from(&self.next_shard_committees, network)
+    }
+
+    fn derive_topology_from(
+        &self,
+        committees: &BTreeMap<ShardGroupId, ShardCommittee>,
+        network: NetworkDefinition,
+    ) -> TopologySnapshot {
         let validators: Vec<ValidatorInfo> = self
             .validators
             .values()
@@ -518,13 +537,12 @@ impl BeaconState {
             .collect();
         let validator_set = ValidatorSet::new(validators);
 
-        let shard_committees: HashMap<ShardGroupId, Vec<ValidatorId>> = self
-            .shard_committees
+        let shard_committees: HashMap<ShardGroupId, Vec<ValidatorId>> = committees
             .iter()
             .map(|(sid, sc)| (*sid, sc.members.clone()))
             .collect();
 
-        let num_shards = u64::try_from(self.shard_committees.len()).unwrap_or(u64::MAX);
+        let num_shards = u64::try_from(committees.len()).unwrap_or(u64::MAX);
 
         TopologySnapshot::with_shard_committees(
             network,
