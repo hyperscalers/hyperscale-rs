@@ -90,13 +90,65 @@ impl Default for BeaconCommitCoordinator {
 
 #[cfg(test)]
 mod tests {
+    use crossbeam::channel::{Receiver, Sender, bounded};
     use hyperscale_storage::test_helpers::{make_test_beacon_block, make_test_beacon_state};
+    use hyperscale_storage::{BeaconChainReader, BeaconChainWriter};
     use hyperscale_storage_memory::SimBeaconStorage;
 
     use super::*;
 
     fn storage() -> Arc<dyn BeaconStorage> {
         Arc::new(SimBeaconStorage::new())
+    }
+
+    /// Storage whose `commit_beacon_block` parks mid-write until released,
+    /// so a test can hold one writer inside the in-flight window while a
+    /// second writer races the same `(epoch, hash)`. Reads delegate to an
+    /// inner `SimBeaconStorage`.
+    struct BlockingBeaconStorage {
+        inner: SimBeaconStorage,
+        entered: Sender<()>,
+        release: Receiver<()>,
+    }
+
+    impl BeaconChainReader for BlockingBeaconStorage {
+        fn get_beacon_block_by_epoch(
+            &self,
+            epoch: Epoch,
+        ) -> Option<Arc<Verified<CertifiedBeaconBlock>>> {
+            self.inner.get_beacon_block_by_epoch(epoch)
+        }
+        fn get_beacon_block_by_hash(
+            &self,
+            hash: BeaconBlockHash,
+        ) -> Option<Arc<Verified<CertifiedBeaconBlock>>> {
+            self.inner.get_beacon_block_by_hash(hash)
+        }
+        fn get_state_by_epoch(&self, epoch: Epoch) -> Option<Arc<BeaconState>> {
+            self.inner.get_state_by_epoch(epoch)
+        }
+        fn latest_committed_epoch(&self) -> Option<Epoch> {
+            self.inner.latest_committed_epoch()
+        }
+        fn latest_committed(
+            &self,
+        ) -> Option<(Arc<Verified<CertifiedBeaconBlock>>, Arc<BeaconState>)> {
+            self.inner.latest_committed()
+        }
+    }
+
+    impl BeaconChainWriter for BlockingBeaconStorage {
+        fn commit_beacon_block(
+            &self,
+            block: &Arc<Verified<CertifiedBeaconBlock>>,
+            state: &BeaconState,
+        ) {
+            // Signal that the write has begun (the key is now in-flight),
+            // then block until the test releases us.
+            self.entered.send(()).expect("entered receiver alive");
+            self.release.recv().expect("release sender alive");
+            self.inner.commit_beacon_block(block, state);
+        }
     }
 
     #[test]
@@ -155,6 +207,47 @@ mod tests {
                 &make_test_beacon_state(2, b"two"),
             ),
             "the next epoch advances past the watermark and writes"
+        );
+    }
+
+    #[test]
+    fn a_concurrent_writer_on_an_in_flight_block_is_deduped() {
+        let coord = Arc::new(BeaconCommitCoordinator::new());
+        let (entered_tx, entered_rx) = bounded::<()>(1);
+        let (release_tx, release_rx) = bounded::<()>(1);
+        let storage: Arc<dyn BeaconStorage> = Arc::new(BlockingBeaconStorage {
+            inner: SimBeaconStorage::new(),
+            entered: entered_tx,
+            release: release_rx,
+        });
+        let block = make_test_beacon_block(4, b"four");
+        let state = make_test_beacon_state(4, b"four");
+
+        // First writer enters the (blocking) storage write — the key is now in
+        // `in_flight`, but `committed_through` has not advanced.
+        let writer = {
+            let coord = Arc::clone(&coord);
+            let storage = Arc::clone(&storage);
+            let block = Arc::clone(&block);
+            let state = Arc::clone(&state);
+            std::thread::spawn(move || coord.commit(&storage, &block, &state))
+        };
+        entered_rx
+            .recv()
+            .expect("first writer reached the storage write");
+
+        // A second writer for the same (epoch, hash) is held off by the
+        // in-flight set — this can't be the watermark path, which hasn't moved.
+        assert!(
+            !coord.commit(&storage, &block, &state),
+            "an in-flight (epoch, hash) dedups a concurrent second writer",
+        );
+
+        // Release the first write; it is the one that actually wrote.
+        release_tx.send(()).expect("first writer still parked");
+        assert!(
+            writer.join().expect("writer thread panicked"),
+            "the first writer performed the storage write",
         );
     }
 }
