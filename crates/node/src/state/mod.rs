@@ -200,6 +200,12 @@ impl NodeStateMachine {
         &self.shard_coordinator
     }
 
+    /// Get a reference to the beacon coordinator.
+    #[must_use]
+    pub const fn beacon_coordinator(&self) -> &BeaconCoordinator {
+        &self.beacon_coordinator
+    }
+
     /// Get a reference to the execution coordinator.
     #[must_use]
     pub const fn execution_coordinator(&self) -> &ExecutionCoordinator {
@@ -255,6 +261,7 @@ impl StateMachine for NodeStateMachine {
     fn handle(&mut self, now: LocalTimestamp, event: ProtocolEvent) -> Vec<Action> {
         self.now = now;
         self.shard_coordinator.set_time(now);
+        self.beacon_coordinator.set_now(now);
         let mut actions = match event {
             // ── Timers ───────────────────────────────────────────────────
             ProtocolEvent::CleanupTimer => self.on_cleanup_timer(),

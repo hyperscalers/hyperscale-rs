@@ -307,22 +307,36 @@ impl BeaconCoordinator {
         ]
     }
 
-    /// Wall-clock duration from `now` to the upcoming epoch's boundary
-    /// (`next_epoch × chain_config.epoch_duration_ms`). Saturates to
-    /// zero if `now` is already past the boundary.
-    const fn duration_until_next_epoch_boundary(&self) -> Duration {
-        let next_epoch = self.state.current_epoch.next();
-        let boundary_ms = next_epoch
-            .inner()
-            .saturating_mul(self.state.chain_config.epoch_duration_ms);
-        Duration::from_millis(boundary_ms.saturating_sub(self.now.as_millis()))
+    /// Wall-clock boundary of the upcoming epoch —
+    /// `next_epoch × chain_config.epoch_duration_ms`. The beacon starts the
+    /// next epoch's SPC only once `now` reaches this, so its synthetic
+    /// per-epoch clock (`epoch × epoch_duration_ms`) tracks wall-clock instead
+    /// of racing ahead at SPC-round speed.
+    const fn next_epoch_boundary(&self) -> LocalTimestamp {
+        LocalTimestamp::from_millis(
+            self.state
+                .current_epoch
+                .next()
+                .inner()
+                .saturating_mul(self.state.chain_config.epoch_duration_ms),
+        )
     }
 
-    /// Whether the committee-start timer is due — i.e. wall-clock
-    /// time has reached the upcoming epoch's wall-clock boundary.
-    /// The runner combines this with its own "block not yet
-    /// committed" + "local on next committee" checks before actually
-    /// bootstrapping an SPC instance.
+    /// Wall-clock duration from `now` to [`Self::next_epoch_boundary`].
+    /// Saturates to zero if `now` is already past the boundary.
+    const fn duration_until_next_epoch_boundary(&self) -> Duration {
+        Duration::from_millis(
+            self.next_epoch_boundary()
+                .as_millis()
+                .saturating_sub(self.now.as_millis()),
+        )
+    }
+
+    /// Whether the committee-start timer is due — i.e. wall-clock time has
+    /// reached the upcoming epoch's boundary. Gates both the initial
+    /// `BeaconCommitteeStart` timer and the per-commit self-perpetuation in
+    /// [`Self::adopt_block`], so the beacon catches up to wall-clock and then
+    /// paces to it rather than cascading ahead.
     #[must_use]
     pub const fn committee_start_due(&self, epoch_boundary: LocalTimestamp) -> bool {
         self.now.as_millis() >= epoch_boundary.as_millis()
@@ -1804,9 +1818,23 @@ impl BeaconCoordinator {
             }));
         }
 
+        // Self-perpetuate the next epoch's SPC, but only once wall-clock has
+        // reached its boundary. While the beacon is behind real time (catch-up
+        // after a gap, or `now` already past the boundary) this fires straight
+        // away and the chain cascades to catch up; once the synthetic epoch
+        // clock reaches wall-clock it instead arms `BeaconCommitteeStart` for
+        // the boundary, so the beacon paces to real time rather than racing
+        // ahead at SPC-round speed.
         if self.is_on_committee() {
-            self.bootstrap_spc_for_next_epoch();
-            actions.extend(self.try_propose());
+            if self.committee_start_due(self.next_epoch_boundary()) {
+                self.bootstrap_spc_for_next_epoch();
+                actions.extend(self.try_propose());
+            } else {
+                actions.push(Action::SetTimer {
+                    id: TimerId::BeaconCommitteeStart,
+                    duration: self.duration_until_next_epoch_boundary(),
+                });
+            }
         }
 
         actions
@@ -3098,6 +3126,11 @@ mod tests {
     #[test]
     fn on_beacon_block_received_dispatches_then_adopts_valid_peer_block() {
         let mut coord = fresh_coord();
+        // Wall-clock past the boundary of the epoch *after* the one we adopt,
+        // so the self-perpetuation gate is in catch-up mode and bootstraps the
+        // next epoch's SPC.
+        let ed = coord.state.chain_config.epoch_duration_ms;
+        coord.set_now(LocalTimestamp::from_millis(2 * ed));
         let prev = coord.latest_block.block_hash();
         let block = valid_block_at(&coord, Epoch::new(1), prev);
         let block_hash = block.block_hash();
@@ -3128,6 +3161,47 @@ mod tests {
         assert_eq!(coord.latest_block.block_hash(), block_hash);
         assert!(!coord.verification.is_block_in_flight(block_hash));
         assert!(coord.spc.is_some(), "next epoch's SPC should bootstrap");
+    }
+
+    /// The beacon paces epoch production to wall-clock instead of racing ahead
+    /// at SPC-round speed. After committing an epoch while still caught up to
+    /// real time, an on-committee node leaves SPC idle and arms
+    /// `BeaconCommitteeStart` for the next boundary; once wall-clock reaches it
+    /// and the timer fires, SPC bootstraps. Without this the beacon's synthetic
+    /// per-epoch clock (`epoch × epoch_duration_ms`) outruns the shards'
+    /// weighted-time past the schedule's retention window and wedges them.
+    #[test]
+    fn adopt_paces_next_epoch_to_wall_clock_then_resumes_at_boundary() {
+        let mut coord = fresh_coord();
+        // `fresh_coord` is at now = 0, before any epoch boundary.
+        let prev = coord.latest_block.block_hash();
+        let block = valid_block_at(&coord, Epoch::new(1), prev);
+        let dispatched = coord.on_beacon_block_received(Arc::clone(&block));
+        let actions = complete_verifications(&mut coord, dispatched);
+
+        assert_eq!(coord.state.current_epoch, Epoch::new(1));
+        assert!(
+            coord.spc.is_none(),
+            "caught up to wall-clock: must not bootstrap the next epoch's SPC early",
+        );
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::SetTimer {
+                    id: TimerId::BeaconCommitteeStart,
+                    ..
+                }
+            )),
+            "must arm BeaconCommitteeStart for the boundary, got {actions:?}",
+        );
+
+        // Wall-clock reaches the boundary and the timer fires: SPC bootstraps.
+        coord.set_now(coord.next_epoch_boundary());
+        coord.on_beacon_committee_start_timer();
+        assert!(
+            coord.spc.is_some(),
+            "the armed BeaconCommitteeStart must bootstrap SPC once its boundary arrives",
+        );
     }
 
     #[test]

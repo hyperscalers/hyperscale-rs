@@ -522,11 +522,20 @@ impl CoordinatorSim {
                 "sim exceeded {max_steps} steps; commits so far: {:?}",
                 self.commit_counts(),
             );
-            assert!(
-                self.step(),
-                "sim went quiescent at step {steps} with commits {:?} < target {target_commits}",
-                self.commit_counts(),
-            );
+            if !self.step() {
+                // The beacon paces epoch production to wall-clock, so it goes
+                // quiescent between epochs waiting for the next
+                // `BeaconCommitteeStart`. Model wall-clock reaching that
+                // boundary by firing the timer; if the sim is still quiescent
+                // afterwards it is genuinely stuck.
+                self.kick_off();
+                assert!(
+                    self.step(),
+                    "sim went quiescent at step {steps} even after starting the next \
+                     epoch; commits {:?} < target {target_commits}",
+                    self.commit_counts(),
+                );
+            }
             steps += 1;
         }
         steps

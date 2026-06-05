@@ -110,4 +110,24 @@ mod tests {
             } if *duration == expected
         );
     }
+
+    /// `handle` must feed wall-clock into the beacon coordinator, not
+    /// only the shard coordinator. The beacon's epoch-pacing gate
+    /// (`committee_start_due` / `duration_until_next_epoch_boundary`)
+    /// reads this clock; left at `ZERO` the gate never fires and the
+    /// committee-start / skip timers arm against a frozen clock.
+    #[test]
+    fn handle_advances_beacon_coordinator_clock() {
+        let TestNode { mut node, .. } = TestNode::new();
+        assert_eq!(node.beacon_coordinator().now(), LocalTimestamp::ZERO);
+
+        let now = LocalTimestamp::from_millis(123_456);
+        let _ = node.handle(now, ProtocolEvent::CleanupTimer);
+
+        assert_eq!(
+            node.beacon_coordinator().now(),
+            now,
+            "handle must propagate wall-clock into the beacon coordinator",
+        );
+    }
 }

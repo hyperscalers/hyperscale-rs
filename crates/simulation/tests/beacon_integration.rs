@@ -11,8 +11,8 @@ use hyperscale_simulation::SimulationRunner;
 use hyperscale_types::{BeaconCert, BeaconChainConfig, Epoch};
 use tracing_test::traced_test;
 
-/// 1-second epoch boundary so the first kickoff fires within the test's
-/// run window. The cascade then runs at SPC-round speed.
+/// 1-second epoch boundary so paced epoch production lands several
+/// epochs within a short run window.
 const TEST_EPOCH_MS: u64 = 1000;
 
 /// 2 shards × 4 validators = 8 total. The first four sit on the
@@ -74,20 +74,25 @@ fn happy_path_commits_multiple_epochs() {
     let mut runner = SimulationRunner::new(&beacon_committee_config(), 42);
     runner.initialize_genesis();
 
-    // First `BeaconCommitteeStart` timer fires at
-    // `chain_config.epoch_duration` (1 sec here). Epochs cascade
-    // through `adopt_block` self-perpetuation at SPC-round speed
-    // afterwards; 30 sim-seconds is well past the few rounds needed
-    // for three epochs to land.
-    runner.run_until(Duration::from_secs(30));
+    // The beacon paces one epoch per `chain_config.epoch_duration` (1s
+    // here): the first committee-start fires at the epoch-1 boundary and
+    // each commit arms the next, so ~9 epochs land in ten sim-seconds.
+    // The window stays below the epoch-16 committee shuffle — at a 1s
+    // epoch a rotation stall outlasts the topology retention window
+    // (sized for production 300s epochs), so a shard block committed
+    // from the stall would reference an evicted committee.
+    runner.run_until(Duration::from_secs(10));
 
     let storage_0 = runner.beacon_storage(0).expect("host 0 exists");
     let latest = storage_0
         .latest_committed_epoch()
         .expect("at least one epoch committed past genesis");
+    // Paced production lands about one epoch per second; the upper
+    // bound holds the beacon to wall-clock rather than committing epochs
+    // as fast as SPC rounds resolve.
     assert!(
-        latest >= Epoch::new(3),
-        "expected ≥3 post-genesis epochs committed, got latest={latest:?}"
+        (3..=15).contains(&latest.inner()),
+        "expected several paced epochs (3..=15), got latest={latest:?}"
     );
 
     // Genesis lives in-memory only; `commit_beacon_block` writes from
