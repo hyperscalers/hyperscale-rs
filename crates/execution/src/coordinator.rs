@@ -45,9 +45,9 @@ use hyperscale_types::{
     Attempt, Block, BlockHash, BlockHeader, BlockHeight, BloomFilter, CertifiedBlock,
     ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote, FinalizedWave,
     FinalizedWaveVerifyError, GlobalReceiptRoot, Hash, Provisions, RoutableTransaction,
-    ShardGroupId, StoredReceipt, TopologySnapshot, TxHash, TxOutcome, ValidatorId, Verifiable,
-    Verified, VotePower, WAVE_TIMEOUT, WaveCertificate, WaveId, WeightedTimestamp, wave_leader,
-    wave_leader_at,
+    ShardGroupId, StoredReceipt, TopologySchedule, TopologySnapshot, TxHash, TxOutcome,
+    ValidatorId, Verifiable, Verified, VotePower, WAVE_TIMEOUT, WaveCertificate, WaveId,
+    WeightedTimestamp, wave_leader, wave_leader_at,
 };
 use tracing::instrument;
 
@@ -300,14 +300,24 @@ impl ExecutionCoordinator {
     /// that need to be replayed through `dispatch_execution_vote()`.
     fn setup_waves_and_dispatch(
         &mut self,
-        topology: &TopologySnapshot,
+        topology: &TopologySchedule,
         block_hash: BlockHash,
         block_height: BlockHeight,
         block_ts: WeightedTimestamp,
         transactions: &[Arc<Verifiable<RoutableTransaction>>],
     ) -> (Vec<Action>, Vec<Verifiable<ExecutionVote>>) {
-        let waves = assign_waves(topology, self.local_shard, block_height, transactions);
-        let quorum = topology.quorum_threshold_for_shard(self.local_shard);
+        let waves = assign_waves(
+            topology.head(),
+            self.local_shard,
+            block_height,
+            transactions,
+        );
+        // Setup-time leader/quorum key on the wave-start timestamp — a
+        // best-effort guess, since the wave's `vote_anchor_ts` isn't fixed
+        // until it votes. When that lands in a later epoch, the
+        // fallback-tracker path rebuilds under the correct committee; `None`
+        // (beacon hasn't reached this epoch) just skips the optimization.
+        let setup_committee = topology.at(block_ts);
         let local_shard = self.local_shard;
         let mut dispatch_actions: Vec<Action> = Vec::new();
         let mut votes_to_replay: Vec<Verifiable<ExecutionVote>> = Vec::new();
@@ -343,7 +353,7 @@ impl ExecutionCoordinator {
                     let conflicts = self.provisioning.register_tx(
                         tx_hash,
                         self.local_shard,
-                        topology,
+                        topology.head(),
                         tx.declared_reads(),
                         tx.declared_writes(),
                     );
@@ -379,8 +389,13 @@ impl ExecutionCoordinator {
             self.waves.insert_wave(wave_id.clone(), wave_state);
 
             // Only the wave leader creates a VoteTracker for aggregation.
-            let leader = wave_leader(&wave_id, topology.committee_for_shard(self.local_shard));
-            if self.me == leader {
+            // Resolved under `setup_committee` (the wave-start guess); the
+            // fallback-tracker path corrects a boundary-straddling wave whose
+            // real committee differs.
+            if let Some(committee) = setup_committee
+                && self.me == wave_leader(&wave_id, committee.committee_for_shard(local_shard))
+            {
+                let quorum = committee.quorum_threshold_for_shard(local_shard);
                 let tracker = VoteTracker::new(wave_id.clone(), block_hash, quorum);
                 self.waves.insert_tracker(wave_id.clone(), tracker);
 
@@ -517,12 +532,20 @@ impl ExecutionCoordinator {
     /// is the shard consensus-authenticated weighted timestamp determined by the wave
     /// (either `all_provisioned_at`, or `wave_start_ts + WAVE_TIMEOUT`
     /// for timeout-abort).
-    pub fn emit_vote_actions(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
-        let committee = topology.committee_for_shard(self.local_shard).to_vec();
+    pub fn emit_vote_actions(&mut self, topology: &TopologySchedule) -> Vec<Action> {
         let local_vid = self.me;
         let completions = self.scan_complete_waves();
         let mut actions = Vec::with_capacity(completions.len());
         for completion in completions {
+            // The wave's committee is the one seated at its vote anchor — the
+            // same committee that will verify the EC. `None` (beacon behind
+            // that epoch) defers this completion; it re-scans on a later commit.
+            let Some(committee) = topology
+                .at(completion.vote_anchor_ts)
+                .map(|s| s.committee_for_shard(self.local_shard).to_vec())
+            else {
+                continue;
+            };
             let leader = wave_leader(&completion.wave_id, &committee);
             // Track retry state for non-leaders so we can re-send to a
             // rotated leader if this one doesn't produce an EC.
@@ -676,7 +699,7 @@ impl ExecutionCoordinator {
     /// fallback, and early-buffer routing rules.
     pub fn on_verified_execution_vote(
         &mut self,
-        topology: &TopologySnapshot,
+        topology: &TopologySchedule,
         vote: Verified<ExecutionVote>,
     ) -> Vec<Action> {
         self.dispatch_execution_vote(topology, vote.into())
@@ -687,7 +710,7 @@ impl ExecutionCoordinator {
     /// [`Self::dispatch_execution_vote`] for the full routing rules.
     pub fn on_unverified_execution_vote(
         &mut self,
-        topology: &TopologySnapshot,
+        topology: &TopologySchedule,
         vote: ExecutionVote,
     ) -> Vec<Action> {
         self.dispatch_execution_vote(topology, vote.into())
@@ -713,11 +736,19 @@ impl ExecutionCoordinator {
     /// tracker is locked across `&mut self`, so this is unreachable.
     fn dispatch_execution_vote(
         &mut self,
-        topology: &TopologySnapshot,
+        topology: &TopologySchedule,
         vote: Verifiable<ExecutionVote>,
     ) -> Vec<Action> {
         let wave_id = vote.wave_id().clone();
         let validator_id = vote.validator();
+
+        // The committee seated at the vote's anchor — the same one whose
+        // positional bitfield the EC will carry. `None` means our beacon
+        // hasn't reached that epoch; drop and let the sender's retry re-deliver
+        // once we catch up.
+        let Some(committee) = topology.at(vote.vote_anchor_ts()) else {
+            return vec![];
+        };
 
         // Only votes from local-committee members count. A globally-known
         // validator outside this shard's committee whose vote pooled into
@@ -726,7 +757,7 @@ impl ExecutionCoordinator {
         // signatures the verifier's bitfield-derived pubkey pool excludes
         // — guaranteed to fail verification and waste a leader rotation.
         // Mirrors `vote_keeper::record_received_vote`.
-        if topology
+        if committee
             .committee_index_for_shard(self.local_shard, validator_id)
             .is_none()
         {
@@ -749,7 +780,7 @@ impl ExecutionCoordinator {
             }
             // Wave exists but no VoteTracker and no EC yet. This validator
             // was targeted as a fallback leader (rotated attempt). Create tracker.
-            let quorum = topology.quorum_threshold_for_shard(self.local_shard);
+            let quorum = committee.quorum_threshold_for_shard(self.local_shard);
             let block_hash = self
                 .waves
                 .get_wave(&wave_id)
@@ -793,10 +824,10 @@ impl ExecutionCoordinator {
         // Committee membership was confirmed above; the topology snapshot
         // invariant guarantees both the public key and the voting power
         // resolve.
-        let public_key = topology
+        let public_key = committee
             .public_key(validator_id)
             .expect("committee member has public key (TopologySnapshot invariant)");
-        let voting_power = topology
+        let voting_power = committee
             .voting_power(validator_id)
             .expect("committee member has voting power (TopologySnapshot invariant)");
 
@@ -847,16 +878,20 @@ impl ExecutionCoordinator {
     /// Handle a verified execution vote (own vote or already-verified).
     fn handle_verified_vote(
         &mut self,
-        topology: &TopologySnapshot,
+        topology: &TopologySchedule,
         vote: Verified<ExecutionVote>,
     ) -> Vec<Action> {
         let wave_id = vote.wave_id().clone();
-        // Callers (`on_execution_vote` for own votes, `on_votes_verified`
-        // for verified votes that already passed the committee filter)
-        // guarantee `vote.validator()` is in the local committee.
-        let voting_power = topology
-            .voting_power(vote.validator())
-            .expect("committee member has voting power (TopologySnapshot invariant)");
+        // Power resolves against the committee seated at the vote's anchor —
+        // the same committee that will verify the EC. Callers guarantee
+        // `vote.validator()` is in the local committee, so `None` here means
+        // only that our beacon hasn't reached that epoch: drop the vote.
+        let Some(voting_power) = topology
+            .at(vote.vote_anchor_ts())
+            .and_then(|c| c.voting_power(vote.validator()))
+        else {
+            return vec![];
+        };
 
         let Some(tracker) = self.waves.get_tracker_mut(&wave_id) else {
             return vec![];
@@ -872,11 +907,18 @@ impl ExecutionCoordinator {
     /// Handle provisions execution vote verification completed.
     pub fn on_votes_verified(
         &mut self,
-        topology: &TopologySnapshot,
+        topology: &TopologySchedule,
         wave_id: WaveId,
         block_hash: BlockHash,
         verified_votes: Vec<(Verified<ExecutionVote>, VotePower)>,
     ) -> Vec<Action> {
+        // Diagnostic quorum threshold for the split-root warning below, keyed
+        // on the votes' anchor before they're consumed into the tracker.
+        let warn_quorum = verified_votes
+            .first()
+            .and_then(|(v, _)| topology.at(v.vote_anchor_ts()))
+            .map(|s| s.quorum_threshold_for_shard(self.local_shard));
+
         let Some(tracker) = self.waves.get_tracker_mut(&wave_id) else {
             return vec![];
         };
@@ -890,9 +932,9 @@ impl ExecutionCoordinator {
         // Warn if we have enough total power for quorum but it's split
         // across multiple global receipt roots — this means validators disagree
         // on execution results.
-        if tracker.check_quorum().is_none()
-            && tracker.total_verified_power()
-                >= topology.quorum_threshold_for_shard(self.local_shard)
+        if let Some(quorum) = warn_quorum
+            && tracker.check_quorum().is_none()
+            && tracker.total_verified_power() >= quorum
             && tracker.distinct_global_receipt_root_count() > 1
         {
             let summary = tracker.global_receipt_root_power_summary();
@@ -900,7 +942,7 @@ impl ExecutionCoordinator {
                 block_hash = ?block_hash,
                 wave = %wave_id,
                 global_receipt_root_split = ?summary,
-                quorum = topology.quorum_threshold_for_shard(self.local_shard).inner(),
+                quorum = quorum.inner(),
                 "Execution vote quorum blocked: global receipt roots are split across validators"
             );
         }
@@ -911,12 +953,25 @@ impl ExecutionCoordinator {
     }
 
     /// Check if quorum is reached for a wave's votes.
-    fn check_vote_quorum(&mut self, topology: &TopologySnapshot, wave_id: WaveId) -> Vec<Action> {
+    fn check_vote_quorum(&mut self, topology: &TopologySchedule, wave_id: WaveId) -> Vec<Action> {
+        let local_shard = self.local_shard;
         let Some(tracker) = self.waves.get_tracker_mut(&wave_id) else {
             return vec![];
         };
 
         let Some((global_receipt_root, vote_anchor_ts, _total_power)) = tracker.check_quorum()
+        else {
+            return vec![];
+        };
+
+        // The EC's signer bitfield is positional against the committee seated
+        // at `vote_anchor_ts` — the committee every verifier resolves from the
+        // EC's own anchor. Resolve it before consuming the votes; `None`
+        // (beacon behind this epoch) leaves the tracker intact to re-check on a
+        // later commit.
+        let Some(committee) = topology
+            .at(vote_anchor_ts)
+            .map(|s| s.committee_for_shard(local_shard).to_vec())
         else {
             return vec![];
         };
@@ -931,7 +986,6 @@ impl ExecutionCoordinator {
         );
 
         let votes = tracker.take_votes(global_receipt_root, vote_anchor_ts);
-        let committee = topology.committee_for_shard(self.local_shard).to_vec();
 
         // Remove the vote tracker — this EC is the shard's final answer.
         // Mark wave as having an EC to skip it in scan_complete_waves.
@@ -977,11 +1031,14 @@ impl ExecutionCoordinator {
     /// then feeds it to the wave-level certificate tracker for finalization.
     pub fn on_certificate_aggregated(
         &mut self,
-        topology: &TopologySnapshot,
+        topology: &TopologySchedule,
         wave_id: &WaveId,
         certificate: &Arc<Verified<ExecutionCertificate>>,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
+        // EC broadcast is routing — who should receive it now — so recipients
+        // key on the active head, not the EC's anchor committee.
+        let head = topology.head();
 
         // The wave_id IS the set of remote shards — no need to look up the
         // accumulator (which may have been pruned by the time the cert is
@@ -993,7 +1050,7 @@ impl ExecutionCoordinator {
         self.exec_certs.insert(Arc::clone(certificate));
 
         // Broadcast EC to all local peers (they don't aggregate — they need it).
-        let local_peers = peers_excluding_self(topology, self.me, self.local_shard);
+        let local_peers = peers_excluding_self(head, self.me, self.local_shard);
         if !local_peers.is_empty() {
             actions.push(Action::BroadcastExecutionCertificate {
                 shard: self.local_shard,
@@ -1006,7 +1063,7 @@ impl ExecutionCoordinator {
         // send so a dropped notify is re-emitted before the source's 24s
         // fallback timer trips — symmetric to ef4eb45a on provisions.
         for target_shard in &remote_shards {
-            let recipients: Vec<ValidatorId> = topology.committee_for_shard(*target_shard).to_vec();
+            let recipients: Vec<ValidatorId> = head.committee_for_shard(*target_shard).to_vec();
             self.outbound_certs.on_broadcast(
                 Arc::clone(certificate),
                 *target_shard,
@@ -1027,7 +1084,7 @@ impl ExecutionCoordinator {
         );
 
         // Feed the EC to the wave-level certificate tracker for finalization.
-        actions.extend(self.handle_wave_attestation(topology, certificate));
+        actions.extend(self.handle_wave_attestation(certificate));
 
         actions
     }
@@ -1042,7 +1099,7 @@ impl ExecutionCoordinator {
     /// that the replay path later trusts.
     pub fn on_wave_certificate(
         &mut self,
-        topology: &TopologySnapshot,
+        topology: &TopologySchedule,
         cert: Verifiable<ExecutionCertificate>,
     ) -> Vec<Action> {
         let shard = cert.shard_group_id();
@@ -1079,10 +1136,13 @@ impl ExecutionCoordinator {
             return vec![];
         }
 
-        let Some(public_keys) = committee_public_keys_for_shard(topology, shard) else {
+        let Some(public_keys) = topology
+            .at(cert.vote_anchor_ts())
+            .and_then(|committee| committee_public_keys_for_shard(committee, shard))
+        else {
             tracing::warn!(
                 shard = shard.inner(),
-                "Could not resolve all public keys for execution cert verification"
+                "Could not resolve EC committee keys (beacon behind or snapshot incomplete)"
             );
             // Verification will never complete; release the in-flight slot
             // so a subsequent arrival isn't permanently shadowed.
@@ -1105,7 +1165,7 @@ impl ExecutionCoordinator {
     /// blocks haven't committed yet for replay.
     pub fn on_certificate_verified(
         &mut self,
-        topology: &TopologySnapshot,
+        topology: &TopologySchedule,
         result: Result<
             Arc<Verified<ExecutionCertificate>>,
             (Arc<ExecutionCertificate>, ExecutionCertificateVerifyError),
@@ -1138,8 +1198,20 @@ impl ExecutionCoordinator {
 
         // A single Byzantine signer can produce a cryptographically valid
         // EC; require 2f+1 voting power on the EC's own shard before any
-        // state mutation downstream.
-        if !ec_has_shard_quorum_power(topology, &ec_arc) {
+        // state mutation downstream. The committee is the one seated at the
+        // EC's anchor; `None` (our beacon behind that epoch) abandons the
+        // fetch so a later catch-up re-resolves it.
+        let Some(committee) = topology.at(ec_arc.vote_anchor_ts()) else {
+            tracing::warn!(
+                shard = ec_arc.shard_group_id().inner(),
+                wave = %ec_arc.wave_id(),
+                "Discarding execution certificate — beacon behind its epoch"
+            );
+            return vec![Action::AbandonFetch(FetchAbandon::ExecutionCerts {
+                ids: vec![ec_arc.wave_id().clone()],
+            })];
+        };
+        if !ec_has_shard_quorum_power(committee, &ec_arc) {
             tracing::warn!(
                 shard = ec_arc.shard_group_id().inner(),
                 wave = %ec_arc.wave_id(),
@@ -1192,7 +1264,7 @@ impl ExecutionCoordinator {
             self.exec_certs.insert(Arc::clone(&ec_arc));
         }
 
-        actions.extend(self.handle_wave_attestation(topology, &ec_arc));
+        actions.extend(self.handle_wave_attestation(&ec_arc));
         actions
     }
 
@@ -1276,13 +1348,12 @@ impl ExecutionCoordinator {
     /// returns a [`RetryEffect`] for each fired retry with the new attempt
     /// number; the coordinator resolves the rotated leader via topology
     /// and lifts each effect to `Action::SignAndSendExecutionVote`.
-    fn check_vote_retry_timeouts(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
+    fn check_vote_retry_timeouts(&mut self, topology: &TopologySchedule) -> Vec<Action> {
         let effects = self.waves.check_vote_retry_timeouts(self.committed_ts);
         if effects.is_empty() {
             return Vec::new();
         }
 
-        let committee = topology.committee_for_shard(self.local_shard).to_vec();
         let mut actions = Vec::with_capacity(effects.len());
         for RetryEffect {
             wave_id,
@@ -1294,6 +1365,15 @@ impl ExecutionCoordinator {
             tx_outcomes,
         } in effects
         {
+            // The rotated leader is drawn from the committee seated at the
+            // wave's anchor — the one that will verify the EC. `None` (beacon
+            // behind) defers this retry to a later commit.
+            let Some(committee) = topology
+                .at(vote_anchor_ts)
+                .map(|s| s.committee_for_shard(self.local_shard).to_vec())
+            else {
+                continue;
+            };
             let new_leader = wave_leader_at(&wave_id, attempt, &committee);
             tracing::info!(
                 wave = %wave_id,
@@ -1343,7 +1423,7 @@ impl ExecutionCoordinator {
     ///    fires before the wave it references is pruned away.
     /// 5. **Dispatch** — route to the live or sealed path for block-specific
     ///    work (wave setup + dispatch, or late-cert routing).
-    #[instrument(skip(self, certified), fields(
+    #[instrument(skip(self, certified, topology), fields(
         height = certified.block().height().inner(),
         block_hash = ?certified.block().hash(),
         tx_count = certified.block().transactions().len(),
@@ -1351,7 +1431,7 @@ impl ExecutionCoordinator {
     ))]
     pub fn on_block_committed(
         &mut self,
-        topology: &TopologySnapshot,
+        topology: &TopologySchedule,
         certified: &CertifiedBlock,
     ) -> Vec<Action> {
         let block = certified.block();
@@ -1459,7 +1539,7 @@ impl ExecutionCoordinator {
     /// to `Provisioned` immediately.
     fn on_live_block_committed(
         &mut self,
-        topology: &TopologySnapshot,
+        topology: &TopologySchedule,
         block_hash: BlockHash,
         header: &BlockHeader,
         transactions: &[Arc<Verifiable<RoutableTransaction>>],
@@ -1472,7 +1552,7 @@ impl ExecutionCoordinator {
         if self.me == header.proposer() {
             let local_shard = self.local_shard;
             if let Some((requests, shard_recipients)) =
-                build_provision_requests(topology, transactions, self.me, local_shard)
+                build_provision_requests(topology.head(), transactions, self.me, local_shard)
             {
                 actions.push(Action::FetchAndBroadcastProvisions {
                     block_hash,
@@ -1503,7 +1583,7 @@ impl ExecutionCoordinator {
                 actions.extend(self.dispatch_execution_vote(topology, vote));
             }
 
-            actions.extend(self.replay_early_wave_attestations(topology, transactions));
+            actions.extend(self.replay_early_wave_attestations(transactions));
         }
 
         // Apply this block's provisions after wave setup so newly-created
@@ -1523,15 +1603,15 @@ impl ExecutionCoordinator {
     /// tx for mempool terminal-state bookkeeping.
     fn on_sealed_block_committed(
         &mut self,
-        topology: &TopologySnapshot,
+        topology: &TopologySchedule,
         header: &BlockHeader,
         transactions: &[Arc<Verifiable<RoutableTransaction>>],
     ) -> Vec<Action> {
         if transactions.is_empty() {
             return Vec::new();
         }
-        self.register_sealed_wave_assignments(topology, header.height(), transactions);
-        self.replay_early_wave_attestations(topology, transactions)
+        self.register_sealed_wave_assignments(topology.head(), header.height(), transactions);
+        self.replay_early_wave_attestations(transactions)
     }
 
     /// Replay buffered early ECs for txs that have just received wave
@@ -1540,7 +1620,6 @@ impl ExecutionCoordinator {
     /// tx target to route to.
     fn replay_early_wave_attestations(
         &mut self,
-        topology: &TopologySnapshot,
         transactions: &[Arc<Verifiable<RoutableTransaction>>],
     ) -> Vec<Action> {
         let tx_hashes: Vec<TxHash> = transactions.iter().map(|tx| tx.hash()).collect();
@@ -1554,7 +1633,7 @@ impl ExecutionCoordinator {
         );
         let mut actions = Vec::new();
         for ec in &ecs_to_replay {
-            actions.extend(self.handle_wave_attestation(topology, ec));
+            actions.extend(self.handle_wave_attestation(ec));
         }
         actions
     }
@@ -1593,11 +1672,7 @@ impl ExecutionCoordinator {
     /// local assignment are buffered (or kept buffered) via `pending_routing`
     /// until their blocks commit; routed `tx_hashes` are cleared from the
     /// pending set, dropping the EC entirely once fully routed.
-    fn handle_wave_attestation(
-        &mut self,
-        _topology: &TopologySnapshot,
-        ec: &Arc<Verified<ExecutionCertificate>>,
-    ) -> Vec<Action> {
+    fn handle_wave_attestation(&mut self, ec: &Arc<Verified<ExecutionCertificate>>) -> Vec<Action> {
         let routing = self.waves.classify_attestation(ec);
 
         self.early.clear_routed(ec, &routing.routed_tx_hashes);
@@ -1677,7 +1752,7 @@ impl ExecutionCoordinator {
     #[must_use]
     pub fn admit_finalized_wave(
         &mut self,
-        topology: &TopologySnapshot,
+        topology: &TopologySchedule,
         wave: Arc<Verifiable<FinalizedWave>>,
     ) -> Vec<Action> {
         let wave_id = wave.wave_id().clone();
@@ -1709,7 +1784,21 @@ impl ExecutionCoordinator {
         let mut ec_public_keys = Vec::with_capacity(ecs.len());
         for ec in ecs {
             let shard = ec.shard_group_id();
-            if !ec_has_shard_quorum_power(topology, ec.as_unverified()) {
+            // Each contained EC is verified against the committee seated at its
+            // own anchor on its own shard. `None` (our beacon behind that
+            // epoch) abandons the fetch for a later catch-up.
+            let Some(committee) = topology.at(ec.vote_anchor_ts()) else {
+                tracing::warn!(
+                    wave = %wave.wave_id(),
+                    shard = shard.inner(),
+                    "Rejecting fetched FinalizedWave: beacon behind a contained EC's epoch"
+                );
+                self.pending_finalized_wave_verifications.remove(&wave_id);
+                return vec![Action::AbandonFetch(FetchAbandon::FinalizedWaves {
+                    ids: vec![wave_id],
+                })];
+            };
+            if !ec_has_shard_quorum_power(committee, ec.as_unverified()) {
                 tracing::warn!(
                     wave = %wave.wave_id(),
                     shard = shard.inner(),
@@ -1720,7 +1809,7 @@ impl ExecutionCoordinator {
                     ids: vec![wave_id],
                 })];
             }
-            let Some(public_keys) = committee_public_keys_for_shard(topology, shard) else {
+            let Some(public_keys) = committee_public_keys_for_shard(committee, shard) else {
                 tracing::warn!(
                     wave = %wave.wave_id(),
                     shard = shard.inner(),
@@ -2003,14 +2092,14 @@ mod tests {
     };
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
-        Bls12381G1PrivateKey, ConsensusReceipt, ExecutionOutcome, GlobalReceiptHash, Hash,
-        NetworkDefinition, QuorumCertificate, SignerBitfield, ValidatorInfo, ValidatorSet,
-        VotePower, generate_bls_keypair, zero_bls_signature,
+        Bls12381G1PrivateKey, Bls12381G1PublicKey, ConsensusReceipt, Epoch, ExecutionOutcome,
+        GlobalReceiptHash, Hash, NetworkDefinition, QuorumCertificate, SignerBitfield,
+        ValidatorInfo, ValidatorSet, VotePower, generate_bls_keypair, zero_bls_signature,
     };
 
     use super::*;
 
-    fn make_test_topology() -> TopologySnapshot {
+    fn make_test_topology() -> TopologySchedule {
         let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
 
         let validators: Vec<ValidatorInfo> = keys
@@ -2024,7 +2113,11 @@ mod tests {
             .collect();
         let validator_set = ValidatorSet::new(validators);
 
-        TopologySnapshot::new(NetworkDefinition::simulator(), 1, validator_set)
+        TopologySchedule::single(Arc::new(TopologySnapshot::new(
+            NetworkDefinition::simulator(),
+            1,
+            validator_set,
+        )))
     }
 
     fn make_test_state() -> ExecutionCoordinator {
@@ -2036,7 +2129,7 @@ mod tests {
     }
 
     fn make_live_block(
-        _topology: &TopologySnapshot,
+        _topology: &TopologySchedule,
         height: BlockHeight,
         timestamp_ms: u64,
         proposer: ValidatorId,
@@ -2089,7 +2182,7 @@ mod tests {
         assert!(state.waves.contains_wave(&wave_id.unwrap()));
     }
 
-    fn make_topology() -> TopologySnapshot {
+    fn make_topology() -> TopologySchedule {
         let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
         let validators: Vec<ValidatorInfo> = keys
             .iter()
@@ -2101,7 +2194,11 @@ mod tests {
             })
             .collect();
         let validator_set = ValidatorSet::new(validators);
-        TopologySnapshot::new(NetworkDefinition::simulator(), 1, validator_set)
+        TopologySchedule::single(Arc::new(TopologySnapshot::new(
+            NetworkDefinition::simulator(),
+            1,
+            validator_set,
+        )))
     }
 
     #[test]
@@ -2110,7 +2207,10 @@ mod tests {
 
         // Determine who the wave leader will be for this block's wave.
         let topo0 = make_topology();
-        let committee = topo0.committee_for_shard(ShardGroupId::new(0)).to_vec();
+        let committee = topo0
+            .head()
+            .committee_for_shard(ShardGroupId::new(0))
+            .to_vec();
         let block = make_live_block(
             &topo0,
             BlockHeight::new(1),
@@ -2169,7 +2269,10 @@ mod tests {
     fn test_fallback_tracker_created_on_vote() {
         let tx = test_transaction(1);
         let topo = make_topology();
-        let committee = topo.committee_for_shard(ShardGroupId::new(0)).to_vec();
+        let committee = topo
+            .head()
+            .committee_for_shard(ShardGroupId::new(0))
+            .to_vec();
         let block = make_live_block(
             &topo,
             BlockHeight::new(1),
@@ -2237,7 +2340,7 @@ mod tests {
         // pool its cross-shard power into the tracker and trigger premature
         // aggregation that produces an EC the BLS verifier will reject.
         let topo = make_two_shard_topology();
-        let local = topo.committee_for_shard(ShardGroupId::new(0));
+        let local = topo.head().committee_for_shard(ShardGroupId::new(0));
         let outsider = (0u64..4)
             .map(ValidatorId::new)
             .find(|v| !local.contains(v))
@@ -2276,7 +2379,10 @@ mod tests {
         use crate::waves::VOTE_RETRY_TIMEOUT;
         let wave_id = WaveId::new(ShardGroupId::new(0), BlockHeight::new(1), BTreeSet::new());
         let topo = make_test_topology();
-        let committee = topo.committee_for_shard(ShardGroupId::new(0)).to_vec();
+        let committee = topo
+            .head()
+            .committee_for_shard(ShardGroupId::new(0))
+            .to_vec();
 
         let mut state = make_test_state();
         state.committed_height = BlockHeight::new(20);
@@ -3115,7 +3221,7 @@ mod tests {
 
     /// Multi-shard topology for expected-cert tests: 4 validators, 2 shards.
     /// Local is validator 0 (shard 0); shard 1 = {1, 3}.
-    fn make_two_shard_topology() -> TopologySnapshot {
+    fn make_two_shard_topology() -> TopologySchedule {
         let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
         let validators: Vec<ValidatorInfo> = keys
             .iter()
@@ -3126,11 +3232,145 @@ mod tests {
                 voting_power: VotePower::new(1),
             })
             .collect();
-        TopologySnapshot::new(
+        TopologySchedule::single(Arc::new(TopologySnapshot::new(
             NetworkDefinition::simulator(),
             2,
             ValidatorSet::new(validators),
-        )
+        )))
+    }
+
+    /// A uniform-power committee over `ids`, one shard, plus its public keys in
+    /// committee order (what `committee_public_keys_for_shard` returns).
+    fn committee_snapshot(ids: &[u64]) -> (TopologySnapshot, Vec<Bls12381G1PublicKey>) {
+        let validators: Vec<ValidatorInfo> = ids
+            .iter()
+            .map(|&id| {
+                let k = generate_bls_keypair();
+                ValidatorInfo {
+                    validator_id: ValidatorId::new(id),
+                    public_key: k.public_key(),
+                    voting_power: VotePower::new(1),
+                }
+            })
+            .collect();
+        let pubkeys = validators.iter().map(|v| v.public_key).collect();
+        let snapshot = TopologySnapshot::new(
+            NetworkDefinition::simulator(),
+            1,
+            ValidatorSet::new(validators),
+        );
+        (snapshot, pubkeys)
+    }
+
+    /// Committee A governs epoch 0 (the routing head); committee B, with
+    /// disjoint signing keys, governs epoch 1. A remote EC whose
+    /// `vote_anchor_ts` lands in epoch 1 must dispatch BLS verification against
+    /// B's keys — the committee seated at the EC's anchor — not the head.
+    #[test]
+    fn remote_ec_verification_resolves_committee_at_its_vote_anchor() {
+        const ED: u64 = 1_000;
+        let shard = ShardGroupId::new(0);
+
+        let (snap_a, keys_a) = committee_snapshot(&[0, 1, 2, 3]);
+        let (snap_b, keys_b) = committee_snapshot(&[4, 5, 6, 7]);
+        assert_ne!(keys_a, keys_b, "committees must have distinct keys");
+
+        let mut schedule = TopologySchedule::new(ED, 100, Epoch::new(0), Arc::new(snap_a));
+        schedule.insert(Epoch::new(1), Arc::new(snap_b));
+
+        let mut coord = make_test_state();
+        let cert = ExecutionCertificate::new(
+            WaveId::new(shard, BlockHeight::new(1), BTreeSet::new()),
+            WeightedTimestamp::from_millis(ED), // epoch 1
+            GlobalReceiptRoot::ZERO,
+            vec![],
+            zero_bls_signature(),
+            SignerBitfield::new(4),
+        );
+
+        let actions = coord.on_wave_certificate(&schedule, Verifiable::from(cert));
+        let public_keys = actions
+            .iter()
+            .find_map(|a| match a {
+                Action::VerifyExecutionCertificateSignature { public_keys, .. } => {
+                    Some(public_keys)
+                }
+                _ => None,
+            })
+            .expect("on_wave_certificate dispatches a signature verification");
+        assert_eq!(
+            *public_keys, keys_b,
+            "remote EC must verify against the committee at its vote_anchor_ts, not the head",
+        );
+    }
+
+    /// The leader-side counterpart to the test above: when a local vote quorum
+    /// forms, `check_vote_quorum` packs the committee at the wave's
+    /// `vote_anchor_ts` into the EC. That committee positions the signer
+    /// bitfield every verifier later resolves, so it must be the epoch-1
+    /// committee (the wave is anchored there), not the head.
+    #[test]
+    fn local_aggregation_packs_committee_at_vote_anchor() {
+        const ED: u64 = 1_000;
+        let shard = ShardGroupId::new(0);
+
+        let (snap_a, _keys_a) = committee_snapshot(&[0, 1, 2, 3]);
+        let (snap_b, _keys_b) = committee_snapshot(&[4, 5, 6, 7]);
+        let committee_b: Vec<ValidatorId> = snap_b.committee_for_shard(shard).to_vec();
+        let mut schedule = TopologySchedule::new(ED, 100, Epoch::new(0), Arc::new(snap_a));
+        schedule.insert(Epoch::new(1), Arc::new(snap_b));
+
+        // Local node is a committee-B member; commit a single-shard wave anchored
+        // in epoch 1 (block weighted timestamp = ED, so vote_anchor_ts = ED).
+        let mut coord = make_test_state_for(ValidatorId::new(4));
+        let block = make_live_block(
+            &schedule,
+            BlockHeight::new(1),
+            ED,
+            ValidatorId::new(4),
+            vec![Arc::new(test_transaction(1))],
+        );
+        let block_hash = block.hash();
+        coord.on_block_committed(&schedule, &test_certify(block, ED));
+        let wave_id = coord
+            .waves
+            .waves_iter()
+            .next()
+            .map(|(w, _)| w.clone())
+            .expect("single-shard wave created on commit");
+
+        // Feed a 2f+1 quorum of verified votes from committee B, all sharing the
+        // wave's anchor and receipt root so they land in one quorum bucket.
+        let mut actions = Vec::new();
+        for v in [4u64, 5, 6] {
+            let vote = ExecutionVote::new(
+                block_hash,
+                BlockHeight::new(1),
+                WeightedTimestamp::from_millis(ED),
+                wave_id.clone(),
+                shard,
+                GlobalReceiptRoot::ZERO,
+                1,
+                vec![],
+                ValidatorId::new(v),
+                zero_bls_signature(),
+            );
+            actions.extend(
+                coord.on_verified_execution_vote(&schedule, Verified::new_unchecked_for_test(vote)),
+            );
+        }
+
+        let committee = actions
+            .iter()
+            .find_map(|a| match a {
+                Action::AggregateExecutionCertificate { committee, .. } => Some(committee),
+                _ => None,
+            })
+            .expect("vote quorum dispatches certificate aggregation");
+        assert_eq!(
+            *committee, committee_b,
+            "the EC's bitfield committee must be the one at vote_anchor_ts (epoch 1), not the head",
+        );
     }
 
     /// Expected-cert entries must be retained while any local `WaveState`

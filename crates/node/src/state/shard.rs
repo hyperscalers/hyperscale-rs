@@ -424,10 +424,10 @@ impl NodeStateMachine {
         self.execution_coordinator
             .cleanup_committed_waves(certified.block().certificates());
 
-        actions.extend(self.execution_coordinator.on_block_committed(
-            self.beacon_coordinator.current_topology_snapshot(),
-            certified,
-        ));
+        actions.extend(
+            self.execution_coordinator
+                .on_block_committed(self.beacon_coordinator.topology_schedule(), certified),
+        );
 
         // Round voting: scan all incomplete waves and emit votes for
         // complete ones. Single path to execution voting — abort intents
@@ -436,7 +436,7 @@ impl NodeStateMachine {
         // validators at this height produce the same votes.
         actions.extend(
             self.execution_coordinator
-                .emit_vote_actions(self.beacon_coordinator.current_topology_snapshot()),
+                .emit_vote_actions(self.beacon_coordinator.topology_schedule()),
         );
 
         actions

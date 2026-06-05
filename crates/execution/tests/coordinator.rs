@@ -5,18 +5,21 @@
 //! API is caught here rather than by inline tests that can reach into
 //! private fields.
 
+use std::sync::Arc;
+
 use hyperscale_execution::{ExecutionCoordinator, ExecutionMemoryStats};
 use hyperscale_test_helpers::TestCommittee;
 use hyperscale_types::{
-    BlockHeight, Hash, ShardGroupId, TopologySnapshot, TxHash, ValidatorId, WaveId,
+    BlockHeight, Hash, ShardGroupId, TopologySchedule, TxHash, ValidatorId, WaveId,
 };
 
 fn fresh_coordinator() -> ExecutionCoordinator {
     ExecutionCoordinator::new(ValidatorId::new(0), ShardGroupId::new(0))
 }
 
-fn fresh_coordinator_with_topology() -> (ExecutionCoordinator, TopologySnapshot) {
-    let topology = TestCommittee::new(4, 42).topology_snapshot(1);
+fn fresh_coordinator_with_topology() -> (ExecutionCoordinator, TopologySchedule) {
+    let topology =
+        TopologySchedule::single(Arc::new(TestCommittee::new(4, 42).topology_snapshot(1)));
     (fresh_coordinator(), topology)
 }
 
