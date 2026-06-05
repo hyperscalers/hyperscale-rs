@@ -37,7 +37,7 @@
 //! Validators collect shard execution proofs from all participating shards. When all
 //! proofs are received, a `WaveCertificate` is created.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use hyperscale_core::{Action, FetchAbandon, FetchRequest, ProtocolEvent};
@@ -125,6 +125,12 @@ pub struct ExecutionMemoryStats {
     pub outbound_certs: usize,
 }
 
+/// Per-shard cap on cross-shard artifacts (ECs, finalized waves) buffered
+/// awaiting their committee's epoch (this node's beacon hasn't reached it).
+/// Drop-oldest past this bound; a node this far behind re-fetches the dropped
+/// artifacts regardless. Node-local cache bound, not consensus-critical.
+const MAX_AWAITING_TOPOLOGY_PER_SHARD: usize = 256;
+
 /// Execution state machine.
 ///
 /// Handles transaction execution after blocks are committed.
@@ -211,6 +217,21 @@ pub struct ExecutionCoordinator {
     /// fetch arrival for the same wave can short-circuit the BLS pool.
     pending_finalized_wave_verifications: HashSet<WaveId>,
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // Beacon-sync-lag buffers
+    // ═══════════════════════════════════════════════════════════════════════
+    /// Cross-shard ECs whose committee epoch this node's beacon hasn't reached,
+    /// so `at(vote_anchor_ts)` can't resolve the signing committee. Keyed by the
+    /// EC's own shard, bounded per shard (drop-oldest). Re-attempted on
+    /// `BeaconBlockPersisted`. Pure catch-up: a buffered EC means *we* are
+    /// behind, since under lookahead its committee is already globally fixed.
+    awaiting_certs: HashMap<ShardGroupId, VecDeque<Verifiable<ExecutionCertificate>>>,
+
+    /// Fetched `FinalizedWave`s deferred for the same reason — a contained EC's
+    /// committee epoch isn't in our schedule yet. Keyed by the wave's own shard;
+    /// re-attempted on `BeaconBlockPersisted`.
+    awaiting_waves: HashMap<ShardGroupId, VecDeque<Arc<Verifiable<FinalizedWave>>>>,
+
     /// This validator's identity.
     me: ValidatorId,
 
@@ -257,6 +278,8 @@ impl ExecutionCoordinator {
             exec_certs,
             pending_ec_verifications: HashSet::new(),
             pending_finalized_wave_verifications: HashSet::new(),
+            awaiting_certs: HashMap::new(),
+            awaiting_waves: HashMap::new(),
             me,
             local_shard,
         }
@@ -1136,13 +1159,18 @@ impl ExecutionCoordinator {
             return vec![];
         }
 
-        let Some(public_keys) = topology
-            .at(cert.vote_anchor_ts())
-            .and_then(|committee| committee_public_keys_for_shard(committee, shard))
-        else {
+        let Some(committee) = topology.at(cert.vote_anchor_ts()) else {
+            // Beacon hasn't reached this EC's epoch — buffer for replay on
+            // catch-up rather than abandoning and re-fetching. Release the
+            // in-flight slot so the replay re-dispatches.
+            self.pending_ec_verifications.remove(&wire_hash);
+            self.buffer_awaiting_cert(cert);
+            return vec![];
+        };
+        let Some(public_keys) = committee_public_keys_for_shard(committee, shard) else {
             tracing::warn!(
                 shard = shard.inner(),
-                "Could not resolve EC committee keys (beacon behind or snapshot incomplete)"
+                "Could not resolve EC committee keys — snapshot incomplete"
             );
             // Verification will never complete; release the in-flight slot
             // so a subsequent arrival isn't permanently shadowed.
@@ -1782,21 +1810,16 @@ impl ExecutionCoordinator {
 
         let ecs = wave.execution_certificates();
         let mut ec_public_keys = Vec::with_capacity(ecs.len());
+        let mut beacon_behind = false;
         for ec in ecs {
             let shard = ec.shard_group_id();
             // Each contained EC is verified against the committee seated at its
             // own anchor on its own shard. `None` (our beacon behind that
-            // epoch) abandons the fetch for a later catch-up.
+            // epoch) defers the whole wave for replay once the beacon catches
+            // up, rather than abandoning and re-fetching.
             let Some(committee) = topology.at(ec.vote_anchor_ts()) else {
-                tracing::warn!(
-                    wave = %wave.wave_id(),
-                    shard = shard.inner(),
-                    "Rejecting fetched FinalizedWave: beacon behind a contained EC's epoch"
-                );
-                self.pending_finalized_wave_verifications.remove(&wave_id);
-                return vec![Action::AbandonFetch(FetchAbandon::FinalizedWaves {
-                    ids: vec![wave_id],
-                })];
+                beacon_behind = true;
+                break;
             };
             if !ec_has_shard_quorum_power(committee, ec.as_unverified()) {
                 tracing::warn!(
@@ -1822,10 +1845,69 @@ impl ExecutionCoordinator {
             };
             ec_public_keys.push(public_keys);
         }
+        if beacon_behind {
+            // Buffer the whole wave; replayed on `BeaconBlockPersisted` once the
+            // beacon reaches the deferred EC's epoch.
+            self.pending_finalized_wave_verifications.remove(&wave_id);
+            self.buffer_awaiting_wave(wave);
+            return Vec::new();
+        }
         vec![Action::VerifyFinalizedWave {
             wave,
             ec_public_keys,
         }]
+    }
+
+    /// Buffer a cross-shard EC whose committee epoch this node's beacon hasn't
+    /// reached. Keyed by the EC's own shard, bounded per shard (drop-oldest).
+    fn buffer_awaiting_cert(&mut self, cert: Verifiable<ExecutionCertificate>) {
+        let queue = self
+            .awaiting_certs
+            .entry(cert.shard_group_id())
+            .or_default();
+        queue.push_back(cert);
+        while queue.len() > MAX_AWAITING_TOPOLOGY_PER_SHARD {
+            queue.pop_front();
+        }
+    }
+
+    /// Buffer a fetched `FinalizedWave` deferred because a contained EC's
+    /// committee epoch isn't in our schedule yet. Keyed by the wave's own
+    /// shard, bounded per shard (drop-oldest).
+    fn buffer_awaiting_wave(&mut self, wave: Arc<Verifiable<FinalizedWave>>) {
+        let queue = self
+            .awaiting_waves
+            .entry(wave.wave_id().shard_group_id())
+            .or_default();
+        queue.push_back(wave);
+        while queue.len() > MAX_AWAITING_TOPOLOGY_PER_SHARD {
+            queue.pop_front();
+        }
+    }
+
+    /// Re-attempt every buffered cross-shard EC and finalized wave now that the
+    /// beacon has advanced. Drains both buffers and replays each through its
+    /// normal admission path, which re-resolves the committee and re-buffers
+    /// any still beyond the schedule. Called on `BeaconBlockPersisted`.
+    pub fn on_beacon_block_persisted(&mut self, topology: &TopologySchedule) -> Vec<Action> {
+        let mut actions = Vec::new();
+        let certs: Vec<Verifiable<ExecutionCertificate>> = self
+            .awaiting_certs
+            .drain()
+            .flat_map(|(_, queue)| queue)
+            .collect();
+        for cert in certs {
+            actions.extend(self.on_wave_certificate(topology, cert));
+        }
+        let waves: Vec<Arc<Verifiable<FinalizedWave>>> = self
+            .awaiting_waves
+            .drain()
+            .flat_map(|(_, queue)| queue)
+            .collect();
+        for wave in waves {
+            actions.extend(self.admit_finalized_wave(topology, wave));
+        }
+        actions
     }
 
     /// Handle the result of [`Action::VerifyFinalizedWave`]. Emits the
@@ -3370,6 +3452,94 @@ mod tests {
         assert_eq!(
             *committee, committee_b,
             "the EC's bitfield committee must be the one at vote_anchor_ts (epoch 1), not the head",
+        );
+    }
+
+    #[test]
+    fn cross_shard_ec_buffers_when_beacon_behind_then_drains_on_catch_up() {
+        const ED: u64 = 1_000;
+        let shard = ShardGroupId::new(0);
+
+        // Schedule holds only epoch 5; an EC anchored in epoch 0 can't resolve.
+        let behind = TopologySchedule::new(
+            ED,
+            1,
+            Epoch::new(5),
+            Arc::new(committee_snapshot(&[0, 1, 2, 3]).0),
+        );
+        let mut coord = make_test_state();
+        let cert = ExecutionCertificate::new(
+            WaveId::new(shard, BlockHeight::new(1), BTreeSet::new()),
+            WeightedTimestamp::ZERO, // epoch 0, outside the schedule
+            GlobalReceiptRoot::ZERO,
+            vec![],
+            zero_bls_signature(),
+            SignerBitfield::new(4),
+        );
+
+        let actions = coord.on_wave_certificate(&behind, Verifiable::from(cert));
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::VerifyExecutionCertificateSignature { .. })),
+            "an EC whose epoch the beacon hasn't reached must buffer, not dispatch",
+        );
+
+        let caught_up = TopologySchedule::single(Arc::new(committee_snapshot(&[0, 1, 2, 3]).0));
+        let drained = coord.on_beacon_block_persisted(&caught_up);
+        assert!(
+            drained
+                .iter()
+                .any(|a| matches!(a, Action::VerifyExecutionCertificateSignature { .. })),
+            "draining on catch-up must dispatch the buffered EC's verification",
+        );
+    }
+
+    #[test]
+    fn finalized_wave_buffers_when_beacon_behind_then_drains_on_catch_up() {
+        const ED: u64 = 1_000;
+        let shard = ShardGroupId::new(0);
+
+        let behind = TopologySchedule::new(
+            ED,
+            1,
+            Epoch::new(5),
+            Arc::new(committee_snapshot(&[0, 1, 2, 3]).0),
+        );
+        let mut coord = make_test_state();
+
+        let wave_id = WaveId::new(shard, BlockHeight::new(1), BTreeSet::new());
+        let mut signers = SignerBitfield::new(4);
+        signers.set(0);
+        signers.set(1);
+        signers.set(2);
+        let ec = Arc::new(ExecutionCertificate::new(
+            wave_id.clone(),
+            WeightedTimestamp::ZERO, // epoch 0, outside the schedule
+            GlobalReceiptRoot::ZERO,
+            vec![],
+            zero_bls_signature(),
+            signers,
+        ));
+        let wave: Arc<Verifiable<FinalizedWave>> = Arc::new(
+            FinalizedWave::new(Arc::new(WaveCertificate::new(wave_id, vec![ec])), vec![]).into(),
+        );
+
+        let actions = coord.admit_finalized_wave(&behind, Arc::clone(&wave));
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::VerifyFinalizedWave { .. })),
+            "a finalized wave whose EC epoch the beacon hasn't reached must buffer, not dispatch",
+        );
+
+        let caught_up = TopologySchedule::single(Arc::new(committee_snapshot(&[0, 1, 2, 3]).0));
+        let drained = coord.on_beacon_block_persisted(&caught_up);
+        assert!(
+            drained
+                .iter()
+                .any(|a| matches!(a, Action::VerifyFinalizedWave { .. })),
+            "draining on catch-up must dispatch the buffered wave's verification",
         );
     }
 

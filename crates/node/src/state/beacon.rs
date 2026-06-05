@@ -162,9 +162,19 @@ impl NodeStateMachine {
             }
             ProtocolEvent::BeaconSkipTimer => self.beacon_coordinator.on_beacon_skip_timer(),
             ProtocolEvent::BeaconSpcViewTimer => self.beacon_coordinator.on_beacon_spc_view_timer(),
-            ProtocolEvent::BeaconBlockPersisted { .. } => self
-                .remote_headers_coordinator
-                .on_beacon_block_persisted(self.beacon_coordinator.topology_schedule()),
+            ProtocolEvent::BeaconBlockPersisted { .. } => {
+                // Beacon advanced an epoch — replay any cross-shard artifacts
+                // buffered because their committee epoch wasn't yet in the
+                // schedule (remote headers, ECs, finalized waves).
+                let mut actions = self
+                    .remote_headers_coordinator
+                    .on_beacon_block_persisted(self.beacon_coordinator.topology_schedule());
+                actions.extend(
+                    self.execution_coordinator
+                        .on_beacon_block_persisted(self.beacon_coordinator.topology_schedule()),
+                );
+                actions
+            }
             ProtocolEvent::BeaconBlockSyncReadyToApply { block } => self
                 .beacon_coordinator
                 .on_beacon_block_sync_ready_to_apply(block),
