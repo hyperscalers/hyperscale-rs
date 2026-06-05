@@ -3506,11 +3506,12 @@ impl ShardCoordinator {
         committee.committee_index_for_shard(self.local_shard, voter)?;
         // Membership is confirmed above, so the power resolves; a miss is the
         // same invariant violation the committee-key lookups assert on.
-        Some(
-            committee
-                .voting_power(voter)
-                .expect("committee member has voting power (BeaconState invariant)"),
-        )
+        Some(committee.voting_power(voter).unwrap_or_else(|| {
+            panic!(
+                "committee member {voter:?} has no voting power — \
+                 BeaconState invariant (committees subset of validators) violated"
+            )
+        }))
     }
 
     /// Screen a wire timeout, then delegate its BLS share verification to the
@@ -3560,9 +3561,13 @@ impl ShardCoordinator {
         // `committee_timeout_power` above confirmed committee membership, so the
         // public key resolves; a miss is the same BeaconState invariant
         // violation the committee-key lookups assert on.
-        let voter_public_key = committee
-            .public_key(timeout.voter())
-            .expect("committee member has public key (BeaconState invariant)");
+        let voter = timeout.voter();
+        let voter_public_key = committee.public_key(voter).unwrap_or_else(|| {
+            panic!(
+                "committee member {voter:?} has no public key — \
+                 BeaconState invariant (committees subset of validators) violated"
+            )
+        });
         vec![Action::VerifyTimeout {
             timeout: timeout.clone(),
             voter_public_key,

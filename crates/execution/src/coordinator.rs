@@ -1230,13 +1230,15 @@ impl ExecutionCoordinator {
         // A single Byzantine signer can produce a cryptographically valid
         // EC; require 2f+1 voting power on the EC's own shard before any
         // state mutation downstream. The committee is the one seated at the
-        // EC's anchor; `None` (our beacon behind that epoch) abandons the
-        // fetch so a later catch-up re-resolves it.
+        // EC's anchor. `on_wave_certificate` already resolved it to dispatch
+        // this verification, so `None` here means that epoch aged out of the
+        // schedule in the interim (the beacon advanced past retention) — the
+        // EC is stale, so abandon it.
         let Some(committee) = topology.at(ec_arc.vote_anchor_ts()) else {
             tracing::warn!(
                 shard = ec_arc.shard_group_id().inner(),
                 wave = %ec_arc.wave_id(),
-                "Discarding execution certificate — beacon behind its epoch"
+                "Discarding execution certificate — epoch evicted from schedule before verification completed"
             );
             return vec![Action::AbandonFetch(FetchAbandon::ExecutionCerts {
                 ids: vec![ec_arc.wave_id().clone()],

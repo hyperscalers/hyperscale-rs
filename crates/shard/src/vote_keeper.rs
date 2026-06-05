@@ -169,9 +169,10 @@ impl VoteKeeper {
     /// Admit a locally-produced, already-verified block vote into the
     /// block's [`VoteSet`] without re-checking the BLS signature, then
     /// fire batch verification if the combined power can now reach
-    /// quorum. `header_for_vote` is the header from the caller's
-    /// pending-block map; `None` is acceptable when the header hasn't
-    /// been received yet — a later [`VoteSet::set_header`] fills it in.
+    /// quorum. `header_for_vote` carries the height/round/parent metadata
+    /// the [`VoteSet`] needs to build a QC; a vote whose header hasn't
+    /// arrived is held in the coordinator's unanchored buffer and reaches
+    /// here only once the header anchors its committee.
     ///
     /// These are our own votes — one per block we vote on — so they are
     /// inherently bounded and bypass the [`MAX_VOTE_SETS`] flood cap that gates
