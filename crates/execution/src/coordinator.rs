@@ -905,16 +905,19 @@ impl ExecutionCoordinator {
         vote: Verified<ExecutionVote>,
     ) -> Vec<Action> {
         let wave_id = vote.wave_id().clone();
-        // Power resolves against the committee seated at the vote's anchor —
-        // the same committee that will verify the EC. Callers guarantee
-        // `vote.validator()` is in the local committee, so `None` here means
-        // only that our beacon hasn't reached that epoch: drop the vote.
-        let Some(voting_power) = topology
-            .at(vote.vote_anchor_ts())
-            .and_then(|c| c.voting_power(vote.validator()))
-        else {
+        // Power resolves against the committee seated at the vote's anchor — the
+        // same committee `dispatch_execution_vote` already confirmed this
+        // validator belongs to before delegating here. `at` returning `None`
+        // would mean the beacon hasn't reached that epoch (drop and let the
+        // sender retry), but the membership gate guarantees the validator's
+        // power resolves — a missing power is a TopologySnapshot invariant
+        // violation, not lag, so fail loud rather than silently undercount.
+        let Some(committee) = topology.at(vote.vote_anchor_ts()) else {
             return vec![];
         };
+        let voting_power = committee
+            .voting_power(vote.validator())
+            .expect("committee member has voting power (TopologySnapshot invariant)");
 
         let Some(tracker) = self.waves.get_tracker_mut(&wave_id) else {
             return vec![];
