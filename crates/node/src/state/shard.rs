@@ -88,7 +88,7 @@ impl NodeStateMachine {
                 // Route through the centralized remote header coordinator.
                 // Structural pre-checks happen there; downstream consumers
                 // receive headers via `RemoteHeaderAdmitted`.
-                let topology = self.beacon_coordinator.current_topology_snapshot();
+                let topology = self.beacon_coordinator.topology_schedule();
                 self.remote_headers_coordinator.on_remote_header_received(
                     topology,
                     certified_header,
@@ -150,7 +150,7 @@ impl NodeStateMachine {
             } => self
                 .remote_headers_coordinator
                 .on_remote_header_qc_verified(
-                    self.beacon_coordinator.current_topology_snapshot(),
+                    self.beacon_coordinator.topology_schedule(),
                     shard,
                     height,
                     sender,

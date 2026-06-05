@@ -162,7 +162,9 @@ impl NodeStateMachine {
             }
             ProtocolEvent::BeaconSkipTimer => self.beacon_coordinator.on_beacon_skip_timer(),
             ProtocolEvent::BeaconSpcViewTimer => self.beacon_coordinator.on_beacon_spc_view_timer(),
-            ProtocolEvent::BeaconBlockPersisted { .. } => Vec::new(),
+            ProtocolEvent::BeaconBlockPersisted { .. } => self
+                .remote_headers_coordinator
+                .on_beacon_block_persisted(self.beacon_coordinator.topology_schedule()),
             ProtocolEvent::BeaconBlockSyncReadyToApply { block } => self
                 .beacon_coordinator
                 .on_beacon_block_sync_ready_to_apply(block),
