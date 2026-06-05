@@ -344,26 +344,40 @@ impl RemoteHeaderCoordinator {
                     "Remote header QC verification failed"
                 );
 
-                // Remove the failed candidate; try the next candidate if any.
-                let next = self.pending.get_mut(&key).and_then(|sender_map| {
+                // The failed candidate is out. Dispatch the next candidate
+                // whose committee resolves; buffer any whose epoch the beacon
+                // hasn't reached yet so a catch-up retries them. If none
+                // resolve, every remaining candidate is buffered or removed and
+                // the key is gone, so the drain re-adds the first one with
+                // `first_for_key` set and re-dispatches it cleanly.
+                if let Some(sender_map) = self.pending.get_mut(&key) {
                     sender_map.remove(&sender);
-                    sender_map.iter().next().map(|(s, h)| (*s, Arc::clone(h)))
-                });
-                let Some((next_sender, next_header)) = next else {
-                    self.pending.remove(&key);
-                    return vec![];
-                };
-                // Resolve the next candidate's committee at its parent WT; a
-                // beacon-behind miss moves it to the awaiting buffer for replay.
-                let anchor = next_header.header().parent_qc().weighted_timestamp();
-                let Some(committee) = topology.at(anchor) else {
+                }
+                loop {
+                    let next = self.pending.get_mut(&key).and_then(|sender_map| {
+                        sender_map.iter().next().map(|(s, h)| (*s, Arc::clone(h)))
+                    });
+                    let Some((next_sender, next_header)) = next else {
+                        self.pending.remove(&key);
+                        return vec![];
+                    };
+                    let anchor = next_header.header().parent_qc().weighted_timestamp();
+                    if let Some(committee) = topology.at(anchor) {
+                        return Self::emit_verify_qc(
+                            committee,
+                            shard,
+                            height,
+                            next_sender,
+                            next_header,
+                        );
+                    }
+                    // Beacon hasn't reached this candidate's epoch — buffer it
+                    // for replay and try the next.
                     if let Some(sender_map) = self.pending.get_mut(&key) {
                         sender_map.remove(&next_sender);
                     }
                     self.buffer_awaiting(shard, next_sender, next_header);
-                    return vec![];
-                };
-                return Self::emit_verify_qc(committee, shard, height, next_sender, next_header);
+                }
             }
         };
 
@@ -919,6 +933,61 @@ mod tests {
         assert!(
             verify_qc_keys(&drained).is_some(),
             "draining on catch-up must dispatch the buffered header's verification",
+        );
+    }
+
+    #[test]
+    fn failed_verification_with_beacon_behind_buffers_all_siblings() {
+        // Three peers gossip the same header at one (shard, height): the first
+        // dispatches verification, the other two wait as pending fallbacks. The
+        // first candidate's QC verification then fails, and by the time the
+        // result lands the beacon has evicted that epoch, so no sibling can
+        // resolve its committee. Every sibling must move to the awaiting buffer
+        // — none left in `pending` with no verification in flight — so a beacon
+        // catch-up re-dispatches one rather than the whole height wedging.
+        const ED: u64 = 1_000;
+        let remote = ShardGroupId::new(1);
+        let ids = [0u64, 1, 2, 3]; // shard 1's committee is {1, 3}
+        let snap = || Arc::new(shard_snapshot(2, &ids, 0));
+
+        // Epoch 0 is in the schedule when the headers arrive.
+        let present = TopologySchedule::new(ED, 100, Epoch::new(0), snap());
+        let mut coord = RemoteHeaderCoordinator::new(ShardGroupId::new(0));
+        let header = remote_header(remote, BlockHeight::new(5), 0); // parent WT in epoch 0
+
+        let dispatched =
+            coord.on_remote_header_received(&present, Arc::clone(&header), ValidatorId::new(1));
+        assert!(verify_qc_keys(&dispatched).is_some());
+        coord.on_remote_header_received(&present, Arc::clone(&header), ValidatorId::new(2));
+        coord.on_remote_header_received(&present, Arc::clone(&header), ValidatorId::new(3));
+        assert_eq!(coord.memory_stats().pending_headers, 3);
+
+        // The first candidate's verification fails, and the schedule no longer
+        // covers epoch 0 (the beacon advanced past it).
+        let evicted = TopologySchedule::new(ED, 1, Epoch::new(5), snap());
+        let after_fail = coord.on_remote_header_qc_verified(
+            &evicted,
+            remote,
+            BlockHeight::new(5),
+            ValidatorId::new(1),
+            Err(CertifiedHeaderVerifyError::LinkageMismatch),
+        );
+        assert!(
+            verify_qc_keys(&after_fail).is_none(),
+            "no sibling can verify while their epoch is outside the schedule",
+        );
+        assert_eq!(
+            coord.memory_stats().pending_headers,
+            0,
+            "every sibling must move to the awaiting buffer, none stranded in pending",
+        );
+
+        // Beacon catches up: draining re-dispatches a buffered sibling.
+        let caught_up = TopologySchedule::single(snap());
+        let drained = coord.on_beacon_block_persisted(&caught_up);
+        assert!(
+            verify_qc_keys(&drained).is_some(),
+            "a buffered sibling must re-dispatch verification on beacon catch-up",
         );
     }
 }
