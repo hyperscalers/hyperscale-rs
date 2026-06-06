@@ -165,10 +165,10 @@ mod tests {
 
     fn make_header(height: u8, parent_block_hash: BlockHash) -> BlockHeader {
         BlockHeader::new(
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             BlockHeight::new(u64::from(height)),
             parent_block_hash,
-            QuorumCertificate::genesis(ShardGroupId::new(0)),
+            QuorumCertificate::genesis(ShardGroupId::ROOT),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(1000),
             Round::INITIAL,
@@ -206,7 +206,7 @@ mod tests {
         f: impl FnOnce(&ChainView<'_>) -> R,
     ) -> R {
         let view = ChainView {
-            local_shard: ShardGroupId::new(0),
+            local_shard: ShardGroupId::ROOT,
             committed_height: BlockHeight::new(committed_height),
             committed_hash,
             committed_state_root,
@@ -266,7 +266,7 @@ mod tests {
         let header = make_header(3, BlockHash::ZERO);
         let block_hash = header.hash();
         let wave = WaveId::new(
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             BlockHeight::new(2),
             std::collections::BTreeSet::new(),
         );
@@ -432,7 +432,7 @@ mod tests {
         let qc_block = bh(b"qc_block");
         let qc = QuorumCertificate::new(
             qc_block,
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             BlockHeight::new(5),
             BlockHash::ZERO,
             Round::INITIAL,

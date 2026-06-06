@@ -247,7 +247,7 @@ mod tests {
     fn register_inserts_expectation() {
         let mut t = ExpectedProvisionTracker::new();
         t.register(
-            ShardGroupId::new(1),
+            ShardGroupId::leaf(2, 1),
             BlockHeight::new(10),
             ValidatorId::new(3),
         );
@@ -258,12 +258,12 @@ mod tests {
     fn register_is_idempotent() {
         let mut t = ExpectedProvisionTracker::new();
         t.register(
-            ShardGroupId::new(1),
+            ShardGroupId::leaf(2, 1),
             BlockHeight::new(10),
             ValidatorId::new(3),
         );
         t.register(
-            ShardGroupId::new(1),
+            ShardGroupId::leaf(2, 1),
             BlockHeight::new(10),
             ValidatorId::new(7),
         );
@@ -274,12 +274,12 @@ mod tests {
     fn on_provisions_verified_clears_entry() {
         let mut t = ExpectedProvisionTracker::new();
         t.register(
-            ShardGroupId::new(1),
+            ShardGroupId::leaf(2, 1),
             BlockHeight::new(10),
             ValidatorId::new(3),
         );
-        assert!(t.on_provisions_verified(ShardGroupId::new(1), BlockHeight::new(10)));
-        assert!(!t.on_provisions_verified(ShardGroupId::new(1), BlockHeight::new(10)));
+        assert!(t.on_provisions_verified(ShardGroupId::leaf(2, 1), BlockHeight::new(10)));
+        assert!(!t.on_provisions_verified(ShardGroupId::leaf(2, 1), BlockHeight::new(10)));
         assert_eq!(t.len(), 0);
     }
 
@@ -287,7 +287,7 @@ mod tests {
     fn first_commit_retro_stamps_pregenesis_entries() {
         let mut t = ExpectedProvisionTracker::new();
         t.register(
-            ShardGroupId::new(1),
+            ShardGroupId::leaf(2, 1),
             BlockHeight::new(10),
             ValidatorId::new(3),
         );
@@ -307,7 +307,7 @@ mod tests {
         let mut t = ExpectedProvisionTracker::new();
         t.record_block_committed(ts(1_000));
         t.register(
-            ShardGroupId::new(1),
+            ShardGroupId::leaf(2, 1),
             BlockHeight::new(10),
             ValidatorId::new(3),
         );
@@ -326,7 +326,7 @@ mod tests {
         assert_eq!(
             effects[0],
             TimeoutEffect {
-                source_shard: ShardGroupId::new(1),
+                source_shard: ShardGroupId::leaf(2, 1),
                 block_height: BlockHeight::new(10),
                 proposer: ValidatorId::new(3),
             }
@@ -341,13 +341,13 @@ mod tests {
         let mut t = ExpectedProvisionTracker::new();
         t.record_block_committed(ts(1_000));
         t.register(
-            ShardGroupId::new(1),
+            ShardGroupId::leaf(2, 1),
             BlockHeight::new(10),
             ValidatorId::new(3),
         );
 
         // Verify before the timeout fires.
-        assert!(t.on_provisions_verified(ShardGroupId::new(1), BlockHeight::new(10)));
+        assert!(t.on_provisions_verified(ShardGroupId::leaf(2, 1), BlockHeight::new(10)));
 
         let well_past =
             ts(1_000
@@ -360,12 +360,12 @@ mod tests {
         let mut t = ExpectedProvisionTracker::new();
         t.record_block_committed(ts(1_000));
         t.register(
-            ShardGroupId::new(1),
+            ShardGroupId::leaf(2, 1),
             BlockHeight::new(10),
             ValidatorId::new(3),
         );
         t.register(
-            ShardGroupId::new(2),
+            ShardGroupId::leaf(2, 2),
             BlockHeight::new(5),
             ValidatorId::new(7),
         );
@@ -382,7 +382,7 @@ mod tests {
         let mut t = ExpectedProvisionTracker::new();
         t.record_block_committed(ts(1_000));
         t.register(
-            ShardGroupId::new(1),
+            ShardGroupId::leaf(2, 1),
             BlockHeight::new(10),
             ValidatorId::new(3),
         );
@@ -394,7 +394,10 @@ mod tests {
 
         let cutoff = far_future.minus(RETENTION_HORIZON);
         let dropped = t.cleanup_orphans(cutoff);
-        assert_eq!(dropped, vec![(ShardGroupId::new(1), BlockHeight::new(10))]);
+        assert_eq!(
+            dropped,
+            vec![(ShardGroupId::leaf(2, 1), BlockHeight::new(10))]
+        );
         assert_eq!(t.len(), 0);
     }
 
@@ -402,7 +405,7 @@ mod tests {
     fn cleanup_orphans_no_op_when_cutoff_zero() {
         let mut t = ExpectedProvisionTracker::new();
         t.register(
-            ShardGroupId::new(1),
+            ShardGroupId::leaf(2, 1),
             BlockHeight::new(10),
             ValidatorId::new(3),
         );

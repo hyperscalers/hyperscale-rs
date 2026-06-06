@@ -100,8 +100,9 @@ impl TestFixtures {
 
         // Build per-shard committee mappings
         let mut shard_committees: HashMap<ShardGroupId, Vec<ValidatorId>> = HashMap::new();
+        let shard_depth = num_shards.trailing_zeros();
         for shard_id in 0..num_shards {
-            let shard = ShardGroupId::new(shard_id);
+            let shard = ShardGroupId::leaf(shard_depth, shard_id);
             let shard_start = u32::try_from(shard_id).expect("shard_id fits in u32 for tests")
                 * validators_per_shard;
             let shard_end = shard_start + validators_per_shard;
@@ -163,7 +164,7 @@ impl TestFixtures {
 
     /// Get validators in a shard.
     pub fn validators_in_shard(&self, shard: ShardGroupId) -> Vec<u32> {
-        let start = u32::try_from(shard.inner()).expect("shard fits in u32 for tests")
+        let start = u32::try_from(shard.path()).expect("shard fits in u32 for tests")
             * self.validators_per_shard;
         let end = start + self.validators_per_shard;
         (start..end).collect()
@@ -232,10 +233,10 @@ mod tests {
         assert_eq!(fixtures.validators_per_shard, 3);
 
         // Check shard assignments
-        let shard0_validators = fixtures.validators_in_shard(ShardGroupId::new(0));
+        let shard0_validators = fixtures.validators_in_shard(ShardGroupId::leaf(1, 0));
         assert_eq!(shard0_validators, vec![0, 1, 2]);
 
-        let shard1_validators = fixtures.validators_in_shard(ShardGroupId::new(1));
+        let shard1_validators = fixtures.validators_in_shard(ShardGroupId::leaf(1, 1));
         assert_eq!(shard1_validators, vec![3, 4, 5]);
     }
 
@@ -246,7 +247,7 @@ mod tests {
         let topology = fixtures.topology();
         assert!(
             topology
-                .committee_for_shard(ShardGroupId::new(0))
+                .committee_for_shard(ShardGroupId::ROOT)
                 .contains(&ValidatorId::new(0))
         );
         assert_eq!(topology.num_shards(), 1);

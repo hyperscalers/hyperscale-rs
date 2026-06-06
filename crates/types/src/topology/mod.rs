@@ -10,4 +10,5 @@
 pub mod awaiting;
 pub mod schedule;
 pub mod snapshot;
+pub mod trie;
 pub mod validator;

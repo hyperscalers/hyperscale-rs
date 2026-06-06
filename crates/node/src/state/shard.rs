@@ -470,13 +470,13 @@ mod tests {
     fn remote_header_admitted_fans_to_execution_and_provisions() {
         let TestNode { mut node, .. } = TestNode::builder().num_shards(2).build();
 
-        // Wave on remote shard 1 listing local shard 0 as a dependency.
+        // Wave on a remote leaf shard listing the local root shard as a dependency.
         let mut remote_shards = BTreeSet::new();
-        remote_shards.insert(ShardGroupId::new(0));
-        let wave = WaveId::new(ShardGroupId::new(1), BlockHeight::new(5), remote_shards);
+        remote_shards.insert(ShardGroupId::ROOT);
+        let wave = WaveId::new(ShardGroupId::leaf(1, 1), BlockHeight::new(5), remote_shards);
 
         let mut block = make_live_block(
-            ShardGroupId::new(1),
+            ShardGroupId::leaf(1, 1),
             BlockHeight::new(5),
             /* timestamp_ms */ 1_000,
             ValidatorId::new(0),
@@ -508,7 +508,7 @@ mod tests {
         let certified_header =
             Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
                 block.header().clone(),
-                QuorumCertificate::genesis(ShardGroupId::new(0)),
+                QuorumCertificate::genesis(ShardGroupId::leaf(1, 1)),
             )));
 
         let pre_exec = node
@@ -643,11 +643,11 @@ mod tests {
     fn block_committed_evicts_outbound_provisions_on_qc_weighted_timestamp_not_local_clock() {
         let TestNode { mut node, .. } = TestNode::builder().num_shards(2).build();
 
-        // Register an outbound batch (local shard 0 → remote shard 1).
+        // Register an outbound batch (local root shard → remote leaf shard).
         // Deadline = self.now (ZERO) + RETENTION_HORIZON ≈ 5m24s.
         let provisions = Arc::new(Verified::new_unchecked_for_test(Provisions::new(
-            ShardGroupId::new(0),
-            ShardGroupId::new(1),
+            ShardGroupId::ROOT,
+            ShardGroupId::leaf(1, 1),
             BlockHeight::new(1),
             MerkleInclusionProof::dummy(),
             vec![ProvisionEntry::new(
@@ -661,7 +661,7 @@ mod tests {
             LocalTimestamp::ZERO,
             ProtocolEvent::OutboundProvisionBroadcast {
                 provisions,
-                target_shard: ShardGroupId::new(1),
+                target_shard: ShardGroupId::leaf(1, 1),
             },
         );
         assert_eq!(
@@ -680,7 +680,7 @@ mod tests {
         // Commit a block whose qc.weighted_timestamp() is BELOW the entry
         // deadline. The orchestrator passes this into the outbound sweep.
         let block = make_live_block(
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             BlockHeight::new(1),
             /* timestamp_ms */ 1_000,
             ValidatorId::new(0),
@@ -703,7 +703,7 @@ mod tests {
         // Commit a second block whose qc.weighted_timestamp() IS past the
         // deadline. Now the eviction path proper must fire.
         let block = make_live_block(
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             BlockHeight::new(2),
             /* timestamp_ms */ 1_000,
             ValidatorId::new(0),
@@ -742,7 +742,7 @@ mod tests {
         // validation rejects on proposer mismatch, so the header must name the
         // round-0 leader to reach the pending-blocks insert.
         let header = make_live_block(
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             BlockHeight::new(1),
             /* timestamp_ms */ 1_000,
             ValidatorId::new(0),
@@ -798,7 +798,7 @@ mod tests {
         );
 
         let block = make_live_block(
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             BlockHeight::new(1),
             /* timestamp_ms */ 1_000,
             ValidatorId::new(0),

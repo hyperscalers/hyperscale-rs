@@ -103,10 +103,10 @@ mod tests {
         };
 
         let header = BlockHeader::new(
-            ShardGroupId::new(1),
+            ShardGroupId::leaf(1, 1),
             BlockHeight::new(42),
             BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            QuorumCertificate::genesis(ShardGroupId::new(0)),
+            QuorumCertificate::genesis(ShardGroupId::leaf(1, 0)),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(1_234_567_890),
             Round::INITIAL,
@@ -122,7 +122,7 @@ mod tests {
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
         );
-        let qc = QuorumCertificate::genesis(ShardGroupId::new(0));
+        let qc = QuorumCertificate::genesis(ShardGroupId::leaf(1, 0));
 
         let gossip = CertifiedBlockHeaderGossip {
             certified_header: Arc::new(Verifiable::from(CertifiedBlockHeader::new(header, qc))),

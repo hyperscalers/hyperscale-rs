@@ -12,7 +12,7 @@ use blake3::hash as blake3_hash;
 
 use crate::{
     Bls12381G1PublicKey, NetworkDefinition, NodeId, Round, RoutableTransaction, ShardGroupId,
-    ValidatorId, ValidatorSet, VotePower,
+    ShardTrie, ValidatorId, ValidatorSet, VotePower,
 };
 
 /// Per-shard committee membership.
@@ -32,10 +32,32 @@ pub fn node_id_hash_u64(node_id: &NodeId) -> u64 {
     ])
 }
 
-/// Compute which shard owns a `NodeId` (hash-modulo).
+/// Compute which shard owns a `NodeId` in a uniform `num_shards`-way trie.
+///
+/// The shard is the leaf at depth `log2(num_shards)` whose path is the top
+/// `depth` bits of `blake3(node_id)` (most-significant first) — a prefix of the
+/// node's JMT leaf key, so the shard owns a contiguous state subtree. For a
+/// non-uniform partition, route through [`ShardTrie::shard_for`] instead.
+///
+/// # Panics
+/// Panics if `num_shards` is not a power of two.
 #[must_use]
 pub fn shard_for_node(node_id: &NodeId, num_shards: u64) -> ShardGroupId {
-    ShardGroupId::new(node_id_hash_u64(node_id) % num_shards)
+    assert!(
+        num_shards.is_power_of_two(),
+        "num_shards must be a power of two, got {num_shards}"
+    );
+    let depth = num_shards.trailing_zeros();
+    if depth == 0 {
+        return ShardGroupId::ROOT;
+    }
+    let hash = blake3_hash(&node_id.0);
+    let bits = u64::from_be_bytes(
+        hash.as_bytes()[..8]
+            .try_into()
+            .expect("blake3 output is 32 bytes"),
+    );
+    ShardGroupId::leaf(depth, bits >> (64 - depth))
 }
 
 /// Per-validator info (voting power + public key).
@@ -66,10 +88,15 @@ struct ValidatorInfoEntry {
 #[derive(Clone)]
 pub struct TopologySnapshot {
     network: NetworkDefinition,
-    num_shards: u64,
+    shard_trie: ShardTrie,
     shard_committees: HashMap<ShardGroupId, ShardCommittee>,
     validator_info: HashMap<ValidatorId, ValidatorInfoEntry>,
     global_validator_set: Arc<ValidatorSet>,
+}
+
+/// The uniform-trie leaf for flat shard index `index` of `num_shards`.
+const fn uniform_leaf(num_shards: u64, index: u64) -> ShardGroupId {
+    ShardGroupId::leaf(num_shards.trailing_zeros(), index)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -87,7 +114,7 @@ impl TopologySnapshot {
         let mut shard_committees = empty_committees(num_shards);
 
         for v in &validator_set.validators {
-            let shard = ShardGroupId::new(v.validator_id.inner() % num_shards);
+            let shard = uniform_leaf(num_shards, v.validator_id.inner() % num_shards);
             if let Some(committee) = shard_committees.get_mut(&shard) {
                 committee.active_validators.push(v.validator_id);
                 committee.total_voting_power += v.voting_power;
@@ -96,7 +123,7 @@ impl TopologySnapshot {
 
         Self {
             network,
-            num_shards,
+            shard_trie: ShardTrie::uniform_from_count(num_shards),
             shard_committees,
             validator_info,
             global_validator_set: Arc::new(validator_set),
@@ -131,7 +158,7 @@ impl TopologySnapshot {
 
         Self {
             network,
-            num_shards,
+            shard_trie: ShardTrie::uniform_from_count(num_shards),
             shard_committees,
             validator_info,
             global_validator_set: Arc::new(validator_set),
@@ -176,7 +203,57 @@ impl TopologySnapshot {
 
         Self {
             network,
-            num_shards,
+            shard_trie: ShardTrie::uniform_from_count(num_shards),
+            shard_committees: committees,
+            validator_info,
+            global_validator_set: Arc::new(global_validator_set.clone()),
+        }
+    }
+
+    /// Create a snapshot whose shard partition is exactly the keys of
+    /// `shard_committees`.
+    ///
+    /// Unlike [`Self::with_shard_committees`] (which assumes a uniform
+    /// `num_shards`-way partition), the live shards are precisely those keys.
+    /// Used to mirror a `BeaconState`'s committees, whose keys define the
+    /// active partition — uniform today, non-uniform under resharding.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a committee references a validator absent from
+    /// `global_validator_set`.
+    #[must_use]
+    pub fn from_explicit_committees(
+        network: NetworkDefinition,
+        global_validator_set: &ValidatorSet,
+        shard_committees: HashMap<ShardGroupId, Vec<ValidatorId>>,
+    ) -> Self {
+        let validator_info = build_validator_info(global_validator_set);
+        let shard_trie = ShardTrie::from_leaves(shard_committees.keys().copied());
+        let committees: HashMap<ShardGroupId, ShardCommittee> = shard_committees
+            .into_iter()
+            .map(|(shard, validators)| {
+                let mut committee = ShardCommittee {
+                    active_validators: Vec::new(),
+                    total_voting_power: VotePower::ZERO,
+                };
+                for validator_id in validators {
+                    let info = validator_info.get(&validator_id).unwrap_or_else(|| {
+                        panic!(
+                            "committee for shard {shard:?} references validator {validator_id:?} \
+                             that is not in the global validator set",
+                        )
+                    });
+                    committee.active_validators.push(validator_id);
+                    committee.total_voting_power += info.voting_power;
+                }
+                (shard, committee)
+            })
+            .collect();
+
+        Self {
+            network,
+            shard_trie,
             shard_committees: committees,
             validator_info,
             global_validator_set: Arc::new(global_validator_set.clone()),
@@ -199,10 +276,17 @@ impl TopologySnapshot {
         &self.network
     }
 
-    /// Get the total number of shards.
+    /// Get the total number of shards (live leaves of the partition).
     #[must_use]
-    pub const fn num_shards(&self) -> u64 {
-        self.num_shards
+    pub fn num_shards(&self) -> u64 {
+        self.shard_trie.len() as u64
+    }
+
+    /// The active shard partition. Routing and shard enumeration go through
+    /// this; [`Self::num_shards`] is its leaf count.
+    #[must_use]
+    pub const fn shard_trie(&self) -> &ShardTrie {
+        &self.shard_trie
     }
 
     /// Get the ordered committee members for a shard.
@@ -302,7 +386,7 @@ impl TopologySnapshot {
     /// Determine which shard a `NodeId` belongs to (hash-modulo).
     #[must_use]
     pub fn shard_for_node_id(&self, node_id: &NodeId) -> ShardGroupId {
-        shard_for_node(node_id, self.num_shards)
+        self.shard_trie.shard_for(node_id)
     }
 
     /// Every shard a transaction touches via either `declared_reads` or
@@ -353,7 +437,7 @@ impl TopologySnapshot {
 impl std::fmt::Debug for TopologySnapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TopologySnapshot")
-            .field("num_shards", &self.num_shards)
+            .field("num_shards", &self.shard_trie.len())
             .field("shard_count_populated", &self.shard_committees.len())
             .finish_non_exhaustive()
     }
@@ -380,10 +464,11 @@ fn build_validator_info(validator_set: &ValidatorSet) -> HashMap<ValidatorId, Va
 }
 
 fn empty_committees(num_shards: u64) -> HashMap<ShardGroupId, ShardCommittee> {
-    (0..num_shards)
-        .map(|id| {
+    ShardTrie::uniform_from_count(num_shards)
+        .leaves()
+        .map(|shard| {
             (
-                ShardGroupId::new(id),
+                shard,
                 ShardCommittee {
                     active_validators: Vec::new(),
                     total_voting_power: VotePower::ZERO,
@@ -425,14 +510,14 @@ mod tests {
     fn test_committee_basics() {
         let snapshot = make_snapshot(4);
 
-        assert_eq!(snapshot.committee_size_for_shard(ShardGroupId::new(0)), 4);
+        assert_eq!(snapshot.committee_size_for_shard(ShardGroupId::ROOT), 4);
         assert_eq!(snapshot.num_shards(), 1);
     }
 
     #[test]
     fn test_quorum() {
         let snapshot = make_snapshot(4);
-        let shard = ShardGroupId::new(0);
+        let shard = ShardGroupId::ROOT;
 
         assert_eq!(snapshot.voting_power_for_shard(shard), VotePower::new(4));
         assert_eq!(
@@ -448,7 +533,7 @@ mod tests {
     #[test]
     fn test_proposer_rotation() {
         let snapshot = make_snapshot(4);
-        let shard = ShardGroupId::new(0);
+        let shard = ShardGroupId::ROOT;
 
         // Round-only rotation: committee[round % n].
         assert_eq!(
@@ -472,7 +557,7 @@ mod tests {
     #[test]
     fn test_single_shard() {
         let validators: Vec<_> = (0..4).map(|i| make_test_validator(i, 1)).collect();
-        let shard = ShardGroupId::new(1);
+        let shard = ShardGroupId::leaf(1, 1);
         let snapshot = TopologySnapshot::single_shard(
             NetworkDefinition::simulator(),
             shard,
@@ -482,7 +567,10 @@ mod tests {
 
         assert_eq!(snapshot.committee_size_for_shard(shard), 4);
         // Other shard should be empty.
-        assert_eq!(snapshot.committee_for_shard(ShardGroupId::new(0)).len(), 0);
+        assert_eq!(
+            snapshot.committee_for_shard(ShardGroupId::leaf(1, 0)).len(),
+            0
+        );
     }
 
     #[test]
@@ -491,11 +579,11 @@ mod tests {
         let vs = ValidatorSet::new(validators);
         let mut committees = HashMap::new();
         committees.insert(
-            ShardGroupId::new(0),
+            ShardGroupId::leaf(1, 0),
             vec![ValidatorId::new(0), ValidatorId::new(2)],
         );
         committees.insert(
-            ShardGroupId::new(1),
+            ShardGroupId::leaf(1, 1),
             vec![ValidatorId::new(1), ValidatorId::new(3)],
         );
 
@@ -506,8 +594,14 @@ mod tests {
             committees,
         );
 
-        assert_eq!(snapshot.committee_for_shard(ShardGroupId::new(0)).len(), 2);
-        assert_eq!(snapshot.committee_for_shard(ShardGroupId::new(1)).len(), 2);
+        assert_eq!(
+            snapshot.committee_for_shard(ShardGroupId::leaf(1, 0)).len(),
+            2
+        );
+        assert_eq!(
+            snapshot.committee_for_shard(ShardGroupId::leaf(1, 1)).len(),
+            2
+        );
     }
 
     /// `with_shard_committees` panics on a committee referencing a
@@ -521,7 +615,7 @@ mod tests {
         let mut committees = HashMap::new();
         // ValidatorId::new(99) isn't in `vs`; constructor must reject.
         committees.insert(
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             vec![ValidatorId::new(0), ValidatorId::new(99)],
         );
         let _ = TopologySnapshot::with_shard_committees(
@@ -543,7 +637,7 @@ mod tests {
         let vs = ValidatorSet::new(validators);
         let mut committees = HashMap::new();
         committees.insert(
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             vec![
                 ValidatorId::new(0),
                 ValidatorId::new(1),
@@ -557,7 +651,7 @@ mod tests {
             committees,
         );
         assert_eq!(
-            snapshot.voting_power_for_shard(ShardGroupId::new(0)),
+            snapshot.voting_power_for_shard(ShardGroupId::ROOT),
             VotePower::new(21)
         );
     }
@@ -572,7 +666,7 @@ mod tests {
         );
 
         // Shard 0: validators 0, 2, 4, 6
-        let shard0 = snapshot.committee_for_shard(ShardGroupId::new(0));
+        let shard0 = snapshot.committee_for_shard(ShardGroupId::leaf(1, 0));
         assert_eq!(shard0.len(), 4);
         assert!(shard0.contains(&ValidatorId::new(0)));
         assert!(shard0.contains(&ValidatorId::new(2)));
@@ -580,7 +674,7 @@ mod tests {
         assert!(shard0.contains(&ValidatorId::new(6)));
 
         // Shard 1: validators 1, 3, 5, 7
-        let shard1 = snapshot.committee_for_shard(ShardGroupId::new(1));
+        let shard1 = snapshot.committee_for_shard(ShardGroupId::leaf(1, 1));
         assert_eq!(shard1.len(), 4);
         assert!(shard1.contains(&ValidatorId::new(1)));
         assert!(shard1.contains(&ValidatorId::new(3)));

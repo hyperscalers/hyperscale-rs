@@ -532,10 +532,10 @@ mod tests {
 
     fn make_header_at_round(height: BlockHeight, round: Round) -> BlockHeader {
         BlockHeader::new(
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             height,
             BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            QuorumCertificate::genesis(ShardGroupId::new(0)),
+            QuorumCertificate::genesis(ShardGroupId::ROOT),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(1_234_567_890),
             round,
@@ -722,7 +722,7 @@ mod tests {
             &NetworkDefinition::simulator(),
             BlockHash::from_raw(Hash::from_bytes(&height.inner().to_le_bytes())),
             BlockHash::ZERO,
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             height,
             Round::INITIAL,
             ValidatorId::new(u64::try_from(voter).unwrap_or(u64::MAX)),
@@ -755,7 +755,7 @@ mod tests {
     #[test]
     fn far_future_vote_height_creates_no_vote_set() {
         let (keys, topo) = keys_and_topology(4);
-        let shard = ShardGroupId::new(0);
+        let shard = ShardGroupId::ROOT;
         let me = ValidatorId::new(0);
         let committed = BlockHeight::new(10);
         let mut vk = VoteKeeper::new();

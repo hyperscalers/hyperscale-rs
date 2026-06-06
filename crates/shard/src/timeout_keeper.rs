@@ -112,7 +112,7 @@ mod tests {
 
     use super::*;
 
-    const SHARD: ShardGroupId = ShardGroupId::new(0);
+    const SHARD: ShardGroupId = ShardGroupId::ROOT;
 
     fn high_qc_at(round: u64) -> QuorumCertificate {
         QuorumCertificate::new(

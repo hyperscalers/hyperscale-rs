@@ -17,7 +17,7 @@ use hyperscale_types::{
 fn fresh_coordinator(config: ShardConsensusConfig) -> ShardCoordinator {
     ShardCoordinator::new(
         ValidatorId::new(0),
-        ShardGroupId::new(0),
+        ShardGroupId::ROOT,
         config,
         RecoveredState::default(),
     )
@@ -115,7 +115,7 @@ fn is_current_proposer_matches_topology() {
     for local_idx in 0_u32..4 {
         let topology = TopologySchedule::single(Arc::new(committee.topology_snapshot(1)));
         let me = ValidatorId::new(u64::from(local_idx));
-        let local_shard = ShardGroupId::new(0);
+        let local_shard = ShardGroupId::ROOT;
         let coordinator = ShardCoordinator::new(
             me,
             local_shard,
@@ -144,7 +144,7 @@ fn will_propose_next_is_true_for_exactly_one_validator_in_fresh_committee() {
         let topology = TopologySchedule::single(Arc::new(committee.topology_snapshot(1)));
         let coordinator = ShardCoordinator::new(
             ValidatorId::new(u64::from(local_idx)),
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             ShardConsensusConfig::default(),
             RecoveredState::default(),
         );

@@ -201,7 +201,18 @@ fn skip_path_advances_past_blocked_epoch() {
 #[traced_test]
 #[test]
 fn fetch_recovery_path_unblocks_dropped_peer() {
-    let mut runner = SimulationRunner::new(&beacon_committee_config(), 0xFE_7C);
+    // 2s epochs: a 30s run at 1s would cross the epoch-16 committee shuffle,
+    // where a rotation stall outlasts the 3-epoch topology retention window
+    // (sized for production 300s epochs), so a fetch-recovered block could
+    // commit against an evicted committee. At 2s the run stays below the
+    // shuffle while still exercising the drop-and-recover path this test cares
+    // about.
+    let mut config = beacon_committee_config();
+    config.beacon_chain_config = Some(BeaconChainConfig {
+        epoch_duration_ms: 2 * TEST_EPOCH_MS,
+        ..BeaconChainConfig::default()
+    });
+    let mut runner = SimulationRunner::new(&config, 0xFE_7C);
     runner.initialize_genesis();
 
     let drop_rule = runner

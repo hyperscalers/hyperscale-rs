@@ -14,7 +14,7 @@
 //! assert_eq!(global.to_string(), "hyperscale/block.header/1.0.0");
 //!
 //! // Shard-specific topic
-//! let shard = Topic::shard("transaction.gossip", ShardGroupId::new(5));
+//! let shard = Topic::shard("transaction.gossip", ShardGroupId::from_heap_index(5));
 //! assert_eq!(shard.to_string(), "hyperscale/transaction.gossip/shard-5/1.0.0");
 //! ```
 
@@ -211,7 +211,7 @@ pub fn parse_topic(topic_str: &str) -> Option<ParsedTopic<'_>> {
             let shard_id = {
                 let id_str = shard_str.strip_prefix("shard-")?;
                 let shard_id: u64 = id_str.parse().ok()?;
-                Some(ShardGroupId::new(shard_id))
+                Some(ShardGroupId::from_heap_index(shard_id))
             };
 
             if !validate_version(parts[3]) {
@@ -250,11 +250,11 @@ mod tests {
 
     #[test]
     fn test_shard_topic() {
-        let topic = Topic::shard("transaction.gossip", ShardGroupId::new(5));
+        let topic = Topic::shard("transaction.gossip", ShardGroupId::from_heap_index(5));
         assert_eq!(topic.message_type(), "transaction.gossip");
         assert!(!topic.is_global());
         assert!(topic.is_shard());
-        assert_eq!(topic.shard_id(), Some(ShardGroupId::new(5)));
+        assert_eq!(topic.shard_id(), Some(ShardGroupId::from_heap_index(5)));
         assert_eq!(
             topic.to_string(),
             "hyperscale/transaction.gossip/shard-5/1.0.0"
@@ -272,7 +272,7 @@ mod tests {
     fn test_parse_shard_topic() {
         let parsed = parse_topic("hyperscale/transaction.gossip/shard-3/1.0.0").unwrap();
         assert_eq!(parsed.message_type, "transaction.gossip");
-        assert_eq!(parsed.shard_id, Some(ShardGroupId::new(3)));
+        assert_eq!(parsed.shard_id, Some(ShardGroupId::from_heap_index(3)));
     }
 
     #[test]
@@ -300,7 +300,7 @@ mod tests {
         assert_eq!(parsed.message_type, original.message_type());
         assert_eq!(parsed.shard_id, original.shard_id());
 
-        let original = Topic::shard("transaction.gossip", ShardGroupId::new(42));
+        let original = Topic::shard("transaction.gossip", ShardGroupId::from_heap_index(42));
         let string = original.to_string();
         let parsed = parse_topic(&string).unwrap();
         assert_eq!(parsed.message_type, original.message_type());

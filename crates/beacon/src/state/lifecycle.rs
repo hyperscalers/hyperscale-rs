@@ -210,7 +210,7 @@ mod tests {
     ) -> BeaconState {
         let mut state = empty_state();
         let pool_id = StakePoolId::new(0);
-        let shard = ShardGroupId::new(0);
+        let shard = ShardGroupId::leaf(1, 0);
         let mut pool_validators = BTreeSet::new();
         let mut members = Vec::new();
         for i in 0..n_active {
@@ -438,7 +438,7 @@ mod tests {
     fn distribute_epoch_rewards_excludes_unready_validators() {
         let mut state = single_pool_state(0);
         let pool_id = StakePoolId::new(0);
-        let shard = ShardGroupId::new(0);
+        let shard = ShardGroupId::leaf(1, 0);
         // Two validators: ready and not-ready, both OnShard.
         state.validators.insert(
             ValidatorId::new(0),
@@ -495,7 +495,7 @@ mod tests {
         let mut state = empty_state();
         let pool_a = StakePoolId::new(1);
         let pool_b = StakePoolId::new(2);
-        let shard = ShardGroupId::new(0);
+        let shard = ShardGroupId::leaf(1, 0);
 
         // Pool A: 1 ready active.
         state.pools.insert(
@@ -599,7 +599,7 @@ mod tests {
                 id: ValidatorId::new(10),
                 pool: pool_a,
                 status: ValidatorStatus::OnShard {
-                    shard: ShardGroupId::new(0),
+                    shard: ShardGroupId::leaf(1, 0),
                     ready: true,
                     placed_at_epoch: Epoch::GENESIS,
                 },
@@ -641,7 +641,7 @@ mod tests {
     /// derived helpers see the pool correctly.
     fn insert_unready_on_shard(state: &mut BeaconState, id: u64, placed_at_epoch: Epoch) {
         let pool_id = StakePoolId::new(0);
-        let shard = ShardGroupId::new(0);
+        let shard = ShardGroupId::leaf(1, 0);
         state
             .pools
             .entry(pool_id)
@@ -684,7 +684,7 @@ mod tests {
         assert_eq!(
             state.validators.get(&ValidatorId::new(0)).unwrap().status,
             ValidatorStatus::OnShard {
-                shard: ShardGroupId::new(0),
+                shard: ShardGroupId::leaf(1, 0),
                 ready: true,
                 placed_at_epoch: placed,
             },
@@ -824,7 +824,7 @@ mod tests {
                 0,
                 0,
                 ValidatorStatus::OnShard {
-                    shard: ShardGroupId::new(0),
+                    shard: ShardGroupId::leaf(1, 0),
                     ready: true,
                     placed_at_epoch: Epoch::GENESIS,
                 },
@@ -832,10 +832,10 @@ mod tests {
         );
         state
             .next_shard_committees
-            .insert(ShardGroupId::new(0), ShardCommittee::default());
+            .insert(ShardGroupId::leaf(1, 0), ShardCommittee::default());
         state
             .next_shard_committees
-            .get_mut(&ShardGroupId::new(0))
+            .get_mut(&ShardGroupId::leaf(1, 0))
             .unwrap()
             .members
             .push(ValidatorId::new(0));

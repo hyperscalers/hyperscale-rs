@@ -163,6 +163,7 @@ pub use time::timestamp::{LocalTimestamp, ProposerTimestamp, WeightedTimestamp};
 pub use topology::awaiting::AwaitingTopologyBuffer;
 pub use topology::schedule::TopologySchedule;
 pub use topology::snapshot::{TopologySnapshot, node_id_hash_u64, shard_for_node};
+pub use topology::trie::ShardTrie;
 pub use topology::validator::{ValidatorInfo, ValidatorSet};
 pub use transaction::constructors::{
     routable_from_notarized_v1, routable_from_notarized_v2, routable_from_user_transaction,

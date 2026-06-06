@@ -237,7 +237,7 @@ fn inject_topology_change_splices_witnesses_into_epoch_one_proposal() {
     // helper delivers a source header committing the witness's leaf root
     // to all replicas first.
     let witness = sim.admissible_shard_witness(
-        ShardGroupId::new(0),
+        ShardGroupId::ROOT,
         1,
         0,
         ShardWitnessPayload::Ready {
@@ -362,7 +362,7 @@ fn injected_topology_witness_mutates_state_at_commit() {
     // delivers a source header so the witness-admission gate accepts the
     // deposit on every peer.
     let witness = sim.admissible_shard_witness(
-        ShardGroupId::new(0),
+        ShardGroupId::ROOT,
         1,
         1,
         ShardWitnessPayload::StakeDeposit {
@@ -467,7 +467,7 @@ fn forged_shard_witness_never_reaches_committed_block() {
             amount: Stake::from_whole_tokens(500),
         },
         proof: ShardWitnessProof {
-            shard_id: ShardGroupId::new(0),
+            shard_id: ShardGroupId::ROOT,
             committed_block_hash: BlockHash::ZERO,
             leaf_index: LeafIndex::new(1),
             siblings: BoundedVec::new(),

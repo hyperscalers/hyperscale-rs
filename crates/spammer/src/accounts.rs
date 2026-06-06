@@ -6,7 +6,7 @@
 //! funded via runtime transactions before the main workload starts.
 
 use hyperscale_types::{
-    Ed25519PrivateKey, NodeId, ShardGroupId, ed25519_keypair_from_seed, shard_for_node,
+    Ed25519PrivateKey, NodeId, ShardGroupId, ShardTrie, ed25519_keypair_from_seed, shard_for_node,
 };
 
 /// Maximum number of accounts that can be created per shard at genesis.
@@ -191,8 +191,7 @@ impl AccountPool {
         let mut round_robin_counters = HashMap::new();
         let mut usage_counts = HashMap::new();
 
-        for shard in 0..num_shards {
-            let shard_id = ShardGroupId::new(shard);
+        for shard_id in ShardTrie::uniform_from_count(num_shards).leaves() {
             by_shard.insert(shard_id, Vec::new());
             round_robin_counters.insert(shard_id, AtomicUsize::new(0));
             usage_counts.insert(shard_id, Vec::new());
@@ -239,7 +238,7 @@ impl AccountPool {
             .any(|&count| count < accounts_per_shard)
         {
             let account = FundedAccount::from_seed(seed, num_shards);
-            let shard_idx = usize::try_from(account.shard.inner()).unwrap_or(usize::MAX);
+            let shard_idx = usize::try_from(account.shard.path()).unwrap_or(usize::MAX);
 
             if found_per_shard[shard_idx] < accounts_per_shard {
                 pool.by_shard.get_mut(&account.shard).unwrap().push(account);
@@ -257,8 +256,7 @@ impl AccountPool {
         }
 
         // Initialize usage counts for each shard
-        for shard in 0..num_shards {
-            let shard_id = ShardGroupId::new(shard);
+        for shard_id in ShardTrie::uniform_from_count(num_shards).leaves() {
             let count = pool.by_shard.get(&shard_id).map_or(0, Vec::len);
             let counters: Vec<AtomicU64> = (0..count).map(|_| AtomicU64::new(0)).collect();
             pool.usage_counts.insert(shard_id, counters);
@@ -388,7 +386,8 @@ impl AccountPool {
         rng: &mut impl Rng,
         mode: SelectionMode,
     ) -> Option<(&FundedAccount, &FundedAccount)> {
-        let shard = ShardGroupId::new(rng.random_range(0..self.num_shards));
+        let depth = self.num_shards.trailing_zeros();
+        let shard = ShardGroupId::leaf(depth, rng.random_range(0..self.num_shards));
         let num_accounts = self.by_shard.get(&shard)?.len();
 
         if num_accounts < 2 {
@@ -411,10 +410,11 @@ impl AccountPool {
             return None;
         }
 
-        let shard1 = ShardGroupId::new(rng.random_range(0..self.num_shards));
-        let mut shard2 = ShardGroupId::new(rng.random_range(0..self.num_shards));
+        let depth = self.num_shards.trailing_zeros();
+        let shard1 = ShardGroupId::leaf(depth, rng.random_range(0..self.num_shards));
+        let mut shard2 = ShardGroupId::leaf(depth, rng.random_range(0..self.num_shards));
         while shard2 == shard1 {
-            shard2 = ShardGroupId::new(rng.random_range(0..self.num_shards));
+            shard2 = ShardGroupId::leaf(depth, rng.random_range(0..self.num_shards));
         }
 
         self.cross_shard_pair_for(shard1, shard2, rng, mode)
@@ -867,8 +867,8 @@ impl AccountPartition {
     /// Create an empty partition.
     fn new(num_shards: u64) -> Self {
         let mut shard_counters = HashMap::new();
-        for shard in 0..num_shards {
-            shard_counters.insert(ShardGroupId::new(shard), 0usize);
+        for shard_id in ShardTrie::uniform_from_count(num_shards).leaves() {
+            shard_counters.insert(shard_id, 0usize);
         }
         Self {
             by_shard: HashMap::new(),
@@ -962,10 +962,11 @@ impl AccountPartition {
             return None;
         }
 
-        let shard1 = ShardGroupId::new(rng.random_range(0..self.num_shards));
-        let mut shard2 = ShardGroupId::new(rng.random_range(0..self.num_shards));
+        let depth = self.num_shards.trailing_zeros();
+        let shard1 = ShardGroupId::leaf(depth, rng.random_range(0..self.num_shards));
+        let mut shard2 = ShardGroupId::leaf(depth, rng.random_range(0..self.num_shards));
         while shard2 == shard1 {
-            shard2 = ShardGroupId::new(rng.random_range(0..self.num_shards));
+            shard2 = ShardGroupId::leaf(depth, rng.random_range(0..self.num_shards));
         }
 
         self.cross_shard_pair_for(shard1, shard2, rng, mode)
@@ -1054,8 +1055,8 @@ mod tests {
     fn test_account_generation() {
         let pool = AccountPool::generate(2, 10).unwrap();
         assert_eq!(pool.total_accounts(), 20);
-        assert_eq!(pool.accounts_on_shard(ShardGroupId::new(0)), 10);
-        assert_eq!(pool.accounts_on_shard(ShardGroupId::new(1)), 10);
+        assert_eq!(pool.accounts_on_shard(ShardGroupId::leaf(1, 0)), 10);
+        assert_eq!(pool.accounts_on_shard(ShardGroupId::leaf(1, 1)), 10);
     }
 
     #[test]
@@ -1244,12 +1245,12 @@ mod tests {
         // Each partition should have ~25 accounts per shard (100/4)
         for partition in &partitions {
             // Should have both shards
-            assert!(partition.accounts_on_shard(ShardGroupId::new(0)) > 0);
-            assert!(partition.accounts_on_shard(ShardGroupId::new(1)) > 0);
+            assert!(partition.accounts_on_shard(ShardGroupId::leaf(1, 0)) > 0);
+            assert!(partition.accounts_on_shard(ShardGroupId::leaf(1, 1)) > 0);
 
             // Should have roughly equal distribution (within 1 due to rounding)
-            let shard0_count = partition.accounts_on_shard(ShardGroupId::new(0));
-            let shard1_count = partition.accounts_on_shard(ShardGroupId::new(1));
+            let shard0_count = partition.accounts_on_shard(ShardGroupId::leaf(1, 0));
+            let shard1_count = partition.accounts_on_shard(ShardGroupId::leaf(1, 1));
             assert!(
                 (24..=26).contains(&shard0_count),
                 "Expected ~25 accounts, got {shard0_count} for shard 0"
@@ -1278,7 +1279,9 @@ mod tests {
 
         for partition in &partitions {
             for shard_id in 0..2 {
-                if let Some(accounts) = partition.accounts_for_shard(ShardGroupId::new(shard_id)) {
+                if let Some(accounts) =
+                    partition.accounts_for_shard(ShardGroupId::leaf(1, shard_id))
+                {
                     for account in accounts {
                         assert!(
                             all_addresses.insert(account.address),
@@ -1303,7 +1306,7 @@ mod tests {
         // Each partition should be able to generate pairs
         for partition in &mut partitions {
             let pair = partition.pair_for_shard(
-                ShardGroupId::new(0),
+                ShardGroupId::leaf(1, 0),
                 &mut rng,
                 SelectionMode::NoContention,
             );
@@ -1327,7 +1330,7 @@ mod tests {
 
         // Get an account from partition 0 and increment its nonce
         let partition0_accounts = partitions[0]
-            .accounts_for_shard(ShardGroupId::new(0))
+            .accounts_for_shard(ShardGroupId::ROOT)
             .unwrap();
         let account_in_partition = &partition0_accounts[0];
         let address = account_in_partition.address;
@@ -1339,7 +1342,7 @@ mod tests {
         assert_eq!(nonce2, 1);
 
         // The original pool should see the updated nonce
-        let pool_accounts = pool.accounts_for_shard(ShardGroupId::new(0)).unwrap();
+        let pool_accounts = pool.accounts_for_shard(ShardGroupId::ROOT).unwrap();
         let original_account = pool_accounts.iter().find(|a| a.address == address).unwrap();
         assert_eq!(
             original_account.current_nonce(),

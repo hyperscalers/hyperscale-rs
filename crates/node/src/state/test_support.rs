@@ -80,7 +80,9 @@ impl TestNodeBuilder {
     pub fn build(self) -> TestNode {
         let committee = TestCommittee::new(4, 7);
         let me = committee.validator_id(self.local_idx);
-        let local_shard = ShardGroupId::new(me.inner() % self.num_shards);
+        // The beacon harness consolidates every validator onto the root shard,
+        // so the node's home shard is the root regardless of `num_shards`.
+        let local_shard = ShardGroupId::ROOT;
         let provision_store = Arc::new(ProvisionStore::new());
         let beacon_coordinator = test_beacon_coordinator(&committee, me, self.num_shards);
 
@@ -136,7 +138,7 @@ fn test_beacon_coordinator(
     // determinism.
     let mut initial_shard_committees: BTreeMap<ShardGroupId, Vec<_>> = BTreeMap::new();
     initial_shard_committees.insert(
-        ShardGroupId::new(0),
+        ShardGroupId::ROOT,
         (0..n).map(|i| committee.validator_id(i)).collect(),
     );
     let config = BeaconGenesisConfig {
@@ -155,7 +157,7 @@ fn test_beacon_coordinator(
         block,
         vec![state],
         me,
-        ShardGroupId::new(0),
+        ShardGroupId::ROOT,
         network,
         config_hash,
         pool,

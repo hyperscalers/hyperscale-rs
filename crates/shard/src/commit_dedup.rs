@@ -177,8 +177,8 @@ mod tests {
     fn make_provisions(seed: u8) -> Arc<Provisions> {
         let tx_hash = TxHash::from_raw(Hash::from_bytes(&[seed; 32]));
         Arc::new(Provisions::new(
-            ShardGroupId::new(0),
-            ShardGroupId::new(1),
+            ShardGroupId::leaf(1, 0),
+            ShardGroupId::leaf(1, 1),
             BlockHeight::new(u64::from(seed)),
             MerkleInclusionProof::dummy(),
             vec![ProvisionEntry::new(tx_hash, vec![], vec![], vec![])],

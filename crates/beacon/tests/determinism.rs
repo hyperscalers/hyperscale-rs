@@ -39,8 +39,8 @@ fn pubkey(seed: u64) -> Bls12381G1PublicKey {
 /// has refill stock.
 fn initial_state() -> BeaconState {
     let pool_id = StakePoolId::new(0);
-    let shard_0 = ShardGroupId::new(0);
-    let shard_1 = ShardGroupId::new(1);
+    let shard_0 = ShardGroupId::leaf(1, 0);
+    let shard_1 = ShardGroupId::leaf(1, 1);
 
     let mut validators = BTreeMap::new();
     let mut pool_validators = BTreeSet::new();

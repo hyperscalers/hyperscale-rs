@@ -230,7 +230,7 @@ mod tests {
         let committee = TestCommittee::new(4, 42);
         let topology = single_shard_topology(&committee);
 
-        let peers = peers_excluding_self(&topology, ValidatorId::new(0), ShardGroupId::new(0));
+        let peers = peers_excluding_self(&topology, ValidatorId::new(0), ShardGroupId::ROOT);
         assert_eq!(peers.len(), 3);
         assert!(!peers.contains(&ValidatorId::new(0)));
         assert!(peers.contains(&ValidatorId::new(1)));
@@ -245,7 +245,7 @@ mod tests {
 
         // Shard 99 has no committee — filter returns an empty vec regardless
         // of who the local validator is.
-        let peers = peers_excluding_self(&topology, ValidatorId::new(0), ShardGroupId::new(99));
+        let peers = peers_excluding_self(&topology, ValidatorId::new(0), ShardGroupId::leaf(8, 99));
         assert!(peers.is_empty());
     }
 
@@ -254,7 +254,7 @@ mod tests {
         let committee = TestCommittee::new(1, 42);
         let topology = single_shard_topology(&committee);
 
-        let peers = peers_excluding_self(&topology, ValidatorId::new(0), ShardGroupId::new(0));
+        let peers = peers_excluding_self(&topology, ValidatorId::new(0), ShardGroupId::ROOT);
         assert!(peers.is_empty());
     }
 
@@ -265,7 +265,7 @@ mod tests {
         let committee = TestCommittee::new(4, 42);
         let topology = single_shard_topology(&committee);
 
-        let keys = committee_public_keys_for_shard(&topology, ShardGroupId::new(0))
+        let keys = committee_public_keys_for_shard(&topology, ShardGroupId::ROOT)
             .expect("well-formed topology resolves every key");
         assert_eq!(keys.len(), 4);
 
@@ -281,7 +281,7 @@ mod tests {
 
         // An unknown shard has an empty committee, so the result is
         // `Some(vec![])` — not `None` (which is reserved for corruption).
-        let keys = committee_public_keys_for_shard(&topology, ShardGroupId::new(99))
+        let keys = committee_public_keys_for_shard(&topology, ShardGroupId::leaf(8, 99))
             .expect("empty committee is not corruption");
         assert!(keys.is_empty());
     }

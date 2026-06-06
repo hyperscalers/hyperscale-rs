@@ -28,7 +28,7 @@ fn test_topology() -> TopologySnapshot {
 
 fn coordinator_with_zero_dwell() -> MempoolCoordinator {
     MempoolCoordinator::with_config(
-        ShardGroupId::new(0),
+        ShardGroupId::ROOT,
         MempoolConfig {
             min_dwell_time: Duration::ZERO,
             ..MempoolConfig::default()
@@ -42,7 +42,7 @@ fn coordinator_with_zero_dwell() -> MempoolCoordinator {
 /// drifting.
 #[test]
 fn memory_stats_destructures_all_fields_for_fresh_coordinator() {
-    let coord = MempoolCoordinator::new(ShardGroupId::new(0));
+    let coord = MempoolCoordinator::new(ShardGroupId::ROOT);
     let MempoolMemoryStats {
         pool,
         ready,
@@ -64,7 +64,7 @@ fn memory_stats_destructures_all_fields_for_fresh_coordinator() {
 
 #[test]
 fn fresh_coordinator_reports_empty_pool_and_ready_set() {
-    let coord = MempoolCoordinator::new(ShardGroupId::new(0));
+    let coord = MempoolCoordinator::new(ShardGroupId::ROOT);
     assert_eq!(coord.len(), 0);
     assert!(coord.is_empty());
     assert_eq!(coord.in_flight(), 0);
@@ -74,19 +74,19 @@ fn fresh_coordinator_reports_empty_pool_and_ready_set() {
 
 #[test]
 fn at_in_flight_limit_is_false_on_fresh_coordinator() {
-    let coord = MempoolCoordinator::new(ShardGroupId::new(0));
+    let coord = MempoolCoordinator::new(ShardGroupId::ROOT);
     assert!(!coord.at_in_flight_limit());
 }
 
 #[test]
 fn at_pending_limit_is_false_on_fresh_coordinator() {
-    let coord = MempoolCoordinator::new(ShardGroupId::new(0));
+    let coord = MempoolCoordinator::new(ShardGroupId::ROOT);
     assert!(!coord.at_pending_limit());
 }
 
 #[test]
 fn has_transaction_is_false_on_fresh_coordinator() {
-    let coord = MempoolCoordinator::new(ShardGroupId::new(0));
+    let coord = MempoolCoordinator::new(ShardGroupId::ROOT);
     assert!(!coord.has_transaction(&TxHash::from_raw(Hash::from_bytes(b"unknown"))));
     assert!(
         coord
@@ -102,7 +102,7 @@ fn has_transaction_is_false_on_fresh_coordinator() {
 
 #[test]
 fn ready_transactions_is_empty_on_fresh_coordinator() {
-    let coord = MempoolCoordinator::new(ShardGroupId::new(0));
+    let coord = MempoolCoordinator::new(ShardGroupId::ROOT);
     assert!(
         coord
             .ready_transactions(100, 0, 0, LocalTimestamp::ZERO)
@@ -112,7 +112,7 @@ fn ready_transactions_is_empty_on_fresh_coordinator() {
 
 #[test]
 fn lock_contention_stats_zero_on_fresh_coordinator() {
-    let coord = MempoolCoordinator::new(ShardGroupId::new(0));
+    let coord = MempoolCoordinator::new(ShardGroupId::ROOT);
     let stats = coord.lock_contention_stats();
     assert_eq!(stats.locked_nodes, 0);
     assert_eq!(stats.pending_count, 0);
@@ -123,7 +123,7 @@ fn lock_contention_stats_zero_on_fresh_coordinator() {
 
 #[test]
 fn is_tombstoned_is_false_on_fresh_coordinator() {
-    let coord = MempoolCoordinator::new(ShardGroupId::new(0));
+    let coord = MempoolCoordinator::new(ShardGroupId::ROOT);
     assert!(!coord.is_tombstoned(&TxHash::from_raw(Hash::from_bytes(b"unknown"))));
 }
 
@@ -147,7 +147,7 @@ fn submit_then_ready_round_trips_a_transaction() {
 #[test]
 fn on_block_committed_transitions_pending_to_committed_and_bumps_in_flight() {
     let topology = test_topology();
-    let mut coord = MempoolCoordinator::new(ShardGroupId::new(0));
+    let mut coord = MempoolCoordinator::new(ShardGroupId::ROOT);
 
     let tx = test_transaction(1);
     let tx_hash = tx.hash();
@@ -159,7 +159,7 @@ fn on_block_committed_transitions_pending_to_committed_and_bumps_in_flight() {
     assert_eq!(coord.in_flight(), 0);
 
     let block = make_live_block(
-        ShardGroupId::new(0),
+        ShardGroupId::ROOT,
         BlockHeight::new(1),
         1_000,
         ValidatorId::new(0),
@@ -178,7 +178,7 @@ fn on_block_committed_transitions_pending_to_committed_and_bumps_in_flight() {
 #[test]
 fn on_block_committed_with_finalized_wave_tombstones_and_evicts() {
     let topology = test_topology();
-    let mut coord = MempoolCoordinator::new(ShardGroupId::new(0));
+    let mut coord = MempoolCoordinator::new(ShardGroupId::ROOT);
 
     let tx = test_transaction(1);
     let tx_hash = tx.hash();
@@ -192,7 +192,7 @@ fn on_block_committed_with_finalized_wave_tombstones_and_evicts() {
     // completing it — drives Pending → Committed → Completed in one call.
     let fw = make_finalized_wave(BlockHeight::new(1), tx_hash, TransactionDecision::Accept);
     let block = make_live_block(
-        ShardGroupId::new(0),
+        ShardGroupId::ROOT,
         BlockHeight::new(1),
         1_000,
         ValidatorId::new(0),

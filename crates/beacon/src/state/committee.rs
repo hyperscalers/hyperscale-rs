@@ -221,7 +221,7 @@ mod tests {
         let mut pool_validators = BTreeSet::new();
         let mut next_id = 0u64;
         for s in 0..shard_count {
-            let shard = ShardGroupId::new(s);
+            let shard = ShardGroupId::leaf(1, s);
             let mut members = Vec::new();
             for _ in 0..per_shard {
                 let id = ValidatorId::new(next_id);
@@ -290,7 +290,7 @@ mod tests {
             .get_mut(&StakePoolId::new(0))
             .unwrap()
             .total_stake = Stake::from_attos(10 * MIN_STAKE_FLOOR.attos());
-        let initial_members = state.next_shard_committees[&ShardGroupId::new(0)]
+        let initial_members = state.next_shard_committees[&ShardGroupId::leaf(1, 0)]
             .members
             .clone();
         let initial_pool = state.pooled_validators();
@@ -298,7 +298,7 @@ mod tests {
         let effects = apply_next_epoch(&mut state, &[]);
 
         assert_eq!(
-            state.next_shard_committees[&ShardGroupId::new(0)].members,
+            state.next_shard_committees[&ShardGroupId::leaf(1, 0)].members,
             initial_members
         );
         assert_eq!(state.pooled_validators(), initial_pool);
@@ -315,19 +315,19 @@ mod tests {
         state.committee = (0u64..4).map(ValidatorId::new).collect();
         state.current_epoch = Epoch::new(SHUFFLE_INTERVAL_EPOCHS - 1);
 
-        let initial_shard_0 = state.next_shard_committees[&ShardGroupId::new(0)]
+        let initial_shard_0 = state.next_shard_committees[&ShardGroupId::leaf(1, 0)]
             .members
             .clone();
-        let initial_shard_1 = state.next_shard_committees[&ShardGroupId::new(1)]
+        let initial_shard_1 = state.next_shard_committees[&ShardGroupId::leaf(1, 1)]
             .members
             .clone();
 
         apply_next_epoch(&mut state, &[]);
 
-        let final_shard_0 = state.next_shard_committees[&ShardGroupId::new(0)]
+        let final_shard_0 = state.next_shard_committees[&ShardGroupId::leaf(1, 0)]
             .members
             .clone();
-        let final_shard_1 = state.next_shard_committees[&ShardGroupId::new(1)]
+        let final_shard_1 = state.next_shard_committees[&ShardGroupId::leaf(1, 1)]
             .members
             .clone();
 
@@ -353,7 +353,7 @@ mod tests {
     /// `OnShard { ready: true }` validators are picked.
     #[test]
     fn shuffle_picks_only_from_ready_members() {
-        let shard = ShardGroupId::new(0);
+        let shard = ShardGroupId::leaf(1, 0);
         let mut state = single_pool_state(4);
         // Mark validators 2 and 3 as not-yet-ready.
         for id in [2u64, 3] {
@@ -411,14 +411,14 @@ mod tests {
         state.current_epoch = Epoch::new(SHUFFLE_INTERVAL_EPOCHS - 1);
         assert!(state.pooled_validators().is_empty());
 
-        let initial_members = state.next_shard_committees[&ShardGroupId::new(0)]
+        let initial_members = state.next_shard_committees[&ShardGroupId::leaf(1, 0)]
             .members
             .clone();
         apply_next_epoch(&mut state, &[]);
 
         // Shard shrunk by one — empty pool, no refill possible.
         assert_eq!(
-            state.next_shard_committees[&ShardGroupId::new(0)]
+            state.next_shard_committees[&ShardGroupId::leaf(1, 0)]
                 .members
                 .len(),
             3
@@ -429,7 +429,7 @@ mod tests {
         let victim = pool_now[0];
         assert!(initial_members.contains(&victim));
         assert!(
-            !state.next_shard_committees[&ShardGroupId::new(0)]
+            !state.next_shard_committees[&ShardGroupId::leaf(1, 0)]
                 .members
                 .contains(&victim)
         );
@@ -460,7 +460,7 @@ mod tests {
         let effects = apply_next_epoch(&mut state, &[]);
         let transition = effects
             .shard_committee_transitions
-            .get(&ShardGroupId::new(0))
+            .get(&ShardGroupId::leaf(1, 0))
             .expect("shuffle on shard 0 emits a transition");
         assert_eq!(transition.cause, TransitionCause::NaturalShuffle);
         assert_eq!(transition.at_slot, Epoch::new(SHUFFLE_INTERVAL_EPOCHS));
@@ -517,7 +517,7 @@ mod tests {
     /// not-yet-ready `OnShard` validators are all excluded.
     #[test]
     fn beacon_eligible_filters_to_on_shard_ready() {
-        let shard = ShardGroupId::new(0);
+        let shard = ShardGroupId::leaf(1, 0);
         let mut state = empty_state();
         let ready_id = ValidatorId::new(1);
         state.validators.insert(
@@ -656,7 +656,7 @@ mod tests {
         // global invariant.
         state
             .next_shard_committees
-            .get_mut(&ShardGroupId::new(0))
+            .get_mut(&ShardGroupId::leaf(1, 0))
             .unwrap()
             .members
             .retain(|v| *v != ValidatorId::new(0));

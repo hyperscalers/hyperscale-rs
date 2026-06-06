@@ -92,7 +92,7 @@ mod tests {
     #[test]
     fn sbor_round_trip() {
         let req = GetShardWitnessesRequest::new(
-            ShardGroupId::new(2),
+            ShardGroupId::ROOT,
             BlockHeight::new(42),
             BlockHash::ZERO,
             vec![LeafIndex::new(1), LeafIndex::new(7), LeafIndex::new(42)],

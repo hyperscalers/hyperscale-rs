@@ -209,7 +209,7 @@ impl TestCommittee {
 /// Build a minimal `Block::Live` fixture for driving state machines.
 ///
 /// Every non-essential header field takes a zero default: all merkle roots
-/// are `Hash::ZERO`, `parent_qc` is `QuorumCertificate::genesis(ShardGroupId::new(0))`, `round`
+/// are `Hash::ZERO`, `parent_qc` is `QuorumCertificate::genesis(ShardGroupId::ROOT)`, `round`
 /// is `Round::INITIAL`, and there are no wave roots or provisions. Callers
 /// pass only the bits that vary between tests.
 ///
@@ -233,7 +233,7 @@ pub fn make_live_block(
         shard_group_id,
         height,
         BlockHash::ZERO,
-        QuorumCertificate::genesis(ShardGroupId::new(0)),
+        QuorumCertificate::genesis(ShardGroupId::ROOT),
         proposer,
         ProposerTimestamp::from_millis(timestamp_ms),
         Round::INITIAL,
@@ -269,7 +269,7 @@ pub fn make_live_block(
 #[must_use]
 pub fn certify(block: Block, weighted_timestamp_ms: u64) -> CertifiedBlock {
     let qc = {
-        let __qc = QuorumCertificate::genesis(ShardGroupId::new(0));
+        let __qc = QuorumCertificate::genesis(ShardGroupId::ROOT);
         QuorumCertificate::new(
             block.hash(),
             __qc.shard_group_id(),
@@ -286,7 +286,7 @@ pub fn certify(block: Block, weighted_timestamp_ms: u64) -> CertifiedBlock {
 
 /// Build a minimal `FinalizedWave` carrying a single tx decision.
 ///
-/// The wave is anchored on `ShardGroupId::new(0)` with `block_height` as its
+/// The wave is anchored on `ShardGroupId::ROOT` with `block_height` as its
 /// identity and no remote shard dependencies — sufficient for driving
 /// `on_block_committed` when tests only care about tx-terminal-state side
 /// effects. The inner EC carries a zeroed BLS signature and a 4-seat
@@ -305,7 +305,7 @@ pub fn make_finalized_wave(
         TransactionDecision::Reject => ExecutionOutcome::Failed,
         TransactionDecision::Aborted => ExecutionOutcome::Aborted,
     };
-    let wave_id = WaveId::new(ShardGroupId::new(0), block_height, BTreeSet::new());
+    let wave_id = WaveId::new(ShardGroupId::ROOT, block_height, BTreeSet::new());
     let ec = ExecutionCertificate::new(
         wave_id.clone(),
         WeightedTimestamp::from_millis(block_height.inner() + 1),

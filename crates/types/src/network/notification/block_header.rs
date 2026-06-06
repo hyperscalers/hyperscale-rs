@@ -95,10 +95,10 @@ mod tests {
 
     fn make_header(height: BlockHeight) -> BlockHeader {
         BlockHeader::new(
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             height,
             BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            QuorumCertificate::genesis(ShardGroupId::new(0)),
+            QuorumCertificate::genesis(ShardGroupId::ROOT),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(1_234_567_890),
             Round::INITIAL,

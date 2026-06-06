@@ -167,7 +167,7 @@ mod tests {
 
     fn sample_config() -> BeaconGenesisConfig {
         let pool_id = StakePoolId::new(0);
-        let shard = ShardGroupId::new(0);
+        let shard = ShardGroupId::ROOT;
         let validators = (0u64..4)
             .map(|i| GenesisValidator {
                 id: ValidatorId::new(i),

@@ -422,10 +422,14 @@ mod tests {
     /// from raw `QuorumCertificate` to `Verifiable<QuorumCertificate>`.
     #[test]
     fn wire_bypass_identical_across_verified_states() {
-        let block = Block::genesis(ShardGroupId::new(0), ValidatorId::new(0), StateRoot::ZERO);
+        let block = Block::genesis(
+            ShardGroupId::leaf(1, 0),
+            ValidatorId::new(0),
+            StateRoot::ZERO,
+        );
         let qc = QuorumCertificate::new(
             block.hash(),
-            ShardGroupId::new(0),
+            ShardGroupId::leaf(1, 0),
             BlockHeight::GENESIS,
             BlockHash::ZERO,
             Round::INITIAL,
@@ -448,11 +452,15 @@ mod tests {
     /// with the same `LinkageError` shape as `assemble`.
     #[test]
     fn from_qc_attestation_accepts_matching_pair_and_rejects_mismatch() {
-        let block = Block::genesis(ShardGroupId::new(0), ValidatorId::new(0), StateRoot::ZERO);
+        let block = Block::genesis(
+            ShardGroupId::leaf(1, 0),
+            ValidatorId::new(0),
+            StateRoot::ZERO,
+        );
         let block_hash = block.hash();
         let qc = QuorumCertificate::new(
             block_hash,
-            ShardGroupId::new(0),
+            ShardGroupId::leaf(1, 0),
             BlockHeight::GENESIS,
             BlockHash::ZERO,
             Round::INITIAL,
@@ -474,11 +482,14 @@ mod tests {
         // (its embedded QC matches its block), but `from_qc_attestation`
         // replaces the embedded QC with the supplied one, so it must
         // re-check the linkage against the new QC.
-        let other_block =
-            Block::genesis(ShardGroupId::new(1), ValidatorId::new(1), StateRoot::ZERO);
+        let other_block = Block::genesis(
+            ShardGroupId::leaf(1, 1),
+            ValidatorId::new(1),
+            StateRoot::ZERO,
+        );
         let other_qc_raw = QuorumCertificate::new(
             other_block.hash(),
-            ShardGroupId::new(1),
+            ShardGroupId::leaf(1, 1),
             BlockHeight::GENESIS,
             BlockHash::ZERO,
             Round::INITIAL,
@@ -498,9 +509,13 @@ mod tests {
     /// verified — byte-equal to whatever the header carries.
     #[test]
     fn parent_qc_attested_returns_header_parent_qc() {
-        let block = Block::genesis(ShardGroupId::new(0), ValidatorId::new(0), StateRoot::ZERO);
+        let block = Block::genesis(
+            ShardGroupId::leaf(1, 0),
+            ValidatorId::new(0),
+            StateRoot::ZERO,
+        );
         let block_hash = block.hash();
-        let raw_qc = QuorumCertificate::genesis(ShardGroupId::new(0));
+        let raw_qc = QuorumCertificate::genesis(ShardGroupId::leaf(1, 0));
         let qc_for_block = QuorumCertificate::new(
             block_hash,
             raw_qc.shard_group_id(),

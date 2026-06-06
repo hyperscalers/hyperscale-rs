@@ -290,7 +290,7 @@ mod tests {
         n_beacon_members: u64,
     ) -> BeaconGenesisConfig {
         let pool_id = StakePoolId::new(0);
-        let shard = ShardGroupId::new(0);
+        let shard = ShardGroupId::ROOT;
         let validators: Vec<GenesisValidator> = (0..n_validators)
             .map(|i| GenesisValidator {
                 id: ValidatorId::new(i),
@@ -335,7 +335,7 @@ mod tests {
             assert_eq!(
                 status,
                 ValidatorStatus::OnShard {
-                    shard: ShardGroupId::new(0),
+                    shard: ShardGroupId::ROOT,
                     ready: true,
                     placed_at_epoch: Epoch::GENESIS,
                 },
@@ -346,7 +346,7 @@ mod tests {
     #[test]
     fn genesis_seeds_both_windows_then_apply_epoch_promotes_unchanged() {
         let cfg = sample_config(4, 4, 4);
-        let shard = ShardGroupId::new(0);
+        let shard = ShardGroupId::ROOT;
         let configured: Vec<ValidatorId> = [0u64, 1, 2, 3].map(ValidatorId::new).to_vec();
 
         let mut state = build_genesis_beacon_state(&cfg);
@@ -401,7 +401,7 @@ mod tests {
     #[test]
     fn beacon_committee_stored_sorted() {
         let pool_id = StakePoolId::new(0);
-        let shard = ShardGroupId::new(0);
+        let shard = ShardGroupId::ROOT;
         let validators: Vec<GenesisValidator> = (0u64..4)
             .map(|i| GenesisValidator {
                 id: ValidatorId::new(i),
@@ -516,7 +516,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "shard Shard(0) and shard Shard(1)")]
+    #[should_panic(expected = "shard Shard(d1p0) and shard Shard(d1p1)")]
     fn rejects_validator_in_two_shard_committees() {
         let pool_id = StakePoolId::new(0);
         let cfg = BeaconGenesisConfig {
@@ -532,8 +532,8 @@ mod tests {
             }],
             initial_beacon_committee: vec![],
             initial_shard_committees: [
-                (ShardGroupId::new(0), vec![ValidatorId::new(0)]),
-                (ShardGroupId::new(1), vec![ValidatorId::new(0)]),
+                (ShardGroupId::leaf(1, 0), vec![ValidatorId::new(0)]),
+                (ShardGroupId::leaf(1, 1), vec![ValidatorId::new(0)]),
             ]
             .into_iter()
             .collect(),

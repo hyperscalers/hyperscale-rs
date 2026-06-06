@@ -5,7 +5,7 @@
 //! the result into envelopes on a two-queue delivery model
 //! (network-first, loopback-second).
 //!
-//! Single-shard by construction (`ShardGroupId::new(0)`), with no
+//! Single-shard by construction (`ShardGroupId::ROOT`), with no
 //! provisions, no remote headers, no execution waves. The full
 //! simulator covers those concerns; this sim pins HotStuff-2
 //! safety + liveness machinery in isolation.
@@ -317,7 +317,7 @@ impl ShardCoordinatorSim {
         let committee = TestCommittee::new(n, seed);
         let topology = TopologySchedule::single(Arc::new(committee.topology_snapshot(1)));
         let network = NetworkDefinition::simulator();
-        let shard = ShardGroupId::new(0);
+        let shard = ShardGroupId::ROOT;
 
         let mut sks = Vec::with_capacity(n);
         let mut members = Vec::with_capacity(n);

@@ -288,7 +288,7 @@ mod tests {
         // Shard committee shrank (the only pool has no Pooled validators
         // to refill from, so `pool_draw` returns None and the committee
         // stays at 3).
-        let members = &state.next_shard_committees[&ShardGroupId::new(0)].members;
+        let members = &state.next_shard_committees[&ShardGroupId::leaf(1, 0)].members;
         assert_eq!(members.len(), 3);
         assert!(!members.contains(&ValidatorId::new(3)));
     }

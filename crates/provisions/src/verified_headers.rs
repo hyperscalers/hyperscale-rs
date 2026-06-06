@@ -92,7 +92,7 @@ mod tests {
             shard,
             height,
             BlockHash::ZERO,
-            QuorumCertificate::genesis(ShardGroupId::new(0)),
+            QuorumCertificate::genesis(ShardGroupId::leaf(1, 0)),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(0),
             Round::INITIAL,
@@ -129,7 +129,7 @@ mod tests {
         let buf = VerifiedHeaderBuffer::new();
         assert_eq!(buf.len(), 0);
         assert!(
-            buf.get((ShardGroupId::new(1), BlockHeight::new(0)))
+            buf.get((ShardGroupId::leaf(1, 1), BlockHeight::new(0)))
                 .is_none()
         );
     }
@@ -137,8 +137,8 @@ mod tests {
     #[test]
     fn insert_and_get_round_trip() {
         let buf = VerifiedHeaderBuffer::new();
-        let key = (ShardGroupId::new(1), BlockHeight::new(10));
-        let header = make_header(ShardGroupId::new(1), BlockHeight::new(10));
+        let key = (ShardGroupId::leaf(1, 1), BlockHeight::new(10));
+        let header = make_header(ShardGroupId::leaf(1, 1), BlockHeight::new(10));
         buf.insert(key, Arc::clone(&header));
         assert_eq!(buf.len(), 1);
         let stored = buf.get(key).expect("present");
@@ -148,17 +148,26 @@ mod tests {
     #[test]
     fn insert_overwrites_existing_key() {
         let buf = VerifiedHeaderBuffer::new();
-        let key = (ShardGroupId::new(1), BlockHeight::new(10));
-        buf.insert(key, make_header(ShardGroupId::new(1), BlockHeight::new(10)));
-        buf.insert(key, make_header(ShardGroupId::new(1), BlockHeight::new(10)));
+        let key = (ShardGroupId::leaf(1, 1), BlockHeight::new(10));
+        buf.insert(
+            key,
+            make_header(ShardGroupId::leaf(1, 1), BlockHeight::new(10)),
+        );
+        buf.insert(
+            key,
+            make_header(ShardGroupId::leaf(1, 1), BlockHeight::new(10)),
+        );
         assert_eq!(buf.len(), 1);
     }
 
     #[test]
     fn remove_returns_stored_header_and_drops_entry() {
         let buf = VerifiedHeaderBuffer::new();
-        let key = (ShardGroupId::new(1), BlockHeight::new(10));
-        buf.insert(key, make_header(ShardGroupId::new(1), BlockHeight::new(10)));
+        let key = (ShardGroupId::leaf(1, 1), BlockHeight::new(10));
+        buf.insert(
+            key,
+            make_header(ShardGroupId::leaf(1, 1), BlockHeight::new(10)),
+        );
         assert!(buf.remove(key).is_some());
         assert_eq!(buf.len(), 0);
         assert!(buf.remove(key).is_none());

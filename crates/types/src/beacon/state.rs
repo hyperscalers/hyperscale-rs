@@ -542,14 +542,7 @@ impl BeaconState {
             .map(|(sid, sc)| (*sid, sc.members.clone()))
             .collect();
 
-        let num_shards = u64::try_from(committees.len()).unwrap_or(u64::MAX);
-
-        TopologySnapshot::with_shard_committees(
-            network,
-            num_shards,
-            &validator_set,
-            shard_committees,
-        )
+        TopologySnapshot::from_explicit_committees(network, &validator_set, shard_committees)
     }
 
     /// Active-duty validator pool: every validator `OnShard { ready: true }`
@@ -732,7 +725,7 @@ mod tests {
     fn single_pool_state(n_active: u64) -> BeaconState {
         let mut state = empty_state();
         let pool_id = StakePoolId::new(0);
-        let shard = ShardGroupId::new(0);
+        let shard = ShardGroupId::ROOT;
 
         let mut pool_validators = BTreeSet::new();
         let mut members = Vec::new();

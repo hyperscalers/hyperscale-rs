@@ -83,7 +83,7 @@ pub fn empty_state() -> BeaconState {
 pub fn single_pool_state(n_active: u64) -> BeaconState {
     let mut state = empty_state();
     let pool_id = StakePoolId::new(0);
-    let shard = ShardGroupId::new(0);
+    let shard = ShardGroupId::leaf(1, 0);
 
     let mut pool_validators = BTreeSet::new();
     let mut members = Vec::new();
@@ -163,7 +163,7 @@ pub fn shard_witness(shard_id: u64, leaf_index: u64, payload: ShardWitnessPayloa
     ShardWitness {
         payload,
         proof: ShardWitnessProof {
-            shard_id: ShardGroupId::new(shard_id),
+            shard_id: ShardGroupId::leaf(1, shard_id),
             committed_block_hash: BlockHash::ZERO,
             leaf_index: LeafIndex::new(leaf_index),
             siblings: BoundedVec::new(),
@@ -186,7 +186,7 @@ pub fn state_with_pending_withdrawal(
     let mut state = empty_state();
     state.current_epoch = current_epoch;
     let pool_id = StakePoolId::new(0);
-    let shard = ShardGroupId::new(0);
+    let shard = ShardGroupId::leaf(1, 0);
     let mut pool_validators = BTreeSet::new();
     let mut members = Vec::new();
     for i in 0..n_actives {

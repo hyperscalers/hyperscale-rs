@@ -20,7 +20,7 @@ use hyperscale_types::{
 const TEST_BLOCK_INTERVAL_MS: u64 = 500;
 
 fn fresh_coordinator() -> ProvisionCoordinator {
-    ProvisionCoordinator::new(ShardGroupId::new(0))
+    ProvisionCoordinator::new(ShardGroupId::leaf(1, 0))
 }
 
 fn fresh_coordinator_with_topology() -> (ProvisionCoordinator, TopologySnapshot) {
@@ -30,10 +30,10 @@ fn fresh_coordinator_with_topology() -> (ProvisionCoordinator, TopologySnapshot)
 
 fn make_block(height: BlockHeight) -> CertifiedBlock {
     let header = BlockHeader::new(
-        ShardGroupId::new(0),
+        ShardGroupId::leaf(1, 0),
         height,
         BlockHash::from_raw(Hash::from_bytes(&[0u8; 32])),
-        QuorumCertificate::genesis(ShardGroupId::new(0)),
+        QuorumCertificate::genesis(ShardGroupId::leaf(1, 0)),
         ValidatorId::new(0),
         ProposerTimestamp::ZERO,
         Round::INITIAL,
@@ -56,7 +56,7 @@ fn make_block(height: BlockHeight) -> CertifiedBlock {
         provisions: Arc::new(BoundedVec::new()),
     };
     let qc = {
-        let __qc = QuorumCertificate::genesis(ShardGroupId::new(0));
+        let __qc = QuorumCertificate::genesis(ShardGroupId::leaf(1, 0));
         QuorumCertificate::new(
             block.hash(),
             __qc.shard_group_id(),
@@ -88,7 +88,7 @@ fn make_remote_header_targeting(
         source_shard,
         height,
         BlockHash::from_raw(Hash::from_bytes(b"parent")),
-        QuorumCertificate::genesis(ShardGroupId::new(0)),
+        QuorumCertificate::genesis(ShardGroupId::leaf(1, 0)),
         ValidatorId::new(0),
         ProposerTimestamp::from_millis(1000 + height.inner()),
         Round::INITIAL,
@@ -126,7 +126,7 @@ fn fresh_coordinator_reports_no_state() {
     assert_eq!(coord.verified_remote_header_count(), 0);
     assert!(
         coord
-            .get_remote_header(ShardGroupId::new(1), BlockHeight::new(1))
+            .get_remote_header(ShardGroupId::leaf(1, 1), BlockHeight::new(1))
             .is_none()
     );
     assert!(
@@ -167,7 +167,7 @@ fn with_config_honours_dwell_time_setting() {
     let config = ProvisionConfig {
         min_dwell_time: std::time::Duration::from_millis(750),
     };
-    let coord = ProvisionCoordinator::with_config(ShardGroupId::new(0), config);
+    let coord = ProvisionCoordinator::with_config(ShardGroupId::leaf(1, 0), config);
     // No queued provisions yet — but the constructor must accept the config
     // without panicking, and the queue must be live.
     assert!(coord.queued_provisions(LocalTimestamp::ZERO).is_empty());
@@ -190,7 +190,7 @@ fn flush_expected_provisions_with_no_expectations_yields_no_actions() {
 #[test]
 fn on_verified_remote_header_for_own_shard_is_no_op() {
     let (mut coord, _topology) = fresh_coordinator_with_topology();
-    let local = ShardGroupId::new(0);
+    let local = ShardGroupId::leaf(1, 0);
     // Header from our own shard must not register an expectation.
     let own_header = make_remote_header_targeting(local, BlockHeight::new(5), local);
     let actions = coord.on_verified_remote_header(&own_header);
@@ -202,8 +202,8 @@ fn on_verified_remote_header_for_own_shard_is_no_op() {
 #[test]
 fn on_verified_remote_header_targeting_local_shard_registers_expectation() {
     let (mut coord, _topology) = fresh_coordinator_with_topology();
-    let local = ShardGroupId::new(0);
-    let remote = ShardGroupId::new(u64::from(local == ShardGroupId::new(0)));
+    let local = ShardGroupId::leaf(1, 0);
+    let remote = ShardGroupId::leaf(1, u64::from(local == ShardGroupId::leaf(1, 0)));
     let header = make_remote_header_targeting(remote, BlockHeight::new(5), local);
     coord.on_verified_remote_header(&header);
 
@@ -229,8 +229,8 @@ fn first_commit_retro_stamps_pre_genesis_expectations() {
     // immediate timeout sweep would fire (entry's discovered_at is ZERO,
     // committed_ts is suddenly ~now, age reports ~57 years).
     let (mut coord, _topology) = fresh_coordinator_with_topology();
-    let local = ShardGroupId::new(0);
-    let remote = ShardGroupId::new(u64::from(local == ShardGroupId::new(0)));
+    let local = ShardGroupId::leaf(1, 0);
+    let remote = ShardGroupId::leaf(1, u64::from(local == ShardGroupId::leaf(1, 0)));
     let header = make_remote_header_targeting(remote, BlockHeight::new(5), local);
     coord.on_verified_remote_header(&header);
 

@@ -1105,7 +1105,7 @@ mod tests {
         fw: FinalizedWave,
     ) -> CertifiedBlock {
         let block = make_live_block(
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             height,
             1_234_567_890,
             ValidatorId::new(0),
@@ -1129,13 +1129,13 @@ mod tests {
             .collect();
         let provision = Provisions::new(
             source_shard,
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             height,
             MerkleInclusionProof::dummy(),
             transactions,
         );
         let block = match make_live_block(
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             height,
             1_234_567_890,
             ValidatorId::new(0),
@@ -1161,7 +1161,7 @@ mod tests {
     #[test]
     fn provisions_record_expected_txs_for_unseen_hashes() {
         let topology = make_test_topology();
-        let mut mempool = MempoolCoordinator::new(ShardGroupId::new(0));
+        let mut mempool = MempoolCoordinator::new(ShardGroupId::ROOT);
 
         let already_seen = test_transaction(1);
         let already_seen_hash = already_seen.hash();
@@ -1175,7 +1175,7 @@ mod tests {
 
         let certified = certified_block_with_provisions(
             BlockHeight::new(5),
-            ShardGroupId::new(1),
+            ShardGroupId::leaf(2, 1),
             &[already_seen_hash, unseen_hash],
         );
         mempool.on_block_committed(&topology, &certified);
@@ -1188,7 +1188,7 @@ mod tests {
         );
         assert_eq!(
             mempool.expected_tx_source(&unseen_hash),
-            Some(ShardGroupId::new(1))
+            Some(ShardGroupId::leaf(2, 1))
         );
         assert!(
             mempool
@@ -1201,7 +1201,7 @@ mod tests {
     #[test]
     fn first_sighting_wins_across_sources_and_repeats() {
         let topology = make_test_topology();
-        let mut mempool = MempoolCoordinator::new(ShardGroupId::new(0));
+        let mut mempool = MempoolCoordinator::new(ShardGroupId::ROOT);
 
         let unseen_hash = test_transaction(1).hash();
 
@@ -1210,7 +1210,7 @@ mod tests {
             &topology,
             &certified_block_with_provisions(
                 BlockHeight::new(3),
-                ShardGroupId::new(1),
+                ShardGroupId::leaf(2, 1),
                 &[unseen_hash],
             ),
         );
@@ -1219,7 +1219,7 @@ mod tests {
             &topology,
             &certified_block_with_provisions(
                 BlockHeight::new(7),
-                ShardGroupId::new(1),
+                ShardGroupId::leaf(2, 1),
                 &[unseen_hash],
             ),
         );
@@ -1228,7 +1228,7 @@ mod tests {
             &topology,
             &certified_block_with_provisions(
                 BlockHeight::new(7),
-                ShardGroupId::new(2),
+                ShardGroupId::leaf(2, 2),
                 &[unseen_hash],
             ),
         );
@@ -1240,14 +1240,14 @@ mod tests {
         );
         assert_eq!(
             mempool.expected_tx_source(&unseen_hash),
-            Some(ShardGroupId::new(1))
+            Some(ShardGroupId::leaf(2, 1))
         );
     }
 
     #[test]
     fn gossip_arrival_drops_expected_entry() {
         let topology = make_test_topology();
-        let mut mempool = MempoolCoordinator::new(ShardGroupId::new(0));
+        let mut mempool = MempoolCoordinator::new(ShardGroupId::ROOT);
 
         let tx = test_transaction(1);
         let tx_hash = tx.hash();
@@ -1255,7 +1255,11 @@ mod tests {
         // Provision arrives first, mempool starts expecting the tx.
         mempool.on_block_committed(
             &topology,
-            &certified_block_with_provisions(BlockHeight::new(1), ShardGroupId::new(1), &[tx_hash]),
+            &certified_block_with_provisions(
+                BlockHeight::new(1),
+                ShardGroupId::leaf(2, 1),
+                &[tx_hash],
+            ),
         );
         assert_eq!(mempool.pending_expected_count(), 1);
 
@@ -1272,14 +1276,18 @@ mod tests {
     #[test]
     fn rpc_submit_drops_expected_entry() {
         let topology = make_test_topology();
-        let mut mempool = MempoolCoordinator::new(ShardGroupId::new(0));
+        let mut mempool = MempoolCoordinator::new(ShardGroupId::ROOT);
 
         let tx = test_transaction(1);
         let tx_hash = tx.hash();
 
         mempool.on_block_committed(
             &topology,
-            &certified_block_with_provisions(BlockHeight::new(1), ShardGroupId::new(1), &[tx_hash]),
+            &certified_block_with_provisions(
+                BlockHeight::new(1),
+                ShardGroupId::leaf(2, 1),
+                &[tx_hash],
+            ),
         );
         assert_eq!(mempool.pending_expected_count(), 1);
 
@@ -1290,14 +1298,18 @@ mod tests {
     #[test]
     fn block_inclusion_drops_expected_entry() {
         let topology = make_test_topology();
-        let mut mempool = MempoolCoordinator::new(ShardGroupId::new(0));
+        let mut mempool = MempoolCoordinator::new(ShardGroupId::ROOT);
 
         let tx = test_transaction(1);
         let tx_hash = tx.hash();
 
         mempool.on_block_committed(
             &topology,
-            &certified_block_with_provisions(BlockHeight::new(1), ShardGroupId::new(1), &[tx_hash]),
+            &certified_block_with_provisions(
+                BlockHeight::new(1),
+                ShardGroupId::leaf(2, 1),
+                &[tx_hash],
+            ),
         );
         assert_eq!(mempool.pending_expected_count(), 1);
 
@@ -1318,7 +1330,7 @@ mod tests {
         // TEST_BLOCK_INTERVAL_MS = 500; grace = 2_000ms. First sighting at
         // H=1 (ts=500); H=4 (ts=2_000) → elapsed 1_500ms < 2_000ms.
         let topology = make_test_topology();
-        let mut mempool = MempoolCoordinator::new(ShardGroupId::new(0));
+        let mut mempool = MempoolCoordinator::new(ShardGroupId::ROOT);
 
         let unseen_hash = test_transaction(1).hash();
 
@@ -1326,13 +1338,13 @@ mod tests {
             &topology,
             &certified_block_with_provisions(
                 BlockHeight::new(1),
-                ShardGroupId::new(0),
+                ShardGroupId::ROOT,
                 &[unseen_hash],
             ),
         );
         let actions = mempool.on_block_committed(
             &topology,
-            &certified_block_with_provisions(BlockHeight::new(4), ShardGroupId::new(0), &[]),
+            &certified_block_with_provisions(BlockHeight::new(4), ShardGroupId::ROOT, &[]),
         );
         assert!(
             !actions
@@ -1347,8 +1359,8 @@ mod tests {
     fn fetch_emitted_after_grace_window_targets_source_committee() {
         // First sighting at H=1 (ts=500); H=5 (ts=2_500) → elapsed 2_000ms.
         let topology = make_test_topology();
-        let source = ShardGroupId::new(0);
-        let mut mempool = MempoolCoordinator::new(ShardGroupId::new(0));
+        let source = ShardGroupId::ROOT;
+        let mut mempool = MempoolCoordinator::new(ShardGroupId::ROOT);
 
         let unseen_hash = test_transaction(1).hash();
 
@@ -1377,7 +1389,7 @@ mod tests {
     #[test]
     fn fetch_uses_first_sighting_source_only() {
         let topology = make_test_topology();
-        let mut mempool = MempoolCoordinator::new(ShardGroupId::new(0));
+        let mut mempool = MempoolCoordinator::new(ShardGroupId::ROOT);
 
         let unseen_hash = test_transaction(1).hash();
 
@@ -1388,7 +1400,7 @@ mod tests {
             &topology,
             &certified_block_with_provisions(
                 BlockHeight::new(1),
-                ShardGroupId::new(0),
+                ShardGroupId::ROOT,
                 &[unseen_hash],
             ),
         );
@@ -1396,13 +1408,13 @@ mod tests {
             &topology,
             &certified_block_with_provisions(
                 BlockHeight::new(2),
-                ShardGroupId::new(1),
+                ShardGroupId::leaf(2, 1),
                 &[unseen_hash],
             ),
         );
         let actions = mempool.on_block_committed(
             &topology,
-            &certified_block_with_provisions(BlockHeight::new(5), ShardGroupId::new(0), &[]),
+            &certified_block_with_provisions(BlockHeight::new(5), ShardGroupId::ROOT, &[]),
         );
 
         let fetches: Vec<_> = actions
@@ -1424,7 +1436,7 @@ mod tests {
         // RETENTION_HORIZON ≈ 5min + 24s. Sighting at H=1 (ts=500ms); commit
         // far past horizon at H=700 (ts=350_000ms) — well over 324_000ms.
         let topology = make_test_topology();
-        let mut mempool = MempoolCoordinator::new(ShardGroupId::new(0));
+        let mut mempool = MempoolCoordinator::new(ShardGroupId::ROOT);
 
         let unseen_hash = test_transaction(1).hash();
 
@@ -1435,7 +1447,7 @@ mod tests {
                 &topology,
                 &certified_block_with_provisions(
                     BlockHeight::new(1),
-                    ShardGroupId::new(0),
+                    ShardGroupId::ROOT,
                     &[unseen_hash],
                 ),
             );
@@ -1444,7 +1456,7 @@ mod tests {
 
             mempool.on_block_committed(
                 &topology,
-                &certified_block_with_provisions(BlockHeight::new(700), ShardGroupId::new(0), &[]),
+                &certified_block_with_provisions(BlockHeight::new(700), ShardGroupId::ROOT, &[]),
             );
             assert_eq!(mempool.pending_expected_count(), 0);
             assert_eq!(recorder.counter("expected_tx_dropped", None), 1);
@@ -1457,7 +1469,7 @@ mod tests {
         // RETENTION_HORIZON (~324_000ms). Entry should still be tracked, and
         // a fetch is emitted but no drop.
         let topology = make_test_topology();
-        let mut mempool = MempoolCoordinator::new(ShardGroupId::new(0));
+        let mut mempool = MempoolCoordinator::new(ShardGroupId::ROOT);
 
         let unseen_hash = test_transaction(1).hash();
 
@@ -1465,13 +1477,13 @@ mod tests {
             &topology,
             &certified_block_with_provisions(
                 BlockHeight::new(1),
-                ShardGroupId::new(0),
+                ShardGroupId::ROOT,
                 &[unseen_hash],
             ),
         );
         mempool.on_block_committed(
             &topology,
-            &certified_block_with_provisions(BlockHeight::new(100), ShardGroupId::new(0), &[]),
+            &certified_block_with_provisions(BlockHeight::new(100), ShardGroupId::ROOT, &[]),
         );
         assert_eq!(mempool.pending_expected_count(), 1);
     }
@@ -1482,7 +1494,7 @@ mod tests {
         // but assert the explicit AbandonFetch action so any in-flight fetch
         // is cancelled rather than retried forever.
         let topology = make_test_topology();
-        let mut mempool = MempoolCoordinator::new(ShardGroupId::new(0));
+        let mut mempool = MempoolCoordinator::new(ShardGroupId::ROOT);
 
         let unseen_hash = test_transaction(1).hash();
 
@@ -1490,13 +1502,13 @@ mod tests {
             &topology,
             &certified_block_with_provisions(
                 BlockHeight::new(1),
-                ShardGroupId::new(0),
+                ShardGroupId::ROOT,
                 &[unseen_hash],
             ),
         );
         let actions = mempool.on_block_committed(
             &topology,
-            &certified_block_with_provisions(BlockHeight::new(700), ShardGroupId::new(0), &[]),
+            &certified_block_with_provisions(BlockHeight::new(700), ShardGroupId::ROOT, &[]),
         );
 
         let abandoned: Vec<TxHash> = actions
@@ -1523,14 +1535,18 @@ mod tests {
         // explicitly because no `TransactionsAdmitted` continuation fires
         // on this path.
         let topology = make_test_topology();
-        let mut mempool = MempoolCoordinator::new(ShardGroupId::new(0));
+        let mut mempool = MempoolCoordinator::new(ShardGroupId::ROOT);
 
         let tx = test_transaction(1);
         let tx_hash = tx.hash();
 
         mempool.on_block_committed(
             &topology,
-            &certified_block_with_provisions(BlockHeight::new(1), ShardGroupId::new(1), &[tx_hash]),
+            &certified_block_with_provisions(
+                BlockHeight::new(1),
+                ShardGroupId::leaf(2, 1),
+                &[tx_hash],
+            ),
         );
         assert_eq!(mempool.pending_expected_count(), 1);
 
@@ -1562,7 +1578,7 @@ mod tests {
         // whenever execution falls behind enough for tx validity to
         // elapse before delivery.
         let topology = make_test_topology();
-        let mut mempool = MempoolCoordinator::new(ShardGroupId::new(0));
+        let mut mempool = MempoolCoordinator::new(ShardGroupId::ROOT);
 
         let tx = test_transaction(1);
         let tx_hash = tx.hash();
@@ -1570,7 +1586,7 @@ mod tests {
         // Block H=1 records the expectation.
         mempool.on_block_committed(
             &topology,
-            &certified_block_with_provisions(BlockHeight::new(1), ShardGroupId::new(0), &[tx_hash]),
+            &certified_block_with_provisions(BlockHeight::new(1), ShardGroupId::ROOT, &[tx_hash]),
         );
         assert_eq!(mempool.pending_expected_count(), 1);
 
@@ -1578,7 +1594,7 @@ mod tests {
         // ends at 60_000ms; TEST_BLOCK_INTERVAL_MS=500 → past validity at H≥121.
         mempool.on_block_committed(
             &topology,
-            &certified_block_with_provisions(BlockHeight::new(125), ShardGroupId::new(0), &[]),
+            &certified_block_with_provisions(BlockHeight::new(125), ShardGroupId::ROOT, &[]),
         );
 
         // Source committee delivers the tx body — but admission rejects
@@ -1608,14 +1624,14 @@ mod tests {
     #[test]
     fn fetch_stops_after_admission_clears_expectation() {
         let topology = make_test_topology();
-        let mut mempool = MempoolCoordinator::new(ShardGroupId::new(0));
+        let mut mempool = MempoolCoordinator::new(ShardGroupId::ROOT);
 
         let tx = test_transaction(1);
         let tx_hash = tx.hash();
 
         mempool.on_block_committed(
             &topology,
-            &certified_block_with_provisions(BlockHeight::new(1), ShardGroupId::new(0), &[tx_hash]),
+            &certified_block_with_provisions(BlockHeight::new(1), ShardGroupId::ROOT, &[tx_hash]),
         );
         mempool.on_transaction_gossip(
             &topology,
@@ -1626,7 +1642,7 @@ mod tests {
 
         let actions = mempool.on_block_committed(
             &topology,
-            &certified_block_with_provisions(BlockHeight::new(5), ShardGroupId::new(0), &[]),
+            &certified_block_with_provisions(BlockHeight::new(5), ShardGroupId::ROOT, &[]),
         );
         assert!(
             !actions
@@ -1639,7 +1655,7 @@ mod tests {
     #[test]
     fn test_abort_updates_status() {
         let topology = make_test_topology();
-        let mut mempool = MempoolCoordinator::new(ShardGroupId::new(0));
+        let mut mempool = MempoolCoordinator::new(ShardGroupId::ROOT);
 
         // Submit a TX, then commit a block whose FinalizedWave aborts it.
         let tx = test_transaction(1);
@@ -1680,7 +1696,7 @@ mod tests {
     #[test]
     fn tx_store_bloom_snapshot_covers_pool_and_tombstone_window() {
         let topology = make_test_topology();
-        let mut mempool = MempoolCoordinator::new(ShardGroupId::new(0));
+        let mut mempool = MempoolCoordinator::new(ShardGroupId::ROOT);
 
         // A submitted-but-not-yet-committed tx lands in pool.
         let tx_live = test_transaction(1);
@@ -1722,7 +1738,7 @@ mod tests {
     #[test]
     fn test_tombstoned_transaction_rejected_on_gossip() {
         let topology = make_test_topology();
-        let mut mempool = MempoolCoordinator::new(ShardGroupId::new(0));
+        let mut mempool = MempoolCoordinator::new(ShardGroupId::ROOT);
 
         let tx = test_transaction(1);
         let tx_hash = tx.hash();
@@ -1759,7 +1775,7 @@ mod tests {
     #[test]
     fn test_tombstoned_transaction_rejected_on_submit() {
         let topology = make_test_topology();
-        let mut mempool = MempoolCoordinator::new(ShardGroupId::new(0));
+        let mut mempool = MempoolCoordinator::new(ShardGroupId::ROOT);
 
         let tx = test_transaction(1);
         let tx_hash = tx.hash();
@@ -1817,7 +1833,7 @@ mod tests {
         }
         for (i, chunk) in txs.chunks(MAX_TXS_PER_BLOCK).enumerate() {
             let block = make_live_block(
-                ShardGroupId::new(0),
+                ShardGroupId::leaf(1, 0),
                 BlockHeight::new(u64::try_from(i + 1).unwrap()),
                 1_234_567_890,
                 ValidatorId::new(0),
@@ -1875,7 +1891,7 @@ mod tests {
     fn test_backpressure_allows_txns_below_limit() {
         // A few txs is far below MAX_TX_IN_FLIGHT, so ready_transactions
         // returns them all once they've dwelled long enough.
-        let mut mempool = MempoolCoordinator::new(ShardGroupId::new(0));
+        let mut mempool = MempoolCoordinator::new(ShardGroupId::leaf(1, 0));
         let topology = make_cross_shard_topology();
         let submit_at = LocalTimestamp::ZERO;
         let read_at = submit_at.plus(DEFAULT_MIN_DWELL_TIME + Duration::from_millis(1));
@@ -1895,7 +1911,7 @@ mod tests {
 
     #[test]
     fn test_backpressure_rejects_all_at_limit() {
-        let mut mempool = MempoolCoordinator::new(ShardGroupId::new(0));
+        let mut mempool = MempoolCoordinator::new(ShardGroupId::leaf(1, 0));
         let topology = make_cross_shard_topology();
 
         // Put mempool at the in-flight limit
@@ -1921,7 +1937,7 @@ mod tests {
             min_dwell_time: Duration::ZERO,
             ..MempoolConfig::default()
         };
-        let mut mempool = MempoolCoordinator::with_config(ShardGroupId::new(0), config);
+        let mut mempool = MempoolCoordinator::with_config(ShardGroupId::leaf(1, 0), config);
 
         // Mempool is not at limit (nothing committed)
         assert!(!mempool.at_in_flight_limit());
@@ -1950,7 +1966,7 @@ mod tests {
     #[test]
     fn test_in_flight_counts_all_txns() {
         let topology = make_cross_shard_topology();
-        let mut mempool = MempoolCoordinator::new(ShardGroupId::new(0));
+        let mut mempool = MempoolCoordinator::new(ShardGroupId::leaf(1, 0));
 
         assert_eq!(mempool.in_flight(), 0);
 
@@ -1972,7 +1988,7 @@ mod tests {
 
         // Block 1 commits both txs — both transition Pending → Committed.
         let block1 = make_live_block(
-            ShardGroupId::new(0),
+            ShardGroupId::leaf(1, 0),
             BlockHeight::new(1),
             1_000,
             ValidatorId::new(0),
@@ -1984,7 +2000,7 @@ mod tests {
 
         // Block 2 carries the wave cert for the cross-shard tx — completes it.
         let block2 = make_live_block(
-            ShardGroupId::new(0),
+            ShardGroupId::leaf(1, 0),
             BlockHeight::new(2),
             2_000,
             ValidatorId::new(0),
@@ -1998,7 +2014,7 @@ mod tests {
         assert_eq!(mempool.in_flight(), 1, "Completed TX releases its lock");
 
         let block3 = make_live_block(
-            ShardGroupId::new(0),
+            ShardGroupId::leaf(1, 0),
             BlockHeight::new(3),
             3_000,
             ValidatorId::new(0),
@@ -2026,7 +2042,7 @@ mod tests {
             min_dwell_time: Duration::ZERO,
             ..MempoolConfig::default()
         };
-        let mut mempool = MempoolCoordinator::with_config(ShardGroupId::new(0), config);
+        let mut mempool = MempoolCoordinator::with_config(ShardGroupId::ROOT, config);
         let topology = make_test_topology();
 
         let now = LocalTimestamp::from_millis(10_000);
@@ -2040,7 +2056,7 @@ mod tests {
     #[test]
     fn test_dwell_time_default_150ms() {
         // Default config has 150ms dwell time
-        let mut mempool = MempoolCoordinator::new(ShardGroupId::new(0));
+        let mut mempool = MempoolCoordinator::new(ShardGroupId::ROOT);
         let topology = make_test_topology();
 
         let submitted_at = LocalTimestamp::from_millis(10_000);
@@ -2066,7 +2082,7 @@ mod tests {
             min_dwell_time: Duration::from_millis(500),
             ..MempoolConfig::default()
         };
-        let mut mempool = MempoolCoordinator::with_config(ShardGroupId::new(0), config);
+        let mut mempool = MempoolCoordinator::with_config(ShardGroupId::ROOT, config);
         let topology = make_test_topology();
 
         // Submit at t=10s
@@ -2097,7 +2113,7 @@ mod tests {
             min_dwell_time: Duration::from_millis(200),
             ..MempoolConfig::default()
         };
-        let mut mempool = MempoolCoordinator::with_config(ShardGroupId::new(0), config);
+        let mut mempool = MempoolCoordinator::with_config(ShardGroupId::ROOT, config);
         let topology = make_test_topology();
 
         // Submit tx1 at t=1s
@@ -2149,7 +2165,7 @@ mod tests {
     #[test]
     fn rpc_submit_rejects_expired_transaction() {
         let topology = make_test_topology();
-        let mut mempool = MempoolCoordinator::new(ShardGroupId::new(0));
+        let mut mempool = MempoolCoordinator::new(ShardGroupId::ROOT);
         set_current_ts(&mut mempool, WeightedTimestamp::from_millis(2_000));
 
         let tx = tx_with_end(1, 1_000); // expired well before now
@@ -2165,7 +2181,7 @@ mod tests {
     #[test]
     fn gossip_drops_expired_transaction() {
         let topology = make_test_topology();
-        let mut mempool = MempoolCoordinator::new(ShardGroupId::new(0));
+        let mut mempool = MempoolCoordinator::new(ShardGroupId::ROOT);
         set_current_ts(&mut mempool, WeightedTimestamp::from_millis(2_000));
 
         let tx = tx_with_end(1, 1_000);
@@ -2178,7 +2194,7 @@ mod tests {
     #[test]
     fn rpc_submit_admits_in_window_transaction() {
         let topology = make_test_topology();
-        let mut mempool = MempoolCoordinator::new(ShardGroupId::new(0));
+        let mut mempool = MempoolCoordinator::new(ShardGroupId::ROOT);
         set_current_ts(&mut mempool, WeightedTimestamp::from_millis(500));
 
         let tx = tx_with_end(1, 1_000); // end_exclusive > now
@@ -2192,7 +2208,7 @@ mod tests {
     #[test]
     fn cleanup_expired_pending_drops_only_past_expiry_entries() {
         let topology = make_test_topology();
-        let mut mempool = MempoolCoordinator::new(ShardGroupId::new(0));
+        let mut mempool = MempoolCoordinator::new(ShardGroupId::ROOT);
         set_current_ts(&mut mempool, WeightedTimestamp::from_millis(500));
 
         let early = tx_with_end(1, 1_000); // alive
@@ -2215,7 +2231,7 @@ mod tests {
     #[test]
     fn cleanup_expired_pending_does_not_tombstone_dropped_entries() {
         let topology = make_test_topology();
-        let mut mempool = MempoolCoordinator::new(ShardGroupId::new(0));
+        let mut mempool = MempoolCoordinator::new(ShardGroupId::ROOT);
         set_current_ts(&mut mempool, WeightedTimestamp::from_millis(500));
 
         let tx = tx_with_end(1, 1_000);

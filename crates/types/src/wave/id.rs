@@ -136,9 +136,9 @@ mod tests {
 
     fn sample_wave_id() -> WaveId {
         WaveId::new(
-            ShardGroupId::new(3),
+            ShardGroupId::leaf(3, 3),
             BlockHeight::new(42),
-            [ShardGroupId::new(1), ShardGroupId::new(7)]
+            [ShardGroupId::leaf(3, 1), ShardGroupId::leaf(3, 7)]
                 .into_iter()
                 .collect(),
         )
@@ -154,7 +154,11 @@ mod tests {
 
     #[test]
     fn sbor_roundtrip_empty_remote_shards() {
-        let wave = WaveId::new(ShardGroupId::new(0), BlockHeight::new(1), BTreeSet::new());
+        let wave = WaveId::new(
+            ShardGroupId::leaf(3, 0),
+            BlockHeight::new(1),
+            BTreeSet::new(),
+        );
         let bytes = basic_encode(&wave).unwrap();
         let decoded: WaveId = basic_decode(&bytes).unwrap();
         assert_eq!(decoded, wave);
@@ -170,7 +174,7 @@ mod tests {
             .unwrap();
         enc.write_value_kind(ValueKind::Tuple).unwrap();
         enc.write_size(3).unwrap();
-        enc.encode(&ShardGroupId::new(0)).unwrap();
+        enc.encode(&ShardGroupId::leaf(3, 0)).unwrap();
         enc.encode(&BlockHeight::new(0)).unwrap();
         enc.write_value_kind(ValueKind::Array).unwrap();
         enc.write_value_kind(ShardGroupId::value_kind()).unwrap();
@@ -194,13 +198,13 @@ mod tests {
             .unwrap();
         enc.write_value_kind(ValueKind::Tuple).unwrap();
         enc.write_size(3).unwrap();
-        enc.encode(&ShardGroupId::new(0)).unwrap();
+        enc.encode(&ShardGroupId::leaf(3, 0)).unwrap();
         enc.encode(&BlockHeight::new(0)).unwrap();
         enc.write_value_kind(ValueKind::Array).unwrap();
         enc.write_value_kind(ShardGroupId::value_kind()).unwrap();
         enc.write_size(2).unwrap();
-        enc.encode_deeper_body(&ShardGroupId::new(5)).unwrap();
-        enc.encode_deeper_body(&ShardGroupId::new(5)).unwrap();
+        enc.encode_deeper_body(&ShardGroupId::leaf(3, 5)).unwrap();
+        enc.encode_deeper_body(&ShardGroupId::leaf(3, 5)).unwrap();
         let err = basic_decode::<WaveId>(&buf).unwrap_err();
         assert!(matches!(err, DecodeError::DuplicateKey));
     }

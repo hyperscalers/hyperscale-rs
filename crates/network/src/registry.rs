@@ -599,7 +599,7 @@ mod tests {
             const SCOPE: TopicScope = TopicScope::Shard;
         }
 
-        let hosted = Arc::new(std::iter::once(ShardGroupId::new(0)).collect());
+        let hosted = Arc::new(std::iter::once(ShardGroupId::leaf(1, 0)).collect());
         let registry = HandlerRegistry::new(hosted);
         let counter = Arc::new(AtomicUsize::new(0));
         let counter_clone = counter.clone();
@@ -613,12 +613,12 @@ mod tests {
 
         let handler = registry.get_gossip("test.gossip").unwrap();
         let encoded = basic_encode(&TestMsg(42)).unwrap();
-        let verdict = handler(encoded, Some(ShardGroupId::new(0)));
+        let verdict = handler(encoded, Some(ShardGroupId::leaf(1, 0)));
         assert_eq!(counter.load(Ordering::SeqCst), 1);
         assert_eq!(verdict, GossipVerdict::Accept);
 
         // SBOR decode failure should return Reject.
-        let verdict = handler(vec![0xFF, 0xFE], Some(ShardGroupId::new(0)));
+        let verdict = handler(vec![0xFF, 0xFE], Some(ShardGroupId::leaf(1, 0)));
         assert_eq!(verdict, GossipVerdict::Reject);
         assert_eq!(counter.load(Ordering::SeqCst), 1); // handler not called
 
@@ -651,7 +651,7 @@ mod tests {
         }
 
         let registry = HandlerRegistry::default();
-        let shard = ShardGroupId::new(0);
+        let shard = ShardGroupId::leaf(1, 0);
 
         registry.register_request(shard, |req: TestReq| TestResp(req.0 * 2));
 
@@ -664,7 +664,7 @@ mod tests {
         assert!(registry.get_request("unknown.request", shard).is_none());
         assert!(
             registry
-                .get_request("test.request", ShardGroupId::new(1))
+                .get_request("test.request", ShardGroupId::leaf(1, 1))
                 .is_none()
         );
     }
@@ -722,7 +722,7 @@ mod tests {
         }
 
         let hosted: Arc<HashSet<ShardGroupId>> =
-            Arc::new(std::iter::once(ShardGroupId::new(0)).collect());
+            Arc::new(std::iter::once(ShardGroupId::leaf(1, 0)).collect());
         let registry = HandlerRegistry::new(hosted);
 
         let observed: Arc<Mutex<Option<Verifiable<u32>>>> = Arc::new(Mutex::new(None));
@@ -738,7 +738,7 @@ mod tests {
         let verified_msg = VTestMsg {
             payload: Verified::new_unchecked_for_test(42u32).into(),
         };
-        let verdict = registry.local_dispatch_gossip(&verified_msg, Some(ShardGroupId::new(0)));
+        let verdict = registry.local_dispatch_gossip(&verified_msg, Some(ShardGroupId::leaf(1, 0)));
         assert_eq!(verdict, Some(GossipVerdict::Accept));
 
         let received = observed

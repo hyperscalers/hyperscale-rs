@@ -419,7 +419,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Generate a transaction specifically for shard 0
             let target_shard: usize = 0;
             let tx = workload
-                .generate_for_shard(&accounts, ShardGroupId::new(target_shard as u64), &mut rng)
+                .generate_for_shard(
+                    &accounts,
+                    ShardGroupId::leaf(num_shards.trailing_zeros(), target_shard as u64),
+                    &mut rng,
+                )
                 .expect("Failed to generate transaction for shard 0");
 
             // Pick the first endpoint serving shard 0 under the configured

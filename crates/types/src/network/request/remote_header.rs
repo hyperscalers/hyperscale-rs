@@ -57,7 +57,7 @@ mod tests {
     #[test]
     fn test_sbor_roundtrip() {
         let request = GetRemoteHeadersRequest {
-            source_shard: ShardGroupId::new(2),
+            source_shard: ShardGroupId::ROOT,
             from_height: BlockHeight::new(42),
             count: HeaderFetchCount::new(16),
         };

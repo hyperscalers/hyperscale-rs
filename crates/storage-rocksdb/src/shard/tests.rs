@@ -189,7 +189,7 @@ fn test_commit_certificate_with_writes_persists_both() {
     let storage = RocksDbShardStorage::open(temp_dir.path()).unwrap();
 
     let updates = make_mapped_database_update(1, 0, vec![10, 20], vec![99, 88, 77]);
-    let cert = make_test_wave_certificate(BlockHeight::new(42), ShardGroupId::new(0));
+    let cert = make_test_wave_certificate(BlockHeight::new(42), ShardGroupId::ROOT);
     let wave_id = cert.wave_id().clone();
 
     storage.commit_certificate_with_writes(&cert, &updates);
@@ -267,7 +267,7 @@ fn test_recovery_with_qc() {
         let storage = RocksDbShardStorage::open(temp_dir.path()).unwrap();
         let qc = QuorumCertificate::new(
             expected_hash,
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             BlockHeight::new(100),
             BlockHash::from_raw(Hash::from_bytes(&[98; 32])),
             Round::new(5),
@@ -336,7 +336,7 @@ fn test_certificate_idempotency() {
     let storage = RocksDbShardStorage::open(temp_dir.path()).unwrap();
 
     let updates = make_mapped_database_update(1, 0, vec![10, 20], vec![99, 88, 77]);
-    let cert = make_test_wave_certificate(BlockHeight::new(42), ShardGroupId::new(0));
+    let cert = make_test_wave_certificate(BlockHeight::new(42), ShardGroupId::ROOT);
     let wave_id = cert.wave_id().clone();
 
     storage.commit_certificate_with_writes(&cert, &updates);
@@ -459,11 +459,11 @@ fn attach_receipts(block: &mut Block, receipts: Vec<StoredReceipt>) {
         FinalizedWave::new(
             Arc::new(WaveCertificate::new(
                 WaveId::new(
-                    ShardGroupId::new(0),
+                    ShardGroupId::ROOT,
                     block.height(),
                     std::collections::BTreeSet::new(),
                 ),
-                vec![placeholder_local_ec(ShardGroupId::new(0), block.height())],
+                vec![placeholder_local_ec(ShardGroupId::ROOT, block.height())],
             )),
             receipts,
         )
@@ -585,7 +585,7 @@ fn test_commit_block_stores_certificates() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbShardStorage::open(temp_dir.path()).unwrap();
 
-    let shard = ShardGroupId::new(0);
+    let shard = ShardGroupId::ROOT;
     let cert = Arc::new(make_test_wave_certificate(BlockHeight::new(1), shard));
     let wave_id = cert.wave_id().clone();
 
@@ -639,8 +639,8 @@ fn test_certificates_batch() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbShardStorage::open(temp_dir.path()).unwrap();
 
-    let cert1 = make_test_wave_certificate(BlockHeight::new(1), ShardGroupId::new(0));
-    let cert2 = make_test_wave_certificate(BlockHeight::new(2), ShardGroupId::new(0));
+    let cert1 = make_test_wave_certificate(BlockHeight::new(1), ShardGroupId::ROOT);
+    let cert2 = make_test_wave_certificate(BlockHeight::new(2), ShardGroupId::ROOT);
     let id1 = cert1.wave_id().clone();
     let id2 = cert2.wave_id().clone();
 
@@ -651,7 +651,7 @@ fn test_certificates_batch() {
     assert_eq!(result.len(), 2);
 
     let missing = WaveId::new(
-        ShardGroupId::new(99),
+        ShardGroupId::leaf(8, 99),
         BlockHeight::new(99),
         std::collections::BTreeSet::new(),
     );
@@ -714,7 +714,7 @@ fn test_certificate_store_and_retrieve() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbShardStorage::open(temp_dir.path()).unwrap();
 
-    let cert = make_test_wave_certificate(BlockHeight::new(1), ShardGroupId::new(0));
+    let cert = make_test_wave_certificate(BlockHeight::new(1), ShardGroupId::ROOT);
     let wave_id = cert.wave_id().clone();
 
     storage.put_certificate(&wave_id, &cert);
@@ -728,7 +728,7 @@ fn test_certificate_get_missing() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbShardStorage::open(temp_dir.path()).unwrap();
     let missing = WaveId::new(
-        ShardGroupId::new(99),
+        ShardGroupId::leaf(8, 99),
         BlockHeight::new(99),
         std::collections::BTreeSet::new(),
     );
@@ -757,7 +757,7 @@ fn test_commit_certificate_via_commit_store() {
     let storage = RocksDbShardStorage::open(temp_dir.path()).unwrap();
 
     let updates = make_mapped_database_update(1, 0, vec![10], vec![42]);
-    let cert = make_test_wave_certificate(BlockHeight::new(1), ShardGroupId::new(0));
+    let cert = make_test_wave_certificate(BlockHeight::new(1), ShardGroupId::ROOT);
 
     storage.commit_certificate_with_writes(&cert, &updates);
 
@@ -790,7 +790,7 @@ fn test_substates_survive_reopen() {
     {
         let storage = RocksDbShardStorage::open(temp_dir.path()).unwrap();
         let updates = make_mapped_database_update(1, 0, vec![10], vec![42]);
-        let cert = make_test_wave_certificate(BlockHeight::new(1), ShardGroupId::new(0));
+        let cert = make_test_wave_certificate(BlockHeight::new(1), ShardGroupId::ROOT);
         cert_id = cert.wave_id().clone();
         storage.commit_certificate_with_writes(&cert, &updates);
         root_after_write = storage.state_root();
@@ -984,11 +984,11 @@ fn rocks_commit_with(
             FinalizedWave::new(
                 Arc::new(WaveCertificate::new(
                     WaveId::new(
-                        ShardGroupId::new(0),
+                        ShardGroupId::ROOT,
                         block.height(),
                         std::collections::BTreeSet::new(),
                     ),
-                    vec![placeholder_local_ec(ShardGroupId::new(0), block.height())],
+                    vec![placeholder_local_ec(ShardGroupId::ROOT, block.height())],
                 )),
                 vec![receipt],
             )

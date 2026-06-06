@@ -192,8 +192,9 @@ impl SimulationRunner {
 
         // Build per-shard committee mappings
         let mut shard_committees: HashMap<ShardGroupId, Vec<ValidatorId>> = HashMap::new();
+        let shard_depth = network_config.num_shards.trailing_zeros();
         for shard_id in 0..network_config.num_shards {
-            let shard = ShardGroupId::new(u64::from(shard_id));
+            let shard = ShardGroupId::leaf(shard_depth, u64::from(shard_id));
             let shard_start = shard_id * network_config.validators_per_shard;
             let shard_end = shard_start + network_config.validators_per_shard;
             let committee: Vec<ValidatorId> = (shard_start..shard_end)
@@ -626,11 +627,13 @@ impl SimulationRunner {
             .collect();
         let empty_config = GenesisConfig::test_default();
 
+        let shard_depth = self.network.config().num_shards.trailing_zeros();
         for shard_idx in 0..self.network.config().num_shards {
-            let shard_id = ShardGroupId::new(u64::from(shard_idx));
+            let shard_id = ShardGroupId::leaf(shard_depth, u64::from(shard_idx));
             let config = configs_by_shard.get(&shard_id).unwrap_or(&empty_config);
             self.install_engine_genesis(config, |node_idx| {
-                ShardGroupId::new(node_idx as u64 / u64::from(hosts_per_shard)) == shard_id
+                ShardGroupId::leaf(shard_depth, node_idx as u64 / u64::from(hosts_per_shard))
+                    == shard_id
             });
         }
 
@@ -676,9 +679,10 @@ impl SimulationRunner {
         use hyperscale_types::Block;
 
         let num_shards = self.network.config().num_shards;
+        let shard_depth = num_shards.trailing_zeros();
 
         for shard_id in 0..num_shards {
-            let shard = ShardGroupId::new(u64::from(shard_id));
+            let shard = ShardGroupId::leaf(shard_depth, u64::from(shard_id));
 
             // Hosts that carry at least one vnode in this shard.
             let num_hosts =
@@ -977,9 +981,10 @@ fn build_host_layout(config: &NetworkConfig) -> Vec<Vec<(u32, ShardGroupId)>> {
                 "vnodes_per_host must divide validators_per_shard"
             );
             let hosts_per_shard = config.validators_per_shard / config.vnodes_per_host;
+            let shard_depth = config.num_shards.trailing_zeros();
             let mut layout = Vec::with_capacity((config.num_shards * hosts_per_shard) as usize);
             for shard_id in 0..config.num_shards {
-                let shard = ShardGroupId::new(u64::from(shard_id));
+                let shard = ShardGroupId::leaf(shard_depth, u64::from(shard_id));
                 for h in 0..hosts_per_shard {
                     let host_first_validator =
                         shard_id * config.validators_per_shard + h * config.vnodes_per_host;
@@ -992,12 +997,13 @@ fn build_host_layout(config: &NetworkConfig) -> Vec<Vec<(u32, ShardGroupId)>> {
             layout
         }
         HostingMode::CrossShard => {
+            let shard_depth = config.num_shards.trailing_zeros();
             let mut layout = Vec::with_capacity(config.validators_per_shard as usize);
             for h in 0..config.validators_per_shard {
                 let host_vnodes: Vec<(u32, ShardGroupId)> = (0..config.num_shards)
                     .map(|s| {
                         let validator_idx = s * config.validators_per_shard + h;
-                        (validator_idx, ShardGroupId::new(u64::from(s)))
+                        (validator_idx, ShardGroupId::leaf(shard_depth, u64::from(s)))
                     })
                     .collect();
                 layout.push(host_vnodes);

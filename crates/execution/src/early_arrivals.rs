@@ -303,7 +303,7 @@ mod tests {
     use super::*;
 
     fn shard() -> ShardGroupId {
-        ShardGroupId::new(0)
+        ShardGroupId::ROOT
     }
 
     fn wave(height: u64) -> WaveId {

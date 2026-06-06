@@ -43,38 +43,163 @@ impl Display for ValidatorId {
     }
 }
 
-/// Shard group identifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, BasicSbor)]
-#[sbor(transparent)]
-pub struct ShardGroupId(u64);
+/// Shard group identifier — a node in the binary trie over the
+/// `blake3(node_id)` keyspace, identified by its prefix path.
+///
+/// The root (whole keyspace) has depth 0; a node at `depth` owns every node id
+/// whose hash begins with `path`'s `depth` bits (most-significant first). A
+/// shard is a leaf of the active [`ShardTrie`](crate::ShardTrie). The id is
+/// self-describing — depth, path, ancestors, and children need no external
+/// context — and orders by keyspace position (left to right), shallower
+/// ancestors before their descendants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, BasicSbor)]
+pub struct ShardGroupId {
+    /// Trie depth; 0 is the root, at most 63. (Padded to a `u64` boundary by
+    /// `path`'s alignment, so `u32` costs nothing over `u8` and avoids casts
+    /// at the `leading_zeros`/`trailing_zeros` boundaries.)
+    depth: u32,
+    /// The `depth`-bit hash prefix (most-significant first) in the low `depth`
+    /// bits; 0 for the root.
+    path: u64,
+}
 
 impl ShardGroupId {
-    /// Construct a shard group id from a raw `u64`.
+    /// The root shard: the whole keyspace, depth 0. The sole shard before any
+    /// split.
+    pub const ROOT: Self = Self { depth: 0, path: 0 };
+
+    /// Construct the trie leaf at `depth` whose path is the integer `path` (the
+    /// first `depth` node-hash bits, most-significant first).
     ///
-    /// Boundary constructor — topology decode, `shard_for_node` routing,
-    /// tests.
+    /// # Panics
+    /// Panics if `depth >= 64` or `path` does not fit in `depth` bits.
     #[must_use]
-    pub const fn new(value: u64) -> Self {
-        Self(value)
+    pub const fn leaf(depth: u32, path: u64) -> Self {
+        assert!(depth < 64, "shard depth must be < 64");
+        assert!(
+            depth == 0 || path < (1u64 << depth),
+            "path must fit in depth bits"
+        );
+        Self { depth, path }
     }
 
-    /// Inner `u64`. Use sparingly — at boundaries (display, structured log
-    /// fields, hashing) only.
+    /// Depth of this node in the trie (root is 0).
+    #[must_use]
+    pub const fn depth(self) -> u32 {
+        self.depth
+    }
+
+    /// The `depth`-bit path (node-hash prefix, MSB-first) as an integer.
+    #[must_use]
+    pub const fn path(self) -> u64 {
+        self.path
+    }
+
+    /// Parent node, or `None` for the root.
+    #[must_use]
+    pub const fn parent(self) -> Option<Self> {
+        if self.depth == 0 {
+            None
+        } else {
+            Some(Self {
+                depth: self.depth - 1,
+                path: self.path >> 1,
+            })
+        }
+    }
+
+    /// The two children (`path||0`, `path||1`) produced by splitting this node.
+    #[must_use]
+    pub const fn children(self) -> (Self, Self) {
+        let depth = self.depth + 1;
+        (
+            Self {
+                depth,
+                path: self.path << 1,
+            },
+            Self {
+                depth,
+                path: (self.path << 1) | 1,
+            },
+        )
+    }
+
+    /// Sibling node (shares a parent), or `None` for the root.
+    #[must_use]
+    pub const fn sibling(self) -> Option<Self> {
+        if self.depth == 0 {
+            None
+        } else {
+            Some(Self {
+                depth: self.depth,
+                path: self.path ^ 1,
+            })
+        }
+    }
+
+    /// Whether `self` is an ancestor of (or equal to) `other` — i.e. `other`
+    /// lies in `self`'s subtree.
+    #[must_use]
+    pub const fn is_ancestor_of(self, other: Self) -> bool {
+        self.depth <= other.depth && (other.path >> (other.depth - self.depth)) == self.path
+    }
+
+    /// Canonical scalar encoding (heap index `(1 << depth) | path`) for storage
+    /// keys, structured-log fields, and hashing. Round-trips via
+    /// [`Self::from_heap_index`].
     #[must_use]
     pub const fn inner(self) -> u64 {
-        self.0
+        (1u64 << self.depth) | self.path
     }
 
-    /// Little-endian byte representation of the inner value.
+    /// Decode a shard from its [`Self::inner`] scalar. Boundary constructor for
+    /// storage / wire decode.
+    ///
+    /// # Panics
+    /// Panics if `heap_index` is 0 (not a valid encoding).
+    #[must_use]
+    pub const fn from_heap_index(heap_index: u64) -> Self {
+        assert!(heap_index >= 1, "heap index must be >= 1");
+        let depth = heap_index.ilog2();
+        Self {
+            depth,
+            path: heap_index & !(1u64 << depth),
+        }
+    }
+
+    /// Little-endian bytes of the [`Self::inner`] scalar.
     #[must_use]
     pub const fn to_le_bytes(self) -> [u8; 8] {
-        self.0.to_le_bytes()
+        self.inner().to_le_bytes()
+    }
+}
+
+impl Ord for ShardGroupId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Keyspace order: by the MSB-aligned path, then shallower (ancestor)
+        // before deeper.
+        let align = |s: &Self| -> u64 {
+            if s.depth == 0 {
+                0
+            } else {
+                s.path << (64 - s.depth)
+            }
+        };
+        align(self)
+            .cmp(&align(other))
+            .then(self.depth.cmp(&other.depth))
+    }
+}
+
+impl PartialOrd for ShardGroupId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 
 impl Display for ShardGroupId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Shard({})", self.0)
+        write!(f, "Shard(d{}p{})", self.depth, self.path)
     }
 }
 

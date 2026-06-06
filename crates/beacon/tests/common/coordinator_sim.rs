@@ -191,7 +191,7 @@ impl CoordinatorSim {
         }
 
         let pool_id = StakePoolId::new(0);
-        let shard = ShardGroupId::new(0);
+        let shard = ShardGroupId::ROOT;
         let config = BeaconGenesisConfig {
             chain_config: BeaconChainConfig::default(),
             initial_validators: members
@@ -226,7 +226,7 @@ impl CoordinatorSim {
                     Arc::clone(&genesis_block),
                     vec![initial_state.clone()],
                     members[i].0,
-                    ShardGroupId::new(0),
+                    ShardGroupId::ROOT,
                     network.clone(),
                     config_hash,
                     Arc::new(BeaconProposalPool::new(next_epoch)),

@@ -814,10 +814,10 @@ mod tests {
 
     fn header(height: BlockHeight, tag: &[u8]) -> BlockHeader {
         BlockHeader::new(
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             height,
             BlockHash::from_raw(Hash::from_bytes(tag)),
-            QuorumCertificate::genesis(ShardGroupId::new(0)),
+            QuorumCertificate::genesis(ShardGroupId::ROOT),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(0),
             Round::INITIAL,
@@ -844,7 +844,7 @@ mod tests {
         };
         let qc = QuorumCertificate::new(
             block.hash(),
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             height,
             BlockHash::ZERO,
             Round::INITIAL,
@@ -1210,7 +1210,7 @@ mod tests {
     fn qc_at(height: BlockHeight) -> QuorumCertificate {
         QuorumCertificate::new(
             BlockHash::from_raw(Hash::from_bytes(b"qc")),
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             height,
             BlockHash::ZERO,
             Round::INITIAL,

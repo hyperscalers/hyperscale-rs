@@ -311,7 +311,7 @@ mod tests {
                 amount: Stake::from_whole_tokens(1_000_000),
             },
             proof: ShardWitnessProof {
-                shard_id: ShardGroupId::new(0),
+                shard_id: ShardGroupId::ROOT,
                 committed_block_hash: BlockHash::ZERO,
                 leaf_index: LeafIndex::new(42),
                 siblings: Vec::new().into(),

@@ -125,10 +125,10 @@ pub fn make_test_block(height: BlockHeight) -> Block {
     parent_bytes[..8].copy_from_slice(&height.to_le_bytes());
     Block::Live {
         header: BlockHeader::new(
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             height,
             BlockHash::from_raw(Hash::from_bytes(&parent_bytes)),
-            QuorumCertificate::genesis(ShardGroupId::new(0)),
+            QuorumCertificate::genesis(ShardGroupId::ROOT),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(height.inner() * 1000),
             Round::INITIAL,
@@ -162,7 +162,7 @@ pub fn make_test_qc(block: &Block) -> Verified<QuorumCertificate> {
     // SAFETY: synthetic test fixture, no real signature.
     Verified::<QuorumCertificate>::new_unchecked_for_test(QuorumCertificate::new(
         block.hash(),
-        ShardGroupId::new(0),
+        ShardGroupId::ROOT,
         block.height(),
         block.header().parent_block_hash(),
         Round::INITIAL,
@@ -339,9 +339,9 @@ pub fn make_test_execution_certificate(
     )];
     let global_receipt_root = compute_global_receipt_root(&outcomes);
     let mut remote_shards = BTreeSet::new();
-    remote_shards.insert(ShardGroupId::new(u64::from(seed) + 1));
+    remote_shards.insert(ShardGroupId::leaf(8, u64::from(seed) + 1));
     ExecutionCertificate::new(
-        WaveId::new(ShardGroupId::new(0), block_height, remote_shards),
+        WaveId::new(ShardGroupId::ROOT, block_height, remote_shards),
         WeightedTimestamp::from_millis(block_height.inner() + 1),
         global_receipt_root,
         outcomes,

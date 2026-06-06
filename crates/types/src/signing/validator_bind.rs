@@ -83,7 +83,7 @@ mod tests {
         let bind_msg = validator_bind_message(&net(), bytes, &nonce);
         let block_msg = block_vote_message(
             &net(),
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             BlockHeight::GENESIS,
             Round::INITIAL,
             &BlockHash::from_raw(Hash::from_bytes(bytes)),

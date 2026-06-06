@@ -442,10 +442,10 @@ mod tests {
 
         Block::Live {
             header: BlockHeader::new(
-                ShardGroupId::new(0),
+                ShardGroupId::ROOT,
                 BlockHeight::new(1),
                 BlockHash::from_raw(Hash::from_bytes(b"parent")),
-                QuorumCertificate::genesis(ShardGroupId::new(0)),
+                QuorumCertificate::genesis(ShardGroupId::ROOT),
                 ValidatorId::new(0),
                 ProposerTimestamp::from_millis(1_234_567_890),
                 Round::INITIAL,
@@ -470,7 +470,7 @@ mod tests {
     fn create_test_qc(block: &Block) -> QuorumCertificate {
         QuorumCertificate::new(
             block.hash(),
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             block.height(),
             block.header().parent_block_hash(),
             block.header().round(),

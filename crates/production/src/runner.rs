@@ -432,8 +432,9 @@ impl ProductionRunnerBuilder {
             let initial_shard_committees: std::collections::BTreeMap<
                 ShardGroupId,
                 Vec<ValidatorId>,
-            > = (0..shared_topology.num_shards())
-                .map(ShardGroupId::new)
+            > = shared_topology
+                .shard_trie()
+                .leaves()
                 .map(|s| (s, shared_topology.committee_for_shard(s).to_vec()))
                 .collect();
             let config = BeaconGenesisConfig {

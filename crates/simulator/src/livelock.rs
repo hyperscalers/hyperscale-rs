@@ -186,8 +186,9 @@ impl LivelockAnalyzer {
         let mut seen_hashes = HashSet::new();
 
         // Collect from first validator of each shard (all validators see same mempool)
+        let depth = num_shards.trailing_zeros();
         for shard_idx in 0..num_shards {
-            let shard = ShardGroupId::new(shard_idx);
+            let shard = ShardGroupId::leaf(depth, shard_idx);
             let first_node_idx =
                 u32::try_from(shard_idx).unwrap_or(u32::MAX) * validators_per_shard;
 

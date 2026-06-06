@@ -79,7 +79,7 @@ impl Signed for ExecutionCertificatesNotification {
         let shard = self
             .certificates
             .first()
-            .map_or(ShardGroupId::new(0), ExecutionCertificate::shard_group_id);
+            .map_or(ShardGroupId::ROOT, ExecutionCertificate::shard_group_id);
         exec_cert_batch_message(network, shard, &self.certificates)
     }
 }

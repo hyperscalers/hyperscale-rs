@@ -58,7 +58,7 @@ impl QuorumCertificate {
     ///
     /// The shard is tagged on the QC so any committee lookup keyed off
     /// `qc.shard_group_id` resolves the same shard the QC anchors. A
-    /// fixed-`ShardGroupId::new(0)` default would silently route shard-N
+    /// fixed-`ShardGroupId::ROOT` default would silently route shard-N
     /// committee lookups to shard 0 for any genesis-anchored header.
     /// The genesis QC has a zero block hash and zero signature.
     #[must_use]
@@ -438,7 +438,7 @@ mod tests {
 
     #[test]
     fn test_genesis_qc() {
-        let qc = QuorumCertificate::genesis(ShardGroupId::new(0));
+        let qc = QuorumCertificate::genesis(ShardGroupId::ROOT);
         assert!(qc.is_genesis());
         assert_eq!(qc.height(), BlockHeight::new(0));
         assert_eq!(qc.block_hash(), BlockHash::ZERO);
@@ -458,7 +458,7 @@ mod tests {
         let parent_block_hash = BlockHash::from_raw(Hash::from_bytes(b"parent"));
         let qc = QuorumCertificate::new(
             BlockHash::from_raw(Hash::from_bytes(b"block1")),
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             BlockHeight::new(1),
             parent_block_hash,
             Round::INITIAL,
@@ -541,7 +541,7 @@ mod tests {
             &keys,
             &[0, 1, 2],
             BlockHash::from_raw(Hash::from_bytes(b"block")),
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             BlockHeight::new(1),
             Round::INITIAL,
         );
@@ -563,7 +563,7 @@ mod tests {
             &keys,
             &[0, 1, 2],
             BlockHash::from_raw(Hash::from_bytes(b"block")),
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             BlockHeight::new(1),
             Round::INITIAL,
         );
@@ -573,7 +573,7 @@ mod tests {
         let net = NetworkDefinition::simulator();
         let wrong_msg = block_vote_message(
             &net,
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             BlockHeight::new(1),
             Round::INITIAL,
             &BlockHash::from_raw(Hash::from_bytes(b"other_block")),
@@ -610,7 +610,7 @@ mod tests {
             &keys,
             &[0, 1, 2],
             BlockHash::from_raw(Hash::from_bytes(b"block")),
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             BlockHeight::new(1),
             Round::INITIAL,
         );
@@ -645,7 +645,7 @@ mod tests {
             &keys,
             &[0, 1],
             BlockHash::from_raw(Hash::from_bytes(b"block")),
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             BlockHeight::new(1),
             Round::INITIAL,
         );
@@ -671,7 +671,7 @@ mod tests {
 
         let qc = QuorumCertificate::new(
             BlockHash::from_raw(Hash::from_bytes(b"b")),
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             BlockHeight::new(1),
             BlockHash::ZERO,
             Round::INITIAL,

@@ -825,7 +825,7 @@ mod tests {
     use super::*;
 
     fn shard() -> ShardGroupId {
-        ShardGroupId::new(0)
+        ShardGroupId::ROOT
     }
 
     fn net() -> NetworkDefinition {

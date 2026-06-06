@@ -334,7 +334,12 @@ mod tests {
             voting_power: VotePower::new(1),
         }]);
         // Local shard = 0, 2 shards total
-        TopologySnapshot::single_shard(NetworkDefinition::simulator(), ShardGroupId::new(0), 2, vs)
+        TopologySnapshot::single_shard(
+            NetworkDefinition::simulator(),
+            ShardGroupId::leaf(1, 0),
+            2,
+            vs,
+        )
     }
 
     fn make_entry(node: NodeId) -> SubstateEntry {
@@ -353,7 +358,7 @@ mod tests {
     ) -> Provisions {
         Provisions::new(
             source_shard,
-            ShardGroupId::new(0),
+            ShardGroupId::leaf(1, 0),
             height,
             MerkleInclusionProof::dummy(),
             txs.into_iter()
@@ -385,14 +390,14 @@ mod tests {
         let topo = make_topology();
         let mut detector = ConflictDetector::new();
 
-        let (node_a, node_b) = two_nodes_on_shard(ShardGroupId::new(1), 2);
-        let local_node = node_on_shard(ShardGroupId::new(0), 2);
+        let (node_a, node_b) = two_nodes_on_shard(ShardGroupId::leaf(1, 1), 2);
+        let local_node = node_on_shard(ShardGroupId::leaf(1, 0), 2);
 
         // Local tx reads node_a from shard 1, owns local_node on shard 0
         let local_tx = TxHash::from_raw(Hash::from_bytes(b"tx_alpha"));
         detector.register_tx(
             local_tx,
-            ShardGroupId::new(0),
+            ShardGroupId::leaf(1, 0),
             &topo,
             &[node_a, local_node],
             &[],
@@ -401,7 +406,7 @@ mod tests {
         // Remote provisions touches node_b (different source node) — no source overlap
         let remote_tx = TxHash::from_raw(Hash::from_bytes(b"tx_beta"));
         let provisions = make_provisions(
-            ShardGroupId::new(1),
+            ShardGroupId::leaf(1, 1),
             BlockHeight::new(10),
             vec![(remote_tx, vec![node_b], vec![local_node])],
         );
@@ -415,14 +420,14 @@ mod tests {
         let topo = make_topology();
         let mut detector = ConflictDetector::new();
 
-        let remote_node = node_on_shard(ShardGroupId::new(1), 2);
-        let (local_a, local_b) = two_nodes_on_shard(ShardGroupId::new(0), 2);
+        let remote_node = node_on_shard(ShardGroupId::leaf(1, 1), 2);
+        let (local_a, local_b) = two_nodes_on_shard(ShardGroupId::leaf(1, 0), 2);
 
         // Local tx reads remote_node from shard 1, owns local_a on shard 0
         let local_tx = TxHash::from_raw(Hash::from_bytes(b"tx_alpha"));
         detector.register_tx(
             local_tx,
-            ShardGroupId::new(0),
+            ShardGroupId::leaf(1, 0),
             &topo,
             &[remote_node, local_a],
             &[],
@@ -431,7 +436,7 @@ mod tests {
         // Remote provisions: source nodes overlap (remote_node) but targets local_b (not local_a)
         let remote_tx = TxHash::from_raw(Hash::from_bytes(b"tx_beta"));
         let provisions = make_provisions(
-            ShardGroupId::new(1),
+            ShardGroupId::leaf(1, 1),
             BlockHeight::new(10),
             vec![(remote_tx, vec![remote_node], vec![local_b])],
         );
@@ -444,15 +449,15 @@ mod tests {
     fn test_bidirectional_overlap_higher_hash_loses() {
         let topo = make_topology();
         let mut detector = ConflictDetector::new();
-        let remote_node = node_on_shard(ShardGroupId::new(1), 2);
-        let local_node = node_on_shard(ShardGroupId::new(0), 2);
+        let remote_node = node_on_shard(ShardGroupId::leaf(1, 1), 2);
+        let local_node = node_on_shard(ShardGroupId::leaf(1, 0), 2);
 
         let (higher, lower) = ordered_hashes(b"tx_alpha", b"tx_beta");
 
         // Local tx (higher hash) reads remote_node, owns local_node
         detector.register_tx(
             higher,
-            ShardGroupId::new(0),
+            ShardGroupId::leaf(1, 0),
             &topo,
             &[remote_node, local_node],
             &[],
@@ -460,7 +465,7 @@ mod tests {
 
         // Remote provision: source has remote_node (overlap dir 1), targets local_node (overlap dir 2)
         let provisions = make_provisions(
-            ShardGroupId::new(1),
+            ShardGroupId::leaf(1, 1),
             BlockHeight::new(10),
             vec![(lower, vec![remote_node], vec![local_node])],
         );
@@ -479,22 +484,22 @@ mod tests {
     fn test_local_wins_no_conflict_emitted() {
         let topo = make_topology();
         let mut detector = ConflictDetector::new();
-        let remote_node = node_on_shard(ShardGroupId::new(1), 2);
-        let local_node = node_on_shard(ShardGroupId::new(0), 2);
+        let remote_node = node_on_shard(ShardGroupId::leaf(1, 1), 2);
+        let local_node = node_on_shard(ShardGroupId::leaf(1, 0), 2);
 
         let (higher, lower) = ordered_hashes(b"tx_alpha", b"tx_beta");
 
         // Local tx (lower hash) — it wins
         detector.register_tx(
             lower,
-            ShardGroupId::new(0),
+            ShardGroupId::leaf(1, 0),
             &topo,
             &[remote_node, local_node],
             &[],
         );
 
         let provisions = make_provisions(
-            ShardGroupId::new(1),
+            ShardGroupId::leaf(1, 1),
             BlockHeight::new(10),
             vec![(higher, vec![remote_node], vec![local_node])],
         );
@@ -507,14 +512,14 @@ mod tests {
     fn test_reverse_detection_provisions_before_local_tx() {
         let topo = make_topology();
         let mut detector = ConflictDetector::new();
-        let remote_node = node_on_shard(ShardGroupId::new(1), 2);
-        let local_node = node_on_shard(ShardGroupId::new(0), 2);
+        let remote_node = node_on_shard(ShardGroupId::leaf(1, 1), 2);
+        let local_node = node_on_shard(ShardGroupId::leaf(1, 0), 2);
 
         let (higher, lower) = ordered_hashes(b"tx_local", b"tx_remote");
 
         // Provisions commit FIRST
         let provisions = make_provisions(
-            ShardGroupId::new(1),
+            ShardGroupId::leaf(1, 1),
             BlockHeight::new(5),
             vec![(lower, vec![remote_node], vec![local_node])],
         );
@@ -525,7 +530,7 @@ mod tests {
         // Local tx registers AFTER — reverse detection catches bidirectional overlap
         let rev_conflicts = detector.register_tx(
             higher,
-            ShardGroupId::new(0),
+            ShardGroupId::leaf(1, 0),
             &topo,
             &[remote_node, local_node],
             &[],
@@ -542,14 +547,14 @@ mod tests {
     fn test_reverse_detection_local_wins() {
         let topo = make_topology();
         let mut detector = ConflictDetector::new();
-        let remote_node = node_on_shard(ShardGroupId::new(1), 2);
-        let local_node = node_on_shard(ShardGroupId::new(0), 2);
+        let remote_node = node_on_shard(ShardGroupId::leaf(1, 1), 2);
+        let local_node = node_on_shard(ShardGroupId::leaf(1, 0), 2);
 
         let (higher, lower) = ordered_hashes(b"tx_local", b"tx_remote");
 
         // Provisions commit first with the higher hash
         let provisions = make_provisions(
-            ShardGroupId::new(1),
+            ShardGroupId::leaf(1, 1),
             BlockHeight::new(5),
             vec![(higher, vec![remote_node], vec![local_node])],
         );
@@ -558,7 +563,7 @@ mod tests {
         // Local tx registers with lower hash — wins, no conflict
         let rev_conflicts = detector.register_tx(
             lower,
-            ShardGroupId::new(0),
+            ShardGroupId::leaf(1, 0),
             &topo,
             &[remote_node, local_node],
             &[],
@@ -570,13 +575,13 @@ mod tests {
     fn test_remove_tx_stops_detection() {
         let topo = make_topology();
         let mut detector = ConflictDetector::new();
-        let remote_node = node_on_shard(ShardGroupId::new(1), 2);
-        let local_node = node_on_shard(ShardGroupId::new(0), 2);
+        let remote_node = node_on_shard(ShardGroupId::leaf(1, 1), 2);
+        let local_node = node_on_shard(ShardGroupId::leaf(1, 0), 2);
 
         let local_tx = TxHash::from_raw(Hash::from_bytes(b"tx_alpha"));
         detector.register_tx(
             local_tx,
-            ShardGroupId::new(0),
+            ShardGroupId::leaf(1, 0),
             &topo,
             &[remote_node, local_node],
             &[],
@@ -586,7 +591,7 @@ mod tests {
 
         let remote_tx = TxHash::from_raw(Hash::from_bytes(b"tx_beta"));
         let provisions = make_provisions(
-            ShardGroupId::new(1),
+            ShardGroupId::leaf(1, 1),
             BlockHeight::new(10),
             vec![(remote_tx, vec![remote_node], vec![local_node])],
         );
@@ -599,13 +604,13 @@ mod tests {
     fn test_wrong_shard_no_conflict() {
         let topo = make_topology();
         let mut detector = ConflictDetector::new();
-        let remote_node = node_on_shard(ShardGroupId::new(1), 2);
-        let local_node = node_on_shard(ShardGroupId::new(0), 2);
+        let remote_node = node_on_shard(ShardGroupId::leaf(1, 1), 2);
+        let local_node = node_on_shard(ShardGroupId::leaf(1, 0), 2);
 
         let local_tx = TxHash::from_raw(Hash::from_bytes(b"tx_alpha"));
         detector.register_tx(
             local_tx,
-            ShardGroupId::new(0),
+            ShardGroupId::leaf(1, 0),
             &topo,
             &[remote_node, local_node],
             &[],
@@ -614,7 +619,7 @@ mod tests {
         // Batch from shard 0 (our shard) — wrong source shard
         let remote_tx = TxHash::from_raw(Hash::from_bytes(b"tx_beta"));
         let provisions = make_provisions(
-            ShardGroupId::new(0),
+            ShardGroupId::leaf(1, 0),
             BlockHeight::new(10),
             vec![(remote_tx, vec![remote_node], vec![local_node])],
         );
@@ -627,25 +632,25 @@ mod tests {
     fn test_remove_provision_stops_reverse_detection() {
         let topo = make_topology();
         let mut detector = ConflictDetector::new();
-        let remote_node = node_on_shard(ShardGroupId::new(1), 2);
-        let local_node = node_on_shard(ShardGroupId::new(0), 2);
+        let remote_node = node_on_shard(ShardGroupId::leaf(1, 1), 2);
+        let local_node = node_on_shard(ShardGroupId::leaf(1, 0), 2);
 
         let (higher, lower) = ordered_hashes(b"tx_local", b"tx_remote");
 
         let provisions = make_provisions(
-            ShardGroupId::new(1),
+            ShardGroupId::leaf(1, 1),
             BlockHeight::new(5),
             vec![(lower, vec![remote_node], vec![local_node])],
         );
         detector.detect_conflicts(&provisions, WeightedTimestamp::from_millis(5 * 500));
         assert_eq!(detector.stored_provision_count(), 1);
 
-        detector.remove_provision(lower, ShardGroupId::new(1));
+        detector.remove_provision(lower, ShardGroupId::leaf(1, 1));
         assert_eq!(detector.stored_provision_count(), 0);
 
         let rev_conflicts = detector.register_tx(
             higher,
-            ShardGroupId::new(0),
+            ShardGroupId::leaf(1, 0),
             &topo,
             &[remote_node, local_node],
             &[],

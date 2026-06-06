@@ -49,8 +49,8 @@ mod tests {
     #[test]
     fn test_state_provisions_message_deterministic() {
         let provisions = Provisions::new(
-            ShardGroupId::new(1),
-            ShardGroupId::new(2),
+            ShardGroupId::leaf(1, 0),
+            ShardGroupId::leaf(1, 1),
             BlockHeight::new(10),
             MerkleInclusionProof::dummy(),
             vec![ProvisionEntry::new(

@@ -151,13 +151,13 @@ mod tests {
     /// were ack'd.
     #[test]
     fn execution_certificate_admitted_emits_outbound_ec_continuation_when_we_were_a_source() {
-        // 2-shard committee so local (0) ≠ EC shard (1).
+        // Local home shard is the root; the EC names a distinct leaf shard.
         let TestNode { mut node, .. } = TestNode::builder().num_shards(2).build();
 
         let mut remote_shards = BTreeSet::new();
-        remote_shards.insert(ShardGroupId::new(0));
+        remote_shards.insert(ShardGroupId::ROOT);
         let ec = make_ec(
-            ShardGroupId::new(1),
+            ShardGroupId::leaf(1, 1),
             remote_shards,
             BlockHeight::new(1),
             vec![TxOutcome::new(TxHash::ZERO, ExecutionOutcome::Failed)],
@@ -177,7 +177,7 @@ mod tests {
             tx_outcomes,
         }) = cont
         {
-            assert_eq!(*target_shard, ShardGroupId::new(1));
+            assert_eq!(*target_shard, ShardGroupId::leaf(1, 1));
             assert_eq!(tx_outcomes.len(), 1);
         } else {
             unreachable!()
@@ -192,7 +192,7 @@ mod tests {
         let TestNode { mut node, .. } = TestNode::new();
 
         let ec = make_ec(
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             BTreeSet::new(),
             BlockHeight::new(1),
             vec![],
@@ -214,13 +214,14 @@ mod tests {
     /// surface.
     #[test]
     fn execution_certificate_admitted_skips_continuation_when_local_not_a_source() {
-        let TestNode { mut node, .. } = TestNode::builder().num_shards(3).build();
+        let TestNode { mut node, .. } = TestNode::builder().num_shards(2).build();
 
-        // EC at shard 1, dependencies = {2}; local (0) is not in the set.
+        // EC on one leaf, dependencies on its sibling; the local root shard
+        // is not in the set.
         let mut remote_shards = BTreeSet::new();
-        remote_shards.insert(ShardGroupId::new(2));
+        remote_shards.insert(ShardGroupId::leaf(1, 1));
         let ec = make_ec(
-            ShardGroupId::new(1),
+            ShardGroupId::leaf(1, 0),
             remote_shards,
             BlockHeight::new(1),
             vec![],

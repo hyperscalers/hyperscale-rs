@@ -781,7 +781,7 @@ mod tests {
         sink: CommitSink,
     ) -> (PendingCommit, PreparedCommit) {
         let block = make_live_block(
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             height,
             /* timestamp_ms */ 1_000 + height.inner(),
             ValidatorId::new(0),
@@ -866,7 +866,7 @@ mod tests {
     #[test]
     fn accumulate_skips_block_at_or_below_persisted_height() {
         let committee = TestCommittee::new(4, 1);
-        let mut coord = BlockCommitCoordinator::new(ShardGroupId::new(0), BlockHeight::new(5));
+        let mut coord = BlockCommitCoordinator::new(ShardGroupId::ROOT, BlockHeight::new(5));
         let sink = empty_sink();
 
         for h in [1u64, 5] {
@@ -887,7 +887,7 @@ mod tests {
     #[test]
     fn accumulate_dedups_same_block_hash() {
         let committee = TestCommittee::new(4, 1);
-        let mut coord = BlockCommitCoordinator::new(ShardGroupId::new(0), BlockHeight::GENESIS);
+        let mut coord = BlockCommitCoordinator::new(ShardGroupId::ROOT, BlockHeight::GENESIS);
         let sink = empty_sink();
 
         let (first, _) = make_commit(
@@ -919,7 +919,7 @@ mod tests {
     #[test]
     fn accumulate_notifies_immediately_within_lag_window() {
         let committee = TestCommittee::new(4, 1);
-        let mut coord = BlockCommitCoordinator::new(ShardGroupId::new(0), BlockHeight::GENESIS);
+        let mut coord = BlockCommitCoordinator::new(ShardGroupId::ROOT, BlockHeight::GENESIS);
         let sink = empty_sink();
 
         // Heights 1..=MAX_PERSISTENCE_LAG should all notify immediately.
@@ -944,7 +944,7 @@ mod tests {
     #[test]
     fn accumulate_defers_notification_when_persistence_lag_exceeded() {
         let committee = TestCommittee::new(4, 1);
-        let mut coord = BlockCommitCoordinator::new(ShardGroupId::new(0), BlockHeight::GENESIS);
+        let mut coord = BlockCommitCoordinator::new(ShardGroupId::ROOT, BlockHeight::GENESIS);
         let sink = empty_sink();
 
         let max_lag = BlockCommitCoordinator::MAX_PERSISTENCE_LAG;
@@ -970,7 +970,7 @@ mod tests {
         // accumulate time. This guards against a re-derivation bug where
         // a later `mark_persisted` could change the answer mid-flight.
         let committee = TestCommittee::new(4, 1);
-        let mut coord = BlockCommitCoordinator::new(ShardGroupId::new(0), BlockHeight::GENESIS);
+        let mut coord = BlockCommitCoordinator::new(ShardGroupId::ROOT, BlockHeight::GENESIS);
         let sink = empty_sink();
 
         let max_lag = BlockCommitCoordinator::MAX_PERSISTENCE_LAG;
@@ -1007,7 +1007,7 @@ mod tests {
 
     #[test]
     fn mark_persisted_is_monotonic() {
-        let mut coord = BlockCommitCoordinator::new(ShardGroupId::new(0), BlockHeight::new(3));
+        let mut coord = BlockCommitCoordinator::new(ShardGroupId::ROOT, BlockHeight::new(3));
         coord.mark_persisted(BlockHeight::new(7));
         assert_eq!(coord.persisted_height().inner(), 7);
         // Going backwards must not regress the high-water mark.
@@ -1020,7 +1020,7 @@ mod tests {
     #[test]
     fn has_prepared_and_insert_prepared_roundtrip() {
         let committee = TestCommittee::new(4, 1);
-        let coord = BlockCommitCoordinator::new(ShardGroupId::new(0), BlockHeight::GENESIS);
+        let coord = BlockCommitCoordinator::new(ShardGroupId::ROOT, BlockHeight::GENESIS);
         let sink = empty_sink();
         let (commit, prepared) =
             make_commit(&committee, BlockHeight::new(1), CommitSource::Sync, sink);
@@ -1060,7 +1060,7 @@ mod tests {
 
     #[test]
     fn flush_is_noop_when_pending_is_empty() {
-        let mut coord = BlockCommitCoordinator::new(ShardGroupId::new(0), BlockHeight::GENESIS);
+        let mut coord = BlockCommitCoordinator::new(ShardGroupId::ROOT, BlockHeight::GENESIS);
         let sink = empty_sink();
         let (tx, rx) = unbounded();
         let dispatch = SyncDispatch::new();
@@ -1074,7 +1074,7 @@ mod tests {
     #[test]
     fn flush_writes_blocks_in_height_order_even_when_accumulated_out_of_order() {
         let committee = TestCommittee::new(4, 1);
-        let mut coord = BlockCommitCoordinator::new(ShardGroupId::new(0), BlockHeight::GENESIS);
+        let mut coord = BlockCommitCoordinator::new(ShardGroupId::ROOT, BlockHeight::GENESIS);
         let sink = empty_sink();
         let (tx, rx) = unbounded();
         let dispatch = SyncDispatch::new();
@@ -1103,7 +1103,7 @@ mod tests {
     #[test]
     fn flush_drops_blocks_already_persisted_by_sync_path() {
         let committee = TestCommittee::new(4, 1);
-        let mut coord = BlockCommitCoordinator::new(ShardGroupId::new(0), BlockHeight::GENESIS);
+        let mut coord = BlockCommitCoordinator::new(ShardGroupId::ROOT, BlockHeight::GENESIS);
         let sink = empty_sink();
         let (tx, rx) = unbounded();
         let dispatch = SyncDispatch::new();
@@ -1135,7 +1135,7 @@ mod tests {
     #[test]
     fn flush_defers_when_prepared_commit_missing_for_first_block() {
         let committee = TestCommittee::new(4, 1);
-        let mut coord = BlockCommitCoordinator::new(ShardGroupId::new(0), BlockHeight::GENESIS);
+        let mut coord = BlockCommitCoordinator::new(ShardGroupId::ROOT, BlockHeight::GENESIS);
         let sink = empty_sink();
         let (tx, rx) = unbounded();
         let dispatch = SyncDispatch::new();
@@ -1161,7 +1161,7 @@ mod tests {
     #[test]
     fn flush_defers_later_blocks_when_an_earlier_block_is_unprepared() {
         let committee = TestCommittee::new(4, 1);
-        let mut coord = BlockCommitCoordinator::new(ShardGroupId::new(0), BlockHeight::GENESIS);
+        let mut coord = BlockCommitCoordinator::new(ShardGroupId::ROOT, BlockHeight::GENESIS);
         let sink = empty_sink();
         let (tx, rx) = unbounded();
         let dispatch = SyncDispatch::new();
@@ -1210,7 +1210,7 @@ mod tests {
     #[test]
     fn flush_emits_deferred_block_committed_events_after_persistence() {
         let committee = TestCommittee::new(4, 1);
-        let mut coord = BlockCommitCoordinator::new(ShardGroupId::new(0), BlockHeight::GENESIS);
+        let mut coord = BlockCommitCoordinator::new(ShardGroupId::ROOT, BlockHeight::GENESIS);
         let sink = empty_sink();
         let (tx, rx) = unbounded();
         let dispatch = SyncDispatch::new();
@@ -1240,7 +1240,7 @@ mod tests {
     #[test]
     fn flush_skips_when_a_previous_commit_is_still_in_flight() {
         let committee = TestCommittee::new(4, 1);
-        let mut coord = BlockCommitCoordinator::new(ShardGroupId::new(0), BlockHeight::GENESIS);
+        let mut coord = BlockCommitCoordinator::new(ShardGroupId::ROOT, BlockHeight::GENESIS);
         let sink = empty_sink();
         let (tx, _rx) = unbounded();
         let dispatch = SyncDispatch::new();
@@ -1264,7 +1264,7 @@ mod tests {
     #[test]
     fn flush_clears_in_flight_flag_so_subsequent_flush_drains_backlog() {
         let committee = TestCommittee::new(4, 1);
-        let mut coord = BlockCommitCoordinator::new(ShardGroupId::new(0), BlockHeight::GENESIS);
+        let mut coord = BlockCommitCoordinator::new(ShardGroupId::ROOT, BlockHeight::GENESIS);
         let sink = empty_sink();
         let (tx, _rx) = unbounded();
         let dispatch = SyncDispatch::new();
@@ -1295,7 +1295,7 @@ mod tests {
     #[test]
     fn flush_consumes_prepared_commits_so_a_repeat_flush_finds_nothing() {
         let committee = TestCommittee::new(4, 1);
-        let mut coord = BlockCommitCoordinator::new(ShardGroupId::new(0), BlockHeight::GENESIS);
+        let mut coord = BlockCommitCoordinator::new(ShardGroupId::ROOT, BlockHeight::GENESIS);
         let sink = empty_sink();
         let (tx, _rx) = unbounded();
         let dispatch = SyncDispatch::new();
@@ -1316,7 +1316,7 @@ mod tests {
     #[test]
     fn flush_keeps_qc_only_path_prepared_commit_until_it_is_used() {
         let committee = TestCommittee::new(4, 1);
-        let mut coord = BlockCommitCoordinator::new(ShardGroupId::new(0), BlockHeight::GENESIS);
+        let mut coord = BlockCommitCoordinator::new(ShardGroupId::ROOT, BlockHeight::GENESIS);
         let sink = empty_sink();
         let (tx, _rx) = unbounded();
         let dispatch = SyncDispatch::new();

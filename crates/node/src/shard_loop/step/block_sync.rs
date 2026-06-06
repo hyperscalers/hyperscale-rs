@@ -450,10 +450,10 @@ mod tests {
 
     fn header() -> BlockHeader {
         BlockHeader::new(
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             HEIGHT,
             BlockHash::ZERO,
-            QuorumCertificate::genesis(ShardGroupId::new(0)),
+            QuorumCertificate::genesis(ShardGroupId::ROOT),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(1_000),
             Round::INITIAL,
@@ -503,7 +503,7 @@ mod tests {
     fn qc_for(block: &Block) -> QuorumCertificate {
         QuorumCertificate::new(
             block.hash(),
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             block.height(),
             BlockHash::ZERO,
             Round::INITIAL,
@@ -526,7 +526,7 @@ mod tests {
     ) {
         let tx_hash = TxHash::from_raw(Hash::from_bytes(b"tx"));
         let wave_id = WaveId::new(
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             HEIGHT,
             std::collections::BTreeSet::new(),
         );
@@ -615,7 +615,7 @@ mod tests {
         };
         let qc = QuorumCertificate::new(
             BlockHash::from_raw(Hash::from_bytes(b"wrong")),
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             block.height(),
             BlockHash::ZERO,
             Round::INITIAL,
@@ -636,7 +636,7 @@ mod tests {
         };
         let qc = QuorumCertificate::new(
             block.hash(),
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             BlockHeight::new(99),
             BlockHash::ZERO,
             Round::INITIAL,
@@ -720,7 +720,7 @@ mod tests {
         // (corrupted) body and would tautologically match.
         let tx_hash = TxHash::from_raw(Hash::from_bytes(b"tx_divergent"));
         let wave_id = WaveId::new(
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             HEIGHT,
             std::collections::BTreeSet::new(),
         );

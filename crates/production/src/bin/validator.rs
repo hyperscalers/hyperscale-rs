@@ -730,7 +730,10 @@ fn build_topology(
     if has_shard_assignments {
         let mut shard_committees: HashMap<ShardGroupId, Vec<ValidatorId>> = HashMap::new();
         for v in &genesis.validators {
-            let shard = ShardGroupId::new(v.shard.unwrap_or(v.id % num_shards));
+            let shard = ShardGroupId::leaf(
+                num_shards.trailing_zeros(),
+                v.shard.unwrap_or(v.id % num_shards),
+            );
             shard_committees
                 .entry(shard)
                 .or_default()
@@ -1169,6 +1172,7 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
     // the storage Arc; different-shard vnodes each provision their own.
     let hosted_shards: std::collections::BTreeSet<u64> =
         config.vnodes.iter().map(|v| v.shard).collect();
+    let shard_depth = config.node.num_shards.trailing_zeros();
     let mut storages: HashMap<ShardGroupId, Arc<RocksDbShardStorage>> = HashMap::new();
     for shard in &hosted_shards {
         let db_path = config
@@ -1179,7 +1183,7 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
         let storage = RocksDbShardStorage::open_with_config(&db_path, &rocksdb_config)
             .with_context(|| format!("Failed to open database at {}", db_path.display()))?;
         info!(shard = shard, path = %db_path.display(), "Storage opened");
-        storages.insert(ShardGroupId::new(*shard), Arc::new(storage));
+        storages.insert(ShardGroupId::leaf(shard_depth, *shard), Arc::new(storage));
     }
 
     // Process-level beacon storage, shared across every hosted vnode's
@@ -1209,7 +1213,7 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
     }
 
     // Build the host's single identity-agnostic topology snapshot.
-    let fallback_shard = ShardGroupId::new(config.vnodes[0].shard);
+    let fallback_shard = ShardGroupId::leaf(shard_depth, config.vnodes[0].shard);
     let topology = build_topology(
         config.node.network.clone(),
         config.node.num_shards,
@@ -1222,7 +1226,7 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
     let mut vnode_configs: Vec<VnodeConfig> = Vec::with_capacity(config.vnodes.len());
     for entry in &config.vnodes {
         let validator_id = ValidatorId::new(entry.validator_id);
-        let local_shard = ShardGroupId::new(entry.shard);
+        let local_shard = ShardGroupId::leaf(shard_depth, entry.shard);
         let signing_key = hosted_keypairs
             .iter()
             .find_map(|(vid, k)| (*vid == validator_id).then(|| Arc::clone(k)))

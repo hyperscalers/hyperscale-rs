@@ -79,9 +79,9 @@ fn find_accounts_on_each_shard(
         let radix_node_id = acc.into_node_id();
         let hs_node_id = NodeId(radix_node_id.0[..30].try_into().unwrap());
         let shard = shard_for_node(&hs_node_id, num_shards);
-        if shard == ShardGroupId::new(0) && shard0.is_none() {
+        if shard == ShardGroupId::leaf(1, 0) && shard0.is_none() {
             shard0 = Some((kp, acc));
-        } else if shard == ShardGroupId::new(1) && shard1.is_none() {
+        } else if shard == ShardGroupId::leaf(1, 1) && shard1.is_none() {
             shard1 = Some((kp, acc));
         }
         if shard0.is_some() && shard1.is_some() {

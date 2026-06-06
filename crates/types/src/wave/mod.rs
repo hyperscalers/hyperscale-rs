@@ -68,7 +68,7 @@ mod tests {
         )
     }
 
-    /// Find a node seed that routes to `target_shard` under modulo-2 sharding.
+    /// Find a node seed that routes to `target_shard` under 2-way sharding.
     fn node_on_shard(topology: &TopologySnapshot, target_shard: ShardGroupId) -> NodeId {
         for seed in 0u8..=255 {
             let node = NodeId([seed; 30]);
@@ -90,19 +90,19 @@ mod tests {
 
     fn make_wave_id(shard: u64, height: BlockHeight, remote: &[u64]) -> WaveId {
         WaveId::new(
-            ShardGroupId::new(shard),
+            ShardGroupId::leaf(3, shard),
             height,
-            remote.iter().map(|&s| ShardGroupId::new(s)).collect(),
+            remote.iter().map(|&s| ShardGroupId::leaf(3, s)).collect(),
         )
     }
 
     #[test]
     fn test_wave_id_display() {
         let zero = make_wave_id(0, BlockHeight::new(42), &[]);
-        assert_eq!(zero.to_string(), "Wave(shard=0, h=42, ∅)");
+        assert_eq!(zero.to_string(), "Wave(shard=8, h=42, ∅)");
 
         let wave = make_wave_id(0, BlockHeight::new(42), &[2, 5]);
-        assert_eq!(wave.to_string(), "Wave(shard=0, h=42, {2,5})");
+        assert_eq!(wave.to_string(), "Wave(shard=8, h=42, {10,13})");
     }
 
     #[test]
@@ -134,28 +134,30 @@ mod tests {
     #[test]
     fn test_compute_provision_tx_roots_empty() {
         let topology = two_shard_topology();
-        let map = Verified::<ProvisionTxRootsMap>::compute(ShardGroupId::new(0), &topology, &[]);
+        let map =
+            Verified::<ProvisionTxRootsMap>::compute(ShardGroupId::leaf(1, 0), &topology, &[]);
         assert!(map.is_empty());
     }
 
     #[test]
     fn test_compute_provision_tx_roots_single_shard_excluded() {
         let topology = two_shard_topology();
-        let local_node = node_on_shard(&topology, ShardGroupId::new(0));
+        let local_node = node_on_shard(&topology, ShardGroupId::leaf(1, 0));
         let tx = Arc::new(Verifiable::from(test_transaction_with_nodes(
             &[1, 2, 3],
             vec![local_node],
             vec![local_node],
         )));
-        let map = Verified::<ProvisionTxRootsMap>::compute(ShardGroupId::new(0), &topology, &[tx]);
+        let map =
+            Verified::<ProvisionTxRootsMap>::compute(ShardGroupId::leaf(1, 0), &topology, &[tx]);
         assert!(map.is_empty(), "single-shard tx must not produce an entry");
     }
 
     #[test]
     fn test_compute_provision_tx_roots_covers_all_touched_targets() {
         let topology = two_shard_topology();
-        let local_node = node_on_shard(&topology, ShardGroupId::new(0));
-        let remote_node = node_on_shard(&topology, ShardGroupId::new(1));
+        let local_node = node_on_shard(&topology, ShardGroupId::leaf(1, 0));
+        let remote_node = node_on_shard(&topology, ShardGroupId::leaf(1, 1));
 
         // Cross-shard tx: writes span local shard 0 and remote shard 1.
         let tx_a = Arc::new(Verifiable::from(test_transaction_with_nodes(
@@ -170,20 +172,20 @@ mod tests {
         )));
 
         let roots = Verified::<ProvisionTxRootsMap>::compute(
-            ShardGroupId::new(0),
+            ShardGroupId::leaf(1, 0),
             &topology,
             &[tx_a.clone(), tx_b.clone()],
         );
 
         // Local shard excluded; only shard 1 receives provisions.
         assert_eq!(roots.len(), 1);
-        assert!(roots.contains_key(&ShardGroupId::new(1)));
+        assert!(roots.contains_key(&ShardGroupId::leaf(1, 1)));
 
         let expected = ProvisionTxRoot::from_raw(compute_merkle_root(&[
             tx_a.hash().into_raw(),
             tx_b.hash().into_raw(),
         ]));
-        assert_eq!(roots[&ShardGroupId::new(1)], expected);
+        assert_eq!(roots[&ShardGroupId::leaf(1, 1)], expected);
     }
 
     #[test]

@@ -139,7 +139,7 @@ mod tests {
 
     #[test]
     fn test_block_vote_message_deterministic() {
-        let shard = ShardGroupId::new(1);
+        let shard = ShardGroupId::ROOT;
         let block = BlockHash::from_raw(Hash::from_bytes(b"test_block"));
         let parent = BlockHash::from_raw(Hash::from_bytes(b"parent_block"));
 
@@ -166,7 +166,7 @@ mod tests {
 
     #[test]
     fn block_vote_message_binds_parent_block_hash() {
-        let shard = ShardGroupId::new(1);
+        let shard = ShardGroupId::ROOT;
         let block = BlockHash::from_raw(Hash::from_bytes(b"test_block"));
         let parent_a = BlockHash::from_raw(Hash::from_bytes(b"parent_a"));
         let parent_b = BlockHash::from_raw(Hash::from_bytes(b"parent_b"));
@@ -195,7 +195,7 @@ mod tests {
 
     #[test]
     fn test_certified_block_header_message_deterministic() {
-        let shard = ShardGroupId::new(1);
+        let shard = ShardGroupId::ROOT;
         let block = BlockHash::from_raw(Hash::from_bytes(b"test_block"));
 
         let msg1 = certified_block_header_message(&net(), shard, BlockHeight::new(10), &block);
@@ -207,7 +207,7 @@ mod tests {
 
     #[test]
     fn test_block_header_message_deterministic() {
-        let shard = ShardGroupId::new(1);
+        let shard = ShardGroupId::ROOT;
         let block = BlockHash::from_raw(Hash::from_bytes(b"test_block"));
 
         let msg1 =
@@ -221,7 +221,7 @@ mod tests {
 
     #[test]
     fn test_block_header_differs_from_block_vote() {
-        let shard = ShardGroupId::new(1);
+        let shard = ShardGroupId::ROOT;
         let block = BlockHash::from_raw(Hash::from_bytes(b"test_block"));
 
         let parent = BlockHash::from_raw(Hash::from_bytes(b"parent_block"));
@@ -242,7 +242,7 @@ mod tests {
 
     #[test]
     fn block_vote_message_differs_across_networks() {
-        let shard = ShardGroupId::new(1);
+        let shard = ShardGroupId::ROOT;
         let block = BlockHash::from_raw(Hash::from_bytes(b"test_block"));
 
         let parent = BlockHash::from_raw(Hash::from_bytes(b"parent_block"));

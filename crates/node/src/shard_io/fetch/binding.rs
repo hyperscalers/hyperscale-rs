@@ -807,8 +807,8 @@ mod tests {
             TxHash,
         };
         let asked = Arc::new(Provisions::new(
-            ShardGroupId::new(1),
-            ShardGroupId::new(2),
+            ShardGroupId::leaf(2, 1),
+            ShardGroupId::leaf(2, 2),
             BlockHeight::new(10),
             MerkleInclusionProof::dummy(),
             vec![ProvisionEntry::new(
@@ -819,8 +819,8 @@ mod tests {
             )],
         ));
         let extra = Arc::new(Provisions::new(
-            ShardGroupId::new(3),
-            ShardGroupId::new(2),
+            ShardGroupId::leaf(2, 3),
+            ShardGroupId::leaf(2, 2),
             BlockHeight::new(11),
             MerkleInclusionProof::dummy(),
             vec![ProvisionEntry::new(

@@ -519,7 +519,7 @@ mod tests {
     use super::*;
 
     fn sample_header() -> BlockHeader {
-        BlockHeader::genesis(ShardGroupId::new(0), ValidatorId::new(0), StateRoot::ZERO)
+        BlockHeader::genesis(ShardGroupId::ROOT, ValidatorId::new(0), StateRoot::ZERO)
     }
 
     /// Hand-roll a `BlockHeader` whose `waves` length prefix exceeds the cap.
@@ -645,7 +645,7 @@ mod tests {
     #[test]
     fn with_verified_parent_qc_rejects_mismatched_witness() {
         let header = sample_header();
-        let other_shard = ShardGroupId::new(header.shard_group_id().inner() + 1);
+        let other_shard = ShardGroupId::from_heap_index(header.shard_group_id().inner() + 1);
         let mismatched = Verified::<QuorumCertificate>::genesis(other_shard);
         let err = Verified::<BlockHeader>::with_verified_parent_qc(header, mismatched)
             .expect_err("mismatched parent_qc rejected");

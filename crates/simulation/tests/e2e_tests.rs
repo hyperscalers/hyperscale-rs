@@ -594,9 +594,9 @@ fn test_e2e_cross_shard_transaction() {
         let hs_node_id = NodeId(node_id.0[..30].try_into().unwrap());
         let shard = shard_for_node(&hs_node_id, num_shards);
 
-        if shard == ShardGroupId::new(0) && shard0_keypair.is_none() {
+        if shard == ShardGroupId::leaf(1, 0) && shard0_keypair.is_none() {
             shard0_keypair = Some((seed, kp, account));
-        } else if shard == ShardGroupId::new(1) && shard1_keypair.is_none() {
+        } else if shard == ShardGroupId::leaf(1, 1) && shard1_keypair.is_none() {
             shard1_keypair = Some((seed, kp, account));
         }
 

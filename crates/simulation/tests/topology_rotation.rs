@@ -151,7 +151,7 @@ fn cross_shard_verification_survives_a_committee_rotation() {
     // proves every verifier resolved the rotated set from the header's WT (the
     // pre-shuffle set's signer bitfield would misalign) across a real rotation.
     for (verifier, source) in [(1u32, 0u32), (0u32, 1u32)] {
-        let source_shard = ShardGroupId::new(u64::from(source));
+        let source_shard = ShardGroupId::leaf(1, u64::from(source));
         let source_tip = max_committed_height(&runner, shard_hosts(source));
         let epoch = highest_verified_committee_epoch(
             &runner,

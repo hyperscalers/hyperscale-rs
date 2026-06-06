@@ -79,9 +79,9 @@ mod tests {
     #[test]
     fn push_then_drain_returns_all_values_across_shards() {
         let mut buf: AwaitingTopologyBuffer<u32> = AwaitingTopologyBuffer::new();
-        buf.push(ShardGroupId::new(0), 1);
-        buf.push(ShardGroupId::new(0), 2);
-        buf.push(ShardGroupId::new(1), 3);
+        buf.push(ShardGroupId::leaf(1, 0), 1);
+        buf.push(ShardGroupId::leaf(1, 0), 2);
+        buf.push(ShardGroupId::leaf(1, 1), 3);
         assert_eq!(buf.len(), 3);
         assert!(!buf.is_empty());
 
@@ -95,7 +95,7 @@ mod tests {
     #[test]
     fn push_drops_oldest_past_the_per_shard_cap() {
         let mut buf: AwaitingTopologyBuffer<usize> = AwaitingTopologyBuffer::new();
-        let shard = ShardGroupId::new(0);
+        let shard = ShardGroupId::leaf(1, 0);
         for i in 0..MAX_AWAITING_TOPOLOGY_PER_SHARD + 5 {
             buf.push(shard, i);
         }
@@ -112,8 +112,8 @@ mod tests {
     fn cap_is_independent_per_shard() {
         let mut buf: AwaitingTopologyBuffer<usize> = AwaitingTopologyBuffer::new();
         for i in 0..MAX_AWAITING_TOPOLOGY_PER_SHARD + 10 {
-            buf.push(ShardGroupId::new(0), i);
-            buf.push(ShardGroupId::new(1), i);
+            buf.push(ShardGroupId::leaf(1, 0), i);
+            buf.push(ShardGroupId::leaf(1, 1), i);
         }
         // Each shard is capped on its own; the cap doesn't pool across shards.
         assert_eq!(buf.len(), 2 * MAX_AWAITING_TOPOLOGY_PER_SHARD);

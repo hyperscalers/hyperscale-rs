@@ -143,7 +143,7 @@ mod tests {
 
     use super::*;
 
-    const SHARD: ShardGroupId = ShardGroupId::new(0);
+    const SHARD: ShardGroupId = ShardGroupId::ROOT;
 
     fn deposit(amount: u64) -> ShardWitnessPayload {
         ShardWitnessPayload::StakeDeposit {

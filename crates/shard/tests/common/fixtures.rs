@@ -10,5 +10,5 @@ use hyperscale_types::{Block, ShardGroupId, ValidatorId};
 #[must_use]
 pub fn build_genesis_block(storage: &SimShardStorage, proposer: ValidatorId) -> Block {
     let state_root = storage.state_root();
-    Block::genesis(ShardGroupId::new(0), proposer, state_root)
+    Block::genesis(ShardGroupId::ROOT, proposer, state_root)
 }

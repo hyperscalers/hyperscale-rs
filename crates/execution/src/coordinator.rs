@@ -2170,7 +2170,14 @@ mod tests {
     }
 
     fn make_test_state_for(me: ValidatorId) -> ExecutionCoordinator {
-        ExecutionCoordinator::new(me, ShardGroupId::new(0))
+        ExecutionCoordinator::new(me, ShardGroupId::ROOT)
+    }
+
+    fn make_test_state_for_shard(
+        me: ValidatorId,
+        local_shard: ShardGroupId,
+    ) -> ExecutionCoordinator {
+        ExecutionCoordinator::new(me, local_shard)
     }
 
     fn make_live_block(
@@ -2180,13 +2187,23 @@ mod tests {
         transactions: Vec<Arc<RoutableTransaction>>,
     ) -> Block {
         helpers_make_live_block(
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             height,
             timestamp_ms,
             proposer,
             transactions,
             vec![],
         )
+    }
+
+    fn make_live_block_on_shard(
+        shard: ShardGroupId,
+        height: BlockHeight,
+        timestamp_ms: u64,
+        proposer: ValidatorId,
+        transactions: Vec<Arc<RoutableTransaction>>,
+    ) -> Block {
+        helpers_make_live_block(shard, height, timestamp_ms, proposer, transactions, vec![])
     }
 
     fn certify(block: Block) -> CertifiedBlock {
@@ -2252,7 +2269,7 @@ mod tests {
         let topo0 = make_topology();
         let committee = topo0
             .head()
-            .committee_for_shard(ShardGroupId::new(0))
+            .committee_for_shard(ShardGroupId::ROOT)
             .to_vec();
         let block = make_live_block(
             BlockHeight::new(1),
@@ -2309,10 +2326,7 @@ mod tests {
     fn test_fallback_tracker_created_on_vote() {
         let tx = test_transaction(1);
         let topo = make_topology();
-        let committee = topo
-            .head()
-            .committee_for_shard(ShardGroupId::new(0))
-            .to_vec();
+        let committee = topo.head().committee_for_shard(ShardGroupId::ROOT).to_vec();
         let block = make_live_block(
             BlockHeight::new(1),
             1000,
@@ -2353,7 +2367,7 @@ mod tests {
             BlockHeight::new(1),
             WeightedTimestamp::ZERO,
             wave_id.clone(),
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             GlobalReceiptRoot::ZERO,
             1,
             vec![],
@@ -2378,20 +2392,24 @@ mod tests {
         // pool its cross-shard power into the tracker and trigger premature
         // aggregation that produces an EC the BLS verifier will reject.
         let topo = make_two_shard_topology();
-        let local = topo.head().committee_for_shard(ShardGroupId::new(0));
+        let local = topo.head().committee_for_shard(ShardGroupId::leaf(1, 0));
         let outsider = (0u64..4)
             .map(ValidatorId::new)
             .find(|v| !local.contains(v))
             .expect("two-shard topology has at least one non-local validator");
 
-        let mut state = make_test_state();
-        let wave_id = WaveId::new(ShardGroupId::new(0), BlockHeight::new(1), BTreeSet::new());
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardGroupId::leaf(1, 0));
+        let wave_id = WaveId::new(
+            ShardGroupId::leaf(1, 0),
+            BlockHeight::new(1),
+            BTreeSet::new(),
+        );
         let vote = ExecutionVote::new(
             BlockHash::ZERO,
             BlockHeight::new(1),
             WeightedTimestamp::ZERO,
             wave_id.clone(),
-            ShardGroupId::new(0),
+            ShardGroupId::leaf(1, 0),
             GlobalReceiptRoot::ZERO,
             0,
             vec![],
@@ -2415,12 +2433,9 @@ mod tests {
     #[test]
     fn test_vote_retry_timeout_emits_rotated_action() {
         use crate::waves::VOTE_RETRY_TIMEOUT;
-        let wave_id = WaveId::new(ShardGroupId::new(0), BlockHeight::new(1), BTreeSet::new());
+        let wave_id = WaveId::new(ShardGroupId::ROOT, BlockHeight::new(1), BTreeSet::new());
         let topo = make_test_topology();
-        let committee = topo
-            .head()
-            .committee_for_shard(ShardGroupId::new(0))
-            .to_vec();
+        let committee = topo.head().committee_for_shard(ShardGroupId::ROOT).to_vec();
 
         let mut state = make_test_state();
         state.committed_height = BlockHeight::new(20);
@@ -2478,7 +2493,7 @@ mod tests {
     #[test]
     fn test_vote_retry_cancelled_on_ec_receipt() {
         use crate::waves::VOTE_RETRY_TIMEOUT;
-        let wave_id = WaveId::new(ShardGroupId::new(0), BlockHeight::new(1), BTreeSet::new());
+        let wave_id = WaveId::new(ShardGroupId::ROOT, BlockHeight::new(1), BTreeSet::new());
         let topo = make_test_topology();
 
         let mut state = make_test_state();
@@ -2533,7 +2548,7 @@ mod tests {
         let mut state = make_test_state();
         state.committed_height = BlockHeight::new(10);
 
-        let wave_id = WaveId::new(ShardGroupId::new(0), BlockHeight::new(1), BTreeSet::new());
+        let wave_id = WaveId::new(ShardGroupId::ROOT, BlockHeight::new(1), BTreeSet::new());
 
         let mut signers = SignerBitfield::new(4);
         signers.set(0); // single signer — well below 2f+1 = 3
@@ -2576,7 +2591,7 @@ mod tests {
         let topo = make_test_topology();
         let mut state = make_test_state();
 
-        let wave_id = WaveId::new(ShardGroupId::new(0), BlockHeight::new(1), BTreeSet::new());
+        let wave_id = WaveId::new(ShardGroupId::ROOT, BlockHeight::new(1), BTreeSet::new());
         let mut signers = SignerBitfield::new(4);
         signers.set(0);
         signers.set(1);
@@ -2626,9 +2641,9 @@ mod tests {
     #[test]
     fn test_leader_broadcasts_ec_locally() {
         let wave_id = WaveId::new(
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             BlockHeight::new(1),
-            std::iter::once(ShardGroupId::new(1)).collect(),
+            std::iter::once(ShardGroupId::leaf(1, 1)).collect(),
         );
         let topo = make_test_topology();
 
@@ -2663,14 +2678,16 @@ mod tests {
 
         // One should be for the local shard (shard 0).
         let has_local = broadcast_actions.iter().any(|a| match a {
-            Action::BroadcastExecutionCertificate { shard, .. } => *shard == ShardGroupId::new(0),
+            Action::BroadcastExecutionCertificate { shard, .. } => *shard == ShardGroupId::ROOT,
             _ => false,
         });
         assert!(has_local, "Should include local shard broadcast");
 
         // One should be for the remote shard (shard 1).
         let has_remote = broadcast_actions.iter().any(|a| match a {
-            Action::BroadcastExecutionCertificate { shard, .. } => *shard == ShardGroupId::new(1),
+            Action::BroadcastExecutionCertificate { shard, .. } => {
+                *shard == ShardGroupId::leaf(1, 1)
+            }
             _ => false,
         });
         assert!(has_remote, "Should include remote shard broadcast");
@@ -2686,7 +2703,7 @@ mod tests {
         let topo = make_test_topology();
         let mut state = make_test_state();
 
-        let wave_id = WaveId::new(ShardGroupId::new(0), BlockHeight::new(1), BTreeSet::new());
+        let wave_id = WaveId::new(ShardGroupId::ROOT, BlockHeight::new(1), BTreeSet::new());
         let mut signers = SignerBitfield::new(4);
         signers.set(0);
         signers.set(1);
@@ -2723,7 +2740,7 @@ mod tests {
     #[test]
     fn on_finalized_wave_verified_drops_invalid() {
         let mut state = make_test_state();
-        let wave_id = WaveId::new(ShardGroupId::new(0), BlockHeight::new(1), BTreeSet::new());
+        let wave_id = WaveId::new(ShardGroupId::ROOT, BlockHeight::new(1), BTreeSet::new());
         let ec = Arc::new(ExecutionCertificate::new(
             wave_id.clone(),
             WeightedTimestamp::ZERO,
@@ -2768,7 +2785,7 @@ mod tests {
         let topo = make_test_topology();
         let mut state = make_test_state();
 
-        let wave_id = WaveId::new(ShardGroupId::new(0), BlockHeight::new(1), BTreeSet::new());
+        let wave_id = WaveId::new(ShardGroupId::ROOT, BlockHeight::new(1), BTreeSet::new());
         // Only one signer in a 4-validator committee — sub-quorum
         // (2f+1=3 needed).
         let mut signers = SignerBitfield::new(4);
@@ -2820,13 +2837,17 @@ mod tests {
 
         // EC for a shard the test topology doesn't know about — the
         // committee-keys lookup returns `None` and triggers the gate.
-        let wave_id = WaveId::new(ShardGroupId::new(0), BlockHeight::new(1), BTreeSet::new());
+        let wave_id = WaveId::new(ShardGroupId::ROOT, BlockHeight::new(1), BTreeSet::new());
         let mut signers = SignerBitfield::new(4);
         signers.set(0);
         signers.set(1);
         signers.set(2);
         let ec = Arc::new(ExecutionCertificate::new(
-            WaveId::new(ShardGroupId::new(99), BlockHeight::new(1), BTreeSet::new()),
+            WaveId::new(
+                ShardGroupId::leaf(8, 99),
+                BlockHeight::new(1),
+                BTreeSet::new(),
+            ),
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
             vec![],
@@ -2865,7 +2886,7 @@ mod tests {
     #[test]
     fn on_finalized_wave_verified_admits_valid() {
         let mut state = make_test_state();
-        let wave_id = WaveId::new(ShardGroupId::new(0), BlockHeight::new(1), BTreeSet::new());
+        let wave_id = WaveId::new(ShardGroupId::ROOT, BlockHeight::new(1), BTreeSet::new());
         let ec = Arc::new(ExecutionCertificate::new(
             wave_id.clone(),
             WeightedTimestamp::ZERO,
@@ -2894,7 +2915,7 @@ mod tests {
         let topo = make_test_topology();
         let mut state = make_test_state();
 
-        let wave_id = WaveId::new(ShardGroupId::new(0), BlockHeight::new(1), BTreeSet::new());
+        let wave_id = WaveId::new(ShardGroupId::ROOT, BlockHeight::new(1), BTreeSet::new());
         let mut signers = SignerBitfield::new(4);
         signers.set(0);
         signers.set(1);
@@ -2929,7 +2950,7 @@ mod tests {
         let topo = make_test_topology();
         let mut state = make_test_state();
 
-        let wave_id = WaveId::new(ShardGroupId::new(0), BlockHeight::new(1), BTreeSet::new());
+        let wave_id = WaveId::new(ShardGroupId::ROOT, BlockHeight::new(1), BTreeSet::new());
         let mut signers = SignerBitfield::new(4);
         signers.set(0);
         signers.set(1);
@@ -2969,7 +2990,7 @@ mod tests {
         let topo = make_test_topology();
         let mut state = make_test_state();
 
-        let wave_id = WaveId::new(ShardGroupId::new(0), BlockHeight::new(1), BTreeSet::new());
+        let wave_id = WaveId::new(ShardGroupId::ROOT, BlockHeight::new(1), BTreeSet::new());
         let mut signers = SignerBitfield::new(4);
         signers.set(0);
         signers.set(1);
@@ -3002,7 +3023,7 @@ mod tests {
         let topo = make_test_topology();
         let mut state = make_test_state();
 
-        let wave_id = WaveId::new(ShardGroupId::new(0), BlockHeight::new(1), BTreeSet::new());
+        let wave_id = WaveId::new(ShardGroupId::ROOT, BlockHeight::new(1), BTreeSet::new());
         let mut signers_a = SignerBitfield::new(4);
         signers_a.set(0);
         signers_a.set(1);
@@ -3048,7 +3069,7 @@ mod tests {
         let topo = make_test_topology();
         let mut state = make_test_state();
 
-        let wave_id = WaveId::new(ShardGroupId::new(0), BlockHeight::new(1), BTreeSet::new());
+        let wave_id = WaveId::new(ShardGroupId::ROOT, BlockHeight::new(1), BTreeSet::new());
         let mut signers = SignerBitfield::new(4);
         signers.set(0);
         signers.set(1);
@@ -3080,7 +3101,7 @@ mod tests {
         let topo = make_test_topology();
         let mut state = make_test_state();
 
-        let wave_id = WaveId::new(ShardGroupId::new(0), BlockHeight::new(1), BTreeSet::new());
+        let wave_id = WaveId::new(ShardGroupId::ROOT, BlockHeight::new(1), BTreeSet::new());
         let mut signers = SignerBitfield::new(4);
         signers.set(0);
         signers.set(1);
@@ -3115,9 +3136,13 @@ mod tests {
     #[test]
     fn test_admit_finalized_wave_rejects_subquorum_ec() {
         let topo = make_two_shard_topology();
-        let mut state = make_test_state();
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardGroupId::leaf(1, 0));
 
-        let wave_id = WaveId::new(ShardGroupId::new(0), BlockHeight::new(1), BTreeSet::new());
+        let wave_id = WaveId::new(
+            ShardGroupId::leaf(1, 0),
+            BlockHeight::new(1),
+            BTreeSet::new(),
+        );
         let bogus_ec = Arc::new(ExecutionCertificate::new(
             wave_id.clone(),
             WeightedTimestamp::from_millis(1_000_000),
@@ -3163,13 +3188,13 @@ mod tests {
     #[test]
     fn test_on_wave_certificate_does_not_mark_fulfilled_before_verification() {
         let topo = make_two_shard_topology();
-        let mut state = make_test_state();
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardGroupId::leaf(1, 0));
 
-        let remote_shard = ShardGroupId::new(1);
+        let remote_shard = ShardGroupId::leaf(1, 1);
         let wave_id = WaveId::new(
             remote_shard,
             BlockHeight::new(5),
-            std::iter::once(ShardGroupId::new(0)).collect(),
+            std::iter::once(ShardGroupId::leaf(1, 0)).collect(),
         );
         state.on_verified_remote_header(
             remote_shard,
@@ -3220,13 +3245,13 @@ mod tests {
     #[test]
     fn test_on_wave_certificate_always_dispatches_verification_even_without_tracker() {
         let topo = make_two_shard_topology();
-        let mut state = make_test_state();
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardGroupId::leaf(1, 0));
 
-        let remote_shard = ShardGroupId::new(1);
+        let remote_shard = ShardGroupId::leaf(1, 1);
         let wave_id = WaveId::new(
             remote_shard,
             BlockHeight::new(5),
-            std::iter::once(ShardGroupId::new(0)).collect(),
+            std::iter::once(ShardGroupId::leaf(1, 0)).collect(),
         );
         // No local waves / trackers have been created for this tx.
         let cert = ExecutionCertificate::new(
@@ -3307,7 +3332,7 @@ mod tests {
     #[test]
     fn remote_ec_verification_resolves_committee_at_its_vote_anchor() {
         const ED: u64 = 1_000;
-        let shard = ShardGroupId::new(0);
+        let shard = ShardGroupId::ROOT;
 
         let (snap_a, keys_a) = committee_snapshot(&[0, 1, 2, 3]);
         let (snap_b, keys_b) = committee_snapshot(&[4, 5, 6, 7]);
@@ -3350,7 +3375,7 @@ mod tests {
     #[test]
     fn local_aggregation_packs_committee_at_vote_anchor() {
         const ED: u64 = 1_000;
-        let shard = ShardGroupId::new(0);
+        let shard = ShardGroupId::ROOT;
 
         let (snap_a, _keys_a) = committee_snapshot(&[0, 1, 2, 3]);
         let (snap_b, _keys_b) = committee_snapshot(&[4, 5, 6, 7]);
@@ -3413,7 +3438,7 @@ mod tests {
     #[test]
     fn cross_shard_ec_buffers_when_beacon_behind_then_drains_on_catch_up() {
         const ED: u64 = 1_000;
-        let shard = ShardGroupId::new(0);
+        let shard = ShardGroupId::ROOT;
 
         // Schedule holds only epoch 5; an EC anchored in epoch 0 can't resolve.
         let behind = TopologySchedule::new(
@@ -3453,7 +3478,7 @@ mod tests {
     #[test]
     fn finalized_wave_buffers_when_beacon_behind_then_drains_on_catch_up() {
         const ED: u64 = 1_000;
-        let shard = ShardGroupId::new(0);
+        let shard = ShardGroupId::ROOT;
 
         let behind = TopologySchedule::new(
             ED,
@@ -3510,13 +3535,13 @@ mod tests {
         use hyperscale_types::test_utils::test_transaction;
 
         let _topo = make_two_shard_topology();
-        let mut state = make_test_state();
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardGroupId::leaf(1, 0));
 
-        let remote_shard = ShardGroupId::new(1);
+        let remote_shard = ShardGroupId::leaf(1, 1);
         let remote_wave = WaveId::new(
             remote_shard,
             BlockHeight::new(5),
-            std::iter::once(ShardGroupId::new(0)).collect(),
+            std::iter::once(ShardGroupId::leaf(1, 0)).collect(),
         );
         state.on_verified_remote_header(
             remote_shard,
@@ -3531,14 +3556,14 @@ mod tests {
 
         // Simulate an outstanding local cross-shard wave needing shard 1's EC.
         let local_wave = WaveId::new(
-            ShardGroupId::new(0),
+            ShardGroupId::leaf(1, 0),
             BlockHeight::new(10),
             std::iter::once(remote_shard).collect(),
         );
         let tx = Arc::new(test_transaction(7));
         let tx_hash = tx.hash();
         let mut participating = BTreeSet::new();
-        participating.insert(ShardGroupId::new(0));
+        participating.insert(ShardGroupId::leaf(1, 0));
         participating.insert(remote_shard);
         state.waves.insert_wave(
             local_wave.clone(),
@@ -3594,12 +3619,12 @@ mod tests {
     /// has an execution result and a local receipt, and the local EC has
     /// been added. `WaveState::is_complete` returns true.
     fn make_ready_single_shard_wave(tx_seeds: &[u8]) -> (WaveId, WaveState) {
-        let wave_id = WaveId::new(ShardGroupId::new(0), BlockHeight::new(1), BTreeSet::new());
+        let wave_id = WaveId::new(ShardGroupId::ROOT, BlockHeight::new(1), BTreeSet::new());
         let txs: Vec<(Arc<Verifiable<RoutableTransaction>>, BTreeSet<ShardGroupId>)> = tx_seeds
             .iter()
             .map(|s| {
                 let mut participating = BTreeSet::new();
-                participating.insert(ShardGroupId::new(0));
+                participating.insert(ShardGroupId::ROOT);
                 (
                     Arc::new(Verifiable::from(test_transaction(*s))),
                     participating,
@@ -3699,7 +3724,7 @@ mod tests {
     #[test]
     fn test_finalize_wave_is_noop_for_absent_wave_id() {
         let mut state = make_test_state();
-        let unknown = WaveId::new(ShardGroupId::new(0), BlockHeight::new(99), BTreeSet::new());
+        let unknown = WaveId::new(ShardGroupId::ROOT, BlockHeight::new(99), BTreeSet::new());
         let actions = state.finalize_wave(&unknown);
         assert!(actions.is_empty());
         assert!(state.finalized.is_empty());
@@ -3722,7 +3747,7 @@ mod tests {
         state.waves.assign_tx(tx_hash, wave_id.clone());
         state
             .provisioning
-            .record_required(tx_hash, std::iter::once(ShardGroupId::new(1)).collect());
+            .record_required(tx_hash, std::iter::once(ShardGroupId::leaf(1, 1)).collect());
         // Drive finalize_wave to populate the FinalizedWaveStore naturally.
         let _ = state.finalize_wave(&wave_id);
         let finalized = state
@@ -3757,14 +3782,14 @@ mod tests {
     #[test]
     fn test_first_commit_retro_stamps_expected_certs_and_suppresses_fallback() {
         let topo = make_two_shard_topology();
-        let mut state = make_test_state();
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardGroupId::leaf(1, 0));
 
         // Pre-first-commit: register an expectation. discovered_at is ZERO.
-        let remote_shard = ShardGroupId::new(1);
+        let remote_shard = ShardGroupId::leaf(1, 1);
         let remote_wave = WaveId::new(
             remote_shard,
             BlockHeight::new(5),
-            std::iter::once(ShardGroupId::new(0)).collect(),
+            std::iter::once(ShardGroupId::leaf(1, 0)).collect(),
         );
         state.on_verified_remote_header(
             remote_shard,
@@ -3774,13 +3799,13 @@ mod tests {
         // Also seed a local wave that needs shard 1's EC, so the retention
         // check in `check_exec_cert_timeouts` keeps the expectation alive.
         let local_wave = WaveId::new(
-            ShardGroupId::new(0),
+            ShardGroupId::leaf(1, 0),
             BlockHeight::new(10),
             std::iter::once(remote_shard).collect(),
         );
         let tx = Arc::new(test_transaction(1));
         let mut participating = BTreeSet::new();
-        participating.insert(ShardGroupId::new(0));
+        participating.insert(ShardGroupId::leaf(1, 0));
         participating.insert(remote_shard);
         state.waves.insert_wave(
             local_wave.clone(),
@@ -3795,7 +3820,13 @@ mod tests {
 
         // Commit the first block with a QC weighted_timestamp that, without
         // retro-stamping, would imply an elapsed_since of ~billions of ms.
-        let block = make_live_block(BlockHeight::new(1), 30_000, ValidatorId::new(0), vec![]);
+        let block = make_live_block_on_shard(
+            ShardGroupId::leaf(1, 0),
+            BlockHeight::new(1),
+            30_000,
+            ValidatorId::new(0),
+            vec![],
+        );
         let (block, qc) = certify(block).into_parts();
         let qc = QuorumCertificate::new(
             qc.block_hash(),

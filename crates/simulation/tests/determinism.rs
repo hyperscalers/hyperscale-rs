@@ -53,7 +53,7 @@ fn test_schedule_initial_events() {
         runner.schedule_initial_event(
             node,
             Duration::from_millis(100),
-            ShardEvent::protocol(ShardGroupId::new(0), ProtocolEvent::CleanupTimer),
+            ShardEvent::protocol(ShardGroupId::ROOT, ProtocolEvent::CleanupTimer),
         );
     }
 
@@ -80,7 +80,7 @@ fn test_determinism_same_seed() {
         runner1.schedule_initial_event(
             node,
             Duration::from_millis(100),
-            ShardEvent::protocol(ShardGroupId::new(0), ProtocolEvent::CleanupTimer),
+            ShardEvent::protocol(ShardGroupId::ROOT, ProtocolEvent::CleanupTimer),
         );
     }
     runner1.run_until(Duration::from_secs(1));
@@ -92,7 +92,7 @@ fn test_determinism_same_seed() {
         runner2.schedule_initial_event(
             node,
             Duration::from_millis(100),
-            ShardEvent::protocol(ShardGroupId::new(0), ProtocolEvent::CleanupTimer),
+            ShardEvent::protocol(ShardGroupId::ROOT, ProtocolEvent::CleanupTimer),
         );
     }
     runner2.run_until(Duration::from_secs(1));
@@ -128,7 +128,7 @@ fn test_different_seeds_diverge() {
         runner1.schedule_initial_event(
             node,
             Duration::from_millis(100),
-            ShardEvent::protocol(ShardGroupId::new(0), ProtocolEvent::CleanupTimer),
+            ShardEvent::protocol(ShardGroupId::ROOT, ProtocolEvent::CleanupTimer),
         );
     }
     runner1.run_until(Duration::from_secs(1));
@@ -139,7 +139,7 @@ fn test_different_seeds_diverge() {
         runner2.schedule_initial_event(
             node,
             Duration::from_millis(100),
-            ShardEvent::protocol(ShardGroupId::new(0), ProtocolEvent::CleanupTimer),
+            ShardEvent::protocol(ShardGroupId::ROOT, ProtocolEvent::CleanupTimer),
         );
     }
     runner2.run_until(Duration::from_secs(1));
@@ -176,7 +176,7 @@ fn test_multi_shard_simulation() {
         runner.schedule_initial_event(
             node,
             Duration::from_millis(100),
-            ShardEvent::protocol(ShardGroupId::new(0), ProtocolEvent::CleanupTimer),
+            ShardEvent::protocol(ShardGroupId::leaf(1, 0), ProtocolEvent::CleanupTimer),
         );
     }
 
@@ -203,7 +203,7 @@ fn test_round_advancement_via_view_change_timer() {
         runner.schedule_initial_event(
             node,
             Duration::from_millis(100),
-            ShardEvent::protocol(ShardGroupId::new(0), ProtocolEvent::CleanupTimer),
+            ShardEvent::protocol(ShardGroupId::ROOT, ProtocolEvent::CleanupTimer),
         );
     }
 
@@ -256,7 +256,7 @@ fn test_extended_simulation_determinism() {
         runner1.schedule_initial_event(
             node,
             Duration::from_millis(100),
-            ShardEvent::protocol(ShardGroupId::new(0), ProtocolEvent::CleanupTimer),
+            ShardEvent::protocol(ShardGroupId::ROOT, ProtocolEvent::CleanupTimer),
         );
     }
     runner1.run_until(Duration::from_secs(5));
@@ -268,7 +268,7 @@ fn test_extended_simulation_determinism() {
         runner2.schedule_initial_event(
             node,
             Duration::from_millis(100),
-            ShardEvent::protocol(ShardGroupId::new(0), ProtocolEvent::CleanupTimer),
+            ShardEvent::protocol(ShardGroupId::ROOT, ProtocolEvent::CleanupTimer),
         );
     }
     runner2.run_until(Duration::from_secs(5));
@@ -386,7 +386,7 @@ fn test_full_consensus_simulation() {
 #[test]
 fn test_multi_shard_genesis() {
     let config = NetworkConfig {
-        num_shards: 3,
+        num_shards: 4,
         validators_per_shard: 4,
         intra_shard_latency: Duration::from_millis(100),
         cross_shard_latency: Duration::from_millis(100),
@@ -404,14 +404,14 @@ fn test_multi_shard_genesis() {
 
     let stats = runner.stats();
 
-    // Should have initialized 12 nodes (3 shards * 4 validators)
+    // Should have initialized 16 nodes (4 shards * 4 validators)
     // Each shard gets its own genesis block
     assert!(
-        stats.timers_set >= 12,
-        "Should have set timers for all 12 nodes"
+        stats.timers_set >= 16,
+        "Should have set timers for all 16 nodes"
     );
     assert!(
-        stats.events_processed >= 12,
+        stats.events_processed >= 16,
         "Should have processed events from all nodes"
     );
 }
@@ -1447,7 +1447,7 @@ fn test_multi_shard_initialization() {
     for node_idx in 0..4u32 {
         let node = runner.node(node_idx).expect("Node should exist");
         assert_eq!(
-            node.shard_id().inner(),
+            node.shard_id().path(),
             0,
             "Node {node_idx} should be in shard 0"
         );
@@ -1462,7 +1462,7 @@ fn test_multi_shard_initialization() {
     for node_idx in 4..8u32 {
         let node = runner.node(node_idx).expect("Node should exist");
         assert_eq!(
-            node.shard_id().inner(),
+            node.shard_id().path(),
             1,
             "Node {node_idx} should be in shard 1"
         );
@@ -1569,8 +1569,8 @@ fn test_cross_shard_latency() {
     );
 
     // Verify shard assignment
-    assert_eq!(shard_0.inner(), 0);
-    assert_eq!(shard_4.inner(), 1);
+    assert_eq!(shard_0.path(), 0);
+    assert_eq!(shard_4.path(), 1);
 
     println!("Cross-shard latency test passed");
     println!("  Intra-shard latency: {:?}", config.intra_shard_latency);
@@ -1604,11 +1604,11 @@ fn test_cross_shard_transaction_detection() {
     // Build shard committees
     let mut shard_committees: HashMap<ShardGroupId, Vec<ValidatorId>> = HashMap::new();
     shard_committees.insert(
-        ShardGroupId::new(0),
+        ShardGroupId::leaf(1, 0),
         vec![ValidatorId::new(0), ValidatorId::new(1)],
     );
     shard_committees.insert(
-        ShardGroupId::new(1),
+        ShardGroupId::leaf(1, 1),
         vec![ValidatorId::new(2), ValidatorId::new(3)],
     );
 
@@ -1635,7 +1635,7 @@ fn test_cross_shard_transaction_detection() {
     // Create a single-shard transaction (all nodes in same shard)
     let same_shard_nodes: Vec<_> = (0..10u8)
         .map(test_node)
-        .filter(|n| topology.shard_for_node_id(n) == ShardGroupId::new(0))
+        .filter(|n| topology.shard_for_node_id(n) == ShardGroupId::leaf(1, 0))
         .take(2)
         .collect();
 
@@ -1653,10 +1653,10 @@ fn test_cross_shard_transaction_detection() {
     // Create a cross-shard transaction (nodes in different shards)
     let shard0_node = (0..255u8)
         .map(test_node)
-        .find(|n| topology.shard_for_node_id(n) == ShardGroupId::new(0));
+        .find(|n| topology.shard_for_node_id(n) == ShardGroupId::leaf(1, 0));
     let shard1_node = (0..255u8)
         .map(test_node)
-        .find(|n| topology.shard_for_node_id(n) == ShardGroupId::new(1));
+        .find(|n| topology.shard_for_node_id(n) == ShardGroupId::leaf(1, 1));
 
     if let (Some(node0), Some(node1)) = (shard0_node, shard1_node) {
         let tx = test_transaction_with_nodes(b"cross_shard_tx", vec![node0], vec![node1]);

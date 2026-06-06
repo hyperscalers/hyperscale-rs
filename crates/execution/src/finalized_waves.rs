@@ -207,7 +207,7 @@ mod tests {
 
     fn make_wave_id(block_height: u64) -> WaveId {
         WaveId::new(
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             BlockHeight::new(block_height),
             BTreeSet::new(),
         )

@@ -329,7 +329,7 @@ mod tests {
         let net = NetworkDefinition::simulator();
         let message = block_vote_message(
             &net,
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             BlockHeight::new(1),
             Round::INITIAL,
             &BlockHash::from_raw(Hash::from_bytes(&[1u8; 32])),
@@ -342,7 +342,7 @@ mod tests {
                 let pk = sk.public_key();
                 let vote = BlockVote::from_parts(
                     BlockHash::from_raw(Hash::from_bytes(&[1u8; 32])),
-                    ShardGroupId::new(0),
+                    ShardGroupId::ROOT,
                     BlockHeight::new(1),
                     Round::INITIAL,
                     ValidatorId::new(i),
@@ -366,7 +366,7 @@ mod tests {
         let net = NetworkDefinition::simulator();
         let message = block_vote_message(
             &net,
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             BlockHeight::new(1),
             Round::INITIAL,
             &BlockHash::from_raw(Hash::from_bytes(&[2u8; 32])),
@@ -379,7 +379,7 @@ mod tests {
             let pk = sk.public_key();
             let vote = BlockVote::from_parts(
                 BlockHash::from_raw(Hash::from_bytes(&[2u8; 32])),
-                ShardGroupId::new(0),
+                ShardGroupId::ROOT,
                 BlockHeight::new(1),
                 Round::INITIAL,
                 ValidatorId::new(i),

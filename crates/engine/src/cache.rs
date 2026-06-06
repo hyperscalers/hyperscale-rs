@@ -318,7 +318,7 @@ mod tests {
     }
 
     fn shard(n: u64) -> ShardGroupId {
-        ShardGroupId::new(n)
+        ShardGroupId::leaf(3, n)
     }
 
     fn hosted(shards: &[u64]) -> HashSet<ShardGroupId> {

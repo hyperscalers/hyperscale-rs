@@ -441,8 +441,7 @@ impl RemoteHeaderCoordinator {
         }
 
         // Seed expected headers for remote shards we haven't seen yet.
-        for shard_id in 0..topology.num_shards() {
-            let shard = ShardGroupId::new(shard_id);
+        for shard in topology.shard_trie().leaves() {
             if shard == self.local_shard {
                 continue;
             }
@@ -707,7 +706,7 @@ mod tests {
 
     #[test]
     fn test_new_coordinator_is_empty() {
-        let coord = RemoteHeaderCoordinator::new(ShardGroupId::new(0));
+        let coord = RemoteHeaderCoordinator::new(ShardGroupId::leaf(2, 0));
         let stats = coord.memory_stats();
         assert_eq!(stats.pending_headers, 0);
         assert_eq!(stats.verified_headers, 0);
@@ -718,10 +717,10 @@ mod tests {
     fn test_structural_precheck_rejects_mismatched_qc_hash() {
         // This test verifies the structural pre-check without needing a real topology.
         let header = BlockHeader::new(
-            ShardGroupId::new(2),
+            ShardGroupId::leaf(2, 2),
             BlockHeight::new(5),
             BlockHash::ZERO,
-            QuorumCertificate::genesis(ShardGroupId::new(0)),
+            QuorumCertificate::genesis(ShardGroupId::leaf(2, 0)),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(1_234_567_890),
             Round::INITIAL,
@@ -740,7 +739,7 @@ mod tests {
         // Deliberately set wrong block_hash
         let qc = QuorumCertificate::new(
             BlockHash::from_raw(Hash::from_bytes(b"wrong")),
-            ShardGroupId::new(2),
+            ShardGroupId::leaf(2, 2),
             BlockHeight::new(5),
             BlockHash::ZERO,
             Round::INITIAL,
@@ -750,7 +749,7 @@ mod tests {
         );
 
         let committed = CertifiedBlockHeader::new(header, qc);
-        let _coord = RemoteHeaderCoordinator::new(ShardGroupId::new(0));
+        let _coord = RemoteHeaderCoordinator::new(ShardGroupId::leaf(2, 0));
 
         // The structural check happens inside on_remote_header_received which
         // needs a topology. We test the logic directly here by checking the
@@ -760,13 +759,13 @@ mod tests {
 
     #[test]
     fn test_get_verified_returns_none_when_empty() {
-        let coord = RemoteHeaderCoordinator::new(ShardGroupId::new(0));
+        let coord = RemoteHeaderCoordinator::new(ShardGroupId::leaf(2, 0));
         assert!(
             coord
-                .get_verified(ShardGroupId::new(1), BlockHeight::new(5))
+                .get_verified(ShardGroupId::leaf(2, 1), BlockHeight::new(5))
                 .is_none()
         );
-        assert!(!coord.has_verified(ShardGroupId::new(1), BlockHeight::new(5)));
+        assert!(!coord.has_verified(ShardGroupId::leaf(2, 1), BlockHeight::new(5)));
     }
 
     /// A snapshot over `ids` across `num_shards` (`shard = id % num_shards`).
@@ -860,7 +859,7 @@ mod tests {
         // epoch 1. A header whose parent QC weighted timestamp is in epoch 1
         // must dispatch verification against the epoch-1 keys, not the head's.
         const ED: u64 = 1_000;
-        let remote = ShardGroupId::new(1);
+        let remote = ShardGroupId::leaf(1, 1);
         let ids = [0u64, 1, 2, 3]; // shard 1's committee is the odd ids {1, 3}
 
         let snap_a = shard_snapshot(2, &ids, 0);
@@ -874,7 +873,7 @@ mod tests {
         let mut schedule = TopologySchedule::new(ED, 100, Epoch::new(0), Arc::new(snap_a));
         schedule.insert(Epoch::new(1), Arc::new(snap_b));
 
-        let mut coord = RemoteHeaderCoordinator::new(ShardGroupId::new(0));
+        let mut coord = RemoteHeaderCoordinator::new(ShardGroupId::leaf(1, 0));
         let header = remote_header(remote, BlockHeight::new(5), ED); // parent WT in epoch 1
         let actions = coord.on_remote_header_received(&schedule, header, ValidatorId::new(1));
 
@@ -888,13 +887,13 @@ mod tests {
     #[test]
     fn remote_header_buffers_when_beacon_behind_then_drains_on_catch_up() {
         const ED: u64 = 1_000;
-        let remote = ShardGroupId::new(1);
+        let remote = ShardGroupId::leaf(1, 1);
         let ids = [0u64, 1, 2, 3];
 
         // Schedule holds only epoch 5; a header anchored in epoch 0 can't resolve.
         let behind =
             TopologySchedule::new(ED, 1, Epoch::new(5), Arc::new(shard_snapshot(2, &ids, 0)));
-        let mut coord = RemoteHeaderCoordinator::new(ShardGroupId::new(0));
+        let mut coord = RemoteHeaderCoordinator::new(ShardGroupId::leaf(1, 0));
         let header = remote_header(remote, BlockHeight::new(5), 0); // parent WT in epoch 0
 
         let actions =
@@ -923,13 +922,13 @@ mod tests {
         // — none left in `pending` with no verification in flight — so a beacon
         // catch-up re-dispatches one rather than the whole height wedging.
         const ED: u64 = 1_000;
-        let remote = ShardGroupId::new(1);
+        let remote = ShardGroupId::leaf(1, 1);
         let ids = [0u64, 1, 2, 3]; // shard 1's committee is {1, 3}
         let snap = || Arc::new(shard_snapshot(2, &ids, 0));
 
         // Epoch 0 is in the schedule when the headers arrive.
         let present = TopologySchedule::new(ED, 100, Epoch::new(0), snap());
-        let mut coord = RemoteHeaderCoordinator::new(ShardGroupId::new(0));
+        let mut coord = RemoteHeaderCoordinator::new(ShardGroupId::leaf(1, 0));
         let header = remote_header(remote, BlockHeight::new(5), 0); // parent WT in epoch 0
 
         let dispatched =

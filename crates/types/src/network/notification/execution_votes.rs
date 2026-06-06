@@ -80,7 +80,7 @@ impl Signed for ExecutionVotesNotification {
         let shard = self
             .votes
             .first()
-            .map_or(ShardGroupId::new(0), |v| v.shard_group_id());
+            .map_or(ShardGroupId::ROOT, |v| v.shard_group_id());
         exec_vote_batch_message(
             network,
             shard,

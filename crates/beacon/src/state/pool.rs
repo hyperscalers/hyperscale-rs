@@ -97,7 +97,7 @@ mod tests {
         );
         state
             .next_shard_committees
-            .insert(ShardGroupId::new(0), ShardCommittee::default());
+            .insert(ShardGroupId::leaf(1, 0), ShardCommittee::default());
         state
     }
 
@@ -106,10 +106,10 @@ mod tests {
         let mut state = empty_state();
         state
             .next_shard_committees
-            .insert(ShardGroupId::new(0), ShardCommittee::default());
-        assert_eq!(pool_draw(&mut state, ShardGroupId::new(0)), None);
+            .insert(ShardGroupId::leaf(1, 0), ShardCommittee::default());
+        assert_eq!(pool_draw(&mut state, ShardGroupId::leaf(1, 0)), None);
         assert!(
-            state.next_shard_committees[&ShardGroupId::new(0)]
+            state.next_shard_committees[&ShardGroupId::leaf(1, 0)]
                 .members
                 .is_empty()
         );
@@ -122,8 +122,8 @@ mod tests {
     fn pool_draw_is_deterministic_across_replicas() {
         let mut a = state_with_pool(8, Randomness::new([0x5A; 32]), Epoch::new(1));
         let mut b = state_with_pool(8, Randomness::new([0x5A; 32]), Epoch::new(1));
-        let pick_a = pool_draw(&mut a, ShardGroupId::new(0)).unwrap();
-        let pick_b = pool_draw(&mut b, ShardGroupId::new(0)).unwrap();
+        let pick_a = pool_draw(&mut a, ShardGroupId::leaf(1, 0)).unwrap();
+        let pick_b = pool_draw(&mut b, ShardGroupId::leaf(1, 0)).unwrap();
         assert_eq!(pick_a, pick_b);
         assert_eq!(a.next_shard_committees, b.next_shard_committees);
         assert_eq!(a.pooled_validators(), b.pooled_validators());
@@ -137,10 +137,10 @@ mod tests {
     #[test]
     fn pool_draw_two_calls_same_slot_shard_pick_distinct_validators() {
         let mut state = state_with_pool(8, Randomness::new([0x42; 32]), Epoch::new(1));
-        let first = pool_draw(&mut state, ShardGroupId::new(0)).unwrap();
-        let second = pool_draw(&mut state, ShardGroupId::new(0)).unwrap();
+        let first = pool_draw(&mut state, ShardGroupId::leaf(1, 0)).unwrap();
+        let second = pool_draw(&mut state, ShardGroupId::leaf(1, 0)).unwrap();
         assert_ne!(first, second);
-        let members = &state.next_shard_committees[&ShardGroupId::new(0)].members;
+        let members = &state.next_shard_committees[&ShardGroupId::leaf(1, 0)].members;
         assert_eq!(members.len(), 2);
         assert!(members.contains(&first));
         assert!(members.contains(&second));
@@ -153,12 +153,12 @@ mod tests {
     fn pool_draw_places_chosen_validator_with_current_epoch() {
         let placed_epoch = Epoch::new(5);
         let mut state = state_with_pool(4, Randomness::new([0x99; 32]), placed_epoch);
-        let chosen = pool_draw(&mut state, ShardGroupId::new(0)).unwrap();
+        let chosen = pool_draw(&mut state, ShardGroupId::leaf(1, 0)).unwrap();
         let status = state.validators.get(&chosen).unwrap().status;
         assert_eq!(
             status,
             ValidatorStatus::OnShard {
-                shard: ShardGroupId::new(0),
+                shard: ShardGroupId::leaf(1, 0),
                 ready: false,
                 placed_at_epoch: placed_epoch,
             },
@@ -175,10 +175,10 @@ mod tests {
             let mut a = state_with_pool(8, Randomness::new([i; 32]), Epoch::GENESIS);
             // Add a second shard so the draw target exists.
             a.next_shard_committees
-                .insert(ShardGroupId::new(1), ShardCommittee::default());
+                .insert(ShardGroupId::leaf(1, 1), ShardCommittee::default());
             let mut b = a.clone();
-            let pick_a = pool_draw(&mut a, ShardGroupId::new(0)).unwrap();
-            let pick_b = pool_draw(&mut b, ShardGroupId::new(1)).unwrap();
+            let pick_a = pool_draw(&mut a, ShardGroupId::leaf(1, 0)).unwrap();
+            let pick_b = pool_draw(&mut b, ShardGroupId::leaf(1, 1)).unwrap();
             pick_a != pick_b
         });
         assert!(any_differ);

@@ -236,7 +236,7 @@ mod tests {
     fn make_provisions(seed: u8, source_shard: ShardGroupId, height: BlockHeight) -> Provisions {
         Provisions::new(
             source_shard,
-            ShardGroupId::new(0),
+            ShardGroupId::leaf(2, 0),
             height,
             MerkleInclusionProof::dummy(),
             vec![ProvisionEntry::new(
@@ -253,22 +253,22 @@ mod tests {
         let pl = ProvisionPipeline::new(Arc::new(ProvisionStore::new()));
         assert_eq!(pl.pending_len(), 0);
         assert_eq!(pl.verified_len(), 0);
-        let hash = make_provisions(99, ShardGroupId::new(1), BlockHeight::new(1)).hash();
+        let hash = make_provisions(99, ShardGroupId::leaf(2, 1), BlockHeight::new(1)).hash();
         assert!(!pl.has_verified(&hash));
     }
 
     #[test]
     fn buffer_and_drain_round_trip() {
         let mut pl = ProvisionPipeline::new(Arc::new(ProvisionStore::new()));
-        let key = (ShardGroupId::new(1), BlockHeight::new(10));
+        let key = (ShardGroupId::leaf(2, 1), BlockHeight::new(10));
         pl.buffer_pending(
             key,
-            make_provisions(1, ShardGroupId::new(1), BlockHeight::new(10)),
+            make_provisions(1, ShardGroupId::leaf(2, 1), BlockHeight::new(10)),
             ts(100),
         );
         pl.buffer_pending(
             key,
-            make_provisions(2, ShardGroupId::new(1), BlockHeight::new(10)),
+            make_provisions(2, ShardGroupId::leaf(2, 1), BlockHeight::new(10)),
             ts(100),
         );
         assert_eq!(pl.pending_len(), 1);
@@ -281,7 +281,7 @@ mod tests {
     fn drain_for_unknown_key_returns_empty() {
         let mut pl = ProvisionPipeline::new(Arc::new(ProvisionStore::new()));
         assert!(
-            pl.drain_pending_for_key((ShardGroupId::new(1), BlockHeight::new(10)))
+            pl.drain_pending_for_key((ShardGroupId::leaf(2, 1), BlockHeight::new(10)))
                 .is_empty()
         );
     }
@@ -290,7 +290,7 @@ mod tests {
     fn insert_verified_populates_store_and_index() {
         let store = Arc::new(ProvisionStore::new());
         let mut pl = ProvisionPipeline::new(Arc::clone(&store));
-        let provisions = make_provisions(1, ShardGroupId::new(1), BlockHeight::new(10));
+        let provisions = make_provisions(1, ShardGroupId::leaf(2, 1), BlockHeight::new(10));
         let hash = provisions.hash();
         let arc = pl.insert_verified(
             Arc::new(Verified::new_unchecked_for_test(provisions)),
@@ -298,7 +298,7 @@ mod tests {
         );
         assert!(pl.has_verified(&hash));
         assert!(store.get(hash).is_some());
-        assert_eq!(arc.source_shard(), ShardGroupId::new(1));
+        assert_eq!(arc.source_shard(), ShardGroupId::leaf(2, 1));
     }
 
     #[test]
@@ -311,7 +311,7 @@ mod tests {
         // second insert.
         let store = Arc::new(ProvisionStore::new());
         let mut pl = ProvisionPipeline::new(Arc::clone(&store));
-        let shard = ShardGroupId::new(1);
+        let shard = ShardGroupId::leaf(2, 1);
         let height = BlockHeight::new(10);
 
         let p_a = make_provisions(1, shard, height);
@@ -333,8 +333,8 @@ mod tests {
         let store = Arc::new(ProvisionStore::new());
         let mut pl = ProvisionPipeline::new(Arc::clone(&store));
 
-        let key_v = (ShardGroupId::new(1), BlockHeight::new(10));
-        let provisions_v = make_provisions(1, ShardGroupId::new(1), BlockHeight::new(10));
+        let key_v = (ShardGroupId::leaf(2, 1), BlockHeight::new(10));
+        let provisions_v = make_provisions(1, ShardGroupId::leaf(2, 1), BlockHeight::new(10));
         let hash_v = provisions_v.hash();
         let source_ts = ts(1_000);
         let live_after = provisions_v.deadline(source_ts);
@@ -343,10 +343,10 @@ mod tests {
             source_ts,
         );
 
-        let pending = make_provisions(2, ShardGroupId::new(2), BlockHeight::new(5));
+        let pending = make_provisions(2, ShardGroupId::leaf(2, 2), BlockHeight::new(5));
         let pending_hash = pending.hash();
         pl.buffer_pending(
-            (ShardGroupId::new(2), BlockHeight::new(5)),
+            (ShardGroupId::leaf(2, 2), BlockHeight::new(5)),
             pending,
             ts(1_000),
         );

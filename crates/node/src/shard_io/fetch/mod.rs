@@ -373,7 +373,7 @@ mod tests {
         }
     }
 
-    const SHARD: ShardGroupId = ShardGroupId::new(0);
+    const SHARD: ShardGroupId = ShardGroupId::ROOT;
 
     #[test]
     fn request_emits_chunked_sends() {

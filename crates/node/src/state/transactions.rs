@@ -129,7 +129,7 @@ mod tests {
 
     /// Counterpart to the rejection test: a tx that touches a local node
     /// must reach the mempool (with `num_shards = 1` every node maps to
-    /// `ShardGroupId::new(0)`).
+    /// `ShardGroupId::ROOT`).
     #[test]
     fn transaction_validated_routes_local_shard_tx_to_mempool() {
         let TestNode { mut node, .. } = TestNode::new();

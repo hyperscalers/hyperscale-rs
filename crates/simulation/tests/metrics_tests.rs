@@ -26,8 +26,10 @@ fn metrics_recorder_collects_values_from_running_sim() {
     runner.initialize_genesis();
     runner.run_until(Duration::from_secs(2));
 
-    let blocks_committed = recorder.counter("blocks_committed", Some("0"));
-    let block_height = recorder.gauge("block_height", Some("0"));
+    // Per-shard metrics are labeled by the shard's scalar id. The single shard
+    // is the trie root, whose scalar id is 1.
+    let blocks_committed = recorder.counter("blocks_committed", Some("1"));
+    let block_height = recorder.gauge("block_height", Some("1"));
     let commit_observations: u64 = ["aggregator", "header", "sync"]
         .iter()
         .map(|src| recorder.histogram_count("block_commit_latency", Some(src)))

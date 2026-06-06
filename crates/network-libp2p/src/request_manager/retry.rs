@@ -275,7 +275,7 @@ mod tests {
             .request(
                 peers,
                 preferred,
-                ShardGroupId::new(0),
+                ShardGroupId::ROOT,
                 "test".to_string(),
                 "test.req",
                 vec![1, 2, 3],

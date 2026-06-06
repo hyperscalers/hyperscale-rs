@@ -440,15 +440,15 @@ mod tests {
     }
 
     fn local_shard() -> ShardGroupId {
-        ShardGroupId::new(0)
+        ShardGroupId::ROOT
     }
 
     fn header_at_height(height: BlockHeight, timestamp_ms: u64) -> BlockHeader {
         BlockHeader::new(
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             height,
             BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            QuorumCertificate::genesis(ShardGroupId::new(0)),
+            QuorumCertificate::genesis(ShardGroupId::ROOT),
             ValidatorId::new(height.inner() % 4),
             ProposerTimestamp::from_millis(timestamp_ms),
             Round::new(0),
@@ -497,10 +497,10 @@ mod tests {
 
     fn block_with_waves(height: BlockHeight, waves: Vec<WaveId>) -> Block {
         let header = BlockHeader::new(
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             height,
             BlockHash::ZERO,
-            QuorumCertificate::genesis(ShardGroupId::new(0)),
+            QuorumCertificate::genesis(ShardGroupId::ROOT),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(0),
             Round::INITIAL,
@@ -539,7 +539,7 @@ mod tests {
         let block = block_with_waves(
             BlockHeight::new(1),
             vec![WaveId::new(
-                ShardGroupId::new(99),
+                ShardGroupId::leaf(8, 99),
                 BlockHeight::new(1),
                 BTreeSet::new(),
             )],
@@ -684,7 +684,7 @@ mod tests {
         signers.set(2);
         QuorumCertificate::new(
             BlockHash::from_raw(Hash::from_bytes(b"parent_block")),
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             BlockHeight::new(1),
             BlockHash::from_raw(Hash::from_bytes(b"grandparent")),
             Round::new(0),
@@ -701,7 +701,7 @@ mod tests {
         let round = Round::new(1);
         let proposer = topology().proposer_for(local_shard(), round);
         BlockHeader::new(
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             BlockHeight::new(2),
             parent_qc.block_hash(),
             parent_qc,
@@ -825,7 +825,7 @@ mod tests {
         signers.set(0);
         QuorumCertificate::new(
             BlockHash::from_raw(Hash::from_bytes(b"parent_block")),
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             BlockHeight::new(1),
             BlockHash::from_raw(Hash::from_bytes(b"grandparent")),
             Round::new(0),
@@ -844,7 +844,7 @@ mod tests {
         now: LocalTimestamp,
     ) -> BlockHeader {
         BlockHeader::new(
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             BlockHeight::new(2),
             parent_qc.block_hash(),
             parent_qc,
@@ -1137,8 +1137,8 @@ mod tests {
     fn provisions_with_seed(seed: u8) -> Arc<Provisions> {
         let tx_hash = TxHash::from_raw(Hash::from_bytes(&[seed; 32]));
         Arc::new(Provisions::new(
-            ShardGroupId::new(0),
-            ShardGroupId::new(1),
+            ShardGroupId::leaf(1, 0),
+            ShardGroupId::leaf(1, 1),
             BlockHeight::new(u64::from(seed)),
             MerkleInclusionProof::dummy(),
             vec![ProvisionEntry::new(tx_hash, vec![], vec![], vec![])],

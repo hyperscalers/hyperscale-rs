@@ -296,7 +296,7 @@ mod tests {
             counter_clone.fetch_add(1, Ordering::SeqCst);
             GossipVerdict::Accept
         };
-        let verdict = handler.on_message(TestMsg(42), ShardGroupId::new(0));
+        let verdict = handler.on_message(TestMsg(42), ShardGroupId::ROOT);
         assert_eq!(counter.load(Ordering::SeqCst), 1);
         assert_eq!(verdict, GossipVerdict::Accept);
     }

@@ -350,7 +350,7 @@ mod tests {
     use super::*;
 
     fn shard(n: u64) -> ShardGroupId {
-        ShardGroupId::new(n)
+        ShardGroupId::leaf(1, n)
     }
 
     /// Build a verified `CertifiedBlockHeader` with the few fields the

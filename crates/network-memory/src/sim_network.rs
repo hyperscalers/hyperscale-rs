@@ -279,7 +279,7 @@ mod tests {
     fn test_broadcast_to_shard_creates_outbox_entry() {
         let adapter = SimNetworkAdapter::default();
         let gossip = test_gossip();
-        let shard = ShardGroupId::new(3);
+        let shard = ShardGroupId::leaf(2, 3);
 
         adapter.broadcast_to_shard(shard, &gossip);
 
@@ -327,7 +327,7 @@ mod tests {
 
         let registry = Arc::new(HandlerRegistry::default());
         let adapter = SimNetworkAdapter::new(registry.clone());
-        let shard = ShardGroupId::new(0);
+        let shard = ShardGroupId::leaf(2, 0);
 
         assert!(registry.get_request("block.request", shard).is_none());
         adapter.register_request_handler::<GetBlockRequest>(shard, |_req| {
@@ -343,7 +343,7 @@ mod tests {
         use hyperscale_types::network::response::GetBlockResponse;
 
         let adapter = SimNetworkAdapter::default();
-        let shard = ShardGroupId::new(0);
+        let shard = ShardGroupId::leaf(2, 0);
 
         adapter.register_request_handler::<GetBlockRequest>(shard, |_req| {
             GetBlockResponse::not_found()
@@ -359,7 +359,7 @@ mod tests {
 
         let adapter = SimNetworkAdapter::default();
         let preferred = Some(ValidatorId::new(7));
-        let shard = ShardGroupId::new(3);
+        let shard = ShardGroupId::leaf(2, 3);
 
         adapter.request(
             shard,
@@ -392,7 +392,7 @@ mod tests {
         let result_clone = result.clone();
 
         adapter.request(
-            ShardGroupId::new(0),
+            ShardGroupId::leaf(2, 0),
             None,
             GetBlockRequest::new(BlockHeight::new(1), BlockHeight::new(1)),
             None,
@@ -426,7 +426,7 @@ mod tests {
         let result_clone = result.clone();
 
         adapter.request(
-            ShardGroupId::new(0),
+            ShardGroupId::leaf(2, 0),
             None,
             GetBlockRequest::new(BlockHeight::new(1), BlockHeight::new(1)),
             None,

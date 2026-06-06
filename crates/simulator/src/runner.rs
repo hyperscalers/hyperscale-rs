@@ -445,23 +445,22 @@ impl Simulator {
 
     /// Determine the target shard for a transaction.
     fn get_target_shard(&self, tx: &RoutableTransaction) -> ShardGroupId {
-        tx.declared_writes()
-            .first()
-            .map_or(ShardGroupId::new(0), |node_id| {
-                shard_for_node(node_id, u64::from(self.config.num_shards))
-            })
+        tx.declared_writes().first().map_or_else(
+            || ShardGroupId::leaf(self.config.num_shards.trailing_zeros(), 0),
+            |node_id| shard_for_node(node_id, u64::from(self.config.num_shards)),
+        )
     }
 
     /// Get a node index for submitting to a shard (for status checks).
     fn get_node_for_shard(&self, shard: ShardGroupId) -> u32 {
-        // Return the first validator in the shard
-        u32::try_from(shard.inner()).unwrap_or(u32::MAX) * self.config.validators_per_shard
+        // The shard's flat index in a uniform partition is its trie path.
+        u32::try_from(shard.path()).unwrap_or(u32::MAX) * self.config.validators_per_shard
     }
 
     /// Get all node indices in a shard.
     fn nodes_for_shard(&self, shard: ShardGroupId) -> Vec<NodeIndex> {
         let start =
-            u32::try_from(shard.inner()).unwrap_or(u32::MAX) * self.config.validators_per_shard;
+            u32::try_from(shard.path()).unwrap_or(u32::MAX) * self.config.validators_per_shard;
         let end = start + self.config.validators_per_shard;
         (start..end).collect()
     }

@@ -119,8 +119,8 @@ mod tests {
             TxHash, ValidatorId, WeightedTimestamp, zero_bls_signature,
         };
 
-        let source_shard = ShardGroupId::new(1);
-        let target_shard = ShardGroupId::new(0);
+        let source_shard = ShardGroupId::leaf(1, 1);
+        let target_shard = ShardGroupId::leaf(1, 0);
         let source_height = BlockHeight::new(7);
         let provisions = Arc::new(Provisions::new(
             source_shard,

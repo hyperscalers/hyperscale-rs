@@ -129,7 +129,7 @@ mod tests {
         let committee = TestCommittee::new(4, 42);
         let topology = topology_for(&committee);
         let me = committee.validator_id(0);
-        let shard = ShardGroupId::new(0);
+        let shard = ShardGroupId::ROOT;
 
         // Voting in round 0:
         //   Block proposer: round 0 -> V0 (self, skipped)
@@ -160,7 +160,7 @@ mod tests {
         let committee = TestCommittee::new(4, 42);
         let topology = topology_for(&committee);
         let me = committee.validator_id(0);
-        let shard = ShardGroupId::new(0);
+        let shard = ShardGroupId::ROOT;
         assert_eq!(
             vote_recipients(&topology, shard, me, Round::new(3)),
             vec![
@@ -179,7 +179,7 @@ mod tests {
         let committee = TestCommittee::new(4, 42);
         let topology = topology_for(&committee);
         let me = committee.validator_id(0);
-        let shard = ShardGroupId::new(0);
+        let shard = ShardGroupId::ROOT;
         assert_eq!(
             vote_recipients(&topology, shard, me, Round::new(2)),
             vec![
@@ -195,7 +195,7 @@ mod tests {
         let committee = TestCommittee::new(1, 42);
         let topology = topology_for(&committee);
         let me = committee.validator_id(0);
-        let shard = ShardGroupId::new(0);
+        let shard = ShardGroupId::ROOT;
         assert!(vote_recipients(&topology, shard, me, Round::new(0)).is_empty());
     }
 
@@ -205,7 +205,7 @@ mod tests {
     fn committee_public_keys_returns_all_keys_in_order() {
         let committee = TestCommittee::new(4, 42);
         let topology = topology_for(&committee);
-        let shard = ShardGroupId::new(0);
+        let shard = ShardGroupId::ROOT;
 
         let keys = committee_public_keys(&topology, shard);
         assert_eq!(keys.len(), 4);

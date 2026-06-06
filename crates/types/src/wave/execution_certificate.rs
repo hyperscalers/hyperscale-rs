@@ -481,9 +481,9 @@ mod tests {
 
     fn wave_id() -> WaveId {
         WaveId::new(
-            ShardGroupId::new(0),
+            ShardGroupId::leaf(1, 0),
             BlockHeight::new(7),
-            std::iter::once(ShardGroupId::new(1)).collect(),
+            std::iter::once(ShardGroupId::leaf(1, 1)).collect(),
         )
     }
 
@@ -502,7 +502,7 @@ mod tests {
             BlockHeight::new(7),
             WeightedTimestamp::from_millis(11),
             wave_id(),
-            ShardGroupId::new(0),
+            ShardGroupId::leaf(1, 0),
             outcomes,
             ValidatorId::new(validator),
             sk,

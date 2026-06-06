@@ -75,7 +75,7 @@ mod tests {
                 amount: Stake::from_whole_tokens(1_000),
             },
             proof: ShardWitnessProof {
-                shard_id: ShardGroupId::new(2),
+                shard_id: ShardGroupId::ROOT,
                 committed_block_hash: BlockHash::from_raw(Hash::from_bytes(b"committed")),
                 leaf_index: LeafIndex::new(leaf_index),
                 siblings: vec![

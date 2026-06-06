@@ -129,7 +129,7 @@ fn commit_with(
         let new_fw: Arc<Verifiable<FinalizedWave>> = Arc::new(
             FinalizedWave::new(
                 Arc::new(WaveCertificate::new(
-                    WaveId::new(ShardGroupId::new(0), block.height(), BTreeSet::new()),
+                    WaveId::new(ShardGroupId::ROOT, block.height(), BTreeSet::new()),
                     vec![],
                 )),
                 vec![receipt],

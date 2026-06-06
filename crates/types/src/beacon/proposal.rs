@@ -270,7 +270,7 @@ mod tests {
                 amount: Stake::from_whole_tokens(1_000),
             },
             proof: ShardWitnessProof {
-                shard_id: ShardGroupId::new(0),
+                shard_id: ShardGroupId::ROOT,
                 committed_block_hash: BlockHash::ZERO,
                 leaf_index: LeafIndex::new(leaf_index),
                 siblings: Vec::new().into(),

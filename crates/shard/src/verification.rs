@@ -1751,10 +1751,10 @@ mod tests {
 
     fn header(height: BlockHeight, parent_block_hash: BlockHash, in_flight: u32) -> BlockHeader {
         BlockHeader::new(
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             height,
             parent_block_hash,
-            QuorumCertificate::genesis(ShardGroupId::new(0)),
+            QuorumCertificate::genesis(ShardGroupId::ROOT),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(0),
             Round::INITIAL,
@@ -1779,7 +1779,7 @@ mod tests {
         parent_qc: QuorumCertificate,
     ) -> BlockHeader {
         BlockHeader::new(
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             height,
             parent_block_hash,
             parent_qc,
@@ -1821,7 +1821,7 @@ mod tests {
         pending: &'a PendingBlocks,
     ) -> ChainView<'a> {
         ChainView::new(
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             committed_height,
             committed_hash,
             StateRoot::ZERO,
@@ -1856,7 +1856,7 @@ mod tests {
         let parent = bh(b"parent");
         let parent_qc = QuorumCertificate::new(
             parent,
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             BlockHeight::new(4),
             BlockHash::ZERO,
             Round::INITIAL,
@@ -2002,7 +2002,7 @@ mod tests {
             &pending,
             &accumulator,
             BlockHash::ZERO,
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             &topology,
         );
 
@@ -2042,7 +2042,7 @@ mod tests {
                 &pending,
                 &accumulator,
                 BlockHash::ZERO,
-                ShardGroupId::new(0),
+                ShardGroupId::ROOT,
                 &topology,
             );
         }
@@ -2082,7 +2082,7 @@ mod tests {
             &pending,
             &accumulator,
             BlockHash::ZERO,
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             &topology,
         );
         assert!(vp.is_beacon_witness_deferred(child_hash));
@@ -2102,13 +2102,13 @@ mod tests {
     // ─── PendingAssembly multi-slot completion ──────────────────────────
 
     fn assembly_block() -> Block {
-        Block::genesis(ShardGroupId::new(0), ValidatorId::new(0), StateRoot::ZERO)
+        Block::genesis(ShardGroupId::ROOT, ValidatorId::new(0), StateRoot::ZERO)
     }
 
     fn assembly_qc_for(block: &Block) -> QuorumCertificate {
         QuorumCertificate::new(
             block.hash(),
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             BlockHeight::GENESIS,
             BlockHash::ZERO,
             Round::INITIAL,
@@ -2202,10 +2202,10 @@ mod tests {
     fn track_pending_assembly_rejects_nonzero_root_on_empty_content() {
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
         let forged_header = BlockHeader::new(
-            ShardGroupId::new(0),
+            ShardGroupId::ROOT,
             BlockHeight::new(1),
             BlockHash::ZERO,
-            QuorumCertificate::genesis(ShardGroupId::new(0)),
+            QuorumCertificate::genesis(ShardGroupId::ROOT),
             ValidatorId::new(0),
             ProposerTimestamp::from_millis(0),
             Round::INITIAL,

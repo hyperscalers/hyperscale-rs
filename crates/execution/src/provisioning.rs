@@ -299,7 +299,7 @@ mod tests {
     use super::*;
 
     fn shard(n: u64) -> ShardGroupId {
-        ShardGroupId::new(n)
+        ShardGroupId::leaf(2, n)
     }
 
     fn make_provisions(
@@ -313,7 +313,7 @@ mod tests {
             .collect();
         Verified::<Provisions>::new_unchecked_for_test(Provisions::new(
             source,
-            ShardGroupId::new(0),
+            ShardGroupId::leaf(2, 0),
             block_height,
             MerkleInclusionProof::dummy(),
             transactions,
