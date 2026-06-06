@@ -161,6 +161,7 @@ pub use time::timeouts::{
 };
 pub use time::timestamp::{LocalTimestamp, ProposerTimestamp, WeightedTimestamp};
 pub use topology::awaiting::AwaitingTopologyBuffer;
+pub use topology::network_root::{network_state_root, shard_prefix_path};
 pub use topology::schedule::TopologySchedule;
 pub use topology::snapshot::{TopologySnapshot, node_id_hash_u64, uniform_shard_for_node};
 pub use topology::trie::ShardTrie;

@@ -32,30 +32,60 @@ impl<H: Hasher, const ARITY_BITS: u8> Tree<H, ARITY_BITS> {
     /// Number of children per internal node.
     pub const ARITY: usize = 1 << ARITY_BITS as usize;
 
-    /// Apply a batch of key updates to produce a new version of the tree.
-    ///
-    /// - `parent_version`: the version to base this update on, or `None`
-    ///   for the initial commit into an empty store.
-    /// - `new_version`: the version label for the resulting root. Must
-    ///   be strictly greater than `parent_version`.
-    /// - `updates`: `Some(value_hash)` to insert or update, `None` to
-    ///   delete. The map's key ordering is used to sort updates by key.
-    ///
-    /// Returns an [`UpdateResult`] whose `batch` must be persisted to
-    /// make the new version visible to reads.
+    /// Apply `updates` to a whole-keyspace tree (rooted at the empty path).
+    /// Equivalent to [`Self::apply_updates_at`] with [`NibblePath::empty`].
     ///
     /// # Errors
     ///
-    /// Returns [`UpdateError::NonMonotonicVersion`] if `new_version` is
-    /// not strictly greater than `parent_version`,
-    /// [`UpdateError::ParentVersionMissing`] if the parent root is not
-    /// in `store`, [`UpdateError::MissingNode`] if a referenced node
-    /// has been pruned, or [`UpdateError::Invariant`] if an internal
-    /// post-condition fails.
+    /// See [`Self::apply_updates_at`].
     pub fn apply_updates<S>(
         store: &S,
         parent_version: Option<u64>,
         new_version: u64,
+        updates: &BTreeMap<Key, Option<ValueHash>>,
+    ) -> Result<UpdateResult, UpdateError>
+    where
+        S: TreeReader,
+    {
+        Self::apply_updates_at(
+            store,
+            parent_version,
+            new_version,
+            &NibblePath::empty(),
+            updates,
+        )
+    }
+
+    /// Apply a batch of key updates to the tree rooted at `root_path`,
+    /// producing a new version.
+    ///
+    /// - `parent_version`: the version to base this update on, or `None` for the
+    ///   initial commit into an empty store.
+    /// - `new_version`: the version label for the resulting root. Must be
+    ///   strictly greater than `parent_version`.
+    /// - `root_path`: where this tree is rooted — [`NibblePath::empty`] for a
+    ///   whole-keyspace tree, or a prefix so the tree covers only keys sharing
+    ///   that prefix (its root node sits at the prefix depth, so the root hash is
+    ///   the subtree root at that prefix). All keys in `updates` must share
+    ///   `root_path`, and incremental updates must reuse it.
+    /// - `updates`: `Some(value_hash)` to insert or update, `None` to delete.
+    ///   The map's key ordering sorts updates by key.
+    ///
+    /// Returns an [`UpdateResult`] whose `batch` must be persisted to make the
+    /// new version visible to reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UpdateError::NonMonotonicVersion`] if `new_version` is not
+    /// strictly greater than `parent_version`,
+    /// [`UpdateError::ParentVersionMissing`] if the parent root is not in
+    /// `store`, [`UpdateError::MissingNode`] if a referenced node has been
+    /// pruned, or [`UpdateError::Invariant`] if an internal post-condition fails.
+    pub fn apply_updates_at<S>(
+        store: &S,
+        parent_version: Option<u64>,
+        new_version: u64,
+        root_path: &NibblePath,
         updates: &BTreeMap<Key, Option<ValueHash>>,
     ) -> Result<UpdateResult, UpdateError>
     where
@@ -80,31 +110,33 @@ impl<H: Hasher, const ARITY_BITS: u8> Tree<H, ARITY_BITS> {
                 let root_key = store
                     .get_root_key(parent)
                     .ok_or(UpdateError::ParentVersionMissing(parent))?;
+                debug_assert_eq!(
+                    &root_key.path, root_path,
+                    "JMT root path must be stable across versions of a tree",
+                );
                 update_existing::<S, H, ARITY_BITS>(
                     store,
                     root_key.version,
-                    &root_key.path,
+                    root_path,
                     new_version,
                     &kvs,
                     &mut batch,
                 )?
             }
-            None => {
-                build_fresh::<H, ARITY_BITS>(&NibblePath::empty(), new_version, &kvs, &mut batch)
-            }
+            None => build_fresh::<H, ARITY_BITS>(root_path, new_version, &kvs, &mut batch),
         };
 
-        // Write the root. An empty tree produces no root node; callers
-        // interpret a missing root_key as EMPTY_HASH.
+        // Write the root at `root_path`. An empty tree produces no root node;
+        // callers interpret a missing root_key as EMPTY_HASH.
         let (root_hash, root_key) = match new_root {
             Some(node) => {
                 let hash = node.hash::<H>();
-                let key = NodeKey::root(new_version);
+                let key = NodeKey::new(new_version, root_path.clone());
                 batch.new_nodes.push((key.clone(), node));
                 batch.root_key = Some((new_version, key.clone()));
                 (hash, key)
             }
-            None => (EMPTY_HASH, NodeKey::root(new_version)),
+            None => (EMPTY_HASH, NodeKey::new(new_version, root_path.clone())),
         };
 
         Ok(UpdateResult {

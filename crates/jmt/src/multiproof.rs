@@ -36,8 +36,9 @@
 //!
 //! ```text
 //! byte 0       : version (u8) = 0x01
-//! bytes 1..5   : claim_count (u32 big-endian)
-//! bytes 5..    : claim_count × claim
+//! bytes 1..3   : root_depth_bits (u16 big-endian) — depth the tree is rooted at
+//! next 4 bytes : claim_count (u32 big-endian)
+//! then         : claim_count × claim
 //! next 4 bytes : sibling_count (u32 big-endian)
 //! then         : sibling_count × hash (32 bytes each)
 //! ```
@@ -74,6 +75,12 @@ use crate::tree::Tree;
 /// A batched proof covering multiple keys against a single root.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MultiProof {
+    /// Bit-depth at which the proven tree is rooted. Zero for a
+    /// whole-keyspace tree; a prefix length for a subtree-rooted tree (e.g. a
+    /// shard state tree rooted at its prefix). Verification reconstructs the
+    /// root starting from this depth, so the proof is self-describing.
+    pub root_depth_bits: u16,
+
     /// Per-claim termination metadata, in sorted-key order.
     pub claims: Vec<ProofClaim>,
 
@@ -167,7 +174,11 @@ impl<H: Hasher, const ARITY_BITS: u8> Tree<H, ARITY_BITS> {
         let mut siblings = Vec::new();
 
         if sorted.is_empty() {
-            return Ok(MultiProof { claims, siblings });
+            return Ok(MultiProof {
+                root_depth_bits: root_key.path.len(),
+                claims,
+                siblings,
+            });
         }
 
         // The caller provided a root key — it must resolve to a node in
@@ -189,7 +200,11 @@ impl<H: Hasher, const ARITY_BITS: u8> Tree<H, ARITY_BITS> {
             &mut siblings,
         )?;
 
-        Ok(MultiProof { claims, siblings })
+        Ok(MultiProof {
+            root_depth_bits: root_key.path.len(),
+            claims,
+            siblings,
+        })
     }
 
     /// Verify a multiproof against an expected root.
@@ -269,8 +284,16 @@ impl<H: Hasher, const ARITY_BITS: u8> Tree<H, ARITY_BITS> {
             }
         }
 
-        // Reconstruct root by walking the claim topology.
-        let (computed, consumed) = verify_rec::<H, ARITY_BITS>(&proof.claims, 0, &proof.siblings)?;
+        if proof.root_depth_bits > MAX_DEPTH_BITS
+            || !proof.root_depth_bits.is_multiple_of(u16::from(ARITY_BITS))
+        {
+            return Err(ProofError::Malformed("root depth off the arity grid"));
+        }
+
+        // Reconstruct root by walking the claim topology, starting at the depth
+        // the tree is rooted at (zero for a whole-keyspace tree).
+        let (computed, consumed) =
+            verify_rec::<H, ARITY_BITS>(&proof.claims, proof.root_depth_bits, &proof.siblings)?;
 
         if consumed != proof.siblings.len() {
             return Err(ProofError::Malformed("trailing siblings"));
@@ -629,6 +652,7 @@ impl MultiProof {
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(self.encoded_size_hint());
         buf.push(WIRE_VERSION);
+        buf.extend_from_slice(&self.root_depth_bits.to_be_bytes());
         buf.extend_from_slice(
             &u32::try_from(self.claims.len())
                 .unwrap_or(u32::MAX)
@@ -662,6 +686,7 @@ impl MultiProof {
         if version != WIRE_VERSION {
             return Err(DecodeError::UnsupportedVersion(version));
         }
+        let root_depth_bits = r.u16_be()?;
         let claim_count = r.u32_be()? as usize;
         if claim_count > MAX_PROOF_CLAIMS {
             return Err(DecodeError::LengthOverLimit {
@@ -687,7 +712,11 @@ impl MultiProof {
         if !r.is_empty() {
             return Err(DecodeError::TrailingBytes);
         }
-        Ok(Self { claims, siblings })
+        Ok(Self {
+            root_depth_bits,
+            claims,
+            siblings,
+        })
     }
 
     fn encoded_size_hint(&self) -> usize {
@@ -704,7 +733,7 @@ impl MultiProof {
                     }
             })
             .sum();
-        1 + 4 + claims_bytes + 4 + self.siblings.len() * 32
+        1 + 2 + 4 + claims_bytes + 4 + self.siblings.len() * 32
     }
 }
 
@@ -831,6 +860,7 @@ mod tests {
 
     use super::*;
     use crate::hasher::Blake3Hasher;
+    use crate::node::NibblePath;
     use crate::storage::MemoryStore;
     use crate::tree::Tree;
 
@@ -873,6 +903,46 @@ mod tests {
         let expected: Vec<(Key, Option<ValueHash>)> =
             entries.iter().map(|(k, v)| (*k, Some(*v))).collect();
         Jmt::verify(&proof, root_hash, &expected).unwrap();
+    }
+
+    #[test]
+    fn prove_and_verify_rooted_at_prefix() {
+        // A tree rooted at a non-empty prefix (its keys all share that prefix)
+        // must still prove and verify — its root sits at the prefix depth, which
+        // is exactly what a prefix-rooted shard state tree relies on.
+        let mut prefix = NibblePath::empty();
+        prefix.push_bits(0b1010, 4); // 4-bit prefix 0xA
+
+        let entries: Vec<(Key, ValueHash)> = (0u8..6)
+            .map(|i| {
+                let mut key = [0u8; 32];
+                key[0] = 0xA0 | i; // top nibble 0xA matches the prefix
+                key[1] = i; // diverge below the prefix
+                (key, v(i.wrapping_mul(7)))
+            })
+            .collect();
+
+        let mut store = MemoryStore::new();
+        let updates: BTreeMap<Key, Option<ValueHash>> =
+            entries.iter().map(|(k, val)| (*k, Some(*val))).collect();
+        let res = Jmt::apply_updates_at(&store, None, 1, &prefix, &updates).unwrap();
+        store.apply(&res);
+
+        let root_key = store.get_root_key(1).unwrap();
+        assert_eq!(
+            root_key.path, prefix,
+            "root sits at the prefix, not depth 0"
+        );
+
+        let keys: Vec<Key> = entries.iter().map(|(k, _)| *k).collect();
+        let proof = Jmt::prove(&store, &root_key, &keys).unwrap();
+        let expected: Vec<(Key, Option<ValueHash>)> =
+            entries.iter().map(|(k, val)| (*k, Some(*val))).collect();
+        Jmt::verify(&proof, res.root_hash, &expected).unwrap();
+
+        // Tampered value still fails against the prefix-rooted root.
+        let bad = Jmt::verify(&proof, res.root_hash, &[(entries[0].0, Some(v(255)))]).unwrap_err();
+        assert!(matches!(bad, ProofError::ValueMismatch));
     }
 
     #[test]
@@ -1002,12 +1072,13 @@ mod tests {
     #[test]
     fn encode_decode_empty_proof() {
         let proof = MultiProof {
+            root_depth_bits: 0,
             claims: vec![],
             siblings: vec![],
         };
         let bytes = proof.encode();
-        // version (1) + claim_count (4) + sibling_count (4) = 9 bytes
-        assert_eq!(bytes.len(), 9);
+        // version (1) + root_depth_bits (2) + claim_count (4) + sibling_count (4) = 11 bytes
+        assert_eq!(bytes.len(), 11);
         assert_eq!(bytes[0], WIRE_VERSION);
         let decoded = MultiProof::decode(&bytes).unwrap();
         assert_eq!(proof, decoded);
@@ -1075,7 +1146,7 @@ mod tests {
 
     #[test]
     fn decode_rejects_truncated_header() {
-        // Version byte only — no claim_count.
+        // Version byte only — no root_depth_bits.
         let bytes = vec![WIRE_VERSION];
         let err = MultiProof::decode(&bytes).unwrap_err();
         assert!(matches!(err, DecodeError::Truncated));
@@ -1085,6 +1156,7 @@ mod tests {
     fn decode_rejects_truncated_claims() {
         // Version + claim_count=1, then a partial claim.
         let mut bytes = vec![WIRE_VERSION];
+        bytes.extend_from_slice(&0u16.to_be_bytes()); // root_depth_bits
         bytes.extend_from_slice(&1u32.to_be_bytes());
         bytes.extend_from_slice(&[0u8; 10]); // only 10 bytes of a claim
         let err = MultiProof::decode(&bytes).unwrap_err();
@@ -1106,6 +1178,7 @@ mod tests {
         // Construct a minimal proof: version + claim_count=1 + key + depth
         // + invalid discriminator.
         let mut bytes = vec![WIRE_VERSION];
+        bytes.extend_from_slice(&0u16.to_be_bytes()); // root_depth_bits
         bytes.extend_from_slice(&1u32.to_be_bytes());
         bytes.extend_from_slice(&[0u8; 32]); // key
         bytes.extend_from_slice(&0u16.to_be_bytes()); // depth
@@ -1119,6 +1192,7 @@ mod tests {
         // The exact attack: tiny payload, large claim_count claim.
         // Without the cap, this triggers a multi-GB Vec::with_capacity.
         let mut bytes = vec![WIRE_VERSION];
+        bytes.extend_from_slice(&0u16.to_be_bytes()); // root_depth_bits
         bytes.extend_from_slice(&u32::MAX.to_be_bytes());
         let err = MultiProof::decode(&bytes).unwrap_err();
         assert!(matches!(
@@ -1134,6 +1208,7 @@ mod tests {
     fn decode_rejects_oversized_sibling_count() {
         // claim_count=0, then huge sibling_count.
         let mut bytes = vec![WIRE_VERSION];
+        bytes.extend_from_slice(&0u16.to_be_bytes()); // root_depth_bits
         bytes.extend_from_slice(&0u32.to_be_bytes());
         bytes.extend_from_slice(&u32::MAX.to_be_bytes());
         let err = MultiProof::decode(&bytes).unwrap_err();
@@ -1151,6 +1226,7 @@ mod tests {
         // A claim depth past the 256-bit key space. Left unbounded, this
         // drives `verify_rec` to index a key byte past its end and panic.
         let mut bytes = vec![WIRE_VERSION];
+        bytes.extend_from_slice(&0u16.to_be_bytes()); // root_depth_bits
         bytes.extend_from_slice(&1u32.to_be_bytes());
         bytes.extend_from_slice(&[0u8; 32]); // key
         bytes.extend_from_slice(&300u16.to_be_bytes()); // depth past 256
@@ -1173,6 +1249,7 @@ mod tests {
         // split below.
         type Jmt4 = Tree<Blake3Hasher, 2>;
         let proof = MultiProof {
+            root_depth_bits: 0,
             claims: vec![ProofClaim {
                 key: k(1),
                 value_hash: Some(v(10)),
